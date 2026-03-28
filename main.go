@@ -62,7 +62,7 @@ func main() {
 
 	actualAddr := listener.Addr().String()
 	appURL := fmt.Sprintf("http://%s", actualAddr)
-	log.Printf("ParaLauncher %s serving at %s", version, appURL)
+	log.Printf("Croopor %s serving at %s", version, appURL)
 
 	// Start HTTP server in background
 	go func() {

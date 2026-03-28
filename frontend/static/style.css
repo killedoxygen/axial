@@ -1,5 +1,5 @@
 /* ═══════════════════════════════════════════
-   MC ParaLauncher — Subterranean Industrial
+   Croopor — Subterranean Industrial
    ═══════════════════════════════════════════ */
 
 :root {
@@ -113,12 +113,11 @@ body::before {
   user-select: none;
 }
 
-.logo-glyph {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 32px;
-  height: 32px;
+.logo-img {
+  width: 28px;
+  height: 28px;
+  border-radius: var(--r-sm);
+  object-fit: cover;
 }
 
 .logo-text {

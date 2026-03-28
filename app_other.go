@@ -12,7 +12,7 @@ import (
 // runApp on non-Windows opens a browser and blocks until interrupted.
 // This is the development/fallback mode.
 func runApp(appURL string) {
-	fmt.Printf("\n  ParaLauncher %s\n  %s\n\n", version, appURL)
+	fmt.Printf("\n  Croopor %s\n  %s\n\n", version, appURL)
 
 	cmd := newBrowserCmd(appURL)
 	cmd.Start()

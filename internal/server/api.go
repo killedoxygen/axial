@@ -13,7 +13,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":   "ok",
 		"mc_dir":   s.mcDir,
-		"app_name": "ParaLauncher",
+		"app_name": "Croopor",
 		"version":  "1.0.0",
 	})
 }

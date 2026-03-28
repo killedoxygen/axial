@@ -18,7 +18,7 @@ func runApp(appURL string) {
 		Debug:     false,
 		AutoFocus: true,
 		WindowOptions: webview2.WindowOptions{
-			Title:  "ParaLauncher",
+			Title:  "Croopor",
 			Width:  1100,
 			Height: 720,
 			IconId: 2,

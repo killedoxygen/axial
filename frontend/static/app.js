@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════
-// MC ParaLauncher — Frontend Application
+// Croopor — Frontend Application
 // ═══════════════════════════════════════════
 
 const API = '/api/v1';
