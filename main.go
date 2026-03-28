@@ -14,7 +14,7 @@ import (
 	"github.com/mateoltd/mc-paralauncher/internal/server"
 )
 
-var version = "1.0.0"
+var version = "1.0.1"
 
 func main() {
 	port := flag.Int("port", 0, "HTTP server port (0 = auto)")

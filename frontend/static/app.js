@@ -7,10 +7,50 @@ const STORAGE_KEY = 'croopor_ui';
 
 // ── Local UI State ──
 
-const defaults = { theme: 'obsidian', customHue: 140, logExpanded: false, collapsedGroups: {}, sidebarFilter: 'all', sounds: true };
+const PRESET_HUES = { obsidian: 140, deepslate: 215, nether: 15, end: 268, birch: 100 };
+const LOGO_BASE_HUE = 106;
+
+const SHORTCUT_DEFAULTS = {
+  settings:   { key: ',', ctrl: true, desc: 'Open or close settings' },
+  search:     { key: 'f', ctrl: true, desc: 'Focus version search' },
+  addVersion: { key: 'n', ctrl: true, desc: 'Add a new version' },
+  launch:     { key: 'Enter', ctrl: true, desc: 'Launch selected version' },
+  save:       { key: 's', ctrl: true, desc: 'Save settings' },
+  close:      { key: 'Escape', ctrl: false, desc: 'Close dialogs' },
+};
+
+const Shortcuts = {
+  _custom: {},
+  load(stored) { this._custom = stored || {}; },
+  get(action) { return this._custom[action] || SHORTCUT_DEFAULTS[action]; },
+  set(action, binding) { this._custom[action] = binding; },
+  reset(action) { delete this._custom[action]; },
+  all() { return Object.keys(SHORTCUT_DEFAULTS); },
+  matches(e, action) {
+    const b = this.get(action);
+    if (!b) return false;
+    const key = b.key.length === 1 ? b.key.toLowerCase() : b.key;
+    const eKey = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+    return eKey === key && !!e.ctrlKey === !!b.ctrl && !!e.shiftKey === !!b.shift && !!e.altKey === !!b.alt;
+  },
+  format(action) {
+    const b = this.get(action);
+    if (!b) return '';
+    const parts = [];
+    if (b.ctrl) parts.push('Ctrl');
+    if (b.shift) parts.push('Shift');
+    if (b.alt) parts.push('Alt');
+    const k = b.key === ' ' ? 'Space' : b.key === ',' ? ',' : b.key.length === 1 ? b.key.toUpperCase() : b.key;
+    parts.push(k);
+    return parts.join('+');
+  },
+};
+
+const defaults = { theme: 'obsidian', customHue: 140, customVibrancy: 100, lightness: 0, logExpanded: false, collapsedGroups: {}, sidebarFilter: 'all', sounds: true, shortcuts: {} };
 function loadLocalState() { try { const r = localStorage.getItem(STORAGE_KEY); return r ? { ...defaults, ...JSON.parse(r) } : { ...defaults }; } catch { return { ...defaults }; } }
 function saveLocalState() { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(local)); } catch {} }
 const local = loadLocalState();
+Shortcuts.load(local.shortcuts);
 
 // ── Sound Engine ──
 
@@ -248,43 +288,176 @@ function scrambleText(el, text, duration) {
 
 // ── Theme Engine ──
 
-function generateThemeFromHue(hue) {
-  const s = (hue >= 0 && hue < 60) || hue >= 300 ? 18 : 15;
+function generateThemeFromHue(hue, vibrancy, lightness) {
+  const v = (vibrancy != null ? vibrancy : 100) / 100;
+  const l = (lightness != null ? lightness : 0) / 100; // 0=dark, 1=light
+  const baseSat = ((hue >= 0 && hue < 60) || hue >= 300 ? 18 : 15);
+  const s = Math.round(baseSat * v);
+  // lerp helper
+  const mix = (dark, light) => Math.round(dark + (light - dark) * l);
+  const mixF = (dark, light) => +(dark + (light - dark) * l).toFixed(2);
+
+  const bgDeepL = mix(5, 90), bgL = mix(7, 94);
+  const s0L = mix(9.5, 97), s1L = mix(12, 92), s2L = mix(15.5, 88), s3L = mix(19, 83);
+  const bgS = Math.max(0, s), bgS2 = Math.max(0, s - 3), bgS3 = Math.max(0, s - 5);
+  const accentL = mix(58, 42), accentDimL = mix(44, 34);
+  const accentS = l > 0.5 ? Math.round(55 + v * 15) : 65;
+  const accentDimS = l > 0.5 ? Math.round(45 + v * 15) : 55;
+  const textL = mix(86, 16), textDimL = mix(52, 42), textMutedL = mix(34, 60);
+  const textS = Math.round(mix(8 * v, 6 + v * 4));
+  const borderL = mix(14, 84), borderHoverL = mix(24, 76);
+  const borderS = Math.max(0, mix(s - 4, s - 2)), borderHoverS = Math.max(0, mix(s - 2, s));
+  const shadowA = mixF(0.5, 0.08);
+
   return {
-    '--bg-deep': `hsl(${hue},${s}%,5%)`, '--bg': `hsl(${hue},${s - 3}%,7%)`,
-    '--surface-0': `hsl(${hue},${s - 5}%,9.5%)`, '--surface-1': `hsl(${hue},${s - 5}%,12%)`,
-    '--surface-2': `hsl(${hue},${s - 5}%,15.5%)`, '--surface-3': `hsl(${hue},${s - 5}%,19%)`,
-    '--accent': `hsl(${hue},65%,58%)`, '--accent-dim': `hsl(${hue},55%,44%)`,
-    '--accent-glow': `hsla(${hue},65%,58%,0.12)`, '--accent-glow-strong': `hsla(${hue},65%,58%,0.28)`,
-    '--text': `hsl(${hue},8%,86%)`, '--text-dim': `hsl(${hue},8%,52%)`, '--text-muted': `hsl(${hue},8%,34%)`,
-    '--border': `hsl(${hue},${s - 4}%,14%)`, '--border-hover': `hsl(${hue},${s - 2}%,24%)`,
+    '--bg-deep': `hsl(${hue},${bgS}%,${bgDeepL}%)`, '--bg': `hsl(${hue},${bgS2}%,${bgL}%)`,
+    '--surface-0': `hsl(${hue},${bgS3}%,${s0L}%)`, '--surface-1': `hsl(${hue},${bgS3}%,${s1L}%)`,
+    '--surface-2': `hsl(${hue},${bgS3}%,${s2L}%)`, '--surface-3': `hsl(${hue},${bgS3}%,${s3L}%)`,
+    '--accent': `hsl(${hue},${accentS}%,${accentL}%)`, '--accent-dim': `hsl(${hue},${accentDimS}%,${accentDimL}%)`,
+    '--accent-glow': `hsla(${hue},${accentS}%,${accentL}%,0.12)`, '--accent-glow-strong': `hsla(${hue},${accentS}%,${accentL}%,${mixF(0.28, 0.22)})`,
+    '--text': `hsl(${hue},${textS}%,${textL}%)`, '--text-dim': `hsl(${hue},${textS}%,${textDimL}%)`,
+    '--text-muted': `hsl(${hue},${textS}%,${textMutedL}%)`,
+    '--border': `hsl(${hue},${borderS}%,${borderL}%)`, '--border-hover': `hsl(${hue},${borderHoverS}%,${borderHoverL}%)`,
+    '--shadow-color': `rgba(0,0,0,${shadowA})`,
+    '--amber': `hsl(38,${mix(78,72)}%,${mix(57,42)}%)`,
+    '--red': `hsl(0,${mix(68,62)}%,${mix(56,40)}%)`,
+    '--purple': `hsl(256,${mix(82,60)}%,${mix(74,48)}%)`,
   };
 }
 
 function applyTheme(theme, hue, options = {}) {
-  const { silent = false } = options;
+  const { silent = false, vibrancy, lightness } = options;
   const el = document.documentElement;
-  const clearCustom = () => { Object.keys(generateThemeFromHue(0)).forEach(k => el.style.removeProperty(k)); };
-  clearCustom();
-  if (theme === 'custom') {
+  const clearVars = () => { Object.keys(generateThemeFromHue(0, 100, 0)).forEach(k => el.style.removeProperty(k)); };
+  const lt = lightness ?? local.lightness;
+  clearVars();
+
+  let accentHue = PRESET_HUES[theme] ?? local.customHue;
+  if (theme === 'custom' || lt > 0) {
+    const h = theme === 'custom' ? (hue ?? local.customHue) : (PRESET_HUES[theme] || 140);
+    const v = vibrancy ?? local.customVibrancy;
+    accentHue = h;
     el.setAttribute('data-theme', 'custom');
-    Object.entries(generateThemeFromHue(hue || local.customHue)).forEach(([k, v]) => el.style.setProperty(k, v));
-    local.customHue = hue || local.customHue;
+    Object.entries(generateThemeFromHue(h, v, lt)).forEach(([k, val]) => el.style.setProperty(k, val));
+    if (theme === 'custom') { local.customHue = h; local.customVibrancy = v; }
   } else {
     el.setAttribute('data-theme', theme);
   }
+
+  el.setAttribute('data-color-mode', lt >= 50 ? 'light' : 'dark');
+  local.lightness = lt;
   local.theme = theme;
   saveLocalState();
+
+  // Logo hue shift
+  el.style.setProperty('--logo-hue-shift', `${accentHue - LOGO_BASE_HUE}deg`);
+
+  // Sync lightness sliders
+  document.querySelectorAll('.lightness-slider').forEach(s => { s.value = lt; });
+
   dom.themePicker?.querySelectorAll('.theme-swatch').forEach(s => s.classList.toggle('active', s.dataset.theme === local.theme));
+
+  // Animate color field marker to preset position
+  if (theme !== 'custom' && PRESET_HUES[theme] != null) {
+    animateMarkerToHue(dom.colorField, dom.colorFieldMarker, PRESET_HUES[theme]);
+    animateMarkerToHue(dom.obColorField, dom.obColorFieldMarker, PRESET_HUES[theme]);
+  }
+
   if (!silent) Sound.ui('theme');
 }
 
-function updateHuePreview(hue, bgEl, surfaceEl, accentEl, textEl) {
-  const vars = generateThemeFromHue(hue);
-  if (bgEl) bgEl.style.background = vars['--bg-deep'];
-  if (surfaceEl) surfaceEl.style.background = vars['--surface-2'];
-  if (accentEl) accentEl.style.background = vars['--accent'];
-  if (textEl) textEl.style.background = vars['--text'];
+function animateMarkerToHue(field, marker, hue) {
+  if (!field || !marker) return;
+  marker.classList.add('animating');
+  marker.style.left = `${(hue / 360) * 100}%`;
+  marker.style.top = '0%';
+  marker.style.background = `hsl(${hue},65%,55%)`;
+  setTimeout(() => marker.classList.remove('animating'), 380);
+}
+
+// ── Shortcut UI ──
+
+function syncShortcutHints() {
+  document.querySelectorAll('[data-action]').forEach(el => {
+    const action = el.dataset.action;
+    const label = Shortcuts.format(action);
+    if (label) el.setAttribute('data-shortcut-hint', label);
+    else el.removeAttribute('data-shortcut-hint');
+  });
+}
+
+function renderShortcutEditor() {
+  if (!dom.shortcutList) return;
+  const labels = { settings: 'Settings', search: 'Search', addVersion: 'Add Version', launch: 'Launch', save: 'Save', close: 'Close' };
+  dom.shortcutList.innerHTML = Shortcuts.all().map(action => {
+    const b = Shortcuts.get(action);
+    const isCustom = !!local.shortcuts[action];
+    return `<div class="shortcut-item" data-sc-action="${action}">
+      <span class="shortcut-key shortcut-item-key" data-sc-record="${action}" title="Click to change">${esc(Shortcuts.format(action))}</span>
+      <span class="shortcut-desc">${esc(b.desc)}${isCustom ? ` <button class="shortcut-item-reset" data-sc-reset="${action}">reset</button>` : ''}</span>
+    </div>`;
+  }).join('');
+}
+
+let recordingAction = null;
+function startRecording(action) {
+  stopRecording();
+  recordingAction = action;
+  const el = dom.shortcutList?.querySelector(`[data-sc-record="${action}"]`);
+  if (el) { el.classList.add('recording'); el.textContent = 'Press keys...'; }
+}
+function stopRecording() {
+  if (!recordingAction) return;
+  const el = dom.shortcutList?.querySelector(`[data-sc-record="${recordingAction}"]`);
+  if (el) { el.classList.remove('recording'); el.textContent = Shortcuts.format(recordingAction); }
+  recordingAction = null;
+}
+function handleRecordKey(e) {
+  if (!recordingAction) return false;
+  e.preventDefault(); e.stopPropagation();
+  if (e.key === 'Escape') { stopRecording(); return true; }
+  if (['Control', 'Shift', 'Alt', 'Meta'].includes(e.key)) return true;
+  Shortcuts.set(recordingAction, { key: e.key, ctrl: e.ctrlKey, shift: e.shiftKey, alt: e.altKey, desc: Shortcuts.get(recordingAction).desc });
+  local.shortcuts = Shortcuts._custom;
+  saveLocalState();
+  stopRecording();
+  renderShortcutEditor();
+  syncShortcutHints();
+  Sound.ui('affirm');
+  return true;
+}
+
+function positionFieldMarker(field, marker, hue, vibrancy) {
+  if (!field || !marker) return;
+  marker.style.left = `${(hue / 360) * 100}%`;
+  marker.style.top = `${(1 - vibrancy / 100) * 100}%`;
+  marker.style.background = `hsl(${hue},65%,55%)`;
+}
+
+function initColorField(field, marker, onDrag, onEnd) {
+  if (!field) return;
+  let active = false;
+  function calc(e) {
+    const r = field.getBoundingClientRect();
+    const x = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
+    const y = Math.max(0, Math.min(1, (e.clientY - r.top) / r.height));
+    return { hue: Math.round(x * 360), vibrancy: Math.round((1 - y) * 100) };
+  }
+  field.addEventListener('pointerdown', (e) => {
+    active = true;
+    field.setPointerCapture(e.pointerId);
+    const c = calc(e);
+    positionFieldMarker(field, marker, c.hue, c.vibrancy);
+    onDrag(c.hue, c.vibrancy);
+  });
+  field.addEventListener('pointermove', (e) => {
+    if (!active) return;
+    const c = calc(e);
+    positionFieldMarker(field, marker, c.hue, c.vibrancy);
+    onDrag(c.hue, c.vibrancy);
+  });
+  field.addEventListener('pointerup', () => { active = false; if (onEnd) onEnd(); });
+  field.addEventListener('lostpointercapture', () => { active = false; });
 }
 
 // ── App State ──
@@ -319,14 +492,13 @@ function cacheDom() {
     'log-panel', 'log-toggle', 'log-content', 'log-lines', 'log-count',
     'settings-btn', 'settings-cancel', 'settings-save',
     'setting-java-path', 'setting-width', 'setting-height', 'java-runtimes',
-    'theme-picker', 'hue-slider', 'hue-swatch-bg', 'hue-swatch-surface', 'hue-swatch-accent', 'hue-swatch-text',
-    'apply-custom-theme', 'sounds-toggle',
+    'theme-picker', 'color-field', 'color-field-marker', 'lightness-slider', 'sounds-toggle', 'shortcut-list',
     'add-version-btn', 'catalog-modal', 'catalog-close', 'catalog-search', 'catalog-list',
     'onboarding', 'onboarding-step-1', 'onboarding-step-2', 'onboarding-step-3', 'onboarding-step-4',
     'onboarding-username', 'onboarding-ram-info', 'onboarding-memory-slider', 'onboarding-memory-value', 'onboarding-rec',
     'onboarding-next-1', 'onboarding-next-2', 'onboarding-next-3', 'onboarding-finish',
     'dot-1', 'dot-2', 'dot-3', 'dot-4',
-    'ob-theme-presets', 'ob-hue-slider', 'ob-hue-chip-bg', 'ob-hue-chip-accent', 'ob-hue-chip-text', 'ob-apply-custom',
+    'ob-theme-presets', 'ob-color-field', 'ob-color-field-marker', 'ob-lightness-slider',
     'dev-tools', 'dev-cleanup', 'dev-flush',
   ];
   ids.forEach(id => { dom[id.replace(/-([a-z0-9])/g, (_, c) => c.toUpperCase())] = document.getElementById(id); });
@@ -490,10 +662,12 @@ function renderVersionList() {
     return;
   }
 
-  dom.emptyAddBtn?.classList.add('hidden');
   if (!state.selectedVersion) {
     if (dom.emptyTitle) dom.emptyTitle.textContent = 'Select a version';
     if (dom.emptySub) dom.emptySub.textContent = 'Choose a Minecraft version from the sidebar to launch';
+    dom.emptyAddBtn?.classList.remove('hidden');
+  } else {
+    dom.emptyAddBtn?.classList.add('hidden');
   }
 
   if (filtered.length === 0) {
@@ -873,9 +1047,9 @@ function syncSettingsForm() {
     if (dom.settingHeight) dom.settingHeight.value = state.config.window_height || '';
   }
   dom.themePicker?.querySelectorAll('.theme-swatch').forEach(s => s.classList.toggle('active', s.dataset.theme === local.theme));
-  if (dom.hueSlider) dom.hueSlider.value = local.customHue;
-  updateHuePreview(local.customHue, dom.hueSwatchBg, dom.hueSwatchSurface, dom.hueSwatchAccent, dom.hueSwatchText);
+  positionFieldMarker(dom.colorField, dom.colorFieldMarker, local.customHue, local.customVibrancy);
   if (dom.soundsToggle) dom.soundsToggle.checked = Sound.enabled;
+  renderShortcutEditor();
 }
 
 async function saveSettings() {
@@ -941,10 +1115,7 @@ function showOnboarding() {
       if (dom.onboardingRec) dom.onboardingRec.textContent = text;
     }
   }
-  if (dom.obHueSlider) {
-    dom.obHueSlider.value = local.customHue;
-    updateObHuePreview(local.customHue);
-  }
+  positionFieldMarker(dom.obColorField, dom.obColorFieldMarker, local.customHue, local.customVibrancy);
 }
 
 function onboardingStep(n) {
@@ -968,12 +1139,6 @@ async function finishOnboarding() {
   dom.onboarding?.classList.add('hidden');
 }
 
-function updateObHuePreview(hue) {
-  const vars = generateThemeFromHue(hue);
-  if (dom.obHueChipBg) dom.obHueChipBg.style.background = vars['--bg-deep'];
-  if (dom.obHueChipAccent) dom.obHueChipAccent.style.background = vars['--accent'];
-  if (dom.obHueChipText) dom.obHueChipText.style.background = vars['--text'];
-}
 
 // ── Animations ──
 
@@ -1063,7 +1228,7 @@ function esc(s) {
 function fmtMem(gb) { return gb === Math.floor(gb) ? `${gb}\u00A0GB` : `${gb.toFixed(1)}\u00A0GB`; }
 
 function inferButtonSound(btn) {
-  if (btn.classList.contains('version-item') || btn.classList.contains('theme-swatch') || btn.classList.contains('ob-theme-btn') || btn.classList.contains('settings-nav-btn') || btn.id === 'apply-custom-theme' || btn.id === 'ob-apply-custom') return null;
+  if (btn.classList.contains('version-item') || btn.classList.contains('theme-swatch') || btn.classList.contains('ob-theme-btn') || btn.classList.contains('settings-nav-btn')) return null;
   if (btn.classList.contains('chip')) return 'soft';
   if (btn.id === 'launch-btn') return 'launchPress';
   if (btn.id === 'add-version-btn' || btn.id === 'empty-add-btn') return 'bright';
@@ -1097,15 +1262,16 @@ function playSliderSound(value, family) {
 
 async function init() {
   cacheDom();
-  applyTheme(local.theme, local.customHue, { silent: true });
+  applyTheme(local.theme, local.customHue, { silent: true, vibrancy: local.customVibrancy, lightness: local.lightness });
   Sound.enabled = local.sounds;
   Sound.warmup();
   if (dom.soundsToggle) dom.soundsToggle.checked = local.sounds;
   if (local.logExpanded) dom.logPanel?.classList.add('expanded');
   state.filter = local.sidebarFilter;
   $$('.filter-chips .chip[data-filter]').forEach(c => c.classList.toggle('active', c.dataset.filter === state.filter));
-  updateHuePreview(local.customHue, dom.hueSwatchBg, dom.hueSwatchSurface, dom.hueSwatchAccent, dom.hueSwatchText);
-  if (dom.hueSlider) dom.hueSlider.value = local.customHue;
+  positionFieldMarker(dom.colorField, dom.colorFieldMarker, local.customHue, local.customVibrancy);
+  syncShortcutHints();
+  renderShortcutEditor();
   setPage('launcher');
 
   try {
@@ -1222,11 +1388,34 @@ function bindEvents() {
     });
   });
   dom.themePicker?.querySelectorAll('.theme-swatch').forEach(s => s.addEventListener('click', () => applyTheme(s.dataset.theme)));
-  dom.hueSlider?.addEventListener('input', () => {
-    updateHuePreview(parseInt(dom.hueSlider.value, 10), dom.hueSwatchBg, dom.hueSwatchSurface, dom.hueSwatchAccent, dom.hueSwatchText);
-    playSliderSound(parseInt(dom.hueSlider.value, 10) / 360, 'hue');
+  initColorField(dom.colorField, dom.colorFieldMarker,
+    (hue, vibrancy) => {
+      applyTheme('custom', hue, { silent: true, vibrancy });
+      playSliderSound(hue / 360, 'hue');
+    },
+    () => Sound.ui('theme')
+  );
+  document.querySelectorAll('.lightness-slider').forEach(slider => {
+    slider.addEventListener('input', () => {
+      const lt = parseInt(slider.value, 10);
+      applyTheme(local.theme, null, { silent: true, lightness: lt });
+      playSliderSound(lt / 100, 'hue');
+    });
+    slider.addEventListener('change', () => Sound.ui('theme'));
   });
-  dom.applyCustomTheme?.addEventListener('click', () => applyTheme('custom', parseInt(dom.hueSlider?.value || 140, 10)));
+  dom.shortcutList?.addEventListener('click', (e) => {
+    const rec = e.target.closest('[data-sc-record]');
+    if (rec) { startRecording(rec.dataset.scRecord); return; }
+    const rst = e.target.closest('[data-sc-reset]');
+    if (rst) {
+      Shortcuts.reset(rst.dataset.scReset);
+      local.shortcuts = Shortcuts._custom;
+      saveLocalState();
+      renderShortcutEditor();
+      syncShortcutHints();
+      Sound.ui('soft');
+    }
+  });
   dom.soundsToggle?.addEventListener('change', () => {
     const next = dom.soundsToggle.checked;
     if (next) {
@@ -1275,14 +1464,14 @@ function bindEvents() {
       applyTheme(btn.dataset.obTheme);
     });
   });
-  dom.obHueSlider?.addEventListener('input', () => {
-    updateObHuePreview(parseInt(dom.obHueSlider.value, 10));
-    playSliderSound(parseInt(dom.obHueSlider.value, 10) / 360, 'hue');
-  });
-  dom.obApplyCustom?.addEventListener('click', () => {
-    applyTheme('custom', parseInt(dom.obHueSlider?.value || 140, 10));
-    dom.obThemePresets?.querySelectorAll('.ob-theme-btn').forEach(b => b.classList.remove('active'));
-  });
+  initColorField(dom.obColorField, dom.obColorFieldMarker,
+    (hue, vibrancy) => {
+      applyTheme('custom', hue, { silent: true, vibrancy });
+      dom.obThemePresets?.querySelectorAll('.ob-theme-btn').forEach(b => b.classList.remove('active'));
+      playSliderSound(hue / 360, 'hue');
+    },
+    () => Sound.ui('theme')
+  );
 
   dom.devCleanup?.addEventListener('click', async () => {
     if (!confirm('Remove all installed versions?\nWorlds/mods will be backed up.')) return;
@@ -1318,22 +1507,16 @@ function bindEvents() {
   });
 
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Control') {
-      toggleShortcutHints(true);
-      return;
-    }
-    if (e.key === 'F2') {
+    if (e.key === 'Control') { toggleShortcutHints(true); return; }
+    if (handleRecordKey(e)) return;
+
+    if (Shortcuts.matches(e, 'settings')) {
       e.preventDefault();
-      if (state.currentPage === 'settings') {
-        Sound.ui('soft');
-        closeSettings();
-      } else {
-        Sound.ui('theme');
-        openSettings();
-      }
+      if (state.currentPage === 'settings') { Sound.ui('soft'); closeSettings(); }
+      else { Sound.ui('theme'); openSettings(); }
       return;
     }
-    if (e.key === 'F8') {
+    if (Shortcuts.matches(e, 'addVersion')) {
       e.preventDefault();
       if (state.currentPage === 'settings') closeSettings();
       setPage('launcher');
@@ -1341,38 +1524,30 @@ function bindEvents() {
       openCatalog();
       return;
     }
-    if (e.key === 'F9') {
+    if (Shortcuts.matches(e, 'launch')) {
       e.preventDefault();
       if (state.currentPage === 'settings') closeSettings();
       setPage('launcher');
-      if (state.selectedVersion?.launchable && !state.launching && !state.gameRunning) {
-        Sound.ui('launchPress');
-        launchGame();
-      } else {
-        Sound.ui('soft');
-        dom.launchBtn?.focus();
-      }
+      if (state.selectedVersion?.launchable && !state.launching && !state.gameRunning) { Sound.ui('launchPress'); launchGame(); }
+      else { Sound.ui('soft'); dom.launchBtn?.focus(); }
       return;
     }
-    if (e.ctrlKey) {
-      const key = e.key.toLowerCase();
-      if (key === 'f') {
-        e.preventDefault();
-        if (state.currentPage === 'settings') closeSettings();
-        setPage('launcher');
-        Sound.ui('soft');
-        dom.versionSearch?.focus();
-        dom.versionSearch?.select?.();
-        return;
-      }
-      if (key === 's' && state.currentPage === 'settings') {
-        e.preventDefault();
-        Sound.ui('affirm');
-        saveSettings();
-        return;
-      }
+    if (Shortcuts.matches(e, 'search')) {
+      e.preventDefault();
+      if (state.currentPage === 'settings') closeSettings();
+      setPage('launcher');
+      Sound.ui('soft');
+      dom.versionSearch?.focus();
+      dom.versionSearch?.select?.();
+      return;
     }
-    if (e.key === 'Escape') {
+    if (Shortcuts.matches(e, 'save') && state.currentPage === 'settings') {
+      e.preventDefault();
+      Sound.ui('affirm');
+      saveSettings();
+      return;
+    }
+    if (Shortcuts.matches(e, 'close')) {
       if (!dom.catalogModal?.classList.contains('hidden')) closeCatalog();
       else if (state.currentPage === 'settings') closeSettings();
     }
