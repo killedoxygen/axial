@@ -265,14 +265,17 @@ function selectVersion(version) {
 
   if (state.gameRunning) {
     dom.runningArea.classList.remove('hidden');
-  } else if (version.status === 'incomplete') {
-    dom.installArea.classList.remove('hidden');
-    dom.installText.textContent = version.status_detail || 'Game files incomplete — click to download';
   } else if (version.launchable) {
     dom.launchArea.classList.remove('hidden');
+  } else if (version.status === 'incomplete') {
+    dom.installArea.classList.remove('hidden');
+    dom.installText.textContent = version.status_detail || 'Game files need downloading';
+    // Store which version to actually install (could be parent for modded)
+    dom.installBtn.dataset.installTarget = version.needs_install || version.id;
   } else {
     dom.installArea.classList.remove('hidden');
     dom.installText.textContent = version.status_detail || 'Game files need downloading';
+    dom.installBtn.dataset.installTarget = version.needs_install || version.id;
   }
 }
 
@@ -282,14 +285,18 @@ async function installVersion() {
   if (!state.selectedVersion || state.installing) return;
   state.installing = true;
 
+  // Use the install target (might be a parent version for modded)
+  const target = dom.installBtn.dataset.installTarget || state.selectedVersion.id;
+
   dom.installBtn.disabled = true;
   dom.installBtn.querySelector('.install-btn-text').textContent = 'INSTALLING...';
   dom.installProgress.classList.remove('hidden');
-  dom.progressText.textContent = 'Starting download...';
+  dom.progressText.textContent = target !== state.selectedVersion.id
+    ? `Installing base version ${target}...`
+    : 'Starting download...';
 
   try {
-    // Only send version_id — backend resolves the URL
-    const res = await api('POST', '/install', { version_id: state.selectedVersion.id });
+    const res = await api('POST', '/install', { version_id: target });
     if (res.error) { showError(res.error); resetInstallUI(); return; }
     connectInstallSSE(res.install_id);
   } catch (err) {

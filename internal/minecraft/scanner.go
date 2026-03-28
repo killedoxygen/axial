@@ -9,17 +9,18 @@ import (
 
 // VersionEntry is a lightweight summary of a version.
 type VersionEntry struct {
-	ID            string `json:"id"`
-	Type          string `json:"type"`
-	ReleaseTime   string `json:"release_time,omitempty"`
-	InheritsFrom  string `json:"inherits_from,omitempty"`
-	Launchable    bool   `json:"launchable"`
-	Installed     bool   `json:"installed"`
-	Status        string `json:"status"` // "ready", "not_installed", "incomplete"
-	StatusDetail  string `json:"status_detail,omitempty"`
-	JavaComponent string `json:"java_component,omitempty"`
-	JavaMajor     int    `json:"java_major,omitempty"`
-	ManifestURL   string `json:"manifest_url,omitempty"`
+	ID             string `json:"id"`
+	Type           string `json:"type"`
+	ReleaseTime    string `json:"release_time,omitempty"`
+	InheritsFrom   string `json:"inherits_from,omitempty"`
+	Launchable     bool   `json:"launchable"`
+	Installed      bool   `json:"installed"`
+	Status         string `json:"status"` // "ready", "incomplete"
+	StatusDetail   string `json:"status_detail,omitempty"`
+	NeedsInstall   string `json:"needs_install,omitempty"` // version ID to install (self or parent)
+	JavaComponent  string `json:"java_component,omitempty"`
+	JavaMajor      int    `json:"java_major,omitempty"`
+	ManifestURL    string `json:"manifest_url,omitempty"`
 }
 
 // versionStub is used for quick JSON parsing without full version resolution.
@@ -79,25 +80,32 @@ func ScanVersions(mcDir string) ([]VersionEntry, error) {
 		// Determine launch readiness
 		ready := true
 		detail := ""
+		needsInstall := ""
 
 		if stub.InheritsFrom == "" {
+			// Vanilla version: needs its own client JAR
 			if _, err := os.Stat(jarPath); os.IsNotExist(err) {
 				ready = false
 				detail = "Game files not fully downloaded"
+				needsInstall = id
 			}
 		} else {
+			// Modded version: needs the parent's client JAR
 			parentJar := filepath.Join(versionsDir, stub.InheritsFrom, stub.InheritsFrom+".jar")
 			parentJSON := filepath.Join(versionsDir, stub.InheritsFrom, stub.InheritsFrom+".json")
 			if _, err := os.Stat(parentJSON); os.IsNotExist(err) {
 				ready = false
-				detail = "Base version " + stub.InheritsFrom + " not installed"
+				detail = "Base version " + stub.InheritsFrom + " needs to be installed"
+				needsInstall = stub.InheritsFrom
 			} else if _, err := os.Stat(parentJar); os.IsNotExist(err) {
 				ready = false
-				detail = "Base version " + stub.InheritsFrom + " not fully downloaded"
+				detail = "Base version " + stub.InheritsFrom + " needs to be downloaded"
+				needsInstall = stub.InheritsFrom
 			}
 		}
 
 		ve.Launchable = ready
+		ve.NeedsInstall = needsInstall
 		if ready {
 			ve.Status = "ready"
 		} else {

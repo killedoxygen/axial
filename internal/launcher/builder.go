@@ -44,10 +44,10 @@ func BuildAndLaunch(opts LaunchOptions) (*LaunchResult, error) {
 	// Step 2: Set up environment (is_demo_user = false is the key)
 	env := minecraft.DefaultEnvironment()
 
-	// Step 3: Find Java runtime
-	javaResult, err := minecraft.FindJava(opts.MCDir, version.JavaVersion, opts.Config.JavaPathOverride)
+	// Step 3: Find or download the correct Java runtime
+	javaResult, err := minecraft.EnsureJavaRuntime(opts.MCDir, version.JavaVersion, opts.Config.JavaPathOverride)
 	if err != nil {
-		return nil, fmt.Errorf("finding java: %w", err)
+		return nil, fmt.Errorf("java runtime: %w", err)
 	}
 
 	// Step 4: Resolve libraries and build classpath
