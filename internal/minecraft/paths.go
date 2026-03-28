@@ -2,6 +2,7 @@ package minecraft
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -68,6 +69,39 @@ func LibrariesDir(mcDir string) string {
 // AssetsDir returns the path to the assets directory.
 func AssetsDir(mcDir string) string {
 	return filepath.Join(mcDir, "assets")
+}
+
+// DefaultMinecraftDir returns the default .minecraft path for the current OS
+// without checking whether it exists.
+func DefaultMinecraftDir() string {
+	switch runtime.GOOS {
+	case "windows":
+		appdata := os.Getenv("APPDATA")
+		if appdata != "" {
+			return filepath.Join(appdata, ".minecraft")
+		}
+	case "darwin":
+		home, err := os.UserHomeDir()
+		if err == nil {
+			return filepath.Join(home, "Library", "Application Support", "minecraft")
+		}
+	default:
+		home, err := os.UserHomeDir()
+		if err == nil {
+			return filepath.Join(home, ".minecraft")
+		}
+	}
+	return ""
+}
+
+// CreateMinecraftDir creates a .minecraft directory structure at the given path.
+func CreateMinecraftDir(dir string) error {
+	for _, sub := range []string{"versions", "libraries", "assets"} {
+		if err := os.MkdirAll(filepath.Join(dir, sub), 0755); err != nil {
+			return fmt.Errorf("creating %s: %w", sub, err)
+		}
+	}
+	return nil
 }
 
 // RuntimeDir returns possible paths for Java runtimes.

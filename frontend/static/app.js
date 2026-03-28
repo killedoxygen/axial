@@ -500,6 +500,8 @@ function cacheDom() {
     'dot-1', 'dot-2', 'dot-3', 'dot-4',
     'ob-theme-presets', 'ob-color-field', 'ob-color-field-marker', 'ob-lightness-slider',
     'dev-tools', 'dev-cleanup', 'dev-flush',
+    'setup-overlay', 'setup-path-input', 'setup-path-error', 'setup-browse-btn', 'setup-use-btn',
+    'setup-new-path', 'setup-init-btn',
   ];
   ids.forEach(id => { dom[id.replace(/-([a-z0-9])/g, (_, c) => c.toUpperCase())] = document.getElementById(id); });
 }
@@ -1100,6 +1102,87 @@ async function loadJavaRuntimes() {
   }
 }
 
+// ── Setup (Minecraft not found) ──
+
+function showSetup() {
+  return new Promise(async (resolve) => {
+    dom.setupOverlay?.classList.remove('hidden');
+
+    // Load the default path for the "create new" option
+    try {
+      const defaults = await api('GET', '/setup/defaults');
+      if (dom.setupNewPath) dom.setupNewPath.value = defaults.default_path || '';
+    } catch {}
+
+    function hideSetup() {
+      dom.setupOverlay?.classList.add('hidden');
+      resolve();
+    }
+
+    function showPathError(msg) {
+      if (dom.setupPathError) {
+        dom.setupPathError.textContent = msg;
+        dom.setupPathError.classList.remove('hidden');
+      }
+    }
+    function clearPathError() {
+      if (dom.setupPathError) dom.setupPathError.classList.add('hidden');
+    }
+
+    // "Use this path" flow
+    dom.setupUseBtn?.addEventListener('click', async () => {
+      clearPathError();
+      const path = dom.setupPathInput?.value.trim();
+      if (!path) { showPathError('Please enter a path'); return; }
+      dom.setupUseBtn.disabled = true;
+      dom.setupUseBtn.textContent = 'Checking...';
+      try {
+        const res = await api('POST', '/setup/set-dir', { path });
+        if (res.error) { showPathError(res.error); return; }
+        hideSetup();
+      } catch (err) {
+        showPathError(err.message || 'Failed to set directory');
+      } finally {
+        dom.setupUseBtn.disabled = false;
+        dom.setupUseBtn.textContent = 'Use this path';
+      }
+    });
+
+    // "Browse" button
+    dom.setupBrowseBtn?.addEventListener('click', async () => {
+      dom.setupBrowseBtn.disabled = true;
+      dom.setupBrowseBtn.textContent = 'Opening...';
+      try {
+        const res = await api('POST', '/setup/browse');
+        if (res.path) {
+          dom.setupPathInput.value = res.path;
+          clearPathError();
+        }
+      } catch {}
+      dom.setupBrowseBtn.disabled = false;
+      dom.setupBrowseBtn.textContent = 'Browse';
+    });
+
+    // "Create & Continue" flow
+    dom.setupInitBtn?.addEventListener('click', async () => {
+      const path = dom.setupNewPath?.value.trim();
+      if (!path) return;
+      dom.setupInitBtn.disabled = true;
+      dom.setupInitBtn.textContent = 'Creating...';
+      try {
+        const res = await api('POST', '/setup/init', { path });
+        if (res.error) { showPathError(res.error); return; }
+        hideSetup();
+      } catch (err) {
+        showPathError(err.message || 'Failed to create directory');
+      } finally {
+        dom.setupInitBtn.disabled = false;
+        dom.setupInitBtn.textContent = 'Create & Continue';
+      }
+    });
+  });
+}
+
 // ── Onboarding ──
 
 function showOnboarding() {
@@ -1275,17 +1358,24 @@ async function init() {
   setPage('launcher');
 
   try {
-    const [versionsRes, configRes, systemRes, statusRes] = await Promise.all([
-      api('GET', '/versions'),
+    const [configRes, systemRes, statusRes] = await Promise.all([
       api('GET', '/config'),
       api('GET', '/system').catch(() => null),
       api('GET', '/status').catch(() => null),
     ]);
-    state.versions = versionsRes.versions || [];
     state.config = configRes;
     state.systemInfo = systemRes;
     state.devMode = statusRes?.dev_mode === true;
     if (state.devMode && dom.devTools) dom.devTools.classList.remove('hidden');
+
+    // If Minecraft is not found, show setup screen and wait
+    if (statusRes?.setup_required) {
+      await showSetup();
+    }
+
+    // Now load versions (mcDir is guaranteed to be set)
+    const versionsRes = await api('GET', '/versions');
+    state.versions = versionsRes.versions || [];
     applyConfig(state.config);
     applySystemInfo(state.systemInfo);
     renderVersionList();

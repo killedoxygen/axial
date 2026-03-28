@@ -18,6 +18,7 @@ type Config struct {
 	WindowWidth      int               `json:"window_width,omitempty"`
 	WindowHeight     int               `json:"window_height,omitempty"`
 	OnboardingDone   bool              `json:"onboarding_done"`
+	MCDir            string            `json:"mc_dir,omitempty"`
 }
 
 var (

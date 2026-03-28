@@ -12,12 +12,27 @@ import (
 )
 
 type Server struct {
+	mu       sync.RWMutex
 	mcDir    string
 	config   *config.Config
 	sessions *SessionManager
 	installs *InstallManager
 	mux      *http.ServeMux
 	frontend fs.FS
+}
+
+// GetMCDir returns the current Minecraft directory (thread-safe).
+func (s *Server) GetMCDir() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.mcDir
+}
+
+// SetMCDir updates the Minecraft directory (thread-safe).
+func (s *Server) SetMCDir(dir string) {
+	s.mu.Lock()
+	s.mcDir = dir
+	s.mu.Unlock()
 }
 
 func NewServer(mcDir string, cfg *config.Config, frontend fs.FS) *Server {
@@ -48,6 +63,11 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/v1/install", s.handleInstall)
 	s.mux.HandleFunc("GET /api/v1/install/{id}/events", s.handleInstallEvents)
 	s.mux.HandleFunc("GET /api/v1/java", s.handleJava)
+	s.mux.HandleFunc("GET /api/v1/setup/defaults", s.handleSetupDefaults)
+	s.mux.HandleFunc("POST /api/v1/setup/validate", s.handleSetupValidate)
+	s.mux.HandleFunc("POST /api/v1/setup/set-dir", s.handleSetupSetDir)
+	s.mux.HandleFunc("POST /api/v1/setup/init", s.handleSetupInit)
+	s.mux.HandleFunc("POST /api/v1/setup/browse", s.handleSetupBrowse)
 	registerDevRoutes(s)
 	s.mux.Handle("/", http.FileServer(http.FS(s.frontend)))
 }

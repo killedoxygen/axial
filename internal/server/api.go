@@ -6,6 +6,9 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"os/exec"
+	"runtime"
+	"strings"
 	"time"
 
 	"github.com/mateoltd/croopor/internal/config"
@@ -15,12 +18,14 @@ import (
 )
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	mcDir := s.GetMCDir()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":   "ok",
-		"mc_dir":   s.mcDir,
-		"app_name": "Croopor",
-		"version":  "1.0.0",
-		"dev_mode": devMode,
+		"status":         "ok",
+		"mc_dir":         mcDir,
+		"setup_required": mcDir == "",
+		"app_name":       "Croopor",
+		"version":        "1.0.0",
+		"dev_mode":       devMode,
 	})
 }
 
@@ -38,9 +43,21 @@ func (s *Server) handleSystem(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) requireMCDir(w http.ResponseWriter) string {
+	mcDir := s.GetMCDir()
+	if mcDir == "" {
+		writeError(w, http.StatusPreconditionFailed, "minecraft directory not configured")
+	}
+	return mcDir
+}
+
 // handleVersions returns ONLY locally installed versions.
 func (s *Server) handleVersions(w http.ResponseWriter, r *http.Request) {
-	versions, err := minecraft.ScanVersions(s.mcDir)
+	mcDir := s.requireMCDir(w)
+	if mcDir == "" {
+		return
+	}
+	versions, err := minecraft.ScanVersions(mcDir)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to scan versions: "+err.Error())
 		return
@@ -50,6 +67,10 @@ func (s *Server) handleVersions(w http.ResponseWriter, r *http.Request) {
 
 // handleCatalog returns the remote Mojang version catalog for browsing/installing.
 func (s *Server) handleCatalog(w http.ResponseWriter, r *http.Request) {
+	mcDir := s.requireMCDir(w)
+	if mcDir == "" {
+		return
+	}
 	manifest, err := minecraft.FetchVersionManifest()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to fetch catalog: "+err.Error())
@@ -57,7 +78,7 @@ func (s *Server) handleCatalog(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Build a set of locally installed version IDs for marking
-	local, _ := minecraft.ScanVersions(s.mcDir)
+	local, _ := minecraft.ScanVersions(mcDir)
 	installedSet := make(map[string]bool, len(local))
 	for _, v := range local {
 		if v.Launchable {
@@ -173,12 +194,17 @@ func (s *Server) handleLaunch(w http.ResponseWriter, r *http.Request) {
 		minMem = s.config.MinMemoryMB
 	}
 
+	mcDir := s.requireMCDir(w)
+	if mcDir == "" {
+		return
+	}
+
 	result, err := launcher.BuildAndLaunch(launcher.LaunchOptions{
 		VersionID:   req.VersionID,
 		Username:    username,
 		MaxMemoryMB: maxMem,
 		MinMemoryMB: minMem,
-		MCDir:       s.mcDir,
+		MCDir:       mcDir,
 		Config:      s.config,
 	})
 	if err != nil {
@@ -251,9 +277,14 @@ func (s *Server) handleInstall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	mcDir := s.requireMCDir(w)
+	if mcDir == "" {
+		return
+	}
+
 	// manifest_url is now optional — the downloader resolves it if empty
 	installID := randomID()
-	dl := minecraft.NewDownloader(s.mcDir)
+	dl := minecraft.NewDownloader(mcDir)
 	s.installs.Add(installID, dl)
 
 	log.Printf("Starting install of %s (manifest_url=%q)", req.VersionID, req.ManifestURL)
@@ -298,7 +329,11 @@ func (s *Server) handleInstallEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleJava(w http.ResponseWriter, r *http.Request) {
-	runtimes := minecraft.ListJavaRuntimes(s.mcDir)
+	mcDir := s.requireMCDir(w)
+	if mcDir == "" {
+		return
+	}
+	runtimes := minecraft.ListJavaRuntimes(mcDir)
 	writeJSON(w, http.StatusOK, map[string]any{"runtimes": runtimes})
 }
 
@@ -306,4 +341,96 @@ func randomID() string {
 	b := make([]byte, 8)
 	rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// ── Setup handlers ──
+
+func (s *Server) handleSetupDefaults(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{
+		"default_path": minecraft.DefaultMinecraftDir(),
+		"os":           runtime.GOOS,
+	})
+}
+
+func (s *Server) handleSetupValidate(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Path string `json:"path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	if req.Path == "" {
+		writeJSON(w, http.StatusOK, map[string]any{"valid": false, "error": "path is empty"})
+		return
+	}
+	if err := minecraft.ValidateInstallation(req.Path); err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"valid": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"valid": true})
+}
+
+func (s *Server) handleSetupSetDir(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Path string `json:"path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	if err := minecraft.ValidateInstallation(req.Path); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid minecraft installation: "+err.Error())
+		return
+	}
+	s.SetMCDir(req.Path)
+	s.config.MCDir = req.Path
+	if err := config.Save(s.config); err != nil {
+		log.Printf("Warning: failed to save config: %v", err)
+	}
+	log.Printf("Minecraft directory set to: %s", req.Path)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "mc_dir": req.Path})
+}
+
+func (s *Server) handleSetupInit(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Path string `json:"path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	if req.Path == "" {
+		req.Path = minecraft.DefaultMinecraftDir()
+	}
+	if req.Path == "" {
+		writeError(w, http.StatusInternalServerError, "could not determine default minecraft path")
+		return
+	}
+	if err := minecraft.CreateMinecraftDir(req.Path); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to create directory: "+err.Error())
+		return
+	}
+	s.SetMCDir(req.Path)
+	s.config.MCDir = req.Path
+	if err := config.Save(s.config); err != nil {
+		log.Printf("Warning: failed to save config: %v", err)
+	}
+	log.Printf("Created new Minecraft directory at: %s", req.Path)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "mc_dir": req.Path})
+}
+
+func (s *Server) handleSetupBrowse(w http.ResponseWriter, r *http.Request) {
+	if runtime.GOOS != "windows" {
+		writeJSON(w, http.StatusOK, map[string]string{"path": ""})
+		return
+	}
+	cmd := exec.Command("powershell", "-NoProfile", "-Command",
+		`Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.FolderBrowserDialog; $f.Description = 'Select your .minecraft folder'; if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath }`)
+	out, err := cmd.Output()
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]string{"path": ""})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"path": strings.TrimSpace(string(out))})
 }

@@ -351,6 +351,36 @@
       </div>
     </div>
 
+    <div class="setup-overlay hidden" id="setup-overlay">
+      <div class="setup-card">
+        <img src="logo.svg" alt="Croopor" width="64" height="64" class="onboarding-logo">
+        <h1 class="onboarding-title">Minecraft Not Found</h1>
+        <p class="onboarding-sub">Croopor couldn't detect a Minecraft installation on this computer.</p>
+
+        <div class="setup-options">
+          <div class="setup-option">
+            <h3 class="setup-option-title">I have Minecraft installed</h3>
+            <p class="setup-option-sub">Point Croopor to your .minecraft folder</p>
+            <div class="setup-path-row">
+              <input type="text" id="setup-path-input" class="setting-input setup-path-input" placeholder="C:\Users\...\.minecraft" spellcheck="false" autocomplete="off">
+              <button class="btn-secondary setup-browse-btn" id="setup-browse-btn">Browse</button>
+            </div>
+            <span class="setup-error hidden" id="setup-path-error"></span>
+            <button class="btn-primary setup-action-btn" id="setup-use-btn">Use this path</button>
+          </div>
+
+          <div class="setup-divider"><span>or</span></div>
+
+          <div class="setup-option">
+            <h3 class="setup-option-title">Set up Minecraft for me</h3>
+            <p class="setup-option-sub">Create a fresh installation and download any version you want</p>
+            <input type="text" id="setup-new-path" class="setting-input setup-path-input" spellcheck="false" autocomplete="off">
+            <button class="btn-primary setup-action-btn" id="setup-init-btn">Create &amp; Continue</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <div class="onboarding-overlay hidden" id="onboarding">
       <div class="onboarding-card">
         <div class="onboarding-step" id="onboarding-step-1">

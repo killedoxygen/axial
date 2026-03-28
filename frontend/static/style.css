@@ -493,6 +493,22 @@ body.show-shortcuts .search-box[data-shortcut-hint]::after{top:7px;right:7px}
 .catalog-install-btn:disabled{opacity:.4;cursor:default}
 .catalog-installed-badge{font-size:9px;color:var(--accent-dim);font-weight:600;padding:4px 10px}
 
+/* ══════════════ SETUP ══════════════ */
+
+.setup-overlay{position:fixed;inset:0;background:var(--bg-deep);display:flex;align-items:center;justify-content:center;z-index:210;animation:fade-in .3s ease}
+.setup-card{display:flex;flex-direction:column;align-items:center;max-width:480px;width:100%;padding:36px;gap:14px;text-align:center}
+.setup-options{width:100%;display:flex;flex-direction:column;gap:18px;margin-top:10px}
+.setup-option{display:flex;flex-direction:column;align-items:center;gap:10px;padding:18px;border-radius:var(--r-lg);background:var(--surface-0);border:1px solid var(--border)}
+.setup-option-title{font-family:var(--font-sans);font-size:14px;font-weight:700;color:var(--text);margin:0}
+.setup-option-sub{font-size:11px;color:var(--text-dim);margin:0;line-height:1.5}
+.setup-path-row{display:flex;gap:6px;width:100%}
+.setup-path-input{flex:1;font-size:11px;padding:8px 10px}
+.setup-browse-btn{padding:8px 12px;font-size:11px;white-space:nowrap}
+.setup-action-btn{padding:8px 22px;font-size:12px}
+.setup-error{font-size:11px;color:var(--red);text-align:left;width:100%}
+.setup-divider{display:flex;align-items:center;gap:12px;width:100%;color:var(--text-muted);font-size:11px}
+.setup-divider::before,.setup-divider::after{content:'';flex:1;height:1px;background:var(--border)}
+
 /* ══════════════ ONBOARDING ══════════════ */
 
 .onboarding-overlay{position:fixed;inset:0;background:var(--bg-deep);display:flex;align-items:center;justify-content:center;z-index:200;animation:fade-in .3s ease}

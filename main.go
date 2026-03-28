@@ -28,21 +28,29 @@ func main() {
 		cfg = config.DefaultConfig()
 	}
 
-	// Detect Minecraft installation
+	// Detect Minecraft installation — if not found, the UI will handle setup.
 	dir := *mcDir
+	if dir == "" && cfg.MCDir != "" {
+		// Check config for a previously saved directory
+		if err := minecraft.ValidateInstallation(cfg.MCDir); err == nil {
+			dir = cfg.MCDir
+		}
+	}
 	if dir == "" {
-		dir, err = minecraft.DetectMinecraftDir()
-		if err != nil {
-			log.Fatalf("Minecraft installation not found: %v\n"+
-				"Make sure Minecraft is installed, or use --mc-dir to specify the path.", err)
+		dir, _ = minecraft.DetectMinecraftDir()
+	}
+	if dir != "" {
+		if err := minecraft.ValidateInstallation(dir); err != nil {
+			log.Printf("Invalid Minecraft installation at %s: %v", dir, err)
+			dir = ""
 		}
 	}
 
-	if err := minecraft.ValidateInstallation(dir); err != nil {
-		log.Fatalf("Invalid Minecraft installation at %s: %v", dir, err)
+	if dir != "" {
+		log.Printf("Minecraft directory: %s", dir)
+	} else {
+		log.Printf("Minecraft directory not found — setup required")
 	}
-
-	log.Printf("Minecraft directory: %s", dir)
 
 	// Set up embedded frontend filesystem
 	staticFS, err := fs.Sub(frontend.Static, "static")

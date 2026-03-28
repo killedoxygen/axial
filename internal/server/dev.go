@@ -23,7 +23,11 @@ func registerDevRoutes(s *Server) {
 
 // handleDevCleanup backs up worlds, resourcepacks, mods, then removes all versions.
 func (s *Server) handleDevCleanup(w http.ResponseWriter, r *http.Request) {
-	mcDir := s.mcDir
+	mcDir := s.GetMCDir()
+	if mcDir == "" {
+		writeError(w, http.StatusPreconditionFailed, "minecraft directory not configured")
+		return
+	}
 
 	// Create backup directory
 	backupName := fmt.Sprintf("croopor-backup-%s", time.Now().Format("20060102-150405"))
