@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 )
 
 // VersionEntry is a lightweight summary of a version.
@@ -131,8 +132,66 @@ func sortVersions(versions []VersionEntry) {
 		if ti != tj {
 			return ti < tj
 		}
-		return versions[i].ID > versions[j].ID
+		return compareVersionIDs(versions[i].ID, versions[j].ID) > 0
 	})
+}
+
+// compareVersionIDs compares two Minecraft version strings numerically.
+// Returns >0 if a should sort before b (higher/newer), <0 if after, 0 if equal.
+// Handles versions like "1.8.9", "1.21.1", "24w14a", "1.0", "b1.8.1", etc.
+func compareVersionIDs(a, b string) int {
+	partsA := splitVersionParts(a)
+	partsB := splitVersionParts(b)
+
+	n := len(partsA)
+	if len(partsB) > n {
+		n = len(partsB)
+	}
+	for i := 0; i < n; i++ {
+		var pa, pb string
+		if i < len(partsA) {
+			pa = partsA[i]
+		}
+		if i < len(partsB) {
+			pb = partsB[i]
+		}
+		na, errA := strconv.Atoi(pa)
+		nb, errB := strconv.Atoi(pb)
+		if errA == nil && errB == nil {
+			if na != nb {
+				return na - nb
+			}
+			continue
+		}
+		// Fall back to string comparison for non-numeric parts
+		if pa != pb {
+			if pa > pb {
+				return 1
+			}
+			return -1
+		}
+	}
+	return 0
+}
+
+func splitVersionParts(v string) []string {
+	// Split on "." and "-" to handle "1.21.1", "1.8.9-forge", "24w14a", etc.
+	var parts []string
+	current := ""
+	for _, c := range v {
+		if c == '.' || c == '-' {
+			if current != "" {
+				parts = append(parts, current)
+			}
+			current = ""
+		} else {
+			current += string(c)
+		}
+	}
+	if current != "" {
+		parts = append(parts, current)
+	}
+	return parts
 }
 
 func versionTypePriority(t string) int {
