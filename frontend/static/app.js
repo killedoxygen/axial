@@ -3,6 +3,31 @@
 // ═══════════════════════════════════════════
 
 const API = '/api/v1';
+const STORAGE_KEY = 'croopor_ui';
+
+// ── Local UI State (persisted to localStorage) ──
+
+const defaults = {
+  theme: 'obsidian',
+  logExpanded: false,
+  collapsedGroups: {},
+  sidebarFilter: 'all',
+};
+
+function loadLocalState() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    return raw ? { ...defaults, ...JSON.parse(raw) } : { ...defaults };
+  } catch { return { ...defaults }; }
+}
+
+function saveLocalState() {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(local)); } catch {}
+}
+
+const local = loadLocalState();
+
+// ── App State ──
 
 const state = {
   versions: [],
@@ -15,13 +40,13 @@ const state = {
   eventSource: null,
   installEventSource: null,
   logLines: 0,
-  filter: 'all',
   catalogFilter: 'release',
   search: '',
   catalogSearch: '',
   gameRunning: false,
+  runningVersionId: null,
   installing: false,
-  collapsedGroups: {},
+  launching: false,
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -40,8 +65,13 @@ const dom = {
   detailMeta: $('#detail-meta'),
   launchArea: $('#launch-area'),
   launchBtn: $('#launch-btn'),
+  launchingArea: $('#launching-area'),
+  launchAscii: $('#launch-ascii'),
   runningArea: $('#running-area'),
+  runningAscii: $('#running-ascii'),
+  runningVersion: $('#running-version'),
   runningPid: $('#running-pid'),
+  runningUptime: $('#running-uptime'),
   killBtn: $('#kill-btn'),
   notLaunchable: $('#not-launchable'),
   notLaunchableText: $('#not-launchable-text'),
@@ -69,6 +99,7 @@ const dom = {
   settingWidth: $('#setting-width'),
   settingHeight: $('#setting-height'),
   javaRuntimes: $('#java-runtimes'),
+  themePicker: $('#theme-picker'),
   addVersionBtn: $('#add-version-btn'),
   catalogModal: $('#catalog-modal'),
   catalogClose: $('#catalog-close'),
@@ -91,6 +122,18 @@ const dom = {
   devCleanup: $('#dev-cleanup'),
   devFlush: $('#dev-flush'),
 };
+
+// ── Theme ──
+
+function applyTheme(theme) {
+  document.documentElement.setAttribute('data-theme', theme);
+  local.theme = theme;
+  saveLocalState();
+  // Update active swatch
+  dom.themePicker?.querySelectorAll('.theme-swatch').forEach(s => {
+    s.classList.toggle('active', s.dataset.theme === theme);
+  });
+}
 
 // ── API ──
 
@@ -120,6 +163,16 @@ function updateMemoryRecText(val, totalGB) {
 // ── Init ──
 
 async function init() {
+  // Apply persisted local state
+  applyTheme(local.theme);
+  if (local.logExpanded) dom.logPanel.classList.add('expanded');
+
+  // Set persisted sidebar filter
+  state.filter = local.sidebarFilter;
+  $$('.filter-chips .chip[data-filter]').forEach(c => {
+    c.classList.toggle('active', c.dataset.filter === state.filter);
+  });
+
   try {
     const [versionsRes, configRes, systemRes, statusRes] = await Promise.all([
       api('GET', '/versions'),
@@ -141,7 +194,7 @@ async function init() {
   } catch (err) {
     dom.versionList.innerHTML = `<div class="loading-placeholder">
       <span style="color:var(--red)">Failed to connect</span>
-      <span style="color:var(--text-muted);font-size:11px">${err.message}</span></div>`;
+      <span style="color:var(--text-muted);font-size:10px">${err.message}</span></div>`;
   }
 }
 
@@ -204,19 +257,22 @@ function renderVersionList() {
 
   const renderGroup = (key, label, versions) => {
     if (!versions.length) return;
-    const collapsed = state.collapsedGroups[key];
-    html += `<div class="version-group-label${collapsed ? ' collapsed' : ''}" data-group="${key}">${chevronSvg}${label} <span style="opacity:0.5;font-weight:400;margin-left:2px">${versions.length}</span></div>`;
+    const collapsed = local.collapsedGroups[key];
+    html += `<div class="version-group-label${collapsed ? ' collapsed' : ''}" data-group="${key}">${chevronSvg}${label} <span style="opacity:0.4;font-weight:400;margin-left:2px">${versions.length}</span></div>`;
     html += `<div class="version-group-items${collapsed ? ' collapsed' : ''}" data-group-items="${key}">`;
     versions.forEach((v, i) => {
       const isModded = !!v.inherits_from;
       const badgeClass = isModded ? 'badge-modded' : v.type === 'release' ? 'badge-release' : v.type === 'snapshot' ? 'badge-snapshot' : 'badge-old';
       const badgeText = isModded ? 'MOD' : v.type === 'release' ? 'REL' : v.type === 'snapshot' ? 'SNAP' : v.type?.toUpperCase()?.slice(0, 4) || '?';
-      const dotClass = v.launchable ? 'ok' : 'missing';
+      const isRunning = state.gameRunning && state.runningVersionId === v.id;
+      const dotClass = isRunning ? 'running' : v.launchable ? 'ok' : 'missing';
       const dimClass = v.launchable ? '' : 'dimmed';
       const selected = state.selectedVersion?.id === v.id ? 'selected' : '';
-      html += `<div class="version-item ${dimClass} ${selected}" data-id="${v.id}" style="animation-delay:${i*20}ms">
+      const runningClass = isRunning ? 'is-running' : '';
+      html += `<div class="version-item ${dimClass} ${selected} ${runningClass}" data-id="${v.id}" style="animation-delay:${i*15}ms">
         <div class="version-dot ${dotClass}"></div>
         <span class="version-name">${esc(v.id)}</span>
+        ${isRunning ? '<span class="version-running-tag">LIVE</span>' : ''}
         <span class="version-badge ${badgeClass}">${badgeText}</span></div>`;
     });
     html += `</div>`;
@@ -238,7 +294,8 @@ function renderVersionList() {
   dom.versionList.querySelectorAll('.version-group-label').forEach(label => {
     label.addEventListener('click', () => {
       const key = label.dataset.group;
-      state.collapsedGroups[key] = !state.collapsedGroups[key];
+      local.collapsedGroups[key] = !local.collapsedGroups[key];
+      saveLocalState();
       label.classList.toggle('collapsed');
       const items = dom.versionList.querySelector(`[data-group-items="${key}"]`);
       if (items) items.classList.toggle('collapsed');
@@ -284,17 +341,19 @@ function selectVersion(version) {
   dom.launchArea.classList.add('hidden');
   dom.installArea.classList.add('hidden');
   dom.notLaunchable.classList.add('hidden');
+  dom.launchingArea.classList.add('hidden');
   dom.runningArea.classList.add('hidden');
   resetInstallUI();
 
-  if (state.gameRunning) {
+  if (state.launching && state.runningVersionId === version.id) {
+    dom.launchingArea.classList.remove('hidden');
+  } else if (state.gameRunning && state.runningVersionId === version.id) {
     dom.runningArea.classList.remove('hidden');
   } else if (version.launchable) {
     dom.launchArea.classList.remove('hidden');
   } else if (version.status === 'incomplete') {
     dom.installArea.classList.remove('hidden');
     dom.installText.textContent = version.status_detail || 'Game files need downloading';
-    // Store which version to actually install (could be parent for modded)
     dom.installBtn.dataset.installTarget = version.needs_install || version.id;
   } else {
     dom.installArea.classList.remove('hidden');
@@ -309,7 +368,6 @@ async function installVersion() {
   if (!state.selectedVersion || state.installing) return;
   state.installing = true;
 
-  // Use the install target (might be a parent version for modded)
   const target = dom.installBtn.dataset.installTarget || state.selectedVersion.id;
 
   dom.installBtn.disabled = true;
@@ -329,7 +387,6 @@ async function installVersion() {
   }
 }
 
-// Install from catalog (has manifest_url)
 async function installFromCatalog(versionId, manifestUrl) {
   if (state.installing) return;
   state.installing = true;
@@ -338,7 +395,6 @@ async function installFromCatalog(versionId, manifestUrl) {
     const res = await api('POST', '/install', { version_id: versionId, manifest_url: manifestUrl });
     if (res.error) { showError(res.error); state.installing = false; return; }
 
-    // Update catalog button to show progress
     const btn = dom.catalogList.querySelector(`[data-install-id="${versionId}"]`);
     if (btn) { btn.disabled = true; btn.textContent = 'Installing...'; }
 
@@ -357,7 +413,6 @@ function connectInstallSSE(installId, catalogVersionId) {
 
   es.addEventListener('progress', (e) => {
     const d = JSON.parse(e.data);
-    // Calculate progress percentage
     let pct = 0;
     if (d.phase === 'version_json') pct = 5;
     else if (d.phase === 'client_jar') pct = 30;
@@ -384,19 +439,16 @@ async function onInstallDone(catalogVersionId) {
   dom.progressFill.style.width = '100%';
   dom.progressText.textContent = 'Complete!';
 
-  // Refresh versions
   try {
     const res = await api('GET', '/versions');
     state.versions = res.versions || [];
     renderVersionList();
 
-    // If installed from catalog, update the catalog item
     if (catalogVersionId) {
       const btn = dom.catalogList.querySelector(`[data-install-id="${catalogVersionId}"]`);
       if (btn) { btn.outerHTML = `<span class="catalog-installed-badge">Installed</span>`; }
     }
 
-    // Re-select
     if (state.selectedVersion) {
       const updated = state.versions.find(v => v.id === state.selectedVersion.id);
       if (updated) selectVersion(updated);
@@ -443,7 +495,6 @@ function renderCatalog() {
     list = list.filter(v => v.id.toLowerCase().includes(q));
   }
 
-  // Limit to 50 entries for performance
   const display = list.slice(0, 50);
   const hasMore = list.length > 50;
 
@@ -464,9 +515,8 @@ function renderCatalog() {
       <div class="catalog-item-info"><span class="catalog-item-id">${esc(v.id)}</span><span class="catalog-item-date">${dateStr}</span></div>
       <span class="version-badge ${badgeClass}">${badgeText}</span>
       ${action}</div>`;
-  }).join('') + (hasMore ? `<div class="loading-placeholder"><span style="font-size:11px;color:var(--text-muted)">Showing 50 of ${list.length} — use search to narrow</span></div>` : '');
+  }).join('') + (hasMore ? `<div class="loading-placeholder"><span style="font-size:10px;color:var(--text-muted)">Showing 50 of ${list.length} — use search to narrow</span></div>` : '');
 
-  // Install button click handlers
   dom.catalogList.querySelectorAll('.catalog-install-btn').forEach(btn => {
     btn.addEventListener('click', () => installFromCatalog(btn.dataset.installId, btn.dataset.url));
   });
@@ -475,26 +525,49 @@ function renderCatalog() {
 // ── Launch ──
 
 async function launchGame() {
-  if (!state.selectedVersion || state.gameRunning) return;
+  if (!state.selectedVersion || state.gameRunning || state.launching) return;
   const username = dom.usernameInput.value.trim() || 'Player';
   const maxMemMB = Math.round(parseFloat(dom.memorySlider.value) * 1024);
 
-  dom.launchBtn.querySelector('.launch-btn-text').textContent = 'LAUNCHING...';
-  dom.launchBtn.disabled = true;
+  state.launching = true;
+  state.runningVersionId = state.selectedVersion.id;
+  dom.launchArea.classList.add('hidden');
+  dom.launchingArea.classList.remove('hidden');
+  startLaunchSequence();
+  renderVersionList();
 
   try {
     const res = await api('POST', '/launch', { version_id: state.selectedVersion.id, username, max_memory_mb: maxMemMB });
-    if (res.error) { showError(res.error); resetLaunchBtn(); return; }
+    if (res.error) { showError(res.error); endLaunchSequence(); resetLaunchBtn(); return; }
 
     state.activeSession = res.session_id;
-    state.gameRunning = true;
-    dom.launchArea.classList.add('hidden');
-    dom.runningArea.classList.remove('hidden');
-    dom.runningPid.textContent = `PID ${res.pid}`;
+
+    setTimeout(() => {
+      state.launching = false;
+      state.gameRunning = true;
+      endLaunchSequence();
+      dom.launchingArea.classList.add('hidden');
+      dom.runningArea.classList.remove('hidden');
+      dom.runningVersion.textContent = state.selectedVersion?.id || '';
+      dom.runningPid.textContent = `PID ${res.pid}`;
+      startRunningAnimation();
+      startUptime();
+      renderVersionList();
+    }, 1800);
+
     dom.logPanel.classList.add('expanded');
     connectLaunchSSE(res.session_id);
     api('PUT', '/config', { username, max_memory_mb: maxMemMB, last_version_id: state.selectedVersion.id });
-  } catch (err) { showError(err.message); resetLaunchBtn(); }
+  } catch (err) {
+    showError(err.message);
+    endLaunchSequence();
+    state.launching = false;
+    state.runningVersionId = null;
+    dom.launchingArea.classList.add('hidden');
+    dom.launchArea.classList.remove('hidden');
+    resetLaunchBtn();
+    renderVersionList();
+  }
 }
 
 function resetLaunchBtn() {
@@ -513,11 +586,17 @@ function connectLaunchSSE(sessionId) {
 
 function onGameExited(exitCode) {
   state.gameRunning = false;
+  state.launching = false;
+  state.runningVersionId = null;
   state.activeSession = null;
   if (state.eventSource) { state.eventSource.close(); state.eventSource = null; }
+  stopRunningAnimation();
+  stopUptime();
   dom.runningArea.classList.add('hidden');
+  dom.launchingArea.classList.add('hidden');
   if (state.selectedVersion?.launchable) { dom.launchArea.classList.remove('hidden'); resetLaunchBtn(); }
   appendLog('system', `Game exited with code ${exitCode}`);
+  renderVersionList();
 }
 
 async function killGame() {
@@ -546,8 +625,13 @@ function openSettings() {
     dom.settingWidth.value = state.config.window_width || '';
     dom.settingHeight.value = state.config.window_height || '';
   }
+  // Mark active theme swatch
+  dom.themePicker?.querySelectorAll('.theme-swatch').forEach(s => {
+    s.classList.toggle('active', s.dataset.theme === local.theme);
+  });
   loadJavaRuntimes();
 }
+
 function closeSettings() { dom.settingsModal.classList.add('hidden'); }
 
 async function saveSettings() {
@@ -602,6 +686,111 @@ async function finishOnboarding() {
   dom.onboarding.classList.add('hidden');
 }
 
+// ── Launch Sequence Animation ──
+
+const LAUNCH_FRAMES = [
+  [
+    '  ┌──────────┐  ',
+    '  │ ▓▓▓▓▓▓▓▓ │  ',
+    '  │ ▓▓    ▓▓ │  ',
+    '  │ ▓▓    ▓▓ │  ',
+    '  │ ▓▓▓▓▓▓▓▓ │  ',
+    '  └──────────┘  ',
+  ],
+  [
+    '  ┌──────────┐  ',
+    '  │ ░▓▓▓▓▓▓░ │  ',
+    '  │ ▓░░  ░░▓ │  ',
+    '  │ ▓░░  ░░▓ │  ',
+    '  │ ░▓▓▓▓▓▓░ │  ',
+    '  └──────────┘  ',
+  ],
+  [
+    '  ┌──────────┐  ',
+    '  │ ░░▓▓▓▓░░ │  ',
+    '  │ ░▓▓  ▓▓░ │  ',
+    '  │ ░▓▓  ▓▓░ │  ',
+    '  │ ░░▓▓▓▓░░ │  ',
+    '  └──────────┘  ',
+  ],
+  [
+    '  ╔══════════╗  ',
+    '  ║ ▓▓▓▓▓▓▓▓ ║  ',
+    '  ║ ▓▓ ◆◆ ▓▓ ║  ',
+    '  ║ ▓▓ ◆◆ ▓▓ ║  ',
+    '  ║ ▓▓▓▓▓▓▓▓ ║  ',
+    '  ╚══════════╝  ',
+  ],
+  [
+    '  ╔══════════╗  ',
+    '  ║ ████████ ║  ',
+    '  ║ ██ ◈◈ ██ ║  ',
+    '  ║ ██ ◈◈ ██ ║  ',
+    '  ║ ████████ ║  ',
+    '  ╚══════════╝  ',
+  ],
+];
+
+let launchSeqInterval = null;
+let launchSeqFrame = 0;
+
+function startLaunchSequence() {
+  launchSeqFrame = 0;
+  if (dom.launchAscii) dom.launchAscii.textContent = LAUNCH_FRAMES[0].join('\n');
+  launchSeqInterval = setInterval(() => {
+    launchSeqFrame = (launchSeqFrame + 1) % LAUNCH_FRAMES.length;
+    if (dom.launchAscii) dom.launchAscii.textContent = LAUNCH_FRAMES[launchSeqFrame].join('\n');
+  }, 350);
+}
+
+function endLaunchSequence() {
+  if (launchSeqInterval) { clearInterval(launchSeqInterval); launchSeqInterval = null; }
+}
+
+// ── Running ASCII Animation ──
+
+let runningAnimInterval = null;
+
+const RUNNING_FRAMES = [
+  ['╭─────╮', '│ ◈ ◈ │', '│  ▽  │', '╰─────╯'],
+  ['╭─────╮', '│ ◇ ◇ │', '│  △  │', '╰─────╯'],
+  ['╭─────╮', '│ ◆ ◆ │', '│  ▽  │', '╰─────╯'],
+  ['╭─────╮', '│ ◇ ◇ │', '│  ○  │', '╰─────╯'],
+];
+
+function startRunningAnimation() {
+  if (!dom.runningAscii) return;
+  let frame = 0;
+  dom.runningAscii.textContent = RUNNING_FRAMES[0].join('\n');
+  runningAnimInterval = setInterval(() => {
+    frame = (frame + 1) % RUNNING_FRAMES.length;
+    dom.runningAscii.textContent = RUNNING_FRAMES[frame].join('\n');
+  }, 800);
+}
+
+function stopRunningAnimation() {
+  if (runningAnimInterval) { clearInterval(runningAnimInterval); runningAnimInterval = null; }
+}
+
+// ── Uptime Counter ──
+
+let uptimeInterval = null;
+let uptimeStart = 0;
+
+function startUptime() {
+  uptimeStart = Date.now();
+  uptimeInterval = setInterval(() => {
+    const elapsed = Math.floor((Date.now() - uptimeStart) / 1000);
+    const m = Math.floor(elapsed / 60);
+    const s = elapsed % 60;
+    if (dom.runningUptime) dom.runningUptime.textContent = `${m}:${s.toString().padStart(2, '0')}`;
+  }, 1000);
+}
+
+function stopUptime() {
+  if (uptimeInterval) { clearInterval(uptimeInterval); uptimeInterval = null; }
+}
+
 // ── Utilities ──
 
 function showError(msg) { appendLog('stderr', `ERROR: ${msg}`); dom.logPanel.classList.add('expanded'); }
@@ -617,6 +806,8 @@ $$('.filter-chips .chip[data-filter]').forEach(chip => {
     chip.parentElement.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
     chip.classList.add('active');
     state.filter = chip.dataset.filter;
+    local.sidebarFilter = state.filter;
+    saveLocalState();
     renderVersionList();
   });
 });
@@ -635,7 +826,12 @@ dom.usernameInput.addEventListener('blur', () => {
 dom.launchBtn.addEventListener('click', launchGame);
 dom.installBtn.addEventListener('click', installVersion);
 dom.killBtn.addEventListener('click', killGame);
-dom.logToggle.addEventListener('click', () => dom.logPanel.classList.toggle('expanded'));
+
+dom.logToggle.addEventListener('click', () => {
+  dom.logPanel.classList.toggle('expanded');
+  local.logExpanded = dom.logPanel.classList.contains('expanded');
+  saveLocalState();
+});
 
 // Settings
 dom.settingsBtn.addEventListener('click', openSettings);
@@ -643,6 +839,11 @@ dom.settingsClose.addEventListener('click', closeSettings);
 dom.settingsCancel.addEventListener('click', closeSettings);
 dom.settingsSave.addEventListener('click', saveSettings);
 dom.settingsModal.addEventListener('click', (e) => { if (e.target === dom.settingsModal) closeSettings(); });
+
+// Theme picker
+dom.themePicker?.querySelectorAll('.theme-swatch').forEach(swatch => {
+  swatch.addEventListener('click', () => applyTheme(swatch.dataset.theme));
+});
 
 // Catalog
 dom.addVersionBtn.addEventListener('click', openCatalog);
@@ -702,6 +903,7 @@ if (dom.devFlush) dom.devFlush.addEventListener('click', async () => {
   if (!confirm('This will delete all Croopor settings and cached runtimes.\nThe app will restart from the onboarding screen.\n\nContinue?')) return;
   try {
     await api('POST', '/dev/flush');
+    localStorage.removeItem(STORAGE_KEY);
     location.reload();
   } catch (err) { showError(err.message); }
 });

@@ -31,7 +31,7 @@ GOOS=windows GOARCH=amd64 go build -ldflags="-s -w -H windowsgui" -o croopor.exe
 Development build (with dev tools for cleanup/flush):
 
 ```
-go build -tags dev -o croopor.exe .
+GOOS=windows GOARCH=amd64 go build -tags dev -o croopor.exe .
 ```
 
 The dev build adds a "Developer Tools" section in Settings with options to wipe all installed versions (with automatic backup of worlds, mods, and resource packs) and to flush all program data back to the onboarding state. These features are excluded from production binaries entirely via build tags.
