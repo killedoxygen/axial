@@ -3,6 +3,7 @@ package launcher
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -57,7 +58,7 @@ func BuildAndLaunch(opts LaunchOptions) (*LaunchResult, error) {
 	}
 
 	// Step 5: Determine client JAR path
-	clientJarPath := findClientJar(opts.MCDir, version)
+	clientJarPath := findClientJar(opts.MCDir, version, opts.VersionID)
 
 	classpath := minecraft.BuildClasspath(libs, clientJarPath)
 
@@ -170,24 +171,39 @@ func BuildAndLaunch(opts LaunchOptions) (*LaunchResult, error) {
 	return result, nil
 }
 
-func findClientJar(mcDir string, v *minecraft.VersionJSON) string {
-	// For modded versions, the client JAR comes from the parent (vanilla) version
-	versionID := v.ID
+func findClientJar(mcDir string, v *minecraft.VersionJSON, originalVersionID string) string {
+	versionsDir := minecraft.VersionsDir(mcDir)
 
-	// Check if there's a JAR matching the version ID
-	jarPath := filepath.Join(minecraft.VersionsDir(mcDir), versionID, versionID+".jar")
+	// Check the version's own directory first
+	jarPath := filepath.Join(versionsDir, v.ID, v.ID+".jar")
 	if _, err := os.Stat(jarPath); err == nil {
 		return jarPath
 	}
 
-	// For versions with inheritsFrom that was already merged, try the original parent
-	// The ID in a merged version is the child's ID. The parent's JAR might have a different name.
-	// Try common patterns
-	entries, err := os.ReadDir(filepath.Join(minecraft.VersionsDir(mcDir), versionID))
+	// For modded versions (Fabric/Forge/NeoForge), the client JAR lives in the
+	// parent vanilla version's directory. Load the original (unmerged) version
+	// JSON to find the inheritsFrom field.
+	if originalVersionID != "" {
+		origJSON := filepath.Join(versionsDir, originalVersionID, originalVersionID+".json")
+		if data, err := os.ReadFile(origJSON); err == nil {
+			var stub struct {
+				InheritsFrom string `json:"inheritsFrom"`
+			}
+			if json.Unmarshal(data, &stub) == nil && stub.InheritsFrom != "" {
+				parentJar := filepath.Join(versionsDir, stub.InheritsFrom, stub.InheritsFrom+".jar")
+				if _, err := os.Stat(parentJar); err == nil {
+					return parentJar
+				}
+			}
+		}
+	}
+
+	// Last resort: scan the version directory for any .jar
+	entries, err := os.ReadDir(filepath.Join(versionsDir, v.ID))
 	if err == nil {
 		for _, e := range entries {
 			if filepath.Ext(e.Name()) == ".jar" {
-				return filepath.Join(minecraft.VersionsDir(mcDir), versionID, e.Name())
+				return filepath.Join(versionsDir, v.ID, e.Name())
 			}
 		}
 	}

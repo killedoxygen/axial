@@ -268,6 +268,10 @@ const scrambleTimers = new Map();
 function scrambleText(el, text, duration) {
   if (!el) return;
   if (scrambleTimers.has(el)) clearInterval(scrambleTimers.get(el));
+  // Set final text first to measure layout, then animate
+  el.textContent = text;
+  const finalHeight = el.offsetHeight;
+  el.style.minHeight = finalHeight + 'px';
   const steps = 7;
   const interval = (duration || 280) / steps;
   let step = 0;
@@ -281,7 +285,7 @@ function scrambleText(el, text, duration) {
       else out += SCRAMBLE_CHARS[Math.floor(Math.random() * SCRAMBLE_CHARS.length)];
     }
     el.textContent = out;
-    if (step >= steps) { clearInterval(id); scrambleTimers.delete(el); el.textContent = text; }
+    if (step >= steps) { clearInterval(id); scrambleTimers.delete(el); el.textContent = text; el.style.minHeight = ''; }
   }, interval);
   scrambleTimers.set(el, id);
 }
@@ -649,6 +653,38 @@ function refreshSelectedVersionActionState() {
 }
 
 // ══════════════════════════════════════════
+// VERSION WATCHER (detect third-party installs)
+// ══════════════════════════════════════════
+
+function watchVersions() {
+  if (state.versionWatcher) state.versionWatcher.close();
+  const es = new EventSource(`${API}/versions/watch`);
+  state.versionWatcher = es;
+  es.addEventListener('versions_changed', (e) => {
+    try {
+      const d = JSON.parse(e.data);
+      const newVersions = d.versions || [];
+      state.versions = newVersions;
+      renderVersionList();
+      // Update selected version if it's still in the list
+      if (state.selectedVersion) {
+        const updated = newVersions.find(v => v.id === state.selectedVersion.id);
+        if (updated) {
+          state.selectedVersion = updated;
+          renderSelectedVersion();
+        }
+      }
+    } catch {}
+  });
+  es.onerror = () => {
+    // Reconnect after a delay if connection drops
+    es.close();
+    state.versionWatcher = null;
+    setTimeout(watchVersions, 5000);
+  };
+}
+
+// ══════════════════════════════════════════
 // SIDEBAR
 // ══════════════════════════════════════════
 
@@ -791,21 +827,72 @@ function connectInstallSSE(installId, catalogVersionId) {
   if (state.installEventSource) state.installEventSource.close();
   const es = new EventSource(`${API}/install/${installId}/events`);
   state.installEventSource = es;
+  const installTarget = dom.installBtn?.dataset.installTarget || state.selectedVersion?.id;
+  const startTime = Date.now();
+
+  // Show sidebar progress bar immediately
+  updateSidebarProgress(installTarget, 0);
+
   es.addEventListener('progress', (e) => {
     const d = JSON.parse(e.data);
     let pct = 0;
-    if (d.phase === 'version_json') pct = 5;
-    else if (d.phase === 'client_jar') pct = 30;
-    else if (d.phase === 'libraries' && d.total > 0) pct = 30 + Math.round((d.current / d.total) * 65);
-    else if (d.phase === 'done') pct = 100;
-    else if (d.phase === 'error') { showError(d.error); onInstallDone(catalogVersionId); return; }
-    if (dom.progressFill) dom.progressFill.style.width = pct + '%';
-    if (dom.progressText) {
-      dom.progressText.textContent = d.phase === 'done' ? 'Complete!' : d.phase === 'libraries' ? `Libraries (${d.current}/${d.total})` : d.phase === 'client_jar' ? 'Downloading game...' : d.phase === 'version_json' ? 'Fetching version info...' : d.phase;
+    let label = '';
+
+    // Phase weights: version_json=2%, client_jar=5%, libraries=13%, asset_index=1%, assets=72%, log_config=1%
+    if (d.phase === 'version_json') {
+      pct = 2; label = 'Fetching version info...';
+    } else if (d.phase === 'client_jar') {
+      pct = 7; label = 'Downloading game JAR...';
+    } else if (d.phase === 'libraries') {
+      const libPct = d.total > 0 ? d.current / d.total : 0;
+      pct = 7 + Math.round(libPct * 13);
+      label = `Libraries (${d.current}/${d.total})`;
+    } else if (d.phase === 'asset_index') {
+      pct = 21; label = 'Downloading asset index...';
+    } else if (d.phase === 'assets') {
+      const assetPct = d.total > 0 ? d.current / d.total : 0;
+      pct = 21 + Math.round(assetPct * 72);
+      label = `Assets (${d.current}/${d.total})`;
+    } else if (d.phase === 'log_config') {
+      pct = 94; label = 'Downloading log config...';
+    } else if (d.phase === 'done') {
+      pct = 100; label = 'Complete!';
+    } else if (d.phase === 'error') {
+      showError(d.error); updateSidebarProgress(installTarget, -1); onInstallDone(catalogVersionId); return;
     }
+
+    // ETA calculation
+    if (pct > 5 && pct < 100) {
+      const elapsed = (Date.now() - startTime) / 1000;
+      const remaining = (elapsed / pct) * (100 - pct);
+      if (remaining < 60) label += ` — ~${Math.ceil(remaining)}s left`;
+      else label += ` — ~${Math.ceil(remaining / 60)}m left`;
+    }
+
+    if (dom.progressFill) dom.progressFill.style.width = pct + '%';
+    if (dom.progressText) dom.progressText.textContent = label;
+    updateSidebarProgress(installTarget, pct);
+
     if (d.done) onInstallDone(catalogVersionId);
   });
-  es.onerror = () => { if (state.installing) onInstallDone(catalogVersionId); };
+  es.onerror = () => { if (state.installing) { updateSidebarProgress(installTarget, -1); onInstallDone(catalogVersionId); } };
+}
+
+function updateSidebarProgress(versionId, pct) {
+  if (!versionId) return;
+  const el = dom.versionList?.querySelector(`.version-item[data-id="${CSS.escape(versionId)}"]`);
+  if (!el) return;
+  let bar = el.querySelector('.version-install-bar');
+  if (pct < 0) { if (bar) bar.remove(); return; }
+  if (!bar) {
+    bar = document.createElement('div');
+    bar.className = 'version-install-bar';
+    bar.innerHTML = '<div class="version-install-fill"></div>';
+    el.appendChild(bar);
+  }
+  const fill = bar.querySelector('.version-install-fill');
+  if (fill) fill.style.width = pct + '%';
+  if (pct >= 100) setTimeout(() => bar.remove(), 1500);
 }
 
 async function onInstallDone(catalogVersionId) {
@@ -1367,6 +1454,8 @@ async function init() {
     state.systemInfo = systemRes;
     state.devMode = statusRes?.dev_mode === true;
     if (state.devMode && dom.devTools) dom.devTools.classList.remove('hidden');
+    const advancedSection = document.getElementById('settings-section-advanced');
+    if (advancedSection) advancedSection.classList.toggle('hidden', !state.devMode);
 
     // If Minecraft is not found, show setup screen and wait
     if (statusRes?.setup_required) {
@@ -1384,6 +1473,7 @@ async function init() {
       if (remembered) selectVersion(remembered, { silent: true });
     }
     if (state.config && !state.config.onboarding_done) showOnboarding();
+    watchVersions();
   } catch (err) {
     if (dom.versionList) dom.versionList.innerHTML = `<div class="loading-placeholder"><span style="color:var(--red)">Failed to connect</span><span style="color:var(--text-muted);font-size:10px">${err.message}</span></div>`;
   }

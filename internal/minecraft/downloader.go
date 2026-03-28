@@ -148,6 +148,9 @@ func (d *Downloader) InstallVersion(versionID, manifestURL string) {
 		}
 	}
 
+	// Ensure launcher_profiles.json exists for mod loader compatibility
+	EnsureLauncherProfiles(d.MCDir, versionID)
+
 	d.send(DownloadProgress{Phase: "done", Current: 1, Total: 1, Done: true})
 }
 

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"os"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -388,6 +389,8 @@ func (s *Server) handleSetupSetDir(w http.ResponseWriter, r *http.Request) {
 	if err := config.Save(s.config); err != nil {
 		log.Printf("Warning: failed to save config: %v", err)
 	}
+	// Ensure launcher_profiles.json exists for mod loader compatibility
+	minecraft.EnsureLauncherProfiles(req.Path, "")
 	log.Printf("Minecraft directory set to: %s", req.Path)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "mc_dir": req.Path})
 }
@@ -411,6 +414,8 @@ func (s *Server) handleSetupInit(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to create directory: "+err.Error())
 		return
 	}
+	// Create launcher_profiles.json for mod loader compatibility
+	minecraft.EnsureLauncherProfiles(req.Path, "")
 	s.SetMCDir(req.Path)
 	s.config.MCDir = req.Path
 	if err := config.Save(s.config); err != nil {
@@ -433,4 +438,76 @@ func (s *Server) handleSetupBrowse(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"path": strings.TrimSpace(string(out))})
+}
+
+// handleVersionWatch is an SSE endpoint that detects new versions added by
+// third-party tools (Fabric/Forge/NeoForge installers) and pushes updates.
+// Designed for low-end devices: uses a single Stat call on the versions/
+// directory per tick instead of scanning every subdirectory.
+func (s *Server) handleVersionWatch(w http.ResponseWriter, r *http.Request) {
+	mcDir := s.GetMCDir()
+	if mcDir == "" {
+		writeError(w, http.StatusBadRequest, "minecraft directory not configured")
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "streaming not supported")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	ctx := r.Context()
+	lastMod := dirModTime(minecraft.VersionsDir(mcDir))
+	lastCount := dirCount(minecraft.VersionsDir(mcDir))
+
+	// 5s is plenty — mod loaders take seconds to install, users won't
+	// notice a few seconds delay. Costs 1 Stat syscall per tick.
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			dir := minecraft.VersionsDir(s.GetMCDir())
+			mod := dirModTime(dir)
+			count := dirCount(dir)
+			if mod == lastMod && count == lastCount {
+				continue
+			}
+			lastMod = mod
+			lastCount = count
+			versions, err := minecraft.ScanVersions(s.GetMCDir())
+			if err != nil {
+				continue
+			}
+			sendSSE(w, flusher, "versions_changed", map[string]any{"versions": versions})
+		}
+	}
+}
+
+// dirModTime returns the modification time of a directory (1 syscall).
+// On most filesystems, this changes when entries are added or removed.
+func dirModTime(path string) int64 {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	return info.ModTime().UnixNano()
+}
+
+// dirCount returns the number of entries in a directory.
+// Used as a fallback for filesystems where dir mtime doesn't update reliably.
+func dirCount(path string) int {
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return -1
+	}
+	return len(entries)
 }

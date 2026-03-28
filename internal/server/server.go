@@ -52,6 +52,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/v1/status", s.handleStatus)
 	s.mux.HandleFunc("GET /api/v1/system", s.handleSystem)
 	s.mux.HandleFunc("GET /api/v1/versions", s.handleVersions)
+	s.mux.HandleFunc("GET /api/v1/versions/watch", s.handleVersionWatch)
 	s.mux.HandleFunc("GET /api/v1/catalog", s.handleCatalog)
 	s.mux.HandleFunc("GET /api/v1/config", s.handleGetConfig)
 	s.mux.HandleFunc("PUT /api/v1/config", s.handleUpdateConfig)

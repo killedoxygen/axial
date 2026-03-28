@@ -155,7 +155,7 @@ input[type="range"]::-moz-range-thumb{width:13px;height:13px;border-radius:50%;b
 
 .version-item{
   display:flex;align-items:center;gap:7px;padding:6px 9px;border-radius:var(--r-sm);cursor:pointer;transition:background .12s;
-  position:relative;animation:slide-up .15s ease both;width:100%;border:none;background:transparent;font-family:inherit;text-align:left;
+  position:relative;overflow:hidden;animation:slide-up .15s ease both;width:100%;border:none;background:transparent;font-family:inherit;text-align:left;
 }
 .version-item:hover{background:var(--surface-1)}
 .version-item:focus-visible{outline:1px solid color-mix(in srgb,var(--accent) 60%,transparent);box-shadow:0 0 0 2px var(--accent-glow)}
@@ -177,6 +177,9 @@ input[type="range"]::-moz-range-thumb{width:13px;height:13px;border-radius:50%;b
 .version-running-tag{font-size:7px;font-weight:700;letter-spacing:.1em;color:var(--accent);background:color-mix(in srgb,var(--accent) 10%,transparent);padding:1px 4px;border-radius:3px;animation:tag-pulse 2s ease-in-out infinite}
 @keyframes dot-breathe{0%,100%{box-shadow:0 0 4px var(--accent-glow)}50%{box-shadow:0 0 10px var(--accent-glow-strong)}}
 @keyframes tag-pulse{0%,100%{opacity:1}50%{opacity:.6}}
+
+.version-install-bar{position:absolute;bottom:0;left:0;right:0;height:2px;background:var(--surface-3);border-radius:0 0 var(--r-sm) var(--r-sm);overflow:hidden}
+.version-install-fill{height:100%;background:linear-gradient(90deg,var(--accent-dim),var(--accent));width:0%;transition:width .4s ease}
 
 .loading-placeholder{display:flex;flex-direction:column;align-items:center;gap:12px;padding:40px 20px;color:var(--text-muted);font-size:11px}
 .spinner{width:18px;height:18px;border:2px solid var(--surface-3);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}
@@ -220,9 +223,10 @@ input[type="range"]::-moz-range-thumb{width:13px;height:13px;border-radius:50%;b
   display:flex;flex-direction:column;align-items:center;gap:18px;
   position:relative;max-width:540px;width:100%;
 }
-.detail-header{display:flex;align-items:flex-end;gap:12px;margin-bottom:2px}
+.detail-header{display:flex;align-items:flex-end;gap:12px;margin-bottom:2px;width:100%;justify-content:center;flex-wrap:wrap}
 .detail-id{
-  font-family:var(--font-sans);font-size:40px;font-weight:800;letter-spacing:-.05em;color:var(--text);line-height:.95;
+  font-family:var(--font-sans);font-size:clamp(20px,5vw,40px);font-weight:800;letter-spacing:-.05em;color:var(--text);line-height:1;
+  text-align:center;word-break:break-word;overflow-wrap:break-word;
 }
 .detail-badge{
   font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;padding:3px 9px;border-radius:var(--r-sm);
@@ -258,7 +262,7 @@ input[type="range"]::-moz-range-thumb{width:13px;height:13px;border-radius:50%;b
 .install-btn:hover{transform:translateY(-1px);opacity:.9}
 .install-btn:active{transform:translateY(1px)}
 .install-btn:disabled{opacity:.5;cursor:default;transform:none}
-.install-progress{max-width:320px;display:flex;flex-direction:column;gap:8px;padding:14px;background:var(--surface-1);border:1px solid var(--border);border-radius:var(--r-md);position:relative;overflow:hidden;margin-top:10px}
+.install-progress{max-width:320px;width:100%;display:flex;flex-direction:column;gap:8px;padding:14px;background:var(--surface-1);border:1px solid var(--border);border-radius:var(--r-md);position:relative;overflow:hidden;margin-top:10px}
 .install-progress::before{content:'';position:absolute;top:0;left:-100%;width:100%;height:100%;background:linear-gradient(90deg,transparent,color-mix(in srgb,var(--accent) 3%,transparent),transparent);animation:shimmer 2s ease-in-out infinite}
 @keyframes shimmer{0%{left:-100%}100%{left:100%}}
 .progress-bar{width:100%;height:5px;background:var(--surface-3);border-radius:3px;overflow:hidden;position:relative}
@@ -269,7 +273,8 @@ input[type="range"]::-moz-range-thumb{width:13px;height:13px;border-radius:50%;b
 @keyframes text-fade{0%,100%{opacity:1}50%{opacity:.6}}
 
 /* ── Launching ── */
-#launching-area,#running-area,#install-area,#not-launchable{width:100%;display:flex;justify-content:center}
+#launching-area,#running-area,#not-launchable{width:100%;display:flex;justify-content:center}
+#install-area{width:100%;display:flex;flex-direction:column;align-items:center}
 .launch-sequence{
   width:min(100%,560px);display:flex;flex-direction:column;align-items:center;gap:14px;padding:8px 6px 0;
   animation:fade-in .3s ease;
