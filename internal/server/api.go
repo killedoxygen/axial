@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/mateoltd/mc-paralauncher/internal/config"
 	"github.com/mateoltd/mc-paralauncher/internal/launcher"
@@ -186,14 +187,21 @@ func (s *Server) handleLaunch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.sessions.Add(result)
+	if s.config.LastLaunched == nil {
+		s.config.LastLaunched = map[string]string{}
+	}
+	launchedAt := time.Now().UTC().Format(time.RFC3339)
 	s.config.LastVersionID = req.VersionID
 	s.config.Username = username
+	s.config.MaxMemoryMB = maxMem
+	s.config.LastLaunched[req.VersionID] = launchedAt
 	config.Save(s.config)
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":     "launching",
-		"session_id": result.SessionID,
-		"pid":        result.Process.PID(),
+		"status":      "launching",
+		"session_id":  result.SessionID,
+		"pid":         result.Process.PID(),
+		"launched_at": launchedAt,
 	})
 }
 

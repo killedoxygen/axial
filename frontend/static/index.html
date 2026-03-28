@@ -12,7 +12,6 @@
 </head>
 <body>
   <div id="app">
-    <!-- Top Bar -->
     <header class="topbar">
       <div class="topbar-left">
         <div class="logo">
@@ -32,130 +31,306 @@
           <div class="memory-control">
             <input type="range" id="memory-slider" min="1" max="16" step="0.5" value="4">
             <span id="memory-value" class="memory-value">4 GB</span>
-            <span id="memory-rec" class="memory-rec"></span>
+            <span id="memory-rec" class="memory-rec" aria-live="polite"></span>
           </div>
         </div>
       </div>
       <div class="topbar-right">
-        <button class="icon-btn" id="settings-btn" title="Settings">
+        <button class="icon-btn" id="settings-btn" title="Settings" aria-label="Open settings" data-shortcut="F2">
           <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
-            <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+            <circle cx="12" cy="12" r="3"></circle>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
           </svg>
         </button>
       </div>
     </header>
 
-    <!-- Main Content -->
     <div class="main">
-      <!-- Sidebar: Version List -->
       <aside class="sidebar">
-        <div class="sidebar-header">
-          <div class="search-box">
-            <svg class="search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
-            <input type="text" id="version-search" class="search-input" placeholder="Search versions..." spellcheck="false">
+        <div class="sidebar-launcher-panel" id="sidebar-launcher-panel">
+          <div class="sidebar-header">
+            <div class="search-box" data-shortcut="Ctrl+F">
+              <svg class="search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></svg>
+              <input type="text" id="version-search" class="search-input" placeholder="Search versions..." spellcheck="false" aria-label="Search installed versions">
+            </div>
+            <div class="filter-chips">
+              <button class="chip active" data-filter="all">All</button>
+              <button class="chip" data-filter="release">Release</button>
+              <button class="chip" data-filter="snapshot">Snapshot</button>
+              <button class="chip" data-filter="modded">Modded</button>
+            </div>
           </div>
-          <div class="filter-chips">
-            <button class="chip active" data-filter="all">All</button>
-            <button class="chip" data-filter="release">Release</button>
-            <button class="chip" data-filter="snapshot">Snapshot</button>
-            <button class="chip" data-filter="modded">Modded</button>
+          <div class="version-list" id="version-list" data-shortcut="Tab" aria-label="Installed versions">
+            <div class="loading-placeholder">
+              <div class="spinner"></div>
+              <span>Scanning versions...</span>
+            </div>
+          </div>
+          <button class="add-version-btn" id="add-version-btn" data-shortcut="F8">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+            <span>Add Version</span>
+          </button>
+        </div>
+
+        <div class="sidebar-settings-panel hidden" id="sidebar-settings-panel">
+          <div class="sidebar-settings-head">
+            <span class="sidebar-settings-kicker">Settings</span>
+            <h2 class="sidebar-settings-title">Settings</h2>
+            <p class="sidebar-settings-sub">Appearance, launch defaults and Java in the same sidebar.</p>
+          </div>
+          <nav class="settings-nav" id="settings-nav">
+            <button class="settings-nav-btn active" data-settings-target="settings-section-appearance">Appearance</button>
+            <button class="settings-nav-btn" data-settings-target="settings-section-launch">Launch</button>
+            <button class="settings-nav-btn" data-settings-target="settings-section-java">Java</button>
+            <button class="settings-nav-btn" data-settings-target="settings-section-shortcuts">Shortcuts</button>
+            <button class="settings-nav-btn" data-settings-target="settings-section-advanced">Advanced</button>
+          </nav>
+          <div class="sidebar-settings-actions">
+            <button class="btn-secondary" id="settings-cancel" data-shortcut="Esc">Back</button>
+            <button class="btn-primary" id="settings-save" data-shortcut="Ctrl+S">Save</button>
           </div>
         </div>
-        <div class="version-list" id="version-list">
-          <div class="loading-placeholder">
-            <div class="spinner"></div>
-            <span>Scanning versions...</span>
-          </div>
-        </div>
-        <button class="add-version-btn" id="add-version-btn">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-          <span>Add Version</span>
-        </button>
       </aside>
 
-      <!-- Center: Launch Panel -->
-      <main class="launch-panel" id="launch-panel">
-        <div class="empty-state" id="empty-state">
-          <div class="empty-icon">
-            <svg width="48" height="48" viewBox="0 0 48 48" fill="none">
-              <rect x="4" y="4" width="16" height="16" rx="2" fill="var(--surface-2)" stroke="var(--border)" stroke-width="1.5"/>
-              <rect x="28" y="4" width="16" height="16" rx="2" fill="var(--surface-2)" stroke="var(--border)" stroke-width="1.5"/>
-              <rect x="4" y="28" width="16" height="16" rx="2" fill="var(--surface-2)" stroke="var(--border)" stroke-width="1.5"/>
-              <rect x="28" y="28" width="16" height="16" rx="2" fill="var(--accent)" opacity="0.2" stroke="var(--accent)" stroke-width="1.5" stroke-opacity="0.4"/>
-            </svg>
-          </div>
-          <p class="empty-title" id="empty-title">Select a version</p>
-          <p class="empty-sub" id="empty-sub">Choose a Minecraft version from the sidebar to launch</p>
-          <button class="btn-primary hidden" id="empty-add-btn" style="margin-top: 12px;">Add Your First Version</button>
-        </div>
-
-        <div class="version-detail hidden" id="version-detail">
-          <div class="detail-header">
-            <div class="detail-id" id="detail-id"></div>
-            <span class="detail-badge" id="detail-badge"></span>
-          </div>
-          <div class="detail-meta" id="detail-meta"></div>
-
-          <div class="launch-area" id="launch-area">
-            <button class="launch-btn" id="launch-btn">
-              <span class="launch-btn-text">LAUNCH</span>
-              <span class="launch-btn-glow"></span>
-            </button>
-          </div>
-
-          <div class="install-area hidden" id="install-area">
-            <p class="install-text" id="install-text">This version is not installed</p>
-            <button class="install-btn" id="install-btn">
-              <span class="install-btn-text">INSTALL</span>
-            </button>
-            <div class="install-progress hidden" id="install-progress">
-              <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
-              <span class="progress-text" id="progress-text">Downloading...</span>
+      <main class="center-panel" id="center-panel">
+        <div class="page-stack" id="page-stack">
+          <section class="launcher-view" id="launcher-view">
+            <div class="empty-state" id="empty-state">
+              <div class="empty-icon">
+                <svg width="48" height="48" viewBox="0 0 48 48" fill="none">
+                  <rect x="4" y="4" width="16" height="16" rx="2" fill="var(--surface-2)" stroke="var(--border)" stroke-width="1.5"></rect>
+                  <rect x="28" y="4" width="16" height="16" rx="2" fill="var(--surface-2)" stroke="var(--border)" stroke-width="1.5"></rect>
+                  <rect x="4" y="28" width="16" height="16" rx="2" fill="var(--surface-2)" stroke="var(--border)" stroke-width="1.5"></rect>
+                  <rect x="28" y="28" width="16" height="16" rx="2" fill="var(--accent)" opacity="0.2" stroke="var(--accent)" stroke-width="1.5" stroke-opacity="0.4"></rect>
+                </svg>
+              </div>
+              <p class="empty-title" id="empty-title">Select a version</p>
+              <p class="empty-sub" id="empty-sub">Choose a Minecraft version from the sidebar to launch</p>
+              <button class="btn-primary hidden" id="empty-add-btn" style="margin-top: 12px;" data-shortcut="F8">Add Your First Version</button>
             </div>
-          </div>
 
-          <!-- Launching transition -->
-          <div class="launching-area hidden" id="launching-area">
-            <div class="launch-sequence">
-              <pre class="launch-ascii" id="launch-ascii"></pre>
-              <div class="launch-seq-text">Preparing launch...</div>
-              <div class="launch-seq-dots"><span></span><span></span><span></span></div>
-            </div>
-          </div>
+            <div class="version-detail hidden" id="version-detail">
+              <div class="detail-header">
+                <div class="detail-id" id="detail-id"></div>
+                <span class="detail-badge" id="detail-badge"></span>
+              </div>
+              <div class="detail-props" id="detail-props"></div>
 
-          <!-- Game running -->
-          <div class="running-area hidden" id="running-area">
-            <div class="running-card">
-              <div class="running-card-bg"></div>
-              <div class="running-top">
-                <pre class="running-ascii" id="running-ascii"></pre>
-                <div class="running-info">
-                  <span class="running-label">Game Running</span>
-                  <span class="running-version" id="running-version"></span>
-                  <span class="running-pid" id="running-pid"></span>
+              <div class="detail-actions">
+                <div id="launch-area">
+                  <button class="launch-btn" id="launch-btn" data-shortcut="F9">
+                    <span class="launch-btn-text">LAUNCH</span>
+                    <span class="launch-btn-glow"></span>
+                  </button>
+                </div>
+
+                <div class="action-hidden" id="install-area">
+                  <p class="install-text" id="install-text">Game files need downloading</p>
+                  <button class="install-btn" id="install-btn">
+                    <span class="install-btn-text">INSTALL</span>
+                  </button>
+                  <div class="install-progress action-hidden" id="install-progress">
+                    <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+                    <span class="progress-text" id="progress-text">Downloading...</span>
+                  </div>
+                </div>
+
+                <div class="action-hidden" id="launching-area">
+                  <div class="launch-sequence">
+                    <div class="launch-seq-head">
+                      <span class="launch-seq-label">Launch Sequence</span>
+                      <span class="launch-seq-version" id="launch-seq-version"></span>
+                    </div>
+                    <pre class="launch-ascii" id="launch-ascii"></pre>
+                    <div class="launch-seq-text">Preparing runtime, assets and session...</div>
+                    <div class="launch-seq-dots"><span></span><span></span><span></span></div>
+                  </div>
+                </div>
+
+                <div class="action-hidden" id="running-area">
+                  <div class="running-card">
+                    <div class="running-card-bg"></div>
+                    <div class="running-top">
+                      <pre class="running-ascii" id="running-ascii"></pre>
+                      <div class="running-info">
+                        <span class="running-label">Game Launched</span>
+                        <span class="running-version" id="running-version"></span>
+                        <span class="running-pid" id="running-pid"></span>
+                      </div>
+                    </div>
+                    <div class="running-bottom">
+                      <div class="running-uptime-wrap">
+                        <span class="running-uptime-label">Session Time</span>
+                        <div class="running-uptime" id="running-uptime">0:00</div>
+                      </div>
+                      <button class="kill-btn" id="kill-btn">
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><rect x="3" y="3" width="18" height="18" rx="2"></rect></svg>
+                        STOP
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="action-hidden" id="not-launchable">
+                  <span id="not-launchable-text"></span>
                 </div>
               </div>
-              <div class="running-bottom">
-                <div class="running-uptime" id="running-uptime">0:00</div>
-                <button class="kill-btn" id="kill-btn">
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><rect x="3" y="3" width="18" height="18" rx="2"/></svg>
-                  STOP
-                </button>
+            </div>
+          </section>
+
+          <section class="settings-view hidden" id="settings-view">
+            <div class="settings-main-panel">
+              <div class="settings-page-header">
+                <div>
+                  <span class="settings-page-kicker">Croopor Configuration</span>
+                  <h2 class="settings-page-title">Launcher Settings</h2>
+                  <p class="settings-page-sub">Theme, Java, window sizing and launcher behavior in one place.</p>
+                </div>
+              </div>
+
+              <div class="settings-content" id="settings-content">
+                <section class="settings-section-card" id="settings-section-appearance">
+                  <div class="settings-section-head">
+                    <span class="settings-section-kicker">Appearance</span>
+                    <h3 class="settings-section-title">Theme and feedback</h3>
+                  </div>
+
+                  <div class="setting-group">
+                    <label class="setting-label">Theme</label>
+                    <div class="theme-picker" id="theme-picker">
+                      <button class="theme-swatch" data-theme="obsidian" title="Obsidian">
+                        <span class="swatch-color" style="background:#0c0e11;border-color:#3dd68c"></span>
+                        <span class="swatch-name">Obsidian</span>
+                      </button>
+                      <button class="theme-swatch" data-theme="deepslate" title="Deepslate">
+                        <span class="swatch-color" style="background:#101218;border-color:#6ea8fe"></span>
+                        <span class="swatch-name">Deepslate</span>
+                      </button>
+                      <button class="theme-swatch" data-theme="nether" title="Nether">
+                        <span class="swatch-color" style="background:#140a0a;border-color:#ff6b4a"></span>
+                        <span class="swatch-name">Nether</span>
+                      </button>
+                      <button class="theme-swatch" data-theme="end" title="The End">
+                        <span class="swatch-color" style="background:#0d0b14;border-color:#c4a3ff"></span>
+                        <span class="swatch-name">The End</span>
+                      </button>
+                      <button class="theme-swatch" data-theme="birch" title="Birch">
+                        <span class="swatch-color" style="background:#f5f0e8;border-color:#5a8f4a"></span>
+                        <span class="swatch-name">Birch</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  <div class="setting-group">
+                    <label class="setting-label">Custom Theme</label>
+                    <div class="hue-creator">
+                      <input type="range" id="hue-slider" class="hue-slider" min="0" max="360" step="1" value="140">
+                      <div class="hue-footer">
+                        <div class="hue-preview" id="hue-preview">
+                          <span class="hue-preview-swatch" id="hue-swatch-bg"></span>
+                          <span class="hue-preview-swatch" id="hue-swatch-surface"></span>
+                          <span class="hue-preview-swatch" id="hue-swatch-accent"></span>
+                          <span class="hue-preview-swatch" id="hue-swatch-text"></span>
+                        </div>
+                  <button class="btn-secondary btn-sm" id="apply-custom-theme">Use Hue</button>
+                </div>
               </div>
             </div>
-          </div>
 
-          <div class="not-launchable hidden" id="not-launchable">
-            <span id="not-launchable-text"></span>
-          </div>
+                  <div class="setting-group">
+                    <label class="setting-label">Sounds</label>
+                    <label class="toggle-label">
+                      <input type="checkbox" id="sounds-toggle" checked>
+                      <span>Enable UI sounds</span>
+                    </label>
+                  </div>
+                </section>
+
+                <section class="settings-section-card" id="settings-section-launch">
+                  <div class="settings-section-head">
+                    <span class="settings-section-kicker">Launch</span>
+                    <h3 class="settings-section-title">Window defaults</h3>
+                  </div>
+
+                  <div class="setting-row">
+                    <div class="setting-group">
+                      <label class="setting-label">Window Width</label>
+                      <input type="number" id="setting-width" class="setting-input" placeholder="Default">
+                    </div>
+                    <div class="setting-group">
+                      <label class="setting-label">Window Height</label>
+                      <input type="number" id="setting-height" class="setting-input" placeholder="Default">
+                    </div>
+                  </div>
+                  <p class="setting-hint">Leave these empty to let Minecraft choose its own size on launch.</p>
+                </section>
+
+                <section class="settings-section-card" id="settings-section-java">
+                  <div class="settings-section-head">
+                    <span class="settings-section-kicker">Runtime</span>
+                    <h3 class="settings-section-title">Java selection</h3>
+                  </div>
+
+                  <div class="setting-group">
+                    <label class="setting-label">Java Path Override</label>
+                    <input type="text" id="setting-java-path" class="setting-input" placeholder="Leave empty for auto-detect">
+                    <p class="setting-hint">Full path to `javaw.exe` or your Java binary.</p>
+                  </div>
+                  <div class="setting-group">
+                    <label class="setting-label">Detected Java Runtimes</label>
+                    <div class="java-runtimes" id="java-runtimes">
+                      <span class="setting-hint">Loading...</span>
+                    </div>
+                  </div>
+                </section>
+
+                <section class="settings-section-card" id="settings-section-shortcuts">
+                  <div class="settings-section-head">
+                    <span class="settings-section-kicker">Shortcuts</span>
+                    <h3 class="settings-section-title">Keyboard flow</h3>
+                  </div>
+                  <p class="setting-hint">Hold <kbd class="shortcut-key">Ctrl</kbd> anywhere in the launcher to reveal these hints directly on the UI.</p>
+                  <div class="shortcut-list">
+                    <div class="shortcut-item"><span class="shortcut-key">Tab</span><span class="shortcut-desc">Move focus through installed versions and controls.</span></div>
+                    <div class="shortcut-item"><span class="shortcut-key">Shift+Tab</span><span class="shortcut-desc">Move focus backward.</span></div>
+                    <div class="shortcut-item"><span class="shortcut-key">Enter</span><span class="shortcut-desc">Activate the focused version or button.</span></div>
+                    <div class="shortcut-item"><span class="shortcut-key">Ctrl+F</span><span class="shortcut-desc">Focus version search.</span></div>
+                    <div class="shortcut-item"><span class="shortcut-key">F8</span><span class="shortcut-desc">Open Add Version.</span></div>
+                    <div class="shortcut-item"><span class="shortcut-key">F9</span><span class="shortcut-desc">Launch the selected version.</span></div>
+                    <div class="shortcut-item"><span class="shortcut-key">F2</span><span class="shortcut-desc">Open or close Settings.</span></div>
+                    <div class="shortcut-item"><span class="shortcut-key">Ctrl+S</span><span class="shortcut-desc">Save Settings while the settings page is open.</span></div>
+                    <div class="shortcut-item"><span class="shortcut-key">Esc</span><span class="shortcut-desc">Close settings or dialogs.</span></div>
+                  </div>
+                </section>
+
+                <section class="settings-section-card" id="settings-section-advanced">
+                  <div class="settings-section-head">
+                    <span class="settings-section-kicker">Advanced</span>
+                    <h3 class="settings-section-title">Maintenance</h3>
+                  </div>
+                  <p class="setting-hint">Use cleanup tools carefully. Worlds and mods are backed up before destructive actions.</p>
+
+                  <div class="dev-tools hidden" id="dev-tools">
+                    <div class="setting-group">
+                      <label class="setting-label" style="color:var(--amber)">Developer Tools</label>
+                      <div class="dev-actions">
+                        <button class="btn-danger" id="dev-cleanup">Cleanup Versions</button>
+                        <button class="btn-danger" id="dev-flush">Flush All Data</button>
+                      </div>
+                      <p class="setting-hint">Cleanup backs up worlds and mods then removes all versions. Flush resets Croopor to first-launch state.</p>
+                    </div>
+                  </div>
+                </section>
+              </div>
+            </div>
+          </section>
         </div>
       </main>
     </div>
 
-    <!-- Bottom Log Panel -->
     <div class="log-panel" id="log-panel">
       <button class="log-toggle" id="log-toggle">
-        <svg class="log-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="18 15 12 9 6 15"/></svg>
+        <svg class="log-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="18 15 12 9 6 15"></polyline></svg>
         <span>Game Output</span>
         <span class="log-count" id="log-count">0 lines</span>
       </button>
@@ -164,89 +339,12 @@
       </div>
     </div>
 
-    <!-- Settings Modal -->
-    <div class="modal-overlay hidden" id="settings-modal">
-      <div class="modal settings-modal">
-        <div class="modal-header">
-          <span class="modal-title">Settings</span>
-          <button class="icon-btn modal-close" id="settings-close">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-          </button>
-        </div>
-        <div class="modal-body">
-          <!-- Theme Selector -->
-          <div class="setting-group">
-            <label class="setting-label">Theme</label>
-            <div class="theme-picker" id="theme-picker">
-              <button class="theme-swatch" data-theme="obsidian" title="Obsidian">
-                <span class="swatch-color" style="background:#0c0e11;border-color:#3dd68c"></span>
-                <span class="swatch-name">Obsidian</span>
-              </button>
-              <button class="theme-swatch" data-theme="deepslate" title="Deepslate">
-                <span class="swatch-color" style="background:#101218;border-color:#6ea8fe"></span>
-                <span class="swatch-name">Deepslate</span>
-              </button>
-              <button class="theme-swatch" data-theme="nether" title="Nether">
-                <span class="swatch-color" style="background:#140a0a;border-color:#ff6b4a"></span>
-                <span class="swatch-name">Nether</span>
-              </button>
-              <button class="theme-swatch" data-theme="end" title="The End">
-                <span class="swatch-color" style="background:#0d0b14;border-color:#c4a3ff"></span>
-                <span class="swatch-name">The End</span>
-              </button>
-              <button class="theme-swatch" data-theme="birch" title="Birch">
-                <span class="swatch-color" style="background:#f5f0e8;border-color:#5a8f4a"></span>
-                <span class="swatch-name">Birch</span>
-              </button>
-            </div>
-          </div>
-
-          <div class="setting-group">
-            <label class="setting-label">Java Path Override</label>
-            <input type="text" id="setting-java-path" class="setting-input" placeholder="Leave empty for auto-detect">
-            <p class="setting-hint">Full path to javaw.exe or java binary</p>
-          </div>
-          <div class="setting-row">
-            <div class="setting-group">
-              <label class="setting-label">Window Width</label>
-              <input type="number" id="setting-width" class="setting-input" placeholder="Default">
-            </div>
-            <div class="setting-group">
-              <label class="setting-label">Window Height</label>
-              <input type="number" id="setting-height" class="setting-input" placeholder="Default">
-            </div>
-          </div>
-          <div class="setting-group">
-            <label class="setting-label">Detected Java Runtimes</label>
-            <div class="java-runtimes" id="java-runtimes">
-              <span class="setting-hint">Loading...</span>
-            </div>
-          </div>
-        </div>
-        <div class="dev-tools hidden" id="dev-tools">
-          <div class="setting-group">
-            <label class="setting-label" style="color:var(--amber)">Developer Tools</label>
-            <div style="display:flex;gap:8px;flex-wrap:wrap">
-              <button class="btn-danger" id="dev-cleanup">Cleanup Versions</button>
-              <button class="btn-danger" id="dev-flush">Flush All Data</button>
-            </div>
-            <p class="setting-hint">Cleanup backs up worlds/mods then removes all versions. Flush resets Croopor to first-launch state.</p>
-          </div>
-        </div>
-        <div class="modal-footer">
-          <button class="btn-secondary" id="settings-cancel">Cancel</button>
-          <button class="btn-primary" id="settings-save">Save</button>
-        </div>
-      </div>
-    </div>
-
-    <!-- Catalog Modal (Add Version) -->
     <div class="modal-overlay hidden" id="catalog-modal">
       <div class="modal catalog-modal-size">
         <div class="modal-header">
           <span class="modal-title">Add Version</span>
-          <button class="icon-btn modal-close" id="catalog-close">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          <button class="icon-btn modal-close" id="catalog-close" data-shortcut="Esc" aria-label="Close add version dialog">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
           </button>
         </div>
         <div class="catalog-filters">
@@ -267,7 +365,6 @@
       </div>
     </div>
 
-    <!-- Onboarding Overlay -->
     <div class="onboarding-overlay hidden" id="onboarding">
       <div class="onboarding-card">
         <div class="onboarding-step" id="onboarding-step-1">
@@ -280,6 +377,7 @@
           </div>
           <button class="btn-primary onboarding-next" id="onboarding-next-1">Continue</button>
         </div>
+
         <div class="onboarding-step hidden" id="onboarding-step-2">
           <h2 class="onboarding-title">Memory Allocation</h2>
           <p class="onboarding-sub" id="onboarding-ram-info">Detecting system memory...</p>
@@ -290,16 +388,57 @@
           <p class="onboarding-rec" id="onboarding-rec"></p>
           <button class="btn-primary onboarding-next" id="onboarding-next-2">Continue</button>
         </div>
+
         <div class="onboarding-step hidden" id="onboarding-step-3">
+          <h2 class="onboarding-title">Pick your style</h2>
+          <p class="onboarding-sub">Choose a preset or craft your own palette</p>
+          <div class="ob-theme-presets" id="ob-theme-presets">
+            <button class="ob-theme-btn active" data-ob-theme="obsidian">
+              <span class="ob-swatch" style="background:linear-gradient(135deg,#0c0e11 60%,#3dd68c)"></span>
+              <span>Obsidian</span>
+            </button>
+            <button class="ob-theme-btn" data-ob-theme="deepslate">
+              <span class="ob-swatch" style="background:linear-gradient(135deg,#101218 60%,#6ea8fe)"></span>
+              <span>Deepslate</span>
+            </button>
+            <button class="ob-theme-btn" data-ob-theme="nether">
+              <span class="ob-swatch" style="background:linear-gradient(135deg,#140a0a 60%,#ff6b4a)"></span>
+              <span>Nether</span>
+            </button>
+            <button class="ob-theme-btn" data-ob-theme="end">
+              <span class="ob-swatch" style="background:linear-gradient(135deg,#0d0b14 60%,#c4a3ff)"></span>
+              <span>The End</span>
+            </button>
+            <button class="ob-theme-btn" data-ob-theme="birch">
+              <span class="ob-swatch" style="background:linear-gradient(135deg,#f5f0e8 60%,#5a8f4a)"></span>
+              <span>Birch</span>
+            </button>
+          </div>
+          <div class="ob-custom-section">
+            <label class="setting-label" style="text-align:center;width:100%">Or create your own</label>
+            <input type="range" id="ob-hue-slider" class="hue-slider" min="0" max="360" step="1" value="140">
+            <div class="ob-hue-live" id="ob-hue-live">
+              <span class="ob-hue-chip" id="ob-hue-chip-bg"></span>
+              <span class="ob-hue-chip" id="ob-hue-chip-accent"></span>
+              <span class="ob-hue-chip" id="ob-hue-chip-text"></span>
+            </div>
+            <button class="btn-secondary btn-sm" id="ob-apply-custom">Use this palette</button>
+          </div>
+          <button class="btn-primary onboarding-next" id="onboarding-next-3">Continue</button>
+        </div>
+
+        <div class="onboarding-step hidden" id="onboarding-step-4">
           <div class="onboarding-check">&#10003;</div>
           <h2 class="onboarding-title">You're all set!</h2>
-          <p class="onboarding-sub">Select a version from the sidebar and hit Launch.<br>Croopor handles everything else.</p>
+          <p class="onboarding-sub">Scroll the wheel to pick a version and hit Launch.<br>Croopor handles everything else.</p>
           <button class="btn-primary onboarding-next" id="onboarding-finish">Let's go</button>
         </div>
+
         <div class="onboarding-dots">
           <span class="dot active" id="dot-1"></span>
           <span class="dot" id="dot-2"></span>
           <span class="dot" id="dot-3"></span>
+          <span class="dot" id="dot-4"></span>
         </div>
       </div>
     </div>

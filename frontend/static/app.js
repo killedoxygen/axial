@@ -5,134 +5,331 @@
 const API = '/api/v1';
 const STORAGE_KEY = 'croopor_ui';
 
-// ── Local UI State (persisted to localStorage) ──
+// ── Local UI State ──
 
-const defaults = {
-  theme: 'obsidian',
-  logExpanded: false,
-  collapsedGroups: {},
-  sidebarFilter: 'all',
+const defaults = { theme: 'obsidian', customHue: 140, logExpanded: false, collapsedGroups: {}, sidebarFilter: 'all', sounds: true };
+function loadLocalState() { try { const r = localStorage.getItem(STORAGE_KEY); return r ? { ...defaults, ...JSON.parse(r) } : { ...defaults }; } catch { return { ...defaults }; } }
+function saveLocalState() { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(local)); } catch {} }
+const local = loadLocalState();
+
+// ── Sound Engine ──
+
+const Sound = {
+  ctx: null,
+  enabled: true,
+  preloadPromise: null,
+  spriteBuffer: null,
+  spriteMap: null,
+  customBuffers: new Map(),
+  init() {
+    if (this.ctx) return this.ctx;
+    try {
+      this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    } catch {}
+    return this.ctx;
+  },
+  activate() {
+    this.init();
+    this.preload();
+    if (this.ctx?.state === 'suspended') this.ctx.resume().catch(() => {});
+  },
+  preload() {
+    if (this.preloadPromise) return this.preloadPromise;
+    this.init();
+    if (!this.ctx) return Promise.resolve();
+    this.preloadPromise = (async () => {
+      try {
+        const [manifestRes, spriteRes, launchRes] = await Promise.all([
+          fetch('sounds/snd01/audioSprite.json'),
+          fetch('sounds/snd01/audioSprite.mp3'),
+          fetch('sounds/launch.ogg'),
+        ]);
+        const manifest = await manifestRes.json();
+        const [spriteArray, launchArray] = await Promise.all([spriteRes.arrayBuffer(), launchRes.arrayBuffer()]);
+        this.spriteMap = manifest.spritemap || {};
+        this.spriteBuffer = await this.ctx.decodeAudioData(spriteArray.slice(0));
+        this.customBuffers.set('launchSuccess', await this.ctx.decodeAudioData(launchArray.slice(0)));
+      } catch {}
+    })();
+    return this.preloadPromise;
+  },
+  async warmup() {
+    this.activate();
+    try { await this.preload(); } catch {}
+  },
+  playBuffer(buffer, options = {}) {
+    if (!buffer || !this.ctx) return false;
+    const {
+      when = 0,
+      volume = 0.22,
+      playbackRate = 1,
+      offset = 0,
+      duration = null,
+    } = options;
+    try {
+      const source = this.ctx.createBufferSource();
+      const gain = this.ctx.createGain();
+      source.buffer = buffer;
+      source.playbackRate.setValueAtTime(playbackRate, this.ctx.currentTime);
+      gain.gain.setValueAtTime(Math.max(0.0001, volume), this.ctx.currentTime + when);
+      source.connect(gain);
+      gain.connect(this.ctx.destination);
+      const startAt = this.ctx.currentTime + when;
+      if (duration != null) source.start(startAt, offset, duration);
+      else source.start(startAt, offset);
+      return true;
+    } catch {
+      return false;
+    }
+  },
+  playSprite(name, options = {}) {
+    const entry = this.spriteMap?.[name];
+    if (!entry || !this.spriteBuffer) return false;
+    return this.playBuffer(this.spriteBuffer, {
+      offset: entry.start,
+      duration: Math.max(0.01, entry.end - entry.start),
+      ...options,
+    });
+  },
+  randomFrom(keys) {
+    return keys[Math.floor(Math.random() * keys.length)];
+  },
+  playKind(kind, value = 0.5) {
+    switch (kind) {
+      case 'soft':
+        return this.playSprite('tap_01', { volume: 0.18 });
+      case 'bright':
+        return this.playSprite(this.randomFrom(['swipe', 'swipe_01', 'swipe_02', 'swipe_03', 'swipe_04', 'swipe_05']), { volume: 0.22 });
+      case 'affirm':
+        return this.playSprite('button', { volume: 0.24 });
+      case 'theme':
+        return this.playSprite('transition_up', { volume: 0.26 });
+      case 'slider':
+        return this.playSprite('select', { volume: 0.15, playbackRate: 0.93 + (value * 0.16) });
+      case 'memory':
+        return this.playSprite('select', { volume: 0.18, playbackRate: 0.86 + (value * 0.12) });
+      case 'launchPress':
+        return this.playSprite('button', { volume: 0.3, playbackRate: 0.96 });
+      case 'launchSuccess':
+        return this.playBuffer(this.customBuffers.get('launchSuccess'), { volume: 0.38 }) || this.playSprite('celebration', { volume: 0.28 });
+      case 'click':
+      default:
+        return this.playSprite(this.randomFrom(['tap_01', 'tap_02', 'tap_03', 'tap_04', 'tap_05']), { volume: 0.17 });
+    }
+  },
+  tone(freq, duration, options = {}) {
+    if (!this.enabled) return;
+    this.init();
+    if (!this.ctx) return;
+    const {
+      type = 'triangle',
+      volume = 0.035,
+      when = 0,
+      attack = 0.008,
+      release = 0.09,
+      detune = 0,
+      endFreq = null,
+    } = options;
+    try {
+      const now = this.ctx.currentTime + when;
+      const osc = this.ctx.createOscillator();
+      const gain = this.ctx.createGain();
+      osc.type = type;
+      osc.frequency.setValueAtTime(freq, now);
+      osc.detune.setValueAtTime(detune, now);
+      if (endFreq) osc.frequency.exponentialRampToValueAtTime(endFreq, now + duration);
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.exponentialRampToValueAtTime(volume, now + attack);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + duration + release);
+      osc.connect(gain);
+      gain.connect(this.ctx.destination);
+      osc.start(now);
+      osc.stop(now + duration + release + 0.01);
+    } catch {}
+  },
+  sequence(notes) { notes.forEach(note => this.tone(note.freq, note.duration, note)); },
+  ui(kind, value = 0.5) {
+    if (!this.enabled) return;
+    this.activate();
+    if (this.playKind(kind, value)) return;
+    switch (kind) {
+      case 'soft':
+        this.sequence([
+          { freq: 340, duration: 0.024, volume: 0.013, type: 'sine' },
+          { freq: 430, duration: 0.03, volume: 0.014, when: 0.015, type: 'triangle' },
+        ]);
+        break;
+      case 'bright':
+        this.sequence([
+          { freq: 620, duration: 0.024, volume: 0.022, type: 'triangle' },
+          { freq: 930, duration: 0.045, volume: 0.02, when: 0.018, type: 'sine' },
+        ]);
+        break;
+      case 'affirm':
+        this.sequence([
+          { freq: 480, duration: 0.035, volume: 0.022, type: 'triangle' },
+          { freq: 720, duration: 0.055, volume: 0.024, when: 0.024, type: 'triangle' },
+          { freq: 960, duration: 0.09, volume: 0.018, when: 0.055, type: 'sine' },
+        ]);
+        break;
+      case 'theme':
+        this.sequence([
+          { freq: 392, duration: 0.028, volume: 0.016, type: 'sine' },
+          { freq: 587.33, duration: 0.05, volume: 0.02, when: 0.016, type: 'triangle' },
+          { freq: 783.99, duration: 0.085, volume: 0.022, when: 0.04, type: 'triangle' },
+          { freq: 1174.66, duration: 0.08, volume: 0.012, when: 0.085, type: 'sine' },
+        ]);
+        break;
+      case 'slider': {
+        const freq = 460 + (value * 360);
+        this.sequence([{ freq, duration: 0.02, volume: 0.012, type: 'triangle', endFreq: freq * 1.05 }]);
+        break;
+      }
+      case 'memory': {
+        const freq = 150 + (value * 160);
+        this.sequence([
+          { freq, duration: 0.024, volume: 0.018, type: 'sine', endFreq: freq * 1.03 },
+          { freq: freq * 1.5, duration: 0.03, volume: 0.009, when: 0.008, type: 'triangle' },
+        ]);
+        break;
+      }
+      case 'launchPress':
+        this.sequence([
+          { freq: 220, duration: 0.05, volume: 0.018, type: 'triangle' },
+          { freq: 293.66, duration: 0.055, volume: 0.022, when: 0.028, type: 'triangle' },
+          { freq: 440, duration: 0.07, volume: 0.016, when: 0.055, type: 'sine' },
+        ]);
+        break;
+      case 'launchSuccess':
+        this.sequence([
+          { freq: 196, duration: 0.16, volume: 0.013, type: 'sine' },
+          { freq: 392, duration: 0.07, volume: 0.022, when: 0.02, type: 'triangle' },
+          { freq: 523.25, duration: 0.085, volume: 0.026, when: 0.085, type: 'triangle' },
+          { freq: 659.25, duration: 0.11, volume: 0.028, when: 0.15, type: 'triangle' },
+          { freq: 783.99, duration: 0.18, volume: 0.026, when: 0.215, type: 'triangle' },
+          { freq: 1174.66, duration: 0.34, volume: 0.014, when: 0.25, type: 'sine' },
+        ]);
+        break;
+      default:
+        this.sequence([
+          { freq: 520, duration: 0.02, volume: 0.015, type: 'triangle' },
+          { freq: 690, duration: 0.028, volume: 0.012, when: 0.014, type: 'sine' },
+        ]);
+    }
+  },
+  tick() { this.ui('click'); },
 };
 
-function loadLocalState() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    return raw ? { ...defaults, ...JSON.parse(raw) } : { ...defaults };
-  } catch { return { ...defaults }; }
+// ── Text Scramble Effect ──
+
+const SCRAMBLE_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-';
+const scrambleTimers = new Map();
+
+function scrambleText(el, text, duration) {
+  if (!el) return;
+  if (scrambleTimers.has(el)) clearInterval(scrambleTimers.get(el));
+  const steps = 7;
+  const interval = (duration || 280) / steps;
+  let step = 0;
+  const id = setInterval(() => {
+    step++;
+    const reveal = Math.floor((step / steps) * text.length);
+    let out = '';
+    for (let i = 0; i < text.length; i++) {
+      if (text[i] === ' ') out += ' ';
+      else if (i < reveal) out += text[i];
+      else out += SCRAMBLE_CHARS[Math.floor(Math.random() * SCRAMBLE_CHARS.length)];
+    }
+    el.textContent = out;
+    if (step >= steps) { clearInterval(id); scrambleTimers.delete(el); el.textContent = text; }
+  }, interval);
+  scrambleTimers.set(el, id);
 }
 
-function saveLocalState() {
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(local)); } catch {}
+// ── Theme Engine ──
+
+function generateThemeFromHue(hue) {
+  const s = (hue >= 0 && hue < 60) || hue >= 300 ? 18 : 15;
+  return {
+    '--bg-deep': `hsl(${hue},${s}%,5%)`, '--bg': `hsl(${hue},${s - 3}%,7%)`,
+    '--surface-0': `hsl(${hue},${s - 5}%,9.5%)`, '--surface-1': `hsl(${hue},${s - 5}%,12%)`,
+    '--surface-2': `hsl(${hue},${s - 5}%,15.5%)`, '--surface-3': `hsl(${hue},${s - 5}%,19%)`,
+    '--accent': `hsl(${hue},65%,58%)`, '--accent-dim': `hsl(${hue},55%,44%)`,
+    '--accent-glow': `hsla(${hue},65%,58%,0.12)`, '--accent-glow-strong': `hsla(${hue},65%,58%,0.28)`,
+    '--text': `hsl(${hue},8%,86%)`, '--text-dim': `hsl(${hue},8%,52%)`, '--text-muted': `hsl(${hue},8%,34%)`,
+    '--border': `hsl(${hue},${s - 4}%,14%)`, '--border-hover': `hsl(${hue},${s - 2}%,24%)`,
+  };
 }
 
-const local = loadLocalState();
+function applyTheme(theme, hue, options = {}) {
+  const { silent = false } = options;
+  const el = document.documentElement;
+  const clearCustom = () => { Object.keys(generateThemeFromHue(0)).forEach(k => el.style.removeProperty(k)); };
+  clearCustom();
+  if (theme === 'custom') {
+    el.setAttribute('data-theme', 'custom');
+    Object.entries(generateThemeFromHue(hue || local.customHue)).forEach(([k, v]) => el.style.setProperty(k, v));
+    local.customHue = hue || local.customHue;
+  } else {
+    el.setAttribute('data-theme', theme);
+  }
+  local.theme = theme;
+  saveLocalState();
+  dom.themePicker?.querySelectorAll('.theme-swatch').forEach(s => s.classList.toggle('active', s.dataset.theme === local.theme));
+  if (!silent) Sound.ui('theme');
+}
+
+function updateHuePreview(hue, bgEl, surfaceEl, accentEl, textEl) {
+  const vars = generateThemeFromHue(hue);
+  if (bgEl) bgEl.style.background = vars['--bg-deep'];
+  if (surfaceEl) surfaceEl.style.background = vars['--surface-2'];
+  if (accentEl) accentEl.style.background = vars['--accent'];
+  if (textEl) textEl.style.background = vars['--text'];
+}
 
 // ── App State ──
 
 const state = {
-  versions: [],
-  catalog: null,
-  config: null,
-  systemInfo: null,
-  devMode: false,
-  selectedVersion: null,
-  activeSession: null,
-  eventSource: null,
-  installEventSource: null,
-  logLines: 0,
-  catalogFilter: 'release',
-  search: '',
-  catalogSearch: '',
-  gameRunning: false,
-  runningVersionId: null,
-  installing: false,
-  launching: false,
+  versions: [], config: null, systemInfo: null, devMode: false,
+  selectedVersion: null, activeSession: null,
+  eventSource: null, installEventSource: null,
+  logLines: 0, filter: 'all', catalogFilter: 'release',
+  search: '', catalogSearch: '', catalog: null,
+  gameRunning: false, runningVersionId: null,
+  installing: false, launching: false,
+  currentPage: 'launcher',
 };
 
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => document.querySelectorAll(sel);
+const dom = {};
+let lastMemorySoundAt = 0;
+let lastHueSoundAt = 0;
 
-const dom = {
-  versionList: $('#version-list'),
-  versionSearch: $('#version-search'),
-  emptyState: $('#empty-state'),
-  emptyTitle: $('#empty-title'),
-  emptySub: $('#empty-sub'),
-  emptyAddBtn: $('#empty-add-btn'),
-  versionDetail: $('#version-detail'),
-  detailId: $('#detail-id'),
-  detailBadge: $('#detail-badge'),
-  detailMeta: $('#detail-meta'),
-  launchArea: $('#launch-area'),
-  launchBtn: $('#launch-btn'),
-  launchingArea: $('#launching-area'),
-  launchAscii: $('#launch-ascii'),
-  runningArea: $('#running-area'),
-  runningAscii: $('#running-ascii'),
-  runningVersion: $('#running-version'),
-  runningPid: $('#running-pid'),
-  runningUptime: $('#running-uptime'),
-  killBtn: $('#kill-btn'),
-  notLaunchable: $('#not-launchable'),
-  notLaunchableText: $('#not-launchable-text'),
-  installArea: $('#install-area'),
-  installText: $('#install-text'),
-  installBtn: $('#install-btn'),
-  installProgress: $('#install-progress'),
-  progressFill: $('#progress-fill'),
-  progressText: $('#progress-text'),
-  usernameInput: $('#username-input'),
-  memorySlider: $('#memory-slider'),
-  memoryValue: $('#memory-value'),
-  memoryRec: $('#memory-rec'),
-  logPanel: $('#log-panel'),
-  logToggle: $('#log-toggle'),
-  logContent: $('#log-content'),
-  logLines: $('#log-lines'),
-  logCount: $('#log-count'),
-  settingsBtn: $('#settings-btn'),
-  settingsModal: $('#settings-modal'),
-  settingsClose: $('#settings-close'),
-  settingsCancel: $('#settings-cancel'),
-  settingsSave: $('#settings-save'),
-  settingJavaPath: $('#setting-java-path'),
-  settingWidth: $('#setting-width'),
-  settingHeight: $('#setting-height'),
-  javaRuntimes: $('#java-runtimes'),
-  themePicker: $('#theme-picker'),
-  addVersionBtn: $('#add-version-btn'),
-  catalogModal: $('#catalog-modal'),
-  catalogClose: $('#catalog-close'),
-  catalogSearch: $('#catalog-search'),
-  catalogList: $('#catalog-list'),
-  onboarding: $('#onboarding'),
-  onboardingStep1: $('#onboarding-step-1'),
-  onboardingStep2: $('#onboarding-step-2'),
-  onboardingStep3: $('#onboarding-step-3'),
-  onboardingUsername: $('#onboarding-username'),
-  onboardingRamInfo: $('#onboarding-ram-info'),
-  onboardingMemorySlider: $('#onboarding-memory-slider'),
-  onboardingMemoryValue: $('#onboarding-memory-value'),
-  onboardingRec: $('#onboarding-rec'),
-  onboardingNext1: $('#onboarding-next-1'),
-  onboardingNext2: $('#onboarding-next-2'),
-  onboardingFinish: $('#onboarding-finish'),
-  dot1: $('#dot-1'), dot2: $('#dot-2'), dot3: $('#dot-3'),
-  devTools: $('#dev-tools'),
-  devCleanup: $('#dev-cleanup'),
-  devFlush: $('#dev-flush'),
-};
-
-// ── Theme ──
-
-function applyTheme(theme) {
-  document.documentElement.setAttribute('data-theme', theme);
-  local.theme = theme;
-  saveLocalState();
-  // Update active swatch
-  dom.themePicker?.querySelectorAll('.theme-swatch').forEach(s => {
-    s.classList.toggle('active', s.dataset.theme === theme);
-  });
+function cacheDom() {
+  const ids = [
+    'version-list', 'version-search', 'empty-state', 'empty-title', 'empty-sub', 'empty-add-btn',
+    'center-panel', 'page-stack', 'launcher-view', 'settings-view', 'settings-content', 'settings-nav', 'sidebar-launcher-panel', 'sidebar-settings-panel',
+    'version-detail', 'detail-id', 'detail-badge', 'detail-props',
+    'launch-area', 'launch-btn', 'launching-area', 'launch-ascii', 'launch-seq-version',
+    'running-area', 'running-ascii', 'running-version', 'running-pid', 'running-uptime', 'kill-btn',
+    'not-launchable', 'not-launchable-text',
+    'install-area', 'install-text', 'install-btn', 'install-progress', 'progress-fill', 'progress-text',
+    'username-input', 'memory-slider', 'memory-value', 'memory-rec',
+    'log-panel', 'log-toggle', 'log-content', 'log-lines', 'log-count',
+    'settings-btn', 'settings-cancel', 'settings-save',
+    'setting-java-path', 'setting-width', 'setting-height', 'java-runtimes',
+    'theme-picker', 'hue-slider', 'hue-swatch-bg', 'hue-swatch-surface', 'hue-swatch-accent', 'hue-swatch-text',
+    'apply-custom-theme', 'sounds-toggle',
+    'add-version-btn', 'catalog-modal', 'catalog-close', 'catalog-search', 'catalog-list',
+    'onboarding', 'onboarding-step-1', 'onboarding-step-2', 'onboarding-step-3', 'onboarding-step-4',
+    'onboarding-username', 'onboarding-ram-info', 'onboarding-memory-slider', 'onboarding-memory-value', 'onboarding-rec',
+    'onboarding-next-1', 'onboarding-next-2', 'onboarding-next-3', 'onboarding-finish',
+    'dot-1', 'dot-2', 'dot-3', 'dot-4',
+    'ob-theme-presets', 'ob-hue-slider', 'ob-hue-chip-bg', 'ob-hue-chip-accent', 'ob-hue-chip-text', 'ob-apply-custom',
+    'dev-tools', 'dev-cleanup', 'dev-flush',
+  ];
+  ids.forEach(id => { dom[id.replace(/-([a-z0-9])/g, (_, c) => c.toUpperCase())] = document.getElementById(id); });
 }
 
 // ── API ──
@@ -140,8 +337,7 @@ function applyTheme(theme) {
 async function api(method, path, body) {
   const opts = { method, headers: { 'Content-Type': 'application/json' } };
   if (body) opts.body = JSON.stringify(body);
-  const res = await fetch(`${API}${path}`, opts);
-  return res.json();
+  return (await fetch(`${API}${path}`, opts)).json();
 }
 
 // ── Memory ──
@@ -155,89 +351,150 @@ function getMemoryRecommendation(totalGB) {
 
 function updateMemoryRecText(val, totalGB) {
   if (!totalGB || !dom.memoryRec) return;
-  if (val < 2) dom.memoryRec.textContent = '(low — may lag)';
-  else if (val > totalGB * 0.75) dom.memoryRec.textContent = '(high — leave room for OS)';
-  else dom.memoryRec.textContent = '';
+  dom.memoryRec.textContent = val < 2 ? '(low — may lag)' : val > totalGB * 0.75 ? '(high — leave room for OS)' : '';
 }
 
-// ── Init ──
+// ── Pages ──
 
-async function init() {
-  // Apply persisted local state
-  applyTheme(local.theme);
-  if (local.logExpanded) dom.logPanel.classList.add('expanded');
-
-  // Set persisted sidebar filter
-  state.filter = local.sidebarFilter;
-  $$('.filter-chips .chip[data-filter]').forEach(c => {
-    c.classList.toggle('active', c.dataset.filter === state.filter);
-  });
-
-  try {
-    const [versionsRes, configRes, systemRes, statusRes] = await Promise.all([
-      api('GET', '/versions'),
-      api('GET', '/config'),
-      api('GET', '/system').catch(() => null),
-      api('GET', '/status').catch(() => null),
-    ]);
-    state.versions = versionsRes.versions || [];
-    state.config = configRes;
-    state.systemInfo = systemRes;
-    state.devMode = statusRes?.dev_mode === true;
-    if (state.devMode && dom.devTools) dom.devTools.classList.remove('hidden');
-
-    applyConfig(state.config);
-    applySystemInfo(state.systemInfo);
-    renderVersionList();
-
-    if (state.config && !state.config.onboarding_done) showOnboarding();
-  } catch (err) {
-    dom.versionList.innerHTML = `<div class="loading-placeholder">
-      <span style="color:var(--red)">Failed to connect</span>
-      <span style="color:var(--text-muted);font-size:10px">${err.message}</span></div>`;
-  }
+function setPage(page) {
+  state.currentPage = page;
+  dom.launcherView?.classList.toggle('hidden', page !== 'launcher');
+  dom.settingsView?.classList.toggle('hidden', page !== 'settings');
+  dom.sidebarLauncherPanel?.classList.toggle('hidden', page !== 'launcher');
+  dom.sidebarSettingsPanel?.classList.toggle('hidden', page !== 'settings');
+  dom.settingsBtn?.classList.toggle('active', page === 'settings');
 }
 
-function applyConfig(cfg) {
-  if (cfg.username) dom.usernameInput.value = cfg.username;
-  if (cfg.max_memory_mb) {
-    const gb = cfg.max_memory_mb / 1024;
-    dom.memorySlider.value = gb;
-    dom.memoryValue.textContent = fmtMem(gb);
-  }
+function toggleShortcutHints(show) {
+  document.body.classList.toggle('show-shortcuts', show);
 }
 
-function applySystemInfo(info) {
-  if (!info?.total_memory_mb) return;
-  const totalGB = Math.floor(info.total_memory_mb / 1024);
-  if (totalGB > 0) {
-    dom.memorySlider.max = totalGB;
-    const cur = parseFloat(dom.memorySlider.value);
-    if (cur > totalGB) {
-      dom.memorySlider.value = totalGB;
-      dom.memoryValue.textContent = fmtMem(totalGB);
-    }
-    updateMemoryRecText(parseFloat(dom.memorySlider.value), totalGB);
-  }
+// ══════════════════════════════════════════
+// VERSION SELECTION
+// ══════════════════════════════════════════
+
+function selectVersion(version, options = {}) {
+  const { silent = false } = options;
+  if (!silent) { Sound.init(); Sound.tick(); }
+  state.selectedVersion = version;
+  setPage('launcher');
+  renderSelectedVersion();
+  renderVersionList();
 }
 
-// ── Sidebar: Installed Versions Only ──
-
-function renderVersionList() {
-  const filtered = filterVersions(state.versions);
-
-  if (state.versions.length === 0) {
-    dom.versionList.innerHTML = `<div class="loading-placeholder">
-      <span>No versions installed</span></div>`;
-    dom.emptyTitle.textContent = 'No versions installed';
-    dom.emptySub.textContent = 'Add a Minecraft version to get started';
-    dom.emptyAddBtn.classList.remove('hidden');
+function renderSelectedVersion() {
+  const version = state.selectedVersion;
+  if (!version) {
+    dom.versionDetail?.classList.add('hidden');
+    dom.emptyState?.classList.remove('hidden');
     return;
   }
 
-  dom.emptyAddBtn.classList.add('hidden');
-  dom.emptyTitle.textContent = 'Select a version';
-  dom.emptySub.textContent = 'Choose a Minecraft version from the sidebar to launch';
+  dom.versionList?.querySelectorAll('.version-item').forEach(el => {
+    const selected = el.dataset.id === version.id;
+    el.classList.toggle('selected', selected);
+    el.setAttribute('aria-pressed', selected ? 'true' : 'false');
+  });
+  dom.emptyState?.classList.add('hidden');
+  dom.versionDetail?.classList.remove('hidden');
+
+  scrambleText(dom.detailId, version.id, 300);
+
+  const isModded = !!version.inherits_from;
+  const badgeClass = isModded ? 'badge-modded' : version.type === 'release' ? 'badge-release' : version.type === 'snapshot' ? 'badge-snapshot' : 'badge-old';
+  dom.detailBadge.className = `detail-badge ${badgeClass}`;
+  dom.detailBadge.textContent = isModded ? 'Modded' : version.type === 'release' ? 'Release' : version.type === 'snapshot' ? 'Snapshot' : version.type || 'Unknown';
+
+  if (dom.detailProps) dom.detailProps.innerHTML = buildVersionProps(version);
+  refreshSelectedVersionActionState();
+}
+
+function buildVersionProps(version) {
+  let props = '';
+  if (version.java_component) props += prop('Runtime', version.java_component, true);
+  if (version.java_major) props += prop('Java', `Java ${version.java_major}`);
+  if (version.inherits_from) props += prop('Base', version.inherits_from);
+  if (version.release_time) {
+    const d = new Date(version.release_time);
+    if (!isNaN(d)) props += prop('Released', d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }));
+  }
+  const lastLaunched = formatLastLaunched(version.id);
+  props += prop('Last launched', lastLaunched.text, lastLaunched.accent);
+  if (version.status) props += prop('Status', version.launchable ? 'Ready' : version.status_detail || 'Incomplete', version.launchable);
+  return props;
+}
+
+function formatLastLaunched(versionId) {
+  const ts = state.config?.last_launched?.[versionId];
+  if (!ts) return { text: 'Never', accent: false };
+  const d = new Date(ts);
+  if (isNaN(d)) return { text: ts, accent: true };
+  return { text: new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(d), accent: true };
+}
+
+function prop(label, value, accent) {
+  return `<div class="detail-prop"><span class="detail-prop-label">${label}</span><span class="detail-prop-value${accent ? ' accent' : ''}">${esc(String(value))}</span></div>`;
+}
+
+function hideAllActions() {
+  [dom.launchArea, dom.installArea, dom.launchingArea, dom.runningArea, dom.notLaunchable].forEach(el => { if (el) el.classList.add('action-hidden'); });
+  resetInstallUI();
+}
+
+function show(el) { if (el) el.classList.remove('action-hidden'); }
+
+function showNotLaunchable(message) {
+  if (dom.notLaunchableText) dom.notLaunchableText.textContent = message;
+  show(dom.notLaunchable);
+}
+
+function refreshSelectedVersionActionState() {
+  if (!state.selectedVersion) return;
+  hideAllActions();
+  const version = state.selectedVersion;
+
+  if (state.launching) {
+    if (state.runningVersionId === version.id) show(dom.launchingArea);
+    else showNotLaunchable('Another launch is already being prepared.');
+    return;
+  }
+
+  if (state.gameRunning) {
+    if (state.runningVersionId === version.id) show(dom.runningArea);
+    else showNotLaunchable(`${state.runningVersionId} is already running.`);
+    return;
+  }
+
+  if (version.launchable) {
+    show(dom.launchArea);
+  } else {
+    show(dom.installArea);
+    if (dom.installText) dom.installText.textContent = version.status_detail || 'Game files need downloading';
+    if (dom.installBtn) dom.installBtn.dataset.installTarget = version.needs_install || version.id;
+  }
+}
+
+// ══════════════════════════════════════════
+// SIDEBAR
+// ══════════════════════════════════════════
+
+function renderVersionList() {
+  if (!dom.versionList) return;
+  const filtered = filterVersions(state.versions);
+
+  if (state.versions.length === 0) {
+    dom.versionList.innerHTML = `<div class="loading-placeholder"><span>No versions installed</span></div>`;
+    if (dom.emptyTitle) dom.emptyTitle.textContent = 'No versions installed';
+    if (dom.emptySub) dom.emptySub.textContent = 'Add a Minecraft version to get started';
+    dom.emptyAddBtn?.classList.remove('hidden');
+    return;
+  }
+
+  dom.emptyAddBtn?.classList.add('hidden');
+  if (!state.selectedVersion) {
+    if (dom.emptyTitle) dom.emptyTitle.textContent = 'Select a version';
+    if (dom.emptySub) dom.emptySub.textContent = 'Choose a Minecraft version from the sidebar to launch';
+  }
 
   if (filtered.length === 0) {
     dom.versionList.innerHTML = `<div class="loading-placeholder"><span>No matching versions</span></div>`;
@@ -253,30 +510,27 @@ function renderVersionList() {
   }
 
   let html = '';
-  const chevronSvg = `<svg class="version-group-chevron" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>`;
+  const chevron = `<svg class="version-group-chevron" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>`;
 
   const renderGroup = (key, label, versions) => {
     if (!versions.length) return;
     const collapsed = local.collapsedGroups[key];
-    html += `<div class="version-group-label${collapsed ? ' collapsed' : ''}" data-group="${key}">${chevronSvg}${label} <span style="opacity:0.4;font-weight:400;margin-left:2px">${versions.length}</span></div>`;
+    html += `<div class="version-group-label${collapsed ? ' collapsed' : ''}" data-group="${key}">${chevron}${label} <span style="opacity:.4;font-weight:400;margin-left:2px">${versions.length}</span></div>`;
     html += `<div class="version-group-items${collapsed ? ' collapsed' : ''}" data-group-items="${key}">`;
     versions.forEach((v, i) => {
       const isModded = !!v.inherits_from;
-      const badgeClass = isModded ? 'badge-modded' : v.type === 'release' ? 'badge-release' : v.type === 'snapshot' ? 'badge-snapshot' : 'badge-old';
-      const badgeText = isModded ? 'MOD' : v.type === 'release' ? 'REL' : v.type === 'snapshot' ? 'SNAP' : v.type?.toUpperCase()?.slice(0, 4) || '?';
+      const bc = isModded ? 'badge-modded' : v.type === 'release' ? 'badge-release' : v.type === 'snapshot' ? 'badge-snapshot' : 'badge-old';
+      const bt = isModded ? 'MOD' : v.type === 'release' ? 'REL' : v.type === 'snapshot' ? 'SNAP' : v.type?.toUpperCase()?.slice(0, 4) || '?';
       const isRunning = state.gameRunning && state.runningVersionId === v.id;
-      const dotClass = isRunning ? 'running' : v.launchable ? 'ok' : 'missing';
-      const dimClass = v.launchable ? '' : 'dimmed';
-      const selected = state.selectedVersion?.id === v.id ? 'selected' : '';
-      const runningClass = isRunning ? 'is-running' : '';
-      html += `<div class="version-item ${dimClass} ${selected} ${runningClass}" data-id="${v.id}" style="animation-delay:${i*15}ms">
-        <div class="version-dot ${dotClass}"></div>
-        <span class="version-name">${esc(v.id)}</span>
-        ${isRunning ? '<span class="version-running-tag">LIVE</span>' : ''}
-        <span class="version-badge ${badgeClass}">${badgeText}</span></div>`;
+      const dc = isRunning ? 'running' : v.launchable ? 'ok' : 'missing';
+      const sel = state.selectedVersion?.id === v.id ? 'selected' : '';
+      const rc = isRunning ? 'is-running' : '';
+      const dim = v.launchable ? '' : 'dimmed';
+      html += `<button type="button" class="version-item ${dim} ${sel} ${rc}" data-id="${v.id}" aria-pressed="${sel ? 'true' : 'false'}" aria-label="Select version ${esc(v.id)}" style="animation-delay:${i * 15}ms"><div class="version-dot ${dc}"></div><span class="version-name">${esc(v.id)}</span>${isRunning ? '<span class="version-running-tag">LIVE</span>' : ''}<span class="version-badge ${bc}">${bt}</span></button>`;
     });
     html += `</div>`;
   };
+
   renderGroup('release', 'Releases', groups.release);
   renderGroup('modded', 'Modded', groups.modded);
   renderGroup('snapshot', 'Snapshots', groups.snapshot);
@@ -284,13 +538,18 @@ function renderVersionList() {
   dom.versionList.innerHTML = html;
 
   dom.versionList.querySelectorAll('.version-item').forEach(el => {
+    const v = state.versions.find(version => version.id === el.dataset.id);
+    el.addEventListener('focus', () => {
+      if (!v || state.selectedVersion?.id === v.id) return;
+      state.selectedVersion = v;
+      setPage('launcher');
+      renderSelectedVersion();
+    });
     el.addEventListener('click', () => {
-      const v = state.versions.find(v => v.id === el.dataset.id);
       if (v) selectVersion(v);
     });
   });
 
-  // Collapsible group headers
   dom.versionList.querySelectorAll('.version-group-label').forEach(label => {
     label.addEventListener('click', () => {
       const key = label.dataset.group;
@@ -308,75 +567,25 @@ function filterVersions(versions) {
   if (state.filter === 'release') list = list.filter(v => v.type === 'release' && !v.inherits_from);
   else if (state.filter === 'snapshot') list = list.filter(v => v.type === 'snapshot' && !v.inherits_from);
   else if (state.filter === 'modded') list = list.filter(v => !!v.inherits_from);
-  if (state.search) {
-    const q = state.search.toLowerCase();
-    list = list.filter(v => v.id.toLowerCase().includes(q));
-  }
+  if (state.search) { const q = state.search.toLowerCase(); list = list.filter(v => v.id.toLowerCase().includes(q)); }
   return list;
 }
 
-// ── Version Selection ──
-
-function selectVersion(version) {
-  state.selectedVersion = version;
-  dom.versionList.querySelectorAll('.version-item').forEach(el => el.classList.toggle('selected', el.dataset.id === version.id));
-
-  dom.emptyState.classList.add('hidden');
-  dom.versionDetail.classList.remove('hidden');
-  dom.detailId.textContent = version.id;
-
-  const isModded = !!version.inherits_from;
-  const badgeClass = isModded ? 'badge-modded' : version.type === 'release' ? 'badge-release' : version.type === 'snapshot' ? 'badge-snapshot' : 'badge-old';
-  dom.detailBadge.className = `detail-badge ${badgeClass}`;
-  dom.detailBadge.textContent = isModded ? 'Modded' : version.type === 'release' ? 'Release' : version.type === 'snapshot' ? 'Snapshot' : version.type || 'Unknown';
-
-  let meta = '';
-  if (version.java_component) meta += `<span>${version.java_component}</span>`;
-  if (version.java_major) meta += `<span>Java ${version.java_major}</span>`;
-  if (version.inherits_from) meta += `<span>Based on ${esc(version.inherits_from)}</span>`;
-  if (version.release_time) { const d = new Date(version.release_time); if (!isNaN(d)) meta += `<span>${d.toLocaleDateString()}</span>`; }
-  dom.detailMeta.innerHTML = meta;
-
-  // Hide all areas
-  dom.launchArea.classList.add('hidden');
-  dom.installArea.classList.add('hidden');
-  dom.notLaunchable.classList.add('hidden');
-  dom.launchingArea.classList.add('hidden');
-  dom.runningArea.classList.add('hidden');
-  resetInstallUI();
-
-  if (state.launching && state.runningVersionId === version.id) {
-    dom.launchingArea.classList.remove('hidden');
-  } else if (state.gameRunning && state.runningVersionId === version.id) {
-    dom.runningArea.classList.remove('hidden');
-  } else if (version.launchable) {
-    dom.launchArea.classList.remove('hidden');
-  } else if (version.status === 'incomplete') {
-    dom.installArea.classList.remove('hidden');
-    dom.installText.textContent = version.status_detail || 'Game files need downloading';
-    dom.installBtn.dataset.installTarget = version.needs_install || version.id;
-  } else {
-    dom.installArea.classList.remove('hidden');
-    dom.installText.textContent = version.status_detail || 'Game files need downloading';
-    dom.installBtn.dataset.installTarget = version.needs_install || version.id;
-  }
-}
-
-// ── Install (for incomplete local versions) ──
+// ══════════════════════════════════════════
+// INSTALL
+// ══════════════════════════════════════════
 
 async function installVersion() {
   if (!state.selectedVersion || state.installing) return;
   state.installing = true;
-
-  const target = dom.installBtn.dataset.installTarget || state.selectedVersion.id;
-
-  dom.installBtn.disabled = true;
-  dom.installBtn.querySelector('.install-btn-text').textContent = 'INSTALLING...';
-  dom.installProgress.classList.remove('hidden');
-  dom.progressText.textContent = target !== state.selectedVersion.id
-    ? `Installing base version ${target}...`
-    : 'Starting download...';
-
+  const target = dom.installBtn?.dataset.installTarget || state.selectedVersion.id;
+  if (dom.installBtn) {
+    dom.installBtn.disabled = true;
+    const label = dom.installBtn.querySelector('.install-btn-text');
+    if (label) label.textContent = 'INSTALLING...';
+  }
+  show(dom.installProgress);
+  if (dom.progressText) dom.progressText.textContent = target !== state.selectedVersion.id ? `Installing base version ${target}...` : 'Starting download...';
   try {
     const res = await api('POST', '/install', { version_id: target });
     if (res.error) { showError(res.error); resetInstallUI(); return; }
@@ -390,14 +599,11 @@ async function installVersion() {
 async function installFromCatalog(versionId, manifestUrl) {
   if (state.installing) return;
   state.installing = true;
-
   try {
     const res = await api('POST', '/install', { version_id: versionId, manifest_url: manifestUrl });
     if (res.error) { showError(res.error); state.installing = false; return; }
-
-    const btn = dom.catalogList.querySelector(`[data-install-id="${versionId}"]`);
+    const btn = dom.catalogList?.querySelector(`[data-install-id="${versionId}"]`);
     if (btn) { btn.disabled = true; btn.textContent = 'Installing...'; }
-
     connectInstallSSE(res.install_id, versionId);
   } catch (err) {
     showError('Install failed: ' + err.message);
@@ -407,10 +613,8 @@ async function installFromCatalog(versionId, manifestUrl) {
 
 function connectInstallSSE(installId, catalogVersionId) {
   if (state.installEventSource) state.installEventSource.close();
-
   const es = new EventSource(`${API}/install/${installId}/events`);
   state.installEventSource = es;
-
   es.addEventListener('progress', (e) => {
     const d = JSON.parse(e.data);
     let pct = 0;
@@ -419,501 +623,771 @@ function connectInstallSSE(installId, catalogVersionId) {
     else if (d.phase === 'libraries' && d.total > 0) pct = 30 + Math.round((d.current / d.total) * 65);
     else if (d.phase === 'done') pct = 100;
     else if (d.phase === 'error') { showError(d.error); onInstallDone(catalogVersionId); return; }
-
-    dom.progressFill.style.width = pct + '%';
-    dom.progressText.textContent = d.phase === 'done' ? 'Complete!' :
-      d.phase === 'libraries' ? `Libraries (${d.current}/${d.total})` :
-      d.phase === 'client_jar' ? 'Downloading game...' :
-      d.phase === 'version_json' ? 'Fetching version info...' : d.phase;
-
+    if (dom.progressFill) dom.progressFill.style.width = pct + '%';
+    if (dom.progressText) {
+      dom.progressText.textContent = d.phase === 'done' ? 'Complete!' : d.phase === 'libraries' ? `Libraries (${d.current}/${d.total})` : d.phase === 'client_jar' ? 'Downloading game...' : d.phase === 'version_json' ? 'Fetching version info...' : d.phase;
+    }
     if (d.done) onInstallDone(catalogVersionId);
   });
-
   es.onerror = () => { if (state.installing) onInstallDone(catalogVersionId); };
 }
 
 async function onInstallDone(catalogVersionId) {
   state.installing = false;
   if (state.installEventSource) { state.installEventSource.close(); state.installEventSource = null; }
-
-  dom.progressFill.style.width = '100%';
-  dom.progressText.textContent = 'Complete!';
-
+  if (dom.progressFill) dom.progressFill.style.width = '100%';
+  if (dom.progressText) dom.progressText.textContent = 'Complete!';
   try {
     const res = await api('GET', '/versions');
     state.versions = res.versions || [];
     renderVersionList();
-
     if (catalogVersionId) {
-      const btn = dom.catalogList.querySelector(`[data-install-id="${catalogVersionId}"]`);
-      if (btn) { btn.outerHTML = `<span class="catalog-installed-badge">Installed</span>`; }
+      const btn = dom.catalogList?.querySelector(`[data-install-id="${catalogVersionId}"]`);
+      if (btn) btn.outerHTML = `<span class="catalog-installed-badge">Installed</span>`;
     }
-
     if (state.selectedVersion) {
       const updated = state.versions.find(v => v.id === state.selectedVersion.id);
-      if (updated) selectVersion(updated);
+      if (updated) {
+        state.selectedVersion = updated;
+        renderSelectedVersion();
+      }
     }
-  } catch { resetInstallUI(); }
+  } catch {
+    resetInstallUI();
+  }
 }
 
 function resetInstallUI() {
   state.installing = false;
   if (dom.installBtn) {
     dom.installBtn.disabled = false;
-    const txt = dom.installBtn.querySelector('.install-btn-text');
-    if (txt) txt.textContent = 'INSTALL';
+    const t = dom.installBtn.querySelector('.install-btn-text');
+    if (t) t.textContent = 'INSTALL';
   }
-  dom.installProgress.classList.add('hidden');
-  dom.progressFill.style.width = '0%';
+  dom.installProgress?.classList.add('action-hidden');
+  if (dom.progressFill) dom.progressFill.style.width = '0%';
 }
 
-// ── Catalog Modal ──
+// ══════════════════════════════════════════
+// CATALOG
+// ══════════════════════════════════════════
 
 async function openCatalog() {
-  dom.catalogModal.classList.remove('hidden');
-  dom.catalogSearch.value = '';
+  restoreFocusEl = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  dom.catalogModal?.classList.remove('hidden');
+  if (dom.catalogSearch) dom.catalogSearch.value = '';
   state.catalogSearch = '';
-  dom.catalogList.innerHTML = `<div class="loading-placeholder"><div class="spinner"></div><span>Loading available versions...</span></div>`;
-
+  if (dom.catalogList) dom.catalogList.innerHTML = `<div class="loading-placeholder"><div class="spinner"></div><span>Loading...</span></div>`;
+  setTimeout(() => dom.catalogSearch?.focus(), 0);
   try {
-    const res = await api('GET', '/catalog');
-    state.catalog = res;
+    state.catalog = await api('GET', '/catalog');
     renderCatalog();
-  } catch (err) {
-    dom.catalogList.innerHTML = `<div class="loading-placeholder"><span style="color:var(--red)">Failed to load catalog</span></div>`;
+  } catch {
+    if (dom.catalogList) dom.catalogList.innerHTML = `<div class="loading-placeholder"><span style="color:var(--red)">Failed to load</span></div>`;
   }
 }
 
-function closeCatalog() { dom.catalogModal.classList.add('hidden'); }
+function closeCatalog() {
+  dom.catalogModal?.classList.add('hidden');
+  restoreFocusEl?.focus?.();
+}
 
 function renderCatalog() {
-  if (!state.catalog?.versions) return;
-
+  if (!state.catalog?.versions || !dom.catalogList) return;
   let list = state.catalog.versions.filter(v => v.type === state.catalogFilter);
-  if (state.catalogSearch) {
-    const q = state.catalogSearch.toLowerCase();
-    list = list.filter(v => v.id.toLowerCase().includes(q));
-  }
-
+  if (state.catalogSearch) { const q = state.catalogSearch.toLowerCase(); list = list.filter(v => v.id.toLowerCase().includes(q)); }
   const display = list.slice(0, 50);
-  const hasMore = list.length > 50;
-
-  if (display.length === 0) {
+  if (!display.length) {
     dom.catalogList.innerHTML = `<div class="loading-placeholder"><span>No versions found</span></div>`;
     return;
   }
-
   dom.catalogList.innerHTML = display.map(v => {
-    const badgeClass = v.type === 'release' ? 'badge-release' : v.type === 'snapshot' ? 'badge-snapshot' : 'badge-old';
-    const badgeText = v.type === 'release' ? 'REL' : v.type === 'snapshot' ? 'SNAP' : v.type.toUpperCase().slice(0, 4);
-    const date = new Date(v.release_time);
-    const dateStr = !isNaN(date) ? date.toLocaleDateString() : '';
-    const action = v.installed
-      ? `<span class="catalog-installed-badge">Installed</span>`
-      : `<button class="catalog-install-btn" data-install-id="${esc(v.id)}" data-url="${esc(v.url)}">Install</button>`;
-    return `<div class="catalog-item">
-      <div class="catalog-item-info"><span class="catalog-item-id">${esc(v.id)}</span><span class="catalog-item-date">${dateStr}</span></div>
-      <span class="version-badge ${badgeClass}">${badgeText}</span>
-      ${action}</div>`;
-  }).join('') + (hasMore ? `<div class="loading-placeholder"><span style="font-size:10px;color:var(--text-muted)">Showing 50 of ${list.length} — use search to narrow</span></div>` : '');
-
-  dom.catalogList.querySelectorAll('.catalog-install-btn').forEach(btn => {
-    btn.addEventListener('click', () => installFromCatalog(btn.dataset.installId, btn.dataset.url));
-  });
+    const bc = v.type === 'release' ? 'badge-release' : v.type === 'snapshot' ? 'badge-snapshot' : 'badge-old';
+    const bt = v.type === 'release' ? 'REL' : v.type === 'snapshot' ? 'SNAP' : v.type.toUpperCase().slice(0, 4);
+    const ds = new Date(v.release_time);
+    const dateStr = !isNaN(ds) ? ds.toLocaleDateString() : '';
+    const act = v.installed ? `<span class="catalog-installed-badge">Installed</span>` : `<button class="catalog-install-btn" data-install-id="${esc(v.id)}" data-url="${esc(v.url)}">Install</button>`;
+    return `<div class="catalog-item"><div class="catalog-item-info"><span class="catalog-item-id">${esc(v.id)}</span><span class="catalog-item-date">${dateStr}</span></div><span class="version-badge ${bc}">${bt}</span>${act}</div>`;
+  }).join('') + (list.length > 50 ? `<div class="loading-placeholder"><span style="font-size:10px;color:var(--text-muted)">Showing 50 of ${list.length}</span></div>` : '');
+  dom.catalogList.querySelectorAll('.catalog-install-btn').forEach(btn => btn.addEventListener('click', () => installFromCatalog(btn.dataset.installId, btn.dataset.url)));
 }
 
-// ── Launch ──
+// ══════════════════════════════════════════
+// LAUNCH
+// ══════════════════════════════════════════
+
+let launchSeqInterval = null;
+let runningAnimInterval = null;
+let uptimeInterval = null;
+let uptimeStart = 0;
+let restoreFocusEl = null;
+
+function clearLaunchVisualState() {
+  endLaunchSequence();
+  stopRunningAnimation();
+  stopUptime();
+  if (dom.runningUptime) dom.runningUptime.textContent = '0:00';
+  if (dom.runningPid) dom.runningPid.textContent = '';
+  if (dom.runningVersion) dom.runningVersion.textContent = '';
+}
 
 async function launchGame() {
   if (!state.selectedVersion || state.gameRunning || state.launching) return;
-  const username = dom.usernameInput.value.trim() || 'Player';
-  const maxMemMB = Math.round(parseFloat(dom.memorySlider.value) * 1024);
+  Sound.init();
 
+  const versionId = state.selectedVersion.id;
+  const username = dom.usernameInput?.value.trim() || 'Player';
+  const maxMemMB = Math.round(parseFloat(dom.memorySlider?.value || 4) * 1024);
+
+  clearLaunchVisualState();
   state.launching = true;
-  state.runningVersionId = state.selectedVersion.id;
-  dom.launchArea.classList.add('hidden');
-  dom.launchingArea.classList.remove('hidden');
+  state.runningVersionId = versionId;
+  state.activeSession = null;
+  if (dom.launchSeqVersion) dom.launchSeqVersion.textContent = versionId;
+  refreshSelectedVersionActionState();
   startLaunchSequence();
   renderVersionList();
 
   try {
-    const res = await api('POST', '/launch', { version_id: state.selectedVersion.id, username, max_memory_mb: maxMemMB });
-    if (res.error) { showError(res.error); endLaunchSequence(); resetLaunchBtn(); return; }
+    const res = await api('POST', '/launch', { version_id: versionId, username, max_memory_mb: maxMemMB });
+    if (res.error) {
+      showError(res.error);
+      clearLaunchVisualState();
+      state.launching = false;
+      state.runningVersionId = null;
+      refreshSelectedVersionActionState();
+      renderVersionList();
+      return;
+    }
 
     state.activeSession = res.session_id;
+    state.launching = false;
+    state.gameRunning = true;
+    state.runningVersionId = versionId;
 
-    setTimeout(() => {
-      state.launching = false;
-      state.gameRunning = true;
-      endLaunchSequence();
-      dom.launchingArea.classList.add('hidden');
-      dom.runningArea.classList.remove('hidden');
-      dom.runningVersion.textContent = state.selectedVersion?.id || '';
-      dom.runningPid.textContent = `PID ${res.pid}`;
-      startRunningAnimation();
-      startUptime();
-      renderVersionList();
-    }, 1800);
-
-    dom.logPanel.classList.add('expanded');
+    endLaunchSequence();
+    Sound.ui('launchSuccess');
+    if (dom.runningVersion) dom.runningVersion.textContent = versionId;
+    if (dom.runningPid) dom.runningPid.textContent = `PID ${res.pid}`;
+    startRunningAnimation();
+    startUptime();
+    refreshSelectedVersionActionState();
+    renderVersionList();
+    dom.logPanel?.classList.add('expanded');
     connectLaunchSSE(res.session_id);
-    api('PUT', '/config', { username, max_memory_mb: maxMemMB, last_version_id: state.selectedVersion.id });
+    markVersionLaunched(versionId, res.launched_at || new Date().toISOString(), username, maxMemMB);
   } catch (err) {
     showError(err.message);
-    endLaunchSequence();
+    clearLaunchVisualState();
     state.launching = false;
     state.runningVersionId = null;
-    dom.launchingArea.classList.add('hidden');
-    dom.launchArea.classList.remove('hidden');
-    resetLaunchBtn();
+    refreshSelectedVersionActionState();
     renderVersionList();
   }
 }
 
-function resetLaunchBtn() {
-  dom.launchBtn.querySelector('.launch-btn-text').textContent = 'LAUNCH';
-  dom.launchBtn.disabled = false;
+function markVersionLaunched(versionId, launchedAt, username, maxMemMB) {
+  if (!state.config) state.config = {};
+  state.config.username = username;
+  state.config.max_memory_mb = maxMemMB;
+  state.config.last_version_id = versionId;
+  state.config.last_launched = { ...(state.config.last_launched || {}), [versionId]: launchedAt };
+  if (state.selectedVersion?.id === versionId && dom.detailProps) dom.detailProps.innerHTML = buildVersionProps(state.selectedVersion);
 }
 
 function connectLaunchSSE(sessionId) {
   if (state.eventSource) state.eventSource.close();
   const es = new EventSource(`${API}/launch/${sessionId}/events`);
   state.eventSource = es;
-  es.addEventListener('status', (e) => { const d = JSON.parse(e.data); if (d.state === 'exited') onGameExited(d.exit_code); });
-  es.addEventListener('log', (e) => { const d = JSON.parse(e.data); appendLog(d.source, d.text); });
-  es.onerror = () => { if (state.gameRunning) onGameExited(-1); };
+  es.addEventListener('status', (e) => {
+    if (state.activeSession !== sessionId) return;
+    const d = JSON.parse(e.data);
+    if (d.state === 'exited') onGameExited(d.exit_code, sessionId);
+  });
+  es.addEventListener('log', (e) => {
+    if (state.activeSession !== sessionId) return;
+    const d = JSON.parse(e.data);
+    appendLog(d.source, d.text);
+  });
+  es.onerror = () => {
+    if (state.activeSession === sessionId && state.gameRunning) onGameExited(-1, sessionId);
+  };
 }
 
-function onGameExited(exitCode) {
+function onGameExited(exitCode, sessionId) {
+  if (sessionId && state.activeSession && sessionId !== state.activeSession) return;
   state.gameRunning = false;
   state.launching = false;
   state.runningVersionId = null;
   state.activeSession = null;
   if (state.eventSource) { state.eventSource.close(); state.eventSource = null; }
-  stopRunningAnimation();
-  stopUptime();
-  dom.runningArea.classList.add('hidden');
-  dom.launchingArea.classList.add('hidden');
-  if (state.selectedVersion?.launchable) { dom.launchArea.classList.remove('hidden'); resetLaunchBtn(); }
+  clearLaunchVisualState();
+  refreshSelectedVersionActionState();
   appendLog('system', `Game exited with code ${exitCode}`);
   renderVersionList();
 }
 
 async function killGame() {
   if (!state.activeSession) return;
-  try { await api('POST', `/launch/${state.activeSession}/kill`); } catch (err) { showError('Failed to kill: ' + err.message); }
+  try {
+    await api('POST', `/launch/${state.activeSession}/kill`);
+  } catch (err) {
+    showError('Failed to kill: ' + err.message);
+  }
 }
 
-// ── Log Panel ──
+// ── Log ──
 
 function appendLog(source, text) {
   const line = document.createElement('div');
   line.className = `log-line ${source}`;
   line.textContent = text;
-  dom.logLines.appendChild(line);
+  dom.logLines?.appendChild(line);
   state.logLines++;
-  dom.logCount.textContent = `${state.logLines} lines`;
-  dom.logContent.scrollTop = dom.logContent.scrollHeight;
+  if (dom.logCount) dom.logCount.textContent = `${state.logLines} lines`;
+  if (dom.logContent) dom.logContent.scrollTop = dom.logContent.scrollHeight;
 }
 
 // ── Settings ──
 
 function openSettings() {
-  dom.settingsModal.classList.remove('hidden');
-  if (state.config) {
-    dom.settingJavaPath.value = state.config.java_path_override || '';
-    dom.settingWidth.value = state.config.window_width || '';
-    dom.settingHeight.value = state.config.window_height || '';
-  }
-  // Mark active theme swatch
-  dom.themePicker?.querySelectorAll('.theme-swatch').forEach(s => {
-    s.classList.toggle('active', s.dataset.theme === local.theme);
-  });
+  restoreFocusEl = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  syncSettingsForm();
+  setPage('settings');
+  if (dom.settingsContent) dom.settingsContent.scrollTop = 0;
+  syncSettingsSectionNav();
   loadJavaRuntimes();
+  setTimeout(() => dom.settingsNav?.querySelector('.settings-nav-btn.active')?.focus(), 0);
 }
 
-function closeSettings() { dom.settingsModal.classList.add('hidden'); }
+function closeSettings() {
+  setPage('launcher');
+  renderSelectedVersion();
+  restoreFocusEl?.focus?.();
+}
+
+function syncSettingsForm() {
+  if (state.config) {
+    if (dom.settingJavaPath) dom.settingJavaPath.value = state.config.java_path_override || '';
+    if (dom.settingWidth) dom.settingWidth.value = state.config.window_width || '';
+    if (dom.settingHeight) dom.settingHeight.value = state.config.window_height || '';
+  }
+  dom.themePicker?.querySelectorAll('.theme-swatch').forEach(s => s.classList.toggle('active', s.dataset.theme === local.theme));
+  if (dom.hueSlider) dom.hueSlider.value = local.customHue;
+  updateHuePreview(local.customHue, dom.hueSwatchBg, dom.hueSwatchSurface, dom.hueSwatchAccent, dom.hueSwatchText);
+  if (dom.soundsToggle) dom.soundsToggle.checked = Sound.enabled;
+}
 
 async function saveSettings() {
-  const u = {};
-  const jp = dom.settingJavaPath.value.trim();
-  if (jp !== (state.config?.java_path_override || '')) u.java_path_override = jp;
-  const w = parseInt(dom.settingWidth.value) || 0;
-  const h = parseInt(dom.settingHeight.value) || 0;
-  if (w > 0) u.window_width = w;
-  if (h > 0) u.window_height = h;
-  if (Object.keys(u).length) { const r = await api('PUT', '/config', u); if (!r.error) state.config = r; }
+  const updates = {};
+  const jp = dom.settingJavaPath?.value.trim() || '';
+  if (jp !== (state.config?.java_path_override || '')) updates.java_path_override = jp;
+
+  const widthRaw = dom.settingWidth?.value.trim() || '';
+  const heightRaw = dom.settingHeight?.value.trim() || '';
+  const w = widthRaw === '' ? 0 : parseInt(widthRaw, 10) || 0;
+  const h = heightRaw === '' ? 0 : parseInt(heightRaw, 10) || 0;
+  if (w !== (state.config?.window_width || 0)) updates.window_width = w;
+  if (h !== (state.config?.window_height || 0)) updates.window_height = h;
+
+  if (Object.keys(updates).length) {
+    const r = await api('PUT', '/config', updates);
+    if (!r.error) state.config = r;
+  }
   closeSettings();
 }
 
+function syncSettingsSectionNav() {
+  if (!dom.settingsContent || !dom.settingsNav) return;
+  const sections = [...dom.settingsContent.querySelectorAll('.settings-section-card')].filter(section => !section.classList.contains('hidden'));
+  if (!sections.length) return;
+  const contentTop = dom.settingsContent.getBoundingClientRect().top;
+  let activeId = sections[0].id;
+  let best = Number.POSITIVE_INFINITY;
+  sections.forEach(section => {
+    const distance = Math.abs(section.getBoundingClientRect().top - contentTop - 18);
+    if (distance < best) {
+      best = distance;
+      activeId = section.id;
+    }
+  });
+  dom.settingsNav.querySelectorAll('.settings-nav-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.settingsTarget === activeId));
+}
+
 async function loadJavaRuntimes() {
+  if (!dom.javaRuntimes) return;
   try {
     const res = await api('GET', '/java');
     const rt = res.runtimes || [];
     dom.javaRuntimes.innerHTML = rt.length === 0 ? '<span class="setting-hint">No runtimes detected</span>' :
-      rt.map(r => `<div class="java-runtime-item"><span class="java-runtime-component">${esc(r.Component||r.component)}</span><span class="java-runtime-source">${esc(r.Source||r.source)}</span></div>`).join('');
-  } catch { dom.javaRuntimes.innerHTML = '<span class="setting-hint">Failed to load</span>'; }
+      rt.map(r => `<div class="java-runtime-item"><span class="java-runtime-component">${esc(r.Component || r.component)}</span><span class="java-runtime-source">${esc(r.Source || r.source)}</span></div>`).join('');
+  } catch {
+    dom.javaRuntimes.innerHTML = '<span class="setting-hint">Failed to load</span>';
+  }
 }
 
 // ── Onboarding ──
 
 function showOnboarding() {
-  dom.onboarding.classList.remove('hidden');
+  dom.onboarding?.classList.remove('hidden');
   if (state.systemInfo?.total_memory_mb) {
     const gb = Math.floor(state.systemInfo.total_memory_mb / 1024);
-    dom.onboardingRamInfo.textContent = `Your system has ${gb} GB of RAM`;
-    dom.onboardingMemorySlider.max = gb;
-    const { rec, text } = getMemoryRecommendation(gb);
-    dom.onboardingMemorySlider.value = rec;
-    dom.onboardingMemoryValue.textContent = fmtMem(rec);
-    dom.onboardingRec.textContent = text;
+    if (dom.onboardingRamInfo) dom.onboardingRamInfo.textContent = `Your system has ${gb} GB of RAM`;
+    if (dom.onboardingMemorySlider) {
+      dom.onboardingMemorySlider.max = gb;
+      const { rec, text } = getMemoryRecommendation(gb);
+      dom.onboardingMemorySlider.value = rec;
+      if (dom.onboardingMemoryValue) dom.onboardingMemoryValue.textContent = fmtMem(rec);
+      if (dom.onboardingRec) dom.onboardingRec.textContent = text;
+    }
+  }
+  if (dom.obHueSlider) {
+    dom.obHueSlider.value = local.customHue;
+    updateObHuePreview(local.customHue);
   }
 }
 
 function onboardingStep(n) {
-  [dom.onboardingStep1, dom.onboardingStep2, dom.onboardingStep3].forEach((s, i) => s.classList.toggle('hidden', i !== n - 1));
-  [dom.dot1, dom.dot2, dom.dot3].forEach((d, i) => d.classList.toggle('active', i === n - 1));
+  [dom.onboardingStep1, dom.onboardingStep2, dom.onboardingStep3, dom.onboardingStep4].forEach((s, i) => { if (s) s.classList.toggle('hidden', i !== n - 1); });
+  [dom.dot1, dom.dot2, dom.dot3, dom.dot4].forEach((d, i) => { if (d) d.classList.toggle('active', i === n - 1); });
 }
 
 async function finishOnboarding() {
-  const username = dom.onboardingUsername.value.trim() || 'Player';
-  const memGB = parseFloat(dom.onboardingMemorySlider.value);
-  dom.usernameInput.value = username;
-  dom.memorySlider.value = memGB;
-  dom.memoryValue.textContent = fmtMem(memGB);
-  try { const r = await api('PUT', '/config', { username, max_memory_mb: Math.round(memGB * 1024) }); if (!r.error) state.config = r; } catch {}
+  const username = dom.onboardingUsername?.value.trim() || 'Player';
+  const memGB = parseFloat(dom.onboardingMemorySlider?.value || 4);
+  if (dom.usernameInput) dom.usernameInput.value = username;
+  if (dom.memorySlider) {
+    dom.memorySlider.value = memGB;
+    if (dom.memoryValue) dom.memoryValue.textContent = fmtMem(memGB);
+  }
+  try {
+    const r = await api('PUT', '/config', { username, max_memory_mb: Math.round(memGB * 1024) });
+    if (!r.error) state.config = r;
+  } catch {}
   try { await api('POST', '/onboarding/complete'); } catch {}
-  dom.onboarding.classList.add('hidden');
+  dom.onboarding?.classList.add('hidden');
 }
 
-// ── Launch Sequence Animation ──
+function updateObHuePreview(hue) {
+  const vars = generateThemeFromHue(hue);
+  if (dom.obHueChipBg) dom.obHueChipBg.style.background = vars['--bg-deep'];
+  if (dom.obHueChipAccent) dom.obHueChipAccent.style.background = vars['--accent'];
+  if (dom.obHueChipText) dom.obHueChipText.style.background = vars['--text'];
+}
+
+// ── Animations ──
 
 const LAUNCH_FRAMES = [
-  [
-    '  ┌──────────┐  ',
-    '  │ ▓▓▓▓▓▓▓▓ │  ',
-    '  │ ▓▓    ▓▓ │  ',
-    '  │ ▓▓    ▓▓ │  ',
-    '  │ ▓▓▓▓▓▓▓▓ │  ',
-    '  └──────────┘  ',
-  ],
-  [
-    '  ┌──────────┐  ',
-    '  │ ░▓▓▓▓▓▓░ │  ',
-    '  │ ▓░░  ░░▓ │  ',
-    '  │ ▓░░  ░░▓ │  ',
-    '  │ ░▓▓▓▓▓▓░ │  ',
-    '  └──────────┘  ',
-  ],
-  [
-    '  ┌──────────┐  ',
-    '  │ ░░▓▓▓▓░░ │  ',
-    '  │ ░▓▓  ▓▓░ │  ',
-    '  │ ░▓▓  ▓▓░ │  ',
-    '  │ ░░▓▓▓▓░░ │  ',
-    '  └──────────┘  ',
-  ],
-  [
-    '  ╔══════════╗  ',
-    '  ║ ▓▓▓▓▓▓▓▓ ║  ',
-    '  ║ ▓▓ ◆◆ ▓▓ ║  ',
-    '  ║ ▓▓ ◆◆ ▓▓ ║  ',
-    '  ║ ▓▓▓▓▓▓▓▓ ║  ',
-    '  ╚══════════╝  ',
-  ],
-  [
-    '  ╔══════════╗  ',
-    '  ║ ████████ ║  ',
-    '  ║ ██ ◈◈ ██ ║  ',
-    '  ║ ██ ◈◈ ██ ║  ',
-    '  ║ ████████ ║  ',
-    '  ╚══════════╝  ',
-  ],
+  ['   ╭──────────────╮   ', '   │  ▓▓▓▓▓▓▓▓▓▓  │   ', '   │ ▓▓  ◉  ◉  ▓▓ │   ', '   │ ▓▓   ▔▔   ▓▓ │   ', '   │ ▓▓  ╲__/  ▓▓ │   ', '   │  ▓▓▓▓▓▓▓▓▓▓  │   ', '   ╰──────────────╯   '],
+  ['   ╭──────────────╮   ', '   │  ░▓▓▓▓▓▓▓▓░  │   ', '   │ ▓░  ◌  ◌  ░▓ │   ', '   │ ▓░   ▔▔   ░▓ │   ', '   │ ▓░  ╲__/  ░▓ │   ', '   │  ░▓▓▓▓▓▓▓▓░  │   ', '   ╰──────────────╯   '],
+  ['   ╔══════════════╗   ', '   ║  ██████████  ║   ', '   ║ ██  ◆  ◆  ██ ║   ', '   ║ ██   ▔▔   ██ ║   ', '   ║ ██  ╱__╲  ██ ║   ', '   ║  ██████████  ║   ', '   ╚══════════════╝   '],
+  ['   ╔══════════════╗   ', '   ║  ███▓▓▓▓███  ║   ', '   ║ ██  ◈  ◈  ██ ║   ', '   ║ ██   ▂▂   ██ ║   ', '   ║ ██  ╲──╱  ██ ║   ', '   ║  ███▓▓▓▓███  ║   ', '   ╚══════════════╝   '],
 ];
 
-let launchSeqInterval = null;
-let launchSeqFrame = 0;
-
 function startLaunchSequence() {
-  launchSeqFrame = 0;
+  endLaunchSequence();
+  let f = 0;
   if (dom.launchAscii) dom.launchAscii.textContent = LAUNCH_FRAMES[0].join('\n');
   launchSeqInterval = setInterval(() => {
-    launchSeqFrame = (launchSeqFrame + 1) % LAUNCH_FRAMES.length;
-    if (dom.launchAscii) dom.launchAscii.textContent = LAUNCH_FRAMES[launchSeqFrame].join('\n');
-  }, 350);
+    f = (f + 1) % LAUNCH_FRAMES.length;
+    if (dom.launchAscii) dom.launchAscii.textContent = LAUNCH_FRAMES[f].join('\n');
+  }, 320);
 }
 
 function endLaunchSequence() {
-  if (launchSeqInterval) { clearInterval(launchSeqInterval); launchSeqInterval = null; }
+  if (launchSeqInterval) {
+    clearInterval(launchSeqInterval);
+    launchSeqInterval = null;
+  }
 }
 
-// ── Running ASCII Animation ──
-
-let runningAnimInterval = null;
-
 const RUNNING_FRAMES = [
-  ['╭─────╮', '│ ◈ ◈ │', '│  ▽  │', '╰─────╯'],
-  ['╭─────╮', '│ ◇ ◇ │', '│  △  │', '╰─────╯'],
-  ['╭─────╮', '│ ◆ ◆ │', '│  ▽  │', '╰─────╯'],
-  ['╭─────╮', '│ ◇ ◇ │', '│  ○  │', '╰─────╯'],
+  [' /\\_/\\ ', '( o.o )', ' > ^ < '],
+  [' /\\_/\\ ', '( o.o )', ' > ^ < '],
+  [' /\\_/\\ ', '( -.- )', ' > ^ < '],
+  [' /\\_/\\ ', '( o.o )', ' > ^ < '],
+  [' /\\_/\\ ', '( ^.^ )', ' > ^ < '],
+  [' /\\_/\\ ', '( ^.^ )', ' > ^ < '],
+  [' /\\_/\\ ', '( o.o )', ' > ^ < '],
+  [' /\\_/\\ ', '( -.o )', ' > ^ < '],
 ];
 
 function startRunningAnimation() {
+  stopRunningAnimation();
   if (!dom.runningAscii) return;
-  let frame = 0;
+  let f = 0;
   dom.runningAscii.textContent = RUNNING_FRAMES[0].join('\n');
   runningAnimInterval = setInterval(() => {
-    frame = (frame + 1) % RUNNING_FRAMES.length;
-    dom.runningAscii.textContent = RUNNING_FRAMES[frame].join('\n');
-  }, 800);
+    f = (f + 1) % RUNNING_FRAMES.length;
+    dom.runningAscii.textContent = RUNNING_FRAMES[f].join('\n');
+  }, 900);
 }
 
 function stopRunningAnimation() {
-  if (runningAnimInterval) { clearInterval(runningAnimInterval); runningAnimInterval = null; }
+  if (runningAnimInterval) {
+    clearInterval(runningAnimInterval);
+    runningAnimInterval = null;
+  }
 }
 
-// ── Uptime Counter ──
-
-let uptimeInterval = null;
-let uptimeStart = 0;
-
 function startUptime() {
+  stopUptime();
   uptimeStart = Date.now();
+  if (dom.runningUptime) dom.runningUptime.textContent = '0:00';
   uptimeInterval = setInterval(() => {
     const elapsed = Math.floor((Date.now() - uptimeStart) / 1000);
-    const m = Math.floor(elapsed / 60);
-    const s = elapsed % 60;
-    if (dom.runningUptime) dom.runningUptime.textContent = `${m}:${s.toString().padStart(2, '0')}`;
+    if (dom.runningUptime) dom.runningUptime.textContent = `${Math.floor(elapsed / 60)}:${(elapsed % 60).toString().padStart(2, '0')}`;
   }, 1000);
 }
 
 function stopUptime() {
-  if (uptimeInterval) { clearInterval(uptimeInterval); uptimeInterval = null; }
+  if (uptimeInterval) {
+    clearInterval(uptimeInterval);
+    uptimeInterval = null;
+  }
 }
 
 // ── Utilities ──
 
-function showError(msg) { appendLog('stderr', `ERROR: ${msg}`); dom.logPanel.classList.add('expanded'); }
-function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
-function fmtMem(gb) { return gb === Math.floor(gb) ? `${gb} GB` : `${gb.toFixed(1)} GB`; }
+function showError(msg) {
+  appendLog('stderr', `ERROR: ${msg}`);
+  dom.logPanel?.classList.add('expanded');
+}
 
-// ── Event Bindings ──
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
 
-dom.versionSearch.addEventListener('input', (e) => { state.search = e.target.value; renderVersionList(); });
+function fmtMem(gb) { return gb === Math.floor(gb) ? `${gb}\u00A0GB` : `${gb.toFixed(1)}\u00A0GB`; }
 
-$$('.filter-chips .chip[data-filter]').forEach(chip => {
-  chip.addEventListener('click', () => {
-    chip.parentElement.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
-    chip.classList.add('active');
-    state.filter = chip.dataset.filter;
-    local.sidebarFilter = state.filter;
-    saveLocalState();
+function inferButtonSound(btn) {
+  if (btn.classList.contains('version-item') || btn.classList.contains('theme-swatch') || btn.classList.contains('ob-theme-btn') || btn.classList.contains('settings-nav-btn') || btn.id === 'apply-custom-theme' || btn.id === 'ob-apply-custom') return null;
+  if (btn.classList.contains('chip')) return 'soft';
+  if (btn.id === 'launch-btn') return 'launchPress';
+  if (btn.id === 'add-version-btn' || btn.id === 'empty-add-btn') return 'bright';
+  if (btn.id === 'settings-save' || btn.id === 'install-btn' || btn.classList.contains('catalog-install-btn') || btn.id === 'onboarding-finish') return 'affirm';
+  if (btn.id === 'settings-cancel' || btn.id === 'catalog-close' || btn.id === 'kill-btn') return 'soft';
+  return 'click';
+}
+
+function bindButtonSounds() {
+  document.addEventListener('click', (e) => {
+    const btn = e.target.closest('button');
+    if (!btn || btn.disabled) return;
+    const kind = inferButtonSound(btn);
+    if (kind) Sound.ui(kind);
+  });
+}
+
+function playSliderSound(value, family) {
+  const now = performance.now();
+  const limit = family === 'memory' ? 55 : 45;
+  const ref = family === 'memory' ? lastMemorySoundAt : lastHueSoundAt;
+  if (now - ref < limit) return;
+  if (family === 'memory') lastMemorySoundAt = now;
+  else lastHueSoundAt = now;
+  Sound.ui(family === 'memory' ? 'memory' : 'slider', Math.max(0, Math.min(1, value)));
+}
+
+// ══════════════════════════════════════════
+// INIT & EVENT BINDINGS
+// ══════════════════════════════════════════
+
+async function init() {
+  cacheDom();
+  applyTheme(local.theme, local.customHue, { silent: true });
+  Sound.enabled = local.sounds;
+  Sound.warmup();
+  if (dom.soundsToggle) dom.soundsToggle.checked = local.sounds;
+  if (local.logExpanded) dom.logPanel?.classList.add('expanded');
+  state.filter = local.sidebarFilter;
+  $$('.filter-chips .chip[data-filter]').forEach(c => c.classList.toggle('active', c.dataset.filter === state.filter));
+  updateHuePreview(local.customHue, dom.hueSwatchBg, dom.hueSwatchSurface, dom.hueSwatchAccent, dom.hueSwatchText);
+  if (dom.hueSlider) dom.hueSlider.value = local.customHue;
+  setPage('launcher');
+
+  try {
+    const [versionsRes, configRes, systemRes, statusRes] = await Promise.all([
+      api('GET', '/versions'),
+      api('GET', '/config'),
+      api('GET', '/system').catch(() => null),
+      api('GET', '/status').catch(() => null),
+    ]);
+    state.versions = versionsRes.versions || [];
+    state.config = configRes;
+    state.systemInfo = systemRes;
+    state.devMode = statusRes?.dev_mode === true;
+    if (state.devMode && dom.devTools) dom.devTools.classList.remove('hidden');
+    applyConfig(state.config);
+    applySystemInfo(state.systemInfo);
+    renderVersionList();
+    if (state.config?.last_version_id) {
+      const remembered = state.versions.find(v => v.id === state.config.last_version_id);
+      if (remembered) selectVersion(remembered, { silent: true });
+    }
+    if (state.config && !state.config.onboarding_done) showOnboarding();
+  } catch (err) {
+    if (dom.versionList) dom.versionList.innerHTML = `<div class="loading-placeholder"><span style="color:var(--red)">Failed to connect</span><span style="color:var(--text-muted);font-size:10px">${err.message}</span></div>`;
+  }
+
+  bindEvents();
+}
+
+function applyConfig(cfg) {
+  if (!cfg) return;
+  if (cfg.username && dom.usernameInput) dom.usernameInput.value = cfg.username;
+  if (cfg.max_memory_mb && dom.memorySlider) {
+    const gb = cfg.max_memory_mb / 1024;
+    dom.memorySlider.value = gb;
+    if (dom.memoryValue) dom.memoryValue.textContent = fmtMem(gb);
+  }
+}
+
+function applySystemInfo(info) {
+  if (!info?.total_memory_mb) return;
+  const totalGB = Math.floor(info.total_memory_mb / 1024);
+  if (totalGB > 0 && dom.memorySlider) {
+    dom.memorySlider.max = totalGB;
+    const cur = parseFloat(dom.memorySlider.value);
+    if (cur > totalGB) {
+      dom.memorySlider.value = totalGB;
+      if (dom.memoryValue) dom.memoryValue.textContent = fmtMem(totalGB);
+    }
+    updateMemoryRecText(parseFloat(dom.memorySlider.value), totalGB);
+  }
+}
+
+function bindEvents() {
+  bindButtonSounds();
+  const activateSound = () => Sound.activate();
+  window.addEventListener('pointerdown', activateSound, { once: true, capture: true });
+  window.addEventListener('touchstart', activateSound, { once: true, capture: true });
+  window.addEventListener('keydown', activateSound, { once: true, capture: true });
+
+  dom.versionSearch?.addEventListener('input', (e) => {
+    state.search = e.target.value;
     renderVersionList();
   });
-});
 
-dom.memorySlider.addEventListener('input', () => {
-  const v = parseFloat(dom.memorySlider.value);
-  dom.memoryValue.textContent = fmtMem(v);
-  updateMemoryRecText(v, state.systemInfo?.total_memory_mb ? Math.floor(state.systemInfo.total_memory_mb / 1024) : null);
-});
+  $$('.filter-chips .chip[data-filter]').forEach(chip => {
+    chip.addEventListener('click', () => {
+      chip.parentElement.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
+      chip.classList.add('active');
+      state.filter = chip.dataset.filter;
+      local.sidebarFilter = state.filter;
+      saveLocalState();
+      renderVersionList();
+    });
+  });
 
-dom.usernameInput.addEventListener('blur', () => {
-  const u = dom.usernameInput.value.trim();
-  if (u && u !== state.config?.username) { api('PUT', '/config', { username: u }); if (state.config) state.config.username = u; }
-});
+  dom.memorySlider?.addEventListener('input', () => {
+    const v = parseFloat(dom.memorySlider.value);
+    if (dom.memoryValue) dom.memoryValue.textContent = fmtMem(v);
+    updateMemoryRecText(v, state.systemInfo?.total_memory_mb ? Math.floor(state.systemInfo.total_memory_mb / 1024) : null);
+    playSliderSound(v / parseFloat(dom.memorySlider.max || 16), 'memory');
+  });
 
-dom.launchBtn.addEventListener('click', launchGame);
-dom.installBtn.addEventListener('click', installVersion);
-dom.killBtn.addEventListener('click', killGame);
+  dom.usernameInput?.addEventListener('blur', () => {
+    const u = dom.usernameInput.value.trim();
+    if (u && u !== state.config?.username) {
+      api('PUT', '/config', { username: u });
+      if (state.config) state.config.username = u;
+    }
+  });
 
-dom.logToggle.addEventListener('click', () => {
-  dom.logPanel.classList.toggle('expanded');
-  local.logExpanded = dom.logPanel.classList.contains('expanded');
-  saveLocalState();
-});
+  dom.launchBtn?.addEventListener('click', launchGame);
+  dom.installBtn?.addEventListener('click', installVersion);
+  dom.killBtn?.addEventListener('click', killGame);
 
-// Settings
-dom.settingsBtn.addEventListener('click', openSettings);
-dom.settingsClose.addEventListener('click', closeSettings);
-dom.settingsCancel.addEventListener('click', closeSettings);
-dom.settingsSave.addEventListener('click', saveSettings);
-dom.settingsModal.addEventListener('click', (e) => { if (e.target === dom.settingsModal) closeSettings(); });
+  dom.logToggle?.addEventListener('click', () => {
+    dom.logPanel?.classList.toggle('expanded');
+    local.logExpanded = dom.logPanel?.classList.contains('expanded');
+    saveLocalState();
+  });
 
-// Theme picker
-dom.themePicker?.querySelectorAll('.theme-swatch').forEach(swatch => {
-  swatch.addEventListener('click', () => applyTheme(swatch.dataset.theme));
-});
+  dom.settingsBtn?.addEventListener('click', () => {
+    if (state.currentPage === 'settings') closeSettings();
+    else openSettings();
+  });
+  dom.settingsCancel?.addEventListener('click', closeSettings);
+  dom.settingsSave?.addEventListener('click', saveSettings);
+  dom.settingsContent?.addEventListener('scroll', syncSettingsSectionNav);
+  dom.settingsNav?.querySelectorAll('.settings-nav-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      Sound.ui('soft');
+      const section = document.getElementById(btn.dataset.settingsTarget);
+      section?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+  });
+  dom.themePicker?.querySelectorAll('.theme-swatch').forEach(s => s.addEventListener('click', () => applyTheme(s.dataset.theme)));
+  dom.hueSlider?.addEventListener('input', () => {
+    updateHuePreview(parseInt(dom.hueSlider.value, 10), dom.hueSwatchBg, dom.hueSwatchSurface, dom.hueSwatchAccent, dom.hueSwatchText);
+    playSliderSound(parseInt(dom.hueSlider.value, 10) / 360, 'hue');
+  });
+  dom.applyCustomTheme?.addEventListener('click', () => applyTheme('custom', parseInt(dom.hueSlider?.value || 140, 10)));
+  dom.soundsToggle?.addEventListener('change', () => {
+    const next = dom.soundsToggle.checked;
+    if (next) {
+      Sound.enabled = true;
+      Sound.ui('theme');
+    } else {
+      Sound.ui('soft');
+      setTimeout(() => { Sound.enabled = false; }, 40);
+    }
+    local.sounds = next;
+    saveLocalState();
+  });
 
-// Catalog
-dom.addVersionBtn.addEventListener('click', openCatalog);
-dom.emptyAddBtn.addEventListener('click', openCatalog);
-dom.catalogClose.addEventListener('click', closeCatalog);
-dom.catalogModal.addEventListener('click', (e) => { if (e.target === dom.catalogModal) closeCatalog(); });
-dom.catalogSearch.addEventListener('input', (e) => { state.catalogSearch = e.target.value; renderCatalog(); });
-
-$$('.chip[data-catalog-filter]').forEach(chip => {
-  chip.addEventListener('click', () => {
-    chip.parentElement.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
-    chip.classList.add('active');
-    state.catalogFilter = chip.dataset.catalogFilter;
+  dom.addVersionBtn?.addEventListener('click', openCatalog);
+  dom.emptyAddBtn?.addEventListener('click', openCatalog);
+  dom.catalogClose?.addEventListener('click', closeCatalog);
+  dom.catalogModal?.addEventListener('click', (e) => { if (e.target === dom.catalogModal) closeCatalog(); });
+  dom.catalogSearch?.addEventListener('input', (e) => {
+    state.catalogSearch = e.target.value;
     renderCatalog();
   });
-});
+  $$('.chip[data-catalog-filter]').forEach(chip => {
+    chip.addEventListener('click', () => {
+      chip.parentElement.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
+      chip.classList.add('active');
+      state.catalogFilter = chip.dataset.catalogFilter;
+      renderCatalog();
+    });
+  });
 
-// Onboarding
-dom.onboardingNext1.addEventListener('click', () => onboardingStep(2));
-dom.onboardingNext2.addEventListener('click', () => onboardingStep(3));
-dom.onboardingFinish.addEventListener('click', finishOnboarding);
-dom.onboardingMemorySlider.addEventListener('input', () => {
-  const v = parseFloat(dom.onboardingMemorySlider.value);
-  dom.onboardingMemoryValue.textContent = fmtMem(v);
-  const gb = state.systemInfo?.total_memory_mb ? Math.floor(state.systemInfo.total_memory_mb / 1024) : null;
-  if (gb) {
-    if (v < 2) dom.onboardingRec.textContent = 'Low — may cause issues';
-    else if (v > gb * 0.75) dom.onboardingRec.textContent = 'High — leave room for OS';
-    else dom.onboardingRec.textContent = getMemoryRecommendation(gb).text;
-  }
-});
+  dom.onboardingNext1?.addEventListener('click', () => onboardingStep(2));
+  dom.onboardingNext2?.addEventListener('click', () => onboardingStep(3));
+  dom.onboardingNext3?.addEventListener('click', () => onboardingStep(4));
+  dom.onboardingFinish?.addEventListener('click', finishOnboarding);
+  dom.onboardingMemorySlider?.addEventListener('input', () => {
+    const v = parseFloat(dom.onboardingMemorySlider.value);
+    if (dom.onboardingMemoryValue) dom.onboardingMemoryValue.textContent = fmtMem(v);
+    const gb = state.systemInfo?.total_memory_mb ? Math.floor(state.systemInfo.total_memory_mb / 1024) : null;
+    if (gb && dom.onboardingRec) dom.onboardingRec.textContent = v < 2 ? 'Low — may cause issues' : v > gb * 0.75 ? 'High — leave room for OS' : getMemoryRecommendation(gb).text;
+    playSliderSound(v / parseFloat(dom.onboardingMemorySlider.max || 16), 'memory');
+  });
+  dom.obThemePresets?.querySelectorAll('.ob-theme-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      dom.obThemePresets.querySelectorAll('.ob-theme-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      applyTheme(btn.dataset.obTheme);
+    });
+  });
+  dom.obHueSlider?.addEventListener('input', () => {
+    updateObHuePreview(parseInt(dom.obHueSlider.value, 10));
+    playSliderSound(parseInt(dom.obHueSlider.value, 10) / 360, 'hue');
+  });
+  dom.obApplyCustom?.addEventListener('click', () => {
+    applyTheme('custom', parseInt(dom.obHueSlider?.value || 140, 10));
+    dom.obThemePresets?.querySelectorAll('.ob-theme-btn').forEach(b => b.classList.remove('active'));
+  });
 
-// Dev tools
-if (dom.devCleanup) dom.devCleanup.addEventListener('click', async () => {
-  if (!confirm('This will remove all installed versions.\nWorlds, mods, and resource packs will be backed up.\n\nContinue?')) return;
-  dom.devCleanup.disabled = true;
-  dom.devCleanup.textContent = 'Working...';
-  try {
-    const res = await api('POST', '/dev/cleanup-versions');
-    if (res.error) { showError(res.error); } else {
-      appendLog('system', `Backup saved to: ${res.backup_dir}`);
-      appendLog('system', `Backed up: ${(res.backed_up||[]).join(', ')}`);
-      appendLog('system', `Removed ${res.removed} versions`);
-      const vr = await api('GET', '/versions');
-      state.versions = vr.versions || [];
-      state.selectedVersion = null;
-      dom.versionDetail.classList.add('hidden');
-      dom.emptyState.classList.remove('hidden');
-      renderVersionList();
+  dom.devCleanup?.addEventListener('click', async () => {
+    if (!confirm('Remove all installed versions?\nWorlds/mods will be backed up.')) return;
+    dom.devCleanup.disabled = true;
+    dom.devCleanup.textContent = 'Working...';
+    try {
+      const res = await api('POST', '/dev/cleanup-versions');
+      if (res.error) showError(res.error);
+      else {
+        appendLog('system', `Removed ${res.removed} versions`);
+        state.versions = (await api('GET', '/versions')).versions || [];
+        state.selectedVersion = null;
+        dom.versionDetail?.classList.add('hidden');
+        dom.emptyState?.classList.remove('hidden');
+        renderVersionList();
+      }
+    } catch (err) {
+      showError(err.message);
     }
-  } catch (err) { showError(err.message); }
-  dom.devCleanup.disabled = false;
-  dom.devCleanup.textContent = 'Cleanup Versions';
-});
+    dom.devCleanup.disabled = false;
+    dom.devCleanup.textContent = 'Cleanup Versions';
+  });
 
-if (dom.devFlush) dom.devFlush.addEventListener('click', async () => {
-  if (!confirm('This will delete all Croopor settings and cached runtimes.\nThe app will restart from the onboarding screen.\n\nContinue?')) return;
-  try {
-    await api('POST', '/dev/flush');
-    localStorage.removeItem(STORAGE_KEY);
-    location.reload();
-  } catch (err) { showError(err.message); }
-});
+  dom.devFlush?.addEventListener('click', async () => {
+    if (!confirm('Delete all settings? App will restart.')) return;
+    try {
+      await api('POST', '/dev/flush');
+      localStorage.removeItem(STORAGE_KEY);
+      location.reload();
+    } catch (err) {
+      showError(err.message);
+    }
+  });
 
-document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') {
-    if (!dom.settingsModal.classList.contains('hidden')) closeSettings();
-    else if (!dom.catalogModal.classList.contains('hidden')) closeCatalog();
-  }
-});
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Control') {
+      toggleShortcutHints(true);
+      return;
+    }
+    if (e.key === 'F2') {
+      e.preventDefault();
+      if (state.currentPage === 'settings') {
+        Sound.ui('soft');
+        closeSettings();
+      } else {
+        Sound.ui('theme');
+        openSettings();
+      }
+      return;
+    }
+    if (e.key === 'F8') {
+      e.preventDefault();
+      if (state.currentPage === 'settings') closeSettings();
+      setPage('launcher');
+      Sound.ui('bright');
+      openCatalog();
+      return;
+    }
+    if (e.key === 'F9') {
+      e.preventDefault();
+      if (state.currentPage === 'settings') closeSettings();
+      setPage('launcher');
+      if (state.selectedVersion?.launchable && !state.launching && !state.gameRunning) {
+        Sound.ui('launchPress');
+        launchGame();
+      } else {
+        Sound.ui('soft');
+        dom.launchBtn?.focus();
+      }
+      return;
+    }
+    if (e.ctrlKey) {
+      const key = e.key.toLowerCase();
+      if (key === 'f') {
+        e.preventDefault();
+        if (state.currentPage === 'settings') closeSettings();
+        setPage('launcher');
+        Sound.ui('soft');
+        dom.versionSearch?.focus();
+        dom.versionSearch?.select?.();
+        return;
+      }
+      if (key === 's' && state.currentPage === 'settings') {
+        e.preventDefault();
+        Sound.ui('affirm');
+        saveSettings();
+        return;
+      }
+    }
+    if (e.key === 'Escape') {
+      if (!dom.catalogModal?.classList.contains('hidden')) closeCatalog();
+      else if (state.currentPage === 'settings') closeSettings();
+    }
+    if (e.key === 'Enter' && dom.onboarding && !dom.onboarding.classList.contains('hidden')) {
+      e.preventDefault();
+      if (!dom.onboardingStep1?.classList.contains('hidden')) onboardingStep(2);
+      else if (!dom.onboardingStep2?.classList.contains('hidden')) onboardingStep(3);
+      else if (!dom.onboardingStep3?.classList.contains('hidden')) onboardingStep(4);
+      else if (!dom.onboardingStep4?.classList.contains('hidden')) finishOnboarding();
+    }
+  });
+  document.addEventListener('keyup', (e) => {
+    if (e.key === 'Control') toggleShortcutHints(false);
+  });
+  window.addEventListener('blur', () => toggleShortcutHints(false));
+}
 
-// ── Boot ──
 init();
