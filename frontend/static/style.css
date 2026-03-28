@@ -1188,3 +1188,125 @@ input[type="range"]::-moz-range-thumb {
   background: var(--surface-3);
   border: 1px solid var(--text-muted);
 }
+
+/* ══════════════
+   ADD VERSION BUTTON
+   ══════════════ */
+
+.add-version-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: calc(100% - 12px);
+  margin: 6px;
+  padding: 8px;
+  background: var(--surface-1);
+  border: 1px dashed var(--border);
+  border-radius: var(--r-md);
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s;
+  flex-shrink: 0;
+}
+
+.add-version-btn:hover {
+  background: var(--surface-2);
+  border-color: var(--accent-dim);
+  color: var(--accent);
+}
+
+/* ══════════════
+   CATALOG MODAL
+   ══════════════ */
+
+.catalog-modal-size {
+  width: 520px;
+  max-width: 90vw;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.catalog-filters {
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.catalog-search {
+  width: 100%;
+}
+
+.catalog-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 6px;
+  min-height: 200px;
+  max-height: 400px;
+}
+
+.catalog-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-radius: var(--r-sm);
+  transition: background 0.12s;
+}
+
+.catalog-item:hover {
+  background: var(--surface-1);
+}
+
+.catalog-item-info {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.catalog-item-id {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+}
+
+.catalog-item-date {
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.catalog-item .version-badge {
+  flex-shrink: 0;
+}
+
+.catalog-install-btn {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  padding: 4px 12px;
+  border-radius: var(--r-sm);
+  border: none;
+  background: var(--accent);
+  color: var(--bg-deep);
+  cursor: pointer;
+  transition: opacity 0.15s;
+  flex-shrink: 0;
+}
+
+.catalog-install-btn:hover { opacity: 0.85; }
+.catalog-install-btn:disabled { opacity: 0.4; cursor: default; }
+
+.catalog-installed-badge {
+  font-size: 10px;
+  color: var(--accent-dim);
+  font-weight: 500;
+  padding: 4px 10px;
+}

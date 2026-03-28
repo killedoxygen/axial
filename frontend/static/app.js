@@ -6,6 +6,7 @@ const API = '/api/v1';
 
 const state = {
   versions: [],
+  catalog: null,
   config: null,
   systemInfo: null,
   selectedVersion: null,
@@ -14,12 +15,12 @@ const state = {
   installEventSource: null,
   logLines: 0,
   filter: 'all',
+  catalogFilter: 'release',
   search: '',
+  catalogSearch: '',
   gameRunning: false,
   installing: false,
 };
-
-// ── DOM References ──
 
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => document.querySelectorAll(sel);
@@ -27,8 +28,10 @@ const $$ = (sel) => document.querySelectorAll(sel);
 const dom = {
   versionList: $('#version-list'),
   versionSearch: $('#version-search'),
-  launchPanel: $('#launch-panel'),
   emptyState: $('#empty-state'),
+  emptyTitle: $('#empty-title'),
+  emptySub: $('#empty-sub'),
+  emptyAddBtn: $('#empty-add-btn'),
   versionDetail: $('#version-detail'),
   detailId: $('#detail-id'),
   detailBadge: $('#detail-badge'),
@@ -64,7 +67,11 @@ const dom = {
   settingWidth: $('#setting-width'),
   settingHeight: $('#setting-height'),
   javaRuntimes: $('#java-runtimes'),
-  // Onboarding
+  addVersionBtn: $('#add-version-btn'),
+  catalogModal: $('#catalog-modal'),
+  catalogClose: $('#catalog-close'),
+  catalogSearch: $('#catalog-search'),
+  catalogList: $('#catalog-list'),
   onboarding: $('#onboarding'),
   onboardingStep1: $('#onboarding-step-1'),
   onboardingStep2: $('#onboarding-step-2'),
@@ -77,47 +84,35 @@ const dom = {
   onboardingNext1: $('#onboarding-next-1'),
   onboardingNext2: $('#onboarding-next-2'),
   onboardingFinish: $('#onboarding-finish'),
-  dot1: $('#dot-1'),
-  dot2: $('#dot-2'),
-  dot3: $('#dot-3'),
+  dot1: $('#dot-1'), dot2: $('#dot-2'), dot3: $('#dot-3'),
 };
 
-// ── API Helpers ──
+// ── API ──
 
 async function api(method, path, body) {
-  const opts = {
-    method,
-    headers: { 'Content-Type': 'application/json' },
-  };
+  const opts = { method, headers: { 'Content-Type': 'application/json' } };
   if (body) opts.body = JSON.stringify(body);
   const res = await fetch(`${API}${path}`, opts);
   return res.json();
 }
 
-// ── Memory Recommendation ──
+// ── Memory ──
 
 function getMemoryRecommendation(totalGB) {
-  if (totalGB <= 4) return { rec: 2, text: 'Low RAM system — 2 GB recommended' };
-  if (totalGB <= 8) return { rec: 4, text: '4 GB recommended for most versions' };
+  if (totalGB <= 4) return { rec: 2, text: 'Low RAM — 2 GB recommended' };
+  if (totalGB <= 8) return { rec: 4, text: '4 GB recommended' };
   if (totalGB <= 16) return { rec: 6, text: '6 GB recommended' };
-  return { rec: 8, text: '8 GB recommended for best performance' };
+  return { rec: 8, text: '8 GB recommended' };
 }
 
-function updateMemoryRecText(sliderValue, totalGB) {
-  if (!totalGB) return;
-  const { rec } = getMemoryRecommendation(totalGB);
-  const el = dom.memoryRec;
-  if (!el) return;
-  if (sliderValue < 2) {
-    el.textContent = '(low — may cause issues)';
-  } else if (sliderValue > totalGB * 0.75) {
-    el.textContent = '(high — leave room for OS)';
-  } else {
-    el.textContent = '';
-  }
+function updateMemoryRecText(val, totalGB) {
+  if (!totalGB || !dom.memoryRec) return;
+  if (val < 2) dom.memoryRec.textContent = '(low — may lag)';
+  else if (val > totalGB * 0.75) dom.memoryRec.textContent = '(high — leave room for OS)';
+  else dom.memoryRec.textContent = '';
 }
 
-// ── Initialization ──
+// ── Init ──
 
 async function init() {
   try {
@@ -126,7 +121,6 @@ async function init() {
       api('GET', '/config'),
       api('GET', '/system').catch(() => null),
     ]);
-
     state.versions = versionsRes.versions || [];
     state.config = configRes;
     state.systemInfo = systemRes;
@@ -135,16 +129,11 @@ async function init() {
     applySystemInfo(state.systemInfo);
     renderVersionList();
 
-    // Show onboarding if not completed
-    if (state.config && state.config.onboarding_done === false) {
-      showOnboarding();
-    }
+    if (state.config && !state.config.onboarding_done) showOnboarding();
   } catch (err) {
-    dom.versionList.innerHTML = `
-      <div class="loading-placeholder">
-        <span style="color: var(--red)">Failed to connect to backend</span>
-        <span style="color: var(--text-muted); font-size: 11px">${err.message}</span>
-      </div>`;
+    dom.versionList.innerHTML = `<div class="loading-placeholder">
+      <span style="color:var(--red)">Failed to connect</span>
+      <span style="color:var(--text-muted);font-size:11px">${err.message}</span></div>`;
   }
 }
 
@@ -153,153 +142,95 @@ function applyConfig(cfg) {
   if (cfg.max_memory_mb) {
     const gb = cfg.max_memory_mb / 1024;
     dom.memorySlider.value = gb;
-    dom.memoryValue.textContent = formatMemory(gb);
+    dom.memoryValue.textContent = fmtMem(gb);
   }
 }
 
 function applySystemInfo(info) {
-  if (!info || !info.total_memory_mb) return;
+  if (!info?.total_memory_mb) return;
   const totalGB = Math.floor(info.total_memory_mb / 1024);
   if (totalGB > 0) {
     dom.memorySlider.max = totalGB;
-    // Clamp current value
-    const current = parseFloat(dom.memorySlider.value);
-    if (current > totalGB) {
+    const cur = parseFloat(dom.memorySlider.value);
+    if (cur > totalGB) {
       dom.memorySlider.value = totalGB;
-      dom.memoryValue.textContent = formatMemory(totalGB);
+      dom.memoryValue.textContent = fmtMem(totalGB);
     }
     updateMemoryRecText(parseFloat(dom.memorySlider.value), totalGB);
   }
 }
 
-// ── Version List Rendering ──
+// ── Sidebar: Installed Versions Only ──
 
 function renderVersionList() {
   const filtered = filterVersions(state.versions);
 
-  if (filtered.length === 0) {
-    dom.versionList.innerHTML = `
-      <div class="loading-placeholder">
-        <span>No versions found</span>
-      </div>`;
+  if (state.versions.length === 0) {
+    dom.versionList.innerHTML = `<div class="loading-placeholder">
+      <span>No versions installed</span></div>`;
+    dom.emptyTitle.textContent = 'No versions installed';
+    dom.emptySub.textContent = 'Add a Minecraft version to get started';
+    dom.emptyAddBtn.classList.remove('hidden');
     return;
   }
 
-  // Group versions
-  const groups = {
-    release: [],
-    snapshot: [],
-    modded: [],
-    other: [],
-  };
+  dom.emptyAddBtn.classList.add('hidden');
+  dom.emptyTitle.textContent = 'Select a version';
+  dom.emptySub.textContent = 'Choose a Minecraft version from the sidebar to launch';
 
+  if (filtered.length === 0) {
+    dom.versionList.innerHTML = `<div class="loading-placeholder"><span>No matching versions</span></div>`;
+    return;
+  }
+
+  const groups = { release: [], snapshot: [], modded: [], other: [] };
   for (const v of filtered) {
-    if (v.inherits_from) {
-      groups.modded.push(v);
-    } else if (v.type === 'release') {
-      groups.release.push(v);
-    } else if (v.type === 'snapshot') {
-      groups.snapshot.push(v);
-    } else {
-      groups.other.push(v);
-    }
+    if (v.inherits_from) groups.modded.push(v);
+    else if (v.type === 'release') groups.release.push(v);
+    else if (v.type === 'snapshot') groups.snapshot.push(v);
+    else groups.other.push(v);
   }
 
   let html = '';
   const renderGroup = (label, versions) => {
-    if (versions.length === 0) return;
+    if (!versions.length) return;
     html += `<div class="version-group-label">${label}</div>`;
     versions.forEach((v, i) => {
       const isModded = !!v.inherits_from;
-      const isRemote = v.status === 'not_installed';
-      const badgeClass = isModded ? 'badge-modded' :
-        v.type === 'release' ? 'badge-release' :
-        v.type === 'snapshot' ? 'badge-snapshot' : 'badge-old';
-      const badgeText = isModded ? 'MOD' :
-        v.type === 'release' ? 'REL' :
-        v.type === 'snapshot' ? 'SNAP' : v.type?.toUpperCase()?.slice(0, 4) || '?';
-
-      let dotClass;
-      if (isRemote) {
-        dotClass = 'remote';
-      } else if (v.launchable) {
-        dotClass = 'ok';
-      } else {
-        dotClass = 'missing';
-      }
-
-      const dimClass = isRemote ? 'dimmed' : (v.launchable ? '' : 'dimmed');
+      const badgeClass = isModded ? 'badge-modded' : v.type === 'release' ? 'badge-release' : v.type === 'snapshot' ? 'badge-snapshot' : 'badge-old';
+      const badgeText = isModded ? 'MOD' : v.type === 'release' ? 'REL' : v.type === 'snapshot' ? 'SNAP' : v.type?.toUpperCase()?.slice(0, 4) || '?';
+      const dotClass = v.launchable ? 'ok' : 'missing';
+      const dimClass = v.launchable ? '' : 'dimmed';
       const selected = state.selectedVersion?.id === v.id ? 'selected' : '';
-      const tooltip = !v.launchable && !isRemote && v.missing?.length
-        ? `data-tooltip="Missing: ${v.missing.join(', ')}"`
-        : '';
-      const delay = `style="animation-delay: ${i * 20}ms"`;
-
-      html += `<div class="version-item ${dimClass} ${selected}" data-id="${v.id}" ${tooltip} ${delay}>
+      html += `<div class="version-item ${dimClass} ${selected}" data-id="${v.id}" style="animation-delay:${i*20}ms">
         <div class="version-dot ${dotClass}"></div>
-        <span class="version-name">${escapeHtml(v.id)}</span>
-        <span class="version-badge ${badgeClass}">${badgeText}</span>
-      </div>`;
+        <span class="version-name">${esc(v.id)}</span>
+        <span class="version-badge ${badgeClass}">${badgeText}</span></div>`;
     });
   };
-
   renderGroup('Releases', groups.release);
   renderGroup('Modded', groups.modded);
   renderGroup('Snapshots', groups.snapshot);
   renderGroup('Other', groups.other);
-
   dom.versionList.innerHTML = html;
 
-  // Attach click handlers
   dom.versionList.querySelectorAll('.version-item').forEach(el => {
     el.addEventListener('click', () => {
-      const id = el.dataset.id;
-      const version = state.versions.find(v => v.id === id);
-      if (version) selectVersion(version);
+      const v = state.versions.find(v => v.id === el.dataset.id);
+      if (v) selectVersion(v);
     });
   });
 }
 
 function filterVersions(versions) {
   let list = versions;
-
-  // When searching, search everything (no filter restrictions on remote)
-  const isSearching = !!state.search;
-
-  if (!isSearching) {
-    // Default view: hide remote snapshots unless Snapshot filter is active
-    // Remote versions that are releases are shown in "All" and "Release"
-    // Remote snapshots are only shown when filter is "snapshot"
-    if (state.filter === 'all') {
-      list = list.filter(v => {
-        if (v.status === 'not_installed' && v.type !== 'release') return false;
-        return true;
-      });
-    } else if (state.filter === 'release') {
-      list = list.filter(v => v.type === 'release' && !v.inherits_from);
-    } else if (state.filter === 'snapshot') {
-      list = list.filter(v => v.type === 'snapshot' && !v.inherits_from);
-    } else if (state.filter === 'modded') {
-      list = list.filter(v => !!v.inherits_from);
-    }
-  } else {
-    // Apply type filter even during search (except "all" which shows everything)
-    if (state.filter !== 'all') {
-      list = list.filter(v => {
-        if (state.filter === 'modded') return !!v.inherits_from;
-        if (state.filter === 'release') return v.type === 'release' && !v.inherits_from;
-        if (state.filter === 'snapshot') return v.type === 'snapshot' && !v.inherits_from;
-        return true;
-      });
-    }
-  }
-
-  // Filter by search text
+  if (state.filter === 'release') list = list.filter(v => v.type === 'release' && !v.inherits_from);
+  else if (state.filter === 'snapshot') list = list.filter(v => v.type === 'snapshot' && !v.inherits_from);
+  else if (state.filter === 'modded') list = list.filter(v => !!v.inherits_from);
   if (state.search) {
     const q = state.search.toLowerCase();
     list = list.filter(v => v.id.toLowerCase().includes(q));
   }
-
   return list;
 }
 
@@ -307,211 +238,213 @@ function filterVersions(versions) {
 
 function selectVersion(version) {
   state.selectedVersion = version;
+  dom.versionList.querySelectorAll('.version-item').forEach(el => el.classList.toggle('selected', el.dataset.id === version.id));
 
-  // Update sidebar selection
-  dom.versionList.querySelectorAll('.version-item').forEach(el => {
-    el.classList.toggle('selected', el.dataset.id === version.id);
-  });
-
-  // Show detail panel
   dom.emptyState.classList.add('hidden');
   dom.versionDetail.classList.remove('hidden');
-
   dom.detailId.textContent = version.id;
 
   const isModded = !!version.inherits_from;
-  const badgeClass = isModded ? 'badge-modded' :
-    version.type === 'release' ? 'badge-release' :
-    version.type === 'snapshot' ? 'badge-snapshot' : 'badge-old';
-  const badgeText = isModded ? 'Modded' :
-    version.type === 'release' ? 'Release' :
-    version.type === 'snapshot' ? 'Snapshot' : version.type || 'Unknown';
-
+  const badgeClass = isModded ? 'badge-modded' : version.type === 'release' ? 'badge-release' : version.type === 'snapshot' ? 'badge-snapshot' : 'badge-old';
   dom.detailBadge.className = `detail-badge ${badgeClass}`;
-  dom.detailBadge.textContent = badgeText;
+  dom.detailBadge.textContent = isModded ? 'Modded' : version.type === 'release' ? 'Release' : version.type === 'snapshot' ? 'Snapshot' : version.type || 'Unknown';
 
-  // Meta info
   let meta = '';
-  if (version.java_component) {
-    meta += `<span>${version.java_component}</span>`;
-  }
-  if (version.java_major) {
-    meta += `<span>Java ${version.java_major}</span>`;
-  }
-  if (version.inherits_from) {
-    meta += `<span>Based on ${escapeHtml(version.inherits_from)}</span>`;
-  }
-  if (version.release_time) {
-    const date = new Date(version.release_time);
-    if (!isNaN(date)) {
-      meta += `<span>${date.toLocaleDateString()}</span>`;
-    }
-  }
+  if (version.java_component) meta += `<span>${version.java_component}</span>`;
+  if (version.java_major) meta += `<span>Java ${version.java_major}</span>`;
+  if (version.inherits_from) meta += `<span>Based on ${esc(version.inherits_from)}</span>`;
+  if (version.release_time) { const d = new Date(version.release_time); if (!isNaN(d)) meta += `<span>${d.toLocaleDateString()}</span>`; }
   dom.detailMeta.innerHTML = meta;
 
-  // Hide all action areas first
+  // Hide all areas
   dom.launchArea.classList.add('hidden');
   dom.installArea.classList.add('hidden');
   dom.notLaunchable.classList.add('hidden');
   dom.runningArea.classList.add('hidden');
+  resetInstallUI();
 
-  // Reset install UI
-  dom.installBtn.disabled = false;
-  dom.installBtn.querySelector('.install-btn-text').textContent = 'INSTALL';
-  dom.installProgress.classList.add('hidden');
-  dom.progressFill.style.width = '0%';
-
-  // Determine which area to show
-  if (state.gameRunning && state.activeSession) {
-    // Game is running
+  if (state.gameRunning) {
     dom.runningArea.classList.remove('hidden');
-  } else if (version.status === 'not_installed') {
-    // Remote version — needs install
-    dom.installArea.classList.remove('hidden');
-    dom.installText.textContent = 'This version is not installed';
   } else if (version.status === 'incomplete') {
-    // Incomplete install
     dom.installArea.classList.remove('hidden');
-    dom.installText.textContent = version.status_detail || 'Installation incomplete';
+    dom.installText.textContent = version.status_detail || 'Game files incomplete — click to download';
   } else if (version.launchable) {
-    // Ready to launch
     dom.launchArea.classList.remove('hidden');
   } else {
-    // Installed but not launchable (missing files etc.)
-    dom.notLaunchable.classList.remove('hidden');
-    const missingText = version.missing?.length
-      ? `Missing: ${version.missing.join(', ')}`
-      : 'Cannot launch — missing files';
-    dom.notLaunchableText.textContent = missingText;
+    dom.installArea.classList.remove('hidden');
+    dom.installText.textContent = version.status_detail || 'Game files need downloading';
   }
 }
 
-// ── Install ──
+// ── Install (for incomplete local versions) ──
 
 async function installVersion() {
   if (!state.selectedVersion || state.installing) return;
-
-  const versionId = state.selectedVersion.id;
   state.installing = true;
 
   dom.installBtn.disabled = true;
   dom.installBtn.querySelector('.install-btn-text').textContent = 'INSTALLING...';
   dom.installProgress.classList.remove('hidden');
-  dom.progressFill.style.width = '0%';
-  dom.progressText.textContent = 'Starting...';
+  dom.progressText.textContent = 'Starting download...';
 
   try {
-    const res = await api('POST', '/install', { version_id: versionId });
-
-    if (res.error) {
-      showError(res.error);
-      resetInstallButton();
-      return;
-    }
-
-    const installId = res.install_id || res.id;
-    if (installId) {
-      connectInstallSSE(installId);
-    } else {
-      // No SSE — installation was synchronous or no ID returned
-      await onInstallComplete();
-    }
+    // Only send version_id — backend resolves the URL
+    const res = await api('POST', '/install', { version_id: state.selectedVersion.id });
+    if (res.error) { showError(res.error); resetInstallUI(); return; }
+    connectInstallSSE(res.install_id);
   } catch (err) {
     showError('Install failed: ' + err.message);
-    resetInstallButton();
+    resetInstallUI();
   }
 }
 
-function connectInstallSSE(installId) {
-  if (state.installEventSource) {
-    state.installEventSource.close();
+// Install from catalog (has manifest_url)
+async function installFromCatalog(versionId, manifestUrl) {
+  if (state.installing) return;
+  state.installing = true;
+
+  try {
+    const res = await api('POST', '/install', { version_id: versionId, manifest_url: manifestUrl });
+    if (res.error) { showError(res.error); state.installing = false; return; }
+
+    // Update catalog button to show progress
+    const btn = dom.catalogList.querySelector(`[data-install-id="${versionId}"]`);
+    if (btn) { btn.disabled = true; btn.textContent = 'Installing...'; }
+
+    connectInstallSSE(res.install_id, versionId);
+  } catch (err) {
+    showError('Install failed: ' + err.message);
+    state.installing = false;
   }
+}
+
+function connectInstallSSE(installId, catalogVersionId) {
+  if (state.installEventSource) state.installEventSource.close();
 
   const es = new EventSource(`${API}/install/${installId}/events`);
   state.installEventSource = es;
 
   es.addEventListener('progress', (e) => {
-    const data = JSON.parse(e.data);
-    if (data.percent !== undefined) {
-      dom.progressFill.style.width = `${data.percent}%`;
-    }
-    if (data.text) {
-      dom.progressText.textContent = data.text;
-    }
+    const d = JSON.parse(e.data);
+    // Calculate progress percentage
+    let pct = 0;
+    if (d.phase === 'version_json') pct = 5;
+    else if (d.phase === 'client_jar') pct = 30;
+    else if (d.phase === 'libraries' && d.total > 0) pct = 30 + Math.round((d.current / d.total) * 65);
+    else if (d.phase === 'done') pct = 100;
+    else if (d.phase === 'error') { showError(d.error); onInstallDone(catalogVersionId); return; }
+
+    dom.progressFill.style.width = pct + '%';
+    dom.progressText.textContent = d.phase === 'done' ? 'Complete!' :
+      d.phase === 'libraries' ? `Libraries (${d.current}/${d.total})` :
+      d.phase === 'client_jar' ? 'Downloading game...' :
+      d.phase === 'version_json' ? 'Fetching version info...' : d.phase;
+
+    if (d.done) onInstallDone(catalogVersionId);
   });
 
-  es.addEventListener('status', (e) => {
-    const data = JSON.parse(e.data);
-    if (data.state === 'complete' || data.state === 'done') {
-      onInstallComplete();
-    } else if (data.state === 'error' || data.state === 'failed') {
-      showError(data.message || 'Installation failed');
-      resetInstallButton();
-    }
-  });
-
-  es.addEventListener('error', (e) => {
-    // Check if this is a normal close (installation done)
-    if (es.readyState === EventSource.CLOSED) {
-      // Connection was closed — could be success or failure
-      // If we haven't already handled completion, re-fetch versions
-      if (state.installing) {
-        onInstallComplete();
-      }
-    }
-  });
-
-  es.onerror = () => {
-    // SSE connection lost
-    if (state.installing) {
-      onInstallComplete();
-    }
-  };
+  es.onerror = () => { if (state.installing) onInstallDone(catalogVersionId); };
 }
 
-async function onInstallComplete() {
+async function onInstallDone(catalogVersionId) {
   state.installing = false;
-
-  if (state.installEventSource) {
-    state.installEventSource.close();
-    state.installEventSource = null;
-  }
+  if (state.installEventSource) { state.installEventSource.close(); state.installEventSource = null; }
 
   dom.progressFill.style.width = '100%';
   dom.progressText.textContent = 'Complete!';
 
-  // Re-fetch versions to get updated status
+  // Refresh versions
   try {
-    const versionsRes = await api('GET', '/versions');
-    state.versions = versionsRes.versions || [];
+    const res = await api('GET', '/versions');
+    state.versions = res.versions || [];
     renderVersionList();
 
-    // Re-select the version if still selected
+    // If installed from catalog, update the catalog item
+    if (catalogVersionId) {
+      const btn = dom.catalogList.querySelector(`[data-install-id="${catalogVersionId}"]`);
+      if (btn) { btn.outerHTML = `<span class="catalog-installed-badge">Installed</span>`; }
+    }
+
+    // Re-select
     if (state.selectedVersion) {
       const updated = state.versions.find(v => v.id === state.selectedVersion.id);
-      if (updated) {
-        selectVersion(updated);
-      }
+      if (updated) selectVersion(updated);
     }
+  } catch { resetInstallUI(); }
+}
+
+function resetInstallUI() {
+  state.installing = false;
+  if (dom.installBtn) {
+    dom.installBtn.disabled = false;
+    const txt = dom.installBtn.querySelector('.install-btn-text');
+    if (txt) txt.textContent = 'INSTALL';
+  }
+  dom.installProgress.classList.add('hidden');
+  dom.progressFill.style.width = '0%';
+}
+
+// ── Catalog Modal ──
+
+async function openCatalog() {
+  dom.catalogModal.classList.remove('hidden');
+  dom.catalogSearch.value = '';
+  state.catalogSearch = '';
+  dom.catalogList.innerHTML = `<div class="loading-placeholder"><div class="spinner"></div><span>Loading available versions...</span></div>`;
+
+  try {
+    const res = await api('GET', '/catalog');
+    state.catalog = res;
+    renderCatalog();
   } catch (err) {
-    showError('Failed to refresh versions: ' + err.message);
-    resetInstallButton();
+    dom.catalogList.innerHTML = `<div class="loading-placeholder"><span style="color:var(--red)">Failed to load catalog</span></div>`;
   }
 }
 
-function resetInstallButton() {
-  state.installing = false;
-  dom.installBtn.disabled = false;
-  dom.installBtn.querySelector('.install-btn-text').textContent = 'INSTALL';
-  dom.installProgress.classList.add('hidden');
-  dom.progressFill.style.width = '0%';
+function closeCatalog() { dom.catalogModal.classList.add('hidden'); }
+
+function renderCatalog() {
+  if (!state.catalog?.versions) return;
+
+  let list = state.catalog.versions.filter(v => v.type === state.catalogFilter);
+  if (state.catalogSearch) {
+    const q = state.catalogSearch.toLowerCase();
+    list = list.filter(v => v.id.toLowerCase().includes(q));
+  }
+
+  // Limit to 50 entries for performance
+  const display = list.slice(0, 50);
+  const hasMore = list.length > 50;
+
+  if (display.length === 0) {
+    dom.catalogList.innerHTML = `<div class="loading-placeholder"><span>No versions found</span></div>`;
+    return;
+  }
+
+  dom.catalogList.innerHTML = display.map(v => {
+    const badgeClass = v.type === 'release' ? 'badge-release' : v.type === 'snapshot' ? 'badge-snapshot' : 'badge-old';
+    const badgeText = v.type === 'release' ? 'REL' : v.type === 'snapshot' ? 'SNAP' : v.type.toUpperCase().slice(0, 4);
+    const date = new Date(v.release_time);
+    const dateStr = !isNaN(date) ? date.toLocaleDateString() : '';
+    const action = v.installed
+      ? `<span class="catalog-installed-badge">Installed</span>`
+      : `<button class="catalog-install-btn" data-install-id="${esc(v.id)}" data-url="${esc(v.url)}">Install</button>`;
+    return `<div class="catalog-item">
+      <div class="catalog-item-info"><span class="catalog-item-id">${esc(v.id)}</span><span class="catalog-item-date">${dateStr}</span></div>
+      <span class="version-badge ${badgeClass}">${badgeText}</span>
+      ${action}</div>`;
+  }).join('') + (hasMore ? `<div class="loading-placeholder"><span style="font-size:11px;color:var(--text-muted)">Showing 50 of ${list.length} — use search to narrow</span></div>` : '');
+
+  // Install button click handlers
+  dom.catalogList.querySelectorAll('.catalog-install-btn').forEach(btn => {
+    btn.addEventListener('click', () => installFromCatalog(btn.dataset.installId, btn.dataset.url));
+  });
 }
 
 // ── Launch ──
 
 async function launchGame() {
   if (!state.selectedVersion || state.gameRunning) return;
-
   const username = dom.usernameInput.value.trim() || 'Player';
   const maxMemMB = Math.round(parseFloat(dom.memorySlider.value) * 1024);
 
@@ -519,108 +452,46 @@ async function launchGame() {
   dom.launchBtn.disabled = true;
 
   try {
-    const res = await api('POST', '/launch', {
-      version_id: state.selectedVersion.id,
-      username: username,
-      max_memory_mb: maxMemMB,
-    });
-
-    if (res.error) {
-      showError(res.error);
-      resetLaunchButton();
-      return;
-    }
+    const res = await api('POST', '/launch', { version_id: state.selectedVersion.id, username, max_memory_mb: maxMemMB });
+    if (res.error) { showError(res.error); resetLaunchBtn(); return; }
 
     state.activeSession = res.session_id;
     state.gameRunning = true;
-
-    // Update UI to running state
     dom.launchArea.classList.add('hidden');
     dom.runningArea.classList.remove('hidden');
     dom.runningPid.textContent = `PID ${res.pid}`;
-
-    // Open log panel
     dom.logPanel.classList.add('expanded');
-
-    // Connect SSE
-    connectSSE(res.session_id);
-
-    // Save config
-    api('PUT', '/config', {
-      username: username,
-      max_memory_mb: maxMemMB,
-      last_version_id: state.selectedVersion.id,
-    });
-
-  } catch (err) {
-    showError(err.message);
-    resetLaunchButton();
-  }
+    connectLaunchSSE(res.session_id);
+    api('PUT', '/config', { username, max_memory_mb: maxMemMB, last_version_id: state.selectedVersion.id });
+  } catch (err) { showError(err.message); resetLaunchBtn(); }
 }
 
-function resetLaunchButton() {
+function resetLaunchBtn() {
   dom.launchBtn.querySelector('.launch-btn-text').textContent = 'LAUNCH';
   dom.launchBtn.disabled = false;
 }
 
-// ── SSE ──
-
-function connectSSE(sessionId) {
-  if (state.eventSource) {
-    state.eventSource.close();
-  }
-
+function connectLaunchSSE(sessionId) {
+  if (state.eventSource) state.eventSource.close();
   const es = new EventSource(`${API}/launch/${sessionId}/events`);
   state.eventSource = es;
-
-  es.addEventListener('status', (e) => {
-    const data = JSON.parse(e.data);
-    if (data.state === 'exited') {
-      onGameExited(data.exit_code);
-    }
-  });
-
-  es.addEventListener('log', (e) => {
-    const data = JSON.parse(e.data);
-    appendLog(data.source, data.text);
-  });
-
-  es.onerror = () => {
-    // SSE connection lost — game might have exited
-    if (state.gameRunning) {
-      onGameExited(-1);
-    }
-  };
+  es.addEventListener('status', (e) => { const d = JSON.parse(e.data); if (d.state === 'exited') onGameExited(d.exit_code); });
+  es.addEventListener('log', (e) => { const d = JSON.parse(e.data); appendLog(d.source, d.text); });
+  es.onerror = () => { if (state.gameRunning) onGameExited(-1); };
 }
 
 function onGameExited(exitCode) {
   state.gameRunning = false;
   state.activeSession = null;
-
-  if (state.eventSource) {
-    state.eventSource.close();
-    state.eventSource = null;
-  }
-
+  if (state.eventSource) { state.eventSource.close(); state.eventSource = null; }
   dom.runningArea.classList.add('hidden');
-
-  if (state.selectedVersion?.launchable) {
-    dom.launchArea.classList.remove('hidden');
-    resetLaunchButton();
-  }
-
+  if (state.selectedVersion?.launchable) { dom.launchArea.classList.remove('hidden'); resetLaunchBtn(); }
   appendLog('system', `Game exited with code ${exitCode}`);
 }
 
-// ── Kill ──
-
 async function killGame() {
   if (!state.activeSession) return;
-  try {
-    await api('POST', `/launch/${state.activeSession}/kill`);
-  } catch (err) {
-    showError('Failed to kill: ' + err.message);
-  }
+  try { await api('POST', `/launch/${state.activeSession}/kill`); } catch (err) { showError('Failed to kill: ' + err.message); }
 }
 
 // ── Log Panel ──
@@ -630,263 +501,153 @@ function appendLog(source, text) {
   line.className = `log-line ${source}`;
   line.textContent = text;
   dom.logLines.appendChild(line);
-
   state.logLines++;
   dom.logCount.textContent = `${state.logLines} lines`;
-
-  // Auto-scroll
   dom.logContent.scrollTop = dom.logContent.scrollHeight;
-}
-
-function toggleLog() {
-  dom.logPanel.classList.toggle('expanded');
 }
 
 // ── Settings ──
 
 function openSettings() {
   dom.settingsModal.classList.remove('hidden');
-
-  // Populate fields
   if (state.config) {
     dom.settingJavaPath.value = state.config.java_path_override || '';
     dom.settingWidth.value = state.config.window_width || '';
     dom.settingHeight.value = state.config.window_height || '';
   }
-
-  // Load Java runtimes
   loadJavaRuntimes();
 }
-
-function closeSettings() {
-  dom.settingsModal.classList.add('hidden');
-}
+function closeSettings() { dom.settingsModal.classList.add('hidden'); }
 
 async function saveSettings() {
-  const updates = {};
-
-  const javaPath = dom.settingJavaPath.value.trim();
-  if (javaPath !== (state.config?.java_path_override || '')) {
-    updates.java_path_override = javaPath;
-  }
-
-  const width = parseInt(dom.settingWidth.value) || 0;
-  const height = parseInt(dom.settingHeight.value) || 0;
-  if (width > 0) updates.window_width = width;
-  if (height > 0) updates.window_height = height;
-
-  if (Object.keys(updates).length > 0) {
-    const res = await api('PUT', '/config', updates);
-    if (!res.error) {
-      state.config = res;
-    }
-  }
-
+  const u = {};
+  const jp = dom.settingJavaPath.value.trim();
+  if (jp !== (state.config?.java_path_override || '')) u.java_path_override = jp;
+  const w = parseInt(dom.settingWidth.value) || 0;
+  const h = parseInt(dom.settingHeight.value) || 0;
+  if (w > 0) u.window_width = w;
+  if (h > 0) u.window_height = h;
+  if (Object.keys(u).length) { const r = await api('PUT', '/config', u); if (!r.error) state.config = r; }
   closeSettings();
 }
 
 async function loadJavaRuntimes() {
   try {
     const res = await api('GET', '/java');
-    const runtimes = res.runtimes || [];
-
-    if (runtimes.length === 0) {
-      dom.javaRuntimes.innerHTML = '<span class="setting-hint">No Java runtimes detected</span>';
-      return;
-    }
-
-    dom.javaRuntimes.innerHTML = runtimes.map(r => `
-      <div class="java-runtime-item">
-        <span class="java-runtime-component">${escapeHtml(r.Component || r.component)}</span>
-        <span class="java-runtime-source">${escapeHtml(r.Source || r.source)}</span>
-      </div>
-    `).join('');
-  } catch {
-    dom.javaRuntimes.innerHTML = '<span class="setting-hint">Failed to load</span>';
-  }
+    const rt = res.runtimes || [];
+    dom.javaRuntimes.innerHTML = rt.length === 0 ? '<span class="setting-hint">No runtimes detected</span>' :
+      rt.map(r => `<div class="java-runtime-item"><span class="java-runtime-component">${esc(r.Component||r.component)}</span><span class="java-runtime-source">${esc(r.Source||r.source)}</span></div>`).join('');
+  } catch { dom.javaRuntimes.innerHTML = '<span class="setting-hint">Failed to load</span>'; }
 }
 
 // ── Onboarding ──
 
 function showOnboarding() {
   dom.onboarding.classList.remove('hidden');
-
-  // Set up system info for memory step
-  if (state.systemInfo && state.systemInfo.total_memory_mb) {
-    const totalGB = Math.floor(state.systemInfo.total_memory_mb / 1024);
-    const totalMB = state.systemInfo.total_memory_mb;
-    dom.onboardingRamInfo.textContent = `Your system has ${totalGB} GB of RAM (${totalMB} MB)`;
-    dom.onboardingMemorySlider.max = totalGB;
-
-    const { rec, text } = getMemoryRecommendation(totalGB);
+  if (state.systemInfo?.total_memory_mb) {
+    const gb = Math.floor(state.systemInfo.total_memory_mb / 1024);
+    dom.onboardingRamInfo.textContent = `Your system has ${gb} GB of RAM`;
+    dom.onboardingMemorySlider.max = gb;
+    const { rec, text } = getMemoryRecommendation(gb);
     dom.onboardingMemorySlider.value = rec;
-    dom.onboardingMemoryValue.textContent = formatMemory(rec);
+    dom.onboardingMemoryValue.textContent = fmtMem(rec);
     dom.onboardingRec.textContent = text;
   }
 }
 
-function onboardingGoToStep(step) {
-  dom.onboardingStep1.classList.add('hidden');
-  dom.onboardingStep2.classList.add('hidden');
-  dom.onboardingStep3.classList.add('hidden');
-
-  dom.dot1.classList.remove('active');
-  dom.dot2.classList.remove('active');
-  dom.dot3.classList.remove('active');
-
-  if (step === 1) {
-    dom.onboardingStep1.classList.remove('hidden');
-    dom.dot1.classList.add('active');
-  } else if (step === 2) {
-    dom.onboardingStep2.classList.remove('hidden');
-    dom.dot2.classList.add('active');
-  } else if (step === 3) {
-    dom.onboardingStep3.classList.remove('hidden');
-    dom.dot3.classList.add('active');
-  }
+function onboardingStep(n) {
+  [dom.onboardingStep1, dom.onboardingStep2, dom.onboardingStep3].forEach((s, i) => s.classList.toggle('hidden', i !== n - 1));
+  [dom.dot1, dom.dot2, dom.dot3].forEach((d, i) => d.classList.toggle('active', i === n - 1));
 }
 
 async function finishOnboarding() {
   const username = dom.onboardingUsername.value.trim() || 'Player';
   const memGB = parseFloat(dom.onboardingMemorySlider.value);
-  const maxMemMB = Math.round(memGB * 1024);
-
-  // Apply to main UI
   dom.usernameInput.value = username;
   dom.memorySlider.value = memGB;
-  dom.memoryValue.textContent = formatMemory(memGB);
-
-  // Save config
-  try {
-    const res = await api('PUT', '/config', {
-      username: username,
-      max_memory_mb: maxMemMB,
-    });
-    if (!res.error) {
-      state.config = res;
-    }
-  } catch {
-    // Non-critical — continue anyway
-  }
-
-  // Mark onboarding complete
-  try {
-    await api('POST', '/onboarding/complete');
-  } catch {
-    // Non-critical
-  }
-
-  // Hide overlay
+  dom.memoryValue.textContent = fmtMem(memGB);
+  try { const r = await api('PUT', '/config', { username, max_memory_mb: Math.round(memGB * 1024) }); if (!r.error) state.config = r; } catch {}
+  try { await api('POST', '/onboarding/complete'); } catch {}
   dom.onboarding.classList.add('hidden');
-}
-
-// ── Error Display ──
-
-function showError(msg) {
-  appendLog('stderr', `ERROR: ${msg}`);
-  dom.logPanel.classList.add('expanded');
 }
 
 // ── Utilities ──
 
-function escapeHtml(str) {
-  const div = document.createElement('div');
-  div.textContent = str;
-  return div.innerHTML;
-}
-
-function formatMemory(gb) {
-  if (gb === Math.floor(gb)) return `${gb} GB`;
-  return `${gb.toFixed(1)} GB`;
-}
+function showError(msg) { appendLog('stderr', `ERROR: ${msg}`); dom.logPanel.classList.add('expanded'); }
+function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+function fmtMem(gb) { return gb === Math.floor(gb) ? `${gb} GB` : `${gb.toFixed(1)} GB`; }
 
 // ── Event Bindings ──
 
-// Search and filter
-dom.versionSearch.addEventListener('input', (e) => {
-  state.search = e.target.value;
-  renderVersionList();
-});
+dom.versionSearch.addEventListener('input', (e) => { state.search = e.target.value; renderVersionList(); });
 
-$$('.chip').forEach(chip => {
+$$('.filter-chips .chip[data-filter]').forEach(chip => {
   chip.addEventListener('click', () => {
-    $$('.chip').forEach(c => c.classList.remove('active'));
+    chip.parentElement.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
     chip.classList.add('active');
     state.filter = chip.dataset.filter;
     renderVersionList();
   });
 });
 
-// Memory slider
 dom.memorySlider.addEventListener('input', () => {
-  const val = parseFloat(dom.memorySlider.value);
-  dom.memoryValue.textContent = formatMemory(val);
-  const totalGB = state.systemInfo?.total_memory_mb
-    ? Math.floor(state.systemInfo.total_memory_mb / 1024)
-    : null;
-  updateMemoryRecText(val, totalGB);
+  const v = parseFloat(dom.memorySlider.value);
+  dom.memoryValue.textContent = fmtMem(v);
+  updateMemoryRecText(v, state.systemInfo?.total_memory_mb ? Math.floor(state.systemInfo.total_memory_mb / 1024) : null);
 });
 
-// Username save on blur
 dom.usernameInput.addEventListener('blur', () => {
-  const username = dom.usernameInput.value.trim();
-  if (username && username !== state.config?.username) {
-    api('PUT', '/config', { username });
-    if (state.config) state.config.username = username;
-  }
+  const u = dom.usernameInput.value.trim();
+  if (u && u !== state.config?.username) { api('PUT', '/config', { username: u }); if (state.config) state.config.username = u; }
 });
 
-// Launch
 dom.launchBtn.addEventListener('click', launchGame);
-
-// Install
 dom.installBtn.addEventListener('click', installVersion);
-
-// Kill
 dom.killBtn.addEventListener('click', killGame);
-
-// Log toggle
-dom.logToggle.addEventListener('click', toggleLog);
+dom.logToggle.addEventListener('click', () => dom.logPanel.classList.toggle('expanded'));
 
 // Settings
 dom.settingsBtn.addEventListener('click', openSettings);
 dom.settingsClose.addEventListener('click', closeSettings);
 dom.settingsCancel.addEventListener('click', closeSettings);
 dom.settingsSave.addEventListener('click', saveSettings);
+dom.settingsModal.addEventListener('click', (e) => { if (e.target === dom.settingsModal) closeSettings(); });
 
-dom.settingsModal.addEventListener('click', (e) => {
-  if (e.target === dom.settingsModal) closeSettings();
+// Catalog
+dom.addVersionBtn.addEventListener('click', openCatalog);
+dom.emptyAddBtn.addEventListener('click', openCatalog);
+dom.catalogClose.addEventListener('click', closeCatalog);
+dom.catalogModal.addEventListener('click', (e) => { if (e.target === dom.catalogModal) closeCatalog(); });
+dom.catalogSearch.addEventListener('input', (e) => { state.catalogSearch = e.target.value; renderCatalog(); });
+
+$$('.chip[data-catalog-filter]').forEach(chip => {
+  chip.addEventListener('click', () => {
+    chip.parentElement.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
+    chip.classList.add('active');
+    state.catalogFilter = chip.dataset.catalogFilter;
+    renderCatalog();
+  });
 });
 
 // Onboarding
-dom.onboardingNext1.addEventListener('click', () => onboardingGoToStep(2));
-dom.onboardingNext2.addEventListener('click', () => onboardingGoToStep(3));
+dom.onboardingNext1.addEventListener('click', () => onboardingStep(2));
+dom.onboardingNext2.addEventListener('click', () => onboardingStep(3));
 dom.onboardingFinish.addEventListener('click', finishOnboarding);
-
 dom.onboardingMemorySlider.addEventListener('input', () => {
-  const val = parseFloat(dom.onboardingMemorySlider.value);
-  dom.onboardingMemoryValue.textContent = formatMemory(val);
-  const totalGB = state.systemInfo?.total_memory_mb
-    ? Math.floor(state.systemInfo.total_memory_mb / 1024)
-    : null;
-  if (totalGB) {
-    const { text } = getMemoryRecommendation(totalGB);
-    if (val < 2) {
-      dom.onboardingRec.textContent = 'Low — may cause performance issues';
-    } else if (val > totalGB * 0.75) {
-      dom.onboardingRec.textContent = 'High — leave room for your OS';
-    } else {
-      dom.onboardingRec.textContent = text;
-    }
+  const v = parseFloat(dom.onboardingMemorySlider.value);
+  dom.onboardingMemoryValue.textContent = fmtMem(v);
+  const gb = state.systemInfo?.total_memory_mb ? Math.floor(state.systemInfo.total_memory_mb / 1024) : null;
+  if (gb) {
+    if (v < 2) dom.onboardingRec.textContent = 'Low — may cause issues';
+    else if (v > gb * 0.75) dom.onboardingRec.textContent = 'High — leave room for OS';
+    else dom.onboardingRec.textContent = getMemoryRecommendation(gb).text;
   }
 });
 
-// Keyboard shortcut: Escape closes modal
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
-    if (!dom.settingsModal.classList.contains('hidden')) {
-      closeSettings();
-    }
+    if (!dom.settingsModal.classList.contains('hidden')) closeSettings();
+    else if (!dom.catalogModal.classList.contains('hidden')) closeCatalog();
   }
 });
 

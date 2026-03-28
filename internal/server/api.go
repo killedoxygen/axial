@@ -25,34 +25,66 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleSystem(w http.ResponseWriter, r *http.Request) {
 	totalMB, err := system.TotalMemoryMB()
 	if err != nil {
-		totalMB = 8192 // fallback
+		totalMB = 8192
 	}
 	recMin, recMax := system.RecommendedMemoryRange(totalMB)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"total_memory_mb":       totalMB,
-		"recommended_min_mb":    recMin,
-		"recommended_max_mb":    recMax,
-		"max_allocatable_gb":    totalMB / 1024,
+		"total_memory_mb":    totalMB,
+		"recommended_min_mb": recMin,
+		"recommended_max_mb": recMax,
+		"max_allocatable_gb": totalMB / 1024,
 	})
 }
 
+// handleVersions returns ONLY locally installed versions.
 func (s *Server) handleVersions(w http.ResponseWriter, r *http.Request) {
-	local, err := minecraft.ScanVersions(s.mcDir)
+	versions, err := minecraft.ScanVersions(s.mcDir)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to scan versions: "+err.Error())
 		return
 	}
+	writeJSON(w, http.StatusOK, map[string]any{"versions": versions})
+}
 
-	// Merge with remote manifest (best-effort, don't fail if offline)
+// handleCatalog returns the remote Mojang version catalog for browsing/installing.
+func (s *Server) handleCatalog(w http.ResponseWriter, r *http.Request) {
 	manifest, err := minecraft.FetchVersionManifest()
 	if err != nil {
-		log.Printf("Warning: could not fetch version manifest: %v", err)
+		writeError(w, http.StatusInternalServerError, "failed to fetch catalog: "+err.Error())
+		return
 	}
 
-	versions := minecraft.MergeWithManifest(local, manifest)
+	// Build a set of locally installed version IDs for marking
+	local, _ := minecraft.ScanVersions(s.mcDir)
+	installedSet := make(map[string]bool, len(local))
+	for _, v := range local {
+		if v.Launchable {
+			installedSet[v.ID] = true
+		}
+	}
+
+	type catalogEntry struct {
+		ID          string `json:"id"`
+		Type        string `json:"type"`
+		ReleaseTime string `json:"release_time"`
+		URL         string `json:"url"`
+		Installed   bool   `json:"installed"`
+	}
+
+	entries := make([]catalogEntry, 0, len(manifest.Versions))
+	for _, v := range manifest.Versions {
+		entries = append(entries, catalogEntry{
+			ID:          v.ID,
+			Type:        v.Type,
+			ReleaseTime: v.ReleaseTime,
+			URL:         v.URL,
+			Installed:   installedSet[v.ID],
+		})
+	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"versions": versions,
+		"latest":   manifest.Latest,
+		"versions": entries,
 	})
 }
 
@@ -121,7 +153,6 @@ func (s *Server) handleLaunch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
-
 	if req.VersionID == "" {
 		writeError(w, http.StatusBadRequest, "version_id is required")
 		return
@@ -140,16 +171,14 @@ func (s *Server) handleLaunch(w http.ResponseWriter, r *http.Request) {
 		minMem = s.config.MinMemoryMB
 	}
 
-	opts := launcher.LaunchOptions{
+	result, err := launcher.BuildAndLaunch(launcher.LaunchOptions{
 		VersionID:   req.VersionID,
 		Username:    username,
 		MaxMemoryMB: maxMem,
 		MinMemoryMB: minMem,
 		MCDir:       s.mcDir,
 		Config:      s.config,
-	}
-
-	result, err := launcher.BuildAndLaunch(opts)
+	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -189,7 +218,7 @@ func (s *Server) handleKillProcess(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := result.Process.Kill(); err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to kill process: "+err.Error())
+		writeError(w, http.StatusInternalServerError, "failed to kill: "+err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "killed"})
@@ -197,30 +226,31 @@ func (s *Server) handleKillProcess(w http.ResponseWriter, r *http.Request) {
 
 type installRequest struct {
 	VersionID   string `json:"version_id"`
-	ManifestURL string `json:"manifest_url"`
+	ManifestURL string `json:"manifest_url,omitempty"`
 }
 
+// handleInstall starts a version download. manifest_url is optional —
+// if empty, the downloader resolves it from the Mojang manifest or uses local JSON.
 func (s *Server) handleInstall(w http.ResponseWriter, r *http.Request) {
 	var req installRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
-
-	if req.VersionID == "" || req.ManifestURL == "" {
-		writeError(w, http.StatusBadRequest, "version_id and manifest_url are required")
+	if req.VersionID == "" {
+		writeError(w, http.StatusBadRequest, "version_id is required")
 		return
 	}
 
+	// manifest_url is now optional — the downloader resolves it if empty
 	installID := randomID()
 	dl := minecraft.NewDownloader(s.mcDir)
 	s.installs.Add(installID, dl)
 
+	log.Printf("Starting install of %s (manifest_url=%q)", req.VersionID, req.ManifestURL)
 	go dl.InstallVersion(req.VersionID, req.ManifestURL)
 
-	writeJSON(w, http.StatusOK, map[string]string{
-		"install_id": installID,
-	})
+	writeJSON(w, http.StatusOK, map[string]string{"install_id": installID})
 }
 
 func (s *Server) handleInstallEvents(w http.ResponseWriter, r *http.Request) {
@@ -260,9 +290,7 @@ func (s *Server) handleInstallEvents(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleJava(w http.ResponseWriter, r *http.Request) {
 	runtimes := minecraft.ListJavaRuntimes(s.mcDir)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"runtimes": runtimes,
-	})
+	writeJSON(w, http.StatusOK, map[string]any{"runtimes": runtimes})
 }
 
 func randomID() string {

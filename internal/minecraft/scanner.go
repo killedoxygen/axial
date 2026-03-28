@@ -112,51 +112,6 @@ func ScanVersions(mcDir string) ([]VersionEntry, error) {
 	return versions, nil
 }
 
-// MergeWithManifest combines local versions with the remote Mojang manifest.
-// Local versions are enriched with ManifestURL; remote-only versions are added as not_installed.
-func MergeWithManifest(local []VersionEntry, manifest *VersionManifest) []VersionEntry {
-	if manifest == nil {
-		return local
-	}
-
-	localMap := make(map[string]*VersionEntry, len(local))
-	for i := range local {
-		localMap[local[i].ID] = &local[i]
-	}
-
-	var merged []VersionEntry
-
-	for _, entry := range manifest.Versions {
-		if lv, exists := localMap[entry.ID]; exists {
-			lv.ManifestURL = entry.URL
-			if lv.ReleaseTime == "" {
-				lv.ReleaseTime = entry.ReleaseTime
-			}
-			merged = append(merged, *lv)
-			delete(localMap, entry.ID)
-		} else {
-			// Remote-only version
-			merged = append(merged, VersionEntry{
-				ID:          entry.ID,
-				Type:        entry.Type,
-				ReleaseTime: entry.ReleaseTime,
-				Installed:   false,
-				Launchable:  false,
-				Status:      "not_installed",
-				ManifestURL: entry.URL,
-			})
-		}
-	}
-
-	// Add any local-only versions (modded/custom) that aren't in the manifest
-	for _, lv := range localMap {
-		merged = append(merged, *lv)
-	}
-
-	sortVersions(merged)
-	return merged
-}
-
 func sortVersions(versions []VersionEntry) {
 	sort.Slice(versions, func(i, j int) bool {
 		// Installed first

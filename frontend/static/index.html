@@ -66,6 +66,10 @@
             <span>Scanning versions...</span>
           </div>
         </div>
+        <button class="add-version-btn" id="add-version-btn">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          <span>Add Version</span>
+        </button>
       </aside>
 
       <!-- Center: Launch Panel -->
@@ -79,8 +83,9 @@
               <rect x="28" y="28" width="16" height="16" rx="2" fill="var(--accent)" opacity="0.2" stroke="var(--accent)" stroke-width="1.5" stroke-opacity="0.4"/>
             </svg>
           </div>
-          <p class="empty-title">Select a version</p>
-          <p class="empty-sub">Choose a Minecraft version from the sidebar to launch</p>
+          <p class="empty-title" id="empty-title">Select a version</p>
+          <p class="empty-sub" id="empty-sub">Choose a Minecraft version from the sidebar to launch</p>
+          <button class="btn-primary hidden" id="empty-add-btn" style="margin-top: 12px;">Add Your First Version</button>
         </div>
 
         <div class="version-detail hidden" id="version-detail">
@@ -174,6 +179,33 @@
         <div class="modal-footer">
           <button class="btn-secondary" id="settings-cancel">Cancel</button>
           <button class="btn-primary" id="settings-save">Save</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Catalog Modal (Add Version) -->
+    <div class="modal-overlay hidden" id="catalog-modal">
+      <div class="modal catalog-modal-size">
+        <div class="modal-header">
+          <span class="modal-title">Add Version</span>
+          <button class="icon-btn modal-close" id="catalog-close">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+        <div class="catalog-filters">
+          <input type="text" id="catalog-search" class="search-input catalog-search" placeholder="Search all Minecraft versions..." spellcheck="false">
+          <div class="filter-chips">
+            <button class="chip active" data-catalog-filter="release">Releases</button>
+            <button class="chip" data-catalog-filter="snapshot">Snapshots</button>
+            <button class="chip" data-catalog-filter="old_beta">Beta</button>
+            <button class="chip" data-catalog-filter="old_alpha">Alpha</button>
+          </div>
+        </div>
+        <div class="catalog-list" id="catalog-list">
+          <div class="loading-placeholder">
+            <div class="spinner"></div>
+            <span>Loading catalog...</span>
+          </div>
         </div>
       </div>
     </div>

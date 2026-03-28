@@ -12,24 +12,21 @@ import (
 	"time"
 )
 
-// DownloadProgress reports the current state of a version download.
 type DownloadProgress struct {
-	Phase      string `json:"phase"`
-	Current    int    `json:"current"`
-	Total      int    `json:"total"`
-	File       string `json:"file,omitempty"`
-	Error      string `json:"error,omitempty"`
-	Done       bool   `json:"done"`
+	Phase   string `json:"phase"`
+	Current int    `json:"current"`
+	Total   int    `json:"total"`
+	File    string `json:"file,omitempty"`
+	Error   string `json:"error,omitempty"`
+	Done    bool   `json:"done"`
 }
 
-// Downloader handles downloading Minecraft version files from Mojang servers.
 type Downloader struct {
 	MCDir      string
 	ProgressCh chan DownloadProgress
 	client     *http.Client
 }
 
-// NewDownloader creates a new downloader.
 func NewDownloader(mcDir string) *Downloader {
 	return &Downloader{
 		MCDir:      mcDir,
@@ -39,13 +36,9 @@ func NewDownloader(mcDir string) *Downloader {
 }
 
 // InstallVersion downloads all files needed to launch a version.
+// manifestURL can be empty for incomplete local versions — the local JSON will be used.
 func (d *Downloader) InstallVersion(versionID, manifestURL string) {
-	defer func() {
-		close(d.ProgressCh)
-	}()
-
-	// Phase 1: Download version JSON
-	d.send(DownloadProgress{Phase: "version_json", Current: 0, Total: 3, File: versionID + ".json"})
+	defer close(d.ProgressCh)
 
 	versionDir := filepath.Join(VersionsDir(d.MCDir), versionID)
 	if err := os.MkdirAll(versionDir, 0755); err != nil {
@@ -54,12 +47,30 @@ func (d *Downloader) InstallVersion(versionID, manifestURL string) {
 	}
 
 	jsonPath := filepath.Join(versionDir, versionID+".json")
-	if err := d.downloadFile(manifestURL, jsonPath, ""); err != nil {
-		d.sendError("Failed to download version JSON: " + err.Error())
-		return
-	}
 
-	// Parse the version JSON to get download URLs
+	// Phase 1: Get version JSON (download or use existing)
+	d.send(DownloadProgress{Phase: "version_json", Current: 0, Total: 3, File: versionID + ".json"})
+
+	if manifestURL != "" {
+		// Download fresh version JSON from Mojang
+		if err := d.downloadFile(manifestURL, jsonPath, ""); err != nil {
+			d.sendError("Failed to download version JSON: " + err.Error())
+			return
+		}
+	} else if _, err := os.Stat(jsonPath); os.IsNotExist(err) {
+		// No manifest URL and no local JSON — try to resolve from manifest
+		resolved, lookupErr := d.resolveManifestURL(versionID)
+		if lookupErr != nil || resolved == "" {
+			d.sendError("Cannot find download URL for version " + versionID)
+			return
+		}
+		if err := d.downloadFile(resolved, jsonPath, ""); err != nil {
+			d.sendError("Failed to download version JSON: " + err.Error())
+			return
+		}
+	}
+	// else: local JSON exists, use it
+
 	data, err := os.ReadFile(jsonPath)
 	if err != nil {
 		d.sendError("Failed to read version JSON: " + err.Error())
@@ -104,17 +115,24 @@ func (d *Downloader) InstallVersion(versionID, manifestURL string) {
 			continue
 		}
 
-		dir := filepath.Dir(libPath)
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			continue // skip this library, non-fatal
-		}
-
-		if err := d.downloadFile(libURL, libPath, libSHA1); err != nil {
-			continue // skip, non-fatal
-		}
+		os.MkdirAll(filepath.Dir(libPath), 0755)
+		d.downloadFile(libURL, libPath, libSHA1) // non-fatal
 	}
 
 	d.send(DownloadProgress{Phase: "done", Current: 3, Total: 3, Done: true})
+}
+
+func (d *Downloader) resolveManifestURL(versionID string) (string, error) {
+	manifest, err := FetchVersionManifest()
+	if err != nil {
+		return "", err
+	}
+	for _, entry := range manifest.Versions {
+		if entry.ID == versionID {
+			return entry.URL, nil
+		}
+	}
+	return "", fmt.Errorf("version %s not found in manifest", versionID)
 }
 
 func filterLibraries(libs []Library, env Environment) []Library {
@@ -130,34 +148,27 @@ func filterLibraries(libs []Library, env Environment) []Library {
 func resolveLibDownload(lib Library, mcDir string) (path, url, sha1 string) {
 	libDir := LibrariesDir(mcDir)
 
-	// Standard artifact
 	if lib.Downloads != nil && lib.Downloads.Artifact != nil {
 		a := lib.Downloads.Artifact
 		return filepath.Join(libDir, filepath.FromSlash(a.Path)), a.URL, a.SHA1
 	}
 
-	// Maven coordinate fallback
 	mavenPath := MavenToPath(lib.Name)
 	if mavenPath == "" {
 		return "", "", ""
 	}
 
 	absPath := filepath.Join(libDir, mavenPath)
-
-	// Construct URL from maven base URL
 	baseURL := lib.URL
 	if baseURL == "" {
 		baseURL = "https://libraries.minecraft.net/"
 	}
-	// Convert path separators to URL slashes
 	urlPath := filepath.ToSlash(mavenPath)
 	return absPath, baseURL + urlPath, lib.SHA1
 }
 
 func (d *Downloader) downloadFile(url, destPath, expectedSHA1 string) error {
-	if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
-		return err
-	}
+	os.MkdirAll(filepath.Dir(destPath), 0755)
 
 	tmpPath := destPath + ".tmp"
 	resp, err := d.client.Get(url)
@@ -176,21 +187,18 @@ func (d *Downloader) downloadFile(url, destPath, expectedSHA1 string) error {
 	}
 
 	h := sha1.New()
-	writer := io.MultiWriter(out, h)
-
-	if _, err := io.Copy(writer, resp.Body); err != nil {
+	if _, err := io.Copy(io.MultiWriter(out, h), resp.Body); err != nil {
 		out.Close()
 		os.Remove(tmpPath)
 		return err
 	}
 	out.Close()
 
-	// Verify SHA1 if provided
 	if expectedSHA1 != "" {
-		actualSHA1 := hex.EncodeToString(h.Sum(nil))
-		if actualSHA1 != expectedSHA1 {
+		actual := hex.EncodeToString(h.Sum(nil))
+		if actual != expectedSHA1 {
 			os.Remove(tmpPath)
-			return fmt.Errorf("SHA1 mismatch for %s: expected %s, got %s", filepath.Base(destPath), expectedSHA1, actualSHA1)
+			return fmt.Errorf("SHA1 mismatch for %s", filepath.Base(destPath))
 		}
 	}
 
@@ -202,7 +210,7 @@ func fileExistsWithSHA1(path, expectedSHA1 string) bool {
 		return false
 	}
 	if expectedSHA1 == "" {
-		return true // file exists, no SHA1 to check
+		return true
 	}
 	f, err := os.Open(path)
 	if err != nil {
