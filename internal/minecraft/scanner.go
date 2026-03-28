@@ -7,16 +7,19 @@ import (
 	"sort"
 )
 
-// VersionEntry is a lightweight summary of a detected version (no full parse needed).
+// VersionEntry is a lightweight summary of a version.
 type VersionEntry struct {
-	ID           string `json:"id"`
-	Type         string `json:"type"`
-	ReleaseTime  string `json:"release_time,omitempty"`
-	InheritsFrom string `json:"inherits_from,omitempty"`
-	Launchable   bool   `json:"launchable"`
-	Missing      []string `json:"missing,omitempty"`
+	ID            string `json:"id"`
+	Type          string `json:"type"`
+	ReleaseTime   string `json:"release_time,omitempty"`
+	InheritsFrom  string `json:"inherits_from,omitempty"`
+	Launchable    bool   `json:"launchable"`
+	Installed     bool   `json:"installed"`
+	Status        string `json:"status"` // "ready", "not_installed", "incomplete"
+	StatusDetail  string `json:"status_detail,omitempty"`
 	JavaComponent string `json:"java_component,omitempty"`
 	JavaMajor     int    `json:"java_major,omitempty"`
+	ManifestURL   string `json:"manifest_url,omitempty"`
 }
 
 // versionStub is used for quick JSON parsing without full version resolution.
@@ -33,7 +36,7 @@ type javaVerStub struct {
 	MajorVersion int    `json:"majorVersion"`
 }
 
-// ScanVersions scans the versions directory and returns a list of detected versions.
+// ScanVersions scans the local versions directory.
 func ScanVersions(mcDir string) ([]VersionEntry, error) {
 	versionsDir := VersionsDir(mcDir)
 	entries, err := os.ReadDir(versionsDir)
@@ -52,7 +55,7 @@ func ScanVersions(mcDir string) ([]VersionEntry, error) {
 
 		jsonData, err := os.ReadFile(jsonPath)
 		if err != nil {
-			continue // skip dirs without a version JSON
+			continue
 		}
 
 		var stub versionStub
@@ -65,6 +68,7 @@ func ScanVersions(mcDir string) ([]VersionEntry, error) {
 			Type:         stub.Type,
 			ReleaseTime:  stub.ReleaseTime,
 			InheritsFrom: stub.InheritsFrom,
+			Installed:    true,
 		}
 
 		if stub.JavaVersion != nil {
@@ -73,32 +77,92 @@ func ScanVersions(mcDir string) ([]VersionEntry, error) {
 		}
 
 		// Determine launch readiness
-		var missing []string
+		ready := true
+		detail := ""
+
 		if stub.InheritsFrom == "" {
-			// Vanilla version: needs its own client JAR
 			if _, err := os.Stat(jarPath); os.IsNotExist(err) {
-				missing = append(missing, "client_jar")
+				ready = false
+				detail = "Game files not fully downloaded"
 			}
 		} else {
-			// Modded version: needs the parent's client JAR
 			parentJar := filepath.Join(versionsDir, stub.InheritsFrom, stub.InheritsFrom+".jar")
-			if _, err := os.Stat(parentJar); os.IsNotExist(err) {
-				missing = append(missing, "parent_client_jar")
-			}
-			// Also check parent JSON exists
 			parentJSON := filepath.Join(versionsDir, stub.InheritsFrom, stub.InheritsFrom+".json")
 			if _, err := os.Stat(parentJSON); os.IsNotExist(err) {
-				missing = append(missing, "parent_version_json")
+				ready = false
+				detail = "Base version " + stub.InheritsFrom + " not installed"
+			} else if _, err := os.Stat(parentJar); os.IsNotExist(err) {
+				ready = false
+				detail = "Base version " + stub.InheritsFrom + " not fully downloaded"
 			}
 		}
 
-		ve.Missing = missing
-		ve.Launchable = len(missing) == 0
+		ve.Launchable = ready
+		if ready {
+			ve.Status = "ready"
+		} else {
+			ve.Status = "incomplete"
+			ve.StatusDetail = detail
+		}
+
 		versions = append(versions, ve)
 	}
 
-	// Sort: releases first, then by ID descending (newest first for semver-like IDs)
+	sortVersions(versions)
+	return versions, nil
+}
+
+// MergeWithManifest combines local versions with the remote Mojang manifest.
+// Local versions are enriched with ManifestURL; remote-only versions are added as not_installed.
+func MergeWithManifest(local []VersionEntry, manifest *VersionManifest) []VersionEntry {
+	if manifest == nil {
+		return local
+	}
+
+	localMap := make(map[string]*VersionEntry, len(local))
+	for i := range local {
+		localMap[local[i].ID] = &local[i]
+	}
+
+	var merged []VersionEntry
+
+	for _, entry := range manifest.Versions {
+		if lv, exists := localMap[entry.ID]; exists {
+			lv.ManifestURL = entry.URL
+			if lv.ReleaseTime == "" {
+				lv.ReleaseTime = entry.ReleaseTime
+			}
+			merged = append(merged, *lv)
+			delete(localMap, entry.ID)
+		} else {
+			// Remote-only version
+			merged = append(merged, VersionEntry{
+				ID:          entry.ID,
+				Type:        entry.Type,
+				ReleaseTime: entry.ReleaseTime,
+				Installed:   false,
+				Launchable:  false,
+				Status:      "not_installed",
+				ManifestURL: entry.URL,
+			})
+		}
+	}
+
+	// Add any local-only versions (modded/custom) that aren't in the manifest
+	for _, lv := range localMap {
+		merged = append(merged, *lv)
+	}
+
+	sortVersions(merged)
+	return merged
+}
+
+func sortVersions(versions []VersionEntry) {
 	sort.Slice(versions, func(i, j int) bool {
+		// Installed first
+		if versions[i].Installed != versions[j].Installed {
+			return versions[i].Installed
+		}
 		ti := versionTypePriority(versions[i].Type)
 		tj := versionTypePriority(versions[j].Type)
 		if ti != tj {
@@ -106,8 +170,6 @@ func ScanVersions(mcDir string) ([]VersionEntry, error) {
 		}
 		return versions[i].ID > versions[j].ID
 	})
-
-	return versions, nil
 }
 
 func versionTypePriority(t string) int {

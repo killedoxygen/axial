@@ -31,6 +31,7 @@
           <div class="memory-control">
             <input type="range" id="memory-slider" min="1" max="16" step="0.5" value="4">
             <span id="memory-value" class="memory-value">4 GB</span>
+            <span id="memory-rec" class="memory-rec"></span>
           </div>
         </div>
       </div>
@@ -96,6 +97,17 @@
             </button>
           </div>
 
+          <div class="install-area hidden" id="install-area">
+            <p class="install-text" id="install-text">This version is not installed</p>
+            <button class="install-btn" id="install-btn">
+              <span class="install-btn-text">INSTALL</span>
+            </button>
+            <div class="install-progress hidden" id="install-progress">
+              <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+              <span class="progress-text" id="progress-text">Downloading...</span>
+            </div>
+          </div>
+
           <div class="running-area hidden" id="running-area">
             <div class="running-indicator">
               <div class="pulse-ring"></div>
@@ -109,8 +121,7 @@
           </div>
 
           <div class="not-launchable hidden" id="not-launchable">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--amber)" stroke-width="2" stroke-linecap="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
-            <span id="not-launchable-text">Cannot launch — missing files</span>
+            <span id="not-launchable-text"></span>
           </div>
         </div>
       </main>
@@ -163,6 +174,43 @@
         <div class="modal-footer">
           <button class="btn-secondary" id="settings-cancel">Cancel</button>
           <button class="btn-primary" id="settings-save">Save</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Onboarding Overlay -->
+    <div class="onboarding-overlay hidden" id="onboarding">
+      <div class="onboarding-card">
+        <div class="onboarding-step" id="onboarding-step-1">
+          <img src="logo.png" alt="Croopor" width="64" height="64" class="onboarding-logo">
+          <h1 class="onboarding-title">Welcome to Croopor</h1>
+          <p class="onboarding-sub">Your offline Minecraft launcher</p>
+          <div class="onboarding-field">
+            <label class="setting-label">Choose your player name</label>
+            <input type="text" id="onboarding-username" class="setting-input onboarding-input" value="Player" spellcheck="false" autocomplete="off" autofocus>
+          </div>
+          <button class="btn-primary onboarding-next" id="onboarding-next-1">Continue</button>
+        </div>
+        <div class="onboarding-step hidden" id="onboarding-step-2">
+          <h2 class="onboarding-title">Memory Allocation</h2>
+          <p class="onboarding-sub" id="onboarding-ram-info">Detecting system memory...</p>
+          <div class="onboarding-memory">
+            <input type="range" id="onboarding-memory-slider" min="1" max="16" step="0.5" value="4" class="onboarding-slider">
+            <span id="onboarding-memory-value" class="memory-value">4 GB</span>
+          </div>
+          <p class="onboarding-rec" id="onboarding-rec"></p>
+          <button class="btn-primary onboarding-next" id="onboarding-next-2">Continue</button>
+        </div>
+        <div class="onboarding-step hidden" id="onboarding-step-3">
+          <div class="onboarding-check">&#10003;</div>
+          <h2 class="onboarding-title">You're all set!</h2>
+          <p class="onboarding-sub">Select a version from the sidebar and hit Launch.<br>Croopor handles everything else.</p>
+          <button class="btn-primary onboarding-next" id="onboarding-finish">Let's go</button>
+        </div>
+        <div class="onboarding-dots">
+          <span class="dot active" id="dot-1"></span>
+          <span class="dot" id="dot-2"></span>
+          <span class="dot" id="dot-3"></span>
         </div>
       </div>
     </div>

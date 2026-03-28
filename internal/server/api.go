@@ -1,12 +1,16 @@
 package server
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"log"
 	"net/http"
 
 	"github.com/mateoltd/mc-paralauncher/internal/config"
 	"github.com/mateoltd/mc-paralauncher/internal/launcher"
 	"github.com/mateoltd/mc-paralauncher/internal/minecraft"
+	"github.com/mateoltd/mc-paralauncher/internal/system"
 )
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -18,12 +22,35 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) handleSystem(w http.ResponseWriter, r *http.Request) {
+	totalMB, err := system.TotalMemoryMB()
+	if err != nil {
+		totalMB = 8192 // fallback
+	}
+	recMin, recMax := system.RecommendedMemoryRange(totalMB)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"total_memory_mb":       totalMB,
+		"recommended_min_mb":    recMin,
+		"recommended_max_mb":    recMax,
+		"max_allocatable_gb":    totalMB / 1024,
+	})
+}
+
 func (s *Server) handleVersions(w http.ResponseWriter, r *http.Request) {
-	versions, err := minecraft.ScanVersions(s.mcDir)
+	local, err := minecraft.ScanVersions(s.mcDir)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to scan versions: "+err.Error())
 		return
 	}
+
+	// Merge with remote manifest (best-effort, don't fail if offline)
+	manifest, err := minecraft.FetchVersionManifest()
+	if err != nil {
+		log.Printf("Warning: could not fetch version manifest: %v", err)
+	}
+
+	versions := minecraft.MergeWithManifest(local, manifest)
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"versions": versions,
 	})
@@ -34,41 +61,51 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
-	var updates config.Config
+	var updates map[string]any
 	if err := json.NewDecoder(r.Body).Decode(&updates); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
 
-	// Apply non-zero updates
-	if updates.Username != "" {
-		s.config.Username = updates.Username
+	if v, ok := updates["username"].(string); ok && v != "" {
+		s.config.Username = v
 	}
-	if updates.MaxMemoryMB > 0 {
-		s.config.MaxMemoryMB = updates.MaxMemoryMB
+	if v, ok := updates["max_memory_mb"].(float64); ok && v > 0 {
+		s.config.MaxMemoryMB = int(v)
 	}
-	if updates.MinMemoryMB > 0 {
-		s.config.MinMemoryMB = updates.MinMemoryMB
+	if v, ok := updates["min_memory_mb"].(float64); ok && v > 0 {
+		s.config.MinMemoryMB = int(v)
 	}
-	if updates.LastVersionID != "" {
-		s.config.LastVersionID = updates.LastVersionID
+	if v, ok := updates["last_version_id"].(string); ok && v != "" {
+		s.config.LastVersionID = v
 	}
-	if updates.JavaPathOverride != "" {
-		s.config.JavaPathOverride = updates.JavaPathOverride
+	if v, ok := updates["java_path_override"].(string); ok {
+		s.config.JavaPathOverride = v
 	}
-	if updates.WindowWidth > 0 {
-		s.config.WindowWidth = updates.WindowWidth
+	if v, ok := updates["window_width"].(float64); ok {
+		s.config.WindowWidth = int(v)
 	}
-	if updates.WindowHeight > 0 {
-		s.config.WindowHeight = updates.WindowHeight
+	if v, ok := updates["window_height"].(float64); ok {
+		s.config.WindowHeight = int(v)
+	}
+	if v, ok := updates["onboarding_done"].(bool); ok {
+		s.config.OnboardingDone = v
 	}
 
 	if err := config.Save(s.config); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to save config: "+err.Error())
 		return
 	}
-
 	writeJSON(w, http.StatusOK, s.config)
+}
+
+func (s *Server) handleOnboardingComplete(w http.ResponseWriter, r *http.Request) {
+	s.config.OnboardingDone = true
+	if err := config.Save(s.config); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to save: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 type launchRequest struct {
@@ -90,7 +127,6 @@ func (s *Server) handleLaunch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Use request values or fall back to config
 	username := req.Username
 	if username == "" {
 		username = s.config.Username
@@ -120,8 +156,6 @@ func (s *Server) handleLaunch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.sessions.Add(result)
-
-	// Update config with last used version
 	s.config.LastVersionID = req.VersionID
 	s.config.Username = username
 	config.Save(s.config)
@@ -140,7 +174,6 @@ func (s *Server) handleLaunchCommand(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "session not found")
 		return
 	}
-
 	writeJSON(w, http.StatusOK, map[string]any{
 		"command":    result.Command,
 		"java_path":  result.JavaPath,
@@ -155,13 +188,74 @@ func (s *Server) handleKillProcess(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "session not found")
 		return
 	}
-
 	if err := result.Process.Kill(); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to kill process: "+err.Error())
 		return
 	}
-
 	writeJSON(w, http.StatusOK, map[string]string{"status": "killed"})
+}
+
+type installRequest struct {
+	VersionID   string `json:"version_id"`
+	ManifestURL string `json:"manifest_url"`
+}
+
+func (s *Server) handleInstall(w http.ResponseWriter, r *http.Request) {
+	var req installRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+
+	if req.VersionID == "" || req.ManifestURL == "" {
+		writeError(w, http.StatusBadRequest, "version_id and manifest_url are required")
+		return
+	}
+
+	installID := randomID()
+	dl := minecraft.NewDownloader(s.mcDir)
+	s.installs.Add(installID, dl)
+
+	go dl.InstallVersion(req.VersionID, req.ManifestURL)
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		"install_id": installID,
+	})
+}
+
+func (s *Server) handleInstallEvents(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	dl, ok := s.installs.Get(id)
+	if !ok {
+		writeError(w, http.StatusNotFound, "install session not found")
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "streaming not supported")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case p, ok := <-dl.ProgressCh:
+			if !ok {
+				return
+			}
+			sendSSE(w, flusher, "progress", p)
+			if p.Done {
+				return
+			}
+		}
+	}
 }
 
 func (s *Server) handleJava(w http.ResponseWriter, r *http.Request) {
@@ -169,4 +263,10 @@ func (s *Server) handleJava(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"runtimes": runtimes,
 	})
+}
+
+func randomID() string {
+	b := make([]byte, 8)
+	rand.Read(b)
+	return hex.EncodeToString(b)
 }

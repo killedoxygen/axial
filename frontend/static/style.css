@@ -988,3 +988,203 @@ input[type="range"]::-moz-range-thumb {
 .version-item {
   animation: slide-up 0.2s ease both;
 }
+
+/* ══════════════
+   MEMORY RECOMMENDATION
+   ══════════════ */
+
+.memory-rec {
+  font-size: 10px;
+  color: var(--text-muted);
+  margin-left: 4px;
+}
+
+/* ══════════════
+   INSTALL AREA
+   ══════════════ */
+
+.install-area {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  margin-top: 12px;
+}
+
+.install-text {
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+.install-btn {
+  font-family: var(--font-sans);
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--bg-deep);
+  background: var(--accent);
+  border: none;
+  border-radius: var(--r-md);
+  padding: 12px 44px;
+  cursor: pointer;
+  transition: transform 0.1s, opacity 0.15s;
+}
+
+.install-btn:hover { transform: translateY(-1px); opacity: 0.9; }
+.install-btn:active { transform: translateY(1px); }
+.install-btn:disabled { opacity: 0.5; cursor: default; transform: none; }
+
+.install-progress {
+  width: 100%;
+  max-width: 300px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: center;
+}
+
+.progress-bar {
+  width: 100%;
+  height: 4px;
+  background: var(--surface-2);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+  width: 0%;
+  transition: width 0.3s ease;
+}
+
+.progress-text {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+/* ══════════════
+   ONBOARDING
+   ══════════════ */
+
+.onboarding-overlay {
+  position: fixed;
+  inset: 0;
+  background: var(--bg-deep);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 200;
+  animation: fade-in 0.3s ease;
+}
+
+.onboarding-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  max-width: 380px;
+  width: 100%;
+  padding: 40px;
+}
+
+.onboarding-step {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  text-align: center;
+  width: 100%;
+  animation: fade-in 0.25s ease;
+}
+
+.onboarding-logo {
+  border-radius: var(--r-lg);
+  margin-bottom: 8px;
+}
+
+.onboarding-title {
+  font-family: var(--font-sans);
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--text);
+  margin: 0;
+}
+
+.onboarding-sub {
+  font-size: 13px;
+  color: var(--text-dim);
+  line-height: 1.6;
+  margin: 0;
+}
+
+.onboarding-field {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.onboarding-input {
+  text-align: center;
+  font-size: 16px;
+  padding: 10px;
+}
+
+.onboarding-memory {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  justify-content: center;
+  margin-top: 8px;
+}
+
+.onboarding-slider {
+  width: 200px;
+}
+
+.onboarding-rec {
+  font-size: 11px;
+  color: var(--accent-dim);
+  margin: 0;
+}
+
+.onboarding-check {
+  font-size: 48px;
+  color: var(--accent);
+  line-height: 1;
+  margin-bottom: 8px;
+}
+
+.onboarding-next {
+  margin-top: 12px;
+  padding: 10px 32px;
+  font-size: 13px;
+}
+
+.onboarding-dots {
+  display: flex;
+  gap: 8px;
+  margin-top: 32px;
+}
+
+.dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--surface-3);
+  transition: background 0.2s;
+}
+
+.dot.active {
+  background: var(--accent);
+}
+
+/* Version dot for not-installed */
+.version-dot.remote {
+  background: var(--surface-3);
+  border: 1px solid var(--text-muted);
+}
