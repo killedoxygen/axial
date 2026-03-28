@@ -48,6 +48,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/v1/install", s.handleInstall)
 	s.mux.HandleFunc("GET /api/v1/install/{id}/events", s.handleInstallEvents)
 	s.mux.HandleFunc("GET /api/v1/java", s.handleJava)
+	registerDevRoutes(s)
 	s.mux.Handle("/", http.FileServer(http.FS(s.frontend)))
 }
 

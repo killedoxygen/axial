@@ -176,6 +176,16 @@
             </div>
           </div>
         </div>
+        <div class="dev-tools hidden" id="dev-tools">
+          <div class="setting-group">
+            <label class="setting-label" style="color:var(--amber)">Developer Tools</label>
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <button class="btn-danger" id="dev-cleanup">Cleanup Versions</button>
+              <button class="btn-danger" id="dev-flush">Flush All Data</button>
+            </div>
+            <p class="setting-hint">Cleanup backs up worlds/mods then removes all versions. Flush resets Croopor to first-launch state.</p>
+          </div>
+        </div>
         <div class="modal-footer">
           <button class="btn-secondary" id="settings-cancel">Cancel</button>
           <button class="btn-primary" id="settings-save">Save</button>

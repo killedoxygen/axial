@@ -19,6 +19,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"mc_dir":   s.mcDir,
 		"app_name": "Croopor",
 		"version":  "1.0.0",
+		"dev_mode": devMode,
 	})
 }
 

@@ -9,6 +9,7 @@ const state = {
   catalog: null,
   config: null,
   systemInfo: null,
+  devMode: false,
   selectedVersion: null,
   activeSession: null,
   eventSource: null,
@@ -20,6 +21,7 @@ const state = {
   catalogSearch: '',
   gameRunning: false,
   installing: false,
+  collapsedGroups: {},
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -85,6 +87,9 @@ const dom = {
   onboardingNext2: $('#onboarding-next-2'),
   onboardingFinish: $('#onboarding-finish'),
   dot1: $('#dot-1'), dot2: $('#dot-2'), dot3: $('#dot-3'),
+  devTools: $('#dev-tools'),
+  devCleanup: $('#dev-cleanup'),
+  devFlush: $('#dev-flush'),
 };
 
 // ── API ──
@@ -116,14 +121,17 @@ function updateMemoryRecText(val, totalGB) {
 
 async function init() {
   try {
-    const [versionsRes, configRes, systemRes] = await Promise.all([
+    const [versionsRes, configRes, systemRes, statusRes] = await Promise.all([
       api('GET', '/versions'),
       api('GET', '/config'),
       api('GET', '/system').catch(() => null),
+      api('GET', '/status').catch(() => null),
     ]);
     state.versions = versionsRes.versions || [];
     state.config = configRes;
     state.systemInfo = systemRes;
+    state.devMode = statusRes?.dev_mode === true;
+    if (state.devMode && dom.devTools) dom.devTools.classList.remove('hidden');
 
     applyConfig(state.config);
     applySystemInfo(state.systemInfo);
@@ -192,9 +200,13 @@ function renderVersionList() {
   }
 
   let html = '';
-  const renderGroup = (label, versions) => {
+  const chevronSvg = `<svg class="version-group-chevron" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>`;
+
+  const renderGroup = (key, label, versions) => {
     if (!versions.length) return;
-    html += `<div class="version-group-label">${label}</div>`;
+    const collapsed = state.collapsedGroups[key];
+    html += `<div class="version-group-label${collapsed ? ' collapsed' : ''}" data-group="${key}">${chevronSvg}${label} <span style="opacity:0.5;font-weight:400;margin-left:2px">${versions.length}</span></div>`;
+    html += `<div class="version-group-items${collapsed ? ' collapsed' : ''}" data-group-items="${key}">`;
     versions.forEach((v, i) => {
       const isModded = !!v.inherits_from;
       const badgeClass = isModded ? 'badge-modded' : v.type === 'release' ? 'badge-release' : v.type === 'snapshot' ? 'badge-snapshot' : 'badge-old';
@@ -207,17 +219,29 @@ function renderVersionList() {
         <span class="version-name">${esc(v.id)}</span>
         <span class="version-badge ${badgeClass}">${badgeText}</span></div>`;
     });
+    html += `</div>`;
   };
-  renderGroup('Releases', groups.release);
-  renderGroup('Modded', groups.modded);
-  renderGroup('Snapshots', groups.snapshot);
-  renderGroup('Other', groups.other);
+  renderGroup('release', 'Releases', groups.release);
+  renderGroup('modded', 'Modded', groups.modded);
+  renderGroup('snapshot', 'Snapshots', groups.snapshot);
+  renderGroup('other', 'Other', groups.other);
   dom.versionList.innerHTML = html;
 
   dom.versionList.querySelectorAll('.version-item').forEach(el => {
     el.addEventListener('click', () => {
       const v = state.versions.find(v => v.id === el.dataset.id);
       if (v) selectVersion(v);
+    });
+  });
+
+  // Collapsible group headers
+  dom.versionList.querySelectorAll('.version-group-label').forEach(label => {
+    label.addEventListener('click', () => {
+      const key = label.dataset.group;
+      state.collapsedGroups[key] = !state.collapsedGroups[key];
+      label.classList.toggle('collapsed');
+      const items = dom.versionList.querySelector(`[data-group-items="${key}"]`);
+      if (items) items.classList.toggle('collapsed');
     });
   });
 }
@@ -649,6 +673,37 @@ dom.onboardingMemorySlider.addEventListener('input', () => {
     else if (v > gb * 0.75) dom.onboardingRec.textContent = 'High — leave room for OS';
     else dom.onboardingRec.textContent = getMemoryRecommendation(gb).text;
   }
+});
+
+// Dev tools
+if (dom.devCleanup) dom.devCleanup.addEventListener('click', async () => {
+  if (!confirm('This will remove all installed versions.\nWorlds, mods, and resource packs will be backed up.\n\nContinue?')) return;
+  dom.devCleanup.disabled = true;
+  dom.devCleanup.textContent = 'Working...';
+  try {
+    const res = await api('POST', '/dev/cleanup-versions');
+    if (res.error) { showError(res.error); } else {
+      appendLog('system', `Backup saved to: ${res.backup_dir}`);
+      appendLog('system', `Backed up: ${(res.backed_up||[]).join(', ')}`);
+      appendLog('system', `Removed ${res.removed} versions`);
+      const vr = await api('GET', '/versions');
+      state.versions = vr.versions || [];
+      state.selectedVersion = null;
+      dom.versionDetail.classList.add('hidden');
+      dom.emptyState.classList.remove('hidden');
+      renderVersionList();
+    }
+  } catch (err) { showError(err.message); }
+  dom.devCleanup.disabled = false;
+  dom.devCleanup.textContent = 'Cleanup Versions';
+});
+
+if (dom.devFlush) dom.devFlush.addEventListener('click', async () => {
+  if (!confirm('This will delete all Croopor settings and cached runtimes.\nThe app will restart from the onboarding screen.\n\nContinue?')) return;
+  try {
+    await api('POST', '/dev/flush');
+    location.reload();
+  } catch (err) { showError(err.message); }
 });
 
 document.addEventListener('keydown', (e) => {
