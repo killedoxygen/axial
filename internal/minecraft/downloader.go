@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -35,8 +36,9 @@ func NewDownloader(mcDir string) *Downloader {
 	}
 }
 
-// InstallVersion downloads all files needed to launch a version.
-// manifestURL can be empty for incomplete local versions — the local JSON will be used.
+// InstallVersion downloads all files needed to launch a version:
+// version JSON, client JAR, libraries (including native classifiers),
+// asset index, asset objects, and log config.
 func (d *Downloader) InstallVersion(versionID, manifestURL string) {
 	defer close(d.ProgressCh)
 
@@ -49,7 +51,7 @@ func (d *Downloader) InstallVersion(versionID, manifestURL string) {
 	jsonPath := filepath.Join(versionDir, versionID+".json")
 
 	// Phase 1: Get version JSON (download or use existing)
-	d.send(DownloadProgress{Phase: "version_json", Current: 0, Total: 3, File: versionID + ".json"})
+	d.send(DownloadProgress{Phase: "version_json", Current: 0, Total: 1, File: versionID + ".json"})
 
 	if manifestURL != "" {
 		// Download fresh version JSON from Mojang
@@ -84,7 +86,7 @@ func (d *Downloader) InstallVersion(versionID, manifestURL string) {
 	}
 
 	// Phase 2: Download client JAR
-	d.send(DownloadProgress{Phase: "client_jar", Current: 1, Total: 3, File: versionID + ".jar"})
+	d.send(DownloadProgress{Phase: "client_jar", Current: 0, Total: 1, File: versionID + ".jar"})
 
 	if version.Downloads.Client != nil {
 		jarPath := filepath.Join(versionDir, versionID+".jar")
@@ -96,7 +98,7 @@ func (d *Downloader) InstallVersion(versionID, manifestURL string) {
 		}
 	}
 
-	// Phase 3: Download libraries
+	// Phase 3: Download libraries (including native classifier JARs)
 	env := DefaultEnvironment()
 	libs := filterLibraries(version.Libraries, env)
 	totalLibs := len(libs)
@@ -104,22 +106,131 @@ func (d *Downloader) InstallVersion(versionID, manifestURL string) {
 	d.send(DownloadProgress{Phase: "libraries", Current: 0, Total: totalLibs})
 
 	for i, lib := range libs {
+		// Download main artifact
 		libPath, libURL, libSHA1 := resolveLibDownload(lib, d.MCDir)
-		if libPath == "" || libURL == "" {
-			continue
+		if libPath != "" && libURL != "" {
+			d.send(DownloadProgress{Phase: "libraries", Current: i + 1, Total: totalLibs, File: filepath.Base(libPath)})
+			if !fileExistsWithSHA1(libPath, libSHA1) {
+				os.MkdirAll(filepath.Dir(libPath), 0755)
+				d.downloadFile(libURL, libPath, libSHA1) // non-fatal
+			}
 		}
 
-		d.send(DownloadProgress{Phase: "libraries", Current: i + 1, Total: totalLibs, File: filepath.Base(libPath)})
-
-		if fileExistsWithSHA1(libPath, libSHA1) {
-			continue
+		// Download native classifier JAR if this library has a natives map
+		natPath, natURL, natSHA1 := resolveNativeDownload(lib, d.MCDir, env)
+		if natPath != "" && natURL != "" && !fileExistsWithSHA1(natPath, natSHA1) {
+			os.MkdirAll(filepath.Dir(natPath), 0755)
+			d.downloadFile(natURL, natPath, natSHA1) // non-fatal
 		}
-
-		os.MkdirAll(filepath.Dir(libPath), 0755)
-		d.downloadFile(libURL, libPath, libSHA1) // non-fatal
 	}
 
-	d.send(DownloadProgress{Phase: "done", Current: 3, Total: 3, Done: true})
+	// Phase 4: Download asset index
+	if version.AssetIndex.URL != "" {
+		assetIndexPath := filepath.Join(AssetsDir(d.MCDir), "indexes", version.AssetIndex.ID+".json")
+		d.send(DownloadProgress{Phase: "asset_index", Current: 0, Total: 1, File: version.AssetIndex.ID + ".json"})
+		if !fileExistsWithSHA1(assetIndexPath, version.AssetIndex.SHA1) {
+			if err := d.downloadFile(version.AssetIndex.URL, assetIndexPath, version.AssetIndex.SHA1); err != nil {
+				d.sendError("Failed to download asset index: " + err.Error())
+				return
+			}
+		}
+
+		// Phase 5: Download asset objects
+		d.downloadAssetObjects(assetIndexPath)
+	}
+
+	// Phase 6: Download log config file
+	if version.Logging != nil && version.Logging.Client != nil && version.Logging.Client.File.URL != "" {
+		logConfigPath := filepath.Join(AssetsDir(d.MCDir), "log_configs", version.Logging.Client.File.ID)
+		if !fileExistsWithSHA1(logConfigPath, version.Logging.Client.File.SHA1) {
+			d.send(DownloadProgress{Phase: "log_config", Current: 0, Total: 1, File: version.Logging.Client.File.ID})
+			d.downloadFile(version.Logging.Client.File.URL, logConfigPath, version.Logging.Client.File.SHA1)
+		}
+	}
+
+	d.send(DownloadProgress{Phase: "done", Current: 1, Total: 1, Done: true})
+}
+
+// resolveNativeDownload finds the native classifier JAR for a library with a "natives" map.
+// Legacy versions (<=1.12) store native DLLs in classifier JARs like "natives-windows".
+func resolveNativeDownload(lib Library, mcDir string, env Environment) (path, url, sha1 string) {
+	if lib.Natives == nil {
+		return "", "", ""
+	}
+	classifierKey, ok := lib.Natives[env.OSName]
+	if !ok {
+		return "", "", ""
+	}
+	classifierKey = strings.ReplaceAll(classifierKey, "${arch}", archBits())
+
+	libDir := LibrariesDir(mcDir)
+	if lib.Downloads != nil && lib.Downloads.Classifiers != nil {
+		if artifact, ok := lib.Downloads.Classifiers[classifierKey]; ok {
+			return filepath.Join(libDir, filepath.FromSlash(artifact.Path)), artifact.URL, artifact.SHA1
+		}
+	}
+	return "", "", ""
+}
+
+// downloadAssetObjects reads the asset index and downloads all referenced objects.
+// For legacy/virtual indexes, it also creates the virtual directory structure.
+func (d *Downloader) downloadAssetObjects(indexPath string) {
+	data, err := os.ReadFile(indexPath)
+	if err != nil {
+		return
+	}
+
+	var index struct {
+		Objects map[string]struct {
+			Hash string `json:"hash"`
+			Size int64  `json:"size"`
+		} `json:"objects"`
+		Virtual        bool `json:"virtual"`
+		MapToResources bool `json:"map_to_resources"`
+	}
+	if err := json.Unmarshal(data, &index); err != nil {
+		return
+	}
+
+	objectsDir := filepath.Join(AssetsDir(d.MCDir), "objects")
+	total := len(index.Objects)
+	current := 0
+
+	for _, obj := range index.Objects {
+		current++
+		if current%100 == 1 || current == total {
+			d.send(DownloadProgress{Phase: "assets", Current: current, Total: total})
+		}
+
+		prefix := obj.Hash[:2]
+		objPath := filepath.Join(objectsDir, prefix, obj.Hash)
+		if fileExistsWithSHA1(objPath, obj.Hash) {
+			continue
+		}
+
+		url := "https://resources.download.minecraft.net/" + prefix + "/" + obj.Hash
+		d.downloadFile(url, objPath, obj.Hash) // non-fatal per object
+	}
+
+	// For legacy/virtual asset indexes (pre-1.6), create the virtual directory
+	// so ${game_assets} points to actual files at their original paths.
+	if index.Virtual || index.MapToResources {
+		virtualDir := filepath.Join(AssetsDir(d.MCDir), "virtual", "legacy")
+		for name, obj := range index.Objects {
+			dstPath := filepath.Join(virtualDir, filepath.FromSlash(name))
+			if _, err := os.Stat(dstPath); err == nil {
+				continue
+			}
+			prefix := obj.Hash[:2]
+			srcPath := filepath.Join(objectsDir, prefix, obj.Hash)
+			srcData, err := os.ReadFile(srcPath)
+			if err != nil {
+				continue
+			}
+			os.MkdirAll(filepath.Dir(dstPath), 0755)
+			os.WriteFile(dstPath, srcData, 0644)
+		}
+	}
 }
 
 func (d *Downloader) resolveManifestURL(versionID string) (string, error) {

@@ -29,6 +29,7 @@ type LaunchVars struct {
 	ClasspathSeparator string
 	ResolutionWidth  string
 	ResolutionHeight string
+	GameAssets       string // for pre-1.6 versions: assets/virtual/legacy/
 }
 
 // BuildVarMap returns the template variable map for argument substitution.
@@ -54,9 +55,16 @@ func (lv *LaunchVars) BuildVarMap() map[string]string {
 		"resolution_width":  lv.ResolutionWidth,
 		"resolution_height": lv.ResolutionHeight,
 		// Some versions use these alternate names
-		"game_assets":       lv.AssetsRoot,
+		"game_assets":       lv.gameAssetsDir(),
 		"user_properties":   "{}",
 	}
+}
+
+func (lv *LaunchVars) gameAssetsDir() string {
+	if lv.GameAssets != "" {
+		return lv.GameAssets
+	}
+	return lv.AssetsRoot
 }
 
 // ResolveArguments processes the version's arguments, evaluates rules,

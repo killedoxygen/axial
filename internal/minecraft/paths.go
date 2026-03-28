@@ -1,6 +1,7 @@
 package minecraft
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -92,6 +93,22 @@ func DefaultMinecraftDir() string {
 		}
 	}
 	return ""
+}
+
+// IsLegacyAssets checks if the asset index uses the legacy/virtual format (pre-1.6).
+// These versions expect assets at assets/virtual/legacy/<path> instead of assets/objects/.
+func IsLegacyAssets(mcDir string, assetIndexID string) bool {
+	indexPath := filepath.Join(AssetsDir(mcDir), "indexes", assetIndexID+".json")
+	data, err := os.ReadFile(indexPath)
+	if err != nil {
+		return false
+	}
+	var idx struct {
+		Virtual        bool `json:"virtual"`
+		MapToResources bool `json:"map_to_resources"`
+	}
+	json.Unmarshal(data, &idx)
+	return idx.Virtual || idx.MapToResources
 }
 
 // CreateMinecraftDir creates a .minecraft directory structure at the given path.

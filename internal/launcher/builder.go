@@ -67,12 +67,12 @@ func BuildAndLaunch(opts LaunchOptions) (*LaunchResult, error) {
 		return nil, fmt.Errorf("creating natives dir: %w", err)
 	}
 
-	// Step 7: Extract legacy natives if needed
-	if version.IsLegacyVersion() {
-		if err := ExtractLegacyNatives(libs, nativesDir); err != nil {
-			CleanupNativesDir(nativesDir)
-			return nil, fmt.Errorf("extracting natives: %w", err)
-		}
+	// Step 7: Extract native DLLs from native library JARs into the natives directory.
+	// Required for ALL versions — legacy versions use classifier JARs, modern versions
+	// use separate native library entries, but both need extraction.
+	if err := ExtractLegacyNatives(libs, nativesDir); err != nil {
+		CleanupNativesDir(nativesDir)
+		return nil, fmt.Errorf("extracting natives: %w", err)
 	}
 
 	// Step 8: Build launch variables
@@ -84,6 +84,13 @@ func BuildAndLaunch(opts LaunchOptions) (*LaunchResult, error) {
 	gameDir := opts.MCDir
 	if opts.Config.JavaPathOverride != "" {
 		// Keep using .minecraft as game dir
+	}
+
+	// For pre-1.6 versions with virtual/legacy asset indexes,
+	// game_assets must point to assets/virtual/legacy/ instead of assets/.
+	var gameAssets string
+	if minecraft.IsLegacyAssets(opts.MCDir, version.AssetIndex.ID) {
+		gameAssets = filepath.Join(minecraft.AssetsDir(opts.MCDir), "virtual", "legacy")
 	}
 
 	vars := &minecraft.LaunchVars{
@@ -104,6 +111,7 @@ func BuildAndLaunch(opts LaunchOptions) (*LaunchResult, error) {
 		Classpath:          classpath,
 		LibraryDirectory:   minecraft.LibrariesDir(opts.MCDir),
 		ClasspathSeparator: string(os.PathListSeparator),
+		GameAssets:         gameAssets,
 	}
 
 	if opts.Config.WindowWidth > 0 && opts.Config.WindowHeight > 0 {
