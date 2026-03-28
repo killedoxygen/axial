@@ -351,6 +351,135 @@
       </div>
     </div>
 
+    <!-- Context Menu -->
+    <div class="ctx-menu hidden" id="ctx-menu" role="menu">
+      <button class="ctx-item" id="ctx-open-folder" role="menuitem">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+        <span>Open Folder</span>
+      </button>
+      <button class="ctx-item" id="ctx-copy-id" role="menuitem">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+        <span>Copy Version ID</span>
+      </button>
+      <div class="ctx-divider"></div>
+      <button class="ctx-item ctx-item-danger" id="ctx-delete" role="menuitem">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>
+        <span>Delete Version</span>
+      </button>
+    </div>
+
+    <!-- Delete Version Wizard -->
+    <div class="modal-overlay hidden" id="delete-modal">
+      <div class="modal delete-modal-size">
+        <div class="modal-header">
+          <span class="modal-title" id="delete-modal-title">Delete Version</span>
+          <button class="icon-btn modal-close" id="delete-close" data-action="close" aria-label="Close delete dialog">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+          </button>
+        </div>
+        <div class="delete-wizard" id="delete-wizard">
+          <!-- Step 1: Analyzing -->
+          <div class="delete-step" id="delete-step-analyze">
+            <div class="delete-loading">
+              <div class="spinner"></div>
+              <span>Analyzing version data...</span>
+            </div>
+          </div>
+
+          <!-- Step 2: Impact Summary -->
+          <div class="delete-step hidden" id="delete-step-summary">
+            <div class="delete-version-header">
+              <span class="delete-version-name" id="delete-version-name"></span>
+              <span class="delete-version-size" id="delete-version-size"></span>
+            </div>
+
+            <!-- Warning: dependents -->
+            <div class="delete-card delete-card-warn hidden" id="delete-dependents-card">
+              <div class="delete-card-icon">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+              </div>
+              <div class="delete-card-body">
+                <strong class="delete-card-title">Dependent Versions</strong>
+                <p class="delete-card-text">These modded versions rely on <strong id="delete-dep-parent"></strong> as their base. Deleting it will make them unlaunchable.</p>
+                <div class="delete-dep-list" id="delete-dep-list"></div>
+                <label class="delete-checkbox">
+                  <input type="checkbox" id="delete-cascade-check">
+                  <span>Also delete dependent versions</span>
+                </label>
+              </div>
+            </div>
+
+            <!-- Info: worlds -->
+            <div class="delete-card delete-card-info hidden" id="delete-worlds-card">
+              <div class="delete-card-icon">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+              </div>
+              <div class="delete-card-body">
+                <strong class="delete-card-title">Your Worlds Are Safe</strong>
+                <p class="delete-card-text">Worlds are stored in the shared <code>saves/</code> folder and won't be deleted. You have <strong id="delete-world-count">0</strong> world(s):</p>
+                <div class="delete-world-list" id="delete-world-list"></div>
+              </div>
+            </div>
+
+            <!-- Info: shared data -->
+            <div class="delete-card delete-card-info hidden" id="delete-shared-card">
+              <div class="delete-card-icon">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg>
+              </div>
+              <div class="delete-card-body">
+                <strong class="delete-card-title">Shared Data Intact</strong>
+                <p class="delete-card-text" id="delete-shared-text">Your mods, resource packs, and shader packs are shared across all versions and won't be affected.</p>
+                <div class="delete-shared-list" id="delete-shared-list"></div>
+              </div>
+            </div>
+
+            <!-- What will be deleted -->
+            <div class="delete-card delete-card-delete">
+              <div class="delete-card-icon">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+              </div>
+              <div class="delete-card-body">
+                <strong class="delete-card-title">Will Be Deleted</strong>
+                <p class="delete-card-text">The version folder <code id="delete-folder-path"></code> containing the version JSON, JAR, and any extracted natives.</p>
+              </div>
+            </div>
+
+            <div class="delete-confirm-area">
+              <p class="delete-confirm-hint">Type <strong id="delete-confirm-target"></strong> to confirm</p>
+              <input type="text" id="delete-confirm-input" class="setting-input delete-confirm-input" placeholder="Type version name..." spellcheck="false" autocomplete="off">
+              <div class="delete-actions">
+                <button class="btn-secondary" id="delete-cancel">Cancel</button>
+                <button class="btn-danger delete-btn" id="delete-confirm-btn" disabled>
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/></svg>
+                  Delete Version
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Step 3: Deleting -->
+          <div class="delete-step hidden" id="delete-step-progress">
+            <div class="delete-loading">
+              <div class="spinner"></div>
+              <span id="delete-progress-text">Deleting version...</span>
+            </div>
+          </div>
+
+          <!-- Step 4: Done -->
+          <div class="delete-step hidden" id="delete-step-done">
+            <div class="delete-done">
+              <div class="delete-done-icon">
+                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="20 6 9 17 4 12"/></svg>
+              </div>
+              <strong class="delete-done-title">Version Deleted</strong>
+              <p class="delete-done-text" id="delete-done-text"></p>
+              <button class="btn-primary" id="delete-done-close">Done</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <div class="setup-overlay hidden" id="setup-overlay">
       <div class="setup-card">
         <img src="logo.svg" alt="Croopor" width="64" height="64" class="onboarding-logo">

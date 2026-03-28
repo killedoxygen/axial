@@ -48,6 +48,12 @@ func (d *Downloader) InstallVersion(versionID, manifestURL string) {
 		return
 	}
 
+	// Mark installation as in-progress. Removed on successful completion.
+	// If the app crashes mid-install, the marker persists and the scanner
+	// will flag this version as incomplete on next startup.
+	markerPath := filepath.Join(versionDir, ".incomplete")
+	os.WriteFile(markerPath, []byte("installing"), 0644)
+
 	jsonPath := filepath.Join(versionDir, versionID+".json")
 
 	// Phase 1: Get version JSON (download or use existing)
@@ -150,6 +156,9 @@ func (d *Downloader) InstallVersion(versionID, manifestURL string) {
 
 	// Ensure launcher_profiles.json exists for mod loader compatibility
 	EnsureLauncherProfiles(d.MCDir, versionID)
+
+	// Installation succeeded — remove the incomplete marker
+	os.Remove(filepath.Join(versionDir, ".incomplete"))
 
 	d.send(DownloadProgress{Phase: "done", Current: 1, Total: 1, Done: true})
 }

@@ -83,7 +83,14 @@ func ScanVersions(mcDir string) ([]VersionEntry, error) {
 		detail := ""
 		needsInstall := ""
 
-		if stub.InheritsFrom == "" {
+		// Check for incomplete install marker (written at install start,
+		// removed on success). Persists across crashes.
+		markerPath := filepath.Join(versionsDir, id, ".incomplete")
+		if _, err := os.Stat(markerPath); err == nil {
+			ready = false
+			detail = "Installation incomplete — reinstall required"
+			needsInstall = id
+		} else if stub.InheritsFrom == "" {
 			// Vanilla version: needs its own client JAR
 			if _, err := os.Stat(jarPath); os.IsNotExist(err) {
 				ready = false

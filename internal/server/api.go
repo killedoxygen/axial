@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -200,6 +201,16 @@ func (s *Server) handleLaunch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Pre-launch integrity check: verify all critical files exist
+	integrity := minecraft.VerifyIntegrity(mcDir, req.VersionID)
+	if !integrity.OK {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error":  integrity.FormatIssues(),
+			"issues": integrity.Issues,
+		})
+		return
+	}
+
 	result, err := launcher.BuildAndLaunch(launcher.LaunchOptions{
 		VersionID:   req.VersionID,
 		Username:    username,
@@ -327,6 +338,222 @@ func (s *Server) handleInstallEvents(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+}
+
+// handleVersionInfo returns metadata about a version for the delete wizard.
+func (s *Server) handleVersionInfo(w http.ResponseWriter, r *http.Request) {
+	mcDir := s.requireMCDir(w)
+	if mcDir == "" {
+		return
+	}
+	versionID := r.PathValue("id")
+	if versionID == "" {
+		writeError(w, http.StatusBadRequest, "version id is required")
+		return
+	}
+
+	versionDir := filepath.Join(minecraft.VersionsDir(mcDir), versionID)
+	if _, err := os.Stat(versionDir); os.IsNotExist(err) {
+		writeError(w, http.StatusNotFound, "version not found")
+		return
+	}
+
+	// Calculate folder size
+	var folderSize int64
+	filepath.Walk(versionDir, func(_ string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() {
+			folderSize += info.Size()
+		}
+		return nil
+	})
+
+	// Find dependent modded versions (inheritsFrom == versionID)
+	allVersions, _ := minecraft.ScanVersions(mcDir)
+	var dependents []string
+	for _, v := range allVersions {
+		if v.InheritsFrom == versionID {
+			dependents = append(dependents, v.ID)
+		}
+	}
+
+	// Scan worlds in saves/ directory
+	type worldInfo struct {
+		Name       string `json:"name"`
+		Size       int64  `json:"size"`
+		LastPlayed string `json:"last_played,omitempty"`
+	}
+	var worlds []worldInfo
+	savesDir := filepath.Join(mcDir, "saves")
+	if entries, err := os.ReadDir(savesDir); err == nil {
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			worldDir := filepath.Join(savesDir, e.Name())
+			var worldSize int64
+			filepath.Walk(worldDir, func(_ string, info os.FileInfo, err error) error {
+				if err == nil && !info.IsDir() {
+					worldSize += info.Size()
+				}
+				return nil
+			})
+			info, _ := e.Info()
+			var lastMod string
+			if info != nil {
+				lastMod = info.ModTime().UTC().Format(time.RFC3339)
+			}
+			worlds = append(worlds, worldInfo{
+				Name:       e.Name(),
+				Size:       worldSize,
+				LastPlayed: lastMod,
+			})
+		}
+	}
+
+	// Count shared data directories
+	type sharedDataInfo struct {
+		Name  string `json:"name"`
+		Count int    `json:"count"`
+		Size  int64  `json:"size"`
+	}
+	var sharedData []sharedDataInfo
+	sharedDirs := []string{"mods", "resourcepacks", "shaderpacks"}
+	for _, dir := range sharedDirs {
+		dirPath := filepath.Join(mcDir, dir)
+		entries, err := os.ReadDir(dirPath)
+		if err != nil || len(entries) == 0 {
+			continue
+		}
+		var totalSize int64
+		count := 0
+		for _, e := range entries {
+			if e.Name() == "." || e.Name() == ".." {
+				continue
+			}
+			count++
+			if info, err := e.Info(); err == nil {
+				totalSize += info.Size()
+			}
+		}
+		if count > 0 {
+			sharedData = append(sharedData, sharedDataInfo{Name: dir, Count: count, Size: totalSize})
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id":          versionID,
+		"folder_size": folderSize,
+		"dependents":  dependents,
+		"worlds":      worlds,
+		"shared_data": sharedData,
+	})
+}
+
+// handleDeleteVersion removes a version directory and optionally its dependents.
+func (s *Server) handleDeleteVersion(w http.ResponseWriter, r *http.Request) {
+	mcDir := s.requireMCDir(w)
+	if mcDir == "" {
+		return
+	}
+	versionID := r.PathValue("id")
+	if versionID == "" {
+		writeError(w, http.StatusBadRequest, "version id is required")
+		return
+	}
+
+	// Block deletion if the version is currently running
+	s.sessions.mu.RLock()
+	for _, sess := range s.sessions.sessions {
+		if sess.VersionID == versionID && sess.Process.GetState() == launcher.StateRunning {
+			s.sessions.mu.RUnlock()
+			writeError(w, http.StatusConflict, "cannot delete a running version — stop the game first")
+			return
+		}
+	}
+	s.sessions.mu.RUnlock()
+
+	var req struct {
+		CascadeDependents bool `json:"cascade_dependents"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+
+	versionDir := filepath.Join(minecraft.VersionsDir(mcDir), versionID)
+	if _, err := os.Stat(versionDir); os.IsNotExist(err) {
+		writeError(w, http.StatusNotFound, "version not found")
+		return
+	}
+
+	deleted := []string{}
+
+	// If cascade, delete dependents first
+	if req.CascadeDependents {
+		allVersions, _ := minecraft.ScanVersions(mcDir)
+		for _, v := range allVersions {
+			if v.InheritsFrom == versionID {
+				depDir := filepath.Join(minecraft.VersionsDir(mcDir), v.ID)
+				if err := os.RemoveAll(depDir); err == nil {
+					deleted = append(deleted, v.ID)
+					log.Printf("Deleted dependent version: %s", v.ID)
+				}
+			}
+		}
+	}
+
+	// Delete the version itself
+	if err := os.RemoveAll(versionDir); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to delete version: "+err.Error())
+		return
+	}
+	deleted = append(deleted, versionID)
+
+	// Clean up last_launched reference
+	if s.config.LastLaunched != nil {
+		for _, id := range deleted {
+			delete(s.config.LastLaunched, id)
+		}
+	}
+	if s.config.LastVersionID == versionID {
+		s.config.LastVersionID = ""
+	}
+	config.Save(s.config)
+
+	log.Printf("Deleted version(s): %v", deleted)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":  "ok",
+		"deleted": deleted,
+	})
+}
+
+// handleOpenVersionFolder opens the version folder in the system file manager.
+func (s *Server) handleOpenVersionFolder(w http.ResponseWriter, r *http.Request) {
+	mcDir := s.requireMCDir(w)
+	if mcDir == "" {
+		return
+	}
+	versionID := r.PathValue("id")
+	if versionID == "" {
+		writeError(w, http.StatusBadRequest, "version id is required")
+		return
+	}
+
+	versionDir := filepath.Join(minecraft.VersionsDir(mcDir), versionID)
+	if _, err := os.Stat(versionDir); os.IsNotExist(err) {
+		writeError(w, http.StatusNotFound, "version not found")
+		return
+	}
+
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		cmd = exec.Command("explorer", versionDir)
+	case "darwin":
+		cmd = exec.Command("open", versionDir)
+	default:
+		cmd = exec.Command("xdg-open", versionDir)
+	}
+	cmd.Start()
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 func (s *Server) handleJava(w http.ResponseWriter, r *http.Request) {

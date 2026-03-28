@@ -30,6 +30,7 @@ type LaunchResult struct {
 	Process     *GameProcess
 	SessionID   string
 	NativesDir  string
+	VersionID   string
 }
 
 // BuildAndLaunch constructs the launch command and starts the game.
@@ -158,6 +159,7 @@ func BuildAndLaunch(opts LaunchOptions) (*LaunchResult, error) {
 		JavaPath:   javaResult.Path,
 		SessionID:  sessionID,
 		NativesDir: nativesDir,
+		VersionID:  opts.VersionID,
 	}
 
 	// Step 13: Create and start game process

@@ -615,8 +615,12 @@ function prop(label, value, accent) {
 }
 
 function hideAllActions() {
-  [dom.launchArea, dom.installArea, dom.launchingArea, dom.runningArea, dom.notLaunchable].forEach(el => { if (el) el.classList.add('action-hidden'); });
-  resetInstallUI();
+  [dom.launchArea, dom.launchingArea, dom.runningArea, dom.notLaunchable].forEach(el => { if (el) el.classList.add('action-hidden'); });
+  // Only reset install UI if no install is actively running
+  if (!state.installing) {
+    dom.installArea?.classList.add('action-hidden');
+    resetInstallUI();
+  }
 }
 
 function show(el) { if (el) el.classList.remove('action-hidden'); }
@@ -640,6 +644,12 @@ function refreshSelectedVersionActionState() {
   if (state.gameRunning) {
     if (state.runningVersionId === version.id) show(dom.runningArea);
     else showNotLaunchable(`${state.runningVersionId} is already running.`);
+    return;
+  }
+
+  // Active install: keep showing install area with progress
+  if (state.installing) {
+    show(dom.installArea);
     return;
   }
 
@@ -757,8 +767,19 @@ function renderVersionList() {
       setPage('launcher');
       renderSelectedVersion();
     });
-    el.addEventListener('click', () => {
+    el.addEventListener('click', (e) => {
+      if (e.button !== 0) return; // ignore right/middle clicks
       if (v) selectVersion(v);
+    });
+    el.addEventListener('contextmenu', (e) => {
+      if (v) {
+        e.preventDefault();
+        e.stopPropagation(); // prevent document-level handler from immediately hiding the menu
+        state.selectedVersion = v;
+        setPage('launcher');
+        renderSelectedVersion();
+        showContextMenu(e, v);
+      }
     });
   });
 
@@ -996,6 +1017,7 @@ function clearLaunchVisualState() {
 
 async function launchGame() {
   if (!state.selectedVersion || state.gameRunning || state.launching) return;
+  if (!state.selectedVersion.launchable) return;
   Sound.init();
 
   const versionId = state.selectedVersion.id;
@@ -1018,6 +1040,13 @@ async function launchGame() {
       clearLaunchVisualState();
       state.launching = false;
       state.runningVersionId = null;
+      // Integrity failure — mark version as not launchable so install UI shows
+      if (res.issues && state.selectedVersion) {
+        state.selectedVersion.launchable = false;
+        state.selectedVersion.status = 'incomplete';
+        state.selectedVersion.status_detail = res.error;
+        state.selectedVersion.needs_install = state.selectedVersion.needs_install || state.selectedVersion.id;
+      }
       refreshSelectedVersionActionState();
       renderVersionList();
       return;
@@ -1403,7 +1432,9 @@ function inferButtonSound(btn) {
   if (btn.id === 'launch-btn') return 'launchPress';
   if (btn.id === 'add-version-btn' || btn.id === 'empty-add-btn') return 'bright';
   if (btn.id === 'settings-save' || btn.id === 'install-btn' || btn.classList.contains('catalog-install-btn') || btn.id === 'onboarding-finish') return 'affirm';
-  if (btn.id === 'settings-cancel' || btn.id === 'catalog-close' || btn.id === 'kill-btn') return 'soft';
+  if (btn.id === 'settings-cancel' || btn.id === 'catalog-close' || btn.id === 'kill-btn' || btn.id === 'delete-cancel' || btn.id === 'delete-close') return 'soft';
+  if (btn.id === 'delete-done-close') return 'affirm';
+  if (btn.classList.contains('ctx-item')) return null; // handled by ctx menu
   return 'click';
 }
 
@@ -1424,6 +1455,307 @@ function playSliderSound(value, family) {
   if (family === 'memory') lastMemorySoundAt = now;
   else lastHueSoundAt = now;
   Sound.ui(family === 'memory' ? 'memory' : 'slider', Math.max(0, Math.min(1, value)));
+}
+
+// ══════════════════════════════════════════
+// CONTEXT MENU
+// ══════════════════════════════════════════
+
+let ctxMenuVersion = null;
+
+function showContextMenu(e, version) {
+  e.preventDefault();
+  ctxMenuVersion = version;
+  const menu = document.getElementById('ctx-menu');
+  if (!menu) return;
+  menu.classList.remove('hidden');
+
+  // Position: appear at cursor, but clamp to viewport
+  const mw = menu.offsetWidth || 180;
+  const mh = menu.offsetHeight || 120;
+  let x = e.clientX;
+  let y = e.clientY;
+  if (x + mw > window.innerWidth - 8) x = window.innerWidth - mw - 8;
+  if (y + mh > window.innerHeight - 8) y = window.innerHeight - mh - 8;
+  if (x < 4) x = 4;
+  if (y < 4) y = 4;
+  menu.style.left = x + 'px';
+  menu.style.top = y + 'px';
+
+  Sound.ui('soft');
+}
+
+function hideContextMenu() {
+  const menu = document.getElementById('ctx-menu');
+  if (menu) menu.classList.add('hidden');
+  ctxMenuVersion = null;
+}
+
+function bindContextMenu() {
+  document.addEventListener('click', (e) => {
+    const menu = document.getElementById('ctx-menu');
+    if (menu && !menu.contains(e.target)) hideContextMenu();
+  });
+  document.addEventListener('contextmenu', (e) => {
+    const menu = document.getElementById('ctx-menu');
+    if (menu && !menu.classList.contains('hidden') && !menu.contains(e.target)) hideContextMenu();
+  });
+
+  document.getElementById('ctx-open-folder')?.addEventListener('click', () => {
+    if (!ctxMenuVersion) return;
+    // Copy path to clipboard as fallback, since we can't open explorer from browser
+    const id = ctxMenuVersion.id;
+    navigator.clipboard?.writeText(id).catch(() => {});
+    // Try the system open path via API
+    api('POST', `/versions/${encodeURIComponent(id)}/open-folder`).catch(() => {});
+    hideContextMenu();
+    Sound.ui('click');
+  });
+
+  document.getElementById('ctx-copy-id')?.addEventListener('click', () => {
+    if (!ctxMenuVersion) return;
+    navigator.clipboard?.writeText(ctxMenuVersion.id).then(() => {
+      Sound.ui('affirm');
+    }).catch(() => {});
+    hideContextMenu();
+  });
+
+  document.getElementById('ctx-delete')?.addEventListener('click', () => {
+    if (!ctxMenuVersion) return;
+    const version = ctxMenuVersion;
+    hideContextMenu();
+    openDeleteWizard(version);
+  });
+}
+
+// ══════════════════════════════════════════
+// DELETE VERSION WIZARD
+// ══════════════════════════════════════════
+
+let deleteTarget = null;
+let deleteInfo = null;
+
+function openDeleteWizard(version) {
+  // Prevent deleting a running version
+  if (state.gameRunning && state.runningVersionId === version.id) {
+    showError(`Cannot delete ${version.id} while it's running. Stop the game first.`);
+    return;
+  }
+
+  deleteTarget = version;
+  deleteInfo = null;
+  const modal = document.getElementById('delete-modal');
+  if (!modal) return;
+
+  // Reset all steps
+  document.getElementById('delete-step-analyze')?.classList.remove('hidden');
+  document.getElementById('delete-step-summary')?.classList.add('hidden');
+  document.getElementById('delete-step-progress')?.classList.add('hidden');
+  document.getElementById('delete-step-done')?.classList.add('hidden');
+
+  const titleEl = document.getElementById('delete-modal-title');
+  if (titleEl) titleEl.textContent = `Delete ${version.id}`;
+
+  modal.classList.remove('hidden');
+  Sound.ui('click');
+
+  // Fetch version info
+  fetchDeleteInfo(version.id);
+}
+
+function closeDeleteWizard() {
+  const modal = document.getElementById('delete-modal');
+  if (modal) modal.classList.add('hidden');
+  deleteTarget = null;
+  deleteInfo = null;
+  const input = document.getElementById('delete-confirm-input');
+  if (input) input.value = '';
+}
+
+async function fetchDeleteInfo(versionId) {
+  try {
+    const info = await api('GET', `/versions/${encodeURIComponent(versionId)}/info`);
+    if (info.error) {
+      closeDeleteWizard();
+      showError(info.error);
+      return;
+    }
+    deleteInfo = info;
+    renderDeleteSummary();
+  } catch (err) {
+    closeDeleteWizard();
+    showError('Failed to analyze version: ' + err.message);
+  }
+}
+
+function formatBytes(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+  return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+}
+
+function renderDeleteSummary() {
+  if (!deleteInfo || !deleteTarget) return;
+
+  document.getElementById('delete-step-analyze')?.classList.add('hidden');
+  document.getElementById('delete-step-summary')?.classList.remove('hidden');
+
+  const nameEl = document.getElementById('delete-version-name');
+  if (nameEl) nameEl.textContent = deleteTarget.id;
+
+  const sizeEl = document.getElementById('delete-version-size');
+  if (sizeEl) sizeEl.textContent = formatBytes(deleteInfo.folder_size);
+
+  // Dependents
+  const deps = deleteInfo.dependents || [];
+  const depCard = document.getElementById('delete-dependents-card');
+  if (depCard) {
+    depCard.classList.toggle('hidden', deps.length === 0);
+    const depParent = document.getElementById('delete-dep-parent');
+    if (depParent) depParent.textContent = deleteTarget.id;
+    const depList = document.getElementById('delete-dep-list');
+    if (depList) {
+      depList.innerHTML = deps.map(d => `<span class="delete-dep-tag">${esc(d)}</span>`).join('');
+    }
+  }
+  // Reset cascade checkbox
+  const cascadeCheck = document.getElementById('delete-cascade-check');
+  if (cascadeCheck) cascadeCheck.checked = false;
+
+  // Worlds
+  const worlds = deleteInfo.worlds || [];
+  const worldCard = document.getElementById('delete-worlds-card');
+  if (worldCard) {
+    worldCard.classList.toggle('hidden', worlds.length === 0);
+    const countEl = document.getElementById('delete-world-count');
+    if (countEl) countEl.textContent = worlds.length;
+    const worldList = document.getElementById('delete-world-list');
+    if (worldList) {
+      worldList.innerHTML = worlds.slice(0, 12).map(w =>
+        `<span class="delete-world-tag">${esc(w.name)} <span class="delete-world-tag-size">${formatBytes(w.size)}</span></span>`
+      ).join('') + (worlds.length > 12 ? `<span class="delete-world-tag">+${worlds.length - 12} more</span>` : '');
+    }
+  }
+
+  // Shared data
+  const shared = deleteInfo.shared_data || [];
+  const sharedCard = document.getElementById('delete-shared-card');
+  if (sharedCard) {
+    sharedCard.classList.toggle('hidden', shared.length === 0);
+    const sharedList = document.getElementById('delete-shared-list');
+    if (sharedList) {
+      sharedList.innerHTML = shared.map(s =>
+        `<span class="delete-shared-tag">${esc(s.name)} <span class="delete-shared-tag-count">${s.count} items</span></span>`
+      ).join('');
+    }
+  }
+
+  // Folder path
+  const folderEl = document.getElementById('delete-folder-path');
+  if (folderEl) folderEl.textContent = `versions/${deleteTarget.id}/`;
+
+  // Confirm target
+  const confirmTarget = document.getElementById('delete-confirm-target');
+  if (confirmTarget) confirmTarget.textContent = deleteTarget.id;
+
+  // Reset confirm input and button
+  const input = document.getElementById('delete-confirm-input');
+  if (input) { input.value = ''; input.focus(); }
+  const btn = document.getElementById('delete-confirm-btn');
+  if (btn) btn.disabled = true;
+
+  Sound.ui('bright');
+}
+
+function bindDeleteWizard() {
+  // Confirm input validation
+  document.getElementById('delete-confirm-input')?.addEventListener('input', (e) => {
+    const btn = document.getElementById('delete-confirm-btn');
+    if (!btn || !deleteTarget) return;
+    btn.disabled = e.target.value !== deleteTarget.id;
+  });
+
+  // Enter key in confirm input
+  document.getElementById('delete-confirm-input')?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      const btn = document.getElementById('delete-confirm-btn');
+      if (btn && !btn.disabled) executeDelete();
+    }
+  });
+
+  // Delete button
+  document.getElementById('delete-confirm-btn')?.addEventListener('click', executeDelete);
+
+  // Cancel
+  document.getElementById('delete-cancel')?.addEventListener('click', closeDeleteWizard);
+  document.getElementById('delete-close')?.addEventListener('click', closeDeleteWizard);
+  document.getElementById('delete-done-close')?.addEventListener('click', closeDeleteWizard);
+
+  // Overlay click to close
+  document.getElementById('delete-modal')?.addEventListener('click', (e) => {
+    if (e.target.id === 'delete-modal') closeDeleteWizard();
+  });
+}
+
+async function executeDelete() {
+  if (!deleteTarget) return;
+
+  const cascade = document.getElementById('delete-cascade-check')?.checked || false;
+  const versionId = deleteTarget.id;
+
+  // Show progress
+  document.getElementById('delete-step-summary')?.classList.add('hidden');
+  document.getElementById('delete-step-progress')?.classList.remove('hidden');
+
+  const progressText = document.getElementById('delete-progress-text');
+  if (progressText) progressText.textContent = cascade ? 'Deleting version and dependents...' : 'Deleting version...';
+
+  Sound.ui('click');
+
+  try {
+    const res = await api('DELETE', `/versions/${encodeURIComponent(versionId)}`, { cascade_dependents: cascade });
+    if (res.error) {
+      closeDeleteWizard();
+      showError(res.error);
+      return;
+    }
+
+    // Show done
+    document.getElementById('delete-step-progress')?.classList.add('hidden');
+    document.getElementById('delete-step-done')?.classList.remove('hidden');
+
+    const deleted = res.deleted || [versionId];
+    const doneText = document.getElementById('delete-done-text');
+    if (doneText) {
+      if (deleted.length === 1) {
+        doneText.textContent = `${deleted[0]} has been removed.`;
+      } else {
+        doneText.textContent = `Removed ${deleted.length} versions: ${deleted.join(', ')}`;
+      }
+    }
+
+    Sound.ui('affirm');
+
+    // Refresh version list
+    try {
+      const versionsRes = await api('GET', '/versions');
+      state.versions = versionsRes.versions || [];
+      // If the deleted version was selected, deselect
+      if (state.selectedVersion && deleted.includes(state.selectedVersion.id)) {
+        state.selectedVersion = null;
+        dom.versionDetail?.classList.add('hidden');
+        dom.emptyState?.classList.remove('hidden');
+        if (dom.emptyTitle) dom.emptyTitle.textContent = 'Select a version';
+        if (dom.emptySub) dom.emptySub.textContent = 'Choose a Minecraft version from the sidebar to launch';
+      }
+      renderVersionList();
+    } catch {}
+  } catch (err) {
+    closeDeleteWizard();
+    showError('Delete failed: ' + err.message);
+  }
 }
 
 // ══════════════════════════════════════════
@@ -1507,6 +1839,8 @@ function applySystemInfo(info) {
 
 function bindEvents() {
   bindButtonSounds();
+  bindContextMenu();
+  bindDeleteWizard();
   const activateSound = () => Sound.activate();
   window.addEventListener('pointerdown', activateSound, { once: true, capture: true });
   window.addEventListener('touchstart', activateSound, { once: true, capture: true });
@@ -1728,7 +2062,12 @@ function bindEvents() {
       return;
     }
     if (Shortcuts.matches(e, 'close')) {
-      if (!dom.catalogModal?.classList.contains('hidden')) closeCatalog();
+      // Close in priority order: context menu > delete wizard > catalog > settings
+      const ctxMenu = document.getElementById('ctx-menu');
+      const deleteModal = document.getElementById('delete-modal');
+      if (ctxMenu && !ctxMenu.classList.contains('hidden')) hideContextMenu();
+      else if (deleteModal && !deleteModal.classList.contains('hidden')) closeDeleteWizard();
+      else if (!dom.catalogModal?.classList.contains('hidden')) closeCatalog();
       else if (state.currentPage === 'settings') closeSettings();
     }
     if (e.key === 'Enter' && dom.onboarding && !dom.onboarding.classList.contains('hidden')) {
