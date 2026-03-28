@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	webview2 "github.com/jchv/go-webview2"
@@ -17,6 +18,7 @@ func runApp(appURL string) {
 	w := webview2.NewWithOptions(webview2.WebViewOptions{
 		Debug:     false,
 		AutoFocus: true,
+		DataPath:  filepath.Join(os.Getenv("APPDATA"), "croopor", "webview2"),
 		WindowOptions: webview2.WindowOptions{
 			Title:  "Croopor",
 			Width:  1100,
