@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ParaLauncher</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <!-- Top Bar -->
+    <header class="topbar">
+      <div class="topbar-left">
+        <div class="logo">
+          <div class="logo-glyph">
+            <svg width="22" height="22" viewBox="0 0 22 22" fill="none">
+              <rect x="1" y="1" width="8" height="8" rx="1" fill="var(--accent)" opacity="0.9"/>
+              <rect x="13" y="1" width="8" height="8" rx="1" fill="var(--accent)" opacity="0.5"/>
+              <rect x="1" y="13" width="8" height="8" rx="1" fill="var(--accent)" opacity="0.5"/>
+              <rect x="13" y="13" width="8" height="8" rx="1" fill="var(--accent)" opacity="0.3"/>
+            </svg>
+          </div>
+          <span class="logo-text">ParaLauncher</span>
+          <span class="logo-version">v1.0</span>
+        </div>
+      </div>
+      <div class="topbar-center">
+        <div class="topbar-field">
+          <label class="field-label">Player</label>
+          <input type="text" id="username-input" class="field-input" value="Player" spellcheck="false" autocomplete="off">
+        </div>
+        <div class="topbar-field">
+          <label class="field-label">Memory</label>
+          <div class="memory-control">
+            <input type="range" id="memory-slider" min="1" max="16" step="0.5" value="4">
+            <span id="memory-value" class="memory-value">4 GB</span>
+          </div>
+        </div>
+      </div>
+      <div class="topbar-right">
+        <button class="icon-btn" id="settings-btn" title="Settings">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- Main Content -->
+    <div class="main">
+      <!-- Sidebar: Version List -->
+      <aside class="sidebar">
+        <div class="sidebar-header">
+          <div class="search-box">
+            <svg class="search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+            <input type="text" id="version-search" class="search-input" placeholder="Search versions..." spellcheck="false">
+          </div>
+          <div class="filter-chips">
+            <button class="chip active" data-filter="all">All</button>
+            <button class="chip" data-filter="release">Release</button>
+            <button class="chip" data-filter="snapshot">Snapshot</button>
+            <button class="chip" data-filter="modded">Modded</button>
+          </div>
+        </div>
+        <div class="version-list" id="version-list">
+          <div class="loading-placeholder">
+            <div class="spinner"></div>
+            <span>Scanning versions...</span>
+          </div>
+        </div>
+      </aside>
+
+      <!-- Center: Launch Panel -->
+      <main class="launch-panel" id="launch-panel">
+        <div class="empty-state" id="empty-state">
+          <div class="empty-icon">
+            <svg width="48" height="48" viewBox="0 0 48 48" fill="none">
+              <rect x="4" y="4" width="16" height="16" rx="2" fill="var(--surface-2)" stroke="var(--border)" stroke-width="1.5"/>
+              <rect x="28" y="4" width="16" height="16" rx="2" fill="var(--surface-2)" stroke="var(--border)" stroke-width="1.5"/>
+              <rect x="4" y="28" width="16" height="16" rx="2" fill="var(--surface-2)" stroke="var(--border)" stroke-width="1.5"/>
+              <rect x="28" y="28" width="16" height="16" rx="2" fill="var(--accent)" opacity="0.2" stroke="var(--accent)" stroke-width="1.5" stroke-opacity="0.4"/>
+            </svg>
+          </div>
+          <p class="empty-title">Select a version</p>
+          <p class="empty-sub">Choose a Minecraft version from the sidebar to launch</p>
+        </div>
+
+        <div class="version-detail hidden" id="version-detail">
+          <div class="detail-header">
+            <div class="detail-id" id="detail-id"></div>
+            <span class="detail-badge" id="detail-badge"></span>
+          </div>
+          <div class="detail-meta" id="detail-meta"></div>
+
+          <div class="launch-area" id="launch-area">
+            <button class="launch-btn" id="launch-btn">
+              <span class="launch-btn-text">LAUNCH</span>
+              <span class="launch-btn-glow"></span>
+            </button>
+          </div>
+
+          <div class="running-area hidden" id="running-area">
+            <div class="running-indicator">
+              <div class="pulse-ring"></div>
+              <div class="pulse-dot"></div>
+            </div>
+            <div class="running-info">
+              <span class="running-label">Game Running</span>
+              <span class="running-pid" id="running-pid"></span>
+            </div>
+            <button class="kill-btn" id="kill-btn">STOP</button>
+          </div>
+
+          <div class="not-launchable hidden" id="not-launchable">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--amber)" stroke-width="2" stroke-linecap="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+            <span id="not-launchable-text">Cannot launch — missing files</span>
+          </div>
+        </div>
+      </main>
+    </div>
+
+    <!-- Bottom Log Panel -->
+    <div class="log-panel" id="log-panel">
+      <button class="log-toggle" id="log-toggle">
+        <svg class="log-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="18 15 12 9 6 15"/></svg>
+        <span>Game Output</span>
+        <span class="log-count" id="log-count">0 lines</span>
+      </button>
+      <div class="log-content" id="log-content">
+        <div class="log-lines" id="log-lines"></div>
+      </div>
+    </div>
+
+    <!-- Settings Modal -->
+    <div class="modal-overlay hidden" id="settings-modal">
+      <div class="modal">
+        <div class="modal-header">
+          <span class="modal-title">Settings</span>
+          <button class="icon-btn modal-close" id="settings-close">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+        <div class="modal-body">
+          <div class="setting-group">
+            <label class="setting-label">Java Path Override</label>
+            <input type="text" id="setting-java-path" class="setting-input" placeholder="Leave empty for auto-detect">
+            <p class="setting-hint">Full path to javaw.exe or java binary</p>
+          </div>
+          <div class="setting-row">
+            <div class="setting-group">
+              <label class="setting-label">Window Width</label>
+              <input type="number" id="setting-width" class="setting-input" placeholder="Default">
+            </div>
+            <div class="setting-group">
+              <label class="setting-label">Window Height</label>
+              <input type="number" id="setting-height" class="setting-input" placeholder="Default">
+            </div>
+          </div>
+          <div class="setting-group">
+            <label class="setting-label">Detected Java Runtimes</label>
+            <div class="java-runtimes" id="java-runtimes">
+              <span class="setting-hint">Loading...</span>
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn-secondary" id="settings-cancel">Cancel</button>
+          <button class="btn-primary" id="settings-save">Save</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
