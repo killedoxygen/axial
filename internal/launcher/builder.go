@@ -8,8 +8,8 @@ import (
 	"os/exec"
 	"path/filepath"
 
-	"github.com/mateoltd/mc-paralauncher/internal/config"
-	"github.com/mateoltd/mc-paralauncher/internal/minecraft"
+	"github.com/mateoltd/croopor/internal/config"
+	"github.com/mateoltd/croopor/internal/minecraft"
 )
 
 // LaunchOptions holds parameters for launching a version.
@@ -98,7 +98,7 @@ func BuildAndLaunch(opts LaunchOptions) (*LaunchResult, error) {
 		AuthXUID:           "",
 		UserType:           "msa",
 		VersionType:        version.Type,
-		LauncherName:       "paralauncher",
+		LauncherName:       "croopor",
 		LauncherVersion:    "1.0.0",
 		NativesDirectory:   nativesDir,
 		Classpath:          classpath,
@@ -141,7 +141,7 @@ func BuildAndLaunch(opts LaunchOptions) (*LaunchResult, error) {
 	cmd := exec.Command(javaResult.Path, cmdArgs...)
 	cmd.Dir = gameDir
 
-	// Set up process attributes for Windows (detach so game survives if paralauncher exits)
+	// Set up process attributes for Windows (detach so game survives if croopor exits)
 	setProcAttr(cmd)
 
 	result := &LaunchResult{

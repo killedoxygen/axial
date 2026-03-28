@@ -1,4 +1,4 @@
-module github.com/mateoltd/mc-paralauncher
+module github.com/mateoltd/croopor
 
 go 1.23.0
 

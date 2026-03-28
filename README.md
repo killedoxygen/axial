@@ -17,6 +17,12 @@ Croopor never modifies existing Minecraft files. It only reads from `.minecraft`
 - Configurable player name, memory allocation, window size
 - First-launch onboarding with system RAM detection
 - Real-time game output log
+- 5 theme presets (Obsidian, Deepslate, Nether, The End, Birch) with live theme picker
+- Per-version running state with LIVE badge and uptime counter
+- ASCII launch animation and running state card
+- Sound system with audio sprites
+- Per-version last-launched timestamp tracking
+- Keyboard shortcuts and accessibility labels
 
 ## Building
 
@@ -25,7 +31,7 @@ Requires Go 1.23 or later.
 Production build (Windows, no console window):
 
 ```
-GOOS=windows GOARCH=amd64 go build -ldflags="-s -w -H windowsgui" -o croopor.exe .
+GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w -H windowsgui" -o croopor.exe .
 ```
 
 Development build (with dev tools for cleanup/flush):
@@ -56,7 +62,7 @@ main.go                          Entry point, flags, server startup
 app_windows.go                   Native WebView2 window (Windows)
 app_other.go                     Browser fallback (Linux/macOS)
 internal/
-  config/config.go               User preferences (stored in %APPDATA%/paralauncher/)
+  config/config.go               User preferences (stored in %APPDATA%/croopor/)
   minecraft/
     paths.go                     .minecraft detection and validation
     version.go                   Version JSON parsing (legacy and modern formats)
@@ -71,7 +77,7 @@ internal/
   launcher/
     builder.go                   Launch command construction
     process.go                   Game process management
-    natives.go                   Temporary natives directory handling
+    natives.go                   Natives directory handling (under %LOCALAPPDATA%/croopor/)
   server/
     server.go                    HTTP server and route registration
     api.go                       REST API handlers
@@ -80,6 +86,7 @@ internal/
     dev_stub.go                  No-op stub for production builds
 frontend/static/
   index.html, style.css, app.js  Embedded web UI
+  sounds/                        Audio sprites for UI sound system
 ```
 
 ## License

@@ -8,10 +8,10 @@ import (
 	"net"
 	"net/http"
 
-	"github.com/mateoltd/mc-paralauncher/frontend"
-	"github.com/mateoltd/mc-paralauncher/internal/config"
-	"github.com/mateoltd/mc-paralauncher/internal/minecraft"
-	"github.com/mateoltd/mc-paralauncher/internal/server"
+	"github.com/mateoltd/croopor/frontend"
+	"github.com/mateoltd/croopor/internal/config"
+	"github.com/mateoltd/croopor/internal/minecraft"
+	"github.com/mateoltd/croopor/internal/server"
 )
 
 var version = "1.0.1"

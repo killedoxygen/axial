@@ -47,7 +47,7 @@ jobs:
         run: |
           VERSION=${GITHUB_REF_NAME#v}
           BINARY="croopor-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}"
-          go build -ldflags='${{ matrix.ldflags }} -X main.version='"${VERSION}" -o "${BINARY}" .
+          go build -trimpath -ldflags='${{ matrix.ldflags }} -X main.version='"${VERSION}" -o "${BINARY}" .
 
       - uses: actions/upload-artifact@v4
         with:

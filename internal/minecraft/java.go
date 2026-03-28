@@ -121,11 +121,11 @@ func runtimeCacheDir() string {
 	if runtime.GOOS == "windows" {
 		appdata := os.Getenv("APPDATA")
 		if appdata != "" {
-			return filepath.Join(appdata, "paralauncher", "runtimes")
+			return filepath.Join(appdata, "croopor", "runtimes")
 		}
 	}
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".paralauncher", "runtimes")
+	return filepath.Join(home, ".croopor", "runtimes")
 }
 
 // downloadRuntime fetches a Java runtime from Mojang's servers.

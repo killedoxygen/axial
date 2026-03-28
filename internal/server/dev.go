@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mateoltd/mc-paralauncher/internal/config"
-	"github.com/mateoltd/mc-paralauncher/internal/minecraft"
+	"github.com/mateoltd/croopor/internal/config"
+	"github.com/mateoltd/croopor/internal/minecraft"
 )
 
 const devMode = true

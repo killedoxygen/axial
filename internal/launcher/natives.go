@@ -8,12 +8,22 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/mateoltd/mc-paralauncher/internal/minecraft"
+	"github.com/mateoltd/croopor/internal/minecraft"
 )
 
-// CreateNativesDir creates a temporary directory for native library extraction.
+// CreateNativesDir creates a directory for native library extraction under the
+// user's local app cache rather than the system temp folder. This avoids
+// heuristic DLL-drop detections that AV engines apply to %TEMP%.
 func CreateNativesDir(sessionID string) (string, error) {
-	dir := filepath.Join(os.TempDir(), "paralauncher-natives-"+sessionID)
+	cacheDir, err := os.UserCacheDir()
+	if err != nil {
+		// Fallback: use LOCALAPPDATA on Windows, home dir elsewhere
+		cacheDir = os.Getenv("LOCALAPPDATA")
+		if cacheDir == "" {
+			cacheDir, _ = os.UserHomeDir()
+		}
+	}
+	dir := filepath.Join(cacheDir, "croopor", "natives", sessionID)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return "", fmt.Errorf("creating natives dir: %w", err)
 	}
@@ -26,8 +36,8 @@ func CleanupNativesDir(dir string) error {
 		return nil
 	}
 	// Safety: only remove dirs we created
-	if !strings.Contains(dir, "paralauncher-natives-") {
-		return fmt.Errorf("refusing to remove non-paralauncher directory: %s", dir)
+	if !strings.Contains(dir, filepath.Join("croopor", "natives")) {
+		return fmt.Errorf("refusing to remove non-croopor directory: %s", dir)
 	}
 	return os.RemoveAll(dir)
 }

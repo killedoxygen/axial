@@ -39,12 +39,12 @@ func ConfigDir() string {
 		if runtime.GOOS == "windows" {
 			appdata := os.Getenv("APPDATA")
 			if appdata != "" {
-				configDir = filepath.Join(appdata, "paralauncher")
+				configDir = filepath.Join(appdata, "croopor")
 			}
 		}
 		if configDir == "" {
 			home, _ := os.UserHomeDir()
-			configDir = filepath.Join(home, ".paralauncher")
+			configDir = filepath.Join(home, ".croopor")
 		}
 	})
 	return configDir

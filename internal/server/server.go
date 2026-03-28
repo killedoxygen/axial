@@ -6,9 +6,9 @@ import (
 	"net/http"
 	"sync"
 
-	"github.com/mateoltd/mc-paralauncher/internal/config"
-	"github.com/mateoltd/mc-paralauncher/internal/launcher"
-	"github.com/mateoltd/mc-paralauncher/internal/minecraft"
+	"github.com/mateoltd/croopor/internal/config"
+	"github.com/mateoltd/croopor/internal/launcher"
+	"github.com/mateoltd/croopor/internal/minecraft"
 )
 
 type Server struct {

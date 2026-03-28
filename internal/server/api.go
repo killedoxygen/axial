@@ -8,10 +8,10 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/mateoltd/mc-paralauncher/internal/config"
-	"github.com/mateoltd/mc-paralauncher/internal/launcher"
-	"github.com/mateoltd/mc-paralauncher/internal/minecraft"
-	"github.com/mateoltd/mc-paralauncher/internal/system"
+	"github.com/mateoltd/croopor/internal/config"
+	"github.com/mateoltd/croopor/internal/launcher"
+	"github.com/mateoltd/croopor/internal/minecraft"
+	"github.com/mateoltd/croopor/internal/system"
 )
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
