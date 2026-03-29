@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/mateoltd/croopor/internal/config"
+	"github.com/mateoltd/croopor/internal/launcher"
 	"github.com/mateoltd/croopor/internal/minecraft"
 )
 
@@ -19,6 +20,9 @@ const devMode = true
 func registerDevRoutes(s *Server) {
 	s.mux.HandleFunc("POST /api/v1/dev/cleanup-versions", s.handleDevCleanup)
 	s.mux.HandleFunc("POST /api/v1/dev/flush", s.handleDevFlush)
+	s.mux.HandleFunc("GET /api/v1/dev/boot-profiles", s.handleDevListProfiles)
+	s.mux.HandleFunc("GET /api/v1/dev/boot-profiles/{name}", s.handleDevGetProfile)
+	s.mux.HandleFunc("GET /api/v1/dev/boot-profile-live/{id}", s.handleDevLiveProfile)
 }
 
 // handleDevCleanup backs up worlds, resourcepacks, mods, then removes all versions.
@@ -87,6 +91,111 @@ func (s *Server) handleDevFlush(w http.ResponseWriter, r *http.Request) {
 	*s.config = *def
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "flushed"})
+}
+
+// handleDevListProfiles lists all saved boot profile reports.
+func (s *Server) handleDevListProfiles(w http.ResponseWriter, r *http.Request) {
+	dir := filepath.Join(config.ConfigDir(), "boot-profiles")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		writeJSON(w, http.StatusOK, []string{})
+		return
+	}
+
+	profiles := []map[string]string{}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		info, _ := e.Info()
+		profiles = append(profiles, map[string]string{
+			"name": e.Name(),
+			"size": fmt.Sprintf("%d", info.Size()),
+		})
+	}
+	writeJSON(w, http.StatusOK, profiles)
+}
+
+// handleDevGetProfile returns a single boot profile by filename.
+func (s *Server) handleDevGetProfile(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if strings.Contains(name, "..") || strings.Contains(name, "/") || strings.Contains(name, "\\") {
+		writeError(w, http.StatusBadRequest, "invalid name")
+		return
+	}
+
+	path := filepath.Join(config.ConfigDir(), "boot-profiles", name)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "profile not found")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(data)
+}
+
+// handleDevLiveProfile streams real-time profiler samples via SSE for a running session.
+func (s *Server) handleDevLiveProfile(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	result, ok := s.sessions.Get(id)
+	if !ok {
+		writeError(w, http.StatusNotFound, "session not found")
+		return
+	}
+	if result.Process.Profile == nil {
+		writeError(w, http.StatusNotFound, "no profiler attached")
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "streaming not supported")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	ctx := r.Context()
+	lastSent := 0
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			samples := result.Process.Profile.GetSamples()
+			for i := lastSent; i < len(samples); i++ {
+				sendSSE(w, flusher, "sample", samples[i])
+			}
+			lastSent = len(samples)
+
+			// Send boot complete event and stop
+			if result.Process.BootCompleted() {
+				sendSSE(w, flusher, "boot_complete", map[string]any{
+					"duration_ms":  result.Process.BootDuration().Milliseconds(),
+					"peak_threads": result.Process.Profile.PeakThreads,
+					"peak_mem_mb":  result.Process.Profile.PeakMemMB,
+					"peak_cpu_pct": result.Process.Profile.PeakCPUPct,
+					"total_samples": len(samples),
+				})
+				return
+			}
+
+			// Also stop if process exited
+			if result.Process.GetState() == launcher.StateExited || result.Process.GetState() == launcher.StateFailed {
+				sendSSE(w, flusher, "process_exited", map[string]any{
+					"state":     string(result.Process.GetState()),
+					"exit_code": result.Process.ExitCode,
+				})
+				return
+			}
+		}
+	}
 }
 
 func copyPath(src, dst string) error {

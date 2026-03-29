@@ -5,9 +5,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 
 	"github.com/mateoltd/croopor/internal/config"
 	"github.com/mateoltd/croopor/internal/minecraft"
@@ -125,7 +127,23 @@ func BuildAndLaunch(opts LaunchOptions) (*LaunchResult, error) {
 	// Step 9: Resolve JVM and game arguments
 	jvmArgs, gameArgs := minecraft.ResolveArguments(version, env, vars)
 
-	// Step 10: Add memory flags
+	// Step 10: Add boot throttling and GC preset flags
+	javaMajor := version.JavaVersion.MajorVersion
+	bootArgs := bootThrottleArgs(javaMajor)
+	gcArgs := gcPresetArgs(opts.Config.JVMPreset, javaMajor)
+
+	// Step 10b: Add CDS flags if archive exists (vanilla versions only, Java 11+)
+	var cdsArgs []string
+	isModded := isModdedVersion(opts.MCDir, opts.VersionID)
+	configDir := config.ConfigDir()
+	if !isModded && javaMajor >= 11 && CDSArchiveExists(configDir, opts.VersionID) {
+		cdsArgs = []string{
+			"-Xshare:on",
+			"-XX:SharedArchiveFile=" + CDSArchivePath(configDir, opts.VersionID),
+		}
+	}
+
+	// Step 11: Add memory flags
 	maxMem := opts.MaxMemoryMB
 	if maxMem <= 0 {
 		maxMem = 4096
@@ -139,15 +157,22 @@ func BuildAndLaunch(opts LaunchOptions) (*LaunchResult, error) {
 		fmt.Sprintf("-Xms%dM", minMem),
 	}
 
-	// Step 11: Assemble full command
-	// Order: java [jvm_args] [mem_args] <mainClass> [game_args]
+	// Step 12: Assemble full command
+	// Order: java [cds_args] [boot_args] [jvm_args] [gc_args] [mem_args] <mainClass> [game_args]
 	var cmdArgs []string
+	cmdArgs = append(cmdArgs, cdsArgs...)
+	cmdArgs = append(cmdArgs, bootArgs...)
 	cmdArgs = append(cmdArgs, jvmArgs...)
+	cmdArgs = append(cmdArgs, gcArgs...)
 	cmdArgs = append(cmdArgs, memArgs...)
 	cmdArgs = append(cmdArgs, version.MainClass)
 	cmdArgs = append(cmdArgs, gameArgs...)
 
-	// Step 12: Create exec.Cmd
+	// Step 12b: Prefetch key files into OS page cache before JVM starts.
+	// Synchronous — ensures files are in cache before the JVM touches them.
+	prefetchForLaunch(libs, clientJarPath, opts.MCDir, version.AssetIndex.ID)
+
+	// Step 13: Create exec.Cmd
 	cmd := exec.Command(javaResult.Path, cmdArgs...)
 	cmd.Dir = gameDir
 
@@ -162,13 +187,32 @@ func BuildAndLaunch(opts LaunchOptions) (*LaunchResult, error) {
 		VersionID:  opts.VersionID,
 	}
 
-	// Step 13: Create and start game process
+	// Step 14: Create and start game process
 	gp := NewGameProcess(cmd, nativesDir)
 	if err := gp.Start(); err != nil {
 		CleanupNativesDir(nativesDir)
 		return nil, fmt.Errorf("starting game process: %w", err)
 	}
 	result.Process = gp
+
+	// Step 15: Start boot profiler to capture diagnostic data
+	profile := NewBootProfile(
+		sessionID, opts.VersionID, gp.PID(),
+		opts.Config.JVMPreset, opts.MaxMemoryMB,
+		bootCPUCap(), len(cdsArgs) > 0,
+	)
+	profile.Start()
+	gp.Profile = profile
+
+	// Step 16: Schedule CDS archive generation for next launch if not yet cached
+	if !isModded && javaMajor >= 11 && len(cdsArgs) == 0 {
+		go func() {
+			archivePath := CDSArchivePath(configDir, opts.VersionID)
+			if err := GenerateCDSArchive(javaResult.Path, classpath, archivePath); err != nil {
+				log.Printf("CDS archive generation failed for %s: %v", opts.VersionID, err)
+			}
+		}()
+	}
 
 	return result, nil
 }
@@ -213,8 +257,138 @@ func findClientJar(mcDir string, v *minecraft.VersionJSON, originalVersionID str
 	return ""
 }
 
+// prefetchForLaunch reads key files to warm the OS page cache before the JVM needs them.
+// Runs in a goroutine so it overlaps with process startup. The OS caches file contents
+// in memory after a read, so subsequent reads by the JVM hit RAM instead of disk.
+func prefetchForLaunch(libs []minecraft.ResolvedLibrary, clientJar, mcDir, assetIndexID string) {
+	buf := make([]byte, 256*1024) // 256KB read buffer
+
+	touch := func(path string) {
+		f, err := os.Open(path)
+		if err != nil {
+			return
+		}
+		defer f.Close()
+		for {
+			_, err := f.Read(buf)
+			if err != nil {
+				return
+			}
+		}
+	}
+
+	// Prefetch the client JAR (largest single file, ~20-40MB)
+	touch(clientJar)
+
+	// Prefetch library JARs (classpath entries the JVM scans at startup)
+	for _, lib := range libs {
+		if !lib.IsNative {
+			touch(lib.AbsPath)
+		}
+	}
+
+	// Prefetch the asset index (small but read early)
+	if assetIndexID != "" {
+		touch(filepath.Join(minecraft.AssetsDir(mcDir), "indexes", assetIndexID+".json"))
+	}
+}
+
+// isModdedVersion checks the original (unmerged) version JSON to see if it inherits from another version.
+func isModdedVersion(mcDir, versionID string) bool {
+	origJSON := filepath.Join(minecraft.VersionsDir(mcDir), versionID, versionID+".json")
+	data, err := os.ReadFile(origJSON)
+	if err != nil {
+		return false
+	}
+	var stub struct {
+		InheritsFrom string `json:"inheritsFrom"`
+	}
+	if json.Unmarshal(data, &stub) == nil && stub.InheritsFrom != "" {
+		return true
+	}
+	return false
+}
+
 func generateSessionID() string {
 	b := make([]byte, 8)
 	rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// bootThrottleArgs returns JVM flags that limit concurrency during boot to prevent
+// the JVM from overwhelming the system. These are always applied regardless of GC preset.
+func bootThrottleArgs(javaMajor int) []string {
+	// Determine a reasonable thread budget.
+	// Leave at least 2 cores free for the OS and other applications.
+	cpus := runtime.NumCPU()
+	budget := cpus - 2
+	if budget < 2 {
+		budget = 2
+	}
+
+	// CICompilerCount: limits JIT compilation threads. Default is max(2, cores/2)
+	// which causes a huge CPU spike during class loading. Cap it.
+	ciThreads := budget / 2
+	if ciThreads < 2 {
+		ciThreads = 2
+	}
+	if ciThreads > 4 {
+		ciThreads = 4
+	}
+
+	args := []string{
+		fmt.Sprintf("-XX:CICompilerCount=%d", ciThreads),
+	}
+
+	// On Java 9+, limit parallel GC threads so collection doesn't steal all cores.
+	// Only apply if user hasn't selected ZGC (which manages its own threads).
+	if javaMajor >= 9 {
+		gcThreads := budget
+		if gcThreads > 6 {
+			gcThreads = 6
+		}
+		args = append(args,
+			fmt.Sprintf("-XX:ParallelGCThreads=%d", gcThreads),
+			fmt.Sprintf("-XX:ConcGCThreads=%d", ciThreads),
+		)
+	}
+
+	return args
+}
+
+// gcPresetArgs returns JVM garbage collector flags for the given preset.
+func gcPresetArgs(preset string, javaMajor int) []string {
+	switch preset {
+	case "aikar":
+		return []string{
+			"-XX:+UseG1GC",
+			"-XX:+ParallelRefProcEnabled",
+			"-XX:MaxGCPauseMillis=200",
+			"-XX:+UnlockExperimentalVMOptions",
+			"-XX:+DisableExplicitGC",
+			"-XX:G1NewSizePercent=30",
+			"-XX:G1MaxNewSizePercent=40",
+			"-XX:G1HeapRegionSize=8M",
+			"-XX:G1ReservePercent=20",
+			"-XX:G1HeapWastePercent=5",
+			"-XX:G1MixedGCCountTarget=4",
+			"-XX:InitiatingHeapOccupancyPercent=15",
+			"-XX:G1MixedGCLiveThresholdPercent=90",
+			"-XX:G1RSetUpdatingPauseTimePercent=5",
+			"-XX:SurvivorRatio=32",
+			"-XX:+PerfDisableSharedMem",
+			"-XX:MaxTenuringThreshold=1",
+		}
+	case "zgc":
+		if javaMajor < 17 {
+			return nil
+		}
+		args := []string{"-XX:+UseZGC"}
+		if javaMajor >= 21 {
+			args = append(args, "-XX:+ZGenerational")
+		}
+		return args
+	default:
+		return nil
+	}
 }

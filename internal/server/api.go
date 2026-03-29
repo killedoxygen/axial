@@ -299,6 +299,9 @@ func (s *Server) handleInstall(w http.ResponseWriter, r *http.Request) {
 	dl := minecraft.NewDownloader(mcDir)
 	s.installs.Add(installID, dl)
 
+	// Invalidate CDS archive since the version will be reinstalled
+	launcher.InvalidateCDSArchive(config.ConfigDir(), req.VersionID)
+
 	log.Printf("Starting install of %s (manifest_url=%q)", req.VersionID, req.ManifestURL)
 	go dl.InstallVersion(req.VersionID, req.ManifestURL)
 
@@ -505,6 +508,11 @@ func (s *Server) handleDeleteVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	deleted = append(deleted, versionID)
+
+	// Invalidate CDS archives for all deleted versions
+	for _, id := range deleted {
+		launcher.InvalidateCDSArchive(config.ConfigDir(), id)
+	}
 
 	// Clean up last_launched reference
 	if s.config.LastLaunched != nil {

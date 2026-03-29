@@ -17,6 +17,7 @@ type Config struct {
 	JavaPathOverride string            `json:"java_path_override,omitempty"`
 	WindowWidth      int               `json:"window_width,omitempty"`
 	WindowHeight     int               `json:"window_height,omitempty"`
+	JVMPreset        string            `json:"jvm_preset,omitempty"`
 	OnboardingDone   bool              `json:"onboarding_done"`
 	MCDir            string            `json:"mc_dir,omitempty"`
 }

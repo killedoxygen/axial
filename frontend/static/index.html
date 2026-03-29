@@ -278,6 +278,16 @@
                       <span class="setting-hint">Loading...</span>
                     </div>
                   </div>
+
+                  <div class="setting-group">
+                    <label class="setting-label">JVM Performance Preset</label>
+                    <div class="jvm-preset-group" id="jvm-preset-group">
+                      <label class="radio-label"><input type="radio" name="jvm-preset" value="" checked> Default</label>
+                      <label class="radio-label"><input type="radio" name="jvm-preset" value="aikar"> Aikar's Flags <span class="setting-hint-inline">(optimized G1GC)</span></label>
+                      <label class="radio-label"><input type="radio" name="jvm-preset" value="zgc"> ZGC Low-Latency <span class="setting-hint-inline">(Java 17+)</span></label>
+                    </div>
+                    <p class="setting-hint">Aikar's Flags are widely used in the Minecraft community for better GC performance. ZGC eliminates GC pauses but requires Java 17 or newer.</p>
+                  </div>
                 </section>
 
                 <section class="settings-section-card" id="settings-section-shortcuts">

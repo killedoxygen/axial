@@ -495,7 +495,7 @@ function cacheDom() {
     'username-input', 'memory-slider', 'memory-value', 'memory-rec',
     'log-panel', 'log-toggle', 'log-content', 'log-lines', 'log-count',
     'settings-btn', 'settings-cancel', 'settings-save',
-    'setting-java-path', 'setting-width', 'setting-height', 'java-runtimes',
+    'setting-java-path', 'setting-width', 'setting-height', 'java-runtimes', 'jvm-preset-group',
     'theme-picker', 'color-field', 'color-field-marker', 'lightness-slider', 'sounds-toggle', 'shortcut-list',
     'add-version-btn', 'catalog-modal', 'catalog-close', 'catalog-search', 'catalog-list',
     'onboarding', 'onboarding-step-1', 'onboarding-step-2', 'onboarding-step-3', 'onboarding-step-4',
@@ -1163,6 +1163,11 @@ function syncSettingsForm() {
     if (dom.settingJavaPath) dom.settingJavaPath.value = state.config.java_path_override || '';
     if (dom.settingWidth) dom.settingWidth.value = state.config.window_width || '';
     if (dom.settingHeight) dom.settingHeight.value = state.config.window_height || '';
+    if (dom.jvmPresetGroup) {
+      const preset = state.config.jvm_preset || '';
+      const radio = dom.jvmPresetGroup.querySelector(`input[value="${preset}"]`);
+      if (radio) radio.checked = true;
+    }
   }
   dom.themePicker?.querySelectorAll('.theme-swatch').forEach(s => s.classList.toggle('active', s.dataset.theme === local.theme));
   positionFieldMarker(dom.colorField, dom.colorFieldMarker, local.customHue, local.customVibrancy);
@@ -1174,6 +1179,10 @@ async function saveSettings() {
   const updates = {};
   const jp = dom.settingJavaPath?.value.trim() || '';
   if (jp !== (state.config?.java_path_override || '')) updates.java_path_override = jp;
+
+  const presetRadio = dom.jvmPresetGroup?.querySelector('input[name="jvm-preset"]:checked');
+  const preset = presetRadio?.value || '';
+  if (preset !== (state.config?.jvm_preset || '')) updates.jvm_preset = preset;
 
   const widthRaw = dom.settingWidth?.value.trim() || '';
   const heightRaw = dom.settingHeight?.value.trim() || '';
