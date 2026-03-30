@@ -2,6 +2,44 @@ import { PRESET_HUES, LOGO_BASE_HUE, dom, local, state, saveLocalState } from '.
 import { api } from './api.js';
 import { Sound } from './sound.js';
 
+// WCAG 2.1 contrast helpers
+function srgbToLinear(c) {
+  return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+}
+
+function hslToLuminance(h, s, l) {
+  s /= 100; l /= 100;
+  const a = s * Math.min(l, 1 - l);
+  const f = n => { const k = (n + h / 30) % 12; return l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1)); };
+  return 0.2126 * srgbToLinear(f(0)) + 0.7152 * srgbToLinear(f(8)) + 0.0722 * srgbToLinear(f(4));
+}
+
+function contrastRatio(l1, l2) {
+  const [a, b] = l1 > l2 ? [l1, l2] : [l2, l1];
+  return (a + 0.05) / (b + 0.05);
+}
+
+function parseHSL(str) {
+  const m = str.match(/hsl\((\d+),(\d+)%,([.\d]+)%\)/);
+  return m ? [+m[1], +m[2], +m[3]] : null;
+}
+
+function checkContrast(vars) {
+  const text = parseHSL(vars['--text']);
+  const bg = parseHSL(vars['--bg']);
+  if (!text || !bg) return Infinity;
+  return contrastRatio(hslToLuminance(...text), hslToLuminance(...bg));
+}
+
+export function findFixedLightness(hue, vibrancy, currentLt) {
+  const dir = currentLt < 50 ? -1 : 1;
+  for (let lt = currentLt; lt >= 0 && lt <= 100; lt += dir) {
+    const vars = generateThemeFromHue(hue, vibrancy, lt);
+    if (checkContrast(vars) >= 4.5) return lt;
+  }
+  return dir > 0 ? 100 : 0;
+}
+
 // generateThemeFromHue — exact copy from original lines 295-330
 export function generateThemeFromHue(hue, vibrancy, lightness) {
   const v = (vibrancy != null ? vibrancy : 100) / 100;
@@ -48,15 +86,27 @@ export function applyTheme(theme, hue, options = {}) {
   clearVars();
 
   let accentHue = PRESET_HUES[theme] ?? local.customHue;
+  let generatedVars = null;
   if (theme === 'custom' || lt > 0) {
     const h = theme === 'custom' ? (hue ?? local.customHue) : (PRESET_HUES[theme] || 140);
     const v = vibrancy ?? local.customVibrancy;
     accentHue = h;
     el.setAttribute('data-theme', 'custom');
-    Object.entries(generateThemeFromHue(h, v, lt)).forEach(([k, val]) => el.style.setProperty(k, val));
+    generatedVars = generateThemeFromHue(h, v, lt);
+    Object.entries(generatedVars).forEach(([k, val]) => el.style.setProperty(k, val));
     if (theme === 'custom') { local.customHue = h; local.customVibrancy = v; }
   } else {
     el.setAttribute('data-theme', theme);
+  }
+
+  // WCAG contrast check for custom/adjusted themes
+  const warn = document.getElementById('wcag-warning');
+  if (warn) {
+    if (generatedVars && checkContrast(generatedVars) < 4.5) {
+      warn.classList.remove('hidden');
+    } else {
+      warn.classList.add('hidden');
+    }
   }
 
   el.setAttribute('data-color-mode', lt >= 50 ? 'light' : 'dark');

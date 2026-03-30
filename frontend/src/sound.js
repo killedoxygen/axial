@@ -213,7 +213,7 @@ export function inferButtonSound(btn) {
   if (btn.classList.contains('chip')) return 'soft';
   if (btn.id === 'launch-btn') return 'launchPress';
   if (btn.id === 'add-version-btn' || btn.id === 'empty-add-btn') return 'bright';
-  if (btn.id === 'settings-save' || btn.id === 'install-btn' || btn.id === 'onboarding-finish') return 'affirm';
+  if (btn.id === 'settings-save' || btn.id === 'install-btn' || btn.id === 'onboarding-next') return 'affirm';
   if (btn.id === 'settings-cancel' || btn.id === 'kill-btn' || btn.id === 'delete-cancel' || btn.id === 'delete-close') return 'soft';
   if (btn.id === 'delete-done-close') return 'affirm';
   if (btn.classList.contains('ctx-item')) return null; // handled by ctx menu

@@ -49,7 +49,7 @@ export function cacheDom() {
     'add-version-btn',
     'onboarding', 'onboarding-step-1', 'onboarding-step-2', 'onboarding-step-3', 'onboarding-step-4', 'onboarding-step-5',
     'onboarding-username', 'onboarding-ram-info', 'onboarding-memory-slider', 'onboarding-memory-value', 'onboarding-rec',
-    'onboarding-next-1', 'onboarding-next-2', 'onboarding-next-3', 'onboarding-next-4', 'onboarding-finish',
+    'onboarding-back', 'onboarding-next',
     'dot-1', 'dot-2', 'dot-3', 'dot-4', 'dot-5',
     'music-btn', 'music-eq', 'music-toggle', 'music-volume-slider', 'music-volume-value', 'music-volume-row',
     'ob-music-yes', 'ob-music-no',

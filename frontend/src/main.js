@@ -1,8 +1,8 @@
-import { state, dom, local, $, $$, cacheDom, STORAGE_KEY, saveLocalState } from './state.js';
+import { state, dom, local, $, $$, cacheDom, STORAGE_KEY, saveLocalState, PRESET_HUES } from './state.js';
 import { api } from './api.js';
 import { Sound, bindButtonSounds, playSliderSound } from './sound.js';
 import { Music } from './music.js';
-import { applyTheme, initColorField, positionFieldMarker } from './theme.js';
+import { applyTheme, initColorField, positionFieldMarker, findFixedLightness } from './theme.js';
 import { Shortcuts, syncShortcutHints, renderShortcutEditor, startRecording, handleRecordKey } from './shortcuts.js';
 import { fmtMem, showError, appendLog, setLogFilter, setPage, toggleShortcutHints, getMemoryRecommendation, updateMemoryRecText } from './utils.js';
 import { renderInstanceList, watchVersions } from './sidebar.js';
@@ -10,7 +10,7 @@ import { selectInstance, renderSelectedInstance, refreshSelectedInstanceActionSt
 import { installVersion } from './install.js';
 import { launchGame, killGame } from './launch.js';
 import { openSettings, closeSettings, saveSettings, syncSettingsSectionNav } from './settings.js';
-import { openNewInstanceFlow, showSetup, showOnboarding, onboardingStep, finishOnboarding } from './modals.js';
+import { openNewInstanceFlow, showSetup, showOnboarding, onboardingStep, onboardingNext, onboardingBack, getObStep, finishOnboarding } from './modals.js';
 import { hideContextMenu, bindContextMenu } from './context-menu.js';
 import { closeDeleteWizard, bindDeleteWizard } from './delete-wizard.js';
 import { showConfirm } from './dialogs.js';
@@ -227,6 +227,12 @@ function bindEvents() {
     });
     slider.addEventListener('change', () => Sound.ui('theme'));
   });
+  document.getElementById('wcag-fix-btn')?.addEventListener('click', () => {
+    const h = local.theme === 'custom' ? local.customHue : (PRESET_HUES[local.theme] || 140);
+    const v = local.customVibrancy ?? 100;
+    const fixed = findFixedLightness(h, v, local.lightness);
+    applyTheme(local.theme, null, { lightness: fixed });
+  });
   dom.shortcutList?.addEventListener('click', (e) => {
     const rec = e.target.closest('[data-sc-record]');
     if (rec) { startRecording(rec.dataset.scRecord); return; }
@@ -282,11 +288,8 @@ function bindEvents() {
   dom.addVersionBtn?.addEventListener('click', openNewInstanceFlow);
   dom.emptyAddBtn?.addEventListener('click', openNewInstanceFlow);
 
-  dom.onboardingNext1?.addEventListener('click', () => onboardingStep(2));
-  dom.onboardingNext2?.addEventListener('click', () => onboardingStep(3));
-  dom.onboardingNext3?.addEventListener('click', () => onboardingStep(4));
-  dom.onboardingNext4?.addEventListener('click', () => onboardingStep(5));
-  dom.onboardingFinish?.addEventListener('click', finishOnboarding);
+  dom.onboardingNext?.addEventListener('click', onboardingNext);
+  dom.onboardingBack?.addEventListener('click', () => { onboardingBack(); Sound.ui('soft'); });
   dom.onboardingMemorySlider?.addEventListener('input', () => {
     const v = parseFloat(dom.onboardingMemorySlider.value);
     if (dom.onboardingMemoryValue) dom.onboardingMemoryValue.textContent = fmtMem(v);
@@ -400,13 +403,9 @@ function bindEvents() {
       else if (niModal) { niModal.remove(); Sound.ui('soft'); }
       else if (state.currentPage === 'settings') closeSettings();
     }
-    if (e.key === 'Enter' && dom.onboarding && !dom.onboarding.classList.contains('hidden')) {
-      e.preventDefault();
-      if (!dom.onboardingStep1?.classList.contains('hidden')) onboardingStep(2);
-      else if (!dom.onboardingStep2?.classList.contains('hidden')) onboardingStep(3);
-      else if (!dom.onboardingStep3?.classList.contains('hidden')) onboardingStep(4);
-      else if (!dom.onboardingStep4?.classList.contains('hidden')) onboardingStep(5);
-      else if (!dom.onboardingStep5?.classList.contains('hidden')) finishOnboarding();
+    if (dom.onboarding && !dom.onboarding.classList.contains('hidden')) {
+      if (e.key === 'Enter') { e.preventDefault(); onboardingNext(); }
+      if (e.key === 'Backspace' && getObStep() > 1 && document.activeElement?.tagName !== 'INPUT') { e.preventDefault(); onboardingBack(); }
     }
   });
   document.addEventListener('keyup', (e) => {

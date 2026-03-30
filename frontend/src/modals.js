@@ -56,7 +56,7 @@ export async function openNewInstanceFlow() {
         </div>
         <div>
           <label class="detail-prop-label" style="display:block;margin-bottom:6px;padding:0">Version</label>
-          <input type="text" id="ni-version-search" class="field-input" placeholder="Search versions..." spellcheck="false" style="width:100%;box-sizing:border-box;margin-bottom:8px">
+          <input type="text" id="ni-version-search" class="field-input" placeholder="Search versions..." spellcheck="false" autocomplete="off" style="width:100%;box-sizing:border-box;margin-bottom:8px">
           <div class="filter-chips" id="ni-filters">
             <button class="chip active" data-nif="release">Release</button>
             <button class="chip" data-nif="snapshot">Snapshot</button>
@@ -273,9 +273,29 @@ export function showOnboarding() {
   positionFieldMarker(dom.obColorField, dom.obColorFieldMarker, local.customHue, local.customVibrancy);
 }
 
+let obStep = 1;
+const OB_STEPS = 5;
+
+export function getObStep() { return obStep; }
+
 export function onboardingStep(n) {
-  [dom.onboardingStep1, dom.onboardingStep2, dom.onboardingStep3, dom.onboardingStep4, dom.onboardingStep5].forEach((s, i) => { if (s) s.classList.toggle('hidden', i !== n - 1); });
-  [dom.dot1, dom.dot2, dom.dot3, dom.dot4, dom.dot5].forEach((d, i) => { if (d) d.classList.toggle('active', i === n - 1); });
+  obStep = Math.max(1, Math.min(OB_STEPS, n));
+  const steps = [dom.onboardingStep1, dom.onboardingStep2, dom.onboardingStep3, dom.onboardingStep4, dom.onboardingStep5];
+  const dots = [dom.dot1, dom.dot2, dom.dot3, dom.dot4, dom.dot5];
+  steps.forEach((s, i) => { if (s) s.classList.toggle('hidden', i !== obStep - 1); });
+  dots.forEach((d, i) => { if (d) d.classList.toggle('active', i === obStep - 1); });
+  if (dom.onboardingBack) dom.onboardingBack.classList.toggle('hidden', obStep === 1);
+  if (dom.onboardingNext) dom.onboardingNext.textContent = obStep === OB_STEPS ? "Let's go" : 'Continue';
+  if (obStep === 1) dom.onboardingUsername?.focus();
+}
+
+export function onboardingNext() {
+  if (obStep < OB_STEPS) onboardingStep(obStep + 1);
+  else finishOnboarding();
+}
+
+export function onboardingBack() {
+  if (obStep > 1) onboardingStep(obStep - 1);
 }
 
 export async function finishOnboarding() {

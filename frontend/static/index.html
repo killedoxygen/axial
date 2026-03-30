@@ -61,7 +61,7 @@
           <div class="sidebar-header">
             <div class="search-box" data-action="search">
               <svg class="search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></svg>
-              <input type="text" id="version-search" class="search-input" placeholder="Search instances..." spellcheck="false" aria-label="Search instances">
+              <input type="text" id="version-search" class="search-input" placeholder="Search instances..." spellcheck="false" autocomplete="off" aria-label="Search instances">
             </div>
             <div class="filter-chips">
               <button class="chip active" data-filter="all">All</button>
@@ -84,9 +84,7 @@
 
         <div class="sidebar-settings-panel hidden" id="sidebar-settings-panel">
           <div class="sidebar-settings-head">
-            <span class="sidebar-settings-kicker">Settings</span>
             <h2 class="sidebar-settings-title">Settings</h2>
-            <p class="sidebar-settings-sub">Appearance, launch defaults and Java in the same sidebar.</p>
           </div>
           <nav class="settings-nav" id="settings-nav">
             <button class="settings-nav-btn active" data-settings-target="settings-section-appearance">Appearance</button>
@@ -188,9 +186,8 @@
             <div class="settings-main-panel">
               <div class="settings-page-header">
                 <div>
-                  <span class="settings-page-kicker">Croopor Configuration</span>
+                  <span class="settings-page-kicker">Croopor</span>
                   <h2 class="settings-page-title">Launcher Settings</h2>
-                  <p class="settings-page-sub">Theme, Java, window sizing and launcher behavior in one place.</p>
                 </div>
               </div>
 
@@ -237,6 +234,11 @@
                       <input type="range" id="lightness-slider" class="lightness-slider" min="0" max="100" step="1" value="0">
                       <svg class="lightness-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
                     </div>
+                    <div class="wcag-warning hidden" id="wcag-warning">
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+                      <span>Low contrast, text may be hard to read.</span>
+                      <button class="wcag-fix-btn" id="wcag-fix-btn" type="button">Fix</button>
+                    </div>
                   </div>
 
                   <div class="setting-group">
@@ -272,11 +274,11 @@
                   <div class="setting-row">
                     <div class="setting-group">
                       <label class="setting-label">Window Width</label>
-                      <input type="number" id="setting-width" class="setting-input" placeholder="Default">
+                      <input type="number" id="setting-width" class="setting-input" placeholder="Default" autocomplete="off">
                     </div>
                     <div class="setting-group">
                       <label class="setting-label">Window Height</label>
-                      <input type="number" id="setting-height" class="setting-input" placeholder="Default">
+                      <input type="number" id="setting-height" class="setting-input" placeholder="Default" autocomplete="off">
                     </div>
                   </div>
                   <p class="setting-hint">Leave these empty to let Minecraft choose its own size on launch.</p>
@@ -290,7 +292,7 @@
 
                   <div class="setting-group">
                     <label class="setting-label">Java Path Override</label>
-                    <input type="text" id="setting-java-path" class="setting-input" placeholder="Leave empty for auto-detect">
+                    <input type="text" id="setting-java-path" class="setting-input" placeholder="Leave empty for auto-detect" autocomplete="off">
                     <p class="setting-hint">Full path to `javaw.exe` or your Java binary.</p>
                   </div>
                   <div class="setting-group">
@@ -304,10 +306,9 @@
                     <label class="setting-label">JVM Performance Preset</label>
                     <div class="jvm-preset-group" id="jvm-preset-group">
                       <label class="radio-label"><input type="radio" name="jvm-preset" value="" checked> Default</label>
-                      <label class="radio-label"><input type="radio" name="jvm-preset" value="aikar"> Aikar's Flags <span class="setting-hint-inline">(optimized G1GC)</span></label>
-                      <label class="radio-label"><input type="radio" name="jvm-preset" value="zgc"> ZGC Low-Latency <span class="setting-hint-inline">(Java 17+)</span></label>
+                      <label class="radio-label"><input type="radio" name="jvm-preset" value="aikar"> Aikar's Flags <span class="setting-hint-inline">(optimized G1GC)</span> <span class="info-tip" data-tip="Widely used in the MC community for better GC performance.">i</span></label>
+                      <label class="radio-label"><input type="radio" name="jvm-preset" value="zgc"> ZGC Low-Latency <span class="setting-hint-inline">(Java 17+)</span> <span class="info-tip" data-tip="Eliminates GC pauses but requires Java 17 or newer. You will still be able to launch older versions, but you will not benefit from the setting on them.">i</span></label>
                     </div>
-                    <p class="setting-hint">Aikar's Flags are widely used in the Minecraft community for better GC performance. ZGC eliminates GC pauses but requires Java 17 or newer.</p>
                   </div>
                 </section>
 
@@ -334,7 +335,6 @@
                         <button class="btn-danger" id="dev-cleanup">Cleanup All</button>
                         <button class="btn-danger" id="dev-flush">Flush All Data</button>
                       </div>
-                      <p class="setting-hint">Cleanup backs up instance data then removes all versions and instances. Flush resets Croopor to first-launch state (config, instances, runtimes).</p>
                     </div>
                   </div>
                 </section>
@@ -523,102 +523,105 @@
 
     <div class="onboarding-overlay hidden" id="onboarding">
       <div class="onboarding-card">
-        <div class="onboarding-step" id="onboarding-step-1">
-          <img src="logo.svg" alt="Croopor" width="64" height="64" class="onboarding-logo">
-          <h1 class="onboarding-title">Welcome to Croopor</h1>
-          <p class="onboarding-sub">Your offline Minecraft launcher</p>
-          <div class="onboarding-field">
-            <label class="setting-label">Choose your player name</label>
-            <input type="text" id="onboarding-username" class="setting-input onboarding-input" value="Player" spellcheck="false" autocomplete="off" autofocus>
-          </div>
-          <button class="btn-primary onboarding-next" id="onboarding-next-1">Continue</button>
-        </div>
-
-        <div class="onboarding-step hidden" id="onboarding-step-2">
-          <h2 class="onboarding-title">Memory Allocation</h2>
-          <p class="onboarding-sub" id="onboarding-ram-info">Detecting system memory...</p>
-          <div class="onboarding-memory">
-            <input type="range" id="onboarding-memory-slider" min="1" max="16" step="0.5" value="4" class="onboarding-slider">
-            <span id="onboarding-memory-value" class="memory-value">4 GB</span>
-          </div>
-          <p class="onboarding-rec" id="onboarding-rec"></p>
-          <button class="btn-primary onboarding-next" id="onboarding-next-2">Continue</button>
-        </div>
-
-        <div class="onboarding-step hidden" id="onboarding-step-3">
-          <h2 class="onboarding-title">Pick your style</h2>
-          <p class="onboarding-sub">Choose a preset or craft your own palette</p>
-          <div class="ob-theme-presets" id="ob-theme-presets">
-            <button class="ob-theme-btn active" data-ob-theme="obsidian">
-              <span class="ob-swatch" style="background:linear-gradient(135deg,#0c0e11 60%,#3dd68c)"></span>
-              <span>Obsidian</span>
-            </button>
-            <button class="ob-theme-btn" data-ob-theme="deepslate">
-              <span class="ob-swatch" style="background:linear-gradient(135deg,#101218 60%,#6ea8fe)"></span>
-              <span>Deepslate</span>
-            </button>
-            <button class="ob-theme-btn" data-ob-theme="nether">
-              <span class="ob-swatch" style="background:linear-gradient(135deg,#140a0a 60%,#ff6b4a)"></span>
-              <span>Nether</span>
-            </button>
-            <button class="ob-theme-btn" data-ob-theme="end">
-              <span class="ob-swatch" style="background:linear-gradient(135deg,#0d0b14 60%,#c4a3ff)"></span>
-              <span>The End</span>
-            </button>
-            <button class="ob-theme-btn" data-ob-theme="birch">
-              <span class="ob-swatch" style="background:linear-gradient(135deg,#f5f0e8 60%,#5a8f4a)"></span>
-              <span>Birch</span>
-            </button>
-          </div>
-          <div class="ob-custom-section">
-            <label class="setting-label" style="text-align:center;width:100%">Or create your own</label>
-            <div class="color-field" id="ob-color-field">
-              <div class="color-field-marker" id="ob-color-field-marker"></div>
-            </div>
-            <div class="lightness-row">
-              <svg class="lightness-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
-              <input type="range" id="ob-lightness-slider" class="lightness-slider" min="0" max="100" step="1" value="0">
-              <svg class="lightness-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+        <div class="onboarding-body">
+          <div class="onboarding-step" id="onboarding-step-1">
+            <img src="logo.svg" alt="Croopor" width="64" height="64" class="onboarding-logo">
+            <h1 class="onboarding-title">Welcome to Croopor</h1>
+            <p class="onboarding-sub">Your offline Minecraft launcher</p>
+            <div class="onboarding-field">
+              <label class="setting-label">Choose your player name</label>
+              <input type="text" id="onboarding-username" class="setting-input onboarding-input" value="Player" spellcheck="false" autocomplete="off" autofocus>
             </div>
           </div>
-          <button class="btn-primary onboarding-next" id="onboarding-next-3">Continue</button>
-        </div>
 
-        <div class="onboarding-step hidden" id="onboarding-step-4">
-          <h2 class="onboarding-title">Background Music</h2>
-          <p class="onboarding-sub">Optional ambient track while you're in the launcher</p>
-          <div class="ob-music-toggle">
-            <button class="ob-music-btn" id="ob-music-yes">
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
-                <path d="M9 18V5l12-2v13"></path><circle cx="6" cy="18" r="3"></circle><circle cx="18" cy="16" r="3"></circle>
-              </svg>
-              <span>Enable music</span>
-            </button>
-            <button class="ob-music-btn active" id="ob-music-no">
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
-                <path d="M9 18V5l12-2v13" opacity="0.4"></path><circle cx="6" cy="18" r="3" opacity="0.4"></circle><circle cx="18" cy="16" r="3" opacity="0.4"></circle>
-                <line x1="3" y1="3" x2="21" y2="21" stroke-width="2.5"></line>
-              </svg>
-              <span>No thanks</span>
-            </button>
+          <div class="onboarding-step hidden" id="onboarding-step-2">
+            <h2 class="onboarding-title">Memory Allocation</h2>
+            <p class="onboarding-sub" id="onboarding-ram-info">Detecting system memory...</p>
+            <div class="onboarding-memory">
+              <input type="range" id="onboarding-memory-slider" min="1" max="16" step="0.5" value="4" class="onboarding-slider">
+              <span id="onboarding-memory-value" class="memory-value">4 GB</span>
+            </div>
+            <p class="onboarding-rec" id="onboarding-rec"></p>
           </div>
-          <p class="onboarding-sub" style="font-size:11px;margin-top:8px;opacity:0.5">Downloaded on first play (~12 MB), works offline after that</p>
-          <button class="btn-primary onboarding-next" id="onboarding-next-4">Continue</button>
+
+          <div class="onboarding-step hidden" id="onboarding-step-3">
+            <h2 class="onboarding-title">Pick your style</h2>
+            <p class="onboarding-sub">Choose a preset or craft your own palette</p>
+            <div class="ob-theme-presets" id="ob-theme-presets">
+              <button class="ob-theme-btn active" data-ob-theme="obsidian">
+                <span class="ob-swatch" style="background:linear-gradient(135deg,#0c0e11 60%,#3dd68c)"></span>
+                <span>Obsidian</span>
+              </button>
+              <button class="ob-theme-btn" data-ob-theme="deepslate">
+                <span class="ob-swatch" style="background:linear-gradient(135deg,#101218 60%,#6ea8fe)"></span>
+                <span>Deepslate</span>
+              </button>
+              <button class="ob-theme-btn" data-ob-theme="nether">
+                <span class="ob-swatch" style="background:linear-gradient(135deg,#140a0a 60%,#ff6b4a)"></span>
+                <span>Nether</span>
+              </button>
+              <button class="ob-theme-btn" data-ob-theme="end">
+                <span class="ob-swatch" style="background:linear-gradient(135deg,#0d0b14 60%,#c4a3ff)"></span>
+                <span>The End</span>
+              </button>
+              <button class="ob-theme-btn" data-ob-theme="birch">
+                <span class="ob-swatch" style="background:linear-gradient(135deg,#f5f0e8 60%,#5a8f4a)"></span>
+                <span>Birch</span>
+              </button>
+            </div>
+            <div class="ob-custom-section">
+              <label class="setting-label" style="text-align:center;width:100%">Or create your own</label>
+              <div class="color-field" id="ob-color-field">
+                <div class="color-field-marker" id="ob-color-field-marker"></div>
+              </div>
+              <div class="lightness-row">
+                <svg class="lightness-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+                <input type="range" id="ob-lightness-slider" class="lightness-slider" min="0" max="100" step="1" value="0">
+                <svg class="lightness-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+              </div>
+            </div>
+          </div>
+
+          <div class="onboarding-step hidden" id="onboarding-step-4">
+            <h2 class="onboarding-title">Background Music</h2>
+            <p class="onboarding-sub">Ambient track while you're in the launcher</p>
+            <div class="ob-music-toggle">
+              <button class="ob-music-btn active" id="ob-music-yes">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                  <path d="M9 18V5l12-2v13"></path><circle cx="6" cy="18" r="3"></circle><circle cx="18" cy="16" r="3"></circle>
+                </svg>
+                <span>Enable music</span>
+              </button>
+              <button class="ob-music-btn" id="ob-music-no">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                  <path d="M9 18V5l12-2v13" opacity="0.4"></path><circle cx="6" cy="18" r="3" opacity="0.4"></circle><circle cx="18" cy="16" r="3" opacity="0.4"></circle>
+                  <line x1="3" y1="3" x2="21" y2="21" stroke-width="2.5"></line>
+                </svg>
+                <span>No thanks</span>
+              </button>
+            </div>
+            <p class="onboarding-hint">Downloaded on first play (~12 MB), works offline after that</p>
+          </div>
+
+          <div class="onboarding-step hidden" id="onboarding-step-5">
+            <div class="onboarding-check">&#10003;</div>
+            <h2 class="onboarding-title">You're all set!</h2>
+            <p class="onboarding-sub">Scroll the wheel to pick a version and hit Launch.<br>Croopor handles everything else.</p>
+          </div>
         </div>
 
-        <div class="onboarding-step hidden" id="onboarding-step-5">
-          <div class="onboarding-check">&#10003;</div>
-          <h2 class="onboarding-title">You're all set!</h2>
-          <p class="onboarding-sub">Scroll the wheel to pick a version and hit Launch. Croopor handles everything else.</p>
-          <button class="btn-primary onboarding-next" id="onboarding-finish">Let's go</button>
-        </div>
-
-        <div class="onboarding-dots">
-          <span class="dot active" id="dot-1"></span>
-          <span class="dot" id="dot-2"></span>
-          <span class="dot" id="dot-3"></span>
-          <span class="dot" id="dot-4"></span>
-          <span class="dot" id="dot-5"></span>
+        <div class="onboarding-footer">
+          <button class="onboarding-back hidden" id="onboarding-back">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="15 18 9 12 15 6"></polyline></svg>
+          </button>
+          <div class="onboarding-dots">
+            <span class="dot active" id="dot-1"></span>
+            <span class="dot" id="dot-2"></span>
+            <span class="dot" id="dot-3"></span>
+            <span class="dot" id="dot-4"></span>
+            <span class="dot" id="dot-5"></span>
+          </div>
+          <button class="btn-primary onboarding-next" id="onboarding-next">Continue</button>
         </div>
       </div>
     </div>
