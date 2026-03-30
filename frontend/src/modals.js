@@ -70,7 +70,6 @@ export async function openNewInstanceFlow() {
     </div>
   `;
   document.body.appendChild(modal);
-  Sound.ui('bright');
 
   const nameInput = document.getElementById('new-instance-name');
   const nameError = document.getElementById('ni-name-error');
