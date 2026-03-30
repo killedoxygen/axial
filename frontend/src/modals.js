@@ -2,7 +2,7 @@ import { state, dom, local } from './state.js';
 import { api } from './api.js';
 import { Sound } from './sound.js';
 import { Music } from './music.js';
-import { esc, fmtMem, showError, getMemoryRecommendation } from './utils.js';
+import { esc, fmtMem, showError, getMemoryRecommendation, parseVersionDisplay } from './utils.js';
 import { positionFieldMarker } from './theme.js';
 import { renderInstanceList } from './sidebar.js';
 import { selectInstance } from './instance.js';
@@ -96,7 +96,7 @@ export async function openNewInstanceFlow() {
 
   function renderVersionPicker() {
     let list = allVersions.filter(v => v.type === filter);
-    if (search) { const q = search.toLowerCase(); list = list.filter(v => v.id.toLowerCase().includes(q)); }
+    if (search) { const q = search.toLowerCase(); list = list.filter(v => { const pd = parseVersionDisplay(v.id, v, allVersions); return v.id.toLowerCase().includes(q) || pd.name.toLowerCase().includes(q); }); }
     const total = list.length;
     const start = page * PAGE_SIZE;
     const display = list.slice(start, start + PAGE_SIZE);
@@ -107,7 +107,9 @@ export async function openNewInstanceFlow() {
     const totalPages = Math.ceil(total / PAGE_SIZE);
     let html = display.map(v => {
       const selected = v.id === selectedVersionId;
-      return `<div class="ni-version-item${selected ? ' selected' : ''}" data-vid="${esc(v.id)}"><span class="ni-version-id">${esc(v.id)}</span>${v.installed ? '<span class="ni-installed-badge">Installed</span>' : ''}</div>`;
+      const pd = parseVersionDisplay(v.id, v, allVersions);
+      const label = pd.hint ? `${esc(pd.name)} <span class="version-hint">${esc(pd.hint)}</span>` : esc(pd.name);
+      return `<div class="ni-version-item${selected ? ' selected' : ''}" data-vid="${esc(v.id)}"><span class="ni-version-id">${label}</span>${v.installed ? '<span class="ni-installed-badge">Installed</span>' : ''}</div>`;
     }).join('');
     if (totalPages > 1) {
       html += `<div class="ni-pagination"><button class="ni-page-btn" id="ni-prev" ${page === 0 ? 'disabled' : ''}>&lsaquo;</button><span class="ni-page-info">${page + 1} / ${totalPages}</span><button class="ni-page-btn" id="ni-next" ${page >= totalPages - 1 ? 'disabled' : ''}>&rsaquo;</button></div>`;
