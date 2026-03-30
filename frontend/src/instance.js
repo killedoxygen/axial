@@ -1,6 +1,6 @@
 import { state, dom } from './state.js';
 import { Sound } from './sound.js';
-import { esc, setPage, formatRelativeTime } from './utils.js';
+import { esc, setPage, formatRelativeTime, parseVersionDisplay } from './utils.js';
 import { scrambleText, startRunningAnimation, stopRunningAnimation, startUptime, stopUptime } from './effects.js';
 import { api } from './api.js';
 
@@ -47,22 +47,24 @@ export function renderSelectedVersion() {
   dom.emptyState?.classList.add('hidden');
   dom.versionDetail?.classList.remove('hidden');
 
-  scrambleText(dom.detailId, version.id, 300);
+  const pd = parseVersionDisplay(version.id, version, state.versions);
+  scrambleText(dom.detailId, pd.name, 300);
 
   const isModded = !!version.inherits_from;
   const badgeClass = isModded ? 'badge-modded' : version.type === 'release' ? 'badge-release' : version.type === 'snapshot' ? 'badge-snapshot' : 'badge-old';
   dom.detailBadge.className = `detail-badge ${badgeClass}`;
   dom.detailBadge.textContent = isModded ? 'MOD' : version.type === 'release' ? 'REL' : version.type === 'snapshot' ? 'SNAP' : version.type?.toUpperCase()?.slice(0, 4) || '?';
 
-  if (dom.detailProps) dom.detailProps.innerHTML = buildVersionProps(version);
+  if (dom.detailProps) dom.detailProps.innerHTML = buildVersionProps(version, pd);
   refreshSelectedVersionActionState();
 }
 
-function buildVersionProps(version) {
+function buildVersionProps(version, pd) {
   let props = '';
   if (version.java_component) props += prop('Runtime', version.java_component, true);
   if (version.java_major) props += prop('Java', `Java ${version.java_major}`);
-  if (version.inherits_from) props += prop('Base', version.inherits_from);
+  if (pd?.hint) props += prop('Loader', pd.hint);
+  else if (version.inherits_from) props += prop('Base', version.inherits_from);
   if (version.release_time) {
     const d = new Date(version.release_time);
     if (!isNaN(d)) props += prop('Released', d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }));
@@ -103,8 +105,10 @@ export function renderSelectedInstance() {
     linksEl.className = 'instance-links';
     dom.detailProps?.parentNode?.insertBefore(linksEl, dom.detailProps.nextSibling);
   }
-  linksEl.innerHTML = `<a class="instance-link" data-sub="saves">Open saves</a><a class="instance-link" data-sub="mods">Open mods</a><a class="instance-link" data-sub="resourcepacks">Open resources</a><a class="instance-link" data-sub="">Open folder</a>`;
+  const isVanilla = !version?.inherits_from;
+  linksEl.innerHTML = `<a class="instance-link" data-sub="saves">Open saves</a><a class="instance-link${isVanilla ? ' disabled' : ''}" data-sub="mods"${isVanilla ? ' title="No mod loader installed"' : ''}>Open mods</a><a class="instance-link" data-sub="resourcepacks">Open resources</a><a class="instance-link" data-sub="">Open folder</a>`;
   linksEl.querySelectorAll('.instance-link').forEach(a => {
+    if (a.classList.contains('disabled')) return;
     a.addEventListener('click', () => {
       const sub = a.dataset.sub;
       api('POST', `/instances/${encodeURIComponent(inst.id)}/open-folder${sub ? '?sub=' + sub : ''}`);
@@ -123,7 +127,8 @@ function jvmPresetLabel(preset) {
 
 function buildInstanceMeta(inst, version) {
   const parts = [];
-  parts.push(esc(inst.version_id));
+  const pd = parseVersionDisplay(inst.version_id, version, state.versions);
+  parts.push(pd.hint ? `${esc(pd.name)} <span class="meta-hint">${esc(pd.hint)}</span>` : esc(pd.name));
   if (version?.java_major) parts.push(`Java ${version.java_major}`);
   const preset = inst.jvm_preset || state.config?.jvm_preset || '';
   const presetText = jvmPresetLabel(preset);

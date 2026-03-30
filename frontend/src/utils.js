@@ -89,6 +89,61 @@ export function esc(s) {
   return d.innerHTML;
 }
 
+export function parseVersionDisplay(versionId, version, versions) {
+  if (version?.inherits_from) return parseModded(versionId, version.inherits_from);
+  const type = version?.type;
+  if (type === 'old_beta') return { name: versionId.replace(/^b/, 'Beta '), hint: null };
+  if (type === 'old_alpha') return { name: versionId.replace(/^a/, 'Alpha '), hint: null };
+  if (type === 'snapshot') return parseSnapshot(versionId, version, versions);
+  return { name: versionId, hint: null };
+}
+
+function parseModded(id, base) {
+  const lo = id.toLowerCase();
+  let m;
+  // fabric-loader-0.16.9-1.20.1
+  m = lo.match(/^fabric-loader-([.\d]+)-/);
+  if (m) return { name: `Fabric ${base}`, hint: `Loader ${m[1]}` };
+  // quilt-loader-0.26.1-1.20.1
+  m = lo.match(/^quilt-loader-([.\d]+)-/);
+  if (m) return { name: `Quilt ${base}`, hint: `Loader ${m[1]}` };
+  // 1.20.1-forge-47.3.0 or 1.20.1-forge47.3.0
+  m = id.match(/-forge-?([.\d]+)/i);
+  if (m) return { name: `Forge ${base}`, hint: `Forge ${m[1]}` };
+  // neoforge variants
+  if (lo.includes('neoforge')) {
+    m = id.match(/neoforge[.-]?([.\d]+(?:-[.\d]+)?)/i);
+    return { name: `NeoForge ${base}`, hint: m ? `NeoForge ${m[1]}` : null };
+  }
+  // optifine
+  m = id.match(/-optifine[_-](.*)/i);
+  if (m) return { name: `OptiFine ${base}`, hint: m[1].replace(/_/g, ' ').trim() };
+  // X.X.X-fabric (simple)
+  if (lo.includes('fabric')) return { name: `Fabric ${base}`, hint: null };
+  if (lo.includes('quilt')) return { name: `Quilt ${base}`, hint: null };
+  if (lo.includes('liteloader')) return { name: `LiteLoader ${base}`, hint: null };
+  // generic fallback
+  return { name: base, hint: id !== base ? id : null };
+}
+
+function parseSnapshot(id, version, versions) {
+  // pre-release / release candidate: 1.20.5-pre1, 1.20.5-rc1
+  const m = id.match(/^(\d+\.\d+(?:\.\d+)?)-(?:pre|rc)\d+$/);
+  if (m) return { name: id, hint: `\u2192 ${m[1]}` };
+  // weekly snapshot: find nearest release by time
+  if (versions?.length && version?.release_time) {
+    const t = version.release_time;
+    const rel = versions.filter(v => v.type === 'release' && v.release_time).sort((a, b) => a.release_time.localeCompare(b.release_time));
+    // first release at or after snapshot
+    let nearest = null;
+    for (const r of rel) { if (r.release_time >= t) { nearest = r; break; } }
+    // if none after, use last release before
+    if (!nearest) { for (let i = rel.length - 1; i >= 0; i--) { if (rel[i].release_time <= t) { nearest = rel[i]; break; } } }
+    if (nearest) return { name: id, hint: `~ ${nearest.id}` };
+  }
+  return { name: id, hint: null };
+}
+
 export function fmtMem(gb) { return gb === Math.floor(gb) ? `${gb}\u00A0GB` : `${gb.toFixed(1)}\u00A0GB`; }
 
 export function formatBytes(bytes) {

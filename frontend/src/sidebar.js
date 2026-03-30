@@ -1,6 +1,6 @@
 import { state, dom, local, saveLocalState, API } from './state.js';
 import { Sound } from './sound.js';
-import { esc, setPage } from './utils.js';
+import { esc, setPage, parseVersionDisplay } from './utils.js';
 import { selectInstance, selectVersion, renderSelectedVersion, renderSelectedInstance } from './instance.js';
 import { showInstanceContextMenu, showContextMenu } from './context-menu.js';
 
@@ -65,7 +65,9 @@ export function renderInstanceList() {
       const iTarget = v?.needs_install || v?.id || inst.version_id;
       const iPct = state.activeInstall?.versionId === iTarget ? (state.activeInstall.pct || 0) : state.installQueue.some(q => q.versionId === iTarget) ? 0 : -1;
       const iBar = iPct >= 0 ? `<div class="version-install-bar"><div class="version-install-fill" style="width:${iPct}%"></div></div>` : '';
-      html += `<button type="button" class="version-item ${dim} ${sel} ${rc}" data-id="${inst.id}" aria-pressed="${sel ? 'true' : 'false'}" aria-label="Select instance ${esc(inst.name)}" style="animation-delay:${i * 15}ms"><div class="version-dot ${dc}"></div><span class="version-name">${esc(inst.name)}</span><span class="version-sub">${esc(inst.version_id)}</span>${isRunning ? '<span class="version-running-tag">LIVE</span>' : ''}<span class="version-badge ${bc}">${bt}</span>${iBar}</button>`;
+      const pd = parseVersionDisplay(inst.version_id, v, state.versions);
+      const sub = pd.hint ? `${esc(pd.name)} <span class="version-hint">${esc(pd.hint)}</span>` : esc(pd.name);
+      html += `<button type="button" class="version-item ${dim} ${sel} ${rc}" data-id="${inst.id}" aria-pressed="${sel ? 'true' : 'false'}" aria-label="Select instance ${esc(inst.name)}" style="animation-delay:${i * 15}ms"><div class="version-dot ${dc}"></div><span class="version-name">${esc(inst.name)}</span><span class="version-sub">${sub}</span>${isRunning ? '<span class="version-running-tag">LIVE</span>' : ''}<span class="version-badge ${bc}">${bt}</span>${iBar}</button>`;
     });
     html += `</div>`;
   };
@@ -174,7 +176,9 @@ export function renderVersionList() {
       const sel = state.selectedVersion?.id === v.id ? 'selected' : '';
       const rc = isRunning ? 'is-running' : '';
       const dim = v.launchable ? '' : 'dimmed';
-      html += `<button type="button" class="version-item ${dim} ${sel} ${rc}" data-id="${v.id}" aria-pressed="${sel ? 'true' : 'false'}" aria-label="Select version ${esc(v.id)}" style="animation-delay:${i * 15}ms"><div class="version-dot ${dc}"></div><span class="version-name">${esc(v.id)}</span>${isRunning ? '<span class="version-running-tag">LIVE</span>' : ''}<span class="version-badge ${bc}">${bt}</span></button>`;
+      const pd = parseVersionDisplay(v.id, v, state.versions);
+      const vLabel = pd.hint ? `${esc(pd.name)} <span class="version-hint">${esc(pd.hint)}</span>` : esc(pd.name);
+      html += `<button type="button" class="version-item ${dim} ${sel} ${rc}" data-id="${v.id}" aria-pressed="${sel ? 'true' : 'false'}" aria-label="Select version ${esc(v.id)}" style="animation-delay:${i * 15}ms"><div class="version-dot ${dc}"></div><span class="version-name">${vLabel}</span>${isRunning ? '<span class="version-running-tag">LIVE</span>' : ''}<span class="version-badge ${bc}">${bt}</span></button>`;
     });
     html += `</div>`;
   };
