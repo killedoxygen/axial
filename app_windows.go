@@ -32,8 +32,6 @@ func runApp(appURL string) {
 		fallbackBrowser(appURL)
 		return
 	}
-	defer w.Destroy()
-
 	w.SetSize(1100, 720, webview2.HintMin)
 	w.Navigate(appURL)
 
@@ -46,6 +44,7 @@ func runApp(appURL string) {
 	}()
 
 	w.Run()
+	w.Destroy() // Flush WebView2 data (localStorage) before exit
 	os.Exit(0)
 }
 

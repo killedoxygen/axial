@@ -6,7 +6,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 )
+
+// cdsGenerating prevents concurrent archive generation for the same path.
+var cdsGenerating sync.Map
 
 // CDSArchivePath returns the path to the CDS archive for a version.
 func CDSArchivePath(configDir, versionID string) string {
@@ -21,7 +25,14 @@ func CDSArchiveExists(configDir, versionID string) bool {
 
 // GenerateCDSArchive runs a one-time JVM class data sharing dump.
 // The archive speeds up subsequent launches by caching class metadata.
+// Concurrent calls for the same archive path are safely deduplicated.
 func GenerateCDSArchive(javaPath, classpath, archivePath string) error {
+	// Prevent concurrent generation of the same archive
+	if _, loaded := cdsGenerating.LoadOrStore(archivePath, true); loaded {
+		return nil
+	}
+	defer cdsGenerating.Delete(archivePath)
+
 	dir := filepath.Dir(archivePath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("creating CDS dir: %w", err)

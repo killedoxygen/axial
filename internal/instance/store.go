@@ -76,6 +76,16 @@ func (s *InstanceStore) Get(id string) *Instance {
 	return nil
 }
 
+// NameExists returns true if any instance already uses this name (case-sensitive).
+func (s *InstanceStore) NameExists(name, excludeID string) bool {
+	for _, inst := range s.Instances {
+		if inst.Name == name && inst.ID != excludeID {
+			return true
+		}
+	}
+	return false
+}
+
 // Add creates an instance, sets up its game directory, and persists.
 func (s *InstanceStore) Add(name, versionID, mcDir string) (*Instance, error) {
 	if name == "" {
@@ -83,6 +93,9 @@ func (s *InstanceStore) Add(name, versionID, mcDir string) (*Instance, error) {
 	}
 	if versionID == "" {
 		return nil, errors.New("version_id is required")
+	}
+	if s.NameExists(name, "") {
+		return nil, errors.New("an instance with this name already exists")
 	}
 
 	inst := Instance{

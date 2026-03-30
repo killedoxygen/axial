@@ -115,6 +115,10 @@ func (s *Server) handleUpdateInstance(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if v, ok := updates["name"].(string); ok && v != "" {
+		if v != inst.Name && s.instances.NameExists(v, inst.ID) {
+			writeError(w, http.StatusConflict, "an instance with this name already exists")
+			return
+		}
 		inst.Name = v
 	}
 	if v, ok := updates["version_id"].(string); ok && v != "" {

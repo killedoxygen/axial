@@ -142,7 +142,7 @@ func BuildAndLaunch(opts LaunchOptions) (*LaunchResult, error) {
 	configDir := config.ConfigDir()
 	if !isModded && javaMajor >= 11 && CDSArchiveExists(configDir, opts.VersionID) {
 		cdsArgs = []string{
-			"-Xshare:on",
+			"-Xshare:auto",
 			"-XX:SharedArchiveFile=" + CDSArchivePath(configDir, opts.VersionID),
 		}
 	}
@@ -216,6 +216,18 @@ func BuildAndLaunch(opts LaunchOptions) (*LaunchResult, error) {
 			archivePath := CDSArchivePath(configDir, opts.VersionID)
 			if err := GenerateCDSArchive(javaResult.Path, classpath, archivePath); err != nil {
 				log.Printf("CDS archive generation failed for %s: %v", opts.VersionID, err)
+			}
+		}()
+	}
+
+	// Step 17: Auto-repair CDS — if the JVM detects a corrupted archive, invalidate it
+	if len(cdsArgs) > 0 {
+		cdsVersionID := opts.VersionID
+		go func() {
+			<-gp.Done()
+			if gp.CDSFailed {
+				log.Printf("CDS archive unusable for %s — invalidating for next launch", cdsVersionID)
+				InvalidateCDSArchive(configDir, cdsVersionID)
 			}
 		}()
 	}

@@ -146,6 +146,24 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	if v, ok := updates["onboarding_done"].(bool); ok {
 		s.config.OnboardingDone = v
 	}
+	if v, ok := updates["jvm_preset"].(string); ok {
+		s.config.JVMPreset = v
+	}
+	if v, ok := updates["theme"].(string); ok {
+		s.config.Theme = v
+	}
+	if v, ok := updates["custom_hue"].(float64); ok {
+		i := int(v)
+		s.config.CustomHue = &i
+	}
+	if v, ok := updates["custom_vibrancy"].(float64); ok {
+		i := int(v)
+		s.config.CustomVibrancy = &i
+	}
+	if v, ok := updates["lightness"].(float64); ok {
+		i := int(v)
+		s.config.Lightness = &i
+	}
 
 	if err := config.Save(s.config); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to save config: "+err.Error())

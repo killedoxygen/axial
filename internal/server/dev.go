@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/mateoltd/croopor/internal/config"
+	"github.com/mateoltd/croopor/internal/instance"
 	"github.com/mateoltd/croopor/internal/launcher"
 	"github.com/mateoltd/croopor/internal/minecraft"
 )
@@ -25,7 +26,7 @@ func registerDevRoutes(s *Server) {
 	s.mux.HandleFunc("GET /api/v1/dev/boot-profile-live/{id}", s.handleDevLiveProfile)
 }
 
-// handleDevCleanup backs up worlds, resourcepacks, mods, then removes all versions.
+// handleDevCleanup backs up instance data + shared MC data, then removes all versions and instances.
 func (s *Server) handleDevCleanup(w http.ResponseWriter, r *http.Request) {
 	mcDir := s.GetMCDir()
 	if mcDir == "" {
@@ -41,7 +42,7 @@ func (s *Server) handleDevCleanup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Back up important user data
+	// Back up shared Minecraft data
 	preserve := []string{"saves", "resourcepacks", "mods", "shaderpacks", "config", "options.txt", "servers.dat"}
 	backed := []string{}
 	for _, name := range preserve {
@@ -56,26 +57,46 @@ func (s *Server) handleDevCleanup(w http.ResponseWriter, r *http.Request) {
 		backed = append(backed, name)
 	}
 
+	// Back up instance data (saves, mods, etc. per instance)
+	instancesRemoved := 0
+	instanceBackupDir := filepath.Join(backupDir, "instances")
+	for _, inst := range s.instances.Instances {
+		gameDir := instance.GameDir(inst.ID)
+		if _, err := os.Stat(gameDir); os.IsNotExist(err) {
+			continue
+		}
+		dst := filepath.Join(instanceBackupDir, inst.Name+" ("+inst.ID[:8]+")")
+		copyPath(gameDir, dst)
+	}
+
+	// Remove all instance game directories and clear instance store
+	os.RemoveAll(instance.InstancesBaseDir())
+	instancesRemoved = len(s.instances.Instances)
+	s.instances.Instances = nil
+	s.instances.LastInstanceID = ""
+	instance.Save(s.instances)
+
 	// Remove versions directory contents
 	versionsDir := minecraft.VersionsDir(mcDir)
 	entries, _ := os.ReadDir(versionsDir)
-	removed := 0
+	versionsRemoved := 0
 	for _, e := range entries {
 		if e.IsDir() {
 			os.RemoveAll(filepath.Join(versionsDir, e.Name()))
-			removed++
+			versionsRemoved++
 		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":     "ok",
-		"backup_dir": backupDir,
-		"backed_up":  backed,
-		"removed":    removed,
+		"status":             "ok",
+		"backup_dir":         backupDir,
+		"backed_up":          backed,
+		"versions_removed":   versionsRemoved,
+		"instances_removed":  instancesRemoved,
 	})
 }
 
-// handleDevFlush deletes all Croopor config and cached runtimes, resetting to first-launch state.
+// handleDevFlush deletes all Croopor config, instances, and cached runtimes, resetting to first-launch state.
 func (s *Server) handleDevFlush(w http.ResponseWriter, r *http.Request) {
 	configDir := config.ConfigDir()
 
@@ -83,8 +104,13 @@ func (s *Server) handleDevFlush(w http.ResponseWriter, r *http.Request) {
 	os.Remove(config.ConfigPath())
 
 	// Remove cached runtimes
-	runtimesDir := filepath.Join(configDir, "runtimes")
-	os.RemoveAll(runtimesDir)
+	os.RemoveAll(filepath.Join(configDir, "runtimes"))
+
+	// Remove all instances (store + game directories)
+	os.RemoveAll(instance.InstancesBaseDir())
+	os.Remove(filepath.Join(configDir, "instances.json"))
+	s.instances.Instances = nil
+	s.instances.LastInstanceID = ""
 
 	// Reset in-memory config to defaults
 	def := config.DefaultConfig()

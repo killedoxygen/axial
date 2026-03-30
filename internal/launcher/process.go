@@ -42,6 +42,7 @@ type GameProcess struct {
 	startTime     time.Time
 	throttle      *BootThrottle
 	Profile       *BootProfile
+	CDSFailed     bool // set if JVM reports CDS archive errors
 }
 
 // NewGameProcess creates a game process from an exec.Cmd.
@@ -179,6 +180,13 @@ func (gp *GameProcess) streamOutput(r io.Reader, source string) {
 					break
 				}
 			}
+		}
+
+		// Detect CDS archive errors (e.g. corrupted or incompatible archive)
+		if source == "stderr" && (strings.Contains(line, "[error][cds]") || strings.Contains(line, "Unable to use shared archive")) {
+			gp.mu.Lock()
+			gp.CDSFailed = true
+			gp.mu.Unlock()
 		}
 
 		select {
