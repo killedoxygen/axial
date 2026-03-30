@@ -51,7 +51,7 @@
           <div class="sidebar-header">
             <div class="search-box" data-action="search">
               <svg class="search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></svg>
-              <input type="text" id="version-search" class="search-input" placeholder="Search versions..." spellcheck="false" aria-label="Search installed versions">
+              <input type="text" id="version-search" class="search-input" placeholder="Search instances..." spellcheck="false" aria-label="Search instances">
             </div>
             <div class="filter-chips">
               <button class="chip active" data-filter="all">All</button>
@@ -66,9 +66,9 @@
               <span>Scanning versions...</span>
             </div>
           </div>
-          <button class="add-version-btn" id="add-version-btn" data-action="addVersion">
+          <button class="add-version-btn" id="add-version-btn" data-action="newInstance">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
-            <span>Add Version</span>
+            <span>New Instance</span>
           </button>
         </div>
 
@@ -106,7 +106,7 @@
               </div>
               <p class="empty-title" id="empty-title">Select a version</p>
               <p class="empty-sub" id="empty-sub">Choose a Minecraft version from the sidebar to launch</p>
-              <button class="btn-primary hidden" id="empty-add-btn" style="margin-top: 12px;" data-action="addVersion">Add Version</button>
+              <button class="btn-primary hidden" id="empty-add-btn" style="margin-top: 12px;" data-action="newInstance">New Instance</button>
             </div>
 
             <div class="version-detail hidden" id="version-detail">
@@ -149,11 +149,10 @@
 
                 <div class="action-hidden" id="running-area">
                   <div class="running-card">
-                    <div class="running-card-bg"></div>
+                    <div class="running-card-head"><span class="running-card-label">Game Launched</span></div>
                     <div class="running-top">
                       <pre class="running-ascii" id="running-ascii"></pre>
                       <div class="running-info">
-                        <span class="running-label">Game Launched</span>
                         <span class="running-version" id="running-version"></span>
                         <span class="running-pid" id="running-pid"></span>
                       </div>
@@ -335,34 +334,12 @@
       </div>
     </div>
 
-    <div class="modal-overlay hidden" id="catalog-modal">
-      <div class="modal catalog-modal-size">
-        <div class="modal-header">
-          <span class="modal-title">Add Version</span>
-          <button class="icon-btn modal-close" id="catalog-close" data-action="close" aria-label="Close add version dialog">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
-          </button>
-        </div>
-        <div class="catalog-filters">
-          <input type="text" id="catalog-search" class="search-input catalog-search" placeholder="Search all Minecraft versions..." spellcheck="false">
-          <div class="filter-chips">
-            <button class="chip active" data-catalog-filter="release">Releases</button>
-            <button class="chip" data-catalog-filter="snapshot">Snapshots</button>
-            <button class="chip" data-catalog-filter="old_beta">Beta</button>
-            <button class="chip" data-catalog-filter="old_alpha">Alpha</button>
-          </div>
-        </div>
-        <div class="catalog-list" id="catalog-list">
-          <div class="loading-placeholder">
-            <div class="spinner"></div>
-            <span>Loading catalog...</span>
-          </div>
-        </div>
-      </div>
-    </div>
-
     <!-- Context Menu -->
     <div class="ctx-menu hidden" id="ctx-menu" role="menu">
+      <button class="ctx-item" id="ctx-rename" role="menuitem">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+        <span>Rename</span>
+      </button>
       <button class="ctx-item" id="ctx-open-folder" role="menuitem">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
         <span>Open Folder</span>
@@ -374,7 +351,7 @@
       <div class="ctx-divider"></div>
       <button class="ctx-item ctx-item-danger" id="ctx-delete" role="menuitem">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>
-        <span>Delete Version</span>
+        <span>Delete Instance</span>
       </button>
     </div>
 

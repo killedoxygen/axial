@@ -9,17 +9,15 @@ import (
 )
 
 type Config struct {
-	Username         string            `json:"username"`
-	MaxMemoryMB      int               `json:"max_memory_mb"`
-	MinMemoryMB      int               `json:"min_memory_mb"`
-	LastVersionID    string            `json:"last_version_id,omitempty"`
-	LastLaunched     map[string]string `json:"last_launched,omitempty"`
-	JavaPathOverride string            `json:"java_path_override,omitempty"`
-	WindowWidth      int               `json:"window_width,omitempty"`
-	WindowHeight     int               `json:"window_height,omitempty"`
-	JVMPreset        string            `json:"jvm_preset,omitempty"`
-	OnboardingDone   bool              `json:"onboarding_done"`
-	MCDir            string            `json:"mc_dir,omitempty"`
+	Username         string `json:"username"`
+	MaxMemoryMB      int    `json:"max_memory_mb"`
+	MinMemoryMB      int    `json:"min_memory_mb"`
+	JavaPathOverride string `json:"java_path_override,omitempty"`
+	WindowWidth      int    `json:"window_width,omitempty"`
+	WindowHeight     int    `json:"window_height,omitempty"`
+	JVMPreset        string `json:"jvm_preset,omitempty"`
+	OnboardingDone   bool   `json:"onboarding_done"`
+	MCDir            string `json:"mc_dir,omitempty"`
 }
 
 var (
@@ -29,10 +27,9 @@ var (
 
 func DefaultConfig() *Config {
 	return &Config{
-		Username:     "Player",
-		MaxMemoryMB:  4096,
-		MinMemoryMB:  512,
-		LastLaunched: map[string]string{},
+		Username:    "Player",
+		MaxMemoryMB: 4096,
+		MinMemoryMB: 512,
 	}
 }
 
@@ -76,9 +73,6 @@ func Load() (*Config, error) {
 	}
 	if cfg.Username == "" {
 		cfg.Username = "Player"
-	}
-	if cfg.LastLaunched == nil {
-		cfg.LastLaunched = map[string]string{}
 	}
 	return cfg, nil
 }

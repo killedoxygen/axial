@@ -7,18 +7,20 @@ import (
 	"sync"
 
 	"github.com/mateoltd/croopor/internal/config"
+	"github.com/mateoltd/croopor/internal/instance"
 	"github.com/mateoltd/croopor/internal/launcher"
 	"github.com/mateoltd/croopor/internal/minecraft"
 )
 
 type Server struct {
-	mu       sync.RWMutex
-	mcDir    string
-	config   *config.Config
-	sessions *SessionManager
-	installs *InstallManager
-	mux      *http.ServeMux
-	frontend fs.FS
+	mu        sync.RWMutex
+	mcDir     string
+	config    *config.Config
+	instances *instance.InstanceStore
+	sessions  *SessionManager
+	installs  *InstallManager
+	mux       *http.ServeMux
+	frontend  fs.FS
 }
 
 // GetMCDir returns the current Minecraft directory (thread-safe).
@@ -35,14 +37,15 @@ func (s *Server) SetMCDir(dir string) {
 	s.mu.Unlock()
 }
 
-func NewServer(mcDir string, cfg *config.Config, frontend fs.FS) *Server {
+func NewServer(mcDir string, cfg *config.Config, instances *instance.InstanceStore, frontend fs.FS) *Server {
 	s := &Server{
-		mcDir:    mcDir,
-		config:   cfg,
-		sessions: NewSessionManager(),
-		installs: NewInstallManager(),
-		mux:      http.NewServeMux(),
-		frontend: frontend,
+		mcDir:     mcDir,
+		config:    cfg,
+		instances: instances,
+		sessions:  NewSessionManager(),
+		installs:  NewInstallManager(),
+		mux:       http.NewServeMux(),
+		frontend:  frontend,
 	}
 	s.registerRoutes()
 	return s
@@ -61,6 +64,13 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/v1/launch/{id}/events", s.handleLaunchEvents)
 	s.mux.HandleFunc("GET /api/v1/launch/{id}/command", s.handleLaunchCommand)
 	s.mux.HandleFunc("POST /api/v1/launch/{id}/kill", s.handleKillProcess)
+	s.mux.HandleFunc("GET /api/v1/instances", s.handleListInstances)
+	s.mux.HandleFunc("POST /api/v1/instances", s.handleCreateInstance)
+	s.mux.HandleFunc("GET /api/v1/instances/{id}", s.handleGetInstance)
+	s.mux.HandleFunc("PUT /api/v1/instances/{id}", s.handleUpdateInstance)
+	s.mux.HandleFunc("DELETE /api/v1/instances/{id}", s.handleDeleteInstance)
+	s.mux.HandleFunc("POST /api/v1/instances/{id}/duplicate", s.handleDuplicateInstance)
+	s.mux.HandleFunc("POST /api/v1/instances/{id}/open-folder", s.handleOpenInstanceFolder)
 	s.mux.HandleFunc("POST /api/v1/install", s.handleInstall)
 	s.mux.HandleFunc("GET /api/v1/install/{id}/events", s.handleInstallEvents)
 	s.mux.HandleFunc("GET /api/v1/java", s.handleJava)

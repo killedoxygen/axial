@@ -11,12 +11,12 @@ const PRESET_HUES = { obsidian: 140, deepslate: 215, nether: 15, end: 268, birch
 const LOGO_BASE_HUE = 106;
 
 const SHORTCUT_DEFAULTS = {
-  settings:   { key: ',', ctrl: true, desc: 'Open or close settings' },
-  search:     { key: 'f', ctrl: true, desc: 'Focus version search' },
-  addVersion: { key: 'n', ctrl: true, desc: 'Add a new version' },
-  launch:     { key: 'Enter', ctrl: true, desc: 'Launch selected version' },
-  save:       { key: 's', ctrl: true, desc: 'Save settings' },
-  close:      { key: 'Escape', ctrl: false, desc: 'Close dialogs' },
+  settings:    { key: ',', ctrl: true, desc: 'Open or close settings' },
+  search:      { key: 'f', ctrl: true, desc: 'Focus instance search' },
+  newInstance: { key: 'n', ctrl: true, desc: 'New instance' },
+  launch:      { key: 'Enter', ctrl: true, desc: 'Launch selected instance' },
+  save:        { key: 's', ctrl: true, desc: 'Save settings' },
+  close:       { key: 'Escape', ctrl: false, desc: 'Close dialogs' },
 };
 
 const Shortcuts = {
@@ -392,7 +392,7 @@ function syncShortcutHints() {
 
 function renderShortcutEditor() {
   if (!dom.shortcutList) return;
-  const labels = { settings: 'Settings', search: 'Search', addVersion: 'Add Version', launch: 'Launch', save: 'Save', close: 'Close' };
+  const labels = { settings: 'Settings', search: 'Search', newInstance: 'New Instance', launch: 'Launch', save: 'Save', close: 'Close' };
   dom.shortcutList.innerHTML = Shortcuts.all().map(action => {
     const b = Shortcuts.get(action);
     const isCustom = !!local.shortcuts[action];
@@ -467,14 +467,15 @@ function initColorField(field, marker, onDrag, onEnd) {
 // ── App State ──
 
 const state = {
-  versions: [], config: null, systemInfo: null, devMode: false,
-  selectedVersion: null, activeSession: null,
+  instances: [], versions: [], config: null, systemInfo: null, devMode: false,
+  selectedInstance: null, selectedVersion: null, activeSession: null,
   eventSource: null, installEventSource: null,
-  logLines: 0, filter: 'all', catalogFilter: 'release',
-  search: '', catalogSearch: '', catalog: null,
-  gameRunning: false, runningVersionId: null,
+  logLines: 0, filter: 'all',
+  search: '', catalog: null,
+  gameRunning: false, runningInstanceId: null, runningVersionId: null,
   installing: false, launching: false,
   currentPage: 'launcher',
+  lastInstanceId: null,
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -497,7 +498,7 @@ function cacheDom() {
     'settings-btn', 'settings-cancel', 'settings-save',
     'setting-java-path', 'setting-width', 'setting-height', 'java-runtimes', 'jvm-preset-group',
     'theme-picker', 'color-field', 'color-field-marker', 'lightness-slider', 'sounds-toggle', 'shortcut-list',
-    'add-version-btn', 'catalog-modal', 'catalog-close', 'catalog-search', 'catalog-list',
+    'add-version-btn',
     'onboarding', 'onboarding-step-1', 'onboarding-step-2', 'onboarding-step-3', 'onboarding-step-4',
     'onboarding-username', 'onboarding-ram-info', 'onboarding-memory-slider', 'onboarding-memory-value', 'onboarding-rec',
     'onboarding-next-1', 'onboarding-next-2', 'onboarding-next-3', 'onboarding-finish',
@@ -548,9 +549,26 @@ function toggleShortcutHints(show) {
 }
 
 // ══════════════════════════════════════════
-// VERSION SELECTION
+// INSTANCE SELECTION
 // ══════════════════════════════════════════
 
+function selectInstance(inst, options = {}) {
+  const { silent = false } = options;
+  if (!silent) { Sound.init(); Sound.tick(); }
+  state.selectedInstance = inst;
+  // Also set selectedVersion for install flow compatibility
+  state.selectedVersion = inst ? state.versions.find(v => v.id === inst.version_id) || null : null;
+  setPage('launcher');
+  renderSelectedInstance();
+  // Update selection classes without re-rendering the full list (avoids killing click handlers)
+  dom.versionList?.querySelectorAll('.version-item').forEach(el => {
+    const selected = el.dataset.id === inst?.id;
+    el.classList.toggle('selected', selected);
+    el.setAttribute('aria-pressed', selected ? 'true' : 'false');
+  });
+}
+
+// Keep for catalog/install compatibility
 function selectVersion(version, options = {}) {
   const { silent = false } = options;
   if (!silent) { Sound.init(); Sound.tick(); }
@@ -581,7 +599,7 @@ function renderSelectedVersion() {
   const isModded = !!version.inherits_from;
   const badgeClass = isModded ? 'badge-modded' : version.type === 'release' ? 'badge-release' : version.type === 'snapshot' ? 'badge-snapshot' : 'badge-old';
   dom.detailBadge.className = `detail-badge ${badgeClass}`;
-  dom.detailBadge.textContent = isModded ? 'Modded' : version.type === 'release' ? 'Release' : version.type === 'snapshot' ? 'Snapshot' : version.type || 'Unknown';
+  dom.detailBadge.textContent = isModded ? 'MOD' : version.type === 'release' ? 'REL' : version.type === 'snapshot' ? 'SNAP' : version.type?.toUpperCase()?.slice(0, 4) || '?';
 
   if (dom.detailProps) dom.detailProps.innerHTML = buildVersionProps(version);
   refreshSelectedVersionActionState();
@@ -602,12 +620,123 @@ function buildVersionProps(version) {
   return props;
 }
 
+function renderSelectedInstance() {
+  const inst = state.selectedInstance;
+  if (!inst) {
+    dom.versionDetail?.classList.add('hidden');
+    dom.emptyState?.classList.remove('hidden');
+    return;
+  }
+  dom.emptyState?.classList.add('hidden');
+  dom.versionDetail?.classList.remove('hidden');
+
+  // Instance name as the hero
+  scrambleText(dom.detailId, inst.name, 300);
+
+  // Version badge
+  const version = state.versions.find(v => v.id === inst.version_id);
+  const vType = inst.version_type || version?.type || '';
+  const isModded = version?.inherits_from;
+  const badgeClass = isModded ? 'badge-modded' : vType === 'release' ? 'badge-release' : vType === 'snapshot' ? 'badge-snapshot' : 'badge-old';
+  dom.detailBadge.className = `detail-badge ${badgeClass}`;
+  dom.detailBadge.textContent = isModded ? 'MOD' : vType === 'release' ? 'REL' : vType === 'snapshot' ? 'SNAP' : vType?.toUpperCase()?.slice(0, 4) || '?';
+
+  // Metadata line replaces prop grid
+  if (dom.detailProps) dom.detailProps.innerHTML = buildInstanceMeta(inst, version);
+
+  // Quick links
+  let linksEl = document.getElementById('instance-links');
+  if (!linksEl) {
+    linksEl = document.createElement('div');
+    linksEl.id = 'instance-links';
+    linksEl.className = 'instance-links';
+    dom.detailProps?.parentNode?.insertBefore(linksEl, dom.detailProps.nextSibling);
+  }
+  linksEl.innerHTML = `<a class="instance-link" data-sub="saves">Open saves</a><a class="instance-link" data-sub="mods">Open mods</a><a class="instance-link" data-sub="resourcepacks">Open resources</a><a class="instance-link" data-sub="">Open folder</a>`;
+  linksEl.querySelectorAll('.instance-link').forEach(a => {
+    a.addEventListener('click', () => {
+      const sub = a.dataset.sub;
+      api('POST', `/instances/${encodeURIComponent(inst.id)}/open-folder${sub ? '?sub=' + sub : ''}`);
+      Sound.ui('click');
+    });
+  });
+
+  refreshSelectedInstanceActionState();
+}
+
+function buildInstanceMeta(inst, version) {
+  const parts = [];
+  parts.push(esc(inst.version_id));
+  if (version?.java_major) parts.push(`Java ${version.java_major}`);
+  if (version) {
+    parts.push(version.launchable ? 'Ready' : version.status_detail || 'Incomplete');
+  } else {
+    parts.push('Version not installed');
+  }
+  if (inst.last_played_at) {
+    const d = new Date(inst.last_played_at);
+    if (!isNaN(d)) parts.push('Played ' + formatRelativeTime(d));
+  } else {
+    parts.push('Never played');
+  }
+  return `<div class="instance-meta">${parts.join(' <span class="meta-dot">·</span> ')}</div>`;
+}
+
+function formatRelativeTime(date) {
+  const now = new Date();
+  const diff = now - date;
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  const days = Math.floor(hrs / 24);
+  if (days < 7) return `${days}d ago`;
+  return new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' }).format(date);
+}
+
+function refreshSelectedInstanceActionState() {
+  const inst = state.selectedInstance;
+  if (!inst) return;
+  hideAllActions();
+
+  if (state.launching) {
+    if (state.runningInstanceId === inst.id) show(dom.launchingArea);
+    else showNotLaunchable('Another launch is already being prepared.');
+    return;
+  }
+
+  if (state.gameRunning) {
+    if (state.runningInstanceId === inst.id) show(dom.runningArea);
+    else showNotLaunchable('Another instance is already running.');
+    return;
+  }
+
+  if (state.installing) {
+    show(dom.installArea);
+    return;
+  }
+
+  const version = state.versions.find(v => v.id === inst.version_id);
+  if (!version) {
+    show(dom.installArea);
+    if (dom.installText) dom.installText.textContent = `Version ${inst.version_id} is not installed`;
+    if (dom.installBtn) dom.installBtn.dataset.installTarget = inst.version_id;
+    return;
+  }
+
+  if (version.launchable) {
+    show(dom.launchArea);
+  } else {
+    show(dom.installArea);
+    if (dom.installText) dom.installText.textContent = version.status_detail || 'Game files need downloading';
+    if (dom.installBtn) dom.installBtn.dataset.installTarget = version.needs_install || version.id;
+  }
+}
+
 function formatLastLaunched(versionId) {
-  const ts = state.config?.last_launched?.[versionId];
-  if (!ts) return { text: 'Never', accent: false };
-  const d = new Date(ts);
-  if (isNaN(d)) return { text: ts, accent: true };
-  return { text: new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(d), accent: true };
+  // Legacy — kept for version detail compatibility
+  return { text: 'N/A', accent: false };
 }
 
 function prop(label, value, accent) {
@@ -675,14 +804,10 @@ function watchVersions() {
       const d = JSON.parse(e.data);
       const newVersions = d.versions || [];
       state.versions = newVersions;
-      renderVersionList();
-      // Update selected version if it's still in the list
-      if (state.selectedVersion) {
-        const updated = newVersions.find(v => v.id === state.selectedVersion.id);
-        if (updated) {
-          state.selectedVersion = updated;
-          renderSelectedVersion();
-        }
+      renderInstanceList();
+      // Update selected instance action state (version may have become launchable)
+      if (state.selectedInstance) {
+        renderSelectedInstance();
       }
     } catch {}
   });
@@ -695,7 +820,123 @@ function watchVersions() {
 }
 
 // ══════════════════════════════════════════
-// SIDEBAR
+// SIDEBAR — INSTANCE LIST
+// ══════════════════════════════════════════
+
+function renderInstanceList() {
+  if (!dom.versionList) return;
+  const instances = filterInstances(state.instances);
+
+  if (state.instances.length === 0) {
+    dom.versionList.innerHTML = `<div class="loading-placeholder"><span>No instances</span></div>`;
+    if (dom.emptyTitle) dom.emptyTitle.textContent = 'No instances yet';
+    if (dom.emptySub) dom.emptySub.textContent = 'Create an instance to get started';
+    dom.emptyAddBtn?.classList.remove('hidden');
+    return;
+  }
+
+  if (!state.selectedInstance) {
+    if (dom.emptyTitle) dom.emptyTitle.textContent = 'Select an instance';
+    if (dom.emptySub) dom.emptySub.textContent = 'Choose an instance from the sidebar to launch';
+    dom.emptyAddBtn?.classList.remove('hidden');
+  } else {
+    dom.emptyAddBtn?.classList.add('hidden');
+  }
+
+  if (instances.length === 0) {
+    dom.versionList.innerHTML = `<div class="loading-placeholder"><span>No matching instances</span></div>`;
+    return;
+  }
+
+  // Group by version type
+  const versionMap = {};
+  for (const v of state.versions) versionMap[v.id] = v;
+
+  const groups = { release: [], snapshot: [], modded: [], other: [] };
+  for (const inst of instances) {
+    const v = versionMap[inst.version_id];
+    if (v?.inherits_from) groups.modded.push(inst);
+    else if (v?.type === 'release') groups.release.push(inst);
+    else if (v?.type === 'snapshot') groups.snapshot.push(inst);
+    else groups.other.push(inst);
+  }
+
+  let html = '';
+  const chevron = `<svg class="version-group-chevron" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>`;
+
+  const renderGroup = (key, label, items) => {
+    if (!items.length) return;
+    const collapsed = local.collapsedGroups[key];
+    html += `<div class="version-group-label${collapsed ? ' collapsed' : ''}" data-group="${key}">${chevron}${label} <span style="opacity:.4;font-weight:400;margin-left:2px">${items.length}</span></div>`;
+    html += `<div class="version-group-items${collapsed ? ' collapsed' : ''}" data-group-items="${key}">`;
+    items.forEach((inst, i) => {
+      const v = versionMap[inst.version_id];
+      const isModded = !!v?.inherits_from;
+      const bc = isModded ? 'badge-modded' : v?.type === 'release' ? 'badge-release' : v?.type === 'snapshot' ? 'badge-snapshot' : 'badge-old';
+      const bt = isModded ? 'MOD' : v?.type === 'release' ? 'REL' : v?.type === 'snapshot' ? 'SNAP' : v?.type?.toUpperCase()?.slice(0, 4) || '?';
+      const isRunning = state.gameRunning && state.runningInstanceId === inst.id;
+      const dc = isRunning ? 'running' : v?.launchable ? 'ok' : 'missing';
+      const sel = state.selectedInstance?.id === inst.id ? 'selected' : '';
+      const rc = isRunning ? 'is-running' : '';
+      const dim = v?.launchable ? '' : 'dimmed';
+      html += `<button type="button" class="version-item ${dim} ${sel} ${rc}" data-id="${inst.id}" aria-pressed="${sel ? 'true' : 'false'}" aria-label="Select instance ${esc(inst.name)}" style="animation-delay:${i * 15}ms"><div class="version-dot ${dc}"></div><span class="version-name">${esc(inst.name)}</span><span class="version-sub">${esc(inst.version_id)}</span>${isRunning ? '<span class="version-running-tag">LIVE</span>' : ''}<span class="version-badge ${bc}">${bt}</span></button>`;
+    });
+    html += `</div>`;
+  };
+
+  renderGroup('release', 'Releases', groups.release);
+  renderGroup('modded', 'Modded', groups.modded);
+  renderGroup('snapshot', 'Snapshots', groups.snapshot);
+  renderGroup('other', 'Other', groups.other);
+  dom.versionList.innerHTML = html;
+
+  dom.versionList.querySelectorAll('.version-item').forEach(el => {
+    const inst = state.instances.find(i => i.id === el.dataset.id);
+    el.addEventListener('focus', () => {
+      if (!inst || state.selectedInstance?.id === inst.id) return;
+      selectInstance(inst, { silent: true });
+    });
+    el.addEventListener('click', (e) => {
+      if (e.button !== 0) return;
+      if (inst) selectInstance(inst);
+    });
+    el.addEventListener('contextmenu', (e) => {
+      if (inst) {
+        e.preventDefault();
+        e.stopPropagation();
+        selectInstance(inst, { silent: true });
+        showInstanceContextMenu(e, inst);
+      }
+    });
+  });
+
+  dom.versionList.querySelectorAll('.version-group-label').forEach(label => {
+    label.addEventListener('click', () => {
+      const key = label.dataset.group;
+      local.collapsedGroups[key] = !local.collapsedGroups[key];
+      saveLocalState();
+      label.classList.toggle('collapsed');
+      const items = dom.versionList.querySelector(`[data-group-items="${key}"]`);
+      if (items) items.classList.toggle('collapsed');
+    });
+  });
+}
+
+function filterInstances(instances) {
+  let list = instances;
+  const versionMap = {};
+  for (const v of state.versions) versionMap[v.id] = v;
+
+  if (state.filter === 'release') list = list.filter(inst => { const v = versionMap[inst.version_id]; return v?.type === 'release' && !v?.inherits_from; });
+  else if (state.filter === 'snapshot') list = list.filter(inst => { const v = versionMap[inst.version_id]; return v?.type === 'snapshot' && !v?.inherits_from; });
+  else if (state.filter === 'modded') list = list.filter(inst => { const v = versionMap[inst.version_id]; return !!v?.inherits_from; });
+
+  if (state.search) { const q = state.search.toLowerCase(); list = list.filter(inst => inst.name.toLowerCase().includes(q) || inst.version_id.toLowerCase().includes(q)); }
+  return list;
+}
+
+// ══════════════════════════════════════════
+// SIDEBAR — VERSION LIST (kept for catalog install flow)
 // ══════════════════════════════════════════
 
 function renderVersionList() {
@@ -809,16 +1050,17 @@ function filterVersions(versions) {
 // ══════════════════════════════════════════
 
 async function installVersion() {
-  if (!state.selectedVersion || state.installing) return;
+  if (state.installing) return;
+  const target = dom.installBtn?.dataset.installTarget || state.selectedVersion?.id || state.selectedInstance?.version_id;
+  if (!target) return;
   state.installing = true;
-  const target = dom.installBtn?.dataset.installTarget || state.selectedVersion.id;
   if (dom.installBtn) {
     dom.installBtn.disabled = true;
     const label = dom.installBtn.querySelector('.install-btn-text');
     if (label) label.textContent = 'INSTALLING...';
   }
   show(dom.installProgress);
-  if (dom.progressText) dom.progressText.textContent = target !== state.selectedVersion.id ? `Installing base version ${target}...` : 'Starting download...';
+  if (dom.progressText) dom.progressText.textContent = 'Starting download...';
   try {
     const res = await api('POST', '/install', { version_id: target });
     if (res.error) { showError(res.error); resetInstallUI(); return; }
@@ -829,22 +1071,8 @@ async function installVersion() {
   }
 }
 
-async function installFromCatalog(versionId, manifestUrl) {
-  if (state.installing) return;
-  state.installing = true;
-  try {
-    const res = await api('POST', '/install', { version_id: versionId, manifest_url: manifestUrl });
-    if (res.error) { showError(res.error); state.installing = false; return; }
-    const btn = dom.catalogList?.querySelector(`[data-install-id="${versionId}"]`);
-    if (btn) { btn.disabled = true; btn.textContent = 'Installing...'; }
-    connectInstallSSE(res.install_id, versionId);
-  } catch (err) {
-    showError('Install failed: ' + err.message);
-    state.installing = false;
-  }
-}
 
-function connectInstallSSE(installId, catalogVersionId) {
+function connectInstallSSE(installId) {
   if (state.installEventSource) state.installEventSource.close();
   const es = new EventSource(`${API}/install/${installId}/events`);
   state.installEventSource = es;
@@ -879,7 +1107,7 @@ function connectInstallSSE(installId, catalogVersionId) {
     } else if (d.phase === 'done') {
       pct = 100; label = 'Complete!';
     } else if (d.phase === 'error') {
-      showError(d.error); updateSidebarProgress(installTarget, -1); onInstallDone(catalogVersionId); return;
+      showError(d.error); updateSidebarProgress(installTarget, -1); onInstallDone(); return;
     }
 
     // ETA calculation
@@ -894,9 +1122,9 @@ function connectInstallSSE(installId, catalogVersionId) {
     if (dom.progressText) dom.progressText.textContent = label;
     updateSidebarProgress(installTarget, pct);
 
-    if (d.done) onInstallDone(catalogVersionId);
+    if (d.done) onInstallDone();
   });
-  es.onerror = () => { if (state.installing) { updateSidebarProgress(installTarget, -1); onInstallDone(catalogVersionId); } };
+  es.onerror = () => { if (state.installing) { updateSidebarProgress(installTarget, -1); onInstallDone(); } };
 }
 
 function updateSidebarProgress(versionId, pct) {
@@ -916,7 +1144,7 @@ function updateSidebarProgress(versionId, pct) {
   if (pct >= 100) setTimeout(() => bar.remove(), 1500);
 }
 
-async function onInstallDone(catalogVersionId) {
+async function onInstallDone() {
   state.installing = false;
   if (state.installEventSource) { state.installEventSource.close(); state.installEventSource = null; }
   if (dom.progressFill) dom.progressFill.style.width = '100%';
@@ -924,18 +1152,13 @@ async function onInstallDone(catalogVersionId) {
   try {
     const res = await api('GET', '/versions');
     state.versions = res.versions || [];
-    renderVersionList();
-    if (catalogVersionId) {
-      const btn = dom.catalogList?.querySelector(`[data-install-id="${catalogVersionId}"]`);
-      if (btn) btn.outerHTML = `<span class="catalog-installed-badge">Installed</span>`;
+    // Update catalog cache so newly installed version shows as installed
+    if (state.catalog?.versions) {
+      const installed = new Set(state.versions.filter(v => v.launchable).map(v => v.id));
+      state.catalog.versions.forEach(v => { v.installed = installed.has(v.id); });
     }
-    if (state.selectedVersion) {
-      const updated = state.versions.find(v => v.id === state.selectedVersion.id);
-      if (updated) {
-        state.selectedVersion = updated;
-        renderSelectedVersion();
-      }
-    }
+    renderInstanceList();
+    if (state.selectedInstance) renderSelectedInstance();
   } catch {
     resetInstallUI();
   }
@@ -956,44 +1179,128 @@ function resetInstallUI() {
 // CATALOG
 // ══════════════════════════════════════════
 
-async function openCatalog() {
-  restoreFocusEl = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-  dom.catalogModal?.classList.remove('hidden');
-  if (dom.catalogSearch) dom.catalogSearch.value = '';
-  state.catalogSearch = '';
-  if (dom.catalogList) dom.catalogList.innerHTML = `<div class="loading-placeholder"><div class="spinner"></div><span>Loading...</span></div>`;
-  setTimeout(() => dom.catalogSearch?.focus(), 0);
-  try {
-    state.catalog = await api('GET', '/catalog');
-    renderCatalog();
-  } catch {
-    if (dom.catalogList) dom.catalogList.innerHTML = `<div class="loading-placeholder"><span style="color:var(--red)">Failed to load</span></div>`;
+async function openNewInstanceFlow() {
+  // Load catalog if not cached
+  if (!state.catalog) {
+    try {
+      state.catalog = await api('GET', '/catalog');
+    } catch {
+      showError('Failed to load version catalog');
+      return;
+    }
   }
-}
 
-function closeCatalog() {
-  dom.catalogModal?.classList.add('hidden');
-  restoreFocusEl?.focus?.();
-}
+  const allVersions = state.catalog.versions || [];
+  let filter = 'release';
+  let search = '';
+  let selectedVersionId = null;
 
-function renderCatalog() {
-  if (!state.catalog?.versions || !dom.catalogList) return;
-  let list = state.catalog.versions.filter(v => v.type === state.catalogFilter);
-  if (state.catalogSearch) { const q = state.catalogSearch.toLowerCase(); list = list.filter(v => v.id.toLowerCase().includes(q)); }
-  const display = list.slice(0, 50);
-  if (!display.length) {
-    dom.catalogList.innerHTML = `<div class="loading-placeholder"><span>No versions found</span></div>`;
-    return;
+  const modal = document.createElement('div');
+  modal.className = 'modal-overlay';
+  modal.id = 'new-instance-modal';
+  modal.innerHTML = `
+    <div class="modal" style="width:480px">
+      <div class="modal-header">
+        <span class="modal-title">New Instance</span>
+        <button class="icon-btn modal-close" id="new-instance-close">&times;</button>
+      </div>
+      <div style="padding:16px 18px;display:flex;flex-direction:column;gap:14px">
+        <div>
+          <label class="detail-prop-label" style="display:block;margin-bottom:6px;padding:0">Name</label>
+          <input type="text" id="new-instance-name" class="field-input" placeholder="My Instance" spellcheck="false" autocomplete="off" style="width:100%;box-sizing:border-box">
+        </div>
+        <div>
+          <label class="detail-prop-label" style="display:block;margin-bottom:6px;padding:0">Version</label>
+          <input type="text" id="ni-version-search" class="search-input" placeholder="Search versions..." spellcheck="false" style="width:100%;box-sizing:border-box;margin-bottom:8px">
+          <div class="filter-chips" id="ni-filters">
+            <button class="chip active" data-nif="release">Release</button>
+            <button class="chip" data-nif="snapshot">Snapshot</button>
+            <button class="chip" data-nif="old_beta">Beta</button>
+            <button class="chip" data-nif="old_alpha">Alpha</button>
+          </div>
+          <div class="ni-version-list" id="ni-version-list"></div>
+        </div>
+        <button class="btn-primary" id="new-instance-create" style="align-self:flex-end;margin-top:4px">Create</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(modal);
+  Sound.ui('bright');
+
+  const nameInput = document.getElementById('new-instance-name');
+  const searchInput = document.getElementById('ni-version-search');
+  const versionList = document.getElementById('ni-version-list');
+  nameInput?.focus();
+
+  function renderVersionPicker() {
+    let list = allVersions.filter(v => v.type === filter);
+    if (search) { const q = search.toLowerCase(); list = list.filter(v => v.id.toLowerCase().includes(q)); }
+    const display = list.slice(0, 50);
+    if (!display.length) {
+      versionList.innerHTML = '<div style="padding:12px;text-align:center;color:var(--text-muted);font-size:12px">No versions found</div>';
+      return;
+    }
+    versionList.innerHTML = display.map(v => {
+      const selected = v.id === selectedVersionId;
+      return `<div class="ni-version-item${selected ? ' selected' : ''}" data-vid="${esc(v.id)}"><span class="ni-version-id">${esc(v.id)}</span>${v.installed ? '<span class="ni-installed-badge">Installed</span>' : ''}</div>`;
+    }).join('') + (list.length > 50 ? `<div style="padding:8px;text-align:center;font-size:10px;color:var(--text-muted)">Showing 50 of ${list.length}</div>` : '');
+    versionList.querySelectorAll('.ni-version-item').forEach(el => {
+      el.addEventListener('click', () => {
+        selectedVersionId = el.dataset.vid;
+        const cur = nameInput?.value.trim();
+        if (!cur || allVersions.some(v => v.id === cur)) nameInput.value = selectedVersionId;
+        renderVersionPicker();
+        Sound.ui('click');
+      });
+    });
   }
-  dom.catalogList.innerHTML = display.map(v => {
-    const bc = v.type === 'release' ? 'badge-release' : v.type === 'snapshot' ? 'badge-snapshot' : 'badge-old';
-    const bt = v.type === 'release' ? 'REL' : v.type === 'snapshot' ? 'SNAP' : v.type.toUpperCase().slice(0, 4);
-    const ds = new Date(v.release_time);
-    const dateStr = !isNaN(ds) ? ds.toLocaleDateString() : '';
-    const act = v.installed ? `<span class="catalog-installed-badge">Installed</span>` : `<button class="catalog-install-btn" data-install-id="${esc(v.id)}" data-url="${esc(v.url)}">Install</button>`;
-    return `<div class="catalog-item"><div class="catalog-item-info"><span class="catalog-item-id">${esc(v.id)}</span><span class="catalog-item-date">${dateStr}</span></div><span class="version-badge ${bc}">${bt}</span>${act}</div>`;
-  }).join('') + (list.length > 50 ? `<div class="loading-placeholder"><span style="font-size:10px;color:var(--text-muted)">Showing 50 of ${list.length}</span></div>` : '');
-  dom.catalogList.querySelectorAll('.catalog-install-btn').forEach(btn => btn.addEventListener('click', () => installFromCatalog(btn.dataset.installId, btn.dataset.url)));
+
+  // Select first version by default
+  const defaults = allVersions.filter(v => v.type === filter);
+  if (defaults.length > 0) {
+    selectedVersionId = defaults[0].id;
+    if (!nameInput.value) nameInput.value = selectedVersionId;
+  }
+  renderVersionPicker();
+
+  searchInput?.addEventListener('input', (e) => { search = e.target.value; renderVersionPicker(); });
+  document.getElementById('ni-filters')?.querySelectorAll('.chip').forEach(chip => {
+    chip.addEventListener('click', () => {
+      document.getElementById('ni-filters').querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
+      chip.classList.add('active');
+      filter = chip.dataset.nif;
+      renderVersionPicker();
+    });
+  });
+
+  const close = () => { modal.remove(); Sound.ui('soft'); };
+  document.getElementById('new-instance-close')?.addEventListener('click', close);
+  modal.addEventListener('click', (e) => { if (e.target === modal) close(); });
+
+  document.getElementById('new-instance-create')?.addEventListener('click', async () => {
+    const name = nameInput?.value.trim();
+    if (!name) { nameInput?.focus(); return; }
+    if (!selectedVersionId) return;
+
+    try {
+      const res = await api('POST', '/instances', { name, version_id: selectedVersionId });
+      if (res.error) { showError(res.error); return; }
+      state.instances.push(res);
+      const needsInstall = !allVersions.find(v => v.id === selectedVersionId)?.installed;
+      close();
+      renderInstanceList();
+      selectInstance(res);
+      Sound.ui('affirm');
+      // Auto-install if version not yet installed
+      if (needsInstall) installVersion();
+    } catch (err) {
+      showError(err.message);
+    }
+  });
+
+  nameInput?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') document.getElementById('new-instance-create')?.click();
+  });
 }
 
 // ══════════════════════════════════════════
@@ -1016,75 +1323,68 @@ function clearLaunchVisualState() {
 }
 
 async function launchGame() {
-  if (!state.selectedVersion || state.gameRunning || state.launching) return;
-  if (!state.selectedVersion.launchable) return;
+  const inst = state.selectedInstance;
+  if (!inst || state.gameRunning || state.launching) return;
+  const version = state.versions.find(v => v.id === inst.version_id);
+  if (!version?.launchable) return;
   Sound.init();
 
-  const versionId = state.selectedVersion.id;
   const username = dom.usernameInput?.value.trim() || 'Player';
   const maxMemMB = Math.round(parseFloat(dom.memorySlider?.value || 4) * 1024);
 
   clearLaunchVisualState();
   state.launching = true;
-  state.runningVersionId = versionId;
+  state.runningInstanceId = inst.id;
+  state.runningVersionId = inst.version_id;
   state.activeSession = null;
-  if (dom.launchSeqVersion) dom.launchSeqVersion.textContent = versionId;
-  refreshSelectedVersionActionState();
+  if (dom.launchSeqVersion) dom.launchSeqVersion.textContent = `${inst.name} (${inst.version_id})`;
+  refreshSelectedInstanceActionState();
   startLaunchSequence();
-  renderVersionList();
+  renderInstanceList();
 
   try {
-    const res = await api('POST', '/launch', { version_id: versionId, username, max_memory_mb: maxMemMB });
+    const res = await api('POST', '/launch', { instance_id: inst.id, username, max_memory_mb: maxMemMB });
     if (res.error) {
       showError(res.error);
       clearLaunchVisualState();
       state.launching = false;
+      state.runningInstanceId = null;
       state.runningVersionId = null;
-      // Integrity failure — mark version as not launchable so install UI shows
-      if (res.issues && state.selectedVersion) {
-        state.selectedVersion.launchable = false;
-        state.selectedVersion.status = 'incomplete';
-        state.selectedVersion.status_detail = res.error;
-        state.selectedVersion.needs_install = state.selectedVersion.needs_install || state.selectedVersion.id;
-      }
-      refreshSelectedVersionActionState();
-      renderVersionList();
+      refreshSelectedInstanceActionState();
+      renderInstanceList();
       return;
     }
 
     state.activeSession = res.session_id;
     state.launching = false;
     state.gameRunning = true;
-    state.runningVersionId = versionId;
 
     endLaunchSequence();
     Sound.ui('launchSuccess');
-    if (dom.runningVersion) dom.runningVersion.textContent = versionId;
+    if (dom.runningVersion) dom.runningVersion.textContent = `${inst.name} (${inst.version_id})`;
     if (dom.runningPid) dom.runningPid.textContent = `PID ${res.pid}`;
     startRunningAnimation();
     startUptime();
-    refreshSelectedVersionActionState();
-    renderVersionList();
+    refreshSelectedInstanceActionState();
+    renderInstanceList();
     dom.logPanel?.classList.add('expanded');
     connectLaunchSSE(res.session_id);
-    markVersionLaunched(versionId, res.launched_at || new Date().toISOString(), username, maxMemMB);
+
+    // Update instance last-played in local state
+    inst.last_played_at = res.launched_at || new Date().toISOString();
+    if (state.config) {
+      state.config.username = username;
+      state.config.max_memory_mb = maxMemMB;
+    }
   } catch (err) {
     showError(err.message);
     clearLaunchVisualState();
     state.launching = false;
+    state.runningInstanceId = null;
     state.runningVersionId = null;
-    refreshSelectedVersionActionState();
-    renderVersionList();
+    refreshSelectedInstanceActionState();
+    renderInstanceList();
   }
-}
-
-function markVersionLaunched(versionId, launchedAt, username, maxMemMB) {
-  if (!state.config) state.config = {};
-  state.config.username = username;
-  state.config.max_memory_mb = maxMemMB;
-  state.config.last_version_id = versionId;
-  state.config.last_launched = { ...(state.config.last_launched || {}), [versionId]: launchedAt };
-  if (state.selectedVersion?.id === versionId && dom.detailProps) dom.detailProps.innerHTML = buildVersionProps(state.selectedVersion);
 }
 
 function connectLaunchSSE(sessionId) {
@@ -1110,13 +1410,14 @@ function onGameExited(exitCode, sessionId) {
   if (sessionId && state.activeSession && sessionId !== state.activeSession) return;
   state.gameRunning = false;
   state.launching = false;
+  state.runningInstanceId = null;
   state.runningVersionId = null;
   state.activeSession = null;
   if (state.eventSource) { state.eventSource.close(); state.eventSource = null; }
   clearLaunchVisualState();
-  refreshSelectedVersionActionState();
+  refreshSelectedInstanceActionState();
   appendLog('system', `Game exited with code ${exitCode}`);
-  renderVersionList();
+  renderInstanceList();
 }
 
 async function killGame() {
@@ -1154,7 +1455,7 @@ function openSettings() {
 
 function closeSettings() {
   setPage('launcher');
-  renderSelectedVersion();
+  renderSelectedInstance();
   restoreFocusEl?.focus?.();
 }
 
@@ -1440,8 +1741,8 @@ function inferButtonSound(btn) {
   if (btn.classList.contains('chip')) return 'soft';
   if (btn.id === 'launch-btn') return 'launchPress';
   if (btn.id === 'add-version-btn' || btn.id === 'empty-add-btn') return 'bright';
-  if (btn.id === 'settings-save' || btn.id === 'install-btn' || btn.classList.contains('catalog-install-btn') || btn.id === 'onboarding-finish') return 'affirm';
-  if (btn.id === 'settings-cancel' || btn.id === 'catalog-close' || btn.id === 'kill-btn' || btn.id === 'delete-cancel' || btn.id === 'delete-close') return 'soft';
+  if (btn.id === 'settings-save' || btn.id === 'install-btn' || btn.id === 'onboarding-finish') return 'affirm';
+  if (btn.id === 'settings-cancel' || btn.id === 'kill-btn' || btn.id === 'delete-cancel' || btn.id === 'delete-close') return 'soft';
   if (btn.id === 'delete-done-close') return 'affirm';
   if (btn.classList.contains('ctx-item')) return null; // handled by ctx menu
   return 'click';
@@ -1471,6 +1772,25 @@ function playSliderSound(value, family) {
 // ══════════════════════════════════════════
 
 let ctxMenuVersion = null;
+
+function showInstanceContextMenu(e, inst) {
+  e.preventDefault();
+  ctxMenuVersion = { id: inst.id, _instance: inst }; // reuse ctxMenuVersion slot
+  const menu = document.getElementById('ctx-menu');
+  if (!menu) return;
+  menu.classList.remove('hidden');
+  const mw = menu.offsetWidth || 180;
+  const mh = menu.offsetHeight || 120;
+  let x = e.clientX;
+  let y = e.clientY;
+  if (x + mw > window.innerWidth - 8) x = window.innerWidth - mw - 8;
+  if (y + mh > window.innerHeight - 8) y = window.innerHeight - mh - 8;
+  if (x < 4) x = 4;
+  if (y < 4) y = 4;
+  menu.style.left = x + 'px';
+  menu.style.top = y + 'px';
+  Sound.ui('soft');
+}
 
 function showContextMenu(e, version) {
   e.preventDefault();
@@ -1512,28 +1832,63 @@ function bindContextMenu() {
 
   document.getElementById('ctx-open-folder')?.addEventListener('click', () => {
     if (!ctxMenuVersion) return;
-    // Copy path to clipboard as fallback, since we can't open explorer from browser
-    const id = ctxMenuVersion.id;
-    navigator.clipboard?.writeText(id).catch(() => {});
-    // Try the system open path via API
-    api('POST', `/versions/${encodeURIComponent(id)}/open-folder`).catch(() => {});
+    const inst = ctxMenuVersion._instance;
+    if (inst) {
+      api('POST', `/instances/${encodeURIComponent(inst.id)}/open-folder`).catch(() => {});
+    } else {
+      api('POST', `/versions/${encodeURIComponent(ctxMenuVersion.id)}/open-folder`).catch(() => {});
+    }
     hideContextMenu();
     Sound.ui('click');
   });
 
   document.getElementById('ctx-copy-id')?.addEventListener('click', () => {
     if (!ctxMenuVersion) return;
-    navigator.clipboard?.writeText(ctxMenuVersion.id).then(() => {
+    const inst = ctxMenuVersion._instance;
+    const text = inst ? inst.version_id : ctxMenuVersion.id;
+    navigator.clipboard?.writeText(text).then(() => {
       Sound.ui('affirm');
     }).catch(() => {});
     hideContextMenu();
   });
 
+  document.getElementById('ctx-rename')?.addEventListener('click', () => {
+    if (!ctxMenuVersion?._instance) return;
+    const inst = ctxMenuVersion._instance;
+    hideContextMenu();
+    const newName = prompt('Rename instance:', inst.name);
+    if (newName && newName !== inst.name) {
+      api('PUT', `/instances/${encodeURIComponent(inst.id)}`, { name: newName }).then(() => {
+        inst.name = newName;
+        renderInstanceList();
+        if (state.selectedInstance?.id === inst.id) renderSelectedInstance();
+      });
+      Sound.ui('affirm');
+    }
+  });
+
   document.getElementById('ctx-delete')?.addEventListener('click', () => {
     if (!ctxMenuVersion) return;
-    const version = ctxMenuVersion;
-    hideContextMenu();
-    openDeleteWizard(version);
+    const inst = ctxMenuVersion._instance;
+    if (inst) {
+      hideContextMenu();
+      if (!confirm(`Delete instance "${inst.name}"?\nThis will remove saves, mods, and all instance data.`)) return;
+      api('DELETE', `/instances/${encodeURIComponent(inst.id)}`).then(res => {
+        if (res.error) { showError(res.error); return; }
+        state.instances = state.instances.filter(i => i.id !== inst.id);
+        if (state.selectedInstance?.id === inst.id) {
+          state.selectedInstance = null;
+          dom.versionDetail?.classList.add('hidden');
+          dom.emptyState?.classList.remove('hidden');
+        }
+        renderInstanceList();
+        Sound.ui('affirm');
+      });
+    } else {
+      const version = ctxMenuVersion;
+      hideContextMenu();
+      openDeleteWizard(version);
+    }
   });
 }
 
@@ -1751,15 +2106,9 @@ async function executeDelete() {
     try {
       const versionsRes = await api('GET', '/versions');
       state.versions = versionsRes.versions || [];
-      // If the deleted version was selected, deselect
-      if (state.selectedVersion && deleted.includes(state.selectedVersion.id)) {
-        state.selectedVersion = null;
-        dom.versionDetail?.classList.add('hidden');
-        dom.emptyState?.classList.remove('hidden');
-        if (dom.emptyTitle) dom.emptyTitle.textContent = 'Select a version';
-        if (dom.emptySub) dom.emptySub.textContent = 'Choose a Minecraft version from the sidebar to launch';
-      }
-      renderVersionList();
+      // Refresh instance state after version deletion
+      renderInstanceList();
+      if (state.selectedInstance) renderSelectedInstance();
     } catch {}
   } catch (err) {
     closeDeleteWizard();
@@ -1803,15 +2152,21 @@ async function init() {
       await showSetup();
     }
 
-    // Now load versions (mcDir is guaranteed to be set)
-    const versionsRes = await api('GET', '/versions');
+    // Load versions and instances
+    const [versionsRes, instancesRes] = await Promise.all([
+      api('GET', '/versions'),
+      api('GET', '/instances'),
+    ]);
     state.versions = versionsRes.versions || [];
+    state.instances = instancesRes.instances || [];
+    state.lastInstanceId = instancesRes.last_instance_id || null;
     applyConfig(state.config);
     applySystemInfo(state.systemInfo);
-    renderVersionList();
-    if (state.config?.last_version_id) {
-      const remembered = state.versions.find(v => v.id === state.config.last_version_id);
-      if (remembered) selectVersion(remembered, { silent: true });
+    renderInstanceList();
+    // Restore last selected instance
+    if (state.lastInstanceId) {
+      const remembered = state.instances.find(i => i.id === state.lastInstanceId);
+      if (remembered) selectInstance(remembered, { silent: true });
     }
     if (state.config && !state.config.onboarding_done) showOnboarding();
     watchVersions();
@@ -1857,7 +2212,7 @@ function bindEvents() {
 
   dom.versionSearch?.addEventListener('input', (e) => {
     state.search = e.target.value;
-    renderVersionList();
+    renderInstanceList();
   });
 
   $$('.filter-chips .chip[data-filter]').forEach(chip => {
@@ -1867,7 +2222,7 @@ function bindEvents() {
       state.filter = chip.dataset.filter;
       local.sidebarFilter = state.filter;
       saveLocalState();
-      renderVersionList();
+      renderInstanceList();
     });
   });
 
@@ -1952,22 +2307,8 @@ function bindEvents() {
     saveLocalState();
   });
 
-  dom.addVersionBtn?.addEventListener('click', openCatalog);
-  dom.emptyAddBtn?.addEventListener('click', openCatalog);
-  dom.catalogClose?.addEventListener('click', closeCatalog);
-  dom.catalogModal?.addEventListener('click', (e) => { if (e.target === dom.catalogModal) closeCatalog(); });
-  dom.catalogSearch?.addEventListener('input', (e) => {
-    state.catalogSearch = e.target.value;
-    renderCatalog();
-  });
-  $$('.chip[data-catalog-filter]').forEach(chip => {
-    chip.addEventListener('click', () => {
-      chip.parentElement.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
-      chip.classList.add('active');
-      state.catalogFilter = chip.dataset.catalogFilter;
-      renderCatalog();
-    });
-  });
+  dom.addVersionBtn?.addEventListener('click', openNewInstanceFlow);
+  dom.emptyAddBtn?.addEventListener('click', openNewInstanceFlow);
 
   dom.onboardingNext1?.addEventListener('click', () => onboardingStep(2));
   dom.onboardingNext2?.addEventListener('click', () => onboardingStep(3));
@@ -2006,10 +2347,10 @@ function bindEvents() {
       else {
         appendLog('system', `Removed ${res.removed} versions`);
         state.versions = (await api('GET', '/versions')).versions || [];
-        state.selectedVersion = null;
+        state.selectedInstance = null;
         dom.versionDetail?.classList.add('hidden');
         dom.emptyState?.classList.remove('hidden');
-        renderVersionList();
+        renderInstanceList();
       }
     } catch (err) {
       showError(err.message);
@@ -2039,19 +2380,19 @@ function bindEvents() {
       else { Sound.ui('theme'); openSettings(); }
       return;
     }
-    if (Shortcuts.matches(e, 'addVersion')) {
+    if (Shortcuts.matches(e, 'newInstance')) {
       e.preventDefault();
       if (state.currentPage === 'settings') closeSettings();
       setPage('launcher');
-      Sound.ui('bright');
-      openCatalog();
+      openNewInstanceFlow();
       return;
     }
     if (Shortcuts.matches(e, 'launch')) {
       e.preventDefault();
       if (state.currentPage === 'settings') closeSettings();
       setPage('launcher');
-      if (state.selectedVersion?.launchable && !state.launching && !state.gameRunning) { Sound.ui('launchPress'); launchGame(); }
+      const selVer = state.selectedInstance ? state.versions.find(v => v.id === state.selectedInstance.version_id) : null;
+      if (selVer?.launchable && !state.launching && !state.gameRunning) { Sound.ui('launchPress'); launchGame(); }
       else { Sound.ui('soft'); dom.launchBtn?.focus(); }
       return;
     }
@@ -2071,12 +2412,13 @@ function bindEvents() {
       return;
     }
     if (Shortcuts.matches(e, 'close')) {
-      // Close in priority order: context menu > delete wizard > catalog > settings
+      // Close in priority order: context menu > delete wizard > new instance modal > settings
       const ctxMenu = document.getElementById('ctx-menu');
       const deleteModal = document.getElementById('delete-modal');
+      const niModal = document.getElementById('new-instance-modal');
       if (ctxMenu && !ctxMenu.classList.contains('hidden')) hideContextMenu();
       else if (deleteModal && !deleteModal.classList.contains('hidden')) closeDeleteWizard();
-      else if (!dom.catalogModal?.classList.contains('hidden')) closeCatalog();
+      else if (niModal) { niModal.remove(); Sound.ui('soft'); }
       else if (state.currentPage === 'settings') closeSettings();
     }
     if (e.key === 'Enter' && dom.onboarding && !dom.onboarding.classList.contains('hidden')) {

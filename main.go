@@ -10,6 +10,7 @@ import (
 
 	"github.com/mateoltd/croopor/frontend"
 	"github.com/mateoltd/croopor/internal/config"
+	"github.com/mateoltd/croopor/internal/instance"
 	"github.com/mateoltd/croopor/internal/minecraft"
 	"github.com/mateoltd/croopor/internal/server"
 )
@@ -52,6 +53,13 @@ func main() {
 		log.Printf("Minecraft directory not found — setup required")
 	}
 
+	// Load instance store
+	instances, err := instance.Load()
+	if err != nil {
+		log.Printf("Warning: could not load instances: %v (starting empty)", err)
+		instances = &instance.InstanceStore{}
+	}
+
 	// Set up embedded frontend filesystem
 	staticFS, err := fs.Sub(frontend.Static, "static")
 	if err != nil {
@@ -59,7 +67,7 @@ func main() {
 	}
 
 	// Create HTTP server
-	srv := server.NewServer(dir, cfg, staticFS)
+	srv := server.NewServer(dir, cfg, instances, staticFS)
 
 	// Bind to a port (0 = random available port)
 	addr := fmt.Sprintf("127.0.0.1:%d", *port)

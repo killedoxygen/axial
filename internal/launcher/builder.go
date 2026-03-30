@@ -17,22 +17,26 @@ import (
 
 // LaunchOptions holds parameters for launching a version.
 type LaunchOptions struct {
-	VersionID   string
-	Username    string
-	MaxMemoryMB int
-	MinMemoryMB int
-	MCDir       string
-	Config      *config.Config
+	VersionID    string
+	InstanceID   string
+	Username     string
+	MaxMemoryMB  int
+	MinMemoryMB  int
+	MCDir        string   // Shared .minecraft (assets, libraries, versions)
+	GameDir      string   // Instance game dir (saves, mods, config). Falls back to MCDir if empty.
+	ExtraJVMArgs []string // Additional JVM args from instance overrides
+	Config       *config.Config
 }
 
 // LaunchResult contains the constructed command and game process.
 type LaunchResult struct {
-	Command     []string
-	JavaPath    string
-	Process     *GameProcess
-	SessionID   string
-	NativesDir  string
-	VersionID   string
+	Command    []string
+	JavaPath   string
+	Process    *GameProcess
+	SessionID  string
+	NativesDir string
+	VersionID  string
+	InstanceID string
 }
 
 // BuildAndLaunch constructs the launch command and starts the game.
@@ -85,9 +89,9 @@ func BuildAndLaunch(opts LaunchOptions) (*LaunchResult, error) {
 		username = "Player"
 	}
 
-	gameDir := opts.MCDir
-	if opts.Config.JavaPathOverride != "" {
-		// Keep using .minecraft as game dir
+	gameDir := opts.GameDir
+	if gameDir == "" {
+		gameDir = opts.MCDir
 	}
 
 	// For pre-1.6 versions with virtual/legacy asset indexes,
@@ -158,12 +162,13 @@ func BuildAndLaunch(opts LaunchOptions) (*LaunchResult, error) {
 	}
 
 	// Step 12: Assemble full command
-	// Order: java [cds_args] [boot_args] [jvm_args] [gc_args] [mem_args] <mainClass> [game_args]
+	// Order: java [cds_args] [boot_args] [jvm_args] [gc_args] [extra_args] [mem_args] <mainClass> [game_args]
 	var cmdArgs []string
 	cmdArgs = append(cmdArgs, cdsArgs...)
 	cmdArgs = append(cmdArgs, bootArgs...)
 	cmdArgs = append(cmdArgs, jvmArgs...)
 	cmdArgs = append(cmdArgs, gcArgs...)
+	cmdArgs = append(cmdArgs, opts.ExtraJVMArgs...)
 	cmdArgs = append(cmdArgs, memArgs...)
 	cmdArgs = append(cmdArgs, version.MainClass)
 	cmdArgs = append(cmdArgs, gameArgs...)
@@ -185,6 +190,7 @@ func BuildAndLaunch(opts LaunchOptions) (*LaunchResult, error) {
 		SessionID:  sessionID,
 		NativesDir: nativesDir,
 		VersionID:  opts.VersionID,
+		InstanceID: opts.InstanceID,
 	}
 
 	// Step 14: Create and start game process

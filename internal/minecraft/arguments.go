@@ -3,7 +3,6 @@ package minecraft
 import (
 	"crypto/md5"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 )
@@ -82,7 +81,7 @@ func ResolveArguments(v *VersionJSON, env Environment, vars *LaunchVars) (jvmArg
 
 	// Add logging config if present
 	if v.Logging != nil && v.Logging.Client != nil {
-		logArg := resolveLoggingArg(v.Logging.Client, vars.GameDirectory)
+		logArg := resolveLoggingArg(v.Logging.Client, vars.AssetsRoot)
 		if logArg != "" {
 			jvmArgs = append(jvmArgs, logArg)
 		}
@@ -126,26 +125,11 @@ func defaultLegacyJVMArgs(varMap map[string]string) []string {
 	}
 }
 
-func resolveLoggingArg(entry *LoggingEntry, gameDir string) string {
+func resolveLoggingArg(entry *LoggingEntry, assetsRoot string) string {
 	if entry.Argument == "" || entry.File.ID == "" {
 		return ""
 	}
-
-	// The log config file is typically in assets/log_configs/
-	mcDir := filepath.Dir(gameDir)
-	if gameDir == mcDir {
-		mcDir = gameDir
-	}
-	logConfigPath := filepath.Join(gameDir, "assets", "log_configs", entry.File.ID)
-
-	// Check if file exists; if gameDir IS .minecraft, the path is correct
-	// If not, try the standard .minecraft location
-	if _, err := os.Stat(logConfigPath); os.IsNotExist(err) {
-		// gameDir might be .minecraft itself
-		logConfigPath = filepath.Join(gameDir, "assets", "log_configs", entry.File.ID)
-	}
-
-	// The argument template is like "-Dlog4j.configurationFile=${path}"
+	logConfigPath := filepath.Join(assetsRoot, "log_configs", entry.File.ID)
 	return strings.ReplaceAll(entry.Argument, "${path}", logConfigPath)
 }
 

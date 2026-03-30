@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/mateoltd/croopor/internal/config"
+	"github.com/mateoltd/croopor/internal/instance"
 	"github.com/mateoltd/croopor/internal/launcher"
 	"github.com/mateoltd/croopor/internal/minecraft"
 	"github.com/mateoltd/croopor/internal/system"
@@ -133,9 +134,6 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	if v, ok := updates["min_memory_mb"].(float64); ok && v > 0 {
 		s.config.MinMemoryMB = int(v)
 	}
-	if v, ok := updates["last_version_id"].(string); ok && v != "" {
-		s.config.LastVersionID = v
-	}
 	if v, ok := updates["java_path_override"].(string); ok {
 		s.config.JavaPathOverride = v
 	}
@@ -166,7 +164,7 @@ func (s *Server) handleOnboardingComplete(w http.ResponseWriter, r *http.Request
 }
 
 type launchRequest struct {
-	VersionID   string `json:"version_id"`
+	InstanceID  string `json:"instance_id"`
 	Username    string `json:"username"`
 	MaxMemoryMB int    `json:"max_memory_mb"`
 	MinMemoryMB int    `json:"min_memory_mb"`
@@ -178,20 +176,33 @@ func (s *Server) handleLaunch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
-	if req.VersionID == "" {
-		writeError(w, http.StatusBadRequest, "version_id is required")
+	if req.InstanceID == "" {
+		writeError(w, http.StatusBadRequest, "instance_id is required")
 		return
 	}
 
+	inst := s.instances.Get(req.InstanceID)
+	if inst == nil {
+		writeError(w, http.StatusNotFound, "instance not found")
+		return
+	}
+
+	// Resolve settings: instance overrides > request overrides > global config
 	username := req.Username
 	if username == "" {
 		username = s.config.Username
 	}
 	maxMem := req.MaxMemoryMB
+	if maxMem <= 0 && inst.MaxMemoryMB > 0 {
+		maxMem = inst.MaxMemoryMB
+	}
 	if maxMem <= 0 {
 		maxMem = s.config.MaxMemoryMB
 	}
 	minMem := req.MinMemoryMB
+	if minMem <= 0 && inst.MinMemoryMB > 0 {
+		minMem = inst.MinMemoryMB
+	}
 	if minMem <= 0 {
 		minMem = s.config.MinMemoryMB
 	}
@@ -202,7 +213,7 @@ func (s *Server) handleLaunch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Pre-launch integrity check: verify all critical files exist
-	integrity := minecraft.VerifyIntegrity(mcDir, req.VersionID)
+	integrity := minecraft.VerifyIntegrity(mcDir, inst.VersionID)
 	if !integrity.OK {
 		writeJSON(w, http.StatusConflict, map[string]any{
 			"error":  integrity.FormatIssues(),
@@ -211,13 +222,35 @@ func (s *Server) handleLaunch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Build effective config with instance overrides
+	effectiveConfig := *s.config
+	if inst.JavaPath != "" {
+		effectiveConfig.JavaPathOverride = inst.JavaPath
+	}
+	if inst.WindowWidth > 0 && inst.WindowHeight > 0 {
+		effectiveConfig.WindowWidth = inst.WindowWidth
+		effectiveConfig.WindowHeight = inst.WindowHeight
+	}
+	if inst.JVMPreset != "" {
+		effectiveConfig.JVMPreset = inst.JVMPreset
+	}
+
+	// Parse extra JVM args from instance
+	var extraJVMArgs []string
+	if inst.ExtraJVMArgs != "" {
+		extraJVMArgs = strings.Fields(inst.ExtraJVMArgs)
+	}
+
 	result, err := launcher.BuildAndLaunch(launcher.LaunchOptions{
-		VersionID:   req.VersionID,
-		Username:    username,
-		MaxMemoryMB: maxMem,
-		MinMemoryMB: minMem,
-		MCDir:       mcDir,
-		Config:      s.config,
+		VersionID:    inst.VersionID,
+		InstanceID:   inst.ID,
+		Username:     username,
+		MaxMemoryMB:  maxMem,
+		MinMemoryMB:  minMem,
+		MCDir:        mcDir,
+		GameDir:      instance.GameDir(inst.ID),
+		ExtraJVMArgs: extraJVMArgs,
+		Config:       &effectiveConfig,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -225,19 +258,22 @@ func (s *Server) handleLaunch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.sessions.Add(result)
-	if s.config.LastLaunched == nil {
-		s.config.LastLaunched = map[string]string{}
-	}
+
+	// Update instance last-played and store selection
 	launchedAt := time.Now().UTC().Format(time.RFC3339)
-	s.config.LastVersionID = req.VersionID
+	inst.LastPlayedAt = launchedAt
+	s.instances.Update(*inst)
+	s.instances.LastInstanceID = inst.ID
+	instance.Save(s.instances)
+
 	s.config.Username = username
 	s.config.MaxMemoryMB = maxMem
-	s.config.LastLaunched[req.VersionID] = launchedAt
 	config.Save(s.config)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":      "launching",
 		"session_id":  result.SessionID,
+		"instance_id": inst.ID,
 		"pid":         result.Process.PID(),
 		"launched_at": launchedAt,
 	})
@@ -514,21 +550,22 @@ func (s *Server) handleDeleteVersion(w http.ResponseWriter, r *http.Request) {
 		launcher.InvalidateCDSArchive(config.ConfigDir(), id)
 	}
 
-	// Clean up last_launched reference
-	if s.config.LastLaunched != nil {
+	// Find instances that reference deleted versions
+	var affectedInstances []string
+	for _, inst := range s.instances.Instances {
 		for _, id := range deleted {
-			delete(s.config.LastLaunched, id)
+			if inst.VersionID == id {
+				affectedInstances = append(affectedInstances, inst.Name)
+				break
+			}
 		}
 	}
-	if s.config.LastVersionID == versionID {
-		s.config.LastVersionID = ""
-	}
-	config.Save(s.config)
 
 	log.Printf("Deleted version(s): %v", deleted)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":  "ok",
-		"deleted": deleted,
+		"status":             "ok",
+		"deleted":            deleted,
+		"affected_instances": affectedInstances,
 	})
 }
 
