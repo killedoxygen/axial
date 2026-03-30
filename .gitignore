@@ -10,3 +10,6 @@ frontend/static/app.js
 
 # Local-only
 plans/
+assets/*.mp3
+assets/*.wav
+CHANGELOG-next.md

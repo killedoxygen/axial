@@ -4,6 +4,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -163,6 +165,13 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	if v, ok := updates["lightness"].(float64); ok {
 		i := int(v)
 		s.config.Lightness = &i
+	}
+	if v, ok := updates["music_enabled"].(bool); ok {
+		s.config.MusicEnabled = &v
+	}
+	if v, ok := updates["music_volume"].(float64); ok {
+		i := int(v)
+		s.config.MusicVolume = &i
 	}
 
 	if err := config.Save(s.config); err != nil {
@@ -800,4 +809,81 @@ func dirCount(path string) int {
 		return -1
 	}
 	return len(entries)
+}
+
+const (
+	musicRemoteURL = "https://github.com/mateoltd/croopor/releases/download/music-v1/celestial-drift-clean.mp3"
+	musicFileName  = "celestial-drift-clean.mp3"
+)
+
+var musicHTTPClient = &http.Client{Timeout: 2 * time.Minute}
+
+func musicLocalPath() string {
+	return filepath.Join(config.MusicDir(), musicFileName)
+}
+
+// handleMusicTrack serves the cached music file, downloading it on first request.
+// Uses http.ServeFile for zero-copy transfer with Range request support.
+func (s *Server) handleMusicTrack(w http.ResponseWriter, r *http.Request) {
+	localPath := musicLocalPath()
+
+	if _, err := os.Stat(localPath); err == nil {
+		http.ServeFile(w, r, localPath)
+		return
+	}
+
+	if err := downloadMusicFile(localPath); err != nil {
+		log.Printf("Music download failed: %v", err)
+		writeError(w, http.StatusBadGateway, "failed to download music: "+err.Error())
+		return
+	}
+
+	http.ServeFile(w, r, localPath)
+}
+
+func downloadMusicFile(localPath string) error {
+	if err := os.MkdirAll(filepath.Dir(localPath), 0755); err != nil {
+		return fmt.Errorf("create directory: %w", err)
+	}
+
+	log.Printf("Downloading background music from %s", musicRemoteURL)
+	resp, err := musicHTTPClient.Get(musicRemoteURL)
+	if err != nil {
+		return fmt.Errorf("request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	tmpPath := localPath + ".tmp"
+	f, err := os.Create(tmpPath)
+	if err != nil {
+		return fmt.Errorf("create file: %w", err)
+	}
+
+	if _, err := io.Copy(f, resp.Body); err != nil {
+		f.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("write: %w", err)
+	}
+	f.Close()
+
+	if err := os.Rename(tmpPath, localPath); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("finalize: %w", err)
+	}
+
+	log.Printf("Music cached at %s", localPath)
+	return nil
+}
+
+// handleMusicStatus returns whether the music file is cached locally.
+func (s *Server) handleMusicStatus(w http.ResponseWriter, r *http.Request) {
+	_, err := os.Stat(musicLocalPath())
+	writeJSON(w, http.StatusOK, map[string]any{
+		"cached": err == nil,
+		"track":  "celestial-drift-clean",
+	})
 }

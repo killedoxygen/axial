@@ -1,6 +1,7 @@
 import { state, dom, local, saveLocalState } from './state.js';
 import { api } from './api.js';
 import { Sound } from './sound.js';
+import { Music } from './music.js';
 import { esc, setPage } from './utils.js';
 import { positionFieldMarker } from './theme.js';
 import { renderShortcutEditor } from './shortcuts.js';
@@ -39,6 +40,7 @@ function syncSettingsForm() {
   dom.themePicker?.querySelectorAll('.theme-swatch').forEach(s => s.classList.toggle('active', s.dataset.theme === local.theme));
   positionFieldMarker(dom.colorField, dom.colorFieldMarker, local.customHue, local.customVibrancy);
   if (dom.soundsToggle) dom.soundsToggle.checked = Sound.enabled;
+  Music.syncUI();
   renderShortcutEditor();
 }
 

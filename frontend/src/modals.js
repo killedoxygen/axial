@@ -1,6 +1,7 @@
 import { state, dom, local } from './state.js';
 import { api } from './api.js';
 import { Sound } from './sound.js';
+import { Music } from './music.js';
 import { esc, fmtMem, showError, getMemoryRecommendation } from './utils.js';
 import { positionFieldMarker } from './theme.js';
 import { renderInstanceList } from './sidebar.js';
@@ -274,22 +275,25 @@ export function showOnboarding() {
 }
 
 export function onboardingStep(n) {
-  [dom.onboardingStep1, dom.onboardingStep2, dom.onboardingStep3, dom.onboardingStep4].forEach((s, i) => { if (s) s.classList.toggle('hidden', i !== n - 1); });
-  [dom.dot1, dom.dot2, dom.dot3, dom.dot4].forEach((d, i) => { if (d) d.classList.toggle('active', i === n - 1); });
+  [dom.onboardingStep1, dom.onboardingStep2, dom.onboardingStep3, dom.onboardingStep4, dom.onboardingStep5].forEach((s, i) => { if (s) s.classList.toggle('hidden', i !== n - 1); });
+  [dom.dot1, dom.dot2, dom.dot3, dom.dot4, dom.dot5].forEach((d, i) => { if (d) d.classList.toggle('active', i === n - 1); });
 }
 
 export async function finishOnboarding() {
   const username = dom.onboardingUsername?.value.trim() || 'Player';
   const memGB = parseFloat(dom.onboardingMemorySlider?.value || 4);
+  const musicEnabled = dom.obMusicYes?.classList.contains('active') ?? false;
   if (dom.usernameInput) dom.usernameInput.value = username;
   if (dom.memorySlider) {
     dom.memorySlider.value = memGB;
     if (dom.memoryValue) dom.memoryValue.textContent = fmtMem(memGB);
   }
   try {
-    const r = await api('PUT', '/config', { username, max_memory_mb: Math.round(memGB * 1024) });
+    const r = await api('PUT', '/config', { username, max_memory_mb: Math.round(memGB * 1024), music_enabled: musicEnabled, music_volume: 5 });
     if (!r.error) state.config = r;
   } catch {}
   try { await api('POST', '/onboarding/complete'); } catch {}
   dom.onboarding?.classList.add('hidden');
+  Music.applyConfig({ music_enabled: musicEnabled, music_volume: 5 });
+  if (musicEnabled) Music.play();
 }

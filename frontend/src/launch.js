@@ -1,6 +1,7 @@
 import { state, dom, API } from './state.js';
 import { api } from './api.js';
 import { Sound } from './sound.js';
+import { Music } from './music.js';
 import { fmtMem, showError, appendLog } from './utils.js';
 import { renderInstanceList } from './sidebar.js';
 import { refreshSelectedInstanceActionState } from './instance.js';
@@ -60,6 +61,7 @@ export async function launchGame() {
     };
 
     endLaunchSequence();
+    Music.suppress();
     Sound.ui('launchSuccess');
     if (dom.runningVersion) dom.runningVersion.textContent = `${inst.name} (${inst.version_id})`;
     if (dom.runningPid) dom.runningPid.textContent = `PID ${res.pid}`;
@@ -112,6 +114,9 @@ function onGameExited(exitCode, instanceId, sessionId) {
 
   if (session.eventSource) session.eventSource.close();
   delete state.runningSessions[instanceId];
+
+  // Resume music when all game sessions have ended
+  if (Object.keys(state.runningSessions).length === 0) Music.unsuppress();
 
   if (state.selectedInstance?.id === instanceId) {
     clearLaunchVisualState();

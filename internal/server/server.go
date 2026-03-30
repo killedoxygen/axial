@@ -82,6 +82,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/v1/setup/set-dir", s.handleSetupSetDir)
 	s.mux.HandleFunc("POST /api/v1/setup/init", s.handleSetupInit)
 	s.mux.HandleFunc("POST /api/v1/setup/browse", s.handleSetupBrowse)
+	s.mux.HandleFunc("GET /api/v1/music/track", s.handleMusicTrack)
+	s.mux.HandleFunc("GET /api/v1/music/status", s.handleMusicStatus)
 	registerDevRoutes(s)
 	s.mux.Handle("/", http.FileServer(http.FS(s.frontend)))
 }

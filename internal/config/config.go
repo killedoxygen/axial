@@ -22,6 +22,8 @@ type Config struct {
 	Lightness        *int   `json:"lightness,omitempty"`
 	OnboardingDone   bool   `json:"onboarding_done"`
 	MCDir            string `json:"mc_dir,omitempty"`
+	MusicEnabled     *bool  `json:"music_enabled,omitempty"`
+	MusicVolume      *int   `json:"music_volume,omitempty"`
 }
 
 var (
@@ -55,6 +57,10 @@ func ConfigDir() string {
 
 func ConfigPath() string {
 	return filepath.Join(ConfigDir(), "config.json")
+}
+
+func MusicDir() string {
+	return filepath.Join(ConfigDir(), "music")
 }
 
 func Load() (*Config, error) {

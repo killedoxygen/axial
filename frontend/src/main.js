@@ -1,6 +1,7 @@
 import { state, dom, local, $, $$, cacheDom, STORAGE_KEY, saveLocalState } from './state.js';
 import { api } from './api.js';
 import { Sound, bindButtonSounds, playSliderSound } from './sound.js';
+import { Music } from './music.js';
 import { applyTheme, initColorField, positionFieldMarker } from './theme.js';
 import { Shortcuts, syncShortcutHints, renderShortcutEditor, startRecording, handleRecordKey } from './shortcuts.js';
 import { fmtMem, showError, appendLog, setLogFilter, setPage, toggleShortcutHints, getMemoryRecommendation, updateMemoryRecText } from './utils.js';
@@ -65,6 +66,15 @@ async function init() {
       if (remembered) selectInstance(remembered, { silent: true });
     }
     if (state.config && !state.config.onboarding_done) showOnboarding();
+    else if (Music.enabled) {
+      const startMusic = () => {
+        window.removeEventListener('pointerdown', startMusic, true);
+        window.removeEventListener('keydown', startMusic, true);
+        Music.play();
+      };
+      window.addEventListener('pointerdown', startMusic, { once: false, capture: true });
+      window.addEventListener('keydown', startMusic, { once: false, capture: true });
+    }
     watchVersions();
   } catch (err) {
     if (dom.versionList) dom.versionList.innerHTML = `<div class="loading-placeholder"><span style="color:var(--red)">Failed to connect</span><span style="color:var(--text-muted);font-size:10px">${err.message}</span></div>`;
@@ -89,6 +99,7 @@ function applyConfig(cfg) {
       lightness: cfg.lightness ?? local.lightness,
     });
   }
+  Music.applyConfig(cfg);
 }
 
 function applySystemInfo(info) {
@@ -242,12 +253,39 @@ function bindEvents() {
     saveLocalState();
   });
 
+  // Music controls
+  dom.musicBtn?.addEventListener('click', () => {
+    Music.toggle();
+    Sound.ui(Music.enabled ? 'affirm' : 'soft');
+  });
+  dom.musicToggle?.addEventListener('change', () => {
+    if (dom.musicToggle.checked !== Music.enabled) Music.toggle();
+    Sound.ui(Music.enabled ? 'affirm' : 'soft');
+  });
+  dom.musicVolumeSlider?.addEventListener('input', () => {
+    Music.setVolume(parseInt(dom.musicVolumeSlider.value, 10));
+    Music.syncUI();
+  });
+
+  // Onboarding music buttons
+  dom.obMusicYes?.addEventListener('click', () => {
+    dom.obMusicYes?.classList.add('active');
+    dom.obMusicNo?.classList.remove('active');
+    Sound.ui('affirm');
+  });
+  dom.obMusicNo?.addEventListener('click', () => {
+    dom.obMusicNo?.classList.add('active');
+    dom.obMusicYes?.classList.remove('active');
+    Sound.ui('soft');
+  });
+
   dom.addVersionBtn?.addEventListener('click', openNewInstanceFlow);
   dom.emptyAddBtn?.addEventListener('click', openNewInstanceFlow);
 
   dom.onboardingNext1?.addEventListener('click', () => onboardingStep(2));
   dom.onboardingNext2?.addEventListener('click', () => onboardingStep(3));
   dom.onboardingNext3?.addEventListener('click', () => onboardingStep(4));
+  dom.onboardingNext4?.addEventListener('click', () => onboardingStep(5));
   dom.onboardingFinish?.addEventListener('click', finishOnboarding);
   dom.onboardingMemorySlider?.addEventListener('input', () => {
     const v = parseFloat(dom.onboardingMemorySlider.value);
@@ -367,7 +405,8 @@ function bindEvents() {
       if (!dom.onboardingStep1?.classList.contains('hidden')) onboardingStep(2);
       else if (!dom.onboardingStep2?.classList.contains('hidden')) onboardingStep(3);
       else if (!dom.onboardingStep3?.classList.contains('hidden')) onboardingStep(4);
-      else if (!dom.onboardingStep4?.classList.contains('hidden')) finishOnboarding();
+      else if (!dom.onboardingStep4?.classList.contains('hidden')) onboardingStep(5);
+      else if (!dom.onboardingStep5?.classList.contains('hidden')) finishOnboarding();
     }
   });
   document.addEventListener('keyup', (e) => {

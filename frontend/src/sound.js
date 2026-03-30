@@ -208,7 +208,8 @@ export const Sound = {
 };
 
 export function inferButtonSound(btn) {
-  if (btn.classList.contains('version-item') || btn.classList.contains('theme-swatch') || btn.classList.contains('ob-theme-btn') || btn.classList.contains('settings-nav-btn')) return null;
+  if (btn.classList.contains('version-item') || btn.classList.contains('theme-swatch') || btn.classList.contains('ob-theme-btn') || btn.classList.contains('ob-music-btn') || btn.classList.contains('settings-nav-btn')) return null;
+  if (btn.id === 'music-btn') return null;
   if (btn.classList.contains('chip')) return 'soft';
   if (btn.id === 'launch-btn') return 'launchPress';
   if (btn.id === 'add-version-btn' || btn.id === 'empty-add-btn') return 'bright';
