@@ -3,3 +3,7 @@ croopor.exe
 *.tar.gz
 *.syso
 *.exe
+
+# Frontend build artifacts
+frontend/node_modules/
+frontend/static/app.js

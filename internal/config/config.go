@@ -16,6 +16,10 @@ type Config struct {
 	WindowWidth      int    `json:"window_width,omitempty"`
 	WindowHeight     int    `json:"window_height,omitempty"`
 	JVMPreset        string `json:"jvm_preset,omitempty"`
+	Theme            string `json:"theme,omitempty"`
+	CustomHue        *int   `json:"custom_hue,omitempty"`
+	CustomVibrancy   *int   `json:"custom_vibrancy,omitempty"`
+	Lightness        *int   `json:"lightness,omitempty"`
 	OnboardingDone   bool   `json:"onboarding_done"`
 	MCDir            string `json:"mc_dir,omitempty"`
 }

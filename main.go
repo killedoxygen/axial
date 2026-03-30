@@ -15,7 +15,7 @@ import (
 	"github.com/mateoltd/croopor/internal/server"
 )
 
-var version = "1.0.1"
+var version = "1.1.0"
 
 func main() {
 	port := flag.Int("port", 0, "HTTP server port (0 = auto)")

@@ -17,7 +17,7 @@
         <div class="logo">
           <img class="logo-img" src="logo.svg" alt="Croopor" width="26" height="26">
           <span class="logo-text">Croopor</span>
-          <span class="logo-version">v1.0</span>
+          <span class="logo-version">v1.1</span>
         </div>
       </div>
       <div class="topbar-center">
@@ -162,10 +162,7 @@
                         <span class="running-uptime-label">Session Time</span>
                         <div class="running-uptime" id="running-uptime">0:00</div>
                       </div>
-                      <button class="kill-btn" id="kill-btn">
-                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><rect x="3" y="3" width="18" height="18" rx="2"></rect></svg>
-                        STOP
-                      </button>
+                      <button class="kill-btn" id="kill-btn">STOP</button>
                     </div>
                   </div>
                 </div>
@@ -309,10 +306,10 @@
                     <div class="setting-group">
                       <label class="setting-label" style="color:var(--amber)">Developer Tools</label>
                       <div class="dev-actions">
-                        <button class="btn-danger" id="dev-cleanup">Cleanup Versions</button>
+                        <button class="btn-danger" id="dev-cleanup">Cleanup All</button>
                         <button class="btn-danger" id="dev-flush">Flush All Data</button>
                       </div>
-                      <p class="setting-hint">Cleanup backs up worlds and mods then removes all versions. Flush resets Croopor to first-launch state.</p>
+                      <p class="setting-hint">Cleanup backs up instance data then removes all versions and instances. Flush resets Croopor to first-launch state (config, instances, runtimes).</p>
                     </div>
                   </div>
                 </section>
@@ -324,11 +321,13 @@
     </div>
 
     <div class="log-panel" id="log-panel">
-      <button class="log-toggle" id="log-toggle">
+      <div class="log-resize" id="log-resize"></div>
+      <div class="log-toggle" id="log-toggle">
         <svg class="log-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="18 15 12 9 6 15"></polyline></svg>
         <span>Game Output</span>
+        <select class="log-filter hidden" id="log-filter"><option value="all">All instances</option></select>
         <span class="log-count" id="log-count">0 lines</span>
-      </button>
+      </div>
       <div class="log-content" id="log-content">
         <div class="log-lines" id="log-lines"></div>
       </div>
