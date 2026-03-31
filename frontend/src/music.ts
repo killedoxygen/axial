@@ -93,7 +93,15 @@ export const Music = {
 
   setVolume(v: number): void {
     this.volume = Math.max(0, Math.min(100, v));
-    if (audio && !fadeRaf && !suppressed) audio.volume = this.targetVolume;
+    if (audio && !suppressed) {
+      if (fadeRaf) {
+        fadeFrom = audio.volume;
+        fadeTarget = this.targetVolume;
+        fadeStart = performance.now();
+      } else {
+        audio.volume = this.targetVolume;
+      }
+    }
     this.debouncedPersist();
     this.syncUI();
   },

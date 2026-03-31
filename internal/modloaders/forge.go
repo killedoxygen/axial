@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
@@ -135,8 +134,10 @@ func (f *forgeLoader) LoaderVersions(mcVersion string) ([]LoaderVersion, error) 
 		})
 	}
 
-	// Reverse so newest first
-	sort.Slice(versions, func(i, j int) bool { return i > j })
+	// Maven metadata is oldest-first; reverse to newest-first.
+	for i, j := 0, len(versions)-1; i < j; i, j = i+1, j-1 {
+		versions[i], versions[j] = versions[j], versions[i]
+	}
 
 	f.cache.Set(cacheKey, versions)
 	return versions, nil

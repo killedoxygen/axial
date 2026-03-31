@@ -119,14 +119,16 @@ export function InstanceDetail(): JSX.Element | null {
         <div class="instance-meta">{metaChildren}</div>
       </div>
       <div class="instance-links" id="instance-links">
-        <a class="instance-link" onClick={() => handleLinkClick('saves')}>Open saves</a>
-        <a
+        <button type="button" class="instance-link" onClick={() => handleLinkClick('saves')}>Open saves</button>
+        <button
+          type="button"
           class={`instance-link${isVanilla ? ' disabled' : ''}`}
           {...(isVanilla ? { title: 'No mod loader installed' } : {})}
+          disabled={isVanilla}
           {...(!isVanilla ? { onClick: () => handleLinkClick('mods') } : {})}
-        >Open mods</a>
-        <a class="instance-link" onClick={() => handleLinkClick('resourcepacks')}>Open resources</a>
-        <a class="instance-link" onClick={() => handleLinkClick('')}>Open folder</a>
+        >Open mods</button>
+        <button type="button" class="instance-link" onClick={() => handleLinkClick('resourcepacks')}>Open resources</button>
+        <button type="button" class="instance-link" onClick={() => handleLinkClick('')}>Open folder</button>
       </div>
     </>
   );

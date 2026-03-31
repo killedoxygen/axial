@@ -99,10 +99,17 @@ export function bindContextMenu(): void {
       },
     });
     if (!newName || newName === inst.name) return;
-    api('PUT', `/instances/${encodeURIComponent(inst.id)}`, { name: newName }).then(() => {
+    try {
+      const res = await api('PUT', `/instances/${encodeURIComponent(inst.id)}`, { name: newName });
+      if (res.error) {
+        showError(res.error);
+        return;
+      }
       updateInstanceInList({ ...(inst as any), name: newName });
-    });
-    Sound.ui('affirm');
+      Sound.ui('affirm');
+    } catch (err: unknown) {
+      showError((err as Error).message);
+    }
   });
 
   document.getElementById('ctx-delete')?.addEventListener('click', async () => {
@@ -112,11 +119,14 @@ export function bindContextMenu(): void {
       hideContextMenu();
       const ok: boolean = await showConfirm(`Delete instance "${inst.name}"?\nThis will remove saves, mods, and all instance data.`, { confirmText: 'Delete', destructive: true });
       if (!ok) return;
-      api('DELETE', `/instances/${encodeURIComponent(inst.id)}`).then((res: any) => {
+      try {
+        const res: any = await api('DELETE', `/instances/${encodeURIComponent(inst.id)}`);
         if (res.error) { showError(res.error); return; }
         removeInstance(inst.id);
         Sound.ui('affirm');
-      });
+      } catch (err: unknown) {
+        showError((err as Error).message);
+      }
     } else {
       const version: Record<string, any> = ctxMenuVersion;
       hideContextMenu();

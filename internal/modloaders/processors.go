@@ -63,7 +63,10 @@ func RunForgeProcessors(mcDir, mcVersion, versionID string, installProfileData, 
 	}
 
 	// Build data variable lookup
-	dataVars, tempDir := buildDataVars(profile.Data, mcDir, mcVersion, versionID, installerData)
+	dataVars, tempDir, err := buildDataVars(profile.Data, mcDir, mcVersion, versionID, installerData)
+	if err != nil {
+		return fmt.Errorf("building processor data vars: %w", err)
+	}
 	if tempDir != "" {
 		defer os.RemoveAll(tempDir)
 	}
@@ -227,7 +230,7 @@ func substituteArg(arg string, libPaths, dataVars map[string]string, libDir stri
 	return arg
 }
 
-func buildDataVars(data map[string]dataEntry, mcDir, mcVersion, versionID string, installerData []byte) (map[string]string, string) {
+func buildDataVars(data map[string]dataEntry, mcDir, mcVersion, versionID string, installerData []byte) (map[string]string, string, error) {
 	vars := map[string]string{}
 	tempDir := ""
 
@@ -253,12 +256,14 @@ func buildDataVars(data map[string]dataEntry, mcDir, mcVersion, versionID string
 				var err error
 				tempDir, err = os.MkdirTemp("", "forge-processors-")
 				if err != nil {
-					continue
+					return nil, tempDir, fmt.Errorf("creating temp dir for processor data: %w", err)
 				}
 			}
-			if extracted := extractFromInstallerJar(installerData, val[1:], tempDir); extracted != "" {
-				vars[key] = extracted
+			extracted := extractFromInstallerJar(installerData, val[1:], tempDir)
+			if extracted == "" {
+				return nil, tempDir, fmt.Errorf("extracting %s from installer", val)
 			}
+			vars[key] = extracted
 			continue
 		}
 
@@ -272,7 +277,7 @@ func buildDataVars(data map[string]dataEntry, mcDir, mcVersion, versionID string
 	vars["ROOT"] = mcDir
 	vars["LIBRARY_DIR"] = minecraft.LibrariesDir(mcDir)
 
-	return vars, tempDir
+	return vars, tempDir, nil
 }
 
 // extractFromInstallerJar extracts a single entry from the installer JAR ZIP to tempDir.
@@ -308,7 +313,7 @@ func extractFromInstallerJar(jarData []byte, entryPath, tempDir string) string {
 
 func findJavaForProcessors(mcDir string) (string, error) {
 	// Try common Java version components
-	components := []string{"java-runtime-delta", "java-runtime-gamma", "java-runtime-beta", "java-runtime-alpha"}
+	components := []string{"java-runtime-delta", "java-runtime-gamma", "java-runtime-beta", "java-runtime-alpha", "jre-legacy"}
 	for _, comp := range components {
 		result, err := minecraft.FindJava(mcDir, minecraft.JavaVersion{Component: comp, MajorVersion: 21}, "")
 		if err == nil {

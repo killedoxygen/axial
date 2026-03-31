@@ -26,7 +26,11 @@ export const Shortcuts = {
     if (!b) return false;
     const key = b.key.length === 1 ? b.key.toLowerCase() : b.key;
     const eKey = e.key.length === 1 ? e.key.toLowerCase() : e.key;
-    return eKey === key && !!e.ctrlKey === !!b.ctrl && !!e.shiftKey === !!b.shift && !!e.altKey === !!b.alt;
+    return eKey === key
+      && !!e.ctrlKey === !!b.ctrl
+      && !!e.shiftKey === !!b.shift
+      && !!e.altKey === !!b.alt
+      && !!e.metaKey === !!b.meta;
   },
   format(action: string): string {
     const b = this.get(action);
@@ -35,6 +39,7 @@ export const Shortcuts = {
     if (b.ctrl) parts.push('Ctrl');
     if (b.shift) parts.push('Shift');
     if (b.alt) parts.push('Alt');
+    if (b.meta) parts.push('Meta');
     const k = b.key === ' ' ? 'Space' : b.key === ',' ? ',' : b.key.length === 1 ? b.key.toUpperCase() : b.key;
     parts.push(k);
     return parts.join('+');
@@ -73,7 +78,14 @@ export function handleRecordKey(e: KeyboardEvent): boolean {
   e.preventDefault(); e.stopPropagation();
   if (e.key === 'Escape') { stopRecording(); return true; }
   if (['Control', 'Shift', 'Alt', 'Meta'].includes(e.key)) return true;
-  Shortcuts.set(action, { key: e.key, ctrl: e.ctrlKey, shift: e.shiftKey, alt: e.altKey, desc: Shortcuts.get(action)!.desc });
+  Shortcuts.set(action, {
+    key: e.key,
+    ctrl: e.ctrlKey,
+    shift: e.shiftKey,
+    alt: e.altKey,
+    meta: e.metaKey,
+    desc: Shortcuts.get(action)!.desc,
+  });
   local.shortcuts = { ...Shortcuts._custom };
   saveLocalState();
   stopRecording();

@@ -170,6 +170,8 @@ export function InstanceItem({ instance, version, index, onContextMenu }: Instan
     if (isModded) return 'MOD';
     if (version?.type === 'release') return 'REL';
     if (version?.type === 'snapshot') return 'SNAP';
+    if (version?.type === 'old_beta') return 'BETA';
+    if (version?.type === 'old_alpha') return 'ALPH';
     return version?.type?.toUpperCase()?.slice(0, 4) || '?';
   });
 

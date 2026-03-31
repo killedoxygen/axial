@@ -180,9 +180,11 @@ async function connectVanillaEvents(installId: string, versionId: string): Promi
   });
 
   es.onerror = () => {
+    if (es.readyState !== EventSource.CLOSED) return;
     void (async () => {
       const active = installState.value;
       if (active.status === 'active' && active.versionId === versionId) {
+        showError('Install event stream closed unexpectedly');
         await onInstallDone();
       }
     })();
@@ -289,6 +291,7 @@ async function onInstallDone(): Promise<void> {
 
   try {
     const res = await api('GET', '/versions');
+    if (res.error) throw new Error(res.error);
     const nextVersions = res.versions || [];
     versions.value = nextVersions;
 
@@ -304,7 +307,9 @@ async function onInstallDone(): Promise<void> {
         })),
       };
     }
-  } catch {}
+  } catch (err: unknown) {
+    showError(`Install completed, but failed to refresh versions: ${(err as Error).message}`);
+  }
 
   processNextInstall();
 }

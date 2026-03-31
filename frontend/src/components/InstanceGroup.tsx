@@ -28,7 +28,8 @@ export function InstanceGroup({ groupKey, label, instances, versionMap, onContex
 
   return (
     <>
-      <div
+      <button
+        type="button"
         class={`version-group-label${collapsed.value ? ' collapsed' : ''}`}
         data-group={groupKey}
         onClick={() => handleToggle()}
@@ -36,7 +37,7 @@ export function InstanceGroup({ groupKey, label, instances, versionMap, onContex
         <span dangerouslySetInnerHTML={{ __html: CHEVRON_SVG }} />
         {label}{' '}
         <span style="opacity:.4;font-weight:400;margin-left:2px">{instances.length}</span>
-      </div>
+      </button>
       <div
         class={`version-group-items${collapsed.value ? ' collapsed' : ''}`}
         data-group-items={groupKey}

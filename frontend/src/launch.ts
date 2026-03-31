@@ -51,6 +51,8 @@ export async function launchGame(): Promise<void> {
   startLaunch(inst.id);
   requestAnimationFrame(() => startLaunchSequence());
 
+  let launchCommitted = false;
+
   try {
     const res = await api('POST', '/launch', {
       instance_id: inst.id,
@@ -73,11 +75,17 @@ export async function launchGame(): Promise<void> {
       launchedAt,
       allocatedMB: maxMemMB,
     });
+    launchCommitted = true;
     endLaunchSequence();
     Music.suppress();
     Sound.ui('launchSuccess');
     byId<HTMLElement>('log-panel')?.classList.add('expanded');
-    await connectLaunchEvents(res.session_id, inst.id, inst.name);
+    try {
+      await connectLaunchEvents(res.session_id, inst.id, inst.name);
+    } catch (err: unknown) {
+      showError(`Game launched, but live updates failed: ${(err as Error).message}`);
+      appendLog('system', `Live updates unavailable for ${inst.name}; stop detection may be delayed.`, inst.id, inst.name);
+    }
 
     updateInstanceInList({ ...inst, last_played_at: launchedAt });
     if (config.value) {
@@ -89,7 +97,7 @@ export async function launchGame(): Promise<void> {
     }
   } catch (err: unknown) {
     showError((err as Error).message);
-    resetFailedLaunch(inst.id);
+    if (!launchCommitted) resetFailedLaunch(inst.id);
   }
 }
 
@@ -138,6 +146,7 @@ async function connectLaunchEvents(sessionId: string, instanceId: string, instan
   });
 
   es.onerror = () => {
+    if (es.readyState !== EventSource.CLOSED) return;
     if (runningSessions.value[instanceId]?.sessionId === sessionId) {
       onGameExited(-1, instanceId, instanceName, sessionId, es);
     }

@@ -89,9 +89,11 @@ export function NewInstanceModal(): JSX.Element | null {
     (async () => {
       if (!catalog.value) {
         try {
-          catalog.value = await api('GET', '/catalog');
-        } catch {
-          showError('Failed to load version catalog');
+          const res = await api('GET', '/catalog');
+          if (res.error) throw new Error(res.error);
+          catalog.value = res;
+        } catch (err: unknown) {
+          showError(`Failed to load version catalog: ${(err as Error).message}`);
           showNewInstanceModal.value = false;
           return;
         }
@@ -145,6 +147,22 @@ export function NewInstanceModal(): JSX.Element | null {
     search.value = e.currentTarget.value;
     page.value = 0;
   };
+
+  useEffect(() => {
+    if (filteredVersions.length === 0) {
+      selectedVersionId.value = null;
+      loaderVersionsList.value = null;
+      selectedLoaderVersion.value = null;
+      return;
+    }
+    if (selectedVersionId.value && filteredVersions.some((version) => version.id === selectedVersionId.value)) return;
+
+    const nextId = filteredVersions[0].id;
+    selectedVersionId.value = nextId;
+    if (isAutoName(name.value.trim())) name.value = defaultName();
+    nameError.value = null;
+    if (loaderEnabled.value) void updateLoaderVersionInfo(nextId);
+  }, [filteredVersions, loaderEnabled.value]);
 
   const handleNameInput = (e: JSX.TargetedEvent<HTMLInputElement>) => {
     name.value = e.currentTarget.value;
@@ -378,8 +396,9 @@ export function NewInstanceModal(): JSX.Element | null {
                     const selected = v.id === selectedVersionId.value;
                     const pd = parseVersionDisplay(v.id, v, allVersions);
                     return (
-                      <div
+                      <button
                         key={v.id}
+                        type="button"
                         class={`ni-version-item${selected ? ' selected' : ''}`}
                         onClick={() => selectVersion(v.id)}
                       >
@@ -392,7 +411,7 @@ export function NewInstanceModal(): JSX.Element | null {
                           }}
                         />
                         {v.installed && <span class="ni-installed-badge">Installed</span>}
-                      </div>
+                      </button>
                     );
                   })}
                   {totalPages > 1 && (

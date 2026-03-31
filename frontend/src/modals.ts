@@ -20,18 +20,26 @@ export function closeNewInstanceFlow(): void {
 }
 
 export function showSetup(): Promise<void> {
-  return new Promise(async (resolve: () => void) => {
-    byId<HTMLElement>('setup-overlay')?.classList.remove('hidden');
+  return new Promise((resolve: () => void) => {
+    const overlay = byId<HTMLElement>('setup-overlay');
+    const setupUseBtn = byId<HTMLButtonElement>('setup-use-btn');
+    const setupBrowseBtn = byId<HTMLButtonElement>('setup-browse-btn');
+    const setupInitBtn = byId<HTMLButtonElement>('setup-init-btn');
+    overlay?.classList.remove('hidden');
 
-    // Load the default path for the "create new" option
-    try {
-      const defaults: any = await api('GET', '/setup/defaults');
-      const setupNewPath = byId<HTMLInputElement>('setup-new-path');
-      if (setupNewPath) setupNewPath.value = defaults.default_path || '';
-    } catch (err: unknown) {}
+    void (async () => {
+      try {
+        const defaults: any = await api('GET', '/setup/defaults');
+        const setupNewPath = byId<HTMLInputElement>('setup-new-path');
+        if (setupNewPath) setupNewPath.value = defaults.default_path || '';
+      } catch (err: unknown) {}
+    })();
 
     function hideSetup(): void {
-      byId<HTMLElement>('setup-overlay')?.classList.add('hidden');
+      if (setupUseBtn) setupUseBtn.onclick = null;
+      if (setupBrowseBtn) setupBrowseBtn.onclick = null;
+      if (setupInitBtn) setupInitBtn.onclick = null;
+      overlay?.classList.add('hidden');
       resolve();
     }
 
@@ -47,12 +55,11 @@ export function showSetup(): Promise<void> {
     }
 
     // "Use this path" flow
-    byId<HTMLButtonElement>('setup-use-btn')?.addEventListener('click', async () => {
-      const setupUseBtn = byId<HTMLButtonElement>('setup-use-btn');
+    if (setupUseBtn) {
+      setupUseBtn.onclick = async () => {
       clearPathError();
       const path: string | undefined = byId<HTMLInputElement>('setup-path-input')?.value.trim();
       if (!path) { showPathError('Please enter a path'); return; }
-      if (!setupUseBtn) return;
       setupUseBtn.disabled = true;
       setupUseBtn.textContent = 'Checking...';
       try {
@@ -65,12 +72,12 @@ export function showSetup(): Promise<void> {
         setupUseBtn.disabled = false;
         setupUseBtn.textContent = 'Use this path';
       }
-    });
+      };
+    }
 
     // "Browse" button
-    byId<HTMLButtonElement>('setup-browse-btn')?.addEventListener('click', async () => {
-      const setupBrowseBtn = byId<HTMLButtonElement>('setup-browse-btn');
-      if (!setupBrowseBtn) return;
+    if (setupBrowseBtn) {
+      setupBrowseBtn.onclick = async () => {
       setupBrowseBtn.disabled = true;
       setupBrowseBtn.textContent = 'Opening...';
       try {
@@ -90,17 +97,19 @@ export function showSetup(): Promise<void> {
           if (setupPathInput) setupPathInput.value = res.path;
           clearPathError();
         }
-      } catch (err: unknown) {}
-      setupBrowseBtn.disabled = false;
-      setupBrowseBtn.textContent = 'Browse';
-    });
+      } catch (err: unknown) {
+      } finally {
+        setupBrowseBtn.disabled = false;
+        setupBrowseBtn.textContent = 'Browse';
+      }
+      };
+    }
 
     // "Create & Continue" flow
-    byId<HTMLButtonElement>('setup-init-btn')?.addEventListener('click', async () => {
-      const setupInitBtn = byId<HTMLButtonElement>('setup-init-btn');
+    if (setupInitBtn) {
+      setupInitBtn.onclick = async () => {
       const path: string | undefined = byId<HTMLInputElement>('setup-new-path')?.value.trim();
       if (!path) return;
-      if (!setupInitBtn) return;
       setupInitBtn.disabled = true;
       setupInitBtn.textContent = 'Creating...';
       try {
@@ -113,7 +122,8 @@ export function showSetup(): Promise<void> {
         setupInitBtn.disabled = false;
         setupInitBtn.textContent = 'Create & Continue';
       }
-    });
+      };
+    }
   });
 }
 

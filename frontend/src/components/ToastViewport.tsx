@@ -2,12 +2,11 @@ import type { JSX } from 'preact';
 import { toasts } from '../store';
 import { dismissToast } from '../toast';
 
-export function ToastViewport(): JSX.Element | null {
+export function ToastViewport(): JSX.Element {
   const items = toasts.value;
-  if (items.length === 0) return null;
 
   return (
-    <div class="app-toast-viewport" aria-live="polite" aria-atomic="true">
+    <div class="app-toast-viewport" aria-live="polite" aria-atomic="true" role="status">
       {items.map((toast) => (
         <button
           key={toast.id}

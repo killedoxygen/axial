@@ -18,6 +18,29 @@ interface PromptOptions {
   validate?: (val: string) => string | null;
 }
 
+const FOCUSABLE_SELECTOR = 'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])';
+
+function trapDialogFocus(dialog: HTMLElement, e: KeyboardEvent): void {
+  if (e.key !== 'Tab') return;
+  const focusable = Array.from(dialog.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR))
+    .filter((el) => !el.hasAttribute('disabled') && el.tabIndex !== -1);
+  if (focusable.length === 0) {
+    e.preventDefault();
+    return;
+  }
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  const active = document.activeElement as HTMLElement | null;
+
+  if (e.shiftKey && active === first) {
+    e.preventDefault();
+    last.focus();
+  } else if (!e.shiftKey && active === last) {
+    e.preventDefault();
+    first.focus();
+  }
+}
+
 // ── Confirm dialog component ──
 
 function ConfirmDialog({ message, options, onResult }: {
@@ -25,6 +48,7 @@ function ConfirmDialog({ message, options, onResult }: {
   options: Required<Pick<ConfirmOptions, 'confirmText' | 'cancelText'>> & { destructive: boolean };
   onResult: (result: boolean) => void;
 }): JSX.Element {
+  const dialogRef = useRef<HTMLDivElement>(null);
   const confirmRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => { confirmRef.current?.focus(); }, []);
@@ -35,7 +59,17 @@ function ConfirmDialog({ message, options, onResult }: {
       id="dialog-overlay"
       onClick={(e) => { if (e.target === e.currentTarget) onResult(false); }}
     >
-      <div class="modal" style="width:380px">
+      <div
+        ref={dialogRef}
+        class="modal"
+        style="width:380px"
+        role="dialog"
+        aria-modal="true"
+        onKeyDown={(e) => {
+          if (e.key === 'Escape') onResult(false);
+          if (dialogRef.current) trapDialogFocus(dialogRef.current, e as KeyboardEvent);
+        }}
+      >
         <div style="padding:20px 18px 8px">
           <p style="margin:0;font-family:var(--font-sans);font-size:13px;color:var(--text);line-height:1.5;white-space:pre-line">
             {message}
@@ -66,6 +100,7 @@ function PromptDialog({ message, defaultValue, options, onResult }: {
   options: Required<Pick<PromptOptions, 'confirmText' | 'cancelText'>> & { validate?: (val: string) => string | null };
   onResult: (result: string | null) => void;
 }): JSX.Element {
+  const dialogRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const inputValue = useSignal(defaultValue);
   const error = useSignal<string | null>(null);
@@ -95,7 +130,17 @@ function PromptDialog({ message, defaultValue, options, onResult }: {
       id="dialog-overlay"
       onClick={(e) => { if (e.target === e.currentTarget) onResult(null); }}
     >
-      <div class="modal" style="width:380px">
+      <div
+        ref={dialogRef}
+        class="modal"
+        style="width:380px"
+        role="dialog"
+        aria-modal="true"
+        onKeyDown={(e) => {
+          if (e.key === 'Escape') onResult(null);
+          if (dialogRef.current) trapDialogFocus(dialogRef.current, e as KeyboardEvent);
+        }}
+      >
         <div style="padding:20px 18px 8px;display:flex;flex-direction:column;gap:10px">
           <p style="margin:0;font-family:var(--font-sans);font-size:13px;color:var(--text);line-height:1.5">
             {message}

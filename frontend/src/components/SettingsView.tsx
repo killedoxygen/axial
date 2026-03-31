@@ -1,5 +1,5 @@
 import type { JSX } from 'preact';
-import { useEffect } from 'preact/hooks';
+import { useEffect, useRef } from 'preact/hooks';
 import { devMode } from '../store';
 import { PRESET_HUES, local, localStateVersion, saveLocalState } from '../state';
 import { Music, musicStateVersion } from '../music';
@@ -44,6 +44,7 @@ function markerStyle(): JSX.CSSProperties {
 }
 
 export function SettingsView(): JSX.Element {
+  const soundDisableTimer = useRef<number | null>(null);
   localStateVersion.value;
   musicStateVersion.value;
   const isDevMode = devMode.value;
@@ -65,6 +66,10 @@ export function SettingsView(): JSX.Element {
       },
       () => applyTheme('custom', local.customHue, { vibrancy: local.customVibrancy }),
     );
+  }, []);
+
+  useEffect(() => () => {
+    if (soundDisableTimer.current != null) window.clearTimeout(soundDisableTimer.current);
   }, []);
 
   return (
@@ -159,11 +164,19 @@ export function SettingsView(): JSX.Element {
                 onChange={(e) => {
                   const next = (e.currentTarget as HTMLInputElement).checked;
                   if (next) {
+                    if (soundDisableTimer.current != null) {
+                      window.clearTimeout(soundDisableTimer.current);
+                      soundDisableTimer.current = null;
+                    }
                     Sound.enabled = true;
                     Sound.ui('theme');
                   } else {
                     Sound.ui('soft');
-                    setTimeout(() => { Sound.enabled = false; }, 40);
+                    if (soundDisableTimer.current != null) window.clearTimeout(soundDisableTimer.current);
+                    soundDisableTimer.current = window.setTimeout(() => {
+                      Sound.enabled = false;
+                      soundDisableTimer.current = null;
+                    }, 40);
                   }
                   local.sounds = next;
                   saveLocalState();

@@ -300,9 +300,10 @@ func (d *Downloader) downloadFile(url, destPath, expectedSHA1 string) error {
 // DownloadFile downloads a URL to destPath with optional SHA1 verification.
 // It writes to a .tmp file first and renames on success for atomicity.
 func DownloadFile(client *http.Client, url, destPath, expectedSHA1 string) error {
-	os.MkdirAll(filepath.Dir(destPath), 0755)
+	if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+		return err
+	}
 
-	tmpPath := destPath + ".tmp"
 	resp, err := client.Get(url)
 	if err != nil {
 		return fmt.Errorf("GET %s: %w", url, err)
@@ -313,23 +314,25 @@ func DownloadFile(client *http.Client, url, destPath, expectedSHA1 string) error
 		return fmt.Errorf("GET %s: status %d", url, resp.StatusCode)
 	}
 
-	out, err := os.Create(tmpPath)
+	out, err := os.CreateTemp(filepath.Dir(destPath), filepath.Base(destPath)+".*.tmp")
 	if err != nil {
 		return err
 	}
+	tmpPath := out.Name()
+	defer os.Remove(tmpPath)
 
 	h := sha1.New()
 	if _, err := io.Copy(io.MultiWriter(out, h), resp.Body); err != nil {
 		out.Close()
-		os.Remove(tmpPath)
 		return err
 	}
-	out.Close()
+	if err := out.Close(); err != nil {
+		return err
+	}
 
 	if expectedSHA1 != "" {
 		actual := hex.EncodeToString(h.Sum(nil))
 		if actual != expectedSHA1 {
-			os.Remove(tmpPath)
 			return fmt.Errorf("SHA1 mismatch for %s", filepath.Base(destPath))
 		}
 	}

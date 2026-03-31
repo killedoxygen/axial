@@ -24,14 +24,14 @@ export function appendLog(source: string, text: string, instanceId?: string, ins
   line.appendChild(ts);
 
   // Instance tag (hidden by CSS unless .multi)
-  if (instanceName) {
+  if (instanceName && instanceId) {
     const tag = document.createElement('span');
     tag.className = 'log-tag';
     tag.textContent = instanceName;
     line.appendChild(tag);
 
-    if (!loggedInstances.has(instanceId!)) {
-      loggedInstances.add(instanceId!);
+    if (!loggedInstances.has(instanceId)) {
+      loggedInstances.add(instanceId);
       if (loggedInstances.size > 1) logLinesEl?.classList.add('multi');
       syncLogFilter();
     }

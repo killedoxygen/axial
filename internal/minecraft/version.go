@@ -206,7 +206,11 @@ func MavenToPath(coordinate string) string {
 	// Handle @extension syntax: group:artifact:version:classifier@extension
 	ext := ".jar"
 	if atIdx := strings.LastIndex(coordinate, "@"); atIdx >= 0 {
-		ext = "." + coordinate[atIdx+1:]
+		rawExt := strings.TrimSpace(coordinate[atIdx+1:])
+		if rawExt != "" {
+			rawExt = strings.TrimPrefix(rawExt, ".")
+			ext = "." + rawExt
+		}
 		coordinate = coordinate[:atIdx]
 	}
 

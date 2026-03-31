@@ -143,6 +143,7 @@ export interface ShortcutBinding {
   ctrl?: boolean;
   shift?: boolean;
   alt?: boolean;
+  meta?: boolean;
   desc: string;
 }
 

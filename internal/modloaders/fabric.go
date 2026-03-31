@@ -164,7 +164,9 @@ func (f *fabricLoader) Install(mcDir, mcVersion, loaderVersion string, progress 
 	if err := os.MkdirAll(versionDir, 0755); err != nil {
 		return nil, fmt.Errorf("creating version directory: %w", err)
 	}
-	os.WriteFile(markerPath, []byte("installing"), 0644)
+	if err := os.WriteFile(markerPath, []byte("installing"), 0644); err != nil {
+		return nil, fmt.Errorf("creating incomplete marker: %w", err)
+	}
 
 	if err := os.WriteFile(jsonPath, profileData, 0644); err != nil {
 		return nil, fmt.Errorf("writing version JSON: %w", err)
@@ -182,7 +184,9 @@ func (f *fabricLoader) Install(mcDir, mcVersion, loaderVersion string, progress 
 
 	// Remove incomplete marker — loader-specific install is done.
 	// The base game install will add its own marker for the vanilla version.
-	os.Remove(markerPath)
+	if err := os.Remove(markerPath); err != nil {
+		return nil, fmt.Errorf("removing incomplete marker: %w", err)
+	}
 
 	return &InstallResult{VersionID: versionID, GameVersion: mcVersion, LoaderType: Fabric}, nil
 }

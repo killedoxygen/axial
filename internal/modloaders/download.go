@@ -19,12 +19,18 @@ func DownloadLibraries(libs []minecraft.Library, mcDir string, progress chan<- P
 	env := minecraft.DefaultEnvironment()
 	filtered := minecraft.FilterLibraries(libs, env)
 
-	total := len(filtered)
-	for i, lib := range filtered {
-		libPath, libURL, libSHA1 := minecraft.ResolveLibDownload(lib, mcDir)
+	resolvable := make([]minecraft.Library, 0, len(filtered))
+	for _, lib := range filtered {
+		libPath, libURL, _ := minecraft.ResolveLibDownload(lib, mcDir)
 		if libPath == "" || libURL == "" {
 			continue
 		}
+		resolvable = append(resolvable, lib)
+	}
+
+	total := len(resolvable)
+	for i, lib := range resolvable {
+		libPath, libURL, libSHA1 := minecraft.ResolveLibDownload(lib, mcDir)
 
 		progress <- Progress{
 			Phase:   "loader_libraries",

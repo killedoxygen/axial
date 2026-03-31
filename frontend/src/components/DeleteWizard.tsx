@@ -99,6 +99,7 @@ export function DeleteWizard(): JSX.Element | null {
 
       try {
         const versionsRes = await api('GET', '/versions');
+        if (versionsRes.error) throw new Error(versionsRes.error);
         const nextVersions = versionsRes.versions || [];
         versions.value = nextVersions;
 
@@ -112,7 +113,9 @@ export function DeleteWizard(): JSX.Element | null {
             })),
           };
         }
-      } catch {}
+      } catch (err: unknown) {
+        showError(`Deleted ${versionId}, but failed to refresh versions: ${(err as Error).message}`);
+      }
     } catch (err: unknown) {
       closeDeleteWizard();
       showError(`Delete failed: ${(err as Error).message}`);

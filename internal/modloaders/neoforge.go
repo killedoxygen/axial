@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
@@ -112,8 +111,10 @@ func (n *neoforgeLoader) LoaderVersions(mcVersion string) ([]LoaderVersion, erro
 		})
 	}
 
-	// Reverse so newest first
-	sort.Slice(versions, func(i, j int) bool { return i > j })
+	// Maven metadata is oldest-first; reverse to newest-first.
+	for i, j := 0, len(versions)-1; i < j; i, j = i+1, j-1 {
+		versions[i], versions[j] = versions[j], versions[i]
+	}
 
 	n.cache.Set(cacheKey, versions)
 	return versions, nil
@@ -165,7 +166,9 @@ func (n *neoforgeLoader) Install(mcDir, mcVersion, loaderVersion string, progres
 	if err := os.MkdirAll(versionDir, 0755); err != nil {
 		return nil, fmt.Errorf("creating version directory: %w", err)
 	}
-	os.WriteFile(markerPath, []byte("installing"), 0644)
+	if err := os.WriteFile(markerPath, []byte("installing"), 0644); err != nil {
+		return nil, fmt.Errorf("creating incomplete marker: %w", err)
+	}
 
 	if err := os.WriteFile(jsonPath, versionJSON, 0644); err != nil {
 		return nil, fmt.Errorf("writing version JSON: %w", err)
@@ -195,7 +198,9 @@ func (n *neoforgeLoader) Install(mcDir, mcVersion, loaderVersion string, progres
 		}
 	}
 
-	os.Remove(markerPath)
+	if err := os.Remove(markerPath); err != nil {
+		return nil, fmt.Errorf("removing incomplete marker: %w", err)
+	}
 	return &InstallResult{VersionID: versionID, GameVersion: mcVersion, LoaderType: NeoForge}, nil
 }
 
@@ -223,6 +228,9 @@ func (n *neoforgeLoader) fetchMavenVersions() ([]string, error) {
 
 	var meta mavenMetadata
 	if err := xml.NewDecoder(resp.Body).Decode(&meta); err != nil {
+		if data, ok, _ := n.cache.Get(cacheKey); ok {
+			return data.([]string), nil
+		}
 		return nil, fmt.Errorf("parsing neoforge maven metadata: %w", err)
 	}
 

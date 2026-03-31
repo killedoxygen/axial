@@ -93,8 +93,8 @@ export function connectLoaderInstallSSE(
   });
 
   es.onerror = (): void => {
+    if (es.readyState !== EventSource.CLOSED) return;
     onError('Connection lost');
-    es.close();
   };
 
   return es;

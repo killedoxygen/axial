@@ -191,11 +191,15 @@ function bindEvents(): void {
     playSliderSound(v / parseFloat(slider.max || '16'), 'memory');
   });
 
-  usernameInput?.addEventListener('blur', () => {
+  usernameInput?.addEventListener('blur', async () => {
     const u: string = usernameInput.value.trim();
     if (u && u !== config.value?.username) {
-      api('PUT', '/config', { username: u });
-      if (config.value) config.value = { ...config.value, username: u };
+      try {
+        await api('PUT', '/config', { username: u });
+        if (config.value) config.value = { ...config.value, username: u };
+      } catch (err: unknown) {
+        showError((err as Error).message);
+      }
     }
   });
 

@@ -34,8 +34,7 @@ export const selectedVersion = computed<Version | null>(() => {
 
 export type InstallState =
   | { status: 'idle' }
-  | { status: 'active'; versionId: string; pct: number; label: string }
-  | { status: 'complete'; versionId: string };
+  | { status: 'active'; versionId: string; pct: number; label: string };
 
 export const installState = signal<InstallState>({ status: 'idle' });
 export const installQueue = signal<InstallItem[]>([]);
