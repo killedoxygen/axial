@@ -23,14 +23,16 @@ jobs:
 
       - uses: arduino/setup-task@v2
 
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+          run_install: false
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: pnpm
           cache-dependency-path: frontend/pnpm-lock.yaml
-
-      - name: Enable corepack
-        run: corepack enable
 
       - name: Install frontend dependencies
         run: task frontend:install
@@ -53,14 +55,16 @@ jobs:
 
       - uses: arduino/setup-task@v2
 
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+          run_install: false
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: pnpm
           cache-dependency-path: frontend/pnpm-lock.yaml
-
-      - name: Enable corepack
-        run: corepack enable
 
       - uses: actions/setup-go@v5
         with:
