@@ -2,6 +2,8 @@ version: "3"
 
 env:
   GOCACHE: "{{.TASKFILE_DIR}}/.cache/go-build"
+  COREPACK_HOME: "{{.TASKFILE_DIR}}/.cache/corepack"
+  PNPM: pnpm
 
 vars:
   FRONTEND_DIR: frontend
@@ -29,25 +31,25 @@ tasks:
     desc: install frontend deps
     dir: "{{.FRONTEND_DIR}}"
     cmds:
-      - npm ci
+      - "{{.PNPM}} install --frozen-lockfile --ignore-scripts"
 
   frontend:check:
     desc: run frontend typecheck
     dir: "{{.FRONTEND_DIR}}"
     cmds:
-      - npm run check
+      - "{{.PNPM}} run check"
 
   frontend:build:
     desc: build frontend bundle
     dir: "{{.FRONTEND_DIR}}"
     cmds:
-      - npm run build
+      - "{{.PNPM}} run build"
 
   frontend:serve:
     desc: run frontend-only dev server
     dir: "{{.FRONTEND_DIR}}"
     cmds:
-      - npm run dev
+      - "{{.PNPM}} run dev"
 
   fmt:check:
     desc: fail if go files are not formatted

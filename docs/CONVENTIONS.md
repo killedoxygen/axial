@@ -34,6 +34,10 @@ keep this short and real. if the codebase changes, update this file.
 ## Build
 - frontend entry is `frontend/src/main.tsx`
 - output is `frontend/static/app.js`
+- frontend package manager is `pnpm`, pinned through `frontend/package.json`
+- use `task` for real repo commands, use `make` only as a short compatibility layer
+- enable `corepack` instead of telling people to install random global js tooling
+- frontend installs should use the lockfile and `--ignore-scripts`
 - desktop build is wails
 - on ubuntu 24 the linux build uses `webkit2_41`
 - local dev commands live in `Taskfile.yml`

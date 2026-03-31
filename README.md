@@ -21,7 +21,7 @@ current stack:
 ## prereqs
 - go 1.25+
 - node 22+
-- npm 10+
+- corepack enabled
 - task v3
 - wails cli `v2.11.0`
 - goreleaser v2 if you want local release snapshots
@@ -31,10 +31,14 @@ ubuntu 24.04:
 ```bash
 sudo apt-get update
 sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev
+corepack enable
 go install github.com/go-task/task/v3/cmd/task@latest
 go install github.com/wailsapp/wails/v2/cmd/wails@v2.11.0
 go install github.com/goreleaser/goreleaser/v2@latest
 ```
+
+the frontend uses `pnpm`, pinned through `corepack`.
+the first `pnpm` run may download that pinned version once.
 
 if `go install` put `task` in `~/go/bin`, `make` will pick it up even if your shell PATH was not reloaded yet.
 
@@ -88,6 +92,7 @@ make verify
 first time setup:
 
 ```bash
+corepack enable
 task frontend:install
 # or
 make setup

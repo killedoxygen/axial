@@ -26,8 +26,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Enable corepack
+        run: corepack enable
 
       - name: Install frontend dependencies
         run: task frontend:install
@@ -53,8 +56,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Enable corepack
+        run: corepack enable
 
       - uses: actions/setup-go@v5
         with:
