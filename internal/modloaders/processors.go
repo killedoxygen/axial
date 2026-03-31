@@ -192,16 +192,38 @@ func readMainClassFromJar(jarPath string) (string, error) {
 			if err != nil {
 				return "", err
 			}
-			for _, line := range strings.Split(string(data), "\n") {
-				line = strings.TrimSpace(line)
-				if strings.HasPrefix(line, "Main-Class:") {
-					return strings.TrimSpace(strings.TrimPrefix(line, "Main-Class:")), nil
-				}
+			if mainClass := parseManifestMainClass(data); mainClass != "" {
+				return mainClass, nil
 			}
 		}
 	}
 
 	return "", fmt.Errorf("no Main-Class in manifest")
+}
+
+func parseManifestMainClass(data []byte) string {
+	var current string
+	for _, line := range strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n") {
+		if line == "" {
+			if strings.HasPrefix(current, "Main-Class:") {
+				return strings.TrimSpace(strings.TrimPrefix(current, "Main-Class:"))
+			}
+			current = ""
+			continue
+		}
+		if strings.HasPrefix(line, " ") {
+			current += strings.TrimPrefix(line, " ")
+			continue
+		}
+		if strings.HasPrefix(current, "Main-Class:") {
+			return strings.TrimSpace(strings.TrimPrefix(current, "Main-Class:"))
+		}
+		current = line
+	}
+	if strings.HasPrefix(current, "Main-Class:") {
+		return strings.TrimSpace(strings.TrimPrefix(current, "Main-Class:"))
+	}
+	return ""
 }
 
 func substituteArg(arg string, libPaths, dataVars map[string]string, libDir string) string {
@@ -338,7 +360,7 @@ func findJavaForProcessors(mcDir string) (string, error) {
 	// Fallback: check if "java" is on PATH
 	javaExe := "java"
 	if runtime.GOOS == "windows" {
-		javaExe = "javaw.exe"
+		javaExe = "java.exe"
 	}
 	if path, err := exec.LookPath(javaExe); err == nil {
 		return path, nil

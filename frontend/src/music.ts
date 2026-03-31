@@ -76,7 +76,7 @@ export const Music = {
 
   applyConfig(cfg: { music_enabled?: boolean; music_volume?: number; music_track?: number }): void {
     if (cfg.music_enabled != null) this.enabled = cfg.music_enabled;
-    if (cfg.music_volume != null) this.volume = cfg.music_volume;
+    if (cfg.music_volume != null) this.volume = Math.max(0, Math.min(100, cfg.music_volume));
     if (cfg.music_track != null) this.track = clampTrack(cfg.music_track);
     this.syncUI();
   },

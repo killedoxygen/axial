@@ -2,7 +2,7 @@ import { api, API } from './api';
 import { byId } from './dom';
 import { Sound } from './sound';
 import { Music } from './music';
-import { fmtMem, showError, appendLog } from './utils';
+import { fmtMem, showError, appendLog, errMessage } from './utils';
 import { clearLaunchVisualState, startLaunchSequence, endLaunchSequence } from './effects';
 import { showConfirm } from './dialogs';
 import {
@@ -83,7 +83,7 @@ export async function launchGame(): Promise<void> {
     try {
       await connectLaunchEvents(res.session_id, inst.id, inst.name);
     } catch (err: unknown) {
-      showError(`Game launched, but live updates failed: ${(err as Error).message}`);
+      showError(`Game launched, but live updates failed: ${errMessage(err)}`);
       appendLog('system', `Live updates unavailable for ${inst.name}; stop detection may be delayed.`, inst.id, inst.name);
     }
 
@@ -96,7 +96,7 @@ export async function launchGame(): Promise<void> {
       };
     }
   } catch (err: unknown) {
-    showError((err as Error).message);
+    showError(errMessage(err));
     if (!launchCommitted) resetFailedLaunch(inst.id);
   }
 }
@@ -175,6 +175,6 @@ export async function killGame(): Promise<void> {
   try {
     await api('POST', `/launch/${session.sessionId}/kill`);
   } catch (err: unknown) {
-    showError(`Failed to kill: ${(err as Error).message}`);
+    showError(`Failed to kill: ${errMessage(err)}`);
   }
 }

@@ -38,7 +38,7 @@ keep this short and real. if the codebase changes, update this file.
 - on ubuntu 24 the linux build uses `webkit2_41`
 
 ## Inputs
-- text and number inputs should use `autocomplete=\"off\"`
+- text and number inputs should use `autocomplete="off"`
 - same goes for dynamic modal/dialog inputs
 
 ## repo attitude

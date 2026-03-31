@@ -5,7 +5,7 @@ import { catalog, runningSessions, versions } from '../store';
 import type { VersionInfo } from '../types';
 import { api } from '../api';
 import { Sound } from '../sound';
-import { showError, formatBytes } from '../utils';
+import { showError, formatBytes, errMessage } from '../utils';
 
 type DeleteTarget = { id?: string };
 type DeleteStep = 'analyze' | 'summary' | 'progress' | 'done';
@@ -34,8 +34,8 @@ export function bindDeleteWizard(): void {}
 
 export function DeleteWizard(): JSX.Element | null {
   const target = deleteTarget.value;
-  if (!showDeleteWizard.value || !target?.id) return null;
-  const versionId = target.id;
+  const isOpen = showDeleteWizard.value;
+  const versionId = target?.id ?? null;
 
   const step = useSignal<DeleteStep>('analyze');
   const info = useSignal<VersionInfo | null>(null);
@@ -44,6 +44,7 @@ export function DeleteWizard(): JSX.Element | null {
   const doneText = useSignal('');
 
   useEffect(() => {
+    if (!isOpen || !versionId) return;
     let cancelled = false;
     step.value = 'analyze';
     info.value = null;
@@ -67,14 +68,18 @@ export function DeleteWizard(): JSX.Element | null {
       } catch (err: unknown) {
         if (cancelled) return;
         closeDeleteWizard();
-        showError(`Failed to analyze version: ${(err as Error).message}`);
+        showError(`Failed to analyze version: ${errMessage(err)}`);
       }
     })();
 
     return () => {
       cancelled = true;
     };
-  }, [target.id]);
+  }, [isOpen, versionId]);
+
+  if (!isOpen || !versionId) return null;
+
+  const targetId = versionId;
 
   const executeDelete = async () => {
     step.value = 'progress';
@@ -114,11 +119,11 @@ export function DeleteWizard(): JSX.Element | null {
           };
         }
       } catch (err: unknown) {
-        showError(`Deleted ${versionId}, but failed to refresh versions: ${(err as Error).message}`);
+        showError(`Deleted ${versionId}, but failed to refresh versions: ${errMessage(err)}`);
       }
     } catch (err: unknown) {
       closeDeleteWizard();
-      showError(`Delete failed: ${(err as Error).message}`);
+      showError(`Delete failed: ${errMessage(err)}`);
     }
   };
 
@@ -135,7 +140,7 @@ export function DeleteWizard(): JSX.Element | null {
     <div class="modal-overlay" id="delete-modal" onClick={(e: MouseEvent) => handleOverlayClick(e)}>
       <div class="modal delete-modal-size">
         <div class="modal-header">
-          <span class="modal-title" id="delete-modal-title">Delete {target.id}</span>
+          <span class="modal-title" id="delete-modal-title">Delete {targetId}</span>
           <button class="icon-btn modal-close" id="delete-close" data-action="close" aria-label="Close delete dialog" onClick={() => closeDeleteWizard()}>
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
           </button>
@@ -153,7 +158,7 @@ export function DeleteWizard(): JSX.Element | null {
           {step.value === 'summary' && currentInfo && (
             <div class="delete-step" id="delete-step-summary">
               <div class="delete-version-header">
-                <span class="delete-version-name" id="delete-version-name">{target.id}</span>
+                <span class="delete-version-name" id="delete-version-name">{targetId}</span>
                 <span class="delete-version-size" id="delete-version-size">{formatBytes(currentInfo.folder_size)}</span>
               </div>
 
@@ -164,7 +169,7 @@ export function DeleteWizard(): JSX.Element | null {
                   </div>
                   <div class="delete-card-body">
                     <strong class="delete-card-title">Dependent Versions</strong>
-                    <p class="delete-card-text">These modded versions rely on <strong id="delete-dep-parent">{target.id}</strong> as their base. Deleting it will make them unlaunchable.</p>
+                    <p class="delete-card-text">These modded versions rely on <strong id="delete-dep-parent">{targetId}</strong> as their base. Deleting it will make them unlaunchable.</p>
                     <div class="delete-dep-list" id="delete-dep-list">
                       {dependents.map((dependent) => <span key={dependent} class="delete-dep-tag">{dependent}</span>)}
                     </div>
@@ -223,12 +228,12 @@ export function DeleteWizard(): JSX.Element | null {
                 </div>
                 <div class="delete-card-body">
                   <strong class="delete-card-title">Will Be Deleted</strong>
-                  <p class="delete-card-text">The version folder <code id="delete-folder-path">versions/{target.id}/</code> containing the version JSON, JAR, and any extracted natives.</p>
+                  <p class="delete-card-text">The version folder <code id="delete-folder-path">versions/{targetId}/</code> containing the version JSON, JAR, and any extracted natives.</p>
                 </div>
               </div>
 
               <div class="delete-confirm-area">
-                <p class="delete-confirm-hint">Type <strong id="delete-confirm-target">{target.id}</strong> to confirm</p>
+                <p class="delete-confirm-hint">Type <strong id="delete-confirm-target">{targetId}</strong> to confirm</p>
                 <input
                   type="text"
                   id="delete-confirm-input"
@@ -239,7 +244,7 @@ export function DeleteWizard(): JSX.Element | null {
                   value={confirmInput.value}
                   onInput={(e) => { confirmInput.value = (e.currentTarget as HTMLInputElement).value; }}
                   onKeyDown={(e) => {
-                    if (e.key === 'Enter' && confirmInput.value === target.id) {
+                    if (e.key === 'Enter' && confirmInput.value === targetId) {
                       e.preventDefault();
                       executeDelete();
                     }
@@ -247,7 +252,7 @@ export function DeleteWizard(): JSX.Element | null {
                 />
                 <div class="delete-actions">
                   <button class="btn-secondary" id="delete-cancel" onClick={() => closeDeleteWizard()}>Cancel</button>
-                  <button class="btn-danger delete-btn" id="delete-confirm-btn" disabled={confirmInput.value !== target.id} onClick={() => executeDelete()}>
+                  <button class="btn-danger delete-btn" id="delete-confirm-btn" disabled={confirmInput.value !== targetId} onClick={() => executeDelete()}>
                     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="3 6 5 6 21 6" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" /></svg>
                     Delete Version
                   </button>

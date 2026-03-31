@@ -1,6 +1,6 @@
 import { api } from './api';
 import { Sound } from './sound';
-import { showError } from './utils';
+import { showError, errMessage } from './utils';
 import { openDeleteWizard } from './delete-wizard';
 import { showConfirm, showPrompt } from './dialogs';
 import { removeInstance, updateInstanceInList } from './actions';
@@ -108,7 +108,7 @@ export function bindContextMenu(): void {
       updateInstanceInList({ ...(inst as any), name: newName });
       Sound.ui('affirm');
     } catch (err: unknown) {
-      showError((err as Error).message);
+      showError(errMessage(err));
     }
   });
 
@@ -125,7 +125,7 @@ export function bindContextMenu(): void {
         removeInstance(inst.id);
         Sound.ui('affirm');
       } catch (err: unknown) {
-        showError((err as Error).message);
+        showError(errMessage(err));
       }
     } else {
       const version: Record<string, any> = ctxMenuVersion;

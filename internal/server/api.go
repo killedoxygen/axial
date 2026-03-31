@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mateoltd/croopor/internal/config"
@@ -836,6 +837,7 @@ var musicTracks = []struct {
 }
 
 var musicHTTPClient = &http.Client{Timeout: 2 * time.Minute}
+var musicDownloadLocks sync.Map
 
 func musicLocalPath(idx int) string {
 	return filepath.Join(config.MusicDir(), musicTracks[idx].File)
@@ -866,7 +868,12 @@ func (s *Server) handleMusicTrack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := downloadMusicFile(localPath, musicTracks[idx].URL); err != nil {
+	if err := withMusicDownloadLock(localPath, func() error {
+		if _, err := os.Stat(localPath); err == nil {
+			return nil
+		}
+		return downloadMusicFile(localPath, musicTracks[idx].URL)
+	}); err != nil {
 		log.Printf("Music download failed: %v", err)
 		writeError(w, http.StatusBadGateway, "failed to download music: "+err.Error())
 		return
@@ -921,4 +928,12 @@ func (s *Server) handleMusicStatus(w http.ResponseWriter, r *http.Request) {
 		tracks[i] = map[string]any{"cached": err == nil, "file": t.File}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"tracks": tracks, "count": len(musicTracks)})
+}
+
+func withMusicDownloadLock(path string, fn func() error) error {
+	lockAny, _ := musicDownloadLocks.LoadOrStore(path, &sync.Mutex{})
+	lock := lockAny.(*sync.Mutex)
+	lock.Lock()
+	defer lock.Unlock()
+	return fn()
 }

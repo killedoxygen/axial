@@ -3,7 +3,7 @@ import { api } from './api';
 import { byId } from './dom';
 import { Sound } from './sound';
 import { Music } from './music';
-import { fmtMem, getMemoryRecommendation } from './utils';
+import { fmtMem, getMemoryRecommendation, errMessage } from './utils';
 import { positionFieldMarker } from './theme';
 import { showNewInstanceModal } from './components/NewInstanceModal';
 import { browseDirectory } from './native';
@@ -67,7 +67,7 @@ export function showSetup(): Promise<void> {
         if (res.error) { showPathError(res.error); return; }
         hideSetup();
       } catch (err: unknown) {
-        showPathError((err as Error).message || 'Failed to set directory');
+        showPathError(errMessage(err) || 'Failed to set directory');
       } finally {
         setupUseBtn.disabled = false;
         setupUseBtn.textContent = 'Use this path';
@@ -117,7 +117,7 @@ export function showSetup(): Promise<void> {
         if (res.error) { showPathError(res.error); return; }
         hideSetup();
       } catch (err: unknown) {
-        showPathError((err as Error).message || 'Failed to create directory');
+        showPathError(errMessage(err) || 'Failed to create directory');
       } finally {
         setupInitBtn.disabled = false;
         setupInitBtn.textContent = 'Create & Continue';

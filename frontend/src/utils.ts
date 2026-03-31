@@ -91,6 +91,12 @@ export function showError(msg: string): void {
   byId<HTMLElement>('log-panel')?.classList.add('expanded');
 }
 
+export function errMessage(err: unknown): string {
+  if (err instanceof Error && err.message) return err.message;
+  if (typeof err === 'string') return err;
+  return 'Unknown error';
+}
+
 export function esc(s: string): string {
   const d = document.createElement('div');
   d.textContent = s;

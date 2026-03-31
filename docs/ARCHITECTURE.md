@@ -1,5 +1,5 @@
 # Architecture
-Very small map so it is obvious where to start. wierdly enough, this document was written by a human this time
+Very small map so it is obvious where to start. weirdly enough, this document was written by a human this time
 
 ## desktop side
 - `main.go`: wails bootstrap

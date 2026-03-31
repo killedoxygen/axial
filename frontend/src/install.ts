@@ -1,5 +1,5 @@
 import { api, API } from './api';
-import { showError } from './utils';
+import { showError, errMessage } from './utils';
 import { startLoaderInstall, connectLoaderInstallSSE } from './loaders';
 import {
   isWailsRuntime, nativeInstallEventName, nativeLoaderInstallEventName,
@@ -92,7 +92,7 @@ async function processVanillaInstall(next: InstallItem): Promise<void> {
     }
     await connectVanillaEvents(res.install_id, next.versionId);
   } catch (err: unknown) {
-    showError(`Install failed: ${(err as Error).message}`);
+    showError(`Install failed: ${errMessage(err)}`);
     await onInstallDone();
   }
 }
@@ -110,7 +110,7 @@ async function processLoaderInstall(next: InstallItem): Promise<void> {
     );
     await connectLoaderEvents(installId, next.versionId);
   } catch (err: unknown) {
-    showError(`Loader install failed: ${(err as Error).message}`);
+    showError(`Loader install failed: ${errMessage(err)}`);
     await onInstallDone();
   }
 }
@@ -307,7 +307,7 @@ async function onInstallDone(): Promise<void> {
       };
     }
   } catch (err: unknown) {
-    showError(`Install completed, but failed to refresh versions: ${(err as Error).message}`);
+    showError(`Install completed, but failed to refresh versions: ${errMessage(err)}`);
   }
 
   processNextInstall();

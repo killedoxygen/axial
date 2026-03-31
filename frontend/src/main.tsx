@@ -23,6 +23,12 @@ import { closeDeleteWizard, bindDeleteWizard } from './delete-wizard';
 import { dismissDialog, showConfirm } from './dialogs';
 import { getNativeAppVersion } from './native';
 
+function errMessage(err: unknown): string {
+  if (err instanceof Error && err.message) return err.message;
+  if (typeof err === 'string') return err;
+  return 'Unknown error';
+}
+
 async function init(): Promise<void> {
   render(<App />, document.getElementById('app')!);
   const nativeVersion = await getNativeAppVersion();
@@ -88,7 +94,7 @@ async function init(): Promise<void> {
     }
     watchVersions();
   } catch (err: unknown) {
-    bootstrapError.value = (err as Error).message;
+    bootstrapError.value = errMessage(err);
     bootstrapState.value = 'error';
   }
 
@@ -200,7 +206,7 @@ function bindEvents(): void {
         await api('PUT', '/config', { username: u });
         if (config.value) config.value = { ...config.value, username: u };
       } catch (err: unknown) {
-        showError((err as Error).message);
+        showError(errMessage(err));
       }
     }
   });
@@ -327,7 +333,7 @@ function bindEvents(): void {
         catalog.value = null;
       }
     } catch (err: unknown) {
-      showError((err as Error).message);
+      showError(errMessage(err));
     }
     btn.disabled = false;
     btn.textContent = 'Cleanup All';
@@ -341,7 +347,7 @@ function bindEvents(): void {
       localStorage.removeItem(STORAGE_KEY);
       location.reload();
     } catch (err: unknown) {
-      showError((err as Error).message);
+      showError(errMessage(err));
     }
   });
 

@@ -6,7 +6,7 @@ import { catalog, instances } from '../store';
 import { addInstance, selectInstance } from '../actions';
 import { api } from '../api';
 import { Sound } from '../sound';
-import { showError, esc, parseVersionDisplay } from '../utils';
+import { showError, esc, parseVersionDisplay, errMessage } from '../utils';
 import { installVersion, installLoaderVersion } from '../install';
 import {
   fetchGameVersions, fetchLoaderVersions,
@@ -65,7 +65,7 @@ function buildCompositeId(loaderType: string, mcVersion: string, loaderVersion: 
 }
 
 export function NewInstanceModal(): JSX.Element | null {
-  if (!showNewInstanceModal.value) return null;
+  const isOpen = showNewInstanceModal.value;
 
   const filter = useSignal('release');
   const search = useSignal('');
@@ -82,9 +82,26 @@ export function NewInstanceModal(): JSX.Element | null {
 
   const overlayRef = useRef<HTMLDivElement>(null);
   const nameRef = useRef<HTMLInputElement>(null);
+  const loaderGamesRequestRef = useRef(0);
+  const loaderVersionsRequestRef = useRef(0);
 
-  // Load catalog on first open, auto-focus name, play sound
+  // Reset modal state on each open, then ensure catalog exists
   useEffect(() => {
+    if (!isOpen) return;
+
+    filter.value = 'release';
+    search.value = '';
+    selectedVersionId.value = null;
+    page.value = 0;
+    loaderEnabled.value = false;
+    selectedLoader.value = 'fabric';
+    loaderGameVersions.value = null;
+    loaderVersionsList.value = null;
+    selectedLoaderVersion.value = null;
+    loaderLoading.value = false;
+    name.value = defaultName();
+    nameError.value = null;
+
     Sound.ui('soft');
     (async () => {
       if (!catalog.value) {
@@ -93,21 +110,20 @@ export function NewInstanceModal(): JSX.Element | null {
           if (res.error) throw new Error(res.error);
           catalog.value = res;
         } catch (err: unknown) {
-          showError(`Failed to load version catalog: ${(err as Error).message}`);
+          showError(`Failed to load version catalog: ${err instanceof Error ? err.message : String(err)}`);
           showNewInstanceModal.value = false;
           return;
         }
       }
-      // Auto-select first version
       const allVersions = catalog.value?.versions ?? [];
       const first = allVersions.filter(v => v.type === filter.value);
       if (first.length > 0) {
         selectedVersionId.value = first[0].id;
-        name.value = defaultName();
+        if (isAutoName(name.value.trim())) name.value = defaultName();
       }
     })();
     requestAnimationFrame(() => nameRef.current?.focus());
-  }, []);
+  }, [isOpen]);
 
   const allVersions: CatalogVersion[] = catalog.value?.versions ?? [];
 
@@ -131,6 +147,8 @@ export function NewInstanceModal(): JSX.Element | null {
   const totalPages = Math.ceil(total / PAGE_SIZE);
   const start = page.value * PAGE_SIZE;
   const display = filteredVersions.slice(start, start + PAGE_SIZE);
+
+  if (!isOpen) return null;
 
   const close = () => {
     showNewInstanceModal.value = false;
@@ -188,22 +206,36 @@ export function NewInstanceModal(): JSX.Element | null {
   };
 
   const loadLoaderGameVersions = async (): Promise<void> => {
+    const requestId = ++loaderGamesRequestRef.current;
+    const loaderType = selectedLoader.value;
     loaderLoading.value = true;
     try {
-      loaderGameVersions.value = await fetchGameVersions(selectedLoader.value);
+      const nextVersions = await fetchGameVersions(loaderType);
+      if (requestId !== loaderGamesRequestRef.current || selectedLoader.value !== loaderType) return;
+      loaderGameVersions.value = nextVersions;
     } catch {
+      if (requestId !== loaderGamesRequestRef.current || selectedLoader.value !== loaderType) return;
       loaderGameVersions.value = [];
+    } finally {
+      if (requestId === loaderGamesRequestRef.current && selectedLoader.value === loaderType) {
+        loaderLoading.value = false;
+      }
     }
-    loaderLoading.value = false;
   };
 
   const updateLoaderVersionInfo = async (mcVersion: string): Promise<void> => {
     if (!loaderEnabled.value) return;
+    const requestId = ++loaderVersionsRequestRef.current;
+    const loaderType = selectedLoader.value;
     try {
-      loaderVersionsList.value = await fetchLoaderVersions(selectedLoader.value, mcVersion);
-      const best = latestStable(loaderVersionsList.value);
+      const nextVersions = await fetchLoaderVersions(loaderType, mcVersion);
+      if (requestId !== loaderVersionsRequestRef.current || !loaderEnabled.value || selectedLoader.value !== loaderType || selectedVersionId.value !== mcVersion) return;
+      loaderVersionsList.value = nextVersions;
+      const best = latestStable(nextVersions);
       selectedLoaderVersion.value = best?.version ?? null;
     } catch {
+      if (requestId !== loaderVersionsRequestRef.current || !loaderEnabled.value || selectedLoader.value !== loaderType || selectedVersionId.value !== mcVersion) return;
+      loaderVersionsList.value = null;
       selectedLoaderVersion.value = null;
     }
   };
@@ -288,7 +320,7 @@ export function NewInstanceModal(): JSX.Element | null {
         if (needsInstall) installVersion(selectedVersionId.value);
       }
     } catch (err: unknown) {
-      showError((err as Error).message);
+      showError(errMessage(err));
     }
   };
 

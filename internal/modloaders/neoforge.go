@@ -55,14 +55,14 @@ func (n *neoforgeLoader) VersionID(mcVersion, loaderVersion string) string {
 func (n *neoforgeLoader) GameVersions() ([]GameVersion, error) {
 	const cacheKey = "neoforge:game_versions"
 
-	if data, ok, fresh := n.cache.Get(cacheKey); ok && fresh {
-		return data.([]GameVersion), nil
+	if versions, ok, fresh := cacheGetAs[[]GameVersion](n.cache, cacheKey); ok && fresh {
+		return versions, nil
 	}
 
 	entries, err := n.fetchMavenVersions()
 	if err != nil {
-		if data, ok, _ := n.cache.Get(cacheKey); ok {
-			return data.([]GameVersion), nil
+		if versions, ok, _ := cacheGetAs[[]GameVersion](n.cache, cacheKey); ok {
+			return versions, nil
 		}
 		return nil, err
 	}
@@ -87,14 +87,14 @@ func (n *neoforgeLoader) GameVersions() ([]GameVersion, error) {
 func (n *neoforgeLoader) LoaderVersions(mcVersion string) ([]LoaderVersion, error) {
 	cacheKey := "neoforge:loader_versions:" + mcVersion
 
-	if data, ok, fresh := n.cache.Get(cacheKey); ok && fresh {
-		return data.([]LoaderVersion), nil
+	if versions, ok, fresh := cacheGetAs[[]LoaderVersion](n.cache, cacheKey); ok && fresh {
+		return versions, nil
 	}
 
 	entries, err := n.fetchMavenVersions()
 	if err != nil {
-		if data, ok, _ := n.cache.Get(cacheKey); ok {
-			return data.([]LoaderVersion), nil
+		if versions, ok, _ := cacheGetAs[[]LoaderVersion](n.cache, cacheKey); ok {
+			return versions, nil
 		}
 		return nil, err
 	}
@@ -123,118 +123,120 @@ func (n *neoforgeLoader) LoaderVersions(mcVersion string) ([]LoaderVersion, erro
 func (n *neoforgeLoader) Install(mcDir, mcVersion, loaderVersion string, progress chan<- Progress) (*InstallResult, error) {
 	versionID := n.VersionID(mcVersion, loaderVersion)
 
-	// Check if already installed
-	versionDir := filepath.Join(minecraft.VersionsDir(mcDir), versionID)
-	jsonPath := filepath.Join(versionDir, versionID+".json")
-	markerPath := filepath.Join(versionDir, ".incomplete")
-	if _, err := os.Stat(jsonPath); err == nil {
-		if _, mErr := os.Stat(markerPath); os.IsNotExist(mErr) {
-			return &InstallResult{VersionID: versionID, GameVersion: mcVersion, LoaderType: NeoForge}, nil
-		}
-	}
-
-	// Download the installer JAR
-	progress <- Progress{Phase: "loader_meta", Current: 0, Total: 1, Detail: "Downloading NeoForge installer..."}
-
-	installerURL := fmt.Sprintf("%s/net/neoforged/neoforge/%s/neoforge-%s-installer.jar", neoforgeMavenBase, loaderVersion, loaderVersion)
-
-	installerData, err := n.downloadToMemory(installerURL)
-	if err != nil {
-		return nil, fmt.Errorf("downloading NeoForge installer: %w", err)
-	}
-
-	// Extract version.json and install_profile.json
-	progress <- Progress{Phase: "loader_json", Current: 0, Total: 1, Detail: "Extracting installer..."}
-
-	versionJSON, installProfile, err := extractNeoForgeInstaller(installerData)
-	if err != nil {
-		return nil, fmt.Errorf("extracting NeoForge installer: %w", err)
-	}
-
-	// Use the ID from the JSON
-	var parsedVersion struct {
-		ID string `json:"id"`
-	}
-	if err := json.Unmarshal(versionJSON, &parsedVersion); err == nil && parsedVersion.ID != "" {
-		versionID = parsedVersion.ID
-		versionDir = filepath.Join(minecraft.VersionsDir(mcDir), versionID)
-		jsonPath = filepath.Join(versionDir, versionID+".json")
-		markerPath = filepath.Join(versionDir, ".incomplete")
+	return withInstallLock("neoforge:"+versionID, func() (*InstallResult, error) {
+		versionDir := filepath.Join(minecraft.VersionsDir(mcDir), versionID)
+		jsonPath := filepath.Join(versionDir, versionID+".json")
+		markerPath := filepath.Join(versionDir, ".incomplete")
 		if _, err := os.Stat(jsonPath); err == nil {
 			if _, mErr := os.Stat(markerPath); os.IsNotExist(mErr) {
 				return &InstallResult{VersionID: versionID, GameVersion: mcVersion, LoaderType: NeoForge}, nil
+			} else if mErr != nil {
+				return nil, fmt.Errorf("checking incomplete marker: %w", mErr)
+			}
+		} else if err != nil && !os.IsNotExist(err) {
+			return nil, fmt.Errorf("checking installed NeoForge version: %w", err)
+		}
+
+		progress <- Progress{Phase: "loader_meta", Current: 0, Total: 1, Detail: "Downloading NeoForge installer..."}
+
+		installerURL := fmt.Sprintf("%s/net/neoforged/neoforge/%s/neoforge-%s-installer.jar", neoforgeMavenBase, loaderVersion, loaderVersion)
+
+		installerData, err := n.downloadToMemory(installerURL)
+		if err != nil {
+			return nil, fmt.Errorf("downloading NeoForge installer: %w", err)
+		}
+
+		progress <- Progress{Phase: "loader_json", Current: 0, Total: 1, Detail: "Extracting installer..."}
+
+		versionJSON, installProfile, err := extractNeoForgeInstaller(installerData)
+		if err != nil {
+			return nil, fmt.Errorf("extracting NeoForge installer: %w", err)
+		}
+
+		var parsedVersion struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(versionJSON, &parsedVersion); err == nil && parsedVersion.ID != "" {
+			versionID = parsedVersion.ID
+			versionDir = filepath.Join(minecraft.VersionsDir(mcDir), versionID)
+			jsonPath = filepath.Join(versionDir, versionID+".json")
+			markerPath = filepath.Join(versionDir, ".incomplete")
+			if _, err := os.Stat(jsonPath); err == nil {
+				if _, mErr := os.Stat(markerPath); os.IsNotExist(mErr) {
+					return &InstallResult{VersionID: versionID, GameVersion: mcVersion, LoaderType: NeoForge}, nil
+				} else if mErr != nil {
+					return nil, fmt.Errorf("checking incomplete marker: %w", mErr)
+				}
+			} else if err != nil && !os.IsNotExist(err) {
+				return nil, fmt.Errorf("checking installed NeoForge version: %w", err)
 			}
 		}
-	}
 
-	// Write version JSON
-	if err := os.MkdirAll(versionDir, 0755); err != nil {
-		return nil, fmt.Errorf("creating version directory: %w", err)
-	}
-	if err := os.WriteFile(markerPath, []byte("installing"), 0644); err != nil {
-		return nil, fmt.Errorf("creating incomplete marker: %w", err)
-	}
-
-	if err := os.WriteFile(jsonPath, versionJSON, 0644); err != nil {
-		return nil, fmt.Errorf("writing version JSON: %w", err)
-	}
-
-	// Download libraries
-	allLibs, err := collectForgeLibraries(versionJSON, installProfile)
-	if err != nil {
-		return nil, fmt.Errorf("parsing NeoForge libraries: %w", err)
-	}
-
-	if err := DownloadLibraries(allLibs, mcDir, progress); err != nil {
-		return nil, fmt.Errorf("downloading NeoForge libraries: %w", err)
-	}
-
-	// Extract data files from installer JAR
-	if err := extractInstallerDataFiles(installerData, mcDir); err != nil {
-		return nil, fmt.Errorf("extracting installer data: %w", err)
-	}
-
-	// Run processors
-	if installProfile != nil {
-		progress <- Progress{Phase: "loader_processors", Current: 0, Total: 1, Detail: "Running processors..."}
-
-		if err := RunForgeProcessors(mcDir, mcVersion, versionID, installProfile, installerData, progress); err != nil {
-			return nil, fmt.Errorf("running NeoForge processors: %w", err)
+		if err := os.MkdirAll(versionDir, 0755); err != nil {
+			return nil, fmt.Errorf("creating version directory: %w", err)
 		}
-	}
+		if err := os.WriteFile(markerPath, []byte("installing"), 0644); err != nil {
+			return nil, fmt.Errorf("creating incomplete marker: %w", err)
+		}
 
-	if err := os.Remove(markerPath); err != nil {
-		return nil, fmt.Errorf("removing incomplete marker: %w", err)
-	}
-	return &InstallResult{VersionID: versionID, GameVersion: mcVersion, LoaderType: NeoForge}, nil
+		if err := os.WriteFile(jsonPath, versionJSON, 0644); err != nil {
+			return nil, fmt.Errorf("writing version JSON: %w", err)
+		}
+
+		allLibs, err := collectForgeLibraries(versionJSON, installProfile)
+		if err != nil {
+			return nil, fmt.Errorf("parsing NeoForge libraries: %w", err)
+		}
+
+		if err := DownloadLibraries(allLibs, mcDir, progress); err != nil {
+			return nil, fmt.Errorf("downloading NeoForge libraries: %w", err)
+		}
+
+		if err := extractInstallerDataFiles(installerData, mcDir); err != nil {
+			return nil, fmt.Errorf("extracting installer data: %w", err)
+		}
+
+		if installProfile != nil {
+			progress <- Progress{Phase: "loader_processors", Current: 0, Total: 1, Detail: "Running processors..."}
+
+			if err := RunForgeProcessors(mcDir, mcVersion, versionID, installProfile, installerData, progress); err != nil {
+				return nil, fmt.Errorf("running NeoForge processors: %w", err)
+			}
+		}
+
+		if err := os.Remove(markerPath); err != nil && !os.IsNotExist(err) {
+			return nil, fmt.Errorf("removing incomplete marker: %w", err)
+		}
+		return &InstallResult{VersionID: versionID, GameVersion: mcVersion, LoaderType: NeoForge}, nil
+	})
 }
 
 func (n *neoforgeLoader) fetchMavenVersions() ([]string, error) {
 	const cacheKey = "neoforge:maven_versions"
-	if data, ok, fresh := n.cache.Get(cacheKey); ok && fresh {
-		return data.([]string), nil
+	if versions, ok, fresh := cacheGetAs[[]string](n.cache, cacheKey); ok && fresh {
+		return versions, nil
 	}
 
 	resp, err := n.client.Get(neoforgeMavenMeta)
 	if err != nil {
-		if data, ok, _ := n.cache.Get(cacheKey); ok {
-			return data.([]string), nil
+		if versions, ok, _ := cacheGetAs[[]string](n.cache, cacheKey); ok {
+			return versions, nil
 		}
 		return nil, fmt.Errorf("neoforge maven: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		if data, ok, _ := n.cache.Get(cacheKey); ok {
-			return data.([]string), nil
+		if versions, ok, _ := cacheGetAs[[]string](n.cache, cacheKey); ok {
+			return versions, nil
 		}
 		return nil, fmt.Errorf("neoforge maven: status %d", resp.StatusCode)
 	}
 
 	var meta mavenMetadata
 	if err := xml.NewDecoder(resp.Body).Decode(&meta); err != nil {
-		if data, ok, _ := n.cache.Get(cacheKey); ok {
-			return data.([]string), nil
+		if versions, ok, _ := cacheGetAs[[]string](n.cache, cacheKey); ok {
+			return versions, nil
 		}
 		return nil, fmt.Errorf("parsing neoforge maven metadata: %w", err)
 	}

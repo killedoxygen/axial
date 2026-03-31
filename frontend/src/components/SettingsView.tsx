@@ -270,7 +270,7 @@ export function SettingsView(): JSX.Element {
               value={settingsJavaPath.value}
               onInput={(e) => { settingsJavaPath.value = (e.currentTarget as HTMLInputElement).value; }}
             />
-            <p class="setting-hint">Full path to `javaw.exe` or your Java binary.</p>
+            <p class="setting-hint">Full path to `java.exe` or your Java binary.</p>
           </div>
           <div class="setting-group">
             <label class="setting-label">Detected Java Runtimes</label>
