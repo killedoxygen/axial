@@ -1,17 +1,38 @@
 .DEFAULT_GOAL := help
-TASK ?= task
+TASK ?= $(or $(shell command -v task 2>/dev/null),$(HOME)/go/bin/task)
 
-.PHONY: _require-task help frontend-install frontend-check frontend-build check test build build-dev build-windows build-windows-dev dev serve wails-build verify clean release-snapshot
+.PHONY: _require-task help setup frontend-install frontend-check frontend-build check test build build-dev build-windows build-windows-dev dev serve wails-build verify clean release-snapshot
 
 _require-task:
-	@$(TASK) --version >/dev/null 2>&1 || { \
-		echo "task is required. install it with:"; \
+	@[ -x "$(TASK)" ] || { \
+		echo "task is required."; \
+		echo ""; \
+		echo "install it with:"; \
 		echo "  go install github.com/go-task/task/v3/cmd/task@latest"; \
+		echo ""; \
+		echo "then either add ~/go/bin to PATH or rerun make."; \
 		exit 1; \
 	}
 
-help: _require-task
-	@$(TASK) --list-all
+help:
+	@if [ -x "$(TASK)" ]; then \
+		$(TASK) --list-all; \
+	else \
+		echo "task is required."; \
+		echo ""; \
+		echo "install it with:"; \
+		echo "  go install github.com/go-task/task/v3/cmd/task@latest"; \
+		echo ""; \
+		echo "common commands after that:"; \
+		echo "  make setup"; \
+		echo "  make dev"; \
+		echo "  make build"; \
+		echo "  make build-dev"; \
+		echo "  make verify"; \
+	fi
+
+setup: _require-task
+	@$(TASK) frontend:install
 
 frontend-install: _require-task
 	@$(TASK) frontend:install

@@ -36,71 +36,101 @@ go install github.com/wailsapp/wails/v2/cmd/wails@v2.11.0
 go install github.com/goreleaser/goreleaser/v2@latest
 ```
 
-## dev
-install deps once:
+if `go install` put `task` in `~/go/bin`, `make` will pick it up even if your shell PATH was not reloaded yet.
+
+## quickstart
+first time:
 
 ```bash
-task frontend:install
+make setup
 ```
 
-run the app:
+daily app dev:
 
 ```bash
-task wails:dev
+make dev
 ```
 
-frontend-only server:
+native local builds:
 
 ```bash
-task frontend:serve
+make build
+make build-dev
 ```
 
-## build
-see what exists:
+see everything:
 
 ```bash
-task --list-all
+make help
 ```
 
-native builds:
+## cli
+`task` is the real interface. `make` is only a small compatibility shim for the common commands.
+
+daily commands:
 
 ```bash
 task build
 task build:dev
+task wails:dev
+task verify
 ```
 
-windows builds from any machine:
+same thing through `make`:
+
+```bash
+make build
+make build-dev
+make dev
+make verify
+```
+
+first time setup:
+
+```bash
+task frontend:install
+# or
+make setup
+```
+
+frontend only:
+
+```bash
+task frontend:serve
+task frontend:check
+task frontend:build
+```
+
+desktop app:
+
+```bash
+task test
+task wails:dev
+task wails:build
+task build
+task build:dev
+```
+
+windows cross-builds:
 
 ```bash
 task build:windows
 task build:windows:dev
 ```
 
-wails production build:
-
-```bash
-task wails:build
-```
-
-## verify
-full local pass:
-
-```bash
-task verify
-```
-
-useful smaller targets:
+full local verification:
 
 ```bash
 task check
 task test
-task frontend:build
+task verify
 ```
 
-## roadmap
-- msa auth
-- modrinth-powered bundles
-- skin stuff
+release snapshot:
+
+```bash
+task release:snapshot
+```
 
 ## maintainer docs
 - `docs/CONVENTIONS.md`
@@ -120,5 +150,7 @@ local snapshot:
 task release:snapshot
 ```
 
-## make
-`make` is only a small compatibility shim now. use `task` as the real interface.
+## roadmap
+- msa auth
+- modrinth-powered bundles
+- skin stuff
