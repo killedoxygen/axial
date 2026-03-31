@@ -8,12 +8,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
-
-	"github.com/mateoltd/croopor/internal/minecraft"
 )
 
 const (
@@ -121,15 +119,25 @@ func (n *neoforgeLoader) LoaderVersions(mcVersion string) ([]LoaderVersion, erro
 }
 
 func (n *neoforgeLoader) Install(mcDir, mcVersion, loaderVersion string, progress chan<- Progress) (*InstallResult, error) {
-	versionID := n.VersionID(mcVersion, loaderVersion)
+	safeMCVersion, err := sanitizeVersionSegment("minecraft version", mcVersion)
+	if err != nil {
+		return nil, err
+	}
+	safeLoaderVersion, err := sanitizeVersionSegment("loader version", loaderVersion)
+	if err != nil {
+		return nil, err
+	}
+
+	versionID := n.VersionID(safeMCVersion, safeLoaderVersion)
 
 	return withInstallLock("neoforge:"+versionID, func() (*InstallResult, error) {
-		versionDir := filepath.Join(minecraft.VersionsDir(mcDir), versionID)
-		jsonPath := filepath.Join(versionDir, versionID+".json")
-		markerPath := filepath.Join(versionDir, ".incomplete")
+		versionDir, jsonPath, markerPath, err := resolveVersionFiles(mcDir, versionID)
+		if err != nil {
+			return nil, err
+		}
 		if _, err := os.Stat(jsonPath); err == nil {
 			if _, mErr := os.Stat(markerPath); os.IsNotExist(mErr) {
-				return &InstallResult{VersionID: versionID, GameVersion: mcVersion, LoaderType: NeoForge}, nil
+				return &InstallResult{VersionID: versionID, GameVersion: safeMCVersion, LoaderType: NeoForge}, nil
 			} else if mErr != nil {
 				return nil, fmt.Errorf("checking incomplete marker: %w", mErr)
 			}
@@ -139,7 +147,12 @@ func (n *neoforgeLoader) Install(mcDir, mcVersion, loaderVersion string, progres
 
 		progress <- Progress{Phase: "loader_meta", Current: 0, Total: 1, Detail: "Downloading NeoForge installer..."}
 
-		installerURL := fmt.Sprintf("%s/net/neoforged/neoforge/%s/neoforge-%s-installer.jar", neoforgeMavenBase, loaderVersion, loaderVersion)
+		installerURL := fmt.Sprintf(
+			"%s/net/neoforged/neoforge/%s/neoforge-%s-installer.jar",
+			neoforgeMavenBase,
+			url.PathEscape(safeLoaderVersion),
+			url.PathEscape(safeLoaderVersion),
+		)
 
 		installerData, err := n.downloadToMemory(installerURL)
 		if err != nil {
@@ -157,13 +170,17 @@ func (n *neoforgeLoader) Install(mcDir, mcVersion, loaderVersion string, progres
 			ID string `json:"id"`
 		}
 		if err := json.Unmarshal(versionJSON, &parsedVersion); err == nil && parsedVersion.ID != "" {
-			versionID = parsedVersion.ID
-			versionDir = filepath.Join(minecraft.VersionsDir(mcDir), versionID)
-			jsonPath = filepath.Join(versionDir, versionID+".json")
-			markerPath = filepath.Join(versionDir, ".incomplete")
+			versionID, err = sanitizeVersionSegment("installer version id", parsedVersion.ID)
+			if err != nil {
+				return nil, err
+			}
+			versionDir, jsonPath, markerPath, err = resolveVersionFiles(mcDir, versionID)
+			if err != nil {
+				return nil, err
+			}
 			if _, err := os.Stat(jsonPath); err == nil {
 				if _, mErr := os.Stat(markerPath); os.IsNotExist(mErr) {
-					return &InstallResult{VersionID: versionID, GameVersion: mcVersion, LoaderType: NeoForge}, nil
+					return &InstallResult{VersionID: versionID, GameVersion: safeMCVersion, LoaderType: NeoForge}, nil
 				} else if mErr != nil {
 					return nil, fmt.Errorf("checking incomplete marker: %w", mErr)
 				}
@@ -199,7 +216,7 @@ func (n *neoforgeLoader) Install(mcDir, mcVersion, loaderVersion string, progres
 		if installProfile != nil {
 			progress <- Progress{Phase: "loader_processors", Current: 0, Total: 1, Detail: "Running processors..."}
 
-			if err := RunForgeProcessors(mcDir, mcVersion, versionID, installProfile, installerData, progress); err != nil {
+			if err := RunForgeProcessors(mcDir, safeMCVersion, versionID, installProfile, installerData, progress); err != nil {
 				return nil, fmt.Errorf("running NeoForge processors: %w", err)
 			}
 		}
@@ -207,7 +224,7 @@ func (n *neoforgeLoader) Install(mcDir, mcVersion, loaderVersion string, progres
 		if err := os.Remove(markerPath); err != nil && !os.IsNotExist(err) {
 			return nil, fmt.Errorf("removing incomplete marker: %w", err)
 		}
-		return &InstallResult{VersionID: versionID, GameVersion: mcVersion, LoaderType: NeoForge}, nil
+		return &InstallResult{VersionID: versionID, GameVersion: safeMCVersion, LoaderType: NeoForge}, nil
 	})
 }
 

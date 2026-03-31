@@ -909,7 +909,10 @@ func downloadMusicFile(localPath, remoteURL string) error {
 		os.Remove(tmpPath)
 		return fmt.Errorf("write: %w", err)
 	}
-	f.Close()
+	if err := f.Close(); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("close: %w", err)
+	}
 
 	if err := os.Rename(tmpPath, localPath); err != nil {
 		os.Remove(tmpPath)

@@ -16,7 +16,8 @@ import {
   confirmLaunch, endLaunchPrep, endSession, startLaunch, updateInstanceInList,
 } from './actions';
 
-function resetFailedLaunch(instanceId: string): void {
+function rollbackLaunch(instanceId: string, animationFrameId: number | null): void {
+  if (animationFrameId !== null) cancelAnimationFrame(animationFrameId);
   endSession(instanceId);
   if (Object.keys(runningSessions.value).length === 0) Music.unsuppress();
   clearLaunchVisualState();
@@ -49,7 +50,7 @@ export async function launchGame(): Promise<void> {
   Sound.init();
   clearLaunchVisualState();
   startLaunch(inst.id);
-  requestAnimationFrame(() => startLaunchSequence());
+  const launchAnimationFrameId = requestAnimationFrame(() => startLaunchSequence());
 
   let launchCommitted = false;
 
@@ -62,8 +63,8 @@ export async function launchGame(): Promise<void> {
 
     if (res.error) {
       showError(res.error);
-      clearLaunchVisualState();
-      endLaunchPrep();
+      launchCommitted = false;
+      rollbackLaunch(inst.id, launchAnimationFrameId);
       return;
     }
 
@@ -97,7 +98,7 @@ export async function launchGame(): Promise<void> {
     }
   } catch (err: unknown) {
     showError(errMessage(err));
-    if (!launchCommitted) resetFailedLaunch(inst.id);
+    if (!launchCommitted) rollbackLaunch(inst.id, launchAnimationFrameId);
   }
 }
 
@@ -173,7 +174,11 @@ export async function killGame(): Promise<void> {
   if (!session) return;
 
   try {
-    await api('POST', `/launch/${session.sessionId}/kill`);
+    const res = await api('POST', `/launch/${session.sessionId}/kill`);
+    if (res?.error) {
+      showError(`Failed to kill: ${res.error}`);
+      return;
+    }
   } catch (err: unknown) {
     showError(`Failed to kill: ${errMessage(err)}`);
   }

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -71,6 +72,10 @@ func (q *quiltLoader) GameVersions() ([]GameVersion, error) {
 		Stable  bool   `json:"stable"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		if versions, ok, _ := cacheGetAs[[]GameVersion](q.cache, cacheKey); ok {
+			log.Printf("quilt meta decode failed, using stale cache: %v", err)
+			return versions, nil
+		}
 		return nil, fmt.Errorf("quilt meta API: %w", err)
 	}
 
@@ -117,6 +122,10 @@ func (q *quiltLoader) LoaderVersions(mcVersion string) ([]LoaderVersion, error) 
 		} `json:"loader"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		if versions, ok, _ := cacheGetAs[[]LoaderVersion](q.cache, cacheKey); ok {
+			log.Printf("quilt meta decode failed, using stale cache: %v", err)
+			return versions, nil
+		}
 		return nil, fmt.Errorf("quilt meta API: %w", err)
 	}
 

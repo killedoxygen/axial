@@ -350,10 +350,13 @@ func extractFromInstallerJar(jarData []byte, entryPath, tempDir string) string {
 func findJavaForProcessors(mcDir string) (string, error) {
 	// Try common Java version components
 	components := []string{"java-runtime-delta", "java-runtime-gamma", "java-runtime-beta", "java-runtime-alpha", "jre-legacy"}
-	for _, comp := range components {
-		result, err := minecraft.FindJava(mcDir, minecraft.JavaVersion{Component: comp, MajorVersion: 21}, "")
-		if err == nil {
-			return result.Path, nil
+	majors := []int{21, 17, 11, 8}
+	for _, major := range majors {
+		for _, comp := range components {
+			result, err := minecraft.FindJava(mcDir, minecraft.JavaVersion{Component: comp, MajorVersion: major}, "")
+			if err == nil {
+				return result.Path, nil
+			}
 		}
 	}
 

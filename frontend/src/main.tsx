@@ -29,6 +29,13 @@ function errMessage(err: unknown): string {
   return 'Unknown error';
 }
 
+function computeMemoryRecommendationText(val: number, totalGB: number | null): string {
+  if (!totalGB) return '';
+  if (val < 2) return 'Low, may cause issues';
+  if (val > totalGB * 0.75) return 'High, leave room for OS';
+  return getMemoryRecommendation(totalGB).text;
+}
+
 async function init(): Promise<void> {
   render(<App />, document.getElementById('app')!);
   const nativeVersion = await getNativeAppVersion();
@@ -85,12 +92,10 @@ async function init(): Promise<void> {
     if (config.value && !config.value.onboarding_done) showOnboarding();
     else if (Music.enabled) {
       const startMusic = (): void => {
-        window.removeEventListener('pointerdown', startMusic, true);
-        window.removeEventListener('keydown', startMusic, true);
         Music.play();
       };
-      window.addEventListener('pointerdown', startMusic, { once: false, capture: true });
-      window.addEventListener('keydown', startMusic, { once: false, capture: true });
+      window.addEventListener('pointerdown', startMusic, { once: true, capture: true });
+      window.addEventListener('keydown', startMusic, { once: true, capture: true });
     }
     watchVersions();
   } catch (err: unknown) {
@@ -297,7 +302,7 @@ function bindEvents(): void {
     const v: number = parseFloat(slider.value);
     if (onboardingMemoryValue) onboardingMemoryValue.textContent = fmtMem(v);
     const gb = systemInfo.value?.total_memory_mb ? Math.floor(systemInfo.value.total_memory_mb / 1024) : null;
-    if (gb && onboardingRec) onboardingRec.textContent = v < 2 ? 'Low — may cause issues' : v > gb * 0.75 ? 'High — leave room for OS' : getMemoryRecommendation(gb).text;
+    if (onboardingRec) onboardingRec.textContent = computeMemoryRecommendationText(v, gb);
     playSliderSound(v / parseFloat(slider.max || '16'), 'memory');
   });
   obThemePresets?.querySelectorAll<HTMLElement>('.ob-theme-btn').forEach((btn: HTMLElement) => {

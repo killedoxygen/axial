@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -71,6 +72,10 @@ func (f *fabricLoader) GameVersions() ([]GameVersion, error) {
 		Stable  bool   `json:"stable"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		if versions, ok, _ := cacheGetAs[[]GameVersion](f.cache, cacheKey); ok {
+			log.Printf("fabric meta decode failed, using stale cache: %v", err)
+			return versions, nil
+		}
 		return nil, fmt.Errorf("fabric meta API: %w", err)
 	}
 
@@ -118,6 +123,10 @@ func (f *fabricLoader) LoaderVersions(mcVersion string) ([]LoaderVersion, error)
 		} `json:"loader"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		if versions, ok, _ := cacheGetAs[[]LoaderVersion](f.cache, cacheKey); ok {
+			log.Printf("fabric meta decode failed, using stale cache: %v", err)
+			return versions, nil
+		}
 		return nil, fmt.Errorf("fabric meta API: %w", err)
 	}
 

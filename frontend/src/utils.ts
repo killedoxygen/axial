@@ -73,7 +73,7 @@ function syncLogFilter(): void {
   if (!filter) return;
   // Rebuild filter options
   const current = filter.value;
-  filter.innerHTML = '<option value="all">All instances</option>';
+  filter.replaceChildren(new Option('All instances', 'all'));
   for (const id of loggedInstances) {
     const inst = instances.value.find((instance) => instance.id === id);
     const name: string = inst?.name || id.slice(0, 8);

@@ -337,7 +337,13 @@ func DownloadFile(client *http.Client, url, destPath, expectedSHA1 string) error
 		}
 	}
 
-	return os.Rename(tmpPath, destPath)
+	if err := os.Rename(tmpPath, destPath); err != nil {
+		if expectedSHA1 != "" && FileExistsWithSHA1(destPath, expectedSHA1) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 // FileExistsWithSHA1 checks whether a file exists and optionally matches the expected hash.
