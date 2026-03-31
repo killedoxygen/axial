@@ -173,6 +173,9 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		i := int(v)
 		s.config.MusicVolume = &i
 	}
+	if v, ok := updates["music_track"].(float64); ok {
+		s.config.MusicTrack = int(v)
+	}
 
 	if err := config.Save(s.config); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to save config: "+err.Error())
@@ -811,28 +814,41 @@ func dirCount(path string) int {
 	return len(entries)
 }
 
-const (
-	musicRemoteURL = "https://github.com/mateoltd/croopor/releases/download/music-v1/celestial-drift-clean.mp3"
-	musicFileName  = "celestial-drift-clean.mp3"
-)
+var musicTracks = []struct {
+	File string
+	URL  string
+}{
+	{"vapor-halo.mp3", "https://github.com/mateoltd/croopor/releases/download/music-v2/vapor-halo.mp3"},
+	{"sublunar-hum.mp3", "https://github.com/mateoltd/croopor/releases/download/music-v2/sublunar-hum.mp3"},
+}
 
 var musicHTTPClient = &http.Client{Timeout: 2 * time.Minute}
 
-func musicLocalPath() string {
-	return filepath.Join(config.MusicDir(), musicFileName)
+func musicLocalPath(idx int) string {
+	return filepath.Join(config.MusicDir(), musicTracks[idx].File)
 }
 
 // handleMusicTrack serves the cached music file, downloading it on first request.
 // Uses http.ServeFile for zero-copy transfer with Range request support.
 func (s *Server) handleMusicTrack(w http.ResponseWriter, r *http.Request) {
-	localPath := musicLocalPath()
+	idx := 0
+	if idxStr := r.URL.Query().Get("t"); idxStr != "" {
+		if i := 0; len(idxStr) == 1 && idxStr[0] >= '0' && idxStr[0] <= '9' {
+			i = int(idxStr[0] - '0')
+			if i < len(musicTracks) {
+				idx = i
+			}
+		}
+	}
+
+	localPath := musicLocalPath(idx)
 
 	if _, err := os.Stat(localPath); err == nil {
 		http.ServeFile(w, r, localPath)
 		return
 	}
 
-	if err := downloadMusicFile(localPath); err != nil {
+	if err := downloadMusicFile(localPath, musicTracks[idx].URL); err != nil {
 		log.Printf("Music download failed: %v", err)
 		writeError(w, http.StatusBadGateway, "failed to download music: "+err.Error())
 		return
@@ -841,13 +857,13 @@ func (s *Server) handleMusicTrack(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, localPath)
 }
 
-func downloadMusicFile(localPath string) error {
+func downloadMusicFile(localPath, remoteURL string) error {
 	if err := os.MkdirAll(filepath.Dir(localPath), 0755); err != nil {
 		return fmt.Errorf("create directory: %w", err)
 	}
 
-	log.Printf("Downloading background music from %s", musicRemoteURL)
-	resp, err := musicHTTPClient.Get(musicRemoteURL)
+	log.Printf("Downloading background music from %s", remoteURL)
+	resp, err := musicHTTPClient.Get(remoteURL)
 	if err != nil {
 		return fmt.Errorf("request: %w", err)
 	}
@@ -879,11 +895,12 @@ func downloadMusicFile(localPath string) error {
 	return nil
 }
 
-// handleMusicStatus returns whether the music file is cached locally.
+// handleMusicStatus returns whether each track is cached locally.
 func (s *Server) handleMusicStatus(w http.ResponseWriter, r *http.Request) {
-	_, err := os.Stat(musicLocalPath())
-	writeJSON(w, http.StatusOK, map[string]any{
-		"cached": err == nil,
-		"track":  "celestial-drift-clean",
-	})
+	tracks := make([]map[string]any, len(musicTracks))
+	for i, t := range musicTracks {
+		_, err := os.Stat(filepath.Join(config.MusicDir(), t.File))
+		tracks[i] = map[string]any{"cached": err == nil, "file": t.File}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"tracks": tracks, "count": len(musicTracks)})
 }

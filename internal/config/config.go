@@ -24,6 +24,7 @@ type Config struct {
 	MCDir            string `json:"mc_dir,omitempty"`
 	MusicEnabled     *bool  `json:"music_enabled,omitempty"`
 	MusicVolume      *int   `json:"music_volume,omitempty"`
+	MusicTrack       int    `json:"music_track,omitempty"`
 }
 
 var (

@@ -2,6 +2,8 @@ import { signal } from '@preact/signals';
 import { api, API } from './api';
 import { byId } from './dom';
 
+const TRACK_COUNT = 2;
+
 let audio: HTMLAudioElement | null = null;
 let fadeRaf: number | null = null;
 let fadeStart = 0;
@@ -52,6 +54,7 @@ function startFade(target: number, cb?: () => void): void {
 export const Music = {
   enabled: false,
   volume: 5,
+  track: 0,
   ready: false,
 
   /** Resolved target volume (0-1). */
@@ -62,14 +65,15 @@ export const Music = {
 
   // -- Configuration --
 
-  applyConfig(cfg: { music_enabled?: boolean; music_volume?: number }): void {
+  applyConfig(cfg: { music_enabled?: boolean; music_volume?: number; music_track?: number }): void {
     if (cfg.music_enabled != null) this.enabled = cfg.music_enabled;
     if (cfg.music_volume != null) this.volume = cfg.music_volume;
+    if (cfg.music_track != null) this.track = cfg.music_track;
     this.syncUI();
   },
 
   persist(): void {
-    api('PUT', '/config', { music_enabled: this.enabled, music_volume: this.volume }).catch(() => {});
+    api('PUT', '/config', { music_enabled: this.enabled, music_volume: this.volume, music_track: this.track }).catch(() => {});
   },
 
   debouncedPersist(): void {
@@ -102,7 +106,7 @@ export const Music = {
       audio.preload = 'none';
     }
     if (!this.ready) {
-      audio.src = `${API}/music/track`;
+      audio.src = `${API}/music/track?t=${this.track}`;
       this.ready = true;
     }
     if (!audio.paused) return;
@@ -117,6 +121,22 @@ export const Music = {
   stop(): void {
     if (!audio || audio.paused) return;
     startFade(0, () => { audio!.pause(); this.syncUI(); });
+  },
+
+  /** Cycle to the next track. Cross-fades if currently playing. */
+  nextTrack(): void {
+    this.track = (this.track + 1) % TRACK_COUNT;
+    this.ready = false;
+    if (audio && !audio.paused) {
+      startFade(0, () => {
+        audio!.pause();
+        audio!.src = `${API}/music/track?t=${this.track}`;
+        this.ready = true;
+        this.play();
+      });
+    }
+    this.persist();
+    this.syncUI();
   },
 
   // -- Game session suppression --

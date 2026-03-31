@@ -173,10 +173,10 @@ input[type="range"]::-moz-range-thumb{width:13px;height:13px;border-radius:50%;b
 .badge-modded{background:color-mix(in srgb,var(--purple) 10%,transparent);color:var(--purple)}
 .badge-loader{padding:3px;display:inline-flex;align-items:center;justify-content:center;line-height:0}
 .badge-loader svg{display:block}
-.badge-fabric{background:color-mix(in srgb,#dbc8a0 12%,transparent);color:#dbc8a0}
-.badge-quilt{background:color-mix(in srgb,#c084fc 12%,transparent);color:#c084fc}
+.badge-fabric{background:color-mix(in srgb,#dbc8a0 12%,transparent);}
+.badge-quilt{background:color-mix(in srgb,#c084fc 12%,transparent);}
 .badge-forge{background:color-mix(in srgb,#60a5fa 12%,transparent);color:#60a5fa}
-.badge-neoforge{background:color-mix(in srgb,#fb923c 12%,transparent);color:#fb923c}
+.badge-neoforge{background:color-mix(in srgb,#fb923c 12%,transparent);}
 .badge-old{background:color-mix(in srgb,var(--text-dim) 8%,transparent);color:var(--text-dim)}
 .version-item.is-running{background:color-mix(in srgb,var(--accent) 8%,var(--surface-0))}
 .version-dot.running{background:var(--accent);box-shadow:0 0 6px var(--accent-glow-strong);animation:dot-breathe 2s ease-in-out infinite}
@@ -641,13 +641,16 @@ body.show-shortcuts .search-box[data-shortcut-hint]::after{top:7px;right:7px}
 .setting-sublabel{font-size:10px;color:var(--text-muted);display:block;margin-bottom:4px}
 
 /* ── Mini Equalizer ── */
-.music-eq{display:flex;align-items:flex-end;gap:2px;height:14px;padding:0 2px}
+.music-eq{display:flex;align-items:flex-end;gap:3px;height:14px;padding:0 6px;cursor:pointer;border-radius:var(--r-sm);transition:background .15s}
+.music-eq:hover{background:var(--surface-1)}
 .music-eq.hidden{display:none}
-.music-eq span{display:block;width:2px;border-radius:1px;background:var(--accent);opacity:0.6}
+.music-eq span{display:block;width:2.5px;border-radius:1px;background:var(--accent);opacity:0.6}
 .music-eq:not(.hidden) span{animation:eq-bar var(--eq-d, 0.8s) var(--eq-delay, 0s) ease-in-out infinite alternate}
 .music-eq span:nth-child(1){--eq-d:0.8s;--eq-delay:-0.3s;height:4px}
 .music-eq span:nth-child(2){--eq-d:0.6s;--eq-delay:-0.1s;height:8px}
 .music-eq span:nth-child(3){--eq-d:0.9s;--eq-delay:-0.5s;height:5px}
+.music-eq span:nth-child(4){--eq-d:0.7s;--eq-delay:-0.4s;height:6px}
+.music-eq span:nth-child(5){--eq-d:0.85s;--eq-delay:-0.2s;height:3px}
 @keyframes eq-bar{0%{height:2px}100%{height:12px}}
 
 /* ══════════════ CONTEXT MENU ══════════════ */

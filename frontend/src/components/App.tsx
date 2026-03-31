@@ -80,7 +80,7 @@ export function App(): JSX.Element {
           </div>
         </div>
         <div class="topbar-right">
-          <div class="music-eq hidden" id="music-eq"><span /><span /><span /></div>
+          <div class="music-eq hidden" id="music-eq" title="Next track"><span /><span /><span /><span /><span /></div>
           <button class="icon-btn" id="music-btn" title="Music off" aria-label="Toggle background music">
             <svg class="music-icon-on" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="display:none">
               <path d="M9 18V5l12-2v13" /><circle cx="6" cy="18" r="3" /><circle cx="18" cy="16" r="3" />

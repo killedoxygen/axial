@@ -258,6 +258,10 @@ function bindEvents(): void {
     Music.toggle();
     Sound.ui(Music.enabled ? 'affirm' : 'soft');
   });
+  byId<HTMLElement>('music-eq')?.addEventListener('click', () => {
+    Music.nextTrack();
+    Sound.ui('click');
+  });
 
   // Onboarding music buttons
   obMusicYes?.addEventListener('click', () => {
