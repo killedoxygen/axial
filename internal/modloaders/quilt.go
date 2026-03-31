@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/mateoltd/croopor/internal/minecraft"
@@ -46,22 +46,22 @@ func (q *quiltLoader) VersionID(mcVersion, loaderVersion string) string {
 func (q *quiltLoader) GameVersions() ([]GameVersion, error) {
 	const cacheKey = "quilt:game_versions"
 
-	if data, ok, fresh := q.cache.Get(cacheKey); ok && fresh {
-		return data.([]GameVersion), nil
+	if versions, ok, fresh := cacheGetAs[[]GameVersion](q.cache, cacheKey); ok && fresh {
+		return versions, nil
 	}
 
 	resp, err := q.client.Get(quiltMetaBase + "/game")
 	if err != nil {
-		if data, ok, _ := q.cache.Get(cacheKey); ok {
-			return data.([]GameVersion), nil
+		if versions, ok, _ := cacheGetAs[[]GameVersion](q.cache, cacheKey); ok {
+			return versions, nil
 		}
 		return nil, fmt.Errorf("quilt meta API: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		if data, ok, _ := q.cache.Get(cacheKey); ok {
-			return data.([]GameVersion), nil
+		if versions, ok, _ := cacheGetAs[[]GameVersion](q.cache, cacheKey); ok {
+			return versions, nil
 		}
 		return nil, fmt.Errorf("quilt meta API: status %d", resp.StatusCode)
 	}
@@ -84,24 +84,29 @@ func (q *quiltLoader) GameVersions() ([]GameVersion, error) {
 }
 
 func (q *quiltLoader) LoaderVersions(mcVersion string) ([]LoaderVersion, error) {
-	cacheKey := "quilt:loader_versions:" + mcVersion
-
-	if data, ok, fresh := q.cache.Get(cacheKey); ok && fresh {
-		return data.([]LoaderVersion), nil
+	safeMCVersion, err := sanitizeVersionSegment("minecraft version", mcVersion)
+	if err != nil {
+		return nil, err
 	}
 
-	resp, err := q.client.Get(quiltMetaBase + "/loader/" + mcVersion)
+	cacheKey := "quilt:loader_versions:" + mcVersion
+
+	if versions, ok, fresh := cacheGetAs[[]LoaderVersion](q.cache, cacheKey); ok && fresh {
+		return versions, nil
+	}
+
+	resp, err := q.client.Get(quiltMetaBase + "/loader/" + url.PathEscape(safeMCVersion))
 	if err != nil {
-		if data, ok, _ := q.cache.Get(cacheKey); ok {
-			return data.([]LoaderVersion), nil
+		if versions, ok, _ := cacheGetAs[[]LoaderVersion](q.cache, cacheKey); ok {
+			return versions, nil
 		}
 		return nil, fmt.Errorf("quilt meta API: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		if data, ok, _ := q.cache.Get(cacheKey); ok {
-			return data.([]LoaderVersion), nil
+		if versions, ok, _ := cacheGetAs[[]LoaderVersion](q.cache, cacheKey); ok {
+			return versions, nil
 		}
 		return nil, fmt.Errorf("quilt meta API: status %d", resp.StatusCode)
 	}
@@ -125,22 +130,36 @@ func (q *quiltLoader) LoaderVersions(mcVersion string) ([]LoaderVersion, error) 
 }
 
 func (q *quiltLoader) Install(mcDir, mcVersion, loaderVersion string, progress chan<- Progress) (*InstallResult, error) {
-	versionID := q.VersionID(mcVersion, loaderVersion)
+	safeMCVersion, err := sanitizeVersionSegment("minecraft version", mcVersion)
+	if err != nil {
+		return nil, err
+	}
+	safeLoaderVersion, err := sanitizeVersionSegment("loader version", loaderVersion)
+	if err != nil {
+		return nil, err
+	}
+
+	versionID := q.VersionID(safeMCVersion, safeLoaderVersion)
 
 	// Check if already installed
-	versionDir := filepath.Join(minecraft.VersionsDir(mcDir), versionID)
-	jsonPath := filepath.Join(versionDir, versionID+".json")
-	markerPath := filepath.Join(versionDir, ".incomplete")
+	versionDir, jsonPath, markerPath, err := resolveVersionFiles(mcDir, versionID)
+	if err != nil {
+		return nil, err
+	}
 	if _, err := os.Stat(jsonPath); err == nil {
 		if _, mErr := os.Stat(markerPath); os.IsNotExist(mErr) {
-			return &InstallResult{VersionID: versionID, GameVersion: mcVersion, LoaderType: Quilt}, nil
+			return &InstallResult{VersionID: versionID, GameVersion: safeMCVersion, LoaderType: Quilt}, nil
+		} else if mErr != nil {
+			return nil, fmt.Errorf("checking incomplete marker: %w", mErr)
 		}
+	} else if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("checking installed Quilt version: %w", err)
 	}
 
 	// Fetch version profile JSON
 	progress <- Progress{Phase: "loader_meta", Current: 0, Total: 1, Detail: "Fetching Quilt profile..."}
 
-	profileURL := fmt.Sprintf("%s/loader/%s/%s/profile/json", quiltMetaBase, mcVersion, loaderVersion)
+	profileURL := fmt.Sprintf("%s/loader/%s/%s/profile/json", quiltMetaBase, url.PathEscape(safeMCVersion), url.PathEscape(safeLoaderVersion))
 	resp, err := q.client.Get(profileURL)
 	if err != nil {
 		return nil, fmt.Errorf("fetching Quilt profile: %w", err)
@@ -180,8 +199,8 @@ func (q *quiltLoader) Install(mcDir, mcVersion, loaderVersion string, progress c
 		return nil, fmt.Errorf("downloading Quilt libraries: %w", err)
 	}
 
-	if err := os.Remove(markerPath); err != nil {
+	if err := os.Remove(markerPath); err != nil && !os.IsNotExist(err) {
 		return nil, fmt.Errorf("removing incomplete marker: %w", err)
 	}
-	return &InstallResult{VersionID: versionID, GameVersion: mcVersion, LoaderType: Quilt}, nil
+	return &InstallResult{VersionID: versionID, GameVersion: safeMCVersion, LoaderType: Quilt}, nil
 }

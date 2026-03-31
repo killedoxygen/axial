@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/mateoltd/croopor/internal/minecraft"
@@ -46,22 +46,22 @@ func (f *fabricLoader) VersionID(mcVersion, loaderVersion string) string {
 func (f *fabricLoader) GameVersions() ([]GameVersion, error) {
 	const cacheKey = "fabric:game_versions"
 
-	if data, ok, fresh := f.cache.Get(cacheKey); ok && fresh {
-		return data.([]GameVersion), nil
+	if versions, ok, fresh := cacheGetAs[[]GameVersion](f.cache, cacheKey); ok && fresh {
+		return versions, nil
 	}
 
 	resp, err := f.client.Get(fabricMetaBase + "/game")
 	if err != nil {
-		if data, ok, _ := f.cache.Get(cacheKey); ok {
-			return data.([]GameVersion), nil // stale fallback
+		if versions, ok, _ := cacheGetAs[[]GameVersion](f.cache, cacheKey); ok {
+			return versions, nil
 		}
 		return nil, fmt.Errorf("fabric meta API: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		if data, ok, _ := f.cache.Get(cacheKey); ok {
-			return data.([]GameVersion), nil
+		if versions, ok, _ := cacheGetAs[[]GameVersion](f.cache, cacheKey); ok {
+			return versions, nil
 		}
 		return nil, fmt.Errorf("fabric meta API: status %d", resp.StatusCode)
 	}
@@ -84,24 +84,29 @@ func (f *fabricLoader) GameVersions() ([]GameVersion, error) {
 }
 
 func (f *fabricLoader) LoaderVersions(mcVersion string) ([]LoaderVersion, error) {
-	cacheKey := "fabric:loader_versions:" + mcVersion
-
-	if data, ok, fresh := f.cache.Get(cacheKey); ok && fresh {
-		return data.([]LoaderVersion), nil
+	safeMCVersion, err := sanitizeVersionSegment("minecraft version", mcVersion)
+	if err != nil {
+		return nil, err
 	}
 
-	resp, err := f.client.Get(fabricMetaBase + "/loader/" + mcVersion)
+	cacheKey := "fabric:loader_versions:" + mcVersion
+
+	if versions, ok, fresh := cacheGetAs[[]LoaderVersion](f.cache, cacheKey); ok && fresh {
+		return versions, nil
+	}
+
+	resp, err := f.client.Get(fabricMetaBase + "/loader/" + url.PathEscape(safeMCVersion))
 	if err != nil {
-		if data, ok, _ := f.cache.Get(cacheKey); ok {
-			return data.([]LoaderVersion), nil
+		if versions, ok, _ := cacheGetAs[[]LoaderVersion](f.cache, cacheKey); ok {
+			return versions, nil
 		}
 		return nil, fmt.Errorf("fabric meta API: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		if data, ok, _ := f.cache.Get(cacheKey); ok {
-			return data.([]LoaderVersion), nil
+		if versions, ok, _ := cacheGetAs[[]LoaderVersion](f.cache, cacheKey); ok {
+			return versions, nil
 		}
 		return nil, fmt.Errorf("fabric meta API: status %d", resp.StatusCode)
 	}
@@ -126,23 +131,37 @@ func (f *fabricLoader) LoaderVersions(mcVersion string) ([]LoaderVersion, error)
 }
 
 func (f *fabricLoader) Install(mcDir, mcVersion, loaderVersion string, progress chan<- Progress) (*InstallResult, error) {
-	versionID := f.VersionID(mcVersion, loaderVersion)
+	safeMCVersion, err := sanitizeVersionSegment("minecraft version", mcVersion)
+	if err != nil {
+		return nil, err
+	}
+	safeLoaderVersion, err := sanitizeVersionSegment("loader version", loaderVersion)
+	if err != nil {
+		return nil, err
+	}
+
+	versionID := f.VersionID(safeMCVersion, safeLoaderVersion)
 
 	// Check if already installed
-	versionDir := filepath.Join(minecraft.VersionsDir(mcDir), versionID)
-	jsonPath := filepath.Join(versionDir, versionID+".json")
-	markerPath := filepath.Join(versionDir, ".incomplete")
+	versionDir, jsonPath, markerPath, err := resolveVersionFiles(mcDir, versionID)
+	if err != nil {
+		return nil, err
+	}
 	if _, err := os.Stat(jsonPath); err == nil {
 		if _, mErr := os.Stat(markerPath); os.IsNotExist(mErr) {
 			// Already installed and complete
-			return &InstallResult{VersionID: versionID, GameVersion: mcVersion, LoaderType: Fabric}, nil
+			return &InstallResult{VersionID: versionID, GameVersion: safeMCVersion, LoaderType: Fabric}, nil
+		} else if mErr != nil {
+			return nil, fmt.Errorf("checking incomplete marker: %w", mErr)
 		}
+	} else if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("checking installed Fabric version: %w", err)
 	}
 
 	// Fetch version profile JSON from meta API
 	progress <- Progress{Phase: "loader_meta", Current: 0, Total: 1, Detail: "Fetching Fabric profile..."}
 
-	profileURL := fmt.Sprintf("%s/loader/%s/%s/profile/json", fabricMetaBase, mcVersion, loaderVersion)
+	profileURL := fmt.Sprintf("%s/loader/%s/%s/profile/json", fabricMetaBase, url.PathEscape(safeMCVersion), url.PathEscape(safeLoaderVersion))
 	resp, err := f.client.Get(profileURL)
 	if err != nil {
 		return nil, fmt.Errorf("fetching Fabric profile: %w", err)
@@ -184,9 +203,9 @@ func (f *fabricLoader) Install(mcDir, mcVersion, loaderVersion string, progress 
 
 	// Remove incomplete marker. Loader-specific install is done.
 	// The base game install will add its own marker for the vanilla version.
-	if err := os.Remove(markerPath); err != nil {
+	if err := os.Remove(markerPath); err != nil && !os.IsNotExist(err) {
 		return nil, fmt.Errorf("removing incomplete marker: %w", err)
 	}
 
-	return &InstallResult{VersionID: versionID, GameVersion: mcVersion, LoaderType: Fabric}, nil
+	return &InstallResult{VersionID: versionID, GameVersion: safeMCVersion, LoaderType: Fabric}, nil
 }

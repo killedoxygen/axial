@@ -160,6 +160,11 @@ func (n *neoforgeLoader) Install(mcDir, mcVersion, loaderVersion string, progres
 		versionDir = filepath.Join(minecraft.VersionsDir(mcDir), versionID)
 		jsonPath = filepath.Join(versionDir, versionID+".json")
 		markerPath = filepath.Join(versionDir, ".incomplete")
+		if _, err := os.Stat(jsonPath); err == nil {
+			if _, mErr := os.Stat(markerPath); os.IsNotExist(mErr) {
+				return &InstallResult{VersionID: versionID, GameVersion: mcVersion, LoaderType: NeoForge}, nil
+			}
+		}
 	}
 
 	// Write version JSON

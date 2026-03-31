@@ -1,5 +1,5 @@
 import type { JSX } from 'preact';
-import { useEffect, useRef } from 'preact/hooks';
+import { useEffect, useMemo, useRef } from 'preact/hooks';
 import { signal } from '@preact/signals';
 import { useSignal } from '@preact/signals';
 import { catalog, instances } from '../store';
@@ -112,17 +112,20 @@ export function NewInstanceModal(): JSX.Element | null {
   const allVersions: CatalogVersion[] = catalog.value?.versions ?? [];
 
   // Filter versions
-  let filteredVersions = allVersions.filter(v => v.type === filter.value);
-  if (loaderEnabled.value && loaderGameVersions.value) {
-    filteredVersions = filterByLoaderSupport(filteredVersions, loaderGameVersions.value);
-  }
-  if (search.value) {
-    const q = search.value.toLowerCase();
-    filteredVersions = filteredVersions.filter(v => {
-      const pd = parseVersionDisplay(v.id, v, allVersions);
-      return v.id.toLowerCase().includes(q) || pd.name.toLowerCase().includes(q);
-    });
-  }
+  const filteredVersions = useMemo(() => {
+    let next = allVersions.filter(v => v.type === filter.value);
+    if (loaderEnabled.value && loaderGameVersions.value) {
+      next = filterByLoaderSupport(next, loaderGameVersions.value);
+    }
+    if (search.value) {
+      const q = search.value.toLowerCase();
+      next = next.filter(v => {
+        const pd = parseVersionDisplay(v.id, v, allVersions);
+        return v.id.toLowerCase().includes(q) || pd.name.toLowerCase().includes(q);
+      });
+    }
+    return next;
+  }, [allVersions, filter.value, loaderEnabled.value, loaderGameVersions.value, search.value]);
 
   const total = filteredVersions.length;
   const totalPages = Math.ceil(total / PAGE_SIZE);

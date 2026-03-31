@@ -2,7 +2,8 @@ import { signal } from '@preact/signals';
 import { api, API } from './api';
 import { byId } from './dom';
 
-const TRACK_COUNT = 2;
+const DEFAULT_TRACK_COUNT = 2;
+let trackCount = DEFAULT_TRACK_COUNT;
 
 let audio: HTMLAudioElement | null = null;
 let fadeRaf: number | null = null;
@@ -18,6 +19,14 @@ export const musicStateVersion = signal(0);
 
 function notifyMusicState(): void {
   musicStateVersion.value += 1;
+}
+
+function clampTrack(track: number): number {
+  if (trackCount <= 0) return 0;
+  if (!Number.isFinite(track)) return 0;
+  if (track < 0) return 0;
+  if (track >= trackCount) return trackCount - 1;
+  return Math.trunc(track);
 }
 
 function fadeStep(ts: number): void {
@@ -68,8 +77,18 @@ export const Music = {
   applyConfig(cfg: { music_enabled?: boolean; music_volume?: number; music_track?: number }): void {
     if (cfg.music_enabled != null) this.enabled = cfg.music_enabled;
     if (cfg.music_volume != null) this.volume = cfg.music_volume;
-    if (cfg.music_track != null) this.track = cfg.music_track;
+    if (cfg.music_track != null) this.track = clampTrack(cfg.music_track);
     this.syncUI();
+  },
+
+  setTrackCount(count?: number): void {
+    if (typeof count === 'number' && Number.isFinite(count) && count > 0) {
+      trackCount = Math.max(1, Math.trunc(count));
+    } else {
+      trackCount = DEFAULT_TRACK_COUNT;
+    }
+    this.track = clampTrack(this.track);
+    notifyMusicState();
   },
 
   persist(): void {
@@ -133,7 +152,7 @@ export const Music = {
 
   /** Cycle to the next track. Cross-fades if currently playing. */
   nextTrack(): void {
-    this.track = (this.track + 1) % TRACK_COUNT;
+    this.track = (this.track + 1) % trackCount;
     this.ready = false;
     if (audio && !audio.paused) {
       startFade(0, () => {

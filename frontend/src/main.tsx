@@ -39,14 +39,16 @@ async function init(): Promise<void> {
   setPage('launcher');
 
   try {
-    const [configRes, systemRes, statusRes] = await Promise.all([
+    const [configRes, systemRes, statusRes, musicStatusRes] = await Promise.all([
       api('GET', '/config'),
       api('GET', '/system').catch(() => null),
       api('GET', '/status').catch(() => null),
+      api('GET', '/music/status').catch(() => null),
     ]);
     config.value = configRes;
     systemInfo.value = systemRes;
     devMode.value = statusRes?.dev_mode === true;
+    Music.setTrackCount(musicStatusRes?.count);
 
     // If Minecraft is not found, show setup screen and wait
     if (statusRes?.setup_required) {

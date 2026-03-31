@@ -302,11 +302,25 @@ func extractFromInstallerJar(jarData []byte, entryPath, tempDir string) string {
 		}
 
 		destPath := filepath.Join(tempDir, filepath.FromSlash(entryPath))
-		os.MkdirAll(filepath.Dir(destPath), 0755)
-		if err := os.WriteFile(destPath, data, 0644); err != nil {
+		tempDirAbs, err := filepath.Abs(tempDir)
+		if err != nil {
 			return ""
 		}
-		return destPath
+		destPathAbs, err := filepath.Abs(filepath.Clean(destPath))
+		if err != nil {
+			return ""
+		}
+		rel, err := filepath.Rel(tempDirAbs, destPathAbs)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+			return ""
+		}
+		if err := os.MkdirAll(filepath.Dir(destPathAbs), 0755); err != nil {
+			return ""
+		}
+		if err := os.WriteFile(destPathAbs, data, 0644); err != nil {
+			return ""
+		}
+		return destPathAbs
 	}
 	return ""
 }

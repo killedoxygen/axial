@@ -46,3 +46,23 @@ func (c *MetaCache) Set(key string, data any) {
 	c.entries[key] = cacheEntry{data: data, fetchedAt: time.Now()}
 	c.mu.Unlock()
 }
+
+// Delete removes a cached entry.
+func (c *MetaCache) Delete(key string) {
+	c.mu.Lock()
+	delete(c.entries, key)
+	c.mu.Unlock()
+}
+
+func cacheGetAs[T any](cache *MetaCache, key string) (value T, ok bool, fresh bool) {
+	data, ok, fresh := cache.Get(key)
+	if !ok {
+		return value, false, false
+	}
+	typed, typeOK := data.(T)
+	if !typeOK {
+		cache.Delete(key)
+		return value, false, false
+	}
+	return typed, true, fresh
+}
