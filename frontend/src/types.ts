@@ -58,6 +58,7 @@ export interface Config {
   mc_dir?: string;
   music_enabled?: boolean;
   music_volume?: number;
+  music_track?: number;
 }
 
 export interface SystemInfo {

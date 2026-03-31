@@ -1,5 +1,6 @@
 import { byId } from './dom';
 import { currentPage, instances, logLines } from './store';
+import type { Page } from './types';
 
 const loggedInstances = new Set<string>();
 let activeLogFilter = 'all';
@@ -192,8 +193,8 @@ export function updateMemoryRecText(val: number, totalGB: number): void {
   memoryRec.textContent = val < 2 ? '(low — may lag)' : val > totalGB * 0.75 ? '(high — leave room for OS)' : '';
 }
 
-export function setPage(page: string): void {
-  currentPage.value = page as 'launcher' | 'settings';
+export function setPage(page: Page): void {
+  currentPage.value = page;
 }
 
 export function toggleShortcutHints(show: boolean): void {

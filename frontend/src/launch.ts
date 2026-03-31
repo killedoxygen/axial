@@ -147,9 +147,9 @@ async function connectLaunchEvents(sessionId: string, instanceId: string, instan
 
   es.onerror = () => {
     if (es.readyState !== EventSource.CLOSED) return;
-    if (runningSessions.value[instanceId]?.sessionId === sessionId) {
-      onGameExited(-1, instanceId, instanceName, sessionId, es);
-    }
+    if (runningSessions.value[instanceId]?.sessionId !== sessionId) return;
+    appendLog('system', `Lost live updates for ${instanceName || instanceId}. The game may still be running.`, instanceId, instanceName);
+    es.close();
   };
 }
 

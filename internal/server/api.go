@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -174,7 +176,18 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		s.config.MusicVolume = &i
 	}
 	if v, ok := updates["music_track"].(float64); ok {
-		s.config.MusicTrack = int(v)
+		if v == math.Trunc(v) {
+			idx := int(v)
+			if idx < 0 {
+				idx = 0
+			}
+			if idx >= len(musicTracks) {
+				idx = len(musicTracks) - 1
+			}
+			if len(musicTracks) > 0 {
+				s.config.MusicTrack = idx
+			}
+		}
 	}
 
 	if err := config.Save(s.config); err != nil {
@@ -833,9 +846,14 @@ func musicLocalPath(idx int) string {
 func (s *Server) handleMusicTrack(w http.ResponseWriter, r *http.Request) {
 	idx := 0
 	if idxStr := r.URL.Query().Get("t"); idxStr != "" {
-		if i := 0; len(idxStr) == 1 && idxStr[0] >= '0' && idxStr[0] <= '9' {
-			i = int(idxStr[0] - '0')
-			if i < len(musicTracks) {
+		if i, err := strconv.Atoi(idxStr); err == nil {
+			if i < 0 {
+				i = 0
+			}
+			if i >= len(musicTracks) {
+				i = len(musicTracks) - 1
+			}
+			if len(musicTracks) > 0 {
 				idx = i
 			}
 		}

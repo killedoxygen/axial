@@ -133,13 +133,15 @@ export function showOnboarding(): void {
     const gb: number = Math.floor(systemInfo.value.total_memory_mb / 1024);
     const onboardingRamInfo = byId<HTMLElement>('onboarding-ram-info');
     const onboardingMemorySlider = byId<HTMLInputElement>('onboarding-memory-slider');
+    const onboardingMemoryValue = byId<HTMLElement>('onboarding-memory-value');
+    const onboardingRec = byId<HTMLElement>('onboarding-rec');
     if (onboardingRamInfo) onboardingRamInfo.textContent = `Your system has ${gb} GB of RAM`;
     if (onboardingMemorySlider) {
       onboardingMemorySlider.max = String(gb);
       const { rec, text } = getMemoryRecommendation(gb);
       onboardingMemorySlider.value = String(rec);
-      byId<HTMLElement>('onboarding-memory-value')!.textContent = fmtMem(rec);
-      byId<HTMLElement>('onboarding-rec')!.textContent = text;
+      if (onboardingMemoryValue) onboardingMemoryValue.textContent = fmtMem(rec);
+      if (onboardingRec) onboardingRec.textContent = text;
     }
   }
   positionFieldMarker(byId('ob-color-field'), byId('ob-color-field-marker'), local.customHue, local.customVibrancy);

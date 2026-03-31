@@ -37,11 +37,13 @@ func TestBridgeInstallEvents(t *testing.T) {
 	dl.ProgressCh <- minecraft.DownloadProgress{Phase: "done", Current: 1, Total: 1, Done: true}
 	close(dl.ProgressCh)
 
-	waitFor(func() bool {
+	if !waitFor(func() bool {
 		mu.Lock()
 		defer mu.Unlock()
 		return len(events) == 2
-	})
+	}) {
+		t.Fatal("timed out waiting for install bridge events")
+	}
 
 	if got := events[0].Phase; got != "version_json" {
 		t.Fatalf("first phase = %q, want version_json", got)
@@ -119,11 +121,13 @@ func TestBridgeLaunchEvents(t *testing.T) {
 	process.LogChan <- launcher.LogLine{Source: "stdout", Text: "hello"}
 	close(process.LogChan)
 
-	waitFor(func() bool {
+	if !waitFor(func() bool {
 		mu.Lock()
 		defer mu.Unlock()
 		return len(events) == 3
-	})
+	}) {
+		t.Fatal("timed out waiting for launch bridge events")
+	}
 
 	if events[0].Type != "status" || events[0].Data["state"] != string(launcher.StateRunning) {
 		t.Fatalf("unexpected initial status event: %+v", events[0])
@@ -136,12 +140,13 @@ func TestBridgeLaunchEvents(t *testing.T) {
 	}
 }
 
-func waitFor(check func() bool) {
+func waitFor(check func() bool) bool {
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if check() {
-			return
+			return true
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	return false
 }

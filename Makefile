@@ -63,3 +63,4 @@ verify: check test build wails-build
 
 clean:
 	rm -rf $(BIN_DIR)
+	rm -rf $(GO_CACHE_DIR)

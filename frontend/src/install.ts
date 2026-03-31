@@ -36,7 +36,6 @@ export function installVersion(target: string): void {
   if (!target) return;
   const active = installState.value;
   if (active.status === 'active' && active.versionId === target) return;
-  if (installState.value.status === 'active' && installState.value.versionId === target) return;
   enqueueInstall({ versionId: target });
   if (installState.value.status === 'idle') processNextInstall();
 }

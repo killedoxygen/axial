@@ -166,7 +166,7 @@ export function DeleteWizard(): JSX.Element | null {
                     <strong class="delete-card-title">Dependent Versions</strong>
                     <p class="delete-card-text">These modded versions rely on <strong id="delete-dep-parent">{target.id}</strong> as their base. Deleting it will make them unlaunchable.</p>
                     <div class="delete-dep-list" id="delete-dep-list">
-                      {dependents.map((dependent) => <span class="delete-dep-tag">{dependent}</span>)}
+                      {dependents.map((dependent) => <span key={dependent} class="delete-dep-tag">{dependent}</span>)}
                     </div>
                     <label class="delete-checkbox">
                       <input type="checkbox" id="delete-cascade-check" checked={cascade.value} onChange={(e) => { cascade.value = (e.currentTarget as HTMLInputElement).checked; }} />
@@ -186,7 +186,7 @@ export function DeleteWizard(): JSX.Element | null {
                     <p class="delete-card-text">Worlds are stored in the shared <code>saves/</code> folder and won't be deleted. You have <strong id="delete-world-count">{worlds.length}</strong> world(s):</p>
                     <div class="delete-world-list" id="delete-world-list">
                       {worlds.slice(0, 12).map((world) => (
-                        <span class="delete-world-tag">
+                        <span key={`${world.name}:${world.size}`} class="delete-world-tag">
                           {world.name} <span class="delete-world-tag-size">{formatBytes(world.size)}</span>
                         </span>
                       ))}
@@ -208,7 +208,7 @@ export function DeleteWizard(): JSX.Element | null {
                     <p class="delete-card-text" id="delete-shared-text">Your mods, resource packs, and shader packs are shared across all versions and won't be affected.</p>
                     <div class="delete-shared-list" id="delete-shared-list">
                       {sharedData.map((item) => (
-                        <span class="delete-shared-tag">
+                        <span key={`${item.name}:${item.count}`} class="delete-shared-tag">
                           {item.name} <span class="delete-shared-tag-count">{item.count} items</span>
                         </span>
                       ))}

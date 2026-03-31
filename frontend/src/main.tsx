@@ -175,7 +175,7 @@ function bindEvents(): void {
 
   $$<HTMLElement>('.filter-chips .chip[data-filter]').forEach((chip: HTMLElement) => {
     chip.addEventListener('click', () => {
-      chip.parentElement!.querySelectorAll('.chip').forEach((c: Element) => c.classList.remove('active'));
+      chip.parentElement?.querySelectorAll('.chip').forEach((c: Element) => c.classList.remove('active'));
       chip.classList.add('active');
       sidebarFilter.value = chip.dataset.filter || 'all';
       local.sidebarFilter = sidebarFilter.value;
@@ -395,7 +395,8 @@ function bindEvents(): void {
       else if (document.getElementById('new-instance-modal')) closeNewInstanceFlow();
       else if (currentPage.value === 'settings') closeSettings();
     }
-    if (byId<HTMLElement>('onboarding') && !byId<HTMLElement>('onboarding')?.classList.contains('hidden')) {
+    const onboardingEl = byId<HTMLElement>('onboarding');
+    if (onboardingEl && !onboardingEl.classList.contains('hidden')) {
       if (e.key === 'Enter') { e.preventDefault(); onboardingNext(); }
       if (e.key === 'Backspace' && getObStep() > 1 && document.activeElement?.tagName !== 'INPUT') { e.preventDefault(); onboardingBack(); }
     }

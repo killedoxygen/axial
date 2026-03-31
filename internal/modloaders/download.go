@@ -43,7 +43,9 @@ func DownloadLibraries(libs []minecraft.Library, mcDir string, progress chan<- P
 			continue
 		}
 
-		os.MkdirAll(filepath.Dir(libPath), 0755)
+		if err := os.MkdirAll(filepath.Dir(libPath), 0755); err != nil {
+			return err
+		}
 		if err := minecraft.DownloadFile(DefaultClient, libURL, libPath, libSHA1); err != nil {
 			return err
 		}

@@ -191,7 +191,9 @@ func (f *forgeLoader) Install(mcDir, mcVersion, loaderVersion string, progress c
 	if err := os.MkdirAll(versionDir, 0755); err != nil {
 		return nil, fmt.Errorf("creating version directory: %w", err)
 	}
-	os.WriteFile(markerPath, []byte("installing"), 0644)
+	if err := os.WriteFile(markerPath, []byte("installing"), 0644); err != nil {
+		return nil, fmt.Errorf("creating incomplete marker: %w", err)
+	}
 
 	if err := os.WriteFile(jsonPath, versionJSON, 0644); err != nil {
 		return nil, fmt.Errorf("writing version JSON: %w", err)
@@ -221,7 +223,9 @@ func (f *forgeLoader) Install(mcDir, mcVersion, loaderVersion string, progress c
 		}
 	}
 
-	os.Remove(markerPath)
+	if err := os.Remove(markerPath); err != nil {
+		return nil, fmt.Errorf("removing incomplete marker: %w", err)
+	}
 	return &InstallResult{VersionID: versionID, GameVersion: mcVersion, LoaderType: Forge}, nil
 }
 
@@ -250,6 +254,11 @@ func (f *forgeLoader) fetchMavenVersions() ([]string, error) {
 
 	var meta mavenMetadata
 	if err := xml.NewDecoder(resp.Body).Decode(&meta); err != nil {
+		if data, ok, _ := f.cache.Get(cacheKey); ok {
+			if cached, ok := data.([]string); ok {
+				return cached, nil
+			}
+		}
 		return nil, fmt.Errorf("parsing forge maven metadata: %w", err)
 	}
 
@@ -400,6 +409,12 @@ func extractInstallerDataFiles(jarData []byte, mcDir string) error {
 		}
 
 		destPath := filepath.Join(libDir, filepath.FromSlash(relPath))
+		cleanLibDir := filepath.Clean(libDir)
+		cleanDestPath := filepath.Clean(destPath)
+		relDest, err := filepath.Rel(cleanLibDir, cleanDestPath)
+		if err != nil || relDest == ".." || strings.HasPrefix(relDest, ".."+string(os.PathSeparator)) {
+			continue
+		}
 		if _, err := os.Stat(destPath); err == nil {
 			continue // Already exists
 		}
@@ -414,8 +429,12 @@ func extractInstallerDataFiles(jarData []byte, mcDir string) error {
 			continue
 		}
 
-		os.MkdirAll(filepath.Dir(destPath), 0755)
-		os.WriteFile(destPath, data, 0644)
+		if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+			return fmt.Errorf("creating installer library dir %s: %w", filepath.Dir(destPath), err)
+		}
+		if err := os.WriteFile(destPath, data, 0644); err != nil {
+			return fmt.Errorf("writing installer library %s: %w", destPath, err)
+		}
 	}
 
 	return nil

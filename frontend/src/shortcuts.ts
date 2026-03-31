@@ -49,7 +49,11 @@ export const Shortcuts = {
 export function syncShortcutHints(): void {
   document.querySelectorAll('[data-action]').forEach(el => {
     const action = (el as HTMLElement).dataset.action;
-    const label = Shortcuts.format(action!);
+    if (!action) {
+      el.removeAttribute('data-shortcut-hint');
+      return;
+    }
+    const label = Shortcuts.format(action);
     if (label) el.setAttribute('data-shortcut-hint', label);
     else el.removeAttribute('data-shortcut-hint');
   });

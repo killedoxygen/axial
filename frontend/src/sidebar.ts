@@ -1,12 +1,13 @@
 import { api, API } from './api';
 import { catalog, versions } from './store';
 import { isWailsRuntime } from './native';
+import type { Version } from './types';
 
 let versionWatcher: EventSource | null = null;
 let versionPollTimer: ReturnType<typeof setInterval> | null = null;
 
-function applyVersions(nextVersions: Array<{ id: string; launchable: boolean }>): void {
-  versions.value = nextVersions as any;
+function applyVersions(nextVersions: Version[]): void {
+  versions.value = nextVersions;
 
   if (catalog.value) {
     const installed = new Set<string>(
@@ -47,7 +48,7 @@ export function watchVersions(): void {
 
   es.addEventListener('versions_changed', (e: MessageEvent) => {
     try {
-      const data: { versions?: Array<{ id: string; launchable: boolean }> } = JSON.parse(e.data);
+      const data: { versions?: Version[] } = JSON.parse(e.data);
       applyVersions(data.versions || []);
     } catch {}
   });
