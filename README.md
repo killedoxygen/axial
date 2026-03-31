@@ -1,6 +1,6 @@
 # Croopor
 
-A standalone Minecraft launcher that fully replaces the official launcher for offline play. Manages versions, instances, Java runtimes, and mod loaders independently — no Mojang launcher required.
+A standalone Minecraft launcher that fully replaces the official launcher for offline play. It manages versions, instances, Java runtimes, and mod loaders independently. No Mojang launcher required.
 
 Croopor is currently a **paralauncher**: it runs alongside or instead of the official launcher, but doesn't yet support Microsoft account authentication. Online-mode server play requires a premium account through the official launcher. MSA authentication is on the roadmap to make Croopor a complete standalone launcher.
 

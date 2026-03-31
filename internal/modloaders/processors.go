@@ -250,7 +250,7 @@ func buildDataVars(data map[string]dataEntry, mcDir, mcVersion, versionID string
 			continue
 		}
 
-		// If value starts with /, it's a path inside the installer JAR — extract to temp
+		// If the value starts with /, it is a path inside the installer JAR. Extract it to temp.
 		if strings.HasPrefix(val, "/") {
 			if tempDir == "" {
 				var err error

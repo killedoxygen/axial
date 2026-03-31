@@ -182,7 +182,7 @@ func (f *fabricLoader) Install(mcDir, mcVersion, loaderVersion string, progress 
 		return nil, fmt.Errorf("downloading Fabric libraries: %w", err)
 	}
 
-	// Remove incomplete marker — loader-specific install is done.
+	// Remove incomplete marker. Loader-specific install is done.
 	// The base game install will add its own marker for the vanilla version.
 	if err := os.Remove(markerPath); err != nil {
 		return nil, fmt.Errorf("removing incomplete marker: %w", err)

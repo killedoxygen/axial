@@ -355,7 +355,7 @@ type installRequest struct {
 	ManifestURL string `json:"manifest_url,omitempty"`
 }
 
-// handleInstall starts a version download. manifest_url is optional —
+// handleInstall starts a version download. manifest_url is optional -
 // if empty, the downloader resolves it from the Mojang manifest or uses local JSON.
 func (s *Server) handleInstall(w http.ResponseWriter, r *http.Request) {
 	var req installRequest
@@ -373,7 +373,7 @@ func (s *Server) handleInstall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// manifest_url is now optional — the downloader resolves it if empty
+	// manifest_url is now optional. The downloader resolves it if empty.
 	installID := randomID()
 	dl := minecraft.NewDownloader(mcDir)
 	s.installs.Add(installID, dl)
@@ -780,7 +780,7 @@ func (s *Server) handleVersionWatch(w http.ResponseWriter, r *http.Request) {
 	lastMod := dirModTime(minecraft.VersionsDir(mcDir))
 	lastCount := dirCount(minecraft.VersionsDir(mcDir))
 
-	// 5s is plenty — mod loaders take seconds to install, users won't
+	// 5s is plenty. Mod loaders take seconds to install, users will not
 	// notice a few seconds delay. Costs 1 Stat syscall per tick.
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()

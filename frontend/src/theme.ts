@@ -46,7 +46,7 @@ export function findFixedLightness(hue: number, vibrancy: number, currentLt: num
   return dir > 0 ? 100 : 0;
 }
 
-// generateThemeFromHue — exact copy from original lines 295-330
+// generateThemeFromHue - exact copy from original lines 295-330
 export function generateThemeFromHue(hue: number, vibrancy: number, lightness: number): Record<string, string> {
   const v = (vibrancy != null ? vibrancy : 100) / 100;
   const l = (lightness != null ? lightness : 0) / 100;
@@ -89,7 +89,7 @@ interface ApplyThemeOptions {
   lightness?: number;
 }
 
-// applyTheme — exact copy from original lines 332-371
+// applyTheme - exact copy from original lines 332-371
 export function applyTheme(theme: string, hue: number | null, options: ApplyThemeOptions = {}): void {
   const { silent = false, vibrancy, lightness } = options;
   const el = document.documentElement;
@@ -145,7 +145,7 @@ export function applyTheme(theme: string, hue: number | null, options: ApplyThem
   if (!silent) Sound.ui('theme');
 }
 
-// animateMarkerToHue — exact copy from lines 373-380
+// animateMarkerToHue - exact copy from lines 373-380
 export function animateMarkerToHue(field: HTMLElement | null, marker: HTMLElement | null, hue: number): void {
   if (!field || !marker) return;
   marker.classList.add('animating');
@@ -155,7 +155,7 @@ export function animateMarkerToHue(field: HTMLElement | null, marker: HTMLElemen
   setTimeout(() => marker.classList.remove('animating'), 380);
 }
 
-// positionFieldMarker — exact copy from lines 434-439
+// positionFieldMarker - exact copy from lines 434-439
 export function positionFieldMarker(field: HTMLElement | null, marker: HTMLElement | null, hue: number, vibrancy: number): void {
   if (!field || !marker) return;
   marker.style.left = `${(hue / 360) * 100}%`;
@@ -163,7 +163,7 @@ export function positionFieldMarker(field: HTMLElement | null, marker: HTMLEleme
   marker.style.background = `hsl(${hue},65%,55%)`;
 }
 
-// initColorField — exact copy from lines 441-465
+// initColorField - exact copy from lines 441-465
 export function initColorField(field: HTMLElement | null, marker: HTMLElement | null, onDrag: (hue: number, vibrancy: number) => void, onEnd?: () => void): void {
   if (!field) return;
   let active = false;

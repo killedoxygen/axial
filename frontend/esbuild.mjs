@@ -24,7 +24,7 @@ const sizeReporter = {
 };
 
 if (mode === 'serve') {
-  // Standalone dev server — rebuilds per request, no disk writes
+  // Standalone dev server, rebuilds per request and does not write to disk
   const ctx = await context({
     ...shared, sourcemap: 'inline', metafile: true, plugins: [sizeReporter],
   });
@@ -32,7 +32,7 @@ if (mode === 'serve') {
   console.log(`dev → http://localhost:${port}`);
 
 } else if (mode === 'watch') {
-  // File watcher for wails dev — rebuilds to disk on source change
+  // File watcher for wails dev, rebuilds to disk on source change
   const ctx = await context({
     ...shared, sourcemap: 'inline', metafile: true, plugins: [sizeReporter],
   });

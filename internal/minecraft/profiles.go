@@ -90,7 +90,7 @@ func EnsureLauncherProfiles(mcDir string, versionID string) error {
 		return err
 	}
 
-	// Also write the Microsoft Store variant — Forge/Fabric check both filenames
+	// Also write the Microsoft Store variant. Forge and Fabric check both filenames.
 	msStorePath := filepath.Join(mcDir, "launcher_profiles_microsoft_store.json")
 	if _, err := os.Stat(msStorePath); os.IsNotExist(err) {
 		os.WriteFile(msStorePath, out, 0644)

@@ -2,7 +2,7 @@
 
 ## Sounds
 - Button sounds are owned by the global `bindButtonSounds()` listener. Never call `Sound.ui()` from a button's click handler if the button is already matched by `inferButtonSound()`.
-- Non-button elements (divs, spans acting as controls) must call `Sound.ui()` explicitly — the global listener ignores them.
+- Non-button elements (divs, spans acting as controls) must call `Sound.ui()` explicitly. The global listener ignores them.
 - Add new button sound mappings in `inferButtonSound()`, not at the call site.
 - Slider sounds are throttled per family. Use `playSliderSound()`, never `Sound.ui('slider')` directly.
 

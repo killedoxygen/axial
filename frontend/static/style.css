@@ -1,5 +1,5 @@
 /* ═══════════════════════════════════════════
-   Croopor — Theme System & UI v2
+   Croopor, Theme System & UI v2
    ═══════════════════════════════════════════ */
 
 /* ── Themes ── */
@@ -611,7 +611,7 @@ body.show-shortcuts .search-box[data-shortcut-hint]::after{top:7px;right:7px}
 .onboarding-check{font-size:44px;color:var(--accent);line-height:1;margin-bottom:6px;animation:ob-check .5s cubic-bezier(.34,1.56,.64,1)}
 @keyframes ob-check{from{opacity:0;transform:scale(.5)}to{opacity:1;transform:scale(1)}}
 
-/* Footer: Back · Dots · Continue — always pinned */
+/* Footer: Back · Dots · Continue, always pinned */
 .onboarding-footer{display:flex;align-items:center;justify-content:space-between;width:100%;padding-top:24px;flex-shrink:0}
 .onboarding-back{
   display:flex;align-items:center;justify-content:center;width:32px;height:32px;border-radius:var(--r-sm);
@@ -624,7 +624,7 @@ body.show-shortcuts .search-box[data-shortcut-hint]::after{top:7px;right:7px}
 .dot{width:6px;height:6px;border-radius:50%;background:var(--surface-3);transition:all .3s ease}
 .dot.active{background:var(--accent);box-shadow:0 0 6px var(--accent-glow)}
 
-/* Theme presets grid — 5 columns, no wrapping */
+/* Theme presets grid, 5 columns, no wrapping */
 .ob-theme-presets{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;width:100%;margin:4px 0}
 .ob-theme-btn{display:flex;flex-direction:column;align-items:center;gap:4px;padding:8px 6px;border-radius:var(--r-md);border:2px solid transparent;background:var(--surface-1);cursor:pointer;transition:all .2s;font-family:var(--font-mono);font-size:9px;font-weight:600;color:var(--text-dim)}
 .ob-theme-btn:hover{border-color:var(--border-hover)}

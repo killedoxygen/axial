@@ -66,7 +66,7 @@ func (d *Downloader) InstallVersion(versionID, manifestURL string) {
 			return
 		}
 	} else if _, err := os.Stat(jsonPath); os.IsNotExist(err) {
-		// No manifest URL and no local JSON — try to resolve from manifest
+		// No manifest URL and no local JSON, try to resolve from the manifest
 		resolved, lookupErr := d.resolveManifestURL(versionID)
 		if lookupErr != nil || resolved == "" {
 			d.sendError("Cannot find download URL for version " + versionID)
@@ -157,7 +157,7 @@ func (d *Downloader) InstallVersion(versionID, manifestURL string) {
 	// Ensure launcher_profiles.json exists for mod loader compatibility
 	EnsureLauncherProfiles(d.MCDir, versionID)
 
-	// Installation succeeded — remove the incomplete marker
+	// Installation succeeded, remove the incomplete marker
 	os.Remove(filepath.Join(versionDir, ".incomplete"))
 
 	d.send(DownloadProgress{Phase: "done", Current: 1, Total: 1, Done: true})

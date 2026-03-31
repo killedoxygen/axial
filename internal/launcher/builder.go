@@ -76,7 +76,7 @@ func BuildAndLaunch(opts LaunchOptions) (*LaunchResult, error) {
 	}
 
 	// Step 7: Extract native DLLs from native library JARs into the natives directory.
-	// Required for ALL versions — legacy versions use classifier JARs, modern versions
+	// Required for ALL versions. Legacy versions use classifier JARs, modern versions
 	// use separate native library entries, but both need extraction.
 	if err := ExtractLegacyNatives(libs, nativesDir); err != nil {
 		CleanupNativesDir(nativesDir)
@@ -174,7 +174,7 @@ func BuildAndLaunch(opts LaunchOptions) (*LaunchResult, error) {
 	cmdArgs = append(cmdArgs, gameArgs...)
 
 	// Step 12b: Prefetch key files into OS page cache before JVM starts.
-	// Synchronous — ensures files are in cache before the JVM touches them.
+	// Synchronous. Ensures files are in cache before the JVM touches them.
 	prefetchForLaunch(libs, clientJarPath, opts.MCDir, version.AssetIndex.ID)
 
 	// Step 13: Create exec.Cmd
@@ -220,7 +220,7 @@ func BuildAndLaunch(opts LaunchOptions) (*LaunchResult, error) {
 		}()
 	}
 
-	// Step 17: Auto-repair CDS — if the JVM detects a corrupted archive, invalidate it
+	// Step 17: Auto-repair CDS. If the JVM detects a corrupted archive, invalidate it.
 	if len(cdsArgs) > 0 {
 		cdsVersionID := opts.VersionID
 		go func() {
