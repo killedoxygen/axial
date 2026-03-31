@@ -158,9 +158,9 @@ func (gp *GameProcess) Start() error {
 // Boot-complete marker strings. When any of these appear in game output,
 // the game has finished loading and we can promote the process to normal priority.
 var bootMarkers = []string{
-	"Setting user:",    // Modern versions after login
-	"LWJGL Version",   // Legacy versions during LWJGL init
-	"[Render thread",  // 1.13+ render thread initialization
+	"Setting user:",  // Modern versions after login
+	"LWJGL Version",  // Legacy versions during LWJGL init
+	"[Render thread", // 1.13+ render thread initialization
 }
 
 func (gp *GameProcess) streamOutput(r io.Reader, source string) {
@@ -255,7 +255,7 @@ func (gp *GameProcess) GetState() ProcessState {
 
 // PID returns the process ID, or 0 if not running.
 func (gp *GameProcess) PID() int {
-	if gp.cmd.Process == nil {
+	if gp.cmd == nil || gp.cmd.Process == nil {
 		return 0
 	}
 	return gp.cmd.Process.Pid

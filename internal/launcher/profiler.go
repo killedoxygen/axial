@@ -21,21 +21,21 @@ type BootProfile struct {
 	FinishedAt time.Time `json:"finished_at,omitempty"`
 
 	// System info
-	SystemCPUs  int    `json:"system_cpus"`
-	SystemOS    string `json:"system_os"`
-	SystemArch  string `json:"system_arch"`
+	SystemCPUs int    `json:"system_cpus"`
+	SystemOS   string `json:"system_os"`
+	SystemArch string `json:"system_arch"`
 
 	// Configuration applied
-	JVMPreset     string `json:"jvm_preset"`
-	MaxMemoryMB   int    `json:"max_memory_mb"`
-	ThrottleCap   int    `json:"throttle_cap_pct"`
-	CDS           bool   `json:"cds_enabled"`
+	JVMPreset   string `json:"jvm_preset"`
+	MaxMemoryMB int    `json:"max_memory_mb"`
+	ThrottleCap int    `json:"throttle_cap_pct"`
+	CDS         bool   `json:"cds_enabled"`
 
 	// Samples collected during boot
 	Samples []BootSample `json:"samples"`
 
 	// Summary (computed at end)
-	BootDurationMs int64  `json:"boot_duration_ms,omitempty"`
+	BootDurationMs int64   `json:"boot_duration_ms,omitempty"`
 	PeakCPUPct     float64 `json:"peak_cpu_pct,omitempty"`
 	PeakMemMB      int64   `json:"peak_mem_mb,omitempty"`
 	PeakThreads    int     `json:"peak_threads,omitempty"`
@@ -48,31 +48,31 @@ type BootProfile struct {
 
 // BootSample is a single point-in-time snapshot of the process.
 type BootSample struct {
-	ElapsedMs    int64   `json:"elapsed_ms"`
-	CPUPct       float64 `json:"cpu_pct"`        // Process CPU usage (% of one core)
-	MemResidentMB int64  `json:"mem_resident_mb"` // RSS in MB
-	MemVirtualMB  int64  `json:"mem_virtual_mb"`  // Virtual memory in MB
-	ThreadCount   int    `json:"thread_count"`
+	ElapsedMs     int64   `json:"elapsed_ms"`
+	CPUPct        float64 `json:"cpu_pct"`         // Process CPU usage (% of one core)
+	MemResidentMB int64   `json:"mem_resident_mb"` // RSS in MB
+	MemVirtualMB  int64   `json:"mem_virtual_mb"`  // Virtual memory in MB
+	ThreadCount   int     `json:"thread_count"`
 	// Disk I/O metrics (cumulative since process start)
-	IOReadMB     float64 `json:"io_read_mb"`      // Total bytes read from disk
-	IOWriteMB    float64 `json:"io_write_mb"`     // Total bytes written to disk
-	IOReadOps    int64   `json:"io_read_ops"`     // Number of read syscalls
-	IOWriteOps   int64   `json:"io_write_ops"`    // Number of write syscalls
+	IOReadMB   float64 `json:"io_read_mb"`   // Total bytes read from disk
+	IOWriteMB  float64 `json:"io_write_mb"`  // Total bytes written to disk
+	IOReadOps  int64   `json:"io_read_ops"`  // Number of read syscalls
+	IOWriteOps int64   `json:"io_write_ops"` // Number of write syscalls
 	// System-wide metrics
-	SystemCPUPct  float64 `json:"system_cpu_pct"`  // Total system CPU usage
-	SystemFreeMB  int64   `json:"system_free_mb"`  // Free physical memory
+	SystemCPUPct float64 `json:"system_cpu_pct"` // Total system CPU usage
+	SystemFreeMB int64   `json:"system_free_mb"` // Free physical memory
 }
 
 // NewBootProfile creates a profiler for a game launch session.
 func NewBootProfile(sessionID, versionID string, pid int, jvmPreset string, maxMem int, throttleCap int, cds bool) *BootProfile {
 	return &BootProfile{
-		SessionID:  sessionID,
-		VersionID:  versionID,
-		StartedAt:  time.Now(),
-		SystemCPUs: runtime.NumCPU(),
-		SystemOS:   runtime.GOOS,
-		SystemArch: runtime.GOARCH,
-		JVMPreset:  jvmPreset,
+		SessionID:   sessionID,
+		VersionID:   versionID,
+		StartedAt:   time.Now(),
+		SystemCPUs:  runtime.NumCPU(),
+		SystemOS:    runtime.GOOS,
+		SystemArch:  runtime.GOARCH,
+		JVMPreset:   jvmPreset,
 		MaxMemoryMB: maxMem,
 		ThrottleCap: throttleCap,
 		CDS:         cds,

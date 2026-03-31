@@ -142,7 +142,7 @@ func downloadRuntime(component, destDir string) error {
 
 	var allRuntimes map[string]map[string][]struct {
 		Availability struct {
-			Group   int `json:"group"`
+			Group    int `json:"group"`
 			Progress int `json:"progress"`
 		} `json:"availability"`
 		Manifest struct {
@@ -151,7 +151,7 @@ func downloadRuntime(component, destDir string) error {
 			URL  string `json:"url"`
 		} `json:"manifest"`
 		Version struct {
-			Name    string `json:"name"`
+			Name     string `json:"name"`
 			Released string `json:"released"`
 		} `json:"version"`
 	}

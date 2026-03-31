@@ -162,7 +162,13 @@ async function connectVanillaEvents(installId: string, versionId: string): Promi
     });
     if (!subscription) throw new Error('native install stream unavailable');
     setInstallEventSource(subscription);
-    await startNativeInstallEvents(installId);
+    try {
+      await startNativeInstallEvents(installId);
+    } catch (err: unknown) {
+      subscription.close();
+      setInstallEventSource(null);
+      throw err;
+    }
     return;
   }
 
@@ -250,7 +256,13 @@ async function connectLoaderEvents(installId: string, versionId: string): Promis
     });
     if (!subscription) throw new Error('native loader install stream unavailable');
     setInstallEventSource(subscription);
-    await startNativeLoaderInstallEvents(installId);
+    try {
+      await startNativeLoaderInstallEvents(installId);
+    } catch (err: unknown) {
+      subscription.close();
+      setInstallEventSource(null);
+      throw err;
+    }
     return;
   }
 

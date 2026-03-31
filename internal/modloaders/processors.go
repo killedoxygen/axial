@@ -17,8 +17,8 @@ import (
 
 // installProfileJSON represents the install_profile.json from Forge/NeoForge installers.
 type installProfileJSON struct {
-	Processors []processor        `json:"processors"`
-	Libraries  []minecraft.Library `json:"libraries"`
+	Processors []processor          `json:"processors"`
+	Libraries  []minecraft.Library  `json:"libraries"`
 	Data       map[string]dataEntry `json:"data"`
 }
 
@@ -327,4 +327,3 @@ func findJavaForProcessors(mcDir string) (string, error) {
 
 	return "", fmt.Errorf("no Java runtime found; install the base game version first to download Java")
 }
-

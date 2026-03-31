@@ -14,29 +14,97 @@ Croopor is currently a **paralauncher**: it runs alongside or instead of the off
 | Planned | Microsoft account authentication (online-mode servers) |
 | Planned | Skin viewer and management |
 
-## Building
+## Prerequisites
 
-Requires Go 1.23+ and Node.js 18+.
+Croopor is now a Wails desktop app.
+
+- Go 1.25+
+- Node.js 22+
+- npm 10+
+- Wails CLI `v2.11.0`
+
+Linux desktop builds also require GTK/WebKit development packages. On Ubuntu 24.04:
 
 ```bash
-cd frontend && npm install && npm run build && cd ..
-
-# Production (Windows, no console)
-GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w -H windowsgui" -o croopor.exe .
-
-# Development (includes dev tools)
-GOOS=windows GOARCH=amd64 go build -tags dev -o croopor.exe .
+sudo apt-get update
+sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev
 ```
 
-On Windows the app opens a native WebView2 window. On other platforms it falls back to a browser tab.
+Install Wails:
 
-## Releasing
+```bash
+go install github.com/wailsapp/wails/v2/cmd/wails@v2.11.0
+```
+
+## Development
+
+Install frontend dependencies once:
+
+```bash
+make frontend-install
+```
+
+Run the desktop app with live reload:
+
+```bash
+make dev
+```
+
+This wraps `wails dev`. The frontend watcher writes `frontend/static/app.js`, the Go backend runs in-process, and the app opens through the Wails desktop runtime.
+
+If you only want the standalone frontend server:
+
+```bash
+make serve
+```
+
+## Verification
+
+Run the full local verification path:
+
+```bash
+make verify
+```
+
+Useful individual targets:
+
+```bash
+make check              # frontend typecheck + gofmt check
+make test               # go test ./...
+make build              # production desktop binary for the current platform
+make build-dev          # current-platform binary with the dev tag
+make build-dev-windows  # Windows amd64 binary with the dev tag
+make wails-build        # production Wails build
+```
+
+## Building
+
+Standard local build:
+
+```bash
+make build
+```
+
+Explicit Wails production build:
+
+```bash
+wails build -nopackage -m -v 1
+```
+
+Example Windows dev-tag build:
+
+```bash
+make build-dev-windows
+```
+
+## CI And Releases
+
+- Pull requests and branch pushes run frontend checks, Go tests, Linux desktop builds, and `wails build`.
+- Tag pushes create release artifacts.
 
 ```bash
 git tag v1.1.0 && git push --tags
 ```
-
-GitHub Actions builds Windows (amd64, arm64) and Linux (amd64) binaries and publishes them as a release.
 
 ## License
 

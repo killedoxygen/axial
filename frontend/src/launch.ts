@@ -16,6 +16,13 @@ import {
   confirmLaunch, endLaunchPrep, endSession, startLaunch, updateInstanceInList,
 } from './actions';
 
+function resetFailedLaunch(instanceId: string): void {
+  endSession(instanceId);
+  if (Object.keys(runningSessions.value).length === 0) Music.unsuppress();
+  clearLaunchVisualState();
+  endLaunchPrep();
+}
+
 export async function launchGame(): Promise<void> {
   const inst = selectedInstance.value;
   const version = selectedVersion.value;
@@ -82,8 +89,7 @@ export async function launchGame(): Promise<void> {
     }
   } catch (err: unknown) {
     showError((err as Error).message);
-    clearLaunchVisualState();
-    endLaunchPrep();
+    resetFailedLaunch(inst.id);
   }
 }
 
@@ -113,7 +119,12 @@ async function connectLaunchEvents(sessionId: string, instanceId: string, instan
     });
     const logSubscription = onNativeEvent(nativeLaunchLogEventName(sessionId), onLog);
     streamHandle = makeCompositeSubscription(statusSubscription, logSubscription);
-    await startNativeLaunchEvents(sessionId);
+    try {
+      await startNativeLaunchEvents(sessionId);
+    } catch (err: unknown) {
+      streamHandle.close();
+      throw err;
+    }
     return;
   }
 

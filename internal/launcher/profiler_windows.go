@@ -11,11 +11,11 @@ import (
 )
 
 var (
-	modpsapi                    = windows.NewLazySystemDLL("psapi.dll")
-	procGetProcessMemoryInfo    = modpsapi.NewProc("GetProcessMemoryInfo")
+	modpsapi                 = windows.NewLazySystemDLL("psapi.dll")
+	procGetProcessMemoryInfo = modpsapi.NewProc("GetProcessMemoryInfo")
 
-	modntdll                    = windows.NewLazySystemDLL("ntdll.dll")
-	procNtQuerySystemInformation = modntdll.NewProc("NtQuerySystemInformation")
+	modntdll                      = windows.NewLazySystemDLL("ntdll.dll")
+	procNtQuerySystemInformation  = modntdll.NewProc("NtQuerySystemInformation")
 	procNtQueryInformationProcess = modntdll.NewProc("NtQueryInformationProcess")
 )
 
@@ -57,9 +57,9 @@ type memoryStatusEx struct {
 }
 
 var (
-	procGlobalMemoryStatusEx  = modkernel32.NewProc("GlobalMemoryStatusEx")
-	procGetSystemTimes        = modkernel32.NewProc("GetSystemTimes")
-	procGetProcessIoCounters  = modkernel32.NewProc("GetProcessIoCounters")
+	procGlobalMemoryStatusEx = modkernel32.NewProc("GlobalMemoryStatusEx")
+	procGetSystemTimes       = modkernel32.NewProc("GetSystemTimes")
+	procGetProcessIoCounters = modkernel32.NewProc("GetProcessIoCounters")
 )
 
 // Per-process CPU delta state (guarded by cpuMu since profiler runs in a goroutine).

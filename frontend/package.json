@@ -3,7 +3,8 @@
   "type": "module",
   "scripts": {
     "build": "tsc --noEmit && node esbuild.mjs",
-    "dev": "node esbuild.mjs --dev --watch",
+    "dev": "node esbuild.mjs serve",
+    "watch": "node esbuild.mjs watch",
     "check": "tsc --noEmit"
   },
   "devDependencies": {

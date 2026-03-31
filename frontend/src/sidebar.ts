@@ -37,6 +37,7 @@ export function watchVersions(): void {
   }
 
   if (isWailsRuntime()) {
+    void pollVersions();
     versionPollTimer = setInterval(() => { void pollVersions(); }, 5000);
     return;
   }

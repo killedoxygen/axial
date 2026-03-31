@@ -88,11 +88,11 @@ func (s *Server) handleDevCleanup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":             "ok",
-		"backup_dir":         backupDir,
-		"backed_up":          backed,
-		"versions_removed":   versionsRemoved,
-		"instances_removed":  instancesRemoved,
+		"status":            "ok",
+		"backup_dir":        backupDir,
+		"backed_up":         backed,
+		"versions_removed":  versionsRemoved,
+		"instances_removed": instancesRemoved,
 	})
 }
 
@@ -203,10 +203,10 @@ func (s *Server) handleDevLiveProfile(w http.ResponseWriter, r *http.Request) {
 			// Send boot complete event and stop
 			if result.Process.BootCompleted() {
 				sendSSE(w, flusher, "boot_complete", map[string]any{
-					"duration_ms":  result.Process.BootDuration().Milliseconds(),
-					"peak_threads": result.Process.Profile.PeakThreads,
-					"peak_mem_mb":  result.Process.Profile.PeakMemMB,
-					"peak_cpu_pct": result.Process.Profile.PeakCPUPct,
+					"duration_ms":   result.Process.BootDuration().Milliseconds(),
+					"peak_threads":  result.Process.Profile.PeakThreads,
+					"peak_mem_mb":   result.Process.Profile.PeakMemMB,
+					"peak_cpu_pct":  result.Process.Profile.PeakCPUPct,
 					"total_samples": len(samples),
 				})
 				return

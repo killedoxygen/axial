@@ -34,9 +34,9 @@ func DefaultEnvironment() Environment {
 		OSName: currentOSName(),
 		OSArch: currentOSArch(),
 		Features: map[string]bool{
-			"is_demo_user":            false,
-			"has_custom_resolution":   false,
-			"has_quick_plays_support": true,
+			"is_demo_user":               false,
+			"has_custom_resolution":      false,
+			"has_quick_plays_support":    true,
 			"is_quick_play_singleplayer": false,
 			"is_quick_play_multiplayer":  false,
 			"is_quick_play_realms":       false,
