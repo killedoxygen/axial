@@ -9,6 +9,7 @@ on:
 
 permissions:
   contents: read
+  packages: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -37,13 +38,10 @@ jobs:
 
   desktop-linux:
     runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/mateoltd/croopor-linux-ci:latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Linux desktop dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev
 
       - uses: actions/setup-node@v4
         with:
