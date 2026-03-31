@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - wip-*
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: make frontend-install
+
+      - name: Frontend typecheck
+        run: make frontend-check
+
+      - name: Frontend build
+        run: make frontend-build
+
+  desktop-linux:
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/mateoltd/croopor-linux-ci:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.11.0
+
+      - name: Install frontend dependencies
+        run: make frontend-install
+
+      - name: Static checks
+        run: make check
+
+      - name: Go tests
+        run: make test
+
+      - name: Linux desktop build
+        run: make build
+
+      - name: Wails production build
+        run: |
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          make wails-build

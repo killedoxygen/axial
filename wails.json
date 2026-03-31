@@ -1,0 +1,24 @@
+{
+  "version": "2",
+  "name": "Croopor",
+  "assetdir": "frontend/static",
+  "build:tags": "webkit2_41",
+  "frontend:dir": "frontend",
+  "frontend:install": "npm ci",
+  "frontend:build": "npm run build",
+  "frontend:dev:build": "npm run build",
+  "frontend:dev:watcher": "npm run watch",
+  "wailsjsdir": "frontend/src",
+  "outputfilename": "croopor",
+  "bindings": {
+    "ts_generation": {
+      "outputType": "functions"
+    }
+  },
+  "info": {
+    "companyName": "Mateoltd",
+    "productName": "Croopor",
+    "productVersion": "1.1.0",
+    "comments": "Offline Minecraft launcher"
+  }
+}

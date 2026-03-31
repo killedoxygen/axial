@@ -5,22 +5,25 @@ import (
 	"io/fs"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/mateoltd/croopor/internal/config"
 	"github.com/mateoltd/croopor/internal/instance"
 	"github.com/mateoltd/croopor/internal/launcher"
 	"github.com/mateoltd/croopor/internal/minecraft"
+	"github.com/mateoltd/croopor/internal/modloaders"
 )
 
 type Server struct {
-	mu        sync.RWMutex
-	mcDir     string
-	config    *config.Config
-	instances *instance.InstanceStore
-	sessions  *SessionManager
-	installs  *InstallManager
-	mux       *http.ServeMux
-	frontend  fs.FS
+	mu             sync.RWMutex
+	mcDir          string
+	config         *config.Config
+	instances      *instance.InstanceStore
+	sessions       *SessionManager
+	installs       *InstallManager
+	loaderInstalls *LoaderInstallManager
+	mux            *http.ServeMux
+	frontend       fs.FS
 }
 
 // GetMCDir returns the current Minecraft directory (thread-safe).
@@ -39,14 +42,23 @@ func (s *Server) SetMCDir(dir string) {
 
 func NewServer(mcDir string, cfg *config.Config, instances *instance.InstanceStore, frontend fs.FS) *Server {
 	s := &Server{
-		mcDir:     mcDir,
-		config:    cfg,
-		instances: instances,
-		sessions:  NewSessionManager(),
-		installs:  NewInstallManager(),
-		mux:       http.NewServeMux(),
-		frontend:  frontend,
+		mcDir:          mcDir,
+		config:         cfg,
+		instances:      instances,
+		sessions:       NewSessionManager(),
+		installs:       NewInstallManager(),
+		loaderInstalls: NewLoaderInstallManager(),
+		mux:            http.NewServeMux(),
+		frontend:       frontend,
 	}
+
+	// Register mod loader backends
+	cache := modloaders.NewMetaCache(15 * time.Minute)
+	modloaders.Register(modloaders.NewFabricLoader(cache))
+	modloaders.Register(modloaders.NewQuiltLoader(cache))
+	modloaders.Register(modloaders.NewForgeLoader(cache))
+	modloaders.Register(modloaders.NewNeoForgeLoader(cache))
+
 	s.registerRoutes()
 	return s
 }
@@ -84,6 +96,10 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/v1/setup/browse", s.handleSetupBrowse)
 	s.mux.HandleFunc("GET /api/v1/music/track", s.handleMusicTrack)
 	s.mux.HandleFunc("GET /api/v1/music/status", s.handleMusicStatus)
+	s.mux.HandleFunc("GET /api/v1/loaders/{type}/game-versions", s.handleLoaderGameVersions)
+	s.mux.HandleFunc("GET /api/v1/loaders/{type}/loader-versions", s.handleLoaderVersions)
+	s.mux.HandleFunc("POST /api/v1/loaders/install", s.handleLoaderInstall)
+	s.mux.HandleFunc("GET /api/v1/loaders/install/{id}/events", s.handleLoaderInstallEvents)
 	registerDevRoutes(s)
 	s.mux.Handle("/", http.FileServer(http.FS(s.frontend)))
 }

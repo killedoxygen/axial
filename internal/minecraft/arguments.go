@@ -9,53 +9,53 @@ import (
 
 // LaunchVars holds all the template variables for argument substitution.
 type LaunchVars struct {
-	AuthPlayerName string
-	VersionName    string
-	GameDirectory  string
-	AssetsRoot     string
-	AssetIndexName string
-	AuthUUID       string
-	AuthAccessToken string
-	ClientID       string
-	AuthXUID       string
-	UserType       string
-	VersionType    string
-	LauncherName   string
-	LauncherVersion string
-	NativesDirectory string
-	Classpath      string
-	LibraryDirectory string
+	AuthPlayerName     string
+	VersionName        string
+	GameDirectory      string
+	AssetsRoot         string
+	AssetIndexName     string
+	AuthUUID           string
+	AuthAccessToken    string
+	ClientID           string
+	AuthXUID           string
+	UserType           string
+	VersionType        string
+	LauncherName       string
+	LauncherVersion    string
+	NativesDirectory   string
+	Classpath          string
+	LibraryDirectory   string
 	ClasspathSeparator string
-	ResolutionWidth  string
-	ResolutionHeight string
-	GameAssets       string // for pre-1.6 versions: assets/virtual/legacy/
+	ResolutionWidth    string
+	ResolutionHeight   string
+	GameAssets         string // for pre-1.6 versions: assets/virtual/legacy/
 }
 
 // BuildVarMap returns the template variable map for argument substitution.
 func (lv *LaunchVars) BuildVarMap() map[string]string {
 	return map[string]string{
-		"auth_player_name":  lv.AuthPlayerName,
-		"version_name":      lv.VersionName,
-		"game_directory":    lv.GameDirectory,
-		"assets_root":       lv.AssetsRoot,
-		"assets_index_name": lv.AssetIndexName,
-		"auth_uuid":         lv.AuthUUID,
-		"auth_access_token": lv.AuthAccessToken,
-		"clientid":          lv.ClientID,
-		"auth_xuid":         lv.AuthXUID,
-		"user_type":         lv.UserType,
-		"version_type":      lv.VersionType,
-		"launcher_name":     lv.LauncherName,
-		"launcher_version":  lv.LauncherVersion,
-		"natives_directory":  lv.NativesDirectory,
-		"classpath":         lv.Classpath,
-		"library_directory":  lv.LibraryDirectory,
+		"auth_player_name":    lv.AuthPlayerName,
+		"version_name":        lv.VersionName,
+		"game_directory":      lv.GameDirectory,
+		"assets_root":         lv.AssetsRoot,
+		"assets_index_name":   lv.AssetIndexName,
+		"auth_uuid":           lv.AuthUUID,
+		"auth_access_token":   lv.AuthAccessToken,
+		"clientid":            lv.ClientID,
+		"auth_xuid":           lv.AuthXUID,
+		"user_type":           lv.UserType,
+		"version_type":        lv.VersionType,
+		"launcher_name":       lv.LauncherName,
+		"launcher_version":    lv.LauncherVersion,
+		"natives_directory":   lv.NativesDirectory,
+		"classpath":           lv.Classpath,
+		"library_directory":   lv.LibraryDirectory,
 		"classpath_separator": lv.ClasspathSeparator,
-		"resolution_width":  lv.ResolutionWidth,
-		"resolution_height": lv.ResolutionHeight,
+		"resolution_width":    lv.ResolutionWidth,
+		"resolution_height":   lv.ResolutionHeight,
 		// Some versions use these alternate names
-		"game_assets":       lv.gameAssetsDir(),
-		"user_properties":   "{}",
+		"game_assets":     lv.gameAssetsDir(),
+		"user_properties": "{}",
 	}
 }
 

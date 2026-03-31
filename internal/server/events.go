@@ -40,7 +40,7 @@ func (s *Server) handleLaunchEvents(w http.ResponseWriter, r *http.Request) {
 			return
 		case line, ok := <-result.Process.LogChan:
 			if !ok {
-				// Channel closed — process exited
+				// Channel closed, process exited
 				sendSSE(w, flusher, "status", map[string]any{
 					"state":     "exited",
 					"exit_code": result.Process.ExitCode,

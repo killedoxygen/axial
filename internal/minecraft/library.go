@@ -80,7 +80,7 @@ func ResolveLibraries(v *VersionJSON, mcDir string, env Environment) ([]Resolved
 			}
 		}
 
-		// Library not found on disk — include it anyway so the classpath is complete
+		// Library not found on disk, include it anyway so the classpath is complete
 		// (it may still work if the game doesn't need it, or the error will be clear)
 		resolved = append(resolved, ResolvedLibrary{
 			AbsPath:  absPath,

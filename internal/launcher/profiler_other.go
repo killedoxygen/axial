@@ -112,7 +112,7 @@ func readProcessStats(pid int) processStats {
 func monotonicNano() int64 {
 	// /proc/self/stat would give us a clock, but simplest is just time.Now
 	// which in Go includes a monotonic component.
-	// We import time indirectly — use a simple approach.
+	// We import time indirectly, use a simple approach.
 	var ts [2]int64
 	// Fallback: read /proc/uptime and convert. But simpler to just use
 	// the wall clock (close enough for 250ms intervals).

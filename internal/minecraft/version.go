@@ -10,14 +10,14 @@ import (
 
 // VersionJSON represents the full parsed version JSON file.
 type VersionJSON struct {
-	ID                 string            `json:"id"`
-	InheritsFrom       string            `json:"inheritsFrom,omitempty"`
-	Type               string            `json:"type"`
-	MainClass          string            `json:"mainClass"`
-	MinimumLauncherVer int               `json:"minimumLauncherVersion,omitempty"`
-	ComplianceLevel    int               `json:"complianceLevel,omitempty"`
-	ReleaseTime        string            `json:"releaseTime,omitempty"`
-	Time               string            `json:"time,omitempty"`
+	ID                 string `json:"id"`
+	InheritsFrom       string `json:"inheritsFrom,omitempty"`
+	Type               string `json:"type"`
+	MainClass          string `json:"mainClass"`
+	MinimumLauncherVer int    `json:"minimumLauncherVersion,omitempty"`
+	ComplianceLevel    int    `json:"complianceLevel,omitempty"`
+	ReleaseTime        string `json:"releaseTime,omitempty"`
+	Time               string `json:"time,omitempty"`
 
 	// Modern argument format (1.13+)
 	Arguments *ArgumentsSection `json:"arguments,omitempty"`
@@ -133,12 +133,12 @@ type JavaVersion struct {
 }
 
 type Library struct {
-	Name      string           `json:"name"`
-	Downloads *LibraryDownload `json:"downloads,omitempty"`
-	URL       string           `json:"url,omitempty"`
-	Rules     []Rule           `json:"rules,omitempty"`
+	Name      string            `json:"name"`
+	Downloads *LibraryDownload  `json:"downloads,omitempty"`
+	URL       string            `json:"url,omitempty"`
+	Rules     []Rule            `json:"rules,omitempty"`
 	Natives   map[string]string `json:"natives,omitempty"`
-	Extract   *ExtractRule     `json:"extract,omitempty"`
+	Extract   *ExtractRule      `json:"extract,omitempty"`
 
 	// Fabric/Forge style direct fields
 	SHA1   string `json:"sha1,omitempty"`
@@ -203,6 +203,17 @@ func LoadVersionJSON(mcDir, versionID string) (*VersionJSON, error) {
 // MavenToPath converts a Maven coordinate like "org.lwjgl:lwjgl:3.3.3" or
 // "org.lwjgl:lwjgl:3.3.3:natives-windows" to a relative file path.
 func MavenToPath(coordinate string) string {
+	// Handle @extension syntax: group:artifact:version:classifier@extension
+	ext := ".jar"
+	if atIdx := strings.LastIndex(coordinate, "@"); atIdx >= 0 {
+		rawExt := strings.TrimSpace(coordinate[atIdx+1:])
+		if rawExt != "" {
+			rawExt = strings.TrimPrefix(rawExt, ".")
+			ext = "." + rawExt
+		}
+		coordinate = coordinate[:atIdx]
+	}
+
 	parts := strings.Split(coordinate, ":")
 	if len(parts) < 3 {
 		return ""
@@ -216,7 +227,7 @@ func MavenToPath(coordinate string) string {
 	if len(parts) >= 4 {
 		filename += "-" + parts[3]
 	}
-	filename += ".jar"
+	filename += ext
 
 	return filepath.Join(group, artifact, version, filename)
 }

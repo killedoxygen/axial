@@ -2,13 +2,17 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "node esbuild.mjs",
-    "dev": "node esbuild.mjs --dev"
+    "build": "tsc --noEmit && node esbuild.mjs",
+    "dev": "node esbuild.mjs serve",
+    "watch": "node esbuild.mjs watch",
+    "check": "tsc --noEmit"
   },
   "devDependencies": {
-    "esbuild": "^0.25.0"
+    "esbuild": "^0.25.0",
+    "typescript": "^5.7.0"
   },
   "dependencies": {
-    "toastify-js": "^1.12.0"
+    "@preact/signals": "^2.0.0",
+    "preact": "^10.25.0"
   }
 }

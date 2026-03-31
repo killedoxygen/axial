@@ -10,18 +10,18 @@ import (
 
 // VersionEntry is a lightweight summary of a version.
 type VersionEntry struct {
-	ID             string `json:"id"`
-	Type           string `json:"type"`
-	ReleaseTime    string `json:"release_time,omitempty"`
-	InheritsFrom   string `json:"inherits_from,omitempty"`
-	Launchable     bool   `json:"launchable"`
-	Installed      bool   `json:"installed"`
-	Status         string `json:"status"` // "ready", "incomplete"
-	StatusDetail   string `json:"status_detail,omitempty"`
-	NeedsInstall   string `json:"needs_install,omitempty"` // version ID to install (self or parent)
-	JavaComponent  string `json:"java_component,omitempty"`
-	JavaMajor      int    `json:"java_major,omitempty"`
-	ManifestURL    string `json:"manifest_url,omitempty"`
+	ID            string `json:"id"`
+	Type          string `json:"type"`
+	ReleaseTime   string `json:"release_time,omitempty"`
+	InheritsFrom  string `json:"inherits_from,omitempty"`
+	Launchable    bool   `json:"launchable"`
+	Installed     bool   `json:"installed"`
+	Status        string `json:"status"` // "ready", "incomplete"
+	StatusDetail  string `json:"status_detail,omitempty"`
+	NeedsInstall  string `json:"needs_install,omitempty"` // version ID to install (self or parent)
+	JavaComponent string `json:"java_component,omitempty"`
+	JavaMajor     int    `json:"java_major,omitempty"`
+	ManifestURL   string `json:"manifest_url,omitempty"`
 }
 
 // versionStub is used for quick JSON parsing without full version resolution.

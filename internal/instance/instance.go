@@ -8,7 +8,7 @@ type Instance struct {
 	CreatedAt    string `json:"created_at"`
 	LastPlayedAt string `json:"last_played_at,omitempty"`
 
-	// Setting overrides — zero value means "use global config".
+	// Setting overrides. Zero value means "use global config".
 	MaxMemoryMB  int    `json:"max_memory_mb,omitempty"`
 	MinMemoryMB  int    `json:"min_memory_mb,omitempty"`
 	JavaPath     string `json:"java_path,omitempty"`

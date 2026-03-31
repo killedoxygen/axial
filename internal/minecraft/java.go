@@ -24,7 +24,7 @@ type JavaResult struct {
 }
 
 // FindJava searches for the EXACT Java runtime component required by a version.
-// It will NOT fall back to a different component — wrong Java version = broken launch.
+// It will NOT fall back to a different component. The wrong Java version breaks launch.
 // If the runtime is not found locally, it returns ErrJavaNotFound.
 func FindJava(mcDir string, javaVersion JavaVersion, overridePath string) (*JavaResult, error) {
 	if overridePath != "" {
@@ -38,7 +38,7 @@ func FindJava(mcDir string, javaVersion JavaVersion, overridePath string) (*Java
 		component = "java-runtime-delta"
 	}
 
-	// Search ONLY for the exact component — no fallbacks
+	// Search ONLY for the exact component. No fallbacks.
 	for _, dir := range RuntimeDirs(mcDir) {
 		result := searchExactRuntime(dir, component)
 		if result != nil {
@@ -142,7 +142,7 @@ func downloadRuntime(component, destDir string) error {
 
 	var allRuntimes map[string]map[string][]struct {
 		Availability struct {
-			Group   int `json:"group"`
+			Group    int `json:"group"`
 			Progress int `json:"progress"`
 		} `json:"availability"`
 		Manifest struct {
@@ -151,7 +151,7 @@ func downloadRuntime(component, destDir string) error {
 			URL  string `json:"url"`
 		} `json:"manifest"`
 		Version struct {
-			Name    string `json:"name"`
+			Name     string `json:"name"`
 			Released string `json:"released"`
 		} `json:"version"`
 	}

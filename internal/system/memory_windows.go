@@ -8,8 +8,8 @@ import (
 )
 
 var (
-	kernel32                = syscall.NewLazyDLL("kernel32.dll")
-	globalMemoryStatusExFn  = kernel32.NewProc("GlobalMemoryStatusEx")
+	kernel32               = syscall.NewLazyDLL("kernel32.dll")
+	globalMemoryStatusExFn = kernel32.NewProc("GlobalMemoryStatusEx")
 )
 
 type memoryStatusEx struct {

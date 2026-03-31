@@ -3,10 +3,13 @@ croopor.exe
 *.tar.gz
 *.syso
 *.exe
+build/bin/
+.cache/
 
 # Frontend build artifacts
 frontend/node_modules/
 frontend/static/app.js
+frontend/package.json.md5
 
 # Local-only
 plans/

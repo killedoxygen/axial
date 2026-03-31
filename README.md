@@ -1,43 +1,104 @@
-# Croopor
+# croopor
+offline minecraft launcher, built as a wails desktop app.
 
-A standalone Minecraft launcher that fully replaces the official launcher for offline play. Manages versions, instances, Java runtimes, and mod loaders independently — no Mojang launcher required.
+it already handles:
+- multi-instance installs
+- vanilla + fabric + quilt + forge + neoforge
+- java runtime detection and download flows
+- launch sessions, logs, install progress
+- local music, themes, shortcuts, onboarding
 
-Croopor is currently a **paralauncher**: it runs alongside or instead of the official launcher, but doesn't yet support Microsoft account authentication. Online-mode server play requires a premium account through the official launcher. MSA authentication is on the roadmap to make Croopor a complete standalone launcher.
+it does **not** handle microsoft account auth, so for online-mode stuff you need the official launcher.
 
-## Roadmap
+## state
+current stack:
+- desktop shell is wails
+- frontend state is mostly signal-driven
+- backend exposes `/api/v1/*`
+- desktop event streaming uses wails runtime events
+- browser mode uses sse
 
-| Status | Milestone |
-|--------|-----------|
-| Done | Multi-instance management with isolated game directories |
-| Done | Boot optimization (CDS caching, CPU throttling, JVM tuning) |
-| Planned | One-click performance mod bundles via Modrinth API |
-| Planned | Microsoft account authentication (online-mode servers) |
-| Planned | Skin viewer and management |
+## prereqs
+- go 1.25+
+- node 22+
+- npm 10+
+- wails cli `v2.11.0`
 
-## Building
-
-Requires Go 1.23+ and Node.js 18+.
-
-```bash
-cd frontend && npm install && npm run build && cd ..
-
-# Production (Windows, no console)
-GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w -H windowsgui" -o croopor.exe .
-
-# Development (includes dev tools)
-GOOS=windows GOARCH=amd64 go build -tags dev -o croopor.exe .
-```
-
-On Windows the app opens a native WebView2 window. On other platforms it falls back to a browser tab.
-
-## Releasing
+ubuntu 24.04:
 
 ```bash
-git tag v1.1.0 && git push --tags
+sudo apt-get update
+sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev
+go install github.com/wailsapp/wails/v2/cmd/wails@v2.11.0
 ```
 
-GitHub Actions builds Windows (amd64, arm64) and Linux (amd64) binaries and publishes them as a release.
+## dev
+install deps once:
 
-## License
+```bash
+make frontend-install
+```
 
-See repository for license information.
+run the app:
+
+```bash
+make dev
+```
+
+frontend-only server:
+
+```bash
+make serve
+```
+
+## build
+normal build:
+
+```bash
+make build
+```
+
+dev-tag build:
+
+```bash
+make build-dev
+make build-dev-windows
+```
+
+wails production build:
+
+```bash
+make wails-build
+```
+
+## verify
+full local pass:
+
+```bash
+make verify
+```
+
+useful smaller targets:
+
+```bash
+make check
+make test
+make frontend-build
+```
+
+## roadmap
+- msa auth
+- modrinth-powered bundles
+- skin stuff
+
+## maintainer docs
+- `docs/CONVENTIONS.md`
+- `docs/ARCHITECTURE.md`
+
+## release
+tag push builds release artifacts.
+
+```bash
+git tag v1.1.0
+git push --tags
+```
