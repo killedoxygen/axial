@@ -7,6 +7,7 @@ it already handles:
 - java runtime detection and download flows
 - launch sessions, logs, install progress
 - local music, themes, shortcuts, onboarding
+- desktop update detection
 
 ## stack
 - desktop shell: wails

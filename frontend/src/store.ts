@@ -1,7 +1,7 @@
 import { signal, computed } from '@preact/signals';
 import type {
   Instance, Version, Config, SystemInfo,
-  RunningSession, InstallItem, Catalog, Page, ToastItem,
+  RunningSession, InstallItem, Catalog, Page, ToastItem, UpdateInfo,
 } from './types';
 
 // ── Core data ──
@@ -60,6 +60,8 @@ export const bootstrapState = signal<'loading' | 'ready' | 'error'>('loading');
 export const bootstrapError = signal<string | null>(null);
 export const appVersion = signal('1.1.0');
 export const toasts = signal<ToastItem[]>([]);
+export const updateInfo = signal<UpdateInfo | null>(null);
+export const updateCheckState = signal<'idle' | 'checking' | 'ready' | 'error'>('idle');
 
 // ── Derived state ──
 

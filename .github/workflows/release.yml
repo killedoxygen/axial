@@ -8,6 +8,8 @@ on:
 permissions:
   contents: write
   packages: read
+  pages: write
+  id-token: write
 
 concurrency:
   group: release-${{ github.ref }}
@@ -50,7 +52,7 @@ jobs:
       - name: Verify
         run: task verify
 
-  release:
+  release-binaries:
     needs: verify
     runs-on: ubuntu-24.04
     container:
@@ -83,3 +85,212 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  linux-appimage:
+    needs:
+      - verify
+      - release-binaries
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/mateoltd/croopor-linux-ci:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Trust checkout as a safe git directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+          run_install: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install frontend dependencies
+        run: pnpm --dir frontend install --frozen-lockfile --ignore-scripts
+
+      - name: Build frontend bundle
+        run: pnpm --dir frontend run build
+
+      - name: Build AppImage
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p dist/appimage/AppDir/usr/bin
+          mkdir -p dist/appimage/AppDir/usr/share/applications
+          mkdir -p dist/appimage/AppDir/usr/share/icons/hicolor/256x256/apps
+          go build -trimpath -tags webkit2_41 -ldflags "-s -w -X main.version=${VERSION}" -o dist/appimage/AppDir/usr/bin/croopor .
+          cp packaging/linux/croopor.desktop dist/appimage/AppDir/usr/share/applications/croopor.desktop
+          cp frontend/static/logo.png dist/appimage/AppDir/usr/share/icons/hicolor/256x256/apps/croopor.png
+          ln -sf usr/share/applications/croopor.desktop dist/appimage/AppDir/croopor.desktop
+          ln -sf usr/share/icons/hicolor/256x256/apps/croopor.png dist/appimage/AppDir/.DirIcon
+          cat > dist/appimage/AppDir/AppRun <<'EOF'
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "$0")")"
+          exec "$HERE/usr/bin/croopor" "$@"
+          EOF
+          chmod +x dist/appimage/AppDir/AppRun
+          curl -L -o dist/appimagetool.AppImage https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x dist/appimagetool.AppImage
+          ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 ./dist/appimagetool.AppImage dist/appimage/AppDir dist/croopor-linux-amd64.AppImage
+
+      - name: Upload AppImage to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/croopor-linux-amd64.AppImage
+
+  windows-msix:
+    needs:
+      - verify
+      - release-binaries
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goarch: amd64
+            appx_arch: x64
+          - goarch: arm64
+            appx_arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+          run_install: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install frontend dependencies
+        run: pnpm --dir frontend install --frozen-lockfile --ignore-scripts
+
+      - name: Build frontend bundle
+        run: pnpm --dir frontend run build
+
+      - name: Build and package MSIX
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          $packageVersion = "$version.0"
+          $publisher = 'CN=Croopor Dev Test'
+          $repoOwner = '${{ github.repository_owner }}'
+          $repoName = '${{ github.event.repository.name }}'
+          $goarch = '${{ matrix.goarch }}'
+          $appxArch = '${{ matrix.appx_arch }}'
+          $pagesUrl = "https://$repoOwner.github.io/$repoName/updates/windows/$goarch/croopor.appinstaller"
+          $msixUrl = "https://github.com/${{ github.repository }}/releases/download/$env:GITHUB_REF_NAME/croopor-windows-$goarch.msix"
+          $dist = Join-Path $env:GITHUB_WORKSPACE "dist\windows-$goarch"
+          $appDir = Join-Path $dist "AppDir"
+          $assetsDir = Join-Path $appDir "Assets"
+          $exePath = Join-Path $appDir "croopor.exe"
+          $msixPath = Join-Path $dist "croopor-windows-$goarch.msix"
+          $cerPath = Join-Path $dist "croopor-dev-test-$goarch.cer"
+          $appInstallerPath = Join-Path $dist "croopor.appinstaller"
+          $manifestPath = Join-Path $appDir "AppxManifest.xml"
+          New-Item -ItemType Directory -Force -Path $assetsDir | Out-Null
+          $env:GOOS = 'windows'
+          $env:GOARCH = $goarch
+          go build -trimpath -ldflags "-s -w -H windowsgui -X main.version=$version" -o $exePath .
+          foreach ($name in @('StoreLogo.png', 'Square44x44Logo.png', 'Square150x150Logo.png', 'Wide310x150Logo.png', 'Square310x310Logo.png')) {
+            Copy-Item 'frontend/static/logo.png' (Join-Path $assetsDir $name)
+          }
+          $manifestTemplate = Get-Content 'packaging/windows/AppxManifest.xml.template' -Raw
+          $manifest = $manifestTemplate.Replace('{{PUBLISHER}}', $publisher).Replace('{{VERSION}}', $packageVersion).Replace('{{ARCH}}', $appxArch)
+          Set-Content -Path $manifestPath -Value $manifest -Encoding utf8
+          $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject $publisher -CertStoreLocation Cert:\CurrentUser\My
+          Export-Certificate -Cert $cert -FilePath $cerPath | Out-Null
+          $makeAppx = (Get-Command makeappx.exe -ErrorAction Stop).Source
+          $signTool = (Get-Command signtool.exe -ErrorAction Stop).Source
+          & $makeAppx pack /d $appDir /p $msixPath /o
+          & $signTool sign /fd SHA256 /sha1 $cert.Thumbprint $msixPath
+          $appInstallerTemplate = Get-Content 'packaging/windows/croopor.appinstaller.template' -Raw
+          $appInstaller = $appInstallerTemplate.Replace('{{APPINSTALLER_URL}}', $pagesUrl).Replace('{{APPINSTALLER_VERSION}}', $packageVersion).Replace('{{PUBLISHER}}', $publisher).Replace('{{VERSION}}', $packageVersion).Replace('{{ARCH}}', $appxArch).Replace('{{MSIX_URL}}', $msixUrl)
+          Set-Content -Path $appInstallerPath -Value $appInstaller -Encoding utf8
+
+      - name: Upload Windows updater artifacts to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/windows-${{ matrix.goarch }}/croopor-windows-${{ matrix.goarch }}.msix
+            dist/windows-${{ matrix.goarch }}/croopor-dev-test-${{ matrix.goarch }}.cer
+            dist/windows-${{ matrix.goarch }}/croopor.appinstaller
+
+      - name: Upload App Installer file for Pages
+        uses: actions/upload-artifact@v4
+        with:
+          name: appinstaller-${{ matrix.goarch }}
+          path: dist/windows-${{ matrix.goarch }}/croopor.appinstaller
+
+  pages:
+    needs:
+      - release-binaries
+      - linux-appimage
+      - windows-msix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: appinstaller-amd64
+          path: dist/pages/updates/windows/amd64
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: appinstaller-arm64
+          path: dist/pages/updates/windows/arm64
+
+      - name: Render stable update metadata
+        env:
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          RELEASE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${GITHUB_REF_NAME}"
+          PAGES_BASE="https://${REPO_OWNER}.github.io/${REPO_NAME}"
+          mkdir -p dist/pages/updates
+          cat > dist/pages/updates/stable.json <<EOF
+          {
+            "channel": "stable",
+            "version": "${VERSION}",
+            "published_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "notes_url": "${RELEASE_URL}",
+            "windows": {
+              "amd64": {
+                "release_url": "${RELEASE_URL}",
+                "appinstaller_url": "${PAGES_BASE}/updates/windows/amd64/croopor.appinstaller"
+              },
+              "arm64": {
+                "release_url": "${RELEASE_URL}",
+                "appinstaller_url": "${PAGES_BASE}/updates/windows/arm64/croopor.appinstaller"
+              }
+            },
+            "linux": {
+              "amd64": {
+                "appimage_url": "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/croopor-linux-amd64.AppImage"
+              }
+            }
+          }
+          EOF
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist/pages
+
+      - uses: actions/deploy-pages@v4

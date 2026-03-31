@@ -60,7 +60,7 @@ func main() {
 		log.Fatalf("Failed to load frontend: %v", err)
 	}
 
-	srv := server.NewServer(dir, cfg, instances, staticFS)
+	srv := server.NewServer(dir, version, cfg, instances, staticFS)
 	app := NewApp(version, srv)
 
 	err = wails.Run(&options.App{

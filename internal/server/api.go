@@ -33,7 +33,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"mc_dir":         mcDir,
 		"setup_required": mcDir == "",
 		"app_name":       "Croopor",
-		"version":        "1.0.0",
+		"version":        s.appVersion,
 		"dev_mode":       devMode,
 	})
 }
@@ -122,6 +122,15 @@ func (s *Server) handleCatalog(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.config)
+}
+
+func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
+	result, err := s.updater.Check(s.appVersion)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "failed to check updates: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {

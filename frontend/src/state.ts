@@ -9,7 +9,20 @@ export const LOGO_BASE_HUE: number = 106;
 
 // ── Local preferences (localStorage-backed) ──
 
-export const defaults: LocalPrefs = { theme: 'obsidian', customHue: 140, customVibrancy: 100, lightness: 0, logExpanded: false, logHeight: 0, collapsedGroups: {}, sidebarFilter: 'all', sounds: true, shortcuts: {} };
+export const defaults: LocalPrefs = {
+  theme: 'obsidian',
+  customHue: 140,
+  customVibrancy: 100,
+  lightness: 0,
+  logExpanded: false,
+  logHeight: 0,
+  collapsedGroups: {},
+  sidebarFilter: 'all',
+  sounds: true,
+  shortcuts: {},
+  lastUpdateCheckAt: '',
+  dismissedUpdateVersion: '',
+};
 
 export function loadLocalState(): LocalPrefs {
   try { const r: string | null = localStorage.getItem(STORAGE_KEY); return r ? { ...defaults, ...JSON.parse(r) } : { ...defaults }; } catch { return { ...defaults }; }

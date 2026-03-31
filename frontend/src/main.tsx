@@ -22,6 +22,7 @@ import { hideContextMenu, bindContextMenu } from './context-menu';
 import { closeDeleteWizard, bindDeleteWizard } from './delete-wizard';
 import { dismissDialog, showConfirm } from './dialogs';
 import { getNativeAppVersion } from './native';
+import { scheduleAutoUpdateCheck } from './updater';
 
 function computeMemoryRecommendationText(val: number, totalGB: number | null): string {
   if (!totalGB) return '';
@@ -92,6 +93,7 @@ async function init(): Promise<void> {
       window.addEventListener('keydown', startMusic, { once: true, capture: true });
     }
     watchVersions();
+    scheduleAutoUpdateCheck();
   } catch (err: unknown) {
     bootstrapError.value = errMessage(err);
     bootstrapState.value = 'error';

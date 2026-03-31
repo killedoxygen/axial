@@ -1,6 +1,6 @@
 import type { JSX } from 'preact';
 import { useEffect, useRef } from 'preact/hooks';
-import { devMode } from '../store';
+import { appVersion, devMode, updateCheckState, updateInfo } from '../store';
 import { PRESET_HUES, local, localStateVersion, saveLocalState } from '../state';
 import { Music, musicStateVersion } from '../music';
 import { Sound, playSliderSound } from '../sound';
@@ -10,6 +10,7 @@ import {
   settingsWindowHeight, settingsWindowWidth,
 } from '../settings';
 import { recordingShortcut, resetShortcut, Shortcuts, startRecording } from '../shortcuts';
+import { checkForUpdates, dismissAvailableUpdate, formatUpdateCheckTime, hasVisibleUpdate, openUpdateAction, openUpdateNotes } from '../updater';
 
 const THEME_SWATCHS = [
   { theme: 'obsidian', title: 'Obsidian', background: '#0c0e11', border: '#3dd68c', label: 'Obsidian' },
@@ -48,8 +49,11 @@ export function SettingsView(): JSX.Element {
   localStateVersion.value;
   musicStateVersion.value;
   const isDevMode = devMode.value;
+  const currentUpdate = updateInfo.value;
+  const updateState = updateCheckState.value;
   const javaRuntimeState = settingsJavaRuntimesState.value;
   const javaRuntimes = settingsJavaRuntimes.value;
+  const visibleUpdate = hasVisibleUpdate();
   const isLowContrast = isLowContrastTheme(
     local.theme === 'custom' ? local.customHue : (PRESET_HUES[local.theme] || 140),
     local.customVibrancy,
@@ -350,11 +354,63 @@ export function SettingsView(): JSX.Element {
           </div>
         </section>
 
-        <section class={`settings-section-card${isDevMode ? '' : ' hidden'}`} id="settings-section-advanced">
+        <section class="settings-section-card" id="settings-section-advanced">
           <div class="settings-section-head">
             <span class="settings-section-kicker">Advanced</span>
             <h3 class="settings-section-title">Maintenance</h3>
           </div>
+
+          <div class="setting-group">
+            <label class="setting-label">Updates</label>
+            <div class="update-status-grid">
+              <span class="setting-hint">Current version</span>
+              <span class="update-status-value">{appVersion.value.startsWith('v') ? appVersion.value : `v${appVersion.value}`}</span>
+              <span class="setting-hint">Latest known</span>
+              <span class="update-status-value">{currentUpdate?.latest_version ? (currentUpdate.latest_version.startsWith('v') ? currentUpdate.latest_version : `v${currentUpdate.latest_version}`) : 'Not checked yet'}</span>
+              <span class="setting-hint">Last checked</span>
+              <span class="update-status-value">{formatUpdateCheckTime(local.lastUpdateCheckAt)}</span>
+            </div>
+            <p class="setting-hint">
+              {visibleUpdate && currentUpdate
+                ? `A newer build is ready for ${currentUpdate.platform}.`
+                : 'Checks are quiet, desktop-only, and run at most once a day.'}
+            </p>
+            <div class="update-actions">
+              <button
+                type="button"
+                class="btn-secondary"
+                onClick={() => { void checkForUpdates({ force: true }); }}
+                disabled={updateState === 'checking'}
+              >
+                {updateState === 'checking' ? 'Checking...' : 'Check for updates'}
+              </button>
+              <button
+                type="button"
+                class="btn-secondary"
+                onClick={() => { void openUpdateNotes(); }}
+                disabled={!currentUpdate?.notes_url}
+              >
+                View release notes
+              </button>
+              <button
+                type="button"
+                class="btn-primary"
+                onClick={() => { void openUpdateAction(); }}
+                disabled={!visibleUpdate || !currentUpdate?.action_url}
+              >
+                {currentUpdate?.action_label || 'Open latest release'}
+              </button>
+              <button
+                type="button"
+                class="btn-secondary"
+                onClick={() => dismissAvailableUpdate()}
+                disabled={!visibleUpdate}
+              >
+                Hide this version
+              </button>
+            </div>
+          </div>
+
           <p class="setting-hint">Use cleanup tools carefully. Worlds and mods are backed up before destructive actions.</p>
 
           <div class={`dev-tools${isDevMode ? '' : ' hidden'}`} id="dev-tools">

@@ -30,6 +30,7 @@ keep this short and real. if the codebase changes, update this file.
 - json in, json out
 - errors are `{\"error\":\"message\"}`
 - launch/install progress uses sse in browser mode, wails runtime events in desktop mode
+- update checks go through `/api/v1/update`
 
 ## Build
 - frontend entry is `frontend/src/main.tsx`
