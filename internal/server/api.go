@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -556,7 +557,7 @@ func (s *Server) handleDeleteVersion(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		CascadeDependents bool `json:"cascade_dependents"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err.Error() != "EOF" {
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
@@ -645,6 +646,11 @@ func (s *Server) handleOpenVersionFolder(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusInternalServerError, "failed to open folder: "+err.Error())
 		return
 	}
+	go func() {
+		if err := cmd.Wait(); err != nil {
+			log.Printf("open version folder command failed: %v", err)
+		}
+	}()
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
@@ -864,9 +870,7 @@ func (s *Server) handleMusicTrack(w http.ResponseWriter, r *http.Request) {
 			if i >= len(musicTracks) {
 				i = len(musicTracks) - 1
 			}
-			if len(musicTracks) > 0 {
-				idx = i
-			}
+			idx = i
 		}
 	}
 

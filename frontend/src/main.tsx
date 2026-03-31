@@ -32,8 +32,6 @@ function computeMemoryRecommendationText(val: number, totalGB: number | null): s
 
 async function init(): Promise<void> {
   render(<App />, document.getElementById('app')!);
-  const nativeVersion = await getNativeAppVersion();
-  if (nativeVersion) appVersion.value = nativeVersion;
   Shortcuts.load(local.shortcuts);
   applyTheme(local.theme, local.customHue, { silent: true, vibrancy: local.customVibrancy, lightness: local.lightness });
   Sound.enabled = local.sounds;
@@ -46,6 +44,8 @@ async function init(): Promise<void> {
   setPage('launcher');
 
   try {
+    const nativeVersion = await getNativeAppVersion();
+    if (nativeVersion) appVersion.value = nativeVersion;
     const [configRes, systemRes, statusRes, musicStatusRes] = await Promise.all([
       api('GET', '/config'),
       api('GET', '/system').catch(() => null),
@@ -401,8 +401,11 @@ function bindEvents(): void {
       if (dialogOverlay) dismissDialog();
       else if (ctxMenu && !ctxMenu.classList.contains('hidden')) hideContextMenu();
       else if (deleteModal && !deleteModal.classList.contains('hidden')) closeDeleteWizard();
-      else if (document.getElementById('new-instance-modal')) closeNewInstanceFlow();
-      else if (currentPage.value === 'settings') closeSettings();
+      else {
+        const newInstanceModal = document.getElementById('new-instance-modal');
+        if (newInstanceModal && !newInstanceModal.classList.contains('hidden')) closeNewInstanceFlow();
+        else if (currentPage.value === 'settings') closeSettings();
+      }
     }
     const onboardingEl = byId<HTMLElement>('onboarding');
     if (onboardingEl && !onboardingEl.classList.contains('hidden')) {

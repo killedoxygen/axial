@@ -2,6 +2,9 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -187,7 +190,7 @@ func (s *Server) handleDuplicateInstance(w http.ResponseWriter, r *http.Request)
 	var req struct {
 		Name string `json:"name"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err.Error() != "EOF" {
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
@@ -249,6 +252,11 @@ func (s *Server) handleOpenInstanceFolder(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusInternalServerError, "failed to open folder: "+err.Error())
 		return
 	}
+	go func() {
+		if err := cmd.Wait(); err != nil {
+			log.Printf("open instance folder command failed: %v", err)
+		}
+	}()
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }

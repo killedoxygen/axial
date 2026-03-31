@@ -20,12 +20,21 @@ export function closeNewInstanceFlow(): void {
 }
 
 export function showSetup(): Promise<void> {
-  return new Promise((resolve: () => void) => {
+  return new Promise((resolve: () => void, reject: (reason?: unknown) => void) => {
     const overlay = byId<HTMLElement>('setup-overlay');
     const setupUseBtn = byId<HTMLButtonElement>('setup-use-btn');
     const setupBrowseBtn = byId<HTMLButtonElement>('setup-browse-btn');
     const setupInitBtn = byId<HTMLButtonElement>('setup-init-btn');
-    overlay?.classList.remove('hidden');
+    if (!overlay || !setupUseBtn || !setupBrowseBtn || !setupInitBtn) {
+      overlay?.classList.add('hidden');
+      reject(new Error('setup UI is missing required elements'));
+      return;
+    }
+    const overlayEl = overlay;
+    const setupUseBtnEl = setupUseBtn;
+    const setupBrowseBtnEl = setupBrowseBtn;
+    const setupInitBtnEl = setupInitBtn;
+    overlayEl.classList.remove('hidden');
 
     void (async () => {
       try {
@@ -36,10 +45,10 @@ export function showSetup(): Promise<void> {
     })();
 
     function hideSetup(): void {
-      if (setupUseBtn) setupUseBtn.onclick = null;
-      if (setupBrowseBtn) setupBrowseBtn.onclick = null;
-      if (setupInitBtn) setupInitBtn.onclick = null;
-      overlay?.classList.add('hidden');
+      setupUseBtnEl.onclick = null;
+      setupBrowseBtnEl.onclick = null;
+      setupInitBtnEl.onclick = null;
+      overlayEl.classList.add('hidden');
       resolve();
     }
 
@@ -55,13 +64,12 @@ export function showSetup(): Promise<void> {
     }
 
     // "Use this path" flow
-    if (setupUseBtn) {
-      setupUseBtn.onclick = async () => {
+    setupUseBtnEl.onclick = async () => {
       clearPathError();
       const path: string | undefined = byId<HTMLInputElement>('setup-path-input')?.value.trim();
       if (!path) { showPathError('Please enter a path'); return; }
-      setupUseBtn.disabled = true;
-      setupUseBtn.textContent = 'Checking...';
+      setupUseBtnEl.disabled = true;
+      setupUseBtnEl.textContent = 'Checking...';
       try {
         const res: any = await api('POST', '/setup/set-dir', { path });
         if (res.error) { showPathError(res.error); return; }
@@ -69,17 +77,15 @@ export function showSetup(): Promise<void> {
       } catch (err: unknown) {
         showPathError(errMessage(err) || 'Failed to set directory');
       } finally {
-        setupUseBtn.disabled = false;
-        setupUseBtn.textContent = 'Use this path';
+        setupUseBtnEl.disabled = false;
+        setupUseBtnEl.textContent = 'Use this path';
       }
-      };
-    }
+    };
 
     // "Browse" button
-    if (setupBrowseBtn) {
-      setupBrowseBtn.onclick = async () => {
-      setupBrowseBtn.disabled = true;
-      setupBrowseBtn.textContent = 'Opening...';
+    setupBrowseBtnEl.onclick = async () => {
+      setupBrowseBtnEl.disabled = true;
+      setupBrowseBtnEl.textContent = 'Opening...';
       try {
         const setupPathInput = byId<HTMLInputElement>('setup-path-input');
         const currentPath = setupPathInput?.value.trim() || '';
@@ -100,19 +106,17 @@ export function showSetup(): Promise<void> {
       } catch (err: unknown) {
         showPathError(errMessage(err) || 'Failed to browse for a folder');
       } finally {
-        setupBrowseBtn.disabled = false;
-        setupBrowseBtn.textContent = 'Browse';
+        setupBrowseBtnEl.disabled = false;
+        setupBrowseBtnEl.textContent = 'Browse';
       }
-      };
-    }
+    };
 
     // "Create & Continue" flow
-    if (setupInitBtn) {
-      setupInitBtn.onclick = async () => {
+    setupInitBtnEl.onclick = async () => {
       const path: string | undefined = byId<HTMLInputElement>('setup-new-path')?.value.trim();
       if (!path) return;
-      setupInitBtn.disabled = true;
-      setupInitBtn.textContent = 'Creating...';
+      setupInitBtnEl.disabled = true;
+      setupInitBtnEl.textContent = 'Creating...';
       try {
         const res: any = await api('POST', '/setup/init', { path });
         if (res.error) { showPathError(res.error); return; }
@@ -120,11 +124,10 @@ export function showSetup(): Promise<void> {
       } catch (err: unknown) {
         showPathError(errMessage(err) || 'Failed to create directory');
       } finally {
-        setupInitBtn.disabled = false;
-        setupInitBtn.textContent = 'Create & Continue';
+        setupInitBtnEl.disabled = false;
+        setupInitBtnEl.textContent = 'Create & Continue';
       }
-      };
-    }
+    };
   });
 }
 
@@ -179,7 +182,10 @@ export function onboardingBack(): void {
 
 export async function finishOnboarding(): Promise<void> {
   const username: string = byId<HTMLInputElement>('onboarding-username')?.value.trim() || 'Player';
-  const memGB: number = parseFloat(byId<HTMLInputElement>('onboarding-memory-slider')?.value || '4');
+  const rawMemGB = parseFloat(byId<HTMLInputElement>('onboarding-memory-slider')?.value || '4');
+  const sliderMax = parseFloat(byId<HTMLInputElement>('onboarding-memory-slider')?.max || '0');
+  const maxMemGB = Number.isFinite(sliderMax) && sliderMax >= 1 ? sliderMax : 64;
+  const memGB = Number.isFinite(rawMemGB) ? Math.min(maxMemGB, Math.max(1, rawMemGB)) : Math.min(4, maxMemGB);
   const musicEnabled: boolean = byId<HTMLElement>('ob-music-yes')?.classList.contains('active') ?? false;
   const usernameInput = byId<HTMLInputElement>('username-input');
   const memorySlider = byId<HTMLInputElement>('memory-slider');

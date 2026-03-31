@@ -18,9 +18,10 @@ import (
 )
 
 const (
-	forgeMavenBase     = "https://maven.minecraftforge.net"
-	forgeMavenMeta     = forgeMavenBase + "/net/minecraftforge/forge/maven-metadata.xml"
-	forgePromotionsURL = "https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json"
+	forgeMavenBase           = "https://maven.minecraftforge.net"
+	forgeMavenMeta           = forgeMavenBase + "/net/minecraftforge/forge/maven-metadata.xml"
+	forgePromotionsURL       = "https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json"
+	maxInstallerDownloadSize = 50 << 20
 )
 
 type forgeLoader struct {
@@ -330,8 +331,11 @@ func (f *forgeLoader) downloadToMemory(url string) ([]byte, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("status %d for %s", resp.StatusCode, url)
 	}
+	if resp.ContentLength > 0 && resp.ContentLength > maxInstallerDownloadSize {
+		return nil, fmt.Errorf("download too large for %s", url)
+	}
 
-	return io.ReadAll(resp.Body)
+	return io.ReadAll(io.LimitReader(resp.Body, maxInstallerDownloadSize))
 }
 
 // extractMCVersion extracts "1.20.1" from "1.20.1-47.3.0"

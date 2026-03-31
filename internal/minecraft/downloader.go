@@ -120,16 +120,28 @@ func (d *Downloader) InstallVersion(versionID, manifestURL string) {
 		if libPath != "" && libURL != "" {
 			d.send(DownloadProgress{Phase: "libraries", Current: i + 1, Total: totalLibs, File: filepath.Base(libPath)})
 			if !FileExistsWithSHA1(libPath, libSHA1) {
-				os.MkdirAll(filepath.Dir(libPath), 0755)
-				d.downloadFile(libURL, libPath, libSHA1) // non-fatal
+				if err := os.MkdirAll(filepath.Dir(libPath), 0755); err != nil {
+					d.sendError("Failed to create library directory: " + err.Error())
+					return
+				}
+				if err := d.downloadFile(libURL, libPath, libSHA1); err != nil {
+					d.sendError("Failed to download library: " + err.Error())
+					return
+				}
 			}
 		}
 
 		// Download native classifier JAR if this library has a natives map
 		natPath, natURL, natSHA1 := resolveNativeDownload(lib, d.MCDir, env)
 		if natPath != "" && natURL != "" && !FileExistsWithSHA1(natPath, natSHA1) {
-			os.MkdirAll(filepath.Dir(natPath), 0755)
-			d.downloadFile(natURL, natPath, natSHA1) // non-fatal
+			if err := os.MkdirAll(filepath.Dir(natPath), 0755); err != nil {
+				d.sendError("Failed to create native library directory: " + err.Error())
+				return
+			}
+			if err := d.downloadFile(natURL, natPath, natSHA1); err != nil {
+				d.sendError("Failed to download native library: " + err.Error())
+				return
+			}
 		}
 	}
 
@@ -153,7 +165,10 @@ func (d *Downloader) InstallVersion(versionID, manifestURL string) {
 		logConfigPath := filepath.Join(AssetsDir(d.MCDir), "log_configs", version.Logging.Client.File.ID)
 		if !FileExistsWithSHA1(logConfigPath, version.Logging.Client.File.SHA1) {
 			d.send(DownloadProgress{Phase: "log_config", Current: 0, Total: 1, File: version.Logging.Client.File.ID})
-			d.downloadFile(version.Logging.Client.File.URL, logConfigPath, version.Logging.Client.File.SHA1)
+			if err := d.downloadFile(version.Logging.Client.File.URL, logConfigPath, version.Logging.Client.File.SHA1); err != nil {
+				d.sendError("Failed to download log config: " + err.Error())
+				return
+			}
 		}
 	}
 
@@ -184,7 +199,9 @@ func resolveNativeDownload(lib Library, mcDir string, env Environment) (path, ur
 	libDir := LibrariesDir(mcDir)
 	if lib.Downloads != nil && lib.Downloads.Classifiers != nil {
 		if artifact, ok := lib.Downloads.Classifiers[classifierKey]; ok {
-			return filepath.Join(libDir, filepath.FromSlash(artifact.Path)), artifact.URL, artifact.SHA1
+			if resolved, ok := resolvePathUnderRoot(libDir, artifact.Path); ok {
+				return resolved, artifact.URL, artifact.SHA1
+			}
 		}
 	}
 	return "", "", ""
@@ -282,7 +299,10 @@ func ResolveLibDownload(lib Library, mcDir string) (path, url, sha1 string) {
 
 	if lib.Downloads != nil && lib.Downloads.Artifact != nil {
 		a := lib.Downloads.Artifact
-		return filepath.Join(libDir, filepath.FromSlash(a.Path)), a.URL, a.SHA1
+		if resolved, ok := resolvePathUnderRoot(libDir, a.Path); ok {
+			return resolved, a.URL, a.SHA1
+		}
+		return "", "", ""
 	}
 
 	mavenPath := MavenToPath(lib.Name)
@@ -295,8 +315,25 @@ func ResolveLibDownload(lib Library, mcDir string) (path, url, sha1 string) {
 	if baseURL == "" {
 		baseURL = "https://libraries.minecraft.net/"
 	}
+	if !strings.HasSuffix(baseURL, "/") {
+		baseURL += "/"
+	}
 	urlPath := filepath.ToSlash(mavenPath)
 	return absPath, baseURL + urlPath, lib.SHA1
+}
+
+func resolvePathUnderRoot(root, rel string) (string, bool) {
+	cleanRel := filepath.Clean(filepath.FromSlash(rel))
+	if cleanRel == "." || cleanRel == "" || filepath.IsAbs(cleanRel) {
+		return "", false
+	}
+
+	joined := filepath.Join(root, cleanRel)
+	relPath, err := filepath.Rel(root, joined)
+	if err != nil || relPath == ".." || strings.HasPrefix(relPath, ".."+string(os.PathSeparator)) {
+		return "", false
+	}
+	return joined, true
 }
 
 func (d *Downloader) downloadFile(url, destPath, expectedSHA1 string) error {
