@@ -22,68 +22,79 @@ current stack:
 - go 1.25+
 - node 22+
 - npm 10+
+- task v3
 - wails cli `v2.11.0`
+- goreleaser v2 if you want local release snapshots
 
 ubuntu 24.04:
 
 ```bash
 sudo apt-get update
 sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev
+go install github.com/go-task/task/v3/cmd/task@latest
 go install github.com/wailsapp/wails/v2/cmd/wails@v2.11.0
+go install github.com/goreleaser/goreleaser/v2@latest
 ```
 
 ## dev
 install deps once:
 
 ```bash
-make frontend-install
+task frontend:install
 ```
 
 run the app:
 
 ```bash
-make dev
+task wails:dev
 ```
 
 frontend-only server:
 
 ```bash
-make serve
+task frontend:serve
 ```
 
 ## build
-normal build:
+see what exists:
 
 ```bash
-make build
+task --list-all
 ```
 
-dev-tag build:
+native builds:
 
 ```bash
-make build-dev
-make build-dev-windows
+task build
+task build:dev
+```
+
+windows builds from any machine:
+
+```bash
+task build:windows
+task build:windows:dev
 ```
 
 wails production build:
 
 ```bash
-make wails-build
+task wails:build
 ```
 
 ## verify
 full local pass:
 
 ```bash
-make verify
+task verify
 ```
 
 useful smaller targets:
 
 ```bash
-make check
-make test
-make frontend-build
+task check
+task test
+task frontend:build
 ```
 
 ## roadmap
@@ -96,9 +107,18 @@ make frontend-build
 - `docs/ARCHITECTURE.md`
 
 ## release
-tag push builds release artifacts.
+tag push builds release artifacts through goreleaser.
 
 ```bash
 git tag v1.1.0
 git push --tags
 ```
+
+local snapshot:
+
+```bash
+task release:snapshot
+```
+
+## make
+`make` is only a small compatibility shim now. use `task` as the real interface.

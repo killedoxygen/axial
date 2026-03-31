@@ -1,66 +1,59 @@
-SHELL := /bin/bash
+.DEFAULT_GOAL := help
+TASK ?= task
 
-GO ?= go
-NPM ?= npm
-WAILS ?= wails
-FRONTEND_DIR := frontend
-BIN_DIR := build/bin
-BIN := $(BIN_DIR)/croopor
-GO_BUILD_TAGS ?= webkit2_41
-GO_CACHE_DIR ?= $(CURDIR)/.cache/go-build
-GO_ENV = GOCACHE=$(GO_CACHE_DIR)
+.PHONY: _require-task help frontend-install frontend-check frontend-build check test build build-dev build-windows build-windows-dev dev serve wails-build verify clean release-snapshot
 
-.PHONY: frontend-install frontend-check frontend-build fmt-check check test build build-dev build-dev-windows dev serve wails-build verify clean
-
-frontend-install:
-	cd $(FRONTEND_DIR) && $(NPM) ci
-
-frontend-check:
-	cd $(FRONTEND_DIR) && $(NPM) run check
-
-frontend-build:
-	cd $(FRONTEND_DIR) && $(NPM) run build
-
-fmt-check:
-	@out="$$(gofmt -l $$(find . -type f -name '*.go' -not -path './build/*' -not -path './vendor/*'))"; \
-	if [ -n "$$out" ]; then \
-		echo "$$out"; \
+_require-task:
+	@$(TASK) --version >/dev/null 2>&1 || { \
+		echo "task is required. install it with:"; \
+		echo "  go install github.com/go-task/task/v3/cmd/task@latest"; \
 		exit 1; \
-	fi
+	}
 
-check: frontend-check fmt-check
+help: _require-task
+	@$(TASK) --list-all
 
-test:
-	mkdir -p $(GO_CACHE_DIR)
-	$(GO_ENV) $(GO) test ./...
+frontend-install: _require-task
+	@$(TASK) frontend:install
 
-build: frontend-build
-	mkdir -p $(BIN_DIR)
-	mkdir -p $(GO_CACHE_DIR)
-	$(GO_ENV) $(GO) build -trimpath -tags $(GO_BUILD_TAGS) -o $(BIN) .
+frontend-check: _require-task
+	@$(TASK) frontend:check
 
-build-dev: frontend-build
-	mkdir -p $(BIN_DIR)
-	mkdir -p $(GO_CACHE_DIR)
-	$(GO_ENV) $(GO) build -trimpath -tags dev -o $(BIN_DIR)/croopor-dev .
+frontend-build: _require-task
+	@$(TASK) frontend:build
 
-build-dev-windows: frontend-build
-	mkdir -p $(BIN_DIR)
-	mkdir -p $(GO_CACHE_DIR)
-	$(GO_ENV) GOOS=windows GOARCH=amd64 $(GO) build -trimpath -tags dev -o $(BIN_DIR)/croopor-dev.exe .
+check: _require-task
+	@$(TASK) check
 
-dev:
-	$(WAILS) dev
+test: _require-task
+	@$(TASK) test
 
-serve:
-	cd $(FRONTEND_DIR) && $(NPM) run dev
+build: _require-task
+	@$(TASK) build
 
-wails-build: frontend-build
-	mkdir -p $(GO_CACHE_DIR)
-	$(GO_ENV) $(WAILS) build -nopackage -m -v 1
+build-dev: _require-task
+	@$(TASK) build:dev
 
-verify: check test build wails-build
+build-windows: _require-task
+	@$(TASK) build:windows
 
-clean:
-	rm -rf $(BIN_DIR)
-	rm -rf $(GO_CACHE_DIR)
+build-windows-dev: _require-task
+	@$(TASK) build:windows:dev
+
+dev: _require-task
+	@$(TASK) wails:dev
+
+serve: _require-task
+	@$(TASK) frontend:serve
+
+wails-build: _require-task
+	@$(TASK) wails:build
+
+verify: _require-task
+	@$(TASK) verify
+
+clean: _require-task
+	@$(TASK) clean
+
+release-snapshot: _require-task
+	@$(TASK) release:snapshot

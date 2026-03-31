@@ -36,6 +36,9 @@ keep this short and real. if the codebase changes, update this file.
 - output is `frontend/static/app.js`
 - desktop build is wails
 - on ubuntu 24 the linux build uses `webkit2_41`
+- local dev commands live in `Taskfile.yml`
+- `Makefile` is only a compatibility shim
+- release artifacts are driven by `.goreleaser.yml`
 
 ## Inputs
 - text and number inputs should use `autocomplete="off"`

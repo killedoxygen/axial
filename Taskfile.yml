@@ -1,0 +1,162 @@
+version: "3"
+
+env:
+  GOCACHE: "{{.TASKFILE_DIR}}/.cache/go-build"
+
+vars:
+  FRONTEND_DIR: frontend
+  BIN_DIR: build/bin
+  HOST_BIN_EXT:
+    sh: |
+      if [ "$(go env GOOS)" = "windows" ]; then
+        printf ".exe"
+      fi
+  HOST_GOOS:
+    sh: go env GOOS
+  NATIVE_TAGS:
+    sh: |
+      if [ "$(go env GOOS)" = "linux" ]; then
+        printf "webkit2_41"
+      fi
+
+tasks:
+  default:
+    desc: show available commands
+    cmds:
+      - task --list-all
+
+  frontend:install:
+    desc: install frontend deps
+    dir: "{{.FRONTEND_DIR}}"
+    cmds:
+      - npm ci
+
+  frontend:check:
+    desc: run frontend typecheck
+    dir: "{{.FRONTEND_DIR}}"
+    cmds:
+      - npm run check
+
+  frontend:build:
+    desc: build frontend bundle
+    dir: "{{.FRONTEND_DIR}}"
+    cmds:
+      - npm run build
+
+  frontend:serve:
+    desc: run frontend-only dev server
+    dir: "{{.FRONTEND_DIR}}"
+    cmds:
+      - npm run dev
+
+  fmt:check:
+    desc: fail if go files are not formatted
+    cmds:
+      - cmd: |
+          out="$(gofmt -l $(find . -type f -name '*.go' -not -path './build/*' -not -path './vendor/*'))"
+          if [ -n "$out" ]; then
+            echo "$out"
+            exit 1
+          fi
+        platforms: [linux, darwin]
+      - cmd: >
+          powershell.exe -NoProfile -Command
+          "$files = Get-ChildItem -Recurse -Filter *.go | Where-Object { $_.FullName -notmatch '\\build\\' -and $_.FullName -notmatch '\\vendor\\' };
+          $out = @();
+          foreach ($file in $files) { $fmt = gofmt -l $file.FullName; if ($fmt) { $out += $fmt } };
+          if ($out.Count -gt 0) { $out | ForEach-Object { Write-Host $_ }; exit 1 }"
+        platforms: [windows]
+
+  check:
+    desc: run fast checks
+    deps:
+      - frontend:check
+      - fmt:check
+
+  test:
+    desc: run go tests
+    cmds:
+      - go test ./...
+
+  build:
+    desc: build native release binary for this machine
+    deps:
+      - frontend:build
+      - _prepare:bin-dir
+    cmds:
+      - go build -trimpath {{if .NATIVE_TAGS}}-tags {{.NATIVE_TAGS}}{{end}} -o {{.BIN_DIR}}/croopor{{.HOST_BIN_EXT}} .
+
+  build:dev:
+    desc: build native dev binary for this machine
+    deps:
+      - frontend:build
+      - _prepare:bin-dir
+    cmds:
+      - go build -trimpath -tags "{{if .NATIVE_TAGS}}{{.NATIVE_TAGS}} {{end}}dev" -o {{.BIN_DIR}}/croopor-dev{{.HOST_BIN_EXT}} .
+
+  build:windows:
+    desc: build windows amd64 release binary
+    deps:
+      - frontend:build
+      - _prepare:bin-dir
+    env:
+      GOOS: windows
+      GOARCH: amd64
+    cmds:
+      - go build -trimpath -o {{.BIN_DIR}}/croopor-windows.exe .
+
+  build:windows:dev:
+    desc: build windows amd64 dev binary
+    deps:
+      - frontend:build
+      - _prepare:bin-dir
+    env:
+      GOOS: windows
+      GOARCH: amd64
+    cmds:
+      - go build -trimpath -tags dev -o {{.BIN_DIR}}/croopor-dev-windows.exe .
+
+  wails:dev:
+    desc: run wails dev
+    cmds:
+      - wails dev
+
+  wails:build:
+    desc: build wails production bundle
+    deps:
+      - frontend:build
+    cmds:
+      - wails build -nopackage -m -v 1
+
+  verify:
+    desc: run full local verification
+    deps:
+      - check
+      - test
+      - build
+      - wails:build
+
+  release:snapshot:
+    desc: build release artifacts locally with goreleaser
+    cmds:
+      - goreleaser release --snapshot --clean
+
+  clean:
+    desc: remove build outputs and go caches
+    cmds:
+      - go clean -cache -testcache
+      - cmd: rm -rf build/bin dist
+        platforms: [linux, darwin]
+      - cmd: >
+          powershell.exe -NoProfile -Command
+          "if (Test-Path 'build/bin') { Remove-Item -Recurse -Force 'build/bin' };
+          if (Test-Path 'dist') { Remove-Item -Recurse -Force 'dist' }"
+        platforms: [windows]
+
+  _prepare:bin-dir:
+    internal: true
+    cmds:
+      - cmd: mkdir -p build/bin
+        platforms: [linux, darwin]
+      - cmd: powershell.exe -NoProfile -Command "New-Item -ItemType Directory -Force -Path 'build/bin' | Out-Null"
+        platforms: [windows]

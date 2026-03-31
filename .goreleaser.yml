@@ -1,0 +1,56 @@
+version: 2
+
+project_name: croopor
+
+before:
+  hooks:
+    - npm --prefix frontend ci
+    - npm --prefix frontend run build
+
+builds:
+  - id: linux
+    main: .
+    binary: croopor
+    goos:
+      - linux
+    goarch:
+      - amd64
+    tags:
+      - webkit2_41
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+    env:
+      - CGO_ENABLED=1
+
+  - id: windows
+    main: .
+    binary: croopor
+    goos:
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -H windowsgui -X main.version={{ .Version }}
+
+archives:
+  - id: raw-binaries
+    ids:
+      - linux
+      - windows
+    formats:
+      - binary
+    name_template: "{{ .ProjectName }}-{{ .Os }}-{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+
+release:
+  draft: false
+
+changelog:
+  sort: asc

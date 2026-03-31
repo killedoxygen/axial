@@ -21,6 +21,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: arduino/setup-task@v2
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -28,13 +30,13 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
 
       - name: Install frontend dependencies
-        run: make frontend-install
+        run: task frontend:install
 
       - name: Frontend typecheck
-        run: make frontend-check
+        run: task frontend:check
 
       - name: Frontend build
-        run: make frontend-build
+        run: task frontend:build
 
   desktop-linux:
     runs-on: ubuntu-24.04
@@ -42,6 +44,8 @@ jobs:
       image: ghcr.io/mateoltd/croopor-linux-ci:latest
     steps:
       - uses: actions/checkout@v4
+
+      - uses: arduino/setup-task@v2
 
       - uses: actions/setup-node@v4
         with:
@@ -57,18 +61,16 @@ jobs:
         run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.11.0
 
       - name: Install frontend dependencies
-        run: make frontend-install
+        run: task frontend:install
 
       - name: Static checks
-        run: make check
+        run: task check
 
       - name: Go tests
-        run: make test
+        run: task test
 
       - name: Linux desktop build
-        run: make build
+        run: task build
 
       - name: Wails production build
-        run: |
-          export PATH="$(go env GOPATH)/bin:$PATH"
-          make wails-build
+        run: task wails:build

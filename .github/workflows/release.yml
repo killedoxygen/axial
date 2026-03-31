@@ -14,37 +14,14 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  go-test:
-    runs-on: ubuntu-latest
+  verify:
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/mateoltd/croopor-linux-ci:latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-
-      - name: Run Go tests
-        run: make test
-
-  build-windows:
-    needs: go-test
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        include:
-          - goos: windows
-            goarch: amd64
-            ext: .exe
-            ldflags: "-s -w -H windowsgui"
-            gotags: ""
-          - goos: windows
-            goarch: arm64
-            ext: .exe
-            ldflags: "-s -w -H windowsgui"
-            gotags: ""
-
-    steps:
-      - uses: actions/checkout@v4
+      - uses: arduino/setup-task@v2
 
       - uses: actions/setup-node@v4
         with:
@@ -56,33 +33,17 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.11.0
+
       - name: Install frontend dependencies
-        run: make frontend-install
+        run: task frontend:install
 
-      - name: Verify frontend bundle
-        run: make frontend-build
+      - name: Verify
+        run: task verify
 
-      - name: Embed Windows resources
-        run: |
-          go install github.com/tc-hib/go-winres@v0.3.3
-          go-winres make --arch ${{ matrix.goarch }}
-
-      - name: Build
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-        run: |
-          VERSION=${GITHUB_REF_NAME#v}
-          BINARY="croopor-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}"
-          go build -trimpath ${{ matrix.gotags }} -ldflags='${{ matrix.ldflags }} -X main.version='"${VERSION}" -o "${BINARY}" .
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: croopor-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: croopor-*
-
-  build-linux:
-    needs: go-test
+  release:
+    needs: verify
     runs-on: ubuntu-24.04
     container:
       image: ghcr.io/mateoltd/croopor-linux-ci:latest
@@ -99,38 +60,10 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Install frontend dependencies
-        run: make frontend-install
-
-      - name: Verify frontend bundle
-        run: make frontend-build
-
-      - name: Build
+      - name: Release with goreleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: v2.8.2
+          args: release --clean
         env:
-          GOOS: linux
-          GOARCH: amd64
-        run: |
-          VERSION=${GITHUB_REF_NAME#v}
-          BINARY="croopor-linux-amd64"
-          go build -trimpath -tags webkit2_41 -ldflags='-s -w -X main.version='"${VERSION}" -o "${BINARY}" .
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: croopor-linux-amd64
-          path: croopor-linux-amd64
-
-  release:
-    needs:
-      - build-windows
-      - build-linux
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          merge-multiple: true
-
-      - name: Create release
-        uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          files: croopor-*
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

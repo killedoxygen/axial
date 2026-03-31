@@ -5,6 +5,7 @@ croopor.exe
 *.exe
 build/bin/
 .cache/
+.tools/
 
 # Frontend build artifacts
 frontend/node_modules/
