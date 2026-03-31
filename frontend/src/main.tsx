@@ -12,7 +12,7 @@ import { App } from './components/App';
 import { Music } from './music';
 import { applyTheme, initColorField } from './theme';
 import { Shortcuts, syncShortcutHints, handleRecordKey } from './shortcuts';
-import { fmtMem, showError, appendLog, setLogFilter, setPage, toggleShortcutHints, getMemoryRecommendation, updateMemoryRecText } from './utils';
+import { fmtMem, showError, appendLog, setLogFilter, setPage, toggleShortcutHints, getMemoryRecommendation, updateMemoryRecText, errMessage } from './utils';
 import { watchVersions } from './sidebar';
 import { selectInstance } from './actions';
 import { launchGame } from './launch';
@@ -22,12 +22,6 @@ import { hideContextMenu, bindContextMenu } from './context-menu';
 import { closeDeleteWizard, bindDeleteWizard } from './delete-wizard';
 import { dismissDialog, showConfirm } from './dialogs';
 import { getNativeAppVersion } from './native';
-
-function errMessage(err: unknown): string {
-  if (err instanceof Error && err.message) return err.message;
-  if (typeof err === 'string') return err;
-  return 'Unknown error';
-}
 
 function computeMemoryRecommendationText(val: number, totalGB: number | null): string {
   if (!totalGB) return '';
@@ -332,7 +326,9 @@ function bindEvents(): void {
       if (res.error) showError(res.error);
       else {
         appendLog('system', `Removed ${res.versions_removed} versions, ${res.instances_removed} instances`);
-        versions.value = (await api('GET', '/versions')).versions || [];
+        const versionsRes: any = await api('GET', '/versions');
+        if (versionsRes.error) showError(versionsRes.error);
+        else versions.value = versionsRes.versions || [];
         instances.value = [];
         selectedInstanceId.value = null;
         catalog.value = null;

@@ -177,7 +177,7 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		s.config.MusicVolume = &i
 	}
 	if v, ok := updates["music_track"].(float64); ok {
-		if v == math.Trunc(v) {
+		if len(musicTracks) > 0 && v == math.Trunc(v) {
 			idx := int(v)
 			if idx < 0 {
 				idx = 0
@@ -185,9 +185,7 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 			if idx >= len(musicTracks) {
 				idx = len(musicTracks) - 1
 			}
-			if len(musicTracks) > 0 {
-				s.config.MusicTrack = idx
-			}
+			s.config.MusicTrack = idx
 		}
 	}
 
@@ -558,7 +556,10 @@ func (s *Server) handleDeleteVersion(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		CascadeDependents bool `json:"cascade_dependents"`
 	}
-	json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err.Error() != "EOF" {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
 
 	versionDir := filepath.Join(minecraft.VersionsDir(mcDir), versionID)
 	if _, err := os.Stat(versionDir); os.IsNotExist(err) {
@@ -640,7 +641,10 @@ func (s *Server) handleOpenVersionFolder(w http.ResponseWriter, r *http.Request)
 	default:
 		cmd = exec.Command("xdg-open", versionDir)
 	}
-	cmd.Start()
+	if err := cmd.Start(); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to open folder: "+err.Error())
+		return
+	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
@@ -846,6 +850,11 @@ func musicLocalPath(idx int) string {
 // handleMusicTrack serves the cached music file, downloading it on first request.
 // Uses http.ServeFile for zero-copy transfer with Range request support.
 func (s *Server) handleMusicTrack(w http.ResponseWriter, r *http.Request) {
+	if len(musicTracks) == 0 {
+		writeError(w, http.StatusNotFound, "no music tracks available")
+		return
+	}
+
 	idx := 0
 	if idxStr := r.URL.Query().Get("t"); idxStr != "" {
 		if i, err := strconv.Atoi(idxStr); err == nil {

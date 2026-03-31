@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -97,7 +98,12 @@ func (f *forgeLoader) GameVersions() ([]GameVersion, error) {
 }
 
 func (f *forgeLoader) LoaderVersions(mcVersion string) ([]LoaderVersion, error) {
-	cacheKey := "forge:loader_versions:" + mcVersion
+	safeMCVersion, err := sanitizeVersionSegment("minecraft version", mcVersion)
+	if err != nil {
+		return nil, err
+	}
+
+	cacheKey := "forge:loader_versions:" + safeMCVersion
 
 	if versions, ok, fresh := cacheGetAs[[]LoaderVersion](f.cache, cacheKey); ok && fresh {
 		return versions, nil
@@ -114,13 +120,13 @@ func (f *forgeLoader) LoaderVersions(mcVersion string) ([]LoaderVersion, error) 
 	// Fetch promotions for recommended/latest flags
 	promos := f.fetchPromotions()
 
-	recommended := promos[mcVersion+"-recommended"]
-	latest := promos[mcVersion+"-latest"]
+	recommended := promos[safeMCVersion+"-recommended"]
+	latest := promos[safeMCVersion+"-latest"]
 
 	var versions []LoaderVersion
 	for _, entry := range entries {
 		mcv := extractMCVersion(entry)
-		if mcv != mcVersion {
+		if mcv != safeMCVersion {
 			continue
 		}
 		forgeVer := extractForgeVersion(entry)
@@ -144,15 +150,25 @@ func (f *forgeLoader) LoaderVersions(mcVersion string) ([]LoaderVersion, error) 
 }
 
 func (f *forgeLoader) Install(mcDir, mcVersion, loaderVersion string, progress chan<- Progress) (*InstallResult, error) {
-	versionID := f.VersionID(mcVersion, loaderVersion)
+	safeMCVersion, err := sanitizeVersionSegment("minecraft version", mcVersion)
+	if err != nil {
+		return nil, err
+	}
+	safeLoaderVersion, err := sanitizeVersionSegment("loader version", loaderVersion)
+	if err != nil {
+		return nil, err
+	}
+
+	versionID := f.VersionID(safeMCVersion, safeLoaderVersion)
 
 	return withInstallLock("forge:"+versionID, func() (*InstallResult, error) {
-		versionDir := filepath.Join(minecraft.VersionsDir(mcDir), versionID)
-		jsonPath := filepath.Join(versionDir, versionID+".json")
-		markerPath := filepath.Join(versionDir, ".incomplete")
+		versionDir, jsonPath, markerPath, err := resolveVersionFiles(mcDir, versionID)
+		if err != nil {
+			return nil, err
+		}
 		if _, err := os.Stat(jsonPath); err == nil {
 			if _, mErr := os.Stat(markerPath); os.IsNotExist(mErr) {
-				return &InstallResult{VersionID: versionID, GameVersion: mcVersion, LoaderType: Forge}, nil
+				return &InstallResult{VersionID: versionID, GameVersion: safeMCVersion, LoaderType: Forge}, nil
 			} else if mErr != nil {
 				return nil, fmt.Errorf("checking incomplete marker: %w", mErr)
 			}
@@ -162,8 +178,9 @@ func (f *forgeLoader) Install(mcDir, mcVersion, loaderVersion string, progress c
 
 		progress <- Progress{Phase: "loader_meta", Current: 0, Total: 1, Detail: "Downloading Forge installer..."}
 
-		mavenCoord := mcVersion + "-" + loaderVersion
-		installerURL := fmt.Sprintf("%s/net/minecraftforge/forge/%s/forge-%s-installer.jar", forgeMavenBase, mavenCoord, mavenCoord)
+		mavenCoord := safeMCVersion + "-" + safeLoaderVersion
+		escapedMavenCoord := url.PathEscape(mavenCoord)
+		installerURL := fmt.Sprintf("%s/net/minecraftforge/forge/%s/forge-%s-installer.jar", forgeMavenBase, escapedMavenCoord, escapedMavenCoord)
 
 		installerData, err := f.downloadToMemory(installerURL)
 		if err != nil {
@@ -181,13 +198,17 @@ func (f *forgeLoader) Install(mcDir, mcVersion, loaderVersion string, progress c
 			ID string `json:"id"`
 		}
 		if err := json.Unmarshal(versionJSON, &parsedVersion); err == nil && parsedVersion.ID != "" {
-			versionID = parsedVersion.ID
-			versionDir = filepath.Join(minecraft.VersionsDir(mcDir), versionID)
-			jsonPath = filepath.Join(versionDir, versionID+".json")
-			markerPath = filepath.Join(versionDir, ".incomplete")
+			versionID, err = sanitizeVersionSegment("installer version id", parsedVersion.ID)
+			if err != nil {
+				return nil, err
+			}
+			versionDir, jsonPath, markerPath, err = resolveVersionFiles(mcDir, versionID)
+			if err != nil {
+				return nil, err
+			}
 			if _, err := os.Stat(jsonPath); err == nil {
 				if _, mErr := os.Stat(markerPath); os.IsNotExist(mErr) {
-					return &InstallResult{VersionID: versionID, GameVersion: mcVersion, LoaderType: Forge}, nil
+					return &InstallResult{VersionID: versionID, GameVersion: safeMCVersion, LoaderType: Forge}, nil
 				} else if mErr != nil {
 					return nil, fmt.Errorf("checking incomplete marker: %w", mErr)
 				}
@@ -223,7 +244,7 @@ func (f *forgeLoader) Install(mcDir, mcVersion, loaderVersion string, progress c
 		if installProfile != nil {
 			progress <- Progress{Phase: "loader_processors", Current: 0, Total: 1, Detail: "Running processors..."}
 
-			if err := RunForgeProcessors(mcDir, mcVersion, versionID, installProfile, installerData, progress); err != nil {
+			if err := RunForgeProcessors(mcDir, safeMCVersion, versionID, installProfile, installerData, progress); err != nil {
 				return nil, fmt.Errorf("running Forge processors: %w", err)
 			}
 		}
@@ -231,7 +252,7 @@ func (f *forgeLoader) Install(mcDir, mcVersion, loaderVersion string, progress c
 		if err := os.Remove(markerPath); err != nil && !os.IsNotExist(err) {
 			return nil, fmt.Errorf("removing incomplete marker: %w", err)
 		}
-		return &InstallResult{VersionID: versionID, GameVersion: mcVersion, LoaderType: Forge}, nil
+		return &InstallResult{VersionID: versionID, GameVersion: safeMCVersion, LoaderType: Forge}, nil
 	})
 }
 

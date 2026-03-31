@@ -3,7 +3,7 @@ import { api } from './api';
 import { byId } from './dom';
 import { Sound } from './sound';
 import { Music } from './music';
-import { fmtMem, getMemoryRecommendation, errMessage } from './utils';
+import { fmtMem, getMemoryRecommendation, errMessage, showError } from './utils';
 import { positionFieldMarker } from './theme';
 import { showNewInstanceModal } from './components/NewInstanceModal';
 import { browseDirectory } from './native';
@@ -98,6 +98,7 @@ export function showSetup(): Promise<void> {
           clearPathError();
         }
       } catch (err: unknown) {
+        showPathError(errMessage(err) || 'Failed to browse for a folder');
       } finally {
         setupBrowseBtn.disabled = false;
         setupBrowseBtn.textContent = 'Browse';
@@ -183,16 +184,26 @@ export async function finishOnboarding(): Promise<void> {
   const usernameInput = byId<HTMLInputElement>('username-input');
   const memorySlider = byId<HTMLInputElement>('memory-slider');
   const memoryValue = byId<HTMLElement>('memory-value');
+  try {
+    const r: any = await api('PUT', '/config', { username, max_memory_mb: Math.round(memGB * 1024), music_enabled: musicEnabled, music_volume: 5 });
+    if (r.error) throw new Error(r.error);
+    config.value = r;
+  } catch (err: unknown) {
+    showError(`Failed to save onboarding settings: ${errMessage(err)}`);
+    return;
+  }
+  try {
+    const res: any = await api('POST', '/onboarding/complete');
+    if (res?.error) throw new Error(res.error);
+  } catch (err: unknown) {
+    showError(`Failed to finish onboarding: ${errMessage(err)}`);
+    return;
+  }
   if (usernameInput) usernameInput.value = username;
   if (memorySlider) {
     memorySlider.value = String(memGB);
     if (memoryValue) memoryValue.textContent = fmtMem(memGB);
   }
-  try {
-    const r: any = await api('PUT', '/config', { username, max_memory_mb: Math.round(memGB * 1024), music_enabled: musicEnabled, music_volume: 5 });
-    if (!r.error) config.value = r;
-  } catch (err: unknown) {}
-  try { await api('POST', '/onboarding/complete'); } catch (err: unknown) {}
   byId<HTMLElement>('onboarding')?.classList.add('hidden');
   Music.applyConfig({ music_enabled: musicEnabled, music_volume: 5 });
   if (musicEnabled) Music.play();

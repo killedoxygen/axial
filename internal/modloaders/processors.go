@@ -3,6 +3,7 @@ package modloaders
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/mateoltd/croopor/internal/minecraft"
 )
@@ -151,13 +153,19 @@ func runProcessor(javaPath string, proc processor, libPaths map[string]string, d
 	args := make([]string, 0, len(proc.Args)+4)
 	args = append(args, "-cp", classpath, mainClass)
 	for _, arg := range proc.Args {
-		args = append(args, substituteArg(arg, libPaths, dataVars, libDir))
+		args = append(args, substituteArg(arg, libPaths, dataVars, libDir, 0))
 	}
 
-	cmd := exec.Command(javaPath, args...)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, javaPath, args...)
 	cmd.Dir = libDir
 	output, err := cmd.CombinedOutput()
 	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("processor timed out after %s\noutput: %s", 2*time.Minute, string(output))
+		}
 		return fmt.Errorf("%s\noutput: %s", err, string(output))
 	}
 
@@ -226,30 +234,50 @@ func parseManifestMainClass(data []byte) string {
 	return ""
 }
 
-func substituteArg(arg string, libPaths, dataVars map[string]string, libDir string) string {
-	// [artifact:coordinate] -> library path
-	if strings.HasPrefix(arg, "[") && strings.HasSuffix(arg, "]") {
-		coord := arg[1 : len(arg)-1]
+func substituteArg(arg string, libPaths, dataVars map[string]string, libDir string, depth int) string {
+	if depth > 8 || arg == "" {
+		return arg
+	}
+
+	replaced := arg
+
+	for {
+		start := strings.IndexByte(replaced, '[')
+		end := strings.IndexByte(replaced, ']')
+		if start < 0 || end < 0 || end <= start {
+			break
+		}
+		coord := replaced[start+1 : end]
+		path := ""
 		if p, ok := libPaths[coord]; ok {
-			return p
+			path = p
+		} else if mavenPath := minecraft.MavenToPath(coord); mavenPath != "" {
+			path = filepath.Join(libDir, mavenPath)
 		}
-		mavenPath := minecraft.MavenToPath(coord)
-		if mavenPath != "" {
-			return filepath.Join(libDir, mavenPath)
+		if path == "" {
+			break
 		}
-		return arg
+		replaced = replaced[:start] + path + replaced[end+1:]
 	}
 
-	// {DATA_KEY} -> data variable value
-	if strings.HasPrefix(arg, "{") && strings.HasSuffix(arg, "}") {
-		key := arg[1 : len(arg)-1]
-		if v, ok := dataVars[key]; ok {
-			return v
+	for {
+		start := strings.IndexByte(replaced, '{')
+		end := strings.IndexByte(replaced, '}')
+		if start < 0 || end < 0 || end <= start {
+			break
 		}
-		return arg
+		key := replaced[start+1 : end]
+		value, ok := dataVars[key]
+		if !ok {
+			break
+		}
+		replaced = replaced[:start] + value + replaced[end+1:]
 	}
 
-	return arg
+	if replaced == arg {
+		return arg
+	}
+	return substituteArg(replaced, libPaths, dataVars, libDir, depth+1)
 }
 
 func buildDataVars(data map[string]dataEntry, mcDir, mcVersion, versionID string, installerData []byte) (map[string]string, string, error) {
@@ -355,7 +383,7 @@ func findJavaForProcessors(mcDir string) (string, error) {
 		for _, comp := range components {
 			result, err := minecraft.FindJava(mcDir, minecraft.JavaVersion{Component: comp, MajorVersion: major}, "")
 			if err == nil {
-				return result.Path, nil
+				return normalizeProcessorJavaPath(result.Path), nil
 			}
 		}
 	}
@@ -366,8 +394,18 @@ func findJavaForProcessors(mcDir string) (string, error) {
 		javaExe = "java.exe"
 	}
 	if path, err := exec.LookPath(javaExe); err == nil {
-		return path, nil
+		return normalizeProcessorJavaPath(path), nil
 	}
 
 	return "", fmt.Errorf("no Java runtime found; install the base game version first to download Java")
+}
+
+func normalizeProcessorJavaPath(path string) string {
+	if runtime.GOOS != "windows" {
+		return path
+	}
+	if strings.EqualFold(filepath.Base(path), "javaw.exe") {
+		return filepath.Join(filepath.Dir(path), "java.exe")
+	}
+	return path
 }

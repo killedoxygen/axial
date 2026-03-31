@@ -52,7 +52,10 @@ func (d *Downloader) InstallVersion(versionID, manifestURL string) {
 	// If the app crashes mid-install, the marker persists and the scanner
 	// will flag this version as incomplete on next startup.
 	markerPath := filepath.Join(versionDir, ".incomplete")
-	os.WriteFile(markerPath, []byte("installing"), 0644)
+	if err := os.WriteFile(markerPath, []byte("installing"), 0644); err != nil {
+		d.sendError("Failed to create install marker: " + err.Error())
+		return
+	}
 
 	jsonPath := filepath.Join(versionDir, versionID+".json")
 
@@ -158,7 +161,10 @@ func (d *Downloader) InstallVersion(versionID, manifestURL string) {
 	EnsureLauncherProfiles(d.MCDir, versionID)
 
 	// Installation succeeded, remove the incomplete marker
-	os.Remove(filepath.Join(versionDir, ".incomplete"))
+	if err := os.Remove(markerPath); err != nil && !os.IsNotExist(err) {
+		d.sendError("Failed to finalize install marker: " + err.Error())
+		return
+	}
 
 	d.send(DownloadProgress{Phase: "done", Current: 1, Total: 1, Done: true})
 }
@@ -348,7 +354,8 @@ func DownloadFile(client *http.Client, url, destPath, expectedSHA1 string) error
 
 // FileExistsWithSHA1 checks whether a file exists and optionally matches the expected hash.
 func FileExistsWithSHA1(path, expectedSHA1 string) bool {
-	if _, err := os.Stat(path); os.IsNotExist(err) {
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() {
 		return false
 	}
 	if expectedSHA1 == "" {
@@ -360,7 +367,9 @@ func FileExistsWithSHA1(path, expectedSHA1 string) bool {
 	}
 	defer f.Close()
 	h := sha1.New()
-	io.Copy(h, f)
+	if _, err := io.Copy(h, f); err != nil {
+		return false
+	}
 	return hex.EncodeToString(h.Sum(nil)) == expectedSHA1
 }
 

@@ -187,7 +187,10 @@ func (s *Server) handleDuplicateInstance(w http.ResponseWriter, r *http.Request)
 	var req struct {
 		Name string `json:"name"`
 	}
-	json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err.Error() != "EOF" {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
 
 	src := s.instances.Get(id)
 	if src == nil {
@@ -227,7 +230,10 @@ func (s *Server) handleOpenInstanceFolder(w http.ResponseWriter, r *http.Request
 	}
 
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
-		os.MkdirAll(dir, 0755)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to create folder: "+err.Error())
+			return
+		}
 	}
 
 	var cmd *exec.Cmd
@@ -239,7 +245,10 @@ func (s *Server) handleOpenInstanceFolder(w http.ResponseWriter, r *http.Request
 	default:
 		cmd = exec.Command("xdg-open", dir)
 	}
-	cmd.Start()
+	if err := cmd.Start(); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to open folder: "+err.Error())
+		return
+	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
