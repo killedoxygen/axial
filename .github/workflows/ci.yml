@@ -45,6 +45,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Trust checkout as a safe git directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - uses: arduino/setup-task@v2
 
       - uses: actions/setup-node@v4
