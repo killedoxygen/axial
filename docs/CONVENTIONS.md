@@ -7,25 +7,31 @@
 - Slider sounds are throttled per family. Use `playSliderSound()`, never `Sound.ui('slider')` directly.
 
 ## State
-- Single mutable `state` object from `state.js`. Mutate directly, then call the relevant render function.
-- UI preferences live in `local` (synced to localStorage). Runtime data lives in `state`.
-- DOM refs are cached once at startup via `cacheDom()`. Use `dom.elementName`, not `document.getElementById` in hot paths.
+- Runtime state lives in `frontend/src/store.ts` as Preact signals. Read with `.value`, update by assigning `.value` or through `frontend/src/actions.ts`.
+- UI preferences live in `local` from `frontend/src/state.ts` and are synced with `saveLocalState()`.
+- Do not introduce new proxy state bridges, manual `renderX()` calls, or mutate nested signal payloads in place when a reassignment is needed to trigger updates.
 
 ## Modules
 - Flat files with named exports. No classes, no default exports.
 - Singletons are plain object literals (`Sound`, `Music`, `Shortcuts`).
-- Cross-module communication goes through `state`, not custom events or callbacks.
+- Cross-module communication goes through signals/actions, not custom events or callback chains.
+
+## Event Handlers
+- Never pass business functions directly as `addEventListener` callbacks. Always use arrow wrappers: `addEventListener('click', () => doThing())`, not `addEventListener('click', doThing)`. This prevents DOM events from leaking into business logic as unexpected arguments.
+- If the handler needs the event (e.g. `preventDefault`), receive it explicitly in the arrow: `(e) => { e.preventDefault(); doThing(); }`.
+- Click handlers that need context (selected instance, version, etc.) read from signals/store state, never from DOM data attributes or the event object.
+- DOM `dataset` attributes annotate elements with their own metadata (data-id, data-theme). Never use them as a state bus between modules.
 
 ## Frontend DOM
-- `$` = `querySelector`, `$$` = `querySelectorAll` (from `state.js`).
+- `$` = `querySelector`, `$$` = `querySelectorAll` (from `dom.ts`) where helpers are already in use.
 - IDs: kebab-case. CSS classes: kebab-case. JS variables: camelCase.
-- Modals are created dynamically, appended to `document.body`, removed on close. Backdrop dismiss: `e.target === modal`.
+- New UI should prefer Preact components and signals over direct DOM construction.
 
 ## API
 - All endpoints: `/api/v1/*`. JSON in, JSON out.
 - Errors: `{"error": "message"}` with appropriate HTTP status.
 - Streaming (launch, install progress): Server-Sent Events.
-- Frontend helper: `api(method, path, body)` from `utils.js`.
+- Frontend helper: `api(method, path, body)` from `frontend/src/api.ts`.
 
 ## Go Backend
 - Handlers are methods on `Server`. Routes use Go 1.22+ patterns in `registerRoutes()`.
@@ -33,8 +39,9 @@
 - Sub-managers (`SessionManager`, `InstallManager`) are struct fields, not globals.
 
 ## Build
-- Frontend entry: `frontend/src/main.js` → output: `frontend/static/app.js`.
+- Frontend entry: `frontend/src/main.tsx` → output: `frontend/static/app.js`.
 - Build: `npm run build` in `frontend/`. Dev: `npm run dev` (sourcemaps, no minify).
+- Desktop build: `wails build`. On Linux/Ubuntu 24 the project uses the `webkit2_41` build tag through `wails.json`.
 - Go embeds `frontend/static` into the binary.
 
 ## CSS

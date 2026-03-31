@@ -203,6 +203,13 @@ func LoadVersionJSON(mcDir, versionID string) (*VersionJSON, error) {
 // MavenToPath converts a Maven coordinate like "org.lwjgl:lwjgl:3.3.3" or
 // "org.lwjgl:lwjgl:3.3.3:natives-windows" to a relative file path.
 func MavenToPath(coordinate string) string {
+	// Handle @extension syntax: group:artifact:version:classifier@extension
+	ext := ".jar"
+	if atIdx := strings.LastIndex(coordinate, "@"); atIdx >= 0 {
+		ext = "." + coordinate[atIdx+1:]
+		coordinate = coordinate[:atIdx]
+	}
+
 	parts := strings.Split(coordinate, ":")
 	if len(parts) < 3 {
 		return ""
@@ -216,7 +223,7 @@ func MavenToPath(coordinate string) string {
 	if len(parts) >= 4 {
 		filename += "-" + parts[3]
 	}
-	filename += ".jar"
+	filename += ext
 
 	return filepath.Join(group, artifact, version, filename)
 }

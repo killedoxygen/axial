@@ -96,7 +96,7 @@ func (d *Downloader) InstallVersion(versionID, manifestURL string) {
 
 	if version.Downloads.Client != nil {
 		jarPath := filepath.Join(versionDir, versionID+".jar")
-		if !fileExistsWithSHA1(jarPath, version.Downloads.Client.SHA1) {
+		if !FileExistsWithSHA1(jarPath, version.Downloads.Client.SHA1) {
 			if err := d.downloadFile(version.Downloads.Client.URL, jarPath, version.Downloads.Client.SHA1); err != nil {
 				d.sendError("Failed to download client JAR: " + err.Error())
 				return
@@ -106,17 +106,17 @@ func (d *Downloader) InstallVersion(versionID, manifestURL string) {
 
 	// Phase 3: Download libraries (including native classifier JARs)
 	env := DefaultEnvironment()
-	libs := filterLibraries(version.Libraries, env)
+	libs := FilterLibraries(version.Libraries, env)
 	totalLibs := len(libs)
 
 	d.send(DownloadProgress{Phase: "libraries", Current: 0, Total: totalLibs})
 
 	for i, lib := range libs {
 		// Download main artifact
-		libPath, libURL, libSHA1 := resolveLibDownload(lib, d.MCDir)
+		libPath, libURL, libSHA1 := ResolveLibDownload(lib, d.MCDir)
 		if libPath != "" && libURL != "" {
 			d.send(DownloadProgress{Phase: "libraries", Current: i + 1, Total: totalLibs, File: filepath.Base(libPath)})
-			if !fileExistsWithSHA1(libPath, libSHA1) {
+			if !FileExistsWithSHA1(libPath, libSHA1) {
 				os.MkdirAll(filepath.Dir(libPath), 0755)
 				d.downloadFile(libURL, libPath, libSHA1) // non-fatal
 			}
@@ -124,7 +124,7 @@ func (d *Downloader) InstallVersion(versionID, manifestURL string) {
 
 		// Download native classifier JAR if this library has a natives map
 		natPath, natURL, natSHA1 := resolveNativeDownload(lib, d.MCDir, env)
-		if natPath != "" && natURL != "" && !fileExistsWithSHA1(natPath, natSHA1) {
+		if natPath != "" && natURL != "" && !FileExistsWithSHA1(natPath, natSHA1) {
 			os.MkdirAll(filepath.Dir(natPath), 0755)
 			d.downloadFile(natURL, natPath, natSHA1) // non-fatal
 		}
@@ -134,7 +134,7 @@ func (d *Downloader) InstallVersion(versionID, manifestURL string) {
 	if version.AssetIndex.URL != "" {
 		assetIndexPath := filepath.Join(AssetsDir(d.MCDir), "indexes", version.AssetIndex.ID+".json")
 		d.send(DownloadProgress{Phase: "asset_index", Current: 0, Total: 1, File: version.AssetIndex.ID + ".json"})
-		if !fileExistsWithSHA1(assetIndexPath, version.AssetIndex.SHA1) {
+		if !FileExistsWithSHA1(assetIndexPath, version.AssetIndex.SHA1) {
 			if err := d.downloadFile(version.AssetIndex.URL, assetIndexPath, version.AssetIndex.SHA1); err != nil {
 				d.sendError("Failed to download asset index: " + err.Error())
 				return
@@ -148,7 +148,7 @@ func (d *Downloader) InstallVersion(versionID, manifestURL string) {
 	// Phase 6: Download log config file
 	if version.Logging != nil && version.Logging.Client != nil && version.Logging.Client.File.URL != "" {
 		logConfigPath := filepath.Join(AssetsDir(d.MCDir), "log_configs", version.Logging.Client.File.ID)
-		if !fileExistsWithSHA1(logConfigPath, version.Logging.Client.File.SHA1) {
+		if !FileExistsWithSHA1(logConfigPath, version.Logging.Client.File.SHA1) {
 			d.send(DownloadProgress{Phase: "log_config", Current: 0, Total: 1, File: version.Logging.Client.File.ID})
 			d.downloadFile(version.Logging.Client.File.URL, logConfigPath, version.Logging.Client.File.SHA1)
 		}
@@ -216,7 +216,7 @@ func (d *Downloader) downloadAssetObjects(indexPath string) {
 
 		prefix := obj.Hash[:2]
 		objPath := filepath.Join(objectsDir, prefix, obj.Hash)
-		if fileExistsWithSHA1(objPath, obj.Hash) {
+		if FileExistsWithSHA1(objPath, obj.Hash) {
 			continue
 		}
 
@@ -258,7 +258,8 @@ func (d *Downloader) resolveManifestURL(versionID string) (string, error) {
 	return "", fmt.Errorf("version %s not found in manifest", versionID)
 }
 
-func filterLibraries(libs []Library, env Environment) []Library {
+// FilterLibraries returns only the libraries whose rules match the given environment.
+func FilterLibraries(libs []Library, env Environment) []Library {
 	var result []Library
 	for _, lib := range libs {
 		if EvaluateRules(lib.Rules, env) {
@@ -268,7 +269,9 @@ func filterLibraries(libs []Library, env Environment) []Library {
 	return result
 }
 
-func resolveLibDownload(lib Library, mcDir string) (path, url, sha1 string) {
+// ResolveLibDownload determines the local path, download URL, and expected SHA1
+// for a library's main artifact.
+func ResolveLibDownload(lib Library, mcDir string) (path, url, sha1 string) {
 	libDir := LibrariesDir(mcDir)
 
 	if lib.Downloads != nil && lib.Downloads.Artifact != nil {
@@ -291,10 +294,16 @@ func resolveLibDownload(lib Library, mcDir string) (path, url, sha1 string) {
 }
 
 func (d *Downloader) downloadFile(url, destPath, expectedSHA1 string) error {
+	return DownloadFile(d.client, url, destPath, expectedSHA1)
+}
+
+// DownloadFile downloads a URL to destPath with optional SHA1 verification.
+// It writes to a .tmp file first and renames on success for atomicity.
+func DownloadFile(client *http.Client, url, destPath, expectedSHA1 string) error {
 	os.MkdirAll(filepath.Dir(destPath), 0755)
 
 	tmpPath := destPath + ".tmp"
-	resp, err := d.client.Get(url)
+	resp, err := client.Get(url)
 	if err != nil {
 		return fmt.Errorf("GET %s: %w", url, err)
 	}
@@ -328,7 +337,8 @@ func (d *Downloader) downloadFile(url, destPath, expectedSHA1 string) error {
 	return os.Rename(tmpPath, destPath)
 }
 
-func fileExistsWithSHA1(path, expectedSHA1 string) bool {
+// FileExistsWithSHA1 checks whether a file exists and optionally matches the expected hash.
+func FileExistsWithSHA1(path, expectedSHA1 string) bool {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		return false
 	}

@@ -171,6 +171,12 @@ input[type="range"]::-moz-range-thumb{width:13px;height:13px;border-radius:50%;b
 .badge-release{background:color-mix(in srgb,var(--accent) 10%,transparent);color:var(--accent)}
 .badge-snapshot{background:color-mix(in srgb,var(--amber) 10%,transparent);color:var(--amber)}
 .badge-modded{background:color-mix(in srgb,var(--purple) 10%,transparent);color:var(--purple)}
+.badge-loader{padding:3px;display:inline-flex;align-items:center;justify-content:center;line-height:0}
+.badge-loader svg{display:block}
+.badge-fabric{background:color-mix(in srgb,#dbc8a0 12%,transparent);color:#dbc8a0}
+.badge-quilt{background:color-mix(in srgb,#c084fc 12%,transparent);color:#c084fc}
+.badge-forge{background:color-mix(in srgb,#60a5fa 12%,transparent);color:#60a5fa}
+.badge-neoforge{background:color-mix(in srgb,#fb923c 12%,transparent);color:#fb923c}
 .badge-old{background:color-mix(in srgb,var(--text-dim) 8%,transparent);color:var(--text-dim)}
 .version-item.is-running{background:color-mix(in srgb,var(--accent) 8%,var(--surface-0))}
 .version-dot.running{background:var(--accent);box-shadow:0 0 6px var(--accent-glow-strong);animation:dot-breathe 2s ease-in-out infinite}
@@ -557,6 +563,19 @@ body.show-shortcuts .search-box[data-shortcut-hint]::after{top:7px;right:7px}
 .ni-page-btn:disabled{opacity:.3;cursor:default}
 .ni-page-info{font-size:11px;color:var(--text-muted);font-family:var(--font-mono)}
 
+/* ── Loader toggle & dropdown ── */
+.ni-loader-row{display:flex;align-items:center;gap:10px;min-height:28px}
+.ni-loader-toggle{position:relative;display:inline-flex;align-items:center;cursor:pointer;user-select:none}
+.ni-loader-toggle input{position:absolute;opacity:0;width:0;height:0}
+.ni-toggle-track{position:relative;width:36px;height:20px;border-radius:10px;background:var(--surface-2);border:1px solid var(--border);transition:background .15s,border-color .15s}
+.ni-toggle-thumb{position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;background:var(--text-muted);transition:transform .15s,background .15s}
+.ni-loader-toggle input:checked+.ni-toggle-track{background:rgba(var(--accent-h),0.2);border-color:var(--accent-dim)}
+.ni-loader-toggle input:checked+.ni-toggle-track .ni-toggle-thumb{transform:translateX(16px);background:var(--accent)}
+.ni-loader-select{background:var(--surface-1);border:1px solid var(--border);border-radius:var(--r-sm);color:var(--text);font-family:var(--font-sans);font-size:12px;padding:4px 8px;outline:none;cursor:pointer;transition:border-color .12s}
+.ni-loader-select:hover{border-color:var(--border-hover)}
+.ni-loader-select:focus{border-color:var(--accent-dim)}
+.ni-loader-info{font-size:11px;color:var(--text-muted);font-family:var(--font-mono);white-space:nowrap}
+
 /* ══════════════ SETUP ══════════════ */
 
 .setup-overlay{position:fixed;inset:0;background:var(--bg-deep);display:flex;align-items:center;justify-content:center;z-index:210;animation:fade-in .3s ease}
@@ -780,13 +799,10 @@ body.show-shortcuts .search-box[data-shortcut-hint]::after{top:7px;right:7px}
   .delete-actions .btn-secondary,.delete-actions .btn-danger{width:100%}
 }
 
-/* ═══ Toastify base (inline — esbuild outputs JS only) ═══ */
-.toastify{padding:12px 20px;display:inline-block;position:fixed;opacity:0;transition:all .4s cubic-bezier(.215,.61,.355,1);cursor:pointer;text-decoration:none;max-width:calc(50% - 20px);z-index:2147483647}
-.toastify.on{opacity:1}
-.toastify-bottom{bottom:-150px}
-.toastify-center{margin-left:auto;margin-right:auto;left:0;right:0;max-width:fit-content}
-
 /* ═══ App toast theme ═══ */
-.app-toast{font-family:var(--font-sans);font-size:12px;font-weight:500;border-radius:var(--r-sm);border:1px solid var(--border);box-shadow:0 4px 16px rgba(0,0,0,.35);padding:10px 18px;letter-spacing:.01em}
+.app-toast-viewport{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);display:flex;flex-direction:column;gap:10px;z-index:2147483647;pointer-events:none}
+.app-toast{font-family:var(--font-sans);font-size:12px;font-weight:500;border-radius:var(--r-sm);border:1px solid var(--border);box-shadow:0 4px 16px rgba(0,0,0,.35);padding:10px 18px;letter-spacing:.01em;pointer-events:auto;min-width:220px;max-width:min(420px,calc(100vw - 32px));text-align:left;animation:toast-in .18s ease-out}
 .app-toast-success{background:var(--surface-2);color:var(--accent)}
 .app-toast-error{background:var(--surface-2);color:var(--red)}
+
+@keyframes toast-in{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
