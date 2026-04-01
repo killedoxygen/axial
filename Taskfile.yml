@@ -3,53 +3,99 @@ version: "3"
 env:
   GOCACHE: "{{.TASKFILE_DIR}}/.cache/go-build"
   COREPACK_HOME: "{{.TASKFILE_DIR}}/.cache/corepack"
-  PNPM: pnpm
+  GOBIN: "{{.TASKFILE_DIR}}/.tools/bin"
 
 vars:
   FRONTEND_DIR: frontend
   BIN_DIR: build/bin
-  HOST_BIN_EXT:
-    sh: |
-      if [ "$(go env GOOS)" = "windows" ]; then
-        printf ".exe"
-      fi
-  HOST_GOOS:
-    sh: go env GOOS
-  NATIVE_TAGS:
-    sh: |
-      if [ "$(go env GOOS)" = "linux" ]; then
-        printf "webkit2_41"
-      fi
+  TOOLS_DIR: .tools/bin
 
 tasks:
   default:
     desc: show available commands
     cmds:
-      - task --list-all
+      - task --list
+
+  help:
+    desc: show available commands
+    cmds:
+      - task --list
+
+  setup:
+    desc: install go deps, frontend deps, and the local wails cli
+    deps:
+      - deps:go
+      - tools:wails
+      - frontend:install
+
+  doctor:
+    desc: show the local toolchain and platform state
+    silent: true
+    cmds:
+      - cmd: |
+          echo "go      $(go version)"
+          echo "node    $(node --version)"
+          echo "corepack $(corepack --version)"
+          echo "task    $(task --version)"
+          if command -v wails >/dev/null 2>&1; then
+            echo "wails   $(wails version | head -n 1)"
+          else
+            echo "wails   missing"
+          fi
+          if [ -n "${WSL_DISTRO_NAME:-}" ]; then
+            echo "wsl     yes"
+            if [ -n "${WAYLAND_DISPLAY:-}" ] || [ -n "${DISPLAY:-}" ]; then
+              echo "gui     detected"
+            else
+              echo "gui     missing, use 'dev-web' or run under WSLg"
+            fi
+          else
+            echo "wsl     no"
+          fi
+        platforms: [linux, darwin]
+      - cmd: >
+          powershell.exe -NoProfile -Command
+          "$wails = if (Get-Command wails -ErrorAction SilentlyContinue) { (wails version | Select-Object -First 1) } else { 'missing' };
+          Write-Host ('go      ' + (go version));
+          Write-Host ('node    ' + (node --version));
+          Write-Host ('corepack ' + (corepack --version));
+          Write-Host ('task    ' + (task --version));
+          Write-Host ('wails   ' + $wails);
+          Write-Host 'wsl     no'"
+        platforms: [windows]
 
   frontend:install:
     desc: install frontend deps
+    aliases: [setup:frontend]
     dir: "{{.FRONTEND_DIR}}"
     cmds:
-      - "{{.PNPM}} install --frozen-lockfile --ignore-scripts"
+      - corepack pnpm install --frozen-lockfile --ignore-scripts
 
   frontend:check:
     desc: run frontend typecheck
     dir: "{{.FRONTEND_DIR}}"
     cmds:
-      - "{{.PNPM}} run check"
+      - corepack pnpm run check
 
   frontend:build:
     desc: build frontend bundle
     dir: "{{.FRONTEND_DIR}}"
     cmds:
-      - "{{.PNPM}} run build"
+      - corepack pnpm run build
+
+  frontend:watch:
+    desc: rebuild frontend assets on file changes
+    aliases: [watch]
+    dir: "{{.FRONTEND_DIR}}"
+    cmds:
+      - corepack pnpm run watch
 
   frontend:serve:
     desc: run frontend-only dev server
+    aliases: [dev-web, web]
     dir: "{{.FRONTEND_DIR}}"
     cmds:
-      - "{{.PNPM}} run dev"
+      - corepack pnpm run dev
 
   fmt:check:
     desc: fail if go files are not formatted
@@ -75,29 +121,48 @@ tasks:
       - frontend:check
       - fmt:check
 
+  deps:go:
+    desc: download go modules
+    aliases: [setup:go]
+    cmds:
+      - go mod download
+
   test:
     desc: run go tests
     cmds:
       - go test ./...
 
   build:
-    desc: build native release binary for this machine
+    desc: build the native release binary for this machine
+    aliases: [build-local]
     deps:
       - frontend:build
       - _prepare:bin-dir
     cmds:
-      - go build -trimpath {{if .NATIVE_TAGS}}-tags {{.NATIVE_TAGS}}{{end}} -o {{.BIN_DIR}}/croopor{{.HOST_BIN_EXT}} .
+      - cmd: go build -trimpath -tags webkit2_41 -o {{.BIN_DIR}}/croopor .
+        platforms: [linux]
+      - cmd: go build -trimpath -o {{.BIN_DIR}}/croopor .
+        platforms: [darwin]
+      - cmd: go build -trimpath -o {{.BIN_DIR}}/croopor.exe .
+        platforms: [windows]
 
   build:dev:
-    desc: build native dev binary for this machine
+    desc: build the native dev binary for this machine
+    aliases: [build-dev, build-local-dev]
     deps:
       - frontend:build
       - _prepare:bin-dir
     cmds:
-      - go build -trimpath -tags "{{if .NATIVE_TAGS}}{{.NATIVE_TAGS}} {{end}}dev" -o {{.BIN_DIR}}/croopor-dev{{.HOST_BIN_EXT}} .
+      - cmd: go build -trimpath -tags "webkit2_41 dev" -o {{.BIN_DIR}}/croopor-dev .
+        platforms: [linux]
+      - cmd: go build -trimpath -tags dev -o {{.BIN_DIR}}/croopor-dev .
+        platforms: [darwin]
+      - cmd: go build -trimpath -tags dev -o {{.BIN_DIR}}/croopor-dev.exe .
+        platforms: [windows]
 
   build:windows:
-    desc: build windows amd64 release binary
+    desc: build the windows amd64 release binary
+    aliases: [build-windows]
     deps:
       - frontend:build
       - _prepare:bin-dir
@@ -108,7 +173,8 @@ tasks:
       - go build -trimpath -o {{.BIN_DIR}}/croopor-windows.exe .
 
   build:windows:dev:
-    desc: build windows amd64 dev binary
+    desc: build the windows amd64 dev binary
+    aliases: [build-windows-dev]
     deps:
       - frontend:build
       - _prepare:bin-dir
@@ -118,20 +184,48 @@ tasks:
     cmds:
       - go build -trimpath -tags dev -o {{.BIN_DIR}}/croopor-dev-windows.exe .
 
+  run:windows:dev:
+    desc: build and launch the windows dev binary
+    aliases: [dev-windows]
+    deps:
+      - build:windows:dev
+    cmds:
+      - cmd: |
+          if [ -z "${WSL_DISTRO_NAME:-}" ]; then
+            echo "dev-windows from linux is only supported under WSL."
+            exit 1
+          fi
+          if ! command -v powershell.exe >/dev/null 2>&1 || ! command -v wslpath >/dev/null 2>&1; then
+            echo "dev-windows needs powershell.exe and wslpath."
+            exit 1
+          fi
+          win_path="$(wslpath -w "{{.TASKFILE_DIR}}/{{.BIN_DIR}}/croopor-dev-windows.exe")"
+          win_dir="$(wslpath -w "{{.TASKFILE_DIR}}/{{.BIN_DIR}}")"
+          powershell.exe -NoProfile -Command "Start-Process -FilePath '$win_path' -WorkingDirectory '$win_dir'"
+        platforms: [linux]
+      - cmd: >
+          powershell.exe -NoProfile -Command
+          "Start-Process (Resolve-Path 'build/bin/croopor-dev-windows.exe')"
+        platforms: [windows]
+
   wails:dev:
-    desc: run wails dev
+    desc: run desktop dev with wails
+    aliases: [dev, dev-desktop]
+    deps:
+      - tools:wails
     cmds:
       - wails dev
 
   wails:build:
-    desc: build wails production bundle
+    desc: build the wails production bundle
     deps:
+      - tools:wails
       - frontend:build
     cmds:
       - wails build -nopackage -m -v 1
 
   verify:
-    desc: run full local verification
+    desc: run checks, tests, and native builds
     deps:
       - check
       - test
@@ -139,7 +233,10 @@ tasks:
       - wails:build
 
   release:snapshot:
-    desc: build release artifacts locally with goreleaser
+    desc: build local release artifacts with goreleaser
+    aliases: [release-snapshot]
+    deps:
+      - tools:goreleaser
     cmds:
       - goreleaser release --snapshot --clean
 
@@ -153,6 +250,40 @@ tasks:
           powershell.exe -NoProfile -Command
           "if (Test-Path 'build/bin') { Remove-Item -Recurse -Force 'build/bin' };
           if (Test-Path 'dist') { Remove-Item -Recurse -Force 'dist' }"
+        platforms: [windows]
+
+  tools:wails:
+    desc: install the local wails cli into .tools/bin
+    internal: true
+    silent: true
+    cmds:
+      - cmd: |
+          if command -v wails >/dev/null 2>&1 || [ -x "{{.TOOLS_DIR}}/wails" ]; then
+            exit 0
+          fi
+          go install github.com/wailsapp/wails/v2/cmd/wails@v2.11.0
+        platforms: [linux, darwin]
+      - cmd: >
+          powershell.exe -NoProfile -Command
+          "if ((Get-Command wails -ErrorAction SilentlyContinue) -or (Test-Path '.tools/bin/wails.exe')) { exit 0 };
+          go install github.com/wailsapp/wails/v2/cmd/wails@v2.11.0"
+        platforms: [windows]
+
+  tools:goreleaser:
+    desc: install local goreleaser into .tools/bin
+    internal: true
+    silent: true
+    cmds:
+      - cmd: |
+          if command -v goreleaser >/dev/null 2>&1 || [ -x "{{.TOOLS_DIR}}/goreleaser" ]; then
+            exit 0
+          fi
+          go install github.com/goreleaser/goreleaser/v2@v2.8.2
+        platforms: [linux, darwin]
+      - cmd: >
+          powershell.exe -NoProfile -Command
+          "if ((Get-Command goreleaser -ErrorAction SilentlyContinue) -or (Test-Path '.tools/bin/goreleaser.exe')) { exit 0 };
+          go install github.com/goreleaser/goreleaser/v2@v2.8.2"
         platforms: [windows]
 
   _prepare:bin-dir:

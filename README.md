@@ -8,154 +8,124 @@ it already handles:
 - launch sessions, logs, install progress
 - local music, themes, shortcuts, onboarding
 
-it does **not** handle microsoft account auth, so for online-mode stuff you need the official launcher.
-
-## state
-current stack:
-- desktop shell is wails
-- frontend state is mostly signal-driven
-- backend exposes `/api/v1/*`
-- desktop event streaming uses wails runtime events
-- browser mode uses sse
+## stack
+- desktop shell: wails
+- frontend: preact + signals
+- backend: go + `/api/v1/*`
+- desktop event streaming: wails runtime events
+- browser mode: sse
 
 ## prereqs
 - go 1.25+
 - node 22+
-- corepack enabled
-- task v3
-- wails cli `v2.11.0`
-- goreleaser v2 if you want local release snapshots
+- ubuntu 24.04 linux desktop builds need `libgtk-3-dev` and `libwebkit2gtk-4.1-dev`
 
-ubuntu 24.04:
+you do **not** need to install `task`, `pnpm`, `wails`, or `goreleaser` globally for normal local work.
+
+ubuntu 24.04 quick prereqs:
 
 ```bash
 sudo apt-get update
 sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev
-corepack enable
-go install github.com/go-task/task/v3/cmd/task@latest
-go install github.com/wailsapp/wails/v2/cmd/wails@v2.11.0
-go install github.com/goreleaser/goreleaser/v2@latest
-```
-
-the frontend uses `pnpm`, pinned through `corepack`.
-the first `pnpm` run may download that pinned version once.
-
-if `go install` put `task` in `~/go/bin`, `make` will pick it up even if your shell PATH was not reloaded yet.
-
-## quickstart
-first time:
-
-```bash
-make setup
-```
-
-daily app dev:
-
-```bash
-make dev
-```
-
-native local builds:
-
-```bash
-make build
-make build-dev
-```
-
-see everything:
-
-```bash
-make help
 ```
 
 ## cli
-`task` is the real interface. `make` is only a small compatibility shim for the common commands.
+main entrypoints:
+- unix, mac, wsl: `./dev`
+- windows powershell: `.\dev.ps1`
+- windows cmd: `dev.cmd`
 
-daily commands:
+the repo bootstraps its own local tools into `.tools/bin`.
+extra compatibility path:
+- unix, mac, wsl: `make`
+
+## quickstart
+unix, mac, wsl:
 
 ```bash
-task build
-task build:dev
-task wails:dev
-task verify
+./dev setup
+./dev help
+./dev dev
 ```
 
-same thing through `make`:
+windows powershell:
 
-```bash
-make build
-make build-dev
-make dev
-make verify
+```powershell
+.\dev.ps1 setup
+.\dev.ps1 help
+.\dev.ps1 dev
 ```
 
-first time setup:
+## common commands
+- `setup`: install go deps, frontend deps, and the local wails cli
+- `dev`: run desktop dev with wails
+- `dev-web`: run the frontend-only dev server
+- `dev-windows`: build and launch the windows dev binary
+- `watch`: rebuild frontend assets on file changes
+- `build`: build the native release binary for this machine
+- `build-dev`: build the native dev binary for this machine
+- `build-windows`: cross-build a windows amd64 release binary
+- `build-windows-dev`: cross-build a windows amd64 dev binary
+- `verify`: run checks, tests, and native builds
+- `doctor`: show detected tools and platform state
+- `clean`: remove build outputs and go caches
+
+examples:
 
 ```bash
-corepack enable
-task frontend:install
-# or
-make setup
+./dev setup
+./dev dev-web
+./dev dev-windows
+./dev watch
+./dev build-dev
+./dev verify
 ```
 
-frontend only:
+## wsl note
+`dev` needs a gui session. with wsl that means wslg or another linux gui path.
+
+if you are in headless wsl, use:
 
 ```bash
-task frontend:serve
-task frontend:check
-task frontend:build
+./dev dev-web
 ```
 
-desktop app:
+if you want the windows app from wsl instead of the linux desktop app:
 
 ```bash
-task test
-task wails:dev
-task wails:build
-task build
-task build:dev
+./dev dev-windows
 ```
 
-windows cross-builds:
+frontend dev server port is configurable:
 
 ```bash
-task build:windows
-task build:windows:dev
+PORT=3001 ./dev dev-web
 ```
 
-full local verification:
+## direct task usage
+`task` is the workflow engine, not the required user entrypoint.
+
+if you really want to use it directly after setup:
 
 ```bash
-task check
-task test
-task verify
+.tools/bin/task --list
 ```
 
-release snapshot:
+## release
+tag pushes build release artifacts and updater metadata.
+
+current release output:
+- raw binaries through goreleaser
+- linux amd64 appimage
+- windows msix + appinstaller files for internal updater validation
+- github pages update metadata at `updates/stable.json`
+
+local snapshot:
 
 ```bash
-task release:snapshot
+./dev release-snapshot
 ```
 
 ## maintainer docs
 - `docs/CONVENTIONS.md`
 - `docs/ARCHITECTURE.md`
-
-## release
-tag push builds release artifacts through goreleaser.
-
-```bash
-git tag v1.1.0
-git push --tags
-```
-
-local snapshot:
-
-```bash
-task release:snapshot
-```
-
-## roadmap
-- msa auth
-- modrinth-powered bundles
-- skin stuff

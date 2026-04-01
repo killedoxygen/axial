@@ -35,14 +35,18 @@ keep this short and real. if the codebase changes, update this file.
 - frontend entry is `frontend/src/main.tsx`
 - output is `frontend/static/app.js`
 - frontend package manager is `pnpm`, pinned through `frontend/package.json`
-- use `task` for real repo commands, use `make` only as a short compatibility layer
-- enable `corepack` instead of telling people to install random global js tooling
+- run frontend commands through `corepack pnpm`, do not assume a global `pnpm` shim
+- workflow definitions live in `Taskfile.yml`
+- main local entrypoints are `./dev` on unix/wsl and `dev.ps1` or `dev.cmd` on windows
+- `make` is a fallback path, not the main daily interface
+- the repo bootstraps local tools into `.tools/bin`, do not rely on random global `task`, `wails`, or `goreleaser` installs
 - frontend installs should use the lockfile and `--ignore-scripts`
 - desktop build is wails
 - on ubuntu 24 the linux build uses `webkit2_41`
 - local dev commands live in `Taskfile.yml`
-- `Makefile` is only a compatibility shim
-- release artifacts are driven by `.goreleaser.yml`
+- `Makefile` is only a unix/wsl convenience shim
+- raw release binaries are driven by `.goreleaser.yml`
+- extra release packaging and updater metadata live in `.github/workflows/release.yml`
 
 ## Inputs
 - text and number inputs should use `autocomplete="off"`
