@@ -144,10 +144,12 @@ input[type="range"]::-moz-range-thumb{width:13px;height:13px;border-radius:50%;b
 
 .version-list{flex:1;overflow-y:auto;padding:6px}
 .version-group-label{
+  appearance:none;background:transparent;border:none;outline:none;margin:0;font-family:inherit;
   font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--text-muted);
-  padding:10px 8px 4px;user-select:none;cursor:pointer;display:flex;align-items:center;gap:4px;transition:color .15s;
+  padding:10px 8px 4px;user-select:none;cursor:pointer;display:flex;align-items:center;gap:4px;width:100%;text-align:left;transition:color .15s;
 }
 .version-group-label:hover{color:var(--text-dim)}
+.version-group-label>span{display:flex}
 .version-group-chevron{width:10px;height:10px;transition:transform .2s ease;flex-shrink:0}
 .version-group-label.collapsed .version-group-chevron{transform:rotate(-90deg)}
 .version-group-items{overflow:hidden;transition:max-height .25s ease}
