@@ -12,7 +12,7 @@ import { App } from './components/App';
 import { Music } from './music';
 import { applyTheme, initColorField } from './theme';
 import { Shortcuts, syncShortcutHints, handleRecordKey } from './shortcuts';
-import { fmtMem, showError, appendLog, setLogFilter, setPage, toggleShortcutHints, getMemoryRecommendation, updateMemoryRecText, errMessage } from './utils';
+import { fmtMem, showError, appendLog, clearLogIndicator, setLogFilter, setPage, toggleShortcutHints, getMemoryRecommendation, updateMemoryRecText, errMessage } from './utils';
 import { watchVersions } from './sidebar';
 import { selectInstance } from './actions';
 import { launchGame } from './launch';
@@ -222,6 +222,7 @@ function bindEvents(): void {
   logToggle?.addEventListener('click', (e: MouseEvent) => {
     if ((e.target as HTMLElement).closest('.log-filter')) return;
     logPanel?.classList.toggle('expanded');
+    if (logPanel?.classList.contains('expanded')) clearLogIndicator();
     local.logExpanded = !!logPanel?.classList.contains('expanded');
     saveLocalState();
   });

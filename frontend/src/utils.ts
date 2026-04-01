@@ -1,9 +1,32 @@
 import { byId } from './dom';
-import { currentPage, instances, logLines } from './store';
+import { collapsedLogSeverity, currentPage, instances, logLines } from './store';
 import type { Page } from './types';
 
 const loggedInstances = new Set<string>();
 let activeLogFilter = 'all';
+import type { LogSeverity } from './store';
+
+const SEVERITY_RANK: Record<LogSeverity, number> = { error: 3, system: 2, info: 1 };
+
+function logSeverityFromSource(source: string): LogSeverity {
+  if (source === 'stderr') return 'error';
+  if (source === 'system') return 'system';
+  return 'info';
+}
+
+function updateLogIndicator(source: string): void {
+  const panel = byId<HTMLElement>('log-panel');
+  if (panel?.classList.contains('expanded')) return;
+
+  const newSeverity = logSeverityFromSource(source);
+  const currentSeverity = collapsedLogSeverity.value;
+  if (currentSeverity && SEVERITY_RANK[currentSeverity] >= SEVERITY_RANK[newSeverity]) return;
+  collapsedLogSeverity.value = newSeverity;
+}
+
+export function clearLogIndicator(): void {
+  collapsedLogSeverity.value = null;
+}
 
 function fmtTime(): string {
   const d = new Date();
@@ -24,7 +47,7 @@ export function appendLog(source: string, text: string, instanceId?: string, ins
   ts.textContent = fmtTime();
   line.appendChild(ts);
 
-  // Instance tag (hidden by CSS unless .multi)
+  // Instance tag
   if (instanceName && instanceId) {
     const tag = document.createElement('span');
     tag.className = 'log-tag';
@@ -48,6 +71,7 @@ export function appendLog(source: string, text: string, instanceId?: string, ins
   logLinesEl?.appendChild(line);
   logLines.value += 1;
   if (logCountEl) logCountEl.textContent = `${logLines.value} line${logLines.value !== 1 ? 's' : ''}`;
+  updateLogIndicator(source);
   if (logContentEl) logContentEl.scrollTop = logContentEl.scrollHeight;
 }
 
@@ -88,7 +112,6 @@ function syncLogFilter(): void {
 
 export function showError(msg: string): void {
   appendLog('stderr', `ERROR: ${msg}`);
-  byId<HTMLElement>('log-panel')?.classList.add('expanded');
 }
 
 export function errMessage(err: unknown): string {

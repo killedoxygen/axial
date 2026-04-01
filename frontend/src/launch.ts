@@ -80,7 +80,6 @@ export async function launchGame(): Promise<void> {
     endLaunchSequence();
     Music.suppress();
     Sound.ui('launchSuccess');
-    byId<HTMLElement>('log-panel')?.classList.add('expanded');
     try {
       await connectLaunchEvents(res.session_id, inst.id, inst.name);
     } catch (err: unknown) {
