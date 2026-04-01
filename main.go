@@ -17,7 +17,7 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
 )
 
-var version = "1.1.0"
+var version = "0.3.0"
 
 func main() {
 	mcDir := flag.String("mc-dir", "", "Override .minecraft directory path")
