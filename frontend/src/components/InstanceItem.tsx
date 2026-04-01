@@ -14,7 +14,7 @@ function LoaderIcon({ loader }: { loader: string }): JSX.Element | null {
     case 'fabric':
       // Fabric pixel-art knot (cropped to content)
       return (
-        <svg width="10" height="10" viewBox="2 1 13 14" shape-rendering="crispEdges">
+        <svg width="10" height="10" viewBox="2 2 13 13" shape-rendering="crispEdges">
           <rect x="8" y="2" width="1" height="1" fill="#38342a" />
           <rect x="9" y="2" width="1" height="1" fill="#dbd0b4" />
           <rect x="10" y="2" width="1" height="1" fill="#38342a" />
