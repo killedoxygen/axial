@@ -4,6 +4,44 @@ import type { Page } from './types';
 
 const loggedInstances = new Set<string>();
 let activeLogFilter = 'all';
+type LogSeverity = 'error' | 'system' | 'info';
+
+let currentSeverity: LogSeverity | null = null;
+
+const SEVERITY_SVGS: Record<LogSeverity, string> = {
+  error: '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 18 0a9 9 0 0 0 -18 0"/><path d="M12 8v4"/><path d="M12 16h.01"/></svg>',
+  system: '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9v4"/><path d="M10.363 3.591l-8.106 13.534a1.914 1.914 0 0 0 1.636 2.871h16.214a1.914 1.914 0 0 0 1.636 -2.87l-8.106 -13.536a1.914 1.914 0 0 0 -3.274 0"/><path d="M12 16h.01"/></svg>',
+  info: '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 18 0a9 9 0 0 0 -18 0"/><path d="M12 9h.01"/><path d="M11 12h1v4h1"/></svg>',
+};
+
+const SEVERITY_RANK: Record<LogSeverity, number> = { error: 3, system: 2, info: 1 };
+
+function updateLogIndicator(source: string): void {
+  const panel = byId<HTMLElement>('log-panel');
+  if (panel?.classList.contains('expanded')) return;
+
+  const newSeverity: LogSeverity = source === 'stderr' ? 'error' : source === 'system' ? 'system' : 'info';
+  if (currentSeverity && SEVERITY_RANK[currentSeverity] >= SEVERITY_RANK[newSeverity]) return;
+
+  currentSeverity = newSeverity;
+  const label = newSeverity === 'error' ? 'Errors in game output' : newSeverity === 'system' ? 'New system messages' : 'New game output';
+  let icon = byId<HTMLElement>('log-severity-icon');
+  if (!icon) {
+    icon = document.createElement('span');
+    icon.id = 'log-severity-icon';
+    icon.setAttribute('role', 'img');
+    byId<HTMLElement>('log-title')?.insertAdjacentElement('afterend', icon);
+  }
+  icon.className = `log-severity-icon severity-${newSeverity}`;
+  icon.innerHTML = SEVERITY_SVGS[newSeverity];
+  icon.title = label;
+  icon.setAttribute('aria-label', label);
+}
+
+export function clearLogIndicator(): void {
+  currentSeverity = null;
+  byId<HTMLElement>('log-severity-icon')?.remove();
+}
 
 function fmtTime(): string {
   const d = new Date();
@@ -48,6 +86,7 @@ export function appendLog(source: string, text: string, instanceId?: string, ins
   logLinesEl?.appendChild(line);
   logLines.value += 1;
   if (logCountEl) logCountEl.textContent = `${logLines.value} line${logLines.value !== 1 ? 's' : ''}`;
+  updateLogIndicator(source);
   if (logContentEl) logContentEl.scrollTop = logContentEl.scrollHeight;
 }
 
@@ -88,7 +127,6 @@ function syncLogFilter(): void {
 
 export function showError(msg: string): void {
   appendLog('stderr', `ERROR: ${msg}`);
-  byId<HTMLElement>('log-panel')?.classList.add('expanded');
 }
 
 export function errMessage(err: unknown): string {

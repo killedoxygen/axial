@@ -181,7 +181,7 @@ export function App(): JSX.Element {
         <div class="log-resize" id="log-resize" />
         <div class="log-toggle" id="log-toggle">
           <svg class="log-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="18 15 12 9 6 15" /></svg>
-          <span>Game Output</span>
+          <span id="log-title">Game Output</span>
           <select class="log-filter hidden" id="log-filter"><option value="all">All instances</option></select>
           <span class="log-count" id="log-count">0 lines</span>
         </div>
