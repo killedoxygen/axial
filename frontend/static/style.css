@@ -202,8 +202,8 @@ input[type="range"]::-moz-range-thumb{width:13px;height:13px;border-radius:50%;b
 .sidebar-settings-panel{padding:10px 10px 12px}
 .sidebar-settings-head{padding:2px 2px 12px;border-bottom:1px solid var(--border);margin-bottom:10px}
 .sidebar-settings-title{font-family:var(--font-sans);font-size:18px;line-height:1;margin:6px 0 4px;letter-spacing:-.03em}
-.settings-nav{flex:1;min-height:0;overflow-y:auto}
-.sidebar-settings-actions{display:flex;gap:8px;flex-wrap:wrap;flex-shrink:0;padding-top:10px}
+.settings-nav{min-height:0;overflow-y:auto}
+.sidebar-settings-actions{display:flex;gap:8px;flex-wrap:wrap;flex-shrink:0;padding-top:10px;margin-top:auto}
 
 /* ══════════════ CENTER PANEL ══════════════ */
 
