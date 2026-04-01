@@ -15,6 +15,9 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  APPIMAGETOOL_VERSION: "13"
+
 jobs:
   verify:
     runs-on: ubuntu-24.04
@@ -137,7 +140,7 @@ jobs:
           exec "$HERE/usr/bin/croopor" "$@"
           EOF
           chmod +x dist/appimage/AppDir/AppRun
-          curl -L -o dist/appimagetool.AppImage https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+          curl -L -o dist/appimagetool.AppImage https://github.com/AppImage/AppImageKit/releases/download/${APPIMAGETOOL_VERSION}/appimagetool-x86_64.AppImage
           chmod +x dist/appimagetool.AppImage
           ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 ./dist/appimagetool.AppImage dist/appimage/AppDir dist/croopor-linux-amd64.AppImage
 
@@ -228,7 +231,6 @@ jobs:
         with:
           files: |
             dist/windows-${{ matrix.goarch }}/croopor-windows-${{ matrix.goarch }}.msix
-            dist/windows-${{ matrix.goarch }}/croopor-dev-test-${{ matrix.goarch }}.cer
             dist/windows-${{ matrix.goarch }}/croopor.appinstaller
 
       - name: Upload App Installer file for Pages
@@ -236,6 +238,12 @@ jobs:
         with:
           name: appinstaller-${{ matrix.goarch }}
           path: dist/windows-${{ matrix.goarch }}/croopor.appinstaller
+
+      - name: Upload Windows test certificate artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-cert-${{ matrix.goarch }}
+          path: dist/windows-${{ matrix.goarch }}/croopor-dev-test-${{ matrix.goarch }}.cer
 
   pages:
     needs:

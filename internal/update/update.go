@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -58,8 +59,9 @@ func NewService(manifestURL, platform, arch string) *Service {
 }
 
 func (s *Service) Check(currentVersion string) (Result, error) {
+	normalizedCurrent := normalizeVersion(currentVersion)
 	result := Result{
-		CurrentVersion: strings.TrimSpace(currentVersion),
+		CurrentVersion: normalizedCurrent,
 		Platform:       s.platform,
 		Arch:           s.arch,
 		Kind:           "none",
@@ -169,10 +171,23 @@ func parseStableVersion(raw string) (stableVersion, error) {
 	if strings.ContainsAny(raw, "+-") {
 		return stableVersion{}, fmt.Errorf("pre-release versions are not supported")
 	}
-	var v stableVersion
-	if _, err := fmt.Sscanf(raw, "%d.%d.%d", &v.major, &v.minor, &v.patch); err != nil {
-		return stableVersion{}, fmt.Errorf("expected vX.Y.Z")
+	parts := strings.Split(raw, ".")
+	if len(parts) != 3 {
+		return stableVersion{}, fmt.Errorf("expected version X.Y.Z or vX.Y.Z")
 	}
+	major, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return stableVersion{}, fmt.Errorf("expected version X.Y.Z or vX.Y.Z")
+	}
+	minor, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return stableVersion{}, fmt.Errorf("expected version X.Y.Z or vX.Y.Z")
+	}
+	patch, err := strconv.Atoi(parts[2])
+	if err != nil {
+		return stableVersion{}, fmt.Errorf("expected version X.Y.Z or vX.Y.Z")
+	}
+	v := stableVersion{major: major, minor: minor, patch: patch}
 	return v, nil
 }
 

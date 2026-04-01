@@ -101,11 +101,22 @@ body::before{
   font-family:var(--font-mono);cursor:pointer;transition:background .15s,border-color .15s,color .15s;
 }
 .update-chip:hover{background:color-mix(in srgb,var(--accent) 18%,var(--surface-1));border-color:var(--accent)}
+.update-chip:focus-visible{
+  outline:none;
+  border-color:var(--accent);
+  box-shadow:0 0 0 2px var(--accent-glow-strong);
+}
 .update-chip-dismiss{
   border:none;background:transparent;color:var(--text-muted);font-size:10px;font-weight:600;
   font-family:var(--font-mono);cursor:pointer;padding:3px 4px;border-radius:var(--r-sm);
 }
 .update-chip-dismiss:hover{background:var(--surface-2);color:var(--text)}
+.update-chip-dismiss:focus-visible{
+  outline:none;
+  background:var(--surface-2);
+  color:var(--text);
+  box-shadow:0 0 0 2px var(--accent-glow);
+}
 .topbar-center{display:flex;align-items:center;gap:16px}
 .topbar-divider{width:1px;height:22px;background:var(--border)}
 .topbar-field{display:flex;align-items:center;gap:8px}

@@ -4,12 +4,14 @@ import (
 	"flag"
 	"io/fs"
 	"log"
+	"runtime"
 
 	"github.com/mateoltd/croopor/frontend"
 	"github.com/mateoltd/croopor/internal/config"
 	"github.com/mateoltd/croopor/internal/instance"
 	"github.com/mateoltd/croopor/internal/minecraft"
 	"github.com/mateoltd/croopor/internal/server"
+	appupdate "github.com/mateoltd/croopor/internal/update"
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
@@ -60,7 +62,8 @@ func main() {
 		log.Fatalf("Failed to load frontend: %v", err)
 	}
 
-	srv := server.NewServer(dir, version, cfg, instances, staticFS)
+	updater := appupdate.NewService(appupdate.DefaultManifestURL, runtime.GOOS, runtime.GOARCH)
+	srv := server.NewServer(dir, version, cfg, instances, staticFS, updater)
 	app := NewApp(version, srv)
 
 	err = wails.Run(&options.App{

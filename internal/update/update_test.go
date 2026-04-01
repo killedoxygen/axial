@@ -52,6 +52,9 @@ func TestCheckWindowsReleasePage(t *testing.T) {
 	if result.ActionURL != "https://example.test/windows" {
 		t.Fatalf("action url = %q", result.ActionURL)
 	}
+	if result.CurrentVersion != "1.2.2" {
+		t.Fatalf("current version = %q", result.CurrentVersion)
+	}
 }
 
 func TestCheckLinuxAppImage(t *testing.T) {
@@ -112,5 +115,19 @@ func TestCheckRejectsBadManifest(t *testing.T) {
 	updater := newTestService(`{"channel":"stable","version":"wat"}`, "windows", "amd64")
 	if _, err := updater.Check("1.2.2"); err == nil {
 		t.Fatal("expected malformed manifest to fail")
+	}
+}
+
+func TestCheckRejectsTrailingVersionGarbage(t *testing.T) {
+	updater := newTestService(`{"channel":"stable","version":"1.2.3"}`, "windows", "amd64")
+	if _, err := updater.Check("1.2.3foo"); err == nil {
+		t.Fatal("expected partially parsed version to fail")
+	}
+}
+
+func TestCheckRejectsTooManyVersionSegments(t *testing.T) {
+	updater := newTestService(`{"channel":"stable","version":"1.2.3.4"}`, "windows", "amd64")
+	if _, err := updater.Check("1.2.2"); err == nil {
+		t.Fatal("expected invalid manifest version to fail")
 	}
 }

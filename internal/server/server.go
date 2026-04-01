@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"io/fs"
 	"net/http"
-	"runtime"
 	"sync"
 	"time"
 
@@ -16,6 +15,17 @@ import (
 	appupdate "github.com/mateoltd/croopor/internal/update"
 )
 
+type UpdateChecker interface {
+	Check(currentVersion string) (appupdate.Result, error)
+}
+
+type updateCacheEntry struct {
+	version string
+	result  appupdate.Result
+	checked time.Time
+	ok      bool
+}
+
 type Server struct {
 	mu             sync.RWMutex
 	mcDir          string
@@ -25,7 +35,9 @@ type Server struct {
 	sessions       *SessionManager
 	installs       *InstallManager
 	loaderInstalls *LoaderInstallManager
-	updater        *appupdate.Service
+	updater        UpdateChecker
+	updateCacheMu  sync.RWMutex
+	updateCache    updateCacheEntry
 	mux            *http.ServeMux
 	frontend       fs.FS
 }
@@ -44,7 +56,7 @@ func (s *Server) SetMCDir(dir string) {
 	s.mu.Unlock()
 }
 
-func NewServer(mcDir string, appVersion string, cfg *config.Config, instances *instance.InstanceStore, frontend fs.FS) *Server {
+func NewServer(mcDir string, appVersion string, cfg *config.Config, instances *instance.InstanceStore, frontend fs.FS, updater UpdateChecker) *Server {
 	s := &Server{
 		mcDir:          mcDir,
 		appVersion:     appVersion,
@@ -53,7 +65,7 @@ func NewServer(mcDir string, appVersion string, cfg *config.Config, instances *i
 		sessions:       NewSessionManager(),
 		installs:       NewInstallManager(),
 		loaderInstalls: NewLoaderInstallManager(),
-		updater:        appupdate.NewService(appupdate.DefaultManifestURL, runtime.GOOS, runtime.GOARCH),
+		updater:        updater,
 		mux:            http.NewServeMux(),
 		frontend:       frontend,
 	}
