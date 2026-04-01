@@ -1,8 +1,6 @@
 package modloaders
 
 import (
-	"archive/zip"
-	"bytes"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
@@ -161,7 +159,7 @@ func (n *neoforgeLoader) Install(mcDir, mcVersion, loaderVersion string, progres
 
 		progress <- Progress{Phase: "loader_json", Current: 0, Total: 1, Detail: "Extracting installer..."}
 
-		versionJSON, installProfile, err := extractNeoForgeInstaller(installerData)
+		versionJSON, installProfile, err := extractInstallerJSONs(installerData)
 		if err != nil {
 			return nil, fmt.Errorf("extracting NeoForge installer: %w", err)
 		}
@@ -273,8 +271,11 @@ func (n *neoforgeLoader) downloadToMemory(url string) ([]byte, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("status %d for %s", resp.StatusCode, url)
 	}
+	if resp.ContentLength > 0 && resp.ContentLength > maxInstallerDownloadSize {
+		return nil, fmt.Errorf("download too large for %s", url)
+	}
 
-	return io.ReadAll(resp.Body)
+	return io.ReadAll(io.LimitReader(resp.Body, maxInstallerDownloadSize))
 }
 
 // neoforgeToMCVersion maps a NeoForge version to its Minecraft version.
@@ -291,43 +292,4 @@ func neoforgeToMCVersion(neoVersion string) string {
 		return "1." + major
 	}
 	return "1." + major + "." + minor
-}
-
-// extractNeoForgeInstaller reads version.json and install_profile.json from the installer.
-func extractNeoForgeInstaller(jarData []byte) (versionJSON []byte, installProfile []byte, err error) {
-	r, err := zip.NewReader(bytes.NewReader(jarData), int64(len(jarData)))
-	if err != nil {
-		return nil, nil, fmt.Errorf("opening installer JAR: %w", err)
-	}
-
-	for _, f := range r.File {
-		switch f.Name {
-		case "version.json":
-			rc, err := f.Open()
-			if err != nil {
-				return nil, nil, err
-			}
-			versionJSON, err = io.ReadAll(rc)
-			rc.Close()
-			if err != nil {
-				return nil, nil, err
-			}
-		case "install_profile.json":
-			rc, err := f.Open()
-			if err != nil {
-				return nil, nil, err
-			}
-			installProfile, err = io.ReadAll(rc)
-			rc.Close()
-			if err != nil {
-				return nil, nil, err
-			}
-		}
-	}
-
-	if versionJSON == nil {
-		return nil, nil, fmt.Errorf("version.json not found in installer JAR")
-	}
-
-	return versionJSON, installProfile, nil
 }
