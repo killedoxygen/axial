@@ -30,7 +30,9 @@ func ResolveLibraries(v *VersionJSON, mcDir string, env Environment) ([]Resolved
 		if lib.Natives != nil {
 			nativeLibs := resolveLegacyNatives(lib, libDir, env)
 			resolved = append(resolved, nativeLibs...)
-			// If this library ONLY provides natives (no artifact), skip artifact resolution
+			// If this library explicitly omits a main artifact, only keep the natives.
+			// When downloads are omitted entirely, we still try Maven-coordinate fallbacks
+			// below for both the main JAR and native classifier JARs.
 			if lib.Downloads != nil && lib.Downloads.Artifact == nil {
 				continue
 			}
@@ -112,7 +114,19 @@ func resolveLegacyNatives(lib Library, libDir string, env Environment) []Resolve
 				IsNative: true,
 				Name:     lib.Name + ":" + classifierKey,
 			})
+			return results
 		}
+	}
+
+	// Maven-coordinate fallback for old versions that omit downloads entirely.
+	mavenPath := MavenToPath(lib.Name + ":" + classifierKey)
+	if mavenPath != "" {
+		absPath := filepath.Join(libDir, mavenPath)
+		results = append(results, ResolvedLibrary{
+			AbsPath:  absPath,
+			IsNative: true,
+			Name:     lib.Name + ":" + classifierKey,
+		})
 	}
 
 	return results

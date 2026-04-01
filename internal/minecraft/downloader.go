@@ -204,7 +204,22 @@ func resolveNativeDownload(lib Library, mcDir string, env Environment) (path, ur
 			}
 		}
 	}
-	return "", "", ""
+
+	// Maven-coordinate fallback for old versions that omit the downloads block entirely.
+	// Construct the classifier path from lib.Name + classifier key.
+	mavenPath := MavenToPath(lib.Name + ":" + classifierKey)
+	if mavenPath == "" {
+		return "", "", ""
+	}
+	absPath := filepath.Join(libDir, mavenPath)
+	baseURL := lib.URL
+	if baseURL == "" {
+		baseURL = "https://libraries.minecraft.net/"
+	}
+	if !strings.HasSuffix(baseURL, "/") {
+		baseURL += "/"
+	}
+	return absPath, baseURL + filepath.ToSlash(mavenPath), ""
 }
 
 // downloadAssetObjects reads the asset index and downloads all referenced objects.
@@ -296,6 +311,12 @@ func FilterLibraries(libs []Library, env Environment) []Library {
 // for a library's main artifact.
 func ResolveLibDownload(lib Library, mcDir string) (path, url, sha1 string) {
 	libDir := LibrariesDir(mcDir)
+
+	// Libraries that explicitly omit a main artifact only ship classifier JARs.
+	// If the entire downloads block is missing, fall back to Maven coordinates below.
+	if lib.Natives != nil && lib.Downloads != nil && lib.Downloads.Artifact == nil {
+		return "", "", ""
+	}
 
 	if lib.Downloads != nil && lib.Downloads.Artifact != nil {
 		a := lib.Downloads.Artifact
