@@ -149,7 +149,7 @@ function parseModded(id: string, base: string): VersionDisplay {
 function parseSnapshot(id: string, version: any, versions: any[]): VersionDisplay {
   // pre-release / release candidate: 1.20.5-pre1, 1.20.5-rc1
   const m = id.match(/^(\d+\.\d+(?:\.\d+)?)-(?:pre|rc)\d+$/);
-  if (m) return { name: id, hint: `\u2192 ${m[1]}` };
+  if (m) return { name: id, hint: null };
   // weekly snapshot: find nearest release by time
   if (versions?.length && version?.release_time) {
     const t = version.release_time as string;
@@ -159,7 +159,7 @@ function parseSnapshot(id: string, version: any, versions: any[]): VersionDispla
     for (const r of rel) { if (r.release_time >= t) { nearest = r; break; } }
     // if none after, use last release before
     if (!nearest) { for (let i = rel.length - 1; i >= 0; i--) { if (rel[i].release_time <= t) { nearest = rel[i]; break; } } }
-    if (nearest) return { name: id, hint: `~ ${nearest.id}` };
+    if (nearest && !id.includes(nearest.id)) return { name: id, hint: `~ ${nearest.id}` };
   }
   return { name: id, hint: null };
 }
