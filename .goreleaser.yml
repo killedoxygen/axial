@@ -4,8 +4,10 @@ project_name: croopor
 
 before:
   hooks:
-    - npm --prefix frontend ci
-    - npm --prefix frontend run build
+    - corepack pnpm -C frontend install --frozen-lockfile --ignore-scripts
+    - corepack pnpm -C frontend run build
+    - go install github.com/tc-hib/go-winres@latest
+    - go-winres make --arch amd64,arm64
 
 builds:
   - id: linux

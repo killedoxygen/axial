@@ -165,6 +165,7 @@ tasks:
     aliases: [build-windows]
     deps:
       - frontend:build
+      - winres
       - _prepare:bin-dir
     env:
       GOOS: windows
@@ -177,6 +178,7 @@ tasks:
     aliases: [build-windows-dev]
     deps:
       - frontend:build
+      - winres
       - _prepare:bin-dir
     env:
       GOOS: windows
@@ -250,6 +252,30 @@ tasks:
           powershell.exe -NoProfile -Command
           "if (Test-Path 'build/bin') { Remove-Item -Recurse -Force 'build/bin' };
           if (Test-Path 'dist') { Remove-Item -Recurse -Force 'dist' }"
+        platforms: [windows]
+
+  winres:
+    desc: generate Windows resource files (.syso) from winres/
+    deps:
+      - tools:winres
+    cmds:
+      - go-winres make --arch amd64,arm64
+
+  tools:winres:
+    desc: install go-winres into .tools/bin
+    internal: true
+    silent: true
+    cmds:
+      - cmd: |
+          if command -v go-winres >/dev/null 2>&1 || [ -x "{{.TOOLS_DIR}}/go-winres" ]; then
+            exit 0
+          fi
+          go install github.com/tc-hib/go-winres@latest
+        platforms: [linux, darwin]
+      - cmd: >
+          powershell.exe -NoProfile -Command
+          "if ((Get-Command go-winres -ErrorAction SilentlyContinue) -or (Test-Path '.tools/bin/go-winres.exe')) { exit 0 };
+          go install github.com/tc-hib/go-winres@latest"
         platforms: [windows]
 
   tools:wails:
