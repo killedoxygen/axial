@@ -1,26 +1,12 @@
 import { byId } from './dom';
-import { currentPage, instances, logLines } from './store';
+import { collapsedLogSeverity, currentPage, instances, logLines } from './store';
 import type { Page } from './types';
 
 const loggedInstances = new Set<string>();
 let activeLogFilter = 'all';
-type LogSeverity = 'error' | 'system' | 'info';
-const SVG_NS = 'http://www.w3.org/2000/svg';
-
-let currentSeverity: LogSeverity | null = null;
-
-const SEVERITY_PATHS: Record<LogSeverity, readonly string[]> = {
-  error: ['M3 12a9 9 0 1 0 18 0a9 9 0 0 0 -18 0', 'M12 8v4', 'M12 16h.01'],
-  system: ['M12 9v4', 'M10.363 3.591l-8.106 13.534a1.914 1.914 0 0 0 1.636 2.871h16.214a1.914 1.914 0 0 0 1.636 -2.87l-8.106 -13.536a1.914 1.914 0 0 0 -3.274 0', 'M12 16h.01'],
-  info: ['M3 12a9 9 0 1 0 18 0a9 9 0 0 0 -18 0', 'M12 9h.01', 'M11 12h1v4h1'],
-};
+import type { LogSeverity } from './store';
 
 const SEVERITY_RANK: Record<LogSeverity, number> = { error: 3, system: 2, info: 1 };
-const SEVERITY_LABELS: Record<LogSeverity, string> = {
-  error: 'Errors in game output',
-  system: 'New system messages',
-  info: 'New game output',
-};
 
 function logSeverityFromSource(source: string): LogSeverity {
   if (source === 'stderr') return 'error';
@@ -28,54 +14,18 @@ function logSeverityFromSource(source: string): LogSeverity {
   return 'info';
 }
 
-function createSeverityIcon(severity: LogSeverity): SVGSVGElement {
-  const svg = document.createElementNS(SVG_NS, 'svg');
-  svg.setAttribute('width', '12');
-  svg.setAttribute('height', '12');
-  svg.setAttribute('viewBox', '0 0 24 24');
-  svg.setAttribute('fill', 'none');
-  svg.setAttribute('stroke', 'currentColor');
-  svg.setAttribute('stroke-width', '2');
-  svg.setAttribute('stroke-linecap', 'round');
-  svg.setAttribute('stroke-linejoin', 'round');
-  svg.setAttribute('aria-hidden', 'true');
-
-  for (const d of SEVERITY_PATHS[severity]) {
-    const path = document.createElementNS(SVG_NS, 'path');
-    path.setAttribute('d', d);
-    svg.appendChild(path);
-  }
-
-  return svg;
-}
-
 function updateLogIndicator(source: string): void {
   const panel = byId<HTMLElement>('log-panel');
   if (panel?.classList.contains('expanded')) return;
 
   const newSeverity = logSeverityFromSource(source);
+  const currentSeverity = collapsedLogSeverity.value;
   if (currentSeverity && SEVERITY_RANK[currentSeverity] >= SEVERITY_RANK[newSeverity]) return;
-
-  currentSeverity = newSeverity;
-  const label = SEVERITY_LABELS[newSeverity];
-  let icon = byId<HTMLElement>('log-severity-icon');
-  if (!icon) {
-    const title = byId<HTMLElement>('log-title');
-    if (!title) return;
-    icon = document.createElement('span');
-    icon.id = 'log-severity-icon';
-    icon.setAttribute('role', 'img');
-    title.insertAdjacentElement('afterend', icon);
-  }
-  icon.className = `log-severity-icon severity-${newSeverity}`;
-  icon.replaceChildren(createSeverityIcon(newSeverity));
-  icon.title = label;
-  icon.setAttribute('aria-label', label);
+  collapsedLogSeverity.value = newSeverity;
 }
 
 export function clearLogIndicator(): void {
-  currentSeverity = null;
-  byId<HTMLElement>('log-severity-icon')?.remove();
+  collapsedLogSeverity.value = null;
 }
 
 function fmtTime(): string {

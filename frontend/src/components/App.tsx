@@ -1,6 +1,6 @@
 import type { JSX } from 'preact';
 import {
-  appVersion, bootstrapError, bootstrapState, currentPage, instances, selectedInstance, updateInfo,
+  appVersion, bootstrapError, bootstrapState, collapsedLogSeverity, currentPage, instances, selectedInstance, updateInfo,
 } from '../store';
 import { localStateVersion } from '../state';
 import { SettingsView } from './SettingsView';
@@ -13,6 +13,36 @@ import { dismissAvailableUpdate, hasVisibleUpdate, openUpdateAction } from '../u
 
 function displayVersion(version: string): string {
   return version.startsWith('v') ? version : `v${version}`;
+}
+
+function LogSeverityIndicator(): JSX.Element | null {
+  const severity = collapsedLogSeverity.value;
+  if (!severity) return null;
+
+  const label = severity === 'error' ? 'Errors in game output' : severity === 'system' ? 'New system messages' : 'New game output';
+  return (
+    <span id="log-severity-icon" class={`log-severity-icon severity-${severity}`} role="img" aria-label={label} title={label}>
+      {severity === 'error' ? (
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M3 12a9 9 0 1 0 18 0a9 9 0 0 0 -18 0" />
+          <path d="M12 8v4" />
+          <path d="M12 16h.01" />
+        </svg>
+      ) : severity === 'system' ? (
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M12 9v4" />
+          <path d="M10.363 3.591l-8.106 13.534a1.914 1.914 0 0 0 1.636 2.871h16.214a1.914 1.914 0 0 0 1.636 -2.87l-8.106 -13.536a1.914 1.914 0 0 0 -3.274 0" />
+          <path d="M12 16h.01" />
+        </svg>
+      ) : (
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M3 12a9 9 0 1 0 18 0a9 9 0 0 0 -18 0" />
+          <path d="M12 9h.01" />
+          <path d="M11 12h1v4h1" />
+        </svg>
+      )}
+    </span>
+  );
 }
 
 function EmptyState(): JSX.Element {
@@ -182,6 +212,7 @@ export function App(): JSX.Element {
         <div class="log-toggle" id="log-toggle">
           <svg class="log-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="18 15 12 9 6 15" /></svg>
           <span id="log-title">Game Output</span>
+          <LogSeverityIndicator />
           <select class="log-filter hidden" id="log-filter"><option value="all">All instances</option></select>
           <span class="log-count" id="log-count">0 lines</span>
         </div>
