@@ -102,12 +102,11 @@ export function App(): JSX.Element {
         <div class="topbar-right">
           <div class="music-eq hidden" id="music-eq" title="Next track"><span /><span /><span /><span /><span /></div>
           <button class="icon-btn" id="music-btn" title="Music off" aria-label="Toggle background music">
-            <svg class="music-icon-on" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="display:none">
-              <path d="M9 18V5l12-2v13" /><circle cx="6" cy="18" r="3" /><circle cx="18" cy="16" r="3" />
+            <svg class="music-icon-on" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none">
+              <path d="M3 17a3 3 0 1 0 6 0a3 3 0 0 0 -6 0" /><path d="M13 17a3 3 0 1 0 6 0a3 3 0 0 0 -6 0" /><path d="M9 17v-13h10v13" /><path d="M9 8h10" />
             </svg>
-            <svg class="music-icon-off" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
-              <path d="M9 18V5l12-2v13" opacity="0.4" /><circle cx="6" cy="18" r="3" opacity="0.4" /><circle cx="18" cy="16" r="3" opacity="0.4" />
-              <line x1="3" y1="3" x2="21" y2="21" stroke-width="2.5" />
+            <svg class="music-icon-off" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 17a3 3 0 1 0 6 0a3 3 0 1 0 -6 0" /><path d="M14.42 14.45a3 3 0 1 0 4.138 4.119" /><path d="M9 17v-8m0 -4v-1h10v11" /><path d="M12 8h7" /><path d="M3 3l18 18" />
             </svg>
           </button>
           <button class={`icon-btn${page === 'settings' ? ' active' : ''}`} id="settings-btn" title="Settings" aria-label="Open settings" data-action="settings">
@@ -306,15 +305,14 @@ export function App(): JSX.Element {
               <p class="onboarding-sub">Ambient track while you're in the launcher</p>
               <div class="ob-music-toggle">
                 <button class="ob-music-btn active" id="ob-music-yes">
-                  <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
-                    <path d="M9 18V5l12-2v13" /><circle cx="6" cy="18" r="3" /><circle cx="18" cy="16" r="3" />
+                  <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M3 17a3 3 0 1 0 6 0a3 3 0 0 0 -6 0" /><path d="M13 17a3 3 0 1 0 6 0a3 3 0 0 0 -6 0" /><path d="M9 17v-13h10v13" /><path d="M9 8h10" />
                   </svg>
                   <span>Enable music</span>
                 </button>
                 <button class="ob-music-btn" id="ob-music-no">
-                  <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
-                    <path d="M9 18V5l12-2v13" opacity="0.4" /><circle cx="6" cy="18" r="3" opacity="0.4" /><circle cx="18" cy="16" r="3" opacity="0.4" />
-                    <line x1="3" y1="3" x2="21" y2="21" stroke-width="2.5" />
+                  <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M3 17a3 3 0 1 0 6 0a3 3 0 1 0 -6 0" /><path d="M14.42 14.45a3 3 0 1 0 4.138 4.119" /><path d="M9 17v-8m0 -4v-1h10v11" /><path d="M12 8h7" /><path d="M3 3l18 18" />
                   </svg>
                   <span>No thanks</span>
                 </button>
