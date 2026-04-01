@@ -22,6 +22,8 @@ import { hideContextMenu, bindContextMenu } from './context-menu';
 import { closeDeleteWizard, bindDeleteWizard } from './delete-wizard';
 import { dismissDialog, showConfirm } from './dialogs';
 import { getNativeAppVersion } from './native';
+import { scheduleAutoUpdateCheck } from './updater';
+import { toast } from './toast';
 
 function computeMemoryRecommendationText(val: number, totalGB: number | null): string {
   if (!totalGB) return '';
@@ -92,6 +94,11 @@ async function init(): Promise<void> {
       window.addEventListener('keydown', startMusic, { once: true, capture: true });
     }
     watchVersions();
+    try {
+      scheduleAutoUpdateCheck();
+    } catch (err: unknown) {
+      console.error('Failed to schedule update check', err);
+    }
   } catch (err: unknown) {
     bootstrapError.value = errMessage(err);
     bootstrapState.value = 'error';
@@ -332,6 +339,7 @@ function bindEvents(): void {
         instances.value = [];
         selectedInstanceId.value = null;
         catalog.value = null;
+        toast(`Cleanup done, removed ${res.versions_removed} versions and ${res.instances_removed} instances`);
       }
     } catch (err: unknown) {
       showError(errMessage(err));
@@ -343,11 +351,17 @@ function bindEvents(): void {
   devFlush?.addEventListener('click', async () => {
     const ok: boolean = await showConfirm('Delete all settings? App will restart.', { confirmText: 'Delete', destructive: true });
     if (!ok) return;
+    const btn = devFlush;
+    btn.setAttribute('disabled', 'true');
+    btn.textContent = 'Flushing...';
     try {
       await api('POST', '/dev/flush');
+      toast('Data flushed, restarting...');
       localStorage.removeItem(STORAGE_KEY);
       location.reload();
     } catch (err: unknown) {
+      btn.removeAttribute('disabled');
+      btn.textContent = 'Flush All Data';
       showError(errMessage(err));
     }
   });

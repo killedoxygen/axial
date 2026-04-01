@@ -12,16 +12,32 @@ import (
 	"github.com/mateoltd/croopor/internal/launcher"
 	"github.com/mateoltd/croopor/internal/minecraft"
 	"github.com/mateoltd/croopor/internal/modloaders"
+	appupdate "github.com/mateoltd/croopor/internal/update"
 )
+
+type UpdateChecker interface {
+	Check(currentVersion string) (appupdate.Result, error)
+}
+
+type updateCacheEntry struct {
+	version string
+	result  appupdate.Result
+	checked time.Time
+	ok      bool
+}
 
 type Server struct {
 	mu             sync.RWMutex
 	mcDir          string
+	appVersion     string
 	config         *config.Config
 	instances      *instance.InstanceStore
 	sessions       *SessionManager
 	installs       *InstallManager
 	loaderInstalls *LoaderInstallManager
+	updater        UpdateChecker
+	updateCacheMu  sync.RWMutex
+	updateCache    updateCacheEntry
 	mux            *http.ServeMux
 	frontend       fs.FS
 }
@@ -40,14 +56,16 @@ func (s *Server) SetMCDir(dir string) {
 	s.mu.Unlock()
 }
 
-func NewServer(mcDir string, cfg *config.Config, instances *instance.InstanceStore, frontend fs.FS) *Server {
+func NewServer(mcDir string, appVersion string, cfg *config.Config, instances *instance.InstanceStore, frontend fs.FS, updater UpdateChecker) *Server {
 	s := &Server{
 		mcDir:          mcDir,
+		appVersion:     appVersion,
 		config:         cfg,
 		instances:      instances,
 		sessions:       NewSessionManager(),
 		installs:       NewInstallManager(),
 		loaderInstalls: NewLoaderInstallManager(),
+		updater:        updater,
 		mux:            http.NewServeMux(),
 		frontend:       frontend,
 	}
@@ -71,6 +89,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/v1/catalog", s.handleCatalog)
 	s.mux.HandleFunc("GET /api/v1/config", s.handleGetConfig)
 	s.mux.HandleFunc("PUT /api/v1/config", s.handleUpdateConfig)
+	s.mux.HandleFunc("GET /api/v1/update", s.handleUpdate)
 	s.mux.HandleFunc("POST /api/v1/onboarding/complete", s.handleOnboardingComplete)
 	s.mux.HandleFunc("POST /api/v1/launch", s.handleLaunch)
 	s.mux.HandleFunc("GET /api/v1/launch/{id}/events", s.handleLaunchEvents)

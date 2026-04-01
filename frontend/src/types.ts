@@ -159,6 +159,8 @@ export interface LocalPrefs {
   sidebarFilter: string;
   sounds: boolean;
   shortcuts: Record<string, ShortcutBinding>;
+  lastUpdateCheckAt: string;
+  dismissedUpdateVersion: string;
 }
 
 export type ToastKind = 'success' | 'error';
@@ -185,4 +187,19 @@ export interface LoaderVersion {
 export interface LoaderInfo {
   type: LoaderType;
   name: string;
+}
+
+export type UpdateKind = 'none' | 'release-page' | 'appimage';
+
+export interface UpdateInfo {
+  current_version: string;
+  latest_version: string;
+  available: boolean;
+  platform: string;
+  arch: string;
+  kind: UpdateKind;
+  notes_url: string;
+  action_url: string;
+  action_label: string;
+  checked_at: string;
 }

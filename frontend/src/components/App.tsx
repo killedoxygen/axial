@@ -1,13 +1,15 @@
 import type { JSX } from 'preact';
 import {
-  appVersion, bootstrapError, bootstrapState, currentPage, instances, selectedInstance,
+  appVersion, bootstrapError, bootstrapState, currentPage, instances, selectedInstance, updateInfo,
 } from '../store';
+import { localStateVersion } from '../state';
 import { SettingsView } from './SettingsView';
 import { InstanceList } from './InstanceList';
 import { DetailPanel } from './DetailPanel';
 import { NewInstanceModal } from './NewInstanceModal';
 import { DeleteWizard } from './DeleteWizard';
 import { ToastViewport } from './ToastViewport';
+import { dismissAvailableUpdate, hasVisibleUpdate, openUpdateAction } from '../updater';
 
 function displayVersion(version: string): string {
   return version.startsWith('v') ? version : `v${version}`;
@@ -53,6 +55,9 @@ function EmptyState(): JSX.Element {
 
 export function App(): JSX.Element {
   const page = currentPage.value;
+  const info = updateInfo.value;
+  localStateVersion.value;
+  const visibleUpdate = hasVisibleUpdate();
 
   return (
     <>
@@ -62,6 +67,21 @@ export function App(): JSX.Element {
             <img class="logo-img" src="logo.svg" alt="Croopor" width="26" height="26" />
             <span class="logo-text">Croopor</span>
             <span class="logo-version">{displayVersion(appVersion.value)}</span>
+            {visibleUpdate && info && (
+              <div class="topbar-update">
+                <button type="button" class="update-chip" onClick={() => { void openUpdateAction(); }}>
+                  update {displayVersion(info.latest_version)}
+                </button>
+                <button
+                  type="button"
+                  class="update-chip-dismiss"
+                  aria-label={`Hide update ${displayVersion(info.latest_version)}`}
+                  onClick={() => dismissAvailableUpdate()}
+                >
+                  hide
+                </button>
+              </div>
+            )}
           </div>
         </div>
         <div class="topbar-center">

@@ -24,7 +24,10 @@ import (
 	"github.com/mateoltd/croopor/internal/launcher"
 	"github.com/mateoltd/croopor/internal/minecraft"
 	"github.com/mateoltd/croopor/internal/system"
+	appupdate "github.com/mateoltd/croopor/internal/update"
 )
+
+const updateCacheTTL = time.Minute
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	mcDir := s.GetMCDir()
@@ -33,7 +36,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"mc_dir":         mcDir,
 		"setup_required": mcDir == "",
 		"app_name":       "Croopor",
-		"version":        "1.0.0",
+		"version":        s.appVersion,
 		"dev_mode":       devMode,
 	})
 }
@@ -122,6 +125,49 @@ func (s *Server) handleCatalog(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.config)
+}
+
+func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
+	if s.updater == nil {
+		writeError(w, http.StatusServiceUnavailable, "update service is not configured")
+		return
+	}
+	force := r.URL.Query().Get("force") != ""
+	if !force {
+		if cached, ok := s.readCachedUpdate(); ok {
+			writeJSON(w, http.StatusOK, cached)
+			return
+		}
+	}
+
+	s.updateCacheMu.Lock()
+	defer s.updateCacheMu.Unlock()
+	if !force && s.updateCache.ok && s.updateCache.version == s.appVersion && time.Since(s.updateCache.checked) < updateCacheTTL {
+		writeJSON(w, http.StatusOK, s.updateCache.result)
+		return
+	}
+
+	result, err := s.updater.Check(s.appVersion)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "failed to check updates: "+err.Error())
+		return
+	}
+	s.updateCache = updateCacheEntry{
+		version: s.appVersion,
+		result:  result,
+		checked: time.Now(),
+		ok:      true,
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) readCachedUpdate() (appupdate.Result, bool) {
+	s.updateCacheMu.RLock()
+	defer s.updateCacheMu.RUnlock()
+	if !s.updateCache.ok || s.updateCache.version != s.appVersion || time.Since(s.updateCache.checked) >= updateCacheTTL {
+		return appupdate.Result{}, false
+	}
+	return s.updateCache.result, true
 }
 
 func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
