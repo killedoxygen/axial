@@ -12,8 +12,6 @@ interface InstanceGroupProps {
   onContextMenu: (e: MouseEvent, inst: Instance) => void;
 }
 
-const CHEVRON_SVG = '<svg class="version-group-chevron" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>';
-
 export function InstanceGroup({ groupKey, label, instances, versionMap, onContextMenu }: InstanceGroupProps) {
   const collapsed = useComputed(() => !!collapsedGroups.value[groupKey]);
 
@@ -34,7 +32,19 @@ export function InstanceGroup({ groupKey, label, instances, versionMap, onContex
         data-group={groupKey}
         onClick={() => handleToggle()}
       >
-        <span dangerouslySetInnerHTML={{ __html: CHEVRON_SVG }} />
+        <svg
+          class="version-group-chevron"
+          width="10"
+          height="10"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2.5"
+          stroke-linecap="round"
+          aria-hidden="true"
+        >
+          <polyline points="6 9 12 15 18 9" />
+        </svg>
         {label}{' '}
         <span style="opacity:.4;font-weight:400;margin-left:2px">{instances.length}</span>
       </button>
