@@ -121,6 +121,11 @@ current release output:
 - windows msix + appinstaller files for internal updater validation
 - github pages update metadata at `updates/stable.json`
 
+hard todo:
+- do not ship public windows updater artifacts signed with dev/test/self-signed certs
+- windows msix + appinstaller should only become a public release path once real production signing is set up
+- until then, windows users stay on the normal release binary path
+
 local snapshot:
 
 ```bash

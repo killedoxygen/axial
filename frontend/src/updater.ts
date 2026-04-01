@@ -81,7 +81,7 @@ export async function checkForUpdates(options: { force?: boolean; silent?: boole
   updateCheckState.value = 'checking';
   const request = (async () => {
     try {
-      const res = await api('GET', '/update');
+      const res = await api('GET', force ? '/update?force=1' : '/update');
       if (res.error) throw new Error(res.error);
       if (checkSeq === pendingCheckSeq) {
         updateInfo.value = res;
@@ -115,7 +115,11 @@ export async function checkForUpdates(options: { force?: boolean; silent?: boole
 }
 
 export function scheduleAutoUpdateCheck(): void {
-  if (!shouldAutoCheck()) return;
+  if (!isWailsRuntime()) return;
+  if (!shouldAutoCheck()) {
+    queueAutoUpdateCheck(AUTO_CHECK_INTERVAL_MS);
+    return;
+  }
   if (autoCheckTimer != null) window.clearTimeout(autoCheckTimer);
   autoCheckTimer = window.setTimeout(() => {
     autoCheckTimer = null;
@@ -124,7 +128,11 @@ export function scheduleAutoUpdateCheck(): void {
 }
 
 async function runAutoUpdateCheck(): Promise<void> {
-  if (!shouldAutoCheck()) return;
+  if (!isWailsRuntime()) return;
+  if (!shouldAutoCheck()) {
+    queueAutoUpdateCheck(AUTO_CHECK_INTERVAL_MS);
+    return;
+  }
   if (bootstrapState.value !== 'ready' || installState.value.status !== 'idle' || launchState.value.status !== 'idle') {
     queueAutoUpdateCheck(AUTO_CHECK_RETRY_MS);
     return;

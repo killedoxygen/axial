@@ -132,14 +132,17 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "update service is not configured")
 		return
 	}
-	if cached, ok := s.readCachedUpdate(); ok {
-		writeJSON(w, http.StatusOK, cached)
-		return
+	force := r.URL.Query().Get("force") != ""
+	if !force {
+		if cached, ok := s.readCachedUpdate(); ok {
+			writeJSON(w, http.StatusOK, cached)
+			return
+		}
 	}
 
 	s.updateCacheMu.Lock()
 	defer s.updateCacheMu.Unlock()
-	if s.updateCache.ok && s.updateCache.version == s.appVersion && time.Since(s.updateCache.checked) < updateCacheTTL {
+	if !force && s.updateCache.ok && s.updateCache.version == s.appVersion && time.Since(s.updateCache.checked) < updateCacheTTL {
 		writeJSON(w, http.StatusOK, s.updateCache.result)
 		return
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -11,6 +12,7 @@ import (
 )
 
 const DefaultManifestURL = "https://mateoltd.github.io/croopor/updates/stable.json"
+const maxManifestSize = 1 << 20
 
 type Manifest struct {
 	Channel     string                 `json:"channel"`
@@ -50,7 +52,7 @@ type Service struct {
 
 func NewService(manifestURL, platform, arch string) *Service {
 	return &Service{
-		client:      &http.Client{Timeout: 2 * time.Second},
+		client:      &http.Client{},
 		manifestURL: manifestURL,
 		platform:    platform,
 		arch:        arch,
@@ -121,7 +123,7 @@ func (s *Service) fetchManifest() (*Manifest, error) {
 	}
 
 	var manifest Manifest
-	if err := json.NewDecoder(resp.Body).Decode(&manifest); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxManifestSize)).Decode(&manifest); err != nil {
 		return nil, fmt.Errorf("decode update manifest: %w", err)
 	}
 	if manifest.Channel != "" && manifest.Channel != "stable" {
@@ -151,6 +153,9 @@ func resolveAction(manifest *Manifest, platform, arch string) (string, string, s
 			return "none", "", ""
 		}
 		actionURL := strings.TrimSpace(entry.AppImageURL)
+		if actionURL == "" {
+			return "none", "", ""
+		}
 		return "appimage", actionURL, "Download AppImage"
 	default:
 		return "none", "", ""

@@ -77,6 +77,25 @@ func TestCheckLinuxAppImage(t *testing.T) {
 	}
 }
 
+func TestCheckLinuxIgnoresBlankAppImageURL(t *testing.T) {
+	updater := newTestService(`{
+			"channel":"stable",
+			"version":"1.2.3",
+			"notes_url":"https://example.test/release/v1.2.3",
+			"linux":{"amd64":{"appimage_url":"   "}}
+		}`, "linux", "amd64")
+	result, err := updater.Check("1.2.2")
+	if err != nil {
+		t.Fatalf("Check returned error: %v", err)
+	}
+	if result.Available {
+		t.Fatalf("expected no update to be available without a usable appimage url")
+	}
+	if result.Kind != "none" {
+		t.Fatalf("kind = %q, want none", result.Kind)
+	}
+}
+
 func TestCheckNoUpdateWhenCurrentIsLatest(t *testing.T) {
 	updater := newTestService(`{
 			"channel":"stable",

@@ -66,3 +66,7 @@ Update check:
 - updater/release metadata: `internal/update`, `frontend/src/updater.ts`, `.github/workflows/release.yml`
 - shell/layout: `frontend/src/components/App.tsx`
 - wails integration: `main.go`, `app.go`, `wails.json`, `frontend/src/native.ts`
+
+hard todo:
+- windows native updater packaging is only public when real production signing exists
+- do not expose dev/test/self-signed msix or appinstaller artifacts to users

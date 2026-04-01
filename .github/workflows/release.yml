@@ -154,6 +154,13 @@ jobs:
       - verify
       - release-binaries
     runs-on: windows-latest
+    # hard TODO:
+    # do not publish windows msix/appinstaller artifacts to real users unless they are signed
+    # with a real long-lived production certificate.
+    # dev/test/self-signed windows updater artifacts are not acceptable public release assets.
+    # if signing is not ready, skip this packaging path and keep windows users on the raw release binary path.
+    env:
+      WINDOWS_SIGNING_READY: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 != '' && secrets.WINDOWS_SIGNING_PFX_PASSWORD != '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -181,32 +188,46 @@ jobs:
           go-version-file: go.mod
 
       - name: Install frontend dependencies
+        if: env.WINDOWS_SIGNING_READY == 'true'
         run: pnpm --dir frontend install --frozen-lockfile --ignore-scripts
 
       - name: Build frontend bundle
+        if: env.WINDOWS_SIGNING_READY == 'true'
         run: pnpm --dir frontend run build
 
       - name: Build and package MSIX
+        if: env.WINDOWS_SIGNING_READY == 'true'
         shell: pwsh
+        env:
+          WINDOWS_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
+          WINDOWS_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
         run: |
           $version = $env:GITHUB_REF_NAME.TrimStart('v')
           $packageVersion = "$version.0"
-          $publisher = 'CN=Croopor Dev Test'
           $repoOwner = '${{ github.repository_owner }}'
           $repoName = '${{ github.event.repository.name }}'
           $goarch = '${{ matrix.goarch }}'
           $appxArch = '${{ matrix.appx_arch }}'
-          $pagesUrl = "https://$repoOwner.github.io/$repoName/updates/windows/$goarch/croopor.appinstaller"
+          $appInstallerName = "croopor-windows-$goarch.appinstaller"
+          $pagesUrl = "https://$repoOwner.github.io/$repoName/updates/windows/$goarch/$appInstallerName"
           $msixUrl = "https://github.com/${{ github.repository }}/releases/download/$env:GITHUB_REF_NAME/croopor-windows-$goarch.msix"
           $dist = Join-Path $env:GITHUB_WORKSPACE "dist\windows-$goarch"
           $appDir = Join-Path $dist "AppDir"
           $assetsDir = Join-Path $appDir "Assets"
           $exePath = Join-Path $appDir "croopor.exe"
           $msixPath = Join-Path $dist "croopor-windows-$goarch.msix"
-          $cerPath = Join-Path $dist "croopor-dev-test-$goarch.cer"
-          $appInstallerPath = Join-Path $dist "croopor.appinstaller"
+          $appInstallerPath = Join-Path $dist $appInstallerName
           $manifestPath = Join-Path $appDir "AppxManifest.xml"
+          $pfxPath = Join-Path $dist "croopor-signing.pfx"
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_SIGNING_PFX_BASE64)) { throw 'WINDOWS_SIGNING_PFX_BASE64 is required' }
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_SIGNING_PFX_PASSWORD)) { throw 'WINDOWS_SIGNING_PFX_PASSWORD is required' }
           New-Item -ItemType Directory -Force -Path $assetsDir | Out-Null
+          $makeAppx = (Get-Command makeappx.exe -ErrorAction Stop).Source
+          $signTool = (Get-Command signtool.exe -ErrorAction Stop).Source
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_SIGNING_PFX_BASE64))
+          $securePassword = ConvertTo-SecureString $env:WINDOWS_SIGNING_PFX_PASSWORD -AsPlainText -Force
+          $pfxData = Get-PfxData -FilePath $pfxPath -Password $securePassword
+          $publisher = $pfxData.EndEntityCertificates[0].Subject
           $env:GOOS = 'windows'
           $env:GOARCH = $goarch
           go build -trimpath -ldflags "-s -w -H windowsgui -X main.version=$version" -o $exePath .
@@ -216,34 +237,31 @@ jobs:
           $manifestTemplate = Get-Content 'packaging/windows/AppxManifest.xml.template' -Raw
           $manifest = $manifestTemplate.Replace('{{PUBLISHER}}', $publisher).Replace('{{VERSION}}', $packageVersion).Replace('{{ARCH}}', $appxArch)
           Set-Content -Path $manifestPath -Value $manifest -Encoding utf8
-          $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject $publisher -CertStoreLocation Cert:\CurrentUser\My
-          Export-Certificate -Cert $cert -FilePath $cerPath | Out-Null
-          $makeAppx = (Get-Command makeappx.exe -ErrorAction Stop).Source
-          $signTool = (Get-Command signtool.exe -ErrorAction Stop).Source
           & $makeAppx pack /d $appDir /p $msixPath /o
-          & $signTool sign /fd SHA256 /sha1 $cert.Thumbprint $msixPath
+          & $signTool sign /fd SHA256 /f $pfxPath /p $env:WINDOWS_SIGNING_PFX_PASSWORD $msixPath
           $appInstallerTemplate = Get-Content 'packaging/windows/croopor.appinstaller.template' -Raw
           $appInstaller = $appInstallerTemplate.Replace('{{APPINSTALLER_URL}}', $pagesUrl).Replace('{{APPINSTALLER_VERSION}}', $packageVersion).Replace('{{PUBLISHER}}', $publisher).Replace('{{VERSION}}', $packageVersion).Replace('{{ARCH}}', $appxArch).Replace('{{MSIX_URL}}', $msixUrl)
           Set-Content -Path $appInstallerPath -Value $appInstaller -Encoding utf8
 
+      - name: Skip Windows updater packaging
+        if: env.WINDOWS_SIGNING_READY != 'true'
+        shell: pwsh
+        run: Write-Host 'Skipping Windows MSIX/App Installer packaging, signing secrets are not configured.'
+
       - name: Upload Windows updater artifacts to release
+        if: env.WINDOWS_SIGNING_READY == 'true'
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/windows-${{ matrix.goarch }}/croopor-windows-${{ matrix.goarch }}.msix
-            dist/windows-${{ matrix.goarch }}/croopor.appinstaller
+            dist/windows-${{ matrix.goarch }}/croopor-windows-${{ matrix.goarch }}.appinstaller
 
       - name: Upload App Installer file for Pages
+        if: env.WINDOWS_SIGNING_READY == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: appinstaller-${{ matrix.goarch }}
-          path: dist/windows-${{ matrix.goarch }}/croopor.appinstaller
-
-      - name: Upload Windows test certificate artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-cert-${{ matrix.goarch }}
-          path: dist/windows-${{ matrix.goarch }}/croopor-dev-test-${{ matrix.goarch }}.cer
+          path: dist/windows-${{ matrix.goarch }}/croopor-windows-${{ matrix.goarch }}.appinstaller
 
   pages:
     needs:
@@ -253,11 +271,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: appinstaller-amd64
           path: dist/pages/updates/windows/amd64
 
       - uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: appinstaller-arm64
           path: dist/pages/updates/windows/arm64
@@ -270,6 +290,14 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           RELEASE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${GITHUB_REF_NAME}"
           PAGES_BASE="https://${REPO_OWNER}.github.io/${REPO_NAME}"
+          WINDOWS_AMD64_JSON="\"release_url\": \"${RELEASE_URL}\""
+          WINDOWS_ARM64_JSON="\"release_url\": \"${RELEASE_URL}\""
+          if [ -f dist/pages/updates/windows/amd64/croopor-windows-amd64.appinstaller ]; then
+            WINDOWS_AMD64_JSON="${WINDOWS_AMD64_JSON}, \"appinstaller_url\": \"${PAGES_BASE}/updates/windows/amd64/croopor-windows-amd64.appinstaller\""
+          fi
+          if [ -f dist/pages/updates/windows/arm64/croopor-windows-arm64.appinstaller ]; then
+            WINDOWS_ARM64_JSON="${WINDOWS_ARM64_JSON}, \"appinstaller_url\": \"${PAGES_BASE}/updates/windows/arm64/croopor-windows-arm64.appinstaller\""
+          fi
           mkdir -p dist/pages/updates
           cat > dist/pages/updates/stable.json <<EOF
           {
@@ -279,12 +307,10 @@ jobs:
             "notes_url": "${RELEASE_URL}",
             "windows": {
               "amd64": {
-                "release_url": "${RELEASE_URL}",
-                "appinstaller_url": "${PAGES_BASE}/updates/windows/amd64/croopor.appinstaller"
+                ${WINDOWS_AMD64_JSON}
               },
               "arm64": {
-                "release_url": "${RELEASE_URL}",
-                "appinstaller_url": "${PAGES_BASE}/updates/windows/arm64/croopor.appinstaller"
+                ${WINDOWS_ARM64_JSON}
               }
             },
             "linux": {
