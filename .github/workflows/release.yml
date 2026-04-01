@@ -134,6 +134,7 @@ jobs:
           cp frontend/static/logo.png dist/appimage/AppDir/usr/share/icons/hicolor/256x256/apps/croopor.png
           ln -sf usr/share/applications/croopor.desktop dist/appimage/AppDir/croopor.desktop
           ln -sf usr/share/icons/hicolor/256x256/apps/croopor.png dist/appimage/AppDir/.DirIcon
+          ln -sf usr/share/icons/hicolor/256x256/apps/croopor.png dist/appimage/AppDir/croopor.png
           cat > dist/appimage/AppDir/AppRun <<'EOF'
           #!/bin/sh
           HERE="$(dirname "$(readlink -f "$0")")"
