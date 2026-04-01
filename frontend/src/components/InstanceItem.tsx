@@ -2,7 +2,7 @@ import type { JSX } from 'preact';
 import { useComputed } from '@preact/signals';
 import type { Instance, Version } from '../types';
 import {
-  selectedInstanceId, runningSessions, installState, installQueue, versions,
+  selectedInstanceId, runningSessions, installState, installQueue, versions, versionMap,
 } from '../store';
 import { selectInstance } from '../actions';
 import { parseVersionDisplay } from '../utils';
@@ -151,9 +151,11 @@ export function InstanceItem({ instance, version, index, onContextMenu }: Instan
   const isRunning = useComputed(() => !!runningSessions.value[instance.id]);
   const isSelected = useComputed(() => selectedInstanceId.value === instance.id);
 
-  const dotClass = useComputed(() =>
-    isRunning.value ? 'running' : version?.launchable ? 'ok' : 'missing'
-  );
+  const dotClass = useComputed(() => {
+    if (isRunning.value) return 'running';
+    const v = versionMap.value.get(instance.version_id);
+    return v?.launchable ? 'ok' : 'missing';
+  });
 
   const badgeClass = useComputed(() => {
     const p = pd.value;
