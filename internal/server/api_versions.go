@@ -304,21 +304,13 @@ func (s *Server) handleDeleteVersion(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Block deletion if any of the target versions is currently running
-	s.sessions.mu.RLock()
-	for _, sess := range s.sessions.sessions {
-		if sess.Process.GetState() != launcher.StateRunning {
-			continue
-		}
-		for _, id := range toDelete {
-			if sess.VersionID == id {
-				s.sessions.mu.RUnlock()
-				writeError(w, http.StatusConflict, "cannot delete version "+id+" — stop the game first")
-				return
-			}
-		}
+	// Atomically check no versions are running and mark them as being deleted.
+	// This prevents a launch from starting between the check and the removal.
+	if runningID := s.sessions.MarkDeleting(toDelete); runningID != "" {
+		writeError(w, http.StatusConflict, "cannot delete version "+runningID+" — stop the game first")
+		return
 	}
-	s.sessions.mu.RUnlock()
+	defer s.sessions.UnmarkDeleting(toDelete)
 
 	deleted := []string{}
 

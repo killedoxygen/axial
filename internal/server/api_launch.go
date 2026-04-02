@@ -63,6 +63,12 @@ func (s *Server) handleLaunch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Block launch if the version is being deleted
+	if s.sessions.IsVersionDeleting(inst.VersionID) {
+		writeError(w, http.StatusConflict, "version is being deleted")
+		return
+	}
+
 	// Pre-launch integrity check: verify all critical files exist
 	integrity := minecraft.VerifyIntegrity(mcDir, inst.VersionID)
 	if !integrity.OK {

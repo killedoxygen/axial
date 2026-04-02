@@ -124,10 +124,14 @@ func (s *Server) Handler() http.Handler {
 type SessionManager struct {
 	mu       sync.RWMutex
 	sessions map[string]*launcher.LaunchResult
+	deleting map[string]struct{} // version IDs being deleted
 }
 
 func NewSessionManager() *SessionManager {
-	return &SessionManager{sessions: make(map[string]*launcher.LaunchResult)}
+	return &SessionManager{
+		sessions: make(map[string]*launcher.LaunchResult),
+		deleting: make(map[string]struct{}),
+	}
 }
 
 func (sm *SessionManager) Add(result *launcher.LaunchResult) {
@@ -141,6 +145,61 @@ func (sm *SessionManager) Get(id string) (*launcher.LaunchResult, bool) {
 	defer sm.mu.RUnlock()
 	r, ok := sm.sessions[id]
 	return r, ok
+}
+
+// IsVersionDeleting returns true if the version is currently being deleted.
+func (sm *SessionManager) IsVersionDeleting(versionID string) bool {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	_, ok := sm.deleting[versionID]
+	return ok
+}
+
+// AnyRunningVersion returns the first running version ID from the given set, or "".
+func (sm *SessionManager) AnyRunningVersion(versionIDs []string) string {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	for _, sess := range sm.sessions {
+		if sess.Process.GetState() != launcher.StateRunning {
+			continue
+		}
+		for _, id := range versionIDs {
+			if sess.VersionID == id {
+				return id
+			}
+		}
+	}
+	return ""
+}
+
+// MarkDeleting atomically checks no versions are running and marks them as
+// being deleted. Returns the running version ID if any is running.
+func (sm *SessionManager) MarkDeleting(versionIDs []string) (runningID string) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	for _, sess := range sm.sessions {
+		if sess.Process.GetState() != launcher.StateRunning {
+			continue
+		}
+		for _, id := range versionIDs {
+			if sess.VersionID == id {
+				return id
+			}
+		}
+	}
+	for _, id := range versionIDs {
+		sm.deleting[id] = struct{}{}
+	}
+	return ""
+}
+
+// UnmarkDeleting removes version IDs from the pending-deletion set.
+func (sm *SessionManager) UnmarkDeleting(versionIDs []string) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	for _, id := range versionIDs {
+		delete(sm.deleting, id)
+	}
 }
 
 // InstallManager tracks active version installations.

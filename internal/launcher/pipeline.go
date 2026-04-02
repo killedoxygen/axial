@@ -2,6 +2,7 @@ package launcher
 
 import (
 	"fmt"
+	"log"
 	"os/exec"
 
 	"github.com/mateoltd/croopor/internal/config"
@@ -63,6 +64,18 @@ func runPipeline(ctx *LaunchContext, steps []LaunchStep) error {
 	return nil
 }
 
+// bestEffort wraps a step so failures are logged but don't abort the pipeline.
+// Used for post-start steps where the game process is already running.
+type bestEffort struct{ inner LaunchStep }
+
+func (b *bestEffort) Name() string { return b.inner.Name() }
+func (b *bestEffort) Execute(ctx *LaunchContext) error {
+	if err := b.inner.Execute(ctx); err != nil {
+		log.Printf("warning: %s: %v", b.inner.Name(), err)
+	}
+	return nil
+}
+
 // defaultPipeline returns the standard launch pipeline.
 func defaultPipeline() []LaunchStep {
 	return []LaunchStep{
@@ -80,8 +93,8 @@ func defaultPipeline() []LaunchStep {
 		&prefetchStep{},
 		&buildCommandStep{},
 		&startProcessStep{},
-		&startProfilerStep{},
-		&scheduleCDSStep{},
+		&bestEffort{&startProfilerStep{}},
+		&bestEffort{&scheduleCDSStep{}},
 	}
 }
 
