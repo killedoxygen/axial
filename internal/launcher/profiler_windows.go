@@ -3,7 +3,6 @@
 package launcher
 
 import (
-	"encoding/json"
 	"sync"
 	"unsafe"
 
@@ -17,6 +16,10 @@ var (
 	modntdll                      = windows.NewLazySystemDLL("ntdll.dll")
 	procNtQuerySystemInformation  = modntdll.NewProc("NtQuerySystemInformation")
 	procNtQueryInformationProcess = modntdll.NewProc("NtQueryInformationProcess")
+
+	procGlobalMemoryStatusEx = modkernel32.NewProc("GlobalMemoryStatusEx")
+	procGetSystemTimes       = modkernel32.NewProc("GetSystemTimes")
+	procGetProcessIoCounters = modkernel32.NewProc("GetProcessIoCounters")
 )
 
 // PROCESS_MEMORY_COUNTERS_EX
@@ -34,7 +37,6 @@ type processMemoryCounters struct {
 	PrivateUsage               uintptr
 }
 
-// IO_COUNTERS from GetProcessIoCounters
 type ioCounters struct {
 	ReadOperationCount  uint64
 	WriteOperationCount uint64
@@ -56,21 +58,15 @@ type memoryStatusEx struct {
 	AvailExtendedVirtual uint64
 }
 
-var (
-	procGlobalMemoryStatusEx = modkernel32.NewProc("GlobalMemoryStatusEx")
-	procGetSystemTimes       = modkernel32.NewProc("GetSystemTimes")
-	procGetProcessIoCounters = modkernel32.NewProc("GetProcessIoCounters")
-)
-
-// Per-process CPU delta state (guarded by cpuMu since profiler runs in a goroutine).
+// Per-process CPU delta state.
 var (
 	cpuMu             sync.Mutex
 	lastProcKernel    uint64
 	lastProcUser      uint64
-	lastProcWallTicks uint64 // wall-clock in 100ns units
+	lastProcWallTicks uint64
 )
 
-// System CPU delta state
+// System CPU delta state.
 var (
 	lastIdleTime   uint64
 	lastKernelTime uint64
@@ -89,7 +85,7 @@ func readProcessStats(pid int) processStats {
 	}
 	defer windows.CloseHandle(handle)
 
-	// Memory info
+	// Memory
 	var memInfo processMemoryCounters
 	memInfo.CB = uint32(unsafe.Sizeof(memInfo))
 	ret, _, _ := procGetProcessMemoryInfo.Call(
@@ -119,12 +115,10 @@ func readProcessStats(pid int) processStats {
 
 	// Per-process CPU via GetProcessTimes delta
 	var creationTime, exitTime, kernelTime, userTime windows.Filetime
-	err = windows.GetProcessTimes(handle, &creationTime, &exitTime, &kernelTime, &userTime)
-	if err == nil {
+	if err := windows.GetProcessTimes(handle, &creationTime, &exitTime, &kernelTime, &userTime); err == nil {
 		k := uint64(kernelTime.HighDateTime)<<32 | uint64(kernelTime.LowDateTime)
 		u := uint64(userTime.HighDateTime)<<32 | uint64(userTime.LowDateTime)
 
-		// Wall clock in 100ns units (FILETIME epoch)
 		var now windows.Filetime
 		windows.GetSystemTimeAsFileTime(&now)
 		wall := uint64(now.HighDateTime)<<32 | uint64(now.LowDateTime)
@@ -134,9 +128,6 @@ func readProcessStats(pid int) processStats {
 			cpuDelta := (k - lastProcKernel) + (u - lastProcUser)
 			wallDelta := wall - lastProcWallTicks
 			if wallDelta > 0 {
-				// cpuDelta and wallDelta are both in 100ns units.
-				// Result is % of one core; multiply by nothing since
-				// a single core at 100% = wallDelta of CPU time.
 				ps.cpuPct = float64(cpuDelta) / float64(wallDelta) * 100.0
 			}
 		}
@@ -146,7 +137,7 @@ func readProcessStats(pid int) processStats {
 		cpuMu.Unlock()
 	}
 
-	// Disk I/O via GetProcessIoCounters
+	// Disk I/O
 	var ioc ioCounters
 	ret, _, _ = procGetProcessIoCounters.Call(
 		uintptr(handle),
@@ -185,9 +176,7 @@ func readSystemStats() (cpuPct float64, freeMemBytes int64) {
 
 		if lastKernelTime != 0 {
 			idleDelta := idle - lastIdleTime
-			kernelDelta := kernel - lastKernelTime
-			userDelta := user - lastUserTime
-			total := kernelDelta + userDelta
+			total := (kernel - lastKernelTime) + (user - lastUserTime)
 			if total > 0 {
 				cpuPct = float64(total-idleDelta) / float64(total) * 100.0
 			}
@@ -198,8 +187,4 @@ func readSystemStats() (cpuPct float64, freeMemBytes int64) {
 	}
 
 	return cpuPct, freeMemBytes
-}
-
-func marshalJSON(v any) ([]byte, error) {
-	return json.MarshalIndent(v, "", "  ")
 }
