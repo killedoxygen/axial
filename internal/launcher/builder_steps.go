@@ -179,6 +179,8 @@ func (s *computeMemoryStep) Execute(ctx *LaunchContext) error {
 	if minMem > maxMem {
 		minMem = maxMem
 	}
+	ctx.EffectiveMaxMemoryMB = maxMem
+	ctx.EffectiveMinMemoryMB = minMem
 	ctx.MemArgs = []string{
 		fmt.Sprintf("-Xmx%dM", maxMem),
 		fmt.Sprintf("-Xms%dM", minMem),
@@ -265,7 +267,7 @@ func (s *startProfilerStep) Name() string { return "start profiler" }
 func (s *startProfilerStep) Execute(ctx *LaunchContext) error {
 	profile := NewBootProfile(
 		ctx.SessionID, ctx.Opts.VersionID, ctx.Process.PID(),
-		ctx.Opts.Config.JVMPreset, ctx.Opts.MaxMemoryMB,
+		ctx.Opts.Config.JVMPreset, ctx.EffectiveMaxMemoryMB,
 		bootCPUCap(), len(ctx.CDSArgs) > 0,
 	)
 	profile.Start()

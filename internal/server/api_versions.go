@@ -132,6 +132,8 @@ func (s *Server) handleInstallEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
+	defer s.installs.Remove(id)
+
 	ctx := r.Context()
 	for {
 		select {
@@ -320,10 +322,12 @@ func (s *Server) handleDeleteVersion(w http.ResponseWriter, r *http.Request) {
 				continue // parent is deleted below
 			}
 			depDir := filepath.Join(minecraft.VersionsDir(mcDir), id)
-			if err := os.RemoveAll(depDir); err == nil {
-				deleted = append(deleted, id)
-				log.Printf("Deleted dependent version: %s", id)
+			if err := os.RemoveAll(depDir); err != nil {
+				writeError(w, http.StatusInternalServerError, "failed to delete dependent version "+id+": "+err.Error())
+				return
 			}
+			deleted = append(deleted, id)
+			log.Printf("Deleted dependent version: %s", id)
 		}
 	}
 

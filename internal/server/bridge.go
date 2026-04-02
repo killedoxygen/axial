@@ -9,6 +9,7 @@ func (s *Server) BridgeInstallEvents(id string, emit func(eventType string, data
 	}
 
 	go func() {
+		defer s.installs.Remove(id)
 		for progress := range dl.ProgressCh {
 			emit("progress", progress)
 			if progress.Done {

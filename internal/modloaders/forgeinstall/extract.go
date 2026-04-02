@@ -59,7 +59,7 @@ func CollectLibraries(versionJSON, installProfile []byte) ([]minecraft.Library, 
 		Libraries []minecraft.Library `json:"libraries"`
 	}
 	if err := json.Unmarshal(versionJSON, &version); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("parsing version.json libraries: %w", err)
 	}
 
 	libs := version.Libraries
@@ -101,26 +101,35 @@ func ExtractDataFiles(jarData []byte, mcDir string) error {
 		cleanDestPath := filepath.Clean(destPath)
 		relDest, err := filepath.Rel(cleanLibDir, cleanDestPath)
 		if err != nil || relDest == ".." || strings.HasPrefix(relDest, ".."+string(os.PathSeparator)) {
-			continue
+			return fmt.Errorf("installer entry %q escapes library dir (resolved to %s)", f.Name, cleanDestPath)
 		}
-		if _, err := os.Stat(destPath); err == nil {
-			continue // Already exists
+		if info, err := os.Stat(destPath); err == nil {
+			if uint64(info.Size()) == f.UncompressedSize64 {
+				continue // Already exists with matching size
+			}
+		}
+
+		if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+			return fmt.Errorf("creating installer library dir %s: %w", filepath.Dir(destPath), err)
 		}
 
 		rc, err := f.Open()
 		if err != nil {
 			return fmt.Errorf("opening installer entry %s: %w", f.Name, err)
 		}
-		data, err := io.ReadAll(rc)
-		rc.Close()
+
+		out, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 		if err != nil {
-			return fmt.Errorf("reading installer entry %s: %w", f.Name, err)
+			rc.Close()
+			return fmt.Errorf("creating installer library %s: %w", destPath, err)
 		}
 
-		if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
-			return fmt.Errorf("creating installer library dir %s: %w", filepath.Dir(destPath), err)
+		_, err = io.Copy(out, rc)
+		rc.Close()
+		if closeErr := out.Close(); err == nil {
+			err = closeErr
 		}
-		if err := os.WriteFile(destPath, data, 0644); err != nil {
+		if err != nil {
 			return fmt.Errorf("writing installer library %s: %w", destPath, err)
 		}
 	}

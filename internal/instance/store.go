@@ -188,6 +188,15 @@ func (s *InstanceStore) Duplicate(id, newName, mcDir string, copyFiles bool) (*I
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if newName == "" {
+		return nil, errors.New("instance name is required")
+	}
+	for _, inst := range s.Instances {
+		if inst.Name == newName {
+			return nil, errors.New("an instance with this name already exists")
+		}
+	}
+
 	var src *Instance
 	for i := range s.Instances {
 		if s.Instances[i].ID == id {

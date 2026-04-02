@@ -29,6 +29,10 @@ type LaunchContext struct {
 	Vars          *minecraft.LaunchVars
 	GameDir       string
 
+	// Effective memory values (computed by computeMemoryStep with defaults/clamping)
+	EffectiveMaxMemoryMB int
+	EffectiveMinMemoryMB int
+
 	// Argument groups (assembled in order)
 	CDSArgs  []string
 	BootArgs []string

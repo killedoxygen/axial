@@ -166,6 +166,12 @@ func (im *InstallManager) Get(id string) (*minecraft.Downloader, bool) {
 	return d, ok
 }
 
+func (im *InstallManager) Remove(id string) {
+	im.mu.Lock()
+	delete(im.installs, id)
+	im.mu.Unlock()
+}
+
 // JSON helpers
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
