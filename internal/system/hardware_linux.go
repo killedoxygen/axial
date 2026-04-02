@@ -30,25 +30,57 @@ func detectGPU() GPUProfile {
 	return gpu
 }
 
+// gpuPriority returns a sort weight for GPU vendor selection.
+// Higher is better. Matches the Windows detection preference order.
+func gpuPriority(v GPUVendor) int {
+	switch v {
+	case GPUVendorNVIDIA:
+		return 3
+	case GPUVendorAMD:
+		return 2
+	case GPUVendorIntel:
+		return 1
+	default:
+		return 0
+	}
+}
+
 func readGPUVendor() GPUVendor {
-	// Try card0 first, then card1
-	for _, card := range []string{"card0", "card1"} {
-		path := filepath.Join("/sys/class/drm", card, "device/vendor")
+	entries, err := os.ReadDir("/sys/class/drm")
+	if err != nil {
+		return GPUVendorUnknown
+	}
+
+	best := GPUVendorUnknown
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), "card") {
+			continue
+		}
+		// Skip render nodes like card0-HDMI-A-1
+		if strings.Contains(entry.Name(), "-") {
+			continue
+		}
+		path := filepath.Join("/sys/class/drm", entry.Name(), "device/vendor")
 		data, err := os.ReadFile(path)
 		if err != nil {
 			continue
 		}
-		vendorID := strings.TrimSpace(string(data))
-		switch vendorID {
+		var v GPUVendor
+		switch strings.TrimSpace(string(data)) {
 		case "0x10de":
-			return GPUVendorNVIDIA
+			v = GPUVendorNVIDIA
 		case "0x1002":
-			return GPUVendorAMD
+			v = GPUVendorAMD
 		case "0x8086":
-			return GPUVendorIntel
+			v = GPUVendorIntel
+		default:
+			continue
+		}
+		if gpuPriority(v) > gpuPriority(best) {
+			best = v
 		}
 	}
-	return GPUVendorUnknown
+	return best
 }
 
 func readNVIDIAModel() string {
@@ -87,12 +119,15 @@ func detectPhysicalCores() int {
 
 	seen := make(map[string]struct{})
 	for i := 0; i <= maxCPU; i++ {
-		path := filepath.Join("/sys/devices/system/cpu", "cpu"+strconv.Itoa(i), "topology/core_id")
-		data, err := os.ReadFile(path)
+		cpuDir := filepath.Join("/sys/devices/system/cpu", "cpu"+strconv.Itoa(i), "topology")
+		coreData, err := os.ReadFile(filepath.Join(cpuDir, "core_id"))
 		if err != nil {
 			continue
 		}
-		seen[strings.TrimSpace(string(data))] = struct{}{}
+		pkgData, _ := os.ReadFile(filepath.Join(cpuDir, "physical_package_id"))
+		pkg := strings.TrimSpace(string(pkgData))
+		core := strings.TrimSpace(string(coreData))
+		seen[pkg+":"+core] = struct{}{}
 	}
 
 	if len(seen) == 0 {

@@ -2,11 +2,13 @@ package system
 
 import (
 	"bufio"
+	"context"
 	"log"
 	"os/exec"
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 )
 
 // GPUVendor identifies the GPU manufacturer.
@@ -60,9 +62,9 @@ const (
 type HardwareTier string
 
 const (
-	HardwareTierLow  HardwareTier = "low"  // <=4 logical cores OR <=8GB RAM
-	HardwareTierMid  HardwareTier = "mid"  // 5-7 cores AND 8-16GB RAM
-	HardwareTierHigh HardwareTier = "high" // 8+ cores AND 16+ GB RAM
+	HardwareTierLow  HardwareTier = "low"  // <=4 cores OR <=8GB RAM
+	HardwareTierMid  HardwareTier = "mid"  // everything between low and high
+	HardwareTierHigh HardwareTier = "high" // >=8 cores AND >=16GB RAM
 )
 
 // HardwareProfile is the complete system snapshot consumed by later phases.
@@ -171,11 +173,17 @@ func DetectJavaDistribution(javaPath string) JavaDistribution {
 }
 
 func detectJavaDistribution(javaPath string) JavaDistribution {
-	// -XshowSettings:property prints to stderr, -version also to stderr
-	cmd := exec.Command(javaPath, "-XshowSettings:property", "-version")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, javaPath, "-XshowSettings:property", "-version")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		log.Printf("hardware detect: failed to run java for distribution detection: %v", err)
+		if ctx.Err() == context.DeadlineExceeded {
+			log.Printf("hardware detect: java distribution probe timed out for %s", javaPath)
+		} else {
+			log.Printf("hardware detect: failed to run java for distribution detection: %v", err)
+		}
 		return JavaDistributionUnknown
 	}
 

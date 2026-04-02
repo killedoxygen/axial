@@ -214,6 +214,7 @@ func (s *applyGCPresetStep) Execute(ctx *LaunchContext) error {
 		}
 		preset = AutoSelectPreset(hw, ctx.JavaMajor, dist)
 	}
+	ctx.EffectivePreset = preset
 	ctx.GCArgs = gcPresetArgs(preset, ctx.JavaMajor)
 	return nil
 }
@@ -277,7 +278,7 @@ func (s *startProfilerStep) Name() string { return "start profiler" }
 func (s *startProfilerStep) Execute(ctx *LaunchContext) error {
 	profile := NewBootProfile(
 		ctx.SessionID, ctx.Opts.VersionID, ctx.Process.PID(),
-		ctx.Opts.Config.JVMPreset, ctx.EffectiveMaxMemoryMB,
+		ctx.EffectivePreset, ctx.EffectiveMaxMemoryMB,
 		bootCPUCap(), len(ctx.CDSArgs) > 0,
 	)
 	profile.Start()

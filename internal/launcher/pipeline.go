@@ -30,9 +30,10 @@ type LaunchContext struct {
 	Vars          *minecraft.LaunchVars
 	GameDir       string
 
-	// Effective memory values (computed by computeMemoryStep with defaults/clamping)
+	// Effective values (computed by steps, used by profiler and downstream)
 	EffectiveMaxMemoryMB int
 	EffectiveMinMemoryMB int
+	EffectivePreset      string // GC preset actually applied (auto-selected or user-configured)
 
 	// Argument groups (assembled in order)
 	CDSArgs  []string
