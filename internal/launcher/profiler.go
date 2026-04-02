@@ -1,6 +1,7 @@
 package launcher
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,7 +13,7 @@ import (
 )
 
 // BootProfile captures diagnostic data during Minecraft boot to identify
-// what causes system lag. Samples are taken every 500ms until boot completes.
+// what causes system lag. Samples are taken every 250ms until boot completes.
 type BootProfile struct {
 	// Metadata
 	SessionID  string    `json:"session_id"`
@@ -53,14 +54,24 @@ type BootSample struct {
 	MemResidentMB int64   `json:"mem_resident_mb"` // RSS in MB
 	MemVirtualMB  int64   `json:"mem_virtual_mb"`  // Virtual memory in MB
 	ThreadCount   int     `json:"thread_count"`
-	// Disk I/O metrics (cumulative since process start)
-	IOReadMB   float64 `json:"io_read_mb"`   // Total bytes read from disk
-	IOWriteMB  float64 `json:"io_write_mb"`  // Total bytes written to disk
-	IOReadOps  int64   `json:"io_read_ops"`  // Number of read syscalls
-	IOWriteOps int64   `json:"io_write_ops"` // Number of write syscalls
-	// System-wide metrics
-	SystemCPUPct float64 `json:"system_cpu_pct"` // Total system CPU usage
-	SystemFreeMB int64   `json:"system_free_mb"` // Free physical memory
+	IOReadMB      float64 `json:"io_read_mb"`     // Total bytes read from disk
+	IOWriteMB     float64 `json:"io_write_mb"`    // Total bytes written to disk
+	IOReadOps     int64   `json:"io_read_ops"`    // Number of read syscalls
+	IOWriteOps    int64   `json:"io_write_ops"`   // Number of write syscalls
+	SystemCPUPct  float64 `json:"system_cpu_pct"` // Total system CPU usage
+	SystemFreeMB  int64   `json:"system_free_mb"` // Free physical memory
+}
+
+// processStats holds raw metrics returned by the platform-specific readProcessStats.
+type processStats struct {
+	cpuPct       float64
+	rss          int64
+	virt         int64
+	threads      int
+	ioReadBytes  int64
+	ioWriteBytes int64
+	ioReadOps    int64
+	ioWriteOps   int64
 }
 
 // NewBootProfile creates a profiler for a game launch session.
@@ -100,7 +111,6 @@ func (bp *BootProfile) Stop() {
 	bp.FinishedAt = time.Now()
 	bp.BootDurationMs = bp.FinishedAt.Sub(bp.StartedAt).Milliseconds()
 
-	// Compute peaks
 	for _, s := range bp.Samples {
 		if s.CPUPct > bp.PeakCPUPct {
 			bp.PeakCPUPct = s.CPUPct
@@ -133,7 +143,6 @@ func (bp *BootProfile) sampleLoop() {
 
 func (bp *BootProfile) takeSample() BootSample {
 	elapsed := time.Since(bp.StartedAt).Milliseconds()
-
 	ps := readProcessStats(bp.pid)
 	sysCPU, sysFree := readSystemStats()
 
@@ -152,20 +161,7 @@ func (bp *BootProfile) takeSample() BootSample {
 	}
 }
 
-// processStats holds raw metrics returned by the platform-specific readProcessStats.
-type processStats struct {
-	cpuPct       float64
-	rss          int64
-	virt         int64
-	threads      int
-	ioReadBytes  int64
-	ioWriteBytes int64
-	ioReadOps    int64
-	ioWriteOps   int64
-}
-
 // SaveReport writes the profile as JSON to the config directory.
-// Returns the file path.
 func (bp *BootProfile) SaveReport() (string, error) {
 	dir := filepath.Join(config.ConfigDir(), "boot-profiles")
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -179,11 +175,10 @@ func (bp *BootProfile) SaveReport() (string, error) {
 	)
 	path := filepath.Join(dir, filename)
 
-	data, err := marshalJSON(bp)
+	data, err := json.MarshalIndent(bp, "", "  ")
 	if err != nil {
 		return "", err
 	}
-
 	if err := os.WriteFile(path, data, 0644); err != nil {
 		return "", err
 	}

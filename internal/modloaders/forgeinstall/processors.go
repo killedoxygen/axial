@@ -1,4 +1,4 @@
-package modloaders
+package forgeinstall
 
 import (
 	"archive/zip"
@@ -16,6 +16,9 @@ import (
 
 	"github.com/mateoltd/croopor/internal/minecraft"
 )
+
+// ProgressFunc is called to report processor execution progress.
+type ProgressFunc func(current, total int, detail string)
 
 // installProfileJSON represents the install_profile.json from Forge/NeoForge installers.
 type installProfileJSON struct {
@@ -36,9 +39,9 @@ type dataEntry struct {
 	Server string `json:"server"`
 }
 
-// RunForgeProcessors executes the processors from an install_profile.json.
+// RunProcessors executes the processors from an install_profile.json.
 // This patches the Minecraft client JAR and generates required artifacts.
-func RunForgeProcessors(mcDir, mcVersion, versionID string, installProfileData, installerData []byte, progress chan<- Progress) error {
+func RunProcessors(mcDir, mcVersion, versionID string, installProfileData, installerData []byte, progress ProgressFunc) error {
 	var profile installProfileJSON
 	if err := json.Unmarshal(installProfileData, &profile); err != nil {
 		return fmt.Errorf("parsing install profile: %w", err)
@@ -93,11 +96,8 @@ func RunForgeProcessors(mcDir, mcVersion, versionID string, installProfileData, 
 
 	total := len(clientProcessors)
 	for i, proc := range clientProcessors {
-		progress <- Progress{
-			Phase:   "loader_processors",
-			Current: i + 1,
-			Total:   total,
-			Detail:  fmt.Sprintf("Processor %d/%d", i+1, total),
+		if progress != nil {
+			progress(i+1, total, fmt.Sprintf("Processor %d/%d", i+1, total))
 		}
 
 		if err := runProcessor(javaPath, proc, libPaths, dataVars, libDir); err != nil {

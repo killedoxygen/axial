@@ -5,9 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 
@@ -41,198 +39,21 @@ type LaunchResult struct {
 
 // BuildAndLaunch constructs the launch command and starts the game.
 func BuildAndLaunch(opts LaunchOptions) (*LaunchResult, error) {
-	sessionID := generateSessionID()
+	ctx := newLaunchContext(opts)
 
-	// Step 1: Resolve version (handles inheritsFrom)
-	version, err := minecraft.ResolveVersion(opts.MCDir, opts.VersionID)
-	if err != nil {
-		return nil, fmt.Errorf("resolving version: %w", err)
+	if err := runPipeline(ctx, defaultPipeline()); err != nil {
+		return nil, err
 	}
 
-	// Step 2: Set up environment (is_demo_user = false is the key)
-	env := minecraft.DefaultEnvironment()
-
-	// Step 3: Find or download the correct Java runtime
-	javaResult, err := minecraft.EnsureJavaRuntime(opts.MCDir, version.JavaVersion, opts.Config.JavaPathOverride)
-	if err != nil {
-		return nil, fmt.Errorf("java runtime: %w", err)
-	}
-
-	// Step 4: Resolve libraries and build classpath
-	libs, err := minecraft.ResolveLibraries(version, opts.MCDir, env)
-	if err != nil {
-		return nil, fmt.Errorf("resolving libraries: %w", err)
-	}
-
-	// Step 5: Determine client JAR path
-	clientJarPath := findClientJar(opts.MCDir, version, opts.VersionID)
-
-	classpath := minecraft.BuildClasspath(libs, clientJarPath)
-
-	// Step 6: Create natives directory
-	nativesDir, err := CreateNativesDir(sessionID)
-	if err != nil {
-		return nil, fmt.Errorf("creating natives dir: %w", err)
-	}
-
-	// Step 7: Extract native DLLs from native library JARs into the natives directory.
-	// Required for ALL versions. Legacy versions use classifier JARs, modern versions
-	// use separate native library entries, but both need extraction.
-	if err := ExtractLegacyNatives(libs, nativesDir); err != nil {
-		CleanupNativesDir(nativesDir)
-		return nil, fmt.Errorf("extracting natives: %w", err)
-	}
-
-	// Step 8: Build launch variables
-	username := opts.Username
-	if username == "" {
-		username = "Player"
-	}
-
-	gameDir := opts.GameDir
-	if gameDir == "" {
-		gameDir = opts.MCDir
-	}
-
-	// For pre-1.6 versions with virtual/legacy asset indexes,
-	// game_assets must point to assets/virtual/legacy/ instead of assets/.
-	var gameAssets string
-	if minecraft.IsLegacyAssets(opts.MCDir, version.AssetIndex.ID) {
-		gameAssets = filepath.Join(minecraft.AssetsDir(opts.MCDir), "virtual", "legacy")
-	}
-
-	vars := &minecraft.LaunchVars{
-		AuthPlayerName:     username,
-		VersionName:        version.ID,
-		GameDirectory:      gameDir,
-		AssetsRoot:         minecraft.AssetsDir(opts.MCDir),
-		AssetIndexName:     version.AssetIndex.ID,
-		AuthUUID:           minecraft.OfflineUUID(username),
-		AuthAccessToken:    "null",
-		ClientID:           "",
-		AuthXUID:           "",
-		UserType:           "msa",
-		VersionType:        version.Type,
-		LauncherName:       "croopor",
-		LauncherVersion:    "1.0.0",
-		NativesDirectory:   nativesDir,
-		Classpath:          classpath,
-		LibraryDirectory:   minecraft.LibrariesDir(opts.MCDir),
-		ClasspathSeparator: string(os.PathListSeparator),
-		GameAssets:         gameAssets,
-	}
-
-	if opts.Config.WindowWidth > 0 && opts.Config.WindowHeight > 0 {
-		vars.ResolutionWidth = fmt.Sprintf("%d", opts.Config.WindowWidth)
-		vars.ResolutionHeight = fmt.Sprintf("%d", opts.Config.WindowHeight)
-		env.Features["has_custom_resolution"] = true
-	}
-
-	// Step 9: Resolve JVM and game arguments
-	jvmArgs, gameArgs := minecraft.ResolveArguments(version, env, vars)
-
-	// Step 10: Add boot throttling and GC preset flags
-	javaMajor := version.JavaVersion.MajorVersion
-	bootArgs := bootThrottleArgs(javaMajor)
-	gcArgs := gcPresetArgs(opts.Config.JVMPreset, javaMajor)
-
-	// Step 10b: Add CDS flags if archive exists (vanilla versions only, Java 11+)
-	var cdsArgs []string
-	isModded := isModdedVersion(opts.MCDir, opts.VersionID)
-	configDir := config.ConfigDir()
-	if !isModded && javaMajor >= 11 && CDSArchiveExists(configDir, opts.VersionID) {
-		cdsArgs = []string{
-			"-Xshare:auto",
-			"-XX:SharedArchiveFile=" + CDSArchivePath(configDir, opts.VersionID),
-		}
-	}
-
-	// Step 11: Add memory flags
-	maxMem := opts.MaxMemoryMB
-	if maxMem <= 0 {
-		maxMem = 4096
-	}
-	minMem := opts.MinMemoryMB
-	if minMem <= 0 {
-		minMem = 512
-	}
-	memArgs := []string{
-		fmt.Sprintf("-Xmx%dM", maxMem),
-		fmt.Sprintf("-Xms%dM", minMem),
-	}
-
-	// Step 12: Assemble full command
-	// Order: java [cds_args] [boot_args] [jvm_args] [gc_args] [extra_args] [mem_args] <mainClass> [game_args]
-	var cmdArgs []string
-	cmdArgs = append(cmdArgs, cdsArgs...)
-	cmdArgs = append(cmdArgs, bootArgs...)
-	cmdArgs = append(cmdArgs, jvmArgs...)
-	cmdArgs = append(cmdArgs, gcArgs...)
-	cmdArgs = append(cmdArgs, opts.ExtraJVMArgs...)
-	cmdArgs = append(cmdArgs, memArgs...)
-	cmdArgs = append(cmdArgs, version.MainClass)
-	cmdArgs = append(cmdArgs, gameArgs...)
-
-	// Step 12b: Prefetch key files into OS page cache before JVM starts.
-	// Synchronous. Ensures files are in cache before the JVM touches them.
-	prefetchForLaunch(libs, clientJarPath, opts.MCDir, version.AssetIndex.ID)
-
-	// Step 13: Create exec.Cmd
-	cmd := exec.Command(javaResult.Path, cmdArgs...)
-	cmd.Dir = gameDir
-
-	// Set up process attributes for Windows (detach so game survives if croopor exits)
-	setProcAttr(cmd)
-
-	result := &LaunchResult{
-		Command:    append([]string{javaResult.Path}, cmdArgs...),
-		JavaPath:   javaResult.Path,
-		SessionID:  sessionID,
-		NativesDir: nativesDir,
+	return &LaunchResult{
+		Command:    append([]string{ctx.JavaPath}, ctx.CmdArgs...),
+		JavaPath:   ctx.JavaPath,
+		Process:    ctx.Process,
+		SessionID:  ctx.SessionID,
+		NativesDir: ctx.NativesDir,
 		VersionID:  opts.VersionID,
 		InstanceID: opts.InstanceID,
-	}
-
-	// Step 14: Create and start game process
-	gp := NewGameProcess(cmd, nativesDir)
-	if err := gp.Start(); err != nil {
-		CleanupNativesDir(nativesDir)
-		return nil, fmt.Errorf("starting game process: %w", err)
-	}
-	result.Process = gp
-
-	// Step 15: Start boot profiler to capture diagnostic data
-	profile := NewBootProfile(
-		sessionID, opts.VersionID, gp.PID(),
-		opts.Config.JVMPreset, opts.MaxMemoryMB,
-		bootCPUCap(), len(cdsArgs) > 0,
-	)
-	profile.Start()
-	gp.Profile = profile
-
-	// Step 16: Schedule CDS archive generation for next launch if not yet cached
-	if !isModded && javaMajor >= 11 && len(cdsArgs) == 0 {
-		go func() {
-			archivePath := CDSArchivePath(configDir, opts.VersionID)
-			if err := GenerateCDSArchive(javaResult.Path, classpath, archivePath); err != nil {
-				log.Printf("CDS archive generation failed for %s: %v", opts.VersionID, err)
-			}
-		}()
-	}
-
-	// Step 17: Auto-repair CDS. If the JVM detects a corrupted archive, invalidate it.
-	if len(cdsArgs) > 0 {
-		cdsVersionID := opts.VersionID
-		go func() {
-			<-gp.Done()
-			if gp.CDSFailed {
-				log.Printf("CDS archive unusable for %s — invalidating for next launch", cdsVersionID)
-				InvalidateCDSArchive(configDir, cdsVersionID)
-			}
-		}()
-	}
-
-	return result, nil
+	}, nil
 }
 
 func findClientJar(mcDir string, v *minecraft.VersionJSON, originalVersionID string) string {

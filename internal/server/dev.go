@@ -58,9 +58,10 @@ func (s *Server) handleDevCleanup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Back up instance data (saves, mods, etc. per instance)
+	allInstances := s.instances.List()
 	instancesRemoved := 0
 	instanceBackupDir := filepath.Join(backupDir, "instances")
-	for _, inst := range s.instances.Instances {
+	for _, inst := range allInstances {
 		gameDir := instance.GameDir(inst.ID)
 		if _, err := os.Stat(gameDir); os.IsNotExist(err) {
 			continue
@@ -71,9 +72,8 @@ func (s *Server) handleDevCleanup(w http.ResponseWriter, r *http.Request) {
 
 	// Remove all instance game directories and clear instance store
 	os.RemoveAll(instance.InstancesBaseDir())
-	instancesRemoved = len(s.instances.Instances)
-	s.instances.Instances = nil
-	s.instances.LastInstanceID = ""
+	instancesRemoved = s.instances.Len()
+	s.instances.Clear()
 	instance.Save(s.instances)
 
 	// Remove versions directory contents
@@ -109,8 +109,7 @@ func (s *Server) handleDevFlush(w http.ResponseWriter, r *http.Request) {
 	// Remove all instances (store + game directories)
 	os.RemoveAll(instance.InstancesBaseDir())
 	os.Remove(filepath.Join(configDir, "instances.json"))
-	s.instances.Instances = nil
-	s.instances.LastInstanceID = ""
+	s.instances.Clear()
 
 	// Reset in-memory config to defaults
 	def := config.DefaultConfig()

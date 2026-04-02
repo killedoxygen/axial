@@ -10,6 +10,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/mateoltd/croopor/internal/modloaders/forgeinstall"
 )
 
 const (
@@ -159,7 +161,7 @@ func (n *neoforgeLoader) Install(mcDir, mcVersion, loaderVersion string, progres
 
 		progress <- Progress{Phase: "loader_json", Current: 0, Total: 1, Detail: "Extracting installer..."}
 
-		versionJSON, installProfile, err := extractInstallerJSONs(installerData)
+		versionJSON, installProfile, err := forgeinstall.ExtractInstallerJSONs(installerData)
 		if err != nil {
 			return nil, fmt.Errorf("extracting NeoForge installer: %w", err)
 		}
@@ -198,7 +200,7 @@ func (n *neoforgeLoader) Install(mcDir, mcVersion, loaderVersion string, progres
 			return nil, fmt.Errorf("writing version JSON: %w", err)
 		}
 
-		allLibs, err := collectForgeLibraries(versionJSON, installProfile)
+		allLibs, err := forgeinstall.CollectLibraries(versionJSON, installProfile)
 		if err != nil {
 			return nil, fmt.Errorf("parsing NeoForge libraries: %w", err)
 		}
@@ -207,14 +209,16 @@ func (n *neoforgeLoader) Install(mcDir, mcVersion, loaderVersion string, progres
 			return nil, fmt.Errorf("downloading NeoForge libraries: %w", err)
 		}
 
-		if err := extractInstallerDataFiles(installerData, mcDir); err != nil {
+		if err := forgeinstall.ExtractDataFiles(installerData, mcDir); err != nil {
 			return nil, fmt.Errorf("extracting installer data: %w", err)
 		}
 
 		if installProfile != nil {
 			progress <- Progress{Phase: "loader_processors", Current: 0, Total: 1, Detail: "Running processors..."}
 
-			if err := RunForgeProcessors(mcDir, safeMCVersion, versionID, installProfile, installerData, progress); err != nil {
+			if err := forgeinstall.RunProcessors(mcDir, safeMCVersion, versionID, installProfile, installerData, func(current, total int, detail string) {
+				progress <- Progress{Phase: "loader_processors", Current: current, Total: total, Detail: detail}
+			}); err != nil {
 				return nil, fmt.Errorf("running NeoForge processors: %w", err)
 			}
 		}

@@ -1,8 +1,6 @@
 package modloaders
 
 import (
-	"archive/zip"
-	"bytes"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
@@ -10,11 +8,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/mateoltd/croopor/internal/minecraft"
+	"github.com/mateoltd/croopor/internal/modloaders/forgeinstall"
 )
 
 const (
@@ -190,7 +187,7 @@ func (f *forgeLoader) Install(mcDir, mcVersion, loaderVersion string, progress c
 
 		progress <- Progress{Phase: "loader_json", Current: 0, Total: 1, Detail: "Extracting installer..."}
 
-		versionJSON, installProfile, err := extractInstallerJSONs(installerData)
+		versionJSON, installProfile, err := forgeinstall.ExtractInstallerJSONs(installerData)
 		if err != nil {
 			return nil, fmt.Errorf("extracting Forge installer: %w", err)
 		}
@@ -229,7 +226,7 @@ func (f *forgeLoader) Install(mcDir, mcVersion, loaderVersion string, progress c
 			return nil, fmt.Errorf("writing version JSON: %w", err)
 		}
 
-		allLibs, err := collectForgeLibraries(versionJSON, installProfile)
+		allLibs, err := forgeinstall.CollectLibraries(versionJSON, installProfile)
 		if err != nil {
 			return nil, fmt.Errorf("parsing Forge libraries: %w", err)
 		}
@@ -238,14 +235,16 @@ func (f *forgeLoader) Install(mcDir, mcVersion, loaderVersion string, progress c
 			return nil, fmt.Errorf("downloading Forge libraries: %w", err)
 		}
 
-		if err := extractInstallerDataFiles(installerData, mcDir); err != nil {
+		if err := forgeinstall.ExtractDataFiles(installerData, mcDir); err != nil {
 			return nil, fmt.Errorf("extracting installer data: %w", err)
 		}
 
 		if installProfile != nil {
 			progress <- Progress{Phase: "loader_processors", Current: 0, Total: 1, Detail: "Running processors..."}
 
-			if err := RunForgeProcessors(mcDir, safeMCVersion, versionID, installProfile, installerData, progress); err != nil {
+			if err := forgeinstall.RunProcessors(mcDir, safeMCVersion, versionID, installProfile, installerData, func(current, total int, detail string) {
+				progress <- Progress{Phase: "loader_processors", Current: current, Total: total, Detail: detail}
+			}); err != nil {
 				return nil, fmt.Errorf("running Forge processors: %w", err)
 			}
 		}
@@ -354,78 +353,4 @@ func extractForgeVersion(mavenVersion string) string {
 		return ""
 	}
 	return mavenVersion[idx+1:]
-}
-
-// collectForgeLibraries gathers libraries from both version.json and install_profile.json.
-func collectForgeLibraries(versionJSON, installProfile []byte) ([]minecraft.Library, error) {
-	var version struct {
-		Libraries []minecraft.Library `json:"libraries"`
-	}
-	if err := json.Unmarshal(versionJSON, &version); err != nil {
-		return nil, err
-	}
-
-	libs := version.Libraries
-
-	if installProfile != nil {
-		var profile struct {
-			Libraries []minecraft.Library `json:"libraries"`
-		}
-		if err := json.Unmarshal(installProfile, &profile); err == nil {
-			libs = append(libs, profile.Libraries...)
-		}
-	}
-
-	return libs, nil
-}
-
-// extractInstallerDataFiles extracts data/ entries from the installer JAR
-// into the libraries directory (Forge stores some artifacts this way).
-func extractInstallerDataFiles(jarData []byte, mcDir string) error {
-	r, err := zip.NewReader(bytes.NewReader(jarData), int64(len(jarData)))
-	if err != nil {
-		return err
-	}
-
-	libDir := minecraft.LibrariesDir(mcDir)
-	for _, f := range r.File {
-		if !strings.HasPrefix(f.Name, "maven/") {
-			continue
-		}
-
-		relPath := strings.TrimPrefix(f.Name, "maven/")
-		if relPath == "" || strings.HasSuffix(relPath, "/") {
-			continue
-		}
-
-		destPath := filepath.Join(libDir, filepath.FromSlash(relPath))
-		cleanLibDir := filepath.Clean(libDir)
-		cleanDestPath := filepath.Clean(destPath)
-		relDest, err := filepath.Rel(cleanLibDir, cleanDestPath)
-		if err != nil || relDest == ".." || strings.HasPrefix(relDest, ".."+string(os.PathSeparator)) {
-			continue
-		}
-		if _, err := os.Stat(destPath); err == nil {
-			continue // Already exists
-		}
-
-		rc, err := f.Open()
-		if err != nil {
-			continue
-		}
-		data, err := io.ReadAll(rc)
-		rc.Close()
-		if err != nil {
-			continue
-		}
-
-		if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
-			return fmt.Errorf("creating installer library dir %s: %w", filepath.Dir(destPath), err)
-		}
-		if err := os.WriteFile(destPath, data, 0644); err != nil {
-			return fmt.Errorf("writing installer library %s: %w", destPath, err)
-		}
-	}
-
-	return nil
 }
