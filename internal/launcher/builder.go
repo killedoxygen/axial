@@ -11,6 +11,18 @@ import (
 
 	"github.com/mateoltd/croopor/internal/config"
 	"github.com/mateoltd/croopor/internal/minecraft"
+	"github.com/mateoltd/croopor/internal/system"
+)
+
+// JVM GC preset names.
+const (
+	PresetSmooth          = "smooth"            // Shenandoah — default for Java 11+
+	PresetPerformance     = "performance"       // brucethemoose client G1GC
+	PresetUltraLowLatency = "ultra_low_latency" // Generational ZGC — Java 21+
+	PresetGraalVM         = "graalvm"           // GraalVM-specific tuning
+	PresetLegacy          = "legacy"            // conservative G1GC for Java 8
+	PresetLegacyPvP       = "legacy_pvp"        // low-pause G1GC for 1.8.9 PvP
+	PresetLegacyHeavy     = "legacy_heavy"      // tuned G1GC for heavy modpacks
 )
 
 // LaunchOptions holds parameters for launching a version.
@@ -195,6 +207,25 @@ func bootThrottleArgs(javaMajor int) []string {
 	return args
 }
 
+// AutoSelectPreset chooses the best JVM GC preset based on the detected
+// hardware profile, Java version, and JVM distribution. It is called only
+// when the user has not explicitly set a preset in config.
+func AutoSelectPreset(profile system.HardwareProfile, javaMajor int, dist system.JavaDistribution) string {
+	if dist == system.JavaDistributionGraalVM {
+		return PresetGraalVM
+	}
+	if javaMajor <= 8 {
+		return PresetLegacy
+	}
+	if javaMajor >= 21 && profile.CPU.LogicalCores >= 8 && profile.TotalRAMMB >= 8192 {
+		return PresetUltraLowLatency
+	}
+	if javaMajor >= 11 {
+		return PresetSmooth
+	}
+	return PresetPerformance
+}
+
 // gcPresetArgs returns JVM garbage collector flags for the given preset.
 func gcPresetArgs(preset string, javaMajor int) []string {
 	switch preset {
@@ -218,15 +249,132 @@ func gcPresetArgs(preset string, javaMajor int) []string {
 			"-XX:+PerfDisableSharedMem",
 			"-XX:MaxTenuringThreshold=1",
 		}
-	case "zgc":
-		if javaMajor < 17 {
-			return nil
+
+	case PresetSmooth:
+		// Shenandoah requires Java 11+; fall back to performance if unavailable.
+		if javaMajor < 11 {
+			return gcPresetArgs(PresetPerformance, javaMajor)
 		}
-		args := []string{"-XX:+UseZGC"}
-		if javaMajor >= 21 {
-			args = append(args, "-XX:+ZGenerational")
+		return []string{
+			"-XX:+UseShenandoahGC",
+			"-XX:ShenandoahGCHeuristics=compact",
+			"-XX:+AlwaysPreTouch",
+			"-XX:+DisableExplicitGC",
+			"-XX:+UseNUMA",
+			"-XX:-UseBiasedLocking",
+			"-XX:+PerfDisableSharedMem",
 		}
-		return args
+
+	case PresetPerformance:
+		return []string{
+			"-XX:+UseG1GC",
+			"-XX:MaxGCPauseMillis=37",
+			"-XX:+PerfDisableSharedMem",
+			"-XX:+AlwaysPreTouch",
+			"-XX:-UseAdaptiveSizePolicy",
+			"-XX:G1NewSizePercent=20",
+			"-XX:G1MaxNewSizePercent=40",
+			"-XX:G1HeapRegionSize=16M",
+			"-XX:G1ReservePercent=20",
+			"-XX:G1MixedGCCountTarget=3",
+			"-XX:InitiatingHeapOccupancyPercent=15",
+			"-XX:G1MixedGCLiveThresholdPercent=90",
+			"-XX:G1RSetUpdatingPauseTimePercent=0",
+			"-XX:SurvivorRatio=32",
+			"-XX:MaxTenuringThreshold=1",
+			"-XX:+UseNUMA",
+			"-XX:-DontCompileHugeMethods",
+			"-XX:+DisableExplicitGC",
+			"-XX:-UseBiasedLocking",
+		}
+
+	case PresetUltraLowLatency, "zgc":
+		// Generational ZGC requires Java 21+; fall back through smooth then performance.
+		if javaMajor < 21 {
+			return gcPresetArgs(PresetSmooth, javaMajor)
+		}
+		return []string{
+			"-XX:+UseZGC",
+			"-XX:+ZGenerational",
+			"-XX:+AlwaysPreTouch",
+			"-XX:+DisableExplicitGC",
+			"-XX:+PerfDisableSharedMem",
+			"-XX:+UseNUMA",
+		}
+
+	case PresetGraalVM:
+		return []string{
+			"-XX:+UseG1GC",
+			"-XX:+EnableJVMCI",
+			"-XX:+UseJVMCICompiler",
+			"-XX:-TieredCompilation",
+			"-XX:ReservedCodeCacheSize=256M",
+			"-XX:InitialCodeCacheSize=256M",
+			"-XX:+AlwaysPreTouch",
+			"-XX:+DisableExplicitGC",
+			"-XX:MaxInlineLevel=15",
+			"-XX:MaxInlineSize=270",
+		}
+
+	case PresetLegacy:
+		return []string{
+			"-XX:+UseG1GC",
+			"-XX:+ParallelRefProcEnabled",
+			"-XX:MaxGCPauseMillis=200",
+			"-XX:+UnlockExperimentalVMOptions",
+			"-XX:+DisableExplicitGC",
+			"-XX:G1NewSizePercent=20",
+			"-XX:G1MaxNewSizePercent=40",
+			"-XX:G1HeapRegionSize=8M",
+			"-XX:G1ReservePercent=20",
+			"-XX:InitiatingHeapOccupancyPercent=15",
+			"-XX:G1MixedGCLiveThresholdPercent=90",
+			"-XX:G1RSetUpdatingPauseTimePercent=5",
+			"-XX:SurvivorRatio=32",
+			"-XX:MaxTenuringThreshold=1",
+			"-XX:+PerfDisableSharedMem",
+		}
+
+	case PresetLegacyPvP:
+		return []string{
+			"-XX:+UseG1GC",
+			"-XX:MaxGCPauseMillis=15",
+			"-XX:+ParallelRefProcEnabled",
+			"-XX:+UnlockExperimentalVMOptions",
+			"-XX:+DisableExplicitGC",
+			"-XX:G1NewSizePercent=20",
+			"-XX:G1MaxNewSizePercent=40",
+			"-XX:G1HeapRegionSize=4M",
+			"-XX:G1ReservePercent=20",
+			"-XX:InitiatingHeapOccupancyPercent=20",
+			"-XX:G1MixedGCLiveThresholdPercent=85",
+			"-XX:SurvivorRatio=32",
+			"-XX:MaxTenuringThreshold=1",
+			"-XX:+PerfDisableSharedMem",
+		}
+
+	case PresetLegacyHeavy:
+		return []string{
+			"-XX:+UseG1GC",
+			"-XX:+ParallelRefProcEnabled",
+			"-XX:MaxGCPauseMillis=100",
+			"-XX:+UnlockExperimentalVMOptions",
+			"-XX:+DisableExplicitGC",
+			"-XX:G1NewSizePercent=30",
+			"-XX:G1MaxNewSizePercent=50",
+			"-XX:G1HeapRegionSize=32M",
+			"-XX:G1ReservePercent=20",
+			"-XX:G1HeapWastePercent=5",
+			"-XX:G1MixedGCCountTarget=4",
+			"-XX:InitiatingHeapOccupancyPercent=15",
+			"-XX:G1MixedGCLiveThresholdPercent=90",
+			"-XX:G1RSetUpdatingPauseTimePercent=5",
+			"-XX:SurvivorRatio=32",
+			"-XX:MaxTenuringThreshold=1",
+			"-XX:+PerfDisableSharedMem",
+			"-XX:+AlwaysPreTouch",
+		}
+
 	default:
 		return nil
 	}

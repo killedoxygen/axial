@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 
 	"github.com/mateoltd/croopor/internal/minecraft"
+	"github.com/mateoltd/croopor/internal/system"
 )
 
 // resolveVersionStep resolves the version JSON (handles inheritsFrom).
@@ -204,7 +205,16 @@ type applyGCPresetStep struct{}
 func (s *applyGCPresetStep) Name() string { return "apply GC preset" }
 
 func (s *applyGCPresetStep) Execute(ctx *LaunchContext) error {
-	ctx.GCArgs = gcPresetArgs(ctx.Opts.Config.JVMPreset, ctx.JavaMajor)
+	preset := ctx.Opts.Config.JVMPreset
+	if preset == "" {
+		hw := system.Detect()
+		dist := system.JavaDistributionUnknown
+		if ctx.JavaPath != "" {
+			dist = system.DetectJavaDistribution(ctx.JavaPath)
+		}
+		preset = AutoSelectPreset(hw, ctx.JavaMajor, dist)
+	}
+	ctx.GCArgs = gcPresetArgs(preset, ctx.JavaMajor)
 	return nil
 }
 
