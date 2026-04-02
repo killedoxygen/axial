@@ -1,0 +1,147 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-04-02T00:00:00Z",
+  "compositions": [
+    {
+      "id": "family-e-fabric-extended",
+      "display_name": "Family E Fabric Extended",
+      "description": "Full managed composition for 1.16-1.20.1 Fabric",
+      "families": ["E"],
+      "loaders": ["fabric"],
+      "tier": "extended",
+      "fallback_to": "family-e-fabric-core",
+      "mods": [
+        {"project_id": "sodium", "slug": "sodium", "name": "Sodium", "condition": "always"},
+        {"project_id": "lithium", "slug": "lithium", "name": "Lithium", "condition": "always"},
+        {"project_id": "ferrite-core", "slug": "ferrite-core", "name": "FerriteCore", "condition": "always"},
+        {"project_id": "immediatelyfast", "slug": "immediatelyfast", "name": "ImmediatelyFast", "condition": "always"},
+        {"project_id": "dynamic-fps", "slug": "dynamic-fps", "name": "Dynamic FPS", "condition": "always"},
+        {"project_id": "modernfix", "slug": "modernfix", "name": "ModernFix", "condition": "always"},
+        {"project_id": "entityculling", "slug": "entityculling", "name": "EntityCulling", "condition": "always"},
+        {"project_id": "c2me-fabric", "slug": "c2me-fabric", "name": "C2ME", "condition": "always"},
+        {"project_id": "moreculling", "slug": "moreculling", "name": "MoreCulling", "condition": "always"},
+        {"project_id": "krypton", "slug": "krypton", "name": "Krypton", "condition": "always"},
+        {"project_id": "enhancedblockentities", "slug": "enhancedblockentities", "name": "Enhanced Block Entities", "condition": "always"},
+        {"project_id": "memoryleakfix", "slug": "memoryleakfix", "name": "MemoryLeakFix", "condition": "always"},
+        {"project_id": "clumps", "slug": "clumps", "name": "Clumps", "condition": "always"},
+        {"project_id": "lazydfu", "slug": "lazydfu", "name": "LazyDFU", "condition": "version_range", "version_range": ">=1.16 <1.19.4"},
+        {"project_id": "smooth-boot-reloaded", "slug": "smooth-boot-reloaded", "name": "Smooth Boot Reloaded", "condition": "version_range", "version_range": ">=1.16 <1.19.4"},
+        {"project_id": "starlight", "slug": "starlight", "name": "Starlight", "condition": "version_range", "version_range": ">=1.16 <1.19.4"},
+        {"project_id": "nvidium", "slug": "nvidium", "name": "Nvidium", "condition": "hardware", "hardware_req": {"gpu_vendor": "nvidia", "gpu_arch_min": 2}}
+      ]
+    },
+    {
+      "id": "family-e-fabric-core",
+      "display_name": "Family E Fabric Core",
+      "description": "Core managed composition for 1.16-1.20.1 Fabric",
+      "families": ["E"],
+      "loaders": ["fabric"],
+      "tier": "core",
+      "fallback_to": "family-e-vanilla-enhanced",
+      "mods": [
+        {"project_id": "sodium", "slug": "sodium", "name": "Sodium", "condition": "always"},
+        {"project_id": "lithium", "slug": "lithium", "name": "Lithium", "condition": "always"},
+        {"project_id": "ferrite-core", "slug": "ferrite-core", "name": "FerriteCore", "condition": "always"},
+        {"project_id": "immediatelyfast", "slug": "immediatelyfast", "name": "ImmediatelyFast", "condition": "always"},
+        {"project_id": "dynamic-fps", "slug": "dynamic-fps", "name": "Dynamic FPS", "condition": "always"},
+        {"project_id": "modernfix", "slug": "modernfix", "name": "ModernFix", "condition": "always"}
+      ]
+    },
+    {
+      "id": "family-e-vanilla-enhanced",
+      "display_name": "Family E Vanilla Enhanced",
+      "description": "Vanilla-enhanced fallback for 1.16-1.20.1",
+      "families": ["E"],
+      "loaders": ["fabric", "forge", "neoforge", "vanilla"],
+      "tier": "vanilla_enhanced",
+      "mods": []
+    },
+    {
+      "id": "family-e-forge-extended",
+      "display_name": "Family E Forge Extended",
+      "description": "Managed composition for 1.16-1.20.1 Forge and NeoForge",
+      "families": ["E"],
+      "loaders": ["forge", "neoforge"],
+      "tier": "extended",
+      "fallback_to": "family-e-vanilla-enhanced",
+      "mods": [
+        {"project_id": "embeddium", "slug": "embeddium", "name": "Embeddium", "condition": "always"},
+        {"project_id": "ferrite-core", "slug": "ferrite-core", "name": "FerriteCore", "condition": "always"},
+        {"project_id": "entityculling", "slug": "entityculling", "name": "EntityCulling", "condition": "always"},
+        {"project_id": "memoryleakfix", "slug": "memoryleakfix", "name": "MemoryLeakFix", "condition": "always"},
+        {"project_id": "clumps", "slug": "clumps", "name": "Clumps", "condition": "always"}
+      ]
+    },
+    {
+      "id": "family-f-fabric-extended",
+      "display_name": "Family F Fabric Extended",
+      "description": "Full managed composition for 1.20.2+ Fabric",
+      "families": ["F"],
+      "loaders": ["fabric"],
+      "tier": "extended",
+      "fallback_to": "family-f-fabric-core",
+      "mods": [
+        {"project_id": "sodium", "slug": "sodium", "name": "Sodium", "condition": "always"},
+        {"project_id": "lithium", "slug": "lithium", "name": "Lithium", "condition": "always"},
+        {"project_id": "ferrite-core", "slug": "ferrite-core", "name": "FerriteCore", "condition": "always"},
+        {"project_id": "immediatelyfast", "slug": "immediatelyfast", "name": "ImmediatelyFast", "condition": "always"},
+        {"project_id": "dynamic-fps", "slug": "dynamic-fps", "name": "Dynamic FPS", "condition": "always"},
+        {"project_id": "modernfix", "slug": "modernfix", "name": "ModernFix", "condition": "always"},
+        {"project_id": "entityculling", "slug": "entityculling", "name": "EntityCulling", "condition": "always"},
+        {"project_id": "c2me-fabric", "slug": "c2me-fabric", "name": "C2ME", "condition": "always"},
+        {"project_id": "moreculling", "slug": "moreculling", "name": "MoreCulling", "condition": "always"},
+        {"project_id": "krypton", "slug": "krypton", "name": "Krypton", "condition": "always"},
+        {"project_id": "enhancedblockentities", "slug": "enhancedblockentities", "name": "Enhanced Block Entities", "condition": "always"},
+        {"project_id": "memoryleakfix", "slug": "memoryleakfix", "name": "MemoryLeakFix", "condition": "always"},
+        {"project_id": "clumps", "slug": "clumps", "name": "Clumps", "condition": "always"},
+        {"project_id": "scalablelux", "slug": "scalablelux", "name": "ScalableLux", "condition": "always"},
+        {"project_id": "particle-core", "slug": "particle-core", "name": "Particle Core", "condition": "always"},
+        {"project_id": "badoptimizations", "slug": "badoptimizations", "name": "BadOptimizations", "condition": "always"},
+        {"project_id": "nvidium", "slug": "nvidium", "name": "Nvidium", "condition": "hardware", "hardware_req": {"gpu_vendor": "nvidia", "gpu_arch_min": 2}}
+      ]
+    },
+    {
+      "id": "family-f-fabric-core",
+      "display_name": "Family F Fabric Core",
+      "description": "Core managed composition for 1.20.2+ Fabric",
+      "families": ["F"],
+      "loaders": ["fabric"],
+      "tier": "core",
+      "fallback_to": "family-f-vanilla-enhanced",
+      "mods": [
+        {"project_id": "sodium", "slug": "sodium", "name": "Sodium", "condition": "always"},
+        {"project_id": "lithium", "slug": "lithium", "name": "Lithium", "condition": "always"},
+        {"project_id": "ferrite-core", "slug": "ferrite-core", "name": "FerriteCore", "condition": "always"},
+        {"project_id": "immediatelyfast", "slug": "immediatelyfast", "name": "ImmediatelyFast", "condition": "always"},
+        {"project_id": "dynamic-fps", "slug": "dynamic-fps", "name": "Dynamic FPS", "condition": "always"},
+        {"project_id": "modernfix", "slug": "modernfix", "name": "ModernFix", "condition": "always"},
+        {"project_id": "scalablelux", "slug": "scalablelux", "name": "ScalableLux", "condition": "always"}
+      ]
+    },
+    {
+      "id": "family-f-vanilla-enhanced",
+      "display_name": "Family F Vanilla Enhanced",
+      "description": "Vanilla-enhanced fallback for 1.20.2+",
+      "families": ["F"],
+      "loaders": ["fabric", "forge", "neoforge", "vanilla"],
+      "tier": "vanilla_enhanced",
+      "mods": []
+    },
+    {
+      "id": "family-f-forge-extended",
+      "display_name": "Family F Forge Extended",
+      "description": "Managed composition for 1.20.2+ Forge and NeoForge",
+      "families": ["F"],
+      "loaders": ["forge", "neoforge"],
+      "tier": "extended",
+      "fallback_to": "family-f-vanilla-enhanced",
+      "mods": [
+        {"project_id": "embeddium", "slug": "embeddium", "name": "Embeddium", "condition": "always"},
+        {"project_id": "ferrite-core", "slug": "ferrite-core", "name": "FerriteCore", "condition": "always"},
+        {"project_id": "entityculling", "slug": "entityculling", "name": "EntityCulling", "condition": "always"},
+        {"project_id": "memoryleakfix", "slug": "memoryleakfix", "name": "MemoryLeakFix", "condition": "always"},
+        {"project_id": "clumps", "slug": "clumps", "name": "Clumps", "condition": "always"}
+      ]
+    }
+  ]
+}

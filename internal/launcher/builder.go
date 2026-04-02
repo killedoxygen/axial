@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 
+	"github.com/mateoltd/croopor/internal/composition"
 	"github.com/mateoltd/croopor/internal/config"
 	"github.com/mateoltd/croopor/internal/minecraft"
 	"github.com/mateoltd/croopor/internal/system"
@@ -27,15 +28,17 @@ const (
 
 // LaunchOptions holds parameters for launching a version.
 type LaunchOptions struct {
-	VersionID    string
-	InstanceID   string
-	Username     string
-	MaxMemoryMB  int
-	MinMemoryMB  int
-	MCDir        string   // Shared .minecraft (assets, libraries, versions)
-	GameDir      string   // Instance game dir (saves, mods, config). Falls back to MCDir if empty.
-	ExtraJVMArgs []string // Additional JVM args from instance overrides
-	Config       *config.Config
+	VersionID       string
+	InstanceID      string
+	Username        string
+	MaxMemoryMB     int
+	MinMemoryMB     int
+	MCDir           string   // Shared .minecraft (assets, libraries, versions)
+	GameDir         string   // Instance game dir (saves, mods, config). Falls back to MCDir if empty.
+	ExtraJVMArgs    []string // Additional JVM args from instance overrides
+	Loader          string
+	CompositionMode composition.CompositionMode
+	Config          *config.Config
 }
 
 // LaunchResult contains the constructed command and game process.

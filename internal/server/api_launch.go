@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mateoltd/croopor/internal/composition"
 	"github.com/mateoltd/croopor/internal/config"
 	"github.com/mateoltd/croopor/internal/instance"
 	"github.com/mateoltd/croopor/internal/launcher"
@@ -101,15 +102,16 @@ func (s *Server) handleLaunch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result, err := launcher.BuildAndLaunch(launcher.LaunchOptions{
-		VersionID:    inst.VersionID,
-		InstanceID:   inst.ID,
-		Username:     username,
-		MaxMemoryMB:  maxMem,
-		MinMemoryMB:  minMem,
-		MCDir:        mcDir,
-		GameDir:      instance.GameDir(inst.ID),
-		ExtraJVMArgs: extraJVMArgs,
-		Config:       &effectiveConfig,
+		VersionID:       inst.VersionID,
+		InstanceID:      inst.ID,
+		Username:        username,
+		MaxMemoryMB:     maxMem,
+		MinMemoryMB:     minMem,
+		MCDir:           mcDir,
+		GameDir:         instance.GameDir(inst.ID),
+		ExtraJVMArgs:    extraJVMArgs,
+		CompositionMode: composition.ModeManaged,
+		Config:          &effectiveConfig,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())

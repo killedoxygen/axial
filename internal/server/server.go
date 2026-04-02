@@ -12,6 +12,7 @@ import (
 	"github.com/mateoltd/croopor/internal/launcher"
 	"github.com/mateoltd/croopor/internal/minecraft"
 	"github.com/mateoltd/croopor/internal/modloaders"
+	"github.com/mateoltd/croopor/internal/performance"
 	appupdate "github.com/mateoltd/croopor/internal/update"
 )
 
@@ -27,19 +28,20 @@ type updateCacheEntry struct {
 }
 
 type Server struct {
-	mu             sync.RWMutex
-	mcDir          string
-	appVersion     string
-	config         *config.Config
-	instances      *instance.InstanceStore
-	sessions       *SessionManager
-	installs       *InstallManager
-	loaderInstalls *LoaderInstallManager
-	updater        UpdateChecker
-	updateCacheMu  sync.RWMutex
-	updateCache    updateCacheEntry
-	mux            *http.ServeMux
-	frontend       fs.FS
+	mu                 sync.RWMutex
+	mcDir              string
+	appVersion         string
+	config             *config.Config
+	instances          *instance.InstanceStore
+	sessions           *SessionManager
+	installs           *InstallManager
+	loaderInstalls     *LoaderInstallManager
+	updater            UpdateChecker
+	updateCacheMu      sync.RWMutex
+	updateCache        updateCacheEntry
+	mux                *http.ServeMux
+	frontend           fs.FS
+	performanceManager *performance.PerformanceManager
 }
 
 // GetMCDir returns the current Minecraft directory (thread-safe).
@@ -112,6 +114,9 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/v1/loaders/{type}/loader-versions", s.handleLoaderVersions)
 	s.mux.HandleFunc("POST /api/v1/loaders/install", s.handleLoaderInstall)
 	s.mux.HandleFunc("GET /api/v1/loaders/install/{id}/events", s.handleLoaderInstallEvents)
+	s.mux.HandleFunc("GET /api/v1/performance/plan", s.handlePerformancePlan)
+	s.mux.HandleFunc("GET /api/v1/performance/health", s.handlePerformanceHealth)
+	s.mux.HandleFunc("POST /api/v1/performance/install", s.handlePerformanceInstall)
 	registerDevRoutes(s)
 	s.mux.Handle("/", http.FileServer(http.FS(s.frontend)))
 }

@@ -6,8 +6,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strings"
 
+	"github.com/mateoltd/croopor/internal/composition"
 	"github.com/mateoltd/croopor/internal/minecraft"
+	"github.com/mateoltd/croopor/internal/performance"
 	"github.com/mateoltd/croopor/internal/system"
 )
 
@@ -64,6 +68,40 @@ func (s *resolveLibrariesStep) Execute(ctx *LaunchContext) error {
 	ctx.ClientJarPath = findClientJar(ctx.Opts.MCDir, ctx.Version, ctx.Opts.VersionID)
 	ctx.Classpath = minecraft.BuildClasspath(libs, ctx.ClientJarPath)
 	ctx.IsModded = isModdedVersion(ctx.Opts.MCDir, ctx.Opts.VersionID)
+	return nil
+}
+
+// resolveCompositionStep resolves the effective performance plan for this launch.
+type resolveCompositionStep struct {
+	manager *performance.PerformanceManager
+}
+
+func (s *resolveCompositionStep) Name() string { return "resolve composition" }
+
+func (s *resolveCompositionStep) Execute(ctx *LaunchContext) error {
+	if s.manager == nil {
+		return nil
+	}
+	loader := ctx.Opts.Loader
+	if loader == "" {
+		loader = inferLoader(ctx)
+	}
+	mode := ctx.Opts.CompositionMode
+	if mode == "" {
+		mode = composition.ModeManaged
+	}
+	gameDir := ctx.Opts.GameDir
+	if gameDir == "" {
+		gameDir = ctx.Opts.MCDir
+	}
+	req := composition.ResolutionRequest{
+		GameVersion:   extractBaseVersion(ctx.Opts.VersionID),
+		Loader:        loader,
+		Mode:          mode,
+		Hardware:      system.Detect(),
+		InstalledMods: listModIDs(gameDir),
+	}
+	ctx.CompositionPlan = s.manager.GetPlan(req)
 	return nil
 }
 
@@ -219,6 +257,21 @@ func (s *applyGCPresetStep) Execute(ctx *LaunchContext) error {
 	return nil
 }
 
+// applyCompositionJVMStep applies any JVM flags mandated by the composition plan.
+type applyCompositionJVMStep struct{}
+
+func (s *applyCompositionJVMStep) Name() string { return "apply composition JVM" }
+
+func (s *applyCompositionJVMStep) Execute(ctx *LaunchContext) error {
+	if ctx.CompositionPlan == nil || ctx.Opts.Config.JVMPreset != "" {
+		return nil
+	}
+	if ctx.CompositionPlan.JVMPreset != "" {
+		ctx.GCArgs = gcPresetArgs(ctx.CompositionPlan.JVMPreset, ctx.JavaMajor)
+	}
+	return nil
+}
+
 // prefetchStep prefetches key files into OS page cache before JVM starts.
 type prefetchStep struct{}
 
@@ -321,4 +374,54 @@ func (s *scheduleCDSStep) Execute(ctx *LaunchContext) error {
 	}
 
 	return nil
+}
+
+var mcVersionPrefixPattern = regexp.MustCompile(`^\d+\.\d+(?:\.\d+)?$`)
+
+func inferLoader(ctx *LaunchContext) string {
+	versionID := ctx.Opts.VersionID
+	if ctx.Version != nil && ctx.Version.ID != "" {
+		versionID = ctx.Version.ID
+	}
+	versionID = strings.ToLower(versionID)
+	switch {
+	case strings.Contains(versionID, "fabric"):
+		return "fabric"
+	case strings.Contains(versionID, "forge") && strings.Contains(versionID, "neoforge"):
+		return "neoforge"
+	case strings.Contains(versionID, "neoforge"):
+		return "neoforge"
+	case strings.Contains(versionID, "forge"):
+		return "forge"
+	case strings.Contains(versionID, "quilt"):
+		return "quilt"
+	default:
+		return "vanilla"
+	}
+}
+
+func extractBaseVersion(versionID string) string {
+	parts := strings.Split(versionID, "-")
+	if len(parts) == 0 {
+		return versionID
+	}
+	if mcVersionPrefixPattern.MatchString(parts[0]) {
+		return parts[0]
+	}
+	return versionID
+}
+
+func listModIDs(gameDir string) []string {
+	if gameDir == "" {
+		return nil
+	}
+	state, err := performance.LoadState(filepath.Join(gameDir, "mods"))
+	if err != nil || state == nil {
+		return nil
+	}
+	out := make([]string, 0, len(state.InstalledMods))
+	for _, mod := range state.InstalledMods {
+		out = append(out, mod.ProjectID)
+	}
+	return out
 }

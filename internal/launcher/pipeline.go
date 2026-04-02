@@ -5,6 +5,7 @@ import (
 	"log"
 	"os/exec"
 
+	"github.com/mateoltd/croopor/internal/composition"
 	"github.com/mateoltd/croopor/internal/config"
 	"github.com/mateoltd/croopor/internal/minecraft"
 )
@@ -18,17 +19,18 @@ type LaunchContext struct {
 	ConfigDir string
 
 	// Progressive state (set by steps as they execute)
-	Version       *minecraft.VersionJSON
-	Env           minecraft.Environment
-	JavaPath      string
-	JavaMajor     int
-	Libraries     []minecraft.ResolvedLibrary
-	ClientJarPath string
-	Classpath     string
-	NativesDir    string
-	IsModded      bool
-	Vars          *minecraft.LaunchVars
-	GameDir       string
+	Version         *minecraft.VersionJSON
+	Env             minecraft.Environment
+	JavaPath        string
+	JavaMajor       int
+	Libraries       []minecraft.ResolvedLibrary
+	ClientJarPath   string
+	Classpath       string
+	NativesDir      string
+	IsModded        bool
+	Vars            *minecraft.LaunchVars
+	GameDir         string
+	CompositionPlan *composition.CompositionPlan
 
 	// Effective values (computed by steps, used by profiler and downstream)
 	EffectiveMaxMemoryMB int
@@ -84,6 +86,7 @@ func defaultPipeline() []LaunchStep {
 		&setupEnvironmentStep{},
 		&resolveJavaStep{},
 		&resolveLibrariesStep{},
+		&resolveCompositionStep{manager: nil},
 		&extractNativesStep{},
 		&buildLaunchVarsStep{},
 		&resolveArgumentsStep{},
@@ -91,6 +94,7 @@ func defaultPipeline() []LaunchStep {
 		&computeMemoryStep{},
 		&applyBootThrottleStep{},
 		&applyGCPresetStep{},
+		&applyCompositionJVMStep{},
 		&prefetchStep{},
 		&buildCommandStep{},
 		&startProcessStep{},
