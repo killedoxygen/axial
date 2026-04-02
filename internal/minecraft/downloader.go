@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -110,38 +111,79 @@ func (d *Downloader) InstallVersion(versionID, manifestURL string) {
 	// Phase 3: Download libraries (including native classifier JARs)
 	env := DefaultEnvironment()
 	libs := FilterLibraries(version.Libraries, env)
-	totalLibs := len(libs)
 
-	d.send(DownloadProgress{Phase: "libraries", Current: 0, Total: totalLibs})
+	type libJob struct {
+		path string
+		url  string
+		sha1 string
+		name string
+	}
 
-	for i, lib := range libs {
-		// Download main artifact
+	var libJobs []libJob
+	for _, lib := range libs {
 		libPath, libURL, libSHA1 := ResolveLibDownload(lib, d.MCDir)
-		if libPath != "" && libURL != "" {
-			d.send(DownloadProgress{Phase: "libraries", Current: i + 1, Total: totalLibs, File: filepath.Base(libPath)})
-			if !FileExistsWithSHA1(libPath, libSHA1) {
-				if err := os.MkdirAll(filepath.Dir(libPath), 0755); err != nil {
-					d.sendError("Failed to create library directory: " + err.Error())
-					return
-				}
-				if err := d.downloadFile(libURL, libPath, libSHA1); err != nil {
-					d.sendError("Failed to download library: " + err.Error())
-					return
-				}
-			}
+		if libPath != "" && libURL != "" && !FileExistsWithSHA1(libPath, libSHA1) {
+			libJobs = append(libJobs, libJob{path: libPath, url: libURL, sha1: libSHA1, name: filepath.Base(libPath)})
 		}
-
-		// Download native classifier JAR if this library has a natives map
 		natPath, natURL, natSHA1 := resolveNativeDownload(lib, d.MCDir, env)
 		if natPath != "" && natURL != "" && !FileExistsWithSHA1(natPath, natSHA1) {
-			if err := os.MkdirAll(filepath.Dir(natPath), 0755); err != nil {
-				d.sendError("Failed to create native library directory: " + err.Error())
-				return
-			}
-			if err := d.downloadFile(natURL, natPath, natSHA1); err != nil {
-				d.sendError("Failed to download native library: " + err.Error())
-				return
-			}
+			libJobs = append(libJobs, libJob{path: natPath, url: natURL, sha1: natSHA1, name: filepath.Base(natPath)})
+		}
+	}
+
+	totalLibs := len(libJobs)
+	d.send(DownloadProgress{Phase: "libraries", Current: 0, Total: totalLibs})
+
+	if totalLibs > 0 {
+		var libMu sync.Mutex
+		var libCompleted int
+		var libErr error
+		libSem := make(chan struct{}, 4)
+		var libWg sync.WaitGroup
+
+		for _, job := range libJobs {
+			libWg.Add(1)
+			libSem <- struct{}{}
+			go func(j libJob) {
+				defer libWg.Done()
+				defer func() { <-libSem }()
+
+				libMu.Lock()
+				failed := libErr != nil
+				libMu.Unlock()
+				if failed {
+					return
+				}
+
+				if err := os.MkdirAll(filepath.Dir(j.path), 0755); err != nil {
+					libMu.Lock()
+					if libErr == nil {
+						libErr = err
+					}
+					libMu.Unlock()
+					return
+				}
+				if err := d.downloadFile(j.url, j.path, j.sha1); err != nil {
+					libMu.Lock()
+					if libErr == nil {
+						libErr = err
+					}
+					libMu.Unlock()
+					return
+				}
+
+				libMu.Lock()
+				libCompleted++
+				d.send(DownloadProgress{Phase: "libraries", Current: libCompleted, Total: totalLibs, File: j.name})
+				libMu.Unlock()
+			}(job)
+		}
+
+		libWg.Wait()
+
+		if libErr != nil {
+			d.sendError("Failed to download library: " + libErr.Error())
+			return
 		}
 	}
 
@@ -243,23 +285,51 @@ func (d *Downloader) downloadAssetObjects(indexPath string) {
 	}
 
 	objectsDir := filepath.Join(AssetsDir(d.MCDir), "objects")
-	total := len(index.Objects)
-	current := 0
 
+	type assetJob struct {
+		hash string
+		path string
+	}
+
+	var jobs []assetJob
 	for _, obj := range index.Objects {
-		current++
-		if current%100 == 1 || current == total {
-			d.send(DownloadProgress{Phase: "assets", Current: current, Total: total})
-		}
-
 		prefix := obj.Hash[:2]
 		objPath := filepath.Join(objectsDir, prefix, obj.Hash)
 		if FileExistsWithSHA1(objPath, obj.Hash) {
 			continue
 		}
+		jobs = append(jobs, assetJob{hash: obj.Hash, path: objPath})
+	}
 
-		url := "https://resources.download.minecraft.net/" + prefix + "/" + obj.Hash
-		d.downloadFile(url, objPath, obj.Hash) // non-fatal per object
+	total := len(jobs)
+	if total > 0 {
+		var mu sync.Mutex
+		var completed int
+		sem := make(chan struct{}, 8)
+		var wg sync.WaitGroup
+
+		d.send(DownloadProgress{Phase: "assets", Current: 0, Total: total})
+
+		for _, job := range jobs {
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(j assetJob) {
+				defer wg.Done()
+				defer func() { <-sem }()
+
+				url := "https://resources.download.minecraft.net/" + j.hash[:2] + "/" + j.hash
+				d.downloadFile(url, j.path, j.hash) // non-fatal per object
+
+				mu.Lock()
+				completed++
+				if completed%50 == 0 || completed == total {
+					d.send(DownloadProgress{Phase: "assets", Current: completed, Total: total})
+				}
+				mu.Unlock()
+			}(job)
+		}
+
+		wg.Wait()
 	}
 
 	// For legacy/virtual asset indexes (pre-1.6), create the virtual directory

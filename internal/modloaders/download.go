@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/mateoltd/croopor/internal/minecraft"
@@ -28,26 +29,76 @@ func DownloadLibraries(libs []minecraft.Library, mcDir string, progress chan<- P
 		resolvable = append(resolvable, lib)
 	}
 
-	total := len(resolvable)
-	for i, lib := range resolvable {
+	type dlJob struct {
+		path string
+		url  string
+		sha1 string
+		name string
+	}
+
+	var jobs []dlJob
+	for _, lib := range resolvable {
 		libPath, libURL, libSHA1 := minecraft.ResolveLibDownload(lib, mcDir)
+		if !minecraft.FileExistsWithSHA1(libPath, libSHA1) {
+			jobs = append(jobs, dlJob{path: libPath, url: libURL, sha1: libSHA1, name: filepath.Base(libPath)})
+		}
+	}
 
-		progress <- Progress{
-			Phase:   "loader_libraries",
-			Current: i + 1,
-			Total:   total,
-			Detail:  filepath.Base(libPath),
+	total := len(jobs)
+	if total > 0 {
+		var mu sync.Mutex
+		var completed int
+		var dlErr error
+		sem := make(chan struct{}, 4)
+		var wg sync.WaitGroup
+
+		for _, job := range jobs {
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(j dlJob) {
+				defer wg.Done()
+				defer func() { <-sem }()
+
+				mu.Lock()
+				failed := dlErr != nil
+				mu.Unlock()
+				if failed {
+					return
+				}
+
+				if err := os.MkdirAll(filepath.Dir(j.path), 0755); err != nil {
+					mu.Lock()
+					if dlErr == nil {
+						dlErr = err
+					}
+					mu.Unlock()
+					return
+				}
+				if err := minecraft.DownloadFile(DefaultClient, j.url, j.path, j.sha1); err != nil {
+					mu.Lock()
+					if dlErr == nil {
+						dlErr = err
+					}
+					mu.Unlock()
+					return
+				}
+
+				mu.Lock()
+				completed++
+				progress <- Progress{
+					Phase:   "loader_libraries",
+					Current: completed,
+					Total:   total,
+					Detail:  j.name,
+				}
+				mu.Unlock()
+			}(job)
 		}
 
-		if minecraft.FileExistsWithSHA1(libPath, libSHA1) {
-			continue
-		}
+		wg.Wait()
 
-		if err := os.MkdirAll(filepath.Dir(libPath), 0755); err != nil {
-			return err
-		}
-		if err := minecraft.DownloadFile(DefaultClient, libURL, libPath, libSHA1); err != nil {
-			return err
+		if dlErr != nil {
+			return dlErr
 		}
 	}
 	return nil
