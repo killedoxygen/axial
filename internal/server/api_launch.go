@@ -37,24 +37,26 @@ func (s *Server) handleLaunch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Resolve settings: instance overrides > request overrides > global config
+	s.mu.RLock()
 	username := req.Username
 	if username == "" {
 		username = s.config.Username
 	}
-	maxMem := req.MaxMemoryMB
-	if maxMem <= 0 && inst.MaxMemoryMB > 0 {
-		maxMem = inst.MaxMemoryMB
+	maxMem := inst.MaxMemoryMB
+	if maxMem <= 0 && req.MaxMemoryMB > 0 {
+		maxMem = req.MaxMemoryMB
 	}
 	if maxMem <= 0 {
 		maxMem = s.config.MaxMemoryMB
 	}
-	minMem := req.MinMemoryMB
-	if minMem <= 0 && inst.MinMemoryMB > 0 {
-		minMem = inst.MinMemoryMB
+	minMem := inst.MinMemoryMB
+	if minMem <= 0 && req.MinMemoryMB > 0 {
+		minMem = req.MinMemoryMB
 	}
 	if minMem <= 0 {
 		minMem = s.config.MinMemoryMB
 	}
+	s.mu.RUnlock()
 
 	mcDir := s.requireMCDir(w)
 	if mcDir == "" {
@@ -72,7 +74,9 @@ func (s *Server) handleLaunch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Build effective config with instance overrides
+	s.mu.RLock()
 	effectiveConfig := *s.config
+	s.mu.RUnlock()
 	if inst.JavaPath != "" {
 		effectiveConfig.JavaPathOverride = inst.JavaPath
 	}
@@ -115,9 +119,11 @@ func (s *Server) handleLaunch(w http.ResponseWriter, r *http.Request) {
 	s.instances.SetLastInstanceID(inst.ID)
 	instance.Save(s.instances)
 
+	s.mu.Lock()
 	s.config.Username = username
 	s.config.MaxMemoryMB = maxMem
 	config.Save(s.config)
+	s.mu.Unlock()
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":      "launching",

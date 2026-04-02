@@ -16,6 +16,12 @@ var (
 	lastWallNano  int64
 )
 
+// System-wide CPU delta state.
+var (
+	lastSysTotal float64
+	lastSysIdle  float64
+)
+
 func readProcessStats(pid int) processStats {
 	var ps processStats
 
@@ -97,7 +103,7 @@ func readProcessStats(pid int) processStats {
 }
 
 func readSystemStats() (cpuPct float64, freeMemBytes int64) {
-	// /proc/stat for system CPU
+	// /proc/stat for system CPU (delta between samples)
 	data, err := os.ReadFile("/proc/stat")
 	if err == nil {
 		lines := strings.Split(string(data), "\n")
@@ -109,9 +115,16 @@ func readSystemStats() (cpuPct float64, freeMemBytes int64) {
 				system, _ := strconv.ParseFloat(fields[3], 64)
 				idle, _ := strconv.ParseFloat(fields[4], 64)
 				total := user + nice + system + idle
-				if total > 0 {
-					cpuPct = (total - idle) / total * 100.0
+
+				if lastSysTotal > 0 {
+					deltaTotal := total - lastSysTotal
+					deltaIdle := idle - lastSysIdle
+					if deltaTotal > 0 {
+						cpuPct = (deltaTotal - deltaIdle) / deltaTotal * 100.0
+					}
 				}
+				lastSysTotal = total
+				lastSysIdle = idle
 			}
 		}
 	}

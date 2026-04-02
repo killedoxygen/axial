@@ -243,7 +243,8 @@ func (s *InstanceStore) GetLastInstanceID() string {
 	return s.LastInstanceID
 }
 
-// SetLastInstanceID sets the last selected instance ID and persists.
+// SetLastInstanceID sets the last selected instance ID in memory.
+// The caller is responsible for calling Save to persist the change.
 func (s *InstanceStore) SetLastInstanceID(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

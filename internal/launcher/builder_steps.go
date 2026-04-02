@@ -18,7 +18,7 @@ func (s *resolveVersionStep) Name() string { return "resolve version" }
 func (s *resolveVersionStep) Execute(ctx *LaunchContext) error {
 	version, err := minecraft.ResolveVersion(ctx.Opts.MCDir, ctx.Opts.VersionID)
 	if err != nil {
-		return fmt.Errorf("resolving version: %w", err)
+		return err
 	}
 	ctx.Version = version
 	return nil
@@ -57,7 +57,7 @@ func (s *resolveLibrariesStep) Name() string { return "resolve libraries" }
 func (s *resolveLibrariesStep) Execute(ctx *LaunchContext) error {
 	libs, err := minecraft.ResolveLibraries(ctx.Version, ctx.Opts.MCDir, ctx.Env)
 	if err != nil {
-		return fmt.Errorf("resolving libraries: %w", err)
+		return err
 	}
 	ctx.Libraries = libs
 	ctx.ClientJarPath = findClientJar(ctx.Opts.MCDir, ctx.Version, ctx.Opts.VersionID)
@@ -176,6 +176,9 @@ func (s *computeMemoryStep) Execute(ctx *LaunchContext) error {
 	if minMem <= 0 {
 		minMem = 512
 	}
+	if minMem > maxMem {
+		minMem = maxMem
+	}
 	ctx.MemArgs = []string{
 		fmt.Sprintf("-Xmx%dM", maxMem),
 		fmt.Sprintf("-Xms%dM", minMem),
@@ -248,7 +251,7 @@ func (s *startProcessStep) Execute(ctx *LaunchContext) error {
 	gp := NewGameProcess(ctx.Cmd, ctx.NativesDir)
 	if err := gp.Start(); err != nil {
 		CleanupNativesDir(ctx.NativesDir)
-		return fmt.Errorf("starting game process: %w", err)
+		return err
 	}
 	ctx.Process = gp
 	return nil

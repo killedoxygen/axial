@@ -28,8 +28,8 @@ func ExtractInstallerJSONs(jarData []byte) (versionJSON []byte, installProfile [
 			if err != nil {
 				return nil, nil, err
 			}
+			defer rc.Close()
 			versionJSON, err = io.ReadAll(rc)
-			rc.Close()
 			if err != nil {
 				return nil, nil, err
 			}
@@ -38,8 +38,8 @@ func ExtractInstallerJSONs(jarData []byte) (versionJSON []byte, installProfile [
 			if err != nil {
 				return nil, nil, err
 			}
+			defer rc.Close()
 			installProfile, err = io.ReadAll(rc)
-			rc.Close()
 			if err != nil {
 				return nil, nil, err
 			}
@@ -68,9 +68,10 @@ func CollectLibraries(versionJSON, installProfile []byte) ([]minecraft.Library, 
 		var profile struct {
 			Libraries []minecraft.Library `json:"libraries"`
 		}
-		if err := json.Unmarshal(installProfile, &profile); err == nil {
-			libs = append(libs, profile.Libraries...)
+		if err := json.Unmarshal(installProfile, &profile); err != nil {
+			return nil, fmt.Errorf("parsing install_profile.json libraries: %w", err)
 		}
+		libs = append(libs, profile.Libraries...)
 	}
 
 	return libs, nil
@@ -108,12 +109,12 @@ func ExtractDataFiles(jarData []byte, mcDir string) error {
 
 		rc, err := f.Open()
 		if err != nil {
-			continue
+			return fmt.Errorf("opening installer entry %s: %w", f.Name, err)
 		}
 		data, err := io.ReadAll(rc)
 		rc.Close()
 		if err != nil {
-			continue
+			return fmt.Errorf("reading installer entry %s: %w", f.Name, err)
 		}
 
 		if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {

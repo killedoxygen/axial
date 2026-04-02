@@ -96,7 +96,9 @@ func RunProcessors(mcDir, mcVersion, versionID string, installProfileData, insta
 
 	total := len(clientProcessors)
 	for i, proc := range clientProcessors {
-		progress(i+1, total, fmt.Sprintf("Processor %d/%d", i+1, total))
+		if progress != nil {
+			progress(i+1, total, fmt.Sprintf("Processor %d/%d", i+1, total))
+		}
 
 		if err := runProcessor(javaPath, proc, libPaths, dataVars, libDir); err != nil {
 			return fmt.Errorf("processor %d/%d failed: %w", i+1, total, err)

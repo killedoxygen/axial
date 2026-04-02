@@ -270,17 +270,6 @@ func (s *Server) handleDeleteVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Block deletion if the version is currently running
-	s.sessions.mu.RLock()
-	for _, sess := range s.sessions.sessions {
-		if sess.VersionID == versionID && sess.Process.GetState() == launcher.StateRunning {
-			s.sessions.mu.RUnlock()
-			writeError(w, http.StatusConflict, "cannot delete a running version — stop the game first")
-			return
-		}
-	}
-	s.sessions.mu.RUnlock()
-
 	var req struct {
 		CascadeDependents bool `json:"cascade_dependents"`
 	}
@@ -295,18 +284,45 @@ func (s *Server) handleDeleteVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	deleted := []string{}
-
-	// If cascade, delete dependents first
+	// Collect all version IDs that will be deleted
+	toDelete := []string{versionID}
 	if req.CascadeDependents {
 		allVersions, _ := minecraft.ScanVersions(mcDir)
 		for _, v := range allVersions {
 			if v.InheritsFrom == versionID {
-				depDir := filepath.Join(minecraft.VersionsDir(mcDir), v.ID)
-				if err := os.RemoveAll(depDir); err == nil {
-					deleted = append(deleted, v.ID)
-					log.Printf("Deleted dependent version: %s", v.ID)
-				}
+				toDelete = append(toDelete, v.ID)
+			}
+		}
+	}
+
+	// Block deletion if any of the target versions is currently running
+	s.sessions.mu.RLock()
+	for _, sess := range s.sessions.sessions {
+		if sess.Process.GetState() != launcher.StateRunning {
+			continue
+		}
+		for _, id := range toDelete {
+			if sess.VersionID == id {
+				s.sessions.mu.RUnlock()
+				writeError(w, http.StatusConflict, "cannot delete version "+id+" — stop the game first")
+				return
+			}
+		}
+	}
+	s.sessions.mu.RUnlock()
+
+	deleted := []string{}
+
+	// If cascade, delete dependents first
+	if req.CascadeDependents {
+		for _, id := range toDelete {
+			if id == versionID {
+				continue // parent is deleted below
+			}
+			depDir := filepath.Join(minecraft.VersionsDir(mcDir), id)
+			if err := os.RemoveAll(depDir); err == nil {
+				deleted = append(deleted, id)
+				log.Printf("Deleted dependent version: %s", id)
 			}
 		}
 	}

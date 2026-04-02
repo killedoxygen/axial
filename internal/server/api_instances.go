@@ -268,11 +268,5 @@ func countEntries(dir string) int {
 	if err != nil {
 		return 0
 	}
-	count := 0
-	for _, e := range entries {
-		if e.Name() != "." && e.Name() != ".." {
-			count++
-		}
-	}
-	return count
+	return len(entries)
 }

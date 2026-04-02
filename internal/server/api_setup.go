@@ -14,7 +14,10 @@ import (
 )
 
 func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, s.config)
+	s.mu.RLock()
+	cfg := *s.config
+	s.mu.RUnlock()
+	writeJSON(w, http.StatusOK, &cfg)
 }
 
 func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
@@ -23,6 +26,9 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	if v, ok := updates["username"].(string); ok && v != "" {
 		s.config.Username = v
@@ -91,6 +97,9 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleOnboardingComplete(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	s.config.OnboardingDone = true
 	if err := config.Save(s.config); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to save: "+err.Error())
@@ -139,11 +148,17 @@ func (s *Server) handleSetupSetDir(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid minecraft installation: "+err.Error())
 		return
 	}
-	s.SetMCDir(req.Path)
+	s.mu.Lock()
+	s.mcDir = req.Path
 	s.config.MCDir = req.Path
 	if err := config.Save(s.config); err != nil {
-		log.Printf("Warning: failed to save config: %v", err)
+		s.config.MCDir = ""
+		s.mcDir = ""
+		s.mu.Unlock()
+		writeError(w, http.StatusInternalServerError, "failed to save config: "+err.Error())
+		return
 	}
+	s.mu.Unlock()
 	// Ensure launcher_profiles.json exists for mod loader compatibility
 	minecraft.EnsureLauncherProfiles(req.Path, "")
 	log.Printf("Minecraft directory set to: %s", req.Path)
@@ -171,11 +186,17 @@ func (s *Server) handleSetupInit(w http.ResponseWriter, r *http.Request) {
 	}
 	// Create launcher_profiles.json for mod loader compatibility
 	minecraft.EnsureLauncherProfiles(req.Path, "")
-	s.SetMCDir(req.Path)
+	s.mu.Lock()
+	s.mcDir = req.Path
 	s.config.MCDir = req.Path
 	if err := config.Save(s.config); err != nil {
-		log.Printf("Warning: failed to save config: %v", err)
+		s.config.MCDir = ""
+		s.mcDir = ""
+		s.mu.Unlock()
+		writeError(w, http.StatusInternalServerError, "failed to save config: "+err.Error())
+		return
 	}
+	s.mu.Unlock()
 	log.Printf("Created new Minecraft directory at: %s", req.Path)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "mc_dir": req.Path})
 }

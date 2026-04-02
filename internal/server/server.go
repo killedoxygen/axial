@@ -49,13 +49,6 @@ func (s *Server) GetMCDir() string {
 	return s.mcDir
 }
 
-// SetMCDir updates the Minecraft directory (thread-safe).
-func (s *Server) SetMCDir(dir string) {
-	s.mu.Lock()
-	s.mcDir = dir
-	s.mu.Unlock()
-}
-
 func NewServer(mcDir string, appVersion string, cfg *config.Config, instances *instance.InstanceStore, frontend fs.FS, updater UpdateChecker) *Server {
 	s := &Server{
 		mcDir:          mcDir,
