@@ -190,7 +190,7 @@ func (f *forgeLoader) Install(mcDir, mcVersion, loaderVersion string, progress c
 
 		progress <- Progress{Phase: "loader_json", Current: 0, Total: 1, Detail: "Extracting installer..."}
 
-		versionJSON, installProfile, err := extractForgeInstaller(installerData)
+		versionJSON, installProfile, err := extractInstallerJSONs(installerData)
 		if err != nil {
 			return nil, fmt.Errorf("extracting Forge installer: %w", err)
 		}
@@ -354,45 +354,6 @@ func extractForgeVersion(mavenVersion string) string {
 		return ""
 	}
 	return mavenVersion[idx+1:]
-}
-
-// extractForgeInstaller reads version.json and install_profile.json from the installer JAR.
-func extractForgeInstaller(jarData []byte) (versionJSON []byte, installProfile []byte, err error) {
-	r, err := zip.NewReader(bytes.NewReader(jarData), int64(len(jarData)))
-	if err != nil {
-		return nil, nil, fmt.Errorf("opening installer JAR: %w", err)
-	}
-
-	for _, f := range r.File {
-		switch f.Name {
-		case "version.json":
-			rc, err := f.Open()
-			if err != nil {
-				return nil, nil, err
-			}
-			versionJSON, err = io.ReadAll(rc)
-			rc.Close()
-			if err != nil {
-				return nil, nil, err
-			}
-		case "install_profile.json":
-			rc, err := f.Open()
-			if err != nil {
-				return nil, nil, err
-			}
-			installProfile, err = io.ReadAll(rc)
-			rc.Close()
-			if err != nil {
-				return nil, nil, err
-			}
-		}
-	}
-
-	if versionJSON == nil {
-		return nil, nil, fmt.Errorf("version.json not found in installer JAR")
-	}
-
-	return versionJSON, installProfile, nil
 }
 
 // collectForgeLibraries gathers libraries from both version.json and install_profile.json.
