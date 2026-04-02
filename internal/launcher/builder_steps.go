@@ -51,6 +51,17 @@ func (s *resolveJavaStep) Execute(ctx *LaunchContext) error {
 	}
 	ctx.JavaPath = javaResult.Path
 	ctx.JavaMajor = ctx.Version.JavaVersion.MajorVersion
+
+	info := system.DetectJavaRuntimeInfo(ctx.JavaPath)
+	if info.Major > 0 {
+		ctx.JavaMajor = info.Major
+	}
+
+	baseVersion := extractBaseVersion(ctx.Opts.VersionID)
+	family := composition.ClassifyVersion(baseVersion)
+	if err := validateJavaForLaunch(family, info); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -209,11 +220,11 @@ func (s *computeMemoryStep) Name() string { return "compute memory" }
 func (s *computeMemoryStep) Execute(ctx *LaunchContext) error {
 	maxMem := ctx.Opts.MaxMemoryMB
 	if maxMem <= 0 {
-		maxMem = 4096
+		_, maxMem = recommendedMemoryForLaunch(extractBaseVersion(ctx.Opts.VersionID), ctx.IsModded, system.Detect())
 	}
 	minMem := ctx.Opts.MinMemoryMB
 	if minMem <= 0 {
-		minMem = 512
+		minMem, _ = recommendedMemoryForLaunch(extractBaseVersion(ctx.Opts.VersionID), ctx.IsModded, system.Detect())
 	}
 	if minMem > maxMem {
 		minMem = maxMem
@@ -424,4 +435,88 @@ func listModIDs(gameDir string) []string {
 		out = append(out, mod.ProjectID)
 	}
 	return out
+}
+
+func validateJavaForLaunch(family composition.VersionFamily, info system.JavaRuntimeInfo) error {
+	if info.Major == 0 {
+		return nil
+	}
+
+	switch family {
+	case composition.FamilyB, composition.FamilyC:
+		if info.Major >= 9 && info.Major <= 15 {
+			return fmt.Errorf("Java %d is not supported for legacy Minecraft versions; use Java 8 or Java 17+", info.Major)
+		}
+		if info.Major == 8 && info.Update > 0 && info.Update < 312 {
+			return fmt.Errorf("Java 8 update %d is too old for legacy Minecraft support; use Java 8u312 or newer", info.Update)
+		}
+	}
+	return nil
+}
+
+func recommendedMemoryForLaunch(versionID string, isModded bool, hw system.HardwareProfile) (minMem, maxMem int) {
+	totalMB := hw.TotalRAMMB
+	if totalMB <= 0 {
+		totalMB = 8192
+	}
+	baseMin, baseMax := system.RecommendedMemoryRange(totalMB)
+	family := composition.ClassifyVersion(versionID)
+
+	switch family {
+	case composition.FamilyA, composition.FamilyB:
+		minMem = 1024
+		if hw.Tier == system.HardwareTierLow {
+			minMem = 768
+		}
+		maxMem = minInt(baseMax, 2048)
+	case composition.FamilyC:
+		minMem = 1024
+		if hw.Tier != system.HardwareTierLow {
+			minMem = 1536
+		}
+		maxMem = minInt(baseMax, 4096)
+		if isModded && hw.Tier == system.HardwareTierHigh {
+			maxMem = minInt(baseMax, 6144)
+		}
+	case composition.FamilyD:
+		minMem = 1536
+		if hw.Tier != system.HardwareTierLow {
+			minMem = 2048
+		}
+		maxMem = minInt(baseMax, 6144)
+	default:
+		minMem = maxInt(baseMin, 2048)
+		maxMem = baseMax
+		if isModded && hw.Tier == system.HardwareTierHigh {
+			maxMem = maxInt(maxMem, 6144)
+		}
+	}
+
+	if maxMem > totalMB-2048 {
+		maxMem = totalMB - 2048
+	}
+	if maxMem < 1024 {
+		maxMem = 1024
+	}
+	if minMem > maxMem {
+		minMem = maxMem
+	}
+	if minMem < 512 {
+		minMem = 512
+	}
+	return minMem, maxMem
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

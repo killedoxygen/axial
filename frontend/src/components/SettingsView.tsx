@@ -6,7 +6,7 @@ import { Music, musicStateVersion } from '../music';
 import { Sound, playSliderSound } from '../sound';
 import { applyTheme, findFixedLightness, initColorField, isLowContrastTheme } from '../theme';
 import {
-  settingsJavaPath, settingsJavaRuntimes, settingsJavaRuntimesState, settingsJvmPreset,
+  settingsJavaPath, settingsJavaRuntimes, settingsJavaRuntimesState, settingsJvmPreset, settingsPerformanceMode,
   settingsWindowHeight, settingsWindowWidth,
 } from '../settings';
 import { recordingShortcut, resetShortcut, Shortcuts, startRecording } from '../shortcuts';
@@ -21,19 +21,60 @@ const THEME_SWATCHS = [
 ] as const;
 
 const JVM_PRESETS = [
-  { value: '', label: 'Default', hint: null, tip: null },
   {
-    value: 'aikar',
-    label: "Aikar's Flags",
-    hint: '(optimized G1GC)',
-    tip: 'Widely used in the MC community for better GC performance.',
+    value: '',
+    label: 'Default',
+    hint: '(auto-select)',
+    tip: 'Croopor chooses the best preset based on detected hardware, Java version, and JVM vendor.',
   },
   {
-    value: 'zgc',
-    label: 'ZGC Low-Latency',
-    hint: '(Java 17+)',
-    tip: 'Eliminates GC pauses but requires Java 17 or newer. You will still be able to launch older versions, but you will not benefit from the setting on them.',
+    value: 'smooth',
+    label: 'Smooth',
+    hint: '(Shenandoah)',
+    tip: 'Default for modern Java runtimes. Prioritizes low GC pauses and smooth frame pacing.',
   },
+  {
+    value: 'performance',
+    label: 'Performance',
+    hint: '(tuned G1GC)',
+    tip: 'Favors throughput on systems where Shenandoah is unavailable or not ideal.',
+  },
+  {
+    value: 'ultra_low_latency',
+    label: 'Ultra Low Latency',
+    hint: '(Java 21+ ZGC)',
+    tip: 'Uses Generational ZGC for the lowest pause times on newer Java and stronger hardware.',
+  },
+  {
+    value: 'graalvm',
+    label: 'GraalVM',
+    hint: '(JVMCI)',
+    tip: 'Applies GraalVM-specific tuning when you want to force that runtime profile manually.',
+  },
+  {
+    value: 'legacy',
+    label: 'Legacy',
+    hint: '(Java 8 safe)',
+    tip: 'Conservative G1GC tuning for older Minecraft versions and Java 8 runtimes.',
+  },
+  {
+    value: 'legacy_pvp',
+    label: 'Legacy PvP',
+    hint: '(1.8.9 focused)',
+    tip: 'Lower-pause Java 8 profile aimed at competitive older-version play.',
+  },
+  {
+    value: 'legacy_heavy',
+    label: 'Legacy Heavy',
+    hint: '(large modpacks)',
+    tip: 'Java 8 tuning for heavier legacy modpacks that need larger heap behavior.',
+  },
+] as const;
+
+const PERFORMANCE_MODES = [
+  { value: 'managed', label: 'Managed', tip: 'Croopor resolves and installs the managed performance stack automatically.' },
+  { value: 'vanilla', label: 'Vanilla', tip: 'Disables the managed stack while keeping the regular launcher path.' },
+  { value: 'custom', label: 'Custom', tip: 'Leaves mod management to you while still showing performance state.' },
 ] as const;
 
 function markerStyle(): JSX.CSSProperties {
@@ -225,7 +266,7 @@ export function SettingsView(): JSX.Element {
         <section class="settings-section-card" id="settings-section-launch">
           <div class="settings-section-head">
             <span class="settings-section-kicker">Launch</span>
-            <h3 class="settings-section-title">Window defaults</h3>
+            <h3 class="settings-section-title">Window defaults and performance</h3>
           </div>
 
           <div class="setting-row">
@@ -255,6 +296,23 @@ export function SettingsView(): JSX.Element {
             </div>
           </div>
           <p class="setting-hint">Leave these empty to let Minecraft choose its own size on launch.</p>
+
+          <div class="setting-group">
+            <label class="setting-label">Performance Mode</label>
+            <select
+              class="ni-loader-select"
+              autocomplete="off"
+              value={settingsPerformanceMode.value}
+              onChange={(e) => { settingsPerformanceMode.value = (e.currentTarget as HTMLSelectElement).value; }}
+            >
+              {PERFORMANCE_MODES.map((mode) => (
+                <option key={mode.value} value={mode.value}>{mode.label}</option>
+              ))}
+            </select>
+            <p class="setting-hint">
+              {PERFORMANCE_MODES.find((mode) => mode.value === settingsPerformanceMode.value)?.tip}
+            </p>
+          </div>
         </section>
 
         <section class="settings-section-card" id="settings-section-java">
@@ -310,6 +368,7 @@ export function SettingsView(): JSX.Element {
                 </label>
               ))}
             </div>
+            <p class="setting-hint">Default mode auto-selects between modern, GraalVM, and legacy profiles based on your runtime and hardware.</p>
           </div>
         </section>
 

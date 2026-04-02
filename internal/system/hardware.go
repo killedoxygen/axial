@@ -5,7 +5,9 @@ import (
 	"context"
 	"log"
 	"os/exec"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -76,11 +78,21 @@ type HardwareProfile struct {
 	Tier       HardwareTier
 }
 
+// JavaRuntimeInfo describes the detected runtime behind a java binary path.
+type JavaRuntimeInfo struct {
+	Distribution JavaDistribution
+	Major        int
+	Update       int
+	Version      string
+}
+
 var (
 	hwOnce    sync.Once
 	hwCached  HardwareProfile
-	javaCache sync.Map // map[string]JavaDistribution
+	javaCache sync.Map // map[string]JavaRuntimeInfo
 )
+
+var javaVersionPattern = regexp.MustCompile(`(?i)(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:[_\.](\d+))?`)
 
 // nvidiaArchTable maps model name substrings to NVIDIA microarchitecture.
 // Checked in order; first match wins.
@@ -180,16 +192,22 @@ func detect() HardwareProfile {
 // DetectJavaDistribution identifies the JVM vendor for the given java binary.
 // Results are cached per javaPath. On error, returns JavaDistributionUnknown.
 func DetectJavaDistribution(javaPath string) JavaDistribution {
-	if cached, ok := javaCache.Load(javaPath); ok {
-		return cached.(JavaDistribution)
-	}
-
-	dist := detectJavaDistribution(javaPath)
-	javaCache.Store(javaPath, dist)
-	return dist
+	return DetectJavaRuntimeInfo(javaPath).Distribution
 }
 
-func detectJavaDistribution(javaPath string) JavaDistribution {
+// DetectJavaRuntimeInfo identifies the JVM vendor and version details for the given java binary.
+// Results are cached per javaPath. On error, returns conservative defaults.
+func DetectJavaRuntimeInfo(javaPath string) JavaRuntimeInfo {
+	if cached, ok := javaCache.Load(javaPath); ok {
+		return cached.(JavaRuntimeInfo)
+	}
+
+	info := detectJavaRuntimeInfo(javaPath)
+	javaCache.Store(javaPath, info)
+	return info
+}
+
+func detectJavaRuntimeInfo(javaPath string) JavaRuntimeInfo {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
@@ -201,9 +219,10 @@ func detectJavaDistribution(javaPath string) JavaDistribution {
 		} else {
 			log.Printf("hardware detect: failed to run java for distribution detection: %v", err)
 		}
-		return JavaDistributionUnknown
+		return JavaRuntimeInfo{Distribution: JavaDistributionUnknown}
 	}
 
+	info := JavaRuntimeInfo{Distribution: JavaDistributionUnknown}
 	scanner := bufio.NewScanner(strings.NewReader(string(out)))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -216,16 +235,72 @@ func detectJavaDistribution(javaPath string) JavaDistribution {
 			upper := strings.ToUpper(vendor)
 			switch {
 			case strings.Contains(upper, "GRAALVM"):
-				return JavaDistributionGraalVM
+				info.Distribution = JavaDistributionGraalVM
 			case strings.Contains(upper, "TEMURIN") || strings.Contains(upper, "ECLIPSE"):
-				return JavaDistributionTemurin
+				info.Distribution = JavaDistributionTemurin
 			case strings.Contains(upper, "ORACLE"):
-				return JavaDistributionOracle
+				info.Distribution = JavaDistributionOracle
 			default:
-				return JavaDistributionOpenJDK
+				info.Distribution = JavaDistributionOpenJDK
+			}
+			continue
+		}
+		if (strings.HasPrefix(line, "java.version") || strings.HasPrefix(line, "java.runtime.version")) && strings.Contains(line, "=") {
+			parts := strings.SplitN(line, "=", 2)
+			if len(parts) < 2 {
+				continue
+			}
+			version := strings.TrimSpace(parts[1])
+			if info.Version == "" {
+				info.Version = version
+			}
+			major, update := parseJavaVersion(version)
+			if major > 0 {
+				info.Major = major
+			}
+			if update > 0 {
+				info.Update = update
 			}
 		}
 	}
 
-	return JavaDistributionUnknown
+	return info
+}
+
+func parseJavaVersion(version string) (major int, update int) {
+	version = strings.Trim(version, `"`)
+	match := javaVersionPattern.FindStringSubmatch(version)
+	if match == nil {
+		return 0, 0
+	}
+
+	parts := make([]int, 0, 4)
+	for _, raw := range match[1:] {
+		if raw == "" {
+			continue
+		}
+		n, err := strconv.Atoi(raw)
+		if err != nil {
+			continue
+		}
+		parts = append(parts, n)
+	}
+	if len(parts) == 0 {
+		return 0, 0
+	}
+	if parts[0] == 1 && len(parts) >= 2 {
+		major = parts[1]
+		if len(parts) >= 4 {
+			update = parts[3]
+		} else if len(parts) >= 3 {
+			update = parts[2]
+		}
+		return major, update
+	}
+
+	major = parts[0]
+	if major == 8 && len(parts) >= 4 {
+		update = parts[3]
+	}
+	return major, update
 }

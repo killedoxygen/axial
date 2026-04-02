@@ -22,6 +22,14 @@ function badgeInfo(version: Version | null, versionType: string): { cls: string;
 }
 
 function jvmPresetLabel(preset: string): string | null {
+  if (preset === '') return 'Auto JVM';
+  if (preset === 'smooth') return 'Smooth GC';
+  if (preset === 'performance') return 'Performance GC';
+  if (preset === 'ultra_low_latency') return 'Ultra Low Latency';
+  if (preset === 'graalvm') return 'GraalVM';
+  if (preset === 'legacy') return 'Legacy GC';
+  if (preset === 'legacy_pvp') return 'Legacy PvP GC';
+  if (preset === 'legacy_heavy') return 'Legacy Heavy GC';
   if (preset === 'aikar') return "Aikar's Flags";
   if (preset === 'zgc') return 'ZGC';
   return null;
