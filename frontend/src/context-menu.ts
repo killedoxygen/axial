@@ -6,6 +6,19 @@ import { showConfirm, showPrompt } from './dialogs';
 import { removeInstance, updateInstanceInList } from './actions';
 import { instances } from './store';
 
+function positionAtCursor(menu: HTMLElement, e: MouseEvent): void {
+  const mw = menu.offsetWidth || 180;
+  const mh = menu.offsetHeight || 120;
+  let x = e.clientX;
+  let y = e.clientY;
+  if (x + mw > window.innerWidth - 8) x = window.innerWidth - mw - 8;
+  if (y + mh > window.innerHeight - 8) y = window.innerHeight - mh - 8;
+  if (x < 4) x = 4;
+  if (y < 4) y = 4;
+  menu.style.left = x + 'px';
+  menu.style.top = y + 'px';
+}
+
 let ctxMenuVersion: Record<string, any> | null = null;
 
 export function showInstanceContextMenu(e: MouseEvent, inst: Record<string, any>): void {
@@ -14,16 +27,7 @@ export function showInstanceContextMenu(e: MouseEvent, inst: Record<string, any>
   const menu = document.getElementById('ctx-menu');
   if (!menu) return;
   menu.classList.remove('hidden');
-  const mw: number = menu.offsetWidth || 180;
-  const mh: number = menu.offsetHeight || 120;
-  let x: number = e.clientX;
-  let y: number = e.clientY;
-  if (x + mw > window.innerWidth - 8) x = window.innerWidth - mw - 8;
-  if (y + mh > window.innerHeight - 8) y = window.innerHeight - mh - 8;
-  if (x < 4) x = 4;
-  if (y < 4) y = 4;
-  menu.style.left = x + 'px';
-  menu.style.top = y + 'px';
+  positionAtCursor(menu, e);
   Sound.ui('soft');
 }
 
@@ -33,19 +37,7 @@ export function showContextMenu(e: MouseEvent, version: Record<string, any>): vo
   const menu = document.getElementById('ctx-menu');
   if (!menu) return;
   menu.classList.remove('hidden');
-
-  // Position: appear at cursor, but clamp to viewport
-  const mw: number = menu.offsetWidth || 180;
-  const mh: number = menu.offsetHeight || 120;
-  let x: number = e.clientX;
-  let y: number = e.clientY;
-  if (x + mw > window.innerWidth - 8) x = window.innerWidth - mw - 8;
-  if (y + mh > window.innerHeight - 8) y = window.innerHeight - mh - 8;
-  if (x < 4) x = 4;
-  if (y < 4) y = 4;
-  menu.style.left = x + 'px';
-  menu.style.top = y + 'px';
-
+  positionAtCursor(menu, e);
   Sound.ui('soft');
 }
 
