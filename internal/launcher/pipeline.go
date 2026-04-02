@@ -8,6 +8,7 @@ import (
 	"github.com/mateoltd/croopor/internal/composition"
 	"github.com/mateoltd/croopor/internal/config"
 	"github.com/mateoltd/croopor/internal/minecraft"
+	"github.com/mateoltd/croopor/internal/performance"
 )
 
 // LaunchContext carries state through the launch pipeline.
@@ -80,13 +81,13 @@ func (b *bestEffort) Execute(ctx *LaunchContext) error {
 }
 
 // defaultPipeline returns the standard launch pipeline.
-func defaultPipeline() []LaunchStep {
+func defaultPipeline(manager *performance.PerformanceManager) []LaunchStep {
 	return []LaunchStep{
 		&resolveVersionStep{},
 		&setupEnvironmentStep{},
 		&resolveJavaStep{},
 		&resolveLibrariesStep{},
-		&resolveCompositionStep{manager: nil},
+		&resolveCompositionStep{manager: manager},
 		&extractNativesStep{},
 		&buildLaunchVarsStep{},
 		&resolveArgumentsStep{},

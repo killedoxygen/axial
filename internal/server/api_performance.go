@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/mateoltd/croopor/internal/composition"
+	"github.com/mateoltd/croopor/internal/config"
 	"github.com/mateoltd/croopor/internal/instance"
 	"github.com/mateoltd/croopor/internal/performance"
 	"github.com/mateoltd/croopor/internal/system"
@@ -25,7 +26,7 @@ func (s *Server) handlePerformancePlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mode := parseCompositionMode(r.URL.Query().Get("mode"))
+	mode := resolveConfigPerformanceMode(s.config, r.URL.Query().Get("mode"))
 	plan := s.performanceManager.GetPlan(composition.ResolutionRequest{
 		GameVersion: gameVersion,
 		Loader:      strings.TrimSpace(r.URL.Query().Get("loader")),
@@ -55,15 +56,28 @@ func (s *Server) handlePerformanceHealth(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	effectiveMode := resolveInstancePerformanceMode(s.config, inst, "")
 	var plan *composition.CompositionPlan
 	if s.performanceManager != nil {
 		plan = s.performanceManager.GetPlan(composition.ResolutionRequest{
 			GameVersion:   extractServerBaseVersion(inst.VersionID),
 			Loader:        inferLoaderFromVersionID(inst.VersionID),
-			Mode:          composition.ModeManaged,
+			Mode:          effectiveMode,
 			Hardware:      system.Detect(),
 			InstalledMods: installedModIDsFromState(state),
 		})
+	}
+
+	if effectiveMode != composition.ModeManaged {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"active":          s.performanceManager != nil,
+			"health":          performance.HealthDisabled,
+			"composition_id":  "",
+			"tier":            "",
+			"installed_count": 0,
+			"warnings":        []string(nil),
+		})
+		return
 	}
 
 	health, warnings := performance.DeriveHealth(state, plan, modsDir)
@@ -115,17 +129,24 @@ func (s *Server) handlePerformanceInstall(w http.ResponseWriter, r *http.Request
 	if req.Loader == "" {
 		req.Loader = inferLoaderFromVersionID(inst.VersionID)
 	}
+	mode := resolveInstancePerformanceMode(s.config, inst, req.Mode)
 
 	plan := s.performanceManager.GetPlan(composition.ResolutionRequest{
 		GameVersion:   req.GameVersion,
 		Loader:        req.Loader,
-		Mode:          parseCompositionMode(req.Mode),
+		Mode:          mode,
 		Hardware:      system.Detect(),
 		InstalledMods: nil,
 	})
 
 	modsDir := filepath.Join(instance.GameDir(inst.ID), "mods")
 	go func() {
+		if mode != composition.ModeManaged {
+			if err := s.performanceManager.RemoveManaged(modsDir); err != nil {
+				log.Printf("performance cleanup failed for instance %s: %v", inst.ID, err)
+			}
+			return
+		}
 		if _, err := s.performanceManager.EnsureInstalled(context.Background(), plan, req.GameVersion, modsDir); err != nil {
 			log.Printf("performance install failed for instance %s: %v", inst.ID, err)
 		}
@@ -145,6 +166,44 @@ func parseCompositionMode(raw string) composition.CompositionMode {
 	default:
 		return composition.ModeManaged
 	}
+}
+
+func normalizeConfigPerformanceMode(raw string) string {
+	return string(resolveConfigPerformanceMode(nil, raw))
+}
+
+func normalizeInstancePerformanceMode(raw string) string {
+	raw = strings.ToLower(strings.TrimSpace(raw))
+	switch raw {
+	case "":
+		return ""
+	case string(composition.ModeManaged), string(composition.ModeVanilla), string(composition.ModeCustom):
+		return raw
+	default:
+		return ""
+	}
+}
+
+func resolveConfigPerformanceMode(cfg *config.Config, raw string) composition.CompositionMode {
+	mode := strings.ToLower(strings.TrimSpace(raw))
+	if mode != "" {
+		return parseCompositionMode(mode)
+	}
+	if cfg != nil {
+		return parseCompositionMode(cfg.PerformanceMode)
+	}
+	return composition.ModeManaged
+}
+
+func resolveInstancePerformanceMode(cfg *config.Config, inst *instance.Instance, raw string) composition.CompositionMode {
+	mode := strings.ToLower(strings.TrimSpace(raw))
+	if mode != "" {
+		return parseCompositionMode(mode)
+	}
+	if inst != nil && inst.PerformanceMode != "" {
+		return parseCompositionMode(inst.PerformanceMode)
+	}
+	return resolveConfigPerformanceMode(cfg, "")
 }
 
 func inferLoaderFromVersionID(versionID string) string {

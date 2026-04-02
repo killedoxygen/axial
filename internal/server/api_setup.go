@@ -54,6 +54,9 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	if v, ok := updates["jvm_preset"].(string); ok {
 		s.config.JVMPreset = v
 	}
+	if v, ok := updates["performance_mode"].(string); ok {
+		s.config.PerformanceMode = normalizeConfigPerformanceMode(v)
+	}
 	if v, ok := updates["theme"].(string); ok {
 		s.config.Theme = v
 	}

@@ -12,6 +12,7 @@ export interface Instance {
   window_width?: number;
   window_height?: number;
   jvm_preset?: string;
+  performance_mode?: string;
   extra_jvm_args?: string;
 }
 
@@ -50,6 +51,7 @@ export interface Config {
   window_width?: number;
   window_height?: number;
   jvm_preset?: string;
+  performance_mode?: string;
   theme?: string;
   custom_hue?: number;
   custom_vibrancy?: number;

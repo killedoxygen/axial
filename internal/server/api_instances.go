@@ -146,6 +146,9 @@ func (s *Server) handleUpdateInstance(w http.ResponseWriter, r *http.Request) {
 	if v, ok := updates["jvm_preset"].(string); ok {
 		inst.JVMPreset = v
 	}
+	if v, ok := updates["performance_mode"].(string); ok {
+		inst.PerformanceMode = normalizeInstancePerformanceMode(v)
+	}
 	if v, ok := updates["extra_jvm_args"].(string); ok {
 		inst.ExtraJVMArgs = v
 	}

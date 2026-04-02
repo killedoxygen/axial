@@ -12,6 +12,7 @@ import (
 	"github.com/mateoltd/croopor/internal/launcher"
 	"github.com/mateoltd/croopor/internal/minecraft"
 	"github.com/mateoltd/croopor/internal/modloaders"
+	"github.com/mateoltd/croopor/internal/modrinth"
 	"github.com/mateoltd/croopor/internal/performance"
 	appupdate "github.com/mateoltd/croopor/internal/update"
 )
@@ -63,6 +64,10 @@ func NewServer(mcDir string, appVersion string, cfg *config.Config, instances *i
 		updater:        updater,
 		mux:            http.NewServeMux(),
 		frontend:       frontend,
+		performanceManager: performance.New(
+			config.ConfigDir(),
+			modrinth.NewClient("", "", &http.Client{Timeout: 30 * time.Second}),
+		),
 	}
 
 	// Register mod loader backends

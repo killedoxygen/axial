@@ -16,6 +16,7 @@ type Config struct {
 	WindowWidth      int    `json:"window_width,omitempty"`
 	WindowHeight     int    `json:"window_height,omitempty"`
 	JVMPreset        string `json:"jvm_preset,omitempty"`
+	PerformanceMode  string `json:"performance_mode,omitempty"`
 	Theme            string `json:"theme,omitempty"`
 	CustomHue        *int   `json:"custom_hue,omitempty"`
 	CustomVibrancy   *int   `json:"custom_vibrancy,omitempty"`
@@ -35,9 +36,10 @@ var (
 
 func DefaultConfig() *Config {
 	return &Config{
-		Username:    "Player",
-		MaxMemoryMB: 4096,
-		MinMemoryMB: 512,
+		Username:        "Player",
+		MaxMemoryMB:     4096,
+		MinMemoryMB:     512,
+		PerformanceMode: "managed",
 	}
 }
 
@@ -87,6 +89,9 @@ func Load() (*Config, error) {
 	}
 	if cfg.Username == "" {
 		cfg.Username = "Player"
+	}
+	if cfg.PerformanceMode == "" {
+		cfg.PerformanceMode = "managed"
 	}
 	return cfg, nil
 }
