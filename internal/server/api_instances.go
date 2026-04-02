@@ -43,8 +43,9 @@ func (s *Server) handleListInstances(w http.ResponseWriter, r *http.Request) {
 		versionMap[v.ID] = v
 	}
 
-	enriched := make([]enrichedInstance, 0, len(s.instances.Instances))
-	for _, inst := range s.instances.Instances {
+	allInstances := s.instances.List()
+	enriched := make([]enrichedInstance, 0, len(allInstances))
+	for _, inst := range allInstances {
 		ei := enrichedInstance{Instance: inst}
 
 		if v, ok := versionMap[inst.VersionID]; ok {
@@ -69,7 +70,7 @@ func (s *Server) handleListInstances(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"instances":        enriched,
-		"last_instance_id": s.instances.LastInstanceID,
+		"last_instance_id": s.instances.GetLastInstanceID(),
 	})
 }
 

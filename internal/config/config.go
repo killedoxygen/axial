@@ -30,6 +30,7 @@ type Config struct {
 var (
 	configDir  string
 	configOnce sync.Once
+	fileMu     sync.Mutex
 )
 
 func DefaultConfig() *Config {
@@ -65,6 +66,8 @@ func MusicDir() string {
 }
 
 func Load() (*Config, error) {
+	fileMu.Lock()
+	defer fileMu.Unlock()
 	cfg := DefaultConfig()
 	data, err := os.ReadFile(ConfigPath())
 	if err != nil {
@@ -89,6 +92,8 @@ func Load() (*Config, error) {
 }
 
 func Save(cfg *Config) error {
+	fileMu.Lock()
+	defer fileMu.Unlock()
 	dir := ConfigDir()
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err

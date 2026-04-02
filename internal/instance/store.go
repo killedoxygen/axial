@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/mateoltd/croopor/internal/config"
@@ -15,6 +16,7 @@ import (
 
 // InstanceStore holds all instances and persists to instances.json.
 type InstanceStore struct {
+	mu             sync.RWMutex
 	Instances      []Instance `json:"instances"`
 	LastInstanceID string     `json:"last_instance_id,omitempty"`
 }
@@ -66,11 +68,14 @@ func Save(store *InstanceStore) error {
 	return os.Rename(tmp, storePath())
 }
 
-// Get returns the instance with the given ID, or nil if not found.
+// Get returns a copy of the instance with the given ID, or nil if not found.
 func (s *InstanceStore) Get(id string) *Instance {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	for i := range s.Instances {
 		if s.Instances[i].ID == id {
-			return &s.Instances[i]
+			inst := s.Instances[i]
+			return &inst
 		}
 	}
 	return nil
@@ -78,6 +83,8 @@ func (s *InstanceStore) Get(id string) *Instance {
 
 // NameExists returns true if any instance already uses this name (case-sensitive).
 func (s *InstanceStore) NameExists(name, excludeID string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	for _, inst := range s.Instances {
 		if inst.Name == name && inst.ID != excludeID {
 			return true
@@ -88,14 +95,19 @@ func (s *InstanceStore) NameExists(name, excludeID string) bool {
 
 // Add creates an instance, sets up its game directory, and persists.
 func (s *InstanceStore) Add(name, versionID, mcDir string) (*Instance, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if name == "" {
 		return nil, errors.New("instance name is required")
 	}
 	if versionID == "" {
 		return nil, errors.New("version_id is required")
 	}
-	if s.NameExists(name, "") {
-		return nil, errors.New("an instance with this name already exists")
+	for _, inst := range s.Instances {
+		if inst.Name == name {
+			return nil, errors.New("an instance with this name already exists")
+		}
 	}
 
 	inst := Instance{
@@ -130,6 +142,8 @@ func (s *InstanceStore) Add(name, versionID, mcDir string) (*Instance, error) {
 
 // Update replaces an instance by ID and persists.
 func (s *InstanceStore) Update(inst Instance) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	for i := range s.Instances {
 		if s.Instances[i].ID == inst.ID {
 			s.Instances[i] = inst
@@ -141,6 +155,9 @@ func (s *InstanceStore) Update(inst Instance) error {
 
 // Remove deletes an instance from the store. If deleteFiles is true, also removes the game directory.
 func (s *InstanceStore) Remove(id string, deleteFiles bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	idx := -1
 	for i := range s.Instances {
 		if s.Instances[i].ID == id {
@@ -168,7 +185,17 @@ func (s *InstanceStore) Remove(id string, deleteFiles bool) error {
 // Duplicate creates a copy of an instance with a new name. If copyFiles is true,
 // deep-copies the game directory; otherwise creates a fresh one.
 func (s *InstanceStore) Duplicate(id, newName, mcDir string, copyFiles bool) (*Instance, error) {
-	src := s.Get(id)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var src *Instance
+	for i := range s.Instances {
+		if s.Instances[i].ID == id {
+			cpy := s.Instances[i]
+			src = &cpy
+			break
+		}
+	}
 	if src == nil {
 		return nil, errors.New("instance not found")
 	}
@@ -198,6 +225,44 @@ func (s *InstanceStore) Duplicate(id, newName, mcDir string, copyFiles bool) (*I
 		return nil, err
 	}
 	return &inst, nil
+}
+
+// List returns a snapshot copy of all instances.
+func (s *InstanceStore) List() []Instance {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]Instance, len(s.Instances))
+	copy(out, s.Instances)
+	return out
+}
+
+// GetLastInstanceID returns the last selected instance ID.
+func (s *InstanceStore) GetLastInstanceID() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.LastInstanceID
+}
+
+// SetLastInstanceID sets the last selected instance ID and persists.
+func (s *InstanceStore) SetLastInstanceID(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.LastInstanceID = id
+}
+
+// Clear removes all instances and resets the last instance ID.
+func (s *InstanceStore) Clear() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Instances = nil
+	s.LastInstanceID = ""
+}
+
+// Len returns the number of instances.
+func (s *InstanceStore) Len() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.Instances)
 }
 
 func generateID() string {
