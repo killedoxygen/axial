@@ -354,4 +354,3 @@ func extractForgeVersion(mavenVersion string) string {
 	}
 	return mavenVersion[idx+1:]
 }
-

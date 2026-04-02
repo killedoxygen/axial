@@ -54,10 +54,10 @@ type BootSample struct {
 	MemResidentMB int64   `json:"mem_resident_mb"` // RSS in MB
 	MemVirtualMB  int64   `json:"mem_virtual_mb"`  // Virtual memory in MB
 	ThreadCount   int     `json:"thread_count"`
-	IOReadMB      float64 `json:"io_read_mb"`   // Total bytes read from disk
-	IOWriteMB     float64 `json:"io_write_mb"`  // Total bytes written to disk
-	IOReadOps     int64   `json:"io_read_ops"`  // Number of read syscalls
-	IOWriteOps    int64   `json:"io_write_ops"` // Number of write syscalls
+	IOReadMB      float64 `json:"io_read_mb"`     // Total bytes read from disk
+	IOWriteMB     float64 `json:"io_write_mb"`    // Total bytes written to disk
+	IOReadOps     int64   `json:"io_read_ops"`    // Number of read syscalls
+	IOWriteOps    int64   `json:"io_write_ops"`   // Number of write syscalls
 	SystemCPUPct  float64 `json:"system_cpu_pct"` // Total system CPU usage
 	SystemFreeMB  int64   `json:"system_free_mb"` // Free physical memory
 }

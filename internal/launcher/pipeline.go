@@ -30,12 +30,12 @@ type LaunchContext struct {
 	GameDir       string
 
 	// Argument groups (assembled in order)
-	CDSArgs   []string
-	BootArgs  []string
-	JVMArgs   []string
-	GCArgs    []string
-	MemArgs   []string
-	GameArgs  []string
+	CDSArgs  []string
+	BootArgs []string
+	JVMArgs  []string
+	GCArgs   []string
+	MemArgs  []string
+	GameArgs []string
 
 	// Final command
 	CmdArgs []string
