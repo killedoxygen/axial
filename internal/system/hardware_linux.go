@@ -30,21 +30,6 @@ func detectGPU() GPUProfile {
 	return gpu
 }
 
-// gpuPriority returns a sort weight for GPU vendor selection.
-// Higher is better. Matches the Windows detection preference order.
-func gpuPriority(v GPUVendor) int {
-	switch v {
-	case GPUVendorNVIDIA:
-		return 3
-	case GPUVendorAMD:
-		return 2
-	case GPUVendorIntel:
-		return 1
-	default:
-		return 0
-	}
-}
-
 func readGPUVendor() GPUVendor {
 	entries, err := os.ReadDir("/sys/class/drm")
 	if err != nil {
@@ -124,8 +109,10 @@ func detectPhysicalCores() int {
 		if err != nil {
 			continue
 		}
-		pkgData, _ := os.ReadFile(filepath.Join(cpuDir, "physical_package_id"))
-		pkg := strings.TrimSpace(string(pkgData))
+		pkg := "0"
+		if pkgData, err := os.ReadFile(filepath.Join(cpuDir, "physical_package_id")); err == nil {
+			pkg = strings.TrimSpace(string(pkgData))
+		}
 		core := strings.TrimSpace(string(coreData))
 		seen[pkg+":"+core] = struct{}{}
 	}
@@ -136,17 +123,26 @@ func detectPhysicalCores() int {
 	return len(seen)
 }
 
-// parseCPURange parses "0-N" format from /sys/devices/system/cpu/possible and returns N.
+// parseCPURange parses /sys/devices/system/cpu/possible and returns the highest
+// CPU index. Handles formats like "0-7", "0-3,8-11", "0-3,8-11,14,17".
 func parseCPURange(s string) int {
-	// Format is typically "0-N" or just "0"
-	parts := strings.Split(s, "-")
-	if len(parts) == 0 {
-		return -1
+	max := -1
+	for _, segment := range strings.Split(s, ",") {
+		segment = strings.TrimSpace(segment)
+		if segment == "" {
+			continue
+		}
+		if idx := strings.Index(segment, "-"); idx >= 0 {
+			n, err := strconv.Atoi(segment[idx+1:])
+			if err == nil && n > max {
+				max = n
+			}
+		} else {
+			n, err := strconv.Atoi(segment)
+			if err == nil && n > max {
+				max = n
+			}
+		}
 	}
-	last := parts[len(parts)-1]
-	n, err := strconv.Atoi(last)
-	if err != nil {
-		return -1
-	}
-	return n
+	return max
 }

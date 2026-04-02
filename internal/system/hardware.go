@@ -30,7 +30,8 @@ const (
 	NVIDIAArchPascal  NVIDIAArch = 1 // GTX 10xx
 	NVIDIAArchTuring  NVIDIAArch = 2 // RTX 20xx / GTX 16xx — minimum for Nvidium
 	NVIDIAArchAmpere  NVIDIAArch = 3 // RTX 30xx
-	NVIDIAArchAda     NVIDIAArch = 4 // RTX 40xx
+	NVIDIAArchAda       NVIDIAArch = 4 // RTX 40xx
+	NVIDIAArchBlackwell NVIDIAArch = 5 // RTX 50xx
 )
 
 // GPUProfile describes the primary GPU.
@@ -87,6 +88,7 @@ var nvidiaArchTable = []struct {
 	substr string
 	arch   NVIDIAArch
 }{
+	{"RTX 50", NVIDIAArchBlackwell},
 	{"RTX 40", NVIDIAArchAda},
 	{"RTX 30", NVIDIAArchAmpere},
 	{"RTX 20", NVIDIAArchTuring},
@@ -95,6 +97,21 @@ var nvidiaArchTable = []struct {
 	{"GTX16", NVIDIAArchTuring},
 	{"GTX 10", NVIDIAArchPascal},
 	{"GTX10", NVIDIAArchPascal},
+}
+
+// gpuPriority returns the preference order for GPU vendor selection.
+// Higher value = more preferred when multiple GPUs are found.
+func gpuPriority(v GPUVendor) int {
+	switch v {
+	case GPUVendorNVIDIA:
+		return 3
+	case GPUVendorAMD:
+		return 2
+	case GPUVendorIntel:
+		return 1
+	default:
+		return 0
+	}
 }
 
 // inferNVIDIAArch determines the NVIDIA microarchitecture from the GPU model name.

@@ -79,20 +79,6 @@ func parseGPUFromDesc(desc string) GPUProfile {
 	return gpu
 }
 
-// gpuPriority returns the preference order for GPU vendors.
-// Higher value = more preferred when multiple GPUs are found.
-func gpuPriority(v GPUVendor) int {
-	switch v {
-	case GPUVendorNVIDIA:
-		return 3
-	case GPUVendorAMD:
-		return 2
-	case GPUVendorIntel:
-		return 1
-	default:
-		return 0
-	}
-}
 
 // detectPhysicalCores returns the physical core count.
 // On Windows, we use runtime.NumCPU() as a safe fallback since
