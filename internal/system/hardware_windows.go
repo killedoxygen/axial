@@ -79,7 +79,6 @@ func parseGPUFromDesc(desc string) GPUProfile {
 	return gpu
 }
 
-
 // detectPhysicalCores returns the physical core count.
 // On Windows, we use runtime.NumCPU() as a safe fallback since
 // SYSTEM_LOGICAL_PROCESSOR_INFORMATION is complex.

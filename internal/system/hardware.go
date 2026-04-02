@@ -26,10 +26,10 @@ const (
 type NVIDIAArch int
 
 const (
-	NVIDIAArchUnknown NVIDIAArch = 0
-	NVIDIAArchPascal  NVIDIAArch = 1 // GTX 10xx
-	NVIDIAArchTuring  NVIDIAArch = 2 // RTX 20xx / GTX 16xx — minimum for Nvidium
-	NVIDIAArchAmpere  NVIDIAArch = 3 // RTX 30xx
+	NVIDIAArchUnknown   NVIDIAArch = 0
+	NVIDIAArchPascal    NVIDIAArch = 1 // GTX 10xx
+	NVIDIAArchTuring    NVIDIAArch = 2 // RTX 20xx / GTX 16xx — minimum for Nvidium
+	NVIDIAArchAmpere    NVIDIAArch = 3 // RTX 30xx
 	NVIDIAArchAda       NVIDIAArch = 4 // RTX 40xx
 	NVIDIAArchBlackwell NVIDIAArch = 5 // RTX 50xx
 )
