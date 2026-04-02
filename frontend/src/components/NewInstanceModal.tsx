@@ -2,7 +2,7 @@ import type { JSX } from 'preact';
 import { useEffect, useMemo, useRef } from 'preact/hooks';
 import { signal } from '@preact/signals';
 import { useSignal } from '@preact/signals';
-import { catalog, instances } from '../store';
+import { catalog, instances, versions } from '../store';
 import { addInstance, selectInstance } from '../actions';
 import { api } from '../api';
 import { Sound } from '../sound';
@@ -142,6 +142,25 @@ export function NewInstanceModal(): JSX.Element | null {
     }
     return next;
   }, [allVersions, filter.value, loaderEnabled.value, loaderGameVersions.value, search.value]);
+
+  const loaderInstalledFor = useMemo(() => {
+    if (!loaderEnabled.value) return null;
+    const loader = selectedLoader.value;
+    const set = new Set<string>();
+    for (const ver of versions.value) {
+      if (!ver.launchable || !ver.inherits_from) continue;
+      const id = ver.id.toLowerCase();
+      if (
+        (loader === 'fabric' && id.startsWith('fabric-loader-')) ||
+        (loader === 'quilt' && id.startsWith('quilt-loader-')) ||
+        (loader === 'forge' && id.includes('-forge-') && !id.startsWith('neoforge')) ||
+        (loader === 'neoforge' && id.startsWith('neoforge-'))
+      ) {
+        set.add(ver.inherits_from);
+      }
+    }
+    return set;
+  }, [loaderEnabled.value, selectedLoader.value, versions.value]);
 
   const total = filteredVersions.length;
   const totalPages = Math.ceil(total / PAGE_SIZE);
@@ -445,7 +464,7 @@ export function NewInstanceModal(): JSX.Element | null {
                               : esc(pd.name),
                           }}
                         />
-                        {v.installed && <span class="ni-installed-badge">Installed</span>}
+                        {(loaderInstalledFor ? loaderInstalledFor.has(v.id) : v.installed) && <span class="ni-installed-badge">Installed</span>}
                       </button>
                     );
                   })}
