@@ -10,12 +10,23 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/mateoltd/croopor/internal/config"
 	"github.com/mateoltd/croopor/internal/launcher"
 	"github.com/mateoltd/croopor/internal/minecraft"
 )
+
+// validVersionID checks that a version ID is safe to use in filesystem paths.
+func validVersionID(id string) bool {
+	return id != "" &&
+		!filepath.IsAbs(id) &&
+		!strings.Contains(id, "..") &&
+		!strings.Contains(id, "/") &&
+		!strings.Contains(id, "\\") &&
+		filepath.Clean(id) == id
+}
 
 // handleVersions returns ONLY locally installed versions.
 func (s *Server) handleVersions(w http.ResponseWriter, r *http.Request) {
@@ -158,8 +169,8 @@ func (s *Server) handleVersionInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	versionID := r.PathValue("id")
-	if versionID == "" {
-		writeError(w, http.StatusBadRequest, "version id is required")
+	if !validVersionID(versionID) {
+		writeError(w, http.StatusBadRequest, "invalid version id")
 		return
 	}
 
@@ -236,12 +247,8 @@ func (s *Server) handleVersionInfo(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		var totalSize int64
-		count := 0
+		count := len(entries)
 		for _, e := range entries {
-			if e.Name() == "." || e.Name() == ".." {
-				continue
-			}
-			count++
 			if info, err := e.Info(); err == nil {
 				totalSize += info.Size()
 			}
@@ -267,8 +274,8 @@ func (s *Server) handleDeleteVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	versionID := r.PathValue("id")
-	if versionID == "" {
-		writeError(w, http.StatusBadRequest, "version id is required")
+	if !validVersionID(versionID) {
+		writeError(w, http.StatusBadRequest, "invalid version id")
 		return
 	}
 
@@ -369,8 +376,8 @@ func (s *Server) handleOpenVersionFolder(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	versionID := r.PathValue("id")
-	if versionID == "" {
-		writeError(w, http.StatusBadRequest, "version id is required")
+	if !validVersionID(versionID) {
+		writeError(w, http.StatusBadRequest, "invalid version id")
 		return
 	}
 

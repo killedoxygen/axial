@@ -31,6 +31,12 @@ func (lim *LoaderInstallManager) Get(id string) (*modloaders.CombinedInstall, bo
 	return ci, ok
 }
 
+func (lim *LoaderInstallManager) Remove(id string) {
+	lim.mu.Lock()
+	delete(lim.installs, id)
+	lim.mu.Unlock()
+}
+
 func (lim *LoaderInstallManager) Lock()    { lim.mu.Lock() }
 func (lim *LoaderInstallManager) Unlock()  { lim.mu.Unlock() }
 func (lim *LoaderInstallManager) RLock()   { lim.mu.RLock() }
@@ -142,6 +148,8 @@ func (s *Server) handleLoaderInstallEvents(w http.ResponseWriter, r *http.Reques
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+
+	defer s.loaderInstalls.Remove(id)
 
 	ctx := r.Context()
 	for {

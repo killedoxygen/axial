@@ -28,6 +28,7 @@ func (s *Server) BridgeLoaderInstallEvents(id string, emit func(eventType string
 	}
 
 	go func() {
+		defer s.loaderInstalls.Remove(id)
 		for progress := range ci.ProgressCh {
 			emit("progress", progress)
 			if progress.Done {
