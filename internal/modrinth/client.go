@@ -78,15 +78,15 @@ func (c *httpClient) ListVersions(ctx context.Context, projectID string, gameVer
 		return nil, err
 	}
 
-	best := pickBestVersion(versions, gameVersions, loaders)
-	if best == nil {
+	candidates := compatibleVersions(versions, gameVersions, loaders)
+	if len(candidates) == 0 {
 		return nil, nil
 	}
 
-	sort.SliceStable(versions, func(i, j int) bool {
-		return compareVersionPreference(versions[i], versions[j], gameVersions, loaders) < 0
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return compareVersionPreference(candidates[i], candidates[j], gameVersions, loaders) < 0
 	})
-	return versions, nil
+	return candidates, nil
 }
 
 func (c *httpClient) DownloadFile(ctx context.Context, rawURL string, expectedSHA512 string, dst io.Writer) error {
@@ -171,9 +171,17 @@ func withDefaultTimeout(ctx context.Context, timeout time.Duration) (context.Con
 }
 
 func pickBestVersion(versions []Version, gameVersions []string, loaders []string) *Version {
-	if len(versions) == 0 {
+	candidates := compatibleVersions(versions, gameVersions, loaders)
+	if len(candidates) == 0 {
 		return nil
 	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return compareVersionPreference(candidates[i], candidates[j], gameVersions, loaders) < 0
+	})
+	return &candidates[0]
+}
+
+func compatibleVersions(versions []Version, gameVersions []string, loaders []string) []Version {
 	candidates := make([]Version, 0, len(versions))
 	for _, version := range versions {
 		if !matchesAny(version.GameVersions, gameVersions) {
@@ -184,13 +192,7 @@ func pickBestVersion(versions []Version, gameVersions []string, loaders []string
 		}
 		candidates = append(candidates, version)
 	}
-	if len(candidates) == 0 {
-		return nil
-	}
-	sort.SliceStable(candidates, func(i, j int) bool {
-		return compareVersionPreference(candidates[i], candidates[j], gameVersions, loaders) < 0
-	})
-	return &candidates[0]
+	return candidates
 }
 
 func compareVersionPreference(a, b Version, gameVersions []string, loaders []string) int {

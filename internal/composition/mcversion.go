@@ -2,6 +2,7 @@ package composition
 
 import (
 	"fmt"
+	"log"
 	"regexp"
 	"strconv"
 	"strings"
@@ -93,6 +94,7 @@ func (v MCVersion) InRange(rangeStr string) bool {
 		op, versionStr := splitRangeCondition(condition)
 		target, err := Parse(versionStr)
 		if err != nil {
+			log.Printf("composition version range parse failed: range=%q condition=%q err=%v", rangeStr, condition, err)
 			return false
 		}
 		cmp := v.Compare(target)

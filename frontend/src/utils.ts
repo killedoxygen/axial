@@ -1,5 +1,6 @@
 import { byId } from './dom';
 import { collapsedLogSeverity, currentPage, instances, logLines } from './store';
+import { toast } from './toast';
 import type { Page } from './types';
 
 const loggedInstances = new Set<string>();
@@ -112,6 +113,7 @@ function syncLogFilter(): void {
 
 export function showError(msg: string): void {
   appendLog('stderr', `ERROR: ${msg}`);
+  toast(msg, 'error');
 }
 
 export function errMessage(err: unknown): string {

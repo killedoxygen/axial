@@ -58,6 +58,7 @@ const (
 	JavaDistributionTemurin JavaDistribution = "temurin"
 	JavaDistributionOracle  JavaDistribution = "oracle"
 	JavaDistributionOpenJDK JavaDistribution = "openjdk"
+	JavaDistributionOpenJ9  JavaDistribution = "openj9"
 	JavaDistributionUnknown JavaDistribution = "unknown"
 )
 
@@ -226,16 +227,21 @@ func detectJavaRuntimeInfo(javaPath string) JavaRuntimeInfo {
 	scanner := bufio.NewScanner(strings.NewReader(string(out)))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		if strings.HasPrefix(line, "java.vendor") && strings.Contains(line, "=") {
-			parts := strings.SplitN(line, "=", 2)
-			if len(parts) < 2 {
-				continue
-			}
-			vendor := strings.TrimSpace(parts[1])
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) < 2 {
+			continue
+		}
+		key := strings.TrimSpace(parts[0])
+		value := strings.TrimSpace(parts[1])
+
+		if key == "java.vendor" {
+			vendor := value
 			upper := strings.ToUpper(vendor)
 			switch {
 			case strings.Contains(upper, "GRAALVM"):
 				info.Distribution = JavaDistributionGraalVM
+			case strings.Contains(upper, "OPENJ9") || strings.Contains(upper, "SEMERU") || strings.Contains(upper, "IBM"):
+				info.Distribution = JavaDistributionOpenJ9
 			case strings.Contains(upper, "TEMURIN") || strings.Contains(upper, "ECLIPSE"):
 				info.Distribution = JavaDistributionTemurin
 			case strings.Contains(upper, "ORACLE"):
@@ -245,12 +251,8 @@ func detectJavaRuntimeInfo(javaPath string) JavaRuntimeInfo {
 			}
 			continue
 		}
-		if (strings.HasPrefix(line, "java.version") || strings.HasPrefix(line, "java.runtime.version")) && strings.Contains(line, "=") {
-			parts := strings.SplitN(line, "=", 2)
-			if len(parts) < 2 {
-				continue
-			}
-			version := strings.TrimSpace(parts[1])
+		if key == "java.version" || key == "java.runtime.version" {
+			version := value
 			if info.Version == "" {
 				info.Version = version
 			}

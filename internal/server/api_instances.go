@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	"github.com/mateoltd/croopor/internal/instance"
 	"github.com/mateoltd/croopor/internal/launcher"
@@ -147,7 +148,12 @@ func (s *Server) handleUpdateInstance(w http.ResponseWriter, r *http.Request) {
 		inst.JVMPreset = v
 	}
 	if v, ok := updates["performance_mode"].(string); ok {
-		inst.PerformanceMode = normalizeInstancePerformanceMode(v)
+		normalized := normalizeInstancePerformanceMode(v)
+		if strings.TrimSpace(v) != "" && normalized == "" {
+			writeError(w, http.StatusBadRequest, "invalid performance_mode: "+v)
+			return
+		}
+		inst.PerformanceMode = normalized
 	}
 	if v, ok := updates["extra_jvm_args"].(string); ok {
 		inst.ExtraJVMArgs = v

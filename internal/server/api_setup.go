@@ -55,7 +55,12 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		s.config.JVMPreset = v
 	}
 	if v, ok := updates["performance_mode"].(string); ok {
-		s.config.PerformanceMode = normalizeConfigPerformanceMode(v)
+		normalized := normalizeConfigPerformanceMode(v)
+		if strings.TrimSpace(v) != "" && normalized == "" {
+			writeError(w, http.StatusBadRequest, "invalid performance_mode: "+v)
+			return
+		}
+		s.config.PerformanceMode = normalized
 	}
 	if v, ok := updates["theme"].(string); ok {
 		s.config.Theme = v

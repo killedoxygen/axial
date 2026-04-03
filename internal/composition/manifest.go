@@ -2,19 +2,20 @@ package composition
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 )
 
 // Load returns the manifest to use: remote cache if valid, built-in otherwise.
-func Load(cacheDir string) *Manifest {
+func Load(cacheDir string) (*Manifest, error) {
 	cachePath := filepath.Join(cacheDir, "performance", "manifest.json")
 	if data, err := os.ReadFile(cachePath); err == nil {
 		var cached Manifest
 		if err := json.Unmarshal(data, &cached); err == nil {
 			if err := validate(&cached); err == nil {
-				return &cached
+				return &cached, nil
 			}
 			log.Printf("performance manifest cache invalid: %v", err)
 		}
@@ -22,14 +23,12 @@ func Load(cacheDir string) *Manifest {
 
 	builtin := &Manifest{}
 	if err := json.Unmarshal(builtinCatalog, builtin); err != nil {
-		log.Printf("builtin performance manifest invalid: %v", err)
-		return &Manifest{SchemaVersion: 1}
+		return nil, fmt.Errorf("builtin performance manifest invalid: %w", err)
 	}
 	if err := validate(builtin); err != nil {
-		log.Printf("builtin performance manifest failed validation: %v", err)
-		return &Manifest{SchemaVersion: 1}
+		return nil, fmt.Errorf("builtin performance manifest failed validation: %w", err)
 	}
-	return builtin
+	return builtin, nil
 }
 
 // Refresh is a stub until remote rule refresh ships.

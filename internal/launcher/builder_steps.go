@@ -49,18 +49,21 @@ func (s *resolveJavaStep) Execute(ctx *LaunchContext) error {
 	if err != nil {
 		return fmt.Errorf("java runtime: %w", err)
 	}
-	ctx.JavaPath = javaResult.Path
-	ctx.JavaMajor = ctx.Version.JavaVersion.MajorVersion
 
-	info := system.DetectJavaRuntimeInfo(ctx.JavaPath)
-	if info.Major > 0 {
-		ctx.JavaMajor = info.Major
+	info := system.DetectJavaRuntimeInfo(javaResult.Path)
+	if shouldPreferManagedRuntime(ctx.Version.JavaVersion, javaResult, info) {
+		fallbackResult, fallbackErr := minecraft.EnsureJavaRuntime(ctx.Opts.MCDir, ctx.Version.JavaVersion, "")
+		if fallbackErr == nil {
+			javaResult = fallbackResult
+			info = system.DetectJavaRuntimeInfo(javaResult.Path)
+		}
 	}
 
-	baseVersion := extractBaseVersion(ctx.Opts.VersionID)
-	family := composition.ClassifyVersion(baseVersion)
-	if err := validateJavaForLaunch(family, info); err != nil {
-		return err
+	ctx.JavaPath = javaResult.Path
+	ctx.JavaInfo = info
+	ctx.JavaMajor = ctx.Version.JavaVersion.MajorVersion
+	if info.Major > 0 {
+		ctx.JavaMajor = info.Major
 	}
 	return nil
 }
@@ -76,7 +79,11 @@ func (s *resolveLibrariesStep) Execute(ctx *LaunchContext) error {
 		return err
 	}
 	ctx.Libraries = libs
-	ctx.ClientJarPath = findClientJar(ctx.Opts.MCDir, ctx.Version, ctx.Opts.VersionID)
+	if usesModuleBootstrap(ctx.Version) {
+		ctx.ClientJarPath = ""
+	} else {
+		ctx.ClientJarPath = findClientJar(ctx.Opts.MCDir, ctx.Version, ctx.Opts.VersionID)
+	}
 	ctx.Classpath = minecraft.BuildClasspath(libs, ctx.ClientJarPath)
 	ctx.IsModded = isModdedVersion(ctx.Opts.MCDir, ctx.Opts.VersionID)
 	return nil
@@ -164,7 +171,7 @@ func (s *buildLaunchVarsStep) Execute(ctx *LaunchContext) error {
 		AssetsRoot:         minecraft.AssetsDir(ctx.Opts.MCDir),
 		AssetIndexName:     ctx.Version.AssetIndex.ID,
 		AuthUUID:           minecraft.OfflineUUID(username),
-		AuthAccessToken:    "null",
+		AuthAccessToken:    "0",
 		ClientID:           "",
 		AuthXUID:           "",
 		UserType:           "msa",
@@ -218,13 +225,15 @@ type computeMemoryStep struct{}
 func (s *computeMemoryStep) Name() string { return "compute memory" }
 
 func (s *computeMemoryStep) Execute(ctx *LaunchContext) error {
+	hw := system.Detect()
+	recMin, recMax := recommendedMemoryForLaunch(extractBaseVersion(ctx.Opts.VersionID), ctx.IsModded, hw)
 	maxMem := ctx.Opts.MaxMemoryMB
 	if maxMem <= 0 {
-		_, maxMem = recommendedMemoryForLaunch(extractBaseVersion(ctx.Opts.VersionID), ctx.IsModded, system.Detect())
+		maxMem = recMax
 	}
 	minMem := ctx.Opts.MinMemoryMB
 	if minMem <= 0 {
-		minMem, _ = recommendedMemoryForLaunch(extractBaseVersion(ctx.Opts.VersionID), ctx.IsModded, system.Detect())
+		minMem = recMin
 	}
 	if minMem > maxMem {
 		minMem = maxMem
@@ -255,16 +264,14 @@ func (s *applyGCPresetStep) Name() string { return "apply GC preset" }
 
 func (s *applyGCPresetStep) Execute(ctx *LaunchContext) error {
 	preset := ctx.Opts.Config.JVMPreset
+	family := composition.ClassifyVersion(extractBaseVersion(ctx.Opts.VersionID))
+	loader := inferLoader(ctx)
 	if preset == "" {
-		hw := system.Detect()
-		dist := system.JavaDistributionUnknown
-		if ctx.JavaPath != "" {
-			dist = system.DetectJavaDistribution(ctx.JavaPath)
-		}
-		preset = AutoSelectPreset(hw, ctx.JavaMajor, dist)
+		preset = autoSelectPresetForLaunch(system.Detect(), family, loader, ctx.IsModded, ctx.JavaInfo)
 	}
+	preset = sanitizePresetForLaunch(preset, family, loader, ctx.IsModded, ctx.JavaInfo)
 	ctx.EffectivePreset = preset
-	ctx.GCArgs = gcPresetArgs(preset, ctx.JavaMajor)
+	ctx.GCArgs = gcPresetArgs(preset, ctx.JavaInfo)
 	return nil
 }
 
@@ -278,7 +285,11 @@ func (s *applyCompositionJVMStep) Execute(ctx *LaunchContext) error {
 		return nil
 	}
 	if ctx.CompositionPlan.JVMPreset != "" {
-		ctx.GCArgs = gcPresetArgs(ctx.CompositionPlan.JVMPreset, ctx.JavaMajor)
+		family := composition.ClassifyVersion(extractBaseVersion(ctx.Opts.VersionID))
+		loader := inferLoader(ctx)
+		preset := sanitizePresetForLaunch(ctx.CompositionPlan.JVMPreset, family, loader, ctx.IsModded, ctx.JavaInfo)
+		ctx.EffectivePreset = preset
+		ctx.GCArgs = gcPresetArgs(preset, ctx.JavaInfo)
 	}
 	return nil
 }
@@ -412,12 +423,21 @@ func inferLoader(ctx *LaunchContext) string {
 }
 
 func extractBaseVersion(versionID string) string {
-	parts := strings.Split(versionID, "-")
-	if len(parts) == 0 {
-		return versionID
+	var fallback string
+	for _, part := range strings.Split(versionID, "-") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if v, err := composition.Parse(part); err == nil && (v.IsSnapshot || v.Major == 1) {
+			return part
+		}
+		if fallback == "" && mcVersionPrefixPattern.MatchString(part) {
+			fallback = part
+		}
 	}
-	if mcVersionPrefixPattern.MatchString(parts[0]) {
-		return parts[0]
+	if fallback != "" {
+		return fallback
 	}
 	return versionID
 }
@@ -435,23 +455,6 @@ func listModIDs(gameDir string) []string {
 		out = append(out, mod.ProjectID)
 	}
 	return out
-}
-
-func validateJavaForLaunch(family composition.VersionFamily, info system.JavaRuntimeInfo) error {
-	if info.Major == 0 {
-		return nil
-	}
-
-	switch family {
-	case composition.FamilyB, composition.FamilyC:
-		if info.Major >= 9 && info.Major <= 15 {
-			return fmt.Errorf("Java %d is not supported for legacy Minecraft versions; use Java 8 or Java 17+", info.Major)
-		}
-		if info.Major == 8 && info.Update > 0 && info.Update < 312 {
-			return fmt.Errorf("Java 8 update %d is too old for legacy Minecraft support; use Java 8u312 or newer", info.Update)
-		}
-	}
-	return nil
 }
 
 func recommendedMemoryForLaunch(versionID string, isModded bool, hw system.HardwareProfile) (minMem, maxMem int) {
@@ -519,4 +522,20 @@ func maxInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func shouldPreferManagedRuntime(required minecraft.JavaVersion, result *minecraft.JavaResult, info system.JavaRuntimeInfo) bool {
+	if result == nil || result.Source != "override" {
+		return false
+	}
+	if info.Major == 0 || required.MajorVersion == 0 {
+		return false
+	}
+	if info.Major != required.MajorVersion {
+		return true
+	}
+	if info.Major == 8 && info.Update > 0 && info.Update < 312 {
+		return true
+	}
+	return false
 }

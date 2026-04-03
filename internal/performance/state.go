@@ -60,5 +60,25 @@ func SaveState(instanceModsDir string, state *CompositionState) error {
 	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
 		return err
 	}
-	return os.Rename(tmpPath, lockFilePath(instanceModsDir))
+	return replaceFileAtomic(tmpPath, lockFilePath(instanceModsDir))
+}
+
+func replaceFileAtomic(tmpPath, finalPath string) error {
+	if err := os.Rename(tmpPath, finalPath); err == nil {
+		return nil
+	}
+
+	if _, statErr := os.Stat(finalPath); statErr == nil {
+		_ = os.Chmod(finalPath, 0666)
+		if removeErr := os.Remove(finalPath); removeErr != nil && !os.IsNotExist(removeErr) {
+			_ = os.Remove(tmpPath)
+			return removeErr
+		}
+	}
+
+	if err := os.Rename(tmpPath, finalPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return nil
 }

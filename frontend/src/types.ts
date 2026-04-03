@@ -155,7 +155,6 @@ export interface LocalPrefs {
   customHue: number;
   customVibrancy: number;
   lightness: number;
-  logExpanded: boolean;
   logHeight: number;
   collapsedGroups: Record<string, boolean>;
   sidebarFilter: string;

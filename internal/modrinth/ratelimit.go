@@ -17,6 +17,9 @@ type Limiter struct {
 
 // NewLimiter creates a limiter allowing rps requests per second.
 func NewLimiter(rps float64) *Limiter {
+	if rps <= 0 {
+		rps = 1
+	}
 	now := time.Now()
 	return &Limiter{
 		tokens:     rps,

@@ -76,15 +76,9 @@ func BuildAndLaunch(opts LaunchOptions) (*LaunchResult, error) {
 func findClientJar(mcDir string, v *minecraft.VersionJSON, originalVersionID string) string {
 	versionsDir := minecraft.VersionsDir(mcDir)
 
-	// Check the version's own directory first
-	jarPath := filepath.Join(versionsDir, v.ID, v.ID+".jar")
-	if _, err := os.Stat(jarPath); err == nil {
-		return jarPath
-	}
-
-	// For modded versions (Fabric/Forge/NeoForge), the client JAR lives in the
-	// parent vanilla version's directory. Load the original (unmerged) version
-	// JSON to find the inheritsFrom field.
+	// For inherited versions, prefer the parent game jar first. Loader installers
+	// often drop helper jars into the child version directory that should not be
+	// treated as the vanilla client jar for ${classpath}.
 	if originalVersionID != "" {
 		origJSON := filepath.Join(versionsDir, originalVersionID, originalVersionID+".json")
 		if data, err := os.ReadFile(origJSON); err == nil {
@@ -100,6 +94,12 @@ func findClientJar(mcDir string, v *minecraft.VersionJSON, originalVersionID str
 		}
 	}
 
+	// Check the version's own directory after inherited parent fallback.
+	jarPath := filepath.Join(versionsDir, v.ID, v.ID+".jar")
+	if _, err := os.Stat(jarPath); err == nil {
+		return jarPath
+	}
+
 	// Last resort: scan the version directory for any .jar
 	entries, err := os.ReadDir(filepath.Join(versionsDir, v.ID))
 	if err == nil {
@@ -111,6 +111,28 @@ func findClientJar(mcDir string, v *minecraft.VersionJSON, originalVersionID str
 	}
 
 	return ""
+}
+
+func usesModuleBootstrap(v *minecraft.VersionJSON) bool {
+	if v == nil || v.Arguments == nil {
+		return false
+	}
+	if v.MainClass == "cpw.mods.bootstraplauncher.BootstrapLauncher" {
+		return true
+	}
+	hasModulePath := false
+	hasAllModulePath := false
+	for _, arg := range v.Arguments.JVM {
+		for _, val := range arg.Value {
+			switch val {
+			case "-p", "--module-path":
+				hasModulePath = true
+			case "ALL-MODULE-PATH":
+				hasAllModulePath = true
+			}
+		}
+	}
+	return hasModulePath && hasAllModulePath
 }
 
 // prefetchForLaunch reads key files to warm the OS page cache before the JVM needs them.
@@ -213,34 +235,45 @@ func bootThrottleArgs(javaMajor int) []string {
 }
 
 // AutoSelectPreset chooses the best JVM GC preset based on the detected
-// hardware profile, Java version, and JVM distribution. It is called only
-// when the user has not explicitly set a preset in config.
+// hardware profile, Java version, and JVM distribution.
 func AutoSelectPreset(profile system.HardwareProfile, javaMajor int, dist system.JavaDistribution) string {
-	if dist == system.JavaDistributionGraalVM {
+	info := system.JavaRuntimeInfo{Distribution: dist, Major: javaMajor}
+	return autoSelectPresetForLaunch(profile, composition.VersionFamily(""), "vanilla", false, info)
+}
+
+func autoSelectPresetForLaunch(profile system.HardwareProfile, family composition.VersionFamily, loader string, isModded bool, info system.JavaRuntimeInfo) string {
+	caps := runtimeCaps(info)
+	if !caps.HotSpotTuning {
+		return ""
+	}
+	if caps.GraalVM && info.Major >= 17 && !isModded {
 		return PresetGraalVM
 	}
-	if javaMajor <= 8 {
+	if info.Major <= 8 {
 		return PresetLegacy
 	}
-	if javaMajor >= 21 && profile.CPU.LogicalCores >= 8 && profile.TotalRAMMB >= 8192 {
+	if family == composition.FamilyA || family == composition.FamilyB || family == composition.FamilyC {
+		return PresetPerformance
+	}
+	if loader == "forge" || loader == "neoforge" || isModded {
+		return PresetPerformance
+	}
+	if supportsGenerationalZGC(info) && profile.CPU.LogicalCores >= 8 && profile.TotalRAMMB >= 8192 {
 		return PresetUltraLowLatency
 	}
-	if javaMajor >= 11 {
+	if supportsShenandoah(info) {
 		return PresetSmooth
 	}
 	return PresetPerformance
 }
 
 // gcPresetArgs returns JVM garbage collector flags for the given preset.
-func gcPresetArgs(preset string, javaMajor int) []string {
+func gcPresetArgs(preset string, info system.JavaRuntimeInfo) []string {
+	preset = sanitizePresetForLaunch(preset, composition.VersionFamily(""), "vanilla", false, info)
+	caps := runtimeCaps(info)
 	switch preset {
 	case "aikar":
-		return []string{
-			"-XX:+UseG1GC",
-			"-XX:+ParallelRefProcEnabled",
-			"-XX:MaxGCPauseMillis=200",
-			"-XX:+UnlockExperimentalVMOptions",
-			"-XX:+DisableExplicitGC",
+		return advancedG1Args(caps, info, 200, []string{
 			"-XX:G1NewSizePercent=30",
 			"-XX:G1MaxNewSizePercent=40",
 			"-XX:G1HeapRegionSize=8M",
@@ -251,63 +284,53 @@ func gcPresetArgs(preset string, javaMajor int) []string {
 			"-XX:G1MixedGCLiveThresholdPercent=90",
 			"-XX:G1RSetUpdatingPauseTimePercent=5",
 			"-XX:SurvivorRatio=32",
-			"-XX:+PerfDisableSharedMem",
 			"-XX:MaxTenuringThreshold=1",
-		}
+		})
 
 	case PresetSmooth:
-		// Shenandoah requires Java 11+; fall back to performance if unavailable.
-		if javaMajor < 11 {
-			return gcPresetArgs(PresetPerformance, javaMajor)
+		if !caps.Shenandoah {
+			return gcPresetArgs(PresetPerformance, info)
 		}
-		return []string{
+		args := []string{
 			"-XX:+UseShenandoahGC",
 			"-XX:ShenandoahGCHeuristics=compact",
 			"-XX:+AlwaysPreTouch",
 			"-XX:+DisableExplicitGC",
-			"-XX:+UseNUMA",
-			"-XX:-UseBiasedLocking",
 			"-XX:+PerfDisableSharedMem",
 		}
+		if caps.NUMA {
+			args = append(args, "-XX:+UseNUMA")
+		}
+		if caps.BiasedLockingFlag {
+			args = append(args, "-XX:-UseBiasedLocking")
+		}
+		return args
 
 	case PresetPerformance:
-		return []string{
-			"-XX:+UseG1GC",
-			"-XX:MaxGCPauseMillis=37",
-			"-XX:+PerfDisableSharedMem",
-			"-XX:+AlwaysPreTouch",
-			"-XX:-UseAdaptiveSizePolicy",
-			"-XX:G1NewSizePercent=20",
-			"-XX:G1MaxNewSizePercent=40",
-			"-XX:G1HeapRegionSize=16M",
-			"-XX:G1ReservePercent=20",
-			"-XX:G1MixedGCCountTarget=3",
-			"-XX:InitiatingHeapOccupancyPercent=15",
-			"-XX:G1MixedGCLiveThresholdPercent=90",
-			"-XX:G1RSetUpdatingPauseTimePercent=0",
-			"-XX:SurvivorRatio=32",
-			"-XX:MaxTenuringThreshold=1",
-			"-XX:+UseNUMA",
-			"-XX:-DontCompileHugeMethods",
-			"-XX:+DisableExplicitGC",
-			"-XX:-UseBiasedLocking",
-		}
+		return conservativeG1Args(caps, 37)
 
 	case PresetUltraLowLatency, "zgc":
-		// Generational ZGC requires Java 21+; fall back through smooth then performance.
-		if javaMajor < 21 {
-			return gcPresetArgs(PresetSmooth, javaMajor)
+		if !caps.ZGC {
+			return gcPresetArgs(PresetPerformance, info)
 		}
-		return []string{
+		args := []string{
 			"-XX:+UseZGC",
-			"-XX:+ZGenerational",
 			"-XX:+AlwaysPreTouch",
 			"-XX:+DisableExplicitGC",
 			"-XX:+PerfDisableSharedMem",
-			"-XX:+UseNUMA",
 		}
+		if caps.NUMA {
+			args = append(args, "-XX:+UseNUMA")
+		}
+		if caps.GenerationalZGC {
+			args = append(args, "-XX:+ZGenerational")
+		}
+		return args
 
 	case PresetGraalVM:
+		if !caps.GraalVM || info.Major < 17 {
+			return gcPresetArgs(PresetPerformance, info)
+		}
 		return []string{
 			"-XX:+UseG1GC",
 			"-XX:+EnableJVMCI",
@@ -322,65 +345,148 @@ func gcPresetArgs(preset string, javaMajor int) []string {
 		}
 
 	case PresetLegacy:
-		return []string{
-			"-XX:+UseG1GC",
-			"-XX:+ParallelRefProcEnabled",
-			"-XX:MaxGCPauseMillis=200",
-			"-XX:+UnlockExperimentalVMOptions",
-			"-XX:+DisableExplicitGC",
-			"-XX:G1NewSizePercent=20",
-			"-XX:G1MaxNewSizePercent=40",
-			"-XX:G1HeapRegionSize=8M",
-			"-XX:G1ReservePercent=20",
-			"-XX:InitiatingHeapOccupancyPercent=15",
-			"-XX:G1MixedGCLiveThresholdPercent=90",
-			"-XX:G1RSetUpdatingPauseTimePercent=5",
-			"-XX:SurvivorRatio=32",
-			"-XX:MaxTenuringThreshold=1",
-			"-XX:+PerfDisableSharedMem",
+		if info.Major > 8 {
+			return gcPresetArgs(PresetPerformance, info)
 		}
+		return conservativeG1Args(caps, 200)
 
 	case PresetLegacyPvP:
-		return []string{
-			"-XX:+UseG1GC",
-			"-XX:MaxGCPauseMillis=15",
-			"-XX:+ParallelRefProcEnabled",
-			"-XX:+UnlockExperimentalVMOptions",
-			"-XX:+DisableExplicitGC",
-			"-XX:G1NewSizePercent=20",
-			"-XX:G1MaxNewSizePercent=40",
-			"-XX:G1HeapRegionSize=4M",
-			"-XX:G1ReservePercent=20",
-			"-XX:InitiatingHeapOccupancyPercent=20",
-			"-XX:G1MixedGCLiveThresholdPercent=85",
-			"-XX:SurvivorRatio=32",
-			"-XX:MaxTenuringThreshold=1",
-			"-XX:+PerfDisableSharedMem",
+		if info.Major > 8 {
+			return gcPresetArgs(PresetPerformance, info)
 		}
+		return conservativeG1Args(caps, 15)
 
 	case PresetLegacyHeavy:
-		return []string{
-			"-XX:+UseG1GC",
-			"-XX:+ParallelRefProcEnabled",
-			"-XX:MaxGCPauseMillis=100",
-			"-XX:+UnlockExperimentalVMOptions",
-			"-XX:+DisableExplicitGC",
-			"-XX:G1NewSizePercent=30",
-			"-XX:G1MaxNewSizePercent=50",
-			"-XX:G1HeapRegionSize=32M",
-			"-XX:G1ReservePercent=20",
-			"-XX:G1HeapWastePercent=5",
-			"-XX:G1MixedGCCountTarget=4",
-			"-XX:InitiatingHeapOccupancyPercent=15",
-			"-XX:G1MixedGCLiveThresholdPercent=90",
-			"-XX:G1RSetUpdatingPauseTimePercent=5",
-			"-XX:SurvivorRatio=32",
-			"-XX:MaxTenuringThreshold=1",
-			"-XX:+PerfDisableSharedMem",
-			"-XX:+AlwaysPreTouch",
+		if info.Major > 8 {
+			return gcPresetArgs(PresetPerformance, info)
 		}
+		return conservativeG1Args(caps, 100)
 
 	default:
 		return nil
 	}
+}
+
+func sanitizePresetForLaunch(preset string, family composition.VersionFamily, loader string, isModded bool, info system.JavaRuntimeInfo) string {
+	caps := runtimeCaps(info)
+	if !caps.HotSpotTuning {
+		return ""
+	}
+	switch preset {
+	case PresetLegacy, PresetLegacyPvP, PresetLegacyHeavy:
+		if info.Major > 8 {
+			return PresetPerformance
+		}
+	case PresetSmooth:
+		if family == composition.FamilyA || family == composition.FamilyB || family == composition.FamilyC || !caps.Shenandoah {
+			return PresetPerformance
+		}
+	case PresetUltraLowLatency, "zgc":
+		if !caps.ZGC {
+			if info.Major <= 8 {
+				return PresetLegacy
+			}
+			return PresetPerformance
+		}
+	case PresetGraalVM:
+		if info.Distribution != system.JavaDistributionGraalVM || info.Major < 17 {
+			return PresetPerformance
+		}
+	}
+
+	if info.Major <= 8 {
+		return PresetLegacy
+	}
+	if family == composition.FamilyA || family == composition.FamilyB || family == composition.FamilyC {
+		if preset == PresetUltraLowLatency || preset == "zgc" || preset == PresetSmooth {
+			return PresetPerformance
+		}
+	}
+	if loader == "forge" || loader == "neoforge" || isModded {
+		if preset == PresetUltraLowLatency {
+			return PresetPerformance
+		}
+	}
+	return preset
+}
+
+func supportsShenandoah(info system.JavaRuntimeInfo) bool {
+	return runtimeCaps(info).Shenandoah
+}
+
+func supportsZGC(info system.JavaRuntimeInfo) bool {
+	return runtimeCaps(info).ZGC
+}
+
+func supportsGenerationalZGC(info system.JavaRuntimeInfo) bool {
+	return runtimeCaps(info).GenerationalZGC
+}
+
+func supportsHotSpotTuning(info system.JavaRuntimeInfo) bool {
+	return runtimeCaps(info).HotSpotTuning
+}
+
+type runtimeCapabilities struct {
+	HotSpotTuning     bool
+	GraalVM           bool
+	Shenandoah        bool
+	ZGC               bool
+	GenerationalZGC   bool
+	NUMA              bool
+	BiasedLockingFlag bool
+	ExperimentalG1    bool
+}
+
+func runtimeCaps(info system.JavaRuntimeInfo) runtimeCapabilities {
+	caps := runtimeCapabilities{
+		HotSpotTuning:     info.Distribution != system.JavaDistributionOpenJ9,
+		GraalVM:           info.Distribution == system.JavaDistributionGraalVM,
+		NUMA:              info.Distribution != system.JavaDistributionOpenJ9 && info.Major >= 8,
+		BiasedLockingFlag: info.Distribution != system.JavaDistributionOpenJ9 && info.Major > 0 && info.Major < 18,
+		ExperimentalG1:    info.Distribution != system.JavaDistributionOpenJ9 && info.Major == 8,
+	}
+	if caps.HotSpotTuning && info.Major >= 17 && !caps.GraalVM {
+		caps.Shenandoah = true
+		caps.ZGC = true
+	}
+	if caps.ZGC && info.Major >= 21 && info.Major <= 23 {
+		caps.GenerationalZGC = true
+	}
+	return caps
+}
+
+func conservativeG1Args(caps runtimeCapabilities, pauseMillis int) []string {
+	if !caps.HotSpotTuning {
+		return nil
+	}
+	args := []string{
+		"-XX:+UseG1GC",
+		"-XX:+ParallelRefProcEnabled",
+		fmt.Sprintf("-XX:MaxGCPauseMillis=%d", pauseMillis),
+		"-XX:+DisableExplicitGC",
+		"-XX:+PerfDisableSharedMem",
+	}
+	if caps.NUMA {
+		args = append(args, "-XX:+UseNUMA")
+	}
+	return args
+}
+
+func advancedG1Args(caps runtimeCapabilities, info system.JavaRuntimeInfo, pauseMillis int, tuning []string) []string {
+	args := conservativeG1Args(caps, pauseMillis)
+	if len(args) == 0 {
+		return nil
+	}
+	if !caps.ExperimentalG1 {
+		return args
+	}
+	args = append(args, "-XX:+UnlockExperimentalVMOptions")
+	args = append(args, tuning...)
+	if caps.BiasedLockingFlag {
+		args = append(args, "-XX:-UseBiasedLocking")
+	}
+	if info.Major >= 11 {
+		args = append(args, "-XX:+AlwaysPreTouch")
+	}
+	return args
 }

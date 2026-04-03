@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"path/filepath"
@@ -26,7 +27,11 @@ func (s *Server) handlePerformancePlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mode := resolveConfigPerformanceMode(s.config, r.URL.Query().Get("mode"))
+	mode, err := resolveConfigPerformanceMode(s.config, r.URL.Query().Get("mode"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	plan := s.performanceManager.GetPlan(composition.ResolutionRequest{
 		GameVersion: gameVersion,
 		Loader:      strings.TrimSpace(r.URL.Query().Get("loader")),
@@ -56,7 +61,11 @@ func (s *Server) handlePerformanceHealth(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	effectiveMode := resolveInstancePerformanceMode(s.config, inst, "")
+	effectiveMode, err := resolveInstancePerformanceMode(s.config, inst, "")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	var plan *composition.CompositionPlan
 	if s.performanceManager != nil {
 		plan = s.performanceManager.GetPlan(composition.ResolutionRequest{
@@ -129,7 +138,11 @@ func (s *Server) handlePerformanceInstall(w http.ResponseWriter, r *http.Request
 	if req.Loader == "" {
 		req.Loader = inferLoaderFromVersionID(inst.VersionID)
 	}
-	mode := resolveInstancePerformanceMode(s.config, inst, req.Mode)
+	mode, err := resolveInstancePerformanceMode(s.config, inst, req.Mode)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	plan := s.performanceManager.GetPlan(composition.ResolutionRequest{
 		GameVersion:   req.GameVersion,
@@ -155,21 +168,28 @@ func (s *Server) handlePerformanceInstall(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusAccepted, map[string]any{"status": "installing"})
 }
 
-func parseCompositionMode(raw string) composition.CompositionMode {
+func parseCompositionMode(raw string) (composition.CompositionMode, bool) {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "", string(composition.ModeManaged):
-		return composition.ModeManaged
+	case string(composition.ModeManaged):
+		return composition.ModeManaged, true
 	case string(composition.ModeVanilla):
-		return composition.ModeVanilla
+		return composition.ModeVanilla, true
 	case string(composition.ModeCustom):
-		return composition.ModeCustom
+		return composition.ModeCustom, true
 	default:
-		return composition.ModeManaged
+		return "", false
 	}
 }
 
 func normalizeConfigPerformanceMode(raw string) string {
-	return string(resolveConfigPerformanceMode(nil, raw))
+	if strings.TrimSpace(raw) == "" {
+		return ""
+	}
+	mode, ok := parseCompositionMode(raw)
+	if !ok {
+		return ""
+	}
+	return string(mode)
 }
 
 func normalizeInstancePerformanceMode(raw string) string {
@@ -184,24 +204,36 @@ func normalizeInstancePerformanceMode(raw string) string {
 	}
 }
 
-func resolveConfigPerformanceMode(cfg *config.Config, raw string) composition.CompositionMode {
+func resolveConfigPerformanceMode(cfg *config.Config, raw string) (composition.CompositionMode, error) {
 	mode := strings.ToLower(strings.TrimSpace(raw))
 	if mode != "" {
-		return parseCompositionMode(mode)
+		parsed, ok := parseCompositionMode(mode)
+		if !ok {
+			return "", fmt.Errorf("invalid performance mode: %s", raw)
+		}
+		return parsed, nil
 	}
 	if cfg != nil {
-		return parseCompositionMode(cfg.PerformanceMode)
+		if parsed, ok := parseCompositionMode(cfg.PerformanceMode); ok {
+			return parsed, nil
+		}
 	}
-	return composition.ModeManaged
+	return composition.ModeManaged, nil
 }
 
-func resolveInstancePerformanceMode(cfg *config.Config, inst *instance.Instance, raw string) composition.CompositionMode {
+func resolveInstancePerformanceMode(cfg *config.Config, inst *instance.Instance, raw string) (composition.CompositionMode, error) {
 	mode := strings.ToLower(strings.TrimSpace(raw))
 	if mode != "" {
-		return parseCompositionMode(mode)
+		parsed, ok := parseCompositionMode(mode)
+		if !ok {
+			return "", fmt.Errorf("invalid performance mode: %s", raw)
+		}
+		return parsed, nil
 	}
 	if inst != nil && inst.PerformanceMode != "" {
-		return parseCompositionMode(inst.PerformanceMode)
+		if parsed, ok := parseCompositionMode(inst.PerformanceMode); ok {
+			return parsed, nil
+		}
 	}
 	return resolveConfigPerformanceMode(cfg, "")
 }
@@ -223,13 +255,21 @@ func inferLoaderFromVersionID(versionID string) string {
 }
 
 func extractServerBaseVersion(versionID string) string {
-	parts := strings.Split(versionID, "-")
-	if len(parts) == 0 {
-		return versionID
+	var fallback string
+	for _, part := range strings.Split(versionID, "-") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if v, err := composition.Parse(part); err == nil && (v.IsSnapshot || v.Major == 1) {
+			return part
+		}
+		if fallback == "" && strings.Count(part, ".") >= 1 {
+			fallback = part
+		}
 	}
-	base := strings.TrimSpace(parts[0])
-	if strings.Count(base, ".") >= 1 {
-		return base
+	if fallback != "" {
+		return fallback
 	}
 	return versionID
 }

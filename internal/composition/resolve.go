@@ -60,6 +60,10 @@ func Resolve(m *Manifest, req ResolutionRequest) *CompositionPlan {
 			}
 		}
 
+		// Keep managed plans meaningful: prefer a real multi-mod composition for
+		// TierExtended/TierCore so CompositionPlan only promotes a bundle when
+		// findComposition/shouldIncludeMod leave enough benefit to justify taking
+		// ownership, while TierVanillaEnhanced remains the explicit floor.
 		if len(activeMods) >= 2 || tier == TierVanillaEnhanced {
 			plan := &CompositionPlan{
 				CompositionID: def.ID,
@@ -145,6 +149,8 @@ func shouldIncludeMod(mod ManagedMod, gameVersion string, hw system.HardwareProf
 			return false, warning
 		}
 	case ConditionRecommend:
+		// Recommended mods stay out of the managed install set for now; they are
+		// reserved for future UX surfacing rather than automatic ownership.
 		return false, ""
 	default:
 		return false, ""

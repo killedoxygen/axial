@@ -14,7 +14,6 @@ export const defaults: LocalPrefs = {
   customHue: 140,
   customVibrancy: 100,
   lightness: 0,
-  logExpanded: false,
   logHeight: 0,
   collapsedGroups: {},
   sidebarFilter: 'all',
@@ -25,7 +24,14 @@ export const defaults: LocalPrefs = {
 };
 
 export function loadLocalState(): LocalPrefs {
-  try { const r: string | null = localStorage.getItem(STORAGE_KEY); return r ? { ...defaults, ...JSON.parse(r) } : { ...defaults }; } catch { return { ...defaults }; }
+  try {
+    const raw: string | null = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return { ...defaults };
+    const { logExpanded: _ignored, ...saved } = JSON.parse(raw) as Partial<LocalPrefs & { logExpanded?: boolean }>;
+    return { ...defaults, ...saved };
+  } catch {
+    return { ...defaults };
+  }
 }
 
 export const local: LocalPrefs = loadLocalState();

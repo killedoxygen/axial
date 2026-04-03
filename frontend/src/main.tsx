@@ -39,7 +39,6 @@ async function init(): Promise<void> {
   Sound.enabled = local.sounds;
   Sound.warmup();
   const logPanel = byId<HTMLElement>('log-panel');
-  if (local.logExpanded) logPanel?.classList.add('expanded');
   if (local.logHeight && logPanel) logPanel.style.setProperty('--log-h', `${local.logHeight}px`);
   sidebarFilter.value = local.sidebarFilter;
   $$<HTMLElement>('.filter-chips .chip[data-filter]').forEach((c: HTMLElement) => c.classList.toggle('active', c.dataset.filter === sidebarFilter.value));
@@ -223,8 +222,6 @@ function bindEvents(): void {
     if ((e.target as HTMLElement).closest('.log-filter')) return;
     logPanel?.classList.toggle('expanded');
     if (logPanel?.classList.contains('expanded')) clearLogIndicator();
-    local.logExpanded = !!logPanel?.classList.contains('expanded');
-    saveLocalState();
   });
 
   logFilter?.addEventListener('change', (e: Event) => {

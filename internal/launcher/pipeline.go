@@ -9,6 +9,7 @@ import (
 	"github.com/mateoltd/croopor/internal/config"
 	"github.com/mateoltd/croopor/internal/minecraft"
 	"github.com/mateoltd/croopor/internal/performance"
+	"github.com/mateoltd/croopor/internal/system"
 )
 
 // LaunchContext carries state through the launch pipeline.
@@ -23,6 +24,7 @@ type LaunchContext struct {
 	Version         *minecraft.VersionJSON
 	Env             minecraft.Environment
 	JavaPath        string
+	JavaInfo        system.JavaRuntimeInfo
 	JavaMajor       int
 	Libraries       []minecraft.ResolvedLibrary
 	ClientJarPath   string

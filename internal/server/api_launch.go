@@ -99,6 +99,11 @@ func (s *Server) handleLaunch(w http.ResponseWriter, r *http.Request) {
 	if inst.ExtraJVMArgs != "" {
 		extraJVMArgs = strings.Fields(inst.ExtraJVMArgs)
 	}
+	effectiveMode, err := resolveInstancePerformanceMode(s.config, inst, "")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	result, err := launcher.BuildAndLaunch(launcher.LaunchOptions{
 		VersionID:          inst.VersionID,
@@ -109,7 +114,7 @@ func (s *Server) handleLaunch(w http.ResponseWriter, r *http.Request) {
 		MCDir:              mcDir,
 		GameDir:            instance.GameDir(inst.ID),
 		ExtraJVMArgs:       extraJVMArgs,
-		CompositionMode:    resolveInstancePerformanceMode(s.config, inst, ""),
+		CompositionMode:    effectiveMode,
 		PerformanceManager: s.performanceManager,
 		Config:             &effectiveConfig,
 	})
