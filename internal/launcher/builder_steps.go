@@ -152,6 +152,11 @@ func (s *buildLaunchVarsStep) Execute(ctx *LaunchContext) error {
 	if username == "" {
 		username = "Player"
 	}
+	authMode := ctx.Opts.AuthMode
+	if authMode == "" {
+		authMode = LaunchAuthOffline
+	}
+	ctx.AuthMode = authMode
 
 	gameDir := ctx.Opts.GameDir
 	if gameDir == "" {

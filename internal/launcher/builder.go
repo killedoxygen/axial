@@ -27,11 +27,19 @@ const (
 	PresetLegacyHeavy     = "legacy_heavy"      // tuned G1GC for heavy modpacks
 )
 
+type LaunchAuthMode string
+
+const (
+	LaunchAuthOffline       LaunchAuthMode = "offline"
+	LaunchAuthAuthenticated LaunchAuthMode = "authenticated"
+)
+
 // LaunchOptions holds parameters for launching a version.
 type LaunchOptions struct {
 	VersionID          string
 	InstanceID         string
 	Username           string
+	AuthMode           LaunchAuthMode
 	MaxMemoryMB        int
 	MinMemoryMB        int
 	MCDir              string   // Shared .minecraft (assets, libraries, versions)

@@ -26,6 +26,7 @@ type LaunchContext struct {
 	JavaPath        string
 	JavaInfo        system.JavaRuntimeInfo
 	JavaMajor       int
+	AuthMode        LaunchAuthMode
 	Libraries       []minecraft.ResolvedLibrary
 	ClientJarPath   string
 	Classpath       string
@@ -93,6 +94,7 @@ func defaultPipeline(manager *performance.PerformanceManager) []LaunchStep {
 		&extractNativesStep{},
 		&buildLaunchVarsStep{},
 		&resolveArgumentsStep{},
+		&applyVersionOverridesStep{},
 		&prepareCDSStep{},
 		&computeMemoryStep{},
 		&applyBootThrottleStep{},

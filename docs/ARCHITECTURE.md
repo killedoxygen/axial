@@ -59,6 +59,14 @@ Update check:
 3. backend fetches the stable Pages manifest
 4. frontend shows a quiet CTA if a newer build exists
 
+## version overrides
+`internal/launcher/version_overrides.go` contains table-driven JVM flag injection for known launch-context quirks. The `builtinOverrides` slice maps predicates over a small `versionOverrideContext` to sets of `-D` flags. The `applyVersionOverridesStep` runs in the launch pipeline right after argument resolution, builds that context from the base version and auth mode, and appends matching flags to `JVMArgs`.
+
+Current overrides:
+- **authlib-offline-mp**: 1.16.4 and 1.16.5 ship authlib 2.1.28 which silently disables multiplayer with offline tokens. Redirects Mojang API hosts to `nope.invalid` so the request fails and the client falls back to permissive defaults. This override is gated to offline launches only.
+
+To add a new override, append an entry to `builtinOverrides` with an ID, reason, matcher, and JVM args.
+
 ## where to look
 - install bugs: `internal/minecraft`, `internal/modloaders`, `frontend/src/install.ts`
 - launch bugs: `internal/launcher`, `internal/server/api.go`, `frontend/src/launch.ts`
