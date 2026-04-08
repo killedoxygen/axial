@@ -45,7 +45,11 @@ type resolveJavaStep struct{}
 func (s *resolveJavaStep) Name() string { return "resolve java" }
 
 func (s *resolveJavaStep) Execute(ctx *LaunchContext) error {
-	javaResult, err := minecraft.EnsureJavaRuntime(ctx.Opts.MCDir, ctx.Version.JavaVersion, ctx.Opts.Config.JavaPathOverride)
+	overridePath := ctx.Opts.Config.JavaPathOverride
+	if ctx.Opts.ForceManagedJava {
+		overridePath = ""
+	}
+	javaResult, err := minecraft.EnsureJavaRuntime(ctx.Opts.MCDir, ctx.Version.JavaVersion, overridePath)
 	if err != nil {
 		return fmt.Errorf("java runtime: %w", err)
 	}
@@ -268,7 +272,15 @@ type applyGCPresetStep struct{}
 func (s *applyGCPresetStep) Name() string { return "apply GC preset" }
 
 func (s *applyGCPresetStep) Execute(ctx *LaunchContext) error {
-	preset := ctx.Opts.Config.JVMPreset
+	if ctx.Opts.DisableCustomGC {
+		ctx.EffectivePreset = ""
+		ctx.GCArgs = nil
+		return nil
+	}
+	preset := ctx.Opts.ForcedPreset
+	if preset == "" {
+		preset = ctx.Opts.Config.JVMPreset
+	}
 	family := composition.ClassifyVersion(extractBaseVersion(ctx.Opts.VersionID))
 	loader := inferLoader(ctx)
 	if preset == "" {
@@ -286,6 +298,9 @@ type applyCompositionJVMStep struct{}
 func (s *applyCompositionJVMStep) Name() string { return "apply composition JVM" }
 
 func (s *applyCompositionJVMStep) Execute(ctx *LaunchContext) error {
+	if ctx.Opts.DisableCustomGC || ctx.Opts.ForcedPreset != "" {
+		return nil
+	}
 	if ctx.CompositionPlan == nil || ctx.Opts.Config.JVMPreset != "" {
 		return nil
 	}

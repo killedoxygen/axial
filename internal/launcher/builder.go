@@ -40,6 +40,7 @@ type LaunchOptions struct {
 	InstanceID         string
 	Username           string
 	AuthMode           LaunchAuthMode
+	AdvancedOverrides  bool
 	MaxMemoryMB        int
 	MinMemoryMB        int
 	MCDir              string   // Shared .minecraft (assets, libraries, versions)
@@ -49,6 +50,10 @@ type LaunchOptions struct {
 	CompositionMode    composition.CompositionMode
 	PerformanceManager *performance.PerformanceManager
 	Config             *config.Config
+
+	ForcedPreset     string
+	DisableCustomGC  bool
+	ForceManagedJava bool
 }
 
 // LaunchResult contains the constructed command and game process.
@@ -60,25 +65,59 @@ type LaunchResult struct {
 	NativesDir string
 	VersionID  string
 	InstanceID string
+	Healing    HealingSummary
 }
 
 // BuildAndLaunch constructs the launch command and starts the game.
 func BuildAndLaunch(opts LaunchOptions) (*LaunchResult, error) {
-	ctx := newLaunchContext(opts)
+	sessionID := generateSessionID()
+	healing := newHealingSummary(opts)
+	attemptOpts := opts
 
-	if err := runPipeline(ctx, defaultPipeline(opts.PerformanceManager)); err != nil {
-		return nil, err
+	for attempt := 0; attempt < 2; attempt++ {
+		ctx := newLaunchContext(attemptOpts)
+		ctx.SessionID = sessionID
+		ctx.Healing = &healing
+
+		if err := runPipeline(ctx, defaultPipeline(attemptOpts.PerformanceManager)); err != nil {
+			healing.FailureClass = classifyLaunchFailure(err, nil)
+			if attempt == 0 {
+				if recovery, ok := recoveryForFailure(healing.FailureClass, attemptOpts, ctx); ok {
+					applyRecovery(&attemptOpts, recovery)
+					recordRecovery(&healing, recovery)
+					continue
+				}
+			}
+			return nil, newLaunchError(err, healing)
+		}
+
+		switch ctx.Process.WaitForStartup(startupObservationWindow) {
+		case startupStable, startupTimedOut:
+			healing.FailureClass = ""
+			return &LaunchResult{
+				Command:    append([]string{ctx.JavaPath}, ctx.CmdArgs...),
+				JavaPath:   ctx.JavaPath,
+				Process:    ctx.Process,
+				SessionID:  ctx.SessionID,
+				NativesDir: ctx.NativesDir,
+				VersionID:  opts.VersionID,
+				InstanceID: opts.InstanceID,
+				Healing:    healing,
+			}, nil
+		case startupExited:
+			healing.FailureClass = classifyLaunchFailure(nil, ctx.Process)
+			if attempt == 0 {
+				if recovery, ok := recoveryForFailure(healing.FailureClass, attemptOpts, ctx); ok {
+					applyRecovery(&attemptOpts, recovery)
+					recordRecovery(&healing, recovery)
+					continue
+				}
+			}
+			return nil, newLaunchError(fmt.Errorf("launch failed during startup: %s", formatFailureClass(healing.FailureClass)), healing)
+		}
 	}
 
-	return &LaunchResult{
-		Command:    append([]string{ctx.JavaPath}, ctx.CmdArgs...),
-		JavaPath:   ctx.JavaPath,
-		Process:    ctx.Process,
-		SessionID:  ctx.SessionID,
-		NativesDir: ctx.NativesDir,
-		VersionID:  opts.VersionID,
-		InstanceID: opts.InstanceID,
-	}, nil
+	return nil, newLaunchError(fmt.Errorf("launch failed during startup"), healing)
 }
 
 func findClientJar(mcDir string, v *minecraft.VersionJSON, originalVersionID string) string {

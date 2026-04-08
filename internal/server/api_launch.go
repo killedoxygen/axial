@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -109,6 +110,8 @@ func (s *Server) handleLaunch(w http.ResponseWriter, r *http.Request) {
 		VersionID:          inst.VersionID,
 		InstanceID:         inst.ID,
 		Username:           username,
+		AuthMode:           launcher.LaunchAuthOffline,
+		AdvancedOverrides:  inst.JavaPath != "" || len(extraJVMArgs) > 0,
 		MaxMemoryMB:        maxMem,
 		MinMemoryMB:        minMem,
 		MCDir:              mcDir,
@@ -119,6 +122,14 @@ func (s *Server) handleLaunch(w http.ResponseWriter, r *http.Request) {
 		Config:             &effectiveConfig,
 	})
 	if err != nil {
+		var launchErr *launcher.LaunchError
+		if errors.As(err, &launchErr) {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error":   launchErr.Error(),
+				"healing": launchErr.Healing,
+			})
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -144,6 +155,7 @@ func (s *Server) handleLaunch(w http.ResponseWriter, r *http.Request) {
 		"instance_id": inst.ID,
 		"pid":         result.Process.PID(),
 		"launched_at": launchedAt,
+		"healing":     result.Healing,
 	})
 }
 
@@ -158,6 +170,7 @@ func (s *Server) handleLaunchCommand(w http.ResponseWriter, r *http.Request) {
 		"command":    result.Command,
 		"java_path":  result.JavaPath,
 		"session_id": result.SessionID,
+		"healing":    result.Healing,
 	})
 }
 
@@ -197,8 +210,9 @@ func (s *Server) handleLaunchEvents(w http.ResponseWriter, r *http.Request) {
 
 	// Send initial state
 	sendSSE(w, flusher, "status", map[string]any{
-		"state": string(result.Process.GetState()),
-		"pid":   result.Process.PID(),
+		"state":   string(result.Process.GetState()),
+		"pid":     result.Process.PID(),
+		"healing": result.Healing,
 	})
 
 	ctx := r.Context()
@@ -211,8 +225,10 @@ func (s *Server) handleLaunchEvents(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				// Channel closed, process exited
 				sendSSE(w, flusher, "status", map[string]any{
-					"state":     "exited",
-					"exit_code": result.Process.ExitCode,
+					"state":          "exited",
+					"exit_code":      result.Process.ExitCode,
+					"failure_class":  result.Process.GetFailureClass(),
+					"failure_detail": result.Process.GetFailureDetail(),
 				})
 				return
 			}

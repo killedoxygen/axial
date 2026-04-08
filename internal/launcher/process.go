@@ -43,6 +43,11 @@ type GameProcess struct {
 	throttle      *BootThrottle
 	Profile       *BootProfile
 	CDSFailed     bool // set if JVM reports CDS archive errors
+	bootCh        chan struct{}
+	bootOnce      sync.Once
+	recentLogs    []LogLine
+	failureClass  LaunchFailureClass
+	failureDetail string
 }
 
 // NewGameProcess creates a game process from an exec.Cmd.
@@ -52,6 +57,7 @@ func NewGameProcess(cmd *exec.Cmd, nativesDir string) *GameProcess {
 		State:      StateStarting,
 		LogChan:    make(chan LogLine, 256),
 		doneChan:   make(chan struct{}),
+		bootCh:     make(chan struct{}),
 		nativesDir: nativesDir,
 	}
 }
@@ -71,6 +77,8 @@ func (gp *GameProcess) Start() error {
 		gp.mu.Lock()
 		gp.State = StateFailed
 		gp.Error = err
+		gp.failureClass = classifyFailureText(err.Error())
+		gp.failureDetail = err.Error()
 		gp.mu.Unlock()
 		close(gp.LogChan)
 		close(gp.doneChan)
@@ -189,6 +197,14 @@ func (gp *GameProcess) streamOutput(r io.Reader, source string) {
 			gp.mu.Unlock()
 		}
 
+		gp.mu.Lock()
+		gp.recentLogs = appendRecentLog(gp.recentLogs, LogLine{Source: source, Text: line})
+		if class := classifyFailureText(line); class != "" && class != LaunchFailureUnknown {
+			gp.failureClass = class
+			gp.failureDetail = line
+		}
+		gp.mu.Unlock()
+
 		select {
 		case gp.LogChan <- LogLine{Source: source, Text: line}:
 		default:
@@ -208,6 +224,7 @@ func (gp *GameProcess) markBootCompleted() {
 	throttle := gp.throttle
 	profile := gp.Profile
 	gp.mu.Unlock()
+	gp.bootOnce.Do(func() { close(gp.bootCh) })
 
 	// Stop profiler and save report
 	if profile != nil {
@@ -259,6 +276,40 @@ func (gp *GameProcess) PID() int {
 		return 0
 	}
 	return gp.cmd.Process.Pid
+}
+
+func (gp *GameProcess) WaitForStartup(timeout time.Duration) startupOutcome {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case <-gp.bootCh:
+		return startupStable
+	case <-gp.doneChan:
+		return startupExited
+	case <-timer.C:
+		return startupTimedOut
+	}
+}
+
+func (gp *GameProcess) GetFailureClass() LaunchFailureClass {
+	gp.mu.RLock()
+	defer gp.mu.RUnlock()
+	return gp.failureClass
+}
+
+func (gp *GameProcess) GetFailureDetail() string {
+	gp.mu.RLock()
+	defer gp.mu.RUnlock()
+	return gp.failureDetail
+}
+
+func appendRecentLog(logs []LogLine, line LogLine) []LogLine {
+	logs = append(logs, line)
+	if len(logs) > 64 {
+		return append([]LogLine(nil), logs[len(logs)-64:]...)
+	}
+	return logs
 }
 
 // BootCompleted returns whether the game has finished booting.

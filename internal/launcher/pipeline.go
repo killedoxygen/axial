@@ -27,6 +27,7 @@ type LaunchContext struct {
 	JavaInfo        system.JavaRuntimeInfo
 	JavaMajor       int
 	AuthMode        LaunchAuthMode
+	Healing         *HealingSummary
 	Libraries       []minecraft.ResolvedLibrary
 	ClientJarPath   string
 	Classpath       string
@@ -100,6 +101,7 @@ func defaultPipeline(manager *performance.PerformanceManager) []LaunchStep {
 		&applyBootThrottleStep{},
 		&applyGCPresetStep{},
 		&applyCompositionJVMStep{},
+		&resolveHealingStep{},
 		&prefetchStep{},
 		&buildCommandStep{},
 		&startProcessStep{},

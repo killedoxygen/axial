@@ -5,6 +5,7 @@ import { Music } from './music';
 import { fmtMem, showError, appendLog, errMessage } from './utils';
 import { clearLaunchVisualState, startLaunchSequence, endLaunchSequence } from './effects';
 import { showConfirm } from './dialogs';
+import { toast } from './toast';
 import {
   isWailsRuntime, nativeLaunchLogEventName, nativeLaunchStatusEventName,
   onNativeEvent, startNativeLaunchEvents,
@@ -15,6 +16,7 @@ import {
 import {
   confirmLaunch, endLaunchPrep, endSession, startLaunch, updateInstanceInList,
 } from './actions';
+import type { LaunchHealingSummary } from './types';
 
 function rollbackLaunch(instanceId: string, animationFrameId: number | null): void {
   if (animationFrameId !== null) cancelAnimationFrame(animationFrameId);
@@ -22,6 +24,40 @@ function rollbackLaunch(instanceId: string, animationFrameId: number | null): vo
   if (Object.keys(runningSessions.value).length === 0) Music.unsuppress();
   clearLaunchVisualState();
   endLaunchPrep();
+}
+
+function describeFailureClass(failureClass: string | undefined): string {
+  switch (failureClass) {
+    case 'jvm_unsupported_option':
+      return 'unsupported JVM option';
+    case 'jvm_experimental_unlock_required':
+      return 'experimental JVM option requires unlock';
+    case 'jvm_option_ordering':
+      return 'JVM option ordering conflict';
+    case 'java_runtime_mismatch':
+      return 'Java runtime mismatch';
+    case 'classpath_or_module_conflict':
+      return 'classpath or module conflict';
+    case 'auth_mode_incompatible':
+      return 'auth mode incompatibility';
+    case 'loader_bootstrap_failure':
+      return 'loader bootstrap failure';
+    default:
+      return 'startup failure';
+  }
+}
+
+function surfaceHealing(healing: LaunchHealingSummary | undefined, instanceId: string, instanceName: string): void {
+  if (!healing) return;
+  for (const warning of healing.warnings || []) {
+    appendLog('system', warning, instanceId, instanceName);
+  }
+  if (healing.fallback_applied) {
+    toast(healing.fallback_applied, 'error');
+  }
+  if (healing.retry_count && healing.retry_count > 0) {
+    appendLog('system', `Launch recovered automatically after ${healing.retry_count} retry attempt${healing.retry_count > 1 ? 's' : ''}.`, instanceId, instanceName);
+  }
 }
 
 export async function launchGame(): Promise<void> {
@@ -62,6 +98,7 @@ export async function launchGame(): Promise<void> {
     });
 
     if (res.error) {
+      surfaceHealing(res.healing, inst.id, inst.name);
       showError(res.error);
       launchCommitted = false;
       rollbackLaunch(inst.id, launchAnimationFrameId);
@@ -75,8 +112,10 @@ export async function launchGame(): Promise<void> {
       pid: res.pid,
       launchedAt,
       allocatedMB: maxMemMB,
+      healing: res.healing,
     });
     launchCommitted = true;
+    surfaceHealing(res.healing, inst.id, inst.name);
     endLaunchSequence();
     Music.suppress();
     Sound.ui('launchSuccess');
@@ -112,7 +151,7 @@ function makeCompositeSubscription(...subscriptions: Array<{ close(): void } | n
 async function connectLaunchEvents(sessionId: string, instanceId: string, instanceName: string): Promise<void> {
   const onStatus = (data: any, handle: { close(): void }): void => {
     if (runningSessions.value[instanceId]?.sessionId !== sessionId) return;
-    if (data.state === 'exited') onGameExited(data.exit_code, instanceId, instanceName, sessionId, handle);
+    if (data.state === 'exited') onGameExited(data, instanceId, instanceName, sessionId, handle);
   };
 
   const onLog = (data: any): void => {
@@ -153,9 +192,10 @@ async function connectLaunchEvents(sessionId: string, instanceId: string, instan
   };
 }
 
-function onGameExited(exitCode: number, instanceId: string, instanceName: string, sessionId: string, eventSource: { close(): void }): void {
+function onGameExited(data: any, instanceId: string, instanceName: string, sessionId: string, eventSource: { close(): void }): void {
   const session = runningSessions.value[instanceId];
   if (!session || session.sessionId !== sessionId) return;
+  const exitCode = data.exit_code;
 
   eventSource.close();
   endSession(instanceId);
@@ -164,6 +204,9 @@ function onGameExited(exitCode: number, instanceId: string, instanceName: string
   if (selectedInstance.value?.id === instanceId) clearLaunchVisualState();
 
   appendLog('system', `${instanceName || instanceId} exited with code ${exitCode}`, instanceId, instanceName);
+  if (typeof data.failure_class === 'string' && data.failure_class) {
+    showError(`Launch failed during startup: ${describeFailureClass(data.failure_class)}`);
+  }
 }
 
 export async function killGame(): Promise<void> {

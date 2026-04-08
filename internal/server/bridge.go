@@ -48,8 +48,9 @@ func (s *Server) BridgeLaunchEvents(id string, emit func(eventType string, data 
 
 	go func() {
 		emit("status", map[string]any{
-			"state": string(result.Process.GetState()),
-			"pid":   result.Process.PID(),
+			"state":   string(result.Process.GetState()),
+			"pid":     result.Process.PID(),
+			"healing": result.Healing,
 		})
 
 		for line := range result.Process.LogChan {
@@ -60,8 +61,10 @@ func (s *Server) BridgeLaunchEvents(id string, emit func(eventType string, data 
 		}
 
 		emit("status", map[string]any{
-			"state":     "exited",
-			"exit_code": result.Process.ExitCode,
+			"state":          "exited",
+			"exit_code":      result.Process.ExitCode,
+			"failure_class":  result.Process.GetFailureClass(),
+			"failure_detail": result.Process.GetFailureDetail(),
 		})
 	}()
 

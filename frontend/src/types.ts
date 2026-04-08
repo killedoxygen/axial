@@ -110,7 +110,21 @@ export interface RunningSession {
   pid: number;
   launchedAt: string;
   allocatedMB: number;
+  healing?: LaunchHealingSummary;
   eventSource?: EventSource;
+}
+
+export interface LaunchHealingSummary {
+  requested_preset?: string;
+  effective_preset?: string;
+  requested_java_path?: string;
+  effective_java_path?: string;
+  auth_mode?: string;
+  warnings?: string[];
+  fallback_applied?: string;
+  retry_count?: number;
+  failure_class?: string;
+  advanced_overrides?: boolean;
 }
 
 // ── Version info (detail panel) ──
