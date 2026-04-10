@@ -26,12 +26,19 @@ export function ActionArea(): JSX.Element | null {
   const notice = launchNotices.value[inst.id];
 
   const session = sessions[inst.id];
+  const noticeDetails = notice?.details?.length ? notice.details : (notice?.detail ? [notice.detail] : []);
 
   const noticeEl = notice ? (
     <div class={`launch-notice launch-notice-${notice.tone}`}>
       <div class="launch-notice-copy">
         <div class="launch-notice-message">{notice.message}</div>
-        {notice.detail ? <div class="launch-notice-detail">{notice.detail}</div> : null}
+        {noticeDetails.length > 0 ? (
+          <div class="launch-notice-details">
+            {noticeDetails.map((detail) => (
+              <div class="launch-notice-detail" key={detail}>{detail}</div>
+            ))}
+          </div>
+        ) : null}
       </div>
       <button
         type="button"

@@ -67,7 +67,7 @@ func searchExactRuntime(baseDir, component string) *JavaResult {
 
 	// Pattern 1: <baseDir>/<component>/<os-arch>/<component>/bin/javaw.exe
 	javaExe := javaExecutable(filepath.Join(baseDir, component, osArch, component), "bin")
-	if _, err := os.Stat(javaExe); err == nil {
+	if runtimeExecutableReady(javaExe) {
 		source := "minecraft-runtime"
 		if strings.Contains(baseDir, "Packages") {
 			source = "ms-store"
@@ -79,7 +79,7 @@ func searchExactRuntime(baseDir, component string) *JavaResult {
 
 	// Pattern 2: <baseDir>/<component>/bin/javaw.exe
 	javaExe = javaExecutable(filepath.Join(baseDir, component), "bin")
-	if _, err := os.Stat(javaExe); err == nil {
+	if runtimeExecutableReady(javaExe) {
 		source := "minecraft-runtime"
 		if strings.Contains(baseDir, "Packages") {
 			source = "ms-store"
@@ -90,6 +90,31 @@ func searchExactRuntime(baseDir, component string) *JavaResult {
 	}
 
 	return nil
+}
+
+func runtimeExecutableReady(javaExe string) bool {
+	if _, err := os.Stat(javaExe); err != nil {
+		return false
+	}
+	if runtime.GOOS != "windows" {
+		return true
+	}
+	for _, cfgPath := range runtimeConfigCandidates(javaExe) {
+		if _, err := os.Stat(cfgPath); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func runtimeConfigCandidates(javaExe string) []string {
+	runtimeRoot := filepath.Dir(filepath.Dir(javaExe))
+	return []string{
+		filepath.Join(runtimeRoot, "lib", "jvm.cfg"),
+		filepath.Join(runtimeRoot, "lib", "amd64", "jvm.cfg"),
+		filepath.Join(runtimeRoot, "jre", "lib", "jvm.cfg"),
+		filepath.Join(runtimeRoot, "jre", "lib", "amd64", "jvm.cfg"),
+	}
 }
 
 // EnsureJavaRuntime downloads the required Java runtime if not found locally.

@@ -338,6 +338,7 @@ input[type="range"]::-moz-range-thumb{width:13px;height:13px;border-radius:50%;b
 .launch-notice-error{border-color:color-mix(in srgb,var(--red) 40%,var(--border));background:color-mix(in srgb,var(--red) 14%,var(--surface-1))}
 .launch-notice-copy{display:flex;flex-direction:column;gap:5px;min-width:0}
 .launch-notice-message{font-size:12px;font-weight:700;color:var(--text);line-height:1.45}
+.launch-notice-details{display:flex;flex-direction:column;gap:3px}
 .launch-notice-detail{font-size:11px;color:var(--text-muted);line-height:1.5}
 .launch-notice-dismiss{
   flex-shrink:0;border:none;background:none;color:var(--text-muted);cursor:pointer;

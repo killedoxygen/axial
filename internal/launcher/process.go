@@ -288,6 +288,16 @@ func (gp *GameProcess) WaitForStartup(timeout time.Duration) startupOutcome {
 	case <-gp.doneChan:
 		return startupExited
 	case <-timer.C:
+		gp.mu.RLock()
+		booted := gp.bootCompleted
+		logCount := len(gp.recentLogs)
+		gp.mu.RUnlock()
+		if booted {
+			return startupStable
+		}
+		if logCount == 0 {
+			return startupStalled
+		}
 		return startupTimedOut
 	}
 }

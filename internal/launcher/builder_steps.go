@@ -10,10 +10,20 @@ import (
 	"strings"
 
 	"github.com/mateoltd/croopor/internal/composition"
+	launchhealing "github.com/mateoltd/croopor/internal/launcher/healing"
 	"github.com/mateoltd/croopor/internal/minecraft"
 	"github.com/mateoltd/croopor/internal/performance"
 	"github.com/mateoltd/croopor/internal/system"
 )
+
+var resolveJavaRuntime = func(mcDir string, javaVersion minecraft.JavaVersion, overridePath string) (*minecraft.JavaResult, system.JavaRuntimeInfo, error) {
+	javaResult, resolveErr := minecraft.EnsureJavaRuntime(mcDir, javaVersion, overridePath)
+	if resolveErr != nil {
+		return nil, system.JavaRuntimeInfo{}, fmt.Errorf("java runtime: %w", resolveErr)
+	}
+	info := system.DetectJavaRuntimeInfo(javaResult.Path)
+	return javaResult, info, nil
+}
 
 // resolveVersionStep resolves the version JSON (handles inheritsFrom).
 type resolveVersionStep struct{}
@@ -45,29 +55,24 @@ type resolveJavaStep struct{}
 func (s *resolveJavaStep) Name() string { return "resolve java" }
 
 func (s *resolveJavaStep) Execute(ctx *LaunchContext) error {
-	overridePath := ctx.Opts.Config.JavaPathOverride
-	if ctx.Opts.ForceManagedJava {
-		overridePath = ""
-	}
-	javaResult, err := minecraft.EnsureJavaRuntime(ctx.Opts.MCDir, ctx.Version.JavaVersion, overridePath)
+	selection, err := launchhealing.ResolveRuntime(
+		ctx.Version.JavaVersion,
+		ctx.Opts.Config.JavaPathOverride,
+		ctx.Opts.ForceManagedJava,
+		func(overridePath string) (*minecraft.JavaResult, system.JavaRuntimeInfo, error) {
+			return resolveJavaRuntime(ctx.Opts.MCDir, ctx.Version.JavaVersion, overridePath)
+		},
+	)
 	if err != nil {
-		return fmt.Errorf("java runtime: %w", err)
+		return err
 	}
-
-	info := system.DetectJavaRuntimeInfo(javaResult.Path)
-	if shouldPreferManagedRuntime(ctx.Version.JavaVersion, javaResult, info) {
-		fallbackResult, fallbackErr := minecraft.EnsureJavaRuntime(ctx.Opts.MCDir, ctx.Version.JavaVersion, "")
-		if fallbackErr == nil {
-			javaResult = fallbackResult
-			info = system.DetectJavaRuntimeInfo(javaResult.Path)
-		}
+	if selection.EffectivePath != "" && selection.EffectiveSource != "override" && selection.EffectiveInfo.Major == 0 && ctx.Version.JavaVersion.MajorVersion > 0 {
+		selection.EffectiveInfo.Major = ctx.Version.JavaVersion.MajorVersion
 	}
-
-	ctx.JavaPath = javaResult.Path
-	ctx.JavaInfo = info
-	ctx.JavaMajor = ctx.Version.JavaVersion.MajorVersion
-	if info.Major > 0 {
-		ctx.JavaMajor = info.Major
+	ctx.JavaRuntime = selection
+	ctx.EffectiveJavaMajor = ctx.Version.JavaVersion.MajorVersion
+	if selection.EffectiveInfo.Major > 0 {
+		ctx.EffectiveJavaMajor = selection.EffectiveInfo.Major
 	}
 	return nil
 }
@@ -219,7 +224,7 @@ type prepareCDSStep struct{}
 func (s *prepareCDSStep) Name() string { return "prepare CDS" }
 
 func (s *prepareCDSStep) Execute(ctx *LaunchContext) error {
-	if !ctx.IsModded && ctx.JavaMajor >= 11 && CDSArchiveExists(ctx.ConfigDir, ctx.Opts.VersionID) && !usesNativeAccessProperty(ctx.JVMArgs) {
+	if !ctx.IsModded && ctx.EffectiveJavaMajor >= 11 && CDSArchiveExists(ctx.ConfigDir, ctx.Opts.VersionID) && !usesNativeAccessProperty(ctx.JVMArgs) {
 		ctx.CDSArgs = []string{
 			"-Xshare:auto",
 			"-XX:SharedArchiveFile=" + CDSArchivePath(ctx.ConfigDir, ctx.Opts.VersionID),
@@ -271,7 +276,7 @@ type applyBootThrottleStep struct{}
 func (s *applyBootThrottleStep) Name() string { return "apply boot throttle" }
 
 func (s *applyBootThrottleStep) Execute(ctx *LaunchContext) error {
-	ctx.BootArgs = bootThrottleArgs(ctx.JavaMajor)
+	ctx.BootArgs = bootThrottleArgs(ctx.EffectiveJavaMajor)
 	return nil
 }
 
@@ -293,11 +298,11 @@ func (s *applyGCPresetStep) Execute(ctx *LaunchContext) error {
 	family := composition.ClassifyVersion(extractBaseVersion(ctx.Opts.VersionID))
 	loader := inferLoader(ctx)
 	if preset == "" {
-		preset = autoSelectPresetForLaunch(system.Detect(), family, loader, ctx.IsModded, ctx.JavaInfo)
+		preset = autoSelectPresetForLaunch(system.Detect(), family, loader, ctx.IsModded, ctx.JavaRuntime.EffectiveInfo)
 	}
-	preset = sanitizePresetForLaunch(preset, family, loader, ctx.IsModded, ctx.JavaInfo)
+	preset = sanitizePresetForLaunch(preset, family, loader, ctx.IsModded, ctx.JavaRuntime.EffectiveInfo)
 	ctx.EffectivePreset = preset
-	ctx.GCArgs = gcPresetArgs(preset, ctx.JavaInfo)
+	ctx.GCArgs = gcPresetArgs(preset, ctx.JavaRuntime.EffectiveInfo)
 	return nil
 }
 
@@ -316,9 +321,9 @@ func (s *applyCompositionJVMStep) Execute(ctx *LaunchContext) error {
 	if ctx.CompositionPlan.JVMPreset != "" {
 		family := composition.ClassifyVersion(extractBaseVersion(ctx.Opts.VersionID))
 		loader := inferLoader(ctx)
-		preset := sanitizePresetForLaunch(ctx.CompositionPlan.JVMPreset, family, loader, ctx.IsModded, ctx.JavaInfo)
+		preset := sanitizePresetForLaunch(ctx.CompositionPlan.JVMPreset, family, loader, ctx.IsModded, ctx.JavaRuntime.EffectiveInfo)
 		ctx.EffectivePreset = preset
-		ctx.GCArgs = gcPresetArgs(preset, ctx.JavaInfo)
+		ctx.GCArgs = gcPresetArgs(preset, ctx.JavaRuntime.EffectiveInfo)
 	}
 	return nil
 }
@@ -351,7 +356,7 @@ func (s *buildCommandStep) Execute(ctx *LaunchContext) error {
 	cmdArgs = append(cmdArgs, ctx.GameArgs...)
 	ctx.CmdArgs = cmdArgs
 
-	cmd := exec.Command(ctx.JavaPath, cmdArgs...)
+	cmd := exec.Command(ctx.JavaRuntime.EffectivePath, cmdArgs...)
 	cmd.Dir = ctx.GameDir
 	setProcAttr(cmd)
 	ctx.Cmd = cmd
@@ -397,8 +402,8 @@ func (s *scheduleCDSStep) Name() string { return "schedule CDS" }
 
 func (s *scheduleCDSStep) Execute(ctx *LaunchContext) error {
 	// Schedule CDS archive generation for next launch if not yet cached
-	if !ctx.IsModded && ctx.JavaMajor >= 11 && len(ctx.CDSArgs) == 0 {
-		javaPath := ctx.JavaPath
+	if !ctx.IsModded && ctx.EffectiveJavaMajor >= 11 && len(ctx.CDSArgs) == 0 {
+		javaPath := ctx.JavaRuntime.EffectivePath
 		classpath := ctx.Classpath
 		configDir := ctx.ConfigDir
 		versionID := ctx.Opts.VersionID
@@ -551,20 +556,4 @@ func maxInt(a, b int) int {
 		return a
 	}
 	return b
-}
-
-func shouldPreferManagedRuntime(required minecraft.JavaVersion, result *minecraft.JavaResult, info system.JavaRuntimeInfo) bool {
-	if result == nil || result.Source != "override" {
-		return false
-	}
-	if info.Major == 0 || required.MajorVersion == 0 {
-		return false
-	}
-	if info.Major != required.MajorVersion {
-		return true
-	}
-	if info.Major == 8 && info.Update > 0 && info.Update < 312 {
-		return true
-	}
-	return false
 }

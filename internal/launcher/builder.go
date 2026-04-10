@@ -75,6 +75,7 @@ func BuildAndLaunch(opts LaunchOptions) (*LaunchResult, error) {
 	attemptOpts := opts
 
 	for attempt := 0; attempt < 2; attempt++ {
+		resetHealingAttempt(&healing, attemptOpts)
 		ctx := newLaunchContext(attemptOpts)
 		ctx.SessionID = sessionID
 		ctx.Healing = &healing
@@ -95,8 +96,8 @@ func BuildAndLaunch(opts LaunchOptions) (*LaunchResult, error) {
 		case startupStable, startupTimedOut:
 			healing.FailureClass = ""
 			return &LaunchResult{
-				Command:    append([]string{ctx.JavaPath}, ctx.CmdArgs...),
-				JavaPath:   ctx.JavaPath,
+				Command:    append([]string{ctx.JavaRuntime.EffectivePath}, ctx.CmdArgs...),
+				JavaPath:   ctx.JavaRuntime.EffectivePath,
 				Process:    ctx.Process,
 				SessionID:  ctx.SessionID,
 				NativesDir: ctx.NativesDir,
@@ -114,6 +115,17 @@ func BuildAndLaunch(opts LaunchOptions) (*LaunchResult, error) {
 				}
 			}
 			return nil, newLaunchError(fmt.Errorf("launch failed during startup: %s", formatFailureClass(healing.FailureClass)), healing)
+		case startupStalled:
+			_ = ctx.Process.Kill()
+			healing.FailureClass = classifyLaunchFailure(fmt.Errorf("launch produced no startup output"), ctx.Process)
+			if attempt == 0 {
+				if recovery, ok := recoveryForFailure(healing.FailureClass, attemptOpts, ctx); ok {
+					applyRecovery(&attemptOpts, recovery)
+					recordRecovery(&healing, recovery)
+					continue
+				}
+			}
+			return nil, newLaunchError(fmt.Errorf("launch failed during startup: no startup activity observed"), healing)
 		}
 	}
 

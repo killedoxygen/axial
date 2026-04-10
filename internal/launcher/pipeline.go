@@ -7,9 +7,9 @@ import (
 
 	"github.com/mateoltd/croopor/internal/composition"
 	"github.com/mateoltd/croopor/internal/config"
+	launchhealing "github.com/mateoltd/croopor/internal/launcher/healing"
 	"github.com/mateoltd/croopor/internal/minecraft"
 	"github.com/mateoltd/croopor/internal/performance"
-	"github.com/mateoltd/croopor/internal/system"
 )
 
 // LaunchContext carries state through the launch pipeline.
@@ -23,9 +23,7 @@ type LaunchContext struct {
 	// Progressive state (set by steps as they execute)
 	Version         *minecraft.VersionJSON
 	Env             minecraft.Environment
-	JavaPath        string
-	JavaInfo        system.JavaRuntimeInfo
-	JavaMajor       int
+	JavaRuntime     launchhealing.RuntimeSelection
 	AuthMode        LaunchAuthMode
 	Healing         *HealingSummary
 	Libraries       []minecraft.ResolvedLibrary
@@ -40,6 +38,7 @@ type LaunchContext struct {
 	// Effective values (computed by steps, used by profiler and downstream)
 	EffectiveMaxMemoryMB int
 	EffectiveMinMemoryMB int
+	EffectiveJavaMajor   int
 	EffectivePreset      string // GC preset actually applied (auto-selected or user-configured)
 
 	// Argument groups (assembled in order)

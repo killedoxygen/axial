@@ -46,24 +46,113 @@ function describeFailureClass(failureClass: string | undefined): string {
   }
 }
 
+function formatPresetName(preset: string): string {
+  switch (preset) {
+    case 'smooth':
+      return 'Smooth';
+    case 'performance':
+      return 'Performance';
+    case 'ultra_low_latency':
+      return 'Ultra Low Latency';
+    case 'graalvm':
+      return 'GraalVM';
+    case 'legacy':
+      return 'Legacy';
+    case 'legacy_pvp':
+      return 'Legacy PvP';
+    case 'legacy_heavy':
+      return 'Legacy Heavy';
+    case '':
+    case 'none':
+      return 'Auto';
+    default:
+      return preset.replace(/_/g, ' ').replace(/\b\w/g, (m) => m.toUpperCase());
+  }
+}
+
+function ensureSentence(text: string): string {
+  const trimmed = text.trim();
+  if (!trimmed) return '';
+  if (/[.!?]$/.test(trimmed)) return trimmed;
+  return `${trimmed}.`;
+}
+
+function formatHealingDetail(detail: string): string {
+  const trimmed = detail.trim();
+  if (!trimmed) return '';
+
+  let match = trimmed.match(/^Requested JVM preset "([^"]+)" was downgraded to "([^"]+)" for compatibility$/);
+  if (match) {
+    return `GC preset changed from ${formatPresetName(match[1])} to ${formatPresetName(match[2])} to match this runtime.`;
+  }
+
+  if (trimmed === 'Requested Java override was bypassed in favor of a safer managed runtime') {
+    return 'Java override was skipped and the managed runtime was used instead.';
+  }
+
+  match = trimmed.match(/^Automatic retry: downgraded JVM preset to "([^"]+)" after startup failure$/);
+  if (match) {
+    return `Croopor retried startup with the ${formatPresetName(match[1])} GC preset.`;
+  }
+
+  if (trimmed === 'Automatic retry: disabled custom GC flags after startup failure') {
+    return 'Croopor retried startup without custom GC flags.';
+  }
+
+  if (trimmed === 'Automatic retry: switched to managed Java after runtime mismatch') {
+    return 'Croopor retried startup with the managed Java runtime.';
+  }
+
+  match = trimmed.match(/^Launch recovered automatically after (\d+) retry attempt(?:s)?\.$/);
+  if (match) {
+    const count = Number(match[1]);
+    return `Recovered automatically after ${count} ${count === 1 ? 'retry' : 'retries'}.`;
+  }
+
+  match = trimmed.match(/^Reason: (.+)$/);
+  if (match) {
+    return ensureSentence(`Reason: ${match[1]}`);
+  }
+
+  return ensureSentence(trimmed);
+}
+
 function healingToastMessage(healing: LaunchHealingSummary): string {
   if (healing.failure_class && (!healing.retry_count || healing.retry_count === 0) && !healing.fallback_applied) {
-    return 'We got you. Croopor stopped this launch before startup because the manual settings were incompatible.';
+    return 'Launch stopped before startup because the manual overrides were not compatible.';
   }
   if (healing.retry_count && healing.retry_count > 0) {
-    return 'We got you. Croopor retried this launch with safer settings.';
+    return 'Launch recovered automatically with safer settings.';
   }
   if (healing.fallback_applied || (healing.warnings && healing.warnings.length > 0)) {
-    return 'We got you. Croopor adjusted this launch for compatibility.';
+    return 'Launch settings were adjusted for compatibility.';
   }
   return '';
 }
 
-function healingNoticeDetail(healing: LaunchHealingSummary): string {
-  if (healing.fallback_applied) return healing.fallback_applied;
-  if (healing.warnings && healing.warnings.length > 0) return healing.warnings[0];
-  if (healing.failure_class) return `Reason: ${describeFailureClass(healing.failure_class)}`;
-  return '';
+function pushUniqueNoticeDetail(details: string[], detail: string | undefined): void {
+  const trimmed = detail ? formatHealingDetail(detail) : '';
+  if (!trimmed || details.includes(trimmed)) return;
+  details.push(trimmed);
+}
+
+function healingNoticeDetails(healing: LaunchHealingSummary): string[] {
+  const details: string[] = [];
+  for (const warning of healing.warnings || []) {
+    pushUniqueNoticeDetail(details, warning);
+  }
+  pushUniqueNoticeDetail(details, healing.fallback_applied);
+  if (healing.retry_count && healing.retry_count > 0) {
+    pushUniqueNoticeDetail(details, `Launch recovered automatically after ${healing.retry_count} retry attempt${healing.retry_count > 1 ? 's' : ''}.`);
+  }
+  if (healing.failure_class) {
+    pushUniqueNoticeDetail(details, `Reason: ${describeFailureClass(healing.failure_class)}`);
+  }
+  return details;
+}
+
+function primaryNoticeDetail(details: string[]): string {
+  return details[0] || '';
 }
 
 function friendlyLaunchErrorDetail(message: string): string {
@@ -73,7 +162,7 @@ function friendlyLaunchErrorDetail(message: string): string {
   if (detail.length > 0) {
     detail = detail.charAt(0).toUpperCase() + detail.slice(1);
   }
-  return detail;
+  return ensureSentence(detail);
 }
 
 function surfaceHealing(healing: LaunchHealingSummary | undefined, instanceId: string, instanceName: string, showNotice = true): void {
@@ -92,9 +181,11 @@ function surfaceHealing(healing: LaunchHealingSummary | undefined, instanceId: s
   }
   const message = healingToastMessage(healing);
   if (message) {
+    const details = healingNoticeDetails(healing);
     setLaunchNotice(instanceId, {
       message,
-      detail: healingNoticeDetail(healing),
+      detail: primaryNoticeDetail(details),
+      details,
       tone: healing.failure_class ? 'error' : (healing.retry_count && healing.retry_count > 0 ? 'success' : 'info'),
     });
   }
@@ -176,9 +267,12 @@ export async function launchGame(): Promise<void> {
         showError(res.error);
       } else {
         const detail = friendlyLaunchErrorDetail(res.error);
+        const healingDetails = healingNoticeDetails(res.healing || {});
+        const details = [detail, ...healingDetails.filter((entry) => entry !== detail)];
         setLaunchNotice(inst.id, {
-          message: 'We got you. Croopor stopped this launch before startup because the manual settings were incompatible.',
+          message: 'Launch stopped before startup because the manual overrides were not compatible.',
           detail,
+          details,
           tone: 'error',
         });
         appendLog('system', detail, inst.id, inst.name);
@@ -289,8 +383,8 @@ function onGameExited(data: any, instanceId: string, instanceName: string, sessi
   appendLog('system', `${instanceName || instanceId} exited with code ${exitCode}`, instanceId, instanceName);
   if (typeof data.failure_class === 'string' && data.failure_class) {
     setLaunchNotice(instanceId, {
-      message: 'We got you. Croopor detected a startup failure and stopped the launch cleanly.',
-      detail: `Reason: ${describeFailureClass(data.failure_class)}`,
+      message: 'Startup failed and the launch was stopped cleanly.',
+      detail: formatHealingDetail(`Reason: ${describeFailureClass(data.failure_class)}`),
       tone: 'error',
     });
   }

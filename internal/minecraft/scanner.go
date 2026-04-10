@@ -73,7 +73,10 @@ func ScanVersions(mcDir string) ([]VersionEntry, error) {
 			Installed:    true,
 		}
 
-		if stub.JavaVersion != nil {
+		if resolved, err := ResolveVersion(mcDir, id); err == nil {
+			ve.JavaComponent = resolved.JavaVersion.Component
+			ve.JavaMajor = resolved.JavaVersion.MajorVersion
+		} else if stub.JavaVersion != nil {
 			ve.JavaComponent = stub.JavaVersion.Component
 			ve.JavaMajor = stub.JavaVersion.MajorVersion
 		}

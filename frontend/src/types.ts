@@ -139,6 +139,7 @@ export type LaunchNoticeTone = 'info' | 'success' | 'error';
 export interface LaunchNotice {
   message: string;
   detail?: string;
+  details?: string[];
   tone: LaunchNoticeTone;
 }
 

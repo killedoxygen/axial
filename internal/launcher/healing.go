@@ -63,6 +63,7 @@ const (
 	startupStable startupOutcome = iota
 	startupExited
 	startupTimedOut
+	startupStalled
 )
 
 type resolveHealingStep struct{}
@@ -76,7 +77,7 @@ func (s *resolveHealingStep) Execute(ctx *LaunchContext) error {
 	}
 
 	ctx.Healing.EffectivePreset = ctx.EffectivePreset
-	ctx.Healing.EffectiveJavaPath = ctx.JavaPath
+	ctx.Healing.EffectiveJavaPath = ctx.JavaRuntime.EffectivePath
 	ctx.Healing.AuthMode = ctx.AuthMode
 	if ctx.Healing.RequestedPreset == "" && ctx.CompositionPlan != nil && ctx.CompositionPlan.JVMPreset != "" {
 		ctx.Healing.RequestedPreset = ctx.CompositionPlan.JVMPreset
@@ -85,7 +86,7 @@ func (s *resolveHealingStep) Execute(ctx *LaunchContext) error {
 	if ctx.Healing.RequestedPreset != "" && ctx.Healing.RequestedPreset != ctx.EffectivePreset {
 		appendHealingWarning(ctx.Healing, fmt.Sprintf("Requested JVM preset %q was downgraded to %q for compatibility", ctx.Healing.RequestedPreset, blankAsNone(ctx.EffectivePreset)))
 	}
-	if ctx.Healing.RequestedJavaPath != "" && ctx.Healing.RequestedJavaPath != ctx.JavaPath {
+	if ctx.Healing.RequestedJavaPath != "" && ctx.Healing.RequestedJavaPath != ctx.JavaRuntime.EffectivePath {
 		appendHealingWarning(ctx.Healing, "Requested Java override was bypassed in favor of a safer managed runtime")
 	}
 
@@ -93,7 +94,7 @@ func (s *resolveHealingStep) Execute(ctx *LaunchContext) error {
 		if err := validateManualJavaOverride(ctx); err != nil {
 			return err
 		}
-		if err := validateManualJVMArgs(ctx.Opts.ExtraJVMArgs, ctx.JavaInfo); err != nil {
+		if err := validateManualJVMArgs(ctx.Opts.ExtraJVMArgs, ctx.JavaRuntime.EffectiveInfo); err != nil {
 			return err
 		}
 	}
@@ -115,6 +116,21 @@ func newHealingSummary(opts LaunchOptions) HealingSummary {
 		summary.RequestedJavaPath = strings.TrimSpace(opts.Config.JavaPathOverride)
 	}
 	return summary
+}
+
+func resetHealingAttempt(summary *HealingSummary, opts LaunchOptions) {
+	if summary == nil {
+		return
+	}
+	authMode := opts.AuthMode
+	if authMode == "" {
+		authMode = LaunchAuthOffline
+	}
+	summary.AuthMode = authMode
+	summary.EffectivePreset = ""
+	summary.EffectiveJavaPath = ""
+	summary.Warnings = nil
+	summary.FailureClass = ""
 }
 
 func newLaunchError(err error, healing HealingSummary) error {
@@ -139,7 +155,6 @@ func recordRecovery(summary *HealingSummary, recovery launchRecovery) {
 	}
 	summary.RetryCount++
 	summary.FallbackApplied = recovery.Description
-	appendHealingWarning(summary, recovery.Description)
 }
 
 func recoveryForFailure(class LaunchFailureClass, opts LaunchOptions, ctx *LaunchContext) (launchRecovery, bool) {
@@ -181,11 +196,11 @@ func recoveryForFailure(class LaunchFailureClass, opts LaunchOptions, ctx *Launc
 }
 
 func conservativeHealingPreset(ctx *LaunchContext) string {
-	if ctx == nil || !supportsHotSpotTuning(ctx.JavaInfo) {
+	if ctx == nil || !supportsHotSpotTuning(ctx.JavaRuntime.EffectiveInfo) {
 		return ""
 	}
 	family := composition.ClassifyVersion(extractBaseVersion(ctx.Opts.VersionID))
-	if ctx.JavaInfo.Major <= 8 || family == composition.FamilyA || family == composition.FamilyB || family == composition.FamilyC {
+	if ctx.JavaRuntime.EffectiveInfo.Major <= 8 || family == composition.FamilyA || family == composition.FamilyB || family == composition.FamilyC {
 		return PresetLegacy
 	}
 	return PresetPerformance
@@ -291,20 +306,20 @@ func validateManualJavaOverride(ctx *LaunchContext) error {
 		return nil
 	}
 	requested := strings.TrimSpace(ctx.Opts.Config.JavaPathOverride)
-	if requested == "" || requested != ctx.JavaPath {
+	if requested == "" || requested != ctx.JavaRuntime.EffectivePath {
 		return nil
 	}
 	required := ctx.Version.JavaVersion.MajorVersion
-	if required > 0 && ctx.JavaInfo.Major > 0 && ctx.JavaInfo.Major != required {
+	if required > 0 && ctx.JavaRuntime.EffectiveInfo.Major > 0 && ctx.JavaRuntime.EffectiveInfo.Major != required {
 		return &launchValidationError{
 			Class:   LaunchFailureJavaRuntimeMismatch,
-			Message: fmt.Sprintf("explicit Java override targets Java %d but this version requires Java %d", ctx.JavaInfo.Major, required),
+			Message: fmt.Sprintf("explicit Java override targets Java %d but this version requires Java %d", ctx.JavaRuntime.EffectiveInfo.Major, required),
 		}
 	}
-	if required == 8 && ctx.JavaInfo.Major == 8 && ctx.JavaInfo.Update > 0 && ctx.JavaInfo.Update < 312 {
+	if required == 8 && ctx.JavaRuntime.EffectiveInfo.Major == 8 && ctx.JavaRuntime.EffectiveInfo.Update > 0 && ctx.JavaRuntime.EffectiveInfo.Update < 312 {
 		return &launchValidationError{
 			Class:   LaunchFailureJavaRuntimeMismatch,
-			Message: fmt.Sprintf("explicit Java 8 override is too old for legacy support (8u%d detected; use 8u312 or newer)", ctx.JavaInfo.Update),
+			Message: fmt.Sprintf("explicit Java 8 override is too old for legacy support (8u%d detected; use 8u312 or newer)", ctx.JavaRuntime.EffectiveInfo.Update),
 		}
 	}
 	return nil

@@ -71,7 +71,10 @@ func mergeVersions(parent, child *VersionJSON) *VersionJSON {
 	// JavaVersion: parent provides it unless child overrides
 	merged.JavaVersion = parent.JavaVersion
 	if child.JavaVersion.Component != "" {
-		merged.JavaVersion = child.JavaVersion
+		merged.JavaVersion.Component = child.JavaVersion.Component
+	}
+	if child.JavaVersion.MajorVersion != 0 {
+		merged.JavaVersion.MajorVersion = child.JavaVersion.MajorVersion
 	}
 
 	// Downloads: parent has the client JAR download
