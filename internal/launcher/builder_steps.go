@@ -219,13 +219,22 @@ type prepareCDSStep struct{}
 func (s *prepareCDSStep) Name() string { return "prepare CDS" }
 
 func (s *prepareCDSStep) Execute(ctx *LaunchContext) error {
-	if !ctx.IsModded && ctx.JavaMajor >= 11 && CDSArchiveExists(ctx.ConfigDir, ctx.Opts.VersionID) {
+	if !ctx.IsModded && ctx.JavaMajor >= 11 && CDSArchiveExists(ctx.ConfigDir, ctx.Opts.VersionID) && !usesNativeAccessProperty(ctx.JVMArgs) {
 		ctx.CDSArgs = []string{
 			"-Xshare:auto",
 			"-XX:SharedArchiveFile=" + CDSArchivePath(ctx.ConfigDir, ctx.Opts.VersionID),
 		}
 	}
 	return nil
+}
+
+func usesNativeAccessProperty(args []string) bool {
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "-Djdk.module.enable.native.access=") {
+			return true
+		}
+	}
+	return false
 }
 
 // computeMemoryStep computes memory flags.

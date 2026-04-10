@@ -419,13 +419,14 @@ func sanitizePresetForLaunch(preset string, family composition.VersionFamily, lo
 	if !caps.HotSpotTuning {
 		return ""
 	}
+	isLegacyFamily := family == composition.FamilyA || family == composition.FamilyB || family == composition.FamilyC
 	switch preset {
 	case PresetLegacy, PresetLegacyPvP, PresetLegacyHeavy:
-		if info.Major > 8 {
+		if !isLegacyFamily || info.Major > 8 {
 			return PresetPerformance
 		}
 	case PresetSmooth:
-		if family == composition.FamilyA || family == composition.FamilyB || family == composition.FamilyC || !caps.Shenandoah {
+		if isLegacyFamily || !caps.Shenandoah {
 			return PresetPerformance
 		}
 	case PresetUltraLowLatency, "zgc":
@@ -444,7 +445,7 @@ func sanitizePresetForLaunch(preset string, family composition.VersionFamily, lo
 	if info.Major <= 8 {
 		return PresetLegacy
 	}
-	if family == composition.FamilyA || family == composition.FamilyB || family == composition.FamilyC {
+	if isLegacyFamily {
 		if preset == PresetUltraLowLatency || preset == "zgc" || preset == PresetSmooth {
 			return PresetPerformance
 		}

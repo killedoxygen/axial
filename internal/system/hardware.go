@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"context"
 	"log"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -212,7 +214,7 @@ func detectJavaRuntimeInfo(javaPath string) JavaRuntimeInfo {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, javaPath, "-XshowSettings:property", "-version")
+	cmd := exec.CommandContext(ctx, javaProbePath(javaPath), "-XshowSettings:property", "-version")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
@@ -267,6 +269,20 @@ func detectJavaRuntimeInfo(javaPath string) JavaRuntimeInfo {
 	}
 
 	return info
+}
+
+func javaProbePath(javaPath string) string {
+	if runtime.GOOS != "windows" {
+		return javaPath
+	}
+	if !strings.HasSuffix(strings.ToLower(javaPath), "javaw.exe") {
+		return javaPath
+	}
+	probePath := filepath.Join(filepath.Dir(javaPath), "java.exe")
+	if _, err := os.Stat(probePath); err == nil {
+		return probePath
+	}
+	return javaPath
 }
 
 func parseJavaVersion(version string) (major int, update int) {

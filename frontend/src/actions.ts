@@ -3,12 +3,12 @@ import {
   instances, versions, config, systemInfo, devMode, catalog,
   selectedInstanceId, lastInstanceId,
   installState, installQueue, installEventSource,
-  launchState, runningSessions,
+  launchState, runningSessions, launchNotices,
   currentPage, searchQuery, sidebarFilter, logLines,
 } from './store';
 import type {
   Instance, Version, Config, SystemInfo, Catalog,
-  RunningSession, InstallItem, Page,
+  RunningSession, InstallItem, Page, LaunchNotice,
 } from './types';
 
 // ── Selection ──
@@ -79,6 +79,17 @@ export function endSession(instanceId: string): void {
   const next = { ...runningSessions.value };
   delete next[instanceId];
   runningSessions.value = next;
+}
+
+export function setLaunchNotice(instanceId: string, notice: LaunchNotice): void {
+  launchNotices.value = { ...launchNotices.value, [instanceId]: notice };
+}
+
+export function clearLaunchNotice(instanceId: string): void {
+  if (!launchNotices.value[instanceId]) return;
+  const next = { ...launchNotices.value };
+  delete next[instanceId];
+  launchNotices.value = next;
 }
 
 // ── Data setters ──

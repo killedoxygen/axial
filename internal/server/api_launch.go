@@ -111,7 +111,7 @@ func (s *Server) handleLaunch(w http.ResponseWriter, r *http.Request) {
 		InstanceID:         inst.ID,
 		Username:           username,
 		AuthMode:           launcher.LaunchAuthOffline,
-		AdvancedOverrides:  inst.JavaPath != "" || len(extraJVMArgs) > 0,
+		AdvancedOverrides:  inst.JavaPath != "" || inst.JVMPreset != "" || len(extraJVMArgs) > 0,
 		MaxMemoryMB:        maxMem,
 		MinMemoryMB:        minMem,
 		MCDir:              mcDir,

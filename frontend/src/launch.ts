@@ -5,16 +5,15 @@ import { Music } from './music';
 import { fmtMem, showError, appendLog, errMessage } from './utils';
 import { clearLaunchVisualState, startLaunchSequence, endLaunchSequence } from './effects';
 import { showConfirm } from './dialogs';
-import { toast } from './toast';
 import {
   isWailsRuntime, nativeLaunchLogEventName, nativeLaunchStatusEventName,
   onNativeEvent, startNativeLaunchEvents,
 } from './native';
 import {
-  config, launchState, runningSessions, selectedInstance, selectedVersion, systemInfo,
+  config, launchState, runningSessions, selectedInstance, selectedVersion, systemInfo, instanceLaunchDrafts,
 } from './store';
 import {
-  confirmLaunch, endLaunchPrep, endSession, startLaunch, updateInstanceInList,
+  clearLaunchNotice, confirmLaunch, endLaunchPrep, endSession, setLaunchNotice, startLaunch, updateInstanceInList,
 } from './actions';
 import type { LaunchHealingSummary } from './types';
 
@@ -47,16 +46,57 @@ function describeFailureClass(failureClass: string | undefined): string {
   }
 }
 
-function surfaceHealing(healing: LaunchHealingSummary | undefined, instanceId: string, instanceName: string): void {
+function healingToastMessage(healing: LaunchHealingSummary): string {
+  if (healing.failure_class && (!healing.retry_count || healing.retry_count === 0) && !healing.fallback_applied) {
+    return 'We got you. Croopor stopped this launch before startup because the manual settings were incompatible.';
+  }
+  if (healing.retry_count && healing.retry_count > 0) {
+    return 'We got you. Croopor retried this launch with safer settings.';
+  }
+  if (healing.fallback_applied || (healing.warnings && healing.warnings.length > 0)) {
+    return 'We got you. Croopor adjusted this launch for compatibility.';
+  }
+  return '';
+}
+
+function healingNoticeDetail(healing: LaunchHealingSummary): string {
+  if (healing.fallback_applied) return healing.fallback_applied;
+  if (healing.warnings && healing.warnings.length > 0) return healing.warnings[0];
+  if (healing.failure_class) return `Reason: ${describeFailureClass(healing.failure_class)}`;
+  return '';
+}
+
+function friendlyLaunchErrorDetail(message: string): string {
+  let detail = message.trim();
+  detail = detail.replace(/^resolve healing:\s*/i, '');
+  detail = detail.replace(/^explicit /i, 'Manual ');
+  if (detail.length > 0) {
+    detail = detail.charAt(0).toUpperCase() + detail.slice(1);
+  }
+  return detail;
+}
+
+function surfaceHealing(healing: LaunchHealingSummary | undefined, instanceId: string, instanceName: string, showNotice = true): void {
   if (!healing) return;
   for (const warning of healing.warnings || []) {
     appendLog('system', warning, instanceId, instanceName);
   }
   if (healing.fallback_applied) {
-    toast(healing.fallback_applied, 'error');
+    appendLog('system', healing.fallback_applied, instanceId, instanceName);
   }
   if (healing.retry_count && healing.retry_count > 0) {
     appendLog('system', `Launch recovered automatically after ${healing.retry_count} retry attempt${healing.retry_count > 1 ? 's' : ''}.`, instanceId, instanceName);
+  }
+  if (!showNotice) {
+    return;
+  }
+  const message = healingToastMessage(healing);
+  if (message) {
+    setLaunchNotice(instanceId, {
+      message,
+      detail: healingNoticeDetail(healing),
+      tone: healing.failure_class ? 'error' : (healing.retry_count && healing.retry_count > 0 ? 'success' : 'info'),
+    });
   }
 }
 
@@ -85,21 +125,64 @@ export async function launchGame(): Promise<void> {
 
   Sound.init();
   clearLaunchVisualState();
+  clearLaunchNotice(inst.id);
   startLaunch(inst.id);
   const launchAnimationFrameId = requestAnimationFrame(() => startLaunchSequence());
 
   let launchCommitted = false;
+  let launchInst = inst;
 
   try {
+    const launchDraft = instanceLaunchDrafts.value[inst.id];
+    if (launchDraft?.dirty) {
+      const saved = await api('PUT', `/instances/${encodeURIComponent(inst.id)}`, {
+        java_path: launchDraft.javaPath.trim(),
+        jvm_preset: launchDraft.jvmPreset,
+        extra_jvm_args: launchDraft.extraJvmArgs.trim(),
+      });
+      if (saved.error) {
+        setLaunchNotice(inst.id, {
+          message: 'Croopor could not save the pending launch overrides.',
+          detail: saved.error,
+          tone: 'error',
+        });
+        showError(saved.error);
+        rollbackLaunch(inst.id, launchAnimationFrameId);
+        return;
+      }
+      launchInst = saved;
+      updateInstanceInList(saved);
+      instanceLaunchDrafts.value = {
+        ...instanceLaunchDrafts.value,
+        [inst.id]: {
+          javaPath: saved.java_path || '',
+          jvmPreset: saved.jvm_preset || '',
+          extraJvmArgs: saved.extra_jvm_args || '',
+          dirty: false,
+        },
+      };
+      appendLog('system', `Applied pending launch overrides for ${inst.name}.`, inst.id, inst.name);
+    }
+
     const res = await api('POST', '/launch', {
-      instance_id: inst.id,
+      instance_id: launchInst.id,
       username,
       max_memory_mb: maxMemMB,
     });
 
     if (res.error) {
-      surfaceHealing(res.healing, inst.id, inst.name);
-      showError(res.error);
+      surfaceHealing(res.healing, inst.id, inst.name, !res.healing?.failure_class);
+      if (!res.healing?.failure_class) {
+        showError(res.error);
+      } else {
+        const detail = friendlyLaunchErrorDetail(res.error);
+        setLaunchNotice(inst.id, {
+          message: 'We got you. Croopor stopped this launch before startup because the manual settings were incompatible.',
+          detail,
+          tone: 'error',
+        });
+        appendLog('system', detail, inst.id, inst.name);
+      }
       launchCommitted = false;
       rollbackLaunch(inst.id, launchAnimationFrameId);
       return;
@@ -108,7 +191,7 @@ export async function launchGame(): Promise<void> {
     const launchedAt = res.launched_at || new Date().toISOString();
     confirmLaunch(inst.id, {
       sessionId: res.session_id,
-      versionId: inst.version_id,
+      versionId: launchInst.version_id,
       pid: res.pid,
       launchedAt,
       allocatedMB: maxMemMB,
@@ -126,7 +209,7 @@ export async function launchGame(): Promise<void> {
       appendLog('system', `Live updates unavailable for ${inst.name}; stop detection may be delayed.`, inst.id, inst.name);
     }
 
-    updateInstanceInList({ ...inst, last_played_at: launchedAt });
+    updateInstanceInList({ ...launchInst, last_played_at: launchedAt });
     if (config.value) {
       config.value = {
         ...config.value,
@@ -205,7 +288,11 @@ function onGameExited(data: any, instanceId: string, instanceName: string, sessi
 
   appendLog('system', `${instanceName || instanceId} exited with code ${exitCode}`, instanceId, instanceName);
   if (typeof data.failure_class === 'string' && data.failure_class) {
-    showError(`Launch failed during startup: ${describeFailureClass(data.failure_class)}`);
+    setLaunchNotice(instanceId, {
+      message: 'We got you. Croopor detected a startup failure and stopped the launch cleanly.',
+      detail: `Reason: ${describeFailureClass(data.failure_class)}`,
+      tone: 'error',
+    });
   }
 }
 

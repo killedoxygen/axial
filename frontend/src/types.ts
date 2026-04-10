@@ -127,6 +127,21 @@ export interface LaunchHealingSummary {
   advanced_overrides?: boolean;
 }
 
+export interface InstanceLaunchDraft {
+  javaPath: string;
+  jvmPreset: string;
+  extraJvmArgs: string;
+  dirty: boolean;
+}
+
+export type LaunchNoticeTone = 'info' | 'success' | 'error';
+
+export interface LaunchNotice {
+  message: string;
+  detail?: string;
+  tone: LaunchNoticeTone;
+}
+
 // ── Version info (detail panel) ──
 
 export interface WorldInfo {
