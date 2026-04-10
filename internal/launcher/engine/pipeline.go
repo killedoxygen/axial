@@ -1,4 +1,4 @@
-package launcher
+package engine
 
 import (
 	"fmt"
@@ -7,7 +7,7 @@ import (
 
 	"github.com/mateoltd/croopor/internal/composition"
 	"github.com/mateoltd/croopor/internal/config"
-	launchhealing "github.com/mateoltd/croopor/internal/launcher/healing"
+	launchruntime "github.com/mateoltd/croopor/internal/launcher/runtime"
 	"github.com/mateoltd/croopor/internal/minecraft"
 	"github.com/mateoltd/croopor/internal/performance"
 )
@@ -23,7 +23,7 @@ type LaunchContext struct {
 	// Progressive state (set by steps as they execute)
 	Version         *minecraft.VersionJSON
 	Env             minecraft.Environment
-	JavaRuntime     launchhealing.RuntimeSelection
+	JavaRuntime     launchruntime.RuntimeSelection
 	AuthMode        LaunchAuthMode
 	Healing         *HealingSummary
 	Libraries       []minecraft.ResolvedLibrary

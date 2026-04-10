@@ -32,6 +32,12 @@ keep this short and real. if the codebase changes, update this file.
 - launch/install progress uses sse in browser mode, wails runtime events in desktop mode
 - update checks go through `/api/v1/update`
 
+## Backend layout
+- `internal/launcher` is the public launcher facade used by the server layer
+- `internal/launcher/engine` owns launch pipeline internals, healing policy, process lifecycle, and profiling
+- `internal/launcher/runtime` owns requested-vs-effective Java runtime resolution
+- if launcher work is not part of the public API, add it under `engine` or `runtime`, not back into the root facade
+
 ## Build
 - frontend entry is `frontend/src/main.tsx`
 - output is `frontend/static/app.js`

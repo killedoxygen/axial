@@ -1,4 +1,4 @@
-package launcher
+package engine
 
 import (
 	"encoding/json"

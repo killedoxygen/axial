@@ -1,4 +1,4 @@
-package launcher
+package engine
 
 import (
 	"bufio"
@@ -19,6 +19,15 @@ const (
 	StateRunning  ProcessState = "running"
 	StateExited   ProcessState = "exited"
 	StateFailed   ProcessState = "failed"
+)
+
+type startupOutcome int
+
+const (
+	startupStable startupOutcome = iota
+	startupExited
+	startupTimedOut
+	startupStalled
 )
 
 // LogLine represents a single line of game output.

@@ -1,10 +1,10 @@
-package launcher
+package engine
 
 import (
 	"testing"
 
 	"github.com/mateoltd/croopor/internal/config"
-	launchhealing "github.com/mateoltd/croopor/internal/launcher/healing"
+	launchruntime "github.com/mateoltd/croopor/internal/launcher/runtime"
 	"github.com/mateoltd/croopor/internal/minecraft"
 	"github.com/mateoltd/croopor/internal/system"
 )
@@ -18,7 +18,7 @@ func TestApplyGCPresetUsesEffectiveRuntime(t *testing.T) {
 				JVMPreset:        PresetPerformance,
 			},
 		},
-		JavaRuntime: launchhealing.RuntimeSelection{
+		JavaRuntime: launchruntime.RuntimeSelection{
 			RequestedPath: "/runtimes/jre-legacy/bin/java",
 			EffectivePath: "/runtimes/java-runtime-delta/bin/java",
 			EffectiveInfo: system.JavaRuntimeInfo{

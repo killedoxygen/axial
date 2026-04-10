@@ -1,6 +1,6 @@
 //go:build !windows
 
-package launcher
+package engine
 
 import (
 	"os/exec"

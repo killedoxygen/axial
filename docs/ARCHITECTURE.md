@@ -29,7 +29,9 @@ main workflow files:
 ## packages that matter
 - `internal/minecraft`: vanilla metadata, downloads, java, integrity
 - `internal/modloaders`: fabric/quilt/forge/neoforge
-- `internal/launcher`: command building, process lifecycle, profiling
+- `internal/launcher`: public launch api used by `internal/server`
+- `internal/launcher/engine`: launch pipeline, process lifecycle, self-healing, profiling
+- `internal/launcher/runtime`: requested vs effective java runtime resolution
 - `internal/config`: config persistence
 - `internal/instance`: instance storage
 
@@ -60,7 +62,7 @@ Update check:
 4. frontend shows a quiet CTA if a newer build exists
 
 ## version overrides
-`internal/launcher/version_overrides.go` contains table-driven JVM flag injection for known launch-context quirks. The `builtinOverrides` slice maps predicates over a small `versionOverrideContext` to sets of `-D` flags. The `applyVersionOverridesStep` runs in the launch pipeline right after argument resolution, builds that context from the base version and auth mode, and appends matching flags to `JVMArgs`.
+`internal/launcher/engine/version_overrides.go` contains table-driven JVM flag injection for known launch-context quirks. The `builtinOverrides` slice maps predicates over a small `versionOverrideContext` to sets of `-D` flags. The `applyVersionOverridesStep` runs in the launch pipeline right after argument resolution, builds that context from the base version and auth mode, and appends matching flags to `JVMArgs`.
 
 Current overrides:
 - **authlib-offline-mp**: 1.16.4 and 1.16.5 ship authlib 2.1.28 which silently disables multiplayer with offline tokens. Redirects Mojang API hosts to `nope.invalid` so the request fails and the client falls back to permissive defaults. This override is gated to offline launches only.
@@ -69,7 +71,7 @@ To add a new override, append an entry to `builtinOverrides` with an ID, reason,
 
 ## where to look
 - install bugs: `internal/minecraft`, `internal/modloaders`, `frontend/src/install.ts`
-- launch bugs: `internal/launcher`, `internal/server/api.go`, `frontend/src/launch.ts`
+- launch bugs: `internal/launcher`, `internal/launcher/engine`, `internal/launcher/runtime`, `internal/server/api_launch.go`, `frontend/src/launch.ts`
 - settings/prefs: `internal/config/config.go`, `frontend/src/settings.ts`, `frontend/src/state.ts`
 - updater/release metadata: `internal/update`, `frontend/src/updater.ts`, `.github/workflows/release.yml`
 - shell/layout: `frontend/src/components/App.tsx`
