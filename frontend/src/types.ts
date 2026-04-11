@@ -114,6 +114,17 @@ export interface RunningSession {
   eventSource?: EventSource;
 }
 
+export type HealingEventKind =
+  | 'runtime_bypassed'
+  | 'preset_downgraded'
+  | 'startup_stalled'
+  | 'fallback_applied';
+
+export interface HealingEvent {
+  kind: HealingEventKind;
+  detail?: string;
+}
+
 export interface LaunchHealingSummary {
   requested_preset?: string;
   effective_preset?: string;
@@ -125,6 +136,7 @@ export interface LaunchHealingSummary {
   retry_count?: number;
   failure_class?: string;
   advanced_overrides?: boolean;
+  events?: HealingEvent[];
 }
 
 export interface InstanceLaunchDraft {

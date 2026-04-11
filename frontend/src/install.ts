@@ -2,7 +2,7 @@ import { api, API } from './api';
 import { showError, errMessage } from './utils';
 import { startLoaderInstall, connectLoaderInstallSSE } from './loaders';
 import {
-  isWailsRuntime, nativeInstallEventName, nativeLoaderInstallEventName,
+  hasNativeDesktopRuntime, nativeInstallEventName, nativeLoaderInstallEventName,
   onNativeEvent, startNativeInstallEvents, startNativeLoaderInstallEvents,
 } from './native';
 import {
@@ -155,7 +155,7 @@ async function connectVanillaEvents(installId: string, versionId: string): Promi
     if (data.done) await onInstallDone();
   };
 
-  if (isWailsRuntime()) {
+  if (hasNativeDesktopRuntime()) {
     const subscription = onNativeEvent(nativeInstallEventName(installId), (data) => {
       void onProgress(data);
     });
@@ -247,7 +247,7 @@ async function connectLoaderEvents(installId: string, versionId: string): Promis
     }
   };
 
-  if (isWailsRuntime()) {
+  if (hasNativeDesktopRuntime()) {
     const subscription = onNativeEvent(nativeLoaderInstallEventName(installId), (data) => {
       if (data.phase === 'error' || data.error) {
         onError(data.error || 'Unknown error');

@@ -6,7 +6,7 @@ import { fmtMem, showError, appendLog, errMessage } from './utils';
 import { clearLaunchVisualState, startLaunchSequence, endLaunchSequence } from './effects';
 import { showConfirm } from './dialogs';
 import {
-  isWailsRuntime, nativeLaunchLogEventName, nativeLaunchStatusEventName,
+  hasNativeDesktopRuntime, nativeLaunchLogEventName, nativeLaunchStatusEventName,
   onNativeEvent, startNativeLaunchEvents,
 } from './native';
 import {
@@ -15,7 +15,7 @@ import {
 import {
   clearLaunchNotice, confirmLaunch, endLaunchPrep, endSession, setLaunchNotice, startLaunch, updateInstanceInList,
 } from './actions';
-import type { LaunchHealingSummary } from './types';
+import type { HealingEvent, LaunchHealingSummary } from './types';
 
 function rollbackLaunch(instanceId: string, animationFrameId: number | null): void {
   if (animationFrameId !== null) cancelAnimationFrame(animationFrameId);
@@ -130,6 +130,21 @@ function healingToastMessage(healing: LaunchHealingSummary): string {
   return '';
 }
 
+function formatHealingEvent(event: HealingEvent): string {
+  switch (event.kind) {
+    case 'runtime_bypassed':
+      return 'Java override was skipped and the managed runtime was used instead.';
+    case 'preset_downgraded':
+      return event.detail ? ensureSentence(event.detail) : 'GC preset was adjusted for compatibility.';
+    case 'startup_stalled':
+      return 'Launch was stopped because no startup activity was detected.';
+    case 'fallback_applied':
+      return event.detail ? ensureSentence(event.detail) : 'Croopor retried startup with safer settings.';
+    default:
+      return event.detail ? ensureSentence(event.detail) : '';
+  }
+}
+
 function pushUniqueNoticeDetail(details: string[], detail: string | undefined): void {
   const trimmed = detail ? formatHealingDetail(detail) : '';
   if (!trimmed || details.includes(trimmed)) return;
@@ -138,6 +153,9 @@ function pushUniqueNoticeDetail(details: string[], detail: string | undefined): 
 
 function healingNoticeDetails(healing: LaunchHealingSummary): string[] {
   const details: string[] = [];
+  for (const event of healing.events || []) {
+    pushUniqueNoticeDetail(details, formatHealingEvent(event));
+  }
   for (const warning of healing.warnings || []) {
     pushUniqueNoticeDetail(details, warning);
   }
@@ -167,14 +185,8 @@ function friendlyLaunchErrorDetail(message: string): string {
 
 function surfaceHealing(healing: LaunchHealingSummary | undefined, instanceId: string, instanceName: string, showNotice = true): void {
   if (!healing) return;
-  for (const warning of healing.warnings || []) {
-    appendLog('system', warning, instanceId, instanceName);
-  }
-  if (healing.fallback_applied) {
-    appendLog('system', healing.fallback_applied, instanceId, instanceName);
-  }
-  if (healing.retry_count && healing.retry_count > 0) {
-    appendLog('system', `Launch recovered automatically after ${healing.retry_count} retry attempt${healing.retry_count > 1 ? 's' : ''}.`, instanceId, instanceName);
+  for (const detail of healingNoticeDetails(healing)) {
+    appendLog('system', detail, instanceId, instanceName);
   }
   if (!showNotice) {
     return;
@@ -336,7 +348,7 @@ async function connectLaunchEvents(sessionId: string, instanceId: string, instan
     appendLog(data.source, data.text, instanceId, instanceName);
   };
 
-  if (isWailsRuntime()) {
+  if (hasNativeDesktopRuntime()) {
     let streamHandle: { close(): void };
     const statusSubscription = onNativeEvent(nativeLaunchStatusEventName(sessionId), (data) => {
       onStatus(data, streamHandle);
