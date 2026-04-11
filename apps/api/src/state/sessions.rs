@@ -1,6 +1,6 @@
 use croopor_launcher::{
     LaunchEvent, LaunchFailure, LaunchFailureClass, LaunchLogEvent, LaunchSessionRecord,
-    LaunchState, LaunchStatusEvent, cleanup_natives_dir,
+    LaunchState, LaunchStatusEvent,
 };
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -144,14 +144,31 @@ impl SessionStore {
         record.state = LaunchState::Starting;
 
         let session_id = record.session_id.0.clone();
-        self.insert(record.clone()).await;
         let child_handle = Arc::new(Mutex::new(child));
         let mut startup_observed = Arc::new(AtomicBool::new(false));
         {
             let mut sessions = self.sessions.write().await;
             if let Some(entry) = sessions.get_mut(&session_id) {
+                record.failure = None;
+                entry.record = record.clone();
                 entry.child = Some(child_handle.clone());
                 startup_observed = entry.startup_observed.clone();
+                entry.startup_observed.store(false, Ordering::Relaxed);
+                entry.boot_completed.store(false, Ordering::Relaxed);
+                entry.log_count.store(0, Ordering::Relaxed);
+            } else {
+                let (events, _) = broadcast::channel(256);
+                sessions.insert(
+                    session_id.clone(),
+                    SessionEntry {
+                        record: record.clone(),
+                        events,
+                        child: Some(child_handle.clone()),
+                        startup_observed: startup_observed.clone(),
+                        boot_completed: Arc::new(AtomicBool::new(false)),
+                        log_count: Arc::new(AtomicUsize::new(0)),
+                    },
+                );
             }
         }
 
@@ -279,9 +296,6 @@ impl SessionStore {
             if existing.as_ref().is_some_and(|record| {
                 record.state == LaunchState::Exited && record.failure.is_some()
             }) {
-                if let Some(natives_dir) = existing.and_then(|record| record.natives_dir) {
-                    let _ = cleanup_natives_dir(std::path::Path::new(&natives_dir));
-                }
                 return;
             }
             match status {
@@ -315,13 +329,6 @@ impl SessionStore {
                         )
                         .await;
                 }
-            }
-            if let Some(natives_dir) = store
-                .get(&session_id)
-                .await
-                .and_then(|record| record.natives_dir)
-            {
-                let _ = cleanup_natives_dir(std::path::Path::new(&natives_dir));
             }
         });
     }
@@ -384,8 +391,11 @@ async fn pump_output(
 
 fn parse_launch_state(state: &str) -> LaunchState {
     match state {
+        "queued" => LaunchState::Queued,
         "planning" => LaunchState::Planning,
         "validating" => LaunchState::Validating,
+        "ensuring_runtime" => LaunchState::EnsuringRuntime,
+        "downloading_runtime" => LaunchState::DownloadingRuntime,
         "preparing" => LaunchState::Preparing,
         "starting" => LaunchState::Starting,
         "monitoring" => LaunchState::Monitoring,

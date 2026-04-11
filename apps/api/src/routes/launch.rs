@@ -8,17 +8,15 @@ use axum::{
 };
 use croopor_config::{AppConfig, Instance};
 use croopor_launcher::{
-    HealingEvent, HealingEventKind, LaunchFailureClass, LaunchState, RuntimeSelection, SessionId,
-    VanillaLaunchRequest, boot_throttle_args, cleanup_natives_dir, gc_preset_args,
-    plan_vanilla_launch, resolve_preset, resolve_runtime,
+    LaunchFailureClass, LaunchIntent, LaunchState, RecoveryAction, SessionId,
+    build_healing_summary, failure_class_name, format_failure_class, is_terminal_state,
+    is_terminal_status, launch_state_name, prepare_launch_attempt, recovery_for_failure,
+    snapshot_status,
 };
-use croopor_minecraft::{
-    JavaRuntimeInfo, JavaVersion, find_java_runtime, probe_java_runtime_info, resolve_version,
-};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::{
     convert::Infallible,
-    path::{Path as FsPath, PathBuf},
+    path::PathBuf,
     time::{Duration, SystemTime},
 };
 use tokio::process::Command;
@@ -29,45 +27,6 @@ struct LaunchRequest {
     username: Option<String>,
     max_memory_mb: Option<i32>,
     min_memory_mb: Option<i32>,
-}
-
-#[derive(Debug, Default, Serialize)]
-struct LegacyHealingSummary {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    requested_preset: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    effective_preset: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    requested_java_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    effective_java_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    auth_mode: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    warnings: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    fallback_applied: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    retry_count: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    failure_class: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    advanced_overrides: Option<bool>,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    events: Vec<HealingEvent>,
-}
-
-#[derive(Debug, Clone)]
-struct Recovery {
-    description: String,
-    action: RecoveryAction,
-}
-
-#[derive(Debug, Clone)]
-enum RecoveryAction {
-    DowngradePreset(String),
-    DisableCustomGc,
-    SwitchManagedRuntime,
 }
 
 pub fn router() -> Router<AppState> {
@@ -82,22 +41,28 @@ async fn handle_launch(
     State(state): State<AppState>,
     Json(payload): Json<LaunchRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let mc_dir = state.mc_dir().ok_or_else(|| {
+    let library_dir = state.library_dir().ok_or_else(|| {
         (
             StatusCode::PRECONDITION_FAILED,
-            Json(serde_json::json!({ "error": "minecraft directory not configured" })),
+            Json(serde_json::json!({ "error": "Croopor library is not configured" })),
         )
     })?;
-    let mc_dir = PathBuf::from(mc_dir);
+    let library_dir = PathBuf::from(library_dir);
 
-    let mut instance = state.instances().get(&payload.instance_id).ok_or_else(|| {
+    let instance = state.instances().get(&payload.instance_id).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": "instance not found" })),
         )
     })?;
-    let config = state.config().current();
+    if state.sessions().has_active_instance(&instance.id).await {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "instance already has an active session" })),
+        ));
+    }
 
+    let config = state.config().current();
     let username = payload
         .username
         .as_deref()
@@ -111,178 +76,223 @@ async fn handle_launch(
     let requested_preset = selected_jvm_preset(&instance, &config);
     let advanced_overrides = has_advanced_overrides(&instance);
     let launched_at = chrono::DateTime::<chrono::Utc>::from(SystemTime::now()).to_rfc3339();
-    let base_extra_jvm_args = split_jvm_args(&instance.extra_jvm_args);
+    let session_id = SessionId(generate_session_id());
 
-    let version = resolve_version(&mc_dir, &instance.version_id).map_err(internal_error)?;
-    let mut runtime =
-        resolve_runtime_selection(&mc_dir, &version.java_version, &requested_java, false).map_err(
-            |error| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({
-                        "error": format!("resolve java: {error}"),
-                        "healing": build_healing_summary(HealingSummaryInput {
-                            requested_java_path: &requested_java,
-                            requested_preset: &requested_preset,
-                            effective_java_path: None,
-                            effective_preset: None,
-                            advanced_overrides,
-                            fallback_applied: None,
-                            retry_count: 0,
-                            failure_class: Some(LaunchFailureClass::JavaRuntimeMismatch),
-                        })
-                    })),
-                )
-            },
-        )?;
+    let intent = LaunchIntent {
+        session_id: session_id.0.clone(),
+        library_dir: library_dir.clone(),
+        instance_id: instance.id.clone(),
+        version_id: instance.version_id.clone(),
+        username: username.clone(),
+        requested_java: requested_java.clone(),
+        requested_preset: requested_preset.clone(),
+        extra_jvm_args: split_jvm_args(&instance.extra_jvm_args),
+        max_memory_mb,
+        min_memory_mb,
+        resolution: selected_resolution(&instance, &config),
+        launcher_name: "croopor".to_string(),
+        launcher_version: state.version().to_string(),
+        game_dir: Some(state.instances().game_dir(&instance.id)),
+        advanced_overrides,
+    };
 
-    if runtime.effective_path.is_empty() {
-        return Err(internal_error("effective runtime path is empty"));
-    }
-    if runtime.effective_info.major == 0 && version.java_version.major_version > 0 {
-        runtime.effective_info.major = version.java_version.major_version as u32;
-    }
-
-    let loader = infer_loader(&instance.version_id);
-    let is_modded = loader != "vanilla" || !version.inherits_from.trim().is_empty();
-    let mut effective_preset = resolve_preset(
-        &requested_preset,
-        &instance.version_id,
-        loader,
-        is_modded,
-        &runtime.effective_info,
-    );
-
-    if advanced_overrides {
-        if let Err((class, message)) = validate_manual_java_override(
-            &requested_java,
-            &runtime,
-            version.java_version.major_version,
-        ) {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": message,
-                    "healing": build_healing_summary(HealingSummaryInput {
-                        requested_java_path: &requested_java,
-                        requested_preset: &requested_preset,
-                        effective_java_path: Some(runtime.effective_path.as_str()),
-                        effective_preset: Some(effective_preset.as_str()),
-                        advanced_overrides,
-                        fallback_applied: None,
-                        retry_count: 0,
-                        failure_class: Some(class),
-                    }),
-                })),
-            ));
-        }
-        if let Err((class, message)) =
-            validate_manual_jvm_args(&base_extra_jvm_args, &runtime.effective_info)
-        {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": message,
-                    "healing": build_healing_summary(HealingSummaryInput {
-                        requested_java_path: &requested_java,
-                        requested_preset: &requested_preset,
-                        effective_java_path: Some(runtime.effective_path.as_str()),
-                        effective_preset: Some(effective_preset.as_str()),
-                        advanced_overrides,
-                        fallback_applied: None,
-                        retry_count: 0,
-                        failure_class: Some(class),
-                    }),
-                })),
-            ));
-        }
-    }
-
-    let mut retry_count = 0u32;
-    let mut fallback_applied: Option<String> = None;
-    let mut disable_custom_gc = false;
-
-    loop {
-        let session_id = SessionId(generate_session_id());
-        let healing = build_healing_summary(HealingSummaryInput {
-            requested_java_path: &requested_java,
-            requested_preset: &requested_preset,
-            effective_java_path: Some(runtime.effective_path.as_str()),
-            effective_preset: Some(effective_preset.as_str()),
-            advanced_overrides,
-            fallback_applied: fallback_applied.as_deref(),
-            retry_count,
-            failure_class: None,
-        });
-
-        let mut extra_jvm_args = boot_throttle_args(runtime.effective_info.major);
-        if !effective_preset.trim().is_empty() && !disable_custom_gc {
-            extra_jvm_args.extend(gc_preset_args(&effective_preset, &runtime.effective_info));
-        }
-        extra_jvm_args.extend(base_extra_jvm_args.iter().cloned());
-
-        let plan = plan_vanilla_launch(&VanillaLaunchRequest {
-            session_id: session_id.0.clone(),
-            mc_dir: mc_dir.clone(),
-            version_id: instance.version_id.clone(),
-            username: username.clone(),
-            runtime: runtime.clone(),
-            game_dir: Some(state.instances().game_dir(&instance.id)),
-            launcher_name: "croopor".to_string(),
-            launcher_version: state.version().to_string(),
-            min_memory_mb: Some(min_memory_mb),
-            max_memory_mb: Some(max_memory_mb),
-            extra_jvm_args,
-            resolution: selected_resolution(&instance, &config),
-        })
-        .map_err(internal_error)?;
-
-        if plan.command.len() < 2 {
-            return Err(internal_error(
-                "launch plan did not produce a runnable command",
-            ));
-        }
-
-        let mut command = Command::new(&plan.command[0]);
-        command.args(&plan.command[1..]);
-        command.current_dir(&plan.game_dir);
-
-        let record = LaunchSessionRecord {
+    state
+        .sessions()
+        .insert(LaunchSessionRecord {
             session_id: session_id.clone(),
             instance_id: instance.id.clone(),
             version_id: instance.version_id.clone(),
+            state: LaunchState::Queued,
+            pid: None,
+            exit_code: None,
+            command: Vec::new(),
+            java_path: None,
+            natives_dir: None,
+            failure: None,
+            healing: None,
+        })
+        .await;
+
+    let state_task = state.clone();
+    let instance_task = instance.clone();
+    let config_task = config.clone();
+    let launched_at_task = launched_at.clone();
+    tokio::spawn(async move {
+        run_launch_session(
+            state_task,
+            instance_task,
+            config_task,
+            intent,
+            username,
+            launched_at_task,
+            requested_java,
+            requested_preset,
+            advanced_overrides,
+        )
+        .await;
+    });
+
+    Ok(Json(serde_json::json!({
+        "status": "accepted",
+        "session_id": session_id.0,
+        "instance_id": instance.id,
+        "pid": 0,
+        "launched_at": launched_at,
+        "healing": null,
+    })))
+}
+
+async fn run_launch_session(
+    state: AppState,
+    mut instance: Instance,
+    config: AppConfig,
+    intent: LaunchIntent,
+    username: String,
+    launched_at: String,
+    requested_java: String,
+    requested_preset: String,
+    advanced_overrides: bool,
+) {
+    let session_id = intent.session_id.clone();
+    let mut attempt = croopor_launcher::service::AttemptOverrides::default();
+
+    loop {
+        emit_status(&state, &session_id, LaunchState::Validating, None, None, None).await;
+        state
+            .sessions()
+            .emit_log(
+                &session_id,
+                "system",
+                format!("Preparing launch for {}.", instance.name),
+            )
+            .await;
+
+        let prepared = match prepare_launch_attempt(&intent, &attempt).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let failure_class = error.failure_class.unwrap_or(LaunchFailureClass::Unknown);
+                emit_terminal_failure(
+                    &state,
+                    &session_id,
+                    failure_class,
+                    &error.message,
+                    error.healing,
+                )
+                .await;
+                return;
+            }
+        };
+
+        if prepared.runtime.bypassed_requested_runtime {
+            state
+                .sessions()
+                .emit_log(
+                    &session_id,
+                    "system",
+                    "Croopor bypassed the selected Java override and will use the managed runtime."
+                        .to_string(),
+                )
+                .await;
+        }
+        if prepared.runtime.effective_source == "managed" {
+            emit_status(
+                &state,
+                &session_id,
+                LaunchState::EnsuringRuntime,
+                None,
+                None,
+                prepared.healing.clone(),
+            )
+            .await;
+        }
+
+        emit_status(
+            &state,
+            &session_id,
+            LaunchState::Planning,
+            None,
+            None,
+            prepared.healing.clone(),
+        )
+        .await;
+        state
+            .sessions()
+            .emit_log(
+                &session_id,
+                "system",
+                format!(
+                    "Using Java {} via {}.",
+                    prepared.runtime.effective_info.major,
+                    prepared.runtime.effective_source
+                ),
+            )
+            .await;
+
+        if prepared.plan.command.len() < 2 {
+            emit_terminal_failure(
+                &state,
+                &session_id,
+                LaunchFailureClass::Unknown,
+                "launch plan did not produce a runnable command",
+                prepared.healing.clone(),
+            )
+            .await;
+            return;
+        }
+
+        let mut command = Command::new(&prepared.plan.command[0]);
+        command.args(&prepared.plan.command[1..]);
+        command.current_dir(&prepared.plan.game_dir);
+
+        let record = LaunchSessionRecord {
+            session_id: SessionId(session_id.clone()),
+            instance_id: intent.instance_id.clone(),
+            version_id: intent.version_id.clone(),
             state: LaunchState::Starting,
             pid: None,
             exit_code: None,
-            command: plan.command.clone(),
-            java_path: Some(runtime.effective_path.clone()),
-            natives_dir: plan
+            command: prepared.plan.command.clone(),
+            java_path: Some(prepared.runtime.effective_path.clone()),
+            natives_dir: prepared
+                .plan
                 .natives_dir
                 .as_ref()
                 .map(|path| path.to_string_lossy().to_string()),
             failure: None,
-            healing: healing
+            healing: prepared
+                .healing
                 .as_ref()
-                .map(|value| serde_json::to_value(value).unwrap_or_default()),
+                .and_then(|value| serde_json::to_value(value).ok()),
         };
 
-        let launched = state
-            .sessions()
-            .start_process(record, command)
-            .await
-            .map_err(|error| {
-                if let Some(natives_dir) = &plan.natives_dir {
-                    let _ = cleanup_natives_dir(natives_dir);
-                }
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "error": format!("failed to start launch process: {error}") })),
+        let launched = match state.sessions().start_process(record, command).await {
+            Ok(record) => record,
+            Err(error) => {
+                emit_terminal_failure(
+                    &state,
+                    &session_id,
+                    LaunchFailureClass::Unknown,
+                    &format!("failed to start launch process: {error}"),
+                    prepared.healing.clone(),
                 )
-            })?;
+                .await;
+                return;
+            }
+        };
+
+        emit_status(
+            &state,
+            &session_id,
+            LaunchState::Monitoring,
+            launched.pid,
+            None,
+            prepared.healing.clone(),
+        )
+        .await;
 
         let outcome = state
             .sessions()
-            .wait_for_startup(&session_id.0, Duration::from_secs(5))
+            .wait_for_startup(&session_id, Duration::from_secs(5))
             .await;
 
         match outcome {
@@ -292,27 +302,19 @@ async fn handle_launch(
                     &mut instance,
                     &config,
                     &username,
-                    max_memory_mb,
-                    min_memory_mb,
+                    intent.max_memory_mb,
+                    intent.min_memory_mb,
                     &launched_at,
                 );
-
-                return Ok(Json(serde_json::json!({
-                    "status": "launching",
-                    "session_id": launched.session_id.0,
-                    "instance_id": launched.instance_id,
-                    "pid": launched.pid,
-                    "launched_at": launched_at,
-                    "healing": launched.healing,
-                })));
+                return;
             }
             StartupOutcome::Exited | StartupOutcome::Stalled => {
                 let stalled = matches!(outcome, StartupOutcome::Stalled);
                 if stalled {
-                    let _ = state.sessions().kill(&session_id.0).await;
+                    let _ = state.sessions().kill(&session_id).await;
                 }
 
-                let failed_record = state.sessions().get(&session_id.0).await;
+                let failed_record = state.sessions().get(&session_id).await;
                 let failure_class = if stalled {
                     LaunchFailureClass::StartupStalled
                 } else {
@@ -321,82 +323,51 @@ async fn handle_launch(
                         .and_then(|record| record.failure.as_ref().map(|failure| failure.class))
                         .unwrap_or(LaunchFailureClass::Unknown)
                 };
-
-                if let Some(natives_dir) = failed_record
-                    .as_ref()
-                    .and_then(|record| record.natives_dir.as_ref())
-                {
-                    let _ = cleanup_natives_dir(FsPath::new(natives_dir));
-                }
-                state.sessions().remove(&session_id.0).await;
-
-                if retry_count == 0
+                if attempt.retry_count == 0
                     && let Some(recovery) = recovery_for_failure(
                         failure_class,
-                        &instance.version_id,
-                        &runtime.effective_info,
+                        &intent.version_id,
+                        &prepared.runtime.effective_info,
                         &requested_java,
                         advanced_overrides,
-                        disable_custom_gc,
-                        &effective_preset,
+                        attempt.disable_custom_gc,
+                        &prepared.effective_preset,
                     )
                 {
-                    retry_count += 1;
-                    fallback_applied = Some(recovery.description.clone());
+                    state
+                        .sessions()
+                        .emit_log(&session_id, "system", recovery.description.clone())
+                        .await;
+                    attempt.retry_count += 1;
+                    attempt.fallback_applied = Some(recovery.description.clone());
                     match recovery.action {
                         RecoveryAction::DowngradePreset(next_preset) => {
-                            effective_preset = next_preset;
-                            disable_custom_gc = false;
+                            attempt.preset_override = Some(next_preset);
+                            attempt.disable_custom_gc = false;
                         }
                         RecoveryAction::DisableCustomGc => {
-                            effective_preset.clear();
-                            disable_custom_gc = true;
+                            attempt.preset_override = None;
+                            attempt.disable_custom_gc = true;
                         }
                         RecoveryAction::SwitchManagedRuntime => {
-                            runtime = resolve_runtime_selection(
-                                &mc_dir,
-                                &version.java_version,
-                                &requested_java,
-                                true,
-                            )
-                            .map_err(|error| {
-                                (
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    Json(serde_json::json!({
-                                        "error": format!("resolve java: {error}")
-                                    })),
-                                )
-                            })?;
-                            if runtime.effective_info.major == 0
-                                && version.java_version.major_version > 0
-                            {
-                                runtime.effective_info.major =
-                                    version.java_version.major_version as u32;
-                            }
-                            effective_preset = resolve_preset(
-                                &requested_preset,
-                                &instance.version_id,
-                                loader,
-                                is_modded,
-                                &runtime.effective_info,
-                            );
-                            disable_custom_gc = false;
+                            attempt.force_managed_runtime = true;
+                            attempt.preset_override = None;
+                            attempt.disable_custom_gc = false;
                         }
                     }
                     continue;
                 }
 
-                let healing = build_healing_summary(HealingSummaryInput {
+                let healing = build_healing_summary(croopor_launcher::service::HealingSummaryInput {
                     requested_java_path: &requested_java,
                     requested_preset: &requested_preset,
-                    effective_java_path: Some(runtime.effective_path.as_str()),
-                    effective_preset: Some(effective_preset.as_str()),
+                    effective_java_path: Some(prepared.runtime.effective_path.as_str()),
+                    effective_preset: Some(prepared.effective_preset.as_str()),
                     advanced_overrides,
-                    fallback_applied: fallback_applied.as_deref(),
-                    retry_count,
+                    fallback_applied: attempt.fallback_applied.as_deref(),
+                    retry_count: attempt.retry_count,
                     failure_class: Some(failure_class),
                 });
-
                 let message = if failure_class == LaunchFailureClass::StartupStalled {
                     "launch stopped before startup: no startup activity observed".to_string()
                 } else {
@@ -405,13 +376,8 @@ async fn handle_launch(
                         format_failure_class(failure_class)
                     )
                 };
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({
-                        "error": message,
-                        "healing": healing,
-                    })),
-                ));
+                emit_terminal_failure(&state, &session_id, failure_class, &message, healing).await;
+                return;
             }
         }
     }
@@ -502,6 +468,57 @@ async fn handle_launch_kill(
     Ok(Json(serde_json::json!({ "status": "killed" })))
 }
 
+async fn emit_status(
+    state: &AppState,
+    session_id: &str,
+    launch_state: LaunchState,
+    pid: Option<u32>,
+    failure_class: Option<LaunchFailureClass>,
+    healing: Option<croopor_launcher::LaunchHealingSummary>,
+) {
+    state
+        .sessions()
+        .emit_status(
+            session_id,
+            LaunchStatusEvent {
+                state: launch_state_name(launch_state).to_string(),
+                pid,
+                exit_code: None,
+                failure_class: failure_class.map(failure_class_name).map(str::to_string),
+                failure_detail: None,
+                healing: healing.and_then(|value| serde_json::to_value(value).ok()),
+            },
+        )
+        .await;
+}
+
+async fn emit_terminal_failure(
+    state: &AppState,
+    session_id: &str,
+    failure_class: LaunchFailureClass,
+    message: &str,
+    healing: Option<croopor_launcher::LaunchHealingSummary>,
+) {
+    state
+        .sessions()
+        .emit_log(session_id, "system", message.to_string())
+        .await;
+    state
+        .sessions()
+        .emit_status(
+            session_id,
+            LaunchStatusEvent {
+                state: "exited".to_string(),
+                pid: None,
+                exit_code: Some(-1),
+                failure_class: Some(failure_class_name(failure_class).to_string()),
+                failure_detail: Some(message.to_string()),
+                healing: healing.and_then(|value| serde_json::to_value(value).ok()),
+            },
+        )
+        .await;
+}
+
 fn selected_java_override(instance: &Instance, config: &AppConfig) -> String {
     if !instance.java_path.trim().is_empty() {
         instance.java_path.trim().to_string()
@@ -575,114 +592,6 @@ fn has_advanced_overrides(instance: &Instance) -> bool {
         || !instance.extra_jvm_args.trim().is_empty()
 }
 
-struct HealingSummaryInput<'a> {
-    requested_java_path: &'a str,
-    requested_preset: &'a str,
-    effective_java_path: Option<&'a str>,
-    effective_preset: Option<&'a str>,
-    advanced_overrides: bool,
-    fallback_applied: Option<&'a str>,
-    retry_count: u32,
-    failure_class: Option<LaunchFailureClass>,
-}
-
-fn build_healing_summary(input: HealingSummaryInput<'_>) -> Option<LegacyHealingSummary> {
-    let requested_java_path = (!input.requested_java_path.trim().is_empty())
-        .then(|| input.requested_java_path.to_string());
-    let requested_preset = (!input.requested_preset.trim().is_empty())
-        .then(|| input.requested_preset.trim().to_string());
-    let effective_java_path = input
-        .effective_java_path
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_string);
-    let effective_preset = input
-        .effective_preset
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_string);
-    let fallback_applied = input
-        .fallback_applied
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_string);
-    let failure_class_name = input
-        .failure_class
-        .map(failure_class_name)
-        .map(str::to_string);
-
-    let mut warnings = Vec::new();
-    let mut events = Vec::new();
-
-    if let Some(requested) = requested_preset.as_ref() {
-        let effective = effective_preset.as_deref().unwrap_or("none");
-        if requested != effective {
-            let detail = format!(
-                "Requested JVM preset \"{requested}\" was downgraded to \"{effective}\" for compatibility"
-            );
-            warnings.push(detail.clone());
-            events.push(HealingEvent {
-                kind: HealingEventKind::PresetDowngraded,
-                detail: Some(detail),
-            });
-        }
-    }
-    if let (Some(requested), Some(effective)) =
-        (requested_java_path.as_ref(), effective_java_path.as_ref())
-        && requested != effective
-    {
-        let detail =
-            "Requested Java override was bypassed in favor of a safer managed runtime".to_string();
-        warnings.push(detail.clone());
-        events.push(HealingEvent {
-            kind: HealingEventKind::RuntimeBypassed,
-            detail: Some(format!("requested={requested} effective={effective}")),
-        });
-    }
-    if let Some(detail) = fallback_applied.as_ref() {
-        events.push(HealingEvent {
-            kind: HealingEventKind::FallbackApplied,
-            detail: Some(detail.clone()),
-        });
-    }
-    if matches!(
-        input.failure_class,
-        Some(LaunchFailureClass::StartupStalled)
-    ) {
-        events.push(HealingEvent {
-            kind: HealingEventKind::StartupStalled,
-            detail: Some("no startup activity observed".to_string()),
-        });
-    }
-
-    let summary = LegacyHealingSummary {
-        requested_preset,
-        effective_preset,
-        requested_java_path,
-        effective_java_path,
-        auth_mode: Some("offline".to_string()),
-        warnings,
-        fallback_applied,
-        retry_count: (input.retry_count > 0).then_some(input.retry_count),
-        failure_class: failure_class_name,
-        advanced_overrides: Some(input.advanced_overrides),
-        events,
-    };
-
-    if summary.requested_preset.is_none()
-        && summary.effective_preset.is_none()
-        && summary.requested_java_path.is_none()
-        && summary.effective_java_path.is_none()
-        && summary.warnings.is_empty()
-        && summary.fallback_applied.is_none()
-        && summary.retry_count.is_none()
-        && summary.failure_class.is_none()
-        && summary.events.is_empty()
-        && !input.advanced_overrides
-    {
-        None
-    } else {
-        Some(summary)
-    }
-}
-
 fn persist_launch_metadata(
     state: &AppState,
     instance: &mut Instance,
@@ -707,36 +616,12 @@ fn persist_launch_metadata(
     let _ = state.config().update(next);
 }
 
-fn internal_error(error: impl std::fmt::Display) -> (StatusCode, Json<serde_json::Value>) {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(serde_json::json!({ "error": error.to_string() })),
-    )
-}
-
 fn generate_session_id() -> String {
     let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|value| value.as_nanos())
         .unwrap_or_default();
     format!("{:032x}", nanos)
-}
-
-fn snapshot_status(record: &LaunchSessionRecord) -> LaunchStatusEvent {
-    LaunchStatusEvent {
-        state: launch_state_name(record.state).to_string(),
-        pid: record.pid,
-        exit_code: record.exit_code,
-        failure_class: record
-            .failure
-            .as_ref()
-            .map(|failure| failure_class_name(failure.class).to_string()),
-        failure_detail: record
-            .failure
-            .as_ref()
-            .and_then(|failure| failure.detail.clone()),
-        healing: record.healing.clone(),
-    }
 }
 
 fn status_event(status: &LaunchStatusEvent) -> Event {
@@ -749,265 +634,4 @@ fn log_event(log: &crate::state::LaunchLogEvent) -> Event {
     Event::default()
         .event("log")
         .data(serde_json::to_string(log).unwrap_or_else(|_| "{}".to_string()))
-}
-
-fn is_terminal_status(status: &LaunchStatusEvent) -> bool {
-    matches!(status.state.as_str(), "failed" | "exited")
-}
-
-fn is_terminal_state(state: LaunchState) -> bool {
-    matches!(state, LaunchState::Failed | LaunchState::Exited)
-}
-
-fn launch_state_name(state: LaunchState) -> &'static str {
-    match state {
-        LaunchState::Idle => "idle",
-        LaunchState::Planning => "planning",
-        LaunchState::Validating => "validating",
-        LaunchState::Preparing => "preparing",
-        LaunchState::Starting => "starting",
-        LaunchState::Monitoring => "monitoring",
-        LaunchState::Running => "running",
-        LaunchState::Degraded => "degraded",
-        LaunchState::Failed => "failed",
-        LaunchState::Exited => "exited",
-    }
-}
-
-fn failure_class_name(class: LaunchFailureClass) -> &'static str {
-    match class {
-        LaunchFailureClass::Unknown => "unknown",
-        LaunchFailureClass::JvmUnsupportedOption => "jvm_unsupported_option",
-        LaunchFailureClass::JvmExperimentalUnlock => "jvm_experimental_unlock_required",
-        LaunchFailureClass::JvmOptionOrdering => "jvm_option_ordering",
-        LaunchFailureClass::JavaRuntimeMismatch => "java_runtime_mismatch",
-        LaunchFailureClass::ClasspathModuleConflict => "classpath_or_module_conflict",
-        LaunchFailureClass::AuthModeIncompatible => "auth_mode_incompatible",
-        LaunchFailureClass::LoaderBootstrapFailure => "loader_bootstrap_failure",
-        LaunchFailureClass::StartupStalled => "startup_stalled",
-    }
-}
-
-fn format_failure_class(class: LaunchFailureClass) -> &'static str {
-    match class {
-        LaunchFailureClass::Unknown => "unknown startup failure",
-        LaunchFailureClass::JvmUnsupportedOption => "unsupported JVM option",
-        LaunchFailureClass::JvmExperimentalUnlock => "experimental JVM option requires unlock",
-        LaunchFailureClass::JvmOptionOrdering => "JVM option ordering conflict",
-        LaunchFailureClass::JavaRuntimeMismatch => "Java runtime mismatch",
-        LaunchFailureClass::ClasspathModuleConflict => "classpath or module conflict",
-        LaunchFailureClass::AuthModeIncompatible => "auth mode incompatibility",
-        LaunchFailureClass::LoaderBootstrapFailure => "loader bootstrap failure",
-        LaunchFailureClass::StartupStalled => "startup stalled",
-    }
-}
-
-fn infer_loader(version_id: &str) -> &'static str {
-    let version = version_id.to_ascii_lowercase();
-    if version.contains("neoforge") {
-        "neoforge"
-    } else if version.contains("fabric") {
-        "fabric"
-    } else if version.contains("forge") {
-        "forge"
-    } else if version.contains("quilt") {
-        "quilt"
-    } else {
-        "vanilla"
-    }
-}
-
-fn resolve_runtime_selection(
-    mc_dir: &FsPath,
-    java_version: &JavaVersion,
-    requested_java: &str,
-    force_managed: bool,
-) -> Result<RuntimeSelection, croopor_minecraft::JavaRuntimeLookupError> {
-    resolve_runtime::<croopor_minecraft::JavaRuntimeLookupError, _>(
-        java_version,
-        requested_java.to_string(),
-        force_managed,
-        Some(|override_value: &str| {
-            let runtime = find_java_runtime(mc_dir, java_version, override_value)?;
-            let info =
-                probe_java_runtime_info(FsPath::new(&runtime.path), Some(&runtime.component))?;
-            Ok((Some(runtime), info))
-        }),
-    )
-    .map_err(|error| match error {
-        croopor_launcher::RuntimeSelectionError::Resolve(error) => error,
-        croopor_launcher::RuntimeSelectionError::MissingResolver => {
-            croopor_minecraft::JavaRuntimeLookupError::Probe(
-                "runtime resolver is required".to_string(),
-            )
-        }
-    })
-}
-
-fn validate_manual_java_override(
-    requested_java: &str,
-    runtime: &RuntimeSelection,
-    required_major: i32,
-) -> Result<(), (LaunchFailureClass, String)> {
-    if requested_java.trim().is_empty() || requested_java.trim() != runtime.effective_path.trim() {
-        return Ok(());
-    }
-    if required_major > 0
-        && runtime.effective_info.major > 0
-        && runtime.effective_info.major as i32 != required_major
-    {
-        return Err((
-            LaunchFailureClass::JavaRuntimeMismatch,
-            format!(
-                "explicit Java override targets Java {} but this version requires Java {}",
-                runtime.effective_info.major, required_major
-            ),
-        ));
-    }
-    if required_major == 8
-        && runtime.effective_info.major == 8
-        && runtime.effective_info.update > 0
-        && runtime.effective_info.update < 312
-    {
-        return Err((
-            LaunchFailureClass::JavaRuntimeMismatch,
-            format!(
-                "explicit Java 8 override is too old for legacy support (8u{} detected; use 8u312 or newer)",
-                runtime.effective_info.update
-            ),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_manual_jvm_args(
-    args: &[String],
-    info: &JavaRuntimeInfo,
-) -> Result<(), (LaunchFailureClass, String)> {
-    if args.is_empty() {
-        return Ok(());
-    }
-    let unlock_index = args
-        .iter()
-        .position(|arg| arg == "-XX:+UnlockExperimentalVMOptions");
-    for (index, arg) in args.iter().enumerate() {
-        match () {
-            _ if arg == "-XX:+UseShenandoahGC"
-                && !croopor_launcher::jvm::supports_shenandoah(info) =>
-            {
-                return Err((
-                    LaunchFailureClass::JvmUnsupportedOption,
-                    "explicit JVM args request Shenandoah on an unsupported runtime".to_string(),
-                ));
-            }
-            _ if arg == "-XX:+UseZGC" && !croopor_launcher::jvm::supports_zgc(info) => {
-                return Err((
-                    LaunchFailureClass::JvmUnsupportedOption,
-                    "explicit JVM args request ZGC on an unsupported runtime".to_string(),
-                ));
-            }
-            _ if arg == "-XX:+ZGenerational"
-                && !croopor_launcher::jvm::supports_generational_zgc(info) =>
-            {
-                return Err((
-                    LaunchFailureClass::JvmUnsupportedOption,
-                    "explicit JVM args request Generational ZGC on an unsupported runtime"
-                        .to_string(),
-                ));
-            }
-            _ if arg.starts_with("-XX:G1NewSizePercent=")
-                || arg.starts_with("-XX:G1MaxNewSizePercent=") =>
-            {
-                if !croopor_launcher::jvm::supports_hotspot_tuning(info) {
-                    return Err((
-                        LaunchFailureClass::JvmUnsupportedOption,
-                        "explicit JVM args request experimental G1 tuning on an unsupported runtime"
-                            .to_string(),
-                    ));
-                }
-                if unlock_index.is_none() {
-                    return Err((
-                        LaunchFailureClass::JvmExperimentalUnlock,
-                        "explicit JVM args require -XX:+UnlockExperimentalVMOptions".to_string(),
-                    ));
-                }
-                if unlock_index.is_some_and(|unlock| unlock > index) {
-                    return Err((
-                        LaunchFailureClass::JvmOptionOrdering,
-                        "explicit JVM args place -XX:+UnlockExperimentalVMOptions after dependent flags"
-                            .to_string(),
-                    ));
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-fn recovery_for_failure(
-    class: LaunchFailureClass,
-    version_id: &str,
-    info: &JavaRuntimeInfo,
-    requested_java: &str,
-    advanced_overrides: bool,
-    disable_custom_gc: bool,
-    effective_preset: &str,
-) -> Option<Recovery> {
-    if advanced_overrides {
-        return None;
-    }
-
-    match class {
-        LaunchFailureClass::JvmUnsupportedOption
-        | LaunchFailureClass::JvmExperimentalUnlock
-        | LaunchFailureClass::JvmOptionOrdering => {
-            if !effective_preset.trim().is_empty() {
-                let preset = conservative_healing_preset(version_id, info);
-                if !preset.is_empty() && preset != effective_preset {
-                    return Some(Recovery {
-                        description: format!(
-                            "Automatic retry: downgraded JVM preset to \"{preset}\" after startup failure"
-                        ),
-                        action: RecoveryAction::DowngradePreset(preset),
-                    });
-                }
-            }
-            if !disable_custom_gc {
-                return Some(Recovery {
-                    description: "Automatic retry: disabled custom GC flags after startup failure"
-                        .to_string(),
-                    action: RecoveryAction::DisableCustomGc,
-                });
-            }
-        }
-        LaunchFailureClass::JavaRuntimeMismatch => {
-            if !requested_java.trim().is_empty() {
-                return Some(Recovery {
-                    description: "Automatic retry: switched to managed Java after runtime mismatch"
-                        .to_string(),
-                    action: RecoveryAction::SwitchManagedRuntime,
-                });
-            }
-        }
-        _ => {}
-    }
-    None
-}
-
-fn conservative_healing_preset(version_id: &str, info: &JavaRuntimeInfo) -> String {
-    if info.major <= 8 || is_legacy_version_family(version_id) {
-        "legacy".to_string()
-    } else {
-        "performance".to_string()
-    }
-}
-
-fn is_legacy_version_family(version_id: &str) -> bool {
-    let base = version_id.split("-forge-").next().unwrap_or(version_id);
-    let numbers = base
-        .split('.')
-        .filter_map(|part| part.parse::<u32>().ok())
-        .collect::<Vec<_>>();
-    matches!(numbers.as_slice(), [1, minor, ..] if *minor <= 12)
 }

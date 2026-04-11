@@ -1,7 +1,7 @@
 use crate::launch::{Library, VersionJson, maven_to_path};
 use crate::manifest::fetch_version_manifest;
 use crate::paths::{assets_dir, libraries_dir, versions_dir};
-use crate::rules::{default_environment, evaluate_rules};
+use crate::rules::{current_os_arch, default_environment, evaluate_rules};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -292,17 +292,37 @@ impl Downloader {
             fs::create_dir_all(parent)?;
         }
 
-        let response = self.client.get(url).send().await?.error_for_status()?;
         let tmp_path = destination.with_extension("tmp");
-        let mut output = fs::File::create(&tmp_path)?;
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            output.write_all(&chunk)?;
+        let mut last_error: Option<DownloadError> = None;
+
+        for attempt in 0..3 {
+            let result = async {
+                let response = self.client.get(url).send().await?.error_for_status()?;
+                let mut output = fs::File::create(&tmp_path)?;
+                let mut stream = response.bytes_stream();
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk?;
+                    output.write_all(&chunk)?;
+                }
+                output.flush()?;
+                fs::rename(&tmp_path, destination)?;
+                Ok::<(), DownloadError>(())
+            }
+            .await;
+
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    last_error = Some(error);
+                    let _ = fs::remove_file(&tmp_path);
+                    if attempt < 2 {
+                        tokio::time::sleep(Duration::from_millis(250 * (attempt + 1) as u64)).await;
+                    }
+                }
+            }
         }
-        output.flush()?;
-        fs::rename(tmp_path, destination)?;
-        Ok(())
+
+        Err(last_error.unwrap_or_else(|| DownloadError::ResolveManifest("download failed".to_string())))
     }
 }
 
@@ -402,32 +422,26 @@ fn resolve_library_download(lib: &Library, mc_dir: &Path) -> Option<DownloadJob>
 }
 
 fn resolve_native_download(lib: &Library, mc_dir: &Path, os_name: &str) -> Option<DownloadJob> {
-    let classifier_key = lib.natives.get(os_name)?.replace(
-        "${arch}",
-        if cfg!(target_arch = "x86_64") || cfg!(target_arch = "aarch64") {
-            "64"
-        } else {
-            "32"
-        },
-    );
-
     let lib_dir = libraries_dir(mc_dir);
-    if let Some(artifact) = lib
-        .downloads
-        .as_ref()
-        .and_then(|downloads| downloads.classifiers.get(&classifier_key))
-    {
-        let path = resolve_path_under_root(&lib_dir, &artifact.path)?;
-        return Some(DownloadJob {
-            name: Path::new(&artifact.path)
-                .file_name()
-                .map(|value| value.to_string_lossy().to_string())
-                .unwrap_or_else(|| format!("{}:{classifier_key}", lib.name)),
-            path,
-            url: artifact.url.clone(),
-        });
+    for classifier_key in native_classifier_candidates(lib, os_name) {
+        if let Some(artifact) = lib
+            .downloads
+            .as_ref()
+            .and_then(|downloads| downloads.classifiers.get(&classifier_key))
+        {
+            let path = resolve_path_under_root(&lib_dir, &artifact.path)?;
+            return Some(DownloadJob {
+                name: Path::new(&artifact.path)
+                    .file_name()
+                    .map(|value| value.to_string_lossy().to_string())
+                    .unwrap_or_else(|| format!("{}:{classifier_key}", lib.name)),
+                path,
+                url: artifact.url.clone(),
+            });
+        }
     }
 
+    let classifier_key = native_classifier_candidates(lib, os_name).into_iter().next()?;
     let maven_path = maven_to_path(&format!("{}:{classifier_key}", lib.name));
     if maven_path.as_os_str().is_empty() {
         return None;
@@ -454,6 +468,33 @@ fn resolve_native_download(lib: &Library, mc_dir: &Path, os_name: &str) -> Optio
     })
 }
 
+fn native_classifier_candidates(lib: &Library, os_name: &str) -> Vec<String> {
+    let Some(base) = lib.natives.get(os_name) else {
+        return Vec::new();
+    };
+
+    let arch = current_os_arch();
+    let mut candidates = Vec::new();
+    let variants = match arch {
+        "x86_64" => vec![
+            base.replace("${arch}", "64"),
+            base.replace("-${arch}", ""),
+            base.replace("${arch}", "x86_64"),
+        ],
+        "x86" => vec![base.replace("${arch}", "32"), base.replace("${arch}", "x86")],
+        "arm64" => vec![base.replace("${arch}", "arm64"), base.replace("${arch}", "64")],
+        _ => vec![base.replace("${arch}", arch)],
+    };
+
+    for variant in variants {
+        if !variant.is_empty() && !candidates.contains(&variant) {
+            candidates.push(variant);
+        }
+    }
+
+    candidates
+}
+
 fn library_jobs_for(
     mc_dir: &Path,
     libraries: &[Library],
@@ -463,6 +504,10 @@ fn library_jobs_for(
 
     for lib in libraries {
         if !evaluate_rules(&lib.rules, env) {
+            continue;
+        }
+
+        if crate::rules::is_native_library(&lib.name) && !native_name_matches_env(&lib.name, env) {
             continue;
         }
 
@@ -477,6 +522,38 @@ fn library_jobs_for(
     jobs
 }
 
+fn native_name_matches_env(name: &str, env: &crate::rules::Environment) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if !lower.contains("natives-") {
+        return true;
+    }
+    if lower.contains("windows-arm64") {
+        return env.os_name == "windows" && env.os_arch == "arm64";
+    }
+    if lower.contains("windows-x86") {
+        return env.os_name == "windows" && env.os_arch == "x86";
+    }
+    if lower.contains("natives-windows") {
+        return env.os_name == "windows" && env.os_arch == "x86_64";
+    }
+    if lower.contains("macos-arm64") || lower.contains("osx-arm64") {
+        return env.os_name == "osx" && env.os_arch == "arm64";
+    }
+    if lower.contains("natives-macos") || lower.contains("natives-osx") {
+        return env.os_name == "osx" && env.os_arch == "x86_64";
+    }
+    if lower.contains("linux-arm64") {
+        return env.os_name == "linux" && env.os_arch == "arm64";
+    }
+    if lower.contains("linux-x86") {
+        return env.os_name == "linux" && env.os_arch == "x86";
+    }
+    if lower.contains("natives-linux") {
+        return env.os_name == "linux" && env.os_arch == "x86_64";
+    }
+    true
+}
+
 async fn download_file_with_client(
     client: &reqwest::Client,
     url: &str,
@@ -486,17 +563,35 @@ async fn download_file_with_client(
         fs::create_dir_all(parent)?;
     }
 
-    let response = client.get(url).send().await?.error_for_status()?;
     let tmp_path = destination.with_extension("tmp");
-    let mut output = fs::File::create(&tmp_path)?;
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        output.write_all(&chunk)?;
+    let mut last_error: Option<DownloadError> = None;
+    for attempt in 0..3 {
+        let result = async {
+            let response = client.get(url).send().await?.error_for_status()?;
+            let mut output = fs::File::create(&tmp_path)?;
+            let mut stream = response.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                output.write_all(&chunk)?;
+            }
+            output.flush()?;
+            fs::rename(&tmp_path, destination)?;
+            Ok::<(), DownloadError>(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last_error = Some(error);
+                let _ = fs::remove_file(&tmp_path);
+                if attempt < 2 {
+                    tokio::time::sleep(Duration::from_millis(250 * (attempt + 1) as u64)).await;
+                }
+            }
+        }
     }
-    output.flush()?;
-    fs::rename(tmp_path, destination)?;
-    Ok(())
+    Err(last_error.unwrap_or_else(|| DownloadError::ResolveManifest("download failed".to_string())))
 }
 
 fn resolve_path_under_root(root: &Path, relative: &str) -> Option<PathBuf> {
@@ -513,4 +608,96 @@ fn resolve_path_under_root(root: &Path, relative: &str) -> Option<PathBuf> {
         return None;
     }
     Some(joined)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::launch::{Library, LibraryArtifact, LibraryDownload};
+    use crate::rules::Environment;
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    #[test]
+    fn mixed_windows_native_libraries_only_download_matching_arch() {
+        let env = Environment {
+            os_name: "windows".to_string(),
+            os_arch: "x86_64".to_string(),
+            os_version: String::new(),
+            features: HashMap::new(),
+        };
+        let mc_dir = Path::new("/tmp/croopor-test");
+        let libraries = vec![
+            native_library("org.lwjgl:lwjgl:3.3.3:natives-windows-arm64"),
+            native_library("org.lwjgl:lwjgl:3.3.3:natives-windows-x86"),
+            native_library("org.lwjgl:lwjgl:3.3.3:natives-windows"),
+        ];
+
+        let jobs = library_jobs_for(mc_dir, &libraries, &env);
+        let names = jobs
+            .into_iter()
+            .map(|job| job.name)
+            .collect::<Vec<_>>();
+
+        assert!(names.iter().any(|name| name.contains("natives-windows.jar")));
+        assert!(!names.iter().any(|name| name.contains("arm64")));
+        assert!(!names.iter().any(|name| name.contains("-x86.jar")));
+    }
+
+    #[test]
+    fn legacy_native_classifier_prefers_windows_generic_classifier() {
+        let mut natives = HashMap::new();
+        natives.insert("windows".to_string(), "natives-windows-${arch}".to_string());
+
+        let mut classifiers = HashMap::new();
+        classifiers.insert(
+            "natives-windows".to_string(),
+            artifact("org/lwjgl/lwjgl/3.3.3/lwjgl-3.3.3-natives-windows.jar"),
+        );
+        classifiers.insert(
+            "natives-windows-arm64".to_string(),
+            artifact("org/lwjgl/lwjgl/3.3.3/lwjgl-3.3.3-natives-windows-arm64.jar"),
+        );
+        classifiers.insert(
+            "natives-windows-x86".to_string(),
+            artifact("org/lwjgl/lwjgl/3.3.3/lwjgl-3.3.3-natives-windows-x86.jar"),
+        );
+
+        let lib = Library {
+            name: "org.lwjgl:lwjgl:3.3.3".to_string(),
+            downloads: Some(LibraryDownload {
+                artifact: None,
+                classifiers,
+            }),
+            natives,
+            ..Library::default()
+        };
+
+        let job = resolve_native_download(&lib, Path::new("/tmp/croopor-test"), "windows")
+            .expect("native download");
+
+        assert!(job.name.contains("natives-windows.jar"));
+        assert!(!job.name.contains("arm64"));
+        assert!(!job.name.contains("-x86.jar"));
+    }
+
+    fn native_library(name: &str) -> Library {
+        let artifact_path = maven_to_path(name).to_string_lossy().replace('\\', "/");
+        Library {
+            name: name.to_string(),
+            downloads: Some(LibraryDownload {
+                artifact: Some(artifact(&artifact_path)),
+                classifiers: HashMap::new(),
+            }),
+            ..Library::default()
+        }
+    }
+
+    fn artifact(path: &str) -> LibraryArtifact {
+        LibraryArtifact {
+            path: path.to_string(),
+            url: format!("https://libraries.minecraft.net/{path}"),
+            ..LibraryArtifact::default()
+        }
+    }
 }

@@ -1,5 +1,5 @@
-use crate::paths::{assets_dir, libraries_dir, versions_dir};
-use crate::rules::{Environment, Rule, current_os_arch, evaluate_rules, is_native_library};
+use crate::paths::{libraries_dir, versions_dir};
+use crate::rules::{Environment, Rule, evaluate_rules, is_native_library};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -319,6 +319,9 @@ pub fn resolve_libraries(
         }
 
         let is_native = is_native_library(&lib.name);
+        if is_native && !native_name_matches_env(&lib.name, env) {
+            continue;
+        }
 
         if !lib.natives.is_empty() {
             resolved.extend(resolve_legacy_natives(lib, &lib_dir, env));
@@ -606,23 +609,27 @@ fn resolve_legacy_natives(
     lib_dir: &Path,
     env: &Environment,
 ) -> Vec<ResolvedLibrary> {
-    let Some(classifier_key) = lib.natives.get(&env.os_name) else {
+    let Some(base_classifier) = lib.natives.get(&env.os_name) else {
         return Vec::new();
     };
-    let classifier_key = classifier_key.replace("${arch}", arch_bits());
 
-    if let Some(artifact) = lib
-        .downloads
-        .as_ref()
-        .and_then(|downloads| downloads.classifiers.get(&classifier_key))
-    {
-        return vec![ResolvedLibrary {
-            abs_path: lib_dir.join(PathBuf::from(&artifact.path)),
-            is_native: true,
-            name: format!("{}:{classifier_key}", lib.name),
-        }];
+    for classifier_key in native_classifier_candidates(base_classifier, &env.os_arch) {
+        if let Some(artifact) = lib
+            .downloads
+            .as_ref()
+            .and_then(|downloads| downloads.classifiers.get(&classifier_key))
+        {
+            return vec![ResolvedLibrary {
+                abs_path: lib_dir.join(PathBuf::from(&artifact.path)),
+                is_native: true,
+                name: format!("{}:{classifier_key}", lib.name),
+            }];
+        }
     }
 
+    let Some(classifier_key) = native_classifier_candidates(base_classifier, &env.os_arch).into_iter().next() else {
+        return Vec::new();
+    };
     let maven_path = maven_to_path(&format!("{}:{classifier_key}", lib.name));
     if maven_path.as_os_str().is_empty() {
         return Vec::new();
@@ -633,6 +640,66 @@ fn resolve_legacy_natives(
         is_native: true,
         name: format!("{}:{classifier_key}", lib.name),
     }]
+}
+
+fn native_classifier_candidates(base_classifier: &str, os_arch: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    let variants = match os_arch {
+        "x86_64" => vec![
+            base_classifier.replace("${arch}", "64"),
+            base_classifier.replace("-${arch}", ""),
+            base_classifier.replace("${arch}", "x86_64"),
+        ],
+        "x86" => vec![
+            base_classifier.replace("${arch}", "32"),
+            base_classifier.replace("${arch}", "x86"),
+        ],
+        "arm64" => vec![
+            base_classifier.replace("${arch}", "arm64"),
+            base_classifier.replace("${arch}", "64"),
+        ],
+        _ => vec![base_classifier.replace("${arch}", os_arch)],
+    };
+
+    for variant in variants {
+        if !variant.is_empty() && !candidates.contains(&variant) {
+            candidates.push(variant);
+        }
+    }
+
+    candidates
+}
+
+fn native_name_matches_env(name: &str, env: &Environment) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if !lower.contains("natives-") {
+        return true;
+    }
+    if lower.contains("windows-arm64") {
+        return env.os_name == "windows" && env.os_arch == "arm64";
+    }
+    if lower.contains("windows-x86") {
+        return env.os_name == "windows" && env.os_arch == "x86";
+    }
+    if lower.contains("natives-windows") {
+        return env.os_name == "windows" && env.os_arch == "x86_64";
+    }
+    if lower.contains("macos-arm64") || lower.contains("osx-arm64") {
+        return env.os_name == "osx" && env.os_arch == "arm64";
+    }
+    if lower.contains("natives-macos") || lower.contains("natives-osx") {
+        return env.os_name == "osx" && env.os_arch == "x86_64";
+    }
+    if lower.contains("linux-arm64") {
+        return env.os_name == "linux" && env.os_arch == "arm64";
+    }
+    if lower.contains("linux-x86") {
+        return env.os_name == "linux" && env.os_arch == "x86";
+    }
+    if lower.contains("natives-linux") {
+        return env.os_name == "linux" && env.os_arch == "x86_64";
+    }
+    true
 }
 
 fn resolve_arg_list(
@@ -688,7 +755,7 @@ fn resolve_logging_arg(entry: &LoggingEntry, assets_root: &str) -> String {
 
     entry.argument.replace(
         "${path}",
-        &assets_dir(Path::new(assets_root))
+        &Path::new(assets_root)
             .join("log_configs")
             .join(&entry.file.id)
             .to_string_lossy(),
@@ -735,13 +802,6 @@ pub fn maven_to_path(coordinate: &str) -> PathBuf {
         .join(artifact)
         .join(version)
         .join(filename)
-}
-
-fn arch_bits() -> &'static str {
-    match current_os_arch() {
-        "x86_64" | "arm64" => "64",
-        _ => "32",
-    }
 }
 
 fn non_empty(preferred: &str, fallback: &str) -> String {
@@ -862,10 +922,10 @@ mod tests {
             assets_root: ".".to_string(),
             asset_index_name: "1.20.1".to_string(),
             auth_uuid: offline_uuid("Player"),
-            auth_access_token: "0".to_string(),
+            auth_access_token: "null".to_string(),
             client_id: String::new(),
             auth_xuid: String::new(),
-            user_type: "msa".to_string(),
+            user_type: "legacy".to_string(),
             version_type: "release".to_string(),
             launcher_name: "croopor".to_string(),
             launcher_version: "1.0.0".to_string(),
@@ -881,5 +941,30 @@ mod tests {
             resolution_height: String::new(),
             game_assets: String::new(),
         }
+    }
+
+    #[test]
+    fn logging_arg_uses_assets_root_once() {
+        let entry = LoggingEntry {
+            argument: "-Dlog4j.configurationFile=${path}".to_string(),
+            file: LoggingFile {
+                id: "client-1.12.xml".to_string(),
+                ..LoggingFile::default()
+            },
+            ..LoggingEntry::default()
+        };
+
+        let resolved = resolve_logging_arg(&entry, "C:/croopor/library/assets");
+        assert_eq!(
+            resolved,
+            "-Dlog4j.configurationFile=C:/croopor/library/assets/log_configs/client-1.12.xml"
+        );
+    }
+
+    #[test]
+    fn native_classifier_prefers_windows_x64_fallback() {
+        let candidates = native_classifier_candidates("natives-windows-${arch}", "x86_64");
+        assert_eq!(candidates[0], "natives-windows-64");
+        assert!(candidates.iter().any(|candidate| candidate == "natives-windows"));
     }
 }
