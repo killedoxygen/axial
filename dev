@@ -2,49 +2,55 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TOOLS_DIR="$ROOT/.tools/bin"
-TASK_BIN="$TOOLS_DIR/task"
-TASK_VERSION="v3.49.1"
 
 print_help() {
   cat <<'EOF'
 croopor dev cli
 
 setup once
-  ./dev setup              install go deps, frontend deps, and local dev tools
+  ./dev setup              install frontend deps and prefetch rust deps
 
 daily
-  ./dev dev                run desktop dev with wails
+  ./dev dev                run desktop dev with rust + tauri
   ./dev dev-web            run the frontend-only dev server
-  ./dev dev-windows        build and launch the windows dev binary
-  ./dev build              build the native release binary for this machine
-  ./dev build-dev          build the native dev binary for this machine
-  ./dev verify             run checks, tests, and native builds
-  ./dev clean              remove build outputs and go caches
+  ./dev watch              rebuild frontend assets on file changes
+  ./dev check              run static checks
+  ./dev test               run rust tests
+  ./dev verify             run checks, tests, and a release desktop build
+  ./dev clean              remove build outputs and caches
+
+build
+  ./dev build              build the release desktop binary
+  ./dev build-dev          build the dev desktop binary
+  ./dev build:api          build the dev api binary
+  ./dev build:api:release  build the release api binary
+
+rust
+  ./dev rust:check
+  ./dev rust:clippy
+  ./dev rust:fmt
+  ./dev rust:fmt:fix
+  ./dev rust:test
+  ./dev rust:api
+  ./dev rust:desktop
+
+frontend
+  ./dev frontend:install
+  ./dev frontend:check
+  ./dev frontend:build
+  ./dev frontend:watch
+  ./dev frontend:serve
 
 other
-  ./dev build-windows
-  ./dev build-windows-dev
-  ./dev release-snapshot
   ./dev doctor
   ./dev help
 
 notes
   - on WSL, desktop dev needs WSLg or another Linux GUI session
   - if you only need frontend work in WSL/headless, use ./dev dev-web
-  - if you want the windows app from WSL, use ./dev dev-windows
   - make is just a unix/wsl convenience wrapper around this script
+  - Taskfile.yml mirrors these commands but is optional
 EOF
-}
-
-ensure_task() {
-  if [ -x "$TASK_BIN" ]; then
-    return
-  fi
-
-  mkdir -p "$TOOLS_DIR"
-  echo "bootstrapping local task into .tools/bin"
-  GOBIN="$TOOLS_DIR" go install "github.com/go-task/task/v3/cmd/task@${TASK_VERSION}"
 }
 
 check_desktop_env() {
@@ -53,17 +59,6 @@ check_desktop_env() {
     echo "use './dev dev-web' for frontend-only work in headless WSL."
     exit 1
   fi
-}
-
-is_interruptible_dev_command() {
-  case "${1:-}" in
-    dev|dev-web|watch|dev:desktop|dev-desktop|frontend:serve|frontend:watch|wails:dev)
-      return 0
-      ;;
-    *)
-      return 1
-      ;;
-  esac
 }
 
 run_interruptible() {
@@ -80,45 +75,136 @@ run_interruptible() {
   exit "$status"
 }
 
+run_frontend() {
+  corepack pnpm --dir "$ROOT/frontend" "$@"
+}
+
+run_setup() {
+  run_frontend install --frozen-lockfile --ignore-scripts
+  cargo fetch --locked
+}
+
+run_doctor() {
+  echo "rustc    $(rustc --version)"
+  echo "cargo    $(cargo --version)"
+  echo "rustfmt  $(cargo fmt --version 2>/dev/null || echo missing)"
+  echo "clippy   $(cargo clippy --version 2>/dev/null || echo missing)"
+  echo "node     $(node --version)"
+  echo "corepack $(corepack --version)"
+  if command -v task >/dev/null 2>&1; then
+    echo "task     $(task --version)"
+  else
+    echo "task     optional"
+  fi
+  if [ -n "${WSL_DISTRO_NAME:-}" ]; then
+    echo "wsl      yes"
+    if [ -n "${WAYLAND_DISPLAY:-}" ] || [ -n "${DISPLAY:-}" ]; then
+      echo "gui      detected"
+    else
+      echo "gui      missing, use './dev dev-web' or run under WSLg"
+    fi
+  else
+    echo "wsl      no"
+  fi
+}
+
+run_check() {
+  run_frontend run check
+  cargo fmt --all --check
+  cargo check --workspace --locked
+  cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+}
+
+run_verify() {
+  run_frontend run build
+  run_check
+  cargo test --workspace --locked
+  cargo build --locked -p croopor-desktop --release
+}
+
 main() {
   local cmd="${1:-help}"
 
   case "$cmd" in
     help|-h|--help)
       print_help
-      exit 0
       ;;
-    bootstrap)
-      ensure_task
-      exit 0
+    setup)
+      run_setup
       ;;
-  esac
-
-  ensure_task
-  export PATH="$TOOLS_DIR:$PATH"
-
-  case "$cmd" in
-    dev|dev:desktop|wails:dev)
+    doctor)
+      run_doctor
+      ;;
+    dev|dev:desktop|dev-desktop|rust:desktop)
       check_desktop_env
+      run_interruptible cargo run --locked -p croopor-desktop
       ;;
-  esac
-
-  case "$cmd" in
-    dev|dev:desktop|dev-desktop|wails:dev)
-      export PATH="$TOOLS_DIR:$PATH"
-      run_interruptible wails dev
+    rust:api)
+      run_interruptible cargo run --locked -p croopor-api
       ;;
     dev-web|frontend:serve|web)
-      cd "$ROOT/frontend"
-      run_interruptible node esbuild.mjs serve
+      run_interruptible corepack pnpm --dir "$ROOT/frontend" run dev
       ;;
     watch|frontend:watch)
-      cd "$ROOT/frontend"
-      run_interruptible node esbuild.mjs watch
+      run_interruptible corepack pnpm --dir "$ROOT/frontend" run watch
+      ;;
+    frontend:install)
+      run_frontend install --frozen-lockfile --ignore-scripts
+      ;;
+    frontend:check)
+      run_frontend run check
+      ;;
+    frontend:build)
+      run_frontend run build
+      ;;
+    rust:fetch)
+      cargo fetch --locked
+      ;;
+    rust:fmt)
+      cargo fmt --all --check
+      ;;
+    rust:fmt:fix)
+      cargo fmt --all
+      ;;
+    rust:check)
+      cargo check --workspace --locked
+      ;;
+    rust:clippy)
+      cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      ;;
+    rust:test|test)
+      cargo test --workspace --locked
+      ;;
+    check)
+      run_check
+      ;;
+    verify)
+      run_verify
+      ;;
+    build|build-local)
+      run_frontend run build
+      cargo build --locked -p croopor-desktop --release
+      ;;
+    build-dev|build-local-dev)
+      run_frontend run build
+      cargo build --locked -p croopor-desktop
+      ;;
+    build:api)
+      cargo build --locked -p croopor-api
+      ;;
+    build:api:release)
+      cargo build --locked -p croopor-api --release
+      ;;
+    clean)
+      cargo clean
+      rm -rf "$ROOT/dist"
+      ;;
+    *)
+      echo "unknown command: $cmd" >&2
+      echo "run './dev help' to see available commands." >&2
+      exit 1
       ;;
   esac
-
-  exec "$TASK_BIN" -d "$ROOT" "$@"
 }
 
 main "$@"

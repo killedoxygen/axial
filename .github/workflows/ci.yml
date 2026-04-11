@@ -5,11 +5,11 @@ on:
   push:
     branches:
       - main
+      - rewrite-in-rust
       - wip-*
 
 permissions:
   contents: read
-  packages: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -21,8 +21,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: arduino/setup-task@v2
-
       - uses: pnpm/action-setup@v4
         with:
           version: 10.33.0
@@ -35,13 +33,13 @@ jobs:
           cache-dependency-path: frontend/pnpm-lock.yaml
 
       - name: Install frontend dependencies
-        run: task frontend:install
+        run: corepack pnpm --dir frontend install --frozen-lockfile --ignore-scripts
 
       - name: Frontend typecheck
-        run: task frontend:check
+        run: corepack pnpm --dir frontend run check
 
       - name: Frontend build
-        run: task frontend:build
+        run: corepack pnpm --dir frontend run build
 
   desktop-linux:
     runs-on: ubuntu-24.04
@@ -53,8 +51,6 @@ jobs:
       - name: Trust checkout as a safe git directory
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - uses: arduino/setup-task@v2
-
       - uses: pnpm/action-setup@v4
         with:
           version: 10.33.0
@@ -66,24 +62,32 @@ jobs:
           cache: pnpm
           cache-dependency-path: frontend/pnpm-lock.yaml
 
-      - uses: actions/setup-go@v5
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          go-version-file: go.mod
+          components: rustfmt, clippy
 
-      - name: Install Wails CLI
-        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.11.0
+      - uses: Swatinem/rust-cache@v2
 
       - name: Install frontend dependencies
-        run: task frontend:install
+        run: corepack pnpm --dir frontend install --frozen-lockfile --ignore-scripts
 
-      - name: Static checks
-        run: task check
+      - name: Rust fmt
+        run: cargo fmt --all --check
 
-      - name: Go tests
-        run: task test
+      - name: Rust check
+        run: cargo check --workspace --locked
 
-      - name: Linux desktop build
-        run: task build
+      - name: Rust clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
-      - name: Wails production build
-        run: task wails:build
+      - name: Rust tests
+        run: cargo test --workspace --locked
+
+      - name: Frontend typecheck
+        run: corepack pnpm --dir frontend run check
+
+      - name: Frontend build
+        run: corepack pnpm --dir frontend run build
+
+      - name: Release desktop build
+        run: cargo build --locked -p croopor-desktop --release

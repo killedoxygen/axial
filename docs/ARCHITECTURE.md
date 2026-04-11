@@ -2,19 +2,15 @@
 Very small map so it is obvious where to start. weirdly enough, this document was written by a human this time
 
 ## desktop side
-- `main.go`: wails bootstrap
-- `app.go`: bindings exposed to the frontend
-- `internal/server`: api routes, session/install managers, wails bridge helpers
-- `internal/update`: release manifest fetch + version resolution
-
-the backend serves `/api/v1/*` inside wails too.
+- runtime: `apps/api` + `apps/desktop`
+- the backend serves `/api/v1/*`
 
 ## frontend side
 - `frontend/src/main.tsx`: bootstrap
 - `frontend/src/components/App.tsx`: app shell
 - `frontend/src/store.ts`: runtime state
 - `frontend/src/actions.ts`: state transitions
-- `frontend/src/native.ts`: wails runtime bridge
+- `frontend/src/native.ts`: desktop runtime bridge, Tauri-aware
 - `frontend/src/updater.ts`: update checks, dismissal, desktop-only auto-check
 
 main workflow files:
@@ -27,13 +23,12 @@ main workflow files:
 - `updater.ts`
 
 ## packages that matter
-- `internal/minecraft`: vanilla metadata, downloads, java, integrity
-- `internal/modloaders`: fabric/quilt/forge/neoforge
-- `internal/launcher`: public launch api used by `internal/server`
-- `internal/launcher/engine`: launch pipeline, process lifecycle, self-healing, profiling
-- `internal/launcher/runtime`: requested vs effective java runtime resolution
-- `internal/config`: config persistence
-- `internal/instance`: instance storage
+- `apps/api`: Rust Axum server for `/api/v1/*` and static asset serving
+- `apps/desktop`: Rust Tauri shell
+- `core/config`: config store, paths, and model normalization
+- `core/launcher`: launch pipeline, runtime selection, healing, process/session lifecycle
+- `core/minecraft`: vanilla metadata, downloads, Java/runtime discovery, loaders, installs
+- `core/performance`: performance planning and policy surfaces
 
 ## runtime flow
 Bootstrap:
@@ -46,7 +41,7 @@ Bootstrap:
 Install:
 1. frontend queues install work
 2. backend starts a session
-3. progress comes through sse or wails events
+3. progress comes through sse or desktop-native events
 4. frontend refreshes versions and catalog flags
 
 Launch:
@@ -58,25 +53,16 @@ Launch:
 Update check:
 1. frontend waits until bootstrap is ready
 2. desktop runtime does a quiet `/api/v1/update` check
-3. backend fetches the stable Pages manifest
-4. frontend shows a quiet CTA if a newer build exists
-
-## version overrides
-`internal/launcher/engine/version_overrides.go` contains table-driven JVM flag injection for known launch-context quirks. The `builtinOverrides` slice maps predicates over a small `versionOverrideContext` to sets of `-D` flags. The `applyVersionOverridesStep` runs in the launch pipeline right after argument resolution, builds that context from the base version and auth mode, and appends matching flags to `JVMArgs`.
-
-Current overrides:
-- **authlib-offline-mp**: 1.16.4 and 1.16.5 ship authlib 2.1.28 which silently disables multiplayer with offline tokens. Redirects Mojang API hosts to `nope.invalid` so the request fails and the client falls back to permissive defaults. This override is gated to offline launches only.
-
-To add a new override, append an entry to `builtinOverrides` with an ID, reason, matcher, and JVM args.
+3. backend currently returns the local app version and no available update
+4. release automation currently publishes raw desktop binaries, not a native updater feed
 
 ## where to look
-- install bugs: `internal/minecraft`, `internal/modloaders`, `frontend/src/install.ts`
-- launch bugs: `internal/launcher`, `internal/launcher/engine`, `internal/launcher/runtime`, `internal/server/api_launch.go`, `frontend/src/launch.ts`
-- settings/prefs: `internal/config/config.go`, `frontend/src/settings.ts`, `frontend/src/state.ts`
-- updater/release metadata: `internal/update`, `frontend/src/updater.ts`, `.github/workflows/release.yml`
+- install bugs: `core/minecraft`, `apps/api/src/routes/install.rs`, `apps/api/src/routes/loaders.rs`, `frontend/src/install.ts`
+- launch bugs: `core/launcher`, `core/minecraft`, `apps/api/src/routes/launch.rs`, `frontend/src/launch.ts`
+- settings/prefs: `core/config`, `frontend/src/settings.ts`, `frontend/src/state.ts`
+- updater/release metadata: `apps/api/src/routes/update.rs`, `frontend/src/updater.ts`, `.github/workflows/release.yml`, `README.md`
 - shell/layout: `frontend/src/components/App.tsx`
-- wails integration: `main.go`, `app.go`, `wails.json`, `frontend/src/native.ts`
+- current desktop/runtime entrypoints: `apps/api`, `apps/desktop`, `core/*`, `plans/RUST-REWRITE.md`
 
 hard todo:
-- windows native updater packaging is only public when real production signing exists
-- do not expose dev/test/self-signed msix or appinstaller artifacts to users
+- windows packaging is still just raw release binaries, not a signed native updater path

@@ -29,14 +29,15 @@ keep this short and real. if the codebase changes, update this file.
 - backend surface is `/api/v1/*`
 - json in, json out
 - errors are `{\"error\":\"message\"}`
-- launch/install progress uses sse in browser mode, wails runtime events in desktop mode
+- launch/install progress uses sse in browser mode and the Tauri desktop event bridge on desktop
 - update checks go through `/api/v1/update`
 
 ## Backend layout
-- `internal/launcher` is the public launcher facade used by the server layer
-- `internal/launcher/engine` owns launch pipeline internals, healing policy, process lifecycle, and profiling
-- `internal/launcher/runtime` owns requested-vs-effective Java runtime resolution
-- if launcher work is not part of the public API, add it under `engine` or `runtime`, not back into the root facade
+- the Rust rewrite lives under `apps/` and `core/`
+- `apps/api` owns the local HTTP surface and static frontend serving
+- `apps/desktop` owns the Tauri shell
+- `core/launcher`, `core/minecraft`, `core/performance`, and `core/config` are the long-term Rust product logic crates
+- if backend work is part of this branch, add it in Rust
 
 ## Build
 - frontend entry is `frontend/src/main.tsx`
@@ -46,14 +47,16 @@ keep this short and real. if the codebase changes, update this file.
 - workflow definitions live in `Taskfile.yml`
 - main local entrypoints are `./dev` on unix/wsl and `dev.ps1` or `dev.cmd` on windows
 - `make` is a fallback path, not the main daily interface
-- the repo bootstraps local tools into `.tools/bin`, do not rely on random global `task`, `wails`, or `goreleaser` installs
+- `./dev` and `dev.ps1` call cargo/corepack directly; they must not depend on Go or a repo-local task bootstrap
 - frontend installs should use the lockfile and `--ignore-scripts`
-- desktop build is wails
-- on ubuntu 24 the linux build uses `webkit2_41`
+- desktop dev/build on this branch is Rust + Tauri
 - local dev commands live in `Taskfile.yml`
+- `Taskfile.yml` mirrors the direct dev commands but is optional
 - `Makefile` is only a unix/wsl convenience shim
-- raw release binaries are driven by `.goreleaser.yml`
-- extra release packaging and updater metadata live in `.github/workflows/release.yml`
+- release builds and release artifacts live in `.github/workflows/release.yml`
+- Rust workspace commands go through `cargo`
+- Rust build output lives in `target/`
+- local release staging goes through `dist/`
 
 ## Inputs
 - text and number inputs should use `autocomplete="off"`
