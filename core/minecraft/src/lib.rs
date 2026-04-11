@@ -6,8 +6,8 @@ pub mod loaders;
 pub mod manifest;
 pub mod paths;
 pub mod profiles;
-pub mod runtime;
 pub mod rules;
+pub mod runtime;
 pub mod types;
 pub mod version;
 
@@ -16,11 +16,6 @@ pub use java::{
     JavaRuntimeInfo, JavaRuntimeLookupError, JavaRuntimeResult, ensure_java_runtime,
     find_java_runtime, is_known_runtime_component, list_java_runtimes, preferred_runtime_component,
     probe_java_runtime_info,
-};
-pub use runtime::{
-    RuntimeEnsureAction, RuntimeEnsureResult, RuntimeId, RuntimeInstallState, RuntimeOverride,
-    RuntimeRecord, RuntimeRequirement, RuntimeSource, ensure_runtime, list_runtime_records,
-    parse_runtime_override, runtime_requirement,
 };
 pub use launch::{
     JavaVersion, LaunchModelError, LaunchVars, ResolvedLibrary, VersionJson, build_classpath,
@@ -40,6 +35,11 @@ pub use profiles::ensure_launcher_profiles;
 pub use rules::{
     Environment, Rule, current_os_arch, current_os_name, default_environment, evaluate_rules,
     is_native_library, native_classifier_key,
+};
+pub use runtime::{
+    RuntimeEnsureAction, RuntimeEnsureResult, RuntimeId, RuntimeInstallState, RuntimeOverride,
+    RuntimeRecord, RuntimeRequirement, RuntimeSource, ensure_runtime, list_runtime_records,
+    parse_runtime_override, runtime_requirement,
 };
 pub use types::VersionEntry;
 pub use version::scan_versions;

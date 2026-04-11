@@ -25,8 +25,8 @@ pub use runtime::{
 pub use service::{
     LaunchHealingSummary, LaunchIntent, LaunchPreparationError, PreparedLaunchAttempt,
     RecoveryAction, RecoveryPlan, build_healing_summary, conservative_healing_preset,
-    failure_class_name, format_failure_class, infer_loader, is_terminal_state,
-    is_terminal_status, launch_state_name, prepare_launch_attempt, recovery_for_failure,
+    failure_class_name, format_failure_class, infer_loader, is_terminal_state, is_terminal_status,
+    launch_state_name, prepare_launch_attempt, recovery_for_failure,
     sanitize_effective_runtime_major, snapshot_status,
 };
 pub use types::{InstanceId, LaunchFailure, LaunchFailureClass, LaunchState, SessionId, VersionId};

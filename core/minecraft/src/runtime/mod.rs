@@ -9,8 +9,7 @@ use std::sync::{Arc, OnceLock};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
-const RUNTIME_MANIFEST_URL: &str =
-    "https://launchermeta.mojang.com/v1/products/java-runtime/2ec0cc96c44e5a76b9c8b7c39df7210883d12871/all.json";
+const RUNTIME_MANIFEST_URL: &str = "https://launchermeta.mojang.com/v1/products/java-runtime/2ec0cc96c44e5a76b9c8b7c39df7210883d12871/all.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JavaRuntimeInfo {
@@ -157,14 +156,13 @@ pub fn list_runtime_records(library_dir: &Path) -> Vec<RuntimeRecord> {
     let mut results = Vec::new();
     for dir in dirs {
         for component in &components {
-            if let Some(runtime) = inspect_component_runtime(&dir, component) {
-                if runtime.install_state == RuntimeInstallState::Ready
-                    && !results.iter().any(|entry: &RuntimeRecord| {
-                        entry.id == runtime.id && entry.java_path == runtime.java_path
-                    })
-                {
-                    results.push(runtime);
-                }
+            if let Some(runtime) = inspect_component_runtime(&dir, component)
+                && runtime.install_state == RuntimeInstallState::Ready
+                && !results.iter().any(|entry: &RuntimeRecord| {
+                    entry.id == runtime.id && entry.java_path == runtime.java_path
+                })
+            {
+                results.push(runtime);
             }
         }
     }
@@ -192,7 +190,9 @@ pub fn find_java_runtime(
     let requirement = runtime_requirement(java_version);
     let runtime_override = parse_runtime_override(override_path);
     let record = match runtime_override {
-        RuntimeOverride::None => resolve_managed_runtime(library_dir, &requirement.preferred_component)?,
+        RuntimeOverride::None => {
+            resolve_managed_runtime(library_dir, &requirement.preferred_component)?
+        }
         RuntimeOverride::Component(component) => {
             resolve_component_runtime(library_dir, &component, java_version.major_version)?
         }
@@ -235,25 +235,28 @@ pub async fn ensure_runtime(
     } else {
         match &requested_override {
             RuntimeOverride::None => None,
-            RuntimeOverride::Component(component) => {
-                Some(resolve_component_runtime(library_dir, component, java_version.major_version)?)
-            }
-            RuntimeOverride::ExecutablePath(path) => {
-                Some(resolve_override_runtime(path, &requirement.preferred_component)?)
-            }
+            RuntimeOverride::Component(component) => Some(resolve_component_runtime(
+                library_dir,
+                component,
+                java_version.major_version,
+            )?),
+            RuntimeOverride::ExecutablePath(path) => Some(resolve_override_runtime(
+                path,
+                &requirement.preferred_component,
+            )?),
         }
     };
 
-    if let Some(requested_runtime) = requested.clone() {
-        if !should_bypass_requested_runtime(java_version, &requested_runtime) {
-            return Ok(RuntimeEnsureResult {
-                requested: Some(requested_runtime.clone()),
-                effective: requested_runtime,
-                bypassed_requested_runtime: false,
-                install_performed: false,
-                action: RuntimeEnsureAction::UseRequested,
-            });
-        }
+    if let Some(requested_runtime) = requested.clone()
+        && !should_bypass_requested_runtime(java_version, &requested_runtime)
+    {
+        return Ok(RuntimeEnsureResult {
+            requested: Some(requested_runtime.clone()),
+            effective: requested_runtime,
+            bypassed_requested_runtime: false,
+            install_performed: false,
+            action: RuntimeEnsureAction::UseRequested,
+        });
     }
 
     let managed = ensure_managed_runtime(library_dir, &requirement).await?;
@@ -343,10 +346,10 @@ fn resolve_component_runtime(
     let mut dirs = runtime_dirs(library_dir);
     dirs.push(runtime_cache_dir());
     for dir in dirs {
-        if let Some(record) = inspect_component_runtime(&dir, component.as_str()) {
-            if record.install_state == RuntimeInstallState::Ready {
-                return Ok(record);
-            }
+        if let Some(record) = inspect_component_runtime(&dir, component.as_str())
+            && record.install_state == RuntimeInstallState::Ready
+        {
+            return Ok(record);
         }
     }
 
@@ -526,9 +529,9 @@ async fn install_managed_runtime(
         .build()
         .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
 
-    let parent_dir = dest_dir
-        .parent()
-        .ok_or_else(|| JavaRuntimeLookupError::Download("invalid runtime destination".to_string()))?;
+    let parent_dir = dest_dir.parent().ok_or_else(|| {
+        JavaRuntimeLookupError::Download("invalid runtime destination".to_string())
+    })?;
     fs::create_dir_all(parent_dir)
         .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
 

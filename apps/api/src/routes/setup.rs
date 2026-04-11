@@ -102,13 +102,11 @@ async fn handle_setup_set_dir(
     state.set_library_dir(payload.path.clone());
     let _ = ensure_launcher_profiles(&path, "");
 
-    Ok(Json(
-        serde_json::json!({
-            "status": "ok",
-            "library_dir": payload.path,
-            "library_mode": "existing"
-        }),
-    ))
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "library_dir": payload.path,
+        "library_mode": "existing"
+    })))
 }
 
 async fn handle_setup_init(
@@ -123,7 +121,9 @@ async fn handle_setup_init(
     if path.as_os_str().is_empty() {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "could not determine default Croopor library path" })),
+            Json(
+                serde_json::json!({ "error": "could not determine default Croopor library path" }),
+            ),
         ));
     }
 

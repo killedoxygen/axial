@@ -130,18 +130,15 @@ pub async fn prepare_launch_attempt(
 
     let loader = infer_loader(&intent.version_id);
     let is_modded = loader != "vanilla" || !version.inherits_from.trim().is_empty();
-    let mut effective_preset = attempt
-        .preset_override
-        .clone()
-        .unwrap_or_else(|| {
-            resolve_preset(
-                &intent.requested_preset,
-                &intent.version_id,
-                loader,
-                is_modded,
-                &runtime.effective_info,
-            )
-        });
+    let mut effective_preset = attempt.preset_override.clone().unwrap_or_else(|| {
+        resolve_preset(
+            &intent.requested_preset,
+            &intent.version_id,
+            loader,
+            is_modded,
+            &runtime.effective_info,
+        )
+    });
 
     if intent.advanced_overrides {
         if let Err((class, message)) = validate_manual_java_override(
@@ -235,7 +232,10 @@ fn runtime_selection_from_ensure(
     requested_java: &str,
     ensured: croopor_minecraft::RuntimeEnsureResult,
 ) -> RuntimeSelection {
-    let selected = ensured.requested.clone().unwrap_or_else(|| ensured.effective.clone());
+    let selected = ensured
+        .requested
+        .clone()
+        .unwrap_or_else(|| ensured.effective.clone());
     let selected_path = if requested_java.trim().is_empty() {
         String::new()
     } else {
@@ -265,7 +265,10 @@ fn runtime_selection_from_ensure(
     }
 }
 
-pub fn sanitize_effective_runtime_major(runtime: &mut RuntimeSelection, java_version: &JavaVersion) {
+pub fn sanitize_effective_runtime_major(
+    runtime: &mut RuntimeSelection,
+    java_version: &JavaVersion,
+) {
     if runtime.effective_path.is_empty() {
         return;
     }
@@ -302,7 +305,10 @@ pub fn build_healing_summary(input: HealingSummaryInput<'_>) -> Option<LaunchHea
         .fallback_applied
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string);
-    let failure_class_name = input.failure_class.map(failure_class_name).map(str::to_string);
+    let failure_class_name = input
+        .failure_class
+        .map(failure_class_name)
+        .map(str::to_string);
 
     let mut warnings = Vec::new();
     let mut events = Vec::new();
@@ -338,7 +344,10 @@ pub fn build_healing_summary(input: HealingSummaryInput<'_>) -> Option<LaunchHea
             detail: Some(detail.clone()),
         });
     }
-    if matches!(input.failure_class, Some(LaunchFailureClass::StartupStalled)) {
+    if matches!(
+        input.failure_class,
+        Some(LaunchFailureClass::StartupStalled)
+    ) {
         events.push(HealingEvent {
             kind: HealingEventKind::StartupStalled,
             detail: Some("no startup activity observed".to_string()),
@@ -609,7 +618,9 @@ fn is_legacy_version_family(version_id: &str) -> bool {
     matches!(numbers.as_slice(), [1, minor, ..] if *minor <= 12)
 }
 
-pub fn snapshot_status(record: &crate::process::LaunchSessionRecord) -> crate::process::LaunchStatusEvent {
+pub fn snapshot_status(
+    record: &crate::process::LaunchSessionRecord,
+) -> crate::process::LaunchStatusEvent {
     crate::process::LaunchStatusEvent {
         state: launch_state_name(record.state).to_string(),
         pid: record.pid,

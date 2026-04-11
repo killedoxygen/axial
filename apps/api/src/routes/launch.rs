@@ -29,6 +29,13 @@ struct LaunchRequest {
     min_memory_mb: Option<i32>,
 }
 
+struct LaunchSessionTask {
+    instance: Instance,
+    config: AppConfig,
+    intent: LaunchIntent,
+    launched_at: String,
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/launch", post(handle_launch))
@@ -114,22 +121,14 @@ async fn handle_launch(
         .await;
 
     let state_task = state.clone();
-    let instance_task = instance.clone();
-    let config_task = config.clone();
-    let launched_at_task = launched_at.clone();
+    let task = LaunchSessionTask {
+        instance: instance.clone(),
+        config: config.clone(),
+        intent,
+        launched_at: launched_at.clone(),
+    };
     tokio::spawn(async move {
-        run_launch_session(
-            state_task,
-            instance_task,
-            config_task,
-            intent,
-            username,
-            launched_at_task,
-            requested_java,
-            requested_preset,
-            advanced_overrides,
-        )
-        .await;
+        run_launch_session(state_task, task).await;
     });
 
     Ok(Json(serde_json::json!({
@@ -142,22 +141,26 @@ async fn handle_launch(
     })))
 }
 
-async fn run_launch_session(
-    state: AppState,
-    mut instance: Instance,
-    config: AppConfig,
-    intent: LaunchIntent,
-    username: String,
-    launched_at: String,
-    requested_java: String,
-    requested_preset: String,
-    advanced_overrides: bool,
-) {
+async fn run_launch_session(state: AppState, task: LaunchSessionTask) {
+    let LaunchSessionTask {
+        mut instance,
+        config,
+        intent,
+        launched_at,
+    } = task;
     let session_id = intent.session_id.clone();
     let mut attempt = croopor_launcher::service::AttemptOverrides::default();
 
     loop {
-        emit_status(&state, &session_id, LaunchState::Validating, None, None, None).await;
+        emit_status(
+            &state,
+            &session_id,
+            LaunchState::Validating,
+            None,
+            None,
+            None,
+        )
+        .await;
         state
             .sessions()
             .emit_log(
@@ -222,8 +225,7 @@ async fn run_launch_session(
                 "system",
                 format!(
                     "Using Java {} via {}.",
-                    prepared.runtime.effective_info.major,
-                    prepared.runtime.effective_source
+                    prepared.runtime.effective_info.major, prepared.runtime.effective_source
                 ),
             )
             .await;
@@ -301,7 +303,7 @@ async fn run_launch_session(
                     &state,
                     &mut instance,
                     &config,
-                    &username,
+                    &intent.username,
                     intent.max_memory_mb,
                     intent.min_memory_mb,
                     &launched_at,
@@ -328,8 +330,8 @@ async fn run_launch_session(
                         failure_class,
                         &intent.version_id,
                         &prepared.runtime.effective_info,
-                        &requested_java,
-                        advanced_overrides,
+                        &intent.requested_java,
+                        intent.advanced_overrides,
                         attempt.disable_custom_gc,
                         &prepared.effective_preset,
                     )
@@ -358,16 +360,17 @@ async fn run_launch_session(
                     continue;
                 }
 
-                let healing = build_healing_summary(croopor_launcher::service::HealingSummaryInput {
-                    requested_java_path: &requested_java,
-                    requested_preset: &requested_preset,
-                    effective_java_path: Some(prepared.runtime.effective_path.as_str()),
-                    effective_preset: Some(prepared.effective_preset.as_str()),
-                    advanced_overrides,
-                    fallback_applied: attempt.fallback_applied.as_deref(),
-                    retry_count: attempt.retry_count,
-                    failure_class: Some(failure_class),
-                });
+                let healing =
+                    build_healing_summary(croopor_launcher::service::HealingSummaryInput {
+                        requested_java_path: &intent.requested_java,
+                        requested_preset: &intent.requested_preset,
+                        effective_java_path: Some(prepared.runtime.effective_path.as_str()),
+                        effective_preset: Some(prepared.effective_preset.as_str()),
+                        advanced_overrides: intent.advanced_overrides,
+                        fallback_applied: attempt.fallback_applied.as_deref(),
+                        retry_count: attempt.retry_count,
+                        failure_class: Some(failure_class),
+                    });
                 let message = if failure_class == LaunchFailureClass::StartupStalled {
                     "launch stopped before startup: no startup activity observed".to_string()
                 } else {

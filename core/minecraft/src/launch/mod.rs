@@ -627,7 +627,10 @@ fn resolve_legacy_natives(
         }
     }
 
-    let Some(classifier_key) = native_classifier_candidates(base_classifier, &env.os_arch).into_iter().next() else {
+    let Some(classifier_key) = native_classifier_candidates(base_classifier, &env.os_arch)
+        .into_iter()
+        .next()
+    else {
         return Vec::new();
     };
     let maven_path = maven_to_path(&format!("{}:{classifier_key}", lib.name));
@@ -965,6 +968,10 @@ mod tests {
     fn native_classifier_prefers_windows_x64_fallback() {
         let candidates = native_classifier_candidates("natives-windows-${arch}", "x86_64");
         assert_eq!(candidates[0], "natives-windows-64");
-        assert!(candidates.iter().any(|candidate| candidate == "natives-windows"));
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate == "natives-windows")
+        );
     }
 }

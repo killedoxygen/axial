@@ -493,29 +493,31 @@ mod tests {
 
         assert!(plan.natives_dir.is_some());
         let natives_dir = plan.natives_dir.as_ref().expect("natives dir");
-        assert!(natives_dir
-            .to_string_lossy()
-            .contains(&format!(
-                "croopor{}cache{}natives",
-                std::path::MAIN_SEPARATOR,
-                std::path::MAIN_SEPARATOR
-            )));
-        assert!(plan
-            .jvm_args
-            .iter()
-            .any(|arg| arg.starts_with("-Dorg.lwjgl.librarypath=")));
-        assert!(plan
-            .jvm_args
-            .iter()
-            .any(|arg| arg.starts_with("-Dorg.lwjgl.system.SharedLibraryExtractPath=")));
-        assert!(plan
-            .jvm_args
-            .iter()
-            .any(|arg| arg.starts_with("-Djna.tmpdir=")));
-        assert!(plan
-            .jvm_args
-            .iter()
-            .any(|arg| arg.starts_with("-Djava.io.tmpdir=")));
+        assert!(natives_dir.to_string_lossy().contains(&format!(
+            "croopor{}cache{}natives",
+            std::path::MAIN_SEPARATOR,
+            std::path::MAIN_SEPARATOR
+        )));
+        assert!(
+            plan.jvm_args
+                .iter()
+                .any(|arg| arg.starts_with("-Dorg.lwjgl.librarypath="))
+        );
+        assert!(
+            plan.jvm_args
+                .iter()
+                .any(|arg| arg.starts_with("-Dorg.lwjgl.system.SharedLibraryExtractPath="))
+        );
+        assert!(
+            plan.jvm_args
+                .iter()
+                .any(|arg| arg.starts_with("-Djna.tmpdir="))
+        );
+        assert!(
+            plan.jvm_args
+                .iter()
+                .any(|arg| arg.starts_with("-Djava.io.tmpdir="))
+        );
 
         let _ = fs::remove_dir_all(root);
         let _ = cleanup_natives_dir(natives_dir);

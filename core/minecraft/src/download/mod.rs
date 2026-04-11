@@ -322,7 +322,8 @@ impl Downloader {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| DownloadError::ResolveManifest("download failed".to_string())))
+        Err(last_error
+            .unwrap_or_else(|| DownloadError::ResolveManifest("download failed".to_string())))
     }
 }
 
@@ -441,7 +442,9 @@ fn resolve_native_download(lib: &Library, mc_dir: &Path, os_name: &str) -> Optio
         }
     }
 
-    let classifier_key = native_classifier_candidates(lib, os_name).into_iter().next()?;
+    let classifier_key = native_classifier_candidates(lib, os_name)
+        .into_iter()
+        .next()?;
     let maven_path = maven_to_path(&format!("{}:{classifier_key}", lib.name));
     if maven_path.as_os_str().is_empty() {
         return None;
@@ -481,8 +484,14 @@ fn native_classifier_candidates(lib: &Library, os_name: &str) -> Vec<String> {
             base.replace("-${arch}", ""),
             base.replace("${arch}", "x86_64"),
         ],
-        "x86" => vec![base.replace("${arch}", "32"), base.replace("${arch}", "x86")],
-        "arm64" => vec![base.replace("${arch}", "arm64"), base.replace("${arch}", "64")],
+        "x86" => vec![
+            base.replace("${arch}", "32"),
+            base.replace("${arch}", "x86"),
+        ],
+        "arm64" => vec![
+            base.replace("${arch}", "arm64"),
+            base.replace("${arch}", "64"),
+        ],
         _ => vec![base.replace("${arch}", arch)],
     };
 
@@ -634,12 +643,13 @@ mod tests {
         ];
 
         let jobs = library_jobs_for(mc_dir, &libraries, &env);
-        let names = jobs
-            .into_iter()
-            .map(|job| job.name)
-            .collect::<Vec<_>>();
+        let names = jobs.into_iter().map(|job| job.name).collect::<Vec<_>>();
 
-        assert!(names.iter().any(|name| name.contains("natives-windows.jar")));
+        assert!(
+            names
+                .iter()
+                .any(|name| name.contains("natives-windows.jar"))
+        );
         assert!(!names.iter().any(|name| name.contains("arm64")));
         assert!(!names.iter().any(|name| name.contains("-x86.jar")));
     }
