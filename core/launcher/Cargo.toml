@@ -1,0 +1,14 @@
+[package]
+name = "croopor-launcher"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+croopor-minecraft = { path = "../minecraft" }
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+zip.workspace = true

@@ -1,0 +1,43 @@
+[workspace]
+members = [
+  "apps/api",
+  "apps/desktop",
+  "core/config",
+  "core/launcher",
+  "core/minecraft",
+  "core/performance",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.3.1"
+edition = "2024"
+license = "MIT"
+authors = ["Mateoltd"]
+
+[workspace.dependencies]
+async-stream = "0.3.6"
+axum = { version = "0.8.6", features = ["macros"] }
+chrono = { version = "0.4.44", default-features = true, features = ["clock"] }
+futures-util = "0.3.32"
+include_dir = "0.7.4"
+md5 = "0.8.0"
+reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls"] }
+regex = "1.12.2"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+sha2 = "0.10.9"
+sysinfo = "0.37.2"
+tauri = { version = "2.9.3" }
+tauri-build = { version = "2.5.1" }
+tauri-plugin-dialog = "2.4.2"
+tauri-plugin-opener = "2.5.0"
+thiserror = "2.0.17"
+tokio = { version = "1.48.0", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tower = "0.5.2"
+tower-http = { version = "0.6.6", features = ["fs", "trace"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+url = "2.5.7"
+zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
+hex = "0.4.3"

@@ -1,0 +1,22 @@
+[package]
+name = "croopor-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+tauri.workspace = true
+tauri-plugin-dialog.workspace = true
+tauri-plugin-opener.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde_json.workspace = true
+croopor-api = { path = "../api" }
+croopor-config = { path = "../../core/config" }
+croopor-launcher = { path = "../../core/launcher" }
+croopor-performance = { path = "../../core/performance" }

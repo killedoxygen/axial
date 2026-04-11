@@ -1,0 +1,310 @@
+use crate::paths::AppPaths;
+use croopor_minecraft::VersionEntry;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
+use std::sync::RwLock;
+use thiserror::Error;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Instance {
+    pub id: String,
+    pub name: String,
+    pub version_id: String,
+    pub created_at: String,
+    #[serde(default)]
+    pub last_played_at: String,
+    #[serde(default)]
+    pub max_memory_mb: i32,
+    #[serde(default)]
+    pub min_memory_mb: i32,
+    #[serde(default)]
+    pub java_path: String,
+    #[serde(default)]
+    pub window_width: i32,
+    #[serde(default)]
+    pub window_height: i32,
+    #[serde(default)]
+    pub jvm_preset: String,
+    #[serde(default)]
+    pub performance_mode: String,
+    #[serde(default)]
+    pub extra_jvm_args: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnrichedInstance {
+    #[serde(flatten)]
+    pub instance: Instance,
+    #[serde(default)]
+    pub version_type: String,
+    pub launchable: bool,
+    #[serde(default)]
+    pub status_detail: String,
+    #[serde(default)]
+    pub needs_install: String,
+    #[serde(default)]
+    pub java_major: i32,
+    pub saves_count: usize,
+    pub mods_count: usize,
+    pub resource_count: usize,
+    pub shader_count: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct StoredInstances {
+    #[serde(default)]
+    instances: Vec<Instance>,
+    #[serde(default)]
+    last_instance_id: String,
+}
+
+pub struct InstanceStore {
+    paths: AppPaths,
+    inner: RwLock<StoredInstances>,
+}
+
+#[derive(Debug, Error)]
+pub enum InstanceStoreError {
+    #[error("failed to read instances: {0}")]
+    Read(#[from] std::io::Error),
+    #[error("failed to parse instances: {0}")]
+    Parse(#[from] serde_json::Error),
+}
+
+impl InstanceStore {
+    pub fn load_default() -> Result<Self, InstanceStoreError> {
+        Self::load_from(AppPaths::detect())
+    }
+
+    pub fn load_from(paths: AppPaths) -> Result<Self, InstanceStoreError> {
+        let inner = match fs::read_to_string(&paths.instances_file) {
+            Ok(data) => serde_json::from_str::<StoredInstances>(&data)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                StoredInstances::default()
+            }
+            Err(error) => return Err(InstanceStoreError::Read(error)),
+        };
+
+        Ok(Self {
+            paths,
+            inner: RwLock::new(inner),
+        })
+    }
+
+    pub fn list(&self) -> Vec<Instance> {
+        self.inner
+            .read()
+            .map(|inner| inner.instances.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn get(&self, id: &str) -> Option<Instance> {
+        self.inner.read().ok().and_then(|inner| {
+            inner
+                .instances
+                .iter()
+                .find(|instance| instance.id == id)
+                .cloned()
+        })
+    }
+
+    pub fn last_instance_id(&self) -> Option<String> {
+        self.inner.read().ok().and_then(|inner| {
+            if inner.last_instance_id.is_empty() {
+                None
+            } else {
+                Some(inner.last_instance_id.clone())
+            }
+        })
+    }
+
+    pub fn enrich(&self, versions: &[VersionEntry]) -> Vec<EnrichedInstance> {
+        let version_map: HashMap<&str, &VersionEntry> = versions
+            .iter()
+            .map(|version| (version.id.as_str(), version))
+            .collect();
+
+        self.list()
+            .into_iter()
+            .map(|instance| {
+                let version = version_map.get(instance.version_id.as_str()).copied();
+                let game_dir = self.game_dir(&instance.id);
+
+                EnrichedInstance {
+                    version_type: version.map(|entry| entry.kind.clone()).unwrap_or_default(),
+                    launchable: version.is_some_and(|entry| entry.launchable),
+                    status_detail: version
+                        .map(|entry| entry.status_detail.clone())
+                        .unwrap_or_else(|| "version not installed".to_string()),
+                    needs_install: version
+                        .map(|entry| entry.needs_install.clone())
+                        .unwrap_or_default(),
+                    java_major: version.map(|entry| entry.java_major).unwrap_or_default(),
+                    saves_count: count_entries(&game_dir.join("saves")),
+                    mods_count: count_entries(&game_dir.join("mods")),
+                    resource_count: count_entries(&game_dir.join("resourcepacks")),
+                    shader_count: count_entries(&game_dir.join("shaderpacks")),
+                    instance,
+                }
+            })
+            .collect()
+    }
+
+    pub fn game_dir(&self, id: &str) -> std::path::PathBuf {
+        self.paths.instances_dir.join(id)
+    }
+
+    pub fn update(&self, next: Instance) -> Result<Instance, InstanceStoreError> {
+        let mut inner = self.inner.write().map_err(|_| {
+            InstanceStoreError::Read(std::io::Error::other("instance store lock poisoned"))
+        })?;
+        let Some(index) = inner
+            .instances
+            .iter()
+            .position(|instance| instance.id == next.id)
+        else {
+            return Err(InstanceStoreError::Read(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "instance not found",
+            )));
+        };
+
+        inner.instances[index] = next.clone();
+        self.persist_locked(&inner)?;
+        Ok(next)
+    }
+
+    pub fn clear(&self) -> Result<(), InstanceStoreError> {
+        let mut inner = self.inner.write().map_err(|_| {
+            InstanceStoreError::Read(std::io::Error::other("instance store lock poisoned"))
+        })?;
+        inner.instances.clear();
+        inner.last_instance_id.clear();
+        self.persist_locked(&inner)
+    }
+
+    pub fn paths(&self) -> &AppPaths {
+        &self.paths
+    }
+
+    pub fn remove(&self, id: &str, delete_files: bool) -> Result<(), InstanceStoreError> {
+        let mut inner = self.inner.write().map_err(|_| {
+            InstanceStoreError::Read(std::io::Error::other("instance store lock poisoned"))
+        })?;
+        let Some(index) = inner
+            .instances
+            .iter()
+            .position(|instance| instance.id == id)
+        else {
+            return Err(InstanceStoreError::Read(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "instance not found",
+            )));
+        };
+
+        inner.instances.remove(index);
+        if inner.last_instance_id == id {
+            inner.last_instance_id.clear();
+        }
+        if delete_files {
+            let _ = fs::remove_dir_all(self.paths.instances_dir.join(id));
+        }
+        self.persist_locked(&inner)
+    }
+
+    pub fn set_last_instance_id(&self, id: impl Into<String>) -> Result<(), InstanceStoreError> {
+        let mut inner = self.inner.write().map_err(|_| {
+            InstanceStoreError::Read(std::io::Error::other("instance store lock poisoned"))
+        })?;
+        inner.last_instance_id = id.into();
+        self.persist_locked(&inner)
+    }
+
+    pub fn add(
+        &self,
+        name: String,
+        version_id: String,
+        mc_dir: Option<&Path>,
+    ) -> Result<Instance, InstanceStoreError> {
+        let mut inner = self.inner.write().map_err(|_| {
+            InstanceStoreError::Read(std::io::Error::other("instance store lock poisoned"))
+        })?;
+
+        if name.trim().is_empty() {
+            return Err(InstanceStoreError::Read(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "instance name is required",
+            )));
+        }
+        if version_id.trim().is_empty() {
+            return Err(InstanceStoreError::Read(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "version_id is required",
+            )));
+        }
+        if inner.instances.iter().any(|instance| instance.name == name) {
+            return Err(InstanceStoreError::Read(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "an instance with this name already exists",
+            )));
+        }
+
+        let instance = Instance {
+            id: generate_id(),
+            name,
+            version_id,
+            created_at: chrono::DateTime::<chrono::Utc>::from(std::time::SystemTime::now())
+                .to_rfc3339(),
+            last_played_at: String::new(),
+            max_memory_mb: 0,
+            min_memory_mb: 0,
+            java_path: String::new(),
+            window_width: 0,
+            window_height: 0,
+            jvm_preset: String::new(),
+            performance_mode: String::new(),
+            extra_jvm_args: String::new(),
+        };
+
+        let game_dir = self.paths.instances_dir.join(&instance.id);
+        for subdir in ["saves", "mods", "resourcepacks", "shaderpacks", "config"] {
+            fs::create_dir_all(game_dir.join(subdir))?;
+        }
+
+        if let Some(mc_dir) = mc_dir {
+            let options_path = mc_dir.join("options.txt");
+            if let Ok(data) = fs::read(&options_path) {
+                let _ = fs::write(game_dir.join("options.txt"), data);
+            }
+        }
+
+        inner.instances.push(instance.clone());
+        self.persist_locked(&inner)?;
+        Ok(instance)
+    }
+
+    fn persist_locked(&self, inner: &StoredInstances) -> Result<(), InstanceStoreError> {
+        fs::create_dir_all(&self.paths.config_dir)?;
+        let data = serde_json::to_string_pretty(inner)?;
+        let temp_path = self.paths.instances_file.with_extension("json.tmp");
+        fs::write(&temp_path, data)?;
+        fs::rename(temp_path, &self.paths.instances_file)?;
+        Ok(())
+    }
+}
+
+fn count_entries(path: &Path) -> usize {
+    fs::read_dir(path)
+        .map(|entries| entries.filter_map(Result::ok).count())
+        .unwrap_or(0)
+}
+
+fn generate_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or_default();
+    format!("{:016x}", nanos as u64)
+}
