@@ -2,7 +2,6 @@
 *.syso
 *.exe
 .tools/
-build/
 .cache/
 dist/
 
