@@ -5,7 +5,8 @@ use serde::Serialize;
 #[derive(Debug, Serialize)]
 struct StatusResponse {
     status: &'static str,
-    mc_dir: String,
+    library_dir: String,
+    library_mode: String,
     setup_required: bool,
     app_name: String,
     version: String,
@@ -17,12 +18,14 @@ pub fn router() -> Router<AppState> {
 }
 
 async fn handle_status(State(state): State<AppState>) -> Json<StatusResponse> {
-    let mc_dir = state.mc_dir().unwrap_or_default();
+    let config = state.config().current();
+    let library_dir = state.library_dir().unwrap_or_default();
 
     Json(StatusResponse {
         status: "ok",
-        setup_required: mc_dir.is_empty(),
-        mc_dir,
+        setup_required: library_dir.is_empty(),
+        library_dir,
+        library_mode: config.library_mode,
         app_name: state.app_name().to_string(),
         version: state.version().to_string(),
         dev_mode: cfg!(debug_assertions),

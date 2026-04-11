@@ -26,7 +26,8 @@ struct ConfigPatch {
     music_enabled: Option<bool>,
     music_volume: Option<i32>,
     music_track: Option<i32>,
-    mc_dir: Option<String>,
+    library_dir: Option<String>,
+    library_mode: Option<String>,
 }
 
 pub fn router() -> Router<AppState> {
@@ -92,13 +93,16 @@ async fn handle_update_config(
     if let Some(music_track) = patch.music_track {
         next.music_track = music_track.max(0);
     }
-    if let Some(mc_dir) = patch.mc_dir {
-        next.mc_dir = mc_dir;
+    if let Some(library_dir) = patch.library_dir {
+        next.library_dir = library_dir;
+    }
+    if let Some(library_mode) = patch.library_mode {
+        next.library_mode = library_mode;
     }
 
     match state.config().update(next) {
         Ok(config) => {
-            state.set_mc_dir(config.mc_dir.clone());
+            state.set_library_dir(config.library_dir.clone());
             Ok(Json(config))
         }
         Err(error) => Err((

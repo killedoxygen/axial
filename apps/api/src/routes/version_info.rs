@@ -49,10 +49,10 @@ async fn handle_version_info(
     State(state): State<AppState>,
     Path(version_id): Path<String>,
 ) -> Result<Json<VersionInfoResponse>, (StatusCode, Json<serde_json::Value>)> {
-    let Some(mc_dir) = state.mc_dir() else {
+    let Some(mc_dir) = state.library_dir() else {
         return Err((
             StatusCode::PRECONDITION_FAILED,
-            Json(serde_json::json!({ "error": "minecraft directory not configured" })),
+            Json(serde_json::json!({ "error": "Croopor library is not configured" })),
         ));
     };
     if !valid_version_id(&version_id) {
@@ -91,10 +91,10 @@ async fn handle_open_version_folder(
     State(state): State<AppState>,
     Path(version_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let Some(mc_dir) = state.mc_dir() else {
+    let Some(mc_dir) = state.library_dir() else {
         return Err((
             StatusCode::PRECONDITION_FAILED,
-            Json(serde_json::json!({ "error": "minecraft directory not configured" })),
+            Json(serde_json::json!({ "error": "Croopor library is not configured" })),
         ));
     };
     if !valid_version_id(&version_id) {
@@ -133,10 +133,10 @@ async fn handle_delete_version(
     Path(version_id): Path<String>,
     Json(payload): Json<DeleteVersionRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let Some(mc_dir) = state.mc_dir() else {
+    let Some(mc_dir) = state.library_dir() else {
         return Err((
             StatusCode::PRECONDITION_FAILED,
-            Json(serde_json::json!({ "error": "minecraft directory not configured" })),
+            Json(serde_json::json!({ "error": "Croopor library is not configured" })),
         ));
     };
     if !valid_version_id(&version_id) {

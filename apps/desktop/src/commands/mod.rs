@@ -181,8 +181,11 @@ fn is_terminal_state(state: LaunchState) -> bool {
 fn launch_state_name(state: LaunchState) -> &'static str {
     match state {
         LaunchState::Idle => "idle",
+        LaunchState::Queued => "queued",
         LaunchState::Planning => "planning",
         LaunchState::Validating => "validating",
+        LaunchState::EnsuringRuntime => "ensuring_runtime",
+        LaunchState::DownloadingRuntime => "downloading_runtime",
         LaunchState::Preparing => "preparing",
         LaunchState::Starting => "starting",
         LaunchState::Monitoring => "monitoring",

@@ -7,6 +7,7 @@ pub struct AppPaths {
     pub instances_file: PathBuf,
     pub instances_dir: PathBuf,
     pub music_dir: PathBuf,
+    pub library_dir: PathBuf,
 }
 
 impl AppPaths {
@@ -27,6 +28,7 @@ impl AppPaths {
             instances_file: config_dir.join("instances.json"),
             instances_dir: config_dir.join("instances"),
             music_dir: config_dir.join("music"),
+            library_dir: config_dir.join("library"),
             config_dir,
         }
     }

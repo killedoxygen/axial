@@ -25,6 +25,15 @@ function rollbackLaunch(instanceId: string, animationFrameId: number | null): vo
   endLaunchPrep();
 }
 
+function updateRunningSession(instanceId: string, patch: Partial<import('./types').RunningSession>): void {
+  const current = runningSessions.value[instanceId];
+  if (!current) return;
+  runningSessions.value = {
+    ...runningSessions.value,
+    [instanceId]: { ...current, ...patch },
+  };
+}
+
 function describeFailureClass(failureClass: string | undefined): string {
   switch (failureClass) {
     case 'jvm_unsupported_option':
@@ -119,7 +128,13 @@ function formatHealingDetail(detail: string): string {
 
 function healingToastMessage(healing: LaunchHealingSummary): string {
   if (healing.failure_class && (!healing.retry_count || healing.retry_count === 0) && !healing.fallback_applied) {
-    return 'Launch stopped before startup because the manual overrides were not compatible.';
+    if (healing.advanced_overrides) {
+      return 'Launch stopped before startup because the manual overrides were not compatible.';
+    }
+    if (healing.failure_class === 'java_runtime_mismatch') {
+      return 'Launch stopped before startup because the required Java runtime was not available.';
+    }
+    return 'Launch stopped before startup because the selected setup was not compatible.';
   }
   if (healing.retry_count && healing.retry_count > 0) {
     return 'Launch recovered automatically with safer settings.';
@@ -281,8 +296,9 @@ export async function launchGame(): Promise<void> {
         const detail = friendlyLaunchErrorDetail(res.error);
         const healingDetails = healingNoticeDetails(res.healing || {});
         const details = [detail, ...healingDetails.filter((entry) => entry !== detail)];
+        const message = healingToastMessage(res.healing || {}) || 'Launch stopped before startup.';
         setLaunchNotice(inst.id, {
-          message: 'Launch stopped before startup because the manual overrides were not compatible.',
+          message,
           detail,
           details,
           tone: 'error',
@@ -298,7 +314,7 @@ export async function launchGame(): Promise<void> {
     confirmLaunch(inst.id, {
       sessionId: res.session_id,
       versionId: launchInst.version_id,
-      pid: res.pid,
+      pid: typeof res.pid === 'number' ? res.pid : 0,
       launchedAt,
       allocatedMB: maxMemMB,
       healing: res.healing,
@@ -340,6 +356,12 @@ function makeCompositeSubscription(...subscriptions: Array<{ close(): void } | n
 async function connectLaunchEvents(sessionId: string, instanceId: string, instanceName: string): Promise<void> {
   const onStatus = (data: any, handle: { close(): void }): void => {
     if (runningSessions.value[instanceId]?.sessionId !== sessionId) return;
+    if (typeof data.pid === 'number' || data.healing) {
+      updateRunningSession(instanceId, {
+        pid: typeof data.pid === 'number' ? data.pid : runningSessions.value[instanceId]?.pid || 0,
+        healing: data.healing || runningSessions.value[instanceId]?.healing,
+      });
+    }
     if (data.state === 'exited') onGameExited(data, instanceId, instanceName, sessionId, handle);
   };
 

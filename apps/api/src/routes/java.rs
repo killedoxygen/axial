@@ -15,7 +15,7 @@ pub fn router() -> Router<AppState> {
 
 async fn handle_java(State(state): State<AppState>) -> Json<JavaResponse> {
     let runtimes = state
-        .mc_dir()
+        .library_dir()
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty())
         .map(|path| list_java_runtimes(&path))

@@ -6,14 +6,21 @@ pub mod loaders;
 pub mod manifest;
 pub mod paths;
 pub mod profiles;
+pub mod runtime;
 pub mod rules;
 pub mod types;
 pub mod version;
 
 pub use download::{DownloadError, DownloadProgress, Downloader};
 pub use java::{
-    JavaRuntimeInfo, JavaRuntimeLookupError, JavaRuntimeResult, find_java_runtime,
-    list_java_runtimes, probe_java_runtime_info,
+    JavaRuntimeInfo, JavaRuntimeLookupError, JavaRuntimeResult, ensure_java_runtime,
+    find_java_runtime, is_known_runtime_component, list_java_runtimes, preferred_runtime_component,
+    probe_java_runtime_info,
+};
+pub use runtime::{
+    RuntimeEnsureAction, RuntimeEnsureResult, RuntimeId, RuntimeInstallState, RuntimeOverride,
+    RuntimeRecord, RuntimeRequirement, RuntimeSource, ensure_runtime, list_runtime_records,
+    parse_runtime_override, runtime_requirement,
 };
 pub use launch::{
     JavaVersion, LaunchModelError, LaunchVars, ResolvedLibrary, VersionJson, build_classpath,

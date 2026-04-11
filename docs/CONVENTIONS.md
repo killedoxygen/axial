@@ -39,24 +39,14 @@ keep this short and real. if the codebase changes, update this file.
 - `core/launcher`, `core/minecraft`, `core/performance`, and `core/config` are the long-term Rust product logic crates
 - if backend work is part of this branch, add it in Rust
 
-## Build
+## Build shape
 - frontend entry is `frontend/src/main.tsx`
-- output is `frontend/static/app.js`
+- frontend bundle output is `frontend/static/app.js`
 - frontend package manager is `pnpm`, pinned through `frontend/package.json`
-- run frontend commands through `corepack pnpm`, do not assume a global `pnpm` shim
-- workflow definitions live in `Taskfile.yml`
-- main local entrypoints are `./dev` on unix/wsl and `dev.ps1` or `dev.cmd` on windows
-- `make` is a fallback path, not the main daily interface
-- `./dev` and `dev.ps1` call cargo/corepack directly; they must not depend on Go or a repo-local task bootstrap
-- frontend installs should use the lockfile and `--ignore-scripts`
-- desktop dev/build on this branch is Rust + Tauri
-- local dev commands live in `Taskfile.yml`
-- `Taskfile.yml` mirrors the direct dev commands but is optional
-- `Makefile` is only a unix/wsl convenience shim
-- release builds and release artifacts live in `.github/workflows/release.yml`
-- Rust workspace commands go through `cargo`
+- the Rust workspace root is `Cargo.toml`
+- release/build automation lives in `.github/workflows/`
 - Rust build output lives in `target/`
-- local release staging goes through `dist/`
+- local release staging lives in `dist/`
 
 ## Inputs
 - text and number inputs should use `autocomplete="off"`

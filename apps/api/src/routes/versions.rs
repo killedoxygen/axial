@@ -24,10 +24,10 @@ pub fn router() -> Router<AppState> {
 async fn handle_versions(
     State(state): State<AppState>,
 ) -> Result<Json<VersionsResponse>, (axum::http::StatusCode, Json<serde_json::Value>)> {
-    let Some(mc_dir) = state.mc_dir() else {
+    let Some(mc_dir) = state.library_dir() else {
         return Err((
             axum::http::StatusCode::PRECONDITION_FAILED,
-            Json(serde_json::json!({ "error": "minecraft directory not configured" })),
+            Json(serde_json::json!({ "error": "Croopor library is not configured" })),
         ));
     };
 
@@ -47,10 +47,10 @@ async fn handle_version_watch(
     Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>,
     (axum::http::StatusCode, Json<serde_json::Value>),
 > {
-    let Some(mc_dir) = state.mc_dir() else {
+    let Some(mc_dir) = state.library_dir() else {
         return Err((
             axum::http::StatusCode::PRECONDITION_FAILED,
-            Json(serde_json::json!({ "error": "minecraft directory not configured" })),
+            Json(serde_json::json!({ "error": "Croopor library is not configured" })),
         ));
     };
 

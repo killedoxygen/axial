@@ -27,8 +27,11 @@ id_type!(VersionId);
 #[serde(rename_all = "snake_case")]
 pub enum LaunchState {
     Idle,
+    Queued,
     Planning,
     Validating,
+    EnsuringRuntime,
+    DownloadingRuntime,
     Preparing,
     Starting,
     Monitoring,

@@ -199,7 +199,7 @@ function RunningCard({ name, versionId, pid, launchedAt }: {
     <div class="running-area" id="running-area">
       <div class="running-card">
         <div class="running-card-head">
-          <span class="running-card-label">Game Launched</span>
+          <span class="running-card-label">{pid > 0 ? 'Game Launched' : 'Preparing Launch'}</span>
         </div>
         <div class="running-top">
           <pre class="running-ascii" id="running-ascii"></pre>
@@ -207,7 +207,7 @@ function RunningCard({ name, versionId, pid, launchedAt }: {
             <span class="running-version" id="running-version">
               {name} ({versionId})
             </span>
-            <span class="running-pid" id="running-pid">PID {pid}</span>
+            <span class="running-pid" id="running-pid">{pid > 0 ? `PID ${pid}` : 'Waiting for process...'}</span>
           </div>
         </div>
         <div class="running-bottom">

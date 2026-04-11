@@ -35,10 +35,10 @@ async fn handle_install(
         ));
     }
 
-    let mc_dir = state.mc_dir().ok_or_else(|| {
+    let mc_dir = state.library_dir().ok_or_else(|| {
         (
             StatusCode::PRECONDITION_FAILED,
-            Json(serde_json::json!({ "error": "minecraft directory not configured" })),
+            Json(serde_json::json!({ "error": "Croopor library is not configured" })),
         )
     })?;
 

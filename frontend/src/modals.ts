@@ -25,7 +25,11 @@ export function showSetup(): Promise<void> {
     const setupUseBtn = byId<HTMLButtonElement>('setup-use-btn');
     const setupBrowseBtn = byId<HTMLButtonElement>('setup-browse-btn');
     const setupInitBtn = byId<HTMLButtonElement>('setup-init-btn');
-    if (!overlay || !setupUseBtn || !setupBrowseBtn || !setupInitBtn) {
+    const setupAdvancedToggle = byId<HTMLButtonElement>('setup-advanced-toggle');
+    const setupAdvanced = byId<HTMLElement>('setup-advanced');
+    const setupManagedPath = byId<HTMLElement>('setup-managed-path');
+    const setupProgressCopy = byId<HTMLElement>('setup-progress-copy');
+    if (!overlay || !setupUseBtn || !setupBrowseBtn || !setupInitBtn || !setupAdvancedToggle || !setupAdvanced || !setupManagedPath || !setupProgressCopy) {
       overlay?.classList.add('hidden');
       reject(new Error('setup UI is missing required elements'));
       return;
@@ -34,20 +38,19 @@ export function showSetup(): Promise<void> {
     const setupUseBtnEl = setupUseBtn;
     const setupBrowseBtnEl = setupBrowseBtn;
     const setupInitBtnEl = setupInitBtn;
+    const setupAdvancedToggleEl = setupAdvancedToggle;
+    const setupAdvancedEl = setupAdvanced;
+    const setupManagedPathEl = setupManagedPath;
+    const setupProgressCopyEl = setupProgressCopy;
+    let managedPath = '';
+    let setupRunning = false;
     overlayEl.classList.remove('hidden');
-
-    void (async () => {
-      try {
-        const defaults: any = await api('GET', '/setup/defaults');
-        const setupNewPath = byId<HTMLInputElement>('setup-new-path');
-        if (setupNewPath) setupNewPath.value = defaults.default_path || '';
-      } catch (err: unknown) {}
-    })();
 
     function hideSetup(): void {
       setupUseBtnEl.onclick = null;
       setupBrowseBtnEl.onclick = null;
       setupInitBtnEl.onclick = null;
+      setupAdvancedToggleEl.onclick = null;
       overlayEl.classList.add('hidden');
       resolve();
     }
@@ -62,6 +65,36 @@ export function showSetup(): Promise<void> {
     function clearPathError(): void {
       byId<HTMLElement>('setup-path-error')?.classList.add('hidden');
     }
+
+    async function runManagedSetup(isRetry = false): Promise<void> {
+      if (setupRunning || !managedPath) return;
+      setupRunning = true;
+      clearPathError();
+      setupInitBtnEl.disabled = true;
+      setupInitBtnEl.textContent = isRetry ? 'Retrying setup...' : 'Setting up Croopor...';
+      setupProgressCopyEl.textContent = isRetry
+        ? 'Retrying managed library setup...'
+        : 'Creating the Croopor library...';
+      try {
+        const res: any = await api('POST', '/setup/init', { path: managedPath });
+        if (res.error) { showPathError(res.error); return; }
+        hideSetup();
+      } catch (err: unknown) {
+        showPathError(errMessage(err) || 'Failed to set up the Croopor library');
+      } finally {
+        setupRunning = false;
+        setupInitBtnEl.disabled = false;
+        setupInitBtnEl.textContent = 'Retry setup';
+        setupProgressCopyEl.textContent = 'Croopor could not finish setup. You can retry or use an existing library instead.';
+      }
+    }
+
+    setupAdvancedToggleEl.onclick = () => {
+      const open = setupAdvancedEl.classList.toggle('hidden');
+      setupAdvancedToggleEl.textContent = open
+        ? 'Use an existing Minecraft folder instead'
+        : 'Hide existing-library option';
+    };
 
     // "Use this path" flow
     setupUseBtnEl.onclick = async () => {
@@ -78,7 +111,7 @@ export function showSetup(): Promise<void> {
         showPathError(errMessage(err) || 'Failed to set directory');
       } finally {
         setupUseBtnEl.disabled = false;
-        setupUseBtnEl.textContent = 'Use this path';
+        setupUseBtnEl.textContent = 'Use existing library';
       }
     };
 
@@ -111,23 +144,32 @@ export function showSetup(): Promise<void> {
       }
     };
 
-    // "Create & Continue" flow
-    setupInitBtnEl.onclick = async () => {
-      const path: string | undefined = byId<HTMLInputElement>('setup-new-path')?.value.trim();
-      if (!path) return;
-      setupInitBtnEl.disabled = true;
-      setupInitBtnEl.textContent = 'Creating...';
-      try {
-        const res: any = await api('POST', '/setup/init', { path });
-        if (res.error) { showPathError(res.error); return; }
-        hideSetup();
-      } catch (err: unknown) {
-        showPathError(errMessage(err) || 'Failed to create directory');
-      } finally {
-        setupInitBtnEl.disabled = false;
-        setupInitBtnEl.textContent = 'Create & Continue';
-      }
+    setupInitBtnEl.onclick = () => {
+      void runManagedSetup(true);
     };
+
+    void (async () => {
+      try {
+        const defaults: any = await api('GET', '/setup/defaults');
+        managedPath = defaults.managed_default_path || '';
+        setupManagedPathEl.textContent = managedPath || 'Could not determine a default library path.';
+        const setupPathInput = byId<HTMLInputElement>('setup-path-input');
+        if (setupPathInput && defaults.existing_default_path) {
+          setupPathInput.value = defaults.existing_default_path;
+        }
+        if (!managedPath) {
+          setupProgressCopyEl.textContent = 'Croopor could not determine a managed library path. Use an existing library or retry.';
+          setupInitBtnEl.disabled = false;
+          setupInitBtnEl.textContent = 'Retry setup';
+          return;
+        }
+        void runManagedSetup(false);
+      } catch (err: unknown) {
+        setupProgressCopyEl.textContent = 'Croopor could not start setup automatically. Retry or use an existing library instead.';
+        setupInitBtnEl.disabled = false;
+        setupInitBtnEl.textContent = 'Retry setup';
+      }
+    })();
   });
 }
 

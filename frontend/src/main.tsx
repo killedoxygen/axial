@@ -58,7 +58,7 @@ async function init(): Promise<void> {
     devMode.value = statusRes?.dev_mode === true;
     Music.setTrackCount(musicStatusRes?.count);
 
-    // If Minecraft is not found, show setup screen and wait
+    // If the Croopor library is not configured yet, show setup and wait
     if (statusRes?.setup_required) {
       await showSetup();
     }

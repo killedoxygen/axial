@@ -26,7 +26,9 @@ pub struct AppConfig {
     #[serde(default)]
     pub onboarding_done: bool,
     #[serde(default)]
-    pub mc_dir: String,
+    pub library_dir: String,
+    #[serde(default)]
+    pub library_mode: String,
     #[serde(default)]
     pub music_enabled: Option<bool>,
     #[serde(default)]
@@ -51,7 +53,8 @@ impl Default for AppConfig {
             custom_vibrancy: None,
             lightness: None,
             onboarding_done: false,
-            mc_dir: String::new(),
+            library_dir: String::new(),
+            library_mode: "managed".to_string(),
             music_enabled: None,
             music_volume: None,
             music_track: 0,
@@ -72,6 +75,9 @@ impl AppConfig {
         }
         if self.performance_mode.is_empty() {
             self.performance_mode = "managed".to_string();
+        }
+        if self.library_mode.is_empty() {
+            self.library_mode = "managed".to_string();
         }
         self
     }

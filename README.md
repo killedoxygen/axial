@@ -59,6 +59,7 @@ windows powershell:
 
 ## common commands
 - `setup`: install frontend deps and prefetch Rust deps
+- on Linux/WSL, `setup` also prepares the Windows GNU target and MinGW linker for cross-builds
 - `dev`: run desktop dev with Rust + Tauri
 - `dev-web`: run the frontend-only dev server
 - `watch`: rebuild frontend assets on file changes
@@ -74,6 +75,10 @@ windows powershell:
 - `rust:desktop`: run the Rust Tauri desktop shell
 - `build`: build the release desktop binary
 - `build-dev`: build the dev desktop binary
+- `build --target windows`: build the release Windows desktop binary from Linux/WSL
+- `build-dev --target windows`: build the dev Windows desktop binary from Linux/WSL
+- `build:windows`: explicit alias for the release Windows cross-build
+- `build:windows:dev`: explicit alias for the dev Windows cross-build
 - `build:api`: build the dev API binary
 - `build:api:release`: build the release API binary
 - `doctor`: show detected tools and platform state
@@ -86,6 +91,7 @@ examples:
 ./dev dev-web
 ./dev watch
 ./dev build-dev
+./dev build --target windows
 ./dev verify
 ```
 
@@ -103,6 +109,16 @@ frontend dev server port is configurable:
 ```bash
 PORT=3001 ./dev dev-web
 ```
+
+windows cross-build note:
+
+```bash
+./dev setup
+./dev build --target windows
+```
+
+on Ubuntu/WSL, `setup` installs the Rust target and `gcc-mingw-w64-x86-64` by default unless `CI=true`.
+this currently builds a raw Windows `.exe`, not a signed installer or updater package.
 
 ## taskfile
 `Taskfile.yml` mirrors the same commands as `./dev`, but it is optional.

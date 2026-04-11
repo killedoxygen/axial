@@ -20,7 +20,7 @@ pub struct AppState {
     installs: Arc<InstallStore>,
     sessions: Arc<SessionStore>,
     performance: Arc<PerformanceManager>,
-    mc_dir: Arc<RwLock<Option<String>>>,
+    library_dir: Arc<RwLock<Option<String>>>,
     frontend_dir: Arc<PathBuf>,
 }
 
@@ -37,7 +37,7 @@ pub struct AppStateInit {
 
 impl AppState {
     pub fn new(init: AppStateInit) -> Self {
-        let mc_dir = init.config.current().mc_dir;
+        let library_dir = init.config.current().library_dir;
 
         Self {
             app_name: init.app_name,
@@ -47,10 +47,10 @@ impl AppState {
             installs: init.installs,
             sessions: init.sessions,
             performance: init.performance,
-            mc_dir: Arc::new(RwLock::new(if mc_dir.is_empty() {
+            library_dir: Arc::new(RwLock::new(if library_dir.is_empty() {
                 None
             } else {
-                Some(mc_dir)
+                Some(library_dir)
             })),
             frontend_dir: Arc::new(init.frontend_dir),
         }
@@ -84,12 +84,12 @@ impl AppState {
         &self.performance
     }
 
-    pub fn mc_dir(&self) -> Option<String> {
-        self.mc_dir.read().ok().and_then(|value| value.clone())
+    pub fn library_dir(&self) -> Option<String> {
+        self.library_dir.read().ok().and_then(|value| value.clone())
     }
 
-    pub fn set_mc_dir(&self, value: String) {
-        if let Ok(mut guard) = self.mc_dir.write() {
+    pub fn set_library_dir(&self, value: String) {
+        if let Ok(mut guard) = self.library_dir.write() {
             *guard = if value.is_empty() { None } else { Some(value) };
         }
     }

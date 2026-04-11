@@ -36,7 +36,7 @@ pub fn router() -> Router<AppState> {
 
 async fn handle_list_instances(State(state): State<AppState>) -> Json<InstancesResponse> {
     let versions = state
-        .mc_dir()
+        .library_dir()
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty())
         .and_then(|path| scan_versions(&path).ok())
@@ -73,7 +73,7 @@ async fn handle_create_instance(
     State(state): State<AppState>,
     Json(payload): Json<CreateInstanceRequest>,
 ) -> Result<Json<croopor_config::Instance>, (StatusCode, Json<serde_json::Value>)> {
-    let mc_dir = state.mc_dir().map(PathBuf::from);
+    let mc_dir = state.library_dir().map(PathBuf::from);
     state
         .instances()
         .add(payload.name, payload.version_id, mc_dir.as_deref())

@@ -14,10 +14,10 @@ pub fn router() -> Router<AppState> {
 async fn handle_dev_cleanup(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let mc_dir = state.mc_dir().ok_or_else(|| {
+    let mc_dir = state.library_dir().ok_or_else(|| {
         (
             StatusCode::PRECONDITION_FAILED,
-            Json(serde_json::json!({ "error": "minecraft directory not configured" })),
+            Json(serde_json::json!({ "error": "Croopor library is not configured" })),
         )
     })?;
     let mc_dir = PathBuf::from(mc_dir);
@@ -99,7 +99,7 @@ async fn handle_dev_flush(
     let _ = fs::remove_dir_all(config_paths.config_dir.join("runtimes"));
 
     state.config().replace_in_memory(AppConfig::default());
-    state.set_mc_dir(String::new());
+    state.set_library_dir(String::new());
     let _ = state.instances().clear();
 
     Ok(Json(serde_json::json!({ "status": "flushed" })))

@@ -5,6 +5,7 @@ use axum::{
     http::StatusCode,
     routing::{get, post},
 };
+use croopor_config::AppPaths;
 use croopor_minecraft::{
     create_minecraft_dir, default_minecraft_dir, ensure_launcher_profiles, validate_installation,
 };
@@ -13,7 +14,9 @@ use std::path::PathBuf;
 
 #[derive(Debug, Serialize)]
 struct SetupDefaultsResponse {
-    default_path: String,
+    managed_default_path: String,
+    existing_default_path: String,
+    recommended_mode: &'static str,
     os: &'static str,
 }
 
@@ -43,11 +46,14 @@ pub fn router() -> Router<AppState> {
 }
 
 async fn handle_setup_defaults() -> Json<SetupDefaultsResponse> {
+    let paths = AppPaths::detect();
     Json(SetupDefaultsResponse {
-        default_path: default_minecraft_dir()
+        managed_default_path: paths.library_dir.to_string_lossy().to_string(),
+        existing_default_path: default_minecraft_dir()
             .unwrap_or_default()
             .to_string_lossy()
             .to_string(),
+        recommended_mode: "managed",
         os: std::env::consts::OS,
     })
 }
@@ -70,7 +76,7 @@ async fn handle_setup_validate(
     } else {
         Json(SetupValidateResponse {
             valid: false,
-            error: Some("minecraft installation is missing required directories".to_string()),
+            error: Some("existing library is missing required directories".to_string()),
         })
     }
 }
@@ -84,19 +90,24 @@ async fn handle_setup_set_dir(
         return Err((
             StatusCode::BAD_REQUEST,
             Json(
-                serde_json::json!({ "error": "invalid minecraft installation: minecraft installation is missing required directories" }),
+                serde_json::json!({ "error": "invalid existing library: existing library is missing required directories" }),
             ),
         ));
     }
 
     let mut config = state.config().current();
-    config.mc_dir = payload.path.clone();
+    config.library_dir = payload.path.clone();
+    config.library_mode = "existing".to_string();
     state.config().update(config).map_err(internal_error)?;
-    state.set_mc_dir(payload.path.clone());
+    state.set_library_dir(payload.path.clone());
     let _ = ensure_launcher_profiles(&path, "");
 
     Ok(Json(
-        serde_json::json!({ "status": "ok", "mc_dir": payload.path }),
+        serde_json::json!({
+            "status": "ok",
+            "library_dir": payload.path,
+            "library_mode": "existing"
+        }),
     ))
 }
 
@@ -105,14 +116,14 @@ async fn handle_setup_init(
     Json(payload): Json<SetupPathRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let path = if payload.path.is_empty() {
-        default_minecraft_dir().unwrap_or_default()
+        AppPaths::detect().library_dir
     } else {
         PathBuf::from(&payload.path)
     };
     if path.as_os_str().is_empty() {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "could not determine default minecraft path" })),
+            Json(serde_json::json!({ "error": "could not determine default Croopor library path" })),
         ));
     }
 
@@ -120,13 +131,15 @@ async fn handle_setup_init(
     let _ = ensure_launcher_profiles(&path, "");
 
     let mut config = state.config().current();
-    config.mc_dir = path.to_string_lossy().to_string();
+    config.library_dir = path.to_string_lossy().to_string();
+    config.library_mode = "managed".to_string();
     state.config().update(config).map_err(internal_error)?;
-    state.set_mc_dir(path.to_string_lossy().to_string());
+    state.set_library_dir(path.to_string_lossy().to_string());
 
     Ok(Json(serde_json::json!({
         "status": "ok",
-        "mc_dir": path.to_string_lossy().to_string()
+        "library_dir": path.to_string_lossy().to_string(),
+        "library_mode": "managed"
     })))
 }
 

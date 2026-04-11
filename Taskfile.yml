@@ -5,6 +5,7 @@ env:
 
 vars:
   FRONTEND_DIR: frontend
+  WINDOWS_TARGET: x86_64-pc-windows-gnu
 
 tasks:
   default:
@@ -18,10 +19,11 @@ tasks:
       - task --list
 
   setup:
-    desc: install frontend deps and prefetch Rust deps
+    desc: install frontend deps, prefetch Rust deps, and prep Windows cross-builds on Linux/WSL
     deps:
       - frontend:install
       - rust:fetch
+      - rust:setup:windows-cross
 
   doctor:
     desc: show the local toolchain and platform state
@@ -95,6 +97,35 @@ tasks:
     cmds:
       - cargo fetch --locked
 
+  rust:setup:windows-cross:
+    desc: prepare Linux/WSL Windows cross-build prerequisites
+    cmds:
+      - cmd: |
+          target="x86_64-pc-windows-gnu"
+          if ! rustup target list --installed | grep -Fxq "$target"; then
+            rustup target add "$target"
+          fi
+          if ! command -v apt-get >/dev/null 2>&1; then
+            exit 0
+          fi
+          if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
+            exit 0
+          fi
+          if [ "${CI:-}" = "true" ]; then
+            echo "skipping apt install for Windows cross-build prerequisites in CI"
+            exit 0
+          fi
+          if [ "$(id -u)" -eq 0 ]; then
+            apt-get install -y gcc-mingw-w64-x86-64
+          elif command -v sudo >/dev/null 2>&1; then
+            sudo apt-get install -y gcc-mingw-w64-x86-64
+          else
+            echo "missing MinGW linker: x86_64-w64-mingw32-gcc" >&2
+            echo "install it with: sudo apt-get install -y gcc-mingw-w64-x86-64" >&2
+            exit 1
+          fi
+        platforms: [linux]
+
   rust:fmt:
     desc: run cargo fmt check for the Rust workspace
     cmds:
@@ -146,6 +177,20 @@ tasks:
       - frontend:build
     cmds:
       - cargo build --locked -p croopor-desktop
+
+  build:windows:
+    desc: build the release Windows desktop binary from linux/wsl
+    deps:
+      - frontend:build
+    cmds:
+      - cargo build --locked -p croopor-desktop --release --target {{.WINDOWS_TARGET}}
+
+  build:windows:dev:
+    desc: build the dev Windows desktop binary from linux/wsl
+    deps:
+      - frontend:build
+    cmds:
+      - cargo build --locked -p croopor-desktop --target {{.WINDOWS_TARGET}}
 
   build:api:
     desc: build the API binary in dev mode

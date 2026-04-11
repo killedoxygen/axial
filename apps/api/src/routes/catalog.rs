@@ -28,10 +28,10 @@ pub fn router() -> Router<AppState> {
 async fn handle_catalog(
     State(state): State<AppState>,
 ) -> Result<Json<CatalogResponse>, (StatusCode, Json<serde_json::Value>)> {
-    let Some(mc_dir) = state.mc_dir() else {
+    let Some(mc_dir) = state.library_dir() else {
         return Err((
             StatusCode::PRECONDITION_FAILED,
-            Json(serde_json::json!({ "error": "minecraft directory not configured" })),
+            Json(serde_json::json!({ "error": "Croopor library is not configured" })),
         ));
     };
 

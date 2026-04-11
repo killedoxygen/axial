@@ -57,7 +57,8 @@ export interface Config {
   custom_vibrancy?: number;
   lightness?: number;
   onboarding_done: boolean;
-  mc_dir?: string;
+  library_dir?: string;
+  library_mode?: string;
   music_enabled?: boolean;
   music_volume?: number;
   music_track?: number;
