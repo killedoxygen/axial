@@ -347,7 +347,10 @@ function bindEvents(): void {
   });
 
   devFlush?.addEventListener('click', async () => {
-    const ok: boolean = await showConfirm('Delete all settings? App will restart.', { confirmText: 'Delete', destructive: true });
+    const ok: boolean = await showConfirm(
+      'Delete all Croopor-owned data and reset the launcher to first run?\nExternal libraries selected through "Use existing library" will not be deleted.',
+      { confirmText: 'Reset', destructive: true },
+    );
     if (!ok) return;
     const btn = devFlush;
     btn.setAttribute('disabled', 'true');
@@ -355,7 +358,7 @@ function bindEvents(): void {
     try {
       await api('POST', '/dev/flush');
       toast('Data flushed, restarting...');
-      localStorage.removeItem(STORAGE_KEY);
+      localStorage.clear();
       location.reload();
     } catch (err: unknown) {
       btn.removeAttribute('disabled');

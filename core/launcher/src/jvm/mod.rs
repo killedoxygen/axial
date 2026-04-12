@@ -24,46 +24,35 @@ pub fn resolve_preset(
     sanitize_preset(&preset, version_id, loader, is_modded, info)
 }
 
-pub fn gc_preset_args(preset: &str, info: &JavaRuntimeInfo) -> Vec<String> {
+pub fn gc_preset_args(
+    preset: &str,
+    info: &JavaRuntimeInfo,
+    low_impact_startup: bool,
+) -> Vec<String> {
     let preset = sanitize_preset(preset, "", "vanilla", false, info);
     match preset.as_str() {
-        PRESET_SMOOTH => vec![
-            "-XX:+UseShenandoahGC".to_string(),
-            "-XX:ShenandoahGCHeuristics=compact".to_string(),
-            "-XX:+AlwaysPreTouch".to_string(),
-            "-XX:+DisableExplicitGC".to_string(),
-            "-XX:+PerfDisableSharedMem".to_string(),
-        ],
-        PRESET_ULTRA_LOW_LATENCY => {
-            let mut args = vec![
-                "-XX:+UseZGC".to_string(),
-                "-XX:+AlwaysPreTouch".to_string(),
-                "-XX:+DisableExplicitGC".to_string(),
-                "-XX:+PerfDisableSharedMem".to_string(),
-            ];
-            if supports_generational_zgc(info) {
-                args.push("-XX:+ZGenerational".to_string());
-            }
-            args
-        }
-        PRESET_GRAALVM => vec![
-            "-XX:+UseG1GC".to_string(),
-            "-XX:+EnableJVMCI".to_string(),
-            "-XX:+UseJVMCICompiler".to_string(),
-            "-XX:-TieredCompilation".to_string(),
-            "-XX:ReservedCodeCacheSize=256M".to_string(),
-            "-XX:InitialCodeCacheSize=256M".to_string(),
-            "-XX:+AlwaysPreTouch".to_string(),
-            "-XX:+DisableExplicitGC".to_string(),
-            "-XX:MaxInlineLevel=15".to_string(),
-            "-XX:MaxInlineSize=270".to_string(),
-        ],
-        PRESET_LEGACY => conservative_g1_args(200),
-        PRESET_LEGACY_PVP => conservative_g1_args(15),
-        PRESET_LEGACY_HEAVY => conservative_g1_args(100),
-        PRESET_PERFORMANCE => conservative_g1_args(37),
+        PRESET_SMOOTH => smooth_args(low_impact_startup),
+        PRESET_ULTRA_LOW_LATENCY => ultra_low_latency_args(info, low_impact_startup),
+        PRESET_GRAALVM => graalvm_args(low_impact_startup),
+        PRESET_LEGACY => conservative_g1_args(200, low_impact_startup),
+        PRESET_LEGACY_PVP => conservative_g1_args(15, low_impact_startup),
+        PRESET_LEGACY_HEAVY => conservative_g1_args(100, low_impact_startup),
+        PRESET_PERFORMANCE => conservative_g1_args(37, low_impact_startup),
         _ => Vec::new(),
     }
+}
+
+fn smooth_args(low_impact_startup: bool) -> Vec<String> {
+    let mut args = vec![
+        "-XX:+UseShenandoahGC".to_string(),
+        "-XX:ShenandoahGCHeuristics=compact".to_string(),
+        "-XX:+DisableExplicitGC".to_string(),
+        "-XX:+PerfDisableSharedMem".to_string(),
+    ];
+    if !low_impact_startup {
+        args.push("-XX:+AlwaysPreTouch".to_string());
+    }
+    args
 }
 
 pub fn boot_throttle_args(java_major: u32) -> Vec<String> {
@@ -174,14 +163,46 @@ fn auto_select_preset(
     PRESET_PERFORMANCE.to_string()
 }
 
-fn conservative_g1_args(pause_millis: i32) -> Vec<String> {
-    vec![
+fn ultra_low_latency_args(info: &JavaRuntimeInfo, low_impact_startup: bool) -> Vec<String> {
+    let mut args = vec![
+        "-XX:+UseZGC".to_string(),
+        "-XX:+DisableExplicitGC".to_string(),
+        "-XX:+PerfDisableSharedMem".to_string(),
+    ];
+    if !low_impact_startup {
+        args.push("-XX:+AlwaysPreTouch".to_string());
+    }
+    if supports_generational_zgc(info) {
+        args.push("-XX:+ZGenerational".to_string());
+    }
+    args
+}
+
+fn graalvm_args(low_impact_startup: bool) -> Vec<String> {
+    let mut args = vec![
+        "-XX:+UseG1GC".to_string(),
+        "-XX:+EnableJVMCI".to_string(),
+        "-XX:+UseJVMCICompiler".to_string(),
+        "-XX:-TieredCompilation".to_string(),
+        "-XX:ReservedCodeCacheSize=256M".to_string(),
+        "-XX:InitialCodeCacheSize=256M".to_string(),
+        "-XX:+DisableExplicitGC".to_string(),
+        "-XX:MaxInlineLevel=15".to_string(),
+        "-XX:MaxInlineSize=270".to_string(),
+    ];
+    if !low_impact_startup {
+        args.push("-XX:+AlwaysPreTouch".to_string());
+    }
+    args
+}
+
+fn conservative_g1_args(pause_millis: i32, low_impact_startup: bool) -> Vec<String> {
+    let mut args = vec![
         "-XX:+UseG1GC".to_string(),
         format!("-XX:MaxGCPauseMillis={pause_millis}"),
         "-XX:+ParallelRefProcEnabled".to_string(),
         "-XX:+UnlockExperimentalVMOptions".to_string(),
         "-XX:+DisableExplicitGC".to_string(),
-        "-XX:+AlwaysPreTouch".to_string(),
         "-XX:G1NewSizePercent=20".to_string(),
         "-XX:G1MaxNewSizePercent=60".to_string(),
         "-XX:G1HeapRegionSize=16M".to_string(),
@@ -193,7 +214,11 @@ fn conservative_g1_args(pause_millis: i32) -> Vec<String> {
         "-XX:G1RSetUpdatingPauseTimePercent=5".to_string(),
         "-XX:SurvivorRatio=32".to_string(),
         "-XX:+PerfDisableSharedMem".to_string(),
-    ]
+    ];
+    if !low_impact_startup {
+        args.push("-XX:+AlwaysPreTouch".to_string());
+    }
+    args
 }
 
 fn is_legacy_family(version_id: &str) -> bool {
@@ -253,5 +278,17 @@ mod tests {
             sanitize_preset(PRESET_LEGACY, "1.20.4", "vanilla", false, &info(21)),
             PRESET_PERFORMANCE
         );
+    }
+
+    #[test]
+    fn managed_modes_skip_always_pre_touch() {
+        let args = gc_preset_args(PRESET_PERFORMANCE, &info(21), true);
+        assert!(!args.iter().any(|arg| arg == "-XX:+AlwaysPreTouch"));
+    }
+
+    #[test]
+    fn custom_modes_keep_always_pre_touch() {
+        let args = gc_preset_args(PRESET_PERFORMANCE, &info(21), false);
+        assert!(args.iter().any(|arg| arg == "-XX:+AlwaysPreTouch"));
     }
 }

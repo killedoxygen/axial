@@ -1,3 +1,4 @@
+use crate::logging::{append_trace, timestamp_utc};
 use crate::state::{AppState, LaunchEvent, LaunchSessionRecord, LaunchStatusEvent, StartupOutcome};
 use axum::{
     Json, Router,
@@ -27,6 +28,7 @@ struct LaunchRequest {
     username: Option<String>,
     max_memory_mb: Option<i32>,
     min_memory_mb: Option<i32>,
+    client_started_at_ms: Option<i64>,
 }
 
 struct LaunchSessionTask {
@@ -40,6 +42,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/launch", post(handle_launch))
         .route("/api/v1/launch/{id}/events", get(handle_launch_events))
+        .route("/api/v1/launch/{id}/status", get(handle_launch_status))
         .route("/api/v1/launch/{id}/command", get(handle_launch_command))
         .route("/api/v1/launch/{id}/kill", post(handle_launch_kill))
 }
@@ -82,7 +85,7 @@ async fn handle_launch(
     let requested_java = selected_java_override(&instance, &config);
     let requested_preset = selected_jvm_preset(&instance, &config);
     let advanced_overrides = has_advanced_overrides(&instance);
-    let launched_at = chrono::DateTime::<chrono::Utc>::from(SystemTime::now()).to_rfc3339();
+    let launched_at = timestamp_utc();
     let session_id = SessionId(generate_session_id());
 
     let intent = LaunchIntent {
@@ -101,6 +104,7 @@ async fn handle_launch(
         launcher_version: state.version().to_string(),
         game_dir: Some(state.instances().game_dir(&instance.id)),
         advanced_overrides,
+        performance_mode: selected_performance_mode(&instance, &config),
     };
 
     state
@@ -119,6 +123,13 @@ async fn handle_launch(
             healing: None,
         })
         .await;
+    trace_launch_event(
+        &session_id.0,
+        &format!(
+            "launch accepted for instance {} version {} client_started_at_ms={:?}",
+            instance.id, instance.version_id, payload.client_started_at_ms
+        ),
+    );
 
     let state_task = state.clone();
     let task = LaunchSessionTask {
@@ -152,6 +163,7 @@ async fn run_launch_session(state: AppState, task: LaunchSessionTask) {
     let mut attempt = croopor_launcher::service::AttemptOverrides::default();
 
     loop {
+        trace_launch_event(&session_id, "run_launch_session entered");
         emit_status(
             &state,
             &session_id,
@@ -173,6 +185,7 @@ async fn run_launch_session(state: AppState, task: LaunchSessionTask) {
         let prepared = match prepare_launch_attempt(&intent, &attempt).await {
             Ok(prepared) => prepared,
             Err(error) => {
+                trace_launch_event(&session_id, &format!("prepare failed: {}", error.message));
                 let failure_class = error.failure_class.unwrap_or(LaunchFailureClass::Unknown);
                 emit_terminal_failure(
                     &state,
@@ -185,6 +198,31 @@ async fn run_launch_session(state: AppState, task: LaunchSessionTask) {
                 return;
             }
         };
+        trace_launch_event(
+            &session_id,
+            &format!(
+                "prepare finished total={}ms version={}ms runtime={}ms planning={}ms",
+                prepared.metrics.total_ms,
+                prepared.metrics.version_ms,
+                prepared.metrics.runtime_ms,
+                prepared.metrics.planning_ms,
+            ),
+        );
+
+        state
+            .sessions()
+            .emit_log(
+                &session_id,
+                "system",
+                format!(
+                    "Launch prep finished in {} ms (version {} ms, runtime {} ms, plan {} ms).",
+                    prepared.metrics.total_ms,
+                    prepared.metrics.version_ms,
+                    prepared.metrics.runtime_ms,
+                    prepared.metrics.planning_ms,
+                ),
+            )
+            .await;
 
         if prepared.runtime.bypassed_requested_runtime {
             state
@@ -270,6 +308,7 @@ async fn run_launch_session(state: AppState, task: LaunchSessionTask) {
         let launched = match state.sessions().start_process(record, command).await {
             Ok(record) => record,
             Err(error) => {
+                trace_launch_event(&session_id, &format!("spawn failed: {error}"));
                 emit_terminal_failure(
                     &state,
                     &session_id,
@@ -281,6 +320,7 @@ async fn run_launch_session(state: AppState, task: LaunchSessionTask) {
                 return;
             }
         };
+        trace_launch_event(&session_id, &format!("spawned pid={:?}", launched.pid));
 
         emit_status(
             &state,
@@ -386,6 +426,10 @@ async fn run_launch_session(state: AppState, task: LaunchSessionTask) {
     }
 }
 
+fn trace_launch_event(session_id: &str, message: &str) {
+    append_trace("launch", session_id, message);
+}
+
 async fn handle_launch_events(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -449,6 +493,29 @@ async fn handle_launch_command(
         "java_path": record.java_path,
         "session_id": record.session_id.0,
         "healing": record.healing,
+    })))
+}
+
+async fn handle_launch_status(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let record = state.sessions().get(&id).await.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "session not found" })),
+        )
+    })?;
+
+    let status = snapshot_status(&record);
+    Ok(Json(serde_json::json!({
+        "state": status.state,
+        "pid": status.pid,
+        "exit_code": status.exit_code,
+        "failure_class": status.failure_class,
+        "failure_detail": status.failure_detail,
+        "healing": status.healing,
+        "session_id": record.session_id.0,
     })))
 }
 
@@ -535,6 +602,14 @@ fn selected_jvm_preset(instance: &Instance, config: &AppConfig) -> String {
         instance.jvm_preset.trim().to_string()
     } else {
         config.jvm_preset.trim().to_string()
+    }
+}
+
+fn selected_performance_mode(instance: &Instance, config: &AppConfig) -> String {
+    if !instance.performance_mode.trim().is_empty() {
+        instance.performance_mode.trim().to_string()
+    } else {
+        config.performance_mode.trim().to_string()
     }
 }
 

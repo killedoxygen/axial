@@ -41,6 +41,8 @@ export interface Version {
   java_component?: string;
   java_major?: number;
   manifest_url?: string;
+  loader_component_id?: string;
+  loader_build_id?: string;
 }
 
 export interface Config {
@@ -86,13 +88,12 @@ export interface Catalog {
 
 // ── Install types ──
 
-export type LoaderType = 'fabric' | 'quilt' | 'forge' | 'neoforge';
-
 export interface InstallItem {
   versionId: string;
   loader?: {
-    type: LoaderType;
-    gameVersion: string;
+    componentId: LoaderComponentId;
+    buildId: string;
+    minecraftVersion: string;
     loaderVersion: string;
   };
 }
@@ -109,6 +110,7 @@ export interface RunningSession {
   sessionId: string;
   versionId: string;
   pid: number;
+  state?: string;
   launchedAt: string;
   allocatedMB: number;
   healing?: LaunchHealingSummary;
@@ -217,20 +219,54 @@ export interface ToastItem {
 
 // ── Loader metadata ──
 
-export interface GameVersion {
-  version: string;
-  stable: boolean;
+export type LoaderComponentId =
+  | 'net.fabricmc.fabric-loader'
+  | 'org.quiltmc.quilt-loader'
+  | 'net.minecraftforge'
+  | 'net.neoforged';
+
+export type LoaderType = 'fabric' | 'quilt' | 'forge' | 'neoforge';
+
+export interface LoaderAvailability {
+  fresh: boolean;
+  stale: boolean;
+  cache_hit: boolean;
+  checked_at_ms: number;
+  last_success_at_ms?: number;
+  last_error?: string;
 }
 
-export interface LoaderVersion {
-  version: string;
-  stable: boolean;
-  recommended?: boolean;
+export interface LoaderCatalogState {
+  availability: LoaderAvailability;
 }
 
-export interface LoaderInfo {
-  type: LoaderType;
+export interface LoaderComponentRecord {
+  id: LoaderComponentId;
   name: string;
+}
+
+export interface LoaderBuildRecord {
+  component_id: LoaderComponentId;
+  component_name: string;
+  build_id: string;
+  minecraft_version: string;
+  loader_version: string;
+  version_id: string;
+  stable: boolean;
+  recommended: boolean;
+  latest: boolean;
+  strategy: string;
+  artifact_kind: string;
+  installability: string;
+}
+
+export interface LoaderBuildsResponse {
+  builds: LoaderBuildRecord[];
+  catalog: LoaderCatalogState;
+}
+
+export interface LoaderComponentsResponse {
+  components: LoaderComponentRecord[];
 }
 
 export type UpdateKind = 'none' | 'release-page' | 'appimage';

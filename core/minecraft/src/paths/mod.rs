@@ -12,6 +12,26 @@ pub fn versions_dir(mc_dir: &Path) -> PathBuf {
     mc_dir.join("versions")
 }
 
+pub fn cache_dir(mc_dir: &Path) -> PathBuf {
+    mc_dir.join("cache")
+}
+
+pub fn loader_cache_dir(mc_dir: &Path) -> PathBuf {
+    cache_dir(mc_dir).join("loaders")
+}
+
+pub fn loader_catalog_dir(mc_dir: &Path) -> PathBuf {
+    loader_cache_dir(mc_dir).join("catalog")
+}
+
+pub fn loader_artifacts_dir(mc_dir: &Path) -> PathBuf {
+    loader_cache_dir(mc_dir).join("artifacts")
+}
+
+pub fn loader_work_dir(mc_dir: &Path) -> PathBuf {
+    loader_cache_dir(mc_dir).join("work")
+}
+
 pub fn default_minecraft_dir() -> Option<PathBuf> {
     if cfg!(target_os = "windows") {
         std::env::var_os("APPDATA")
@@ -54,7 +74,14 @@ pub fn validate_installation(mc_dir: &Path) -> bool {
 }
 
 pub fn create_minecraft_dir(dir: &Path) -> std::io::Result<()> {
-    for subdir in ["versions", "libraries", "assets"] {
+    for subdir in [
+        "versions",
+        "libraries",
+        "assets",
+        "cache/loaders/catalog",
+        "cache/loaders/artifacts",
+        "cache/loaders/work",
+    ] {
         std::fs::create_dir_all(dir.join(subdir))?;
     }
     Ok(())

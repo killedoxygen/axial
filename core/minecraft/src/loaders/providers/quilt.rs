@@ -1,0 +1,77 @@
+use super::common::QUILT_META_BASE;
+use crate::loaders::api::{build_id_for, installed_version_id_for};
+use crate::loaders::http::fetch_json;
+use crate::loaders::types::{
+    LoaderArtifactKind, LoaderBuildRecord, LoaderComponentId, LoaderGameVersion,
+    LoaderInstallSource, LoaderInstallStrategy, LoaderInstallability, LoaderVersionIndex,
+};
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct QuiltGameEntry {
+    version: String,
+    stable: bool,
+}
+
+#[derive(Deserialize)]
+struct QuiltLoaderEntry {
+    loader: QuiltLoaderVersion,
+}
+
+#[derive(Deserialize)]
+struct QuiltLoaderVersion {
+    version: String,
+}
+
+pub async fn fetch_game_versions()
+-> Result<Vec<LoaderGameVersion>, crate::loaders::types::LoaderError> {
+    let raw = fetch_json::<Vec<QuiltGameEntry>>(&format!("{QUILT_META_BASE}/game")).await?;
+    Ok(raw
+        .into_iter()
+        .map(|entry| LoaderGameVersion {
+            version: entry.version,
+            stable: entry.stable,
+        })
+        .collect())
+}
+
+pub async fn fetch_builds(
+    minecraft_version: &str,
+) -> Result<LoaderVersionIndex, crate::loaders::types::LoaderError> {
+    let raw = fetch_json::<Vec<QuiltLoaderEntry>>(&format!(
+        "{QUILT_META_BASE}/loader/{minecraft_version}"
+    ))
+    .await?;
+    let component_id = LoaderComponentId::Quilt;
+
+    Ok(LoaderVersionIndex {
+        component_id,
+        builds: raw
+            .into_iter()
+            .map(|entry| LoaderBuildRecord {
+                component_id,
+                component_name: component_id.display_name().to_string(),
+                build_id: build_id_for(component_id, minecraft_version, &entry.loader.version),
+                minecraft_version: minecraft_version.to_string(),
+                loader_version: entry.loader.version.clone(),
+                version_id: installed_version_id_for(
+                    component_id,
+                    minecraft_version,
+                    &entry.loader.version,
+                ),
+                stable: true,
+                recommended: false,
+                latest: false,
+                strategy: LoaderInstallStrategy::QuiltProfile,
+                artifact_kind: LoaderArtifactKind::ProfileJson,
+                installability: LoaderInstallability::Installable,
+                install_source: LoaderInstallSource::ProfileJson {
+                    url: format!(
+                        "{QUILT_META_BASE}/loader/{minecraft_version}/{}/profile/json",
+                        entry.loader.version
+                    ),
+                },
+            })
+            .collect(),
+    })
+}

@@ -10,6 +10,7 @@ Very small map so it is obvious where to start. weirdly enough, this document wa
 - `frontend/src/components/App.tsx`: app shell
 - `frontend/src/store.ts`: runtime state
 - `frontend/src/actions.ts`: state transitions
+- `frontend/src/machines/`: complex async workflow machines
 - `frontend/src/native.ts`: desktop runtime bridge, Tauri-aware
 - `frontend/src/updater.ts`: update checks, dismissal, desktop-only auto-check
 
@@ -30,6 +31,9 @@ main workflow files:
 - `core/minecraft`: vanilla metadata, downloads, Java/runtime discovery, loaders, installs
 - `core/performance`: performance planning and policy surfaces
 
+specialized docs:
+- modloader fetch/cache/install architecture: `docs/LOADER-ARCHITECTURE.md`
+
 ## runtime flow
 Bootstrap:
 1. app mounts
@@ -43,6 +47,12 @@ Install:
 2. backend starts a session
 3. progress comes through sse or desktop-native events
 4. frontend refreshes versions and catalog flags
+
+Loader install:
+1. frontend fetches loader components
+2. frontend fetches build records for `(component, mc_version)`
+3. frontend creates the instance with `build.version_id`
+4. frontend installs through `component_id + build_id`
 
 Launch:
 1. frontend posts to `/launch`
@@ -58,6 +68,7 @@ Update check:
 
 ## where to look
 - install bugs: `core/minecraft`, `apps/api/src/routes/install.rs`, `apps/api/src/routes/loaders.rs`, `frontend/src/install.ts`
+- loader selection bugs: `frontend/src/machines/new-instance-loader.ts`, `frontend/src/loaders/`, `docs/LOADER-ARCHITECTURE.md`
 - launch bugs: `core/launcher`, `core/minecraft`, `apps/api/src/routes/launch.rs`, `frontend/src/launch.ts`
 - settings/prefs: `core/config`, `frontend/src/settings.ts`, `frontend/src/state.ts`
 - updater/release metadata: `apps/api/src/routes/update.rs`, `frontend/src/updater.ts`, `.github/workflows/release.yml`, `README.md`

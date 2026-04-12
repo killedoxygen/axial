@@ -1,4 +1,4 @@
-use crate::build::{VanillaLaunchPlan, VanillaLaunchRequest, plan_vanilla_launch};
+use crate::build::{VanillaLaunchPlan, VanillaLaunchRequest, plan_resolved_launch};
 use crate::healing::{HealingEvent, HealingEventKind};
 use crate::jvm::{boot_throttle_args, gc_preset_args, resolve_preset};
 use crate::runtime::RuntimeSelection;
@@ -8,6 +8,7 @@ use croopor_minecraft::{
 };
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::time::Instant;
 
 #[derive(Debug, Clone)]
 pub struct LaunchIntent {
@@ -26,6 +27,7 @@ pub struct LaunchIntent {
     pub launcher_version: String,
     pub game_dir: Option<std::path::PathBuf>,
     pub advanced_overrides: bool,
+    pub performance_mode: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -43,6 +45,15 @@ pub struct PreparedLaunchAttempt {
     pub effective_preset: String,
     pub plan: VanillaLaunchPlan,
     pub healing: Option<LaunchHealingSummary>,
+    pub metrics: LaunchPreparationMetrics,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LaunchPreparationMetrics {
+    pub version_ms: u128,
+    pub runtime_ms: u128,
+    pub planning_ms: u128,
+    pub total_ms: u128,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -95,6 +106,8 @@ pub async fn prepare_launch_attempt(
     intent: &LaunchIntent,
     attempt: &AttemptOverrides,
 ) -> Result<PreparedLaunchAttempt, LaunchPreparationError> {
+    let started_at = Instant::now();
+    let version_started_at = Instant::now();
     let version = resolve_version(&intent.library_dir, &intent.version_id).map_err(|error| {
         LaunchPreparationError {
             message: error.to_string(),
@@ -102,7 +115,9 @@ pub async fn prepare_launch_attempt(
             healing: None,
         }
     })?;
+    let version_ms = version_started_at.elapsed().as_millis();
 
+    let runtime_started_at = Instant::now();
     let ensured_runtime = ensure_runtime(
         &intent.library_dir,
         &version.java_version,
@@ -124,6 +139,7 @@ pub async fn prepare_launch_attempt(
             failure_class: Some(LaunchFailureClass::JavaRuntimeMismatch),
         }),
     })?;
+    let runtime_ms = runtime_started_at.elapsed().as_millis();
 
     let mut runtime = runtime_selection_from_ensure(&intent.requested_java, ensured_runtime);
     sanitize_effective_runtime_major(&mut runtime, &version.java_version);
@@ -194,38 +210,57 @@ pub async fn prepare_launch_attempt(
 
     let mut extra_jvm_args = boot_throttle_args(runtime.effective_info.major);
     if !effective_preset.trim().is_empty() && !attempt.disable_custom_gc {
-        extra_jvm_args.extend(gc_preset_args(&effective_preset, &runtime.effective_info));
+        extra_jvm_args.extend(gc_preset_args(
+            &effective_preset,
+            &runtime.effective_info,
+            uses_low_impact_startup(&intent.performance_mode),
+        ));
     } else if attempt.disable_custom_gc {
         effective_preset.clear();
     }
     extra_jvm_args.extend(intent.extra_jvm_args.iter().cloned());
 
-    let plan = plan_vanilla_launch(&VanillaLaunchRequest {
-        session_id: intent.session_id.clone(),
-        mc_dir: intent.library_dir.clone(),
-        version_id: intent.version_id.clone(),
-        username: intent.username.clone(),
-        runtime: runtime.clone(),
-        game_dir: intent.game_dir.clone(),
-        launcher_name: intent.launcher_name.clone(),
-        launcher_version: intent.launcher_version.clone(),
-        min_memory_mb: Some(intent.min_memory_mb),
-        max_memory_mb: Some(intent.max_memory_mb),
-        extra_jvm_args,
-        resolution: intent.resolution,
-    })
+    let planning_started_at = Instant::now();
+    let plan = plan_resolved_launch(
+        &VanillaLaunchRequest {
+            session_id: intent.session_id.clone(),
+            mc_dir: intent.library_dir.clone(),
+            version_id: intent.version_id.clone(),
+            username: intent.username.clone(),
+            runtime: runtime.clone(),
+            game_dir: intent.game_dir.clone(),
+            launcher_name: intent.launcher_name.clone(),
+            launcher_version: intent.launcher_version.clone(),
+            min_memory_mb: Some(intent.min_memory_mb),
+            max_memory_mb: Some(intent.max_memory_mb),
+            extra_jvm_args,
+            resolution: intent.resolution,
+        },
+        version,
+    )
     .map_err(|error| LaunchPreparationError {
         message: error.to_string(),
         failure_class: Some(LaunchFailureClass::Unknown),
         healing: healing.clone(),
     })?;
+    let planning_ms = planning_started_at.elapsed().as_millis();
 
     Ok(PreparedLaunchAttempt {
         runtime,
         effective_preset,
         plan,
         healing,
+        metrics: LaunchPreparationMetrics {
+            version_ms,
+            runtime_ms,
+            planning_ms,
+            total_ms: started_at.elapsed().as_millis(),
+        },
     })
+}
+
+fn uses_low_impact_startup(performance_mode: &str) -> bool {
+    !matches!(performance_mode.trim(), "custom")
 }
 
 fn runtime_selection_from_ensure(

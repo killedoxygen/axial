@@ -286,6 +286,7 @@ export async function launchGame(): Promise<void> {
       instance_id: launchInst.id,
       username,
       max_memory_mb: maxMemMB,
+      client_started_at_ms: Date.now(),
     });
 
     if (res.error) {
@@ -315,6 +316,7 @@ export async function launchGame(): Promise<void> {
       sessionId: res.session_id,
       versionId: launchInst.version_id,
       pid: typeof res.pid === 'number' ? res.pid : 0,
+      state: 'queued',
       launchedAt,
       allocatedMB: maxMemMB,
       healing: res.healing,
@@ -353,12 +355,47 @@ function makeCompositeSubscription(...subscriptions: Array<{ close(): void } | n
   };
 }
 
+function makeLaunchStatusPoller(
+  sessionId: string,
+  instanceId: string,
+  onStatus: (data: any, handle: { close(): void }) => void,
+): { close(): void } {
+  let stopped = false;
+  let timerId = 0;
+
+  const handle = {
+    close(): void {
+      stopped = true;
+      if (timerId) window.clearInterval(timerId);
+    },
+  };
+
+  const poll = async (): Promise<void> => {
+    if (stopped) return;
+    if (runningSessions.value[instanceId]?.sessionId !== sessionId) {
+      handle.close();
+      return;
+    }
+    try {
+      const data = await api('GET', `/launch/${sessionId}/status`);
+      if (!stopped && !data?.error) onStatus(data, handle);
+    } catch {
+      // Native events remain primary. Polling is only a convergence fallback.
+    }
+  };
+
+  timerId = window.setInterval(() => { void poll(); }, 1000);
+  void poll();
+  return handle;
+}
+
 async function connectLaunchEvents(sessionId: string, instanceId: string, instanceName: string): Promise<void> {
   const onStatus = (data: any, handle: { close(): void }): void => {
     if (runningSessions.value[instanceId]?.sessionId !== sessionId) return;
-    if (typeof data.pid === 'number' || data.healing) {
+    if (typeof data.pid === 'number' || data.healing || typeof data.state === 'string') {
       updateRunningSession(instanceId, {
         pid: typeof data.pid === 'number' ? data.pid : runningSessions.value[instanceId]?.pid || 0,
+        state: typeof data.state === 'string' ? data.state : runningSessions.value[instanceId]?.state,
         healing: data.healing || runningSessions.value[instanceId]?.healing,
       });
     }
@@ -372,11 +409,15 @@ async function connectLaunchEvents(sessionId: string, instanceId: string, instan
 
   if (hasNativeDesktopRuntime()) {
     let streamHandle: { close(): void };
-    const statusSubscription = onNativeEvent(nativeLaunchStatusEventName(sessionId), (data) => {
+    const statusSubscription = await onNativeEvent(nativeLaunchStatusEventName(sessionId), (data) => {
       onStatus(data, streamHandle);
     });
-    const logSubscription = onNativeEvent(nativeLaunchLogEventName(sessionId), onLog);
-    streamHandle = makeCompositeSubscription(statusSubscription, logSubscription);
+    const logSubscription = await onNativeEvent(nativeLaunchLogEventName(sessionId), onLog);
+    if (!statusSubscription || !logSubscription) {
+      throw new Error('native launch stream unavailable');
+    }
+    const pollSubscription = makeLaunchStatusPoller(sessionId, instanceId, onStatus);
+    streamHandle = makeCompositeSubscription(statusSubscription, logSubscription, pollSubscription);
     try {
       await startNativeLaunchEvents(sessionId);
     } catch (err: unknown) {

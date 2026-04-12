@@ -30,4 +30,8 @@ pub struct VersionEntry {
     pub java_major: i32,
     #[serde(default)]
     pub manifest_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loader_component_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loader_build_id: Option<String>,
 }

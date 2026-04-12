@@ -10,7 +10,7 @@ pub mod types;
 
 pub use build::{
     VanillaLaunchPlan, VanillaLaunchPlanError, VanillaLaunchRequest, cleanup_natives_dir,
-    plan_vanilla_launch,
+    plan_resolved_launch, plan_vanilla_launch,
 };
 pub use healing::{HealingEvent, HealingEventKind};
 pub use jvm::{

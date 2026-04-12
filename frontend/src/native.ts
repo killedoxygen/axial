@@ -56,20 +56,17 @@ export function nativeLaunchLogEventName(sessionId: string): string {
   return `croopor:launch:${sessionId}:log`;
 }
 
-export function onNativeEvent(eventName: string, callback: (data: any) => void): { close(): void } | null {
+export async function onNativeEvent(eventName: string, callback: (data: any) => void): Promise<{ close(): void } | null> {
   const tauri = getTauriBinding();
   if (!tauri?.event) return null;
 
-  let unsubscribe: (() => void) | null = null;
-  void tauri.event.listen(eventName, (event) => {
+  const unsubscribe = await tauri.event.listen(eventName, (event) => {
     callback(event.payload);
-  }).then((unlisten) => {
-    unsubscribe = unlisten;
   });
 
   return {
     close(): void {
-      unsubscribe?.();
+      unsubscribe();
     },
   };
 }

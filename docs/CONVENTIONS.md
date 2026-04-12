@@ -12,6 +12,10 @@ keep this short and real. if the codebase changes, update this file.
 - keep modules flat, named exports only
 - no classes, no default exports
 - use signals/actions for cross-module state, not custom event spaghetti
+- keep complex async workflows in small machine modules built on signals, not scattered local flags
+- keep workflow machines under `frontend/src/machines/`
+- loader UI logic should consume normalized backend records, not raw ids or raw provider payloads
+- do not use composite version-id parsing as the main loader UI data model
 
 ## DOM and handlers
 - wrap dom listeners with arrows, do not pass business functions directly to `addEventListener`
@@ -31,6 +35,8 @@ keep this short and real. if the codebase changes, update this file.
 - errors are `{\"error\":\"message\"}`
 - launch/install progress uses sse in browser mode and the Tauri desktop event bridge on desktop
 - update checks go through `/api/v1/update`
+- loader selection uses component ids and build ids
+- route and frontend code must not inspect raw Fabric, Quilt, Forge, or NeoForge payloads
 
 ## Backend layout
 - the Rust rewrite lives under `apps/` and `core/`
@@ -38,6 +44,7 @@ keep this short and real. if the codebase changes, update this file.
 - `apps/desktop` owns the Tauri shell
 - `core/launcher`, `core/minecraft`, `core/performance`, and `core/config` are the long-term Rust product logic crates
 - if backend work is part of this branch, add it in Rust
+- loader-specific install behavior belongs in `core/minecraft/src/loaders/strategies/`, not in route handlers
 
 ## Build shape
 - frontend entry is `frontend/src/main.tsx`

@@ -1,3 +1,4 @@
+use crate::java::ensure_java_runtime;
 use crate::launch::{Library, VersionJson, maven_to_path};
 use crate::manifest::fetch_version_manifest;
 use crate::paths::{assets_dir, libraries_dir, versions_dir};
@@ -9,6 +10,9 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
+
+const LIBRARY_DOWNLOAD_CONCURRENCY: usize = 4;
+const ASSET_DOWNLOAD_CONCURRENCY: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DownloadProgress {
@@ -37,6 +41,8 @@ pub enum DownloadError {
     Request(#[from] reqwest::Error),
     #[error("parse version json: {0}")]
     ParseVersion(#[from] serde_json::Error),
+    #[error("prepare java runtime: {0}")]
+    PrepareRuntime(String),
 }
 
 #[derive(Debug, Clone)]
@@ -50,10 +56,7 @@ impl Downloader {
     pub fn new(mc_dir: impl Into<PathBuf>) -> Self {
         Self {
             mc_dir: mc_dir.into(),
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(300))
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+            client: build_http_client(Duration::from_secs(300)),
         }
     }
 
@@ -133,6 +136,33 @@ impl Downloader {
         }
 
         let version = serde_json::from_str::<VersionJson>(&fs::read_to_string(&json_path)?)?;
+        let runtime_task = if version.java_version.major_version > 0 {
+            send(progress(
+                "java_runtime",
+                0,
+                1,
+                Some(format!(
+                    "Preparing {} (Java {})",
+                    if version.java_version.component.trim().is_empty() {
+                        "managed runtime".to_string()
+                    } else {
+                        version.java_version.component.clone()
+                    },
+                    version.java_version.major_version
+                )),
+            ));
+
+            let mc_dir = self.mc_dir.clone();
+            let java_version = version.java_version.clone();
+            Some(tokio::spawn(async move {
+                ensure_java_runtime(&mc_dir, &java_version, "")
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok::<_, String>(java_version)
+            }))
+        } else {
+            None
+        };
 
         send(progress(
             "client_jar",
@@ -149,15 +179,28 @@ impl Downloader {
 
         let library_jobs = self.library_jobs(&version);
         send(progress("libraries", 0, library_jobs.len() as i32, None));
-        for (index, job) in library_jobs.iter().enumerate() {
-            if !job.path.is_file() {
-                self.download_file(&job.url, &job.path).await?;
-            }
+        let client = self.client.clone();
+        let total_library_jobs = library_jobs.len() as i32;
+        let mut completed_library_jobs = 0;
+        let mut library_downloads =
+            futures_util::stream::iter(library_jobs.into_iter().map(|job| {
+                let client = client.clone();
+                async move {
+                    if !job.path.is_file() {
+                        download_file_with_client(&client, &job.url, &job.path).await?;
+                    }
+                    Ok::<String, DownloadError>(job.name)
+                }
+            }))
+            .buffer_unordered(LIBRARY_DOWNLOAD_CONCURRENCY);
+        while let Some(result) = library_downloads.next().await {
+            let name = result?;
+            completed_library_jobs += 1;
             send(progress(
                 "libraries",
-                (index + 1) as i32,
-                library_jobs.len() as i32,
-                Some(job.name.clone()),
+                completed_library_jobs,
+                total_library_jobs,
+                Some(name),
             ));
         }
 
@@ -192,6 +235,27 @@ impl Downloader {
                 self.download_file(&logging.file.url, &log_config_path)
                     .await?;
             }
+        }
+
+        if let Some(task) = runtime_task {
+            let java_version = task
+                .await
+                .map_err(|error| DownloadError::PrepareRuntime(error.to_string()))?
+                .map_err(DownloadError::PrepareRuntime)?;
+            send(progress(
+                "java_runtime",
+                1,
+                1,
+                Some(format!(
+                    "Ready {} (Java {})",
+                    if java_version.component.trim().is_empty() {
+                        "managed runtime".to_string()
+                    } else {
+                        java_version.component.clone()
+                    },
+                    java_version.major_version
+                )),
+            ));
         }
 
         Ok(())
@@ -252,20 +316,27 @@ impl Downloader {
         }
 
         send(progress("assets", 0, jobs.len() as i32, None));
-        for (index_value, (hash, path)) in jobs.iter().enumerate() {
-            let url = format!(
-                "https://resources.download.minecraft.net/{}/{}",
-                &hash[..2],
-                hash
-            );
-            self.download_file(&url, path).await?;
-            if index_value + 1 == jobs.len() || (index_value + 1) % 50 == 0 {
-                send(progress(
-                    "assets",
-                    (index_value + 1) as i32,
-                    jobs.len() as i32,
-                    None,
-                ));
+        let client = self.client.clone();
+        let total_jobs = jobs.len() as i32;
+        let mut completed_jobs = 0;
+        let mut asset_downloads =
+            futures_util::stream::iter(jobs.into_iter().map(|(hash, path)| {
+                let client = client.clone();
+                async move {
+                    let url = format!(
+                        "https://resources.download.minecraft.net/{}/{}",
+                        &hash[..2],
+                        hash
+                    );
+                    download_file_with_client(&client, &url, &path).await
+                }
+            }))
+            .buffer_unordered(ASSET_DOWNLOAD_CONCURRENCY);
+        while let Some(result) = asset_downloads.next().await {
+            result?;
+            completed_jobs += 1;
+            if completed_jobs == total_jobs || completed_jobs % 50 == 0 {
+                send(progress("assets", completed_jobs, total_jobs, None));
             }
         }
 
@@ -336,26 +407,37 @@ pub async fn download_libraries<F>(
 where
     F: FnMut(DownloadProgress),
 {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(300))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+    let client = build_http_client(Duration::from_secs(300));
     let env = default_environment();
     let jobs = library_jobs_for(mc_dir, libraries, &env);
 
     send(progress(phase, 0, jobs.len() as i32, None));
-    for (index, job) in jobs.iter().enumerate() {
-        if !job.path.is_file() {
-            download_file_with_client(&client, &job.url, &job.path).await?;
+    let total_jobs = jobs.len() as i32;
+    let mut completed_jobs = 0;
+    let mut downloads = futures_util::stream::iter(jobs.into_iter().map(|job| {
+        let client = client.clone();
+        async move {
+            if !job.path.is_file() {
+                download_file_with_client(&client, &job.url, &job.path).await?;
+            }
+            Ok::<String, DownloadError>(job.name)
         }
-        send(progress(
-            phase,
-            (index + 1) as i32,
-            jobs.len() as i32,
-            Some(job.name.clone()),
-        ));
+    }))
+    .buffer_unordered(LIBRARY_DOWNLOAD_CONCURRENCY);
+    while let Some(result) = downloads.next().await {
+        let name = result?;
+        completed_jobs += 1;
+        send(progress(phase, completed_jobs, total_jobs, Some(name)));
     }
     Ok(())
+}
+
+fn build_http_client(timeout: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent("croopor/0.3")
+        .timeout(timeout)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
 }
 
 fn progress(phase: &str, current: i32, total: i32, file: Option<String>) -> DownloadProgress {
@@ -375,7 +457,7 @@ fn resolve_library_download(lib: &Library, mc_dir: &Path) -> Option<DownloadJob>
         && lib
             .downloads
             .as_ref()
-            .is_some_and(|downloads| downloads.artifact.is_none())
+            .is_none_or(|downloads| downloads.artifact.is_none())
     {
         return None;
     }
@@ -385,15 +467,18 @@ fn resolve_library_download(lib: &Library, mc_dir: &Path) -> Option<DownloadJob>
         .as_ref()
         .and_then(|downloads| downloads.artifact.as_ref())
     {
-        let path = resolve_path_under_root(&lib_dir, &artifact.path)?;
-        return Some(DownloadJob {
-            name: Path::new(&artifact.path)
-                .file_name()
-                .map(|value| value.to_string_lossy().to_string())
-                .unwrap_or_else(|| lib.name.clone()),
-            path,
-            url: artifact.url.clone(),
-        });
+        if !artifact.url.trim().is_empty() {
+            let path = resolve_path_under_root(&lib_dir, &artifact.path)?;
+            return Some(DownloadJob {
+                name: Path::new(&artifact.path)
+                    .file_name()
+                    .map(|value| value.to_string_lossy().to_string())
+                    .unwrap_or_else(|| lib.name.clone()),
+                path,
+                url: artifact.url.clone(),
+            });
+        }
+        return None;
     }
 
     let maven_path = maven_to_path(&lib.name);
@@ -430,15 +515,17 @@ fn resolve_native_download(lib: &Library, mc_dir: &Path, os_name: &str) -> Optio
             .as_ref()
             .and_then(|downloads| downloads.classifiers.get(&classifier_key))
         {
-            let path = resolve_path_under_root(&lib_dir, &artifact.path)?;
-            return Some(DownloadJob {
-                name: Path::new(&artifact.path)
-                    .file_name()
-                    .map(|value| value.to_string_lossy().to_string())
-                    .unwrap_or_else(|| format!("{}:{classifier_key}", lib.name)),
-                path,
-                url: artifact.url.clone(),
-            });
+            if !artifact.url.trim().is_empty() {
+                let path = resolve_path_under_root(&lib_dir, &artifact.path)?;
+                return Some(DownloadJob {
+                    name: Path::new(&artifact.path)
+                        .file_name()
+                        .map(|value| value.to_string_lossy().to_string())
+                        .unwrap_or_else(|| format!("{}:{classifier_key}", lib.name)),
+                    path,
+                    url: artifact.url.clone(),
+                });
+            }
         }
     }
 

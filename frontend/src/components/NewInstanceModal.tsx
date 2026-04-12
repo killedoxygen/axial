@@ -8,24 +8,14 @@ import { api } from '../api';
 import { Sound } from '../sound';
 import { showError, esc, parseVersionDisplay, errMessage } from '../utils';
 import { installVersion, installLoaderVersion } from '../install';
-import {
-  fetchGameVersions, fetchLoaderVersions,
-  filterByLoaderSupport, latestStable,
-} from '../loaders';
+import { createNewInstanceLoaderMachine } from '../machines/new-instance-loader';
 import type {
-  CatalogVersion, GameVersion, LoaderVersion, LoaderType,
+  CatalogVersion, LoaderBuildRecord, LoaderComponentId, LoaderComponentRecord,
 } from '../types';
 
 export const showNewInstanceModal = signal(false);
 
 const PAGE_SIZE = 50;
-
-const LOADER_OPTIONS: { value: LoaderType; label: string }[] = [
-  { value: 'fabric', label: 'Fabric' },
-  { value: 'quilt', label: 'Quilt' },
-  { value: 'forge', label: 'Forge' },
-  { value: 'neoforge', label: 'NeoForge' },
-];
 
 const FILTER_CHIPS: { value: string; label: string }[] = [
   { value: 'release', label: 'Release' },
@@ -54,16 +44,6 @@ function validateName(name: string): string | null {
   return null;
 }
 
-function buildCompositeId(loaderType: string, mcVersion: string, loaderVersion: string): string {
-  switch (loaderType) {
-    case 'fabric': return `fabric-loader-${loaderVersion}-${mcVersion}`;
-    case 'quilt': return `quilt-loader-${loaderVersion}-${mcVersion}`;
-    case 'forge': return `${mcVersion}-forge-${loaderVersion}`;
-    case 'neoforge': return `neoforge-${loaderVersion}`;
-    default: return mcVersion;
-  }
-}
-
 export function NewInstanceModal(): JSX.Element | null {
   const isOpen = showNewInstanceModal.value;
 
@@ -71,19 +51,25 @@ export function NewInstanceModal(): JSX.Element | null {
   const search = useSignal('');
   const selectedVersionId = useSignal<string | null>(null);
   const page = useSignal(0);
-  const loaderEnabled = useSignal(false);
-  const selectedLoader = useSignal<LoaderType>('fabric');
-  const loaderGameVersions = useSignal<GameVersion[] | null>(null);
-  const loaderVersionsList = useSignal<LoaderVersion[] | null>(null);
-  const selectedLoaderVersion = useSignal<string | null>(null);
-  const loaderLoading = useSignal(false);
   const name = useSignal(defaultName());
   const nameError = useSignal<string | null>(null);
 
   const overlayRef = useRef<HTMLDivElement>(null);
   const nameRef = useRef<HTMLInputElement>(null);
-  const loaderGamesRequestRef = useRef(0);
-  const loaderVersionsRequestRef = useRef(0);
+  const loaderMachineRef = useRef<ReturnType<typeof createNewInstanceLoaderMachine> | null>(null);
+  if (!loaderMachineRef.current) {
+    loaderMachineRef.current = createNewInstanceLoaderMachine();
+  }
+  const loaderMachine = loaderMachineRef.current;
+  const loaderState = loaderMachine.state;
+  const loaderEnabled = loaderState.value.kind !== 'disabled';
+  const loaderLoading = loaderState.value.kind === 'loading_components' || loaderState.value.kind === 'loading_builds';
+  const loaderComponents: LoaderComponentRecord[] | null = loaderState.value.context.components;
+  const selectedLoader = loaderState.value.context.selectedComponentId;
+  const loaderBuilds: LoaderBuildRecord[] | null = loaderState.value.context.builds;
+  const selectedLoaderBuildId: string | null = loaderState.value.context.selectedBuildId;
+  const loaderError = loaderState.value.kind === 'error' ? loaderState.value.context.errorMessage : null;
+  const selectedLoaderBuild = loaderBuilds?.find((build) => build.build_id === selectedLoaderBuildId) ?? null;
 
   // Reset modal state on each open, then ensure catalog exists
   useEffect(() => {
@@ -93,12 +79,7 @@ export function NewInstanceModal(): JSX.Element | null {
     search.value = '';
     selectedVersionId.value = null;
     page.value = 0;
-    loaderEnabled.value = false;
-    selectedLoader.value = 'fabric';
-    loaderGameVersions.value = null;
-    loaderVersionsList.value = null;
-    selectedLoaderVersion.value = null;
-    loaderLoading.value = false;
+    loaderMachine.reset();
     name.value = defaultName();
     nameError.value = null;
 
@@ -130,9 +111,6 @@ export function NewInstanceModal(): JSX.Element | null {
   // Filter versions
   const filteredVersions = useMemo(() => {
     let next = allVersions.filter(v => v.type === filter.value);
-    if (loaderEnabled.value && loaderGameVersions.value) {
-      next = filterByLoaderSupport(next, loaderGameVersions.value);
-    }
     if (search.value) {
       const q = search.value.toLowerCase();
       next = next.filter(v => {
@@ -141,26 +119,20 @@ export function NewInstanceModal(): JSX.Element | null {
       });
     }
     return next;
-  }, [allVersions, filter.value, loaderEnabled.value, loaderGameVersions.value, search.value]);
+  }, [allVersions, filter.value, search.value]);
 
   const loaderInstalledFor = useMemo(() => {
-    if (!loaderEnabled.value) return null;
-    const loader = selectedLoader.value;
+    if (!loaderEnabled) return null;
+    const loader = selectedLoader;
     const set = new Set<string>();
     for (const ver of versions.value) {
-      if (!ver.launchable || !ver.inherits_from) continue;
-      const id = ver.id.toLowerCase();
-      if (
-        (loader === 'fabric' && id.startsWith('fabric-loader-')) ||
-        (loader === 'quilt' && id.startsWith('quilt-loader-')) ||
-        (loader === 'forge' && id.includes('-forge-') && !id.startsWith('neoforge')) ||
-        (loader === 'neoforge' && id.startsWith('neoforge-'))
-      ) {
+      if (!ver.launchable || !ver.inherits_from || !loader) continue;
+      if (ver.loader_component_id === loader) {
         set.add(ver.inherits_from);
       }
     }
     return set;
-  }, [loaderEnabled.value, selectedLoader.value, versions.value]);
+  }, [loaderEnabled, selectedLoader, versions.value]);
 
   const total = filteredVersions.length;
   const totalPages = Math.ceil(total / PAGE_SIZE);
@@ -191,8 +163,6 @@ export function NewInstanceModal(): JSX.Element | null {
   useEffect(() => {
     if (filteredVersions.length === 0) {
       selectedVersionId.value = null;
-      loaderVersionsList.value = null;
-      selectedLoaderVersion.value = null;
       return;
     }
     if (selectedVersionId.value && filteredVersions.some((version) => version.id === selectedVersionId.value)) return;
@@ -201,8 +171,8 @@ export function NewInstanceModal(): JSX.Element | null {
     selectedVersionId.value = nextId;
     if (isAutoName(name.value.trim())) name.value = defaultName();
     nameError.value = null;
-    if (loaderEnabled.value) void updateLoaderVersionInfo(nextId);
-  }, [filteredVersions, loaderEnabled.value]);
+    if (loaderEnabled) void loaderMachine.changeMcVersion(nextId);
+  }, [filteredVersions, loaderEnabled]);
 
   const handleNameInput = (e: JSX.TargetedEvent<HTMLInputElement>) => {
     name.value = e.currentTarget.value;
@@ -219,88 +189,39 @@ export function NewInstanceModal(): JSX.Element | null {
     nameError.value = null;
     Sound.ui('click');
 
-    if (loaderEnabled.value) {
-      await updateLoaderVersionInfo(vid);
+    if (loaderEnabled) {
+      await loaderMachine.changeMcVersion(vid);
     }
   };
 
-  const loadLoaderGameVersions = async (): Promise<void> => {
-    const requestId = ++loaderGamesRequestRef.current;
-    const loaderType = selectedLoader.value;
-    loaderLoading.value = true;
-    try {
-      const nextVersions = await fetchGameVersions(loaderType);
-      if (requestId !== loaderGamesRequestRef.current || selectedLoader.value !== loaderType) return;
-      loaderGameVersions.value = nextVersions;
-    } catch {
-      if (requestId !== loaderGamesRequestRef.current || selectedLoader.value !== loaderType) return;
-      loaderGameVersions.value = [];
-    } finally {
-      if (requestId === loaderGamesRequestRef.current && selectedLoader.value === loaderType) {
-        loaderLoading.value = false;
-      }
-    }
-  };
-
-  const updateLoaderVersionInfo = async (mcVersion: string): Promise<void> => {
-    if (!loaderEnabled.value) return;
-    const requestId = ++loaderVersionsRequestRef.current;
-    const loaderType = selectedLoader.value;
-    try {
-      const nextVersions = await fetchLoaderVersions(loaderType, mcVersion);
-      if (requestId !== loaderVersionsRequestRef.current || !loaderEnabled.value || selectedLoader.value !== loaderType || selectedVersionId.value !== mcVersion) return;
-      loaderVersionsList.value = nextVersions;
-      const best = latestStable(nextVersions);
-      selectedLoaderVersion.value = best?.version ?? null;
-    } catch {
-      if (requestId !== loaderVersionsRequestRef.current || !loaderEnabled.value || selectedLoader.value !== loaderType || selectedVersionId.value !== mcVersion) return;
-      loaderVersionsList.value = null;
-      selectedLoaderVersion.value = null;
-    }
-  };
-
-  const autoSelectFirstVersion = (list: CatalogVersion[]) => {
+  const autoSelectFirstVersion = (list: CatalogVersion[], loadBuilds = loaderMachine.state.value.kind !== 'disabled') => {
     if (list.length > 0) {
       selectedVersionId.value = list[0].id;
       if (isAutoName(name.value.trim())) name.value = defaultName();
-      if (loaderEnabled.value) updateLoaderVersionInfo(list[0].id);
+      if (loadBuilds) {
+        void loaderMachine.changeMcVersion(list[0].id);
+      }
     }
   };
 
   const handleLoaderToggle = async (e: JSX.TargetedEvent<HTMLInputElement>) => {
     const enabled = e.currentTarget.checked;
-    loaderEnabled.value = enabled;
     if (enabled) {
-      await loadLoaderGameVersions();
+      await loaderMachine.enable(selectedVersionId.value);
     } else {
-      loaderGameVersions.value = null;
-      loaderVersionsList.value = null;
-      selectedLoaderVersion.value = null;
+      loaderMachine.disable();
     }
     page.value = 0;
-    selectedVersionId.value = null;
-
-    // Re-compute filtered list for auto-select
-    let list = allVersions.filter(v => v.type === filter.value);
-    if (enabled && loaderGameVersions.value) {
-      list = filterByLoaderSupport(list, loaderGameVersions.value);
-    }
-    autoSelectFirstVersion(list);
+    autoSelectFirstVersion(allVersions.filter(v => v.type === filter.value), enabled);
   };
 
   const handleLoaderChange = async (e: JSX.TargetedEvent<HTMLSelectElement>) => {
-    selectedLoader.value = e.currentTarget.value as LoaderType;
-    loaderVersionsList.value = null;
-    selectedLoaderVersion.value = null;
-    await loadLoaderGameVersions();
+    await loaderMachine.changeComponent(
+      e.currentTarget.value as LoaderComponentId,
+      selectedVersionId.value,
+    );
     page.value = 0;
-    selectedVersionId.value = null;
-
-    let list = allVersions.filter(v => v.type === filter.value);
-    if (loaderGameVersions.value) {
-      list = filterByLoaderSupport(list, loaderGameVersions.value);
-    }
-    autoSelectFirstVersion(list);
+    autoSelectFirstVersion(allVersions.filter(v => v.type === filter.value), true);
     Sound.ui('soft');
   };
 
@@ -314,14 +235,12 @@ export function NewInstanceModal(): JSX.Element | null {
     }
     if (!selectedVersionId.value) return;
 
-    if (loaderEnabled.value && !selectedLoaderVersion.value) {
-      nameError.value = 'No loader version available for this Minecraft version';
+    if (loaderEnabled && (loaderState.value.kind !== 'ready' || !selectedLoaderBuild)) {
+      nameError.value = 'No loader build available for this Minecraft version';
       return;
     }
 
-    const compositeId = loaderEnabled.value
-      ? buildCompositeId(selectedLoader.value, selectedVersionId.value, selectedLoaderVersion.value!)
-      : selectedVersionId.value;
+    const compositeId = loaderEnabled ? selectedLoaderBuild!.version_id : selectedVersionId.value;
 
     try {
       const res = await api('POST', '/instances', { name: trimmed, version_id: compositeId });
@@ -332,8 +251,8 @@ export function NewInstanceModal(): JSX.Element | null {
       Sound.ui('affirm');
 
       // Auto-install
-      if (loaderEnabled.value) {
-        installLoaderVersion(selectedLoader.value, selectedVersionId.value, selectedLoaderVersion.value!, compositeId);
+      if (loaderEnabled) {
+        installLoaderVersion(selectedLoaderBuild!);
       } else {
         const needsInstall = !allVersions.find(v => v.id === selectedVersionId.value)?.installed;
         if (needsInstall) installVersion(selectedVersionId.value);
@@ -344,9 +263,10 @@ export function NewInstanceModal(): JSX.Element | null {
   };
 
   // Loader info text
-  const loaderInfoText = loaderEnabled.value && selectedLoaderVersion.value
-    ? `Loader: ${selectedLoaderVersion.value}`
+  const loaderInfoText = loaderEnabled && selectedLoaderBuild
+    ? `Loader: ${selectedLoaderBuild.loader_version}`
     : null;
+  const createDisabled = !selectedVersionId.value || (loaderEnabled && loaderState.value.kind !== 'ready');
 
   return (
     <div
@@ -388,22 +308,37 @@ export function NewInstanceModal(): JSX.Element | null {
               <label class="ni-loader-toggle">
                 <input
                   type="checkbox"
-                  checked={loaderEnabled.value}
+                  checked={loaderEnabled}
                   onChange={handleLoaderToggle}
                 />
                 <span class="ni-toggle-track"><span class="ni-toggle-thumb"></span></span>
               </label>
-              {loaderEnabled.value && (
-                <select
-                  class="ni-loader-select"
-                  autocomplete="off"
-                  value={selectedLoader.value}
-                  onChange={handleLoaderChange}
-                >
-                  {LOADER_OPTIONS.map(opt => (
-                    <option key={opt.value} value={opt.value}>{opt.label}</option>
-                  ))}
-                </select>
+              {loaderEnabled && (
+                <>
+                  <select
+                    class="ni-loader-select"
+                    autocomplete="off"
+                    value={selectedLoader ?? ''}
+                    onChange={handleLoaderChange}
+                  >
+                    {(loaderComponents ?? []).map(opt => (
+                      <option key={opt.id} value={opt.id}>{opt.name}</option>
+                    ))}
+                  </select>
+                  <select
+                    class="ni-loader-select"
+                    autocomplete="off"
+                    value={selectedLoaderBuildId ?? ''}
+                    disabled={loaderBuilds === null || loaderBuilds.length === 0}
+                    onChange={(event) => loaderMachine.selectBuild(event.currentTarget.value)}
+                  >
+                    {(loaderBuilds ?? []).map(build => (
+                      <option key={build.build_id} value={build.build_id}>
+                        {build.loader_version}{build.recommended ? ' (recommended)' : build.latest ? ' (latest)' : ''}
+                      </option>
+                    ))}
+                  </select>
+                </>
               )}
               {loaderInfoText && (
                 <span class="ni-loader-info">{loaderInfoText}</span>
@@ -436,9 +371,13 @@ export function NewInstanceModal(): JSX.Element | null {
               ))}
             </div>
             <div class="ni-version-list">
-              {loaderLoading.value ? (
+              {loaderLoading ? (
                 <div style="padding:12px;text-align:center;color:var(--text-muted);font-size:12px">
                   Loading versions...
+                </div>
+              ) : loaderError ? (
+                <div style="padding:12px;text-align:center;color:var(--red);font-size:12px">
+                  {loaderError}
                 </div>
               ) : display.length === 0 ? (
                 <div style="padding:12px;text-align:center;color:var(--text-muted);font-size:12px">
@@ -495,6 +434,7 @@ export function NewInstanceModal(): JSX.Element | null {
           <button
             class="btn-primary"
             style="align-self:flex-end;margin-top:4px"
+            disabled={createDisabled}
             onClick={handleCreate}
           >
             Create

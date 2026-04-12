@@ -214,6 +214,22 @@ impl SessionStore {
         self.sessions.write().await.remove(session_id);
     }
 
+    pub async fn terminate_all(&self) {
+        let children = self
+            .sessions
+            .read()
+            .await
+            .values()
+            .filter_map(|entry| entry.child.clone())
+            .collect::<Vec<_>>();
+
+        for child in children {
+            let _ = child.lock().await.kill().await;
+        }
+
+        self.sessions.write().await.clear();
+    }
+
     pub async fn has_active_instance(&self, instance_id: &str) -> bool {
         self.sessions.read().await.values().any(|entry| {
             entry.record.instance_id == instance_id && !is_terminal_state(entry.record.state)

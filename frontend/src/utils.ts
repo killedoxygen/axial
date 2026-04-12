@@ -146,12 +146,18 @@ export function parseVersionDisplay(versionId: string, version: any, versions: a
 function parseModded(id: string, base: string): VersionDisplay {
   const lo = id.toLowerCase();
   let m: RegExpMatchArray | null;
-  // fabric-loader-0.16.9-1.20.1
-  m = lo.match(/^fabric-loader-([.\d]+)-/);
-  if (m) return { name: `Fabric ${base}`, hint: `Loader ${m[1]}`, loader: 'fabric' };
-  // quilt-loader-0.26.1-1.20.1
-  m = lo.match(/^quilt-loader-([.\d]+)-/);
-  if (m) return { name: `Quilt ${base}`, hint: `Loader ${m[1]}`, loader: 'quilt' };
+  if (lo.startsWith('fabric-loader-')) {
+    const suffix = base ? `-${base}` : '';
+    const rest = id.slice('fabric-loader-'.length);
+    const loaderVersion = suffix && rest.endsWith(suffix) ? rest.slice(0, -suffix.length) : rest;
+    return { name: `Fabric ${base}`, hint: loaderVersion ? `Loader ${loaderVersion}` : null, loader: 'fabric' };
+  }
+  if (lo.startsWith('quilt-loader-')) {
+    const suffix = base ? `-${base}` : '';
+    const rest = id.slice('quilt-loader-'.length);
+    const loaderVersion = suffix && rest.endsWith(suffix) ? rest.slice(0, -suffix.length) : rest;
+    return { name: `Quilt ${base}`, hint: loaderVersion ? `Loader ${loaderVersion}` : null, loader: 'quilt' };
+  }
   // 1.20.1-forge-47.3.0 or 1.20.1-forge47.3.0
   m = id.match(/-forge-?([.\d]+)/i);
   if (m) return { name: `Forge ${base}`, hint: `Forge ${m[1]}`, loader: 'forge' };

@@ -1,5 +1,6 @@
+use super::compose::LoaderProfileFragment;
 use crate::download::DownloadError;
-use crate::launch::{Library, VersionJson};
+use crate::launch::Library;
 use crate::paths::libraries_dir;
 use serde::Deserialize;
 use std::fs;
@@ -26,7 +27,7 @@ pub enum ForgeInstallerError {
 
 #[derive(Debug)]
 pub struct ExtractedForgeInstaller {
-    pub version_json: Vec<u8>,
+    pub version_fragment: LoaderProfileFragment,
     pub install_profile_json: Option<Vec<u8>>,
     pub version_id: String,
     pub libraries: Vec<Library>,
@@ -35,6 +36,8 @@ pub struct ExtractedForgeInstaller {
 #[derive(Debug, Deserialize)]
 struct LegacyInstallProfile {
     install: LegacyInstallData,
+    #[serde(default)]
+    minecraft: String,
     #[serde(rename = "versionInfo")]
     version_info: serde_json::Value,
 }
@@ -64,7 +67,7 @@ pub fn extract_installer(jar_data: &[u8]) -> Result<ExtractedForgeInstaller, For
         (None, None) => return Err(ForgeInstallerError::MissingVersionJson),
     };
 
-    let version = serde_json::from_slice::<VersionJson>(&version_json)?;
+    let version = serde_json::from_slice::<LoaderProfileFragment>(&version_json)?;
     let install_info = install_profile
         .as_deref()
         .map(serde_json::from_slice::<InstallProfileLibraries>)
@@ -77,7 +80,7 @@ pub fn extract_installer(jar_data: &[u8]) -> Result<ExtractedForgeInstaller, For
     Ok(ExtractedForgeInstaller {
         install_profile_json: install_profile,
         version_id: version.id.clone(),
-        version_json,
+        version_fragment: version,
         libraries,
     })
 }
@@ -138,17 +141,21 @@ fn extract_legacy_version_info(install_profile: &[u8]) -> Result<Vec<u8>, ForgeI
     let profile = serde_json::from_slice::<LegacyInstallProfile>(install_profile)?;
     let mut version_info = profile.version_info;
 
-    if let Some(version_id) = normalize_legacy_forge_version_id(&profile.install.path)
-        .or_else(|| (!profile.install.target.is_empty()).then(|| profile.install.target.clone()))
+    if let Some(version_id) =
+        normalize_legacy_forge_version_id(&profile.install.path, &profile.minecraft).or_else(|| {
+            (!profile.install.target.is_empty()).then(|| profile.install.target.clone())
+        })
     {
         version_info["id"] = serde_json::Value::String(version_id);
     }
 
-    if let Some(normalized_library) =
-        normalize_legacy_forge_library(&profile.install.path, &profile.install.file_path)
-        && let Some(libraries) = version_info
-            .get_mut("libraries")
-            .and_then(|value| value.as_array_mut())
+    if let Some(normalized_library) = normalize_legacy_forge_library(
+        &profile.install.path,
+        &profile.install.file_path,
+        &profile.minecraft,
+    ) && let Some(libraries) = version_info
+        .get_mut("libraries")
+        .and_then(|value| value.as_array_mut())
     {
         for library in libraries.iter_mut() {
             if library.get("name").and_then(|value| value.as_str())
@@ -163,7 +170,7 @@ fn extract_legacy_version_info(install_profile: &[u8]) -> Result<Vec<u8>, ForgeI
     Ok(serde_json::to_vec(&version_info)?)
 }
 
-fn normalize_legacy_forge_library(path: &str, file_path: &str) -> Option<String> {
+fn normalize_legacy_forge_library(path: &str, file_path: &str, minecraft: &str) -> Option<String> {
     let mut parts = path.split(':');
     let group = parts.next()?;
     let artifact = parts.next()?;
@@ -173,6 +180,19 @@ fn normalize_legacy_forge_library(path: &str, file_path: &str) -> Option<String>
     }
 
     let filename = Path::new(file_path).file_stem()?.to_string_lossy();
+    if artifact == "minecraftforge" && !minecraft.trim().is_empty() {
+        let classifier = if filename.contains("-universal-") {
+            "universal"
+        } else if filename.contains("-client-") {
+            "client"
+        } else if filename.contains("-server-") {
+            "server"
+        } else {
+            return None;
+        };
+        return Some(format!("{group}:forge:{minecraft}-{version}:{classifier}"));
+    }
+
     let prefix = format!("{artifact}-{version}-");
     let classifier = filename.strip_prefix(&prefix)?;
     if classifier.is_empty() {
@@ -181,13 +201,16 @@ fn normalize_legacy_forge_library(path: &str, file_path: &str) -> Option<String>
     Some(format!("{group}:{artifact}:{version}:{classifier}"))
 }
 
-fn normalize_legacy_forge_version_id(path: &str) -> Option<String> {
+fn normalize_legacy_forge_version_id(path: &str, minecraft: &str) -> Option<String> {
     let mut parts = path.split(':');
     let _group = parts.next()?;
-    let _artifact = parts.next()?;
+    let artifact = parts.next()?;
     let version = parts.next()?;
     if parts.next().is_some() {
         return None;
+    }
+    if artifact == "minecraftforge" && !minecraft.trim().is_empty() {
+        return Some(format!("{minecraft}-forge-{version}"));
     }
     let index = version.find('-')?;
     if index == 0 || index + 1 >= version.len() {
@@ -207,7 +230,7 @@ mod tests {
     #[test]
     fn normalizes_legacy_forge_version_id() {
         assert_eq!(
-            normalize_legacy_forge_version_id("net.minecraftforge:forge:1.2.4-2.0.0.68"),
+            normalize_legacy_forge_version_id("net.minecraftforge:forge:1.2.4-2.0.0.68", ""),
             Some("1.2.4-forge-2.0.0.68".to_string())
         );
     }
@@ -217,9 +240,29 @@ mod tests {
         assert_eq!(
             normalize_legacy_forge_library(
                 "net.minecraftforge:forge:1.2.4-2.0.0.68",
-                "forge-1.2.4-2.0.0.68-universal.zip"
+                "forge-1.2.4-2.0.0.68-universal.zip",
+                ""
             ),
             Some("net.minecraftforge:forge:1.2.4-2.0.0.68:universal".to_string())
+        );
+    }
+
+    #[test]
+    fn normalizes_minecraftforge_legacy_coordinates() {
+        assert_eq!(
+            normalize_legacy_forge_version_id(
+                "net.minecraftforge:minecraftforge:9.11.1.1345",
+                "1.6.4"
+            ),
+            Some("1.6.4-forge-9.11.1.1345".to_string())
+        );
+        assert_eq!(
+            normalize_legacy_forge_library(
+                "net.minecraftforge:minecraftforge:9.11.1.1345",
+                "minecraftforge-universal-1.6.4-9.11.1.1345.jar",
+                "1.6.4"
+            ),
+            Some("net.minecraftforge:forge:1.6.4-9.11.1.1345:universal".to_string())
         );
     }
 }

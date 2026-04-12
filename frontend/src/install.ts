@@ -1,6 +1,6 @@
 import { api, API } from './api';
 import { showError, errMessage } from './utils';
-import { startLoaderInstall, connectLoaderInstallSSE } from './loaders';
+import { startLoaderInstall, connectLoaderInstallSSE } from './loaders/api';
 import {
   hasNativeDesktopRuntime, nativeInstallEventName, nativeLoaderInstallEventName,
   onNativeEvent, startNativeInstallEvents, startNativeLoaderInstallEvents,
@@ -12,7 +12,7 @@ import {
   enqueueInstall, dequeueNextInstall, startInstall, updateInstallProgress,
   completeInstall, setInstallEventSource,
 } from './actions';
-import type { InstallItem, LoaderType } from './types';
+import type { InstallItem, LoaderBuildRecord, LoaderComponentId } from './types';
 
 export function handleInstallClick(): void {
   const inst = selectedInstance.value;
@@ -20,13 +20,31 @@ export function handleInstallClick(): void {
 
   const version = selectedVersion.value;
   const target = version?.needs_install || version?.id || inst.version_id;
-
-  if (version?.inherits_from) {
-    const loader = parseLoaderFromId(target);
-    if (loader) {
-      installLoaderVersion(loader.type, version.inherits_from, loader.loaderVersion, target);
-      return;
-    }
+  const loader = version?.loader_component_id && version?.loader_build_id
+    ? {
+        componentId: version.loader_component_id as LoaderComponentId,
+        buildId: version.loader_build_id,
+        minecraftVersion: version.inherits_from || '',
+        loaderVersion: inferLoaderVersionFromBuildId(version.loader_build_id),
+        versionId: target,
+      }
+    : parseLoaderFromId(target, version?.inherits_from || '');
+  if (loader) {
+    installLoaderVersion({
+      component_id: loader.componentId,
+      component_name: '',
+      build_id: loader.buildId,
+      minecraft_version: loader.minecraftVersion,
+      loader_version: loader.loaderVersion,
+      version_id: loader.versionId,
+      stable: false,
+      recommended: false,
+      latest: false,
+      strategy: '',
+      artifact_kind: '',
+      installability: '',
+    });
+    return;
   }
 
   installVersion(target);
@@ -40,34 +58,107 @@ export function installVersion(target: string): void {
   if (installState.value.status === 'idle') processNextInstall();
 }
 
-function parseLoaderFromId(id: string): { type: LoaderType; loaderVersion: string } | null {
+function parseLoaderFromId(
+  id: string,
+  baseVersion: string,
+): { componentId: LoaderComponentId; buildId: string; minecraftVersion: string; loaderVersion: string; versionId: string } | null {
   const lo = id.toLowerCase();
-  let match: RegExpMatchArray | null;
+  const inferredBase = baseVersion || inferMinecraftVersionFromCompositeId(id);
 
-  match = lo.match(/^fabric-loader-([.\d]+)-/);
-  if (match) return { type: 'fabric', loaderVersion: match[1] };
+  if (lo.startsWith('fabric-loader-')) {
+    const suffix = inferredBase ? `-${inferredBase}` : '';
+    const rest = id.slice('fabric-loader-'.length);
+    const loaderVersion = suffix && rest.endsWith(suffix) ? rest.slice(0, -suffix.length) : rest;
+    if (loaderVersion && inferredBase) {
+      return {
+        componentId: 'net.fabricmc.fabric-loader',
+        buildId: `fabric:${inferredBase}:${loaderVersion}`,
+        minecraftVersion: inferredBase,
+        loaderVersion,
+        versionId: id,
+      };
+    }
+  }
 
-  match = lo.match(/^quilt-loader-([.\d]+)-/);
-  if (match) return { type: 'quilt', loaderVersion: match[1] };
+  if (lo.startsWith('quilt-loader-')) {
+    const suffix = inferredBase ? `-${inferredBase}` : '';
+    const rest = id.slice('quilt-loader-'.length);
+    const loaderVersion = suffix && rest.endsWith(suffix) ? rest.slice(0, -suffix.length) : rest;
+    if (loaderVersion && inferredBase) {
+      return {
+        componentId: 'org.quiltmc.quilt-loader',
+        buildId: `quilt:${inferredBase}:${loaderVersion}`,
+        minecraftVersion: inferredBase,
+        loaderVersion,
+        versionId: id,
+      };
+    }
+  }
 
-  match = id.match(/-forge-([.\d]+)$/i);
-  if (match) return { type: 'forge', loaderVersion: match[1] };
+  const forgeIndex = lo.lastIndexOf('-forge-');
+  if (forgeIndex > 0) {
+    const minecraftVersion = id.slice(0, forgeIndex);
+    const loaderVersion = id.slice(forgeIndex + '-forge-'.length);
+    if (minecraftVersion && loaderVersion) {
+      return {
+        componentId: 'net.minecraftforge',
+        buildId: `forge:${minecraftVersion}:${loaderVersion}`,
+        minecraftVersion,
+        loaderVersion,
+        versionId: id,
+      };
+    }
+  }
 
-  if (lo.includes('neoforge')) {
-    match = id.match(/neoforge-([.\d]+)/i);
-    if (match) return { type: 'neoforge', loaderVersion: match[1] };
+  if (lo.startsWith('neoforge-')) {
+    const loaderVersion = id.slice('neoforge-'.length);
+    const minecraftVersion = inferNeoForgeGameVersion(loaderVersion);
+    if (loaderVersion && minecraftVersion) {
+      return {
+        componentId: 'net.neoforged',
+        buildId: `neoforge:${minecraftVersion}:${loaderVersion}`,
+        minecraftVersion,
+        loaderVersion,
+        versionId: id,
+      };
+    }
   }
 
   return null;
 }
 
-export function installLoaderVersion(loaderType: LoaderType, gameVersion: string, loaderVersion: string, compositeVersionId: string): void {
-  if (!loaderType || !gameVersion || !loaderVersion || !compositeVersionId) return;
+function inferNeoForgeGameVersion(loaderVersion: string): string {
+  const parts = loaderVersion.split('.', 3);
+  if (parts.length < 2) return '';
+  if (parts[1] === '0') return `1.${parts[0]}`;
+  return `1.${parts[0]}.${parts[1]}`;
+}
+
+function inferMinecraftVersionFromCompositeId(id: string): string {
+  const snapshot = id.match(/(\d{2}w\d{2}[a-z])$/i);
+  if (snapshot) return snapshot[1];
+
+  const prerelease = id.match(/(\d+\.\d+(?:\.\d+)?-(?:pre|rc)\d+)$/i);
+  if (prerelease) return prerelease[1];
+
+  const release = id.match(/(\d+\.\d+(?:\.\d+)?)$/);
+  if (release) return release[1];
+
+  return '';
+}
+
+export function installLoaderVersion(build: LoaderBuildRecord): void {
+  if (!build.component_id || !build.build_id || !build.version_id) return;
   const active = installState.value;
-  if (active.status === 'active' && active.versionId === compositeVersionId) return;
+  if (active.status === 'active' && active.versionId === build.version_id) return;
   enqueueInstall({
-    versionId: compositeVersionId,
-    loader: { type: loaderType, gameVersion, loaderVersion },
+    versionId: build.version_id,
+    loader: {
+      componentId: build.component_id,
+      buildId: build.build_id,
+      minecraftVersion: build.minecraft_version,
+      loaderVersion: build.loader_version,
+    },
   });
   if (installState.value.status === 'idle') processNextInstall();
 }
@@ -104,15 +195,19 @@ async function processLoaderInstall(next: InstallItem): Promise<void> {
 
   try {
     const installId = await startLoaderInstall(
-      next.loader.type,
-      next.loader.gameVersion,
-      next.loader.loaderVersion,
+      next.loader.componentId,
+      next.loader.buildId,
     );
     await connectLoaderEvents(installId, next.versionId);
   } catch (err: unknown) {
     showError(`Loader install failed: ${errMessage(err)}`);
     await onInstallDone();
   }
+}
+
+function inferLoaderVersionFromBuildId(buildId: string): string {
+  const parts = buildId.split(':');
+  return parts[2] || '';
 }
 
 async function connectVanillaEvents(installId: string, versionId: string): Promise<void> {
@@ -156,7 +251,7 @@ async function connectVanillaEvents(installId: string, versionId: string): Promi
   };
 
   if (hasNativeDesktopRuntime()) {
-    const subscription = onNativeEvent(nativeInstallEventName(installId), (data) => {
+    const subscription = await onNativeEvent(nativeInstallEventName(installId), (data) => {
       void onProgress(data);
     });
     if (!subscription) throw new Error('native install stream unavailable');
@@ -248,7 +343,7 @@ async function connectLoaderEvents(installId: string, versionId: string): Promis
   };
 
   if (hasNativeDesktopRuntime()) {
-    const subscription = onNativeEvent(nativeLoaderInstallEventName(installId), (data) => {
+    const subscription = await onNativeEvent(nativeLoaderInstallEventName(installId), (data) => {
       if (data.phase === 'error' || data.error) {
         onError(data.error || 'Unknown error');
         return;

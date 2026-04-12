@@ -3,6 +3,7 @@ use crate::paths::runtime_dirs;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, OnceLock};
@@ -524,11 +525,6 @@ async fn install_managed_runtime(
     dest_dir: &Path,
 ) -> Result<(), JavaRuntimeLookupError> {
     let os_arch = runtime_os_arch();
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
-
     let parent_dir = dest_dir.parent().ok_or_else(|| {
         JavaRuntimeLookupError::Download("invalid runtime destination".to_string())
     })?;
@@ -547,16 +543,7 @@ async fn install_managed_runtime(
     fs::write(temp_dir.join(".croopor-installing"), b"installing")
         .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
 
-    let all_runtimes = client
-        .get(RUNTIME_MANIFEST_URL)
-        .send()
-        .await
-        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?
-        .error_for_status()
-        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?
-        .json::<RuntimeManifest>()
-        .await
-        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+    let all_runtimes = fetch_runtime_json::<RuntimeManifest>(RUNTIME_MANIFEST_URL).await?;
 
     let os_runtimes = all_runtimes.get(&os_arch).ok_or_else(|| {
         JavaRuntimeLookupError::Download(format!("no runtimes available for {os_arch}"))
@@ -577,16 +564,7 @@ async fn install_managed_runtime(
             ))
         })?;
 
-    let component_manifest = client
-        .get(manifest_url)
-        .send()
-        .await
-        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?
-        .error_for_status()
-        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?
-        .json::<ComponentManifest>()
-        .await
-        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+    let component_manifest = fetch_runtime_json::<ComponentManifest>(manifest_url).await?;
 
     for (relative_path, file) in component_manifest.files {
         let destination = temp_dir.join(relative_path.replace('/', std::path::MAIN_SEPARATOR_STR));
@@ -607,16 +585,7 @@ async fn install_managed_runtime(
                 .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
         }
 
-        let bytes = client
-            .get(&raw.url)
-            .send()
-            .await
-            .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?
-            .error_for_status()
-            .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?
-            .bytes()
-            .await
-            .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+        let bytes = fetch_runtime_bytes(&raw.url).await?;
         let temp_path = destination.with_extension("tmp");
         fs::write(&temp_path, &bytes)
             .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
@@ -651,6 +620,48 @@ async fn install_managed_runtime(
         .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
 
     Ok(())
+}
+
+async fn fetch_runtime_json<T>(url: &str) -> Result<T, JavaRuntimeLookupError>
+where
+    T: serde::de::DeserializeOwned + Send + 'static,
+{
+    let url = url.to_string();
+    tokio::task::spawn_blocking(move || {
+        let response = ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(30))
+            .user_agent("croopor/0.3")
+            .build()
+            .get(&url)
+            .call()
+            .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+        response
+            .into_json::<T>()
+            .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))
+    })
+    .await
+    .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?
+}
+
+async fn fetch_runtime_bytes(url: &str) -> Result<Vec<u8>, JavaRuntimeLookupError> {
+    let url = url.to_string();
+    tokio::task::spawn_blocking(move || {
+        let response = ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(300))
+            .user_agent("croopor/0.3")
+            .build()
+            .get(&url)
+            .call()
+            .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+        let mut reader = response.into_reader();
+        let mut bytes = Vec::new();
+        reader
+            .read_to_end(&mut bytes)
+            .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+        Ok(bytes)
+    })
+    .await
+    .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?
 }
 
 fn runtime_cache_dir() -> PathBuf {

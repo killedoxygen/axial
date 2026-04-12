@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -41,7 +42,7 @@ struct ManifestCache {
 
 static MANIFEST_CACHE: OnceLock<Mutex<ManifestCache>> = OnceLock::new();
 
-pub async fn fetch_version_manifest() -> Result<VersionManifest, reqwest::Error> {
+pub async fn fetch_version_manifest() -> Result<VersionManifest, String> {
     let cache = MANIFEST_CACHE.get_or_init(|| {
         Mutex::new(ManifestCache {
             value: None,
@@ -56,15 +57,16 @@ pub async fn fetch_version_manifest() -> Result<VersionManifest, reqwest::Error>
         return Ok(value.clone());
     }
 
-    let response = reqwest::Client::new()
-        .get(MANIFEST_URL)
-        .timeout(Duration::from_secs(15))
-        .send()
-        .await?;
-    let manifest = response
-        .error_for_status()?
-        .json::<VersionManifest>()
-        .await?;
+    let cached_stale = cache.lock().ok().and_then(|cache| cache.value.clone());
+    let manifest = match fetch_manifest_live().await {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            if let Some(stale) = cached_stale {
+                return Ok(stale);
+            }
+            return Err(error);
+        }
+    };
 
     if let Ok(mut cache) = cache.lock() {
         cache.value = Some(manifest.clone());
@@ -72,4 +74,28 @@ pub async fn fetch_version_manifest() -> Result<VersionManifest, reqwest::Error>
     }
 
     Ok(manifest)
+}
+
+async fn fetch_manifest_live() -> Result<VersionManifest, String> {
+    tokio::task::spawn_blocking(|| {
+        let response = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(10))
+            .timeout_read(Duration::from_secs(15))
+            .timeout_write(Duration::from_secs(15))
+            .user_agent("croopor/0.3")
+            .build()
+            .get(MANIFEST_URL)
+            .call()
+            .map_err(|error| format!("fetching version manifest: {error}"))?;
+
+        let mut reader = response.into_reader();
+        let mut body = Vec::new();
+        reader
+            .read_to_end(&mut body)
+            .map_err(|error| format!("reading version manifest: {error}"))?;
+        serde_json::from_slice::<VersionManifest>(&body)
+            .map_err(|error| format!("parsing version manifest: {error}"))
+    })
+    .await
+    .map_err(|error| format!("fetching version manifest: {error}"))?
 }

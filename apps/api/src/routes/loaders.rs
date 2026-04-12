@@ -1,3 +1,5 @@
+use crate::dto::loaders::{LoaderBuildsResponse, LoaderComponentsResponse};
+use crate::install_runtime::prewarm_version_runtime;
 use crate::state::AppState;
 use axum::{
     Json, Router,
@@ -7,34 +9,30 @@ use axum::{
     routing::{get, post},
 };
 use croopor_minecraft::{
-    DownloadProgress, LoaderError, LoaderType, fetch_game_versions, fetch_loader_versions,
-    install_loader,
+    DownloadProgress, LoaderComponentId, LoaderError, fetch_builds, fetch_components,
+    install_build, resolve_build_record,
 };
 use serde::Deserialize;
 use std::{convert::Infallible, path::PathBuf, time::SystemTime};
 use tokio::sync::mpsc;
 
 #[derive(Debug, Deserialize)]
-struct LoaderVersionQuery {
+struct LoaderBuildQuery {
     mc_version: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct LoaderInstallRequest {
-    loader_type: String,
-    game_version: String,
-    loader_version: String,
+    component_id: String,
+    build_id: String,
 }
 
 pub fn router() -> Router<AppState> {
     Router::new()
+        .route("/api/v1/loaders/components", get(handle_loader_components))
         .route(
-            "/api/v1/loaders/{type}/game-versions",
-            get(handle_loader_game_versions),
-        )
-        .route(
-            "/api/v1/loaders/{type}/loader-versions",
-            get(handle_loader_versions),
+            "/api/v1/loaders/components/{id}/builds",
+            get(handle_loader_builds),
         )
         .route("/api/v1/loaders/install", post(handle_loader_install))
         .route(
@@ -43,41 +41,40 @@ pub fn router() -> Router<AppState> {
         )
 }
 
-async fn handle_loader_game_versions(
-    Path(loader_type): Path<String>,
-    State(_state): State<AppState>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let loader_type = parse_loader_type(&loader_type)?;
-    match fetch_game_versions(loader_type).await {
-        Ok(game_versions) => Ok(Json(serde_json::json!({ "game_versions": game_versions }))),
-        Err(error) => Ok(Json(serde_json::json!({
-            "game_versions": [],
-            "error": error.to_string(),
-        }))),
-    }
+async fn handle_loader_components() -> Json<LoaderComponentsResponse> {
+    Json(LoaderComponentsResponse {
+        components: fetch_components(),
+    })
 }
 
-async fn handle_loader_versions(
-    Path(loader_type): Path<String>,
-    Query(query): Query<LoaderVersionQuery>,
-    State(_state): State<AppState>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let loader_type = parse_loader_type(&loader_type)?;
+async fn handle_loader_builds(
+    Path(component_id): Path<String>,
+    Query(query): Query<LoaderBuildQuery>,
+    State(state): State<AppState>,
+) -> Result<Json<LoaderBuildsResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let component_id = parse_component_id(&component_id)?;
     if query.mc_version.trim().is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": "mc_version query parameter is required" })),
         ));
     }
+    let library_dir = state.library_dir().ok_or_else(|| {
+        (
+            StatusCode::PRECONDITION_FAILED,
+            Json(serde_json::json!({ "error": "Croopor library is not configured" })),
+        )
+    })?;
 
-    match fetch_loader_versions(loader_type, &query.mc_version).await {
-        Ok(loader_versions) => Ok(Json(serde_json::json!({
-            "loader_versions": loader_versions
-        }))),
-        Err(error) => Ok(Json(serde_json::json!({
-            "loader_versions": [],
-            "error": error.to_string(),
-        }))),
+    match fetch_builds(
+        PathBuf::from(library_dir).as_path(),
+        component_id,
+        &query.mc_version,
+    )
+    .await
+    {
+        Ok((builds, catalog)) => Ok(Json(LoaderBuildsResponse { builds, catalog })),
+        Err(error) => Err(error_response(error)),
     }
 }
 
@@ -85,30 +82,35 @@ async fn handle_loader_install(
     State(state): State<AppState>,
     Json(payload): Json<LoaderInstallRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let loader_type = parse_loader_type(&payload.loader_type)?;
-    if payload.game_version.trim().is_empty() || payload.loader_version.trim().is_empty() {
+    let component_id = parse_component_id(&payload.component_id)?;
+    if payload.build_id.trim().is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "loader_type, game_version, and loader_version are required"
-            })),
+            Json(serde_json::json!({ "error": "build_id is required" })),
         ));
     }
 
-    let mc_dir = state.library_dir().ok_or_else(|| {
+    let library_dir = state.library_dir().ok_or_else(|| {
         (
             StatusCode::PRECONDITION_FAILED,
             Json(serde_json::json!({ "error": "Croopor library is not configured" })),
         )
     })?;
+    let library_dir_path = PathBuf::from(&library_dir);
+
+    let build = resolve_build_record(
+        library_dir_path.as_path(),
+        component_id,
+        payload.build_id.trim(),
+    )
+    .await
+    .map_err(error_response)?;
 
     let install_id = generate_install_id();
     state.installs().insert(install_id.clone()).await;
 
     let store = state.installs().clone();
-    let mc_dir = PathBuf::from(mc_dir);
-    let game_version = payload.game_version.trim().to_string();
-    let loader_version = payload.loader_version.trim().to_string();
+    let library_dir = PathBuf::from(library_dir);
     let install_id_task = install_id.clone();
 
     tokio::spawn(async move {
@@ -123,19 +125,34 @@ async fn handle_loader_install(
             })
         };
 
-        let result = install_loader(
-            &mc_dir,
-            loader_type,
-            &game_version,
-            &loader_version,
-            |progress| {
+        let version_id = build.version_id.clone();
+        let mut final_progress: Option<DownloadProgress> = None;
+        let result = install_build(&library_dir, build, |progress| {
+            if progress.done && progress.phase == "done" {
+                final_progress = Some(progress);
+            } else {
                 let _ = progress_tx.send(progress);
-            },
-        )
+            }
+        })
         .await;
 
         if let Err(error) = result {
             let _ = progress_tx.send(error_progress(error));
+        } else if let Err(error) = prewarm_version_runtime(&library_dir, &version_id, |progress| {
+            let _ = progress_tx.send(progress);
+        })
+        .await
+        {
+            let _ = progress_tx.send(DownloadProgress {
+                phase: "error".to_string(),
+                current: 0,
+                total: 0,
+                file: None,
+                error: Some(format!("prepare java runtime: {error}")),
+                done: true,
+            });
+        } else if let Some(progress) = final_progress {
+            let _ = progress_tx.send(progress);
         }
 
         drop(progress_tx);
@@ -197,14 +214,14 @@ async fn handle_loader_install_events(
     Ok(Sse::new(stream))
 }
 
-fn parse_loader_type(
-    loader_type: &str,
-) -> Result<LoaderType, (StatusCode, Json<serde_json::Value>)> {
-    LoaderType::parse(loader_type).ok_or_else(|| {
+fn parse_component_id(
+    component_id: &str,
+) -> Result<LoaderComponentId, (StatusCode, Json<serde_json::Value>)> {
+    LoaderComponentId::parse(component_id).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
-                "error": format!("unknown loader type: {loader_type}")
+                "error": format!("unknown loader component: {component_id}")
             })),
         )
     })
@@ -225,6 +242,25 @@ fn error_progress(error: LoaderError) -> DownloadProgress {
         error: Some(error.to_string()),
         done: true,
     }
+}
+
+fn error_response(error: LoaderError) -> (StatusCode, Json<serde_json::Value>) {
+    let status = match error {
+        LoaderError::InvalidMinecraftVersion
+        | LoaderError::InvalidBuildId
+        | LoaderError::InvalidComponentId => StatusCode::BAD_REQUEST,
+        LoaderError::BuildNotFound(_) => StatusCode::NOT_FOUND,
+        LoaderError::MissingLibraryDir => StatusCode::PRECONDITION_FAILED,
+        LoaderError::CatalogUnavailable(_) => StatusCode::BAD_GATEWAY,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "error": error.to_string(),
+            "failure_kind": error.failure_kind(),
+        })),
+    )
 }
 
 fn generate_install_id() -> String {

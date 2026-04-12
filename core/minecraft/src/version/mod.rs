@@ -1,3 +1,4 @@
+use crate::loaders::infer_build_from_version_id;
 use crate::paths::versions_dir;
 use crate::types::VersionEntry;
 use serde::{Deserialize, Serialize};
@@ -55,6 +56,7 @@ pub fn scan_versions(mc_dir: &Path) -> std::io::Result<Vec<VersionEntry>> {
 
     let mut versions = Vec::new();
     for (id, stub) in &stubs {
+        let effective_parent = effective_parent_version(id, &stub.inherits_from);
         let jar_path = versions_dir.join(id).join(format!("{id}.jar"));
         let incomplete_marker = versions_dir.join(id).join(".incomplete");
 
@@ -66,7 +68,7 @@ pub fn scan_versions(mc_dir: &Path) -> std::io::Result<Vec<VersionEntry>> {
                 "Installation incomplete".to_string(),
                 id.clone(),
             )
-        } else if stub.inherits_from.is_empty() {
+        } else if effective_parent.is_empty() {
             if jar_path.is_file() {
                 (true, "ready".to_string(), String::new(), String::new())
             } else {
@@ -79,35 +81,46 @@ pub fn scan_versions(mc_dir: &Path) -> std::io::Result<Vec<VersionEntry>> {
             }
         } else {
             let parent_json = versions_dir
-                .join(&stub.inherits_from)
-                .join(format!("{}.json", stub.inherits_from));
+                .join(&effective_parent)
+                .join(format!("{}.json", effective_parent));
             let parent_jar = versions_dir
-                .join(&stub.inherits_from)
-                .join(format!("{}.jar", stub.inherits_from));
+                .join(&effective_parent)
+                .join(format!("{}.jar", effective_parent));
             if !parent_json.is_file() {
                 (
                     false,
                     "incomplete".to_string(),
-                    format!("Base version {} needs to be installed", stub.inherits_from),
-                    stub.inherits_from.clone(),
+                    format!("Base version {} needs to be installed", effective_parent),
+                    id.clone(),
                 )
             } else if !parent_jar.is_file() {
                 (
                     false,
                     "incomplete".to_string(),
-                    format!("Base version {} needs to be downloaded", stub.inherits_from),
-                    stub.inherits_from.clone(),
+                    format!("Base version {} needs to be downloaded", effective_parent),
+                    id.clone(),
                 )
             } else {
-                (true, "ready".to_string(), String::new(), String::new())
+                if jar_path.is_file() {
+                    (true, "ready".to_string(), String::new(), String::new())
+                } else {
+                    (
+                        false,
+                        "incomplete".to_string(),
+                        "Loader files are not fully installed".to_string(),
+                        id.clone(),
+                    )
+                }
             }
         };
+
+        let loader_meta = infer_build_from_version_id(id);
 
         versions.push(VersionEntry {
             id: id.clone(),
             kind: stub.kind.clone(),
             release_time: stub.release_time.clone(),
-            inherits_from: stub.inherits_from.clone(),
+            inherits_from: effective_parent.clone(),
             launchable,
             installed: true,
             status,
@@ -116,6 +129,10 @@ pub fn scan_versions(mc_dir: &Path) -> std::io::Result<Vec<VersionEntry>> {
             java_component: resolved_java.component,
             java_major: resolved_java.major_version,
             manifest_url: String::new(),
+            loader_component_id: loader_meta
+                .as_ref()
+                .map(|(component_id, _, _, _)| component_id.as_str().to_string()),
+            loader_build_id: loader_meta.map(|(_, build_id, _, _)| build_id),
         });
     }
 
@@ -125,19 +142,68 @@ pub fn scan_versions(mc_dir: &Path) -> std::io::Result<Vec<VersionEntry>> {
 
 fn resolve_java_version(id: &str, stubs: &HashMap<String, VersionStub>) -> JavaVersionStub {
     let mut current = stubs.get(id);
+    let mut fallback_parent = String::new();
     while let Some(stub) = current {
         if let Some(java_version) = &stub.java_version {
             return java_version.clone();
         }
-        if stub.inherits_from.is_empty() {
+        let next_parent = effective_parent_version(id, &stub.inherits_from);
+        if next_parent.is_empty() {
             break;
         }
-        current = stubs.get(&stub.inherits_from);
+        fallback_parent = next_parent.clone();
+        current = stubs.get(&next_parent);
+    }
+
+    if !fallback_parent.is_empty() && fallback_parent != id {
+        if let Some(stub) = stubs.get(&fallback_parent)
+            && let Some(java_version) = &stub.java_version
+        {
+            return java_version.clone();
+        }
     }
 
     JavaVersionStub {
         component: String::new(),
         major_version: 0,
+    }
+}
+
+fn effective_parent_version(id: &str, declared_parent: &str) -> String {
+    if !declared_parent.trim().is_empty() {
+        return declared_parent.to_string();
+    }
+    infer_loader_base_version(id).unwrap_or_default()
+}
+
+fn infer_loader_base_version(id: &str) -> Option<String> {
+    let lower = id.to_ascii_lowercase();
+
+    if let Some(rest) = id.strip_prefix("fabric-loader-") {
+        return rest.rsplit_once('-').map(|(_, base)| base.to_string());
+    }
+    if let Some(rest) = id.strip_prefix("quilt-loader-") {
+        return rest.rsplit_once('-').map(|(_, base)| base.to_string());
+    }
+    if lower.starts_with("neoforge-") {
+        let version = id.strip_prefix("neoforge-")?;
+        return Some(neoforge_to_mc_version(version));
+    }
+    id.split_once("-forge-").map(|(base, _)| base.to_string())
+}
+
+fn neoforge_to_mc_version(version: &str) -> String {
+    let mut parts = version.splitn(3, '.');
+    let Some(major) = parts.next() else {
+        return String::new();
+    };
+    let Some(minor) = parts.next() else {
+        return String::new();
+    };
+    if minor == "0" {
+        format!("1.{major}")
+    } else {
+        format!("1.{major}.{minor}")
     }
 }
 

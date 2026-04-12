@@ -92,6 +92,7 @@ export function ActionArea(): JSX.Element | null {
           name={inst.name}
           versionId={inst.version_id}
           pid={session.pid}
+          state={session.state}
           launchedAt={session.launchedAt}
         />
       </div>
@@ -180,11 +181,12 @@ export function ActionArea(): JSX.Element | null {
   );
 }
 
-function RunningCard({ name, versionId, pid, launchedAt }: {
+function RunningCard({ name, versionId, pid, launchedAt, state }: {
   name: string;
   versionId: string;
   pid: number;
   launchedAt: string;
+  state?: string;
 }): JSX.Element {
   useEffect(() => {
     startRunningAnimation();
@@ -199,7 +201,7 @@ function RunningCard({ name, versionId, pid, launchedAt }: {
     <div class="running-area" id="running-area">
       <div class="running-card">
         <div class="running-card-head">
-          <span class="running-card-label">{pid > 0 ? 'Game Launched' : 'Preparing Launch'}</span>
+          <span class="running-card-label">{runningLabel(pid, state)}</span>
         </div>
         <div class="running-top">
           <pre class="running-ascii" id="running-ascii"></pre>
@@ -207,7 +209,7 @@ function RunningCard({ name, versionId, pid, launchedAt }: {
             <span class="running-version" id="running-version">
               {name} ({versionId})
             </span>
-            <span class="running-pid" id="running-pid">{pid > 0 ? `PID ${pid}` : 'Waiting for process...'}</span>
+            <span class="running-pid" id="running-pid">{pid > 0 ? `PID ${pid}` : runningDetail(state)}</span>
           </div>
         </div>
         <div class="running-bottom">
@@ -220,4 +222,39 @@ function RunningCard({ name, versionId, pid, launchedAt }: {
       </div>
     </div>
   );
+}
+
+function runningLabel(pid: number, state?: string): string {
+  if (pid > 0) return 'Game Launched';
+  switch (state) {
+    case 'validating':
+      return 'Validating Launch';
+    case 'ensuring_runtime':
+      return 'Checking Java Runtime';
+    case 'planning':
+      return 'Planning Launch';
+    case 'preparing':
+      return 'Preparing Files';
+    case 'starting':
+      return 'Starting Game';
+    default:
+      return 'Preparing Launch';
+  }
+}
+
+function runningDetail(state?: string): string {
+  switch (state) {
+    case 'validating':
+      return 'Checking version and overrides...';
+    case 'ensuring_runtime':
+      return 'Resolving Java runtime...';
+    case 'planning':
+      return 'Building the launch plan...';
+    case 'preparing':
+      return 'Preparing natives and launch files...';
+    case 'starting':
+      return 'Waiting for process...';
+    default:
+      return 'Waiting for process...';
+  }
 }

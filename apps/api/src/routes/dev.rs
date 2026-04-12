@@ -93,16 +93,26 @@ async fn handle_dev_flush(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let config_paths = state.config().paths().clone();
-    let _ = fs::remove_file(&config_paths.config_file);
-    let _ = fs::remove_file(&config_paths.instances_file);
-    let _ = fs::remove_dir_all(config_paths.instances_dir);
-    let _ = fs::remove_dir_all(config_paths.config_dir.join("runtimes"));
+    let current_config = state.config().current();
+
+    state.sessions().terminate_all().await;
+    state.installs().clear().await;
+
+    if let Some(managed_library_dir) = managed_library_dir_to_remove(&config_paths, &current_config)
+    {
+        let _ = fs::remove_dir_all(managed_library_dir);
+    }
+
+    let _ = fs::remove_dir_all(&config_paths.config_dir);
 
     state.config().replace_in_memory(AppConfig::default());
     state.set_library_dir(String::new());
     let _ = state.instances().clear();
 
-    Ok(Json(serde_json::json!({ "status": "flushed" })))
+    Ok(Json(serde_json::json!({
+        "status": "flushed",
+        "setup_required": true
+    })))
 }
 
 fn copy_path(src: &Path, dst: &Path) -> std::io::Result<()> {
@@ -143,4 +153,41 @@ fn internal_error(error: impl std::fmt::Display) -> (StatusCode, Json<serde_json
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(serde_json::json!({ "error": error.to_string() })),
     )
+}
+
+fn managed_library_dir_to_remove(
+    paths: &croopor_config::AppPaths,
+    config: &AppConfig,
+) -> Option<PathBuf> {
+    let library_dir = config.library_dir.trim();
+    if library_dir.is_empty() {
+        return Some(paths.library_dir.clone());
+    }
+
+    if config.library_mode != "managed" {
+        return None;
+    }
+
+    let candidate = PathBuf::from(library_dir);
+    if candidate == paths.library_dir {
+        return Some(candidate);
+    }
+
+    let config_root = normalize_for_prefix(&paths.config_dir)?;
+    let library_root = normalize_for_prefix(&candidate)?;
+    if library_root.starts_with(&config_root) {
+        return Some(candidate);
+    }
+
+    Some(candidate)
+}
+
+fn normalize_for_prefix(path: &Path) -> Option<PathBuf> {
+    if path.exists() {
+        path.canonicalize().ok()
+    } else if path.is_absolute() {
+        Some(path.to_path_buf())
+    } else {
+        std::env::current_dir().ok().map(|cwd| cwd.join(path))
+    }
 }

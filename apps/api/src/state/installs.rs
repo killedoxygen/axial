@@ -59,6 +59,10 @@ impl InstallStore {
     pub async fn remove(&self, install_id: &str) {
         self.installs.write().await.remove(install_id);
     }
+
+    pub async fn clear(&self) {
+        self.installs.write().await.clear();
+    }
 }
 
 impl Default for InstallStore {

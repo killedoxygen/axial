@@ -23,12 +23,17 @@ pub use launch::{
     resolve_version,
 };
 pub use loaders::{
-    GameVersion, LoaderError, LoaderType, LoaderVersion, fetch_game_versions,
-    fetch_loader_versions, install_loader,
+    LoaderArtifactKind, LoaderAvailability, LoaderBuildId, LoaderBuildRecord, LoaderCatalogState,
+    LoaderComponentId, LoaderComponentRecord, LoaderError, LoaderGameVersion,
+    LoaderInstallFailureKind, LoaderInstallStrategy, LoaderInstallability, LoaderVersionIndex,
+    build_id_for, fetch_builds, fetch_components, fetch_supported_versions,
+    infer_build_from_version_id, infer_neoforge_minecraft_version, install_build,
+    installed_version_id_for, loader_components, parse_build_id, resolve_build_record,
 };
 pub use manifest::{ManifestEntry, VersionManifest, fetch_version_manifest};
 pub use paths::{
-    create_minecraft_dir, default_minecraft_dir, is_legacy_assets, libraries_dir, runtime_dirs,
+    cache_dir, create_minecraft_dir, default_minecraft_dir, is_legacy_assets, libraries_dir,
+    loader_artifacts_dir, loader_cache_dir, loader_catalog_dir, loader_work_dir, runtime_dirs,
     validate_installation, versions_dir,
 };
 pub use profiles::ensure_launcher_profiles;

@@ -63,6 +63,13 @@ pub fn plan_vanilla_launch(
     }
 
     let version = resolve_version(&request.mc_dir, &request.version_id)?;
+    plan_resolved_launch(request, version)
+}
+
+pub fn plan_resolved_launch(
+    request: &VanillaLaunchRequest,
+    version: VersionJson,
+) -> Result<VanillaLaunchPlan, VanillaLaunchPlanError> {
     let client_jar = if uses_module_bootstrap(&version) {
         None
     } else {
@@ -84,11 +91,7 @@ pub fn plan_vanilla_launch(
     let classpath = build_classpath(&libraries, client_jar.as_deref());
     let needs_natives_dir = libraries.iter().any(|library| library.is_native);
     let natives_dir = if needs_natives_dir {
-        let dir = create_natives_dir(&request.version_id, &libraries)?;
-        if let Err(error) = extract_native_libraries(&libraries, &dir) {
-            return Err(error.into());
-        }
-        Some(dir)
+        Some(create_natives_dir(&request.version_id, &libraries)?)
     } else {
         None
     };

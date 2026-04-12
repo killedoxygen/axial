@@ -59,6 +59,8 @@ pub async fn run_processors<F>(
     mc_version: &str,
     install_profile_json: &[u8],
     installer_data: &[u8],
+    work_dir: &Path,
+    installer_path: &Path,
     mut progress: F,
 ) -> Result<(), ProcessorError>
 where
@@ -79,7 +81,14 @@ where
         }
     }
 
-    let (data_vars, temp_dir) = build_data_vars(&profile.data, mc_dir, mc_version, installer_data)?;
+    let (data_vars, temp_dir) = build_data_vars(
+        &profile.data,
+        mc_dir,
+        mc_version,
+        installer_data,
+        work_dir,
+        installer_path,
+    )?;
     let processors = profile
         .processors
         .into_iter()
@@ -95,7 +104,10 @@ where
             total,
             format!("Processor {}/{}", index + 1, total),
         );
-        run_processor(&java_path, processor, &lib_paths, &data_vars, &lib_dir).await?;
+        run_processor(
+            &java_path, processor, &lib_paths, &data_vars, &lib_dir, &lib_dir,
+        )
+        .await?;
     }
 
     if let Some(temp_dir) = temp_dir {
@@ -174,6 +186,8 @@ fn build_data_vars(
     mc_dir: &Path,
     mc_version: &str,
     installer_data: &[u8],
+    work_dir: &Path,
+    installer_path: &Path,
 ) -> Result<(HashMap<String, String>, Option<PathBuf>), ProcessorError> {
     let mut vars = HashMap::new();
     let mut temp_dir = None;
@@ -188,20 +202,18 @@ fn build_data_vars(
             let coord = &value[1..value.len() - 1];
             let maven_path = maven_to_path(coord);
             if !maven_path.as_os_str().is_empty() {
-                vars.insert(
-                    key.clone(),
-                    libraries_dir(mc_dir)
-                        .join(maven_path)
-                        .to_string_lossy()
-                        .to_string(),
-                );
+                let path = libraries_dir(mc_dir).join(maven_path);
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                vars.insert(key.clone(), path.to_string_lossy().to_string());
             }
             continue;
         }
 
         if let Some(entry_path) = value.strip_prefix('/') {
             if temp_dir.is_none() {
-                temp_dir = Some(create_temp_dir()?);
+                temp_dir = Some(create_temp_dir(work_dir)?);
             }
             let extracted = extract_from_installer_jar(
                 installer_data,
@@ -230,16 +242,20 @@ fn build_data_vars(
         "LIBRARY_DIR".to_string(),
         libraries_dir(mc_dir).to_string_lossy().to_string(),
     );
+    vars.insert(
+        "INSTALLER".to_string(),
+        installer_path.to_string_lossy().to_string(),
+    );
 
     Ok((vars, temp_dir))
 }
 
-fn create_temp_dir() -> Result<PathBuf, std::io::Error> {
+fn create_temp_dir(work_dir: &Path) -> Result<PathBuf, std::io::Error> {
     let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|value| value.as_nanos())
         .unwrap_or_default();
-    let dir = std::env::temp_dir().join(format!("croopor-forge-processors-{nanos:x}"));
+    let dir = work_dir.join(format!("processors-{nanos:x}"));
     fs::create_dir_all(&dir)?;
     Ok(dir)
 }
@@ -268,6 +284,7 @@ async fn run_processor(
     lib_paths: &HashMap<String, PathBuf>,
     data_vars: &HashMap<String, String>,
     lib_dir: &Path,
+    root_dir: &Path,
 ) -> Result<(), ProcessorError> {
     let mut classpath_parts = Vec::new();
     let proc_jar_path =
@@ -301,7 +318,7 @@ async fn run_processor(
 
     let mut command = Command::new(java_path);
     command.args(args);
-    command.current_dir(lib_dir);
+    command.current_dir(root_dir);
     let output = tokio::time::timeout(Duration::from_secs(120), command.output())
         .await
         .map_err(|_| ProcessorError::Command("processor timed out after 120s".to_string()))?
