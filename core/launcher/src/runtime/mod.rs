@@ -102,7 +102,7 @@ pub fn should_bypass_requested_runtime(
     if info.major as i32 != required.major_version {
         return true;
     }
-    info.major == 8
+    false
 }
 
 impl RuntimeSelection {
@@ -193,5 +193,29 @@ mod tests {
         assert!(!selection.bypassed_requested_runtime);
         assert_eq!(selection.effective_path, "C:/java-21/bin/javaw.exe");
         assert_eq!(selection.selected_path, "C:/java-21/bin/javaw.exe");
+    }
+
+    #[test]
+    fn keeps_java_8_override_when_java_8_is_required() {
+        let required = JavaVersion {
+            component: "jre-legacy".to_string(),
+            major_version: 8,
+        };
+        let selection = resolve_runtime::<io::Error, _>(
+            &required,
+            "/override-java-8/bin/java",
+            false,
+            Some(|override_path: &str| {
+                Ok((
+                    Some(result(override_path, "override")),
+                    info(override_path, 8),
+                ))
+            }),
+        )
+        .expect("resolve runtime");
+
+        assert!(!selection.bypassed_requested_runtime);
+        assert_eq!(selection.effective_path, "/override-java-8/bin/java");
+        assert_eq!(selection.selected_path, "/override-java-8/bin/java");
     }
 }

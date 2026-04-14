@@ -1,6 +1,7 @@
 use crate::models::AppConfig;
 use crate::paths::AppPaths;
 use std::fs;
+use std::path::Path;
 use std::sync::RwLock;
 use thiserror::Error;
 
@@ -18,6 +19,24 @@ pub enum ConfigStoreError {
 }
 
 impl ConfigStore {
+    fn replace_file(source: &Path, destination: &Path) -> Result<(), std::io::Error> {
+        if fs::rename(source, destination).is_ok() {
+            return Ok(());
+        }
+
+        if destination.exists() {
+            let _ = fs::remove_file(destination);
+        }
+
+        match fs::rename(source, destination) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let _ = fs::remove_file(source);
+                Err(error)
+            }
+        }
+    }
+
     pub fn load_default() -> Result<Self, ConfigStoreError> {
         Self::load_from(AppPaths::detect())
     }
@@ -48,7 +67,7 @@ impl ConfigStore {
         let data = serde_json::to_string_pretty(&normalized)?;
         let temp_path = self.paths.config_file.with_extension("json.tmp");
         fs::write(&temp_path, data)?;
-        fs::rename(temp_path, &self.paths.config_file)?;
+        Self::replace_file(&temp_path, &self.paths.config_file)?;
 
         if let Ok(mut guard) = self.config.write() {
             *guard = normalized.clone();

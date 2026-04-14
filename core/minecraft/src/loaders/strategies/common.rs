@@ -75,9 +75,10 @@ where
     .inspect_err(|_| cleanup_incomplete_version(library_dir, &installed_version_id))?;
     verify_install(library_dir, &installed_version_id)
         .inspect_err(|_| cleanup_incomplete_version(library_dir, &installed_version_id))?;
+    ensure_launcher_profiles(library_dir, &installed_version_id)
+        .inspect_err(|_| cleanup_incomplete_version(library_dir, &installed_version_id))?;
     finalize_version_install(library_dir, &installed_version_id)
         .inspect_err(|_| cleanup_incomplete_version(library_dir, &installed_version_id))?;
-    ensure_launcher_profiles(library_dir, &installed_version_id)?;
     send(done());
     Ok(installed_version_id)
 }
@@ -208,10 +209,10 @@ where
     verify_install(library_dir, &installed_version_id).inspect_err(|_| {
         cleanup_incomplete_version(library_dir, &installed_version_id);
     })?;
-    finalize_version_install(library_dir, &installed_version_id).inspect_err(|_| {
+    ensure_launcher_profiles(library_dir, &installed_version_id).inspect_err(|_| {
         cleanup_incomplete_version(library_dir, &installed_version_id);
     })?;
-    ensure_launcher_profiles(library_dir, &installed_version_id).inspect_err(|_| {
+    finalize_version_install(library_dir, &installed_version_id).inspect_err(|_| {
         cleanup_incomplete_version(library_dir, &installed_version_id);
     })?;
     send(done());
@@ -276,10 +277,10 @@ where
     verify_install(library_dir, &plan.record.version_id).inspect_err(|_| {
         cleanup_incomplete_version(library_dir, &plan.record.version_id);
     })?;
-    finalize_version_install(library_dir, &plan.record.version_id).inspect_err(|_| {
+    ensure_launcher_profiles(library_dir, &plan.record.version_id).inspect_err(|_| {
         cleanup_incomplete_version(library_dir, &plan.record.version_id);
     })?;
-    ensure_launcher_profiles(library_dir, &plan.record.version_id).inspect_err(|_| {
+    finalize_version_install(library_dir, &plan.record.version_id).inspect_err(|_| {
         cleanup_incomplete_version(library_dir, &plan.record.version_id);
     })?;
     send(done());
