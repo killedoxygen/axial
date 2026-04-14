@@ -8,6 +8,7 @@ use std::fs;
 use std::path::Path;
 
 use super::types::LoaderError;
+use super::validate_version_id;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct LoaderProfileFragment {
@@ -127,6 +128,7 @@ pub fn write_composed_version(
     version: &VersionJson,
     base_version_id: &str,
 ) -> Result<(), LoaderError> {
+    validate_version_id(version_id, "installed loader version id")?;
     let version_dir = versions_dir(mc_dir).join(version_id);
     fs::create_dir_all(&version_dir)?;
     let marker = version_dir.join(".incomplete");
@@ -140,6 +142,7 @@ pub fn write_composed_version(
 }
 
 pub fn finalize_version_install(mc_dir: &Path, version_id: &str) -> Result<(), LoaderError> {
+    validate_version_id(version_id, "installed loader version id")?;
     let version_dir = versions_dir(mc_dir).join(version_id);
     let marker = version_dir.join(".incomplete");
     if marker.exists() {
@@ -149,7 +152,7 @@ pub fn finalize_version_install(mc_dir: &Path, version_id: &str) -> Result<(), L
 }
 
 pub fn cleanup_incomplete_version(mc_dir: &Path, version_id: &str) {
-    if version_id.trim().is_empty() {
+    if validate_version_id(version_id, "installed loader version id").is_err() {
         return;
     }
     let version_dir = versions_dir(mc_dir).join(version_id);
@@ -181,6 +184,7 @@ fn link_or_copy_base_jar(
     base_version_id: &str,
     version_id: &str,
 ) -> Result<(), LoaderError> {
+    validate_version_id(version_id, "installed loader version id")?;
     let base_jar = versions_dir(mc_dir)
         .join(base_version_id)
         .join(format!("{base_version_id}.jar"));
@@ -339,6 +343,21 @@ mod tests {
         fs::create_dir_all(&retained).expect("retained version");
 
         cleanup_incomplete_version(&root, "   ");
+
+        assert!(root.join("versions").is_dir());
+        assert!(retained.is_dir());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cleanup_incomplete_version_ignores_traversal_version_id() {
+        let root = temp_dir("cleanup-traversal-version-id");
+        create_minecraft_dir(&root).expect("library");
+        let retained = root.join("versions").join("retained");
+        fs::create_dir_all(&retained).expect("retained version");
+
+        cleanup_incomplete_version(&root, "..");
 
         assert!(root.join("versions").is_dir());
         assert!(retained.is_dir());

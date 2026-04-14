@@ -379,6 +379,7 @@ fn cleanup_on_error<T, E>(
 }
 
 fn verify_install(library_dir: &Path, version_id: &str) -> Result<(), LoaderError> {
+    validate_version_id(version_id, "installed loader version id")?;
     let version = resolve_version(library_dir, version_id)
         .map_err(|error| LoaderError::Verify(format!("resolve version: {error}")))?;
     if version.main_class.trim().is_empty() {
@@ -401,6 +402,7 @@ fn write_raw_profile_version(
     version_id: &str,
     profile_bytes: &[u8],
 ) -> Result<(), LoaderError> {
+    validate_version_id(version_id, "installed loader version id")?;
     let version_dir = versions_dir(library_dir).join(version_id);
     fs::create_dir_all(&version_dir)?;
     fs::write(version_dir.join(".incomplete"), b"installing")?;

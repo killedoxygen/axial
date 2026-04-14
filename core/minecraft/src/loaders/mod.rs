@@ -26,7 +26,7 @@ pub use types::{
 use crate::download::DownloadProgress;
 use crate::paths::loader_work_dir;
 use std::fs;
-use std::path::Path;
+use std::path::{Component, Path};
 
 pub async fn install_build<F>(
     library_dir: &Path,
@@ -50,8 +50,18 @@ where
 }
 
 pub(crate) fn validate_version_id(version_id: &str, context: &str) -> Result<(), LoaderError> {
-    if version_id.trim().is_empty() {
+    let trimmed = version_id.trim();
+    if trimmed.is_empty() {
         return Err(LoaderError::Other(format!("{context} is empty")));
+    }
+    if trimmed.contains(['/', '\\']) {
+        return Err(LoaderError::Other(format!(
+            "{context} contains path separators"
+        )));
+    }
+    let mut components = Path::new(trimmed).components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        return Err(LoaderError::Other(format!("{context} is invalid")));
     }
     Ok(())
 }
@@ -64,5 +74,18 @@ mod tests {
     fn rejects_empty_version_ids() {
         let error = validate_version_id(" \t ", "loader build version id").expect_err("error");
         assert_eq!(error.to_string(), "loader build version id is empty");
+    }
+
+    #[test]
+    fn rejects_path_traversal_version_ids() {
+        for version_id in ["..", ".", "../escape", "loader/escape", "loader\\escape"] {
+            let error =
+                validate_version_id(version_id, "loader build version id").expect_err("error");
+            assert!(
+                error.to_string().contains("loader build version id"),
+                "{version_id} => {}",
+                error
+            );
+        }
     }
 }
