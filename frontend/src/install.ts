@@ -210,40 +210,85 @@ function inferLoaderVersionFromBuildId(buildId: string): string {
   return parts[2] || '';
 }
 
+function formatCountLabel(base: string, data: any): string {
+  if (typeof data.current === 'number' && typeof data.total === 'number' && data.total > 0) {
+    return `${base} (${data.current}/${data.total})`;
+  }
+  return base;
+}
+
+function phaseLabel(data: any, loaderInstall: boolean): string {
+  switch (data.phase) {
+    case 'loader_meta':
+      return 'Fetching loader info...';
+    case 'loader_json':
+      return 'Preparing loader...';
+    case 'profile':
+      return data.file || 'Preparing loader profile...';
+    case 'artifacts':
+      return data.file || 'Downloading loader artifacts...';
+    case 'loader_libraries':
+      return formatCountLabel('Loader libraries', data);
+    case 'loader_processors':
+    case 'processors':
+      return data.file || formatCountLabel('Running processors', data);
+    case 'version_json':
+      return 'Fetching version info...';
+    case 'client_jar':
+      return 'Downloading game JAR...';
+    case 'libraries':
+      return formatCountLabel('Libraries', data);
+    case 'asset_index':
+      return 'Downloading asset index...';
+    case 'assets':
+      return formatCountLabel('Assets', data);
+    case 'log_config':
+      return 'Downloading log config...';
+    case 'java_runtime':
+      return data.file || 'Preparing Java runtime...';
+    case 'done':
+      return 'Complete!';
+    case 'error':
+      return data.error || 'Install failed.';
+    default:
+      if (typeof data.file === 'string' && data.file.trim()) {
+        return data.file;
+      }
+      return loaderInstall ? `Working on ${data.phase || 'loader install'}...` : `Working on ${data.phase || 'install'}...`;
+  }
+}
+
 async function connectVanillaEvents(installId: string, versionId: string): Promise<void> {
   const startedAt = Date.now();
 
   const onProgress = async (data: any): Promise<void> => {
     let pct = 0;
-    let label = '';
+    let label = phaseLabel(data, false);
 
     if (data.phase === 'version_json') {
       pct = 2;
-      label = 'Fetching version info...';
     } else if (data.phase === 'client_jar') {
       pct = 7;
-      label = 'Downloading game JAR...';
     } else if (data.phase === 'libraries') {
       const libraryPct = data.total > 0 ? data.current / data.total : 0;
       pct = 7 + Math.round(libraryPct * 13);
-      label = `Libraries (${data.current}/${data.total})`;
     } else if (data.phase === 'asset_index') {
       pct = 21;
-      label = 'Downloading asset index...';
     } else if (data.phase === 'assets') {
       const assetPct = data.total > 0 ? data.current / data.total : 0;
       pct = 21 + Math.round(assetPct * 72);
-      label = `Assets (${data.current}/${data.total})`;
     } else if (data.phase === 'log_config') {
       pct = 94;
-      label = 'Downloading log config...';
+    } else if (data.phase === 'java_runtime') {
+      pct = 95;
     } else if (data.phase === 'done') {
       pct = 100;
-      label = 'Complete!';
     } else if (data.phase === 'error') {
       showError(data.error);
       await onInstallDone();
       return;
+    } else {
+      pct = installState.value.status === 'active' ? installState.value.pct : 0;
     }
 
     updateInstallProgress(pct, appendETA(label, pct, startedAt));
@@ -289,45 +334,45 @@ async function connectLoaderEvents(installId: string, versionId: string): Promis
   const startedAt = Date.now();
   const onProgress = (data: any): void => {
     let pct = 0;
-    let label = '';
+    let label = phaseLabel(data, true);
 
     if (data.phase === 'loader_meta') {
       pct = 1;
-      label = 'Fetching loader info...';
     } else if (data.phase === 'loader_json') {
       pct = 3;
-      label = 'Preparing loader...';
+    } else if (data.phase === 'profile') {
+      pct = 3;
+    } else if (data.phase === 'artifacts') {
+      pct = 6;
     } else if (data.phase === 'loader_libraries') {
       const loaderPct = data.total > 0 ? data.current / data.total : 0;
       pct = 3 + Math.round(loaderPct * 7);
-      label = `Loader libraries (${data.current}/${data.total})`;
-    } else if (data.phase === 'loader_processors') {
+    } else if (data.phase === 'loader_processors' || data.phase === 'processors') {
       const processorPct = data.total > 0 ? data.current / data.total : 0;
       pct = 10 + Math.round(processorPct * 10);
-      label = data.file || `Processing (${data.current}/${data.total})`;
     } else if (data.phase === 'version_json') {
       pct = 21;
-      label = 'Fetching version info...';
     } else if (data.phase === 'client_jar') {
       pct = 24;
-      label = 'Downloading game JAR...';
     } else if (data.phase === 'libraries') {
       const libraryPct = data.total > 0 ? data.current / data.total : 0;
       pct = 24 + Math.round(libraryPct * 10);
-      label = `Libraries (${data.current}/${data.total})`;
     } else if (data.phase === 'asset_index') {
       pct = 35;
-      label = 'Downloading asset index...';
     } else if (data.phase === 'assets') {
       const assetPct = data.total > 0 ? data.current / data.total : 0;
       pct = 35 + Math.round(assetPct * 58);
-      label = `Assets (${data.current}/${data.total})`;
     } else if (data.phase === 'log_config') {
       pct = 94;
-      label = 'Downloading log config...';
+    } else if (data.phase === 'java_runtime') {
+      pct = 95;
     } else if (data.phase === 'done') {
       pct = 100;
-      label = 'Complete!';
+    } else if (data.phase === 'error') {
+      onError(data.error || 'Unknown error');
+      return;
+    } else {
+      pct = installState.value.status === 'active' ? installState.value.pct : 0;
     }
 
     updateInstallProgress(pct, appendETA(label, pct, startedAt));

@@ -523,6 +523,13 @@ async fn handle_launch_kill(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let record = state.sessions().get(&id).await.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "session not found" })),
+        )
+    })?;
+
     state.sessions().kill(&id).await.map_err(|error| {
         let status = if error.kind() == std::io::ErrorKind::NotFound {
             StatusCode::NOT_FOUND
@@ -534,6 +541,26 @@ async fn handle_launch_kill(
             Json(serde_json::json!({ "error": error.to_string() })),
         )
     })?;
+
+    trace_launch_event(&id, "kill requested by client");
+    state
+        .sessions()
+        .emit_log(&id, "system", "Launch stopped by user.".to_string())
+        .await;
+    state
+        .sessions()
+        .emit_status(
+            &id,
+            LaunchStatusEvent {
+                state: "exited".to_string(),
+                pid: record.pid,
+                exit_code: Some(-9),
+                failure_class: None,
+                failure_detail: Some("stopped by user".to_string()),
+                healing: record.healing.clone(),
+            },
+        )
+        .await;
 
     Ok(Json(serde_json::json!({ "status": "killed" })))
 }

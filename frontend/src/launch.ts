@@ -13,7 +13,8 @@ import {
   config, launchState, runningSessions, selectedInstance, selectedVersion, systemInfo, instanceLaunchDrafts,
 } from './store';
 import {
-  clearLaunchNotice, confirmLaunch, endLaunchPrep, endSession, setLaunchNotice, startLaunch, updateInstanceInList,
+  clearLaunchNotice, confirmLaunch, endLaunchPrep, endSession, setLaunchNotice, startLaunch,
+  updateInstanceInList, updateRunningSessionState,
 } from './actions';
 import type { HealingEvent, LaunchHealingSummary } from './types';
 
@@ -26,12 +27,7 @@ function rollbackLaunch(instanceId: string, animationFrameId: number | null): vo
 }
 
 function updateRunningSession(instanceId: string, patch: Partial<import('./types').RunningSession>): void {
-  const current = runningSessions.value[instanceId];
-  if (!current) return;
-  runningSessions.value = {
-    ...runningSessions.value,
-    [instanceId]: { ...current, ...patch },
-  };
+  updateRunningSessionState(instanceId, patch);
 }
 
 function describeFailureClass(failureClass: string | undefined): string {
@@ -470,14 +466,18 @@ export async function killGame(): Promise<void> {
   if (!inst) return;
   const session = runningSessions.value[inst.id];
   if (!session) return;
+  if (session.stopping) return;
 
   try {
+    updateRunningSessionState(inst.id, { stopping: true });
     const res = await api('POST', `/launch/${session.sessionId}/kill`);
     if (res?.error) {
+      updateRunningSessionState(inst.id, { stopping: false });
       showError(`Failed to kill: ${res.error}`);
       return;
     }
   } catch (err: unknown) {
+    updateRunningSessionState(inst.id, { stopping: false });
     showError(`Failed to kill: ${errMessage(err)}`);
   }
 }

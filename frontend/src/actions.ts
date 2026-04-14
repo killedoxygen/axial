@@ -81,6 +81,18 @@ export function endSession(instanceId: string): void {
   runningSessions.value = next;
 }
 
+export function updateRunningSessionState(
+  instanceId: string,
+  patch: Partial<RunningSession>,
+): void {
+  const current = runningSessions.value[instanceId];
+  if (!current) return;
+  runningSessions.value = {
+    ...runningSessions.value,
+    [instanceId]: { ...current, ...patch },
+  };
+}
+
 export function setLaunchNotice(instanceId: string, notice: LaunchNotice): void {
   launchNotices.value = { ...launchNotices.value, [instanceId]: notice };
 }

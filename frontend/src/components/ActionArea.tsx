@@ -93,6 +93,7 @@ export function ActionArea(): JSX.Element | null {
           versionId={inst.version_id}
           pid={session.pid}
           state={session.state}
+          stopping={session.stopping}
           launchedAt={session.launchedAt}
         />
       </div>
@@ -181,12 +182,13 @@ export function ActionArea(): JSX.Element | null {
   );
 }
 
-function RunningCard({ name, versionId, pid, launchedAt, state }: {
+function RunningCard({ name, versionId, pid, launchedAt, state, stopping }: {
   name: string;
   versionId: string;
   pid: number;
   launchedAt: string;
   state?: string;
+  stopping?: boolean;
 }): JSX.Element {
   useEffect(() => {
     startRunningAnimation();
@@ -217,7 +219,9 @@ function RunningCard({ name, versionId, pid, launchedAt, state }: {
             <span class="running-uptime-label">Session Time</span>
             <div class="running-uptime" id="running-uptime">0:00</div>
           </div>
-          <button class="kill-btn" id="kill-btn" onClick={() => killGame()}>STOP</button>
+          <button class="kill-btn" id="kill-btn" disabled={stopping} onClick={() => killGame()}>
+            {stopping ? 'STOPPING...' : 'STOP'}
+          </button>
         </div>
       </div>
     </div>
@@ -237,6 +241,8 @@ function runningLabel(pid: number, state?: string): string {
       return 'Preparing Files';
     case 'starting':
       return 'Starting Game';
+    case 'exited':
+      return 'Stopping Session';
     default:
       return 'Preparing Launch';
   }
@@ -254,6 +260,8 @@ function runningDetail(state?: string): string {
       return 'Preparing natives and launch files...';
     case 'starting':
       return 'Waiting for process...';
+    case 'exited':
+      return 'Waiting for stop confirmation...';
     default:
       return 'Waiting for process...';
   }

@@ -111,6 +111,7 @@ export interface RunningSession {
   versionId: string;
   pid: number;
   state?: string;
+  stopping?: boolean;
   launchedAt: string;
   allocatedMB: number;
   healing?: LaunchHealingSummary;
