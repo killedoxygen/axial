@@ -39,46 +39,64 @@ where
         fragment.id.clone()
     };
 
-    write_raw_profile_version(library_dir, &installed_version_id, &profile_bytes)?;
-
-    if let Err(error) = download_libraries(
+    cleanup_on_error(
+        write_raw_profile_version(library_dir, &installed_version_id, &profile_bytes),
         library_dir,
-        &fragment.libraries,
-        "loader_libraries",
-        &mut *send,
-    )
-    .await
-    {
-        cleanup_incomplete_version(library_dir, &installed_version_id);
-        return Err(LoaderError::Other(format!(
-            "downloading loader libraries: {error}"
-        )));
-    }
-
-    ensure_base_version(library_dir, &plan.record.minecraft_version, send)
+        &installed_version_id,
+    )?;
+    cleanup_on_error(
+        download_libraries(
+            library_dir,
+            &fragment.libraries,
+            "loader_libraries",
+            &mut *send,
+        )
         .await
-        .inspect_err(|_| cleanup_incomplete_version(library_dir, &installed_version_id))?;
+        .map_err(|error| LoaderError::Other(format!("downloading loader libraries: {error}"))),
+        library_dir,
+        &installed_version_id,
+    )?;
+    cleanup_on_error(
+        ensure_base_version(library_dir, &plan.record.minecraft_version, send).await,
+        library_dir,
+        &installed_version_id,
+    )?;
 
-    let version = compose_loader_version(
+    let version = cleanup_on_error(
+        compose_loader_version(
+            library_dir,
+            &plan.record.minecraft_version,
+            &installed_version_id,
+            &fragment,
+        ),
         library_dir,
-        &plan.record.minecraft_version,
         &installed_version_id,
-        &fragment,
-    )
-    .inspect_err(|_| cleanup_incomplete_version(library_dir, &installed_version_id))?;
-    write_composed_version(
+    )?;
+    cleanup_on_error(
+        write_composed_version(
+            library_dir,
+            &installed_version_id,
+            &version,
+            &plan.record.minecraft_version,
+        ),
         library_dir,
         &installed_version_id,
-        &version,
-        &plan.record.minecraft_version,
-    )
-    .inspect_err(|_| cleanup_incomplete_version(library_dir, &installed_version_id))?;
-    verify_install(library_dir, &installed_version_id)
-        .inspect_err(|_| cleanup_incomplete_version(library_dir, &installed_version_id))?;
-    ensure_launcher_profiles(library_dir, &installed_version_id)
-        .inspect_err(|_| cleanup_incomplete_version(library_dir, &installed_version_id))?;
-    finalize_version_install(library_dir, &installed_version_id)
-        .inspect_err(|_| cleanup_incomplete_version(library_dir, &installed_version_id))?;
+    )?;
+    cleanup_on_error(
+        verify_install(library_dir, &installed_version_id),
+        library_dir,
+        &installed_version_id,
+    )?;
+    cleanup_on_error(
+        ensure_launcher_profiles(library_dir, &installed_version_id),
+        library_dir,
+        &installed_version_id,
+    )?;
+    cleanup_on_error(
+        finalize_version_install(library_dir, &installed_version_id),
+        library_dir,
+        &installed_version_id,
+    )?;
     send(done());
     Ok(installed_version_id)
 }
@@ -141,35 +159,43 @@ where
         &installed_version_id,
         &extracted.version_fragment,
     )?;
-    write_composed_version(
+    cleanup_on_error(
+        write_composed_version(
+            library_dir,
+            &installed_version_id,
+            &version,
+            &plan.record.minecraft_version,
+        ),
         library_dir,
         &installed_version_id,
-        &version,
-        &plan.record.minecraft_version,
     )?;
-
-    if let Err(error) = extract_maven_entries(&installer_data, library_dir) {
-        cleanup_incomplete_version(library_dir, &installed_version_id);
-        return Err(LoaderError::Other(format!(
-            "extracting {} installer libraries: {error}",
-            plan.record.component_name
-        )));
-    }
-
-    if let Err(error) = download_libraries(
+    cleanup_on_error(
+        extract_maven_entries(&installer_data, library_dir).map_err(|error| {
+            LoaderError::Other(format!(
+                "extracting {} installer libraries: {error}",
+                plan.record.component_name
+            ))
+        }),
         library_dir,
-        &extracted.libraries,
-        "loader_libraries",
-        &mut *send,
-    )
-    .await
-    {
-        cleanup_incomplete_version(library_dir, &installed_version_id);
-        return Err(LoaderError::Other(format!(
-            "downloading {} libraries: {error}",
-            plan.record.component_name
-        )));
-    }
+        &installed_version_id,
+    )?;
+    cleanup_on_error(
+        download_libraries(
+            library_dir,
+            &extracted.libraries,
+            "loader_libraries",
+            &mut *send,
+        )
+        .await
+        .map_err(|error| {
+            LoaderError::Other(format!(
+                "downloading {} libraries: {error}",
+                plan.record.component_name
+            ))
+        }),
+        library_dir,
+        &installed_version_id,
+    )?;
 
     if let Some(install_profile_json) = extracted.install_profile_json.as_deref() {
         send(progress(
@@ -178,43 +204,52 @@ where
             1,
             Some("Running processors...".to_string()),
         ));
-        if let Err(error) = run_processors(
+        cleanup_on_error(
+            run_processors(
+                library_dir,
+                &plan.record.minecraft_version,
+                install_profile_json,
+                &installer_data,
+                &plan.stage_dir,
+                &installer_path,
+                |current, total, detail| {
+                    send(DownloadProgress {
+                        phase: "processors".to_string(),
+                        current: current as i32,
+                        total: total as i32,
+                        file: Some(detail),
+                        error: None,
+                        done: false,
+                    });
+                },
+            )
+            .await
+            .map_err(|error| {
+                LoaderError::Other(format!(
+                    "running {} processors: {error}",
+                    plan.record.component_name
+                ))
+            }),
             library_dir,
-            &plan.record.minecraft_version,
-            install_profile_json,
-            &installer_data,
-            &plan.stage_dir,
-            &installer_path,
-            |current, total, detail| {
-                send(DownloadProgress {
-                    phase: "processors".to_string(),
-                    current: current as i32,
-                    total: total as i32,
-                    file: Some(detail),
-                    error: None,
-                    done: false,
-                });
-            },
-        )
-        .await
-        {
-            cleanup_incomplete_version(library_dir, &installed_version_id);
-            return Err(LoaderError::Other(format!(
-                "running {} processors: {error}",
-                plan.record.component_name
-            )));
-        }
+            &installed_version_id,
+        )?;
     }
 
-    verify_install(library_dir, &installed_version_id).inspect_err(|_| {
-        cleanup_incomplete_version(library_dir, &installed_version_id);
-    })?;
-    ensure_launcher_profiles(library_dir, &installed_version_id).inspect_err(|_| {
-        cleanup_incomplete_version(library_dir, &installed_version_id);
-    })?;
-    finalize_version_install(library_dir, &installed_version_id).inspect_err(|_| {
-        cleanup_incomplete_version(library_dir, &installed_version_id);
-    })?;
+    cleanup_on_error(
+        verify_install(library_dir, &installed_version_id),
+        library_dir,
+        &installed_version_id,
+    )?;
+    cleanup_on_error(
+        ensure_launcher_profiles(library_dir, &installed_version_id),
+        library_dir,
+        &installed_version_id,
+    )?;
+    cleanup_on_error(
+        finalize_version_install(library_dir, &installed_version_id),
+        library_dir,
+        &installed_version_id,
+    )?;
     send(done());
     Ok(installed_version_id)
 }
@@ -262,27 +297,40 @@ where
         &plan.record.version_id,
         &fragment,
     )?;
-    write_composed_version(
+    cleanup_on_error(
+        write_composed_version(
+            library_dir,
+            &plan.record.version_id,
+            &version,
+            &plan.record.minecraft_version,
+        ),
         library_dir,
         &plan.record.version_id,
-        &version,
-        &plan.record.minecraft_version,
     )?;
 
     let version_jar = versions_dir(library_dir)
         .join(&plan.record.version_id)
         .join(format!("{}.jar", plan.record.version_id));
-    fs::write(&version_jar, archive_data)?;
-
-    verify_install(library_dir, &plan.record.version_id).inspect_err(|_| {
-        cleanup_incomplete_version(library_dir, &plan.record.version_id);
-    })?;
-    ensure_launcher_profiles(library_dir, &plan.record.version_id).inspect_err(|_| {
-        cleanup_incomplete_version(library_dir, &plan.record.version_id);
-    })?;
-    finalize_version_install(library_dir, &plan.record.version_id).inspect_err(|_| {
-        cleanup_incomplete_version(library_dir, &plan.record.version_id);
-    })?;
+    cleanup_on_error(
+        fs::write(&version_jar, archive_data),
+        library_dir,
+        &plan.record.version_id,
+    )?;
+    cleanup_on_error(
+        verify_install(library_dir, &plan.record.version_id),
+        library_dir,
+        &plan.record.version_id,
+    )?;
+    cleanup_on_error(
+        ensure_launcher_profiles(library_dir, &plan.record.version_id),
+        library_dir,
+        &plan.record.version_id,
+    )?;
+    cleanup_on_error(
+        finalize_version_install(library_dir, &plan.record.version_id),
+        library_dir,
+        &plan.record.version_id,
+    )?;
     send(done());
     Ok(plan.record.version_id.clone())
 }
@@ -316,6 +364,14 @@ fn is_base_game_installed(library_dir: &Path, game_version: &str) -> bool {
     let jar_path = version_dir.join(format!("{game_version}.jar"));
     let marker_path = version_dir.join(".incomplete");
     json_path.is_file() && jar_path.is_file() && !marker_path.exists()
+}
+
+fn cleanup_on_error<T, E>(
+    result: Result<T, E>,
+    library_dir: &Path,
+    version_id: &str,
+) -> Result<T, E> {
+    result.inspect_err(|_| cleanup_incomplete_version(library_dir, version_id))
 }
 
 fn verify_install(library_dir: &Path, version_id: &str) -> Result<(), LoaderError> {
@@ -388,5 +444,42 @@ fn done() -> DownloadProgress {
         file: None,
         error: None,
         done: true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cleanup_on_error;
+    use crate::loaders::types::LoaderError;
+    use crate::paths::versions_dir;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn cleanup_on_error_removes_incomplete_version_dir() {
+        let root = temp_dir("cleanup-on-error");
+        let version_dir = versions_dir(&root).join("broken-loader");
+        fs::create_dir_all(&version_dir).expect("version dir");
+        fs::write(version_dir.join(".incomplete"), b"installing").expect("marker");
+
+        let result = cleanup_on_error::<(), _>(
+            Err(LoaderError::Verify("broken".to_string())),
+            &root,
+            "broken-loader",
+        );
+
+        assert!(result.is_err());
+        assert!(!version_dir.exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn temp_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or_default();
+        std::env::temp_dir().join(format!("croopor-{prefix}-{nanos:x}"))
     }
 }

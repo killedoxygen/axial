@@ -28,17 +28,7 @@ pub fn is_terminal_state(state: LaunchState) -> bool {
 }
 
 pub fn failure_class_name(class: LaunchFailureClass) -> &'static str {
-    match class {
-        LaunchFailureClass::Unknown => "unknown",
-        LaunchFailureClass::JvmUnsupportedOption => "jvm_unsupported_option",
-        LaunchFailureClass::JvmExperimentalUnlock => "jvm_experimental_unlock_required",
-        LaunchFailureClass::JvmOptionOrdering => "jvm_option_ordering",
-        LaunchFailureClass::JavaRuntimeMismatch => "java_runtime_mismatch",
-        LaunchFailureClass::ClasspathModuleConflict => "classpath_or_module_conflict",
-        LaunchFailureClass::AuthModeIncompatible => "auth_mode_incompatible",
-        LaunchFailureClass::LoaderBootstrapFailure => "loader_bootstrap_failure",
-        LaunchFailureClass::StartupStalled => "startup_stalled",
-    }
+    class.as_str()
 }
 
 pub fn format_failure_class(class: LaunchFailureClass) -> &'static str {

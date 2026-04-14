@@ -23,17 +23,7 @@ pub(super) fn is_terminal_state(state: LaunchState) -> bool {
 }
 
 pub(super) fn parse_failure_class(raw: &str) -> LaunchFailureClass {
-    match raw {
-        "jvm_unsupported_option" => LaunchFailureClass::JvmUnsupportedOption,
-        "jvm_experimental_unlock_required" => LaunchFailureClass::JvmExperimentalUnlock,
-        "jvm_option_ordering" => LaunchFailureClass::JvmOptionOrdering,
-        "java_runtime_mismatch" => LaunchFailureClass::JavaRuntimeMismatch,
-        "classpath_or_module_conflict" => LaunchFailureClass::ClasspathModuleConflict,
-        "auth_mode_incompatible" => LaunchFailureClass::AuthModeIncompatible,
-        "loader_bootstrap_failure" => LaunchFailureClass::LoaderBootstrapFailure,
-        "startup_stalled" => LaunchFailureClass::StartupStalled,
-        _ => LaunchFailureClass::Unknown,
-    }
+    LaunchFailureClass::from_name(raw).unwrap_or(LaunchFailureClass::Unknown)
 }
 
 pub(super) fn boot_marker_detected(text: &str) -> bool {

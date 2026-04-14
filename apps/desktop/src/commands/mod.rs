@@ -165,7 +165,7 @@ fn snapshot_status(record: &LaunchSessionRecord) -> LaunchStatusEvent {
         failure_class: record
             .failure
             .as_ref()
-            .map(|failure| failure_class_name(failure.class).to_string()),
+            .map(|failure| failure.class.as_str().to_string()),
         failure_detail: record
             .failure
             .as_ref()
@@ -193,19 +193,5 @@ fn launch_state_name(state: LaunchState) -> &'static str {
         LaunchState::Degraded => "degraded",
         LaunchState::Failed => "failed",
         LaunchState::Exited => "exited",
-    }
-}
-
-fn failure_class_name(class: LaunchFailureClass) -> &'static str {
-    match class {
-        LaunchFailureClass::Unknown => "unknown",
-        LaunchFailureClass::JvmUnsupportedOption => "jvm_unsupported_option",
-        LaunchFailureClass::JvmExperimentalUnlock => "jvm_experimental_unlock_required",
-        LaunchFailureClass::JvmOptionOrdering => "jvm_option_ordering",
-        LaunchFailureClass::JavaRuntimeMismatch => "java_runtime_mismatch",
-        LaunchFailureClass::ClasspathModuleConflict => "classpath_or_module_conflict",
-        LaunchFailureClass::AuthModeIncompatible => "auth_mode_incompatible",
-        LaunchFailureClass::LoaderBootstrapFailure => "loader_bootstrap_failure",
-        LaunchFailureClass::StartupStalled => "startup_stalled",
     }
 }

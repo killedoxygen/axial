@@ -34,12 +34,14 @@ function describeFailureClass(failureClass: string | undefined): string {
   switch (failureClass) {
     case 'jvm_unsupported_option':
       return 'unsupported JVM option';
+    case 'jvm_experimental_unlock':
     case 'jvm_experimental_unlock_required':
       return 'experimental JVM option requires unlock';
     case 'jvm_option_ordering':
       return 'JVM option ordering conflict';
     case 'java_runtime_mismatch':
       return 'Java runtime mismatch';
+    case 'classpath_module_conflict':
     case 'classpath_or_module_conflict':
       return 'classpath or module conflict';
     case 'auth_mode_incompatible':
