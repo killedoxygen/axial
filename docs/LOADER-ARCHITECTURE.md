@@ -149,6 +149,7 @@ It prevents fake assumptions like:
 Current backend endpoints:
 
 - `GET /api/v1/loaders/components`
+- `GET /api/v1/loaders/components/{id}/game-versions`
 - `GET /api/v1/loaders/components/{id}/builds?mc_version=...`
 - `POST /api/v1/loaders/install`
 - `GET /api/v1/loaders/install/{id}/events`
@@ -166,8 +167,9 @@ The frontend is component-driven now.
 
 Selection flow:
 
-- pick a Minecraft version
 - pick a loader component
+- fetch supported Minecraft versions for that component
+- pick a Minecraft version from that supported set
 - fetch build records for that pair
 - pick a build record
 - create the instance with `build.version_id`
@@ -192,6 +194,7 @@ Frontend loader UI
   |
   v
 /api/v1/loaders/components
+/api/v1/loaders/components/{id}/game-versions
 /api/v1/loaders/components/{id}/builds
   |
   v

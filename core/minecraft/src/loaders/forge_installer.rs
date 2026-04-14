@@ -1,6 +1,6 @@
 use super::compose::LoaderProfileFragment;
 use crate::download::DownloadError;
-use crate::launch::Library;
+use crate::launch::{Library, merge_libraries_prefer_first};
 use crate::paths::libraries_dir;
 use serde::Deserialize;
 use std::fs;
@@ -72,10 +72,13 @@ pub fn extract_installer(jar_data: &[u8]) -> Result<ExtractedForgeInstaller, For
         .as_deref()
         .map(serde_json::from_slice::<InstallProfileLibraries>)
         .transpose()?;
-    let mut libraries = version.libraries.clone();
-    if let Some(info) = &install_info {
-        libraries.extend(info.libraries.clone());
-    }
+    let libraries = merge_libraries_prefer_first(
+        &version.libraries,
+        install_info
+            .as_ref()
+            .map(|info| info.libraries.as_slice())
+            .unwrap_or(&[]),
+    );
 
     Ok(ExtractedForgeInstaller {
         install_profile_json: install_profile,

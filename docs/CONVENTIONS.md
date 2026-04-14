@@ -36,6 +36,7 @@ keep this short and real. if the codebase changes, update this file.
 - launch/install progress uses sse in browser mode and the Tauri desktop event bridge on desktop
 - update checks go through `/api/v1/update`
 - loader selection uses component ids and build ids
+- loader version pickers must be driven by per-component supported Minecraft versions, not the vanilla catalog
 - route and frontend code must not inspect raw Fabric, Quilt, Forge, or NeoForge payloads
 
 ## Backend layout

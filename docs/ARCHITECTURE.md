@@ -50,9 +50,10 @@ Install:
 
 Loader install:
 1. frontend fetches loader components
-2. frontend fetches build records for `(component, mc_version)`
-3. frontend creates the instance with `build.version_id`
-4. frontend installs through `component_id + build_id`
+2. frontend fetches supported Minecraft versions for the selected component
+3. frontend fetches build records for `(component, mc_version)`
+4. frontend creates the instance with `build.version_id`
+5. frontend installs through `component_id + build_id`
 
 Launch:
 1. frontend posts to `/launch`

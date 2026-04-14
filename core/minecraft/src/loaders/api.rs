@@ -127,12 +127,28 @@ pub fn infer_build_from_version_id(
 }
 
 pub fn infer_neoforge_minecraft_version(loader_version: &str) -> Option<String> {
-    let mut parts = loader_version.splitn(3, '.');
-    let major = parts.next()?;
-    let minor = parts.next()?;
-    if major.is_empty() || minor.is_empty() {
-        return None;
+    let numeric_parts = loader_version
+        .split('.')
+        .map(|part| {
+            part.chars()
+                .take_while(|ch| ch.is_ascii_digit())
+                .collect::<String>()
+        })
+        .take_while(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+
+    let major = numeric_parts.first()?;
+    let minor = numeric_parts.get(1)?;
+    if major.parse::<u32>().ok()? >= 25 {
+        let mut parts = vec![major.clone(), minor.clone()];
+        if let Some(patch) = numeric_parts.get(2)
+            && patch != "0"
+        {
+            parts.push(patch.clone());
+        }
+        return Some(parts.join("."));
     }
+
     if minor == "0" {
         Some(format!("1.{major}"))
     } else {

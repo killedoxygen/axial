@@ -1,6 +1,6 @@
 use crate::launch::{
     ArgumentsSection, AssetIndex, Downloads, JavaVersion, Library, LoggingConf, VersionJson,
-    resolve_version,
+    merge_libraries_prefer_first, resolve_version,
 };
 use crate::paths::versions_dir;
 use serde::{Deserialize, Serialize};
@@ -110,11 +110,7 @@ pub fn compose_loader_version(
             .java_version
             .clone()
             .unwrap_or_else(|| base.java_version.clone()),
-        libraries: {
-            let mut libraries = fragment.libraries.clone();
-            libraries.extend(base.libraries.clone());
-            libraries
-        },
+        libraries: merge_libraries_prefer_first(&fragment.libraries, &base.libraries),
         logging: fragment.logging.clone().or_else(|| base.logging.clone()),
     };
 
@@ -271,6 +267,63 @@ mod tests {
                 .iter()
                 .any(|library| library.name == "net.fabricmc:fabric-loader:0.16.10")
         );
+        assert_eq!(
+            composed
+                .libraries
+                .iter()
+                .filter(|library| library.name.starts_with("org.ow2.asm:asm:"))
+                .count(),
+            0
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn composed_version_prefers_loader_library_over_base_duplicate() {
+        let root = temp_dir("compose-loader-version-dedup");
+        create_minecraft_dir(&root).expect("library");
+        let version_dir = root.join("versions").join("1.21.6");
+        fs::create_dir_all(&version_dir).expect("version dir");
+        fs::write(
+            version_dir.join("1.21.6.json"),
+            r#"{
+                "id":"1.21.6",
+                "type":"release",
+                "mainClass":"net.minecraft.client.main.Main",
+                "arguments":{"game":[],"jvm":[]},
+                "assetIndex":{"id":"1.21.6","url":"https://example.invalid/assets.json"},
+                "downloads":{"client":{"url":"https://example.invalid/client.jar"}},
+                "javaVersion":{"component":"java-runtime-gamma","majorVersion":21},
+                "libraries":[{"name":"org.ow2.asm:asm:9.6"}]
+            }"#,
+        )
+        .expect("base json");
+
+        let fragment = serde_json::from_str::<LoaderProfileFragment>(
+            r#"{
+                "id":"fabric-loader-0.16.10-1.21.6",
+                "inheritsFrom":"1.21.6",
+                "mainClass":"net.fabricmc.loader.impl.launch.knot.KnotClient",
+                "libraries":[
+                    {"name":"net.fabricmc:fabric-loader:0.16.10"},
+                    {"name":"org.ow2.asm:asm:9.9"}
+                ]
+            }"#,
+        )
+        .expect("fragment");
+
+        let composed =
+            compose_loader_version(&root, "1.21.6", "fabric-loader-0.16.10-1.21.6", &fragment)
+                .expect("compose");
+
+        let asm_libraries = composed
+            .libraries
+            .iter()
+            .filter(|library| library.name.starts_with("org.ow2.asm:asm:"))
+            .map(|library| library.name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(asm_libraries, vec!["org.ow2.asm:asm:9.9".to_string()]);
 
         let _ = fs::remove_dir_all(root);
     }

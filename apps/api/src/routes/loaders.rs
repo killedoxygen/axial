@@ -1,4 +1,6 @@
-use crate::dto::loaders::{LoaderBuildsResponse, LoaderComponentsResponse};
+use crate::dto::loaders::{
+    LoaderBuildsResponse, LoaderComponentsResponse, LoaderGameVersionsResponse,
+};
 use crate::install_runtime::prewarm_version_runtime;
 use crate::state::AppState;
 use axum::{
@@ -10,7 +12,7 @@ use axum::{
 };
 use croopor_minecraft::{
     DownloadProgress, LoaderComponentId, LoaderError, fetch_builds, fetch_components,
-    install_build, resolve_build_record,
+    fetch_supported_versions, install_build, resolve_build_record,
 };
 use serde::Deserialize;
 use std::{convert::Infallible, path::PathBuf, time::SystemTime};
@@ -33,6 +35,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/v1/loaders/components/{id}/builds",
             get(handle_loader_builds),
+        )
+        .route(
+            "/api/v1/loaders/components/{id}/game-versions",
+            get(handle_loader_game_versions),
         )
         .route("/api/v1/loaders/install", post(handle_loader_install))
         .route(
@@ -74,6 +80,24 @@ async fn handle_loader_builds(
     .await
     {
         Ok((builds, catalog)) => Ok(Json(LoaderBuildsResponse { builds, catalog })),
+        Err(error) => Err(error_response(error)),
+    }
+}
+
+async fn handle_loader_game_versions(
+    Path(component_id): Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<LoaderGameVersionsResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let component_id = parse_component_id(&component_id)?;
+    let library_dir = state.library_dir().ok_or_else(|| {
+        (
+            StatusCode::PRECONDITION_FAILED,
+            Json(serde_json::json!({ "error": "Croopor library is not configured" })),
+        )
+    })?;
+
+    match fetch_supported_versions(PathBuf::from(library_dir).as_path(), component_id).await {
+        Ok((versions, catalog)) => Ok(Json(LoaderGameVersionsResponse { versions, catalog })),
         Err(error) => Err(error_response(error)),
     }
 }

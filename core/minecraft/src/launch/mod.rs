@@ -1,7 +1,7 @@
 use crate::paths::{libraries_dir, versions_dir};
 use crate::rules::{Environment, Rule, evaluate_rules, is_native_library};
 use serde::{Deserialize, Deserializer, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -312,8 +312,13 @@ pub fn resolve_libraries(
 ) -> Vec<ResolvedLibrary> {
     let lib_dir = libraries_dir(mc_dir);
     let mut resolved = Vec::new();
+    let mut seen_libraries = HashSet::new();
 
     for lib in &version.libraries {
+        if !seen_libraries.insert(library_merge_key(&lib.name)) {
+            continue;
+        }
+
         if !evaluate_rules(&lib.rules, env) {
             continue;
         }
@@ -568,10 +573,7 @@ fn merge_versions(parent: &VersionJson, child: &VersionJson) -> VersionJson {
         logging: child.logging.clone().or_else(|| parent.logging.clone()),
     };
 
-    let mut libraries = Vec::with_capacity(child.libraries.len() + parent.libraries.len());
-    libraries.extend(child.libraries.clone());
-    libraries.extend(parent.libraries.clone());
-    merged.libraries = libraries;
+    merged.libraries = merge_libraries_prefer_first(&child.libraries, &parent.libraries);
 
     if parent.arguments.is_some() || child.arguments.is_some() {
         let mut arguments = ArgumentsSection::default();
@@ -587,6 +589,35 @@ fn merge_versions(parent: &VersionJson, child: &VersionJson) -> VersionJson {
     }
 
     merged
+}
+
+pub fn merge_libraries_prefer_first(preferred: &[Library], fallback: &[Library]) -> Vec<Library> {
+    let mut seen = HashSet::new();
+    let mut merged = Vec::with_capacity(preferred.len() + fallback.len());
+
+    for library in preferred.iter().chain(fallback.iter()) {
+        let key = library_merge_key(&library.name);
+        if !seen.insert(key) {
+            continue;
+        }
+        merged.push(library.clone());
+    }
+
+    merged
+}
+
+pub(crate) fn library_merge_key(name: &str) -> String {
+    let parts = name.split(':').collect::<Vec<_>>();
+    if parts.len() < 2 {
+        return name.to_string();
+    }
+
+    let mut key = format!("{}:{}", parts[0], parts[1]);
+    if let Some(classifier) = parts.get(3) {
+        key.push(':');
+        key.push_str(classifier);
+    }
+    key
 }
 
 fn merge_java_version(parent: &JavaVersion, child: &JavaVersion) -> JavaVersion {
@@ -972,6 +1003,67 @@ mod tests {
             candidates
                 .iter()
                 .any(|candidate| candidate == "natives-windows")
+        );
+    }
+
+    #[test]
+    fn merge_libraries_prefers_child_version_for_same_artifact() {
+        let merged = merge_libraries_prefer_first(
+            &[Library {
+                name: "org.ow2.asm:asm:9.9".to_string(),
+                ..Library::default()
+            }],
+            &[Library {
+                name: "org.ow2.asm:asm:9.6".to_string(),
+                ..Library::default()
+            }],
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].name, "org.ow2.asm:asm:9.9");
+    }
+
+    #[test]
+    fn merge_libraries_keeps_distinct_classifiers() {
+        let merged = merge_libraries_prefer_first(
+            &[
+                Library {
+                    name: "org.lwjgl:lwjgl:3.3.3".to_string(),
+                    ..Library::default()
+                },
+                Library {
+                    name: "org.lwjgl:lwjgl:3.3.3:natives-windows".to_string(),
+                    ..Library::default()
+                },
+            ],
+            &[],
+        );
+
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn resolve_libraries_skips_duplicate_artifact_versions_from_existing_manifest() {
+        let mut version = default_version();
+        version.libraries = vec![
+            Library {
+                name: "org.ow2.asm:asm:9.9".to_string(),
+                ..Library::default()
+            },
+            Library {
+                name: "org.ow2.asm:asm:9.6".to_string(),
+                ..Library::default()
+            },
+        ];
+
+        let env = default_environment();
+        let resolved = resolve_libraries(&version, Path::new("/tmp/croopor"), &env);
+        assert_eq!(resolved.len(), 1);
+        assert!(
+            resolved[0]
+                .abs_path
+                .to_string_lossy()
+                .contains("org/ow2/asm/asm/9.9/asm-9.9.jar")
         );
     }
 }

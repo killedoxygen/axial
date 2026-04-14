@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const CATALOG_SCHEMA_VERSION: u32 = 4;
+const CATALOG_SCHEMA_VERSION: u32 = 5;
 
 pub async fn resolve_cached<T, F, Fut>(
     cache_path: PathBuf,

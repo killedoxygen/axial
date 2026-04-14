@@ -74,12 +74,65 @@ pub fn minecraft_version_at_least(version: &str, target: &[u32]) -> bool {
 }
 
 pub fn neoforge_to_minecraft_version(version: &str) -> Option<String> {
-    let mut parts = version.splitn(3, '.');
-    let major = parts.next()?;
-    let minor = parts.next()?;
+    let numeric_parts = version
+        .split('.')
+        .map(|part| {
+            part.chars()
+                .take_while(|ch| ch.is_ascii_digit())
+                .collect::<String>()
+        })
+        .take_while(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+
+    let major = numeric_parts.first()?;
+    let minor = numeric_parts.get(1)?;
+
+    if major.parse::<u32>().ok()? >= 25 {
+        let mut parts = vec![major.clone(), minor.clone()];
+        if let Some(patch) = numeric_parts.get(2)
+            && patch != "0"
+        {
+            parts.push(patch.clone());
+        }
+        return Some(parts.join("."));
+    }
+
     if minor == "0" {
         Some(format!("1.{major}"))
     } else {
         Some(format!("1.{major}.{minor}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::neoforge_to_minecraft_version;
+
+    #[test]
+    fn maps_legacy_neoforge_versions_to_one_prefixed_minecraft_versions() {
+        assert_eq!(
+            neoforge_to_minecraft_version("21.0.167"),
+            Some("1.21".to_string())
+        );
+        assert_eq!(
+            neoforge_to_minecraft_version("21.11.5-beta"),
+            Some("1.21.11".to_string())
+        );
+        assert_eq!(
+            neoforge_to_minecraft_version("20.4.239"),
+            Some("1.20.4".to_string())
+        );
+    }
+
+    #[test]
+    fn maps_year_based_neoforge_versions_without_one_prefix() {
+        assert_eq!(
+            neoforge_to_minecraft_version("26.1.0.7-beta"),
+            Some("26.1".to_string())
+        );
+        assert_eq!(
+            neoforge_to_minecraft_version("26.1.2.7-beta"),
+            Some("26.1.2".to_string())
+        );
     }
 }

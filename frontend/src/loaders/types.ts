@@ -5,4 +5,6 @@ export type {
   LoaderComponentId,
   LoaderComponentRecord,
   LoaderComponentsResponse,
+  LoaderGameVersion,
+  LoaderGameVersionsResponse,
 } from '../types';

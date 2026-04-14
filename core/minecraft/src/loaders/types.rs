@@ -157,7 +157,7 @@ pub struct CachedCatalog<T> {
 impl<T> CachedCatalog<T> {
     pub fn new(value: T) -> Self {
         Self {
-            schema_version: 4,
+            schema_version: 5,
             fetched_at_ms: Utc::now().timestamp_millis(),
             value,
         }

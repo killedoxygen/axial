@@ -265,6 +265,16 @@ export interface LoaderBuildsResponse {
   catalog: LoaderCatalogState;
 }
 
+export interface LoaderGameVersion {
+  version: string;
+  stable: boolean;
+}
+
+export interface LoaderGameVersionsResponse {
+  versions: LoaderGameVersion[];
+  catalog: LoaderCatalogState;
+}
+
 export interface LoaderComponentsResponse {
   components: LoaderComponentRecord[];
 }

@@ -193,18 +193,37 @@ fn infer_loader_base_version(id: &str) -> Option<String> {
 }
 
 fn neoforge_to_mc_version(version: &str) -> String {
-    let mut parts = version.splitn(3, '.');
-    let Some(major) = parts.next() else {
+    let numeric_parts = version
+        .split('.')
+        .map(|part| {
+            part.chars()
+                .take_while(|ch| ch.is_ascii_digit())
+                .collect::<String>()
+        })
+        .take_while(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let Some(major) = numeric_parts.first() else {
         return String::new();
     };
-    let Some(minor) = parts.next() else {
+    let Some(minor) = numeric_parts.get(1) else {
         return String::new();
     };
-    if minor == "0" {
-        format!("1.{major}")
-    } else {
-        format!("1.{major}.{minor}")
+
+    if major.parse::<u32>().ok().is_some_and(|value| value >= 25) {
+        let mut parts = vec![major.clone(), minor.clone()];
+        if let Some(patch) = numeric_parts.get(2)
+            && patch != "0"
+        {
+            parts.push(patch.clone());
+        }
+        return parts.join(".");
     }
+
+    if minor == "0" {
+        return format!("1.{major}");
+    }
+
+    format!("1.{major}.{minor}")
 }
 
 fn compare_version_entries(left: &VersionEntry, right: &VersionEntry) -> Ordering {

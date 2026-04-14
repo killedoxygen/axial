@@ -10,7 +10,7 @@ import { showError, esc, parseVersionDisplay, errMessage } from '../utils';
 import { installVersion, installLoaderVersion } from '../install';
 import { createNewInstanceLoaderMachine } from '../machines/new-instance-loader';
 import type {
-  CatalogVersion, LoaderBuildRecord, LoaderComponentId, LoaderComponentRecord,
+  CatalogVersion, LoaderBuildRecord, LoaderComponentId, LoaderComponentRecord, LoaderGameVersion,
 } from '../types';
 
 export const showNewInstanceModal = signal(false);
@@ -23,6 +23,10 @@ const FILTER_CHIPS: { value: string; label: string }[] = [
   { value: 'old_beta', label: 'Beta' },
   { value: 'old_alpha', label: 'Alpha' },
 ];
+
+type VersionListEntry = CatalogVersion & {
+  stable?: boolean;
+};
 
 function defaultName(): string {
   const base = 'Instance';
@@ -44,6 +48,27 @@ function validateName(name: string): string | null {
   return null;
 }
 
+function inferLoaderVersionType(version: LoaderGameVersion, catalogVersion?: CatalogVersion): string {
+  if (catalogVersion?.type) return catalogVersion.type;
+  if (version.version.startsWith('b')) return 'old_beta';
+  if (version.version.startsWith('a')) return 'old_alpha';
+  return version.stable ? 'release' : 'snapshot';
+}
+
+function toLoaderVersionEntry(
+  version: LoaderGameVersion,
+  catalogVersion?: CatalogVersion,
+): VersionListEntry {
+  return {
+    id: version.version,
+    type: inferLoaderVersionType(version, catalogVersion),
+    release_time: catalogVersion?.release_time ?? '',
+    url: catalogVersion?.url ?? '',
+    installed: false,
+    stable: version.stable,
+  };
+}
+
 export function NewInstanceModal(): JSX.Element | null {
   const isOpen = showNewInstanceModal.value;
 
@@ -63,12 +88,22 @@ export function NewInstanceModal(): JSX.Element | null {
   const loaderMachine = loaderMachineRef.current;
   const loaderState = loaderMachine.state;
   const loaderEnabled = loaderState.value.kind !== 'disabled';
-  const loaderLoading = loaderState.value.kind === 'loading_components' || loaderState.value.kind === 'loading_builds';
+  const loaderVersionListLoading = loaderState.value.kind === 'loading_components'
+    || loaderState.value.kind === 'loading_versions';
+  const loaderBuildLoading = loaderState.value.kind === 'loading_builds';
   const loaderComponents: LoaderComponentRecord[] | null = loaderState.value.context.components;
+  const loaderSupportedVersions = loaderState.value.context.supportedVersions;
   const selectedLoader = loaderState.value.context.selectedComponentId;
   const loaderBuilds: LoaderBuildRecord[] | null = loaderState.value.context.builds;
   const selectedLoaderBuildId: string | null = loaderState.value.context.selectedBuildId;
-  const loaderError = loaderState.value.kind === 'error' ? loaderState.value.context.errorMessage : null;
+  const loaderVersionError = loaderState.value.kind === 'error'
+    && (loaderState.value.stage === 'components' || loaderState.value.stage === 'versions')
+    ? loaderState.value.context.errorMessage
+    : null;
+  const loaderBuildError = loaderState.value.kind === 'error'
+    && loaderState.value.stage === 'builds'
+    ? loaderState.value.context.errorMessage
+    : null;
   const selectedLoaderBuild = loaderBuilds?.find((build) => build.build_id === selectedLoaderBuildId) ?? null;
 
   // Reset modal state on each open, then ensure catalog exists
@@ -107,9 +142,9 @@ export function NewInstanceModal(): JSX.Element | null {
   }, [isOpen]);
 
   const allVersions: CatalogVersion[] = catalog.value?.versions ?? [];
+  const catalogById = useMemo(() => new Map(allVersions.map((version) => [version.id, version])), [allVersions]);
 
-  // Filter versions
-  const filteredVersions = useMemo(() => {
+  const filteredCatalogVersions = useMemo(() => {
     let next = allVersions.filter(v => v.type === filter.value);
     if (search.value) {
       const q = search.value.toLowerCase();
@@ -120,6 +155,26 @@ export function NewInstanceModal(): JSX.Element | null {
     }
     return next;
   }, [allVersions, filter.value, search.value]);
+
+  const filteredLoaderVersions = useMemo(() => {
+    if (!loaderSupportedVersions) return [];
+
+    let next = loaderSupportedVersions
+      .map((version) => toLoaderVersionEntry(version, catalogById.get(version.version)))
+      .filter((version) => version.type === filter.value);
+
+    if (search.value) {
+      const q = search.value.toLowerCase();
+      next = next.filter((version) => {
+        const pd = parseVersionDisplay(version.id, version, allVersions);
+        return version.id.toLowerCase().includes(q) || pd.name.toLowerCase().includes(q);
+      });
+    }
+
+    return next;
+  }, [allVersions, catalogById, filter.value, loaderSupportedVersions, search.value]);
+
+  const visibleVersions = loaderEnabled ? filteredLoaderVersions : filteredCatalogVersions;
 
   const loaderInstalledFor = useMemo(() => {
     if (!loaderEnabled) return null;
@@ -134,10 +189,10 @@ export function NewInstanceModal(): JSX.Element | null {
     return set;
   }, [loaderEnabled, selectedLoader, versions.value]);
 
-  const total = filteredVersions.length;
+  const total = visibleVersions.length;
   const totalPages = Math.ceil(total / PAGE_SIZE);
   const start = page.value * PAGE_SIZE;
-  const display = filteredVersions.slice(start, start + PAGE_SIZE);
+  const display = visibleVersions.slice(start, start + PAGE_SIZE);
 
   if (!isOpen) return null;
 
@@ -161,18 +216,25 @@ export function NewInstanceModal(): JSX.Element | null {
   };
 
   useEffect(() => {
-    if (filteredVersions.length === 0) {
+    if (visibleVersions.length === 0) {
       selectedVersionId.value = null;
       return;
     }
-    if (selectedVersionId.value && filteredVersions.some((version) => version.id === selectedVersionId.value)) return;
+    if (selectedVersionId.value && visibleVersions.some((version) => version.id === selectedVersionId.value)) return;
 
-    const nextId = filteredVersions[0].id;
+    const nextId = visibleVersions[0].id;
     selectedVersionId.value = nextId;
     if (isAutoName(name.value.trim())) name.value = defaultName();
     nameError.value = null;
     if (loaderEnabled) void loaderMachine.changeMcVersion(nextId);
-  }, [filteredVersions, loaderEnabled]);
+  }, [visibleVersions, loaderEnabled]);
+
+  useEffect(() => {
+    if (!loaderEnabled || selectedLoader === null || display.length === 0) {
+      return;
+    }
+    loaderMachine.prefetchBuilds(display.map((version) => version.id));
+  }, [loaderEnabled, selectedLoader, display]);
 
   const handleNameInput = (e: JSX.TargetedEvent<HTMLInputElement>) => {
     name.value = e.currentTarget.value;
@@ -210,9 +272,9 @@ export function NewInstanceModal(): JSX.Element | null {
       await loaderMachine.enable(selectedVersionId.value);
     } else {
       loaderMachine.disable();
+      autoSelectFirstVersion(allVersions.filter(v => v.type === filter.value), false);
     }
     page.value = 0;
-    autoSelectFirstVersion(allVersions.filter(v => v.type === filter.value), enabled);
   };
 
   const handleLoaderChange = async (e: JSX.TargetedEvent<HTMLSelectElement>) => {
@@ -221,7 +283,6 @@ export function NewInstanceModal(): JSX.Element | null {
       selectedVersionId.value,
     );
     page.value = 0;
-    autoSelectFirstVersion(allVersions.filter(v => v.type === filter.value), true);
     Sound.ui('soft');
   };
 
@@ -329,9 +390,12 @@ export function NewInstanceModal(): JSX.Element | null {
                     class="ni-loader-select"
                     autocomplete="off"
                     value={selectedLoaderBuildId ?? ''}
-                    disabled={loaderBuilds === null || loaderBuilds.length === 0}
+                    disabled={loaderBuildLoading || loaderBuilds === null || loaderBuilds.length === 0}
                     onChange={(event) => loaderMachine.selectBuild(event.currentTarget.value)}
                   >
+                    {loaderBuildLoading && (
+                      <option value="">Loading builds...</option>
+                    )}
                     {(loaderBuilds ?? []).map(build => (
                       <option key={build.build_id} value={build.build_id}>
                         {build.loader_version}{build.recommended ? ' (recommended)' : build.latest ? ' (latest)' : ''}
@@ -344,6 +408,9 @@ export function NewInstanceModal(): JSX.Element | null {
                 <span class="ni-loader-info">{loaderInfoText}</span>
               )}
             </div>
+            {loaderBuildError && (
+              <div style="font-size:11px;color:var(--red);margin-top:6px">{loaderBuildError}</div>
+            )}
           </div>
 
           {/* Version */}
@@ -371,13 +438,13 @@ export function NewInstanceModal(): JSX.Element | null {
               ))}
             </div>
             <div class="ni-version-list">
-              {loaderLoading ? (
+              {loaderVersionListLoading ? (
                 <div style="padding:12px;text-align:center;color:var(--text-muted);font-size:12px">
                   Loading versions...
                 </div>
-              ) : loaderError ? (
+              ) : loaderVersionError ? (
                 <div style="padding:12px;text-align:center;color:var(--red);font-size:12px">
-                  {loaderError}
+                  {loaderVersionError}
                 </div>
               ) : display.length === 0 ? (
                 <div style="padding:12px;text-align:center;color:var(--text-muted);font-size:12px">

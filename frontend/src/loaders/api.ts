@@ -6,9 +6,12 @@ import type {
   LoaderComponentId,
   LoaderComponentRecord,
   LoaderComponentsResponse,
+  LoaderGameVersion,
+  LoaderGameVersionsResponse,
 } from './types';
 
 let componentsCache: LoaderComponentRecord[] | null = null;
+let supportedVersionsCache: Record<string, LoaderGameVersion[]> = {};
 let buildsCache: Record<string, LoaderBuildRecord[]> = {};
 
 export async function fetchLoaderComponents(): Promise<LoaderComponentRecord[]> {
@@ -34,6 +37,20 @@ export async function fetchLoaderBuilds(
   if (res.error) throw new Error(res.error);
   buildsCache[key] = res.builds || [];
   return buildsCache[key];
+}
+
+export async function fetchLoaderSupportedVersions(
+  componentId: LoaderComponentId,
+): Promise<LoaderGameVersion[]> {
+  if (supportedVersionsCache[componentId]) return supportedVersionsCache[componentId];
+
+  const res = await api(
+    'GET',
+    `/loaders/components/${encodeURIComponent(componentId)}/game-versions`,
+  ) as LoaderGameVersionsResponse & { error?: string };
+  if (res.error) throw new Error(res.error);
+  supportedVersionsCache[componentId] = res.versions || [];
+  return supportedVersionsCache[componentId];
 }
 
 export async function startLoaderInstall(
@@ -80,5 +97,6 @@ export function connectLoaderInstallSSE(
 
 export function clearLoaderCaches(): void {
   componentsCache = null;
+  supportedVersionsCache = {};
   buildsCache = {};
 }
