@@ -49,9 +49,7 @@ async fn handle_launch_events(
     Path(id): Path<String>,
 ) -> Result<
     axum::response::sse::Sse<
-        impl futures_util::Stream<
-            Item = Result<axum::response::sse::Event, std::convert::Infallible>,
-        >,
+        impl futures_util::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
     >,
     (StatusCode, Json<serde_json::Value>),
 > {

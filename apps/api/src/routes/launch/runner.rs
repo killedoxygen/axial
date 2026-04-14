@@ -2,9 +2,8 @@ use crate::logging::append_trace;
 use crate::state::{AppState, LaunchStatusEvent, StartupOutcome};
 use croopor_config::{AppConfig, Instance};
 use croopor_launcher::{
-    LaunchFailureClass, LaunchState, RecoveryAction, build_healing_summary,
-    failure_class_name, format_failure_class, launch_state_name, prepare_launch_attempt,
-    recovery_for_failure,
+    LaunchFailureClass, LaunchState, RecoveryAction, build_healing_summary, failure_class_name,
+    format_failure_class, launch_state_name, prepare_launch_attempt, recovery_for_failure,
 };
 use serde_json::Value;
 use tokio::process::Command;
@@ -362,8 +361,6 @@ fn persist_launch_metadata(
     let _ = state.config().update(next);
 }
 
-fn serialize_healing(
-    healing: Option<croopor_launcher::LaunchHealingSummary>,
-) -> Option<Value> {
+fn serialize_healing(healing: Option<croopor_launcher::LaunchHealingSummary>) -> Option<Value> {
     healing.and_then(|value| serde_json::to_value(value).ok())
 }

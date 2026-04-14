@@ -40,9 +40,10 @@ pub(super) fn spawn_wait_task(
     tokio::spawn(async move {
         let status = child.lock().await.wait().await;
         let existing = store.get(&session_id).await;
-        if existing.as_ref().is_some_and(|record| {
-            record.state == LaunchState::Exited && record.failure.is_some()
-        }) {
+        if existing
+            .as_ref()
+            .is_some_and(|record| record.state == LaunchState::Exited && record.failure.is_some())
+        {
             return;
         }
         match status {

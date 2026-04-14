@@ -10,8 +10,8 @@ use crate::types::LaunchFailureClass;
 use serde::{Deserialize, Serialize};
 
 pub use healing::{
-    HealingSummaryInput, build_healing_summary, conservative_healing_preset,
-    infer_loader, recovery_for_failure,
+    HealingSummaryInput, build_healing_summary, conservative_healing_preset, infer_loader,
+    recovery_for_failure,
 };
 pub use mapping::{
     failure_class_name, format_failure_class, is_terminal_state, is_terminal_status,

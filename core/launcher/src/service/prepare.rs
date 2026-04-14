@@ -1,7 +1,6 @@
 use super::{
     AttemptOverrides, HealingSummaryInput, LaunchIntent, LaunchPreparationError,
-    LaunchPreparationMetrics, PreparedLaunchAttempt,
-    build_healing_summary, infer_loader,
+    LaunchPreparationMetrics, PreparedLaunchAttempt, build_healing_summary, infer_loader,
 };
 use crate::build::{VanillaLaunchRequest, plan_resolved_launch};
 use crate::jvm::{boot_throttle_args, gc_preset_args, resolve_preset};
@@ -87,9 +86,10 @@ pub async fn prepare_launch_attempt(
                 }),
             });
         }
-        if let Err((class, message)) =
-            super::validation::validate_manual_jvm_args(&intent.extra_jvm_args, &runtime.effective_info)
-        {
+        if let Err((class, message)) = super::validation::validate_manual_jvm_args(
+            &intent.extra_jvm_args,
+            &runtime.effective_info,
+        ) {
             return Err(LaunchPreparationError {
                 message,
                 failure_class: Some(class),

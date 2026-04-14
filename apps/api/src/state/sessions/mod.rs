@@ -187,8 +187,14 @@ impl SessionStore {
         )
         .await;
 
-        supervisor::spawn_output_tasks(self.clone(), session_id.clone(), child_handle.clone()).await;
-        supervisor::spawn_startup_watchdog(self.clone(), session_id.clone(), child_handle.clone(), startup_observed);
+        supervisor::spawn_output_tasks(self.clone(), session_id.clone(), child_handle.clone())
+            .await;
+        supervisor::spawn_startup_watchdog(
+            self.clone(),
+            session_id.clone(),
+            child_handle.clone(),
+            startup_observed,
+        );
         supervisor::spawn_wait_task(self.clone(), session_id, child_handle);
 
         Ok(record)
