@@ -153,7 +153,8 @@ fn resolve_java_version(id: &str, stubs: &HashMap<String, VersionStub>) -> JavaV
         current = stubs.get(&next_parent);
     }
 
-    if !fallback_parent.is_empty() && fallback_parent != id
+    if !fallback_parent.is_empty()
+        && fallback_parent != id
         && let Some(stub) = stubs.get(&fallback_parent)
         && let Some(java_version) = &stub.java_version
     {
