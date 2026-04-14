@@ -139,17 +139,22 @@ pub fn scan_versions(mc_dir: &Path) -> std::io::Result<Vec<VersionEntry>> {
 }
 
 fn resolve_java_version(id: &str, stubs: &HashMap<String, VersionStub>) -> JavaVersionStub {
-    let mut current = stubs.get(id);
+    let mut current_id = id.to_string();
+    let mut current = stubs.get(&current_id);
     let mut fallback_parent = String::new();
     while let Some(stub) = current {
         if let Some(java_version) = &stub.java_version {
             return java_version.clone();
         }
-        let next_parent = effective_parent_version(id, &stub.inherits_from);
+        let next_parent = effective_parent_version(&current_id, &stub.inherits_from);
         if next_parent.is_empty() {
             break;
         }
+        if next_parent == current_id {
+            break;
+        }
         fallback_parent = next_parent.clone();
+        current_id = next_parent.clone();
         current = stubs.get(&next_parent);
     }
 
@@ -282,4 +287,41 @@ fn split_version_parts(version: &str) -> Vec<String> {
     }
 
     parts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{JavaVersionStub, VersionStub, resolve_java_version};
+    use std::collections::HashMap;
+
+    #[test]
+    fn resolve_java_version_follows_current_parent_chain_for_loader_versions() {
+        let mut stubs = HashMap::new();
+        stubs.insert(
+            "fabric-loader-0.14.21-1.20.1".to_string(),
+            VersionStub {
+                kind: "release".to_string(),
+                release_time: String::new(),
+                inherits_from: String::new(),
+                java_version: None,
+            },
+        );
+        stubs.insert(
+            "1.20.1".to_string(),
+            VersionStub {
+                kind: "release".to_string(),
+                release_time: String::new(),
+                inherits_from: String::new(),
+                java_version: Some(JavaVersionStub {
+                    component: "java-runtime-gamma".to_string(),
+                    major_version: 17,
+                }),
+            },
+        );
+
+        let resolved = resolve_java_version("fabric-loader-0.14.21-1.20.1", &stubs);
+
+        assert_eq!(resolved.component, "java-runtime-gamma");
+        assert_eq!(resolved.major_version, 17);
+    }
 }

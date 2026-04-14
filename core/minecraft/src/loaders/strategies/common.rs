@@ -205,9 +205,15 @@ where
         }
     }
 
-    verify_install(library_dir, &installed_version_id)?;
-    finalize_version_install(library_dir, &installed_version_id)?;
-    ensure_launcher_profiles(library_dir, &installed_version_id)?;
+    verify_install(library_dir, &installed_version_id).inspect_err(|_| {
+        cleanup_incomplete_version(library_dir, &installed_version_id);
+    })?;
+    finalize_version_install(library_dir, &installed_version_id).inspect_err(|_| {
+        cleanup_incomplete_version(library_dir, &installed_version_id);
+    })?;
+    ensure_launcher_profiles(library_dir, &installed_version_id).inspect_err(|_| {
+        cleanup_incomplete_version(library_dir, &installed_version_id);
+    })?;
     send(done());
     Ok(installed_version_id)
 }
@@ -267,9 +273,15 @@ where
         .join(format!("{}.jar", plan.record.version_id));
     fs::write(&version_jar, archive_data)?;
 
-    verify_install(library_dir, &plan.record.version_id)?;
-    finalize_version_install(library_dir, &plan.record.version_id)?;
-    ensure_launcher_profiles(library_dir, &plan.record.version_id)?;
+    verify_install(library_dir, &plan.record.version_id).inspect_err(|_| {
+        cleanup_incomplete_version(library_dir, &plan.record.version_id);
+    })?;
+    finalize_version_install(library_dir, &plan.record.version_id).inspect_err(|_| {
+        cleanup_incomplete_version(library_dir, &plan.record.version_id);
+    })?;
+    ensure_launcher_profiles(library_dir, &plan.record.version_id).inspect_err(|_| {
+        cleanup_incomplete_version(library_dir, &plan.record.version_id);
+    })?;
     send(done());
     Ok(plan.record.version_id.clone())
 }
