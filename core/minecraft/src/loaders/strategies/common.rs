@@ -45,7 +45,7 @@ where
         library_dir,
         &fragment.libraries,
         "loader_libraries",
-        |progress| send(progress),
+        &mut *send,
     )
     .await
     {
@@ -159,7 +159,7 @@ where
         library_dir,
         &extracted.libraries,
         "loader_libraries",
-        |progress| send(progress),
+        &mut *send,
     )
     .await
     {

@@ -514,18 +514,17 @@ fn resolve_native_download(lib: &Library, mc_dir: &Path, os_name: &str) -> Optio
             .downloads
             .as_ref()
             .and_then(|downloads| downloads.classifiers.get(&classifier_key))
+            && !artifact.url.trim().is_empty()
         {
-            if !artifact.url.trim().is_empty() {
-                let path = resolve_path_under_root(&lib_dir, &artifact.path)?;
-                return Some(DownloadJob {
-                    name: Path::new(&artifact.path)
-                        .file_name()
-                        .map(|value| value.to_string_lossy().to_string())
-                        .unwrap_or_else(|| format!("{}:{classifier_key}", lib.name)),
-                    path,
-                    url: artifact.url.clone(),
-                });
-            }
+            let path = resolve_path_under_root(&lib_dir, &artifact.path)?;
+            return Some(DownloadJob {
+                name: Path::new(&artifact.path)
+                    .file_name()
+                    .map(|value| value.to_string_lossy().to_string())
+                    .unwrap_or_else(|| format!("{}:{classifier_key}", lib.name)),
+                path,
+                url: artifact.url.clone(),
+            });
         }
     }
 

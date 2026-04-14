@@ -100,17 +100,15 @@ pub fn scan_versions(mc_dir: &Path) -> std::io::Result<Vec<VersionEntry>> {
                     format!("Base version {} needs to be downloaded", effective_parent),
                     id.clone(),
                 )
+            } else if jar_path.is_file() {
+                (true, "ready".to_string(), String::new(), String::new())
             } else {
-                if jar_path.is_file() {
-                    (true, "ready".to_string(), String::new(), String::new())
-                } else {
-                    (
-                        false,
-                        "incomplete".to_string(),
-                        "Loader files are not fully installed".to_string(),
-                        id.clone(),
-                    )
-                }
+                (
+                    false,
+                    "incomplete".to_string(),
+                    "Loader files are not fully installed".to_string(),
+                    id.clone(),
+                )
             }
         };
 
@@ -155,12 +153,11 @@ fn resolve_java_version(id: &str, stubs: &HashMap<String, VersionStub>) -> JavaV
         current = stubs.get(&next_parent);
     }
 
-    if !fallback_parent.is_empty() && fallback_parent != id {
-        if let Some(stub) = stubs.get(&fallback_parent)
-            && let Some(java_version) = &stub.java_version
-        {
-            return java_version.clone();
-        }
+    if !fallback_parent.is_empty() && fallback_parent != id
+        && let Some(stub) = stubs.get(&fallback_parent)
+        && let Some(java_version) = &stub.java_version
+    {
+        return java_version.clone();
     }
 
     JavaVersionStub {
