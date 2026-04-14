@@ -1,7 +1,7 @@
 use crate::events;
 use crate::state::{ApiRuntimeState, DesktopState};
 use croopor_api::state::{AppState, LaunchEvent, LaunchSessionRecord, LaunchStatusEvent};
-use croopor_launcher::{LaunchFailureClass, LaunchState};
+use croopor_launcher::LaunchState;
 use tauri::{AppHandle, Emitter, State};
 
 #[tauri::command]
