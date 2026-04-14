@@ -52,6 +52,8 @@ pub fn compose_loader_version(
     version_id: &str,
     fragment: &LoaderProfileFragment,
 ) -> Result<VersionJson, LoaderError> {
+    validate_version_id(base_version_id, "base minecraft version id")?;
+    validate_version_id(version_id, "installed loader version id")?;
     let base = resolve_version(mc_dir, base_version_id)
         .map_err(|error| LoaderError::InvalidProfile(format!("resolve base version: {error}")))?;
 
@@ -128,6 +130,7 @@ pub fn write_composed_version(
     version: &VersionJson,
     base_version_id: &str,
 ) -> Result<(), LoaderError> {
+    validate_version_id(base_version_id, "base minecraft version id")?;
     validate_version_id(version_id, "installed loader version id")?;
     let version_dir = versions_dir(mc_dir).join(version_id);
     fs::create_dir_all(&version_dir)?;
@@ -184,6 +187,7 @@ fn link_or_copy_base_jar(
     base_version_id: &str,
     version_id: &str,
 ) -> Result<(), LoaderError> {
+    validate_version_id(base_version_id, "base minecraft version id")?;
     validate_version_id(version_id, "installed loader version id")?;
     let base_jar = versions_dir(mc_dir)
         .join(base_version_id)
@@ -210,7 +214,11 @@ fn link_or_copy_base_jar(
 
 #[cfg(test)]
 mod tests {
-    use super::{LoaderProfileFragment, cleanup_incomplete_version, compose_loader_version};
+    use super::{
+        LoaderProfileFragment, cleanup_incomplete_version, compose_loader_version,
+        write_composed_version,
+    };
+    use crate::launch::{AssetIndex, Downloads, JavaVersion, VersionJson};
     use crate::paths::create_minecraft_dir;
     use std::fs;
     use std::path::PathBuf;
@@ -361,6 +369,41 @@ mod tests {
 
         assert!(root.join("versions").is_dir());
         assert!(retained.is_dir());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn write_composed_version_rejects_traversal_base_version_id() {
+        let root = temp_dir("write-composed-version-base-traversal");
+        create_minecraft_dir(&root).expect("library");
+        let version = VersionJson {
+            id: "loader-test".to_string(),
+            inherits_from: String::new(),
+            kind: String::new(),
+            main_class: String::new(),
+            minimum_launcher_version: 0,
+            compliance_level: 0,
+            release_time: String::new(),
+            time: String::new(),
+            arguments: None,
+            minecraft_arguments: String::new(),
+            asset_index: AssetIndex::default(),
+            assets: String::new(),
+            downloads: Downloads::default(),
+            java_version: JavaVersion::default(),
+            libraries: Vec::new(),
+            logging: None,
+        };
+
+        let error = write_composed_version(&root, "loader-test", &version, "../escape")
+            .expect_err("traversal should fail");
+
+        assert_eq!(
+            error.to_string(),
+            "base minecraft version id contains path separators"
+        );
+        assert!(!root.join("versions").join("loader-test").exists());
 
         let _ = fs::remove_dir_all(root);
     }

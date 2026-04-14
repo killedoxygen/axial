@@ -488,6 +488,16 @@ mod tests {
         assert_eq!(error.to_string(), "installed loader version id is empty");
     }
 
+    #[test]
+    fn rejects_whitespace_padded_installed_version_id() {
+        let error =
+            validate_version_id(" loader-id ", "installed loader version id").expect_err("error");
+        assert_eq!(
+            error.to_string(),
+            "installed loader version id contains surrounding whitespace"
+        );
+    }
+
     fn temp_dir(prefix: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)

@@ -54,6 +54,11 @@ pub(crate) fn validate_version_id(version_id: &str, context: &str) -> Result<(),
     if trimmed.is_empty() {
         return Err(LoaderError::Other(format!("{context} is empty")));
     }
+    if version_id != trimmed {
+        return Err(LoaderError::Other(format!(
+            "{context} contains surrounding whitespace"
+        )));
+    }
     if trimmed.contains(['/', '\\']) {
         return Err(LoaderError::Other(format!(
             "{context} contains path separators"
@@ -87,5 +92,15 @@ mod tests {
                 error
             );
         }
+    }
+
+    #[test]
+    fn rejects_whitespace_padded_version_ids() {
+        let error =
+            validate_version_id(" loader-id ", "loader build version id").expect_err("error");
+        assert_eq!(
+            error.to_string(),
+            "loader build version id contains surrounding whitespace"
+        );
     }
 }
