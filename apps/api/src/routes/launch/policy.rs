@@ -75,10 +75,12 @@ pub(super) fn effective_min_memory(
 }
 
 pub(super) fn split_jvm_args(extra_jvm_args: &str) -> Vec<String> {
-    extra_jvm_args
-        .split_whitespace()
-        .map(str::to_string)
-        .collect()
+    shlex::split(extra_jvm_args).unwrap_or_else(|| {
+        extra_jvm_args
+            .split_whitespace()
+            .map(str::to_string)
+            .collect()
+    })
 }
 
 pub(super) fn has_advanced_overrides(instance: &Instance) -> bool {

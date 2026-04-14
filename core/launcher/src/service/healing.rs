@@ -26,7 +26,7 @@ pub fn build_healing_summary(input: HealingSummaryInput<'_>) -> Option<LaunchHea
     let effective_preset = input
         .effective_preset
         .filter(|value| !value.trim().is_empty())
-        .map(str::to_string);
+        .map(|value| value.trim().to_string());
     let fallback_applied = input
         .fallback_applied
         .filter(|value| !value.trim().is_empty())
