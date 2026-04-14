@@ -1,6 +1,7 @@
 import { api, API } from './api';
 import { showError, errMessage } from './utils';
 import { startLoaderInstall, connectLoaderInstallSSE } from './loaders/api';
+import { createProgressEstimator } from './progress-estimation';
 import {
   hasNativeDesktopRuntime, nativeInstallEventName, nativeLoaderInstallEventName,
   onNativeEvent, startNativeInstallEvents, startNativeLoaderInstallEvents,
@@ -13,6 +14,23 @@ import {
   completeInstall, setInstallEventSource,
 } from './actions';
 import type { InstallItem, LoaderBuildRecord, LoaderComponentId } from './types';
+
+type InstallProgressEvent = {
+  phase?: string;
+  current?: number;
+  total?: number;
+  file?: string;
+  error?: string;
+  done?: boolean;
+};
+
+const INSTALL_ETA_PHASES = new Set([
+  'libraries',
+  'assets',
+  'loader_libraries',
+  'loader_processors',
+  'processors',
+]);
 
 export function handleInstallClick(): void {
   const inst = selectedInstance.value;
@@ -210,14 +228,21 @@ function inferLoaderVersionFromBuildId(buildId: string): string {
   return parts[2] || '';
 }
 
-function formatCountLabel(base: string, data: any): string {
+function formatCountLabel(base: string, data: InstallProgressEvent): string {
   if (typeof data.current === 'number' && typeof data.total === 'number' && data.total > 0) {
     return `${base} (${data.current}/${data.total})`;
   }
   return base;
 }
 
-function phaseLabel(data: any, loaderInstall: boolean): string {
+function progressFraction(data: InstallProgressEvent): number {
+  if (typeof data.current !== 'number' || typeof data.total !== 'number' || data.total <= 0) {
+    return 0;
+  }
+  return data.current / data.total;
+}
+
+function phaseLabel(data: InstallProgressEvent, loaderInstall: boolean): string {
   switch (data.phase) {
     case 'loader_meta':
       return 'Fetching loader info...';
@@ -260,8 +285,9 @@ function phaseLabel(data: any, loaderInstall: boolean): string {
 
 async function connectVanillaEvents(installId: string, versionId: string): Promise<void> {
   const startedAt = Date.now();
+  const estimator = createProgressEstimator({ etaPhases: INSTALL_ETA_PHASES });
 
-  const onProgress = async (data: any): Promise<void> => {
+  const onProgress = async (data: InstallProgressEvent): Promise<void> => {
     let pct = 0;
     let label = phaseLabel(data, false);
 
@@ -270,12 +296,12 @@ async function connectVanillaEvents(installId: string, versionId: string): Promi
     } else if (data.phase === 'client_jar') {
       pct = 7;
     } else if (data.phase === 'libraries') {
-      const libraryPct = data.total > 0 ? data.current / data.total : 0;
+      const libraryPct = progressFraction(data);
       pct = 7 + Math.round(libraryPct * 13);
     } else if (data.phase === 'asset_index') {
       pct = 21;
     } else if (data.phase === 'assets') {
-      const assetPct = data.total > 0 ? data.current / data.total : 0;
+      const assetPct = progressFraction(data);
       pct = 21 + Math.round(assetPct * 72);
     } else if (data.phase === 'log_config') {
       pct = 94;
@@ -284,14 +310,14 @@ async function connectVanillaEvents(installId: string, versionId: string): Promi
     } else if (data.phase === 'done') {
       pct = 100;
     } else if (data.phase === 'error') {
-      showError(data.error);
+      showError(data.error || 'Install failed.');
       await onInstallDone();
       return;
     } else {
       pct = installState.value.status === 'active' ? installState.value.pct : 0;
     }
 
-    updateInstallProgress(pct, appendETA(label, pct, startedAt));
+    updateInstallProgress(pct, estimator.formatLabel(label, data, pct, startedAt));
     if (data.done) await onInstallDone();
   };
 
@@ -332,7 +358,8 @@ async function connectVanillaEvents(installId: string, versionId: string): Promi
 
 async function connectLoaderEvents(installId: string, versionId: string): Promise<void> {
   const startedAt = Date.now();
-  const onProgress = (data: any): void => {
+  const estimator = createProgressEstimator({ etaPhases: INSTALL_ETA_PHASES });
+  const onProgress = (data: InstallProgressEvent): void => {
     let pct = 0;
     let label = phaseLabel(data, true);
 
@@ -345,22 +372,22 @@ async function connectLoaderEvents(installId: string, versionId: string): Promis
     } else if (data.phase === 'artifacts') {
       pct = 6;
     } else if (data.phase === 'loader_libraries') {
-      const loaderPct = data.total > 0 ? data.current / data.total : 0;
+      const loaderPct = progressFraction(data);
       pct = 3 + Math.round(loaderPct * 7);
     } else if (data.phase === 'loader_processors' || data.phase === 'processors') {
-      const processorPct = data.total > 0 ? data.current / data.total : 0;
+      const processorPct = progressFraction(data);
       pct = 10 + Math.round(processorPct * 10);
     } else if (data.phase === 'version_json') {
       pct = 21;
     } else if (data.phase === 'client_jar') {
       pct = 24;
     } else if (data.phase === 'libraries') {
-      const libraryPct = data.total > 0 ? data.current / data.total : 0;
+      const libraryPct = progressFraction(data);
       pct = 24 + Math.round(libraryPct * 10);
     } else if (data.phase === 'asset_index') {
       pct = 35;
     } else if (data.phase === 'assets') {
-      const assetPct = data.total > 0 ? data.current / data.total : 0;
+      const assetPct = progressFraction(data);
       pct = 35 + Math.round(assetPct * 58);
     } else if (data.phase === 'log_config') {
       pct = 94;
@@ -375,7 +402,7 @@ async function connectLoaderEvents(installId: string, versionId: string): Promis
       pct = installState.value.status === 'active' ? installState.value.pct : 0;
     }
 
-    updateInstallProgress(pct, appendETA(label, pct, startedAt));
+    updateInstallProgress(pct, estimator.formatLabel(label, data, pct, startedAt));
     if (data.done) void onInstallDone();
   };
 
@@ -415,14 +442,6 @@ async function connectLoaderEvents(installId: string, versionId: string): Promis
   );
 
   setInstallEventSource(es);
-}
-
-function appendETA(label: string, pct: number, startedAt: number): string {
-  if (pct <= 5 || pct >= 100) return label;
-  const elapsed = (Date.now() - startedAt) / 1000;
-  const remaining = (elapsed / pct) * (100 - pct);
-  if (remaining < 60) return `${label} — ~${Math.ceil(remaining)}s left`;
-  return `${label} — ~${Math.ceil(remaining / 60)}m left`;
 }
 
 async function onInstallDone(): Promise<void> {
