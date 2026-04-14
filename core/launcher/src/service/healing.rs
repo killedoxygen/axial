@@ -16,13 +16,13 @@ pub struct HealingSummaryInput<'a> {
 
 pub fn build_healing_summary(input: HealingSummaryInput<'_>) -> Option<LaunchHealingSummary> {
     let requested_java_path = (!input.requested_java_path.trim().is_empty())
-        .then(|| input.requested_java_path.to_string());
+        .then(|| input.requested_java_path.trim().to_string());
     let requested_preset = (!input.requested_preset.trim().is_empty())
         .then(|| input.requested_preset.trim().to_string());
     let effective_java_path = input
         .effective_java_path
         .filter(|value| !value.trim().is_empty())
-        .map(str::to_string);
+        .map(|value| value.trim().to_string());
     let effective_preset = input
         .effective_preset
         .filter(|value| !value.trim().is_empty())
@@ -191,4 +191,38 @@ fn is_legacy_version_family(version_id: &str) -> bool {
         .filter_map(|part| part.parse::<u32>().ok())
         .collect::<Vec<_>>();
     matches!(numbers.as_slice(), [1, minor, ..] if *minor <= 12)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HealingSummaryInput, build_healing_summary};
+
+    #[test]
+    fn ignores_runtime_bypass_when_java_paths_only_differ_by_whitespace() {
+        let summary = build_healing_summary(HealingSummaryInput {
+            requested_java_path: " /usr/bin/java ",
+            requested_preset: "",
+            effective_java_path: Some("/usr/bin/java"),
+            effective_preset: None,
+            advanced_overrides: false,
+            fallback_applied: None,
+            retry_count: 0,
+            failure_class: None,
+        })
+        .expect("expected healing summary");
+
+        assert_eq!(
+            summary.requested_java_path.as_deref(),
+            Some("/usr/bin/java")
+        );
+        assert_eq!(
+            summary.effective_java_path.as_deref(),
+            Some("/usr/bin/java")
+        );
+        assert!(summary.warnings.is_empty());
+        assert!(summary.events.iter().all(|event| !matches!(
+            event.kind,
+            crate::healing::HealingEventKind::RuntimeBypassed
+        )));
+    }
 }
