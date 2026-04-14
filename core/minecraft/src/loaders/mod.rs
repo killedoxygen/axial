@@ -36,6 +36,7 @@ pub async fn install_build<F>(
 where
     F: FnMut(DownloadProgress),
 {
+    validate_version_id(&record.version_id, "loader build version id")?;
     let stage_dir = loader_work_dir(library_dir).join(&record.version_id);
     if stage_dir.exists() {
         let _ = fs::remove_dir_all(&stage_dir);
@@ -46,4 +47,22 @@ where
     let result = strategies::install_build(library_dir, &plan, send).await;
     let _ = fs::remove_dir_all(&plan.stage_dir);
     result
+}
+
+pub(crate) fn validate_version_id(version_id: &str, context: &str) -> Result<(), LoaderError> {
+    if version_id.trim().is_empty() {
+        return Err(LoaderError::Other(format!("{context} is empty")));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_version_id;
+
+    #[test]
+    fn rejects_empty_version_ids() {
+        let error = validate_version_id(" \t ", "loader build version id").expect_err("error");
+        assert_eq!(error.to_string(), "loader build version id is empty");
+    }
 }

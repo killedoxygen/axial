@@ -8,6 +8,7 @@ use crate::loaders::forge_installer::{extract_installer, extract_maven_entries};
 use crate::loaders::http::fetch_bytes;
 use crate::loaders::processors::run_processors;
 use crate::loaders::types::{LoaderBuildRecord, LoaderError, LoaderInstallPlan};
+use crate::loaders::validate_version_id;
 use crate::paths::{loader_artifacts_dir, versions_dir};
 use crate::profiles::ensure_launcher_profiles;
 use std::fs;
@@ -38,6 +39,7 @@ where
     } else {
         fragment.id.clone()
     };
+    validate_version_id(&installed_version_id, "installed loader version id")?;
 
     cleanup_on_error(
         write_raw_profile_version(library_dir, &installed_version_id, &profile_bytes),
@@ -153,6 +155,7 @@ where
     } else {
         extracted.version_id.clone()
     };
+    validate_version_id(&installed_version_id, "installed loader version id")?;
     let version = compose_loader_version(
         library_dir,
         &plan.record.minecraft_version,
@@ -264,6 +267,7 @@ where
     F: FnMut(DownloadProgress),
 {
     ensure_base_version(library_dir, &plan.record.minecraft_version, send).await?;
+    validate_version_id(&plan.record.version_id, "installed loader version id")?;
 
     let archive_path = cached_legacy_archive_path(library_dir, &plan.record);
     send(progress(
@@ -451,6 +455,7 @@ fn done() -> DownloadProgress {
 mod tests {
     use super::cleanup_on_error;
     use crate::loaders::types::LoaderError;
+    use crate::loaders::validate_version_id;
     use crate::paths::versions_dir;
     use std::fs;
     use std::path::PathBuf;
@@ -473,6 +478,12 @@ mod tests {
         assert!(!version_dir.exists());
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejects_whitespace_only_installed_version_id() {
+        let error = validate_version_id(" \n ", "installed loader version id").expect_err("error");
+        assert_eq!(error.to_string(), "installed loader version id is empty");
     }
 
     fn temp_dir(prefix: &str) -> PathBuf {

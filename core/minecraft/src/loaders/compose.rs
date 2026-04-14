@@ -149,6 +149,9 @@ pub fn finalize_version_install(mc_dir: &Path, version_id: &str) -> Result<(), L
 }
 
 pub fn cleanup_incomplete_version(mc_dir: &Path, version_id: &str) {
+    if version_id.trim().is_empty() {
+        return;
+    }
     let version_dir = versions_dir(mc_dir).join(version_id);
     let _ = fs::remove_dir_all(version_dir);
 }
@@ -203,7 +206,7 @@ fn link_or_copy_base_jar(
 
 #[cfg(test)]
 mod tests {
-    use super::{LoaderProfileFragment, compose_loader_version};
+    use super::{LoaderProfileFragment, cleanup_incomplete_version, compose_loader_version};
     use crate::paths::create_minecraft_dir;
     use std::fs;
     use std::path::PathBuf;
@@ -324,6 +327,21 @@ mod tests {
             .map(|library| library.name.clone())
             .collect::<Vec<_>>();
         assert_eq!(asm_libraries, vec!["org.ow2.asm:asm:9.9".to_string()]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cleanup_incomplete_version_ignores_empty_version_id() {
+        let root = temp_dir("cleanup-empty-version-id");
+        create_minecraft_dir(&root).expect("library");
+        let retained = root.join("versions").join("retained");
+        fs::create_dir_all(&retained).expect("retained version");
+
+        cleanup_incomplete_version(&root, "   ");
+
+        assert!(root.join("versions").is_dir());
+        assert!(retained.is_dir());
 
         let _ = fs::remove_dir_all(root);
     }
