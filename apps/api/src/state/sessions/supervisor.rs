@@ -62,7 +62,7 @@ pub(super) fn spawn_wait_task(
                             failure_detail: observed_failure
                                 .as_ref()
                                 .and_then(|failure| failure.detail.clone()),
-                            healing: None,
+                            healing: existing.as_ref().and_then(|record| record.healing.clone()),
                             guardian: existing.as_ref().and_then(|record| record.guardian.clone()),
                         },
                     )
@@ -78,7 +78,7 @@ pub(super) fn spawn_wait_task(
                             exit_code: Some(-1),
                             failure_class: Some("unknown".to_string()),
                             failure_detail: Some(error.to_string()),
-                            healing: None,
+                            healing: existing.as_ref().and_then(|record| record.healing.clone()),
                             guardian: existing.as_ref().and_then(|record| record.guardian.clone()),
                         },
                     )
