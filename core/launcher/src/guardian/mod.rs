@@ -367,6 +367,9 @@ pub fn conservative_healing_preset(version_id: &str, info: &JavaRuntimeInfo) -> 
 
 fn is_legacy_version_family(version_id: &str) -> bool {
     let base = version_id.split("-forge-").next().unwrap_or(version_id);
+    if matches!(base.as_bytes().first(), Some(b'a' | b'b')) {
+        return true;
+    }
     let numbers = base
         .split('.')
         .filter_map(|part| part.parse::<u32>().ok())
@@ -378,7 +381,8 @@ fn is_legacy_version_family(version_id: &str) -> bool {
 mod tests {
     use super::{
         GuardianMode, LaunchGuardianContext, OverrideOrigin, PreLaunchAction, PreLaunchDecision,
-        RecoveryAction, decide_prepare_failure, recovery_plan_for_startup_failure,
+        RecoveryAction, conservative_healing_preset, decide_prepare_failure,
+        recovery_plan_for_startup_failure,
     };
     use crate::types::LaunchFailureClass;
     use croopor_minecraft::JavaRuntimeInfo;
@@ -492,5 +496,19 @@ mod tests {
         .expect("expected plan");
 
         assert!(matches!(plan.action, RecoveryAction::SwitchManagedRuntime));
+    }
+
+    #[test]
+    fn conservative_preset_uses_legacy_for_alpha_and_beta_versions() {
+        let info = JavaRuntimeInfo {
+            id: "test".to_string(),
+            major: 17,
+            update: 0,
+            distribution: "temurin".to_string(),
+            path: "/usr/bin/java".to_string(),
+        };
+
+        assert_eq!(conservative_healing_preset("b1.8.1", &info), "legacy");
+        assert_eq!(conservative_healing_preset("a1.2.6", &info), "legacy");
     }
 }

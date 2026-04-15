@@ -73,6 +73,7 @@ pub struct LoaderGameVersion {
     pub release_time: String,
     #[serde(default)]
     pub meta: VersionMeta,
+    #[serde(default)]
     pub stable: bool,
 }
 
@@ -243,5 +244,25 @@ impl LoaderError {
             | Self::MissingLibraryDir
             | Self::Other(_) => LoaderInstallFailureKind::Other,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LoaderGameVersion;
+
+    #[test]
+    fn loader_game_version_defaults_stable_when_missing() {
+        let version: LoaderGameVersion = serde_json::from_str(
+            r#"{
+                "version": "1.20.4",
+                "type": "release"
+            }"#,
+        )
+        .expect("loader game version should deserialize");
+
+        assert_eq!(version.version, "1.20.4");
+        assert_eq!(version.kind, "release");
+        assert!(!version.stable);
     }
 }
