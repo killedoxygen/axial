@@ -38,7 +38,18 @@ pub(super) fn spawn_wait_task(
     child: Arc<Mutex<Child>>,
 ) {
     tokio::spawn(async move {
-        let status = child.lock().await.wait().await;
+        let status = loop {
+            let try_status = {
+                let mut locked = child.lock().await;
+                locked.try_wait()
+            };
+
+            match try_status {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => tokio::time::sleep(Duration::from_millis(100)).await,
+                Err(error) => break Err(error),
+            }
+        };
         let existing = store.get(&session_id).await;
         if existing
             .as_ref()
