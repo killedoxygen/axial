@@ -46,6 +46,7 @@ pub(super) fn spawn_wait_task(
         {
             return;
         }
+        let observed_failure = store.observed_failure(&session_id).await;
         match status {
             Ok(status) => {
                 store
@@ -55,9 +56,14 @@ pub(super) fn spawn_wait_task(
                             state: "exited".to_string(),
                             pid: None,
                             exit_code: status.code(),
-                            failure_class: None,
-                            failure_detail: None,
+                            failure_class: observed_failure
+                                .as_ref()
+                                .map(|failure| failure.class.as_str().to_string()),
+                            failure_detail: observed_failure
+                                .as_ref()
+                                .and_then(|failure| failure.detail.clone()),
                             healing: None,
+                            guardian: existing.as_ref().and_then(|record| record.guardian.clone()),
                         },
                     )
                     .await;
@@ -73,6 +79,7 @@ pub(super) fn spawn_wait_task(
                             failure_class: Some("unknown".to_string()),
                             failure_detail: Some(error.to_string()),
                             healing: None,
+                            guardian: existing.as_ref().and_then(|record| record.guardian.clone()),
                         },
                     )
                     .await;
@@ -111,6 +118,7 @@ pub(super) fn spawn_startup_watchdog(
                     failure_class: Some("startup_stalled".to_string()),
                     failure_detail: Some("no startup activity observed".to_string()),
                     healing: record.healing.clone(),
+                    guardian: record.guardian.clone(),
                 },
             )
             .await;

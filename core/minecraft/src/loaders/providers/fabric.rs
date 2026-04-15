@@ -5,6 +5,7 @@ use crate::loaders::types::{
     LoaderArtifactKind, LoaderBuildRecord, LoaderComponentId, LoaderGameVersion,
     LoaderInstallSource, LoaderInstallStrategy, LoaderInstallability, LoaderVersionIndex,
 };
+use crate::version_meta::VersionMeta;
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -31,6 +32,9 @@ pub async fn fetch_game_versions()
         .into_iter()
         .map(|entry| LoaderGameVersion {
             version: entry.version,
+            kind: String::new(),
+            release_time: String::new(),
+            meta: VersionMeta::default(),
             stable: entry.stable,
         })
         .collect())

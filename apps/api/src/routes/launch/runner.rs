@@ -2,13 +2,33 @@ use crate::logging::append_trace;
 use crate::state::{AppState, LaunchStatusEvent, StartupOutcome};
 use croopor_config::{AppConfig, Instance};
 use croopor_launcher::{
-    LaunchFailureClass, LaunchState, RecoveryAction, build_healing_summary, failure_class_name,
-    format_failure_class, launch_state_name, prepare_launch_attempt, recovery_for_failure,
+    GuardianInterventionKind, GuardianSummary, LaunchFailureClass, LaunchState, PreLaunchAction,
+    PreLaunchDecision, RecoveryAction, build_healing_summary, decide_prepare_failure,
+    failure_class_name, format_failure_class, guidance_for_failure, launch_state_name,
+    prepare_launch_attempt, recovery_plan_for_startup_failure,
 };
 use serde_json::Value;
 use tokio::process::Command;
 
-pub(super) async fn run_launch_session(state: AppState, task: super::task::LaunchSessionTask) {
+pub(super) struct LaunchSuccess {
+    pub session_id: String,
+    pub instance_id: String,
+    pub pid: u32,
+    pub launched_at: String,
+    pub healing: Option<croopor_launcher::LaunchHealingSummary>,
+    pub guardian: Option<GuardianSummary>,
+}
+
+pub(super) struct LaunchRequestError {
+    pub message: String,
+    pub healing: Option<croopor_launcher::LaunchHealingSummary>,
+    pub guardian: Option<GuardianSummary>,
+}
+
+pub(super) async fn launch_session(
+    state: AppState,
+    task: super::task::LaunchSessionTask,
+) -> Result<LaunchSuccess, LaunchRequestError> {
     let super::task::LaunchSessionTask {
         mut instance,
         config,
@@ -17,9 +37,10 @@ pub(super) async fn run_launch_session(state: AppState, task: super::task::Launc
     } = task;
     let session_id = intent.session_id.clone();
     let mut attempt = croopor_launcher::service::AttemptOverrides::default();
+    let mut guardian = GuardianSummary::new(intent.guardian.mode);
 
     loop {
-        trace_launch_event(&session_id, "run_launch_session entered");
+        trace_launch_event(&session_id, "launch_session entered");
         emit_status(
             &state,
             &session_id,
@@ -27,6 +48,7 @@ pub(super) async fn run_launch_session(state: AppState, task: super::task::Launc
             None,
             None,
             None,
+            Some(guardian.clone()),
         )
         .await;
         state
@@ -43,17 +65,74 @@ pub(super) async fn run_launch_session(state: AppState, task: super::task::Launc
             Err(error) => {
                 trace_launch_event(&session_id, &format!("prepare failed: {}", error.message));
                 let failure_class = error.failure_class.unwrap_or(LaunchFailureClass::Unknown);
-                emit_terminal_failure(
+                match decide_prepare_failure(
+                    &intent.guardian,
+                    failure_class,
+                    &error.message,
+                    &intent.requested_java,
+                    &intent.extra_jvm_args,
+                    attempt.runtime_intervention_applied,
+                    attempt.raw_jvm_args_intervention_applied,
+                ) {
+                    PreLaunchDecision::Allow => {}
+                    PreLaunchDecision::Intervene {
+                        action,
+                        kind,
+                        description,
+                    } => {
+                        state
+                            .sessions()
+                            .emit_log(&session_id, "system", description.clone())
+                            .await;
+                        guardian.record_intervention(kind, description.clone(), false);
+                        match action {
+                            PreLaunchAction::ForceManagedRuntime => {
+                                attempt.record_runtime_intervention(description);
+                            }
+                            PreLaunchAction::StripRawJvmArgs => {
+                                attempt.record_raw_jvm_args_intervention(description);
+                            }
+                        }
+                        continue;
+                    }
+                    PreLaunchDecision::Block {
+                        class,
+                        message,
+                        guidance,
+                    } => {
+                        guardian.block_with_guidance(guidance);
+                        return Err(fail_launch(
+                            &state,
+                            &session_id,
+                            class,
+                            &message,
+                            error.healing,
+                            Some(guardian.clone()),
+                        )
+                        .await);
+                    }
+                }
+                guardian.block_with_guidance(guidance_for_failure(failure_class, &intent.guardian));
+                return Err(fail_launch(
                     &state,
                     &session_id,
                     failure_class,
                     &error.message,
                     error.healing,
+                    Some(guardian.clone()),
                 )
-                .await;
-                return;
+                .await);
             }
         };
+        for intervention in &prepared.guardian_interventions {
+            if let Some(detail) = intervention.detail.as_deref() {
+                guardian.record_intervention(
+                    intervention.kind,
+                    detail,
+                    intervention.silent.unwrap_or(false),
+                );
+            }
+        }
         trace_launch_event(
             &session_id,
             &format!(
@@ -80,17 +159,6 @@ pub(super) async fn run_launch_session(state: AppState, task: super::task::Launc
             )
             .await;
 
-        if prepared.runtime.bypassed_requested_runtime {
-            state
-                .sessions()
-                .emit_log(
-                    &session_id,
-                    "system",
-                    "Croopor bypassed the selected Java override and will use the managed runtime."
-                        .to_string(),
-                )
-                .await;
-        }
         if prepared.runtime.effective_source == "managed" {
             emit_status(
                 &state,
@@ -99,6 +167,7 @@ pub(super) async fn run_launch_session(state: AppState, task: super::task::Launc
                 None,
                 None,
                 prepared.healing.clone(),
+                Some(guardian.clone()),
             )
             .await;
         }
@@ -110,6 +179,7 @@ pub(super) async fn run_launch_session(state: AppState, task: super::task::Launc
             None,
             None,
             prepared.healing.clone(),
+            Some(guardian.clone()),
         )
         .await;
         state
@@ -125,15 +195,15 @@ pub(super) async fn run_launch_session(state: AppState, task: super::task::Launc
             .await;
 
         if prepared.plan.command.len() < 2 {
-            emit_terminal_failure(
+            return Err(fail_launch(
                 &state,
                 &session_id,
                 LaunchFailureClass::Unknown,
                 "launch plan did not produce a runnable command",
                 prepared.healing.clone(),
+                Some(guardian.clone()),
             )
-            .await;
-            return;
+            .await);
         }
 
         let mut command = Command::new(&prepared.plan.command[0]);
@@ -159,21 +229,22 @@ pub(super) async fn run_launch_session(state: AppState, task: super::task::Launc
                 .healing
                 .as_ref()
                 .and_then(|value| serde_json::to_value(value).ok()),
+            guardian: serialize_guardian(Some(guardian.clone())),
         };
 
         let launched = match state.sessions().start_process(record, command).await {
             Ok(record) => record,
             Err(error) => {
                 trace_launch_event(&session_id, &format!("spawn failed: {error}"));
-                emit_terminal_failure(
+                return Err(fail_launch(
                     &state,
                     &session_id,
                     LaunchFailureClass::Unknown,
                     &format!("failed to start launch process: {error}"),
                     prepared.healing.clone(),
+                    Some(guardian.clone()),
                 )
-                .await;
-                return;
+                .await);
             }
         };
         trace_launch_event(&session_id, &format!("spawned pid={:?}", launched.pid));
@@ -185,6 +256,7 @@ pub(super) async fn run_launch_session(state: AppState, task: super::task::Launc
             launched.pid,
             None,
             prepared.healing.clone(),
+            Some(guardian.clone()),
         )
         .await;
 
@@ -204,7 +276,14 @@ pub(super) async fn run_launch_session(state: AppState, task: super::task::Launc
                     intent.min_memory_mb,
                     &launched_at,
                 );
-                return;
+                return Ok(LaunchSuccess {
+                    session_id: session_id.clone(),
+                    instance_id: intent.instance_id.clone(),
+                    pid: launched.pid.unwrap_or_default(),
+                    launched_at: launched_at.clone(),
+                    healing: prepared.healing.clone(),
+                    guardian: Some(guardian.clone()),
+                });
             }
             StartupOutcome::Exited | StartupOutcome::Stalled => {
                 let stalled = matches!(outcome, StartupOutcome::Stalled);
@@ -212,22 +291,23 @@ pub(super) async fn run_launch_session(state: AppState, task: super::task::Launc
                     let _ = state.sessions().kill(&session_id).await;
                 }
 
-                let failed_record = state.sessions().get(&session_id).await;
                 let failure_class = if stalled {
                     LaunchFailureClass::StartupStalled
                 } else {
-                    failed_record
-                        .as_ref()
-                        .and_then(|record| record.failure.as_ref().map(|failure| failure.class))
+                    state
+                        .sessions()
+                        .observed_failure(&session_id)
+                        .await
+                        .map(|failure| failure.class)
                         .unwrap_or(LaunchFailureClass::Unknown)
                 };
-                if attempt.retry_count == 0
-                    && let Some(recovery) = recovery_for_failure(
+                if !attempt.startup_recovery_applied
+                    && let Some(recovery) = recovery_plan_for_startup_failure(
                         failure_class,
                         &intent.version_id,
                         &prepared.runtime.effective_info,
                         &intent.requested_java,
-                        intent.advanced_overrides,
+                        &intent.guardian,
                         attempt.disable_custom_gc,
                         &prepared.effective_preset,
                     )
@@ -236,18 +316,32 @@ pub(super) async fn run_launch_session(state: AppState, task: super::task::Launc
                         .sessions()
                         .emit_log(&session_id, "system", recovery.description.clone())
                         .await;
-                    attempt.retry_count += 1;
-                    attempt.fallback_applied = Some(recovery.description.clone());
+                    attempt.record_startup_recovery(recovery.description.clone());
                     match recovery.action {
                         RecoveryAction::DowngradePreset(next_preset) => {
+                            guardian.record_intervention(
+                                GuardianInterventionKind::DowngradePreset,
+                                recovery.description.clone(),
+                                false,
+                            );
                             attempt.preset_override = Some(next_preset);
                             attempt.disable_custom_gc = false;
                         }
                         RecoveryAction::DisableCustomGc => {
+                            guardian.record_intervention(
+                                GuardianInterventionKind::DisableCustomGc,
+                                recovery.description.clone(),
+                                false,
+                            );
                             attempt.preset_override = None;
                             attempt.disable_custom_gc = true;
                         }
                         RecoveryAction::SwitchManagedRuntime => {
+                            guardian.record_intervention(
+                                GuardianInterventionKind::SwitchManagedRuntime,
+                                recovery.description.clone(),
+                                false,
+                            );
                             attempt.force_managed_runtime = true;
                             attempt.preset_override = None;
                             attempt.disable_custom_gc = false;
@@ -262,11 +356,11 @@ pub(super) async fn run_launch_session(state: AppState, task: super::task::Launc
                         requested_preset: &intent.requested_preset,
                         effective_java_path: Some(prepared.runtime.effective_path.as_str()),
                         effective_preset: Some(prepared.effective_preset.as_str()),
-                        advanced_overrides: intent.advanced_overrides,
                         fallback_applied: attempt.fallback_applied.as_deref(),
                         retry_count: attempt.retry_count,
                         failure_class: Some(failure_class),
                     });
+                guardian.block_with_guidance(guidance_for_failure(failure_class, &intent.guardian));
                 let message = if failure_class == LaunchFailureClass::StartupStalled {
                     "launch stopped before startup: no startup activity observed".to_string()
                 } else {
@@ -275,8 +369,15 @@ pub(super) async fn run_launch_session(state: AppState, task: super::task::Launc
                         format_failure_class(failure_class)
                     )
                 };
-                emit_terminal_failure(&state, &session_id, failure_class, &message, healing).await;
-                return;
+                return Err(fail_launch(
+                    &state,
+                    &session_id,
+                    failure_class,
+                    &message,
+                    healing,
+                    Some(guardian.clone()),
+                )
+                .await);
             }
         }
     }
@@ -286,6 +387,31 @@ pub(super) fn trace_launch_event(session_id: &str, message: &str) {
     append_trace("launch", session_id, message);
 }
 
+async fn fail_launch(
+    state: &AppState,
+    session_id: &str,
+    failure_class: LaunchFailureClass,
+    message: &str,
+    healing: Option<croopor_launcher::LaunchHealingSummary>,
+    guardian: Option<GuardianSummary>,
+) -> LaunchRequestError {
+    emit_terminal_failure(
+        state,
+        session_id,
+        failure_class,
+        message,
+        healing.clone(),
+        guardian.clone(),
+    )
+    .await;
+    state.sessions().remove(session_id).await;
+    LaunchRequestError {
+        message: message.to_string(),
+        healing,
+        guardian,
+    }
+}
+
 async fn emit_status(
     state: &AppState,
     session_id: &str,
@@ -293,6 +419,7 @@ async fn emit_status(
     pid: Option<u32>,
     failure_class: Option<LaunchFailureClass>,
     healing: Option<croopor_launcher::LaunchHealingSummary>,
+    guardian: Option<GuardianSummary>,
 ) {
     state
         .sessions()
@@ -305,6 +432,7 @@ async fn emit_status(
                 failure_class: failure_class.map(failure_class_name).map(str::to_string),
                 failure_detail: None,
                 healing: serialize_healing(healing),
+                guardian: serialize_guardian(guardian),
             },
         )
         .await;
@@ -316,6 +444,7 @@ async fn emit_terminal_failure(
     failure_class: LaunchFailureClass,
     message: &str,
     healing: Option<croopor_launcher::LaunchHealingSummary>,
+    guardian: Option<GuardianSummary>,
 ) {
     state
         .sessions()
@@ -332,6 +461,7 @@ async fn emit_terminal_failure(
                 failure_class: Some(failure_class_name(failure_class).to_string()),
                 failure_detail: Some(message.to_string()),
                 healing: serialize_healing(healing),
+                guardian: serialize_guardian(guardian),
             },
         )
         .await;
@@ -363,4 +493,8 @@ fn persist_launch_metadata(
 
 fn serialize_healing(healing: Option<croopor_launcher::LaunchHealingSummary>) -> Option<Value> {
     healing.and_then(|value| serde_json::to_value(value).ok())
+}
+
+fn serialize_guardian(guardian: Option<GuardianSummary>) -> Option<Value> {
+    guardian.and_then(|value| serde_json::to_value(value).ok())
 }

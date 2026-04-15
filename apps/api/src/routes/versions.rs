@@ -5,7 +5,10 @@ use axum::{
     response::sse::{Event, Sse},
     routing::get,
 };
-use croopor_minecraft::{VersionEntry, scan_versions};
+use croopor_minecraft::{
+    VersionEntry, enrich_version_entries, fetch_version_manifest, manifest_release_references,
+    scan_versions,
+};
 use serde::Serialize;
 use std::{convert::Infallible, path::PathBuf, time::Duration};
 use tokio::time::interval;
@@ -31,12 +34,16 @@ async fn handle_versions(
         ));
     };
 
-    let versions = scan_versions(&PathBuf::from(mc_dir)).map_err(|error| {
+    let mut versions = scan_versions(&PathBuf::from(mc_dir)).map_err(|error| {
         (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": format!("failed to scan versions: {error}") })),
         )
     })?;
+    if let Ok(manifest) = fetch_version_manifest().await {
+        let releases = manifest_release_references(&manifest);
+        enrich_version_entries(&mut versions, &releases);
+    }
 
     Ok(Json(VersionsResponse { versions }))
 }
@@ -61,7 +68,11 @@ async fn handle_version_watch(
 
         loop {
             ticker.tick().await;
-            let versions = scan_versions(&mc_dir).unwrap_or_default();
+            let mut versions = scan_versions(&mc_dir).unwrap_or_default();
+            if let Ok(manifest) = fetch_version_manifest().await {
+                let releases = manifest_release_references(&manifest);
+                enrich_version_entries(&mut versions, &releases);
+            }
             let payload = serde_json::to_string(&serde_json::json!({ "versions": versions })).unwrap_or_else(|_| "{\"versions\":[]}".to_string());
             if payload != last_payload {
                 last_payload = payload.clone();

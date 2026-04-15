@@ -26,21 +26,28 @@ async fn handle_launch(
     State(state): State<AppState>,
     Json(payload): Json<task::LaunchRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let accepted = task::prepare_launch_session(&state, payload).await?;
-
-    let state_task = state.clone();
-    let task = accepted.task;
-    tokio::spawn(async move {
-        runner::run_launch_session(state_task, task).await;
-    });
+    let prepared = task::prepare_launch_session(&state, payload).await?;
+    let launched = runner::launch_session(state.clone(), prepared.task)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": error.message,
+                    "healing": error.healing,
+                    "guardian": error.guardian,
+                })),
+            )
+        })?;
 
     Ok(Json(json!({
-        "status": "accepted",
-        "session_id": accepted.session_id.0,
-        "instance_id": accepted.instance_id,
-        "pid": 0,
-        "launched_at": accepted.launched_at,
-        "healing": null,
+        "status": "launching",
+        "session_id": launched.session_id,
+        "instance_id": launched.instance_id,
+        "pid": launched.pid,
+        "launched_at": launched.launched_at,
+        "healing": launched.healing,
+        "guardian": launched.guardian,
     })))
 }
 
@@ -72,6 +79,7 @@ async fn handle_launch_command(
         "java_path": record.java_path,
         "session_id": record.session_id.0,
         "healing": record.healing,
+        "guardian": record.guardian,
     })))
 }
 
@@ -94,6 +102,7 @@ async fn handle_launch_status(
         "failure_class": status.failure_class,
         "failure_detail": status.failure_detail,
         "healing": status.healing,
+        "guardian": status.guardian,
         "session_id": record.session_id.0,
     })))
 }
@@ -134,6 +143,7 @@ async fn handle_launch_kill(
                 failure_class: None,
                 failure_detail: Some("stopped by user".to_string()),
                 healing: record.healing.clone(),
+                guardian: record.guardian.clone(),
             },
         )
         .await;

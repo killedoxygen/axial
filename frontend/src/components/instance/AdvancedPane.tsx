@@ -60,7 +60,7 @@ export function AdvancedPane({ inst, cfg, isVanilla, javaPath, jvmPreset, extraJ
             onInput={(e) => onJavaPath((e.currentTarget as HTMLInputElement).value)}
           />
           <div class="setting-hint">
-            Global: {cfg?.java_path_override || 'auto-detected managed runtime'}
+            Global: {cfg?.java_path_override || 'auto-detected managed runtime'}. Managed Guardian may bypass an incompatible override before launch.
           </div>
         </div>
         <div class="setting-group">
@@ -81,7 +81,7 @@ export function AdvancedPane({ inst, cfg, isVanilla, javaPath, jvmPreset, extraJ
             <option value="legacy_heavy">Legacy Heavy</option>
           </select>
           <div class="setting-hint">
-            Per-instance presets are treated as explicit manual choices by the self-healing layer.
+            Guardian Mode decides whether Croopor may correct this preset for compatibility or stop before launch with guidance.
           </div>
         </div>
         <div class="setting-group">
@@ -95,7 +95,7 @@ export function AdvancedPane({ inst, cfg, isVanilla, javaPath, jvmPreset, extraJ
             onInput={(e) => onExtraJvmArgs((e.currentTarget as HTMLTextAreaElement).value)}
           />
           <div class="setting-hint">
-            Appended to the computed flags. Use for testing self-healing guardrails.
+            Appended to the computed flags. Managed Guardian may strip fatal combinations; Custom Guardian will stop and tell you what to fix.
           </div>
         </div>
         <div class="advanced-actions">

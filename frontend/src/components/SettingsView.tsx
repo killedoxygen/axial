@@ -6,7 +6,8 @@ import { Music, musicStateVersion } from '../music';
 import { Sound, playSliderSound } from '../sound';
 import { applyTheme, findFixedLightness, initColorField, isLowContrastTheme } from '../theme';
 import {
-  settingsJavaPath, settingsJavaRuntimes, settingsJavaRuntimesState, settingsJvmPreset, settingsPerformanceMode,
+  settingsGuardianMode, settingsJavaPath, settingsJavaRuntimes, settingsJavaRuntimesState,
+  settingsJvmPreset, settingsPerformanceMode,
   settingsWindowHeight, settingsWindowWidth,
 } from '../settings';
 import { recordingShortcut, resetShortcut, Shortcuts, startRecording } from '../shortcuts';
@@ -75,6 +76,19 @@ const PERFORMANCE_MODES = [
   { value: 'managed', label: 'Managed', tip: 'Croopor resolves and installs the managed performance stack automatically.' },
   { value: 'vanilla', label: 'Vanilla', tip: 'Disables the managed stack while keeping the regular launcher path.' },
   { value: 'custom', label: 'Custom', tip: 'Leaves mod management to you while still showing performance state.' },
+] as const;
+
+const GUARDIAN_MODES = [
+  {
+    value: 'managed',
+    label: 'Managed',
+    tip: 'Guardian may correct unsafe launch choices for you, while leaving logs for every intervention.',
+  },
+  {
+    value: 'custom',
+    label: 'Custom',
+    tip: 'Guardian respects your launch choices and only blocks guaranteed-fatal setups with guidance.',
+  },
 ] as const;
 
 function markerStyle(): JSX.CSSProperties {
@@ -311,6 +325,23 @@ export function SettingsView(): JSX.Element {
             </select>
             <p class="setting-hint">
               {PERFORMANCE_MODES.find((mode) => mode.value === settingsPerformanceMode.value)?.tip}
+            </p>
+          </div>
+
+          <div class="setting-group">
+            <label class="setting-label">Guardian Mode</label>
+            <select
+              class="ni-loader-select"
+              autocomplete="off"
+              value={settingsGuardianMode.value}
+              onChange={(e) => { settingsGuardianMode.value = (e.currentTarget as HTMLSelectElement).value; }}
+            >
+              {GUARDIAN_MODES.map((mode) => (
+                <option key={mode.value} value={mode.value}>{mode.label}</option>
+              ))}
+            </select>
+            <p class="setting-hint">
+              {GUARDIAN_MODES.find((mode) => mode.value === settingsGuardianMode.value)?.tip}
             </p>
           </div>
         </section>

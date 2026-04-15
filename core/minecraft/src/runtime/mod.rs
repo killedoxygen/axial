@@ -108,7 +108,6 @@ pub enum RuntimeOverride {
 pub enum RuntimeEnsureAction {
     UseRequested,
     UseManaged,
-    BypassRequested,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -248,9 +247,7 @@ pub async fn ensure_runtime(
         }
     };
 
-    if let Some(requested_runtime) = requested.clone()
-        && !should_bypass_requested_runtime(java_version, &requested_runtime)
-    {
+    if let Some(requested_runtime) = requested.clone() {
         return Ok(RuntimeEnsureResult {
             requested: Some(requested_runtime.clone()),
             effective: requested_runtime,
@@ -261,18 +258,13 @@ pub async fn ensure_runtime(
     }
 
     let managed = ensure_managed_runtime(library_dir, &requirement).await?;
-    let bypassed_requested_runtime = requested.is_some();
 
     Ok(RuntimeEnsureResult {
         requested,
         effective: managed.effective,
-        bypassed_requested_runtime,
+        bypassed_requested_runtime: false,
         install_performed: managed.install_performed,
-        action: if bypassed_requested_runtime {
-            RuntimeEnsureAction::BypassRequested
-        } else {
-            RuntimeEnsureAction::UseManaged
-        },
+        action: RuntimeEnsureAction::UseManaged,
     })
 }
 
@@ -324,19 +316,6 @@ fn known_runtime_components() -> [&'static str; 6] {
         "java-runtime-alpha",
         "jre-legacy",
     ]
-}
-
-fn should_bypass_requested_runtime(java_version: &JavaVersion, runtime: &RuntimeRecord) -> bool {
-    if runtime.source != RuntimeSource::ExternalOverride {
-        return false;
-    }
-    if runtime.info.major == 0 || java_version.major_version == 0 {
-        return false;
-    }
-    if runtime.info.major as i32 != java_version.major_version {
-        return true;
-    }
-    runtime.info.major == 8
 }
 
 fn resolve_component_runtime(

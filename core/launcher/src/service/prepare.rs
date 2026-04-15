@@ -3,12 +3,11 @@ use super::{
     LaunchPreparationMetrics, PreparedLaunchAttempt, build_healing_summary, infer_loader,
 };
 use crate::build::{VanillaLaunchRequest, plan_resolved_launch};
-use crate::jvm::{boot_throttle_args, gc_preset_args, resolve_preset};
+use crate::guardian::resolve_launch_preset;
+use crate::jvm::{boot_throttle_args, gc_preset_args};
 use crate::runtime::RuntimeSelection;
 use crate::types::LaunchFailureClass;
-use croopor_minecraft::{
-    JavaRuntimeInfo, JavaVersion, RuntimeEnsureAction, ensure_runtime, resolve_version,
-};
+use croopor_minecraft::{JavaRuntimeInfo, JavaVersion, ensure_runtime, resolve_version};
 use std::time::Instant;
 
 pub async fn prepare_launch_attempt(
@@ -42,7 +41,6 @@ pub async fn prepare_launch_attempt(
             requested_preset: &intent.requested_preset,
             effective_java_path: None,
             effective_preset: None,
-            advanced_overrides: intent.advanced_overrides,
             fallback_applied: attempt.fallback_applied.as_deref(),
             retry_count: attempt.retry_count,
             failure_class: Some(LaunchFailureClass::JavaRuntimeMismatch),
@@ -50,61 +48,110 @@ pub async fn prepare_launch_attempt(
     })?;
     let runtime_ms = runtime_started_at.elapsed().as_millis();
 
+    if intent.guardian.has_java_override()
+        && let Some(requested_runtime) = ensured_runtime.requested.as_ref()
+        && let Err((class, message)) = super::validation::validate_requested_java_override(
+            &intent.requested_java,
+            &requested_runtime.info,
+            version.java_version.major_version,
+        )
+    {
+        return Err(LaunchPreparationError {
+            message,
+            failure_class: Some(class),
+            healing: build_healing_summary(HealingSummaryInput {
+                requested_java_path: &intent.requested_java,
+                requested_preset: &intent.requested_preset,
+                effective_java_path: Some(ensured_runtime.effective.java_path.as_str()),
+                effective_preset: None,
+                fallback_applied: attempt.fallback_applied.as_deref(),
+                retry_count: attempt.retry_count,
+                failure_class: Some(class),
+            }),
+        });
+    }
+
     let mut runtime = runtime_selection_from_ensure(&intent.requested_java, ensured_runtime);
     sanitize_effective_runtime_major(&mut runtime, &version.java_version);
 
     let loader = infer_loader(&intent.version_id);
     let is_modded = loader != "vanilla" || !version.inherits_from.trim().is_empty();
-    let mut effective_preset = attempt.preset_override.clone().unwrap_or_else(|| {
-        resolve_preset(
+    let mut guardian_interventions = Vec::new();
+    let mut effective_preset = if let Some(preset_override) = attempt.preset_override.clone() {
+        preset_override
+    } else {
+        let resolved = resolve_launch_preset(
+            &intent.guardian,
             &intent.requested_preset,
             &intent.version_id,
             loader,
             is_modded,
             &runtime.effective_info,
         )
-    });
+        .map_err(|(class, message)| LaunchPreparationError {
+            message,
+            failure_class: Some(class),
+            healing: build_healing_summary(HealingSummaryInput {
+                requested_java_path: &intent.requested_java,
+                requested_preset: &intent.requested_preset,
+                effective_java_path: Some(runtime.effective_path.as_str()),
+                effective_preset: None,
+                fallback_applied: attempt.fallback_applied.as_deref(),
+                retry_count: attempt.retry_count,
+                failure_class: Some(class),
+            }),
+        })?;
+        if let Some(intervention) = resolved.intervention {
+            guardian_interventions.push(intervention);
+        }
+        resolved.effective_preset
+    };
 
-    if intent.advanced_overrides {
-        if let Err((class, message)) = super::validation::validate_manual_java_override(
+    if intent.guardian.has_java_override()
+        && let Err((class, message)) = super::validation::validate_manual_java_override(
             &intent.requested_java,
             &runtime,
             version.java_version.major_version,
-        ) {
-            return Err(LaunchPreparationError {
-                message,
+        )
+    {
+        return Err(LaunchPreparationError {
+            message,
+            failure_class: Some(class),
+            healing: build_healing_summary(HealingSummaryInput {
+                requested_java_path: &intent.requested_java,
+                requested_preset: &intent.requested_preset,
+                effective_java_path: Some(runtime.effective_path.as_str()),
+                effective_preset: Some(effective_preset.as_str()),
+                fallback_applied: attempt.fallback_applied.as_deref(),
+                retry_count: attempt.retry_count,
                 failure_class: Some(class),
-                healing: build_healing_summary(HealingSummaryInput {
-                    requested_java_path: &intent.requested_java,
-                    requested_preset: &intent.requested_preset,
-                    effective_java_path: Some(runtime.effective_path.as_str()),
-                    effective_preset: Some(effective_preset.as_str()),
-                    advanced_overrides: intent.advanced_overrides,
-                    fallback_applied: attempt.fallback_applied.as_deref(),
-                    retry_count: attempt.retry_count,
-                    failure_class: Some(class),
-                }),
-            });
-        }
-        if let Err((class, message)) = super::validation::validate_manual_jvm_args(
-            &intent.extra_jvm_args,
+            }),
+        });
+    }
+    let effective_extra_jvm_args = if attempt.ignore_extra_jvm_args {
+        Vec::new()
+    } else {
+        intent.extra_jvm_args.clone()
+    };
+    if intent.guardian.has_raw_jvm_args()
+        && let Err((class, message)) = super::validation::validate_manual_jvm_args(
+            &effective_extra_jvm_args,
             &runtime.effective_info,
-        ) {
-            return Err(LaunchPreparationError {
-                message,
+        )
+    {
+        return Err(LaunchPreparationError {
+            message,
+            failure_class: Some(class),
+            healing: build_healing_summary(HealingSummaryInput {
+                requested_java_path: &intent.requested_java,
+                requested_preset: &intent.requested_preset,
+                effective_java_path: Some(runtime.effective_path.as_str()),
+                effective_preset: Some(effective_preset.as_str()),
+                fallback_applied: attempt.fallback_applied.as_deref(),
+                retry_count: attempt.retry_count,
                 failure_class: Some(class),
-                healing: build_healing_summary(HealingSummaryInput {
-                    requested_java_path: &intent.requested_java,
-                    requested_preset: &intent.requested_preset,
-                    effective_java_path: Some(runtime.effective_path.as_str()),
-                    effective_preset: Some(effective_preset.as_str()),
-                    advanced_overrides: intent.advanced_overrides,
-                    fallback_applied: attempt.fallback_applied.as_deref(),
-                    retry_count: attempt.retry_count,
-                    failure_class: Some(class),
-                }),
-            });
-        }
+            }),
+        });
     }
 
     let healing = build_healing_summary(HealingSummaryInput {
@@ -112,7 +159,6 @@ pub async fn prepare_launch_attempt(
         requested_preset: &intent.requested_preset,
         effective_java_path: Some(runtime.effective_path.as_str()),
         effective_preset: Some(effective_preset.as_str()),
-        advanced_overrides: intent.advanced_overrides,
         fallback_applied: attempt.fallback_applied.as_deref(),
         retry_count: attempt.retry_count,
         failure_class: None,
@@ -128,7 +174,7 @@ pub async fn prepare_launch_attempt(
     } else if attempt.disable_custom_gc {
         effective_preset.clear();
     }
-    extra_jvm_args.extend(intent.extra_jvm_args.iter().cloned());
+    extra_jvm_args.extend(effective_extra_jvm_args);
 
     let planning_started_at = Instant::now();
     let plan = plan_resolved_launch(
@@ -160,6 +206,7 @@ pub async fn prepare_launch_attempt(
         effective_preset,
         plan,
         healing,
+        guardian_interventions,
         metrics: LaunchPreparationMetrics {
             version_ms,
             runtime_ms,
@@ -205,8 +252,7 @@ fn runtime_selection_from_ensure(
         effective_path: ensured.effective.java_path.clone(),
         effective_info: ensured.effective.info.clone(),
         effective_source: ensured.effective.source.as_str().to_string(),
-        bypassed_requested_runtime: ensured.bypassed_requested_runtime
-            || matches!(ensured.action, RuntimeEnsureAction::BypassRequested),
+        bypassed_requested_runtime: ensured.bypassed_requested_runtime,
     }
 }
 

@@ -16,6 +16,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub performance_mode: String,
     #[serde(default)]
+    pub guardian_mode: String,
+    #[serde(default)]
     pub theme: String,
     #[serde(default)]
     pub custom_hue: Option<i32>,
@@ -48,6 +50,7 @@ impl Default for AppConfig {
             window_height: 0,
             jvm_preset: String::new(),
             performance_mode: "managed".to_string(),
+            guardian_mode: "managed".to_string(),
             theme: String::new(),
             custom_hue: None,
             custom_vibrancy: None,
@@ -76,6 +79,10 @@ impl AppConfig {
         if self.performance_mode.is_empty() {
             self.performance_mode = "managed".to_string();
         }
+        self.guardian_mode = match self.guardian_mode.trim() {
+            "custom" => "custom".to_string(),
+            _ => "managed".to_string(),
+        };
         if self.library_mode.is_empty() {
             self.library_mode = "managed".to_string();
         }

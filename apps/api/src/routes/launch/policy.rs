@@ -1,5 +1,5 @@
 use croopor_config::{AppConfig, Instance};
-use croopor_launcher::SessionId;
+use croopor_launcher::{GuardianMode, OverrideOrigin, SessionId};
 use std::time::SystemTime;
 
 pub(super) fn selected_java_override(instance: &Instance, config: &AppConfig) -> String {
@@ -83,10 +83,38 @@ pub(super) fn split_jvm_args(extra_jvm_args: &str) -> Vec<String> {
     })
 }
 
-pub(super) fn has_advanced_overrides(instance: &Instance) -> bool {
-    !instance.java_path.trim().is_empty()
-        || !instance.jvm_preset.trim().is_empty()
-        || !instance.extra_jvm_args.trim().is_empty()
+pub(super) fn selected_guardian_mode(config: &AppConfig) -> GuardianMode {
+    GuardianMode::from_config(&config.guardian_mode)
+}
+
+pub(super) fn java_override_origin(
+    instance: &Instance,
+    config: &AppConfig,
+) -> Option<OverrideOrigin> {
+    if !instance.java_path.trim().is_empty() {
+        Some(OverrideOrigin::Instance)
+    } else if !config.java_path_override.trim().is_empty() {
+        Some(OverrideOrigin::Global)
+    } else {
+        None
+    }
+}
+
+pub(super) fn preset_override_origin(
+    instance: &Instance,
+    config: &AppConfig,
+) -> Option<OverrideOrigin> {
+    if !instance.jvm_preset.trim().is_empty() {
+        Some(OverrideOrigin::Instance)
+    } else if !config.jvm_preset.trim().is_empty() {
+        Some(OverrideOrigin::Global)
+    } else {
+        None
+    }
+}
+
+pub(super) fn raw_jvm_args_origin(instance: &Instance) -> Option<OverrideOrigin> {
+    (!instance.extra_jvm_args.trim().is_empty()).then_some(OverrideOrigin::Instance)
 }
 
 pub(super) fn generate_session_id() -> SessionId {

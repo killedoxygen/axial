@@ -32,6 +32,7 @@ export interface Version {
   id: string;
   type: string;
   release_time?: string;
+  meta: VersionMeta;
   inherits_from?: string;
   launchable: boolean;
   installed: boolean;
@@ -54,6 +55,7 @@ export interface Config {
   window_height?: number;
   jvm_preset?: string;
   performance_mode?: string;
+  guardian_mode?: string;
   theme?: string;
   custom_hue?: number;
   custom_vibrancy?: number;
@@ -77,6 +79,7 @@ export interface CatalogVersion {
   id: string;
   type: string;
   release_time: string;
+  meta: VersionMeta;
   url: string;
   installed: boolean;
 }
@@ -115,7 +118,31 @@ export interface RunningSession {
   launchedAt: string;
   allocatedMB: number;
   healing?: LaunchHealingSummary;
+  guardian?: GuardianSummary;
   eventSource?: EventSource;
+}
+
+export type GuardianMode = 'managed' | 'custom';
+
+export type GuardianDecision = 'allowed' | 'warned' | 'blocked' | 'intervened';
+
+export type GuardianInterventionKind =
+  | 'switch_managed_runtime'
+  | 'strip_jvm_args'
+  | 'downgrade_preset'
+  | 'disable_custom_gc';
+
+export interface GuardianIntervention {
+  kind: GuardianInterventionKind;
+  detail?: string;
+  silent?: boolean;
+}
+
+export interface GuardianSummary {
+  mode: GuardianMode;
+  decision: GuardianDecision;
+  guidance?: string[];
+  interventions?: GuardianIntervention[];
 }
 
 export type HealingEventKind =
@@ -139,7 +166,6 @@ export interface LaunchHealingSummary {
   fallback_applied?: string;
   retry_count?: number;
   failure_class?: string;
-  advanced_overrides?: boolean;
   events?: HealingEvent[];
 }
 
@@ -268,7 +294,21 @@ export interface LoaderBuildsResponse {
 
 export interface LoaderGameVersion {
   version: string;
+  type: string;
+  release_time?: string;
+  meta: VersionMeta;
   stable: boolean;
+}
+
+export interface VersionMeta {
+  canonical_kind: string;
+  family: string;
+  base_id: string;
+  effective_version: string;
+  variant_of: string;
+  variant_kind: string;
+  display_name: string;
+  display_hint: string;
 }
 
 export interface LoaderGameVersionsResponse {

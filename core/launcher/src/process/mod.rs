@@ -14,6 +14,8 @@ pub struct LaunchStatusEvent {
     pub failure_detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub healing: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guardian: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -50,4 +52,5 @@ pub struct LaunchSessionRecord {
     pub natives_dir: Option<String>,
     pub failure: Option<LaunchFailure>,
     pub healing: Option<serde_json::Value>,
+    pub guardian: Option<serde_json::Value>,
 }

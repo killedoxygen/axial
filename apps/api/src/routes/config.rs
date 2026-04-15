@@ -19,6 +19,7 @@ struct ConfigPatch {
     onboarding_done: Option<bool>,
     jvm_preset: Option<String>,
     performance_mode: Option<String>,
+    guardian_mode: Option<String>,
     theme: Option<String>,
     custom_hue: Option<i32>,
     custom_vibrancy: Option<i32>,
@@ -71,6 +72,9 @@ async fn handle_update_config(
     }
     if let Some(performance_mode) = patch.performance_mode {
         next.performance_mode = performance_mode;
+    }
+    if let Some(guardian_mode) = patch.guardian_mode {
+        next.guardian_mode = guardian_mode;
     }
     if let Some(theme) = patch.theme {
         next.theme = theme;

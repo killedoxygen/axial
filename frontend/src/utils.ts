@@ -136,6 +136,12 @@ interface VersionDisplay {
 
 export function parseVersionDisplay(versionId: string, version: any, versions: any[]): VersionDisplay {
   if (version?.inherits_from) return parseModded(versionId, version.inherits_from);
+  if (version?.meta?.display_name) {
+    return {
+      name: version.meta.display_name,
+      hint: version.meta.display_hint || null,
+    };
+  }
   const type = version?.type;
   if (type === 'old_beta') return { name: versionId.replace(/^b/, 'Beta '), hint: null };
   if (type === 'old_alpha') return { name: versionId.replace(/^a/, 'Alpha '), hint: null };
@@ -178,6 +184,12 @@ function parseModded(id: string, base: string): VersionDisplay {
 }
 
 function parseSnapshot(id: string, version: any, versions: any[]): VersionDisplay {
+  if (version?.meta?.display_name) {
+    return {
+      name: version.meta.display_name,
+      hint: version.meta.display_hint || null,
+    };
+  }
   // pre-release / release candidate: 1.20.5-pre1, 1.20.5-rc1
   const m = id.match(/^(\d+\.\d+(?:\.\d+)?)-(?:pre|rc)\d+$/);
   if (m) return { name: id, hint: null };

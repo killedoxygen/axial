@@ -50,6 +50,8 @@ function validateName(name: string): string | null {
 
 function inferLoaderVersionType(version: LoaderGameVersion, catalogVersion?: CatalogVersion): string {
   if (catalogVersion?.type) return catalogVersion.type;
+  if (version.meta?.canonical_kind) return version.meta.canonical_kind;
+  if (version.type) return version.type;
   if (version.version.startsWith('b')) return 'old_beta';
   if (version.version.startsWith('a')) return 'old_alpha';
   return version.stable ? 'release' : 'snapshot';
@@ -62,7 +64,17 @@ function toLoaderVersionEntry(
   return {
     id: version.version,
     type: inferLoaderVersionType(version, catalogVersion),
-    release_time: catalogVersion?.release_time ?? '',
+    release_time: version.release_time || catalogVersion?.release_time || '',
+    meta: version.meta || catalogVersion?.meta || {
+      canonical_kind: inferLoaderVersionType(version, catalogVersion),
+      family: '',
+      base_id: version.version,
+      effective_version: '',
+      variant_of: '',
+      variant_kind: '',
+      display_name: version.version,
+      display_hint: '',
+    },
     url: catalogVersion?.url ?? '',
     installed: false,
     stable: version.stable,

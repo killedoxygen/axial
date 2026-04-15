@@ -1,12 +1,15 @@
 use super::cache::resolve_cached;
-use super::normalize::normalize_build_index;
+use super::normalize::{normalize_build_index, normalize_supported_versions};
 use crate::loaders::api::{loader_components, parse_build_id};
 use crate::loaders::providers;
 use crate::loaders::types::{
     LoaderBuildRecord, LoaderCatalogState, LoaderComponentId, LoaderComponentRecord, LoaderError,
     LoaderGameVersion,
 };
+use crate::manifest::fetch_version_manifest;
 use crate::paths::loader_catalog_dir;
+use crate::version_meta::{enrich_loader_game_versions, manifest_release_entries};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -21,12 +24,23 @@ pub async fn fetch_supported_versions(
     library_dir: &Path,
     component_id: LoaderComponentId,
 ) -> Result<(Vec<LoaderGameVersion>, LoaderCatalogState), LoaderError> {
-    resolve_cached(
+    let (mut versions, catalog) = resolve_cached(
         supported_versions_cache_path(library_dir, component_id),
         SUPPORTED_VERSIONS_TTL,
         || providers::fetch_supported_versions(component_id),
     )
-    .await
+    .await?;
+    let catalog_order = if let Ok(manifest) = fetch_version_manifest().await {
+        let releases = manifest_release_entries(&manifest.versions);
+        enrich_loader_game_versions(&mut versions, &manifest.versions, &releases);
+        Some(catalog_version_order(&manifest.versions))
+    } else {
+        None
+    };
+    Ok((
+        normalize_supported_versions(versions, catalog_order.as_ref()),
+        catalog,
+    ))
 }
 
 pub async fn fetch_builds(
@@ -102,4 +116,12 @@ fn sanitize_segment(value: &str) -> Result<String, LoaderError> {
         return Err(LoaderError::InvalidMinecraftVersion);
     }
     Ok(value.to_string())
+}
+
+fn catalog_version_order(entries: &[crate::manifest::ManifestEntry]) -> HashMap<String, usize> {
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| (entry.id.clone(), index))
+        .collect()
 }

@@ -1,3 +1,4 @@
+use crate::version_meta::VersionMeta;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -15,6 +16,8 @@ pub struct VersionEntry {
     pub kind: String,
     #[serde(default)]
     pub release_time: String,
+    #[serde(default)]
+    pub meta: VersionMeta,
     #[serde(default)]
     pub inherits_from: String,
     pub launchable: bool,

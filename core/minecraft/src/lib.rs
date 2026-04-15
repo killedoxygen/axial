@@ -10,6 +10,7 @@ pub mod rules;
 pub mod runtime;
 pub mod types;
 pub mod version;
+pub mod version_meta;
 
 pub use download::{DownloadError, DownloadProgress, Downloader};
 pub use java::{
@@ -48,3 +49,8 @@ pub use runtime::{
 };
 pub use types::VersionEntry;
 pub use version::scan_versions;
+pub use version_meta::{
+    ReleaseReference, VersionMeta, analyze_version_metadata, apply_version_metadata,
+    compare_version_entries, compare_version_like, enrich_loader_game_versions,
+    enrich_version_entries, manifest_release_entries, manifest_release_references,
+};

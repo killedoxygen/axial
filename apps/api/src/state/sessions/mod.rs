@@ -20,6 +20,7 @@ struct SessionEntry {
     startup_observed: Arc<AtomicBool>,
     boot_completed: Arc<AtomicBool>,
     log_count: Arc<AtomicUsize>,
+    observed_failure: Option<LaunchFailure>,
 }
 
 pub struct SessionStore {
@@ -53,6 +54,7 @@ impl SessionStore {
                 startup_observed: Arc::new(AtomicBool::new(false)),
                 boot_completed: Arc::new(AtomicBool::new(false)),
                 log_count: Arc::new(AtomicUsize::new(0)),
+                observed_failure: None,
             },
         );
     }
@@ -85,7 +87,15 @@ impl SessionStore {
         if let Some(entry) = sessions.get_mut(session_id) {
             entry.startup_observed.store(true, Ordering::Relaxed);
             entry.log_count.fetch_add(1, Ordering::Relaxed);
-            if entry.record.state == LaunchState::Starting {
+            if classify::boot_marker_detected(&text) {
+                entry.boot_completed.store(true, Ordering::Relaxed);
+            }
+            if entry.boot_completed.load(Ordering::Relaxed)
+                && matches!(
+                    entry.record.state,
+                    LaunchState::Starting | LaunchState::Monitoring
+                )
+            {
                 entry.record.state = LaunchState::Running;
                 let _ = entry.events.send(LaunchEvent::Status(LaunchStatusEvent {
                     state: "running".to_string(),
@@ -94,14 +104,12 @@ impl SessionStore {
                     failure_class: None,
                     failure_detail: None,
                     healing: entry.record.healing.clone(),
+                    guardian: entry.record.guardian.clone(),
                 }));
-            }
-            if classify::boot_marker_detected(&text) {
-                entry.boot_completed.store(true, Ordering::Relaxed);
             }
             let failure_class = classify::classify_failure_text(&text);
             if failure_class != LaunchFailureClass::Unknown {
-                entry.record.failure = Some(LaunchFailure {
+                entry.observed_failure = Some(LaunchFailure {
                     class: failure_class,
                     detail: Some(text.clone()),
                 });
@@ -131,6 +139,9 @@ impl SessionStore {
             if event.healing.is_some() {
                 entry.record.healing = event.healing.clone();
             }
+            if event.guardian.is_some() {
+                entry.record.guardian = event.guardian.clone();
+            }
             let _ = entry.events.send(LaunchEvent::Status(event));
         }
     }
@@ -158,6 +169,7 @@ impl SessionStore {
                 entry.startup_observed.store(false, Ordering::Relaxed);
                 entry.boot_completed.store(false, Ordering::Relaxed);
                 entry.log_count.store(0, Ordering::Relaxed);
+                entry.observed_failure = None;
             } else {
                 let (events, _) = broadcast::channel(256);
                 sessions.insert(
@@ -169,6 +181,7 @@ impl SessionStore {
                         startup_observed: startup_observed.clone(),
                         boot_completed: Arc::new(AtomicBool::new(false)),
                         log_count: Arc::new(AtomicUsize::new(0)),
+                        observed_failure: None,
                     },
                 );
             }
@@ -183,6 +196,7 @@ impl SessionStore {
                 failure_class: None,
                 failure_detail: None,
                 healing: record.healing.clone(),
+                guardian: record.guardian.clone(),
             },
         )
         .await;
@@ -219,6 +233,14 @@ impl SessionStore {
 
     pub async fn remove(&self, session_id: &str) {
         self.sessions.write().await.remove(session_id);
+    }
+
+    pub async fn observed_failure(&self, session_id: &str) -> Option<LaunchFailure> {
+        self.sessions
+            .read()
+            .await
+            .get(session_id)
+            .and_then(|entry| entry.observed_failure.clone())
     }
 
     pub async fn terminate_all(&self) {

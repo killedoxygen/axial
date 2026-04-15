@@ -1,4 +1,5 @@
 use crate::download::DownloadError;
+use crate::version_meta::VersionMeta;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -66,6 +67,12 @@ pub struct LoaderComponentRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoaderGameVersion {
     pub version: String,
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    #[serde(default)]
+    pub release_time: String,
+    #[serde(default)]
+    pub meta: VersionMeta,
     pub stable: bool,
 }
 

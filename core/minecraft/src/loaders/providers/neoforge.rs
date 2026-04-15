@@ -7,6 +7,7 @@ use crate::loaders::types::{
     LoaderArtifactKind, LoaderBuildRecord, LoaderComponentId, LoaderGameVersion,
     LoaderInstallSource, LoaderInstallStrategy, LoaderInstallability, LoaderVersionIndex,
 };
+use crate::version_meta::VersionMeta;
 
 pub async fn fetch_game_versions()
 -> Result<Vec<LoaderGameVersion>, crate::loaders::types::LoaderError> {
@@ -22,6 +23,9 @@ pub async fn fetch_game_versions()
         }
         versions.push(LoaderGameVersion {
             version: minecraft_version,
+            kind: String::new(),
+            release_time: String::new(),
+            meta: VersionMeta::default(),
             stable: true,
         });
     }

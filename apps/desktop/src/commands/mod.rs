@@ -171,6 +171,7 @@ fn snapshot_status(record: &LaunchSessionRecord) -> LaunchStatusEvent {
             .as_ref()
             .and_then(|failure| failure.detail.clone()),
         healing: record.healing.clone(),
+        guardian: record.guardian.clone(),
     }
 }
 

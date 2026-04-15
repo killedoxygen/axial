@@ -16,7 +16,7 @@ import {
   clearLaunchNotice, confirmLaunch, endLaunchPrep, endSession, setLaunchNotice, startLaunch,
   updateInstanceInList, updateRunningSessionState,
 } from './actions';
-import type { HealingEvent, LaunchHealingSummary } from './types';
+import type { GuardianSummary, HealingEvent, LaunchHealingSummary } from './types';
 
 function rollbackLaunch(instanceId: string, animationFrameId: number | null): void {
   if (animationFrameId !== null) cancelAnimationFrame(animationFrameId);
@@ -97,6 +97,10 @@ function formatHealingDetail(detail: string): string {
     return 'Java override was skipped and the managed runtime was used instead.';
   }
 
+  if (trimmed === 'Guardian switched to managed Java before launch') {
+    return 'Guardian switched to the managed Java runtime before launch.';
+  }
+
   match = trimmed.match(/^Automatic retry: downgraded JVM preset to "([^"]+)" after startup failure$/);
   if (match) {
     return `Croopor retried startup with the ${formatPresetName(match[1])} GC preset.`;
@@ -126,9 +130,6 @@ function formatHealingDetail(detail: string): string {
 
 function healingToastMessage(healing: LaunchHealingSummary): string {
   if (healing.failure_class && (!healing.retry_count || healing.retry_count === 0) && !healing.fallback_applied) {
-    if (healing.advanced_overrides) {
-      return 'Launch stopped before startup because the manual overrides were not compatible.';
-    }
     if (healing.failure_class === 'java_runtime_mismatch') {
       return 'Launch stopped before startup because the required Java runtime was not available.';
     }
@@ -196,24 +197,97 @@ function friendlyLaunchErrorDetail(message: string): string {
   return ensureSentence(detail);
 }
 
-function surfaceHealing(healing: LaunchHealingSummary | undefined, instanceId: string, instanceName: string, showNotice = true): void {
-  if (!healing) return;
-  for (const detail of healingNoticeDetails(healing)) {
+function guardianNoticeDetails(guardian: GuardianSummary | undefined): string[] {
+  if (!guardian) return [];
+  const details: string[] = [];
+  for (const intervention of guardian.interventions || []) {
+    pushUniqueNoticeDetail(details, intervention.detail);
+  }
+  for (const guidance of guardian.guidance || []) {
+    pushUniqueNoticeDetail(details, guidance);
+  }
+  return details;
+}
+
+function guardianToastMessage(guardian: GuardianSummary | undefined): string {
+  if (!guardian) return '';
+  if (guardian.decision === 'blocked') {
+    return 'Guardian blocked an unsafe launch setup.';
+  }
+  if (guardian.decision === 'intervened') {
+    return 'Guardian adjusted launch settings for safety.';
+  }
+  return '';
+}
+
+function guardianOwnsLaunchOutcome(
+  guardian: GuardianSummary | undefined,
+  healing: LaunchHealingSummary | undefined,
+): boolean {
+  if (!guardian || guardian.decision !== 'intervened') return false;
+  if (!healing) return true;
+  return !healing.failure_class && !healing.retry_count;
+}
+
+function launchOutcomeDetails(
+  guardian: GuardianSummary | undefined,
+  healing: LaunchHealingSummary | undefined,
+  leadDetail = '',
+): string[] {
+  const details: string[] = [];
+  pushUniqueNoticeDetail(details, leadDetail);
+  for (const detail of guardianNoticeDetails(guardian)) {
+    pushUniqueNoticeDetail(details, detail);
+  }
+  const includeHealing = !guardianOwnsLaunchOutcome(guardian, healing);
+  if (includeHealing) {
+    for (const detail of healingNoticeDetails(healing || {})) {
+      pushUniqueNoticeDetail(details, detail);
+    }
+  }
+  return details;
+}
+
+function launchOutcomeMessage(
+  guardian: GuardianSummary | undefined,
+  healing: LaunchHealingSummary | undefined,
+  fallbackMessage = '',
+): string {
+  return guardianToastMessage(guardian) || healingToastMessage(healing || {}) || fallbackMessage;
+}
+
+function launchOutcomeTone(
+  guardian: GuardianSummary | undefined,
+  healing: LaunchHealingSummary | undefined,
+): import('./types').LaunchNoticeTone {
+  if (guardian?.decision === 'blocked' || healing?.failure_class) return 'error';
+  if (healing?.retry_count && healing.retry_count > 0) return 'success';
+  return 'info';
+}
+
+function surfaceLaunchOutcome(
+  guardian: GuardianSummary | undefined,
+  healing: LaunchHealingSummary | undefined,
+  instanceId: string,
+  instanceName: string,
+  showNotice = true,
+  leadDetail = '',
+  fallbackMessage = '',
+): boolean {
+  const details = launchOutcomeDetails(guardian, healing, leadDetail);
+  for (const detail of details) {
     appendLog('system', detail, instanceId, instanceName);
   }
-  if (!showNotice) {
-    return;
-  }
-  const message = healingToastMessage(healing);
-  if (message) {
-    const details = healingNoticeDetails(healing);
-    setLaunchNotice(instanceId, {
-      message,
-      detail: primaryNoticeDetail(details),
-      details,
-      tone: healing.failure_class ? 'error' : (healing.retry_count && healing.retry_count > 0 ? 'success' : 'info'),
-    });
-  }
+  if (!showNotice) return details.length > 0;
+  const message = launchOutcomeMessage(guardian, healing, fallbackMessage);
+  if (!message) return false;
+  setLaunchNotice(instanceId, {
+    message,
+    detail: primaryNoticeDetail(details),
+    details,
+    tone: launchOutcomeTone(guardian, healing),
+  });
+  return true;
 }
 
 export async function launchGame(): Promise<void> {
@@ -288,21 +362,18 @@ export async function launchGame(): Promise<void> {
     });
 
     if (res.error) {
-      surfaceHealing(res.healing, inst.id, inst.name, !res.healing?.failure_class);
-      if (!res.healing?.failure_class) {
+      const detail = friendlyLaunchErrorDetail(res.error);
+      const surfaced = surfaceLaunchOutcome(
+        res.guardian,
+        res.healing,
+        inst.id,
+        inst.name,
+        true,
+        detail,
+        'Launch stopped before startup.',
+      );
+      if (!surfaced) {
         showError(res.error);
-      } else {
-        const detail = friendlyLaunchErrorDetail(res.error);
-        const healingDetails = healingNoticeDetails(res.healing || {});
-        const details = [detail, ...healingDetails.filter((entry) => entry !== detail)];
-        const message = healingToastMessage(res.healing || {}) || 'Launch stopped before startup.';
-        setLaunchNotice(inst.id, {
-          message,
-          detail,
-          details,
-          tone: 'error',
-        });
-        appendLog('system', detail, inst.id, inst.name);
       }
       launchCommitted = false;
       rollbackLaunch(inst.id, launchAnimationFrameId);
@@ -314,13 +385,14 @@ export async function launchGame(): Promise<void> {
       sessionId: res.session_id,
       versionId: launchInst.version_id,
       pid: typeof res.pid === 'number' ? res.pid : 0,
-      state: 'queued',
+      state: 'monitoring',
       launchedAt,
       allocatedMB: maxMemMB,
       healing: res.healing,
+      guardian: res.guardian,
     });
     launchCommitted = true;
-    surfaceHealing(res.healing, inst.id, inst.name);
+    surfaceLaunchOutcome(res.guardian, res.healing, inst.id, inst.name);
     endLaunchSequence();
     Music.suppress();
     Sound.ui('launchSuccess');
@@ -395,6 +467,7 @@ async function connectLaunchEvents(sessionId: string, instanceId: string, instan
         pid: typeof data.pid === 'number' ? data.pid : runningSessions.value[instanceId]?.pid || 0,
         state: typeof data.state === 'string' ? data.state : runningSessions.value[instanceId]?.state,
         healing: data.healing || runningSessions.value[instanceId]?.healing,
+        guardian: data.guardian || runningSessions.value[instanceId]?.guardian,
       });
     }
     if (data.state === 'exited') onGameExited(data, instanceId, instanceName, sessionId, handle);
@@ -455,11 +528,15 @@ function onGameExited(data: any, instanceId: string, instanceName: string, sessi
 
   appendLog('system', `${instanceName || instanceId} exited with code ${exitCode}`, instanceId, instanceName);
   if (typeof data.failure_class === 'string' && data.failure_class) {
-    setLaunchNotice(instanceId, {
-      message: 'Startup failed and the launch was stopped cleanly.',
-      detail: formatHealingDetail(`Reason: ${describeFailureClass(data.failure_class)}`),
-      tone: 'error',
-    });
+    surfaceLaunchOutcome(
+      data.guardian,
+      data.healing,
+      instanceId,
+      instanceName,
+      true,
+      formatHealingDetail(`Reason: ${describeFailureClass(data.failure_class)}`),
+      'Startup failed and the launch was stopped cleanly.',
+    );
   }
 }
 

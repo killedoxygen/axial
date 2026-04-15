@@ -1,14 +1,12 @@
-use super::{LaunchHealingSummary, RecoveryAction, RecoveryPlan};
+use super::LaunchHealingSummary;
 use crate::healing::{HealingEvent, HealingEventKind};
 use crate::types::LaunchFailureClass;
-use croopor_minecraft::JavaRuntimeInfo;
 
 pub struct HealingSummaryInput<'a> {
     pub requested_java_path: &'a str,
     pub requested_preset: &'a str,
     pub effective_java_path: Option<&'a str>,
     pub effective_preset: Option<&'a str>,
-    pub advanced_overrides: bool,
     pub fallback_applied: Option<&'a str>,
     pub retry_count: u32,
     pub failure_class: Option<LaunchFailureClass>,
@@ -90,7 +88,6 @@ pub fn build_healing_summary(input: HealingSummaryInput<'_>) -> Option<LaunchHea
         fallback_applied,
         retry_count: (input.retry_count > 0).then_some(input.retry_count),
         failure_class: failure_class_name,
-        advanced_overrides: Some(input.advanced_overrides),
         events,
     };
 
@@ -103,7 +100,6 @@ pub fn build_healing_summary(input: HealingSummaryInput<'_>) -> Option<LaunchHea
         && summary.retry_count.is_none()
         && summary.failure_class.is_none()
         && summary.events.is_empty()
-        && !input.advanced_overrides
     {
         None
     } else {
@@ -126,73 +122,6 @@ pub fn infer_loader(version_id: &str) -> &'static str {
     }
 }
 
-pub fn recovery_for_failure(
-    class: LaunchFailureClass,
-    version_id: &str,
-    info: &JavaRuntimeInfo,
-    requested_java: &str,
-    advanced_overrides: bool,
-    disable_custom_gc: bool,
-    effective_preset: &str,
-) -> Option<RecoveryPlan> {
-    if advanced_overrides {
-        return None;
-    }
-
-    match class {
-        LaunchFailureClass::JvmUnsupportedOption
-        | LaunchFailureClass::JvmExperimentalUnlock
-        | LaunchFailureClass::JvmOptionOrdering => {
-            if !effective_preset.trim().is_empty() {
-                let preset = conservative_healing_preset(version_id, info);
-                if !preset.is_empty() && preset != effective_preset {
-                    return Some(RecoveryPlan {
-                        description: format!(
-                            "Automatic retry: downgraded JVM preset to \"{preset}\" after startup failure"
-                        ),
-                        action: RecoveryAction::DowngradePreset(preset),
-                    });
-                }
-            }
-            if !disable_custom_gc {
-                return Some(RecoveryPlan {
-                    description: "Automatic retry: disabled custom GC flags after startup failure"
-                        .to_string(),
-                    action: RecoveryAction::DisableCustomGc,
-                });
-            }
-        }
-        LaunchFailureClass::JavaRuntimeMismatch => {
-            if !requested_java.trim().is_empty() {
-                return Some(RecoveryPlan {
-                    description: "Automatic retry: switched to managed Java after runtime mismatch"
-                        .to_string(),
-                    action: RecoveryAction::SwitchManagedRuntime,
-                });
-            }
-        }
-        _ => {}
-    }
-    None
-}
-
-pub fn conservative_healing_preset(version_id: &str, info: &JavaRuntimeInfo) -> String {
-    if info.major <= 8 || is_legacy_version_family(version_id) {
-        "legacy".to_string()
-    } else {
-        "performance".to_string()
-    }
-}
-
-fn is_legacy_version_family(version_id: &str) -> bool {
-    let base = version_id.split("-forge-").next().unwrap_or(version_id);
-    let numbers = base
-        .split('.')
-        .filter_map(|part| part.parse::<u32>().ok())
-        .collect::<Vec<_>>();
-    matches!(numbers.as_slice(), [1, minor, ..] if *minor <= 12)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{HealingSummaryInput, build_healing_summary};
@@ -204,7 +133,6 @@ mod tests {
             requested_preset: "",
             effective_java_path: Some("/usr/bin/java"),
             effective_preset: None,
-            advanced_overrides: false,
             fallback_applied: None,
             retry_count: 0,
             failure_class: None,

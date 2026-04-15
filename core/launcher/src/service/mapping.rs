@@ -61,5 +61,6 @@ pub fn snapshot_status(
             .as_ref()
             .and_then(|failure| failure.detail.clone()),
         healing: record.healing.clone(),
+        guardian: record.guardian.clone(),
     }
 }

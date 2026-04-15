@@ -1,8 +1,8 @@
 use crate::loaders::infer_build_from_version_id;
 use crate::paths::versions_dir;
 use crate::types::VersionEntry;
+use crate::version_meta::{analyze_version_metadata, compare_version_entries};
 use serde::{Deserialize, Serialize};
-use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -113,11 +113,13 @@ pub fn scan_versions(mc_dir: &Path) -> std::io::Result<Vec<VersionEntry>> {
         };
 
         let loader_meta = infer_build_from_version_id(id);
+        let metadata = analyze_version_metadata(id, &stub.kind, &stub.release_time, None, &[]);
 
         versions.push(VersionEntry {
             id: id.clone(),
-            kind: stub.kind.clone(),
+            kind: metadata.canonical_kind.clone(),
             release_time: stub.release_time.clone(),
+            meta: metadata,
             inherits_from: effective_parent.clone(),
             launchable,
             installed: true,
@@ -227,66 +229,6 @@ fn neoforge_to_mc_version(version: &str) -> String {
     }
 
     format!("1.{major}.{minor}")
-}
-
-fn compare_version_entries(left: &VersionEntry, right: &VersionEntry) -> Ordering {
-    let left_priority = version_type_priority(&left.kind);
-    let right_priority = version_type_priority(&right.kind);
-    left_priority
-        .cmp(&right_priority)
-        .then_with(|| compare_version_ids(&right.id, &left.id))
-}
-
-fn version_type_priority(kind: &str) -> i32 {
-    match kind {
-        "release" => 0,
-        "snapshot" => 1,
-        "old_beta" => 2,
-        "old_alpha" => 3,
-        _ => 4,
-    }
-}
-
-fn compare_version_ids(left: &str, right: &str) -> Ordering {
-    let left_parts = split_version_parts(left);
-    let right_parts = split_version_parts(right);
-    let len = left_parts.len().max(right_parts.len());
-
-    for index in 0..len {
-        let left_part = left_parts.get(index).map(String::as_str).unwrap_or("");
-        let right_part = right_parts.get(index).map(String::as_str).unwrap_or("");
-
-        match (left_part.parse::<i32>(), right_part.parse::<i32>()) {
-            (Ok(left_num), Ok(right_num)) if left_num != right_num => {
-                return left_num.cmp(&right_num);
-            }
-            _ if left_part != right_part => return left_part.cmp(right_part),
-            _ => {}
-        }
-    }
-
-    Ordering::Equal
-}
-
-fn split_version_parts(version: &str) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut current = String::new();
-
-    for ch in version.chars() {
-        if ch == '.' || ch == '-' {
-            if !current.is_empty() {
-                parts.push(std::mem::take(&mut current));
-            }
-        } else {
-            current.push(ch);
-        }
-    }
-
-    if !current.is_empty() {
-        parts.push(current);
-    }
-
-    parts
 }
 
 #[cfg(test)]

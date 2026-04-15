@@ -8,7 +8,7 @@ pub const PRESET_LEGACY: &str = "legacy";
 pub const PRESET_LEGACY_PVP: &str = "legacy_pvp";
 pub const PRESET_LEGACY_HEAVY: &str = "legacy_heavy";
 
-pub fn resolve_preset(
+pub fn recommended_preset(
     requested: &str,
     version_id: &str,
     loader: &str,
@@ -29,8 +29,7 @@ pub fn gc_preset_args(
     info: &JavaRuntimeInfo,
     low_impact_startup: bool,
 ) -> Vec<String> {
-    let preset = sanitize_preset(preset, "", "vanilla", false, info);
-    match preset.as_str() {
+    match preset.trim() {
         PRESET_SMOOTH => smooth_args(low_impact_startup),
         PRESET_ULTRA_LOW_LATENCY => ultra_low_latency_args(info, low_impact_startup),
         PRESET_GRAALVM => graalvm_args(low_impact_startup),

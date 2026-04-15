@@ -2,6 +2,35 @@ use crate::runtime::RuntimeSelection;
 use crate::types::LaunchFailureClass;
 use croopor_minecraft::JavaRuntimeInfo;
 
+pub(crate) fn validate_requested_java_override(
+    requested_java: &str,
+    info: &JavaRuntimeInfo,
+    required_major: i32,
+) -> Result<(), (LaunchFailureClass, String)> {
+    if requested_java.trim().is_empty() {
+        return Ok(());
+    }
+    if required_major > 0 && info.major > 0 && info.major as i32 != required_major {
+        return Err((
+            LaunchFailureClass::JavaRuntimeMismatch,
+            format!(
+                "explicit Java override targets Java {} but this version requires Java {}",
+                info.major, required_major
+            ),
+        ));
+    }
+    if required_major == 8 && info.major == 8 && info.update > 0 && info.update < 312 {
+        return Err((
+            LaunchFailureClass::JavaRuntimeMismatch,
+            format!(
+                "explicit Java 8 override is too old for legacy support (8u{} detected; use 8u312 or newer)",
+                info.update
+            ),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_manual_java_override(
     requested_java: &str,
     runtime: &RuntimeSelection,
@@ -10,32 +39,7 @@ pub(crate) fn validate_manual_java_override(
     if requested_java.trim().is_empty() || requested_java.trim() != runtime.effective_path.trim() {
         return Ok(());
     }
-    if required_major > 0
-        && runtime.effective_info.major > 0
-        && runtime.effective_info.major as i32 != required_major
-    {
-        return Err((
-            LaunchFailureClass::JavaRuntimeMismatch,
-            format!(
-                "explicit Java override targets Java {} but this version requires Java {}",
-                runtime.effective_info.major, required_major
-            ),
-        ));
-    }
-    if required_major == 8
-        && runtime.effective_info.major == 8
-        && runtime.effective_info.update > 0
-        && runtime.effective_info.update < 312
-    {
-        return Err((
-            LaunchFailureClass::JavaRuntimeMismatch,
-            format!(
-                "explicit Java 8 override is too old for legacy support (8u{} detected; use 8u312 or newer)",
-                runtime.effective_info.update
-            ),
-        ));
-    }
-    Ok(())
+    validate_requested_java_override(requested_java, &runtime.effective_info, required_major)
 }
 
 pub(crate) fn validate_manual_jvm_args(

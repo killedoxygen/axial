@@ -4,15 +4,14 @@ mod prepare;
 mod validation;
 
 use crate::build::VanillaLaunchPlan;
+use crate::guardian::{GuardianIntervention, LaunchGuardianContext};
 use crate::healing::HealingEvent;
 use crate::runtime::RuntimeSelection;
 use crate::types::LaunchFailureClass;
 use serde::{Deserialize, Serialize};
 
-pub use healing::{
-    HealingSummaryInput, build_healing_summary, conservative_healing_preset, infer_loader,
-    recovery_for_failure,
-};
+pub use crate::guardian::{RecoveryAction, RecoveryPlan, conservative_healing_preset};
+pub use healing::{HealingSummaryInput, build_healing_summary, infer_loader};
 pub use mapping::{
     failure_class_name, format_failure_class, is_terminal_state, is_terminal_status,
     launch_state_name, snapshot_status,
@@ -35,7 +34,7 @@ pub struct LaunchIntent {
     pub launcher_name: String,
     pub launcher_version: String,
     pub game_dir: Option<std::path::PathBuf>,
-    pub advanced_overrides: bool,
+    pub guardian: LaunchGuardianContext,
     pub performance_mode: String,
 }
 
@@ -43,9 +42,35 @@ pub struct LaunchIntent {
 pub struct AttemptOverrides {
     pub force_managed_runtime: bool,
     pub disable_custom_gc: bool,
+    pub ignore_extra_jvm_args: bool,
     pub preset_override: Option<String>,
     pub fallback_applied: Option<String>,
     pub retry_count: u32,
+    pub startup_recovery_applied: bool,
+    pub runtime_intervention_applied: bool,
+    pub raw_jvm_args_intervention_applied: bool,
+}
+
+impl AttemptOverrides {
+    pub fn record_runtime_intervention(&mut self, description: String) {
+        self.runtime_intervention_applied = true;
+        self.fallback_applied = Some(description);
+        self.force_managed_runtime = true;
+        self.preset_override = None;
+        self.disable_custom_gc = false;
+    }
+
+    pub fn record_raw_jvm_args_intervention(&mut self, description: String) {
+        self.raw_jvm_args_intervention_applied = true;
+        self.fallback_applied = Some(description);
+        self.ignore_extra_jvm_args = true;
+    }
+
+    pub fn record_startup_recovery(&mut self, description: String) {
+        self.retry_count += 1;
+        self.startup_recovery_applied = true;
+        self.fallback_applied = Some(description);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +79,7 @@ pub struct PreparedLaunchAttempt {
     pub effective_preset: String,
     pub plan: VanillaLaunchPlan,
     pub healing: Option<LaunchHealingSummary>,
+    pub guardian_interventions: Vec<GuardianIntervention>,
     pub metrics: LaunchPreparationMetrics,
 }
 
@@ -85,8 +111,6 @@ pub struct LaunchHealingSummary {
     pub retry_count: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_class: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub advanced_overrides: Option<bool>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub events: Vec<HealingEvent>,
 }
@@ -96,17 +120,4 @@ pub struct LaunchPreparationError {
     pub message: String,
     pub failure_class: Option<LaunchFailureClass>,
     pub healing: Option<LaunchHealingSummary>,
-}
-
-#[derive(Debug, Clone)]
-pub struct RecoveryPlan {
-    pub description: String,
-    pub action: RecoveryAction,
-}
-
-#[derive(Debug, Clone)]
-pub enum RecoveryAction {
-    DowngradePreset(String),
-    DisableCustomGc,
-    SwitchManagedRuntime,
 }

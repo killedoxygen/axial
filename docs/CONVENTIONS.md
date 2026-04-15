@@ -47,6 +47,16 @@ keep this short and real. if the codebase changes, update this file.
 - if backend work is part of this branch, add it in Rust
 - loader-specific install behavior belongs in `core/minecraft/src/loaders/strategies/`, not in route handlers
 
+## Architecture docs
+- `docs/README.md` is the docs entrypoint and ownership map
+- `docs/ARCHITECTURE.md` must describe the current launcher pipeline, not an aspirational one
+- if launch/install/settings/runtime architecture shifts, update `docs/ARCHITECTURE.md` in the same change
+- if Guardian authority, Healing scope, or launch-safety policy changes, update `docs/GUARDIAN-ARCHITECTURE.md` in the same change
+- if version classification, naming, or ordering architecture shifts, update `docs/VERSION-METADATA-ARCHITECTURE.md` in the same change
+- if the docs structure changes, update `docs/README.md` in the same change
+- use `docs/adr/` for major decisions that need rationale, not for current-state walkthroughs
+- do not land architecture shifts without updating the matching docs
+
 ## Build shape
 - frontend entry is `frontend/src/main.tsx`
 - frontend bundle output is `frontend/static/app.js`

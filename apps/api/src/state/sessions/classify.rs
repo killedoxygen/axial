@@ -48,7 +48,6 @@ pub(super) fn classify_failure_text(text: &str) -> LaunchFailureClass {
     if lower.contains("unsupportedclassversionerror")
         || lower.contains("compiled by a more recent version of the java runtime")
         || lower.contains("requires java")
-        || lower.contains("java runtime")
     {
         return LaunchFailureClass::JavaRuntimeMismatch;
     }
