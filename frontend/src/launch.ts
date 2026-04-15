@@ -494,6 +494,7 @@ async function connectLaunchEvents(sessionId: string, instanceId: string, instan
     });
     logSubscription = await onNativeEvent(nativeLaunchLogEventName(sessionId), onLog);
     if (!statusSubscription || !logSubscription) {
+      streamHandle.close();
       throw new Error('native launch stream unavailable');
     }
     pollSubscription = makeLaunchStatusPoller(sessionId, instanceId, (data) => {
