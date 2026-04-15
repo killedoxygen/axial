@@ -479,16 +479,26 @@ async function connectLaunchEvents(sessionId: string, instanceId: string, instan
   };
 
   if (hasNativeDesktopRuntime()) {
-    let streamHandle: { close(): void };
-    const statusSubscription = await onNativeEvent(nativeLaunchStatusEventName(sessionId), (data) => {
+    let statusSubscription: { close(): void } | null = null;
+    let logSubscription: { close(): void } | null = null;
+    let pollSubscription: { close(): void } | null = null;
+    const streamHandle = {
+      close(): void {
+        statusSubscription?.close();
+        logSubscription?.close();
+        pollSubscription?.close();
+      },
+    };
+    statusSubscription = await onNativeEvent(nativeLaunchStatusEventName(sessionId), (data) => {
       onStatus(data, streamHandle);
     });
-    const logSubscription = await onNativeEvent(nativeLaunchLogEventName(sessionId), onLog);
+    logSubscription = await onNativeEvent(nativeLaunchLogEventName(sessionId), onLog);
     if (!statusSubscription || !logSubscription) {
       throw new Error('native launch stream unavailable');
     }
-    const pollSubscription = makeLaunchStatusPoller(sessionId, instanceId, onStatus);
-    streamHandle = makeCompositeSubscription(statusSubscription, logSubscription, pollSubscription);
+    pollSubscription = makeLaunchStatusPoller(sessionId, instanceId, (data) => {
+      onStatus(data, streamHandle);
+    });
     try {
       await startNativeLaunchEvents(sessionId);
     } catch (err: unknown) {

@@ -91,14 +91,14 @@ pub fn scan_versions(mc_dir: &Path) -> std::io::Result<Vec<VersionEntry>> {
                     false,
                     "incomplete".to_string(),
                     format!("Base version {} needs to be installed", effective_parent),
-                    id.clone(),
+                    effective_parent.clone(),
                 )
             } else if !parent_jar.is_file() {
                 (
                     false,
                     "incomplete".to_string(),
                     format!("Base version {} needs to be downloaded", effective_parent),
-                    id.clone(),
+                    effective_parent.clone(),
                 )
             } else if jar_path.is_file() {
                 (true, "ready".to_string(), String::new(), String::new())
@@ -233,8 +233,11 @@ fn neoforge_to_mc_version(version: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{JavaVersionStub, VersionStub, resolve_java_version};
+    use super::{JavaVersionStub, VersionStub, resolve_java_version, scan_versions};
     use std::collections::HashMap;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn resolve_java_version_follows_current_parent_chain_for_loader_versions() {
@@ -265,5 +268,42 @@ mod tests {
 
         assert_eq!(resolved.component, "java-runtime-gamma");
         assert_eq!(resolved.major_version, 17);
+    }
+
+    #[test]
+    fn scan_versions_marks_missing_parent_as_install_target() {
+        let mc_dir = unique_test_dir("missing-parent-install-target");
+        let versions_dir = mc_dir.join("versions");
+        let child_dir = versions_dir.join("fabric-loader-0.14.21-1.20.1");
+        fs::create_dir_all(&child_dir).expect("create child version dir");
+        fs::write(
+            child_dir.join("fabric-loader-0.14.21-1.20.1.json"),
+            r#"{
+                "id":"fabric-loader-0.14.21-1.20.1",
+                "inheritsFrom":"1.20.1",
+                "type":"release"
+            }"#,
+        )
+        .expect("write child json");
+
+        let versions = scan_versions(&mc_dir).expect("scan versions");
+        let version = versions
+            .iter()
+            .find(|entry| entry.id == "fabric-loader-0.14.21-1.20.1")
+            .expect("child version exists");
+
+        assert_eq!(version.status, "incomplete");
+        assert_eq!(version.needs_install, "1.20.1");
+        assert!(version.status_detail.contains("1.20.1"));
+
+        fs::remove_dir_all(&mc_dir).expect("remove temp test dir");
+    }
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time ok")
+            .as_nanos();
+        std::env::temp_dir().join(format!("croopor-{name}-{unique}"))
     }
 }

@@ -76,6 +76,9 @@ impl AppConfig {
         if self.min_memory_mb < 256 {
             self.min_memory_mb = 512;
         }
+        if self.min_memory_mb > self.max_memory_mb {
+            self.min_memory_mb = self.max_memory_mb;
+        }
         if self.performance_mode.is_empty() {
             self.performance_mode = "managed".to_string();
         }
@@ -87,5 +90,23 @@ impl AppConfig {
             self.library_mode = "managed".to_string();
         }
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppConfig;
+
+    #[test]
+    fn normalized_clamps_min_memory_to_max_memory() {
+        let config = AppConfig {
+            min_memory_mb: 800,
+            max_memory_mb: 600,
+            ..AppConfig::default()
+        }
+        .normalized();
+
+        assert_eq!(config.max_memory_mb, 600);
+        assert_eq!(config.min_memory_mb, 600);
     }
 }
