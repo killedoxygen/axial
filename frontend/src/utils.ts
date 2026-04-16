@@ -1,7 +1,7 @@
 import { byId } from './dom';
 import { collapsedLogSeverity, currentPage, instances, logLines } from './store';
 import { toast } from './toast';
-import type { Page } from './types';
+import type { LoaderBuildRecord, LoaderComponentId, LoaderType, Page, Version } from './types';
 
 const loggedInstances = new Set<string>();
 let activeLogFilter = 'all';
@@ -135,7 +135,7 @@ interface VersionDisplay {
 }
 
 export function parseVersionDisplay(versionId: string, version: any, versions: any[]): VersionDisplay {
-  if (version?.inherits_from) return parseModded(versionId, version.inherits_from);
+  if (version?.inherits_from) return parseModded(versionId, version.inherits_from, version as Version | null);
   if (version?.meta?.display_name) {
     return {
       name: version.meta.display_name,
@@ -149,31 +149,46 @@ export function parseVersionDisplay(versionId: string, version: any, versions: a
   return { name: versionId, hint: null };
 }
 
-function parseModded(id: string, base: string): VersionDisplay {
+export function formatLoaderBuildLabel(
+  build: Pick<LoaderBuildRecord, 'loader_version' | 'prerelease' | 'recommended' | 'latest'>,
+): string {
+  const tags: string[] = [];
+  if (build.prerelease) tags.push(prereleaseTag(build.loader_version));
+  if (build.recommended) tags.push('recommended');
+  else if (build.latest) tags.push('latest');
+  return tags.length > 0 ? `${build.loader_version} (${tags.join(', ')})` : build.loader_version;
+}
+
+export function formatLoaderVersionLabel(loaderVersion: string, prerelease = false): string {
+  return prerelease ? `${loaderVersion} (${prereleaseTag(loaderVersion)})` : loaderVersion;
+}
+
+function parseModded(id: string, base: string, version?: Version | null): VersionDisplay {
+  const normalized = parseNormalizedLoaderDisplay(base, version);
+  if (normalized) return normalized;
+
   const lo = id.toLowerCase();
-  let m: RegExpMatchArray | null;
   if (lo.startsWith('fabric-loader-')) {
     const suffix = base ? `-${base}` : '';
     const rest = id.slice('fabric-loader-'.length);
     const loaderVersion = suffix && rest.endsWith(suffix) ? rest.slice(0, -suffix.length) : rest;
-    return { name: `Fabric ${base}`, hint: loaderVersion ? `Loader ${loaderVersion}` : null, loader: 'fabric' };
+    return loaderDisplay('fabric', base, loaderVersion);
   }
   if (lo.startsWith('quilt-loader-')) {
     const suffix = base ? `-${base}` : '';
     const rest = id.slice('quilt-loader-'.length);
     const loaderVersion = suffix && rest.endsWith(suffix) ? rest.slice(0, -suffix.length) : rest;
-    return { name: `Quilt ${base}`, hint: loaderVersion ? `Loader ${loaderVersion}` : null, loader: 'quilt' };
+    return loaderDisplay('quilt', base, loaderVersion);
   }
-  // 1.20.1-forge-47.3.0 or 1.20.1-forge47.3.0
-  m = id.match(/-forge-?([.\d]+)/i);
-  if (m) return { name: `Forge ${base}`, hint: `Forge ${m[1]}`, loader: 'forge' };
-  // neoforge variants
-  if (lo.includes('neoforge')) {
-    m = id.match(/neoforge[.-]?([.\d]+(?:-[.\d]+)?)/i);
-    return { name: `NeoForge ${base}`, hint: m ? `NeoForge ${m[1]}` : null, loader: 'neoforge' };
+  const forgeIndex = lo.lastIndexOf('-forge-');
+  if (forgeIndex > 0) {
+    return loaderDisplay('forge', base, id.slice(forgeIndex + '-forge-'.length));
+  }
+  if (lo.startsWith('neoforge-')) {
+    return loaderDisplay('neoforge', base, id.slice('neoforge-'.length));
   }
   // optifine
-  m = id.match(/-optifine[_-](.*)/i);
+  const m = id.match(/-optifine[_-](.*)/i);
   if (m) return { name: `OptiFine ${base}`, hint: m[1].replace(/_/g, ' ').trim(), loader: null };
   // X.X.X-fabric (simple)
   if (lo.includes('fabric')) return { name: `Fabric ${base}`, hint: null, loader: 'fabric' };
@@ -181,6 +196,79 @@ function parseModded(id: string, base: string): VersionDisplay {
   if (lo.includes('liteloader')) return { name: `LiteLoader ${base}`, hint: null, loader: null };
   // generic fallback
   return { name: base, hint: id !== base ? id : null, loader: null };
+}
+
+function parseNormalizedLoaderDisplay(base: string, version?: Version | null): VersionDisplay | null {
+  if (!version?.loader_component_id || !version.loader_build_id) return null;
+  const parsed = parseLoaderBuildId(version.loader_build_id);
+  const loader = loaderTypeFromComponentId(version.loader_component_id);
+  if (!parsed || !loader) return null;
+  return loaderDisplay(
+    loader,
+    base,
+    parsed.loaderVersion,
+    version.loader_prerelease ?? isPrereleaseLoaderVersion(parsed.loaderVersion),
+  );
+}
+
+function parseLoaderBuildId(buildId: string): { componentId: LoaderComponentId; minecraftVersion: string; loaderVersion: string } | null {
+  const parts = buildId.split(':');
+  if (parts.length < 3) return null;
+  const componentId = loaderComponentIdFromShortKey(parts[0]);
+  const minecraftVersion = parts[1] || '';
+  const loaderVersion = parts.slice(2).join(':');
+  if (!componentId || !minecraftVersion || !loaderVersion) return null;
+  return { componentId, minecraftVersion, loaderVersion };
+}
+
+function loaderComponentIdFromShortKey(shortKey: string): LoaderComponentId | null {
+  if (shortKey === 'fabric') return 'net.fabricmc.fabric-loader';
+  if (shortKey === 'quilt') return 'org.quiltmc.quilt-loader';
+  if (shortKey === 'forge') return 'net.minecraftforge';
+  if (shortKey === 'neoforge') return 'net.neoforged';
+  return null;
+}
+
+function loaderTypeFromComponentId(componentId: string): LoaderType | null {
+  if (componentId === 'net.fabricmc.fabric-loader') return 'fabric';
+  if (componentId === 'org.quiltmc.quilt-loader') return 'quilt';
+  if (componentId === 'net.minecraftforge') return 'forge';
+  if (componentId === 'net.neoforged') return 'neoforge';
+  return null;
+}
+
+function loaderDisplay(
+  loader: LoaderType,
+  base: string,
+  loaderVersion: string,
+  prerelease = isPrereleaseLoaderVersion(loaderVersion),
+): VersionDisplay {
+  const title = loader === 'fabric' ? `Fabric ${base}`
+    : loader === 'quilt' ? `Quilt ${base}`
+    : loader === 'forge' ? `Forge ${base}`
+    : `NeoForge ${base}`;
+  const hintPrefix = loader === 'fabric' || loader === 'quilt'
+    ? 'Loader'
+    : loader === 'forge'
+      ? 'Forge'
+      : 'NeoForge';
+  return {
+    name: title,
+    hint: loaderVersion ? `${hintPrefix} ${formatLoaderVersionLabel(loaderVersion, prerelease)}` : null,
+    loader,
+  };
+}
+
+function isPrereleaseLoaderVersion(loaderVersion: string): boolean {
+  const lower = loaderVersion.toLowerCase();
+  return ['alpha', 'beta', 'snapshot', 'pre', 'rc'].some((marker) => lower.includes(marker));
+}
+
+function prereleaseTag(loaderVersion: string): string {
+  const lower = loaderVersion.toLowerCase();
+  if (lower.includes('beta')) return 'beta';
+  if (lower.includes('alpha')) return 'alpha';
+  return 'prerelease';
 }
 
 function parseSnapshot(id: string, version: any, versions: any[]): VersionDisplay {

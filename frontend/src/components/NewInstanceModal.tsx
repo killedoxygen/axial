@@ -6,7 +6,9 @@ import { catalog, instances, versions } from '../store';
 import { addInstance, selectInstance } from '../actions';
 import { api } from '../api';
 import { Sound } from '../sound';
-import { showError, esc, parseVersionDisplay, errMessage } from '../utils';
+import {
+  showError, esc, parseVersionDisplay, errMessage, formatLoaderBuildLabel, formatLoaderVersionLabel,
+} from '../utils';
 import { installVersion, installLoaderVersion } from '../install';
 import { createNewInstanceLoaderMachine } from '../machines/new-instance-loader';
 import type {
@@ -337,7 +339,7 @@ export function NewInstanceModal(): JSX.Element | null {
 
   // Loader info text
   const loaderInfoText = loaderEnabled && selectedLoaderBuild
-    ? `Loader: ${selectedLoaderBuild.loader_version}`
+    ? `Loader: ${formatLoaderVersionLabel(selectedLoaderBuild.loader_version, selectedLoaderBuild.prerelease)}`
     : null;
   const createDisabled = !selectedVersionId.value || (loaderEnabled && loaderState.value.kind !== 'ready');
 
@@ -410,7 +412,7 @@ export function NewInstanceModal(): JSX.Element | null {
                     )}
                     {(loaderBuilds ?? []).map(build => (
                       <option key={build.build_id} value={build.build_id}>
-                        {build.loader_version}{build.recommended ? ' (recommended)' : build.latest ? ' (latest)' : ''}
+                        {formatLoaderBuildLabel(build)}
                       </option>
                     ))}
                   </select>

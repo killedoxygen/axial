@@ -1,6 +1,6 @@
 use super::common::{
-    NEOFORGE_MAVEN_BASE, NEOFORGE_MAVEN_META, fetch_text, neoforge_to_minecraft_version,
-    parse_maven_versions,
+    NEOFORGE_MAVEN_BASE, NEOFORGE_MAVEN_META, fetch_text, is_prerelease_loader_version,
+    neoforge_to_minecraft_version, parse_maven_versions,
 };
 use crate::loaders::api::{build_id_for, installed_version_id_for};
 use crate::loaders::types::{
@@ -46,6 +46,7 @@ pub async fn fetch_builds(
         if resolved_minecraft_version != minecraft_version {
             continue;
         }
+        let prerelease = is_prerelease_loader_version(&entry);
         builds.push(LoaderBuildRecord {
             component_id,
             component_name: component_id.display_name().to_string(),
@@ -53,7 +54,8 @@ pub async fn fetch_builds(
             minecraft_version: minecraft_version.to_string(),
             loader_version: entry.clone(),
             version_id: installed_version_id_for(component_id, minecraft_version, &entry),
-            stable: !entry.contains("beta"),
+            stable: !prerelease,
+            prerelease,
             recommended: false,
             latest: false,
             strategy: LoaderInstallStrategy::NeoForgeModern,

@@ -65,6 +65,7 @@ pub async fn fetch_builds(
                     &entry.loader.version,
                 ),
                 stable: entry.loader.stable,
+                prerelease: !entry.loader.stable,
                 recommended: false,
                 latest: false,
                 strategy: LoaderInstallStrategy::FabricProfile,

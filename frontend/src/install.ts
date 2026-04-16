@@ -56,6 +56,7 @@ export function handleInstallClick(): void {
       loader_version: loader.loaderVersion,
       version_id: loader.versionId,
       stable: false,
+      prerelease: false,
       recommended: false,
       latest: false,
       strategy: '',

@@ -140,6 +140,8 @@ pub struct LoaderBuildRecord {
     pub loader_version: String,
     pub version_id: String,
     pub stable: bool,
+    #[serde(default)]
+    pub prerelease: bool,
     pub recommended: bool,
     pub latest: bool,
     pub strategy: LoaderInstallStrategy,
@@ -165,7 +167,7 @@ pub struct CachedCatalog<T> {
 impl<T> CachedCatalog<T> {
     pub fn new(value: T) -> Self {
         Self {
-            schema_version: 5,
+            schema_version: 6,
             fetched_at_ms: Utc::now().timestamp_millis(),
             value,
         }

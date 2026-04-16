@@ -1,5 +1,8 @@
-use crate::loaders::infer_build_from_version_id;
-use crate::paths::versions_dir;
+use crate::loaders::{
+    infer_build_from_version_id,
+    types::{CachedCatalog, LoaderComponentId, LoaderVersionIndex},
+};
+use crate::paths::{loader_catalog_dir, versions_dir};
 use crate::types::VersionEntry;
 use crate::version_meta::{analyze_version_metadata, compare_version_entries};
 use serde::{Deserialize, Serialize};
@@ -113,6 +116,7 @@ pub fn scan_versions(mc_dir: &Path) -> std::io::Result<Vec<VersionEntry>> {
         };
 
         let loader_meta = infer_build_from_version_id(id);
+        let loader_prerelease = infer_loader_prerelease(mc_dir, loader_meta.as_ref());
         let metadata = analyze_version_metadata(id, &stub.kind, &stub.release_time, None, &[]);
 
         versions.push(VersionEntry {
@@ -133,6 +137,7 @@ pub fn scan_versions(mc_dir: &Path) -> std::io::Result<Vec<VersionEntry>> {
                 .as_ref()
                 .map(|(component_id, _, _, _)| component_id.as_str().to_string()),
             loader_build_id: loader_meta.map(|(_, build_id, _, _)| build_id),
+            loader_prerelease,
         });
     }
 
@@ -231,9 +236,44 @@ fn neoforge_to_mc_version(version: &str) -> String {
     format!("1.{major}.{minor}")
 }
 
+fn infer_loader_prerelease(
+    mc_dir: &Path,
+    loader_meta: Option<&(LoaderComponentId, String, String, String)>,
+) -> Option<bool> {
+    let (component_id, build_id, minecraft_version, loader_version) = loader_meta?;
+    if is_prerelease_loader_version(loader_version) {
+        return Some(true);
+    }
+
+    let cache_path = loader_catalog_dir(mc_dir).join(format!(
+        "component-{}-builds-{}.json",
+        component_id.short_key(),
+        minecraft_version
+    ));
+    let data = fs::read(cache_path).ok()?;
+    let cached = serde_json::from_slice::<CachedCatalog<LoaderVersionIndex>>(&data).ok()?;
+    cached
+        .value
+        .builds
+        .into_iter()
+        .find(|build| build.build_id == *build_id)
+        .map(|build| build.prerelease)
+}
+
+fn is_prerelease_loader_version(loader_version: &str) -> bool {
+    let lower = loader_version.to_ascii_lowercase();
+    ["alpha", "beta", "snapshot", "pre", "rc"]
+        .into_iter()
+        .any(|marker| lower.contains(marker))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{JavaVersionStub, VersionStub, resolve_java_version, scan_versions};
+    use crate::loaders::types::{
+        CachedCatalog, LoaderArtifactKind, LoaderBuildRecord, LoaderComponentId,
+        LoaderInstallSource, LoaderInstallStrategy, LoaderInstallability, LoaderVersionIndex,
+    };
     use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
@@ -295,6 +335,62 @@ mod tests {
         assert_eq!(version.status, "incomplete");
         assert_eq!(version.needs_install, "1.20.1");
         assert!(version.status_detail.contains("1.20.1"));
+
+        fs::remove_dir_all(&mc_dir).expect("remove temp test dir");
+    }
+
+    #[test]
+    fn scan_versions_reads_loader_prerelease_from_cached_build_index() {
+        let mc_dir = unique_test_dir("loader-prerelease-cache");
+        let versions_dir = mc_dir.join("versions");
+        let forge_dir = versions_dir.join("26.1.2-forge-64.0.4");
+        fs::create_dir_all(&forge_dir).expect("create forge version dir");
+        fs::write(
+            forge_dir.join("26.1.2-forge-64.0.4.json"),
+            r#"{
+                "id":"26.1.2-forge-64.0.4",
+                "inheritsFrom":"26.1.2",
+                "type":"release"
+            }"#,
+        )
+        .expect("write forge json");
+
+        let cache_dir = mc_dir.join("cache").join("loaders").join("catalog");
+        fs::create_dir_all(&cache_dir).expect("create cache dir");
+        let cache = CachedCatalog::new(LoaderVersionIndex {
+            component_id: LoaderComponentId::Forge,
+            builds: vec![LoaderBuildRecord {
+                component_id: LoaderComponentId::Forge,
+                component_name: "Forge".to_string(),
+                build_id: "forge:26.1.2:64.0.4".to_string(),
+                minecraft_version: "26.1.2".to_string(),
+                loader_version: "64.0.4".to_string(),
+                version_id: "26.1.2-forge-64.0.4".to_string(),
+                stable: false,
+                prerelease: true,
+                recommended: false,
+                latest: true,
+                strategy: LoaderInstallStrategy::ForgeModern,
+                artifact_kind: LoaderArtifactKind::InstallerJar,
+                installability: LoaderInstallability::Installable,
+                install_source: LoaderInstallSource::InstallerJar {
+                    url: "https://example.invalid/forge-installer.jar".to_string(),
+                },
+            }],
+        });
+        fs::write(
+            cache_dir.join("component-forge-builds-26.1.2.json"),
+            serde_json::to_vec_pretty(&cache).expect("serialize cache"),
+        )
+        .expect("write cache");
+
+        let versions = scan_versions(&mc_dir).expect("scan versions");
+        let version = versions
+            .iter()
+            .find(|entry| entry.id == "26.1.2-forge-64.0.4")
+            .expect("forge version exists");
+
+        assert_eq!(version.loader_prerelease, Some(true));
 
         fs::remove_dir_all(&mc_dir).expect("remove temp test dir");
     }

@@ -44,6 +44,7 @@ export interface Version {
   manifest_url?: string;
   loader_component_id?: string;
   loader_build_id?: string;
+  loader_prerelease?: boolean;
 }
 
 export interface Config {
@@ -280,6 +281,7 @@ export interface LoaderBuildRecord {
   loader_version: string;
   version_id: string;
   stable: boolean;
+  prerelease: boolean;
   recommended: boolean;
   latest: boolean;
   strategy: string;

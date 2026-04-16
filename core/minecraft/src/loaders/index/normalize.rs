@@ -33,8 +33,9 @@ fn compare_build_records(left: &LoaderBuildRecord, right: &LoaderBuildRecord) ->
     right
         .recommended
         .cmp(&left.recommended)
-        .then_with(|| right.latest.cmp(&left.latest))
         .then_with(|| right.stable.cmp(&left.stable))
+        .then_with(|| left.prerelease.cmp(&right.prerelease))
+        .then_with(|| right.latest.cmp(&left.latest))
         .then_with(|| compare_version_like(&right.loader_version, &left.loader_version))
 }
 
@@ -179,6 +180,26 @@ mod tests {
         assert_eq!(ordered, vec!["40.3.0", "40.2.0", "40.1.0", "39.0.0"]);
     }
 
+    #[test]
+    fn keeps_stable_build_ahead_of_latest_prerelease() {
+        let component_id = LoaderComponentId::NeoForge;
+        let normalized = normalize_build_index(LoaderVersionIndex {
+            component_id,
+            builds: vec![
+                build_record(component_id, "26.1.2.12-beta", false, true, false),
+                build_record(component_id, "26.1.1.15", false, false, true),
+            ],
+        });
+
+        let ordered = normalized
+            .builds
+            .into_iter()
+            .map(|build| build.loader_version)
+            .collect::<Vec<_>>();
+
+        assert_eq!(ordered, vec!["26.1.1.15", "26.1.2.12-beta"]);
+    }
+
     fn build_record(
         component_id: LoaderComponentId,
         loader_version: &str,
@@ -194,6 +215,7 @@ mod tests {
             loader_version: loader_version.to_string(),
             version_id: format!("1.18.2-forge-{loader_version}"),
             stable,
+            prerelease: !stable,
             recommended,
             latest,
             strategy: LoaderInstallStrategy::ForgeModern,

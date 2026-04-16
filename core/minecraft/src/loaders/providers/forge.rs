@@ -55,6 +55,7 @@ pub async fn fetch_builds(
         .promos
         .get(&format!("{minecraft_version}-latest"))
         .cloned();
+    let prerelease = recommended.is_none();
     let component_id = LoaderComponentId::Forge;
     let mut builds = Vec::new();
 
@@ -75,9 +76,8 @@ pub async fn fetch_builds(
             minecraft_version: minecraft_version.to_string(),
             loader_version: loader_version.clone(),
             version_id: installed_version_id_for(component_id, minecraft_version, &loader_version),
-            stable: recommended
-                .as_ref()
-                .is_some_and(|value| value == &loader_version),
+            stable: !prerelease,
+            prerelease,
             recommended: recommended
                 .as_ref()
                 .is_some_and(|value| value == &loader_version),

@@ -64,6 +64,7 @@ pub async fn fetch_builds(
                     &entry.loader.version,
                 ),
                 stable: true,
+                prerelease: false,
                 recommended: false,
                 latest: false,
                 strategy: LoaderInstallStrategy::QuiltProfile,

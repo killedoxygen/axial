@@ -73,6 +73,13 @@ pub fn minecraft_version_at_least(version: &str, target: &[u32]) -> bool {
     true
 }
 
+pub fn is_prerelease_loader_version(version: &str) -> bool {
+    let lower = version.to_ascii_lowercase();
+    ["alpha", "beta", "snapshot", "pre", "rc"]
+        .into_iter()
+        .any(|marker| lower.contains(marker))
+}
+
 pub fn neoforge_to_minecraft_version(version: &str) -> Option<String> {
     let numeric_parts = version
         .split('.')
@@ -106,7 +113,15 @@ pub fn neoforge_to_minecraft_version(version: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::neoforge_to_minecraft_version;
+    use super::{is_prerelease_loader_version, neoforge_to_minecraft_version};
+
+    #[test]
+    fn detects_common_prerelease_loader_markers() {
+        assert!(is_prerelease_loader_version("26.1.2.12-beta"));
+        assert!(is_prerelease_loader_version("26.1.0.0-alpha.15+pre-3"));
+        assert!(is_prerelease_loader_version("1.0.0-rc1"));
+        assert!(!is_prerelease_loader_version("61.1.5"));
+    }
 
     #[test]
     fn maps_legacy_neoforge_versions_to_one_prefixed_minecraft_versions() {

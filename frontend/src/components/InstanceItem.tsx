@@ -103,9 +103,7 @@ export function InstanceItem({ instance, version, index, onContextMenu }: Instan
       <div class={`version-dot ${dotClass.value}`} />
       <span class="version-name">{instance.name}</span>
       <span class="version-sub">
-        {p.loader ? (
-          version?.inherits_from || p.name
-        ) : p.hint ? (
+        {p.hint ? (
           <>
             {p.name} <span class="version-hint">{p.hint}</span>
           </>
