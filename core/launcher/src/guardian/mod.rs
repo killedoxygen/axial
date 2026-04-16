@@ -343,14 +343,14 @@ pub fn recovery_plan_for_startup_failure(
                 });
             }
         }
-        LaunchFailureClass::JavaRuntimeMismatch => {
-            if !requested_java.trim().is_empty() && guardian.allows_runtime_healing() {
-                return Some(RecoveryPlan {
-                    description: "Automatic retry: switched to managed Java after runtime mismatch"
-                        .to_string(),
-                    action: RecoveryAction::SwitchManagedRuntime,
-                });
-            }
+        LaunchFailureClass::JavaRuntimeMismatch
+            if !requested_java.trim().is_empty() && guardian.allows_runtime_healing() =>
+        {
+            return Some(RecoveryPlan {
+                description: "Automatic retry: switched to managed Java after runtime mismatch"
+                    .to_string(),
+                action: RecoveryAction::SwitchManagedRuntime,
+            });
         }
         _ => {}
     }
