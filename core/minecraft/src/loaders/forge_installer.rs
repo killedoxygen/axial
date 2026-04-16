@@ -1,8 +1,9 @@
 use super::compose::LoaderProfileFragment;
 use crate::download::DownloadError;
-use crate::launch::{Library, merge_libraries_prefer_first};
+use crate::launch::Library;
 use crate::paths::libraries_dir;
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
@@ -72,7 +73,7 @@ pub fn extract_installer(jar_data: &[u8]) -> Result<ExtractedForgeInstaller, For
         .as_deref()
         .map(serde_json::from_slice::<InstallProfileLibraries>)
         .transpose()?;
-    let libraries = merge_libraries_prefer_first(
+    let libraries = merge_libraries_by_name(
         &version.libraries,
         install_info
             .as_ref()
@@ -86,6 +87,20 @@ pub fn extract_installer(jar_data: &[u8]) -> Result<ExtractedForgeInstaller, For
         version_fragment: version,
         libraries,
     })
+}
+
+fn merge_libraries_by_name(primary: &[Library], secondary: &[Library]) -> Vec<Library> {
+    let mut seen = HashSet::new();
+    let mut merged = Vec::with_capacity(primary.len() + secondary.len());
+
+    for library in primary.iter().chain(secondary.iter()) {
+        if !seen.insert(library.name.clone()) {
+            continue;
+        }
+        merged.push(library.clone());
+    }
+
+    merged
 }
 
 pub fn extract_maven_entries(jar_data: &[u8], mc_dir: &Path) -> Result<(), ForgeInstallerError> {
@@ -228,7 +243,10 @@ fn normalize_legacy_forge_version_id(path: &str, minecraft: &str) -> Option<Stri
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_legacy_forge_library, normalize_legacy_forge_version_id};
+    use super::{
+        merge_libraries_by_name, normalize_legacy_forge_library, normalize_legacy_forge_version_id,
+    };
+    use crate::launch::Library;
 
     #[test]
     fn normalizes_legacy_forge_version_id() {
@@ -266,6 +284,28 @@ mod tests {
                 "1.6.4"
             ),
             Some("net.minecraftforge:forge:1.6.4-9.11.1.1345:universal".to_string())
+        );
+    }
+
+    #[test]
+    fn merge_libraries_by_name_keeps_distinct_versions() {
+        let merged = merge_libraries_by_name(
+            &[Library {
+                name: "net.sf.jopt-simple:jopt-simple:5.0.4".to_string(),
+                ..Library::default()
+            }],
+            &[Library {
+                name: "net.sf.jopt-simple:jopt-simple:6.0-alpha-3".to_string(),
+                ..Library::default()
+            }],
+        );
+
+        assert_eq!(
+            merged.into_iter().map(|library| library.name).collect::<Vec<_>>(),
+            vec![
+                "net.sf.jopt-simple:jopt-simple:5.0.4".to_string(),
+                "net.sf.jopt-simple:jopt-simple:6.0-alpha-3".to_string()
+            ]
         );
     }
 }
