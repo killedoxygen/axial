@@ -301,7 +301,10 @@ mod tests {
         );
 
         assert_eq!(
-            merged.into_iter().map(|library| library.name).collect::<Vec<_>>(),
+            merged
+                .into_iter()
+                .map(|library| library.name)
+                .collect::<Vec<_>>(),
             vec![
                 "net.sf.jopt-simple:jopt-simple:5.0.4".to_string(),
                 "net.sf.jopt-simple:jopt-simple:6.0-alpha-3".to_string()
