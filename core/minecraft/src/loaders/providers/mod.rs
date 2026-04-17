@@ -1,4 +1,4 @@
-mod common;
+pub(crate) mod common;
 mod fabric;
 mod forge;
 mod neoforge;

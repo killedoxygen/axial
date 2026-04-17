@@ -1,11 +1,14 @@
-use super::common::QUILT_META_BASE;
+use super::common::{QUILT_META_BASE, infer_loader_build_metadata};
+use crate::lifecycle::LifecycleMeta;
 use crate::loaders::api::{build_id_for, installed_version_id_for};
 use crate::loaders::http::fetch_json;
 use crate::loaders::types::{
-    LoaderArtifactKind, LoaderBuildRecord, LoaderComponentId, LoaderGameVersion,
-    LoaderInstallSource, LoaderInstallStrategy, LoaderInstallability, LoaderVersionIndex,
+    LoaderArtifactKind, LoaderBuildRecord, LoaderBuildSubjectKind, LoaderComponentId,
+    LoaderGameVersion, LoaderInstallSource, LoaderInstallStrategy, LoaderInstallability,
+    LoaderVersionIndex,
 };
-use crate::version_meta::VersionMeta;
+use crate::types::VersionSubjectKind;
+use crate::version_meta::MinecraftVersionMeta;
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -30,11 +33,12 @@ pub async fn fetch_game_versions()
     Ok(raw
         .into_iter()
         .map(|entry| LoaderGameVersion {
-            version: entry.version,
-            kind: String::new(),
+            subject_kind: VersionSubjectKind::MinecraftVersion,
+            id: entry.version,
             release_time: String::new(),
-            meta: VersionMeta::default(),
-            stable: entry.stable,
+            minecraft_meta: MinecraftVersionMeta::default(),
+            lifecycle: LifecycleMeta::default(),
+            stable_hint: Some(entry.stable),
         })
         .collect())
 }
@@ -53,6 +57,7 @@ pub async fn fetch_builds(
         builds: raw
             .into_iter()
             .map(|entry| LoaderBuildRecord {
+                subject_kind: LoaderBuildSubjectKind::LoaderBuild,
                 component_id,
                 component_name: component_id.display_name().to_string(),
                 build_id: build_id_for(component_id, minecraft_version, &entry.loader.version),
@@ -63,10 +68,13 @@ pub async fn fetch_builds(
                     minecraft_version,
                     &entry.loader.version,
                 ),
-                stable: true,
-                prerelease: false,
-                recommended: false,
-                latest: false,
+                build_meta: infer_loader_build_metadata(
+                    &entry.loader.version,
+                    &[],
+                    false,
+                    false,
+                    None,
+                ),
                 strategy: LoaderInstallStrategy::QuiltProfile,
                 artifact_kind: LoaderArtifactKind::ProfileJson,
                 installability: LoaderInstallability::Installable,

@@ -1,4 +1,4 @@
-// ── API response types (mirrors Go structs) ──
+// ── API response types (mirrors Rust structs) ──
 
 export interface Instance {
   id: string;
@@ -17,7 +17,6 @@ export interface Instance {
 }
 
 export interface EnrichedInstance extends Instance {
-  version_type?: string;
   launchable: boolean;
   status_detail?: string;
   needs_install?: string;
@@ -28,11 +27,124 @@ export interface EnrichedInstance extends Instance {
   shader_count: number;
 }
 
+export type LifecycleChannel =
+  | 'stable'
+  | 'preview'
+  | 'experimental'
+  | 'legacy'
+  | 'unknown';
+
+export type LifecycleLabel =
+  | 'release'
+  | 'recommended'
+  | 'latest'
+  | 'snapshot'
+  | 'pre_release'
+  | 'release_candidate'
+  | 'beta'
+  | 'alpha'
+  | 'old_beta'
+  | 'old_alpha'
+  | 'nightly'
+  | 'dev'
+  | 'unknown';
+
+export interface LifecycleMeta {
+  channel: LifecycleChannel;
+  labels: LifecycleLabel[];
+  default_rank: number;
+  badge_text: string;
+  provider_terms: string[];
+}
+
+export interface MinecraftVersionMeta {
+  family: string;
+  base_id: string;
+  effective_version: string;
+  variant_of: string;
+  variant_kind: string;
+  display_name: string;
+  display_hint: string;
+}
+
+export type VersionSubjectKind = 'installed_version' | 'minecraft_version';
+export type LoaderBuildSubjectKind = 'loader_build';
+
+export type LoaderComponentId =
+  | 'net.fabricmc.fabric-loader'
+  | 'org.quiltmc.quilt-loader'
+  | 'net.minecraftforge'
+  | 'net.neoforged';
+
+export type LoaderType = 'fabric' | 'quilt' | 'forge' | 'neoforge';
+
+export type LoaderTerm =
+  | 'recommended'
+  | 'latest'
+  | 'snapshot'
+  | 'pre_release'
+  | 'release_candidate'
+  | 'beta'
+  | 'alpha'
+  | 'nightly'
+  | 'dev';
+
+export type LoaderTermSource =
+  | 'explicit_version_label'
+  | 'explicit_api_flag'
+  | 'promotion_marker'
+  | 'none';
+
+export interface LoaderTermEvidence {
+  term: LoaderTerm;
+  source: LoaderTermSource;
+}
+
+export type LoaderSelectionReason =
+  | 'recommended'
+  | 'latest_stable'
+  | 'latest'
+  | 'stable'
+  | 'unlabeled'
+  | 'latest_unstable'
+  | 'unstable'
+  | 'unknown';
+
+export type LoaderSelectionSource =
+  | 'explicit_version_label'
+  | 'explicit_api_flag'
+  | 'promotion_marker'
+  | 'absence_of_recommended'
+  | 'none';
+
+export interface LoaderSelectionMeta {
+  default_rank: number;
+  reason: LoaderSelectionReason;
+  source: LoaderSelectionSource;
+}
+
+export interface LoaderBuildMetadata {
+  terms: LoaderTerm[];
+  evidence: LoaderTermEvidence[];
+  selection: LoaderSelectionMeta;
+  display_tags: string[];
+}
+
+export interface VersionLoaderAttachment {
+  component_id: LoaderComponentId;
+  component_name: string;
+  build_id: string;
+  loader_version: string;
+  build_meta: LoaderBuildMetadata;
+}
+
 export interface Version {
+  subject_kind: VersionSubjectKind;
   id: string;
-  type: string;
+  raw_kind: string;
   release_time?: string;
-  meta: VersionMeta;
+  minecraft_meta: MinecraftVersionMeta;
+  lifecycle: LifecycleMeta;
   inherits_from?: string;
   launchable: boolean;
   installed: boolean;
@@ -42,9 +154,7 @@ export interface Version {
   java_component?: string;
   java_major?: number;
   manifest_url?: string;
-  loader_component_id?: string;
-  loader_build_id?: string;
-  loader_prerelease?: boolean;
+  loader?: VersionLoaderAttachment | null;
 }
 
 export interface Config {
@@ -77,10 +187,12 @@ export interface SystemInfo {
 }
 
 export interface CatalogVersion {
+  subject_kind: VersionSubjectKind;
   id: string;
-  type: string;
+  raw_kind: string;
   release_time: string;
-  meta: VersionMeta;
+  minecraft_meta: MinecraftVersionMeta;
+  lifecycle: LifecycleMeta;
   url: string;
   installed: boolean;
 }
@@ -247,14 +359,6 @@ export interface ToastItem {
 
 // ── Loader metadata ──
 
-export type LoaderComponentId =
-  | 'net.fabricmc.fabric-loader'
-  | 'org.quiltmc.quilt-loader'
-  | 'net.minecraftforge'
-  | 'net.neoforged';
-
-export type LoaderType = 'fabric' | 'quilt' | 'forge' | 'neoforge';
-
 export interface LoaderAvailability {
   fresh: boolean;
   stale: boolean;
@@ -274,16 +378,14 @@ export interface LoaderComponentRecord {
 }
 
 export interface LoaderBuildRecord {
+  subject_kind: LoaderBuildSubjectKind;
   component_id: LoaderComponentId;
   component_name: string;
   build_id: string;
   minecraft_version: string;
   loader_version: string;
   version_id: string;
-  stable: boolean;
-  prerelease: boolean;
-  recommended: boolean;
-  latest: boolean;
+  build_meta: LoaderBuildMetadata;
   strategy: string;
   artifact_kind: string;
   installability: string;
@@ -295,22 +397,11 @@ export interface LoaderBuildsResponse {
 }
 
 export interface LoaderGameVersion {
-  version: string;
-  type: string;
+  subject_kind: VersionSubjectKind;
+  id: string;
   release_time?: string;
-  meta: VersionMeta;
-  stable: boolean;
-}
-
-export interface VersionMeta {
-  canonical_kind: string;
-  family: string;
-  base_id: string;
-  effective_version: string;
-  variant_of: string;
-  variant_kind: string;
-  display_name: string;
-  display_hint: string;
+  minecraft_meta: MinecraftVersionMeta;
+  lifecycle: LifecycleMeta;
 }
 
 export interface LoaderGameVersionsResponse {

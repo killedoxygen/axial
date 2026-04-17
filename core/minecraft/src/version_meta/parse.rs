@@ -48,18 +48,6 @@ pub(crate) enum VersionShape {
 }
 
 impl VersionShape {
-    pub(crate) fn is_snapshot_like(&self) -> bool {
-        matches!(
-            self,
-            Self::PreRelease { .. }
-                | Self::ReleaseCandidate { .. }
-                | Self::WeeklySnapshot { .. }
-                | Self::CombatTest { .. }
-                | Self::ExperimentalSnapshot { .. }
-                | Self::DeepDarkExperimentalSnapshot { .. }
-        )
-    }
-
     pub(crate) fn base_release(&self) -> Option<&str> {
         match self {
             Self::PreRelease { release, .. }

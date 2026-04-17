@@ -7,7 +7,7 @@ import { addInstance, selectInstance } from '../actions';
 import { api } from '../api';
 import { Sound } from '../sound';
 import {
-  showError, esc, parseVersionDisplay, errMessage, formatLoaderBuildLabel, formatLoaderVersionLabel,
+  showError, esc, parseVersionDisplay, errMessage, formatLoaderBuildLabel, matchesVersionFilter,
 } from '../utils';
 import { installVersion, installLoaderVersion } from '../install';
 import { createNewInstanceLoaderMachine } from '../machines/new-instance-loader';
@@ -26,9 +26,7 @@ const FILTER_CHIPS: { value: string; label: string }[] = [
   { value: 'old_alpha', label: 'Alpha' },
 ];
 
-type VersionListEntry = CatalogVersion & {
-  stable?: boolean;
-};
+type VersionListEntry = CatalogVersion;
 
 function defaultName(): string {
   const base = 'Instance';
@@ -50,36 +48,19 @@ function validateName(name: string): string | null {
   return null;
 }
 
-function inferLoaderVersionType(version: LoaderGameVersion, catalogVersion?: CatalogVersion): string {
-  if (catalogVersion?.type) return catalogVersion.type;
-  if (version.meta?.canonical_kind) return version.meta.canonical_kind;
-  if (version.type) return version.type;
-  if (version.version.startsWith('b')) return 'old_beta';
-  if (version.version.startsWith('a')) return 'old_alpha';
-  return version.stable ? 'release' : 'snapshot';
-}
-
 function toLoaderVersionEntry(
   version: LoaderGameVersion,
   catalogVersion?: CatalogVersion,
 ): VersionListEntry {
   return {
-    id: version.version,
-    type: inferLoaderVersionType(version, catalogVersion),
+    subject_kind: version.subject_kind,
+    id: version.id,
+    raw_kind: catalogVersion?.raw_kind ?? '',
     release_time: version.release_time || catalogVersion?.release_time || '',
-    meta: version.meta || catalogVersion?.meta || {
-      canonical_kind: inferLoaderVersionType(version, catalogVersion),
-      family: '',
-      base_id: version.version,
-      effective_version: '',
-      variant_of: '',
-      variant_kind: '',
-      display_name: version.version,
-      display_hint: '',
-    },
+    minecraft_meta: version.minecraft_meta || catalogVersion?.minecraft_meta,
+    lifecycle: version.lifecycle || catalogVersion?.lifecycle,
     url: catalogVersion?.url ?? '',
     installed: false,
-    stable: version.stable,
   };
 }
 
@@ -146,7 +127,7 @@ export function NewInstanceModal(): JSX.Element | null {
         }
       }
       const allVersions = catalog.value?.versions ?? [];
-      const first = allVersions.filter(v => v.type === filter.value);
+      const first = allVersions.filter(v => matchesVersionFilter(v, filter.value));
       if (first.length > 0) {
         selectedVersionId.value = first[0].id;
         if (isAutoName(name.value.trim())) name.value = defaultName();
@@ -159,7 +140,7 @@ export function NewInstanceModal(): JSX.Element | null {
   const catalogById = useMemo(() => new Map(allVersions.map((version) => [version.id, version])), [allVersions]);
 
   const filteredCatalogVersions = useMemo(() => {
-    let next = allVersions.filter(v => v.type === filter.value);
+    let next = allVersions.filter(v => matchesVersionFilter(v, filter.value));
     if (search.value) {
       const q = search.value.toLowerCase();
       next = next.filter(v => {
@@ -174,8 +155,8 @@ export function NewInstanceModal(): JSX.Element | null {
     if (!loaderSupportedVersions) return [];
 
     let next = loaderSupportedVersions
-      .map((version) => toLoaderVersionEntry(version, catalogById.get(version.version)))
-      .filter((version) => version.type === filter.value);
+      .map((version) => toLoaderVersionEntry(version, catalogById.get(version.id)))
+      .filter((version) => matchesVersionFilter(version, filter.value));
 
     if (search.value) {
       const q = search.value.toLowerCase();
@@ -196,7 +177,7 @@ export function NewInstanceModal(): JSX.Element | null {
     const set = new Set<string>();
     for (const ver of versions.value) {
       if (!ver.launchable || !ver.inherits_from || !loader) continue;
-      if (ver.loader_component_id === loader) {
+      if (ver.loader?.component_id === loader) {
         set.add(ver.inherits_from);
       }
     }
@@ -286,7 +267,7 @@ export function NewInstanceModal(): JSX.Element | null {
       await loaderMachine.enable(selectedVersionId.value);
     } else {
       loaderMachine.disable();
-      autoSelectFirstVersion(allVersions.filter(v => v.type === filter.value), false);
+      autoSelectFirstVersion(allVersions.filter(v => matchesVersionFilter(v, filter.value)), false);
     }
     page.value = 0;
   };
@@ -337,10 +318,6 @@ export function NewInstanceModal(): JSX.Element | null {
     }
   };
 
-  // Loader info text
-  const loaderInfoText = loaderEnabled && selectedLoaderBuild
-    ? `Loader: ${formatLoaderVersionLabel(selectedLoaderBuild.loader_version, selectedLoaderBuild.prerelease)}`
-    : null;
   const createDisabled = !selectedVersionId.value || (loaderEnabled && loaderState.value.kind !== 'ready');
 
   return (
@@ -417,9 +394,6 @@ export function NewInstanceModal(): JSX.Element | null {
                     ))}
                   </select>
                 </>
-              )}
-              {loaderInfoText && (
-                <span class="ni-loader-info">{loaderInfoText}</span>
               )}
             </div>
             {loaderBuildError && (

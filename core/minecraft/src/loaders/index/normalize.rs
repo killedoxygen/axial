@@ -13,29 +13,15 @@ pub fn normalize_supported_versions(
 
 pub fn normalize_build_index(mut index: LoaderVersionIndex) -> LoaderVersionIndex {
     index.builds.sort_by(compare_build_records);
-
-    if !index.builds.iter().any(|build| build.latest)
-        && let Some(first) = index.builds.first_mut()
-    {
-        first.latest = true;
-    }
-
-    if !index.builds.iter().any(|build| build.recommended)
-        && let Some(first_stable) = index.builds.iter_mut().find(|build| build.stable)
-    {
-        first_stable.recommended = true;
-    }
-
     index
 }
 
 fn compare_build_records(left: &LoaderBuildRecord, right: &LoaderBuildRecord) -> Ordering {
     right
-        .recommended
-        .cmp(&left.recommended)
-        .then_with(|| right.stable.cmp(&left.stable))
-        .then_with(|| left.prerelease.cmp(&right.prerelease))
-        .then_with(|| right.latest.cmp(&left.latest))
+        .build_meta
+        .selection
+        .default_rank
+        .cmp(&left.build_meta.selection.default_rank)
         .then_with(|| compare_version_like(&right.loader_version, &left.loader_version))
 }
 
@@ -45,8 +31,8 @@ fn compare_supported_versions(
     catalog_order: Option<&HashMap<String, usize>>,
 ) -> Ordering {
     if let Some(order) = catalog_order {
-        let left_rank = order.get(&left.version);
-        let right_rank = order.get(&right.version);
+        let left_rank = order.get(&left.id);
+        let right_rank = order.get(&right.id);
 
         match (left_rank, right_rank) {
             (Some(left_rank), Some(right_rank)) if left_rank != right_rank => {
@@ -58,17 +44,21 @@ fn compare_supported_versions(
         }
     }
 
-    compare_version_like(&right.version, &left.version)
+    compare_version_like(&right.id, &left.id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{normalize_build_index, normalize_supported_versions};
+    use crate::lifecycle::LifecycleMeta;
     use crate::loaders::types::{
-        LoaderArtifactKind, LoaderBuildRecord, LoaderComponentId, LoaderGameVersion,
-        LoaderInstallSource, LoaderInstallStrategy, LoaderInstallability, LoaderVersionIndex,
+        LoaderArtifactKind, LoaderBuildMetadata, LoaderBuildRecord, LoaderBuildSubjectKind,
+        LoaderComponentId, LoaderGameVersion, LoaderInstallSource, LoaderInstallStrategy,
+        LoaderInstallability, LoaderSelectionMeta, LoaderSelectionReason, LoaderSelectionSource,
+        LoaderTerm, LoaderTermEvidence, LoaderTermSource, LoaderVersionIndex,
     };
-    use crate::version_meta::VersionMeta;
+    use crate::types::VersionSubjectKind;
+    use crate::version_meta::MinecraftVersionMeta;
     use std::collections::HashMap;
 
     #[test]
@@ -86,7 +76,7 @@ mod tests {
 
         let ordered = versions
             .into_iter()
-            .map(|entry| entry.version)
+            .map(|entry| entry.id)
             .collect::<Vec<_>>();
 
         assert_eq!(ordered, vec!["26.1.2", "26.1", "1.18.2", "1.18.1", "1.18"]);
@@ -110,7 +100,7 @@ mod tests {
 
         let ordered = versions
             .into_iter()
-            .map(|entry| entry.version)
+            .map(|entry| entry.id)
             .collect::<Vec<_>>();
 
         assert_eq!(ordered, vec!["1.20.4", "1.20.3", "1.20.2"]);
@@ -133,7 +123,7 @@ mod tests {
 
         let ordered = versions
             .into_iter()
-            .map(|entry| entry.version)
+            .map(|entry| entry.id)
             .collect::<Vec<_>>();
 
         assert_eq!(ordered, vec!["1.20.4", "1.20.3", "26.1"]);
@@ -152,7 +142,7 @@ mod tests {
 
         let ordered = versions
             .into_iter()
-            .map(|entry| entry.version)
+            .map(|entry| entry.id)
             .collect::<Vec<_>>();
 
         assert_eq!(ordered, vec!["1.20.5", "1.20.5-rc1", "1.20.5-pre1"]);
@@ -164,10 +154,10 @@ mod tests {
         let normalized = normalize_build_index(LoaderVersionIndex {
             component_id,
             builds: vec![
-                build_record(component_id, "40.1.0", false, false, true),
-                build_record(component_id, "40.2.0", false, true, true),
-                build_record(component_id, "40.3.0", true, false, true),
-                build_record(component_id, "39.0.0", false, false, false),
+                build_record(component_id, "40.1.0", 800),
+                build_record(component_id, "40.2.0", 900),
+                build_record(component_id, "40.3.0", 1_000),
+                build_record(component_id, "39.0.0", 600),
             ],
         });
 
@@ -186,8 +176,8 @@ mod tests {
         let normalized = normalize_build_index(LoaderVersionIndex {
             component_id,
             builds: vec![
-                build_record(component_id, "26.1.2.12-beta", false, true, false),
-                build_record(component_id, "26.1.1.15", false, false, true),
+                build_record(component_id, "26.1.2.12-beta", 650),
+                build_record(component_id, "26.1.1.15", 800),
             ],
         });
 
@@ -203,21 +193,73 @@ mod tests {
     fn build_record(
         component_id: LoaderComponentId,
         loader_version: &str,
-        recommended: bool,
-        latest: bool,
-        stable: bool,
+        default_rank: i32,
     ) -> LoaderBuildRecord {
         LoaderBuildRecord {
+            subject_kind: LoaderBuildSubjectKind::LoaderBuild,
             component_id,
             component_name: component_id.display_name().to_string(),
             build_id: format!("{}:1.18.2:{loader_version}", component_id.short_key()),
             minecraft_version: "1.18.2".to_string(),
             loader_version: loader_version.to_string(),
             version_id: format!("1.18.2-forge-{loader_version}"),
-            stable,
-            prerelease: !stable,
-            recommended,
-            latest,
+            build_meta: LoaderBuildMetadata {
+                terms: if default_rank >= 1_000 {
+                    vec![LoaderTerm::Recommended]
+                } else if default_rank >= 900 {
+                    vec![LoaderTerm::Latest]
+                } else if default_rank >= 800 {
+                    Vec::new()
+                } else {
+                    vec![LoaderTerm::Beta]
+                },
+                evidence: if default_rank >= 1_000 {
+                    vec![LoaderTermEvidence {
+                        term: LoaderTerm::Recommended,
+                        source: LoaderTermSource::PromotionMarker,
+                    }]
+                } else if default_rank >= 900 {
+                    vec![LoaderTermEvidence {
+                        term: LoaderTerm::Latest,
+                        source: LoaderTermSource::PromotionMarker,
+                    }]
+                } else if default_rank >= 800 {
+                    Vec::new()
+                } else {
+                    vec![LoaderTermEvidence {
+                        term: LoaderTerm::Beta,
+                        source: LoaderTermSource::ExplicitVersionLabel,
+                    }]
+                },
+                selection: LoaderSelectionMeta {
+                    default_rank,
+                    reason: if default_rank >= 1_000 {
+                        LoaderSelectionReason::Recommended
+                    } else if default_rank >= 900 {
+                        LoaderSelectionReason::LatestStable
+                    } else if default_rank >= 800 {
+                        LoaderSelectionReason::Stable
+                    } else {
+                        LoaderSelectionReason::Unstable
+                    },
+                    source: if default_rank >= 900 {
+                        LoaderSelectionSource::PromotionMarker
+                    } else if default_rank >= 800 {
+                        LoaderSelectionSource::ExplicitApiFlag
+                    } else {
+                        LoaderSelectionSource::ExplicitVersionLabel
+                    },
+                },
+                display_tags: if default_rank >= 1_000 {
+                    vec!["recommended".to_string()]
+                } else if default_rank >= 900 {
+                    vec!["latest".to_string()]
+                } else if default_rank >= 800 {
+                    Vec::new()
+                } else {
+                    vec!["beta".to_string()]
+                },
+            },
             strategy: LoaderInstallStrategy::ForgeModern,
             artifact_kind: LoaderArtifactKind::InstallerJar,
             installability: LoaderInstallability::Installable,
@@ -229,11 +271,12 @@ mod tests {
 
     fn game_version(version: &str, stable: bool) -> LoaderGameVersion {
         LoaderGameVersion {
-            version: version.to_string(),
-            kind: String::new(),
+            subject_kind: VersionSubjectKind::MinecraftVersion,
+            id: version.to_string(),
             release_time: String::new(),
-            meta: VersionMeta::default(),
-            stable,
+            minecraft_meta: MinecraftVersionMeta::default(),
+            lifecycle: LifecycleMeta::default(),
+            stable_hint: Some(stable),
         }
     }
 }

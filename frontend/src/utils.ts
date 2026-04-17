@@ -1,7 +1,17 @@
 import { byId } from './dom';
 import { collapsedLogSeverity, currentPage, instances, logLines } from './store';
 import { toast } from './toast';
-import type { LoaderBuildRecord, LoaderComponentId, LoaderType, Page, Version } from './types';
+import type {
+  CatalogVersion,
+  LifecycleLabel,
+  LifecycleMeta,
+  LoaderBuildRecord,
+  LoaderBuildMetadata,
+  LoaderComponentId,
+  LoaderType,
+  Page,
+  Version,
+} from './types';
 
 const loggedInstances = new Set<string>();
 let activeLogFilter = 'all';
@@ -134,33 +144,83 @@ interface VersionDisplay {
   loader?: string | null;
 }
 
-export function parseVersionDisplay(versionId: string, version: any, versions: any[]): VersionDisplay {
-  if (version?.inherits_from) return parseModded(versionId, version.inherits_from, version as Version | null);
-  if (version?.meta?.display_name) {
+type VersionLike = Pick<Version, 'id' | 'inherits_from' | 'loader' | 'minecraft_meta' | 'lifecycle' | 'release_time'>
+  | Pick<CatalogVersion, 'id' | 'minecraft_meta' | 'lifecycle' | 'release_time'>;
+
+export function hasLifecycleLabel(
+  lifecycle: LifecycleMeta | undefined | null,
+  label: LifecycleLabel,
+): boolean {
+  return !!lifecycle?.labels?.includes(label);
+}
+
+export function isReleaseVersion(version: Pick<Version, 'lifecycle'> | Pick<CatalogVersion, 'lifecycle'> | null | undefined): boolean {
+  return version?.lifecycle?.channel === 'stable' && hasLifecycleLabel(version.lifecycle, 'release');
+}
+
+export function isSnapshotVersion(version: Pick<Version, 'lifecycle'> | Pick<CatalogVersion, 'lifecycle'> | null | undefined): boolean {
+  if (!version?.lifecycle) return false;
+  if (hasLifecycleLabel(version.lifecycle, 'old_beta') || hasLifecycleLabel(version.lifecycle, 'old_alpha')) {
+    return false;
+  }
+  return version.lifecycle.channel === 'preview' || version.lifecycle.channel === 'experimental';
+}
+
+export function isOldBetaVersion(version: Pick<Version, 'lifecycle'> | Pick<CatalogVersion, 'lifecycle'> | null | undefined): boolean {
+  return hasLifecycleLabel(version?.lifecycle, 'old_beta');
+}
+
+export function isOldAlphaVersion(version: Pick<Version, 'lifecycle'> | Pick<CatalogVersion, 'lifecycle'> | null | undefined): boolean {
+  return hasLifecycleLabel(version?.lifecycle, 'old_alpha');
+}
+
+export function matchesVersionFilter(
+  version: Pick<CatalogVersion, 'lifecycle'> | Pick<Version, 'lifecycle'>,
+  filter: string,
+): boolean {
+  if (filter === 'release') return isReleaseVersion(version);
+  if (filter === 'snapshot') return isSnapshotVersion(version);
+  if (filter === 'old_beta') return isOldBetaVersion(version);
+  if (filter === 'old_alpha') return isOldAlphaVersion(version);
+  return true;
+}
+
+export function versionBadgeInfo(version: Version | null | undefined): { cls: string; text: string } {
+  if (isReleaseVersion(version)) return { cls: 'badge-release', text: 'REL' };
+  if (isSnapshotVersion(version)) return { cls: 'badge-snapshot', text: 'SNAP' };
+  if (isOldBetaVersion(version)) return { cls: 'badge-old', text: 'BETA' };
+  if (isOldAlphaVersion(version)) return { cls: 'badge-old', text: 'ALPH' };
+  return { cls: 'badge-old', text: version?.lifecycle?.badge_text || '?' };
+}
+
+export function parseVersionDisplay(versionId: string, version: VersionLike | null | undefined, versions: VersionLike[]): VersionDisplay {
+  if (version && 'inherits_from' in version && version.inherits_from) {
+    return parseModded(versionId, version.inherits_from, version as Version | null);
+  }
+  if (version?.minecraft_meta?.display_name) {
     return {
-      name: version.meta.display_name,
-      hint: version.meta.display_hint || null,
+      name: version.minecraft_meta.display_name,
+      hint: version.minecraft_meta.display_hint || null,
     };
   }
-  const type = version?.type;
-  if (type === 'old_beta') return { name: versionId.replace(/^b/, 'Beta '), hint: null };
-  if (type === 'old_alpha') return { name: versionId.replace(/^a/, 'Alpha '), hint: null };
-  if (type === 'snapshot') return parseSnapshot(versionId, version, versions);
+  if (isOldBetaVersion(version)) return { name: versionId.replace(/^b/, 'Beta '), hint: null };
+  if (isOldAlphaVersion(version)) return { name: versionId.replace(/^a/, 'Alpha '), hint: null };
+  if (isSnapshotVersion(version)) return parseSnapshot(versionId, version, versions);
   return { name: versionId, hint: null };
 }
 
-export function formatLoaderBuildLabel(
-  build: Pick<LoaderBuildRecord, 'loader_version' | 'prerelease' | 'recommended' | 'latest'>,
-): string {
-  const tags: string[] = [];
-  if (build.prerelease) tags.push(prereleaseTag(build.loader_version));
-  if (build.recommended) tags.push('recommended');
-  else if (build.latest) tags.push('latest');
+function loaderTermTags(buildMeta: LoaderBuildMetadata | undefined | null): string[] {
+  return buildMeta?.display_tags ?? [];
+}
+
+export function formatLoaderBuildLabel(build: Pick<LoaderBuildRecord, 'loader_version' | 'build_meta'>): string {
+  const tags = loaderTermTags(build.build_meta);
   return tags.length > 0 ? `${build.loader_version} (${tags.join(', ')})` : build.loader_version;
 }
 
-export function formatLoaderVersionLabel(loaderVersion: string, prerelease = false): string {
-  return prerelease ? `${loaderVersion} (${prereleaseTag(loaderVersion)})` : loaderVersion;
+export function formatLoaderVersionLabel(loaderVersion: string, buildMeta?: LoaderBuildMetadata | null): string {
+  const tags = loaderTermTags(buildMeta);
+  return tags.length > 0 ? `${loaderVersion} (${tags.join(', ')})` : loaderVersion;
 }
 
 function parseModded(id: string, base: string, version?: Version | null): VersionDisplay {
@@ -199,34 +259,15 @@ function parseModded(id: string, base: string, version?: Version | null): Versio
 }
 
 function parseNormalizedLoaderDisplay(base: string, version?: Version | null): VersionDisplay | null {
-  if (!version?.loader_component_id || !version.loader_build_id) return null;
-  const parsed = parseLoaderBuildId(version.loader_build_id);
-  const loader = loaderTypeFromComponentId(version.loader_component_id);
-  if (!parsed || !loader) return null;
+  if (!version?.loader) return null;
+  const loader = loaderTypeFromComponentId(version.loader.component_id);
+  if (!loader) return null;
   return loaderDisplay(
     loader,
     base,
-    parsed.loaderVersion,
-    version.loader_prerelease ?? isPrereleaseLoaderVersion(parsed.loaderVersion),
+    version.loader.loader_version,
+    version.loader.build_meta,
   );
-}
-
-function parseLoaderBuildId(buildId: string): { componentId: LoaderComponentId; minecraftVersion: string; loaderVersion: string } | null {
-  const parts = buildId.split(':');
-  if (parts.length < 3) return null;
-  const componentId = loaderComponentIdFromShortKey(parts[0]);
-  const minecraftVersion = parts[1] || '';
-  const loaderVersion = parts.slice(2).join(':');
-  if (!componentId || !minecraftVersion || !loaderVersion) return null;
-  return { componentId, minecraftVersion, loaderVersion };
-}
-
-function loaderComponentIdFromShortKey(shortKey: string): LoaderComponentId | null {
-  if (shortKey === 'fabric') return 'net.fabricmc.fabric-loader';
-  if (shortKey === 'quilt') return 'org.quiltmc.quilt-loader';
-  if (shortKey === 'forge') return 'net.minecraftforge';
-  if (shortKey === 'neoforge') return 'net.neoforged';
-  return null;
 }
 
 function loaderTypeFromComponentId(componentId: string): LoaderType | null {
@@ -241,7 +282,7 @@ function loaderDisplay(
   loader: LoaderType,
   base: string,
   loaderVersion: string,
-  prerelease = isPrereleaseLoaderVersion(loaderVersion),
+  buildMeta?: LoaderBuildMetadata | null,
 ): VersionDisplay {
   const title = loader === 'fabric' ? `Fabric ${base}`
     : loader === 'quilt' ? `Quilt ${base}`
@@ -254,28 +295,16 @@ function loaderDisplay(
       : 'NeoForge';
   return {
     name: title,
-    hint: loaderVersion ? `${hintPrefix} ${formatLoaderVersionLabel(loaderVersion, prerelease)}` : null,
+    hint: loaderVersion ? `${hintPrefix} ${formatLoaderVersionLabel(loaderVersion, buildMeta)}` : null,
     loader,
   };
 }
 
-function isPrereleaseLoaderVersion(loaderVersion: string): boolean {
-  const lower = loaderVersion.toLowerCase();
-  return ['alpha', 'beta', 'snapshot', 'pre', 'rc'].some((marker) => lower.includes(marker));
-}
-
-function prereleaseTag(loaderVersion: string): string {
-  const lower = loaderVersion.toLowerCase();
-  if (lower.includes('beta')) return 'beta';
-  if (lower.includes('alpha')) return 'alpha';
-  return 'prerelease';
-}
-
-function parseSnapshot(id: string, version: any, versions: any[]): VersionDisplay {
-  if (version?.meta?.display_name) {
+function parseSnapshot(id: string, version: VersionLike | null | undefined, versions: VersionLike[]): VersionDisplay {
+  if (version?.minecraft_meta?.display_name) {
     return {
-      name: version.meta.display_name,
-      hint: version.meta.display_hint || null,
+      name: version.minecraft_meta.display_name,
+      hint: version.minecraft_meta.display_hint || null,
     };
   }
   // pre-release / release candidate: 1.20.5-pre1, 1.20.5-rc1
@@ -284,12 +313,26 @@ function parseSnapshot(id: string, version: any, versions: any[]): VersionDispla
   // weekly snapshot: find nearest release by time
   if (versions?.length && version?.release_time) {
     const t = version.release_time as string;
-    const rel = versions.filter((v: any) => v.type === 'release' && v.release_time).sort((a: any, b: any) => (a.release_time as string).localeCompare(b.release_time as string));
+    const rel = versions
+      .filter((v) => isReleaseVersion(v) && v.release_time)
+      .sort((a, b) => (a.release_time as string).localeCompare(b.release_time as string));
     // first release at or after snapshot
-    let nearest: any = null;
-    for (const r of rel) { if (r.release_time >= t) { nearest = r; break; } }
+    let nearest: VersionLike | null = null;
+    for (const r of rel) {
+      if ((r.release_time || '') >= t) {
+        nearest = r;
+        break;
+      }
+    }
     // if none after, use last release before
-    if (!nearest) { for (let i = rel.length - 1; i >= 0; i--) { if (rel[i].release_time <= t) { nearest = rel[i]; break; } } }
+    if (!nearest) {
+      for (let i = rel.length - 1; i >= 0; i--) {
+        if ((rel[i]?.release_time || '') <= t) {
+          nearest = rel[i] || null;
+          break;
+        }
+      }
+    }
     if (nearest && !id.includes(nearest.id)) return { name: id, hint: `~ ${nearest.id}` };
   }
   return { name: id, hint: null };

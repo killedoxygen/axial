@@ -81,15 +81,23 @@ export const filteredInstances = computed<Instance[]>(() => {
   const filter = sidebarFilter.value;
   const search = searchQuery.value;
 
+  const isRelease = (version: Version | undefined) =>
+    version?.lifecycle?.channel === 'stable' && version.lifecycle.labels.includes('release');
+  const isSnapshot = (version: Version | undefined) =>
+    !!version
+    && !version.lifecycle.labels.includes('old_beta')
+    && !version.lifecycle.labels.includes('old_alpha')
+    && (version.lifecycle.channel === 'preview' || version.lifecycle.channel === 'experimental');
+
   if (filter === 'release') {
     list = list.filter(inst => {
       const v = vm.get(inst.version_id);
-      return v?.type === 'release' && !v?.inherits_from;
+      return isRelease(v) && !v?.inherits_from;
     });
   } else if (filter === 'snapshot') {
     list = list.filter(inst => {
       const v = vm.get(inst.version_id);
-      return v?.type === 'snapshot' && !v?.inherits_from;
+      return isSnapshot(v) && !v?.inherits_from;
     });
   } else if (filter === 'modded') {
     list = list.filter(inst => {

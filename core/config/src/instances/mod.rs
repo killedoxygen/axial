@@ -37,8 +37,6 @@ pub struct Instance {
 pub struct EnrichedInstance {
     #[serde(flatten)]
     pub instance: Instance,
-    #[serde(default)]
-    pub version_type: String,
     pub launchable: bool,
     #[serde(default)]
     pub status_detail: String,
@@ -133,7 +131,6 @@ impl InstanceStore {
                 let game_dir = self.game_dir(&instance.id);
 
                 EnrichedInstance {
-                    version_type: version.map(|entry| entry.kind.clone()).unwrap_or_default(),
                     launchable: version.is_some_and(|entry| entry.launchable),
                     status_detail: version
                         .map(|entry| entry.status_detail.clone())

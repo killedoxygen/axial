@@ -1,10 +1,11 @@
 use crate::loaders::{
     infer_build_from_version_id,
-    types::{CachedCatalog, LoaderComponentId, LoaderVersionIndex},
+    providers::common::infer_loader_build_metadata,
+    types::{CachedCatalog, LoaderBuildMetadata, LoaderComponentId, LoaderVersionIndex},
 };
 use crate::paths::{loader_catalog_dir, versions_dir};
-use crate::types::VersionEntry;
-use crate::version_meta::{analyze_version_metadata, compare_version_entries};
+use crate::types::{VersionEntry, VersionLoaderAttachment, VersionSubjectKind};
+use crate::version_meta::{analyze_minecraft_version, compare_version_entries};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -115,15 +116,16 @@ pub fn scan_versions(mc_dir: &Path) -> std::io::Result<Vec<VersionEntry>> {
             }
         };
 
-        let loader_meta = infer_build_from_version_id(id);
-        let loader_prerelease = infer_loader_prerelease(mc_dir, loader_meta.as_ref());
-        let metadata = analyze_version_metadata(id, &stub.kind, &stub.release_time, None, &[]);
+        let loader = infer_loader_attachment(mc_dir, id);
+        let analysis = analyze_minecraft_version(id, &stub.kind, &stub.release_time, None, &[]);
 
         versions.push(VersionEntry {
+            subject_kind: VersionSubjectKind::InstalledVersion,
             id: id.clone(),
-            kind: metadata.canonical_kind.clone(),
+            raw_kind: stub.kind.clone(),
             release_time: stub.release_time.clone(),
-            meta: metadata,
+            minecraft_meta: analysis.minecraft_meta,
+            lifecycle: analysis.lifecycle,
             inherits_from: effective_parent.clone(),
             launchable,
             installed: true,
@@ -133,11 +135,7 @@ pub fn scan_versions(mc_dir: &Path) -> std::io::Result<Vec<VersionEntry>> {
             java_component: resolved_java.component,
             java_major: resolved_java.major_version,
             manifest_url: String::new(),
-            loader_component_id: loader_meta
-                .as_ref()
-                .map(|(component_id, _, _, _)| component_id.as_str().to_string()),
-            loader_build_id: loader_meta.map(|(_, build_id, _, _)| build_id),
-            loader_prerelease,
+            loader,
         });
     }
 
@@ -236,15 +234,30 @@ fn neoforge_to_mc_version(version: &str) -> String {
     format!("1.{major}.{minor}")
 }
 
-fn infer_loader_prerelease(
-    mc_dir: &Path,
-    loader_meta: Option<&(LoaderComponentId, String, String, String)>,
-) -> Option<bool> {
-    let (component_id, build_id, minecraft_version, loader_version) = loader_meta?;
-    if is_prerelease_loader_version(loader_version) {
-        return Some(true);
-    }
+fn infer_loader_attachment(mc_dir: &Path, version_id: &str) -> Option<VersionLoaderAttachment> {
+    let (component_id, build_id, minecraft_version, loader_version) =
+        infer_build_from_version_id(version_id)?;
+    let build_meta =
+        read_cached_loader_metadata(mc_dir, component_id, &build_id, &minecraft_version)
+            .unwrap_or_else(|| {
+                infer_loader_build_metadata(&loader_version, &[], false, false, None)
+            });
 
+    Some(VersionLoaderAttachment {
+        component_id,
+        component_name: component_id.display_name().to_string(),
+        build_id,
+        loader_version,
+        build_meta,
+    })
+}
+
+fn read_cached_loader_metadata(
+    mc_dir: &Path,
+    component_id: LoaderComponentId,
+    build_id: &str,
+    minecraft_version: &str,
+) -> Option<LoaderBuildMetadata> {
     let cache_path = loader_catalog_dir(mc_dir).join(format!(
         "component-{}-builds-{}.json",
         component_id.short_key(),
@@ -256,23 +269,18 @@ fn infer_loader_prerelease(
         .value
         .builds
         .into_iter()
-        .find(|build| build.build_id == *build_id)
-        .map(|build| build.prerelease)
-}
-
-fn is_prerelease_loader_version(loader_version: &str) -> bool {
-    let lower = loader_version.to_ascii_lowercase();
-    ["alpha", "beta", "snapshot", "pre", "rc"]
-        .into_iter()
-        .any(|marker| lower.contains(marker))
+        .find(|build| build.build_id == build_id)
+        .map(|build| build.build_meta)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{JavaVersionStub, VersionStub, resolve_java_version, scan_versions};
     use crate::loaders::types::{
-        CachedCatalog, LoaderArtifactKind, LoaderBuildRecord, LoaderComponentId,
-        LoaderInstallSource, LoaderInstallStrategy, LoaderInstallability, LoaderVersionIndex,
+        CachedCatalog, LoaderArtifactKind, LoaderBuildMetadata, LoaderBuildRecord,
+        LoaderBuildSubjectKind, LoaderComponentId, LoaderInstallSource, LoaderInstallStrategy,
+        LoaderInstallability, LoaderSelectionMeta, LoaderSelectionReason, LoaderSelectionSource,
+        LoaderTerm, LoaderTermEvidence, LoaderTermSource, LoaderVersionIndex,
     };
     use std::collections::HashMap;
     use std::fs;
@@ -340,8 +348,8 @@ mod tests {
     }
 
     #[test]
-    fn scan_versions_reads_loader_prerelease_from_cached_build_index() {
-        let mc_dir = unique_test_dir("loader-prerelease-cache");
+    fn scan_versions_reads_loader_lifecycle_from_cached_build_index() {
+        let mc_dir = unique_test_dir("loader-lifecycle-cache");
         let versions_dir = mc_dir.join("versions");
         let forge_dir = versions_dir.join("26.1.2-forge-64.0.4");
         fs::create_dir_all(&forge_dir).expect("create forge version dir");
@@ -360,16 +368,32 @@ mod tests {
         let cache = CachedCatalog::new(LoaderVersionIndex {
             component_id: LoaderComponentId::Forge,
             builds: vec![LoaderBuildRecord {
+                subject_kind: LoaderBuildSubjectKind::LoaderBuild,
                 component_id: LoaderComponentId::Forge,
                 component_name: "Forge".to_string(),
                 build_id: "forge:26.1.2:64.0.4".to_string(),
                 minecraft_version: "26.1.2".to_string(),
                 loader_version: "64.0.4".to_string(),
                 version_id: "26.1.2-forge-64.0.4".to_string(),
-                stable: false,
-                prerelease: true,
-                recommended: false,
-                latest: true,
+                build_meta: LoaderBuildMetadata {
+                    terms: vec![LoaderTerm::Beta, LoaderTerm::Latest],
+                    evidence: vec![
+                        LoaderTermEvidence {
+                            term: LoaderTerm::Beta,
+                            source: LoaderTermSource::ExplicitVersionLabel,
+                        },
+                        LoaderTermEvidence {
+                            term: LoaderTerm::Latest,
+                            source: LoaderTermSource::PromotionMarker,
+                        },
+                    ],
+                    selection: LoaderSelectionMeta {
+                        default_rank: 650,
+                        reason: LoaderSelectionReason::LatestUnstable,
+                        source: LoaderSelectionSource::AbsenceOfRecommended,
+                    },
+                    display_tags: vec!["latest".to_string(), "beta".to_string()],
+                },
                 strategy: LoaderInstallStrategy::ForgeModern,
                 artifact_kind: LoaderArtifactKind::InstallerJar,
                 installability: LoaderInstallability::Installable,
@@ -390,7 +414,14 @@ mod tests {
             .find(|entry| entry.id == "26.1.2-forge-64.0.4")
             .expect("forge version exists");
 
-        assert_eq!(version.loader_prerelease, Some(true));
+        let loader = version.loader.as_ref().expect("loader lifecycle exists");
+        assert_eq!(loader.component_id, LoaderComponentId::Forge);
+        assert_eq!(loader.loader_version, "64.0.4");
+        assert!(loader.build_meta.terms.contains(&LoaderTerm::Beta));
+        assert_eq!(
+            loader.build_meta.selection.reason,
+            LoaderSelectionReason::LatestUnstable
+        );
 
         fs::remove_dir_all(&mc_dir).expect("remove temp test dir");
     }

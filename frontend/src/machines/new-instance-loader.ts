@@ -310,7 +310,7 @@ export function createNewInstanceLoaderMachine(): NewInstanceLoaderMachine {
     });
     try {
       const supportedVersions = await fetchLoaderSupportedVersions(selectedComponentId);
-      const versionSet = new Set(supportedVersions.map((entry) => entry.version));
+      const versionSet = new Set(supportedVersions.map((entry) => entry.id));
       const nextSelectedMcVersion = selectedMcVersion && versionSet.has(selectedMcVersion)
         ? selectedMcVersion
         : null;
@@ -392,7 +392,7 @@ export function createNewInstanceLoaderMachine(): NewInstanceLoaderMachine {
       if (!selectedComponentId || !supportedVersions) {
         return;
       }
-      if (!supportedVersions.some((entry) => entry.version === mcVersion)) {
+      if (!supportedVersions.some((entry) => entry.id === mcVersion)) {
         return;
       }
       await loadBuilds(selectedComponentId, mcVersion);
@@ -406,7 +406,7 @@ export function createNewInstanceLoaderMachine(): NewInstanceLoaderMachine {
       if (!selectedComponentId || !supportedVersions || mcVersions.length === 0) {
         return;
       }
-      const supported = new Set(supportedVersions.map((entry) => entry.version));
+      const supported = new Set(supportedVersions.map((entry) => entry.id));
       void Promise.allSettled(
         mcVersions
           .filter((version) => supported.has(version))

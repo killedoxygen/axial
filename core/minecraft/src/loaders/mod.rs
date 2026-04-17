@@ -17,10 +17,11 @@ pub use api::{
 };
 pub use index::{fetch_builds, fetch_components, fetch_supported_versions, resolve_build_record};
 pub use types::{
-    LoaderArtifactKind, LoaderAvailability, LoaderBuildId, LoaderBuildRecord, LoaderCatalogState,
-    LoaderComponentId, LoaderComponentRecord, LoaderError, LoaderGameVersion,
+    LoaderArtifactKind, LoaderAvailability, LoaderBuildId, LoaderBuildMetadata, LoaderBuildRecord,
+    LoaderCatalogState, LoaderComponentId, LoaderComponentRecord, LoaderError, LoaderGameVersion,
     LoaderInstallFailureKind, LoaderInstallPlan, LoaderInstallSource, LoaderInstallStrategy,
-    LoaderInstallability, LoaderVersionIndex,
+    LoaderInstallability, LoaderSelectionMeta, LoaderSelectionReason, LoaderSelectionSource,
+    LoaderTerm, LoaderTermEvidence, LoaderTermSource, LoaderVersionIndex,
 };
 
 use crate::download::DownloadProgress;

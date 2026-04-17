@@ -1,6 +1,7 @@
 mod parse;
 mod tokenize;
 
+use crate::lifecycle::{LifecycleChannel, LifecycleLabel, LifecycleMeta};
 use crate::loaders::types::LoaderGameVersion;
 use crate::types::VersionEntry;
 use crate::{ManifestEntry, manifest::VersionManifest};
@@ -16,9 +17,7 @@ pub struct ReleaseReference {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct VersionMeta {
-    #[serde(default)]
-    pub canonical_kind: String,
+pub struct MinecraftVersionMeta {
     #[serde(default)]
     pub family: String,
     #[serde(default)]
@@ -33,6 +32,12 @@ pub struct VersionMeta {
     pub display_name: String,
     #[serde(default)]
     pub display_hint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnalyzedMinecraftVersion {
+    pub lifecycle: LifecycleMeta,
+    pub minecraft_meta: MinecraftVersionMeta,
 }
 
 pub fn manifest_release_references(manifest: &VersionManifest) -> Vec<ReleaseReference> {
@@ -52,33 +57,35 @@ pub fn manifest_release_entries(entries: &[ManifestEntry]) -> Vec<ReleaseReferen
     releases
 }
 
-pub fn analyze_version_metadata(
+pub fn analyze_minecraft_version(
     id: &str,
     raw_kind: &str,
     release_time: &str,
     stable_hint: Option<bool>,
     releases: &[ReleaseReference],
-) -> VersionMeta {
+) -> AnalyzedMinecraftVersion {
     let parsed = parse_version_id(id);
-    let canonical_kind = classify_version_kind(&parsed, raw_kind, stable_hint);
-    let family = classify_version_family(&parsed, &canonical_kind);
+    let family = classify_version_family(&parsed, raw_kind, stable_hint);
     let effective_version = effective_version_for(&parsed, family, release_time, releases);
     let display_name = display_name_for(&parsed);
     let display_hint = display_hint_for(&parsed, family, &effective_version);
+    let lifecycle = classify_lifecycle(&parsed, raw_kind, stable_hint);
 
-    VersionMeta {
-        canonical_kind,
-        family: family.to_string(),
-        base_id: parsed.base_id.clone(),
-        effective_version,
-        variant_of: if parsed.variant_kind.is_empty() {
-            String::new()
-        } else {
-            parsed.base_id.clone()
+    AnalyzedMinecraftVersion {
+        lifecycle,
+        minecraft_meta: MinecraftVersionMeta {
+            family: family.to_string(),
+            base_id: parsed.base_id.clone(),
+            effective_version,
+            variant_of: if parsed.variant_kind.is_empty() {
+                String::new()
+            } else {
+                parsed.base_id.clone()
+            },
+            variant_kind: parsed.variant_kind.clone(),
+            display_name,
+            display_hint,
         },
-        variant_kind: parsed.variant_kind.clone(),
-        display_name,
-        display_hint,
     }
 }
 
@@ -88,42 +95,50 @@ pub fn enrich_loader_game_versions(
     releases: &[ReleaseReference],
 ) {
     for version in versions {
-        let manifest_entry = manifest_entries
-            .iter()
-            .find(|entry| entry.id == version.version);
-        let metadata = analyze_version_metadata(
-            &version.version,
+        let manifest_entry = manifest_entries.iter().find(|entry| entry.id == version.id);
+        let metadata = analyze_minecraft_version(
+            &version.id,
             manifest_entry
                 .map(|entry| entry.kind.as_str())
-                .unwrap_or(&version.kind),
+                .unwrap_or(""),
             manifest_entry
                 .map(|entry| entry.release_time.as_str())
                 .unwrap_or(&version.release_time),
-            Some(version.stable),
+            version.stable_hint,
             releases,
         );
         if let Some(entry) = manifest_entry {
             version.release_time = entry.release_time.clone();
         }
-        version.kind = metadata.canonical_kind.clone();
-        version.meta = metadata;
+        version.lifecycle = metadata.lifecycle;
+        version.minecraft_meta = metadata.minecraft_meta;
     }
 }
 
 pub fn enrich_version_entries(entries: &mut [VersionEntry], releases: &[ReleaseReference]) {
     for entry in entries {
-        let metadata =
-            analyze_version_metadata(&entry.id, &entry.kind, &entry.release_time, None, releases);
-        entry.kind = metadata.canonical_kind.clone();
-        entry.meta = metadata;
+        let analysis = analyze_minecraft_version(
+            &entry.id,
+            &entry.raw_kind,
+            &entry.release_time,
+            None,
+            releases,
+        );
+        entry.lifecycle = analysis.lifecycle;
+        entry.minecraft_meta = analysis.minecraft_meta;
     }
 }
 
-pub fn apply_version_metadata(entry: &mut VersionEntry, releases: &[ReleaseReference]) {
-    let metadata =
-        analyze_version_metadata(&entry.id, &entry.kind, &entry.release_time, None, releases);
-    entry.kind = metadata.canonical_kind.clone();
-    entry.meta = metadata;
+pub fn apply_version_analysis(entry: &mut VersionEntry, releases: &[ReleaseReference]) {
+    let analysis = analyze_minecraft_version(
+        &entry.id,
+        &entry.raw_kind,
+        &entry.release_time,
+        None,
+        releases,
+    );
+    entry.lifecycle = analysis.lifecycle;
+    entry.minecraft_meta = analysis.minecraft_meta;
 }
 
 pub fn compare_version_like(left: &str, right: &str) -> Ordering {
@@ -136,51 +151,146 @@ pub fn compare_version_like(left: &str, right: &str) -> Ordering {
 }
 
 pub fn compare_version_entries(left: &VersionEntry, right: &VersionEntry) -> Ordering {
-    version_kind_priority(&left.kind)
-        .cmp(&version_kind_priority(&right.kind))
+    version_lifecycle_priority(&left.lifecycle, &left.minecraft_meta)
+        .cmp(&version_lifecycle_priority(
+            &right.lifecycle,
+            &right.minecraft_meta,
+        ))
         .then_with(|| compare_release_time_desc(&left.release_time, &right.release_time))
-        .then_with(|| compare_version_meta_desc(&left.meta, &right.meta))
+        .then_with(|| compare_version_meta_desc(&left.minecraft_meta, &right.minecraft_meta))
         .then_with(|| compare_version_like(&right.id, &left.id))
 }
 
-fn classify_version_kind(
+fn classify_lifecycle(
     parsed: &ParsedVersionId,
     raw_kind: &str,
     stable_hint: Option<bool>,
-) -> String {
+) -> LifecycleMeta {
     match parsed.shape {
-        VersionShape::OldBeta { .. } => "old_beta".to_string(),
-        VersionShape::OldAlpha { .. } => "old_alpha".to_string(),
+        VersionShape::OldBeta { .. } => LifecycleMeta::new(
+            LifecycleChannel::Legacy,
+            vec![LifecycleLabel::OldBeta],
+            200,
+            "BETA",
+            vec!["old_beta".to_string()],
+        ),
+        VersionShape::OldAlpha { .. } => LifecycleMeta::new(
+            LifecycleChannel::Legacy,
+            vec![LifecycleLabel::OldAlpha],
+            100,
+            "ALPH",
+            vec!["old_alpha".to_string()],
+        ),
+        VersionShape::PreRelease { .. } => LifecycleMeta::new(
+            LifecycleChannel::Preview,
+            vec![LifecycleLabel::PreRelease],
+            430,
+            "PRE",
+            vec!["pre_release".to_string()],
+        ),
+        VersionShape::ReleaseCandidate { .. } => LifecycleMeta::new(
+            LifecycleChannel::Preview,
+            vec![LifecycleLabel::ReleaseCandidate],
+            440,
+            "RC",
+            vec!["release_candidate".to_string()],
+        ),
+        VersionShape::CombatTest { .. }
+        | VersionShape::ExperimentalSnapshot { .. }
+        | VersionShape::DeepDarkExperimentalSnapshot { .. } => LifecycleMeta::new(
+            LifecycleChannel::Experimental,
+            vec![LifecycleLabel::Snapshot],
+            320,
+            "EXP",
+            vec!["experimental".to_string()],
+        ),
+        VersionShape::WeeklySnapshot { .. } => LifecycleMeta::new(
+            LifecycleChannel::Preview,
+            vec![LifecycleLabel::Snapshot],
+            400,
+            "SNAP",
+            vec!["snapshot".to_string()],
+        ),
+        VersionShape::Release { .. } => LifecycleMeta::new(
+            LifecycleChannel::Stable,
+            vec![LifecycleLabel::Release],
+            500,
+            "REL",
+            vec!["release".to_string()],
+        ),
         VersionShape::Unknown => {
-            if matches!(raw_kind, "old_beta" | "old_alpha" | "release" | "snapshot") {
-                raw_kind.to_string()
+            if raw_kind == "old_beta" {
+                LifecycleMeta::new(
+                    LifecycleChannel::Legacy,
+                    vec![LifecycleLabel::OldBeta],
+                    200,
+                    "BETA",
+                    vec![raw_kind.to_string()],
+                )
+            } else if raw_kind == "old_alpha" {
+                LifecycleMeta::new(
+                    LifecycleChannel::Legacy,
+                    vec![LifecycleLabel::OldAlpha],
+                    100,
+                    "ALPH",
+                    vec![raw_kind.to_string()],
+                )
+            } else if raw_kind == "snapshot" {
+                LifecycleMeta::new(
+                    LifecycleChannel::Preview,
+                    vec![LifecycleLabel::Snapshot],
+                    400,
+                    "SNAP",
+                    vec![raw_kind.to_string()],
+                )
+            } else if raw_kind == "release" {
+                LifecycleMeta::new(
+                    LifecycleChannel::Stable,
+                    vec![LifecycleLabel::Release],
+                    500,
+                    "REL",
+                    vec![raw_kind.to_string()],
+                )
             } else if let Some(stable) = stable_hint {
                 if stable {
-                    "release".to_string()
+                    LifecycleMeta::new(
+                        LifecycleChannel::Stable,
+                        vec![LifecycleLabel::Release],
+                        500,
+                        "REL",
+                        Vec::new(),
+                    )
                 } else {
-                    "snapshot".to_string()
+                    LifecycleMeta::new(
+                        LifecycleChannel::Preview,
+                        vec![LifecycleLabel::Unknown],
+                        250,
+                        "PRE",
+                        Vec::new(),
+                    )
                 }
             } else {
-                "release".to_string()
-            }
-        }
-        _ if parsed.shape.is_snapshot_like() => "snapshot".to_string(),
-        _ if matches!(raw_kind, "snapshot" | "release") => raw_kind.to_string(),
-        _ => {
-            if let Some(stable) = stable_hint {
-                if stable {
-                    "release".to_string()
-                } else {
-                    "snapshot".to_string()
-                }
-            } else {
-                "release".to_string()
+                LifecycleMeta::new(
+                    LifecycleChannel::Unknown,
+                    vec![LifecycleLabel::Unknown],
+                    0,
+                    "?",
+                    if raw_kind.trim().is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![raw_kind.to_string()]
+                    },
+                )
             }
         }
     }
 }
 
-fn classify_version_family(parsed: &ParsedVersionId, canonical_kind: &str) -> &'static str {
+fn classify_version_family(
+    parsed: &ParsedVersionId,
+    raw_kind: &str,
+    stable_hint: Option<bool>,
+) -> &'static str {
     match &parsed.shape {
         VersionShape::OldBeta { .. } => "old_beta",
         VersionShape::OldAlpha { .. } => "old_alpha",
@@ -191,7 +301,10 @@ fn classify_version_family(parsed: &ParsedVersionId, canonical_kind: &str) -> &'
         VersionShape::ExperimentalSnapshot { .. } => "experimental_snapshot",
         VersionShape::WeeklySnapshot { is_potato, .. } if *is_potato => "potato_snapshot",
         VersionShape::WeeklySnapshot { .. } => "weekly_snapshot",
-        _ if canonical_kind == "snapshot" => "snapshot",
+        VersionShape::Release { .. } => "release",
+        VersionShape::Unknown if raw_kind == "snapshot" || matches!(stable_hint, Some(false)) => {
+            "snapshot"
+        }
         _ => "release",
     }
 }
@@ -467,7 +580,10 @@ fn parse_release_components(value: &str) -> Option<Vec<u32>> {
     }
 }
 
-fn compare_version_meta_desc(left: &VersionMeta, right: &VersionMeta) -> Ordering {
+fn compare_version_meta_desc(
+    left: &MinecraftVersionMeta,
+    right: &MinecraftVersionMeta,
+) -> Ordering {
     compare_version_like(
         effective_version_or_base(right),
         effective_version_or_base(left),
@@ -477,7 +593,7 @@ fn compare_version_meta_desc(left: &VersionMeta, right: &VersionMeta) -> Orderin
     .then_with(|| variant_priority(&left.variant_kind).cmp(&variant_priority(&right.variant_kind)))
 }
 
-fn effective_version_or_base(meta: &VersionMeta) -> &str {
+fn effective_version_or_base(meta: &MinecraftVersionMeta) -> &str {
     if !meta.effective_version.is_empty() {
         meta.effective_version.as_str()
     } else if !meta.base_id.is_empty() {
@@ -496,13 +612,27 @@ fn compare_release_time_desc(left: &str, right: &str) -> Ordering {
     }
 }
 
-fn version_kind_priority(kind: &str) -> i32 {
-    match kind {
-        "release" => 0,
-        "snapshot" => 1,
-        "old_beta" => 2,
-        "old_alpha" => 3,
-        _ => 4,
+fn version_lifecycle_priority(lifecycle: &LifecycleMeta, meta: &MinecraftVersionMeta) -> i32 {
+    match lifecycle.channel {
+        LifecycleChannel::Stable => 0,
+        LifecycleChannel::Preview => {
+            if lifecycle.has_label(LifecycleLabel::ReleaseCandidate) {
+                1
+            } else if lifecycle.has_label(LifecycleLabel::PreRelease) {
+                2
+            } else {
+                3
+            }
+        }
+        LifecycleChannel::Experimental => 4,
+        LifecycleChannel::Legacy => {
+            if meta.family == "old_beta" {
+                5
+            } else {
+                6
+            }
+        }
+        LifecycleChannel::Unknown => 7,
     }
 }
 
@@ -534,21 +664,23 @@ fn variant_priority(variant_kind: &str) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReleaseReference, analyze_version_metadata, compare_version_like};
+    use super::{ReleaseReference, analyze_minecraft_version, compare_version_like};
+    use crate::lifecycle::{LifecycleChannel, LifecycleLabel};
 
     #[test]
     fn classifies_unobfuscated_release_as_release_with_variant_hint() {
-        let metadata = analyze_version_metadata("1.21.11_unobfuscated", "release", "", None, &[]);
-        assert_eq!(metadata.canonical_kind, "release");
-        assert_eq!(metadata.variant_kind, "unobfuscated");
-        assert_eq!(metadata.variant_of, "1.21.11");
-        assert_eq!(metadata.display_name, "1.21.11");
-        assert_eq!(metadata.display_hint, "Unobfuscated");
+        let analysis = analyze_minecraft_version("1.21.11_unobfuscated", "release", "", None, &[]);
+        assert_eq!(analysis.lifecycle.channel, LifecycleChannel::Stable);
+        assert_eq!(analysis.lifecycle.labels, vec![LifecycleLabel::Release]);
+        assert_eq!(analysis.minecraft_meta.variant_kind, "unobfuscated");
+        assert_eq!(analysis.minecraft_meta.variant_of, "1.21.11");
+        assert_eq!(analysis.minecraft_meta.display_name, "1.21.11");
+        assert_eq!(analysis.minecraft_meta.display_hint, "Unobfuscated");
     }
 
     #[test]
     fn classifies_snapshot_variants_with_release_estimate_and_variant_hint() {
-        let metadata = analyze_version_metadata(
+        let analysis = analyze_minecraft_version(
             "25w46a_unobfuscated",
             "snapshot",
             "2026-01-01T00:00:00+00:00",
@@ -558,11 +690,15 @@ mod tests {
                 release_time: "2026-01-02T00:00:00+00:00".to_string(),
             }],
         );
-        assert_eq!(metadata.canonical_kind, "snapshot");
-        assert_eq!(metadata.family, "weekly_snapshot");
-        assert_eq!(metadata.effective_version, "1.21.11");
-        assert_eq!(metadata.display_name, "25w46a");
-        assert_eq!(metadata.display_hint, "~ 1.21.11 · Unobfuscated");
+        assert_eq!(analysis.lifecycle.channel, LifecycleChannel::Preview);
+        assert_eq!(analysis.lifecycle.labels, vec![LifecycleLabel::Snapshot]);
+        assert_eq!(analysis.minecraft_meta.family, "weekly_snapshot");
+        assert_eq!(analysis.minecraft_meta.effective_version, "1.21.11");
+        assert_eq!(analysis.minecraft_meta.display_name, "25w46a");
+        assert_eq!(
+            analysis.minecraft_meta.display_hint,
+            "~ 1.21.11 · Unobfuscated"
+        );
     }
 
     #[test]
@@ -578,7 +714,7 @@ mod tests {
             },
         ];
 
-        let metadata = analyze_version_metadata(
+        let analysis = analyze_minecraft_version(
             "25w46a",
             "snapshot",
             "2025-11-10T00:00:00+00:00",
@@ -586,25 +722,28 @@ mod tests {
             &releases,
         );
 
-        assert_eq!(metadata.display_hint, "~ 1.21.11");
+        assert_eq!(analysis.minecraft_meta.display_hint, "~ 1.21.11");
     }
 
     #[test]
     fn humanizes_experimental_snapshot_names() {
-        let metadata = analyze_version_metadata("1.18_experimentaI-snapshot-6", "", "", None, &[]);
-        assert_eq!(metadata.canonical_kind, "snapshot");
-        assert_eq!(metadata.family, "experimental_snapshot");
-        assert_eq!(metadata.effective_version, "1.18");
-        assert_eq!(metadata.display_name, "1.18 Experimental Snapshot 6");
+        let analysis = analyze_minecraft_version("1.18_experimentaI-snapshot-6", "", "", None, &[]);
+        assert_eq!(analysis.lifecycle.channel, LifecycleChannel::Experimental);
+        assert_eq!(analysis.minecraft_meta.family, "experimental_snapshot");
+        assert_eq!(analysis.minecraft_meta.effective_version, "1.18");
+        assert_eq!(
+            analysis.minecraft_meta.display_name,
+            "1.18 Experimental Snapshot 6"
+        );
     }
 
     #[test]
     fn humanizes_combat_test_names() {
-        let metadata = analyze_version_metadata("1.16_combat-3", "", "", None, &[]);
-        assert_eq!(metadata.canonical_kind, "snapshot");
-        assert_eq!(metadata.family, "combat_test");
-        assert_eq!(metadata.effective_version, "1.16");
-        assert_eq!(metadata.display_name, "1.16 Combat Test 3");
+        let analysis = analyze_minecraft_version("1.16_combat-3", "", "", None, &[]);
+        assert_eq!(analysis.lifecycle.channel, LifecycleChannel::Experimental);
+        assert_eq!(analysis.minecraft_meta.family, "combat_test");
+        assert_eq!(analysis.minecraft_meta.effective_version, "1.16");
+        assert_eq!(analysis.minecraft_meta.display_name, "1.16 Combat Test 3");
     }
 
     #[test]

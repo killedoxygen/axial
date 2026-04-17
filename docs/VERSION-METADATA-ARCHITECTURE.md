@@ -1,69 +1,92 @@
 # Version Metadata Architecture
-This is the current version-analysis model. Keep it accurate. If version naming, classification, or ordering changes, update this file in the same change.
+This is the current Minecraft-version interpretation model. Keep it accurate. If version naming, lifecycle classification, or ordering changes, update this file in the same change.
 
 ## Purpose
-The backend owns version interpretation.
+The backend owns two separate concerns:
 
-That means:
-- raw version ids are never the UI data model
-- frontend code renders backend-authored version metadata
-- weird version families are classified once in Rust, not re-guessed in multiple UI callsites
-- ordering is deterministic and backend-owned
-- unknown shapes still pass through a deterministic fallback path instead of devolving to raw provider order
+- `minecraft_meta`: what kind of Minecraft version this is structurally
+- `lifecycle`: how mature that version is in launcher terms
+
+That split is deliberate. Loader builds use a different metadata contract and are documented separately in `docs/LOADER-ARCHITECTURE.md`.
 
 ## Source of truth
-The authority lives in `core/minecraft/src/version_meta/mod.rs`.
+The authority lives in:
 
-The analysis pipeline is layered under:
-- `core/minecraft/src/version_meta/tokenize.rs`
-- `core/minecraft/src/version_meta/parse.rs`
 - `core/minecraft/src/version_meta/mod.rs`
+- `core/minecraft/src/version_meta/parse.rs`
+- `core/minecraft/src/version_meta/tokenize.rs`
 
-It produces `VersionMeta` for:
+It produces:
+
+- `MinecraftVersionMeta`
+- `LifecycleMeta`
+
+Those fields are attached to:
+
 - vanilla catalog entries from `/api/v1/catalog`
 - installed/local versions from `/api/v1/versions`
 - loader-supported Minecraft versions from `/api/v1/loaders/components/{id}/game-versions`
 
-## VersionMeta model
-`VersionMeta` currently carries:
-- `canonical_kind`: normalized launcher category such as `release`, `snapshot`, `old_beta`, `old_alpha`
-- `family`: more precise version family such as `weekly_snapshot`, `pre_release`, `release_candidate`, `combat_test`, `experimental_snapshot`, `deep_dark_experimental_snapshot`, `potato_snapshot`
-- `base_id`: normalized id without variant suffixes like `_unobfuscated` or `_original`
-- `effective_version`: the real release target or practical grouping version
-- `variant_of`: base version id when the raw id is a variant
-- `variant_kind`: variant label such as `unobfuscated` or `original`
-- `display_name`: backend-authored main label
-- `display_hint`: backend-authored secondary hint text
+## Record model
+Minecraft-version records expose:
 
-Top-level API `type` remains as the normalized `canonical_kind` for simple filtering, but `VersionMeta` is the richer authority.
+- `subject_kind = minecraft_version` for catalog and loader-supported records
+- `subject_kind = installed_version` for installed/local version records
+- `raw_kind`: upstream kind string when available
+- `minecraft_meta`
+- `lifecycle`
+
+`MinecraftVersionMeta` carries:
+
+- `family`
+- `base_id`
+- `effective_version`
+- `variant_of`
+- `variant_kind`
+- `display_name`
+- `display_hint`
+
+`LifecycleMeta` carries:
+
+- `channel`: `stable | preview | experimental | legacy | unknown`
+- `labels`
+- `default_rank`
+- `badge_text`
+- `provider_terms`
+
+`minecraft_meta` does not own maturity anymore. `lifecycle` does.
 
 ## Pipeline
 ```mermaid
 flowchart TD
-    A[Raw version id] --> B[tokenize.rs builds typed token stream]
+    A[Raw version id + raw kind + release time] --> B[tokenize.rs builds typed token stream]
     B --> C[parse.rs strips known variant suffixes]
     C --> D[parse.rs detects structural shape]
-    D --> E[mod.rs maps shape to canonical kind and family]
-    E --> F[mod.rs resolves effective version from shape or manifest timeline]
-    F --> G[mod.rs builds display_name and display_hint]
-    G --> H[mod.rs applies deterministic ordering]
-    H --> I[Attach VersionMeta to API record]
-    I --> J[Frontend renders backend metadata]
+    D --> E[mod.rs builds MinecraftVersionMeta]
+    D --> F[mod.rs maps shape to LifecycleMeta]
+    E --> G[mod.rs resolves effective_version and display strings]
+    F --> H[mod.rs assigns default_rank and badge_text]
+    G --> I[attach minecraft_meta]
+    H --> J[attach lifecycle]
+    I --> K[frontend renders backend-authored metadata]
+    J --> K
 ```
 
 ## Layer responsibilities
 ### 1. Tokenizer
-`tokenize.rs` converts a raw id into typed tokens:
+`tokenize.rs` converts a raw id into tolerant typed tokens:
+
 - `number`
 - `word`
 - `separator`
 
-This is the generic fallback layer. It should remain tolerant of unseen shapes and never encode version-family policy directly.
+It stays generic and should not own family policy.
 
 ### 2. Structural parser
-`parse.rs` uses the token stream to detect shapes without owning UI policy.
+`parse.rs` detects Minecraft version shapes and strips variant suffixes.
 
-Current shapes:
+Current shapes include:
+
 - release
 - pre-release
 - release candidate
@@ -75,78 +98,82 @@ Current shapes:
 - old alpha
 - unknown
 
-The parser also strips variant suffixes such as `_unobfuscated` and `_original` into:
-- `base_id`
-- `variant_kind`
-
 ### 3. Semantic interpreter
-`mod.rs` is the policy layer over the parsed shape. It decides:
-- canonical kind
-- family
-- effective version
-- display name
-- display hint
+`mod.rs` is the policy layer.
+
+It decides:
+
+- `minecraft_meta.family`
+- `minecraft_meta.effective_version`
+- `minecraft_meta.display_name`
+- `minecraft_meta.display_hint`
+- `lifecycle.channel`
+- `lifecycle.labels`
 - sort precedence
 
-This is where explicit knowledge of Minecraft version families belongs.
-
 ## Classification rules
-### Family classification examples
 Examples:
-- `25w46a` -> `weekly_snapshot`
-- `1.21.11-pre5` -> `pre_release`
-- `1.21.11-rc3` -> `release_candidate`
-- `1.18_experimentaI-snapshot-6` -> `experimental_snapshot`
-- `1.19_deep_dark_experimental_snapshot-l` -> `deep_dark_experimental_snapshot`
-- `1.16_combat-3` -> `combat_test`
-- `24w14potato_original` -> `potato_snapshot` + `original`
 
-### Effective version
-This is the practical release target or grouping anchor.
+- `25w46a`
+  - `family = weekly_snapshot`
+  - `lifecycle.channel = preview`
+  - `lifecycle.labels = [snapshot]`
+- `1.21.11-pre5`
+  - `family = pre_release`
+  - `lifecycle.channel = preview`
+  - `lifecycle.labels = [pre_release]`
+- `1.21.11-rc3`
+  - `family = release_candidate`
+  - `lifecycle.channel = preview`
+  - `lifecycle.labels = [release_candidate]`
+- `b1.7.3`
+  - `family = old_beta`
+  - `lifecycle.channel = legacy`
+  - `lifecycle.labels = [old_beta]`
+- `a1.2.6`
+  - `family = old_alpha`
+  - `lifecycle.channel = legacy`
+  - `lifecycle.labels = [old_alpha]`
+
+## Effective version
+`effective_version` is the practical release target or grouping anchor.
 
 Examples:
+
 - `1.21.11-pre5` -> `1.21.11`
 - `1.21.11-rc3` -> `1.21.11`
 - `1.16_combat-3` -> `1.16`
-- `1.18_experimentaI-snapshot-6` -> `1.18`
-- `25w46a` -> nearest release by timestamp from the Mojang manifest
-
-### Variant normalization
-- suffix variants such as `_unobfuscated` and `_original` are stripped into `base_id`
-- the removed suffix becomes `variant_kind`
-- the base id stays visible in the main UI label
-- variants stay in the hint text, not as separate fake versions
+- `25w46a` -> nearest release by manifest timestamp
 
 ## Ordering rules
-Installed version ordering is backend-owned and follows this shape:
-1. normalized kind priority
+Installed version ordering is backend-owned and currently follows:
+
+1. lifecycle priority
 2. release time descending when available
 3. effective version descending
 4. family priority
 5. base id descending
 6. variant priority
-7. raw id descending as the final deterministic fallback
+7. raw id descending
 
-Loader-supported Minecraft versions are ordered by:
-1. Mojang manifest order when the version exists there
-2. backend fallback comparator for versions outside the manifest ordering path
+Loader-supported Minecraft versions use:
 
-The fallback comparator is also layered:
-1. shape-aware comparison for known families
-2. token-aware comparison for unknown or partially known shapes
-3. raw id comparison as the last deterministic fallback
+1. Mojang manifest order when known
+2. backend fallback version comparison otherwise
 
-That means new weird ids should still sort stably even before a dedicated family interpreter exists.
+The fallback comparator stays deterministic even for unknown shapes.
 
 ## Frontend contract
 Frontend code should:
-- use `meta.display_name` and `meta.display_hint` for non-modded versions
-- use backend `type` or `meta.canonical_kind` for filtering/badges
-- avoid re-parsing vanilla, snapshot, experimental, combat, or suffix variants locally
 
-The remaining frontend parsing is for modded composite ids like Fabric, Quilt, Forge, NeoForge, and OptiFine.
+- render `minecraft_meta.display_name` and `minecraft_meta.display_hint`
+- use `lifecycle` for filtering and badges
+- avoid re-parsing vanilla-like version ids locally
+
+The remaining local parsing is only fallback presentation for composite modded ids when installed metadata is incomplete.
 
 ## Maintenance rules
-- add new version-family semantics in the semantic interpreter layer, not in the frontend
-- keep the tokenizer generic; do not turn it into a pile of family-specific regex checks
-- if a new Mojang naming family appears, first make sure the fallback path renders and sorts it sanely, then add a family interpreter if the UX still needs more precision
+- add new Mojang naming families in `version_meta/mod.rs`, not in the frontend
+- do not overload `family` as a maturity field
+- do not reintroduce top-level `type` or `canonical_kind`
+- if lifecycle policy changes, update both this doc and `docs/LOADER-ARCHITECTURE.md`

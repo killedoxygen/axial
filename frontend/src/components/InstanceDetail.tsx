@@ -4,7 +4,7 @@ import type { EnrichedInstance, Version } from '../types';
 import {
   selectedInstance, selectedVersion, versions, config, instanceLaunchDrafts,
 } from '../store';
-import { parseVersionDisplay, formatRelativeTime } from '../utils';
+import { parseVersionDisplay, formatRelativeTime, versionBadgeInfo } from '../utils';
 import { api } from '../api';
 import { Sound } from '../sound';
 import { updateInstanceInList } from '../actions';
@@ -17,18 +17,9 @@ import { ResourcesPane } from './instance/ResourcesPane';
 import { ScreenshotsPane } from './instance/ScreenshotsPane';
 import { AdvancedPane } from './instance/AdvancedPane';
 
-function badgeInfo(version: Version | null, versionType: string): { cls: string; text: string } {
-  const isModded = !!version?.inherits_from;
-  const vType = versionType || version?.type || '';
-  const cls = isModded ? 'badge-modded'
-    : vType === 'release' ? 'badge-release'
-    : vType === 'snapshot' ? 'badge-snapshot'
-    : 'badge-old';
-  const text = isModded ? 'MOD'
-    : vType === 'release' ? 'REL'
-    : vType === 'snapshot' ? 'SNAP'
-    : vType?.toUpperCase()?.slice(0, 4) || '?';
-  return { cls, text };
+function badgeInfo(version: Version | null): { cls: string; text: string } {
+  if (version?.inherits_from) return { cls: 'badge-modded', text: 'MOD' };
+  return versionBadgeInfo(version);
 }
 
 function jvmPresetLabel(preset: string): string | null {
@@ -92,8 +83,7 @@ export function InstanceDetail(): JSX.Element | null {
     };
   }, [inst.id, inst.java_path, inst.jvm_preset, inst.extra_jvm_args]);
 
-  const versionType = (inst as any).version_type || version?.type || '';
-  const badge = badgeInfo(version, versionType);
+  const badge = badgeInfo(version);
   const pd = parseVersionDisplay(inst.version_id, version, allVersions);
 
   // Build meta parts

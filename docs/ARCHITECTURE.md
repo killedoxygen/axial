@@ -33,7 +33,9 @@ This is the current map of the launcher. Keep it accurate. If the architecture c
 - `core/launcher/src/guardian/`: launch-safety authority and intervention model
 - `core/launcher/src/service/`: launch preparation, mappings, Healing summary/recovery helpers
 - `core/minecraft/src/runtime/`: runtime discovery and managed runtime installation
-- `core/minecraft/src/version_meta/`: version classification, effective-version resolution, display metadata, deterministic ordering
+- `core/minecraft/src/version_meta/`: Minecraft version interpretation, lifecycle classification, effective-version resolution, display metadata, deterministic ordering
+- `core/minecraft/src/lifecycle.rs`: launcher-owned lifecycle model for Minecraft versions
+- `core/minecraft/src/loaders/types.rs`: loader build metadata contract, explicit upstream terms, evidence, backend display tags, and default-selection policy
 
 ## Full launcher pipeline
 
@@ -161,17 +163,33 @@ flowchart TD
     F --> G[frontend refreshes versions/catalog/instance state]
 ```
 
-### Version metadata pipeline
+### Version and lifecycle pipeline
 ```mermaid
 flowchart TD
     A[Raw version id from manifest/local scan/loader provider] --> B[tokenize.rs builds typed token stream]
     B --> C[parse.rs strips known variant suffixes and detects shape]
-    C --> D[mod.rs maps shape to canonical kind and family]
-    D --> E[mod.rs resolves effective version]
-    E --> F[mod.rs builds display_name and display_hint]
-    F --> G[mod.rs applies deterministic ordering]
-    G --> H[attach VersionMeta to catalog, installed version, or loader version record]
-    H --> I[frontend renders backend metadata without re-parsing vanilla-like ids]
+    C --> D[mod.rs builds MinecraftVersionMeta]
+    C --> E[mod.rs maps shape or provider data to LifecycleMeta]
+    D --> F[mod.rs resolves effective version]
+    F --> G[mod.rs builds display_name and display_hint]
+    E --> H[default_rank and badge_text are backend-authored]
+    G --> I[attach minecraft_meta]
+    H --> J[attach lifecycle]
+    I --> K[frontend renders backend metadata without re-parsing vanilla-like ids]
+    J --> K
+```
+
+### Loader metadata pipeline
+```mermaid
+flowchart TD
+    A[Raw provider payload] --> B[loader provider parses upstream fields]
+    B --> C[extract explicit loader terms from version string or provider markers]
+    B --> D[derive term evidence and selection evidence from explicit flags or provider-specific rules]
+    C --> E[build LoaderBuildMetadata]
+    D --> E
+    E --> F[assign backend-owned selection rank reason and display tags]
+    F --> G[attach build_meta to LoaderBuildRecord]
+    G --> H[frontend renders backend-authored loader tags only]
 ```
 
 ## Launch authority boundaries
@@ -185,7 +203,7 @@ flowchart TD
 - launch behavior: `apps/api/src/routes/launch/`, `apps/api/src/state/sessions/`, `core/launcher/`, `core/minecraft/src/runtime/`
 - config/settings: `core/config/`, `frontend/src/settings.ts`
 - install flow: `apps/api/src/routes/install.rs`, `core/minecraft/`, `frontend/src/install.ts`
-- version analysis: `core/minecraft/src/version_meta/`, `apps/api/src/routes/catalog.rs`, `apps/api/src/routes/versions.rs`, `core/minecraft/src/loaders/index/query.rs`
+- version and loader metadata analysis: `core/minecraft/src/version_meta/`, `core/minecraft/src/lifecycle.rs`, `core/minecraft/src/loaders/types.rs`, `core/minecraft/src/loaders/providers/`, `apps/api/src/routes/catalog.rs`, `apps/api/src/routes/versions.rs`, `core/minecraft/src/loaders/index/query.rs`
 - desktop bridge: `apps/desktop/`, `frontend/src/native.ts`
 
 ## Current architectural pressure points

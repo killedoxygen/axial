@@ -2,6 +2,7 @@ import { useComputed } from '@preact/signals';
 import type { Instance, Version } from '../types';
 import { bootstrapError, bootstrapState, filteredInstances, instances, versionMap } from '../store';
 import { showInstanceContextMenu } from '../context-menu';
+import { isReleaseVersion, isSnapshotVersion } from '../utils';
 import { InstanceGroup } from './InstanceGroup';
 
 interface InstanceGroups {
@@ -24,8 +25,8 @@ export function InstanceList() {
     for (const inst of filtered.value) {
       const v: Version | undefined = map.get(inst.version_id);
       if (v?.inherits_from) result.modded.push(inst);
-      else if (v?.type === 'release') result.release.push(inst);
-      else if (v?.type === 'snapshot') result.snapshot.push(inst);
+      else if (isReleaseVersion(v)) result.release.push(inst);
+      else if (isSnapshotVersion(v)) result.snapshot.push(inst);
       else result.other.push(inst);
     }
     return result;

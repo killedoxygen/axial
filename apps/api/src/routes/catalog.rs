@@ -1,8 +1,8 @@
 use crate::state::AppState;
 use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
 use croopor_minecraft::{
-    VersionMeta, analyze_version_metadata, fetch_version_manifest, manifest_release_references,
-    scan_versions,
+    LifecycleMeta, MinecraftVersionMeta, VersionSubjectKind, analyze_minecraft_version,
+    fetch_version_manifest, manifest_release_references, scan_versions,
 };
 use serde::Serialize;
 use std::collections::HashSet;
@@ -10,11 +10,12 @@ use std::path::PathBuf;
 
 #[derive(Debug, Serialize)]
 struct CatalogEntry {
+    subject_kind: VersionSubjectKind,
     id: String,
-    #[serde(rename = "type")]
-    kind: String,
+    raw_kind: String,
     release_time: String,
-    meta: VersionMeta,
+    minecraft_meta: MinecraftVersionMeta,
+    lifecycle: LifecycleMeta,
     url: String,
     installed: bool,
 }
@@ -58,7 +59,7 @@ async fn handle_catalog(
         .versions
         .into_iter()
         .map(|version| {
-            let metadata = analyze_version_metadata(
+            let analysis = analyze_minecraft_version(
                 &version.id,
                 &version.kind,
                 &version.release_time,
@@ -66,11 +67,13 @@ async fn handle_catalog(
                 &releases,
             );
             CatalogEntry {
+                subject_kind: VersionSubjectKind::MinecraftVersion,
                 installed: installed.contains(&version.id),
                 id: version.id,
-                kind: metadata.canonical_kind.clone(),
+                raw_kind: version.kind,
                 release_time: version.release_time,
-                meta: metadata,
+                minecraft_meta: analysis.minecraft_meta,
+                lifecycle: analysis.lifecycle,
                 url: version.url,
             }
         })

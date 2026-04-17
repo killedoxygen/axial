@@ -4,7 +4,7 @@ import {
   selectedInstanceId, runningSessions, installState, installQueue, versions, versionMap,
 } from '../store';
 import { selectInstance } from '../actions';
-import { parseVersionDisplay } from '../utils';
+import { parseVersionDisplay, versionBadgeInfo } from '../utils';
 import { LoaderIcon } from './LoaderIcons';
 
 const KNOWN_LOADERS = new Set(['fabric', 'quilt', 'forge', 'neoforge']);
@@ -35,20 +35,14 @@ export function InstanceItem({ instance, version, index, onContextMenu }: Instan
     const p = pd.value;
     if (p.loader && KNOWN_LOADERS.has(p.loader)) return `badge-loader badge-${p.loader}`;
     if (isModded) return 'badge-modded';
-    if (version?.type === 'release') return 'badge-release';
-    if (version?.type === 'snapshot') return 'badge-snapshot';
-    return 'badge-old';
+    return versionBadgeInfo(version).cls;
   });
 
   const badgeText = useComputed(() => {
     const p = pd.value;
     if (p.loader && KNOWN_LOADERS.has(p.loader)) return null;
     if (isModded) return 'MOD';
-    if (version?.type === 'release') return 'REL';
-    if (version?.type === 'snapshot') return 'SNAP';
-    if (version?.type === 'old_beta') return 'BETA';
-    if (version?.type === 'old_alpha') return 'ALPH';
-    return version?.type?.toUpperCase()?.slice(0, 4) || '?';
+    return versionBadgeInfo(version).text;
   });
 
   const installPct = useComputed(() => {

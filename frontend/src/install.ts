@@ -38,27 +38,34 @@ export function handleInstallClick(): void {
 
   const version = selectedVersion.value;
   const target = version?.needs_install || version?.id || inst.version_id;
-  const loader = version?.loader_component_id && version?.loader_build_id
+  const loader = version?.loader
     ? {
-        componentId: version.loader_component_id as LoaderComponentId,
-        buildId: version.loader_build_id,
+        componentId: version.loader.component_id as LoaderComponentId,
+        buildId: version.loader.build_id,
         minecraftVersion: version.inherits_from || '',
-        loaderVersion: inferLoaderVersionFromBuildId(version.loader_build_id),
+        loaderVersion: version.loader.loader_version,
         versionId: target,
       }
     : parseLoaderFromId(target, version?.inherits_from || '');
   if (loader) {
     installLoaderVersion({
+      subject_kind: 'loader_build',
       component_id: loader.componentId,
       component_name: '',
       build_id: loader.buildId,
       minecraft_version: loader.minecraftVersion,
       loader_version: loader.loaderVersion,
       version_id: loader.versionId,
-      stable: false,
-      prerelease: false,
-      recommended: false,
-      latest: false,
+      build_meta: {
+        terms: [],
+        evidence: [],
+        selection: {
+          default_rank: 0,
+          reason: 'unknown',
+          source: 'none',
+        },
+        display_tags: [],
+      },
       strategy: '',
       artifact_kind: '',
       installability: '',
@@ -222,11 +229,6 @@ async function processLoaderInstall(next: InstallItem): Promise<void> {
     showError(`Loader install failed: ${errMessage(err)}`);
     await onInstallDone();
   }
-}
-
-function inferLoaderVersionFromBuildId(buildId: string): string {
-  const parts = buildId.split(':');
-  return parts[2] || '';
 }
 
 function formatCountLabel(base: string, data: InstallProgressEvent): string {

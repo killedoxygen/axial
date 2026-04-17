@@ -1,5 +1,6 @@
 use crate::download::DownloadError;
-use crate::version_meta::VersionMeta;
+use crate::types::VersionSubjectKind;
+use crate::version_meta::MinecraftVersionMeta;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -64,17 +65,101 @@ pub struct LoaderComponentRecord {
     pub name: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoaderTerm {
+    Recommended,
+    Latest,
+    Snapshot,
+    PreRelease,
+    ReleaseCandidate,
+    Beta,
+    Alpha,
+    Nightly,
+    Dev,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LoaderTermSource {
+    ExplicitVersionLabel,
+    ExplicitApiFlag,
+    PromotionMarker,
+    #[default]
+    None,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct LoaderTermEvidence {
+    pub term: LoaderTerm,
+    #[serde(default)]
+    pub source: LoaderTermSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LoaderSelectionReason {
+    Recommended,
+    LatestStable,
+    Stable,
+    Latest,
+    Unlabeled,
+    LatestUnstable,
+    Unstable,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LoaderSelectionSource {
+    ExplicitVersionLabel,
+    ExplicitApiFlag,
+    PromotionMarker,
+    AbsenceOfRecommended,
+    #[default]
+    None,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct LoaderSelectionMeta {
+    #[serde(default)]
+    pub default_rank: i32,
+    #[serde(default)]
+    pub reason: LoaderSelectionReason,
+    #[serde(default)]
+    pub source: LoaderSelectionSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct LoaderBuildMetadata {
+    #[serde(default)]
+    pub terms: Vec<LoaderTerm>,
+    #[serde(default)]
+    pub evidence: Vec<LoaderTermEvidence>,
+    #[serde(default)]
+    pub selection: LoaderSelectionMeta,
+    #[serde(default)]
+    pub display_tags: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoaderGameVersion {
-    pub version: String,
-    #[serde(rename = "type", default)]
-    pub kind: String,
+    #[serde(default = "minecraft_version_subject_kind")]
+    pub subject_kind: VersionSubjectKind,
+    pub id: String,
     #[serde(default)]
     pub release_time: String,
     #[serde(default)]
-    pub meta: VersionMeta,
+    pub minecraft_meta: MinecraftVersionMeta,
     #[serde(default)]
-    pub stable: bool,
+    pub lifecycle: crate::lifecycle::LifecycleMeta,
+    #[serde(skip)]
+    pub stable_hint: Option<bool>,
+}
+
+fn minecraft_version_subject_kind() -> VersionSubjectKind {
+    VersionSubjectKind::MinecraftVersion
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -132,22 +217,31 @@ pub enum LoaderInstallability {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoaderBuildSubjectKind {
+    LoaderBuild,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoaderBuildRecord {
+    #[serde(default = "loader_build_subject_kind")]
+    pub subject_kind: LoaderBuildSubjectKind,
     pub component_id: LoaderComponentId,
     pub component_name: String,
     pub build_id: LoaderBuildId,
     pub minecraft_version: String,
     pub loader_version: String,
     pub version_id: String,
-    pub stable: bool,
     #[serde(default)]
-    pub prerelease: bool,
-    pub recommended: bool,
-    pub latest: bool,
+    pub build_meta: LoaderBuildMetadata,
     pub strategy: LoaderInstallStrategy,
     pub artifact_kind: LoaderArtifactKind,
     pub installability: LoaderInstallability,
     pub install_source: LoaderInstallSource,
+}
+
+fn loader_build_subject_kind() -> LoaderBuildSubjectKind {
+    LoaderBuildSubjectKind::LoaderBuild
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -254,17 +348,19 @@ mod tests {
     use super::LoaderGameVersion;
 
     #[test]
-    fn loader_game_version_defaults_stable_when_missing() {
+    fn loader_game_version_defaults_lifecycle_when_missing() {
         let version: LoaderGameVersion = serde_json::from_str(
             r#"{
-                "version": "1.20.4",
-                "type": "release"
+                "id": "1.20.4"
             }"#,
         )
         .expect("loader game version should deserialize");
 
-        assert_eq!(version.version, "1.20.4");
-        assert_eq!(version.kind, "release");
-        assert!(!version.stable);
+        assert_eq!(version.id, "1.20.4");
+        assert_eq!(version.lifecycle.default_rank, 0);
+        assert_eq!(
+            version.subject_kind,
+            crate::types::VersionSubjectKind::MinecraftVersion
+        );
     }
 }

@@ -2,6 +2,7 @@ pub mod download;
 pub mod integrity;
 pub mod java;
 pub mod launch;
+pub mod lifecycle;
 pub mod loaders;
 pub mod manifest;
 pub mod paths;
@@ -23,11 +24,13 @@ pub use launch::{
     client_jar_path, load_version_json, offline_uuid, resolve_arguments, resolve_libraries,
     resolve_version,
 };
+pub use lifecycle::{LifecycleChannel, LifecycleLabel, LifecycleMeta};
 pub use loaders::{
-    LoaderArtifactKind, LoaderAvailability, LoaderBuildId, LoaderBuildRecord, LoaderCatalogState,
-    LoaderComponentId, LoaderComponentRecord, LoaderError, LoaderGameVersion,
-    LoaderInstallFailureKind, LoaderInstallStrategy, LoaderInstallability, LoaderVersionIndex,
-    build_id_for, fetch_builds, fetch_components, fetch_supported_versions,
+    LoaderArtifactKind, LoaderAvailability, LoaderBuildId, LoaderBuildMetadata, LoaderBuildRecord,
+    LoaderCatalogState, LoaderComponentId, LoaderComponentRecord, LoaderError, LoaderGameVersion,
+    LoaderInstallFailureKind, LoaderInstallStrategy, LoaderInstallability, LoaderSelectionMeta,
+    LoaderSelectionReason, LoaderSelectionSource, LoaderTerm, LoaderTermEvidence, LoaderTermSource,
+    LoaderVersionIndex, build_id_for, fetch_builds, fetch_components, fetch_supported_versions,
     infer_build_from_version_id, infer_neoforge_minecraft_version, install_build,
     installed_version_id_for, loader_components, parse_build_id, resolve_build_record,
 };
@@ -47,10 +50,10 @@ pub use runtime::{
     RuntimeRecord, RuntimeRequirement, RuntimeSource, ensure_runtime, list_runtime_records,
     parse_runtime_override, runtime_requirement,
 };
-pub use types::VersionEntry;
+pub use types::{VersionEntry, VersionLoaderAttachment, VersionSubjectKind};
 pub use version::scan_versions;
 pub use version_meta::{
-    ReleaseReference, VersionMeta, analyze_version_metadata, apply_version_metadata,
+    MinecraftVersionMeta, ReleaseReference, analyze_minecraft_version, apply_version_analysis,
     compare_version_entries, compare_version_like, enrich_loader_game_versions,
     enrich_version_entries, manifest_release_entries, manifest_release_references,
 };

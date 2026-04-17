@@ -1,13 +1,13 @@
 # Loader Architecture
 
-This is the modloader shape used by Croopor.
+This is the current modloader model used by Croopor.
 
-The goal is simple:
+The important rule is:
 
-- upstream APIs stay isolated
-- Croopor works on normalized component and build records
-- install behavior is selected by strategy, not by scattered `if` chains
-- the launcher sees the result as a normal installed version
+- loaders are normalized by component and build
+- user-facing loader labels come only from explicit upstream terms
+- backend selection policy is separate from user-facing terms
+- the frontend consumes normalized records and does not inspect raw upstream payloads
 
 ## Core model
 
@@ -20,15 +20,39 @@ Current component ids:
 - `net.minecraftforge`
 - `net.neoforged`
 
-Each installable loader build is a normalized `LoaderBuildRecord`.
+The two main normalized record types are:
+
+- `LoaderGameVersion`
+- `LoaderBuildRecord`
+
+`LoaderGameVersion` answers:
+
+- which Minecraft versions a loader component supports
+- what the backend thinks that Minecraft version means
 
 Important fields:
 
+- `subject_kind = minecraft_version`
+- `id`
+- `release_time`
+- `minecraft_meta`
+- `lifecycle`
+
+`LoaderBuildRecord` answers:
+
+- which loader build is installable for one `(component, minecraft_version)` pair
+- what explicit upstream terms it carries
+- how the backend should rank it for default selection
+
+Important fields:
+
+- `subject_kind = loader_build`
 - `component_id`
 - `build_id`
 - `minecraft_version`
 - `loader_version`
 - `version_id`
+- `build_meta`
 - `strategy`
 - `artifact_kind`
 - `install_source`
@@ -36,6 +60,57 @@ Important fields:
 `build_id` is Croopor-owned. It is the stable selection key for install work.
 
 `version_id` is the installed local version id written into `versions/`.
+
+## Loader build metadata
+
+Loader builds use `LoaderBuildMetadata`, not generic `LifecycleMeta`.
+
+`LoaderBuildMetadata` has four concerns:
+
+- `terms`
+  - explicit normalized upstream terms exposed to the UI
+- `evidence`
+  - where a term came from, like `explicit_version_label`, `explicit_api_flag`, or `promotion_marker`
+- `selection`
+  - backend-owned default-selection policy
+- `display_tags`
+  - backend-authored badge strings derived from `terms`
+
+Important rule:
+
+- the UI renders `display_tags`
+- the backend uses `selection`
+- the UI does not infer extra loader meaning from missing terms
+
+Current normalized terms are:
+
+- `recommended`
+- `latest`
+- `snapshot`
+- `pre_release`
+- `release_candidate`
+- `beta`
+- `alpha`
+- `nightly`
+- `dev`
+
+Examples:
+
+- stable Fabric build with only `stable=true`
+  - `terms = []`
+  - `selection.reason = stable`
+  - `selection.source = explicit_api_flag`
+- recommended Forge build
+  - `terms = [recommended]`
+  - `evidence` includes `promotion_marker`
+- latest Forge build with no recommended promotion
+  - `terms = [latest]`
+  - `selection.reason = latest_unstable`
+  - `selection.source = absence_of_recommended`
+- NeoForge beta
+  - `terms = [beta]` or `[latest, beta]` depending on upstream markers
+
+`latest` and `recommended` are explicit provider-facing terms. They are not generic maturity classes.
 
 ## Layers
 
@@ -54,9 +129,10 @@ Responsibility:
 
 - fetch raw upstream endpoints
 - parse upstream payloads
-- normalize into Croopor build records
+- normalize supported Minecraft versions and loader builds
+- map upstream terms and evidence into `LoaderBuildMetadata`
 
-This layer knows upstream wire shapes.
+This layer knows provider wire formats.
 
 It does not install anything.
 
@@ -79,7 +155,7 @@ Responsibility:
   - builds for `(component, mc_version)`
   - one resolved build record for install
 
-This layer is the backend source of truth for loader selection.
+This layer is the backend source of truth for loader selection and build ordering.
 
 ### 3. Strategy layer
 
@@ -100,8 +176,6 @@ Responsibility:
 - choose behavior from `LoaderInstallStrategy`
 - keep loader-family and era-specific work local to the selected strategy
 
-Shared helpers stay in `common.rs`.
-
 ### 4. Helper layers
 
 Files:
@@ -119,30 +193,37 @@ Responsibility:
 
 - `api.rs`: component ids, build ids, version-id inference
 - `types.rs`: normalized types and errors
-- `artifacts/*`: artifact classification and source helpers
-- `workspace/*`: Croopor-owned cache and work paths
-- `legacy/*`: legacy-specific boundaries
-- `compose.rs`: profile fragment composition
-- `forge_installer.rs`: Forge installer extraction and legacy rewrite rules
-- `processors.rs`: processor execution
+- helper modules: install artifacts, work dirs, composition, legacy behavior, processors
+
+## Selection flow
+
+Frontend flow:
+
+1. pick a loader component
+2. fetch supported Minecraft versions for that component
+3. pick a Minecraft version from that supported set
+4. fetch build records for that pair
+5. choose the highest `build_meta.selection.default_rank`
+6. create the instance with `build.version_id`
+7. install using `component_id + build_id`
+
+Complex async loader state lives in:
+
+- `frontend/src/machines/new-instance-loader.ts`
+
+The frontend should not parse composite ids as its main loader data model.
 
 ## Forge split
 
 Forge is not one installer path.
 
-Croopor treats it as three eras:
+Croopor still treats it as three eras:
 
 1. earliest pre-installer Forge
 2. legacy installer/FML Forge
 3. modern processor-based Forge
 
-That split is required from the start.
-
-It prevents fake assumptions like:
-
-- every Forge build has an installer jar
-- every Forge artifact is downloadable
-- every Forge version uses the same processor or library rules
+That split is install-strategy architecture, not lifecycle architecture.
 
 ## API shape
 
@@ -161,109 +242,28 @@ Install requests use:
 
 Route code does not inspect raw upstream payloads.
 
-## Frontend model
+## Installed versions
 
-The frontend is component-driven now.
+When a loader build is installed, the resulting `VersionEntry` carries:
 
-Selection flow:
+- Minecraft `minecraft_meta`
+- Minecraft `lifecycle`
+- optional `loader` attachment
 
-- pick a loader component
-- fetch supported Minecraft versions for that component
-- pick a Minecraft version from that supported set
-- fetch build records for that pair
-- pick a build record
-- create the instance with `build.version_id`
-- install using `component_id + build_id`
+The loader attachment carries:
 
-Complex async loader state lives in:
+- `component_id`
+- `component_name`
+- `build_id`
+- `loader_version`
+- `build_meta`
 
-- `frontend/src/machines/new-instance-loader.ts`
+That keeps Minecraft-version lifecycle and loader-build terms separate in the UI.
 
-Frontend loader API helpers live in:
+## Maintenance rules
 
-- `frontend/src/loaders/api.ts`
-- `frontend/src/loaders/view-model.ts`
-- `frontend/src/loaders/types.ts`
-
-The frontend should not parse composite ids as its main data model.
-
-## Flow
-
-```text
-Frontend loader UI
-  |
-  v
-/api/v1/loaders/components
-/api/v1/loaders/components/{id}/game-versions
-/api/v1/loaders/components/{id}/builds
-  |
-  v
-index/query
-  |
-  +--> providers/*
-  |      |
-  |      +--> raw upstream APIs
-  |
-  +--> normalized LoaderBuildRecord
-            |
-            v
-      strategies/*
-            |
-            +--> artifacts/*
-            +--> workspace/*
-            +--> compose.rs
-            +--> forge_installer.rs
-            +--> processors.rs
-            +--> legacy/*
-            |
-            v
-      installed local version
-            |
-            v
-      launcher treats it like a normal version
-```
-
-## Cache and workspace
-
-Croopor stores loader data inside the library:
-
-```text
-cache/
-  loaders/
-    catalog/
-    artifacts/
-    work/
-```
-
-Meaning:
-
-- `catalog/`: normalized metadata caches
-- `artifacts/`: reusable installer jars and similar artifacts
-- `work/`: install-scoped extraction and processor work
-
-The loader system should not use generic OS temp directories for normal install work.
-
-## Prism reference
-
-PrismLauncher is kept as a local code reference at:
-
-- `/tmp/PrismLauncher`
-
-Useful reference files:
-
-- `/tmp/PrismLauncher/launcher/ui/dialogs/InstallLoaderDialog.cpp`
-- `/tmp/PrismLauncher/launcher/ui/pages/modplatform/CustomPage.cpp`
-- `/tmp/PrismLauncher/launcher/minecraft/update/LegacyFMLLibrariesTask.cpp`
-
-Use Prism for:
-
-- component and metadata selection flow
-- parent-version filtering
-- loader-specific install boundaries
-- legacy Forge/FML split
-
-Prism is a reference for boundaries.
-
-It is not the target design.
-
-Croopor keeps its own normalized types, API shape, and strategy model.
+- add new providers by normalizing them into `LoaderBuildMetadata`
+- do not add provider-specific booleans like `stable`, `recommended`, `latest`, or `prerelease` to app-facing records
+- do not invent generic loader labels like `preview` or `experimental`
+- keep explicit upstream loader terms and selection policy as separate concerns
+- keep provider heuristics in the provider layer, not the frontend

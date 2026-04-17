@@ -1,13 +1,16 @@
 use super::common::{
-    NEOFORGE_MAVEN_BASE, NEOFORGE_MAVEN_META, fetch_text, is_prerelease_loader_version,
-    neoforge_to_minecraft_version, parse_maven_versions,
+    NEOFORGE_MAVEN_BASE, NEOFORGE_MAVEN_META, fetch_text, infer_loader_build_metadata,
+    is_prerelease_loader_version, neoforge_to_minecraft_version, parse_maven_versions,
 };
+use crate::lifecycle::LifecycleMeta;
 use crate::loaders::api::{build_id_for, installed_version_id_for};
 use crate::loaders::types::{
-    LoaderArtifactKind, LoaderBuildRecord, LoaderComponentId, LoaderGameVersion,
-    LoaderInstallSource, LoaderInstallStrategy, LoaderInstallability, LoaderVersionIndex,
+    LoaderArtifactKind, LoaderBuildRecord, LoaderBuildSubjectKind, LoaderComponentId,
+    LoaderGameVersion, LoaderInstallSource, LoaderInstallStrategy, LoaderInstallability,
+    LoaderVersionIndex,
 };
-use crate::version_meta::VersionMeta;
+use crate::types::VersionSubjectKind;
+use crate::version_meta::MinecraftVersionMeta;
 
 pub async fn fetch_game_versions()
 -> Result<Vec<LoaderGameVersion>, crate::loaders::types::LoaderError> {
@@ -22,11 +25,12 @@ pub async fn fetch_game_versions()
             continue;
         }
         versions.push(LoaderGameVersion {
-            version: minecraft_version,
-            kind: String::new(),
+            subject_kind: VersionSubjectKind::MinecraftVersion,
+            id: minecraft_version,
             release_time: String::new(),
-            meta: VersionMeta::default(),
-            stable: true,
+            minecraft_meta: MinecraftVersionMeta::default(),
+            lifecycle: LifecycleMeta::default(),
+            stable_hint: Some(true),
         });
     }
     Ok(versions)
@@ -48,16 +52,14 @@ pub async fn fetch_builds(
         }
         let prerelease = is_prerelease_loader_version(&entry);
         builds.push(LoaderBuildRecord {
+            subject_kind: LoaderBuildSubjectKind::LoaderBuild,
             component_id,
             component_name: component_id.display_name().to_string(),
             build_id: build_id_for(component_id, minecraft_version, &entry),
             minecraft_version: minecraft_version.to_string(),
             loader_version: entry.clone(),
             version_id: installed_version_id_for(component_id, minecraft_version, &entry),
-            stable: !prerelease,
-            prerelease,
-            recommended: false,
-            latest: false,
+            build_meta: infer_loader_build_metadata(&entry, &[], false, false, Some(!prerelease)),
             strategy: LoaderInstallStrategy::NeoForgeModern,
             artifact_kind: LoaderArtifactKind::InstallerJar,
             installability: LoaderInstallability::Installable,

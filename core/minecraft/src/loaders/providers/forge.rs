@@ -1,14 +1,17 @@
 use super::common::{
-    FORGE_MAVEN_BASE, FORGE_MAVEN_META, FORGE_PROMOTIONS_URL, extract_forge_loader_version,
-    extract_forge_minecraft_version, fetch_text, minecraft_version_at_least, parse_maven_versions,
+    FORGE_MAVEN_BASE, FORGE_MAVEN_META, FORGE_PROMOTIONS_URL, apply_forge_promotion_selection,
+    extract_forge_loader_version, extract_forge_minecraft_version, fetch_text,
+    infer_loader_build_metadata, minecraft_version_at_least, parse_maven_versions,
 };
 use crate::loaders::api::{build_id_for, installed_version_id_for};
 use crate::loaders::http::fetch_json;
 use crate::loaders::types::{
-    LoaderArtifactKind, LoaderBuildRecord, LoaderComponentId, LoaderGameVersion,
-    LoaderInstallSource, LoaderInstallStrategy, LoaderInstallability, LoaderVersionIndex,
+    LoaderArtifactKind, LoaderBuildRecord, LoaderBuildSubjectKind, LoaderComponentId,
+    LoaderGameVersion, LoaderInstallSource, LoaderInstallStrategy, LoaderInstallability,
+    LoaderVersionIndex,
 };
-use crate::version_meta::VersionMeta;
+use crate::types::VersionSubjectKind;
+use crate::{LifecycleMeta, version_meta::MinecraftVersionMeta};
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -29,11 +32,12 @@ pub async fn fetch_game_versions()
             continue;
         }
         versions.push(LoaderGameVersion {
-            version: minecraft_version,
-            kind: String::new(),
+            subject_kind: VersionSubjectKind::MinecraftVersion,
+            id: minecraft_version,
             release_time: String::new(),
-            meta: VersionMeta::default(),
-            stable: true,
+            minecraft_meta: MinecraftVersionMeta::default(),
+            lifecycle: LifecycleMeta::default(),
+            stable_hint: Some(true),
         });
     }
     Ok(versions)
@@ -55,7 +59,6 @@ pub async fn fetch_builds(
         .promos
         .get(&format!("{minecraft_version}-latest"))
         .cloned();
-    let prerelease = recommended.is_none();
     let component_id = LoaderComponentId::Forge;
     let mut builds = Vec::new();
 
@@ -67,23 +70,32 @@ pub async fn fetch_builds(
         if loader_version.is_empty() {
             continue;
         }
+        let is_recommended = recommended
+            .as_ref()
+            .is_some_and(|value| value == &loader_version);
+        let is_latest = latest
+            .as_ref()
+            .is_some_and(|value| value == &loader_version);
         let (strategy, artifact_kind, install_source) =
             forge_install_source(minecraft_version, &loader_version);
+        let mut build_meta =
+            infer_loader_build_metadata(&loader_version, &[], is_recommended, is_latest, None);
+        apply_forge_promotion_selection(
+            &mut build_meta,
+            recommended.is_some(),
+            is_recommended,
+            is_latest,
+        );
+
         builds.push(LoaderBuildRecord {
+            subject_kind: LoaderBuildSubjectKind::LoaderBuild,
             component_id,
             component_name: component_id.display_name().to_string(),
             build_id: build_id_for(component_id, minecraft_version, &loader_version),
             minecraft_version: minecraft_version.to_string(),
             loader_version: loader_version.clone(),
             version_id: installed_version_id_for(component_id, minecraft_version, &loader_version),
-            stable: !prerelease,
-            prerelease,
-            recommended: recommended
-                .as_ref()
-                .is_some_and(|value| value == &loader_version),
-            latest: latest
-                .as_ref()
-                .is_some_and(|value| value == &loader_version),
+            build_meta,
             strategy,
             artifact_kind,
             installability: LoaderInstallability::Installable,
