@@ -78,9 +78,19 @@ pub fn minecraft_version_at_least(version: &str, target: &[u32]) -> bool {
 
 pub fn is_prerelease_loader_version(version: &str) -> bool {
     let lower = version.to_ascii_lowercase();
-    ["alpha", "beta", "snapshot", "pre", "rc", "nightly", "dev"]
+    ["alpha", "beta", "snapshot", "pre", "nightly", "dev"]
         .into_iter()
         .any(|marker| lower.contains(marker))
+        || contains_release_candidate_marker(&lower)
+}
+
+fn contains_release_candidate_marker(version: &str) -> bool {
+    version.match_indices("rc").any(|(index, _)| {
+        matches!(
+            version[..index].chars().next_back(),
+            None | Some('-' | '.' | '_')
+        )
+    })
 }
 
 pub fn infer_loader_build_metadata(
@@ -136,7 +146,7 @@ pub fn infer_loader_build_metadata(
             term: LoaderTerm::Beta,
             source: LoaderTermSource::ExplicitVersionLabel,
         });
-    } else if lower.contains("rc") {
+    } else if contains_release_candidate_marker(&lower) {
         terms.push(LoaderTerm::ReleaseCandidate);
         evidence.push(LoaderTermEvidence {
             term: LoaderTerm::ReleaseCandidate,
@@ -375,6 +385,8 @@ mod tests {
         assert!(is_prerelease_loader_version("26.1.0.0-alpha.15+pre-3"));
         assert!(is_prerelease_loader_version("1.0.0-rc1"));
         assert!(!is_prerelease_loader_version("61.1.5"));
+        assert!(!is_prerelease_loader_version("1.0.0+source"));
+        assert!(!is_prerelease_loader_version("from-src-1.0"));
     }
 
     #[test]
@@ -414,6 +426,15 @@ mod tests {
             metadata.display_tags,
             vec!["latest".to_string(), "beta".to_string()]
         );
+    }
+
+    #[test]
+    fn only_maps_release_candidate_for_delimited_rc_markers() {
+        let metadata = infer_loader_build_metadata("1.0.0+source", &[], false, false, None);
+        assert!(!metadata.terms.contains(&LoaderTerm::ReleaseCandidate));
+
+        let metadata = infer_loader_build_metadata("1.0.0-rc1", &[], false, false, None);
+        assert!(metadata.terms.contains(&LoaderTerm::ReleaseCandidate));
     }
 
     #[test]

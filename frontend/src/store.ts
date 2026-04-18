@@ -84,7 +84,7 @@ export const filteredInstances = computed<Instance[]>(() => {
   const isRelease = (version: Version | undefined) =>
     version?.lifecycle?.channel === 'stable' && version.lifecycle.labels.includes('release');
   const isSnapshot = (version: Version | undefined) =>
-    !!version
+    !!version?.lifecycle
     && !version.lifecycle.labels.includes('old_beta')
     && !version.lifecycle.labels.includes('old_alpha')
     && (version.lifecycle.channel === 'preview' || version.lifecycle.channel === 'experimental');

@@ -265,7 +265,33 @@ impl InstanceStore {
             extra_jvm_args: String::new(),
         };
 
-        let game_dir = self.paths.instances_dir.join(&instance.id);
+        inner.instances.push(instance.clone());
+        if let Err(error) = self.persist_locked(&inner) {
+            inner.instances.retain(|stored| stored.id != instance.id);
+            return Err(error);
+        }
+
+        if let Err(error) = self.initialize_instance_files(&instance.id, mc_dir) {
+            inner.instances.retain(|stored| stored.id != instance.id);
+            let rollback_result = self.persist_locked(&inner);
+            let _ = fs::remove_dir_all(self.paths.instances_dir.join(&instance.id));
+            return Err(match rollback_result {
+                Ok(()) => InstanceStoreError::Read(error),
+                Err(rollback_error) => InstanceStoreError::Read(std::io::Error::other(format!(
+                    "failed to initialize instance files: {error}; failed to roll back persisted instance: {rollback_error}"
+                ))),
+            });
+        }
+
+        Ok(instance)
+    }
+
+    fn initialize_instance_files(
+        &self,
+        instance_id: &str,
+        mc_dir: Option<&Path>,
+    ) -> Result<(), std::io::Error> {
+        let game_dir = self.paths.instances_dir.join(instance_id);
         for subdir in ["saves", "mods", "resourcepacks", "shaderpacks", "config"] {
             fs::create_dir_all(game_dir.join(subdir))?;
         }
@@ -277,9 +303,7 @@ impl InstanceStore {
             }
         }
 
-        inner.instances.push(instance.clone());
-        self.persist_locked(&inner)?;
-        Ok(instance)
+        Ok(())
     }
 
     fn persist_locked(&self, inner: &StoredInstances) -> Result<(), InstanceStoreError> {
@@ -304,4 +328,100 @@ fn generate_id() -> String {
         .map(|value| value.as_nanos())
         .unwrap_or_default();
     format!("{:016x}", nanos as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InstanceStore, StoredInstances};
+    use crate::paths::AppPaths;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::RwLock;
+
+    fn test_root(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "croopor-config-{name}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or_default()
+        ));
+        fs::create_dir_all(&path).expect("create test root");
+        path
+    }
+
+    fn test_paths(root: &PathBuf) -> AppPaths {
+        let config_dir = root.join("config");
+        AppPaths {
+            config_file: config_dir.join("config.json"),
+            instances_file: config_dir.join("instances.json"),
+            instances_dir: root.join("instances"),
+            music_dir: root.join("music"),
+            library_dir: root.join("library"),
+            config_dir,
+        }
+    }
+
+    #[test]
+    fn add_does_not_create_instance_dirs_when_persist_fails() {
+        let root = test_root("persist-failure");
+        let config_blocker = root.join("config-blocker");
+        fs::write(&config_blocker, "not a dir").expect("create config blocker");
+
+        let paths = AppPaths {
+            config_file: config_blocker.join("config.json"),
+            instances_file: config_blocker.join("instances.json"),
+            instances_dir: root.join("instances"),
+            music_dir: root.join("music"),
+            library_dir: root.join("library"),
+            config_dir: config_blocker,
+        };
+        let store = InstanceStore {
+            paths: paths.clone(),
+            inner: RwLock::new(StoredInstances::default()),
+        };
+
+        let error = store
+            .add("Test".to_string(), "1.21.1".to_string(), None)
+            .expect_err("persist should fail");
+
+        assert!(matches!(error, super::InstanceStoreError::Read(_)));
+        assert!(store.list().is_empty());
+        assert!(!paths.instances_dir.exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn add_rolls_back_persisted_instance_when_file_setup_fails() {
+        let root = test_root("file-setup-failure");
+        let paths = test_paths(&root);
+        fs::create_dir_all(&paths.config_dir).expect("create config dir");
+        fs::write(&paths.instances_dir, "not a dir").expect("create instances blocker");
+
+        let store = InstanceStore {
+            paths: paths.clone(),
+            inner: RwLock::new(StoredInstances::default()),
+        };
+
+        let error = store
+            .add("Test".to_string(), "1.21.1".to_string(), None)
+            .expect_err("file setup should fail");
+
+        assert!(matches!(error, super::InstanceStoreError::Read(_)));
+        assert!(store.list().is_empty());
+
+        let persisted = fs::read_to_string(&paths.instances_file).expect("read persisted store");
+        let stored: serde_json::Value =
+            serde_json::from_str(&persisted).expect("parse persisted store");
+        assert_eq!(
+            stored["instances"]
+                .as_array()
+                .expect("instances array")
+                .len(),
+            0
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
 }
