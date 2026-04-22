@@ -75,7 +75,7 @@ function StatusPill(): JSX.Element {
   return (
     <span class="cp-status-pill cp-nodrag">
       <span class="cp-status-dot" />
-      Idle
+      idle
     </span>
   );
 }

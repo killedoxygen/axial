@@ -88,6 +88,60 @@
   justify-content: stretch;
 }
 
+/* Accent pane ----------------------------------------------------------- */
+.cp-accent-pane {
+  margin-top: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.cp-accent-field { touch-action: none; }
+.cp-accent-readout {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--text-mute);
+}
+.cp-accent-readout-labels {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+.cp-accent-readout strong {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+.cp-accent-sep {
+  display: inline-block;
+  width: 3px; height: 3px;
+  border-radius: 999px;
+  background: var(--text-mute);
+  opacity: 0.6;
+}
+.cp-accent-chip {
+  width: 26px; height: 26px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  box-shadow: 0 1px 2px rgba(0,0,0,0.2) inset;
+  flex-shrink: 0;
+}
+.cp-accent-presets {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--line);
+}
+.cp-accent-presets-label {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  font-weight: 600;
+  color: var(--text-mute);
+}
+
 /* Accent swatch row */
 .cp-swatch-row {
   display: flex;
@@ -107,6 +161,13 @@
   border-color: var(--text);
   transform: scale(1.08);
   box-shadow: 0 0 0 3px color-mix(in oklch, currentColor 25%, transparent);
+}
+
+/* Color marker: transitions only fire when programmatically moved */
+.cp-color-marker.animating {
+  transition: left 260ms cubic-bezier(0.22, 1, 0.36, 1),
+              top 260ms cubic-bezier(0.22, 1, 0.36, 1),
+              background 260ms ease;
 }
 
 /* Toggle ----------------------------------------------------------------- */

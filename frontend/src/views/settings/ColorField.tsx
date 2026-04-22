@@ -44,16 +44,16 @@ export function ColorField({
     >
       <div
         ref={markerRef}
+        class="cp-color-marker"
         style={{
           position: 'absolute',
-          width: 16,
-          height: 16,
+          width: 18,
+          height: 18,
           borderRadius: '50%',
           border: '2px solid white',
-          boxShadow: '0 1px 6px rgba(0,0,0,0.5)',
+          boxShadow: '0 2px 10px rgba(0,0,0,0.55), 0 0 0 1px rgba(0,0,0,0.12)',
           transform: 'translate(-50%, -50%)',
           pointerEvents: 'none',
-          transition: 'left 80ms ease, top 80ms ease, background 80ms ease',
         }}
       />
     </div>

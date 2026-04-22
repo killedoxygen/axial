@@ -86,14 +86,13 @@ function AppearanceSection(): JSX.Element {
   const onDrag = (h: number, v: number): void => {
     setHue(h);
     setVibrancy(v);
+    playSliderSound(h / 360, 'hue');
     applyTheme('custom', h, { vibrancy: v, lightness: local.lightness, silent: true });
   };
   const onEnd = (): void => {
     Sound.ui('theme');
     applyTheme('custom', hue, { vibrancy, lightness: local.lightness });
   };
-
-  const accentHues = [22, 48, 70, 140, 180, 220, 270, 320];
 
   return (
     <>
@@ -106,55 +105,43 @@ function AppearanceSection(): JSX.Element {
         }
       />
       <SettingsCard
-        title="Presets"
-        desc="Curated palettes tuned for the launcher. Click to match a preset's hue in one tap."
+        title="Accent"
+        desc="Drag inside the field to pick any hue and chroma, or tap a preset. Every tint, ring, and on-accent contrast is derived from this single point."
         stack
       >
-        <div class="cp-swatch-row" style={{ marginTop: 14 }}>
-          {Object.entries(PRESET_HUES).map(([id, h]) => {
-            const active = local.theme === id;
-            return (
-              <button
-                key={id}
-                class="cp-swatch"
-                data-active={active}
-                aria-label={id}
-                title={id}
-                style={{ background: `oklch(0.78 0.14 ${h})`, color: `oklch(0.78 0.14 ${h})` }}
-                onClick={() => applyPreset(id)}
-              />
-            );
-          })}
-        </div>
-      </SettingsCard>
-      <SettingsCard
-        title="Custom accent"
-        desc="Pick any hue and chroma. Hovers, tints, ring, and on-accent contrast are all derived from this single point."
-        stack
-      >
-        <div style={{ marginTop: 14 }}>
-          <ColorField hue={hue} vibrancy={vibrancy} onChange={onDrag} onEnd={onEnd} />
-          <div style={{
-            marginTop: 12, display: 'flex', gap: 10, alignItems: 'center',
-            fontSize: 12, color: 'var(--text-mute)',
-          }}>
-            <div style={{
-              width: 24, height: 24, borderRadius: 8,
-              background: `oklch(0.78 ${(vibrancy / 100) * 0.14} ${hue})`,
-              border: '1px solid var(--line)',
-            }} />
-            <span>hue <strong style={{ color: 'var(--text)' }}>{hue}°</strong></span>
-            <span>·</span>
-            <span>chroma <strong style={{ color: 'var(--text)' }}>{vibrancy}%</strong></span>
-            <div style={{ flex: 1 }} />
+        <div class="cp-accent-pane">
+          <div class="cp-accent-field">
+            <ColorField hue={hue} vibrancy={vibrancy} onChange={onDrag} onEnd={onEnd} />
+          </div>
+          <div class="cp-accent-readout">
+            <div
+              class="cp-accent-chip"
+              style={{ background: `oklch(0.78 ${(vibrancy / 100) * 0.14} ${hue})` }}
+              aria-hidden="true"
+            />
+            <div class="cp-accent-readout-labels">
+              <span>hue <strong>{hue}°</strong></span>
+              <span class="cp-accent-sep" />
+              <span>chroma <strong>{vibrancy}%</strong></span>
+            </div>
+          </div>
+          <div class="cp-accent-presets">
+            <div class="cp-accent-presets-label">Presets</div>
             <div class="cp-swatch-row">
-              {accentHues.map(h => (
-                <button key={h} class="cp-swatch" style={{
-                  width: 22, height: 22,
-                  background: `oklch(0.78 0.14 ${h})`,
-                  color: `oklch(0.78 0.14 ${h})`,
-                }} onClick={() => { setHue(h); applyTheme('custom', h, { vibrancy, lightness: local.lightness }); }} />
-              ))}
+              {Object.entries(PRESET_HUES).map(([id, h]) => {
+                const active = local.theme === id;
+                return (
+                  <button
+                    key={id}
+                    class="cp-swatch"
+                    data-active={active}
+                    aria-label={id}
+                    title={id}
+                    style={{ background: `oklch(0.78 0.14 ${h})`, color: `oklch(0.78 0.14 ${h})` }}
+                    onClick={() => applyPreset(id)}
+                  />
+                );
+              })}
             </div>
           </div>
         </div>

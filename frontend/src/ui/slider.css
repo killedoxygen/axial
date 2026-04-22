@@ -24,7 +24,6 @@
   width: var(--slider-filled);
   background: linear-gradient(90deg, var(--accent-strong), var(--accent));
   border-radius: 999px;
-  transition: width 60ms linear;
 }
 .cp-slider-rec {
   position: absolute;

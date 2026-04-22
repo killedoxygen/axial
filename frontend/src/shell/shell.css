@@ -86,7 +86,11 @@
 
 .cp-sidebar-spacer { flex: 1; }
 
+.cp-user-shell {
+  position: relative;
+}
 .cp-sidebar-user {
+  width: 100%;
   padding: 10px;
   border-radius: var(--r-md);
   background: var(--surface-2);
@@ -98,8 +102,92 @@
   color: inherit;
   cursor: pointer;
   text-align: left;
+  transition: background 120ms, border-color 120ms;
 }
 .cp-sidebar-user:hover { background: var(--surface-3); }
+.cp-sidebar-user[data-open="true"] {
+  background: var(--surface-3);
+  border-color: var(--accent-line);
+}
+
+/* User popover */
+.cp-userm {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 0;
+  right: 0;
+  background: color-mix(in oklab, var(--surface) 94%, transparent);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  padding: 6px;
+  box-shadow:
+    0 1px 0 color-mix(in oklab, var(--text) 6%, transparent) inset,
+    0 18px 40px -12px rgba(0, 0, 0, 0.45),
+    0 4px 12px -2px rgba(0, 0, 0, 0.22);
+  backdrop-filter: blur(12px) saturate(1.05);
+  -webkit-backdrop-filter: blur(12px) saturate(1.05);
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  animation: cp-userm-in 160ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  transform-origin: bottom center;
+}
+.cp-userm-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 9px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+  color: var(--text-dim);
+  text-align: left;
+  border-radius: var(--r-sm);
+  transition: background 100ms, color 100ms;
+  font-size: 12.5px;
+}
+.cp-userm-row:hover {
+  background: var(--surface-3);
+  color: var(--text);
+}
+.cp-userm-label { flex: 1; font-weight: 500; }
+.cp-userm-hint {
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--text-mute);
+  letter-spacing: 0.4px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--surface-2);
+}
+.cp-userm-pill {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: var(--surface-3);
+  color: var(--text-mute);
+  min-width: 32px;
+  text-align: center;
+}
+.cp-userm-pill[data-on="true"] {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.cp-userm-divider {
+  height: 1px;
+  background: var(--line);
+  margin: 4px 2px;
+}
+
+@keyframes cp-userm-in {
+  from { opacity: 0; transform: translateY(6px) scale(0.97); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
 .cp-sidebar-user .cp-avatar {
   width: 32px; height: 32px;
   border-radius: var(--r-sm);
@@ -144,11 +232,11 @@
   align-items: center;
   gap: 8px;
   height: 28px;
-  padding: 0 12px;
+  padding: 0 12px 0 10px;
   border-radius: 999px;
-  border: 1px solid var(--line);
-  background: var(--surface-2);
-  color: var(--text-dim);
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-mute);
   font-size: 12px;
   font-weight: 600;
   font: inherit;
@@ -169,6 +257,57 @@
   background: var(--accent);
   box-shadow: 0 0 10px var(--accent);
   animation: cp-pulse 2s ease-in-out infinite;
+}
+
+/* Music widget ---------------------------------------------------------- */
+.cp-music-widget {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  transition: background 160ms, border-color 160ms;
+}
+.cp-music-widget--on {
+  border-color: var(--accent-line);
+  background: var(--accent-softer);
+}
+.cp-music-btn {
+  width: 26px; height: 26px;
+  border: none;
+  background: transparent;
+  color: var(--text-mute);
+  border-radius: 999px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: color 140ms, background 140ms;
+}
+.cp-music-btn[data-active="true"] { color: var(--accent); }
+.cp-music-btn:hover { background: var(--surface-3); color: var(--text); }
+.cp-music-widget--on .cp-music-btn:hover { background: var(--accent-soft); color: var(--accent); }
+.cp-music-btn--skip { color: var(--text-mute); }
+.cp-music-widget--on .cp-music-btn--skip { color: var(--accent); opacity: 0.75; }
+.cp-music-widget--on .cp-music-btn--skip:hover { opacity: 1; }
+
+.cp-music-eq {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 12px;
+  width: 14px;
+  justify-content: center;
+}
+.cp-music-eq > span {
+  width: 2px;
+  background: currentColor;
+  border-radius: 1px;
+  transform-origin: bottom;
+  animation: cp-eq 900ms ease-in-out infinite;
+  height: 100%;
 }
 
 /* Window controls ------------------------------------------------------- */

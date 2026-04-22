@@ -4,9 +4,9 @@
 .tools/
 .cache/
 dist/
+node_modules
 
 # Frontend build artifacts
-frontend/node_modules/
 frontend/static/app.js
 frontend/static/app.css
 frontend/package.json.md5
@@ -17,3 +17,4 @@ plans/
 assets/*.mp3
 assets/*.wav
 CHANGELOG-next.md
+debug-builds

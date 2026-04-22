@@ -11,6 +11,9 @@ importers:
       '@preact/signals':
         specifier: ^2.0.0
         version: 2.9.0(preact@10.29.0)
+      '@tabler/icons-preact':
+        specifier: ^3.41.1
+        version: 3.41.1(preact@10.29.0)
       preact:
         specifier: ^10.25.0
         version: 10.29.0
@@ -188,6 +191,14 @@ packages:
     peerDependencies:
       preact: '>= 10.25.0 || >=11.0.0-0'
 
+  '@tabler/icons-preact@3.41.1':
+    resolution: {integrity: sha512-H27Fzpk3lgj/AC4waJ/YGFPrvrR5MXeLbPhl23V6GWWC8uJ27rU7DVVVNI6hFoKVjpl+KlkmH2SUPissy5LJ+w==}
+    peerDependencies:
+      preact: ^10.5.13
+
+  '@tabler/icons@3.41.1':
+    resolution: {integrity: sha512-OaRnVbRmH2nHtFeg+RmMJ/7m2oBIF9XCJAUD5gQnMrpK9f05ydj8MZrAf3NZQqOXyxGN1UBL0D5IKLLEUfr74Q==}
+
   esbuild@0.25.12:
     resolution: {integrity: sha512-bbPBYYrtZbkt6Os6FiTLCTFxvq4tt3JKall1vRwshA3fdVztsLAatFaZobhkBC8/BrPetoa0oksYoKXoG4ryJg==}
     engines: {node: '>=18'}
@@ -287,6 +298,13 @@ snapshots:
     dependencies:
       '@preact/signals-core': 1.14.0
       preact: 10.29.0
+
+  '@tabler/icons-preact@3.41.1(preact@10.29.0)':
+    dependencies:
+      '@tabler/icons': 3.41.1
+      preact: 10.29.0
+
+  '@tabler/icons@3.41.1': {}
 
   esbuild@0.25.12:
     optionalDependencies:

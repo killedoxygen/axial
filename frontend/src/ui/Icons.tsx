@@ -1,89 +1,90 @@
-import type { JSX } from 'preact';
+import type { JSX, FunctionComponent } from 'preact';
+import {
+  IconArrowLeft,
+  IconArrowRight,
+  IconCheck,
+  IconChevronLeft,
+  IconChevronRight,
+  IconChevronUp,
+  IconClock,
+  IconCompass,
+  IconCopy,
+  IconCube,
+  IconDots,
+  IconDownload,
+  IconEdit,
+  IconFolder,
+  IconGlobe,
+  IconHeadphones,
+  IconHome,
+  IconInfoCircle,
+  IconAlertCircle,
+  IconKeyboard,
+  IconMinus,
+  IconMusic,
+  IconMusicOff,
+  IconPalette,
+  IconPlayerPlay,
+  IconPlayerSkipForward,
+  IconPlayerStop,
+  IconPlus,
+  IconRectangle,
+  IconRefresh,
+  IconSearch,
+  IconSettings,
+  IconTag,
+  IconTerminal2,
+  IconTrash,
+  IconUser,
+  IconX,
+} from '@tabler/icons-preact';
 
-// Tabler Icons, MIT license, 24x24 viewBox with stroke 2 and round caps
-// Paths from https://tabler.io/icons, copied verbatim
-const ICONS: Record<string, string> = {
-  // navigation / chevrons / arrows
-  'home':           'M5 12l-2 0l9 -9l9 9l-2 0 M5 12v7a2 2 0 0 0 2 2h10a2 2 0 0 0 2 -2v-7 M9 21v-6a2 2 0 0 1 2 -2h2a2 2 0 0 1 2 2v6',
-  'compass':        'M12 12m-9 0a9 9 0 1 0 18 0a9 9 0 1 0 -18 0 M10.5 10.5l5 -2l-2 5l-5 2z',
-  'arrow-left':     'M5 12l14 0 M5 12l4 4 M5 12l4 -4',
-  'arrow-right':    'M5 12l14 0 M15 16l4 -4 M15 8l4 4',
-  'chevron-right':  'M9 6l6 6l-6 6',
-  'chevron-left':   'M15 6l-6 6l6 6',
-  'chevron-down':   'M6 9l6 6l6 -6',
-  'chevron-up':     'M6 15l6 -6l6 6',
-  // actions
-  'plus':           'M12 5l0 14 M5 12l14 0',
-  'minus':          'M5 12l14 0',
-  'x':              'M18 6l-12 12 M6 6l12 12',
-  'square':         'M4 4h16v16H4z',
-  'rectangle':      'M3 5m0 2a2 2 0 0 1 2 -2h14a2 2 0 0 1 2 2v10a2 2 0 0 1 -2 2H5a2 2 0 0 1 -2 -2z',
-  'check':          'M5 12l5 5l10 -10',
-  'dots':           'M5 12m-1 0a1 1 0 1 0 2 0a1 1 0 1 0 -2 0 M12 12m-1 0a1 1 0 1 0 2 0a1 1 0 1 0 -2 0 M19 12m-1 0a1 1 0 1 0 2 0a1 1 0 1 0 -2 0',
-  'dots-vertical':  'M12 12m-1 0a1 1 0 1 0 2 0a1 1 0 1 0 -2 0 M12 19m-1 0a1 1 0 1 0 2 0a1 1 0 1 0 -2 0 M12 5m-1 0a1 1 0 1 0 2 0a1 1 0 1 0 -2 0',
-  // state
-  'search':         'M10 10m-7 0a7 7 0 1 0 14 0a7 7 0 1 0 -14 0 M21 21l-6 -6',
-  'filter':         'M4 4h16v2.172a2 2 0 0 1 -.586 1.414l-4.414 4.414v7l-6 2v-8.5l-4.48 -4.928a2 2 0 0 1 -.52 -1.345z',
-  'refresh':        'M20 11a8.1 8.1 0 0 0 -15.5 -2m-.5 -4v4h4 M4 13a8.1 8.1 0 0 0 15.5 2m.5 4v-4h-4',
-  'loader':         'M12 3a9 9 0 1 0 9 9 M12 3v3 M15.93 4.87l-2.13 2.13 M20.12 9.84l-3 1 M19.5 15.95l-2.83 -2.83 M14.15 19.5l-1 -3',
-  // content
-  'cube':           'M21 16.008v-8.018a1.98 1.98 0 0 0 -1 -1.717l-7 -4.008a2.016 2.016 0 0 0 -2 0l-7 4.007c-.619 .355 -1 1.01 -1 1.718v8.018c0 .709 .381 1.363 1 1.717l7 4.008a2.016 2.016 0 0 0 2 0l7 -4.008c.619 -.355 1 -1.01 1 -1.718z M12 22v-10 M12 12l8.73 -5.04 M3.27 6.96l8.73 5.04',
-  'package':        'M12 3l8 4.5l0 9l-8 4.5l-8 -4.5l0 -9l8 -4.5 M12 12l8 -4.5 M12 12l0 9 M12 12l-8 -4.5',
-  'folder':         'M5 4h4l3 3h7a2 2 0 0 1 2 2v8a2 2 0 0 1 -2 2h-14a2 2 0 0 1 -2 -2v-11a2 2 0 0 1 2 -2',
-  'folder-open':    'M5 19l2.757 -7.351a1 1 0 0 1 .936 -.649h12.307a1 1 0 0 1 .986 1.164l-.996 5.211a2 2 0 0 1 -1.964 1.625h-14.026a2 2 0 0 1 -2 -2v-11a2 2 0 0 1 2 -2h4l3 3h7a2 2 0 0 1 2 2v2',
-  'download':       'M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2 -2v-2 M7 11l5 5l5 -5 M12 4l0 12',
-  'upload':         'M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2 -2v-2 M7 9l5 -5l5 5 M12 4l0 12',
-  'puzzle':         'M4 7h3a1 1 0 0 0 1 -1v-1a2 2 0 0 1 4 0v1a1 1 0 0 0 1 1h3a1 1 0 0 1 1 1v3a1 1 0 0 0 1 1h1a2 2 0 0 1 0 4h-1a1 1 0 0 0 -1 1v3a1 1 0 0 1 -1 1h-3a1 1 0 0 1 -1 -1v-1a2 2 0 0 0 -4 0v1a1 1 0 0 1 -1 1h-3a1 1 0 0 1 -1 -1v-3a1 1 0 0 1 1 -1h1a2 2 0 0 0 0 -4h-1a1 1 0 0 1 -1 -1v-3a1 1 0 0 1 1 -1',
-  // people
-  'user':           'M8 7a4 4 0 1 0 8 0a4 4 0 0 0 -8 0 M6 21v-2a4 4 0 0 1 4 -4h4a4 4 0 0 1 4 4v2',
-  'users':          'M9 7m-4 0a4 4 0 1 0 8 0a4 4 0 1 0 -8 0 M3 21v-2a4 4 0 0 1 4 -4h4a4 4 0 0 1 4 4v2 M16 3.13a4 4 0 0 1 0 7.75 M21 21v-2a4 4 0 0 0 -3 -3.85',
-  'user-circle':    'M12 12m-9 0a9 9 0 1 0 18 0a9 9 0 1 0 -18 0 M12 10m-3 0a3 3 0 1 0 6 0a3 3 0 1 0 -6 0 M6.168 18.849a4 4 0 0 1 3.832 -2.849h4a4 4 0 0 1 3.839 2.839',
-  // media / audio
-  'play':           'M7 4v16l13 -8z',
-  'pause':          'M6 5v14m12 -14v14',
-  'stop':           'M5 5m0 2a2 2 0 0 1 2 -2h10a2 2 0 0 1 2 2v10a2 2 0 0 1 -2 2H7a2 2 0 0 1 -2 -2z',
-  'player-skip':    'M4 5v14l12 -7z M20 5l0 14',
-  'music':          'M9 17a3 3 0 1 0 0 -6a3 3 0 0 0 0 6 M13 17v-13h8v3h-5 M15 17a2 2 0 1 0 4 0a2 2 0 0 0 -4 0',
-  'music-off':      'M9 17a3 3 0 1 0 0 -6a3 3 0 0 0 0 6 M9 17v-4 M13 13v-9h8v3h-5 M15 17a2 2 0 1 0 4 0a2 2 0 0 0 -4 0 M3 3l18 18',
-  'headphones':     'M4 13m0 2a2 2 0 0 1 2 -2h1a2 2 0 0 1 2 2v3a2 2 0 0 1 -2 2h-1a2 2 0 0 1 -2 -2z M15 13m0 2a2 2 0 0 1 2 -2h1a2 2 0 0 1 2 2v3a2 2 0 0 1 -2 2h-1a2 2 0 0 1 -2 -2z M4 15v-3a8 8 0 0 1 16 0v3',
-  'volume':         'M15 8a5 5 0 0 1 0 8 M17.7 5a9 9 0 0 1 0 14 M6 15h-2a1 1 0 0 1 -1 -1v-4a1 1 0 0 1 1 -1h2l3.5 -4.5a.8 .8 0 0 1 1.5 .5v14a.8 .8 0 0 1 -1.5 .5l-3.5 -4.5',
-  // settings / data
-  'settings':       'M10.325 4.317c.426 -1.756 2.924 -1.756 3.35 0a1.724 1.724 0 0 0 2.573 1.066c1.543 -.94 3.31 .826 2.37 2.37a1.724 1.724 0 0 0 1.065 2.572c1.756 .426 1.756 2.924 0 3.35a1.724 1.724 0 0 0 -1.066 2.573c.94 1.543 -.826 3.31 -2.37 2.37a1.724 1.724 0 0 0 -2.572 1.065c-.426 1.756 -2.924 1.756 -3.35 0a1.724 1.724 0 0 0 -2.573 -1.066c-1.543 .94 -3.31 -.826 -2.37 -2.37a1.724 1.724 0 0 0 -1.065 -2.572c-1.756 -.426 -1.756 -2.924 0 -3.35a1.724 1.724 0 0 0 1.066 -2.573c-.94 -1.543 .826 -3.31 2.37 -2.37c1 .608 2.296 .07 2.572 -1.065 M9 12a3 3 0 1 0 6 0a3 3 0 0 0 -6 0',
-  'sliders':        'M4 10h4 M10 10h10 M4 6h2 M8 6h12 M4 14h6 M12 14h8 M4 18h8 M14 18h6 M6 6m-2 0a2 2 0 1 0 4 0a2 2 0 1 0 -4 0 M10 10m-2 0a2 2 0 1 0 4 0a2 2 0 1 0 -4 0 M12 14m-2 0a2 2 0 1 0 4 0a2 2 0 1 0 -4 0 M14 18m-2 0a2 2 0 1 0 4 0a2 2 0 1 0 -4 0',
-  'palette':        'M12 21a9 9 0 1 1 0 -18a9 8 0 0 1 9 8a4.5 4 0 0 1 -4.5 4h-2.5a2 2 0 0 0 -1 3.75a1.3 1.3 0 0 1 -1 2.25 M8.5 10.5m-.5 0a.5 .5 0 1 0 1 0a.5 .5 0 1 0 -1 0 M12.5 7.5m-.5 0a.5 .5 0 1 0 1 0a.5 .5 0 1 0 -1 0 M16.5 10.5m-.5 0a.5 .5 0 1 0 1 0a.5 .5 0 1 0 -1 0',
-  'sparkles':       'M16 18a2 2 0 0 1 2 2a2 2 0 0 1 2 -2a2 2 0 0 1 -2 -2a2 2 0 0 1 -2 2zm0 -12a2 2 0 0 1 2 2a2 2 0 0 1 2 -2a2 2 0 0 1 -2 -2a2 2 0 0 1 -2 2zm-7 12a6 6 0 0 1 6 -6a6 6 0 0 1 -6 -6a6 6 0 0 1 -6 6a6 6 0 0 1 6 6z',
-  'sun':            'M12 12m-4 0a4 4 0 1 0 8 0a4 4 0 1 0 -8 0 M3 12h1m8 -9v1m8 8h1m-9 8v1m-6.4 -15.4l.7 .7m12.1 -.7l-.7 .7m0 11.4l.7 .7m-12.1 -.7l-.7 .7',
-  'moon':           'M12 3c.132 0 .263 0 .393 0a7.5 7.5 0 0 0 7.92 12.446a9 9 0 1 1 -8.313 -12.454z',
-  // misc
-  'star':           'M12 17.75l-6.172 3.245l1.179 -6.873l-5 -4.867l6.9 -1l3.086 -6.253l3.086 6.253l6.9 1l-5 4.867l1.179 6.873z',
-  'heart':          'M19.5 13.572l-7.5 7.428l-7.5 -7.428a5 5 0 1 1 7.5 -6.566a5 5 0 1 1 7.5 6.572',
-  'bolt':           'M13 3l0 7l6 0l-8 11l0 -7l-6 0l8 -11',
-  'clock':          'M12 12m-9 0a9 9 0 1 0 18 0a9 9 0 1 0 -18 0 M12 7v5l3 3',
-  'trash':          'M4 7l16 0 M10 11l0 6 M14 11l0 6 M5 7l1 12a2 2 0 0 0 2 2h8a2 2 0 0 0 2 -2l1 -12 M9 7v-3a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v3',
-  'edit':           'M7 7h-1a2 2 0 0 0 -2 2v9a2 2 0 0 0 2 2h9a2 2 0 0 0 2 -2v-1 M20.385 6.585a2.1 2.1 0 0 0 -2.97 -2.97l-8.415 8.385v3h3l8.385 -8.415z M16 5l3 3',
-  'copy':           'M8 8m0 2a2 2 0 0 1 2 -2h8a2 2 0 0 1 2 2v8a2 2 0 0 1 -2 2h-8a2 2 0 0 1 -2 -2z M16 8v-2a2 2 0 0 0 -2 -2h-8a2 2 0 0 0 -2 2v8a2 2 0 0 0 2 2h2',
-  'tag':            'M7.859 6h-2.834a2.025 2.025 0 0 0 -2.025 2.025v2.834a2.025 2.025 0 0 0 .593 1.432l8.116 8.116a2.025 2.025 0 0 0 2.864 0l4.834 -4.834a2.025 2.025 0 0 0 0 -2.864l-8.117 -8.116a2.025 2.025 0 0 0 -1.431 -.593z M6 9m-.5 0a.5 .5 0 1 0 1 0a.5 .5 0 1 0 -1 0',
-  'shield':         'M12 3a12 12 0 0 0 8.5 3a12 12 0 0 1 -8.5 15a12 12 0 0 1 -8.5 -15a12 12 0 0 0 8.5 -3',
-  'globe':          'M12 12m-9 0a9 9 0 1 0 18 0a9 9 0 1 0 -18 0 M3.6 9h16.8 M3.6 15h16.8 M11.5 3a17 17 0 0 0 0 18 M12.5 3a17 17 0 0 1 0 18',
-  'server':         'M3 4m0 3a3 3 0 0 1 3 -3h12a3 3 0 0 1 3 3v2a3 3 0 0 1 -3 3h-12a3 3 0 0 1 -3 -3z M3 15m0 3a3 3 0 0 1 3 -3h12a3 3 0 0 1 3 3v0a3 3 0 0 1 -3 3h-12a3 3 0 0 1 -3 -3z M7 8v.01 M7 18v.01',
-  'info':           'M12 12m-9 0a9 9 0 1 0 18 0a9 9 0 1 0 -18 0 M12 8h.01 M11 12h1v4h1',
-  'alert':          'M12 9v4 M10.363 3.591l-8.106 13.534a1.914 1.914 0 0 0 1.636 2.871h16.214a1.914 1.914 0 0 0 1.636 -2.87l-8.106 -13.536a1.914 1.914 0 0 0 -3.274 0z M12 16h.01',
-  'layers':         'M12 3l-8 4l8 4l8 -4l-8 -4 M4 11l8 4l8 -4 M4 15l8 4l8 -4',
-  'image':          'M15 8h.01 M3 6m0 2a2 2 0 0 1 2 -2h14a2 2 0 0 1 2 2v12a2 2 0 0 1 -2 2h-14a2 2 0 0 1 -2 -2z M3 16l5 -5c.928 -.893 2.072 -.893 3 0l5 5 M14 14l1 -1c.928 -.893 2.072 -.893 3 0l3 3',
-  'share':          'M6 12m-3 0a3 3 0 1 0 6 0a3 3 0 1 0 -6 0 M18 6m-3 0a3 3 0 1 0 6 0a3 3 0 1 0 -6 0 M18 18m-3 0a3 3 0 1 0 6 0a3 3 0 1 0 -6 0 M8.7 10.7l6.6 -3.4 M8.7 13.3l6.6 3.4',
-  'logout':         'M14 8v-2a2 2 0 0 0 -2 -2h-7a2 2 0 0 0 -2 2v12a2 2 0 0 0 2 2h7a2 2 0 0 0 2 -2v-2 M9 12h12l-3 -3 M18 15l3 -3',
-  'login':          'M14 8v-2a2 2 0 0 0 -2 -2h-7a2 2 0 0 0 -2 2v12a2 2 0 0 0 2 2h7a2 2 0 0 0 2 -2v-2 M20 12h-13l3 -3 M10 15l-3 -3',
-  'keyboard':       'M2 6m0 2a2 2 0 0 1 2 -2h16a2 2 0 0 1 2 2v8a2 2 0 0 1 -2 2h-16a2 2 0 0 1 -2 -2z M6 10v.01 M10 10v.01 M14 10v.01 M18 10v.01 M6 14v.01 M18 14v.01 M10 14l4 0',
-  'grid':           'M4 6a2 2 0 0 1 2 -2h2a2 2 0 0 1 2 2v2a2 2 0 0 1 -2 2h-2a2 2 0 0 1 -2 -2z M14 6a2 2 0 0 1 2 -2h2a2 2 0 0 1 2 2v2a2 2 0 0 1 -2 2h-2a2 2 0 0 1 -2 -2z M4 16a2 2 0 0 1 2 -2h2a2 2 0 0 1 2 2v2a2 2 0 0 1 -2 2h-2a2 2 0 0 1 -2 -2z M14 16a2 2 0 0 1 2 -2h2a2 2 0 0 1 2 2v2a2 2 0 0 1 -2 2h-2a2 2 0 0 1 -2 -2z',
-  'list':           'M9 6l11 0 M9 12l11 0 M9 18l11 0 M5 6l0 .01 M5 12l0 .01 M5 18l0 .01',
-  'adjustments':    'M4 10a2 2 0 1 0 4 0a2 2 0 0 0 -4 0 M6 4v4 M6 12v8 M10 16a2 2 0 1 0 4 0a2 2 0 0 0 -4 0 M12 4v10 M12 18v2 M16 7a2 2 0 1 0 4 0a2 2 0 0 0 -4 0 M18 4v1 M18 9v11',
-  'terminal':       'M5 7l5 5l-5 5 M12 19l7 0',
-  'eye':            'M12 12m-2 0a2 2 0 1 0 4 0a2 2 0 1 0 -4 0 M22 12c-2.667 4.667 -6 7 -10 7s-7.333 -2.333 -10 -7c2.667 -4.667 6 -7 10 -7s7.333 2.333 10 7',
-  'eye-off':        'M10.585 10.587a2 2 0 0 0 2.829 2.828 M16.681 16.673a8.717 8.717 0 0 1 -4.681 1.327c-3.6 0 -6.6 -2 -9 -6c1.272 -2.12 2.712 -3.678 4.32 -4.674m2.86 -1.146a9.055 9.055 0 0 1 1.82 -.18c3.6 0 6.6 2 9 6c-.666 1.11 -1.379 2.067 -2.138 2.87 M3 3l18 18',
-  'brush':          'M4 21v-4a4 4 0 1 1 4 4h-4 M21 3a16 16 0 0 0 -12.8 10.2 M21 3a16 16 0 0 1 -10.2 12.8 M10.6 9a9 9 0 0 1 4.4 4.4',
-  'device-desktop':'M3 5a1 1 0 0 1 1 -1h16a1 1 0 0 1 1 1v10a1 1 0 0 1 -1 1h-16a1 1 0 0 1 -1 -1z M7 20h10 M9 16v4 M15 16v4',
-  'brand-minecraft':'M21 8l-9 -5l-9 5l9 5l9 -5 M3 8v8l9 5 M21 8v8l-9 5 M12 13v8',
-  'world':          'M3 12a9 9 0 1 0 18 0a9 9 0 0 0 -18 0 M3 12h18 M12 3a12 12 0 0 1 0 18 M12 3a12 12 0 0 0 0 18',
+type IconComponent = FunctionComponent<{
+  size?: number | string;
+  stroke?: number | string;
+  color?: string;
+  class?: string;
+  style?: JSX.CSSProperties;
+}>;
+
+const REGISTRY: Record<string, IconComponent> = {
+  'arrow-left': IconArrowLeft as IconComponent,
+  'arrow-right': IconArrowRight as IconComponent,
+  'check': IconCheck as IconComponent,
+  'chevron-left': IconChevronLeft as IconComponent,
+  'chevron-right': IconChevronRight as IconComponent,
+  'chevron-up': IconChevronUp as IconComponent,
+  'clock': IconClock as IconComponent,
+  'compass': IconCompass as IconComponent,
+  'copy': IconCopy as IconComponent,
+  'cube': IconCube as IconComponent,
+  'dots': IconDots as IconComponent,
+  'download': IconDownload as IconComponent,
+  'edit': IconEdit as IconComponent,
+  'folder': IconFolder as IconComponent,
+  'globe': IconGlobe as IconComponent,
+  'headphones': IconHeadphones as IconComponent,
+  'home': IconHome as IconComponent,
+  'info': IconInfoCircle as IconComponent,
+  'alert': IconAlertCircle as IconComponent,
+  'keyboard': IconKeyboard as IconComponent,
+  'minus': IconMinus as IconComponent,
+  'music': IconMusic as IconComponent,
+  'music-off': IconMusicOff as IconComponent,
+  'palette': IconPalette as IconComponent,
+  'play': IconPlayerPlay as IconComponent,
+  'player-skip': IconPlayerSkipForward as IconComponent,
+  'plus': IconPlus as IconComponent,
+  'rectangle': IconRectangle as IconComponent,
+  'refresh': IconRefresh as IconComponent,
+  'search': IconSearch as IconComponent,
+  'settings': IconSettings as IconComponent,
+  'stop': IconPlayerStop as IconComponent,
+  'tag': IconTag as IconComponent,
+  'terminal': IconTerminal2 as IconComponent,
+  'trash': IconTrash as IconComponent,
+  'user': IconUser as IconComponent,
+  'x': IconX as IconComponent,
 };
 
 export interface IconProps {
@@ -95,22 +96,14 @@ export interface IconProps {
 }
 
 export function Icon({ name, size = 18, stroke = 2, color = 'currentColor', style }: IconProps): JSX.Element | null {
-  const d = ICONS[name];
-  if (!d) return null;
+  const Cmp = REGISTRY[name];
+  if (!Cmp) return null;
   return (
-    <svg
-      width={size}
-      height={size}
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke={color}
-      stroke-width={stroke}
-      stroke-linecap="round"
-      stroke-linejoin="round"
+    <Cmp
+      size={size}
+      stroke={stroke}
+      color={color}
       style={{ display: 'block', flexShrink: 0, ...style }}
-      aria-hidden="true"
-    >
-      <path d={d} />
-    </svg>
+    />
   );
 }
