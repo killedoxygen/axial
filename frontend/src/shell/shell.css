@@ -237,9 +237,9 @@
   border: 1px solid transparent;
   background: transparent;
   color: var(--text-mute);
-  font-size: 12px;
-  font-weight: 600;
-  font: inherit;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 500;
   cursor: default;
 }
 .cp-status-pill--running {
