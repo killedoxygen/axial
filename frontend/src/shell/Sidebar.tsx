@@ -1,9 +1,9 @@
 import type { JSX } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { Icon } from '../ui/Icons';
-import { Input } from '../ui/Atoms';
+import { Kbd } from '../ui/Atoms';
 import { route, navigate, commandPaletteOpen, type Route } from '../ui-state';
-import { installQueue, runningSessions, config, searchQuery } from '../store';
+import { installQueue, runningSessions, config } from '../store';
 import { prompt } from '../ui/Dialog';
 import { api } from '../api';
 import { toast } from '../toast';
@@ -11,6 +11,22 @@ import { errMessage } from '../utils';
 import { Music, musicStateVersion } from '../music';
 import { local, saveLocalState } from '../state';
 import { Sound } from '../sound';
+
+function CommandTrigger(): JSX.Element {
+  const isMac = typeof navigator !== 'undefined' && /Mac/i.test(navigator.platform);
+  return (
+    <button
+      class="cp-sidebar-search"
+      onClick={() => { commandPaletteOpen.value = true; }}
+      title="Search and jump to"
+      data-sound-silent="true"
+    >
+      <Icon name="search" size={13} color="var(--text-mute)" />
+      <span class="cp-sidebar-search-label">Search…</span>
+      <Kbd>{isMac ? '⌘K' : 'Ctrl K'}</Kbd>
+    </button>
+  );
+}
 
 interface SidebarItem {
   icon: string;
@@ -191,18 +207,7 @@ export function Sidebar(): JSX.Element {
         <img class="cp-logo" src="logo.svg" alt="" width="22" height="22" />
         <span class="cp-brand-name">Croopor</span>
       </div>
-      <div class="cp-sidebar-search">
-        <Input
-          value={searchQuery.value}
-          onChange={(v) => { searchQuery.value = v; }}
-          placeholder="Search instances…"
-          icon="search"
-          onKeyDown={(e) => {
-            if (e.key === 'Enter') { commandPaletteOpen.value = true; }
-            if (e.key === 'Escape') { searchQuery.value = ''; }
-          }}
-        />
-      </div>
+      <CommandTrigger />
       {groups.map(g => (
         <div class="cp-sidebar-group" key={g.title}>
           <div class="cp-sidebar-group-title">{g.title}</div>

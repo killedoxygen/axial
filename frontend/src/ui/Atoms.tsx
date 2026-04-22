@@ -138,6 +138,7 @@ export function Segmented<T extends string>({ options, value, onChange }: {
 
 export function Input({
   value, onChange, placeholder, icon, trailing, style, type = 'text', autoFocus, onKeyDown,
+  onFocus, onBlur,
 }: {
   value: string;
   onChange: (v: string) => void;
@@ -148,6 +149,8 @@ export function Input({
   type?: string;
   autoFocus?: boolean;
   onKeyDown?: (e: KeyboardEvent) => void;
+  onFocus?: () => void;
+  onBlur?: () => void;
 }): JSX.Element {
   const [focus, setFocus] = useState(false);
   return (
@@ -161,8 +164,8 @@ export function Input({
         autoFocus={autoFocus}
         onKeyDown={onKeyDown as any}
         onInput={(e: any) => onChange(e.currentTarget.value)}
-        onFocus={() => setFocus(true)}
-        onBlur={() => setFocus(false)}
+        onFocus={() => { setFocus(true); onFocus?.(); }}
+        onBlur={() => { setFocus(false); onBlur?.(); }}
         placeholder={placeholder}
       />
       {trailing}

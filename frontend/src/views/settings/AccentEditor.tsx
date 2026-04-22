@@ -34,7 +34,11 @@ export function AccentModeToggle({
   );
 }
 
-export function AccentField(): JSX.Element {
+export function AccentField({
+  showPresets = true,
+}: {
+  showPresets?: boolean;
+} = {}): JSX.Element {
   const [hue, setHue] = useState<number>(local.customHue);
   const [vibrancy, setVibrancy] = useState<number>(local.customVibrancy);
 
@@ -74,25 +78,27 @@ export function AccentField(): JSX.Element {
           <span>chroma <strong>{vibrancy}%</strong></span>
         </div>
       </div>
-      <div class="cp-accent-presets">
-        <div class="cp-accent-presets-label">Presets</div>
-        <div class="cp-swatch-row">
-          {Object.entries(PRESET_HUES).map(([id, h]) => {
-            const active = local.theme === id;
-            return (
-              <button
-                key={id}
-                class="cp-swatch"
-                data-active={active}
-                aria-label={id}
-                title={id}
-                style={{ background: `oklch(0.78 0.14 ${h})`, color: `oklch(0.78 0.14 ${h})` }}
-                onClick={() => applyPreset(id)}
-              />
-            );
-          })}
+      {showPresets && (
+        <div class="cp-accent-presets">
+          <div class="cp-accent-presets-label">Presets</div>
+          <div class="cp-swatch-row">
+            {Object.entries(PRESET_HUES).map(([id, h]) => {
+              const active = local.theme === id;
+              return (
+                <button
+                  key={id}
+                  class="cp-swatch"
+                  data-active={active}
+                  aria-label={id}
+                  title={id}
+                  style={{ background: `oklch(0.78 0.14 ${h})`, color: `oklch(0.78 0.14 ${h})` }}
+                  onClick={() => applyPreset(id)}
+                />
+              );
+            })}
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }

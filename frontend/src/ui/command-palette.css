@@ -1,0 +1,141 @@
+.cp-cmd-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(8, 6, 12, 0.48);
+  backdrop-filter: blur(8px) saturate(1.1);
+  -webkit-backdrop-filter: blur(8px) saturate(1.1);
+  z-index: 2000;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 110px;
+  animation: cp-cmd-overlay-in 160ms ease;
+}
+
+.cp-cmd {
+  width: 560px;
+  max-width: calc(100vw - 40px);
+  background: color-mix(in oklab, var(--surface) 95%, transparent);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  overflow: hidden;
+  box-shadow:
+    0 1px 0 color-mix(in oklab, var(--text) 8%, transparent) inset,
+    0 28px 80px -12px rgba(0, 0, 0, 0.55),
+    0 8px 20px -4px rgba(0, 0, 0, 0.28);
+  display: flex;
+  flex-direction: column;
+  max-height: min(70vh, 620px);
+  animation: cp-cmd-in 220ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.cp-cmd-head {
+  padding: 14px 14px 14px 16px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border-bottom: 1px solid var(--line);
+  flex-shrink: 0;
+}
+.cp-cmd-input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 15px;
+  font-weight: 500;
+  min-width: 0;
+}
+.cp-cmd-input::placeholder { color: var(--text-mute); }
+
+.cp-cmd-list {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 6px;
+}
+.cp-cmd-section { margin-bottom: 4px; }
+.cp-cmd-section-title {
+  padding: 10px 10px 4px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: var(--text-mute);
+}
+.cp-cmd-item {
+  width: 100%;
+  padding: 8px 10px;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  border-radius: 8px;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  text-align: left;
+  transition: background 80ms, color 80ms;
+}
+.cp-cmd-item[data-active="true"] {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.cp-cmd-label {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cp-cmd-hint {
+  font-size: 11px;
+  color: var(--text-mute);
+  letter-spacing: 0.3px;
+  font-variant-numeric: tabular-nums;
+}
+.cp-cmd-item[data-active="true"] .cp-cmd-hint {
+  color: color-mix(in oklab, var(--accent) 80%, var(--text-mute));
+}
+
+.cp-cmd-empty {
+  padding: 32px 16px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--text-mute);
+  font-size: 13px;
+}
+
+.cp-cmd-foot {
+  padding: 8px 14px;
+  border-top: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  font-size: 11px;
+  color: var(--text-mute);
+  background: var(--surface-2);
+  flex-shrink: 0;
+}
+.cp-cmd-foot-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+@keyframes cp-cmd-overlay-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes cp-cmd-in {
+  from { opacity: 0; transform: translateY(-12px) scale(0.97); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}

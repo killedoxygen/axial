@@ -13,6 +13,7 @@ import { DialogHost } from './ui/Dialog';
 import { SetupOverlay } from './views/setup/SetupOverlay';
 import { ContextMenuHost } from './ui/ContextMenu';
 import { ToastHost } from './ui/ToastHost';
+import { CommandPalette } from './ui/CommandPalette';
 import { route, showOnboardingOverlay, showSetupOverlay } from './ui-state';
 import { bootstrapError, bootstrapState } from './store';
 import { useShortcuts } from './hooks/use-shortcuts';
@@ -71,6 +72,7 @@ export function App(): JSX.Element {
       <DialogHost />
       <ContextMenuHost />
       <ToastHost />
+      <CommandPalette />
       <BootState />
     </>
   );
