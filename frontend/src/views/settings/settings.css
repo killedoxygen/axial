@@ -77,6 +77,9 @@
   margin-top: 4px;
   max-width: 460px;
   line-height: 1.5;
+  /* Distribute words more evenly on multi-line descriptions where supported.
+     Ignored on older WebKit; greedy wrap is the fallback. */
+  text-wrap: balance;
 }
 .cp-settings-card-control {
   min-width: 0;
@@ -88,87 +91,26 @@
   justify-content: stretch;
 }
 
-/* Accent pane ----------------------------------------------------------- */
-.cp-accent-pane {
+/* Player name row: input + save + error, wraps on narrow cards */
+.cp-settings-name {
   margin-top: 14px;
   display: flex;
-  flex-direction: column;
-  gap: 14px;
-}
-.cp-accent-field { touch-action: none; }
-.cp-accent-readout {
-  display: flex;
   align-items: center;
   gap: 10px;
-  font-size: 12px;
-  color: var(--text-mute);
-}
-.cp-accent-readout-labels {
-  display: inline-flex;
-  align-items: center;
-  gap: 10px;
-}
-.cp-accent-readout strong {
-  color: var(--text);
-  font-variant-numeric: tabular-nums;
-  font-weight: 600;
-}
-.cp-accent-sep {
-  display: inline-block;
-  width: 3px; height: 3px;
-  border-radius: 999px;
-  background: var(--text-mute);
-  opacity: 0.6;
-}
-.cp-accent-chip {
-  width: 26px; height: 26px;
-  border-radius: 8px;
-  border: 1px solid var(--line);
-  box-shadow: 0 1px 2px rgba(0,0,0,0.2) inset;
-  flex-shrink: 0;
-}
-.cp-accent-presets {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  padding-top: 10px;
-  border-top: 1px dashed var(--line);
-}
-.cp-accent-presets-label {
-  font-size: 10.5px;
-  text-transform: uppercase;
-  letter-spacing: 0.8px;
-  font-weight: 600;
-  color: var(--text-mute);
-}
-
-/* Accent swatch row */
-.cp-swatch-row {
-  display: flex;
-  gap: 8px;
   flex-wrap: wrap;
-  align-items: center;
 }
-.cp-swatch {
-  width: 30px; height: 30px;
-  border-radius: 999px;
-  cursor: pointer;
-  border: 2px solid transparent;
-  transition: transform 120ms, box-shadow 120ms;
-  padding: 0;
-}
-.cp-swatch[data-active="true"] {
-  border-color: var(--text);
-  transform: scale(1.08);
-  box-shadow: 0 0 0 3px color-mix(in oklch, currentColor 25%, transparent);
+.cp-settings-name-err {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--err);
 }
 
-/* Color marker: transitions only fire when programmatically moved */
-.cp-color-marker.animating {
-  transition: left 260ms cubic-bezier(0.22, 1, 0.36, 1),
-              top 260ms cubic-bezier(0.22, 1, 0.36, 1),
-              background 260ms ease;
-}
+/* Accent editor styles live in ./accent.css (co-located with AccentEditor.tsx)
+   so Onboarding can reuse the exact same component. */
+
+/* Stack-layout cards (e.g. Accent) need top spacing between title and content.
+   AccentEditor itself is layout-agnostic, so we add the breathing room here. */
+.cp-settings-card--stack .cp-accent-pane { margin-top: 14px; }
 
 /* Toggle ----------------------------------------------------------------- */
 .cp-toggle {

@@ -1,18 +1,16 @@
 import type { JSX, ComponentChildren } from 'preact';
 import { useEffect, useMemo, useState } from 'preact/hooks';
-import { Button, Input, Segmented } from '../../ui/Atoms';
+import { Button, Input } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { Slider } from '../../ui/Slider';
-import { useTheme } from '../../hooks/use-theme';
-import { ColorField } from './ColorField';
-import { applyTheme } from '../../theme';
-import { local, PRESET_HUES, saveLocalState } from '../../state';
+import { AccentField, AccentModeToggle } from './AccentEditor';
+import { local, saveLocalState } from '../../state';
 import { Sound, playSliderSound } from '../../sound';
 import { Music, musicStateVersion } from '../../music';
 import { config, systemInfo, devMode, appVersion } from '../../store';
 import { api } from '../../api';
 import { toast } from '../../toast';
-import { errMessage, fmtMem, getMemoryRecommendation } from '../../utils';
+import { errMessage, fmtMem, getMemoryRecommendation, USERNAME_MAX_LEN, validateUsername } from '../../utils';
 import './settings.css';
 
 type SectionId = 'appearance' | 'gameplay' | 'audio' | 'shortcuts' | 'advanced' | 'about';
@@ -65,86 +63,19 @@ function Toggle({ on, onChange }: { on: boolean; onChange: () => void }): JSX.El
 // ── Appearance ─────────────────────────────────────────────────────────
 
 function AppearanceSection(): JSX.Element {
-  const [mode, setMode] = useState<'dark' | 'light'>(local.lightness >= 50 ? 'light' : 'dark');
-  const [hue, setHue] = useState<number>(local.customHue);
-  const [vibrancy, setVibrancy] = useState<number>(local.customVibrancy);
-
-  useEffect(() => { setMode(local.lightness >= 50 ? 'light' : 'dark'); }, []);
-
-  const applyMode = (next: 'dark' | 'light'): void => {
-    setMode(next);
-    applyTheme(local.theme || 'custom', hue, { vibrancy, lightness: next === 'light' ? 60 : 0 });
-  };
-
-  const applyPreset = (id: string): void => {
-    const h = PRESET_HUES[id];
-    if (h == null) return;
-    setHue(h);
-    applyTheme(id, null, { vibrancy, lightness: local.lightness });
-  };
-
-  const onDrag = (h: number, v: number): void => {
-    setHue(h);
-    setVibrancy(v);
-    playSliderSound(h / 360, 'hue');
-    applyTheme('custom', h, { vibrancy: v, lightness: local.lightness, silent: true });
-  };
-  const onEnd = (): void => {
-    Sound.ui('theme');
-    applyTheme('custom', hue, { vibrancy, lightness: local.lightness });
-  };
-
   return (
     <>
       <SettingsCard
         title="Mode"
         desc="Light or dark canvas. Accent colors re-derive automatically so contrast stays safe."
-        control={
-          <Segmented<'dark' | 'light'> value={mode} onChange={applyMode}
-            options={[{ value: 'dark', label: 'Dark' }, { value: 'light', label: 'Light' }]} />
-        }
+        control={<AccentModeToggle />}
       />
       <SettingsCard
         title="Accent"
         desc="Drag inside the field to pick any hue and chroma, or tap a preset. Every tint, ring, and on-accent contrast is derived from this single point."
         stack
       >
-        <div class="cp-accent-pane">
-          <div class="cp-accent-field">
-            <ColorField hue={hue} vibrancy={vibrancy} onChange={onDrag} onEnd={onEnd} />
-          </div>
-          <div class="cp-accent-readout">
-            <div
-              class="cp-accent-chip"
-              style={{ background: `oklch(0.78 ${(vibrancy / 100) * 0.14} ${hue})` }}
-              aria-hidden="true"
-            />
-            <div class="cp-accent-readout-labels">
-              <span>hue <strong>{hue}°</strong></span>
-              <span class="cp-accent-sep" />
-              <span>chroma <strong>{vibrancy}%</strong></span>
-            </div>
-          </div>
-          <div class="cp-accent-presets">
-            <div class="cp-accent-presets-label">Presets</div>
-            <div class="cp-swatch-row">
-              {Object.entries(PRESET_HUES).map(([id, h]) => {
-                const active = local.theme === id;
-                return (
-                  <button
-                    key={id}
-                    class="cp-swatch"
-                    data-active={active}
-                    aria-label={id}
-                    title={id}
-                    style={{ background: `oklch(0.78 0.14 ${h})`, color: `oklch(0.78 0.14 ${h})` }}
-                    onClick={() => applyPreset(id)}
-                  />
-                );
-              })}
-            </div>
-          </div>
-        </div>
+        <AccentField />
       </SettingsCard>
     </>
   );
@@ -175,10 +106,14 @@ function GameplaySection(): JSX.Element {
     return rec.text;
   }, [memGB, totalGB, rec.text]);
 
+  const nameError = validateUsername(username);
+  const nameValid = nameError === null;
+
   const save = async (): Promise<void> => {
+    if (!nameValid) return;
     try {
       const res: any = await api('PUT', '/config', {
-        username: username.trim() || 'Player',
+        username: username.trim(),
         max_memory_mb: Math.round(memGB * 1024),
       });
       if (res.error) throw new Error(res.error);
@@ -194,14 +129,20 @@ function GameplaySection(): JSX.Element {
     <>
       <SettingsCard
         title="Player name"
-        desc="What Minecraft sees when you launch. Offline auth uses this directly."
-        control={
-          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-            <Input value={username} onChange={(v) => { setUsername(v); setDirty(true); }} placeholder="Player" style={{ width: 220 }} />
-            {dirty && <Button size="sm" onClick={save}>Save</Button>}
-          </div>
-        }
-      />
+        desc="Shown to Minecraft at launch. Letters, numbers, or underscores (3–16)."
+        stack
+      >
+        <div class="cp-settings-name">
+          <Input
+            value={username}
+            onChange={(v) => { setUsername(v.slice(0, USERNAME_MAX_LEN)); setDirty(true); }}
+            placeholder="Player"
+            style={{ width: 240 }}
+          />
+          {dirty && <Button size="sm" onClick={save} disabled={!nameValid}>Save</Button>}
+          {dirty && !nameValid && <span class="cp-settings-name-err">{nameError}</span>}
+        </div>
+      </SettingsCard>
       <SettingsCard
         title="Memory"
         desc={`Maximum RAM given to the JVM when launching. ${recText} (system has ${totalGB} GB).`}

@@ -29,6 +29,21 @@
   to   { opacity: 0; transform: scale(1.015); }
 }
 
+/* Top strip (drag region + window controls) ------------------------------ */
+
+.cp-ob-topstrip {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 36px;
+  display: flex;
+  align-items: stretch;
+  justify-content: flex-end;
+  padding-right: 2px;
+  z-index: 2;
+}
+
 /* Column ------------------------------------------------------------------ */
 
 .cp-ob-column {
@@ -145,6 +160,23 @@
   font-weight: 500;
 }
 
+/* Inline validation error under the name input */
+.cp-ob-error {
+  min-height: 16px;
+  margin-top: -6px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--err);
+  opacity: 0;
+  transform: translateY(-2px);
+  transition: opacity 180ms ease, transform 180ms ease;
+}
+
+.cp-ob-error.is-visible {
+  opacity: 1;
+  transform: none;
+}
+
 /* Disabled MSA sign-in placeholder */
 .cp-ob-msa {
   display: flex;
@@ -200,6 +232,34 @@
   color: var(--text);
   font-variant-numeric: tabular-nums;
   transition: color 240ms ease;
+}
+
+/* Color stage: mode toggle row with Weirdo jab ---------------------------- */
+
+.cp-ob-mode-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.cp-ob-weirdo {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 10px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  animation: cp-ob-weirdo-in 320ms cubic-bezier(0.34, 1.56, 0.64, 1) both;
+  user-select: none;
+}
+
+@keyframes cp-ob-weirdo-in {
+  from { opacity: 0; transform: translateX(-6px) rotate(-5deg); }
+  to   { opacity: 1; transform: none; }
 }
 
 /* Music pills ------------------------------------------------------------- */

@@ -360,6 +360,24 @@ export function formatRelativeTime(date: Date): string {
   return new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' }).format(date);
 }
 
+// ── Player name validation ──────────────────────────────────────────────
+// Minecraft (offline + MSA) accepts [A-Za-z0-9_]{3,16}. Anything outside that
+// range breaks launch arg construction (spaces, quotes, semicolons, etc.).
+// Frontend gates every input site; the backend is a last-resort defense.
+
+export const USERNAME_MIN_LEN = 3;
+export const USERNAME_MAX_LEN = 16;
+export const USERNAME_PATTERN: RegExp = /^[A-Za-z0-9_]+$/;
+
+export function validateUsername(raw: string): string | null {
+  const v = raw.trim();
+  if (v.length === 0) return 'Enter a name.';
+  if (v.length < USERNAME_MIN_LEN) return `At least ${USERNAME_MIN_LEN} characters.`;
+  if (v.length > USERNAME_MAX_LEN) return `At most ${USERNAME_MAX_LEN} characters.`;
+  if (!USERNAME_PATTERN.test(v)) return 'Letters, numbers, and underscores only.';
+  return null;
+}
+
 export function getMemoryRecommendation(totalGB: number): { rec: number; text: string } {
   if (totalGB <= 4) return { rec: 2, text: 'Low RAM — 2 GB recommended' };
   if (totalGB <= 8) return { rec: 4, text: '4 GB recommended' };

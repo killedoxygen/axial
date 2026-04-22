@@ -3,8 +3,8 @@ import { useState } from 'preact/hooks';
 import { Button, Input } from '../../ui/Atoms';
 import { Slider } from '../../ui/Slider';
 import { Icon } from '../../ui/Icons';
-import { ColorField } from '../settings/ColorField';
-import { applyTheme } from '../../theme';
+import { AccentField, AccentModeToggle } from '../settings/AccentEditor';
+import { WindowControls } from '../../shell/WindowControls';
 import { local } from '../../state';
 import { Music } from '../../music';
 import { Sound, playSliderSound } from '../../sound';
@@ -12,7 +12,7 @@ import { api } from '../../api';
 import { config, systemInfo } from '../../store';
 import { showOnboardingOverlay } from '../../ui-state';
 import { toast } from '../../toast';
-import { errMessage, fmtMem, getMemoryRecommendation } from '../../utils';
+import { errMessage, fmtMem, getMemoryRecommendation, USERNAME_MAX_LEN, validateUsername } from '../../utils';
 import './onboarding.css';
 
 type Stage = 'name' | 'memory' | 'color' | 'music';
@@ -41,14 +41,17 @@ export function Onboarding(): JSX.Element | null {
   const [stage, setStage] = useState<Stage>('name');
   const [username, setUsername] = useState('');
   const [memory, setMemory] = useState<number>(rec.rec);
-  const [hue, setHue] = useState<number>(local.customHue);
-  const [vibrancy, setVibrancy] = useState<number>(local.customVibrancy);
   const [musicEnabled, setMusicEnabled] = useState<boolean | null>(null);
+  const [isWeirdo, setIsWeirdo] = useState<boolean>(local.lightness >= 50);
   const [saving, setSaving] = useState(false);
   const [dissolving, setDissolving] = useState(false);
 
   const idx = ORDER.indexOf(stage);
-  const nameValid = username.trim().length > 0;
+  const nameError = validateUsername(username);
+  const nameValid = nameError === null;
+  // Only surface the error after the user has actually typed something;
+  // don't shout at an empty input they haven't touched yet.
+  const showNameError = username.length > 0 && !nameValid;
 
   const advance = (): void => {
     const next = ORDER[idx + 1];
@@ -58,18 +61,17 @@ export function Onboarding(): JSX.Element | null {
     }
   };
 
-  const applyCustom = (h: number, v: number): void => {
-    setHue(h);
-    setVibrancy(v);
-    applyTheme('custom', h, { silent: true, vibrancy: v, lightness: local.lightness });
-  };
-
   const commit = async (): Promise<void> => {
     if (saving || musicEnabled == null) return;
     setSaving(true);
+    if (!nameValid) {
+      setSaving(false);
+      setStage('name');
+      return;
+    }
     try {
       const r: any = await api('PUT', '/config', {
-        username: username.trim() || 'Player',
+        username: username.trim(),
         max_memory_mb: Math.round(memory * 1024),
         music_enabled: musicEnabled,
         music_volume: 5,
@@ -89,7 +91,7 @@ export function Onboarding(): JSX.Element | null {
 
   const recapChips: JSX.Element[] = [];
   if (idx > 0) recapChips.push(
-    <span class="cp-ob-chip" key="name">{username.trim() || 'Player'}</span>,
+    <span class="cp-ob-chip" key="name">{username.trim()}</span>,
   );
   if (idx > 1) recapChips.push(
     <span class="cp-ob-chip" key="mem">{fmtMem(memory)}</span>,
@@ -99,12 +101,16 @@ export function Onboarding(): JSX.Element | null {
       class="cp-ob-chip cp-ob-chip--color"
       key="color"
       aria-label="Chosen color"
-      style={{ ['--swatch' as any]: `oklch(0.78 0.14 ${hue})` }}
+      style={{ ['--swatch' as any]: `oklch(0.78 0.14 ${local.customHue})` }}
     />,
   );
 
   return (
     <div class={`cp-ob-root${dissolving ? ' is-dissolving' : ''}`}>
+      <div class="cp-ob-topstrip cp-drag">
+        <WindowControls />
+      </div>
+
       <div class="cp-ob-column">
         {recapChips.length > 0 && <div class="cp-ob-recap">{recapChips}</div>}
 
@@ -115,11 +121,14 @@ export function Onboarding(): JSX.Element | null {
               <div class="cp-ob-widget cp-ob-namefield">
                 <Input
                   value={username}
-                  onChange={setUsername}
+                  onChange={(v) => setUsername(v.slice(0, USERNAME_MAX_LEN))}
                   placeholder="Your name"
                   autoFocus
                   onKeyDown={(e) => { if (e.key === 'Enter' && nameValid) advance(); }}
                 />
+                <div class={`cp-ob-error${showNameError ? ' is-visible' : ''}`}>
+                  {nameError ?? ''}
+                </div>
                 {/* Placeholder slot for future Microsoft-auth sign-in. Disabled on purpose;
                     when MSA lands, this becomes the primary path and the input the fallback. */}
                 <button class="cp-ob-msa" disabled type="button" aria-disabled="true" tabIndex={-1}>
@@ -169,14 +178,13 @@ export function Onboarding(): JSX.Element | null {
           {stage === 'color' && (
             <>
               <h1 class="cp-ob-headline"><Words text="Pick a mood." /></h1>
-              <p class="cp-ob-subline">Drag anywhere. The whole launcher learns your color.</p>
+              <p class="cp-ob-subline">Drag anywhere, tap a preset, or flip the canvas. Everything learns your color.</p>
               <div class="cp-ob-widget">
-                <ColorField
-                  hue={hue}
-                  vibrancy={vibrancy}
-                  onChange={applyCustom}
-                  onEnd={() => Sound.ui('theme')}
-                />
+                <div class="cp-ob-mode-row">
+                  <AccentModeToggle onChange={(m) => setIsWeirdo(m === 'light')} />
+                  {isWeirdo && <span class="cp-ob-weirdo" aria-hidden="true">Weirdo!</span>}
+                </div>
+                <AccentField />
               </div>
               <div class="cp-ob-cta">
                 <Button size="lg" onClick={advance}>Continue</Button>
