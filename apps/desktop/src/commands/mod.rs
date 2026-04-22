@@ -2,7 +2,7 @@ use crate::events;
 use crate::state::{ApiRuntimeState, DesktopState};
 use croopor_api::state::{AppState, LaunchEvent, LaunchSessionRecord, LaunchStatusEvent};
 use croopor_launcher::LaunchState;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 #[tauri::command]
 pub fn app_version(state: State<'_, DesktopState>) -> String {
@@ -12,6 +12,53 @@ pub fn app_version(state: State<'_, DesktopState>) -> String {
 #[tauri::command]
 pub fn api_base_url(state: State<'_, ApiRuntimeState>) -> String {
     format!("http://{}", state.addr())
+}
+
+#[tauri::command]
+pub fn window_minimize(app: AppHandle) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "main window missing".to_string())?;
+    window.minimize().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn window_toggle_maximize(app: AppHandle) -> Result<bool, String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "main window missing".to_string())?;
+    let maximized = window.is_maximized().map_err(|e| e.to_string())?;
+    if maximized {
+        window.unmaximize().map_err(|e| e.to_string())?;
+        Ok(false)
+    } else {
+        window.maximize().map_err(|e| e.to_string())?;
+        Ok(true)
+    }
+}
+
+#[tauri::command]
+pub fn window_close(app: AppHandle) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "main window missing".to_string())?;
+    window.close().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn window_is_maximized(app: AppHandle) -> Result<bool, String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "main window missing".to_string())?;
+    window.is_maximized().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn window_start_dragging(app: AppHandle) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "main window missing".to_string())?;
+    window.start_dragging().map_err(|e| e.to_string())
 }
 
 #[tauri::command]

@@ -47,7 +47,12 @@ async fn main() {
             commands::api_base_url,
             commands::start_install_events,
             commands::start_loader_install_events,
-            commands::start_launch_events
+            commands::start_launch_events,
+            commands::window_minimize,
+            commands::window_toggle_maximize,
+            commands::window_close,
+            commands::window_is_maximized,
+            commands::window_start_dragging
         ])
         .setup(move |app| {
             app.manage(state::ApiRuntimeState::new(api.addr));

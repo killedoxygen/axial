@@ -127,3 +127,38 @@ export async function startNativeLaunchEvents(sessionId: string): Promise<boolea
   await tauri.core.invoke('start_launch_events', { sessionId });
   return true;
 }
+
+// ── Window controls (Tauri only). In browser mode these are no-ops. ──
+
+export async function windowMinimize(): Promise<boolean> {
+  const tauri = getTauriBinding();
+  if (!tauri?.core) return false;
+  await tauri.core.invoke('window_minimize');
+  return true;
+}
+
+export async function windowToggleMaximize(): Promise<boolean | null> {
+  const tauri = getTauriBinding();
+  if (!tauri?.core) return null;
+  return tauri.core.invoke<boolean>('window_toggle_maximize');
+}
+
+export async function windowClose(): Promise<boolean> {
+  const tauri = getTauriBinding();
+  if (!tauri?.core) return false;
+  await tauri.core.invoke('window_close');
+  return true;
+}
+
+export async function windowIsMaximized(): Promise<boolean> {
+  const tauri = getTauriBinding();
+  if (!tauri?.core) return false;
+  return tauri.core.invoke<boolean>('window_is_maximized');
+}
+
+export async function windowStartDragging(): Promise<boolean> {
+  const tauri = getTauriBinding();
+  if (!tauri?.core) return false;
+  await tauri.core.invoke('window_start_dragging');
+  return true;
+}
