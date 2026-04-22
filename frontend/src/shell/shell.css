@@ -1,0 +1,202 @@
+/* Shell, the app IS the window */
+/* Topbar owns the chrome: drag region, min, max, close */
+
+.cp-frame {
+  width: 100%;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  display: flex;
+  overflow: hidden;
+}
+
+/* Sidebar ---------------------------------------------------------------- */
+.cp-sidebar {
+  width: 232px;
+  height: 100%;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 14px 12px 12px;
+  border-right: 1px solid var(--line);
+  background: var(--surface);
+}
+.cp-sidebar-brand { padding: 4px 6px 12px; display: flex; align-items: center; gap: 10px; }
+.cp-sidebar-brand .cp-brand-name {
+  font-weight: 700; font-size: 14px; color: var(--text); letter-spacing: -0.2px;
+}
+.cp-logo {
+  width: 22px; height: 22px;
+  filter: hue-rotate(var(--logo-hue-shift, 0deg));
+  transition: filter 280ms ease;
+}
+
+.cp-sidebar-search {
+  margin: 0 2px 12px;
+}
+
+.cp-sidebar-group { margin-bottom: 14px; }
+.cp-sidebar-group-title {
+  padding: 4px 10px 6px;
+  font-size: 10.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: var(--text-mute);
+}
+.cp-sidebar-items { display: flex; flex-direction: column; gap: 1px; }
+.cp-sidebar-item {
+  position: relative;
+  width: 100%;
+  height: 34px;
+  padding: 0 10px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: transparent;
+  color: var(--text-dim);
+  border: none;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: -0.1px;
+  transition: background 120ms, color 120ms;
+  text-align: left;
+  font-family: inherit;
+}
+.cp-sidebar-item:hover { background: var(--surface-3); color: var(--text); }
+.cp-sidebar-item[data-active="true"] {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.cp-sidebar-item .cp-sidebar-label { flex: 1; }
+.cp-sidebar-item .cp-sidebar-badge {
+  min-width: 18px; height: 18px; padding: 0 5px;
+  border-radius: 9px;
+  font-size: 10.5px; font-weight: 700;
+  background: var(--surface-3);
+  color: var(--text-dim);
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.cp-sidebar-item[data-active="true"] .cp-sidebar-badge {
+  background: var(--accent);
+  color: var(--accent-on);
+}
+
+.cp-sidebar-spacer { flex: 1; }
+
+.cp-sidebar-user {
+  padding: 10px;
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+.cp-sidebar-user:hover { background: var(--surface-3); }
+.cp-sidebar-user .cp-avatar {
+  width: 32px; height: 32px;
+  border-radius: var(--r-sm);
+  background: linear-gradient(135deg, var(--accent), var(--accent-strong));
+  display: inline-flex; align-items: center; justify-content: center;
+  color: var(--accent-on);
+  font-weight: 700; font-size: 13px;
+  flex-shrink: 0;
+}
+.cp-sidebar-user-body { flex: 1; min-width: 0; }
+.cp-sidebar-user-name {
+  font-size: 12.5px; font-weight: 600; color: var(--text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.cp-sidebar-user-sub { font-size: 10.5px; color: var(--text-mute); }
+
+/* Topbar ----------------------------------------------------------------- */
+.cp-topbar {
+  height: 44px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  padding: 0 8px 0 12px;
+  gap: 8px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface);
+}
+.cp-topbar-crumbs {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--text-dim);
+  min-width: 0;
+}
+.cp-topbar-crumb { color: var(--text-dim); font-weight: 500; }
+.cp-topbar-crumb--last { color: var(--text); font-weight: 600; }
+.cp-topbar-spacer { flex: 1; }
+
+.cp-status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 28px;
+  padding: 0 12px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--text-dim);
+  font-size: 12px;
+  font-weight: 600;
+  font: inherit;
+  cursor: default;
+}
+.cp-status-pill--running {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: var(--accent);
+  cursor: pointer;
+}
+.cp-status-dot {
+  width: 7px; height: 7px;
+  border-radius: 999px;
+  background: var(--text-mute);
+}
+.cp-status-pill--running .cp-status-dot {
+  background: var(--accent);
+  box-shadow: 0 0 10px var(--accent);
+  animation: cp-pulse 2s ease-in-out infinite;
+}
+
+/* Window controls ------------------------------------------------------- */
+.cp-winctrls { display: inline-flex; gap: 2px; margin-left: 2px; }
+.cp-winctrl {
+  width: 30px; height: 30px;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: none; background: transparent;
+  color: var(--text-dim);
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  transition: background 120ms, color 120ms;
+  font: inherit;
+}
+.cp-winctrl:hover { background: var(--surface-3); color: var(--text); }
+.cp-winctrl--close:hover { background: oklch(0.70 0.18 25 / 0.18); color: var(--err); }
+
+/* Main / view ----------------------------------------------------------- */
+.cp-main {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+}
+.cp-view {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  width: 100%;
+}

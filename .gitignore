@@ -8,6 +8,7 @@ dist/
 # Frontend build artifacts
 frontend/node_modules/
 frontend/static/app.js
+frontend/static/app.css
 frontend/package.json.md5
 target/
 

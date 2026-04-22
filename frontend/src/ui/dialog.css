@@ -1,0 +1,43 @@
+.cp-dialog-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: oklch(0.1 0 0 / 0.5);
+  backdrop-filter: blur(6px);
+  animation: cp-fade-in 120ms ease;
+}
+.cp-dialog {
+  width: min(420px, 100%);
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow);
+  padding: 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  animation: cp-float-up 160ms ease;
+}
+.cp-dialog-title {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: -0.2px;
+}
+.cp-dialog-body {
+  margin: 0;
+  font-size: 13.5px;
+  color: var(--text-dim);
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+.cp-dialog-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}

@@ -242,15 +242,29 @@ export const Sound = {
 };
 
 export function inferButtonSound(btn: HTMLElement): SoundKind | null {
-  if (btn.classList.contains('version-item') || btn.classList.contains('theme-swatch') || btn.classList.contains('ob-theme-btn') || btn.classList.contains('ob-music-btn') || btn.classList.contains('settings-nav-btn')) return null;
-  if (btn.id === 'music-btn') return null;
-  if (btn.classList.contains('chip')) return 'soft';
-  if (btn.id === 'launch-btn') return 'launchPress';
-  if (btn.id === 'add-version-btn' || btn.id === 'empty-add-btn') return 'bright';
-  if (btn.id === 'settings-save' || btn.id === 'install-btn' || btn.id === 'onboarding-next') return 'affirm';
-  if (btn.id === 'settings-cancel' || btn.id === 'kill-btn' || btn.id === 'delete-cancel' || btn.id === 'delete-close') return 'soft';
-  if (btn.id === 'delete-done-close') return 'affirm';
-  if (btn.classList.contains('ctx-item')) return null; // handled by ctx menu
+  // Skip buttons that play their own tailored sound
+  if (btn.dataset.soundSilent === 'true') return null;
+  if (btn.classList.contains('cp-winctrl')) return 'soft';
+  if (btn.classList.contains('cp-sidebar-item')) return 'soft';
+  if (btn.classList.contains('cp-seg') || btn.closest('.cp-seg')) return 'soft';
+  if (btn.classList.contains('cp-ob-choice')) return 'soft';
+
+  // Button variants drive the sound directly.
+  if (btn.classList.contains('cp-btn--primary')) {
+    const label = btn.textContent?.toLowerCase() || '';
+    if (label.includes('play') || label.includes('launch') || label.includes('resume')) return 'launchPress';
+    if (label.includes('create') || label.includes('finish') || label.includes('save') || label.includes('continue') || label.includes('confirm')) return 'affirm';
+    return 'bright';
+  }
+  if (btn.classList.contains('cp-btn--danger')) return 'soft';
+  if (btn.classList.contains('cp-btn--soft')) return 'soft';
+  if (btn.classList.contains('cp-btn--ghost')) return 'soft';
+  if (btn.classList.contains('cp-btn--secondary')) return 'click';
+
+  if (btn.classList.contains('cp-ibtn')) return 'click';
+  if (btn.classList.contains('cp-quick-action')) return 'click';
+  if (btn.classList.contains('cp-status-pill--running')) return 'soft';
+
   return 'click';
 }
 

@@ -3,8 +3,7 @@ import { byId } from './dom';
 import { Sound } from './sound';
 import { Music } from './music';
 import { fmtMem, showError, appendLog, errMessage } from './utils';
-import { clearLaunchVisualState, startLaunchSequence, endLaunchSequence } from './effects';
-import { showConfirm } from './dialogs';
+import { showConfirm } from './ui/Dialog';
 import {
   hasNativeDesktopRuntime, nativeLaunchLogEventName, nativeLaunchStatusEventName,
   onNativeEvent, startNativeLaunchEvents,
@@ -22,7 +21,7 @@ function rollbackLaunch(instanceId: string, animationFrameId: number | null): vo
   if (animationFrameId !== null) cancelAnimationFrame(animationFrameId);
   endSession(instanceId);
   if (Object.keys(runningSessions.value).length === 0) Music.unsuppress();
-  clearLaunchVisualState();
+
   endLaunchPrep();
 }
 
@@ -297,8 +296,12 @@ export async function launchGame(): Promise<void> {
   if (runningSessions.value[inst.id]) return;
   if (launchState.value.status === 'preparing') return;
 
-  const username = byId<HTMLInputElement>('username-input')?.value.trim() || 'Player';
-  const maxMemMB = Math.round(parseFloat(byId<HTMLInputElement>('memory-slider')?.value || '4') * 1024);
+  const cfg = config.value;
+  const username = byId<HTMLInputElement>('username-input')?.value.trim() || cfg?.username || 'Player';
+  const memSliderEl = byId<HTMLInputElement>('memory-slider');
+  const maxMemMB = memSliderEl
+    ? Math.round(parseFloat(memSliderEl.value || '4') * 1024)
+    : (cfg?.max_memory_mb || 4096);
 
   const activeSessions = Object.values(runningSessions.value);
   if (activeSessions.length > 0) {
@@ -314,10 +317,10 @@ export async function launchGame(): Promise<void> {
   }
 
   Sound.init();
-  clearLaunchVisualState();
+
   clearLaunchNotice(inst.id);
   startLaunch(inst.id);
-  const launchAnimationFrameId = requestAnimationFrame(() => startLaunchSequence());
+  const launchAnimationFrameId: number | null = null;
 
   let launchCommitted = false;
   let launchInst = inst;
@@ -393,7 +396,7 @@ export async function launchGame(): Promise<void> {
     });
     launchCommitted = true;
     surfaceLaunchOutcome(res.guardian, res.healing, inst.id, inst.name);
-    endLaunchSequence();
+    
     Music.suppress();
     Sound.ui('launchSuccess');
     try {
@@ -535,7 +538,7 @@ function onGameExited(data: any, instanceId: string, instanceName: string, sessi
   endSession(instanceId);
 
   if (Object.keys(runningSessions.value).length === 0) Music.unsuppress();
-  if (selectedInstance.value?.id === instanceId) clearLaunchVisualState();
+  if (selectedInstance.value?.id === instanceId) 
 
   appendLog('system', `${instanceName || instanceId} exited with code ${exitCode}`, instanceId, instanceName);
   if (typeof data.failure_class === 'string' && data.failure_class) {

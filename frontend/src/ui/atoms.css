@@ -1,0 +1,209 @@
+/* UI primitives, visuals driven by the :root CSS vars from style.css */
+/* so the theme engine repaints them without any rerender */
+
+/* Button ------------------------------------------------------------------ */
+.cp-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  justify-content: center;
+  height: 36px;
+  padding: 0 16px;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: -0.1px;
+  border: 1px solid transparent;
+  border-radius: var(--r-md);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 120ms ease, color 120ms ease, transform 120ms ease, border-color 120ms;
+  color: var(--text);
+  background: var(--surface-2);
+}
+.cp-btn:active:not([disabled]) { transform: translateY(0.5px); }
+.cp-btn[disabled] { cursor: not-allowed; opacity: 0.5; }
+
+.cp-btn--sm { height: 28px; padding: 0 12px; font-size: 12px; gap: 6px; border-radius: var(--r-sm); }
+.cp-btn--md { /* default */ }
+.cp-btn--lg { height: 44px; padding: 0 20px; font-size: 14px; gap: 10px; }
+.cp-btn--full { width: 100%; }
+
+.cp-btn--primary { background: var(--accent-fill); color: var(--accent-on); border-color: transparent; }
+.cp-btn--primary:hover:not([disabled]) { background: var(--accent-fill-hover); }
+
+.cp-btn--secondary { background: var(--surface-2); color: var(--text); border-color: var(--line); }
+.cp-btn--secondary:hover:not([disabled]) { background: var(--surface-3); }
+
+.cp-btn--soft { background: var(--accent-softer); color: var(--accent); border-color: var(--accent-line); }
+.cp-btn--soft:hover:not([disabled]) { background: var(--accent-soft); }
+
+.cp-btn--ghost { background: transparent; color: var(--text); border-color: transparent; }
+.cp-btn--ghost:hover:not([disabled]) { background: var(--surface-3); }
+
+.cp-btn--danger { background: oklch(0.60 0.18 25); color: oklch(0.99 0.02 25); border-color: transparent; }
+.cp-btn--danger:hover:not([disabled]) { background: oklch(0.65 0.18 25); }
+
+/* IconButton -------------------------------------------------------------- */
+.cp-ibtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px; height: 32px;
+  border: none;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+.cp-ibtn:hover:not([disabled]) { background: var(--surface-3); color: var(--text); }
+.cp-ibtn--active { background: var(--accent-soft); color: var(--accent); }
+.cp-ibtn[disabled] { opacity: 0.45; cursor: not-allowed; }
+.cp-ibtn--danger:hover:not([disabled]) { background: oklch(0.70 0.18 25 / 0.18); color: var(--err); }
+
+/* Pill -------------------------------------------------------------------- */
+.cp-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.1px;
+  border: 1px solid var(--line);
+  background: var(--surface-3);
+  color: var(--text-dim);
+}
+.cp-pill--accent { background: var(--accent-soft); color: var(--accent); border-color: var(--accent-line); }
+.cp-pill--ok   { background: oklch(0.78 0.14 150 / 0.14); color: var(--ok);   border-color: oklch(0.78 0.14 150 / 0.28); }
+.cp-pill--warn { background: oklch(0.80 0.14 70  / 0.14); color: var(--warn); border-color: oklch(0.80 0.14 70  / 0.28); }
+.cp-pill--err  { background: oklch(0.70 0.18 25  / 0.14); color: var(--err);  border-color: oklch(0.70 0.18 25  / 0.28); }
+.cp-pill--info { background: oklch(0.78 0.10 240 / 0.14); color: var(--info); border-color: oklch(0.78 0.10 240 / 0.28); }
+
+/* Kbd --------------------------------------------------------------------- */
+.cp-kbd {
+  font-family: inherit;
+  font-size: 10.5px;
+  font-weight: 500;
+  padding: 2px 6px;
+  border-radius: 5px;
+  background: var(--surface-3);
+  color: var(--text-dim);
+  border: 1px solid var(--line);
+  border-bottom-width: 2px;
+}
+
+/* Input ------------------------------------------------------------------- */
+.cp-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 36px;
+  padding: 0 12px;
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  transition: box-shadow 120ms, border-color 120ms;
+  min-width: 0;
+}
+.cp-field--focused { border-color: var(--accent-line); box-shadow: 0 0 0 3px var(--accent-ring); }
+.cp-field input {
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--text);
+  font-size: 13px;
+}
+
+/* Card -------------------------------------------------------------------- */
+.cp-card {
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+}
+
+/* Segmented --------------------------------------------------------------- */
+.cp-seg {
+  display: inline-flex;
+  padding: 3px;
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  gap: 2px;
+}
+.cp-seg > button {
+  height: 26px;
+  padding: 0 10px;
+  border: none;
+  border-radius: calc(var(--r-sm) - 2px);
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 120ms, color 120ms;
+}
+.cp-seg > button[data-active="true"] {
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 0 1px 2px rgba(0,0,0,0.15);
+}
+
+/* Meter ------------------------------------------------------------------- */
+.cp-meter {
+  height: 4px;
+  border-radius: 999px;
+  background: var(--surface-3);
+  overflow: hidden;
+}
+.cp-meter > span {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+  transition: width 200ms ease;
+}
+.cp-meter--ok > span   { background: var(--ok); }
+.cp-meter--warn > span { background: var(--warn); }
+.cp-meter--err > span  { background: var(--err); }
+
+/* Section heading --------------------------------------------------------- */
+.cp-section-head {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.cp-section-head .cp-section-eyebrow {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-mute);
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  margin-bottom: 2px;
+}
+.cp-section-head h2 {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: -0.4px;
+}
+.cp-section-head .cp-section-action {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--accent);
+  font-size: 12.5px;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  border-radius: var(--r-sm);
+}
+.cp-section-head .cp-section-action:hover { background: var(--accent-softer); }

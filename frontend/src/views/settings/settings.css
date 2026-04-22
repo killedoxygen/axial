@@ -1,0 +1,141 @@
+/* Settings page: left rail nav + stacked SettingsCard sections. */
+
+.cp-settings {
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  gap: 24px;
+  padding: 24px 28px 40px;
+}
+@media (max-width: 880px) {
+  .cp-settings { grid-template-columns: 1fr; }
+}
+
+.cp-settings-rail h1 {
+  margin: 0 0 14px;
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: -0.4px;
+}
+.cp-settings-rail-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.cp-settings-rail-btn {
+  padding: 9px 10px;
+  border: none;
+  cursor: pointer;
+  text-align: left;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: transparent;
+  color: var(--text-dim);
+  border-radius: var(--r-sm);
+  font-size: 13px;
+  font-weight: 500;
+  font-family: inherit;
+  transition: background 120ms, color 120ms;
+}
+.cp-settings-rail-btn:hover { background: var(--surface-3); color: var(--text); }
+.cp-settings-rail-btn[data-active="true"] {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.cp-settings-body {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+}
+
+.cp-settings-card {
+  padding: 18px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 20px;
+  align-items: center;
+}
+.cp-settings-card--stack {
+  grid-template-columns: 1fr;
+  align-items: stretch;
+}
+.cp-settings-card-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: -0.1px;
+}
+.cp-settings-card-desc {
+  font-size: 12.5px;
+  color: var(--text-dim);
+  margin-top: 4px;
+  max-width: 460px;
+  line-height: 1.5;
+}
+.cp-settings-card-control {
+  min-width: 0;
+  display: flex;
+  justify-content: flex-end;
+}
+.cp-settings-card--stack .cp-settings-card-control {
+  margin-top: 14px;
+  justify-content: stretch;
+}
+
+/* Accent swatch row */
+.cp-swatch-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.cp-swatch {
+  width: 30px; height: 30px;
+  border-radius: 999px;
+  cursor: pointer;
+  border: 2px solid transparent;
+  transition: transform 120ms, box-shadow 120ms;
+  padding: 0;
+}
+.cp-swatch[data-active="true"] {
+  border-color: var(--text);
+  transform: scale(1.08);
+  box-shadow: 0 0 0 3px color-mix(in oklch, currentColor 25%, transparent);
+}
+
+/* Toggle ----------------------------------------------------------------- */
+.cp-toggle {
+  width: 42px; height: 24px;
+  border-radius: 999px;
+  background: var(--surface-3);
+  border: 1px solid var(--line);
+  position: relative;
+  cursor: pointer;
+  transition: background 160ms, border-color 160ms;
+  flex-shrink: 0;
+  padding: 0;
+}
+.cp-toggle[data-on="true"] {
+  background: var(--accent-fill);
+  border-color: transparent;
+}
+.cp-toggle::after {
+  content: "";
+  position: absolute;
+  top: 2px; left: 2px;
+  width: 18px; height: 18px;
+  border-radius: 50%;
+  background: var(--text);
+  transition: left 180ms ease, background 180ms;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.25);
+}
+.cp-toggle[data-on="true"]::after {
+  left: 20px;
+  background: var(--accent-on);
+}

@@ -1,0 +1,99 @@
+/* Onboarding overlay shown on first run */
+
+.cp-ob-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+  background:
+    radial-gradient(circle at 30% 20%, var(--accent-soft), transparent 60%),
+    radial-gradient(circle at 80% 100%, var(--accent-softer), transparent 55%),
+    var(--bg-deep);
+  animation: cp-fade-in 200ms ease;
+}
+
+.cp-ob-card {
+  width: min(560px, 100%);
+  max-height: calc(100vh - 64px);
+  overflow: auto;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-xl);
+  box-shadow: var(--shadow);
+  padding: 36px 36px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+
+.cp-ob-step {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  animation: cp-float-up 200ms ease;
+}
+
+.cp-ob-title {
+  margin: 0;
+  font-size: 28px;
+  font-weight: 600;
+  letter-spacing: -0.6px;
+  color: var(--text);
+}
+
+.cp-ob-sub {
+  margin: 0;
+  font-size: 14px;
+  color: var(--text-dim);
+  line-height: 1.5;
+}
+
+.cp-ob-dots {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  justify-content: center;
+}
+.cp-ob-dot {
+  width: 7px; height: 7px;
+  border-radius: 999px;
+  background: var(--surface-3);
+  transition: background 160ms, width 160ms;
+}
+.cp-ob-dot[data-active="true"] {
+  background: var(--accent);
+  width: 22px;
+}
+
+.cp-ob-footer {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.cp-ob-choice {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 14px 16px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+  transition: background 120ms, border-color 120ms;
+}
+.cp-ob-choice:hover { background: var(--surface-3); }
+.cp-ob-choice[data-active="true"] {
+  background: var(--accent-softer);
+  border-color: var(--accent-line);
+  color: var(--accent);
+}
+.cp-ob-choice-title { font-weight: 600; font-size: 14px; }
+.cp-ob-choice-sub { font-size: 12px; color: var(--text-mute); }
+.cp-ob-choice[data-active="true"] .cp-ob-choice-sub { color: var(--accent); opacity: 0.8; }

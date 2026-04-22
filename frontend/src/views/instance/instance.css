@@ -1,0 +1,167 @@
+/* Instance detail layout. */
+
+.cp-instance-hero {
+  position: relative;
+  padding: 32px 36px 24px;
+  overflow: hidden;
+  min-height: 220px;
+}
+.cp-instance-hero-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.cp-instance-hero-gradient {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(180deg, transparent 40%, var(--surface) 100%);
+  pointer-events: none;
+}
+.cp-instance-hero-body {
+  position: relative;
+  display: flex;
+  gap: 22px;
+  align-items: flex-end;
+  flex-wrap: wrap;
+}
+.cp-instance-avatar {
+  width: 120px; height: 120px;
+  border-radius: var(--r-lg);
+  background: rgba(0,0,0,0.35);
+  backdrop-filter: blur(8px);
+  border: 1px solid rgba(255,255,255,0.18);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: white;
+  font-size: 40px;
+  font-weight: 700;
+  letter-spacing: -1px;
+  flex-shrink: 0;
+}
+.cp-instance-title {
+  margin: 0;
+  font-size: 34px;
+  font-weight: 600;
+  color: white;
+  letter-spacing: -0.8px;
+  text-shadow: 0 1px 12px rgba(0,0,0,0.3);
+}
+.cp-instance-meta {
+  margin-top: 6px;
+  font-size: 13px;
+  color: rgba(255,255,255,0.82);
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+.cp-instance-heading-pills {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+.cp-instance-hero-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.cp-instance-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 0 32px;
+  border-bottom: 1px solid var(--line);
+  overflow-x: auto;
+}
+.cp-instance-tabs button {
+  padding: 14px 12px;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  position: relative;
+  letter-spacing: -0.1px;
+  white-space: nowrap;
+}
+.cp-instance-tabs button[data-active="true"] { color: var(--text); }
+.cp-instance-tabs button[data-active="true"]::after {
+  content: "";
+  position: absolute;
+  left: 8px; right: 8px; bottom: -1px;
+  height: 2px;
+  background: var(--accent);
+  border-radius: 2px;
+}
+
+.cp-instance-body {
+  padding: 24px 32px 40px;
+  display: grid;
+  grid-template-columns: 1fr 300px;
+  gap: 22px;
+}
+@media (max-width: 900px) {
+  .cp-instance-body { grid-template-columns: 1fr; }
+}
+.cp-instance-main { display: flex; flex-direction: column; gap: 18px; }
+.cp-instance-side { display: flex; flex-direction: column; gap: 14px; }
+
+/* Quick action row in side panel */
+.cp-quick-action {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 10px;
+  background: transparent;
+  border: none;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  border-radius: var(--r-sm);
+  text-align: left;
+}
+.cp-quick-action:hover { background: var(--surface-3); }
+.cp-quick-action--danger { color: var(--err); }
+.cp-quick-action--danger:hover { background: oklch(0.70 0.18 25 / 0.12); }
+
+/* Contribution grid (sessions) */
+.cp-contrib {
+  display: grid;
+  grid-auto-flow: column;
+  grid-template-rows: repeat(7, 12px);
+  gap: 3px;
+  width: fit-content;
+}
+.cp-contrib-cell {
+  width: 12px; height: 12px;
+  border-radius: 2.5px;
+  background: var(--surface-3);
+}
+.cp-contrib-cell[data-level="1"] { background: color-mix(in oklch, var(--accent) 20%, var(--surface-3)); }
+.cp-contrib-cell[data-level="2"] { background: color-mix(in oklch, var(--accent) 40%, var(--surface-3)); }
+.cp-contrib-cell[data-level="3"] { background: color-mix(in oklch, var(--accent) 65%, var(--surface-3)); }
+.cp-contrib-cell[data-level="4"] { background: var(--accent); }
+
+.cp-meta-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+.cp-meta-row .cp-dim { color: var(--text-dim); }
+
+/* Key/value table in overview */
+.cp-kv {
+  display: grid;
+  grid-template-columns: 120px 1fr;
+  row-gap: 8px;
+  column-gap: 12px;
+  font-size: 12.5px;
+}
+.cp-kv dt { color: var(--text-dim); }
+.cp-kv dd { margin: 0; color: var(--text); font-weight: 500; }
