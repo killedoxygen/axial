@@ -3,10 +3,9 @@ import { useState } from 'preact/hooks';
 import { Button, Input } from '../../ui/Atoms';
 import { Slider } from '../../ui/Slider';
 import { Icon } from '../../ui/Icons';
-import { useTheme } from '../../hooks/use-theme';
 import { ColorField } from '../settings/ColorField';
 import { applyTheme } from '../../theme';
-import { local, PRESET_HUES } from '../../state';
+import { local } from '../../state';
 import { Music } from '../../music';
 import { Sound, playSliderSound } from '../../sound';
 import { api } from '../../api';
@@ -16,43 +15,47 @@ import { toast } from '../../toast';
 import { errMessage, fmtMem, getMemoryRecommendation } from '../../utils';
 import './onboarding.css';
 
-type Step = 'welcome' | 'memory' | 'theme' | 'music' | 'done';
+type Stage = 'name' | 'memory' | 'color' | 'music';
+const ORDER: Stage[] = ['name', 'memory', 'color', 'music'];
 
-const ORDER: Step[] = ['welcome', 'memory', 'theme', 'music', 'done'];
+function Words({ text }: { text: string }): JSX.Element {
+  const parts = text.split(' ');
+  return (
+    <>
+      {parts.map((w, i) => (
+        <span class="cp-ob-word" style={{ ['--i' as any]: String(i) }}>
+          {w}
+          {i < parts.length - 1 ? ' ' : ''}
+        </span>
+      ))}
+    </>
+  );
+}
 
 export function Onboarding(): JSX.Element | null {
-  const theme = useTheme();
-  const [step, setStep] = useState<Step>('welcome');
-  const [username, setUsername] = useState('Player');
-  const totalGB = systemInfo.value?.total_memory_mb ? Math.floor(systemInfo.value.total_memory_mb / 1024) : 16;
+  const totalGB = systemInfo.value?.total_memory_mb
+    ? Math.floor(systemInfo.value.total_memory_mb / 1024)
+    : 16;
   const rec = getMemoryRecommendation(totalGB);
+
+  const [stage, setStage] = useState<Stage>('name');
+  const [username, setUsername] = useState('');
   const [memory, setMemory] = useState<number>(rec.rec);
   const [hue, setHue] = useState<number>(local.customHue);
   const [vibrancy, setVibrancy] = useState<number>(local.customVibrancy);
-  const [musicChoice, setMusicChoice] = useState<boolean>(true);
+  const [musicEnabled, setMusicEnabled] = useState<boolean | null>(null);
   const [saving, setSaving] = useState(false);
+  const [dissolving, setDissolving] = useState(false);
 
-  if (!showOnboardingOverlay.value) return null;
-
-  const idx = ORDER.indexOf(step);
-  const isFirst = idx === 0;
-  const isLast = idx === ORDER.length - 1;
+  const idx = ORDER.indexOf(stage);
+  const nameValid = username.trim().length > 0;
 
   const advance = (): void => {
-    const next = ORDER[Math.min(ORDER.length - 1, idx + 1)];
-    setStep(next);
-  };
-  const back = (): void => {
-    const prev = ORDER[Math.max(0, idx - 1)];
-    setStep(prev);
-    Sound.ui('soft');
-  };
-
-  const applyPreset = (id: string): void => {
-    const h = PRESET_HUES[id];
-    if (h == null) return;
-    setHue(h);
-    applyTheme(id, null, { silent: true, vibrancy, lightness: local.lightness });
+    const next = ORDER[idx + 1];
+    if (next) {
+      setStage(next);
+      Sound.ui('click');
+    }
   };
 
   const applyCustom = (h: number, v: number): void => {
@@ -61,177 +64,158 @@ export function Onboarding(): JSX.Element | null {
     applyTheme('custom', h, { silent: true, vibrancy: v, lightness: local.lightness });
   };
 
-  const finish = async (): Promise<void> => {
+  const commit = async (): Promise<void> => {
+    if (saving || musicEnabled == null) return;
     setSaving(true);
     try {
       const r: any = await api('PUT', '/config', {
         username: username.trim() || 'Player',
         max_memory_mb: Math.round(memory * 1024),
-        music_enabled: musicChoice,
+        music_enabled: musicEnabled,
         music_volume: 5,
       });
       if (r.error) throw new Error(r.error);
       config.value = r;
       await api('POST', '/onboarding/complete');
-      Music.applyConfig({ music_enabled: musicChoice, music_volume: 5 });
-      if (musicChoice) void Music.play();
-      showOnboardingOverlay.value = false;
+      Music.applyConfig({ music_enabled: musicEnabled, music_volume: 5 });
+      if (musicEnabled) void Music.play();
+      setDissolving(true);
+      window.setTimeout(() => { showOnboardingOverlay.value = false; }, 560);
     } catch (err) {
-      toast(`Failed to finish onboarding: ${errMessage(err)}`);
-    } finally {
+      toast(`Couldn't finish onboarding: ${errMessage(err)}`);
       setSaving(false);
     }
   };
 
+  const recapChips: JSX.Element[] = [];
+  if (idx > 0) recapChips.push(
+    <span class="cp-ob-chip" key="name">{username.trim() || 'Player'}</span>,
+  );
+  if (idx > 1) recapChips.push(
+    <span class="cp-ob-chip" key="mem">{fmtMem(memory)}</span>,
+  );
+  if (idx > 2) recapChips.push(
+    <span
+      class="cp-ob-chip cp-ob-chip--color"
+      key="color"
+      aria-label="Chosen color"
+      style={{ ['--swatch' as any]: `oklch(0.78 0.14 ${hue})` }}
+    />,
+  );
+
   return (
-    <div class="cp-ob-overlay">
-      <div class="cp-ob-card">
-        {step === 'welcome' && (
-          <div class="cp-ob-step">
-            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-              <img src="logo.svg" class="cp-logo" alt="" width="40" height="40" />
-              <div>
-                <h1 class="cp-ob-title">Welcome to Croopor</h1>
-                <p class="cp-ob-sub" style={{ marginTop: 4 }}>A focused Minecraft launcher. Let's get you set up.</p>
-              </div>
-            </div>
-            <div>
-              <div style={{ fontSize: 12, fontWeight: 600, color: theme.n.textDim, marginBottom: 6 }}>Player name</div>
-              <Input value={username} onChange={setUsername} placeholder="Player" autoFocus
-                onKeyDown={(e) => { if (e.key === 'Enter' && username.trim()) advance(); }} />
-              <div style={{ fontSize: 11, color: theme.n.textMute, marginTop: 6 }}>You can change this later in settings.</div>
-            </div>
-          </div>
-        )}
+    <div class={`cp-ob-root${dissolving ? ' is-dissolving' : ''}`}>
+      <div class="cp-ob-column">
+        {recapChips.length > 0 && <div class="cp-ob-recap">{recapChips}</div>}
 
-        {step === 'memory' && (
-          <div class="cp-ob-step">
-            <h1 class="cp-ob-title">Memory allocation</h1>
-            <p class="cp-ob-sub">Your system has about {totalGB} GB of RAM. We recommend {rec.rec} GB for Minecraft.</p>
-            <div>
-              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
-                <span style={{ fontSize: 12, fontWeight: 600, color: theme.n.textDim }}>Max memory</span>
-                <span style={{ fontSize: 12, fontWeight: 700, color: theme.n.text }}>{fmtMem(memory)}</span>
+        <div class="cp-ob-stage" key={stage}>
+          {stage === 'name' && (
+            <>
+              <h1 class="cp-ob-headline"><Words text="What should we call you?" /></h1>
+              <div class="cp-ob-widget cp-ob-namefield">
+                <Input
+                  value={username}
+                  onChange={setUsername}
+                  placeholder="Your name"
+                  autoFocus
+                  onKeyDown={(e) => { if (e.key === 'Enter' && nameValid) advance(); }}
+                />
+                {/* Placeholder slot for future Microsoft-auth sign-in. Disabled on purpose;
+                    when MSA lands, this becomes the primary path and the input the fallback. */}
+                <button class="cp-ob-msa" disabled type="button" aria-disabled="true" tabIndex={-1}>
+                  <svg class="cp-ob-msa-mark" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+                    <rect x="0" y="0" width="7" height="7" fill="#f25022" />
+                    <rect x="9" y="0" width="7" height="7" fill="#7fba00" />
+                    <rect x="0" y="9" width="7" height="7" fill="#00a4ef" />
+                    <rect x="9" y="9" width="7" height="7" fill="#ffb900" />
+                  </svg>
+                  <span class="cp-ob-msa-label">Sign in with your Minecraft account</span>
+                  <span class="cp-ob-msa-soon">Coming soon</span>
+                </button>
               </div>
-              <Slider
-                value={memory}
-                min={1}
-                max={totalGB}
-                step={0.5}
-                recommended={[Math.max(2, rec.rec - 2), Math.min(totalGB, rec.rec + 2)]}
-                onChange={(v) => {
-                  setMemory(v);
-                  playSliderSound(v / totalGB, 'memory');
-                }}
-                ariaLabel="Max memory in gigabytes"
-              />
-              <div style={{ fontSize: 11, color: theme.n.textMute, marginTop: 4 }}>
-                {memory < 2 ? 'low, may stutter' :
-                  memory > totalGB * 0.75 ? 'leave some room for your OS' :
-                  rec.text}
+              <div class={`cp-ob-hint${nameValid ? ' is-visible' : ''}`}>
+                Press <kbd>Enter</kbd> to continue
               </div>
-            </div>
-          </div>
-        )}
+            </>
+          )}
 
-        {step === 'theme' && (
-          <div class="cp-ob-step">
-            <h1 class="cp-ob-title">Pick your vibe</h1>
-            <p class="cp-ob-sub">Pick a preset, then fine tune if you want. Every color you pick derives its own hover, tint, and contrast automatically.</p>
-            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-              {Object.entries(PRESET_HUES).map(([id, h]) => {
-                const active = local.theme === id;
-                return (
+          {stage === 'memory' && (
+            <>
+              <h1 class="cp-ob-headline"><Words text="How much memory can Minecraft borrow?" /></h1>
+              <p class="cp-ob-subline">
+                Your system has about {totalGB} GB. {rec.rec} GB is a comfortable starting point.
+              </p>
+              <div class="cp-ob-widget">
+                <div class="cp-ob-memreading">{fmtMem(memory)}</div>
+                <Slider
+                  value={memory}
+                  min={1}
+                  max={totalGB}
+                  step={0.5}
+                  recommended={[Math.max(2, rec.rec - 2), Math.min(totalGB, rec.rec + 2)]}
+                  onChange={(v) => {
+                    setMemory(v);
+                    playSliderSound(v / totalGB, 'memory');
+                  }}
+                  ariaLabel="Max memory in gigabytes"
+                />
+              </div>
+              <div class="cp-ob-cta">
+                <Button size="lg" onClick={advance}>Continue</Button>
+              </div>
+            </>
+          )}
+
+          {stage === 'color' && (
+            <>
+              <h1 class="cp-ob-headline"><Words text="Pick a mood." /></h1>
+              <p class="cp-ob-subline">Drag anywhere. The whole launcher learns your color.</p>
+              <div class="cp-ob-widget">
+                <ColorField
+                  hue={hue}
+                  vibrancy={vibrancy}
+                  onChange={applyCustom}
+                  onEnd={() => Sound.ui('theme')}
+                />
+              </div>
+              <div class="cp-ob-cta">
+                <Button size="lg" onClick={advance}>Continue</Button>
+              </div>
+            </>
+          )}
+
+          {stage === 'music' && (
+            <>
+              <h1 class="cp-ob-headline"><Words text="Quiet, or a little atmosphere?" /></h1>
+              <p class="cp-ob-subline">Ambient music pauses itself when the game starts.</p>
+              <div class="cp-ob-widget">
+                <div class="cp-ob-pills">
                   <button
-                    key={id}
-                    onClick={() => applyPreset(id)}
-                    style={{
-                      display: 'inline-flex', alignItems: 'center', gap: 8,
-                      padding: '6px 12px 6px 8px',
-                      borderRadius: 999,
-                      border: `1px solid ${active ? theme.accent.line : theme.n.line}`,
-                      background: active ? theme.accent.softer : theme.n.surface2,
-                      color: active ? theme.accent.base : theme.n.text,
-                      fontSize: 12, fontWeight: 600,
-                      cursor: 'pointer',
-                      textTransform: 'capitalize',
-                    }}
+                    class="cp-ob-pill"
+                    data-active={musicEnabled === true}
+                    onClick={() => { setMusicEnabled(true); Sound.ui('affirm'); }}
+                    type="button"
                   >
-                    <span style={{ width: 14, height: 14, borderRadius: 999, background: `oklch(0.78 0.14 ${h})` }} />
-                    {id}
+                    <Icon name="music" size={16} />
+                    <span>Ambient music</span>
                   </button>
-                );
-              })}
-            </div>
-            <ColorField hue={hue} vibrancy={vibrancy} onChange={applyCustom} onEnd={() => Sound.ui('theme')} />
-          </div>
-        )}
-
-        {step === 'music' && (
-          <div class="cp-ob-step">
-            <h1 class="cp-ob-title">Background music</h1>
-            <p class="cp-ob-sub">A relaxed ambient track while you're in the launcher. Pauses automatically when the game is running.</p>
-            <div style={{ display: 'flex', gap: 10 }}>
-              <button
-                class="cp-ob-choice"
-                data-active={musicChoice === true}
-                onClick={() => { setMusicChoice(true); Sound.ui('affirm'); }}
-                style={{ flex: 1 }}
-              >
-                <div class="cp-ob-choice-title">
-                  <Icon name="music" size={16} style={{ display: 'inline', verticalAlign: '-2px', marginRight: 6 }} />
-                  Enable music
+                  <button
+                    class="cp-ob-pill"
+                    data-active={musicEnabled === false}
+                    onClick={() => { setMusicEnabled(false); Sound.ui('soft'); }}
+                    type="button"
+                  >
+                    <Icon name="music-off" size={16} />
+                    <span>Silent launcher</span>
+                  </button>
                 </div>
-                <div class="cp-ob-choice-sub">Downloaded on first play (~12 MB), then works offline.</div>
-              </button>
-              <button
-                class="cp-ob-choice"
-                data-active={musicChoice === false}
-                onClick={() => { setMusicChoice(false); Sound.ui('soft'); }}
-                style={{ flex: 1 }}
-              >
-                <div class="cp-ob-choice-title">
-                  <Icon name="music-off" size={16} style={{ display: 'inline', verticalAlign: '-2px', marginRight: 6 }} />
-                  Silent launcher
-                </div>
-                <div class="cp-ob-choice-sub">No ambient audio in the launcher.</div>
-              </button>
-            </div>
-          </div>
-        )}
-
-        {step === 'done' && (
-          <div class="cp-ob-step">
-            <div style={{
-              width: 72, height: 72, borderRadius: '50%',
-              background: theme.accent.soft,
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              color: theme.accent.base,
-            }}>
-              <Icon name="check" size={36} stroke={2.4} />
-            </div>
-            <h1 class="cp-ob-title">You're all set</h1>
-            <p class="cp-ob-sub">
-              Head to <strong>New instance</strong> to create your first Minecraft setup, or explore
-              Settings to tune performance and appearance further.
-            </p>
-          </div>
-        )}
-
-        <div class="cp-ob-dots">
-          {ORDER.map(s => <span key={s} class="cp-ob-dot" data-active={s === step} />)}
-        </div>
-
-        <div class="cp-ob-footer">
-          {!isFirst && <Button variant="ghost" icon="chevron-left" onClick={back}>Back</Button>}
-          <div style={{ flex: 1 }} />
-          {isLast ? (
-            <Button icon="check" onClick={finish} disabled={saving}>{saving ? 'Saving…' : 'Finish'}</Button>
-          ) : (
-            <Button
-              onClick={() => { Sound.ui('click'); advance(); }}
-              disabled={step === 'welcome' && !username.trim()}
-            >Continue</Button>
+              </div>
+              <div class={`cp-ob-cta cp-ob-cta--gated${musicEnabled != null ? ' is-visible' : ''}`}>
+                <Button size="lg" onClick={commit} disabled={saving || musicEnabled == null}>
+                  {saving ? 'Starting…' : "Let's go"}
+                </Button>
+              </div>
+            </>
           )}
         </div>
       </div>

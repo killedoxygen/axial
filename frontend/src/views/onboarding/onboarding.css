@@ -1,99 +1,301 @@
-/* Onboarding overlay shown on first run */
+/* Onboarding overlay. One canvas, one cinematic beat. */
+/* All animations are one-shot; the component teardown reclaims them. */
 
-.cp-ob-overlay {
+.cp-ob-root {
   position: fixed;
   inset: 0;
   z-index: 1000;
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 32px;
-  background:
-    radial-gradient(circle at 30% 20%, var(--accent-soft), transparent 60%),
-    radial-gradient(circle at 80% 100%, var(--accent-softer), transparent 55%),
-    var(--bg-deep);
-  animation: cp-fade-in 200ms ease;
+  padding: 48px 32px;
+  color: var(--text);
+  background: var(--bg);
+  animation: cp-ob-root-in 320ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
 }
 
-.cp-ob-card {
-  width: min(560px, 100%);
-  max-height: calc(100vh - 64px);
-  overflow: auto;
-  background: var(--surface);
+@keyframes cp-ob-root-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+.cp-ob-root.is-dissolving {
+  animation: cp-ob-dissolve 560ms cubic-bezier(0.4, 0, 0.2, 1) forwards;
+  pointer-events: none;
+}
+
+@keyframes cp-ob-dissolve {
+  from { opacity: 1; transform: scale(1); }
+  to   { opacity: 0; transform: scale(1.015); }
+}
+
+/* Column ------------------------------------------------------------------ */
+
+.cp-ob-column {
+  width: min(580px, 100%);
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+}
+
+/* Recap chips ------------------------------------------------------------- */
+
+.cp-ob-recap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 22px;
+  animation: cp-ob-recap-in 280ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+
+@keyframes cp-ob-recap-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to   { opacity: 1; transform: none; }
+}
+
+.cp-ob-chip {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-dim);
+  background: var(--surface-2);
   border: 1px solid var(--line);
-  border-radius: var(--r-xl);
-  box-shadow: var(--shadow);
-  padding: 36px 36px 24px;
+  border-radius: 999px;
+  letter-spacing: -0.1px;
+  transition: background-color 240ms ease, color 240ms ease, border-color 240ms ease;
+}
+
+.cp-ob-chip--color {
+  padding: 0;
+  width: 22px;
+  background: var(--swatch, var(--accent));
+  border-color: var(--accent-line);
+}
+
+/* Stage ------------------------------------------------------------------- */
+
+.cp-ob-stage {
   display: flex;
   flex-direction: column;
   gap: 22px;
+  animation: cp-ob-stage-in 360ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
 }
 
-.cp-ob-step {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-  animation: cp-float-up 200ms ease;
+@keyframes cp-ob-stage-in {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: none; }
 }
 
-.cp-ob-title {
+.cp-ob-headline {
   margin: 0;
-  font-size: 28px;
-  font-weight: 600;
-  letter-spacing: -0.6px;
+  font-size: clamp(28px, 4.4vw, 40px);
+  font-weight: 500;
+  letter-spacing: -0.7px;
+  line-height: 1.12;
   color: var(--text);
 }
 
-.cp-ob-sub {
+.cp-ob-word {
+  display: inline-block;
+  animation: cp-ob-word-rise 420ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
+  animation-delay: calc((var(--i, 0) * 38ms) + 140ms);
+}
+
+@keyframes cp-ob-word-rise {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: none; }
+}
+
+.cp-ob-subline {
   margin: 0;
   font-size: 14px;
   color: var(--text-dim);
-  line-height: 1.5;
+  line-height: 1.55;
+  letter-spacing: -0.1px;
 }
 
-.cp-ob-dots {
+/* Widget area ------------------------------------------------------------- */
+
+.cp-ob-widget {
   display: flex;
-  gap: 6px;
-  align-items: center;
-  justify-content: center;
+  flex-direction: column;
+  gap: 14px;
 }
-.cp-ob-dot {
-  width: 7px; height: 7px;
+
+/* Name stage input: a little taller and larger than the default Atom */
+.cp-ob-namefield .cp-field {
+  height: 52px;
+  padding: 0 18px;
+  border-radius: 14px;
+  transition: box-shadow 200ms ease, border-color 200ms ease, background-color 240ms ease;
+}
+
+/* Override the Atom's accent-colored focus ring: a neutral high-contrast border
+   reads more professional here than a colored glow. */
+.cp-ob-namefield .cp-field.cp-field--focused {
+  border-color: var(--text);
+  box-shadow: none;
+}
+
+.cp-ob-namefield .cp-field input {
+  font-size: 16px;
+  font-weight: 500;
+}
+
+/* Disabled MSA sign-in placeholder */
+.cp-ob-msa {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  height: 48px;
+  padding: 0 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface-2);
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  text-align: left;
+  opacity: 0.58;
+  cursor: not-allowed;
+  transition: background-color 240ms ease, border-color 240ms ease;
+}
+
+.cp-ob-msa-mark {
+  flex-shrink: 0;
+  display: block;
+  border-radius: 2px;
+}
+
+.cp-ob-msa-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cp-ob-msa-soon {
+  flex-shrink: 0;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+  padding: 3px 8px;
   border-radius: 999px;
   background: var(--surface-3);
-  transition: background 160ms, width 160ms;
-}
-.cp-ob-dot[data-active="true"] {
-  background: var(--accent);
-  width: 22px;
+  color: var(--text-mute);
 }
 
-.cp-ob-footer {
+/* Memory reading */
+.cp-ob-memreading {
+  font-size: 30px;
+  font-weight: 500;
+  letter-spacing: -0.5px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  transition: color 240ms ease;
+}
+
+/* Music pills ------------------------------------------------------------- */
+
+.cp-ob-pills {
   display: flex;
-  align-items: center;
   gap: 10px;
 }
 
-.cp-ob-choice {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding: 14px 16px;
-  border-radius: var(--r-md);
+.cp-ob-pill {
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  height: 52px;
+  padding: 0 16px;
   border: 1px solid var(--line);
+  border-radius: 14px;
   background: var(--surface-2);
   color: var(--text);
-  cursor: pointer;
-  text-align: left;
   font: inherit;
-  transition: background 120ms, border-color 120ms;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color 200ms ease, color 200ms ease, border-color 200ms ease;
 }
-.cp-ob-choice:hover { background: var(--surface-3); }
-.cp-ob-choice[data-active="true"] {
-  background: var(--accent-softer);
-  border-color: var(--accent-line);
-  color: var(--accent);
+
+.cp-ob-pill:hover { background: var(--surface-3); }
+
+.cp-ob-pill[data-active="true"] {
+  background: var(--accent-fill);
+  color: var(--accent-on);
+  border-color: transparent;
 }
-.cp-ob-choice-title { font-weight: 600; font-size: 14px; }
-.cp-ob-choice-sub { font-size: 12px; color: var(--text-mute); }
-.cp-ob-choice[data-active="true"] .cp-ob-choice-sub { color: var(--accent); opacity: 0.8; }
+
+/* Hints and CTAs ---------------------------------------------------------- */
+
+.cp-ob-hint {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-mute);
+  opacity: 0;
+  transform: translateY(4px);
+  transition: opacity 220ms ease, transform 220ms ease;
+}
+
+.cp-ob-hint.is-visible {
+  opacity: 1;
+  transform: none;
+}
+
+.cp-ob-hint kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  height: 22px;
+  padding: 0 6px;
+  border-radius: 6px;
+  background: var(--surface-3);
+  color: var(--text-dim);
+  font: 600 11px/1 ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  border: 1px solid var(--line);
+}
+
+.cp-ob-cta {
+  display: flex;
+  justify-content: flex-start;
+  transition: opacity 240ms ease, transform 240ms ease;
+}
+
+/* Music stage: hidden until a pill is chosen. */
+.cp-ob-cta--gated {
+  opacity: 0;
+  transform: translateY(4px);
+  pointer-events: none;
+}
+
+.cp-ob-cta--gated.is-visible {
+  opacity: 1;
+  transform: none;
+  pointer-events: auto;
+}
+
+/* Reduced motion ---------------------------------------------------------- */
+
+@media (prefers-reduced-motion: reduce) {
+  .cp-ob-root,
+  .cp-ob-root *,
+  .cp-ob-root *::before,
+  .cp-ob-root *::after {
+    animation: none !important;
+    transition: opacity 120ms linear, background-color 160ms linear, color 160ms linear !important;
+  }
+  .cp-ob-word { opacity: 1 !important; transform: none !important; }
+}
