@@ -13,6 +13,7 @@ export const defaults: LocalPrefs = {
   customHue: 140,
   customVibrancy: 100,
   lightness: 0,
+  sidebarCompact: false,
   logHeight: 0,
   collapsedGroups: {},
   sidebarFilter: 'all',

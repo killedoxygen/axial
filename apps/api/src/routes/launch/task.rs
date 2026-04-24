@@ -3,7 +3,7 @@ use super::runner::trace_launch_event;
 use crate::logging::timestamp_utc;
 use crate::state::{AppState, LaunchSessionRecord};
 use axum::{Json, http::StatusCode};
-use croopor_config::{AppConfig, Instance};
+use croopor_config::{AppConfig, Instance, validate_username};
 use croopor_launcher::{GuardianSummary, LaunchGuardianContext, LaunchIntent, LaunchState};
 use serde::Deserialize;
 use serde_json::json;
@@ -55,12 +55,14 @@ pub(super) async fn prepare_launch_session(
     }
 
     let config = state.config().current();
-    let username = payload
+    let requested_username = payload
         .username
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or(config.username.as_str())
         .to_string();
+    let username = validate_username(&requested_username)
+        .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?;
     let max_memory_mb = policy::effective_max_memory(&instance, &config, payload.max_memory_mb);
     let min_memory_mb =
         policy::effective_min_memory(&instance, &config, payload.min_memory_mb, max_memory_mb);

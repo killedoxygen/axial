@@ -41,3 +41,9 @@
   gap: 8px;
   justify-content: flex-end;
 }
+.cp-dialog-error {
+  margin-top: -6px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--err);
+}

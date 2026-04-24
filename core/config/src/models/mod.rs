@@ -1,4 +1,34 @@
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+pub const USERNAME_MIN_LEN: usize = 3;
+pub const USERNAME_MAX_LEN: usize = 16;
+
+pub fn validate_username(raw: &str) -> Result<String, &'static str> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err("Enter a name.");
+    }
+    if value.len() < USERNAME_MIN_LEN {
+        return Err("At least 3 characters.");
+    }
+    if value.len() > USERNAME_MAX_LEN {
+        return Err("At most 16 characters.");
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err("Letters, numbers, and underscores only.");
+    }
+    Ok(value.to_string())
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum AppConfigValidationError {
+    #[error("invalid username: {0}")]
+    InvalidUsername(&'static str),
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppConfig {
@@ -66,10 +96,9 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
-    pub fn normalized(mut self) -> Self {
-        if self.username.is_empty() {
-            self.username = "Player".to_string();
-        }
+    pub fn normalized(mut self) -> Result<Self, AppConfigValidationError> {
+        self.username =
+            validate_username(&self.username).map_err(AppConfigValidationError::InvalidUsername)?;
         if self.max_memory_mb < 512 {
             self.max_memory_mb = 4096;
         }
@@ -89,13 +118,13 @@ impl AppConfig {
         if self.library_mode.is_empty() {
             self.library_mode = "managed".to_string();
         }
-        self
+        Ok(self)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::AppConfig;
+    use super::{AppConfig, AppConfigValidationError, validate_username};
 
     #[test]
     fn normalized_clamps_min_memory_to_max_memory() {
@@ -104,9 +133,33 @@ mod tests {
             max_memory_mb: 600,
             ..AppConfig::default()
         }
-        .normalized();
+        .normalized()
+        .expect("valid config should normalize");
 
         assert_eq!(config.max_memory_mb, 600);
         assert_eq!(config.min_memory_mb, 600);
+    }
+
+    #[test]
+    fn validate_username_trims_valid_names() {
+        assert_eq!(
+            validate_username("  Player_1  "),
+            Ok("Player_1".to_string())
+        );
+    }
+
+    #[test]
+    fn normalized_rejects_invalid_username() {
+        let err = AppConfig {
+            username: "bad name".to_string(),
+            ..AppConfig::default()
+        }
+        .normalized()
+        .expect_err("invalid username should be rejected");
+
+        assert_eq!(
+            err,
+            AppConfigValidationError::InvalidUsername("Letters, numbers, and underscores only.")
+        );
     }
 }

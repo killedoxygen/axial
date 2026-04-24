@@ -6,6 +6,16 @@ import './dialog.css';
 
 type DialogResult = boolean | string | null;
 
+interface PromptOptions {
+  title?: string;
+  placeholder?: string;
+  confirmText?: string;
+  destructive?: boolean;
+  validate?: (value: string) => string | null;
+  normalizeInput?: (value: string) => string;
+  normalizeValue?: (value: string) => string;
+}
+
 interface DialogSpec {
   kind: 'confirm' | 'prompt' | 'alert';
   title?: string;
@@ -15,6 +25,9 @@ interface DialogSpec {
   confirmText?: string;
   cancelText?: string | null;
   destructive?: boolean;
+  validate?: (value: string) => string | null;
+  normalizeInput?: (value: string) => string;
+  normalizeValue?: (value: string) => string;
   resolve: (v: DialogResult) => void;
 }
 
@@ -47,7 +60,7 @@ export function showAlert(message: string, title?: string): Promise<void> {
   });
 }
 
-export function prompt(message: string, initial = '', opts: { title?: string; placeholder?: string; confirmText?: string; destructive?: boolean } = {}): Promise<string | null> {
+export function prompt(message: string, initial = '', opts: PromptOptions = {}): Promise<string | null> {
   return new Promise(resolve => {
     current.value = {
       kind: 'prompt',
@@ -58,31 +71,25 @@ export function prompt(message: string, initial = '', opts: { title?: string; pl
       confirmText: opts.confirmText || 'Confirm',
       cancelText: 'Cancel',
       destructive: opts.destructive,
+      validate: opts.validate,
+      normalizeInput: opts.normalizeInput,
+      normalizeValue: opts.normalizeValue,
       resolve: (v) => resolve(typeof v === 'string' ? v : null),
     };
   });
 }
 
-function PromptInput({ initialValue, placeholder, onSubmit }: { initialValue?: string; placeholder?: string; onSubmit: (v: string) => void }): JSX.Element {
-  const [value, setValue] = useState(initialValue || '');
-  return (
-    <Input
-      value={value}
-      onChange={setValue}
-      placeholder={placeholder}
-      autoFocus
-      onKeyDown={(e) => { if (e.key === 'Enter') onSubmit(value); }}
-    />
-  );
-}
-
 export function DialogHost(): JSX.Element | null {
   const spec = current.value;
   const [draft, setDraft] = useState('');
+  const [touched, setTouched] = useState(false);
 
   useEffect(() => {
     if (!spec) return;
-    if (spec.kind === 'prompt') setDraft(spec.initialValue || '');
+    if (spec.kind === 'prompt') {
+      setDraft(spec.initialValue || '');
+      setTouched(false);
+    }
     const onKey = (e: KeyboardEvent): void => {
       if (e.key === 'Escape') { resolveAs(false); }
     };
@@ -92,8 +99,22 @@ export function DialogHost(): JSX.Element | null {
 
   if (!spec) return null;
 
+  const promptError = spec.kind === 'prompt' ? (spec.validate?.(draft) ?? null) : null;
+  const showPromptError = spec.kind === 'prompt' && promptError !== null && (touched || draft.length > 0);
+
   const resolveAs = (ok: boolean): void => {
-    const payload: DialogResult = spec.kind === 'prompt' ? (ok ? draft.trim() : null) : ok;
+    let payload: DialogResult = ok;
+    if (spec.kind === 'prompt') {
+      if (!ok) {
+        payload = null;
+      } else {
+        if (promptError) {
+          setTouched(true);
+          return;
+        }
+        payload = spec.normalizeValue ? spec.normalizeValue(draft) : draft.trim();
+      }
+    }
     spec.resolve(payload);
     current.value = null;
   };
@@ -104,13 +125,19 @@ export function DialogHost(): JSX.Element | null {
         {spec.title && <h2 id="cp-dlg-title" class="cp-dialog-title">{spec.title}</h2>}
         {spec.message && <p class="cp-dialog-body">{spec.message}</p>}
         {spec.kind === 'prompt' && (
-          <Input
-            value={draft}
-            onChange={setDraft}
-            placeholder={spec.placeholder}
-            autoFocus
-            onKeyDown={(e) => { if (e.key === 'Enter') resolveAs(true); }}
-          />
+          <>
+            <Input
+              value={draft}
+              onChange={(value) => {
+                setTouched(true);
+                setDraft(spec.normalizeInput ? spec.normalizeInput(value) : value);
+              }}
+              placeholder={spec.placeholder}
+              autoFocus
+              onKeyDown={(e) => { if (e.key === 'Enter') resolveAs(true); }}
+            />
+            {showPromptError && <div class="cp-dialog-error">{promptError}</div>}
+          </>
         )}
         <div class="cp-dialog-actions">
           {spec.cancelText && (
@@ -118,6 +145,7 @@ export function DialogHost(): JSX.Element | null {
           )}
           <Button
             variant={spec.destructive ? 'danger' : 'primary'}
+            disabled={spec.kind === 'prompt' && promptError !== null}
             onClick={() => resolveAs(true)}
           >{spec.confirmText}</Button>
         </div>

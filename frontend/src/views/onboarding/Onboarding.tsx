@@ -12,7 +12,8 @@ import { api } from '../../api';
 import { config, systemInfo } from '../../store';
 import { showOnboardingOverlay } from '../../ui-state';
 import { toast } from '../../toast';
-import { errMessage, fmtMem, getMemoryRecommendation, USERNAME_MAX_LEN, validateUsername } from '../../utils';
+import { clampPlayerNameInput } from '../../player-name';
+import { errMessage, fmtMem, getMemoryRecommendation, validateUsername } from '../../utils';
 import './onboarding.css';
 
 type Stage = 'name' | 'memory' | 'color' | 'music';
@@ -248,7 +249,7 @@ export function Onboarding(): JSX.Element | null {
         </div>
         <Input
           value={username}
-          onChange={(v) => setUsername(v.slice(0, USERNAME_MAX_LEN))}
+          onChange={(v) => setUsername(clampPlayerNameInput(v))}
           placeholder="Your name"
           autoFocus
           onFocus={() => setNameFocused(true)}

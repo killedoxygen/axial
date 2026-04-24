@@ -4,12 +4,9 @@ import { Icon } from '../ui/Icons';
 import { Kbd } from '../ui/Atoms';
 import { route, navigate, commandPaletteOpen, type Route } from '../ui-state';
 import { runningSessions, config } from '../store';
-import { prompt } from '../ui/Dialog';
-import { api } from '../api';
-import { toast } from '../toast';
-import { errMessage } from '../utils';
+import { promptPlayerName, savePlayerName } from '../player-name';
 import { Music, musicStateVersion } from '../music';
-import { local, saveLocalState } from '../state';
+import { local, localStateVersion, saveLocalState } from '../state';
 import { Sound } from '../sound';
 
 function CommandTrigger(): JSX.Element {
@@ -20,10 +17,11 @@ function CommandTrigger(): JSX.Element {
       onClick={() => { commandPaletteOpen.value = true; }}
       title="Search and jump to"
       data-sound-silent="true"
+      aria-label="Search and jump to"
     >
       <Icon name="search" size={13} color="var(--text-mute)" />
       <span class="cp-sidebar-search-label">Search…</span>
-      <Kbd>{isMac ? '⌘K' : 'Ctrl K'}</Kbd>
+      <span class="cp-sidebar-search-kbd"><Kbd>{isMac ? '⌘K' : 'Ctrl K'}</Kbd></span>
     </button>
   );
 }
@@ -49,10 +47,11 @@ function isItemActive(item: SidebarItem, current: Route): boolean {
   return item.children?.some(child => isItemActive(child, current)) ?? false;
 }
 
-function SidebarItemNode({ item, depth = 0 }: { item: SidebarItem; depth?: number }): JSX.Element {
+function SidebarItemNode({ item, depth = 0, compact = false }: { item: SidebarItem; depth?: number; compact?: boolean }): JSX.Element {
   const current = route.value;
   const active = isRouteActive(item.route, current);
   const childActive = !active && (item.children?.some(child => isItemActive(child, current)) ?? false);
+
   return (
     <div class="cp-sidebar-branch" data-depth={depth}>
       <button
@@ -61,6 +60,8 @@ function SidebarItemNode({ item, depth = 0 }: { item: SidebarItem; depth?: numbe
         data-child-active={childActive}
         data-depth={depth}
         onClick={() => navigate(item.route)}
+        title={compact ? item.label : undefined}
+        aria-label={item.label}
       >
         {depth > 0 && item.showConnector && (
           <span class="cp-sidebar-tree-icon" aria-hidden="true">
@@ -78,7 +79,7 @@ function SidebarItemNode({ item, depth = 0 }: { item: SidebarItem; depth?: numbe
       </button>
       {item.children?.length ? (
         <div class="cp-sidebar-children">
-          {item.children.map(child => <SidebarItemNode key={child.label} item={child} depth={depth + 1} />)}
+          {item.children.map(child => <SidebarItemNode key={child.label} item={child} depth={depth + 1} compact={compact} />)}
         </div>
       ) : null}
     </div>
@@ -92,16 +93,8 @@ function UserMenu({ onClose }: { onClose: () => void }): JSX.Element {
 
   const renameUser = async (): Promise<void> => {
     const current = config.value?.username || 'Player';
-    const next = await prompt('Display name', current, { title: 'Change name', placeholder: 'Your gamertag', confirmText: 'Save' });
-    if (!next || !next.trim() || next === current) { onClose(); return; }
-    try {
-      const res: any = await api('PUT', '/config', { username: next.trim() });
-      if (res.error) throw new Error(res.error);
-      config.value = res;
-      toast('Name updated');
-    } catch (err) {
-      toast(`Failed: ${errMessage(err)}`, 'error');
-    }
+    const next = await promptPlayerName(current);
+    if (next) await savePlayerName(next);
     onClose();
   };
 
@@ -157,7 +150,7 @@ function UserMenu({ onClose }: { onClose: () => void }): JSX.Element {
   );
 }
 
-function UserTrigger(): JSX.Element {
+function UserTrigger({ compact }: { compact: boolean }): JSX.Element {
   const [open, setOpen] = useState(false);
   const username = (config.value?.username || 'Player').slice(0, 24);
   const initial = username[0]?.toUpperCase() || 'P';
@@ -185,25 +178,37 @@ function UserTrigger(): JSX.Element {
         class="cp-sidebar-user"
         type="button"
         data-open={open}
+        data-compact={compact}
         aria-haspopup="menu"
         aria-expanded={open}
         onClick={() => setOpen(o => !o)}
+        title={compact ? username : undefined}
       >
         <div class="cp-avatar">{initial}</div>
         <div class="cp-sidebar-user-body">
           <div class="cp-sidebar-user-name">{username}</div>
           <div class="cp-sidebar-user-sub">{running > 0 ? `${running} playing` : 'online'}</div>
         </div>
-        <Icon name="chevron-up" size={14} color="var(--text-mute)" style={{
-          transform: open ? 'rotate(0deg)' : 'rotate(180deg)',
-          transition: 'transform 160ms ease',
-        }} />
+        {!compact && (
+          <Icon name="chevron-up" size={14} color="var(--text-mute)" style={{
+            transform: open ? 'rotate(0deg)' : 'rotate(180deg)',
+            transition: 'transform 160ms ease',
+          }} />
+        )}
       </button>
     </div>
   );
 }
 
 export function Sidebar(): JSX.Element {
+  localStateVersion.value;
+  const compact = local.sidebarCompact;
+
+  const toggleSidebarMode = (): void => {
+    local.sidebarCompact = !local.sidebarCompact;
+    saveLocalState();
+  };
+
   const mainGroups: SidebarGroup[] = [
     {
       title: 'Play',
@@ -232,18 +237,39 @@ export function Sidebar(): JSX.Element {
     { icon: 'settings', label: 'Settings', route: { name: 'settings' } },
   ];
 
+  const compactItems = (items: SidebarItem[]): SidebarItem[] => items.flatMap(item => {
+    if (!compact || !item.children?.length) return [item];
+    return [
+      { ...item, children: undefined },
+      ...item.children.map(child => ({ ...child, children: undefined })),
+    ];
+  });
+
   return (
-    <aside class="cp-sidebar">
+    <aside class="cp-sidebar" data-compact={compact}>
       <div class="cp-sidebar-brand">
-        <img class="cp-logo" src="logo.png" alt="" width="22" height="22" />
-        <span class="cp-brand-name">Croopor</span>
+        <div class="cp-sidebar-brand-lockup">
+          <img class="cp-logo" src="logo.png" alt="" width="22" height="22" />
+          <span class="cp-brand-name">Croopor</span>
+        </div>
+        <button
+          class="cp-sidebar-mode"
+          type="button"
+          onClick={toggleSidebarMode}
+          title={compact ? 'Expand sidebar' : 'Compact sidebar'}
+          aria-label={compact ? 'Expand sidebar' : 'Compact sidebar'}
+        >
+          <span class="cp-sidebar-mode-icon" aria-hidden="true">
+            <Icon name="chevron-left" size={16} stroke={1.9} />
+          </span>
+        </button>
       </div>
       <CommandTrigger />
       {mainGroups.map(g => (
         <div class="cp-sidebar-group" key={g.title}>
           <div class="cp-sidebar-group-title">{g.title}</div>
           <div class="cp-sidebar-items">
-            {g.items.map(it => <SidebarItemNode key={it.label} item={it} />)}
+            {compactItems(g.items).map(it => <SidebarItemNode key={it.label} item={it} compact={compact} />)}
           </div>
         </div>
       ))}
@@ -251,10 +277,10 @@ export function Sidebar(): JSX.Element {
       <div class="cp-sidebar-group">
         <div class="cp-sidebar-group-title">You</div>
         <div class="cp-sidebar-items">
-          {utilityItems.map(it => <SidebarItemNode key={it.label} item={it} />)}
+          {utilityItems.map(it => <SidebarItemNode key={it.label} item={it} compact={compact} />)}
         </div>
       </div>
-      <UserTrigger />
+      <UserTrigger compact={compact} />
     </aside>
   );
 }

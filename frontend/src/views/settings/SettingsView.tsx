@@ -10,7 +10,8 @@ import { Music, musicStateVersion } from '../../music';
 import { config, systemInfo, devMode, appVersion } from '../../store';
 import { api } from '../../api';
 import { toast } from '../../toast';
-import { errMessage, fmtMem, getMemoryRecommendation, USERNAME_MAX_LEN, validateUsername } from '../../utils';
+import { clampPlayerNameInput } from '../../player-name';
+import { errMessage, fmtMem, getMemoryRecommendation, validateUsername } from '../../utils';
 import './settings.css';
 
 type SectionId = 'appearance' | 'gameplay' | 'audio' | 'shortcuts' | 'advanced' | 'about';
@@ -86,19 +87,19 @@ function AppearanceSection(): JSX.Element {
 function GameplaySection(): JSX.Element {
   const cfg = config.value;
   const sys = systemInfo.value;
+  const savedUsername = cfg?.username || 'Player';
+  const savedMemGB = (cfg?.max_memory_mb ?? 4096) / 1024;
   const [username, setUsername] = useState(cfg?.username || 'Player');
-  const [memGB, setMemGB] = useState<number>((cfg?.max_memory_mb ?? 4096) / 1024);
-  const [dirty, setDirty] = useState(false);
+  const [memGB, setMemGB] = useState<number>(savedMemGB);
   const totalGB = sys?.total_memory_mb ? Math.floor(sys.total_memory_mb / 1024) : 16;
   const maxGB = Math.max(1, totalGB);
   const rec = getMemoryRecommendation(totalGB);
   const recZone: [number, number] = [Math.max(2, rec.rec - 2), Math.min(maxGB, rec.rec + 2)];
 
   useEffect(() => {
-    setUsername(cfg?.username || 'Player');
-    setMemGB((cfg?.max_memory_mb ?? 4096) / 1024);
-    setDirty(false);
-  }, [cfg?.username, cfg?.max_memory_mb]);
+    setUsername(savedUsername);
+    setMemGB(savedMemGB);
+  }, [savedMemGB, savedUsername]);
 
   const recText = useMemo(() => {
     if (memGB < 2) return 'Low, may stutter';
@@ -108,9 +109,11 @@ function GameplaySection(): JSX.Element {
 
   const nameError = validateUsername(username);
   const nameValid = nameError === null;
+  const showNameError = username.length > 0 && !nameValid;
+  const dirty = username !== savedUsername || memGB !== savedMemGB;
 
   const save = async (): Promise<void> => {
-    if (!nameValid) return;
+    if (!dirty || !nameValid) return;
     try {
       const res: any = await api('PUT', '/config', {
         username: username.trim(),
@@ -118,7 +121,6 @@ function GameplaySection(): JSX.Element {
       });
       if (res.error) throw new Error(res.error);
       config.value = res;
-      setDirty(false);
       toast('Saved');
     } catch (err) {
       toast(`Failed: ${errMessage(err)}`);
@@ -135,12 +137,12 @@ function GameplaySection(): JSX.Element {
         <div class="cp-settings-name">
           <Input
             value={username}
-            onChange={(v) => { setUsername(v.slice(0, USERNAME_MAX_LEN)); setDirty(true); }}
+            onChange={(v) => setUsername(clampPlayerNameInput(v))}
             placeholder="Player"
             style={{ width: 240 }}
           />
           {dirty && <Button size="sm" onClick={save} disabled={!nameValid}>Save</Button>}
-          {dirty && !nameValid && <span class="cp-settings-name-err">{nameError}</span>}
+          {showNameError && <span class="cp-settings-name-err">{nameError}</span>}
         </div>
       </SettingsCard>
       <SettingsCard
@@ -160,7 +162,6 @@ function GameplaySection(): JSX.Element {
             ticks={[1, Math.round(maxGB / 4), Math.round(maxGB / 2), Math.round(maxGB * 0.75), maxGB].filter((v, i, arr) => arr.indexOf(v) === i)}
             onChange={(v) => {
               setMemGB(v);
-              setDirty(true);
               playSliderSound(v / maxGB, 'memory');
             }}
             onCommit={() => { if (dirty) void save(); }}

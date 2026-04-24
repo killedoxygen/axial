@@ -8,10 +8,7 @@ import { Music } from '../music';
 import { local, saveLocalState } from '../state';
 import { Sound } from '../sound';
 import { applyTheme } from '../theme';
-import { prompt } from './Dialog';
-import { api } from '../api';
-import { toast } from '../toast';
-import { errMessage } from '../utils';
+import { promptPlayerName, savePlayerName } from '../player-name';
 import type { EnrichedInstance } from '../types';
 import './command-palette.css';
 
@@ -103,16 +100,8 @@ function buildCommands(): Command[] {
       perform: async () => {
         close();
         const current = config.value?.username || 'Player';
-        const next = await prompt('Display name', current, { title: 'Change name', placeholder: 'Your gamertag', confirmText: 'Save' });
-        if (!next || !next.trim() || next === current) return;
-        try {
-          const res: any = await api('PUT', '/config', { username: next.trim() });
-          if (res.error) throw new Error(res.error);
-          config.value = res;
-          toast('Name updated');
-        } catch (err) {
-          toast(`Failed: ${errMessage(err)}`, 'error');
-        }
+        const next = await promptPlayerName(current);
+        if (next) await savePlayerName(next);
       },
     },
     {
