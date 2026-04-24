@@ -3,6 +3,7 @@ import {
   IconArrowLeft,
   IconArrowRight,
   IconCheck,
+  IconBorderCornerRounded,
   IconChevronLeft,
   IconChevronRight,
   IconChevronUp,
@@ -48,6 +49,7 @@ type IconComponent = FunctionComponent<{
 }>;
 
 const REGISTRY: Record<string, IconComponent> = {
+  'border-corner-rounded': IconBorderCornerRounded as IconComponent,
   'arrow-left': IconArrowLeft as IconComponent,
   'arrow-right': IconArrowRight as IconComponent,
   'check': IconCheck as IconComponent,

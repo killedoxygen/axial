@@ -88,7 +88,7 @@ export function SetupOverlay(): JSX.Element {
   return (
     <div class="cp-setup-overlay">
       <div class="cp-setup-card">
-        <img src="logo.svg" alt="" class="cp-logo" width="48" height="48" />
+        <img src="logo.png" alt="" class="cp-logo" width="48" height="48" />
         <h1 class="cp-setup-title">Set up your library</h1>
         <p class="cp-setup-sub">
           Croopor needs a folder for instances, installed versions, and assets. It can manage one

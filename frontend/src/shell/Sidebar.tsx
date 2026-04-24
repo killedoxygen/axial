@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { Icon } from '../ui/Icons';
 import { Kbd } from '../ui/Atoms';
 import { route, navigate, commandPaletteOpen, type Route } from '../ui-state';
-import { installQueue, runningSessions, config } from '../store';
+import { runningSessions, config } from '../store';
 import { prompt } from '../ui/Dialog';
 import { api } from '../api';
 import { toast } from '../toast';
@@ -32,26 +32,56 @@ interface SidebarItem {
   icon: string;
   label: string;
   route: Route;
-  badge?: number;
+  showConnector?: boolean;
+  children?: SidebarItem[];
 }
 
 interface SidebarGroup { title: string; items: SidebarItem[]; }
 
-function SidebarItemBtn({ item }: { item: SidebarItem }): JSX.Element {
+function isRouteActive(target: Route, current: Route): boolean {
+  if (target.name !== current.name) return false;
+  if ('id' in target || 'id' in current) return 'id' in target && 'id' in current && target.id === current.id;
+  return true;
+}
+
+function isItemActive(item: SidebarItem, current: Route): boolean {
+  if (isRouteActive(item.route, current)) return true;
+  return item.children?.some(child => isItemActive(child, current)) ?? false;
+}
+
+function SidebarItemNode({ item, depth = 0 }: { item: SidebarItem; depth?: number }): JSX.Element {
   const current = route.value;
-  const active = current.name === item.route.name;
+  const active = isRouteActive(item.route, current);
+  const childActive = !active && (item.children?.some(child => isItemActive(child, current)) ?? false);
   return (
-    <button
-      class="cp-sidebar-item"
-      data-active={active}
-      onClick={() => navigate(item.route)}
-    >
-      <Icon name={item.icon} size={17} stroke={1.7} />
-      <span class="cp-sidebar-label">{item.label}</span>
-      {item.badge != null && item.badge > 0 && (
-        <span class="cp-sidebar-badge">{item.badge}</span>
-      )}
-    </button>
+    <div class="cp-sidebar-branch" data-depth={depth}>
+      <button
+        class="cp-sidebar-item"
+        data-active={active}
+        data-child-active={childActive}
+        data-depth={depth}
+        onClick={() => navigate(item.route)}
+      >
+        {depth > 0 && item.showConnector && (
+          <span class="cp-sidebar-tree-icon" aria-hidden="true">
+            <Icon
+              name="border-corner-rounded"
+              size={14}
+              stroke={1.35}
+              color="currentColor"
+              style={{ transform: 'scaleY(-1)' }}
+            />
+          </span>
+        )}
+        <Icon name={item.icon} size={depth > 0 ? 15 : 17} stroke={1.7} />
+        <span class="cp-sidebar-label">{item.label}</span>
+      </button>
+      {item.children?.length ? (
+        <div class="cp-sidebar-children">
+          {item.children.map(child => <SidebarItemNode key={child.label} item={child} depth={depth + 1} />)}
+        </div>
+      ) : null}
+    </div>
   );
 }
 
@@ -174,49 +204,56 @@ function UserTrigger(): JSX.Element {
 }
 
 export function Sidebar(): JSX.Element {
-  const queue = installQueue.value;
-
-  const groups: SidebarGroup[] = [
+  const mainGroups: SidebarGroup[] = [
     {
       title: 'Play',
       items: [
         { icon: 'home', label: 'Home', route: { name: 'home' } },
-        { icon: 'cube', label: 'Instances', route: { name: 'instances' } },
-        { icon: 'plus', label: 'New instance', route: { name: 'create' } },
+        {
+          icon: 'cube',
+          label: 'Instances',
+          route: { name: 'instances' },
+          children: [
+            { icon: 'plus', label: 'New', route: { name: 'create' }, showConnector: false },
+          ],
+        },
       ],
     },
     {
       title: 'Discover',
       items: [
         { icon: 'compass', label: 'Browse', route: { name: 'browse' } },
-        { icon: 'download', label: 'Downloads', route: { name: 'downloads' }, badge: queue.length },
       ],
     },
-    {
-      title: 'You',
-      items: [
-        { icon: 'user', label: 'Accounts & skins', route: { name: 'accounts' } },
-        { icon: 'settings', label: 'Settings', route: { name: 'settings' } },
-      ],
-    },
+  ];
+
+  const utilityItems: SidebarItem[] = [
+    { icon: 'user', label: 'Accounts & skins', route: { name: 'accounts' } },
+    { icon: 'settings', label: 'Settings', route: { name: 'settings' } },
   ];
 
   return (
     <aside class="cp-sidebar">
       <div class="cp-sidebar-brand">
-        <img class="cp-logo" src="logo.svg" alt="" width="22" height="22" />
+        <img class="cp-logo" src="logo.png" alt="" width="22" height="22" />
         <span class="cp-brand-name">Croopor</span>
       </div>
       <CommandTrigger />
-      {groups.map(g => (
+      {mainGroups.map(g => (
         <div class="cp-sidebar-group" key={g.title}>
           <div class="cp-sidebar-group-title">{g.title}</div>
           <div class="cp-sidebar-items">
-            {g.items.map(it => <SidebarItemBtn key={it.label} item={it} />)}
+            {g.items.map(it => <SidebarItemNode key={it.label} item={it} />)}
           </div>
         </div>
       ))}
       <div class="cp-sidebar-spacer" />
+      <div class="cp-sidebar-group">
+        <div class="cp-sidebar-group-title">You</div>
+        <div class="cp-sidebar-items">
+          {utilityItems.map(it => <SidebarItemNode key={it.label} item={it} />)}
+        </div>
+      </div>
       <UserTrigger />
     </aside>
   );

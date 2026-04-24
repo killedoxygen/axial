@@ -20,7 +20,10 @@ function crumbsFor(): { label: string; onClick?: () => void }[] {
         { label: inst?.name || 'Instance' },
       ];
     }
-    case 'create': return [{ label: 'New instance' }];
+    case 'create': return [
+      { label: 'Instances', onClick: () => navigate({ name: 'instances' }) },
+      { label: 'New' },
+    ];
     case 'browse': return [{ label: 'Browse' }];
     case 'downloads': return [{ label: 'Downloads' }];
     case 'accounts': return [{ label: 'Accounts & skins' }];

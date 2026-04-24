@@ -3,7 +3,7 @@
 // Vars mirror the :root block in style.css, components consume either
 // those CSS vars or the Theme object from tokens.ts (rebuilt on every change)
 import { signal } from '@preact/signals';
-import { local, saveLocalState, PRESET_HUES, LOGO_BASE_HUE } from './state';
+import { local, saveLocalState, PRESET_HUES } from './state';
 import { api } from './api';
 import { config } from './store';
 import { Sound } from './sound';
@@ -68,8 +68,6 @@ export function applyTheme(theme: string, hue: number | null, options: ApplyOpti
   }
 
   applyCssVars(resolvedHue, dark, vibrancy);
-  // logo.svg is drawn at LOGO_BASE_HUE, CSS rotates it to the active accent
-  document.documentElement.style.setProperty('--logo-hue-shift', `${resolvedHue - LOGO_BASE_HUE}deg`);
   themeSignal.value = buildTheme({ dark, hue: resolvedHue });
 
   local.theme = theme;
