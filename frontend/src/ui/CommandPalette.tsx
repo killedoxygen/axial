@@ -137,6 +137,7 @@ export function CommandPalette(): JSX.Element | null {
   const open = commandPaletteOpen.value;
   const [query, setQuery] = useState('');
   const [active, setActive] = useState(0);
+  const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
 
   const commands = useMemo(() => (open ? buildCommands() : []), [open]);
@@ -156,6 +157,13 @@ export function CommandPalette(): JSX.Element | null {
 
   useEffect(() => { if (open) { setQuery(''); setActive(0); } }, [open]);
   useEffect(() => { setActive(a => Math.min(a, Math.max(0, filtered.length - 1))); }, [filtered.length]);
+  useEffect(() => {
+    if (!open) return;
+    const frame = window.requestAnimationFrame(() => {
+      inputRef.current?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [open]);
 
   useEffect(() => {
     if (!open) return;
@@ -216,6 +224,7 @@ export function CommandPalette(): JSX.Element | null {
           <input
             class="cp-cmd-input"
             autoFocus
+            ref={inputRef}
             placeholder="Jump to…"
             value={query}
             onInput={(e: any) => setQuery(e.currentTarget.value)}
