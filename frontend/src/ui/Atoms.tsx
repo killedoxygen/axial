@@ -138,7 +138,7 @@ export function Segmented<T extends string>({ options, value, onChange }: {
 
 export function Input({
   value, onChange, placeholder, icon, trailing, style, type = 'text', autoFocus, onKeyDown,
-  onFocus, onBlur,
+  onFocus, onBlur, inputRef,
 }: {
   value: string;
   onChange: (v: string) => void;
@@ -151,12 +151,14 @@ export function Input({
   onKeyDown?: (e: KeyboardEvent) => void;
   onFocus?: () => void;
   onBlur?: () => void;
+  inputRef?: { current: HTMLInputElement | null };
 }): JSX.Element {
   const [focus, setFocus] = useState(false);
   return (
     <div class={`cp-field${focus ? ' cp-field--focused' : ''}`} style={style}>
       {icon && <Icon name={icon} size={14} color="var(--text-dim)" />}
       <input
+        ref={inputRef}
         type={type}
         value={value}
         autocomplete="off"

@@ -11,16 +11,28 @@ import type {
 } from './types';
 
 let componentsCache: LoaderComponentRecord[] | null = null;
+let componentsPromise: Promise<LoaderComponentRecord[]> | null = null;
 let supportedVersionsCache: Record<string, LoaderGameVersion[]> = {};
+let supportedVersionsPromiseCache: Partial<Record<string, Promise<LoaderGameVersion[]>>> = {};
 let buildsCache: Record<string, LoaderBuildRecord[]> = {};
+let buildsPromiseCache: Partial<Record<string, Promise<LoaderBuildRecord[]>>> = {};
 
 export async function fetchLoaderComponents(): Promise<LoaderComponentRecord[]> {
   if (componentsCache) return componentsCache;
+  if (componentsPromise) return componentsPromise;
 
-  const res = await api('GET', '/loaders/components') as LoaderComponentsResponse & { error?: string };
-  if (res.error) throw new Error(res.error);
-  componentsCache = res.components || [];
-  return componentsCache;
+  componentsPromise = (async () => {
+    const res = await api('GET', '/loaders/components') as LoaderComponentsResponse & { error?: string };
+    if (res.error) throw new Error(res.error);
+    componentsCache = res.components || [];
+    return componentsCache;
+  })();
+
+  try {
+    return await componentsPromise;
+  } finally {
+    componentsPromise = null;
+  }
 }
 
 export async function fetchLoaderBuilds(
@@ -29,28 +41,46 @@ export async function fetchLoaderBuilds(
 ): Promise<LoaderBuildRecord[]> {
   const key = `${componentId}:${minecraftVersion}`;
   if (buildsCache[key]) return buildsCache[key];
+  if (buildsPromiseCache[key]) return buildsPromiseCache[key];
 
-  const res = await api(
-    'GET',
-    `/loaders/components/${encodeURIComponent(componentId)}/builds?mc_version=${encodeURIComponent(minecraftVersion)}`,
-  ) as LoaderBuildsResponse & { error?: string };
-  if (res.error) throw new Error(res.error);
-  buildsCache[key] = res.builds || [];
-  return buildsCache[key];
+  buildsPromiseCache[key] = (async () => {
+    const res = await api(
+      'GET',
+      `/loaders/components/${encodeURIComponent(componentId)}/builds?mc_version=${encodeURIComponent(minecraftVersion)}`,
+    ) as LoaderBuildsResponse & { error?: string };
+    if (res.error) throw new Error(res.error);
+    buildsCache[key] = res.builds || [];
+    return buildsCache[key];
+  })();
+
+  try {
+    return await buildsPromiseCache[key];
+  } finally {
+    delete buildsPromiseCache[key];
+  }
 }
 
 export async function fetchLoaderSupportedVersions(
   componentId: LoaderComponentId,
 ): Promise<LoaderGameVersion[]> {
   if (supportedVersionsCache[componentId]) return supportedVersionsCache[componentId];
+  if (supportedVersionsPromiseCache[componentId]) return supportedVersionsPromiseCache[componentId];
 
-  const res = await api(
-    'GET',
-    `/loaders/components/${encodeURIComponent(componentId)}/game-versions`,
-  ) as LoaderGameVersionsResponse & { error?: string };
-  if (res.error) throw new Error(res.error);
-  supportedVersionsCache[componentId] = res.versions || [];
-  return supportedVersionsCache[componentId];
+  supportedVersionsPromiseCache[componentId] = (async () => {
+    const res = await api(
+      'GET',
+      `/loaders/components/${encodeURIComponent(componentId)}/game-versions`,
+    ) as LoaderGameVersionsResponse & { error?: string };
+    if (res.error) throw new Error(res.error);
+    supportedVersionsCache[componentId] = res.versions || [];
+    return supportedVersionsCache[componentId];
+  })();
+
+  try {
+    return await supportedVersionsPromiseCache[componentId];
+  } finally {
+    delete supportedVersionsPromiseCache[componentId];
+  }
 }
 
 export async function startLoaderInstall(
@@ -97,6 +127,9 @@ export function connectLoaderInstallSSE(
 
 export function clearLoaderCaches(): void {
   componentsCache = null;
+  componentsPromise = null;
   supportedVersionsCache = {};
+  supportedVersionsPromiseCache = {};
   buildsCache = {};
+  buildsPromiseCache = {};
 }

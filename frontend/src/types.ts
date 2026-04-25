@@ -16,6 +16,8 @@ export interface Instance {
   jvm_preset?: string;
   performance_mode?: string;
   extra_jvm_args?: string;
+  icon?: string;
+  accent?: string;
 }
 
 export interface EnrichedInstance extends Instance {

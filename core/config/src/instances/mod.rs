@@ -46,6 +46,10 @@ pub struct Instance {
     pub performance_mode: String,
     #[serde(default)]
     pub extra_jvm_args: String,
+    #[serde(default)]
+    pub icon: String,
+    #[serde(default)]
+    pub accent: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -238,6 +242,8 @@ impl InstanceStore {
         &self,
         name: String,
         version_id: String,
+        icon: String,
+        accent: String,
         mc_dir: Option<&Path>,
     ) -> Result<Instance, InstanceStoreError> {
         let mut inner = self.inner.write().map_err(|_| {
@@ -282,6 +288,8 @@ impl InstanceStore {
             jvm_preset: String::new(),
             performance_mode: String::new(),
             extra_jvm_args: String::new(),
+            icon,
+            accent,
         };
 
         inner.instances.push(instance.clone());
@@ -431,7 +439,13 @@ mod tests {
         };
 
         let error = store
-            .add("Test".to_string(), "1.21.1".to_string(), None)
+            .add(
+                "Test".to_string(),
+                "1.21.1".to_string(),
+                String::new(),
+                String::new(),
+                None,
+            )
             .expect_err("persist should fail");
 
         assert!(matches!(error, super::InstanceStoreError::Read(_)));
@@ -454,7 +468,13 @@ mod tests {
         };
 
         let error = store
-            .add("Test".to_string(), "1.21.1".to_string(), None)
+            .add(
+                "Test".to_string(),
+                "1.21.1".to_string(),
+                String::new(),
+                String::new(),
+                None,
+            )
             .expect_err("file setup should fail");
 
         assert!(matches!(error, super::InstanceStoreError::Read(_)));
