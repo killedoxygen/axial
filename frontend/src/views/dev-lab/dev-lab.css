@@ -1,0 +1,132 @@
+.cp-dev-lab {
+  gap: 18px;
+}
+
+.cp-dev-tabs {
+  display: inline-flex;
+  align-self: flex-start;
+  gap: 2px;
+  padding: 3px;
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+}
+
+.cp-dev-tabs button {
+  height: 28px;
+  padding: 0 12px;
+  border: none;
+  border-radius: calc(var(--r-sm) - 2px);
+  background: transparent;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.cp-dev-tabs button[data-active="true"] {
+  background: var(--surface);
+  color: var(--text);
+}
+
+.cp-dev-lab-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.cp-dev-lab-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.cp-dev-art-controls {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(160px, 1fr));
+  gap: 12px;
+}
+
+.cp-dev-art-controls label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.cp-dev-art-controls label > span,
+.cp-dev-preview-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-mute);
+  text-transform: uppercase;
+  letter-spacing: 0.7px;
+}
+
+.cp-dev-preset-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.cp-dev-preset-row button {
+  height: 30px;
+  padding: 0 12px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--line);
+  background: var(--surface-3);
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: capitalize;
+  cursor: pointer;
+}
+
+.cp-dev-preset-row button[data-active="true"] {
+  background: var(--accent-softer);
+  border-color: var(--accent-line);
+  color: var(--accent);
+}
+
+.cp-dev-preview-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(180px, 0.7fr);
+  gap: 14px;
+}
+
+.cp-dev-preview-label {
+  margin-bottom: 10px;
+}
+
+.cp-dev-banner-preview {
+  height: min(360px, 32vw);
+  min-height: 220px;
+}
+
+.cp-dev-square-preview {
+  width: 100%;
+  max-width: 320px;
+  margin: 0 auto;
+}
+
+.cp-dev-thumb-row {
+  min-height: 128px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+@media (max-width: 900px) {
+  .cp-dev-art-controls,
+  .cp-dev-preview-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .cp-dev-banner-preview {
+    height: 220px;
+  }
+}

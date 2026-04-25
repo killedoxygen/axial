@@ -4,6 +4,7 @@ import { HomeView } from './views/home/HomeView';
 import { InstancesView } from './views/instances/InstancesView';
 import { InstanceDetailView } from './views/instance/InstanceDetailView';
 import { CreateView } from './views/create/CreateView';
+import { DevLabView } from './views/dev-lab/DevLabView';
 import { BrowseView } from './views/browse/BrowseView';
 import { DownloadsView } from './views/downloads/DownloadsView';
 import { AccountsView } from './views/accounts/AccountsView';
@@ -15,7 +16,7 @@ import { ContextMenuHost } from './ui/ContextMenu';
 import { ToastHost } from './ui/ToastHost';
 import { CommandPalette } from './ui/CommandPalette';
 import { route, showOnboardingOverlay, showSetupOverlay } from './ui-state';
-import { bootstrapError, bootstrapState } from './store';
+import { bootstrapError, bootstrapState, devMode } from './store';
 import { useShortcuts } from './hooks/use-shortcuts';
 import './views/views.css';
 
@@ -55,6 +56,7 @@ function CurrentView(): JSX.Element {
     case 'instances': return <InstancesView />;
     case 'instance': return <InstanceDetailView id={r.id} />;
     case 'create': return <CreateView />;
+    case 'dev-lab': return devMode.value ? <DevLabView /> : <SettingsView />;
     case 'browse': return <BrowseView />;
     case 'downloads': return <DownloadsView />;
     case 'accounts': return <AccountsView />;

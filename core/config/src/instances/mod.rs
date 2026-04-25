@@ -16,6 +16,10 @@ pub struct Instance {
     #[serde(default)]
     pub last_played_at: String,
     #[serde(default)]
+    pub art_seed: u32,
+    #[serde(default)]
+    pub art_preset: String,
+    #[serde(default)]
     pub max_memory_mb: i32,
     #[serde(default)]
     pub min_memory_mb: i32,
@@ -248,13 +252,17 @@ impl InstanceStore {
             )));
         }
 
+        let id = generate_id();
+        let art_seed = derive_art_seed(&id, &name, &version_id);
         let instance = Instance {
-            id: generate_id(),
+            id,
             name,
             version_id,
             created_at: chrono::DateTime::<chrono::Utc>::from(std::time::SystemTime::now())
                 .to_rfc3339(),
             last_played_at: String::new(),
+            art_seed,
+            art_preset: art_preset_for_seed(art_seed).to_string(),
             max_memory_mb: 0,
             min_memory_mb: 0,
             java_path: String::new(),
@@ -328,6 +336,26 @@ fn generate_id() -> String {
         .map(|value| value.as_nanos())
         .unwrap_or_default();
     format!("{:016x}", nanos as u64)
+}
+
+fn derive_art_seed(id: &str, name: &str, version_id: &str) -> u32 {
+    let mut h = 2166136261u32;
+    for byte in id
+        .bytes()
+        .chain([0])
+        .chain(name.bytes())
+        .chain([0])
+        .chain(version_id.bytes())
+    {
+        h ^= u32::from(byte);
+        h = h.wrapping_mul(16777619);
+    }
+    if h == 0 { 1 } else { h }
+}
+
+fn art_preset_for_seed(seed: u32) -> &'static str {
+    const PRESETS: [&str; 4] = ["aurora", "silk", "mineral", "ember"];
+    PRESETS[(seed as usize) % PRESETS.len()]
 }
 
 #[cfg(test)]

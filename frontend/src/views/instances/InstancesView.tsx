@@ -1,6 +1,6 @@
 import type { JSX } from 'preact';
 import { useState } from 'preact/hooks';
-import { Thumb } from '../../ui/Thumb';
+import { InstanceArt } from '../../art/InstanceArt';
 import { Button, IconButton, Input, Segmented, Pill } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { openContextMenu } from '../../ui/ContextMenu';
@@ -65,7 +65,7 @@ function ListRow({ inst }: { inst: EnrichedInstance }): JSX.Element {
       onClick={() => navigate({ name: 'instance', id: inst.id })}
       onContextMenu={(e) => openContextMenu(e, menuItemsFor(inst))}
     >
-      <Thumb name={inst.name} size={36} radius={theme.r.sm} />
+      <InstanceArt instance={inst} aspect="thumb" radius={theme.r.sm} style={{ width: 36, height: 36 }} />
       <div>
         <div class="cp-table-row-title" style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           {inst.name}
@@ -101,7 +101,7 @@ function GridCard({ inst }: { inst: EnrichedInstance }): JSX.Element {
       style={{ border: 'none', font: 'inherit', color: 'inherit' }}
       onClick={() => navigate({ name: 'instance', id: inst.id })}
     >
-      <Thumb name={inst.name} size={68} radius={theme.r.md} />
+      <InstanceArt instance={inst} aspect="square" radius={theme.r.md} style={{ width: 68, height: 68 }} />
       <div class="cp-playcard-body">
         <div class="cp-playcard-title">
           <h3>{inst.name}</h3>

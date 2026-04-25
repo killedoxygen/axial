@@ -1,0 +1,41 @@
+.cp-instance-art {
+  position: relative;
+  overflow: hidden;
+  flex-shrink: 0;
+  background: var(--surface-3);
+  isolation: isolate;
+}
+
+.cp-instance-art > canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.cp-instance-art--thumb,
+.cp-instance-art--square {
+  aspect-ratio: 1;
+}
+
+.cp-instance-art--banner {
+  width: 100%;
+  aspect-ratio: 1024 / 486;
+  min-height: 220px;
+}
+
+.cp-instance-art::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background:
+    linear-gradient(135deg, oklch(1 0 0 / 0.16), transparent 38%),
+    radial-gradient(circle at 78% 12%, oklch(1 0 0 / 0.10), transparent 30%);
+  mix-blend-mode: screen;
+  opacity: 0.5;
+}
+
+html[data-color-mode="light"] .cp-instance-art::after {
+  opacity: 0.38;
+}

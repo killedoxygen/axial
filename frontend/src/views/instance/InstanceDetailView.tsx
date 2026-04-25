@@ -3,8 +3,8 @@ import { useMemo, useState } from 'preact/hooks';
 import { Icon } from '../../ui/Icons';
 import { Button, Card, IconButton, Input, Meter, Pill, SectionHeading } from '../../ui/Atoms';
 import { useTheme } from '../../hooks/use-theme';
-import { gradientFor } from '../../tokens';
 import { initialsOf } from '../../ui/Thumb';
+import { ART_PRESETS, InstanceArt, artPresetFor, artSeedFor, nextArtSeed, type ArtPreset } from '../../art/InstanceArt';
 import { showConfirm } from '../../ui/Dialog';
 import { openContextMenu } from '../../ui/ContextMenu';
 import { instances, runningSessions, versions } from '../../store';
@@ -240,6 +240,9 @@ function PlaceholderPane({ title, hint }: { title: string; hint: string }): JSX.
 
 function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
   const theme = useTheme();
+  const initialArtSeed = artSeedFor(inst);
+  const [artSeed, setArtSeed] = useState<number>(initialArtSeed);
+  const [artPreset, setArtPreset] = useState<ArtPreset>(artPresetFor(inst, initialArtSeed));
   const [maxMem, setMaxMem] = useState<number>((inst.max_memory_mb ?? 4096) / 1024);
   const [minMem, setMinMem] = useState<number>((inst.min_memory_mb ?? 1024) / 1024);
   const [width, setWidth] = useState<number>(inst.window_width ?? 854);
@@ -254,6 +257,8 @@ function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
       const res: any = await api('PUT', `/instances/${encodeURIComponent(inst.id)}`, {
         max_memory_mb: Math.round(maxMem * 1024),
         min_memory_mb: Math.round(minMem * 1024),
+        art_seed: artSeed,
+        art_preset: artPreset,
         window_width: width,
         window_height: height,
         java_path: javaPath || null,
@@ -271,6 +276,40 @@ function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
 
   return (
     <div class="cp-instance-body" style={{ display: 'block' }}>
+      <Card>
+        <SectionHeading
+          eyebrow="Artwork"
+          title="Instance identity"
+          right={<Button variant="soft" size="sm" icon="refresh" onClick={() => setArtSeed(nextArtSeed(artSeed))}>Regenerate</Button>}
+        />
+        <div class="cp-art-settings">
+          <InstanceArt
+            instance={{ ...inst, art_seed: artSeed, art_preset: artPreset }}
+            aspect="square"
+            radius={theme.r.lg}
+            className="cp-art-settings-square"
+          />
+          <InstanceArt
+            instance={{ ...inst, art_seed: artSeed, art_preset: artPreset }}
+            aspect="banner"
+            radius={theme.r.lg}
+            className="cp-art-settings-banner"
+          />
+          <div class="cp-art-preset-list" aria-label="Artwork preset">
+            {ART_PRESETS.map((preset) => (
+              <button
+                key={preset}
+                type="button"
+                data-active={preset === artPreset}
+                onClick={() => setArtPreset(preset)}
+              >
+                {preset}
+              </button>
+            ))}
+          </div>
+        </div>
+      </Card>
+      <div style={{ height: 16 }} />
       <Card>
         <SectionHeading eyebrow="Memory" title="JVM heap" />
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: 20 }}>
@@ -339,6 +378,7 @@ function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
 
 
 export function InstanceDetailView({ id }: { id: string }): JSX.Element {
+  const theme = useTheme();
   const inst = instances.value.find(i => i.id === id) as EnrichedInstance | undefined;
   const [tab, setTab] = useState<Tab>('overview');
   const running = inst ? !!runningSessions.value[inst.id] : false;
@@ -356,7 +396,6 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
     );
   }
 
-  const g = gradientFor(inst.name, useTheme().dark);
   const v = versions.value.find(x => x.id === inst.version_id);
   const tabs: Tab[] = ['overview', 'mods', 'worlds', 'screenshots', 'logs', 'settings'];
 
@@ -368,10 +407,14 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column' }}>
-      <div class="cp-instance-hero" style={{ background: g.bg }}>
+      <div class="cp-instance-hero">
+        <InstanceArt instance={inst} aspect="banner" className="cp-instance-hero-art" />
         <div class="cp-instance-hero-gradient" />
         <div class="cp-instance-hero-body">
-          <div class="cp-instance-avatar">{initialsOf(inst.name)}</div>
+          <div class="cp-instance-avatar" style={{ borderRadius: theme.r.lg }}>
+            <InstanceArt instance={inst} aspect="square" radius={theme.r.lg} />
+            <span>{initialsOf(inst.name)}</span>
+          </div>
           <div style={{ flex: 1, minWidth: 240 }}>
             <div class="cp-instance-heading-pills">
               <Pill>{loaderLabel(v)}</Pill>

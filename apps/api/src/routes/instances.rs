@@ -95,6 +95,8 @@ async fn handle_create_instance(
 struct InstancePatch {
     name: Option<String>,
     version_id: Option<String>,
+    art_seed: Option<u32>,
+    art_preset: Option<String>,
     max_memory_mb: Option<i32>,
     min_memory_mb: Option<i32>,
     java_path: Option<String>,
@@ -122,6 +124,12 @@ async fn handle_update_instance(
     }
     if let Some(version_id) = patch.version_id.filter(|value| !value.trim().is_empty()) {
         instance.version_id = version_id;
+    }
+    if let Some(art_seed) = patch.art_seed.filter(|value| *value > 0) {
+        instance.art_seed = art_seed;
+    }
+    if let Some(art_preset) = patch.art_preset.filter(|value| !value.trim().is_empty()) {
+        instance.art_preset = art_preset;
     }
     if let Some(max_memory_mb) = patch.max_memory_mb {
         instance.max_memory_mb = max_memory_mb.max(0);

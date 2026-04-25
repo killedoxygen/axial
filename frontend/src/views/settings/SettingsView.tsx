@@ -8,6 +8,7 @@ import { local, saveLocalState } from '../../state';
 import { Sound, playSliderSound } from '../../sound';
 import { Music, musicStateVersion } from '../../music';
 import { config, systemInfo, devMode, appVersion } from '../../store';
+import { navigate } from '../../ui-state';
 import { api } from '../../api';
 import { toast } from '../../toast';
 import { clampPlayerNameInput } from '../../player-name';
@@ -290,11 +291,18 @@ function AdvancedSection(): JSX.Element {
         control={<Button variant="secondary" icon="refresh" onClick={() => location.reload()}>Reload</Button>}
       />
       {isDev && (
-        <SettingsCard
-          title="Flush all data"
-          desc="Deletes every Croopor-managed file and restarts from first run. Existing libraries selected through 'Use existing' are preserved."
-          control={<Button variant="danger" icon="trash" disabled={busy} onClick={flush}>{busy ? 'Flushing…' : 'Flush'}</Button>}
-        />
+        <>
+          <SettingsCard
+            title="Dev lab"
+            desc="Developer-only workbench for procedural art and future internal experiments."
+            control={<Button variant="secondary" icon="palette" onClick={() => navigate({ name: 'dev-lab' })}>Open lab</Button>}
+          />
+          <SettingsCard
+            title="Flush all data"
+            desc="Deletes every Croopor-managed file and restarts from first run. Existing libraries selected through 'Use existing' are preserved."
+            control={<Button variant="danger" icon="trash" disabled={busy} onClick={flush}>{busy ? 'Flushing…' : 'Flush'}</Button>}
+          />
+        </>
       )}
     </>
   );

@@ -1,6 +1,6 @@
 import type { JSX } from 'preact';
 import { useMemo } from 'preact/hooks';
-import { Thumb } from '../../ui/Thumb';
+import { InstanceArt } from '../../art/InstanceArt';
 import { Button, SectionHeading, Card, Pill } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { useTheme } from '../../hooks/use-theme';
@@ -65,7 +65,7 @@ function PlayCard({ inst }: { inst: EnrichedInstance }): JSX.Element {
       style={{ border: 'none', font: 'inherit', color: 'inherit', cursor: 'pointer', background: undefined }}
       onClick={() => navigate({ name: 'instance', id: inst.id })}
     >
-      <Thumb name={inst.name} size={68} radius={theme.r.md} />
+      <InstanceArt instance={inst} aspect="square" radius={theme.r.md} style={{ width: 68, height: 68 }} />
       <div class="cp-playcard-body">
         <div class="cp-playcard-title">
           <h3>{inst.name}</h3>

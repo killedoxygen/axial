@@ -7,6 +7,7 @@ export type Route =
   | { name: 'instances' }
   | { name: 'instance'; id: string }
   | { name: 'create' }
+  | { name: 'dev-lab' }
   | { name: 'browse' }
   | { name: 'downloads' }
   | { name: 'accounts' }
