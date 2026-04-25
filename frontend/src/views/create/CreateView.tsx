@@ -1,154 +1,35 @@
 import type { JSX } from 'preact';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { Button, Input } from '../../ui/Atoms';
+import { Button } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
-import { AccentField } from '../settings/AccentEditor';
 import { catalog, config, versions } from '../../store';
 import { setCatalog } from '../../actions';
 import { navigate } from '../../ui-state';
 import { api } from '../../api';
-import { errMessage, isReleaseVersion, isSnapshotVersion, parseVersionDisplay } from '../../utils';
+import { errMessage } from '../../utils';
 import {
   createNewInstanceLoaderMachine,
-  type NewInstanceLoaderMachine, type NewInstanceLoaderState,
 } from '../../machines/new-instance-loader';
 import { createInstance } from '../../instance-create';
 import type {
   Catalog, CatalogVersion, LoaderBuildRecord, LoaderComponentId,
 } from '../../types';
 import {
-  channelOfVersion, defaultIconFor, defaultNameFor, INSTANCE_ICON_CHOICES,
-  LOADER_COMPONENT_IDS, LOADER_KEYS, LOADER_LABELS, LOADER_TAGLINES,
+  channelOfVersion, defaultIconFor, defaultNameFor,
+  LOADER_COMPONENT_IDS,
   type Channel, type LoaderKey,
 } from './defaults';
+import { IdentityStage } from './IdentityStage';
+import { SetupStage } from './SetupStage';
+import { LibraryBlocker, Stepper, STAGE_ORDER, type Stage } from './shared';
+import {
+  buildRowModel,
+  CHANNEL_ORDER,
+  releaseAnchorsFor,
+  type VersionRowModel,
+} from './view-model';
+import { useLoaderHoverPrefetch } from './use-loader-hover-prefetch';
 import './create.css';
-
-type Stage = 'setup' | 'identity';
-const STAGE_ORDER: Stage[] = ['setup', 'identity'];
-const STAGE_LABELS: Record<Stage, string> = {
-  setup: 'Setup',
-  identity: 'Identity',
-};
-
-const SOURCE_ICON: Record<LoaderKey, string> = {
-  vanilla: 'cube',
-  fabric: 'compass',
-  quilt: 'palette',
-  forge: 'terminal',
-  neoforge: 'rectangle',
-};
-
-const CHANNEL_LABEL: Record<Channel, string> = {
-  release: 'Release',
-  snapshot: 'Snapshot',
-  legacy: 'Legacy',
-};
-
-const CHANNEL_ORDER: Channel[] = ['release', 'snapshot', 'legacy'];
-const LOADER_HOVER_PREFETCH_DELAY_MS = 140;
-const LOADER_HOVER_IDLE_TIMEOUT_MS = 500;
-
-type IdleCallbackHandle = number;
-type IdleCallbackDeadline = {
-  didTimeout: boolean;
-  timeRemaining: () => number;
-};
-
-type IdleCapableWindow = Window & {
-  requestIdleCallback?: (
-    callback: (deadline: IdleCallbackDeadline) => void,
-    options?: { timeout: number },
-  ) => IdleCallbackHandle;
-  cancelIdleCallback?: (handle: IdleCallbackHandle) => void;
-};
-
-function Words({ text }: { text: string }): JSX.Element {
-  const parts = text.split(' ');
-  return (
-    <>
-      {parts.flatMap((w, i) => {
-        const span = (
-          <span key={`w${i}`} class="cp-cr-word" style={{ ['--i' as any]: String(i) }}>
-            {w}
-          </span>
-        );
-        return i === 0 ? [span] : [' ', span];
-      })}
-    </>
-  );
-}
-
-function Stepper({
-  current, maxReached, onJump,
-}: {
-  current: number;
-  maxReached: number;
-  onJump: (i: number) => void;
-}): JSX.Element {
-  const nodes: JSX.Element[] = [];
-  STAGE_ORDER.forEach((s, i) => {
-    if (i > 0) {
-      nodes.push(<span key={`sep-${i}`} class="cp-cr-stepper-sep" aria-hidden="true">/</span>);
-    }
-    const state = i < current ? 'past' : i === current ? 'active' : 'future';
-    const clickable = i !== current && i <= maxReached;
-    const label = STAGE_LABELS[s];
-    const num = String(i + 1).padStart(2, '0');
-    const inner = (
-      <>
-        <span class="cp-cr-stepper-num">{num}</span>
-        <span class="cp-cr-stepper-label">{label}</span>
-      </>
-    );
-    if (clickable) {
-      nodes.push(
-        <button
-          key={s}
-          type="button"
-          class="cp-cr-stepper-item"
-          data-state={state}
-          onClick={() => onJump(i)}
-          aria-label={`Go to ${label}`}
-        >
-          {inner}
-        </button>,
-      );
-    } else {
-      nodes.push(
-        <div
-          key={s}
-          class="cp-cr-stepper-item"
-          data-state={state}
-          aria-current={state === 'active' ? 'step' : undefined}
-        >
-          {inner}
-        </div>,
-      );
-    }
-  });
-  return <nav class="cp-cr-stepper" aria-label="Create instance progress">{nodes}</nav>;
-}
-
-interface VersionRowModel {
-  id: string;
-  displayName: string;
-  hint: string | null;
-  channel: Channel;
-  installed: boolean;
-}
-
-function LibraryBlocker(): JSX.Element {
-  return (
-    <div class="cp-cr-blocker">
-      <Icon name="folder" size={32} />
-      <h2>Set up your library first</h2>
-      <p>Croopor needs a place to keep game files before you can make an instance.</p>
-      <Button icon="settings" onClick={() => navigate({ name: 'settings' })}>
-        Open setup
-      </Button>
-    </div>
-  );
-}
 
 export function CreateView(): JSX.Element {
   const libraryDir = config.value?.library_dir ?? '';
@@ -175,10 +56,6 @@ function CreateWizard(): JSX.Element {
 
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const versionListRef = useRef<HTMLDivElement | null>(null);
-  const hoverPrefetchTimeoutRef = useRef<number | null>(null);
-  const hoverPrefetchIdleRef = useRef<IdleCallbackHandle | null>(null);
-  const prefetchedComponentsRef = useRef<Set<LoaderComponentId>>(new Set());
-  const prefetchingComponentsRef = useRef<Set<LoaderComponentId>>(new Set());
 
   const loaderMachine = useMemo(() => createNewInstanceLoaderMachine(), []);
   const loaderState = loaderMachine.state.value;
@@ -237,10 +114,7 @@ function CreateWizard(): JSX.Element {
   }, [catalog.value, source, supportedSet]);
 
   const releaseAnchors = useMemo(() => {
-    return availableForSource
-      .filter(isReleaseVersion)
-      .slice()
-      .sort((a, b) => (a.release_time || '').localeCompare(b.release_time || ''));
+    return releaseAnchorsFor(availableForSource);
   }, [availableForSource]);
 
   const availableChannels = useMemo<Channel[]>(() => {
@@ -296,60 +170,12 @@ function CreateWizard(): JSX.Element {
   }, [source, mcVersionId]);
 
   const name = nameOverride ?? suggestedName;
-
-  const hoverPrefetchVersions = useMemo(() => {
-    const ids = new Set<string>();
-    if (mcVersionId) ids.add(mcVersionId);
-    const latest = catalog.value?.latest;
-    if (latest?.release) ids.add(latest.release);
-    if (latest?.snapshot) ids.add(latest.snapshot);
-    return Array.from(ids).slice(0, 3);
-  }, [mcVersionId, catalog.value]);
-
-  const cancelHoverPrefetch = (): void => {
-    if (hoverPrefetchTimeoutRef.current != null) {
-      window.clearTimeout(hoverPrefetchTimeoutRef.current);
-      hoverPrefetchTimeoutRef.current = null;
-    }
-    const idleWindow = window as IdleCapableWindow;
-    if (hoverPrefetchIdleRef.current != null && idleWindow.cancelIdleCallback) {
-      idleWindow.cancelIdleCallback(hoverPrefetchIdleRef.current);
-      hoverPrefetchIdleRef.current = null;
-    }
-  };
-
-  const runHoverPrefetch = (componentId: LoaderComponentId): void => {
-    if (prefetchedComponentsRef.current.has(componentId)) return;
-    if (prefetchingComponentsRef.current.has(componentId)) return;
-    prefetchingComponentsRef.current.add(componentId);
-    void loaderMachine.prefetchComponent(componentId, hoverPrefetchVersions)
-      .then(() => {
-        prefetchedComponentsRef.current.add(componentId);
-      })
-      .finally(() => {
-        prefetchingComponentsRef.current.delete(componentId);
-      });
-  };
-
-  const scheduleHoverPrefetch = (loaderKey: LoaderKey): void => {
-    if (loaderKey === 'vanilla' || loaderKey === source) return;
-    const componentId = LOADER_COMPONENT_IDS[loaderKey];
-    if (prefetchedComponentsRef.current.has(componentId)) return;
-    if (prefetchingComponentsRef.current.has(componentId)) return;
-    cancelHoverPrefetch();
-    hoverPrefetchTimeoutRef.current = window.setTimeout(() => {
-      hoverPrefetchTimeoutRef.current = null;
-      const idleWindow = window as IdleCapableWindow;
-      if (idleWindow.requestIdleCallback) {
-        hoverPrefetchIdleRef.current = idleWindow.requestIdleCallback(() => {
-          hoverPrefetchIdleRef.current = null;
-          runHoverPrefetch(componentId);
-        }, { timeout: LOADER_HOVER_IDLE_TIMEOUT_MS });
-        return;
-      }
-      runHoverPrefetch(componentId);
-    }, LOADER_HOVER_PREFETCH_DELAY_MS);
-  };
+  const { scheduleHoverPrefetch, cancelHoverPrefetch } = useLoaderHoverPrefetch({
+    source,
+    mcVersionId,
+    latest: catalog.value?.latest,
+    loaderMachine,
+  });
 
   useEffect(() => {
     if (!mcVersionId) return;
@@ -363,8 +189,6 @@ function CreateWizard(): JSX.Element {
     void loaderMachine.changeMcVersion(mcVersionId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mcVersionId, source, loaderState.context.supportedVersions]);
-
-  useEffect(() => () => { cancelHoverPrefetch(); }, []);
 
   const stageValid: boolean =
     stage === 'setup'    ? Boolean(mcVersionId && (source === 'vanilla' || selectedBuild)) :
@@ -547,314 +371,5 @@ function CreateWizard(): JSX.Element {
         </div>
       </footer>
     </div>
-  );
-}
-
-function buildRowModel(
-  v: CatalogVersion,
-  releaseAnchors: CatalogVersion[],
-  installedSet: Set<string>,
-  source: LoaderKey,
-): VersionRowModel {
-  const display = parseVersionDisplay(v.id, v, releaseAnchors);
-  let hint = display.hint;
-  if (!hint && isSnapshotVersion(v) && v.release_time) {
-    const t = v.release_time;
-    let nearest: CatalogVersion | null = null;
-    for (const r of releaseAnchors) {
-      if ((r.release_time || '') >= t) { nearest = r; break; }
-    }
-    if (!nearest && releaseAnchors.length > 0) {
-      nearest = releaseAnchors[releaseAnchors.length - 1] ?? null;
-    }
-    if (nearest && !v.id.includes(nearest.id)) hint = `~ ${nearest.id}`;
-  }
-  return {
-    id: v.id,
-    displayName: display.name === v.id ? v.id : display.name,
-    hint: hint && hint !== display.name ? hint : null,
-    channel: channelOfVersion(v),
-    installed: source === 'vanilla' && (v.installed || installedSet.has(v.id)),
-  };
-}
-
-// ── Setup stage (combined source + version) ───────────────────────────
-
-function SetupStage({
-  source, onSourcePick,
-  onSourcePreview,
-  onSourcePreviewCancel,
-  channel, channels, onChannelChange,
-  query, onQueryChange, searchRef, versionListRef,
-  rows, selectedId, onSelectId,
-  loaderState, loaderMachine, selectedBuild,
-  catalogLoading, catalogError, onRetryCatalog,
-}: {
-  source: LoaderKey;
-  onSourcePick: (k: LoaderKey) => void;
-  onSourcePreview: (k: LoaderKey) => void;
-  onSourcePreviewCancel: () => void;
-  channel: Channel;
-  channels: Channel[];
-  onChannelChange: (c: Channel) => void;
-  query: string;
-  onQueryChange: (v: string) => void;
-  searchRef: { current: HTMLInputElement | null };
-  versionListRef: { current: HTMLDivElement | null };
-  rows: VersionRowModel[];
-  selectedId: string | null;
-  onSelectId: (id: string) => void;
-  loaderState: NewInstanceLoaderState;
-  loaderMachine: NewInstanceLoaderMachine;
-  selectedBuild: LoaderBuildRecord | null;
-  catalogLoading: boolean;
-  catalogError: string | null;
-  onRetryCatalog: () => void;
-}): JSX.Element {
-  const loaderLoading = source !== 'vanilla' && (
-    loaderState.kind === 'loading_components'
-    || loaderState.kind === 'loading_versions'
-  );
-  const loaderError = source !== 'vanilla' && loaderState.kind === 'error'
-    ? loaderState.context.errorMessage
-    : null;
-
-  return (
-    <>
-      <header class="cp-cr-head">
-        <h1 class="cp-cr-headline"><Words text="A new world." /></h1>
-        <p class="cp-cr-subline">
-          {source === 'vanilla'
-            ? 'Pure Minecraft. Pick a version to start with.'
-            : `${LOADER_LABELS[source]}. Pick the Minecraft version it should target.`}
-        </p>
-      </header>
-
-      <div class="cp-cr-setup">
-        <aside class="cp-cr-rail" role="radiogroup" aria-label="Instance source">
-          {LOADER_KEYS.map((k, i) => (
-            <button
-              key={k}
-              type="button"
-              class="cp-cr-rail-item"
-              data-active={source === k}
-              role="radio"
-              aria-checked={source === k}
-              style={{ ['--i' as any]: String(i) }}
-              onClick={() => onSourcePick(k)}
-              onPointerEnter={() => onSourcePreview(k)}
-              onPointerLeave={onSourcePreviewCancel}
-              onFocus={() => onSourcePreview(k)}
-              onBlur={onSourcePreviewCancel}
-            >
-              <span class="cp-cr-rail-glyph">
-                <Icon name={SOURCE_ICON[k]} size={15} stroke={1.8} />
-              </span>
-              <span class="cp-cr-rail-label">
-                <span class="cp-cr-rail-name">{LOADER_LABELS[k]}</span>
-                <span class="cp-cr-rail-tag">{LOADER_TAGLINES[k]}</span>
-              </span>
-            </button>
-          ))}
-          <div class="cp-cr-rail-item is-soon" aria-disabled="true" style={{ ['--i' as any]: String(LOADER_KEYS.length) }}>
-            <span class="cp-cr-rail-glyph">
-              <Icon name="download" size={15} stroke={1.8} />
-            </span>
-            <span class="cp-cr-rail-label">
-              <span class="cp-cr-rail-name">Modpack</span>
-              <span class="cp-cr-rail-tag">Modrinth · soon</span>
-            </span>
-          </div>
-        </aside>
-
-        <section class="cp-cr-vpane">
-          <div class="cp-cr-vbar">
-            <div class="cp-cr-search">
-              <Input
-                value={query}
-                onChange={onQueryChange}
-                placeholder="Filter"
-                icon="search"
-                inputRef={searchRef}
-              />
-            </div>
-            {channels.length > 1 && (
-              <div class="cp-cr-channels" role="tablist" aria-label="Release channel">
-                {channels.map((c) => (
-                  <button
-                    key={c}
-                    type="button"
-                    class="cp-cr-chan"
-                    data-active={channel === c}
-                    role="tab"
-                    aria-selected={channel === c}
-                    onClick={() => onChannelChange(c)}
-                  >
-                    {CHANNEL_LABEL[c]}
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-
-          <div class="cp-cr-vbody" ref={versionListRef}>
-            {catalogLoading && (
-              <div class="cp-cr-state">
-                <span class="cp-cr-spinner" aria-hidden="true" />
-                <span>Loading versions…</span>
-              </div>
-            )}
-            {!catalogLoading && catalogError && (
-              <div class="cp-cr-state is-error" role="alert" aria-live="polite">
-                <span>Couldn't load the catalog: {catalogError}</span>
-                <Button variant="ghost" onClick={onRetryCatalog}>Retry</Button>
-              </div>
-            )}
-            {!catalogLoading && !catalogError && loaderLoading && (
-              <div class="cp-cr-state">
-                <span class="cp-cr-spinner" aria-hidden="true" />
-                <span>Fetching {LOADER_LABELS[source]}…</span>
-              </div>
-            )}
-            {!catalogLoading && !catalogError && loaderError && (
-              <div class="cp-cr-state is-error" role="alert" aria-live="polite">
-                <span>{loaderError}</span>
-                <Button
-                  variant="ghost"
-                  onClick={() => {
-                    if (source === 'vanilla') return;
-                    void loaderMachine.changeComponent(LOADER_COMPONENT_IDS[source], selectedId);
-                  }}
-                >
-                  Retry
-                </Button>
-              </div>
-            )}
-
-            {!catalogLoading && !catalogError && !loaderLoading && !loaderError && rows.length === 0 && (
-              <div class="cp-cr-state is-empty">
-                <span>Nothing matches.</span>
-              </div>
-            )}
-
-            {rows.length > 0 && (
-              <ul class="cp-cr-vlist" role="listbox" aria-label="Minecraft versions">
-                {rows.map((row, i) => (
-                  <li
-                    key={row.id}
-                    class="cp-cr-vrow"
-                    data-active={selectedId === row.id}
-                    role="option"
-                    aria-selected={selectedId === row.id}
-                    style={{ ['--i' as any]: String(Math.min(i, 12)) }}
-                    onClick={() => onSelectId(row.id)}
-                  >
-                    <span class="cp-cr-vrow-name">{row.displayName}</span>
-                    {row.hint && <span class="cp-cr-vrow-hint">{row.hint}</span>}
-                    <span class="cp-cr-vrow-spacer" />
-                    {row.installed && (
-                      <span class="cp-cr-vrow-dot" title="Already installed" aria-hidden="true" />
-                    )}
-                    <span class="cp-cr-vrow-mark" aria-hidden="true">
-                      <Icon name="chevron-right" size={14} stroke={2} />
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
-
-          {source !== 'vanilla' && selectedId && (
-            <div class="cp-cr-build" aria-live="polite">
-              {selectedBuild && (
-                <span class="cp-cr-build-line">
-                  <span class="cp-cr-build-key">Build</span>
-                  <span class="cp-cr-build-value">{selectedBuild.loader_version}</span>
-                </span>
-              )}
-            </div>
-          )}
-        </section>
-      </div>
-    </>
-  );
-}
-
-function IdentityStage({
-  source, mcVersionId, name, suggestedName, onNameChange, icon, onIconPick,
-  alreadyInstalled, selectedBuild,
-}: {
-  source: LoaderKey;
-  mcVersionId: string;
-  name: string;
-  suggestedName: string;
-  onNameChange: (v: string) => void;
-  icon: string;
-  onIconPick: (name: string) => void;
-  alreadyInstalled: boolean;
-  selectedBuild: LoaderBuildRecord | null;
-}): JSX.Element {
-  const summary = source === 'vanilla'
-    ? `Vanilla · ${mcVersionId}`
-    : selectedBuild
-      ? `${LOADER_LABELS[source]} ${selectedBuild.loader_version} · ${mcVersionId}`
-      : `${LOADER_LABELS[source]} · ${mcVersionId}`;
-
-  return (
-    <>
-      <header class="cp-cr-head">
-        <h1 class="cp-cr-headline"><Words text="Name it." /></h1>
-        <p class="cp-cr-subline">
-          {summary}{alreadyInstalled ? '' : ' · downloads after create'}
-        </p>
-      </header>
-
-      <div class="cp-cr-id">
-        <div class="cp-cr-id-card">
-          <div class="cp-cr-id-preview" data-icon={icon}>
-            <span class="cp-cr-id-preview-glyph">
-              <Icon name={icon} size={28} stroke={1.6} />
-            </span>
-            <span class="cp-cr-id-preview-name">{name.trim() || suggestedName || 'Untitled'}</span>
-          </div>
-
-          <div class="cp-cr-id-row">
-            <label class="cp-cr-id-label">Name</label>
-            <Input
-              value={name}
-              onChange={(v) => onNameChange(v)}
-              placeholder={suggestedName || 'Aurora Adventure'}
-              autoFocus
-            />
-          </div>
-
-          <div class="cp-cr-id-row">
-            <label class="cp-cr-id-label">Icon</label>
-            <div class="cp-cr-iconrow" role="radiogroup" aria-label="Instance icon">
-              {INSTANCE_ICON_CHOICES.map((n, i) => (
-                <button
-                  key={n}
-                  type="button"
-                  class="cp-cr-iconbtn"
-                  data-active={icon === n}
-                  aria-label={n}
-                  aria-checked={icon === n}
-                  role="radio"
-                  style={{ ['--i' as any]: String(i) }}
-                  onClick={() => onIconPick(n)}
-                >
-                  <Icon name={n} size={16} />
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div class="cp-cr-id-row">
-            <label class="cp-cr-id-label">Accent</label>
-            <AccentField showPresets={true} />
-          </div>
-        </div>
-      </div>
-    </>
   );
 }
