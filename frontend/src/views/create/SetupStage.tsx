@@ -40,7 +40,8 @@ export function SetupStage({
   rows,
   selectedId,
   onSelectId,
-  loaderState,
+  loaderLoading,
+  loaderError,
   loaderMachine,
   selectedBuild,
   catalogLoading,
@@ -61,21 +62,14 @@ export function SetupStage({
   rows: VersionRowModel[];
   selectedId: string | null;
   onSelectId: (id: string) => void;
-  loaderState: NewInstanceLoaderState;
+  loaderLoading: boolean;
+  loaderError: string | null;
   loaderMachine: NewInstanceLoaderMachine;
   selectedBuild: LoaderBuildRecord | null;
   catalogLoading: boolean;
   catalogError: string | null;
   onRetryCatalog: () => void;
 }): JSX.Element {
-  const loaderLoading = source !== 'vanilla' && (
-    loaderState.kind === 'loading_components'
-    || loaderState.kind === 'loading_versions'
-  );
-  const loaderError = source !== 'vanilla' && loaderState.kind === 'error'
-    ? loaderState.context.errorMessage
-    : null;
-
   return (
     <>
       <header class="cp-cr-head">

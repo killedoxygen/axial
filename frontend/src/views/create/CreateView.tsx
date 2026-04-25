@@ -10,6 +10,11 @@ import { errMessage } from '../../utils';
 import {
   createNewInstanceLoaderMachine,
 } from '../../machines/new-instance-loader';
+import { pickPreferredBuild } from '../../loaders/view-model';
+import {
+  getCachedLoaderBuilds,
+  getCachedLoaderSupportedVersions,
+} from '../../loaders/api';
 import { createInstance } from '../../instance-create';
 import type {
   Catalog, CatalogVersion, LoaderBuildRecord, LoaderComponentId,
@@ -59,6 +64,7 @@ function CreateWizard(): JSX.Element {
 
   const loaderMachine = useMemo(() => createNewInstanceLoaderMachine(), []);
   const loaderState = loaderMachine.state.value;
+  const currentComponentId = source === 'vanilla' ? null : LOADER_COMPONENT_IDS[source];
 
   const idx = STAGE_ORDER.indexOf(stage);
 
@@ -99,12 +105,19 @@ function CreateWizard(): JSX.Element {
     setIcon(defaultIconFor(source));
   }, [source, iconOverride]);
 
+  const currentSupportedVersions = useMemo(() => {
+    if (!currentComponentId) return null;
+    if (loaderState.context.selectedComponentId === currentComponentId && loaderState.context.supportedVersions) {
+      return loaderState.context.supportedVersions;
+    }
+    return getCachedLoaderSupportedVersions(currentComponentId);
+  }, [currentComponentId, loaderState]);
+
   const supportedSet = useMemo(() => {
     if (source === 'vanilla') return null;
-    const supported = loaderState.context.supportedVersions;
-    if (!supported) return null;
-    return new Set(supported.map((v) => v.id));
-  }, [source, loaderState]);
+    if (!currentSupportedVersions) return null;
+    return new Set(currentSupportedVersions.map((version) => version.id));
+  }, [source, currentSupportedVersions]);
 
   const availableForSource: CatalogVersion[] = useMemo(() => {
     const cat = catalog.value;
@@ -146,13 +159,20 @@ function CreateWizard(): JSX.Element {
   }, [catalog.value, versions.value, channel, query, availableForSource, releaseAnchors, source]);
 
   const selectedBuild: LoaderBuildRecord | null = useMemo(() => {
-    if (source === 'vanilla' || !mcVersionId) return null;
-    if (loaderState.context.selectedMcVersion !== mcVersionId) return null;
-    const builds = loaderState.context.builds;
+    if (!currentComponentId || !mcVersionId) return null;
+    const builds = loaderState.context.selectedComponentId === currentComponentId
+      && loaderState.context.selectedMcVersion === mcVersionId
+      ? loaderState.context.builds
+      : getCachedLoaderBuilds(currentComponentId, mcVersionId);
     const buildId = loaderState.context.selectedBuildId;
-    if (!builds || !buildId) return null;
-    return builds.find((b) => b.build_id === buildId) ?? null;
-  }, [source, mcVersionId, loaderState]);
+    if (loaderState.context.selectedComponentId === currentComponentId
+      && loaderState.context.selectedMcVersion === mcVersionId
+      && builds
+      && buildId) {
+      return builds.find((build) => build.build_id === buildId) ?? null;
+    }
+    return pickPreferredBuild(builds ?? []);
+  }, [currentComponentId, mcVersionId, loaderState]);
 
   const effectiveVersionId: string = useMemo(() => {
     if (source === 'vanilla') return mcVersionId ?? '';
@@ -185,10 +205,23 @@ function CreateWizard(): JSX.Element {
 
   useEffect(() => {
     if (source === 'vanilla' || !mcVersionId) return;
-    if (!loaderState.context.supportedVersions) return;
+    if (!currentSupportedVersions || !currentComponentId) return;
     void loaderMachine.changeMcVersion(mcVersionId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mcVersionId, source, loaderState.context.supportedVersions]);
+  }, [mcVersionId, source, currentComponentId, currentSupportedVersions]);
+
+  const loaderLoading = source !== 'vanilla'
+    && currentSupportedVersions == null
+    && (
+      loaderState.kind === 'loading_components'
+      || loaderState.kind === 'loading_versions'
+    );
+
+  const loaderError = source !== 'vanilla'
+    && currentSupportedVersions == null
+    && loaderState.kind === 'error'
+    ? loaderState.context.errorMessage
+    : null;
 
   const stageValid: boolean =
     stage === 'setup'    ? Boolean(mcVersionId && (source === 'vanilla' || selectedBuild)) :
@@ -309,7 +342,8 @@ function CreateWizard(): JSX.Element {
                 rows={versionRows}
                 selectedId={mcVersionId}
                 onSelectId={setMcVersionId}
-                loaderState={loaderState}
+                loaderLoading={loaderLoading}
+                loaderError={loaderError}
                 loaderMachine={loaderMachine}
                 selectedBuild={selectedBuild}
                 catalogLoading={catalogLoading}

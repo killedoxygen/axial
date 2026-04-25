@@ -17,6 +17,23 @@ let supportedVersionsPromiseCache: Partial<Record<string, Promise<LoaderGameVers
 let buildsCache: Record<string, LoaderBuildRecord[]> = {};
 let buildsPromiseCache: Partial<Record<string, Promise<LoaderBuildRecord[]>>> = {};
 
+export function getCachedLoaderComponents(): LoaderComponentRecord[] | null {
+  return componentsCache;
+}
+
+export function getCachedLoaderSupportedVersions(
+  componentId: LoaderComponentId,
+): LoaderGameVersion[] | null {
+  return supportedVersionsCache[componentId] ?? null;
+}
+
+export function getCachedLoaderBuilds(
+  componentId: LoaderComponentId,
+  minecraftVersion: string,
+): LoaderBuildRecord[] | null {
+  return buildsCache[`${componentId}:${minecraftVersion}`] ?? null;
+}
+
 export async function fetchLoaderComponents(): Promise<LoaderComponentRecord[]> {
   if (componentsCache) return componentsCache;
   if (componentsPromise) return componentsPromise;
