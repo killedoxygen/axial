@@ -96,7 +96,6 @@ struct InstancePatch {
     name: Option<String>,
     version_id: Option<String>,
     art_seed: Option<u32>,
-    art_preset: Option<String>,
     max_memory_mb: Option<i32>,
     min_memory_mb: Option<i32>,
     java_path: Option<String>,
@@ -128,9 +127,6 @@ async fn handle_update_instance(
     if let Some(art_seed) = patch.art_seed.filter(|value| *value > 0) {
         instance.art_seed = art_seed;
     }
-    if let Some(art_preset) = patch.art_preset.filter(|value| !value.trim().is_empty()) {
-        instance.art_preset = art_preset;
-    }
     if let Some(max_memory_mb) = patch.max_memory_mb {
         instance.max_memory_mb = max_memory_mb.max(0);
     }
@@ -154,6 +150,9 @@ async fn handle_update_instance(
     }
     if let Some(extra_jvm_args) = patch.extra_jvm_args {
         instance.extra_jvm_args = extra_jvm_args;
+    }
+    if instance.art_seed > 0 {
+        instance.art_preset = croopor_config::art_preset_for_seed(instance.art_seed).to_string();
     }
 
     state

@@ -1,6 +1,6 @@
 import type { JSX } from 'preact';
 import { useState } from 'preact/hooks';
-import { ART_PRESETS, InstanceArt, nextArtSeed, type ArtPreset } from '../../art/InstanceArt';
+import { ART_PRESETS, InstanceArt, artPresetForSeed, artSeedForPreset, nextArtSeed, type ArtPreset } from '../../art/InstanceArt';
 import { Button, Card, Input, SectionHeading } from '../../ui/Atoms';
 import { hashStr } from '../../tokens';
 import type { Instance } from '../../types';
@@ -29,7 +29,7 @@ function ArtWorkbench(): JSX.Element {
   const [name, setName] = useState('Moonlit Forge');
   const [versionId, setVersionId] = useState('1.21.1-fabric');
   const [seed, setSeed] = useState(hashStr('Moonlit Forge:1.21.1-fabric') || 1);
-  const [preset, setPreset] = useState<ArtPreset>('aurora');
+  const preset = artPresetForSeed(seed);
   const inst = demoInstance(name || 'Untitled instance', versionId || 'unknown', seed, preset);
 
   const randomize = (): void => {
@@ -73,7 +73,7 @@ function ArtWorkbench(): JSX.Element {
               key={item}
               type="button"
               data-active={item === preset}
-              onClick={() => setPreset(item)}
+              onClick={() => setSeed((current) => artSeedForPreset(current, item))}
             >
               {item}
             </button>

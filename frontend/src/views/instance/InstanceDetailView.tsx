@@ -4,7 +4,7 @@ import { Icon } from '../../ui/Icons';
 import { Button, Card, IconButton, Input, Meter, Pill, SectionHeading } from '../../ui/Atoms';
 import { useTheme } from '../../hooks/use-theme';
 import { initialsOf } from '../../ui/Thumb';
-import { ART_PRESETS, InstanceArt, artPresetFor, artSeedFor, nextArtSeed, type ArtPreset } from '../../art/InstanceArt';
+import { ART_PRESETS, InstanceArt, artPresetForSeed, artSeedFor, artSeedForPreset, nextArtSeed } from '../../art/InstanceArt';
 import { showConfirm } from '../../ui/Dialog';
 import { openContextMenu } from '../../ui/ContextMenu';
 import { instances, runningSessions, versions } from '../../store';
@@ -242,7 +242,7 @@ function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
   const theme = useTheme();
   const initialArtSeed = artSeedFor(inst);
   const [artSeed, setArtSeed] = useState<number>(initialArtSeed);
-  const [artPreset, setArtPreset] = useState<ArtPreset>(artPresetFor(inst, initialArtSeed));
+  const artPreset = artPresetForSeed(artSeed);
   const [maxMem, setMaxMem] = useState<number>((inst.max_memory_mb ?? 4096) / 1024);
   const [minMem, setMinMem] = useState<number>((inst.min_memory_mb ?? 1024) / 1024);
   const [width, setWidth] = useState<number>(inst.window_width ?? 854);
@@ -258,7 +258,6 @@ function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
         max_memory_mb: Math.round(maxMem * 1024),
         min_memory_mb: Math.round(minMem * 1024),
         art_seed: artSeed,
-        art_preset: artPreset,
         window_width: width,
         window_height: height,
         java_path: javaPath || null,
@@ -284,13 +283,13 @@ function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
         />
         <div class="cp-art-settings">
           <InstanceArt
-            instance={{ ...inst, art_seed: artSeed, art_preset: artPreset }}
+            instance={{ ...inst, art_seed: artSeed }}
             aspect="square"
             radius={theme.r.lg}
             className="cp-art-settings-square"
           />
           <InstanceArt
-            instance={{ ...inst, art_seed: artSeed, art_preset: artPreset }}
+            instance={{ ...inst, art_seed: artSeed }}
             aspect="banner"
             radius={theme.r.lg}
             className="cp-art-settings-banner"
@@ -301,7 +300,7 @@ function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
                 key={preset}
                 type="button"
                 data-active={preset === artPreset}
-                onClick={() => setArtPreset(preset)}
+                onClick={() => setArtSeed((seed) => artSeedForPreset(seed, preset))}
               >
                 {preset}
               </button>

@@ -7,6 +7,17 @@ use std::path::Path;
 use std::sync::RwLock;
 use thiserror::Error;
 
+/// Deterministic instance-art variants. Order is part of the seed contract and
+/// must match `ART_PRESETS` in `frontend/src/art/InstanceArt.tsx`.
+///
+/// `art_seed` is the artwork source of truth. The preset is derived with
+/// `ART_PRESETS[art_seed % ART_PRESETS.len()]`, and every renderer detail is
+/// expected to derive from the same seed. `art_preset` is a denormalized label
+/// recalculated from the seed whenever an instance is created or updated.
+pub const ART_PRESETS: [&str; 9] = [
+    "aurora", "silk", "mineral", "ember", "vapor", "topo", "prism", "dune", "orbit",
+];
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Instance {
     pub id: String,
@@ -353,14 +364,13 @@ fn derive_art_seed(id: &str, name: &str, version_id: &str) -> u32 {
     if h == 0 { 1 } else { h }
 }
 
-fn art_preset_for_seed(seed: u32) -> &'static str {
-    const PRESETS: [&str; 4] = ["aurora", "silk", "mineral", "ember"];
-    PRESETS[(seed as usize) % PRESETS.len()]
+pub fn art_preset_for_seed(seed: u32) -> &'static str {
+    ART_PRESETS[(seed as usize) % ART_PRESETS.len()]
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{InstanceStore, StoredInstances};
+    use super::{ART_PRESETS, InstanceStore, StoredInstances, art_preset_for_seed};
     use crate::paths::AppPaths;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -387,6 +397,17 @@ mod tests {
             music_dir: root.join("music"),
             library_dir: root.join("library"),
             config_dir,
+        }
+    }
+
+    #[test]
+    fn art_preset_is_derived_from_seed_modulo_preset_order() {
+        for (index, preset) in ART_PRESETS.iter().enumerate() {
+            assert_eq!(art_preset_for_seed(index as u32), *preset);
+            assert_eq!(
+                art_preset_for_seed((index + ART_PRESETS.len() * 17) as u32),
+                *preset
+            );
         }
     }
 

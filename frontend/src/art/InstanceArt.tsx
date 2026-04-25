@@ -6,10 +6,12 @@ import type { Instance } from '../types';
 import { renderInstanceArt } from './art-engine';
 import './instance-art.css';
 
-export type ArtPreset = 'aurora' | 'silk' | 'mineral' | 'ember';
+export type ArtPreset = 'aurora' | 'silk' | 'mineral' | 'ember' | 'vapor' | 'topo' | 'prism' | 'dune' | 'orbit';
 export type ArtAspect = 'square' | 'banner' | 'thumb';
 
-export const ART_PRESETS: ArtPreset[] = ['aurora', 'silk', 'mineral', 'ember'];
+// Order is part of the deterministic seed contract. Keep this list in sync
+// with `ART_PRESETS` in `core/config/src/instances/mod.rs`.
+export const ART_PRESETS: ArtPreset[] = ['aurora', 'silk', 'mineral', 'ember', 'vapor', 'topo', 'prism', 'dune', 'orbit'];
 
 interface ArtInput {
   seed: number;
@@ -22,15 +24,36 @@ function pickPreset(seed: number): ArtPreset {
   return ART_PRESETS[seed % ART_PRESETS.length];
 }
 
+/**
+ * Instance artwork is deterministic from one number:
+ *
+ * - `art_seed` is the source of truth for both the composition and the preset.
+ * - the preset is `ART_PRESETS[seed % ART_PRESETS.length]`.
+ * - all renderer randomness is derived from this seed plus stable labels.
+ * - changing the variant changes the seed to the nearest value that maps to
+ *   that preset, so the identity remains reproducible from the seed alone.
+ */
+export function artPresetForSeed(seed: number): ArtPreset {
+  return pickPreset(seed >>> 0 || 1);
+}
+
+export function artSeedForPreset(seed: number, preset: ArtPreset): number {
+  const current = seed >>> 0 || 1;
+  const target = ART_PRESETS.indexOf(preset);
+  if (target < 0) return current;
+  for (let offset = 0; offset < ART_PRESETS.length; offset += 1) {
+    const up = current + offset;
+    if (up <= 0xffffffff && up % ART_PRESETS.length === target) return up >>> 0;
+    const down = current - offset;
+    if (down > 0 && down % ART_PRESETS.length === target) return down >>> 0;
+  }
+  return (target + ART_PRESETS.length) >>> 0;
+}
+
 export function artSeedFor(instance: Pick<Instance, 'id' | 'name' | 'version_id' | 'art_seed'>): number {
   const seed = instance.art_seed ?? 0;
   if (seed > 0) return seed >>> 0;
   return hashStr(`${instance.id}:${instance.name}:${instance.version_id}`) || 1;
-}
-
-export function artPresetFor(instance: Pick<Instance, 'art_preset'>, seed: number): ArtPreset {
-  const preset = instance.art_preset;
-  return ART_PRESETS.includes(preset as ArtPreset) ? preset as ArtPreset : pickPreset(seed);
 }
 
 export function nextArtSeed(seed: number): number {
@@ -56,7 +79,7 @@ export function InstanceArt({
   className,
   style,
 }: {
-  instance: Pick<Instance, 'id' | 'name' | 'version_id' | 'art_seed' | 'art_preset'>;
+  instance: Pick<Instance, 'id' | 'name' | 'version_id' | 'art_seed'>;
   aspect?: ArtAspect;
   radius?: number;
   className?: string;
@@ -65,7 +88,7 @@ export function InstanceArt({
   const theme = useTheme();
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const seed = artSeedFor(instance);
-  const preset = artPresetFor(instance, seed);
+  const preset = artPresetForSeed(seed);
   const classValue = `cp-instance-art cp-instance-art--${aspect}${className ? ` ${className}` : ''}`;
 
   useLayoutEffect(() => {

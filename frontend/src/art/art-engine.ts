@@ -151,6 +151,28 @@ function ridged(x: number, y: number, seed: number): number {
   return 1 - Math.abs(n * 2 - 1);
 }
 
+function fractalOrbit(x: number, y: number, seed: number): number {
+  const angle = (seed % 6283) / 1000;
+  const cx = Math.cos(angle) * 0.42 - 0.18;
+  const cy = Math.sin(angle * 1.37) * 0.34;
+  let zx = x * 2.15 - 1.08;
+  let zy = y * 2.15 - 1.08;
+  let trap = 10;
+  let escape = 0;
+
+  for (let i = 0; i < 10; i += 1) {
+    const xx = zx * zx - zy * zy + cx;
+    const yy = 2 * zx * zy + cy;
+    zx = xx;
+    zy = yy;
+    const radius = Math.sqrt(zx * zx + zy * zy);
+    trap = Math.min(trap, Math.abs(radius - 0.72) + Math.abs(zx + zy) * 0.045);
+    if (radius > 2.6 && escape === 0) escape = i / 10;
+  }
+
+  return clamp((1 - trap * 2.5) * 0.72 + escape * 0.28);
+}
+
 function paletteColor(stops: ColorStop[], value: number): Rgb {
   const v = clamp(value);
   for (let i = 0; i < stops.length - 1; i += 1) {
@@ -169,16 +191,24 @@ function softBand(distance: number, width: number): number {
 }
 
 function buildMotifs(rand: () => number, preset: ArtPreset, aspect: ArtAspect): FlowMotif[] {
-  const count = aspect === 'thumb' ? 2 : preset === 'mineral' ? 5 : 4;
+  const count = aspect === 'thumb'
+    ? 2
+    : preset === 'mineral' || preset === 'topo' || preset === 'dune'
+      ? 5
+      : preset === 'vapor'
+        ? 6
+        : 4;
+  const wideFlow = preset === 'vapor' || preset === 'dune';
+  const tightFlow = preset === 'topo' || preset === 'prism' || preset === 'orbit';
   return Array.from({ length: count }, (_, index) => ({
     base: 0.12 + index * (0.74 / Math.max(1, count - 1)) + (rand() - 0.5) * 0.10,
-    amplitude: (preset === 'silk' ? 0.055 : 0.035) + rand() * 0.065,
-    frequency: 1.1 + rand() * (preset === 'ember' ? 2.4 : 1.6),
+    amplitude: (preset === 'silk' || wideFlow ? 0.055 : 0.030) + rand() * (tightFlow ? 0.035 : 0.065),
+    frequency: 1.1 + rand() * (preset === 'ember' || preset === 'prism' || preset === 'orbit' ? 2.4 : preset === 'vapor' ? 1.0 : 1.6),
     phase: rand() * Math.PI * 2,
     seed: Math.floor(rand() * 0xffffffff),
-    width: (aspect === 'thumb' ? 0.035 : 0.018) + rand() * (preset === 'mineral' ? 0.012 : 0.022),
-    strength: 0.08 + rand() * (preset === 'ember' ? 0.18 : 0.12),
-    slope: (rand() - 0.5) * (aspect === 'banner' ? 0.36 : 0.24),
+    width: (aspect === 'thumb' ? 0.035 : wideFlow ? 0.030 : 0.016) + rand() * (tightFlow ? 0.010 : 0.024),
+    strength: 0.08 + rand() * (preset === 'ember' || preset === 'vapor' ? 0.18 : 0.12),
+    slope: (rand() - 0.5) * (aspect === 'banner' ? preset === 'dune' ? 0.22 : 0.36 : 0.24),
   }));
 }
 
@@ -214,6 +244,35 @@ function integratedMotif(
     const seam = softBand(fract((wx * 0.82 + wy * 1.38 + warpB * 0.22) * 5.0) - 0.5, 0.026);
     line += vein * 0.11 + seam * 0.07;
     shade += seam * 0.05;
+  } else if (preset === 'topo') {
+    const contour = softBand(fract(field * 9.5 + ridge * 0.36 + warpA * 0.24) - 0.5, 0.034);
+    const shelf = softBand(fract((wy + warpB * 0.18 + field * 0.26) * 7.0) - 0.5, 0.038);
+    line += contour * 0.12 + shelf * 0.055;
+    shade += shelf * 0.07;
+  } else if (preset === 'prism') {
+    const facetA = softBand(Math.sin((wx * 5.2 + wy * 3.1 + warpA * 1.8) * Math.PI) * 0.5, 0.16);
+    const facetB = softBand(Math.sin((wx * -3.8 + wy * 5.7 + warpB * 2.0) * Math.PI) * 0.5, 0.14);
+    lift += facetA * 0.08;
+    shade += facetB * 0.06;
+    line += Math.min(facetA, facetB) * 0.08;
+  } else if (preset === 'vapor') {
+    const plume = fbm(wx * 3.4 + field * 0.6, wy * 4.2 + warpA * 0.8, motifs[1]?.seed ?? 1, 3);
+    const veil = softBand(plume - 0.56, 0.20);
+    lift += veil * 0.18;
+    shade += (1 - veil) * 0.035;
+    line += veil * 0.035;
+  } else if (preset === 'dune') {
+    const ripple = softBand(Math.sin((wy * 13.0 + wx * 2.2 + warpA * 2.0) * Math.PI) * 0.5, 0.20);
+    const slip = softBand(fract((wy + field * 0.24 + warpB * 0.16) * 8.0) - 0.5, 0.040);
+    lift += ripple * 0.075;
+    shade += slip * 0.075;
+    line += slip * 0.045;
+  } else if (preset === 'orbit') {
+    const orbit = fractalOrbit(wx + warpA * 0.24, wy + warpB * 0.24, motifs[0]?.seed ?? 1);
+    const ring = softBand(orbit - 0.62, 0.18);
+    lift += orbit * 0.13;
+    shade += (1 - orbit) * 0.04;
+    line += ring * 0.075;
   } else if (preset === 'ember') {
     const heat = softBand(fract((ridge + field * 0.72 + warpA * 0.20) * 4.4) - 0.5, 0.040);
     lift += heat * 0.14;
@@ -242,8 +301,17 @@ function paletteFor(seed: number, preset: ArtPreset, dark: boolean): Palette {
     silk: { offsets: [24, 58, 112, 158], chroma: 0.095 },
     mineral: { offsets: [206, 244, 296, 332], chroma: 0.075 },
     ember: { offsets: [350, 20, 48, 78], chroma: 0.13 },
+    vapor: { offsets: [188, 222, 282, 326], chroma: 0.105 },
+    topo: { offsets: [118, 152, 196, 62], chroma: 0.082 },
+    prism: { offsets: [268, 324, 36, 184], chroma: 0.118 },
+    dune: { offsets: [54, 78, 112, 28], chroma: 0.090 },
+    orbit: { offsets: [224, 274, 318, 34], chroma: 0.110 },
   }[preset];
-  const lows = dark ? [0.16, 0.24, 0.36, 0.57] : [0.66, 0.76, 0.86, 0.94];
+  const lows = preset === 'dune'
+    ? dark ? [0.18, 0.27, 0.41, 0.62] : [0.70, 0.79, 0.88, 0.95]
+    : preset === 'prism' || preset === 'orbit'
+      ? dark ? [0.14, 0.24, 0.40, 0.64] : [0.64, 0.75, 0.87, 0.96]
+      : dark ? [0.16, 0.24, 0.36, 0.57] : [0.66, 0.76, 0.86, 0.94];
   const chroma = profile.chroma;
   return {
     stops: [
@@ -324,6 +392,23 @@ function renderPixels(input: RenderInput, target: HTMLCanvasElement): void {
 
       if (input.preset === 'mineral') {
         field = field * 0.52 + ridge * 0.30 + (strata * 0.5 + 0.5) * 0.18;
+      } else if (input.preset === 'topo') {
+        const terrace = Math.floor((field + ridge * 0.34) * 7) / 7;
+        field = field * 0.44 + terrace * 0.24 + ridge * 0.18 + (strata * 0.5 + 0.5) * 0.14;
+      } else if (input.preset === 'prism') {
+        const refraction = Math.sin((wx * 3.4 - wy * 2.7 + warpA * 3.0) * Math.PI) * 0.5 + 0.5;
+        const split = Math.sin((wx * -4.2 + wy * 4.8 + warpB * 2.5) * Math.PI) * 0.5 + 0.5;
+        field = field * 0.45 + refraction * 0.24 + split * 0.16 + glow * 0.15;
+      } else if (input.preset === 'vapor') {
+        const plume = fbm(wx * 1.7 + warpB, wy * 2.5 - warpA, detailSeed + 211, 4);
+        field = field * 0.38 + plume * 0.34 + glow * 0.20 + beam * 0.08;
+      } else if (input.preset === 'dune') {
+        const sediment = Math.sin((wy * 10.5 + wx * 1.2 + warpA * 1.8) * Math.PI) * 0.5 + 0.5;
+        field = field * 0.48 + sediment * 0.24 + ridge * 0.14 + beam * 0.14;
+      } else if (input.preset === 'orbit') {
+        const orbit = fractalOrbit(wx + warpA * 0.20, wy + warpB * 0.20, detailSeed);
+        const halo = softBand(orbit - 0.58, 0.24);
+        field = field * 0.42 + orbit * 0.24 + halo * 0.18 + glow * 0.16;
       } else if (input.preset === 'silk') {
         field = field * 0.62 + (Math.sin((wx + warpB * 0.35) * 14 + wy * 5) * 0.5 + 0.5) * 0.20 + glow * 0.18;
       } else if (input.preset === 'ember') {
@@ -341,9 +426,11 @@ function renderPixels(input: RenderInput, target: HTMLCanvasElement): void {
       color = mixColor(color, palette.glow, illuminate);
       color = mixColor(color, palette.shade, clamp((1 - vignette) * (input.dark ? 0.48 : 0.20) + motif.shade));
 
-      const contour = input.preset === 'mineral'
-        ? clamp(1 - Math.abs(fract(field * 8.0 + ridge * 0.35) - 0.5) * 24)
-        : clamp(1 - Math.abs(fract(field * 5.0 + warpA * 0.15) - 0.5) * 18);
+      const contour = input.preset === 'mineral' || input.preset === 'topo'
+        ? clamp(1 - Math.abs(fract(field * (input.preset === 'topo' ? 11.0 : 8.0) + ridge * 0.35) - 0.5) * (input.preset === 'topo' ? 30 : 24))
+        : input.preset === 'dune'
+          ? clamp(1 - Math.abs(fract((field + wy * 0.35) * 7.0 + warpA * 0.12) - 0.5) * 22)
+          : clamp(1 - Math.abs(fract(field * 5.0 + warpA * 0.15) - 0.5) * 18);
       color = mixColor(color, palette.mark, contour * (input.aspect === 'thumb' ? 0.025 : 0.040) + motif.line);
 
       const grain = hash2(px, py, detailSeed) - 0.5;
