@@ -154,6 +154,25 @@ button.cp-cr-stepper-item:focus-visible {
   letter-spacing: -0.05px;
 }
 
+.cp-cr-subline--source {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.cp-cr-source-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--text-dim);
+  line-height: 1;
+}
+
 /* ── Setup grid (rail + version pane) ─────────────────────────────────── */
 
 .cp-cr-setup {
@@ -251,9 +270,49 @@ button.cp-cr-stepper-item:focus-visible {
   flex-shrink: 0;
   transition: background-color 160ms ease, color 160ms ease;
 }
+.cp-cr-loader-mark {
+  display: block;
+  flex-shrink: 0;
+  background-color: var(--text-mute);
+  opacity: 0.86;
+  -webkit-mask-image: var(--cp-loader-src);
+  mask-image: var(--cp-loader-src);
+  -webkit-mask-position: center;
+  mask-position: center;
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+  -webkit-mask-size: contain;
+  mask-size: contain;
+  transform: translate(var(--cp-loader-shift-x, 0), var(--cp-loader-shift-y, 0)) scale(var(--cp-loader-scale, 1));
+  transition: background-color 160ms ease, opacity 160ms ease, transform 160ms ease;
+}
+.cp-cr-loader-mark[data-loader="fabric"] {
+  --cp-loader-brand: #dbc8a0;
+}
+.cp-cr-loader-mark[data-loader="forge"] {
+  --cp-loader-brand: #60a5fa;
+}
+.cp-cr-loader-mark[data-loader="neoforge"] {
+  --cp-loader-brand: #fb923c;
+  --cp-loader-shift-x: 0.35px;
+}
+.cp-cr-loader-mark[data-loader="quilt"] {
+  --cp-loader-brand: #c084fc;
+  --cp-loader-scale: 0.9;
+  --cp-loader-shift-x: 0.6px;
+}
 .cp-cr-rail-item[data-active="true"] .cp-cr-rail-glyph {
-  background: var(--accent-soft);
-  color: var(--accent);
+  background: var(--surface-2);
+  color: var(--text);
+}
+.cp-cr-rail-item:hover .cp-cr-loader-mark {
+  background-color: var(--text);
+  opacity: 0.96;
+}
+.cp-cr-rail-item[data-active="true"] .cp-cr-loader-mark,
+.cp-cr-source-chip .cp-cr-loader-mark {
+  background-color: var(--cp-loader-brand, var(--text));
+  opacity: 1;
 }
 .cp-cr-rail-item:hover .cp-cr-rail-glyph { color: var(--text); }
 .cp-cr-rail-item[data-active="true"]:hover .cp-cr-rail-glyph { color: var(--accent); }

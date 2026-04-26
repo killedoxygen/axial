@@ -14,16 +14,9 @@ import {
   type Channel,
   type LoaderKey,
 } from './defaults';
+import { LoaderLogo } from './loader-logos';
 import { Words } from './shared';
 import { CHANNEL_LABEL, type VersionRowModel } from './view-model';
-
-const SOURCE_ICON: Record<LoaderKey, string> = {
-  vanilla: 'cube',
-  fabric: 'compass',
-  quilt: 'palette',
-  forge: 'terminal',
-  neoforge: 'rectangle',
-};
 
 export function SetupStage({
   source,
@@ -70,6 +63,11 @@ export function SetupStage({
   catalogError: string | null;
   onRetryCatalog: () => void;
 }): JSX.Element {
+  const renderSourceGlyph = (key: LoaderKey): JSX.Element => {
+    if (key === 'vanilla') return <Icon name="cube" size={15} stroke={1.8} />;
+    return <LoaderLogo loader={key} size={15} class="cp-cr-loader-mark" />;
+  };
+
   return (
     <>
       <header class="cp-cr-head">
@@ -99,7 +97,7 @@ export function SetupStage({
               onBlur={onSourcePreviewCancel}
             >
               <span class="cp-cr-rail-glyph">
-                <Icon name={SOURCE_ICON[key]} size={15} stroke={1.8} />
+                {renderSourceGlyph(key)}
               </span>
               <span class="cp-cr-rail-label">
                 <span class="cp-cr-rail-name">{LOADER_LABELS[key]}</span>

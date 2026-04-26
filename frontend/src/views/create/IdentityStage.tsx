@@ -8,6 +8,7 @@ import {
   LOADER_LABELS,
   type LoaderKey,
 } from './defaults';
+import { LoaderLogo } from './loader-logos';
 import { Words } from './shared';
 
 export function IdentityStage({
@@ -34,14 +35,20 @@ export function IdentityStage({
   const summary = source === 'vanilla'
     ? `Vanilla · ${mcVersionId}`
     : selectedBuild
-      ? `${LOADER_LABELS[source]} ${selectedBuild.loader_version} · ${mcVersionId}`
-      : `${LOADER_LABELS[source]} · ${mcVersionId}`;
+      ? `${selectedBuild.loader_version} · ${mcVersionId}`
+      : mcVersionId;
 
   return (
     <>
       <header class="cp-cr-head">
         <h1 class="cp-cr-headline"><Words text="Name it." /></h1>
-        <p class="cp-cr-subline">
+        <p class={`cp-cr-subline${source === 'vanilla' ? '' : ' cp-cr-subline--source'}`}>
+          {source !== 'vanilla' && (
+            <span class="cp-cr-source-chip">
+              <LoaderLogo loader={source} size={14} class="cp-cr-loader-mark" />
+              <span>{LOADER_LABELS[source]}</span>
+            </span>
+          )}
           {summary}{alreadyInstalled ? '' : ' · downloads after create'}
         </p>
       </header>
