@@ -12,6 +12,10 @@ keep this short and real. if the codebase changes, update this file.
 - keep modules flat, named exports only
 - no classes, no default exports
 - use signals/actions for cross-module state, not custom event spaghetti
+- keep complex async workflows in small machine modules built on signals, not scattered local flags
+- keep workflow machines under `frontend/src/machines/`
+- loader UI logic should consume normalized backend records, not raw ids or raw provider payloads
+- do not use composite version-id parsing as the main loader UI data model
 
 ## DOM and handlers
 - wrap dom listeners with arrows, do not pass business functions directly to `addEventListener`
@@ -29,25 +33,38 @@ keep this short and real. if the codebase changes, update this file.
 - backend surface is `/api/v1/*`
 - json in, json out
 - errors are `{\"error\":\"message\"}`
-- launch/install progress uses sse in browser mode, wails runtime events in desktop mode
+- launch/install progress uses sse in browser mode and the Tauri desktop event bridge on desktop
 - update checks go through `/api/v1/update`
+- loader selection uses component ids and build ids
+- loader version pickers must be driven by per-component supported Minecraft versions, not the vanilla catalog
+- route and frontend code must not inspect raw Fabric, Quilt, Forge, or NeoForge payloads
 
-## Build
+## Backend layout
+- the Rust rewrite lives under `apps/` and `core/`
+- `apps/api` owns the local HTTP surface and static frontend serving
+- `apps/desktop` owns the Tauri shell
+- `core/launcher`, `core/minecraft`, `core/performance`, and `core/config` are the long-term Rust product logic crates
+- if backend work is part of this branch, add it in Rust
+- loader-specific install behavior belongs in `core/minecraft/src/loaders/strategies/`, not in route handlers
+
+## Architecture docs
+- `docs/README.md` is the docs entrypoint and ownership map
+- `docs/ARCHITECTURE.md` must describe the current launcher pipeline, not an aspirational one
+- if launch/install/settings/runtime architecture shifts, update `docs/ARCHITECTURE.md` in the same change
+- if Guardian authority, Healing scope, or launch-safety policy changes, update `docs/GUARDIAN-ARCHITECTURE.md` in the same change
+- if version classification, naming, or ordering architecture shifts, update `docs/VERSION-METADATA-ARCHITECTURE.md` in the same change
+- if the docs structure changes, update `docs/README.md` in the same change
+- use `docs/adr/` for major decisions that need rationale, not for current-state walkthroughs
+- do not land architecture shifts without updating the matching docs
+
+## Build shape
 - frontend entry is `frontend/src/main.tsx`
-- output is `frontend/static/app.js`
+- frontend bundle output is `frontend/static/app.js`
 - frontend package manager is `pnpm`, pinned through `frontend/package.json`
-- run frontend commands through `corepack pnpm`, do not assume a global `pnpm` shim
-- workflow definitions live in `Taskfile.yml`
-- main local entrypoints are `./dev` on unix/wsl and `dev.ps1` or `dev.cmd` on windows
-- `make` is a fallback path, not the main daily interface
-- the repo bootstraps local tools into `.tools/bin`, do not rely on random global `task`, `wails`, or `goreleaser` installs
-- frontend installs should use the lockfile and `--ignore-scripts`
-- desktop build is wails
-- on ubuntu 24 the linux build uses `webkit2_41`
-- local dev commands live in `Taskfile.yml`
-- `Makefile` is only a unix/wsl convenience shim
-- raw release binaries are driven by `.goreleaser.yml`
-- extra release packaging and updater metadata live in `.github/workflows/release.yml`
+- the Rust workspace root is `Cargo.toml`
+- release/build automation lives in `.github/workflows/`
+- Rust build output lives in `target/`
+- local release staging lives in `dist/`
 
 ## Inputs
 - text and number inputs should use `autocomplete="off"`

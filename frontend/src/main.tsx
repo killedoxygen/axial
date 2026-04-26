@@ -39,7 +39,6 @@ async function init(): Promise<void> {
   Sound.enabled = local.sounds;
   Sound.warmup();
   const logPanel = byId<HTMLElement>('log-panel');
-  if (local.logExpanded) logPanel?.classList.add('expanded');
   if (local.logHeight && logPanel) logPanel.style.setProperty('--log-h', `${local.logHeight}px`);
   sidebarFilter.value = local.sidebarFilter;
   $$<HTMLElement>('.filter-chips .chip[data-filter]').forEach((c: HTMLElement) => c.classList.toggle('active', c.dataset.filter === sidebarFilter.value));
@@ -59,7 +58,7 @@ async function init(): Promise<void> {
     devMode.value = statusRes?.dev_mode === true;
     Music.setTrackCount(musicStatusRes?.count);
 
-    // If Minecraft is not found, show setup screen and wait
+    // If the Croopor library is not configured yet, show setup and wait
     if (statusRes?.setup_required) {
       await showSetup();
     }
@@ -223,8 +222,6 @@ function bindEvents(): void {
     if ((e.target as HTMLElement).closest('.log-filter')) return;
     logPanel?.classList.toggle('expanded');
     if (logPanel?.classList.contains('expanded')) clearLogIndicator();
-    local.logExpanded = !!logPanel?.classList.contains('expanded');
-    saveLocalState();
   });
 
   logFilter?.addEventListener('change', (e: Event) => {
@@ -350,7 +347,10 @@ function bindEvents(): void {
   });
 
   devFlush?.addEventListener('click', async () => {
-    const ok: boolean = await showConfirm('Delete all settings? App will restart.', { confirmText: 'Delete', destructive: true });
+    const ok: boolean = await showConfirm(
+      'Delete all Croopor-owned data and reset the launcher to first run?\nExternal libraries selected through "Use existing library" will not be deleted.',
+      { confirmText: 'Reset', destructive: true },
+    );
     if (!ok) return;
     const btn = devFlush;
     btn.setAttribute('disabled', 'true');
@@ -358,7 +358,7 @@ function bindEvents(): void {
     try {
       await api('POST', '/dev/flush');
       toast('Data flushed, restarting...');
-      localStorage.removeItem(STORAGE_KEY);
+      localStorage.clear();
       location.reload();
     } catch (err: unknown) {
       btn.removeAttribute('disabled');

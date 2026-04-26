@@ -1,7 +1,7 @@
 import { signal, computed } from '@preact/signals';
 import type {
   Instance, Version, Config, SystemInfo,
-  RunningSession, InstallItem, Catalog, Page, ToastItem, UpdateInfo,
+  RunningSession, InstallItem, Catalog, Page, ToastItem, UpdateInfo, InstanceLaunchDraft, LaunchNotice,
 } from './types';
 
 // ── Core data ──
@@ -48,6 +48,8 @@ export type LaunchState =
 
 export const launchState = signal<LaunchState>({ status: 'idle' });
 export const runningSessions = signal<Record<string, RunningSession>>({});
+export const instanceLaunchDrafts = signal<Record<string, InstanceLaunchDraft>>({});
+export const launchNotices = signal<Record<string, LaunchNotice>>({});
 
 // ── UI state ──
 
@@ -79,15 +81,23 @@ export const filteredInstances = computed<Instance[]>(() => {
   const filter = sidebarFilter.value;
   const search = searchQuery.value;
 
+  const isRelease = (version: Version | undefined) =>
+    version?.lifecycle?.channel === 'stable' && version.lifecycle.labels.includes('release');
+  const isSnapshot = (version: Version | undefined) =>
+    !!version?.lifecycle
+    && !version.lifecycle.labels.includes('old_beta')
+    && !version.lifecycle.labels.includes('old_alpha')
+    && (version.lifecycle.channel === 'preview' || version.lifecycle.channel === 'experimental');
+
   if (filter === 'release') {
     list = list.filter(inst => {
       const v = vm.get(inst.version_id);
-      return v?.type === 'release' && !v?.inherits_from;
+      return isRelease(v) && !v?.inherits_from;
     });
   } else if (filter === 'snapshot') {
     list = list.filter(inst => {
       const v = vm.get(inst.version_id);
-      return v?.type === 'snapshot' && !v?.inherits_from;
+      return isSnapshot(v) && !v?.inherits_from;
     });
   } else if (filter === 'modded') {
     list = list.filter(inst => {

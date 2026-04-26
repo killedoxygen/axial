@@ -1,0 +1,19 @@
+[package]
+name = "croopor-minecraft"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+chrono.workspace = true
+futures-util.workspace = true
+md5.workspace = true
+regex.workspace = true
+reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls", "stream"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+ureq = { version = "2.12.1", features = ["json"] }
+zip.workspace = true

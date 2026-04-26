@@ -1,8 +1,9 @@
 import { api, API } from './api';
 import { showError, errMessage } from './utils';
-import { startLoaderInstall, connectLoaderInstallSSE } from './loaders';
+import { startLoaderInstall, connectLoaderInstallSSE } from './loaders/api';
+import { createProgressEstimator } from './progress-estimation';
 import {
-  isWailsRuntime, nativeInstallEventName, nativeLoaderInstallEventName,
+  hasNativeDesktopRuntime, nativeInstallEventName, nativeLoaderInstallEventName,
   onNativeEvent, startNativeInstallEvents, startNativeLoaderInstallEvents,
 } from './native';
 import {
@@ -12,7 +13,24 @@ import {
   enqueueInstall, dequeueNextInstall, startInstall, updateInstallProgress,
   completeInstall, setInstallEventSource,
 } from './actions';
-import type { InstallItem, LoaderType } from './types';
+import type { InstallItem, LoaderBuildRecord, LoaderComponentId } from './types';
+
+type InstallProgressEvent = {
+  phase?: string;
+  current?: number;
+  total?: number;
+  file?: string;
+  error?: string;
+  done?: boolean;
+};
+
+const INSTALL_ETA_PHASES = new Set([
+  'libraries',
+  'assets',
+  'loader_libraries',
+  'loader_processors',
+  'processors',
+]);
 
 export function handleInstallClick(): void {
   const inst = selectedInstance.value;
@@ -20,13 +38,39 @@ export function handleInstallClick(): void {
 
   const version = selectedVersion.value;
   const target = version?.needs_install || version?.id || inst.version_id;
-
-  if (version?.inherits_from) {
-    const loader = parseLoaderFromId(target);
-    if (loader) {
-      installLoaderVersion(loader.type, version.inherits_from, loader.loaderVersion, target);
-      return;
-    }
+  const loader = version?.loader
+    ? {
+        componentId: version.loader.component_id as LoaderComponentId,
+        buildId: version.loader.build_id,
+        minecraftVersion: version.inherits_from || '',
+        loaderVersion: version.loader.loader_version,
+        versionId: target,
+      }
+    : parseLoaderFromId(target, version?.inherits_from || '');
+  if (loader) {
+    installLoaderVersion({
+      subject_kind: 'loader_build',
+      component_id: loader.componentId,
+      component_name: '',
+      build_id: loader.buildId,
+      minecraft_version: loader.minecraftVersion,
+      loader_version: loader.loaderVersion,
+      version_id: loader.versionId,
+      build_meta: {
+        terms: [],
+        evidence: [],
+        selection: {
+          default_rank: 0,
+          reason: 'unknown',
+          source: 'none',
+        },
+        display_tags: [],
+      },
+      strategy: '',
+      artifact_kind: '',
+      installability: '',
+    });
+    return;
   }
 
   installVersion(target);
@@ -40,34 +84,107 @@ export function installVersion(target: string): void {
   if (installState.value.status === 'idle') processNextInstall();
 }
 
-function parseLoaderFromId(id: string): { type: LoaderType; loaderVersion: string } | null {
+function parseLoaderFromId(
+  id: string,
+  baseVersion: string,
+): { componentId: LoaderComponentId; buildId: string; minecraftVersion: string; loaderVersion: string; versionId: string } | null {
   const lo = id.toLowerCase();
-  let match: RegExpMatchArray | null;
+  const inferredBase = baseVersion || inferMinecraftVersionFromCompositeId(id);
 
-  match = lo.match(/^fabric-loader-([.\d]+)-/);
-  if (match) return { type: 'fabric', loaderVersion: match[1] };
+  if (lo.startsWith('fabric-loader-')) {
+    const suffix = inferredBase ? `-${inferredBase}` : '';
+    const rest = id.slice('fabric-loader-'.length);
+    const loaderVersion = suffix && rest.endsWith(suffix) ? rest.slice(0, -suffix.length) : rest;
+    if (loaderVersion && inferredBase) {
+      return {
+        componentId: 'net.fabricmc.fabric-loader',
+        buildId: `fabric:${inferredBase}:${loaderVersion}`,
+        minecraftVersion: inferredBase,
+        loaderVersion,
+        versionId: id,
+      };
+    }
+  }
 
-  match = lo.match(/^quilt-loader-([.\d]+)-/);
-  if (match) return { type: 'quilt', loaderVersion: match[1] };
+  if (lo.startsWith('quilt-loader-')) {
+    const suffix = inferredBase ? `-${inferredBase}` : '';
+    const rest = id.slice('quilt-loader-'.length);
+    const loaderVersion = suffix && rest.endsWith(suffix) ? rest.slice(0, -suffix.length) : rest;
+    if (loaderVersion && inferredBase) {
+      return {
+        componentId: 'org.quiltmc.quilt-loader',
+        buildId: `quilt:${inferredBase}:${loaderVersion}`,
+        minecraftVersion: inferredBase,
+        loaderVersion,
+        versionId: id,
+      };
+    }
+  }
 
-  match = id.match(/-forge-([.\d]+)$/i);
-  if (match) return { type: 'forge', loaderVersion: match[1] };
+  const forgeIndex = lo.lastIndexOf('-forge-');
+  if (forgeIndex > 0) {
+    const minecraftVersion = id.slice(0, forgeIndex);
+    const loaderVersion = id.slice(forgeIndex + '-forge-'.length);
+    if (minecraftVersion && loaderVersion) {
+      return {
+        componentId: 'net.minecraftforge',
+        buildId: `forge:${minecraftVersion}:${loaderVersion}`,
+        minecraftVersion,
+        loaderVersion,
+        versionId: id,
+      };
+    }
+  }
 
-  if (lo.includes('neoforge')) {
-    match = id.match(/neoforge-([.\d]+)/i);
-    if (match) return { type: 'neoforge', loaderVersion: match[1] };
+  if (lo.startsWith('neoforge-')) {
+    const loaderVersion = id.slice('neoforge-'.length);
+    const minecraftVersion = inferNeoForgeGameVersion(loaderVersion);
+    if (loaderVersion && minecraftVersion) {
+      return {
+        componentId: 'net.neoforged',
+        buildId: `neoforge:${minecraftVersion}:${loaderVersion}`,
+        minecraftVersion,
+        loaderVersion,
+        versionId: id,
+      };
+    }
   }
 
   return null;
 }
 
-export function installLoaderVersion(loaderType: LoaderType, gameVersion: string, loaderVersion: string, compositeVersionId: string): void {
-  if (!loaderType || !gameVersion || !loaderVersion || !compositeVersionId) return;
+function inferNeoForgeGameVersion(loaderVersion: string): string {
+  const parts = loaderVersion.split('.', 3);
+  if (parts.length < 2) return '';
+  if (parts[1] === '0') return `1.${parts[0]}`;
+  return `1.${parts[0]}.${parts[1]}`;
+}
+
+function inferMinecraftVersionFromCompositeId(id: string): string {
+  const snapshot = id.match(/(\d{2}w\d{2}[a-z])$/i);
+  if (snapshot) return snapshot[1];
+
+  const prerelease = id.match(/(\d+\.\d+(?:\.\d+)?-(?:pre|rc)\d+)$/i);
+  if (prerelease) return prerelease[1];
+
+  const release = id.match(/(\d+\.\d+(?:\.\d+)?)$/);
+  if (release) return release[1];
+
+  return '';
+}
+
+export function installLoaderVersion(build: LoaderBuildRecord): void {
+  if (!build.component_id || !build.build_id || !build.version_id) return;
   const active = installState.value;
-  if (active.status === 'active' && active.versionId === compositeVersionId) return;
+  if (active.status === 'active' && active.versionId === build.version_id) return;
   enqueueInstall({
-    versionId: compositeVersionId,
-    loader: { type: loaderType, gameVersion, loaderVersion },
+    versionId: build.version_id,
+    loader: {
+      componentId: build.component_id,
+      buildId: build.build_id,
+      minecraftVersion: build.minecraft_version,
+      loaderVersion: build.loader_version,
+    },
   });
   if (installState.value.status === 'idle') processNextInstall();
 }
@@ -104,9 +221,8 @@ async function processLoaderInstall(next: InstallItem): Promise<void> {
 
   try {
     const installId = await startLoaderInstall(
-      next.loader.type,
-      next.loader.gameVersion,
-      next.loader.loaderVersion,
+      next.loader.componentId,
+      next.loader.buildId,
     );
     await connectLoaderEvents(installId, next.versionId);
   } catch (err: unknown) {
@@ -115,48 +231,101 @@ async function processLoaderInstall(next: InstallItem): Promise<void> {
   }
 }
 
+function formatCountLabel(base: string, data: InstallProgressEvent): string {
+  if (typeof data.current === 'number' && typeof data.total === 'number' && data.total > 0) {
+    return `${base} (${data.current}/${data.total})`;
+  }
+  return base;
+}
+
+function progressFraction(data: InstallProgressEvent): number {
+  if (typeof data.current !== 'number' || typeof data.total !== 'number' || data.total <= 0) {
+    return 0;
+  }
+  return data.current / data.total;
+}
+
+function phaseLabel(data: InstallProgressEvent, loaderInstall: boolean): string {
+  switch (data.phase) {
+    case 'loader_meta':
+      return 'Fetching loader info...';
+    case 'loader_json':
+      return 'Preparing loader...';
+    case 'profile':
+      return data.file || 'Preparing loader profile...';
+    case 'artifacts':
+      return data.file || 'Downloading loader artifacts...';
+    case 'loader_libraries':
+      return formatCountLabel('Loader libraries', data);
+    case 'loader_processors':
+    case 'processors':
+      return data.file || formatCountLabel('Running processors', data);
+    case 'version_json':
+      return 'Fetching version info...';
+    case 'client_jar':
+      return 'Downloading game JAR...';
+    case 'libraries':
+      return formatCountLabel('Libraries', data);
+    case 'asset_index':
+      return 'Downloading asset index...';
+    case 'assets':
+      return formatCountLabel('Assets', data);
+    case 'log_config':
+      return 'Downloading log config...';
+    case 'java_runtime':
+      return data.file || 'Preparing Java runtime...';
+    case 'done':
+      return 'Complete!';
+    case 'error':
+      return data.error || 'Install failed.';
+    default:
+      if (typeof data.file === 'string' && data.file.trim()) {
+        return data.file;
+      }
+      return loaderInstall ? `Working on ${data.phase || 'loader install'}...` : `Working on ${data.phase || 'install'}...`;
+  }
+}
+
 async function connectVanillaEvents(installId: string, versionId: string): Promise<void> {
   const startedAt = Date.now();
+  const estimator = createProgressEstimator({ etaPhases: INSTALL_ETA_PHASES });
 
-  const onProgress = async (data: any): Promise<void> => {
+  const onProgress = async (data: InstallProgressEvent): Promise<void> => {
     let pct = 0;
-    let label = '';
+    let label = phaseLabel(data, false);
 
     if (data.phase === 'version_json') {
       pct = 2;
-      label = 'Fetching version info...';
     } else if (data.phase === 'client_jar') {
       pct = 7;
-      label = 'Downloading game JAR...';
     } else if (data.phase === 'libraries') {
-      const libraryPct = data.total > 0 ? data.current / data.total : 0;
+      const libraryPct = progressFraction(data);
       pct = 7 + Math.round(libraryPct * 13);
-      label = `Libraries (${data.current}/${data.total})`;
     } else if (data.phase === 'asset_index') {
       pct = 21;
-      label = 'Downloading asset index...';
     } else if (data.phase === 'assets') {
-      const assetPct = data.total > 0 ? data.current / data.total : 0;
+      const assetPct = progressFraction(data);
       pct = 21 + Math.round(assetPct * 72);
-      label = `Assets (${data.current}/${data.total})`;
     } else if (data.phase === 'log_config') {
       pct = 94;
-      label = 'Downloading log config...';
+    } else if (data.phase === 'java_runtime') {
+      pct = 95;
     } else if (data.phase === 'done') {
       pct = 100;
-      label = 'Complete!';
     } else if (data.phase === 'error') {
-      showError(data.error);
+      showError(data.error || 'Install failed.');
       await onInstallDone();
       return;
+    } else {
+      pct = installState.value.status === 'active' ? installState.value.pct : 0;
     }
 
-    updateInstallProgress(pct, appendETA(label, pct, startedAt));
+    updateInstallProgress(pct, estimator.formatLabel(label, data, pct, startedAt));
     if (data.done) await onInstallDone();
   };
 
-  if (isWailsRuntime()) {
-    const subscription = onNativeEvent(nativeInstallEventName(installId), (data) => {
+  if (hasNativeDesktopRuntime()) {
+    const subscription = await onNativeEvent(nativeInstallEventName(installId), (data) => {
       void onProgress(data);
     });
     if (!subscription) throw new Error('native install stream unavailable');
@@ -192,50 +361,51 @@ async function connectVanillaEvents(installId: string, versionId: string): Promi
 
 async function connectLoaderEvents(installId: string, versionId: string): Promise<void> {
   const startedAt = Date.now();
-  const onProgress = (data: any): void => {
+  const estimator = createProgressEstimator({ etaPhases: INSTALL_ETA_PHASES });
+  const onProgress = (data: InstallProgressEvent): void => {
     let pct = 0;
-    let label = '';
+    let label = phaseLabel(data, true);
 
     if (data.phase === 'loader_meta') {
       pct = 1;
-      label = 'Fetching loader info...';
     } else if (data.phase === 'loader_json') {
       pct = 3;
-      label = 'Preparing loader...';
+    } else if (data.phase === 'profile') {
+      pct = 3;
+    } else if (data.phase === 'artifacts') {
+      pct = 6;
     } else if (data.phase === 'loader_libraries') {
-      const loaderPct = data.total > 0 ? data.current / data.total : 0;
+      const loaderPct = progressFraction(data);
       pct = 3 + Math.round(loaderPct * 7);
-      label = `Loader libraries (${data.current}/${data.total})`;
-    } else if (data.phase === 'loader_processors') {
-      const processorPct = data.total > 0 ? data.current / data.total : 0;
+    } else if (data.phase === 'loader_processors' || data.phase === 'processors') {
+      const processorPct = progressFraction(data);
       pct = 10 + Math.round(processorPct * 10);
-      label = data.file || `Processing (${data.current}/${data.total})`;
     } else if (data.phase === 'version_json') {
       pct = 21;
-      label = 'Fetching version info...';
     } else if (data.phase === 'client_jar') {
       pct = 24;
-      label = 'Downloading game JAR...';
     } else if (data.phase === 'libraries') {
-      const libraryPct = data.total > 0 ? data.current / data.total : 0;
+      const libraryPct = progressFraction(data);
       pct = 24 + Math.round(libraryPct * 10);
-      label = `Libraries (${data.current}/${data.total})`;
     } else if (data.phase === 'asset_index') {
       pct = 35;
-      label = 'Downloading asset index...';
     } else if (data.phase === 'assets') {
-      const assetPct = data.total > 0 ? data.current / data.total : 0;
+      const assetPct = progressFraction(data);
       pct = 35 + Math.round(assetPct * 58);
-      label = `Assets (${data.current}/${data.total})`;
     } else if (data.phase === 'log_config') {
       pct = 94;
-      label = 'Downloading log config...';
+    } else if (data.phase === 'java_runtime') {
+      pct = 95;
     } else if (data.phase === 'done') {
       pct = 100;
-      label = 'Complete!';
+    } else if (data.phase === 'error') {
+      onError(data.error || 'Unknown error');
+      return;
+    } else {
+      pct = installState.value.status === 'active' ? installState.value.pct : 0;
     }
 
-    updateInstallProgress(pct, appendETA(label, pct, startedAt));
+    updateInstallProgress(pct, estimator.formatLabel(label, data, pct, startedAt));
     if (data.done) void onInstallDone();
   };
 
@@ -247,8 +417,8 @@ async function connectLoaderEvents(installId: string, versionId: string): Promis
     }
   };
 
-  if (isWailsRuntime()) {
-    const subscription = onNativeEvent(nativeLoaderInstallEventName(installId), (data) => {
+  if (hasNativeDesktopRuntime()) {
+    const subscription = await onNativeEvent(nativeLoaderInstallEventName(installId), (data) => {
       if (data.phase === 'error' || data.error) {
         onError(data.error || 'Unknown error');
         return;
@@ -275,14 +445,6 @@ async function connectLoaderEvents(installId: string, versionId: string): Promis
   );
 
   setInstallEventSource(es);
-}
-
-function appendETA(label: string, pct: number, startedAt: number): string {
-  if (pct <= 5 || pct >= 100) return label;
-  const elapsed = (Date.now() - startedAt) / 1000;
-  const remaining = (elapsed / pct) * (100 - pct);
-  if (remaining < 60) return `${label} — ~${Math.ceil(remaining)}s left`;
-  return `${label} — ~${Math.ceil(remaining / 60)}m left`;
 }
 
 async function onInstallDone(): Promise<void> {

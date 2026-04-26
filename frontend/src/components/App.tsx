@@ -243,28 +243,37 @@ export function App(): JSX.Element {
       <div class="setup-overlay hidden" id="setup-overlay">
         <div class="setup-card">
           <img src="logo.svg" alt="Croopor" width="64" height="64" class="onboarding-logo" />
-          <h1 class="onboarding-title">Minecraft Not Found</h1>
-          <p class="onboarding-sub">Croopor couldn't detect a Minecraft installation on this computer.</p>
+          <h1 class="onboarding-title">Set Up Croopor</h1>
+          <p class="onboarding-sub">Croopor is preparing its managed library.</p>
 
           <div class="setup-options">
             <div class="setup-option">
-              <h3 class="setup-option-title">I have Minecraft installed</h3>
-              <p class="setup-option-sub">Point Croopor to your .minecraft folder</p>
-              <div class="setup-path-row">
-                <input type="text" id="setup-path-input" class="setting-input setup-path-input" placeholder="C:\\Users\\...\\.minecraft" spellcheck={false} autocomplete="off" />
-                <button class="btn-secondary setup-browse-btn" id="setup-browse-btn">Browse</button>
+              <h3 class="setup-option-title">Create a managed library</h3>
+              <p class="setup-option-sub">This keeps Croopor isolated from any existing Minecraft setup.</p>
+              <div class="setup-managed-path" id="setup-managed-path">Preparing default library path...</div>
+              <div class="setup-progress" aria-hidden="true">
+                <div class="setup-progress-bar"></div>
               </div>
-              <span class="setup-error hidden" id="setup-path-error" />
-              <button class="btn-primary setup-action-btn" id="setup-use-btn">Use this path</button>
+              <div class="setup-progress-copy" id="setup-progress-copy">Creating the Croopor library...</div>
+              <button class="btn-primary setup-action-btn" id="setup-init-btn" disabled>Setting up Croopor...</button>
             </div>
 
-            <div class="setup-divider"><span>or</span></div>
-
-            <div class="setup-option">
-              <h3 class="setup-option-title">Set up Minecraft for me</h3>
-              <p class="setup-option-sub">Create a fresh installation and download any version you want</p>
-              <input type="text" id="setup-new-path" class="setting-input setup-path-input" spellcheck={false} autocomplete="off" />
-              <button class="btn-primary setup-action-btn" id="setup-init-btn">Create &amp; Continue</button>
+            <div class="setup-secondary">
+              <button class="btn-ghost setup-advanced-toggle" id="setup-advanced-toggle" type="button">
+                Use an existing Minecraft folder instead
+              </button>
+              <div class="setup-advanced hidden" id="setup-advanced">
+                <div class="setup-option setup-option-secondary">
+                  <h3 class="setup-option-title">Use an existing library</h3>
+                  <p class="setup-option-sub">Point Croopor to an existing .minecraft or compatible game folder.</p>
+                  <div class="setup-path-row">
+                    <input type="text" id="setup-path-input" class="setting-input setup-path-input" placeholder="C:\\Users\\...\\.minecraft" spellcheck={false} autocomplete="off" />
+                    <button class="btn-secondary setup-browse-btn" id="setup-browse-btn">Browse</button>
+                  </div>
+                  <span class="setup-error hidden" id="setup-path-error" />
+                  <button class="btn-secondary setup-action-btn" id="setup-use-btn">Use existing library</button>
+                </div>
+              </div>
             </div>
           </div>
         </div>

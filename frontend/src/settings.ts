@@ -18,6 +18,8 @@ export const settingsJavaPath = signal('');
 export const settingsWindowWidth = signal('');
 export const settingsWindowHeight = signal('');
 export const settingsJvmPreset = signal('');
+export const settingsPerformanceMode = signal('managed');
+export const settingsGuardianMode = signal('managed');
 export const settingsJavaRuntimes = signal<JavaRuntimeInfo[]>([]);
 export const settingsJavaRuntimesState = signal<'idle' | 'loading' | 'ready' | 'error'>('idle');
 
@@ -26,6 +28,8 @@ function syncSettingsDraft(): void {
   settingsWindowWidth.value = config.value?.window_width ? String(config.value.window_width) : '';
   settingsWindowHeight.value = config.value?.window_height ? String(config.value.window_height) : '';
   settingsJvmPreset.value = config.value?.jvm_preset || '';
+  settingsPerformanceMode.value = config.value?.performance_mode || 'managed';
+  settingsGuardianMode.value = config.value?.guardian_mode || 'managed';
 }
 
 export function openSettings(): void {
@@ -50,6 +54,12 @@ export async function saveSettings(): Promise<void> {
 
   const preset: string = settingsJvmPreset.value;
   if (preset !== (config.value?.jvm_preset || '')) updates.jvm_preset = preset;
+
+  const performanceMode: string = settingsPerformanceMode.value;
+  if (performanceMode !== (config.value?.performance_mode || 'managed')) updates.performance_mode = performanceMode;
+
+  const guardianMode: string = settingsGuardianMode.value;
+  if (guardianMode !== (config.value?.guardian_mode || 'managed')) updates.guardian_mode = guardianMode;
 
   const widthRaw: string = settingsWindowWidth.value.trim();
   const heightRaw: string = settingsWindowHeight.value.trim();

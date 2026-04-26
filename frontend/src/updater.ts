@@ -1,7 +1,7 @@
 import { local, saveLocalState } from './state';
 import { api } from './api';
 import { toast } from './toast';
-import { openExternalURL, isWailsRuntime } from './native';
+import { hasNativeDesktopRuntime, openExternalURL } from './native';
 import { appVersion, bootstrapState, installState, launchState, updateCheckState, updateInfo } from './store';
 import type { UpdateInfo } from './types';
 import { errMessage } from './utils';
@@ -20,7 +20,7 @@ function displayVersion(version: string): string {
 }
 
 function shouldAutoCheck(): boolean {
-  if (!isWailsRuntime()) return false;
+  if (!hasNativeDesktopRuntime()) return false;
   const last = Date.parse(local.lastUpdateCheckAt || '');
   return Number.isNaN(last) || (Date.now() - last) >= AUTO_CHECK_INTERVAL_MS;
 }
@@ -115,7 +115,7 @@ export async function checkForUpdates(options: { force?: boolean; silent?: boole
 }
 
 export function scheduleAutoUpdateCheck(): void {
-  if (!isWailsRuntime()) return;
+  if (!hasNativeDesktopRuntime()) return;
   if (!shouldAutoCheck()) {
     queueAutoUpdateCheck(AUTO_CHECK_INTERVAL_MS);
     return;
@@ -128,7 +128,7 @@ export function scheduleAutoUpdateCheck(): void {
 }
 
 async function runAutoUpdateCheck(): Promise<void> {
-  if (!isWailsRuntime()) return;
+  if (!hasNativeDesktopRuntime()) return;
   if (!shouldAutoCheck()) {
     queueAutoUpdateCheck(AUTO_CHECK_INTERVAL_MS);
     return;

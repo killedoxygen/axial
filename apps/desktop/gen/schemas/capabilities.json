@@ -1,0 +1,1 @@
+{"main-capability":{"identifier":"main-capability","description":"Main desktop capability for the Croopor rewrite shell","remote":{"urls":["http://127.0.0.1:43430/*","http://localhost:43430/*"]},"local":true,"windows":["main"],"permissions":["core:default"]}}

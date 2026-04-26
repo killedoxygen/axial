@@ -91,7 +91,7 @@ if (mode === 'serve') {
   console.log(`dev → http://localhost:${server.port}`);
   await new Promise(() => {});
 } else if (mode === 'watch') {
-  // File watcher for wails dev, rebuilds to disk on source change
+  // File watcher for desktop development, rebuilds to disk on source change
   currentCtx = await context({
     ...shared, sourcemap: 'inline', metafile: true, plugins: [sizeReporter],
   });

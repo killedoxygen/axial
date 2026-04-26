@@ -1,31 +1,43 @@
-import { EventsOn } from './wailsjs/runtime/runtime';
+interface TauriInvokeBinding {
+  invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T>;
+}
 
-interface WailsAppBinding {
-  Version(): Promise<string>;
-  BrowseDirectory(defaultPath: string): Promise<string>;
-  OpenExternalURL(url: string): Promise<void>;
-  ShowNotice(title: string, message: string): Promise<void>;
-  StartInstallEvents(installId: string): Promise<void>;
-  StartLoaderInstallEvents(installId: string): Promise<void>;
-  StartLaunchEvents(sessionId: string): Promise<void>;
+interface TauriEventBinding {
+  listen(eventName: string, callback: (event: { payload: any }) => void): Promise<() => void>;
+}
+
+interface TauriDialogBinding {
+  open(options?: Record<string, unknown>): Promise<string | string[] | null>;
+  message(message: string, options?: Record<string, unknown>): Promise<void>;
+}
+
+interface TauriOpenerBinding {
+  openUrl(url: string): Promise<void>;
+}
+
+interface TauriBinding {
+  core?: TauriInvokeBinding;
+  event?: TauriEventBinding;
+  dialog?: TauriDialogBinding;
+  opener?: TauriOpenerBinding;
 }
 
 declare global {
   interface Window {
-    go?: {
-      main?: {
-        App?: WailsAppBinding;
-      };
-    };
+    __TAURI__?: TauriBinding;
   }
 }
 
-function getBinding(): WailsAppBinding | null {
-  return window.go?.main?.App ?? null;
+function getTauriBinding(): TauriBinding | null {
+  return window.__TAURI__ ?? null;
 }
 
-export function isWailsRuntime(): boolean {
-  return getBinding() !== null;
+export function isTauriRuntime(): boolean {
+  return getTauriBinding() !== null;
+}
+
+export function hasNativeDesktopRuntime(): boolean {
+  return isTauriRuntime();
 }
 
 export function nativeInstallEventName(installId: string): string {
@@ -44,57 +56,74 @@ export function nativeLaunchLogEventName(sessionId: string): string {
   return `croopor:launch:${sessionId}:log`;
 }
 
-export function onNativeEvent(eventName: string, callback: (data: any) => void): { close(): void } | null {
-  if (!isWailsRuntime()) return null;
-  const unsubscribe = EventsOn(eventName, (...data: any[]) => callback(data[0]));
-  return { close: unsubscribe };
+export async function onNativeEvent(eventName: string, callback: (data: any) => void): Promise<{ close(): void } | null> {
+  const tauri = getTauriBinding();
+  if (!tauri?.event) return null;
+
+  const unsubscribe = await tauri.event.listen(eventName, (event) => {
+    callback(event.payload);
+  });
+
+  return {
+    close(): void {
+      unsubscribe();
+    },
+  };
 }
 
 export async function getNativeAppVersion(): Promise<string | null> {
-  const binding = getBinding();
-  if (!binding) return null;
-  return binding.Version();
+  const tauri = getTauriBinding();
+  if (!tauri?.core) return null;
+  return tauri.core.invoke<string>('app_version');
 }
 
 export async function browseDirectory(defaultPath = ''): Promise<string | null> {
-  const binding = getBinding();
-  if (!binding) return null;
-  return binding.BrowseDirectory(defaultPath);
+  const tauri = getTauriBinding();
+  if (!tauri?.dialog) return null;
+  const result = await tauri.dialog.open({
+    directory: true,
+    defaultPath,
+    multiple: false,
+  });
+
+  if (Array.isArray(result)) return result[0] ?? null;
+  return result;
 }
 
 export async function openExternalURL(url: string): Promise<void> {
-  const binding = getBinding();
-  if (!binding) {
-    window.open(url, '_blank', 'noopener,noreferrer');
+  const tauri = getTauriBinding();
+  if (tauri?.opener) {
+    await tauri.opener.openUrl(url);
     return;
   }
-  await binding.OpenExternalURL(url);
+
+  window.open(url, '_blank', 'noopener,noreferrer');
 }
 
 export async function showNativeNotice(title: string, message: string): Promise<boolean> {
-  const binding = getBinding();
-  if (!binding) return false;
-  await binding.ShowNotice(title, message);
+  const tauri = getTauriBinding();
+  if (!tauri?.dialog) return false;
+  await tauri.dialog.message(message, { title, kind: 'info' });
   return true;
 }
 
 export async function startNativeInstallEvents(installId: string): Promise<boolean> {
-  const binding = getBinding();
-  if (!binding) return false;
-  await binding.StartInstallEvents(installId);
+  const tauri = getTauriBinding();
+  if (!tauri?.core) return false;
+  await tauri.core.invoke('start_install_events', { installId });
   return true;
 }
 
 export async function startNativeLoaderInstallEvents(installId: string): Promise<boolean> {
-  const binding = getBinding();
-  if (!binding) return false;
-  await binding.StartLoaderInstallEvents(installId);
+  const tauri = getTauriBinding();
+  if (!tauri?.core) return false;
+  await tauri.core.invoke('start_loader_install_events', { installId });
   return true;
 }
 
 export async function startNativeLaunchEvents(sessionId: string): Promise<boolean> {
-  const binding = getBinding();
-  if (!binding) return false;
-  await binding.StartLaunchEvents(sessionId);
+  const tauri = getTauriBinding();
+  if (!tauri?.core) return false;
+  await tauri.core.invoke('start_launch_events', { sessionId });
   return true;
 }

@@ -1,6 +1,5 @@
 import { api, API } from './api';
 import { catalog, versions } from './store';
-import { isWailsRuntime } from './native';
 import type { Version } from './types';
 
 let versionWatcher: EventSource | null = null;
@@ -35,12 +34,6 @@ export function watchVersions(): void {
   if (versionPollTimer) {
     clearInterval(versionPollTimer);
     versionPollTimer = null;
-  }
-
-  if (isWailsRuntime()) {
-    void pollVersions();
-    versionPollTimer = setInterval(() => { void pollVersions(); }, 5000);
-    return;
   }
 
   const es = new EventSource(`${API}/versions/watch`);

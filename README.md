@@ -1,5 +1,5 @@
 # croopor
-offline minecraft launcher, built as a wails desktop app.
+offline minecraft launcher. on `rewrite-in-rust`, the active desktop/backend path is Rust + Tauri.
 
 it already handles:
 - multi-instance installs
@@ -10,18 +10,19 @@ it already handles:
 - desktop update detection
 
 ## stack
-- desktop shell: wails
+- desktop shell: tauri
 - frontend: preact + signals
-- backend: go + `/api/v1/*`
-- desktop event streaming: wails runtime events
+- backend: rust workspace under `apps/` and `core/`
+- desktop event streaming: tauri-native bridge
 - browser mode: sse
 
 ## prereqs
-- go 1.25+
+- rust stable with `rustfmt` and `clippy`
 - node 22+
 - ubuntu 24.04 linux desktop builds need `libgtk-3-dev` and `libwebkit2gtk-4.1-dev`
 
-you do **not** need to install `task`, `pnpm`, `wails`, or `goreleaser` globally for normal local work.
+you do **not** need to install `task` or `pnpm` globally for normal local work.
+you also do not need a global cargo plugin setup.
 
 ubuntu 24.04 quick prereqs:
 
@@ -36,7 +37,6 @@ main entrypoints:
 - windows powershell: `.\dev.ps1`
 - windows cmd: `dev.cmd`
 
-the repo bootstraps its own local tools into `.tools/bin`.
 extra compatibility path:
 - unix, mac, wsl: `make`
 
@@ -58,27 +58,40 @@ windows powershell:
 ```
 
 ## common commands
-- `setup`: install go deps, frontend deps, and the local wails cli
-- `dev`: run desktop dev with wails
+- `setup`: install frontend deps and prefetch Rust deps
+- on Linux/WSL, `setup` also prepares the Windows GNU target and MinGW linker for cross-builds
+- `dev`: run desktop dev with Rust + Tauri
 - `dev-web`: run the frontend-only dev server
-- `dev-windows`: build and launch the windows dev binary
 - `watch`: rebuild frontend assets on file changes
-- `build`: build the native release binary for this machine
-- `build-dev`: build the native dev binary for this machine
-- `build-windows`: cross-build a windows amd64 release binary
-- `build-windows-dev`: cross-build a windows amd64 dev binary
-- `verify`: run checks, tests, and native builds
+- `check`: run `fmt`, `check`, `clippy`, and frontend typecheck
+- `test`: run the Rust workspace tests
+- `verify`: run checks, tests, frontend build, and a release desktop build
+- `rust:fmt`: run Rust formatting checks
+- `rust:fmt:fix`: format Rust code
+- `rust:check`: typecheck the Rust workspace
+- `rust:clippy`: run clippy with warnings denied
+- `rust:test`: run the Rust workspace tests
+- `rust:api`: run the Rust Axum API
+- `rust:desktop`: run the Rust Tauri desktop shell
+- `build`: build the release desktop binary
+- `build-dev`: build the dev desktop binary
+- `build --target windows`: build the release Windows desktop binary from Linux/WSL
+- `build-dev --target windows`: build the dev Windows desktop binary from Linux/WSL
+- `build:windows`: explicit alias for the release Windows cross-build
+- `build:windows:dev`: explicit alias for the dev Windows cross-build
+- `build:api`: build the dev API binary
+- `build:api:release`: build the release API binary
 - `doctor`: show detected tools and platform state
-- `clean`: remove build outputs and go caches
+- `clean`: remove `target/` and `dist/`
 
 examples:
 
 ```bash
 ./dev setup
 ./dev dev-web
-./dev dev-windows
 ./dev watch
 ./dev build-dev
+./dev build --target windows
 ./dev verify
 ```
 
@@ -91,47 +104,32 @@ if you are in headless wsl, use:
 ./dev dev-web
 ```
 
-if you want the windows app from wsl instead of the linux desktop app:
-
-```bash
-./dev dev-windows
-```
-
 frontend dev server port is configurable:
 
 ```bash
 PORT=3001 ./dev dev-web
 ```
 
-## direct task usage
-`task` is the workflow engine, not the required user entrypoint.
-
-if you really want to use it directly after setup:
+windows cross-build note:
 
 ```bash
-.tools/bin/task --list
+./dev setup
+./dev build --target windows
 ```
 
-## release
-tag pushes build release artifacts and updater metadata.
+on Ubuntu/WSL, `setup` installs the Rust target and `gcc-mingw-w64-x86-64` by default unless `CI=true`.
+this currently builds a raw Windows `.exe`, not a signed installer or updater package.
 
-current release output:
-- raw binaries through goreleaser
-- linux amd64 appimage
-- windows msix + appinstaller files for internal updater validation
-- github pages update metadata at `updates/stable.json`
+## taskfile
+`Taskfile.yml` mirrors the same commands as `./dev`, but it is optional.
 
-hard todo:
-- do not ship public windows updater artifacts signed with dev/test/self-signed certs
-- windows msix + appinstaller should only become a public release path once real production signing is set up
-- until then, windows users stay on the normal release binary path
-
-local snapshot:
+if you already have `task` installed and prefer it:
 
 ```bash
-./dev release-snapshot
+task --list
 ```
 
 ## maintainer docs
 - `docs/CONVENTIONS.md`
 - `docs/ARCHITECTURE.md`
+- `plans/RUST-REWRITE.md`

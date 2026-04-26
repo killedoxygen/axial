@@ -2,49 +2,60 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TOOLS_DIR="$ROOT/.tools/bin"
-TASK_BIN="$TOOLS_DIR/task"
-TASK_VERSION="v3.49.1"
 
 print_help() {
   cat <<'EOF'
 croopor dev cli
 
 setup once
-  ./dev setup              install go deps, frontend deps, and local dev tools
+  ./dev setup              install frontend deps, prefetch rust deps, and prep Windows cross-builds on Linux/WSL
 
 daily
-  ./dev dev                run desktop dev with wails
+  ./dev dev                run desktop dev with rust + tauri
   ./dev dev-web            run the frontend-only dev server
-  ./dev dev-windows        build and launch the windows dev binary
-  ./dev build              build the native release binary for this machine
-  ./dev build-dev          build the native dev binary for this machine
-  ./dev verify             run checks, tests, and native builds
-  ./dev clean              remove build outputs and go caches
+  ./dev watch              rebuild frontend assets on file changes
+  ./dev check              run static checks
+  ./dev test               run rust tests
+  ./dev verify             run checks, tests, and a release desktop build
+  ./dev clean              remove build outputs and caches
+
+build
+  ./dev build              build the release desktop binary
+  ./dev build-dev          build the dev desktop binary
+  ./dev build --target windows
+  ./dev build-dev --target windows
+  ./dev build:windows      build the release Windows desktop binary from linux/wsl
+  ./dev build:windows:dev  build the dev Windows desktop binary from linux/wsl
+  ./dev build:api          build the dev api binary
+  ./dev build:api:release  build the release api binary
+
+rust
+  ./dev rust:check
+  ./dev rust:clippy
+  ./dev rust:fmt
+  ./dev rust:fmt:fix
+  ./dev rust:test
+  ./dev rust:api
+  ./dev rust:desktop
+
+frontend
+  ./dev frontend:install
+  ./dev frontend:check
+  ./dev frontend:build
+  ./dev frontend:watch
+  ./dev frontend:serve
 
 other
-  ./dev build-windows
-  ./dev build-windows-dev
-  ./dev release-snapshot
   ./dev doctor
   ./dev help
 
 notes
   - on WSL, desktop dev needs WSLg or another Linux GUI session
   - if you only need frontend work in WSL/headless, use ./dev dev-web
-  - if you want the windows app from WSL, use ./dev dev-windows
+  - windows cross-builds use x86_64-pc-windows-gnu and require the rust target + mingw linker
   - make is just a unix/wsl convenience wrapper around this script
+  - Taskfile.yml mirrors these commands but is optional
 EOF
-}
-
-ensure_task() {
-  if [ -x "$TASK_BIN" ]; then
-    return
-  fi
-
-  mkdir -p "$TOOLS_DIR"
-  echo "bootstrapping local task into .tools/bin"
-  GOBIN="$TOOLS_DIR" go install "github.com/go-task/task/v3/cmd/task@${TASK_VERSION}"
 }
 
 check_desktop_env() {
@@ -53,17 +64,6 @@ check_desktop_env() {
     echo "use './dev dev-web' for frontend-only work in headless WSL."
     exit 1
   fi
-}
-
-is_interruptible_dev_command() {
-  case "${1:-}" in
-    dev|dev-web|watch|dev:desktop|dev-desktop|frontend:serve|frontend:watch|wails:dev)
-      return 0
-      ;;
-    *)
-      return 1
-      ;;
-  esac
 }
 
 run_interruptible() {
@@ -80,45 +80,365 @@ run_interruptible() {
   exit "$status"
 }
 
+run_frontend() {
+  corepack pnpm --dir "$ROOT/frontend" "$@"
+}
+
+windows_target_triple() {
+  echo "x86_64-pc-windows-gnu"
+}
+
+ensure_linux_windows_cross_setup() {
+  local target
+  target="$(windows_target_triple)"
+
+  if rustup target list --installed | grep -Fxq "$target"; then
+    :
+  else
+    rustup target add "$target"
+  fi
+
+  if ! command -v apt-get >/dev/null 2>&1; then
+    return
+  fi
+  if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
+    return
+  fi
+  if [ "${CI:-}" = "true" ]; then
+    echo "skipping apt install for Windows cross-build prerequisites in CI" >&2
+    return
+  fi
+
+  if [ "$(id -u)" -eq 0 ]; then
+    apt-get install -y gcc-mingw-w64-x86-64
+    return
+  fi
+  if command -v sudo >/dev/null 2>&1; then
+    sudo apt-get install -y gcc-mingw-w64-x86-64
+    return
+  fi
+
+  echo "missing MinGW linker: x86_64-w64-mingw32-gcc" >&2
+  echo "install it with: sudo apt-get install -y gcc-mingw-w64-x86-64" >&2
+  exit 1
+}
+
+run_setup() {
+  run_frontend install --frozen-lockfile --ignore-scripts
+  cargo fetch --locked
+  case "$(uname -s)" in
+    Linux)
+      ensure_linux_windows_cross_setup
+      ;;
+  esac
+}
+
+run_doctor() {
+  echo "rustc    $(rustc --version)"
+  echo "cargo    $(cargo --version)"
+  echo "rustfmt  $(cargo fmt --version 2>/dev/null || echo missing)"
+  echo "clippy   $(cargo clippy --version 2>/dev/null || echo missing)"
+  echo "node     $(node --version)"
+  echo "corepack $(corepack --version)"
+  if command -v task >/dev/null 2>&1; then
+    echo "task     $(task --version)"
+  else
+    echo "task     optional"
+  fi
+  if [ -n "${WSL_DISTRO_NAME:-}" ]; then
+    echo "wsl      yes"
+    if [ -n "${WAYLAND_DISPLAY:-}" ] || [ -n "${DISPLAY:-}" ]; then
+      echo "gui      detected"
+    else
+      echo "gui      missing, use './dev dev-web' or run under WSLg"
+    fi
+  else
+    echo "wsl      no"
+  fi
+}
+
+run_check() {
+  run_frontend run check
+  cargo fmt --all --check
+  cargo check --workspace --locked
+  cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+}
+
+run_verify() {
+  run_frontend run build
+  run_check
+  cargo test --workspace --locked
+  cargo build --locked -p croopor-desktop --release
+}
+
+ensure_windows_cross_target_ready() {
+  local target
+  target="$(windows_target_triple)"
+
+  if ! rustup target list --installed | grep -Fxq "$target"; then
+    echo "missing Rust target: $target" >&2
+    echo "install it with: rustup target add $target" >&2
+    exit 1
+  fi
+
+  if ! command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
+    echo "missing MinGW linker: x86_64-w64-mingw32-gcc" >&2
+    echo "on Ubuntu/WSL install it with: sudo apt-get install -y gcc-mingw-w64-x86-64" >&2
+    exit 1
+  fi
+}
+
+resolve_build_target() {
+  local target=""
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --target)
+        if [ "$#" -lt 2 ]; then
+          echo "missing value for --target" >&2
+          exit 1
+        fi
+        case "$2" in
+          windows|windows-x64)
+            target="$(windows_target_triple)"
+            ;;
+          *)
+            target="$2"
+            ;;
+        esac
+        shift 2
+        ;;
+      --windows|--windows-x64)
+        target="$(windows_target_triple)"
+        shift
+        ;;
+      *)
+        echo "unknown build option: $1" >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  echo "$target"
+}
+
+report_desktop_artifact() {
+  local profile="$1"
+  local target="${2:-}"
+  local artifact_root="$ROOT/target"
+  local extension=""
+
+  if [ -n "$target" ]; then
+    artifact_root="$artifact_root/$target"
+  fi
+  if [[ "$target" == *windows* ]]; then
+    extension=".exe"
+  fi
+
+  echo "artifact → $artifact_root/$profile/croopor-desktop$extension"
+}
+
+run_desktop_build() {
+  local profile="$1"
+  shift
+
+  local target
+  target="$(resolve_build_target "$@")"
+
+  run_frontend run build
+
+  if [ "$target" = "$(windows_target_triple)" ]; then
+    ensure_windows_cross_target_ready
+  fi
+
+  local cargo_args=(build --locked -p croopor-desktop)
+  if [ "$profile" = "release" ]; then
+    cargo_args+=(--release)
+  fi
+  if [ -n "$target" ]; then
+    cargo_args+=(--target "$target")
+  fi
+
+  cargo "${cargo_args[@]}"
+  report_desktop_artifact "$profile" "$target"
+}
+
 main() {
   local cmd="${1:-help}"
+  shift || true
 
   case "$cmd" in
     help|-h|--help)
       print_help
-      exit 0
       ;;
-    bootstrap)
-      ensure_task
-      exit 0
+    setup)
+      if [ "$#" -ne 0 ]; then
+        echo "setup does not accept extra arguments" >&2
+        exit 1
+      fi
+      run_setup
       ;;
-  esac
-
-  ensure_task
-  export PATH="$TOOLS_DIR:$PATH"
-
-  case "$cmd" in
-    dev|dev:desktop|wails:dev)
+    doctor)
+      if [ "$#" -ne 0 ]; then
+        echo "doctor does not accept extra arguments" >&2
+        exit 1
+      fi
+      run_doctor
+      ;;
+    dev|dev:desktop|dev-desktop|rust:desktop)
+      if [ "$#" -ne 0 ]; then
+        echo "$cmd does not accept extra arguments" >&2
+        exit 1
+      fi
       check_desktop_env
+      run_interruptible cargo run --locked -p croopor-desktop
       ;;
-  esac
-
-  case "$cmd" in
-    dev|dev:desktop|dev-desktop|wails:dev)
-      export PATH="$TOOLS_DIR:$PATH"
-      run_interruptible wails dev
+    rust:api)
+      if [ "$#" -ne 0 ]; then
+        echo "rust:api does not accept extra arguments" >&2
+        exit 1
+      fi
+      run_interruptible cargo run --locked -p croopor-api
       ;;
     dev-web|frontend:serve|web)
-      cd "$ROOT/frontend"
-      run_interruptible node esbuild.mjs serve
+      if [ "$#" -ne 0 ]; then
+        echo "$cmd does not accept extra arguments" >&2
+        exit 1
+      fi
+      run_interruptible corepack pnpm --dir "$ROOT/frontend" run dev
       ;;
     watch|frontend:watch)
-      cd "$ROOT/frontend"
-      run_interruptible node esbuild.mjs watch
+      if [ "$#" -ne 0 ]; then
+        echo "$cmd does not accept extra arguments" >&2
+        exit 1
+      fi
+      run_interruptible corepack pnpm --dir "$ROOT/frontend" run watch
+      ;;
+    frontend:install)
+      if [ "$#" -ne 0 ]; then
+        echo "frontend:install does not accept extra arguments" >&2
+        exit 1
+      fi
+      run_frontend install --frozen-lockfile --ignore-scripts
+      ;;
+    frontend:check)
+      if [ "$#" -ne 0 ]; then
+        echo "frontend:check does not accept extra arguments" >&2
+        exit 1
+      fi
+      run_frontend run check
+      ;;
+    frontend:build)
+      if [ "$#" -ne 0 ]; then
+        echo "frontend:build does not accept extra arguments" >&2
+        exit 1
+      fi
+      run_frontend run build
+      ;;
+    rust:fetch)
+      if [ "$#" -ne 0 ]; then
+        echo "rust:fetch does not accept extra arguments" >&2
+        exit 1
+      fi
+      cargo fetch --locked
+      ;;
+    rust:fmt)
+      if [ "$#" -ne 0 ]; then
+        echo "rust:fmt does not accept extra arguments" >&2
+        exit 1
+      fi
+      cargo fmt --all --check
+      ;;
+    rust:fmt:fix)
+      if [ "$#" -ne 0 ]; then
+        echo "rust:fmt:fix does not accept extra arguments" >&2
+        exit 1
+      fi
+      cargo fmt --all
+      ;;
+    rust:check)
+      if [ "$#" -ne 0 ]; then
+        echo "rust:check does not accept extra arguments" >&2
+        exit 1
+      fi
+      cargo check --workspace --locked
+      ;;
+    rust:clippy)
+      if [ "$#" -ne 0 ]; then
+        echo "rust:clippy does not accept extra arguments" >&2
+        exit 1
+      fi
+      cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      ;;
+    rust:test|test)
+      if [ "$#" -ne 0 ]; then
+        echo "$cmd does not accept extra arguments" >&2
+        exit 1
+      fi
+      cargo test --workspace --locked
+      ;;
+    check)
+      if [ "$#" -ne 0 ]; then
+        echo "check does not accept extra arguments" >&2
+        exit 1
+      fi
+      run_check
+      ;;
+    verify)
+      if [ "$#" -ne 0 ]; then
+        echo "verify does not accept extra arguments" >&2
+        exit 1
+      fi
+      run_verify
+      ;;
+    build|build-local)
+      run_desktop_build release "$@"
+      ;;
+    build-dev|build-local-dev)
+      run_desktop_build debug "$@"
+      ;;
+    build:windows)
+      if [ "$#" -ne 0 ]; then
+        echo "build:windows does not accept extra arguments" >&2
+        exit 1
+      fi
+      run_desktop_build release --target windows
+      ;;
+    build:windows:dev)
+      if [ "$#" -ne 0 ]; then
+        echo "build:windows:dev does not accept extra arguments" >&2
+        exit 1
+      fi
+      run_desktop_build debug --target windows
+      ;;
+    build:api)
+      if [ "$#" -ne 0 ]; then
+        echo "build:api does not accept extra arguments" >&2
+        exit 1
+      fi
+      cargo build --locked -p croopor-api
+      ;;
+    build:api:release)
+      if [ "$#" -ne 0 ]; then
+        echo "build:api:release does not accept extra arguments" >&2
+        exit 1
+      fi
+      cargo build --locked -p croopor-api --release
+      ;;
+    clean)
+      if [ "$#" -ne 0 ]; then
+        echo "clean does not accept extra arguments" >&2
+        exit 1
+      fi
+      cargo clean
+      rm -rf "$ROOT/dist"
+      ;;
+    *)
+      echo "unknown command: $cmd" >&2
+      echo "run './dev help' to see available commands." >&2
+      exit 1
       ;;
   esac
-
-  exec "$TASK_BIN" -d "$ROOT" "$@"
 }
 
 main "$@"

@@ -1,0 +1,28 @@
+[package]
+name = "croopor-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+async-stream.workspace = true
+axum.workspace = true
+chrono.workspace = true
+futures-util.workspace = true
+include_dir.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+shlex.workspace = true
+sysinfo.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+croopor-config = { path = "../../core/config" }
+croopor-launcher = { path = "../../core/launcher" }
+croopor-minecraft = { path = "../../core/minecraft" }
+croopor-performance = { path = "../../core/performance" }

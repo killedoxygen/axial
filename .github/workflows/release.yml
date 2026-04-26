@@ -7,16 +7,10 @@ on:
 
 permissions:
   contents: write
-  packages: read
-  pages: write
-  id-token: write
 
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
-
-env:
-  APPIMAGETOOL_VERSION: "continuous"
 
 jobs:
   verify:
@@ -29,8 +23,6 @@ jobs:
       - name: Trust checkout as a safe git directory
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - uses: arduino/setup-task@v2
-
       - uses: pnpm/action-setup@v4
         with:
           version: 10.33.0
@@ -42,20 +34,37 @@ jobs:
           cache: pnpm
           cache-dependency-path: frontend/pnpm-lock.yaml
 
-      - uses: actions/setup-go@v5
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          go-version-file: go.mod
+          components: rustfmt, clippy
 
-      - name: Install Wails CLI
-        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.11.0
+      - uses: Swatinem/rust-cache@v2
 
       - name: Install frontend dependencies
-        run: task frontend:install
+        run: corepack pnpm --dir frontend install --frozen-lockfile --ignore-scripts
 
-      - name: Verify
-        run: task verify
+      - name: Rust fmt
+        run: cargo fmt --all --check
 
-  release-binaries:
+      - name: Rust check
+        run: cargo check --workspace --locked
+
+      - name: Rust clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Rust tests
+        run: cargo test --workspace --locked
+
+      - name: Frontend typecheck
+        run: corepack pnpm --dir frontend run check
+
+      - name: Frontend build
+        run: corepack pnpm --dir frontend run build
+
+      - name: Release desktop build
+        run: cargo build --locked -p croopor-desktop --release
+
+  linux-desktop:
     needs: verify
     runs-on: ubuntu-24.04
     container:
@@ -77,258 +86,71 @@ jobs:
           cache: pnpm
           cache-dependency-path: frontend/pnpm-lock.yaml
 
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
+      - uses: dtolnay/rust-toolchain@stable
 
-      - name: Release with goreleaser
-        uses: goreleaser/goreleaser-action@v6
-        with:
-          version: v2.8.2
-          args: release --clean
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  linux-appimage:
-    needs:
-      - verify
-      - release-binaries
-    runs-on: ubuntu-24.04
-    container:
-      image: ghcr.io/mateoltd/croopor-linux-ci:latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Trust checkout as a safe git directory
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10.33.0
-          run_install: false
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-          cache-dependency-path: frontend/pnpm-lock.yaml
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
+      - uses: Swatinem/rust-cache@v2
 
       - name: Install frontend dependencies
-        run: pnpm --dir frontend install --frozen-lockfile --ignore-scripts
+        run: corepack pnpm --dir frontend install --frozen-lockfile --ignore-scripts
 
       - name: Build frontend bundle
-        run: pnpm --dir frontend run build
+        run: corepack pnpm --dir frontend run build
 
-      - name: Build AppImage
+      - name: Build release desktop binary
+        run: cargo build --locked -p croopor-desktop --release
+
+      - name: Package linux desktop binary
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          mkdir -p dist/appimage/AppDir/usr/bin
-          mkdir -p dist/appimage/AppDir/usr/share/applications
-          mkdir -p dist/appimage/AppDir/usr/share/icons/hicolor/256x256/apps
-          go build -trimpath -tags webkit2_41 -ldflags "-s -w -X main.version=${VERSION}" -o dist/appimage/AppDir/usr/bin/croopor .
-          cp packaging/linux/croopor.desktop dist/appimage/AppDir/usr/share/applications/croopor.desktop
-          cp frontend/static/logo.png dist/appimage/AppDir/usr/share/icons/hicolor/256x256/apps/croopor.png
-          ln -sf usr/share/applications/croopor.desktop dist/appimage/AppDir/croopor.desktop
-          ln -sf usr/share/icons/hicolor/256x256/apps/croopor.png dist/appimage/AppDir/.DirIcon
-          ln -sf usr/share/icons/hicolor/256x256/apps/croopor.png dist/appimage/AppDir/croopor.png
-          cat > dist/appimage/AppDir/AppRun <<'EOF'
-          #!/bin/sh
-          HERE="$(dirname "$(readlink -f "$0")")"
-          exec "$HERE/usr/bin/croopor" "$@"
-          EOF
-          chmod +x dist/appimage/AppDir/AppRun
-          curl -L -o dist/appimagetool.AppImage https://github.com/AppImage/AppImageKit/releases/download/${APPIMAGETOOL_VERSION}/appimagetool-x86_64.AppImage
-          chmod +x dist/appimagetool.AppImage
-          ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 ./dist/appimagetool.AppImage dist/appimage/AppDir dist/croopor-linux-amd64.AppImage
+          mkdir -p dist/linux
+          cp target/release/croopor-desktop dist/linux/croopor
+          chmod +x dist/linux/croopor
+          tar -C dist/linux -czf "dist/croopor-linux-amd64-${VERSION}.tar.gz" croopor
 
-      - name: Upload AppImage to release
+      - name: Upload linux release asset
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/croopor-linux-amd64.AppImage
+          files: dist/croopor-linux-amd64-*.tar.gz
 
-  windows-msix:
-    needs:
-      - verify
-      - release-binaries
+  windows-desktop:
+    needs: verify
     runs-on: windows-latest
-    # hard TODO:
-    # do not publish windows msix/appinstaller artifacts to real users unless they are signed
-    # with a real long-lived production certificate.
-    # dev/test/self-signed windows updater artifacts are not acceptable public release assets.
-    # if signing is not ready, skip this packaging path and keep windows users on the raw release binary path.
-    env:
-      WINDOWS_SIGNING_READY: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 != '' && secrets.WINDOWS_SIGNING_PFX_PASSWORD != '' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - goarch: amd64
-            appx_arch: x64
-          - goarch: arm64
-            appx_arch: arm64
     steps:
       - uses: actions/checkout@v4
 
       - uses: pnpm/action-setup@v4
-        if: env.WINDOWS_SIGNING_READY == 'true'
         with:
           version: 10.33.0
           run_install: false
 
       - uses: actions/setup-node@v4
-        if: env.WINDOWS_SIGNING_READY == 'true'
         with:
           node-version: 22
           cache: pnpm
           cache-dependency-path: frontend/pnpm-lock.yaml
 
-      - uses: actions/setup-go@v5
-        if: env.WINDOWS_SIGNING_READY == 'true'
-        with:
-          go-version-file: go.mod
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
 
       - name: Install frontend dependencies
-        if: env.WINDOWS_SIGNING_READY == 'true'
-        run: pnpm --dir frontend install --frozen-lockfile --ignore-scripts
+        run: corepack pnpm --dir frontend install --frozen-lockfile --ignore-scripts
 
       - name: Build frontend bundle
-        if: env.WINDOWS_SIGNING_READY == 'true'
-        run: pnpm --dir frontend run build
+        run: corepack pnpm --dir frontend run build
 
-      - name: Build and package MSIX
-        if: env.WINDOWS_SIGNING_READY == 'true'
+      - name: Build release desktop binary
+        run: cargo build --locked -p croopor-desktop --release
+
+      - name: Package windows desktop binary
         shell: pwsh
-        env:
-          WINDOWS_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
-          WINDOWS_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
         run: |
           $version = $env:GITHUB_REF_NAME.TrimStart('v')
-          $packageVersion = "$version.0"
-          $repoOwner = '${{ github.repository_owner }}'
-          $repoName = '${{ github.event.repository.name }}'
-          $goarch = '${{ matrix.goarch }}'
-          $appxArch = '${{ matrix.appx_arch }}'
-          $appInstallerName = "croopor-windows-$goarch.appinstaller"
-          $pagesUrl = "https://$repoOwner.github.io/$repoName/updates/windows/$goarch/$appInstallerName"
-          $msixUrl = "https://github.com/${{ github.repository }}/releases/download/$env:GITHUB_REF_NAME/croopor-windows-$goarch.msix"
-          $dist = Join-Path $env:GITHUB_WORKSPACE "dist\windows-$goarch"
-          $appDir = Join-Path $dist "AppDir"
-          $assetsDir = Join-Path $appDir "Assets"
-          $exePath = Join-Path $appDir "croopor.exe"
-          $msixPath = Join-Path $dist "croopor-windows-$goarch.msix"
-          $appInstallerPath = Join-Path $dist $appInstallerName
-          $manifestPath = Join-Path $appDir "AppxManifest.xml"
-          $pfxPath = Join-Path $dist "croopor-signing.pfx"
-          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_SIGNING_PFX_BASE64)) { throw 'WINDOWS_SIGNING_PFX_BASE64 is required' }
-          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_SIGNING_PFX_PASSWORD)) { throw 'WINDOWS_SIGNING_PFX_PASSWORD is required' }
-          New-Item -ItemType Directory -Force -Path $assetsDir | Out-Null
-          $makeAppx = (Get-Command makeappx.exe -ErrorAction Stop).Source
-          $signTool = (Get-Command signtool.exe -ErrorAction Stop).Source
-          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_SIGNING_PFX_BASE64))
-          $securePassword = ConvertTo-SecureString $env:WINDOWS_SIGNING_PFX_PASSWORD -AsPlainText -Force
-          $pfxData = Get-PfxData -FilePath $pfxPath -Password $securePassword
-          $publisher = $pfxData.EndEntityCertificates[0].Subject
-          $env:GOOS = 'windows'
-          $env:GOARCH = $goarch
-          go build -trimpath -ldflags "-s -w -H windowsgui -X main.version=$version" -o $exePath .
-          foreach ($name in @('StoreLogo.png', 'Square44x44Logo.png', 'Square150x150Logo.png', 'Wide310x150Logo.png', 'Square310x310Logo.png')) {
-            Copy-Item 'frontend/static/logo.png' (Join-Path $assetsDir $name)
-          }
-          $manifestTemplate = Get-Content 'packaging/windows/AppxManifest.xml.template' -Raw
-          $manifest = $manifestTemplate.Replace('{{PUBLISHER}}', $publisher).Replace('{{VERSION}}', $packageVersion).Replace('{{ARCH}}', $appxArch)
-          Set-Content -Path $manifestPath -Value $manifest -Encoding utf8
-          & $makeAppx pack /d $appDir /p $msixPath /o
-          & $signTool sign /fd SHA256 /f $pfxPath /p $env:WINDOWS_SIGNING_PFX_PASSWORD $msixPath
-          $appInstallerTemplate = Get-Content 'packaging/windows/croopor.appinstaller.template' -Raw
-          $appInstaller = $appInstallerTemplate.Replace('{{APPINSTALLER_URL}}', $pagesUrl).Replace('{{APPINSTALLER_VERSION}}', $packageVersion).Replace('{{PUBLISHER}}', $publisher).Replace('{{VERSION}}', $packageVersion).Replace('{{ARCH}}', $appxArch).Replace('{{MSIX_URL}}', $msixUrl)
-          Set-Content -Path $appInstallerPath -Value $appInstaller -Encoding utf8
+          New-Item -ItemType Directory -Force -Path dist/windows | Out-Null
+          Copy-Item target/release/croopor-desktop.exe dist/windows/croopor.exe
+          Compress-Archive -Path dist/windows/croopor.exe -DestinationPath "dist/croopor-windows-amd64-$version.zip" -Force
 
-      - name: Skip Windows updater packaging
-        if: env.WINDOWS_SIGNING_READY != 'true'
-        shell: pwsh
-        run: Write-Host 'Skipping Windows MSIX/App Installer packaging, signing secrets are not configured.'
-
-      - name: Upload Windows updater artifacts to release
-        if: env.WINDOWS_SIGNING_READY == 'true'
+      - name: Upload windows release asset
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            dist/windows-${{ matrix.goarch }}/croopor-windows-${{ matrix.goarch }}.msix
-            dist/windows-${{ matrix.goarch }}/croopor-windows-${{ matrix.goarch }}.appinstaller
-
-      - name: Upload App Installer file for Pages
-        if: env.WINDOWS_SIGNING_READY == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: appinstaller-${{ matrix.goarch }}
-          path: dist/windows-${{ matrix.goarch }}/croopor-windows-${{ matrix.goarch }}.appinstaller
-
-  pages:
-    needs:
-      - release-binaries
-      - linux-appimage
-      - windows-msix
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        continue-on-error: true
-        with:
-          name: appinstaller-amd64
-          path: dist/pages/updates/windows/amd64
-
-      - uses: actions/download-artifact@v4
-        continue-on-error: true
-        with:
-          name: appinstaller-arm64
-          path: dist/pages/updates/windows/arm64
-
-      - name: Render stable update metadata
-        env:
-          REPO_OWNER: ${{ github.repository_owner }}
-          REPO_NAME: ${{ github.event.repository.name }}
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          RELEASE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${GITHUB_REF_NAME}"
-          PAGES_BASE="https://${REPO_OWNER}.github.io/${REPO_NAME}"
-          WINDOWS_AMD64_JSON="\"release_url\": \"${RELEASE_URL}\""
-          WINDOWS_ARM64_JSON="\"release_url\": \"${RELEASE_URL}\""
-          if [ -f dist/pages/updates/windows/amd64/croopor-windows-amd64.appinstaller ]; then
-            WINDOWS_AMD64_JSON="${WINDOWS_AMD64_JSON}, \"appinstaller_url\": \"${PAGES_BASE}/updates/windows/amd64/croopor-windows-amd64.appinstaller\""
-          fi
-          if [ -f dist/pages/updates/windows/arm64/croopor-windows-arm64.appinstaller ]; then
-            WINDOWS_ARM64_JSON="${WINDOWS_ARM64_JSON}, \"appinstaller_url\": \"${PAGES_BASE}/updates/windows/arm64/croopor-windows-arm64.appinstaller\""
-          fi
-          mkdir -p dist/pages/updates
-          cat > dist/pages/updates/stable.json <<EOF
-          {
-            "channel": "stable",
-            "version": "${VERSION}",
-            "published_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-            "notes_url": "${RELEASE_URL}",
-            "windows": {
-              "amd64": {
-                ${WINDOWS_AMD64_JSON}
-              },
-              "arm64": {
-                ${WINDOWS_ARM64_JSON}
-              }
-            },
-            "linux": {
-              "amd64": {
-                "appimage_url": "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/croopor-linux-amd64.AppImage"
-              }
-            }
-          }
-          EOF
-
-      - uses: actions/configure-pages@v5
-
-      - uses: actions/upload-pages-artifact@v3
-        with:
-          path: dist/pages
-
-      - uses: actions/deploy-pages@v4
+          files: dist/croopor-windows-amd64-*.zip

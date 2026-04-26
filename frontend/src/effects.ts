@@ -122,3 +122,4 @@ export function clearLaunchVisualState(): void {
   if (runningPid) runningPid.textContent = '';
   if (runningVersion) runningVersion.textContent = '';
 }
+

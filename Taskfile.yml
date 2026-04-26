@@ -1,14 +1,11 @@
 version: "3"
 
 env:
-  GOCACHE: "{{.TASKFILE_DIR}}/.cache/go-build"
   COREPACK_HOME: "{{.TASKFILE_DIR}}/.cache/corepack"
-  GOBIN: "{{.TASKFILE_DIR}}/.tools/bin"
 
 vars:
   FRONTEND_DIR: frontend
-  BIN_DIR: build/bin
-  TOOLS_DIR: .tools/bin
+  WINDOWS_TARGET: x86_64-pc-windows-gnu
 
 tasks:
   default:
@@ -22,300 +19,218 @@ tasks:
       - task --list
 
   setup:
-    desc: install go deps, frontend deps, and the local wails cli
+    desc: install frontend deps, prefetch Rust deps, and prep Windows cross-builds on Linux/WSL
     deps:
-      - deps:go
-      - tools:wails
       - frontend:install
+      - rust:fetch
+      - rust:setup:windows-cross
 
   doctor:
     desc: show the local toolchain and platform state
     silent: true
     cmds:
       - cmd: |
-          echo "go      $(go version)"
-          echo "node    $(node --version)"
+          echo "rustc    $(rustc --version)"
+          echo "cargo    $(cargo --version)"
+          echo "rustfmt  $(cargo fmt --version 2>/dev/null || echo missing)"
+          echo "clippy   $(cargo clippy --version 2>/dev/null || echo missing)"
+          echo "node     $(node --version)"
           echo "corepack $(corepack --version)"
-          echo "task    $(task --version)"
-          if command -v wails >/dev/null 2>&1; then
-            echo "wails   $(wails version | head -n 1)"
+          if command -v task >/dev/null 2>&1; then
+            echo "task     $(task --version)"
           else
-            echo "wails   missing"
+            echo "task     optional"
           fi
           if [ -n "${WSL_DISTRO_NAME:-}" ]; then
-            echo "wsl     yes"
+            echo "wsl      yes"
             if [ -n "${WAYLAND_DISPLAY:-}" ] || [ -n "${DISPLAY:-}" ]; then
-              echo "gui     detected"
+              echo "gui      detected"
             else
-              echo "gui     missing, use 'dev-web' or run under WSLg"
+              echo "gui      missing, use 'dev-web' or run under WSLg"
             fi
           else
-            echo "wsl     no"
+            echo "wsl      no"
           fi
         platforms: [linux, darwin]
       - cmd: >
           powershell.exe -NoProfile -Command
-          "$wails = if (Get-Command wails -ErrorAction SilentlyContinue) { (wails version | Select-Object -First 1) } else { 'missing' };
-          Write-Host ('go      ' + (go version));
-          Write-Host ('node    ' + (node --version));
+          "Write-Host ('rustc    ' + (rustc --version));
+          Write-Host ('cargo    ' + (cargo --version));
+          try { Write-Host ('rustfmt  ' + (cargo fmt --version)) } catch { Write-Host 'rustfmt  missing' };
+          try { Write-Host ('clippy   ' + (cargo clippy --version)) } catch { Write-Host 'clippy   missing' };
+          Write-Host ('node     ' + (node --version));
           Write-Host ('corepack ' + (corepack --version));
-          Write-Host ('task    ' + (task --version));
-          Write-Host ('wails   ' + $wails);
-          Write-Host 'wsl     no'"
+          try { Write-Host ('task     ' + (task --version)) } catch { Write-Host 'task     optional' };
+          Write-Host 'wsl      no'"
         platforms: [windows]
 
   frontend:install:
     desc: install frontend deps
     aliases: [setup:frontend]
-    dir: "{{.FRONTEND_DIR}}"
     cmds:
-      - corepack pnpm install --frozen-lockfile --ignore-scripts
+      - corepack pnpm --dir {{.FRONTEND_DIR}} install --frozen-lockfile --ignore-scripts
 
   frontend:check:
     desc: run frontend typecheck
-    dir: "{{.FRONTEND_DIR}}"
     cmds:
-      - corepack pnpm run check
+      - corepack pnpm --dir {{.FRONTEND_DIR}} run check
 
   frontend:build:
     desc: build frontend bundle
-    dir: "{{.FRONTEND_DIR}}"
     cmds:
-      - corepack pnpm run build
+      - corepack pnpm --dir {{.FRONTEND_DIR}} run build
 
   frontend:watch:
     desc: rebuild frontend assets on file changes
     aliases: [watch]
-    dir: "{{.FRONTEND_DIR}}"
     cmds:
-      - corepack pnpm run watch
+      - corepack pnpm --dir {{.FRONTEND_DIR}} run watch
 
   frontend:serve:
     desc: run frontend-only dev server
     aliases: [dev-web, web]
-    dir: "{{.FRONTEND_DIR}}"
     cmds:
-      - corepack pnpm run dev
+      - corepack pnpm --dir {{.FRONTEND_DIR}} run dev
 
-  fmt:check:
-    desc: fail if go files are not formatted
+  rust:fetch:
+    desc: prefetch Rust dependencies
+    cmds:
+      - cargo fetch --locked
+
+  rust:setup:windows-cross:
+    desc: prepare Linux/WSL Windows cross-build prerequisites
     cmds:
       - cmd: |
-          out="$(gofmt -l $(find . -type f -name '*.go' -not -path './build/*' -not -path './vendor/*'))"
-          if [ -n "$out" ]; then
-            echo "$out"
+          target="x86_64-pc-windows-gnu"
+          if ! rustup target list --installed | grep -Fxq "$target"; then
+            rustup target add "$target"
+          fi
+          if ! command -v apt-get >/dev/null 2>&1; then
+            exit 0
+          fi
+          if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
+            exit 0
+          fi
+          if [ "${CI:-}" = "true" ]; then
+            echo "skipping apt install for Windows cross-build prerequisites in CI"
+            exit 0
+          fi
+          if [ "$(id -u)" -eq 0 ]; then
+            apt-get install -y gcc-mingw-w64-x86-64
+          elif command -v sudo >/dev/null 2>&1; then
+            sudo apt-get install -y gcc-mingw-w64-x86-64
+          else
+            echo "missing MinGW linker: x86_64-w64-mingw32-gcc" >&2
+            echo "install it with: sudo apt-get install -y gcc-mingw-w64-x86-64" >&2
             exit 1
           fi
-        platforms: [linux, darwin]
-      - cmd: >
-          powershell.exe -NoProfile -Command
-          "$files = Get-ChildItem -Recurse -Filter *.go | Where-Object { $_.FullName -notmatch '\\build\\' -and $_.FullName -notmatch '\\vendor\\' };
-          $out = @();
-          foreach ($file in $files) { $fmt = gofmt -l $file.FullName; if ($fmt) { $out += $fmt } };
-          if ($out.Count -gt 0) { $out | ForEach-Object { Write-Host $_ }; exit 1 }"
-        platforms: [windows]
+        platforms: [linux]
 
-  check:
-    desc: run fast checks
-    deps:
-      - frontend:check
-      - fmt:check
-
-  deps:go:
-    desc: download go modules
-    aliases: [setup:go]
+  rust:fmt:
+    desc: run cargo fmt check for the Rust workspace
     cmds:
-      - go mod download
+      - cargo fmt --all --check
 
-  test:
-    desc: run go tests
+  rust:fmt:fix:
+    desc: format Rust code
     cmds:
-      - go test ./...
+      - cargo fmt --all
+
+  rust:check:
+    desc: run cargo check for the Rust workspace
+    cmds:
+      - cargo check --workspace --locked
+
+  rust:clippy:
+    desc: run clippy for the Rust workspace
+    cmds:
+      - cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  rust:test:
+    desc: run cargo test for the Rust workspace
+    cmds:
+      - cargo test --workspace --locked
+
+  rust:api:
+    desc: run the Rust API
+    cmds:
+      - cargo run --locked -p croopor-api
+
+  rust:desktop:
+    desc: run the Rust desktop shell
+    aliases: [dev, dev-desktop, desktop:dev]
+    cmds:
+      - cargo run --locked -p croopor-desktop
 
   build:
-    desc: build the native release binary for this machine
+    desc: build the desktop app in release mode
     aliases: [build-local]
     deps:
       - frontend:build
-      - _prepare:bin-dir
     cmds:
-      - cmd: go build -trimpath -tags webkit2_41 -o {{.BIN_DIR}}/croopor .
-        platforms: [linux]
-      - cmd: go build -trimpath -o {{.BIN_DIR}}/croopor .
-        platforms: [darwin]
-      - cmd: go build -trimpath -o {{.BIN_DIR}}/croopor.exe .
-        platforms: [windows]
+      - cargo build --locked -p croopor-desktop --release
 
   build:dev:
-    desc: build the native dev binary for this machine
+    desc: build the desktop app in dev mode
     aliases: [build-dev, build-local-dev]
     deps:
       - frontend:build
-      - _prepare:bin-dir
     cmds:
-      - cmd: go build -trimpath -tags "webkit2_41 dev" -o {{.BIN_DIR}}/croopor-dev .
-        platforms: [linux]
-      - cmd: go build -trimpath -tags dev -o {{.BIN_DIR}}/croopor-dev .
-        platforms: [darwin]
-      - cmd: go build -trimpath -tags dev -o {{.BIN_DIR}}/croopor-dev.exe .
-        platforms: [windows]
+      - cargo build --locked -p croopor-desktop
 
   build:windows:
-    desc: build the windows amd64 release binary
-    aliases: [build-windows]
+    desc: build the release Windows desktop binary from linux/wsl
     deps:
       - frontend:build
-      - winres
-      - _prepare:bin-dir
-    env:
-      GOOS: windows
-      GOARCH: amd64
     cmds:
-      - go build -trimpath -o {{.BIN_DIR}}/croopor-windows.exe .
+      - cargo build --locked -p croopor-desktop --release --target {{.WINDOWS_TARGET}}
 
   build:windows:dev:
-    desc: build the windows amd64 dev binary
-    aliases: [build-windows-dev]
+    desc: build the dev Windows desktop binary from linux/wsl
     deps:
       - frontend:build
-      - winres
-      - _prepare:bin-dir
-    env:
-      GOOS: windows
-      GOARCH: amd64
     cmds:
-      - go build -trimpath -tags dev -o {{.BIN_DIR}}/croopor-dev-windows.exe .
+      - cargo build --locked -p croopor-desktop --target {{.WINDOWS_TARGET}}
 
-  run:windows:dev:
-    desc: build and launch the windows dev binary
-    aliases: [dev-windows]
-    deps:
-      - build:windows:dev
+  build:api:
+    desc: build the API binary in dev mode
     cmds:
-      - cmd: |
-          if [ -z "${WSL_DISTRO_NAME:-}" ]; then
-            echo "dev-windows from linux is only supported under WSL."
-            exit 1
-          fi
-          if ! command -v powershell.exe >/dev/null 2>&1 || ! command -v wslpath >/dev/null 2>&1; then
-            echo "dev-windows needs powershell.exe and wslpath."
-            exit 1
-          fi
-          win_path="$(wslpath -w "{{.TASKFILE_DIR}}/{{.BIN_DIR}}/croopor-dev-windows.exe")"
-          win_dir="$(wslpath -w "{{.TASKFILE_DIR}}/{{.BIN_DIR}}")"
-          powershell.exe -NoProfile -Command "Start-Process -FilePath '$win_path' -WorkingDirectory '$win_dir'"
-        platforms: [linux]
-      - cmd: >
-          powershell.exe -NoProfile -Command
-          "Start-Process (Resolve-Path 'build/bin/croopor-dev-windows.exe')"
-        platforms: [windows]
+      - cargo build --locked -p croopor-api
 
-  wails:dev:
-    desc: run desktop dev with wails
-    aliases: [dev, dev-desktop]
-    deps:
-      - tools:wails
+  build:api:release:
+    desc: build the API binary in release mode
     cmds:
-      - wails dev
+      - cargo build --locked -p croopor-api --release
 
-  wails:build:
-    desc: build the wails production bundle
+  check:
+    desc: run static checks
     deps:
-      - tools:wails
-      - frontend:build
-    cmds:
-      - wails build -nopackage -m -v 1
+      - frontend:check
+      - rust:fmt
+      - rust:check
+      - rust:clippy
+
+  test:
+    desc: run Rust tests
+    deps:
+      - rust:test
 
   verify:
-    desc: run checks, tests, and native builds
+    desc: run checks, tests, and a release desktop build
     deps:
+      - frontend:build
       - check
       - test
-      - build
-      - wails:build
-
-  release:snapshot:
-    desc: build local release artifacts with goreleaser
-    aliases: [release-snapshot]
-    deps:
-      - tools:goreleaser
     cmds:
-      - goreleaser release --snapshot --clean
+      - cargo build --locked -p croopor-desktop --release
 
   clean:
-    desc: remove build outputs and go caches
+    desc: remove build outputs and caches
     cmds:
-      - go clean -cache -testcache
-      - cmd: rm -rf build/bin dist
+      - cargo clean
+      - cmd: rm -rf dist
         platforms: [linux, darwin]
       - cmd: >
           powershell.exe -NoProfile -Command
-          "if (Test-Path 'build/bin') { Remove-Item -Recurse -Force 'build/bin' };
-          if (Test-Path 'dist') { Remove-Item -Recurse -Force 'dist' }"
-        platforms: [windows]
-
-  winres:
-    desc: generate Windows resource files (.syso) from winres/
-    deps:
-      - tools:winres
-    cmds:
-      - go-winres make --arch amd64,arm64
-
-  tools:winres:
-    desc: install go-winres into .tools/bin
-    internal: true
-    silent: true
-    cmds:
-      - cmd: |
-          if command -v go-winres >/dev/null 2>&1 || [ -x "{{.TOOLS_DIR}}/go-winres" ]; then
-            exit 0
-          fi
-          go install github.com/tc-hib/go-winres@latest
-        platforms: [linux, darwin]
-      - cmd: >
-          powershell.exe -NoProfile -Command
-          "if ((Get-Command go-winres -ErrorAction SilentlyContinue) -or (Test-Path '.tools/bin/go-winres.exe')) { exit 0 };
-          go install github.com/tc-hib/go-winres@latest"
-        platforms: [windows]
-
-  tools:wails:
-    desc: install the local wails cli into .tools/bin
-    internal: true
-    silent: true
-    cmds:
-      - cmd: |
-          if command -v wails >/dev/null 2>&1 || [ -x "{{.TOOLS_DIR}}/wails" ]; then
-            exit 0
-          fi
-          go install github.com/wailsapp/wails/v2/cmd/wails@v2.11.0
-        platforms: [linux, darwin]
-      - cmd: >
-          powershell.exe -NoProfile -Command
-          "if ((Get-Command wails -ErrorAction SilentlyContinue) -or (Test-Path '.tools/bin/wails.exe')) { exit 0 };
-          go install github.com/wailsapp/wails/v2/cmd/wails@v2.11.0"
-        platforms: [windows]
-
-  tools:goreleaser:
-    desc: install local goreleaser into .tools/bin
-    internal: true
-    silent: true
-    cmds:
-      - cmd: |
-          if command -v goreleaser >/dev/null 2>&1 || [ -x "{{.TOOLS_DIR}}/goreleaser" ]; then
-            exit 0
-          fi
-          go install github.com/goreleaser/goreleaser/v2@v2.8.2
-        platforms: [linux, darwin]
-      - cmd: >
-          powershell.exe -NoProfile -Command
-          "if ((Get-Command goreleaser -ErrorAction SilentlyContinue) -or (Test-Path '.tools/bin/goreleaser.exe')) { exit 0 };
-          go install github.com/goreleaser/goreleaser/v2@v2.8.2"
-        platforms: [windows]
-
-  _prepare:bin-dir:
-    internal: true
-    cmds:
-      - cmd: mkdir -p build/bin
-        platforms: [linux, darwin]
-      - cmd: powershell.exe -NoProfile -Command "New-Item -ItemType Directory -Force -Path 'build/bin' | Out-Null"
+          "if (Test-Path 'dist') { Remove-Item -Recurse -Force 'dist' }"
         platforms: [windows]
