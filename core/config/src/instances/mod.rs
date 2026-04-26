@@ -335,7 +335,7 @@ mod tests {
     use super::{InstanceStore, StoredInstances};
     use crate::paths::AppPaths;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::RwLock;
 
     fn test_root(name: &str) -> PathBuf {
@@ -350,7 +350,7 @@ mod tests {
         path
     }
 
-    fn test_paths(root: &PathBuf) -> AppPaths {
+    fn test_paths(root: &Path) -> AppPaths {
         let config_dir = root.join("config");
         AppPaths {
             config_file: config_dir.join("config.json"),
