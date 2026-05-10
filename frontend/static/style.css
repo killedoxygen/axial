@@ -28,6 +28,7 @@ input::placeholder { color: var(--text-mute); }
   color-scheme: dark;
   --bg-deep: oklch(0.12 0.008 70);
   --bg: oklch(0.16 0.008 70);
+  --bg-noise: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140' viewBox='0 0 140 140'%3E%3Cfilter id='n' x='0' y='0' width='100%25' height='100%25'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)' opacity='0.028'/%3E%3C/svg%3E");
   --surface: oklch(0.20 0.008 70);
   --surface-2: oklch(0.24 0.008 70);
   --surface-3: oklch(0.28 0.008 70);
@@ -62,6 +63,7 @@ html[data-color-mode="light"] {
   color-scheme: light;
   --bg-deep: oklch(0.94 0.006 70);
   --bg: oklch(0.96 0.006 70);
+  --bg-noise: none;
   --surface: oklch(0.99 0.004 70);
   --surface-2: oklch(0.97 0.006 70);
   --surface-3: oklch(0.93 0.008 70);
