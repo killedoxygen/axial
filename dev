@@ -12,6 +12,8 @@ setup once
 
 daily
   ./dev dev                run desktop dev with rust + tauri
+  ./dev dev --target windows
+  ./dev dev:windows        run desktop dev as a Windows app from linux/wsl
   ./dev dev-web            run the frontend-only dev server
   ./dev watch              rebuild frontend assets on file changes
   ./dev check              run static checks
@@ -263,6 +265,24 @@ run_desktop_build() {
   report_desktop_artifact "$profile" "$target"
 }
 
+run_desktop_dev() {
+  local target
+  target="$(resolve_build_target "$@")"
+
+  if [ "$target" = "$(windows_target_triple)" ]; then
+    ensure_windows_cross_target_ready
+  else
+    check_desktop_env
+  fi
+
+  local cargo_args=(run --locked -p croopor-desktop)
+  if [ -n "$target" ]; then
+    cargo_args+=(--target "$target")
+  fi
+
+  run_interruptible cargo "${cargo_args[@]}"
+}
+
 main() {
   local cmd="${1:-help}"
   shift || true
@@ -286,12 +306,14 @@ main() {
       run_doctor
       ;;
     dev|dev:desktop|dev-desktop|rust:desktop)
+      run_desktop_dev "$@"
+      ;;
+    dev:windows|dev-windows)
       if [ "$#" -ne 0 ]; then
         echo "$cmd does not accept extra arguments" >&2
         exit 1
       fi
-      check_desktop_env
-      run_interruptible cargo run --locked -p croopor-desktop
+      run_desktop_dev --target windows
       ;;
     rust:api)
       if [ "$#" -ne 0 ]; then

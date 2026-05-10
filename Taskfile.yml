@@ -162,6 +162,12 @@ tasks:
     cmds:
       - cargo run --locked -p croopor-desktop
 
+  dev:windows:
+    desc: run the Windows desktop shell from linux/wsl
+    aliases: [dev-windows, desktop:dev:windows]
+    cmds:
+      - cargo run --locked -p croopor-desktop --target {{.WINDOWS_TARGET}}
+
   build:
     desc: build the desktop app in release mode
     aliases: [build-local]

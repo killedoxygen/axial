@@ -61,6 +61,8 @@ windows powershell:
 - `setup`: install frontend deps and prefetch Rust deps
 - on Linux/WSL, `setup` also prepares the Windows GNU target and MinGW linker for cross-builds
 - `dev`: run desktop dev with Rust + Tauri
+- `dev --target windows`: run desktop dev as a Windows app from Linux/WSL
+- `dev:windows`: explicit alias for Windows desktop dev from Linux/WSL
 - `dev-web`: run the frontend-only dev server
 - `watch`: rebuild frontend assets on file changes
 - `check`: run `fmt`, `check`, `clippy`, and frontend typecheck
@@ -89,6 +91,7 @@ examples:
 ```bash
 ./dev setup
 ./dev dev-web
+./dev dev --target windows
 ./dev watch
 ./dev build-dev
 ./dev build --target windows
@@ -96,12 +99,13 @@ examples:
 ```
 
 ## wsl note
-`dev` needs a gui session. with wsl that means wslg or another linux gui path.
+`dev` needs a Linux gui session. with wsl that means wslg or another linux gui path.
 
-if you are in headless wsl, use:
+if you are in headless wsl, use the frontend-only server or launch the Windows-targeted desktop binary:
 
 ```bash
 ./dev dev-web
+./dev dev --target windows
 ```
 
 frontend dev server port is configurable:
