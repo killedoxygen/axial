@@ -45,8 +45,10 @@ export function AccentField({
   const applyPreset = (id: string): void => {
     const h = PRESET_HUES[id];
     if (h == null) return;
+    const nextVibrancy = local.customVibrancy;
     setHue(h);
-    applyTheme(id, null, { vibrancy, lightness: local.lightness });
+    setVibrancy(nextVibrancy);
+    applyTheme(id, null, { vibrancy: nextVibrancy, lightness: local.lightness });
   };
 
   const onDrag = (h: number, v: number): void => {

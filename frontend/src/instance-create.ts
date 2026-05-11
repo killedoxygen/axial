@@ -36,6 +36,17 @@ interface CreateResponse {
   error?: string;
 }
 
+function isInstance(value: CreateResponse & Partial<Instance>): value is Instance {
+  return typeof value.id === 'string'
+    && value.id.trim().length > 0
+    && typeof value.name === 'string'
+    && value.name.trim().length > 0
+    && typeof value.version_id === 'string'
+    && value.version_id.trim().length > 0
+    && typeof value.created_at === 'string'
+    && value.created_at.trim().length > 0;
+}
+
 function isNameCollision(error: string): boolean {
   return /already exists/i.test(error);
 }
@@ -76,11 +87,12 @@ export async function createInstance(args: CreateInstanceArgs): Promise<CreateIn
         lastError = res.error;
         break;
       }
-      if (res.id) {
-        created = res as Instance;
+      if (isInstance(res)) {
+        created = res;
         break;
       }
-      lastError = 'server returned no instance';
+      lastError = 'server returned an incomplete instance';
+      console.error('Create instance returned invalid payload', res);
       break;
     } catch (err: unknown) {
       lastError = errMessage(err);

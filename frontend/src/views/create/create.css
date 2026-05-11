@@ -818,5 +818,5 @@ button.cp-cr-stepper-item:focus-visible {
     transition: opacity 120ms linear, background-color 160ms linear, color 160ms linear !important;
   }
   .cp-cr-word { opacity: 1 !important; transform: none !important; }
-  .cp-cr-rail-item::before { transform: scaleY(1); }
+  .cp-cr-rail-item[data-active="true"]::before { transform: translateX(-50%) scaleX(1); }
 }

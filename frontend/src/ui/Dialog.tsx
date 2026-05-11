@@ -1,6 +1,6 @@
 import type { JSX } from 'preact';
 import { signal } from '@preact/signals';
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import { Button, Input } from './Atoms';
 import './dialog.css';
 
@@ -33,8 +33,16 @@ interface DialogSpec {
 
 const current = signal<DialogSpec | null>(null);
 
+function cancelCurrent(): void {
+  const spec = current.value;
+  if (!spec) return;
+  spec.resolve(spec.kind === 'prompt' ? null : false);
+  current.value = null;
+}
+
 export function showConfirm(message: string, opts: { title?: string; confirmText?: string; cancelText?: string | null; destructive?: boolean } = {}): Promise<boolean> {
   return new Promise(resolve => {
+    cancelCurrent();
     current.value = {
       kind: 'confirm',
       title: opts.title,
@@ -49,6 +57,7 @@ export function showConfirm(message: string, opts: { title?: string; confirmText
 
 export function showAlert(message: string, title?: string): Promise<void> {
   return new Promise(resolve => {
+    cancelCurrent();
     current.value = {
       kind: 'alert',
       title,
@@ -62,6 +71,7 @@ export function showAlert(message: string, title?: string): Promise<void> {
 
 export function prompt(message: string, initial = '', opts: PromptOptions = {}): Promise<string | null> {
   return new Promise(resolve => {
+    cancelCurrent();
     current.value = {
       kind: 'prompt',
       title: opts.title || message,
@@ -83,26 +93,14 @@ export function DialogHost(): JSX.Element | null {
   const spec = current.value;
   const [draft, setDraft] = useState('');
   const [touched, setTouched] = useState(false);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const primaryRef = useRef<HTMLButtonElement>(null);
 
-  useEffect(() => {
-    if (!spec) return;
-    if (spec.kind === 'prompt') {
-      setDraft(spec.initialValue || '');
-      setTouched(false);
-    }
-    const onKey = (e: KeyboardEvent): void => {
-      if (e.key === 'Escape') { resolveAs(false); }
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [spec]);
-
-  if (!spec) return null;
-
-  const promptError = spec.kind === 'prompt' ? (spec.validate?.(draft) ?? null) : null;
-  const showPromptError = spec.kind === 'prompt' && promptError !== null && (touched || draft.length > 0);
+  const promptError = spec?.kind === 'prompt' ? (spec.validate?.(draft) ?? null) : null;
+  const showPromptError = spec?.kind === 'prompt' && promptError !== null && (touched || draft.length > 0);
 
   const resolveAs = (ok: boolean): void => {
+    if (!spec) return;
     let payload: DialogResult = ok;
     if (spec.kind === 'prompt') {
       if (!ok) {
@@ -119,9 +117,57 @@ export function DialogHost(): JSX.Element | null {
     current.value = null;
   };
 
+  useEffect(() => {
+    if (!spec) return;
+    if (spec.kind === 'prompt') {
+      setDraft(spec.initialValue || '');
+      setTouched(false);
+    }
+  }, [spec]);
+
+  useEffect(() => {
+    if (!spec) return;
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    if (spec.kind !== 'prompt') {
+      window.requestAnimationFrame(() => primaryRef.current?.focus());
+    }
+    const dialog = dialogRef.current;
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        resolveAs(false);
+        return;
+      }
+      if (e.key !== 'Tab' || !dialog) return;
+      const focusable = Array.from(
+        dialog.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'),
+      ).filter((el) => el.offsetParent !== null || el === document.activeElement);
+      if (focusable.length === 0) {
+        e.preventDefault();
+        return;
+      }
+      const first = focusable[0]!;
+      const last = focusable[focusable.length - 1]!;
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    };
+    dialog?.addEventListener('keydown', onKey);
+    return () => {
+      dialog?.removeEventListener('keydown', onKey);
+      previousFocus?.focus();
+    };
+  }, [spec]);
+
+  if (!spec) return null;
+
   return (
     <div class="cp-dialog-overlay" onClick={(e) => { if (e.target === e.currentTarget) resolveAs(false); }}>
-      <div class="cp-dialog" role="dialog" aria-modal="true" aria-labelledby={spec.title ? 'cp-dlg-title' : undefined}>
+      <div ref={dialogRef} class="cp-dialog" role="dialog" aria-modal="true" aria-labelledby={spec.title ? 'cp-dlg-title' : undefined}>
         {spec.title && <h2 id="cp-dlg-title" class="cp-dialog-title">{spec.title}</h2>}
         {spec.message && <p class="cp-dialog-body">{spec.message}</p>}
         {spec.kind === 'prompt' && (
@@ -144,6 +190,7 @@ export function DialogHost(): JSX.Element | null {
             <Button variant="ghost" onClick={() => resolveAs(false)}>{spec.cancelText}</Button>
           )}
           <Button
+            buttonRef={primaryRef}
             variant={spec.destructive ? 'danger' : 'primary'}
             disabled={spec.kind === 'prompt' && promptError !== null}
             onClick={() => resolveAs(true)}

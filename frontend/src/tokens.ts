@@ -120,7 +120,7 @@ export function buildTheme(opts: { dark?: boolean; hue?: number; radius?: number
     info: 'oklch(0.78 0.10 240)',
     font: {
       sans: '"Geist", ui-sans-serif, system-ui, -apple-system, sans-serif',
-      mono: '"Geist", ui-sans-serif, system-ui, sans-serif',
+      mono: '"Geist Mono", ui-monospace, SFMono-Regular, Menlo, monospace',
     },
   };
 }

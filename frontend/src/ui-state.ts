@@ -48,16 +48,35 @@ export function goForward(): void {
   setRoute(next);
 }
 
+function isRoute(value: unknown): value is Route {
+  if (!value || typeof value !== 'object') return false;
+  const candidate = value as Partial<Route>;
+  switch (candidate.name) {
+    case 'home':
+    case 'instances':
+    case 'create':
+    case 'dev-lab':
+    case 'browse':
+    case 'downloads':
+    case 'accounts':
+    case 'settings':
+      return true;
+    case 'instance':
+      return typeof (candidate as { id?: unknown }).id === 'string';
+    default:
+      return false;
+  }
+}
+
 export function restoreRoute(): void {
   try {
     const raw = localStorage.getItem('croopor:route');
     if (!raw) return;
-    const parsed = JSON.parse(raw) as Route;
-    if (parsed && typeof parsed.name === 'string') setRoute(parsed);
+    const parsed = JSON.parse(raw) as unknown;
+    if (isRoute(parsed)) setRoute(parsed);
   } catch {}
 }
 
 export const commandPaletteOpen = signal(false);
-export const windowMaximized = signal(false);
 export const showOnboardingOverlay = signal(false);
 export const showSetupOverlay = signal(false);

@@ -1,5 +1,5 @@
 import type { JSX } from 'preact';
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import { Button, Input } from '../../ui/Atoms';
 import { api } from '../../api';
 import { browseDirectory } from '../../native';
@@ -15,6 +15,7 @@ export function SetupOverlay(): JSX.Element {
   const [existingPath, setExistingPath] = useState<string>('');
   const [status, setStatus] = useState<'pending' | 'running' | 'error' | 'ready'>('pending');
   const [error, setError] = useState<string | null>(null);
+  const userTookOver = useRef(false);
 
   // Fetch defaults on mount, then kick off a managed setup automatically
   useEffect(() => {
@@ -25,10 +26,11 @@ export function SetupOverlay(): JSX.Element {
         if (cancelled) return;
         setManagedPath(defaults.managed_default_path || 'Could not determine a default library path.');
         if (defaults.existing_default_path) setExistingPath(defaults.existing_default_path);
+        if (userTookOver.current) return;
         if (defaults.managed_default_path) {
           setStatus('running');
           const res: any = await api('POST', '/setup/init', { path: defaults.managed_default_path });
-          if (cancelled) return;
+          if (cancelled || userTookOver.current) return;
           if (res.error) { setError(res.error); setStatus('error'); return; }
           setStatus('ready');
           showSetupOverlay.value = false;
@@ -101,7 +103,9 @@ export function SetupOverlay(): JSX.Element {
             {status === 'running' && <div class="cp-setup-progress" />}
             {error && <div class="cp-setup-error">{error}</div>}
             <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
-              <Button variant="ghost" onClick={() => setMode('existing')}>Use existing folder</Button>
+              <Button variant="ghost" onClick={() => { userTookOver.current = true; setMode('existing'); }}>
+                Use existing folder
+              </Button>
               <Button onClick={retryManaged} disabled={status === 'running' || !managedPath}>
                 {status === 'running' ? 'Setting up…' : status === 'error' ? 'Retry' : 'Create library'}
               </Button>

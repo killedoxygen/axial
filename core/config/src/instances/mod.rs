@@ -369,7 +369,7 @@ fn derive_art_seed(id: &str, name: &str, version_id: &str) -> u32 {
         h ^= u32::from(byte);
         h = h.wrapping_mul(16777619);
     }
-    if h == 0 { 1 } else { h }
+    h
 }
 
 pub fn art_preset_for_seed(seed: u32) -> &'static str {

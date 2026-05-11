@@ -1,12 +1,16 @@
 import type { JSX } from 'preact';
-import { useEffect, useState } from 'preact/hooks';
+import { useState } from 'preact/hooks';
 import { Icon } from '../ui/Icons';
 import { IconButton } from '../ui/Atoms';
 import { WindowControls } from './WindowControls';
 import { MusicWidget } from './MusicWidget';
-import { goBack, goForward, navigate, route, windowMaximized } from '../ui-state';
+import { goBack, goForward, navigate, route } from '../ui-state';
 import { runningSessions, instances, launchState, installState } from '../store';
-import { windowStartDragging, hasNativeDesktopRuntime } from '../native';
+import { windowStartDragging, windowToggleMaximize, hasNativeDesktopRuntime } from '../native';
+
+function assertUnreachable(value: never): never {
+  throw new Error(`Unhandled route: ${JSON.stringify(value)}`);
+}
 
 function crumbsFor(): { label: string; onClick?: () => void }[] {
   const r = route.value;
@@ -32,6 +36,7 @@ function crumbsFor(): { label: string; onClick?: () => void }[] {
     case 'downloads': return [{ label: 'Downloads' }];
     case 'accounts': return [{ label: 'Accounts & skins' }];
     case 'settings': return [{ label: 'Settings' }];
+    default: return assertUnreachable(r);
   }
 }
 
@@ -90,8 +95,10 @@ function StatusPill(): JSX.Element {
 export function Topbar(): JSX.Element {
   const [isNative] = useState(hasNativeDesktopRuntime());
 
-  const onDragAreaDoubleClick = (): void => {
+  const onDragAreaDoubleClick = (e: MouseEvent): void => {
     if (!isNative) return;
+    if ((e.target as HTMLElement)?.closest('.cp-nodrag')) return;
+    void windowToggleMaximize();
   };
 
   const onDragAreaMouseDown = (e: MouseEvent): void => {
@@ -100,10 +107,6 @@ export function Topbar(): JSX.Element {
     if (e.button !== 0) return;
     void windowStartDragging();
   };
-
-  useEffect(() => {
-    windowMaximized.value = false;
-  }, []);
 
   const crumbs = crumbsFor();
   return (

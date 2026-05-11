@@ -71,18 +71,22 @@ impl ConfigStore {
         fs::write(&temp_path, data)?;
         Self::replace_file(&temp_path, &self.paths.config_file)?;
 
-        if let Ok(mut guard) = self.config.write() {
-            *guard = normalized.clone();
-        }
+        let mut guard = self
+            .config
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = normalized.clone();
 
         Ok(normalized)
     }
 
     pub fn replace_in_memory(&self, next: AppConfig) -> Result<(), ConfigStoreError> {
         let normalized = next.normalized()?;
-        if let Ok(mut guard) = self.config.write() {
-            *guard = normalized;
-        }
+        let mut guard = self
+            .config
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = normalized;
         Ok(())
     }
 

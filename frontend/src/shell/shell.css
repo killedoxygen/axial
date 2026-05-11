@@ -583,7 +583,7 @@
 }
 .cp-music-eq > span {
   width: 2px;
-  background: currentColor;
+  background: currentcolor;
   border-radius: 1px;
   transform-origin: bottom;
   animation: cp-eq 900ms ease-in-out infinite;

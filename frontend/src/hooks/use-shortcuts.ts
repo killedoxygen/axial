@@ -20,12 +20,14 @@ export function useShortcuts(): void {
       const typing = !!target?.closest('input, textarea, [contenteditable]');
 
       if (match(e, ',')) {
+        if (typing) return;
         e.preventDefault();
         navigate({ name: 'settings' });
         Sound.ui('theme');
         return;
       }
       if (match(e, 'n')) {
+        if (typing) return;
         e.preventDefault();
         navigate({ name: 'create' });
         Sound.ui('soft');
@@ -39,6 +41,7 @@ export function useShortcuts(): void {
         return;
       }
       if (match(e, 'k')) {
+        if (typing) return;
         e.preventDefault();
         commandPaletteOpen.value = true;
         Sound.ui('soft');

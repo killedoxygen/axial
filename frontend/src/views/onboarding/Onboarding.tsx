@@ -164,6 +164,7 @@ export function Onboarding(): JSX.Element | null {
     }
     if (musicEnabled == null) return;
     setSaving(true);
+    const prevConfig = config.value;
     try {
       const r: any = await api('PUT', '/config', {
         username: username.trim(),
@@ -173,12 +174,21 @@ export function Onboarding(): JSX.Element | null {
       });
       if (r.error) throw new Error(r.error);
       config.value = r;
-      await api('POST', '/onboarding/complete');
+      const complete = async (): Promise<void> => {
+        const res: any = await api('POST', '/onboarding/complete');
+        if (res?.error) throw new Error(res.error);
+      };
+      try {
+        await complete();
+      } catch {
+        await complete();
+      }
       Music.applyConfig({ music_enabled: musicEnabled, music_volume: 5 });
       if (musicEnabled) void Music.play();
       setDissolving(true);
       window.setTimeout(() => { showOnboardingOverlay.value = false; }, 560);
     } catch (err) {
+      config.value = prevConfig;
       toast(`Couldn't finish onboarding: ${errMessage(err)}`);
       setSaving(false);
     }

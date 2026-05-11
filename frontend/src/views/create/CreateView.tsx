@@ -131,7 +131,7 @@ function CreateWizard(): JSX.Element {
   }, [availableForSource]);
 
   const availableChannels = useMemo<Channel[]>(() => {
-    const has: Record<Channel, boolean> = { release: false, snapshot: false, legacy: false };
+    const has: Record<Channel, boolean> = { release: false, snapshot: false, legacy: false, unknown: false };
     for (const v of availableForSource) has[channelOfVersion(v)] = true;
     return CHANNEL_ORDER.filter((c) => has[c]);
   }, [availableForSource]);

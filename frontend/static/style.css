@@ -7,12 +7,13 @@
 html, body, #app { height: 100%; }
 body {
   margin: 0;
-  font-family: "Geist", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  font-family: Geist, ui-sans-serif, system-ui, -apple-system, sans-serif;
   background: var(--bg);
   color: var(--text);
   overflow: hidden;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  /* stylelint-disable-next-line value-keyword-case */
   text-rendering: optimizeLegibility;
 }
 button, input, select, textarea { font: inherit; color: inherit; }

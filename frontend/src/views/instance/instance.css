@@ -24,7 +24,7 @@
   inset: 0;
   background:
     radial-gradient(circle at 24% 34%, oklch(0 0 0 / 0.18), transparent 38%),
-    linear-gradient(90deg, oklch(0 0 0 / 0.48), transparent 58%),
+    linear-gradient(90deg, oklch(0 0 0 / 0.58), oklch(0 0 0 / 0.34) 62%, oklch(0 0 0 / 0.12) 100%),
     linear-gradient(180deg, transparent 34%, var(--surface) 100%);
   pointer-events: none;
 }
@@ -163,10 +163,16 @@
   border-radius: 2.5px;
   background: var(--surface-3);
 }
-.cp-contrib-cell[data-level="1"] { background: color-mix(in oklch, var(--accent) 20%, var(--surface-3)); }
-.cp-contrib-cell[data-level="2"] { background: color-mix(in oklch, var(--accent) 40%, var(--surface-3)); }
-.cp-contrib-cell[data-level="3"] { background: color-mix(in oklch, var(--accent) 65%, var(--surface-3)); }
+.cp-contrib-cell[data-level="1"] { background: var(--accent-softer); }
+.cp-contrib-cell[data-level="2"] { background: var(--accent-soft); }
+.cp-contrib-cell[data-level="3"] { background: var(--accent-fill); }
 .cp-contrib-cell[data-level="4"] { background: var(--accent); }
+
+@supports (background: color-mix(in oklch, transparent 0%, transparent)) {
+  .cp-contrib-cell[data-level="1"] { background: color-mix(in oklch, var(--accent) 20%, var(--surface-3)); }
+  .cp-contrib-cell[data-level="2"] { background: color-mix(in oklch, var(--accent) 40%, var(--surface-3)); }
+  .cp-contrib-cell[data-level="3"] { background: color-mix(in oklch, var(--accent) 65%, var(--surface-3)); }
+}
 
 .cp-meta-row {
   display: flex;

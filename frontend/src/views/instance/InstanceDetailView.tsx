@@ -284,7 +284,7 @@ function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
         <SectionHeading
           eyebrow="Artwork"
           title="Instance identity"
-          right={<Button variant="soft" size="sm" icon="refresh" onClick={() => setArtSeed(nextArtSeed(artSeed))}>Regenerate</Button>}
+          right={<Button variant="soft" size="sm" icon="refresh" onClick={() => setArtSeed(seed => nextArtSeed(seed))}>Regenerate</Button>}
         />
         <div class="cp-art-settings">
           <InstanceArt
@@ -305,6 +305,7 @@ function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
                 key={preset}
                 type="button"
                 data-active={preset === artPreset}
+                aria-pressed={preset === artPreset}
                 onClick={() => setArtSeed((seed) => artSeedForPreset(seed, preset))}
               >
                 {preset}
@@ -351,11 +352,23 @@ function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 16 }}>
           <div>
             <div style={{ fontSize: 12, color: theme.n.textDim, marginBottom: 6 }}>Width</div>
-            <Input value={String(width)} onChange={(v) => setWidth(parseInt(v, 10) || 0)} />
+            <Input
+              value={String(width)}
+              onChange={(v) => {
+                const parsed = parseInt(v, 10);
+                if (!Number.isNaN(parsed)) setWidth(parsed);
+              }}
+            />
           </div>
           <div>
             <div style={{ fontSize: 12, color: theme.n.textDim, marginBottom: 6 }}>Height</div>
-            <Input value={String(height)} onChange={(v) => setHeight(parseInt(v, 10) || 0)} />
+            <Input
+              value={String(height)}
+              onChange={(v) => {
+                const parsed = parseInt(v, 10);
+                if (!Number.isNaN(parsed)) setHeight(parsed);
+              }}
+            />
           </div>
         </div>
       </Card>

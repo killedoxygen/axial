@@ -24,7 +24,11 @@ export async function savePlayerName(
   raw: string,
   successMessage = 'Player name updated',
 ): Promise<boolean> {
-  if (validateUsername(raw) !== null) return false;
+  const validationError = validateUsername(raw);
+  if (validationError !== null) {
+    toast(`Invalid name: ${validationError}`, 'error');
+    return false;
+  }
   try {
     const res: any = await api('PUT', '/config', { username: raw.trim() });
     if (res.error) throw new Error(res.error);

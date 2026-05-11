@@ -1,7 +1,7 @@
 import type { LoaderComponentId, Version } from '../../types';
 
 export type LoaderKey = 'vanilla' | 'fabric' | 'quilt' | 'forge' | 'neoforge';
-export type Channel = 'release' | 'snapshot' | 'legacy';
+export type Channel = 'release' | 'snapshot' | 'legacy' | 'unknown';
 
 export const LOADER_KEYS: LoaderKey[] = ['vanilla', 'fabric', 'forge', 'neoforge', 'quilt'];
 
@@ -80,6 +80,8 @@ export function defaultIconFor(loader: LoaderKey): string {
 export function channelOf(labelOrChannel: string): Channel {
   if (labelOrChannel === 'stable') return 'release';
   if (labelOrChannel === 'preview' || labelOrChannel === 'experimental') return 'snapshot';
+  // Unknown lifecycle is kept distinct from legacy so transient metadata gaps are not mislabeled.
+  if (labelOrChannel === 'unknown') return 'unknown';
   return 'legacy';
 }
 

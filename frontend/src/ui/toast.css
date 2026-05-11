@@ -67,7 +67,7 @@
   min-width: 0;
   color: var(--text);
   font-weight: 500;
-  word-wrap: break-word;
+  overflow-wrap: break-word;
 }
 
 .cp-toast-close {

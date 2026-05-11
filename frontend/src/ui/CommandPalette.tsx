@@ -140,7 +140,7 @@ export function CommandPalette(): JSX.Element | null {
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
 
-  const commands = useMemo(() => (open ? buildCommands() : []), [open]);
+  const commands = open ? buildCommands() : [];
 
   const filtered = useMemo(() => {
     const scored = commands

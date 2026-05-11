@@ -9,7 +9,7 @@ type BtnSize = 'sm' | 'md' | 'lg';
 
 export function Button({
   children, variant = 'primary', size = 'md', icon, trailing,
-  onClick, style, disabled, full, title,
+  onClick, style, disabled, full, title, buttonRef,
 }: {
   children?: ComponentChildren;
   variant?: BtnVariant;
@@ -21,10 +21,12 @@ export function Button({
   disabled?: boolean;
   full?: boolean;
   title?: string;
+  buttonRef?: { current: HTMLButtonElement | null };
 }): JSX.Element {
   const cls = `cp-btn cp-btn--${size} cp-btn--${variant}${full ? ' cp-btn--full' : ''}`;
   return (
     <button
+      ref={buttonRef}
       class={cls}
       onClick={disabled ? undefined : onClick}
       disabled={disabled}
@@ -109,9 +111,10 @@ export function Meter({ value, tone = 'accent', height = 4, style }: {
   style?: JSX.CSSProperties;
 }): JSX.Element {
   const cls = tone === 'accent' ? 'cp-meter' : `cp-meter cp-meter--${tone}`;
+  const finiteValue = Number.isFinite(value) ? value : 0;
   return (
     <div class={cls} style={{ height, ...style }}>
-      <span style={{ width: `${Math.max(0, Math.min(100, value))}%` }} />
+      <span style={{ width: `${Math.max(0, Math.min(100, finiteValue))}%` }} />
     </div>
   );
 }

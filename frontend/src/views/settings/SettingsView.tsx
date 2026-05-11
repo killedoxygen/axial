@@ -1,5 +1,5 @@
 import type { JSX, ComponentChildren } from 'preact';
-import { useEffect, useMemo, useState } from 'preact/hooks';
+import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { Button, Input } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { Slider } from '../../ui/Slider';
@@ -92,6 +92,7 @@ function GameplaySection(): JSX.Element {
   const savedMemGB = (cfg?.max_memory_mb ?? 4096) / 1024;
   const [username, setUsername] = useState(cfg?.username || 'Player');
   const [memGB, setMemGB] = useState<number>(savedMemGB);
+  const lastSaveRequest = useRef(0);
   const totalGB = sys?.total_memory_mb ? Math.floor(sys.total_memory_mb / 1024) : 16;
   const maxGB = Math.max(1, totalGB);
   const rec = getMemoryRecommendation(totalGB);
@@ -115,15 +116,19 @@ function GameplaySection(): JSX.Element {
 
   const save = async (): Promise<void> => {
     if (!dirty || !nameValid) return;
+    const requestId = lastSaveRequest.current + 1;
+    lastSaveRequest.current = requestId;
     try {
       const res: any = await api('PUT', '/config', {
         username: username.trim(),
         max_memory_mb: Math.round(memGB * 1024),
       });
       if (res.error) throw new Error(res.error);
+      if (requestId !== lastSaveRequest.current) return;
       config.value = res;
       toast('Saved');
     } catch (err) {
+      if (requestId !== lastSaveRequest.current) return;
       toast(`Failed: ${errMessage(err)}`);
     }
   };

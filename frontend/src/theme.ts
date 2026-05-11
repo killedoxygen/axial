@@ -11,7 +11,14 @@ import { buildTheme, type Theme } from './tokens';
 
 // ── Reactive theme snapshot ──────────────────────────────────────────────────
 
-export const themeSignal = signal<Theme>(buildTheme({ dark: true, hue: 70 }));
+const initialThemeHue = local.theme === 'custom'
+  ? local.customHue
+  : (PRESET_HUES[local.theme] ?? local.customHue);
+
+export const themeSignal = signal<Theme>(buildTheme({
+  dark: local.lightness < 50,
+  hue: initialThemeHue,
+}));
 
 // Vibrancy is a chroma multiplier, 0..100, 100 gives full chroma of 0.14
 // Lightness is 0..100 where 0 is dark and 100 is light, we snap at 50

@@ -55,8 +55,12 @@ export function ContextMenuHost(): JSX.Element | null {
 
   // Keep menu inside viewport.
   const max = 240;
-  const clampedX = Math.min(spec.x, window.innerWidth - max - 8);
-  const clampedY = Math.min(spec.y, window.innerHeight - spec.items.length * 32 - 32);
+  const lowerBound = 8;
+  const clampedX = Math.max(lowerBound, Math.min(spec.x, window.innerWidth - max - lowerBound));
+  const clampedY = Math.max(
+    lowerBound,
+    Math.min(spec.y, window.innerHeight - spec.items.length * 32 - 32),
+  );
 
   return (
     <div

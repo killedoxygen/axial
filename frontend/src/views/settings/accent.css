@@ -70,7 +70,7 @@
 .cp-swatch[data-active="true"] {
   border-color: var(--text);
   transform: scale(1.08);
-  box-shadow: 0 0 0 3px color-mix(in oklch, currentColor 25%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in oklch, currentcolor 25%, transparent);
 }
 
 /* Color marker: transitions only fire when programmatically moved */

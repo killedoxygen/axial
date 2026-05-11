@@ -14,9 +14,10 @@ export const CHANNEL_LABEL: Record<Channel, string> = {
   release: 'Release',
   snapshot: 'Snapshot',
   legacy: 'Legacy',
+  unknown: 'Unknown',
 };
 
-export const CHANNEL_ORDER: Channel[] = ['release', 'snapshot', 'legacy'];
+export const CHANNEL_ORDER: Channel[] = ['release', 'snapshot', 'legacy', 'unknown'];
 
 export function buildRowModel(
   version: CatalogVersion,
