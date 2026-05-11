@@ -80,15 +80,18 @@ export function SetupStage({
       </header>
 
       <div class="cp-cr-setup">
-        <aside class="cp-cr-rail" role="radiogroup" aria-label="Instance source">
+        <aside class="cp-cr-rail" role="radiogroup" aria-label="Instance source" aria-orientation="horizontal">
           {LOADER_KEYS.map((key, index) => (
             <button
               key={key}
               type="button"
               class="cp-cr-rail-item"
               data-active={source === key}
+              data-label={LOADER_LABELS[key]}
+              data-tag={LOADER_TAGLINES[key]}
               role="radio"
               aria-checked={source === key}
+              aria-label={`${LOADER_LABELS[key]}: ${LOADER_TAGLINES[key]}`}
               style={{ ['--i' as any]: String(index) }}
               onClick={() => onSourcePick(key)}
               onPointerEnter={() => onSourcePreview(key)}
@@ -99,19 +102,17 @@ export function SetupStage({
               <span class="cp-cr-rail-glyph">
                 {renderSourceGlyph(key)}
               </span>
-              <span class="cp-cr-rail-label">
-                <span class="cp-cr-rail-name">{LOADER_LABELS[key]}</span>
-                <span class="cp-cr-rail-tag">{LOADER_TAGLINES[key]}</span>
-              </span>
             </button>
           ))}
-          <div class="cp-cr-rail-item is-soon" aria-disabled="true" style={{ ['--i' as any]: String(LOADER_KEYS.length) }}>
+          <div
+            class="cp-cr-rail-item is-soon"
+            aria-disabled="true"
+            data-label="Modpack"
+            data-tag="Modrinth · soon"
+            style={{ ['--i' as any]: String(LOADER_KEYS.length) }}
+          >
             <span class="cp-cr-rail-glyph">
               <Icon name="download" size={15} stroke={1.8} />
-            </span>
-            <span class="cp-cr-rail-label">
-              <span class="cp-cr-rail-name">Modpack</span>
-              <span class="cp-cr-rail-tag">Modrinth · soon</span>
             </span>
           </div>
         </aside>
