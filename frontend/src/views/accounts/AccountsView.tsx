@@ -61,7 +61,7 @@ function PlayerIdentityEditor({
             placeholder="Player"
             style={{ maxWidth: 360 }}
           />
-          <Button onClick={save} disabled={saving || !nameValid || username.trim() === savedUsername}>
+          <Button onClick={save} disabled={saving || !nameValid || username.trim() === savedUsername} sound="affirm">
             Save
           </Button>
           {showNameError && (

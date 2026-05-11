@@ -74,7 +74,7 @@ export function IdentityStage({
 
           <div class="cp-cr-id-row">
             <label class="cp-cr-id-label">Icon</label>
-            <div class="cp-cr-iconrow" role="radiogroup" aria-label="Instance icon">
+            <div class="cp-cr-iconrow">
               {INSTANCE_ICON_CHOICES.map((choice, index) => (
                 <button
                   key={choice}
@@ -82,8 +82,7 @@ export function IdentityStage({
                   class="cp-cr-iconbtn"
                   data-active={icon === choice}
                   aria-label={choice}
-                  aria-checked={icon === choice}
-                  role="radio"
+                  aria-pressed={icon === choice}
                   style={{ ['--i' as any]: String(index) }}
                   onClick={() => onIconPick(choice)}
                 >

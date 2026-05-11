@@ -251,6 +251,8 @@ export function inferButtonSound(btn: HTMLElement): SoundKind | null {
 
   // Button variants drive the sound directly.
   if (btn.classList.contains('cp-btn--primary')) {
+    const explicit = btn.dataset.sound;
+    if (explicit === 'launchPress' || explicit === 'affirm' || explicit === 'bright') return explicit;
     const label = btn.textContent?.toLowerCase() || '';
     if (label.includes('play') || label.includes('launch') || label.includes('resume')) return 'launchPress';
     if (label.includes('create') || label.includes('finish') || label.includes('save') || label.includes('continue') || label.includes('confirm')) return 'affirm';

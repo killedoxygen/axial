@@ -13,8 +13,7 @@ body {
   overflow: hidden;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  /* stylelint-disable-next-line value-keyword-case */
-  text-rendering: optimizeLegibility;
+  text-rendering: optimizelegibility;
 }
 button, input, select, textarea { font: inherit; color: inherit; }
 input::placeholder { color: var(--text-mute); }

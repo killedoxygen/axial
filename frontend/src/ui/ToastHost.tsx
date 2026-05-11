@@ -12,7 +12,6 @@ const ICON_FOR: Record<string, string> = {
 
 export function ToastHost(): JSX.Element | null {
   const list = toasts.value;
-  if (list.length === 0) return null;
   return (
     <div class="cp-toasts" role="region" aria-live="polite" aria-label="Notifications">
       {list.map(t => {

@@ -387,7 +387,7 @@ function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
         </div>
       </Card>
       <div style={{ marginTop: 16, display: 'flex', justifyContent: 'flex-end' }}>
-        <Button onClick={save} disabled={saving}>{saving ? 'Saving…' : 'Save settings'}</Button>
+        <Button onClick={save} disabled={saving} sound="affirm">{saving ? 'Saving…' : 'Save settings'}</Button>
       </div>
     </div>
   );
@@ -463,7 +463,7 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
             {running ? (
               <Button variant="danger" icon="stop" size="lg" onClick={onStop}>Stop</Button>
             ) : (
-              <Button icon="play" size="lg" onClick={onPlay}>Play now</Button>
+              <Button icon="play" size="lg" onClick={onPlay} sound="launchPress">Play now</Button>
             )}
           </div>
         </div>

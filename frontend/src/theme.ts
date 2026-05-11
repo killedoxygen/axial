@@ -50,7 +50,6 @@ function applyCssVars(hue: number, dark: boolean, vibrancy: number): void {
   set('--accent-line',      `oklch(${L} ${C} ${hue} / 0.28)`);
 
   el.setAttribute('data-color-mode', dark ? 'dark' : 'light');
-  el.setAttribute('data-theme', 'custom');
 }
 
 interface ApplyOptions {

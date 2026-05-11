@@ -57,9 +57,10 @@ export function ContextMenuHost(): JSX.Element | null {
   const max = 240;
   const lowerBound = 8;
   const clampedX = Math.max(lowerBound, Math.min(spec.x, window.innerWidth - max - lowerBound));
+  const estimatedHeight = spec.items.reduce((height, item) => height + (item.divider ? 9 : 32), 16);
   const clampedY = Math.max(
     lowerBound,
-    Math.min(spec.y, window.innerHeight - spec.items.length * 32 - 32),
+    Math.min(spec.y, window.innerHeight - estimatedHeight - lowerBound),
   );
 
   return (

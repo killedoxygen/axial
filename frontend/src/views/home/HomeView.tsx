@@ -96,6 +96,7 @@ function PlayCard({ inst }: { inst: EnrichedInstance }): JSX.Element {
         size="md"
         icon="play"
         onClick={(e) => { e.stopPropagation(); navigate({ name: 'instance', id: inst.id }); }}
+        sound="launchPress"
       >Play</Button>
     </div>
   );
@@ -146,7 +147,7 @@ export function HomeView(): JSX.Element {
         <div class="cp-hero-actions">
           <Button variant="secondary" icon="plus" onClick={() => navigate({ name: 'create' })}>New instance</Button>
           {recent[0] && (
-            <Button icon="play" onClick={() => navigate({ name: 'instance', id: recent[0].id })}>
+            <Button icon="play" onClick={() => navigate({ name: 'instance', id: recent[0].id })} sound="launchPress">
               Resume {recent[0].name}
             </Button>
           )}

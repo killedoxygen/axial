@@ -96,7 +96,9 @@ function GameplaySection(): JSX.Element {
   const totalGB = sys?.total_memory_mb ? Math.floor(sys.total_memory_mb / 1024) : 16;
   const maxGB = Math.max(1, totalGB);
   const rec = getMemoryRecommendation(totalGB);
-  const recZone: [number, number] = [Math.max(2, rec.rec - 2), Math.min(maxGB, rec.rec + 2)];
+  const recHigh = Math.min(maxGB, rec.rec + 2);
+  const recLow = Math.min(Math.max(2, rec.rec - 2), recHigh);
+  const recZone: [number, number] = [recLow, recHigh];
 
   useEffect(() => {
     setUsername(savedUsername);
@@ -147,7 +149,7 @@ function GameplaySection(): JSX.Element {
             placeholder="Player"
             style={{ width: 240 }}
           />
-          {dirty && <Button size="sm" onClick={save} disabled={!nameValid}>Save</Button>}
+          {dirty && <Button size="sm" onClick={save} disabled={!nameValid} sound="affirm">Save</Button>}
           {showNameError && <span class="cp-settings-name-err">{nameError}</span>}
         </div>
       </SettingsCard>

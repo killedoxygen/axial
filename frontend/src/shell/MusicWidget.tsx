@@ -1,5 +1,4 @@
 import type { JSX } from 'preact';
-import { useEffect, useState } from 'preact/hooks';
 import { Icon } from '../ui/Icons';
 import { Music, musicStateVersion } from '../music';
 
@@ -8,12 +7,6 @@ import { Music, musicStateVersion } from '../music';
 // When on, show equalizer during playback plus a skip button
 export function MusicWidget(): JSX.Element | null {
   musicStateVersion.value;
-  const [, tick] = useState(0);
-  useEffect(() => {
-    const handler = (): void => tick(t => t + 1);
-    const interval = setInterval(handler, 1000);
-    return () => clearInterval(interval);
-  }, []);
 
   const on = Music.enabled;
   const playing = Music.playing;

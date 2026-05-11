@@ -9,7 +9,7 @@ type BtnSize = 'sm' | 'md' | 'lg';
 
 export function Button({
   children, variant = 'primary', size = 'md', icon, trailing,
-  onClick, style, disabled, full, title, buttonRef,
+  onClick, style, disabled, full, title, buttonRef, sound,
 }: {
   children?: ComponentChildren;
   variant?: BtnVariant;
@@ -22,6 +22,7 @@ export function Button({
   full?: boolean;
   title?: string;
   buttonRef?: { current: HTMLButtonElement | null };
+  sound?: 'launchPress' | 'affirm' | 'bright';
 }): JSX.Element {
   const cls = `cp-btn cp-btn--${size} cp-btn--${variant}${full ? ' cp-btn--full' : ''}`;
   return (
@@ -32,6 +33,7 @@ export function Button({
       disabled={disabled}
       style={style}
       title={title}
+      data-sound={sound}
     >
       {icon && <Icon name={icon} size={size === 'lg' ? 18 : 16} stroke={1.8} />}
       {children != null && <span>{children}</span>}

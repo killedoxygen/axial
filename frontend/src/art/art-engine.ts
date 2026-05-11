@@ -42,7 +42,7 @@ interface RenderSize {
   height: number;
 }
 
-const CACHE_LIMIT = 64;
+const MAX_CACHE_BYTES = 32 * 1024 * 1024;
 interface RenderedArt {
   source: CanvasImageSource;
   width: number;
@@ -50,6 +50,8 @@ interface RenderedArt {
 }
 
 const cache = new Map<string, Promise<RenderedArt>>();
+const cacheSizes = new Map<string, number>();
+let cacheBytes = 0;
 
 const SIZE_BY_ASPECT: Record<ArtAspect, RenderSize> = {
   thumb: { width: 128, height: 128 },
@@ -342,11 +344,23 @@ function cacheKey(input: RenderInput): string {
   return `${input.seed}:${input.preset}:${input.aspect}:${input.dark ? 'd' : 'l'}:${width}x${height}`;
 }
 
+function cacheByteSize(input: RenderInput): number {
+  const { width, height } = sizeFor(input.aspect);
+  return width * height * 4;
+}
+
+function deleteCached(key: string): void {
+  cache.delete(key);
+  cacheBytes -= cacheSizes.get(key) ?? 0;
+  cacheSizes.delete(key);
+  cacheBytes = Math.max(0, cacheBytes);
+}
+
 function enforceCacheLimit(): void {
-  while (cache.size > CACHE_LIMIT) {
+  while (cacheBytes > MAX_CACHE_BYTES) {
     const oldest = cache.keys().next().value;
     if (oldest == null) return;
-    cache.delete(oldest);
+    deleteCached(oldest);
   }
 }
 
@@ -473,10 +487,13 @@ export function renderInstanceArt(input: RenderInput): Promise<RenderedArt> {
   }
 
   const rendered = renderPixels(input).catch(error => {
-    cache.delete(key);
+    deleteCached(key);
     throw error;
   });
   cache.set(key, rendered);
+  const byteSize = cacheByteSize(input);
+  cacheSizes.set(key, byteSize);
+  cacheBytes += byteSize;
   enforceCacheLimit();
   return rendered;
 }

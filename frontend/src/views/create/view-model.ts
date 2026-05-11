@@ -19,6 +19,13 @@ export const CHANNEL_LABEL: Record<Channel, string> = {
 
 export const CHANNEL_ORDER: Channel[] = ['release', 'snapshot', 'legacy', 'unknown'];
 
+function isVersionTokenPrefix(anchorId: string, versionId: string): boolean {
+  const anchorTokens = anchorId.split('.');
+  const versionTokens = versionId.split(/[.\-_]/);
+  return versionTokens.length >= anchorTokens.length
+    && anchorTokens.every((token, index) => versionTokens[index] === token);
+}
+
 export function buildRowModel(
   version: CatalogVersion,
   releaseAnchors: CatalogVersion[],
@@ -39,7 +46,7 @@ export function buildRowModel(
     if (!nearest && releaseAnchors.length > 0) {
       nearest = releaseAnchors[releaseAnchors.length - 1] ?? null;
     }
-    if (nearest && !version.id.includes(nearest.id)) {
+    if (nearest && !isVersionTokenPrefix(nearest.id, version.id)) {
       hint = `~ ${nearest.id}`;
     }
   }

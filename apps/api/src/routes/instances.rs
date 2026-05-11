@@ -136,8 +136,9 @@ async fn handle_update_instance(
     if let Some(version_id) = patch.version_id.filter(|value| !value.trim().is_empty()) {
         instance.version_id = version_id;
     }
-    if let Some(art_seed) = patch.art_seed.filter(|value| *value > 0) {
+    if let Some(art_seed) = patch.art_seed {
         instance.art_seed = art_seed;
+        instance.art_preset = croopor_config::art_preset_for_seed(art_seed).to_string();
     }
     if let Some(max_memory_mb) = patch.max_memory_mb {
         instance.max_memory_mb = max_memory_mb.max(0);
@@ -169,10 +170,6 @@ async fn handle_update_instance(
     if let Some(accent) = patch.accent {
         instance.accent = accent;
     }
-    if instance.art_seed > 0 {
-        instance.art_preset = croopor_config::art_preset_for_seed(instance.art_seed).to_string();
-    }
-
     state
         .instances()
         .update(instance)

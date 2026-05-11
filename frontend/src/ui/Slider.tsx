@@ -28,10 +28,14 @@ export function Slider({
 }): JSX.Element {
   const range = Math.max(1e-9, max - min);
   const pct = ((Math.max(min, Math.min(max, value)) - min) / range) * 100;
-  const recStyle: JSX.CSSProperties | undefined = recommended ? {
-    left: `${((recommended[0] - min) / range) * 100}%`,
-    width: `${((recommended[1] - recommended[0]) / range) * 100}%`,
-  } : undefined;
+  const recStyle: JSX.CSSProperties | undefined = recommended ? (() => {
+    const low = Math.max(min, Math.min(max, recommended[0]));
+    const high = Math.max(low, Math.min(max, recommended[1]));
+    return {
+      left: `${((low - min) / range) * 100}%`,
+      width: `${((high - low) / range) * 100}%`,
+    };
+  })() : undefined;
   return (
     <div>
       <div class="cp-slider" style={{ ...style, ['--slider-filled' as any]: `${pct}%` }}>

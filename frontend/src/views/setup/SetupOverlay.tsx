@@ -12,11 +12,11 @@ import './setup.css';
 export function SetupOverlay(): JSX.Element {
   const [mode, setMode] = useState<'managed' | 'existing'>('managed');
   const [managedPath, setManagedPath] = useState<string>('Preparing default library path…');
+  const [resolvedManagedPath, setResolvedManagedPath] = useState<string | null>(null);
   const [existingPath, setExistingPath] = useState<string>('');
   const [status, setStatus] = useState<'pending' | 'running' | 'error' | 'ready'>('pending');
   const [error, setError] = useState<string | null>(null);
   const userTookOver = useRef(false);
-  const managedReady = status !== 'pending' && managedPath.trim() !== '';
 
   // Fetch defaults on mount, then kick off a managed setup automatically
   useEffect(() => {
@@ -25,12 +25,14 @@ export function SetupOverlay(): JSX.Element {
       try {
         const defaults: any = await api('GET', '/setup/defaults');
         if (cancelled) return;
-        setManagedPath(defaults.managed_default_path || 'Could not determine a default library path.');
+        const managedDefaultPath = defaults.managed_default_path || '';
+        setManagedPath(managedDefaultPath || 'Could not determine a default library path.');
+        setResolvedManagedPath(managedDefaultPath || null);
         if (defaults.existing_default_path) setExistingPath(defaults.existing_default_path);
         if (userTookOver.current) return;
-        if (defaults.managed_default_path) {
+        if (managedDefaultPath) {
           setStatus('running');
-          const res: any = await api('POST', '/setup/init', { path: defaults.managed_default_path });
+          const res: any = await api('POST', '/setup/init', { path: managedDefaultPath });
           if (cancelled || userTookOver.current) return;
           if (res.error) { setError(res.error); setStatus('error'); return; }
           setStatus('ready');
@@ -50,9 +52,10 @@ export function SetupOverlay(): JSX.Element {
 
   const retryManaged = async (): Promise<void> => {
     setError(null);
+    if (!resolvedManagedPath) return;
     setStatus('running');
     try {
-      const res: any = await api('POST', '/setup/init', { path: managedPath });
+      const res: any = await api('POST', '/setup/init', { path: resolvedManagedPath });
       if (res.error) { setError(res.error); setStatus('error'); return; }
       showSetupOverlay.value = false;
     } catch (err) {
@@ -104,10 +107,10 @@ export function SetupOverlay(): JSX.Element {
             {status === 'running' && <div class="cp-setup-progress" />}
             {error && <div class="cp-setup-error">{error}</div>}
             <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
-              <Button variant="ghost" onClick={() => { userTookOver.current = true; setMode('existing'); }}>
+              <Button variant="ghost" onClick={() => { userTookOver.current = true; setError(null); setStatus('pending'); setMode('existing'); }}>
                 Use existing folder
               </Button>
-              <Button onClick={retryManaged} disabled={status === 'running' || !managedReady}>
+              <Button onClick={retryManaged} disabled={status === 'running' || !resolvedManagedPath}>
                 {status === 'running' ? 'Setting up…' : status === 'error' ? 'Retry' : 'Create library'}
               </Button>
             </div>
@@ -120,7 +123,7 @@ export function SetupOverlay(): JSX.Element {
             </div>
             {error && <div class="cp-setup-error">{error}</div>}
             <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
-              <Button variant="ghost" onClick={() => setMode('managed')}>Use managed library</Button>
+              <Button variant="ghost" onClick={() => { setError(null); setStatus('pending'); setMode('managed'); }}>Use managed library</Button>
               <Button onClick={useExisting} disabled={status === 'running' || !existingPath.trim()}>
                 Use this folder
               </Button>
