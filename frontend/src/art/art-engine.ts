@@ -43,7 +43,13 @@ interface RenderSize {
 }
 
 const CACHE_LIMIT = 64;
-const cache = new Map<string, HTMLCanvasElement>();
+interface RenderedArt {
+  source: CanvasImageSource;
+  width: number;
+  height: number;
+}
+
+const cache = new Map<string, Promise<RenderedArt>>();
 
 const SIZE_BY_ASPECT: Record<ArtAspect, RenderSize> = {
   thumb: { width: 128, height: 128 },
@@ -350,17 +356,15 @@ function lightMask(x: number, y: number, lx: number, ly: number): number {
   return Math.exp(-(dx * dx * 2.5 + dy * dy * 4.2));
 }
 
-function renderPixels(input: RenderInput, target: HTMLCanvasElement): void {
+function yieldToMain(): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, 0));
+}
+
+async function renderPixels(input: RenderInput): Promise<RenderedArt> {
   const { width, height } = sizeFor(input.aspect);
-  const ctx = target.getContext('2d');
-  if (!ctx) return;
-
-  target.width = width;
-  target.height = height;
-
   const rand = rng(input.seed ^ hashStr(`${input.preset}:${input.aspect}:${input.dark ? 'dark' : 'light'}`));
   const palette = paletteFor(input.seed, input.preset, input.dark);
-  const image = ctx.createImageData(width, height);
+  const image = new ImageData(width, height);
   const data = image.data;
   const stretch = width / height;
   const fieldSeed = input.seed ^ 0x9e3779b9;
@@ -374,6 +378,7 @@ function renderPixels(input: RenderInput, target: HTMLCanvasElement): void {
   const motifs = buildMotifs(rand, input.preset, input.aspect);
 
   for (let py = 0; py < height; py += 1) {
+    if (py > 0 && py % 16 === 0) await yieldToMain();
     const y = py / Math.max(1, height - 1);
     for (let px = 0; px < width; px += 1) {
       const x = px / Math.max(1, width - 1);
@@ -444,10 +449,20 @@ function renderPixels(input: RenderInput, target: HTMLCanvasElement): void {
     }
   }
 
-  ctx.putImageData(image, 0, 0);
+  if (typeof createImageBitmap === 'function') {
+    const bitmap = await createImageBitmap(image);
+    return { source: bitmap, width, height };
+  }
+
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d');
+  canvas.width = width;
+  canvas.height = height;
+  ctx?.putImageData(image, 0, 0);
+  return { source: canvas, width, height };
 }
 
-export function renderInstanceArt(input: RenderInput): HTMLCanvasElement {
+export function renderInstanceArt(input: RenderInput): Promise<RenderedArt> {
   const key = cacheKey(input);
   const cached = cache.get(key);
   if (cached) {
@@ -456,9 +471,11 @@ export function renderInstanceArt(input: RenderInput): HTMLCanvasElement {
     return cached;
   }
 
-  const canvas = document.createElement('canvas');
-  renderPixels(input, canvas);
-  cache.set(key, canvas);
+  const rendered = renderPixels(input).catch(error => {
+    cache.delete(key);
+    throw error;
+  });
+  cache.set(key, rendered);
   enforceCacheLimit();
-  return canvas;
+  return rendered;
 }

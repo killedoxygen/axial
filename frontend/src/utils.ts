@@ -118,7 +118,7 @@ function syncLogFilter(): void {
     filter.appendChild(opt);
   }
   filter.value = current || 'all';
-  filter.classList.toggle('hidden', loggedInstances.size < 2);
+  filter.classList.toggle('cp-hidden', loggedInstances.size < 2);
 }
 
 export function showError(msg: string): void {

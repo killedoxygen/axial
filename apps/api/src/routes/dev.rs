@@ -105,7 +105,10 @@ async fn handle_dev_flush(
 
     let _ = fs::remove_dir_all(&config_paths.config_dir);
 
-    let _ = state.config().replace_in_memory(AppConfig::default());
+    state
+        .config()
+        .replace_in_memory(AppConfig::default())
+        .map_err(internal_error)?;
     state.set_library_dir(String::new());
     let _ = state.instances().clear();
 

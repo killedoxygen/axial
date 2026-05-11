@@ -46,11 +46,12 @@ export interface Theme {
   font: { sans: string; mono: string };
 }
 
-export function buildAccent(hue: number, dark: boolean): AccentScale {
+export function buildAccent(hue: number, dark: boolean, vibrancy = 100): AccentScale {
   const L = dark ? 0.78 : 0.62;
-  const C = 0.14;
+  const clampedVibrancy = Math.max(0, Math.min(100, vibrancy));
+  const C = 0.14 * clampedVibrancy / 100;
   const Lf = dark ? 0.58 : 0.52;
-  const Cf = 0.15;
+  const Cf = 0.15 * Math.max(0.6, clampedVibrancy / 100);
   return {
     base: `oklch(${L} ${C} ${hue})`,
     strong: `oklch(${L - 0.08} ${C} ${hue})`,
@@ -96,15 +97,16 @@ export function buildNeutrals(dark: boolean): NeutralScale {
   };
 }
 
-export function buildTheme(opts: { dark?: boolean; hue?: number; radius?: number; density?: number } = {}): Theme {
+export function buildTheme(opts: { dark?: boolean; hue?: number; vibrancy?: number; radius?: number; density?: number } = {}): Theme {
   const dark = opts.dark ?? true;
   const hue = opts.hue ?? 70;
+  const vibrancy = opts.vibrancy ?? 100;
   const radius = opts.radius ?? 1;
   const density = opts.density ?? 1;
   return {
     dark,
     hue,
-    accent: buildAccent(hue, dark),
+    accent: buildAccent(hue, dark, vibrancy),
     n: buildNeutrals(dark),
     r: {
       xs: 6 * radius,

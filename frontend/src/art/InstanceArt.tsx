@@ -1,5 +1,5 @@
 import type { JSX } from 'preact';
-import { useLayoutEffect, useRef } from 'preact/hooks';
+import { useEffect, useRef } from 'preact/hooks';
 import { useTheme } from '../hooks/use-theme';
 import { hashStr } from '../tokens';
 import type { Instance } from '../types';
@@ -61,15 +61,16 @@ export function nextArtSeed(seed: number): number {
   return next || 1;
 }
 
-function drawArt(canvas: HTMLCanvasElement | null, input: ArtInput): void {
+async function drawArt(canvas: HTMLCanvasElement | null, input: ArtInput, isStale: () => boolean): Promise<void> {
   if (!canvas) return;
-  const source = renderInstanceArt(input);
+  const art = await renderInstanceArt(input);
+  if (isStale()) return;
   const ctx = canvas.getContext('2d');
   if (!ctx) return;
-  canvas.width = source.width;
-  canvas.height = source.height;
+  canvas.width = art.width;
+  canvas.height = art.height;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-  ctx.drawImage(source, 0, 0);
+  ctx.drawImage(art.source, 0, 0);
 }
 
 export function InstanceArt({
@@ -91,8 +92,12 @@ export function InstanceArt({
   const preset = artPresetForSeed(seed);
   const classValue = `cp-instance-art cp-instance-art--${aspect}${className ? ` ${className}` : ''}`;
 
-  useLayoutEffect(() => {
-    drawArt(canvasRef.current, { seed, preset, dark: theme.dark, aspect });
+  useEffect(() => {
+    let stale = false;
+    void drawArt(canvasRef.current, { seed, preset, dark: theme.dark, aspect }, () => stale);
+    return () => {
+      stale = true;
+    };
   }, [seed, preset, theme.dark, aspect]);
 
   return (

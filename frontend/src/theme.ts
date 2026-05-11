@@ -18,6 +18,7 @@ const initialThemeHue = local.theme === 'custom'
 export const themeSignal = signal<Theme>(buildTheme({
   dark: local.lightness < 50,
   hue: initialThemeHue,
+  vibrancy: local.customVibrancy,
 }));
 
 // Vibrancy is a chroma multiplier, 0..100, 100 gives full chroma of 0.14
@@ -75,7 +76,7 @@ export function applyTheme(theme: string, hue: number | null, options: ApplyOpti
   }
 
   applyCssVars(resolvedHue, dark, vibrancy);
-  themeSignal.value = buildTheme({ dark, hue: resolvedHue });
+  themeSignal.value = buildTheme({ dark, hue: resolvedHue, vibrancy });
 
   local.theme = theme;
   local.lightness = lt;

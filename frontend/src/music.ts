@@ -203,7 +203,7 @@ export const Music = {
     }
     // Equalizer: visible only when actually producing audible output
     const audible = this.enabled && this.playing && !suppressed;
-    byId<HTMLElement>('music-eq')?.classList.toggle('hidden', !audible);
+    byId<HTMLElement>('music-eq')?.classList.toggle('cp-hidden', !audible);
 
     // Settings form (if open)
     const musicToggle = byId<HTMLInputElement>('music-toggle');

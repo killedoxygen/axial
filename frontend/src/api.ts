@@ -9,7 +9,12 @@ let apiBaseUrl = '';
 export let API = API_PATH;
 
 export async function initializeApiBase(): Promise<void> {
-  const nativeBaseUrl = await getNativeApiBaseUrl();
+  let nativeBaseUrl: string | null | undefined;
+  try {
+    nativeBaseUrl = await getNativeApiBaseUrl();
+  } catch {
+    nativeBaseUrl = undefined;
+  }
   setApiBaseUrl(nativeBaseUrl ?? __CROOPOR_WEB_API_BASE__ ?? '');
 }
 
