@@ -59,11 +59,22 @@ function PlayCard({ inst }: { inst: EnrichedInstance }): JSX.Element {
   const version = versions.value.find(v => v.id === inst.version_id);
   const running = runningSessions.value[inst.id];
   const mods = inst.mods_count ?? 0;
+  const openInstance = (): void => navigate({ name: 'instance', id: inst.id });
+  const onCardKeyDown = (e: KeyboardEvent): void => {
+    if (e.target !== e.currentTarget) return;
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    e.preventDefault();
+    openInstance();
+  };
   return (
-    <button
+    <div
       class="cp-playcard"
       style={{ border: 'none', font: 'inherit', color: 'inherit', cursor: 'pointer', background: undefined }}
-      onClick={() => navigate({ name: 'instance', id: inst.id })}
+      role="button"
+      tabIndex={0}
+      aria-label={`Open ${inst.name}`}
+      onClick={openInstance}
+      onKeyDown={onCardKeyDown}
     >
       <InstanceArt instance={inst} aspect="square" radius={theme.r.md} style={{ width: 68, height: 68 }} />
       <div class="cp-playcard-body">
@@ -86,7 +97,7 @@ function PlayCard({ inst }: { inst: EnrichedInstance }): JSX.Element {
         icon="play"
         onClick={(e) => { e.stopPropagation(); navigate({ name: 'instance', id: inst.id }); }}
       >Play</Button>
-    </button>
+    </div>
   );
 }
 

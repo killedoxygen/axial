@@ -53,6 +53,11 @@
   text-align: left;
 }
 .cp-playcard:hover { background: var(--surface-3); }
+.cp-playcard:focus-visible {
+  outline: none;
+  border-color: var(--accent-line);
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
 .cp-playcard-body { flex: 1; min-width: 0; }
 .cp-playcard-title {
   display: flex;

@@ -1,5 +1,5 @@
 import type { JSX } from 'preact';
-import { useMemo, useState } from 'preact/hooks';
+import { useEffect, useMemo, useState } from 'preact/hooks';
 import { Icon } from '../../ui/Icons';
 import { Button, Card, IconButton, Input, Meter, Pill, SectionHeading } from '../../ui/Atoms';
 import { useTheme } from '../../hooks/use-theme';
@@ -251,12 +251,17 @@ function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
   const [jvmArgs, setJvmArgs] = useState<string>(inst.extra_jvm_args ?? '');
   const [saving, setSaving] = useState(false);
 
+  useEffect(() => {
+    setMinMem(prev => Math.min(prev, maxMem));
+  }, [maxMem]);
+
   const save = async (): Promise<void> => {
     setSaving(true);
     try {
+      const clampedMinMem = Math.min(minMem, maxMem);
       const res: any = await api('PUT', `/instances/${encodeURIComponent(inst.id)}`, {
         max_memory_mb: Math.round(maxMem * 1024),
-        min_memory_mb: Math.round(minMem * 1024),
+        min_memory_mb: Math.round(clampedMinMem * 1024),
         art_seed: artSeed,
         window_width: width,
         window_height: height,

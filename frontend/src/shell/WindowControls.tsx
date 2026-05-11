@@ -17,7 +17,12 @@ export function WindowControls(): JSX.Element | null {
 
   useEffect(() => {
     if (!isNative) return;
-    void windowIsMaximized().then(setMaximized);
+    const syncMaximized = (): void => {
+      void windowIsMaximized().then(setMaximized);
+    };
+    syncMaximized();
+    window.addEventListener('focus', syncMaximized);
+    return () => window.removeEventListener('focus', syncMaximized);
   }, [isNative]);
 
   if (!isNative) return null;

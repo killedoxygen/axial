@@ -15,6 +15,7 @@ function PlayerIdentityEditor({
   const theme = useTheme();
   const [username, setUsername] = useState(savedUsername);
   const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const nameError = validateUsername(username);
   const nameValid = nameError === null;
   const showNameError = username.length > 0 && !nameValid;
@@ -24,8 +25,12 @@ function PlayerIdentityEditor({
     const next = username.trim();
     if (!nameValid || next === savedUsername) return;
     setSaving(true);
+    setSaveError(null);
     try {
-      await savePlayerName(next);
+      const saved = await savePlayerName(next);
+      if (!saved) setSaveError('Could not save player name. Try again.');
+    } catch {
+      setSaveError('Could not save player name. Try again.');
     } finally {
       setSaving(false);
     }
@@ -49,7 +54,10 @@ function PlayerIdentityEditor({
         <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
           <Input
             value={username}
-            onChange={(v) => setUsername(clampPlayerNameInput(v))}
+            onChange={(v) => {
+              setUsername(clampPlayerNameInput(v));
+              setSaveError(null);
+            }}
             placeholder="Player"
             style={{ maxWidth: 360 }}
           />
@@ -59,6 +67,11 @@ function PlayerIdentityEditor({
           {showNameError && (
             <span style={{ fontSize: 12, fontWeight: 500, color: 'var(--err)' }}>
               {nameError}
+            </span>
+          )}
+          {saveError && (
+            <span style={{ fontSize: 12, fontWeight: 500, color: 'var(--err)' }}>
+              {saveError}
             </span>
           )}
         </div>
