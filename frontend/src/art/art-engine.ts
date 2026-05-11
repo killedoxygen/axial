@@ -44,12 +44,12 @@ interface RenderSize {
 
 const MAX_CACHE_BYTES = 32 * 1024 * 1024;
 interface RenderedArt {
-  source: CanvasImageSource;
+  source: HTMLCanvasElement;
   width: number;
   height: number;
 }
 
-const cache = new Map<string, Promise<RenderedArt>>();
+const cache = new Map<string, RenderedArt>();
 const cacheSizes = new Map<string, number>();
 let cacheBytes = 0;
 
@@ -370,11 +370,7 @@ function lightMask(x: number, y: number, lx: number, ly: number): number {
   return Math.exp(-(dx * dx * 2.5 + dy * dy * 4.2));
 }
 
-function yieldToMain(): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, 0));
-}
-
-async function renderPixels(input: RenderInput): Promise<RenderedArt> {
+function renderPixels(input: RenderInput): RenderedArt {
   const { width, height } = sizeFor(input.aspect);
   const rand = rng(input.seed ^ hashStr(`${input.preset}:${input.aspect}:${input.dark ? 'dark' : 'light'}`));
   const palette = paletteFor(input.seed, input.preset, input.dark);
@@ -392,7 +388,6 @@ async function renderPixels(input: RenderInput): Promise<RenderedArt> {
   const motifs = buildMotifs(rand, input.preset, input.aspect);
 
   for (let py = 0; py < height; py += 1) {
-    if (py > 0 && py % 16 === 0) await yieldToMain();
     const y = py / Math.max(1, height - 1);
     for (let px = 0; px < width; px += 1) {
       const x = px / Math.max(1, width - 1);
@@ -463,11 +458,6 @@ async function renderPixels(input: RenderInput): Promise<RenderedArt> {
     }
   }
 
-  if (typeof createImageBitmap === 'function') {
-    const bitmap = await createImageBitmap(image);
-    return { source: bitmap, width, height };
-  }
-
   const canvas = document.createElement('canvas');
   const ctx = canvas.getContext('2d');
   if (!ctx) throw new Error('Could not create art canvas context');
@@ -477,7 +467,7 @@ async function renderPixels(input: RenderInput): Promise<RenderedArt> {
   return { source: canvas, width, height };
 }
 
-export function renderInstanceArt(input: RenderInput): Promise<RenderedArt> {
+export function renderInstanceArt(input: RenderInput): RenderedArt {
   const key = cacheKey(input);
   const cached = cache.get(key);
   if (cached) {
@@ -486,10 +476,7 @@ export function renderInstanceArt(input: RenderInput): Promise<RenderedArt> {
     return cached;
   }
 
-  const rendered = renderPixels(input).catch(error => {
-    deleteCached(key);
-    throw error;
-  });
+  const rendered = renderPixels(input);
   cache.set(key, rendered);
   const byteSize = cacheByteSize(input);
   cacheSizes.set(key, byteSize);
