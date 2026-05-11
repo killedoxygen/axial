@@ -175,7 +175,7 @@ export function CommandPalette(): JSX.Element | null {
       }
       if (e.key === 'ArrowDown') {
         e.preventDefault();
-        setActive(a => Math.min(filtered.length - 1, a + 1));
+        setActive(a => Math.max(0, Math.min(filtered.length - 1, a + 1)));
         return;
       }
       if (e.key === 'ArrowUp') {

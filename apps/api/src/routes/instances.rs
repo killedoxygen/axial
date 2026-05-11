@@ -163,10 +163,10 @@ async fn handle_update_instance(
     if let Some(extra_jvm_args) = patch.extra_jvm_args {
         instance.extra_jvm_args = extra_jvm_args;
     }
-    if let Some(icon) = patch.icon.filter(|value| !value.trim().is_empty()) {
+    if let Some(icon) = patch.icon {
         instance.icon = icon;
     }
-    if let Some(accent) = patch.accent.filter(|value| !value.trim().is_empty()) {
+    if let Some(accent) = patch.accent {
         instance.accent = accent;
     }
     if instance.art_seed > 0 {

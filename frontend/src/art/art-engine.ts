@@ -456,9 +456,10 @@ async function renderPixels(input: RenderInput): Promise<RenderedArt> {
 
   const canvas = document.createElement('canvas');
   const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('Could not create art canvas context');
   canvas.width = width;
   canvas.height = height;
-  ctx?.putImageData(image, 0, 0);
+  ctx.putImageData(image, 0, 0);
   return { source: canvas, width, height };
 }
 

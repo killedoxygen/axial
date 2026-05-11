@@ -16,6 +16,7 @@ export function SetupOverlay(): JSX.Element {
   const [status, setStatus] = useState<'pending' | 'running' | 'error' | 'ready'>('pending');
   const [error, setError] = useState<string | null>(null);
   const userTookOver = useRef(false);
+  const managedReady = status !== 'pending' && managedPath.trim() !== '';
 
   // Fetch defaults on mount, then kick off a managed setup automatically
   useEffect(() => {
@@ -106,7 +107,7 @@ export function SetupOverlay(): JSX.Element {
               <Button variant="ghost" onClick={() => { userTookOver.current = true; setMode('existing'); }}>
                 Use existing folder
               </Button>
-              <Button onClick={retryManaged} disabled={status === 'running' || !managedPath}>
+              <Button onClick={retryManaged} disabled={status === 'running' || !managedReady}>
                 {status === 'running' ? 'Setting up…' : status === 'error' ? 'Retry' : 'Create library'}
               </Button>
             </div>
