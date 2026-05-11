@@ -77,6 +77,12 @@ export async function getNativeAppVersion(): Promise<string | null> {
   return tauri.core.invoke<string>('app_version');
 }
 
+export async function getNativeApiBaseUrl(): Promise<string | null> {
+  const tauri = getTauriBinding();
+  if (!tauri?.core) return null;
+  return tauri.core.invoke<string>('api_base_url');
+}
+
 export async function browseDirectory(defaultPath = ''): Promise<string | null> {
   const tauri = getTauriBinding();
   if (!tauri?.dialog) return null;

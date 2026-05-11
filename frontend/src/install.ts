@@ -1,4 +1,4 @@
-import { api, API } from './api';
+import { api, apiUrl } from './api';
 import { showError, errMessage } from './utils';
 import { startLoaderInstall, connectLoaderInstallSSE } from './loaders/api';
 import { createProgressEstimator } from './progress-estimation';
@@ -340,7 +340,7 @@ async function connectVanillaEvents(installId: string, versionId: string): Promi
     return;
   }
 
-  const es = new EventSource(`${API}/install/${installId}/events`);
+  const es = new EventSource(apiUrl(`/install/${installId}/events`));
   setInstallEventSource(es);
 
   es.addEventListener('progress', (e: MessageEvent) => {

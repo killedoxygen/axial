@@ -1,4 +1,4 @@
-import { api, API } from './api';
+import { api, apiUrl } from './api';
 import { byId } from './dom';
 import { Sound } from './sound';
 import { Music } from './music';
@@ -512,7 +512,7 @@ async function connectLaunchEvents(sessionId: string, instanceId: string, instan
     return;
   }
 
-  const es = new EventSource(`${API}/launch/${sessionId}/events`);
+  const es = new EventSource(apiUrl(`/launch/${sessionId}/events`));
   es.addEventListener('status', (e: MessageEvent) => {
     onStatus(JSON.parse(e.data), es);
   });

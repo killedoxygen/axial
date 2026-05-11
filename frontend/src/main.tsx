@@ -5,7 +5,7 @@ import {
   appVersion, bootstrapError, bootstrapState, config, instances, lastInstanceId,
   systemInfo, versions, devMode,
 } from './store';
-import { api } from './api';
+import { api, initializeApiBase } from './api';
 import { applyTheme } from './theme';
 import { Sound, bindButtonSounds } from './sound';
 import { Music } from './music';
@@ -30,6 +30,8 @@ async function init(): Promise<void> {
   bindButtonSounds();
 
   try {
+    await initializeApiBase();
+
     const nativeVersion = await getNativeAppVersion();
     if (nativeVersion) appVersion.value = nativeVersion;
 

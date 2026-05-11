@@ -41,7 +41,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install frontend dependencies
-        run: corepack pnpm --dir frontend install --frozen-lockfile --ignore-scripts
+        run: pnpm --dir frontend install --frozen-lockfile --ignore-scripts
 
       - name: Rust fmt
         run: cargo fmt --all --check
@@ -56,10 +56,10 @@ jobs:
         run: cargo test --workspace --locked
 
       - name: Frontend typecheck
-        run: corepack pnpm --dir frontend run check
+        run: pnpm --dir frontend run check
 
       - name: Frontend build
-        run: corepack pnpm --dir frontend run build
+        run: pnpm --dir frontend run build
 
       - name: Release desktop build
         run: cargo build --locked -p croopor-desktop --release
@@ -91,10 +91,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install frontend dependencies
-        run: corepack pnpm --dir frontend install --frozen-lockfile --ignore-scripts
+        run: pnpm --dir frontend install --frozen-lockfile --ignore-scripts
 
       - name: Build frontend bundle
-        run: corepack pnpm --dir frontend run build
+        run: pnpm --dir frontend run build
 
       - name: Build release desktop binary
         run: cargo build --locked -p croopor-desktop --release
@@ -134,10 +134,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install frontend dependencies
-        run: corepack pnpm --dir frontend install --frozen-lockfile --ignore-scripts
+        run: pnpm --dir frontend install --frozen-lockfile --ignore-scripts
 
       - name: Build frontend bundle
-        run: corepack pnpm --dir frontend run build
+        run: pnpm --dir frontend run build
 
       - name: Build release desktop binary
         run: cargo build --locked -p croopor-desktop --release

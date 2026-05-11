@@ -1,8 +1,5 @@
 version: "3"
 
-env:
-  COREPACK_HOME: "{{.TASKFILE_DIR}}/.cache/corepack"
-
 vars:
   FRONTEND_DIR: frontend
   WINDOWS_TARGET: x86_64-pc-windows-gnu
@@ -35,7 +32,7 @@ tasks:
           echo "rustfmt  $(cargo fmt --version 2>/dev/null || echo missing)"
           echo "clippy   $(cargo clippy --version 2>/dev/null || echo missing)"
           echo "node     $(node --version)"
-          echo "corepack $(corepack --version)"
+          echo "pnpm     $(pnpm --version)"
           if command -v task >/dev/null 2>&1; then
             echo "task     $(task --version)"
           else
@@ -59,7 +56,7 @@ tasks:
           try { Write-Host ('rustfmt  ' + (cargo fmt --version)) } catch { Write-Host 'rustfmt  missing' };
           try { Write-Host ('clippy   ' + (cargo clippy --version)) } catch { Write-Host 'clippy   missing' };
           Write-Host ('node     ' + (node --version));
-          Write-Host ('corepack ' + (corepack --version));
+          Write-Host ('pnpm     ' + (pnpm --version));
           try { Write-Host ('task     ' + (task --version)) } catch { Write-Host 'task     optional' };
           Write-Host 'wsl      no'"
         platforms: [windows]
@@ -68,29 +65,30 @@ tasks:
     desc: install frontend deps
     aliases: [setup:frontend]
     cmds:
-      - corepack pnpm --dir {{.FRONTEND_DIR}} install --frozen-lockfile --ignore-scripts
+      - pnpm --dir {{.FRONTEND_DIR}} install --frozen-lockfile --ignore-scripts
 
   frontend:check:
     desc: run frontend typecheck
     cmds:
-      - corepack pnpm --dir {{.FRONTEND_DIR}} run check
+      - pnpm --dir {{.FRONTEND_DIR}} run check
 
   frontend:build:
     desc: build frontend bundle
     cmds:
-      - corepack pnpm --dir {{.FRONTEND_DIR}} run build
+      - pnpm --dir {{.FRONTEND_DIR}} run build
 
   frontend:watch:
     desc: rebuild frontend assets on file changes
     aliases: [watch]
     cmds:
-      - corepack pnpm --dir {{.FRONTEND_DIR}} run watch
+      - pnpm --dir {{.FRONTEND_DIR}} run watch
 
   frontend:serve:
     desc: run frontend-only dev server
     aliases: [dev-web, web]
+    platforms: [linux, darwin]
     cmds:
-      - corepack pnpm --dir {{.FRONTEND_DIR}} run dev
+      - ./dev dev-web
 
   rust:fetch:
     desc: prefetch Rust dependencies
@@ -159,14 +157,16 @@ tasks:
   rust:desktop:
     desc: run the Rust desktop shell
     aliases: [dev, dev-desktop, desktop:dev]
+    platforms: [linux, darwin]
     cmds:
-      - cargo run --locked -p croopor-desktop
+      - ./dev dev
 
   dev:windows:
     desc: run the Windows desktop shell from linux/wsl
     aliases: [dev-windows, desktop:dev:windows]
+    platforms: [linux, darwin]
     cmds:
-      - cargo run --locked -p croopor-desktop --target {{.WINDOWS_TARGET}}
+      - ./dev dev --target windows
 
   build:
     desc: build the desktop app in release mode

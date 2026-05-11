@@ -10,6 +10,12 @@ This is the current map of the launcher. Keep it accurate. If the architecture c
 - `core/minecraft`: version metadata, runtime discovery/install, download/install, loader strategies
 - `core/performance`: managed performance planning/install
 
+## Runtime topology
+- Desktop builds use Tauri's local frontend bundle from `frontend/static`; desktop dev uses Tauri `devUrl` at `http://127.0.0.1:3000`.
+- The desktop shell always starts its own Axum API on an ephemeral loopback port and exposes that address to the frontend through the `api_base_url` Tauri command.
+- Browser dev runs the frontend dev server at `http://127.0.0.1:3000` and talks to the standalone API at `http://127.0.0.1:43430` unless `CROOPOR_WEB_API_BASE` overrides it.
+- The API only accepts browser CORS requests from local development and Tauri origins; production desktop traffic uses the bundled frontend plus the shell-provided loopback API address.
+
 ## Primary docs
 - Docs index: `docs/README.md`
 - Guardian architecture: `docs/GUARDIAN-ARCHITECTURE.md`

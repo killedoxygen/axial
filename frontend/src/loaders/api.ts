@@ -1,4 +1,4 @@
-import { api, API } from '../api';
+import { api, apiUrl } from '../api';
 import type {
   LoaderBuildRecord,
   LoaderBuildsResponse,
@@ -118,7 +118,7 @@ export function connectLoaderInstallSSE(
   onDone: () => void,
   onError: (message: string) => void,
 ): EventSource {
-  const es = new EventSource(`${API}/loaders/install/${installId}/events`);
+  const es = new EventSource(apiUrl(`/loaders/install/${installId}/events`));
 
   es.addEventListener('progress', (e: MessageEvent) => {
     const data = JSON.parse(e.data);

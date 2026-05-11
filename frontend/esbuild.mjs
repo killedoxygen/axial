@@ -2,8 +2,10 @@ import net from 'node:net';
 import { context, build } from 'esbuild';
 
 const mode = process.argv[2]; // 'serve', 'watch', or omitted (production build)
+const strictDevPort = process.argv.includes('--strict-port');
 const portOverride = process.env.PORT;
 const defaultDevPort = 3000;
+const webApiBase = process.env.CROOPOR_WEB_API_BASE ?? 'http://127.0.0.1:43430';
 
 const shared = {
   entryPoints: { app: 'src/main.tsx' },
@@ -13,6 +15,9 @@ const shared = {
   target: ['es2020'],
   jsx: 'automatic',
   jsxImportSource: 'preact',
+  define: {
+    __CROOPOR_WEB_API_BASE__: JSON.stringify(webApiBase),
+  },
 };
 
 const sizeReporter = {
@@ -73,6 +78,8 @@ async function resolveDevPort() {
     }
     return port;
   }
+
+  if (strictDevPort) return defaultDevPort;
 
   for (let port = defaultDevPort; port <= 65535; port += 1) {
     if (await canListenOn(port)) return port;
