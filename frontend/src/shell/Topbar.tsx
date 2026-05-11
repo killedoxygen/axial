@@ -4,7 +4,7 @@ import { Icon } from '../ui/Icons';
 import { IconButton } from '../ui/Atoms';
 import { WindowControls } from './WindowControls';
 import { MusicWidget } from './MusicWidget';
-import { route, navigate, windowMaximized } from '../ui-state';
+import { goBack, goForward, navigate, route, windowMaximized } from '../ui-state';
 import { runningSessions, instances, launchState, installState } from '../store';
 import { windowStartDragging, hasNativeDesktopRuntime } from '../native';
 
@@ -113,8 +113,8 @@ export function Topbar(): JSX.Element {
       onDblClick={onDragAreaDoubleClick}
     >
       <div class="cp-nodrag" style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
-        <IconButton icon="arrow-left" size={28} tooltip="Back" onClick={() => history.back()} />
-        <IconButton icon="arrow-right" size={28} tooltip="Forward" onClick={() => history.forward()} />
+        <IconButton icon="arrow-left" size={28} tooltip="Back" onClick={goBack} />
+        <IconButton icon="arrow-right" size={28} tooltip="Forward" onClick={goForward} />
       </div>
       <div class="cp-topbar-crumbs cp-nodrag">
         {crumbs.map((c, i) => (

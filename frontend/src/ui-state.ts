@@ -15,9 +15,37 @@ export type Route =
 
 export const route = signal<Route>({ name: 'home' });
 
-export function navigate(r: Route): void {
+const routeBackStack: Route[] = [];
+const routeForwardStack: Route[] = [];
+
+function sameRoute(a: Route, b: Route): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+function setRoute(r: Route): void {
   route.value = r;
   try { localStorage.setItem('croopor:route', JSON.stringify(r)); } catch {}
+}
+
+export function navigate(r: Route): void {
+  if (sameRoute(route.value, r)) return;
+  routeBackStack.push(route.value);
+  routeForwardStack.length = 0;
+  setRoute(r);
+}
+
+export function goBack(): void {
+  const previous = routeBackStack.pop();
+  if (!previous) return;
+  routeForwardStack.push(route.value);
+  setRoute(previous);
+}
+
+export function goForward(): void {
+  const next = routeForwardStack.pop();
+  if (!next) return;
+  routeBackStack.push(route.value);
+  setRoute(next);
 }
 
 export function restoreRoute(): void {
@@ -25,7 +53,7 @@ export function restoreRoute(): void {
     const raw = localStorage.getItem('croopor:route');
     if (!raw) return;
     const parsed = JSON.parse(raw) as Route;
-    if (parsed && typeof parsed.name === 'string') route.value = parsed;
+    if (parsed && typeof parsed.name === 'string') setRoute(parsed);
   } catch {}
 }
 
