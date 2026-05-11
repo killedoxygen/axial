@@ -28,7 +28,7 @@ function PlayerIdentityEditor({
     setSaveError(null);
     try {
       const saved = await savePlayerName(next);
-      if (!saved) setSaveError('Could not save player name. Try again.');
+      if (!saved) return;
     } catch {
       setSaveError('Could not save player name. Try again.');
     } finally {

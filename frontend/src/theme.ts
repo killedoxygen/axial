@@ -8,6 +8,7 @@ import { api } from './api';
 import { config } from './store';
 import { Sound } from './sound';
 import { buildTheme, type Theme } from './tokens';
+import { toast } from './toast';
 
 // ── Reactive theme snapshot ──────────────────────────────────────────────────
 
@@ -61,6 +62,14 @@ interface ApplyOptions {
 export function applyTheme(theme: string, hue: number | null, options: ApplyOptions = {}): void {
   const { silent = false } = options;
 
+  const previousTheme = local.theme;
+  const previousHue = local.customHue;
+  const previousVibrancy = local.customVibrancy;
+  const previousLightness = local.lightness;
+  const previousResolvedHue = previousTheme === 'custom'
+    ? previousHue
+    : (PRESET_HUES[previousTheme] ?? previousHue);
+
   const lt = options.lightness ?? local.lightness;
   const vibrancy = options.vibrancy ?? local.customVibrancy;
   const dark = lt < 50;
@@ -79,7 +88,6 @@ export function applyTheme(theme: string, hue: number | null, options: ApplyOpti
 
   local.theme = theme;
   local.lightness = lt;
-  saveLocalState();
 
   if (!silent) {
     const payload: Record<string, unknown> = { theme, lightness: lt };
@@ -87,8 +95,28 @@ export function applyTheme(theme: string, hue: number | null, options: ApplyOpti
       payload.custom_hue = resolvedHue;
       payload.custom_vibrancy = vibrancy;
     }
-    api('PUT', '/config', payload).then((r: any) => { if (!r.error) config.value = r; }).catch(() => {});
-    Sound.ui('theme');
+    api('PUT', '/config', payload)
+      .then((r: any) => {
+        if (r.error) throw new Error(r.error);
+        config.value = r;
+        saveLocalState();
+        Sound.ui('theme');
+      })
+      .catch(() => {
+        local.theme = previousTheme;
+        local.customHue = previousHue;
+        local.customVibrancy = previousVibrancy;
+        local.lightness = previousLightness;
+        const previousDark = previousLightness < 50;
+        applyCssVars(previousResolvedHue, previousDark, previousVibrancy);
+        themeSignal.value = buildTheme({
+          dark: previousDark,
+          hue: previousResolvedHue,
+          vibrancy: previousVibrancy,
+        });
+        saveLocalState();
+        toast('Failed to save theme', 'error');
+      });
   }
 }
 

@@ -99,6 +99,8 @@ function GameplaySection(): JSX.Element {
   const recHigh = Math.min(maxGB, rec.rec + 2);
   const recLow = Math.min(Math.max(2, rec.rec - 2), recHigh);
   const recZone: [number, number] = [recLow, recHigh];
+  const memoryTicks = [1, Math.round(maxGB / 4), Math.round(maxGB / 2), Math.round(maxGB * 0.75), maxGB]
+    .filter((value, index, values) => value >= 1 && value <= maxGB && values.indexOf(value) === index);
 
   useEffect(() => {
     setUsername(savedUsername);
@@ -167,7 +169,7 @@ function GameplaySection(): JSX.Element {
             value={memGB}
             min={1} max={maxGB} step={0.5}
             recommended={recZone}
-            ticks={[1, Math.round(maxGB / 4), Math.round(maxGB / 2), Math.round(maxGB * 0.75), maxGB].filter((v, i, arr) => arr.indexOf(v) === i)}
+            ticks={memoryTicks}
             onChange={(v) => {
               setMemGB(v);
               playSliderSound(v / maxGB, 'memory');

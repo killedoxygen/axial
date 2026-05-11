@@ -420,7 +420,10 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
     selectInstance(inst.id);
     void launchGame();
   };
-  const onStop = (): void => { void killGame(); };
+  const onStop = (): void => {
+    selectInstance(inst.id);
+    void killGame();
+  };
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column' }}>

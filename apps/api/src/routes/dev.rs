@@ -110,7 +110,7 @@ async fn handle_dev_flush(
         .replace_in_memory(AppConfig::default())
         .map_err(internal_error)?;
     state.set_library_dir(String::new());
-    let _ = state.instances().clear();
+    state.instances().clear().map_err(internal_error)?;
 
     Ok(Json(serde_json::json!({
         "status": "flushed",
