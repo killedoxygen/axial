@@ -17,12 +17,21 @@ type InstallIntent =
   | { kind: 'vanilla'; versionId: string }
   | { kind: 'loader'; build: LoaderBuildRecord };
 
+export interface InitialInstanceSettings {
+  max_memory_mb?: number;
+  art_seed?: number;
+  window_width?: number;
+  window_height?: number;
+  jvm_preset?: string;
+}
+
 export interface CreateInstanceArgs {
   name: string;
   versionId: string;
   icon: string;
   accent: string;
   install: InstallIntent;
+  initialSettings?: InitialInstanceSettings;
 }
 
 export interface CreateInstanceResult {
@@ -103,6 +112,23 @@ export async function createInstance(args: CreateInstanceArgs): Promise<CreateIn
   if (!created) {
     toast(`Failed to create instance: ${lastError || 'unknown error'}`, 'error');
     return { ok: false, error: lastError };
+  }
+
+  // Apply user-tuned defaults from the create flow (memory, art seed, window
+  // size). Failures here don't kill the create; the instance is fine, the
+  // user can re-tune in Settings. The server returns the updated record so
+  // the UI signal carries the right values.
+  const initial = args.initialSettings;
+  if (initial && Object.keys(initial).length > 0) {
+    try {
+      const res = await api('PUT', `/instances/${encodeURIComponent(created.id)}`, initial) as
+        CreateResponse & Partial<Instance>;
+      if (!res.error && isInstance(res)) {
+        created = res;
+      }
+    } catch {
+      /* non-fatal */
+    }
   }
 
   addInstance(created);

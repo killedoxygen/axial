@@ -2,14 +2,14 @@ import type { JSX } from 'preact';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { Button } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
-import { catalog, config, versions } from '../../store';
+import { catalog, config, systemInfo, versions } from '../../store';
 import { setCatalog } from '../../actions';
 import { navigate } from '../../ui-state';
 import { api } from '../../api';
-import { errMessage } from '../../utils';
-import {
-  createNewInstanceLoaderMachine,
-} from '../../machines/new-instance-loader';
+import { errMessage, getMemoryRecommendation } from '../../utils';
+import { hashStr } from '../../tokens';
+import { nextArtSeed } from '../../art/InstanceArt';
+import { createNewInstanceLoaderMachine } from '../../machines/new-instance-loader';
 import { pickPreferredBuild } from '../../loaders/view-model';
 import {
   getCachedLoaderBuilds,
@@ -24,9 +24,9 @@ import {
   LOADER_COMPONENT_IDS,
   type Channel, type LoaderKey,
 } from './defaults';
-import { IdentityStage } from './IdentityStage';
-import { SetupStage } from './SetupStage';
-import { LibraryBlocker, Stepper, STAGE_ORDER, type Stage } from './shared';
+import { PickStep } from './PickStep';
+import { NameStep } from './NameStep';
+import { LibraryBlocker, Stepper, STEP_ORDER, type Step } from './shared';
 import {
   buildRowModel,
   CHANNEL_ORDER,
@@ -34,6 +34,13 @@ import {
   type VersionRowModel,
 } from './view-model';
 import { useLoaderHoverPrefetch } from './use-loader-hover-prefetch';
+import {
+  buildWindowPresets,
+  detectMaxScreenSize,
+  nextWindowPreset,
+  type ScreenSize,
+  type WindowPresetSpec,
+} from './screen-presets';
 import './create.css';
 
 export function CreateView(): JSX.Element {
@@ -44,8 +51,24 @@ export function CreateView(): JSX.Element {
   return <CreateWizard />;
 }
 
+export type JvmPreset = '' | 'smooth' | 'performance' | 'ultra_low_latency';
+const JVM_PRESET_ORDER: JvmPreset[] = ['', 'smooth', 'performance', 'ultra_low_latency'];
+export const JVM_PRESET_LABELS: Record<JvmPreset, string> = {
+  '': 'Auto',
+  smooth: 'Smooth',
+  performance: 'Performance',
+  ultra_low_latency: 'Low latency',
+};
+const JVM_PRESET_HINTS: Record<JvmPreset, string> = {
+  '': 'Launcher picks the JVM flags for you.',
+  smooth: 'Tuned for steady frame times.',
+  performance: 'Higher throughput, hotter CPU.',
+  ultra_low_latency: 'Minimise hitches at the cost of FPS.',
+};
+export { JVM_PRESET_HINTS };
+
 function CreateWizard(): JSX.Element {
-  const [stage, setStage] = useState<Stage>('setup');
+  const [step, setStep] = useState<Step>('pick');
   const [maxReached, setMaxReached] = useState<number>(0);
 
   const [source, setSource] = useState<LoaderKey>('vanilla');
@@ -53,20 +76,60 @@ function CreateWizard(): JSX.Element {
   const [channel, setChannel] = useState<Channel>('release');
   const [query, setQuery] = useState('');
   const [nameOverride, setNameOverride] = useState<string | null>(null);
-  const [icon, setIcon] = useState<string>(defaultIconFor('vanilla'));
-  const [iconOverride, setIconOverride] = useState(false);
   const [catalogError, setCatalogError] = useState<string | null>(null);
   const [catalogLoading, setCatalogLoading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
+  const totalGB = systemInfo.value?.total_memory_mb
+    ? Math.floor(systemInfo.value.total_memory_mb / 1024)
+    : 16;
+  const memoryRec = getMemoryRecommendation(totalGB);
+  const [memoryGB, setMemoryGB] = useState<number>(memoryRec.rec);
+  const [seedOverride, setSeedOverride] = useState<number | null>(null);
+  const [jvmPreset, setJvmPreset] = useState<JvmPreset>('');
+
+  // Window presets derive from the largest available display. Start with the
+  // primary screen so first paint isn't blocked, then upgrade once the Window
+  // Management API resolves (if granted).
+  const [screenMax, setScreenMax] = useState<ScreenSize>(() => ({
+    w: typeof window !== 'undefined' && window.screen ? window.screen.width : 1920,
+    h: typeof window !== 'undefined' && window.screen ? window.screen.height : 1080,
+  }));
+  useEffect(() => {
+    let cancelled = false;
+    void detectMaxScreenSize().then((s) => { if (!cancelled) setScreenMax(s); });
+    return () => { cancelled = true; };
+  }, []);
+  const windowPresets: WindowPresetSpec[] = useMemo(
+    () => buildWindowPresets(screenMax),
+    [screenMax],
+  );
+  const [windowPresetId, setWindowPresetId] = useState<string>('default');
+  // If the dynamic preset list no longer contains the current id (rare), fall
+  // back to default so the cycle stays meaningful.
+  useEffect(() => {
+    if (!windowPresets.some((p) => p.id === windowPresetId)) {
+      setWindowPresetId('default');
+    }
+  }, [windowPresets, windowPresetId]);
+
+  const cycleWindowPreset = (): void => {
+    setWindowPresetId(nextWindowPreset(windowPresets, windowPresetId).id);
+  };
+  const cycleJvmPreset = (): void => {
+    const i = JVM_PRESET_ORDER.indexOf(jvmPreset);
+    setJvmPreset(JVM_PRESET_ORDER[(i + 1) % JVM_PRESET_ORDER.length]!);
+  };
+
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const versionListRef = useRef<HTMLDivElement | null>(null);
+  const nameInputRef = useRef<HTMLInputElement | null>(null);
 
   const loaderMachine = useMemo(() => createNewInstanceLoaderMachine(), []);
   const loaderState = loaderMachine.state.value;
   const currentComponentId = source === 'vanilla' ? null : LOADER_COMPONENT_IDS[source];
 
-  const idx = STAGE_ORDER.indexOf(stage);
+  const idx = STEP_ORDER.indexOf(step);
 
   const loadCatalog = async (): Promise<void> => {
     setCatalogLoading(true);
@@ -99,11 +162,6 @@ function CreateWizard(): JSX.Element {
   }, [source]);
 
   useEffect(() => () => { loaderMachine.disable(); }, [loaderMachine]);
-
-  useEffect(() => {
-    if (iconOverride) return;
-    setIcon(defaultIconFor(source));
-  }, [source, iconOverride]);
 
   const currentSupportedVersions = useMemo(() => {
     if (!currentComponentId) return null;
@@ -190,6 +248,16 @@ function CreateWizard(): JSX.Element {
   }, [source, mcVersionId]);
 
   const name = nameOverride ?? suggestedName;
+
+  const previewSeed = useMemo(() => {
+    if (seedOverride != null) return seedOverride;
+    const previewId = `preview:${source}:${mcVersionId ?? 'none'}`;
+    const displayName = name.trim() || suggestedName || 'Untitled';
+    return hashStr(`${previewId}:${displayName}:${mcVersionId ?? 'preview'}`) || 1;
+  }, [seedOverride, source, mcVersionId, name, suggestedName]);
+
+  const rerollSeed = (): void => { setSeedOverride(nextArtSeed(previewSeed)); };
+
   const { scheduleHoverPrefetch, cancelHoverPrefetch } = useLoaderHoverPrefetch({
     source,
     mcVersionId,
@@ -223,23 +291,23 @@ function CreateWizard(): JSX.Element {
     ? loaderState.context.errorMessage
     : null;
 
-  const stageValid: boolean =
-    stage === 'setup'    ? Boolean(mcVersionId && (source === 'vanilla' || selectedBuild)) :
-    stage === 'identity' ? name.trim().length > 0 && !submitting :
+  const stepValid: boolean =
+    step === 'pick' ? Boolean(mcVersionId && (source === 'vanilla' || selectedBuild)) :
+    step === 'name' ? name.trim().length > 0 && !submitting :
     false;
 
   const advance = (): void => {
     const next = idx + 1;
-    if (next >= STAGE_ORDER.length) return;
-    setStage(STAGE_ORDER[next]!);
+    if (next >= STEP_ORDER.length) return;
+    setStep(STEP_ORDER[next]!);
     setMaxReached((m) => Math.max(m, next));
   };
 
   const jumpTo = (i: number): void => {
-    const target = STAGE_ORDER[i];
+    const target = STEP_ORDER[i];
     if (!target || i === idx) return;
     if (i > maxReached) return;
-    setStage(target);
+    setStep(target);
   };
 
   const goBack = (): void => { if (idx > 0) jumpTo(idx - 1); };
@@ -251,10 +319,14 @@ function CreateWizard(): JSX.Element {
     setSubmitting(true);
     try {
       const accentLabel = config.value?.theme ?? '';
+      const winSpec = windowPresets.find((p) => p.id === windowPresetId);
+      const dims = winSpec && winSpec.id !== 'default'
+        ? { w: winSpec.w, h: winSpec.h }
+        : null;
       await createInstance({
         name: trimmed,
         versionId: effectiveVersionId,
-        icon,
+        icon: defaultIconFor(source),
         accent: accentLabel,
         install: effectiveAlreadyInstalled
           ? { kind: 'none' }
@@ -263,6 +335,12 @@ function CreateWizard(): JSX.Element {
             : selectedBuild
               ? { kind: 'loader', build: selectedBuild }
               : { kind: 'none' },
+        initialSettings: {
+          max_memory_mb: Math.round(memoryGB * 1024),
+          art_seed: previewSeed,
+          ...(dims ? { window_width: dims.w, window_height: dims.h } : {}),
+          ...(jvmPreset ? { jvm_preset: jvmPreset } : {}),
+        },
       });
     } finally {
       setSubmitting(false);
@@ -270,8 +348,8 @@ function CreateWizard(): JSX.Element {
   };
 
   const onPrimary = (): void => {
-    if (!stageValid) return;
-    if (stage === 'identity') void submit();
+    if (!stepValid) return;
+    if (step === 'name') void submit();
     else advance();
   };
 
@@ -290,81 +368,89 @@ function CreateWizard(): JSX.Element {
       }
       if (e.key === 'Enter' && e.ctrlKey) {
         e.preventDefault();
-        if (stageValid) void submit();
+        if (stepValid) void submit();
         return;
       }
       if (e.key === 'Enter') {
-        if (inField && stage !== 'identity') return;
+        if (inField && step !== 'name') return;
         if (target?.tagName === 'BUTTON') return;
         e.preventDefault();
         onPrimary();
         return;
       }
       if (e.key === 'ArrowRight' && !inField) {
-        if (stageValid && stage !== 'identity') { e.preventDefault(); advance(); }
+        if (stepValid && step !== 'name') { e.preventDefault(); advance(); }
         return;
       }
       if (e.key === 'ArrowLeft' && !inField) {
         if (idx > 0) { e.preventDefault(); goBack(); }
         return;
       }
-      if (e.key === '/' && !inField && stage === 'setup') {
+      if (e.key === '/' && !inField && step === 'pick') {
         e.preventDefault();
         searchInputRef.current?.focus();
       }
     };
     window.addEventListener('keydown', handler);
     return () => { window.removeEventListener('keydown', handler); };
-  }, [idx, stage, stageValid, submitting, source, mcVersionId, selectedBuild, name]);
+  }, [idx, step, stepValid, submitting, source, mcVersionId, selectedBuild, name]);
 
   return (
     <div class="cp-cr-root">
-      <div class="cp-cr-statusbar">
+      <header class="cp-cr-top">
         <Stepper current={idx} maxReached={maxReached} onJump={jumpTo} />
-      </div>
+      </header>
 
       <main class="cp-cr-main">
-        <div class={`cp-cr-column cp-cr-column--${stage}`} key={stage}>
-          <div class="cp-cr-stage">
-            {stage === 'setup' && (
-              <SetupStage
-                source={source}
-                onSourcePick={(k) => { setSource(k); setMcVersionId(null); }}
-                onSourcePreview={scheduleHoverPrefetch}
-                onSourcePreviewCancel={cancelHoverPrefetch}
-                channel={channel}
-                channels={availableChannels}
-                onChannelChange={setChannel}
-                query={query}
-                onQueryChange={setQuery}
-                searchRef={searchInputRef}
-                versionListRef={versionListRef}
-                rows={versionRows}
-                selectedId={mcVersionId}
-                onSelectId={setMcVersionId}
-                loaderLoading={loaderLoading}
-                loaderError={loaderError}
-                loaderMachine={loaderMachine}
-                selectedBuild={selectedBuild}
-                catalogLoading={catalogLoading}
-                catalogError={catalogError}
-                onRetryCatalog={() => { void loadCatalog(); }}
-              />
-            )}
-            {stage === 'identity' && (
-              <IdentityStage
-                source={source}
-                mcVersionId={mcVersionId ?? ''}
-                name={name}
-                suggestedName={suggestedName}
-                onNameChange={(v) => setNameOverride(v)}
-                icon={icon}
-                onIconPick={(name) => { setIcon(name); setIconOverride(true); }}
-                alreadyInstalled={effectiveAlreadyInstalled}
-                selectedBuild={selectedBuild}
-              />
-            )}
-          </div>
+        <div class="cp-cr-canvas" key={step}>
+          {step === 'pick' && (
+            <PickStep
+              source={source}
+              onSourcePick={(k) => { setSource(k); setMcVersionId(null); }}
+              onSourcePreview={scheduleHoverPrefetch}
+              onSourcePreviewCancel={cancelHoverPrefetch}
+              channel={channel}
+              channels={availableChannels}
+              onChannelChange={setChannel}
+              query={query}
+              onQueryChange={setQuery}
+              searchRef={searchInputRef}
+              versionListRef={versionListRef}
+              rows={versionRows}
+              selectedId={mcVersionId}
+              onSelectId={setMcVersionId}
+              loaderLoading={loaderLoading}
+              loaderError={loaderError}
+              loaderMachine={loaderMachine}
+              selectedBuild={selectedBuild}
+              catalogLoading={catalogLoading}
+              catalogError={catalogError}
+              onRetryCatalog={() => { void loadCatalog(); }}
+            />
+          )}
+          {step === 'name' && (
+            <NameStep
+              source={source}
+              mcVersionId={mcVersionId ?? ''}
+              name={name}
+              suggestedName={suggestedName}
+              onNameChange={(v) => setNameOverride(v)}
+              nameInputRef={nameInputRef}
+              alreadyInstalled={effectiveAlreadyInstalled}
+              selectedBuild={selectedBuild}
+              previewSeed={previewSeed}
+              onReroll={rerollSeed}
+              memoryGB={memoryGB}
+              onMemoryChange={setMemoryGB}
+              memoryRec={memoryRec.rec}
+              totalGB={totalGB}
+              windowPresets={windowPresets}
+              windowPresetId={windowPresetId}
+              onCycleWindow={cycleWindowPreset}
+              jvmPreset={jvmPreset}
+              onCycleJvm={cycleJvmPreset}
+            />
+          )}
         </div>
       </main>
 
@@ -388,20 +474,24 @@ function CreateWizard(): JSX.Element {
               type="button"
               class="cp-cr-navbtn"
               onClick={onPrimary}
-              disabled={!stageValid}
-              aria-label={stage === 'identity' ? 'Create instance' : 'Next step'}
-              title={stage === 'identity' ? 'Create  Ctrl+↵' : 'Next  →'}
+              disabled={!stepValid}
+              aria-label={step === 'name' ? 'Create instance' : 'Next step'}
+              title={step === 'name' ? 'Create  Ctrl+↵' : 'Next  →'}
             >
-              {stage === 'identity'
+              {step === 'name'
                 ? <Icon name="check" size={18} stroke={2.2} />
                 : <Icon name="chevron-right" size={18} stroke={2.2} />}
             </button>
           </div>
         </div>
-        <div class="cp-cr-footnote">
-          {stage === 'identity'
-            ? 'Press Ctrl + Enter to create.'
-            : 'Enter to continue · Esc to go back · / to search.'}
+        <div class="cp-cr-footnote" aria-live="polite">
+          {step === 'pick'
+            ? mcVersionId
+              ? 'Enter to continue · / to filter · Esc to leave.'
+              : 'Pick a version · / to filter.'
+            : name.trim()
+              ? 'Press Ctrl + Enter to create.'
+              : 'Name your world to create.'}
         </div>
       </footer>
     </div>

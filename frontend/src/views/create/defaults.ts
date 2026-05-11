@@ -28,22 +28,6 @@ export const LOADER_COMPONENT_IDS: Record<Exclude<LoaderKey, 'vanilla'>, LoaderC
   neoforge: 'net.neoforged',
 };
 
-// Icons the user can pick for an instance. Every name must exist in ui/Icons.tsx REGISTRY.
-export const INSTANCE_ICON_CHOICES: readonly string[] = [
-  'cube',
-  'compass',
-  'terminal',
-  'palette',
-  'rectangle',
-  'tag',
-  'folder',
-  'globe',
-  'home',
-  'clock',
-  'music',
-  'headphones',
-];
-
 const LOADER_DEFAULT_ICON: Record<LoaderKey, string> = {
   vanilla: 'cube',
   fabric: 'compass',

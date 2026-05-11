@@ -3,30 +3,14 @@ import { Button } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { navigate } from '../../ui-state';
 
-export type Stage = 'setup' | 'identity';
+export type Step = 'pick' | 'name';
 
-export const STAGE_ORDER: Stage[] = ['setup', 'identity'];
+export const STEP_ORDER: Step[] = ['pick', 'name'];
 
-const STAGE_LABELS: Record<Stage, string> = {
-  setup: 'Setup',
-  identity: 'Identity',
+const STEP_LABELS: Record<Step, string> = {
+  pick: 'Pick',
+  name: 'Name',
 };
-
-export function Words({ text }: { text: string }): JSX.Element {
-  const parts = text.split(' ');
-  return (
-    <>
-      {parts.flatMap((word, index) => {
-        const span = (
-          <span key={`w${index}`} class="cp-cr-word" style={{ ['--i' as any]: String(index) }}>
-            {word}
-          </span>
-        );
-        return index === 0 ? [span] : [' ', span];
-      })}
-    </>
-  );
-}
 
 export function Stepper({
   current,
@@ -38,13 +22,13 @@ export function Stepper({
   onJump: (index: number) => void;
 }): JSX.Element {
   const nodes: JSX.Element[] = [];
-  STAGE_ORDER.forEach((stage, index) => {
+  STEP_ORDER.forEach((step, index) => {
     if (index > 0) {
       nodes.push(<span key={`sep-${index}`} class="cp-cr-stepper-sep" aria-hidden="true">/</span>);
     }
     const state = index < current ? 'past' : index === current ? 'active' : 'future';
     const clickable = index !== current && index <= maxReached;
-    const label = STAGE_LABELS[stage];
+    const label = STEP_LABELS[step];
     const number = String(index + 1).padStart(2, '0');
     const inner = (
       <>
@@ -55,7 +39,7 @@ export function Stepper({
     if (clickable) {
       nodes.push(
         <button
-          key={stage}
+          key={step}
           type="button"
           class="cp-cr-stepper-item"
           data-state={state}
@@ -69,7 +53,7 @@ export function Stepper({
     }
     nodes.push(
       <div
-        key={stage}
+        key={step}
         class="cp-cr-stepper-item"
         data-state={state}
         aria-current={state === 'active' ? 'step' : undefined}
