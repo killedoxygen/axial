@@ -142,9 +142,8 @@ button.cp-cr-stepper-item:focus-visible {
   justify-content: center;
   padding-bottom: clamp(20px, 4vh, 40px);
 }
-/* The name input keeps a comfortable max width, even though the bento
- * below it spreads further. */
-.cp-cr-step--name .cp-cr-name-row { max-width: 640px; width: 100%; }
+/* Keep the name input aligned with the bento grid below it. */
+.cp-cr-step--name .cp-cr-name-row { width: 100%; }
 .cp-cr-step--name .cp-cr-head { max-width: 640px; }
 
 .cp-cr-head {
