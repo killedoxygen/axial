@@ -1,7 +1,7 @@
 import type { JSX } from 'preact';
-import { useEffect, useMemo, useState } from 'preact/hooks';
+import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { Icon } from '../../ui/Icons';
-import { Button, Card, IconButton, Input, Meter, Pill, SectionHeading } from '../../ui/Atoms';
+import { Button, Card, IconButton, Input, Pill, SectionHeading } from '../../ui/Atoms';
 import { useTheme } from '../../hooks/use-theme';
 import { ART_PRESETS, InstanceArt, artPresetForSeed, artSeedFor, artSeedForPreset, nextArtSeed } from '../../art/InstanceArt';
 import { showConfirm } from '../../ui/Dialog';
@@ -98,16 +98,6 @@ function fmtRelative(iso?: string): string {
   return `${y} year${y === 1 ? '' : 's'} ago`;
 }
 
-function fmtClock(iso?: string): string {
-  if (!iso) return '--:--:--';
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return '--:--:--';
-  const hh = String(d.getHours()).padStart(2, '0');
-  const mm = String(d.getMinutes()).padStart(2, '0');
-  const ss = String(d.getSeconds()).padStart(2, '0');
-  return `${hh}:${mm}:${ss}`;
-}
-
 function fmtJoined(iso?: string): string {
   if (!iso) return 'unknown';
   const d = new Date(iso);
@@ -125,18 +115,7 @@ function loaderLabel(v: Version | undefined): string {
   return 'Modded';
 }
 
-function seedFromString(s: string): number {
-  let state = 0;
-  for (let i = 0; i < s.length; i++) state = (state * 31 + s.charCodeAt(i)) | 0;
-  return state || 0x13572468;
-}
-
-function nextRand(state: number): { state: number; r: number } {
-  let s = state;
-  s = Math.imul(s ^ (s >>> 15), 2246822507);
-  s = Math.imul(s ^ (s >>> 13), 3266489909);
-  return { state: s, r: ((s >>> 0) % 10000) / 10000 };
-}
+// ─── Worlds — main column, primary content ───────────────────────────────
 
 function WorldsCard({ inst, onOpenWorlds }: { inst: EnrichedInstance; onOpenWorlds: () => void }): JSX.Element {
   const count = inst.saves_count ?? 0;
@@ -152,24 +131,16 @@ function WorldsCard({ inst, onOpenWorlds }: { inst: EnrichedInstance; onOpenWorl
       </div>
       {count === 0 ? (
         <div class="cp-od-worlds-empty">
-          <div class="cp-od-worlds-mark"><Icon name="cube" size={20} stroke={1.7} /></div>
-          <h4>No worlds yet</h4>
-          <p>Create a new world to start playing, or add an existing world folder to continue.</p>
+          <div class="cp-od-worlds-lead">
+            <div class="cp-od-worlds-mark" aria-hidden="true"><Icon name="cube" size={18} stroke={1.7} /></div>
+            <div class="cp-od-worlds-copy">
+              <h4>No worlds yet</h4>
+              <p>Create a new world, import an existing save, or launch Minecraft and create one there.</p>
+            </div>
+          </div>
           <div class="cp-od-worlds-cta">
-            <Button
-              icon="plus"
-              onClick={onOpenWorlds}
-              sound="affirm"
-            >
-              Create New World
-            </Button>
-            <Button
-              variant="ghost"
-              icon="folder"
-              onClick={() => void openInstanceFolder(inst.id)}
-            >
-              Add Existing World
-            </Button>
+            <Button icon="plus" onClick={onOpenWorlds} sound="affirm">Create world</Button>
+            <Button variant="ghost" icon="folder" onClick={() => void openInstanceFolder(inst.id)}>Import world</Button>
           </div>
         </div>
       ) : (
@@ -178,7 +149,7 @@ function WorldsCard({ inst, onOpenWorlds }: { inst: EnrichedInstance; onOpenWorl
             <div class="cp-od-world-mark"><Icon name="globe" size={16} /></div>
             <div class="cp-od-world-body">
               <div class="cp-od-world-name">{count} save{count === 1 ? '' : 's'} on disk</div>
-              <div class="cp-od-world-sub">last touched {fmtRelative(inst.last_played_at)}</div>
+              <div class="cp-od-world-sub">Last touched {fmtRelative(inst.last_played_at)}</div>
             </div>
             <button class="cp-od-link" type="button" onClick={onOpenWorlds}>
               View all <Icon name="chevron-right" size={11} stroke={2.2} />
@@ -190,119 +161,46 @@ function WorldsCard({ inst, onOpenWorlds }: { inst: EnrichedInstance; onOpenWorl
   );
 }
 
-function LogsCard({ inst, onOpenLogs }: { inst: EnrichedInstance; onOpenLogs: () => void }): JSX.Element {
-  const lines = useMemo(() => {
-    let state = seedFromString(inst.id + 'logs');
-    const templates: Array<[string, string]> = [
-      ['INFO', 'Mod Lithium initialized'],
-      ['INFO', 'Auto-saved world Aurora'],
-      ['INFO', 'Auto-saved world Survival'],
-      ['INFO', 'Loaded shader pack'],
-      ['INFO', 'Loaded 14 mod resources'],
-      ['INFO', 'Mod Sodium initialized'],
-      ['INFO', 'Connected to integrated server'],
-      ['WARN', 'GC pause 218ms in young gen'],
-    ];
-    const base = inst.last_played_at ? new Date(inst.last_played_at).getTime() : Date.now();
-    const out: Array<{ time: string; level: string; msg: string }> = [];
-    for (let i = 0; i < 6; i++) {
-      const a = nextRand(state); state = a.state;
-      const tpl = templates[Math.floor(a.r * templates.length)] ?? templates[0]!;
-      const dt = new Date(base - (5 - i) * 13000);
-      const hh = String(dt.getHours()).padStart(2, '0');
-      const mm = String(dt.getMinutes()).padStart(2, '0');
-      const ss = String(dt.getSeconds()).padStart(2, '0');
-      out.push({ time: `${hh}:${mm}:${ss}`, level: tpl[0], msg: tpl[1] });
-    }
-    return out;
-  }, [inst.id, inst.last_played_at]);
+// ─── Activity — replaces "Recent events"; small, human-readable ──────────
 
-  return (
-    <Card padding={22} class="cp-od-card">
-      <div class="cp-od-head">
-        <h3>Recent Logs</h3>
-        <button class="cp-od-link" type="button" onClick={onOpenLogs}>
-          View full logs <Icon name="external-link" size={11} stroke={2.2} />
-        </button>
-      </div>
-      <div class="cp-od-logs" role="log" aria-live="off">
-        {lines.map((l, i) => (
-          <div key={i} class="cp-od-log-line">
-            <span class="cp-od-log-time">{l.time}</span>
-            <span class="cp-od-log-level" data-level={l.level}>{l.level}</span>
-            <span class="cp-od-log-msg">{l.msg}</span>
-          </div>
-        ))}
-      </div>
-    </Card>
-  );
-}
+interface ActivityItem { label: string; relative: string }
 
-interface EventItem { time: string; iso: string; label: string; relative: string }
-
-function RecentEventsCard({ inst, onOpenLogs }: { inst: EnrichedInstance; onOpenLogs: () => void }): JSX.Element {
+function ActivityCard({ inst, onOpenLogs }: { inst: EnrichedInstance; onOpenLogs: () => void }): JSX.Element {
   const v = versions.value.find(x => x.id === inst.version_id);
-  const events: EventItem[] = useMemo(() => {
-    const out: EventItem[] = [];
-    const created = inst.created_at;
-    const createdMs = new Date(created).getTime();
-    out.push({
-      iso: created,
-      time: fmtClock(created),
-      label: 'Instance created',
-      relative: fmtRelative(created),
-    });
+  const events: ActivityItem[] = useMemo(() => {
+    const out: ActivityItem[] = [];
+    const createdMs = new Date(inst.created_at).getTime();
+    out.push({ label: 'Instance created', relative: fmtRelative(inst.created_at) });
     if (v?.loader) {
       const t = new Date(createdMs + 3000).toISOString();
       out.push({
-        iso: t,
-        time: fmtClock(t),
         label: `Loader ${loaderLabel(v)}${v.loader.loader_version ? ` ${v.loader.loader_version}` : ''} attached`,
         relative: fmtRelative(t),
       });
     }
     if (inst.java_major) {
       const t = new Date(createdMs + 6000).toISOString();
-      out.push({
-        iso: t,
-        time: fmtClock(t),
-        label: `Auto-detected Java ${inst.java_major} environment`,
-        relative: fmtRelative(t),
-      });
-    } else {
-      const t = new Date(createdMs + 6000).toISOString();
-      out.push({
-        iso: t,
-        time: fmtClock(t),
-        label: 'Auto-saved instance configuration',
-        relative: fmtRelative(t),
-      });
+      out.push({ label: `Java ${inst.java_major} environment detected`, relative: fmtRelative(t) });
     }
     if (inst.last_played_at) {
-      out.unshift({
-        iso: inst.last_played_at,
-        time: fmtClock(inst.last_played_at),
-        label: 'Last launch session',
-        relative: fmtRelative(inst.last_played_at),
-      });
+      out.unshift({ label: 'Last launch session', relative: fmtRelative(inst.last_played_at) });
     }
-    return out;
+    return out.slice(0, 3);
   }, [inst.id, inst.created_at, inst.last_played_at, inst.java_major, v?.loader]);
 
   return (
     <Card padding={22} class="cp-od-card">
       <div class="cp-od-head cp-od-head--iconed">
-        <div class="cp-od-head-tile"><Icon name="shield-check" size={13} stroke={1.9} /></div>
-        <h3>Recent events</h3>
+        <div class="cp-od-head-tile"><Icon name="activity" size={13} stroke={1.9} /></div>
+        <h3>Activity</h3>
         <button class="cp-od-link" type="button" onClick={onOpenLogs}>
-          View full history <Icon name="chevron-right" size={11} stroke={2.2} />
+          View all <Icon name="chevron-right" size={11} stroke={2.2} />
         </button>
       </div>
       <ul class="cp-od-events">
         {events.map((e, i) => (
           <li key={i} class="cp-od-event">
             <span class="cp-od-event-dot" aria-hidden="true" />
-            <span class="cp-od-event-time">{e.time}</span>
             <span class="cp-od-event-msg">{e.label}</span>
             <span class="cp-od-event-rel">{e.relative}</span>
           </li>
@@ -312,14 +210,196 @@ function RecentEventsCard({ inst, onOpenLogs }: { inst: EnrichedInstance; onOpen
   );
 }
 
-function SummaryCard({ inst, running }: { inst: EnrichedInstance; running: boolean }): JSX.Element {
-  const v = versions.value.find(x => x.id === inst.version_id);
-  const loader = loaderLabel(v);
-  const loaderVer = v?.loader?.loader_version ? ` ${v.loader.loader_version}` : '';
+// ─── Logs — demoted to a compact card at the bottom of the main column ──
+
+function LogsCard({ inst, onOpenLogs }: { inst: EnrichedInstance; onOpenLogs: () => void }): JSX.Element {
+  const summary = inst.last_played_at ? 'Last launch · no errors' : 'No launch logs yet';
+  return (
+    <Card padding={16} class="cp-od-card cp-od-logs-card">
+      <div class="cp-od-logs-summary">
+        <span class="cp-od-logs-icon"><Icon name="terminal" size={14} stroke={1.9} /></span>
+        <div class="cp-od-logs-line">
+          <strong>Logs</strong>
+          <span class="cp-od-logs-sub">{summary}</span>
+        </div>
+        <button class="cp-od-link" type="button" onClick={onOpenLogs}>
+          View logs <Icon name="chevron-right" size={11} stroke={2.2} />
+        </button>
+      </div>
+    </Card>
+  );
+}
+
+// ─── Performance — main-column quick-control card.
+// RAM allocation + preset + Java runtime. The slider edits local state;
+// Apply / Revert appear only when the value differs from what is saved on
+// the instance, so a stray drag never silently rewrites JVM heap. ──────
+
+type Preset = 'low' | 'balanced' | 'high' | 'custom';
+const PRESET_RAM: Record<Exclude<Preset, 'custom'>, number> = { low: 2, balanced: 6, high: 10 };
+
+function inferPreset(maxMem: number): Preset {
+  if (maxMem === PRESET_RAM.low) return 'low';
+  if (maxMem === PRESET_RAM.balanced) return 'balanced';
+  if (maxMem === PRESET_RAM.high) return 'high';
+  return 'custom';
+}
+
+function PerformanceCard({ inst, onOpenSettings }: { inst: EnrichedInstance; onOpenSettings: () => void }): JSX.Element {
+  const RAM_MIN = 2;
+  const RAM_MAX = 16;
+  const REC_MIN = 4;
+  const REC_MAX = 8;
+  const saved = (inst.max_memory_mb ?? 4096) / 1024;
+  const [maxMem, setMaxMem] = useState<number>(saved);
+  const [saving, setSaving] = useState(false);
+  const savedRef = useRef(saved);
+
+  useEffect(() => {
+    // If the persisted value changes (PUT elsewhere), realign local state.
+    if (saved !== savedRef.current) {
+      savedRef.current = saved;
+      setMaxMem(saved);
+    }
+  }, [saved]);
+
+  const dirty = maxMem !== saved;
+  const apply = async (): Promise<void> => {
+    setSaving(true);
+    try {
+      const res: any = await api('PUT', `/instances/${encodeURIComponent(inst.id)}`, { max_memory_mb: Math.round(maxMem * 1024) });
+      if (res?.error) throw new Error(res.error);
+      updateInstanceInList(res);
+      toast('Memory allocation saved');
+    } catch (err) {
+      toast(`Failed: ${errMessage(err)}`, 'error');
+    } finally {
+      setSaving(false);
+    }
+  };
+  const revert = (): void => setMaxMem(saved);
+
+  const pct = ((maxMem - RAM_MIN) / (RAM_MAX - RAM_MIN)) * 100;
+  const recFrom = ((REC_MIN - RAM_MIN) / (RAM_MAX - RAM_MIN)) * 100;
+  const recTo = ((REC_MAX - RAM_MIN) / (RAM_MAX - RAM_MIN)) * 100;
+  const preset = inferPreset(maxMem);
+
+  return (
+    <Card padding={22} class="cp-od-card">
+      <div class="cp-od-head">
+        <h3>Performance</h3>
+        <button class="cp-od-link" type="button" onClick={onOpenSettings}>
+          Advanced <Icon name="chevron-right" size={11} stroke={2.2} />
+        </button>
+      </div>
+
+      <div class="cp-od-perf-row">
+        <span class="cp-od-perf-key">Memory allocation</span>
+        <span class="cp-od-perf-val">{maxMem} GB</span>
+      </div>
+      <div class="cp-od-perf-slider">
+        <span class="cp-od-perf-track" aria-hidden="true">
+          <span class="cp-od-perf-recommend" style={{ left: `${recFrom}%`, right: `${100 - recTo}%` }} />
+          <span class="cp-od-perf-fill" style={{ width: `${pct}%` }} />
+        </span>
+        <input
+          type="range"
+          min={RAM_MIN}
+          max={RAM_MAX}
+          step={0.5}
+          value={String(maxMem)}
+          onInput={(e: any) => setMaxMem(parseFloat(e.currentTarget.value))}
+          aria-label="Memory allocation in gigabytes"
+        />
+      </div>
+      <div class="cp-od-perf-caption">
+        <span class="cp-od-perf-hint">Recommended {REC_MIN}–{REC_MAX} GB</span>
+        {dirty && (
+          <div class="cp-od-perf-commit">
+            <button class="cp-od-link" type="button" onClick={revert} disabled={saving}>Revert</button>
+            <Button size="sm" variant="primary" onClick={apply} disabled={saving} sound="affirm">
+              {saving ? 'Saving…' : 'Apply'}
+            </Button>
+          </div>
+        )}
+      </div>
+
+      <div class="cp-od-perf-preset-row">
+        <span class="cp-od-perf-key">Preset</span>
+        <div class="cp-mini-seg" role="radiogroup" aria-label="Performance preset">
+          {(['low', 'balanced', 'high'] as const).map(p => (
+            <button
+              key={p}
+              type="button"
+              role="radio"
+              aria-checked={preset === p}
+              data-active={preset === p}
+              onClick={() => setMaxMem(PRESET_RAM[p])}
+            >
+              {p[0].toUpperCase() + p.slice(1)}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div class="cp-od-perf-runtime">
+        <span class="cp-od-perf-runtime-mark"><Icon name="check" size={12} stroke={2.6} /></span>
+        <span class="cp-od-perf-runtime-text">{inst.java_major ? `Java ${inst.java_major} detected` : 'Auto-detect Java runtime'}</span>
+        <button class="cp-od-link" type="button" onClick={onOpenSettings}>Change</button>
+      </div>
+    </Card>
+  );
+}
+
+// ─── Maintenance — right rail, single compact list. Backups + Integrity
+// + Disk. Healthy states stay quiet. ────────────────────────────────────
+
+function MaintenanceCard(): JSX.Element {
   return (
     <Card padding={22} class="cp-od-card cp-od-card--side">
       <div class="cp-od-head">
-        <h3>Summary</h3>
+        <h3>Maintenance</h3>
+      </div>
+      <ul class="cp-od-maint-list">
+        <li class="cp-od-maint-row">
+          <span class="cp-od-maint-icon" data-tone="ok"><Icon name="cloud" size={14} stroke={1.8} /></span>
+          <div class="cp-od-maint-body">
+            <div class="cp-od-maint-title">Backups enabled</div>
+            <div class="cp-od-maint-sub">Daily at 03:00 · 7 day retention</div>
+          </div>
+          <button class="cp-od-link" type="button" onClick={() => toast('Backups will land in a follow-up release')}>Manage</button>
+        </li>
+        <li class="cp-od-maint-row">
+          <span class="cp-od-maint-icon" data-tone="ok"><Icon name="shield-check" size={14} stroke={1.8} /></span>
+          <div class="cp-od-maint-body">
+            <div class="cp-od-maint-title">Integrity verified</div>
+          </div>
+          <button class="cp-od-link" type="button" onClick={() => toast('Integrity recheck is queued')}>Verify</button>
+        </li>
+        <li class="cp-od-maint-row">
+          <span class="cp-od-maint-icon" data-tone="mute"><Icon name="archive" size={14} stroke={1.8} /></span>
+          <div class="cp-od-maint-body">
+            <div class="cp-od-maint-title">Disk usage</div>
+            <div class="cp-od-maint-sub">Not measured</div>
+          </div>
+          <button class="cp-od-link" type="button" onClick={() => toast('Disk measurement will land in a follow-up release')}>Measure</button>
+        </li>
+      </ul>
+    </Card>
+  );
+}
+
+// ─── Details — quiet glanceable KV; duplicates header on purpose. ──────
+
+function DetailsCard({ inst, running }: { inst: EnrichedInstance; running: boolean }): JSX.Element {
+  const v = versions.value.find(x => x.id === inst.version_id);
+  const loader = loaderLabel(v);
+  const loaderVer = v?.loader?.loader_version ? ` ${v.loader.loader_version}` : '';
+  const mcVer = v?.minecraft_meta.display_name || v?.minecraft_meta.display_hint || 'unknown';
+  return (
+    <Card padding={22} class="cp-od-card cp-od-card--side">
+      <div class="cp-od-head">
+        <h3>Details</h3>
       </div>
       <div class="cp-od-kv">
         <div class="cp-od-kv-row">
@@ -332,88 +412,34 @@ function SummaryCard({ inst, running }: { inst: EnrichedInstance; running: boole
           </span>
         </div>
         <div class="cp-od-kv-row">
-          <span class="cp-od-kv-key">Last played</span>
-          <span class="cp-od-kv-val">{fmtRelative(inst.last_played_at)}</span>
+          <span class="cp-od-kv-key">Minecraft</span>
+          <span class="cp-od-kv-val cp-od-kv-val--mono">{mcVer}</span>
+        </div>
+        <div class="cp-od-kv-row">
+          <span class="cp-od-kv-key">Loader</span>
+          <span class="cp-od-kv-val">{loader}{loaderVer}</span>
         </div>
         <div class="cp-od-kv-row">
           <span class="cp-od-kv-key">Created</span>
           <span class="cp-od-kv-val">{fmtJoined(inst.created_at)}</span>
         </div>
         <div class="cp-od-kv-row">
-          <span class="cp-od-kv-key">Minecraft</span>
-          <span class="cp-od-kv-val cp-od-kv-val--mono">{v?.minecraft_meta.display_name || 'unknown'}</span>
-        </div>
-        <div class="cp-od-kv-row">
-          <span class="cp-od-kv-key">Loader</span>
-          <span class="cp-od-kv-val">{loader}{loaderVer}</span>
+          <span class="cp-od-kv-key">Last played</span>
+          <span class="cp-od-kv-val">{fmtRelative(inst.last_played_at)}</span>
         </div>
       </div>
     </Card>
   );
 }
 
-function ResourcesCard({ inst }: { inst: EnrichedInstance }): JSX.Element {
-  const maxMem = (inst.max_memory_mb ?? 4096) / 1024;
-  return (
-    <Card padding={22} class="cp-od-card cp-od-card--side">
-      <div class="cp-od-head">
-        <h3>Resources</h3>
-      </div>
-      <div class="cp-od-resource">
-        <div class="cp-od-resource-row">
-          <span class="cp-od-kv-key">Memory alloc.</span>
-          <span class="cp-od-kv-val cp-od-kv-val--mono">{maxMem} / 16 GB</span>
-        </div>
-        <Meter value={Math.min(100, (maxMem / 16) * 100)} />
-      </div>
-      <div class="cp-od-resource">
-        <div class="cp-od-resource-row">
-          <span class="cp-od-kv-key">Disk footprint</span>
-          <span class="cp-od-resource-pending">not measured</span>
-        </div>
-        <Meter value={0} tone="ok" />
-      </div>
-      <div class="cp-od-resource">
-        <div class="cp-od-resource-row">
-          <span class="cp-od-kv-key">Integrity</span>
-          <span class="cp-od-resource-ok">
-            <Icon name="check" size={11} stroke={2.6} />
-            verified
-          </span>
-        </div>
-        <Meter value={100} tone="ok" />
-      </div>
-    </Card>
-  );
-}
+// ─── Overview pane — original bento, Play replaces Summary ──────────────
 
-function BackupsCard(): JSX.Element {
-  return (
-    <Card padding={22} class="cp-od-card cp-od-card--side">
-      <div class="cp-od-head">
-        <h3>Backups</h3>
-        <button class="cp-od-link" type="button" onClick={() => toast('Backups will land in a follow-up release', 'error')}>
-          View all
-        </button>
-      </div>
-      <div class="cp-od-backup-row">
-        <span class="cp-od-backup-icon" aria-hidden="true">
-          <Icon name="cloud" size={20} stroke={1.6} />
-        </span>
-        <div class="cp-od-backup-body">
-          <div class="cp-od-backup-title">Automatic backups enabled</div>
-          <div class="cp-od-backup-sub">Daily at 03:00 · 7 days retention</div>
-        </div>
-      </div>
-    </Card>
-  );
-}
-
-function OverviewPane({ inst, running, onOpenWorlds, onOpenLogs }: {
+function OverviewPane({ inst, running, onOpenWorlds, onOpenLogs, onOpenSettings }: {
   inst: EnrichedInstance;
   running: boolean;
   onOpenWorlds: () => void;
   onOpenLogs: () => void;
+  onOpenSettings: () => void;
 }): JSX.Element {
   return (
     <div class="cp-instance-body">
@@ -422,21 +448,21 @@ function OverviewPane({ inst, running, onOpenWorlds, onOpenLogs }: {
           <WorldsCard inst={inst} onOpenWorlds={onOpenWorlds} />
         </div>
         <div class="cp-od-stagger" style={{ '--cp-od-delay': '80ms' } as any}>
-          <LogsCard inst={inst} onOpenLogs={onOpenLogs} />
+          <PerformanceCard inst={inst} onOpenSettings={onOpenSettings} />
         </div>
         <div class="cp-od-stagger" style={{ '--cp-od-delay': '160ms' } as any}>
-          <RecentEventsCard inst={inst} onOpenLogs={onOpenLogs} />
+          <ActivityCard inst={inst} onOpenLogs={onOpenLogs} />
+        </div>
+        <div class="cp-od-stagger" style={{ '--cp-od-delay': '240ms' } as any}>
+          <LogsCard inst={inst} onOpenLogs={onOpenLogs} />
         </div>
       </div>
       <div class="cp-instance-side">
         <div class="cp-od-stagger" style={{ '--cp-od-delay': '40ms' } as any}>
-          <SummaryCard inst={inst} running={running} />
+          <MaintenanceCard />
         </div>
         <div class="cp-od-stagger" style={{ '--cp-od-delay': '120ms' } as any}>
-          <ResourcesCard inst={inst} />
-        </div>
-        <div class="cp-od-stagger" style={{ '--cp-od-delay': '200ms' } as any}>
-          <BackupsCard />
+          <DetailsCard inst={inst} running={running} />
         </div>
       </div>
     </div>
@@ -726,9 +752,14 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
   };
 
   const tabCount = (t: Tab): number | undefined => {
-    if (t === 'mods') return inst.mods_count ?? 0;
-    if (t === 'worlds') return inst.saves_count ?? 0;
-    if (t === 'screenshots') return 0;
+    if (t === 'mods') {
+      const n = inst.mods_count ?? 0;
+      return n > 0 ? n : undefined;
+    }
+    if (t === 'worlds') {
+      const n = inst.saves_count ?? 0;
+      return n > 0 ? n : undefined;
+    }
     return undefined;
   };
 
@@ -751,29 +782,31 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
             <div class="cp-instance-titlebar-text">
               <div class="cp-instance-pills-row">
                 <Pill>{loaderLabel(v)}{loaderVer ? ` ${loaderVer}` : ''}</Pill>
-                <span class="cp-instance-mc-version">MC {mcVer}</span>
-                {running && (
-                  <span class="cp-instance-status-pill" data-running="true">
-                    <span class="cp-instance-status-dot" aria-hidden="true" />
-                    Running
-                  </span>
-                )}
+                <span class="cp-instance-mc-version">Minecraft {mcVer}</span>
               </div>
               <h1 class="cp-instance-title">{inst.name}</h1>
               <div class="cp-instance-subtitle">
+                <span class="cp-instance-state-chip" data-running={running}>
+                  <span class="cp-instance-state-dot" aria-hidden="true" />
+                  {running ? 'Running' : 'Ready to launch'}
+                </span>
+                <span class="cp-instance-subtitle-sep" aria-hidden="true">·</span>
                 <span>Last played <b>{fmtRelative(inst.last_played_at)}</b></span>
                 <span class="cp-instance-subtitle-sep" aria-hidden="true">·</span>
-                <span><b>{inst.mods_count ?? 0}</b> mod{(inst.mods_count ?? 0) === 1 ? '' : 's'} loaded</span>
-                <span class="cp-instance-subtitle-sep" aria-hidden="true">·</span>
-                <span>Joined <b>{fmtJoined(inst.created_at)}</b></span>
+                <span>Created <b>{fmtJoined(inst.created_at)}</b></span>
               </div>
             </div>
           </div>
           <div class="cp-instance-actions">
+            <div class="cp-instance-launch">
+              {running ? (
+                <Button variant="secondary" size="lg" icon="stop" onClick={onStop}>Stop</Button>
+              ) : (
+                <Button variant="primary" size="lg" icon="play" onClick={onPlay} sound="launchPress">Launch</Button>
+              )}
+            </div>
             <IconButton icon="folder" tooltip="Open folder"
               onClick={() => void openInstanceFolder(inst.id)} />
-            <IconButton icon="copy" tooltip="Duplicate"
-              onClick={() => void duplicateInstance(inst)} />
             <IconButton icon="edit" tooltip="Rename"
               onClick={() => void renameInstance(inst)} />
             <IconButton icon="dots" tooltip="More"
@@ -784,12 +817,6 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
                 { label: '', onSelect: () => {}, divider: true },
                 { icon: 'trash', label: 'Delete', onSelect: () => void deleteInstanceFlow(inst, () => navigate({ name: 'instances' })), danger: true },
               ])} />
-            <div class="cp-instance-actions-sep" />
-            {running ? (
-              <Button variant="soft" icon="stop" onClick={onStop}>Stop</Button>
-            ) : (
-              <Button icon="play" onClick={onPlay} sound="launchPress">Launch</Button>
-            )}
           </div>
         </div>
       </div>
@@ -819,6 +846,7 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
           running={running}
           onOpenWorlds={() => setTab('worlds')}
           onOpenLogs={() => setTab('logs')}
+          onOpenSettings={() => setTab('settings')}
         />
       )}
       {tab === 'mods' && <ModsPane inst={inst} />}

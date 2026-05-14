@@ -1,16 +1,15 @@
 /* Instance detail layout — Croopor.
- * Ported from a mockup with a borderless, atmospheric, Linear/Raycast-flavored aesthetic.
- * Procedural InstanceArt stands in for the design's gradient/pattern cover. */
+ * Borderless, atmospheric, Linear/Raycast-flavored aesthetic. Procedural
+ * InstanceArt stands in for the design's gradient/pattern cover. Hero
+ * owns the Launch action cluster; Resources/Performance lives in the main
+ * content column; the right rail carries quiet glanceable cards. */
 
-/* ─── Cover strip — taller, with vignette + warm overhead glow.
- * The whole cover is masked to dissolve into the page bg at its bottom,
- * matching the CreateView version-picker horizon. ─── */
+/* ─── Cover strip — atmospheric banner that dissolves into the page bg
+ * via a radial mask (no hard seam). ─── */
 .cp-instance-cover {
   position: relative;
   height: 200px;
   overflow: hidden;
-  /* mask the bottom of the cover (art + glow + vignette) into transparency
-   * so the page bg shows through without a hard seam. */
   -webkit-mask-image:
     radial-gradient(170% 80% at 50% 0%,
       #000 0%,
@@ -44,16 +43,13 @@
   position: absolute;
   inset: 0;
   background:
-    /* corner vignette */
     radial-gradient(130% 100% at 50% 30%, transparent 35%, rgba(0,0,0,0.55) 100%),
-    /* bottom-band darkening for text legibility (smooth, full-width, no localized blobs) */
     linear-gradient(180deg, rgba(0,0,0,0.05) 0%, rgba(0,0,0,0.0) 30%, rgba(0,0,0,0.35) 75%, rgba(0,0,0,0.55) 100%);
   pointer-events: none;
 }
 
-/* ─── Title bar — pulled high into the banner.
- * Per-element backdrop fades darken the banner where text lives,
- * leaving the raw banner visible between elements (irregular horizon). ─── */
+/* ─── Title bar — pulled high into the banner. The right cluster
+ * carries the primary Launch action alongside quiet ghost utilities. ─── */
 .cp-instance-titlebar {
   padding: 0 32px 32px;
   margin-top: -150px;
@@ -73,9 +69,6 @@
   align-items: flex-end;
   min-width: 0;
 }
-/* text-shadow keeps title/subtitle legible on the banner without painting
- * blocky bg-colored halos behind them. The fade-into-page is already done
- * by the cover's radial mask at the bottom. */
 .cp-instance-avatar {
   width: 116px;
   height: 116px;
@@ -105,36 +98,14 @@
   font-size: 11.5px;
   padding: 4px 10px;
 }
+/* Lifted from --text-mute to --text-dim — the previous shade read as
+ * disabled against the dark banner. */
 .cp-instance-mc-version {
   font-size: 13px;
-  color: var(--text-mute);
+  color: var(--text-dim);
   font-variant-numeric: tabular-nums;
   letter-spacing: 0.1px;
   text-shadow: 0 1px 6px rgba(0,0,0,0.55);
-}
-.cp-instance-status-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  height: 24px;
-  padding: 0 11px 0 9px;
-  border-radius: 999px;
-  font-size: 11.5px;
-  font-weight: 600;
-  letter-spacing: 0.1px;
-  background: oklch(0.78 0.14 150 / 0.12);
-  border: 1px solid oklch(0.78 0.14 150 / 0.28);
-  color: var(--ok);
-}
-.cp-instance-status-pill[data-running="true"] .cp-instance-status-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 999px;
-  background: var(--ok);
-  box-shadow:
-    0 0 0 3px oklch(0.78 0.14 150 / 0.22),
-    0 0 6px oklch(0.78 0.14 150 / 0.55);
-  animation: cp-pulse 1.8s ease-in-out infinite;
 }
 .cp-instance-title {
   margin: 0;
@@ -148,6 +119,8 @@
     0 2px 18px rgba(0,0,0,0.55),
     0 1px 2px rgba(0,0,0,0.3);
 }
+/* State chip + metadata share one line. State is the first item, with
+ * a small accent (or pulse-green when running) dot. */
 .cp-instance-subtitle {
   margin-top: 10px;
   display: flex;
@@ -155,12 +128,12 @@
   align-items: center;
   gap: 6px 10px;
   font-size: 13px;
-  color: var(--text-mute);
+  color: var(--text-dim);
   letter-spacing: -0.05px;
   text-shadow: 0 1px 8px rgba(0,0,0,0.6);
 }
 .cp-instance-subtitle b {
-  color: var(--text-dim);
+  color: var(--text);
   font-weight: 600;
   font-variant-numeric: tabular-nums;
 }
@@ -168,17 +141,63 @@
   color: var(--text-mute);
   opacity: 0.55;
 }
-/* Action cluster — icon utilities followed by the primary Launch button.
- * Icon buttons sit quieter against the banner; Launch uses the default
- * primary style (no custom shadows or glow). */
+.cp-instance-state-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: -0.1px;
+}
+.cp-instance-state-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--accent);
+  box-shadow:
+    0 0 0 3px oklch(from var(--accent) l c h / 0.18),
+    0 0 6px oklch(from var(--accent) l c h / 0.4);
+}
+.cp-instance-state-chip[data-running="true"] {
+  color: var(--ok);
+}
+.cp-instance-state-chip[data-running="true"] .cp-instance-state-dot {
+  background: var(--ok);
+  box-shadow:
+    0 0 0 3px oklch(0.78 0.14 150 / 0.22),
+    0 0 6px oklch(0.78 0.14 150 / 0.55);
+  animation: cp-pulse 1.8s ease-in-out infinite;
+}
+
+/* Action cluster — Launch button is the only saturated control here.
+ * The IconButtons are smaller and dimmer ghost glyphs alongside it. ─── */
 .cp-instance-actions {
   display: flex;
-  gap: 4px;
+  gap: 6px;
   align-self: center;
   align-items: center;
   flex-wrap: wrap;
   padding-bottom: 4px;
-  margin-right: 24px;
+}
+.cp-instance-launch {
+  margin-right: 4px;
+}
+/* Launch button — uses the native cp-btn--lg primary, no bespoke styling.
+ * The only addition is a min-width so the action lands at ~132px and a
+ * very subtle accent-tinted drop shadow so it seats against the dark
+ * banner. Same radius family, font weight, and surface logic as every
+ * other button in the app. */
+.cp-instance-launch .cp-btn--lg {
+  min-width: 132px;
+  padding: 0 22px;
+  box-shadow:
+    0 1px 0 oklch(0 0 0 / 0.18),
+    0 10px 24px -16px oklch(from var(--accent-fill) l c h / 0.55);
+}
+.cp-instance-launch .cp-btn--secondary {
+  box-shadow:
+    0 1px 0 oklch(0 0 0 / 0.18),
+    0 10px 24px -18px rgba(0,0,0,0.45);
 }
 .cp-instance-actions .cp-ibtn {
   color: oklch(1 0 0 / 0.62);
@@ -188,15 +207,9 @@
   background: rgba(0,0,0,0.32);
   color: rgba(255,255,255,0.95);
 }
-.cp-instance-actions-sep {
-  width: 1px;
-  height: 22px;
-  background: oklch(1 0 0 / 0.16);
-  margin: 0 6px;
-  align-self: center;
-}
 
-/* ─── Tab strip (kept as pills, with a faint divider beneath) ─── */
+/* ─── Tab strip (pills) — lifted inactive-label contrast to --text-dim
+ * so the row stops reading as half-disabled. ─── */
 .cp-instance-tabs {
   display: flex;
   gap: 2px;
@@ -207,12 +220,11 @@
   position: relative;
 }
 .cp-instance-tabs::-webkit-scrollbar { display: none; }
-
 .cp-instance-tabs button {
   padding: 7px 12px;
   border: none;
   background: transparent;
-  color: var(--text-mute);
+  color: var(--text-dim);
   font-size: 13px;
   font-weight: 500;
   cursor: pointer;
@@ -225,7 +237,7 @@
   white-space: nowrap;
   position: relative;
 }
-.cp-instance-tabs button:hover { background: var(--surface-2); color: var(--text-dim); }
+.cp-instance-tabs button:hover { background: var(--surface-2); color: var(--text); }
 .cp-instance-tabs button[data-active="true"] {
   background: var(--surface-2);
   color: var(--text);
@@ -245,29 +257,39 @@
   color: var(--accent);
 }
 
-/* ─── Body — two independent flex columns.
- * Each column flows its own cards at natural heights (irregular bento). ─── */
+/* ─── Body — intrinsic two-column bento.
+ *
+ * Uses flex-wrap with flex-basis rather than a viewport media query: the
+ * right rail naturally drops below the main column when there isn't
+ * enough room for both at their declared basis. No fixed breakpoint, no
+ * "between 970 and 1400 it feels cramped" — the layout chooses for
+ * itself. The grow factor 999 on .cp-instance-main means main soaks up
+ * any extra width while the rail stays close to its 320px basis.
+ *
+ * Wrap point ≈ 720 + 20 (gap) + 320 = 1060px of body width. With 32px
+ * page padding either side, that's a viewport of ~1124px. Above that:
+ * two columns. Below: one column with the rail stacked underneath. ─── */
 .cp-instance-body {
   padding: 18px 32px 40px;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 340px;
+  display: flex;
+  flex-wrap: wrap;
   column-gap: 20px;
-  align-items: start;
+  row-gap: 14px;
+  align-items: flex-start;
 }
 .cp-instance-main {
+  flex: 999 1 720px;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 14px;
-  min-width: 0;
 }
 .cp-instance-side {
+  flex: 1 1 320px;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 14px;
-  min-width: 0;
-}
-@media (max-width: 980px) {
-  .cp-instance-body { grid-template-columns: minmax(0, 1fr); }
 }
 
 /* ─── Stagger fade-up entrance ─── */
@@ -283,7 +305,7 @@
   to { opacity: 1; transform: translateY(0); }
 }
 
-/* ─── Borderless card override for the Overview surface ─── */
+/* ─── Borderless card surface for the overview ─── */
 .cp-od-card {
   border-color: transparent;
   background: oklch(from var(--surface-2) l c h / 0.78);
@@ -298,11 +320,8 @@
 @supports not (background: oklch(from white l c h)) {
   .cp-od-card { background: var(--surface-2); }
 }
-.cp-od-card--side {
-  /* sidebar feels slightly tighter than main */
-}
 
-/* ─── Card head (sentence case, with optional icon-tile) ─── */
+/* ─── Card head ─── */
 .cp-od-head {
   display: flex;
   align-items: center;
@@ -343,7 +362,7 @@
 .cp-od-link {
   background: transparent;
   border: none;
-  color: var(--text-mute);
+  color: var(--text-dim);
   font-size: 12px;
   font-weight: 500;
   cursor: pointer;
@@ -355,8 +374,7 @@
   transition: color 120ms ease;
 }
 .cp-od-link:hover { color: var(--text); }
-.cp-od-link--accent { color: var(--accent); font-weight: 600; }
-.cp-od-link--accent:hover { color: var(--accent); opacity: 0.85; }
+.cp-od-link[disabled] { opacity: 0.5; cursor: not-allowed; }
 .cp-od-overflow {
   background: transparent;
   border: none;
@@ -372,49 +390,64 @@
 }
 .cp-od-overflow:hover { background: var(--surface-3); color: var(--text); }
 
-/* ─── Worlds card ─── */
+/* ─── Worlds — left-aligned compact empty state.
+ *
+ * Two flex children: a "lead" group (mark + copy) and the CTA cluster.
+ * Both wrap when the card can't hold them on one row, so the buttons
+ * drop below the copy instead of squeezing into a single narrow column.
+ * The lead group's 320px basis is the trigger: if (lead + gap + CTAs)
+ * exceeds the card's content width, CTAs wrap underneath. No media
+ * query needed — the wrap is driven by the card's intrinsic size. ─── */
 .cp-od-worlds-empty {
   display: flex;
-  flex-direction: column;
+  flex-wrap: wrap;
   align-items: center;
-  justify-content: center;
-  text-align: center;
-  padding: 14px 16px 6px;
+  gap: 12px 18px;
+  padding: 4px 2px;
+}
+.cp-od-worlds-lead {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex: 1 1 320px;
+  min-width: 0;
 }
 .cp-od-worlds-mark {
-  width: 44px;
-  height: 44px;
-  border-radius: 12px;
+  width: 40px;
+  height: 40px;
+  border-radius: 10px;
   background: var(--surface-3);
   color: var(--text-dim);
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  margin-bottom: 16px;
+  flex-shrink: 0;
   box-shadow:
     inset 0 0 0 1px oklch(1 0 0 / 0.05),
-    0 6px 18px -10px rgba(0,0,0,0.4);
+    0 6px 18px -12px rgba(0,0,0,0.45);
 }
-.cp-od-worlds-empty h4 {
-  margin: 0 0 4px;
-  font-size: 15px;
+.cp-od-worlds-copy { min-width: 0; flex: 1 1 0; }
+.cp-od-worlds-copy h4 {
+  margin: 0 0 3px;
+  font-size: 14px;
   font-weight: 600;
   color: var(--text);
-  letter-spacing: -0.2px;
+  letter-spacing: -0.15px;
 }
-.cp-od-worlds-empty p {
-  margin: 0 0 20px;
-  font-size: 13px;
+.cp-od-worlds-copy p {
+  margin: 0;
+  font-size: 12.5px;
   color: var(--text-mute);
   line-height: 1.55;
-  max-width: 380px;
+  max-width: 480px;
 }
 .cp-od-worlds-cta {
   display: inline-flex;
-  gap: 10px;
+  gap: 8px;
   flex-wrap: wrap;
-  justify-content: center;
+  margin-left: auto;
 }
+
 .cp-od-worlds-list {
   display: flex;
   flex-direction: column;
@@ -453,55 +486,146 @@
   font-size: 11.5px;
   color: var(--text-mute);
   margin-top: 2px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 
-/* ─── Logs preview (borderless, monospace) ─── */
-.cp-od-logs {
+/* ─── Performance — RAM slider, presets, runtime line.
+ * Slider edits local state. When the local value diverges from the
+ * persisted instance value, an Apply/Revert footer appears below the
+ * recommended-range hint — the user commits the change explicitly. ─── */
+.cp-od-perf-row,
+.cp-od-perf-preset-row {
   display: flex;
-  flex-direction: column;
-  gap: 2px;
-  font-family: ui-monospace, "Geist Mono", SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 11.5px;
-  line-height: 1.6;
-  padding: 4px 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
 }
-.cp-od-log-line {
-  display: grid;
-  grid-template-columns: 64px 48px 1fr;
-  gap: 12px;
-  align-items: baseline;
-  padding: 3px 4px;
-  border-radius: 6px;
-  transition: background 120ms;
+.cp-od-perf-row { margin-bottom: 10px; }
+.cp-od-perf-preset-row { padding: 12px 0; border-top: 1px solid oklch(1 0 0 / 0.04); margin-top: 12px; }
+.cp-od-perf-key {
+  font-size: 12.5px;
+  color: var(--text-dim);
+  letter-spacing: -0.05px;
 }
-.cp-od-log-line:hover {
-  background: oklch(1 0 0 / 0.025);
-}
-.cp-od-log-time {
-  color: var(--text-mute);
+.cp-od-perf-val {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
   font-variant-numeric: tabular-nums;
   letter-spacing: -0.2px;
 }
-.cp-od-log-level {
-  font-weight: 700;
-  font-size: 10.5px;
-  letter-spacing: 0.5px;
-  text-transform: uppercase;
-  align-self: baseline;
+
+/* Native slider layered over a custom track (cross-browser safe).
+ * Recommended-range slab is colored behind the fill; thumb sits on top. */
+.cp-od-perf-slider {
+  position: relative;
+  height: 22px;
+  display: flex;
+  align-items: center;
 }
-.cp-od-log-level[data-level="INFO"]  { color: var(--text-dim); }
-.cp-od-log-level[data-level="WARN"]  { color: var(--warn); }
-.cp-od-log-level[data-level="ERROR"] { color: var(--err); }
-.cp-od-log-msg {
-  color: var(--text);
-  min-width: 0;
-  letter-spacing: -0.1px;
+.cp-od-perf-slider input[type=range] {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  width: 100%;
+  height: 100%;
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  z-index: 2;
+  cursor: pointer;
+}
+.cp-od-perf-slider input[type=range]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  background: var(--text);
+  box-shadow: 0 0 0 3px var(--bg), 0 2px 6px rgba(0,0,0,0.35);
+  cursor: grab;
+  transition: transform 120ms ease;
+}
+.cp-od-perf-slider input[type=range]::-webkit-slider-thumb:active { cursor: grabbing; transform: scale(1.06); }
+.cp-od-perf-slider input[type=range]::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  border: none;
+  background: var(--text);
+  box-shadow: 0 0 0 3px var(--bg), 0 2px 6px rgba(0,0,0,0.35);
+  cursor: grab;
+}
+.cp-od-perf-track {
+  position: absolute;
+  inset: 50% 7px auto 7px;
+  height: 4px;
+  margin-top: -2px;
+  background: var(--surface-3);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.cp-od-perf-recommend {
+  position: absolute;
+  top: 0; bottom: 0;
+  background: oklch(0.78 0.14 150 / 0.18);
+  border-top: 1px solid oklch(0.78 0.14 150 / 0.3);
+  border-bottom: 1px solid oklch(0.78 0.14 150 / 0.3);
+}
+.cp-od-perf-fill {
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  background: var(--accent-fill);
+  border-radius: 999px;
+}
+.cp-od-perf-caption {
+  margin-top: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 11.5px;
+  color: var(--text-mute);
+  letter-spacing: -0.05px;
+  min-height: 22px;
+}
+.cp-od-perf-commit {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
 }
 
-/* ─── Recent events (green-dot timeline) ─── */
+.cp-od-perf-preset-row .cp-mini-seg {
+  background: var(--surface);
+  border: 1px solid var(--line);
+}
+
+.cp-od-perf-runtime {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid oklch(1 0 0 / 0.04);
+  font-size: 12.5px;
+}
+.cp-od-perf-runtime-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  background: oklch(0.78 0.14 150 / 0.14);
+  color: var(--ok);
+  flex-shrink: 0;
+}
+.cp-od-perf-runtime-text {
+  flex: 1;
+  min-width: 0;
+  color: var(--text);
+  letter-spacing: -0.05px;
+}
+
+/* ─── Activity — slim list, capped at 3 events ─── */
 .cp-od-events {
   list-style: none;
   margin: 0;
@@ -511,35 +635,25 @@
 }
 .cp-od-event {
   display: grid;
-  grid-template-columns: 14px 80px 1fr auto;
+  grid-template-columns: 14px 1fr auto;
   gap: 14px;
   align-items: center;
-  padding: 9px 2px;
+  padding: 8px 2px;
 }
 .cp-od-event + .cp-od-event {
   border-top: 1px solid oklch(1 0 0 / 0.04);
 }
 .cp-od-event-dot {
-  width: 8px;
-  height: 8px;
+  width: 6px;
+  height: 6px;
   border-radius: 999px;
-  background: var(--ok);
-  box-shadow:
-    0 0 0 3px oklch(0.78 0.14 150 / 0.18),
-    0 0 4px oklch(0.78 0.14 150 / 0.55);
+  background: var(--text-mute);
   justify-self: center;
-}
-.cp-od-event-time {
-  font-family: ui-monospace, "Geist Mono", SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 11.5px;
-  font-variant-numeric: tabular-nums;
-  color: var(--text-mute);
-  letter-spacing: -0.2px;
 }
 .cp-od-event-msg {
   font-size: 13px;
   color: var(--text);
-  letter-spacing: -0.1px;
+  letter-spacing: -0.05px;
   min-width: 0;
   white-space: nowrap;
   overflow: hidden;
@@ -553,7 +667,7 @@
   white-space: nowrap;
 }
 
-/* ─── Summary KV (sidebar) ─── */
+/* ─── KV rows (Details card) ─── */
 .cp-od-kv {
   display: flex;
   flex-direction: column;
@@ -562,19 +676,19 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 9px 0;
+  padding: 8px 0;
   gap: 12px;
 }
 .cp-od-kv-row + .cp-od-kv-row {
   border-top: 1px solid oklch(1 0 0 / 0.04);
 }
 .cp-od-kv-key {
-  font-size: 12.5px;
+  font-size: 12px;
   color: var(--text-mute);
   letter-spacing: -0.05px;
 }
 .cp-od-kv-val {
-  font-size: 13px;
+  font-size: 12.5px;
   color: var(--text);
   font-weight: 500;
   letter-spacing: -0.1px;
@@ -584,10 +698,9 @@
 }
 .cp-od-kv-val--mono {
   font-family: ui-monospace, "Geist Mono", SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 12.5px;
+  font-size: 12px;
 }
 
-/* status inline in KV row */
 .cp-od-status {
   display: inline-flex;
   align-items: center;
@@ -595,8 +708,8 @@
   color: var(--text-mute);
 }
 .cp-od-status-dot {
-  width: 8px;
-  height: 8px;
+  width: 7px;
+  height: 7px;
   border-radius: 999px;
   background: var(--text-mute);
 }
@@ -611,65 +724,91 @@
   animation: cp-pulse 1.8s ease-in-out infinite;
 }
 
-/* ─── Resources rows ─── */
-.cp-od-resource { margin-bottom: 14px; }
-.cp-od-resource:last-child { margin-bottom: 0; }
-.cp-od-resource-row {
+/* ─── Maintenance — single compact rail list ─── */
+.cp-od-maint-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
   display: flex;
-  justify-content: space-between;
-  align-items: baseline;
-  margin-bottom: 8px;
-  font-size: 12.5px;
+  flex-direction: column;
 }
-.cp-od-resource-pending {
-  color: var(--text-mute);
-  font-style: italic;
-  font-size: 12px;
-}
-.cp-od-resource-ok {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  color: var(--ok);
-  font-weight: 500;
-  font-size: 12px;
-}
-
-/* ─── Backups card (plain, calm, no tinted bg) ─── */
-.cp-od-backup-row {
+.cp-od-maint-row {
   display: grid;
-  grid-template-columns: 32px 1fr;
+  grid-template-columns: 26px minmax(0, 1fr) auto;
   align-items: center;
-  gap: 14px;
+  gap: 12px;
+  padding: 10px 0;
 }
-.cp-od-backup-icon {
-  width: 32px;
-  height: 32px;
+.cp-od-maint-row + .cp-od-maint-row {
+  border-top: 1px solid oklch(1 0 0 / 0.04);
+}
+.cp-od-maint-icon {
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  background: var(--surface-3);
+  color: var(--text-dim);
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  color: var(--text-dim);
+  flex-shrink: 0;
 }
-.cp-od-backup-body {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 0;
+.cp-od-maint-icon[data-tone="ok"] {
+  background: oklch(0.78 0.14 150 / 0.10);
+  color: var(--ok);
 }
-.cp-od-backup-title {
-  font-size: 13.5px;
+.cp-od-maint-icon[data-tone="mute"] { color: var(--text-mute); }
+.cp-od-maint-body { min-width: 0; }
+.cp-od-maint-title {
+  font-size: 13px;
   font-weight: 500;
   color: var(--text);
-  letter-spacing: -0.15px;
+  letter-spacing: -0.1px;
 }
-.cp-od-backup-sub {
-  font-size: 12px;
+.cp-od-maint-sub {
+  font-size: 11.5px;
   color: var(--text-mute);
-  font-variant-numeric: tabular-nums;
+  margin-top: 2px;
   letter-spacing: -0.05px;
 }
 
-/* ─── Mods tab (unchanged structure, lightly retuned) ─── */
+/* ─── Compact Logs card at the bottom of the main column.
+ * Promote on error in a follow-up by expanding into a log preview. ─── */
+.cp-od-logs-summary {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+}
+.cp-od-logs-icon {
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-mute);
+}
+.cp-od-logs-line {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+.cp-od-logs-line strong {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: -0.1px;
+}
+.cp-od-logs-sub {
+  font-size: 12px;
+  color: var(--text-mute);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ─── Mods tab ─── */
 .cp-mods-toolbar {
   display: flex;
   gap: 8px;
@@ -730,51 +869,6 @@
 .cp-mods-table-row:last-child { border-bottom: none; }
 .cp-mods-table-row[data-disabled="true"] { opacity: 0.55; }
 .cp-mods-table-row:hover { background: var(--surface-3); }
-.cp-mods-checkbox {
-  width: 18px;
-  height: 18px;
-  border-radius: 4px;
-  cursor: pointer;
-  border: 1.5px solid var(--line-strong);
-  background: transparent;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  color: transparent;
-  padding: 0;
-}
-.cp-mods-checkbox[data-on="true"] {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: var(--accent-on);
-}
-.cp-mods-table-thumb {
-  width: 30px;
-  height: 30px;
-  border-radius: 6px;
-  background: var(--surface-3);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--text-mute);
-}
-.cp-mods-name { font-weight: 600; color: var(--text); letter-spacing: -0.1px; }
-.cp-mods-sub {
-  font-size: 11px;
-  color: var(--text-mute);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.cp-mods-category { font-size: 11px; color: var(--text-mute); }
-.cp-mods-version {
-  font-size: 12px;
-  color: var(--text-dim);
-  font-variant-numeric: tabular-nums;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-}
-.cp-mods-state { font-size: 11px; font-weight: 500; color: var(--text-mute); }
-.cp-mods-state[data-update="true"] { color: var(--accent); }
 .cp-mods-empty-row {
   padding: 36px 16px;
   text-align: center;
@@ -789,7 +883,7 @@
   margin-bottom: 4px;
 }
 
-/* ─── Segmented (used in mods toolbar) ─── */
+/* ─── Segmented (mods toolbar + perf preset) ─── */
 .cp-mini-seg {
   display: inline-flex;
   background: var(--surface);
@@ -808,7 +902,9 @@
   padding: 4px 10px;
   border-radius: 6px;
   cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
 }
+.cp-mini-seg button:hover { color: var(--text); }
 .cp-mini-seg button[data-active="true"] {
   background: var(--surface-3);
   color: var(--text);
@@ -853,4 +949,15 @@
       "square"
       "presets";
   }
+}
+
+/* ─── Reduced-motion: kill staggered entrances and pulses. ─── */
+@media (prefers-reduced-motion: reduce) {
+  .cp-od-stagger {
+    animation: none !important;
+    opacity: 1 !important;
+    transform: none !important;
+  }
+  .cp-instance-state-chip[data-running="true"] .cp-instance-state-dot,
+  .cp-od-status[data-running="true"] .cp-od-status-dot { animation: none !important; }
 }
