@@ -786,11 +786,6 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
               </div>
               <h1 class="cp-instance-title">{inst.name}</h1>
               <div class="cp-instance-subtitle">
-                <span class="cp-instance-state-chip" data-running={running}>
-                  <span class="cp-instance-state-dot" aria-hidden="true" />
-                  {running ? 'Running' : 'Ready to launch'}
-                </span>
-                <span class="cp-instance-subtitle-sep" aria-hidden="true">·</span>
                 <span>Last played <b>{fmtRelative(inst.last_played_at)}</b></span>
                 <span class="cp-instance-subtitle-sep" aria-hidden="true">·</span>
                 <span>Created <b>{fmtJoined(inst.created_at)}</b></span>
