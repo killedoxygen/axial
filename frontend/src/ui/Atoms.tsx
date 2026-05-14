@@ -180,14 +180,15 @@ export function Input({
   );
 }
 
-export function Card({ children, padding = 18, style, onClick }: {
+export function Card({ children, padding = 18, style, onClick, class: cls }: {
   children?: ComponentChildren;
   padding?: number;
   style?: JSX.CSSProperties;
   onClick?: (e: MouseEvent) => void;
+  class?: string;
 }): JSX.Element {
   return (
-    <div class="cp-card" style={{ padding, ...style }} onClick={onClick}>
+    <div class={cls ? `cp-card ${cls}` : 'cp-card'} style={{ padding, ...style }} onClick={onClick}>
       {children}
     </div>
   );

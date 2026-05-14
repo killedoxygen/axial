@@ -1,199 +1,821 @@
-/* Instance detail layout. */
+/* Instance detail layout — Croopor.
+ * Ported from a mockup with a borderless, atmospheric, Linear/Raycast-flavored aesthetic.
+ * Procedural InstanceArt stands in for the design's gradient/pattern cover. */
 
-.cp-instance-hero {
+/* ─── Cover strip — taller, with vignette + warm overhead glow.
+ * The whole cover is masked to dissolve into the page bg at its bottom,
+ * matching the CreateView version-picker horizon. ─── */
+.cp-instance-cover {
   position: relative;
-  padding: 32px 36px 24px;
+  height: 200px;
   overflow: hidden;
-  min-height: 220px;
-  background: var(--surface-3);
+  /* mask the bottom of the cover (art + glow + vignette) into transparency
+   * so the page bg shows through without a hard seam. */
+  -webkit-mask-image:
+    radial-gradient(170% 80% at 50% 0%,
+      #000 0%,
+      #000 55%,
+      transparent 100%);
+  mask-image:
+    radial-gradient(170% 80% at 50% 0%,
+      #000 0%,
+      #000 55%,
+      transparent 100%);
 }
-.cp-instance-hero-art {
+.cp-instance-cover-art {
   position: absolute;
   inset: 0;
   width: 100%;
   height: 100%;
   border-radius: 0 !important;
+  filter: saturate(0.92) brightness(0.84);
 }
-.cp-instance-hero-overlay {
+.cp-instance-cover-glow {
   position: absolute;
-  inset: 0;
+  inset: -20% 0 auto 0;
+  height: 80%;
+  background:
+    radial-gradient(60% 75% at 50% 0%, oklch(0.92 0.13 70 / 0.22), transparent 70%),
+    radial-gradient(35% 50% at 30% 10%, oklch(0.96 0.10 40 / 0.14), transparent 80%);
   pointer-events: none;
+  mix-blend-mode: screen;
 }
-.cp-instance-hero-gradient {
+.cp-instance-cover-vignette {
   position: absolute;
   inset: 0;
   background:
-    radial-gradient(circle at 24% 34%, oklch(0 0 0 / 0.18), transparent 38%),
-    linear-gradient(90deg, oklch(0 0 0 / 0.58), oklch(0 0 0 / 0.34) 62%, oklch(0 0 0 / 0.12) 100%),
-    linear-gradient(180deg, transparent 34%, var(--surface) 100%);
+    /* corner vignette */
+    radial-gradient(130% 100% at 50% 30%, transparent 35%, rgba(0,0,0,0.55) 100%),
+    /* bottom-band darkening for text legibility (smooth, full-width, no localized blobs) */
+    linear-gradient(180deg, rgba(0,0,0,0.05) 0%, rgba(0,0,0,0.0) 30%, rgba(0,0,0,0.35) 75%, rgba(0,0,0,0.55) 100%);
   pointer-events: none;
 }
-.cp-instance-hero-body {
+
+/* ─── Title bar — pulled high into the banner.
+ * Per-element backdrop fades darken the banner where text lives,
+ * leaving the raw banner visible between elements (irregular horizon). ─── */
+.cp-instance-titlebar {
+  padding: 0 32px 32px;
+  margin-top: -150px;
   position: relative;
+  z-index: 2;
+}
+.cp-instance-titlebar-row {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 22px;
+  flex-wrap: wrap;
+}
+.cp-instance-titlebar-left {
   display: flex;
   gap: 22px;
   align-items: flex-end;
-  flex-wrap: wrap;
+  min-width: 0;
 }
+/* text-shadow keeps title/subtitle legible on the banner without painting
+ * blocky bg-colored halos behind them. The fade-into-page is already done
+ * by the cover's radial mask at the bottom. */
 .cp-instance-avatar {
-  width: 120px; height: 120px;
+  width: 116px;
+  height: 116px;
   position: relative;
   overflow: hidden;
+  border-radius: var(--r-lg);
   background: var(--surface-3);
-  border: 1px solid rgba(255,255,255,0.18);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: white;
-  font-size: 40px;
-  font-weight: 700;
-  letter-spacing: -1px;
   flex-shrink: 0;
-  box-shadow: 0 22px 52px -24px rgba(0,0,0,0.75);
+  box-shadow:
+    0 22px 44px -18px rgba(0,0,0,0.58),
+    0 0 0 4px var(--bg),
+    inset 0 0 0 1px oklch(1 0 0 / 0.06);
 }
-.cp-instance-avatar .cp-instance-art {
-  position: absolute;
-  inset: 0;
+.cp-instance-avatar .cp-instance-art { position: absolute; inset: 0; }
+.cp-instance-titlebar-text {
+  min-width: 0;
+  padding-bottom: 4px;
 }
-.cp-instance-avatar span {
-  position: relative;
-  z-index: 1;
-  text-shadow: 0 2px 18px rgba(0,0,0,0.45);
+.cp-instance-pills-row {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.cp-instance-pills-row .cp-pill {
+  font-size: 11.5px;
+  padding: 4px 10px;
+}
+.cp-instance-mc-version {
+  font-size: 13px;
+  color: var(--text-mute);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.1px;
+  text-shadow: 0 1px 6px rgba(0,0,0,0.55);
+}
+.cp-instance-status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 24px;
+  padding: 0 11px 0 9px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.1px;
+  background: oklch(0.78 0.14 150 / 0.12);
+  border: 1px solid oklch(0.78 0.14 150 / 0.28);
+  color: var(--ok);
+}
+.cp-instance-status-pill[data-running="true"] .cp-instance-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--ok);
+  box-shadow:
+    0 0 0 3px oklch(0.78 0.14 150 / 0.22),
+    0 0 6px oklch(0.78 0.14 150 / 0.55);
+  animation: cp-pulse 1.8s ease-in-out infinite;
 }
 .cp-instance-title {
   margin: 0;
-  font-size: 34px;
+  font-size: 40px;
   font-weight: 600;
-  color: white;
-  letter-spacing: -0.8px;
-  text-shadow: 0 1px 12px rgba(0,0,0,0.3);
+  color: var(--text);
+  letter-spacing: -1.1px;
+  line-height: 1.03;
+  word-break: break-word;
+  text-shadow:
+    0 2px 18px rgba(0,0,0,0.55),
+    0 1px 2px rgba(0,0,0,0.3);
 }
-.cp-instance-meta {
-  margin-top: 6px;
-  font-size: 13px;
-  color: rgba(255,255,255,0.82);
+.cp-instance-subtitle {
+  margin-top: 10px;
   display: flex;
-  gap: 14px;
-  flex-wrap: wrap;
-}
-.cp-instance-heading-pills {
-  display: flex;
-  gap: 6px;
-  margin-bottom: 8px;
-  flex-wrap: wrap;
-}
-.cp-instance-hero-actions {
-  display: flex;
-  gap: 8px;
   flex-wrap: wrap;
   align-items: center;
+  gap: 6px 10px;
+  font-size: 13px;
+  color: var(--text-mute);
+  letter-spacing: -0.05px;
+  text-shadow: 0 1px 8px rgba(0,0,0,0.6);
 }
-
-.cp-instance-tabs {
+.cp-instance-subtitle b {
+  color: var(--text-dim);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.cp-instance-subtitle-sep {
+  color: var(--text-mute);
+  opacity: 0.55;
+}
+/* Action cluster — icon utilities followed by the primary Launch button.
+ * Icon buttons sit quieter against the banner; Launch uses the default
+ * primary style (no custom shadows or glow). */
+.cp-instance-actions {
   display: flex;
   gap: 4px;
-  padding: 0 32px;
-  border-bottom: 1px solid var(--line);
-  overflow-x: auto;
-}
-.cp-instance-tabs button {
-  padding: 14px 12px;
-  border: none;
-  background: transparent;
-  color: var(--text-dim);
-  font-size: 13px;
-  font-weight: 600;
-  cursor: pointer;
-  position: relative;
-  letter-spacing: -0.1px;
-  white-space: nowrap;
-}
-.cp-instance-tabs button[data-active="true"] { color: var(--text); }
-.cp-instance-tabs button[data-active="true"]::after {
-  content: "";
-  position: absolute;
-  left: 8px; right: 8px; bottom: -1px;
-  height: 2px;
-  background: var(--accent);
-  border-radius: 2px;
-}
-
-.cp-instance-body {
-  padding: 24px 32px 40px;
-  display: grid;
-  grid-template-columns: 1fr 300px;
-  gap: 22px;
-}
-@media (max-width: 900px) {
-  .cp-instance-body { grid-template-columns: 1fr; }
-}
-.cp-instance-main { display: flex; flex-direction: column; gap: 18px; }
-.cp-instance-side { display: flex; flex-direction: column; gap: 14px; }
-
-/* Quick action row in side panel */
-.cp-quick-action {
-  width: 100%;
-  display: flex;
+  align-self: center;
   align-items: center;
-  gap: 10px;
-  padding: 9px 10px;
-  background: transparent;
+  flex-wrap: wrap;
+  padding-bottom: 4px;
+  margin-right: 24px;
+}
+.cp-instance-actions .cp-ibtn {
+  color: oklch(1 0 0 / 0.62);
+  transition: color 140ms ease, background 140ms ease;
+}
+.cp-instance-actions .cp-ibtn:hover:not([disabled]) {
+  background: rgba(0,0,0,0.32);
+  color: rgba(255,255,255,0.95);
+}
+.cp-instance-actions-sep {
+  width: 1px;
+  height: 22px;
+  background: oklch(1 0 0 / 0.16);
+  margin: 0 6px;
+  align-self: center;
+}
+
+/* ─── Tab strip (kept as pills, with a faint divider beneath) ─── */
+.cp-instance-tabs {
+  display: flex;
+  gap: 2px;
+  padding: 4px 32px 12px;
+  align-items: center;
+  overflow-x: auto;
+  scrollbar-width: none;
+  position: relative;
+}
+.cp-instance-tabs::-webkit-scrollbar { display: none; }
+
+.cp-instance-tabs button {
+  padding: 7px 12px;
   border: none;
-  color: var(--text);
+  background: transparent;
+  color: var(--text-mute);
   font-size: 13px;
   font-weight: 500;
   cursor: pointer;
   border-radius: var(--r-sm);
-  text-align: left;
+  letter-spacing: -0.1px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  transition: background 140ms ease, color 140ms ease;
+  white-space: nowrap;
+  position: relative;
 }
-.cp-quick-action:hover { background: var(--surface-3); }
-.cp-quick-action--danger { color: var(--err); }
-.cp-quick-action--danger:hover { background: oklch(0.70 0.18 25 / 0.12); }
-
-/* Contribution grid (sessions) */
-.cp-contrib {
-  display: grid;
-  grid-auto-flow: column;
-  grid-template-rows: repeat(7, 12px);
-  gap: 3px;
-  width: fit-content;
+.cp-instance-tabs button:hover { background: var(--surface-2); color: var(--text-dim); }
+.cp-instance-tabs button[data-active="true"] {
+  background: var(--surface-2);
+  color: var(--text);
+  font-weight: 600;
 }
-.cp-contrib-cell {
-  width: 12px; height: 12px;
-  border-radius: 2.5px;
+.cp-tab-count {
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 999px;
   background: var(--surface-3);
+  color: var(--text-mute);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
 }
-.cp-contrib-cell[data-level="1"] { background: var(--accent-softer); }
-.cp-contrib-cell[data-level="2"] { background: var(--accent-soft); }
-.cp-contrib-cell[data-level="3"] { background: var(--accent-fill); }
-.cp-contrib-cell[data-level="4"] { background: var(--accent); }
-
-@supports (background: color-mix(in oklch, transparent 0%, transparent)) {
-  .cp-contrib-cell[data-level="1"] { background: color-mix(in oklch, var(--accent) 20%, var(--surface-3)); }
-  .cp-contrib-cell[data-level="2"] { background: color-mix(in oklch, var(--accent) 40%, var(--surface-3)); }
-  .cp-contrib-cell[data-level="3"] { background: color-mix(in oklch, var(--accent) 65%, var(--surface-3)); }
+.cp-instance-tabs button[data-active="true"] .cp-tab-count {
+  background: var(--accent-soft);
+  color: var(--accent);
 }
 
-.cp-meta-row {
-  display: flex;
-  justify-content: space-between;
-  font-size: 12px;
-  margin-bottom: 6px;
-}
-.cp-meta-row .cp-dim { color: var(--text-dim); }
-
-/* Key/value table in overview */
-.cp-kv {
+/* ─── Body — two independent flex columns.
+ * Each column flows its own cards at natural heights (irregular bento). ─── */
+.cp-instance-body {
+  padding: 18px 32px 40px;
   display: grid;
-  grid-template-columns: 120px 1fr;
-  row-gap: 8px;
-  column-gap: 12px;
+  grid-template-columns: minmax(0, 1fr) 340px;
+  column-gap: 20px;
+  align-items: start;
+}
+.cp-instance-main {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+}
+.cp-instance-side {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+}
+@media (max-width: 980px) {
+  .cp-instance-body { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* ─── Stagger fade-up entrance ─── */
+.cp-od-stagger {
+  opacity: 0;
+  transform: translateY(6px);
+  animation: cp-od-rise 480ms cubic-bezier(0.2, 0.7, 0.2, 1) forwards;
+  animation-delay: var(--cp-od-delay, 0ms);
+  display: block;
+  min-width: 0;
+}
+@keyframes cp-od-rise {
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* ─── Borderless card override for the Overview surface ─── */
+.cp-od-card {
+  border-color: transparent;
+  background: oklch(from var(--surface-2) l c h / 0.78);
+  background-image:
+    linear-gradient(180deg, oklch(1 0 0 / 0.015), oklch(0 0 0 / 0.02));
+  box-shadow:
+    inset 0 1px 0 oklch(1 0 0 / 0.04),
+    0 1px 0 oklch(0 0 0 / 0.18),
+    0 16px 40px -28px rgba(0,0,0,0.55);
+  position: relative;
+}
+@supports not (background: oklch(from white l c h)) {
+  .cp-od-card { background: var(--surface-2); }
+}
+.cp-od-card--side {
+  /* sidebar feels slightly tighter than main */
+}
+
+/* ─── Card head (sentence case, with optional icon-tile) ─── */
+.cp-od-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+  gap: 12px;
+  flex-wrap: wrap;
+  min-height: 22px;
+}
+.cp-od-head h3 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: -0.2px;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.cp-od-head-count {
+  font-weight: 500;
+  color: var(--text-mute);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+}
+.cp-od-head--iconed h3 { margin-right: auto; }
+.cp-od-head-tile {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 7px;
+  background: var(--surface-3);
+  color: var(--text-dim);
+  box-shadow: inset 0 0 0 1px oklch(1 0 0 / 0.04);
+}
+.cp-od-link {
+  background: transparent;
+  border: none;
+  color: var(--text-mute);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  letter-spacing: -0.05px;
+  transition: color 120ms ease;
+}
+.cp-od-link:hover { color: var(--text); }
+.cp-od-link--accent { color: var(--accent); font-weight: 600; }
+.cp-od-link--accent:hover { color: var(--accent); opacity: 0.85; }
+.cp-od-overflow {
+  background: transparent;
+  border: none;
+  color: var(--text-mute);
+  cursor: pointer;
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 120ms, color 120ms;
+}
+.cp-od-overflow:hover { background: var(--surface-3); color: var(--text); }
+
+/* ─── Worlds card ─── */
+.cp-od-worlds-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 14px 16px 6px;
+}
+.cp-od-worlds-mark {
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  background: var(--surface-3);
+  color: var(--text-dim);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 16px;
+  box-shadow:
+    inset 0 0 0 1px oklch(1 0 0 / 0.05),
+    0 6px 18px -10px rgba(0,0,0,0.4);
+}
+.cp-od-worlds-empty h4 {
+  margin: 0 0 4px;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: -0.2px;
+}
+.cp-od-worlds-empty p {
+  margin: 0 0 20px;
+  font-size: 13px;
+  color: var(--text-mute);
+  line-height: 1.55;
+  max-width: 380px;
+}
+.cp-od-worlds-cta {
+  display: inline-flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+.cp-od-worlds-list {
+  display: flex;
+  flex-direction: column;
+}
+.cp-od-world-row {
+  display: grid;
+  grid-template-columns: 36px 1fr auto;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 0;
+}
+.cp-od-world-row + .cp-od-world-row {
+  border-top: 1px solid oklch(1 0 0 / 0.04);
+}
+.cp-od-world-mark {
+  width: 36px;
+  height: 36px;
+  border-radius: 9px;
+  background: var(--surface-3);
+  color: var(--text-dim);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.cp-od-world-body { min-width: 0; }
+.cp-od-world-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: -0.1px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cp-od-world-sub {
+  font-size: 11.5px;
+  color: var(--text-mute);
+  margin-top: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ─── Logs preview (borderless, monospace) ─── */
+.cp-od-logs {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-family: ui-monospace, "Geist Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11.5px;
+  line-height: 1.6;
+  padding: 4px 0;
+}
+.cp-od-log-line {
+  display: grid;
+  grid-template-columns: 64px 48px 1fr;
+  gap: 12px;
+  align-items: baseline;
+  padding: 3px 4px;
+  border-radius: 6px;
+  transition: background 120ms;
+}
+.cp-od-log-line:hover {
+  background: oklch(1 0 0 / 0.025);
+}
+.cp-od-log-time {
+  color: var(--text-mute);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.2px;
+}
+.cp-od-log-level {
+  font-weight: 700;
+  font-size: 10.5px;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  align-self: baseline;
+}
+.cp-od-log-level[data-level="INFO"]  { color: var(--text-dim); }
+.cp-od-log-level[data-level="WARN"]  { color: var(--warn); }
+.cp-od-log-level[data-level="ERROR"] { color: var(--err); }
+.cp-od-log-msg {
+  color: var(--text);
+  min-width: 0;
+  letter-spacing: -0.1px;
+}
+
+/* ─── Recent events (green-dot timeline) ─── */
+.cp-od-events {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+.cp-od-event {
+  display: grid;
+  grid-template-columns: 14px 80px 1fr auto;
+  gap: 14px;
+  align-items: center;
+  padding: 9px 2px;
+}
+.cp-od-event + .cp-od-event {
+  border-top: 1px solid oklch(1 0 0 / 0.04);
+}
+.cp-od-event-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--ok);
+  box-shadow:
+    0 0 0 3px oklch(0.78 0.14 150 / 0.18),
+    0 0 4px oklch(0.78 0.14 150 / 0.55);
+  justify-self: center;
+}
+.cp-od-event-time {
+  font-family: ui-monospace, "Geist Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-mute);
+  letter-spacing: -0.2px;
+}
+.cp-od-event-msg {
+  font-size: 13px;
+  color: var(--text);
+  letter-spacing: -0.1px;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cp-od-event-rel {
+  font-size: 11.5px;
+  color: var(--text-mute);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* ─── Summary KV (sidebar) ─── */
+.cp-od-kv {
+  display: flex;
+  flex-direction: column;
+}
+.cp-od-kv-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 9px 0;
+  gap: 12px;
+}
+.cp-od-kv-row + .cp-od-kv-row {
+  border-top: 1px solid oklch(1 0 0 / 0.04);
+}
+.cp-od-kv-key {
+  font-size: 12.5px;
+  color: var(--text-mute);
+  letter-spacing: -0.05px;
+}
+.cp-od-kv-val {
+  font-size: 13px;
+  color: var(--text);
+  font-weight: 500;
+  letter-spacing: -0.1px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  word-break: break-word;
+}
+.cp-od-kv-val--mono {
+  font-family: ui-monospace, "Geist Mono", SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12.5px;
 }
-.cp-kv dt { color: var(--text-dim); }
-.cp-kv dd { margin: 0; color: var(--text); font-weight: 500; }
 
-/* Artwork settings */
+/* status inline in KV row */
+.cp-od-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-mute);
+}
+.cp-od-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--text-mute);
+}
+.cp-od-status[data-running="true"] {
+  color: var(--ok);
+}
+.cp-od-status[data-running="true"] .cp-od-status-dot {
+  background: var(--ok);
+  box-shadow:
+    0 0 0 3px oklch(0.78 0.14 150 / 0.18),
+    0 0 4px oklch(0.78 0.14 150 / 0.55);
+  animation: cp-pulse 1.8s ease-in-out infinite;
+}
+
+/* ─── Resources rows ─── */
+.cp-od-resource { margin-bottom: 14px; }
+.cp-od-resource:last-child { margin-bottom: 0; }
+.cp-od-resource-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 8px;
+  font-size: 12.5px;
+}
+.cp-od-resource-pending {
+  color: var(--text-mute);
+  font-style: italic;
+  font-size: 12px;
+}
+.cp-od-resource-ok {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--ok);
+  font-weight: 500;
+  font-size: 12px;
+}
+
+/* ─── Backups card (plain, calm, no tinted bg) ─── */
+.cp-od-backup-row {
+  display: grid;
+  grid-template-columns: 32px 1fr;
+  align-items: center;
+  gap: 14px;
+}
+.cp-od-backup-icon {
+  width: 32px;
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-dim);
+}
+.cp-od-backup-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.cp-od-backup-title {
+  font-size: 13.5px;
+  font-weight: 500;
+  color: var(--text);
+  letter-spacing: -0.15px;
+}
+.cp-od-backup-sub {
+  font-size: 12px;
+  color: var(--text-mute);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.05px;
+}
+
+/* ─── Mods tab (unchanged structure, lightly retuned) ─── */
+.cp-mods-toolbar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-bottom: none;
+  border-top-left-radius: var(--r-md);
+  border-top-right-radius: var(--r-md);
+  background: var(--surface-2);
+  flex-wrap: wrap;
+}
+.cp-mods-toolbar .cp-mods-search {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 200px;
+}
+.cp-mods-toolbar .cp-mods-search input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--text);
+  font-size: 13px;
+  font: inherit;
+}
+.cp-mods-table {
+  border: 1px solid var(--line);
+  border-bottom-left-radius: var(--r-md);
+  border-bottom-right-radius: var(--r-md);
+  overflow: hidden;
+  background: var(--surface);
+}
+.cp-mods-table-head,
+.cp-mods-table-row {
+  display: grid;
+  grid-template-columns: 28px 36px 1fr 110px 90px 80px 28px;
+  gap: 12px;
+  padding: 10px 12px;
+  align-items: center;
+}
+.cp-mods-table-head {
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--line);
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text-mute);
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  padding: 8px 12px;
+}
+.cp-mods-table-row {
+  border-bottom: 1px solid var(--line);
+  font-size: 13px;
+}
+.cp-mods-table-row:last-child { border-bottom: none; }
+.cp-mods-table-row[data-disabled="true"] { opacity: 0.55; }
+.cp-mods-table-row:hover { background: var(--surface-3); }
+.cp-mods-checkbox {
+  width: 18px;
+  height: 18px;
+  border-radius: 4px;
+  cursor: pointer;
+  border: 1.5px solid var(--line-strong);
+  background: transparent;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: transparent;
+  padding: 0;
+}
+.cp-mods-checkbox[data-on="true"] {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-on);
+}
+.cp-mods-table-thumb {
+  width: 30px;
+  height: 30px;
+  border-radius: 6px;
+  background: var(--surface-3);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-mute);
+}
+.cp-mods-name { font-weight: 600; color: var(--text); letter-spacing: -0.1px; }
+.cp-mods-sub {
+  font-size: 11px;
+  color: var(--text-mute);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cp-mods-category { font-size: 11px; color: var(--text-mute); }
+.cp-mods-version {
+  font-size: 12px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.cp-mods-state { font-size: 11px; font-weight: 500; color: var(--text-mute); }
+.cp-mods-state[data-update="true"] { color: var(--accent); }
+.cp-mods-empty-row {
+  padding: 36px 16px;
+  text-align: center;
+  color: var(--text-dim);
+  font-size: 13px;
+  line-height: 1.55;
+}
+.cp-mods-empty-row strong {
+  display: block;
+  color: var(--text);
+  font-size: 14px;
+  margin-bottom: 4px;
+}
+
+/* ─── Segmented (used in mods toolbar) ─── */
+.cp-mini-seg {
+  display: inline-flex;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  padding: 2px;
+  gap: 0;
+}
+.cp-mini-seg button {
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: -0.1px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.cp-mini-seg button[data-active="true"] {
+  background: var(--surface-3);
+  color: var(--text);
+  box-shadow: 0 1px 2px rgba(0,0,0,0.15);
+}
+
+/* ─── Settings tab artwork ─── */
 .cp-art-settings {
   display: grid;
   grid-template-columns: 116px minmax(220px, 1fr);
@@ -202,22 +824,9 @@
     "presets presets";
   gap: 12px;
 }
-.cp-art-settings-square {
-  grid-area: square;
-  width: 116px;
-  height: 116px;
-}
-.cp-art-settings-banner {
-  grid-area: banner;
-  height: 116px;
-  min-height: 116px;
-}
-.cp-art-preset-list {
-  grid-area: presets;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
+.cp-art-settings-square { grid-area: square; width: 116px; height: 116px; }
+.cp-art-settings-banner { grid-area: banner; height: 116px; min-height: 116px; }
+.cp-art-preset-list { grid-area: presets; display: flex; flex-wrap: wrap; gap: 8px; }
 .cp-art-preset-list button {
   height: 30px;
   padding: 0 12px;
@@ -230,9 +839,7 @@
   text-transform: capitalize;
   cursor: pointer;
 }
-.cp-art-preset-list button:hover {
-  color: var(--text);
-}
+.cp-art-preset-list button:hover { color: var(--text); }
 .cp-art-preset-list button[data-active="true"] {
   background: var(--accent-softer);
   border-color: var(--accent-line);
