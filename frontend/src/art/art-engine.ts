@@ -30,11 +30,21 @@ interface FlowMotif {
   slope: number;
 }
 
+export type VersionLifecycleTrait = 'snapshot' | 'experimental' | 'old_beta' | 'old_alpha' | 'pre_release' | 'release_candidate';
+export type VersionLoaderTrait = 'fabric' | 'quilt' | 'forge' | 'neoforge';
+
+export interface VersionIdentity {
+  label: string;
+  lifecycleTrait?: VersionLifecycleTrait | null;
+  loaderTrait?: VersionLoaderTrait | null;
+}
+
 interface RenderInput {
   seed: number;
   preset: ArtPreset;
   aspect: ArtAspect;
   dark: boolean;
+  versionIdentity?: VersionIdentity | null;
 }
 
 interface RenderSize {
@@ -341,7 +351,11 @@ function sizeFor(aspect: ArtAspect): RenderSize {
 
 function cacheKey(input: RenderInput): string {
   const { width, height } = sizeFor(input.aspect);
-  return `${input.seed}:${input.preset}:${input.aspect}:${input.dark ? 'd' : 'l'}:${width}x${height}`;
+  const identity = input.versionIdentity;
+  const label = identity?.label.trim() ?? '';
+  const lifecycle = identity?.lifecycleTrait ?? '';
+  const loader = identity?.loaderTrait ?? '';
+  return `${input.seed}:${input.preset}:${input.aspect}:${input.dark ? 'd' : 'l'}:${width}x${height}:${label}:${lifecycle}:${loader}`;
 }
 
 function cacheByteSize(input: RenderInput): number {
@@ -368,6 +382,274 @@ function lightMask(x: number, y: number, lx: number, ly: number): number {
   const dx = x - lx;
   const dy = y - ly;
   return Math.exp(-(dx * dx * 2.5 + dy * dy * 4.2));
+}
+
+function rgbCss(color: Rgb, alpha = 1): string {
+  return `rgba(${Math.round(color.r)}, ${Math.round(color.g)}, ${Math.round(color.b)}, ${alpha})`;
+}
+
+function textHeight(metrics: TextMetrics, fontPx: number): number {
+  const measured = metrics.actualBoundingBoxAscent + metrics.actualBoundingBoxDescent;
+  return measured > 0 ? measured : fontPx * 0.72;
+}
+
+function fitVersionText(
+  ctx: CanvasRenderingContext2D,
+  label: string,
+  width: number,
+  height: number,
+): { fontPx: number; baselineY: number } | null {
+  const targetWidth = width * 0.82;
+  const targetHeight = height * 0.38;
+  const maxFont = width * 0.42;
+  const minFont = 72;
+  const fontFamily = 'Geist, ui-sans-serif, system-ui, -apple-system, sans-serif';
+
+  ctx.font = `800 ${Math.floor(maxFont)}px ${fontFamily}`;
+  let metrics = ctx.measureText(label);
+  const initialHeight = textHeight(metrics, maxFont);
+  const scale = Math.min(1, targetWidth / Math.max(1, metrics.width), targetHeight / Math.max(1, initialHeight));
+  const fontPx = Math.floor(maxFont * scale);
+  if (fontPx < minFont) return null;
+
+  ctx.font = `800 ${fontPx}px ${fontFamily}`;
+  metrics = ctx.measureText(label);
+  if (metrics.width > targetWidth) return null;
+  if (textHeight(metrics, fontPx) > targetHeight) return null;
+
+  const ascent = metrics.actualBoundingBoxAscent;
+  const descent = metrics.actualBoundingBoxDescent;
+  const baselineY = ascent + descent > 0
+    ? height / 2 + (ascent - descent) / 2
+    : height / 2;
+  return { fontPx, baselineY };
+}
+
+function drawPhaseSlices(
+  ctx: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  palette: Palette,
+): void {
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(width * 0.12, height * 0.29, width * 0.76, height * 0.42);
+  ctx.clip();
+  ctx.globalCompositeOperation = 'screen';
+  ctx.strokeStyle = rgbCss(palette.glow, 0.24);
+  ctx.lineWidth = Math.max(3, width * 0.012);
+  ctx.beginPath();
+  ctx.moveTo(width * 0.12, height * 0.63);
+  ctx.lineTo(width * 0.88, height * 0.35);
+  ctx.moveTo(width * 0.17, height * 0.70);
+  ctx.lineTo(width * 0.83, height * 0.42);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawExperimentalOrbit(
+  ctx: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  palette: Palette,
+): void {
+  ctx.save();
+  ctx.globalCompositeOperation = 'screen';
+  ctx.strokeStyle = rgbCss(palette.glow, 0.22);
+  ctx.lineWidth = Math.max(2, width * 0.007);
+  ctx.beginPath();
+  ctx.ellipse(width * 0.50, height * 0.50, width * 0.31, height * 0.18, -0.32, 0.20, Math.PI * 1.46);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.ellipse(width * 0.50, height * 0.50, width * 0.31, height * 0.18, -0.32, Math.PI * 1.63, Math.PI * 1.92);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawLegacySlab(
+  ctx: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  palette: Palette,
+  rough: boolean,
+): void {
+  const x = width * 0.16;
+  const y = height * 0.33;
+  const w = width * 0.68;
+  const h = height * 0.34;
+  const cut = width * 0.055;
+  ctx.save();
+  ctx.globalCompositeOperation = 'multiply';
+  ctx.fillStyle = rgbCss(palette.shade, 0.28);
+  ctx.beginPath();
+  ctx.moveTo(x + cut, y);
+  ctx.lineTo(x + w, y);
+  ctx.lineTo(x + w - cut, y + h);
+  ctx.lineTo(x, y + h);
+  ctx.closePath();
+  ctx.fill();
+
+  ctx.globalCompositeOperation = 'screen';
+  ctx.fillStyle = rgbCss(palette.glow, 0.10);
+  ctx.fillRect(x + w * 0.10, y + h * 0.18, w * 0.78, Math.max(2, h * 0.035));
+  if (rough) {
+    ctx.fillRect(x + w * 0.13, y - 1, cut * 0.70, cut * 0.38);
+    ctx.fillRect(x + w * 0.62, y + h - cut * 0.28, cut * 0.62, cut * 0.32);
+    ctx.fillRect(x + w * 0.84, y + h * 0.34, cut * 0.42, cut * 0.28);
+  } else {
+    ctx.globalCompositeOperation = 'multiply';
+    ctx.fillStyle = rgbCss(palette.shade, 0.26);
+    ctx.fillRect(x + w * 0.10, y, cut * 0.70, cut * 0.35);
+    ctx.fillRect(x + w * 0.77, y + h - cut * 0.34, cut * 0.70, cut * 0.35);
+  }
+  ctx.restore();
+}
+
+function drawProgressRing(
+  ctx: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  palette: Palette,
+  candidate: boolean,
+): void {
+  ctx.save();
+  ctx.globalCompositeOperation = 'screen';
+  ctx.strokeStyle = rgbCss(palette.glow, 0.25);
+  ctx.lineWidth = Math.max(3, width * 0.010);
+  ctx.beginPath();
+  ctx.arc(width * 0.50, height * 0.50, width * 0.33, -Math.PI * 0.88, candidate ? Math.PI * 0.20 : -Math.PI * 0.02);
+  ctx.stroke();
+  ctx.fillStyle = rgbCss(palette.glow, 0.28);
+  ctx.beginPath();
+  ctx.moveTo(width * 0.78, height * 0.35);
+  ctx.lineTo(width * 0.82, height * 0.36);
+  ctx.lineTo(width * 0.79, height * 0.39);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawLoaderTrait(
+  ctx: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  palette: Palette,
+  trait: VersionLoaderTrait,
+): void {
+  ctx.save();
+  ctx.globalCompositeOperation = 'screen';
+  ctx.strokeStyle = rgbCss(palette.glow, 0.20);
+  ctx.fillStyle = rgbCss(palette.glow, 0.15);
+  ctx.lineWidth = Math.max(2, width * 0.006);
+
+  if (trait === 'fabric') {
+    for (let i = 0; i < 4; i += 1) {
+      const y = height * (0.39 + i * 0.072);
+      ctx.beginPath();
+      ctx.moveTo(width * 0.20, y);
+      ctx.bezierCurveTo(width * 0.38, y - 18, width * 0.62, y + 18, width * 0.80, y);
+      ctx.stroke();
+    }
+  } else if (trait === 'quilt') {
+    const size = width * 0.038;
+    for (let row = 0; row < 3; row += 1) {
+      for (let col = 0; col < 3; col += 1) {
+        const cx = width * 0.68 + col * size * 1.22;
+        const cy = height * 0.32 + row * size * 1.22;
+        ctx.beginPath();
+        ctx.moveTo(cx, cy - size * 0.48);
+        ctx.lineTo(cx + size * 0.48, cy);
+        ctx.lineTo(cx, cy + size * 0.48);
+        ctx.lineTo(cx - size * 0.48, cy);
+        ctx.closePath();
+        ctx.fill();
+      }
+    }
+  } else if (trait === 'forge') {
+    ctx.globalCompositeOperation = 'multiply';
+    ctx.fillStyle = rgbCss(palette.shade, 0.24);
+    ctx.fillRect(width * 0.30, height * 0.65, width * 0.40, height * 0.030);
+    ctx.fillRect(width * 0.38, height * 0.70, width * 0.24, height * 0.025);
+  } else {
+    ctx.beginPath();
+    ctx.arc(width * 0.50, height * 0.50, width * 0.34, -Math.PI * 0.22, Math.PI * 0.66);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(width * 0.50, height * 0.50, width * 0.28, Math.PI * 0.86, Math.PI * 1.42);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawVersionIdentity(
+  ctx: CanvasRenderingContext2D,
+  input: RenderInput,
+  palette: Palette,
+  width: number,
+  height: number,
+): void {
+  if (input.aspect !== 'square') return;
+  const identity = input.versionIdentity;
+  if (!identity) return;
+  const label = identity.label.trim();
+  const lifecycle = identity.lifecycleTrait ?? null;
+  const loader = identity.loaderTrait ?? null;
+  if (!label && !lifecycle && !loader) return;
+
+  ctx.save();
+  const basin = ctx.createRadialGradient(width * 0.50, height * 0.50, width * 0.08, width * 0.50, height * 0.50, width * 0.48);
+  basin.addColorStop(0, rgbCss(input.dark ? palette.shade : palette.glow, input.dark ? 0.30 : 0.20));
+  basin.addColorStop(0.58, rgbCss(input.dark ? palette.shade : palette.glow, input.dark ? 0.16 : 0.12));
+  basin.addColorStop(1, rgbCss(input.dark ? palette.shade : palette.glow, 0));
+  ctx.globalCompositeOperation = input.dark ? 'multiply' : 'screen';
+  ctx.fillStyle = basin;
+  ctx.fillRect(0, 0, width, height);
+  ctx.restore();
+
+  if (lifecycle === 'snapshot' || lifecycle === 'experimental') drawPhaseSlices(ctx, width, height, palette);
+  if (lifecycle === 'experimental') drawExperimentalOrbit(ctx, width, height, palette);
+  if (lifecycle === 'old_beta' || lifecycle === 'old_alpha') drawLegacySlab(ctx, width, height, palette, lifecycle === 'old_alpha');
+  if (lifecycle === 'pre_release' || lifecycle === 'release_candidate') {
+    drawProgressRing(ctx, width, height, palette, lifecycle === 'release_candidate');
+  }
+  if (loader) drawLoaderTrait(ctx, width, height, palette, loader);
+  if (!label) return;
+
+  const fitted = fitVersionText(ctx, label, width, height);
+  if (!fitted) return;
+
+  ctx.save();
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'alphabetic';
+  ctx.lineJoin = 'round';
+  ctx.miterLimit = 2;
+
+  const x = width / 2;
+  const y = fitted.baselineY;
+  const stroke = Math.max(5, fitted.fontPx * 0.050);
+  ctx.globalCompositeOperation = 'multiply';
+  ctx.lineWidth = stroke * 1.6;
+  ctx.strokeStyle = rgbCss(palette.shade, input.dark ? 0.56 : 0.30);
+  ctx.strokeText(label, x + fitted.fontPx * 0.018, y + fitted.fontPx * 0.022);
+
+  ctx.globalCompositeOperation = 'screen';
+  ctx.lineWidth = stroke;
+  ctx.strokeStyle = rgbCss(palette.glow, input.dark ? 0.34 : 0.24);
+  ctx.strokeText(label, x - fitted.fontPx * 0.012, y - fitted.fontPx * 0.014);
+
+  const fill = ctx.createLinearGradient(0, y - fitted.fontPx * 0.62, 0, y + fitted.fontPx * 0.18);
+  fill.addColorStop(0, rgbCss(palette.glow, input.dark ? 0.88 : 0.70));
+  fill.addColorStop(0.52, rgbCss(palette.mark, input.dark ? 0.82 : 0.74));
+  fill.addColorStop(1, rgbCss(palette.shade, input.dark ? 0.34 : 0.46));
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = fill;
+  ctx.fillText(label, x, y);
+
+  ctx.globalCompositeOperation = 'multiply';
+  ctx.lineWidth = Math.max(1.5, fitted.fontPx * 0.016);
+  ctx.strokeStyle = rgbCss(palette.shade, input.dark ? 0.36 : 0.22);
+  ctx.strokeText(label, x, y);
+  ctx.restore();
 }
 
 function renderPixels(input: RenderInput): RenderedArt {
@@ -464,6 +746,7 @@ function renderPixels(input: RenderInput): RenderedArt {
   canvas.width = width;
   canvas.height = height;
   ctx.putImageData(image, 0, 0);
+  drawVersionIdentity(ctx, input, palette, width, height);
   return { source: canvas, width, height };
 }
 

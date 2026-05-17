@@ -3,11 +3,18 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { Input } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { Slider } from '../../ui/Slider';
-import { InstanceArt, artPresetForSeed } from '../../art/InstanceArt';
+import {
+  InstanceArt,
+  artPresetForSeed,
+  loaderTraitForComponentId,
+  versionIdentityForVersion,
+  versionIdentityForVersionId,
+  type VersionIdentitySource,
+} from '../../art/InstanceArt';
 import { fmtMem } from '../../utils';
 import { Sound, playSliderSound } from '../../sound';
 import type { LoaderBuildRecord } from '../../types';
-import { LOADER_LABELS, type LoaderKey } from './defaults';
+import { LOADER_COMPONENT_IDS, LOADER_LABELS, type LoaderKey } from './defaults';
 import { LoaderLogo } from './loader-logos';
 import {
   JVM_PRESET_HINTS,
@@ -55,6 +62,7 @@ export function NameStep({
   nameInputRef,
   alreadyInstalled,
   selectedBuild,
+  minecraftVersion,
   previewSeed,
   onReroll,
   memoryGB,
@@ -75,6 +83,7 @@ export function NameStep({
   nameInputRef: { current: HTMLInputElement | null };
   alreadyInstalled: boolean;
   selectedBuild: LoaderBuildRecord | null;
+  minecraftVersion?: VersionIdentitySource | null;
   previewSeed: number;
   onReroll: () => void;
   memoryGB: number;
@@ -98,6 +107,12 @@ export function NameStep({
   };
   const loaderLabel = source === 'vanilla' ? 'Vanilla' : LOADER_LABELS[source];
   const buildLabel = source !== 'vanilla' && selectedBuild ? selectedBuild.loader_version : null;
+  const loaderTrait = source === 'vanilla' ? null : loaderTraitForComponentId(LOADER_COMPONENT_IDS[source]);
+  const versionIdentity = (() => {
+    const fromVersion = versionIdentityForVersion(minecraftVersion);
+    if (fromVersion) return { ...fromVersion, loaderTrait };
+    return versionIdentityForVersionId(mcVersionId, loaderTrait);
+  })();
 
   const artReady = useDeferredFlag();
   const memReady = useDeferredFlag();
@@ -162,7 +177,7 @@ export function NameStep({
           <div class="cp-cr-card-top">
             <div class="cp-cr-card-avatar">
               {showArt ? (
-                <InstanceArt instance={previewInstance} aspect="square" radius={14} />
+                <InstanceArt instance={previewInstance} versionIdentity={versionIdentity} aspect="square" radius={14} />
               ) : (
                 <div class="cp-cr-blob cp-cr-blob--avatar" />
               )}

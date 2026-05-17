@@ -133,7 +133,7 @@ function UserMenu({ onClose }: { onClose: () => void }): JSX.Element {
       <MenuRow icon="user" label="Accounts and skins" onSelect={() => { navigate({ name: 'accounts' }); onClose(); }} />
       <div class="cp-userm-divider" />
       <MenuRow
-        icon={soundsOn ? 'volume' : 'volume'}
+        icon={soundsOn ? 'volume' : 'volume-off'}
         label="UI sounds"
         onSelect={toggleSounds}
         right={<span class="cp-userm-pill" data-on={soundsOn}>{soundsOn ? 'On' : 'Off'}</span>}

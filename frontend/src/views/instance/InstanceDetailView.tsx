@@ -362,7 +362,7 @@ function MaintenanceCard(): JSX.Element {
       </div>
       <ul class="cp-od-maint-list">
         <li class="cp-od-maint-row">
-          <span class="cp-od-maint-icon" data-tone="ok"><Icon name="cloud" size={14} stroke={1.8} /></span>
+          <span class="cp-od-maint-icon" data-tone="ok"><Icon name="archive" size={14} stroke={1.8} /></span>
           <div class="cp-od-maint-body">
             <div class="cp-od-maint-title">Backups enabled</div>
             <div class="cp-od-maint-sub">Daily at 03:00 · 7 day retention</div>

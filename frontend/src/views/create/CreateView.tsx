@@ -232,6 +232,11 @@ function CreateWizard(): JSX.Element {
     return pickPreferredBuild(builds ?? []);
   }, [currentComponentId, mcVersionId, loaderState]);
 
+  const selectedMinecraftVersion = useMemo(() => {
+    if (!mcVersionId) return null;
+    return availableForSource.find((version) => version.id === mcVersionId) ?? null;
+  }, [availableForSource, mcVersionId]);
+
   const effectiveVersionId: string = useMemo(() => {
     if (source === 'vanilla') return mcVersionId ?? '';
     return selectedBuild?.version_id ?? '';
@@ -438,6 +443,7 @@ function CreateWizard(): JSX.Element {
               nameInputRef={nameInputRef}
               alreadyInstalled={effectiveAlreadyInstalled}
               selectedBuild={selectedBuild}
+              minecraftVersion={selectedMinecraftVersion}
               previewSeed={previewSeed}
               onReroll={rerollSeed}
               memoryGB={memoryGB}

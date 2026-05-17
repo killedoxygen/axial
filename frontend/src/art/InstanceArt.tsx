@@ -2,12 +2,19 @@ import type { JSX } from 'preact';
 import { useLayoutEffect, useRef } from 'preact/hooks';
 import { useTheme } from '../hooks/use-theme';
 import { hashStr } from '../tokens';
-import type { Instance } from '../types';
-import { renderInstanceArt } from './art-engine';
+import type { Instance, LoaderComponentId, Version } from '../types';
+import { renderInstanceArt, type VersionIdentity, type VersionLoaderTrait } from './art-engine';
 import './instance-art.css';
 
 export type ArtPreset = 'aurora' | 'silk' | 'mineral' | 'ember' | 'vapor' | 'topo' | 'prism' | 'dune' | 'orbit';
 export type ArtAspect = 'square' | 'banner' | 'thumb';
+
+export interface VersionIdentitySource {
+  id: string;
+  minecraft_meta: Version['minecraft_meta'];
+  lifecycle: Version['lifecycle'];
+  loader?: Version['loader'];
+}
 
 // Order is part of the deterministic seed contract. Keep this list in sync
 // with `ART_PRESETS` in `core/config/src/instances/mod.rs`.
@@ -18,6 +25,7 @@ interface ArtInput {
   preset: ArtPreset;
   dark: boolean;
   aspect: ArtAspect;
+  versionIdentity?: VersionIdentity | null;
 }
 
 function pickPreset(seed: number): ArtPreset {
@@ -61,6 +69,60 @@ export function nextArtSeed(seed: number): number {
   return next || 1;
 }
 
+function numericAnchorFrom(...values: Array<string | undefined | null>): string {
+  for (const value of values) {
+    const trimmed = value?.trim() ?? '';
+    if (!trimmed) continue;
+    if (/^\d+(?:\.\d+)*$/.test(trimmed)) return trimmed;
+    const match = trimmed.match(/\d+(?:\.\d+)+/);
+    if (match) return match[0];
+  }
+  return '';
+}
+
+function lifecycleTraitForVersion(version: VersionIdentitySource): VersionIdentity['lifecycleTrait'] {
+  const labels = version.lifecycle?.labels ?? [];
+  if (labels.includes('old_alpha')) return 'old_alpha';
+  if (labels.includes('old_beta')) return 'old_beta';
+  if (labels.includes('release_candidate')) return 'release_candidate';
+  if (labels.includes('pre_release')) return 'pre_release';
+  if (version.lifecycle?.channel === 'experimental') return 'experimental';
+  if (labels.includes('snapshot') || version.lifecycle?.channel === 'preview') return 'snapshot';
+  return null;
+}
+
+export function loaderTraitForComponentId(componentId: LoaderComponentId | string | undefined | null): VersionLoaderTrait | null {
+  if (componentId === 'net.fabricmc.fabric-loader') return 'fabric';
+  if (componentId === 'org.quiltmc.quilt-loader') return 'quilt';
+  if (componentId === 'net.minecraftforge') return 'forge';
+  if (componentId === 'net.neoforged') return 'neoforge';
+  return null;
+}
+
+export function versionIdentityForVersionId(
+  versionId: string,
+  loaderTrait?: VersionLoaderTrait | null,
+): VersionIdentity | null {
+  const label = numericAnchorFrom(versionId);
+  if (!label && !loaderTrait) return null;
+  return { label, loaderTrait: loaderTrait ?? null };
+}
+
+export function versionIdentityForVersion(version: VersionIdentitySource | null | undefined): VersionIdentity | null {
+  if (!version) return null;
+  const label = numericAnchorFrom(
+    version.minecraft_meta?.effective_version,
+    version.minecraft_meta?.display_hint,
+    version.minecraft_meta?.display_name,
+    version.minecraft_meta?.base_id,
+    version.id,
+  );
+  const lifecycleTrait = lifecycleTraitForVersion(version);
+  const loaderTrait = loaderTraitForComponentId(version.loader?.component_id);
+  if (!label && !lifecycleTrait && !loaderTrait) return null;
+  return { label, lifecycleTrait, loaderTrait };
+}
+
 function drawArt(canvas: HTMLCanvasElement | null, input: ArtInput): void {
   if (!canvas) return;
   const art = renderInstanceArt(input);
@@ -78,22 +140,29 @@ export function InstanceArt({
   radius,
   className,
   style,
+  version,
+  versionIdentity,
 }: {
   instance: Pick<Instance, 'id' | 'name' | 'version_id' | 'art_seed'>;
   aspect?: ArtAspect;
   radius?: number;
   className?: string;
   style?: JSX.CSSProperties;
+  version?: Version | null;
+  versionIdentity?: VersionIdentity | null;
 }): JSX.Element {
   const theme = useTheme();
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const seed = artSeedFor(instance);
   const preset = artPresetForSeed(seed);
   const classValue = `cp-instance-art cp-instance-art--${aspect}${className ? ` ${className}` : ''}`;
+  const identity = aspect === 'square'
+    ? versionIdentity ?? versionIdentityForVersion(version)
+    : null;
 
   useLayoutEffect(() => {
-    drawArt(canvasRef.current, { seed, preset, dark: theme.dark, aspect });
-  }, [seed, preset, theme.dark, aspect]);
+    drawArt(canvasRef.current, { seed, preset, dark: theme.dark, aspect, versionIdentity: identity });
+  }, [seed, preset, theme.dark, aspect, identity?.label, identity?.lifecycleTrait, identity?.loaderTrait]);
 
   return (
     <div

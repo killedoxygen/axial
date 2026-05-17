@@ -112,7 +112,7 @@ function GridCard({ inst }: { inst: EnrichedInstance }): JSX.Element {
       onClick={openInstance}
       onKeyDown={onCardKeyDown}
     >
-      <InstanceArt instance={inst} aspect="square" radius={theme.r.md} style={{ width: 68, height: 68 }} />
+      <InstanceArt instance={inst} version={v} aspect="square" radius={theme.r.md} style={{ width: 68, height: 68 }} />
       <div class="cp-playcard-body">
         <div class="cp-playcard-title">
           <h3>{inst.name}</h3>

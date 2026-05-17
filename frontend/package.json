@@ -14,8 +14,8 @@
     "typescript": "^5.7.0"
   },
   "dependencies": {
+    "@openai/apps-sdk-ui": "^0.2.2",
     "@preact/signals": "^2.0.0",
-    "@tabler/icons-preact": "^3.41.1",
     "preact": "^10.25.0"
   }
 }

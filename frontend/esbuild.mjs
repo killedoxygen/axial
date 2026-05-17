@@ -1,11 +1,31 @@
 import net from 'node:net';
+import { createRequire } from 'node:module';
 import { context, build } from 'esbuild';
 
+const require = createRequire(import.meta.url);
 const mode = process.argv[2]; // 'serve', 'watch', or omitted (production build)
 const strictDevPort = process.argv.includes('--strict-port');
 const portOverride = process.env.PORT;
 const defaultDevPort = 3000;
 const webApiBase = process.env.CROOPOR_WEB_API_BASE ?? 'http://127.0.0.1:43430';
+
+const reactCompatAliases = new Map([
+  ['react', 'preact/compat'],
+  ['react-dom', 'preact/compat'],
+  ['react/jsx-runtime', 'preact/jsx-runtime'],
+  ['react/jsx-dev-runtime', 'preact/jsx-runtime'],
+]);
+
+const preactCompatAliasPlugin = {
+  name: 'preact-compat-alias',
+  setup(b) {
+    b.onResolve({ filter: /^react(?:-dom|\/jsx-runtime|\/jsx-dev-runtime)?$/ }, args => {
+      const target = reactCompatAliases.get(args.path);
+      if (!target) return;
+      return { path: require.resolve(target, { paths: [process.cwd()] }) };
+    });
+  },
+};
 
 const shared = {
   entryPoints: { app: 'src/main.tsx' },
@@ -18,6 +38,7 @@ const shared = {
   define: {
     __CROOPOR_WEB_API_BASE__: JSON.stringify(webApiBase),
   },
+  plugins: [preactCompatAliasPlugin],
 };
 
 const sizeReporter = {
@@ -92,7 +113,7 @@ if (mode === 'serve') {
   // Standalone dev server, rebuilds per request and does not write to disk
   const port = await resolveDevPort();
   currentCtx = await context({
-    ...shared, sourcemap: 'inline', metafile: true, plugins: [sizeReporter],
+    ...shared, sourcemap: 'inline', metafile: true, plugins: [...shared.plugins, sizeReporter],
   });
   const server = await currentCtx.serve({ servedir: 'static', port });
   console.log(`dev → http://localhost:${server.port}`);
@@ -100,7 +121,7 @@ if (mode === 'serve') {
 } else if (mode === 'watch') {
   // File watcher for desktop development, rebuilds to disk on source change
   currentCtx = await context({
-    ...shared, sourcemap: 'inline', metafile: true, plugins: [sizeReporter],
+    ...shared, sourcemap: 'inline', metafile: true, plugins: [...shared.plugins, sizeReporter],
   });
   await currentCtx.watch();
   console.log('watching → static/app.js');

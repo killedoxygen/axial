@@ -1,6 +1,6 @@
 import type { JSX } from 'preact';
 import { useState } from 'preact/hooks';
-import { ART_PRESETS, InstanceArt, artPresetForSeed, artSeedForPreset, nextArtSeed, type ArtPreset } from '../../art/InstanceArt';
+import { ART_PRESETS, InstanceArt, artPresetForSeed, artSeedForPreset, nextArtSeed, versionIdentityForVersionId, type ArtPreset } from '../../art/InstanceArt';
 import { Button, Card, Input, SectionHeading } from '../../ui/Atoms';
 import { hashStr } from '../../tokens';
 import type { Instance } from '../../types';
@@ -31,6 +31,7 @@ function ArtWorkbench(): JSX.Element {
   const [seed, setSeed] = useState(hashStr('Moonlit Forge:1.21.1-fabric') || 1);
   const preset = artPresetForSeed(seed);
   const inst = demoInstance(name || 'Untitled instance', versionId || 'unknown', seed, preset);
+  const versionIdentity = versionIdentityForVersionId(versionId);
 
   const randomize = (): void => {
     setSeed(nextArtSeed(seed ^ Date.now()));
@@ -88,7 +89,7 @@ function ArtWorkbench(): JSX.Element {
         </Card>
         <Card padding={12}>
           <div class="cp-dev-preview-label">Square</div>
-          <InstanceArt instance={inst} aspect="square" radius={18} className="cp-dev-square-preview" />
+          <InstanceArt instance={inst} versionIdentity={versionIdentity} aspect="square" radius={18} className="cp-dev-square-preview" />
         </Card>
         <Card padding={12}>
           <div class="cp-dev-preview-label">Thumb</div>
