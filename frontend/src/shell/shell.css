@@ -191,7 +191,8 @@
   color: var(--accent);
 }
 .cp-sidebar-item[data-child-active="true"] {
-  color: var(--text-dim);
+  background: var(--surface-3);
+  color: var(--text);
 }
 .cp-sidebar-item[data-child-active="true"] .cp-sidebar-label {
   font-weight: 500;

@@ -47,10 +47,18 @@ function isItemActive(item: SidebarItem, current: Route): boolean {
   return item.children?.some(child => isItemActive(child, current)) ?? false;
 }
 
+function isRouteInsideItem(target: Route, current: Route): boolean {
+  if (target.name === 'instances' && current.name === 'instance') return true;
+  return false;
+}
+
 function SidebarItemNode({ item, depth = 0, compact = false }: { item: SidebarItem; depth?: number; compact?: boolean }): JSX.Element {
   const current = route.value;
   const active = isRouteActive(item.route, current);
-  const childActive = !active && (item.children?.some(child => isItemActive(child, current)) ?? false);
+  const childActive = !active && (
+    isRouteInsideItem(item.route, current)
+    || (item.children?.some(child => isItemActive(child, current)) ?? false)
+  );
   const iconSize = compact ? 20 : (depth > 0 ? 15 : 17);
 
   return (
