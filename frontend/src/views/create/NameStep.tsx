@@ -12,7 +12,7 @@ import {
   type VersionIdentitySource,
 } from '../../art/InstanceArt';
 import { fmtMem } from '../../utils';
-import { Sound, playSliderSound } from '../../sound';
+import { Sound } from '../../sound';
 import type { LoaderBuildRecord } from '../../types';
 import { LOADER_COMPONENT_IDS, LOADER_LABELS, type LoaderKey } from './defaults';
 import { LoaderLogo } from './loader-logos';
@@ -230,10 +230,8 @@ export function NameStep({
               max={totalGB}
               step={0.5}
               recommended={[Math.max(2, memoryRec - 2), Math.min(totalGB, memoryRec + 2)]}
-              onChange={(v) => {
-                onMemoryChange(v);
-                playSliderSound(v / Math.max(1, totalGB), 'memory');
-              }}
+              sound="memory"
+              onChange={onMemoryChange}
               ariaLabel="Max memory in gigabytes"
             />
           ) : (

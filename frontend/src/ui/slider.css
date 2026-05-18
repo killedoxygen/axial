@@ -23,23 +23,39 @@
   inset: 0 auto 0 0;
   width: var(--slider-filled);
   background: linear-gradient(90deg, var(--accent-strong), var(--accent));
+  opacity: 0.72;
   border-radius: 999px;
+  z-index: 2;
 }
-.cp-slider-rec {
+.cp-slider-zone {
   position: absolute;
   top: 0; bottom: 0;
-  background: var(--accent-softer);
+  pointer-events: none;
+  z-index: 1;
+}
+.cp-slider-zone[data-tone="low"] {
+  background: color-mix(in oklab, var(--text-mute) 18%, transparent);
+}
+.cp-slider-zone[data-tone="sweet"] {
+  background: color-mix(in oklab, var(--accent) 28%, transparent);
   border: 1px dashed var(--accent-line);
   border-radius: 999px;
-  pointer-events: none;
+}
+.cp-slider-zone[data-tone="high"] {
+  background: color-mix(in oklab, #f6c85f 24%, transparent);
+}
+.cp-slider-zone[data-tone="extreme"] {
+  background: color-mix(in oklab, #ff5f6d 26%, transparent);
 }
 .cp-slider-thumb {
   position: absolute;
   top: 50%;
   left: var(--slider-filled);
+  z-index: 3;
   width: 18px; height: 18px;
   border-radius: 999px;
   background: var(--accent-fill);
+  opacity: 1;
   border: 2px solid var(--surface);
   box-shadow:
     0 1px 2px rgba(0,0,0,0.3),

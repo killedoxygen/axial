@@ -5,7 +5,7 @@ import { Icon } from '../../ui/Icons';
 import { Slider } from '../../ui/Slider';
 import { AccentField, AccentModeToggle } from './AccentEditor';
 import { local, saveLocalState } from '../../state';
-import { Sound, playSliderSound } from '../../sound';
+import { Sound } from '../../sound';
 import { Music, musicStateVersion } from '../../music';
 import { config, systemInfo, devMode, appVersion } from '../../store';
 import { navigate } from '../../ui-state';
@@ -170,10 +170,8 @@ function GameplaySection(): JSX.Element {
             min={1} max={maxGB} step={0.5}
             recommended={recZone}
             ticks={memoryTicks}
-            onChange={(v) => {
-              setMemGB(v);
-              playSliderSound(v / maxGB, 'memory');
-            }}
+            sound="memory"
+            onChange={setMemGB}
             onCommit={() => { if (dirty) void save(); }}
             ariaLabel="Max memory in gigabytes"
           />
@@ -229,10 +227,10 @@ function AudioSection(): JSX.Element {
             </div>
             <Slider
               value={volume} min={0} max={100} step={1}
+              sound="volume"
               onChange={(v) => {
                 setVolume(v);
                 Music.setVolume(v);
-                playSliderSound(v / 100, 'volume');
               }}
               ariaLabel="Music volume"
             />

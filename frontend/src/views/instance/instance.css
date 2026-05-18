@@ -4,6 +4,17 @@
  * owns the Launch action cluster; Resources/Performance lives in the main
  * content column; the right rail carries quiet glanceable cards. */
 
+.cp-instance-page {
+  --cp-instance-dock-pad: 32px;
+  --cp-scrollbar-lane: 16px;
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+.cp-instance-page--overview {
+  padding-bottom: 70px;
+}
+
 /* ─── Cover strip — atmospheric banner that dissolves into the page bg
  * via a radial mask (no hard seam). ─── */
 .cp-instance-cover {
@@ -270,12 +281,12 @@
  * page padding either side, that's a viewport of ~1124px. Above that:
  * two columns. Below: one column with the rail stacked underneath. ─── */
 .cp-instance-body {
-  padding: 18px 32px 40px;
+  padding: 18px 32px 24px;
   display: flex;
   flex-wrap: wrap;
   column-gap: 15px;
   row-gap: 14px;
-  align-items: flex-start;
+  align-items: stretch;
 }
 .cp-instance-main {
   flex: 999 1 720px;
@@ -291,6 +302,24 @@
   flex-direction: column;
   gap: 14px;
 }
+.cp-instance-bottom {
+  position: fixed;
+  left: calc(244px + var(--cp-instance-dock-pad));
+  right: calc(var(--cp-instance-dock-pad) + var(--cp-scrollbar-lane));
+  bottom: -1px;
+  width: auto;
+  min-width: 0;
+  z-index: 18;
+  pointer-events: none;
+  border: 1px solid color-mix(in oklab, var(--line) 48%, transparent);
+  border-bottom: none;
+  border-radius: var(--r-md) var(--r-md) 0 0;
+  background: var(--surface-2);
+  box-shadow: inset 0 1px 0 oklch(1 0 0 / 0.035);
+}
+.cp-sidebar[data-compact="true"] ~ .cp-main .cp-instance-bottom {
+  left: calc(76px + var(--cp-instance-dock-pad));
+}
 
 /* ─── Stagger fade-up entrance ─── */
 .cp-od-stagger {
@@ -300,6 +329,23 @@
   animation-delay: var(--cp-od-delay, 0ms);
   display: block;
   min-width: 0;
+}
+.cp-od-stagger.cp-od-worlds-slot {
+  flex: 1 1 0;
+  display: flex;
+  min-height: 232px;
+}
+.cp-od-worlds-card {
+  width: 100%;
+  height: 100%;
+  min-height: 100%;
+  max-height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+.cp-od-worlds-card .cp-od-worlds-empty,
+.cp-od-worlds-card .cp-od-worlds-list {
+  flex: 1;
 }
 @keyframes cp-od-rise {
   to { opacity: 1; transform: translateY(0); }
@@ -395,32 +441,29 @@
  * exceeds the card's content width, CTAs wrap underneath. No media
  * query needed — the wrap is driven by the card's intrinsic size. ─── */
 .cp-od-worlds-empty {
-  display: flex;
-  flex-wrap: wrap;
+  position: relative;
+  z-index: 1;
+  display: grid;
+  grid-template-columns: minmax(108px, 144px) minmax(260px, 560px) minmax(170px, auto);
   align-items: center;
-  gap: 12px 18px;
-  padding: 4px 2px;
+  gap: 24px;
+  padding: 6px 2px;
+}
+.cp-od-worlds-art {
+  width: min(144px, 100%);
+  max-width: 100%;
+}
+.cp-od-worlds-art img {
+  display: block;
+  width: 100%;
+  height: auto;
+  user-select: none;
+  pointer-events: none;
 }
 .cp-od-worlds-lead {
   display: flex;
   align-items: center;
-  gap: 16px;
-  flex: 1 1 320px;
   min-width: 0;
-}
-.cp-od-worlds-mark {
-  width: 40px;
-  height: 40px;
-  border-radius: 10px;
-  background: var(--surface-3);
-  color: var(--text-dim);
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  flex-shrink: 0;
-  box-shadow:
-    inset 0 0 0 1px oklch(1 0 0 / 0.05),
-    0 6px 18px -12px rgba(0,0,0,0.45);
 }
 .cp-od-worlds-copy { min-width: 0; flex: 1 1 0; }
 .cp-od-worlds-copy h4 {
@@ -435,13 +478,17 @@
   font-size: 12.5px;
   color: var(--text-mute);
   line-height: 1.55;
-  max-width: 480px;
+  max-width: 540px;
 }
 .cp-od-worlds-cta {
-  display: inline-flex;
+  display: flex;
+  flex-direction: column;
   gap: 8px;
-  flex-wrap: wrap;
-  margin-left: auto;
+  justify-self: end;
+  width: min(180px, 100%);
+}
+.cp-od-worlds-cta .cp-btn {
+  width: 100%;
 }
 
 .cp-od-worlds-list {
@@ -484,10 +531,7 @@
   margin-top: 2px;
 }
 
-/* ─── Performance — RAM slider, presets, runtime line.
- * Slider edits local state. When the local value diverges from the
- * persisted instance value, an Apply/Revert footer appears below the
- * recommended-range hint — the user commits the change explicitly. ─── */
+/* ─── Performance — RAM slider, presets, runtime line. ──────────────── */
 .cp-od-perf-row,
 .cp-od-perf-preset-row {
   display: flex;
@@ -510,83 +554,8 @@
   letter-spacing: -0.2px;
 }
 
-/* Native slider layered over a custom track (cross-browser safe).
- * Recommended-range slab is colored behind the fill; thumb sits on top. */
 .cp-od-perf-slider {
-  position: relative;
-  height: 22px;
-  display: flex;
-  align-items: center;
-}
-.cp-od-perf-slider input[type=range] {
-  position: absolute;
-  inset: 0;
-  margin: 0;
-  width: 100%;
-  height: 100%;
-  -webkit-appearance: none;
-  appearance: none;
-  background: transparent;
-  z-index: 2;
-  cursor: pointer;
-}
-.cp-od-perf-slider input[type=range]::-webkit-slider-thumb {
-  -webkit-appearance: none;
-  width: 14px;
-  height: 14px;
-  border-radius: 999px;
-  background: var(--text);
-  box-shadow: 0 0 0 3px var(--bg), 0 2px 6px rgba(0,0,0,0.35);
-  cursor: grab;
-  transition: transform 120ms ease;
-}
-.cp-od-perf-slider input[type=range]::-webkit-slider-thumb:active { cursor: grabbing; transform: scale(1.06); }
-.cp-od-perf-slider input[type=range]::-moz-range-thumb {
-  width: 14px;
-  height: 14px;
-  border-radius: 999px;
-  border: none;
-  background: var(--text);
-  box-shadow: 0 0 0 3px var(--bg), 0 2px 6px rgba(0,0,0,0.35);
-  cursor: grab;
-}
-.cp-od-perf-track {
-  position: absolute;
-  inset: 50% 7px auto 7px;
-  height: 4px;
-  margin-top: -2px;
-  background: var(--surface-3);
-  border-radius: 999px;
-  overflow: hidden;
-}
-.cp-od-perf-recommend {
-  position: absolute;
-  top: 0; bottom: 0;
-  background: oklch(0.78 0.14 150 / 0.18);
-  border-top: 1px solid oklch(0.78 0.14 150 / 0.3);
-  border-bottom: 1px solid oklch(0.78 0.14 150 / 0.3);
-}
-.cp-od-perf-fill {
-  position: absolute;
-  left: 0; top: 0; bottom: 0;
-  background: var(--accent-fill);
-  border-radius: 999px;
-}
-.cp-od-perf-caption {
-  margin-top: 8px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  font-size: 11.5px;
-  color: var(--text-mute);
-  letter-spacing: -0.05px;
-  min-height: 22px;
-}
-.cp-od-perf-commit {
-  display: inline-flex;
-  align-items: center;
-  gap: 10px;
+  margin-bottom: 10px;
 }
 
 .cp-od-perf-preset-row .cp-mini-seg {
@@ -619,6 +588,82 @@
   min-width: 0;
   color: var(--text);
   letter-spacing: -0.05px;
+}
+
+/* Quick actions: compact command surface in the main column. */
+.cp-od-quick-card .cp-od-head {
+  margin-bottom: 12px;
+}
+.cp-od-quick-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+.cp-od-quick-action {
+  min-width: 0;
+  min-height: 58px;
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in oklab, var(--line) 55%, transparent);
+  border-radius: var(--r-sm);
+  background: color-mix(in oklab, var(--surface-3) 72%, transparent);
+  color: var(--text);
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 140ms ease, border-color 140ms ease, transform 120ms ease;
+}
+.cp-od-quick-action:hover:not([disabled]) {
+  background: var(--surface-3);
+  border-color: color-mix(in oklab, var(--line) 82%, transparent);
+}
+.cp-od-quick-action:active:not([disabled]) {
+  transform: translateY(0.5px);
+}
+.cp-od-quick-action[disabled] {
+  cursor: not-allowed;
+  opacity: 0.48;
+}
+.cp-od-quick-icon {
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--surface-2);
+  color: var(--text-dim);
+  box-shadow: inset 0 0 0 1px oklch(1 0 0 / 0.04);
+}
+.cp-od-quick-action[data-tone="danger"] .cp-od-quick-icon {
+  color: var(--err);
+  background: oklch(0.70 0.18 25 / 0.10);
+}
+.cp-od-quick-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.cp-od-quick-copy strong {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: -0.1px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cp-od-quick-copy span {
+  font-size: 11.5px;
+  color: var(--text-mute);
+  letter-spacing: -0.05px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* ─── Activity — slim list, capped at 3 events ─── */
@@ -768,21 +813,31 @@
   letter-spacing: -0.05px;
 }
 
-/* ─── Compact Logs card at the bottom of the main column.
- * Promote on error in a follow-up by expanding into a log preview. ─── */
+/* Compact Logs strip pinned at the bottom of the overview.
+ * Promote on error in a follow-up by expanding into a log preview. */
+.cp-od-logs-card {
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  pointer-events: auto;
+}
 .cp-od-logs-summary {
   display: grid;
-  grid-template-columns: 24px minmax(0, 1fr) auto;
+  grid-template-columns: 34px minmax(0, 1fr) auto;
   align-items: center;
   gap: 12px;
 }
 .cp-od-logs-icon {
-  width: 24px;
-  height: 24px;
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  color: var(--text-mute);
+  color: var(--text-dim);
+  background: var(--surface-3);
+  box-shadow: inset 0 0 0 1px oklch(1 0 0 / 0.04);
 }
 .cp-od-logs-line {
   display: flex;
@@ -802,6 +857,61 @@
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+@media (max-width: 1180px) {
+  .cp-od-quick-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .cp-od-stagger.cp-od-worlds-slot {
+    min-height: 260px;
+  }
+  .cp-od-worlds-empty {
+    grid-template-columns: minmax(96px, 128px) minmax(220px, 1fr);
+  }
+  .cp-od-worlds-cta {
+    grid-column: 2;
+    justify-self: start;
+    width: min(360px, 100%);
+    flex-direction: row;
+  }
+}
+
+@media (max-width: 640px) {
+  .cp-instance-page {
+    --cp-instance-dock-pad: 18px;
+  }
+  .cp-instance-body {
+    padding-inline: 18px;
+  }
+  .cp-od-quick-grid {
+    grid-template-columns: 1fr;
+  }
+  .cp-od-stagger.cp-od-worlds-slot {
+    min-height: 390px;
+  }
+  .cp-od-worlds-empty {
+    grid-template-columns: 1fr;
+    justify-items: start;
+    align-content: center;
+  }
+  .cp-od-worlds-cta {
+    justify-self: stretch;
+    width: 100%;
+  }
+  .cp-od-logs-summary {
+    grid-template-columns: 34px minmax(0, 1fr);
+  }
+  .cp-od-logs-summary .cp-od-link {
+    grid-column: 2;
+    justify-self: start;
+    margin-top: 2px;
+  }
+  .cp-od-logs-line {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 2px;
+  }
 }
 
 /* ─── Mods tab ─── */

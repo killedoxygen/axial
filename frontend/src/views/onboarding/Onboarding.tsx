@@ -7,7 +7,7 @@ import { AccentField, AccentModeToggle } from '../settings/AccentEditor';
 import { WindowControls } from '../../shell/WindowControls';
 import { local } from '../../state';
 import { Music } from '../../music';
-import { Sound, playSliderSound } from '../../sound';
+import { Sound } from '../../sound';
 import { api } from '../../api';
 import { config, systemInfo } from '../../store';
 import { showOnboardingOverlay } from '../../ui-state';
@@ -294,10 +294,8 @@ export function Onboarding(): JSX.Element | null {
           max={totalGB}
           step={0.5}
           recommended={[Math.max(2, rec.rec - 2), Math.min(totalGB, rec.rec + 2)]}
-          onChange={(v) => {
-            setMemory(v);
-            playSliderSound(v / totalGB, 'memory');
-          }}
+          sound="memory"
+          onChange={setMemory}
           ariaLabel="Max memory in gigabytes"
         />
         <div class="cp-ob-memory-summary" aria-live="polite">

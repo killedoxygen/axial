@@ -2,17 +2,18 @@ import type { JSX } from 'preact';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { Icon } from '../../ui/Icons';
 import { Button, Card, IconButton, Input, Pill, SectionHeading } from '../../ui/Atoms';
+import { Slider, type SliderZone } from '../../ui/Slider';
 import { useTheme } from '../../hooks/use-theme';
 import { ART_PRESETS, InstanceArt, artPresetForSeed, artSeedFor, artSeedForPreset, nextArtSeed } from '../../art/InstanceArt';
 import { showConfirm } from '../../ui/Dialog';
 import { openContextMenu } from '../../ui/ContextMenu';
-import { instances, runningSessions, versions } from '../../store';
+import { config, instances, runningSessions, systemInfo, versions } from '../../store';
 import { navigate } from '../../ui-state';
 import { addInstance, removeInstance, selectInstance, updateInstanceInList } from '../../actions';
 import { launchGame, killGame } from '../../launch';
 import { api } from '../../api';
 import { toast } from '../../toast';
-import { errMessage } from '../../utils';
+import { errMessage, fmtMem, getMemoryRecommendation } from '../../utils';
 import type { EnrichedInstance, Version } from '../../types';
 import './instance.css';
 
@@ -120,7 +121,7 @@ function loaderLabel(v: Version | undefined): string {
 function WorldsCard({ inst, onOpenWorlds }: { inst: EnrichedInstance; onOpenWorlds: () => void }): JSX.Element {
   const count = inst.saves_count ?? 0;
   return (
-    <Card padding={22} class="cp-od-card">
+    <Card padding={22} class={`cp-od-card cp-od-worlds-card${count === 0 ? ' cp-od-worlds-card--empty' : ''}`}>
       <div class="cp-od-head">
         <h3>Worlds{count > 0 ? <span class="cp-od-head-count">· {count}</span> : null}</h3>
         <button class="cp-od-overflow" type="button" aria-label="More" onClick={(e) => openContextMenu(e, [
@@ -131,11 +132,13 @@ function WorldsCard({ inst, onOpenWorlds }: { inst: EnrichedInstance; onOpenWorl
       </div>
       {count === 0 ? (
         <div class="cp-od-worlds-empty">
+          <div class="cp-od-worlds-art" aria-hidden="true">
+            <img src="worlds_empty.svg" alt="" loading="lazy" draggable={false} />
+          </div>
           <div class="cp-od-worlds-lead">
-            <div class="cp-od-worlds-mark" aria-hidden="true"><Icon name="cube" size={18} stroke={1.7} /></div>
             <div class="cp-od-worlds-copy">
               <h4>No worlds yet</h4>
-              <p>Create a new world, import an existing save, or launch Minecraft and create one there.</p>
+              <p>Create a new world, import an existing save,<br />or launch Minecraft and create one there.</p>
             </div>
           </div>
           <div class="cp-od-worlds-cta">
@@ -230,59 +233,227 @@ function LogsCard({ inst, onOpenLogs }: { inst: EnrichedInstance; onOpenLogs: ()
   );
 }
 
+function QuickActionsCard({
+  running,
+  onLaunch,
+  onStop,
+  onOpenLogs,
+}: {
+  running: boolean;
+  onLaunch: () => void;
+  onStop: () => void;
+  onOpenLogs: () => void;
+}): JSX.Element {
+  return (
+    <Card padding={20} class="cp-od-card cp-od-quick-card">
+      <div class="cp-od-head">
+        <h3>Quick actions</h3>
+      </div>
+      <div class="cp-od-quick-grid">
+        <button
+          class="cp-od-quick-action"
+          type="button"
+          onClick={() => toast('Manual backups will land in a follow-up release')}
+        >
+          <span class="cp-od-quick-icon"><Icon name="archive" size={15} stroke={1.9} /></span>
+          <span class="cp-od-quick-copy">
+            <strong>Backup world</strong>
+            <span>Create a manual backup</span>
+          </span>
+        </button>
+        <button
+          class="cp-od-quick-action"
+          type="button"
+          disabled={!running}
+          onClick={() => {
+            onStop();
+            window.setTimeout(onLaunch, 450);
+          }}
+        >
+          <span class="cp-od-quick-icon"><Icon name="refresh" size={15} stroke={1.9} /></span>
+          <span class="cp-od-quick-copy">
+            <strong>Restart</strong>
+            <span>{running ? 'Restart the instance' : 'Available while running'}</span>
+          </span>
+        </button>
+        <button
+          class="cp-od-quick-action"
+          type="button"
+          data-tone="danger"
+          disabled={!running}
+          onClick={onStop}
+        >
+          <span class="cp-od-quick-icon"><Icon name="stop" size={15} stroke={1.9} /></span>
+          <span class="cp-od-quick-copy">
+            <strong>Stop</strong>
+            <span>{running ? 'Stop the instance' : 'Not running'}</span>
+          </span>
+        </button>
+        <button class="cp-od-quick-action" type="button" onClick={onOpenLogs}>
+          <span class="cp-od-quick-icon"><Icon name="terminal" size={15} stroke={1.9} /></span>
+          <span class="cp-od-quick-copy">
+            <strong>Open logs</strong>
+            <span>Inspect launch output</span>
+          </span>
+        </button>
+      </div>
+    </Card>
+  );
+}
+
 // ─── Performance — main-column quick-control card.
-// RAM allocation + preset + Java runtime. The slider edits local state;
-// Apply / Revert appear only when the value differs from what is saved on
-// the instance, so a stray drag never silently rewrites JVM heap. ──────
+// RAM allocation + preset + Java runtime. The slider writes on commit so
+// instance launch policy sees the same value after reboot. ─────────────
 
 type Preset = 'low' | 'balanced' | 'high' | 'custom';
-const PRESET_RAM: Record<Exclude<Preset, 'custom'>, number> = { low: 2, balanced: 6, high: 10 };
 
-function inferPreset(maxMem: number): Preset {
-  if (maxMem === PRESET_RAM.low) return 'low';
-  if (maxMem === PRESET_RAM.balanced) return 'balanced';
-  if (maxMem === PRESET_RAM.high) return 'high';
-  return 'custom';
+interface MemoryPreset {
+  id: Exclude<Preset, 'custom'>;
+  value: number;
+}
+
+interface MemoryProfile {
+  max: number;
+  recommended: [number, number];
+  presets: MemoryPreset[];
+}
+
+function roundHalf(value: number): number {
+  return Math.round(value * 2) / 2;
+}
+
+function memoryGb(valueMb: number | undefined, fallbackMb: number): number {
+  const mb = typeof valueMb === 'number' && valueMb > 0 ? valueMb : fallbackMb;
+  return Math.max(0.5, mb / 1024);
+}
+
+function clampMemoryGb(value: number, min: number, max: number): number {
+  return roundHalf(Math.max(min, Math.min(max, value)));
+}
+
+function systemMemoryMaxGb(savedGb: number, minGb: number): number {
+  const sys = systemInfo.value;
+  const detected = sys?.max_allocatable_gb || (sys?.total_memory_mb ? Math.floor(sys.total_memory_mb / 1024) : 16);
+  return Math.max(minGb, detected, Math.ceil(savedGb));
+}
+
+function systemMemoryRecommendationGb(totalGb: number, minGb: number): [number, number] {
+  const sys = systemInfo.value;
+  if (sys?.recommended_min_mb && sys.recommended_max_mb) {
+    const min = Math.max(minGb, roundHalf(sys.recommended_min_mb / 1024));
+    const max = Math.max(min, sys.recommended_max_mb / 1024);
+    return [min, clampMemoryGb(max, min, totalGb)];
+  }
+  const rec = getMemoryRecommendation(totalGb);
+  const low = Math.min(Math.max(minGb, rec.rec - 2), totalGb);
+  const high = Math.min(totalGb, Math.max(low, rec.rec + 2));
+  return [low, high];
+}
+
+function memoryProfileForInstance(inst: EnrichedInstance, savedGb: number, minGb: number): MemoryProfile {
+  const max = systemMemoryMaxGb(savedGb, minGb);
+  const recommended = systemMemoryRecommendationGb(max, minGb);
+  const [recMin, recMax] = recommended;
+  const modWeight = Math.min(4, Math.floor((inst.mods_count ?? 0) / 50));
+  const loaderWeight = versions.value.find(v => v.id === inst.version_id)?.loader ? 1 : 0;
+  const headroom = Math.max(0, max - minGb);
+  const estimatedSweetSpot = clampMemoryGb(
+    Math.max(((recMin + recMax) / 2) + loaderWeight + modWeight, recMin + (headroom * 0.2)),
+    minGb,
+    max,
+  );
+  const highHeadroom = Math.max(2, Math.min(8, Math.round(max * 0.12)));
+  const high = clampMemoryGb(Math.max(recMax, estimatedSweetSpot + highHeadroom, recMin + (headroom * 0.45)), minGb, max);
+
+  return {
+    max,
+    recommended,
+    presets: [
+      { id: 'low', value: clampMemoryGb(recMin, minGb, max) },
+      { id: 'balanced', value: estimatedSweetSpot },
+      { id: 'high', value: high },
+    ],
+  };
+}
+
+function inferPreset(maxMem: number, presets: MemoryPreset[]): Preset {
+  return presets.find(preset => preset.value === maxMem)?.id ?? 'custom';
 }
 
 function PerformanceCard({ inst, onOpenSettings }: { inst: EnrichedInstance; onOpenSettings: () => void }): JSX.Element {
   const RAM_MIN = 2;
-  const RAM_MAX = 16;
-  const REC_MIN = 4;
-  const REC_MAX = 8;
-  const saved = (inst.max_memory_mb ?? 4096) / 1024;
-  const [maxMem, setMaxMem] = useState<number>(saved);
+  const saved = memoryGb(inst.max_memory_mb, config.value?.max_memory_mb ?? 4096);
+  const memoryProfile = memoryProfileForInstance(inst, saved, RAM_MIN);
+  const ramMax = memoryProfile.max;
+  const [recMin, recMax] = memoryProfile.recommended;
+  const initialMem = clampMemoryGb(saved, RAM_MIN, ramMax);
+  const [maxMem, setMaxMem] = useState<number>(initialMem);
   const [saving, setSaving] = useState(false);
-  const savedRef = useRef(saved);
+  const savedRef = useRef(initialMem);
+  const saveRequestRef = useRef(0);
+  const saveTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     // If the persisted value changes (PUT elsewhere), realign local state.
-    if (saved !== savedRef.current) {
-      savedRef.current = saved;
-      setMaxMem(saved);
+    const nextSaved = clampMemoryGb(saved, RAM_MIN, ramMax);
+    if (nextSaved !== savedRef.current) {
+      savedRef.current = nextSaved;
+      setMaxMem(nextSaved);
     }
-  }, [saved]);
+  }, [ramMax, saved]);
 
-  const dirty = maxMem !== saved;
-  const apply = async (): Promise<void> => {
+  useEffect(() => {
+    return () => {
+      if (saveTimerRef.current !== null) window.clearTimeout(saveTimerRef.current);
+    };
+  }, []);
+
+  const saveMemory = async (nextMem: number): Promise<void> => {
+    const clampedMem = clampMemoryGb(nextMem, RAM_MIN, ramMax);
+    if (clampedMem === savedRef.current) return;
+    const requestId = saveRequestRef.current + 1;
+    saveRequestRef.current = requestId;
     setSaving(true);
     try {
-      const res: any = await api('PUT', `/instances/${encodeURIComponent(inst.id)}`, { max_memory_mb: Math.round(maxMem * 1024) });
+      const res: any = await api('PUT', `/instances/${encodeURIComponent(inst.id)}`, { max_memory_mb: Math.round(clampedMem * 1024) });
       if (res?.error) throw new Error(res.error);
+      if (requestId !== saveRequestRef.current) return;
+      savedRef.current = clampedMem;
       updateInstanceInList(res);
-      toast('Memory allocation saved');
     } catch (err) {
+      if (requestId !== saveRequestRef.current) return;
       toast(`Failed: ${errMessage(err)}`, 'error');
     } finally {
-      setSaving(false);
+      if (requestId === saveRequestRef.current) setSaving(false);
     }
   };
-  const revert = (): void => setMaxMem(saved);
 
-  const pct = ((maxMem - RAM_MIN) / (RAM_MAX - RAM_MIN)) * 100;
-  const recFrom = ((REC_MIN - RAM_MIN) / (RAM_MAX - RAM_MIN)) * 100;
-  const recTo = ((REC_MAX - RAM_MIN) / (RAM_MAX - RAM_MIN)) * 100;
-  const preset = inferPreset(maxMem);
+  const scheduleSaveMemory = (nextMem: number): void => {
+    const clampedMem = clampMemoryGb(nextMem, RAM_MIN, ramMax);
+    setMaxMem(clampedMem);
+    if (saveTimerRef.current !== null) window.clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = window.setTimeout(() => {
+      saveTimerRef.current = null;
+      void saveMemory(clampedMem);
+    }, 350);
+  };
+
+  const commitMemory = (nextMem: number): void => {
+    if (saveTimerRef.current !== null) {
+      window.clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = null;
+    }
+    void saveMemory(nextMem);
+  };
+
+  const preset = inferPreset(maxMem, memoryProfile.presets);
+  const highStart = Math.min(ramMax, Math.max(recMax, Math.round(ramMax * 0.75)));
+  const memoryZones: SliderZone[] = [
+    { from: RAM_MIN, to: recMin, tone: 'low', label: 'Low' },
+    { from: recMin, to: recMax, tone: 'sweet', label: 'Sweet spot' },
+    { from: recMax, to: highStart, tone: 'high', label: 'High' },
+    { from: highStart, to: ramMax, tone: 'extreme', label: 'Extreme' },
+  ];
 
   return (
     <Card padding={22} class="cp-od-card">
@@ -295,48 +466,39 @@ function PerformanceCard({ inst, onOpenSettings }: { inst: EnrichedInstance; onO
 
       <div class="cp-od-perf-row">
         <span class="cp-od-perf-key">Memory allocation</span>
-        <span class="cp-od-perf-val">{maxMem} GB</span>
+        <span class="cp-od-perf-val" aria-live="polite">{fmtMem(maxMem)}</span>
       </div>
       <div class="cp-od-perf-slider">
-        <span class="cp-od-perf-track" aria-hidden="true">
-          <span class="cp-od-perf-recommend" style={{ left: `${recFrom}%`, right: `${100 - recTo}%` }} />
-          <span class="cp-od-perf-fill" style={{ width: `${pct}%` }} />
-        </span>
-        <input
-          type="range"
+        <Slider
+          value={maxMem}
           min={RAM_MIN}
-          max={RAM_MAX}
+          max={ramMax}
           step={0.5}
-          value={String(maxMem)}
-          onInput={(e: any) => setMaxMem(parseFloat(e.currentTarget.value))}
-          aria-label="Memory allocation in gigabytes"
+          zones={memoryZones}
+          sound="memory"
+          onChange={scheduleSaveMemory}
+          onCommit={commitMemory}
+          ariaLabel="Memory allocation in gigabytes"
         />
-      </div>
-      <div class="cp-od-perf-caption">
-        <span class="cp-od-perf-hint">Recommended {REC_MIN}–{REC_MAX} GB</span>
-        {dirty && (
-          <div class="cp-od-perf-commit">
-            <button class="cp-od-link" type="button" onClick={revert} disabled={saving}>Revert</button>
-            <Button size="sm" variant="primary" onClick={apply} disabled={saving} sound="affirm">
-              {saving ? 'Saving…' : 'Apply'}
-            </Button>
-          </div>
-        )}
       </div>
 
       <div class="cp-od-perf-preset-row">
         <span class="cp-od-perf-key">Preset</span>
         <div class="cp-mini-seg" role="radiogroup" aria-label="Performance preset">
-          {(['low', 'balanced', 'high'] as const).map(p => (
+          {memoryProfile.presets.map(p => (
             <button
-              key={p}
+              key={p.id}
               type="button"
               role="radio"
-              aria-checked={preset === p}
-              data-active={preset === p}
-              onClick={() => setMaxMem(PRESET_RAM[p])}
+              aria-checked={preset === p.id}
+              data-active={preset === p.id}
+              onClick={() => {
+                const next = p.value;
+                setMaxMem(next);
+                commitMemory(next);
+              }}
             >
-              {p[0].toUpperCase() + p.slice(1)}
+              {p.id[0].toUpperCase() + p.id.slice(1)}
             </button>
           ))}
         </div>
@@ -434,9 +596,11 @@ function DetailsCard({ inst, running }: { inst: EnrichedInstance; running: boole
 
 // ─── Overview pane — original bento, Play replaces Summary ──────────────
 
-function OverviewPane({ inst, running, onOpenWorlds, onOpenLogs, onOpenSettings }: {
+function OverviewPane({ inst, running, onLaunch, onStop, onOpenWorlds, onOpenLogs, onOpenSettings }: {
   inst: EnrichedInstance;
   running: boolean;
+  onLaunch: () => void;
+  onStop: () => void;
   onOpenWorlds: () => void;
   onOpenLogs: () => void;
   onOpenSettings: () => void;
@@ -444,24 +608,29 @@ function OverviewPane({ inst, running, onOpenWorlds, onOpenLogs, onOpenSettings 
   return (
     <div class="cp-instance-body">
       <div class="cp-instance-main">
-        <div class="cp-od-stagger" style={{ '--cp-od-delay': '0ms' } as any}>
+        <div class="cp-od-stagger cp-od-worlds-slot" style={{ '--cp-od-delay': '0ms' } as any}>
           <WorldsCard inst={inst} onOpenWorlds={onOpenWorlds} />
         </div>
         <div class="cp-od-stagger" style={{ '--cp-od-delay': '80ms' } as any}>
           <PerformanceCard inst={inst} onOpenSettings={onOpenSettings} />
         </div>
         <div class="cp-od-stagger" style={{ '--cp-od-delay': '160ms' } as any}>
-          <ActivityCard inst={inst} onOpenLogs={onOpenLogs} />
-        </div>
-        <div class="cp-od-stagger" style={{ '--cp-od-delay': '240ms' } as any}>
-          <LogsCard inst={inst} onOpenLogs={onOpenLogs} />
+          <QuickActionsCard
+            running={running}
+            onLaunch={onLaunch}
+            onStop={onStop}
+            onOpenLogs={onOpenLogs}
+          />
         </div>
       </div>
       <div class="cp-instance-side">
         <div class="cp-od-stagger" style={{ '--cp-od-delay': '40ms' } as any}>
-          <MaintenanceCard />
+          <ActivityCard inst={inst} onOpenLogs={onOpenLogs} />
         </div>
         <div class="cp-od-stagger" style={{ '--cp-od-delay': '120ms' } as any}>
+          <MaintenanceCard />
+        </div>
+        <div class="cp-od-stagger" style={{ '--cp-od-delay': '200ms' } as any}>
           <DetailsCard inst={inst} running={running} />
         </div>
       </div>
@@ -569,8 +738,8 @@ function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
   const initialArtSeed = artSeedFor(inst);
   const [artSeed, setArtSeed] = useState<number>(initialArtSeed);
   const artPreset = artPresetForSeed(artSeed);
-  const [maxMem, setMaxMem] = useState<number>((inst.max_memory_mb ?? 4096) / 1024);
-  const [minMem, setMinMem] = useState<number>((inst.min_memory_mb ?? 1024) / 1024);
+  const [maxMem, setMaxMem] = useState<number>(memoryGb(inst.max_memory_mb, config.value?.max_memory_mb ?? 4096));
+  const [minMem, setMinMem] = useState<number>(memoryGb(inst.min_memory_mb, config.value?.min_memory_mb ?? 1024));
   const [width, setWidth] = useState<number>(inst.window_width ?? 854);
   const [height, setHeight] = useState<number>(inst.window_height ?? 480);
   const [javaPath, setJavaPath] = useState<string>(inst.java_path ?? '');
@@ -580,6 +749,11 @@ function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
   useEffect(() => {
     setMinMem(prev => Math.min(prev, maxMem));
   }, [maxMem]);
+
+  useEffect(() => {
+    setMaxMem(memoryGb(inst.max_memory_mb, config.value?.max_memory_mb ?? 4096));
+    setMinMem(memoryGb(inst.min_memory_mb, config.value?.min_memory_mb ?? 1024));
+  }, [inst.id, inst.max_memory_mb, inst.min_memory_mb]);
 
   const save = async (): Promise<void> => {
     setSaving(true);
@@ -766,7 +940,7 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
   const loaderVer = v?.loader?.loader_version ?? '';
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column' }}>
+    <div class={`cp-instance-page${tab === 'overview' ? ' cp-instance-page--overview' : ''}`}>
       <div class="cp-instance-cover">
         <InstanceArt instance={inst} aspect="banner" className="cp-instance-cover-art" />
         <div class="cp-instance-cover-vignette" aria-hidden="true" />
@@ -836,13 +1010,20 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
       </div>
 
       {tab === 'overview' && (
-        <OverviewPane
-          inst={inst}
-          running={running}
-          onOpenWorlds={() => setTab('worlds')}
-          onOpenLogs={() => setTab('logs')}
-          onOpenSettings={() => setTab('settings')}
-        />
+        <>
+          <OverviewPane
+            inst={inst}
+            running={running}
+            onLaunch={onPlay}
+            onStop={onStop}
+            onOpenWorlds={() => setTab('worlds')}
+            onOpenLogs={() => setTab('logs')}
+            onOpenSettings={() => setTab('settings')}
+          />
+          <div class="cp-instance-bottom">
+            <LogsCard inst={inst} onOpenLogs={() => setTab('logs')} />
+          </div>
+        </>
       )}
       {tab === 'mods' && <ModsPane inst={inst} />}
       {tab === 'worlds' && (
