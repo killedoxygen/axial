@@ -44,12 +44,22 @@ interface RenderInput {
   preset: ArtPreset;
   aspect: ArtAspect;
   dark: boolean;
+  renderSize?: RenderSize | null;
   versionIdentity?: VersionIdentity | null;
 }
 
 interface RenderSize {
   width: number;
   height: number;
+}
+
+interface RenderDetail {
+  fieldOctaves: number;
+  warpOctaves: number;
+  ridgeOctaves: number;
+  plumeOctaves: number;
+  orbitIterations: number;
+  motifScale: number;
 }
 
 const MAX_CACHE_BYTES = 32 * 1024 * 1024;
@@ -69,8 +79,18 @@ const SIZE_BY_ASPECT: Record<ArtAspect, RenderSize> = {
   banner: { width: 1024, height: 486 },
 };
 
+const MAX_PIXELS_BY_ASPECT: Record<ArtAspect, number> = {
+  thumb: 128 * 128,
+  square: 320 * 320,
+  banner: 800 * 240,
+};
+
 function clamp(value: number, min = 0, max = 1): number {
   return Math.max(min, Math.min(max, value));
+}
+
+function clampByte(value: number): number {
+  return Math.max(0, Math.min(255, Math.round(value)));
 }
 
 function lerp(a: number, b: number, t: number): number {
@@ -165,12 +185,12 @@ function fbm(x: number, y: number, seed: number, octaves: number): number {
   return value / total;
 }
 
-function ridged(x: number, y: number, seed: number): number {
-  const n = fbm(x, y, seed, 5);
+function ridged(x: number, y: number, seed: number, octaves: number): number {
+  const n = fbm(x, y, seed, octaves);
   return 1 - Math.abs(n * 2 - 1);
 }
 
-function fractalOrbit(x: number, y: number, seed: number): number {
+function fractalOrbit(x: number, y: number, seed: number, iterations: number): number {
   const angle = (seed % 6283) / 1000;
   const cx = Math.cos(angle) * 0.42 - 0.18;
   const cy = Math.sin(angle * 1.37) * 0.34;
@@ -179,14 +199,14 @@ function fractalOrbit(x: number, y: number, seed: number): number {
   let trap = 10;
   let escape = 0;
 
-  for (let i = 0; i < 10; i += 1) {
+  for (let i = 0; i < iterations; i += 1) {
     const xx = zx * zx - zy * zy + cx;
     const yy = 2 * zx * zy + cy;
     zx = xx;
     zy = yy;
     const radius = Math.sqrt(zx * zx + zy * zy);
     trap = Math.min(trap, Math.abs(radius - 0.72) + Math.abs(zx + zy) * 0.045);
-    if (radius > 2.6 && escape === 0) escape = i / 10;
+    if (radius > 2.6 && escape === 0) escape = i / iterations;
   }
 
   return clamp((1 - trap * 2.5) * 0.72 + escape * 0.28);
@@ -209,14 +229,15 @@ function softBand(distance: number, width: number): number {
   return Math.exp(-d * d);
 }
 
-function buildMotifs(rand: () => number, preset: ArtPreset, aspect: ArtAspect): FlowMotif[] {
-  const count = aspect === 'thumb'
+function buildMotifs(rand: () => number, preset: ArtPreset, aspect: ArtAspect, scale = 1): FlowMotif[] {
+  const baseCount = aspect === 'thumb'
     ? 2
     : preset === 'mineral' || preset === 'topo' || preset === 'dune'
       ? 5
       : preset === 'vapor'
         ? 6
         : 4;
+  const count = Math.max(1, Math.round(baseCount * scale));
   const wideFlow = preset === 'vapor' || preset === 'dune';
   const tightFlow = preset === 'topo' || preset === 'prism' || preset === 'orbit';
   return Array.from({ length: count }, (_, index) => ({
@@ -242,6 +263,7 @@ function integratedMotif(
   warpB: number,
   preset: ArtPreset,
   motifs: FlowMotif[],
+  detail: RenderDetail,
 ): { lift: number; shade: number; line: number } {
   let lift = 0;
   let shade = 0;
@@ -275,7 +297,7 @@ function integratedMotif(
     shade += facetB * 0.06;
     line += Math.min(facetA, facetB) * 0.08;
   } else if (preset === 'vapor') {
-    const plume = fbm(wx * 3.4 + field * 0.6, wy * 4.2 + warpA * 0.8, motifs[1]?.seed ?? 1, 3);
+    const plume = fbm(wx * 3.4 + field * 0.6, wy * 4.2 + warpA * 0.8, motifs[1]?.seed ?? 1, detail.plumeOctaves);
     const veil = softBand(plume - 0.56, 0.20);
     lift += veil * 0.18;
     shade += (1 - veil) * 0.035;
@@ -287,7 +309,7 @@ function integratedMotif(
     shade += slip * 0.075;
     line += slip * 0.045;
   } else if (preset === 'orbit') {
-    const orbit = fractalOrbit(wx + warpA * 0.24, wy + warpB * 0.24, motifs[0]?.seed ?? 1);
+    const orbit = fractalOrbit(wx + warpA * 0.24, wy + warpB * 0.24, motifs[0]?.seed ?? 1, detail.orbitIterations);
     const ring = softBand(orbit - 0.62, 0.18);
     lift += orbit * 0.13;
     shade += (1 - orbit) * 0.04;
@@ -345,22 +367,47 @@ function paletteFor(seed: number, preset: ArtPreset, dark: boolean): Palette {
   };
 }
 
-function sizeFor(aspect: ArtAspect): RenderSize {
-  return SIZE_BY_ASPECT[aspect];
+function sizeFor(input: Pick<RenderInput, 'aspect' | 'renderSize'>): RenderSize {
+  const max = SIZE_BY_ASPECT[input.aspect];
+  const requested = input.renderSize;
+  if (!requested) return max;
+  let width = Math.max(1, Math.min(max.width, Math.round(requested.width)));
+  let height = Math.max(1, Math.min(max.height, Math.round(requested.height)));
+  const pixels = width * height;
+  const pixelBudget = MAX_PIXELS_BY_ASPECT[input.aspect];
+  if (pixels > pixelBudget) {
+    const scale = Math.sqrt(pixelBudget / pixels);
+    width = Math.max(1, Math.round(width * scale));
+    height = Math.max(1, Math.round(height * scale));
+  }
+  return { width, height };
 }
 
 function cacheKey(input: RenderInput): string {
-  const { width, height } = sizeFor(input.aspect);
+  const { width, height } = sizeFor(input);
   const identity = input.versionIdentity;
-  const label = identity?.label.trim() ?? '';
   const lifecycle = identity?.lifecycleTrait ?? '';
   const loader = identity?.loaderTrait ?? '';
-  return `${input.seed}:${input.preset}:${input.aspect}:${input.dark ? 'd' : 'l'}:${width}x${height}:${label}:${lifecycle}:${loader}`;
+  return `${input.seed}:${input.preset}:${input.aspect}:${input.dark ? 'd' : 'l'}:${width}x${height}:${lifecycle}:${loader}`;
 }
 
 function cacheByteSize(input: RenderInput): number {
-  const { width, height } = sizeFor(input.aspect);
+  const { width, height } = sizeFor(input);
   return width * height * 4;
+}
+
+function detailFor(input: RenderInput, width: number, height: number): RenderDetail {
+  const pixels = width * height;
+  if (input.aspect === 'thumb' || pixels <= 24_000) {
+    return { fieldOctaves: 3, warpOctaves: 2, ridgeOctaves: 3, plumeOctaves: 2, orbitIterations: 5, motifScale: 0.55 };
+  }
+  if (pixels <= 90_000) {
+    return { fieldOctaves: 4, warpOctaves: 3, ridgeOctaves: 3, plumeOctaves: 3, orbitIterations: 6, motifScale: 0.75 };
+  }
+  if (pixels <= 180_000) {
+    return { fieldOctaves: 4, warpOctaves: 3, ridgeOctaves: 4, plumeOctaves: 3, orbitIterations: 8, motifScale: 0.90 };
+  }
+  return { fieldOctaves: 5, warpOctaves: 4, ridgeOctaves: 5, plumeOctaves: 4, orbitIterations: 10, motifScale: 1 };
 }
 
 function deleteCached(key: string): void {
@@ -386,43 +433,6 @@ function lightMask(x: number, y: number, lx: number, ly: number): number {
 
 function rgbCss(color: Rgb, alpha = 1): string {
   return `rgba(${Math.round(color.r)}, ${Math.round(color.g)}, ${Math.round(color.b)}, ${alpha})`;
-}
-
-function textHeight(metrics: TextMetrics, fontPx: number): number {
-  const measured = metrics.actualBoundingBoxAscent + metrics.actualBoundingBoxDescent;
-  return measured > 0 ? measured : fontPx * 0.72;
-}
-
-function fitVersionText(
-  ctx: CanvasRenderingContext2D,
-  label: string,
-  width: number,
-  height: number,
-): { fontPx: number; baselineY: number } | null {
-  const targetWidth = width * 0.82;
-  const targetHeight = height * 0.38;
-  const maxFont = width * 0.42;
-  const minFont = 72;
-  const fontFamily = 'Geist, ui-sans-serif, system-ui, -apple-system, sans-serif';
-
-  ctx.font = `800 ${Math.floor(maxFont)}px ${fontFamily}`;
-  let metrics = ctx.measureText(label);
-  const initialHeight = textHeight(metrics, maxFont);
-  const scale = Math.min(1, targetWidth / Math.max(1, metrics.width), targetHeight / Math.max(1, initialHeight));
-  const fontPx = Math.floor(maxFont * scale);
-  if (fontPx < minFont) return null;
-
-  ctx.font = `800 ${fontPx}px ${fontFamily}`;
-  metrics = ctx.measureText(label);
-  if (metrics.width > targetWidth) return null;
-  if (textHeight(metrics, fontPx) > targetHeight) return null;
-
-  const ascent = metrics.actualBoundingBoxAscent;
-  const descent = metrics.actualBoundingBoxDescent;
-  const baselineY = ascent + descent > 0
-    ? height / 2 + (ascent - descent) / 2
-    : height / 2;
-  return { fontPx, baselineY };
 }
 
 function drawPhaseSlices(
@@ -591,10 +601,9 @@ function drawVersionIdentity(
   if (input.aspect !== 'square') return;
   const identity = input.versionIdentity;
   if (!identity) return;
-  const label = identity.label.trim();
   const lifecycle = identity.lifecycleTrait ?? null;
   const loader = identity.loaderTrait ?? null;
-  if (!label && !lifecycle && !loader) return;
+  if (!lifecycle && !loader) return;
 
   ctx.save();
   const basin = ctx.createRadialGradient(width * 0.50, height * 0.50, width * 0.08, width * 0.50, height * 0.50, width * 0.48);
@@ -613,47 +622,11 @@ function drawVersionIdentity(
     drawProgressRing(ctx, width, height, palette, lifecycle === 'release_candidate');
   }
   if (loader) drawLoaderTrait(ctx, width, height, palette, loader);
-  if (!label) return;
-
-  const fitted = fitVersionText(ctx, label, width, height);
-  if (!fitted) return;
-
-  ctx.save();
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'alphabetic';
-  ctx.lineJoin = 'round';
-  ctx.miterLimit = 2;
-
-  const x = width / 2;
-  const y = fitted.baselineY;
-  const stroke = Math.max(5, fitted.fontPx * 0.050);
-  ctx.globalCompositeOperation = 'multiply';
-  ctx.lineWidth = stroke * 1.6;
-  ctx.strokeStyle = rgbCss(palette.shade, input.dark ? 0.56 : 0.30);
-  ctx.strokeText(label, x + fitted.fontPx * 0.018, y + fitted.fontPx * 0.022);
-
-  ctx.globalCompositeOperation = 'screen';
-  ctx.lineWidth = stroke;
-  ctx.strokeStyle = rgbCss(palette.glow, input.dark ? 0.34 : 0.24);
-  ctx.strokeText(label, x - fitted.fontPx * 0.012, y - fitted.fontPx * 0.014);
-
-  const fill = ctx.createLinearGradient(0, y - fitted.fontPx * 0.62, 0, y + fitted.fontPx * 0.18);
-  fill.addColorStop(0, rgbCss(palette.glow, input.dark ? 0.88 : 0.70));
-  fill.addColorStop(0.52, rgbCss(palette.mark, input.dark ? 0.82 : 0.74));
-  fill.addColorStop(1, rgbCss(palette.shade, input.dark ? 0.34 : 0.46));
-  ctx.globalCompositeOperation = 'source-over';
-  ctx.fillStyle = fill;
-  ctx.fillText(label, x, y);
-
-  ctx.globalCompositeOperation = 'multiply';
-  ctx.lineWidth = Math.max(1.5, fitted.fontPx * 0.016);
-  ctx.strokeStyle = rgbCss(palette.shade, input.dark ? 0.36 : 0.22);
-  ctx.strokeText(label, x, y);
-  ctx.restore();
 }
 
 function renderPixels(input: RenderInput): RenderedArt {
-  const { width, height } = sizeFor(input.aspect);
+  const { width, height } = sizeFor(input);
+  const detail = detailFor(input, width, height);
   const rand = rng(input.seed ^ hashStr(`${input.preset}:${input.aspect}:${input.dark ? 'dark' : 'light'}`));
   const palette = paletteFor(input.seed, input.preset, input.dark);
   const image = new ImageData(width, height);
@@ -667,24 +640,30 @@ function renderPixels(input: RenderInput): RenderedArt {
   const diagonal = rand() > 0.5 ? 1 : -1;
   const beamOffset = 0.20 + rand() * 0.18;
   const strataAngle = (rand() * 0.9 - 0.45) + (input.aspect === 'banner' ? 0.16 : -0.04);
-  const motifs = buildMotifs(rand, input.preset, input.aspect);
+  const strataCos = Math.cos(strataAngle);
+  const strataSin = Math.sin(strataAngle);
+  const invWidth = 1 / Math.max(1, width - 1);
+  const invHeight = 1 / Math.max(1, height - 1);
+  const motifs = buildMotifs(rand, input.preset, input.aspect, detail.motifScale);
 
   for (let py = 0; py < height; py += 1) {
-    const y = py / Math.max(1, height - 1);
+    const y = py * invHeight;
     for (let px = 0; px < width; px += 1) {
-      const x = px / Math.max(1, width - 1);
+      const x = px * invWidth;
       const ux = (x - 0.5) * stretch;
       const uy = y - 0.5;
-      const warpA = fbm(x * 2.2 + 13.1, y * 2.2 - 7.4, warpSeed, 4) - 0.5;
-      const warpB = fbm(x * 2.0 - 2.8, y * 2.0 + 17.6, warpSeed + 37, 4) - 0.5;
+      const warpA = fbm(x * 2.2 + 13.1, y * 2.2 - 7.4, warpSeed, detail.warpOctaves) - 0.5;
+      const warpB = fbm(x * 2.0 - 2.8, y * 2.0 + 17.6, warpSeed + 37, detail.warpOctaves) - 0.5;
       const wx = x + warpA * 0.22;
       const wy = y + warpB * 0.18;
 
-      let field = fbm(wx * 2.8 + diagonal * wy * 0.9, wy * 2.5 - diagonal * wx * 0.35, fieldSeed, 5);
-      const ridge = ridged(wx * 5.5 + wy * 1.4, wy * 5.1, detailSeed);
-      const strata = Math.sin((wx * Math.cos(strataAngle) + wy * Math.sin(strataAngle)) * Math.PI * 8 + warpA * 4);
+      let field = fbm(wx * 2.8 + diagonal * wy * 0.9, wy * 2.5 - diagonal * wx * 0.35, fieldSeed, detail.fieldOctaves);
+      const ridge = ridged(wx * 5.5 + wy * 1.4, wy * 5.1, detailSeed, detail.ridgeOctaves);
+      const strata = Math.sin((wx * strataCos + wy * strataSin) * Math.PI * 8 + warpA * 4);
       const beam = clamp(1 - Math.abs((x - y * 0.72 * diagonal) - beamOffset) * 2.5);
-      const glow = Math.exp(-(((x - light.x) ** 2) * 3.1 + ((y - light.y) ** 2) * 4.6));
+      const lightDx = x - light.x;
+      const lightDy = y - light.y;
+      const glow = Math.exp(-(lightDx * lightDx * 3.1 + lightDy * lightDy * 4.6));
       const vignette = clamp(1 - Math.sqrt(ux * ux + uy * uy) * 0.92);
 
       if (input.preset === 'mineral') {
@@ -697,13 +676,13 @@ function renderPixels(input: RenderInput): RenderedArt {
         const split = Math.sin((wx * -4.2 + wy * 4.8 + warpB * 2.5) * Math.PI) * 0.5 + 0.5;
         field = field * 0.45 + refraction * 0.24 + split * 0.16 + glow * 0.15;
       } else if (input.preset === 'vapor') {
-        const plume = fbm(wx * 1.7 + warpB, wy * 2.5 - warpA, detailSeed + 211, 4);
+        const plume = fbm(wx * 1.7 + warpB, wy * 2.5 - warpA, detailSeed + 211, detail.plumeOctaves);
         field = field * 0.38 + plume * 0.34 + glow * 0.20 + beam * 0.08;
       } else if (input.preset === 'dune') {
         const sediment = Math.sin((wy * 10.5 + wx * 1.2 + warpA * 1.8) * Math.PI) * 0.5 + 0.5;
         field = field * 0.48 + sediment * 0.24 + ridge * 0.14 + beam * 0.14;
       } else if (input.preset === 'orbit') {
-        const orbit = fractalOrbit(wx + warpA * 0.20, wy + warpB * 0.20, detailSeed);
+        const orbit = fractalOrbit(wx + warpA * 0.20, wy + warpB * 0.20, detailSeed, detail.orbitIterations);
         const halo = softBand(orbit - 0.58, 0.24);
         field = field * 0.42 + orbit * 0.24 + halo * 0.18 + glow * 0.16;
       } else if (input.preset === 'silk') {
@@ -715,7 +694,7 @@ function renderPixels(input: RenderInput): RenderedArt {
       }
 
       field = clamp(field * (0.82 + vignette * 0.26) + (input.dark ? -0.03 : 0.015));
-      const motif = integratedMotif(x, y, wx, wy, field, ridge, warpA, warpB, input.preset, motifs);
+      const motif = integratedMotif(x, y, wx, wy, field, ridge, warpA, warpB, input.preset, motifs, detail);
       field = clamp(field + motif.lift * 0.18 - motif.shade * 0.12);
       let color = paletteColor(palette.stops, field);
 
@@ -733,9 +712,9 @@ function renderPixels(input: RenderInput): RenderedArt {
       const grain = hash2(px, py, detailSeed) - 0.5;
       const grainAmount = input.aspect === 'banner' ? 7 : 5;
       const index = (py * width + px) * 4;
-      data[index] = clamp(Math.round(color.r + grain * grainAmount), 0, 255);
-      data[index + 1] = clamp(Math.round(color.g + grain * grainAmount), 0, 255);
-      data[index + 2] = clamp(Math.round(color.b + grain * grainAmount), 0, 255);
+      data[index] = clampByte(color.r + grain * grainAmount);
+      data[index + 1] = clampByte(color.g + grain * grainAmount);
+      data[index + 2] = clampByte(color.b + grain * grainAmount);
       data[index + 3] = 255;
     }
   }

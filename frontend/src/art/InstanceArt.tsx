@@ -25,6 +25,7 @@ interface ArtInput {
   preset: ArtPreset;
   dark: boolean;
   aspect: ArtAspect;
+  renderSize?: { width: number; height: number } | null;
   versionIdentity?: VersionIdentity | null;
 }
 
@@ -123,9 +124,20 @@ export function versionIdentityForVersion(version: VersionIdentitySource | null 
   return { label, lifecycleTrait, loaderTrait };
 }
 
-function drawArt(canvas: HTMLCanvasElement | null, input: ArtInput): void {
+function measuredRenderSize(root: HTMLDivElement | null): ArtInput['renderSize'] {
+  if (!root) return null;
+  const rect = root.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return null;
+  const ratio = Math.max(1, Math.min(window.devicePixelRatio || 1, 1.5));
+  return {
+    width: rect.width * ratio,
+    height: rect.height * ratio,
+  };
+}
+
+function drawArt(root: HTMLDivElement | null, canvas: HTMLCanvasElement | null, input: ArtInput): void {
   if (!canvas) return;
-  const art = renderInstanceArt(input);
+  const art = renderInstanceArt({ ...input, renderSize: input.renderSize ?? measuredRenderSize(root) });
   const ctx = canvas.getContext('2d');
   if (!ctx) return;
   canvas.width = art.width;
@@ -152,6 +164,7 @@ export function InstanceArt({
   versionIdentity?: VersionIdentity | null;
 }): JSX.Element {
   const theme = useTheme();
+  const rootRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const seed = artSeedFor(instance);
   const preset = artPresetForSeed(seed);
@@ -161,11 +174,12 @@ export function InstanceArt({
     : null;
 
   useLayoutEffect(() => {
-    drawArt(canvasRef.current, { seed, preset, dark: theme.dark, aspect, versionIdentity: identity });
+    drawArt(rootRef.current, canvasRef.current, { seed, preset, dark: theme.dark, aspect, versionIdentity: identity });
   }, [seed, preset, theme.dark, aspect, identity?.label, identity?.lifecycleTrait, identity?.loaderTrait]);
 
   return (
     <div
+      ref={rootRef}
       class={classValue}
       style={{ borderRadius: radius, ...style }}
       aria-hidden="true"
