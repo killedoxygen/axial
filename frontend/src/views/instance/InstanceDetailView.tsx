@@ -685,6 +685,47 @@ function OverviewPane({ inst, running, onLaunch, onStop, onOpenWorlds, onOpenLog
   );
 }
 
+function LaunchSplitButton({
+  inst,
+  onLaunch,
+  onOpenLogs,
+  onOpenSettings,
+}: {
+  inst: EnrichedInstance;
+  onLaunch: () => void;
+  onOpenLogs: () => void;
+  onOpenSettings: () => void;
+}): JSX.Element {
+  return (
+    <div class="cp-instance-split-launch" role="group" aria-label="Launch actions">
+      <button
+        class="cp-instance-split-launch-main"
+        type="button"
+        onClick={onLaunch}
+        data-sound="launchPress"
+      >
+        <Icon name="play" size={18} stroke={1.8} />
+        Launch
+      </button>
+      <button
+        class="cp-instance-split-launch-menu"
+        type="button"
+        aria-label="Launch options"
+        aria-haspopup="menu"
+        onClick={(e) => openContextMenu(e, [
+          { icon: 'play', label: 'Launch now', onSelect: onLaunch },
+          { icon: 'settings', label: 'Launch settings', onSelect: onOpenSettings },
+          { icon: 'terminal', label: 'View launch logs', onSelect: onOpenLogs },
+          { label: '', onSelect: () => {}, divider: true },
+          { icon: 'folder', label: 'Open instance folder', onSelect: () => void openInstanceFolder(inst.id) },
+        ])}
+      >
+        <Icon name="chevron-down" size={16} stroke={2.3} />
+      </button>
+    </div>
+  );
+}
+
 function PlaceholderPane({ title, hint, icon }: { title: string; hint: string; icon: string }): JSX.Element {
   const theme = useTheme();
   return (
@@ -1018,7 +1059,12 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
               {running ? (
                 <Button variant="secondary" size="lg" icon="stop" onClick={onStop}>Stop</Button>
               ) : (
-                <Button variant="primary" size="lg" icon="play" onClick={onPlay} sound="launchPress">Launch</Button>
+                <LaunchSplitButton
+                  inst={inst}
+                  onLaunch={onPlay}
+                  onOpenLogs={() => setTab('logs')}
+                  onOpenSettings={() => setTab('settings')}
+                />
               )}
             </div>
             <IconButton icon="folder" tooltip="Open folder"

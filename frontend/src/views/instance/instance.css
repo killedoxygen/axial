@@ -193,11 +193,6 @@
 .cp-instance-launch {
   margin-right: 4px;
 }
-/* Launch button — uses the native cp-btn--lg primary, no bespoke styling.
- * The only addition is a min-width so the action lands at ~132px and a
- * very subtle accent-tinted drop shadow so it seats against the dark
- * banner. Same radius family, font weight, and surface logic as every
- * other button in the app. */
 .cp-instance-launch .cp-btn--lg {
   min-width: 132px;
   padding: 0 22px;
@@ -209,6 +204,52 @@
   box-shadow:
     0 1px 0 oklch(0 0 0 / 0.18),
     0 10px 24px -18px rgba(0,0,0,0.45);
+}
+.cp-instance-split-launch {
+  display: inline-flex;
+  height: 44px;
+  min-width: 132px;
+  overflow: hidden;
+  border: 1px solid transparent;
+  border-radius: var(--r-md);
+  background: var(--accent-fill);
+  color: var(--accent-on);
+  box-shadow:
+    0 1px 0 oklch(0 0 0 / 0.18),
+    0 10px 24px -16px oklch(from var(--accent-fill) l c h / 0.55);
+}
+.cp-instance-split-launch button {
+  height: 100%;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  transition: background 120ms ease, transform 120ms ease;
+}
+.cp-instance-split-launch button:hover {
+  background: oklch(1 0 0 / 0.08);
+}
+.cp-instance-split-launch button:active {
+  transform: translateY(0.5px);
+}
+.cp-instance-split-launch-main {
+  min-width: 92px;
+  padding: 0 18px 0 20px;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.1px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+}
+.cp-instance-split-launch-menu {
+  width: 40px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-left: 1px solid oklch(1 0 0 / 0.28) !important;
 }
 .cp-instance-actions .cp-ibtn {
   color: oklch(1 0 0 / 0.62);
