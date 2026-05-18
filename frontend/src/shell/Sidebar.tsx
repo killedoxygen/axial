@@ -9,7 +9,7 @@ import { Music, musicStateVersion } from '../music';
 import { local, localStateVersion, saveLocalState } from '../state';
 import { Sound } from '../sound';
 
-function CommandTrigger(): JSX.Element {
+function CommandTrigger({ compact }: { compact: boolean }): JSX.Element {
   const isMac = typeof navigator !== 'undefined' && /Mac/i.test(navigator.platform);
   return (
     <button
@@ -19,7 +19,7 @@ function CommandTrigger(): JSX.Element {
       data-sound-silent="true"
       aria-label="Search and jump to"
     >
-      <Icon name="search" size={13} color="var(--text-mute)" />
+      <Icon name="search" size={compact ? 20 : 13} color="var(--text-mute)" />
       <span class="cp-sidebar-search-label">Search…</span>
       <span class="cp-sidebar-search-kbd"><Kbd>{isMac ? '⌘K' : 'Ctrl K'}</Kbd></span>
     </button>
@@ -51,6 +51,7 @@ function SidebarItemNode({ item, depth = 0, compact = false }: { item: SidebarIt
   const current = route.value;
   const active = isRouteActive(item.route, current);
   const childActive = !active && (item.children?.some(child => isItemActive(child, current)) ?? false);
+  const iconSize = compact ? 20 : (depth > 0 ? 15 : 17);
 
   return (
     <div class="cp-sidebar-branch" data-depth={depth}>
@@ -74,7 +75,7 @@ function SidebarItemNode({ item, depth = 0, compact = false }: { item: SidebarIt
             />
           </span>
         )}
-        <Icon name={item.icon} size={depth > 0 ? 15 : 17} stroke={1.7} />
+        <Icon name={item.icon} size={iconSize} stroke={compact ? 1.9 : 1.7} />
         <span class="cp-sidebar-label">{item.label}</span>
       </button>
       {item.children?.length ? (
@@ -264,7 +265,7 @@ export function Sidebar(): JSX.Element {
           </span>
         </button>
       </div>
-      <CommandTrigger />
+      <CommandTrigger compact={compact} />
       {mainGroups.map(g => (
         <div class="cp-sidebar-group" key={g.title}>
           <div class="cp-sidebar-group-title">{g.title}</div>
