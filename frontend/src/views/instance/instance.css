@@ -453,12 +453,15 @@
   width: min(144px, 100%);
   max-width: 100%;
 }
-.cp-od-worlds-art img {
+.cp-od-worlds-svg {
   display: block;
   width: 100%;
   height: auto;
   user-select: none;
   pointer-events: none;
+}
+.cp-od-worlds-accent {
+  stroke: var(--accent);
 }
 .cp-od-worlds-lead {
   display: flex;
