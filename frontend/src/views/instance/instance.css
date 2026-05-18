@@ -278,7 +278,7 @@
   background: transparent;
   color: var(--text-dim);
   font-size: 13px;
-  font-weight: 500;
+  font-weight: 600;
   cursor: pointer;
   border-radius: var(--r-sm);
   letter-spacing: -0.1px;
@@ -293,7 +293,6 @@
 .cp-instance-tabs button[data-active="true"] {
   background: var(--surface-2);
   color: var(--text);
-  font-weight: 600;
 }
 .cp-tab-count {
   font-size: 11px;
