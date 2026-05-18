@@ -398,7 +398,21 @@ function CreateWizard(): JSX.Element {
     };
     window.addEventListener('keydown', handler);
     return () => { window.removeEventListener('keydown', handler); };
-  }, [idx, step, stepValid, submitting, source, mcVersionId, selectedBuild, name]);
+  }, [
+    idx,
+    step,
+    stepValid,
+    submitting,
+    source,
+    mcVersionId,
+    selectedBuild,
+    name,
+    memoryGB,
+    previewSeed,
+    windowPresets,
+    windowPresetId,
+    jvmPreset,
+  ]);
 
   return (
     <div class="cp-cr-root">

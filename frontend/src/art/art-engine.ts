@@ -206,7 +206,10 @@ function fractalOrbit(x: number, y: number, seed: number, iterations: number): n
     zy = yy;
     const radius = Math.sqrt(zx * zx + zy * zy);
     trap = Math.min(trap, Math.abs(radius - 0.72) + Math.abs(zx + zy) * 0.045);
-    if (radius > 2.6 && escape === 0) escape = i / iterations;
+    if (radius > 2.6 && escape === 0) {
+      escape = i / iterations;
+      break;
+    }
   }
 
   return clamp((1 - trap * 2.5) * 0.72 + escape * 0.28);
