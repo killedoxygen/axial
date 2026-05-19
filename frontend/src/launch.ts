@@ -12,7 +12,7 @@ import {
 } from './store';
 import {
   clearLaunchNotice, confirmLaunch, endLaunchPrep, endSession, setLaunchNotice, startLaunch,
-  updateInstanceInList, updateRunningSessionState,
+  updateInstanceInList, updateLaunchPrep, updateRunningSessionState,
 } from './actions';
 import type { GuardianSummary, HealingEvent, LaunchHealingSummary } from './types';
 
@@ -316,6 +316,7 @@ export async function launchGame(): Promise<void> {
 
   clearLaunchNotice(inst.id);
   startLaunch(inst.id);
+  updateLaunchPrep(inst.id, 12, 'Checking running sessions');
   const launchAnimationFrameId: number | null = null;
 
   let launchCommitted = false;
@@ -324,6 +325,7 @@ export async function launchGame(): Promise<void> {
   try {
     const launchDraft = instanceLaunchDrafts.value[inst.id];
     if (launchDraft?.dirty) {
+      updateLaunchPrep(inst.id, 24, 'Saving launch overrides');
       const saved = await api('PUT', `/instances/${encodeURIComponent(inst.id)}`, {
         java_path: launchDraft.javaPath.trim(),
         jvm_preset: launchDraft.jvmPreset,
@@ -353,6 +355,7 @@ export async function launchGame(): Promise<void> {
       appendLog('system', `Applied pending launch overrides for ${inst.name}.`, inst.id, inst.name);
     }
 
+    updateLaunchPrep(inst.id, 46, 'Preparing launcher request');
     const res = await api('POST', '/launch', {
       instance_id: launchInst.id,
       username,
@@ -379,7 +382,9 @@ export async function launchGame(): Promise<void> {
       return;
     }
 
+    updateLaunchPrep(inst.id, 72, 'Starting Minecraft process');
     const launchedAt = res.launched_at || new Date().toISOString();
+    updateLaunchPrep(inst.id, 88, 'Connecting live launch events');
     confirmLaunch(inst.id, {
       sessionId: res.session_id,
       versionId: launchInst.version_id,

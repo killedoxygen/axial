@@ -324,6 +324,51 @@ export interface VersionInfo {
   shared_data: SharedDataInfo[];
 }
 
+// ── Instance resource detail ──
+
+export interface InstanceWorld {
+  name: string;
+  size: number;
+  modified_at: string;
+}
+
+export interface InstanceMod {
+  name: string;
+  size: number;
+  modified_at: string;
+  enabled: boolean;
+}
+
+export interface InstanceScreenshot {
+  name: string;
+  size: number;
+  modified_at: string;
+}
+
+export interface InstanceLogFile {
+  name: string;
+  size: number;
+  modified_at: string;
+}
+
+export interface InstanceResourceSummary {
+  worlds: InstanceWorld[];
+  mods: InstanceMod[];
+  screenshots: InstanceScreenshot[];
+  logs: InstanceLogFile[];
+  worlds_count: number;
+  mods_count: number;
+  screenshots_count: number;
+  logs_count: number;
+}
+
+export interface InstanceLogTail {
+  name: string;
+  size: number;
+  truncated: boolean;
+  text: string;
+}
+
 // ── UI types ──
 
 export type Page = 'launcher' | 'settings';

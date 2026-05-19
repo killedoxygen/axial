@@ -7,14 +7,20 @@ import { useTheme } from '../../hooks/use-theme';
 import { InstanceArt, artPresetForSeed, artSeedFor, nextArtSeed } from '../../art/InstanceArt';
 import { showConfirm } from '../../ui/Dialog';
 import { openContextMenu } from '../../ui/ContextMenu';
-import { config, instances, runningSessions, systemInfo, versions } from '../../store';
+import { config, instances, launchState, runningSessions, systemInfo, versions } from '../../store';
+import type { LaunchState } from '../../store';
 import { navigate } from '../../ui-state';
 import { addInstance, removeInstance, selectInstance, updateInstanceInList } from '../../actions';
 import { launchGame, killGame } from '../../launch';
 import { api } from '../../api';
 import { toast } from '../../toast';
 import { errMessage, fmtMem, getMemoryRecommendation } from '../../utils';
-import type { EnrichedInstance, Version } from '../../types';
+import type {
+  EnrichedInstance,
+  InstanceLogTail,
+  InstanceResourceSummary,
+  Version,
+} from '../../types';
 import {
   JVM_PRESET_HINTS,
   JVM_PRESET_LABELS,
@@ -23,9 +29,10 @@ import {
 } from '../create/jvm-presets';
 import './instance.css';
 
-async function openInstanceFolder(id: string): Promise<void> {
+async function openInstanceFolder(id: string, sub?: string): Promise<void> {
   try {
-    const res: any = await api('POST', `/instances/${encodeURIComponent(id)}/open-folder`);
+    const suffix = sub ? `?sub=${encodeURIComponent(sub)}` : '';
+    const res: any = await api('POST', `/instances/${encodeURIComponent(id)}/open-folder${suffix}`);
     if (res?.error) toast(`Failed: ${res.error}`, 'error');
   } catch (err) {
     toast(`Failed: ${errMessage(err)}`, 'error');
@@ -112,6 +119,71 @@ function fmtJoined(iso?: string): string {
   return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
 }
 
+function fmtBytes(bytes: number | undefined): string {
+  const value = typeof bytes === 'number' && Number.isFinite(bytes) ? bytes : 0;
+  if (value < 1024) return `${value} B`;
+  const units = ['KB', 'MB', 'GB'];
+  let next = value / 1024;
+  let index = 0;
+  while (next >= 1024 && index < units.length - 1) {
+    next /= 1024;
+    index += 1;
+  }
+  return `${next >= 10 ? next.toFixed(1) : next.toFixed(2)} ${units[index]}`;
+}
+
+type ResourceLoadState =
+  | { status: 'loading'; data: InstanceResourceSummary | null; error?: undefined }
+  | { status: 'ready'; data: InstanceResourceSummary; error?: undefined }
+  | { status: 'error'; data: InstanceResourceSummary | null; error: string };
+
+function emptyResources(): InstanceResourceSummary {
+  return {
+    worlds: [],
+    mods: [],
+    screenshots: [],
+    logs: [],
+    worlds_count: 0,
+    mods_count: 0,
+    screenshots_count: 0,
+    logs_count: 0,
+  };
+}
+
+async function fetchInstanceResources(id: string): Promise<InstanceResourceSummary> {
+  const res: any = await api('GET', `/instances/${encodeURIComponent(id)}/resources`);
+  if (res?.error) throw new Error(res.error);
+  return {
+    ...emptyResources(),
+    ...res,
+    worlds: Array.isArray(res?.worlds) ? res.worlds : [],
+    mods: Array.isArray(res?.mods) ? res.mods : [],
+    screenshots: Array.isArray(res?.screenshots) ? res.screenshots : [],
+    logs: Array.isArray(res?.logs) ? res.logs : [],
+  };
+}
+
+function ResourceStatus({
+  state,
+  onRetry,
+}: {
+  state: ResourceLoadState;
+  onRetry: () => void;
+}): JSX.Element | null {
+  if (state.status === 'loading' && !state.data) {
+    return <div class="cp-resource-note">Loading files…</div>;
+  }
+  if (state.status === 'error') {
+    return (
+      <div class="cp-resource-note cp-resource-note--error">
+        <span>{state.error}</span>
+        <Button variant="secondary" size="sm" icon="refresh" onClick={onRetry}>Retry</Button>
+      </div>
+    );
+  }
+  return null;
+}
+
 function loaderLabel(v: Version | undefined): string {
   if (!v?.loader) return 'Vanilla';
   const id = v.loader.component_id;
@@ -171,14 +243,24 @@ function WorldsEmptyArt(): JSX.Element {
   );
 }
 
-function WorldsCard({ inst, onOpenWorlds }: { inst: EnrichedInstance; onOpenWorlds: () => void }): JSX.Element {
-  const count = inst.saves_count ?? 0;
+function WorldsCard({
+  inst,
+  resources,
+  onOpenWorlds,
+}: {
+  inst: EnrichedInstance;
+  resources: InstanceResourceSummary | null;
+  onOpenWorlds: () => void;
+}): JSX.Element {
+  const worlds = resources?.worlds ?? [];
+  const count = resources?.worlds_count ?? inst.saves_count ?? 0;
+  const firstWorld = worlds[0];
   return (
     <Card padding={22} class={`cp-od-worlds-card${count === 0 ? ' cp-od-worlds-card--empty' : ''}`}>
       <div class="cp-od-head">
         <h3>Worlds{count > 0 ? <span class="cp-od-head-count">· {count}</span> : null}</h3>
         <button class="cp-od-overflow" type="button" aria-label="More" onClick={(e) => openContextMenu(e, [
-          { icon: 'folder', label: 'Open saves folder', onSelect: () => void openInstanceFolder(inst.id) },
+          { icon: 'folder', label: 'Open saves folder', onSelect: () => void openInstanceFolder(inst.id, 'saves') },
         ])}>
           <Icon name="dots" size={14} stroke={2} />
         </button>
@@ -195,8 +277,8 @@ function WorldsCard({ inst, onOpenWorlds }: { inst: EnrichedInstance; onOpenWorl
             </div>
           </div>
           <div class="cp-od-worlds-cta">
-            <Button icon="plus" onClick={onOpenWorlds} sound="affirm">Create world</Button>
-            <Button variant="ghost" icon="folder" onClick={() => void openInstanceFolder(inst.id)}>Import world</Button>
+            <Button icon="globe" onClick={onOpenWorlds} sound="affirm">View worlds</Button>
+            <Button variant="ghost" icon="folder" onClick={() => void openInstanceFolder(inst.id, 'saves')}>Import world</Button>
           </div>
         </div>
       ) : (
@@ -204,8 +286,10 @@ function WorldsCard({ inst, onOpenWorlds }: { inst: EnrichedInstance; onOpenWorl
           <div class="cp-od-world-row">
             <div class="cp-od-world-mark"><Icon name="globe" size={16} /></div>
             <div class="cp-od-world-body">
-              <div class="cp-od-world-name">{count} save{count === 1 ? '' : 's'} on disk</div>
-              <div class="cp-od-world-sub">Last touched {fmtRelative(inst.last_played_at)}</div>
+              <div class="cp-od-world-name">{firstWorld?.name || `${count} save${count === 1 ? '' : 's'} on disk`}</div>
+              <div class="cp-od-world-sub">
+                {firstWorld ? `${fmtBytes(firstWorld.size)} · changed ${fmtRelative(firstWorld.modified_at)}` : `Last touched ${fmtRelative(inst.last_played_at)}`}
+              </div>
             </div>
             <button class="cp-od-link" type="button" onClick={onOpenWorlds}>
               View all <Icon name="chevron-right" size={11} stroke={2.2} />
@@ -221,28 +305,31 @@ function WorldsCard({ inst, onOpenWorlds }: { inst: EnrichedInstance; onOpenWorl
 
 interface ActivityItem { label: string; relative: string }
 
-function ActivityCard({ inst, onOpenLogs }: { inst: EnrichedInstance; onOpenLogs: () => void }): JSX.Element {
-  const v = versions.value.find(x => x.id === inst.version_id);
+function ActivityCard({
+  inst,
+  resources,
+  onOpenLogs,
+}: {
+  inst: EnrichedInstance;
+  resources: InstanceResourceSummary | null;
+  onOpenLogs: () => void;
+}): JSX.Element {
   const events: ActivityItem[] = useMemo(() => {
     const out: ActivityItem[] = [];
-    const createdMs = new Date(inst.created_at).getTime();
     out.push({ label: 'Instance created', relative: fmtRelative(inst.created_at) });
-    if (v?.loader) {
-      const t = new Date(createdMs + 3000).toISOString();
-      out.push({
-        label: `Loader ${loaderLabel(v)}${v.loader.loader_version ? ` ${v.loader.loader_version}` : ''} attached`,
-        relative: fmtRelative(t),
-      });
-    }
-    if (inst.java_major) {
-      const t = new Date(createdMs + 6000).toISOString();
-      out.push({ label: `Java ${inst.java_major} environment detected`, relative: fmtRelative(t) });
-    }
     if (inst.last_played_at) {
       out.unshift({ label: 'Last launch session', relative: fmtRelative(inst.last_played_at) });
     }
+    const latestLog = resources?.logs[0];
+    if (latestLog) {
+      out.push({ label: `Latest log: ${latestLog.name}`, relative: fmtRelative(latestLog.modified_at) });
+    }
+    const latestWorld = resources?.worlds[0];
+    if (latestWorld) {
+      out.push({ label: `World changed: ${latestWorld.name}`, relative: fmtRelative(latestWorld.modified_at) });
+    }
     return out.slice(0, 3);
-  }, [inst.id, inst.created_at, inst.last_played_at, inst.java_major, v?.loader]);
+  }, [inst.id, inst.created_at, inst.last_played_at, resources]);
 
   return (
     <Card padding={22}>
@@ -268,8 +355,16 @@ function ActivityCard({ inst, onOpenLogs }: { inst: EnrichedInstance; onOpenLogs
 
 // ─── Logs — demoted to a compact card at the bottom of the main column ──
 
-function LogsCard({ inst, onOpenLogs }: { inst: EnrichedInstance; onOpenLogs: () => void }): JSX.Element {
-  const summary = inst.last_played_at ? 'Last launch · no errors' : 'No launch logs yet';
+function LogsCard({
+  resources,
+  onOpenLogs,
+}: {
+  resources: InstanceResourceSummary | null;
+  onOpenLogs: () => void;
+}): JSX.Element {
+  const latest = resources?.logs[0];
+  const count = resources?.logs_count ?? 0;
+  const summary = latest ? `${latest.name} · ${fmtRelative(latest.modified_at)}` : 'No launch logs on disk yet';
   return (
     <Card padding={16} class="cp-od-logs-card">
       <div class="cp-od-logs-summary">
@@ -279,7 +374,7 @@ function LogsCard({ inst, onOpenLogs }: { inst: EnrichedInstance; onOpenLogs: ()
           <span class="cp-od-logs-sub">{summary}</span>
         </div>
         <button class="cp-od-link" type="button" onClick={onOpenLogs}>
-          View logs <Icon name="chevron-right" size={11} stroke={2.2} />
+          {count > 0 ? `View ${count}` : 'View logs'} <Icon name="chevron-right" size={11} stroke={2.2} />
         </button>
       </div>
     </Card>
@@ -577,27 +672,31 @@ function MaintenanceCard(): JSX.Element {
       </div>
       <ul class="cp-od-maint-list">
         <li class="cp-od-maint-row">
-          <span class="cp-od-maint-icon" data-tone="ok"><Icon name="archive" size={14} stroke={1.8} /></span>
+          <span class="cp-od-maint-icon" data-tone="mute"><Icon name="archive" size={14} stroke={1.8} /></span>
           <div class="cp-od-maint-body">
-            <div class="cp-od-maint-title">Backups enabled</div>
-            <div class="cp-od-maint-sub">Daily at 03:00 · 7 day retention</div>
+            <div class="cp-od-maint-title">Backups</div>
+            <div class="cp-od-maint-sub">Not wired yet</div>
           </div>
-          <button class="cp-od-link" type="button" onClick={() => toast('Backups will land in a follow-up release')}>Manage</button>
+          {/* TODO: enable when the backend owns backup policy and snapshots. */}
+          <button class="cp-od-link" type="button" disabled>Manage</button>
         </li>
         <li class="cp-od-maint-row">
-          <span class="cp-od-maint-icon" data-tone="ok"><Icon name="shield-check" size={14} stroke={1.8} /></span>
+          <span class="cp-od-maint-icon" data-tone="mute"><Icon name="shield-check" size={14} stroke={1.8} /></span>
           <div class="cp-od-maint-body">
-            <div class="cp-od-maint-title">Integrity verified</div>
+            <div class="cp-od-maint-title">Integrity</div>
+            <div class="cp-od-maint-sub">Backend required</div>
           </div>
-          <button class="cp-od-link" type="button" onClick={() => toast('Integrity recheck is queued')}>Verify</button>
+          {/* TODO: enable when the backend exposes integrity checks. */}
+          <button class="cp-od-link" type="button" disabled>Verify</button>
         </li>
         <li class="cp-od-maint-row">
           <span class="cp-od-maint-icon" data-tone="mute"><Icon name="archive" size={14} stroke={1.8} /></span>
           <div class="cp-od-maint-body">
             <div class="cp-od-maint-title">Disk usage</div>
-            <div class="cp-od-maint-sub">Not measured</div>
+            <div class="cp-od-maint-sub">Backend required</div>
           </div>
-          <button class="cp-od-link" type="button" onClick={() => toast('Disk measurement will land in a follow-up release')}>Measure</button>
+          {/* TODO: enable when the backend exposes scoped disk measurement. */}
+          <button class="cp-od-link" type="button" disabled>Measure</button>
         </li>
       </ul>
     </Card>
@@ -649,8 +748,9 @@ function DetailsCard({ inst, running }: { inst: EnrichedInstance; running: boole
 
 // ─── Overview pane — original bento, Play replaces Summary ──────────────
 
-function OverviewPane({ inst, running, onLaunch, onStop, onOpenWorlds, onOpenLogs, onOpenSettings }: {
+function OverviewPane({ inst, resources, running, onLaunch, onStop, onOpenWorlds, onOpenLogs, onOpenSettings }: {
   inst: EnrichedInstance;
+  resources: InstanceResourceSummary | null;
   running: boolean;
   onLaunch: () => void;
   onStop: () => void;
@@ -662,7 +762,7 @@ function OverviewPane({ inst, running, onLaunch, onStop, onOpenWorlds, onOpenLog
     <div class="cp-instance-body">
       <div class="cp-instance-main">
         <div class="cp-od-stagger cp-od-worlds-slot" style={{ '--cp-od-delay': '0ms' } as any}>
-          <WorldsCard inst={inst} onOpenWorlds={onOpenWorlds} />
+          <WorldsCard inst={inst} resources={resources} onOpenWorlds={onOpenWorlds} />
         </div>
         <div class="cp-od-stagger" style={{ '--cp-od-delay': '80ms' } as any}>
           <PerformanceCard inst={inst} onOpenSettings={onOpenSettings} />
@@ -678,7 +778,7 @@ function OverviewPane({ inst, running, onLaunch, onStop, onOpenWorlds, onOpenLog
       </div>
       <div class="cp-instance-side">
         <div class="cp-od-stagger" style={{ '--cp-od-delay': '40ms' } as any}>
-          <ActivityCard inst={inst} onOpenLogs={onOpenLogs} />
+          <ActivityCard inst={inst} resources={resources} onOpenLogs={onOpenLogs} />
         </div>
         <div class="cp-od-stagger" style={{ '--cp-od-delay': '120ms' } as any}>
           <MaintenanceCard />
@@ -696,28 +796,40 @@ function LaunchSplitButton({
   onLaunch,
   onOpenLogs,
   onOpenSettings,
+  preparing,
 }: {
   inst: EnrichedInstance;
   onLaunch: () => void;
   onOpenLogs: () => void;
   onOpenSettings: () => void;
+  preparing: Extract<LaunchState, { status: 'preparing' }> | null;
 }): JSX.Element {
+  const label = preparing?.label || 'Launch';
+  const pct = preparing?.pct ?? 0;
   return (
-    <div class="cp-instance-split-launch" role="group" aria-label="Launch actions">
+    <div
+      class={`cp-instance-split-launch${preparing ? ' cp-instance-split-launch--preparing' : ''}`}
+      role="group"
+      aria-label="Launch actions"
+      style={{ '--cp-launch-pct': `${pct}%` } as any}
+    >
+      {preparing && <span class="cp-instance-split-launch-fill" aria-hidden="true" />}
       <button
         class="cp-instance-split-launch-main"
         type="button"
-        onClick={onLaunch}
+        onClick={preparing ? undefined : onLaunch}
         data-sound="launchPress"
+        disabled={Boolean(preparing)}
       >
-        <Icon name="play" size={18} stroke={1.8} />
-        Launch
+        <Icon name={preparing ? 'clock' : 'play'} size={18} stroke={1.8} />
+        <span>{label}</span>
       </button>
       <button
         class="cp-instance-split-launch-menu"
         type="button"
         aria-label="Launch options"
         aria-haspopup="menu"
+        disabled={Boolean(preparing)}
         onClick={(e) => openContextMenu(e, [
           { icon: 'play', label: 'Launch now', onSelect: onLaunch },
           { icon: 'settings', label: 'Launch settings', onSelect: onOpenSettings },
@@ -728,6 +840,7 @@ function LaunchSplitButton({
       >
         <Icon name="chevron-down" size={16} stroke={2.3} />
       </button>
+      {preparing && <span class="cp-instance-launch-status">{Math.round(pct)}%</span>}
     </div>
   );
 }
@@ -758,12 +871,25 @@ function PlaceholderPane({ title, hint, icon }: { title: string; hint: string; i
   );
 }
 
-type ModFilter = 'all' | 'enabled' | 'updates';
+type ModFilter = 'all' | 'enabled' | 'disabled';
 
-function ModsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
+function ModsPane({
+  inst,
+  resources,
+  onRefresh,
+}: {
+  inst: EnrichedInstance;
+  resources: ResourceLoadState;
+  onRefresh: () => void;
+}): JSX.Element {
   const [q, setQ] = useState('');
   const [filter, setFilter] = useState<ModFilter>('all');
-  const count = inst.mods_count ?? 0;
+  const mods = resources.data?.mods ?? [];
+  const filteredMods = mods.filter((mod) => {
+    const matchesSearch = mod.name.toLowerCase().includes(q.trim().toLowerCase());
+    const matchesFilter = filter === 'all' || (filter === 'enabled' ? mod.enabled : !mod.enabled);
+    return matchesSearch && matchesFilter;
+  });
 
   return (
     <div class="cp-instance-body" style={{ display: 'block' }}>
@@ -780,7 +906,7 @@ function ModsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
           />
         </div>
         <div class="cp-mini-seg" role="tablist" aria-label="Filter mods">
-          {(['all', 'enabled', 'updates'] as ModFilter[]).map(f => (
+          {(['all', 'enabled', 'disabled'] as ModFilter[]).map(f => (
             <button
               key={f}
               type="button"
@@ -793,11 +919,12 @@ function ModsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
             </button>
           ))}
         </div>
+        <Button variant="secondary" size="sm" icon="refresh" onClick={onRefresh}>Refresh</Button>
         <Button
           variant="soft"
           size="sm"
           icon="plus"
-          onClick={() => void openInstanceFolder(inst.id)}
+          onClick={() => void openInstanceFolder(inst.id, 'mods')}
         >
           Add mod
         </Button>
@@ -811,18 +938,215 @@ function ModsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
           <span>State</span>
           <span />
         </div>
-        {count === 0 ? (
+        <ResourceStatus state={resources} onRetry={onRefresh} />
+        {resources.status !== 'loading' && filteredMods.length === 0 ? (
           <div class="cp-mods-empty-row">
-            <strong>No mods installed in this instance</strong>
-            Drop jar files into the instance folder, or use Open folder above. In-app mod browsing is on the roadmap.
+            <strong>{mods.length === 0 ? 'No mods installed in this instance' : 'No mods match this filter'}</strong>
+            Drop jar files into the mods folder. In-app mod browsing and metadata are still backend-team work.
           </div>
         ) : (
-          <div class="cp-mods-empty-row">
-            <strong>{count} mod{count === 1 ? '' : 's'} loaded</strong>
-            Per-mod metadata streams in once the launcher indexes them — for now use Open folder to inspect.
-          </div>
+          filteredMods.map((mod) => (
+            <div class="cp-mods-table-row" data-disabled={!mod.enabled} key={mod.name}>
+              <span><Icon name="puzzle" size={15} color="var(--text-dim)" /></span>
+              <span class="cp-mods-file-icon">JAR</span>
+              <span class="cp-resource-name" title={mod.name}>{mod.name}</span>
+              <span>Local</span>
+              <span>{fmtBytes(mod.size)}</span>
+              <span>{mod.enabled ? 'Enabled' : 'Disabled'}</span>
+              <span />
+            </div>
+          ))
         )}
       </div>
+    </div>
+  );
+}
+
+function WorldsPane({
+  inst,
+  resources,
+  onRefresh,
+}: {
+  inst: EnrichedInstance;
+  resources: ResourceLoadState;
+  onRefresh: () => void;
+}): JSX.Element {
+  const worlds = resources.data?.worlds ?? [];
+  return (
+    <div class="cp-instance-body" style={{ display: 'block' }}>
+      <ResourceToolbar
+        title={`${worlds.length} world${worlds.length === 1 ? '' : 's'}`}
+        onRefresh={onRefresh}
+        action={{ icon: 'folder', label: 'Open saves', onClick: () => void openInstanceFolder(inst.id, 'saves') }}
+      />
+      <ResourceStatus state={resources} onRetry={onRefresh} />
+      {worlds.length === 0 && resources.status !== 'loading' ? (
+        <ResourceEmpty icon="globe" title="No saves yet" hint="Create a world in Minecraft or place an existing save in this instance's saves folder." />
+      ) : (
+        <div class="cp-resource-list">
+          {worlds.map((world) => (
+            <ResourceRow
+              key={world.name}
+              icon="globe"
+              name={world.name}
+              meta={`${fmtBytes(world.size)} · changed ${fmtRelative(world.modified_at)}`}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ScreenshotsPane({
+  inst,
+  resources,
+  onRefresh,
+}: {
+  inst: EnrichedInstance;
+  resources: ResourceLoadState;
+  onRefresh: () => void;
+}): JSX.Element {
+  const screenshots = resources.data?.screenshots ?? [];
+  return (
+    <div class="cp-instance-body" style={{ display: 'block' }}>
+      <ResourceToolbar
+        title={`${screenshots.length} screenshot${screenshots.length === 1 ? '' : 's'}`}
+        onRefresh={onRefresh}
+        action={{ icon: 'folder', label: 'Open screenshots', onClick: () => void openInstanceFolder(inst.id, 'screenshots') }}
+      />
+      <ResourceStatus state={resources} onRetry={onRefresh} />
+      {screenshots.length === 0 && resources.status !== 'loading' ? (
+        <ResourceEmpty icon="image" title="No screenshots yet" hint="Minecraft saves screenshots here after you capture them in game." />
+      ) : (
+        <div class="cp-screenshots-grid">
+          {screenshots.map((shot) => (
+            <div class="cp-screenshot-tile" key={shot.name}>
+              <div class="cp-screenshot-thumb" aria-hidden="true"><Icon name="image" size={22} /></div>
+              <div class="cp-screenshot-name" title={shot.name}>{shot.name}</div>
+              <div class="cp-screenshot-meta">{fmtBytes(shot.size)} · {fmtRelative(shot.modified_at)}</div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function LogsPane({
+  inst,
+  resources,
+  onRefresh,
+}: {
+  inst: EnrichedInstance;
+  resources: ResourceLoadState;
+  onRefresh: () => void;
+}): JSX.Element {
+  const logs = resources.data?.logs ?? [];
+  const [selected, setSelected] = useState<string>('');
+  const [tail, setTail] = useState<{ status: 'idle' | 'loading' | 'ready' | 'error'; data?: InstanceLogTail; error?: string }>({ status: 'idle' });
+
+  useEffect(() => {
+    if (!logs.length) {
+      setSelected('');
+      return;
+    }
+    if (!selected || !logs.some((log) => log.name === selected)) {
+      setSelected(logs[0].name);
+    }
+  }, [logs, selected]);
+
+  useEffect(() => {
+    if (!selected) {
+      setTail({ status: 'idle' });
+      return;
+    }
+    let alive = true;
+    setTail({ status: 'loading' });
+    api('GET', `/instances/${encodeURIComponent(inst.id)}/logs/${encodeURIComponent(selected)}`)
+      .then((res: InstanceLogTail & { error?: string }) => {
+        if (!alive) return;
+        if (res?.error) throw new Error(res.error);
+        setTail({ status: 'ready', data: res });
+      })
+      .catch((err) => {
+        if (alive) setTail({ status: 'error', error: errMessage(err) });
+      });
+    return () => { alive = false; };
+  }, [inst.id, selected]);
+
+  return (
+    <div class="cp-instance-body cp-logs-pane">
+      <ResourceToolbar
+        title={`${logs.length} log file${logs.length === 1 ? '' : 's'}`}
+        onRefresh={onRefresh}
+        action={{ icon: 'folder', label: 'Open logs', onClick: () => void openInstanceFolder(inst.id, 'logs') }}
+      />
+      <ResourceStatus state={resources} onRetry={onRefresh} />
+      {logs.length === 0 && resources.status !== 'loading' ? (
+        <ResourceEmpty icon="terminal" title="No logs yet" hint="Launch this instance and Minecraft log files will appear here." />
+      ) : (
+        <div class="cp-logs-layout">
+          <div class="cp-logs-list">
+            {logs.map((log) => (
+              <button key={log.name} type="button" data-active={selected === log.name} onClick={() => setSelected(log.name)}>
+                <span>{log.name}</span>
+                <small>{fmtBytes(log.size)} · {fmtRelative(log.modified_at)}</small>
+              </button>
+            ))}
+          </div>
+          <div class="cp-log-preview">
+            {tail.status === 'loading' && <div class="cp-resource-note">Loading log preview…</div>}
+            {tail.status === 'error' && <div class="cp-resource-note cp-resource-note--error">{tail.error}</div>}
+            {tail.status === 'ready' && (
+              <>
+                {tail.data?.truncated && <div class="cp-log-truncated">Showing the last {fmtBytes(tail.data.size > 0 ? Math.min(tail.data.size, 128 * 1024) : 0)} of this log.</div>}
+                <pre>{tail.data?.text || 'Log file is empty.'}</pre>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ResourceToolbar({
+  title,
+  onRefresh,
+  action,
+}: {
+  title: string;
+  onRefresh: () => void;
+  action: { icon: string; label: string; onClick: () => void };
+}): JSX.Element {
+  return (
+    <div class="cp-resource-toolbar">
+      <strong>{title}</strong>
+      <div>
+        <Button variant="secondary" size="sm" icon="refresh" onClick={onRefresh}>Refresh</Button>
+        <Button variant="soft" size="sm" icon={action.icon} onClick={action.onClick}>{action.label}</Button>
+      </div>
+    </div>
+  );
+}
+
+function ResourceEmpty({ icon, title, hint }: { icon: string; title: string; hint: string }): JSX.Element {
+  return (
+    <div class="cp-resource-empty">
+      <span><Icon name={icon} size={20} /></span>
+      <strong>{title}</strong>
+      <p>{hint}</p>
+    </div>
+  );
+}
+
+function ResourceRow({ icon, name, meta }: { icon: string; name: string; meta: string }): JSX.Element {
+  return (
+    <div class="cp-resource-row">
+      <span class="cp-resource-row-icon"><Icon name={icon} size={15} /></span>
+      <span class="cp-resource-name" title={name}>{name}</span>
+      <span class="cp-resource-meta">{meta}</span>
     </div>
   );
 }
@@ -1115,7 +1439,36 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
   const theme = useTheme();
   const inst = instances.value.find(i => i.id === id) as EnrichedInstance | undefined;
   const [tab, setTab] = useState<Tab>('overview');
+  const [resources, setResources] = useState<ResourceLoadState>({ status: 'loading', data: null });
   const running = inst ? !!runningSessions.value[inst.id] : false;
+  const launch = launchState.value;
+  const preparing = inst && launch.status === 'preparing' && launch.instanceId === inst.id ? launch : null;
+
+  const reloadResources = (): void => {
+    if (!inst) return;
+    setResources((current) => ({ status: 'loading', data: current.data ?? null }));
+    void fetchInstanceResources(inst.id)
+      .then((data) => setResources({ status: 'ready', data }))
+      .catch((err) => setResources((current) => ({
+        status: 'error',
+        data: current.data ?? null,
+        error: errMessage(err),
+      })));
+  };
+
+  useEffect(() => {
+    if (!inst) return;
+    let alive = true;
+    setResources({ status: 'loading', data: null });
+    void fetchInstanceResources(inst.id)
+      .then((data) => {
+        if (alive) setResources({ status: 'ready', data });
+      })
+      .catch((err) => {
+        if (alive) setResources({ status: 'error', data: null, error: errMessage(err) });
+      });
+    return () => { alive = false; };
+  }, [inst?.id]);
 
   if (!inst) {
     return (
@@ -1144,11 +1497,19 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
 
   const tabCount = (t: Tab): number | undefined => {
     if (t === 'mods') {
-      const n = inst.mods_count ?? 0;
+      const n = resources.data?.mods_count ?? inst.mods_count ?? 0;
       return n > 0 ? n : undefined;
     }
     if (t === 'worlds') {
-      const n = inst.saves_count ?? 0;
+      const n = resources.data?.worlds_count ?? inst.saves_count ?? 0;
+      return n > 0 ? n : undefined;
+    }
+    if (t === 'screenshots') {
+      const n = resources.data?.screenshots_count ?? 0;
+      return n > 0 ? n : undefined;
+    }
+    if (t === 'logs') {
+      const n = resources.data?.logs_count ?? 0;
       return n > 0 ? n : undefined;
     }
     return undefined;
@@ -1193,6 +1554,7 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
                   onLaunch={onPlay}
                   onOpenLogs={() => setTab('logs')}
                   onOpenSettings={() => setTab('settings')}
+                  preparing={preparing}
                 />
               )}
             </div>
@@ -1235,6 +1597,7 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
         <>
           <OverviewPane
             inst={inst}
+            resources={resources.data}
             running={running}
             onLaunch={onPlay}
             onStop={onStop}
@@ -1243,32 +1606,14 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
             onOpenSettings={() => setTab('settings')}
           />
           <div class="cp-instance-bottom">
-            <LogsCard inst={inst} onOpenLogs={() => setTab('logs')} />
+            <LogsCard resources={resources.data} onOpenLogs={() => setTab('logs')} />
           </div>
         </>
       )}
-      {tab === 'mods' && <ModsPane inst={inst} />}
-      {tab === 'worlds' && (
-        <PlaceholderPane
-          icon="globe"
-          title={inst.saves_count ? `${inst.saves_count} saves` : 'No saves yet'}
-          hint="World list and last played times will live here once the backend exposes them"
-        />
-      )}
-      {tab === 'screenshots' && (
-        <PlaceholderPane
-          icon="image"
-          title="Screenshots"
-          hint="Minecraft drops screenshots into the instance folder, we'll surface them here next"
-        />
-      )}
-      {tab === 'logs' && (
-        <PlaceholderPane
-          icon="terminal"
-          title="Logs"
-          hint="Launch logs stream in the main launcher surface for now"
-        />
-      )}
+      {tab === 'mods' && <ModsPane inst={inst} resources={resources} onRefresh={reloadResources} />}
+      {tab === 'worlds' && <WorldsPane inst={inst} resources={resources} onRefresh={reloadResources} />}
+      {tab === 'screenshots' && <ScreenshotsPane inst={inst} resources={resources} onRefresh={reloadResources} />}
+      {tab === 'logs' && <LogsPane inst={inst} resources={resources} onRefresh={reloadResources} />}
       {tab === 'settings' && <SettingsPane inst={inst} />}
     </div>
   );
