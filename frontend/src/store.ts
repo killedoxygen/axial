@@ -44,7 +44,7 @@ export const installEventSource = signal<{ close(): void } | null>(null);
 
 export type LaunchState =
   | { status: 'idle' }
-  | { status: 'preparing'; instanceId: string };
+  | { status: 'preparing'; instanceId: string; pct: number; label: string };
 
 export const launchState = signal<LaunchState>({ status: 'idle' });
 export const runningSessions = signal<Record<string, RunningSession>>({});

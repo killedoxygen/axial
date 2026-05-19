@@ -1,0 +1,1285 @@
+/* Create-instance: two steps. Step 1 picks, Step 2 names. */
+
+.cp-cr-root {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  color: var(--text);
+  animation: cp-cr-root-in 220ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+
+@keyframes cp-cr-root-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+/* ── Top stepper ──────────────────────────────────────────────────────── */
+
+.cp-cr-top {
+  flex-shrink: 0;
+  display: flex;
+  justify-content: center;
+  padding: 14px clamp(20px, 4vw, 40px) 0;
+}
+
+.cp-cr-stepper {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 4px;
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--surface-2) 80%, transparent);
+  border: 1px solid var(--line);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+.cp-cr-stepper-item {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 4px 12px;
+  border-radius: 999px;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  color: var(--text-mute);
+  cursor: default;
+  transition:
+    color 260ms cubic-bezier(0.2, 0.7, 0.2, 1),
+    background-color 260ms cubic-bezier(0.2, 0.7, 0.2, 1),
+    box-shadow 260ms cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+button.cp-cr-stepper-item { cursor: pointer; }
+button.cp-cr-stepper-item:hover {
+  color: var(--text-dim);
+  background: color-mix(in oklab, var(--surface) 50%, transparent);
+}
+button.cp-cr-stepper-item:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.cp-cr-stepper-item[data-state="past"]   { color: var(--text-dim); }
+.cp-cr-stepper-item[data-state="active"] {
+  color: var(--text);
+  background: var(--surface);
+  box-shadow: 0 1px 2px rgba(0,0,0,0.06);
+}
+
+.cp-cr-stepper-num {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.6px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-mute);
+  transition: color 260ms cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+.cp-cr-stepper-item[data-state="past"]   .cp-cr-stepper-num,
+.cp-cr-stepper-item[data-state="active"] .cp-cr-stepper-num { color: var(--accent); }
+
+.cp-cr-stepper-label {
+  font-size: 12.5px;
+  font-weight: 500;
+  letter-spacing: -0.1px;
+  white-space: nowrap;
+  transition: font-weight 220ms ease;
+}
+.cp-cr-stepper-item[data-state="active"] .cp-cr-stepper-label { font-weight: 600; }
+
+/* Separator hidden; the pill container provides spacing.
+ * Still rendered in DOM for backward-compat with the existing markup. */
+.cp-cr-stepper-sep { display: none; }
+
+/* ── Main canvas ──────────────────────────────────────────────────────── */
+
+.cp-cr-main {
+  flex: 1;
+  display: flex;
+  align-items: stretch;
+  justify-content: center;
+  padding: clamp(18px, 3vh, 32px) clamp(20px, 4vw, 40px) 0;
+  min-height: 0;
+}
+
+.cp-cr-canvas {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  min-height: 0;
+  animation: cp-cr-canvas-in 280ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+
+@keyframes cp-cr-canvas-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: none; }
+}
+
+.cp-cr-step {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  margin-inline: auto;
+  min-height: 0;
+}
+
+.cp-cr-step--pick {
+  max-width: 760px;
+  gap: 18px;
+  flex: 1;
+  justify-content: center;
+}
+
+/* Name step: centered vertically, breathes on tall viewports. The column
+ * is wider than the picker's 760 so the bento can host five tiles without
+ * the identity card clipping its meta row. */
+.cp-cr-step--name {
+  max-width: 900px;
+  gap: 20px;
+  flex: 1;
+  justify-content: center;
+  padding-bottom: clamp(20px, 4vh, 40px);
+}
+/* Keep the name input aligned with the bento grid below it. */
+.cp-cr-step--name .cp-cr-name-row { width: 100%; }
+.cp-cr-step--name .cp-cr-head { max-width: 640px; }
+
+.cp-cr-head {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.cp-cr-headline {
+  margin: 0;
+  font-size: clamp(22px, 2.6vw, 28px);
+  font-weight: 500;
+  letter-spacing: -0.5px;
+  line-height: 1.15;
+  color: var(--text);
+}
+.cp-cr-step--name .cp-cr-headline {
+  font-size: clamp(28px, 4.4vw, 40px);
+  letter-spacing: -0.7px;
+  line-height: 1.12;
+}
+
+.cp-cr-subline {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-dim);
+  line-height: 1.5;
+  letter-spacing: -0.05px;
+}
+.cp-cr-step--name .cp-cr-subline { font-size: 14px; line-height: 1.55; }
+
+/* ── Loader rail ──────────────────────────────────────────────────────── */
+
+.cp-cr-rail {
+  position: relative;
+  z-index: 4;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 0 0 10px;
+  border-bottom: 1px solid var(--line);
+}
+
+.cp-cr-rail-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  height: 38px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  border-radius: 10px;
+  font: inherit;
+  color: var(--text-dim);
+  cursor: pointer;
+  flex: 0 0 auto;
+  transition: color 160ms ease, background-color 160ms ease, box-shadow 160ms ease;
+}
+
+.cp-cr-rail-item::before {
+  content: '';
+  position: absolute;
+  left: 50%;
+  bottom: -11px;
+  width: 18px;
+  height: 2px;
+  border-radius: 999px;
+  background: var(--accent);
+  transform: translateX(-50%) scaleX(0);
+  transform-origin: center;
+  transition: transform 220ms cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+
+.cp-cr-rail-item::after {
+  content: attr(data-label) ' · ' attr(data-tag);
+  position: absolute;
+  left: 50%;
+  top: calc(100% + 10px);
+  max-width: min(240px, calc(100vw - 40px));
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.2;
+  letter-spacing: 0;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transform: translate(-50%, -4px);
+  transition: opacity 140ms ease, transform 180ms cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+
+.cp-cr-rail-item:hover { color: var(--text); background: var(--surface-2); }
+.cp-cr-rail-item:hover::after,
+.cp-cr-rail-item:focus-visible::after {
+  opacity: 1;
+  transform: translate(-50%, 0);
+}
+.cp-cr-rail-item:first-child::after {
+  left: 0;
+  transform: translate(0, -4px);
+}
+.cp-cr-rail-item:first-child:hover::after,
+.cp-cr-rail-item:first-child:focus-visible::after {
+  transform: translate(0, 0);
+}
+.cp-cr-rail-item:last-child::after {
+  right: 0;
+  left: auto;
+  transform: translate(0, -4px);
+}
+.cp-cr-rail-item:last-child:hover::after,
+.cp-cr-rail-item:last-child:focus-visible::after {
+  transform: translate(0, 0);
+}
+.cp-cr-rail-item:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.cp-cr-rail-item[data-active="true"] {
+  color: var(--text);
+  background:
+    linear-gradient(180deg,
+      color-mix(in oklab, var(--surface-3) 100%, transparent) 0%,
+      color-mix(in oklab, var(--surface-2) 100%, transparent) 100%);
+  box-shadow: inset 0 1px 0 0 color-mix(in oklab, var(--text) 6%, transparent);
+}
+.cp-cr-rail-item[data-active="true"]::before { transform: translateX(-50%) scaleX(1); }
+
+.cp-cr-rail-glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  background: var(--surface-2);
+  color: var(--text-dim);
+  flex-shrink: 0;
+  transition: background-color 160ms ease, color 160ms ease;
+}
+.cp-cr-loader-mark {
+  display: block;
+  flex-shrink: 0;
+  background-color: var(--text-mute);
+  opacity: 0.86;
+  -webkit-mask-image: var(--cp-loader-src);
+  mask-image: var(--cp-loader-src);
+  -webkit-mask-position: center;
+  mask-position: center;
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+  -webkit-mask-size: contain;
+  mask-size: contain;
+  transform: translate(var(--cp-loader-shift-x, 0), var(--cp-loader-shift-y, 0)) scale(var(--cp-loader-scale, 1));
+  transition: background-color 160ms ease, opacity 160ms ease, transform 160ms ease;
+}
+.cp-cr-loader-mark[data-loader="fabric"]   { --cp-loader-brand: #dbc8a0; }
+.cp-cr-loader-mark[data-loader="forge"]    { --cp-loader-brand: #60a5fa; }
+.cp-cr-loader-mark[data-loader="neoforge"] { --cp-loader-brand: #fb923c; --cp-loader-shift-x: 0.35px; }
+.cp-cr-loader-mark[data-loader="quilt"] {
+  --cp-loader-brand: #c084fc;
+  --cp-loader-scale: 0.9;
+  --cp-loader-shift-x: 0.6px;
+}
+.cp-cr-rail-item[data-active="true"] .cp-cr-rail-glyph {
+  background: color-mix(in oklab, var(--surface) 60%, transparent);
+  color: var(--text);
+}
+.cp-cr-rail-item:hover .cp-cr-loader-mark {
+  background-color: var(--text);
+  opacity: 0.96;
+}
+.cp-cr-rail-item[data-active="true"] .cp-cr-loader-mark {
+  background-color: var(--cp-loader-brand, var(--text));
+  opacity: 1;
+}
+.cp-cr-rail-item:hover .cp-cr-rail-glyph { color: var(--text); }
+
+.cp-cr-rail-item.is-soon {
+  cursor: not-allowed;
+  opacity: 0.5;
+  margin-left: 4px;
+}
+.cp-cr-rail-item.is-soon:hover { background: transparent; color: var(--text-dim); }
+
+/* ── Version pane ─────────────────────────────────────────────────────── */
+
+.cp-cr-vpane {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  gap: 12px;
+  flex: 0 1 auto;
+}
+
+.cp-cr-vbar {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.cp-cr-search {
+  flex: 1;
+  min-width: 160px;
+}
+.cp-cr-search .cp-field {
+  height: 36px;
+  padding: 0 12px;
+  border-radius: 9px;
+  background: var(--surface-2);
+}
+.cp-cr-search .cp-field input { font-size: 13px; }
+
+.cp-cr-channels {
+  display: inline-flex;
+  padding: 2px;
+  gap: 0;
+  background: var(--surface-2);
+  border-radius: 9px;
+  flex-shrink: 0;
+}
+
+.cp-cr-chan {
+  border: 0;
+  background: transparent;
+  color: var(--text-mute);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.1px;
+  padding: 6px 12px;
+  border-radius: 7px;
+  cursor: pointer;
+  transition: background-color 160ms ease, color 160ms ease;
+}
+.cp-cr-chan:hover { color: var(--text-dim); }
+.cp-cr-chan[data-active="true"] {
+  background: var(--surface);
+  color: var(--text);
+}
+.cp-cr-chan:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.cp-cr-vbody {
+  flex: 0 1 auto;
+  height: clamp(280px, 48vh, 460px);
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+  contain: content;
+  /* Horizon: bottom rows dissolve into the page bg + noise underneath
+   * in a wide elliptical curve. No coloured overlay anywhere; the
+   * fade body IS the page. */
+  mask-image:
+    radial-gradient(180% 60% at 50% 100%,
+      transparent 0%,
+      transparent 38%,
+      #000 70%,
+      #000 100%);
+  -webkit-mask-image:
+    radial-gradient(180% 60% at 50% 100%,
+      transparent 0%,
+      transparent 38%,
+      #000 70%,
+      #000 100%);
+}
+
+.cp-cr-vlist {
+  list-style: none;
+  margin: 0;
+  padding: 2px 4px 2px 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.cp-cr-vrow {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px 10px 14px;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  content-visibility: auto;
+  contain-intrinsic-size: 44px;
+  transition: background-color 140ms ease, color 140ms ease, box-shadow 200ms ease;
+  animation: cp-cr-row-in 320ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
+  animation-delay: calc((var(--i, 0) * 18ms) + 40ms);
+}
+
+@keyframes cp-cr-row-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: none; }
+}
+
+.cp-cr-vrow::before {
+  content: '';
+  position: absolute;
+  left: 4px;
+  top: 50%;
+  width: 2px;
+  height: 0;
+  border-radius: 999px;
+  background: var(--accent);
+  transform: translateY(-50%);
+  transition: height 220ms cubic-bezier(0.2, 0.7, 0.2, 1);
+  pointer-events: none;
+}
+
+.cp-cr-vrow + .cp-cr-vrow {
+  box-shadow: inset 0 1px 0 0 var(--line);
+}
+
+.cp-cr-vrow:hover { background: var(--surface-2); }
+.cp-cr-vrow:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.cp-cr-vrow[data-active="true"] {
+  background:
+    linear-gradient(90deg,
+      color-mix(in oklab, var(--accent) 9%, var(--surface-2)) 0%,
+      var(--surface-2) 52%);
+  box-shadow:
+    inset 0 1px 0 0 color-mix(in oklab, var(--text) 6%, transparent),
+    inset 0 -1px 0 0 var(--line);
+}
+.cp-cr-vrow[data-active="true"]::before { height: 18px; }
+.cp-cr-vrow[data-active="true"] + .cp-cr-vrow,
+.cp-cr-vrow:has(+ .cp-cr-vrow[data-active="true"]) { box-shadow: none; }
+
+.cp-cr-vrow-name {
+  font-size: 14px;
+  font-weight: 500;
+  letter-spacing: -0.1px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cp-cr-vrow[data-active="true"] .cp-cr-vrow-name { font-weight: 600; }
+
+.cp-cr-vrow-hint {
+  font-size: 11.5px;
+  color: var(--text-mute);
+  letter-spacing: 0.1px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.cp-cr-vrow-spacer { flex: 1; }
+
+.cp-cr-vrow-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: color-mix(in oklab, var(--ok, #4ade80) 80%, transparent);
+}
+
+.cp-cr-vrow-mark {
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-mute);
+  opacity: 0;
+  transform: translateX(-4px);
+  transition: opacity 140ms ease, transform 180ms cubic-bezier(0.2, 0.7, 0.2, 1), color 140ms ease;
+}
+.cp-cr-vrow:hover .cp-cr-vrow-mark { opacity: 0.7; transform: none; }
+.cp-cr-vrow[data-active="true"] .cp-cr-vrow-mark {
+  opacity: 1;
+  transform: none;
+  color: var(--accent);
+}
+
+/* ── State banners (loading, error, empty) ────────────────────────────── */
+
+.cp-cr-state {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 14px;
+  color: var(--text-mute);
+  font-size: 13px;
+}
+.cp-cr-state.is-error {
+  color: var(--text);
+  background: color-mix(in oklab, var(--err) 7%, transparent);
+  border: 1px solid color-mix(in oklab, var(--err) 25%, var(--line));
+  border-radius: 10px;
+  padding: 12px 14px;
+}
+.cp-cr-state.is-error > span { flex: 1; }
+.cp-cr-state.is-empty {
+  justify-content: flex-start;
+  font-style: italic;
+  opacity: 0.7;
+}
+
+.cp-cr-spinner {
+  width: 12px;
+  height: 12px;
+  border: 1.5px solid var(--text-mute);
+  border-top-color: transparent;
+  border-radius: 50%;
+  display: inline-block;
+  animation: cp-cr-spin 0.85s linear infinite;
+}
+
+@keyframes cp-cr-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* ── Loader build line (footer of version pane) ───────────────────────── */
+
+.cp-cr-build {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  padding: 8px 12px;
+  border-top: 1px solid var(--line);
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.cp-cr-build-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.cp-cr-build-key {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.6px;
+  color: var(--text-mute);
+  text-transform: uppercase;
+}
+.cp-cr-build-value {
+  font-size: 12.5px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Step 2: name input (onboarding-inspired sizing) ──────────────────── */
+
+.cp-cr-name-row {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.cp-cr-name-label {
+  font-size: 10.5px;
+  font-weight: 700;
+  color: var(--text-mute);
+  text-transform: uppercase;
+  letter-spacing: 0.7px;
+}
+
+.cp-cr-name-row .cp-field {
+  height: 52px;
+  padding: 0 18px;
+  border-radius: 14px;
+  transition: border-color 200ms ease, background-color 240ms ease;
+}
+.cp-cr-name-row .cp-field.cp-field--focused {
+  border-color: var(--text);
+  box-shadow: none;
+}
+.cp-cr-name-row .cp-field input {
+  font-size: 16px;
+  font-weight: 500;
+}
+
+/* ── Step 2: bento, identity (heavy) + memory + reroll + window ───────── */
+
+.cp-cr-bento {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  grid-template-rows: minmax(150px, 1fr) minmax(150px, 1fr);
+  gap: 12px;
+  width: 100%;
+  animation: cp-cr-bento-in 420ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+
+@keyframes cp-cr-bento-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: none; }
+}
+
+.cp-cr-tile {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--surface-2);
+  color: var(--text);
+  text-align: left;
+  font: inherit;
+  overflow: hidden;
+  transition:
+    background-color 200ms ease,
+    border-color 200ms ease,
+    transform 140ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+button.cp-cr-tile { cursor: pointer; }
+button.cp-cr-tile:hover { background: var(--surface-3); }
+button.cp-cr-tile:active { transform: scale(0.985); }
+button.cp-cr-tile:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.cp-cr-tile-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.cp-cr-tile-eyebrow {
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 1.3px;
+  text-transform: uppercase;
+  color: var(--text-mute);
+}
+.cp-cr-tile-reading {
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: -0.3px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.cp-cr-tile-hint {
+  margin-top: auto;
+  padding-top: 8px;
+  font-size: 11px;
+  color: var(--text-mute);
+  letter-spacing: 0.05px;
+  line-height: 1.4;
+}
+
+/* Identity tile spans 3 cols x 2 rows; the heaviest visual, and now wide
+ * enough that the meta grid never clips "Will download". */
+.cp-cr-tile--identity {
+  grid-column: 1 / span 3;
+  grid-row: 1 / span 2;
+  justify-content: space-between;
+  padding: 18px;
+  gap: 18px;
+  border-radius: 16px;
+  isolation: isolate;
+  animation: cp-cr-card-in 420ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+
+/* Memory tile spans 3 cols x 1 row, medium weight with interactive slider. */
+.cp-cr-tile--memory {
+  grid-column: 4 / span 3;
+  grid-row: 1;
+  gap: 6px;
+  justify-content: space-between;
+}
+.cp-cr-tile--memory .cp-slider {
+  margin: 4px 0 2px;
+}
+
+/* Reroll / Window / Profile: 1 col x 1 row each, light weight. */
+.cp-cr-tile--reroll,
+.cp-cr-tile--window,
+.cp-cr-tile--profile {
+  grid-row: 2;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+}
+.cp-cr-tile--reroll  { grid-column: 4; }
+.cp-cr-tile--window  { grid-column: 5; }
+.cp-cr-tile--profile { grid-column: 6; }
+
+.cp-cr-reroll-icon {
+  margin: 8px 0 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  background: color-mix(in oklab, var(--accent) 14%, var(--surface-3));
+  color: var(--accent);
+  transition: transform 320ms cubic-bezier(0.4, 0, 0.2, 1), background-color 200ms ease;
+}
+.cp-cr-tile--reroll:hover .cp-cr-reroll-icon {
+  transform: rotate(-90deg);
+  background: color-mix(in oklab, var(--accent) 22%, var(--surface-3));
+}
+.cp-cr-tile--reroll:active .cp-cr-reroll-icon {
+  transform: rotate(-180deg);
+}
+
+/* While the procedural canvas redraws, the reroll button gives loud feedback:
+ * the icon spins continuously, the bg pulses, and the label flips to
+ * "Rerolling" via the JSX. */
+.cp-cr-tile--reroll[data-rerolling="true"] {
+  background: color-mix(in oklab, var(--accent) 12%, var(--surface-2));
+  border-color: color-mix(in oklab, var(--accent) 28%, var(--line));
+}
+.cp-cr-tile--reroll[data-rerolling="true"] .cp-cr-reroll-icon {
+  background: color-mix(in oklab, var(--accent) 28%, var(--surface-3));
+  animation: cp-cr-reroll-spin 540ms cubic-bezier(0.4, 0, 0.2, 1);
+  transform: rotate(0deg);
+}
+@keyframes cp-cr-reroll-spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(-540deg); }
+}
+
+.cp-cr-reroll-label {
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.2px;
+  color: var(--text);
+}
+.cp-cr-reroll-sub {
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  color: var(--text-mute);
+  margin-top: 2px;
+}
+
+.cp-cr-window-frame {
+  position: relative;
+  margin: 10px 0 6px;
+  display: inline-block;
+  width: 46px;
+  height: 28px;
+  border: 1.5px solid var(--text-mute);
+  border-radius: 4px;
+  background: var(--surface-3);
+  overflow: hidden;
+}
+.cp-cr-window-frame::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 4px;
+  background: var(--text-mute);
+  opacity: 0.5;
+}
+.cp-cr-window-frame-inner {
+  position: absolute;
+  inset: 7px 4px 4px;
+  border-radius: 2px;
+  background: color-mix(in oklab, var(--accent) 38%, var(--surface));
+  transition: inset 220ms cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+/* Each preset gives a different inset so the inner rectangle visualises
+ * the relative size choice. Bigger preset = inner fills more of the frame. */
+.cp-cr-window-frame-inner[data-preset="default"] { inset: 10px 14px 10px; }
+.cp-cr-window-frame-inner[data-preset="hd"]      { inset: 9px 12px 8px; }
+.cp-cr-window-frame-inner[data-preset="fhd"]     { inset: 8px 9px 6px; }
+.cp-cr-window-frame-inner[data-preset="2k"]      { inset: 8px 6px 5px; }
+.cp-cr-window-frame-inner[data-preset="3k"]      { inset: 8px 5px 4px; }
+.cp-cr-window-frame-inner[data-preset="4k"]      { inset: 8px 3px 3px; }
+.cp-cr-window-frame-inner[data-preset="5k"]      { inset: 8px 2px 2px; }
+.cp-cr-window-label {
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.2px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.cp-cr-window-sub {
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 1.1px;
+  text-transform: uppercase;
+  color: var(--text-mute);
+  font-variant-numeric: tabular-nums;
+  margin-top: 2px;
+}
+
+/* Profile tile (JVM preset cycle). The glyph is a small bar-chart sized by
+ * the active preset so the icon itself communicates intensity. */
+.cp-cr-profile-glyph {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 28px;
+  margin: 10px 0 6px;
+}
+.cp-cr-profile-bar {
+  width: 6px;
+  border-radius: 2px;
+  background: color-mix(in oklab, var(--accent) 30%, var(--surface-3));
+  transition: height 240ms cubic-bezier(0.2, 0.7, 0.2, 1), background-color 220ms ease;
+}
+.cp-cr-profile-bar[data-bar="1"] { height: 8px; }
+.cp-cr-profile-bar[data-bar="2"] { height: 14px; }
+.cp-cr-profile-bar[data-bar="3"] { height: 20px; }
+.cp-cr-profile-bar[data-bar="4"] { height: 26px; }
+.cp-cr-tile--profile[data-profile="auto"]              .cp-cr-profile-bar { background: color-mix(in oklab, var(--accent) 22%, var(--surface-3)); }
+.cp-cr-tile--profile[data-profile="auto"]              .cp-cr-profile-bar[data-bar="1"],
+.cp-cr-tile--profile[data-profile="auto"]              .cp-cr-profile-bar[data-bar="2"] {
+  background: color-mix(in oklab, var(--accent) 60%, var(--surface-3));
+}
+.cp-cr-tile--profile[data-profile="smooth"]            .cp-cr-profile-bar { background: color-mix(in oklab, var(--accent) 22%, var(--surface-3)); }
+.cp-cr-tile--profile[data-profile="smooth"]            .cp-cr-profile-bar[data-bar="1"],
+.cp-cr-tile--profile[data-profile="smooth"]            .cp-cr-profile-bar[data-bar="2"],
+.cp-cr-tile--profile[data-profile="smooth"]            .cp-cr-profile-bar[data-bar="3"] {
+  background: var(--accent);
+}
+.cp-cr-tile--profile[data-profile="performance"]       .cp-cr-profile-bar { background: var(--accent); }
+.cp-cr-tile--profile[data-profile="ultra_low_latency"] .cp-cr-profile-bar { background: var(--accent); }
+.cp-cr-tile--profile[data-profile="ultra_low_latency"] .cp-cr-profile-bar[data-bar="4"] {
+  box-shadow: 0 0 8px color-mix(in oklab, var(--accent) 50%, transparent);
+}
+
+.cp-cr-profile-label {
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.2px;
+  color: var(--text);
+}
+.cp-cr-profile-sub {
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0;
+  color: var(--text-mute);
+  line-height: 1.35;
+  margin-top: 4px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+@keyframes cp-cr-card-in {
+  from { opacity: 0; transform: translateY(8px) scale(0.99); }
+  to   { opacity: 1; transform: none; }
+}
+
+.cp-cr-card-bg {
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+}
+.cp-cr-card-bg .cp-instance-art,
+.cp-cr-card-bg canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  filter: saturate(1.05);
+  animation: cp-cr-art-in 320ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+
+@keyframes cp-cr-art-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+/* Loading blob: non-blocking placeholder while the procedural art renders.
+ * A soft pulsing gradient that hints at the imminent image without locking
+ * the step transition behind a synchronous canvas draw. */
+.cp-cr-blob {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  background:
+    radial-gradient(70% 80% at 30% 35%,
+      color-mix(in oklab, var(--surface-3) 80%, transparent) 0%,
+      color-mix(in oklab, var(--surface-2) 90%, transparent) 60%,
+      var(--surface-2) 100%);
+  overflow: hidden;
+}
+.cp-cr-blob::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(110deg,
+    transparent 30%,
+    color-mix(in oklab, #fff 6%, transparent) 50%,
+    transparent 70%);
+  animation: cp-cr-blob-sheen 1400ms cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+.cp-cr-blob--avatar { border-radius: 14px; }
+.cp-cr-blob--slider {
+  position: relative;
+  height: 22px;
+  border-radius: 999px;
+  margin: 4px 0 2px;
+}
+
+@keyframes cp-cr-blob-sheen {
+  from { transform: translateX(-50%); }
+  to   { transform: translateX(50%); }
+}
+.cp-cr-card-veil {
+  position: absolute;
+  inset: 0;
+  background:
+    linear-gradient(180deg,
+      color-mix(in oklab, #000 22%, transparent) 0%,
+      color-mix(in oklab, #000 18%, transparent) 35%,
+      color-mix(in oklab, #000 68%, transparent) 100%),
+    radial-gradient(120% 80% at 0% 0%,
+      color-mix(in oklab, #fff 8%, transparent) 0%,
+      transparent 55%);
+}
+
+.cp-cr-card-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.cp-cr-card-avatar {
+  width: clamp(64px, 12vw, 80px);
+  height: clamp(64px, 12vw, 80px);
+  border-radius: 14px;
+  overflow: hidden;
+  flex-shrink: 0;
+  box-shadow:
+    0 0 0 1px color-mix(in oklab, #fff 20%, transparent),
+    0 0 0 4px color-mix(in oklab, #000 40%, transparent);
+  background: var(--surface);
+}
+.cp-cr-card-avatar .cp-instance-art,
+.cp-cr-card-avatar canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.cp-cr-card-stamp {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 9px;
+  border-radius: 6px;
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 1.4px;
+  text-transform: uppercase;
+  color: color-mix(in oklab, #fff 90%, transparent);
+  background: color-mix(in oklab, #000 32%, transparent);
+  border: 1px solid color-mix(in oklab, #fff 14%, transparent);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  white-space: nowrap;
+  align-self: flex-start;
+}
+.cp-cr-card-stamp-sep { opacity: 0.5; }
+.cp-cr-card-stamp-num { color: color-mix(in oklab, #fff 75%, transparent); }
+
+.cp-cr-card-foot {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: #fff;
+}
+
+.cp-cr-card-eyebrow {
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 1.6px;
+  text-transform: uppercase;
+  color: color-mix(in oklab, #fff 75%, transparent);
+  text-shadow: 0 1px 4px rgba(0,0,0,0.45);
+}
+
+.cp-cr-card-name {
+  margin: 0;
+  font-size: clamp(22px, 3vw, 28px);
+  font-weight: 600;
+  letter-spacing: -0.4px;
+  line-height: 1.15;
+  color: #fff;
+  text-shadow: 0 1px 8px rgba(0,0,0,0.4);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cp-cr-card-meta {
+  margin: 10px 0 0;
+  padding: 10px 0 0;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px 16px;
+  border-top: 1px solid color-mix(in oklab, #fff 16%, transparent);
+}
+
+.cp-cr-card-meta-col {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.cp-cr-card-meta dt {
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  color: color-mix(in oklab, #fff 60%, transparent);
+}
+.cp-cr-card-meta dd {
+  margin: 0;
+  font-size: 12.5px;
+  font-weight: 500;
+  letter-spacing: -0.05px;
+  color: color-mix(in oklab, #fff 95%, transparent);
+  font-variant-numeric: tabular-nums;
+  text-shadow: 0 1px 3px rgba(0,0,0,0.35);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cp-cr-card-meta-loader {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.cp-cr-card-meta-loader .cp-cr-loader-mark {
+  background-color: color-mix(in oklab, #fff 88%, transparent);
+  opacity: 1;
+}
+
+.cp-cr-card-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: 0.05px;
+  color: color-mix(in oklab, #fff 95%, transparent);
+}
+.cp-cr-card-status::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: color-mix(in oklab, #fff 80%, transparent);
+  box-shadow: 0 0 8px color-mix(in oklab, #fff 60%, transparent);
+}
+.cp-cr-card-status.is-ok::before {
+  background: var(--ok, #4ade80);
+  box-shadow: 0 0 8px color-mix(in oklab, var(--ok, #4ade80) 70%, transparent);
+}
+
+
+/* ── Footer (onboarding-pattern segmented nav) ────────────────────────── */
+
+.cp-cr-bottom {
+  position: relative;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 12px clamp(20px, 4vw, 40px) clamp(14px, 2.4vh, 22px);
+  /* No solid bg; the page bg + noise must continue through the footer
+   * so the masked picker dissolves into one continuous body of "void". */
+}
+
+
+.cp-cr-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.cp-cr-nav {
+  display: inline-flex;
+  padding: 4px;
+  gap: 4px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+}
+
+.cp-cr-navbtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 36px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-mute);
+  border-radius: 10px;
+  font: inherit;
+  cursor: not-allowed;
+  transition:
+    background-color 180ms ease,
+    color 180ms ease,
+    transform 140ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+.cp-cr-navbtn:not(:disabled) {
+  color: var(--text);
+  cursor: pointer;
+}
+.cp-cr-navbtn:not(:disabled):hover { background: var(--surface-3); }
+.cp-cr-navbtn:not(:disabled):active { transform: scale(0.94); }
+.cp-cr-navbtn:disabled { opacity: 0.35; }
+.cp-cr-navbtn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.cp-cr-footnote {
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.1px;
+  color: var(--text-mute);
+  pointer-events: none;
+  text-align: center;
+  opacity: 0.85;
+}
+
+/* ── Library blocker ──────────────────────────────────────────────────── */
+
+.cp-cr-blocker {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: clamp(48px, 10vh, 96px) 20px;
+  text-align: center;
+  color: var(--text);
+}
+.cp-cr-blocker h2 {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 500;
+  letter-spacing: -0.4px;
+}
+.cp-cr-blocker p {
+  margin: 0 0 6px;
+  color: var(--text-dim);
+  font-size: 14px;
+  max-width: 420px;
+  line-height: 1.5;
+}
+
+/* ── Tight viewports ──────────────────────────────────────────────────── */
+
+/* Mid widths: 6-col grid is preserved, padding tightens. */
+@media (max-width: 980px) and (min-width: 721px) {
+  .cp-cr-bento { grid-template-rows: minmax(140px, 1fr) minmax(140px, 1fr); }
+  .cp-cr-tile { padding: 12px; }
+  .cp-cr-tile--identity { padding: 14px; }
+}
+
+/* Narrow widths: collapse to a 3-col grid that keeps the identity wide and
+ * the three small tiles in a single row below memory. */
+@media (max-width: 720px) {
+  .cp-cr-top { padding-top: 12px; }
+  .cp-cr-main { padding: 16px 16px 0; }
+  .cp-cr-step--name { gap: 14px; padding-bottom: 16px; }
+  .cp-cr-bento {
+    grid-template-columns: repeat(3, 1fr);
+    grid-template-rows: auto auto auto;
+    gap: 10px;
+  }
+  .cp-cr-tile--identity {
+    grid-column: 1 / span 3;
+    grid-row: 1;
+    min-height: 230px;
+    padding: 14px;
+    gap: 14px;
+  }
+  .cp-cr-tile--memory {
+    grid-column: 1 / span 3;
+    grid-row: 2;
+  }
+  .cp-cr-tile--reroll  { grid-column: 1; grid-row: 3; }
+  .cp-cr-tile--window  { grid-column: 2; grid-row: 3; }
+  .cp-cr-tile--profile { grid-column: 3; grid-row: 3; }
+  .cp-cr-card-name { font-size: clamp(20px, 6vw, 24px); }
+  .cp-cr-bottom { padding: 10px 12px 12px; }
+}
+
+@media (max-height: 720px) {
+  .cp-cr-step--pick .cp-cr-headline,
+  .cp-cr-step--name .cp-cr-headline { font-size: clamp(20px, 3vw, 26px); }
+  .cp-cr-main { padding-top: 12px; }
+  .cp-cr-bento { grid-template-rows: minmax(128px, 1fr) minmax(128px, 1fr); }
+  .cp-cr-tile { padding: 12px; }
+  .cp-cr-tile--identity { padding: 14px; }
+  .cp-cr-step--name { gap: 14px; }
+}
+
+/* ── Reduced motion ───────────────────────────────────────────────────── */
+
+@media (prefers-reduced-motion: reduce) {
+  .cp-cr-root,
+  .cp-cr-root *,
+  .cp-cr-root *::before,
+  .cp-cr-root *::after {
+    animation: none !important;
+    transition: opacity 120ms linear, background-color 160ms linear, color 160ms linear !important;
+  }
+  .cp-cr-rail-item[data-active="true"]::before { transform: translateX(-50%) scaleX(1); }
+  .cp-cr-vrow[data-active="true"]::before { height: 18px; }
+}

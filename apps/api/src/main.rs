@@ -1,4 +1,4 @@
-use croopor_api::app::{build_router, default_frontend_dir};
+use croopor_api::app::{DEFAULT_API_PORT, build_router, default_frontend_dir};
 use croopor_api::state::{AppState, AppStateInit, InstallStore, SessionStore};
 use croopor_config::{ConfigStore, InstanceStore};
 use croopor_performance::PerformanceManager;
@@ -30,9 +30,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = std::env::var("CROOPOR_API_ADDR")
         .ok()
         .and_then(|value| value.parse::<SocketAddr>().ok())
-        .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 43_430)));
+        .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], DEFAULT_API_PORT)));
 
     let listener = TcpListener::bind(addr).await?;
+    let addr = listener.local_addr()?;
     info!("croopor api listening on http://{addr}");
 
     axum::serve(listener, build_router(state))

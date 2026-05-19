@@ -12,6 +12,8 @@ setup once
 
 daily
   ./dev dev                run desktop dev with rust + tauri
+  ./dev dev --target windows
+  ./dev dev:windows        run desktop dev as a Windows app from linux/wsl
   ./dev dev-web            run the frontend-only dev server
   ./dev watch              rebuild frontend assets on file changes
   ./dev check              run static checks
@@ -81,7 +83,29 @@ run_interruptible() {
 }
 
 run_frontend() {
-  corepack pnpm --dir "$ROOT/frontend" "$@"
+  pnpm --dir "$ROOT/frontend" "$@"
+}
+
+wait_for_frontend_dev_server() {
+  local url="http://127.0.0.1:3000"
+  local pid="${1:-}"
+
+  for _ in $(seq 1 120); do
+    if [ -n "$pid" ] && ! kill -0 "$pid" >/dev/null 2>&1; then
+      echo "frontend dev server exited before $url became ready" >&2
+      exit 1
+    fi
+    if command -v curl >/dev/null 2>&1 && curl -fsS --max-time 1 "$url" >/dev/null 2>&1; then
+      return
+    fi
+    if ! command -v curl >/dev/null 2>&1 && node -e "fetch(process.argv[1]).then(() => process.exit(0)).catch(() => process.exit(1))" "$url" >/dev/null 2>&1; then
+      return
+    fi
+    sleep 0.25
+  done
+
+  echo "frontend dev server did not become ready at $url" >&2
+  exit 1
 }
 
 windows_target_triple() {
@@ -139,7 +163,7 @@ run_doctor() {
   echo "rustfmt  $(cargo fmt --version 2>/dev/null || echo missing)"
   echo "clippy   $(cargo clippy --version 2>/dev/null || echo missing)"
   echo "node     $(node --version)"
-  echo "corepack $(corepack --version)"
+  echo "pnpm     $(pnpm --version)"
   if command -v task >/dev/null 2>&1; then
     echo "task     $(task --version)"
   else
@@ -263,6 +287,55 @@ run_desktop_build() {
   report_desktop_artifact "$profile" "$target"
 }
 
+run_desktop_dev() {
+  local target
+  target="$(resolve_build_target "$@")"
+
+  if [ "$target" = "$(windows_target_triple)" ]; then
+    ensure_windows_cross_target_ready
+  else
+    check_desktop_env
+  fi
+
+  local cargo_args=(run --locked -p croopor-desktop)
+  if [ -n "$target" ]; then
+    cargo_args+=(--target "$target")
+  fi
+
+  local frontend_pid=""
+  cleanup_desktop_dev() {
+    if [ -n "$frontend_pid" ] && kill -0 "$frontend_pid" >/dev/null 2>&1; then
+      kill -- "-$frontend_pid" >/dev/null 2>&1 || kill "$frontend_pid" >/dev/null 2>&1 || true
+      wait "$frontend_pid" >/dev/null 2>&1 || true
+    fi
+  }
+
+  trap cleanup_desktop_dev EXIT
+  if command -v setsid >/dev/null 2>&1; then
+    setsid env PORT=3000 CROOPOR_WEB_API_BASE="${CROOPOR_WEB_API_BASE:-http://127.0.0.1:43430}" pnpm --dir "$ROOT/frontend" run dev:desktop &
+  else
+    env PORT=3000 CROOPOR_WEB_API_BASE="${CROOPOR_WEB_API_BASE:-http://127.0.0.1:43430}" pnpm --dir "$ROOT/frontend" run dev:desktop &
+  fi
+  frontend_pid=$!
+
+  wait_for_frontend_dev_server "$frontend_pid"
+
+  local interrupted=0
+  trap 'interrupted=1; cleanup_desktop_dev' INT TERM
+  set +e
+  cargo "${cargo_args[@]}"
+  local status=$?
+  set -e
+  trap - INT TERM
+  cleanup_desktop_dev
+  trap - EXIT
+
+  if [ "$interrupted" -eq 1 ] || [ "$status" -eq 130 ]; then
+    exit 0
+  fi
+  exit "$status"
+}
+
 main() {
   local cmd="${1:-help}"
   shift || true
@@ -286,12 +359,14 @@ main() {
       run_doctor
       ;;
     dev|dev:desktop|dev-desktop|rust:desktop)
+      run_desktop_dev "$@"
+      ;;
+    dev:windows|dev-windows)
       if [ "$#" -ne 0 ]; then
         echo "$cmd does not accept extra arguments" >&2
         exit 1
       fi
-      check_desktop_env
-      run_interruptible cargo run --locked -p croopor-desktop
+      run_desktop_dev --target windows
       ;;
     rust:api)
       if [ "$#" -ne 0 ]; then
@@ -305,14 +380,18 @@ main() {
         echo "$cmd does not accept extra arguments" >&2
         exit 1
       fi
-      run_interruptible corepack pnpm --dir "$ROOT/frontend" run dev
+      (
+        export PORT="${PORT:-3000}"
+        export CROOPOR_WEB_API_BASE="${CROOPOR_WEB_API_BASE:-http://127.0.0.1:43430}"
+        run_interruptible pnpm --dir "$ROOT/frontend" run dev:desktop
+      )
       ;;
     watch|frontend:watch)
       if [ "$#" -ne 0 ]; then
         echo "$cmd does not accept extra arguments" >&2
         exit 1
       fi
-      run_interruptible corepack pnpm --dir "$ROOT/frontend" run watch
+      run_interruptible pnpm --dir "$ROOT/frontend" run watch
       ;;
     frontend:install)
       if [ "$#" -ne 0 ]; then

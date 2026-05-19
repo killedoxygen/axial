@@ -5,7 +5,7 @@ use axum::{
     http::StatusCode,
     routing::{get, put},
 };
-use croopor_config::AppConfig;
+use croopor_config::{AppConfig, ConfigStoreError};
 use serde::Deserialize;
 
 #[derive(Debug, Default, Deserialize)]
@@ -46,7 +46,7 @@ async fn handle_update_config(
     Json(patch): Json<ConfigPatch>,
 ) -> Result<Json<AppConfig>, (StatusCode, Json<serde_json::Value>)> {
     let mut next = state.config().current();
-    if let Some(username) = patch.username.filter(|value| !value.is_empty()) {
+    if let Some(username) = patch.username {
         next.username = username;
     }
     if let Some(max_memory_mb) = patch.max_memory_mb.filter(|value| *value > 0) {
@@ -109,6 +109,10 @@ async fn handle_update_config(
             state.set_library_dir(config.library_dir.clone());
             Ok(Json(config))
         }
+        Err(ConfigStoreError::Validation(error)) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )),
         Err(error) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": error.to_string() })),

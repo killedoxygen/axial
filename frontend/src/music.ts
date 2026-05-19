@@ -1,5 +1,5 @@
 import { signal } from '@preact/signals';
-import { api, API } from './api';
+import { api, apiUrl } from './api';
 import { byId } from './dom';
 
 const DEFAULT_TRACK_COUNT = 2;
@@ -133,7 +133,7 @@ export const Music = {
       audio.preload = 'none';
     }
     if (!this.ready) {
-      audio.src = `${API}/music/track?t=${this.track}`;
+      audio.src = apiUrl(`/music/track?t=${this.track}`);
       this.ready = true;
     }
     if (!audio.paused) return;
@@ -157,7 +157,7 @@ export const Music = {
     if (audio && !audio.paused) {
       startFade(0, () => {
         audio!.pause();
-        audio!.src = `${API}/music/track?t=${this.track}`;
+        audio!.src = apiUrl(`/music/track?t=${this.track}`);
         this.ready = true;
         this.play();
       });
@@ -203,7 +203,7 @@ export const Music = {
     }
     // Equalizer: visible only when actually producing audible output
     const audible = this.enabled && this.playing && !suppressed;
-    byId<HTMLElement>('music-eq')?.classList.toggle('hidden', !audible);
+    byId<HTMLElement>('music-eq')?.classList.toggle('cp-hidden', !audible);
 
     // Settings form (if open)
     const musicToggle = byId<HTMLInputElement>('music-toggle');

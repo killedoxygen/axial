@@ -1,10 +1,8 @@
-import { api, API } from './api';
-import { byId } from './dom';
+import { api, apiUrl } from './api';
 import { Sound } from './sound';
 import { Music } from './music';
 import { fmtMem, showError, appendLog, errMessage } from './utils';
-import { clearLaunchVisualState, startLaunchSequence, endLaunchSequence } from './effects';
-import { showConfirm } from './dialogs';
+import { showConfirm } from './ui/Dialog';
 import {
   hasNativeDesktopRuntime, nativeLaunchLogEventName, nativeLaunchStatusEventName,
   onNativeEvent, startNativeLaunchEvents,
@@ -14,7 +12,7 @@ import {
 } from './store';
 import {
   clearLaunchNotice, confirmLaunch, endLaunchPrep, endSession, setLaunchNotice, startLaunch,
-  updateInstanceInList, updateRunningSessionState,
+  updateInstanceInList, updateLaunchPrep, updateRunningSessionState,
 } from './actions';
 import type { GuardianSummary, HealingEvent, LaunchHealingSummary } from './types';
 
@@ -22,7 +20,7 @@ function rollbackLaunch(instanceId: string, animationFrameId: number | null): vo
   if (animationFrameId !== null) cancelAnimationFrame(animationFrameId);
   endSession(instanceId);
   if (Object.keys(runningSessions.value).length === 0) Music.unsuppress();
-  clearLaunchVisualState();
+
   endLaunchPrep();
 }
 
@@ -297,8 +295,9 @@ export async function launchGame(): Promise<void> {
   if (runningSessions.value[inst.id]) return;
   if (launchState.value.status === 'preparing') return;
 
-  const username = byId<HTMLInputElement>('username-input')?.value.trim() || 'Player';
-  const maxMemMB = Math.round(parseFloat(byId<HTMLInputElement>('memory-slider')?.value || '4') * 1024);
+  const cfg = config.value;
+  const username = cfg?.username || 'Player';
+  const maxMemMB = cfg?.max_memory_mb || 4096;
 
   const activeSessions = Object.values(runningSessions.value);
   if (activeSessions.length > 0) {
@@ -314,10 +313,11 @@ export async function launchGame(): Promise<void> {
   }
 
   Sound.init();
-  clearLaunchVisualState();
+
   clearLaunchNotice(inst.id);
   startLaunch(inst.id);
-  const launchAnimationFrameId = requestAnimationFrame(() => startLaunchSequence());
+  updateLaunchPrep(inst.id, 12, 'Checking running sessions');
+  const launchAnimationFrameId: number | null = null;
 
   let launchCommitted = false;
   let launchInst = inst;
@@ -325,6 +325,7 @@ export async function launchGame(): Promise<void> {
   try {
     const launchDraft = instanceLaunchDrafts.value[inst.id];
     if (launchDraft?.dirty) {
+      updateLaunchPrep(inst.id, 24, 'Saving launch overrides');
       const saved = await api('PUT', `/instances/${encodeURIComponent(inst.id)}`, {
         java_path: launchDraft.javaPath.trim(),
         jvm_preset: launchDraft.jvmPreset,
@@ -354,6 +355,7 @@ export async function launchGame(): Promise<void> {
       appendLog('system', `Applied pending launch overrides for ${inst.name}.`, inst.id, inst.name);
     }
 
+    updateLaunchPrep(inst.id, 46, 'Preparing launcher request');
     const res = await api('POST', '/launch', {
       instance_id: launchInst.id,
       username,
@@ -380,7 +382,9 @@ export async function launchGame(): Promise<void> {
       return;
     }
 
+    updateLaunchPrep(inst.id, 72, 'Starting Minecraft process');
     const launchedAt = res.launched_at || new Date().toISOString();
+    updateLaunchPrep(inst.id, 88, 'Connecting live launch events');
     confirmLaunch(inst.id, {
       sessionId: res.session_id,
       versionId: launchInst.version_id,
@@ -393,7 +397,7 @@ export async function launchGame(): Promise<void> {
     });
     launchCommitted = true;
     surfaceLaunchOutcome(res.guardian, res.healing, inst.id, inst.name);
-    endLaunchSequence();
+    
     Music.suppress();
     Sound.ui('launchSuccess');
     try {
@@ -509,7 +513,7 @@ async function connectLaunchEvents(sessionId: string, instanceId: string, instan
     return;
   }
 
-  const es = new EventSource(`${API}/launch/${sessionId}/events`);
+  const es = new EventSource(apiUrl(`/launch/${sessionId}/events`));
   es.addEventListener('status', (e: MessageEvent) => {
     onStatus(JSON.parse(e.data), es);
   });
@@ -535,8 +539,6 @@ function onGameExited(data: any, instanceId: string, instanceName: string, sessi
   endSession(instanceId);
 
   if (Object.keys(runningSessions.value).length === 0) Music.unsuppress();
-  if (selectedInstance.value?.id === instanceId) clearLaunchVisualState();
-
   appendLog('system', `${instanceName || instanceId} exited with code ${exitCode}`, instanceId, instanceName);
   if (typeof data.failure_class === 'string' && data.failure_class) {
     surfaceLaunchOutcome(

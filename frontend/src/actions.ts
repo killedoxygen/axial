@@ -61,7 +61,18 @@ export function setInstallEventSource(es: { close(): void } | null): void {
 // ── Launch state transitions ──
 
 export function startLaunch(instanceId: string): void {
-  launchState.value = { status: 'preparing', instanceId };
+  launchState.value = { status: 'preparing', instanceId, pct: 8, label: 'Preparing launch' };
+}
+
+export function updateLaunchPrep(instanceId: string, pct: number, label: string): void {
+  const current = launchState.value;
+  if (current.status !== 'preparing' || current.instanceId !== instanceId) return;
+  launchState.value = {
+    status: 'preparing',
+    instanceId,
+    pct: Math.max(current.pct, Math.max(0, Math.min(100, pct))),
+    label,
+  };
 }
 
 export function confirmLaunch(instanceId: string, session: RunningSession): void {

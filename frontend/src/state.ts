@@ -5,7 +5,6 @@ import type { LocalPrefs } from './types';
 
 export const STORAGE_KEY: string = 'croopor_ui';
 export const PRESET_HUES: Record<string, number> = { obsidian: 140, deepslate: 215, nether: 15, end: 268, birch: 100 };
-export const LOGO_BASE_HUE: number = 106;
 
 // ── Local preferences (localStorage-backed) ──
 
@@ -14,6 +13,7 @@ export const defaults: LocalPrefs = {
   customHue: 140,
   customVibrancy: 100,
   lightness: 0,
+  sidebarCompact: false,
   logHeight: 0,
   collapsedGroups: {},
   sidebarFilter: 'all',

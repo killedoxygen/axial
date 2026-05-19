@@ -52,7 +52,14 @@ pub enum ApiServerError {
 }
 
 pub async fn spawn_background(state: AppState) -> Result<ServerHandle, ApiServerError> {
-    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], DEFAULT_API_PORT))).await?;
+    spawn_background_on(state, SocketAddr::from(([127, 0, 0, 1], 0))).await
+}
+
+pub async fn spawn_background_on(
+    state: AppState,
+    addr: SocketAddr,
+) -> Result<ServerHandle, ApiServerError> {
+    let listener = TcpListener::bind(addr).await?;
     let addr = listener.local_addr()?;
     let router = build_router(state);
 

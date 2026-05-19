@@ -1,0 +1,295 @@
+import type { JSX } from 'preact';
+import { useEffect, useRef, useState } from 'preact/hooks';
+import { Icon } from '../ui/Icons';
+import { Kbd } from '../ui/Atoms';
+import { route, navigate, commandPaletteOpen, type Route } from '../ui-state';
+import { runningSessions, config } from '../store';
+import { promptPlayerName, savePlayerName } from '../player-name';
+import { Music, musicStateVersion } from '../music';
+import { local, localStateVersion, saveLocalState } from '../state';
+import { Sound } from '../sound';
+
+function CommandTrigger({ compact }: { compact: boolean }): JSX.Element {
+  const isMac = typeof navigator !== 'undefined' && /Mac/i.test(navigator.platform);
+  return (
+    <button
+      class="cp-sidebar-search"
+      onClick={() => { commandPaletteOpen.value = true; }}
+      title="Search and jump to"
+      data-sound-silent="true"
+      aria-label="Search and jump to"
+    >
+      <Icon name="search" size={compact ? 20 : 13} color="var(--text-mute)" />
+      <span class="cp-sidebar-search-label">Search…</span>
+      <span class="cp-sidebar-search-kbd"><Kbd>{isMac ? '⌘K' : 'Ctrl K'}</Kbd></span>
+    </button>
+  );
+}
+
+interface SidebarItem {
+  icon: string;
+  label: string;
+  route: Route;
+  showConnector?: boolean;
+  children?: SidebarItem[];
+}
+
+interface SidebarGroup { title: string; items: SidebarItem[]; }
+
+function isRouteActive(target: Route, current: Route): boolean {
+  if (target.name !== current.name) return false;
+  if ('id' in target || 'id' in current) return 'id' in target && 'id' in current && target.id === current.id;
+  return true;
+}
+
+function isItemActive(item: SidebarItem, current: Route): boolean {
+  if (isRouteActive(item.route, current)) return true;
+  return item.children?.some(child => isItemActive(child, current)) ?? false;
+}
+
+function isRouteInsideItem(target: Route, current: Route): boolean {
+  if (target.name === 'instances' && current.name === 'instance') return true;
+  return false;
+}
+
+function SidebarItemNode({ item, depth = 0, compact = false }: { item: SidebarItem; depth?: number; compact?: boolean }): JSX.Element {
+  const current = route.value;
+  const active = isRouteActive(item.route, current);
+  const childActive = !active && (
+    isRouteInsideItem(item.route, current)
+    || (item.children?.some(child => isItemActive(child, current)) ?? false)
+  );
+  const iconSize = compact ? 20 : (depth > 0 ? 15 : 17);
+
+  return (
+    <div class="cp-sidebar-branch" data-depth={depth}>
+      <button
+        class="cp-sidebar-item"
+        data-active={active}
+        data-child-active={childActive}
+        data-depth={depth}
+        onClick={() => navigate(item.route)}
+        title={compact ? item.label : undefined}
+        aria-label={item.label}
+      >
+        {depth > 0 && item.showConnector && (
+          <span class="cp-sidebar-tree-icon" aria-hidden="true">
+            <Icon
+              name="border-corner-rounded"
+              size={14}
+              stroke={1.35}
+              color="currentColor"
+              style={{ transform: 'scaleY(-1)' }}
+            />
+          </span>
+        )}
+        <Icon name={item.icon} size={iconSize} stroke={compact ? 1.9 : 1.7} />
+        <span class="cp-sidebar-label">{item.label}</span>
+      </button>
+      {item.children?.length ? (
+        <div class="cp-sidebar-children">
+          {item.children.map(child => <SidebarItemNode key={child.label} item={child} depth={depth + 1} compact={compact} />)}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function UserMenu({ onClose }: { onClose: () => void }): JSX.Element {
+  musicStateVersion.value;
+  const musicOn = Music.enabled;
+  const soundsOn = local.sounds;
+
+  const renameUser = async (): Promise<void> => {
+    const current = config.value?.username || 'Player';
+    const next = await promptPlayerName(current);
+    if (next) await savePlayerName(next);
+    onClose();
+  };
+
+  const toggleSounds = (): void => {
+    const next = !soundsOn;
+    local.sounds = next;
+    Sound.enabled = next;
+    saveLocalState();
+    if (next) Sound.ui('affirm');
+  };
+
+  const toggleMusic = (): void => {
+    Music.toggle();
+  };
+
+  const MenuRow = ({
+    icon, label, onSelect, hint, right,
+  }: {
+    icon: string;
+    label: string;
+    onSelect: () => void;
+    hint?: string;
+    right?: JSX.Element;
+  }): JSX.Element => (
+    <button class="cp-userm-row" onClick={onSelect}>
+      <Icon name={icon} size={15} stroke={1.8} />
+      <span class="cp-userm-label">{label}</span>
+      {hint && <span class="cp-userm-hint">{hint}</span>}
+      {right}
+    </button>
+  );
+
+  return (
+    <div class="cp-userm" role="menu">
+      <MenuRow icon="edit" label="Change display name" onSelect={renameUser} />
+      <MenuRow icon="user" label="Accounts and skins" onSelect={() => { navigate({ name: 'accounts' }); onClose(); }} />
+      <div class="cp-userm-divider" />
+      <MenuRow
+        icon={soundsOn ? 'volume' : 'volume-off'}
+        label="UI sounds"
+        onSelect={toggleSounds}
+        right={<span class="cp-userm-pill" data-on={soundsOn}>{soundsOn ? 'On' : 'Off'}</span>}
+      />
+      <MenuRow
+        icon={musicOn ? 'music' : 'music-off'}
+        label="Background music"
+        onSelect={toggleMusic}
+        right={<span class="cp-userm-pill" data-on={musicOn}>{musicOn ? 'On' : 'Off'}</span>}
+      />
+      <div class="cp-userm-divider" />
+      <MenuRow icon="settings" label="Open settings" onSelect={() => { navigate({ name: 'settings' }); onClose(); }} hint="Ctrl ," />
+    </div>
+  );
+}
+
+function UserTrigger({ compact }: { compact: boolean }): JSX.Element {
+  const [open, setOpen] = useState(false);
+  const username = (config.value?.username || 'Player').slice(0, 24);
+  const initial = username[0]?.toUpperCase() || 'P';
+  const running = Object.keys(runningSessions.value).length;
+  const rootRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onClick = (e: MouseEvent): void => {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent): void => { if (e.key === 'Escape') setOpen(false); };
+    document.addEventListener('mousedown', onClick);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onClick);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [open]);
+
+  return (
+    <div class="cp-user-shell" ref={rootRef}>
+      {open && <UserMenu onClose={() => setOpen(false)} />}
+      <button
+        class="cp-sidebar-user"
+        type="button"
+        data-open={open}
+        data-compact={compact}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={() => setOpen(o => !o)}
+        title={compact ? username : undefined}
+      >
+        <div class="cp-avatar">{initial}</div>
+        <div class="cp-sidebar-user-body">
+          <div class="cp-sidebar-user-name">{username}</div>
+          <div class="cp-sidebar-user-sub">{running > 0 ? `${running} playing` : 'online'}</div>
+        </div>
+        {!compact && (
+          <Icon name="chevron-up" size={14} color="var(--text-mute)" style={{
+            transform: open ? 'rotate(0deg)' : 'rotate(180deg)',
+            transition: 'transform 160ms ease',
+          }} />
+        )}
+      </button>
+    </div>
+  );
+}
+
+export function Sidebar(): JSX.Element {
+  localStateVersion.value;
+  const compact = local.sidebarCompact;
+
+  const toggleSidebarMode = (): void => {
+    local.sidebarCompact = !local.sidebarCompact;
+    saveLocalState();
+  };
+
+  const mainGroups: SidebarGroup[] = [
+    {
+      title: 'Play',
+      items: [
+        { icon: 'home', label: 'Home', route: { name: 'home' } },
+        {
+          icon: 'cube',
+          label: 'Instances',
+          route: { name: 'instances' },
+          children: [
+            { icon: 'plus', label: 'New', route: { name: 'create' }, showConnector: false },
+          ],
+        },
+      ],
+    },
+    {
+      title: 'Discover',
+      items: [
+        { icon: 'compass', label: 'Browse', route: { name: 'browse' } },
+      ],
+    },
+  ];
+
+  const utilityItems: SidebarItem[] = [
+    { icon: 'user', label: 'Accounts & skins', route: { name: 'accounts' } },
+    { icon: 'settings', label: 'Settings', route: { name: 'settings' } },
+  ];
+
+  const compactItems = (items: SidebarItem[]): SidebarItem[] => items.flatMap(item => {
+    if (!compact || !item.children?.length) return [item];
+    return [
+      { ...item, children: undefined },
+      ...item.children.map(child => ({ ...child, children: undefined })),
+    ];
+  });
+
+  return (
+    <aside class="cp-sidebar" data-compact={compact}>
+      <div class="cp-sidebar-brand">
+        <div class="cp-sidebar-brand-lockup">
+          <img class="cp-logo" src="logo.png" alt="" width="22" height="22" />
+          <span class="cp-brand-name">Croopor</span>
+        </div>
+        <button
+          class="cp-sidebar-mode"
+          type="button"
+          onClick={toggleSidebarMode}
+          title={compact ? 'Expand sidebar' : 'Compact sidebar'}
+          aria-label={compact ? 'Expand sidebar' : 'Compact sidebar'}
+        >
+          <span class="cp-sidebar-mode-icon" aria-hidden="true">
+            <Icon name="chevron-left" size={16} stroke={1.9} />
+          </span>
+        </button>
+      </div>
+      <CommandTrigger compact={compact} />
+      {mainGroups.map(g => (
+        <div class="cp-sidebar-group" key={g.title}>
+          <div class="cp-sidebar-group-title">{g.title}</div>
+          <div class="cp-sidebar-items">
+            {compactItems(g.items).map(it => <SidebarItemNode key={it.label} item={it} compact={compact} />)}
+          </div>
+        </div>
+      ))}
+      <div class="cp-sidebar-spacer" />
+      <div class="cp-sidebar-group">
+        <div class="cp-sidebar-group-title">You</div>
+        <div class="cp-sidebar-items">
+          {utilityItems.map(it => <SidebarItemNode key={it.label} item={it} compact={compact} />)}
+        </div>
+      </div>
+      <UserTrigger compact={compact} />
+    </aside>
+  );
+}

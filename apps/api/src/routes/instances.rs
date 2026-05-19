@@ -8,12 +8,77 @@ use axum::{
 use croopor_config::EnrichedInstance;
 use croopor_minecraft::scan_versions;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::{
+    fs,
+    io::{Read, Seek, SeekFrom},
+    path::{Path as FsPath, PathBuf},
+};
+
+const LOG_TAIL_LIMIT: u64 = 128 * 1024;
+
+const INSTANCE_SUBFOLDERS: [&str; 7] = [
+    "mods",
+    "saves",
+    "resourcepacks",
+    "shaderpacks",
+    "config",
+    "screenshots",
+    "logs",
+];
 
 #[derive(Debug, Serialize)]
 struct InstancesResponse {
     instances: Vec<EnrichedInstance>,
     last_instance_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct InstanceWorldInfo {
+    name: String,
+    size: u64,
+    modified_at: String,
+}
+
+#[derive(Debug, Serialize)]
+struct InstanceModInfo {
+    name: String,
+    size: u64,
+    modified_at: String,
+    enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct InstanceScreenshotInfo {
+    name: String,
+    size: u64,
+    modified_at: String,
+}
+
+#[derive(Debug, Serialize)]
+struct InstanceLogInfo {
+    name: String,
+    size: u64,
+    modified_at: String,
+}
+
+#[derive(Debug, Serialize)]
+struct InstanceResourcesResponse {
+    worlds: Vec<InstanceWorldInfo>,
+    mods: Vec<InstanceModInfo>,
+    screenshots: Vec<InstanceScreenshotInfo>,
+    logs: Vec<InstanceLogInfo>,
+    worlds_count: usize,
+    mods_count: usize,
+    screenshots_count: usize,
+    logs_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct InstanceLogTailResponse {
+    name: String,
+    size: u64,
+    truncated: bool,
+    text: String,
 }
 
 pub fn router() -> Router<AppState> {
@@ -27,6 +92,21 @@ pub fn router() -> Router<AppState> {
             get(handle_get_instance)
                 .put(handle_update_instance)
                 .delete(handle_delete_instance),
+        )
+        .route(
+            "/api/v1/instances/{id}/resources",
+            get(handle_instance_resources),
+        )
+        .route("/api/v1/instances/{id}/worlds", get(handle_instance_worlds))
+        .route("/api/v1/instances/{id}/mods", get(handle_instance_mods))
+        .route(
+            "/api/v1/instances/{id}/screenshots",
+            get(handle_instance_screenshots),
+        )
+        .route("/api/v1/instances/{id}/logs", get(handle_instance_logs))
+        .route(
+            "/api/v1/instances/{id}/logs/{name}",
+            get(handle_instance_log_tail),
         )
         .route(
             "/api/v1/instances/{id}/open-folder",
@@ -67,6 +147,10 @@ async fn handle_get_instance(
 struct CreateInstanceRequest {
     name: String,
     version_id: String,
+    #[serde(default)]
+    icon: String,
+    #[serde(default)]
+    accent: String,
 }
 
 async fn handle_create_instance(
@@ -76,7 +160,13 @@ async fn handle_create_instance(
     let mc_dir = state.library_dir().map(PathBuf::from);
     state
         .instances()
-        .add(payload.name, payload.version_id, mc_dir.as_deref())
+        .add(
+            payload.name,
+            payload.version_id,
+            payload.icon,
+            payload.accent,
+            mc_dir.as_deref(),
+        )
         .map(Json)
         .map_err(|error| {
             let status = if error.to_string().contains("already exists") {
@@ -95,6 +185,7 @@ async fn handle_create_instance(
 struct InstancePatch {
     name: Option<String>,
     version_id: Option<String>,
+    art_seed: Option<u32>,
     max_memory_mb: Option<i32>,
     min_memory_mb: Option<i32>,
     java_path: Option<String>,
@@ -103,6 +194,8 @@ struct InstancePatch {
     jvm_preset: Option<String>,
     performance_mode: Option<String>,
     extra_jvm_args: Option<String>,
+    icon: Option<String>,
+    accent: Option<String>,
 }
 
 async fn handle_update_instance(
@@ -122,6 +215,10 @@ async fn handle_update_instance(
     }
     if let Some(version_id) = patch.version_id.filter(|value| !value.trim().is_empty()) {
         instance.version_id = version_id;
+    }
+    if let Some(art_seed) = patch.art_seed {
+        instance.art_seed = art_seed;
+        instance.art_preset = croopor_config::art_preset_for_seed(art_seed).to_string();
     }
     if let Some(max_memory_mb) = patch.max_memory_mb {
         instance.max_memory_mb = max_memory_mb.max(0);
@@ -147,7 +244,12 @@ async fn handle_update_instance(
     if let Some(extra_jvm_args) = patch.extra_jvm_args {
         instance.extra_jvm_args = extra_jvm_args;
     }
-
+    if let Some(icon) = patch.icon {
+        instance.icon = icon;
+    }
+    if let Some(accent) = patch.accent {
+        instance.accent = accent;
+    }
     state
         .instances()
         .update(instance)
@@ -184,7 +286,7 @@ async fn handle_open_instance_folder(
 
     let mut dir = state.instances().game_dir(&instance.id);
     if let Some(sub) = query.sub.as_deref()
-        && ["mods", "saves", "resourcepacks", "shaderpacks", "config"].contains(&sub)
+        && INSTANCE_SUBFOLDERS.contains(&sub)
     {
         dir = dir.join(sub);
     }
@@ -203,6 +305,118 @@ async fn handle_open_instance_folder(
     })?;
 
     Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+async fn handle_instance_resources(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<InstanceResourcesResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let game_dir = instance_game_dir(&state, &id)?;
+    let worlds = scan_instance_worlds(&game_dir.join("saves"));
+    let mods = scan_instance_mods(&game_dir.join("mods"));
+    let screenshots = scan_instance_screenshots(&game_dir.join("screenshots"));
+    let logs = scan_instance_logs(&game_dir.join("logs"));
+
+    Ok(Json(InstanceResourcesResponse {
+        worlds_count: worlds.len(),
+        mods_count: mods.len(),
+        screenshots_count: screenshots.len(),
+        logs_count: logs.len(),
+        worlds,
+        mods,
+        screenshots,
+        logs,
+    }))
+}
+
+async fn handle_instance_worlds(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<InstanceWorldInfo>>, (StatusCode, Json<serde_json::Value>)> {
+    let game_dir = instance_game_dir(&state, &id)?;
+    Ok(Json(scan_instance_worlds(&game_dir.join("saves"))))
+}
+
+async fn handle_instance_mods(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<InstanceModInfo>>, (StatusCode, Json<serde_json::Value>)> {
+    let game_dir = instance_game_dir(&state, &id)?;
+    Ok(Json(scan_instance_mods(&game_dir.join("mods"))))
+}
+
+async fn handle_instance_screenshots(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<InstanceScreenshotInfo>>, (StatusCode, Json<serde_json::Value>)> {
+    let game_dir = instance_game_dir(&state, &id)?;
+    Ok(Json(scan_instance_screenshots(
+        &game_dir.join("screenshots"),
+    )))
+}
+
+async fn handle_instance_logs(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<InstanceLogInfo>>, (StatusCode, Json<serde_json::Value>)> {
+    let game_dir = instance_game_dir(&state, &id)?;
+    Ok(Json(scan_instance_logs(&game_dir.join("logs"))))
+}
+
+async fn handle_instance_log_tail(
+    State(state): State<AppState>,
+    Path((id, name)): Path<(String, String)>,
+) -> Result<Json<InstanceLogTailResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let game_dir = instance_game_dir(&state, &id)?;
+    if !is_safe_resource_name(&name) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "invalid log filename" })),
+        ));
+    }
+
+    let path = game_dir.join("logs").join(&name);
+    if !path.is_file() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "log not found" })),
+        ));
+    }
+
+    let metadata = fs::metadata(&path).map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("failed to read log metadata: {error}") })),
+        )
+    })?;
+    let size = metadata.len();
+    let start = size.saturating_sub(LOG_TAIL_LIMIT);
+    let mut file = fs::File::open(&path).map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("failed to open log: {error}") })),
+        )
+    })?;
+    file.seek(SeekFrom::Start(start)).map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("failed to read log: {error}") })),
+        )
+    })?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("failed to read log: {error}") })),
+        )
+    })?;
+
+    Ok(Json(InstanceLogTailResponse {
+        name,
+        size,
+        truncated: start > 0,
+        text: String::from_utf8_lossy(&bytes).to_string(),
+    }))
 }
 
 async fn handle_delete_instance(
@@ -262,4 +476,172 @@ fn open_path(path: &std::path::Path) -> std::io::Result<()> {
 
     let _child = command.spawn()?;
     Ok(())
+}
+
+fn instance_game_dir(
+    state: &AppState,
+    id: &str,
+) -> Result<PathBuf, (StatusCode, Json<serde_json::Value>)> {
+    let instance = state.instances().get(id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "instance not found" })),
+        )
+    })?;
+    Ok(state.instances().game_dir(&instance.id))
+}
+
+fn scan_instance_worlds(saves_dir: &FsPath) -> Vec<InstanceWorldInfo> {
+    let mut worlds = fs::read_dir(saves_dir)
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(Result::ok))
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| {
+            let path = entry.path();
+            let metadata = entry.metadata().ok();
+            InstanceWorldInfo {
+                name: entry.file_name().to_string_lossy().to_string(),
+                size: dir_size(&path),
+                modified_at: modified_at(metadata.as_ref()),
+            }
+        })
+        .collect::<Vec<_>>();
+    worlds.sort_by(|a, b| {
+        b.modified_at
+            .cmp(&a.modified_at)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    worlds
+}
+
+fn scan_instance_mods(mods_dir: &FsPath) -> Vec<InstanceModInfo> {
+    let mut mods = fs::read_dir(mods_dir)
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(Result::ok))
+        .filter(|entry| entry.path().is_file())
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let lower = name.to_ascii_lowercase();
+            let enabled = lower.ends_with(".jar");
+            if !enabled && !lower.ends_with(".jar.disabled") {
+                return None;
+            }
+            let metadata = entry.metadata().ok();
+            Some(InstanceModInfo {
+                name,
+                size: metadata.as_ref().map_or(0, fs::Metadata::len),
+                modified_at: modified_at(metadata.as_ref()),
+                enabled,
+            })
+        })
+        .collect::<Vec<_>>();
+    mods.sort_by(|a, b| {
+        a.name
+            .to_ascii_lowercase()
+            .cmp(&b.name.to_ascii_lowercase())
+    });
+    mods
+}
+
+fn scan_instance_screenshots(screenshots_dir: &FsPath) -> Vec<InstanceScreenshotInfo> {
+    let mut screenshots = fs::read_dir(screenshots_dir)
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(Result::ok))
+        .filter(|entry| entry.path().is_file())
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !is_screenshot_name(&name) {
+                return None;
+            }
+            let metadata = entry.metadata().ok();
+            Some(InstanceScreenshotInfo {
+                name,
+                size: metadata.as_ref().map_or(0, fs::Metadata::len),
+                modified_at: modified_at(metadata.as_ref()),
+            })
+        })
+        .collect::<Vec<_>>();
+    screenshots.sort_by(|a, b| {
+        b.modified_at
+            .cmp(&a.modified_at)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    screenshots
+}
+
+fn scan_instance_logs(logs_dir: &FsPath) -> Vec<InstanceLogInfo> {
+    let mut logs = fs::read_dir(logs_dir)
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(Result::ok))
+        .filter(|entry| entry.path().is_file())
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !is_safe_resource_name(&name) {
+                return None;
+            }
+            let metadata = entry.metadata().ok();
+            Some(InstanceLogInfo {
+                name,
+                size: metadata.as_ref().map_or(0, fs::Metadata::len),
+                modified_at: modified_at(metadata.as_ref()),
+            })
+        })
+        .collect::<Vec<_>>();
+    logs.sort_by(|a, b| {
+        latest_log_rank(&a.name)
+            .cmp(&latest_log_rank(&b.name))
+            .then_with(|| b.modified_at.cmp(&a.modified_at))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    logs
+}
+
+fn latest_log_rank(name: &str) -> u8 {
+    if name.eq_ignore_ascii_case("latest.log") {
+        0
+    } else {
+        1
+    }
+}
+
+fn is_screenshot_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    [".png", ".jpg", ".jpeg", ".webp"]
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
+        && is_safe_resource_name(name)
+}
+
+fn is_safe_resource_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.starts_with('.')
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.chars().any(char::is_control)
+        && FsPath::new(name) == FsPath::new(name).components().as_path()
+}
+
+fn modified_at(metadata: Option<&fs::Metadata>) -> String {
+    metadata
+        .and_then(|metadata| metadata.modified().ok())
+        .map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339())
+        .unwrap_or_default()
+}
+
+fn dir_size(path: &FsPath) -> u64 {
+    let mut total = 0_u64;
+    if let Ok(entries) = fs::read_dir(path) {
+        for entry in entries.filter_map(Result::ok) {
+            if let Ok(metadata) = entry.metadata() {
+                if metadata.is_dir() {
+                    total += dir_size(&entry.path());
+                } else {
+                    total += metadata.len();
+                }
+            }
+        }
+    }
+    total
 }

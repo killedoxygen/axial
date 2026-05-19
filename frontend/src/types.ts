@@ -6,6 +6,8 @@ export interface Instance {
   version_id: string;
   created_at: string;
   last_played_at?: string;
+  art_seed?: number;
+  art_preset?: string;
   max_memory_mb?: number;
   min_memory_mb?: number;
   java_path?: string;
@@ -14,6 +16,8 @@ export interface Instance {
   jvm_preset?: string;
   performance_mode?: string;
   extra_jvm_args?: string;
+  icon?: string;
+  accent?: string;
 }
 
 export interface EnrichedInstance extends Instance {
@@ -320,6 +324,51 @@ export interface VersionInfo {
   shared_data: SharedDataInfo[];
 }
 
+// ── Instance resource detail ──
+
+export interface InstanceWorld {
+  name: string;
+  size: number;
+  modified_at: string;
+}
+
+export interface InstanceMod {
+  name: string;
+  size: number;
+  modified_at: string;
+  enabled: boolean;
+}
+
+export interface InstanceScreenshot {
+  name: string;
+  size: number;
+  modified_at: string;
+}
+
+export interface InstanceLogFile {
+  name: string;
+  size: number;
+  modified_at: string;
+}
+
+export interface InstanceResourceSummary {
+  worlds: InstanceWorld[];
+  mods: InstanceMod[];
+  screenshots: InstanceScreenshot[];
+  logs: InstanceLogFile[];
+  worlds_count: number;
+  mods_count: number;
+  screenshots_count: number;
+  logs_count: number;
+}
+
+export interface InstanceLogTail {
+  name: string;
+  size: number;
+  truncated: boolean;
+  text: string;
+}
+
 // ── UI types ──
 
 export type Page = 'launcher' | 'settings';
@@ -340,6 +389,7 @@ export interface LocalPrefs {
   customHue: number;
   customVibrancy: number;
   lightness: number;
+  sidebarCompact: boolean;
   logHeight: number;
   collapsedGroups: Record<string, boolean>;
   sidebarFilter: string;

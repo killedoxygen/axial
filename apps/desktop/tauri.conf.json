@@ -4,10 +4,10 @@
   "version": "0.3.1",
   "identifier": "dev.mateoltd.croopor",
   "build": {
-    "beforeBuildCommand": "",
-    "beforeDevCommand": "",
-    "frontendDist": "http://127.0.0.1:43430",
-    "devUrl": "http://127.0.0.1:43430"
+    "beforeBuildCommand": "pnpm --dir ../../frontend run build",
+    "beforeDevCommand": "pnpm --dir ../../frontend run dev:desktop",
+    "frontendDist": "../../frontend/static",
+    "devUrl": "http://127.0.0.1:3000"
   },
   "app": {
     "withGlobalTauri": true,
@@ -18,7 +18,10 @@
         "width": 1100,
         "height": 720,
         "minWidth": 960,
-        "minHeight": 640
+        "minHeight": 640,
+        "decorations": false,
+        "transparent": false,
+        "backgroundColor": "#100D0AFF"
       }
     ],
     "security": {

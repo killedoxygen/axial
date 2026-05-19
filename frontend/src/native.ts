@@ -77,6 +77,12 @@ export async function getNativeAppVersion(): Promise<string | null> {
   return tauri.core.invoke<string>('app_version');
 }
 
+export async function getNativeApiBaseUrl(): Promise<string | null> {
+  const tauri = getTauriBinding();
+  if (!tauri?.core) return null;
+  return tauri.core.invoke<string>('api_base_url');
+}
+
 export async function browseDirectory(defaultPath = ''): Promise<string | null> {
   const tauri = getTauriBinding();
   if (!tauri?.dialog) return null;
@@ -125,5 +131,47 @@ export async function startNativeLaunchEvents(sessionId: string): Promise<boolea
   const tauri = getTauriBinding();
   if (!tauri?.core) return false;
   await tauri.core.invoke('start_launch_events', { sessionId });
+  return true;
+}
+
+// ── Window controls (Tauri only). In browser mode these are no-ops. ──
+
+export async function windowMinimize(): Promise<boolean> {
+  const tauri = getTauriBinding();
+  if (!tauri?.core) return false;
+  await tauri.core.invoke('window_minimize');
+  return true;
+}
+
+export async function windowToggleMaximize(): Promise<boolean | null> {
+  const tauri = getTauriBinding();
+  if (!tauri?.core) return null;
+  return tauri.core.invoke<boolean>('window_toggle_maximize');
+}
+
+export async function windowClose(): Promise<boolean> {
+  const tauri = getTauriBinding();
+  if (!tauri?.core) return false;
+  await tauri.core.invoke('window_close');
+  return true;
+}
+
+export async function windowIsMaximized(): Promise<boolean> {
+  const tauri = getTauriBinding();
+  if (!tauri?.core) return false;
+  return tauri.core.invoke<boolean>('window_is_maximized');
+}
+
+export async function windowStartDragging(): Promise<boolean> {
+  const tauri = getTauriBinding();
+  if (!tauri?.core) return false;
+  await tauri.core.invoke('window_start_dragging');
+  return true;
+}
+
+export async function windowSetResizeBackground(dark: boolean): Promise<boolean> {
+  const tauri = getTauriBinding();
+  if (!tauri?.core) return false;
+  await tauri.core.invoke('window_set_resize_background', { dark });
   return true;
 }

@@ -1,0 +1,33 @@
+.cp-ctx-host {
+  position: fixed;
+  z-index: 1300;
+  min-width: 180px;
+  padding: 4px;
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow);
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  animation: cp-float-up 120ms ease;
+}
+.cp-ctx-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 30px;
+  padding: 0 10px;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+  font-family: inherit;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  text-align: left;
+}
+.cp-ctx-item:hover { background: var(--surface-3); }
+.cp-ctx-item--danger { color: var(--err); }
+.cp-ctx-item--danger:hover { background: oklch(0.70 0.18 25 / 0.14); }
+.cp-ctx-divider { height: 1px; background: var(--line); margin: 4px 2px; }

@@ -1,0 +1,75 @@
+.cp-setup-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+  background:
+    radial-gradient(circle at 30% 20%, var(--accent-soft), transparent 60%),
+    var(--bg-deep);
+  animation: cp-fade-in 200ms ease;
+}
+.cp-setup-card {
+  width: min(520px, 100%);
+  max-height: calc(100vh - 64px);
+  overflow: auto;
+  padding: 28px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-xl);
+  box-shadow: var(--shadow);
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+.cp-setup-title {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: -0.4px;
+}
+.cp-setup-sub {
+  margin: 0;
+  font-size: 13.5px;
+  color: var(--text-dim);
+  line-height: 1.5;
+}
+.cp-setup-path {
+  padding: 10px 12px;
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  border: 1px dashed var(--line-strong);
+  color: var(--text-dim);
+  font-size: 12px;
+  word-break: break-all;
+}
+.cp-setup-progress {
+  height: 4px;
+  background: var(--surface-3);
+  border-radius: 999px;
+  overflow: hidden;
+  position: relative;
+}
+.cp-setup-progress::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  width: 40%;
+  background: var(--accent);
+  border-radius: 999px;
+  animation: cp-indet 1.2s ease-in-out infinite;
+}
+@keyframes cp-indet {
+  0%   { left: -40%; }
+  100% { left: 100%; }
+}
+.cp-setup-error {
+  padding: 10px 12px;
+  border-radius: var(--r-sm);
+  background: oklch(0.70 0.18 25 / 0.14);
+  color: var(--err);
+  border: 1px solid oklch(0.70 0.18 25 / 0.28);
+  font-size: 12.5px;
+}

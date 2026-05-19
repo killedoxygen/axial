@@ -118,7 +118,7 @@ function syncLogFilter(): void {
     filter.appendChild(opt);
   }
   filter.value = current || 'all';
-  filter.classList.toggle('hidden', loggedInstances.size < 2);
+  filter.classList.toggle('cp-hidden', loggedInstances.size < 2);
 }
 
 export function showError(msg: string): void {
@@ -358,6 +358,24 @@ export function formatRelativeTime(date: Date): string {
   const days = Math.floor(hrs / 24);
   if (days < 7) return `${days}d ago`;
   return new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' }).format(date);
+}
+
+// ── Player name validation ──────────────────────────────────────────────
+// Minecraft (offline + MSA) accepts [A-Za-z0-9_]{3,16}. Anything outside that
+// range breaks launch arg construction (spaces, quotes, semicolons, etc.).
+// Frontend gates every input site; the backend is a last-resort defense.
+
+export const USERNAME_MIN_LEN = 3;
+export const USERNAME_MAX_LEN = 16;
+export const USERNAME_PATTERN: RegExp = /^[A-Za-z0-9_]+$/;
+
+export function validateUsername(raw: string): string | null {
+  const v = raw.trim();
+  if (v.length === 0) return 'Enter a name.';
+  if (v.length < USERNAME_MIN_LEN) return `At least ${USERNAME_MIN_LEN} characters.`;
+  if (v.length > USERNAME_MAX_LEN) return `At most ${USERNAME_MAX_LEN} characters.`;
+  if (!USERNAME_PATTERN.test(v)) return 'Letters, numbers, and underscores only.';
+  return null;
 }
 
 export function getMemoryRecommendation(totalGB: number): { rec: number; text: string } {

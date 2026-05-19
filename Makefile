@@ -1,7 +1,7 @@
 .DEFAULT_GOAL := help
 DEV := ./dev
 
-.PHONY: help setup dev dev-web watch build build-dev build-windows build-windows-dev check test verify clean doctor
+.PHONY: help setup dev dev-windows dev-web watch build build-dev build-windows build-windows-dev check test verify clean doctor
 
 help:
 	@$(DEV) help
@@ -11,6 +11,9 @@ setup:
 
 dev:
 	@$(DEV) dev
+
+dev-windows:
+	@$(DEV) dev:windows
 
 dev-web:
 	@$(DEV) dev-web

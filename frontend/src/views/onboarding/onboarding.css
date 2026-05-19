@@ -1,0 +1,524 @@
+/* Onboarding overlay. One canvas, one cinematic beat. */
+/* All animations are one-shot; the component teardown reclaims them. */
+
+.cp-ob-root {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  color: var(--text);
+  background: var(--bg);
+  animation: cp-ob-root-in 320ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+
+/* Main region: grows between the status bar and the footer, vertically centers
+   the column. overflow auto is the safety net for very short windows — content
+   scrolls rather than colliding with the nav buttons.
+   With the status bar pulled out above main (topstrip 36 + statusbar ~50 ≈ 86)
+   and footer ~88, the chrome above/below main is near-symmetric, so main's
+   center naturally aligns with the viewport center. No asymmetric padding
+   needed. */
+.cp-ob-main {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: clamp(16px, 3.5vh, 32px) clamp(20px, 4vw, 40px);
+  min-height: 0;
+  overflow: auto;
+  scrollbar-gutter: stable;
+}
+
+.cp-ob-bottom {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: clamp(8px, 1.4vh, 14px);
+  padding: 0 clamp(20px, 4vw, 40px) clamp(16px, 2.8vh, 28px);
+}
+
+/* Navigation — a single segmented pill holding < and >.
+   Grouping them in one container reads as a unified nav control, mirrors the
+   physical shape of the Arrow keys on a keyboard, and gives the buttons a
+   visual anchor at the bottom of the overlay. Pure grey, no accent. */
+.cp-ob-nav {
+  display: inline-flex;
+  padding: 4px;
+  gap: 4px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+}
+
+.cp-ob-navbtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 36px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-mute);
+  border-radius: 10px;
+  font: inherit;
+  cursor: not-allowed;
+  transition:
+    background-color 180ms ease,
+    color 180ms ease,
+    transform 140ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.cp-ob-navbtn:not(:disabled) {
+  color: var(--text);
+  cursor: pointer;
+}
+
+.cp-ob-navbtn:not(:disabled):hover {
+  background: var(--surface-3);
+}
+
+.cp-ob-navbtn:not(:disabled):active {
+  transform: scale(0.94);
+}
+
+.cp-ob-navbtn:disabled {
+  opacity: 0.35;
+}
+
+.cp-ob-navbtn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* Tight viewports (short laptops, small windowed sizes): shrink vertical gaps
+   inside the column so the centered stage + status row still fit comfortably
+   between the top strip and the fixed bottom bar. */
+@media (max-height: 720px) {
+  .cp-ob-stage { gap: 16px; }
+  .cp-ob-headline { font-size: clamp(24px, 3.4vw, 32px); }
+  .cp-ob-statusbar { padding: 10px clamp(20px, 4vw, 40px); }
+}
+
+@media (max-height: 600px) {
+  .cp-ob-stage { gap: 12px; }
+  .cp-ob-statusbar { padding: 8px clamp(20px, 4vw, 40px); }
+}
+
+@keyframes cp-ob-root-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+.cp-ob-root.is-dissolving {
+  animation: cp-ob-dissolve 560ms cubic-bezier(0.4, 0, 0.2, 1) forwards;
+  pointer-events: none;
+}
+
+@keyframes cp-ob-dissolve {
+  from { opacity: 1; transform: scale(1); }
+  to   { opacity: 0; transform: scale(1.015); }
+}
+
+/* Top strip (drag region + window controls) ------------------------------ */
+
+.cp-ob-topstrip {
+  flex-shrink: 0;
+  height: 36px;
+  display: flex;
+  align-items: stretch;
+  justify-content: flex-end;
+  padding-right: 2px;
+}
+
+/* Column ------------------------------------------------------------------ */
+
+.cp-ob-column {
+  width: min(580px, 100%);
+  display: flex;
+  flex-direction: column;
+}
+
+/* Status bar — breadcrumb stepper at the absolute top of the viewport.
+   Numbered step labels separated by a chevron, clickable on past steps.
+   No container chrome (no border, no background), no separator line —
+   just typography + positioning. Its position never shifts; any layout
+   below is free to breathe with content. */
+.cp-ob-statusbar {
+  flex-shrink: 0;
+  display: flex;
+  justify-content: center;
+  padding: 14px clamp(20px, 4vw, 40px) 0;
+}
+
+.cp-ob-stepper {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  animation: cp-ob-stepper-in 320ms cubic-bezier(0.2, 0.7, 0.2, 1) 60ms both;
+}
+
+@keyframes cp-ob-stepper-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to   { opacity: 1; transform: none; }
+}
+
+.cp-ob-stepper-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: 10px;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  color: var(--text-mute);
+  cursor: default;
+  transition: background-color 200ms ease, color 200ms ease;
+}
+
+button.cp-ob-stepper-item { cursor: pointer; }
+
+button.cp-ob-stepper-item:hover {
+  background: var(--surface-2);
+  color: var(--text-dim);
+}
+
+button.cp-ob-stepper-item:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.cp-ob-stepper-item[data-state="past"] { color: var(--text-dim); }
+
+.cp-ob-stepper-item[data-state="active"] {
+  color: var(--text);
+  background: var(--accent-softer);
+}
+
+.cp-ob-stepper-num {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.6px;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.55;
+  transition: color 200ms ease, opacity 200ms ease;
+}
+
+.cp-ob-stepper-item[data-state="past"] .cp-ob-stepper-num {
+  color: var(--accent);
+  opacity: 0.85;
+}
+
+.cp-ob-stepper-item[data-state="active"] .cp-ob-stepper-num {
+  color: var(--accent);
+  opacity: 1;
+}
+
+.cp-ob-stepper-label {
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: -0.1px;
+  white-space: nowrap;
+  transition: font-weight 200ms ease;
+}
+
+.cp-ob-stepper-item[data-state="active"] .cp-ob-stepper-label {
+  font-weight: 600;
+}
+
+.cp-ob-stepper-sep {
+  color: var(--text-mute);
+  font-size: 15px;
+  opacity: 0.45;
+  user-select: none;
+  padding: 0 2px;
+}
+
+/* Stage ------------------------------------------------------------------- */
+
+.cp-ob-stage {
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+  animation: cp-ob-stage-in 360ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+
+@keyframes cp-ob-stage-in {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: none; }
+}
+
+.cp-ob-headline {
+  margin: 0;
+  font-size: clamp(28px, 4.4vw, 40px);
+  font-weight: 500;
+  letter-spacing: -0.7px;
+  line-height: 1.12;
+  color: var(--text);
+}
+
+.cp-ob-word {
+  display: inline-block;
+  animation: cp-ob-word-rise 420ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
+  animation-delay: calc((var(--i, 0) * 38ms) + 140ms);
+}
+
+@keyframes cp-ob-word-rise {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: none; }
+}
+
+.cp-ob-subline {
+  margin: 0;
+  font-size: 14px;
+  color: var(--text-dim);
+  line-height: 1.55;
+  letter-spacing: -0.1px;
+}
+
+/* Widget area ------------------------------------------------------------- */
+
+.cp-ob-widget {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+/* Name stage input: a little taller and larger than the default Atom */
+.cp-ob-namefield .cp-field {
+  height: 52px;
+  padding: 0 18px;
+  border-radius: 14px;
+  transition: box-shadow 200ms ease, border-color 200ms ease, background-color 240ms ease;
+}
+
+/* Override the Atom's accent-colored focus ring: a neutral high-contrast border
+   reads more professional here than a colored glow. */
+.cp-ob-namefield .cp-field.cp-field--focused {
+  border-color: var(--text);
+  box-shadow: none;
+}
+
+.cp-ob-namefield .cp-field input {
+  font-size: 16px;
+  font-weight: 500;
+}
+
+/* Feedback slot above the name input — holds either the validation error OR
+   the keyboard hint (never both). One reserved row keeps layout stable as
+   state changes. Sits above the input so the input stays visually adjacent
+   to the sign-in button below. */
+.cp-ob-feedback {
+  display: flex;
+  align-items: center;
+  min-height: 20px;
+  margin-bottom: -6px;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1;
+  transition: color 160ms ease;
+}
+
+.cp-ob-feedback-error {
+  color: var(--err);
+  animation: cp-ob-feedback-in 180ms ease both;
+}
+
+.cp-ob-feedback-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-mute);
+  animation: cp-ob-feedback-in 220ms ease both;
+}
+
+@keyframes cp-ob-feedback-in {
+  from { opacity: 0; transform: translateY(-2px); }
+  to   { opacity: 1; transform: none; }
+}
+
+.cp-ob-feedback kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: 5px;
+  background: var(--surface-3);
+  color: var(--text-dim);
+  font: 600 11px/1 ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  border: 1px solid var(--line);
+}
+
+/* Disabled MSA sign-in placeholder */
+.cp-ob-msa {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  height: 48px;
+  padding: 0 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface-2);
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  text-align: left;
+  opacity: 0.58;
+  cursor: not-allowed;
+  transition: background-color 240ms ease, border-color 240ms ease;
+}
+
+.cp-ob-msa-mark {
+  flex-shrink: 0;
+  display: block;
+  border-radius: 2px;
+}
+
+.cp-ob-msa-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cp-ob-msa-soon {
+  flex-shrink: 0;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: var(--surface-3);
+  color: var(--text-mute);
+}
+
+/* Memory reading */
+.cp-ob-memory {
+  gap: 16px;
+}
+
+.cp-ob-memory-summary {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 16px;
+}
+
+.cp-ob-memreading {
+  font-size: 28px;
+  font-weight: 500;
+  letter-spacing: -0.5px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  transition: color 240ms ease;
+}
+
+.cp-ob-memory-note {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-mute);
+  text-align: right;
+}
+
+/* Color stage: mode toggle row with Weirdo jab ---------------------------- */
+
+.cp-ob-mode-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.cp-ob-weirdo {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 10px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  animation: cp-ob-weirdo-in 320ms cubic-bezier(0.34, 1.56, 0.64, 1) both;
+  user-select: none;
+}
+
+@keyframes cp-ob-weirdo-in {
+  from { opacity: 0; transform: translateX(-6px) rotate(-5deg); }
+  to   { opacity: 1; transform: none; }
+}
+
+/* Music pills ------------------------------------------------------------- */
+
+.cp-ob-pills {
+  display: flex;
+  gap: 10px;
+}
+
+.cp-ob-pill {
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  height: 52px;
+  padding: 0 16px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--surface-2);
+  color: var(--text);
+  font: inherit;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color 200ms ease, color 200ms ease, border-color 200ms ease;
+}
+
+.cp-ob-pill:hover { background: var(--surface-3); }
+
+.cp-ob-pill[data-active="true"] {
+  background: var(--accent-fill);
+  color: var(--accent-on);
+  border-color: transparent;
+}
+
+/* Footnote ---------------------------------------------------------------- */
+
+.cp-ob-footnote {
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.1px;
+  color: var(--text-mute);
+  pointer-events: none;
+  text-align: center;
+  max-width: 420px;
+  animation: cp-ob-footnote-in 360ms cubic-bezier(0.2, 0.7, 0.2, 1) 280ms both;
+}
+
+@keyframes cp-ob-footnote-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 0.85; transform: none; }
+}
+
+/* Reduced motion ---------------------------------------------------------- */
+
+@media (prefers-reduced-motion: reduce) {
+  .cp-ob-root,
+  .cp-ob-root *,
+  .cp-ob-root *::before,
+  .cp-ob-root *::after {
+    animation: none !important;
+    transition: opacity 120ms linear, background-color 160ms linear, color 160ms linear !important;
+  }
+  .cp-ob-word { opacity: 1 !important; transform: none !important; }
+}

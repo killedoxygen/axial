@@ -7,6 +7,17 @@ use std::path::Path;
 use std::sync::RwLock;
 use thiserror::Error;
 
+/// Deterministic instance-art variants. Order is part of the seed contract and
+/// must match `ART_PRESETS` in `frontend/src/art/InstanceArt.tsx`.
+///
+/// `art_seed` is the artwork source of truth. The preset is derived with
+/// `ART_PRESETS[art_seed % ART_PRESETS.len()]`, and every renderer detail is
+/// expected to derive from the same seed. `art_preset` is a denormalized label
+/// recalculated from the seed whenever an instance is created or updated.
+pub const ART_PRESETS: [&str; 9] = [
+    "aurora", "silk", "mineral", "ember", "vapor", "topo", "prism", "dune", "orbit",
+];
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Instance {
     pub id: String,
@@ -15,6 +26,10 @@ pub struct Instance {
     pub created_at: String,
     #[serde(default)]
     pub last_played_at: String,
+    #[serde(default)]
+    pub art_seed: u32,
+    #[serde(default)]
+    pub art_preset: String,
     #[serde(default)]
     pub max_memory_mb: i32,
     #[serde(default)]
@@ -31,6 +46,10 @@ pub struct Instance {
     pub performance_mode: String,
     #[serde(default)]
     pub extra_jvm_args: String,
+    #[serde(default)]
+    pub icon: String,
+    #[serde(default)]
+    pub accent: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -223,6 +242,8 @@ impl InstanceStore {
         &self,
         name: String,
         version_id: String,
+        icon: String,
+        accent: String,
         mc_dir: Option<&Path>,
     ) -> Result<Instance, InstanceStoreError> {
         let mut inner = self.inner.write().map_err(|_| {
@@ -248,13 +269,17 @@ impl InstanceStore {
             )));
         }
 
+        let id = generate_id();
+        let art_seed = derive_art_seed(&id, &name, &version_id);
         let instance = Instance {
-            id: generate_id(),
+            id,
             name,
             version_id,
             created_at: chrono::DateTime::<chrono::Utc>::from(std::time::SystemTime::now())
                 .to_rfc3339(),
             last_played_at: String::new(),
+            art_seed,
+            art_preset: art_preset_for_seed(art_seed).to_string(),
             max_memory_mb: 0,
             min_memory_mb: 0,
             java_path: String::new(),
@@ -263,6 +288,8 @@ impl InstanceStore {
             jvm_preset: String::new(),
             performance_mode: String::new(),
             extra_jvm_args: String::new(),
+            icon,
+            accent,
         };
 
         inner.instances.push(instance.clone());
@@ -330,9 +357,28 @@ fn generate_id() -> String {
     format!("{:016x}", nanos as u64)
 }
 
+fn derive_art_seed(id: &str, name: &str, version_id: &str) -> u32 {
+    let mut h = 2166136261u32;
+    for byte in id
+        .bytes()
+        .chain([0])
+        .chain(name.bytes())
+        .chain([0])
+        .chain(version_id.bytes())
+    {
+        h ^= u32::from(byte);
+        h = h.wrapping_mul(16777619);
+    }
+    h
+}
+
+pub fn art_preset_for_seed(seed: u32) -> &'static str {
+    ART_PRESETS[(seed as usize) % ART_PRESETS.len()]
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{InstanceStore, StoredInstances};
+    use super::{ART_PRESETS, InstanceStore, StoredInstances, art_preset_for_seed};
     use crate::paths::AppPaths;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -363,6 +409,17 @@ mod tests {
     }
 
     #[test]
+    fn art_preset_is_derived_from_seed_modulo_preset_order() {
+        for (index, preset) in ART_PRESETS.iter().enumerate() {
+            assert_eq!(art_preset_for_seed(index as u32), *preset);
+            assert_eq!(
+                art_preset_for_seed((index + ART_PRESETS.len() * 17) as u32),
+                *preset
+            );
+        }
+    }
+
+    #[test]
     fn add_does_not_create_instance_dirs_when_persist_fails() {
         let root = test_root("persist-failure");
         let config_blocker = root.join("config-blocker");
@@ -382,7 +439,13 @@ mod tests {
         };
 
         let error = store
-            .add("Test".to_string(), "1.21.1".to_string(), None)
+            .add(
+                "Test".to_string(),
+                "1.21.1".to_string(),
+                String::new(),
+                String::new(),
+                None,
+            )
             .expect_err("persist should fail");
 
         assert!(matches!(error, super::InstanceStoreError::Read(_)));
@@ -405,7 +468,13 @@ mod tests {
         };
 
         let error = store
-            .add("Test".to_string(), "1.21.1".to_string(), None)
+            .add(
+                "Test".to_string(),
+                "1.21.1".to_string(),
+                String::new(),
+                String::new(),
+                None,
+            )
             .expect_err("file setup should fail");
 
         assert!(matches!(error, super::InstanceStoreError::Read(_)));
