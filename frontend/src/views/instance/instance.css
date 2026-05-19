@@ -1048,43 +1048,197 @@
   box-shadow: 0 1px 2px rgba(0,0,0,0.15);
 }
 
-/* ─── Settings tab artwork ─── */
-.cp-art-settings {
-  display: grid;
-  grid-template-columns: 116px minmax(220px, 1fr);
-  grid-template-areas:
-    "square banner"
-    "presets presets";
+/* ─── Settings tab ─── */
+.cp-settings-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.cp-settings-topline {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
   gap: 12px;
+  flex-wrap: wrap;
 }
-.cp-art-settings-square { grid-area: square; width: 116px; height: 116px; }
-.cp-art-settings-banner { grid-area: banner; height: 116px; min-height: 116px; }
-.cp-art-preset-list { grid-area: presets; display: flex; flex-wrap: wrap; gap: 8px; }
-.cp-art-preset-list button {
-  height: 30px;
-  padding: 0 12px;
-  border-radius: var(--r-sm);
-  border: 1px solid var(--line);
-  background: var(--surface-3);
-  color: var(--text-dim);
+.cp-settings-topline .cp-section-head {
+  margin: 0;
+}
+.cp-settings-save {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+.cp-settings-save > span {
+  color: var(--text-mute);
   font-size: 12px;
-  font-weight: 600;
-  text-transform: capitalize;
-  cursor: pointer;
+  font-weight: 500;
+  white-space: nowrap;
 }
-.cp-art-preset-list button:hover { color: var(--text); }
-.cp-art-preset-list button[data-active="true"] {
-  background: var(--accent-softer);
-  border-color: var(--accent-line);
+.cp-settings-save > span[data-dirty="true"] {
   color: var(--accent);
 }
-@media (max-width: 640px) {
-  .cp-art-settings {
+.cp-settings-sheet {
+  border-top: 1px solid color-mix(in oklab, var(--line) 60%, transparent);
+}
+.cp-settings-section-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 9px;
+  color: var(--text-dim);
+  background: var(--surface-3);
+  box-shadow: inset 0 0 0 1px oklch(1 0 0 / 0.04);
+  flex-shrink: 0;
+}
+.cp-settings-row {
+  display: grid;
+  grid-template-columns: minmax(200px, 270px) minmax(0, 1fr);
+  gap: 28px;
+  padding: 20px 0;
+  border-bottom: 1px solid color-mix(in oklab, var(--line) 60%, transparent);
+}
+.cp-settings-row-head {
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr);
+  align-items: start;
+  gap: 12px;
+  min-width: 0;
+}
+.cp-settings-row-head h3 {
+  margin: 0;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.15px;
+}
+.cp-settings-row-head p {
+  margin: 4px 0 0;
+  color: var(--text-dim);
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+.cp-settings-row-control {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.cp-settings-identity-control {
+  display: grid;
+  grid-template-columns: 52px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+}
+.cp-settings-avatar {
+  width: 52px;
+  height: 52px;
+}
+.cp-settings-identity-control strong {
+  display: block;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: capitalize;
+}
+.cp-settings-identity-control span {
+  display: block;
+  margin-top: 3px;
+  color: var(--text-mute);
+  font-size: 11.5px;
+}
+.cp-settings-button-strip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.cp-settings-dimensions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.cp-settings-dimensions label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.cp-settings-dimensions label > span {
+  color: var(--text-mute);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+}
+.cp-settings-memory-grid {
+  display: grid;
+  gap: 18px;
+}
+.cp-settings-slider-row {
+  min-width: 0;
+}
+.cp-settings-slider-label {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+.cp-settings-slider-label span {
+  color: var(--text-dim);
+  font-size: 12.5px;
+  font-weight: 560;
+}
+.cp-settings-slider-label strong {
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 680;
+  letter-spacing: -0.2px;
+  font-variant-numeric: tabular-nums;
+}
+.cp-settings-advanced-toggle {
+  display: flex;
+  justify-content: flex-start;
+}
+.cp-settings-advanced-grid {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.85fr) minmax(260px, 1.15fr);
+  gap: 10px;
+}
+.cp-settings-advanced-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.cp-settings-advanced-grid label > span {
+  color: var(--text-mute);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+}
+@media (max-width: 1080px) {
+  .cp-settings-row {
     grid-template-columns: 1fr;
-    grid-template-areas:
-      "banner"
-      "square"
-      "presets";
+    gap: 14px;
+  }
+}
+@media (max-width: 640px) {
+  .cp-settings-save {
+    width: 100%;
+    justify-content: space-between;
+  }
+  .cp-settings-row {
+    padding: 18px 0;
+  }
+  .cp-settings-identity-control,
+  .cp-settings-dimensions,
+  .cp-settings-advanced-grid {
+    grid-template-columns: 1fr;
   }
 }
 

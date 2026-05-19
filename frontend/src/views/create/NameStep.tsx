@@ -20,7 +20,7 @@ import {
   JVM_PRESET_HINTS,
   JVM_PRESET_LABELS,
   type JvmPreset,
-} from './CreateView';
+} from './jvm-presets';
 import type { WindowPresetSpec } from './screen-presets';
 
 type IdleHandle = number;

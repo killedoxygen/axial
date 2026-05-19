@@ -41,6 +41,7 @@ import {
   type ScreenSize,
   type WindowPresetSpec,
 } from './screen-presets';
+import { JVM_PRESET_ORDER, type JvmPreset } from './jvm-presets';
 import './create.css';
 
 export function CreateView(): JSX.Element {
@@ -50,22 +51,6 @@ export function CreateView(): JSX.Element {
   }
   return <CreateWizard />;
 }
-
-export type JvmPreset = '' | 'smooth' | 'performance' | 'ultra_low_latency';
-const JVM_PRESET_ORDER: JvmPreset[] = ['', 'smooth', 'performance', 'ultra_low_latency'];
-export const JVM_PRESET_LABELS: Record<JvmPreset, string> = {
-  '': 'Auto',
-  smooth: 'Smooth',
-  performance: 'Performance',
-  ultra_low_latency: 'Low latency',
-};
-const JVM_PRESET_HINTS: Record<JvmPreset, string> = {
-  '': 'Launcher picks the JVM flags for you.',
-  smooth: 'Tuned for steady frame times.',
-  performance: 'Higher throughput, hotter CPU.',
-  ultra_low_latency: 'Minimise hitches at the cost of FPS.',
-};
-export { JVM_PRESET_HINTS };
 
 function CreateWizard(): JSX.Element {
   const [step, setStep] = useState<Step>('pick');

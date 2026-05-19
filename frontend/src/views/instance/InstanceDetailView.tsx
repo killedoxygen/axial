@@ -4,7 +4,7 @@ import { Icon } from '../../ui/Icons';
 import { Button, Card, IconButton, Input, Pill, SectionHeading } from '../../ui/Atoms';
 import { Slider, type SliderZone } from '../../ui/Slider';
 import { useTheme } from '../../hooks/use-theme';
-import { ART_PRESETS, InstanceArt, artPresetForSeed, artSeedFor, artSeedForPreset, nextArtSeed } from '../../art/InstanceArt';
+import { InstanceArt, artPresetForSeed, artSeedFor, nextArtSeed } from '../../art/InstanceArt';
 import { showConfirm } from '../../ui/Dialog';
 import { openContextMenu } from '../../ui/ContextMenu';
 import { config, instances, runningSessions, systemInfo, versions } from '../../store';
@@ -15,6 +15,12 @@ import { api } from '../../api';
 import { toast } from '../../toast';
 import { errMessage, fmtMem, getMemoryRecommendation } from '../../utils';
 import type { EnrichedInstance, Version } from '../../types';
+import {
+  JVM_PRESET_HINTS,
+  JVM_PRESET_LABELS,
+  JVM_PRESET_ORDER,
+  type JvmPreset,
+} from '../create/jvm-presets';
 import './instance.css';
 
 async function openInstanceFolder(id: string): Promise<void> {
@@ -821,8 +827,26 @@ function ModsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
   );
 }
 
+type InstanceWindowPreset = { id: string; label: string; w: number; h: number };
+
+const WINDOW_PRESETS: InstanceWindowPreset[] = [
+  { id: 'default', label: 'Default', w: 854, h: 480 },
+  { id: 'hd', label: '720p', w: 1280, h: 720 },
+  { id: 'fhd', label: '1080p', w: 1920, h: 1080 },
+  { id: '2k', label: '2K', w: 2560, h: 1440 },
+];
+
+function clampWindowDimension(value: string, fallback: number): number {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(320, Math.min(3840, parsed));
+}
+
+function jvmPresetFrom(value: string | undefined): JvmPreset {
+  return JVM_PRESET_ORDER.includes(value as JvmPreset) ? value as JvmPreset : '';
+}
+
 function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
-  const theme = useTheme();
   const initialArtSeed = artSeedFor(inst);
   const [artSeed, setArtSeed] = useState<number>(initialArtSeed);
   const artPreset = artPresetForSeed(artSeed);
@@ -830,18 +854,61 @@ function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
   const [minMem, setMinMem] = useState<number>(memoryGb(inst.min_memory_mb, config.value?.min_memory_mb ?? 1024));
   const [width, setWidth] = useState<number>(inst.window_width ?? 854);
   const [height, setHeight] = useState<number>(inst.window_height ?? 480);
+  const [jvmPreset, setJvmPreset] = useState<JvmPreset>(jvmPresetFrom(inst.jvm_preset));
   const [javaPath, setJavaPath] = useState<string>(inst.java_path ?? '');
   const [jvmArgs, setJvmArgs] = useState<string>(inst.extra_jvm_args ?? '');
+  const [advancedOpen, setAdvancedOpen] = useState<boolean>(Boolean(inst.java_path || inst.extra_jvm_args));
   const [saving, setSaving] = useState(false);
+  const totalGB = systemInfo.value?.total_memory_mb ? Math.max(1, Math.floor(systemInfo.value.total_memory_mb / 1024)) : 32;
+  const ramMax = Math.max(2, Math.min(32, totalGB));
+  const rec = getMemoryRecommendation(totalGB);
+  const recMin = Math.min(ramMax, Math.max(1, rec.rec - 2));
+  const recMax = Math.min(ramMax, rec.rec + 2);
+  const memoryZones: SliderZone[] = [
+    { from: 0.5, to: recMin, tone: 'low', label: 'Low' },
+    { from: recMin, to: recMax, tone: 'sweet', label: 'Recommended' },
+    { from: recMax, to: Math.min(ramMax, Math.max(recMax, ramMax * 0.75)), tone: 'high', label: 'High' },
+    { from: Math.min(ramMax, Math.max(recMax, ramMax * 0.75)), to: ramMax, tone: 'extreme', label: 'Aggressive' },
+  ];
+  const activeWindowPreset = WINDOW_PRESETS.find(p => p.w === width && p.h === height)?.id ?? 'custom';
+  const activeWindowLabel = WINDOW_PRESETS.find(p => p.id === activeWindowPreset)?.label ?? 'Custom';
+  const dirty = (
+    artSeed !== initialArtSeed ||
+    Math.round(maxMem * 1024) !== (inst.max_memory_mb ?? config.value?.max_memory_mb ?? 4096) ||
+    Math.round(Math.min(minMem, maxMem) * 1024) !== (inst.min_memory_mb ?? config.value?.min_memory_mb ?? 1024) ||
+    width !== (inst.window_width ?? 854) ||
+    height !== (inst.window_height ?? 480) ||
+    jvmPreset !== jvmPresetFrom(inst.jvm_preset) ||
+    javaPath !== (inst.java_path ?? '') ||
+    jvmArgs !== (inst.extra_jvm_args ?? '')
+  );
 
   useEffect(() => {
     setMinMem(prev => Math.min(prev, maxMem));
   }, [maxMem]);
 
   useEffect(() => {
+    const nextSeed = artSeedFor(inst);
+    setArtSeed(nextSeed);
     setMaxMem(memoryGb(inst.max_memory_mb, config.value?.max_memory_mb ?? 4096));
     setMinMem(memoryGb(inst.min_memory_mb, config.value?.min_memory_mb ?? 1024));
-  }, [inst.id, inst.max_memory_mb, inst.min_memory_mb]);
+    setWidth(inst.window_width ?? 854);
+    setHeight(inst.window_height ?? 480);
+    setJvmPreset(jvmPresetFrom(inst.jvm_preset));
+    setJavaPath(inst.java_path ?? '');
+    setJvmArgs(inst.extra_jvm_args ?? '');
+    setAdvancedOpen(Boolean(inst.java_path || inst.extra_jvm_args));
+  }, [
+    inst.id,
+    inst.art_seed,
+    inst.max_memory_mb,
+    inst.min_memory_mb,
+    inst.window_width,
+    inst.window_height,
+    inst.jvm_preset,
+    inst.java_path,
+    inst.extra_jvm_args,
+  ]);
 
   const save = async (): Promise<void> => {
     setSaving(true);
@@ -853,8 +920,9 @@ function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
         art_seed: artSeed,
         window_width: width,
         window_height: height,
-        java_path: javaPath || null,
-        extra_jvm_args: jvmArgs || null,
+        jvm_preset: jvmPreset,
+        java_path: javaPath,
+        extra_jvm_args: jvmArgs,
       });
       if (res?.error) throw new Error(res.error);
       updateInstanceInList(res);
@@ -867,115 +935,176 @@ function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
   };
 
   return (
-    <div class="cp-instance-body" style={{ display: 'block' }}>
-      <Card>
-        <SectionHeading
-          eyebrow="Artwork"
-          title="Instance identity"
-          right={<Button variant="soft" size="sm" icon="refresh" onClick={() => setArtSeed(seed => nextArtSeed(seed))}>Regenerate</Button>}
-        />
-        <div class="cp-art-settings">
-          <InstanceArt
-            instance={{ ...inst, art_seed: artSeed }}
-            aspect="square"
-            radius={theme.r.lg}
-            className="cp-art-settings-square"
-          />
-          <InstanceArt
-            instance={{ ...inst, art_seed: artSeed }}
-            aspect="banner"
-            radius={theme.r.lg}
-            className="cp-art-settings-banner"
-          />
-          <div class="cp-art-preset-list" aria-label="Artwork preset">
-            {ART_PRESETS.map((preset) => (
-              <button
-                key={preset}
-                type="button"
-                data-active={preset === artPreset}
-                aria-pressed={preset === artPreset}
-                onClick={() => setArtSeed((seed) => artSeedForPreset(seed, preset))}
+    <div class="cp-instance-body cp-settings-pane">
+      <div class="cp-settings-topline">
+        <SectionHeading eyebrow="Settings" title="Launch profile" />
+        <div class="cp-settings-save">
+          <span data-dirty={dirty}>{dirty ? 'Unsaved changes' : 'Up to date'}</span>
+          <Button onClick={save} disabled={saving || !dirty} sound="affirm">{saving ? 'Saving…' : 'Save settings'}</Button>
+        </div>
+      </div>
+
+      <div class="cp-settings-sheet">
+        <section class="cp-settings-row cp-settings-row--identity">
+          <div class="cp-settings-row-head">
+            <span class="cp-settings-section-icon"><Icon name="image" size={15} /></span>
+            <div>
+              <h3>Identity</h3>
+              <p>Artwork used for this instance.</p>
+            </div>
+          </div>
+          <div class="cp-settings-row-control cp-settings-identity-control">
+            <InstanceArt
+              instance={{ ...inst, art_seed: artSeed }}
+              aspect="square"
+              radius={12}
+              className="cp-settings-avatar"
+            />
+            <div>
+              <strong>{artPreset}</strong>
+              <span>Current style</span>
+            </div>
+            <Button variant="secondary" size="sm" icon="refresh" onClick={() => setArtSeed(seed => nextArtSeed(seed))}>
+              Regenerate
+            </Button>
+          </div>
+        </section>
+
+        <section class="cp-settings-row">
+          <div class="cp-settings-row-head">
+            <span class="cp-settings-section-icon"><Icon name="rectangle" size={15} /></span>
+            <div>
+              <h3>Window</h3>
+              <p>{activeWindowLabel} · {width} × {height}</p>
+            </div>
+          </div>
+          <div class="cp-settings-row-control cp-settings-window-control">
+            <div class="cp-settings-button-strip" aria-label="Window size">
+              {WINDOW_PRESETS.map((preset) => (
+                <Button
+                  key={preset.id}
+                  variant={activeWindowPreset === preset.id ? 'primary' : 'secondary'}
+                  size="sm"
+                  onClick={() => {
+                    setWidth(preset.w);
+                    setHeight(preset.h);
+                  }}
+                >
+                  {preset.label}
+                </Button>
+              ))}
+            </div>
+            <div class="cp-settings-dimensions">
+              <label>
+                <span>Width</span>
+                <Input
+                  type="number"
+                  value={String(width)}
+                  onChange={(v) => setWidth(clampWindowDimension(v, width))}
+                />
+              </label>
+              <label>
+                <span>Height</span>
+                <Input
+                  type="number"
+                  value={String(height)}
+                  onChange={(v) => setHeight(clampWindowDimension(v, height))}
+                />
+              </label>
+            </div>
+          </div>
+        </section>
+
+        <section class="cp-settings-row">
+          <div class="cp-settings-row-head">
+            <span class="cp-settings-section-icon"><Icon name="settings" size={15} /></span>
+            <div>
+              <h3>Memory</h3>
+              <p>Recommended range: {fmtMem(recMin)} to {fmtMem(recMax)}.</p>
+            </div>
+          </div>
+          <div class="cp-settings-row-control">
+            <div class="cp-settings-memory-grid">
+              <div class="cp-settings-slider-row">
+                <div class="cp-settings-slider-label">
+                  <span>Maximum heap</span>
+                  <strong>{fmtMem(maxMem)}</strong>
+                </div>
+                <Slider
+                  value={maxMem}
+                  min={1}
+                  max={ramMax}
+                  step={0.5}
+                  zones={memoryZones}
+                  sound="memory"
+                  onChange={setMaxMem}
+                  ariaLabel="Maximum heap in gigabytes"
+                />
+              </div>
+              <div class="cp-settings-slider-row">
+                <div class="cp-settings-slider-label">
+                  <span>Minimum heap</span>
+                  <strong>{fmtMem(minMem)}</strong>
+                </div>
+                <Slider
+                  value={minMem}
+                  min={0.5}
+                  max={maxMem}
+                  step={0.5}
+                  sound="memory"
+                  onChange={setMinMem}
+                  ariaLabel="Minimum heap in gigabytes"
+                />
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="cp-settings-row">
+          <div class="cp-settings-row-head">
+            <span class="cp-settings-section-icon"><Icon name="terminal" size={15} /></span>
+            <div>
+              <h3>Runtime</h3>
+              <p>{JVM_PRESET_LABELS[jvmPreset]} · {JVM_PRESET_HINTS[jvmPreset]}</p>
+            </div>
+          </div>
+          <div class="cp-settings-row-control">
+            <div class="cp-settings-button-strip" aria-label="Runtime preset">
+              {JVM_PRESET_ORDER.map((preset) => (
+                <Button
+                  key={preset || 'auto'}
+                  variant={jvmPreset === preset ? 'primary' : 'secondary'}
+                  size="sm"
+                  onClick={() => setJvmPreset(preset)}
+                >
+                  {JVM_PRESET_LABELS[preset]}
+                </Button>
+              ))}
+            </div>
+            <div class="cp-settings-advanced-toggle">
+              <Button
+                variant="secondary"
+                size="sm"
+                icon={advancedOpen ? 'chevron-up' : 'chevron-down'}
+                onClick={() => setAdvancedOpen(open => !open)}
               >
-                {preset}
-              </button>
-            ))}
-          </div>
-        </div>
-      </Card>
-      <div style={{ height: 16 }} />
-      <Card>
-        <SectionHeading eyebrow="Memory" title="JVM heap" />
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: 20 }}>
-          <div>
-            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 6 }}>
-              <span style={{ color: theme.n.textDim }}>Max heap</span>
-              <span style={{ color: theme.n.text, fontWeight: 700 }}>{maxMem} GB</span>
+                Advanced overrides
+              </Button>
             </div>
-            <input
-              type="range"
-              min="1" max="32" step="0.5"
-              value={String(maxMem)}
-              onInput={(e: any) => setMaxMem(parseFloat(e.currentTarget.value))}
-              style={{ width: '100%', accentColor: theme.accent.base }}
-            />
+            {advancedOpen && (
+              <div class="cp-settings-advanced-grid">
+                <label>
+                  <span>Java path</span>
+                  <Input value={javaPath} onChange={setJavaPath} placeholder="Managed Java" />
+                </label>
+                <label>
+                  <span>Extra JVM arguments</span>
+                  <Input value={jvmArgs} onChange={setJvmArgs} placeholder="-Dfoo=bar -Xss2m" />
+                </label>
+              </div>
+            )}
           </div>
-          <div>
-            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 6 }}>
-              <span style={{ color: theme.n.textDim }}>Min heap</span>
-              <span style={{ color: theme.n.text, fontWeight: 700 }}>{minMem} GB</span>
-            </div>
-            <input
-              type="range"
-              min="0.5" max={maxMem} step="0.5"
-              value={String(minMem)}
-              onInput={(e: any) => setMinMem(parseFloat(e.currentTarget.value))}
-              style={{ width: '100%', accentColor: theme.accent.base }}
-            />
-          </div>
-        </div>
-      </Card>
-      <div style={{ height: 16 }} />
-      <Card>
-        <SectionHeading eyebrow="Window" title="Game window" />
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 16 }}>
-          <div>
-            <div style={{ fontSize: 12, color: theme.n.textDim, marginBottom: 6 }}>Width</div>
-            <Input
-              value={String(width)}
-              onChange={(v) => {
-                const parsed = parseInt(v, 10);
-                if (!Number.isNaN(parsed)) setWidth(parsed);
-              }}
-            />
-          </div>
-          <div>
-            <div style={{ fontSize: 12, color: theme.n.textDim, marginBottom: 6 }}>Height</div>
-            <Input
-              value={String(height)}
-              onChange={(v) => {
-                const parsed = parseInt(v, 10);
-                if (!Number.isNaN(parsed)) setHeight(parsed);
-              }}
-            />
-          </div>
-        </div>
-      </Card>
-      <div style={{ height: 16 }} />
-      <Card>
-        <SectionHeading eyebrow="Advanced" title="Java runtime" />
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-          <div>
-            <div style={{ fontSize: 12, color: theme.n.textDim, marginBottom: 6 }}>Java path override</div>
-            <Input value={javaPath} onChange={setJavaPath} placeholder="Leave blank to use bundled Java" />
-          </div>
-          <div>
-            <div style={{ fontSize: 12, color: theme.n.textDim, marginBottom: 6 }}>Extra JVM args</div>
-            <Input value={jvmArgs} onChange={setJvmArgs} placeholder="-Dfoo=bar -Xss2m" />
-          </div>
-        </div>
-      </Card>
-      <div style={{ marginTop: 16, display: 'flex', justifyContent: 'flex-end' }}>
-        <Button onClick={save} disabled={saving} sound="affirm">{saving ? 'Saving…' : 'Save settings'}</Button>
+        </section>
       </div>
     </div>
   );
