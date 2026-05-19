@@ -2,6 +2,7 @@ use crate::events;
 use crate::state::{ApiRuntimeState, DesktopState};
 use croopor_api::state::{AppState, LaunchEvent, LaunchSessionRecord, LaunchStatusEvent};
 use croopor_launcher::LaunchState;
+use tauri::webview::Color;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 #[tauri::command]
@@ -59,6 +60,21 @@ pub fn window_start_dragging(app: AppHandle) -> Result<(), String> {
         .get_webview_window("main")
         .ok_or_else(|| "main window missing".to_string())?;
     window.start_dragging().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn window_set_resize_background(app: AppHandle, dark: bool) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "main window missing".to_string())?;
+    let color = if dark {
+        Color(16, 13, 10, 255)
+    } else {
+        Color(244, 241, 237, 255)
+    };
+    window
+        .set_background_color(Some(color))
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

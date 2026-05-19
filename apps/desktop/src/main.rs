@@ -52,7 +52,8 @@ async fn main() {
             commands::window_toggle_maximize,
             commands::window_close,
             commands::window_is_maximized,
-            commands::window_start_dragging
+            commands::window_start_dragging,
+            commands::window_set_resize_background
         ])
         .setup(move |app| {
             app.manage(state::ApiRuntimeState::new(api.addr));

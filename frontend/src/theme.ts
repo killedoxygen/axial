@@ -9,6 +9,7 @@ import { config } from './store';
 import { Sound } from './sound';
 import { buildTheme, type Theme } from './tokens';
 import { toast } from './toast';
+import { windowSetResizeBackground } from './native';
 
 // ── Reactive theme snapshot ──────────────────────────────────────────────────
 
@@ -21,6 +22,16 @@ export const themeSignal = signal<Theme>(buildTheme({
   hue: initialThemeHue,
   vibrancy: local.customVibrancy,
 }));
+
+let lastNativeResizeBackgroundDark: boolean | null = null;
+
+function syncNativeResizeBackground(dark: boolean): void {
+  if (lastNativeResizeBackgroundDark === dark) return;
+  lastNativeResizeBackgroundDark = dark;
+  windowSetResizeBackground(dark).catch(() => {
+    lastNativeResizeBackgroundDark = null;
+  });
+}
 
 // Vibrancy is a chroma multiplier, 0..100, 100 gives full chroma of 0.14
 // Lightness is 0..100 where 0 is dark and 100 is light, we snap at 50
@@ -85,6 +96,7 @@ export function applyTheme(theme: string, hue: number | null, options: ApplyOpti
 
   applyCssVars(resolvedHue, dark, vibrancy);
   themeSignal.value = buildTheme({ dark, hue: resolvedHue, vibrancy });
+  syncNativeResizeBackground(dark);
 
   local.theme = theme;
   local.lightness = lt;

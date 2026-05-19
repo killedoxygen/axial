@@ -168,3 +168,10 @@ export async function windowStartDragging(): Promise<boolean> {
   await tauri.core.invoke('window_start_dragging');
   return true;
 }
+
+export async function windowSetResizeBackground(dark: boolean): Promise<boolean> {
+  const tauri = getTauriBinding();
+  if (!tauri?.core) return false;
+  await tauri.core.invoke('window_set_resize_background', { dark });
+  return true;
+}
