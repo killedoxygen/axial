@@ -222,7 +222,11 @@
   border: none;
   background: transparent;
   color: inherit;
-  font: inherit;
+  font-family: inherit;
+  font-size: 14px;
+  font-style: normal;
+  font-weight: 600;
+  letter-spacing: -0.1px;
   cursor: pointer;
   transition: background 120ms ease, transform 120ms ease;
 }
@@ -235,9 +239,6 @@
 .cp-instance-split-launch-main {
   min-width: 92px;
   padding: 0 18px 0 20px;
-  font-size: 14px;
-  font-weight: 600;
-  letter-spacing: -0.1px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
