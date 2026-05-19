@@ -68,8 +68,7 @@ function PlayCard({ inst }: { inst: EnrichedInstance }): JSX.Element {
   };
   return (
     <div
-      class="cp-playcard"
-      style={{ border: 'none', font: 'inherit', color: 'inherit', cursor: 'pointer', background: undefined }}
+      class="cp-card cp-playcard"
       role="button"
       tabIndex={0}
       aria-label={`Open ${inst.name}`}

@@ -121,9 +121,14 @@
 
 /* Card -------------------------------------------------------------------- */
 .cp-card {
-  background: var(--surface-2);
-  border: 1px solid var(--line);
-  border-radius: var(--r-lg);
+  background: color-mix(in oklab, var(--surface-2) 86%, transparent);
+  border: 1px solid color-mix(in oklab, var(--line) 48%, transparent);
+  border-radius: var(--r-md);
+  box-shadow: inset 0 1px 0 oklch(1 0 0 / 0.025);
+  position: relative;
+}
+@supports not (background: color-mix(in oklab, white 50%, transparent)) {
+  .cp-card { background: var(--surface-2); }
 }
 
 /* Segmented --------------------------------------------------------------- */

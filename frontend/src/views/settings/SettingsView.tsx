@@ -1,6 +1,6 @@
 import type { JSX, ComponentChildren } from 'preact';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { Button, Input } from '../../ui/Atoms';
+import { Button, Card, Input } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { Slider } from '../../ui/Slider';
 import { AccentField, AccentModeToggle } from './AccentEditor';
@@ -36,7 +36,7 @@ function SettingsCard({
   children?: ComponentChildren;
 }): JSX.Element {
   return (
-    <div class={`cp-settings-card${stack ? ' cp-settings-card--stack' : ''}`}>
+    <Card class={`cp-settings-card${stack ? ' cp-settings-card--stack' : ''}`}>
       <div>
         <div class="cp-settings-card-title">{title}</div>
         {desc && <div class="cp-settings-card-desc">{desc}</div>}
@@ -45,7 +45,7 @@ function SettingsCard({
       {(control || (!stack && children)) && (
         <div class="cp-settings-card-control">{control || children}</div>
       )}
-    </div>
+    </Card>
   );
 }
 

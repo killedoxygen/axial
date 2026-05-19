@@ -104,8 +104,7 @@ function GridCard({ inst }: { inst: EnrichedInstance }): JSX.Element {
   };
   return (
     <div
-      class="cp-playcard"
-      style={{ border: 'none', font: 'inherit', color: 'inherit' }}
+      class="cp-card cp-playcard"
       role="button"
       tabIndex={0}
       aria-label={`Open ${inst.name}`}
@@ -161,7 +160,7 @@ export function InstancesView(): JSX.Element {
           {!q && <Button icon="plus" onClick={() => navigate({ name: 'create' })}>New instance</Button>}
         </div>
       ) : view === 'list' ? (
-        <div class="cp-table">
+        <div class="cp-card cp-table">
           <div class="cp-table-head" style={{ gridTemplateColumns: LIST_COLS }}>
             <span />
             <span>Instance</span>

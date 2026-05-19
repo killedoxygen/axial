@@ -42,9 +42,6 @@
   display: flex;
   gap: 14px;
   padding: 14px;
-  background: var(--surface-2);
-  border: 1px solid var(--line);
-  border-radius: var(--r-lg);
   align-items: center;
   transition: background 120ms;
   position: relative;
@@ -110,9 +107,6 @@
 
 /* Instances table */
 .cp-table {
-  background: var(--surface-2);
-  border: 1px solid var(--line);
-  border-radius: var(--r-lg);
   overflow: hidden;
 }
 .cp-table-head {

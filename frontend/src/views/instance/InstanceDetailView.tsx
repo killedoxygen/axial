@@ -168,7 +168,7 @@ function WorldsEmptyArt(): JSX.Element {
 function WorldsCard({ inst, onOpenWorlds }: { inst: EnrichedInstance; onOpenWorlds: () => void }): JSX.Element {
   const count = inst.saves_count ?? 0;
   return (
-    <Card padding={22} class={`cp-od-card cp-od-worlds-card${count === 0 ? ' cp-od-worlds-card--empty' : ''}`}>
+    <Card padding={22} class={`cp-od-worlds-card${count === 0 ? ' cp-od-worlds-card--empty' : ''}`}>
       <div class="cp-od-head">
         <h3>Worlds{count > 0 ? <span class="cp-od-head-count">· {count}</span> : null}</h3>
         <button class="cp-od-overflow" type="button" aria-label="More" onClick={(e) => openContextMenu(e, [
@@ -239,7 +239,7 @@ function ActivityCard({ inst, onOpenLogs }: { inst: EnrichedInstance; onOpenLogs
   }, [inst.id, inst.created_at, inst.last_played_at, inst.java_major, v?.loader]);
 
   return (
-    <Card padding={22} class="cp-od-card">
+    <Card padding={22}>
       <div class="cp-od-head cp-od-head--iconed">
         <div class="cp-od-head-tile"><Icon name="activity" size={13} stroke={1.9} /></div>
         <h3>Activity</h3>
@@ -265,7 +265,7 @@ function ActivityCard({ inst, onOpenLogs }: { inst: EnrichedInstance; onOpenLogs
 function LogsCard({ inst, onOpenLogs }: { inst: EnrichedInstance; onOpenLogs: () => void }): JSX.Element {
   const summary = inst.last_played_at ? 'Last launch · no errors' : 'No launch logs yet';
   return (
-    <Card padding={16} class="cp-od-card cp-od-logs-card">
+    <Card padding={16} class="cp-od-logs-card">
       <div class="cp-od-logs-summary">
         <span class="cp-od-logs-icon"><Icon name="terminal" size={14} stroke={1.9} /></span>
         <div class="cp-od-logs-line">
@@ -292,7 +292,7 @@ function QuickActionsCard({
   onOpenLogs: () => void;
 }): JSX.Element {
   return (
-    <Card padding={20} class="cp-od-card cp-od-quick-card">
+    <Card padding={20} class="cp-od-quick-card">
       <div class="cp-od-head">
         <h3>Quick actions</h3>
       </div>
@@ -503,7 +503,7 @@ function PerformanceCard({ inst, onOpenSettings }: { inst: EnrichedInstance; onO
   ];
 
   return (
-    <Card padding={22} class="cp-od-card">
+    <Card padding={22}>
       <div class="cp-od-head">
         <h3>Performance</h3>
         <button class="cp-od-link" type="button" onClick={onOpenSettings}>
@@ -565,7 +565,7 @@ function PerformanceCard({ inst, onOpenSettings }: { inst: EnrichedInstance; onO
 
 function MaintenanceCard(): JSX.Element {
   return (
-    <Card padding={22} class="cp-od-card cp-od-card--side">
+    <Card padding={22}>
       <div class="cp-od-head">
         <h3>Maintenance</h3>
       </div>
@@ -606,7 +606,7 @@ function DetailsCard({ inst, running }: { inst: EnrichedInstance; running: boole
   const loaderVer = v?.loader?.loader_version ? ` ${v.loader.loader_version}` : '';
   const mcVer = v?.minecraft_meta.display_name || v?.minecraft_meta.display_hint || 'unknown';
   return (
-    <Card padding={22} class="cp-od-card cp-od-card--side">
+    <Card padding={22}>
       <div class="cp-od-head">
         <h3>Details</h3>
       </div>

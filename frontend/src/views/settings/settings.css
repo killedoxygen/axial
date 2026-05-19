@@ -52,10 +52,6 @@
 }
 
 .cp-settings-card {
-  padding: 18px;
-  background: var(--surface-2);
-  border: 1px solid var(--line);
-  border-radius: var(--r-lg);
   display: grid;
   grid-template-columns: 1fr auto;
   gap: 20px;

@@ -108,12 +108,11 @@
 .cp-instance-pills-row .cp-pill {
   font-size: 11.5px;
   padding: 4px 10px;
+  color: #fff;
 }
-/* Lifted from --text-mute to --text-dim — the previous shade read as
- * disabled against the dark banner. */
 .cp-instance-mc-version {
   font-size: 13px;
-  color: var(--text-dim);
+  color: #fff;
   font-variant-numeric: tabular-nums;
   letter-spacing: 0.1px;
   text-shadow: 0 1px 6px rgba(0,0,0,0.55);
@@ -389,18 +388,6 @@
 }
 @keyframes cp-od-rise {
   to { opacity: 1; transform: translateY(0); }
-}
-
-/* ─── Flat card surface for the overview ─── */
-.cp-od-card {
-  border-color: color-mix(in oklab, var(--line) 48%, transparent);
-  border-radius: var(--r-md);
-  background: color-mix(in oklab, var(--surface-2) 86%, transparent);
-  box-shadow: inset 0 1px 0 oklch(1 0 0 / 0.025);
-  position: relative;
-}
-@supports not (background: color-mix(in oklab, white 50%, transparent)) {
-  .cp-od-card { background: var(--surface-2); }
 }
 
 /* ─── Card head ─── */
