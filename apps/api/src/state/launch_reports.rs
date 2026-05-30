@@ -12,7 +12,8 @@ use sysinfo::System;
 
 const LAUNCH_PROOF_SCHEMA: &str = "croopor.launch.proof";
 const LAUNCH_PROOF_SCHEMA_VERSION: u32 = 1;
-const LAUNCH_COMPARISON_METRIC_NAME: &str = "total_completed_stage_duration_ms";
+const LAUNCH_STAGE_COMPARISON_METRIC_NAME: &str = "total_completed_stage_duration_ms";
+const LAUNCH_BOOT_COMPARISON_METRIC_NAME: &str = "boot_duration_ms";
 const MAX_REPORT_FILENAME_STEM: usize = 96;
 const MAX_BENCHMARK_METADATA_CHARS: usize = 96;
 // Conservative free-space warning threshold for launch caches, natives, and prewarm writes.
@@ -386,12 +387,13 @@ fn build_comparison_from_candidates(
     current: &LaunchProofRecord,
     candidates: &[LaunchProofRecord],
 ) -> Option<LaunchProofComparison> {
-    let current_value_ms = launch_total_completed_stage_duration_ms(current)?;
+    let (metric_name, current_value_ms, metric_value) =
+        launch_comparison_metric_for_current(current)?;
     let mut matches = candidates
         .iter()
         .filter(|candidate| comparison_dimensions_match(current, candidate))
         .filter_map(|candidate| {
-            let value_ms = launch_total_completed_stage_duration_ms(candidate)?;
+            let value_ms = metric_value(candidate)?;
             (value_ms > 0).then_some((candidate, value_ms))
         })
         .collect::<Vec<_>>();
@@ -409,12 +411,30 @@ fn build_comparison_from_candidates(
         baseline_session_id: baseline.session_id.clone(),
         baseline_recorded_at: baseline.recorded_at.clone(),
         matched_sample_count,
-        metric_name: LAUNCH_COMPARISON_METRIC_NAME.to_string(),
+        metric_name: metric_name.to_string(),
         current_value_ms,
         baseline_value_ms: *baseline_value_ms,
         delta_ms,
         delta_percent: (delta_ms as f64 / *baseline_value_ms as f64) * 100.0,
     })
+}
+
+fn launch_comparison_metric_for_current(
+    current: &LaunchProofRecord,
+) -> Option<(&'static str, u64, fn(&LaunchProofRecord) -> Option<u64>)> {
+    if let Some(boot_duration_ms) = current.boot_duration_ms {
+        return Some((
+            LAUNCH_BOOT_COMPARISON_METRIC_NAME,
+            boot_duration_ms,
+            launch_boot_duration_ms,
+        ));
+    }
+
+    Some((
+        LAUNCH_STAGE_COMPARISON_METRIC_NAME,
+        launch_total_completed_stage_duration_ms(current)?,
+        launch_total_completed_stage_duration_ms,
+    ))
 }
 
 fn comparison_dimensions_match(current: &LaunchProofRecord, candidate: &LaunchProofRecord) -> bool {
@@ -486,6 +506,10 @@ fn launch_total_completed_stage_duration_ms(report: &LaunchProofRecord) -> Optio
         completed = true;
     }
     completed.then_some(total)
+}
+
+fn launch_boot_duration_ms(report: &LaunchProofRecord) -> Option<u64> {
+    report.boot_duration_ms
 }
 
 fn metric_delta_ms(current_value_ms: u64, baseline_value_ms: u64) -> i64 {
@@ -945,11 +969,40 @@ mod tests {
         assert_eq!(comparison.baseline_session_id, "baseline");
         assert_eq!(comparison.baseline_recorded_at, "2026-01-01T00:00:00.000Z");
         assert_eq!(comparison.matched_sample_count, 1);
-        assert_eq!(comparison.metric_name, LAUNCH_COMPARISON_METRIC_NAME);
+        assert_eq!(comparison.metric_name, LAUNCH_STAGE_COMPARISON_METRIC_NAME);
         assert_eq!(comparison.current_value_ms, 90);
         assert_eq!(comparison.baseline_value_ms, 120);
         assert_eq!(comparison.delta_ms, -30);
         assert_eq!(comparison.delta_percent, -25.0);
+    }
+
+    #[test]
+    fn matching_boot_duration_launch_report_uses_boot_duration_comparison() {
+        let mut current = comparison_report("current", "2026-01-02T00:00:00.000Z", 90);
+        current.boot_duration_ms = Some(50);
+        let mut previous = comparison_report("baseline", "2026-01-01T00:00:00.000Z", 120);
+        previous.boot_duration_ms = Some(75);
+
+        let comparison = build_comparison_from_candidates(&current, &[previous])
+            .expect("matching boot duration comparison");
+
+        assert_eq!(comparison.baseline_session_id, "baseline");
+        assert_eq!(comparison.matched_sample_count, 1);
+        assert_eq!(comparison.metric_name, LAUNCH_BOOT_COMPARISON_METRIC_NAME);
+        assert_eq!(comparison.current_value_ms, 50);
+        assert_eq!(comparison.baseline_value_ms, 75);
+        assert_eq!(comparison.delta_ms, -25);
+    }
+
+    #[test]
+    fn current_boot_duration_launch_report_does_not_compare_to_stage_only_candidate() {
+        let mut current = comparison_report("current", "2026-01-02T00:00:00.000Z", 90);
+        current.boot_duration_ms = Some(50);
+        let previous = comparison_report("baseline", "2026-01-01T00:00:00.000Z", 120);
+
+        let comparison = build_comparison_from_candidates(&current, &[previous]);
+
+        assert_eq!(comparison, None);
     }
 
     #[test]
@@ -994,7 +1047,7 @@ mod tests {
         let comparison = second.comparison.expect("persisted comparison");
         assert_eq!(comparison.baseline_session_id, "baseline");
         assert_eq!(comparison.matched_sample_count, 1);
-        assert_eq!(comparison.metric_name, LAUNCH_COMPARISON_METRIC_NAME);
+        assert_eq!(comparison.metric_name, LAUNCH_STAGE_COMPARISON_METRIC_NAME);
         assert_eq!(comparison.current_value_ms, 90);
         assert_eq!(comparison.baseline_value_ms, 120);
         assert_eq!(comparison.delta_ms, -30);
