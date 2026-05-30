@@ -1048,6 +1048,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    const CURRENT_FAMILY_F_REPRESENTATIVE: &str = "1.21.1";
+
     #[tokio::test]
     async fn ensure_installed_writes_composition_managed_ownership() {
         let root = test_root("ensure-installed-ownership");
@@ -1242,6 +1244,135 @@ mod tests {
             &requests,
             "/v2/project/declared-slug/version"
         ));
+    }
+
+    #[tokio::test]
+    async fn representative_modern_fabric_plans_install_without_composition_fallback() {
+        let (base_url, requests) = spawn_representative_modrinth_server().await;
+        let manager =
+            PerformanceManager::new_with_modrinth_base_url(base_url).expect("performance manager");
+
+        for (game_version, expected_family, expected_composition) in [
+            ("1.16.5", VersionFamily::E, "family-e-fabric-extended"),
+            ("1.20.1", VersionFamily::E, "family-e-fabric-extended"),
+            (
+                CURRENT_FAMILY_F_REPRESENTATIVE,
+                VersionFamily::F,
+                "family-f-fabric-extended",
+            ),
+        ] {
+            let root = test_root(&format!(
+                "representative-modern-fabric-{}",
+                game_version.replace('.', "-")
+            ));
+            fs::write(root.join("user-owned.jar"), b"user-owned").expect("write user-owned mod");
+            let plan = manager.get_plan(ResolutionRequest {
+                game_version: game_version.to_string(),
+                loader: "fabric".to_string(),
+                mode: PerformanceMode::Managed,
+                hardware: crate::types::HardwareProfile::default(),
+                installed_mods: vec!["user-owned".to_string()],
+            });
+            let planned_projects = plan
+                .mods
+                .iter()
+                .map(|managed_mod| managed_mod.project_id.clone())
+                .collect::<Vec<_>>();
+
+            assert_eq!(plan.composition_id, expected_composition, "{game_version}");
+            assert_eq!(plan.family, expected_family, "{game_version}");
+            assert_eq!(plan.tier, CompositionTier::Extended, "{game_version}");
+            assert!(!plan.mods.is_empty(), "{game_version}");
+            assert!(
+                plan.fallback_chain
+                    .iter()
+                    .any(|fallback| fallback.contains("core")),
+                "{game_version}"
+            );
+
+            let state = manager
+                .ensure_installed(&plan, game_version, &root)
+                .await
+                .unwrap_or_else(|error| panic!("{game_version} representative install: {error}"));
+
+            assert_eq!(state.composition_id, expected_composition, "{game_version}");
+            assert_eq!(state.tier, CompositionTier::Extended, "{game_version}");
+            assert_eq!(state.failure_count, 0, "{game_version}");
+            assert_eq!(
+                state.installed_mods.len(),
+                planned_projects.len(),
+                "{game_version}"
+            );
+            assert_eq!(
+                state
+                    .installed_mods
+                    .iter()
+                    .map(|installed| installed.project_id.clone())
+                    .collect::<Vec<_>>(),
+                sorted_projects(planned_projects),
+                "{game_version}"
+            );
+
+            let loaded = load_state(&root)
+                .expect("load representative state")
+                .expect("representative state should be saved");
+            assert_eq!(
+                loaded.composition_id, expected_composition,
+                "{game_version}"
+            );
+            assert_eq!(loaded.failure_count, 0, "{game_version}");
+            assert_eq!(
+                loaded.installed_mods.len(),
+                state.installed_mods.len(),
+                "{game_version}"
+            );
+            assert!(
+                loaded
+                    .installed_mods
+                    .iter()
+                    .all(|installed| installed.ownership_class
+                        == OwnershipClass::CompositionManaged
+                        && installed.source.provider == ManagedArtifactProvider::Modrinth
+                        && installed.integrity.sha512_verified),
+                "{game_version}"
+            );
+            assert_eq!(
+                fs::read(root.join("user-owned.jar")).expect("read user-owned mod"),
+                b"user-owned",
+                "{game_version}"
+            );
+            assert!(
+                loaded
+                    .installed_mods
+                    .iter()
+                    .all(|installed| installed.project_id != "user-owned"),
+                "{game_version}"
+            );
+            for installed in &loaded.installed_mods {
+                assert!(root.join(&installed.filename).is_file(), "{game_version}");
+            }
+
+            let _ = fs::remove_dir_all(root);
+        }
+
+        let requests = requests.lock().expect("request log").clone();
+        for project in [
+            "sodium",
+            "lithium",
+            "ferrite-core",
+            "immediatelyfast",
+            "dynamic-fps",
+            "modernfix",
+        ] {
+            assert!(
+                request_log_contains(&requests, &format!("/v2/project/{project}/version")),
+                "{project}"
+            );
+            assert!(
+                request_log_contains(&requests, &format!("/files/{project}.jar")),
+                "{project}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2208,6 +2339,117 @@ mod tests {
 
     fn request_log_contains(requests: &[String], needle: &str) -> bool {
         requests.iter().any(|request| request.contains(needle))
+    }
+
+    fn sorted_projects(mut projects: Vec<String>) -> Vec<String> {
+        projects.sort();
+        projects
+    }
+
+    async fn spawn_representative_modrinth_server() -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind representative modrinth test server");
+        let addr = listener.local_addr().expect("representative modrinth addr");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let request_log = Arc::clone(&requests);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let request_log = Arc::clone(&request_log);
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0_u8; 1024];
+                    loop {
+                        let Ok(read) = stream.read(&mut buf).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&buf[..read]);
+                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                        if request.len() > 8192 {
+                            return;
+                        }
+                    }
+
+                    let request = String::from_utf8_lossy(&request);
+                    let first_line = request.lines().next().unwrap_or_default().to_string();
+                    request_log
+                        .lock()
+                        .expect("record request")
+                        .push(first_line.clone());
+
+                    let (status, content_type, body) =
+                        representative_modrinth_response(&addr, &first_line);
+                    let headers = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    if stream.write_all(headers.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    let _ = stream.write_all(&body).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), requests)
+    }
+
+    fn representative_modrinth_response(
+        addr: &std::net::SocketAddr,
+        first_line: &str,
+    ) -> (&'static str, &'static str, Vec<u8>) {
+        if let Some(project) = representative_project_from_version_request(first_line) {
+            return (
+                "200 OK",
+                "application/json",
+                representative_version_response_body(addr, project),
+            );
+        }
+        if let Some(project) = representative_project_from_file_request(first_line) {
+            return (
+                "200 OK",
+                "application/octet-stream",
+                representative_file_body(project),
+            );
+        }
+        ("404 Not Found", "text/plain", b"not found".to_vec())
+    }
+
+    fn representative_project_from_version_request(first_line: &str) -> Option<&str> {
+        let start = first_line.find("/v2/project/")? + "/v2/project/".len();
+        let rest = &first_line[start..];
+        let end = rest.find("/version")?;
+        Some(&rest[..end])
+    }
+
+    fn representative_project_from_file_request(first_line: &str) -> Option<&str> {
+        let start = first_line.find("/files/")? + "/files/".len();
+        let rest = &first_line[start..];
+        let end = rest.find(".jar")?;
+        Some(&rest[..end])
+    }
+
+    fn representative_version_response_body(
+        addr: &std::net::SocketAddr,
+        project_ref: &str,
+    ) -> Vec<u8> {
+        let file_url = format!("http://{addr}/files/{project_ref}.jar");
+        let sha512 = hex::encode(sha2::Sha512::digest(representative_file_body(project_ref)));
+        format!(
+            r#"[{{"id":"{project_ref}-representative-version","game_versions":["1.16.5","1.20.1","{CURRENT_FAMILY_F_REPRESENTATIVE}"],"loaders":["fabric"],"featured":true,"date_published":"2026-05-30T00:00:00Z","files":[{{"url":"{file_url}","filename":"{project_ref}.jar","primary":true,"hashes":{{"sha512":"{sha512}"}}}}]}}]"#
+        )
+        .into_bytes()
+    }
+
+    fn representative_file_body(project_ref: &str) -> Vec<u8> {
+        format!("{project_ref}-representative-jar").into_bytes()
     }
 
     async fn spawn_selective_modrinth_server(success_projects: &[&str]) -> String {
