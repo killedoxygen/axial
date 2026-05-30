@@ -387,10 +387,15 @@ fn build_comparison_from_candidates(
     current: &LaunchProofRecord,
     candidates: &[LaunchProofRecord],
 ) -> Option<LaunchProofComparison> {
+    if !launch_proof_outcome_is_comparable(&current.outcome) {
+        return None;
+    }
+
     let (metric_name, current_value_ms, metric_value) =
         launch_comparison_metric_for_current(current)?;
     let mut matches = candidates
         .iter()
+        .filter(|candidate| launch_proof_outcome_is_comparable(&candidate.outcome))
         .filter(|candidate| comparison_dimensions_match(current, candidate))
         .filter_map(|candidate| {
             let value_ms = metric_value(candidate)?;
@@ -417,6 +422,10 @@ fn build_comparison_from_candidates(
         delta_ms,
         delta_percent: (delta_ms as f64 / *baseline_value_ms as f64) * 100.0,
     })
+}
+
+fn launch_proof_outcome_is_comparable(outcome: &str) -> bool {
+    matches!(outcome.trim(), "running" | "exited" | "completed")
 }
 
 fn launch_comparison_metric_for_current(
@@ -1001,6 +1010,44 @@ mod tests {
         let previous = comparison_report("baseline", "2026-01-01T00:00:00.000Z", 120);
 
         let comparison = build_comparison_from_candidates(&current, &[previous]);
+
+        assert_eq!(comparison, None);
+    }
+
+    #[test]
+    fn failed_current_launch_report_does_not_compare_to_matching_successful_candidate() {
+        let mut current = comparison_report("current", "2026-01-02T00:00:00.000Z", 90);
+        current.outcome = "failed".to_string();
+        let previous = comparison_report("baseline", "2026-01-01T00:00:00.000Z", 120);
+
+        let comparison = build_comparison_from_candidates(&current, &[previous]);
+
+        assert_eq!(comparison, None);
+    }
+
+    #[test]
+    fn failed_candidate_is_ignored_for_launch_report_comparison() {
+        let current = comparison_report("current", "2026-01-03T00:00:00.000Z", 90);
+        let successful = comparison_report("successful", "2026-01-01T00:00:00.000Z", 120);
+        let mut failed = comparison_report("failed", "2026-01-02T00:00:00.000Z", 10);
+        failed.outcome = "failed".to_string();
+
+        let comparison = build_comparison_from_candidates(&current, &[successful, failed])
+            .expect("matching successful report comparison");
+
+        assert_eq!(comparison.baseline_session_id, "successful");
+        assert_eq!(comparison.matched_sample_count, 1);
+        assert_eq!(comparison.baseline_value_ms, 120);
+        assert_eq!(comparison.delta_ms, -30);
+    }
+
+    #[test]
+    fn failed_candidate_does_not_produce_launch_report_comparison() {
+        let current = comparison_report("current", "2026-01-03T00:00:00.000Z", 90);
+        let mut failed = comparison_report("failed", "2026-01-02T00:00:00.000Z", 10);
+        failed.outcome = "failed".to_string();
+
+        let comparison = build_comparison_from_candidates(&current, &[failed]);
 
         assert_eq!(comparison, None);
     }
