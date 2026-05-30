@@ -1,7 +1,7 @@
 use crate::types::{
     CompositionDef, CompositionPlan, CompositionTier, EmergencyDisable, EmergencyDisableTarget,
-    HardwareProfile, ManagedMod, Manifest, ModCondition, PerformanceMode, ResolutionRequest,
-    VersionFamily,
+    HardwareProfile, ManagedArtifactDefinition, ManagedMod, Manifest, ModCondition, OwnershipClass,
+    PerformanceMode, ResolutionRequest, VersionFamily,
 };
 use regex::Regex;
 #[cfg(target_os = "linux")]
@@ -38,6 +38,32 @@ pub enum ResolveError {
     MissingRuleChannel,
     #[error("unsupported rule_channel: {0}")]
     UnsupportedRuleChannel(String),
+    #[error("artifact id is required")]
+    MissingArtifactId,
+    #[error("duplicate artifact id: {0}")]
+    DuplicateArtifactId(String),
+    #[error("artifact {0} source project_id is required")]
+    MissingArtifactProjectId(String),
+    #[error("artifact {0} source slug is required")]
+    MissingArtifactSlug(String),
+    #[error("artifact {0} must be composition_managed")]
+    InvalidArtifactOwnership(String),
+    #[error("managed mod artifact_id is required")]
+    MissingManagedModArtifactId,
+    #[error("managed mod references unknown artifact: {0}")]
+    UnknownManagedModArtifact(String),
+    #[error("managed mod {artifact_id} project_id mismatch: expected {expected}, found {actual}")]
+    ManagedModProjectMismatch {
+        artifact_id: String,
+        expected: String,
+        actual: String,
+    },
+    #[error("managed mod {artifact_id} slug mismatch: expected {expected}, found {actual}")]
+    ManagedModSlugMismatch {
+        artifact_id: String,
+        expected: String,
+        actual: String,
+    },
     #[error("composition id is required")]
     MissingCompositionId,
     #[error("duplicate composition id: {0}")]
@@ -70,6 +96,7 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), ResolveError> {
     }
     validate_app_version_compatibility(&manifest.minimum_app_version)?;
     validate_rule_channel(&manifest.rule_channel)?;
+    let artifacts = validate_artifacts(&manifest.artifacts)?;
 
     let mut ids = std::collections::HashSet::new();
     for composition in &manifest.compositions {
@@ -87,19 +114,12 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), ResolveError> {
                 composition.fallback_to.clone(),
             ));
         }
-    }
-
-    let mut artifact_ids = std::collections::HashSet::new();
-    for composition in &manifest.compositions {
         for managed_mod in &composition.mods {
-            if !managed_mod.project_id.is_empty() {
-                artifact_ids.insert(managed_mod.project_id.to_lowercase());
-            }
-            if !managed_mod.slug.is_empty() {
-                artifact_ids.insert(managed_mod.slug.to_lowercase());
-            }
+            validate_managed_mod_artifact(managed_mod, &artifacts)?;
         }
     }
+
+    let artifact_targets = declared_artifact_targets(&manifest.artifacts);
 
     let mut disable_ids = std::collections::HashSet::new();
     for disable in &manifest.emergency_disables {
@@ -126,7 +146,7 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), ResolveError> {
                 }
             }
             EmergencyDisableTarget::Artifact => {
-                if !artifact_ids.contains(&disable.target_id.to_lowercase()) {
+                if !artifact_targets.contains(&disable.target_id.to_lowercase()) {
                     return Err(ResolveError::UnknownEmergencyDisableArtifact(
                         disable.target_id.clone(),
                     ));
@@ -136,6 +156,74 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), ResolveError> {
     }
 
     Ok(())
+}
+
+fn validate_artifacts(
+    artifacts: &[ManagedArtifactDefinition],
+) -> Result<std::collections::HashMap<String, &ManagedArtifactDefinition>, ResolveError> {
+    let mut ids = std::collections::HashSet::new();
+    let mut by_id = std::collections::HashMap::new();
+    for artifact in artifacts {
+        if artifact.id.trim().is_empty() {
+            return Err(ResolveError::MissingArtifactId);
+        }
+        let normalized_id = artifact.id.to_lowercase();
+        if !ids.insert(normalized_id.clone()) {
+            return Err(ResolveError::DuplicateArtifactId(artifact.id.clone()));
+        }
+        if artifact.source.project_id.trim().is_empty() {
+            return Err(ResolveError::MissingArtifactProjectId(artifact.id.clone()));
+        }
+        if artifact.source.slug.trim().is_empty() {
+            return Err(ResolveError::MissingArtifactSlug(artifact.id.clone()));
+        }
+        if artifact.ownership_class != OwnershipClass::CompositionManaged {
+            return Err(ResolveError::InvalidArtifactOwnership(artifact.id.clone()));
+        }
+        by_id.insert(normalized_id, artifact);
+    }
+    Ok(by_id)
+}
+
+fn validate_managed_mod_artifact(
+    managed_mod: &ManagedMod,
+    artifacts: &std::collections::HashMap<String, &ManagedArtifactDefinition>,
+) -> Result<(), ResolveError> {
+    if managed_mod.artifact_id.trim().is_empty() {
+        return Err(ResolveError::MissingManagedModArtifactId);
+    }
+    let Some(artifact) = artifacts.get(&managed_mod.artifact_id.to_lowercase()) else {
+        return Err(ResolveError::UnknownManagedModArtifact(
+            managed_mod.artifact_id.clone(),
+        ));
+    };
+    if managed_mod.project_id != artifact.source.project_id {
+        return Err(ResolveError::ManagedModProjectMismatch {
+            artifact_id: managed_mod.artifact_id.clone(),
+            expected: artifact.source.project_id.clone(),
+            actual: managed_mod.project_id.clone(),
+        });
+    }
+    if managed_mod.slug != artifact.source.slug {
+        return Err(ResolveError::ManagedModSlugMismatch {
+            artifact_id: managed_mod.artifact_id.clone(),
+            expected: artifact.source.slug.clone(),
+            actual: managed_mod.slug.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn declared_artifact_targets(
+    artifacts: &[ManagedArtifactDefinition],
+) -> std::collections::HashSet<String> {
+    let mut targets = std::collections::HashSet::new();
+    for artifact in artifacts {
+        targets.insert(artifact.id.to_lowercase());
+        targets.insert(artifact.source.project_id.to_lowercase());
+        targets.insert(artifact.source.slug.to_lowercase());
+    }
+    targets
 }
 
 fn validate_app_version_compatibility(minimum_app_version: &str) -> Result<(), ResolveError> {
@@ -661,16 +749,30 @@ fn active_artifact_disable<'a>(
 ) -> Option<&'a EmergencyDisable> {
     manifest.emergency_disables.iter().find(|disable| {
         disable.target == EmergencyDisableTarget::Artifact
-            && artifact_target_matches(disable, managed_mod)
+            && artifact_target_matches(manifest, disable, managed_mod)
             && disable_applies(disable, family, loader, tier)
     })
 }
 
-fn artifact_target_matches(disable: &EmergencyDisable, managed_mod: &ManagedMod) -> bool {
-    disable
-        .target_id
-        .eq_ignore_ascii_case(&managed_mod.project_id)
-        || disable.target_id.eq_ignore_ascii_case(&managed_mod.slug)
+fn artifact_target_matches(
+    manifest: &Manifest,
+    disable: &EmergencyDisable,
+    managed_mod: &ManagedMod,
+) -> bool {
+    let Some(artifact) = manifest
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.id.eq_ignore_ascii_case(&managed_mod.artifact_id))
+    else {
+        return false;
+    };
+    disable.target_id.eq_ignore_ascii_case(&artifact.id)
+        || disable
+            .target_id
+            .eq_ignore_ascii_case(&artifact.source.project_id)
+        || disable
+            .target_id
+            .eq_ignore_ascii_case(&artifact.source.slug)
 }
 
 fn disable_applies(
@@ -1025,8 +1127,8 @@ mod tests {
         validate_manifest,
     };
     use crate::types::{
-        CompositionTier, EmergencyDisable, EmergencyDisableTarget, HardwareProfile, Manifest,
-        PerformanceMode, VersionFamily,
+        CompositionTier, EmergencyDisable, EmergencyDisableTarget, HardwareProfile, ManagedMod,
+        Manifest, OwnershipClass, PerformanceMode, VersionFamily,
     };
 
     #[test]
@@ -1206,6 +1308,7 @@ mod tests {
             "generated_at": "2026-04-02T00:00:00Z",
             "minimum_app_version": "0.3.1",
             "rule_channel": "bundled",
+            "artifacts": [],
             "compositions": []
         }))
         .expect_err("missing emergency_disables should be invalid current schema");
@@ -1214,11 +1317,27 @@ mod tests {
     }
 
     #[test]
+    fn manifest_without_artifacts_is_not_current_schema() {
+        let error = serde_json::from_value::<Manifest>(serde_json::json!({
+            "schema_version": 1,
+            "generated_at": "2026-04-02T00:00:00Z",
+            "minimum_app_version": "0.3.1",
+            "rule_channel": "bundled",
+            "compositions": [],
+            "emergency_disables": []
+        }))
+        .expect_err("missing artifacts should be invalid current schema");
+
+        assert!(error.to_string().contains("artifacts"));
+    }
+
+    #[test]
     fn manifest_without_minimum_app_version_is_not_current_schema() {
         let error = serde_json::from_value::<Manifest>(serde_json::json!({
             "schema_version": 1,
             "generated_at": "2026-04-02T00:00:00Z",
             "rule_channel": "bundled",
+            "artifacts": [],
             "compositions": [],
             "emergency_disables": []
         }))
@@ -1233,6 +1352,7 @@ mod tests {
             "schema_version": 1,
             "generated_at": "2026-04-02T00:00:00Z",
             "minimum_app_version": "0.3.1",
+            "artifacts": [],
             "compositions": [],
             "emergency_disables": []
         }))
@@ -1290,6 +1410,85 @@ mod tests {
 
             validate_manifest(&manifest).expect("manifest minimum should be compatible");
         }
+    }
+
+    #[test]
+    fn validation_rejects_invalid_artifact_definitions() {
+        let mut empty_id = builtin_manifest().expect("manifest");
+        empty_id.artifacts[0].id = String::new();
+        assert_error_kind(
+            validate_manifest(&empty_id),
+            ResolveError::MissingArtifactId,
+        );
+
+        let mut duplicate_id = builtin_manifest().expect("manifest");
+        duplicate_id
+            .artifacts
+            .push(duplicate_id.artifacts[0].clone());
+        assert_error_kind(
+            validate_manifest(&duplicate_id),
+            ResolveError::DuplicateArtifactId("sodium".to_string()),
+        );
+
+        let mut missing_project = builtin_manifest().expect("manifest");
+        missing_project.artifacts[0].source.project_id = String::new();
+        assert_error_kind(
+            validate_manifest(&missing_project),
+            ResolveError::MissingArtifactProjectId("sodium".to_string()),
+        );
+
+        let mut missing_slug = builtin_manifest().expect("manifest");
+        missing_slug.artifacts[0].source.slug = String::new();
+        assert_error_kind(
+            validate_manifest(&missing_slug),
+            ResolveError::MissingArtifactSlug("sodium".to_string()),
+        );
+
+        let mut user_owned = builtin_manifest().expect("manifest");
+        user_owned.artifacts[0].ownership_class = OwnershipClass::UserManaged;
+        assert_error_kind(
+            validate_manifest(&user_owned),
+            ResolveError::InvalidArtifactOwnership("sodium".to_string()),
+        );
+    }
+
+    #[test]
+    fn validation_rejects_invalid_managed_mod_artifact_references() {
+        let mut missing_reference = builtin_manifest().expect("manifest");
+        first_managed_mod_mut(&mut missing_reference).artifact_id = String::new();
+        assert_error_kind(
+            validate_manifest(&missing_reference),
+            ResolveError::MissingManagedModArtifactId,
+        );
+
+        let mut unknown_reference = builtin_manifest().expect("manifest");
+        first_managed_mod_mut(&mut unknown_reference).artifact_id = "missing".to_string();
+        assert_error_kind(
+            validate_manifest(&unknown_reference),
+            ResolveError::UnknownManagedModArtifact("missing".to_string()),
+        );
+
+        let mut project_mismatch = builtin_manifest().expect("manifest");
+        first_managed_mod_mut(&mut project_mismatch).project_id = "other-project".to_string();
+        assert_error_kind(
+            validate_manifest(&project_mismatch),
+            ResolveError::ManagedModProjectMismatch {
+                artifact_id: "sodium".to_string(),
+                expected: "sodium".to_string(),
+                actual: "other-project".to_string(),
+            },
+        );
+
+        let mut slug_mismatch = builtin_manifest().expect("manifest");
+        first_managed_mod_mut(&mut slug_mismatch).slug = "other-slug".to_string();
+        assert_error_kind(
+            validate_manifest(&slug_mismatch),
+            ResolveError::ManagedModSlugMismatch {
+                artifact_id: "sodium".to_string(),
+                expected: "sodium".to_string(),
+                actual: "other-slug".to_string(),
+            },
+        );
     }
 
     #[test]
@@ -1444,6 +1643,43 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn artifact_disable_targets_declared_artifact_aliases() {
+        let mut manifest = builtin_manifest().expect("manifest");
+        manifest.artifacts[0].id = "sodium-artifact".to_string();
+        for composition in &mut manifest.compositions {
+            for managed_mod in &mut composition.mods {
+                if managed_mod.artifact_id == "sodium" {
+                    managed_mod.artifact_id = "sodium-artifact".to_string();
+                }
+            }
+        }
+        manifest
+            .emergency_disables
+            .push(test_artifact_disable("hold-sodium-alias", "sodium"));
+        validate_manifest(&manifest).expect("declared source alias should validate");
+
+        let plan = resolve_plan(
+            Some(&manifest),
+            ResolutionRequest {
+                game_version: "1.20.4".to_string(),
+                loader: "fabric".to_string(),
+                mode: PerformanceMode::Managed,
+                hardware: HardwareProfile::default(),
+                installed_mods: Vec::new(),
+            },
+        );
+
+        assert!(
+            plan.mods
+                .iter()
+                .all(|managed_mod| managed_mod.slug != "sodium")
+        );
+        assert!(plan.warnings.iter().any(|warning| {
+            warning.contains("sodium skipped by emergency disable hold-sodium-alias")
+        }));
+    }
+
     fn test_composition_disable(id: &str, target_id: &str) -> EmergencyDisable {
         EmergencyDisable {
             id: id.to_string(),
@@ -1466,6 +1702,14 @@ mod tests {
             loaders: Vec::new(),
             tiers: Vec::new(),
         }
+    }
+
+    fn first_managed_mod_mut(manifest: &mut Manifest) -> &mut ManagedMod {
+        manifest
+            .compositions
+            .iter_mut()
+            .find_map(|composition| composition.mods.first_mut())
+            .expect("test manifest should include a managed mod")
     }
 
     fn assert_error_kind(result: Result<(), ResolveError>, expected: ResolveError) {

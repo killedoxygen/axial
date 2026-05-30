@@ -57,14 +57,46 @@ pub enum OwnershipClass {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum ManagedArtifactType {
+    #[serde(rename = "mod")]
+    Mod,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ManagedArtifactProvider {
     Modrinth,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedArtifactChecksumPolicy {
+    ProviderSha512,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagedArtifactSource {
     pub provider: ManagedArtifactProvider,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedArtifactDefinitionSource {
+    pub provider: ManagedArtifactProvider,
+    pub project_id: String,
+    pub slug: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedArtifactDefinition {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub artifact_type: ManagedArtifactType,
+    pub source: ManagedArtifactDefinitionSource,
+    pub checksum_policy: ManagedArtifactChecksumPolicy,
+    pub ownership_class: OwnershipClass,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +120,7 @@ pub struct HardwareRequirement {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManagedMod {
+    pub artifact_id: String,
     pub project_id: String,
     pub slug: String,
     pub name: String,
@@ -135,6 +168,7 @@ pub struct Manifest {
     pub generated_at: String,
     pub minimum_app_version: String,
     pub rule_channel: String,
+    pub artifacts: Vec<ManagedArtifactDefinition>,
     pub compositions: Vec<CompositionDef>,
     pub emergency_disables: Vec<EmergencyDisable>,
 }

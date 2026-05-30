@@ -712,6 +712,7 @@ mod tests {
             mode: PerformanceMode::Managed,
             tier: CompositionTier::Core,
             mods: vec![ManagedMod {
+                artifact_id: "sodium".to_string(),
                 project_id: "sodium".to_string(),
                 slug: "sodium".to_string(),
                 name: "Sodium".to_string(),
@@ -771,6 +772,7 @@ mod tests {
             mode: PerformanceMode::Managed,
             tier: CompositionTier::Core,
             mods: vec![ManagedMod {
+                artifact_id: "sodium".to_string(),
                 project_id: "sodium".to_string(),
                 slug: "sodium".to_string(),
                 name: "Sodium".to_string(),
