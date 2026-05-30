@@ -1,5 +1,6 @@
 use croopor_api::app::{
-    DEFAULT_API_PORT, build_router, default_frontend_dir, spawn_performance_rules_refresh,
+    DEFAULT_API_PORT, build_router, default_frontend_dir, spawn_performance_operations_resume,
+    spawn_performance_rules_refresh,
 };
 use croopor_api::state::{AppState, AppStateInit, InstallStore, SessionStore};
 use croopor_config::{AppPaths, ConfigStore, InstanceStore};
@@ -29,6 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         performance,
         frontend_dir: default_frontend_dir(),
     });
+    spawn_performance_operations_resume(&state);
     spawn_performance_rules_refresh(&state);
 
     let addr = std::env::var("CROOPOR_API_ADDR")

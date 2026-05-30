@@ -13,12 +13,31 @@ pub const PERFORMANCE_OPERATION_ID_PREFIX: &str = "performance-install-";
 pub const INTERRUPTED_BY_RESTART_ERROR: &str = "performance operation interrupted by restart";
 const MAX_OPERATION_ERROR_CHARS: usize = 160;
 const MAX_OPERATION_FILENAME_STEM: usize = 96;
+const MAX_RESUMABLE_OPERATIONS: usize = 16;
+const DUPLICATE_RESUME_ERROR: &str =
+    "duplicate pending performance operation ignored after restart";
+const RESUME_LIMIT_ERROR: &str = "pending performance operation ignored after restart resume limit";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PerformanceOperationPayload {
+    pub version_id: String,
+    pub instance_performance_mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub game_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loader: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rollback_id: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PerformanceOperationStatus {
     pub id: String,
     pub instance_id: String,
     pub action: String,
+    pub payload: PerformanceOperationPayload,
     pub state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -33,6 +52,7 @@ pub struct PerformanceOperationConflict;
 struct PerformanceOperationInner {
     operations: HashMap<String, PerformanceOperationStatus>,
     active_by_instance: HashMap<String, String>,
+    pending_resume_ids: Vec<String>,
 }
 
 pub struct PerformanceOperationStore {
@@ -71,6 +91,7 @@ impl PerformanceOperationStore {
         &self,
         instance_id: String,
         action: String,
+        payload: PerformanceOperationPayload,
     ) -> Result<PerformanceOperationStatus, PerformanceOperationConflict> {
         let status = {
             let mut inner = self.inner.lock().await;
@@ -91,6 +112,7 @@ impl PerformanceOperationStore {
                 id: id.clone(),
                 instance_id: instance_id.clone(),
                 action,
+                payload,
                 state: "queued".to_string(),
                 error: None,
                 created_at: now.clone(),
@@ -102,6 +124,15 @@ impl PerformanceOperationStore {
         };
         self.persist_transition(&status);
         Ok(status)
+    }
+
+    pub async fn take_pending_resumable_operations(&self) -> Vec<PerformanceOperationStatus> {
+        let mut inner = self.inner.lock().await;
+        let ids = std::mem::take(&mut inner.pending_resume_ids);
+        ids.into_iter()
+            .filter_map(|id| inner.operations.get(&id).cloned())
+            .filter(|status| is_non_terminal(&status.state))
+            .collect()
     }
 
     pub async fn get(&self, id: &str) -> Option<PerformanceOperationStatus> {
@@ -226,10 +257,29 @@ fn load_persisted_operation_inner(
             status.error = Some(sanitize_operation_error(&error));
         }
         if is_non_terminal(&status.state) {
-            status.state = "interrupted".to_string();
-            status.error = Some(INTERRUPTED_BY_RESTART_ERROR.to_string());
-            status.updated_at = timestamp_utc();
-            interrupted.push(status.clone());
+            if !is_valid_loaded_status(&status) {
+                warn!(
+                    operation_id = %status.id,
+                    "skipping malformed persisted performance operation"
+                );
+                continue;
+            }
+            if inner.pending_resume_ids.len() >= MAX_RESUMABLE_OPERATIONS {
+                status.state = "interrupted".to_string();
+                status.error = Some(RESUME_LIMIT_ERROR.to_string());
+                status.updated_at = timestamp_utc();
+                interrupted.push(status.clone());
+            } else if inner.active_by_instance.contains_key(&status.instance_id) {
+                status.state = "interrupted".to_string();
+                status.error = Some(DUPLICATE_RESUME_ERROR.to_string());
+                status.updated_at = timestamp_utc();
+                interrupted.push(status.clone());
+            } else {
+                inner
+                    .active_by_instance
+                    .insert(status.instance_id.clone(), status.id.clone());
+                inner.pending_resume_ids.push(status.id.clone());
+            }
         }
         inner.operations.insert(status.id.clone(), status);
     }
@@ -239,6 +289,12 @@ fn load_persisted_operation_inner(
 
 fn is_non_terminal(state: &str) -> bool {
     !matches!(state, "complete" | "failed" | "interrupted")
+}
+
+fn is_valid_loaded_status(status: &PerformanceOperationStatus) -> bool {
+    matches!(status.action.as_str(), "install" | "remove" | "rollback")
+        && !status.instance_id.trim().is_empty()
+        && !status.payload.version_id.trim().is_empty()
 }
 
 fn load_status_file(path: &Path) -> io::Result<PerformanceOperationStatus> {
@@ -349,12 +405,16 @@ mod tests {
     use std::path::Path;
 
     #[tokio::test]
-    async fn persisted_operation_status_survives_restart_and_interrupts_active_operation() {
-        let root = test_root("restart-interrupt");
+    async fn persisted_operation_status_survives_restart_as_pending_resume() {
+        let root = test_root("restart-resume");
         let paths = test_paths(&root);
         let store = PerformanceOperationStore::load_from_paths(&paths);
         let started = store
-            .start("instance-a".to_string(), "install".to_string())
+            .start(
+                "instance-a".to_string(),
+                "install".to_string(),
+                test_payload(),
+            )
             .await
             .expect("operation starts");
         store.record_progress(&started.id, "applying").await;
@@ -365,22 +425,39 @@ mod tests {
         assert_eq!(persisted.state, "applying");
 
         let reloaded = PerformanceOperationStore::load_from_paths(&paths);
-        let interrupted = reloaded
+        let resumable = reloaded
             .get(&started.id)
             .await
-            .expect("loaded interrupted operation");
-        assert_eq!(interrupted.state, "interrupted");
-        assert_eq!(
-            interrupted.error.as_deref(),
-            Some(INTERRUPTED_BY_RESTART_ERROR)
+            .expect("loaded resumable operation");
+        assert_eq!(resumable.state, "applying");
+        assert_eq!(resumable.error, None);
+        let pending = reloaded.take_pending_resumable_operations().await;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, started.id);
+        assert!(
+            reloaded
+                .take_pending_resumable_operations()
+                .await
+                .is_empty()
         );
-        let rewritten = load_status_file(&path).expect("rewritten status should load");
-        assert_eq!(rewritten.state, "interrupted");
 
+        let conflict = reloaded
+            .start(
+                "instance-a".to_string(),
+                "remove".to_string(),
+                test_payload(),
+            )
+            .await;
+        assert_eq!(conflict.err(), Some(PerformanceOperationConflict));
+        reloaded.record_complete(&started.id).await;
         reloaded
-            .start("instance-a".to_string(), "remove".to_string())
+            .start(
+                "instance-a".to_string(),
+                "remove".to_string(),
+                test_payload(),
+            )
             .await
-            .expect("interrupted operation should not conflict");
+            .expect("completed resumed operation should not conflict");
 
         cleanup(&root);
     }
@@ -391,7 +468,11 @@ mod tests {
         let paths = test_paths(&root);
         let store = PerformanceOperationStore::load_from_paths(&paths);
         let started = store
-            .start("instance-a".to_string(), "remove".to_string())
+            .start(
+                "instance-a".to_string(),
+                "remove".to_string(),
+                test_payload(),
+            )
             .await
             .expect("operation starts");
         store.record_complete(&started.id).await;
@@ -412,12 +493,20 @@ mod tests {
     async fn non_terminal_same_instance_operation_conflicts_during_runtime() {
         let store = PerformanceOperationStore::new();
         store
-            .start("instance-a".to_string(), "install".to_string())
+            .start(
+                "instance-a".to_string(),
+                "install".to_string(),
+                test_payload(),
+            )
             .await
             .expect("operation starts");
 
         let conflict = store
-            .start("instance-a".to_string(), "remove".to_string())
+            .start(
+                "instance-a".to_string(),
+                "remove".to_string(),
+                test_payload(),
+            )
             .await;
 
         assert_eq!(conflict.err(), Some(PerformanceOperationConflict));
@@ -427,13 +516,21 @@ mod tests {
     async fn terminal_same_instance_operation_allows_new_work() {
         let store = PerformanceOperationStore::new();
         let started = store
-            .start("instance-a".to_string(), "install".to_string())
+            .start(
+                "instance-a".to_string(),
+                "install".to_string(),
+                test_payload(),
+            )
             .await
             .expect("operation starts");
         store.record_failed(&started.id, "failed").await;
 
         store
-            .start("instance-a".to_string(), "remove".to_string())
+            .start(
+                "instance-a".to_string(),
+                "remove".to_string(),
+                test_payload(),
+            )
             .await
             .expect("terminal operation should not conflict");
     }
@@ -469,6 +566,7 @@ mod tests {
             id: "../../secret".to_string(),
             instance_id: "instance-a".to_string(),
             action: "install".to_string(),
+            payload: test_payload(),
             state: "complete".to_string(),
             error: None,
             created_at: timestamp_utc(),
@@ -485,6 +583,72 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_pending_operations_for_instance_interrupt_extra_records() {
+        let root = test_root("duplicate-pending");
+        let paths = test_paths(&root);
+        let dir = operation_dir(&paths);
+        fs::create_dir_all(&dir).expect("create operation dir");
+        let first = test_status(
+            "performance-install-00000000000000000000000000000001",
+            "instance-a",
+            "install",
+            "applying",
+            test_payload(),
+        );
+        let second = test_status(
+            "performance-install-00000000000000000000000000000002",
+            "instance-a",
+            "remove",
+            "removing",
+            test_payload(),
+        );
+        persist_status_to_dir(&dir, &first).expect("persist first status");
+        persist_status_to_dir(&dir, &second).expect("persist second status");
+
+        let (inner, interrupted) = load_persisted_operation_inner(&dir);
+
+        assert_eq!(inner.pending_resume_ids.len(), 1);
+        assert_eq!(interrupted.len(), 1);
+        assert_eq!(
+            interrupted[0].error.as_deref(),
+            Some(DUPLICATE_RESUME_ERROR)
+        );
+        assert_eq!(
+            inner.active_by_instance.get("instance-a"),
+            inner.pending_resume_ids.first()
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn malformed_current_schema_pending_operation_is_not_resumed() {
+        let root = test_root("malformed-pending");
+        let paths = test_paths(&root);
+        let dir = operation_dir(&paths);
+        fs::create_dir_all(&dir).expect("create operation dir");
+        let mut payload = test_payload();
+        payload.version_id = String::new();
+        let status = test_status(
+            "performance-install-00000000000000000000000000000001",
+            "instance-a",
+            "install",
+            "applying",
+            payload,
+        );
+        persist_status_to_dir(&dir, &status).expect("persist malformed status");
+
+        let (inner, interrupted) = load_persisted_operation_inner(&dir);
+
+        assert!(inner.operations.is_empty());
+        assert!(inner.active_by_instance.is_empty());
+        assert!(inner.pending_resume_ids.is_empty());
+        assert!(interrupted.is_empty());
+
+        cleanup(&root);
+    }
+
+    #[test]
     fn operation_error_sanitizer_bounds_error() {
         let long = "x".repeat(MAX_OPERATION_ERROR_CHARS + 32);
         let error = sanitize_operation_error(&format!("failed; {long}"));
@@ -492,6 +656,36 @@ mod tests {
         assert!(error.len() <= MAX_OPERATION_ERROR_CHARS);
         assert!(!error.contains(';'));
         assert_eq!(sanitize_operation_error(""), "performance operation failed");
+    }
+
+    fn test_payload() -> PerformanceOperationPayload {
+        PerformanceOperationPayload {
+            version_id: "1.20.4-fabric".to_string(),
+            instance_performance_mode: "managed".to_string(),
+            game_version: None,
+            loader: None,
+            mode: None,
+            rollback_id: None,
+        }
+    }
+
+    fn test_status(
+        id: &str,
+        instance_id: &str,
+        action: &str,
+        state: &str,
+        payload: PerformanceOperationPayload,
+    ) -> PerformanceOperationStatus {
+        PerformanceOperationStatus {
+            id: id.to_string(),
+            instance_id: instance_id.to_string(),
+            action: action.to_string(),
+            payload,
+            state: state.to_string(),
+            error: None,
+            created_at: timestamp_utc(),
+            updated_at: timestamp_utc(),
+        }
     }
 
     fn test_root(name: &str) -> PathBuf {

@@ -70,6 +70,10 @@ pub fn spawn_performance_rules_refresh(state: &AppState) -> bool {
     true
 }
 
+pub fn spawn_performance_operations_resume(state: &AppState) -> bool {
+    crate::routes::spawn_pending_performance_operations(state)
+}
+
 #[derive(Debug)]
 pub struct ServerHandle {
     pub addr: SocketAddr,

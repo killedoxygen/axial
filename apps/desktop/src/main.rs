@@ -2,7 +2,9 @@ mod commands;
 mod events;
 mod state;
 
-use croopor_api::app::{spawn_background, spawn_performance_rules_refresh};
+use croopor_api::app::{
+    spawn_background, spawn_performance_operations_resume, spawn_performance_rules_refresh,
+};
 use croopor_api::state::{AppState, AppStateInit, InstallStore, SessionStore};
 use croopor_config::{AppPaths, ConfigStore, InstanceStore};
 use croopor_performance::PerformanceManager;
@@ -33,6 +35,7 @@ async fn main() {
         performance,
         frontend_dir: croopor_api::app::default_frontend_dir(),
     });
+    spawn_performance_operations_resume(&state);
     spawn_performance_rules_refresh(&state);
     let desktop_state = state::DesktopState::new(env!("CARGO_PKG_VERSION").to_string());
 

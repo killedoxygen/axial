@@ -1,5 +1,5 @@
 use crate::state::performance_operations::{
-    PerformanceOperationConflict, PerformanceOperationStatus,
+    PerformanceOperationConflict, PerformanceOperationPayload, PerformanceOperationStatus,
 };
 use crate::state::{AppState, DownloadProgress};
 use axum::{
@@ -18,6 +18,7 @@ use croopor_performance::{
 use serde::{Deserialize, Serialize};
 
 const PERFORMANCE_MANAGED_ARTIFACT_SUMMARY_LIMIT: usize = 50;
+const INVALID_PERSISTED_OPERATION_ERROR: &str = "invalid persisted performance operation payload";
 
 #[derive(Debug, Deserialize)]
 struct PlanQuery {
@@ -103,6 +104,20 @@ struct PerformanceOperation {
     mode: Option<String>,
     action: PerformanceInstallAction,
     rollback_id: Option<String>,
+}
+
+pub(crate) fn spawn_pending_performance_operations(state: &AppState) -> bool {
+    let state = state.clone();
+    tokio::spawn(async move {
+        let resumed = resume_pending_performance_operations(state).await;
+        if resumed > 0 {
+            tracing::info!(
+                resumed,
+                "queued performance operations resumed after restart"
+            );
+        }
+    });
+    true
 }
 
 pub fn router() -> Router<AppState> {
@@ -413,6 +428,7 @@ async fn queue_performance_operation(
         .start(
             operation.instance_id.clone(),
             operation_action_name(operation.action).to_string(),
+            operation_payload(&operation),
         )
         .await
         .map_err(performance_operation_conflict)?;
@@ -436,6 +452,36 @@ async fn queue_performance_operation(
         managed_artifacts: Vec::new(),
         warnings: Vec::new(),
     })
+}
+
+async fn resume_pending_performance_operations(state: AppState) -> usize {
+    let pending = state
+        .performance_operations()
+        .take_pending_resumable_operations()
+        .await;
+    let resumed = pending.len();
+
+    for status in pending {
+        let install_id = status.id.clone();
+        let operation = match operation_from_status(&status) {
+            Ok(operation) => operation,
+            Err(error) => {
+                state
+                    .performance_operations()
+                    .record_failed(&install_id, &error)
+                    .await;
+                continue;
+            }
+        };
+        state.installs().insert(install_id.clone()).await;
+        let store = state.installs().clone();
+        let state_task = state.clone();
+        tokio::spawn(async move {
+            run_queued_performance_operation(state_task, operation, store, install_id).await;
+        });
+    }
+
+    resumed
 }
 
 async fn run_queued_performance_operation(
@@ -576,6 +622,47 @@ fn operation_action_name(action: PerformanceInstallAction) -> &'static str {
         PerformanceInstallAction::Install => "install",
         PerformanceInstallAction::Remove => "remove",
         PerformanceInstallAction::Rollback => "rollback",
+    }
+}
+
+fn operation_payload(operation: &PerformanceOperation) -> PerformanceOperationPayload {
+    PerformanceOperationPayload {
+        version_id: operation.version_id.clone(),
+        instance_performance_mode: operation.instance_performance_mode.clone(),
+        game_version: operation.game_version.clone(),
+        loader: operation.loader.clone(),
+        mode: operation.mode.clone(),
+        rollback_id: operation.rollback_id.clone(),
+    }
+}
+
+fn operation_from_status(
+    status: &PerformanceOperationStatus,
+) -> Result<PerformanceOperation, String> {
+    let action = operation_action_from_name(&status.action)
+        .ok_or_else(|| INVALID_PERSISTED_OPERATION_ERROR.to_string())?;
+    if status.instance_id.trim().is_empty() || status.payload.version_id.trim().is_empty() {
+        return Err(INVALID_PERSISTED_OPERATION_ERROR.to_string());
+    }
+
+    Ok(PerformanceOperation {
+        instance_id: status.instance_id.clone(),
+        version_id: status.payload.version_id.clone(),
+        instance_performance_mode: status.payload.instance_performance_mode.clone(),
+        game_version: status.payload.game_version.clone(),
+        loader: status.payload.loader.clone(),
+        mode: status.payload.mode.clone(),
+        action,
+        rollback_id: status.payload.rollback_id.clone(),
+    })
+}
+
+fn operation_action_from_name(action: &str) -> Option<PerformanceInstallAction> {
+    match action {
+        "install" => Some(PerformanceInstallAction::Install),
+        "remove" => Some(PerformanceInstallAction::Remove),
+        "rollback" => Some(PerformanceInstallAction::Rollback),
+        _ => None,
     }
 }
 
@@ -787,7 +874,12 @@ mod tests {
     };
     use croopor_config::{AppPaths, ConfigStore, InstanceStore};
     use croopor_performance::{CompositionState, InstalledMod, PerformanceManager};
-    use std::{fs, path::PathBuf, sync::Arc, time::Duration};
+    use std::{
+        fs,
+        path::{Path as FsPath, PathBuf},
+        sync::Arc,
+        time::Duration,
+    };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tower::ServiceExt;
 
@@ -1596,7 +1688,11 @@ mod tests {
         fixture
             .state
             .performance_operations()
-            .start(instance_id.clone(), "remove".to_string())
+            .start(
+                instance_id.clone(),
+                "remove".to_string(),
+                test_operation_payload("1.20.4-fabric"),
+            )
             .await
             .expect("prelock instance");
 
@@ -1630,7 +1726,11 @@ mod tests {
         let started = fixture
             .state
             .performance_operations()
-            .start("instance-a".to_string(), "install".to_string())
+            .start(
+                "instance-a".to_string(),
+                "install".to_string(),
+                test_operation_payload("1.20.4-fabric"),
+            )
             .await
             .expect("operation starts");
         fixture
@@ -1659,7 +1759,66 @@ mod tests {
         assert_eq!(response.id, started.id);
         assert_eq!(response.instance_id, "instance-a");
         assert_eq!(response.action, "install");
+        assert_eq!(response.payload.version_id, "1.20.4-fabric");
         assert_eq!(response.state, "applying");
+    }
+
+    #[tokio::test]
+    async fn startup_resume_runs_persisted_pending_remove_operation() {
+        let root = test_root("startup-resume-remove");
+        let state = build_test_state(&root, None);
+        let instance_id = state
+            .instances()
+            .add(
+                "Managed".to_string(),
+                "1.20.4-fabric".to_string(),
+                String::new(),
+                String::new(),
+                None,
+            )
+            .expect("add instance")
+            .id;
+        let started = state
+            .performance_operations()
+            .start(
+                instance_id.clone(),
+                "remove".to_string(),
+                test_operation_payload("1.20.4-fabric"),
+            )
+            .await
+            .expect("persist pending operation");
+        state
+            .performance_operations()
+            .record_progress(&started.id, "removing")
+            .await;
+        drop(state);
+
+        let reloaded = build_test_state(&root, None);
+        let loaded = reloaded
+            .performance_operations()
+            .get(&started.id)
+            .await
+            .expect("pending operation should reload");
+        assert_eq!(loaded.state, "removing");
+
+        let resumed = resume_pending_performance_operations(reloaded.clone()).await;
+        assert_eq!(resumed, 1);
+        let events = collect_install_events(&reloaded, &started.id).await;
+        let phases = events
+            .iter()
+            .map(|event| event.phase.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(phases, vec!["queued", "planning", "removing", "complete"]);
+        let completed = reloaded
+            .performance_operations()
+            .get(&started.id)
+            .await
+            .expect("completed operation status");
+        assert_eq!(completed.instance_id, instance_id);
+        assert_eq!(completed.state, "complete");
+        assert_eq!(completed.error, None);
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -1715,26 +1874,7 @@ mod tests {
 
         fn new_with_remote_url(name: &str, remote_rules_url: Option<String>) -> Self {
             let root = test_root(name);
-            let paths = test_paths(&root);
-            let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
-            let instances =
-                Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
-            let state = AppState::new(AppStateInit {
-                app_name: "Croopor".to_string(),
-                version: "test".to_string(),
-                config,
-                instances,
-                installs: Arc::new(InstallStore::new()),
-                sessions: Arc::new(SessionStore::new()),
-                performance: Arc::new(
-                    PerformanceManager::new_with_config_dir_and_remote_url(
-                        &paths.config_dir,
-                        remote_rules_url,
-                    )
-                    .expect("performance manager"),
-                ),
-                frontend_dir: root.join("frontend"),
-            });
+            let state = build_test_state(&root, remote_rules_url);
 
             Self { state, root }
         }
@@ -1807,6 +1947,39 @@ mod tests {
             music_dir: root.join("music"),
             library_dir: root.join("library"),
             config_dir,
+        }
+    }
+
+    fn build_test_state(root: &FsPath, remote_rules_url: Option<String>) -> AppState {
+        let paths = test_paths(root);
+        let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
+        let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
+        AppState::new(AppStateInit {
+            app_name: "Croopor".to_string(),
+            version: "test".to_string(),
+            config,
+            instances,
+            installs: Arc::new(InstallStore::new()),
+            sessions: Arc::new(SessionStore::new()),
+            performance: Arc::new(
+                PerformanceManager::new_with_config_dir_and_remote_url(
+                    &paths.config_dir,
+                    remote_rules_url,
+                )
+                .expect("performance manager"),
+            ),
+            frontend_dir: root.join("frontend"),
+        })
+    }
+
+    fn test_operation_payload(version_id: &str) -> PerformanceOperationPayload {
+        PerformanceOperationPayload {
+            version_id: version_id.to_string(),
+            instance_performance_mode: "managed".to_string(),
+            game_version: None,
+            loader: None,
+            mode: None,
+            rollback_id: None,
         }
     }
 

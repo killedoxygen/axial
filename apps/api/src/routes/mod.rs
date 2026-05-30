@@ -24,6 +24,8 @@ use axum::{
 };
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
+pub(crate) use performance::spawn_pending_performance_operations;
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(status::router())
