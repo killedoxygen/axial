@@ -833,25 +833,22 @@ fn should_include_mod(
     hardware: &HardwareProfile,
     installed: &std::collections::HashSet<String>,
 ) -> (bool, String) {
-    match managed_mod.condition {
-        ModCondition::Always => {}
-        ModCondition::VersionRange => {
-            let Ok(version) = parse_version(game_version) else {
-                return (false, String::new());
-            };
-            if !version_in_range(&version, &managed_mod.version_range) {
-                return (false, String::new());
-            }
-        }
-        ModCondition::Hardware => {
-            let (ok, warning) = satisfies_hardware(managed_mod, hardware);
-            if !ok {
-                return (false, warning);
-            }
-        }
-        ModCondition::Recommend => {
+    if !managed_mod.version_range.trim().is_empty() {
+        let Ok(version) = parse_version(game_version) else {
+            return (false, String::new());
+        };
+        if !version_in_range(&version, &managed_mod.version_range) {
             return (false, String::new());
         }
+    }
+
+    if matches!(managed_mod.condition, ModCondition::Recommend) {
+        return (false, String::new());
+    }
+
+    let (ok, warning) = satisfies_hardware(managed_mod, hardware);
+    if !ok {
+        return (false, warning);
     }
 
     for exclusion in &managed_mod.mutual_exclusions {
@@ -1127,8 +1124,8 @@ mod tests {
         validate_manifest,
     };
     use crate::types::{
-        CompositionTier, EmergencyDisable, EmergencyDisableTarget, HardwareProfile, ManagedMod,
-        Manifest, OwnershipClass, PerformanceMode, VersionFamily,
+        CompositionPlan, CompositionTier, EmergencyDisable, EmergencyDisableTarget,
+        HardwareProfile, ManagedMod, Manifest, OwnershipClass, PerformanceMode, VersionFamily,
     };
 
     const FAMILY_F_FABRIC_CORE_ADDITIONS: &[&str] = &[
@@ -1364,72 +1361,112 @@ mod tests {
     }
 
     #[test]
-    fn nvidium_requires_nvidia_turing_or_newer() {
-        for (hardware, expected_included) in [
-            (
-                HardwareProfile {
-                    gpu_vendor: "nvidia".to_string(),
-                    gpu_arch: 2,
-                    ..HardwareProfile::default()
-                },
-                true,
-            ),
-            (
-                HardwareProfile {
-                    gpu_vendor: "nvidia".to_string(),
-                    gpu_arch: 3,
-                    ..HardwareProfile::default()
-                },
-                true,
-            ),
-            (
-                HardwareProfile {
-                    gpu_vendor: "nvidia".to_string(),
-                    gpu_arch: 1,
-                    ..HardwareProfile::default()
-                },
-                false,
-            ),
-            (
-                HardwareProfile {
-                    gpu_vendor: "nvidia".to_string(),
-                    gpu_arch: 0,
-                    ..HardwareProfile::default()
-                },
-                false,
-            ),
-            (
-                HardwareProfile {
-                    gpu_vendor: "amd".to_string(),
-                    gpu_arch: 0,
-                    ..HardwareProfile::default()
-                },
-                false,
-            ),
-        ] {
-            let plan = resolve_plan(
-                Some(&builtin_manifest().expect("manifest")),
-                ResolutionRequest {
-                    game_version: "1.20.4".to_string(),
-                    loader: "fabric".to_string(),
-                    mode: PerformanceMode::Managed,
-                    hardware,
-                    installed_mods: Vec::new(),
-                },
-            );
+    fn family_e_fabric_1_16_5_uses_older_version_gated_mods_without_nvidium() {
+        let plan = fabric_plan("1.16.5", nvidia_turing_hardware());
 
-            assert_eq!(
-                plan.mods
-                    .iter()
-                    .any(|managed_mod| managed_mod.slug == "nvidium"),
-                expected_included
-            );
-            assert_eq!(
-                plan.warnings
-                    .iter()
-                    .any(|warning| warning == "nvidium skipped: no NVIDIA Turing+ GPU detected"),
-                !expected_included
-            );
+        assert_eq!(plan.composition_id, "family-e-fabric-extended");
+        assert_eq!(plan.family, VersionFamily::E);
+        assert_eq!(plan.tier, CompositionTier::Extended);
+        for slug in ["lazydfu", "smooth-boot-reloaded", "starlight"] {
+            assert_eq!(count_mods_with_slug(&plan.mods, slug), 1, "{slug}");
+        }
+        assert_eq!(count_mods_with_slug(&plan.mods, "nvidium"), 0);
+        assert!(
+            !plan
+                .warnings
+                .iter()
+                .any(|warning| warning == "nvidium skipped: no NVIDIA Turing+ GPU detected")
+        );
+    }
+
+    #[test]
+    fn family_e_fabric_1_20_1_uses_nvidium_without_older_version_gated_mods() {
+        let plan = fabric_plan("1.20.1", nvidia_turing_hardware());
+
+        assert_eq!(plan.composition_id, "family-e-fabric-extended");
+        assert_eq!(plan.family, VersionFamily::E);
+        assert_eq!(plan.tier, CompositionTier::Extended);
+        assert_eq!(count_mods_with_slug(&plan.mods, "nvidium"), 1);
+        for slug in ["lazydfu", "smooth-boot-reloaded", "starlight"] {
+            assert_eq!(count_mods_with_slug(&plan.mods, slug), 0, "{slug}");
+        }
+    }
+
+    #[test]
+    fn family_f_fabric_1_20_4_uses_nvidium_and_family_f_additions() {
+        let plan = fabric_plan("1.20.4", nvidia_turing_hardware());
+
+        assert_eq!(plan.composition_id, "family-f-fabric-extended");
+        assert_eq!(plan.family, VersionFamily::F);
+        assert_eq!(plan.tier, CompositionTier::Extended);
+        assert_eq!(count_mods_with_slug(&plan.mods, "nvidium"), 1);
+        for slug in FAMILY_F_FABRIC_CORE_ADDITIONS {
+            assert_eq!(count_mods_with_slug(&plan.mods, slug), 1, "{slug}");
+        }
+    }
+
+    #[test]
+    fn nvidium_requires_nvidia_turing_or_newer_for_applicable_versions() {
+        for game_version in ["1.20.1", "1.20.4"] {
+            for (hardware, expected_included) in [
+                (
+                    HardwareProfile {
+                        gpu_vendor: "nvidia".to_string(),
+                        gpu_arch: 2,
+                        ..HardwareProfile::default()
+                    },
+                    true,
+                ),
+                (
+                    HardwareProfile {
+                        gpu_vendor: "nvidia".to_string(),
+                        gpu_arch: 3,
+                        ..HardwareProfile::default()
+                    },
+                    true,
+                ),
+                (
+                    HardwareProfile {
+                        gpu_vendor: "nvidia".to_string(),
+                        gpu_arch: 1,
+                        ..HardwareProfile::default()
+                    },
+                    false,
+                ),
+                (
+                    HardwareProfile {
+                        gpu_vendor: "nvidia".to_string(),
+                        gpu_arch: 0,
+                        ..HardwareProfile::default()
+                    },
+                    false,
+                ),
+                (
+                    HardwareProfile {
+                        gpu_vendor: "amd".to_string(),
+                        gpu_arch: 0,
+                        ..HardwareProfile::default()
+                    },
+                    false,
+                ),
+            ] {
+                let plan = fabric_plan(game_version, hardware);
+
+                assert_eq!(
+                    plan.mods
+                        .iter()
+                        .any(|managed_mod| managed_mod.slug == "nvidium"),
+                    expected_included,
+                    "{game_version}"
+                );
+                assert_eq!(
+                    plan.warnings.iter().any(
+                        |warning| warning == "nvidium skipped: no NVIDIA Turing+ GPU detected"
+                    ),
+                    !expected_included,
+                    "{game_version}"
+                );
+            }
         }
     }
 
@@ -1914,6 +1951,28 @@ mod tests {
         mods.iter()
             .filter(|managed_mod| managed_mod.slug == slug)
             .count()
+    }
+
+    fn fabric_plan(game_version: &str, hardware: HardwareProfile) -> CompositionPlan {
+        let manifest = builtin_manifest().expect("manifest");
+        resolve_plan(
+            Some(&manifest),
+            ResolutionRequest {
+                game_version: game_version.to_string(),
+                loader: "fabric".to_string(),
+                mode: PerformanceMode::Managed,
+                hardware,
+                installed_mods: Vec::new(),
+            },
+        )
+    }
+
+    fn nvidia_turing_hardware() -> HardwareProfile {
+        HardwareProfile {
+            gpu_vendor: "nvidia".to_string(),
+            gpu_arch: 2,
+            ..HardwareProfile::default()
+        }
     }
 
     fn assert_error_kind(result: Result<(), ResolveError>, expected: ResolveError) {

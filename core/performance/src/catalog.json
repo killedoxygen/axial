@@ -90,7 +90,7 @@
         {"artifact_id": "lazydfu", "project_id": "lazydfu", "slug": "lazydfu", "name": "LazyDFU", "condition": "version_range", "version_range": ">=1.16 <1.19.4"},
         {"artifact_id": "smooth-boot-reloaded", "project_id": "smooth-boot-reloaded", "slug": "smooth-boot-reloaded", "name": "Smooth Boot Reloaded", "condition": "version_range", "version_range": ">=1.16 <1.19.4"},
         {"artifact_id": "starlight", "project_id": "starlight", "slug": "starlight", "name": "Starlight", "condition": "version_range", "version_range": ">=1.16 <1.19.4"},
-        {"artifact_id": "nvidium", "project_id": "nvidium", "slug": "nvidium", "name": "Nvidium", "condition": "hardware", "hardware_req": {"gpu_vendor": "nvidia", "gpu_arch_min": 2}, "mutual_exclusions": ["iris"]}
+        {"artifact_id": "nvidium", "project_id": "nvidium", "slug": "nvidium", "name": "Nvidium", "condition": "hardware", "version_range": ">=1.20.1", "hardware_req": {"gpu_vendor": "nvidia", "gpu_arch_min": 2}, "mutual_exclusions": ["iris"]}
       ]
     },
     {
@@ -174,7 +174,7 @@
         {"artifact_id": "particle-core", "project_id": "particle-core", "slug": "particle-core", "name": "Particle Core", "condition": "always"},
         {"artifact_id": "threadtweak", "project_id": "threadtweak", "slug": "threadtweak", "name": "ThreadTweak", "condition": "always"},
         {"artifact_id": "badoptimizations", "project_id": "badoptimizations", "slug": "badoptimizations", "name": "BadOptimizations", "condition": "always"},
-        {"artifact_id": "nvidium", "project_id": "nvidium", "slug": "nvidium", "name": "Nvidium", "condition": "hardware", "hardware_req": {"gpu_vendor": "nvidia", "gpu_arch_min": 2}, "mutual_exclusions": ["iris"]}
+        {"artifact_id": "nvidium", "project_id": "nvidium", "slug": "nvidium", "name": "Nvidium", "condition": "hardware", "version_range": ">=1.20.1", "hardware_req": {"gpu_vendor": "nvidia", "gpu_arch_min": 2}, "mutual_exclusions": ["iris"]}
       ]
     },
     {
