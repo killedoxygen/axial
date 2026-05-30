@@ -28,6 +28,8 @@ croopor-minecraft = { path = "../../core/minecraft" }
 croopor-performance = { path = "../../core/performance" }
 
 [dev-dependencies]
+ed25519-dalek.workspace = true
+hex.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 
 [target.'cfg(windows)'.dependencies]

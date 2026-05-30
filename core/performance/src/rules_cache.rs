@@ -1,8 +1,9 @@
 use crate::resolve::validate_manifest;
+use crate::signature::{RemoteRulesVerifier, RulesSignatureMetadata};
 use crate::status::{RuleChannel, RuleSource, RulesValidation};
 use crate::types::Manifest;
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -10,6 +11,7 @@ const RULES_CACHE_FILE: &str = "rules-cache.json";
 const MAX_CACHE_WARNING_CHARS: usize = 240;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RulesCacheSnapshot {
     pub rule_source: RuleSource,
     pub rule_channel: RuleChannel,
@@ -18,8 +20,18 @@ pub struct RulesCacheSnapshot {
     pub validation: RulesValidation,
     pub updated_at: String,
     pub loaded_at: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub manifest: Option<Manifest>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub signature: Option<RulesSignatureMetadata>,
+}
+
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,9 +96,23 @@ pub fn load_active_rules_cache(
     config_dir: &Path,
     builtin_manifest: &Manifest,
     remote_enabled: bool,
+    verifier: &RemoteRulesVerifier,
 ) -> LoadedRulesCache {
     if !remote_enabled {
         let status = load_or_repair_rules_cache(config_dir, builtin_manifest);
+        return LoadedRulesCache {
+            manifest: builtin_manifest.clone(),
+            rule_source: RuleSource::BuiltIn,
+            rule_channel: RuleChannel::Bundled,
+            validation: RulesValidation::Valid,
+            last_refresh_at: None,
+            status,
+        };
+    }
+
+    if let Some(warning) = verifier.acceptance_warning() {
+        let mut status = load_or_repair_rules_cache(config_dir, builtin_manifest);
+        status.warning = Some(bounded_warning(warning));
         return LoadedRulesCache {
             manifest: builtin_manifest.clone(),
             rule_source: RuleSource::BuiltIn,
@@ -101,29 +127,30 @@ pub fn load_active_rules_cache(
     let loaded_at = Utc::now().to_rfc3339();
     match fs::read_to_string(&path) {
         Ok(data) => match serde_json::from_str::<RulesCacheSnapshot>(&data) {
-            Ok(mut snapshot) if snapshot_is_valid_remote(&snapshot) => {
-                let manifest = snapshot
-                    .manifest
-                    .clone()
-                    .expect("valid remote snapshot has manifest");
-                snapshot.loaded_at = loaded_at;
-                let status = match write_snapshot(&path, &snapshot) {
+            Ok(mut snapshot) => match remote_snapshot_manifest(&snapshot, verifier) {
+                Ok(manifest) => {
+                    snapshot.loaded_at = loaded_at;
+                    let status = match write_snapshot(&path, &snapshot) {
                     Ok(()) => RulesCacheStatus::from_snapshot(&snapshot, RulesCacheState::Recorded),
                     Err(_) => RulesCacheStatus::from_snapshot(&snapshot, RulesCacheState::Recorded)
                         .with_warning(
                             "Remote rules cache was read, but its loaded timestamp could not be recorded.",
                         ),
                 };
-                LoadedRulesCache {
-                    manifest,
-                    rule_source: RuleSource::Remote,
-                    rule_channel: RuleChannel::Remote,
-                    validation: RulesValidation::Valid,
-                    last_refresh_at: Some(snapshot.updated_at.clone()),
-                    status,
+                    LoadedRulesCache {
+                        manifest,
+                        rule_source: RuleSource::Remote,
+                        rule_channel: RuleChannel::Remote,
+                        validation: RulesValidation::Valid,
+                        last_refresh_at: Some(snapshot.updated_at.clone()),
+                        status,
+                    }
                 }
-            }
-            Ok(_) | Err(_) => fallback_to_builtin(
+                Err(warning) => {
+                    fallback_to_builtin(&path, builtin_manifest, loaded_at, Some(&warning))
+                }
+            },
+            Err(_) => fallback_to_builtin(
                 &path,
                 builtin_manifest,
                 loaded_at,
@@ -176,9 +203,10 @@ pub fn load_or_repair_rules_cache(config_dir: &Path, manifest: &Manifest) -> Rul
 pub fn write_remote_rules_cache(
     config_dir: &Path,
     manifest: &Manifest,
+    signature: RulesSignatureMetadata,
 ) -> Result<RulesCacheStatus, std::io::Error> {
     let now = Utc::now().to_rfc3339();
-    let snapshot = remote_snapshot(manifest, now);
+    let snapshot = remote_snapshot(manifest, signature, now);
     let path = rules_cache_path(config_dir);
     write_snapshot(&path, &snapshot)?;
     Ok(RulesCacheStatus::from_snapshot(
@@ -234,10 +262,15 @@ fn builtin_snapshot(manifest: &Manifest, now: String) -> RulesCacheSnapshot {
         updated_at: now.clone(),
         loaded_at: now,
         manifest: None,
+        signature: None,
     }
 }
 
-fn remote_snapshot(manifest: &Manifest, now: String) -> RulesCacheSnapshot {
+fn remote_snapshot(
+    manifest: &Manifest,
+    signature: RulesSignatureMetadata,
+    now: String,
+) -> RulesCacheSnapshot {
     RulesCacheSnapshot {
         rule_source: RuleSource::Remote,
         rule_channel: RuleChannel::Remote,
@@ -247,6 +280,7 @@ fn remote_snapshot(manifest: &Manifest, now: String) -> RulesCacheSnapshot {
         updated_at: now.clone(),
         loaded_at: now,
         manifest: Some(manifest.clone()),
+        signature: Some(signature),
     }
 }
 
@@ -258,24 +292,46 @@ fn snapshot_matches_manifest(snapshot: &RulesCacheSnapshot, manifest: &Manifest)
         && snapshot.validation == RulesValidation::Valid
         && !snapshot.updated_at.trim().is_empty()
         && !snapshot.loaded_at.trim().is_empty()
+        && snapshot.manifest.is_none()
+        && snapshot.signature.is_none()
 }
 
-fn snapshot_is_valid_remote(snapshot: &RulesCacheSnapshot) -> bool {
+fn remote_snapshot_manifest(
+    snapshot: &RulesCacheSnapshot,
+    verifier: &RemoteRulesVerifier,
+) -> Result<Manifest, String> {
     if snapshot.rule_source != RuleSource::Remote
         || snapshot.rule_channel != RuleChannel::Remote
         || snapshot.validation != RulesValidation::Valid
         || snapshot.updated_at.trim().is_empty()
         || snapshot.loaded_at.trim().is_empty()
     {
-        return false;
+        return Err("Remote rules cache was invalid; using the built-in manifest.".to_string());
     }
 
-    let Some(manifest) = snapshot.manifest.as_ref() else {
-        return false;
+    let Some(manifest) = snapshot.manifest.clone() else {
+        return Err(
+            "Remote rules cache was missing its manifest; using the built-in manifest.".to_string(),
+        );
     };
-    snapshot.schema_version == manifest.schema_version
-        && snapshot.generated_at == manifest.generated_at
-        && validate_manifest(manifest).is_ok()
+    let Some(signature) = snapshot.signature.as_ref() else {
+        return Err(
+            "Remote rules cache was missing its signature; using the built-in manifest."
+                .to_string(),
+        );
+    };
+    if snapshot.schema_version != manifest.schema_version
+        || snapshot.generated_at != manifest.generated_at
+        || validate_manifest(&manifest).is_err()
+    {
+        return Err("Remote rules cache was invalid; using the built-in manifest.".to_string());
+    }
+    verifier
+        .verify_manifest(&manifest, signature)
+        .map_err(|error| {
+            format!("Remote rules cache signature rejected: {error}; using the built-in manifest.")
+        })?;
+    Ok(manifest)
 }
 
 fn fallback_to_builtin(
@@ -354,7 +410,9 @@ mod tests {
         rules_cache_path, write_remote_rules_cache,
     };
     use crate::resolve::builtin_manifest;
+    use crate::signature::{RemoteRulesVerifier, RulesSignatureMetadata};
     use crate::status::{RuleChannel, RuleSource, RulesValidation};
+    use ed25519_dalek::{Signer, SigningKey};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -380,6 +438,13 @@ mod tests {
         assert_eq!(snapshot.validation, RulesValidation::Valid);
         assert_eq!(snapshot.updated_at, status.updated_at.unwrap());
         assert_eq!(snapshot.loaded_at, status.loaded_at.unwrap());
+        assert_eq!(snapshot.manifest, None);
+        assert_eq!(snapshot.signature, None);
+        let raw: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(rules_cache_path(&root)).expect("read cache"))
+                .expect("cache json");
+        assert!(raw.get("manifest").is_some_and(serde_json::Value::is_null));
+        assert!(raw.get("signature").is_some_and(serde_json::Value::is_null));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -414,9 +479,12 @@ mod tests {
         let builtin = builtin_manifest().expect("builtin manifest");
         let mut remote = builtin.clone();
         remote.generated_at = "2026-05-30T10:00:00Z".to_string();
-        let remote_status = write_remote_rules_cache(&root, &remote).expect("write remote cache");
+        let (public_key, signature) = signed_metadata(&remote);
+        let verifier = RemoteRulesVerifier::from_public_key_hex(Some(public_key));
+        let remote_status =
+            write_remote_rules_cache(&root, &remote, signature).expect("write remote cache");
 
-        let loaded = load_active_rules_cache(&root, &builtin, true);
+        let loaded = load_active_rules_cache(&root, &builtin, true, &verifier);
 
         assert_eq!(loaded.rule_source, RuleSource::Remote);
         assert_eq!(loaded.rule_channel, RuleChannel::Remote);
@@ -436,6 +504,8 @@ mod tests {
         let builtin = builtin_manifest().expect("builtin manifest");
         let mut remote = builtin.clone();
         remote.schema_version = 99;
+        let (public_key, signature) = signed_metadata(&remote);
+        let verifier = RemoteRulesVerifier::from_public_key_hex(Some(public_key));
         let path = rules_cache_path(&root);
         fs::create_dir_all(path.parent().expect("cache parent")).expect("create cache dir");
         fs::write(
@@ -449,12 +519,13 @@ mod tests {
                 updated_at: "2026-05-30T10:00:00Z".to_string(),
                 loaded_at: "2026-05-30T10:00:00Z".to_string(),
                 manifest: Some(remote),
+                signature: Some(signature),
             })
             .expect("serialize invalid remote cache"),
         )
         .expect("write invalid remote cache");
 
-        let loaded = load_active_rules_cache(&root, &builtin, true);
+        let loaded = load_active_rules_cache(&root, &builtin, true, &verifier);
 
         assert_eq!(loaded.rule_source, RuleSource::BuiltIn);
         assert_eq!(loaded.rule_channel, RuleChannel::Bundled);
@@ -466,6 +537,106 @@ mod tests {
                 .warning
                 .as_deref()
                 .is_some_and(|warning| warning.contains("Remote rules cache was invalid"))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn remote_cache_with_null_signature_falls_back_to_builtin_with_warning() {
+        let root = test_root("null-signature-remote");
+        let builtin = builtin_manifest().expect("builtin manifest");
+        let mut remote = builtin.clone();
+        remote.generated_at = "2026-05-30T10:00:00Z".to_string();
+        let verifier = RemoteRulesVerifier::from_public_key_hex(Some(signed_metadata(&remote).0));
+        let path = rules_cache_path(&root);
+        fs::create_dir_all(path.parent().expect("cache parent")).expect("create cache dir");
+        fs::write(
+            &path,
+            serde_json::to_vec(&RulesCacheSnapshot {
+                rule_source: RuleSource::Remote,
+                rule_channel: RuleChannel::Remote,
+                schema_version: remote.schema_version,
+                generated_at: remote.generated_at.clone(),
+                validation: RulesValidation::Valid,
+                updated_at: "2026-05-30T10:00:00Z".to_string(),
+                loaded_at: "2026-05-30T10:00:00Z".to_string(),
+                manifest: Some(remote),
+                signature: None,
+            })
+            .expect("serialize unsigned remote cache"),
+        )
+        .expect("write unsigned remote cache");
+
+        let loaded = load_active_rules_cache(&root, &builtin, true, &verifier);
+
+        assert_eq!(loaded.rule_source, RuleSource::BuiltIn);
+        assert!(
+            loaded
+                .status
+                .warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("missing its signature"))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn remote_cache_with_absent_signature_is_invalid_current_schema() {
+        let root = test_root("absent-signature-remote");
+        let builtin = builtin_manifest().expect("builtin manifest");
+        let mut remote = builtin.clone();
+        remote.generated_at = "2026-05-30T10:00:00Z".to_string();
+        let verifier = RemoteRulesVerifier::from_public_key_hex(Some(signed_metadata(&remote).0));
+        let path = rules_cache_path(&root);
+        fs::create_dir_all(path.parent().expect("cache parent")).expect("create cache dir");
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "rule_source": "remote",
+                "rule_channel": "remote",
+                "schema_version": remote.schema_version,
+                "generated_at": remote.generated_at,
+                "validation": "valid",
+                "updated_at": "2026-05-30T10:00:00Z",
+                "loaded_at": "2026-05-30T10:00:00Z",
+                "manifest": remote
+            }))
+            .expect("serialize remote cache missing signature field"),
+        )
+        .expect("write remote cache missing signature field");
+
+        let loaded = load_active_rules_cache(&root, &builtin, true, &verifier);
+
+        assert_eq!(loaded.rule_source, RuleSource::BuiltIn);
+        assert!(
+            loaded
+                .status
+                .warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("Remote rules cache was invalid"))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn configured_remote_without_public_key_uses_builtin_with_warning() {
+        let root = test_root("missing-public-key");
+        let builtin = builtin_manifest().expect("builtin manifest");
+        let verifier = RemoteRulesVerifier::from_public_key_hex(None);
+
+        let loaded = load_active_rules_cache(&root, &builtin, true, &verifier);
+
+        assert_eq!(loaded.rule_source, RuleSource::BuiltIn);
+        assert!(loaded.status.recorded);
+        assert!(
+            loaded
+                .status
+                .warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("public key is not configured"))
         );
 
         let _ = fs::remove_dir_all(root);
@@ -487,5 +658,18 @@ mod tests {
         ));
         fs::create_dir_all(&path).expect("create test root");
         path
+    }
+
+    fn signed_metadata(manifest: &crate::types::Manifest) -> (String, RulesSignatureMetadata) {
+        let signing_key = SigningKey::from_bytes(&[9_u8; 32]);
+        let payload = crate::signature::canonical_manifest_payload(manifest).expect("payload");
+        let signature = signing_key.sign(&payload);
+        (
+            hex::encode(signing_key.verifying_key().to_bytes()),
+            RulesSignatureMetadata {
+                signature: hex::encode(signature.to_bytes()),
+                key_id: Some("cache-test-key".to_string()),
+            },
+        )
     }
 }

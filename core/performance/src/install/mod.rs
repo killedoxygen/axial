@@ -3,6 +3,10 @@ use crate::resolve::{builtin_manifest, detect_hardware, resolve_plan, validate_m
 use crate::rules_cache::{
     RulesCacheStatus, bounded_warning, load_active_rules_cache, write_remote_rules_cache,
 };
+use crate::signature::{
+    RULES_KEY_ID_HEADER, RULES_SIGNATURE_HEADER, RemoteRulesVerifier, RulesSignatureError,
+    RulesSignatureMetadata, configured_remote_rules_verifier, signature_metadata_from_header,
+};
 use crate::state::{
     RollbackSnapshotSummary, StateError, list_rollback_snapshots, load_rollback_snapshot,
     load_rollback_snapshot_by_id, load_state, managed_artifact_path, remove_state,
@@ -65,6 +69,8 @@ pub enum RulesRefreshError {
     Parse(#[from] serde_json::Error),
     #[error("remote performance manifest failed validation: {0}")]
     Validation(#[from] crate::resolve::ResolveError),
+    #[error("{0}")]
+    Signature(#[from] RulesSignatureError),
     #[error("failed to persist remote performance manifest: {0}")]
     Cache(#[from] std::io::Error),
 }
@@ -76,6 +82,7 @@ pub struct PerformanceManager {
     rules_client: reqwest::Client,
     config_dir: Option<PathBuf>,
     remote_rules_url: Option<String>,
+    remote_rules_verifier: RemoteRulesVerifier,
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +113,7 @@ impl PerformanceManager {
             rules_client: rules_client(),
             config_dir: None,
             remote_rules_url: None,
+            remote_rules_verifier: RemoteRulesVerifier::disabled(),
         })
     }
 
@@ -117,9 +125,31 @@ impl PerformanceManager {
         config_dir: &Path,
         remote_rules_url: Option<String>,
     ) -> Result<Self, InstallError> {
+        Self::new_with_config_dir_remote_url_and_public_key(
+            config_dir,
+            remote_rules_url,
+            std::env::var(crate::signature::PERFORMANCE_RULES_PUBLIC_KEY_ENV).ok(),
+        )
+    }
+
+    pub fn new_with_config_dir_remote_url_and_public_key(
+        config_dir: &Path,
+        remote_rules_url: Option<String>,
+        remote_rules_public_key: Option<String>,
+    ) -> Result<Self, InstallError> {
         let manifest = builtin_manifest()?;
         let remote_rules_url = normalize_remote_rules_url(remote_rules_url);
-        let loaded = load_active_rules_cache(config_dir, &manifest, remote_rules_url.is_some());
+        let remote_rules_verifier = if remote_rules_url.is_some() {
+            RemoteRulesVerifier::from_public_key_hex(remote_rules_public_key)
+        } else {
+            configured_remote_rules_verifier(false)
+        };
+        let loaded = load_active_rules_cache(
+            config_dir,
+            &manifest,
+            remote_rules_url.is_some(),
+            &remote_rules_verifier,
+        );
         Ok(Self {
             active: Arc::new(RwLock::new(ActiveRules {
                 manifest: loaded.manifest,
@@ -134,6 +164,7 @@ impl PerformanceManager {
             rules_client: rules_client(),
             config_dir: Some(config_dir.to_path_buf()),
             remote_rules_url,
+            remote_rules_verifier,
         })
     }
 
@@ -294,9 +325,13 @@ impl PerformanceManager {
         let Some(remote_rules_url) = self.remote_rules_url.as_ref() else {
             return Err(RulesRefreshError::Unconfigured);
         };
+        if let Some(warning) = self.remote_rules_verifier.acceptance_warning() {
+            self.record_refresh_warning(format!("Remote rules refresh rejected: {warning}"));
+            return Ok(self.rules_status());
+        }
 
         match self.fetch_remote_manifest(remote_rules_url).await {
-            Ok(manifest) => match self.accept_remote_manifest(config_dir, manifest) {
+            Ok(candidate) => match self.accept_remote_manifest(config_dir, candidate) {
                 Ok(()) => Ok(self.rules_status()),
                 Err(error) => {
                     self.record_refresh_warning(format!("Remote rules refresh failed: {error}"));
@@ -317,7 +352,7 @@ impl PerformanceManager {
     async fn fetch_remote_manifest(
         &self,
         remote_rules_url: &str,
-    ) -> Result<crate::types::Manifest, RulesRefreshError> {
+    ) -> Result<RemoteRulesCandidate, RulesRefreshError> {
         let response = self
             .rules_client
             .get(remote_rules_url)
@@ -333,6 +368,16 @@ impl PerformanceManager {
         {
             return Err(RulesRefreshError::ResponseTooLarge);
         }
+        let signature = signature_metadata_from_header(
+            response
+                .headers()
+                .get(RULES_SIGNATURE_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            response
+                .headers()
+                .get(RULES_KEY_ID_HEADER)
+                .and_then(|value| value.to_str().ok()),
+        )?;
 
         let mut body = Vec::new();
         let mut response = response;
@@ -345,16 +390,27 @@ impl PerformanceManager {
 
         let manifest = serde_json::from_slice::<crate::types::Manifest>(&body)?;
         validate_manifest(&manifest)?;
-        Ok(manifest)
+        self.remote_rules_verifier
+            .verify_manifest(&manifest, &signature)?;
+        Ok(RemoteRulesCandidate {
+            manifest,
+            signature,
+        })
     }
 
     fn accept_remote_manifest(
         &self,
         config_dir: &Path,
-        manifest: crate::types::Manifest,
+        candidate: RemoteRulesCandidate,
     ) -> Result<(), RulesRefreshError> {
+        let RemoteRulesCandidate {
+            manifest,
+            signature,
+        } = candidate;
         validate_manifest(&manifest)?;
-        let rules_cache = write_remote_rules_cache(config_dir, &manifest)?;
+        self.remote_rules_verifier
+            .verify_manifest(&manifest, &signature)?;
+        let rules_cache = write_remote_rules_cache(config_dir, &manifest, signature)?;
         let last_refresh_at = rules_cache.updated_at.clone();
         let mut active = self
             .active
@@ -542,6 +598,12 @@ impl PerformanceManager {
     }
 }
 
+#[derive(Debug, Clone)]
+struct RemoteRulesCandidate {
+    manifest: crate::types::Manifest,
+    signature: RulesSignatureMetadata,
+}
+
 fn empty_state(plan: &CompositionPlan) -> CompositionState {
     CompositionState {
         composition_id: plan.composition_id.clone(),
@@ -634,6 +696,7 @@ mod tests {
     use super::*;
     use crate::state::{load_state, save_state};
     use crate::types::{CompositionTier, ManagedMod, ModCondition, VersionFamily};
+    use ed25519_dalek::{Signer, SigningKey};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
@@ -926,11 +989,13 @@ mod tests {
         let builtin = builtin_manifest().expect("builtin manifest");
         let mut remote = builtin.clone();
         remote.generated_at = "2026-05-30T11:00:00Z".to_string();
-        write_remote_rules_cache(&root, &remote).expect("write remote cache");
+        let (public_key, signature) = signed_metadata(&remote);
+        write_remote_rules_cache(&root, &remote, signature).expect("write remote cache");
 
-        let manager = PerformanceManager::new_with_config_dir_and_remote_url(
+        let manager = PerformanceManager::new_with_config_dir_remote_url_and_public_key(
             &root,
             Some("https://rules.example.test/performance.json".to_string()),
+            Some(public_key),
         )
         .expect("performance manager");
         let status = manager.rules_status();
@@ -949,16 +1014,24 @@ mod tests {
     #[test]
     fn accepted_remote_refresh_persists_and_updates_active_status() {
         let root = test_root("accept-remote-refresh");
-        let manager = PerformanceManager::new_with_config_dir_and_remote_url(
-            &root,
-            Some("https://rules.example.test/performance.json".to_string()),
-        )
-        .expect("performance manager");
         let mut remote = builtin_manifest().expect("builtin manifest");
         remote.generated_at = "2026-05-30T12:00:00Z".to_string();
+        let (public_key, signature) = signed_metadata(&remote);
+        let manager = PerformanceManager::new_with_config_dir_remote_url_and_public_key(
+            &root,
+            Some("https://rules.example.test/performance.json".to_string()),
+            Some(public_key.clone()),
+        )
+        .expect("performance manager");
 
         manager
-            .accept_remote_manifest(&root, remote.clone())
+            .accept_remote_manifest(
+                &root,
+                RemoteRulesCandidate {
+                    manifest: remote.clone(),
+                    signature,
+                },
+            )
             .expect("accept remote manifest");
         let status = manager.rules_status();
 
@@ -971,6 +1044,7 @@ mod tests {
             &root,
             &builtin_manifest().expect("builtin manifest"),
             true,
+            &RemoteRulesVerifier::from_public_key_hex(Some(public_key)),
         );
         assert_eq!(reloaded.rule_source, RuleSource::Remote);
         assert_eq!(reloaded.manifest.generated_at, remote.generated_at);
@@ -981,17 +1055,25 @@ mod tests {
     #[test]
     fn rejected_remote_refresh_keeps_previous_rules_and_exposes_warning() {
         let root = test_root("reject-remote-refresh");
-        let manager = PerformanceManager::new_with_config_dir_and_remote_url(
+        let mut invalid = builtin_manifest().expect("builtin manifest");
+        invalid.schema_version = 99;
+        let (public_key, signature) = signed_metadata(&invalid);
+        let manager = PerformanceManager::new_with_config_dir_remote_url_and_public_key(
             &root,
             Some("https://rules.example.test/performance.json".to_string()),
+            Some(public_key),
         )
         .expect("performance manager");
         let before = manager.rules_status();
-        let mut invalid = manager.manifest();
-        invalid.schema_version = 99;
 
         let error = manager
-            .accept_remote_manifest(&root, invalid)
+            .accept_remote_manifest(
+                &root,
+                RemoteRulesCandidate {
+                    manifest: invalid,
+                    signature,
+                },
+            )
             .expect_err("invalid remote manifest should be rejected");
         manager.record_refresh_warning(format!("Remote rules refresh rejected: {error}"));
         let after = manager.rules_status();
@@ -1005,6 +1087,29 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|warning| warning.contains("Remote rules refresh rejected"))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn remote_refresh_without_public_key_keeps_builtin_and_exposes_warning() {
+        let root = test_root("remote-refresh-missing-public-key");
+        let manager = PerformanceManager::new_with_config_dir_remote_url_and_public_key(
+            &root,
+            Some("https://rules.example.test/performance.json".to_string()),
+            None,
+        )
+        .expect("performance manager");
+
+        assert!(manager.remote_refresh_enabled());
+        let status = manager.rules_status();
+        assert_eq!(status.rule_source, RuleSource::BuiltIn);
+        assert!(
+            status
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("public key is not configured"))
         );
 
         let _ = fs::remove_dir_all(root);
@@ -1033,6 +1138,19 @@ mod tests {
                 sha512_verified: false,
             },
         }
+    }
+
+    fn signed_metadata(manifest: &crate::types::Manifest) -> (String, RulesSignatureMetadata) {
+        let signing_key = SigningKey::from_bytes(&[11_u8; 32]);
+        let payload = crate::signature::canonical_manifest_payload(manifest).expect("payload");
+        let signature = signing_key.sign(&payload);
+        (
+            hex::encode(signing_key.verifying_key().to_bytes()),
+            RulesSignatureMetadata {
+                signature: hex::encode(signature.to_bytes()),
+                key_id: Some("install-test-key".to_string()),
+            },
+        )
     }
 
     async fn spawn_modrinth_server(include_sha512: bool) -> String {

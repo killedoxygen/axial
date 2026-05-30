@@ -4,6 +4,7 @@ pub mod modrinth;
 pub mod resolve;
 pub mod rules;
 pub mod rules_cache;
+pub mod signature;
 pub mod state;
 pub mod status;
 pub mod types;
@@ -16,6 +17,10 @@ pub use resolve::{
 };
 pub use rules_cache::{
     LoadedRulesCache, RulesCacheSnapshot, RulesCacheState, RulesCacheStatus, rules_cache_path,
+};
+pub use signature::{
+    PERFORMANCE_RULES_PUBLIC_KEY_ENV, RULES_KEY_ID_HEADER, RULES_SIGNATURE_HEADER,
+    RemoteRulesVerifier, RulesSignatureError, RulesSignatureMetadata, canonical_manifest_payload,
 };
 pub use state::{RollbackSnapshotSummary, StateError, load_state, remove_state, save_state};
 pub use status::{

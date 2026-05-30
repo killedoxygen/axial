@@ -895,6 +895,7 @@ mod tests {
     };
     use croopor_config::{AppPaths, ConfigStore, InstanceStore};
     use croopor_performance::{CompositionState, InstalledMod, PerformanceManager};
+    use ed25519_dalek::{Signer, SigningKey};
     use std::{
         fs,
         path::{Path as FsPath, PathBuf},
@@ -988,11 +989,17 @@ mod tests {
     async fn rules_refresh_route_accepts_configured_remote_manifest() {
         let mut manifest = croopor_performance::builtin_manifest().expect("builtin manifest");
         manifest.generated_at = "2026-05-30T13:00:00Z".to_string();
-        let remote_url =
-            spawn_rules_server(serde_json::to_vec(&manifest).expect("serialize remote manifest"))
-                .await;
-        let fixture =
-            TestFixture::new_with_remote_url("rules-refresh-configured", Some(remote_url));
+        let signed = signed_rules_response(&manifest);
+        let remote_url = spawn_rules_server(
+            serde_json::to_vec(&manifest).expect("serialize remote manifest"),
+            Some(signed.signature),
+        )
+        .await;
+        let fixture = TestFixture::new_with_remote_url_and_public_key(
+            "rules-refresh-configured",
+            Some(remote_url),
+            Some(signed.public_key),
+        );
 
         let response = router()
             .with_state(fixture.state.clone())
@@ -1024,6 +1031,50 @@ mod tests {
             croopor_performance::RulesValidation::Valid
         );
         assert!(status.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rules_refresh_route_rejects_missing_signature_and_keeps_builtin_rules() {
+        let mut manifest = croopor_performance::builtin_manifest().expect("builtin manifest");
+        manifest.generated_at = "2026-05-30T13:30:00Z".to_string();
+        let signed = signed_rules_response(&manifest);
+        let remote_url = spawn_rules_server(
+            serde_json::to_vec(&manifest).expect("serialize remote manifest"),
+            None,
+        )
+        .await;
+        let fixture = TestFixture::new_with_remote_url_and_public_key(
+            "rules-refresh-missing-signature",
+            Some(remote_url),
+            Some(signed.public_key),
+        );
+
+        let response = router()
+            .with_state(fixture.state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/performance/rules/refresh")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("route response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let status: PerformanceRulesStatus =
+            serde_json::from_slice(&body).expect("rules status json");
+        assert_eq!(status.rule_source, croopor_performance::RuleSource::BuiltIn);
+        assert!(status.remote_refresh);
+        assert!(
+            status
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("signature header is missing"))
+        );
     }
 
     #[tokio::test]
@@ -1866,7 +1917,7 @@ mod tests {
     #[tokio::test]
     async fn startup_resume_runs_persisted_pending_remove_operation() {
         let root = test_root("startup-resume-remove");
-        let state = build_test_state(&root, None);
+        let state = build_test_state(&root, None, None);
         let instance_id = state
             .instances()
             .add(
@@ -1893,7 +1944,7 @@ mod tests {
             .await;
         drop(state);
 
-        let reloaded = build_test_state(&root, None);
+        let reloaded = build_test_state(&root, None, None);
         let loaded = reloaded
             .performance_operations()
             .get(&started.id)
@@ -1973,8 +2024,16 @@ mod tests {
         }
 
         fn new_with_remote_url(name: &str, remote_rules_url: Option<String>) -> Self {
+            Self::new_with_remote_url_and_public_key(name, remote_rules_url, None)
+        }
+
+        fn new_with_remote_url_and_public_key(
+            name: &str,
+            remote_rules_url: Option<String>,
+            remote_rules_public_key: Option<String>,
+        ) -> Self {
             let root = test_root(name);
-            let state = build_test_state(&root, remote_rules_url);
+            let state = build_test_state(&root, remote_rules_url, remote_rules_public_key);
 
             Self { state, root }
         }
@@ -1994,7 +2053,7 @@ mod tests {
         }
     }
 
-    async fn spawn_rules_server(body: Vec<u8>) -> String {
+    async fn spawn_rules_server(body: Vec<u8>, signature: Option<String>) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind rules server");
@@ -2003,8 +2062,20 @@ mod tests {
             let (mut socket, _) = listener.accept().await.expect("accept rules request");
             let mut request = [0_u8; 1024];
             let _ = socket.read(&mut request).await;
+            let signature_header = signature
+                .as_ref()
+                .map(|signature| {
+                    format!(
+                        "{}: {}\r\n{}: test-key\r\n",
+                        croopor_performance::RULES_SIGNATURE_HEADER,
+                        signature,
+                        croopor_performance::RULES_KEY_ID_HEADER
+                    )
+                })
+                .unwrap_or_default();
             let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                signature_header,
                 body.len()
             );
             socket
@@ -2050,7 +2121,11 @@ mod tests {
         }
     }
 
-    fn build_test_state(root: &FsPath, remote_rules_url: Option<String>) -> AppState {
+    fn build_test_state(
+        root: &FsPath,
+        remote_rules_url: Option<String>,
+        remote_rules_public_key: Option<String>,
+    ) -> AppState {
         let paths = test_paths(root);
         let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
         let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
@@ -2062,9 +2137,10 @@ mod tests {
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
-                PerformanceManager::new_with_config_dir_and_remote_url(
+                PerformanceManager::new_with_config_dir_remote_url_and_public_key(
                     &paths.config_dir,
                     remote_rules_url,
+                    remote_rules_public_key,
                 )
                 .expect("performance manager"),
             ),
@@ -2080,6 +2156,21 @@ mod tests {
             loader: None,
             mode: None,
             rollback_id: None,
+        }
+    }
+
+    struct SignedRulesResponse {
+        public_key: String,
+        signature: String,
+    }
+
+    fn signed_rules_response(manifest: &croopor_performance::Manifest) -> SignedRulesResponse {
+        let signing_key = SigningKey::from_bytes(&[13_u8; 32]);
+        let payload = croopor_performance::canonical_manifest_payload(manifest).expect("payload");
+        let signature = signing_key.sign(&payload);
+        SignedRulesResponse {
+            public_key: hex::encode(signing_key.verifying_key().to_bytes()),
+            signature: hex::encode(signature.to_bytes()),
         }
     }
 
