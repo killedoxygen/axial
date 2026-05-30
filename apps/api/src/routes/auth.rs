@@ -34,8 +34,29 @@ struct AuthStatusResponse {
     verified: bool,
     online_mode_ready: bool,
     skin_source: &'static str,
+    msa_authenticated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    msa_provider: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    msa_token_expires_in: Option<u64>,
     login_available: bool,
     login_reason: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AuthStatusMsaState {
+    authenticated: bool,
+    token_expires_in: Option<u64>,
+}
+
+#[cfg(test)]
+impl AuthStatusMsaState {
+    fn unauthenticated() -> Self {
+        Self {
+            authenticated: false,
+            token_expires_in: None,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -69,6 +90,13 @@ struct AuthLoginMsaAuthenticatedResponse {
     has_refresh_token: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     token_scope: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AuthLogoutResponse {
+    status: &'static str,
+    cleared_pending_logins: usize,
+    had_msa_auth: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,6 +157,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/auth/status", get(handle_auth_status))
         .route("/api/v1/auth/login", post(handle_auth_login))
+        .route("/api/v1/auth/logout", post(handle_auth_logout))
         .route(
             "/api/v1/auth/login/{login_id}",
             get(handle_auth_login_status),
@@ -142,10 +171,12 @@ pub fn router() -> Router<AppState> {
 async fn handle_auth_status(
     State(state): State<AppState>,
 ) -> Result<Json<AuthStatusResponse>, (StatusCode, Json<serde_json::Value>)> {
-    auth_status_from_username(
+    auth_status_for_store(
         &state.config().current().username,
         AuthLoginConfig::from_env(),
+        state.auth_logins(),
     )
+    .await
     .map(Json)
 }
 
@@ -173,9 +204,30 @@ async fn handle_auth_login_poll(
     .await
 }
 
+async fn handle_auth_logout(State(state): State<AppState>) -> Json<AuthLogoutResponse> {
+    Json(auth_logout(state.auth_logins()).await)
+}
+
+async fn auth_status_for_store(
+    config_username: &str,
+    login_config: AuthLoginConfig,
+    login_store: &Arc<AuthLoginStore>,
+) -> Result<AuthStatusResponse, (StatusCode, Json<serde_json::Value>)> {
+    let token_expires_in = login_store.active_msa_auth_remaining_seconds().await;
+    auth_status_from_username(
+        config_username,
+        login_config,
+        AuthStatusMsaState {
+            authenticated: token_expires_in.is_some(),
+            token_expires_in,
+        },
+    )
+}
+
 fn auth_status_from_username(
     config_username: &str,
     login_config: AuthLoginConfig,
+    msa_state: AuthStatusMsaState,
 ) -> Result<AuthStatusResponse, (StatusCode, Json<serde_json::Value>)> {
     let username = validate_username(config_username).map_err(|error| {
         (
@@ -192,9 +244,21 @@ fn auth_status_from_username(
         verified: false,
         online_mode_ready: false,
         skin_source: "default",
+        msa_authenticated: msa_state.authenticated,
+        msa_provider: msa_state.authenticated.then_some("microsoft"),
+        msa_token_expires_in: msa_state.token_expires_in,
         login_available: login_config.is_available(),
         login_reason: login_config.reason(),
     })
+}
+
+async fn auth_logout(login_store: &Arc<AuthLoginStore>) -> AuthLogoutResponse {
+    let (cleared_pending_logins, had_msa_auth) = login_store.clear_all().await;
+    AuthLogoutResponse {
+        status: "logged_out",
+        cleared_pending_logins,
+        had_msa_auth,
+    }
 }
 
 async fn auth_login_for_config(
@@ -596,6 +660,9 @@ mod tests {
         assert!(!response.verified);
         assert!(!response.online_mode_ready);
         assert_eq!(response.skin_source, "default");
+        assert!(!response.msa_authenticated);
+        assert_eq!(response.msa_provider, None);
+        assert_eq!(response.msa_token_expires_in, None);
         assert!(!response.login_available);
         assert_eq!(response.login_reason, LOGIN_UNAVAILABLE_REASON);
     }
@@ -605,6 +672,7 @@ mod tests {
         let response = auth_status_from_username(
             "ConfigUser",
             AuthLoginConfig::from_env_value(Some(" public-client-id ")),
+            AuthStatusMsaState::unauthenticated(),
         )
         .expect("auth status");
 
@@ -614,8 +682,12 @@ mod tests {
 
     #[test]
     fn auth_status_rejects_invalid_configured_username() {
-        let error = auth_status_from_username("bad name", AuthLoginConfig::from_env_value(None))
-            .expect_err("invalid username should fail");
+        let error = auth_status_from_username(
+            "bad name",
+            AuthLoginConfig::from_env_value(None),
+            AuthStatusMsaState::unauthenticated(),
+        )
+        .expect_err("invalid username should fail");
 
         assert_eq!(error.0, StatusCode::BAD_REQUEST);
         assert_eq!(
@@ -910,15 +982,91 @@ mod tests {
         );
         assert_no_sensitive_public_fields(&response.1.0);
         assert_eq!(store.get(&session.login_id).await, None);
+        assert!(store.has_active_msa_auth().await);
+        assert!(
+            store
+                .active_msa_auth_remaining_seconds()
+                .await
+                .is_some_and(|value| value > 0 && value <= 3600)
+        );
+    }
 
-        let token = store
-            .get_msa_token(&session.login_id)
+    #[tokio::test]
+    async fn auth_status_reports_volatile_msa_auth_without_online_identity_claims() {
+        let store = Arc::new(AuthLoginStore::new());
+        let session = insert_pending_login(&store).await;
+        store
+            .complete_with_msa_token(
+                &session.login_id,
+                NewAuthLoginMsaToken {
+                    access_token: "msa-access-token".to_string(),
+                    refresh_token: Some("msa-refresh-token".to_string()),
+                    id_token: Some("msa-id-token".to_string()),
+                    token_type: "Bearer".to_string(),
+                    expires_in: 3600,
+                    scope: Some("XboxLive.signin offline_access".to_string()),
+                },
+            )
             .await
-            .expect("stored msa token");
-        assert_eq!(token.access_token, "msa-access-token");
-        assert_eq!(token.refresh_token, Some("msa-refresh-token".to_string()));
-        assert_eq!(token.id_token, Some("msa-id-token".to_string()));
-        assert_eq!(token.token_type, "Bearer");
+            .expect("complete login");
+
+        let response = auth_status_for_store(
+            "ConfigUser",
+            AuthLoginConfig::from_env_value(Some("public-client-id")),
+            &store,
+        )
+        .await
+        .expect("auth status");
+
+        assert_eq!(response.mode, "offline");
+        assert_eq!(response.username, "ConfigUser");
+        assert_eq!(response.uuid, offline_uuid("ConfigUser"));
+        assert_eq!(response.provider, "offline");
+        assert!(!response.verified);
+        assert!(!response.online_mode_ready);
+        assert_eq!(response.skin_source, "default");
+        assert!(response.msa_authenticated);
+        assert_eq!(response.msa_provider, Some("microsoft"));
+        assert!(
+            response
+                .msa_token_expires_in
+                .is_some_and(|value| value > 0 && value <= 3600)
+        );
+        assert!(response.login_available);
+    }
+
+    #[tokio::test]
+    async fn auth_logout_clears_pending_sessions_and_active_msa_auth() {
+        let store = Arc::new(AuthLoginStore::new());
+        let session = insert_pending_login(&store).await;
+        store
+            .complete_with_msa_token(
+                &session.login_id,
+                NewAuthLoginMsaToken {
+                    access_token: "msa-access-token".to_string(),
+                    refresh_token: Some("msa-refresh-token".to_string()),
+                    id_token: Some("msa-id-token".to_string()),
+                    token_type: "Bearer".to_string(),
+                    expires_in: 3600,
+                    scope: None,
+                },
+            )
+            .await
+            .expect("complete login");
+        let pending = insert_pending_login(&store).await;
+
+        let response = auth_logout(&store).await;
+
+        assert_eq!(response.status, "logged_out");
+        assert_eq!(response.cleared_pending_logins, 1);
+        assert!(response.had_msa_auth);
+        assert_eq!(store.get(&pending.login_id).await, None);
+        assert!(!store.has_active_msa_auth().await);
+
+        let second_response = auth_logout(&store).await;
+        assert_eq!(second_response.status, "logged_out");
+        assert_eq!(second_response.cleared_pending_logins, 0);
+        assert!(!second_response.had_msa_auth);
     }
 
     #[tokio::test]
@@ -1002,6 +1150,7 @@ mod tests {
             auth_status_from_username(
                 &self.state.config().current().username,
                 AuthLoginConfig::from_env_value(None),
+                AuthStatusMsaState::unauthenticated(),
             )
             .map(Json)
         }

@@ -19,6 +19,7 @@ pub struct AuthLoginSession {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthLoginMsaToken {
+    pub login_id: String,
     pub access_token: String,
     pub refresh_token: Option<String>,
     pub id_token: Option<String>,
@@ -51,7 +52,7 @@ pub struct NewAuthLoginSession {
 
 pub struct AuthLoginStore {
     sessions: RwLock<HashMap<String, AuthLoginSession>>,
-    msa_tokens: RwLock<HashMap<String, AuthLoginMsaToken>>,
+    active_msa_token: RwLock<Option<AuthLoginMsaToken>>,
     next_id: AtomicU64,
 }
 
@@ -59,7 +60,7 @@ impl AuthLoginStore {
     pub fn new() -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
-            msa_tokens: RwLock::new(HashMap::new()),
+            active_msa_token: RwLock::new(None),
             next_id: AtomicU64::new(1),
         }
     }
@@ -108,6 +109,7 @@ impl AuthLoginStore {
         }
 
         let token = AuthLoginMsaToken {
+            login_id: login_id.to_string(),
             access_token: new_token.access_token,
             refresh_token: new_token.refresh_token,
             id_token: new_token.id_token,
@@ -119,10 +121,7 @@ impl AuthLoginStore {
                 + chrono::Duration::seconds(saturating_u64_to_i64(new_token.expires_in)),
         };
 
-        self.msa_tokens
-            .write()
-            .await
-            .insert(login_id.to_string(), token.clone());
+        *self.active_msa_token.write().await = Some(token.clone());
         Some(token)
     }
 
@@ -140,9 +139,40 @@ impl AuthLoginStore {
         self.sessions.write().await.remove(login_id).is_some()
     }
 
+    pub async fn has_active_msa_auth(&self) -> bool {
+        self.active_msa_auth_remaining_seconds().await.is_some()
+    }
+
+    pub async fn active_msa_auth_remaining_seconds(&self) -> Option<u64> {
+        let mut token = self.active_msa_token.write().await;
+        let (expires_at, expires_in) = {
+            let active = token.as_ref()?;
+            (active.expires_at, active.expires_in)
+        };
+        let remaining = (expires_at - Utc::now()).num_milliseconds();
+        if remaining <= 0 {
+            *token = None;
+            return None;
+        }
+
+        Some((((remaining as u64) + 999) / 1000).min(expires_in))
+    }
+
+    pub async fn clear_all(&self) -> (usize, bool) {
+        let cleared_pending_logins = {
+            let mut sessions = self.sessions.write().await;
+            let len = sessions.len();
+            sessions.clear();
+            len
+        };
+        let had_msa_auth = self.active_msa_token.write().await.take().is_some();
+
+        (cleared_pending_logins, had_msa_auth)
+    }
+
     #[cfg(test)]
-    pub async fn get_msa_token(&self, login_id: &str) -> Option<AuthLoginMsaToken> {
-        self.msa_tokens.read().await.get(login_id).cloned()
+    pub async fn active_msa_token(&self) -> Option<AuthLoginMsaToken> {
+        self.active_msa_token.read().await.clone()
     }
 
     pub async fn remove_expired(&self, login_id: &str) -> bool {
@@ -281,5 +311,149 @@ mod tests {
 
         assert!(!store.remove_expired(&active.login_id).await);
         assert_eq!(store.get(&active.login_id).await, Some(active));
+    }
+
+    #[tokio::test]
+    async fn auth_login_store_keeps_only_one_active_msa_token() {
+        let store = AuthLoginStore::new();
+        let first = store
+            .insert(NewAuthLoginSession {
+                device_code: "first-device-code".to_string(),
+                user_code: "FIRST".to_string(),
+                verification_uri: "https://www.microsoft.com/link".to_string(),
+                expires_in: 900,
+                interval: 5,
+                message: None,
+            })
+            .await;
+        let second = store
+            .insert(NewAuthLoginSession {
+                device_code: "second-device-code".to_string(),
+                user_code: "SECOND".to_string(),
+                verification_uri: "https://www.microsoft.com/link".to_string(),
+                expires_in: 900,
+                interval: 5,
+                message: None,
+            })
+            .await;
+
+        store
+            .complete_with_msa_token(
+                &first.login_id,
+                NewAuthLoginMsaToken {
+                    access_token: "first-access-token".to_string(),
+                    refresh_token: None,
+                    id_token: None,
+                    token_type: "Bearer".to_string(),
+                    expires_in: 3600,
+                    scope: None,
+                },
+            )
+            .await
+            .expect("first token");
+        store
+            .complete_with_msa_token(
+                &second.login_id,
+                NewAuthLoginMsaToken {
+                    access_token: "second-access-token".to_string(),
+                    refresh_token: Some("second-refresh-token".to_string()),
+                    id_token: None,
+                    token_type: "Bearer".to_string(),
+                    expires_in: 3600,
+                    scope: Some("XboxLive.signin offline_access".to_string()),
+                },
+            )
+            .await
+            .expect("second token");
+
+        let active = store.active_msa_token().await.expect("active token");
+        assert_eq!(active.login_id, second.login_id);
+        assert_eq!(active.access_token, "second-access-token");
+        assert_eq!(
+            active.refresh_token,
+            Some("second-refresh-token".to_string())
+        );
+        assert_eq!(store.get(&first.login_id).await, None);
+        assert_eq!(store.get(&second.login_id).await, None);
+    }
+
+    #[tokio::test]
+    async fn auth_login_store_clear_all_removes_pending_and_active_msa_auth() {
+        let store = AuthLoginStore::new();
+        let session = store
+            .insert(NewAuthLoginSession {
+                device_code: "raw-device-code".to_string(),
+                user_code: "ABCD-EFGH".to_string(),
+                verification_uri: "https://www.microsoft.com/link".to_string(),
+                expires_in: 900,
+                interval: 5,
+                message: None,
+            })
+            .await;
+        store
+            .complete_with_msa_token(
+                &session.login_id,
+                NewAuthLoginMsaToken {
+                    access_token: "msa-access-token".to_string(),
+                    refresh_token: Some("msa-refresh-token".to_string()),
+                    id_token: Some("msa-id-token".to_string()),
+                    token_type: "Bearer".to_string(),
+                    expires_in: 3600,
+                    scope: None,
+                },
+            )
+            .await
+            .expect("complete login");
+        let pending = store
+            .insert(NewAuthLoginSession {
+                device_code: "pending-device-code".to_string(),
+                user_code: "PENDING".to_string(),
+                verification_uri: "https://www.microsoft.com/link".to_string(),
+                expires_in: 900,
+                interval: 5,
+                message: None,
+            })
+            .await;
+
+        let summary = store.clear_all().await;
+
+        assert_eq!(summary, (1, true));
+        assert_eq!(store.get(&pending.login_id).await, None);
+        assert_eq!(store.active_msa_token().await, None);
+
+        assert_eq!(store.clear_all().await, (0, false));
+    }
+
+    #[tokio::test]
+    async fn auth_login_store_drops_expired_active_msa_auth() {
+        let store = AuthLoginStore::new();
+        let session = store
+            .insert(NewAuthLoginSession {
+                device_code: "raw-device-code".to_string(),
+                user_code: "ABCD-EFGH".to_string(),
+                verification_uri: "https://www.microsoft.com/link".to_string(),
+                expires_in: 900,
+                interval: 5,
+                message: None,
+            })
+            .await;
+        store
+            .complete_with_msa_token(
+                &session.login_id,
+                NewAuthLoginMsaToken {
+                    access_token: "msa-access-token".to_string(),
+                    refresh_token: None,
+                    id_token: None,
+                    token_type: "Bearer".to_string(),
+                    expires_in: 0,
+                    scope: None,
+                },
+            )
+            .await
+            .expect("complete login");
+
+        assert_eq!(store.active_msa_auth_remaining_seconds().await, None);
+        assert_eq!(store.active_msa_token().await, None);
+        assert!(!store.has_active_msa_auth().await);
     }
 }
