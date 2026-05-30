@@ -1190,12 +1190,35 @@ mod tests {
                     .any(|managed_mod| managed_mod.slug == "sodium")
             );
             assert_eq!(
-                plan.mods
-                    .iter()
-                    .any(|managed_mod| managed_mod.slug == "threadtweak"),
-                expects_threadtweak
+                count_mods_with_slug(&plan.mods, "threadtweak"),
+                usize::from(expects_threadtweak)
             );
         }
+    }
+
+    #[test]
+    fn family_e_fabric_fallback_does_not_include_threadtweak() {
+        let mut manifest = builtin_manifest().expect("manifest");
+        manifest.emergency_disables.push(test_composition_disable(
+            "hold-family-e-extended",
+            "family-e-fabric-extended",
+        ));
+
+        let plan = resolve_plan(
+            Some(&manifest),
+            ResolutionRequest {
+                game_version: "1.20.1".to_string(),
+                loader: "fabric".to_string(),
+                mode: PerformanceMode::Managed,
+                hardware: HardwareProfile::default(),
+                installed_mods: Vec::new(),
+            },
+        );
+
+        assert_eq!(plan.composition_id, "family-e-fabric-core");
+        assert_eq!(plan.family, VersionFamily::E);
+        assert_eq!(plan.tier, CompositionTier::Core);
+        assert_eq!(count_mods_with_slug(&plan.mods, "threadtweak"), 0);
     }
 
     #[test]
@@ -1673,6 +1696,7 @@ mod tests {
 
         assert_eq!(plan.composition_id, "family-f-fabric-core");
         assert_eq!(plan.tier, CompositionTier::Core);
+        assert_eq!(count_mods_with_slug(&plan.mods, "threadtweak"), 1);
         assert_eq!(
             plan.fallback_reason,
             "a higher-tier managed composition is temporarily disabled"
@@ -1780,6 +1804,12 @@ mod tests {
             .iter_mut()
             .find_map(|composition| composition.mods.first_mut())
             .expect("test manifest should include a managed mod")
+    }
+
+    fn count_mods_with_slug(mods: &[ManagedMod], slug: &str) -> usize {
+        mods.iter()
+            .filter(|managed_mod| managed_mod.slug == slug)
+            .count()
     }
 
     fn assert_error_kind(result: Result<(), ResolveError>, expected: ResolveError) {

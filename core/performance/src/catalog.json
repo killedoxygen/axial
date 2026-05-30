@@ -179,7 +179,8 @@
         {"artifact_id": "immediatelyfast", "project_id": "immediatelyfast", "slug": "immediatelyfast", "name": "ImmediatelyFast", "condition": "always"},
         {"artifact_id": "dynamic-fps", "project_id": "dynamic-fps", "slug": "dynamic-fps", "name": "Dynamic FPS", "condition": "always"},
         {"artifact_id": "modernfix", "project_id": "modernfix", "slug": "modernfix", "name": "ModernFix", "condition": "always"},
-        {"artifact_id": "scalablelux", "project_id": "scalablelux", "slug": "scalablelux", "name": "ScalableLux", "condition": "always"}
+        {"artifact_id": "scalablelux", "project_id": "scalablelux", "slug": "scalablelux", "name": "ScalableLux", "condition": "always"},
+        {"artifact_id": "threadtweak", "project_id": "threadtweak", "slug": "threadtweak", "name": "ThreadTweak", "condition": "always"}
       ]
     },
     {
