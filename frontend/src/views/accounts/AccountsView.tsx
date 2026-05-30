@@ -1,5 +1,5 @@
 import type { JSX } from 'preact';
-import { useEffect, useState } from 'preact/hooks';
+import { useCallback, useEffect, useState } from 'preact/hooks';
 import { api, apiResourceUrl } from '../../api';
 import { Button, Card, Input, Pill, SectionHeading } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
@@ -29,6 +29,9 @@ interface AuthStatus {
   skin_source: string;
   login_available: boolean;
   login_reason: string;
+  msa_authenticated?: boolean;
+  msa_provider?: string | null;
+  msa_token_expires_in?: number | null;
 }
 
 interface AuthLoginPending {
@@ -40,6 +43,28 @@ interface AuthLoginPending {
   interval: number;
   message?: string;
 }
+
+interface AuthPollPending {
+  status: 'pending';
+  interval: number;
+  poll_hint?: string;
+}
+
+interface AuthPollAuthenticated {
+  status: 'msa_authenticated';
+  msa_provider?: string | null;
+  msa_token_expires_in?: number | null;
+}
+
+type AuthPollTerminalStatus = 'authorization_declined' | 'expired' | 'bad_verification_code' | 'error';
+
+interface AuthPollTerminal {
+  status: AuthPollTerminalStatus;
+  error?: string;
+  poll_hint?: string;
+}
+
+type AuthPollResponse = AuthPollPending | AuthPollAuthenticated | AuthPollTerminal;
 
 type OfflineProfileState = 'loading' | 'ready' | 'unavailable';
 type AuthStatusState = 'loading' | 'ready' | 'unavailable';
@@ -140,10 +165,10 @@ function ProfileMetaValue({ label, value }: { label: string; value: string }): J
         color: theme.n.textDim,
         fontFamily: label === 'UUID' ? theme.font.mono : undefined,
         fontSize: 12,
+        lineHeight: 1.35,
         minWidth: 0,
-        overflow: 'hidden',
-        textOverflow: 'ellipsis',
-        whiteSpace: 'nowrap',
+        overflowWrap: 'anywhere',
+        wordBreak: 'break-word',
       }}>{value}</div>
     </div>
   );
@@ -185,9 +210,15 @@ function useOfflineSkinProfile(savedUsername: string): {
 function useAuthStatus(savedUsername: string): {
   status: AuthStatus | null;
   state: AuthStatusState;
+  refresh: () => void;
 } {
   const [status, setStatus] = useState<AuthStatus | null>(null);
   const [state, setState] = useState<AuthStatusState>('loading');
+  const [refreshIndex, setRefreshIndex] = useState(0);
+
+  const refresh = useCallback(() => {
+    setRefreshIndex((value) => value + 1);
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -210,9 +241,9 @@ function useAuthStatus(savedUsername: string): {
     return () => {
       active = false;
     };
-  }, [savedUsername]);
+  }, [savedUsername, refreshIndex]);
 
-  return { status, state };
+  return { status, state, refresh };
 }
 
 function OfflineProfileMeta({
@@ -345,17 +376,84 @@ function loginPendingResponse(value: unknown): AuthLoginPending | null {
   };
 }
 
-function loginErrorMessage(value: unknown): string {
-  if (typeof value !== 'object' || value === null) {
-    return 'Could not start Microsoft sign-in.';
-  }
-  const record = value as Record<string, unknown>;
-  return typeof record.error === 'string' && record.error.trim().length > 0
-    ? record.error
-    : 'Could not start Microsoft sign-in.';
+function boundedMessage(value: string | undefined, fallback: string): string {
+  const trimmed = value?.trim();
+  if (!trimmed) return fallback;
+  return trimmed.length > 180 ? `${trimmed.slice(0, 177)}...` : trimmed;
 }
 
-function DeviceCodePanel({ login }: { login: AuthLoginPending }): JSX.Element {
+function apiErrorMessage(value: unknown, fallback: string): string {
+  if (typeof value !== 'object' || value === null) {
+    return fallback;
+  }
+  const record = value as Record<string, unknown>;
+  return boundedMessage(typeof record.error === 'string' ? record.error : undefined, fallback);
+}
+
+function loginErrorMessage(value: unknown): string {
+  return apiErrorMessage(value, 'Could not start Microsoft sign-in.');
+}
+
+function logoutErrorMessage(value: unknown): string {
+  return apiErrorMessage(value, 'Could not clear Microsoft sign-in.');
+}
+
+function pollResponse(value: unknown): AuthPollResponse | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const record = value as Record<string, unknown>;
+  if (record.status === 'pending' && typeof record.interval === 'number') {
+    return {
+      status: 'pending',
+      interval: record.interval,
+      poll_hint: typeof record.poll_hint === 'string' ? record.poll_hint : undefined,
+    };
+  }
+
+  if (record.status === 'msa_authenticated') {
+    return {
+      status: 'msa_authenticated',
+      msa_provider: typeof record.msa_provider === 'string' ? record.msa_provider : undefined,
+      msa_token_expires_in: typeof record.msa_token_expires_in === 'number'
+        ? record.msa_token_expires_in
+        : undefined,
+    };
+  }
+
+  if (
+    record.status === 'authorization_declined' ||
+    record.status === 'expired' ||
+    record.status === 'bad_verification_code' ||
+    record.status === 'error'
+  ) {
+    return {
+      status: record.status,
+      error: typeof record.error === 'string' ? record.error : undefined,
+      poll_hint: typeof record.poll_hint === 'string' ? record.poll_hint : undefined,
+    };
+  }
+
+  return null;
+}
+
+function pollTerminalMessage(response: AuthPollTerminal | null): string {
+  if (!response) return 'Microsoft sign-in returned an unexpected response.';
+  const fallback = response.status === 'authorization_declined'
+    ? 'Microsoft sign-in was declined.'
+    : response.status === 'expired'
+      ? 'Microsoft sign-in expired. Get a new code to try again.'
+      : response.status === 'bad_verification_code'
+        ? 'Microsoft sign-in code was rejected. Get a new code to try again.'
+        : 'Microsoft sign-in could not be completed.';
+  return boundedMessage(response.error || response.poll_hint, fallback);
+}
+
+function DeviceCodePanel({
+  login,
+  pollHint,
+}: {
+  login: AuthLoginPending;
+  pollHint?: string | null;
+}): JSX.Element {
   const theme = useTheme();
   const [copied, setCopied] = useState<CopyTarget | null>(null);
   const [copyFailed, setCopyFailed] = useState<CopyTarget | null>(null);
@@ -467,7 +565,7 @@ function DeviceCodePanel({ login }: { login: AuthLoginPending }): JSX.Element {
       }}>
         <span>Expires in {formatSeconds(login.expires_in)}</span>
         <span>Poll interval {formatSeconds(login.interval)}</span>
-        <span>Device flow only</span>
+        <span>{pollHint || 'Waiting for approval'}</span>
       </div>
 
       {copyFailed && (
@@ -485,10 +583,14 @@ function DeviceCodePanel({ login }: { login: AuthLoginPending }): JSX.Element {
 
 function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Element {
   const theme = useTheme();
-  const { status, state } = useAuthStatus(savedUsername);
+  const { status, state, refresh: refreshStatus } = useAuthStatus(savedUsername);
   const [login, setLogin] = useState<AuthLoginPending | null>(null);
   const [loginBusy, setLoginBusy] = useState(false);
   const [loginError, setLoginError] = useState<string | null>(null);
+  const [pollHint, setPollHint] = useState<string | null>(null);
+  const [loginSuccess, setLoginSuccess] = useState<string | null>(null);
+  const [logoutBusy, setLogoutBusy] = useState(false);
+  const [logoutError, setLogoutError] = useState<string | null>(null);
   const statusLabel = state === 'ready' && status
     ? status.mode === 'offline' ? 'Offline' : status.mode
     : state === 'loading' ? 'Loading' : 'Unavailable';
@@ -498,12 +600,70 @@ function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Elem
     setLogin(null);
     setLoginError(null);
     setLoginBusy(false);
+    setPollHint(null);
+    setLoginSuccess(null);
+    setLogoutBusy(false);
+    setLogoutError(null);
   }, [savedUsername]);
+
+  useEffect(() => {
+    if (!login) return undefined;
+    let active = true;
+    const timeout = window.setTimeout(() => {
+      void api('POST', `/auth/login/${encodeURIComponent(login.login_id)}/poll`)
+        .then((response: unknown) => {
+          if (!active) return;
+          const poll = pollResponse(response);
+          if (!poll) {
+            setLogin(null);
+            setPollHint(null);
+            setLoginError(pollTerminalMessage(null));
+            return;
+          }
+
+          if (poll.status === 'pending') {
+            setPollHint(poll.poll_hint ? boundedMessage(poll.poll_hint, '') : null);
+            setLogin((current) => current?.login_id === login.login_id
+              ? { ...current, interval: poll.interval }
+              : current);
+            return;
+          }
+
+          if (poll.status === 'msa_authenticated') {
+            setLogin(null);
+            setPollHint(null);
+            setLoginError(null);
+            setLoginSuccess('Microsoft sign-in is active for this launcher session. Launch identity remains offline and unverified.');
+            refreshStatus();
+            return;
+          }
+
+          setLogin(null);
+          setPollHint(null);
+          setLoginError(pollTerminalMessage(poll));
+        })
+        .catch(() => {
+          if (!active) return;
+          setLogin(null);
+          setPollHint(null);
+          setLoginError('Could not reach the local backend while polling Microsoft sign-in.');
+        });
+    }, Math.max(1, login.interval) * 1000);
+
+    return () => {
+      active = false;
+      window.clearTimeout(timeout);
+    };
+  }, [login, refreshStatus]);
 
   const startLogin = async (): Promise<void> => {
     if (loginBusy) return;
     setLoginBusy(true);
+    setLogin(null);
     setLoginError(null);
+    setLogoutError(null);
+    setLoginSuccess(null);
+    setPollHint(null);
     try {
       const response = await api('POST', '/auth/login');
       const pending = loginPendingResponse(response);
@@ -521,22 +681,56 @@ function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Elem
     }
   };
 
+  const logout = async (): Promise<void> => {
+    if (logoutBusy) return;
+    setLogoutBusy(true);
+    setLogin(null);
+    setPollHint(null);
+    setLoginError(null);
+    setLogoutError(null);
+    setLoginSuccess(null);
+    try {
+      const response = await api('POST', '/auth/logout');
+      if (typeof response === 'object' && response !== null && typeof response.error === 'string') {
+        setLogoutError(logoutErrorMessage(response));
+      } else {
+        setLoginSuccess('Microsoft sign-in was cleared. Offline launches are unchanged.');
+      }
+    } catch {
+      setLogoutError('Could not reach the local backend to clear Microsoft sign-in.');
+    } finally {
+      refreshStatus();
+      setLogoutBusy(false);
+    }
+  };
+
+  const msaActive = Boolean(status?.msa_authenticated);
+  const msaProvider = status?.msa_provider || 'Microsoft';
+  const statusCopy = msaActive
+    ? `${msaProvider} sign-in is active. Croopor still launches as ${status?.username}, an offline unverified identity, until the future Minecraft profile chain exists.`
+    : `Croopor is using ${status?.username} as the current ${status?.provider} identity. Online-mode sessions are ${status?.online_mode_ready ? 'ready' : 'not ready'}.`;
+
   return (
     <Card>
       <SectionHeading
         eyebrow="Account"
         title="Minecraft account"
-        right={<Pill tone={statusTone} icon="user">{statusLabel}</Pill>}
+        right={(
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <Pill tone={statusTone} icon="user">{statusLabel}</Pill>
+            {msaActive && <Pill tone="ok" icon="check-circle">Microsoft active</Pill>}
+          </div>
+        )}
       />
       <div style={{ display: 'grid', gap: 12 }}>
         {state === 'ready' && status ? (
           <>
             <div style={{ fontSize: 13, color: theme.n.textDim, lineHeight: 1.5, maxWidth: 780 }}>
-              Croopor is using {status.username} as the current {status.provider} identity. Online-mode sessions are {status.online_mode_ready ? 'ready' : 'not ready'}.
+              {statusCopy}
             </div>
             <div style={{
               display: 'grid',
-              gridTemplateColumns: 'repeat(5, minmax(92px, 1fr))',
+              gridTemplateColumns: 'repeat(auto-fit, minmax(124px, 1fr))',
               gap: 12,
               alignItems: 'start',
             }}>
@@ -545,6 +739,7 @@ function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Elem
               <ProfileMetaValue label="UUID" value={shortenUuid(status.uuid)} />
               <ProfileMetaValue label="Skin" value={status.skin_source || 'default'} />
               <ProfileMetaValue label="Login" value={status.login_available ? 'Available' : 'Unavailable'} />
+              <ProfileMetaValue label="Microsoft" value={msaActive ? msaProvider : 'Inactive'} />
             </div>
             <div style={{
               display: 'flex',
@@ -552,7 +747,17 @@ function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Elem
               gap: 10,
               flexWrap: 'wrap',
             }}>
-              {status.login_available ? (
+              {msaActive ? (
+                <Button
+                  variant="secondary"
+                  icon="x"
+                  onClick={() => void logout()}
+                  disabled={logoutBusy}
+                  sound="affirm"
+                >
+                  {logoutBusy ? 'Signing out' : 'Log out'}
+                </Button>
+              ) : status.login_available ? (
                 <Button
                   variant="secondary"
                   icon="globe"
@@ -577,10 +782,22 @@ function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Elem
                 fontSize: 12,
                 lineHeight: 1.4,
               }}>
-                Microsoft sign-in is a setup step. It does not switch this launcher to online mode yet.
+                {msaActive
+                  ? 'Logout clears only volatile Microsoft state. Offline identity and launches remain available.'
+                  : 'Microsoft sign-in is a setup step. It does not switch this launcher to online mode yet.'}
               </span>
             </div>
-            {login && <DeviceCodePanel login={login} />}
+            {login && <DeviceCodePanel login={login} pollHint={pollHint} />}
+            {loginSuccess && (
+              <div style={{
+                color: theme.n.textDim,
+                fontSize: 12,
+                fontWeight: 500,
+                lineHeight: 1.4,
+              }}>
+                {loginSuccess}
+              </div>
+            )}
             {loginError && (
               <div style={{
                 color: 'var(--err)',
@@ -589,6 +806,16 @@ function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Elem
                 lineHeight: 1.4,
               }}>
                 {loginError}
+              </div>
+            )}
+            {logoutError && (
+              <div style={{
+                color: 'var(--err)',
+                fontSize: 12,
+                fontWeight: 500,
+                lineHeight: 1.4,
+              }}>
+                {logoutError}
               </div>
             )}
           </>
