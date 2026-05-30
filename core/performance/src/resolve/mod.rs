@@ -75,6 +75,12 @@ pub enum ResolveError {
         field: &'static str,
         value: i32,
     },
+    #[error("managed mod {artifact_id} has invalid mutual_exclusions.{field}: {value}")]
+    InvalidManagedModMutualExclusion {
+        artifact_id: String,
+        field: &'static str,
+        value: String,
+    },
     #[error("composition id is required")]
     MissingCompositionId,
     #[error("duplicate composition id: {0}")]
@@ -224,6 +230,7 @@ fn validate_managed_mod_artifact(
     }
     validate_managed_mod_version_range(managed_mod)?;
     validate_managed_mod_hardware_req(managed_mod)?;
+    validate_managed_mod_mutual_exclusions(managed_mod)?;
     Ok(())
 }
 
@@ -258,6 +265,28 @@ fn validate_managed_mod_hardware_req(managed_mod: &ManagedMod) -> Result<(), Res
                 artifact_id: managed_mod.artifact_id.clone(),
                 field,
                 value,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_managed_mod_mutual_exclusions(managed_mod: &ManagedMod) -> Result<(), ResolveError> {
+    let mut exclusions = std::collections::HashSet::new();
+    for exclusion in &managed_mod.mutual_exclusions {
+        let trimmed = exclusion.trim();
+        if trimmed.is_empty() || trimmed != exclusion {
+            return Err(ResolveError::InvalidManagedModMutualExclusion {
+                artifact_id: managed_mod.artifact_id.clone(),
+                field: "entry",
+                value: exclusion.clone(),
+            });
+        }
+        if !exclusions.insert(exclusion.to_lowercase()) {
+            return Err(ResolveError::InvalidManagedModMutualExclusion {
+                artifact_id: managed_mod.artifact_id.clone(),
+                field: "duplicate",
+                value: exclusion.clone(),
             });
         }
     }
@@ -1854,6 +1883,77 @@ mod tests {
                 },
             );
         }
+    }
+
+    #[test]
+    fn validation_accepts_builtin_manifest_and_undeclared_mutual_exclusions() {
+        let mut manifest = builtin_manifest().expect("manifest");
+        let nvidium = nvidium_managed_mod_mut(&mut manifest);
+        assert_eq!(nvidium.mutual_exclusions, vec!["iris".to_string()]);
+        nvidium.mutual_exclusions.push("sodium-extra".to_string());
+
+        validate_manifest(&manifest).expect("mutual exclusions need not be managed artifacts");
+    }
+
+    #[test]
+    fn validation_rejects_blank_managed_mod_mutual_exclusions() {
+        for exclusion in ["", " \t "] {
+            let mut manifest = builtin_manifest().expect("manifest");
+            let artifact_id = {
+                let managed_mod = first_managed_mod_mut(&mut manifest);
+                managed_mod.mutual_exclusions = vec![exclusion.to_string()];
+                managed_mod.artifact_id.clone()
+            };
+
+            assert_error_kind(
+                validate_manifest(&manifest),
+                ResolveError::InvalidManagedModMutualExclusion {
+                    artifact_id,
+                    field: "entry",
+                    value: exclusion.to_string(),
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn validation_rejects_whitespace_padded_managed_mod_mutual_exclusions() {
+        for exclusion in [" iris", "iris "] {
+            let mut manifest = builtin_manifest().expect("manifest");
+            let artifact_id = {
+                let managed_mod = first_managed_mod_mut(&mut manifest);
+                managed_mod.mutual_exclusions = vec![exclusion.to_string()];
+                managed_mod.artifact_id.clone()
+            };
+
+            assert_error_kind(
+                validate_manifest(&manifest),
+                ResolveError::InvalidManagedModMutualExclusion {
+                    artifact_id,
+                    field: "entry",
+                    value: exclusion.to_string(),
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn validation_rejects_duplicate_managed_mod_mutual_exclusions_case_insensitively() {
+        let mut manifest = builtin_manifest().expect("manifest");
+        let artifact_id = {
+            let managed_mod = first_managed_mod_mut(&mut manifest);
+            managed_mod.mutual_exclusions = vec!["iris".to_string(), "IRIS".to_string()];
+            managed_mod.artifact_id.clone()
+        };
+
+        assert_error_kind(
+            validate_manifest(&manifest),
+            ResolveError::InvalidManagedModMutualExclusion {
+                artifact_id,
+                field: "duplicate",
+                value: "IRIS".to_string(),
+            },
+        );
     }
 
     #[test]
