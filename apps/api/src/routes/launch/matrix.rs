@@ -161,14 +161,24 @@ pub(super) fn benchmark_matrix() -> BenchmarkMatrix {
                 intended_use: "Keep current modern managed coverage visible without promising latest-version semantics.",
             },
             BenchmarkTargetDescriptor {
-                id: "legacy_1_12_2_forge",
-                family: "legacy",
+                id: "family_c_forge_1_12_2_vanilla_baseline",
+                family: "C",
                 version: "1.12.2",
                 loader: "Forge",
-                profile: "legacy_family",
+                profile: "vanilla_baseline",
                 run_type: "coldish",
-                description: "Older Forge family workload for long-tail launch behavior.",
-                intended_use: "Measure legacy startup in its own family rather than comparing it to modern targets.",
+                description: "Family C Forge 1.12.2 baseline without managed composition mods.",
+                intended_use: "Compare the Family C Forge managed path against the same version and loader baseline.",
+            },
+            BenchmarkTargetDescriptor {
+                id: "family_c_forge_1_12_2_family_c_forge_core",
+                family: "C",
+                version: "1.12.2",
+                loader: "Forge",
+                profile: "managed_default",
+                run_type: "coldish",
+                description: "Family C Forge 1.12.2 managed target for the family-c-forge-core composition.",
+                intended_use: "Measure the first managed Family C Forge core path against its 1.12.2 baseline.",
             },
             BenchmarkTargetDescriptor {
                 id: "legacy_1_8_9_forge_pvp",
@@ -253,6 +263,10 @@ pub(super) fn benchmark_suite_plan(mode: &str) -> Option<Vec<BenchmarkSuiteRunSp
                 run_type: "coldish",
             },
             BenchmarkSuiteRunSpec {
+                profile: "legacy_family",
+                run_type: "coldish",
+            },
+            BenchmarkSuiteRunSpec {
                 profile: "degraded_managed_path",
                 run_type: "coldish",
             },
@@ -312,7 +326,8 @@ mod tests {
                 "family_e_fabric_1_16_5_managed",
                 "family_e_fabric_1_20_1_managed",
                 "family_f_modern_fabric_managed",
-                "legacy_1_12_2_forge",
+                "family_c_forge_1_12_2_vanilla_baseline",
+                "family_c_forge_1_12_2_family_c_forge_core",
                 "legacy_1_8_9_forge_pvp",
                 "degraded_managed_path",
                 "heavy_modded_launch",
@@ -331,8 +346,12 @@ mod tests {
         assert!(!data.contains('\\'));
         assert!(!lower_data.contains("java_path"));
         assert!(!lower_data.contains("java"));
+        assert!(!lower_data.contains("args"));
+        assert!(!lower_data.contains("arguments"));
+        assert!(!lower_data.contains("account"));
         assert!(!lower_data.contains("command"));
         assert!(!lower_data.contains("jvm"));
+        assert!(!lower_data.contains("token"));
         assert!(!lower_data.contains("username"));
     }
 
@@ -385,6 +404,10 @@ mod tests {
                     run_type: "coldish",
                 },
                 BenchmarkSuiteRunSpec {
+                    profile: "legacy_family",
+                    run_type: "coldish",
+                },
+                BenchmarkSuiteRunSpec {
                     profile: "degraded_managed_path",
                     run_type: "coldish",
                 },
@@ -405,5 +428,34 @@ mod tests {
             }
         }
         assert_eq!(benchmark_suite_plan("nightly-check"), None);
+    }
+
+    #[test]
+    fn benchmark_matrix_distinguishes_family_c_forge_baseline_and_managed_core() {
+        let matrix = benchmark_matrix();
+        let baseline = matrix
+            .representative_targets
+            .iter()
+            .find(|target| target.id == "family_c_forge_1_12_2_vanilla_baseline")
+            .expect("Family C Forge baseline target");
+        let managed = matrix
+            .representative_targets
+            .iter()
+            .find(|target| target.id == "family_c_forge_1_12_2_family_c_forge_core")
+            .expect("Family C Forge managed core target");
+
+        assert_eq!(baseline.family, "C");
+        assert_eq!(managed.family, "C");
+        assert_eq!(baseline.version, "1.12.2");
+        assert_eq!(managed.version, baseline.version);
+        assert_eq!(baseline.loader, "Forge");
+        assert_eq!(managed.loader, baseline.loader);
+        assert_eq!(baseline.profile, "vanilla_baseline");
+        assert_eq!(managed.profile, "managed_default");
+        assert_eq!(baseline.run_type, "coldish");
+        assert_eq!(managed.run_type, "coldish");
+        assert!(baseline.description.contains("baseline"));
+        assert!(managed.description.contains("family-c-forge-core"));
+        assert!(managed.intended_use.contains("Family C Forge core"));
     }
 }
