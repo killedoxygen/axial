@@ -11,6 +11,7 @@ pub(super) struct BenchmarkMatrix {
     pub modes: Vec<BenchmarkModeDescriptor>,
     pub run_types: Vec<BenchmarkRunTypeDescriptor>,
     pub profiles: Vec<BenchmarkProfileDescriptor>,
+    pub representative_targets: Vec<BenchmarkTargetDescriptor>,
     pub limits: BenchmarkMatrixLimits,
 }
 
@@ -31,6 +32,18 @@ pub(super) struct BenchmarkRunTypeDescriptor {
 pub(super) struct BenchmarkProfileDescriptor {
     pub id: &'static str,
     pub scenario: &'static str,
+    pub description: &'static str,
+    pub intended_use: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(super) struct BenchmarkTargetDescriptor {
+    pub id: &'static str,
+    pub family: &'static str,
+    pub version: &'static str,
+    pub loader: &'static str,
+    pub profile: &'static str,
+    pub run_type: &'static str,
     pub description: &'static str,
     pub intended_use: &'static str,
 }
@@ -116,6 +129,88 @@ pub(super) fn benchmark_matrix() -> BenchmarkMatrix {
                 intended_use: "Measure repeat-run cache, prewarm, and managed reuse benefits.",
             },
         ],
+        representative_targets: vec![
+            BenchmarkTargetDescriptor {
+                id: "family_e_fabric_1_16_5_managed",
+                family: "E",
+                version: "1.16.5",
+                loader: "Fabric",
+                profile: "managed_default",
+                run_type: "coldish",
+                description: "Modern-era Fabric managed path anchored to a stable 1.16.5 target.",
+                intended_use: "Compare Family E managed startup against vanilla baseline behavior.",
+            },
+            BenchmarkTargetDescriptor {
+                id: "family_e_fabric_1_20_1_managed",
+                family: "E",
+                version: "1.20.1",
+                loader: "Fabric",
+                profile: "managed_default",
+                run_type: "coldish",
+                description: "Modern-era Fabric managed path anchored to a stable 1.20.1 target.",
+                intended_use: "Track Family E coverage across a newer stable managed target.",
+            },
+            BenchmarkTargetDescriptor {
+                id: "family_f_modern_fabric_managed",
+                family: "F",
+                version: "supported modern",
+                loader: "Fabric",
+                profile: "managed_default",
+                run_type: "coldish",
+                description: "Current supported modern Fabric managed path without a volatile exact game version.",
+                intended_use: "Keep current modern managed coverage visible without promising latest-version semantics.",
+            },
+            BenchmarkTargetDescriptor {
+                id: "legacy_1_12_2_forge",
+                family: "legacy",
+                version: "1.12.2",
+                loader: "Forge",
+                profile: "legacy_family",
+                run_type: "coldish",
+                description: "Older Forge family workload for long-tail launch behavior.",
+                intended_use: "Measure legacy startup in its own family rather than comparing it to modern targets.",
+            },
+            BenchmarkTargetDescriptor {
+                id: "legacy_1_8_9_forge_pvp",
+                family: "legacy",
+                version: "1.8.9",
+                loader: "Forge",
+                profile: "legacy_family",
+                run_type: "coldish",
+                description: "Legacy Forge player-versus-player style target with older startup expectations.",
+                intended_use: "Keep latency-sensitive legacy coverage represented in the matrix.",
+            },
+            BenchmarkTargetDescriptor {
+                id: "degraded_managed_path",
+                family: "E-F",
+                version: "supported managed",
+                loader: "Fabric",
+                profile: "degraded_managed_path",
+                run_type: "coldish",
+                description: "Managed path with optional acceleration or add-on pieces unavailable.",
+                intended_use: "Validate fallback behavior remains measurable and intentionally slower if needed.",
+            },
+            BenchmarkTargetDescriptor {
+                id: "heavy_modded_launch",
+                family: "modern",
+                version: "supported modern",
+                loader: "Fabric",
+                profile: "heavy_modded_launch",
+                run_type: "coldish",
+                description: "Large local modded workload stressing preparation and early boot.",
+                intended_use: "Exercise high-pressure modded launch behavior within bounded local evidence.",
+            },
+            BenchmarkTargetDescriptor {
+                id: "repeat_managed_launch",
+                family: "E-F",
+                version: "supported managed",
+                loader: "Fabric",
+                profile: "repeat_launch",
+                run_type: "repeat",
+                description: "Same managed target launched again after an initial successful run.",
+                intended_use: "Measure repeat-run cache, prewarm, and managed reuse effects.",
+            },
+        ],
         limits: BenchmarkMatrixLimits {
             max_payload_bytes: MAX_MATRIX_JSON_BYTES,
             custom_post_values_allowed: true,
@@ -189,6 +284,11 @@ mod tests {
             .iter()
             .map(|profile| profile.id)
             .collect::<Vec<_>>();
+        let target_ids = matrix
+            .representative_targets
+            .iter()
+            .map(|target| target.id)
+            .collect::<Vec<_>>();
 
         assert_eq!(
             mode_ids,
@@ -204,6 +304,19 @@ mod tests {
                 "legacy_family",
                 "heavy_modded_launch",
                 "repeat_launch",
+            ]
+        );
+        assert_eq!(
+            target_ids,
+            vec![
+                "family_e_fabric_1_16_5_managed",
+                "family_e_fabric_1_20_1_managed",
+                "family_f_modern_fabric_managed",
+                "legacy_1_12_2_forge",
+                "legacy_1_8_9_forge_pvp",
+                "degraded_managed_path",
+                "heavy_modded_launch",
+                "repeat_managed_launch",
             ]
         );
     }
@@ -236,6 +349,10 @@ mod tests {
             .iter()
             .map(|run_type| run_type.id)
             .collect::<HashSet<_>>();
+        for target in &matrix.representative_targets {
+            assert!(profile_ids.contains(target.profile));
+            assert!(run_type_ids.contains(target.run_type));
+        }
 
         assert_eq!(
             benchmark_suite_plan("development").expect("development plan"),

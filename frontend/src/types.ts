@@ -409,6 +409,17 @@ export interface BenchmarkMatrixProfileDescriptor {
   intended_use: string;
 }
 
+export interface BenchmarkMatrixTargetDescriptor {
+  id: string;
+  family: string;
+  version: string;
+  loader: string;
+  profile: string;
+  run_type: string;
+  description: string;
+  intended_use: string;
+}
+
 export interface BenchmarkMatrixLimits {
   max_payload_bytes: number;
   custom_post_values_allowed: boolean;
@@ -420,6 +431,7 @@ export interface BenchmarkMatrixResponse {
   modes: BenchmarkMatrixModeDescriptor[];
   run_types: BenchmarkMatrixRunTypeDescriptor[];
   profiles: BenchmarkMatrixProfileDescriptor[];
+  representative_targets: BenchmarkMatrixTargetDescriptor[];
   limits: BenchmarkMatrixLimits;
 }
 

@@ -675,6 +675,7 @@ function BenchmarkMatrixBlock({ state: matrixState }: { state: BenchmarkMatrixSt
   const modes = matrix?.modes ?? [];
   const profiles = matrix?.profiles ?? [];
   const runTypes = matrix?.run_types ?? [];
+  const targets = matrix?.representative_targets ?? [];
 
   return (
     <div class="cp-settings-benchmark-matrix" aria-live="polite">
@@ -701,6 +702,7 @@ function BenchmarkMatrixBlock({ state: matrixState }: { state: BenchmarkMatrixSt
             <span><strong>{modes.length}</strong> modes</span>
             <span><strong>{profiles.length}</strong> profiles</span>
             <span><strong>{runTypes.length}</strong> run types</span>
+            <span><strong>{targets.length}</strong> targets</span>
             <span><strong>v{matrix.schema_version}</strong> schema</span>
           </div>
           <div class="cp-settings-benchmark-lists">
@@ -715,6 +717,19 @@ function BenchmarkMatrixBlock({ state: matrixState }: { state: BenchmarkMatrixSt
             <div>
               <span>Run types</span>
               <strong>{runTypes.map((runType) => labelFromToken(runType.id, runType.id)).join(', ') || 'None'}</strong>
+            </div>
+            <div>
+              <span>Targets</span>
+              <strong>
+                {targets.slice(0, 5).map((target) => {
+                  const family = /^[A-Z](?:-[A-Z])?$/.test(target.family)
+                    ? `Family ${target.family}`
+                    : labelFromToken(target.family, 'Target');
+                  const loader = target.loader || labelFromToken(target.id, target.id);
+                  const version = target.version ? ` ${target.version}` : '';
+                  return `${family} ${loader}${version}`;
+                }).join(', ') || 'None'}
+              </strong>
             </div>
           </div>
           {matrixState.status === 'error' && (
