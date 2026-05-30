@@ -1,6 +1,23 @@
 use croopor_config::{AppConfig, Instance};
 use croopor_launcher::{GuardianMode, OverrideOrigin, SessionId};
+use croopor_minecraft::{compare_version_like, infer_build_from_version_id};
+use std::cmp::Ordering;
 use std::time::SystemTime;
+
+const BUILT_IN_MAX_MEMORY_MB: i32 = 4096;
+const BUILT_IN_MIN_MEMORY_MB: i32 = 512;
+const OS_MEMORY_HEADROOM_MB: u64 = 2048;
+const MIN_DERIVED_MAX_MEMORY_MB: i32 = 1024;
+const LEGACY_MAX_MEMORY_TARGET_MB: i32 = 2048;
+const MODERN_VANILLA_MAX_MEMORY_TARGET_MB: i32 = 4096;
+const MODDED_MAX_MEMORY_TARGET_MB: i32 = 6144;
+const DERIVED_MIN_MEMORY_TARGET_MB: i32 = 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct LaunchMemoryDefaults {
+    pub max_memory_mb: i32,
+    pub min_memory_mb: i32,
+}
 
 pub(super) fn selected_java_override(instance: &Instance, config: &AppConfig) -> String {
     if !instance.java_path.trim().is_empty() {
@@ -48,11 +65,14 @@ pub(super) fn effective_max_memory(
     instance: &Instance,
     config: &AppConfig,
     requested: Option<i32>,
+    defaults: Option<LaunchMemoryDefaults>,
 ) -> i32 {
     if instance.max_memory_mb > 0 {
         instance.max_memory_mb
     } else if requested.unwrap_or_default() > 0 {
         requested.unwrap_or_default()
+    } else if let Some(defaults) = defaults {
+        defaults.max_memory_mb
     } else {
         config.max_memory_mb
     }
@@ -63,8 +83,9 @@ pub(super) fn effective_min_memory(
     config: &AppConfig,
     requested: Option<i32>,
     max_memory_mb: i32,
+    defaults: Option<LaunchMemoryDefaults>,
 ) -> i32 {
-    selected_raw_min_memory(instance, config, requested)
+    selected_raw_min_memory(instance, config, requested, defaults)
         .min(max_memory_mb)
         .max(0)
 }
@@ -73,14 +94,85 @@ pub(super) fn selected_raw_min_memory(
     instance: &Instance,
     config: &AppConfig,
     requested: Option<i32>,
+    defaults: Option<LaunchMemoryDefaults>,
 ) -> i32 {
     if instance.min_memory_mb > 0 {
         instance.min_memory_mb
     } else if requested.unwrap_or_default() > 0 {
         requested.unwrap_or_default()
+    } else if let Some(defaults) = defaults {
+        defaults.min_memory_mb
     } else {
         config.min_memory_mb
     }
+}
+
+pub(super) fn derived_launch_memory_defaults(
+    instance: &Instance,
+    config: &AppConfig,
+    requested_max_memory_mb: Option<i32>,
+    requested_min_memory_mb: Option<i32>,
+    host_total_memory_mb: Option<u64>,
+) -> Option<LaunchMemoryDefaults> {
+    if instance.max_memory_mb > 0 || instance.min_memory_mb > 0 {
+        return None;
+    }
+    if requested_max_memory_mb.unwrap_or_default() > 0
+        || requested_min_memory_mb.unwrap_or_default() > 0
+    {
+        return None;
+    }
+    if config.max_memory_mb != BUILT_IN_MAX_MEMORY_MB
+        || config.min_memory_mb != BUILT_IN_MIN_MEMORY_MB
+    {
+        return None;
+    }
+
+    launch_memory_defaults_for_host_version(
+        host_total_memory_mb?,
+        instance.version_id.as_str(),
+        version_id_looks_modded(instance.version_id.as_str()),
+    )
+}
+
+fn launch_memory_defaults_for_host_version(
+    host_total_memory_mb: u64,
+    version_id: &str,
+    is_modded: bool,
+) -> Option<LaunchMemoryDefaults> {
+    let host_budget_mb = host_total_memory_mb.saturating_sub(OS_MEMORY_HEADROOM_MB);
+    if host_budget_mb == 0 {
+        return None;
+    }
+
+    let target_max_memory_mb = if is_modded {
+        MODDED_MAX_MEMORY_TARGET_MB
+    } else if version_id_is_legacy(version_id) {
+        LEGACY_MAX_MEMORY_TARGET_MB
+    } else {
+        MODERN_VANILLA_MAX_MEMORY_TARGET_MB
+    };
+    let host_limited_max_memory_mb = i32::try_from(host_budget_mb).unwrap_or(i32::MAX);
+    let max_memory_mb = target_max_memory_mb
+        .min(host_limited_max_memory_mb)
+        .max(MIN_DERIVED_MAX_MEMORY_MB);
+    let min_memory_mb = DERIVED_MIN_MEMORY_TARGET_MB.min(max_memory_mb).max(0);
+
+    Some(LaunchMemoryDefaults {
+        max_memory_mb,
+        min_memory_mb,
+    })
+}
+
+fn version_id_looks_modded(version_id: &str) -> bool {
+    infer_build_from_version_id(version_id).is_some()
+}
+
+fn version_id_is_legacy(version_id: &str) -> bool {
+    let base_version = infer_build_from_version_id(version_id)
+        .map(|(_, _, minecraft_version, _)| minecraft_version)
+        .unwrap_or_else(|| version_id.to_string());
+    compare_version_like(base_version.as_str(), "1.12.2") != Ordering::Greater
 }
 
 pub(super) fn split_jvm_args(extra_jvm_args: &str) -> Vec<String> {
@@ -132,4 +224,187 @@ pub(super) fn generate_session_id() -> SessionId {
         .map(|value| value.as_nanos())
         .unwrap_or_default();
     SessionId(format!("{:032x}", nanos))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_instance_memory_takes_precedence_over_request_and_derived_defaults() {
+        let config = AppConfig::default();
+        let mut instance = test_instance("1.21.1");
+        instance.max_memory_mb = 3072;
+        instance.min_memory_mb = 1536;
+
+        let defaults = derived_launch_memory_defaults(
+            &instance,
+            &config,
+            Some(8192),
+            Some(4096),
+            Some(16_384),
+        );
+
+        assert_eq!(defaults, None);
+        assert_eq!(
+            effective_max_memory(&instance, &config, Some(8192), defaults),
+            3072
+        );
+        assert_eq!(
+            selected_raw_min_memory(&instance, &config, Some(4096), defaults),
+            1536
+        );
+        assert_eq!(
+            effective_min_memory(&instance, &config, Some(4096), 3072, defaults),
+            1536
+        );
+    }
+
+    #[test]
+    fn explicit_request_memory_takes_precedence_over_derived_defaults() {
+        let config = AppConfig::default();
+        let instance = test_instance("1.21.1");
+
+        let defaults = derived_launch_memory_defaults(
+            &instance,
+            &config,
+            Some(5120),
+            Some(2048),
+            Some(16_384),
+        );
+
+        assert_eq!(defaults, None);
+        assert_eq!(
+            effective_max_memory(&instance, &config, Some(5120), defaults),
+            5120
+        );
+        assert_eq!(
+            selected_raw_min_memory(&instance, &config, Some(2048), defaults),
+            2048
+        );
+        assert_eq!(
+            effective_min_memory(&instance, &config, Some(2048), 5120, defaults),
+            2048
+        );
+    }
+
+    #[test]
+    fn custom_global_memory_blocks_derived_defaults_for_fresh_instances() {
+        let config = AppConfig {
+            max_memory_mb: 5120,
+            min_memory_mb: 768,
+            ..AppConfig::default()
+        };
+        let instance = test_instance("1.21.1");
+
+        let defaults = derived_launch_memory_defaults(&instance, &config, None, None, Some(16_384));
+
+        assert_eq!(defaults, None);
+        assert_eq!(
+            effective_max_memory(&instance, &config, None, defaults),
+            5120
+        );
+        assert_eq!(
+            selected_raw_min_memory(&instance, &config, None, defaults),
+            768
+        );
+    }
+
+    #[test]
+    fn fresh_legacy_vanilla_uses_legacy_memory_defaults() {
+        let config = AppConfig::default();
+        let instance = test_instance("1.12.2");
+
+        let defaults = derived_launch_memory_defaults(&instance, &config, None, None, Some(16_384))
+            .expect("legacy defaults");
+
+        assert_eq!(
+            defaults,
+            LaunchMemoryDefaults {
+                max_memory_mb: 2048,
+                min_memory_mb: 1024,
+            }
+        );
+        assert_eq!(
+            effective_max_memory(&instance, &config, None, Some(defaults)),
+            2048
+        );
+        assert_eq!(
+            effective_min_memory(&instance, &config, None, 2048, Some(defaults)),
+            1024
+        );
+    }
+
+    #[test]
+    fn fresh_modern_vanilla_uses_modern_memory_defaults() {
+        let config = AppConfig::default();
+        let instance = test_instance("1.21.1");
+
+        let defaults = derived_launch_memory_defaults(&instance, &config, None, None, Some(16_384))
+            .expect("modern defaults");
+
+        assert_eq!(
+            defaults,
+            LaunchMemoryDefaults {
+                max_memory_mb: 4096,
+                min_memory_mb: 1024,
+            }
+        );
+    }
+
+    #[test]
+    fn fresh_loader_target_uses_modded_memory_defaults() {
+        let config = AppConfig::default();
+        let instance = test_instance("fabric-loader-0.16.10-1.21.1");
+
+        let defaults = derived_launch_memory_defaults(&instance, &config, None, None, Some(16_384))
+            .expect("modded defaults");
+
+        assert_eq!(
+            defaults,
+            LaunchMemoryDefaults {
+                max_memory_mb: 6144,
+                min_memory_mb: 1024,
+            }
+        );
+    }
+
+    #[test]
+    fn derived_defaults_leave_host_headroom_when_host_budget_is_smaller_than_target() {
+        let config = AppConfig::default();
+        let instance = test_instance("fabric-loader-0.16.10-1.21.1");
+
+        let defaults = derived_launch_memory_defaults(&instance, &config, None, None, Some(6_144))
+            .expect("host-limited defaults");
+
+        assert_eq!(
+            defaults,
+            LaunchMemoryDefaults {
+                max_memory_mb: 4096,
+                min_memory_mb: 1024,
+            }
+        );
+    }
+
+    fn test_instance(version_id: &str) -> Instance {
+        Instance {
+            id: "test-instance".to_string(),
+            name: "Test Instance".to_string(),
+            version_id: version_id.to_string(),
+            created_at: "2026-05-30T00:00:00Z".to_string(),
+            last_played_at: String::new(),
+            art_seed: 0,
+            art_preset: String::new(),
+            max_memory_mb: 0,
+            min_memory_mb: 0,
+            java_path: String::new(),
+            window_width: 0,
+            window_height: 0,
+            jvm_preset: String::new(),
+            performance_mode: String::new(),
+            extra_jvm_args: String::new(),
+            icon: String::new(),
+            accent: String::new(),
+        }
+    }
 }

@@ -87,11 +87,25 @@ pub(super) async fn prepare_launch_session(
         .to_string();
     let username = validate_username(&requested_username)
         .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?;
-    let max_memory_mb = policy::effective_max_memory(&instance, &config, payload.max_memory_mb);
+    let memory_evidence = capture_launch_memory_evidence();
+    let memory_defaults = policy::derived_launch_memory_defaults(
+        &instance,
+        &config,
+        payload.max_memory_mb,
+        payload.min_memory_mb,
+        memory_evidence.host_total_memory_mb,
+    );
+    let max_memory_mb =
+        policy::effective_max_memory(&instance, &config, payload.max_memory_mb, memory_defaults);
     let raw_min_memory_mb =
-        policy::selected_raw_min_memory(&instance, &config, payload.min_memory_mb);
-    let min_memory_mb =
-        policy::effective_min_memory(&instance, &config, payload.min_memory_mb, max_memory_mb);
+        policy::selected_raw_min_memory(&instance, &config, payload.min_memory_mb, memory_defaults);
+    let min_memory_mb = policy::effective_min_memory(
+        &instance,
+        &config,
+        payload.min_memory_mb,
+        max_memory_mb,
+        memory_defaults,
+    );
     let requested_java = policy::selected_java_override(&instance, &config);
     let requested_preset = policy::selected_jvm_preset(&instance, &config);
     let launched_at = timestamp_utc();
@@ -103,7 +117,7 @@ pub(super) async fn prepare_launch_session(
         raw_jvm_args_origin: policy::raw_jvm_args_origin(&instance),
     };
     let resource_budget = capture_resource_budget_snapshot(
-        capture_launch_memory_evidence(),
+        memory_evidence,
         capture_launch_disk_evidence([library_dir.as_path(), game_dir.as_path()]),
         capture_launch_cpu_load_evidence(),
         host_cpu_threads(),
