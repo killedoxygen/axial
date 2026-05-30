@@ -56,6 +56,15 @@ impl InstallStore {
             .map(|entry| (entry.history.clone(), entry.events.subscribe(), entry.done))
     }
 
+    pub async fn active_install_count(&self) -> usize {
+        self.installs
+            .read()
+            .await
+            .values()
+            .filter(|entry| !entry.done)
+            .count()
+    }
+
     pub async fn remove(&self, install_id: &str) {
         self.installs.write().await.remove(install_id);
     }
@@ -68,5 +77,32 @@ impl InstallStore {
 impl Default for InstallStore {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn launch_active_install_count_excludes_done_sessions() {
+        let store = InstallStore::new();
+        store.insert("active-install".to_string()).await;
+        store.insert("done-install".to_string()).await;
+        store
+            .emit(
+                "done-install",
+                DownloadProgress {
+                    phase: "done".to_string(),
+                    current: 1,
+                    total: 1,
+                    file: None,
+                    error: None,
+                    done: true,
+                },
+            )
+            .await;
+
+        assert_eq!(store.active_install_count().await, 1);
     }
 }

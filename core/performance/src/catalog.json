@@ -1,7 +1,44 @@
 {
   "schema_version": 1,
   "generated_at": "2026-04-02T00:00:00Z",
+  "emergency_disables": [],
   "compositions": [
+    {
+      "id": "family-a-vanilla-enhanced",
+      "display_name": "Family A Vanilla Enhanced",
+      "description": "Launcher-side vanilla-enhanced fallback for pre-1.6 versions; no managed third-party performance mods are applied by default.",
+      "families": ["A"],
+      "loaders": ["vanilla", "fabric", "forge", "neoforge", "quilt"],
+      "tier": "vanilla_enhanced",
+      "mods": []
+    },
+    {
+      "id": "family-b-vanilla-enhanced",
+      "display_name": "Family B Vanilla Enhanced",
+      "description": "Conservative launcher-side vanilla-enhanced fallback for 1.6-1.7.10; no managed third-party performance mods are applied by default.",
+      "families": ["B"],
+      "loaders": ["vanilla", "fabric", "forge", "neoforge", "quilt"],
+      "tier": "vanilla_enhanced",
+      "mods": []
+    },
+    {
+      "id": "family-c-vanilla-enhanced",
+      "display_name": "Family C Vanilla Enhanced",
+      "description": "Legacy launcher-side vanilla-enhanced fallback for 1.8-1.12.2; no managed third-party performance mods are applied by default.",
+      "families": ["C"],
+      "loaders": ["vanilla", "fabric", "forge", "neoforge", "quilt"],
+      "tier": "vanilla_enhanced",
+      "mods": []
+    },
+    {
+      "id": "family-d-vanilla-enhanced",
+      "display_name": "Family D Vanilla Enhanced",
+      "description": "Transitional launcher-side vanilla-enhanced fallback for 1.13-1.15.2; no managed third-party performance mods are applied by default.",
+      "families": ["D"],
+      "loaders": ["vanilla", "fabric", "forge", "neoforge", "quilt"],
+      "tier": "vanilla_enhanced",
+      "mods": []
+    },
     {
       "id": "family-e-fabric-extended",
       "display_name": "Family E Fabric Extended",

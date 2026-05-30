@@ -1,6 +1,10 @@
 use crate::modrinth::{ModrinthClient, ModrinthError};
 use crate::resolve::{builtin_manifest, detect_hardware, resolve_plan};
-use crate::state::{StateError, load_state, remove_state, save_state};
+use crate::rules_cache::{RulesCacheStatus, load_or_repair_rules_cache};
+use crate::state::{
+    StateError, load_rollback_snapshot, load_state, managed_artifact_path, remove_state,
+    restore_rollback_snapshot, save_rollback_snapshot, save_state,
+};
 use crate::types::{
     CompositionPlan, CompositionState, InstalledMod, PerformanceMode, ResolutionRequest,
 };
@@ -29,12 +33,15 @@ pub enum InstallError {
     NoPrimaryFile(String),
     #[error("mod filename is invalid: {0}")]
     InvalidFilename(String),
+    #[error("no performance rollback snapshot available")]
+    NoRollbackSnapshot,
 }
 
 #[derive(Debug, Clone)]
 pub struct PerformanceManager {
     manifest: crate::types::Manifest,
     modrinth: ModrinthClient,
+    rules_cache: RulesCacheStatus,
 }
 
 impl PerformanceManager {
@@ -42,6 +49,17 @@ impl PerformanceManager {
         Ok(Self {
             manifest: builtin_manifest()?,
             modrinth: ModrinthClient::new(),
+            rules_cache: RulesCacheStatus::unavailable(),
+        })
+    }
+
+    pub fn new_with_config_dir(config_dir: &Path) -> Result<Self, InstallError> {
+        let manifest = builtin_manifest()?;
+        let rules_cache = load_or_repair_rules_cache(config_dir, &manifest);
+        Ok(Self {
+            manifest,
+            modrinth: ModrinthClient::new(),
+            rules_cache,
         })
     }
 
@@ -62,7 +80,15 @@ impl PerformanceManager {
 
         fs::create_dir_all(instance_mods_dir)?;
         let previous_state = load_state(instance_mods_dir)?;
-        self.remove_stale_managed(instance_mods_dir, previous_state.as_ref(), plan)?;
+        let snapshot_available = previous_state.is_some();
+        if let Some(previous_state) = previous_state.as_ref() {
+            save_rollback_snapshot(instance_mods_dir, previous_state)?;
+        }
+        self.restore_after_error(
+            instance_mods_dir,
+            self.remove_stale_managed(instance_mods_dir, previous_state.as_ref(), plan),
+            snapshot_available,
+        )?;
 
         let mut state = CompositionState {
             composition_id: plan.composition_id.clone(),
@@ -93,28 +119,54 @@ impl PerformanceManager {
         state
             .installed_mods
             .sort_by(|left, right| left.project_id.cmp(&right.project_id));
-        save_state(instance_mods_dir, &state)?;
-        self.remove_superseded_managed(instance_mods_dir, previous_state.as_ref(), &state)?;
+        self.restore_after_error(
+            instance_mods_dir,
+            save_state(instance_mods_dir, &state).map_err(InstallError::State),
+            snapshot_available,
+        )?;
+        self.restore_after_error(
+            instance_mods_dir,
+            self.remove_superseded_managed(instance_mods_dir, previous_state.as_ref(), &state),
+            snapshot_available,
+        )?;
         Ok(state)
     }
 
     pub fn remove_managed(&self, instance_mods_dir: &Path) -> Result<(), InstallError> {
         if let Some(state) = load_state(instance_mods_dir)? {
-            for installed in state.installed_mods {
-                let path = instance_mods_dir.join(installed.filename);
-                if let Err(error) = fs::remove_file(path)
-                    && error.kind() != std::io::ErrorKind::NotFound
-                {
-                    return Err(InstallError::Io(error));
+            save_rollback_snapshot(instance_mods_dir, &state)?;
+            let result = (|| -> Result<(), InstallError> {
+                for installed in &state.installed_mods {
+                    let path = managed_artifact_path(instance_mods_dir, &installed.filename)?;
+                    if let Err(error) = fs::remove_file(path)
+                        && error.kind() != std::io::ErrorKind::NotFound
+                    {
+                        return Err(InstallError::Io(error));
+                    }
                 }
-            }
-            remove_state(instance_mods_dir)?;
+                remove_state(instance_mods_dir)?;
+                Ok(())
+            })();
+            self.restore_after_error(instance_mods_dir, result, true)?;
         }
         Ok(())
     }
 
+    pub fn rollback_managed(
+        &self,
+        instance_mods_dir: &Path,
+    ) -> Result<CompositionState, InstallError> {
+        let snapshot =
+            load_rollback_snapshot(instance_mods_dir)?.ok_or(InstallError::NoRollbackSnapshot)?;
+        Ok(restore_rollback_snapshot(instance_mods_dir, &snapshot)?)
+    }
+
     pub fn manifest(&self) -> &crate::types::Manifest {
         &self.manifest
+    }
+
+    pub fn rules_status(&self) -> crate::status::PerformanceRulesStatus {
+        crate::status::rules_status_with_cache(&self.manifest, self.rules_cache.clone())
     }
 
     pub fn hardware(&self) -> crate::types::HardwareProfile {
@@ -206,7 +258,7 @@ impl PerformanceManager {
             if keep.contains(&installed.project_id.to_lowercase()) {
                 continue;
             }
-            let path = instance_mods_dir.join(&installed.filename);
+            let path = managed_artifact_path(instance_mods_dir, &installed.filename)?;
             if let Err(error) = fs::remove_file(path)
                 && error.kind() != std::io::ErrorKind::NotFound
             {
@@ -241,7 +293,7 @@ impl PerformanceManager {
             if previous.filename.is_empty() || previous.filename == installed.filename {
                 continue;
             }
-            let path = instance_mods_dir.join(&previous.filename);
+            let path = managed_artifact_path(instance_mods_dir, &previous.filename)?;
             if let Err(error) = fs::remove_file(path)
                 && error.kind() != std::io::ErrorKind::NotFound
             {
@@ -250,6 +302,28 @@ impl PerformanceManager {
         }
 
         Ok(())
+    }
+
+    fn restore_after_error<T>(
+        &self,
+        instance_mods_dir: &Path,
+        result: Result<T, InstallError>,
+        snapshot_available: bool,
+    ) -> Result<T, InstallError> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                if snapshot_available
+                    && let Err(rollback_error) = self.rollback_managed(instance_mods_dir)
+                {
+                    warn!(
+                        "failed to restore performance rollback snapshot after error: {}",
+                        rollback_error
+                    );
+                }
+                Err(error)
+            }
+        }
     }
 }
 
@@ -299,5 +373,161 @@ fn replace_file_atomic(temp_path: &Path, final_path: &Path) -> Result<(), std::i
             let _ = fs::remove_file(temp_path);
             Err(error)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{load_state, save_state};
+    use crate::types::CompositionTier;
+
+    #[test]
+    fn rollback_restores_previous_managed_files_without_touching_user_files() {
+        let root = test_root("rollback-restores-managed");
+        let manager = PerformanceManager::new().expect("performance manager");
+        fs::write(root.join("managed.jar"), b"managed-v1").expect("write managed file");
+        fs::write(root.join("user.jar"), b"user-v1").expect("write user file");
+        save_state(
+            &root,
+            &test_state("core", vec![test_mod("sodium", "managed.jar")]),
+        )
+        .expect("save state");
+
+        manager
+            .remove_managed(&root)
+            .expect("remove managed bundle");
+        fs::write(root.join("user.jar"), b"user-v2").expect("mutate user file");
+
+        let restored = manager
+            .rollback_managed(&root)
+            .expect("rollback should restore latest snapshot");
+
+        assert_eq!(restored.composition_id, "core");
+        assert_eq!(
+            fs::read(root.join("managed.jar")).expect("read managed"),
+            b"managed-v1"
+        );
+        assert_eq!(
+            fs::read(root.join("user.jar")).expect("read user"),
+            b"user-v2"
+        );
+        assert_eq!(
+            load_state(&root)
+                .expect("load state")
+                .expect("state restored")
+                .installed_mods
+                .len(),
+            1
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rollback_without_snapshot_is_predictable() {
+        let root = test_root("rollback-missing");
+        let manager = PerformanceManager::new().expect("performance manager");
+
+        let error = manager
+            .rollback_managed(&root)
+            .expect_err("missing snapshot should fail");
+
+        assert!(matches!(error, InstallError::NoRollbackSnapshot));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rollback_rejects_path_traversal_metadata() {
+        let root = test_root("rollback-path-traversal");
+        let manager = PerformanceManager::new().expect("performance manager");
+        let rollback_dir = root.join(".croopor-performance").join("rollback");
+        fs::create_dir_all(&rollback_dir).expect("create rollback dir");
+        fs::write(
+            rollback_dir.join("latest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "created_at": "2026-05-30T00:00:00Z",
+                "state": test_state("core", vec![test_mod("sodium", "../outside.jar")]),
+                "artifacts": []
+            }))
+            .expect("serialize snapshot"),
+        )
+        .expect("write snapshot");
+
+        let error = manager
+            .rollback_managed(&root)
+            .expect_err("traversal metadata should fail");
+
+        assert!(matches!(
+            error,
+            InstallError::State(StateError::InvalidFilename(_))
+        ));
+        assert!(!root.join("..").join("outside.jar").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn hard_remove_error_restores_deleted_managed_file() {
+        let root = test_root("rollback-after-remove-error");
+        let manager = PerformanceManager::new().expect("performance manager");
+        fs::write(root.join("managed.jar"), b"managed-v1").expect("write managed file");
+        fs::create_dir(root.join("blocked.jar")).expect("create blocking directory");
+        save_state(
+            &root,
+            &test_state(
+                "core",
+                vec![
+                    test_mod("sodium", "managed.jar"),
+                    test_mod("lithium", "blocked.jar"),
+                ],
+            ),
+        )
+        .expect("save state");
+
+        let error = manager
+            .remove_managed(&root)
+            .expect_err("directory removal should fail");
+
+        assert!(matches!(error, InstallError::Io(_)));
+        assert_eq!(
+            fs::read(root.join("managed.jar")).expect("read managed"),
+            b"managed-v1"
+        );
+        assert!(load_state(&root).expect("load state").is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn test_state(composition_id: &str, installed_mods: Vec<InstalledMod>) -> CompositionState {
+        CompositionState {
+            composition_id: composition_id.to_string(),
+            tier: CompositionTier::Core,
+            installed_mods,
+            installed_at: "2026-05-30T00:00:00Z".to_string(),
+            failure_count: 0,
+            last_failure: String::new(),
+        }
+    }
+
+    fn test_mod(project_id: &str, filename: &str) -> InstalledMod {
+        InstalledMod {
+            project_id: project_id.to_string(),
+            version_id: "version".to_string(),
+            filename: filename.to_string(),
+            sha512: String::new(),
+        }
+    }
+
+    fn test_root(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "croopor-performance-install-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or_default()
+        ));
+        fs::create_dir_all(&path).expect("create test root");
+        path
     }
 }

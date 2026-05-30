@@ -41,6 +41,13 @@ pub enum ModCondition {
     Recommend,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EmergencyDisableTarget {
+    Composition,
+    Artifact,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct HardwareRequirement {
     #[serde(default)]
@@ -100,6 +107,8 @@ pub struct Manifest {
     pub schema_version: i32,
     pub generated_at: String,
     pub compositions: Vec<CompositionDef>,
+    #[serde(default)]
+    pub emergency_disables: Vec<EmergencyDisable>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,6 +125,20 @@ pub struct CompositionDef {
     pub fallback_to: String,
     #[serde(default)]
     pub jvm_preset: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmergencyDisable {
+    pub id: String,
+    pub target: EmergencyDisableTarget,
+    pub target_id: String,
+    pub reason: String,
+    #[serde(default)]
+    pub families: Vec<VersionFamily>,
+    #[serde(default)]
+    pub loaders: Vec<String>,
+    #[serde(default)]
+    pub tiers: Vec<CompositionTier>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

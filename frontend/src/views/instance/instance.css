@@ -280,10 +280,10 @@
   border-left: 1px solid oklch(1 0 0 / 0.28) !important;
 }
 .cp-instance-split-launch--preparing {
-  min-width: 198px;
+  min-width: 218px;
 }
 .cp-instance-split-launch--preparing .cp-instance-split-launch-main {
-  min-width: 150px;
+  min-width: 170px;
   justify-content: flex-start;
 }
 .cp-instance-split-launch--preparing .cp-instance-split-launch-menu {
@@ -298,6 +298,9 @@
   font-weight: 700;
   font-variant-numeric: tabular-nums;
   color: oklch(1 0 0 / 0.82);
+}
+.cp-instance-split-launch--preparing .cp-instance-split-launch-main span {
+  max-width: 158px;
 }
 .cp-instance-actions .cp-ibtn {
   color: oklch(1 0 0 / 0.62);
@@ -390,6 +393,26 @@
   flex-direction: column;
   gap: 14px;
 }
+.cp-instance-body--overview-bento {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(292px, 320px);
+  grid-template-areas:
+    "performance guardian"
+    "worlds activity"
+    "worlds details"
+    "quick details";
+  align-items: start;
+  gap: 14px 15px;
+}
+.cp-od-slot {
+  min-width: 0;
+}
+.cp-od-slot--performance { grid-area: performance; }
+.cp-od-slot--guardian { grid-area: guardian; }
+.cp-od-slot--worlds { grid-area: worlds; }
+.cp-od-slot--activity { grid-area: activity; }
+.cp-od-slot--quick { grid-area: quick; }
+.cp-od-slot--details { grid-area: details; }
 .cp-instance-bottom {
   position: fixed;
   left: calc(244px + var(--cp-instance-dock-pad));
@@ -419,9 +442,8 @@
   min-width: 0;
 }
 .cp-od-stagger.cp-od-worlds-slot {
-  flex: 1 1 0;
   display: flex;
-  min-height: 232px;
+  min-height: 154px;
 }
 .cp-od-worlds-card {
   width: 100%;
@@ -444,7 +466,7 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 16px;
+  margin-bottom: 12px;
   gap: 12px;
   flex-wrap: wrap;
   min-height: 22px;
@@ -520,13 +542,13 @@
   position: relative;
   z-index: 1;
   display: grid;
-  grid-template-columns: minmax(108px, 144px) minmax(260px, 560px) minmax(170px, auto);
+  grid-template-columns: minmax(84px, 112px) minmax(240px, 1fr) minmax(160px, auto);
   align-items: center;
-  gap: 24px;
-  padding: 6px 2px;
+  gap: 18px;
+  padding: 2px 2px;
 }
 .cp-od-worlds-art {
-  width: min(144px, 100%);
+  width: min(112px, 100%);
   max-width: 100%;
 }
 .cp-od-worlds-svg {
@@ -611,6 +633,65 @@
 }
 
 /* ─── Performance — RAM slider, presets, runtime line. ──────────────── */
+.cp-od-perf-summary {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+  color: var(--text-dim);
+}
+.cp-od-perf-summary-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 22px;
+  width: 22px;
+  height: 22px;
+  box-sizing: border-box;
+  border-radius: 999px;
+  background: var(--surface-3);
+  color: var(--text-mute);
+}
+.cp-od-perf-summary-mark > svg {
+  display: block;
+  width: 12px;
+  height: 12px;
+  flex: 0 0 auto;
+}
+.cp-od-perf-summary[data-tone="ok"] .cp-od-perf-summary-mark {
+  background: oklch(0.78 0.14 150 / 0.14);
+  color: var(--ok);
+}
+.cp-od-perf-summary[data-tone="warn"] .cp-od-perf-summary-mark {
+  background: oklch(0.78 0.14 80 / 0.14);
+  color: var(--warn);
+}
+.cp-od-perf-summary[data-tone="err"] .cp-od-perf-summary-mark {
+  background: oklch(0.65 0.18 25 / 0.14);
+  color: var(--err);
+}
+.cp-od-perf-summary-copy strong,
+.cp-od-perf-summary-copy span {
+  display: block;
+  min-width: 0;
+}
+.cp-od-perf-summary-copy strong {
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 700;
+  letter-spacing: -0.05px;
+}
+.cp-od-perf-summary-copy span {
+  margin-top: 2px;
+  font-size: 11.5px;
+  line-height: 1.35;
+}
+.cp-od-perf-summary .cp-btn {
+  align-self: center;
+  min-width: 78px;
+  white-space: nowrap;
+}
 .cp-od-perf-row,
 .cp-od-perf-preset-row {
   display: flex;
@@ -618,7 +699,7 @@
   justify-content: space-between;
   gap: 14px;
 }
-.cp-od-perf-row { margin-bottom: 10px; }
+.cp-od-perf-row { margin-bottom: 8px; }
 .cp-od-perf-preset-row { /* padding: 12px 0; margin-top: 12px; */ }
 .cp-od-perf-key {
   font-size: 12.5px;
@@ -634,7 +715,7 @@
 }
 
 .cp-od-perf-slider {
-  margin-bottom: 10px;
+  margin-bottom: 8px;
 }
 
 .cp-od-perf-preset-row .cp-mini-seg {
@@ -646,8 +727,8 @@
   display: flex;
   align-items: center;
   gap: 10px;
-  margin-top: 14px;
-  padding-top: 12px;
+  margin-top: 12px;
+  padding-top: 10px;
   border-top: 1px solid oklch(1 0 0 / 0.04);
   font-size: 12.5px;
 }
@@ -669,6 +750,102 @@
   letter-spacing: -0.05px;
 }
 
+/* Guardian preflight: launch safety posture without reimplementing policy. */
+.cp-od-guardian-card .cp-od-head {
+  margin-bottom: 12px;
+}
+.cp-od-guardian-posture {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  padding: 9px;
+  border: 1px solid color-mix(in oklab, var(--line) 58%, transparent);
+  border-radius: var(--r-sm);
+  background: color-mix(in oklab, var(--surface-3) 70%, transparent);
+}
+.cp-od-guardian-posture-mark {
+  width: 22px;
+  height: 22px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-dim);
+  background: var(--surface-2);
+}
+.cp-od-guardian-posture[data-tone="ok"] .cp-od-guardian-posture-mark {
+  color: var(--ok);
+  background: oklch(0.78 0.14 150 / 0.12);
+}
+.cp-od-guardian-posture[data-tone="warn"] .cp-od-guardian-posture-mark {
+  color: var(--warn);
+  background: oklch(0.78 0.14 80 / 0.12);
+}
+.cp-od-guardian-posture strong,
+.cp-od-guardian-posture span {
+  display: block;
+  min-width: 0;
+}
+.cp-od-guardian-posture strong {
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 700;
+  letter-spacing: -0.05px;
+}
+.cp-od-guardian-posture span {
+  margin-top: 2px;
+  color: var(--text-mute);
+  font-size: 11.5px;
+  line-height: 1.4;
+}
+.cp-od-guardian-list {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+.cp-od-guardian-row {
+  display: grid;
+  grid-template-columns: 86px minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+  padding: 7px 0;
+}
+.cp-od-guardian-row + .cp-od-guardian-row {
+  border-top: 1px solid oklch(1 0 0 / 0.04);
+}
+.cp-od-guardian-key {
+  color: var(--text-mute);
+  font-size: 12px;
+  letter-spacing: -0.05px;
+}
+.cp-od-guardian-val {
+  min-width: 0;
+  text-align: right;
+}
+.cp-od-guardian-val strong,
+.cp-od-guardian-val small {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cp-od-guardian-val strong {
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: -0.1px;
+}
+.cp-od-guardian-val small {
+  margin-top: 2px;
+  color: var(--text-mute);
+  font-size: 11.5px;
+  letter-spacing: -0.05px;
+}
+
 /* Quick actions: compact command surface in the main column. */
 .cp-od-quick-card .cp-od-head {
   margin-bottom: 12px;
@@ -676,16 +853,16 @@
 .cp-od-quick-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 10px;
+  gap: 8px;
 }
 .cp-od-quick-action {
   min-width: 0;
-  min-height: 58px;
+  min-height: 54px;
   display: grid;
-  grid-template-columns: 34px minmax(0, 1fr);
+  grid-template-columns: 30px minmax(0, 1fr);
   align-items: center;
-  gap: 12px;
-  padding: 10px 12px;
+  gap: 10px;
+  padding: 9px 10px;
   border: 1px solid color-mix(in oklab, var(--line) 55%, transparent);
   border-radius: var(--r-sm);
   background: color-mix(in oklab, var(--surface-3) 72%, transparent);
@@ -707,8 +884,8 @@
   opacity: 0.48;
 }
 .cp-od-quick-icon {
-  width: 34px;
-  height: 34px;
+  width: 30px;
+  height: 30px;
   border-radius: 8px;
   display: inline-flex;
   align-items: center;
@@ -756,9 +933,9 @@
 .cp-od-event {
   display: grid;
   grid-template-columns: 14px 1fr auto;
-  gap: 14px;
+  gap: 12px;
   align-items: center;
-  padding: 8px 2px;
+  padding: 7px 2px;
 }
 .cp-od-event + .cp-od-event {
   border-top: 1px solid oklch(1 0 0 / 0.04);
@@ -796,7 +973,7 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 8px 0;
+  padding: 7px 0;
   gap: 12px;
 }
 .cp-od-kv-row + .cp-od-kv-row {
@@ -939,14 +1116,70 @@
 }
 
 @media (max-width: 1180px) {
+  .cp-instance-cover {
+    height: 156px;
+  }
+  .cp-instance-titlebar {
+    padding: 0 32px 16px;
+    margin-top: -112px;
+  }
+  .cp-instance-titlebar-row {
+    gap: 16px;
+  }
+  .cp-instance-titlebar-left {
+    gap: 18px;
+  }
+  .cp-instance-avatar {
+    width: 84px;
+    height: 84px;
+  }
+  .cp-instance-title {
+    font-size: 30px;
+    line-height: 1.05;
+  }
+  .cp-instance-pills-row {
+    margin-bottom: 8px;
+  }
+  .cp-instance-subtitle {
+    margin-top: 8px;
+  }
+  .cp-instance-actions {
+    padding-bottom: 0;
+  }
+  .cp-instance-tabs {
+    padding-top: 2px;
+    padding-bottom: 6px;
+  }
+  .cp-instance-tabs button {
+    padding: 6px 10px;
+  }
+  .cp-instance-body {
+    padding-top: 10px;
+    row-gap: 12px;
+  }
+  .cp-instance-body--overview-bento {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas:
+      "performance"
+      "guardian"
+      "worlds"
+      "activity"
+      "quick"
+      "details";
+    gap: 12px;
+  }
   .cp-od-quick-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
   .cp-od-stagger.cp-od-worlds-slot {
-    min-height: 260px;
+    min-height: 146px;
+  }
+  .cp-od-worlds-card {
+    min-height: 146px;
   }
   .cp-od-worlds-empty {
-    grid-template-columns: minmax(96px, 128px) minmax(220px, 1fr);
+    grid-template-columns: minmax(82px, 104px) minmax(220px, 1fr);
+    gap: 14px;
   }
   .cp-od-worlds-cta {
     grid-column: 2;
@@ -954,9 +1187,27 @@
     width: min(360px, 100%);
     flex-direction: row;
   }
+  .cp-settings-pane {
+    gap: 12px;
+  }
+  .cp-settings-row {
+    gap: 16px;
+    padding: 16px 0;
+  }
+  .cp-settings-row-control {
+    gap: 10px;
+  }
 }
 
 @media (max-width: 640px) {
+  .cp-od-perf-summary {
+    grid-template-columns: 22px minmax(0, 1fr);
+  }
+  .cp-od-perf-summary .cp-btn {
+    grid-column: 2;
+    justify-self: start;
+    min-width: 0;
+  }
   .cp-instance-page {
     --cp-instance-dock-pad: 18px;
   }
@@ -1502,6 +1753,11 @@
 .cp-settings-advanced-toggle {
   display: flex;
   justify-content: flex-start;
+}
+.cp-settings-mode-note {
+  color: var(--text-mute);
+  font-size: 12px;
+  line-height: 1.45;
 }
 .cp-settings-advanced-grid {
   display: grid;

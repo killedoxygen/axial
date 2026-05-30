@@ -108,6 +108,562 @@
    AccentEditor itself is layout-agnostic, so we add the breathing room here. */
 .cp-settings-card--stack .cp-accent-pane { margin-top: 14px; }
 
+/* Compact mode pickers --------------------------------------------------- */
+.cp-settings-mode-choice {
+  margin-top: 14px;
+  display: grid;
+  grid-template-columns: 116px minmax(0, 1fr);
+  align-items: start;
+  gap: 12px;
+}
+.cp-settings-mode-choice-label {
+  padding-top: 9px;
+  color: var(--text-mute);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.35px;
+  text-transform: uppercase;
+}
+.cp-settings-mode-seg {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(138px, 1fr));
+  gap: 8px;
+}
+.cp-settings-mode-seg button {
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  color: var(--text-dim);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 140ms ease, border-color 140ms ease, color 140ms ease, transform 120ms ease;
+}
+.cp-settings-mode-seg button:hover:not([disabled]) {
+  background: var(--surface-3);
+  color: var(--text);
+}
+.cp-settings-mode-seg button:active:not([disabled]) {
+  transform: translateY(0.5px);
+}
+.cp-settings-mode-seg button[data-active="true"] {
+  background: var(--accent-softer);
+  border-color: var(--accent-line);
+  color: var(--text);
+}
+.cp-settings-mode-seg button[disabled] {
+  cursor: wait;
+  opacity: 0.68;
+}
+.cp-settings-mode-seg span,
+.cp-settings-mode-seg small {
+  display: block;
+  min-width: 0;
+}
+.cp-settings-mode-seg span {
+  font-size: 12.5px;
+  font-weight: 700;
+  letter-spacing: -0.05px;
+}
+.cp-settings-mode-seg small {
+  margin-top: 3px;
+  color: var(--text-mute);
+  font-size: 11.5px;
+  line-height: 1.35;
+}
+
+.cp-settings-rule-status {
+  margin-top: 14px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+}
+.cp-settings-rule-status--warn {
+  border-color: oklch(0.80 0.14 70 / 0.28);
+  background: oklch(0.80 0.14 70 / 0.08);
+}
+.cp-settings-rule-status-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.cp-settings-rule-status-copy {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+.cp-settings-rule-status-copy strong {
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 700;
+}
+.cp-settings-rule-status-copy span {
+  color: var(--text-dim);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.cp-settings-rule-status-grid {
+  margin-top: 12px;
+  display: grid;
+  grid-template-columns: minmax(92px, auto) minmax(0, 1fr);
+  gap: 7px 12px;
+  font-size: 12px;
+}
+.cp-settings-rule-status-grid span {
+  color: var(--text-mute);
+  font-weight: 650;
+}
+.cp-settings-rule-status-grid strong {
+  min-width: 0;
+  color: var(--text-dim);
+  font-weight: 600;
+  line-height: 1.35;
+}
+.cp-settings-rule-status-warnings {
+  margin-top: 10px;
+  display: grid;
+  gap: 4px;
+  color: var(--warn);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.cp-settings-proof-history {
+  margin-top: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+}
+.cp-settings-proof-history-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.cp-settings-proof-muted,
+.cp-settings-proof-error {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  line-height: 1.5;
+  text-transform: uppercase;
+}
+.cp-settings-proof-muted { color: var(--text-mute); }
+.cp-settings-proof-error { color: var(--warn); }
+.cp-settings-proof-empty,
+.cp-settings-proof-note {
+  margin-top: 10px;
+  color: var(--text-dim);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.cp-settings-proof-list {
+  margin-top: 10px;
+  display: grid;
+  gap: 1px;
+}
+.cp-settings-proof-row {
+  display: grid;
+  grid-template-columns: minmax(190px, 1.05fr) minmax(230px, 1.2fr) minmax(190px, 0.9fr);
+  align-items: center;
+  gap: 12px;
+  padding: 9px 0;
+  border-top: 1px solid color-mix(in oklab, var(--line) 72%, transparent);
+}
+.cp-settings-proof-row:first-child {
+  border-top: 0;
+}
+.cp-settings-proof-main {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.cp-settings-proof-title,
+.cp-settings-proof-compare {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+.cp-settings-proof-title strong,
+.cp-settings-proof-compare strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 700;
+  letter-spacing: -0.05px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cp-settings-proof-title span,
+.cp-settings-proof-compare span {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-mute);
+  font-size: 11.5px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cp-settings-proof-evidence {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+}
+.cp-settings-proof-meta {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 5px 10px;
+  flex-wrap: wrap;
+  color: var(--text-dim);
+  font-size: 11.5px;
+  line-height: 1.35;
+}
+.cp-settings-proof-meta span {
+  min-width: 0;
+}
+.cp-settings-proof-budget {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 5px 10px;
+  flex-wrap: wrap;
+  color: var(--text-dim);
+  font-size: 11.5px;
+  line-height: 1.35;
+}
+.cp-settings-proof-budget strong {
+  color: var(--text);
+  font-size: 11.5px;
+  font-weight: 750;
+}
+.cp-settings-proof-budget[data-pressure="true"] strong {
+  color: var(--warn);
+}
+.cp-settings-proof-budget span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.cp-settings-proof-compare {
+  justify-self: end;
+  max-width: 260px;
+  text-align: right;
+}
+.cp-settings-proof-compare[data-tone="ok"] strong {
+  color: var(--ok);
+}
+.cp-settings-proof-compare[data-tone="warn"] strong {
+  color: var(--warn);
+}
+@media (max-width: 1120px) {
+  .cp-settings-proof-row {
+    grid-template-columns: minmax(160px, 1fr) minmax(140px, 220px);
+    align-items: start;
+    gap: 5px 12px;
+  }
+  .cp-settings-proof-main {
+    grid-column: 1;
+    grid-row: 1;
+  }
+  .cp-settings-proof-evidence {
+    grid-column: 1 / -1;
+    padding-left: 0;
+  }
+  .cp-settings-proof-compare {
+    grid-column: 2;
+    grid-row: 1;
+    max-width: 100%;
+  }
+}
+
+.cp-settings-benchmark-matrix {
+  margin-top: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+}
+.cp-settings-benchmark-matrix-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.cp-settings-benchmark-counts {
+  margin-top: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 8px;
+}
+.cp-settings-benchmark-counts span {
+  padding: 3px 7px;
+  border: 1px solid color-mix(in oklab, var(--line) 78%, transparent);
+  border-radius: 999px;
+  color: var(--text-dim);
+  font-size: 11.5px;
+  line-height: 1.3;
+}
+.cp-settings-benchmark-counts strong {
+  color: var(--text);
+  font-weight: 750;
+}
+.cp-settings-benchmark-lists {
+  margin-top: 10px;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+.cp-settings-benchmark-lists div {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+.cp-settings-benchmark-lists span {
+  color: var(--text-mute);
+  font-size: 11.5px;
+  font-weight: 700;
+  line-height: 1.35;
+}
+.cp-settings-benchmark-lists strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-dim);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+@media (max-width: 980px) {
+  .cp-settings-benchmark-lists {
+    grid-template-columns: 1fr;
+    gap: 7px;
+  }
+}
+
+.cp-settings-driver-history {
+  margin-top: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+}
+.cp-settings-driver-history-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.cp-settings-driver-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.cp-settings-driver-start {
+  margin-top: 12px;
+  display: grid;
+  grid-template-columns: minmax(220px, 1.2fr) minmax(150px, 0.7fr) 116px auto;
+  align-items: end;
+  gap: 8px;
+}
+.cp-settings-driver-start-field {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+}
+.cp-settings-driver-start-field > span {
+  color: var(--text-mute);
+  font-size: 10.5px;
+  font-weight: 750;
+  letter-spacing: 0.32px;
+  line-height: 1.2;
+  text-transform: uppercase;
+}
+.cp-settings-driver-start-field select,
+.cp-settings-driver-interval-input {
+  width: 100%;
+  min-width: 0;
+  height: 32px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--surface-1);
+  color: var(--text);
+  font: inherit;
+  font-size: 12.5px;
+}
+.cp-settings-driver-start-field select {
+  padding: 0 28px 0 9px;
+}
+.cp-settings-driver-start-field select:disabled,
+.cp-settings-driver-interval-input:has(input:disabled) {
+  cursor: not-allowed;
+  opacity: 0.68;
+}
+.cp-settings-driver-interval-input {
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+}
+.cp-settings-driver-interval-input input {
+  min-width: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  padding: 0 0 0 9px;
+}
+.cp-settings-driver-interval-input span {
+  flex-shrink: 0;
+  padding: 0 9px 0 6px;
+  color: var(--text-mute);
+  font-size: 12px;
+  font-weight: 700;
+}
+.cp-settings-driver-start-field[data-invalid="true"] .cp-settings-driver-interval-input {
+  border-color: color-mix(in oklab, var(--err) 56%, var(--line));
+}
+.cp-settings-driver-start-error {
+  margin-top: 6px;
+  color: var(--err);
+  font-size: 11.5px;
+  font-weight: 600;
+}
+.cp-settings-driver-list {
+  margin-top: 10px;
+  display: grid;
+  gap: 1px;
+}
+.cp-settings-driver-row {
+  display: grid;
+  grid-template-columns: minmax(190px, 1.05fr) minmax(230px, 1.15fr) minmax(180px, 0.9fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 0;
+  border-top: 1px solid color-mix(in oklab, var(--line) 72%, transparent);
+}
+.cp-settings-driver-row:first-child {
+  border-top: 0;
+}
+.cp-settings-driver-main {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.cp-settings-driver-title {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+.cp-settings-driver-title strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 700;
+  letter-spacing: -0.05px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cp-settings-driver-title span {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-mute);
+  font-size: 11.5px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cp-settings-driver-meta,
+.cp-settings-driver-sessions {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 5px 10px;
+  flex-wrap: wrap;
+  color: var(--text-dim);
+  font-size: 11.5px;
+  line-height: 1.35;
+}
+.cp-settings-driver-meta span,
+.cp-settings-driver-sessions span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cp-settings-driver-sessions {
+  justify-content: flex-end;
+  text-align: right;
+}
+.cp-settings-driver-control {
+  min-width: 92px;
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+@media (max-width: 1160px) {
+  .cp-settings-driver-start {
+    grid-template-columns: minmax(180px, 1fr) minmax(140px, 0.8fr) 112px auto;
+  }
+  .cp-settings-driver-row {
+    grid-template-columns: minmax(170px, 1fr) minmax(200px, 1fr) auto;
+    align-items: start;
+    gap: 6px 12px;
+  }
+  .cp-settings-driver-main {
+    grid-column: 1;
+    grid-row: 1;
+  }
+  .cp-settings-driver-meta {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+  .cp-settings-driver-sessions {
+    grid-column: 2;
+    grid-row: 1;
+  }
+  .cp-settings-driver-control {
+    grid-column: 3;
+    grid-row: 1;
+  }
+}
+@media (max-width: 980px) {
+  .cp-settings-driver-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+  .cp-settings-driver-main,
+  .cp-settings-driver-meta,
+  .cp-settings-driver-sessions {
+    grid-column: 1;
+  }
+  .cp-settings-driver-main { grid-row: 1; }
+  .cp-settings-driver-meta { grid-row: 2; }
+  .cp-settings-driver-sessions {
+    grid-row: 3;
+    justify-content: flex-start;
+    text-align: left;
+  }
+  .cp-settings-driver-control {
+    grid-column: 2;
+    grid-row: 1 / 4;
+    align-self: start;
+  }
+}
 /* Toggle ----------------------------------------------------------------- */
 .cp-toggle {
   width: 42px; height: 24px;

@@ -1,6 +1,7 @@
 use crate::types::{
-    CompositionDef, CompositionPlan, CompositionTier, HardwareProfile, ManagedMod, Manifest,
-    ModCondition, PerformanceMode, ResolutionRequest, VersionFamily,
+    CompositionDef, CompositionPlan, CompositionTier, EmergencyDisable, EmergencyDisableTarget,
+    HardwareProfile, ManagedMod, Manifest, ModCondition, PerformanceMode, ResolutionRequest,
+    VersionFamily,
 };
 use regex::Regex;
 use std::sync::OnceLock;
@@ -21,6 +22,18 @@ pub enum ResolveError {
     DuplicateCompositionId(String),
     #[error("fallback_to references unknown composition: {0}")]
     UnknownFallback(String),
+    #[error("emergency disable id is required")]
+    MissingEmergencyDisableId,
+    #[error("emergency disable target_id is required")]
+    MissingEmergencyDisableTargetId,
+    #[error("emergency disable reason is required")]
+    MissingEmergencyDisableReason,
+    #[error("duplicate emergency disable id: {0}")]
+    DuplicateEmergencyDisableId(String),
+    #[error("emergency composition disable references unknown composition: {0}")]
+    UnknownEmergencyDisableComposition(String),
+    #[error("emergency artifact disable references unknown managed artifact: {0}")]
+    UnknownEmergencyDisableArtifact(String),
 }
 
 pub fn builtin_manifest() -> Result<Manifest, ResolveError> {
@@ -49,6 +62,52 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), ResolveError> {
             return Err(ResolveError::UnknownFallback(
                 composition.fallback_to.clone(),
             ));
+        }
+    }
+
+    let mut artifact_ids = std::collections::HashSet::new();
+    for composition in &manifest.compositions {
+        for managed_mod in &composition.mods {
+            if !managed_mod.project_id.is_empty() {
+                artifact_ids.insert(managed_mod.project_id.to_lowercase());
+            }
+            if !managed_mod.slug.is_empty() {
+                artifact_ids.insert(managed_mod.slug.to_lowercase());
+            }
+        }
+    }
+
+    let mut disable_ids = std::collections::HashSet::new();
+    for disable in &manifest.emergency_disables {
+        if disable.id.trim().is_empty() {
+            return Err(ResolveError::MissingEmergencyDisableId);
+        }
+        if !disable_ids.insert(disable.id.clone()) {
+            return Err(ResolveError::DuplicateEmergencyDisableId(
+                disable.id.clone(),
+            ));
+        }
+        if disable.target_id.trim().is_empty() {
+            return Err(ResolveError::MissingEmergencyDisableTargetId);
+        }
+        if disable.reason.trim().is_empty() {
+            return Err(ResolveError::MissingEmergencyDisableReason);
+        }
+        match disable.target {
+            EmergencyDisableTarget::Composition => {
+                if !ids.contains(&disable.target_id) {
+                    return Err(ResolveError::UnknownEmergencyDisableComposition(
+                        disable.target_id.clone(),
+                    ));
+                }
+            }
+            EmergencyDisableTarget::Artifact => {
+                if !artifact_ids.contains(&disable.target_id.to_lowercase()) {
+                    return Err(ResolveError::UnknownEmergencyDisableArtifact(
+                        disable.target_id.clone(),
+                    ));
+                }
+            }
         }
     }
 
@@ -102,55 +161,75 @@ pub fn resolve_plan(manifest: Option<&Manifest>, request: ResolutionRequest) -> 
         .map(|value| value.to_lowercase())
         .collect();
 
+    let mut skipped_warnings = Vec::new();
     for tier in [
         CompositionTier::Extended,
         CompositionTier::Core,
         CompositionTier::VanillaEnhanced,
     ] {
-        let Some(definition) = find_composition(manifest, family, &loader, tier) else {
-            continue;
-        };
+        for definition in matching_compositions(manifest, family, &loader, tier) {
+            if let Some(disable) = active_composition_disable(manifest, definition, family, &loader)
+            {
+                skipped_warnings.push(composition_disable_warning(disable, &definition.id));
+                continue;
+            }
 
-        let mut active_mods = Vec::new();
-        let mut warnings = Vec::new();
-        for managed_mod in &definition.mods {
-            let (include, warning) = should_include_mod(
-                managed_mod,
-                &request.game_version,
-                &request.hardware,
-                &installed_set,
-            );
-            if !warning.is_empty() {
-                warnings.push(warning);
-            }
-            if include {
-                active_mods.push(managed_mod.clone());
-            }
-        }
+            let mut active_mods = Vec::new();
+            let mut warnings = skipped_warnings.clone();
+            for managed_mod in &definition.mods {
+                if let Some(disable) =
+                    active_artifact_disable(manifest, managed_mod, family, &loader, definition.tier)
+                {
+                    warnings.push(artifact_disable_warning(disable, managed_mod));
+                    continue;
+                }
 
-        if active_mods.len() >= 2 || matches!(tier, CompositionTier::VanillaEnhanced) {
-            let mut plan = CompositionPlan {
-                composition_id: definition.id.clone(),
-                family,
-                loader: loader.clone(),
-                mode,
-                tier: definition.tier,
-                mods: active_mods,
-                jvm_preset: definition.jvm_preset.clone(),
-                fallback_chain: fallback_chain(manifest, &definition.id),
-                warnings,
-                fallback_reason: String::new(),
-            };
-            if !matches!(tier, CompositionTier::Extended) {
-                plan.fallback_reason =
-                    "higher-tier managed composition is unavailable for this combination"
-                        .to_string();
+                let (include, warning) = should_include_mod(
+                    managed_mod,
+                    &request.game_version,
+                    &request.hardware,
+                    &installed_set,
+                );
+                if !warning.is_empty() {
+                    warnings.push(warning);
+                }
+                if include {
+                    active_mods.push(managed_mod.clone());
+                }
             }
-            return plan;
+
+            if active_mods.len() >= 2 || matches!(tier, CompositionTier::VanillaEnhanced) {
+                let mut plan = CompositionPlan {
+                    composition_id: definition.id.clone(),
+                    family,
+                    loader: loader.clone(),
+                    mode,
+                    tier: definition.tier,
+                    mods: active_mods,
+                    jvm_preset: definition.jvm_preset.clone(),
+                    fallback_chain: fallback_chain(manifest, &definition.id),
+                    warnings,
+                    fallback_reason: String::new(),
+                };
+                if !matches!(tier, CompositionTier::Extended) {
+                    plan.fallback_reason = if skipped_warnings.is_empty() {
+                        "higher-tier managed composition is unavailable for this combination"
+                            .to_string()
+                    } else {
+                        "a higher-tier managed composition is temporarily disabled".to_string()
+                    };
+                }
+                return plan;
+            }
         }
     }
 
-    vanilla_enhanced_plan(family, loader, mode)
+    let mut plan = vanilla_enhanced_plan(family, loader, mode);
+    plan.warnings = skipped_warnings;
+    if !plan.warnings.is_empty() {
+        plan.fallback_reason = "managed compositions are temporarily disabled".to_string();
+    }
+    plan
 }
 
 pub fn extract_base_version(version_id: &str) -> String {
@@ -244,28 +323,95 @@ fn vanilla_enhanced_plan(
     }
 }
 
-fn find_composition(
-    manifest: &Manifest,
+fn matching_compositions<'a>(
+    manifest: &'a Manifest,
     family: VersionFamily,
     loader: &str,
     tier: CompositionTier,
-) -> Option<CompositionDef> {
-    manifest.compositions.iter().find_map(|definition| {
-        if definition.tier != tier {
-            return None;
-        }
-        if !definition.families.contains(&family) {
-            return None;
-        }
-        if !definition
-            .loaders
-            .iter()
-            .any(|candidate| candidate.eq_ignore_ascii_case(loader))
-        {
-            return None;
-        }
-        Some(definition.clone())
+) -> Vec<&'a CompositionDef> {
+    manifest
+        .compositions
+        .iter()
+        .filter(|definition| {
+            if definition.tier != tier {
+                return false;
+            }
+            if !definition.families.contains(&family) {
+                return false;
+            }
+            if !definition
+                .loaders
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(loader))
+            {
+                return false;
+            }
+            true
+        })
+        .collect()
+}
+
+fn active_composition_disable<'a>(
+    manifest: &'a Manifest,
+    definition: &CompositionDef,
+    family: VersionFamily,
+    loader: &str,
+) -> Option<&'a EmergencyDisable> {
+    manifest.emergency_disables.iter().find(|disable| {
+        disable.target == EmergencyDisableTarget::Composition
+            && disable.target_id == definition.id
+            && disable_applies(disable, family, loader, definition.tier)
     })
+}
+
+fn active_artifact_disable<'a>(
+    manifest: &'a Manifest,
+    managed_mod: &ManagedMod,
+    family: VersionFamily,
+    loader: &str,
+    tier: CompositionTier,
+) -> Option<&'a EmergencyDisable> {
+    manifest.emergency_disables.iter().find(|disable| {
+        disable.target == EmergencyDisableTarget::Artifact
+            && artifact_target_matches(disable, managed_mod)
+            && disable_applies(disable, family, loader, tier)
+    })
+}
+
+fn artifact_target_matches(disable: &EmergencyDisable, managed_mod: &ManagedMod) -> bool {
+    disable
+        .target_id
+        .eq_ignore_ascii_case(&managed_mod.project_id)
+        || disable.target_id.eq_ignore_ascii_case(&managed_mod.slug)
+}
+
+fn disable_applies(
+    disable: &EmergencyDisable,
+    family: VersionFamily,
+    loader: &str,
+    tier: CompositionTier,
+) -> bool {
+    (disable.families.is_empty() || disable.families.contains(&family))
+        && (disable.loaders.is_empty()
+            || disable
+                .loaders
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(loader)))
+        && (disable.tiers.is_empty() || disable.tiers.contains(&tier))
+}
+
+fn composition_disable_warning(disable: &EmergencyDisable, composition_id: &str) -> String {
+    format!(
+        "{composition_id} skipped by emergency disable {}: {}",
+        disable.id, disable.reason
+    )
+}
+
+fn artifact_disable_warning(disable: &EmergencyDisable, managed_mod: &ManagedMod) -> String {
+    format!(
+        "{} skipped by emergency disable {}: {}",
+        managed_mod.slug, disable.id, disable.reason
+    )
 }
 
 fn fallback_chain(manifest: &Manifest, start_id: &str) -> Vec<String> {
@@ -513,25 +659,73 @@ fn split_range_condition(condition: &str) -> (&str, &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ResolutionRequest, builtin_manifest, detect_hardware, parse_mode, resolve_plan};
-    use crate::types::PerformanceMode;
+    use super::{
+        ResolutionRequest, ResolveError, builtin_manifest, parse_mode, resolve_plan,
+        validate_manifest,
+    };
+    use crate::types::{
+        CompositionTier, EmergencyDisable, EmergencyDisableTarget, HardwareProfile, Manifest,
+        PerformanceMode, VersionFamily,
+    };
 
     #[test]
-    fn fabric_family_f_managed_plan_resolves_real_mods() {
+    fn families_a_through_d_managed_plans_resolve_named_vanilla_enhanced_compositions() {
         let manifest = builtin_manifest().expect("manifest");
-        let plan = resolve_plan(
-            Some(&manifest),
-            ResolutionRequest {
-                game_version: "1.20.4".to_string(),
-                loader: "fabric".to_string(),
-                mode: PerformanceMode::Managed,
-                hardware: detect_hardware(),
-                installed_mods: Vec::new(),
-            },
-        );
 
-        assert_eq!(plan.loader, "fabric");
-        assert!(!plan.mods.is_empty());
+        for (game_version, family, composition_id) in [
+            ("1.5.2", VersionFamily::A, "family-a-vanilla-enhanced"),
+            ("1.7.10", VersionFamily::B, "family-b-vanilla-enhanced"),
+            ("1.12.2", VersionFamily::C, "family-c-vanilla-enhanced"),
+            ("1.15.2", VersionFamily::D, "family-d-vanilla-enhanced"),
+        ] {
+            for loader in ["vanilla", "fabric", "forge", "neoforge", "quilt"] {
+                let plan = resolve_plan(
+                    Some(&manifest),
+                    ResolutionRequest {
+                        game_version: game_version.to_string(),
+                        loader: loader.to_string(),
+                        mode: PerformanceMode::Managed,
+                        hardware: HardwareProfile::default(),
+                        installed_mods: Vec::new(),
+                    },
+                );
+
+                assert_eq!(plan.composition_id, composition_id);
+                assert_eq!(plan.family, family);
+                assert_eq!(plan.loader, loader);
+                assert_eq!(plan.tier, CompositionTier::VanillaEnhanced);
+                assert!(plan.mods.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn fabric_family_e_and_f_managed_plans_resolve_real_mods() {
+        let manifest = builtin_manifest().expect("manifest");
+
+        for (game_version, expected_family) in
+            [("1.20.1", VersionFamily::E), ("1.20.4", VersionFamily::F)]
+        {
+            let plan = resolve_plan(
+                Some(&manifest),
+                ResolutionRequest {
+                    game_version: game_version.to_string(),
+                    loader: "fabric".to_string(),
+                    mode: PerformanceMode::Managed,
+                    hardware: HardwareProfile::default(),
+                    installed_mods: Vec::new(),
+                },
+            );
+
+            assert_eq!(plan.family, expected_family);
+            assert_eq!(plan.loader, "fabric");
+            assert!(plan.composition_id.contains("fabric"));
+            assert!(
+                plan.mods
+                    .iter()
+                    .any(|managed_mod| managed_mod.slug == "sodium")
+            );
+        }
     }
 
     #[test]
@@ -540,5 +734,203 @@ mod tests {
         assert_eq!(parse_mode("vanilla"), Some(PerformanceMode::Vanilla));
         assert_eq!(parse_mode("custom"), Some(PerformanceMode::Custom));
         assert_eq!(parse_mode("invalid"), None);
+    }
+
+    #[test]
+    fn older_manifest_without_emergency_disables_defaults_to_empty() {
+        let manifest = serde_json::from_value::<Manifest>(serde_json::json!({
+            "schema_version": 1,
+            "generated_at": "2026-04-02T00:00:00Z",
+            "compositions": []
+        }))
+        .expect("manifest should parse");
+
+        assert!(manifest.emergency_disables.is_empty());
+        validate_manifest(&manifest).expect("older manifest shape should validate");
+    }
+
+    #[test]
+    fn validation_rejects_invalid_emergency_disables() {
+        for (disable, expected) in [
+            (
+                EmergencyDisable {
+                    id: String::new(),
+                    target: EmergencyDisableTarget::Composition,
+                    target_id: "family-f-fabric-extended".to_string(),
+                    reason: "Temporary hold.".to_string(),
+                    families: Vec::new(),
+                    loaders: Vec::new(),
+                    tiers: Vec::new(),
+                },
+                ResolveError::MissingEmergencyDisableId,
+            ),
+            (
+                EmergencyDisable {
+                    id: "missing-target".to_string(),
+                    target: EmergencyDisableTarget::Composition,
+                    target_id: String::new(),
+                    reason: "Temporary hold.".to_string(),
+                    families: Vec::new(),
+                    loaders: Vec::new(),
+                    tiers: Vec::new(),
+                },
+                ResolveError::MissingEmergencyDisableTargetId,
+            ),
+            (
+                EmergencyDisable {
+                    id: "missing-reason".to_string(),
+                    target: EmergencyDisableTarget::Composition,
+                    target_id: "family-f-fabric-extended".to_string(),
+                    reason: String::new(),
+                    families: Vec::new(),
+                    loaders: Vec::new(),
+                    tiers: Vec::new(),
+                },
+                ResolveError::MissingEmergencyDisableReason,
+            ),
+        ] {
+            let mut manifest = builtin_manifest().expect("manifest");
+            manifest.emergency_disables.push(disable);
+
+            assert_error_kind(validate_manifest(&manifest), expected);
+        }
+    }
+
+    #[test]
+    fn validation_rejects_duplicate_emergency_disable_ids() {
+        let mut manifest = builtin_manifest().expect("manifest");
+        manifest.emergency_disables.push(test_composition_disable(
+            "duplicate",
+            "family-f-fabric-extended",
+        ));
+        manifest
+            .emergency_disables
+            .push(test_artifact_disable("duplicate", "sodium"));
+
+        assert_error_kind(
+            validate_manifest(&manifest),
+            ResolveError::DuplicateEmergencyDisableId("duplicate".to_string()),
+        );
+    }
+
+    #[test]
+    fn validation_rejects_unknown_emergency_disable_targets() {
+        let mut composition_manifest = builtin_manifest().expect("manifest");
+        composition_manifest
+            .emergency_disables
+            .push(test_composition_disable(
+                "unknown-composition",
+                "missing-composition",
+            ));
+        assert_error_kind(
+            validate_manifest(&composition_manifest),
+            ResolveError::UnknownEmergencyDisableComposition("missing-composition".to_string()),
+        );
+
+        let mut artifact_manifest = builtin_manifest().expect("manifest");
+        artifact_manifest
+            .emergency_disables
+            .push(test_artifact_disable(
+                "unknown-artifact",
+                "missing-artifact",
+            ));
+        assert_error_kind(
+            validate_manifest(&artifact_manifest),
+            ResolveError::UnknownEmergencyDisableArtifact("missing-artifact".to_string()),
+        );
+    }
+
+    #[test]
+    fn disabled_composition_falls_back_to_next_eligible_tier() {
+        let mut manifest = builtin_manifest().expect("manifest");
+        manifest.emergency_disables.push(test_composition_disable(
+            "hold-family-f-extended",
+            "family-f-fabric-extended",
+        ));
+
+        let plan = resolve_plan(
+            Some(&manifest),
+            ResolutionRequest {
+                game_version: "1.20.4".to_string(),
+                loader: "fabric".to_string(),
+                mode: PerformanceMode::Managed,
+                hardware: HardwareProfile::default(),
+                installed_mods: Vec::new(),
+            },
+        );
+
+        assert_eq!(plan.composition_id, "family-f-fabric-core");
+        assert_eq!(plan.tier, CompositionTier::Core);
+        assert_eq!(
+            plan.fallback_reason,
+            "a higher-tier managed composition is temporarily disabled"
+        );
+        assert!(plan.warnings.iter().any(|warning| {
+            warning.contains("family-f-fabric-extended skipped by emergency disable")
+                && warning.contains("Temporary hold.")
+        }));
+    }
+
+    #[test]
+    fn artifact_disable_drops_matching_managed_mod_with_warning() {
+        let mut manifest = builtin_manifest().expect("manifest");
+        manifest
+            .emergency_disables
+            .push(test_artifact_disable("hold-sodium", "sodium"));
+
+        let plan = resolve_plan(
+            Some(&manifest),
+            ResolutionRequest {
+                game_version: "1.20.4".to_string(),
+                loader: "fabric".to_string(),
+                mode: PerformanceMode::Managed,
+                hardware: HardwareProfile::default(),
+                installed_mods: Vec::new(),
+            },
+        );
+
+        assert_eq!(plan.composition_id, "family-f-fabric-extended");
+        assert!(
+            plan.mods
+                .iter()
+                .all(|managed_mod| managed_mod.slug != "sodium")
+        );
+        assert!(plan.warnings.iter().any(|warning| {
+            warning.contains("sodium skipped by emergency disable hold-sodium")
+                && warning.contains("Temporary hold.")
+        }));
+    }
+
+    fn test_composition_disable(id: &str, target_id: &str) -> EmergencyDisable {
+        EmergencyDisable {
+            id: id.to_string(),
+            target: EmergencyDisableTarget::Composition,
+            target_id: target_id.to_string(),
+            reason: "Temporary hold.".to_string(),
+            families: Vec::new(),
+            loaders: Vec::new(),
+            tiers: Vec::new(),
+        }
+    }
+
+    fn test_artifact_disable(id: &str, target_id: &str) -> EmergencyDisable {
+        EmergencyDisable {
+            id: id.to_string(),
+            target: EmergencyDisableTarget::Artifact,
+            target_id: target_id.to_string(),
+            reason: "Temporary hold.".to_string(),
+            families: Vec::new(),
+            loaders: Vec::new(),
+            tiers: Vec::new(),
+        }
+    }
+
+    fn assert_error_kind(result: Result<(), ResolveError>, expected: ResolveError) {
+        let error = result.expect_err("manifest should be invalid");
+        assert_eq!(
+            std::mem::discriminant(&error),
+            std::mem::discriminant(&expected)
+        );
+        assert_eq!(error.to_string(), expected.to_string());
     }
 }

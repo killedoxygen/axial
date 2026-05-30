@@ -1,5 +1,5 @@
 import type { JSX } from 'preact';
-import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { Icon } from '../../ui/Icons';
 import { Button, Card, IconButton, Input, Pill, SectionHeading } from '../../ui/Atoms';
 import { Slider, type SliderZone } from '../../ui/Slider';
@@ -12,13 +12,21 @@ import type { LaunchState } from '../../store';
 import { navigate } from '../../ui-state';
 import { addInstance, removeInstance, selectInstance, updateInstanceInList } from '../../actions';
 import { launchGame, killGame } from '../../launch';
-import { api } from '../../api';
+import { api, apiUrl } from '../../api';
 import { toast } from '../../toast';
 import { errMessage, fmtMem, getMemoryRecommendation } from '../../utils';
 import type {
+  CompositionTier,
   EnrichedInstance,
+  GuardianMode,
+  InstancePerformanceMode,
   InstanceLogTail,
   InstanceResourceSummary,
+  PerformanceHealthResponse,
+  PerformanceHealthStatus,
+  PerformanceInstallResponse,
+  PerformanceMode,
+  PerformancePlanResponse,
   Version,
 } from '../../types';
 import {
@@ -55,7 +63,7 @@ async function renameInstance(inst: EnrichedInstance): Promise<void> {
 
 async function duplicateInstance(inst: EnrichedInstance): Promise<void> {
   try {
-    const res: any = await api('POST', '/instances', { name: `${inst.name} copy`, version_id: inst.version_id });
+    const res: any = await api('POST', `/instances/${encodeURIComponent(inst.id)}/duplicate`, {});
     if (res.error) throw new Error(res.error);
     addInstance(res);
     toast('Duplicated');
@@ -137,6 +145,11 @@ type ResourceLoadState =
   | { status: 'ready'; data: InstanceResourceSummary; error?: undefined }
   | { status: 'error'; data: InstanceResourceSummary | null; error: string };
 
+type PerformanceProgramState =
+  | { status: 'loading'; plan: PerformancePlanResponse | null; health: PerformanceHealthResponse | null; error?: undefined }
+  | { status: 'ready'; plan: PerformancePlanResponse | null; health: PerformanceHealthResponse | null; error?: undefined }
+  | { status: 'error'; plan: PerformancePlanResponse | null; health: PerformanceHealthResponse | null; error: string };
+
 function emptyResources(): InstanceResourceSummary {
   return {
     worlds: [],
@@ -192,6 +205,221 @@ function loaderLabel(v: Version | undefined): string {
   if (id.includes('neoforged')) return 'NeoForge';
   if (id.includes('minecraftforge')) return 'Forge';
   return 'Modded';
+}
+
+function performanceModeFrom(value: string | undefined): PerformanceMode | null {
+  if (value === 'managed' || value === 'vanilla' || value === 'custom') return value;
+  return null;
+}
+
+function globalPerformanceMode(): PerformanceMode {
+  return performanceModeFrom(config.value?.performance_mode) ?? 'managed';
+}
+
+function effectivePerformanceMode(inst: EnrichedInstance): { mode: PerformanceMode; source: 'instance' | 'global' } {
+  const instanceMode = performanceModeFrom(inst.performance_mode);
+  if (instanceMode) return { mode: instanceMode, source: 'instance' };
+  return { mode: globalPerformanceMode(), source: 'global' };
+}
+
+function performanceModeLabel(mode: PerformanceMode): string {
+  if (mode === 'managed') return 'Managed';
+  if (mode === 'vanilla') return 'Vanilla';
+  return 'Custom';
+}
+
+function guardianModeFrom(value: string | undefined): GuardianMode {
+  return value === 'custom' ? 'custom' : 'managed';
+}
+
+function guardianModeLabel(mode: GuardianMode): string {
+  return mode === 'custom' ? 'Custom' : 'Managed';
+}
+
+function compactPath(path: string): string {
+  const trimmed = path.trim();
+  if (!trimmed) return '';
+  return trimmed.split(/[\\/]/).filter(Boolean).pop() || trimmed;
+}
+
+function compositionTierLabel(tier: CompositionTier | ''): string {
+  if (tier === 'extended') return 'Extended';
+  if (tier === 'core') return 'Core';
+  if (tier === 'vanilla_enhanced') return 'Vanilla enhanced';
+  return 'Managed';
+}
+
+function healthLabel(health: PerformanceHealthStatus | undefined): string {
+  if (health === 'healthy') return 'healthy';
+  if (health === 'degraded') return 'degraded';
+  if (health === 'fallback') return 'fallback';
+  if (health === 'invalid') return 'needs attention';
+  if (health === 'disabled') return 'not installed';
+  return 'unknown';
+}
+
+function healthTone(health: PerformanceHealthStatus | undefined): 'ok' | 'warn' | 'err' | 'mute' {
+  if (health === 'healthy') return 'ok';
+  if (health === 'degraded' || health === 'fallback' || health === 'disabled') return 'warn';
+  if (health === 'invalid') return 'err';
+  return 'mute';
+}
+
+function planLoader(v: Version | undefined, inst: EnrichedInstance): string {
+  const componentId = v?.loader?.component_id ?? '';
+  if (componentId.includes('neoforged')) return 'neoforge';
+  if (componentId.includes('minecraftforge')) return 'forge';
+  if (componentId.includes('fabric')) return 'fabric';
+  if (componentId.includes('quilt')) return 'quilt';
+  const raw = inst.version_id.toLowerCase();
+  if (raw.includes('neoforge')) return 'neoforge';
+  if (raw.includes('fabric')) return 'fabric';
+  if (raw.includes('forge')) return 'forge';
+  if (raw.includes('quilt')) return 'quilt';
+  return 'vanilla';
+}
+
+function planGameVersion(v: Version | undefined, inst: EnrichedInstance): string {
+  return v?.minecraft_meta.effective_version
+    || v?.minecraft_meta.base_id
+    || v?.minecraft_meta.display_name
+    || inst.version_id;
+}
+
+function performanceSummary(
+  state: PerformanceProgramState,
+  mode: PerformanceMode,
+): { tone: 'ok' | 'warn' | 'err' | 'mute'; title: string; detail: string } {
+  if (state.status === 'loading' && !state.plan && !state.health) {
+    return {
+      tone: 'mute',
+      title: 'Checking plan',
+      detail: 'Memory and Java settings are still available while Croopor reads bundle state.',
+    };
+  }
+  if (state.status === 'error' && !state.plan && !state.health) {
+    return {
+      tone: 'mute',
+      title: 'Plan status unavailable',
+      detail: 'Backend plan data is not available right now.',
+    };
+  }
+  if (mode === 'vanilla') {
+    return {
+      tone: 'mute',
+      title: 'Vanilla performance',
+      detail: 'No managed performance add-ons are planned for this instance.',
+    };
+  }
+  if (mode === 'custom') {
+    return {
+      tone: 'mute',
+      title: 'Custom performance',
+      detail: 'Croopor preserves your overrides and does not manage a bundle.',
+    };
+  }
+
+  const plan = state.plan;
+  const health = state.health;
+  if (!plan) {
+    return {
+      tone: 'mute',
+      title: 'Managed mode',
+      detail: 'Plan details are unavailable.',
+    };
+  }
+
+  const tier = compositionTierLabel(plan.tier);
+  const modCount = plan.mods?.length ?? 0;
+  const composition = plan.composition_id ? `Composition ${plan.composition_id}` : 'No managed composition selected';
+  const healthText = health ? `bundle ${healthLabel(health.health)}` : 'health not checked';
+  const warning = health?.warnings?.[0] || plan.warnings?.[0] || plan.fallback_reason || '';
+
+  return {
+    tone: healthTone(health?.health),
+    title: `${tier} plan`,
+    detail: warning || `${composition}, ${modCount} managed mod${modCount === 1 ? '' : 's'}, ${healthText}.`,
+  };
+}
+
+function performanceSummaryIcon(tone: 'ok' | 'warn' | 'err' | 'mute'): string {
+  if (tone === 'ok') return 'check-circle';
+  if (tone === 'warn' || tone === 'err') return 'alert';
+  return 'info';
+}
+
+interface PerformanceLifecycleAction {
+  label: string;
+  busyLabel: string;
+  icon: string;
+  action: 'install' | 'remove';
+}
+
+interface PerformanceInstallProgress {
+  phase?: string;
+  current?: number;
+  total?: number;
+  file?: string;
+  error?: string;
+  done?: boolean;
+}
+
+function performanceProgressTitle(progress: PerformanceInstallProgress): string {
+  if (progress.phase === 'queued') return 'Bundle queued';
+  if (progress.phase === 'planning') return 'Planning bundle';
+  if (progress.phase === 'applying') return 'Applying bundle';
+  if (progress.phase === 'removing') return 'Removing bundle';
+  if (progress.phase === 'rolling_back') return 'Rolling back bundle';
+  if (progress.phase === 'complete') return 'Bundle updated';
+  if (progress.phase === 'error') return 'Bundle update failed';
+  return 'Updating bundle';
+}
+
+function performanceProgressDetail(progress: PerformanceInstallProgress): string {
+  if (progress.error) return progress.error;
+  if (progress.file?.trim()) return progress.file;
+  if (progress.phase === 'queued') return 'Waiting to update managed performance files.';
+  if (progress.phase === 'planning') return 'Checking the managed performance plan.';
+  if (progress.phase === 'applying') return 'Applying managed performance files.';
+  if (progress.phase === 'removing') return 'Removing managed performance files.';
+  if (progress.phase === 'rolling_back') return 'Rolling back managed performance files.';
+  if (progress.phase === 'complete') return 'Managed performance update complete.';
+  return 'Updating managed performance files.';
+}
+
+function performanceLifecycleAction(
+  mode: PerformanceMode,
+  health: PerformanceHealthResponse | null,
+): PerformanceLifecycleAction | null {
+  if (mode === 'managed') {
+    if (health?.health === 'invalid' || health?.health === 'degraded') {
+      return { label: 'Repair', busyLabel: 'Repairing…', icon: 'refresh', action: 'install' };
+    }
+    if (health?.health === 'fallback') {
+      return { label: 'Apply', busyLabel: 'Applying…', icon: 'download', action: 'install' };
+    }
+    if (health?.health === 'healthy') {
+      return { label: 'Repair', busyLabel: 'Repairing…', icon: 'refresh', action: 'install' };
+    }
+    return { label: 'Prepare', busyLabel: 'Preparing…', icon: 'download', action: 'install' };
+  }
+
+  if (health?.active || health?.installed_count || health?.composition_id) {
+    return { label: 'Remove', busyLabel: 'Removing…', icon: 'trash', action: 'remove' };
+  }
+
+  return null;
+}
+
+function installResponseAsHealth(response: PerformanceInstallResponse): PerformanceHealthResponse {
+  return {
+    active: response.active,
+    health: response.health,
+    composition_id: response.composition_id,
+    tier: response.tier,
+    installed_count: response.installed_count,
+    warnings: response.warnings,
+  };
 }
 
 // ─── Worlds — main column, primary content ───────────────────────────────
@@ -256,7 +484,7 @@ function WorldsCard({
   const count = resources?.worlds_count ?? inst.saves_count ?? 0;
   const firstWorld = worlds[0];
   return (
-    <Card padding={22} class={`cp-od-worlds-card${count === 0 ? ' cp-od-worlds-card--empty' : ''}`}>
+    <Card padding={18} class={`cp-od-worlds-card${count === 0 ? ' cp-od-worlds-card--empty' : ''}`}>
       <div class="cp-od-head">
         <h3>Worlds{count > 0 ? <span class="cp-od-head-count">· {count}</span> : null}</h3>
         <button class="cp-od-overflow" type="button" aria-label="More" onClick={(e) => openContextMenu(e, [
@@ -332,7 +560,7 @@ function ActivityCard({
   }, [inst.id, inst.created_at, inst.last_played_at, resources]);
 
   return (
-    <Card padding={22}>
+    <Card padding={18}>
       <div class="cp-od-head cp-od-head--iconed">
         <div class="cp-od-head-tile"><Icon name="activity" size={13} stroke={1.9} /></div>
         <h3>Activity</h3>
@@ -393,7 +621,7 @@ function QuickActionsCard({
   onOpenLogs: () => void;
 }): JSX.Element {
   return (
-    <Card padding={20} class="cp-od-quick-card">
+    <Card padding={18} class="cp-od-quick-card">
       <div class="cp-od-head">
         <h3>Quick actions</h3>
       </div>
@@ -530,16 +758,46 @@ function inferPreset(maxMem: number, presets: MemoryPreset[]): Preset {
 
 function PerformanceCard({ inst, onOpenSettings }: { inst: EnrichedInstance; onOpenSettings: () => void }): JSX.Element {
   const RAM_MIN = 2;
+  const version = versions.value.find(v => v.id === inst.version_id);
+  const effectiveMode = effectivePerformanceMode(inst);
   const saved = memoryGb(inst.max_memory_mb, config.value?.max_memory_mb ?? 4096);
   const memoryProfile = memoryProfileForInstance(inst, saved, RAM_MIN);
   const ramMax = memoryProfile.max;
   const [recMin, recMax] = memoryProfile.recommended;
   const initialMem = clampMemoryGb(saved, RAM_MIN, ramMax);
   const [maxMem, setMaxMem] = useState<number>(initialMem);
+  const [program, setProgram] = useState<PerformanceProgramState>({ status: 'loading', plan: null, health: null });
+  const [lifecycleBusy, setLifecycleBusy] = useState(false);
+  const [lifecycleProgress, setLifecycleProgress] = useState<{ title: string; detail: string } | null>(null);
   const [saving, setSaving] = useState(false);
   const savedRef = useRef(initialMem);
   const saveRequestRef = useRef(0);
   const saveTimerRef = useRef<number | null>(null);
+  const lifecycleSourceRef = useRef<EventSource | null>(null);
+
+  const fetchPerformanceProgram = useCallback(async (): Promise<{
+    plan: PerformancePlanResponse | null;
+    health: PerformanceHealthResponse | null;
+  }> => {
+    const gameVersion = planGameVersion(version, inst);
+    const loader = planLoader(version, inst);
+    const planParams = new URLSearchParams({
+      game_version: gameVersion,
+      loader,
+      mode: effectiveMode.mode,
+    });
+    const healthParams = new URLSearchParams({ instance_id: inst.id });
+    const [planRes, healthRes]: [any, any] = await Promise.all([
+      api('GET', `/performance/plan?${planParams.toString()}`),
+      api('GET', `/performance/health?${healthParams.toString()}`),
+    ]);
+    if (planRes?.error) throw new Error(planRes.error);
+    if (healthRes?.error) throw new Error(healthRes.error);
+    return {
+      plan: planRes?.mode ? planRes as PerformancePlanResponse : null,
+      health: healthRes?.health ? healthRes as PerformanceHealthResponse : null,
+    };
+  }, [inst.id, inst.version_id, version?.id, version?.loader?.component_id, version?.minecraft_meta.effective_version, effectiveMode.mode]);
 
   useEffect(() => {
     // If the persisted value changes (PUT elsewhere), realign local state.
@@ -553,8 +811,35 @@ function PerformanceCard({ inst, onOpenSettings }: { inst: EnrichedInstance; onO
   useEffect(() => {
     return () => {
       if (saveTimerRef.current !== null) window.clearTimeout(saveTimerRef.current);
+      lifecycleSourceRef.current?.close();
+      lifecycleSourceRef.current = null;
     };
   }, []);
+
+  useEffect(() => {
+    let alive = true;
+    setProgram(current => ({ status: 'loading', plan: current.plan, health: current.health }));
+    void fetchPerformanceProgram()
+      .then(({ plan, health }) => {
+        if (!alive) return;
+        setProgram({
+          status: 'ready',
+          plan,
+          health,
+        });
+      })
+      .catch((err) => {
+        if (!alive) return;
+        setProgram(current => ({
+          status: 'error',
+          plan: current.plan,
+          health: current.health,
+          error: errMessage(err),
+        }));
+      });
+
+    return () => { alive = false; };
+  }, [fetchPerformanceProgram]);
 
   const saveMemory = async (nextMem: number): Promise<void> => {
     const clampedMem = clampMemoryGb(nextMem, RAM_MIN, ramMax);
@@ -594,6 +879,97 @@ function PerformanceCard({ inst, onOpenSettings }: { inst: EnrichedInstance; onO
     void saveMemory(nextMem);
   };
 
+  const waitForPerformanceInstall = (installId: string): Promise<void> => {
+    return new Promise((resolve, reject) => {
+      const es = new EventSource(apiUrl(`/install/${encodeURIComponent(installId)}/events`));
+      let settled = false;
+      lifecycleSourceRef.current?.close();
+      lifecycleSourceRef.current = es;
+
+      const finish = (error?: Error): void => {
+        if (settled) return;
+        settled = true;
+        es.close();
+        if (lifecycleSourceRef.current === es) lifecycleSourceRef.current = null;
+        if (error) reject(error);
+        else resolve();
+      };
+
+      es.addEventListener('progress', (event: MessageEvent) => {
+        let progress: PerformanceInstallProgress;
+        try {
+          progress = JSON.parse(event.data) as PerformanceInstallProgress;
+        } catch {
+          finish(new Error('Performance update stream sent invalid progress data'));
+          return;
+        }
+        setLifecycleProgress({
+          title: performanceProgressTitle(progress),
+          detail: performanceProgressDetail(progress),
+        });
+        if (progress.phase === 'error' || progress.error) {
+          finish(new Error(progress.error || 'Performance update failed'));
+        } else if (progress.done) {
+          finish();
+        }
+      });
+
+      es.onerror = () => {
+        if (settled || es.readyState !== EventSource.CLOSED) return;
+        finish(new Error('Performance update stream closed unexpectedly'));
+      };
+    });
+  };
+
+  const runLifecycleAction = async (action: PerformanceLifecycleAction): Promise<void> => {
+    if (lifecycleBusy) return;
+    setLifecycleBusy(true);
+    setLifecycleProgress({
+      title: 'Bundle queued',
+      detail: 'Waiting to update managed performance files.',
+    });
+    try {
+      const body: Record<string, string | boolean> = {
+        instance_id: inst.id,
+        mode: effectiveMode.mode,
+        queued: true,
+      };
+      if (action.action === 'remove') {
+        body.action = 'remove';
+      } else {
+        body.game_version = planGameVersion(version, inst);
+        body.loader = planLoader(version, inst);
+      }
+      const res: any = await api('POST', '/performance/install', body);
+      if (res?.error) throw new Error(res.error);
+      const installResult = res as PerformanceInstallResponse;
+      if (installResult.install_id) {
+        await waitForPerformanceInstall(installResult.install_id);
+      } else {
+        setProgram(current => ({
+          status: 'ready',
+          plan: current.plan,
+          health: installResponseAsHealth(installResult),
+        }));
+      }
+      const refreshed = await fetchPerformanceProgram();
+      setProgram({ status: 'ready', ...refreshed });
+      toast(action.action === 'remove' ? 'Managed bundle removed' : 'Managed bundle updated');
+    } catch (err) {
+      const message = errMessage(err);
+      setProgram(current => ({
+        status: 'error',
+        plan: current.plan,
+        health: current.health,
+        error: message,
+      }));
+      toast(`Performance update failed: ${message}`, 'error');
+    } finally {
+      setLifecycleBusy(false);
+      setLifecycleProgress(null);
+    }
+  };
+
   const preset = inferPreset(maxMem, memoryProfile.presets);
   const highStart = Math.min(ramMax, Math.max(recMax, Math.round(ramMax * 0.75)));
   const memoryZones: SliderZone[] = [
@@ -602,14 +978,47 @@ function PerformanceCard({ inst, onOpenSettings }: { inst: EnrichedInstance; onO
     { from: recMax, to: highStart, tone: 'high', label: 'High' },
     { from: highStart, to: ramMax, tone: 'extreme', label: 'Extreme' },
   ];
+  const lifecycleAction = performanceLifecycleAction(effectiveMode.mode, program.health);
+  const baseSummary = performanceSummary(program, effectiveMode.mode);
+  const summary = lifecycleBusy
+    ? {
+      tone: 'mute' as const,
+      title: lifecycleProgress?.title || 'Updating bundle',
+      detail: lifecycleProgress?.detail || (lifecycleAction?.action === 'remove'
+        ? 'Croopor is removing managed performance files.'
+        : 'Croopor is applying managed performance files.'),
+    }
+    : baseSummary;
+  const summaryIcon = performanceSummaryIcon(summary.tone);
 
   return (
-    <Card padding={22}>
+    <Card padding={18}>
       <div class="cp-od-head">
         <h3>Performance</h3>
         <button class="cp-od-link" type="button" onClick={onOpenSettings}>
-          Advanced <Icon name="chevron-right" size={11} stroke={2.2} />
+          Settings <Icon name="chevron-right" size={11} stroke={2.2} />
         </button>
+      </div>
+
+      <div class="cp-od-perf-summary" data-tone={summary.tone} aria-live="polite">
+        <span class="cp-od-perf-summary-mark" data-icon={summaryIcon}>
+          <Icon name={summaryIcon} size={12} stroke={2.4} />
+        </span>
+        <div class="cp-od-perf-summary-copy">
+          <strong>{summary.title}</strong>
+          <span>{summary.detail}</span>
+        </div>
+        {lifecycleAction && (
+          <Button
+            variant="secondary"
+            size="sm"
+            icon={lifecycleBusy ? 'refresh' : lifecycleAction.icon}
+            disabled={lifecycleBusy || program.status === 'loading'}
+            onClick={() => void runLifecycleAction(lifecycleAction)}
+          >
+            {lifecycleBusy ? lifecycleAction.busyLabel : lifecycleAction.label}
+          </Button>
+        )}
       </div>
 
       <div class="cp-od-perf-row">
@@ -661,42 +1070,67 @@ function PerformanceCard({ inst, onOpenSettings }: { inst: EnrichedInstance; onO
   );
 }
 
-// ─── Maintenance — right rail, single compact list. Backups + Integrity
-// + Disk. Healthy states stay quiet. ────────────────────────────────────
+// ─── Guardian preflight — right rail, frontend summary of launch inputs.
 
-function MaintenanceCard(): JSX.Element {
+function GuardianPreflightCard({ inst, onOpenSettings }: {
+  inst: EnrichedInstance;
+  onOpenSettings: () => void;
+}): JSX.Element {
+  const cfg = config.value;
+  const mode = guardianModeFrom(cfg?.guardian_mode);
+  const instanceJava = (inst.java_path || '').trim();
+  const globalJava = (cfg?.java_path_override || '').trim();
+  const instancePreset = (inst.jvm_preset || '').trim();
+  const globalPreset = (cfg?.jvm_preset || '').trim();
+  const rawJvmArgs = (inst.extra_jvm_args || '').trim();
+  const hasManualOverride = Boolean(instanceJava || globalJava || instancePreset || globalPreset || rawJvmArgs);
+  const modeCopy = mode === 'custom'
+    ? 'Explicit overrides are preserved, but guaranteed-fatal setups may be blocked with guidance.'
+    : 'Guardian may adjust unsafe Java/JVM choices before startup.';
+  const javaTitle = instanceJava ? 'Instance override' : globalJava ? 'Global override' : 'Managed Java';
+  const javaSub = instanceJava ? compactPath(instanceJava) : globalJava ? compactPath(globalJava) : 'Croopor selects runtime';
+  const presetValue = instancePreset || globalPreset;
+  const presetTitle = instancePreset ? 'Instance preset' : globalPreset ? 'Global preset' : 'Auto preset';
+  const presetSub = presetValue ? JVM_PRESET_LABELS[jvmPresetFrom(presetValue)] : 'Selected at launch';
+
   return (
-    <Card padding={22}>
+    <Card padding={18} class="cp-od-guardian-card">
       <div class="cp-od-head">
-        <h3>Maintenance</h3>
+        <h3>Guardian preflight</h3>
+        <button class="cp-od-link" type="button" onClick={onOpenSettings}>
+          Review <Icon name="chevron-right" size={11} stroke={2.2} />
+        </button>
       </div>
-      <ul class="cp-od-maint-list">
-        <li class="cp-od-maint-row">
-          <span class="cp-od-maint-icon" data-tone="mute"><Icon name="archive" size={14} stroke={1.8} /></span>
-          <div class="cp-od-maint-body">
-            <div class="cp-od-maint-title">Backups</div>
-            <div class="cp-od-maint-sub">Not wired yet</div>
-          </div>
-          {/* TODO: enable when the backend owns backup policy and snapshots. */}
-          <button class="cp-od-link" type="button" disabled>Manage</button>
+      <div class="cp-od-guardian-posture" data-tone={hasManualOverride ? 'warn' : 'ok'}>
+        <span class="cp-od-guardian-posture-mark">
+          <Icon name={hasManualOverride ? 'alert' : 'shield-check'} size={13} stroke={2.2} />
+        </span>
+        <div>
+          <strong>{guardianModeLabel(mode)} mode</strong>
+          <span>{modeCopy}</span>
+        </div>
+      </div>
+      <ul class="cp-od-guardian-list">
+        <li class="cp-od-guardian-row">
+          <span class="cp-od-guardian-key">Java</span>
+          <span class="cp-od-guardian-val" title={instanceJava || globalJava || undefined}>
+            <strong>{javaTitle}</strong>
+            <small>{javaSub}</small>
+          </span>
         </li>
-        <li class="cp-od-maint-row">
-          <span class="cp-od-maint-icon" data-tone="mute"><Icon name="shield-check" size={14} stroke={1.8} /></span>
-          <div class="cp-od-maint-body">
-            <div class="cp-od-maint-title">Integrity</div>
-            <div class="cp-od-maint-sub">Backend required</div>
-          </div>
-          {/* TODO: enable when the backend exposes integrity checks. */}
-          <button class="cp-od-link" type="button" disabled>Verify</button>
+        <li class="cp-od-guardian-row">
+          <span class="cp-od-guardian-key">JVM preset</span>
+          <span class="cp-od-guardian-val">
+            <strong>{presetTitle}</strong>
+            <small>{presetSub}</small>
+          </span>
         </li>
-        <li class="cp-od-maint-row">
-          <span class="cp-od-maint-icon" data-tone="mute"><Icon name="archive" size={14} stroke={1.8} /></span>
-          <div class="cp-od-maint-body">
-            <div class="cp-od-maint-title">Disk usage</div>
-            <div class="cp-od-maint-sub">Backend required</div>
-          </div>
-          {/* TODO: enable when the backend exposes scoped disk measurement. */}
-          <button class="cp-od-link" type="button" disabled>Measure</button>
+        <li class="cp-od-guardian-row">
+          <span class="cp-od-guardian-key">Raw JVM args</span>
+          <span class="cp-od-guardian-val" title={rawJvmArgs || undefined}>
+            <strong>{rawJvmArgs ? 'Instance override' : 'None'}</strong>
+            <small>{rawJvmArgs || 'No raw JVM arguments'}</small>
+          </span>
         </li>
       </ul>
     </Card>
@@ -711,7 +1145,7 @@ function DetailsCard({ inst, running }: { inst: EnrichedInstance; running: boole
   const loaderVer = v?.loader?.loader_version ? ` ${v.loader.loader_version}` : '';
   const mcVer = v?.minecraft_meta.display_name || v?.minecraft_meta.display_hint || 'unknown';
   return (
-    <Card padding={22}>
+    <Card padding={18}>
       <div class="cp-od-head">
         <h3>Details</h3>
       </div>
@@ -759,33 +1193,29 @@ function OverviewPane({ inst, resources, running, onLaunch, onStop, onOpenWorlds
   onOpenSettings: () => void;
 }): JSX.Element {
   return (
-    <div class="cp-instance-body">
-      <div class="cp-instance-main">
-        <div class="cp-od-stagger cp-od-worlds-slot" style={{ '--cp-od-delay': '0ms' } as any}>
-          <WorldsCard inst={inst} resources={resources} onOpenWorlds={onOpenWorlds} />
-        </div>
-        <div class="cp-od-stagger" style={{ '--cp-od-delay': '80ms' } as any}>
-          <PerformanceCard inst={inst} onOpenSettings={onOpenSettings} />
-        </div>
-        <div class="cp-od-stagger" style={{ '--cp-od-delay': '160ms' } as any}>
-          <QuickActionsCard
-            running={running}
-            onLaunch={onLaunch}
-            onStop={onStop}
-            onOpenLogs={onOpenLogs}
-          />
-        </div>
+    <div class="cp-instance-body cp-instance-body--overview-bento">
+      <div class="cp-od-stagger cp-od-slot cp-od-slot--performance" style={{ '--cp-od-delay': '0ms' } as any}>
+        <PerformanceCard inst={inst} onOpenSettings={onOpenSettings} />
       </div>
-      <div class="cp-instance-side">
-        <div class="cp-od-stagger" style={{ '--cp-od-delay': '40ms' } as any}>
-          <ActivityCard inst={inst} resources={resources} onOpenLogs={onOpenLogs} />
-        </div>
-        <div class="cp-od-stagger" style={{ '--cp-od-delay': '120ms' } as any}>
-          <MaintenanceCard />
-        </div>
-        <div class="cp-od-stagger" style={{ '--cp-od-delay': '200ms' } as any}>
-          <DetailsCard inst={inst} running={running} />
-        </div>
+      <div class="cp-od-stagger cp-od-slot cp-od-slot--guardian" style={{ '--cp-od-delay': '40ms' } as any}>
+        <GuardianPreflightCard inst={inst} onOpenSettings={onOpenSettings} />
+      </div>
+      <div class="cp-od-stagger cp-od-slot cp-od-slot--worlds cp-od-worlds-slot" style={{ '--cp-od-delay': '80ms' } as any}>
+        <WorldsCard inst={inst} resources={resources} onOpenWorlds={onOpenWorlds} />
+      </div>
+      <div class="cp-od-stagger cp-od-slot cp-od-slot--activity" style={{ '--cp-od-delay': '120ms' } as any}>
+        <ActivityCard inst={inst} resources={resources} onOpenLogs={onOpenLogs} />
+      </div>
+      <div class="cp-od-stagger cp-od-slot cp-od-slot--quick" style={{ '--cp-od-delay': '160ms' } as any}>
+        <QuickActionsCard
+          running={running}
+          onLaunch={onLaunch}
+          onStop={onStop}
+          onOpenLogs={onOpenLogs}
+        />
+      </div>
+      <div class="cp-od-stagger cp-od-slot cp-od-slot--details" style={{ '--cp-od-delay': '200ms' } as any}>
+        <DetailsCard inst={inst} running={running} />
       </div>
     </div>
   );
@@ -1160,6 +1590,13 @@ const WINDOW_PRESETS: InstanceWindowPreset[] = [
   { id: '2k', label: '2K', w: 2560, h: 1440 },
 ];
 
+const INSTANCE_PERFORMANCE_OPTIONS: Array<{ value: InstancePerformanceMode; label: string }> = [
+  { value: '', label: 'Inherit' },
+  { value: 'managed', label: 'Managed' },
+  { value: 'vanilla', label: 'Vanilla' },
+  { value: 'custom', label: 'Custom' },
+];
+
 function clampWindowDimension(value: string, fallback: number): number {
   const parsed = Number.parseInt(value, 10);
   if (!Number.isFinite(parsed)) return fallback;
@@ -1170,6 +1607,10 @@ function jvmPresetFrom(value: string | undefined): JvmPreset {
   return JVM_PRESET_ORDER.includes(value as JvmPreset) ? value as JvmPreset : '';
 }
 
+function instancePerformanceModeFrom(value: string | undefined): InstancePerformanceMode {
+  return performanceModeFrom(value) ?? '';
+}
+
 function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
   const initialArtSeed = artSeedFor(inst);
   const [artSeed, setArtSeed] = useState<number>(initialArtSeed);
@@ -1178,6 +1619,7 @@ function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
   const [minMem, setMinMem] = useState<number>(memoryGb(inst.min_memory_mb, config.value?.min_memory_mb ?? 1024));
   const [width, setWidth] = useState<number>(inst.window_width ?? 854);
   const [height, setHeight] = useState<number>(inst.window_height ?? 480);
+  const [performanceMode, setPerformanceMode] = useState<InstancePerformanceMode>(instancePerformanceModeFrom(inst.performance_mode));
   const [jvmPreset, setJvmPreset] = useState<JvmPreset>(jvmPresetFrom(inst.jvm_preset));
   const [javaPath, setJavaPath] = useState<string>(inst.java_path ?? '');
   const [jvmArgs, setJvmArgs] = useState<string>(inst.extra_jvm_args ?? '');
@@ -1196,12 +1638,17 @@ function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
   ];
   const activeWindowPreset = WINDOW_PRESETS.find(p => p.w === width && p.h === height)?.id ?? 'custom';
   const activeWindowLabel = WINDOW_PRESETS.find(p => p.id === activeWindowPreset)?.label ?? 'Custom';
+  const effectiveSettingsMode = performanceMode || globalPerformanceMode();
+  const performanceModeText = performanceMode
+    ? `${performanceModeLabel(effectiveSettingsMode)} override`
+    : `Inherits ${performanceModeLabel(effectiveSettingsMode)} from global settings`;
   const dirty = (
     artSeed !== initialArtSeed ||
     Math.round(maxMem * 1024) !== (inst.max_memory_mb ?? config.value?.max_memory_mb ?? 4096) ||
     Math.round(Math.min(minMem, maxMem) * 1024) !== (inst.min_memory_mb ?? config.value?.min_memory_mb ?? 1024) ||
     width !== (inst.window_width ?? 854) ||
     height !== (inst.window_height ?? 480) ||
+    performanceMode !== instancePerformanceModeFrom(inst.performance_mode) ||
     jvmPreset !== jvmPresetFrom(inst.jvm_preset) ||
     javaPath !== (inst.java_path ?? '') ||
     jvmArgs !== (inst.extra_jvm_args ?? '')
@@ -1218,6 +1665,7 @@ function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
     setMinMem(memoryGb(inst.min_memory_mb, config.value?.min_memory_mb ?? 1024));
     setWidth(inst.window_width ?? 854);
     setHeight(inst.window_height ?? 480);
+    setPerformanceMode(instancePerformanceModeFrom(inst.performance_mode));
     setJvmPreset(jvmPresetFrom(inst.jvm_preset));
     setJavaPath(inst.java_path ?? '');
     setJvmArgs(inst.extra_jvm_args ?? '');
@@ -1229,6 +1677,7 @@ function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
     inst.min_memory_mb,
     inst.window_width,
     inst.window_height,
+    inst.performance_mode,
     inst.jvm_preset,
     inst.java_path,
     inst.extra_jvm_args,
@@ -1244,6 +1693,7 @@ function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
         art_seed: artSeed,
         window_width: width,
         window_height: height,
+        performance_mode: performanceMode,
         jvm_preset: jvmPreset,
         java_path: javaPath,
         extra_jvm_args: jvmArgs,
@@ -1269,72 +1719,31 @@ function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
       </div>
 
       <div class="cp-settings-sheet">
-        <section class="cp-settings-row cp-settings-row--identity">
-          <div class="cp-settings-row-head">
-            <span class="cp-settings-section-icon"><Icon name="image" size={15} /></span>
-            <div>
-              <h3>Identity</h3>
-              <p>Artwork used for this instance.</p>
-            </div>
-          </div>
-          <div class="cp-settings-row-control cp-settings-identity-control">
-            <InstanceArt
-              instance={{ ...inst, art_seed: artSeed }}
-              aspect="square"
-              radius={12}
-              className="cp-settings-avatar"
-            />
-            <div>
-              <strong>{artPreset}</strong>
-              <span>Current style</span>
-            </div>
-            <Button variant="secondary" size="sm" icon="refresh" onClick={() => setArtSeed(seed => nextArtSeed(seed))}>
-              Regenerate
-            </Button>
-          </div>
-        </section>
-
         <section class="cp-settings-row">
           <div class="cp-settings-row-head">
-            <span class="cp-settings-section-icon"><Icon name="rectangle" size={15} /></span>
+            <span class="cp-settings-section-icon"><Icon name="shield-check" size={15} /></span>
             <div>
-              <h3>Window</h3>
-              <p>{activeWindowLabel} · {width} × {height}</p>
+              <h3>Performance policy</h3>
+              <p>{performanceModeText}.</p>
             </div>
           </div>
-          <div class="cp-settings-row-control cp-settings-window-control">
-            <div class="cp-settings-button-strip" aria-label="Window size">
-              {WINDOW_PRESETS.map((preset) => (
+          <div class="cp-settings-row-control">
+            <div class="cp-settings-button-strip" aria-label="Instance performance mode">
+              {INSTANCE_PERFORMANCE_OPTIONS.map((option) => (
                 <Button
-                  key={preset.id}
-                  variant={activeWindowPreset === preset.id ? 'primary' : 'secondary'}
+                  key={option.value || 'inherit'}
+                  variant={performanceMode === option.value ? 'primary' : 'secondary'}
                   size="sm"
-                  onClick={() => {
-                    setWidth(preset.w);
-                    setHeight(preset.h);
-                  }}
+                  onClick={() => setPerformanceMode(option.value)}
                 >
-                  {preset.label}
+                  {option.label}
                 </Button>
               ))}
             </div>
-            <div class="cp-settings-dimensions">
-              <label>
-                <span>Width</span>
-                <Input
-                  type="number"
-                  value={String(width)}
-                  onChange={(v) => setWidth(clampWindowDimension(v, width))}
-                />
-              </label>
-              <label>
-                <span>Height</span>
-                <Input
-                  type="number"
-                  value={String(height)}
-                  onChange={(v) => setHeight(clampWindowDimension(v, height))}
-                />
-              </label>
+            <div class="cp-settings-mode-note">
+              {performanceMode
+                ? 'This instance will use its own performance mode.'
+                : 'This instance follows the global Performance setting.'}
             </div>
           </div>
         </section>
@@ -1427,6 +1836,76 @@ function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
                 </label>
               </div>
             )}
+          </div>
+        </section>
+
+        <section class="cp-settings-row">
+          <div class="cp-settings-row-head">
+            <span class="cp-settings-section-icon"><Icon name="rectangle" size={15} /></span>
+            <div>
+              <h3>Window</h3>
+              <p>{activeWindowLabel} · {width} × {height}</p>
+            </div>
+          </div>
+          <div class="cp-settings-row-control cp-settings-window-control">
+            <div class="cp-settings-button-strip" aria-label="Window size">
+              {WINDOW_PRESETS.map((preset) => (
+                <Button
+                  key={preset.id}
+                  variant={activeWindowPreset === preset.id ? 'primary' : 'secondary'}
+                  size="sm"
+                  onClick={() => {
+                    setWidth(preset.w);
+                    setHeight(preset.h);
+                  }}
+                >
+                  {preset.label}
+                </Button>
+              ))}
+            </div>
+            <div class="cp-settings-dimensions">
+              <label>
+                <span>Width</span>
+                <Input
+                  type="number"
+                  value={String(width)}
+                  onChange={(v) => setWidth(clampWindowDimension(v, width))}
+                />
+              </label>
+              <label>
+                <span>Height</span>
+                <Input
+                  type="number"
+                  value={String(height)}
+                  onChange={(v) => setHeight(clampWindowDimension(v, height))}
+                />
+              </label>
+            </div>
+          </div>
+        </section>
+
+        <section class="cp-settings-row cp-settings-row--identity">
+          <div class="cp-settings-row-head">
+            <span class="cp-settings-section-icon"><Icon name="image" size={15} /></span>
+            <div>
+              <h3>Identity</h3>
+              <p>Artwork used for this instance.</p>
+            </div>
+          </div>
+          <div class="cp-settings-row-control cp-settings-identity-control">
+            <InstanceArt
+              instance={{ ...inst, art_seed: artSeed }}
+              aspect="square"
+              radius={12}
+              className="cp-settings-avatar"
+            />
+            <div>
+              <strong>{artPreset}</strong>
+              <span>Current style</span>
+            </div>
+            <Button variant="secondary" size="sm" icon="refresh" onClick={() => setArtSeed(seed => nextArtSeed(seed))}>
+              Regenerate
+            </Button>
           </div>
         </section>
       </div>
