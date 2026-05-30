@@ -797,6 +797,7 @@ function PerformanceCard({ inst, onOpenSettings }: { inst: EnrichedInstance; onO
       game_version: gameVersion,
       loader,
       mode: effectiveMode.mode,
+      instance_id: inst.id,
     });
     const healthParams = new URLSearchParams({ instance_id: inst.id });
     const [planRes, healthRes]: [any, any] = await Promise.all([

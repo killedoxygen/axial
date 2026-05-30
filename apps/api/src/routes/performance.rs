@@ -25,6 +25,7 @@ struct PlanQuery {
     game_version: Option<String>,
     loader: Option<String>,
     mode: Option<String>,
+    instance_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -169,18 +170,63 @@ async fn handle_plan(
         "game_version query parameter is required",
     )?;
     let mode = resolve_config_mode(&state, query.mode.as_deref())?;
+    let installed_mods = plan_installed_mod_evidence(&state, query.instance_id.as_deref())?;
     let plan = state.performance().get_plan(ResolutionRequest {
         game_version,
         loader: optional_value(query.loader.as_deref()).unwrap_or_default(),
         mode,
         hardware: state.performance().hardware(),
-        installed_mods: Vec::new(),
+        installed_mods,
     });
 
     Ok(Json(PerformancePlanResponse {
         active: matches!(mode, PerformanceMode::Managed),
         plan,
     }))
+}
+
+fn plan_installed_mod_evidence(
+    state: &AppState,
+    raw_instance_id: Option<&str>,
+) -> Result<Vec<String>, (StatusCode, Json<serde_json::Value>)> {
+    let Some(instance_id) = optional_value(raw_instance_id) else {
+        return Ok(Vec::new());
+    };
+    let instance = state.instances().get(&instance_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "instance not found" })),
+        )
+    })?;
+    let mods_dir = state.instances().game_dir(&instance.id).join("mods");
+    let state_file = match load_state(&mods_dir) {
+        Ok(state_file) => state_file,
+        Err(StateError::Parse(_)) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "failed to parse performance state" })),
+            ));
+        }
+        Err(StateError::InvalidOwnership { .. }) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid performance artifact ownership metadata"
+                })),
+            ));
+        }
+        Err(StateError::InvalidIntegrity { .. }) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid performance artifact integrity metadata"
+                })),
+            ));
+        }
+        Err(error) => return Err(internal_error(error)),
+    };
+
+    Ok(installed_mod_evidence(&mods_dir, state_file.as_ref()))
 }
 
 async fn handle_health(
@@ -1168,6 +1214,7 @@ mod tests {
                 game_version: None,
                 loader: None,
                 mode: None,
+                instance_id: None,
             }),
         )
         .await
@@ -1190,6 +1237,7 @@ mod tests {
                 game_version: Some("1.20.4".to_string()),
                 loader: Some("fabric".to_string()),
                 mode: Some("turbo".to_string()),
+                instance_id: None,
             }),
         )
         .await
@@ -1212,6 +1260,7 @@ mod tests {
                 game_version: Some(" 1.20.4 ".to_string()),
                 loader: Some(" fabric ".to_string()),
                 mode: Some("custom".to_string()),
+                instance_id: None,
             }),
         )
         .await
@@ -1221,6 +1270,131 @@ mod tests {
         assert_eq!(response.plan.mode, PerformanceMode::Custom);
         assert_eq!(response.plan.loader, "fabric");
         assert!(response.plan.mods.is_empty());
+    }
+
+    #[tokio::test]
+    async fn plan_missing_instance_returns_json_error() {
+        let fixture = TestFixture::new("plan-missing-instance");
+
+        let error = handle_plan(
+            State(fixture.state.clone()),
+            Query(PlanQuery {
+                game_version: Some("1.20.4".to_string()),
+                loader: Some("fabric".to_string()),
+                mode: None,
+                instance_id: Some("missing".to_string()),
+            }),
+        )
+        .await
+        .expect_err("missing instance should fail");
+
+        assert_eq!(error.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            error.1.0,
+            serde_json::json!({ "error": "instance not found" })
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_without_instance_id_stays_request_only() {
+        let manifest = nvidium_always_manifest("2026-05-30T14:10:00Z");
+        let signed = signed_rules_response(&manifest);
+        let remote_url = spawn_rules_server(
+            serde_json::to_vec(&manifest).expect("serialize remote manifest"),
+            Some(signed.signature),
+        )
+        .await;
+        let fixture = TestFixture::new_with_remote_url_and_public_key(
+            "plan-request-only-iris",
+            Some(remote_url),
+            Some(signed.public_key),
+        );
+        let Json(status) = handle_rules_refresh(State(fixture.state.clone()))
+            .await
+            .expect("remote manifest should refresh");
+        assert_eq!(status.rule_source, croopor_performance::RuleSource::Remote);
+        let instance_id = fixture.add_instance("Managed", "1.20.4-fabric");
+        let mods_dir = fixture
+            .state
+            .instances()
+            .game_dir(&instance_id)
+            .join("mods");
+        fs::create_dir_all(&mods_dir).expect("create mods dir");
+        fs::write(mods_dir.join("iris-mc1.20.1-1.7.0.jar"), b"iris").expect("write iris jar");
+
+        let Json(response) = handle_plan(
+            State(fixture.state.clone()),
+            Query(PlanQuery {
+                game_version: Some("1.20.4".to_string()),
+                loader: Some("fabric".to_string()),
+                mode: Some("managed".to_string()),
+                instance_id: None,
+            }),
+        )
+        .await
+        .expect("request-only plan should serialize");
+
+        assert!(
+            response
+                .plan
+                .mods
+                .iter()
+                .any(|managed_mod| managed_mod.slug == "nvidium")
+        );
+        assert!(response.plan.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn plan_with_instance_id_uses_user_installed_iris_file_for_nvidium_exclusion() {
+        let manifest = nvidium_always_manifest("2026-05-30T14:20:00Z");
+        let signed = signed_rules_response(&manifest);
+        let remote_url = spawn_rules_server(
+            serde_json::to_vec(&manifest).expect("serialize remote manifest"),
+            Some(signed.signature),
+        )
+        .await;
+        let fixture = TestFixture::new_with_remote_url_and_public_key(
+            "plan-iris-nvidium-exclusion",
+            Some(remote_url),
+            Some(signed.public_key),
+        );
+        let Json(status) = handle_rules_refresh(State(fixture.state.clone()))
+            .await
+            .expect("remote manifest should refresh");
+        assert_eq!(status.rule_source, croopor_performance::RuleSource::Remote);
+        let instance_id = fixture.add_instance("Managed", "1.20.4-fabric");
+        let mods_dir = fixture
+            .state
+            .instances()
+            .game_dir(&instance_id)
+            .join("mods");
+        fs::create_dir_all(&mods_dir).expect("create mods dir");
+        fs::write(mods_dir.join("iris-mc1.20.1-1.7.0.jar"), b"iris").expect("write iris jar");
+
+        let Json(response) = handle_plan(
+            State(fixture.state.clone()),
+            Query(PlanQuery {
+                game_version: Some("1.20.4".to_string()),
+                loader: Some("fabric".to_string()),
+                mode: Some("managed".to_string()),
+                instance_id: Some(instance_id),
+            }),
+        )
+        .await
+        .expect("instance-scoped plan should serialize");
+
+        assert!(
+            response
+                .plan
+                .mods
+                .iter()
+                .all(|managed_mod| managed_mod.slug != "nvidium")
+        );
+        assert!(
+            response.plan.warnings.iter().any(|warning| {
+                warning == "nvidium skipped: incompatible with managed mod iris"
+            })
+        );
     }
 
     #[tokio::test]
@@ -2314,6 +2488,20 @@ mod tests {
     struct SignedRulesResponse {
         public_key: String,
         signature: String,
+    }
+
+    fn nvidium_always_manifest(generated_at: &str) -> croopor_performance::Manifest {
+        let mut manifest = croopor_performance::builtin_manifest().expect("builtin manifest");
+        manifest.generated_at = generated_at.to_string();
+        for composition in &mut manifest.compositions {
+            for managed_mod in &mut composition.mods {
+                if managed_mod.slug == "nvidium" {
+                    managed_mod.condition = croopor_performance::types::ModCondition::Always;
+                    managed_mod.hardware_req = None;
+                }
+            }
+        }
+        manifest
     }
 
     fn signed_rules_response(manifest: &croopor_performance::Manifest) -> SignedRulesResponse {
