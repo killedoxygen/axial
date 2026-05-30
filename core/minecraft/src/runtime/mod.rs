@@ -1,9 +1,11 @@
 use crate::launch::JavaVersion;
 use crate::paths::runtime_dirs;
 use serde::{Deserialize, Serialize};
+use sha1::{Digest as _, Sha1};
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, OnceLock};
@@ -522,83 +524,318 @@ async fn install_managed_runtime(
     fs::write(temp_dir.join(".croopor-installing"), b"installing")
         .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
 
-    let all_runtimes = fetch_runtime_json::<RuntimeManifest>(RUNTIME_MANIFEST_URL).await?;
+    let install_result = async {
+        let all_runtimes = fetch_runtime_json::<RuntimeManifest>(RUNTIME_MANIFEST_URL).await?;
 
-    let os_runtimes = all_runtimes.get(&os_arch).ok_or_else(|| {
-        JavaRuntimeLookupError::Download(format!("no runtimes available for {os_arch}"))
-    })?;
-    let entries = os_runtimes.get(component.as_str()).ok_or_else(|| {
-        JavaRuntimeLookupError::Download(format!(
-            "runtime {} is not available for {os_arch}",
-            component.as_str()
-        ))
-    })?;
-    let manifest_url = entries
-        .first()
-        .map(|entry| entry.manifest.url.as_str())
-        .ok_or_else(|| {
+        let os_runtimes = all_runtimes.get(&os_arch).ok_or_else(|| {
+            JavaRuntimeLookupError::Download(format!("no runtimes available for {os_arch}"))
+        })?;
+        let entries = os_runtimes.get(component.as_str()).ok_or_else(|| {
             JavaRuntimeLookupError::Download(format!(
-                "runtime {} has no downloadable manifest for {os_arch}",
+                "runtime {} is not available for {os_arch}",
                 component.as_str()
             ))
         })?;
+        let manifest_url = entries
+            .first()
+            .map(|entry| entry.manifest.url.clone())
+            .ok_or_else(|| {
+                JavaRuntimeLookupError::Download(format!(
+                    "runtime {} has no downloadable manifest for {os_arch}",
+                    component.as_str()
+                ))
+            })?;
 
-    let component_manifest = fetch_runtime_json::<ComponentManifest>(manifest_url).await?;
+        let component_manifest = fetch_runtime_json::<ComponentManifest>(&manifest_url).await?;
 
-    for (relative_path, file) in component_manifest.files {
-        let destination = temp_dir.join(relative_path.replace('/', std::path::MAIN_SEPARATOR_STR));
-        if file.kind == "directory" {
-            fs::create_dir_all(&destination)
-                .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
-            continue;
-        }
-        if file.kind != "file" {
-            continue;
-        }
-        let Some(raw) = file.downloads.and_then(|downloads| downloads.raw) else {
-            continue;
-        };
-
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+        for (relative_path, file) in component_manifest.files {
+            install_runtime_manifest_file(&temp_dir, &relative_path, file).await?;
         }
 
-        let bytes = fetch_runtime_bytes(&raw.url).await?;
-        let temp_path = destination.with_extension("tmp");
-        fs::write(&temp_path, &bytes)
-            .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
-        fs::rename(&temp_path, &destination)
-            .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
-        #[cfg(unix)]
-        if file.executable {
-            use std::os::unix::fs::PermissionsExt;
-
-            let metadata = fs::metadata(&destination)
-                .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
-            let mut permissions = metadata.permissions();
-            permissions.set_mode(0o755);
-            fs::set_permissions(&destination, permissions)
-                .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+        let java_exe = java_executable(&temp_dir);
+        if !runtime_executable_ready(&java_exe) {
+            return Err(JavaRuntimeLookupError::Download(format!(
+                "installed runtime {} is incomplete",
+                component.as_str()
+            )));
         }
+
+        Ok(())
     }
+    .await;
 
-    let java_exe = java_executable(&temp_dir);
-    if !runtime_executable_ready(&java_exe) {
+    if let Err(error) = install_result {
         let _ = fs::remove_dir_all(&temp_dir);
-        return Err(JavaRuntimeLookupError::Download(format!(
-            "installed runtime {} is incomplete",
-            component.as_str()
-        )));
+        return Err(error);
     }
 
     let _ = fs::remove_file(temp_dir.join(".croopor-installing"));
-    fs::write(temp_dir.join(".croopor-ready"), b"ready")
-        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
-    fs::rename(&temp_dir, dest_dir)
-        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+    if let Err(error) = fs::write(temp_dir.join(".croopor-ready"), b"ready") {
+        let _ = fs::remove_dir_all(&temp_dir);
+        return Err(JavaRuntimeLookupError::Download(error.to_string()));
+    }
+    if let Err(error) = fs::rename(&temp_dir, dest_dir) {
+        let _ = fs::remove_dir_all(&temp_dir);
+        return Err(JavaRuntimeLookupError::Download(error.to_string()));
+    }
 
     Ok(())
+}
+
+async fn install_runtime_manifest_file(
+    temp_dir: &Path,
+    relative_path: &str,
+    file: ComponentManifestFile,
+) -> Result<(), JavaRuntimeLookupError> {
+    let destination = component_manifest_destination(temp_dir, relative_path)?;
+    if file.kind == "directory" {
+        fs::create_dir_all(&destination)
+            .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+        return Ok(());
+    }
+    if file.kind != "file" {
+        return Ok(());
+    }
+    let Some(raw) = file.downloads.and_then(|downloads| downloads.raw) else {
+        return Ok(());
+    };
+
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+    }
+
+    let temp_path = runtime_download_temp_path(&destination);
+    let expected = RuntimeDownloadEvidence::from(&raw);
+    fetch_runtime_file(&raw.url, &temp_path, expected, relative_path).await?;
+    if let Err(error) = fs::rename(&temp_path, &destination) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(JavaRuntimeLookupError::Download(error.to_string()));
+    }
+    #[cfg(unix)]
+    if file.executable {
+        use std::os::unix::fs::PermissionsExt;
+
+        let metadata = fs::metadata(&destination)
+            .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&destination, permissions)
+            .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+    }
+
+    Ok(())
+}
+
+fn component_manifest_destination(
+    temp_dir: &Path,
+    relative_path: &str,
+) -> Result<PathBuf, JavaRuntimeLookupError> {
+    if relative_path.is_empty() || has_unsafe_path_component(Path::new(relative_path)) {
+        return Err(JavaRuntimeLookupError::Download(format!(
+            "unsafe runtime manifest path: {}",
+            bounded_manifest_file_label(relative_path)
+        )));
+    }
+
+    let mut destination = temp_dir.to_path_buf();
+    for segment in relative_path.split(['/', '\\']) {
+        if segment.is_empty()
+            || segment.contains(':')
+            || has_unsafe_path_component(Path::new(segment))
+        {
+            return Err(JavaRuntimeLookupError::Download(format!(
+                "unsafe runtime manifest path: {}",
+                bounded_manifest_file_label(relative_path)
+            )));
+        }
+        destination.push(segment);
+    }
+
+    Ok(destination)
+}
+
+fn has_unsafe_path_component(path: &Path) -> bool {
+    path.components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+}
+
+fn runtime_download_temp_path(destination: &Path) -> PathBuf {
+    let mut name = destination
+        .file_name()
+        .unwrap_or_else(|| OsStr::new("runtime-download"))
+        .to_os_string();
+    name.push(".croopor-tmp");
+    destination.with_file_name(name)
+}
+
+async fn fetch_runtime_file(
+    url: &str,
+    temp_path: &Path,
+    expected: RuntimeDownloadEvidence,
+    relative_path: &str,
+) -> Result<(), JavaRuntimeLookupError> {
+    let url = url.to_string();
+    let temp_path = temp_path.to_path_buf();
+    let relative_path = relative_path.to_string();
+    let cleanup_path = temp_path.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        stream_runtime_file_to_temp(&url, &temp_path, &expected, &relative_path)
+    })
+    .await
+    .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+
+    if result.is_err() {
+        let _ = fs::remove_file(cleanup_path);
+    }
+
+    result
+}
+
+fn stream_runtime_file_to_temp(
+    url: &str,
+    temp_path: &Path,
+    expected: &RuntimeDownloadEvidence,
+    relative_path: &str,
+) -> Result<(), JavaRuntimeLookupError> {
+    let response = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(300))
+        .user_agent("croopor/0.3")
+        .build()
+        .get(url)
+        .call()
+        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+    let mut reader = response.into_reader();
+    let mut output = fs::File::create(temp_path)
+        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+    let mut hasher = Sha1::new();
+    let mut actual_size = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        output
+            .write_all(&buffer[..read])
+            .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+        hasher.update(&buffer[..read]);
+        actual_size += read as u64;
+    }
+    output
+        .sync_all()
+        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+
+    let actual = RuntimeDownloadActual {
+        size: actual_size,
+        sha1: format!("{:x}", hasher.finalize()),
+    };
+    verify_runtime_download(relative_path, expected, &actual)
+        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeDownloadEvidence {
+    size: Option<u64>,
+    sha1: Option<String>,
+}
+
+impl From<&ComponentManifestDownload> for RuntimeDownloadEvidence {
+    fn from(download: &ComponentManifestDownload) -> Self {
+        Self {
+            size: download.size,
+            sha1: download.sha1.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeDownloadActual {
+    size: u64,
+    sha1: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RuntimeDownloadIntegrityError {
+    SizeMismatch {
+        file: String,
+        expected: u64,
+        actual: u64,
+    },
+    Sha1Mismatch {
+        file: String,
+        expected: String,
+        actual: String,
+    },
+}
+
+impl std::fmt::Display for RuntimeDownloadIntegrityError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SizeMismatch {
+                file,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "runtime file {file} size mismatch: expected {expected}, got {actual}"
+            ),
+            Self::Sha1Mismatch {
+                file,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "runtime file {file} sha1 mismatch: expected {expected}, got {actual}"
+            ),
+        }
+    }
+}
+
+fn verify_runtime_download(
+    relative_path: &str,
+    expected: &RuntimeDownloadEvidence,
+    actual: &RuntimeDownloadActual,
+) -> Result<(), RuntimeDownloadIntegrityError> {
+    let file = bounded_manifest_file_label(relative_path);
+    if let Some(expected_size) = expected.size
+        && actual.size != expected_size
+    {
+        return Err(RuntimeDownloadIntegrityError::SizeMismatch {
+            file,
+            expected: expected_size,
+            actual: actual.size,
+        });
+    }
+
+    if let Some(expected_sha1) = expected.sha1.as_deref() {
+        let expected_sha1 = expected_sha1.trim();
+        if !actual.sha1.eq_ignore_ascii_case(expected_sha1) {
+            return Err(RuntimeDownloadIntegrityError::Sha1Mismatch {
+                file,
+                expected: expected_sha1.to_string(),
+                actual: actual.sha1.clone(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn bounded_manifest_file_label(relative_path: &str) -> String {
+    const MAX_LABEL_CHARS: usize = 120;
+    let sanitized = relative_path.replace(['\r', '\n'], "?");
+    let mut chars = sanitized.chars();
+    let label = chars.by_ref().take(MAX_LABEL_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        format!("{label}...")
+    } else {
+        label
+    }
 }
 
 async fn fetch_runtime_json<T>(url: &str) -> Result<T, JavaRuntimeLookupError>
@@ -617,27 +854,6 @@ where
         response
             .into_json::<T>()
             .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))
-    })
-    .await
-    .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?
-}
-
-async fn fetch_runtime_bytes(url: &str) -> Result<Vec<u8>, JavaRuntimeLookupError> {
-    let url = url.to_string();
-    tokio::task::spawn_blocking(move || {
-        let response = ureq::AgentBuilder::new()
-            .timeout(std::time::Duration::from_secs(300))
-            .user_agent("croopor/0.3")
-            .build()
-            .get(&url)
-            .call()
-            .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
-        let mut reader = response.into_reader();
-        let mut bytes = Vec::new();
-        reader
-            .read_to_end(&mut bytes)
-            .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
-        Ok(bytes)
     })
     .await
     .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?
@@ -694,6 +910,10 @@ struct ComponentManifestDownloads {
 #[derive(Debug, Deserialize)]
 struct ComponentManifestDownload {
     url: String,
+    #[serde(default)]
+    sha1: Option<String>,
+    #[serde(default)]
+    size: Option<u64>,
 }
 
 fn java_probe_executable(java_path: &Path) -> PathBuf {
@@ -843,4 +1063,153 @@ fn runtime_config_candidates(runtime_root: &Path) -> Vec<PathBuf> {
             .join("amd64")
             .join("jvm.cfg"),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        JavaRuntimeLookupError, RuntimeDownloadActual, RuntimeDownloadEvidence,
+        RuntimeDownloadIntegrityError, component_manifest_destination, verify_runtime_download,
+    };
+    use std::path::{Path, PathBuf};
+
+    fn expected(size: Option<u64>, sha1: Option<&str>) -> RuntimeDownloadEvidence {
+        RuntimeDownloadEvidence {
+            size,
+            sha1: sha1.map(str::to_string),
+        }
+    }
+
+    fn actual(size: u64, sha1: &str) -> RuntimeDownloadActual {
+        RuntimeDownloadActual {
+            size,
+            sha1: sha1.to_string(),
+        }
+    }
+
+    fn unsafe_manifest_path_message(result: Result<PathBuf, JavaRuntimeLookupError>) -> String {
+        match result {
+            Err(JavaRuntimeLookupError::Download(message)) => message,
+            other => panic!("expected unsafe manifest path error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn component_manifest_destination_accepts_safe_nested_path() {
+        let temp_dir = Path::new("runtime-temp");
+        let destination = component_manifest_destination(temp_dir, "bin/java").unwrap();
+
+        assert_eq!(destination, temp_dir.join("bin").join("java"));
+    }
+
+    #[test]
+    fn component_manifest_destination_rejects_traversal() {
+        let temp_dir = Path::new("runtime-temp");
+        let message =
+            unsafe_manifest_path_message(component_manifest_destination(temp_dir, "bin/../java"));
+
+        assert!(message.contains("unsafe runtime manifest path"));
+        assert!(message.contains("bin/../java"));
+        assert!(!message.contains("runtime-temp"));
+    }
+
+    #[test]
+    fn component_manifest_destination_rejects_absolute_path() {
+        let temp_dir = Path::new("runtime-temp");
+        let absolute_path = if cfg!(windows) {
+            r"\Windows\System32"
+        } else {
+            "/etc/passwd"
+        };
+        let message =
+            unsafe_manifest_path_message(component_manifest_destination(temp_dir, absolute_path));
+
+        assert!(message.contains("unsafe runtime manifest path"));
+        assert!(message.contains(absolute_path));
+        assert!(!message.contains("runtime-temp"));
+    }
+
+    #[test]
+    fn component_manifest_destination_rejects_drive_like_path_with_slashes() {
+        let temp_dir = Path::new("runtime-temp");
+        let message = unsafe_manifest_path_message(component_manifest_destination(
+            temp_dir,
+            "C:/Windows/System32",
+        ));
+
+        assert!(message.contains("unsafe runtime manifest path"));
+        assert!(message.contains("C:/Windows/System32"));
+        assert!(!message.contains("runtime-temp"));
+    }
+
+    #[test]
+    fn component_manifest_destination_rejects_drive_like_path_with_backslashes() {
+        let temp_dir = Path::new("runtime-temp");
+        let message = unsafe_manifest_path_message(component_manifest_destination(
+            temp_dir,
+            r"C:\Windows\System32",
+        ));
+
+        assert!(message.contains("unsafe runtime manifest path"));
+        assert!(message.contains(r"C:\Windows\System32"));
+        assert!(!message.contains("runtime-temp"));
+    }
+
+    #[test]
+    fn runtime_download_verification_accepts_matching_metadata() {
+        let result = verify_runtime_download(
+            "bin/java",
+            &expected(Some(5), Some("AAF4C61DDCC5E8A2DABEDE0F3B482CD9AEA9434D")),
+            &actual(5, "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d"),
+        );
+
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn runtime_download_verification_rejects_size_mismatch() {
+        let result = verify_runtime_download(
+            "bin/java",
+            &expected(Some(6), None),
+            &actual(5, "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d"),
+        );
+
+        assert_eq!(
+            result,
+            Err(RuntimeDownloadIntegrityError::SizeMismatch {
+                file: "bin/java".to_string(),
+                expected: 6,
+                actual: 5,
+            })
+        );
+    }
+
+    #[test]
+    fn runtime_download_verification_rejects_sha1_mismatch() {
+        let result = verify_runtime_download(
+            "bin/java",
+            &expected(None, Some("0000000000000000000000000000000000000000")),
+            &actual(5, "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d"),
+        );
+
+        assert_eq!(
+            result,
+            Err(RuntimeDownloadIntegrityError::Sha1Mismatch {
+                file: "bin/java".to_string(),
+                expected: "0000000000000000000000000000000000000000".to_string(),
+                actual: "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn runtime_download_verification_accepts_missing_metadata() {
+        let result = verify_runtime_download(
+            "bin/java",
+            &expected(None, None),
+            &actual(5, "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d"),
+        );
+
+        assert_eq!(result, Ok(()));
+    }
 }
