@@ -656,16 +656,7 @@
 .cp-od-perf-summary-mark > svg {
   display: block;
   grid-area: 1 / 1;
-  width: 12px;
-  height: 12px;
   flex: 0 0 auto;
-  transform: translate(var(--cp-od-perf-summary-icon-x, 0), var(--cp-od-perf-summary-icon-y, 0));
-}
-.cp-od-perf-summary-mark[data-icon="check"] > svg {
-  --cp-od-perf-summary-icon-x: 0.25px;
-  --cp-od-perf-summary-icon-y: 0;
-  width: 13px;
-  height: 13px;
 }
 .cp-od-perf-summary[data-tone="ok"] .cp-od-perf-summary-mark {
   background: var(--ok);
@@ -1175,6 +1166,16 @@
       "quick"
       "details";
     gap: 12px;
+  }
+  .cp-instance-page--overview {
+    padding-bottom: 0;
+  }
+  .cp-instance-bottom {
+    position: static;
+    margin: 0 var(--cp-instance-dock-pad) 24px;
+    pointer-events: auto;
+    border-bottom: 1px solid color-mix(in oklab, var(--line) 48%, transparent);
+    border-radius: var(--r-md);
   }
   .cp-od-quick-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
