@@ -87,15 +87,7 @@ async fn handle_launch(
             )
         })?;
 
-    Ok(Json(json!({
-        "status": "launching",
-        "session_id": launched.session_id,
-        "instance_id": launched.instance_id,
-        "pid": launched.pid,
-        "launched_at": launched.launched_at,
-        "healing": launched.healing,
-        "guardian": launched.guardian,
-    })))
+    Ok(Json(launch_success_response_payload(&launched)))
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -319,16 +311,9 @@ async fn handle_benchmark_launch(
             )
         })?;
 
-    Ok(Json(json!({
-        "status": "launching",
-        "session_id": launched.session_id,
-        "instance_id": launched.instance_id,
-        "pid": launched.pid,
-        "launched_at": launched.launched_at,
-        "healing": launched.healing,
-        "guardian": launched.guardian,
-        "benchmark": benchmark_response,
-    })))
+    let mut response = launch_success_response_payload(&launched);
+    response["benchmark"] = benchmark_response;
+    Ok(Json(response))
 }
 
 async fn handle_benchmark_suite_launch(
@@ -590,17 +575,10 @@ async fn launch_benchmark_suite_run(
     )
     .map_err(internal_error)?;
 
-    Ok(json!({
-        "status": "launching",
-        "session_id": launched.session_id,
-        "instance_id": launched.instance_id,
-        "pid": launched.pid,
-        "launched_at": launched.launched_at,
-        "healing": launched.healing,
-        "guardian": launched.guardian,
-        "benchmark": benchmark_response,
-        "suite": suite_response,
-    }))
+    let mut response = launch_success_response_payload(&launched);
+    response["benchmark"] = benchmark_response;
+    response["suite"] = suite_response;
+    Ok(response)
 }
 
 async fn handle_benchmark_matrix() -> Json<matrix::BenchmarkMatrix> {
@@ -777,6 +755,20 @@ fn benchmark_status_payload(
         payload["mode"] = json!(mode);
     }
     payload
+}
+
+fn launch_success_response_payload(launched: &runner::LaunchSuccess) -> serde_json::Value {
+    json!({
+        "status": "launching",
+        "session_id": &launched.session_id,
+        "instance_id": &launched.instance_id,
+        "pid": launched.pid,
+        "launched_at": &launched.launched_at,
+        "max_memory_mb": launched.max_memory_mb,
+        "min_memory_mb": launched.min_memory_mb,
+        "healing": &launched.healing,
+        "guardian": &launched.guardian,
+    })
 }
 
 fn benchmark_suite_mode_or_default(
@@ -1336,6 +1328,24 @@ mod tests {
         .expect_err("old benchmark metadata request fields should be rejected");
 
         assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn launch_success_response_payload_exposes_effective_memory() {
+        let payload = launch_success_response_payload(&runner::LaunchSuccess {
+            session_id: "session-1".to_string(),
+            instance_id: "instance-1".to_string(),
+            pid: 1234,
+            launched_at: "2026-05-30T00:00:00Z".to_string(),
+            max_memory_mb: 6144,
+            min_memory_mb: 1024,
+            healing: None,
+            guardian: None,
+        });
+
+        assert_eq!(payload["status"], serde_json::json!("launching"));
+        assert_eq!(payload["max_memory_mb"], serde_json::json!(6144));
+        assert_eq!(payload["min_memory_mb"], serde_json::json!(1024));
     }
 
     #[test]

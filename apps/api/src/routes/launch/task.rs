@@ -748,6 +748,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn omitted_request_memory_uses_backend_derived_defaults_for_fresh_builtin_global() {
+        let fixture = TestFixture::new("prepare-derived-memory-defaults");
+        let instance_id = fixture.add_instance("Modded", "fabric-loader-0.16.10-1.21.1");
+        let config = fixture.state.config().current();
+        let expected_defaults = policy::derived_launch_memory_defaults(
+            &fixture
+                .state
+                .instances()
+                .get(&instance_id)
+                .expect("instance"),
+            &config,
+            None,
+            None,
+            capture_launch_memory_evidence().host_total_memory_mb,
+        );
+
+        let prepared = fixture
+            .prepare_with_memory(instance_id, None, None)
+            .await
+            .expect("prepare launch session");
+
+        if let Some(defaults) = expected_defaults {
+            assert_eq!(prepared.task.intent.max_memory_mb, defaults.max_memory_mb);
+            assert_eq!(prepared.task.intent.min_memory_mb, defaults.min_memory_mb);
+            assert_ne!(
+                prepared.task.intent.min_memory_mb,
+                AppConfig::default().min_memory_mb
+            );
+        } else {
+            assert_eq!(prepared.task.intent.max_memory_mb, config.max_memory_mb);
+            assert_eq!(prepared.task.intent.min_memory_mb, config.min_memory_mb);
+        }
+    }
+
+    #[tokio::test]
     async fn custom_mode_with_java_override_warns_before_queue() {
         let fixture = TestFixture::new("prepare-custom-java-warning");
         fixture.set_guardian_mode("custom");

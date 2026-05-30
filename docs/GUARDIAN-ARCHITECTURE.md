@@ -197,6 +197,7 @@ Current launcher behavior:
 - `guidance` and `interventions` remain serialized as current bounded diagnostics
 - Healing remains supporting detail for runtime-adjustment specifics and retry/fallback context
 - live launch stage records preserve bounded unique Guardian `details` for `warned`, `intervened`, and `blocked` status payloads before appending Healing warnings without duplicates; Healing `fallback_applied` remains the only source of stage fallback reasons
+- normal frontend launches do not run a separate pre-launch memory-pressure confirmation; backend preparation selects effective memory, Guardian owns memory warnings, and successful launch responses carry the selected `max_memory_mb` and `min_memory_mb`
 
 ## Invariants
 - one launch-safety authority: Guardian

@@ -1,21 +1,20 @@
 import { api, apiUrl } from './api';
 import { Sound } from './sound';
 import { Music } from './music';
-import { fmtMem, showError, appendLog, errMessage } from './utils';
-import { showConfirm } from './ui/Dialog';
+import { showError, appendLog, errMessage } from './utils';
 import {
   hasNativeDesktopRuntime, nativeLaunchLogEventName, nativeLaunchStatusEventName,
   onNativeEvent, startNativeLaunchEvents,
 } from './native';
 import {
-  config, launchState, runningSessions, selectedInstance, selectedVersion, systemInfo, instanceLaunchDrafts,
+  config, launchState, runningSessions, selectedInstance, selectedVersion, instanceLaunchDrafts,
 } from './store';
 import {
   clearLaunchNotice, confirmLaunch, endLaunchPrep, endSession, setLaunchNotice, startLaunch,
   updateInstanceInList, updateLaunchPrep, updateLaunchPrepStage, updateRunningSessionState,
 } from './actions';
 import { launchStageView, type LaunchStage } from './launch-stages';
-import type { GuardianSummary, HealingEvent, LaunchHealingSummary } from './types';
+import type { Config, GuardianSummary, HealingEvent, Instance, LaunchHealingSummary } from './types';
 
 const PRE_RESPONSE_STAGE_CAP_PCT = 87;
 const PRE_RESPONSE_STAGE_TICKS: Array<{ atMs: number; stage: LaunchStage }> = [
@@ -344,6 +343,13 @@ function surfaceLaunchOutcome(
   return true;
 }
 
+function selectedLaunchMaxMemoryMB(response: any, inst: Instance, cfg: Config | null): number {
+  if (typeof response?.max_memory_mb === 'number' && response.max_memory_mb > 0) return response.max_memory_mb;
+  if (typeof inst.max_memory_mb === 'number' && inst.max_memory_mb > 0) return inst.max_memory_mb;
+  if (typeof cfg?.max_memory_mb === 'number' && cfg.max_memory_mb > 0) return cfg.max_memory_mb;
+  return 4096;
+}
+
 export async function launchGame(): Promise<void> {
   const inst = selectedInstance.value;
   const version = selectedVersion.value;
@@ -353,20 +359,6 @@ export async function launchGame(): Promise<void> {
 
   const cfg = config.value;
   const username = cfg?.username || 'Player';
-  const maxMemMB = cfg?.max_memory_mb || 4096;
-
-  const activeSessions = Object.values(runningSessions.value);
-  if (activeSessions.length > 0) {
-    const totalMB = systemInfo.value?.total_memory_mb || 0;
-    const allocatedMB = activeSessions.reduce((sum, session) => sum + (session.allocatedMB || 0), 0);
-    if (totalMB > 0 && allocatedMB + maxMemMB > totalMB - 2048) {
-      const ok = await showConfirm(
-        `You have ${activeSessions.length} instance${activeSessions.length > 1 ? 's' : ''} running, using ~${fmtMem(allocatedMB / 1024)} of ${fmtMem(totalMB / 1024)} system RAM.\n\nLaunching with ${fmtMem(maxMemMB / 1024)} allocated may cause performance issues.`,
-        { confirmText: 'Launch Anyway' },
-      );
-      if (!ok) return;
-    }
-  }
 
   Sound.init();
 
@@ -419,7 +411,6 @@ export async function launchGame(): Promise<void> {
         return await api('POST', '/launch', {
           instance_id: launchInst.id,
           username,
-          max_memory_mb: maxMemMB,
           client_started_at_ms: Date.now(),
         });
       } finally {
@@ -448,6 +439,7 @@ export async function launchGame(): Promise<void> {
 
     updateLaunchPrep(inst.id, 72, 'Starting Minecraft', 'starting');
     const launchedAt = res.launched_at || new Date().toISOString();
+    const allocatedMB = selectedLaunchMaxMemoryMB(res, launchInst, cfg);
     updateLaunchPrep(inst.id, 88, 'Stabilizing startup', 'monitoring');
     confirmLaunch(inst.id, {
       sessionId: res.session_id,
@@ -455,7 +447,7 @@ export async function launchGame(): Promise<void> {
       pid: typeof res.pid === 'number' ? res.pid : 0,
       state: 'monitoring',
       launchedAt,
-      allocatedMB: maxMemMB,
+      allocatedMB,
       benchmark: res.benchmark,
       healing: res.healing,
       guardian: res.guardian,
@@ -477,7 +469,6 @@ export async function launchGame(): Promise<void> {
       config.value = {
         ...config.value,
         username,
-        max_memory_mb: maxMemMB,
       };
     }
   } catch (err: unknown) {

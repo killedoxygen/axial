@@ -27,6 +27,8 @@ pub(super) struct LaunchSuccess {
     pub instance_id: String,
     pub pid: u32,
     pub launched_at: String,
+    pub max_memory_mb: i32,
+    pub min_memory_mb: i32,
     pub healing: Option<croopor_launcher::LaunchHealingSummary>,
     pub guardian: Option<GuardianSummary>,
 }
@@ -360,6 +362,8 @@ pub(super) async fn launch_session(
                     instance_id: intent.instance_id.clone(),
                     pid: launched.pid.unwrap_or_default(),
                     launched_at: launched_at.clone(),
+                    max_memory_mb: intent.max_memory_mb,
+                    min_memory_mb: intent.min_memory_mb,
                     healing: prepared.healing.clone(),
                     guardian: Some(guardian.clone()),
                 });
