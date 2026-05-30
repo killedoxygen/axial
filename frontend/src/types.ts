@@ -502,9 +502,9 @@ export type PerformanceHealthStatus =
   | 'disabled'
   | 'invalid';
 
-export type PerformanceRuleSource = 'built_in';
+export type PerformanceRuleSource = 'built_in' | 'remote';
 
-export type PerformanceRuleChannel = 'bundled' | 'local';
+export type PerformanceRuleChannel = 'bundled' | 'local' | 'remote';
 
 export type PerformanceRulesValidation = 'valid' | 'invalid';
 

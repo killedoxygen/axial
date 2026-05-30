@@ -540,7 +540,9 @@ function PerformanceRulesStatusBlock({ state }: { state: RulesStatusState }): JS
   const source = status.rule_source === 'built_in' ? 'Built-in rules' : healthStateLabel(status.rule_source);
   const channel = status.rule_channel === 'bundled' ? 'bundled manifest' : healthStateLabel(status.rule_channel);
   const refresh = status.remote_refresh
-    ? `Last refreshed ${status.last_refresh_at ? formatRuleDate(status.last_refresh_at) : 'recently'}`
+    ? status.last_refresh_at
+      ? `Last refreshed ${formatRuleDate(status.last_refresh_at)}`
+      : 'Remote refresh configured, not refreshed yet'
     : 'Remote refresh off';
 
   return (

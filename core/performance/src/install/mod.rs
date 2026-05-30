@@ -1,11 +1,14 @@
 use crate::modrinth::{ModrinthClient, ModrinthError};
-use crate::resolve::{builtin_manifest, detect_hardware, resolve_plan};
-use crate::rules_cache::{RulesCacheStatus, load_or_repair_rules_cache};
+use crate::resolve::{builtin_manifest, detect_hardware, resolve_plan, validate_manifest};
+use crate::rules_cache::{
+    RulesCacheStatus, bounded_warning, load_active_rules_cache, write_remote_rules_cache,
+};
 use crate::state::{
     RollbackSnapshotSummary, StateError, list_rollback_snapshots, load_rollback_snapshot,
     load_rollback_snapshot_by_id, load_state, managed_artifact_path, remove_state,
     restore_rollback_snapshot, save_rollback_snapshot, save_state,
 };
+use crate::status::{RuleChannel, RuleSource, RulesValidation};
 use crate::types::{
     CompositionPlan, CompositionState, InstalledMod, PerformanceMode, ResolutionRequest,
 };
@@ -13,8 +16,14 @@ use chrono::Utc;
 use sha2::Digest;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use thiserror::Error;
 use tracing::warn;
+
+pub const PERFORMANCE_RULES_URL_ENV: &str = "CROOPOR_PERFORMANCE_RULES_URL";
+const REMOTE_RULES_TIMEOUT: Duration = Duration::from_secs(10);
+const REMOTE_RULES_MAX_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum InstallError {
@@ -40,34 +49,95 @@ pub enum InstallError {
     RollbackSnapshotNotFound,
 }
 
+#[derive(Debug, Error)]
+pub enum RulesRefreshError {
+    #[error("performance remote rules url is not configured")]
+    Unconfigured,
+    #[error("remote rules request failed: {0}")]
+    Request(#[from] reqwest::Error),
+    #[error("remote rules returned HTTP {0}")]
+    HttpStatus(u16),
+    #[error("remote rules response is too large")]
+    ResponseTooLarge,
+    #[error("failed to parse remote performance manifest: {0}")]
+    Parse(#[from] serde_json::Error),
+    #[error("remote performance manifest failed validation: {0}")]
+    Validation(#[from] crate::resolve::ResolveError),
+    #[error("failed to persist remote performance manifest: {0}")]
+    Cache(#[from] std::io::Error),
+}
+
 #[derive(Debug, Clone)]
 pub struct PerformanceManager {
-    manifest: crate::types::Manifest,
+    active: Arc<RwLock<ActiveRules>>,
     modrinth: ModrinthClient,
+    rules_client: reqwest::Client,
+    config_dir: Option<PathBuf>,
+    remote_rules_url: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveRules {
+    manifest: crate::types::Manifest,
+    rule_source: RuleSource,
+    rule_channel: RuleChannel,
     rules_cache: RulesCacheStatus,
+    remote_refresh: bool,
+    last_refresh_at: Option<String>,
+    validation: RulesValidation,
 }
 
 impl PerformanceManager {
     pub fn new() -> Result<Self, InstallError> {
+        let manifest = builtin_manifest()?;
         Ok(Self {
-            manifest: builtin_manifest()?,
+            active: Arc::new(RwLock::new(ActiveRules {
+                manifest,
+                rule_source: RuleSource::BuiltIn,
+                rule_channel: RuleChannel::Bundled,
+                rules_cache: RulesCacheStatus::unavailable(),
+                remote_refresh: false,
+                last_refresh_at: None,
+                validation: RulesValidation::Valid,
+            })),
             modrinth: ModrinthClient::new(),
-            rules_cache: RulesCacheStatus::unavailable(),
+            rules_client: rules_client(),
+            config_dir: None,
+            remote_rules_url: None,
         })
     }
 
     pub fn new_with_config_dir(config_dir: &Path) -> Result<Self, InstallError> {
+        Self::new_with_config_dir_and_remote_url(config_dir, configured_remote_rules_url())
+    }
+
+    pub fn new_with_config_dir_and_remote_url(
+        config_dir: &Path,
+        remote_rules_url: Option<String>,
+    ) -> Result<Self, InstallError> {
         let manifest = builtin_manifest()?;
-        let rules_cache = load_or_repair_rules_cache(config_dir, &manifest);
+        let remote_rules_url = normalize_remote_rules_url(remote_rules_url);
+        let loaded = load_active_rules_cache(config_dir, &manifest, remote_rules_url.is_some());
         Ok(Self {
-            manifest,
+            active: Arc::new(RwLock::new(ActiveRules {
+                manifest: loaded.manifest,
+                rule_source: loaded.rule_source,
+                rule_channel: loaded.rule_channel,
+                rules_cache: loaded.status,
+                remote_refresh: remote_rules_url.is_some(),
+                last_refresh_at: loaded.last_refresh_at,
+                validation: loaded.validation,
+            })),
             modrinth: ModrinthClient::new(),
-            rules_cache,
+            rules_client: rules_client(),
+            config_dir: Some(config_dir.to_path_buf()),
+            remote_rules_url,
         })
     }
 
     pub fn get_plan(&self, request: ResolutionRequest) -> CompositionPlan {
-        resolve_plan(Some(&self.manifest), request)
+        let active = self.active.read().expect("performance rules lock poisoned");
+        resolve_plan(Some(&active.manifest), request)
     }
 
     pub async fn ensure_installed(
@@ -181,16 +251,120 @@ impl PerformanceManager {
         Ok(list_rollback_snapshots(instance_mods_dir)?)
     }
 
-    pub fn manifest(&self) -> &crate::types::Manifest {
-        &self.manifest
+    pub fn manifest(&self) -> crate::types::Manifest {
+        self.active
+            .read()
+            .expect("performance rules lock poisoned")
+            .manifest
+            .clone()
     }
 
     pub fn rules_status(&self) -> crate::status::PerformanceRulesStatus {
-        crate::status::rules_status_with_cache(&self.manifest, self.rules_cache.clone())
+        let active = self.active.read().expect("performance rules lock poisoned");
+        crate::status::rules_status_for(
+            &active.manifest,
+            active.rule_source,
+            active.rule_channel,
+            active.rules_cache.clone(),
+            active.remote_refresh,
+            active.last_refresh_at.clone(),
+            active.validation,
+        )
+    }
+
+    pub async fn refresh_rules(
+        &self,
+    ) -> Result<crate::status::PerformanceRulesStatus, RulesRefreshError> {
+        let Some(config_dir) = self.config_dir.as_ref() else {
+            return Err(RulesRefreshError::Unconfigured);
+        };
+        let Some(remote_rules_url) = self.remote_rules_url.as_ref() else {
+            return Err(RulesRefreshError::Unconfigured);
+        };
+
+        match self.fetch_remote_manifest(remote_rules_url).await {
+            Ok(manifest) => match self.accept_remote_manifest(config_dir, manifest) {
+                Ok(()) => Ok(self.rules_status()),
+                Err(error) => {
+                    self.record_refresh_warning(format!("Remote rules refresh failed: {error}"));
+                    Ok(self.rules_status())
+                }
+            },
+            Err(error) => {
+                self.record_refresh_warning(format!("Remote rules refresh rejected: {error}"));
+                Ok(self.rules_status())
+            }
+        }
     }
 
     pub fn hardware(&self) -> crate::types::HardwareProfile {
         detect_hardware()
+    }
+
+    async fn fetch_remote_manifest(
+        &self,
+        remote_rules_url: &str,
+    ) -> Result<crate::types::Manifest, RulesRefreshError> {
+        let response = self
+            .rules_client
+            .get(remote_rules_url)
+            .timeout(REMOTE_RULES_TIMEOUT)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(RulesRefreshError::HttpStatus(response.status().as_u16()));
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > REMOTE_RULES_MAX_BYTES as u64)
+        {
+            return Err(RulesRefreshError::ResponseTooLarge);
+        }
+
+        let mut body = Vec::new();
+        let mut response = response;
+        while let Some(chunk) = response.chunk().await? {
+            if body.len().saturating_add(chunk.len()) > REMOTE_RULES_MAX_BYTES {
+                return Err(RulesRefreshError::ResponseTooLarge);
+            }
+            body.extend_from_slice(&chunk);
+        }
+
+        let manifest = serde_json::from_slice::<crate::types::Manifest>(&body)?;
+        validate_manifest(&manifest)?;
+        Ok(manifest)
+    }
+
+    fn accept_remote_manifest(
+        &self,
+        config_dir: &Path,
+        manifest: crate::types::Manifest,
+    ) -> Result<(), RulesRefreshError> {
+        validate_manifest(&manifest)?;
+        let rules_cache = write_remote_rules_cache(config_dir, &manifest)?;
+        let last_refresh_at = rules_cache.updated_at.clone();
+        let mut active = self
+            .active
+            .write()
+            .expect("performance rules lock poisoned");
+        *active = ActiveRules {
+            manifest,
+            rule_source: RuleSource::Remote,
+            rule_channel: RuleChannel::Remote,
+            rules_cache,
+            remote_refresh: true,
+            last_refresh_at,
+            validation: RulesValidation::Valid,
+        };
+        Ok(())
+    }
+
+    fn record_refresh_warning(&self, warning: String) {
+        let mut active = self
+            .active
+            .write()
+            .expect("performance rules lock poisoned");
+        active.rules_cache.warning = Some(bounded_warning(warning));
     }
 
     async fn install_mod(
@@ -396,6 +570,24 @@ fn replace_file_atomic(temp_path: &Path, final_path: &Path) -> Result<(), std::i
     }
 }
 
+fn configured_remote_rules_url() -> Option<String> {
+    normalize_remote_rules_url(std::env::var(PERFORMANCE_RULES_URL_ENV).ok())
+}
+
+fn normalize_remote_rules_url(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn rules_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent("croopor/0.3.1 performance-rules")
+        .timeout(REMOTE_RULES_TIMEOUT)
+        .build()
+        .expect("build performance rules client")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -516,6 +708,96 @@ mod tests {
             b"managed-v1"
         );
         assert!(load_state(&root).expect("load state").is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_uses_valid_cached_remote_rules_when_url_is_configured() {
+        let root = test_root("startup-remote-cache");
+        let builtin = builtin_manifest().expect("builtin manifest");
+        let mut remote = builtin.clone();
+        remote.generated_at = "2026-05-30T11:00:00Z".to_string();
+        write_remote_rules_cache(&root, &remote).expect("write remote cache");
+
+        let manager = PerformanceManager::new_with_config_dir_and_remote_url(
+            &root,
+            Some("https://rules.example.test/performance.json".to_string()),
+        )
+        .expect("performance manager");
+        let status = manager.rules_status();
+
+        assert_eq!(status.rule_source, RuleSource::Remote);
+        assert_eq!(status.rule_channel, RuleChannel::Remote);
+        assert!(status.remote_refresh);
+        assert!(status.last_refresh_at.is_some());
+        assert_eq!(status.generated_at, remote.generated_at);
+        assert_eq!(status.validation, RulesValidation::Valid);
+        assert!(status.warnings.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn accepted_remote_refresh_persists_and_updates_active_status() {
+        let root = test_root("accept-remote-refresh");
+        let manager = PerformanceManager::new_with_config_dir_and_remote_url(
+            &root,
+            Some("https://rules.example.test/performance.json".to_string()),
+        )
+        .expect("performance manager");
+        let mut remote = builtin_manifest().expect("builtin manifest");
+        remote.generated_at = "2026-05-30T12:00:00Z".to_string();
+
+        manager
+            .accept_remote_manifest(&root, remote.clone())
+            .expect("accept remote manifest");
+        let status = manager.rules_status();
+
+        assert_eq!(status.rule_source, RuleSource::Remote);
+        assert_eq!(status.rule_channel, RuleChannel::Remote);
+        assert_eq!(status.generated_at, remote.generated_at);
+        assert!(status.last_refresh_at.is_some());
+
+        let reloaded = crate::rules_cache::load_active_rules_cache(
+            &root,
+            &builtin_manifest().expect("builtin manifest"),
+            true,
+        );
+        assert_eq!(reloaded.rule_source, RuleSource::Remote);
+        assert_eq!(reloaded.manifest.generated_at, remote.generated_at);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejected_remote_refresh_keeps_previous_rules_and_exposes_warning() {
+        let root = test_root("reject-remote-refresh");
+        let manager = PerformanceManager::new_with_config_dir_and_remote_url(
+            &root,
+            Some("https://rules.example.test/performance.json".to_string()),
+        )
+        .expect("performance manager");
+        let before = manager.rules_status();
+        let mut invalid = manager.manifest();
+        invalid.schema_version = 99;
+
+        let error = manager
+            .accept_remote_manifest(&root, invalid)
+            .expect_err("invalid remote manifest should be rejected");
+        manager.record_refresh_warning(format!("Remote rules refresh rejected: {error}"));
+        let after = manager.rules_status();
+
+        assert_eq!(after.rule_source, before.rule_source);
+        assert_eq!(after.rule_channel, before.rule_channel);
+        assert_eq!(after.generated_at, before.generated_at);
+        assert_eq!(after.validation, RulesValidation::Valid);
+        assert!(
+            after
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("Remote rules refresh rejected"))
+        );
+
         let _ = fs::remove_dir_all(root);
     }
 

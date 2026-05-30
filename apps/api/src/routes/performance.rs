@@ -11,8 +11,8 @@ use axum::{
 use croopor_performance::InstallError;
 use croopor_performance::{
     BundleHealth, CompositionPlan, CompositionTier, PerformanceMode, PerformanceRulesStatus,
-    ResolutionRequest, RollbackSnapshotSummary, StateError, derive_health, extract_base_version,
-    infer_loader_from_version_id, load_state, parse_mode,
+    ResolutionRequest, RollbackSnapshotSummary, RulesRefreshError, StateError, derive_health,
+    extract_base_version, infer_loader_from_version_id, load_state, parse_mode,
 };
 use serde::{Deserialize, Serialize};
 
@@ -94,6 +94,10 @@ struct PerformanceOperation {
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/performance/status", get(handle_status))
+        .route(
+            "/api/v1/performance/rules/refresh",
+            post(handle_rules_refresh),
+        )
         .route("/api/v1/performance/plan", get(handle_plan))
         .route("/api/v1/performance/health", get(handle_health))
         .route("/api/v1/performance/rollback", get(handle_rollback_list))
@@ -108,6 +112,21 @@ async fn handle_status(
     State(state): State<AppState>,
 ) -> Result<Json<PerformanceRulesStatus>, (StatusCode, Json<serde_json::Value>)> {
     Ok(Json(state.performance().rules_status()))
+}
+
+async fn handle_rules_refresh(
+    State(state): State<AppState>,
+) -> Result<Json<PerformanceRulesStatus>, (StatusCode, Json<serde_json::Value>)> {
+    match state.performance().refresh_rules().await {
+        Ok(status) => Ok(Json(status)),
+        Err(RulesRefreshError::Unconfigured) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "performance remote rules url is not configured"
+            })),
+        )),
+        Err(error) => Err(internal_error(error)),
+    }
 }
 
 async fn handle_plan(
@@ -710,6 +729,7 @@ mod tests {
     use croopor_config::{AppPaths, ConfigStore, InstanceStore};
     use croopor_performance::{CompositionState, InstalledMod, PerformanceManager};
     use std::{fs, path::PathBuf, sync::Arc, time::Duration};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tower::ServiceExt;
 
     #[tokio::test]
@@ -763,6 +783,75 @@ mod tests {
             ]
         );
         assert!(response.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rules_refresh_route_requires_configured_remote_url() {
+        let fixture = TestFixture::new("rules-refresh-unconfigured");
+
+        let response = router()
+            .with_state(fixture.state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/performance/rules/refresh")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("route response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("error json");
+        assert_eq!(
+            value,
+            serde_json::json!({ "error": "performance remote rules url is not configured" })
+        );
+    }
+
+    #[tokio::test]
+    async fn rules_refresh_route_accepts_configured_remote_manifest() {
+        let mut manifest = croopor_performance::builtin_manifest().expect("builtin manifest");
+        manifest.generated_at = "2026-05-30T13:00:00Z".to_string();
+        let remote_url =
+            spawn_rules_server(serde_json::to_vec(&manifest).expect("serialize remote manifest"))
+                .await;
+        let fixture =
+            TestFixture::new_with_remote_url("rules-refresh-configured", Some(remote_url));
+
+        let response = router()
+            .with_state(fixture.state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/performance/rules/refresh")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("route response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let status: PerformanceRulesStatus =
+            serde_json::from_slice(&body).expect("rules status json");
+        assert_eq!(status.rule_source, croopor_performance::RuleSource::Remote);
+        assert_eq!(
+            status.rule_channel,
+            croopor_performance::RuleChannel::Remote
+        );
+        assert!(status.remote_refresh);
+        assert_eq!(status.generated_at, manifest.generated_at);
+        assert_eq!(
+            status.validation,
+            croopor_performance::RulesValidation::Valid
+        );
+        assert!(status.warnings.is_empty());
     }
 
     #[tokio::test]
@@ -1394,6 +1483,10 @@ mod tests {
 
     impl TestFixture {
         fn new(name: &str) -> Self {
+            Self::new_with_remote_url(name, None)
+        }
+
+        fn new_with_remote_url(name: &str, remote_rules_url: Option<String>) -> Self {
             let root = test_root(name);
             let paths = test_paths(&root);
             let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
@@ -1407,8 +1500,11 @@ mod tests {
                 installs: Arc::new(InstallStore::new()),
                 sessions: Arc::new(SessionStore::new()),
                 performance: Arc::new(
-                    PerformanceManager::new_with_config_dir(&paths.config_dir)
-                        .expect("performance manager"),
+                    PerformanceManager::new_with_config_dir_and_remote_url(
+                        &paths.config_dir,
+                        remote_rules_url,
+                    )
+                    .expect("performance manager"),
                 ),
                 frontend_dir: root.join("frontend"),
             });
@@ -1429,6 +1525,31 @@ mod tests {
                 .expect("add instance")
                 .id
         }
+    }
+
+    async fn spawn_rules_server(body: Vec<u8>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind rules server");
+        let addr = listener.local_addr().expect("rules server addr");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept rules request");
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await;
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket
+                .write_all(header.as_bytes())
+                .await
+                .expect("write rules response header");
+            socket
+                .write_all(&body)
+                .await
+                .expect("write rules response body");
+        });
+        format!("http://{addr}/rules.json")
     }
 
     impl Drop for TestFixture {

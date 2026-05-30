@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 #[serde(rename_all = "snake_case")]
 pub enum RuleSource {
     BuiltIn,
+    Remote,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -15,6 +16,7 @@ pub enum RuleSource {
 pub enum RuleChannel {
     Bundled,
     Local,
+    Remote,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +81,26 @@ pub fn rules_status_with_cache(
     manifest: &Manifest,
     rules_cache: RulesCacheStatus,
 ) -> PerformanceRulesStatus {
+    rules_status_for(
+        manifest,
+        RuleSource::BuiltIn,
+        RuleChannel::Bundled,
+        rules_cache,
+        false,
+        None,
+        RulesValidation::Valid,
+    )
+}
+
+pub fn rules_status_for(
+    manifest: &Manifest,
+    rule_source: RuleSource,
+    rule_channel: RuleChannel,
+    rules_cache: RulesCacheStatus,
+    remote_refresh: bool,
+    last_refresh_at: Option<String>,
+    validation: RulesValidation,
+) -> PerformanceRulesStatus {
     let warnings = rules_cache
         .warning
         .clone()
@@ -86,16 +108,16 @@ pub fn rules_status_with_cache(
         .unwrap_or_default();
 
     PerformanceRulesStatus {
-        rule_source: RuleSource::BuiltIn,
-        rule_channel: RuleChannel::Bundled,
+        rule_source,
+        rule_channel,
         rules_cache,
         schema_version: manifest.schema_version,
         generated_at: manifest.generated_at.clone(),
         composition_count: manifest.compositions.len(),
         family_coverage: family_coverage(manifest),
-        remote_refresh: false,
-        last_refresh_at: None,
-        validation: RulesValidation::Valid,
+        remote_refresh,
+        last_refresh_at,
+        validation,
         health_states: vec![
             BundleHealth::Healthy,
             BundleHealth::Degraded,
@@ -172,7 +194,7 @@ fn coverage_for_family(manifest: &Manifest, family: VersionFamily) -> FamilyCove
     let mut warnings = Vec::new();
     if composition_count == 0 {
         warnings.push(format!(
-            "Family {family:?} has no bundled performance composition coverage."
+            "Family {family:?} has no performance composition coverage."
         ));
     } else if managed_mod_count == 0 && tiers == vec![CompositionTier::VanillaEnhanced] {
         warnings.push(format!(
