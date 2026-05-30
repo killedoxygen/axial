@@ -23,9 +23,6 @@ export function Stepper({
 }): JSX.Element {
   const nodes: JSX.Element[] = [];
   STEP_ORDER.forEach((step, index) => {
-    if (index > 0) {
-      nodes.push(<span key={`sep-${index}`} class="cp-cr-stepper-sep" aria-hidden="true">/</span>);
-    }
     const state = index < current ? 'past' : index === current ? 'active' : 'future';
     const clickable = index !== current && index <= maxReached;
     const label = STEP_LABELS[step];

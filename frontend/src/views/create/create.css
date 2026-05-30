@@ -89,10 +89,6 @@ button.cp-cr-stepper-item:focus-visible {
 }
 .cp-cr-stepper-item[data-state="active"] .cp-cr-stepper-label { font-weight: 600; }
 
-/* Separator hidden; the pill container provides spacing.
- * Still rendered in DOM for backward-compat with the existing markup. */
-.cp-cr-stepper-sep { display: none; }
-
 /* ── Main canvas ──────────────────────────────────────────────────────── */
 
 .cp-cr-main {

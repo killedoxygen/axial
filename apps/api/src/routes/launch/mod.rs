@@ -165,8 +165,21 @@ impl BenchmarkLaunchRequest {
     fn into_launch_input(
         self,
     ) -> Result<BenchmarkLaunchInput, (StatusCode, Json<serde_json::Value>)> {
+        if self
+            .suite_mode
+            .as_deref()
+            .and_then(trimmed_string)
+            .is_some()
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(
+                    json!({ "error": "suite_mode is only supported for benchmark suite requests" }),
+                ),
+            ));
+        }
         let launch = self.launch_request()?;
-        let benchmark_mode = self.requested_benchmark_mode().map(str::to_string);
+        let benchmark_mode = self.benchmark_mode.as_deref().and_then(trimmed_string);
         Ok(BenchmarkLaunchInput {
             launch,
             profile: self.profile,
@@ -218,8 +231,21 @@ impl BenchmarkLaunchRequest {
         self,
         paths: Option<&croopor_config::AppPaths>,
     ) -> Result<BenchmarkSuitePlanInput, (StatusCode, Json<serde_json::Value>)> {
+        if self
+            .benchmark_mode
+            .as_deref()
+            .and_then(trimmed_string)
+            .is_some()
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(
+                    json!({ "error": "benchmark_mode is only supported for benchmark launch requests" }),
+                ),
+            ));
+        }
         let launch = self.launch_request()?;
-        let mode = normalized_benchmark_mode_or_default(self.requested_benchmark_mode());
+        let mode = benchmark_suite_mode_or_default(self.suite_mode.as_deref())?;
         let suite_id = self
             .suite_id
             .as_deref()
@@ -263,12 +289,6 @@ impl BenchmarkLaunchRequest {
             min_memory_mb: self.min_memory_mb,
             client_started_at_ms: self.client_started_at_ms,
         })
-    }
-
-    fn requested_benchmark_mode(&self) -> Option<&str> {
-        self.suite_mode
-            .as_deref()
-            .or(self.benchmark_mode.as_deref())
     }
 }
 
@@ -318,7 +338,7 @@ async fn handle_benchmark_suite_launch(
     let auto_next_run = payload.run_index.is_none();
     if auto_next_run {
         let launch = payload.launch_request()?;
-        let mode = normalized_benchmark_mode_or_default(payload.requested_benchmark_mode());
+        let mode = benchmark_suite_mode_or_default(payload.suite_mode.as_deref())?;
         let _ = matrix::benchmark_suite_plan(&mode).ok_or_else(unsupported_suite_mode_error)?;
         let suite_id = payload
             .suite_id
@@ -484,7 +504,8 @@ async fn resume_benchmark_suite_driver(
     } else {
         manifest.mode.as_str()
     };
-    let mode = normalized_benchmark_mode_or_default(Some(mode_source));
+    let mode =
+        normalize_benchmark_suite_mode(mode_source).ok_or_else(unsupported_suite_mode_error)?;
     let mut payload = BenchmarkLaunchRequest {
         instance_id: Some(manifest.instance_id.clone()),
         username: None,
@@ -758,14 +779,20 @@ fn benchmark_status_payload(
     payload
 }
 
-fn normalized_benchmark_mode_or_default(value: Option<&str>) -> String {
-    let value = value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("development");
-    crate::state::launch_reports::LaunchBenchmarkMetadata::new(None, None, None, Some(value))
-        .mode
-        .unwrap_or_else(|| "development".to_string())
+fn benchmark_suite_mode_or_default(
+    value: Option<&str>,
+) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok("development".to_string());
+    };
+    normalize_benchmark_suite_mode(value).ok_or_else(unsupported_suite_mode_error)
+}
+
+fn normalize_benchmark_suite_mode(value: &str) -> Option<String> {
+    match value.trim() {
+        "development" | "qualification" | "release_validation" => Some(value.trim().to_string()),
+        _ => None,
+    }
 }
 
 fn validate_benchmark_suite_run_index(
@@ -1312,19 +1339,22 @@ mod tests {
     }
 
     #[test]
-    fn benchmark_launch_request_accepts_suite_mode_alias() {
+    fn benchmark_launch_request_rejects_suite_mode_field() {
         let request: BenchmarkLaunchRequest = serde_json::from_value(serde_json::json!({
             "instance_id": " instance ",
             "suite_mode": "qual"
         }))
         .expect("deserialize benchmark launch request");
 
-        let input = request
+        let error = request
             .into_launch_input()
-            .expect("benchmark launch input should parse");
+            .expect_err("suite_mode should not be accepted by benchmark launch");
 
-        assert_eq!(input.launch.instance_id, "instance");
-        assert_eq!(input.benchmark_mode.as_deref(), Some("qual"));
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.1.0,
+            serde_json::json!({ "error": "suite_mode is only supported for benchmark suite requests" })
+        );
     }
 
     #[test]
@@ -1337,8 +1367,8 @@ mod tests {
             client_started_at_ms: Some(123),
             profile: None,
             run_type: None,
-            benchmark_mode: Some("dev".to_string()),
-            suite_mode: None,
+            benchmark_mode: None,
+            suite_mode: Some("development".to_string()),
             suite_id: None,
             run_index: Some(0),
             interval_ms: None,
@@ -1519,29 +1549,56 @@ mod tests {
     }
 
     #[test]
-    fn benchmark_suite_request_normalizes_known_mode_aliases() {
+    fn benchmark_suite_request_accepts_current_suite_mode_ids() {
         let suite_mode_request: BenchmarkLaunchRequest = serde_json::from_value(
-            serde_json::json!({ "instance_id": "instance", "suite_mode": "qual" }),
+            serde_json::json!({ "instance_id": "instance", "suite_mode": "release_validation" }),
         )
         .expect("deserialize suite_mode request");
-        let benchmark_mode_request: BenchmarkLaunchRequest = serde_json::from_value(
-            serde_json::json!({ "instance_id": "instance", "benchmark_mode": "release-validation" }),
-        )
-        .expect("deserialize benchmark_mode request");
 
         assert_eq!(
             suite_mode_request
                 .into_suite_launch_input()
                 .expect("suite mode input")
                 .mode,
-            "qualification"
-        );
-        assert_eq!(
-            benchmark_mode_request
-                .into_suite_launch_input()
-                .expect("benchmark mode input")
-                .mode,
             "release_validation"
+        );
+    }
+
+    #[test]
+    fn benchmark_suite_request_rejects_suite_mode_aliases() {
+        let request: BenchmarkLaunchRequest = serde_json::from_value(serde_json::json!({
+            "instance_id": "instance",
+            "suite_mode": "qual"
+        }))
+        .expect("deserialize suite request");
+
+        let error = request
+            .into_suite_launch_input()
+            .expect_err("suite mode alias should not be accepted");
+
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.1.0,
+            serde_json::json!({ "error": "suite_mode is not supported" })
+        );
+    }
+
+    #[test]
+    fn benchmark_suite_request_rejects_benchmark_mode_field() {
+        let request: BenchmarkLaunchRequest = serde_json::from_value(serde_json::json!({
+            "instance_id": "instance",
+            "benchmark_mode": "release_validation"
+        }))
+        .expect("deserialize suite request");
+
+        let error = request
+            .into_suite_launch_input()
+            .expect_err("benchmark_mode should not be accepted by benchmark suite requests");
+
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.1.0,
+            serde_json::json!({ "error": "benchmark_mode is only supported for benchmark launch requests" })
         );
     }
 
@@ -1650,7 +1707,7 @@ mod tests {
     async fn benchmark_suite_driver_start_status_normalizes_mode_and_clamps_interval() {
         let request: BenchmarkLaunchRequest = serde_json::from_value(serde_json::json!({
             "instance_id": "instance",
-            "suite_mode": "release-validation",
+            "suite_mode": "release_validation",
             "suite_id": "../driver suite",
             "interval_ms": 1
         }))
@@ -2273,7 +2330,7 @@ mod tests {
         let request: BenchmarkLaunchRequest = serde_json::from_value(serde_json::json!({
             "instance_id": "instance",
             "username": "SecretUser",
-            "suite_mode": "release-validation",
+            "suite_mode": "release_validation",
             "run_index": 3
         }))
         .expect("deserialize suite request");
@@ -2315,7 +2372,7 @@ mod tests {
             Some(" benchmark-1 "),
             Some(" dev-default "),
             Some(" repeat "),
-            Some("release-validation"),
+            Some("release_validation"),
         );
 
         assert_eq!(
