@@ -4,7 +4,17 @@ use crate::types::{
     VersionFamily,
 };
 use regex::Regex;
+#[cfg(target_os = "linux")]
+use std::fs;
+#[cfg(target_os = "linux")]
+use std::path::{Path, PathBuf};
+#[cfg(target_os = "windows")]
+use std::process::Command;
 use std::sync::OnceLock;
+#[cfg(target_os = "windows")]
+use std::sync::mpsc;
+#[cfg(target_os = "windows")]
+use std::time::Duration;
 use sysinfo::System;
 use thiserror::Error;
 
@@ -115,6 +125,14 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), ResolveError> {
 }
 
 pub fn detect_hardware() -> HardwareProfile {
+    static HARDWARE_PROFILE: OnceLock<HardwareProfile> = OnceLock::new();
+
+    HARDWARE_PROFILE
+        .get_or_init(detect_hardware_uncached)
+        .clone()
+}
+
+fn detect_hardware_uncached() -> HardwareProfile {
     let mut system = System::new();
     system.refresh_memory();
 
@@ -122,13 +140,244 @@ pub fn detect_hardware() -> HardwareProfile {
     let logical_cores = std::thread::available_parallelism()
         .map(|value| value.get() as i32)
         .unwrap_or(1);
+    let (gpu_vendor, gpu_arch) = detect_gpu();
 
     HardwareProfile {
         total_ram_mb,
         logical_cores,
-        gpu_vendor: String::new(),
-        gpu_arch: 0,
+        gpu_vendor,
+        gpu_arch,
     }
+}
+
+#[cfg(target_os = "linux")]
+fn detect_gpu() -> (String, i32) {
+    let mut best_vendor = String::new();
+    let Ok(entries) = fs::read_dir("/sys/class/drm") else {
+        return (best_vendor, 0);
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !is_drm_card_path(&path) {
+            continue;
+        }
+
+        let Ok(vendor_id) = fs::read_to_string(path.join("device/vendor")) else {
+            continue;
+        };
+        let Some(vendor) = gpu_vendor_from_pci_id(&vendor_id) else {
+            continue;
+        };
+
+        if vendor == "nvidia" {
+            return (vendor.to_string(), detect_nvidia_arch_linux());
+        }
+        if vendor == "amd" && best_vendor != "amd" {
+            best_vendor = vendor.to_string();
+        }
+        if vendor == "intel" && best_vendor.is_empty() {
+            best_vendor = vendor.to_string();
+        }
+    }
+
+    (best_vendor, 0)
+}
+
+#[cfg(target_os = "linux")]
+fn is_drm_card_path(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    let Some(number) = name.strip_prefix("card") else {
+        return false;
+    };
+    !number.is_empty() && number.chars().all(|character| character.is_ascii_digit())
+}
+
+#[cfg(target_os = "linux")]
+fn detect_nvidia_arch_linux() -> i32 {
+    let Ok(entries) = fs::read_dir("/proc/driver/nvidia/gpus") else {
+        return 0;
+    };
+
+    entries
+        .flatten()
+        .filter_map(|entry| nvidia_model_from_information_file(entry.path().join("information")))
+        .map(|model| nvidia_arch_from_model(&model))
+        .find(|arch| *arch > 0)
+        .unwrap_or(0)
+}
+
+#[cfg(target_os = "linux")]
+fn nvidia_model_from_information_file(path: PathBuf) -> Option<String> {
+    let contents = fs::read_to_string(path).ok()?;
+    nvidia_model_from_information(&contents)
+}
+
+#[cfg(target_os = "windows")]
+fn detect_gpu() -> (String, i32) {
+    let Some(output) = run_windows_gpu_query() else {
+        return (String::new(), 0);
+    };
+    let names = parse_windows_gpu_names(&output);
+    select_gpu_from_names(&names)
+}
+
+#[cfg(target_os = "windows")]
+fn run_windows_gpu_query() -> Option<String> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let output = Command::new("wmic")
+            .args(["path", "win32_VideoController", "get", "name"])
+            .output()
+            .ok()
+            .and_then(|output| {
+                if output.status.success() {
+                    decode_windows_command_output(&output.stdout)
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                Command::new("powershell")
+                    .args([
+                        "-NoProfile",
+                        "-Command",
+                        "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name",
+                    ])
+                    .output()
+                    .ok()
+                    .and_then(|output| {
+                        if output.status.success() {
+                            decode_windows_command_output(&output.stdout)
+                        } else {
+                            None
+                        }
+                    })
+            });
+        let _ = sender.send(output);
+    });
+
+    receiver.recv_timeout(Duration::from_secs(2)).ok().flatten()
+}
+
+#[cfg(target_os = "windows")]
+fn decode_windows_command_output(bytes: &[u8]) -> Option<String> {
+    if bytes.is_empty() {
+        return None;
+    }
+
+    let looks_utf16le = bytes.starts_with(&[0xff, 0xfe])
+        || bytes
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .take(32)
+            .filter(|byte| **byte == 0)
+            .count()
+            >= 8;
+    if looks_utf16le {
+        let mut values = Vec::with_capacity(bytes.len() / 2);
+        for pair in bytes.chunks_exact(2) {
+            values.push(u16::from_le_bytes([pair[0], pair[1]]));
+        }
+        return String::from_utf16(&values)
+            .ok()
+            .map(|value| value.trim_start_matches('\u{feff}').to_string());
+    }
+
+    String::from_utf8(bytes.to_vec()).ok()
+}
+
+#[cfg(target_os = "windows")]
+fn parse_windows_gpu_names(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.eq_ignore_ascii_case("name"))
+        .map(str::to_string)
+        .collect()
+}
+
+#[cfg(target_os = "windows")]
+fn select_gpu_from_names(names: &[String]) -> (String, i32) {
+    for vendor in ["nvidia", "amd", "intel"] {
+        if let Some(name) = names
+            .iter()
+            .find(|name| gpu_vendor_from_model_name(name) == Some(vendor))
+        {
+            let arch = if vendor == "nvidia" {
+                nvidia_arch_from_model(name)
+            } else {
+                0
+            };
+            return (vendor.to_string(), arch);
+        }
+    }
+    (String::new(), 0)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn detect_gpu() -> (String, i32) {
+    (String::new(), 0)
+}
+
+fn gpu_vendor_from_pci_id(value: &str) -> Option<&'static str> {
+    match value.trim().to_lowercase().as_str() {
+        "0x10de" => Some("nvidia"),
+        "0x1002" | "0x1022" => Some("amd"),
+        "0x8086" => Some("intel"),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn gpu_vendor_from_model_name(value: &str) -> Option<&'static str> {
+    let normalized = value.to_lowercase();
+    if normalized.contains("nvidia") || normalized.contains("geforce") || normalized.contains("rtx")
+    {
+        Some("nvidia")
+    } else if normalized.contains("amd")
+        || normalized.contains("radeon")
+        || normalized.contains("advanced micro devices")
+    {
+        Some("amd")
+    } else if normalized.contains("intel") {
+        Some("intel")
+    } else {
+        None
+    }
+}
+
+fn nvidia_model_from_information(contents: &str) -> Option<String> {
+    contents.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        if key.trim().eq_ignore_ascii_case("model") {
+            let model = value.trim();
+            if !model.is_empty() {
+                return Some(model.to_string());
+            }
+        }
+        None
+    })
+}
+
+fn nvidia_arch_from_model(model: &str) -> i32 {
+    let normalized = model.to_uppercase();
+    for (needle, arch) in [
+        ("RTX 50", 4),
+        ("RTX 40", 4),
+        ("RTX 30", 3),
+        ("RTX 20", 2),
+        ("GTX 16", 2),
+        ("GTX 10", 1),
+    ] {
+        if normalized.contains(needle) {
+            return arch;
+        }
+    }
+    0
 }
 
 pub fn resolve_plan(manifest: Option<&Manifest>, request: ResolutionRequest) -> CompositionPlan {
@@ -660,7 +909,8 @@ fn split_range_condition(condition: &str) -> (&str, &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ResolutionRequest, ResolveError, builtin_manifest, parse_mode, resolve_plan,
+        ResolutionRequest, ResolveError, builtin_manifest, gpu_vendor_from_pci_id,
+        nvidia_arch_from_model, nvidia_model_from_information, parse_mode, resolve_plan,
         validate_manifest,
     };
     use crate::types::{
@@ -734,6 +984,108 @@ mod tests {
         assert_eq!(parse_mode("vanilla"), Some(PerformanceMode::Vanilla));
         assert_eq!(parse_mode("custom"), Some(PerformanceMode::Custom));
         assert_eq!(parse_mode("invalid"), None);
+    }
+
+    #[test]
+    fn pci_vendor_ids_map_to_gpu_vendors() {
+        assert_eq!(gpu_vendor_from_pci_id("0x10de\n"), Some("nvidia"));
+        assert_eq!(gpu_vendor_from_pci_id("0X1002"), Some("amd"));
+        assert_eq!(gpu_vendor_from_pci_id("0x1022"), Some("amd"));
+        assert_eq!(gpu_vendor_from_pci_id(" 0x8086 "), Some("intel"));
+        assert_eq!(gpu_vendor_from_pci_id("0x1234"), None);
+    }
+
+    #[test]
+    fn nvidia_model_strings_infer_arch_generation() {
+        assert_eq!(nvidia_arch_from_model("NVIDIA GeForce GTX 1080"), 1);
+        assert_eq!(nvidia_arch_from_model("NVIDIA GeForce GTX 1660 Ti"), 2);
+        assert_eq!(nvidia_arch_from_model("NVIDIA GeForce RTX 2060"), 2);
+        assert_eq!(nvidia_arch_from_model("NVIDIA GeForce RTX 3080"), 3);
+        assert_eq!(nvidia_arch_from_model("NVIDIA GeForce RTX 4090"), 4);
+        assert_eq!(nvidia_arch_from_model("NVIDIA GeForce RTX 5090"), 4);
+        assert_eq!(nvidia_arch_from_model("NVIDIA Quadro P2000"), 0);
+    }
+
+    #[test]
+    fn nvidia_proc_information_parser_reads_model_line() {
+        assert_eq!(
+            nvidia_model_from_information(
+                "Model: \t\t NVIDIA GeForce RTX 3080\nIRQ: 54\nGPU UUID: GPU-test\n"
+            )
+            .as_deref(),
+            Some("NVIDIA GeForce RTX 3080")
+        );
+        assert_eq!(nvidia_model_from_information("IRQ: 54\n"), None);
+    }
+
+    #[test]
+    fn nvidium_requires_nvidia_turing_or_newer() {
+        for (hardware, expected_included) in [
+            (
+                HardwareProfile {
+                    gpu_vendor: "nvidia".to_string(),
+                    gpu_arch: 2,
+                    ..HardwareProfile::default()
+                },
+                true,
+            ),
+            (
+                HardwareProfile {
+                    gpu_vendor: "nvidia".to_string(),
+                    gpu_arch: 3,
+                    ..HardwareProfile::default()
+                },
+                true,
+            ),
+            (
+                HardwareProfile {
+                    gpu_vendor: "nvidia".to_string(),
+                    gpu_arch: 1,
+                    ..HardwareProfile::default()
+                },
+                false,
+            ),
+            (
+                HardwareProfile {
+                    gpu_vendor: "nvidia".to_string(),
+                    gpu_arch: 0,
+                    ..HardwareProfile::default()
+                },
+                false,
+            ),
+            (
+                HardwareProfile {
+                    gpu_vendor: "amd".to_string(),
+                    gpu_arch: 0,
+                    ..HardwareProfile::default()
+                },
+                false,
+            ),
+        ] {
+            let plan = resolve_plan(
+                Some(&builtin_manifest().expect("manifest")),
+                ResolutionRequest {
+                    game_version: "1.20.4".to_string(),
+                    loader: "fabric".to_string(),
+                    mode: PerformanceMode::Managed,
+                    hardware,
+                    installed_mods: Vec::new(),
+                },
+            );
+
+            assert_eq!(
+                plan.mods
+                    .iter()
+                    .any(|managed_mod| managed_mod.slug == "nvidium"),
+                expected_included
+            );
+            assert_eq!(
+                plan.warnings
+                    .iter()
+                    .any(|warning| warning == "nvidium skipped: no NVIDIA Turing+ GPU detected"),
+                !expected_included
+            );
+        }
     }
 
     #[test]
