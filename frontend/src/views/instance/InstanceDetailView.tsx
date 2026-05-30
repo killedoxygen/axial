@@ -337,6 +337,15 @@ function performanceSummary(
   const healthText = health ? `bundle ${healthLabel(health.health)}` : 'health not checked';
   const warning = health?.warnings?.[0] || plan.warnings?.[0] || plan.fallback_reason || '';
 
+  if (health?.health === 'fallback') {
+    const fallbackTier = health.tier ? compositionTierLabel(health.tier) : 'Managed';
+    return {
+      tone: healthTone(health.health),
+      title: `${fallbackTier} fallback`,
+      detail: warning || `Croopor safely lowered the requested ${tier} plan.`,
+    };
+  }
+
   return {
     tone: healthTone(health?.health),
     title: `${tier} plan`,
