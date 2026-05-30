@@ -1204,6 +1204,99 @@ mod tests {
     }
 
     #[test]
+    fn forge_family_e_and_f_resolve_extended_then_core_when_extended_disabled() {
+        for (
+            game_version,
+            expected_family,
+            extended_composition_id,
+            core_composition_id,
+            vanilla_composition_id,
+        ) in [
+            (
+                "1.20.1",
+                VersionFamily::E,
+                "family-e-forge-extended",
+                "family-e-forge-core",
+                "family-e-vanilla-enhanced",
+            ),
+            (
+                "1.20.4",
+                VersionFamily::F,
+                "family-f-forge-extended",
+                "family-f-forge-core",
+                "family-f-vanilla-enhanced",
+            ),
+        ] {
+            for loader in ["forge", "neoforge"] {
+                let manifest = builtin_manifest().expect("manifest");
+                let plan = resolve_plan(
+                    Some(&manifest),
+                    ResolutionRequest {
+                        game_version: game_version.to_string(),
+                        loader: loader.to_string(),
+                        mode: PerformanceMode::Managed,
+                        hardware: HardwareProfile::default(),
+                        installed_mods: Vec::new(),
+                    },
+                );
+
+                assert_eq!(plan.composition_id, extended_composition_id);
+                assert_eq!(plan.family, expected_family);
+                assert_eq!(plan.loader, loader);
+                assert_eq!(plan.tier, CompositionTier::Extended);
+                assert_eq!(
+                    plan.fallback_chain,
+                    vec![
+                        core_composition_id.to_string(),
+                        vanilla_composition_id.to_string()
+                    ]
+                );
+                assert_eq!(count_mods_with_slug(&plan.mods, "embeddium"), 1);
+                assert_eq!(count_mods_with_slug(&plan.mods, "ferrite-core"), 1);
+
+                let mut disabled_manifest = builtin_manifest().expect("manifest");
+                disabled_manifest
+                    .emergency_disables
+                    .push(test_composition_disable(
+                        "hold-forge-extended",
+                        extended_composition_id,
+                    ));
+
+                let fallback_plan = resolve_plan(
+                    Some(&disabled_manifest),
+                    ResolutionRequest {
+                        game_version: game_version.to_string(),
+                        loader: loader.to_string(),
+                        mode: PerformanceMode::Managed,
+                        hardware: HardwareProfile::default(),
+                        installed_mods: Vec::new(),
+                    },
+                );
+
+                assert_eq!(fallback_plan.composition_id, core_composition_id);
+                assert_eq!(fallback_plan.family, expected_family);
+                assert_eq!(fallback_plan.loader, loader);
+                assert_eq!(fallback_plan.tier, CompositionTier::Core);
+                assert_eq!(
+                    fallback_plan.fallback_chain,
+                    vec![vanilla_composition_id.to_string()]
+                );
+                assert_eq!(count_mods_with_slug(&fallback_plan.mods, "embeddium"), 1);
+                assert_eq!(count_mods_with_slug(&fallback_plan.mods, "ferrite-core"), 1);
+                assert_eq!(
+                    fallback_plan.fallback_reason,
+                    "a higher-tier managed composition is temporarily disabled"
+                );
+                let expected_warning =
+                    format!("{extended_composition_id} skipped by emergency disable");
+                assert!(fallback_plan.warnings.iter().any(|warning| {
+                    warning.contains(&expected_warning) && warning.contains("Temporary hold.")
+                }));
+            }
+        }
+    }
+
+    #[test]
     fn family_e_fabric_fallback_does_not_include_family_f_core_additions() {
         let mut manifest = builtin_manifest().expect("manifest");
         manifest.emergency_disables.push(test_composition_disable(

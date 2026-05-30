@@ -126,13 +126,26 @@
       "families": ["E"],
       "loaders": ["forge", "neoforge"],
       "tier": "extended",
-      "fallback_to": "family-e-vanilla-enhanced",
+      "fallback_to": "family-e-forge-core",
       "mods": [
         {"artifact_id": "embeddium", "project_id": "embeddium", "slug": "embeddium", "name": "Embeddium", "condition": "always"},
         {"artifact_id": "ferrite-core", "project_id": "ferrite-core", "slug": "ferrite-core", "name": "FerriteCore", "condition": "always"},
         {"artifact_id": "entityculling", "project_id": "entityculling", "slug": "entityculling", "name": "EntityCulling", "condition": "always"},
         {"artifact_id": "memoryleakfix", "project_id": "memoryleakfix", "slug": "memoryleakfix", "name": "MemoryLeakFix", "condition": "always"},
         {"artifact_id": "clumps", "project_id": "clumps", "slug": "clumps", "name": "Clumps", "condition": "always"}
+      ]
+    },
+    {
+      "id": "family-e-forge-core",
+      "display_name": "Family E Forge Core",
+      "description": "Core managed composition for 1.16-1.20.1 Forge and NeoForge",
+      "families": ["E"],
+      "loaders": ["forge", "neoforge"],
+      "tier": "core",
+      "fallback_to": "family-e-vanilla-enhanced",
+      "mods": [
+        {"artifact_id": "embeddium", "project_id": "embeddium", "slug": "embeddium", "name": "Embeddium", "condition": "always"},
+        {"artifact_id": "ferrite-core", "project_id": "ferrite-core", "slug": "ferrite-core", "name": "FerriteCore", "condition": "always"}
       ]
     },
     {
@@ -201,13 +214,26 @@
       "families": ["F"],
       "loaders": ["forge", "neoforge"],
       "tier": "extended",
-      "fallback_to": "family-f-vanilla-enhanced",
+      "fallback_to": "family-f-forge-core",
       "mods": [
         {"artifact_id": "embeddium", "project_id": "embeddium", "slug": "embeddium", "name": "Embeddium", "condition": "always"},
         {"artifact_id": "ferrite-core", "project_id": "ferrite-core", "slug": "ferrite-core", "name": "FerriteCore", "condition": "always"},
         {"artifact_id": "entityculling", "project_id": "entityculling", "slug": "entityculling", "name": "EntityCulling", "condition": "always"},
         {"artifact_id": "memoryleakfix", "project_id": "memoryleakfix", "slug": "memoryleakfix", "name": "MemoryLeakFix", "condition": "always"},
         {"artifact_id": "clumps", "project_id": "clumps", "slug": "clumps", "name": "Clumps", "condition": "always"}
+      ]
+    },
+    {
+      "id": "family-f-forge-core",
+      "display_name": "Family F Forge Core",
+      "description": "Core managed composition for 1.20.2+ Forge and NeoForge",
+      "families": ["F"],
+      "loaders": ["forge", "neoforge"],
+      "tier": "core",
+      "fallback_to": "family-f-vanilla-enhanced",
+      "mods": [
+        {"artifact_id": "embeddium", "project_id": "embeddium", "slug": "embeddium", "name": "Embeddium", "condition": "always"},
+        {"artifact_id": "ferrite-core", "project_id": "ferrite-core", "slug": "ferrite-core", "name": "FerriteCore", "condition": "always"}
       ]
     }
   ]
