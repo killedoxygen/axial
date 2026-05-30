@@ -99,6 +99,7 @@ async fn handle_launch(
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BenchmarkLaunchRequest {
     #[serde(default)]
     instance_id: Option<String>,
@@ -106,9 +107,9 @@ struct BenchmarkLaunchRequest {
     pub max_memory_mb: Option<i32>,
     pub min_memory_mb: Option<i32>,
     pub client_started_at_ms: Option<i64>,
-    #[serde(default, alias = "benchmark_profile")]
+    #[serde(default)]
     pub profile: Option<String>,
-    #[serde(default, alias = "benchmark_run_type")]
+    #[serde(default)]
     pub run_type: Option<String>,
     #[serde(default)]
     pub benchmark_mode: Option<String>,
@@ -1296,6 +1297,18 @@ mod tests {
             error.1.0,
             serde_json::json!({ "error": "instance_id is required" })
         );
+    }
+
+    #[test]
+    fn benchmark_launch_request_rejects_old_benchmark_metadata_fields() {
+        let error = serde_json::from_value::<BenchmarkLaunchRequest>(serde_json::json!({
+            "instance_id": "instance",
+            "benchmark_profile": "dev",
+            "benchmark_run_type": "repeat"
+        }))
+        .expect_err("old benchmark metadata request fields should be rejected");
+
+        assert!(error.to_string().contains("unknown field"));
     }
 
     #[test]

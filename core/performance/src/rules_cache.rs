@@ -38,7 +38,7 @@ where
 #[serde(rename_all = "snake_case")]
 pub enum RulesCacheState {
     Recorded,
-    Recovered,
+    Invalid,
     Unavailable,
 }
 
@@ -76,6 +76,26 @@ impl RulesCacheStatus {
         self.warning = Some(bounded_warning(warning.into()));
         self
     }
+
+    fn invalid(loaded_at: String, warning: impl Into<String>) -> Self {
+        Self {
+            recorded: false,
+            state: RulesCacheState::Invalid,
+            updated_at: None,
+            loaded_at: Some(loaded_at),
+            warning: Some(bounded_warning(warning.into())),
+        }
+    }
+
+    fn unavailable_with_warning(loaded_at: String, warning: impl Into<String>) -> Self {
+        Self {
+            recorded: false,
+            state: RulesCacheState::Unavailable,
+            updated_at: None,
+            loaded_at: Some(loaded_at),
+            warning: Some(bounded_warning(warning.into())),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,7 +119,7 @@ pub fn load_active_rules_cache(
     verifier: &RemoteRulesVerifier,
 ) -> LoadedRulesCache {
     if !remote_enabled {
-        let status = load_or_repair_rules_cache(config_dir, builtin_manifest);
+        let status = load_or_create_rules_cache(config_dir, builtin_manifest);
         return LoadedRulesCache {
             manifest: builtin_manifest.clone(),
             rule_source: RuleSource::BuiltIn,
@@ -111,7 +131,7 @@ pub fn load_active_rules_cache(
     }
 
     if let Some(warning) = verifier.acceptance_warning() {
-        let mut status = load_or_repair_rules_cache(config_dir, builtin_manifest);
+        let mut status = load_or_create_rules_cache(config_dir, builtin_manifest);
         status.warning = Some(bounded_warning(warning));
         return LoadedRulesCache {
             manifest: builtin_manifest.clone(),
@@ -127,49 +147,75 @@ pub fn load_active_rules_cache(
     let loaded_at = Utc::now().to_rfc3339();
     match fs::read_to_string(&path) {
         Ok(data) => match serde_json::from_str::<RulesCacheSnapshot>(&data) {
-            Ok(mut snapshot) => match remote_snapshot_manifest(&snapshot, verifier) {
-                Ok(manifest) => {
+            Ok(mut snapshot) => {
+                if snapshot_matches_manifest(&snapshot, builtin_manifest) {
                     snapshot.loaded_at = loaded_at;
-                    let status = match write_snapshot(&path, &snapshot) {
-                    Ok(()) => RulesCacheStatus::from_snapshot(&snapshot, RulesCacheState::Recorded),
-                    Err(_) => RulesCacheStatus::from_snapshot(&snapshot, RulesCacheState::Recorded)
-                        .with_warning(
-                            "Remote rules cache was read, but its loaded timestamp could not be recorded.",
-                        ),
-                };
-                    LoadedRulesCache {
-                        manifest,
-                        rule_source: RuleSource::Remote,
-                        rule_channel: RuleChannel::Remote,
+                    return LoadedRulesCache {
+                        manifest: builtin_manifest.clone(),
+                        rule_source: RuleSource::BuiltIn,
+                        rule_channel: RuleChannel::Bundled,
                         validation: RulesValidation::Valid,
-                        last_refresh_at: Some(snapshot.updated_at.clone()),
-                        status,
+                        last_refresh_at: None,
+                        status: write_loaded_snapshot_status(
+                            &path,
+                            &snapshot,
+                            "Rules cache was read, but its loaded timestamp could not be recorded.",
+                        ),
+                    };
+                }
+
+                match remote_snapshot_manifest(&snapshot, verifier) {
+                    Ok(manifest) => {
+                        snapshot.loaded_at = loaded_at;
+                        let status = write_loaded_snapshot_status(
+                            &path,
+                            &snapshot,
+                            "Remote rules cache was read, but its loaded timestamp could not be recorded.",
+                        );
+                        LoadedRulesCache {
+                            manifest,
+                            rule_source: RuleSource::Remote,
+                            rule_channel: RuleChannel::Remote,
+                            validation: RulesValidation::Valid,
+                            last_refresh_at: Some(snapshot.updated_at.clone()),
+                            status,
+                        }
                     }
+                    Err(warning) => builtin_with_status(
+                        builtin_manifest,
+                        RulesCacheStatus::invalid(loaded_at, warning),
+                    ),
                 }
-                Err(warning) => {
-                    fallback_to_builtin(&path, builtin_manifest, loaded_at, Some(&warning))
-                }
-            },
-            Err(_) => fallback_to_builtin(
+            }
+            Err(_) => builtin_with_status(
+                builtin_manifest,
+                RulesCacheStatus::invalid(
+                    loaded_at,
+                    "Remote rules cache was invalid; using the built-in manifest.",
+                ),
+            ),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => builtin_with_status(
+            builtin_manifest,
+            write_fresh_snapshot(
                 &path,
                 builtin_manifest,
                 loaded_at,
-                Some("Remote rules cache was invalid; using the built-in manifest."),
+                RulesCacheState::Recorded,
+                None,
             ),
-        },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fallback_to_builtin(&path, builtin_manifest, loaded_at, None)
-        }
-        Err(_) => fallback_to_builtin(
-            &path,
+        ),
+        Err(_) => builtin_with_status(
             builtin_manifest,
-            loaded_at,
-            Some("Remote rules cache could not be read; using the built-in manifest."),
+            RulesCacheStatus::unavailable_with_warning(
+                loaded_at,
+                "Remote rules cache could not be read; using the built-in manifest.",
+            ),
         ),
     }
 }
 
-pub fn load_or_repair_rules_cache(config_dir: &Path, manifest: &Manifest) -> RulesCacheStatus {
+pub fn load_or_create_rules_cache(config_dir: &Path, manifest: &Manifest) -> RulesCacheStatus {
     let path = rules_cache_path(config_dir);
     let loaded_at = Utc::now().to_rfc3339();
 
@@ -177,25 +223,23 @@ pub fn load_or_repair_rules_cache(config_dir: &Path, manifest: &Manifest) -> Rul
         Ok(data) => match serde_json::from_str::<RulesCacheSnapshot>(&data) {
             Ok(mut snapshot) if snapshot_matches_manifest(&snapshot, manifest) => {
                 snapshot.loaded_at = loaded_at;
-                match write_snapshot(&path, &snapshot) {
-                    Ok(()) => RulesCacheStatus::from_snapshot(&snapshot, RulesCacheState::Recorded),
-                    Err(_) => RulesCacheStatus::from_snapshot(&snapshot, RulesCacheState::Recorded)
-                        .with_warning(
-                            "Rules cache was read, but its loaded timestamp could not be recorded.",
-                        ),
-                }
+                write_loaded_snapshot_status(
+                    &path,
+                    &snapshot,
+                    "Rules cache was read, but its loaded timestamp could not be recorded.",
+                )
             }
-            Ok(_) | Err(_) => repair_snapshot(&path, manifest, loaded_at),
+            Ok(_) | Err(_) => RulesCacheStatus::invalid(
+                loaded_at,
+                "Rules cache is invalid; using the built-in manifest.",
+            ),
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             write_fresh_snapshot(&path, manifest, loaded_at, RulesCacheState::Recorded, None)
         }
-        Err(_) => write_fresh_snapshot(
-            &path,
-            manifest,
+        Err(_) => RulesCacheStatus::unavailable_with_warning(
             loaded_at,
-            RulesCacheState::Recovered,
-            Some("Rules cache could not be read and was replaced with the built-in manifest."),
+            "Rules cache could not be read; using the built-in manifest.",
         ),
     }
 }
@@ -213,16 +257,6 @@ pub fn write_remote_rules_cache(
         &snapshot,
         RulesCacheState::Recorded,
     ))
-}
-
-fn repair_snapshot(path: &Path, manifest: &Manifest, loaded_at: String) -> RulesCacheStatus {
-    write_fresh_snapshot(
-        path,
-        manifest,
-        loaded_at,
-        RulesCacheState::Recovered,
-        Some("Rules cache was invalid and was replaced with the built-in manifest."),
-    )
 }
 
 fn write_fresh_snapshot(
@@ -334,23 +368,7 @@ fn remote_snapshot_manifest(
     Ok(manifest)
 }
 
-fn fallback_to_builtin(
-    path: &Path,
-    manifest: &Manifest,
-    loaded_at: String,
-    warning: Option<&str>,
-) -> LoadedRulesCache {
-    let status = write_fresh_snapshot(
-        path,
-        manifest,
-        loaded_at,
-        if warning.is_some() {
-            RulesCacheState::Recovered
-        } else {
-            RulesCacheState::Recorded
-        },
-        warning,
-    );
+fn builtin_with_status(manifest: &Manifest, status: RulesCacheStatus) -> LoadedRulesCache {
     LoadedRulesCache {
         manifest: manifest.clone(),
         rule_source: RuleSource::BuiltIn,
@@ -358,6 +376,18 @@ fn fallback_to_builtin(
         validation: RulesValidation::Valid,
         last_refresh_at: None,
         status,
+    }
+}
+
+fn write_loaded_snapshot_status(
+    path: &Path,
+    snapshot: &RulesCacheSnapshot,
+    warning: &'static str,
+) -> RulesCacheStatus {
+    match write_snapshot(path, snapshot) {
+        Ok(()) => RulesCacheStatus::from_snapshot(snapshot, RulesCacheState::Recorded),
+        Err(_) => RulesCacheStatus::from_snapshot(snapshot, RulesCacheState::Recorded)
+            .with_warning(warning),
     }
 }
 
@@ -406,7 +436,7 @@ fn replace_file(source: &Path, destination: &Path) -> Result<(), std::io::Error>
 #[cfg(test)]
 mod tests {
     use super::{
-        RulesCacheSnapshot, RulesCacheState, load_active_rules_cache, load_or_repair_rules_cache,
+        RulesCacheSnapshot, RulesCacheState, load_active_rules_cache, load_or_create_rules_cache,
         rules_cache_path, write_remote_rules_cache,
     };
     use crate::resolve::builtin_manifest;
@@ -422,7 +452,7 @@ mod tests {
         let root = test_root("missing");
         let manifest = builtin_manifest().expect("builtin manifest");
 
-        let status = load_or_repair_rules_cache(&root, &manifest);
+        let status = load_or_create_rules_cache(&root, &manifest);
 
         assert!(status.recorded);
         assert_eq!(status.state, RulesCacheState::Recorded);
@@ -450,25 +480,24 @@ mod tests {
     }
 
     #[test]
-    fn invalid_cache_is_replaced_without_failing_status() {
+    fn invalid_cache_is_reported_without_repairing_file() {
         let root = test_root("invalid");
         let manifest = builtin_manifest().expect("builtin manifest");
         let path = rules_cache_path(&root);
         fs::create_dir_all(path.parent().expect("cache parent")).expect("create cache dir");
         fs::write(&path, "{not json").expect("write invalid cache");
 
-        let status = load_or_repair_rules_cache(&root, &manifest);
+        let status = load_or_create_rules_cache(&root, &manifest);
 
-        assert!(status.recorded);
-        assert_eq!(status.state, RulesCacheState::Recovered);
+        assert!(!status.recorded);
+        assert_eq!(status.state, RulesCacheState::Invalid);
+        assert_eq!(status.updated_at, None);
+        assert!(status.loaded_at.is_some());
         assert!(status.warning.is_some());
-
-        let snapshot = read_snapshot(&root);
-        assert_eq!(snapshot.rule_source, RuleSource::BuiltIn);
-        assert_eq!(snapshot.rule_channel, RuleChannel::Bundled);
-        assert_eq!(snapshot.schema_version, manifest.schema_version);
-        assert_eq!(snapshot.generated_at, manifest.generated_at);
-        assert_eq!(snapshot.validation, RulesValidation::Valid);
+        assert_eq!(
+            fs::read_to_string(&path).expect("read invalid cache"),
+            "{not json"
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -530,7 +559,8 @@ mod tests {
         assert_eq!(loaded.rule_source, RuleSource::BuiltIn);
         assert_eq!(loaded.rule_channel, RuleChannel::Bundled);
         assert_eq!(loaded.manifest.generated_at, builtin.generated_at);
-        assert_eq!(loaded.status.state, RulesCacheState::Recovered);
+        assert_eq!(loaded.status.state, RulesCacheState::Invalid);
+        assert!(!loaded.status.recorded);
         assert!(
             loaded
                 .status

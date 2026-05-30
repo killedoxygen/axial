@@ -509,7 +509,7 @@ export type PerformanceRuleChannel = 'bundled' | 'local' | 'remote';
 
 export type PerformanceRulesValidation = 'valid' | 'invalid';
 
-export type PerformanceRulesCacheState = 'recorded' | 'recovered' | 'unavailable';
+export type PerformanceRulesCacheState = 'recorded' | 'invalid' | 'unavailable';
 
 export interface PerformanceRulesCacheStatus {
   recorded: boolean;

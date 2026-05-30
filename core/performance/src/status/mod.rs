@@ -261,16 +261,16 @@ mod tests {
         let status = rules_status_with_cache(
             &manifest,
             crate::rules_cache::RulesCacheStatus {
-                recorded: true,
-                state: RulesCacheState::Recovered,
+                recorded: false,
+                state: RulesCacheState::Invalid,
                 updated_at: Some("2026-05-30T10:00:00Z".to_string()),
                 loaded_at: Some("2026-05-30T10:01:00Z".to_string()),
-                warning: Some("Rules cache was invalid and was replaced.".to_string()),
+                warning: Some("Rules cache is invalid.".to_string()),
             },
         );
 
-        assert!(status.rules_cache.recorded);
-        assert_eq!(status.rules_cache.state, RulesCacheState::Recovered);
+        assert!(!status.rules_cache.recorded);
+        assert_eq!(status.rules_cache.state, RulesCacheState::Invalid);
         assert_eq!(
             status.rules_cache.updated_at.as_deref(),
             Some("2026-05-30T10:00:00Z")

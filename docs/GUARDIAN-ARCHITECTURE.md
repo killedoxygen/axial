@@ -194,8 +194,8 @@ The preferred shape is:
 Current launcher behavior:
 - Guardian `message` is preferred for launch notices when present
 - Guardian `details` are preferred over frontend-synthesized intervention/guidance copy
-- existing `guidance` and `interventions` remain serialized for compatibility and diagnostics
-- Healing remains supporting detail for compatibility specifics and retry/fallback context
+- `guidance` and `interventions` remain serialized as current bounded diagnostics
+- Healing remains supporting detail for runtime-adjustment specifics and retry/fallback context
 - live launch stage records preserve bounded unique Guardian `details` for `warned`, `intervened`, and `blocked` status payloads before appending Healing warnings without duplicates; Healing `fallback_applied` remains the only source of stage fallback reasons
 
 ## Invariants

@@ -317,30 +317,10 @@ function PlayerIdentityCard({ savedUsername }: { savedUsername: string }): JSX.E
 }
 
 async function copyText(text: string): Promise<void> {
-  if (navigator.clipboard) {
-    try {
-      await navigator.clipboard.writeText(text);
-      return;
-    } catch {
-      // Fall through to the legacy selection path used by some desktop shells.
-    }
+  if (!navigator.clipboard) {
+    throw new Error('clipboard API unavailable');
   }
-
-  const textarea = document.createElement('textarea');
-  textarea.value = text;
-  textarea.setAttribute('readonly', 'true');
-  textarea.style.position = 'fixed';
-  textarea.style.left = '-9999px';
-  textarea.style.top = '0';
-  document.body.appendChild(textarea);
-  textarea.select();
-  try {
-    if (!document.execCommand('copy')) {
-      throw new Error('copy command rejected');
-    }
-  } finally {
-    textarea.remove();
-  }
+  await navigator.clipboard.writeText(text);
 }
 
 function formatSeconds(seconds: number): string {

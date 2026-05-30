@@ -326,8 +326,8 @@ function emergencyDisableSummary(status: PerformanceRulesStatus): string {
 
 function rulesCacheSummary(status: PerformanceRulesStatus): string {
   const cache = status.rules_cache;
+  if (cache?.state === 'invalid') return 'Invalid local cache';
   if (!cache?.recorded) return 'Unavailable';
-  if (cache.state === 'recovered') return 'Recorded locally, recovered';
   return 'Recorded locally';
 }
 

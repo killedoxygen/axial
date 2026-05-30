@@ -585,7 +585,7 @@ fn sanitize_benchmark_mode_metadata(value: &str) -> Option<String> {
         "development" | "dev" => "development",
         "qualification" | "qual" => "qualification",
         "release_validation" | "release" | "release-validation" => "release_validation",
-        _ => return Some(sanitized),
+        _ => return None,
     };
     Some(normalized.to_string())
 }
@@ -1069,7 +1069,7 @@ mod tests {
     }
 
     #[test]
-    fn benchmark_metadata_normalizes_known_modes_and_preserves_unknown_modes() {
+    fn benchmark_metadata_normalizes_known_modes_and_rejects_unknown_modes() {
         let dev = LaunchBenchmarkMetadata::new(None, None, None, Some("dev"));
         let qual = LaunchBenchmarkMetadata::new(None, None, None, Some(" QUALIFICATION "));
         let release = LaunchBenchmarkMetadata::new(None, None, None, Some("release-validation\n"));
@@ -1078,7 +1078,7 @@ mod tests {
         assert_eq!(dev.mode.as_deref(), Some("development"));
         assert_eq!(qual.mode.as_deref(), Some("qualification"));
         assert_eq!(release.mode.as_deref(), Some("release_validation"));
-        assert_eq!(unknown.mode.as_deref(), Some("nightly-check"));
+        assert_eq!(unknown.mode, None);
     }
 
     #[test]
