@@ -2,6 +2,7 @@ import type { JSX } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { Icon } from '../ui/Icons';
 import { Kbd } from '../ui/Atoms';
+import { PlayerHeadPreview } from '../ui/PlayerHeadPreview';
 import { route, navigate, commandPaletteOpen, type Route } from '../ui-state';
 import { runningSessions, config } from '../store';
 import { promptPlayerName, savePlayerName } from '../player-name';
@@ -162,7 +163,6 @@ function UserMenu({ onClose }: { onClose: () => void }): JSX.Element {
 function UserTrigger({ compact }: { compact: boolean }): JSX.Element {
   const [open, setOpen] = useState(false);
   const username = (config.value?.username || 'Player').slice(0, 24);
-  const initial = username[0]?.toUpperCase() || 'P';
   const running = Object.keys(runningSessions.value).length;
   const rootRef = useRef<HTMLDivElement>(null);
 
@@ -193,10 +193,14 @@ function UserTrigger({ compact }: { compact: boolean }): JSX.Element {
         onClick={() => setOpen(o => !o)}
         title={compact ? username : undefined}
       >
-        <div class="cp-avatar">{initial}</div>
+        <PlayerHeadPreview
+          username={username}
+          size={compact ? 34 : 30}
+          radius={compact ? 10 : 9}
+        />
         <div class="cp-sidebar-user-body">
           <div class="cp-sidebar-user-name">{username}</div>
-          <div class="cp-sidebar-user-sub">{running > 0 ? `${running} playing` : 'online'}</div>
+          <div class="cp-sidebar-user-sub">{running > 0 ? `${running} playing` : 'offline identity'}</div>
         </div>
         {!compact && (
           <Icon name="chevron-up" size={14} color="var(--text-mute)" style={{
@@ -231,12 +235,6 @@ export function Sidebar(): JSX.Element {
             { icon: 'plus', label: 'New', route: { name: 'create' }, showConnector: false },
           ],
         },
-      ],
-    },
-    {
-      title: 'Discover',
-      items: [
-        { icon: 'compass', label: 'Browse', route: { name: 'browse' } },
       ],
     },
   ];

@@ -1,0 +1,29 @@
+.cp-player-head {
+  position: relative;
+  display: inline-flex;
+  align-items: stretch;
+  justify-content: stretch;
+  flex: 0 0 auto;
+  overflow: hidden;
+  background: var(--surface-3);
+  border: 1px solid color-mix(in oklab, var(--line-strong) 76%, transparent);
+  box-shadow:
+    0 1px 0 color-mix(in oklab, var(--text) 8%, transparent) inset,
+    0 10px 20px -14px color-mix(in oklab, var(--text) 34%, transparent);
+  image-rendering: pixelated;
+}
+
+.cp-player-head::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  box-shadow: inset 0 -1px 0 color-mix(in oklab, var(--text) 16%, transparent);
+  pointer-events: none;
+}
+
+.cp-player-head svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}

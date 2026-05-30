@@ -1,3 +1,4 @@
+mod auth;
 mod catalog;
 mod config;
 mod dev;
@@ -9,6 +10,7 @@ mod loaders;
 mod music;
 mod performance;
 mod setup;
+mod skin;
 mod status;
 mod system;
 mod update;
@@ -25,6 +27,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(status::router())
+        .merge(auth::router())
         .merge(system::router())
         .merge(config::router())
         .merge(dev::router())
@@ -34,6 +37,7 @@ pub fn router(state: AppState) -> Router {
         .merge(install::router())
         .merge(music::router())
         .merge(performance::router())
+        .merge(skin::router())
         .merge(update::router())
         .merge(launch::router())
         .merge(loaders::router())
