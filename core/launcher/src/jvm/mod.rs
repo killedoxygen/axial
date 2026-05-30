@@ -85,7 +85,15 @@ pub fn sanitize_preset(
     let preset = preset.trim();
 
     if info.major <= 8 {
-        return PRESET_LEGACY.to_string();
+        if legacy_family
+            && matches!(
+                preset,
+                PRESET_LEGACY | PRESET_LEGACY_PVP | PRESET_LEGACY_HEAVY
+            )
+        {
+            return preset.to_string();
+        }
+        return legacy_preset_for_target(version_id, loader, is_modded).to_string();
     }
 
     match preset {
@@ -110,9 +118,7 @@ pub fn sanitize_preset(
     if legacy_family && matches!(preset, PRESET_ULTRA_LOW_LATENCY | PRESET_SMOOTH) {
         return PRESET_PERFORMANCE.to_string();
     }
-    if (loader == "forge" || loader == "neoforge" || is_modded)
-        && preset == PRESET_ULTRA_LOW_LATENCY
-    {
+    if is_modded_launch(loader, is_modded) && preset == PRESET_ULTRA_LOW_LATENCY {
         return PRESET_PERFORMANCE.to_string();
     }
 
@@ -144,16 +150,16 @@ fn auto_select_preset(
     if !supports_hotspot_tuning(info) {
         return String::new();
     }
-    if info.distribution == "graalvm" && info.major >= 17 && !is_modded {
+    if info.distribution == "graalvm" && info.major >= 17 {
         return PRESET_GRAALVM.to_string();
     }
     if info.major <= 8 {
-        return PRESET_LEGACY.to_string();
+        return legacy_preset_for_target(version_id, loader, is_modded).to_string();
     }
     if is_legacy_family(version_id) {
         return PRESET_PERFORMANCE.to_string();
     }
-    if loader == "forge" || loader == "neoforge" || is_modded {
+    if is_modded_launch(loader, is_modded) {
         return PRESET_PERFORMANCE.to_string();
     }
     if supports_shenandoah(info) {
@@ -232,6 +238,21 @@ fn is_legacy_family(version_id: &str) -> bool {
     parts[0] == 1 && parts[1] <= 12
 }
 
+fn legacy_preset_for_target(version_id: &str, loader: &str, is_modded: bool) -> &'static str {
+    let version = base_version_id(version_id);
+    if version == "1.8.9" {
+        return PRESET_LEGACY_PVP;
+    }
+    if version == "1.12.2" && is_modded_launch(loader, is_modded) {
+        return PRESET_LEGACY_HEAVY;
+    }
+    PRESET_LEGACY
+}
+
+fn is_modded_launch(loader: &str, is_modded: bool) -> bool {
+    loader == "forge" || loader == "neoforge" || is_modded
+}
+
 fn base_version_id(version_id: &str) -> String {
     if let Some((base, _)) = version_id.split_once("-forge-") {
         return base.to_string();
@@ -254,20 +275,98 @@ mod tests {
     use super::*;
 
     fn info(major: u32) -> JavaRuntimeInfo {
+        info_with_distribution(major, "openjdk")
+    }
+
+    fn info_with_distribution(major: u32, distribution: &str) -> JavaRuntimeInfo {
         JavaRuntimeInfo {
             id: "runtime".to_string(),
             major,
             update: 0,
-            distribution: "openjdk".to_string(),
+            distribution: distribution.to_string(),
             path: "/java".to_string(),
         }
     }
 
     #[test]
-    fn legacy_runtime_forces_legacy_preset() {
+    fn openj9_runtime_skips_hotspot_tuning() {
+        let info = info_with_distribution(21, "openj9");
+
+        assert_eq!(
+            recommended_preset("", "1.20.4", "vanilla", false, &info),
+            ""
+        );
+        assert_eq!(
+            sanitize_preset(PRESET_PERFORMANCE, "1.20.4", "vanilla", false, &info),
+            ""
+        );
+    }
+
+    #[test]
+    fn modern_non_graalvm_defaults_stay_on_hotspot_presets() {
+        assert_eq!(
+            recommended_preset("", "1.20.4", "vanilla", false, &info(21)),
+            PRESET_SMOOTH
+        );
+        assert_eq!(
+            recommended_preset("", "1.20.4", "forge", true, &info(21)),
+            PRESET_PERFORMANCE
+        );
+    }
+
+    #[test]
+    fn graalvm_runtime_auto_selects_graalvm_for_modded_launch() {
+        let info = info_with_distribution(21, "graalvm");
+
+        assert_eq!(
+            recommended_preset("", "1.20.4", "forge", true, &info),
+            PRESET_GRAALVM
+        );
+    }
+
+    #[test]
+    fn explicit_graalvm_preset_survives_modded_graalvm_runtime() {
+        let info = info_with_distribution(21, "graalvm");
+
+        assert_eq!(
+            sanitize_preset(PRESET_GRAALVM, "1.20.4", "forge", true, &info),
+            PRESET_GRAALVM
+        );
+    }
+
+    #[test]
+    fn java8_legacy_targets_auto_select_specific_legacy_presets() {
+        assert_eq!(
+            recommended_preset("", "1.8.9", "vanilla", false, &info(8)),
+            PRESET_LEGACY_PVP
+        );
+        assert_eq!(
+            recommended_preset("", "1.12.2", "forge", true, &info(8)),
+            PRESET_LEGACY_HEAVY
+        );
+        assert_eq!(
+            recommended_preset("", "1.12.2", "vanilla", false, &info(8)),
+            PRESET_LEGACY
+        );
+    }
+
+    #[test]
+    fn legacy_runtime_uses_target_specific_safe_preset() {
         assert_eq!(
             sanitize_preset(PRESET_PERFORMANCE, "1.8.9", "vanilla", false, &info(8)),
-            PRESET_LEGACY
+            PRESET_LEGACY_PVP
+        );
+    }
+
+    #[test]
+    fn java8_legacy_targets_preserve_legacy_variants() {
+        assert_eq!(
+            sanitize_preset(PRESET_LEGACY_PVP, "1.8.9", "vanilla", false, &info(8)),
+            PRESET_LEGACY_PVP
+        );
+        assert_eq!(
+            sanitize_preset(PRESET_LEGACY_HEAVY, "1.12.2", "forge", true, &info(8)),
+            PRESET_LEGACY_HEAVY
         );
     }
 
@@ -276,6 +375,22 @@ mod tests {
         assert_eq!(
             sanitize_preset(PRESET_LEGACY, "1.20.4", "vanilla", false, &info(21)),
             PRESET_PERFORMANCE
+        );
+        assert_eq!(
+            sanitize_preset(PRESET_LEGACY_HEAVY, "1.20.4", "vanilla", false, &info(21)),
+            PRESET_PERFORMANCE
+        );
+    }
+
+    #[test]
+    fn unsafe_modern_presets_downgrade_on_java8_legacy_targets() {
+        assert_eq!(
+            sanitize_preset(PRESET_SMOOTH, "1.8.9", "vanilla", false, &info(8)),
+            PRESET_LEGACY_PVP
+        );
+        assert_eq!(
+            sanitize_preset(PRESET_ULTRA_LOW_LATENCY, "1.12.2", "forge", true, &info(8)),
+            PRESET_LEGACY_HEAVY
         );
     }
 

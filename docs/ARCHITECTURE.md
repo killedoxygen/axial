@@ -121,6 +121,8 @@ flowchart TD
     M --> N[PreparedLaunchAttempt]
 ```
 
+Effective JVM preset selection is backend-owned. With no explicit preset override, HotSpot runtimes select from the current presets using version, loader/modded state, and detected Java distribution: supported GraalVM runtimes use the GraalVM preset, Java 8 legacy targets use the specific legacy preset for 1.8.9 PvP and modded 1.12.2 heavy launches when applicable, other Java 8 legacy targets use the conservative legacy preset, modern modded launches use the performance preset, and supported modern vanilla launches use the smooth preset. OpenJ9 and other unsupported HotSpot-tuning targets receive no Croopor GC flags.
+
 ### Live session and event flow
 ```mermaid
 flowchart TD
