@@ -428,6 +428,34 @@ function preferredBenchmarkInstanceId(
   return list[0]?.id ?? '';
 }
 
+type ComparisonMetricCopy = {
+  fasterBy: string;
+  slowerBy: string;
+  matchesBaseline: string;
+};
+
+function comparisonMetricCopy(metricName: string): ComparisonMetricCopy {
+  if (metricName === 'boot_duration_ms') {
+    return {
+      fasterBy: 'Boot faster by',
+      slowerBy: 'Boot slower by',
+      matchesBaseline: 'Boot matches baseline',
+    };
+  }
+  if (metricName === 'total_completed_stage_duration_ms') {
+    return {
+      fasterBy: 'Launch stages faster by',
+      slowerBy: 'Launch stages slower by',
+      matchesBaseline: 'Launch stages match baseline',
+    };
+  }
+  return {
+    fasterBy: 'Faster by',
+    slowerBy: 'Slower by',
+    matchesBaseline: 'Matches baseline',
+  };
+}
+
 function comparisonSummary(comparison: LaunchProofComparison | null | undefined): {
   label: string;
   detail: string;
@@ -441,22 +469,23 @@ function comparisonSummary(comparison: LaunchProofComparison | null | undefined)
   const current = formatDurationMs(comparison.current_value_ms);
   const baseline = formatDurationMs(comparison.baseline_value_ms);
   const samples = `${comparison.matched_sample_count} matched ${comparison.matched_sample_count === 1 ? 'proof' : 'proofs'}`;
+  const metricCopy = comparisonMetricCopy(comparison.metric_name);
   if (comparison.delta_ms < 0) {
     return {
-      label: `Faster by ${formatDurationMs(comparison.delta_ms)} (${percent}%)`,
+      label: `${metricCopy.fasterBy} ${formatDurationMs(comparison.delta_ms)} (${percent}%)`,
       detail: `${current} now, ${baseline} baseline, ${samples}`,
       tone: 'ok',
     };
   }
   if (comparison.delta_ms > 0) {
     return {
-      label: `Slower by ${formatDurationMs(comparison.delta_ms)} (${percent}%)`,
+      label: `${metricCopy.slowerBy} ${formatDurationMs(comparison.delta_ms)} (${percent}%)`,
       detail: `${current} now, ${baseline} baseline, ${samples}`,
       tone: 'warn',
     };
   }
   return {
-    label: 'Matches baseline',
+    label: metricCopy.matchesBaseline,
     detail: `${current} now, ${baseline} baseline, ${samples}`,
     tone: 'neutral',
   };
