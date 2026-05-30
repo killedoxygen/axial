@@ -51,6 +51,8 @@ pub enum InstallError {
     NoPrimaryFile(String),
     #[error("mod filename is invalid: {0}")]
     InvalidFilename(String),
+    #[error("managed artifact target already exists: {0}")]
+    ManagedArtifactTargetExists(String),
     #[error("no performance rollback snapshot available")]
     NoRollbackSnapshot,
     #[error("performance rollback snapshot not found")]
@@ -212,7 +214,12 @@ impl PerformanceManager {
             )?;
 
             let state = self
-                .attempt_install_plan(attempt_plan, game_version, instance_mods_dir)
+                .attempt_install_plan(
+                    attempt_plan,
+                    game_version,
+                    instance_mods_dir,
+                    previous_state.as_ref(),
+                )
                 .await;
             let should_fallback =
                 severe_install_failure(attempt_plan, &state) && index + 1 < attempt_plans.len();
@@ -452,6 +459,7 @@ impl PerformanceManager {
         game_version: &str,
         loader: &str,
         instance_mods_dir: &Path,
+        previous_state: Option<&CompositionState>,
     ) -> Result<InstalledMod, InstallError> {
         let loaders = vec![loader.to_string()];
 
@@ -468,20 +476,26 @@ impl PerformanceManager {
         let filename = sanitize_mod_filename(&file.filename)?;
         let expected_sha = file.hashes.get("sha512").cloned().unwrap_or_default();
         let final_path = instance_mods_dir.join(&filename);
+        let was_previously_tracked = state_tracks_filename(previous_state, &filename);
 
-        if !expected_sha.is_empty()
-            && let Ok(existing) = fs::read(&final_path)
-        {
-            let actual = hex::encode(sha2::Sha512::digest(&existing));
-            if actual.eq_ignore_ascii_case(&expected_sha) {
-                return Ok(InstalledMod {
-                    project_id: managed_mod.project_id.clone(),
-                    version_id: version.id,
-                    filename,
-                    ownership_class: OwnershipClass::CompositionManaged,
-                    source: modrinth_source(),
-                    integrity: verified_sha512_integrity(expected_sha),
-                });
+        if final_path.try_exists()? {
+            if !expected_sha.trim().is_empty()
+                && let Ok(existing) = fs::read(&final_path)
+            {
+                let actual = hex::encode(sha2::Sha512::digest(&existing));
+                if actual.eq_ignore_ascii_case(&expected_sha) {
+                    return Ok(InstalledMod {
+                        project_id: managed_mod.project_id.clone(),
+                        version_id: version.id,
+                        filename,
+                        ownership_class: OwnershipClass::CompositionManaged,
+                        source: modrinth_source(),
+                        integrity: verified_sha512_integrity(expected_sha),
+                    });
+                }
+            }
+            if !was_previously_tracked {
+                return Err(InstallError::ManagedArtifactTargetExists(filename));
             }
         }
 
@@ -489,7 +503,11 @@ impl PerformanceManager {
         self.modrinth
             .download_file_to_path(&file.url, &expected_sha, &temp_path)
             .await?;
-        replace_file_atomic(&temp_path, &final_path)?;
+        if final_path.try_exists()? && !was_previously_tracked {
+            let _ = fs::remove_file(&temp_path);
+            return Err(InstallError::ManagedArtifactTargetExists(filename));
+        }
+        promote_file(&temp_path, &final_path, &filename, was_previously_tracked)?;
 
         Ok(InstalledMod {
             project_id: managed_mod.project_id.clone(),
@@ -510,6 +528,7 @@ impl PerformanceManager {
         plan: &CompositionPlan,
         game_version: &str,
         instance_mods_dir: &Path,
+        previous_state: Option<&CompositionState>,
     ) -> CompositionState {
         let mut state = CompositionState {
             composition_id: plan.composition_id.clone(),
@@ -522,7 +541,13 @@ impl PerformanceManager {
 
         for managed_mod in &plan.mods {
             match self
-                .install_mod(managed_mod, game_version, &plan.loader, instance_mods_dir)
+                .install_mod(
+                    managed_mod,
+                    game_version,
+                    &plan.loader,
+                    instance_mods_dir,
+                    previous_state,
+                )
                 .await
             {
                 Ok(installed) => state.installed_mods.push(installed),
@@ -937,18 +962,58 @@ fn sanitize_mod_filename(name: &str) -> Result<String, InstallError> {
     Ok(base.to_string())
 }
 
-fn replace_file_atomic(temp_path: &Path, final_path: &Path) -> Result<(), std::io::Error> {
+fn state_tracks_filename(state: Option<&CompositionState>, filename: &str) -> bool {
+    state.is_some_and(|state| {
+        state
+            .installed_mods
+            .iter()
+            .any(|installed| installed.filename == filename)
+    })
+}
+
+fn promote_file(
+    temp_path: &Path,
+    final_path: &Path,
+    filename: &str,
+    allow_overwrite: bool,
+) -> Result<(), InstallError> {
+    if allow_overwrite {
+        return promote_file_with_overwrite(temp_path, final_path);
+    }
+
+    match fs::hard_link(temp_path, final_path) {
+        Ok(()) => {
+            let _ = fs::remove_file(temp_path);
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = fs::remove_file(temp_path);
+            Err(InstallError::ManagedArtifactTargetExists(
+                filename.to_string(),
+            ))
+        }
+        Err(error) => {
+            let _ = fs::remove_file(temp_path);
+            Err(InstallError::Io(error))
+        }
+    }
+}
+
+fn promote_file_with_overwrite(temp_path: &Path, final_path: &Path) -> Result<(), InstallError> {
     if fs::rename(temp_path, final_path).is_ok() {
         return Ok(());
     }
-    if final_path.exists() {
-        let _ = fs::remove_file(final_path);
+    if let Err(error) = fs::remove_file(final_path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        let _ = fs::remove_file(temp_path);
+        return Err(InstallError::Io(error));
     }
     match fs::rename(temp_path, final_path) {
         Ok(()) => Ok(()),
         Err(error) => {
             let _ = fs::remove_file(temp_path);
-            Err(error)
+            Err(InstallError::Io(error))
         }
     }
 }
@@ -1221,6 +1286,116 @@ mod tests {
         assert_eq!(
             fs::read(root.join("sodium.jar")).expect("read reused file"),
             existing
+        );
+        assert!(!root.join("sodium.jar.tmp").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn ensure_installed_does_not_overwrite_existing_mismatched_final_file() {
+        let root = test_root("ensure-installed-preserve-existing-final");
+        let existing = b"user-created-sodium";
+        fs::write(root.join("sodium.jar"), existing).expect("write existing user file");
+        let manager = PerformanceManager::new_with_modrinth_base_url(
+            spawn_modrinth_server_with_sha512(Some(hex::encode(sha2::Sha512::digest(
+                b"managed-jar",
+            ))))
+            .await,
+        )
+        .expect("performance manager");
+        let plan = CompositionPlan {
+            composition_id: "core".to_string(),
+            family: VersionFamily::F,
+            loader: "fabric".to_string(),
+            mode: PerformanceMode::Managed,
+            tier: CompositionTier::Core,
+            mods: vec![ManagedMod {
+                artifact_id: "sodium".to_string(),
+                project_id: "sodium".to_string(),
+                slug: "sodium".to_string(),
+                name: "Sodium".to_string(),
+                condition: ModCondition::Always,
+                version_range: String::new(),
+                hardware_req: None,
+                mutual_exclusions: Vec::new(),
+            }],
+            jvm_preset: String::new(),
+            fallback_chain: Vec::new(),
+            warnings: Vec::new(),
+            fallback_reason: String::new(),
+        };
+
+        let state = manager
+            .ensure_installed(&plan, "1.20.4", &root)
+            .await
+            .expect("install should record failed managed artifact");
+
+        assert_eq!(state.failure_count, 1);
+        assert_eq!(
+            state.last_failure,
+            "managed artifact target already exists: sodium.jar"
+        );
+        assert!(state.installed_mods.is_empty());
+        assert_eq!(
+            fs::read(root.join("sodium.jar")).expect("read existing user file"),
+            existing
+        );
+        assert!(!root.join("sodium.jar.tmp").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn ensure_installed_replaces_previously_tracked_mismatched_final_file() {
+        let root = test_root("ensure-installed-replace-tracked-final");
+        fs::write(root.join("sodium.jar"), b"old-managed-sodium")
+            .expect("write previous managed file");
+        save_state(
+            &root,
+            &test_state("core", vec![test_mod("sodium", "sodium.jar")]),
+        )
+        .expect("save previous state");
+        let manager = PerformanceManager::new_with_modrinth_base_url(
+            spawn_modrinth_server_with_sha512(Some(hex::encode(sha2::Sha512::digest(
+                b"managed-jar",
+            ))))
+            .await,
+        )
+        .expect("performance manager");
+        let plan = CompositionPlan {
+            composition_id: "core".to_string(),
+            family: VersionFamily::F,
+            loader: "fabric".to_string(),
+            mode: PerformanceMode::Managed,
+            tier: CompositionTier::Core,
+            mods: vec![ManagedMod {
+                artifact_id: "sodium".to_string(),
+                project_id: "sodium".to_string(),
+                slug: "sodium".to_string(),
+                name: "Sodium".to_string(),
+                condition: ModCondition::Always,
+                version_range: String::new(),
+                hardware_req: None,
+                mutual_exclusions: Vec::new(),
+            }],
+            jvm_preset: String::new(),
+            fallback_chain: Vec::new(),
+            warnings: Vec::new(),
+            fallback_reason: String::new(),
+        };
+
+        let state = manager
+            .ensure_installed(&plan, "1.20.4", &root)
+            .await
+            .expect("replace previous tracked managed artifact");
+
+        assert_eq!(state.failure_count, 0);
+        assert_eq!(state.installed_mods.len(), 1);
+        assert!(state.installed_mods[0].integrity.sha512_verified);
+        assert_eq!(
+            fs::read(root.join("sodium.jar")).expect("read replaced file"),
+            b"managed-jar"
         );
         assert!(!root.join("sodium.jar.tmp").exists());
 
