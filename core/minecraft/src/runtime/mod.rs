@@ -981,25 +981,40 @@ fn parse_java_version(text: &str) -> (u32, u32) {
 }
 
 fn detect_distribution(text: &str) -> String {
-    let vendor = text
+    const IDENTITY_PROPERTIES: [&str; 6] = [
+        "java.vendor",
+        "java.vm.vendor",
+        "java.vm.name",
+        "java.runtime.name",
+        "java.runtime.version",
+        "java.vm.version",
+    ];
+
+    let identities = text
         .lines()
-        .find_map(|line| {
-            let line = line.trim();
-            line.strip_prefix("java.vendor =")
-                .map(str::trim)
-                .map(str::to_uppercase)
+        .filter_map(|line| line.trim().split_once('='))
+        .filter_map(|(key, value)| {
+            let key = key.trim();
+            IDENTITY_PROPERTIES
+                .iter()
+                .any(|property| key.eq_ignore_ascii_case(property))
+                .then(|| value.trim().to_uppercase())
         })
-        .unwrap_or_default();
+        .collect::<Vec<_>>();
+
+    let contains_identity = |needles: &[&str]| {
+        identities
+            .iter()
+            .any(|identity| needles.iter().any(|needle| identity.contains(needle)))
+    };
 
     match () {
-        _ if vendor.contains("GRAALVM") => "graalvm".to_string(),
-        _ if vendor.contains("OPENJ9") || vendor.contains("SEMERU") || vendor.contains("IBM") => {
-            "openj9".to_string()
-        }
-        _ if vendor.contains("TEMURIN") || vendor.contains("ECLIPSE") => "temurin".to_string(),
-        _ if vendor.contains("ORACLE") => "oracle".to_string(),
-        _ if vendor.is_empty() => "unknown".to_string(),
-        _ => "openjdk".to_string(),
+        _ if contains_identity(&["GRAALVM"]) => "graalvm".to_string(),
+        _ if contains_identity(&["OPENJ9", "SEMERU", "IBM"]) => "openj9".to_string(),
+        _ if contains_identity(&["TEMURIN", "ECLIPSE", "ADOPTIUM"]) => "temurin".to_string(),
+        _ if contains_identity(&["ORACLE"]) => "oracle".to_string(),
+        _ if contains_identity(&["OPENJDK"]) => "openjdk".to_string(),
+        _ => "unknown".to_string(),
     }
 }
 
@@ -1069,7 +1084,8 @@ fn runtime_config_candidates(runtime_root: &Path) -> Vec<PathBuf> {
 mod tests {
     use super::{
         JavaRuntimeLookupError, RuntimeDownloadActual, RuntimeDownloadEvidence,
-        RuntimeDownloadIntegrityError, component_manifest_destination, verify_runtime_download,
+        RuntimeDownloadIntegrityError, component_manifest_destination, detect_distribution,
+        verify_runtime_download,
     };
     use std::path::{Path, PathBuf};
 
@@ -1092,6 +1108,84 @@ mod tests {
             Err(JavaRuntimeLookupError::Download(message)) => message,
             other => panic!("expected unsafe manifest path error, got {other:?}"),
         }
+    }
+
+    fn assert_runtime_distribution(text: &str, expected: &str) {
+        assert_eq!(detect_distribution(text), expected);
+    }
+
+    #[test]
+    fn detect_runtime_distribution_favors_graalvm_identity() {
+        assert_runtime_distribution(
+            r#"
+                java.vendor = Oracle Corporation
+                java.vm.name = GraalVM 64-Bit Server VM
+            "#,
+            "graalvm",
+        );
+        assert_runtime_distribution(
+            r#"
+                java.vendor = OpenJDK
+                java.runtime.name = GraalVM Runtime Environment
+            "#,
+            "graalvm",
+        );
+    }
+
+    #[test]
+    fn detect_runtime_distribution_classifies_openj9_identity() {
+        for text in [
+            "java.vm.name = Eclipse OpenJ9 VM",
+            "java.runtime.name = IBM Semeru Runtime Open Edition",
+            "java.vm.vendor = IBM Corporation",
+        ] {
+            assert_runtime_distribution(text, "openj9");
+        }
+    }
+
+    #[test]
+    fn detect_runtime_distribution_classifies_temurin_identity() {
+        for text in [
+            "java.runtime.name = OpenJDK Runtime Environment Temurin-21.0.2+13",
+            "java.vendor = Eclipse Adoptium",
+            "java.vm.vendor = Eclipse Foundation",
+        ] {
+            assert_runtime_distribution(text, "temurin");
+        }
+    }
+
+    #[test]
+    fn detect_runtime_distribution_classifies_oracle_identity() {
+        assert_runtime_distribution(
+            r#"
+                java.vendor   =   Oracle Corporation
+                java.vm.name = Java HotSpot(TM) 64-Bit Server VM
+            "#,
+            "oracle",
+        );
+    }
+
+    #[test]
+    fn detect_runtime_distribution_classifies_generic_openjdk_identity() {
+        assert_runtime_distribution(
+            r#"
+                java.vendor = Debian
+                java.vm.name = OpenJDK 64-Bit Server VM
+                java.runtime.version = 21.0.5+11-Debian-1
+            "#,
+            "openjdk",
+        );
+    }
+
+    #[test]
+    fn detect_runtime_distribution_classifies_missing_identity_as_unknown() {
+        assert_runtime_distribution(
+            r#"
+                java.home = /opt/java
+                sun.arch.data.model = 64
+            "#,
+            "unknown",
+        );
     }
 
     #[test]
