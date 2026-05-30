@@ -731,6 +731,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "sysinfo",
  "thiserror 2.0.18",
  "zip",
 ]

@@ -1,4 +1,5 @@
 use croopor_minecraft::JavaRuntimeInfo;
+use sysinfo::System;
 
 pub const PRESET_SMOOTH: &str = "smooth";
 pub const PRESET_PERFORMANCE: &str = "performance";
@@ -7,6 +8,9 @@ pub const PRESET_GRAALVM: &str = "graalvm";
 pub const PRESET_LEGACY: &str = "legacy";
 pub const PRESET_LEGACY_PVP: &str = "legacy_pvp";
 pub const PRESET_LEGACY_HEAVY: &str = "legacy_heavy";
+
+const ULTRA_LOW_LATENCY_MIN_LOGICAL_CORES: usize = 8;
+const ULTRA_LOW_LATENCY_MIN_TOTAL_MEMORY_MB: u64 = 8 * 1024;
 
 pub fn recommended_preset(
     requested: &str,
@@ -138,7 +142,7 @@ pub fn supports_zgc(info: &JavaRuntimeInfo) -> bool {
 }
 
 pub fn supports_generational_zgc(info: &JavaRuntimeInfo) -> bool {
-    supports_zgc(info) && (21..=23).contains(&info.major)
+    supports_zgc(info) && info.major >= 21
 }
 
 fn auto_select_preset(
@@ -146,6 +150,25 @@ fn auto_select_preset(
     loader: &str,
     is_modded: bool,
     info: &JavaRuntimeInfo,
+) -> String {
+    let (logical_cores, total_memory_mb) = host_evidence();
+    auto_select_preset_with_host(
+        version_id,
+        loader,
+        is_modded,
+        info,
+        logical_cores,
+        total_memory_mb,
+    )
+}
+
+fn auto_select_preset_with_host(
+    version_id: &str,
+    loader: &str,
+    is_modded: bool,
+    info: &JavaRuntimeInfo,
+    logical_cores: Option<usize>,
+    total_memory_mb: Option<u64>,
 ) -> String {
     if !supports_hotspot_tuning(info) {
         return String::new();
@@ -162,10 +185,32 @@ fn auto_select_preset(
     if is_modded_launch(loader, is_modded) {
         return PRESET_PERFORMANCE.to_string();
     }
+    if supports_generational_zgc(info) && is_ultra_low_latency_host(logical_cores, total_memory_mb)
+    {
+        return PRESET_ULTRA_LOW_LATENCY.to_string();
+    }
     if supports_shenandoah(info) {
         return PRESET_SMOOTH.to_string();
     }
     PRESET_PERFORMANCE.to_string()
+}
+
+fn host_evidence() -> (Option<usize>, Option<u64>) {
+    let logical_cores = std::thread::available_parallelism().ok().map(usize::from);
+
+    let mut system = System::new();
+    system.refresh_memory();
+    let total_memory_mb = system.total_memory() / (1024 * 1024);
+
+    (
+        logical_cores,
+        (total_memory_mb > 0).then_some(total_memory_mb),
+    )
+}
+
+fn is_ultra_low_latency_host(logical_cores: Option<usize>, total_memory_mb: Option<u64>) -> bool {
+    logical_cores.is_some_and(|value| value >= ULTRA_LOW_LATENCY_MIN_LOGICAL_CORES)
+        && total_memory_mb.is_some_and(|value| value >= ULTRA_LOW_LATENCY_MIN_TOTAL_MEMORY_MB)
 }
 
 fn ultra_low_latency_args(info: &JavaRuntimeInfo, low_impact_startup: bool) -> Vec<String> {
@@ -305,12 +350,78 @@ mod tests {
     #[test]
     fn modern_non_graalvm_defaults_stay_on_hotspot_presets() {
         assert_eq!(
-            recommended_preset("", "1.20.4", "vanilla", false, &info(21)),
+            auto_select_preset_with_host(
+                "1.20.4",
+                "vanilla",
+                false,
+                &info(21),
+                Some(4),
+                Some(8192)
+            ),
             PRESET_SMOOTH
         );
         assert_eq!(
-            recommended_preset("", "1.20.4", "forge", true, &info(21)),
+            auto_select_preset_with_host(
+                "1.20.4",
+                "forge",
+                true,
+                &info(21),
+                Some(16),
+                Some(32_768)
+            ),
             PRESET_PERFORMANCE
+        );
+    }
+
+    #[test]
+    fn high_end_modern_vanilla_auto_selects_ultra_low_latency() {
+        assert_eq!(
+            auto_select_preset_with_host(
+                "1.20.6",
+                "vanilla",
+                false,
+                &info(21),
+                Some(8),
+                Some(8192)
+            ),
+            PRESET_ULTRA_LOW_LATENCY
+        );
+        assert_eq!(
+            auto_select_preset_with_host(
+                "1.21.1",
+                "vanilla",
+                false,
+                &info(24),
+                Some(12),
+                Some(16_384)
+            ),
+            PRESET_ULTRA_LOW_LATENCY
+        );
+    }
+
+    #[test]
+    fn modern_vanilla_below_high_end_threshold_keeps_smooth() {
+        assert_eq!(
+            auto_select_preset_with_host(
+                "1.20.6",
+                "vanilla",
+                false,
+                &info(21),
+                Some(7),
+                Some(8192)
+            ),
+            PRESET_SMOOTH
+        );
+        assert_eq!(
+            auto_select_preset_with_host(
+                "1.20.6",
+                "vanilla",
+                false,
+                &info(21),
+                Some(8),
+                Some(8191)
+            ),
+            PRESET_SMOOTH
         );
     }
 
