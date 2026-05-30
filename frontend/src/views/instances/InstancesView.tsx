@@ -7,11 +7,9 @@ import { openContextMenu } from '../../ui/ContextMenu';
 import { useTheme } from '../../hooks/use-theme';
 import { instances, versions, runningSessions } from '../../store';
 import { navigate } from '../../ui-state';
-import { createInstance } from '../../instance-create';
 import { loaderKeyFromVersion, LOADER_LABELS } from '../create/defaults';
 import { deleteInstanceFlow, duplicateInstance, openInstanceFolder, renameInstance } from '../instance/InstanceDetailView';
 import type { EnrichedInstance, Version } from '../../types';
-import { parseVersionDisplay } from '../../utils';
 
 function fmtRelative(iso?: string): string {
   if (!iso) return 'never';
@@ -39,7 +37,6 @@ function loaderLabel(v: Version | undefined): string {
 }
 
 const LIST_COLS = '52px 2.4fr 1fr 1fr 1fr 140px';
-const MIGRATION_VERSION_LIMIT = 4;
 
 function menuItemsFor(inst: EnrichedInstance): Parameters<typeof openContextMenu>[1] {
   return [
@@ -127,107 +124,6 @@ function GridCard({ inst }: { inst: EnrichedInstance }): JSX.Element {
   );
 }
 
-function migrationVersionDisplay(version: Version): { title: string; detail: string } {
-  const display = parseVersionDisplay(version.id, version, versions.value);
-  const title = display.name === version.id ? versionLabel(version) : display.name;
-  const detail = display.hint || version.minecraft_meta.effective_version || version.id;
-  return { title, detail };
-}
-
-function migrationInstanceName(version: Version): string {
-  const display = migrationVersionDisplay(version);
-  return display.title.trim() || versionLabel(version);
-}
-
-function MigrationRow({
-  version,
-  busy,
-  disabled,
-  onCreate,
-}: {
-  version: Version;
-  busy: boolean;
-  disabled: boolean;
-  onCreate: (version: Version) => void;
-}): JSX.Element {
-  const display = migrationVersionDisplay(version);
-  const loader = loaderLabel(version);
-  return (
-    <div class="cp-migration-row">
-      <div class="cp-migration-mark">
-        <Icon name={version.loader ? 'puzzle' : 'cube'} size={16} color="var(--text-dim)" />
-      </div>
-      <div class="cp-migration-version">
-        <strong>{display.title}</strong>
-        <span>{loader} · {display.detail}</span>
-      </div>
-      <Button
-        size="sm"
-        variant="secondary"
-        icon="plus"
-        disabled={disabled}
-        title={`Create instance from ${display.title}`}
-        onClick={() => onCreate(version)}
-      >
-        {busy ? 'Creating' : 'Create'}
-      </Button>
-    </div>
-  );
-}
-
-function InstalledVersionsEmpty({
-  installedVersions,
-}: {
-  installedVersions: Version[];
-}): JSX.Element {
-  const [creatingVersionId, setCreatingVersionId] = useState<string | null>(null);
-  const shown = installedVersions.slice(0, MIGRATION_VERSION_LIMIT);
-  const remaining = installedVersions.length - shown.length;
-
-  const createFromInstalled = (version: Version): void => {
-    if (creatingVersionId) return;
-    setCreatingVersionId(version.id);
-    void createInstance({
-      name: migrationInstanceName(version),
-      versionId: version.id,
-      icon: '',
-      accent: '',
-      install: { kind: 'none' },
-    }).then((result) => {
-      if (!result.ok) setCreatingVersionId(null);
-    }, () => setCreatingVersionId(null));
-  };
-
-  return (
-    <div class="cp-empty cp-migration-empty">
-      <div class="cp-card cp-migration-panel">
-        <div class="cp-migration-head">
-          <Icon name="archive" size={34} color="var(--text-mute)" />
-          <div>
-            <h2>Installed versions found</h2>
-            <p>Create an isolated instance from a version that is already installed.</p>
-          </div>
-        </div>
-        <div class="cp-migration-list">
-          {shown.map((version) => (
-            <MigrationRow
-              key={version.id}
-              version={version}
-              busy={creatingVersionId === version.id}
-              disabled={creatingVersionId != null}
-              onCreate={createFromInstalled}
-            />
-          ))}
-        </div>
-        <div class="cp-migration-foot">
-          {remaining > 0 && <span>{remaining} more installed version{remaining === 1 ? '' : 's'} available</span>}
-          <Button icon="plus" onClick={() => navigate({ name: 'create' })}>New instance</Button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
 export function InstancesView(): JSX.Element {
   const theme = useTheme();
   const [view, setView] = useState<'list' | 'grid'>('list');
@@ -235,10 +131,6 @@ export function InstancesView(): JSX.Element {
   const all = instances.value as EnrichedInstance[];
   const query = q.trim().toLowerCase();
   const filtered = all.filter(i => i.name.toLowerCase().includes(query));
-  const installedLaunchableVersions = [...versions.value]
-    .filter(v => v.installed && v.launchable)
-    .sort((a, b) => (b.release_time || '').localeCompare(a.release_time || ''));
-  const showMigrationEmpty = all.length === 0 && query === '' && installedLaunchableVersions.length > 0;
 
   return (
     <div class="cp-view-page" style={{ gap: 16 }}>
@@ -256,9 +148,7 @@ export function InstancesView(): JSX.Element {
         <Button icon="plus" onClick={() => navigate({ name: 'create' })}>New</Button>
       </div>
 
-      {showMigrationEmpty ? (
-        <InstalledVersionsEmpty installedVersions={installedLaunchableVersions} />
-      ) : filtered.length === 0 ? (
+      {filtered.length === 0 ? (
         <div class="cp-empty">
           <Icon name="cube" size={36} color="var(--text-mute)" />
           <h2>{q ? 'No matches' : 'No instances yet'}</h2>
