@@ -69,6 +69,12 @@ pub enum ResolveError {
         artifact_id: String,
         version_range: String,
     },
+    #[error("managed mod {artifact_id} has invalid hardware_req.{field}: {value}")]
+    InvalidManagedModHardwareRequirement {
+        artifact_id: String,
+        field: &'static str,
+        value: i32,
+    },
     #[error("composition id is required")]
     MissingCompositionId,
     #[error("duplicate composition id: {0}")]
@@ -217,6 +223,7 @@ fn validate_managed_mod_artifact(
         });
     }
     validate_managed_mod_version_range(managed_mod)?;
+    validate_managed_mod_hardware_req(managed_mod)?;
     Ok(())
 }
 
@@ -231,6 +238,26 @@ fn validate_managed_mod_version_range(managed_mod: &ManagedMod) -> Result<(), Re
             return Err(ResolveError::InvalidManagedModVersionRange {
                 artifact_id: managed_mod.artifact_id.clone(),
                 version_range: trimmed.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_managed_mod_hardware_req(managed_mod: &ManagedMod) -> Result<(), ResolveError> {
+    let Some(requirement) = &managed_mod.hardware_req else {
+        return Ok(());
+    };
+    for (field, value) in [
+        ("gpu_arch_min", requirement.gpu_arch_min),
+        ("min_ram_mb", requirement.min_ram_mb),
+        ("min_cores", requirement.min_cores),
+    ] {
+        if value < 0 {
+            return Err(ResolveError::InvalidManagedModHardwareRequirement {
+                artifact_id: managed_mod.artifact_id.clone(),
+                field,
+                value,
             });
         }
     }
@@ -1148,7 +1175,8 @@ mod tests {
     };
     use crate::types::{
         CompositionPlan, CompositionTier, EmergencyDisable, EmergencyDisableTarget,
-        HardwareProfile, ManagedMod, Manifest, OwnershipClass, PerformanceMode, VersionFamily,
+        HardwareProfile, HardwareRequirement, ManagedMod, Manifest, OwnershipClass,
+        PerformanceMode, VersionFamily,
     };
 
     const FAMILY_F_FABRIC_CORE_ADDITIONS: &[&str] = &[
@@ -1780,6 +1808,55 @@ mod tests {
     }
 
     #[test]
+    fn validation_accepts_default_and_valid_managed_mod_hardware_requirements() {
+        let mut default_manifest = builtin_manifest().expect("manifest");
+        first_managed_mod_mut(&mut default_manifest).hardware_req =
+            Some(HardwareRequirement::default());
+        validate_manifest(&default_manifest).expect("default hardware_req should validate");
+
+        let mut nvidium_manifest = builtin_manifest().expect("manifest");
+        let nvidium = nvidium_managed_mod_mut(&mut nvidium_manifest);
+        nvidium.hardware_req = Some(HardwareRequirement {
+            gpu_vendor: "nvidia".to_string(),
+            gpu_arch_min: 2,
+            ..HardwareRequirement::default()
+        });
+        validate_manifest(&nvidium_manifest).expect("Nvidium hardware_req should validate");
+    }
+
+    #[test]
+    fn validation_rejects_negative_managed_mod_hardware_requirements() {
+        for (field, value) in [
+            ("gpu_arch_min", -1),
+            ("min_ram_mb", -2048),
+            ("min_cores", -2),
+        ] {
+            let mut manifest = builtin_manifest().expect("manifest");
+            let artifact_id = {
+                let managed_mod = first_managed_mod_mut(&mut manifest);
+                let mut requirement = HardwareRequirement::default();
+                match field {
+                    "gpu_arch_min" => requirement.gpu_arch_min = value,
+                    "min_ram_mb" => requirement.min_ram_mb = value,
+                    "min_cores" => requirement.min_cores = value,
+                    _ => unreachable!("test field should be covered"),
+                }
+                managed_mod.hardware_req = Some(requirement);
+                managed_mod.artifact_id.clone()
+            };
+
+            assert_error_kind(
+                validate_manifest(&manifest),
+                ResolveError::InvalidManagedModHardwareRequirement {
+                    artifact_id,
+                    field,
+                    value,
+                },
+            );
+        }
+    }
+
+    #[test]
     fn validation_rejects_invalid_emergency_disables() {
         for (disable, expected) in [
             (
@@ -2001,6 +2078,15 @@ mod tests {
             .iter_mut()
             .find_map(|composition| composition.mods.first_mut())
             .expect("test manifest should include a managed mod")
+    }
+
+    fn nvidium_managed_mod_mut(manifest: &mut Manifest) -> &mut ManagedMod {
+        manifest
+            .compositions
+            .iter_mut()
+            .flat_map(|composition| &mut composition.mods)
+            .find(|managed_mod| managed_mod.slug == "nvidium")
+            .expect("test manifest should include nvidium")
     }
 
     fn count_mods_with_slug(mods: &[ManagedMod], slug: &str) -> usize {
