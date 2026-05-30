@@ -24,6 +24,7 @@
     {"id": "embeddium", "type": "mod", "source": {"provider": "modrinth", "project_id": "embeddium", "slug": "embeddium"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
     {"id": "scalablelux", "type": "mod", "source": {"provider": "modrinth", "project_id": "scalablelux", "slug": "scalablelux"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
     {"id": "particle-core", "type": "mod", "source": {"provider": "modrinth", "project_id": "particle-core", "slug": "particle-core"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
+    {"id": "threadtweak", "type": "mod", "source": {"provider": "modrinth", "project_id": "threadtweak", "slug": "threadtweak"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
     {"id": "badoptimizations", "type": "mod", "source": {"provider": "modrinth", "project_id": "badoptimizations", "slug": "badoptimizations"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"}
   ],
   "emergency_disables": [],
@@ -158,6 +159,7 @@
         {"artifact_id": "clumps", "project_id": "clumps", "slug": "clumps", "name": "Clumps", "condition": "always"},
         {"artifact_id": "scalablelux", "project_id": "scalablelux", "slug": "scalablelux", "name": "ScalableLux", "condition": "always"},
         {"artifact_id": "particle-core", "project_id": "particle-core", "slug": "particle-core", "name": "Particle Core", "condition": "always"},
+        {"artifact_id": "threadtweak", "project_id": "threadtweak", "slug": "threadtweak", "name": "ThreadTweak", "condition": "always"},
         {"artifact_id": "badoptimizations", "project_id": "badoptimizations", "slug": "badoptimizations", "name": "BadOptimizations", "condition": "always"},
         {"artifact_id": "nvidium", "project_id": "nvidium", "slug": "nvidium", "name": "Nvidium", "condition": "hardware", "hardware_req": {"gpu_vendor": "nvidia", "gpu_arch_min": 2}, "mutual_exclusions": ["iris"]}
       ]

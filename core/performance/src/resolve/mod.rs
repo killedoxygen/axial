@@ -1166,9 +1166,10 @@ mod tests {
     fn fabric_family_e_and_f_managed_plans_resolve_real_mods() {
         let manifest = builtin_manifest().expect("manifest");
 
-        for (game_version, expected_family) in
-            [("1.20.1", VersionFamily::E), ("1.20.4", VersionFamily::F)]
-        {
+        for (game_version, expected_family, expects_threadtweak) in [
+            ("1.20.1", VersionFamily::E, false),
+            ("1.20.4", VersionFamily::F, true),
+        ] {
             let plan = resolve_plan(
                 Some(&manifest),
                 ResolutionRequest {
@@ -1187,6 +1188,12 @@ mod tests {
                 plan.mods
                     .iter()
                     .any(|managed_mod| managed_mod.slug == "sodium")
+            );
+            assert_eq!(
+                plan.mods
+                    .iter()
+                    .any(|managed_mod| managed_mod.slug == "threadtweak"),
+                expects_threadtweak
             );
         }
     }
