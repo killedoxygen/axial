@@ -246,9 +246,10 @@ async fn handle_health(
         loader: infer_loader_from_version_id(&instance.version_id),
         mode,
         hardware: state.performance().hardware(),
-        installed_mods: installed_mod_ids_from_state(state_file.as_ref()),
+        installed_mods: installed_mod_evidence(&mods_dir, state_file.as_ref()),
     });
     let (health, warnings) = derive_health(state_file.as_ref(), Some(&plan), &mods_dir);
+    let warnings = response_warnings(&plan, warnings);
 
     Ok(Json(PerformanceHealthResponse {
         active: true,
@@ -411,13 +412,14 @@ async fn execute_performance_operation(
         loader: loader.clone(),
         mode,
         hardware: state.performance().hardware(),
-        installed_mods: Vec::new(),
+        installed_mods: installed_mod_evidence_from_mods_dir(&mods_dir),
     });
     let installed_state = performance
         .ensure_installed(&plan, &game_version, &mods_dir)
         .await
         .map_err(performance_install_error)?;
     let (health, warnings) = derive_health(Some(&installed_state), Some(&plan), &mods_dir);
+    let warnings = response_warnings(&plan, warnings);
 
     Ok(PerformanceInstallResponse {
         active: true,
@@ -827,18 +829,97 @@ fn resolve_instance_mode(
     resolve_config_mode(state, None)
 }
 
-fn installed_mod_ids_from_state(
+fn installed_mod_evidence(
+    mods_dir: &std::path::Path,
     state: Option<&croopor_performance::CompositionState>,
 ) -> Vec<String> {
-    state
-        .map(|value| {
-            value
-                .installed_mods
-                .iter()
-                .map(|installed| installed.project_id.clone())
-                .collect()
-        })
-        .unwrap_or_default()
+    let mut evidence = std::collections::BTreeSet::new();
+    if let Some(state) = state {
+        for installed in &state.installed_mods {
+            add_mod_evidence(&mut evidence, &installed.project_id);
+        }
+    }
+    for value in installed_mod_file_evidence(mods_dir) {
+        evidence.insert(value);
+    }
+    evidence.into_iter().collect()
+}
+
+fn installed_mod_evidence_from_mods_dir(mods_dir: &std::path::Path) -> Vec<String> {
+    let state = load_state(mods_dir).ok().flatten();
+    installed_mod_evidence(mods_dir, state.as_ref())
+}
+
+fn installed_mod_file_evidence(mods_dir: &std::path::Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(mods_dir) else {
+        return Vec::new();
+    };
+    let mut evidence = std::collections::BTreeSet::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if !path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("jar"))
+        {
+            continue;
+        }
+        if let Some(stem) = path.file_stem().and_then(|value| value.to_str()) {
+            add_mod_evidence(&mut evidence, stem);
+        }
+    }
+    evidence.into_iter().collect()
+}
+
+fn add_mod_evidence(evidence: &mut std::collections::BTreeSet<String>, raw: &str) {
+    let normalized = raw.trim().to_lowercase();
+    if normalized.is_empty() {
+        return;
+    }
+    evidence.insert(normalized.clone());
+
+    let mut prefix = String::new();
+    for token in normalized
+        .split(|value: char| !value.is_ascii_alphanumeric())
+        .filter(|value| !value.is_empty())
+    {
+        if is_versionish_mod_filename_token(token) {
+            break;
+        }
+        if prefix.is_empty() {
+            prefix.push_str(token);
+        } else {
+            prefix.push('-');
+            prefix.push_str(token);
+        }
+        evidence.insert(prefix.clone());
+    }
+}
+
+fn is_versionish_mod_filename_token(token: &str) -> bool {
+    token.strip_prefix("mc").is_some_and(|suffix| {
+        suffix
+            .as_bytes()
+            .first()
+            .is_some_and(|value| value.is_ascii_digit())
+    }) || token.strip_prefix('v').is_some_and(|suffix| {
+        suffix
+            .as_bytes()
+            .first()
+            .is_some_and(|value| value.is_ascii_digit())
+    }) || token
+        .as_bytes()
+        .first()
+        .is_some_and(|value| value.is_ascii_digit())
+}
+
+fn response_warnings(plan: &CompositionPlan, health_warnings: Vec<String>) -> Vec<String> {
+    let mut warnings = plan.warnings.clone();
+    warnings.extend(health_warnings);
+    warnings
 }
 
 fn internal_error(error: impl std::fmt::Display) -> (StatusCode, Json<serde_json::Value>) {
@@ -1245,6 +1326,77 @@ mod tests {
         assert!(value.to_string().contains("managed.jar"));
         assert!(!value.to_string().contains(&mods_dir.display().to_string()));
         assert!(!value.to_string().contains(&valid_sha512()));
+    }
+
+    #[tokio::test]
+    async fn health_plan_uses_user_installed_iris_file_for_nvidium_exclusion() {
+        let mut manifest = croopor_performance::builtin_manifest().expect("builtin manifest");
+        manifest.generated_at = "2026-05-30T14:00:00Z".to_string();
+        for composition in &mut manifest.compositions {
+            for managed_mod in &mut composition.mods {
+                if managed_mod.slug == "nvidium" {
+                    managed_mod.condition = croopor_performance::types::ModCondition::Always;
+                    managed_mod.hardware_req = None;
+                }
+            }
+        }
+        let signed = signed_rules_response(&manifest);
+        let remote_url = spawn_rules_server(
+            serde_json::to_vec(&manifest).expect("serialize remote manifest"),
+            Some(signed.signature),
+        )
+        .await;
+        let fixture = TestFixture::new_with_remote_url_and_public_key(
+            "health-iris-nvidium-exclusion",
+            Some(remote_url),
+            Some(signed.public_key),
+        );
+        let Json(status) = handle_rules_refresh(State(fixture.state.clone()))
+            .await
+            .expect("remote manifest should refresh");
+        assert_eq!(status.rule_source, croopor_performance::RuleSource::Remote);
+        let instance_id = fixture.add_instance("Managed", "1.20.4-fabric");
+        let mods_dir = fixture
+            .state
+            .instances()
+            .game_dir(&instance_id)
+            .join("mods");
+        fs::create_dir_all(&mods_dir).expect("create mods dir");
+        fs::write(mods_dir.join("iris-mc1.20.1-1.7.0.jar"), b"iris").expect("write iris jar");
+
+        let Json(response) = handle_health(
+            State(fixture.state.clone()),
+            Query(HealthQuery {
+                instance_id: Some(instance_id),
+            }),
+        )
+        .await
+        .expect("managed health should serialize");
+
+        assert!(response.active);
+        assert!(
+            response.warnings.iter().any(|warning| {
+                warning == "nvidium skipped: incompatible with managed mod iris"
+            })
+        );
+    }
+
+    #[test]
+    fn installed_mod_evidence_preserves_state_ids_and_jar_name_tokens() {
+        let mods_dir = test_root("installed-mod-evidence");
+        fs::write(mods_dir.join("iris-mc1.20.1-1.7.0.jar"), b"iris").expect("write iris jar");
+        fs::write(mods_dir.join("notes.txt"), b"not a jar").expect("write text file");
+        let state =
+            test_composition_state("core", vec![test_installed_mod("sodium", "sodium.jar")]);
+
+        let evidence = installed_mod_evidence(&mods_dir, Some(&state));
+
+        assert!(evidence.contains(&"sodium".to_string()));
+        assert!(evidence.contains(&"iris".to_string()));
+        assert!(evidence.contains(&"iris-mc1.20.1-1.7.0".to_string()));
+        assert!(!evidence.contains(&"notes".to_string()));
+
+        let _ = fs::remove_dir_all(&mods_dir);
     }
 
     #[tokio::test]

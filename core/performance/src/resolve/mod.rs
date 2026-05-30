@@ -1302,6 +1302,39 @@ mod tests {
     }
 
     #[test]
+    fn nvidium_is_skipped_when_iris_is_installed() {
+        let manifest = builtin_manifest().expect("manifest");
+        let hardware = HardwareProfile {
+            gpu_vendor: "nvidia".to_string(),
+            gpu_arch: 2,
+            ..HardwareProfile::default()
+        };
+
+        for game_version in ["1.20.1", "1.20.4"] {
+            let plan = resolve_plan(
+                Some(&manifest),
+                ResolutionRequest {
+                    game_version: game_version.to_string(),
+                    loader: "fabric".to_string(),
+                    mode: PerformanceMode::Managed,
+                    hardware: hardware.clone(),
+                    installed_mods: vec!["iris".to_string()],
+                },
+            );
+
+            assert_eq!(plan.tier, CompositionTier::Extended);
+            assert!(
+                plan.mods
+                    .iter()
+                    .all(|managed_mod| managed_mod.slug != "nvidium")
+            );
+            assert!(plan.warnings.iter().any(|warning| {
+                warning == "nvidium skipped: incompatible with managed mod iris"
+            }));
+        }
+    }
+
+    #[test]
     fn manifest_without_emergency_disables_is_not_current_schema() {
         let error = serde_json::from_value::<Manifest>(serde_json::json!({
             "schema_version": 1,
