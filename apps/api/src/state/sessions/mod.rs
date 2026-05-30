@@ -1,4 +1,5 @@
 mod classify;
+mod priority;
 mod supervisor;
 
 use croopor_launcher::{
@@ -99,8 +100,16 @@ impl SessionStore {
         if let Some(entry) = sessions.get_mut(session_id) {
             entry.startup_observed.store(true, Ordering::Relaxed);
             entry.log_count.fetch_add(1, Ordering::Relaxed);
-            if classify::boot_marker_detected(&text) {
-                record_boot_completion(entry, now_ms());
+            if classify::boot_marker_detected(&text) && record_boot_completion(entry, now_ms()) {
+                let pid = entry.record.pid;
+                if let Err(error) = priority::promote_after_boot(pid) {
+                    tracing::warn!(
+                        session_id,
+                        pid,
+                        error = %error,
+                        "failed to promote launched game process after boot marker"
+                    );
+                }
             }
             if entry.boot_completed.load(Ordering::Relaxed)
                 && matches!(
@@ -149,6 +158,13 @@ impl SessionStore {
         mut command: Command,
     ) -> std::io::Result<LaunchSessionRecord> {
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        if let Err(error) = priority::configure_start_priority(&mut command) {
+            tracing::warn!(
+                session_id = %record.session_id.0,
+                error = %error,
+                "failed to configure launch process priority; continuing with default priority"
+            );
+        }
         let child = command.spawn()?;
         let process_started_at_ms = now_ms();
         record.pid = child.id();
@@ -398,15 +414,16 @@ fn apply_status_update(entry: &mut SessionEntry, event: &mut LaunchStatusEvent) 
     event.stages = entry.record.stages.clone();
 }
 
-fn record_boot_completion(entry: &mut SessionEntry, now: u64) {
+fn record_boot_completion(entry: &mut SessionEntry, now: u64) -> bool {
     if entry.boot_completed.swap(true, Ordering::Relaxed) {
-        return;
+        return false;
     }
     entry.record.boot_completed_at_ms = Some(now);
     entry.record.boot_duration_ms = entry
         .record
         .process_started_at_ms
         .map(|started_at| now.saturating_sub(started_at));
+    true
 }
 
 fn ensure_stage_started(record: &mut LaunchSessionRecord, now: u64) {

@@ -26,3 +26,6 @@ croopor-config = { path = "../../core/config" }
 croopor-launcher = { path = "../../core/launcher" }
 croopor-minecraft = { path = "../../core/minecraft" }
 croopor-performance = { path = "../../core/performance" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading"] }
