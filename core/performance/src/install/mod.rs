@@ -10,7 +10,8 @@ use crate::state::{
 };
 use crate::status::{RuleChannel, RuleSource, RulesValidation};
 use crate::types::{
-    CompositionPlan, CompositionState, InstalledMod, PerformanceMode, ResolutionRequest,
+    CompositionPlan, CompositionState, InstalledMod, OwnershipClass, PerformanceMode,
+    ResolutionRequest,
 };
 use chrono::Utc;
 use sha2::Digest;
@@ -133,6 +134,13 @@ impl PerformanceManager {
             config_dir: Some(config_dir.to_path_buf()),
             remote_rules_url,
         })
+    }
+
+    #[cfg(test)]
+    fn new_with_modrinth_base_url(base_url: String) -> Result<Self, InstallError> {
+        let mut manager = Self::new()?;
+        manager.modrinth = ModrinthClient::new_with_base_url(base_url);
+        Ok(manager)
     }
 
     pub fn get_plan(&self, request: ResolutionRequest) -> CompositionPlan {
@@ -415,6 +423,7 @@ impl PerformanceManager {
                     project_id: managed_mod.project_id.clone(),
                     version_id: version.id,
                     filename,
+                    ownership_class: OwnershipClass::CompositionManaged,
                     sha512: expected_sha,
                 });
             }
@@ -432,6 +441,7 @@ impl PerformanceManager {
             project_id: managed_mod.project_id.clone(),
             version_id: version.id,
             filename,
+            ownership_class: OwnershipClass::CompositionManaged,
             sha512: expected_sha,
         })
     }
@@ -596,7 +606,56 @@ fn rules_client() -> reqwest::Client {
 mod tests {
     use super::*;
     use crate::state::{load_state, save_state};
-    use crate::types::CompositionTier;
+    use crate::types::{CompositionTier, ManagedMod, ModCondition, VersionFamily};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn ensure_installed_writes_composition_managed_ownership() {
+        let root = test_root("ensure-installed-ownership");
+        let manager = PerformanceManager::new_with_modrinth_base_url(spawn_modrinth_server().await)
+            .expect("performance manager");
+        let plan = CompositionPlan {
+            composition_id: "core".to_string(),
+            family: VersionFamily::F,
+            loader: "fabric".to_string(),
+            mode: PerformanceMode::Managed,
+            tier: CompositionTier::Core,
+            mods: vec![ManagedMod {
+                project_id: "sodium".to_string(),
+                slug: "sodium".to_string(),
+                name: "Sodium".to_string(),
+                condition: ModCondition::Always,
+                version_range: String::new(),
+                hardware_req: None,
+                mutual_exclusions: Vec::new(),
+            }],
+            jvm_preset: String::new(),
+            fallback_chain: Vec::new(),
+            warnings: Vec::new(),
+            fallback_reason: String::new(),
+        };
+
+        let state = manager
+            .ensure_installed(&plan, "1.20.4", &root)
+            .await
+            .expect("install managed artifact");
+
+        assert_eq!(state.installed_mods.len(), 1);
+        assert_eq!(
+            state.installed_mods[0].ownership_class,
+            OwnershipClass::CompositionManaged
+        );
+        assert!(root.join("sodium.jar").is_file());
+        let loaded = load_state(&root)
+            .expect("load state")
+            .expect("state should exist");
+        assert_eq!(
+            loaded.installed_mods[0].ownership_class,
+            OwnershipClass::CompositionManaged
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn rollback_restores_previous_managed_files_without_touching_user_files() {
@@ -650,6 +709,43 @@ mod tests {
             .expect_err("missing snapshot should fail");
 
         assert!(matches!(error, InstallError::NoRollbackSnapshot));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn remove_rejects_non_composition_owned_tracked_state_without_deleting_files() {
+        let root = test_root("remove-rejects-user-owned-tracked-state");
+        let manager = PerformanceManager::new().expect("performance manager");
+        fs::create_dir_all(&root).expect("create mods dir");
+        fs::write(root.join("user.jar"), b"user").expect("write user file");
+        fs::write(
+            root.join(".croopor-lock.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "composition_id": "core",
+                "tier": "core",
+                "installed_mods": [{
+                    "project_id": "sodium",
+                    "version_id": "version",
+                    "filename": "user.jar",
+                    "ownership_class": "user_managed",
+                    "sha512": ""
+                }],
+                "installed_at": "2026-05-30T00:00:00Z"
+            }))
+            .expect("serialize state"),
+        )
+        .expect("write invalid state");
+
+        let error = manager
+            .remove_managed(&root)
+            .expect_err("invalid ownership should stop removal");
+
+        assert!(matches!(
+            error,
+            InstallError::State(StateError::InvalidOwnership { .. })
+        ));
+        assert_eq!(fs::read(root.join("user.jar")).expect("read user"), b"user");
+        assert!(root.join(".croopor-lock.json").is_file());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -846,8 +942,71 @@ mod tests {
             project_id: project_id.to_string(),
             version_id: "version".to_string(),
             filename: filename.to_string(),
+            ownership_class: OwnershipClass::CompositionManaged,
             sha512: String::new(),
         }
+    }
+
+    async fn spawn_modrinth_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind modrinth test server");
+        let addr = listener.local_addr().expect("modrinth test addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0_u8; 1024];
+                    loop {
+                        let Ok(read) = stream.read(&mut buf).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&buf[..read]);
+                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                        if request.len() > 8192 {
+                            return;
+                        }
+                    }
+
+                    let request = String::from_utf8_lossy(&request);
+                    let first_line = request.lines().next().unwrap_or_default();
+                    let file_url = format!("http://{addr}/files/sodium.jar");
+                    let (status, content_type, body) = if first_line
+                        .contains("/v2/project/sodium/version")
+                    {
+                        let body = format!(
+                            r#"[{{"id":"version-a","game_versions":["1.20.4"],"loaders":["fabric"],"featured":true,"date_published":"2026-05-30T00:00:00Z","files":[{{"url":"{file_url}","filename":"sodium.jar","primary":true,"hashes":{{}}}}]}}]"#
+                        );
+                        ("200 OK", "application/json", body.into_bytes())
+                    } else if first_line.contains("/files/sodium.jar") {
+                        (
+                            "200 OK",
+                            "application/octet-stream",
+                            b"managed-jar".to_vec(),
+                        )
+                    } else {
+                        ("404 Not Found", "text/plain", b"not found".to_vec())
+                    };
+                    let headers = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    if stream.write_all(headers.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    let _ = stream.write_all(&body).await;
+                });
+            }
+        });
+        format!("http://{addr}")
     }
 
     fn test_root(name: &str) -> PathBuf {

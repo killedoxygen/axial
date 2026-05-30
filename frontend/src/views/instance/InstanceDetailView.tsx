@@ -418,6 +418,7 @@ function installResponseAsHealth(response: PerformanceInstallResponse): Performa
     composition_id: response.composition_id,
     tier: response.tier,
     installed_count: response.installed_count,
+    managed_artifacts: response.managed_artifacts,
     warnings: response.warnings,
   };
 }

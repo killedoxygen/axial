@@ -65,8 +65,8 @@ fn tier_rank(tier: CompositionTier) -> i32 {
 mod tests {
     use super::{BundleHealth, derive_health};
     use crate::types::{
-        CompositionPlan, CompositionState, CompositionTier, InstalledMod, PerformanceMode,
-        VersionFamily,
+        CompositionPlan, CompositionState, CompositionTier, InstalledMod, OwnershipClass,
+        PerformanceMode, VersionFamily,
     };
     use std::{fs, path::PathBuf};
 
@@ -88,6 +88,7 @@ mod tests {
             project_id: "sodium".to_string(),
             version_id: "version".to_string(),
             filename: "sodium.jar".to_string(),
+            ownership_class: OwnershipClass::CompositionManaged,
             sha512: String::new(),
         }]);
 
@@ -107,6 +108,7 @@ mod tests {
             project_id: "sodium".to_string(),
             version_id: "version".to_string(),
             filename: "sodium.jar".to_string(),
+            ownership_class: OwnershipClass::CompositionManaged,
             sha512: String::new(),
         }]);
         state.failure_count = 1;

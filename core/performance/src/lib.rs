@@ -19,10 +19,10 @@ pub use rules_cache::{
 };
 pub use state::{RollbackSnapshotSummary, StateError, load_state, remove_state, save_state};
 pub use status::{
-    FamilyCoverage, OwnershipClass, PerformanceRulesStatus, RuleChannel, RuleSource,
-    RulesValidation, rules_status, rules_status_for,
+    FamilyCoverage, PerformanceRulesStatus, RuleChannel, RuleSource, RulesValidation, rules_status,
+    rules_status_for,
 };
 pub use types::{
     CompositionPlan, CompositionState, CompositionTier, HardwareProfile, InstalledMod, Manifest,
-    PerformanceMode, ResolutionRequest,
+    OwnershipClass, PerformanceMode, ResolutionRequest,
 };

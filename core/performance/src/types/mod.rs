@@ -48,6 +48,13 @@ pub enum EmergencyDisableTarget {
     Artifact,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnershipClass {
+    CompositionManaged,
+    UserManaged,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct HardwareRequirement {
     #[serde(default)]
@@ -154,6 +161,7 @@ pub struct InstalledMod {
     pub project_id: String,
     pub version_id: String,
     pub filename: String,
+    pub ownership_class: OwnershipClass,
     pub sha512: String,
 }
 

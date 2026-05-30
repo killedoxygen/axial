@@ -10,11 +10,14 @@ use axum::{
 };
 use croopor_performance::InstallError;
 use croopor_performance::{
-    BundleHealth, CompositionPlan, CompositionTier, PerformanceMode, PerformanceRulesStatus,
-    ResolutionRequest, RollbackSnapshotSummary, RulesRefreshError, StateError, derive_health,
-    extract_base_version, infer_loader_from_version_id, load_state, parse_mode,
+    BundleHealth, CompositionPlan, CompositionTier, OwnershipClass, PerformanceMode,
+    PerformanceRulesStatus, ResolutionRequest, RollbackSnapshotSummary, RulesRefreshError,
+    StateError, derive_health, extract_base_version, infer_loader_from_version_id, load_state,
+    parse_mode,
 };
 use serde::{Deserialize, Serialize};
+
+const PERFORMANCE_MANAGED_ARTIFACT_SUMMARY_LIMIT: usize = 50;
 
 #[derive(Debug, Deserialize)]
 struct PlanQuery {
@@ -58,6 +61,7 @@ struct PerformanceHealthResponse {
     composition_id: String,
     tier: String,
     installed_count: usize,
+    managed_artifacts: Vec<PerformanceManagedArtifactSummary>,
     warnings: Vec<String>,
 }
 
@@ -71,7 +75,17 @@ struct PerformanceInstallResponse {
     composition_id: String,
     tier: String,
     installed_count: usize,
+    managed_artifacts: Vec<PerformanceManagedArtifactSummary>,
     warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct PerformanceManagedArtifactSummary {
+    project_id: String,
+    version_id: String,
+    filename: String,
+    ownership_class: OwnershipClass,
+    sha512_present: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -182,7 +196,19 @@ async fn handle_health(
                 composition_id: String::new(),
                 tier: String::new(),
                 installed_count: 0,
+                managed_artifacts: Vec::new(),
                 warnings: vec![format!("failed to parse performance state: {error}")],
+            }));
+        }
+        Err(StateError::InvalidOwnership { .. }) => {
+            return Ok(Json(PerformanceHealthResponse {
+                active: true,
+                health: BundleHealth::Invalid,
+                composition_id: String::new(),
+                tier: String::new(),
+                installed_count: 0,
+                managed_artifacts: Vec::new(),
+                warnings: vec!["invalid performance artifact ownership metadata".to_string()],
             }));
         }
         Err(error) => return Err(internal_error(error)),
@@ -211,6 +237,7 @@ async fn handle_health(
             .as_ref()
             .map(|value| value.installed_mods.len())
             .unwrap_or_default(),
+        managed_artifacts: managed_artifact_summary(state_file.as_ref()),
         warnings,
     }))
 }
@@ -317,9 +344,10 @@ async fn execute_performance_operation(
             status: "rolled_back".to_string(),
             install_id: None,
             health,
-            composition_id: restored_state.composition_id,
+            composition_id: restored_state.composition_id.clone(),
             tier: tier_name(restored_state.tier).to_string(),
             installed_count: restored_state.installed_mods.len(),
+            managed_artifacts: managed_artifact_summary(Some(&restored_state)),
             warnings,
         });
     }
@@ -335,7 +363,7 @@ async fn execute_performance_operation(
     {
         performance
             .remove_managed(&mods_dir)
-            .map_err(internal_error)?;
+            .map_err(performance_install_error)?;
 
         return Ok(removed_install_response());
     }
@@ -360,7 +388,7 @@ async fn execute_performance_operation(
     let installed_state = performance
         .ensure_installed(&plan, &game_version, &mods_dir)
         .await
-        .map_err(internal_error)?;
+        .map_err(performance_install_error)?;
     let (health, warnings) = derive_health(Some(&installed_state), Some(&plan), &mods_dir);
 
     Ok(PerformanceInstallResponse {
@@ -368,9 +396,10 @@ async fn execute_performance_operation(
         status: "complete".to_string(),
         install_id: None,
         health,
-        composition_id: installed_state.composition_id,
+        composition_id: installed_state.composition_id.clone(),
         tier: tier_name(installed_state.tier).to_string(),
         installed_count: installed_state.installed_mods.len(),
+        managed_artifacts: managed_artifact_summary(Some(&installed_state)),
         warnings,
     })
 }
@@ -404,6 +433,7 @@ async fn queue_performance_operation(
         composition_id: String::new(),
         tier: String::new(),
         installed_count: 0,
+        managed_artifacts: Vec::new(),
         warnings: Vec::new(),
     })
 }
@@ -567,6 +597,27 @@ fn error_message(error: &(StatusCode, Json<serde_json::Value>)) -> String {
         .to_string()
 }
 
+fn managed_artifact_summary(
+    state: Option<&croopor_performance::CompositionState>,
+) -> Vec<PerformanceManagedArtifactSummary> {
+    state
+        .map(|state| {
+            state
+                .installed_mods
+                .iter()
+                .take(PERFORMANCE_MANAGED_ARTIFACT_SUMMARY_LIMIT)
+                .map(|installed| PerformanceManagedArtifactSummary {
+                    project_id: installed.project_id.clone(),
+                    version_id: installed.version_id.clone(),
+                    filename: installed.filename.clone(),
+                    ownership_class: installed.ownership_class,
+                    sha512_present: !installed.sha512.trim().is_empty(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn disabled_health_response() -> PerformanceHealthResponse {
     PerformanceHealthResponse {
         active: false,
@@ -574,6 +625,7 @@ fn disabled_health_response() -> PerformanceHealthResponse {
         composition_id: String::new(),
         tier: String::new(),
         installed_count: 0,
+        managed_artifacts: Vec::new(),
         warnings: Vec::new(),
     }
 }
@@ -587,6 +639,7 @@ fn removed_install_response() -> PerformanceInstallResponse {
         composition_id: String::new(),
         tier: String::new(),
         installed_count: 0,
+        managed_artifacts: Vec::new(),
         warnings: Vec::new(),
     }
 }
@@ -702,6 +755,12 @@ fn performance_install_error(error: InstallError) -> (StatusCode, Json<serde_jso
         InstallError::State(StateError::InvalidRollbackId) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": "invalid performance rollback snapshot id" })),
+        ),
+        InstallError::State(StateError::InvalidOwnership { .. }) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid performance artifact ownership metadata"
+            })),
         ),
         error => internal_error(error),
     }
@@ -965,6 +1024,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_response_includes_bounded_managed_artifact_summary() {
+        let fixture = TestFixture::new("health-managed-artifacts");
+        let instance_id = fixture.add_instance("Managed", "1.20.4-fabric");
+        let mods_dir = fixture
+            .state
+            .instances()
+            .game_dir(&instance_id)
+            .join("mods");
+        fs::create_dir_all(&mods_dir).expect("create mods dir");
+        fs::write(mods_dir.join("managed.jar"), b"managed").expect("write managed file");
+        croopor_performance::state::save_state(
+            &mods_dir,
+            &test_composition_state(
+                "core",
+                vec![InstalledMod {
+                    project_id: "sodium".to_string(),
+                    version_id: "version-a".to_string(),
+                    filename: "managed.jar".to_string(),
+                    ownership_class: croopor_performance::OwnershipClass::CompositionManaged,
+                    sha512: "abc123".to_string(),
+                }],
+            ),
+        )
+        .expect("save state");
+
+        let Json(response) = handle_health(
+            State(fixture.state.clone()),
+            Query(HealthQuery {
+                instance_id: Some(instance_id),
+            }),
+        )
+        .await
+        .expect("managed health should serialize");
+
+        assert!(response.active);
+        assert_eq!(response.installed_count, 1);
+        assert_eq!(
+            response.managed_artifacts,
+            vec![PerformanceManagedArtifactSummary {
+                project_id: "sodium".to_string(),
+                version_id: "version-a".to_string(),
+                filename: "managed.jar".to_string(),
+                ownership_class: croopor_performance::OwnershipClass::CompositionManaged,
+                sha512_present: true,
+            }]
+        );
+        let value = serde_json::to_value(&response).expect("serialize response");
+        assert!(value.get("managed_artifacts").is_some());
+        assert!(value.to_string().contains("managed.jar"));
+        assert!(!value.to_string().contains(&mods_dir.display().to_string()));
+        assert!(!value.to_string().contains("abc123"));
+    }
+
+    #[tokio::test]
+    async fn health_invalidates_user_managed_artifact_in_tracked_state() {
+        let fixture = TestFixture::new("health-user-managed-state");
+        let instance_id = fixture.add_instance("Managed", "1.20.4-fabric");
+        let mods_dir = fixture
+            .state
+            .instances()
+            .game_dir(&instance_id)
+            .join("mods");
+        fs::create_dir_all(&mods_dir).expect("create mods dir");
+        fs::write(
+            mods_dir.join(".croopor-lock.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "composition_id": "core",
+                "tier": "core",
+                "installed_mods": [{
+                    "project_id": "sodium",
+                    "version_id": "version",
+                    "filename": "user.jar",
+                    "ownership_class": "user_managed",
+                    "sha512": ""
+                }],
+                "installed_at": "2026-05-30T00:00:00Z"
+            }))
+            .expect("serialize state"),
+        )
+        .expect("write state");
+
+        let Json(response) = handle_health(
+            State(fixture.state.clone()),
+            Query(HealthQuery {
+                instance_id: Some(instance_id),
+            }),
+        )
+        .await
+        .expect("invalid ownership should become health response");
+
+        assert_eq!(response.health, BundleHealth::Invalid);
+        assert!(response.managed_artifacts.is_empty());
+        assert_eq!(
+            response.warnings,
+            vec!["invalid performance artifact ownership metadata".to_string()]
+        );
+    }
+
+    #[tokio::test]
     async fn install_missing_instance_id_returns_json_error() {
         let fixture = TestFixture::new("install-missing-instance-id");
 
@@ -1037,6 +1195,7 @@ mod tests {
                     project_id: "sodium".to_string(),
                     version_id: "version".to_string(),
                     filename: "managed.jar".to_string(),
+                    ownership_class: croopor_performance::OwnershipClass::CompositionManaged,
                     sha512: String::new(),
                 }],
                 installed_at: "2026-05-30T00:00:00Z".to_string(),
@@ -1070,6 +1229,64 @@ mod tests {
         assert!(!mods_dir.join("managed.jar").exists());
         assert!(!mods_dir.join(".croopor-lock.json").exists());
         assert!(mods_dir.join("user.jar").is_file());
+    }
+
+    #[tokio::test]
+    async fn install_remove_rejects_invalid_ownership_without_deleting_files() {
+        let fixture = TestFixture::new("install-invalid-ownership-remove");
+        let instance_id = fixture.add_instance("Custom", "1.20.4-fabric");
+        let mods_dir = fixture
+            .state
+            .instances()
+            .game_dir(&instance_id)
+            .join("mods");
+        fs::create_dir_all(&mods_dir).expect("create mods dir");
+        fs::write(mods_dir.join("user.jar"), b"user").expect("write user file");
+        fs::write(
+            mods_dir.join(".croopor-lock.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "composition_id": "core",
+                "tier": "core",
+                "installed_mods": [{
+                    "project_id": "sodium",
+                    "version_id": "version",
+                    "filename": "user.jar",
+                    "ownership_class": "user_managed",
+                    "sha512": ""
+                }],
+                "installed_at": "2026-05-30T00:00:00Z"
+            }))
+            .expect("serialize state"),
+        )
+        .expect("write invalid state");
+
+        let error = handle_install(
+            State(fixture.state.clone()),
+            Json(InstallRequest {
+                instance_id: Some(instance_id),
+                game_version: None,
+                loader: None,
+                mode: Some("custom".to_string()),
+                action: None,
+                rollback_id: None,
+                queued: None,
+            }),
+        )
+        .await
+        .expect_err("invalid ownership should fail");
+
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.1.0,
+            serde_json::json!({
+                "error": "invalid performance artifact ownership metadata"
+            })
+        );
+        assert_eq!(
+            fs::read(mods_dir.join("user.jar")).expect("read user"),
+            b"user"
+        );
+        assert!(mods_dir.join(".croopor-lock.json").is_file());
     }
 
     #[tokio::test]
@@ -1214,6 +1431,16 @@ mod tests {
 
         assert_eq!(response.status, "rolled_back");
         assert_eq!(response.composition_id, "core-a");
+        assert_eq!(
+            response.managed_artifacts,
+            vec![PerformanceManagedArtifactSummary {
+                project_id: "sodium".to_string(),
+                version_id: "version".to_string(),
+                filename: "managed-a.jar".to_string(),
+                ownership_class: croopor_performance::OwnershipClass::CompositionManaged,
+                sha512_present: false,
+            }]
+        );
         assert_eq!(
             fs::read(mods_dir.join("managed-a.jar")).expect("read managed a"),
             b"managed-a"
@@ -1602,6 +1829,7 @@ mod tests {
             project_id: project_id.to_string(),
             version_id: "version".to_string(),
             filename: filename.to_string(),
+            ownership_class: croopor_performance::OwnershipClass::CompositionManaged,
             sha512: String::new(),
         }
     }

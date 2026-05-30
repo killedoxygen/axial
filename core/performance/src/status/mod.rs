@@ -1,6 +1,8 @@
 use crate::health::BundleHealth;
 use crate::rules_cache::RulesCacheStatus;
-use crate::types::{CompositionTier, EmergencyDisableTarget, Manifest, VersionFamily};
+use crate::types::{
+    CompositionTier, EmergencyDisableTarget, Manifest, OwnershipClass, VersionFamily,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -24,13 +26,6 @@ pub enum RuleChannel {
 pub enum RulesValidation {
     Valid,
     Invalid,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OwnershipClass {
-    CompositionManaged,
-    UserManaged,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,14 +209,11 @@ fn coverage_for_family(manifest: &Manifest, family: VersionFamily) -> FamilyCove
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        OwnershipClass, RuleChannel, RuleSource, RulesValidation, rules_status,
-        rules_status_with_cache,
-    };
+    use super::{RuleChannel, RuleSource, RulesValidation, rules_status, rules_status_with_cache};
     use crate::health::BundleHealth;
     use crate::resolve::builtin_manifest;
     use crate::rules_cache::RulesCacheState;
-    use crate::types::{EmergencyDisable, EmergencyDisableTarget, VersionFamily};
+    use crate::types::{EmergencyDisable, EmergencyDisableTarget, OwnershipClass, VersionFamily};
 
     #[test]
     fn bundled_manifest_status_is_truthful_about_current_foundation() {

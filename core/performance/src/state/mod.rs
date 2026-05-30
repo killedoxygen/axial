@@ -1,4 +1,4 @@
-use crate::types::{CompositionState, CompositionTier};
+use crate::types::{CompositionState, CompositionTier, OwnershipClass};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -23,6 +23,11 @@ pub enum StateError {
     Parse(#[from] serde_json::Error),
     #[error("invalid performance state filename: {0}")]
     InvalidFilename(String),
+    #[error("invalid performance artifact ownership for {filename}: {ownership_class}")]
+    InvalidOwnership {
+        filename: String,
+        ownership_class: String,
+    },
     #[error("invalid performance rollback snapshot id")]
     InvalidRollbackId,
     #[error("invalid rollback snapshot: {0}")]
@@ -58,13 +63,18 @@ pub struct RollbackArtifact {
 pub fn load_state(instance_mods_dir: &Path) -> Result<Option<CompositionState>, StateError> {
     let path = lock_file_path(instance_mods_dir);
     match fs::read_to_string(path) {
-        Ok(data) => Ok(Some(serde_json::from_str(&data)?)),
+        Ok(data) => {
+            let state = serde_json::from_str(&data)?;
+            validate_state(&state)?;
+            Ok(Some(state))
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(StateError::Read(error)),
     }
 }
 
 pub fn save_state(instance_mods_dir: &Path, state: &CompositionState) -> Result<(), StateError> {
+    validate_state(state)?;
     fs::create_dir_all(instance_mods_dir)?;
     let data = serde_json::to_string_pretty(state)?;
     let path = lock_file_path(instance_mods_dir);
@@ -91,7 +101,7 @@ pub fn save_rollback_snapshot(
     instance_mods_dir: &Path,
     state: &CompositionState,
 ) -> Result<RollbackSnapshot, StateError> {
-    validate_state_filenames(state)?;
+    validate_state(state)?;
 
     let files_dir = rollback_files_dir_path(instance_mods_dir);
     fs::create_dir_all(&files_dir)?;
@@ -196,7 +206,7 @@ pub fn restore_rollback_snapshot(
         .collect();
 
     if let Ok(Some(current_state)) = load_state(instance_mods_dir) {
-        validate_state_filenames(&current_state)?;
+        validate_state(&current_state)?;
         for installed in current_state.installed_mods {
             if snapshot_filenames.contains(&installed.filename) {
                 continue;
@@ -267,7 +277,7 @@ fn validate_rollback_snapshot(snapshot: &RollbackSnapshot) -> Result<(), StateEr
         )));
     }
     validate_rollback_snapshot_id(&snapshot.id)?;
-    validate_state_filenames(&snapshot.state)?;
+    validate_state(&snapshot.state)?;
 
     let state_filenames: HashSet<&str> = snapshot
         .state
@@ -302,9 +312,18 @@ fn validate_rollback_snapshot_id(snapshot_id: &str) -> Result<(), StateError> {
     }
 }
 
-fn validate_state_filenames(state: &CompositionState) -> Result<(), StateError> {
+fn validate_state(state: &CompositionState) -> Result<(), StateError> {
     for installed in &state.installed_mods {
         validate_managed_filename(&installed.filename)?;
+        if installed.ownership_class != OwnershipClass::CompositionManaged {
+            return Err(StateError::InvalidOwnership {
+                filename: installed.filename.clone(),
+                ownership_class: serde_json::to_value(installed.ownership_class)
+                    .ok()
+                    .and_then(|value| value.as_str().map(ToOwned::to_owned))
+                    .unwrap_or_else(|| format!("{:?}", installed.ownership_class)),
+            });
+        }
     }
     Ok(())
 }
@@ -639,6 +658,82 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn load_state_rejects_missing_or_unknown_ownership() {
+        let root = test_root("invalid-ownership-shape");
+        fs::write(
+            lock_file_path(&root),
+            serde_json::to_vec(&serde_json::json!({
+                "composition_id": "core",
+                "tier": "core",
+                "installed_mods": [{
+                    "project_id": "sodium",
+                    "version_id": "version",
+                    "filename": "sodium.jar",
+                    "sha512": ""
+                }],
+                "installed_at": "2026-05-30T00:00:00Z"
+            }))
+            .expect("serialize state"),
+        )
+        .expect("write missing ownership state");
+        assert!(matches!(
+            load_state(&root).expect_err("missing ownership should be invalid"),
+            StateError::Parse(_)
+        ));
+
+        fs::write(
+            lock_file_path(&root),
+            serde_json::to_vec(&serde_json::json!({
+                "composition_id": "core",
+                "tier": "core",
+                "installed_mods": [{
+                    "project_id": "sodium",
+                    "version_id": "version",
+                    "filename": "sodium.jar",
+                    "ownership_class": "plugin_managed",
+                    "sha512": ""
+                }],
+                "installed_at": "2026-05-30T00:00:00Z"
+            }))
+            .expect("serialize state"),
+        )
+        .expect("write unknown ownership state");
+        assert!(matches!(
+            load_state(&root).expect_err("unknown ownership should be invalid"),
+            StateError::Parse(_)
+        ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_state_rejects_user_managed_artifacts_as_tracked_state() {
+        let root = test_root("user-managed-state");
+        fs::write(
+            lock_file_path(&root),
+            serde_json::to_vec(&serde_json::json!({
+                "composition_id": "core",
+                "tier": "core",
+                "installed_mods": [{
+                    "project_id": "sodium",
+                    "version_id": "version",
+                    "filename": "user.jar",
+                    "ownership_class": "user_managed",
+                    "sha512": ""
+                }],
+                "installed_at": "2026-05-30T00:00:00Z"
+            }))
+            .expect("serialize state"),
+        )
+        .expect("write user-managed state");
+
+        let error = load_state(&root).expect_err("user-managed tracked state should fail");
+
+        assert!(matches!(error, StateError::InvalidOwnership { .. }));
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn test_state(composition_id: &str, installed_mods: Vec<InstalledMod>) -> CompositionState {
         CompositionState {
             composition_id: composition_id.to_string(),
@@ -655,6 +750,7 @@ mod tests {
             project_id: project_id.to_string(),
             version_id: "version".to_string(),
             filename: filename.to_string(),
+            ownership_class: OwnershipClass::CompositionManaged,
             sha512: String::new(),
         }
     }

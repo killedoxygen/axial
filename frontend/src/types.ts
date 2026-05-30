@@ -566,10 +566,19 @@ export interface PerformanceHealthResponse {
   composition_id: string;
   tier: CompositionTier | '';
   installed_count: number;
+  managed_artifacts: PerformanceManagedArtifactSummary[];
   warnings: string[];
 }
 
 export type PerformanceInstallStatus = 'queued' | 'complete' | 'removed' | 'rolled_back';
+
+export interface PerformanceManagedArtifactSummary {
+  project_id: string;
+  version_id: string;
+  filename: string;
+  ownership_class: PerformanceOwnershipClass;
+  sha512_present: boolean;
+}
 
 export interface PerformanceInstallResponse {
   active: boolean;
@@ -579,6 +588,7 @@ export interface PerformanceInstallResponse {
   composition_id: string;
   tier: CompositionTier | '';
   installed_count: number;
+  managed_artifacts: PerformanceManagedArtifactSummary[];
   warnings: string[];
 }
 

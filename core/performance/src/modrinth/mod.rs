@@ -40,6 +40,13 @@ impl ModrinthClient {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_with_base_url(base_url: String) -> Self {
+        let mut client = Self::new();
+        client.base_url = base_url;
+        client
+    }
+
     pub async fn list_versions(
         &self,
         project_id: &str,
