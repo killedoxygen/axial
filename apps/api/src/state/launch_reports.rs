@@ -403,10 +403,14 @@ fn build_comparison_from_candidates(
         })
         .collect::<Vec<_>>();
     matches.sort_by(|(left, _), (right, _)| {
-        right
-            .recorded_at
-            .cmp(&left.recorded_at)
-            .then_with(|| right.session_id.cmp(&left.session_id))
+        comparison_baseline_mode_rank(current, left)
+            .cmp(&comparison_baseline_mode_rank(current, right))
+            .then_with(|| {
+                right
+                    .recorded_at
+                    .cmp(&left.recorded_at)
+                    .then_with(|| right.session_id.cmp(&left.session_id))
+            })
     });
     let matched_sample_count = matches.len();
     let (baseline, baseline_value_ms) = matches.first()?;
@@ -422,6 +426,13 @@ fn build_comparison_from_candidates(
         delta_ms,
         delta_percent: (delta_ms as f64 / *baseline_value_ms as f64) * 100.0,
     })
+}
+
+fn comparison_baseline_mode_rank(current: &LaunchProofRecord, candidate: &LaunchProofRecord) -> u8 {
+    match (known_launch_mode(current), known_launch_mode(candidate)) {
+        (Some("managed"), Some("vanilla")) => 0,
+        _ => 1,
+    }
 }
 
 fn launch_proof_outcome_is_comparable(outcome: &str) -> bool {
@@ -448,14 +459,7 @@ fn launch_comparison_metric_for_current(
 
 fn comparison_dimensions_match(current: &LaunchProofRecord, candidate: &LaunchProofRecord) -> bool {
     current.session_id != candidate.session_id
-        && required_dimensions_match(
-            &current.scenario.scenario_id,
-            &candidate.scenario.scenario_id,
-        )
-        && required_dimensions_match(
-            &current.scenario.performance_mode,
-            &candidate.scenario.performance_mode,
-        )
+        && launch_modes_are_comparable(current, candidate)
         && required_version_targets_match(current, candidate)
         && current.scenario.requested_memory_mb == candidate.scenario.requested_memory_mb
         && required_dimensions_match(&current.device.tier, &candidate.device.tier)
@@ -471,6 +475,30 @@ fn comparison_dimensions_match(current: &LaunchProofRecord, candidate: &LaunchPr
             current.scenario.benchmark_mode.as_deref(),
             candidate.scenario.benchmark_mode.as_deref(),
         )
+}
+
+fn launch_modes_are_comparable(current: &LaunchProofRecord, candidate: &LaunchProofRecord) -> bool {
+    match (known_launch_mode(current), known_launch_mode(candidate)) {
+        (Some("managed"), Some("vanilla" | "managed")) => true,
+        (Some("vanilla"), Some("vanilla")) => true,
+        (Some("custom"), Some("custom")) => true,
+        _ => false,
+    }
+}
+
+fn known_launch_mode(report: &LaunchProofRecord) -> Option<&str> {
+    let mode = normalized_dimension(&report.scenario.performance_mode)?;
+    match mode {
+        "managed" | "vanilla" | "custom"
+            if required_dimensions_match(
+                &report.scenario.scenario_id,
+                scenario_id_for_performance_mode(mode),
+            ) =>
+        {
+            Some(mode)
+        }
+        _ => None,
+    }
 }
 
 fn required_dimensions_match(left: &str, right: &str) -> bool {
@@ -1055,6 +1083,88 @@ mod tests {
     }
 
     #[test]
+    fn managed_benchmark_launch_report_compares_to_matching_vanilla_baseline() {
+        let mut current = comparison_report("current", "2026-01-02T00:00:00.000Z", 90);
+        set_benchmark_metadata(&mut current, "development-default", "repeat", "development");
+        let mut vanilla = comparison_report("vanilla", "2026-01-01T00:00:00.000Z", 120);
+        set_launch_mode(&mut vanilla, "vanilla");
+        set_benchmark_metadata(&mut vanilla, "development-default", "repeat", "development");
+
+        let comparison = build_comparison_from_candidates(&current, &[vanilla])
+            .expect("matching vanilla benchmark report comparison");
+
+        assert_eq!(comparison.baseline_session_id, "vanilla");
+        assert_eq!(comparison.matched_sample_count, 1);
+        assert_eq!(comparison.baseline_value_ms, 120);
+    }
+
+    #[test]
+    fn managed_benchmark_launch_report_prefers_vanilla_over_newer_managed_baseline() {
+        let mut current = comparison_report("current", "2026-01-03T00:00:00.000Z", 90);
+        set_benchmark_metadata(&mut current, "development-default", "repeat", "development");
+        let mut vanilla = comparison_report("vanilla", "2026-01-01T00:00:00.000Z", 120);
+        set_launch_mode(&mut vanilla, "vanilla");
+        set_benchmark_metadata(&mut vanilla, "development-default", "repeat", "development");
+        let mut managed = comparison_report("managed", "2026-01-02T00:00:00.000Z", 110);
+        set_benchmark_metadata(&mut managed, "development-default", "repeat", "development");
+
+        let comparison = build_comparison_from_candidates(&current, &[vanilla, managed])
+            .expect("matching benchmark report comparison");
+
+        assert_eq!(comparison.baseline_session_id, "vanilla");
+        assert_eq!(comparison.matched_sample_count, 2);
+        assert_eq!(comparison.baseline_value_ms, 120);
+    }
+
+    #[test]
+    fn vanilla_launch_report_does_not_compare_to_managed_launch_report() {
+        let mut current = comparison_report("current", "2026-01-02T00:00:00.000Z", 90);
+        set_launch_mode(&mut current, "vanilla");
+        let managed = comparison_report("managed", "2026-01-01T00:00:00.000Z", 120);
+
+        let comparison = build_comparison_from_candidates(&current, &[managed]);
+
+        assert_eq!(comparison, None);
+    }
+
+    #[test]
+    fn custom_launch_report_does_not_compare_to_managed_or_vanilla_launch_report() {
+        let mut current = comparison_report("current", "2026-01-02T00:00:00.000Z", 90);
+        set_launch_mode(&mut current, "custom");
+        let managed = comparison_report("managed", "2026-01-01T00:00:00.000Z", 120);
+        let mut vanilla = comparison_report("vanilla", "2026-01-01T00:00:01.000Z", 130);
+        set_launch_mode(&mut vanilla, "vanilla");
+
+        let comparison = build_comparison_from_candidates(&current, &[managed, vanilla]);
+
+        assert_eq!(comparison, None);
+    }
+
+    #[test]
+    fn unknown_or_empty_launch_modes_do_not_cross_compare() {
+        let current = comparison_report("current", "2026-01-02T00:00:00.000Z", 90);
+        let mut unknown = comparison_report("unknown", "2026-01-01T00:00:00.000Z", 120);
+        set_launch_mode(&mut unknown, "unknown");
+        let mut empty = comparison_report("empty", "2026-01-01T00:00:01.000Z", 130);
+        empty.scenario.scenario_id.clear();
+        empty.scenario.performance_mode.clear();
+
+        let comparison = build_comparison_from_candidates(&current, &[unknown, empty]);
+
+        assert_eq!(comparison, None);
+
+        let mut current_unknown =
+            comparison_report("current-unknown", "2026-01-02T00:00:00.000Z", 90);
+        set_launch_mode(&mut current_unknown, "unknown");
+        let mut vanilla = comparison_report("vanilla", "2026-01-01T00:00:00.000Z", 120);
+        set_launch_mode(&mut vanilla, "vanilla");
+
+        let comparison = build_comparison_from_candidates(&current_unknown, &[vanilla]);
+
+        assert_eq!(comparison, None);
+    }
+
+    #[test]
     fn benchmark_launch_reports_with_different_profile_do_not_compare() {
         let mut current = comparison_report("current", "2026-01-02T00:00:00.000Z", 90);
         set_benchmark_metadata(&mut current, "development-default", "repeat", "development");
@@ -1552,6 +1662,11 @@ mod tests {
         report.scenario.benchmark_profile = Some(profile.to_string());
         report.scenario.benchmark_run_type = Some(run_type.to_string());
         report.scenario.benchmark_mode = Some(mode.to_string());
+    }
+
+    fn set_launch_mode(report: &mut LaunchProofRecord, mode: &str) {
+        report.scenario.scenario_id = scenario_id_for_performance_mode(mode).to_string();
+        report.scenario.performance_mode = mode.to_string();
     }
 
     fn test_record(session_id: &str) -> LaunchSessionRecord {
