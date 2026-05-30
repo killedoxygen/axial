@@ -1,5 +1,5 @@
 use hex::encode;
-use reqwest::{Client, Url};
+use reqwest::{Client, Response, StatusCode, Url};
 use serde::Deserialize;
 use sha2::{Digest, Sha512};
 use std::fs;
@@ -9,6 +9,7 @@ use std::time::Duration;
 use thiserror::Error;
 
 const USER_AGENT: &str = "croopor/0.3.1 (github.com/mateoltd/croopor)";
+const RATE_LIMIT_BODY_LIMIT: usize = 4096;
 
 #[derive(Debug, Error)]
 pub enum ModrinthError {
@@ -16,6 +17,11 @@ pub enum ModrinthError {
     Request(#[from] reqwest::Error),
     #[error("modrinth download failed: {0}")]
     Io(#[from] io::Error),
+    #[error("modrinth API rate limited; reset after {reset_after_seconds:?} seconds: {body}")]
+    RateLimited {
+        reset_after_seconds: Option<u64>,
+        body: String,
+    },
     #[error("modrinth API returned HTTP {status}: {body}")]
     Http { status: u16, body: String },
     #[error("hash mismatch: expected {expected} got {actual}")]
@@ -76,6 +82,10 @@ impl ModrinthClient {
 
         let response = self.client.get(url).send().await?;
         if !response.status().is_success() {
+            if response.status() == StatusCode::TOO_MANY_REQUESTS {
+                return Err(rate_limited_error(response).await);
+            }
+
             let status = response.status().as_u16();
             let body = response.text().await.unwrap_or_default();
             return Err(ModrinthError::Http { status, body });
@@ -105,6 +115,10 @@ impl ModrinthClient {
     ) -> Result<(), ModrinthError> {
         let response = self.client.get(url).send().await?;
         if !response.status().is_success() {
+            if response.status() == StatusCode::TOO_MANY_REQUESTS {
+                return Err(rate_limited_error(response).await);
+            }
+
             let status = response.status().as_u16();
             let body = response.text().await.unwrap_or_default();
             return Err(ModrinthError::Http { status, body });
@@ -207,12 +221,65 @@ fn matches_any_fold(values: &[String], wanted: &[String]) -> bool {
         })
 }
 
+async fn rate_limited_error(response: Response) -> ModrinthError {
+    let reset_after_seconds = response
+        .headers()
+        .get("X-Ratelimit-Reset")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    let body = bounded_response_text(response, RATE_LIMIT_BODY_LIMIT).await;
+    ModrinthError::RateLimited {
+        reset_after_seconds,
+        body,
+    }
+}
+
+async fn bounded_response_text(mut response: Response, limit: usize) -> String {
+    let mut body = Vec::new();
+    while body.len() < limit {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) | Err(_) => break,
+        };
+        let remaining = limit - body.len();
+        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+    }
+    String::from_utf8_lossy(&body).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn list_versions_maps_429_to_rate_limited_error() {
+        let base_url = spawn_response_server(
+            "429 Too Many Requests",
+            vec![("X-Ratelimit-Reset".to_string(), "42".to_string())],
+            b"try again later".to_vec(),
+        )
+        .await;
+        let client = ModrinthClient::new_with_base_url(base_url);
+
+        let error = client
+            .list_versions("sodium", &["1.21.1".to_string()], &["fabric".to_string()])
+            .await
+            .expect_err("429 should return typed rate-limit error");
+
+        match error {
+            ModrinthError::RateLimited {
+                reset_after_seconds,
+                body,
+            } => {
+                assert_eq!(reset_after_seconds, Some(42));
+                assert_eq!(body, "try again later");
+            }
+            other => panic!("expected rate-limit error, got {other:?}"),
+        }
+    }
 
     #[tokio::test]
     async fn download_file_to_path_streams_and_verifies_sha512() {
@@ -229,6 +296,38 @@ mod tests {
             .expect("download verified file");
 
         assert_eq!(fs::read(&temp_path).expect("read temp file"), body);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn download_file_to_path_maps_429_before_creating_temp_file() {
+        let url = spawn_response_server(
+            "429 Too Many Requests",
+            vec![("X-Ratelimit-Reset".to_string(), "7".to_string())],
+            vec![b'x'; RATE_LIMIT_BODY_LIMIT + 64],
+        )
+        .await;
+        let root = test_root("download-rate-limited");
+        let temp_path = root.join("nested").join("sodium.jar.tmp");
+        let client = ModrinthClient::new();
+
+        let error = client
+            .download_file_to_path(&url, "", &temp_path)
+            .await
+            .expect_err("429 should return typed rate-limit error");
+
+        match error {
+            ModrinthError::RateLimited {
+                reset_after_seconds,
+                body,
+            } => {
+                assert_eq!(reset_after_seconds, Some(7));
+                assert_eq!(body.len(), RATE_LIMIT_BODY_LIMIT);
+            }
+            other => panic!("expected rate-limit error, got {other:?}"),
+        }
+        assert!(!temp_path.exists());
+        assert!(!temp_path.parent().expect("temp path parent").exists());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -250,16 +349,34 @@ mod tests {
     }
 
     async fn spawn_file_server(body: Vec<u8>) -> String {
+        let base_url = spawn_response_server(
+            "200 OK",
+            vec![(
+                "content-type".to_string(),
+                "application/octet-stream".to_string(),
+            )],
+            body,
+        )
+        .await;
+        format!("{base_url}/files/sodium.jar")
+    }
+
+    async fn spawn_response_server(
+        status: &'static str,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    ) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
-            .expect("bind file server");
-        let addr = listener.local_addr().expect("file server addr");
+            .expect("bind response server");
+        let addr = listener.local_addr().expect("response server addr");
         tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     break;
                 };
                 let body = body.clone();
+                let headers = headers.clone();
                 tokio::spawn(async move {
                     let mut request = Vec::new();
                     let mut buf = [0_u8; 1024];
@@ -279,11 +396,19 @@ mod tests {
                         }
                     }
 
-                    let headers = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                        body.len()
+                    let mut response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n",
+                        body.len(),
                     );
-                    if stream.write_all(headers.as_bytes()).await.is_err() {
+                    for (name, value) in headers {
+                        response.push_str(&name);
+                        response.push_str(": ");
+                        response.push_str(&value);
+                        response.push_str("\r\n");
+                    }
+                    response.push_str("\r\n");
+
+                    if stream.write_all(response.as_bytes()).await.is_err() {
                         return;
                     }
                     let midpoint = body.len() / 2;
@@ -294,7 +419,7 @@ mod tests {
                 });
             }
         });
-        format!("http://{addr}/files/sodium.jar")
+        format!("http://{addr}")
     }
 
     fn test_root(name: &str) -> PathBuf {
