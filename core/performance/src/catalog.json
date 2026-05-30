@@ -180,7 +180,9 @@
         {"artifact_id": "dynamic-fps", "project_id": "dynamic-fps", "slug": "dynamic-fps", "name": "Dynamic FPS", "condition": "always"},
         {"artifact_id": "modernfix", "project_id": "modernfix", "slug": "modernfix", "name": "ModernFix", "condition": "always"},
         {"artifact_id": "scalablelux", "project_id": "scalablelux", "slug": "scalablelux", "name": "ScalableLux", "condition": "always"},
-        {"artifact_id": "threadtweak", "project_id": "threadtweak", "slug": "threadtweak", "name": "ThreadTweak", "condition": "always"}
+        {"artifact_id": "particle-core", "project_id": "particle-core", "slug": "particle-core", "name": "Particle Core", "condition": "always"},
+        {"artifact_id": "threadtweak", "project_id": "threadtweak", "slug": "threadtweak", "name": "ThreadTweak", "condition": "always"},
+        {"artifact_id": "badoptimizations", "project_id": "badoptimizations", "slug": "badoptimizations", "name": "BadOptimizations", "condition": "always"}
       ]
     },
     {

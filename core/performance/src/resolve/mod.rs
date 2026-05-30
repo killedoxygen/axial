@@ -1131,6 +1131,13 @@ mod tests {
         Manifest, OwnershipClass, PerformanceMode, VersionFamily,
     };
 
+    const FAMILY_F_FABRIC_CORE_ADDITIONS: &[&str] = &[
+        "scalablelux",
+        "particle-core",
+        "threadtweak",
+        "badoptimizations",
+    ];
+
     #[test]
     fn families_a_through_d_managed_plans_resolve_named_vanilla_enhanced_compositions() {
         let manifest = builtin_manifest().expect("manifest");
@@ -1197,7 +1204,7 @@ mod tests {
     }
 
     #[test]
-    fn family_e_fabric_fallback_does_not_include_threadtweak() {
+    fn family_e_fabric_fallback_does_not_include_family_f_core_additions() {
         let mut manifest = builtin_manifest().expect("manifest");
         manifest.emergency_disables.push(test_composition_disable(
             "hold-family-e-extended",
@@ -1218,7 +1225,9 @@ mod tests {
         assert_eq!(plan.composition_id, "family-e-fabric-core");
         assert_eq!(plan.family, VersionFamily::E);
         assert_eq!(plan.tier, CompositionTier::Core);
-        assert_eq!(count_mods_with_slug(&plan.mods, "threadtweak"), 0);
+        for slug in FAMILY_F_FABRIC_CORE_ADDITIONS {
+            assert_eq!(count_mods_with_slug(&plan.mods, slug), 0, "{slug}");
+        }
     }
 
     #[test]
@@ -1696,7 +1705,9 @@ mod tests {
 
         assert_eq!(plan.composition_id, "family-f-fabric-core");
         assert_eq!(plan.tier, CompositionTier::Core);
-        assert_eq!(count_mods_with_slug(&plan.mods, "threadtweak"), 1);
+        for slug in FAMILY_F_FABRIC_CORE_ADDITIONS {
+            assert_eq!(count_mods_with_slug(&plan.mods, slug), 1, "{slug}");
+        }
         assert_eq!(
             plan.fallback_reason,
             "a higher-tier managed composition is temporarily disabled"
