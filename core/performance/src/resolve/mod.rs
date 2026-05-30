@@ -64,6 +64,11 @@ pub enum ResolveError {
         expected: String,
         actual: String,
     },
+    #[error("managed mod {artifact_id} has invalid version_range: {version_range}")]
+    InvalidManagedModVersionRange {
+        artifact_id: String,
+        version_range: String,
+    },
     #[error("composition id is required")]
     MissingCompositionId,
     #[error("duplicate composition id: {0}")]
@@ -210,6 +215,24 @@ fn validate_managed_mod_artifact(
             expected: artifact.source.slug.clone(),
             actual: managed_mod.slug.clone(),
         });
+    }
+    validate_managed_mod_version_range(managed_mod)?;
+    Ok(())
+}
+
+fn validate_managed_mod_version_range(managed_mod: &ManagedMod) -> Result<(), ResolveError> {
+    let trimmed = managed_mod.version_range.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    for condition in trimmed.split_whitespace() {
+        let (_, raw_target) = split_range_condition(condition);
+        if parse_version(raw_target).is_err() {
+            return Err(ResolveError::InvalidManagedModVersionRange {
+                artifact_id: managed_mod.artifact_id.clone(),
+                version_range: trimmed.to_string(),
+            });
+        }
     }
     Ok(())
 }
@@ -1721,6 +1744,39 @@ mod tests {
                 actual: "other-slug".to_string(),
             },
         );
+    }
+
+    #[test]
+    fn validation_accepts_builtin_manifest_and_valid_managed_mod_version_ranges() {
+        let manifest = builtin_manifest().expect("manifest");
+        validate_manifest(&manifest).expect("built-in manifest should validate");
+
+        for version_range in ["", ">=1.16 <1.19.4", ">=1.20.1", "1.20.4", "24w14a"] {
+            let mut manifest = builtin_manifest().expect("manifest");
+            first_managed_mod_mut(&mut manifest).version_range = version_range.to_string();
+
+            validate_manifest(&manifest).expect("managed mod version_range should validate");
+        }
+    }
+
+    #[test]
+    fn validation_rejects_malformed_managed_mod_version_ranges() {
+        for version_range in [">=", ">=not-a-version"] {
+            let mut manifest = builtin_manifest().expect("manifest");
+            let artifact_id = {
+                let managed_mod = first_managed_mod_mut(&mut manifest);
+                managed_mod.version_range = version_range.to_string();
+                managed_mod.artifact_id.clone()
+            };
+
+            assert_error_kind(
+                validate_manifest(&manifest),
+                ResolveError::InvalidManagedModVersionRange {
+                    artifact_id,
+                    version_range: version_range.to_string(),
+                },
+            );
+        }
     }
 
     #[test]
