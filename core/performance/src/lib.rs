@@ -15,7 +15,7 @@ pub use resolve::{
     infer_loader_from_version_id, parse_mode, resolve_plan,
 };
 pub use rules_cache::{RulesCacheSnapshot, RulesCacheState, RulesCacheStatus, rules_cache_path};
-pub use state::{StateError, load_state, remove_state, save_state};
+pub use state::{RollbackSnapshotSummary, StateError, load_state, remove_state, save_state};
 pub use status::{
     FamilyCoverage, OwnershipClass, PerformanceRulesStatus, RuleChannel, RuleSource,
     RulesValidation, rules_status,

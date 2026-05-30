@@ -2,7 +2,8 @@ use crate::modrinth::{ModrinthClient, ModrinthError};
 use crate::resolve::{builtin_manifest, detect_hardware, resolve_plan};
 use crate::rules_cache::{RulesCacheStatus, load_or_repair_rules_cache};
 use crate::state::{
-    StateError, load_rollback_snapshot, load_state, managed_artifact_path, remove_state,
+    RollbackSnapshotSummary, StateError, list_rollback_snapshots, load_rollback_snapshot,
+    load_rollback_snapshot_by_id, load_state, managed_artifact_path, remove_state,
     restore_rollback_snapshot, save_rollback_snapshot, save_state,
 };
 use crate::types::{
@@ -35,6 +36,8 @@ pub enum InstallError {
     InvalidFilename(String),
     #[error("no performance rollback snapshot available")]
     NoRollbackSnapshot,
+    #[error("performance rollback snapshot not found")]
+    RollbackSnapshotNotFound,
 }
 
 #[derive(Debug, Clone)]
@@ -159,6 +162,23 @@ impl PerformanceManager {
         let snapshot =
             load_rollback_snapshot(instance_mods_dir)?.ok_or(InstallError::NoRollbackSnapshot)?;
         Ok(restore_rollback_snapshot(instance_mods_dir, &snapshot)?)
+    }
+
+    pub fn rollback_managed_snapshot(
+        &self,
+        instance_mods_dir: &Path,
+        snapshot_id: &str,
+    ) -> Result<CompositionState, InstallError> {
+        let snapshot = load_rollback_snapshot_by_id(instance_mods_dir, snapshot_id)?
+            .ok_or(InstallError::RollbackSnapshotNotFound)?;
+        Ok(restore_rollback_snapshot(instance_mods_dir, &snapshot)?)
+    }
+
+    pub fn list_rollback_snapshots(
+        &self,
+        instance_mods_dir: &Path,
+    ) -> Result<Vec<RollbackSnapshotSummary>, InstallError> {
+        Ok(list_rollback_snapshots(instance_mods_dir)?)
     }
 
     pub fn manifest(&self) -> &crate::types::Manifest {
@@ -446,6 +466,7 @@ mod tests {
         fs::write(
             rollback_dir.join("latest.json"),
             serde_json::to_vec(&serde_json::json!({
+                "id": "rb-path-traversal",
                 "schema_version": 1,
                 "created_at": "2026-05-30T00:00:00Z",
                 "state": test_state("core", vec![test_mod("sodium", "../outside.jar")]),

@@ -11,7 +11,7 @@ use axum::{
 use croopor_performance::InstallError;
 use croopor_performance::{
     BundleHealth, CompositionPlan, CompositionTier, PerformanceMode, PerformanceRulesStatus,
-    ResolutionRequest, StateError, derive_health, extract_base_version,
+    ResolutionRequest, RollbackSnapshotSummary, StateError, derive_health, extract_base_version,
     infer_loader_from_version_id, load_state, parse_mode,
 };
 use serde::{Deserialize, Serialize};
@@ -29,12 +29,18 @@ struct HealthQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct RollbackQuery {
+    instance_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct InstallRequest {
     instance_id: Option<String>,
     game_version: Option<String>,
     loader: Option<String>,
     mode: Option<String>,
     action: Option<String>,
+    rollback_id: Option<String>,
     queued: Option<bool>,
 }
 
@@ -68,6 +74,11 @@ struct PerformanceInstallResponse {
     warnings: Vec<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct PerformanceRollbackListResponse {
+    snapshots: Vec<RollbackSnapshotSummary>,
+}
+
 #[derive(Debug, Clone)]
 struct PerformanceOperation {
     instance_id: String,
@@ -77,6 +88,7 @@ struct PerformanceOperation {
     loader: Option<String>,
     mode: Option<String>,
     action: PerformanceInstallAction,
+    rollback_id: Option<String>,
 }
 
 pub fn router() -> Router<AppState> {
@@ -84,6 +96,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/performance/status", get(handle_status))
         .route("/api/v1/performance/plan", get(handle_plan))
         .route("/api/v1/performance/health", get(handle_health))
+        .route("/api/v1/performance/rollback", get(handle_rollback_list))
         .route("/api/v1/performance/install", post(handle_install))
         .route(
             "/api/v1/performance/operations/{id}",
@@ -183,6 +196,29 @@ async fn handle_health(
     }))
 }
 
+async fn handle_rollback_list(
+    State(state): State<AppState>,
+    Query(query): Query<RollbackQuery>,
+) -> Result<Json<PerformanceRollbackListResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let instance_id = required_value(
+        query.instance_id.as_deref(),
+        "instance_id query parameter is required",
+    )?;
+    let instance = state.instances().get(&instance_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "instance not found" })),
+        )
+    })?;
+    let mods_dir = state.instances().game_dir(&instance.id).join("mods");
+    let snapshots = state
+        .performance()
+        .list_rollback_snapshots(&mods_dir)
+        .map_err(performance_install_error)?;
+
+    Ok(Json(PerformanceRollbackListResponse { snapshots }))
+}
+
 async fn handle_install(
     State(state): State<AppState>,
     Json(payload): Json<InstallRequest>,
@@ -203,6 +239,7 @@ async fn handle_install(
         loader: payload.loader.clone(),
         mode: payload.mode.clone(),
         action,
+        rollback_id: payload.rollback_id.clone(),
     };
 
     if payload.queued.unwrap_or(false) {
@@ -244,9 +281,16 @@ async fn execute_performance_operation(
         .join("mods");
 
     if matches!(operation.action, PerformanceInstallAction::Rollback) {
-        let restored_state = performance
-            .rollback_managed(&mods_dir)
-            .map_err(performance_install_error)?;
+        let restored_state =
+            if let Some(rollback_id) = optional_value(operation.rollback_id.as_deref()) {
+                performance
+                    .rollback_managed_snapshot(&mods_dir, &rollback_id)
+                    .map_err(performance_install_error)?
+            } else {
+                performance
+                    .rollback_managed(&mods_dir)
+                    .map_err(performance_install_error)?
+            };
         let (health, warnings) = derive_health(Some(&restored_state), None, &mods_dir);
 
         return Ok(PerformanceInstallResponse {
@@ -632,9 +676,13 @@ fn internal_error(error: impl std::fmt::Display) -> (StatusCode, Json<serde_json
 
 fn performance_install_error(error: InstallError) -> (StatusCode, Json<serde_json::Value>) {
     match error {
-        InstallError::NoRollbackSnapshot => (
+        InstallError::NoRollbackSnapshot | InstallError::RollbackSnapshotNotFound => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": error.to_string() })),
+        ),
+        InstallError::State(StateError::InvalidRollbackId) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "invalid performance rollback snapshot id" })),
         ),
         error => internal_error(error),
     }
@@ -660,7 +708,7 @@ mod tests {
         http::Request,
     };
     use croopor_config::{AppPaths, ConfigStore, InstanceStore};
-    use croopor_performance::PerformanceManager;
+    use croopor_performance::{CompositionState, InstalledMod, PerformanceManager};
     use std::{fs, path::PathBuf, sync::Arc, time::Duration};
     use tower::ServiceExt;
 
@@ -839,6 +887,7 @@ mod tests {
                 loader: None,
                 mode: None,
                 action: None,
+                rollback_id: None,
                 queued: None,
             }),
         )
@@ -864,6 +913,7 @@ mod tests {
                 loader: None,
                 mode: None,
                 action: None,
+                rollback_id: None,
                 queued: None,
             }),
         )
@@ -916,6 +966,7 @@ mod tests {
                 loader: None,
                 mode: Some("custom".to_string()),
                 action: None,
+                rollback_id: None,
                 queued: None,
             }),
         )
@@ -945,6 +996,7 @@ mod tests {
                 loader: None,
                 mode: None,
                 action: Some("rollback".to_string()),
+                rollback_id: None,
                 queued: None,
             }),
         )
@@ -955,6 +1007,182 @@ mod tests {
         assert_eq!(
             error.1.0,
             serde_json::json!({ "error": "no performance rollback snapshot available" })
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_list_route_returns_snapshot_metadata() {
+        let fixture = TestFixture::new("rollback-list");
+        let instance_id = fixture.add_instance("Managed", "1.20.4-fabric");
+        let mods_dir = fixture
+            .state
+            .instances()
+            .game_dir(&instance_id)
+            .join("mods");
+        fs::create_dir_all(&mods_dir).expect("create mods dir");
+        fs::write(mods_dir.join("managed-a.jar"), b"managed-a").expect("write managed a");
+        fs::write(mods_dir.join("managed-b.jar"), b"managed-b").expect("write managed b");
+        let first = croopor_performance::state::save_rollback_snapshot(
+            &mods_dir,
+            &test_composition_state(
+                "core-a",
+                vec![test_installed_mod("sodium", "managed-a.jar")],
+            ),
+        )
+        .expect("save first snapshot");
+        let second = croopor_performance::state::save_rollback_snapshot(
+            &mods_dir,
+            &test_composition_state(
+                "core-b",
+                vec![test_installed_mod("lithium", "managed-b.jar")],
+            ),
+        )
+        .expect("save second snapshot");
+
+        let response = router()
+            .with_state(fixture.state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/performance/rollback?instance_id={instance_id}"
+                    ))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("route response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("rollback list json");
+        let snapshots = value["snapshots"].as_array().expect("snapshots array");
+
+        assert_eq!(snapshots.len(), 2);
+        assert!(snapshots.iter().any(|snapshot| {
+            snapshot["id"] == first.id
+                && snapshot["composition_id"] == "core-a"
+                && snapshot["latest"] == false
+        }));
+        assert!(snapshots.iter().any(|snapshot| {
+            snapshot["id"] == second.id
+                && snapshot["composition_id"] == "core-b"
+                && snapshot["latest"] == true
+        }));
+    }
+
+    #[tokio::test]
+    async fn rollback_with_specific_snapshot_id_restores_older_snapshot() {
+        let fixture = TestFixture::new("rollback-specific");
+        let instance_id = fixture.add_instance("Managed", "1.20.4-fabric");
+        let mods_dir = fixture
+            .state
+            .instances()
+            .game_dir(&instance_id)
+            .join("mods");
+        fs::create_dir_all(&mods_dir).expect("create mods dir");
+        fs::write(mods_dir.join("managed-a.jar"), b"managed-a").expect("write managed a");
+        let older = croopor_performance::state::save_rollback_snapshot(
+            &mods_dir,
+            &test_composition_state(
+                "core-a",
+                vec![test_installed_mod("sodium", "managed-a.jar")],
+            ),
+        )
+        .expect("save older snapshot");
+        fs::write(mods_dir.join("managed-b.jar"), b"managed-b").expect("write managed b");
+        croopor_performance::state::save_state(
+            &mods_dir,
+            &test_composition_state(
+                "core-b",
+                vec![test_installed_mod("lithium", "managed-b.jar")],
+            ),
+        )
+        .expect("save current state");
+        croopor_performance::state::save_rollback_snapshot(
+            &mods_dir,
+            &test_composition_state(
+                "core-b",
+                vec![test_installed_mod("lithium", "managed-b.jar")],
+            ),
+        )
+        .expect("save newer snapshot");
+
+        let Json(response) = handle_install(
+            State(fixture.state.clone()),
+            Json(InstallRequest {
+                instance_id: Some(instance_id),
+                game_version: None,
+                loader: None,
+                mode: None,
+                action: Some("rollback".to_string()),
+                rollback_id: Some(older.id.clone()),
+                queued: None,
+            }),
+        )
+        .await
+        .expect("specific rollback should restore");
+
+        assert_eq!(response.status, "rolled_back");
+        assert_eq!(response.composition_id, "core-a");
+        assert_eq!(
+            fs::read(mods_dir.join("managed-a.jar")).expect("read managed a"),
+            b"managed-a"
+        );
+        assert!(!mods_dir.join("managed-b.jar").exists());
+    }
+
+    #[tokio::test]
+    async fn rollback_invalid_snapshot_id_returns_json_error() {
+        let fixture = TestFixture::new("rollback-invalid-id");
+        let instance_id = fixture.add_instance("Managed", "1.20.4-fabric");
+
+        let error = handle_install(
+            State(fixture.state.clone()),
+            Json(InstallRequest {
+                instance_id: Some(instance_id),
+                game_version: None,
+                loader: None,
+                mode: None,
+                action: Some("rollback".to_string()),
+                rollback_id: Some("../latest".to_string()),
+                queued: None,
+            }),
+        )
+        .await
+        .expect_err("invalid rollback id should fail");
+
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.1.0,
+            serde_json::json!({ "error": "invalid performance rollback snapshot id" })
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_missing_snapshot_id_returns_json_error() {
+        let fixture = TestFixture::new("rollback-missing-id");
+        let instance_id = fixture.add_instance("Managed", "1.20.4-fabric");
+
+        let error = handle_install(
+            State(fixture.state.clone()),
+            Json(InstallRequest {
+                instance_id: Some(instance_id),
+                game_version: None,
+                loader: None,
+                mode: None,
+                action: Some("rollback".to_string()),
+                rollback_id: Some("rb-missing".to_string()),
+                queued: None,
+            }),
+        )
+        .await
+        .expect_err("missing rollback id should fail");
+
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.1.0,
+            serde_json::json!({ "error": "performance rollback snapshot not found" })
         );
     }
 
@@ -971,6 +1199,7 @@ mod tests {
                 loader: None,
                 mode: None,
                 action: Some("remove".to_string()),
+                rollback_id: None,
                 queued: Some(true),
             }),
         )
@@ -1013,6 +1242,7 @@ mod tests {
                 loader: None,
                 mode: None,
                 action: Some("rollback".to_string()),
+                rollback_id: None,
                 queued: Some(true),
             }),
         )
@@ -1062,6 +1292,7 @@ mod tests {
                 loader: None,
                 mode: None,
                 action: Some("remove".to_string()),
+                rollback_id: None,
                 queued: Some(true),
             }),
         )
@@ -1228,6 +1459,29 @@ mod tests {
             music_dir: root.join("music"),
             library_dir: root.join("library"),
             config_dir,
+        }
+    }
+
+    fn test_composition_state(
+        composition_id: &str,
+        installed_mods: Vec<InstalledMod>,
+    ) -> CompositionState {
+        CompositionState {
+            composition_id: composition_id.to_string(),
+            tier: CompositionTier::Core,
+            installed_mods,
+            installed_at: "2026-05-30T00:00:00Z".to_string(),
+            failure_count: 0,
+            last_failure: String::new(),
+        }
+    }
+
+    fn test_installed_mod(project_id: &str, filename: &str) -> InstalledMod {
+        InstalledMod {
+            project_id: project_id.to_string(),
+            version_id: "version".to_string(),
+            filename: filename.to_string(),
+            sha512: String::new(),
         }
     }
 }
