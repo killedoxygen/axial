@@ -33,6 +33,8 @@ import {
   JVM_PRESET_HINTS,
   JVM_PRESET_LABELS,
   JVM_PRESET_ORDER,
+  jvmPresetFrom,
+  jvmPresetLabelFor,
   type JvmPreset,
 } from '../create/jvm-presets';
 import './instance.css';
@@ -1092,7 +1094,7 @@ function GuardianPreflightCard({ inst, onOpenSettings }: {
   const javaSub = instanceJava ? compactPath(instanceJava) : globalJava ? compactPath(globalJava) : 'Croopor selects runtime';
   const presetValue = instancePreset || globalPreset;
   const presetTitle = instancePreset ? 'Instance preset' : globalPreset ? 'Global preset' : 'Auto preset';
-  const presetSub = presetValue ? JVM_PRESET_LABELS[jvmPresetFrom(presetValue)] : 'Selected at launch';
+  const presetSub = presetValue ? jvmPresetLabelFor(presetValue) : 'Selected at launch';
 
   return (
     <Card padding={18} class="cp-od-guardian-card">
@@ -1604,10 +1606,6 @@ function clampWindowDimension(value: string, fallback: number): number {
   return Math.max(320, Math.min(3840, parsed));
 }
 
-function jvmPresetFrom(value: string | undefined): JvmPreset {
-  return JVM_PRESET_ORDER.includes(value as JvmPreset) ? value as JvmPreset : '';
-}
-
 function instancePerformanceModeFrom(value: string | undefined): InstancePerformanceMode {
   return performanceModeFrom(value) ?? '';
 }
@@ -1643,6 +1641,7 @@ function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
   const performanceModeText = performanceMode
     ? `${performanceModeLabel(effectiveSettingsMode)} override`
     : `Inherits ${performanceModeLabel(effectiveSettingsMode)} from global settings`;
+  const runtimePresetText = `${JVM_PRESET_LABELS[jvmPreset]}: ${JVM_PRESET_HINTS[jvmPreset]}`;
   const dirty = (
     artSeed !== initialArtSeed ||
     Math.round(maxMem * 1024) !== (inst.max_memory_mb ?? config.value?.max_memory_mb ?? 4096) ||
@@ -1799,20 +1798,25 @@ function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
             <span class="cp-settings-section-icon"><Icon name="terminal" size={15} /></span>
             <div>
               <h3>Runtime</h3>
-              <p>{JVM_PRESET_LABELS[jvmPreset]} · {JVM_PRESET_HINTS[jvmPreset]}</p>
+              <p>{runtimePresetText}</p>
             </div>
           </div>
           <div class="cp-settings-row-control">
-            <div class="cp-settings-button-strip" aria-label="Runtime preset">
+            <div class="cp-settings-runtime-presets" role="radiogroup" aria-label="Runtime preset">
               {JVM_PRESET_ORDER.map((preset) => (
-                <Button
+                <button
                   key={preset || 'auto'}
-                  variant={jvmPreset === preset ? 'primary' : 'secondary'}
-                  size="sm"
+                  type="button"
+                  role="radio"
+                  aria-checked={jvmPreset === preset}
+                  class="cp-settings-runtime-preset"
+                  data-active={jvmPreset === preset}
                   onClick={() => setJvmPreset(preset)}
+                  title={`${JVM_PRESET_LABELS[preset]}: ${JVM_PRESET_HINTS[preset]}`}
                 >
-                  {JVM_PRESET_LABELS[preset]}
-                </Button>
+                  <span class="cp-settings-runtime-preset-label">{JVM_PRESET_LABELS[preset]}</span>
+                  <span class="cp-settings-runtime-preset-hint">{JVM_PRESET_HINTS[preset]}</span>
+                </button>
               ))}
             </div>
             <div class="cp-settings-advanced-toggle">

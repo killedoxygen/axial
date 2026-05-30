@@ -41,7 +41,7 @@ import {
   type ScreenSize,
   type WindowPresetSpec,
 } from './screen-presets';
-import { JVM_PRESET_ORDER, type JvmPreset } from './jvm-presets';
+import { JVM_PRESET_CREATE_ORDER, type JvmPreset } from './jvm-presets';
 import './create.css';
 
 export function CreateView(): JSX.Element {
@@ -102,8 +102,8 @@ function CreateWizard(): JSX.Element {
     setWindowPresetId(nextWindowPreset(windowPresets, windowPresetId).id);
   };
   const cycleJvmPreset = (): void => {
-    const i = JVM_PRESET_ORDER.indexOf(jvmPreset);
-    setJvmPreset(JVM_PRESET_ORDER[(i + 1) % JVM_PRESET_ORDER.length]!);
+    const i = JVM_PRESET_CREATE_ORDER.indexOf(jvmPreset);
+    setJvmPreset(JVM_PRESET_CREATE_ORDER[(i + 1) % JVM_PRESET_CREATE_ORDER.length]!);
   };
 
   const searchInputRef = useRef<HTMLInputElement | null>(null);

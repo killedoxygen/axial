@@ -35,6 +35,10 @@ const COMPACT_JVM_HINTS: Record<JvmPreset, string> = {
   smooth: 'Steady frames.',
   performance: 'Higher throughput.',
   ultra_low_latency: 'Fewer hitches.',
+  graalvm: 'Graal flags.',
+  legacy: 'Old Java.',
+  legacy_pvp: 'Input bias.',
+  legacy_heavy: 'Old modpacks.',
 };
 
 function useDeferredFlag(): boolean {
@@ -292,6 +296,7 @@ export function NameStep({
           onClick={onCycleJvm}
           aria-label="Cycle performance profile"
           data-profile={jvmPreset || 'auto'}
+          title={JVM_PRESET_HINTS[jvmPreset]}
         >
           <span class="cp-cr-tile-eyebrow">Profile</span>
           <span class="cp-cr-profile-glyph" aria-hidden="true">
