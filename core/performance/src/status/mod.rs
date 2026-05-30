@@ -289,7 +289,7 @@ mod tests {
             id: "disable-family-f-extended".to_string(),
             target: EmergencyDisableTarget::Composition,
             target_id: "family-f-fabric-extended".to_string(),
-            reason: "Temporary compatibility hold.".to_string(),
+            reason: "Temporary hold.".to_string(),
             families: vec![VersionFamily::F],
             loaders: vec!["fabric".to_string()],
             tiers: Vec::new(),
@@ -303,10 +303,7 @@ mod tests {
             status.emergency_disables[0].target,
             EmergencyDisableTarget::Composition
         );
-        assert_eq!(
-            status.emergency_disables[0].reason,
-            "Temporary compatibility hold."
-        );
+        assert_eq!(status.emergency_disables[0].reason, "Temporary hold.");
     }
 
     #[test]

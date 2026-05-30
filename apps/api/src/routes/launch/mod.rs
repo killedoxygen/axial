@@ -1928,7 +1928,7 @@ mod tests {
                 .benchmark_suite_drivers()
                 .get(&stopped.id)
                 .await
-                .expect("old driver remains visible")
+                .expect("stopped driver remains visible")
                 .state,
             "stopped"
         );

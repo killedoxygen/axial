@@ -812,7 +812,9 @@ mod tests {
                     "source": { "provider": "modrinth" },
                     "integrity": { "sha512": "", "sha512_verified": false }
                 }],
-                "installed_at": "2026-05-30T00:00:00Z"
+                "installed_at": "2026-05-30T00:00:00Z",
+                "failure_count": 0,
+                "last_failure": ""
             }))
             .expect("serialize state"),
         )

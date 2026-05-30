@@ -37,12 +37,12 @@ pub enum StateError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RollbackSnapshot {
     pub id: String,
     pub schema_version: i32,
     pub created_at: String,
     pub state: CompositionState,
-    #[serde(default)]
     pub artifacts: Vec<RollbackArtifact>,
 }
 
@@ -57,6 +57,7 @@ pub struct RollbackSnapshotSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RollbackArtifact {
     pub filename: String,
     pub stored_filename: String,
@@ -700,7 +701,9 @@ mod tests {
                     "source": { "provider": "modrinth" },
                     "integrity": { "sha512": "", "sha512_verified": false }
                 }],
-                "installed_at": "2026-05-30T00:00:00Z"
+                "installed_at": "2026-05-30T00:00:00Z",
+                "failure_count": 0,
+                "last_failure": ""
             }))
             .expect("serialize state"),
         )
@@ -723,7 +726,9 @@ mod tests {
                     "source": { "provider": "modrinth" },
                     "integrity": { "sha512": "", "sha512_verified": false }
                 }],
-                "installed_at": "2026-05-30T00:00:00Z"
+                "installed_at": "2026-05-30T00:00:00Z",
+                "failure_count": 0,
+                "last_failure": ""
             }))
             .expect("serialize state"),
         )
@@ -750,7 +755,9 @@ mod tests {
                     "filename": "sodium.jar",
                     "ownership_class": "composition_managed"
                 }],
-                "installed_at": "2026-05-30T00:00:00Z"
+                "installed_at": "2026-05-30T00:00:00Z",
+                "failure_count": 0,
+                "last_failure": ""
             }))
             .expect("serialize state"),
         )
@@ -773,7 +780,9 @@ mod tests {
                     "source": { "provider": "unknown" },
                     "integrity": { "sha512": "", "sha512_verified": false }
                 }],
-                "installed_at": "2026-05-30T00:00:00Z"
+                "installed_at": "2026-05-30T00:00:00Z",
+                "failure_count": 0,
+                "last_failure": ""
             }))
             .expect("serialize state"),
         )
@@ -796,13 +805,89 @@ mod tests {
                     "source": { "provider": "modrinth" },
                     "integrity": { "sha512": "", "sha512_verified": false, "path": "/tmp/sodium.jar" }
                 }],
-                "installed_at": "2026-05-30T00:00:00Z"
+                "installed_at": "2026-05-30T00:00:00Z",
+                "failure_count": 0,
+                "last_failure": ""
             }))
             .expect("serialize state"),
         )
         .expect("write unknown integrity field state");
         assert!(matches!(
             load_state(&root).expect_err("unknown integrity field should be invalid"),
+            StateError::Parse(_)
+        ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_state_rejects_missing_failure_metadata() {
+        let root = test_root("missing-failure-metadata");
+        fs::write(
+            lock_file_path(&root),
+            serde_json::to_vec(&serde_json::json!({
+                "composition_id": "core",
+                "tier": "core",
+                "installed_mods": [],
+                "installed_at": "2026-05-30T00:00:00Z"
+            }))
+            .expect("serialize state"),
+        )
+        .expect("write state without failure metadata");
+
+        assert!(matches!(
+            load_state(&root).expect_err("missing failure metadata should be invalid"),
+            StateError::Parse(_)
+        ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_state_rejects_unknown_top_level_fields() {
+        let root = test_root("unknown-top-level-state");
+        fs::write(
+            lock_file_path(&root),
+            serde_json::to_vec(&serde_json::json!({
+                "composition_id": "core",
+                "tier": "core",
+                "installed_mods": [],
+                "installed_at": "2026-05-30T00:00:00Z",
+                "failure_count": 0,
+                "last_failure": "",
+                "unexpected_state": true
+            }))
+            .expect("serialize state"),
+        )
+        .expect("write state with unknown field");
+
+        assert!(matches!(
+            load_state(&root).expect_err("unknown top-level state should be invalid"),
+            StateError::Parse(_)
+        ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rollback_snapshot_rejects_missing_artifact_list() {
+        let root = test_root("missing-rollback-artifacts");
+        let rollback_dir = rollback_dir_path(&root);
+        fs::create_dir_all(&rollback_dir).expect("create rollback dir");
+        fs::write(
+            rollback_file_path(&root),
+            serde_json::to_vec(&serde_json::json!({
+                "id": "rb-missing-artifacts",
+                "schema_version": ROLLBACK_SCHEMA_VERSION,
+                "created_at": "2026-05-30T00:00:00Z",
+                "state": test_state("core", Vec::new())
+            }))
+            .expect("serialize rollback snapshot"),
+        )
+        .expect("write rollback snapshot without artifacts");
+
+        assert!(matches!(
+            load_rollback_snapshot(&root).expect_err("missing artifacts should be invalid"),
             StateError::Parse(_)
         ));
 
@@ -825,7 +910,9 @@ mod tests {
                     "source": { "provider": "modrinth" },
                     "integrity": { "sha512": "", "sha512_verified": true }
                 }],
-                "installed_at": "2026-05-30T00:00:00Z"
+                "installed_at": "2026-05-30T00:00:00Z",
+                "failure_count": 0,
+                "last_failure": ""
             }))
             .expect("serialize state"),
         )
@@ -853,7 +940,9 @@ mod tests {
                     "source": { "provider": "modrinth" },
                     "integrity": { "sha512": "abc123", "sha512_verified": true }
                 }],
-                "installed_at": "2026-05-30T00:00:00Z"
+                "installed_at": "2026-05-30T00:00:00Z",
+                "failure_count": 0,
+                "last_failure": ""
             }))
             .expect("serialize state"),
         )
@@ -881,7 +970,9 @@ mod tests {
                     "source": { "provider": "modrinth" },
                     "integrity": { "sha512": "", "sha512_verified": false }
                 }],
-                "installed_at": "2026-05-30T00:00:00Z"
+                "installed_at": "2026-05-30T00:00:00Z",
+                "failure_count": 0,
+                "last_failure": ""
             }))
             .expect("serialize state"),
         )

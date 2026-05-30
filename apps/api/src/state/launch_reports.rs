@@ -17,6 +17,7 @@ const MAX_BENCHMARK_METADATA_CHARS: usize = 96;
 pub const LAUNCH_DISK_HEADROOM_MB: u64 = 2048;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct LaunchProofRecord {
     pub schema: String,
     pub schema_version: u32,
@@ -26,17 +27,15 @@ pub struct LaunchProofRecord {
     pub launched_at: String,
     pub recorded_at: String,
     pub outcome: String,
-    #[serde(default)]
     pub scenario: LaunchProofScenario,
-    #[serde(default)]
     pub device: LaunchProofDevice,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_budget: Option<LaunchProofResourceBudget>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub boot_duration_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_class: Option<String>,
@@ -46,13 +45,13 @@ pub struct LaunchProofRecord {
     pub guardian: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub healing: Option<Value>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stages: Vec<LaunchStageRecord>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub comparison: Option<LaunchProofComparison>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct LaunchProofScenario {
     pub scenario_id: String,
     pub performance_mode: String,
@@ -60,13 +59,13 @@ pub struct LaunchProofScenario {
     pub requested_memory_mb: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub benchmark_profile: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub benchmark_run_type: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub benchmark_mode: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub benchmark_id: Option<String>,
 }
 
@@ -86,6 +85,7 @@ impl Default for LaunchProofScenario {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct LaunchProofDevice {
     pub tier: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -105,6 +105,7 @@ impl Default for LaunchProofDevice {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct LaunchProofComparison {
     pub baseline_session_id: String,
     pub baseline_recorded_at: String,
@@ -117,22 +118,23 @@ pub struct LaunchProofComparison {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct LaunchProofResourceBudget {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_total_memory_mb: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub host_available_memory_mb: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub host_used_memory_mb: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_cpu_threads: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub host_cpu_load_1m_x100: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub host_cpu_load_5m_x100: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub host_cpu_load_15m_x100: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub launcher_process_memory_mb: Option<u64>,
     pub active_session_count: usize,
     pub active_install_count: usize,
@@ -145,16 +147,10 @@ pub struct LaunchProofResourceBudget {
     pub memory_pressure: bool,
     pub cpu_pressure: bool,
     pub install_pressure: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub launch_disk_available_mb: Option<u64>,
-    #[serde(default = "default_launch_disk_headroom_mb")]
     pub launch_disk_headroom_mb: u64,
-    #[serde(default)]
     pub disk_pressure: bool,
-}
-
-fn default_launch_disk_headroom_mb() -> u64 {
-    LAUNCH_DISK_HEADROOM_MB
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -724,37 +720,29 @@ mod tests {
     }
 
     #[test]
-    fn older_launch_report_without_comparison_still_loads() {
-        let root = test_root("older-no-comparison");
+    fn launch_report_without_current_structural_fields_is_invalid() {
+        let root = test_root("missing-current-fields");
         let paths = test_paths(&root);
         fs::create_dir_all(report_dir(&paths)).expect("create report dir");
         fs::write(
-            report_path(&paths, "old"),
+            report_path(&paths, "missing-current-fields"),
             serde_json::to_string_pretty(&json!({
                 "schema": LAUNCH_PROOF_SCHEMA,
                 "schema_version": LAUNCH_PROOF_SCHEMA_VERSION,
-                "session_id": "old",
+                "session_id": "missing-current-fields",
                 "instance_id": "instance",
                 "version_id": "1.21.1",
                 "launched_at": "2026-01-01T00:00:00.000Z",
                 "recorded_at": "2026-01-01T00:01:00.000Z",
-                "outcome": "exited",
-                "stages": []
+                "outcome": "exited"
             }))
-            .expect("serialize old report"),
+            .expect("serialize report"),
         )
-        .expect("write old report");
+        .expect("write report");
 
-        let loaded = load(&paths, "old")
-            .expect("load old report")
-            .expect("old report exists");
-
-        assert_eq!(loaded.session_id, "old");
-        assert_eq!(loaded.scenario, LaunchProofScenario::default());
-        assert_eq!(loaded.device, LaunchProofDevice::default());
-        assert_eq!(loaded.resource_budget, None);
-        assert_eq!(loaded.boot_duration_ms, None);
-        assert_eq!(loaded.comparison, None);
+        let error = load(&paths, "missing-current-fields")
+            .expect_err("missing scenario/device/stages should be invalid");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -787,16 +775,16 @@ mod tests {
     }
 
     #[test]
-    fn older_launch_report_without_benchmark_metadata_still_loads() {
-        let root = test_root("older-no-benchmark");
+    fn launch_report_without_optional_benchmark_metadata_loads() {
+        let root = test_root("no-benchmark");
         let paths = test_paths(&root);
         fs::create_dir_all(report_dir(&paths)).expect("create report dir");
         fs::write(
-            report_path(&paths, "old-benchmark-free"),
+            report_path(&paths, "benchmark-free"),
             serde_json::to_string_pretty(&json!({
                 "schema": LAUNCH_PROOF_SCHEMA,
                 "schema_version": LAUNCH_PROOF_SCHEMA_VERSION,
-                "session_id": "old-benchmark-free",
+                "session_id": "benchmark-free",
                 "instance_id": "instance",
                 "version_id": "1.21.1",
                 "launched_at": "2026-01-01T00:00:00.000Z",
@@ -808,15 +796,20 @@ mod tests {
                     "requested_memory_mb": 4096,
                     "version_id": "1.21.1"
                 },
+                "device": {
+                    "tier": "mid",
+                    "total_memory_mb": 16384,
+                    "cpu_threads": 6
+                },
                 "stages": []
             }))
-            .expect("serialize old report"),
+            .expect("serialize report"),
         )
-        .expect("write old report");
+        .expect("write report");
 
-        let loaded = load(&paths, "old-benchmark-free")
-            .expect("load old report")
-            .expect("old report exists");
+        let loaded = load(&paths, "benchmark-free")
+            .expect("load report")
+            .expect("report exists");
 
         assert_eq!(loaded.scenario.scenario_id, "managed_launch");
         assert_eq!(loaded.scenario.benchmark_profile, None);
@@ -1023,21 +1016,32 @@ mod tests {
     }
 
     #[test]
-    fn older_launch_report_resource_budget_without_measured_fields_still_loads() {
-        let root = test_root("older-resource-budget-no-measured-memory");
+    fn launch_report_resource_budget_without_current_pressure_fields_is_invalid() {
+        let root = test_root("resource-budget-missing-current-fields");
         let paths = test_paths(&root);
         fs::create_dir_all(report_dir(&paths)).expect("create report dir");
         fs::write(
-            report_path(&paths, "old-resource-budget"),
+            report_path(&paths, "resource-budget-missing-current-fields"),
             serde_json::to_string_pretty(&json!({
                 "schema": LAUNCH_PROOF_SCHEMA,
                 "schema_version": LAUNCH_PROOF_SCHEMA_VERSION,
-                "session_id": "old-resource-budget",
+                "session_id": "resource-budget-missing-current-fields",
                 "instance_id": "instance",
                 "version_id": "1.21.1",
                 "launched_at": "2026-01-01T00:00:00.000Z",
                 "recorded_at": "2026-01-01T00:01:00.000Z",
                 "outcome": "running",
+                "scenario": {
+                    "scenario_id": "managed_launch",
+                    "performance_mode": "managed",
+                    "requested_memory_mb": 4096,
+                    "version_id": "1.21.1"
+                },
+                "device": {
+                    "tier": "mid",
+                    "total_memory_mb": 16384,
+                    "cpu_threads": 6
+                },
                 "resource_budget": {
                     "host_total_memory_mb": 8192,
                     "host_cpu_threads": 4,
@@ -1053,28 +1057,13 @@ mod tests {
                 },
                 "stages": []
             }))
-            .expect("serialize old report"),
+            .expect("serialize report"),
         )
-        .expect("write old report");
+        .expect("write report");
 
-        let loaded = load(&paths, "old-resource-budget")
-            .expect("load old report")
-            .expect("old report exists");
-        let resource_budget = loaded.resource_budget.expect("resource budget");
-
-        assert_eq!(resource_budget.host_total_memory_mb, Some(8192));
-        assert_eq!(resource_budget.host_available_memory_mb, None);
-        assert_eq!(resource_budget.host_used_memory_mb, None);
-        assert_eq!(resource_budget.host_cpu_load_1m_x100, None);
-        assert_eq!(resource_budget.host_cpu_load_5m_x100, None);
-        assert_eq!(resource_budget.host_cpu_load_15m_x100, None);
-        assert_eq!(resource_budget.launcher_process_memory_mb, None);
-        assert_eq!(resource_budget.launch_disk_available_mb, None);
-        assert_eq!(
-            resource_budget.launch_disk_headroom_mb,
-            LAUNCH_DISK_HEADROOM_MB
-        );
-        assert!(!resource_budget.disk_pressure);
+        let error = load(&paths, "resource-budget-missing-current-fields")
+            .expect_err("missing current resource budget pressure fields should be invalid");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 
         let _ = fs::remove_dir_all(root);
     }

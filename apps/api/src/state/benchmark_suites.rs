@@ -13,6 +13,7 @@ const MAX_MANIFEST_FIELD_CHARS: usize = 96;
 const MAX_MANIFEST_RUNS: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct BenchmarkSuiteManifest {
     pub schema: String,
     pub schema_version: u32,
@@ -21,19 +22,19 @@ pub struct BenchmarkSuiteManifest {
     pub mode: String,
     pub created_at: String,
     pub updated_at: String,
-    #[serde(default)]
     pub runs: Vec<BenchmarkSuiteManifestRun>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct BenchmarkSuiteManifestRun {
     pub run_index: usize,
     pub profile: String,
     pub run_type: String,
     pub benchmark_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub launched_at: Option<String>,
     pub state: String,
 }
@@ -444,6 +445,70 @@ mod tests {
             .expect("suite should exist");
         assert_eq!(loaded, second);
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn launch_suite_manifest_without_runs_is_invalid() {
+        let root = test_root("suite-missing-runs");
+        let paths = test_paths(&root);
+        let suite_id = "suite-missing-runs";
+        let path = suite_path(&paths, suite_id);
+        fs::create_dir_all(path.parent().expect("suite parent")).expect("create suite dir");
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": BENCHMARK_SUITE_SCHEMA,
+                "schema_version": BENCHMARK_SUITE_SCHEMA_VERSION,
+                "suite_id": suite_id,
+                "instance_id": "instance",
+                "mode": "development",
+                "created_at": "2026-01-01T00:00:00.000Z",
+                "updated_at": "2026-01-01T00:00:00.000Z"
+            }))
+            .expect("serialize manifest"),
+        )
+        .expect("write manifest");
+
+        let error = load(&paths, suite_id).expect_err("missing runs should be invalid");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn launch_suite_manifest_with_unknown_fields_is_invalid() {
+        let root = test_root("suite-unknown-field");
+        let paths = test_paths(&root);
+        let suite_id = "suite-unknown-field";
+        let path = suite_path(&paths, suite_id);
+        fs::create_dir_all(path.parent().expect("suite parent")).expect("create suite dir");
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": BENCHMARK_SUITE_SCHEMA,
+                "schema_version": BENCHMARK_SUITE_SCHEMA_VERSION,
+                "suite_id": suite_id,
+                "instance_id": "instance",
+                "mode": "development",
+                "created_at": "2026-01-01T00:00:00.000Z",
+                "updated_at": "2026-01-01T00:00:00.000Z",
+                "runs": [{
+                    "run_index": 0,
+                    "profile": "vanilla_baseline",
+                    "run_type": "coldish",
+                    "benchmark_id": "suite-development-00-vanilla_baseline-coldish",
+                    "state": "pending",
+                    "unexpected_state": true
+                }]
+            }))
+            .expect("serialize manifest"),
+        )
+        .expect("write manifest");
+
+        let error = load(&paths, suite_id).expect_err("unknown run field should be invalid");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         let _ = fs::remove_dir_all(root);
     }
 

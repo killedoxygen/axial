@@ -19,6 +19,7 @@ const DUPLICATE_RESUME_ERROR: &str =
 const RESUME_LIMIT_ERROR: &str = "pending performance operation ignored after restart resume limit";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PerformanceOperationPayload {
     pub version_id: String,
     pub instance_performance_mode: String,
@@ -33,6 +34,7 @@ pub struct PerformanceOperationPayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PerformanceOperationStatus {
     pub id: String,
     pub instance_id: String,
@@ -643,6 +645,41 @@ mod tests {
         assert!(inner.operations.is_empty());
         assert!(inner.active_by_instance.is_empty());
         assert!(inner.pending_resume_ids.is_empty());
+        assert!(interrupted.is_empty());
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn persisted_operation_with_unknown_fields_is_not_loaded() {
+        let root = test_root("unknown-field-pending");
+        let paths = test_paths(&root);
+        let dir = operation_dir(&paths);
+        fs::create_dir_all(&dir).expect("create operation dir");
+        let path = operation_path(&dir, "performance-install-00000000000000000000000000000001");
+        fs::write(
+            path,
+            serde_json::to_vec(&serde_json::json!({
+                "id": "performance-install-00000000000000000000000000000001",
+                "instance_id": "instance-a",
+                "action": "install",
+                "payload": {
+                    "version_id": "1.20.4-fabric",
+                    "instance_performance_mode": "managed",
+                    "unexpected_mode": true
+                },
+                "state": "applying",
+                "error": null,
+                "created_at": timestamp_utc(),
+                "updated_at": timestamp_utc()
+            }))
+            .expect("serialize status"),
+        )
+        .expect("write status");
+
+        let (inner, interrupted) = load_persisted_operation_inner(&dir);
+
+        assert!(inner.operations.is_empty());
         assert!(interrupted.is_empty());
 
         cleanup(&root);

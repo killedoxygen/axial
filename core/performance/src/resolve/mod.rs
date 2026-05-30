@@ -737,16 +737,15 @@ mod tests {
     }
 
     #[test]
-    fn older_manifest_without_emergency_disables_defaults_to_empty() {
-        let manifest = serde_json::from_value::<Manifest>(serde_json::json!({
+    fn manifest_without_emergency_disables_is_not_current_schema() {
+        let error = serde_json::from_value::<Manifest>(serde_json::json!({
             "schema_version": 1,
             "generated_at": "2026-04-02T00:00:00Z",
             "compositions": []
         }))
-        .expect("manifest should parse");
+        .expect_err("missing emergency_disables should be invalid current schema");
 
-        assert!(manifest.emergency_disables.is_empty());
-        validate_manifest(&manifest).expect("older manifest shape should validate");
+        assert!(error.to_string().contains("emergency_disables"));
     }
 
     #[test]

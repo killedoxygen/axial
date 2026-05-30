@@ -129,15 +129,16 @@ pub struct ResolutionRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub schema_version: i32,
     pub generated_at: String,
     pub compositions: Vec<CompositionDef>,
-    #[serde(default)]
     pub emergency_disables: Vec<EmergencyDisable>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompositionDef {
     pub id: String,
     pub display_name: String,
@@ -154,6 +155,7 @@ pub struct CompositionDef {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EmergencyDisable {
     pub id: String,
     pub target: EmergencyDisableTarget,
@@ -187,13 +189,12 @@ pub struct InstalledMod {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompositionState {
     pub composition_id: String,
     pub tier: CompositionTier,
     pub installed_mods: Vec<InstalledMod>,
     pub installed_at: String,
-    #[serde(default)]
     pub failure_count: i32,
-    #[serde(default)]
     pub last_failure: String,
 }

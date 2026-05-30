@@ -14,6 +14,7 @@ const INTERRUPTED_BY_RESTART_ERROR: &str = "driver interrupted by restart";
 const MAX_DRIVER_FILENAME_STEM: usize = 96;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct BenchmarkSuiteDriverStatus {
     pub id: String,
     pub suite_id: String,
@@ -580,7 +581,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stopping_old_terminal_driver_does_not_clear_new_active_driver() {
+    async fn stopping_terminal_driver_does_not_clear_new_active_driver() {
         let store = BenchmarkSuiteDriverStore::new();
         let summary = BenchmarkSuiteDriverSuiteSummary {
             run_count: 2,
@@ -610,7 +611,7 @@ mod tests {
         let stopped_first = store
             .stop(&first.status.id)
             .await
-            .expect("old terminal driver should still be visible");
+            .expect("terminal driver should remain visible");
         let conflict = store
             .start(
                 "suite-dev".to_string(),
@@ -722,6 +723,38 @@ mod tests {
         assert_eq!(status.state, "complete");
         assert_eq!(status.error, None);
 
+        cleanup(&root);
+    }
+
+    #[test]
+    fn persisted_driver_with_unknown_fields_is_not_loaded() {
+        let root = test_root("unknown-field");
+        let paths = test_paths(&root);
+        let dir = driver_dir(&paths);
+        fs::create_dir_all(&dir).expect("create driver dir");
+        let path = driver_path(&dir, "benchmark-suite-driver-0000000000000001");
+        fs::write(
+            path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "id": "benchmark-suite-driver-0000000000000001",
+                "suite_id": "suite-dev",
+                "mode": "development",
+                "state": "complete",
+                "interval_ms": 30000,
+                "run_count": 1,
+                "launched_run_count": 1,
+                "unexpected_state": true,
+                "created_at": "2026-01-01T00:00:00.000Z",
+                "updated_at": "2026-01-01T00:01:00.000Z"
+            }))
+            .expect("serialize driver"),
+        )
+        .expect("write driver");
+
+        let (inner, interrupted) = load_persisted_driver_inner(&dir);
+
+        assert!(inner.drivers.is_empty());
+        assert!(interrupted.is_empty());
         cleanup(&root);
     }
 
