@@ -404,6 +404,128 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn launch_plan_uses_instance_game_dir_but_shared_library_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "croopor-build-isolation-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let instance_dir = root.join("instances").join("survival");
+        let version_dir = root.join("library").join("versions").join("test");
+        fs::create_dir_all(&instance_dir).expect("instance dir");
+        fs::create_dir_all(&version_dir).expect("version dir");
+        fs::write(version_dir.join("test.jar"), b"jar").expect("client jar");
+
+        let version: VersionJson = serde_json::from_value(serde_json::json!({
+            "id": "test",
+            "type": "release",
+            "mainClass": "net.minecraft.client.main.Main",
+            "arguments": {
+                "game": [
+                    "--gameDir",
+                    "${game_directory}",
+                    "--assetsDir",
+                    "${assets_root}"
+                ],
+                "jvm": [
+                    "-DlibraryDir=${library_directory}",
+                    "-DassetRoot=${assets_root}",
+                    "-cp",
+                    "${classpath}"
+                ]
+            },
+            "assetIndex": { "id": "test-assets" },
+            "libraries": [{
+                "name": "com.example:demo:1.0.0",
+                "downloads": {
+                    "artifact": {
+                        "path": "com/example/demo/1.0.0/demo-1.0.0.jar",
+                        "url": "https://example.invalid/demo-1.0.0.jar"
+                    }
+                }
+            }]
+        }))
+        .expect("version json");
+
+        let library_dir = root.join("library");
+        let plan = plan_resolved_launch(
+            &VanillaLaunchRequest {
+                session_id: "test-session".to_string(),
+                mc_dir: library_dir.clone(),
+                version_id: "test".to_string(),
+                username: "Player".to_string(),
+                runtime: RuntimeSelection {
+                    requested_path: String::new(),
+                    selected_path: String::new(),
+                    selected_info: croopor_minecraft::JavaRuntimeInfo {
+                        id: String::new(),
+                        major: 21,
+                        update: 0,
+                        distribution: "test".to_string(),
+                        path: String::new(),
+                    },
+                    effective_path: "/usr/bin/java".to_string(),
+                    effective_info: croopor_minecraft::JavaRuntimeInfo {
+                        id: "java".to_string(),
+                        major: 21,
+                        update: 0,
+                        distribution: "test".to_string(),
+                        path: "/usr/bin/java".to_string(),
+                    },
+                    effective_source: "managed".to_string(),
+                    bypassed_requested_runtime: false,
+                },
+                game_dir: Some(instance_dir.clone()),
+                launcher_name: "croopor".to_string(),
+                launcher_version: "test".to_string(),
+                min_memory_mb: None,
+                max_memory_mb: None,
+                extra_jvm_args: Vec::new(),
+                resolution: None,
+            },
+            version,
+        )
+        .expect("launch plan");
+
+        assert_eq!(plan.game_dir, instance_dir);
+        assert!(
+            plan.game_args.windows(2).any(|args| args[0] == "--gameDir"
+                && args[1] == plan.game_dir.to_string_lossy().as_ref())
+        );
+        assert!(
+            plan.game_args
+                .windows(2)
+                .any(|args| args[0] == "--assetsDir"
+                    && args[1] == library_dir.join("assets").to_string_lossy().as_ref())
+        );
+        assert!(
+            plan.classpath.contains(
+                &library_dir
+                    .join("libraries")
+                    .join("com/example/demo/1.0.0/demo-1.0.0.jar")
+                    .to_string_lossy()
+                    .to_string()
+            )
+        );
+        assert!(plan.jvm_args.iter().any(|arg| {
+            arg == &format!(
+                "-DlibraryDir={}",
+                library_dir.join("libraries").to_string_lossy()
+            )
+        }));
+        assert!(plan.jvm_args.iter().any(|arg| {
+            arg == &format!(
+                "-DassetRoot={}",
+                library_dir.join("assets").to_string_lossy()
+            )
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn modern_native_libraries_get_explicit_native_and_temp_paths() {
         let root = std::env::temp_dir().join(format!(
             "croopor-build-test-{}",

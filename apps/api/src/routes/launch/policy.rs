@@ -64,14 +64,23 @@ pub(super) fn effective_min_memory(
     requested: Option<i32>,
     max_memory_mb: i32,
 ) -> i32 {
-    let min_memory_mb = if instance.min_memory_mb > 0 {
+    selected_raw_min_memory(instance, config, requested)
+        .min(max_memory_mb)
+        .max(0)
+}
+
+pub(super) fn selected_raw_min_memory(
+    instance: &Instance,
+    config: &AppConfig,
+    requested: Option<i32>,
+) -> i32 {
+    if instance.min_memory_mb > 0 {
         instance.min_memory_mb
     } else if requested.unwrap_or_default() > 0 {
         requested.unwrap_or_default()
     } else {
         config.min_memory_mb
-    };
-    min_memory_mb.min(max_memory_mb).max(0)
+    }
 }
 
 pub(super) fn split_jvm_args(extra_jvm_args: &str) -> Vec<String> {

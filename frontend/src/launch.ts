@@ -12,9 +12,18 @@ import {
 } from './store';
 import {
   clearLaunchNotice, confirmLaunch, endLaunchPrep, endSession, setLaunchNotice, startLaunch,
-  updateInstanceInList, updateLaunchPrep, updateRunningSessionState,
+  updateInstanceInList, updateLaunchPrep, updateLaunchPrepStage, updateRunningSessionState,
 } from './actions';
+import { launchStageView, type LaunchStage } from './launch-stages';
 import type { GuardianSummary, HealingEvent, LaunchHealingSummary } from './types';
+
+const PRE_RESPONSE_STAGE_CAP_PCT = 87;
+const PRE_RESPONSE_STAGE_TICKS: Array<{ atMs: number; stage: LaunchStage }> = [
+  { atMs: 700, stage: 'preparing' },
+  { atMs: 1800, stage: 'prewarming' },
+  { atMs: 3400, stage: 'starting' },
+  { atMs: 6200, stage: 'monitoring' },
+];
 
 function rollbackLaunch(instanceId: string, animationFrameId: number | null): void {
   if (animationFrameId !== null) cancelAnimationFrame(animationFrameId);
@@ -22,6 +31,43 @@ function rollbackLaunch(instanceId: string, animationFrameId: number | null): vo
   if (Object.keys(runningSessions.value).length === 0) Music.unsuppress();
 
   endLaunchPrep();
+}
+
+function startPreResponseLaunchStageTicker(instanceId: string): () => void {
+  let stopped = false;
+  let timeoutId: number | null = null;
+  let nextTick = 0;
+  const startedAt = Date.now();
+
+  const scheduleNext = (): void => {
+    if (stopped) return;
+    const tick = PRE_RESPONSE_STAGE_TICKS[nextTick];
+    if (!tick) return;
+    const delayMs = Math.max(0, tick.atMs - (Date.now() - startedAt));
+    timeoutId = window.setTimeout(() => {
+      timeoutId = null;
+      if (stopped) return;
+      const view = launchStageView(tick.stage);
+      updateLaunchPrep(
+        instanceId,
+        Math.min(view.pct, PRE_RESPONSE_STAGE_CAP_PCT),
+        view.label,
+        view.stage,
+      );
+      nextTick += 1;
+      scheduleNext();
+    }, delayMs);
+  };
+
+  scheduleNext();
+
+  return () => {
+    stopped = true;
+    if (timeoutId !== null) {
+      window.clearTimeout(timeoutId);
+      timeoutId = null;
+    }
+  };
 }
 
 function updateRunningSession(instanceId: string, patch: Partial<import('./types').RunningSession>): void {
@@ -197,6 +243,9 @@ function friendlyLaunchErrorDetail(message: string): string {
 
 function guardianNoticeDetails(guardian: GuardianSummary | undefined): string[] {
   if (!guardian) return [];
+  if (guardian.details && guardian.details.length > 0) {
+    return guardian.details;
+  }
   const details: string[] = [];
   for (const intervention of guardian.interventions || []) {
     pushUniqueNoticeDetail(details, intervention.detail);
@@ -209,6 +258,9 @@ function guardianNoticeDetails(guardian: GuardianSummary | undefined): string[] 
 
 function guardianToastMessage(guardian: GuardianSummary | undefined): string {
   if (!guardian) return '';
+  if (guardian.message?.trim()) {
+    return guardian.message.trim();
+  }
   if (guardian.decision === 'blocked') {
     return 'Guardian blocked an unsafe launch setup.';
   }
@@ -233,9 +285,15 @@ function launchOutcomeDetails(
   leadDetail = '',
 ): string[] {
   const details: string[] = [];
-  pushUniqueNoticeDetail(details, leadDetail);
+  const guardianHasAuthoredDetails = Boolean(guardian?.details && guardian.details.length > 0);
+  if (!guardianHasAuthoredDetails) {
+    pushUniqueNoticeDetail(details, leadDetail);
+  }
   for (const detail of guardianNoticeDetails(guardian)) {
     pushUniqueNoticeDetail(details, detail);
+  }
+  if (guardianHasAuthoredDetails) {
+    pushUniqueNoticeDetail(details, leadDetail);
   }
   const includeHealing = !guardianOwnsLaunchOutcome(guardian, healing);
   if (includeHealing) {
@@ -316,16 +374,17 @@ export async function launchGame(): Promise<void> {
 
   clearLaunchNotice(inst.id);
   startLaunch(inst.id);
-  updateLaunchPrep(inst.id, 12, 'Checking running sessions');
+  updateLaunchPrep(inst.id, 8, 'Resolving launch plan', 'planning');
   const launchAnimationFrameId: number | null = null;
 
   let launchCommitted = false;
   let launchInst = inst;
 
   try {
+    updateLaunchPrep(inst.id, 18, 'Checking compatibility', 'validating');
     const launchDraft = instanceLaunchDrafts.value[inst.id];
     if (launchDraft?.dirty) {
-      updateLaunchPrep(inst.id, 24, 'Saving launch overrides');
+      updateLaunchPrep(inst.id, 24, 'Preparing launch files', 'preparing');
       const saved = await api('PUT', `/instances/${encodeURIComponent(inst.id)}`, {
         java_path: launchDraft.javaPath.trim(),
         jvm_preset: launchDraft.jvmPreset,
@@ -355,13 +414,20 @@ export async function launchGame(): Promise<void> {
       appendLog('system', `Applied pending launch overrides for ${inst.name}.`, inst.id, inst.name);
     }
 
-    updateLaunchPrep(inst.id, 46, 'Preparing launcher request');
-    const res = await api('POST', '/launch', {
-      instance_id: launchInst.id,
-      username,
-      max_memory_mb: maxMemMB,
-      client_started_at_ms: Date.now(),
-    });
+    updateLaunchPrep(inst.id, 46, 'Preparing launch files', 'preparing');
+    const stopPreResponseStages = startPreResponseLaunchStageTicker(inst.id);
+    const res = await (async () => {
+      try {
+        return await api('POST', '/launch', {
+          instance_id: launchInst.id,
+          username,
+          max_memory_mb: maxMemMB,
+          client_started_at_ms: Date.now(),
+        });
+      } finally {
+        stopPreResponseStages();
+      }
+    })();
 
     if (res.error) {
       const detail = friendlyLaunchErrorDetail(res.error);
@@ -382,9 +448,9 @@ export async function launchGame(): Promise<void> {
       return;
     }
 
-    updateLaunchPrep(inst.id, 72, 'Starting Minecraft process');
+    updateLaunchPrep(inst.id, 72, 'Starting Minecraft', 'starting');
     const launchedAt = res.launched_at || new Date().toISOString();
-    updateLaunchPrep(inst.id, 88, 'Connecting live launch events');
+    updateLaunchPrep(inst.id, 88, 'Stabilizing startup', 'monitoring');
     confirmLaunch(inst.id, {
       sessionId: res.session_id,
       versionId: launchInst.version_id,
@@ -392,6 +458,7 @@ export async function launchGame(): Promise<void> {
       state: 'monitoring',
       launchedAt,
       allocatedMB: maxMemMB,
+      benchmark: res.benchmark,
       healing: res.healing,
       guardian: res.guardian,
     });
@@ -465,13 +532,18 @@ function makeLaunchStatusPoller(
 
 async function connectLaunchEvents(sessionId: string, instanceId: string, instanceName: string): Promise<void> {
   const onStatus = (data: any, handle: { close(): void }): void => {
-    if (runningSessions.value[instanceId]?.sessionId !== sessionId) return;
-    if (typeof data.pid === 'number' || data.healing || typeof data.state === 'string') {
+    const session = runningSessions.value[instanceId];
+    const prep = launchState.value;
+    const matchingPrep = prep.status === 'preparing' && prep.instanceId === instanceId;
+    if (session?.sessionId !== sessionId && !matchingPrep) return;
+    if (typeof data.state === 'string') updateLaunchPrepStage(instanceId, data.state);
+    if (session && (typeof data.pid === 'number' || data.healing || typeof data.state === 'string')) {
       updateRunningSession(instanceId, {
-        pid: typeof data.pid === 'number' ? data.pid : runningSessions.value[instanceId]?.pid || 0,
-        state: typeof data.state === 'string' ? data.state : runningSessions.value[instanceId]?.state,
-        healing: data.healing || runningSessions.value[instanceId]?.healing,
-        guardian: data.guardian || runningSessions.value[instanceId]?.guardian,
+        pid: typeof data.pid === 'number' ? data.pid : session.pid || 0,
+        state: typeof data.state === 'string' ? data.state : session.state,
+        benchmark: data.benchmark || session.benchmark,
+        healing: data.healing || session.healing,
+        guardian: data.guardian || session.guardian,
       });
     }
     if (data.state === 'exited') onGameExited(data, instanceId, instanceName, sessionId, handle);

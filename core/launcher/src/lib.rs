@@ -26,12 +26,14 @@ pub use jvm::{
     PRESET_SMOOTH, PRESET_ULTRA_LOW_LATENCY, boot_throttle_args, gc_preset_args,
     recommended_preset, sanitize_preset,
 };
-pub use process::{LaunchEvent, LaunchLogEvent, LaunchSessionRecord, LaunchStatusEvent};
+pub use process::{
+    LaunchEvent, LaunchLogEvent, LaunchSessionRecord, LaunchStageRecord, LaunchStatusEvent,
+};
 pub use runtime::RuntimeSelection;
 pub use service::{
     LaunchHealingSummary, LaunchIntent, LaunchPreparationError, PreparedLaunchAttempt,
     build_healing_summary, failure_class_name, format_failure_class, infer_loader,
-    is_terminal_state, is_terminal_status, launch_state_name, prepare_launch_attempt,
-    sanitize_effective_runtime_major, snapshot_status,
+    is_terminal_state, is_terminal_status, launch_stage_label, launch_state_name,
+    prepare_launch_attempt, sanitize_effective_runtime_major, snapshot_status,
 };
 pub use types::{InstanceId, LaunchFailure, LaunchFailureClass, LaunchState, SessionId, VersionId};

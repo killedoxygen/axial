@@ -14,7 +14,7 @@ pub use crate::guardian::{RecoveryAction, RecoveryPlan, conservative_healing_pre
 pub use healing::{HealingSummaryInput, build_healing_summary, infer_loader};
 pub use mapping::{
     failure_class_name, format_failure_class, is_terminal_state, is_terminal_status,
-    launch_state_name, snapshot_status,
+    launch_stage_label, launch_state_name, snapshot_status,
 };
 pub use prepare::{prepare_launch_attempt, sanitize_effective_runtime_major};
 

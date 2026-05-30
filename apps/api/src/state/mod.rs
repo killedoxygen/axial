@@ -1,4 +1,8 @@
+mod auth_logins;
+pub mod benchmark_suite_drivers;
+pub mod benchmark_suites;
 mod installs;
+pub mod launch_reports;
 mod sessions;
 
 use croopor_config::{ConfigStore, InstanceStore};
@@ -8,6 +12,7 @@ use croopor_performance::PerformanceManager;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+pub use auth_logins::{AuthLoginSession, AuthLoginStore, NewAuthLoginSession};
 pub use installs::InstallStore;
 pub use sessions::{SessionStore, StartupOutcome};
 
@@ -17,8 +22,10 @@ pub struct AppState {
     version: String,
     config: Arc<ConfigStore>,
     instances: Arc<InstanceStore>,
+    auth_logins: Arc<AuthLoginStore>,
     installs: Arc<InstallStore>,
     sessions: Arc<SessionStore>,
+    benchmark_suite_drivers: Arc<benchmark_suite_drivers::BenchmarkSuiteDriverStore>,
     performance: Arc<PerformanceManager>,
     library_dir: Arc<RwLock<Option<String>>>,
     frontend_dir: Arc<PathBuf>,
@@ -38,14 +45,21 @@ pub struct AppStateInit {
 impl AppState {
     pub fn new(init: AppStateInit) -> Self {
         let library_dir = init.config.current().library_dir;
+        let benchmark_suite_drivers = Arc::new(
+            benchmark_suite_drivers::BenchmarkSuiteDriverStore::load_from_paths(
+                init.config.paths(),
+            ),
+        );
 
         Self {
             app_name: init.app_name,
             version: init.version,
             config: init.config,
             instances: init.instances,
+            auth_logins: Arc::new(AuthLoginStore::new()),
             installs: init.installs,
             sessions: init.sessions,
+            benchmark_suite_drivers,
             performance: init.performance,
             library_dir: Arc::new(RwLock::new(if library_dir.is_empty() {
                 None
@@ -74,6 +88,16 @@ impl AppState {
 
     pub fn sessions(&self) -> &Arc<SessionStore> {
         &self.sessions
+    }
+
+    pub fn auth_logins(&self) -> &Arc<AuthLoginStore> {
+        &self.auth_logins
+    }
+
+    pub fn benchmark_suite_drivers(
+        &self,
+    ) -> &Arc<benchmark_suite_drivers::BenchmarkSuiteDriverStore> {
+        &self.benchmark_suite_drivers
     }
 
     pub fn installs(&self) -> &Arc<InstallStore> {

@@ -10,12 +10,33 @@ pub fn launch_state_name(state: LaunchState) -> &'static str {
         LaunchState::EnsuringRuntime => "ensuring_runtime",
         LaunchState::DownloadingRuntime => "downloading_runtime",
         LaunchState::Preparing => "preparing",
+        LaunchState::Prewarming => "prewarming",
         LaunchState::Starting => "starting",
         LaunchState::Monitoring => "monitoring",
         LaunchState::Running => "running",
         LaunchState::Degraded => "degraded",
         LaunchState::Failed => "failed",
         LaunchState::Exited => "exited",
+    }
+}
+
+pub fn launch_stage_label(stage: &str) -> &'static str {
+    match stage {
+        "idle" => "Idle",
+        "queued" => "Queued",
+        "planning" => "Planning launch",
+        "validating" => "Validating launch",
+        "ensuring_runtime" => "Ensuring runtime",
+        "downloading_runtime" => "Downloading runtime",
+        "preparing" => "Preparing files",
+        "prewarming" => "Prewarming game data",
+        "starting" => "Starting process",
+        "monitoring" => "Monitoring startup",
+        "running" => "Running",
+        "degraded" => "Degraded",
+        "failed" => "Failed",
+        "exited" => "Exited",
+        _ => "Launch stage",
     }
 }
 
@@ -50,6 +71,7 @@ pub fn snapshot_status(
 ) -> crate::process::LaunchStatusEvent {
     crate::process::LaunchStatusEvent {
         state: launch_state_name(record.state).to_string(),
+        benchmark: record.benchmark.clone(),
         pid: record.pid,
         exit_code: record.exit_code,
         failure_class: record
@@ -62,5 +84,6 @@ pub fn snapshot_status(
             .and_then(|failure| failure.detail.clone()),
         healing: record.healing.clone(),
         guardian: record.guardian.clone(),
+        stages: record.stages.clone(),
     }
 }
