@@ -6,8 +6,9 @@ use crate::types::{
 use regex::Regex;
 #[cfg(target_os = "linux")]
 use std::fs;
+use std::path::Path;
 #[cfg(target_os = "linux")]
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 #[cfg(target_os = "windows")]
 use std::process::Command;
 use std::sync::OnceLock;
@@ -358,9 +359,9 @@ fn detect_hardware_uncached() -> HardwareProfile {
 
 #[cfg(target_os = "linux")]
 fn detect_gpu() -> (String, i32) {
-    let mut best_vendor = String::new();
+    let mut vendors = Vec::new();
     let Ok(entries) = fs::read_dir("/sys/class/drm") else {
-        return (best_vendor, 0);
+        return (String::new(), 0);
     };
 
     for entry in entries.flatten() {
@@ -379,18 +380,13 @@ fn detect_gpu() -> (String, i32) {
         if vendor == "nvidia" {
             return (vendor.to_string(), detect_nvidia_arch_linux());
         }
-        if vendor == "amd" && best_vendor != "amd" {
-            best_vendor = vendor.to_string();
-        }
-        if vendor == "intel" && best_vendor.is_empty() {
-            best_vendor = vendor.to_string();
-        }
+        vendors.push(vendor);
     }
 
-    (best_vendor, 0)
+    (select_gpu_vendor_from_vendors(vendors), 0)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn is_drm_card_path(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
         return false;
@@ -468,7 +464,7 @@ fn run_windows_gpu_query() -> Option<String> {
     receiver.recv_timeout(Duration::from_secs(2)).ok().flatten()
 }
 
-#[cfg(target_os = "windows")]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn decode_windows_command_output(bytes: &[u8]) -> Option<String> {
     if bytes.is_empty() {
         return None;
@@ -496,7 +492,7 @@ fn decode_windows_command_output(bytes: &[u8]) -> Option<String> {
     String::from_utf8(bytes.to_vec()).ok()
 }
 
-#[cfg(target_os = "windows")]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn parse_windows_gpu_names(output: &str) -> Vec<String> {
     output
         .lines()
@@ -506,7 +502,7 @@ fn parse_windows_gpu_names(output: &str) -> Vec<String> {
         .collect()
 }
 
-#[cfg(target_os = "windows")]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn select_gpu_from_names(names: &[String]) -> (String, i32) {
     for vendor in ["nvidia", "amd", "intel"] {
         if let Some(name) = names
@@ -529,6 +525,7 @@ fn detect_gpu() -> (String, i32) {
     (String::new(), 0)
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn gpu_vendor_from_pci_id(value: &str) -> Option<&'static str> {
     match value.trim().to_lowercase().as_str() {
         "0x10de" => Some("nvidia"),
@@ -538,7 +535,24 @@ fn gpu_vendor_from_pci_id(value: &str) -> Option<&'static str> {
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn select_gpu_vendor_from_vendors<'a>(vendors: impl IntoIterator<Item = &'a str>) -> String {
+    let mut best = "";
+    for vendor in vendors {
+        if vendor.eq_ignore_ascii_case("nvidia") {
+            return "nvidia".to_string();
+        }
+        if vendor.eq_ignore_ascii_case("amd") && best != "amd" {
+            best = "amd";
+        }
+        if vendor.eq_ignore_ascii_case("intel") && best.is_empty() {
+            best = "intel";
+        }
+    }
+    best.to_string()
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn gpu_vendor_from_model_name(value: &str) -> Option<&'static str> {
     let normalized = value.to_lowercase();
     if normalized.contains("nvidia") || normalized.contains("geforce") || normalized.contains("rtx")
@@ -572,6 +586,8 @@ fn nvidia_model_from_information(contents: &str) -> Option<String> {
 fn nvidia_arch_from_model(model: &str) -> i32 {
     let normalized = model.to_uppercase();
     for (needle, arch) in [
+        ("QUADRO RTX", 2),
+        ("RTX A", 3),
         ("RTX 50", 4),
         ("RTX 40", 4),
         ("RTX 30", 3),
@@ -1198,15 +1214,17 @@ fn split_range_condition(condition: &str) -> (&str, &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ResolutionRequest, ResolveError, builtin_manifest, gpu_vendor_from_pci_id,
-        nvidia_arch_from_model, nvidia_model_from_information, parse_mode, resolve_plan,
-        validate_manifest,
+        ResolutionRequest, ResolveError, builtin_manifest, decode_windows_command_output,
+        gpu_vendor_from_model_name, gpu_vendor_from_pci_id, is_drm_card_path,
+        nvidia_arch_from_model, nvidia_model_from_information, parse_mode, parse_windows_gpu_names,
+        resolve_plan, select_gpu_from_names, select_gpu_vendor_from_vendors, validate_manifest,
     };
     use crate::types::{
         CompositionPlan, CompositionTier, EmergencyDisable, EmergencyDisableTarget,
         HardwareProfile, HardwareRequirement, ManagedMod, Manifest, OwnershipClass,
         PerformanceMode, VersionFamily,
     };
+    use std::path::Path;
 
     const FAMILY_F_FABRIC_CORE_ADDITIONS: &[&str] = &[
         "scalablelux",
@@ -1418,18 +1436,52 @@ mod tests {
     }
 
     #[test]
-    fn nvidia_model_strings_infer_arch_generation() {
-        assert_eq!(nvidia_arch_from_model("NVIDIA GeForce GTX 1080"), 1);
-        assert_eq!(nvidia_arch_from_model("NVIDIA GeForce GTX 1660 Ti"), 2);
-        assert_eq!(nvidia_arch_from_model("NVIDIA GeForce RTX 2060"), 2);
-        assert_eq!(nvidia_arch_from_model("NVIDIA GeForce RTX 3080"), 3);
-        assert_eq!(nvidia_arch_from_model("NVIDIA GeForce RTX 4090"), 4);
-        assert_eq!(nvidia_arch_from_model("NVIDIA GeForce RTX 5090"), 4);
-        assert_eq!(nvidia_arch_from_model("NVIDIA Quadro P2000"), 0);
+    fn linux_drm_card_paths_accept_only_plain_card_nodes() {
+        for path in ["/sys/class/drm/card0", "/sys/class/drm/card12"] {
+            assert!(is_drm_card_path(Path::new(path)), "{path}");
+        }
+
+        for path in [
+            "/sys/class/drm/card",
+            "/sys/class/drm/card0-DP-1",
+            "/sys/class/drm/renderD128",
+            "/sys/class/drm/controlD64",
+            "/sys/class/drm/cardx",
+        ] {
+            assert!(!is_drm_card_path(Path::new(path)), "{path}");
+        }
     }
 
     #[test]
-    fn nvidia_proc_information_parser_reads_model_line() {
+    fn gpu_vendor_selection_prefers_nvidia_then_amd_then_intel() {
+        assert_eq!(select_gpu_vendor_from_vendors(["intel"]), "intel");
+        assert_eq!(select_gpu_vendor_from_vendors(["intel", "amd"]), "amd");
+        assert_eq!(
+            select_gpu_vendor_from_vendors(["intel", "amd", "nvidia"]),
+            "nvidia"
+        );
+        assert_eq!(select_gpu_vendor_from_vendors(["unknown"]), "");
+        assert_eq!(select_gpu_vendor_from_vendors([]), "");
+    }
+
+    #[test]
+    fn nvidia_model_strings_infer_arch_generation() {
+        assert_eq!(nvidia_arch_from_model("NVIDIA GeForce GTX 1080"), 1);
+        assert_eq!(nvidia_arch_from_model("NVIDIA GeForce GTX 1070 Ti"), 1);
+        assert_eq!(nvidia_arch_from_model("NVIDIA GeForce GTX 1660 Ti"), 2);
+        assert_eq!(nvidia_arch_from_model("NVIDIA GeForce RTX 2060"), 2);
+        assert_eq!(nvidia_arch_from_model("NVIDIA GeForce RTX 2070 SUPER"), 2);
+        assert_eq!(nvidia_arch_from_model("NVIDIA GeForce RTX 3080"), 3);
+        assert_eq!(nvidia_arch_from_model("NVIDIA GeForce RTX 4090"), 4);
+        assert_eq!(nvidia_arch_from_model("NVIDIA GeForce RTX 5090"), 4);
+        assert_eq!(nvidia_arch_from_model("NVIDIA Quadro RTX 5000"), 2);
+        assert_eq!(nvidia_arch_from_model("NVIDIA RTX A5000"), 3);
+        assert_eq!(nvidia_arch_from_model("NVIDIA Quadro P2000"), 0);
+        assert_eq!(nvidia_arch_from_model("Unknown GPU"), 0);
+    }
+
+    #[test]
+    fn nvidia_proc_information_parser_reads_model_line_with_spacing_and_case() {
         assert_eq!(
             nvidia_model_from_information(
                 "Model: \t\t NVIDIA GeForce RTX 3080\nIRQ: 54\nGPU UUID: GPU-test\n"
@@ -1437,7 +1489,96 @@ mod tests {
             .as_deref(),
             Some("NVIDIA GeForce RTX 3080")
         );
+        assert_eq!(
+            nvidia_model_from_information("irq: 54\n model : nvidia geforce rtx 4070 \n")
+                .as_deref(),
+            Some("nvidia geforce rtx 4070")
+        );
+        assert_eq!(
+            nvidia_model_from_information("MoDeL:\tNVIDIA GeForce GTX 1660 SUPER\n").as_deref(),
+            Some("NVIDIA GeForce GTX 1660 SUPER")
+        );
+        assert_eq!(nvidia_model_from_information("Model:\t \n"), None);
         assert_eq!(nvidia_model_from_information("IRQ: 54\n"), None);
+    }
+
+    #[test]
+    fn windows_gpu_output_parser_ignores_header_and_blank_lines() {
+        assert_eq!(
+            parse_windows_gpu_names("Name\r\n\r\n NVIDIA GeForce RTX 4070 \r\nIntel UHD\r\n"),
+            vec![
+                "NVIDIA GeForce RTX 4070".to_string(),
+                "Intel UHD".to_string()
+            ]
+        );
+        assert_eq!(
+            parse_windows_gpu_names("name\nAMD Radeon RX 7900 XT\n"),
+            vec!["AMD Radeon RX 7900 XT".to_string()]
+        );
+    }
+
+    #[test]
+    fn windows_gpu_name_selection_is_platform_neutral() {
+        assert_eq!(
+            gpu_vendor_from_model_name("Advanced Micro Devices, Inc. Radeon RX 7800 XT"),
+            Some("amd")
+        );
+        assert_eq!(
+            gpu_vendor_from_model_name("Intel(R) UHD Graphics"),
+            Some("intel")
+        );
+        assert_eq!(
+            gpu_vendor_from_model_name("GeForce GTX 1660 SUPER"),
+            Some("nvidia")
+        );
+        assert_eq!(gpu_vendor_from_model_name("Generic Display Adapter"), None);
+
+        assert_eq!(
+            select_gpu_from_names(&[
+                "Intel(R) UHD Graphics".to_string(),
+                "AMD Radeon RX 7900 XT".to_string(),
+            ]),
+            ("amd".to_string(), 0)
+        );
+        assert_eq!(
+            select_gpu_from_names(&[
+                "Intel(R) UHD Graphics".to_string(),
+                "NVIDIA GeForce RTX 4070".to_string(),
+                "AMD Radeon RX 7900 XT".to_string(),
+            ]),
+            ("nvidia".to_string(), 4)
+        );
+        assert_eq!(
+            select_gpu_from_names(&["Generic Display Adapter".to_string()]),
+            (String::new(), 0)
+        );
+    }
+
+    #[test]
+    fn windows_command_output_decodes_utf8_and_utf16le() {
+        assert_eq!(
+            decode_windows_command_output(b"Name\r\nNVIDIA GeForce RTX 4070\r\n").as_deref(),
+            Some("Name\r\nNVIDIA GeForce RTX 4070\r\n")
+        );
+
+        let with_bom = "\u{feff}Name\r\nNVIDIA GeForce RTX 4070\r\n"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            decode_windows_command_output(&with_bom).as_deref(),
+            Some("Name\r\nNVIDIA GeForce RTX 4070\r\n")
+        );
+
+        let without_bom = "Name\r\nIntel UHD Graphics\r\n"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            decode_windows_command_output(&without_bom).as_deref(),
+            Some("Name\r\nIntel UHD Graphics\r\n")
+        );
+        assert_eq!(decode_windows_command_output(b""), None);
     }
 
     #[test]
