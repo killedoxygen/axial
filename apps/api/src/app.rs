@@ -39,6 +39,37 @@ pub fn build_router(state: AppState) -> Router {
     }
 }
 
+pub fn spawn_performance_rules_refresh(state: &AppState) -> bool {
+    let performance = state.performance().clone();
+    if !performance.remote_refresh_enabled() {
+        return false;
+    }
+
+    tokio::spawn(async move {
+        match performance.refresh_rules().await {
+            Ok(status) => {
+                if status.warnings.is_empty() {
+                    tracing::info!(
+                        rule_source = ?status.rule_source,
+                        generated_at = %status.generated_at,
+                        "performance rules background refresh finished"
+                    );
+                } else {
+                    tracing::warn!(
+                        warnings = ?status.warnings,
+                        "performance rules background refresh finished with warnings"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!("performance rules background refresh failed: {error}");
+            }
+        }
+    });
+
+    true
+}
+
 #[derive(Debug)]
 pub struct ServerHandle {
     pub addr: SocketAddr,

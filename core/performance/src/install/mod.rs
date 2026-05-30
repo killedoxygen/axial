@@ -272,6 +272,10 @@ impl PerformanceManager {
         )
     }
 
+    pub fn remote_refresh_enabled(&self) -> bool {
+        self.remote_rules_url.is_some()
+    }
+
     pub async fn refresh_rules(
         &self,
     ) -> Result<crate::status::PerformanceRulesStatus, RulesRefreshError> {
@@ -708,6 +712,31 @@ mod tests {
             b"managed-v1"
         );
         assert!(load_state(&root).expect("load state").is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn remote_refresh_enabled_tracks_normalized_remote_url() {
+        let root = test_root("remote-refresh-enabled");
+
+        let unset = PerformanceManager::new_with_config_dir_and_remote_url(&root, None)
+            .expect("performance manager");
+        assert!(!unset.remote_refresh_enabled());
+
+        let blank = PerformanceManager::new_with_config_dir_and_remote_url(
+            &root,
+            Some(" \t\n ".to_string()),
+        )
+        .expect("performance manager");
+        assert!(!blank.remote_refresh_enabled());
+
+        let configured = PerformanceManager::new_with_config_dir_and_remote_url(
+            &root,
+            Some(" https://rules.example.test/performance.json ".to_string()),
+        )
+        .expect("performance manager");
+        assert!(configured.remote_refresh_enabled());
+
         let _ = fs::remove_dir_all(root);
     }
 
