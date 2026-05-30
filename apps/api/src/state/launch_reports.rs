@@ -459,11 +459,34 @@ fn comparison_dimensions_match(current: &LaunchProofRecord, candidate: &LaunchPr
         && required_version_targets_match(current, candidate)
         && current.scenario.requested_memory_mb == candidate.scenario.requested_memory_mb
         && required_dimensions_match(&current.device.tier, &candidate.device.tier)
+        && optional_benchmark_dimensions_match(
+            current.scenario.benchmark_profile.as_deref(),
+            candidate.scenario.benchmark_profile.as_deref(),
+        )
+        && optional_benchmark_dimensions_match(
+            current.scenario.benchmark_run_type.as_deref(),
+            candidate.scenario.benchmark_run_type.as_deref(),
+        )
+        && optional_benchmark_dimensions_match(
+            current.scenario.benchmark_mode.as_deref(),
+            candidate.scenario.benchmark_mode.as_deref(),
+        )
 }
 
 fn required_dimensions_match(left: &str, right: &str) -> bool {
     match (normalized_dimension(left), normalized_dimension(right)) {
         (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn optional_benchmark_dimensions_match(left: Option<&str>, right: Option<&str>) -> bool {
+    match (
+        left.and_then(normalized_dimension),
+        right.and_then(normalized_dimension),
+    ) {
+        (Some(left), Some(right)) => left == right,
+        (None, None) => true,
         _ => false,
     }
 }
@@ -986,6 +1009,109 @@ mod tests {
     }
 
     #[test]
+    fn normal_launch_reports_without_benchmark_metadata_still_compare() {
+        let current = comparison_report("current", "2026-01-02T00:00:00.000Z", 90);
+        let previous = comparison_report("baseline", "2026-01-01T00:00:00.000Z", 120);
+
+        let comparison = build_comparison_from_candidates(&current, &[previous])
+            .expect("normal launch report comparison");
+
+        assert_eq!(comparison.baseline_session_id, "baseline");
+        assert_eq!(comparison.matched_sample_count, 1);
+    }
+
+    #[test]
+    fn empty_or_unknown_benchmark_metadata_is_compatible_with_normal_launch_reports() {
+        let current = comparison_report("current", "2026-01-02T00:00:00.000Z", 90);
+        let mut previous = comparison_report("baseline", "2026-01-01T00:00:00.000Z", 120);
+        previous.scenario.benchmark_profile = Some(" ".to_string());
+        previous.scenario.benchmark_run_type = Some("unknown".to_string());
+        previous.scenario.benchmark_mode = Some("unknown".to_string());
+
+        let comparison = build_comparison_from_candidates(&current, &[previous])
+            .expect("normal launch report comparison");
+
+        assert_eq!(comparison.baseline_session_id, "baseline");
+        assert_eq!(comparison.matched_sample_count, 1);
+    }
+
+    #[test]
+    fn benchmark_launch_reports_with_matching_metadata_compare() {
+        let mut current = comparison_report("current", "2026-01-02T00:00:00.000Z", 90);
+        set_benchmark_metadata(&mut current, "development-default", "repeat", "development");
+        let mut previous = comparison_report("baseline", "2026-01-01T00:00:00.000Z", 120);
+        set_benchmark_metadata(
+            &mut previous,
+            "development-default",
+            "repeat",
+            "development",
+        );
+
+        let comparison = build_comparison_from_candidates(&current, &[previous])
+            .expect("matching benchmark report comparison");
+
+        assert_eq!(comparison.baseline_session_id, "baseline");
+        assert_eq!(comparison.matched_sample_count, 1);
+    }
+
+    #[test]
+    fn benchmark_launch_reports_with_different_profile_do_not_compare() {
+        let mut current = comparison_report("current", "2026-01-02T00:00:00.000Z", 90);
+        set_benchmark_metadata(&mut current, "development-default", "repeat", "development");
+        let mut previous = comparison_report("baseline", "2026-01-01T00:00:00.000Z", 120);
+        set_benchmark_metadata(&mut previous, "release-default", "repeat", "development");
+
+        let comparison = build_comparison_from_candidates(&current, &[previous]);
+
+        assert_eq!(comparison, None);
+    }
+
+    #[test]
+    fn benchmark_launch_reports_with_different_run_type_do_not_compare() {
+        let mut current = comparison_report("current", "2026-01-02T00:00:00.000Z", 90);
+        set_benchmark_metadata(&mut current, "development-default", "cold", "development");
+        let mut previous = comparison_report("baseline", "2026-01-01T00:00:00.000Z", 120);
+        set_benchmark_metadata(
+            &mut previous,
+            "development-default",
+            "repeat",
+            "development",
+        );
+
+        let comparison = build_comparison_from_candidates(&current, &[previous]);
+
+        assert_eq!(comparison, None);
+    }
+
+    #[test]
+    fn benchmark_launch_reports_with_different_mode_do_not_compare() {
+        let mut current = comparison_report("current", "2026-01-02T00:00:00.000Z", 90);
+        set_benchmark_metadata(&mut current, "development-default", "repeat", "development");
+        let mut previous = comparison_report("baseline", "2026-01-01T00:00:00.000Z", 120);
+        set_benchmark_metadata(
+            &mut previous,
+            "development-default",
+            "repeat",
+            "release_validation",
+        );
+
+        let comparison = build_comparison_from_candidates(&current, &[previous]);
+
+        assert_eq!(comparison, None);
+    }
+
+    #[test]
+    fn benchmark_launch_report_does_not_compare_to_normal_launch_report() {
+        let mut current = comparison_report("current", "2026-01-02T00:00:00.000Z", 90);
+        set_benchmark_metadata(&mut current, "development-default", "repeat", "development");
+        let previous = comparison_report("baseline", "2026-01-01T00:00:00.000Z", 120);
+
+        let comparison = build_comparison_from_candidates(&current, &[previous]);
+
+        assert_eq!(comparison, None);
+    }
+
+    #[test]
     fn matching_boot_duration_launch_report_uses_boot_duration_comparison() {
         let mut current = comparison_report("current", "2026-01-02T00:00:00.000Z", 90);
         current.boot_duration_ms = Some(50);
@@ -1415,6 +1541,17 @@ mod tests {
             }],
             comparison: None,
         }
+    }
+
+    fn set_benchmark_metadata(
+        report: &mut LaunchProofRecord,
+        profile: &str,
+        run_type: &str,
+        mode: &str,
+    ) {
+        report.scenario.benchmark_profile = Some(profile.to_string());
+        report.scenario.benchmark_run_type = Some(run_type.to_string());
+        report.scenario.benchmark_mode = Some(mode.to_string());
     }
 
     fn test_record(session_id: &str) -> LaunchSessionRecord {
