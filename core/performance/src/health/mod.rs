@@ -59,7 +59,7 @@ pub fn derive_health(
         && tier_rank(state.tier) < tier_rank(plan.tier)
     {
         warnings.push("managed composition resolved to a lower tier than expected".to_string());
-        return (BundleHealth::Degraded, warnings);
+        return (BundleHealth::Fallback, warnings);
     }
 
     (BundleHealth::Healthy, warnings)
@@ -141,7 +141,7 @@ mod tests {
     }
 
     #[test]
-    fn lower_installed_tier_than_current_plan_is_degraded() {
+    fn lower_installed_tier_than_current_plan_is_fallback() {
         let root = test_root("lower-tier");
         let state = test_state(Vec::new());
         let plan = CompositionPlan {
@@ -159,7 +159,7 @@ mod tests {
 
         let (health, warnings) = derive_health(Some(&state), Some(&plan), &root);
 
-        assert_eq!(health, BundleHealth::Degraded);
+        assert_eq!(health, BundleHealth::Fallback);
         assert_eq!(
             warnings,
             vec!["managed composition resolved to a lower tier than expected"]
