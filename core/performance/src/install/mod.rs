@@ -1,4 +1,4 @@
-use crate::modrinth::{ModrinthClient, ModrinthError};
+use crate::modrinth::{ModrinthClient, ModrinthError, Version};
 use crate::resolve::{builtin_manifest, detect_hardware, resolve_plan, validate_manifest};
 use crate::rules_cache::{
     RulesCacheStatus, bounded_warning, load_active_rules_cache, write_remote_rules_cache,
@@ -443,23 +443,11 @@ impl PerformanceManager {
         loader: &str,
         instance_mods_dir: &Path,
     ) -> Result<InstalledMod, InstallError> {
-        let game_versions = vec![game_version.to_string()];
         let loaders = vec![loader.to_string()];
 
-        let mut versions = self
-            .modrinth
-            .list_versions(&managed_mod.project_id, &game_versions, &loaders)
+        let versions = self
+            .resolve_managed_mod_versions(managed_mod, game_version, &loaders)
             .await?;
-        if versions.is_empty()
-            && let Some(parent_minor) = parent_minor_version(game_version)
-            && parent_minor != game_version
-        {
-            versions = self
-                .modrinth
-                .list_versions(&managed_mod.project_id, &[parent_minor], &loaders)
-                .await?;
-        }
-
         let version = versions
             .into_iter()
             .next()
@@ -505,6 +493,53 @@ impl PerformanceManager {
                 verified_sha512_integrity(expected_sha)
             },
         })
+    }
+
+    async fn resolve_managed_mod_versions(
+        &self,
+        managed_mod: &crate::types::ManagedMod,
+        game_version: &str,
+        loaders: &[String],
+    ) -> Result<Vec<Version>, InstallError> {
+        let project_result = self
+            .list_versions_with_game_fallback(&managed_mod.project_id, game_version, loaders)
+            .await;
+
+        match project_result {
+            Ok(versions) if !versions.is_empty() => Ok(versions),
+            Ok(_) => self
+                .list_versions_with_game_fallback(&managed_mod.slug, game_version, loaders)
+                .await
+                .map_err(InstallError::Modrinth),
+            Err(ModrinthError::Http { status: 404, .. }) => self
+                .list_versions_with_game_fallback(&managed_mod.slug, game_version, loaders)
+                .await
+                .map_err(InstallError::Modrinth),
+            Err(error) => Err(InstallError::Modrinth(error)),
+        }
+    }
+
+    async fn list_versions_with_game_fallback(
+        &self,
+        project_ref: &str,
+        game_version: &str,
+        loaders: &[String],
+    ) -> Result<Vec<Version>, ModrinthError> {
+        let game_versions = vec![game_version.to_string()];
+        let mut versions = self
+            .modrinth
+            .list_versions(project_ref, &game_versions, loaders)
+            .await?;
+        if versions.is_empty()
+            && let Some(parent_minor) = parent_minor_version(game_version)
+            && parent_minor != game_version
+        {
+            versions = self
+                .modrinth
+                .list_versions(project_ref, &[parent_minor], loaders)
+                .await?;
+        }
+        Ok(versions)
     }
 
     fn remove_stale_managed(
@@ -695,6 +730,7 @@ mod tests {
     use crate::state::{load_state, save_state};
     use crate::types::{CompositionTier, ManagedMod, ModCondition, VersionFamily};
     use ed25519_dalek::{Signer, SigningKey};
+    use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
@@ -804,6 +840,93 @@ mod tests {
         assert!(!root.join("sodium.jar.tmp").exists());
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn managed_install_uses_project_id_without_slug_fallback() {
+        let (base_url, requests) =
+            spawn_modrinth_identity_server(ProjectLookupResponse::Version).await;
+        let manager =
+            PerformanceManager::new_with_modrinth_base_url(base_url).expect("performance manager");
+        let managed_mod = managed_mod("declared-project", "declared-slug");
+        let loaders = vec!["fabric".to_string()];
+
+        let versions = manager
+            .resolve_managed_mod_versions(&managed_mod, "1.20.4", &loaders)
+            .await
+            .expect("resolve managed artifact by project id");
+
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].id, "declared-project-version");
+        let requests = requests.lock().expect("request log").clone();
+        assert!(request_log_contains(
+            &requests,
+            "/v2/project/declared-project/version"
+        ));
+        assert!(!request_log_contains(
+            &requests,
+            "/v2/project/declared-slug/version"
+        ));
+    }
+
+    #[tokio::test]
+    async fn managed_install_falls_back_to_slug_after_project_id_404_or_no_compatible_version() {
+        for (name, response) in [
+            ("project-id-404", ProjectLookupResponse::NotFound),
+            ("project-id-empty", ProjectLookupResponse::Empty),
+        ] {
+            let (base_url, requests) = spawn_modrinth_identity_server(response).await;
+            let manager = PerformanceManager::new_with_modrinth_base_url(base_url)
+                .expect("performance manager");
+            let managed_mod = managed_mod("declared-project", "declared-slug");
+            let loaders = vec!["fabric".to_string()];
+
+            let versions = manager
+                .resolve_managed_mod_versions(&managed_mod, "1.20.4", &loaders)
+                .await
+                .unwrap_or_else(|error| panic!("{name} should resolve by slug fallback: {error}"));
+
+            assert_eq!(versions.len(), 1);
+            assert_eq!(versions[0].id, "declared-slug-version");
+            let requests = requests.lock().expect("request log").clone();
+            assert!(request_log_contains(
+                &requests,
+                "/v2/project/declared-project/version"
+            ));
+            assert!(request_log_contains(
+                &requests,
+                "/v2/project/declared-slug/version"
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_install_does_not_fall_back_to_slug_on_rate_limit() {
+        let (base_url, requests) =
+            spawn_modrinth_identity_server(ProjectLookupResponse::RateLimited).await;
+        let manager =
+            PerformanceManager::new_with_modrinth_base_url(base_url).expect("performance manager");
+        let managed_mod = managed_mod("declared-project", "declared-slug");
+        let loaders = vec!["fabric".to_string()];
+
+        let error = manager
+            .resolve_managed_mod_versions(&managed_mod, "1.20.4", &loaders)
+            .await
+            .expect_err("rate limit should not fall back to slug");
+
+        assert!(matches!(
+            error,
+            InstallError::Modrinth(ModrinthError::RateLimited { .. })
+        ));
+        let requests = requests.lock().expect("request log").clone();
+        assert!(request_log_contains(
+            &requests,
+            "/v2/project/declared-project/version"
+        ));
+        assert!(!request_log_contains(
+            &requests,
+            "/v2/project/declared-slug/version"
+        ));
     }
 
     #[tokio::test]
@@ -1235,6 +1358,19 @@ mod tests {
         }
     }
 
+    fn managed_mod(project_id: &str, slug: &str) -> ManagedMod {
+        ManagedMod {
+            artifact_id: "declared-artifact".to_string(),
+            project_id: project_id.to_string(),
+            slug: slug.to_string(),
+            name: "Declared Artifact".to_string(),
+            condition: ModCondition::Always,
+            version_range: String::new(),
+            hardware_req: None,
+            mutual_exclusions: Vec::new(),
+        }
+    }
+
     fn signed_metadata(manifest: &crate::types::Manifest) -> (String, RulesSignatureMetadata) {
         let signing_key = SigningKey::from_bytes(&[11_u8; 32]);
         let payload = crate::signature::canonical_manifest_payload(manifest).expect("payload");
@@ -1255,6 +1391,121 @@ mod tests {
             None
         };
         spawn_modrinth_server_with_sha512(sha512).await
+    }
+
+    #[derive(Clone, Copy)]
+    enum ProjectLookupResponse {
+        Version,
+        NotFound,
+        Empty,
+        RateLimited,
+    }
+
+    async fn spawn_modrinth_identity_server(
+        project_response: ProjectLookupResponse,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind modrinth identity test server");
+        let addr = listener.local_addr().expect("modrinth identity test addr");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let request_log = Arc::clone(&requests);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let request_log = Arc::clone(&request_log);
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0_u8; 1024];
+                    loop {
+                        let Ok(read) = stream.read(&mut buf).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&buf[..read]);
+                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                        if request.len() > 8192 {
+                            return;
+                        }
+                    }
+
+                    let request = String::from_utf8_lossy(&request);
+                    let first_line = request.lines().next().unwrap_or_default().to_string();
+                    request_log
+                        .lock()
+                        .expect("record request")
+                        .push(first_line.clone());
+
+                    let (status, content_type, extra_headers, body) =
+                        if first_line.contains("/v2/project/declared-project/version") {
+                            match project_response {
+                                ProjectLookupResponse::Version => (
+                                    "200 OK",
+                                    "application/json",
+                                    String::new(),
+                                    version_response_body(&addr, "declared-project"),
+                                ),
+                                ProjectLookupResponse::NotFound => (
+                                    "404 Not Found",
+                                    "text/plain",
+                                    String::new(),
+                                    b"not found".to_vec(),
+                                ),
+                                ProjectLookupResponse::Empty => {
+                                    ("200 OK", "application/json", String::new(), b"[]".to_vec())
+                                }
+                                ProjectLookupResponse::RateLimited => (
+                                    "429 Too Many Requests",
+                                    "text/plain",
+                                    "X-Ratelimit-Reset: 13\r\n".to_string(),
+                                    b"try later".to_vec(),
+                                ),
+                            }
+                        } else if first_line.contains("/v2/project/declared-slug/version") {
+                            (
+                                "200 OK",
+                                "application/json",
+                                String::new(),
+                                version_response_body(&addr, "declared-slug"),
+                            )
+                        } else {
+                            (
+                                "404 Not Found",
+                                "text/plain",
+                                String::new(),
+                                b"not found".to_vec(),
+                            )
+                        };
+                    let headers = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n{extra_headers}\r\n",
+                        body.len()
+                    );
+                    if stream.write_all(headers.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    let _ = stream.write_all(&body).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), requests)
+    }
+
+    fn version_response_body(addr: &std::net::SocketAddr, project_ref: &str) -> Vec<u8> {
+        let file_url = format!("http://{addr}/files/{project_ref}.jar");
+        format!(
+            r#"[{{"id":"{project_ref}-version","game_versions":["1.20.4"],"loaders":["fabric"],"featured":true,"date_published":"2026-05-30T00:00:00Z","files":[{{"url":"{file_url}","filename":"{project_ref}.jar","primary":true,"hashes":{{}}}}]}}]"#
+        )
+        .into_bytes()
+    }
+
+    fn request_log_contains(requests: &[String], needle: &str) -> bool {
+        requests.iter().any(|request| request.contains(needle))
     }
 
     async fn spawn_modrinth_server_with_sha512(sha512: Option<String>) -> String {
