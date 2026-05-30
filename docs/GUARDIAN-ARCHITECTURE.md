@@ -71,7 +71,7 @@ Policy:
 - `core/launcher jvm`: compute preset/JVM args from a chosen policy outcome
 - `core/launcher validation`: report why a requested configuration is incompatible
 - `core/launcher healing`: execute recovery plans and format healing summaries
-- `apps/api session store`: capture observations from the running process
+- `apps/api session store`: capture observations from the running process and preserve Guardian-authored stage telemetry details
 - `frontend`: render the backend-authored Guardian outcome
 
 Lower layers should not decide:
@@ -196,6 +196,7 @@ Current launcher behavior:
 - Guardian `details` are preferred over frontend-synthesized intervention/guidance copy
 - existing `guidance` and `interventions` remain serialized for compatibility and diagnostics
 - Healing remains supporting detail for compatibility specifics and retry/fallback context
+- live launch stage records preserve bounded unique Guardian `details` for `warned`, `intervened`, and `blocked` status payloads before appending Healing warnings without duplicates; Healing `fallback_applied` remains the only source of stage fallback reasons
 
 ## Invariants
 - one launch-safety authority: Guardian
@@ -207,7 +208,7 @@ Current launcher behavior:
 ## Known gaps
 - some policy still leaks into runtime/prepare/Healing/session heuristics/frontend
 - `warned` now covers min-memory clamp, very low launch allocation, memory pressure, conservative CPU/load/install/disk pressure, and Custom-mode risky overrides, but broader warning-only launch-safety paths are not normalized yet
-- the API still exposes Guardian and Healing as separate top-level payload pieces, though Guardian now carries normalized message/details
+- the API still exposes Guardian and Healing as separate top-level payload pieces, though Guardian now carries normalized message/details and session stage telemetry preserves those details
 
 ## Change rule
 If Guardian behavior, authority boundaries, or the launch pipeline change, update:

@@ -14,6 +14,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, RwLock, broadcast};
 
+const MAX_GUARDIAN_STAGE_DETAILS: usize = 8;
+
 struct SessionEntry {
     record: LaunchSessionRecord,
     events: broadcast::Sender<LaunchEvent>,
@@ -505,24 +507,61 @@ fn terminal_stage_result(event: &LaunchStatusEvent) -> Option<&'static str> {
 }
 
 fn stage_notes(event: &LaunchStatusEvent) -> (Vec<String>, Option<String>) {
-    let Some(healing) = event.healing.as_ref().and_then(|value| value.as_object()) else {
-        return (Vec::new(), None);
-    };
-    let warnings = healing
-        .get("warnings")
-        .and_then(|value| value.as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(|value| value.as_str())
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    let fallback_reason = healing
-        .get("fallback_applied")
-        .and_then(|value| value.as_str())
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_string);
+    let mut warnings = Vec::new();
+
+    if let Some(guardian) = event.guardian.as_ref().and_then(|value| value.as_object())
+        && guardian
+            .get("decision")
+            .and_then(|value| value.as_str())
+            .is_some_and(|decision| matches!(decision, "warned" | "intervened" | "blocked"))
+    {
+        let mut added_guardian_details = 0;
+        for detail in guardian
+            .get("details")
+            .and_then(|value| value.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|value| value.as_str())
+        {
+            if push_unique_warning(&mut warnings, detail) {
+                added_guardian_details += 1;
+            }
+            if added_guardian_details >= MAX_GUARDIAN_STAGE_DETAILS {
+                break;
+            }
+        }
+    }
+
+    let fallback_reason = event
+        .healing
+        .as_ref()
+        .and_then(|value| value.as_object())
+        .and_then(|healing| {
+            for warning in healing
+                .get("warnings")
+                .and_then(|value| value.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|value| value.as_str())
+            {
+                push_unique_warning(&mut warnings, warning);
+            }
+            healing
+                .get("fallback_applied")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| value.trim().to_string())
+        });
     (warnings, fallback_reason)
+}
+
+fn push_unique_warning(warnings: &mut Vec<String>, warning: &str) -> bool {
+    let warning = warning.trim();
+    if warning.is_empty() || warnings.iter().any(|existing| existing == warning) {
+        return false;
+    }
+    warnings.push(warning.to_string());
+    true
 }
 
 fn apply_stage_notes(
@@ -534,9 +573,7 @@ fn apply_stage_notes(
         return;
     };
     for warning in warnings {
-        if !stage.warnings.iter().any(|existing| existing == warning) {
-            stage.warnings.push(warning.clone());
-        }
+        push_unique_warning(&mut stage.warnings, warning);
     }
     if stage.fallback_reason.is_none()
         && let Some(fallback_reason) = fallback_reason
@@ -650,6 +687,189 @@ mod tests {
         assert_eq!(terminal.stages[2].stage, "exited");
         assert_eq!(terminal.stages[2].result.as_deref(), Some("failed"));
         assert!(terminal.stages[2].ended_at_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn launch_stage_history_captures_guardian_details_before_healing_warnings() {
+        let store = SessionStore::new();
+        store.insert(test_record("guardian-stage-notes")).await;
+
+        let mut receiver = store
+            .subscribe("guardian-stage-notes")
+            .await
+            .expect("subscribe");
+        store
+            .emit_status(
+                "guardian-stage-notes",
+                LaunchStatusEvent {
+                    state: "validating".to_string(),
+                    benchmark: None,
+                    pid: None,
+                    exit_code: None,
+                    failure_class: None,
+                    failure_detail: None,
+                    healing: Some(json!({
+                        "warnings": [
+                            "Java override was bypassed",
+                            "Healing added fallback context"
+                        ],
+                        "fallback_applied": "Guardian switched to managed Java before launch"
+                    })),
+                    guardian: Some(json!({
+                        "mode": "managed",
+                        "decision": "warned",
+                        "message": "Guardian flagged launch settings for review.",
+                        "details": [
+                            "Launch memory budget is tight",
+                            "Java override was bypassed",
+                            "Launch memory budget is tight",
+                            "",
+                            42
+                        ]
+                    })),
+                    stages: Vec::new(),
+                },
+            )
+            .await;
+
+        let emitted = receiver.recv().await.expect("status event");
+        let LaunchEvent::Status(status) = emitted else {
+            panic!("expected status event");
+        };
+        assert_eq!(
+            status.stages[1].warnings,
+            vec![
+                "Launch memory budget is tight",
+                "Java override was bypassed",
+                "Healing added fallback context",
+            ]
+        );
+        assert_eq!(
+            status.stages[1].fallback_reason.as_deref(),
+            Some("Guardian switched to managed Java before launch")
+        );
+
+        let stored = store
+            .get("guardian-stage-notes")
+            .await
+            .expect("stored record");
+        assert_eq!(stored.stages[1].warnings, status.stages[1].warnings);
+        assert_eq!(
+            stored.stages[1].fallback_reason.as_deref(),
+            Some("Guardian switched to managed Java before launch")
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_stage_history_ignores_allowed_empty_and_malformed_guardian_notes() {
+        let store = SessionStore::new();
+
+        store.insert(test_record("guardian-allowed")).await;
+        store
+            .emit_status(
+                "guardian-allowed",
+                LaunchStatusEvent {
+                    state: "validating".to_string(),
+                    benchmark: None,
+                    pid: None,
+                    exit_code: None,
+                    failure_class: None,
+                    failure_detail: None,
+                    healing: None,
+                    guardian: Some(json!({
+                        "mode": "managed",
+                        "decision": "allowed"
+                    })),
+                    stages: Vec::new(),
+                },
+            )
+            .await;
+
+        let allowed = store.get("guardian-allowed").await.expect("stored record");
+        assert!(allowed.stages[1].warnings.is_empty());
+        assert_eq!(allowed.stages[1].fallback_reason, None);
+
+        store.insert(test_record("guardian-empty")).await;
+        store
+            .emit_status(
+                "guardian-empty",
+                LaunchStatusEvent {
+                    state: "validating".to_string(),
+                    benchmark: None,
+                    pid: None,
+                    exit_code: None,
+                    failure_class: None,
+                    failure_detail: None,
+                    healing: Some(json!("not an object")),
+                    guardian: Some(json!({
+                        "mode": "managed",
+                        "decision": "blocked",
+                        "details": []
+                    })),
+                    stages: Vec::new(),
+                },
+            )
+            .await;
+
+        let empty = store.get("guardian-empty").await.expect("stored record");
+        assert!(empty.stages[1].warnings.is_empty());
+        assert_eq!(empty.stages[1].fallback_reason, None);
+
+        store.insert(test_record("guardian-malformed")).await;
+        store
+            .emit_status(
+                "guardian-malformed",
+                LaunchStatusEvent {
+                    state: "validating".to_string(),
+                    benchmark: None,
+                    pid: None,
+                    exit_code: None,
+                    failure_class: None,
+                    failure_detail: None,
+                    healing: None,
+                    guardian: Some(json!("not an object")),
+                    stages: Vec::new(),
+                },
+            )
+            .await;
+
+        let malformed = store
+            .get("guardian-malformed")
+            .await
+            .expect("stored record");
+        assert!(malformed.stages[1].warnings.is_empty());
+        assert_eq!(malformed.stages[1].fallback_reason, None);
+    }
+
+    #[test]
+    fn launch_stage_notes_bounds_unique_guardian_details() {
+        let details = (0..MAX_GUARDIAN_STAGE_DETAILS + 3)
+            .map(|index| format!("Guardian detail {index}"))
+            .collect::<Vec<_>>();
+        let event = LaunchStatusEvent {
+            state: "validating".to_string(),
+            benchmark: None,
+            pid: None,
+            exit_code: None,
+            failure_class: None,
+            failure_detail: None,
+            healing: None,
+            guardian: Some(json!({
+                "mode": "managed",
+                "decision": "intervened",
+                "details": details
+            })),
+            stages: Vec::new(),
+        };
+
+        let (warnings, fallback_reason) = stage_notes(&event);
+        assert_eq!(warnings.len(), MAX_GUARDIAN_STAGE_DETAILS);
+        assert_eq!(warnings[0], "Guardian detail 0");
+        assert_eq!(
+            warnings[MAX_GUARDIAN_STAGE_DETAILS - 1],
+            format!("Guardian detail {}", MAX_GUARDIAN_STAGE_DETAILS - 1)
+        );
+        assert_eq!(fallback_reason, None);
     }
 
     #[tokio::test]
