@@ -642,9 +642,8 @@
   color: var(--text-dim);
 }
 .cp-od-perf-summary-mark {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
+  display: grid;
+  place-items: center;
   flex: 0 0 22px;
   width: 22px;
   height: 22px;
@@ -652,17 +651,21 @@
   border-radius: 999px;
   background: var(--surface-3);
   color: var(--text-mute);
+  line-height: 0;
 }
 .cp-od-perf-summary-mark > svg {
   display: block;
+  grid-area: 1 / 1;
   width: 12px;
   height: 12px;
   flex: 0 0 auto;
+  transform: translate(var(--cp-od-perf-summary-icon-x, 0), var(--cp-od-perf-summary-icon-y, 0));
 }
 .cp-od-perf-summary-mark[data-icon="check"] > svg {
+  --cp-od-perf-summary-icon-x: 0.25px;
+  --cp-od-perf-summary-icon-y: 0;
   width: 13px;
   height: 13px;
-  transform: translateY(0.5px);
 }
 .cp-od-perf-summary[data-tone="ok"] .cp-od-perf-summary-mark {
   background: var(--ok);
