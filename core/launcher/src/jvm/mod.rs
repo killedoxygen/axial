@@ -134,7 +134,7 @@ pub fn supports_hotspot_tuning(info: &JavaRuntimeInfo) -> bool {
 }
 
 pub fn supports_shenandoah(info: &JavaRuntimeInfo) -> bool {
-    supports_hotspot_tuning(info) && info.major >= 17 && info.distribution != "graalvm"
+    supports_hotspot_tuning(info) && info.major >= 11 && info.distribution != "graalvm"
 }
 
 pub fn supports_zgc(info: &JavaRuntimeInfo) -> bool {
@@ -330,6 +330,159 @@ mod tests {
             update: 0,
             distribution: distribution.to_string(),
             path: "/java".to_string(),
+        }
+    }
+
+    #[test]
+    fn phase1_auto_select_preset_gate_matrix() {
+        struct Case {
+            name: &'static str,
+            version_id: &'static str,
+            loader: &'static str,
+            is_modded: bool,
+            info: JavaRuntimeInfo,
+            logical_cores: Option<usize>,
+            total_memory_mb: Option<u64>,
+            expected: &'static str,
+        }
+
+        let cases = [
+            Case {
+                name: "java 11 modern vanilla smooth on lower-spec host",
+                version_id: "1.20.4",
+                loader: "vanilla",
+                is_modded: false,
+                info: info(11),
+                logical_cores: Some(4),
+                total_memory_mb: Some(4096),
+                expected: PRESET_SMOOTH,
+            },
+            Case {
+                name: "java 17 modern vanilla smooth on non-ultra host",
+                version_id: "1.20.4",
+                loader: "vanilla",
+                is_modded: false,
+                info: info(17),
+                logical_cores: Some(8),
+                total_memory_mb: Some(8191),
+                expected: PRESET_SMOOTH,
+            },
+            Case {
+                name: "java 21 high-end modern vanilla ultra low latency",
+                version_id: "1.21.1",
+                loader: "vanilla",
+                is_modded: false,
+                info: info(21),
+                logical_cores: Some(8),
+                total_memory_mb: Some(8192),
+                expected: PRESET_ULTRA_LOW_LATENCY,
+            },
+            Case {
+                name: "high-end modern modded performance",
+                version_id: "1.21.1",
+                loader: "fabric",
+                is_modded: true,
+                info: info(21),
+                logical_cores: Some(16),
+                total_memory_mb: Some(32_768),
+                expected: PRESET_PERFORMANCE,
+            },
+            Case {
+                name: "graalvm java 17 vanilla preserves graalvm tuning",
+                version_id: "1.20.4",
+                loader: "vanilla",
+                is_modded: false,
+                info: info_with_distribution(17, "graalvm"),
+                logical_cores: Some(4),
+                total_memory_mb: Some(4096),
+                expected: PRESET_GRAALVM,
+            },
+            Case {
+                name: "graalvm java 21 modded preserves graalvm tuning",
+                version_id: "1.20.4",
+                loader: "forge",
+                is_modded: true,
+                info: info_with_distribution(21, "graalvm"),
+                logical_cores: Some(16),
+                total_memory_mb: Some(32_768),
+                expected: PRESET_GRAALVM,
+            },
+            Case {
+                name: "normalized openj9 semeru ibm runtime disables hotspot tuning",
+                version_id: "1.20.4",
+                loader: "vanilla",
+                is_modded: false,
+                info: info_with_distribution(21, "openj9"),
+                logical_cores: Some(16),
+                total_memory_mb: Some(32_768),
+                expected: "",
+            },
+            Case {
+                name: "java 8 1.8.9 uses legacy pvp",
+                version_id: "1.8.9",
+                loader: "vanilla",
+                is_modded: false,
+                info: info(8),
+                logical_cores: Some(4),
+                total_memory_mb: Some(4096),
+                expected: PRESET_LEGACY_PVP,
+            },
+            Case {
+                name: "java 8 modded 1.12.2 uses legacy heavy",
+                version_id: "1.12.2",
+                loader: "forge",
+                is_modded: true,
+                info: info(8),
+                logical_cores: Some(4),
+                total_memory_mb: Some(4096),
+                expected: PRESET_LEGACY_HEAVY,
+            },
+            Case {
+                name: "java 8 other legacy target uses conservative legacy",
+                version_id: "1.7.10",
+                loader: "vanilla",
+                is_modded: false,
+                info: info(8),
+                logical_cores: Some(4),
+                total_memory_mb: Some(4096),
+                expected: PRESET_LEGACY,
+            },
+            Case {
+                name: "modern java targeting legacy vanilla uses safe hotspot preset",
+                version_id: "1.8.9",
+                loader: "vanilla",
+                is_modded: false,
+                info: info(17),
+                logical_cores: Some(16),
+                total_memory_mb: Some(32_768),
+                expected: PRESET_PERFORMANCE,
+            },
+            Case {
+                name: "modern java targeting legacy modded uses safe hotspot preset",
+                version_id: "1.12.2",
+                loader: "forge",
+                is_modded: true,
+                info: info(21),
+                logical_cores: Some(16),
+                total_memory_mb: Some(32_768),
+                expected: PRESET_PERFORMANCE,
+            },
+        ];
+
+        for case in cases {
+            assert_eq!(
+                auto_select_preset_with_host(
+                    case.version_id,
+                    case.loader,
+                    case.is_modded,
+                    &case.info,
+                    case.logical_cores,
+                    case.total_memory_mb,
+                ),
+                case.expected,
+                "{}",
+                case.name
+            );
         }
     }
 
