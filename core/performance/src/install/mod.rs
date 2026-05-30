@@ -14,9 +14,9 @@ use crate::state::{
 };
 use crate::status::{RuleChannel, RuleSource, RulesValidation};
 use crate::types::{
-    CompositionPlan, CompositionState, InstalledMod, ManagedArtifactIntegrity,
-    ManagedArtifactProvider, ManagedArtifactSource, OwnershipClass, PerformanceMode,
-    ResolutionRequest,
+    CompositionPlan, CompositionState, CompositionTier, EmergencyDisable, EmergencyDisableTarget,
+    InstalledMod, ManagedArtifactIntegrity, ManagedArtifactProvider, ManagedArtifactSource,
+    ManagedMod, Manifest, OwnershipClass, PerformanceMode, ResolutionRequest, VersionFamily,
 };
 use chrono::Utc;
 use sha2::Digest;
@@ -30,6 +30,8 @@ use tracing::warn;
 pub const PERFORMANCE_RULES_URL_ENV: &str = "CROOPOR_PERFORMANCE_RULES_URL";
 const REMOTE_RULES_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_RULES_MAX_BYTES: usize = 1024 * 1024;
+const MIN_USEFUL_MANAGED_INSTALLS: usize = 2;
+const MAX_INSTALL_FALLBACK_ATTEMPTS: usize = 4;
 
 #[derive(Debug, Error)]
 pub enum InstallError {
@@ -197,41 +199,44 @@ impl PerformanceManager {
         if let Some(previous_state) = previous_state.as_ref() {
             save_rollback_snapshot(instance_mods_dir, previous_state)?;
         }
-        self.restore_after_error(
-            instance_mods_dir,
-            self.remove_stale_managed(instance_mods_dir, previous_state.as_ref(), plan),
-            snapshot_available,
-        )?;
 
-        let mut state = CompositionState {
-            composition_id: plan.composition_id.clone(),
-            tier: plan.tier,
-            installed_mods: Vec::with_capacity(plan.mods.len()),
-            installed_at: Utc::now().to_rfc3339(),
-            failure_count: 0,
-            last_failure: String::new(),
-        };
+        let attempt_plans = self.install_attempt_plans(plan);
+        let mut abandoned_states = Vec::new();
+        let mut selected_state = None;
 
-        for managed_mod in &plan.mods {
-            match self
-                .install_mod(managed_mod, game_version, &plan.loader, instance_mods_dir)
-                .await
-            {
-                Ok(installed) => state.installed_mods.push(installed),
-                Err(error) => {
-                    state.failure_count += 1;
-                    state.last_failure = error.to_string();
-                    warn!(
-                        "performance install failed for {}: {}",
-                        managed_mod.project_id, error
-                    );
-                }
+        for (index, attempt_plan) in attempt_plans.iter().enumerate() {
+            self.restore_after_error(
+                instance_mods_dir,
+                self.remove_stale_managed(instance_mods_dir, previous_state.as_ref(), attempt_plan),
+                snapshot_available,
+            )?;
+
+            let state = self
+                .attempt_install_plan(attempt_plan, game_version, instance_mods_dir)
+                .await;
+            let should_fallback =
+                severe_install_failure(attempt_plan, &state) && index + 1 < attempt_plans.len();
+
+            if should_fallback {
+                let next_plan = &attempt_plans[index + 1];
+                warn!(
+                    "performance composition {} had severe install failure; trying fallback {}",
+                    attempt_plan.composition_id, next_plan.composition_id
+                );
+                self.restore_after_error(
+                    instance_mods_dir,
+                    self.remove_attempt_mods_not_in_plan(instance_mods_dir, &state, next_plan),
+                    snapshot_available,
+                )?;
+                abandoned_states.push(state);
+                continue;
             }
+
+            selected_state = Some(state);
+            break;
         }
 
-        state
-            .installed_mods
-            .sort_by(|left, right| left.project_id.cmp(&right.project_id));
+        let state = selected_state.expect("at least the requested performance plan is attempted");
         self.restore_after_error(
             instance_mods_dir,
             save_state(instance_mods_dir, &state).map_err(InstallError::State),
@@ -240,6 +245,11 @@ impl PerformanceManager {
         self.restore_after_error(
             instance_mods_dir,
             self.remove_superseded_managed(instance_mods_dir, previous_state.as_ref(), &state),
+            snapshot_available,
+        )?;
+        self.restore_after_error(
+            instance_mods_dir,
+            self.remove_abandoned_attempt_mods(instance_mods_dir, &abandoned_states, &state),
             snapshot_available,
         )?;
         Ok(state)
@@ -495,6 +505,131 @@ impl PerformanceManager {
         })
     }
 
+    async fn attempt_install_plan(
+        &self,
+        plan: &CompositionPlan,
+        game_version: &str,
+        instance_mods_dir: &Path,
+    ) -> CompositionState {
+        let mut state = CompositionState {
+            composition_id: plan.composition_id.clone(),
+            tier: plan.tier,
+            installed_mods: Vec::with_capacity(plan.mods.len()),
+            installed_at: Utc::now().to_rfc3339(),
+            failure_count: 0,
+            last_failure: String::new(),
+        };
+
+        for managed_mod in &plan.mods {
+            match self
+                .install_mod(managed_mod, game_version, &plan.loader, instance_mods_dir)
+                .await
+            {
+                Ok(installed) => state.installed_mods.push(installed),
+                Err(error) => {
+                    state.failure_count += 1;
+                    state.last_failure = error.to_string();
+                    warn!(
+                        "performance install failed for {}: {}",
+                        managed_mod.project_id, error
+                    );
+                }
+            }
+        }
+
+        state
+            .installed_mods
+            .sort_by(|left, right| left.project_id.cmp(&right.project_id));
+        state
+    }
+
+    fn install_attempt_plans(&self, plan: &CompositionPlan) -> Vec<CompositionPlan> {
+        let active = self.active.read().expect("performance rules lock poisoned");
+        let manifest = &active.manifest;
+        let mut plans = vec![plan.clone()];
+        let mut seen = std::collections::HashSet::new();
+        if !plan.composition_id.is_empty() {
+            seen.insert(plan.composition_id.clone());
+        }
+
+        for (chain_index, fallback_id) in plan
+            .fallback_chain
+            .iter()
+            .enumerate()
+            .filter(|(_, fallback_id)| !fallback_id.trim().is_empty())
+            .take(MAX_INSTALL_FALLBACK_ATTEMPTS.saturating_sub(1))
+        {
+            if !seen.insert(fallback_id.clone()) {
+                warn!("performance fallback cycle ignored at {}", fallback_id);
+                continue;
+            }
+
+            let Some(definition) = manifest
+                .compositions
+                .iter()
+                .find(|definition| definition.id == *fallback_id)
+            else {
+                warn!(
+                    "performance fallback composition {} is missing",
+                    fallback_id
+                );
+                continue;
+            };
+
+            if !definition.families.contains(&plan.family)
+                || !definition
+                    .loaders
+                    .iter()
+                    .any(|loader| loader.eq_ignore_ascii_case(&plan.loader))
+            {
+                warn!(
+                    "performance fallback composition {} does not apply to {:?}/{}",
+                    fallback_id, plan.family, plan.loader
+                );
+                continue;
+            }
+
+            let mods = definition
+                .mods
+                .iter()
+                .filter(|managed_mod| {
+                    active_artifact_disable(
+                        manifest,
+                        managed_mod,
+                        plan.family,
+                        &plan.loader,
+                        definition.tier,
+                    )
+                    .is_none()
+                })
+                .cloned()
+                .collect();
+
+            plans.push(CompositionPlan {
+                composition_id: definition.id.clone(),
+                family: plan.family,
+                loader: plan.loader.clone(),
+                mode: plan.mode,
+                tier: definition.tier,
+                mods,
+                jvm_preset: definition.jvm_preset.clone(),
+                fallback_chain: plan
+                    .fallback_chain
+                    .iter()
+                    .skip(chain_index + 1)
+                    .cloned()
+                    .collect(),
+                warnings: plan.warnings.clone(),
+                fallback_reason: format!(
+                    "install fallback from {} after severe managed install failure",
+                    plan.composition_id
+                ),
+            });
+        }
+
+        plans
+    }
+
     async fn resolve_managed_mod_versions(
         &self,
         managed_mod: &crate::types::ManagedMod,
@@ -608,6 +743,62 @@ impl PerformanceManager {
         Ok(())
     }
 
+    fn remove_attempt_mods_not_in_plan(
+        &self,
+        instance_mods_dir: &Path,
+        state: &CompositionState,
+        next_plan: &CompositionPlan,
+    ) -> Result<(), InstallError> {
+        let keep: std::collections::HashSet<String> = next_plan
+            .mods
+            .iter()
+            .map(|managed_mod| managed_mod.project_id.to_lowercase())
+            .collect();
+
+        for installed in &state.installed_mods {
+            if keep.contains(&installed.project_id.to_lowercase()) {
+                continue;
+            }
+            let path = managed_artifact_path(instance_mods_dir, &installed.filename)?;
+            if let Err(error) = fs::remove_file(path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(InstallError::Io(error));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn remove_abandoned_attempt_mods(
+        &self,
+        instance_mods_dir: &Path,
+        abandoned_states: &[CompositionState],
+        final_state: &CompositionState,
+    ) -> Result<(), InstallError> {
+        let keep: std::collections::HashSet<String> = final_state
+            .installed_mods
+            .iter()
+            .map(|installed| installed.filename.clone())
+            .collect();
+
+        for state in abandoned_states {
+            for installed in &state.installed_mods {
+                if keep.contains(&installed.filename) {
+                    continue;
+                }
+                let path = managed_artifact_path(instance_mods_dir, &installed.filename)?;
+                if let Err(error) = fs::remove_file(path)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    return Err(InstallError::Io(error));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn restore_after_error<T>(
         &self,
         instance_mods_dir: &Path,
@@ -646,6 +837,62 @@ fn empty_state(plan: &CompositionPlan) -> CompositionState {
         failure_count: 0,
         last_failure: String::new(),
     }
+}
+
+fn severe_install_failure(plan: &CompositionPlan, state: &CompositionState) -> bool {
+    !plan.mods.is_empty()
+        && state.failure_count > 0
+        && state.installed_mods.len() < MIN_USEFUL_MANAGED_INSTALLS
+}
+
+fn active_artifact_disable<'a>(
+    manifest: &'a Manifest,
+    managed_mod: &ManagedMod,
+    family: VersionFamily,
+    loader: &str,
+    tier: CompositionTier,
+) -> Option<&'a EmergencyDisable> {
+    manifest.emergency_disables.iter().find(|disable| {
+        disable.target == EmergencyDisableTarget::Artifact
+            && artifact_target_matches(manifest, disable, managed_mod)
+            && disable_applies(disable, family, loader, tier)
+    })
+}
+
+fn artifact_target_matches(
+    manifest: &Manifest,
+    disable: &EmergencyDisable,
+    managed_mod: &ManagedMod,
+) -> bool {
+    let Some(artifact) = manifest
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.id.eq_ignore_ascii_case(&managed_mod.artifact_id))
+    else {
+        return false;
+    };
+    disable.target_id.eq_ignore_ascii_case(&artifact.id)
+        || disable
+            .target_id
+            .eq_ignore_ascii_case(&artifact.source.project_id)
+        || disable
+            .target_id
+            .eq_ignore_ascii_case(&artifact.source.slug)
+}
+
+fn disable_applies(
+    disable: &EmergencyDisable,
+    family: VersionFamily,
+    loader: &str,
+    tier: CompositionTier,
+) -> bool {
+    (disable.families.is_empty() || disable.families.contains(&family))
+        && (disable.loaders.is_empty()
+            || disable
+                .loaders
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(loader)))
+        && (disable.tiers.is_empty() || disable.tiers.contains(&tier))
 }
 
 fn modrinth_source() -> ManagedArtifactSource {
@@ -728,7 +975,10 @@ fn rules_client() -> reqwest::Client {
 mod tests {
     use super::*;
     use crate::state::{load_state, save_state};
-    use crate::types::{CompositionTier, ManagedMod, ModCondition, VersionFamily};
+    use crate::types::{
+        CompositionDef, CompositionTier, EmergencyDisable, EmergencyDisableTarget, ManagedMod,
+        ModCondition, VersionFamily,
+    };
     use ed25519_dalek::{Signer, SigningKey};
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1015,6 +1265,238 @@ mod tests {
         assert!(state.installed_mods.is_empty());
         assert!(!root.join("sodium.jar").exists());
         assert!(!root.join("sodium.jar.tmp").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn severe_extended_failure_installs_and_saves_core_fallback() {
+        let root = test_root("install-severe-fallback-core");
+        let manager = PerformanceManager::new_with_modrinth_base_url(
+            spawn_selective_modrinth_server(&["sodium", "lithium"]).await,
+        )
+        .expect("performance manager");
+        set_test_compositions(
+            &manager,
+            vec![composition_def(
+                "test-core",
+                CompositionTier::Core,
+                vec![
+                    managed_mod("sodium", "sodium"),
+                    managed_mod("lithium", "lithium"),
+                ],
+            )],
+        );
+        let plan = CompositionPlan {
+            composition_id: "test-extended".to_string(),
+            family: VersionFamily::F,
+            loader: "fabric".to_string(),
+            mode: PerformanceMode::Managed,
+            tier: CompositionTier::Extended,
+            mods: vec![
+                managed_mod("entityculling", "entityculling"),
+                managed_mod("c2me-fabric", "c2me-fabric"),
+                managed_mod("moreculling", "moreculling"),
+            ],
+            jvm_preset: String::new(),
+            fallback_chain: vec!["test-core".to_string()],
+            warnings: Vec::new(),
+            fallback_reason: String::new(),
+        };
+
+        let state = manager
+            .ensure_installed(&plan, "1.20.4", &root)
+            .await
+            .expect("install core fallback");
+
+        assert_eq!(state.composition_id, "test-core");
+        assert_eq!(state.tier, CompositionTier::Core);
+        assert_eq!(state.failure_count, 0);
+        assert_eq!(
+            state
+                .installed_mods
+                .iter()
+                .map(|installed| installed.project_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["lithium", "sodium"]
+        );
+        let loaded = load_state(&root)
+            .expect("load state")
+            .expect("fallback state should be saved");
+        assert_eq!(loaded.composition_id, "test-core");
+        assert!(root.join("sodium.jar").is_file());
+        assert!(root.join("lithium.jar").is_file());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn fallback_attempt_skips_emergency_disabled_artifact() {
+        let root = test_root("install-fallback-skips-disabled-artifact");
+        let manager = PerformanceManager::new_with_modrinth_base_url(
+            spawn_selective_modrinth_server(&["sodium", "lithium"]).await,
+        )
+        .expect("performance manager");
+        set_test_compositions(
+            &manager,
+            vec![composition_def(
+                "test-core",
+                CompositionTier::Core,
+                vec![
+                    managed_mod("sodium", "sodium"),
+                    managed_mod("lithium", "lithium"),
+                ],
+            )],
+        );
+        set_test_emergency_disables(
+            &manager,
+            vec![artifact_disable(
+                "disable-lithium",
+                "lithium",
+                CompositionTier::Core,
+            )],
+        );
+        let plan = CompositionPlan {
+            composition_id: "test-extended".to_string(),
+            family: VersionFamily::F,
+            loader: "fabric".to_string(),
+            mode: PerformanceMode::Managed,
+            tier: CompositionTier::Extended,
+            mods: vec![
+                managed_mod("entityculling", "entityculling"),
+                managed_mod("c2me-fabric", "c2me-fabric"),
+            ],
+            jvm_preset: String::new(),
+            fallback_chain: vec!["test-core".to_string()],
+            warnings: Vec::new(),
+            fallback_reason: String::new(),
+        };
+
+        let state = manager
+            .ensure_installed(&plan, "1.20.4", &root)
+            .await
+            .expect("install filtered fallback");
+
+        assert_eq!(state.composition_id, "test-core");
+        assert_eq!(
+            state
+                .installed_mods
+                .iter()
+                .map(|installed| installed.project_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sodium"]
+        );
+        assert!(root.join("sodium.jar").is_file());
+        assert!(!root.join("lithium.jar").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn partial_degradation_with_two_successes_does_not_fallback() {
+        let root = test_root("install-partial-no-fallback");
+        let manager = PerformanceManager::new_with_modrinth_base_url(
+            spawn_selective_modrinth_server(&["sodium", "lithium", "ferrite-core", "dynamic-fps"])
+                .await,
+        )
+        .expect("performance manager");
+        set_test_compositions(
+            &manager,
+            vec![composition_def(
+                "test-core",
+                CompositionTier::Core,
+                vec![
+                    managed_mod("ferrite-core", "ferrite-core"),
+                    managed_mod("dynamic-fps", "dynamic-fps"),
+                ],
+            )],
+        );
+        let plan = CompositionPlan {
+            composition_id: "test-extended".to_string(),
+            family: VersionFamily::F,
+            loader: "fabric".to_string(),
+            mode: PerformanceMode::Managed,
+            tier: CompositionTier::Extended,
+            mods: vec![
+                managed_mod("sodium", "sodium"),
+                managed_mod("lithium", "lithium"),
+                managed_mod("entityculling", "entityculling"),
+            ],
+            jvm_preset: String::new(),
+            fallback_chain: vec!["test-core".to_string()],
+            warnings: Vec::new(),
+            fallback_reason: String::new(),
+        };
+
+        let state = manager
+            .ensure_installed(&plan, "1.20.4", &root)
+            .await
+            .expect("install degraded original");
+
+        assert_eq!(state.composition_id, "test-extended");
+        assert_eq!(state.tier, CompositionTier::Extended);
+        assert_eq!(state.failure_count, 1);
+        assert_eq!(state.installed_mods.len(), 2);
+        assert!(root.join("sodium.jar").is_file());
+        assert!(root.join("lithium.jar").is_file());
+        assert!(!root.join("ferrite-core.jar").exists());
+        assert!(!root.join("dynamic-fps.jar").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn vanilla_enhanced_fallback_saves_empty_state_and_removes_tracked_files() {
+        let root = test_root("install-fallback-vanilla-empty");
+        fs::write(root.join("managed.jar"), b"managed-v1").expect("write managed file");
+        fs::write(root.join("user.jar"), b"user-v1").expect("write user file");
+        save_state(
+            &root,
+            &test_state("old-core", vec![test_mod("sodium", "managed.jar")]),
+        )
+        .expect("save previous state");
+        let manager = PerformanceManager::new_with_modrinth_base_url(
+            spawn_selective_modrinth_server(&[]).await,
+        )
+        .expect("performance manager");
+        set_test_compositions(
+            &manager,
+            vec![composition_def(
+                "test-vanilla-enhanced",
+                CompositionTier::VanillaEnhanced,
+                Vec::new(),
+            )],
+        );
+        let plan = CompositionPlan {
+            composition_id: "test-core".to_string(),
+            family: VersionFamily::F,
+            loader: "fabric".to_string(),
+            mode: PerformanceMode::Managed,
+            tier: CompositionTier::Core,
+            mods: vec![managed_mod("entityculling", "entityculling")],
+            jvm_preset: String::new(),
+            fallback_chain: vec!["test-vanilla-enhanced".to_string()],
+            warnings: Vec::new(),
+            fallback_reason: String::new(),
+        };
+
+        let state = manager
+            .ensure_installed(&plan, "1.20.4", &root)
+            .await
+            .expect("install vanilla fallback");
+
+        assert_eq!(state.composition_id, "test-vanilla-enhanced");
+        assert_eq!(state.tier, CompositionTier::VanillaEnhanced);
+        assert!(state.installed_mods.is_empty());
+        assert!(!root.join("managed.jar").exists());
+        assert_eq!(
+            fs::read(root.join("user.jar")).expect("read user"),
+            b"user-v1"
+        );
+        let loaded = load_state(&root)
+            .expect("load state")
+            .expect("empty fallback state should be saved");
+        assert!(loaded.installed_mods.is_empty());
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1360,7 +1842,7 @@ mod tests {
 
     fn managed_mod(project_id: &str, slug: &str) -> ManagedMod {
         ManagedMod {
-            artifact_id: "declared-artifact".to_string(),
+            artifact_id: project_id.to_string(),
             project_id: project_id.to_string(),
             slug: slug.to_string(),
             name: "Declared Artifact".to_string(),
@@ -1368,6 +1850,51 @@ mod tests {
             version_range: String::new(),
             hardware_req: None,
             mutual_exclusions: Vec::new(),
+        }
+    }
+
+    fn composition_def(id: &str, tier: CompositionTier, mods: Vec<ManagedMod>) -> CompositionDef {
+        CompositionDef {
+            id: id.to_string(),
+            display_name: id.to_string(),
+            description: id.to_string(),
+            families: vec![VersionFamily::F],
+            loaders: vec!["fabric".to_string()],
+            tier,
+            mods,
+            fallback_to: String::new(),
+            jvm_preset: String::new(),
+        }
+    }
+
+    fn set_test_compositions(manager: &PerformanceManager, compositions: Vec<CompositionDef>) {
+        let mut active = manager
+            .active
+            .write()
+            .expect("performance rules lock poisoned");
+        active.manifest.compositions = compositions;
+    }
+
+    fn set_test_emergency_disables(
+        manager: &PerformanceManager,
+        emergency_disables: Vec<EmergencyDisable>,
+    ) {
+        let mut active = manager
+            .active
+            .write()
+            .expect("performance rules lock poisoned");
+        active.manifest.emergency_disables = emergency_disables;
+    }
+
+    fn artifact_disable(id: &str, target_id: &str, tier: CompositionTier) -> EmergencyDisable {
+        EmergencyDisable {
+            id: id.to_string(),
+            target: EmergencyDisableTarget::Artifact,
+            target_id: target_id.to_string(),
+            reason: "test disable".to_string(),
+            families: vec![VersionFamily::F],
+            loaders: vec!["fabric".to_string()],
+            tiers: vec![tier],
         }
     }
 
@@ -1506,6 +2033,83 @@ mod tests {
 
     fn request_log_contains(requests: &[String], needle: &str) -> bool {
         requests.iter().any(|request| request.contains(needle))
+    }
+
+    async fn spawn_selective_modrinth_server(success_projects: &[&str]) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind selective modrinth test server");
+        let addr = listener.local_addr().expect("selective modrinth test addr");
+        let success_projects = success_projects
+            .iter()
+            .map(|project| project.to_string())
+            .collect::<std::collections::HashSet<_>>();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let success_projects = success_projects.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0_u8; 1024];
+                    loop {
+                        let Ok(read) = stream.read(&mut buf).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&buf[..read]);
+                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                        if request.len() > 8192 {
+                            return;
+                        }
+                    }
+
+                    let request = String::from_utf8_lossy(&request);
+                    let first_line = request.lines().next().unwrap_or_default();
+                    let (status, content_type, body) =
+                        selective_modrinth_response(&addr, &success_projects, first_line);
+                    let headers = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    if stream.write_all(headers.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    let _ = stream.write_all(&body).await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn selective_modrinth_response(
+        addr: &std::net::SocketAddr,
+        success_projects: &std::collections::HashSet<String>,
+        first_line: &str,
+    ) -> (&'static str, &'static str, Vec<u8>) {
+        for project in success_projects {
+            if first_line.contains(&format!("/v2/project/{project}/version")) {
+                return (
+                    "200 OK",
+                    "application/json",
+                    version_response_body(addr, project),
+                );
+            }
+            if first_line.contains(&format!("/files/{project}.jar")) {
+                return (
+                    "200 OK",
+                    "application/octet-stream",
+                    format!("{project}-jar").into_bytes(),
+                );
+            }
+        }
+
+        ("404 Not Found", "text/plain", b"not found".to_vec())
     }
 
     async fn spawn_modrinth_server_with_sha512(sha512: Option<String>) -> String {
