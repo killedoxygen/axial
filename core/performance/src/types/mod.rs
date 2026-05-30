@@ -55,6 +55,25 @@ pub enum OwnershipClass {
     UserManaged,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedArtifactProvider {
+    Modrinth,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedArtifactSource {
+    pub provider: ManagedArtifactProvider,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedArtifactIntegrity {
+    pub sha512: String,
+    pub sha512_verified: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct HardwareRequirement {
     #[serde(default)]
@@ -157,12 +176,14 @@ pub struct HardwareProfile {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InstalledMod {
     pub project_id: String,
     pub version_id: String,
     pub filename: String,
     pub ownership_class: OwnershipClass,
-    pub sha512: String,
+    pub source: ManagedArtifactSource,
+    pub integrity: ManagedArtifactIntegrity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -28,6 +28,8 @@ pub enum StateError {
         filename: String,
         ownership_class: String,
     },
+    #[error("invalid performance artifact integrity for {filename}: {reason}")]
+    InvalidIntegrity { filename: String, reason: String },
     #[error("invalid performance rollback snapshot id")]
     InvalidRollbackId,
     #[error("invalid rollback snapshot: {0}")]
@@ -324,6 +326,29 @@ fn validate_state(state: &CompositionState) -> Result<(), StateError> {
                     .unwrap_or_else(|| format!("{:?}", installed.ownership_class)),
             });
         }
+        validate_sha512_integrity(&installed.filename, &installed.integrity.sha512)?;
+        if installed.integrity.sha512_verified && installed.integrity.sha512.is_empty() {
+            return Err(StateError::InvalidIntegrity {
+                filename: installed.filename.clone(),
+                reason: "verified SHA-512 metadata requires a recorded SHA-512".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_sha512_integrity(filename: &str, sha512: &str) -> Result<(), StateError> {
+    if sha512.is_empty() {
+        return Ok(());
+    }
+    if sha512.trim() != sha512
+        || sha512.len() != 128
+        || !sha512.bytes().all(|value| value.is_ascii_hexdigit())
+    {
+        return Err(StateError::InvalidIntegrity {
+            filename: filename.to_string(),
+            reason: "SHA-512 metadata must be 128 hexadecimal characters".to_string(),
+        });
     }
     Ok(())
 }
@@ -526,7 +551,9 @@ fn replace_file_atomic(temp_path: &Path, final_path: &Path) -> Result<(), std::i
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::InstalledMod;
+    use crate::types::{
+        InstalledMod, ManagedArtifactIntegrity, ManagedArtifactProvider, ManagedArtifactSource,
+    };
 
     #[test]
     fn rollback_history_retains_bounded_recent_snapshots() {
@@ -670,7 +697,8 @@ mod tests {
                     "project_id": "sodium",
                     "version_id": "version",
                     "filename": "sodium.jar",
-                    "sha512": ""
+                    "source": { "provider": "modrinth" },
+                    "integrity": { "sha512": "", "sha512_verified": false }
                 }],
                 "installed_at": "2026-05-30T00:00:00Z"
             }))
@@ -692,7 +720,8 @@ mod tests {
                     "version_id": "version",
                     "filename": "sodium.jar",
                     "ownership_class": "plugin_managed",
-                    "sha512": ""
+                    "source": { "provider": "modrinth" },
+                    "integrity": { "sha512": "", "sha512_verified": false }
                 }],
                 "installed_at": "2026-05-30T00:00:00Z"
             }))
@@ -704,6 +733,135 @@ mod tests {
             StateError::Parse(_)
         ));
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_state_rejects_missing_or_unknown_source_and_integrity_shape() {
+        let root = test_root("invalid-source-integrity-shape");
+        fs::write(
+            lock_file_path(&root),
+            serde_json::to_vec(&serde_json::json!({
+                "composition_id": "core",
+                "tier": "core",
+                "installed_mods": [{
+                    "project_id": "sodium",
+                    "version_id": "version",
+                    "filename": "sodium.jar",
+                    "ownership_class": "composition_managed"
+                }],
+                "installed_at": "2026-05-30T00:00:00Z"
+            }))
+            .expect("serialize state"),
+        )
+        .expect("write missing source state");
+        assert!(matches!(
+            load_state(&root).expect_err("missing source and integrity should be invalid"),
+            StateError::Parse(_)
+        ));
+
+        fs::write(
+            lock_file_path(&root),
+            serde_json::to_vec(&serde_json::json!({
+                "composition_id": "core",
+                "tier": "core",
+                "installed_mods": [{
+                    "project_id": "sodium",
+                    "version_id": "version",
+                    "filename": "sodium.jar",
+                    "ownership_class": "composition_managed",
+                    "source": { "provider": "unknown" },
+                    "integrity": { "sha512": "", "sha512_verified": false }
+                }],
+                "installed_at": "2026-05-30T00:00:00Z"
+            }))
+            .expect("serialize state"),
+        )
+        .expect("write unknown source state");
+        assert!(matches!(
+            load_state(&root).expect_err("unknown source should be invalid"),
+            StateError::Parse(_)
+        ));
+
+        fs::write(
+            lock_file_path(&root),
+            serde_json::to_vec(&serde_json::json!({
+                "composition_id": "core",
+                "tier": "core",
+                "installed_mods": [{
+                    "project_id": "sodium",
+                    "version_id": "version",
+                    "filename": "sodium.jar",
+                    "ownership_class": "composition_managed",
+                    "source": { "provider": "modrinth" },
+                    "integrity": { "sha512": "", "sha512_verified": false, "path": "/tmp/sodium.jar" }
+                }],
+                "installed_at": "2026-05-30T00:00:00Z"
+            }))
+            .expect("serialize state"),
+        )
+        .expect("write unknown integrity field state");
+        assert!(matches!(
+            load_state(&root).expect_err("unknown integrity field should be invalid"),
+            StateError::Parse(_)
+        ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_state_rejects_verified_integrity_without_sha512() {
+        let root = test_root("invalid-integrity");
+        fs::write(
+            lock_file_path(&root),
+            serde_json::to_vec(&serde_json::json!({
+                "composition_id": "core",
+                "tier": "core",
+                "installed_mods": [{
+                    "project_id": "sodium",
+                    "version_id": "version",
+                    "filename": "sodium.jar",
+                    "ownership_class": "composition_managed",
+                    "source": { "provider": "modrinth" },
+                    "integrity": { "sha512": "", "sha512_verified": true }
+                }],
+                "installed_at": "2026-05-30T00:00:00Z"
+            }))
+            .expect("serialize state"),
+        )
+        .expect("write invalid integrity state");
+
+        let error = load_state(&root).expect_err("empty verified SHA-512 should be invalid");
+
+        assert!(matches!(error, StateError::InvalidIntegrity { .. }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_state_rejects_malformed_sha512_metadata() {
+        let root = test_root("malformed-sha512");
+        fs::write(
+            lock_file_path(&root),
+            serde_json::to_vec(&serde_json::json!({
+                "composition_id": "core",
+                "tier": "core",
+                "installed_mods": [{
+                    "project_id": "sodium",
+                    "version_id": "version",
+                    "filename": "sodium.jar",
+                    "ownership_class": "composition_managed",
+                    "source": { "provider": "modrinth" },
+                    "integrity": { "sha512": "abc123", "sha512_verified": true }
+                }],
+                "installed_at": "2026-05-30T00:00:00Z"
+            }))
+            .expect("serialize state"),
+        )
+        .expect("write malformed integrity state");
+
+        let error = load_state(&root).expect_err("short SHA-512 should be invalid");
+
+        assert!(matches!(error, StateError::InvalidIntegrity { .. }));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -720,7 +878,8 @@ mod tests {
                     "version_id": "version",
                     "filename": "user.jar",
                     "ownership_class": "user_managed",
-                    "sha512": ""
+                    "source": { "provider": "modrinth" },
+                    "integrity": { "sha512": "", "sha512_verified": false }
                 }],
                 "installed_at": "2026-05-30T00:00:00Z"
             }))
@@ -751,7 +910,13 @@ mod tests {
             version_id: "version".to_string(),
             filename: filename.to_string(),
             ownership_class: OwnershipClass::CompositionManaged,
-            sha512: String::new(),
+            source: ManagedArtifactSource {
+                provider: ManagedArtifactProvider::Modrinth,
+            },
+            integrity: ManagedArtifactIntegrity {
+                sha512: String::new(),
+                sha512_verified: false,
+            },
         }
     }
 

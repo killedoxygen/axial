@@ -10,7 +10,8 @@ use crate::state::{
 };
 use crate::status::{RuleChannel, RuleSource, RulesValidation};
 use crate::types::{
-    CompositionPlan, CompositionState, InstalledMod, OwnershipClass, PerformanceMode,
+    CompositionPlan, CompositionState, InstalledMod, ManagedArtifactIntegrity,
+    ManagedArtifactProvider, ManagedArtifactSource, OwnershipClass, PerformanceMode,
     ResolutionRequest,
 };
 use chrono::Utc;
@@ -424,7 +425,8 @@ impl PerformanceManager {
                     version_id: version.id,
                     filename,
                     ownership_class: OwnershipClass::CompositionManaged,
-                    sha512: expected_sha,
+                    source: modrinth_source(),
+                    integrity: verified_sha512_integrity(expected_sha),
                 });
             }
         }
@@ -442,7 +444,12 @@ impl PerformanceManager {
             version_id: version.id,
             filename,
             ownership_class: OwnershipClass::CompositionManaged,
-            sha512: expected_sha,
+            source: modrinth_source(),
+            integrity: if expected_sha.trim().is_empty() {
+                unverified_sha512_integrity(expected_sha)
+            } else {
+                verified_sha512_integrity(expected_sha)
+            },
         })
     }
 
@@ -546,6 +553,26 @@ fn empty_state(plan: &CompositionPlan) -> CompositionState {
     }
 }
 
+fn modrinth_source() -> ManagedArtifactSource {
+    ManagedArtifactSource {
+        provider: ManagedArtifactProvider::Modrinth,
+    }
+}
+
+fn verified_sha512_integrity(sha512: String) -> ManagedArtifactIntegrity {
+    ManagedArtifactIntegrity {
+        sha512,
+        sha512_verified: true,
+    }
+}
+
+fn unverified_sha512_integrity(sha512: String) -> ManagedArtifactIntegrity {
+    ManagedArtifactIntegrity {
+        sha512,
+        sha512_verified: false,
+    }
+}
+
 fn parent_minor_version(game_version: &str) -> Option<String> {
     let mut parts = game_version.split('.');
     let major = parts.next()?;
@@ -612,8 +639,9 @@ mod tests {
     #[tokio::test]
     async fn ensure_installed_writes_composition_managed_ownership() {
         let root = test_root("ensure-installed-ownership");
-        let manager = PerformanceManager::new_with_modrinth_base_url(spawn_modrinth_server().await)
-            .expect("performance manager");
+        let manager =
+            PerformanceManager::new_with_modrinth_base_url(spawn_modrinth_server(false).await)
+                .expect("performance manager");
         let plan = CompositionPlan {
             composition_id: "core".to_string(),
             family: VersionFamily::F,
@@ -645,6 +673,11 @@ mod tests {
             state.installed_mods[0].ownership_class,
             OwnershipClass::CompositionManaged
         );
+        assert_eq!(
+            state.installed_mods[0].source.provider,
+            ManagedArtifactProvider::Modrinth
+        );
+        assert!(!state.installed_mods[0].integrity.sha512_verified);
         assert!(root.join("sodium.jar").is_file());
         let loaded = load_state(&root)
             .expect("load state")
@@ -653,6 +686,54 @@ mod tests {
             loaded.installed_mods[0].ownership_class,
             OwnershipClass::CompositionManaged
         );
+        assert_eq!(
+            loaded.installed_mods[0].source.provider,
+            ManagedArtifactProvider::Modrinth
+        );
+        assert!(!loaded.installed_mods[0].integrity.sha512_verified);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn ensure_installed_records_verified_modrinth_sha512_when_available() {
+        let root = test_root("ensure-installed-verified-sha512");
+        let manager =
+            PerformanceManager::new_with_modrinth_base_url(spawn_modrinth_server(true).await)
+                .expect("performance manager");
+        let plan = CompositionPlan {
+            composition_id: "core".to_string(),
+            family: VersionFamily::F,
+            loader: "fabric".to_string(),
+            mode: PerformanceMode::Managed,
+            tier: CompositionTier::Core,
+            mods: vec![ManagedMod {
+                project_id: "sodium".to_string(),
+                slug: "sodium".to_string(),
+                name: "Sodium".to_string(),
+                condition: ModCondition::Always,
+                version_range: String::new(),
+                hardware_req: None,
+                mutual_exclusions: Vec::new(),
+            }],
+            jvm_preset: String::new(),
+            fallback_chain: Vec::new(),
+            warnings: Vec::new(),
+            fallback_reason: String::new(),
+        };
+
+        let state = manager
+            .ensure_installed(&plan, "1.20.4", &root)
+            .await
+            .expect("install managed artifact");
+
+        assert_eq!(state.installed_mods.len(), 1);
+        assert_eq!(
+            state.installed_mods[0].source.provider,
+            ManagedArtifactProvider::Modrinth
+        );
+        assert!(state.installed_mods[0].integrity.sha512_verified);
+        assert!(!state.installed_mods[0].integrity.sha512.is_empty());
 
         let _ = fs::remove_dir_all(root);
     }
@@ -728,7 +809,8 @@ mod tests {
                     "version_id": "version",
                     "filename": "user.jar",
                     "ownership_class": "user_managed",
-                    "sha512": ""
+                    "source": { "provider": "modrinth" },
+                    "integrity": { "sha512": "", "sha512_verified": false }
                 }],
                 "installed_at": "2026-05-30T00:00:00Z"
             }))
@@ -943,11 +1025,15 @@ mod tests {
             version_id: "version".to_string(),
             filename: filename.to_string(),
             ownership_class: OwnershipClass::CompositionManaged,
-            sha512: String::new(),
+            source: modrinth_source(),
+            integrity: ManagedArtifactIntegrity {
+                sha512: String::new(),
+                sha512_verified: false,
+            },
         }
     }
 
-    async fn spawn_modrinth_server() -> String {
+    async fn spawn_modrinth_server(include_sha512: bool) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind modrinth test server");
@@ -979,11 +1065,17 @@ mod tests {
                     let request = String::from_utf8_lossy(&request);
                     let first_line = request.lines().next().unwrap_or_default();
                     let file_url = format!("http://{addr}/files/sodium.jar");
+                    let hashes = if include_sha512 {
+                        let sha512 = hex::encode(sha2::Sha512::digest(b"managed-jar"));
+                        format!(r#""sha512":"{sha512}""#)
+                    } else {
+                        String::new()
+                    };
                     let (status, content_type, body) = if first_line
                         .contains("/v2/project/sodium/version")
                     {
                         let body = format!(
-                            r#"[{{"id":"version-a","game_versions":["1.20.4"],"loaders":["fabric"],"featured":true,"date_published":"2026-05-30T00:00:00Z","files":[{{"url":"{file_url}","filename":"sodium.jar","primary":true,"hashes":{{}}}}]}}]"#
+                            r#"[{{"id":"version-a","game_versions":["1.20.4"],"loaders":["fabric"],"featured":true,"date_published":"2026-05-30T00:00:00Z","files":[{{"url":"{file_url}","filename":"sodium.jar","primary":true,"hashes":{{{hashes}}}}}]}}]"#
                         );
                         ("200 OK", "application/json", body.into_bytes())
                     } else if first_line.contains("/files/sodium.jar") {

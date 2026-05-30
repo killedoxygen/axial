@@ -31,6 +31,15 @@ pub fn derive_health(
         return (BundleHealth::Invalid, warnings);
     }
 
+    for installed in &state.installed_mods {
+        if !installed.integrity.sha512_verified {
+            warnings.push(format!(
+                "{} lacks verified SHA-512 integrity evidence",
+                installed.filename
+            ));
+        }
+    }
+
     if state.failure_count > 0 {
         warnings.push(if state.last_failure.trim().is_empty() {
             format!("{} managed mod install failure(s)", state.failure_count)
@@ -40,6 +49,9 @@ pub fn derive_health(
                 state.failure_count, state.last_failure
             )
         });
+    }
+
+    if !warnings.is_empty() {
         return (BundleHealth::Degraded, warnings);
     }
 
@@ -65,8 +77,9 @@ fn tier_rank(tier: CompositionTier) -> i32 {
 mod tests {
     use super::{BundleHealth, derive_health};
     use crate::types::{
-        CompositionPlan, CompositionState, CompositionTier, InstalledMod, OwnershipClass,
-        PerformanceMode, VersionFamily,
+        CompositionPlan, CompositionState, CompositionTier, InstalledMod, ManagedArtifactIntegrity,
+        ManagedArtifactProvider, ManagedArtifactSource, OwnershipClass, PerformanceMode,
+        VersionFamily,
     };
     use std::{fs, path::PathBuf};
 
@@ -89,7 +102,8 @@ mod tests {
             version_id: "version".to_string(),
             filename: "sodium.jar".to_string(),
             ownership_class: OwnershipClass::CompositionManaged,
-            sha512: String::new(),
+            source: modrinth_source(),
+            integrity: unverified_integrity(),
         }]);
 
         let (health, warnings) = derive_health(Some(&state), None, &root);
@@ -109,7 +123,8 @@ mod tests {
             version_id: "version".to_string(),
             filename: "sodium.jar".to_string(),
             ownership_class: OwnershipClass::CompositionManaged,
-            sha512: String::new(),
+            source: modrinth_source(),
+            integrity: verified_integrity(),
         }]);
         state.failure_count = 1;
         state.last_failure = "no compatible versions found for lithium".to_string();
@@ -164,6 +179,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn unverified_managed_artifacts_are_degraded() {
+        let root = test_root("unverified-integrity");
+        fs::write(root.join("sodium.jar"), b"jar").expect("write managed mod");
+        let state = test_state(vec![InstalledMod {
+            project_id: "sodium".to_string(),
+            version_id: "version".to_string(),
+            filename: "sodium.jar".to_string(),
+            ownership_class: OwnershipClass::CompositionManaged,
+            source: modrinth_source(),
+            integrity: unverified_integrity(),
+        }]);
+
+        let (health, warnings) = derive_health(Some(&state), None, &root);
+
+        assert_eq!(health, BundleHealth::Degraded);
+        assert_eq!(
+            warnings,
+            vec!["sodium.jar lacks verified SHA-512 integrity evidence"]
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn test_root(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "croopor-performance-health-{name}-{}-{}",
@@ -175,5 +214,29 @@ mod tests {
         ));
         fs::create_dir_all(&path).expect("create test root");
         path
+    }
+
+    fn modrinth_source() -> ManagedArtifactSource {
+        ManagedArtifactSource {
+            provider: ManagedArtifactProvider::Modrinth,
+        }
+    }
+
+    fn verified_integrity() -> ManagedArtifactIntegrity {
+        ManagedArtifactIntegrity {
+            sha512: valid_sha512(),
+            sha512_verified: true,
+        }
+    }
+
+    fn unverified_integrity() -> ManagedArtifactIntegrity {
+        ManagedArtifactIntegrity {
+            sha512: String::new(),
+            sha512_verified: false,
+        }
+    }
+
+    fn valid_sha512() -> String {
+        "a".repeat(128)
     }
 }

@@ -521,6 +521,8 @@ export interface PerformanceRulesCacheStatus {
 
 export type PerformanceOwnershipClass = 'composition_managed' | 'user_managed';
 
+export type PerformanceManagedArtifactProvider = 'modrinth';
+
 export type EmergencyDisableTarget = 'composition' | 'artifact';
 
 export interface PerformanceEmergencyDisable {
@@ -577,7 +579,9 @@ export interface PerformanceManagedArtifactSummary {
   version_id: string;
   filename: string;
   ownership_class: PerformanceOwnershipClass;
+  source_provider: PerformanceManagedArtifactProvider;
   sha512_present: boolean;
+  sha512_verified: boolean;
 }
 
 export interface PerformanceInstallResponse {

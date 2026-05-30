@@ -23,6 +23,7 @@ pub use status::{
     rules_status_for,
 };
 pub use types::{
-    CompositionPlan, CompositionState, CompositionTier, HardwareProfile, InstalledMod, Manifest,
+    CompositionPlan, CompositionState, CompositionTier, HardwareProfile, InstalledMod,
+    ManagedArtifactIntegrity, ManagedArtifactProvider, ManagedArtifactSource, Manifest,
     OwnershipClass, PerformanceMode, ResolutionRequest,
 };

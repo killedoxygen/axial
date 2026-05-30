@@ -10,10 +10,10 @@ use axum::{
 };
 use croopor_performance::InstallError;
 use croopor_performance::{
-    BundleHealth, CompositionPlan, CompositionTier, OwnershipClass, PerformanceMode,
-    PerformanceRulesStatus, ResolutionRequest, RollbackSnapshotSummary, RulesRefreshError,
-    StateError, derive_health, extract_base_version, infer_loader_from_version_id, load_state,
-    parse_mode,
+    BundleHealth, CompositionPlan, CompositionTier, ManagedArtifactProvider, OwnershipClass,
+    PerformanceMode, PerformanceRulesStatus, ResolutionRequest, RollbackSnapshotSummary,
+    RulesRefreshError, StateError, derive_health, extract_base_version,
+    infer_loader_from_version_id, load_state, parse_mode,
 };
 use serde::{Deserialize, Serialize};
 
@@ -86,7 +86,9 @@ struct PerformanceManagedArtifactSummary {
     version_id: String,
     filename: String,
     ownership_class: OwnershipClass,
+    source_provider: ManagedArtifactProvider,
     sha512_present: bool,
+    sha512_verified: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -224,6 +226,17 @@ async fn handle_health(
                 installed_count: 0,
                 managed_artifacts: Vec::new(),
                 warnings: vec!["invalid performance artifact ownership metadata".to_string()],
+            }));
+        }
+        Err(StateError::InvalidIntegrity { .. }) => {
+            return Ok(Json(PerformanceHealthResponse {
+                active: true,
+                health: BundleHealth::Invalid,
+                composition_id: String::new(),
+                tier: String::new(),
+                installed_count: 0,
+                managed_artifacts: Vec::new(),
+                warnings: vec!["invalid performance artifact integrity metadata".to_string()],
             }));
         }
         Err(error) => return Err(internal_error(error)),
@@ -698,7 +711,9 @@ fn managed_artifact_summary(
                     version_id: installed.version_id.clone(),
                     filename: installed.filename.clone(),
                     ownership_class: installed.ownership_class,
-                    sha512_present: !installed.sha512.trim().is_empty(),
+                    source_provider: installed.source.provider,
+                    sha512_present: !installed.integrity.sha512.trim().is_empty(),
+                    sha512_verified: installed.integrity.sha512_verified,
                 })
                 .collect()
         })
@@ -847,6 +862,12 @@ fn performance_install_error(error: InstallError) -> (StatusCode, Json<serde_jso
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "error": "invalid performance artifact ownership metadata"
+            })),
+        ),
+        InstallError::State(StateError::InvalidIntegrity { .. }) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid performance artifact integrity metadata"
             })),
         ),
         error => internal_error(error),
@@ -1135,7 +1156,11 @@ mod tests {
                     version_id: "version-a".to_string(),
                     filename: "managed.jar".to_string(),
                     ownership_class: croopor_performance::OwnershipClass::CompositionManaged,
-                    sha512: "abc123".to_string(),
+                    source: test_modrinth_source(),
+                    integrity: croopor_performance::ManagedArtifactIntegrity {
+                        sha512: valid_sha512(),
+                        sha512_verified: true,
+                    },
                 }],
             ),
         )
@@ -1159,14 +1184,16 @@ mod tests {
                 version_id: "version-a".to_string(),
                 filename: "managed.jar".to_string(),
                 ownership_class: croopor_performance::OwnershipClass::CompositionManaged,
+                source_provider: croopor_performance::ManagedArtifactProvider::Modrinth,
                 sha512_present: true,
+                sha512_verified: true,
             }]
         );
         let value = serde_json::to_value(&response).expect("serialize response");
         assert!(value.get("managed_artifacts").is_some());
         assert!(value.to_string().contains("managed.jar"));
         assert!(!value.to_string().contains(&mods_dir.display().to_string()));
-        assert!(!value.to_string().contains("abc123"));
+        assert!(!value.to_string().contains(&valid_sha512()));
     }
 
     #[tokio::test]
@@ -1189,7 +1216,8 @@ mod tests {
                     "version_id": "version",
                     "filename": "user.jar",
                     "ownership_class": "user_managed",
-                    "sha512": ""
+                    "source": { "provider": "modrinth" },
+                    "integrity": { "sha512": "", "sha512_verified": false }
                 }],
                 "installed_at": "2026-05-30T00:00:00Z"
             }))
@@ -1288,7 +1316,11 @@ mod tests {
                     version_id: "version".to_string(),
                     filename: "managed.jar".to_string(),
                     ownership_class: croopor_performance::OwnershipClass::CompositionManaged,
-                    sha512: String::new(),
+                    source: test_modrinth_source(),
+                    integrity: croopor_performance::ManagedArtifactIntegrity {
+                        sha512: String::new(),
+                        sha512_verified: false,
+                    },
                 }],
                 installed_at: "2026-05-30T00:00:00Z".to_string(),
                 failure_count: 0,
@@ -1344,7 +1376,8 @@ mod tests {
                     "version_id": "version",
                     "filename": "user.jar",
                     "ownership_class": "user_managed",
-                    "sha512": ""
+                    "source": { "provider": "modrinth" },
+                    "integrity": { "sha512": "", "sha512_verified": false }
                 }],
                 "installed_at": "2026-05-30T00:00:00Z"
             }))
@@ -1377,6 +1410,65 @@ mod tests {
         assert_eq!(
             fs::read(mods_dir.join("user.jar")).expect("read user"),
             b"user"
+        );
+        assert!(mods_dir.join(".croopor-lock.json").is_file());
+    }
+
+    #[tokio::test]
+    async fn install_remove_rejects_invalid_integrity_without_deleting_files() {
+        let fixture = TestFixture::new("install-invalid-integrity-remove");
+        let instance_id = fixture.add_instance("Custom", "1.20.4-fabric");
+        let mods_dir = fixture
+            .state
+            .instances()
+            .game_dir(&instance_id)
+            .join("mods");
+        fs::create_dir_all(&mods_dir).expect("create mods dir");
+        fs::write(mods_dir.join("managed.jar"), b"managed").expect("write managed file");
+        fs::write(
+            mods_dir.join(".croopor-lock.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "composition_id": "core",
+                "tier": "core",
+                "installed_mods": [{
+                    "project_id": "sodium",
+                    "version_id": "version",
+                    "filename": "managed.jar",
+                    "ownership_class": "composition_managed",
+                    "source": { "provider": "modrinth" },
+                    "integrity": { "sha512": "abc123", "sha512_verified": true }
+                }],
+                "installed_at": "2026-05-30T00:00:00Z"
+            }))
+            .expect("serialize state"),
+        )
+        .expect("write invalid state");
+
+        let error = handle_install(
+            State(fixture.state.clone()),
+            Json(InstallRequest {
+                instance_id: Some(instance_id),
+                game_version: None,
+                loader: None,
+                mode: Some("custom".to_string()),
+                action: None,
+                rollback_id: None,
+                queued: None,
+            }),
+        )
+        .await
+        .expect_err("invalid integrity should fail");
+
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.1.0,
+            serde_json::json!({
+                "error": "invalid performance artifact integrity metadata"
+            })
+        );
+        assert_eq!(
+            fs::read(mods_dir.join("managed.jar")).expect("read managed"),
+            b"managed"
         );
         assert!(mods_dir.join(".croopor-lock.json").is_file());
     }
@@ -1530,7 +1622,9 @@ mod tests {
                 version_id: "version".to_string(),
                 filename: "managed-a.jar".to_string(),
                 ownership_class: croopor_performance::OwnershipClass::CompositionManaged,
+                source_provider: croopor_performance::ManagedArtifactProvider::Modrinth,
                 sha512_present: false,
+                sha512_verified: false,
             }]
         );
         assert_eq!(
@@ -2003,7 +2097,21 @@ mod tests {
             version_id: "version".to_string(),
             filename: filename.to_string(),
             ownership_class: croopor_performance::OwnershipClass::CompositionManaged,
-            sha512: String::new(),
+            source: test_modrinth_source(),
+            integrity: croopor_performance::ManagedArtifactIntegrity {
+                sha512: String::new(),
+                sha512_verified: false,
+            },
         }
+    }
+
+    fn test_modrinth_source() -> croopor_performance::ManagedArtifactSource {
+        croopor_performance::ManagedArtifactSource {
+            provider: croopor_performance::ManagedArtifactProvider::Modrinth,
+        }
+    }
+
+    fn valid_sha512() -> String {
+        "a".repeat(128)
     }
 }
