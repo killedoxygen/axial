@@ -274,6 +274,7 @@ pub(super) async fn launch_session(
             process_started_at_ms: None,
             boot_completed_at_ms: None,
             boot_duration_ms: None,
+            priority: None,
             exit_code: None,
             command: prepared.plan.command.clone(),
             java_path: Some(prepared.runtime.effective_path.clone()),

@@ -60,6 +60,18 @@ impl LaunchEvent {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchPriorityEvidence {
+    pub start_mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub promotion: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub promotion_error: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct LaunchSessionRecord {
     pub session_id: SessionId,
@@ -72,6 +84,7 @@ pub struct LaunchSessionRecord {
     pub process_started_at_ms: Option<u64>,
     pub boot_completed_at_ms: Option<u64>,
     pub boot_duration_ms: Option<u64>,
+    pub priority: Option<LaunchPriorityEvidence>,
     pub exit_code: Option<i32>,
     pub command: Vec<String>,
     pub java_path: Option<String>,

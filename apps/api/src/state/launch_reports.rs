@@ -1,6 +1,8 @@
 use crate::logging::timestamp_utc;
 use croopor_config::AppPaths;
-use croopor_launcher::{LaunchIntent, LaunchSessionRecord, LaunchStageRecord, launch_state_name};
+use croopor_launcher::{
+    LaunchIntent, LaunchPriorityEvidence, LaunchSessionRecord, LaunchStageRecord, launch_state_name,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
@@ -37,6 +39,8 @@ pub struct LaunchProofRecord {
     pub exit_code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub boot_duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<LaunchProofPriority>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_class: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -151,6 +155,29 @@ pub struct LaunchProofResourceBudget {
     pub launch_disk_available_mb: Option<u64>,
     pub launch_disk_headroom_mb: u64,
     pub disk_pressure: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchProofPriority {
+    pub start_mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub promotion: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub promotion_error: Option<String>,
+}
+
+impl From<&LaunchPriorityEvidence> for LaunchProofPriority {
+    fn from(value: &LaunchPriorityEvidence) -> Self {
+        Self {
+            start_mode: value.start_mode.clone(),
+            start_error: value.start_error.clone(),
+            promotion: value.promotion.clone(),
+            promotion_error: value.promotion_error.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -313,6 +340,7 @@ fn build_record(
         pid: record.pid,
         exit_code: record.exit_code,
         boot_duration_ms: record.boot_duration_ms,
+        priority: record.priority.as_ref().map(LaunchProofPriority::from),
         failure_class: record
             .failure
             .as_ref()
@@ -775,6 +803,48 @@ mod tests {
     }
 
     #[test]
+    fn launch_report_persists_priority_evidence_without_empty_error_fields() {
+        let root = test_root("priority-evidence");
+        let paths = test_paths(&root);
+        let mut record = test_record("priority-evidence");
+        record.priority = Some(LaunchPriorityEvidence {
+            start_mode: "below_normal_until_boot".to_string(),
+            start_error: None,
+            promotion: Some("promoted".to_string()),
+            promotion_error: None,
+        });
+
+        let proof =
+            persist_record(&paths, &record, None, "running").expect("persist priority evidence");
+
+        assert_eq!(
+            proof.priority,
+            Some(LaunchProofPriority {
+                start_mode: "below_normal_until_boot".to_string(),
+                start_error: None,
+                promotion: Some("promoted".to_string()),
+                promotion_error: None,
+            })
+        );
+        let persisted_json =
+            fs::read_to_string(report_path(&paths, "priority-evidence")).expect("read report");
+        assert!(persisted_json.contains("\"priority\""));
+        assert!(persisted_json.contains("\"start_mode\": \"below_normal_until_boot\""));
+        assert!(persisted_json.contains("\"promotion\": \"promoted\""));
+        assert!(!persisted_json.contains("start_error"));
+        assert!(!persisted_json.contains("promotion_error"));
+        assert!(!persisted_json.contains("process_started_at_ms"));
+        assert!(!persisted_json.contains("boot_completed_at_ms"));
+
+        let loaded = load(&paths, "priority-evidence")
+            .expect("load report")
+            .expect("report exists");
+        assert_eq!(loaded.priority, proof.priority);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn launch_report_without_optional_benchmark_metadata_loads() {
         let root = test_root("no-benchmark");
         let paths = test_paths(&root);
@@ -816,6 +886,50 @@ mod tests {
         assert_eq!(loaded.scenario.benchmark_run_type, None);
         assert_eq!(loaded.scenario.benchmark_mode, None);
         assert_eq!(loaded.scenario.benchmark_id, None);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn launch_report_priority_with_unknown_fields_is_invalid() {
+        let root = test_root("priority-unknown-field");
+        let paths = test_paths(&root);
+        fs::create_dir_all(report_dir(&paths)).expect("create report dir");
+        fs::write(
+            report_path(&paths, "priority-unknown-field"),
+            serde_json::to_string_pretty(&json!({
+                "schema": LAUNCH_PROOF_SCHEMA,
+                "schema_version": LAUNCH_PROOF_SCHEMA_VERSION,
+                "session_id": "priority-unknown-field",
+                "instance_id": "instance",
+                "version_id": "1.21.1",
+                "launched_at": "2026-01-01T00:00:00.000Z",
+                "recorded_at": "2026-01-01T00:01:00.000Z",
+                "outcome": "running",
+                "scenario": {
+                    "scenario_id": "managed_launch",
+                    "performance_mode": "managed",
+                    "requested_memory_mb": 4096,
+                    "version_id": "1.21.1"
+                },
+                "device": {
+                    "tier": "mid",
+                    "total_memory_mb": 16384,
+                    "cpu_threads": 6
+                },
+                "priority": {
+                    "start_mode": "noop",
+                    "unexpected": true
+                },
+                "stages": []
+            }))
+            .expect("serialize report"),
+        )
+        .expect("write report");
+
+        let error = load(&paths, "priority-unknown-field")
+            .expect_err("unknown priority field should be invalid");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1180,6 +1294,7 @@ mod tests {
             pid: None,
             exit_code: Some(0),
             boot_duration_ms: None,
+            priority: None,
             failure_class: None,
             failure_detail: None,
             guardian: None,
@@ -1210,6 +1325,7 @@ mod tests {
             process_started_at_ms: None,
             boot_completed_at_ms: None,
             boot_duration_ms: None,
+            priority: None,
             exit_code: None,
             command: vec!["java".to_string(), "-Xmx2048M".to_string()],
             java_path: Some("/usr/bin/java".to_string()),

@@ -2473,6 +2473,7 @@ mod tests {
             process_started_at_ms: None,
             boot_completed_at_ms: None,
             boot_duration_ms: None,
+            priority: None,
             exit_code: None,
             command: Vec::new(),
             java_path: None,

@@ -3,8 +3,9 @@ mod priority;
 mod supervisor;
 
 use croopor_launcher::{
-    LaunchEvent, LaunchFailure, LaunchFailureClass, LaunchLogEvent, LaunchSessionRecord,
-    LaunchStageRecord, LaunchState, LaunchStatusEvent, launch_stage_label, launch_state_name,
+    LaunchEvent, LaunchFailure, LaunchFailureClass, LaunchLogEvent, LaunchPriorityEvidence,
+    LaunchSessionRecord, LaunchStageRecord, LaunchState, LaunchStatusEvent, launch_stage_label,
+    launch_state_name,
 };
 use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
@@ -104,13 +105,20 @@ impl SessionStore {
             entry.log_count.fetch_add(1, Ordering::Relaxed);
             if classify::boot_marker_detected(&text) && record_boot_completion(entry, now_ms()) {
                 let pid = entry.record.pid;
-                if let Err(error) = priority::promote_after_boot(pid) {
-                    tracing::warn!(
-                        session_id,
-                        pid,
-                        error = %error,
-                        "failed to promote launched game process after boot marker"
-                    );
+                match priority::promote_after_boot(pid) {
+                    Ok(promotion) => {
+                        record_priority_promotion(entry, promotion.proof_value(), None);
+                    }
+                    Err(error) => {
+                        let promotion_error = priority::sanitize_priority_error(&error);
+                        record_priority_promotion(entry, "failed", promotion_error);
+                        tracing::warn!(
+                            session_id,
+                            pid,
+                            error = %error,
+                            "failed to promote launched game process after boot marker"
+                        );
+                    }
                 }
             }
             if entry.boot_completed.load(Ordering::Relaxed)
@@ -160,13 +168,31 @@ impl SessionStore {
         mut command: Command,
     ) -> std::io::Result<LaunchSessionRecord> {
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
-        if let Err(error) = priority::configure_start_priority(&mut command) {
-            tracing::warn!(
-                session_id = %record.session_id.0,
-                error = %error,
-                "failed to configure launch process priority; continuing with default priority"
-            );
-        }
+        let priority = match priority::configure_start_priority(&mut command) {
+            Ok(mode) => LaunchPriorityEvidence {
+                start_mode: mode.proof_value().to_string(),
+                start_error: None,
+                promotion: None,
+                promotion_error: None,
+            },
+            Err(error) => {
+                let start_error = priority::sanitize_priority_error(&error);
+                tracing::warn!(
+                    session_id = %record.session_id.0,
+                    error = %error,
+                    "failed to configure launch process priority; continuing with default priority"
+                );
+                LaunchPriorityEvidence {
+                    start_mode: "default_after_setup_error".to_string(),
+                    start_error,
+                    promotion: None,
+                    promotion_error: None,
+                }
+            }
+        };
+        record.priority = Some(priority.clone());
+        self.record_priority_start(&record.session_id.0, priority)
+            .await;
         let child = command.spawn()?;
         let process_started_at_ms = now_ms();
         record.pid = child.id();
@@ -247,6 +273,13 @@ impl SessionStore {
         supervisor::spawn_wait_task(self.clone(), session_id, child_handle);
 
         Ok(record)
+    }
+
+    async fn record_priority_start(&self, session_id: &str, priority: LaunchPriorityEvidence) {
+        let mut sessions = self.sessions.write().await;
+        if let Some(entry) = sessions.get_mut(session_id) {
+            entry.record.priority = Some(priority);
+        }
     }
 
     pub async fn kill(&self, session_id: &str) -> std::io::Result<()> {
@@ -426,6 +459,39 @@ fn record_boot_completion(entry: &mut SessionEntry, now: u64) -> bool {
         .process_started_at_ms
         .map(|started_at| now.saturating_sub(started_at));
     true
+}
+
+fn record_priority_promotion(
+    entry: &mut SessionEntry,
+    promotion: &str,
+    promotion_error: Option<String>,
+) {
+    let priority = entry
+        .record
+        .priority
+        .get_or_insert_with(default_priority_evidence);
+    priority.promotion = Some(promotion.to_string());
+    priority.promotion_error = promotion_error;
+}
+
+fn default_priority_evidence() -> LaunchPriorityEvidence {
+    LaunchPriorityEvidence {
+        start_mode: platform_default_start_mode().to_string(),
+        start_error: None,
+        promotion: None,
+        promotion_error: None,
+    }
+}
+
+fn platform_default_start_mode() -> &'static str {
+    #[cfg(windows)]
+    {
+        "below_normal_until_boot"
+    }
+    #[cfg(not(windows))]
+    {
+        "noop"
+    }
 }
 
 fn ensure_stage_started(record: &mut LaunchSessionRecord, now: u64) {
@@ -938,12 +1004,20 @@ mod tests {
         assert!(process_started_at_ms <= after);
         assert_eq!(launched.boot_completed_at_ms, None);
         assert_eq!(launched.boot_duration_ms, None);
+        let priority = launched.priority.as_ref().expect("priority evidence");
+        assert_eq!(priority.start_error, None);
+        assert_eq!(priority.promotion, None);
+        #[cfg(windows)]
+        assert_eq!(priority.start_mode, "below_normal_until_boot");
+        #[cfg(not(windows))]
+        assert_eq!(priority.start_mode, "noop");
 
         let stored = store
             .get("process-start-time")
             .await
             .expect("stored record");
         assert_eq!(stored.process_started_at_ms, Some(process_started_at_ms));
+        assert_eq!(stored.priority, launched.priority);
     }
 
     #[tokio::test]
@@ -979,6 +1053,22 @@ mod tests {
         assert_eq!(stored.state, LaunchState::Running);
         assert!(stored.boot_completed_at_ms.is_some());
         assert!(stored.boot_duration_ms.expect("boot duration") >= 4_200);
+        let priority = stored.priority.expect("priority evidence");
+        assert_eq!(priority.start_error, None);
+        assert_eq!(priority.promotion_error, None);
+        #[cfg(windows)]
+        {
+            assert_eq!(priority.start_mode, "below_normal_until_boot");
+            assert!(matches!(
+                priority.promotion.as_deref(),
+                Some("promoted" | "missing_pid" | "failed")
+            ));
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(priority.start_mode, "noop");
+            assert_eq!(priority.promotion.as_deref(), Some("noop"));
+        }
     }
 
     #[tokio::test]
@@ -1109,6 +1199,7 @@ mod tests {
             process_started_at_ms: None,
             boot_completed_at_ms: None,
             boot_duration_ms: None,
+            priority: None,
             exit_code: None,
             command: Vec::new(),
             java_path: None,

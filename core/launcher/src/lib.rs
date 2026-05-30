@@ -27,7 +27,8 @@ pub use jvm::{
     recommended_preset, sanitize_preset,
 };
 pub use process::{
-    LaunchEvent, LaunchLogEvent, LaunchSessionRecord, LaunchStageRecord, LaunchStatusEvent,
+    LaunchEvent, LaunchLogEvent, LaunchPriorityEvidence, LaunchSessionRecord, LaunchStageRecord,
+    LaunchStatusEvent,
 };
 pub use runtime::RuntimeSelection;
 pub use service::{

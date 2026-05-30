@@ -1,6 +1,8 @@
 use std::io;
 use tokio::process::Command;
 
+const MAX_PRIORITY_ERROR_CHARS: usize = 160;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LaunchPriorityMode {
     #[cfg(windows)]
@@ -19,12 +21,48 @@ pub(super) enum PriorityPromotion {
     Noop,
 }
 
+impl LaunchPriorityMode {
+    pub(super) fn proof_value(self) -> &'static str {
+        match self {
+            #[cfg(windows)]
+            Self::BelowNormalUntilBoot => "below_normal_until_boot",
+            #[cfg(not(windows))]
+            Self::Noop => "noop",
+        }
+    }
+}
+
+impl PriorityPromotion {
+    pub(super) fn proof_value(self) -> &'static str {
+        match self {
+            #[cfg(windows)]
+            Self::Promoted => "promoted",
+            #[cfg(windows)]
+            Self::MissingPid => "missing_pid",
+            #[cfg(not(windows))]
+            Self::Noop => "noop",
+        }
+    }
+}
+
 pub(super) fn configure_start_priority(command: &mut Command) -> io::Result<LaunchPriorityMode> {
     platform::configure_start_priority(command)
 }
 
 pub(super) fn promote_after_boot(pid: Option<u32>) -> io::Result<PriorityPromotion> {
     platform::promote_after_boot(pid)
+}
+
+pub(super) fn sanitize_priority_error(error: &io::Error) -> Option<String> {
+    let sanitized = error
+        .to_string()
+        .trim()
+        .chars()
+        .filter(|value| !value.is_control() && !matches!(value, '/' | '\\'))
+        .take(MAX_PRIORITY_ERROR_CHARS)
+        .collect::<String>();
+    let sanitized = sanitized.trim();
+    (!sanitized.is_empty()).then(|| sanitized.to_string())
 }
 
 #[cfg(windows)]
@@ -113,5 +151,23 @@ mod tests {
             promote_after_boot(None).expect("missing pid promotion"),
             PriorityPromotion::Noop
         );
+    }
+
+    #[test]
+    fn priority_error_text_is_bounded_and_path_scrubbed() {
+        let error = io::Error::new(
+            io::ErrorKind::Other,
+            format!(
+                " /tmp\\secret\n{}",
+                "x".repeat(MAX_PRIORITY_ERROR_CHARS + 40)
+            ),
+        );
+
+        let sanitized = sanitize_priority_error(&error).expect("sanitized error");
+
+        assert!(!sanitized.contains('/'));
+        assert!(!sanitized.contains('\\'));
+        assert!(!sanitized.contains('\n'));
+        assert!(sanitized.chars().count() <= MAX_PRIORITY_ERROR_CHARS);
     }
 }
