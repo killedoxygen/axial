@@ -250,7 +250,7 @@ The API also exposes `GET /api/v1/skin/profile` as a local offline skin-profile 
 - Guardian summaries carry additive backend-authored `message` and `details` fields for user-facing non-allowed outcomes.
 - Live and persisted launch stage histories preserve bounded Guardian `details` for non-allowed status payloads, with Healing warnings retained as supporting detail and Healing fallback metadata retained as the fallback source.
 - Launch preparation computes conservative host resource warnings from active session allocations, requested launch memory, active launch count, CPU thread count, best-effort CPU load averages, active install/download sessions, and launch-relevant disk free space. It also warns when the selected minimum memory exceeds the effective maximum and is clamped down for launch, and when the effective maximum memory allocation is below the conservative 2 GB startup threshold. Tight memory headroom, high launch concurrency, saturated measured CPU load, concurrent install pressure, low disk headroom, very low launch allocation, or memory-bound clamping produce non-blocking Guardian `warned` outcomes.
-- Launch preparation also warns in Guardian Custom mode when explicit Java or raw JVM argument overrides are preserved unchanged.
+- Launch preparation also warns in Guardian Custom mode when explicit Java, JVM preset, or raw JVM argument overrides are preserved unchanged.
 - The frontend should prefer backend-authored Guardian outcomes, then use Guardian guidance/interventions and Healing details as supporting diagnostics when needed.
 
 ## Where to look

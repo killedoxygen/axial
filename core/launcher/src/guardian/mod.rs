@@ -58,7 +58,7 @@ impl LaunchGuardianContext {
     }
 
     pub fn has_risky_overrides(&self) -> bool {
-        self.has_java_override() || self.has_raw_jvm_args()
+        self.has_java_override() || self.has_named_preset() || self.has_raw_jvm_args()
     }
 
     pub fn allows_runtime_healing(&self) -> bool {
@@ -529,6 +529,18 @@ mod tests {
         };
 
         assert!(!context.allows_preset_healing());
+    }
+
+    #[test]
+    fn named_preset_counts_as_risky_override_for_warning_policy() {
+        let context = LaunchGuardianContext {
+            mode: GuardianMode::Custom,
+            java_override_origin: None,
+            preset_override_origin: Some(OverrideOrigin::Instance),
+            raw_jvm_args_origin: None,
+        };
+
+        assert!(context.has_risky_overrides());
     }
 
     #[test]

@@ -620,6 +620,11 @@ fn custom_risky_override_warning_guidance(guardian: &LaunchGuardianContext) -> O
                 .to_string(),
         );
     }
+    if guardian.has_named_preset() {
+        guidance.push(
+            "Guardian Custom mode will keep the selected JVM preset for this launch.".to_string(),
+        );
+    }
     if guardian.has_raw_jvm_args() {
         guidance.push(
             "Guardian Custom mode will keep explicit JVM args; remove them first if startup becomes unstable."
@@ -803,12 +808,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn custom_mode_with_instance_jvm_preset_warns_before_queue() {
+        let fixture = TestFixture::new("prepare-custom-preset-warning");
+        fixture.set_guardian_mode("custom");
+        let instance_id = fixture.add_instance("Survival", "1.21.1");
+        fixture.update_instance(&instance_id, |instance| {
+            instance.jvm_preset = "graalvm".to_string();
+        });
+
+        let prepared = fixture
+            .prepare(instance_id.clone(), None)
+            .await
+            .expect("prepare launch session");
+
+        assert_eq!(prepared.task.guardian.decision, GuardianDecision::Warned);
+        assert_eq!(prepared.task.intent.requested_preset, "graalvm");
+        assert_eq!(
+            prepared.task.intent.guardian.preset_override_origin,
+            Some(OverrideOrigin::Instance)
+        );
+        assert!(prepared.task.guardian.guidance.iter().any(|detail| detail
+            == "Guardian Custom mode will keep the selected JVM preset for this launch."));
+        assert!(prepared.task.guardian.details.iter().any(|detail| detail
+            == "Guardian Custom mode will keep the selected JVM preset for this launch."));
+    }
+
+    #[tokio::test]
+    async fn custom_mode_with_global_jvm_preset_warns_before_queue() {
+        let fixture = TestFixture::new("prepare-custom-global-preset-warning");
+        fixture.set_guardian_mode("custom");
+        fixture.set_global_jvm_preset("performance");
+        let instance_id = fixture.add_instance("Survival", "1.21.1");
+
+        let prepared = fixture
+            .prepare(instance_id.clone(), None)
+            .await
+            .expect("prepare launch session");
+
+        assert_eq!(prepared.task.guardian.decision, GuardianDecision::Warned);
+        assert_eq!(prepared.task.intent.requested_preset, "performance");
+        assert_eq!(
+            prepared.task.intent.guardian.preset_override_origin,
+            Some(OverrideOrigin::Global)
+        );
+        assert!(prepared.task.guardian.guidance.iter().any(|detail| detail
+            == "Guardian Custom mode will keep the selected JVM preset for this launch."));
+    }
+
+    #[tokio::test]
     async fn managed_mode_with_manual_overrides_skips_custom_warning_at_queue_time() {
         let fixture = TestFixture::new("prepare-managed-overrides-no-custom-warning");
         fixture.set_guardian_mode("managed");
         let instance_id = fixture.add_instance("Survival", "1.21.1");
         fixture.update_instance(&instance_id, |instance| {
             instance.java_path = "/manual/java/bin/java".to_string();
+            instance.jvm_preset = "graalvm".to_string();
             instance.extra_jvm_args = "-XX:+UseZGC".to_string();
         });
 
@@ -834,6 +888,7 @@ mod tests {
                 .any(|detail| detail.starts_with("Guardian Custom mode will keep"))
         );
         assert_eq!(prepared.task.intent.requested_java, "/manual/java/bin/java");
+        assert_eq!(prepared.task.intent.requested_preset, "graalvm");
         assert_eq!(prepared.task.intent.extra_jvm_args, vec!["-XX:+UseZGC"]);
     }
 
@@ -1430,6 +1485,15 @@ mod tests {
                 .config()
                 .replace_in_memory(config)
                 .expect("set guardian mode");
+        }
+
+        fn set_global_jvm_preset(&self, preset: &str) {
+            let mut config = self.state.config().current();
+            config.jvm_preset = preset.to_string();
+            self.state
+                .config()
+                .replace_in_memory(config)
+                .expect("set global jvm preset");
         }
 
         async fn prepare(

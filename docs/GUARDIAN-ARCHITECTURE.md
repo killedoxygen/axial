@@ -53,7 +53,7 @@ Intent:
 
 Policy:
 - Guardian does not silently change explicit launch intent
-- Guardian warns when explicit Java or raw JVM argument overrides will be preserved
+- Guardian warns when explicit Java, JVM preset, or raw JVM argument overrides will be preserved
 - Guardian blocks guaranteed-fatal override combinations before spawn
 - Guardian returns guidance instead of auto-healing explicit unsafe choices
 - valid explicit overrides still pass unchanged
