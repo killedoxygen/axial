@@ -267,3 +267,331 @@ pub fn sanitize_effective_runtime_major(
         runtime.effective_info.major = java_version.major_version as u32;
     }
 }
+
+// This no-spawn representative gate relies on a shell-script fake Java that
+// std::process::Command can execute directly on Unix.
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::guardian::{GuardianMode, LaunchGuardianContext};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[tokio::test]
+    async fn prepare_representative_fabric_launch_plans_without_spawning_java() {
+        let root = unique_temp_root("croopor-prepare-fabric-gate");
+        let library_dir = root.join("library");
+        let instance_root = root.join("instances");
+        let fake_java = write_fake_java(&root);
+
+        let targets = [
+            RepresentativeTarget {
+                minecraft_version: "1.16.5",
+                loader_version: "0.16.10",
+                java_major: 8,
+                family: "E",
+            },
+            RepresentativeTarget {
+                minecraft_version: "1.20.1",
+                loader_version: "0.16.10",
+                java_major: 17,
+                family: "E",
+            },
+            RepresentativeTarget {
+                minecraft_version: "1.21.1",
+                loader_version: "0.16.10",
+                java_major: 21,
+                family: "F",
+            },
+        ];
+
+        for target in targets {
+            let version_id = write_fabric_version(&library_dir, target);
+            let game_dir = instance_root.join(target.minecraft_version);
+            fs::create_dir_all(&game_dir).expect("instance dir");
+
+            let intent = LaunchIntent {
+                session_id: format!("prepare-gate-{}", target.minecraft_version),
+                library_dir: library_dir.clone(),
+                instance_id: format!("fabric-{}", target.minecraft_version),
+                version_id: version_id.clone(),
+                username: "Player".to_string(),
+                requested_java: fake_java.to_string_lossy().to_string(),
+                requested_preset: String::new(),
+                extra_jvm_args: Vec::new(),
+                max_memory_mb: 6144,
+                min_memory_mb: 1024,
+                resolution: None,
+                launcher_name: "croopor".to_string(),
+                launcher_version: "test".to_string(),
+                game_dir: Some(game_dir.clone()),
+                guardian: LaunchGuardianContext {
+                    mode: GuardianMode::Managed,
+                    ..LaunchGuardianContext::default()
+                },
+                performance_mode: "managed".to_string(),
+            };
+
+            let prepared = prepare_launch_attempt(&intent, &AttemptOverrides::default())
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "prepare failed for {} Fabric {}: {}",
+                        target.family, target.minecraft_version, error.message
+                    )
+                });
+
+            let plan = prepared.plan;
+            assert_eq!(
+                plan.command.first().map(String::as_str),
+                Some(fake_java.to_string_lossy().as_ref()),
+                "{version_id} should launch through the fake Java override"
+            );
+            assert!(
+                plan.jvm_args.iter().any(|arg| arg == "-Xmx6144M"),
+                "{version_id} should preserve backend-selected max memory"
+            );
+            assert!(
+                plan.jvm_args.iter().any(|arg| arg == "-Xms1024M"),
+                "{version_id} should preserve backend-selected min memory"
+            );
+            assert_eq!(
+                plan.game_dir, game_dir,
+                "{version_id} should use the isolated instance game dir"
+            );
+            assert!(
+                !plan.main_class.trim().is_empty()
+                    && plan.command.iter().any(|arg| arg == &plan.main_class),
+                "{version_id} should include a main class in the final command"
+            );
+            assert_eq!(
+                plan.main_class, "net.fabricmc.loader.impl.launch.knot.KnotClient",
+                "{version_id} should plan the Fabric entrypoint"
+            );
+            assert_eq!(
+                prepared.effective_preset,
+                crate::jvm::PRESET_PERFORMANCE,
+                "{version_id} should resolve the managed modded preset"
+            );
+            assert!(
+                plan.jvm_args.iter().any(|arg| arg == "-XX:+UseG1GC"),
+                "{version_id} should include managed-mode GC preset args"
+            );
+            assert!(
+                plan.jvm_args
+                    .iter()
+                    .any(|arg| arg == "-XX:MaxGCPauseMillis=37"),
+                "{version_id} should include the performance preset pause target"
+            );
+            assert!(
+                !plan.jvm_args.iter().any(|arg| arg == "-XX:+AlwaysPreTouch"),
+                "{version_id} should keep managed-mode low-impact startup behavior"
+            );
+            assert!(
+                plan.classpath.contains("fabric-loader-0.16.10.jar"),
+                "{version_id} should include the fabricated Fabric loader jar"
+            );
+            assert_eq!(
+                plan.version.id, version_id,
+                "{version_id} should prepare the representative Fabric version id"
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[derive(Clone, Copy)]
+    struct RepresentativeTarget {
+        minecraft_version: &'static str,
+        loader_version: &'static str,
+        java_major: i32,
+        family: &'static str,
+    }
+
+    fn unique_temp_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ))
+    }
+
+    fn write_fake_java(root: &Path) -> PathBuf {
+        let bin_dir = root.join("fake-java").join("bin");
+        fs::create_dir_all(&bin_dir).expect("fake java dir");
+        let java_path = bin_dir.join("java");
+        fs::write(
+            &java_path,
+            r#"#!/bin/sh
+echo 'java.vendor = OpenJDK' >&2
+echo 'java.vm.name = OpenJDK 64-Bit Server VM' >&2
+echo 'openjdk version "21.0.3" 2024-04-16' >&2
+"#,
+        )
+        .expect("fake java");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut permissions = fs::metadata(&java_path)
+                .expect("fake java metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&java_path, permissions).expect("fake java permissions");
+        }
+        java_path
+    }
+
+    fn write_fabric_version(library_dir: &Path, target: RepresentativeTarget) -> String {
+        let version_id = format!(
+            "fabric-loader-{}-{}",
+            target.loader_version, target.minecraft_version
+        );
+        let base_version_dir = library_dir.join("versions").join(target.minecraft_version);
+        let fabric_version_dir = library_dir.join("versions").join(&version_id);
+        fs::create_dir_all(&base_version_dir).expect("base version dir");
+        fs::create_dir_all(&fabric_version_dir).expect("fabric version dir");
+
+        fs::write(
+            base_version_dir.join(format!("{}.jar", target.minecraft_version)),
+            b"client jar",
+        )
+        .expect("base client jar");
+        fs::write(
+            fabric_version_dir.join(format!("{version_id}.jar")),
+            b"loader jar",
+        )
+        .expect("fabric version jar");
+
+        write_library_jar(
+            library_dir,
+            &format!(
+                "net/fabricmc/fabric-loader/{}/fabric-loader-{}.jar",
+                target.loader_version, target.loader_version
+            ),
+        );
+        write_library_jar(
+            library_dir,
+            &format!(
+                "net/fabricmc/intermediary/{}/intermediary-{}.jar",
+                target.minecraft_version, target.minecraft_version
+            ),
+        );
+        write_library_jar(
+            library_dir,
+            &format!(
+                "com/example/representative-{}/1.0.0/representative-{}-1.0.0.jar",
+                target.family.to_ascii_lowercase(),
+                target.family.to_ascii_lowercase()
+            ),
+        );
+
+        write_version_json(
+            &base_version_dir.join(format!("{}.json", target.minecraft_version)),
+            serde_json::json!({
+                "id": target.minecraft_version,
+                "type": "release",
+                "mainClass": "net.minecraft.client.main.Main",
+                "javaVersion": {
+                    "component": if target.java_major >= 21 {
+                        "java-runtime-delta"
+                    } else {
+                        "java-runtime-gamma"
+                    },
+                    "majorVersion": target.java_major
+                },
+                "assetIndex": { "id": format!("{}-assets", target.minecraft_version) },
+                "arguments": {
+                    "jvm": [
+                        "-Djava.library.path=${natives_directory}",
+                        "-cp",
+                        "${classpath}"
+                    ],
+                    "game": [
+                        "--username",
+                        "${auth_player_name}",
+                        "--version",
+                        "${version_name}",
+                        "--gameDir",
+                        "${game_directory}",
+                        "--assetsDir",
+                        "${assets_root}",
+                        "--assetIndex",
+                        "${asset_index_name}",
+                        "--accessToken",
+                        "${auth_access_token}",
+                        "--uuid",
+                        "${auth_uuid}",
+                        "--userType",
+                        "${user_type}",
+                        "--versionType",
+                        "${version_type}"
+                    ]
+                },
+                "libraries": [{
+                    "name": format!("com.example:representative-{}:1.0.0", target.family.to_ascii_lowercase()),
+                    "downloads": {
+                        "artifact": {
+                            "path": format!("com/example/representative-{}/1.0.0/representative-{}-1.0.0.jar", target.family.to_ascii_lowercase(), target.family.to_ascii_lowercase()),
+                            "url": "https://example.invalid/representative.jar"
+                        }
+                    }
+                }]
+            }),
+        );
+
+        write_version_json(
+            &fabric_version_dir.join(format!("{version_id}.json")),
+            serde_json::json!({
+                "id": version_id,
+                "inheritsFrom": target.minecraft_version,
+                "type": "release",
+                "mainClass": "net.fabricmc.loader.impl.launch.knot.KnotClient",
+                "assetIndex": {},
+                "arguments": {
+                    "jvm": [],
+                    "game": []
+                },
+                "libraries": [
+                    {
+                        "name": format!("net.fabricmc:fabric-loader:{}", target.loader_version),
+                        "downloads": {
+                            "artifact": {
+                                "path": format!("net/fabricmc/fabric-loader/{}/fabric-loader-{}.jar", target.loader_version, target.loader_version),
+                                "url": "https://example.invalid/fabric-loader.jar"
+                            }
+                        }
+                    },
+                    {
+                        "name": format!("net.fabricmc:intermediary:{}", target.minecraft_version),
+                        "downloads": {
+                            "artifact": {
+                                "path": format!("net/fabricmc/intermediary/{}/intermediary-{}.jar", target.minecraft_version, target.minecraft_version),
+                                "url": "https://example.invalid/intermediary.jar"
+                            }
+                        }
+                    }
+                ]
+            }),
+        );
+
+        version_id
+    }
+
+    fn write_library_jar(library_dir: &Path, relative_path: &str) {
+        let path = library_dir.join("libraries").join(relative_path);
+        fs::create_dir_all(path.parent().expect("library parent")).expect("library dir");
+        fs::write(path, b"library jar").expect("library jar");
+    }
+
+    fn write_version_json(path: &Path, value: serde_json::Value) {
+        fs::write(
+            path,
+            serde_json::to_vec_pretty(&value).expect("serialize version json"),
+        )
+        .expect("version json");
+    }
+}
