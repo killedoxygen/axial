@@ -100,7 +100,7 @@ impl SessionStore {
             entry.startup_observed.store(true, Ordering::Relaxed);
             entry.log_count.fetch_add(1, Ordering::Relaxed);
             if classify::boot_marker_detected(&text) {
-                entry.boot_completed.store(true, Ordering::Relaxed);
+                record_boot_completion(entry, now_ms());
             }
             if entry.boot_completed.load(Ordering::Relaxed)
                 && matches!(
@@ -150,7 +150,11 @@ impl SessionStore {
     ) -> std::io::Result<LaunchSessionRecord> {
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let child = command.spawn()?;
+        let process_started_at_ms = now_ms();
         record.pid = child.id();
+        record.process_started_at_ms = Some(process_started_at_ms);
+        record.boot_completed_at_ms = None;
+        record.boot_duration_ms = None;
         record.state = LaunchState::Starting;
 
         let session_id = record.session_id.0.clone();
@@ -394,6 +398,17 @@ fn apply_status_update(entry: &mut SessionEntry, event: &mut LaunchStatusEvent) 
     event.stages = entry.record.stages.clone();
 }
 
+fn record_boot_completion(entry: &mut SessionEntry, now: u64) {
+    if entry.boot_completed.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    entry.record.boot_completed_at_ms = Some(now);
+    entry.record.boot_duration_ms = entry
+        .record
+        .process_started_at_ms
+        .map(|started_at| now.saturating_sub(started_at));
+}
+
 fn ensure_stage_started(record: &mut LaunchSessionRecord, now: u64) {
     if record.stages.is_empty() {
         let stage = launch_state_name(record.state).to_string();
@@ -541,6 +556,8 @@ mod tests {
     use super::*;
     use croopor_launcher::SessionId;
     use serde_json::json;
+    use std::sync::Arc;
+    use tokio::process::Command;
 
     #[tokio::test]
     async fn launch_stage_history_tracks_transitions_results_and_healing_notes() {
@@ -663,6 +680,104 @@ mod tests {
         assert_eq!(record.benchmark, Some(benchmark));
     }
 
+    #[tokio::test]
+    async fn launch_start_process_records_process_start_time() {
+        let store = Arc::new(SessionStore::new());
+        let record = test_record("process-start-time");
+        let mut command = Command::new(std::env::current_exe().expect("current test binary"));
+        command.arg("--help");
+
+        let before = now_ms();
+        let launched = store
+            .start_process(record, command)
+            .await
+            .expect("spawn test process");
+        let after = now_ms();
+
+        let process_started_at_ms = launched
+            .process_started_at_ms
+            .expect("process start timestamp");
+        assert!(process_started_at_ms >= before);
+        assert!(process_started_at_ms <= after);
+        assert_eq!(launched.boot_completed_at_ms, None);
+        assert_eq!(launched.boot_duration_ms, None);
+
+        let stored = store
+            .get("process-start-time")
+            .await
+            .expect("stored record");
+        assert_eq!(stored.process_started_at_ms, Some(process_started_at_ms));
+    }
+
+    #[tokio::test]
+    async fn launch_boot_marker_records_completion_and_duration() {
+        let store = SessionStore::new();
+        let mut record = test_record("boot-marker-duration");
+        record.state = LaunchState::Starting;
+        record.process_started_at_ms = Some(now_ms().saturating_sub(4_200));
+        store.insert(record).await;
+
+        let mut receiver = store
+            .subscribe("boot-marker-duration")
+            .await
+            .expect("subscribe");
+        store
+            .emit_log(
+                "boot-marker-duration",
+                "stdout",
+                "[Render thread/INFO]: LWJGL Version: 3.3.3",
+            )
+            .await;
+
+        let emitted = receiver.recv().await.expect("status event");
+        let LaunchEvent::Status(status) = emitted else {
+            panic!("expected status event");
+        };
+        assert_eq!(status.state, "running");
+
+        let stored = store
+            .get("boot-marker-duration")
+            .await
+            .expect("stored record");
+        assert_eq!(stored.state, LaunchState::Running);
+        assert!(stored.boot_completed_at_ms.is_some());
+        assert!(stored.boot_duration_ms.expect("boot duration") >= 4_200);
+    }
+
+    #[tokio::test]
+    async fn launch_running_status_without_boot_marker_does_not_record_boot_duration() {
+        let store = SessionStore::new();
+        let mut record = test_record("timeout-running");
+        record.state = LaunchState::Monitoring;
+        record.process_started_at_ms = Some(now_ms().saturating_sub(5_000));
+        store.insert(record).await;
+
+        store
+            .emit_log("timeout-running", "stdout", "ordinary startup output")
+            .await;
+        store
+            .emit_status(
+                "timeout-running",
+                LaunchStatusEvent {
+                    state: "running".to_string(),
+                    benchmark: None,
+                    pid: None,
+                    exit_code: None,
+                    failure_class: None,
+                    failure_detail: None,
+                    healing: None,
+                    guardian: None,
+                    stages: Vec::new(),
+                },
+            )
+            .await;
+
+        let stored = store.get("timeout-running").await.expect("stored record");
+        assert_eq!(stored.state, LaunchState::Running);
+        assert_eq!(stored.boot_completed_at_ms, None);
+        assert_eq!(stored.boot_duration_ms, None);
+    }
+
     #[test]
     fn launch_command_xmx_parser_uses_last_megabyte_allocation() {
         assert_eq!(
@@ -754,6 +869,9 @@ mod tests {
             benchmark: None,
             state: LaunchState::Queued,
             pid: None,
+            process_started_at_ms: None,
+            boot_completed_at_ms: None,
+            boot_duration_ms: None,
             exit_code: None,
             command: Vec::new(),
             java_path: None,

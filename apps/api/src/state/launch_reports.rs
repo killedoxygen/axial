@@ -36,6 +36,8 @@ pub struct LaunchProofRecord {
     pub pid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_duration_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_class: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -314,6 +316,7 @@ fn build_record(
         resource_budget: context.and_then(|value| value.resource_budget.clone()),
         pid: record.pid,
         exit_code: record.exit_code,
+        boot_duration_ms: record.boot_duration_ms,
         failure_class: record
             .failure
             .as_ref()
@@ -675,6 +678,7 @@ mod tests {
             Some("startup_stalled")
         );
         assert_eq!(first_proof.pid, Some(11));
+        assert_eq!(first_proof.boot_duration_ms, None);
         assert_eq!(first_proof.launched_at, "2026-01-02T03:04:05.000Z");
         assert_eq!(first_proof.guardian, Some(json!({ "mode": "managed" })));
         assert_eq!(first_proof.scenario.scenario_id, "unknown_launch");
@@ -698,6 +702,7 @@ mod tests {
         let persisted_json =
             fs::read_to_string(report_path(&paths, "first")).expect("read persisted report");
         assert!(!persisted_json.contains("command"));
+        assert!(!persisted_json.contains("boot_duration_ms"));
         assert!(!persisted_json.contains("-Xmx2048M"));
         assert!(!persisted_json.contains("java_path"));
 
@@ -748,7 +753,35 @@ mod tests {
         assert_eq!(loaded.scenario, LaunchProofScenario::default());
         assert_eq!(loaded.device, LaunchProofDevice::default());
         assert_eq!(loaded.resource_budget, None);
+        assert_eq!(loaded.boot_duration_ms, None);
         assert_eq!(loaded.comparison, None);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn launch_report_persists_boot_duration_when_session_record_has_marker_timing() {
+        let root = test_root("boot-duration");
+        let paths = test_paths(&root);
+        let mut record = test_record("boot-duration");
+        record.process_started_at_ms = Some(1_000);
+        record.boot_completed_at_ms = Some(5_250);
+        record.boot_duration_ms = Some(4_250);
+
+        let proof = persist_record(&paths, &record, None, "running")
+            .expect("persist report with boot duration");
+
+        assert_eq!(proof.boot_duration_ms, Some(4_250));
+        let persisted_json =
+            fs::read_to_string(report_path(&paths, "boot-duration")).expect("read report");
+        assert!(persisted_json.contains("\"boot_duration_ms\": 4250"));
+        assert!(!persisted_json.contains("process_started_at_ms"));
+        assert!(!persisted_json.contains("boot_completed_at_ms"));
+
+        let loaded = load(&paths, "boot-duration")
+            .expect("load report")
+            .expect("report exists");
+        assert_eq!(loaded.boot_duration_ms, Some(4_250));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1157,6 +1190,7 @@ mod tests {
             resource_budget: None,
             pid: None,
             exit_code: Some(0),
+            boot_duration_ms: None,
             failure_class: None,
             failure_detail: None,
             guardian: None,
@@ -1184,6 +1218,9 @@ mod tests {
             benchmark: None,
             state: LaunchState::Queued,
             pid: None,
+            process_started_at_ms: None,
+            boot_completed_at_ms: None,
+            boot_duration_ms: None,
             exit_code: None,
             command: vec!["java".to_string(), "-Xmx2048M".to_string()],
             java_path: Some("/usr/bin/java".to_string()),

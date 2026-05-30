@@ -619,6 +619,9 @@ function LaunchProofHistoryBlock({ state }: { state: LaunchReportsState }): JSX.
             const memory = scenario.requested_memory_mb
               ? fmtMem(scenario.requested_memory_mb / 1024)
               : null;
+            const bootDuration = Number.isFinite(record.boot_duration_ms)
+              ? `Boot ${formatDurationMs(record.boot_duration_ms as number)}`
+              : null;
             const benchmarkParts = [
               scenario.benchmark_mode ? `Mode ${labelFromToken(scenario.benchmark_mode, scenario.benchmark_mode)}` : null,
               scenario.benchmark_profile?.trim(),
@@ -639,6 +642,7 @@ function LaunchProofHistoryBlock({ state }: { state: LaunchReportsState }): JSX.
                   <div class="cp-settings-proof-meta">
                     <span>Launched {formatProofDate(record.launched_at)}</span>
                     <span>Recorded {formatProofDate(record.recorded_at)}</span>
+                    {bootDuration && <span>{bootDuration}</span>}
                     {memory && <span>{memory} requested</span>}
                     {benchmarkParts.length > 0 && <span>{benchmarkParts.join(' · ')}</span>}
                   </div>

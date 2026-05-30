@@ -380,6 +380,7 @@ export interface LaunchProofRecord {
   device: LaunchProofDevice;
   pid?: number;
   exit_code?: number;
+  boot_duration_ms?: number;
   failure_class?: string;
   failure_detail?: string;
   comparison?: LaunchProofComparison | null;
