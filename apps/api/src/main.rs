@@ -1,6 +1,6 @@
 use croopor_api::app::{DEFAULT_API_PORT, build_router, default_frontend_dir};
 use croopor_api::state::{AppState, AppStateInit, InstallStore, SessionStore};
-use croopor_config::{ConfigStore, InstanceStore};
+use croopor_config::{AppPaths, ConfigStore, InstanceStore};
 use croopor_performance::PerformanceManager;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -11,11 +11,12 @@ use tracing::info;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
-    let config = Arc::new(ConfigStore::load_default()?);
-    let instances = Arc::new(InstanceStore::load_default()?);
+    let paths = AppPaths::detect();
+    let config = Arc::new(ConfigStore::load_from(paths.clone())?);
+    let instances = Arc::new(InstanceStore::load_from(paths.clone())?);
     let installs = Arc::new(InstallStore::new());
     let sessions = Arc::new(SessionStore::new());
-    let performance = Arc::new(PerformanceManager::new()?);
+    let performance = Arc::new(PerformanceManager::new_with_config_dir(&paths.config_dir)?);
     let state = AppState::new(AppStateInit {
         app_name: "Croopor".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),

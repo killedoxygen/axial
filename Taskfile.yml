@@ -64,24 +64,28 @@ tasks:
   frontend:install:
     desc: install frontend deps
     aliases: [setup:frontend]
+    dir: "{{.FRONTEND_DIR}}"
     cmds:
-      - pnpm --dir {{.FRONTEND_DIR}} install --frozen-lockfile --ignore-scripts
+      - pnpm install --frozen-lockfile --ignore-scripts
 
   frontend:check:
     desc: run frontend typecheck
+    dir: "{{.FRONTEND_DIR}}"
     cmds:
-      - pnpm --dir {{.FRONTEND_DIR}} run check
+      - pnpm run check
 
   frontend:build:
     desc: build frontend bundle
+    dir: "{{.FRONTEND_DIR}}"
     cmds:
-      - pnpm --dir {{.FRONTEND_DIR}} run build
+      - pnpm run build
 
   frontend:watch:
     desc: rebuild frontend assets on file changes
     aliases: [watch]
+    dir: "{{.FRONTEND_DIR}}"
     cmds:
-      - pnpm --dir {{.FRONTEND_DIR}} run watch
+      - pnpm run watch
 
   frontend:serve:
     desc: run frontend-only dev server

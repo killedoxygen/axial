@@ -4,7 +4,7 @@ mod state;
 
 use croopor_api::app::spawn_background;
 use croopor_api::state::{AppState, AppStateInit, InstallStore, SessionStore};
-use croopor_config::{ConfigStore, InstanceStore};
+use croopor_config::{AppPaths, ConfigStore, InstanceStore};
 use croopor_performance::PerformanceManager;
 use std::sync::Arc;
 use tauri::{Emitter, Manager};
@@ -14,11 +14,15 @@ use tracing::info;
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let config = Arc::new(ConfigStore::load_default().expect("load config store"));
-    let instances = Arc::new(InstanceStore::load_default().expect("load instance store"));
+    let paths = AppPaths::detect();
+    let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config store"));
+    let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instance store"));
     let installs = Arc::new(InstallStore::new());
     let sessions = Arc::new(SessionStore::new());
-    let performance = Arc::new(PerformanceManager::new().expect("load performance manager"));
+    let performance = Arc::new(
+        PerformanceManager::new_with_config_dir(&paths.config_dir)
+            .expect("load performance manager"),
+    );
     let state = AppState::new(AppStateInit {
         app_name: "Croopor".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),

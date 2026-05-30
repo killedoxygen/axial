@@ -223,6 +223,7 @@ pub async fn start_launch_events(
 fn snapshot_status(record: &LaunchSessionRecord) -> LaunchStatusEvent {
     LaunchStatusEvent {
         state: launch_state_name(record.state).to_string(),
+        benchmark: record.benchmark.clone(),
         pid: record.pid,
         exit_code: record.exit_code,
         failure_class: record
@@ -235,6 +236,7 @@ fn snapshot_status(record: &LaunchSessionRecord) -> LaunchStatusEvent {
             .and_then(|failure| failure.detail.clone()),
         healing: record.healing.clone(),
         guardian: record.guardian.clone(),
+        stages: record.stages.clone(),
     }
 }
 
@@ -251,6 +253,7 @@ fn launch_state_name(state: LaunchState) -> &'static str {
         LaunchState::EnsuringRuntime => "ensuring_runtime",
         LaunchState::DownloadingRuntime => "downloading_runtime",
         LaunchState::Preparing => "preparing",
+        LaunchState::Prewarming => "prewarming",
         LaunchState::Starting => "starting",
         LaunchState::Monitoring => "monitoring",
         LaunchState::Running => "running",

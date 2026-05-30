@@ -4,8 +4,8 @@
   "version": "0.3.1",
   "identifier": "dev.mateoltd.croopor",
   "build": {
-    "beforeBuildCommand": "pnpm --dir ../../frontend run build",
-    "beforeDevCommand": "pnpm --dir ../../frontend run dev:desktop",
+    "beforeBuildCommand": "cd ../../frontend && pnpm run build",
+    "beforeDevCommand": "cd ../../frontend && pnpm run dev:desktop",
     "frontendDist": "../../frontend/static",
     "devUrl": "http://127.0.0.1:3000"
   },

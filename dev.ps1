@@ -77,8 +77,13 @@ function Invoke-Frontend {
     [string[]]$CommandArgs
   )
 
-  & corepack pnpm --dir (Join-Path $Root 'frontend') @CommandArgs
-  return $LASTEXITCODE
+  Push-Location (Join-Path $Root 'frontend')
+  try {
+    & corepack pnpm @CommandArgs
+    return $LASTEXITCODE
+  } finally {
+    Pop-Location
+  }
 }
 
 function Run-Doctor {
@@ -138,11 +143,11 @@ switch ($Command) {
   'dev-desktop' { exit (Invoke-Interruptible 'cargo' 'run' '--locked' '-p' 'croopor-desktop') }
   'rust:desktop' { exit (Invoke-Interruptible 'cargo' 'run' '--locked' '-p' 'croopor-desktop') }
   'rust:api' { exit (Invoke-Interruptible 'cargo' 'run' '--locked' '-p' 'croopor-api') }
-  'dev-web' { exit (Invoke-Interruptible 'corepack' 'pnpm' '--dir' (Join-Path $Root 'frontend') 'run' 'dev') }
-  'web' { exit (Invoke-Interruptible 'corepack' 'pnpm' '--dir' (Join-Path $Root 'frontend') 'run' 'dev') }
-  'watch' { exit (Invoke-Interruptible 'corepack' 'pnpm' '--dir' (Join-Path $Root 'frontend') 'run' 'watch') }
-  'frontend:serve' { exit (Invoke-Interruptible 'corepack' 'pnpm' '--dir' (Join-Path $Root 'frontend') 'run' 'dev') }
-  'frontend:watch' { exit (Invoke-Interruptible 'corepack' 'pnpm' '--dir' (Join-Path $Root 'frontend') 'run' 'watch') }
+  'dev-web' { Invoke-Frontend run dev; exit $LASTEXITCODE }
+  'web' { Invoke-Frontend run dev; exit $LASTEXITCODE }
+  'watch' { Invoke-Frontend run watch; exit $LASTEXITCODE }
+  'frontend:serve' { Invoke-Frontend run dev; exit $LASTEXITCODE }
+  'frontend:watch' { Invoke-Frontend run watch; exit $LASTEXITCODE }
   'frontend:install' { Invoke-Frontend install --frozen-lockfile --ignore-scripts; exit $LASTEXITCODE }
   'frontend:check' { Invoke-Frontend run check; exit $LASTEXITCODE }
   'frontend:build' { Invoke-Frontend run build; exit $LASTEXITCODE }

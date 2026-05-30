@@ -83,7 +83,10 @@ run_interruptible() {
 }
 
 run_frontend() {
-  pnpm --dir "$ROOT/frontend" "$@"
+  (
+    cd "$ROOT/frontend"
+    pnpm "$@"
+  )
 }
 
 wait_for_frontend_dev_server() {
@@ -312,9 +315,9 @@ run_desktop_dev() {
 
   trap cleanup_desktop_dev EXIT
   if command -v setsid >/dev/null 2>&1; then
-    setsid env PORT=3000 CROOPOR_WEB_API_BASE="${CROOPOR_WEB_API_BASE:-http://127.0.0.1:43430}" pnpm --dir "$ROOT/frontend" run dev:desktop &
+    setsid env PORT=3000 CROOPOR_WEB_API_BASE="${CROOPOR_WEB_API_BASE:-http://127.0.0.1:43430}" bash -lc 'cd "$1" && exec pnpm run dev:desktop' bash "$ROOT/frontend" &
   else
-    env PORT=3000 CROOPOR_WEB_API_BASE="${CROOPOR_WEB_API_BASE:-http://127.0.0.1:43430}" pnpm --dir "$ROOT/frontend" run dev:desktop &
+    env PORT=3000 CROOPOR_WEB_API_BASE="${CROOPOR_WEB_API_BASE:-http://127.0.0.1:43430}" bash -lc 'cd "$1" && exec pnpm run dev:desktop' bash "$ROOT/frontend" &
   fi
   frontend_pid=$!
 
@@ -383,7 +386,7 @@ main() {
       (
         export PORT="${PORT:-3000}"
         export CROOPOR_WEB_API_BASE="${CROOPOR_WEB_API_BASE:-http://127.0.0.1:43430}"
-        run_interruptible pnpm --dir "$ROOT/frontend" run dev:desktop
+        run_interruptible run_frontend run dev:desktop
       )
       ;;
     watch|frontend:watch)
@@ -391,7 +394,7 @@ main() {
         echo "$cmd does not accept extra arguments" >&2
         exit 1
       fi
-      run_interruptible pnpm --dir "$ROOT/frontend" run watch
+      run_interruptible run_frontend run watch
       ;;
     frontend:install)
       if [ "$#" -ne 0 ]; then
