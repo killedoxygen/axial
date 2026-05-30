@@ -1453,6 +1453,36 @@ mod tests {
     }
 
     #[test]
+    fn manifest_rejects_unverifiable_artifact_publisher_signature_fields() {
+        let error = serde_json::from_value::<Manifest>(serde_json::json!({
+            "schema_version": 1,
+            "generated_at": "2026-04-02T00:00:00Z",
+            "minimum_app_version": "0.3.1",
+            "rule_channel": "bundled",
+            "artifacts": [{
+                "id": "sodium",
+                "type": "mod",
+                "source": {
+                    "provider": "modrinth",
+                    "project_id": "sodium",
+                    "slug": "sodium"
+                },
+                "checksum_policy": "provider_sha512",
+                "ownership_class": "composition_managed",
+                "publisher_signature": {
+                    "algorithm": "ed25519",
+                    "signature": "00"
+                }
+            }],
+            "compositions": [],
+            "emergency_disables": []
+        }))
+        .expect_err("unmodeled artifact signature fields should be invalid current schema");
+
+        assert!(error.to_string().contains("publisher_signature"));
+    }
+
+    #[test]
     fn validation_rejects_invalid_managed_mod_artifact_references() {
         let mut missing_reference = builtin_manifest().expect("manifest");
         first_managed_mod_mut(&mut missing_reference).artifact_id = String::new();
