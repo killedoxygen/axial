@@ -7,10 +7,10 @@ import { useTheme } from '../../hooks/use-theme';
 import { InstanceArt, artPresetForSeed, artSeedFor, nextArtSeed } from '../../art/InstanceArt';
 import { showConfirm } from '../../ui/Dialog';
 import { openContextMenu } from '../../ui/ContextMenu';
-import { config, instances, launchState, runningSessions, systemInfo, versions } from '../../store';
+import { config, instances, launchNotices, launchState, runningSessions, systemInfo, versions } from '../../store';
 import type { LaunchState } from '../../store';
 import { navigate } from '../../ui-state';
-import { addInstance, removeInstance, selectInstance, updateInstanceInList } from '../../actions';
+import { addInstance, clearLaunchNotice, removeInstance, selectInstance, updateInstanceInList } from '../../actions';
 import { launchGame, killGame } from '../../launch';
 import { api, apiUrl } from '../../api';
 import { toast } from '../../toast';
@@ -22,6 +22,7 @@ import type {
   InstancePerformanceMode,
   InstanceLogTail,
   InstanceResourceSummary,
+  LaunchNotice,
   PerformanceHealthResponse,
   PerformanceHealthStatus,
   PerformanceInstallResponse,
@@ -1234,6 +1235,53 @@ function OverviewPane({ inst, resources, running, onLaunch, onStop, onOpenWorlds
   );
 }
 
+function launchNoticeIcon(tone: string): string {
+  if (tone === 'success') return 'check-circle';
+  if (tone === 'error') return 'alert';
+  return 'shield-check';
+}
+
+function LaunchOutcomeNotice({ inst, notice }: {
+  inst: EnrichedInstance;
+  notice: LaunchNotice;
+}): JSX.Element {
+  const details = (notice.details ?? []).map(detail => detail.trim()).filter(Boolean);
+  const primaryDetail = notice.detail?.trim() || (details.length === 1 ? details[0] : '');
+  const listDetails = details.length > 1
+    ? details.filter(detail => !primaryDetail || detail !== primaryDetail)
+    : [];
+
+  return (
+    <div class="cp-instance-notice-shell">
+      <section class="cp-launch-notice" data-tone={notice.tone} aria-live="polite">
+        <span class="cp-launch-notice-mark" aria-hidden="true">
+          <Icon name={launchNoticeIcon(notice.tone)} size={15} stroke={2.2} />
+        </span>
+        <div class="cp-launch-notice-copy">
+          <strong>{notice.message}</strong>
+          {primaryDetail && <p>{primaryDetail}</p>}
+          {listDetails.length > 0 && (
+            <details class="cp-launch-notice-details">
+              <summary>Details</summary>
+              <ul>
+                {listDetails.map((detail, index) => <li key={`${index}:${detail}`}>{detail}</li>)}
+              </ul>
+            </details>
+          )}
+        </div>
+        <button
+          class="cp-launch-notice-dismiss"
+          type="button"
+          aria-label="Dismiss launch notice"
+          onClick={() => clearLaunchNotice(inst.id)}
+        >
+          <Icon name="x" size={13} stroke={2.2} />
+        </button>
+      </section>
+    </div>
+  );
+}
+
 function LaunchSplitButton({
   inst,
   onLaunch,
@@ -2010,6 +2058,7 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
   };
 
   const loaderVer = v?.loader?.loader_version ?? '';
+  const launchNotice = launchNotices.value[inst.id];
 
   return (
     <div class={`cp-instance-page${tab === 'overview' ? ' cp-instance-page--overview' : ''}`}>
@@ -2086,6 +2135,8 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
           );
         })}
       </div>
+
+      {launchNotice && <LaunchOutcomeNotice inst={inst} notice={launchNotice} />}
 
       {tab === 'overview' && (
         <>
