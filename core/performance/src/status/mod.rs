@@ -213,7 +213,9 @@ mod tests {
     use crate::health::BundleHealth;
     use crate::resolve::builtin_manifest;
     use crate::rules_cache::RulesCacheState;
-    use crate::types::{EmergencyDisable, EmergencyDisableTarget, OwnershipClass, VersionFamily};
+    use crate::types::{
+        CompositionTier, EmergencyDisable, EmergencyDisableTarget, OwnershipClass, VersionFamily,
+    };
 
     #[test]
     fn bundled_manifest_status_is_truthful_about_current_foundation() {
@@ -337,17 +339,12 @@ mod tests {
     }
 
     #[test]
-    fn vanilla_enhanced_only_families_are_warned_without_invalidating_status() {
+    fn vanilla_enhanced_only_and_managed_covered_families_report_current_status() {
         let manifest = builtin_manifest().expect("builtin manifest should validate");
 
         let status = rules_status(&manifest);
 
-        for family in [
-            VersionFamily::A,
-            VersionFamily::B,
-            VersionFamily::C,
-            VersionFamily::D,
-        ] {
+        for family in [VersionFamily::A, VersionFamily::B, VersionFamily::D] {
             let coverage = status
                 .family_coverage
                 .iter()
@@ -362,6 +359,19 @@ mod tests {
                 "missing vanilla-enhanced-only warning for {family:?}"
             );
         }
+
+        let family_c = status
+            .family_coverage
+            .iter()
+            .find(|coverage| coverage.family == VersionFamily::C)
+            .expect("family C coverage");
+        assert_eq!(family_c.managed_mod_count, 3);
+        assert!(family_c.tiers.contains(&CompositionTier::Core));
+        assert!(family_c.tiers.contains(&CompositionTier::VanillaEnhanced));
+        assert!(
+            family_c.warnings.is_empty(),
+            "Family C has bounded Forge managed coverage and should not warn as vanilla-only"
+        );
 
         for family in [VersionFamily::E, VersionFamily::F] {
             let coverage = status

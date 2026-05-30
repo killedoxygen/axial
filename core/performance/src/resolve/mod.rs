@@ -1234,13 +1234,12 @@ mod tests {
     ];
 
     #[test]
-    fn families_a_through_d_managed_plans_resolve_named_vanilla_enhanced_compositions() {
+    fn families_a_b_d_managed_plans_resolve_named_vanilla_enhanced_compositions() {
         let manifest = builtin_manifest().expect("manifest");
 
         for (game_version, family, composition_id) in [
             ("1.5.2", VersionFamily::A, "family-a-vanilla-enhanced"),
             ("1.7.10", VersionFamily::B, "family-b-vanilla-enhanced"),
-            ("1.12.2", VersionFamily::C, "family-c-vanilla-enhanced"),
             ("1.15.2", VersionFamily::D, "family-d-vanilla-enhanced"),
         ] {
             for loader in ["vanilla", "fabric", "forge", "neoforge", "quilt"] {
@@ -1262,6 +1261,92 @@ mod tests {
                 assert!(plan.mods.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn family_c_forge_1_12_2_resolves_conservative_core_with_vanilla_fallback() {
+        let manifest = builtin_manifest().expect("manifest");
+
+        let plan = resolve_plan(
+            Some(&manifest),
+            ResolutionRequest {
+                game_version: "1.12.2".to_string(),
+                loader: "forge".to_string(),
+                mode: PerformanceMode::Managed,
+                hardware: HardwareProfile::default(),
+                installed_mods: Vec::new(),
+            },
+        );
+
+        assert_eq!(plan.composition_id, "family-c-forge-core");
+        assert_eq!(plan.family, VersionFamily::C);
+        assert_eq!(plan.loader, "forge");
+        assert_eq!(plan.tier, CompositionTier::Core);
+        assert_eq!(
+            plan.fallback_chain,
+            vec!["family-c-vanilla-enhanced".to_string()]
+        );
+        assert_eq!(count_mods_with_slug(&plan.mods, "foamfix"), 1);
+        assert_eq!(count_mods_with_slug(&plan.mods, "ai-improvements"), 1);
+        assert_eq!(count_mods_with_slug(&plan.mods, "clumps"), 1);
+    }
+
+    #[test]
+    fn family_c_non_forge_loaders_stay_on_vanilla_enhanced() {
+        let manifest = builtin_manifest().expect("manifest");
+
+        for loader in ["vanilla", "fabric", "neoforge", "quilt"] {
+            let plan = resolve_plan(
+                Some(&manifest),
+                ResolutionRequest {
+                    game_version: "1.12.2".to_string(),
+                    loader: loader.to_string(),
+                    mode: PerformanceMode::Managed,
+                    hardware: HardwareProfile::default(),
+                    installed_mods: Vec::new(),
+                },
+            );
+
+            assert_eq!(plan.composition_id, "family-c-vanilla-enhanced");
+            assert_eq!(plan.family, VersionFamily::C);
+            assert_eq!(plan.loader, loader);
+            assert_eq!(plan.tier, CompositionTier::VanillaEnhanced);
+            assert!(plan.mods.is_empty());
+        }
+    }
+
+    #[test]
+    fn family_c_forge_core_emergency_disable_falls_back_to_vanilla_enhanced() {
+        let mut manifest = builtin_manifest().expect("manifest");
+        manifest.emergency_disables.push(test_composition_disable(
+            "hold-family-c-forge-core",
+            "family-c-forge-core",
+        ));
+
+        let plan = resolve_plan(
+            Some(&manifest),
+            ResolutionRequest {
+                game_version: "1.12.2".to_string(),
+                loader: "forge".to_string(),
+                mode: PerformanceMode::Managed,
+                hardware: HardwareProfile::default(),
+                installed_mods: Vec::new(),
+            },
+        );
+
+        assert_eq!(plan.composition_id, "family-c-vanilla-enhanced");
+        assert_eq!(plan.family, VersionFamily::C);
+        assert_eq!(plan.loader, "forge");
+        assert_eq!(plan.tier, CompositionTier::VanillaEnhanced);
+        assert!(plan.mods.is_empty());
+        assert_eq!(
+            plan.fallback_reason,
+            "a higher-tier managed composition is temporarily disabled"
+        );
+        assert!(plan.warnings.iter().any(|warning| {
+            warning.contains("family-c-forge-core skipped by emergency disable")
+                && warning.contains("Temporary hold.")
+        }));
     }
 
     #[test]

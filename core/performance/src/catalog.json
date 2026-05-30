@@ -17,6 +17,8 @@
     {"id": "enhancedblockentities", "type": "mod", "source": {"provider": "modrinth", "project_id": "enhancedblockentities", "slug": "enhancedblockentities"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
     {"id": "memoryleakfix", "type": "mod", "source": {"provider": "modrinth", "project_id": "memoryleakfix", "slug": "memoryleakfix"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
     {"id": "clumps", "type": "mod", "source": {"provider": "modrinth", "project_id": "clumps", "slug": "clumps"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
+    {"id": "foamfix", "type": "mod", "source": {"provider": "modrinth", "project_id": "jupr7Bf5", "slug": "foamfix"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
+    {"id": "ai-improvements", "type": "mod", "source": {"provider": "modrinth", "project_id": "DSVgwcji", "slug": "ai-improvements"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
     {"id": "lazydfu", "type": "mod", "source": {"provider": "modrinth", "project_id": "lazydfu", "slug": "lazydfu"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
     {"id": "smooth-boot-reloaded", "type": "mod", "source": {"provider": "modrinth", "project_id": "smooth-boot-reloaded", "slug": "smooth-boot-reloaded"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
     {"id": "starlight", "type": "mod", "source": {"provider": "modrinth", "project_id": "starlight", "slug": "starlight"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
@@ -234,6 +236,20 @@
       "mods": [
         {"artifact_id": "embeddium", "project_id": "embeddium", "slug": "embeddium", "name": "Embeddium", "condition": "always"},
         {"artifact_id": "ferrite-core", "project_id": "ferrite-core", "slug": "ferrite-core", "name": "FerriteCore", "condition": "always"}
+      ]
+    },
+    {
+      "id": "family-c-forge-core",
+      "display_name": "Family C Forge Core",
+      "description": "Conservative managed Forge composition for 1.12.2 legacy clients",
+      "families": ["C"],
+      "loaders": ["forge"],
+      "tier": "core",
+      "fallback_to": "family-c-vanilla-enhanced",
+      "mods": [
+        {"artifact_id": "foamfix", "project_id": "jupr7Bf5", "slug": "foamfix", "name": "FoamFix", "condition": "version_range", "version_range": "1.12.2"},
+        {"artifact_id": "ai-improvements", "project_id": "DSVgwcji", "slug": "ai-improvements", "name": "AI Improvements", "condition": "version_range", "version_range": "1.12.2"},
+        {"artifact_id": "clumps", "project_id": "clumps", "slug": "clumps", "name": "Clumps", "condition": "version_range", "version_range": "1.12.2"}
       ]
     }
   ]
