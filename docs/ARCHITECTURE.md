@@ -35,6 +35,8 @@ This is the current map of the launcher. Keep it accurate. If the architecture c
 
 ## Backend map
 - `apps/api/src/routes/launch/`: launch route, task assembly, streaming, runner
+- `apps/api/src/routes/auth.rs`: offline-only account/auth status surface and future auth boundary
+- `apps/api/src/routes/skin.rs`: offline/default skin profile metadata and local head image surface
 - `apps/api/src/state/sessions/`: live launch session store, subscriptions, process supervision
 - `core/launcher/src/guardian/`: launch-safety authority and intervention model
 - `core/launcher/src/service/`: launch preparation, mappings, Healing summary/recovery helpers
@@ -116,21 +118,28 @@ flowchart TD
 ```mermaid
 flowchart TD
     A[SessionStore.start_process] --> B[store pid + command + guardian + healing]
-    B --> C[spawn stdout/stderr pumps]
-    B --> D[spawn startup watchdog]
-    B --> E[spawn wait task]
-    C --> F[emit log events]
-    F --> G[update startup observation markers]
-    D --> H{startup seen?}
-    H -->|no| I[emit stalled terminal status]
-    H -->|yes| J[wait]
-    E --> K[process exits]
-    K --> L[emit exited status]
-    F --> M[SSE stream and Tauri bridge deliver logs]
-    L --> N[SSE stream and Tauri bridge deliver status]
-    N --> O[frontend/src/launch.ts updates runningSessions]
-    O --> P[UI tears down session or keeps monitoring]
+    B --> C[seed stage history from queued session state]
+    C --> D[spawn stdout/stderr pumps]
+    C --> E[spawn startup watchdog]
+    C --> F[spawn wait task]
+    D --> G[emit log events]
+    G --> H[update startup observation markers]
+    E --> I{startup seen?}
+    I -->|no| J[emit stalled terminal status]
+    I -->|yes| K[wait]
+    F --> L[process exits]
+    L --> M[emit exited status]
+    G --> N[SSE stream and Tauri bridge deliver logs]
+    M --> O[SSE stream and Tauri bridge deliver status]
+    O --> P[frontend/src/launch.ts updates runningSessions]
+    P --> Q[UI tears down session or keeps monitoring]
 ```
+
+`SessionStore` owns the live stage history for each launch session. Status transitions update the stored `LaunchSessionRecord.stages` array and every status payload can include the current stage records. Each stage record carries the backend stage id, label, start timestamp, optional end timestamp, optional duration, optional result, warnings, and fallback reason. Benchmark launches also attach bounded benchmark metadata to the live session record so active status can be correlated before proof persistence. The route snapshot at `/api/v1/launch/{id}/status`, browser SSE stream, and desktop Tauri bridge all expose the same additive `stages` data and optional benchmark metadata. The backend now emits a `prewarming` stage after launch planning and before JVM spawn; that stage performs a bounded, sequential, best-effort read of high-value local launch files and records its duration like any other launch stage. The prewarm budget is selected from the launch resource-budget snapshot: low-pressure launches keep the normal bounded prewarm, pressure reduces prewarm work, and severe CPU/install or disk-headroom pressure skips prewarm rather than adding avoidable load.
+
+Launch completion also writes a local proof record under `<config_dir>/benchmarks/launch/`. Proof records are best-effort and never fail the launch path. They include session, instance, version, launch timestamps, outcome, scenario metadata, conservative local device metadata, launch-time resource budget snapshot, pid/exit/failure data, Guardian, Healing, and stage history, while avoiding full command-line and Java-path persistence. The resource budget snapshot is captured before the new queued session is inserted and records scalar pressure evidence such as active launch/install counts, active launch memory allocation, requested memory, signed estimated remaining memory, headroom threshold, and memory/CPU/install pressure booleans, plus best-effort measured memory evidence for host available memory, host used memory, and launcher process memory when the host exposes those values. It also records best-effort CPU load-average evidence, launch-relevant free disk space, and a conservative disk-pressure flag without storing filesystem paths. Stage history includes the bounded prewarming stage when launch reaches it, so benchmark proofs can show whether prewarm work ran and how long it took without storing warmed file paths.
+
+When a previous local proof matches the same scenario, performance mode, version target, requested memory, and device tier, the new proof also stores an additive comparison summary for total completed launch-stage duration. `POST /api/v1/launch/benchmark` reuses the normal launch path, returns the normal launch response plus bounded benchmark metadata, attaches the same sanitized metadata to the active session status, and tags the resulting proof scenario with sanitized benchmark profile/run-type/mode/id fields. Benchmark mode metadata normalizes development, qualification, and release-validation labels while preserving unknown forward-compatible values. `GET /api/v1/launch/benchmark/matrix` exposes the backend-authored local benchmark descriptor for stable development, qualification, and release-validation modes, run types, and benchmark profile ids; it is descriptor-only. `POST /api/v1/launch/benchmark/suite` expands those stable ids into a deterministic bounded suite plan and launches one selected suite run through the same benchmark launch path, returning selected and remaining run metadata plus a stable `suite_id` for an advanced caller to drive the suite one run at a time. When `run_index` is omitted, the suite endpoint resumes the first planned run in the persisted manifest without a session id; a complete suite returns a JSON conflict instead of relaunching run 0, and an existing non-terminal suite run returns a JSON conflict instead of overlapping runs. `POST /api/v1/launch/benchmark/suite/tick` is a polling-safe driver primitive for background orchestration: it returns `active` or `complete` as HTTP 200 non-error states when no run should start, or launches exactly one next pending run through the same suite path when the suite can advance. `POST /api/v1/launch/benchmark/suite/driver` starts one explicit in-memory suite driver per suite, clamps the polling interval to safe bounds, and reuses the tick decision path until stopped, complete, or failed; `GET /api/v1/launch/benchmark/suite/drivers/{id}` reports bounded driver state, `GET /api/v1/launch/benchmark/suite/drivers` lists a bounded set of recent driver states, `POST /api/v1/launch/benchmark/suite/drivers/{id}/stop` cancels future driver iterations without killing a launched game session, and `POST /api/v1/launch/benchmark/suite/drivers/{id}/resume` explicitly starts a fresh driver from a persisted terminal/interrupted record when its suite manifest still has a pending run. Driver status records persist under `<config_dir>/benchmarks/suite-drivers/`; API startup loads them for discovery, marks any previous non-terminal record as `interrupted`, and never auto-launches or resumes suite drivers on process start. Suite runs update a local manifest under `<config_dir>/benchmarks/suites/`; after proof persistence, matching suite manifest runs are updated with the persisted proof outcome state. `GET /api/v1/launch/benchmark/suites/{id}` returns that manifest with planned runs and launched session mappings. The API exposes recent proofs through `GET /api/v1/launch/reports` and individual proofs through `GET /api/v1/launch/reports/{id}`; Settings Performance renders the recent proof history with benchmark metadata, comparison text, compact resource-budget evidence, and a bounded advanced benchmark-driver block with instance, suite-mode, interval, start, refresh, stop, and resume controls.
 
 ### Frontend launch flow
 ```mermaid
@@ -141,12 +150,14 @@ flowchart TD
     D -->|error| E[render guardian/healing failure notice]
     D -->|success| F[store running session]
     F --> G[connect SSE or Tauri event stream]
-    G --> H[status updates patch runningSessions]
+    G --> H[status updates patch launch prep and runningSessions]
     G --> I[log updates append launch log]
     H --> J{terminal status?}
     J -->|no| K[keep monitoring]
     J -->|yes| L[render terminal notice and clear session]
 ```
+
+Before `/launch` returns a session id, the frontend uses a bounded local launch-stage placeholder sequence from the same stage vocabulary. Those placeholders are conservative estimates only; backend status events replace them as soon as a session exists.
 
 ### Config/settings flow
 ```mermaid
@@ -198,17 +209,41 @@ flowchart TD
     G --> H[frontend renders backend-authored loader tags only]
 ```
 
+## Performance Program
+
+`core/performance` owns the bundled managed-performance manifest, plan resolution, bundle health vocabulary, emergency-disable evaluation, local rules-cache status, composition-owned artifact installation/removal, and local rollback snapshots for the last tracked managed bundle state. Normal API and desktop startup create a non-sensitive rules-cache snapshot under `<config_dir>/performance/rules-cache.json` for the active built-in manifest. Missing, invalid, or unreadable cache state is repaired from the built-in manifest without blocking launch or status. The API exposes this through `/api/v1/performance/*`:
+
+- `GET /api/v1/performance/status` reports the currently active rule source. Today this is the bundled built-in manifest only: remote refresh is disabled, `last_refresh_at` is null, and validation reflects the loaded built-in manifest. The status also includes per-family coverage diagnostics so older families can be distinguished between intentional vanilla-enhanced fallback and richer managed-mod coverage. Manifest-level emergency disables are exposed as public diagnostics with ids, target type, target id, reason, and optional family/loader/tier bounds. Local rules-cache diagnostics report whether the active rules snapshot was recorded, recovered, or unavailable.
+- `GET /api/v1/performance/plan` resolves the effective composition for a game version, loader, mode, and detected hardware profile. Resolution skips emergency-disabled compositions, drops emergency-disabled managed artifacts from selected plans, and adds calm warnings/fallback reasons without touching user-managed mods.
+- `GET /api/v1/performance/health` summarizes the tracked composition lock state for an instance.
+- `POST /api/v1/performance/install` applies, removes, or rolls back only Croopor-tracked composition-managed files for an instance. Before install/remove mutation, Croopor records a single local latest rollback snapshot under the instance mods state area at `mods/.croopor-performance/rollback/`; snapshots contain the previous composition lock and tracked managed artifact bytes, never user-managed files. Missing rollback state returns a bounded JSON error. Requests can opt into queued execution with `queued: true`; queued performance operations return an install progress id, emit bounded progress through the existing `/api/v1/install/{id}/events` stream, and use a process-local same-instance guard to avoid overlapping managed-bundle mutations while the API process is running.
+
+The bundled manifest has explicit vanilla-enhanced fallback compositions for Families A-D and managed Fabric/Forge-era compositions for Families E-F. The frontend Settings Performance section displays the active mode, rule-source status, and recent local launch proof history from `/api/v1/launch/reports`, including benchmark metadata, baseline comparison text, resource pressure summaries, compact measured-memory details, CPU load details, and disk-free details when proof records contain them. It also renders the backend-authored benchmark matrix descriptor from `/api/v1/launch/benchmark/matrix` as an advanced reference and lets advanced users start a background benchmark suite driver for an existing instance with a selected suite mode and bounded polling interval. Instance overview displays the effective plan/health summary and lifecycle action; that action uses queued performance operations for observable progress, but per-instance policy editing stays in instance Settings to preserve the overview grid layout.
+
+## Accounts And Skin Identity
+
+Croopor currently launches with an offline identity from config. The active player name is validated through `core/config`, launch command planning uses `core/minecraft::offline_uuid`, and no Microsoft token storage or external authentication chain is active yet.
+
+The API exposes `GET /api/v1/auth/status` as the current account boundary. Today it validates the configured username and returns an offline-only status: offline mode, deterministic offline UUID, unverified identity, online-mode not ready, default skin source, and login availability based on the optional public `CROOPOR_MSA_CLIENT_ID`. `POST /api/v1/auth/login` is the login-start boundary. Without that client id it returns a JSON unavailable response; with the client id it requests a Microsoft device-code challenge using the `XboxLive.signin offline_access` scope, stores the raw Microsoft `device_code` in a restart-volatile in-memory `AuthLoginStore`, and returns a public pending response with a local `login_id`, user code, verification URL, expiry, interval, and optional message. `GET /api/v1/auth/login/{login_id}` reads that local session without contacting Microsoft: pending sessions return non-sensitive public metadata with bounded remaining seconds, expired sessions return `410 Gone`, and unknown sessions return `404`. Accounts & skins can start that device-code request and render the user code, verification URL, expiry, and copy affordances inline without owning the raw Microsoft device code. This slice does not poll for tokens, store tokens, exchange Xbox/Minecraft credentials, or change launch credentials. This lets the frontend render account status from backend-owned facts without implying completed Microsoft login support.
+
+The API also exposes `GET /api/v1/skin/profile` as a local offline skin-profile foundation. It accepts an optional `username`, falls back to the configured username when omitted or blank, validates the selected name, returns the deterministic offline UUID, reports a deterministic default `classic` or `slim` variant hint, and includes a local head URL. `GET /api/v1/skin/head` returns a deterministic offline `image/svg+xml` player head with bounded size and private cache headers. These endpoints do not fetch Mojang skins, store tokens, or contact Microsoft services.
+
 ## Launch authority boundaries
 - Guardian is the authority for launch-safety policy.
 - Healing is a capability used by Guardian, not the authority.
 - Runtime/JVM/validation layers should produce facts and execution helpers, not user-policy decisions.
 - Session heuristics are observations. They should not invent user-policy outcomes on their own.
-- The frontend should render backend-authored Guardian outcomes, not reinterpret policy locally.
+- Guardian summaries carry additive backend-authored `message` and `details` fields for user-facing non-allowed outcomes.
+- Launch preparation computes conservative host resource warnings from active session allocations, requested launch memory, active launch count, CPU thread count, best-effort CPU load averages, active install/download sessions, and launch-relevant disk free space. It also warns when the selected minimum memory exceeds the effective maximum and is clamped down for launch, and when the effective maximum memory allocation is below the conservative 2 GB startup threshold. Tight memory headroom, high launch concurrency, saturated measured CPU load, concurrent install pressure, low disk headroom, very low launch allocation, or memory-bound clamping produce non-blocking Guardian `warned` outcomes.
+- Launch preparation also warns in Guardian Custom mode when explicit Java or raw JVM argument overrides are preserved unchanged.
+- The frontend should prefer backend-authored Guardian outcomes, then fall back to legacy intervention/guidance and Healing details when needed.
 
 ## Where to look
 - launch behavior: `apps/api/src/routes/launch/`, `apps/api/src/state/sessions/`, `core/launcher/`, `core/minecraft/src/runtime/`
+- launch proof records: `apps/api/src/state/launch_reports.rs`
 - config/settings: `core/config/`, `frontend/src/settings.ts`
 - install flow: `apps/api/src/routes/install.rs`, `core/minecraft/`, `frontend/src/install.ts`
+- account/skin identity: `apps/api/src/routes/auth.rs`, `apps/api/src/routes/skin.rs`, `core/config/`, `core/minecraft/src/launch/mod.rs`, `frontend/src/views/accounts/AccountsView.tsx`
 - version and loader metadata analysis: `core/minecraft/src/version_meta/`, `core/minecraft/src/lifecycle.rs`, `core/minecraft/src/loaders/types.rs`, `core/minecraft/src/loaders/providers/`, `apps/api/src/routes/catalog.rs`, `apps/api/src/routes/versions.rs`, `core/minecraft/src/loaders/index/query.rs`
 - desktop bridge: `apps/desktop/`, `frontend/src/native.ts`
 
