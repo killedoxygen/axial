@@ -133,6 +133,8 @@ pub struct ResolutionRequest {
 pub struct Manifest {
     pub schema_version: i32,
     pub generated_at: String,
+    pub minimum_app_version: String,
+    pub rule_channel: String,
     pub compositions: Vec<CompositionDef>,
     pub emergency_disables: Vec<EmergencyDisable>,
 }

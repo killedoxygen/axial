@@ -19,6 +19,8 @@ use sysinfo::System;
 use thiserror::Error;
 
 const BUILTIN_CATALOG: &str = include_str!("../catalog.json");
+const RUNNING_APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const KNOWN_RULE_CHANNELS: &[&str] = &["bundled", "local", "remote"];
 
 #[derive(Debug, Error)]
 pub enum ResolveError {
@@ -26,6 +28,16 @@ pub enum ResolveError {
     Parse(#[from] serde_json::Error),
     #[error("unsupported schema_version")]
     UnsupportedSchema,
+    #[error("minimum_app_version is required")]
+    MissingMinimumAppVersion,
+    #[error("minimum_app_version is invalid: {0}")]
+    InvalidMinimumAppVersion(String),
+    #[error("manifest requires app version {required}, but running app version is {running}")]
+    UnsupportedAppVersion { required: String, running: String },
+    #[error("rule_channel is required")]
+    MissingRuleChannel,
+    #[error("unsupported rule_channel: {0}")]
+    UnsupportedRuleChannel(String),
     #[error("composition id is required")]
     MissingCompositionId,
     #[error("duplicate composition id: {0}")]
@@ -56,6 +68,8 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), ResolveError> {
     if manifest.schema_version != 1 {
         return Err(ResolveError::UnsupportedSchema);
     }
+    validate_app_version_compatibility(&manifest.minimum_app_version)?;
+    validate_rule_channel(&manifest.rule_channel)?;
 
     let mut ids = std::collections::HashSet::new();
     for composition in &manifest.compositions {
@@ -121,6 +135,31 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), ResolveError> {
         }
     }
 
+    Ok(())
+}
+
+fn validate_app_version_compatibility(minimum_app_version: &str) -> Result<(), ResolveError> {
+    let minimum = parse_app_version(minimum_app_version)?;
+    let running = parse_app_version(RUNNING_APP_VERSION)
+        .expect("CARGO_PKG_VERSION should be a numeric dotted app version");
+    if compare_app_versions(&minimum, &running).is_gt() {
+        return Err(ResolveError::UnsupportedAppVersion {
+            required: minimum_app_version.trim().to_string(),
+            running: RUNNING_APP_VERSION.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_rule_channel(rule_channel: &str) -> Result<(), ResolveError> {
+    if rule_channel.trim().is_empty() {
+        return Err(ResolveError::MissingRuleChannel);
+    }
+    if !KNOWN_RULE_CHANNELS.contains(&rule_channel) {
+        return Err(ResolveError::UnsupportedRuleChannel(
+            rule_channel.to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -776,6 +815,78 @@ fn satisfies_hardware(managed_mod: &ManagedMod, hardware: &HardwareProfile) -> (
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct AppVersion {
+    major: u64,
+    minor: u64,
+    patch: u64,
+    pre_release: Option<String>,
+}
+
+fn parse_app_version(value: &str) -> Result<AppVersion, ResolveError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(ResolveError::MissingMinimumAppVersion);
+    }
+
+    let (release, pre_release) = match trimmed.split_once('-') {
+        Some((release, pre_release)) => {
+            if release.is_empty() || !valid_pre_release(pre_release) {
+                return Err(ResolveError::InvalidMinimumAppVersion(trimmed.to_string()));
+            }
+            (release, Some(pre_release.to_string()))
+        }
+        None => (trimmed, None),
+    };
+    let parts = release.split('.').collect::<Vec<_>>();
+    if parts.len() != 3 {
+        return Err(ResolveError::InvalidMinimumAppVersion(trimmed.to_string()));
+    }
+
+    let parse_part = |part: &str| -> Result<u64, ResolveError> {
+        if part.is_empty() || !part.chars().all(|character| character.is_ascii_digit()) {
+            return Err(ResolveError::InvalidMinimumAppVersion(trimmed.to_string()));
+        }
+        part.parse::<u64>()
+            .map_err(|_| ResolveError::InvalidMinimumAppVersion(trimmed.to_string()))
+    };
+
+    Ok(AppVersion {
+        major: parse_part(parts[0])?,
+        minor: parse_part(parts[1])?,
+        patch: parse_part(parts[2])?,
+        pre_release,
+    })
+}
+
+fn valid_pre_release(value: &str) -> bool {
+    !value.is_empty()
+        && value.split('.').all(|part| {
+            !part.is_empty()
+                && part
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '-')
+        })
+}
+
+fn compare_app_versions(left: &AppVersion, right: &AppVersion) -> std::cmp::Ordering {
+    for ordering in [
+        left.major.cmp(&right.major),
+        left.minor.cmp(&right.minor),
+        left.patch.cmp(&right.patch),
+    ] {
+        if !ordering.is_eq() {
+            return ordering;
+        }
+    }
+    match (&left.pre_release, &right.pre_release) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (Some(left), Some(right)) => left.cmp(right),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct MCVersion {
     major: i32,
     minor: i32,
@@ -1093,11 +1204,92 @@ mod tests {
         let error = serde_json::from_value::<Manifest>(serde_json::json!({
             "schema_version": 1,
             "generated_at": "2026-04-02T00:00:00Z",
+            "minimum_app_version": "0.3.1",
+            "rule_channel": "bundled",
             "compositions": []
         }))
         .expect_err("missing emergency_disables should be invalid current schema");
 
         assert!(error.to_string().contains("emergency_disables"));
+    }
+
+    #[test]
+    fn manifest_without_minimum_app_version_is_not_current_schema() {
+        let error = serde_json::from_value::<Manifest>(serde_json::json!({
+            "schema_version": 1,
+            "generated_at": "2026-04-02T00:00:00Z",
+            "rule_channel": "bundled",
+            "compositions": [],
+            "emergency_disables": []
+        }))
+        .expect_err("missing minimum_app_version should be invalid current schema");
+
+        assert!(error.to_string().contains("minimum_app_version"));
+    }
+
+    #[test]
+    fn manifest_without_rule_channel_is_not_current_schema() {
+        let error = serde_json::from_value::<Manifest>(serde_json::json!({
+            "schema_version": 1,
+            "generated_at": "2026-04-02T00:00:00Z",
+            "minimum_app_version": "0.3.1",
+            "compositions": [],
+            "emergency_disables": []
+        }))
+        .expect_err("missing rule_channel should be invalid current schema");
+
+        assert!(error.to_string().contains("rule_channel"));
+    }
+
+    #[test]
+    fn validation_rejects_incompatible_or_invalid_manifest_metadata() {
+        let mut too_new = builtin_manifest().expect("manifest");
+        too_new.minimum_app_version = "0.3.2".to_string();
+        assert_error_kind(
+            validate_manifest(&too_new),
+            ResolveError::UnsupportedAppVersion {
+                required: "0.3.2".to_string(),
+                running: env!("CARGO_PKG_VERSION").to_string(),
+            },
+        );
+
+        let mut invalid_version = builtin_manifest().expect("manifest");
+        invalid_version.minimum_app_version = "latest".to_string();
+        assert_error_kind(
+            validate_manifest(&invalid_version),
+            ResolveError::InvalidMinimumAppVersion("latest".to_string()),
+        );
+
+        let mut missing_version = builtin_manifest().expect("manifest");
+        missing_version.minimum_app_version = String::new();
+        assert_error_kind(
+            validate_manifest(&missing_version),
+            ResolveError::MissingMinimumAppVersion,
+        );
+
+        let mut unknown_channel = builtin_manifest().expect("manifest");
+        unknown_channel.rule_channel = "nightly".to_string();
+        assert_error_kind(
+            validate_manifest(&unknown_channel),
+            ResolveError::UnsupportedRuleChannel("nightly".to_string()),
+        );
+
+        let mut missing_channel = builtin_manifest().expect("manifest");
+        missing_channel.rule_channel = String::new();
+        assert_error_kind(
+            validate_manifest(&missing_channel),
+            ResolveError::MissingRuleChannel,
+        );
+    }
+
+    #[test]
+    fn validation_accepts_current_and_older_minimum_app_versions() {
+        for minimum_app_version in [env!("CARGO_PKG_VERSION"), "0.3.0", "0.3.1-alpha.1"] {
+            let mut manifest = builtin_manifest().expect("manifest");
+            manifest.minimum_app_version = minimum_app_version.to_string();
+
+            validate_manifest(&manifest).expect("manifest minimum should be compatible");
+        }
     }
 
     #[test]
