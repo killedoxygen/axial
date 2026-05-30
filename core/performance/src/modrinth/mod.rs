@@ -2,7 +2,9 @@ use hex::encode;
 use reqwest::{Client, Url};
 use serde::Deserialize;
 use sha2::{Digest, Sha512};
-use std::io;
+use std::fs;
+use std::io::{self, Write};
+use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -95,11 +97,12 @@ impl ModrinthClient {
         Ok(compatible)
     }
 
-    pub async fn download_file(
+    pub async fn download_file_to_path(
         &self,
         url: &str,
         expected_sha512: &str,
-    ) -> Result<Vec<u8>, ModrinthError> {
+        temp_path: &Path,
+    ) -> Result<(), ModrinthError> {
         let response = self.client.get(url).send().await?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
@@ -107,17 +110,44 @@ impl ModrinthClient {
             return Err(ModrinthError::Http { status, body });
         }
 
-        let bytes = response.bytes().await?;
-        if !expected_sha512.is_empty() {
-            let actual = encode(Sha512::digest(&bytes));
+        if let Some(parent) = temp_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)?;
+        }
+
+        let result = async {
+            let mut output = fs::File::create(temp_path)?;
+            let mut hasher = Sha512::new();
+            let mut response = response;
+            while let Some(chunk) = response.chunk().await? {
+                hasher.update(&chunk);
+                output.write_all(&chunk)?;
+            }
+            output.flush()?;
+            Ok::<String, ModrinthError>(encode(hasher.finalize()))
+        }
+        .await;
+
+        let actual = match result {
+            Ok(actual) => actual,
+            Err(error) => {
+                let _ = fs::remove_file(temp_path);
+                return Err(error);
+            }
+        };
+
+        if !expected_sha512.trim().is_empty() {
             if !actual.eq_ignore_ascii_case(expected_sha512) {
+                let _ = fs::remove_file(temp_path);
                 return Err(ModrinthError::HashMismatch {
                     expected: expected_sha512.to_string(),
                     actual,
                 });
             }
         }
-        Ok(bytes.to_vec())
+        Ok(())
     }
 }
 
@@ -175,4 +205,108 @@ fn matches_any_fold(values: &[String], wanted: &[String]) -> bool {
                 .iter()
                 .any(|value| value.eq_ignore_ascii_case(candidate))
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn download_file_to_path_streams_and_verifies_sha512() {
+        let body = b"managed-jar".to_vec();
+        let sha512 = encode(Sha512::digest(&body));
+        let url = spawn_file_server(body.clone()).await;
+        let root = test_root("download-stream-success");
+        let temp_path = root.join("sodium.jar.tmp");
+        let client = ModrinthClient::new();
+
+        client
+            .download_file_to_path(&url, &sha512, &temp_path)
+            .await
+            .expect("download verified file");
+
+        assert_eq!(fs::read(&temp_path).expect("read temp file"), body);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn download_file_to_path_removes_temp_file_on_sha512_mismatch() {
+        let url = spawn_file_server(b"managed-jar".to_vec()).await;
+        let root = test_root("download-stream-mismatch");
+        let temp_path = root.join("sodium.jar.tmp");
+        let client = ModrinthClient::new();
+
+        let error = client
+            .download_file_to_path(&url, "not-the-right-hash", &temp_path)
+            .await
+            .expect_err("hash mismatch should fail");
+
+        assert!(matches!(error, ModrinthError::HashMismatch { .. }));
+        assert!(!temp_path.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    async fn spawn_file_server(body: Vec<u8>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind file server");
+        let addr = listener.local_addr().expect("file server addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0_u8; 1024];
+                    loop {
+                        let Ok(read) = stream.read(&mut buf).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&buf[..read]);
+                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                        if request.len() > 8192 {
+                            return;
+                        }
+                    }
+
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    if stream.write_all(headers.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    let midpoint = body.len() / 2;
+                    if stream.write_all(&body[..midpoint]).await.is_err() {
+                        return;
+                    }
+                    let _ = stream.write_all(&body[midpoint..]).await;
+                });
+            }
+        });
+        format!("http://{addr}/files/sodium.jar")
+    }
+
+    fn test_root(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "croopor-performance-modrinth-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or_default()
+        ));
+        fs::create_dir_all(&path).expect("create test root");
+        path
+    }
 }

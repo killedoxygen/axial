@@ -487,12 +487,10 @@ impl PerformanceManager {
             }
         }
 
-        let bytes = self
-            .modrinth
-            .download_file(&file.url, &expected_sha)
-            .await?;
         let temp_path = PathBuf::from(format!("{}.tmp", final_path.display()));
-        fs::write(&temp_path, bytes)?;
+        self.modrinth
+            .download_file_to_path(&file.url, &expected_sha, &temp_path)
+            .await?;
         replace_file_atomic(&temp_path, &final_path)?;
 
         Ok(InstalledMod {
@@ -799,6 +797,101 @@ mod tests {
         );
         assert!(state.installed_mods[0].integrity.sha512_verified);
         assert!(!state.installed_mods[0].integrity.sha512.is_empty());
+        assert_eq!(
+            fs::read(root.join("sodium.jar")).expect("read verified file"),
+            b"managed-jar"
+        );
+        assert!(!root.join("sodium.jar.tmp").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn ensure_installed_reuses_existing_verified_final_file() {
+        let root = test_root("ensure-installed-reuse-verified-final");
+        let existing = b"already-present-jar";
+        fs::write(root.join("sodium.jar"), existing).expect("write existing final file");
+        let manager = PerformanceManager::new_with_modrinth_base_url(
+            spawn_modrinth_server_with_sha512(Some(hex::encode(sha2::Sha512::digest(existing))))
+                .await,
+        )
+        .expect("performance manager");
+        let plan = CompositionPlan {
+            composition_id: "core".to_string(),
+            family: VersionFamily::F,
+            loader: "fabric".to_string(),
+            mode: PerformanceMode::Managed,
+            tier: CompositionTier::Core,
+            mods: vec![ManagedMod {
+                artifact_id: "sodium".to_string(),
+                project_id: "sodium".to_string(),
+                slug: "sodium".to_string(),
+                name: "Sodium".to_string(),
+                condition: ModCondition::Always,
+                version_range: String::new(),
+                hardware_req: None,
+                mutual_exclusions: Vec::new(),
+            }],
+            jvm_preset: String::new(),
+            fallback_chain: Vec::new(),
+            warnings: Vec::new(),
+            fallback_reason: String::new(),
+        };
+
+        let state = manager
+            .ensure_installed(&plan, "1.20.4", &root)
+            .await
+            .expect("reuse existing managed artifact");
+
+        assert_eq!(state.installed_mods.len(), 1);
+        assert!(state.installed_mods[0].integrity.sha512_verified);
+        assert_eq!(
+            fs::read(root.join("sodium.jar")).expect("read reused file"),
+            existing
+        );
+        assert!(!root.join("sodium.jar.tmp").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn ensure_installed_removes_temp_and_leaves_no_final_on_sha512_mismatch() {
+        let root = test_root("ensure-installed-sha512-mismatch");
+        let manager = PerformanceManager::new_with_modrinth_base_url(
+            spawn_modrinth_server_with_sha512(Some("wrong-sha512".to_string())).await,
+        )
+        .expect("performance manager");
+        let plan = CompositionPlan {
+            composition_id: "core".to_string(),
+            family: VersionFamily::F,
+            loader: "fabric".to_string(),
+            mode: PerformanceMode::Managed,
+            tier: CompositionTier::Core,
+            mods: vec![ManagedMod {
+                artifact_id: "sodium".to_string(),
+                project_id: "sodium".to_string(),
+                slug: "sodium".to_string(),
+                name: "Sodium".to_string(),
+                condition: ModCondition::Always,
+                version_range: String::new(),
+                hardware_req: None,
+                mutual_exclusions: Vec::new(),
+            }],
+            jvm_preset: String::new(),
+            fallback_chain: Vec::new(),
+            warnings: Vec::new(),
+            fallback_reason: String::new(),
+        };
+
+        let state = manager
+            .ensure_installed(&plan, "1.20.4", &root)
+            .await
+            .expect("install should record failed managed artifact");
+
+        assert_eq!(state.failure_count, 1);
+        assert!(state.installed_mods.is_empty());
+        assert!(!root.join("sodium.jar").exists());
+        assert!(!root.join("sodium.jar.tmp").exists());
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1156,6 +1249,15 @@ mod tests {
     }
 
     async fn spawn_modrinth_server(include_sha512: bool) -> String {
+        let sha512 = if include_sha512 {
+            Some(hex::encode(sha2::Sha512::digest(b"managed-jar")))
+        } else {
+            None
+        };
+        spawn_modrinth_server_with_sha512(sha512).await
+    }
+
+    async fn spawn_modrinth_server_with_sha512(sha512: Option<String>) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind modrinth test server");
@@ -1165,6 +1267,7 @@ mod tests {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     break;
                 };
+                let sha512 = sha512.clone();
                 tokio::spawn(async move {
                     let mut request = Vec::new();
                     let mut buf = [0_u8; 1024];
@@ -1187,8 +1290,7 @@ mod tests {
                     let request = String::from_utf8_lossy(&request);
                     let first_line = request.lines().next().unwrap_or_default();
                     let file_url = format!("http://{addr}/files/sodium.jar");
-                    let hashes = if include_sha512 {
-                        let sha512 = hex::encode(sha2::Sha512::digest(b"managed-jar"));
+                    let hashes = if let Some(sha512) = sha512.as_ref() {
                         format!(r#""sha512":"{sha512}""#)
                     } else {
                         String::new()
