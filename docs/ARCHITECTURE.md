@@ -35,6 +35,7 @@ This is the current map of the launcher. Keep it accurate. If the architecture c
 
 ## Backend map
 - `apps/api/src/routes/launch/`: launch route, task assembly, streaming, runner
+- `apps/api/src/routes/instances.rs`: instance CRUD, resource listing, log tailing, and folder-opening boundary
 - `apps/api/src/routes/auth.rs`: offline-only account/auth status surface and future auth boundary
 - `apps/api/src/routes/skin.rs`: offline/default skin profile metadata and local head image surface
 - `apps/api/src/state/sessions/`: live launch session store, subscriptions, process supervision
@@ -44,6 +45,12 @@ This is the current map of the launcher. Keep it accurate. If the architecture c
 - `core/minecraft/src/version_meta/`: Minecraft version interpretation, lifecycle classification, effective-version resolution, display metadata, deterministic ordering
 - `core/minecraft/src/lifecycle.rs`: launcher-owned lifecycle model for Minecraft versions
 - `core/minecraft/src/loaders/types.rs`: loader build metadata contract, explicit upstream terms, evidence, backend display tags, and default-selection policy
+
+## Instance Isolation
+
+Instances are direct Minecraft game directories under `<config_dir>/instances/<instance-id>/`. Launch requests are instance-scoped: the API resolves the instance, uses that directory for Minecraft's `--gameDir` and process working directory, and still resolves shared immutable launcher material such as `assets/`, `libraries/`, `runtime/`, and `versions/` from the configured library directory. The current Rust model does not create symlinks or junctions inside instance directories.
+
+The mutable game-state boundary is instance-local. Croopor creates and reads user-visible folders such as `mods/`, `saves/`, `resourcepacks/`, `shaderpacks/`, `config/`, `screenshots/`, and `logs/` under the instance directory. The folder-opening API accepts an omitted `sub` query to open the instance root, or one of those explicit subfolder names; any other `sub` value returns a bounded JSON `400` instead of falling back to the root. Resource listing APIs scan fixed instance-local subdirectories and never accept caller-provided paths. Direct log tailing accepts only a single safe filename and rejects traversal, hidden, separator-containing, and control-character names.
 
 ## Full launcher pipeline
 

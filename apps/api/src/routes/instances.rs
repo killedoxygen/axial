@@ -319,12 +319,13 @@ async fn handle_open_instance_folder(
         )
     })?;
 
-    let mut dir = state.instances().game_dir(&instance.id);
-    if let Some(sub) = query.sub.as_deref()
-        && INSTANCE_SUBFOLDERS.contains(&sub)
-    {
-        dir = dir.join(sub);
-    }
+    let game_dir = state.instances().game_dir(&instance.id);
+    let dir = resolve_instance_folder(&game_dir, query.sub.as_deref()).map_err(|message| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": message })),
+        )
+    })?;
 
     std::fs::create_dir_all(&dir).map_err(|error| {
         (
@@ -340,6 +341,14 @@ async fn handle_open_instance_folder(
     })?;
 
     Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+fn resolve_instance_folder(game_dir: &FsPath, sub: Option<&str>) -> Result<PathBuf, &'static str> {
+    match sub {
+        None => Ok(game_dir.to_path_buf()),
+        Some(subfolder) if INSTANCE_SUBFOLDERS.contains(&subfolder) => Ok(game_dir.join(subfolder)),
+        Some(_) => Err("invalid instance folder"),
+    }
 }
 
 async fn handle_instance_resources(
@@ -684,6 +693,49 @@ fn dir_size(path: &FsPath) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn instance_folder_resolver_returns_root_when_subfolder_is_omitted() {
+        let game_dir = FsPath::new("/tmp/croopor-instance");
+
+        assert_eq!(
+            resolve_instance_folder(game_dir, None).expect("resolve root"),
+            game_dir
+        );
+    }
+
+    #[test]
+    fn instance_folder_resolver_accepts_allowed_subfolder() {
+        let game_dir = FsPath::new("/tmp/croopor-instance");
+
+        assert_eq!(
+            resolve_instance_folder(game_dir, Some("mods")).expect("resolve mods"),
+            game_dir.join("mods")
+        );
+    }
+
+    #[test]
+    fn instance_folder_resolver_rejects_unknown_subfolder() {
+        let game_dir = FsPath::new("/tmp/croopor-instance");
+
+        assert_eq!(
+            resolve_instance_folder(game_dir, Some("versions")),
+            Err("invalid instance folder")
+        );
+    }
+
+    #[test]
+    fn instance_folder_resolver_rejects_traversal_like_subfolders() {
+        let game_dir = FsPath::new("/tmp/croopor-instance");
+
+        for subfolder in ["..", "../mods", "mods/..", "mods/../logs", "mods\\..\\logs"] {
+            assert_eq!(
+                resolve_instance_folder(game_dir, Some(subfolder)),
+                Err("invalid instance folder"),
+                "{subfolder:?} should be rejected"
+            );
+        }
+    }
 
     #[test]
     fn resource_names_reject_path_traversal_hidden_and_control_names() {
