@@ -3,6 +3,7 @@ pub mod benchmark_suite_drivers;
 pub mod benchmark_suites;
 mod installs;
 pub mod launch_reports;
+pub mod performance_operations;
 mod sessions;
 
 use croopor_config::{ConfigStore, InstanceStore};
@@ -26,6 +27,7 @@ pub struct AppState {
     installs: Arc<InstallStore>,
     sessions: Arc<SessionStore>,
     benchmark_suite_drivers: Arc<benchmark_suite_drivers::BenchmarkSuiteDriverStore>,
+    performance_operations: Arc<performance_operations::PerformanceOperationStore>,
     performance: Arc<PerformanceManager>,
     library_dir: Arc<RwLock<Option<String>>>,
     frontend_dir: Arc<PathBuf>,
@@ -50,6 +52,9 @@ impl AppState {
                 init.config.paths(),
             ),
         );
+        let performance_operations = Arc::new(
+            performance_operations::PerformanceOperationStore::load_from_paths(init.config.paths()),
+        );
 
         Self {
             app_name: init.app_name,
@@ -60,6 +65,7 @@ impl AppState {
             installs: init.installs,
             sessions: init.sessions,
             benchmark_suite_drivers,
+            performance_operations,
             performance: init.performance,
             library_dir: Arc::new(RwLock::new(if library_dir.is_empty() {
                 None
@@ -98,6 +104,12 @@ impl AppState {
         &self,
     ) -> &Arc<benchmark_suite_drivers::BenchmarkSuiteDriverStore> {
         &self.benchmark_suite_drivers
+    }
+
+    pub fn performance_operations(
+        &self,
+    ) -> &Arc<performance_operations::PerformanceOperationStore> {
+        &self.performance_operations
     }
 
     pub fn installs(&self) -> &Arc<InstallStore> {

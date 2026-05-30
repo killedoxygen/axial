@@ -1,7 +1,10 @@
+use crate::state::performance_operations::{
+    PerformanceOperationConflict, PerformanceOperationStatus,
+};
 use crate::state::{AppState, DownloadProgress};
 use axum::{
     Json, Router,
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     routing::{get, post},
 };
@@ -12,11 +15,6 @@ use croopor_performance::{
     infer_loader_from_version_id, load_state, parse_mode,
 };
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::HashSet,
-    sync::{Mutex, OnceLock},
-    time::SystemTime,
-};
 
 #[derive(Debug, Deserialize)]
 struct PlanQuery {
@@ -87,6 +85,10 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/performance/plan", get(handle_plan))
         .route("/api/v1/performance/health", get(handle_health))
         .route("/api/v1/performance/install", post(handle_install))
+        .route(
+            "/api/v1/performance/operations/{id}",
+            get(handle_operation_status),
+        )
 }
 
 async fn handle_status(
@@ -214,6 +216,23 @@ async fn handle_install(
         .map(Json)
 }
 
+async fn handle_operation_status(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<PerformanceOperationStatus>, (StatusCode, Json<serde_json::Value>)> {
+    state
+        .performance_operations()
+        .get(&id)
+        .await
+        .map(Json)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "performance operation not found" })),
+            )
+        })
+}
+
 async fn execute_performance_operation(
     state: &AppState,
     operation: &PerformanceOperation,
@@ -297,14 +316,20 @@ async fn queue_performance_operation(
     state: AppState,
     operation: PerformanceOperation,
 ) -> Result<PerformanceInstallResponse, (StatusCode, Json<serde_json::Value>)> {
-    let active_guard = try_begin_queued_performance_operation(&operation.instance_id)?;
-    let install_id = generate_performance_install_id();
+    let status = state
+        .performance_operations()
+        .start(
+            operation.instance_id.clone(),
+            operation_action_name(operation.action).to_string(),
+        )
+        .await
+        .map_err(performance_operation_conflict)?;
+    let install_id = status.id.clone();
     state.installs().insert(install_id.clone()).await;
 
     let store = state.installs().clone();
     let install_id_task = install_id.clone();
     tokio::spawn(async move {
-        let _active_guard = active_guard;
         run_queued_performance_operation(state, operation, store, install_id_task).await;
     });
 
@@ -326,6 +351,10 @@ async fn run_queued_performance_operation(
     store: std::sync::Arc<crate::state::InstallStore>,
     install_id: String,
 ) {
+    state
+        .performance_operations()
+        .record_progress(&install_id, "queued")
+        .await;
     emit_performance_progress(
         &store,
         &install_id,
@@ -337,6 +366,10 @@ async fn run_queued_performance_operation(
         false,
     )
     .await;
+    state
+        .performance_operations()
+        .record_progress(&install_id, "planning")
+        .await;
     emit_performance_progress(
         &store,
         &install_id,
@@ -348,6 +381,10 @@ async fn run_queued_performance_operation(
         false,
     )
     .await;
+    state
+        .performance_operations()
+        .record_progress(&install_id, operation_progress_phase(operation.action))
+        .await;
     emit_performance_progress(
         &store,
         &install_id,
@@ -362,6 +399,10 @@ async fn run_queued_performance_operation(
 
     match execute_performance_operation(&state, &operation).await {
         Ok(response) => {
+            state
+                .performance_operations()
+                .record_complete(&install_id)
+                .await;
             emit_performance_progress(
                 &store,
                 &install_id,
@@ -375,6 +416,11 @@ async fn run_queued_performance_operation(
             .await;
         }
         Err(error) => {
+            let message = error_message(&error);
+            state
+                .performance_operations()
+                .record_failed(&install_id, &message)
+                .await;
             emit_performance_progress(
                 &store,
                 &install_id,
@@ -382,7 +428,7 @@ async fn run_queued_performance_operation(
                 4,
                 4,
                 None,
-                Some(error_message(&error)),
+                Some(message),
                 true,
             )
             .await;
@@ -429,6 +475,14 @@ fn operation_progress_label(action: PerformanceInstallAction) -> &'static str {
         PerformanceInstallAction::Install => "Applying managed performance files",
         PerformanceInstallAction::Remove => "Removing managed performance files",
         PerformanceInstallAction::Rollback => "Rolling back managed performance files",
+    }
+}
+
+fn operation_action_name(action: PerformanceInstallAction) -> &'static str {
+    match action {
+        PerformanceInstallAction::Install => "install",
+        PerformanceInstallAction::Remove => "remove",
+        PerformanceInstallAction::Rollback => "rollback",
     }
 }
 
@@ -586,57 +640,29 @@ fn performance_install_error(error: InstallError) -> (StatusCode, Json<serde_jso
     }
 }
 
-struct PerformanceOperationGuard {
-    instance_id: String,
-}
-
-impl Drop for PerformanceOperationGuard {
-    fn drop(&mut self) {
-        if let Ok(mut active) = active_performance_operations().lock() {
-            active.remove(&self.instance_id);
-        }
-    }
-}
-
-fn try_begin_queued_performance_operation(
-    instance_id: &str,
-) -> Result<PerformanceOperationGuard, (StatusCode, Json<serde_json::Value>)> {
-    let mut active = active_performance_operations().lock().map_err(|error| {
-        internal_error(format!("performance operation guard poisoned: {error}"))
-    })?;
-    if !active.insert(instance_id.to_string()) {
-        return Err((
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": "a performance operation is already queued for this instance"
-            })),
-        ));
-    }
-    Ok(PerformanceOperationGuard {
-        instance_id: instance_id.to_string(),
-    })
-}
-
-fn active_performance_operations() -> &'static Mutex<HashSet<String>> {
-    static ACTIVE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    ACTIVE.get_or_init(|| Mutex::new(HashSet::new()))
-}
-
-fn generate_performance_install_id() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|value| value.as_nanos())
-        .unwrap_or_default();
-    format!("performance-install-{nanos:032x}")
+fn performance_operation_conflict(
+    _error: PerformanceOperationConflict,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error": "a performance operation is already queued for this instance"
+        })),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::state::{AppStateInit, InstallStore, SessionStore};
+    use axum::{
+        body::{Body, to_bytes},
+        http::Request,
+    };
     use croopor_config::{AppPaths, ConfigStore, InstanceStore};
     use croopor_performance::PerformanceManager;
     use std::{fs, path::PathBuf, sync::Arc, time::Duration};
+    use tower::ServiceExt;
 
     #[tokio::test]
     async fn status_reports_bundled_rules_without_remote_refresh() {
@@ -940,7 +966,7 @@ mod tests {
         let Json(response) = handle_install(
             State(fixture.state.clone()),
             Json(InstallRequest {
-                instance_id: Some(instance_id),
+                instance_id: Some(instance_id.clone()),
                 game_version: None,
                 loader: None,
                 mode: None,
@@ -962,6 +988,16 @@ mod tests {
         let terminal = events.last().expect("terminal event");
         assert!(terminal.done);
         assert!(terminal.error.is_none());
+        let status = fixture
+            .state
+            .performance_operations()
+            .get(&install_id)
+            .await
+            .expect("durable operation status");
+        assert_eq!(status.instance_id, instance_id);
+        assert_eq!(status.action, "remove");
+        assert_eq!(status.state, "complete");
+        assert_eq!(status.error, None);
     }
 
     #[tokio::test]
@@ -993,14 +1029,30 @@ mod tests {
             terminal.error.as_deref(),
             Some("no performance rollback snapshot available")
         );
+        let status = fixture
+            .state
+            .performance_operations()
+            .get(&install_id)
+            .await
+            .expect("durable operation status");
+        assert_eq!(status.action, "rollback");
+        assert_eq!(status.state, "failed");
+        assert_eq!(
+            status.error.as_deref(),
+            Some("no performance rollback snapshot available")
+        );
     }
 
     #[tokio::test]
     async fn queued_operation_rejects_same_instance_overlap() {
         let fixture = TestFixture::new("queued-overlap");
         let instance_id = fixture.add_instance("Managed", "1.20.4-fabric");
-        let _guard =
-            try_begin_queued_performance_operation(&instance_id).expect("prelock instance");
+        fixture
+            .state
+            .performance_operations()
+            .start(instance_id.clone(), "remove".to_string())
+            .await
+            .expect("prelock instance");
 
         let error = handle_install(
             State(fixture.state.clone()),
@@ -1022,6 +1074,62 @@ mod tests {
             serde_json::json!({
                 "error": "a performance operation is already queued for this instance"
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn operation_status_route_returns_persisted_status() {
+        let fixture = TestFixture::new("operation-status-route");
+        let started = fixture
+            .state
+            .performance_operations()
+            .start("instance-a".to_string(), "install".to_string())
+            .await
+            .expect("operation starts");
+        fixture
+            .state
+            .performance_operations()
+            .record_progress(&started.id, "applying")
+            .await;
+
+        let response = router()
+            .with_state(fixture.state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/performance/operations/{}", started.id))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("route response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let response: PerformanceOperationStatus =
+            serde_json::from_slice(&body).expect("operation status json");
+
+        assert_eq!(response.id, started.id);
+        assert_eq!(response.instance_id, "instance-a");
+        assert_eq!(response.action, "install");
+        assert_eq!(response.state, "applying");
+    }
+
+    #[tokio::test]
+    async fn missing_operation_status_route_returns_json_error() {
+        let fixture = TestFixture::new("operation-status-missing");
+
+        let error = handle_operation_status(
+            State(fixture.state.clone()),
+            Path("performance-install-00000000000000000000000000000000".to_string()),
+        )
+        .await
+        .expect_err("missing operation should fail");
+
+        assert_eq!(error.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            error.1.0,
+            serde_json::json!({ "error": "performance operation not found" })
         );
     }
 
