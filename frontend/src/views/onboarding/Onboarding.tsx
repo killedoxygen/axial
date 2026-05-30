@@ -239,13 +239,17 @@ export function Onboarding(): JSX.Element | null {
 
   if (stage === 'name') {
     headline = 'What should Minecraft call you?';
+    subline = (
+      <p class="cp-ob-subline">
+        Croopor starts offline-first. Pick the local player name this launcher should use on this device.
+      </p>
+    );
     widget = (
       <div class="cp-ob-widget cp-ob-namefield">
         {/* Error and hint share one reserved slot above the input.
             They are mutually exclusive (error only when the typed
             name is invalid; hint only when valid). Placing them
-            above keeps the input visually adjacent to the sign-in
-            button below — tightens the name-field group. */}
+            above keeps the input and validation state visually grouped. */}
         <div class="cp-ob-feedback" data-state={showNameError ? 'error' : nameValid ? 'hint' : 'idle'}>
           {showNameError ? (
             <span class="cp-ob-feedback-error">{nameError}</span>
@@ -265,18 +269,6 @@ export function Onboarding(): JSX.Element | null {
           onFocus={() => setNameFocused(true)}
           onBlur={() => setNameFocused(false)}
         />
-        {/* Placeholder slot for future Microsoft-auth sign-in. Disabled on purpose;
-            when MSA lands, this becomes the primary path and the input the fallback. */}
-        <button class="cp-ob-msa" disabled type="button" aria-disabled="true" tabIndex={-1}>
-          <svg class="cp-ob-msa-mark" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
-            <rect x="0" y="0" width="7" height="7" fill="#f25022" />
-            <rect x="9" y="0" width="7" height="7" fill="#7fba00" />
-            <rect x="0" y="9" width="7" height="7" fill="#00a4ef" />
-            <rect x="9" y="9" width="7" height="7" fill="#ffb900" />
-          </svg>
-          <span class="cp-ob-msa-label">Sign in with your Minecraft account</span>
-          <span class="cp-ob-msa-soon">Coming soon</span>
-        </button>
       </div>
     );
   } else if (stage === 'memory') {

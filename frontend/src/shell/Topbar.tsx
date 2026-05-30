@@ -7,6 +7,7 @@ import { MusicWidget } from './MusicWidget';
 import { goBack, goForward, navigate, route } from '../ui-state';
 import { runningSessions, instances, launchState, installState } from '../store';
 import { windowStartDragging, windowToggleMaximize, hasNativeDesktopRuntime } from '../native';
+import { launchStageViewFrom } from '../launch-stages';
 
 function assertUnreachable(value: never): never {
   throw new Error(`Unhandled route: ${JSON.stringify(value)}`);
@@ -32,7 +33,6 @@ function crumbsFor(): { label: string; onClick?: () => void }[] {
       { label: 'Settings', onClick: () => navigate({ name: 'settings' }) },
       { label: 'Dev lab' },
     ];
-    case 'browse': return [{ label: 'Browse' }];
     case 'downloads': return [{ label: 'Downloads' }];
     case 'accounts': return [{ label: 'Accounts & skins' }];
     case 'settings': return [{ label: 'Settings' }];
@@ -46,8 +46,10 @@ function StatusPill(): JSX.Element {
   const sessions = runningSessions.value;
   const runIds = Object.keys(sessions);
   const inst = runIds.length > 0 ? instances.value.find(i => i.id === runIds[0]) : null;
+  const session = runIds.length > 0 ? sessions[runIds[0]] : null;
 
-  if (inst) {
+  if (inst && session) {
+    const label = session.stopping ? 'Stopping' : launchStageViewFrom(session.state)?.label || 'Playing';
     return (
       <button
         class="cp-status-pill cp-status-pill--running cp-nodrag"
@@ -55,7 +57,7 @@ function StatusPill(): JSX.Element {
         title="Jump to running instance"
       >
         <span class="cp-status-dot" />
-        Playing · {inst.name}
+        {label} · {inst.name}
       </button>
     );
   }
@@ -79,7 +81,7 @@ function StatusPill(): JSX.Element {
     return (
       <span class="cp-status-pill cp-status-pill--running cp-nodrag">
         <span class="cp-status-dot" />
-        Preparing {li?.name || 'launch'}…
+        {launch.label} · {li?.name || 'launch'}
       </span>
     );
   }

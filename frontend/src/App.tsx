@@ -5,7 +5,6 @@ import { InstancesView } from './views/instances/InstancesView';
 import { InstanceDetailView } from './views/instance/InstanceDetailView';
 import { CreateView } from './views/create/CreateView';
 import { DevLabView } from './views/dev-lab/DevLabView';
-import { BrowseView } from './views/browse/BrowseView';
 import { DownloadsView } from './views/downloads/DownloadsView';
 import { AccountsView } from './views/accounts/AccountsView';
 import { SettingsView } from './views/settings/SettingsView';
@@ -57,7 +56,6 @@ function CurrentView(): JSX.Element {
     case 'instance': return <InstanceDetailView id={r.id} />;
     case 'create': return <CreateView />;
     case 'dev-lab': return devMode.value ? <DevLabView /> : <SettingsView />;
-    case 'browse': return <BrowseView />;
     case 'downloads': return <DownloadsView />;
     case 'accounts': return <AccountsView />;
     case 'settings': return <SettingsView />;

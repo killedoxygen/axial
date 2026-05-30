@@ -39,7 +39,6 @@ function buildCommands(): Command[] {
     { id: 'jump:home', group: 'jump', icon: 'home', label: 'Home', perform: goto({ name: 'home' }) },
     { id: 'jump:instances', group: 'jump', icon: 'cube', label: 'Instances', perform: goto({ name: 'instances' }) },
     { id: 'jump:create', group: 'jump', icon: 'plus', label: 'New instance', hint: 'Ctrl N', perform: goto({ name: 'create' }) },
-    { id: 'jump:browse', group: 'jump', icon: 'compass', label: 'Browse', perform: goto({ name: 'browse' }) },
     { id: 'jump:downloads', group: 'jump', icon: 'download', label: 'Downloads', perform: goto({ name: 'downloads' }) },
     { id: 'jump:accounts', group: 'jump', icon: 'user', label: 'Accounts and skins', perform: goto({ name: 'accounts' }) },
     { id: 'jump:settings', group: 'jump', icon: 'settings', label: 'Settings', hint: 'Ctrl ,', perform: goto({ name: 'settings' }) },

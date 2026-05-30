@@ -3,6 +3,7 @@ import type {
   Instance, Version, Config, SystemInfo,
   RunningSession, InstallItem, Catalog, Page, ToastItem, UpdateInfo, InstanceLaunchDraft, LaunchNotice,
 } from './types';
+import type { LaunchStage } from './launch-stages';
 
 // ── Core data ──
 
@@ -44,7 +45,7 @@ export const installEventSource = signal<{ close(): void } | null>(null);
 
 export type LaunchState =
   | { status: 'idle' }
-  | { status: 'preparing'; instanceId: string; pct: number; label: string };
+  | { status: 'preparing'; instanceId: string; pct: number; label: string; stage?: LaunchStage };
 
 export const launchState = signal<LaunchState>({ status: 'idle' });
 export const runningSessions = signal<Record<string, RunningSession>>({});

@@ -96,18 +96,9 @@ export function PickStep({
             <span class="cp-cr-rail-glyph">
               {renderSourceGlyph(key)}
             </span>
+            <span class="cp-cr-rail-label">{LOADER_LABELS[key]}</span>
           </button>
         ))}
-        <div
-          class="cp-cr-rail-item is-soon"
-          aria-disabled="true"
-          data-label="Modpack"
-          data-tag="Modrinth · soon"
-        >
-          <span class="cp-cr-rail-glyph">
-            <Icon name="download" size={15} stroke={1.8} />
-          </span>
-        </div>
       </aside>
 
       <div class="cp-cr-vpane">

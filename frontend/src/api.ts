@@ -27,6 +27,14 @@ export function apiUrl(path: string): string {
   return `${API}${path.startsWith('/') ? path : `/${path}`}`;
 }
 
+export function apiResourceUrl(path: string): string {
+  const trimmed = path.trim();
+  if (/^[a-z][a-z\d+\-.]*:/i.test(trimmed) || trimmed.startsWith('//')) return trimmed;
+  if (trimmed === API_PATH) return API;
+  if (trimmed.startsWith(`${API_PATH}/`)) return apiUrl(trimmed.slice(API_PATH.length));
+  return apiUrl(trimmed);
+}
+
 export async function api(method: string, path: string, body?: unknown): Promise<any> {
   const opts: RequestInit = { method };
   if (body !== undefined) {

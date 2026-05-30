@@ -3,6 +3,7 @@ use croopor_minecraft::VersionEntry;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::io;
 use std::path::Path;
 use std::sync::RwLock;
 use thiserror::Error;
@@ -298,7 +299,7 @@ impl InstanceStore {
             return Err(error);
         }
 
-        if let Err(error) = self.initialize_instance_files(&instance.id, mc_dir) {
+        if let Err(error) = self.ensure_instance_layout(&instance.id, mc_dir) {
             inner.instances.retain(|stored| stored.id != instance.id);
             let rollback_result = self.persist_locked(&inner);
             let _ = fs::remove_dir_all(self.paths.instances_dir.join(&instance.id));
@@ -313,20 +314,117 @@ impl InstanceStore {
         Ok(instance)
     }
 
-    fn initialize_instance_files(
+    pub fn duplicate(
+        &self,
+        source_id: &str,
+        requested_name: Option<String>,
+        mc_dir: Option<&Path>,
+    ) -> Result<Instance, InstanceStoreError> {
+        let mut inner = self.inner.write().map_err(|_| {
+            InstanceStoreError::Read(std::io::Error::other("instance store lock poisoned"))
+        })?;
+        let source = inner
+            .instances
+            .iter()
+            .find(|instance| instance.id == source_id)
+            .cloned()
+            .ok_or_else(|| {
+                InstanceStoreError::Read(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "instance not found",
+                ))
+            })?;
+        let requested_name = requested_name
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty());
+        let name = match requested_name {
+            Some(name) => {
+                if inner.instances.iter().any(|instance| instance.name == name) {
+                    return Err(InstanceStoreError::Read(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "an instance with this name already exists",
+                    )));
+                }
+                name
+            }
+            None => duplicate_name_for(&source.name, &inner.instances),
+        };
+
+        let id = generate_id();
+        let art_seed = derive_art_seed(&id, &name, &source.version_id);
+        let instance = Instance {
+            id,
+            name,
+            version_id: source.version_id.clone(),
+            created_at: chrono::DateTime::<chrono::Utc>::from(std::time::SystemTime::now())
+                .to_rfc3339(),
+            last_played_at: String::new(),
+            art_seed,
+            art_preset: art_preset_for_seed(art_seed).to_string(),
+            max_memory_mb: source.max_memory_mb,
+            min_memory_mb: source.min_memory_mb,
+            java_path: source.java_path.clone(),
+            window_width: source.window_width,
+            window_height: source.window_height,
+            jvm_preset: source.jvm_preset.clone(),
+            performance_mode: source.performance_mode.clone(),
+            extra_jvm_args: source.extra_jvm_args.clone(),
+            icon: source.icon.clone(),
+            accent: source.accent.clone(),
+        };
+
+        inner.instances.push(instance.clone());
+        if let Err(error) = self.persist_locked(&inner) {
+            inner.instances.retain(|stored| stored.id != instance.id);
+            return Err(error);
+        }
+        drop(inner);
+
+        if let Err(error) = self
+            .ensure_instance_layout(source_id, mc_dir)
+            .and_then(|_| {
+                self.ensure_instance_layout(&instance.id, mc_dir)?;
+                copy_instance_files(&self.game_dir(source_id), &self.game_dir(&instance.id))
+            })
+        {
+            let mut inner = self.inner.write().map_err(|_| {
+                InstanceStoreError::Read(std::io::Error::other("instance store lock poisoned"))
+            })?;
+            inner.instances.retain(|stored| stored.id != instance.id);
+            let rollback_result = self.persist_locked(&inner);
+            let _ = fs::remove_dir_all(self.paths.instances_dir.join(&instance.id));
+            return Err(match rollback_result {
+                Ok(()) => InstanceStoreError::Read(error),
+                Err(rollback_error) => InstanceStoreError::Read(std::io::Error::other(format!(
+                    "failed to duplicate instance files: {error}; failed to roll back persisted instance: {rollback_error}"
+                ))),
+            });
+        }
+
+        Ok(instance)
+    }
+
+    pub fn ensure_instance_layout(
         &self,
         instance_id: &str,
         mc_dir: Option<&Path>,
     ) -> Result<(), std::io::Error> {
         let game_dir = self.paths.instances_dir.join(instance_id);
-        for subdir in ["saves", "mods", "resourcepacks", "shaderpacks", "config"] {
+        for subdir in [
+            "mods",
+            "saves",
+            "resourcepacks",
+            "shaderpacks",
+            "config",
+            "screenshots",
+            "logs",
+        ] {
             fs::create_dir_all(game_dir.join(subdir))?;
         }
 
         if let Some(mc_dir) = mc_dir {
-            let options_path = mc_dir.join("options.txt");
-            if let Ok(data) = fs::read(&options_path) {
-                let _ = fs::write(game_dir.join("options.txt"), data);
+            for file_name in ["options.txt", "servers.dat"] {
+                copy_shared_file_if_missing(mc_dir, &game_dir, file_name)?;
             }
         }
 
@@ -347,6 +445,77 @@ fn count_entries(path: &Path) -> usize {
     fs::read_dir(path)
         .map(|entries| entries.filter_map(Result::ok).count())
         .unwrap_or(0)
+}
+
+fn duplicate_name_for(source_name: &str, instances: &[Instance]) -> String {
+    let base = format!("{source_name} copy");
+    if !instances.iter().any(|instance| instance.name == base) {
+        return base;
+    }
+    for index in 2.. {
+        let candidate = format!("{base} {index}");
+        if !instances.iter().any(|instance| instance.name == candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("unbounded duplicate name search should always return");
+}
+
+fn copy_instance_files(source_dir: &Path, target_dir: &Path) -> io::Result<()> {
+    for dir_name in ["mods", "saves", "resourcepacks", "shaderpacks", "config"] {
+        copy_dir_contents(&source_dir.join(dir_name), &target_dir.join(dir_name))?;
+    }
+    for file_name in ["options.txt", "servers.dat"] {
+        let source = source_dir.join(file_name);
+        if source.is_file() {
+            fs::copy(source, target_dir.join(file_name))?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_dir_contents(source_dir: &Path, target_dir: &Path) -> io::Result<()> {
+    if !source_dir.is_dir() {
+        return Ok(());
+    }
+    fs::create_dir_all(target_dir)?;
+    for entry in fs::read_dir(source_dir)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let target = target_dir.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_contents(&entry.path(), &target)?;
+        } else if file_type.is_file() {
+            fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_shared_file_if_missing(
+    source_dir: &Path,
+    target_dir: &Path,
+    file_name: &str,
+) -> io::Result<()> {
+    let source = source_dir.join(file_name);
+    if !source.is_file() {
+        return Ok(());
+    }
+
+    let target = target_dir.join(file_name);
+    let mut input = fs::File::open(source)?;
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&target)
+    {
+        Ok(mut output) => {
+            io::copy(&mut input, &mut output)?;
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn generate_id() -> String {
@@ -490,6 +659,172 @@ mod tests {
                 .len(),
             0
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn add_and_ensure_create_layout_and_copy_shared_files_without_overwrite() {
+        let root = test_root("layout-ensure");
+        let paths = test_paths(&root);
+        let mc_dir = root.join("library");
+        fs::create_dir_all(&mc_dir).expect("create shared library dir");
+        fs::write(mc_dir.join("options.txt"), "shared options").expect("write options");
+        fs::write(mc_dir.join("servers.dat"), "shared servers").expect("write servers");
+
+        let store = InstanceStore {
+            paths: paths.clone(),
+            inner: RwLock::new(StoredInstances::default()),
+        };
+
+        let instance = store
+            .add(
+                "Test".to_string(),
+                "1.21.1".to_string(),
+                String::new(),
+                String::new(),
+                Some(&mc_dir),
+            )
+            .expect("add instance");
+        let game_dir = store.game_dir(&instance.id);
+
+        for subdir in [
+            "mods",
+            "saves",
+            "resourcepacks",
+            "shaderpacks",
+            "config",
+            "screenshots",
+            "logs",
+        ] {
+            assert!(game_dir.join(subdir).is_dir(), "{subdir} should exist");
+        }
+        assert_eq!(
+            fs::read_to_string(game_dir.join("options.txt")).expect("read copied options"),
+            "shared options"
+        );
+        assert_eq!(
+            fs::read_to_string(game_dir.join("servers.dat")).expect("read copied servers"),
+            "shared servers"
+        );
+
+        fs::write(game_dir.join("options.txt"), "local options").expect("write local options");
+        fs::write(game_dir.join("servers.dat"), "local servers").expect("write local servers");
+        fs::write(mc_dir.join("options.txt"), "changed options").expect("change shared options");
+        fs::write(mc_dir.join("servers.dat"), "changed servers").expect("change shared servers");
+
+        store
+            .ensure_instance_layout(&instance.id, Some(&mc_dir))
+            .expect("ensure layout");
+
+        assert_eq!(
+            fs::read_to_string(game_dir.join("options.txt")).expect("read local options"),
+            "local options"
+        );
+        assert_eq!(
+            fs::read_to_string(game_dir.join("servers.dat")).expect("read local servers"),
+            "local servers"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn duplicate_copies_settings_and_gameplay_files_without_runtime_history() {
+        let root = test_root("duplicate");
+        let paths = test_paths(&root);
+        let mc_dir = root.join("library");
+        fs::create_dir_all(&mc_dir).expect("create shared library dir");
+        let store = InstanceStore {
+            paths,
+            inner: RwLock::new(StoredInstances::default()),
+        };
+
+        let mut source = store
+            .add(
+                "Survival".to_string(),
+                "1.21.1".to_string(),
+                "grass".to_string(),
+                "green".to_string(),
+                Some(&mc_dir),
+            )
+            .expect("add source");
+        source.max_memory_mb = 6144;
+        source.min_memory_mb = 2048;
+        source.java_path = "/usr/bin/java".to_string();
+        source.window_width = 1280;
+        source.window_height = 720;
+        source.jvm_preset = "balanced".to_string();
+        source.performance_mode = "managed".to_string();
+        source.extra_jvm_args = "-Ddemo=true".to_string();
+        source.last_played_at = "2026-05-30T00:00:00Z".to_string();
+        store.update(source.clone()).expect("update source");
+
+        let source_dir = store.game_dir(&source.id);
+        fs::create_dir_all(source_dir.join("mods")).expect("create mods");
+        fs::create_dir_all(source_dir.join("saves").join("World")).expect("create world");
+        fs::create_dir_all(source_dir.join("config").join("nested")).expect("create config");
+        fs::write(source_dir.join("mods").join("sodium.jar"), "mod").expect("write mod");
+        fs::write(
+            source_dir.join("saves").join("World").join("level.dat"),
+            "world",
+        )
+        .expect("write world");
+        fs::write(
+            source_dir.join("config").join("nested").join("options.cfg"),
+            "config",
+        )
+        .expect("write config");
+        fs::write(source_dir.join("options.txt"), "local options").expect("write options");
+        fs::write(source_dir.join("servers.dat"), "local servers").expect("write servers");
+        fs::write(source_dir.join("logs").join("latest.log"), "log").expect("write log");
+
+        let copy = store
+            .duplicate(&source.id, None, Some(&mc_dir))
+            .expect("duplicate source");
+        let copy_dir = store.game_dir(&copy.id);
+
+        assert_eq!(copy.name, "Survival copy");
+        assert_eq!(copy.version_id, source.version_id);
+        assert_eq!(copy.max_memory_mb, source.max_memory_mb);
+        assert_eq!(copy.min_memory_mb, source.min_memory_mb);
+        assert_eq!(copy.java_path, source.java_path);
+        assert_eq!(copy.window_width, source.window_width);
+        assert_eq!(copy.window_height, source.window_height);
+        assert_eq!(copy.jvm_preset, source.jvm_preset);
+        assert_eq!(copy.performance_mode, source.performance_mode);
+        assert_eq!(copy.extra_jvm_args, source.extra_jvm_args);
+        assert_eq!(copy.icon, source.icon);
+        assert_eq!(copy.accent, source.accent);
+        assert!(copy.last_played_at.is_empty());
+        assert_eq!(
+            fs::read_to_string(copy_dir.join("mods").join("sodium.jar")).expect("read mod"),
+            "mod"
+        );
+        assert_eq!(
+            fs::read_to_string(copy_dir.join("saves").join("World").join("level.dat"))
+                .expect("read world"),
+            "world"
+        );
+        assert_eq!(
+            fs::read_to_string(copy_dir.join("config").join("nested").join("options.cfg"))
+                .expect("read config"),
+            "config"
+        );
+        assert_eq!(
+            fs::read_to_string(copy_dir.join("options.txt")).expect("read options"),
+            "local options"
+        );
+        assert_eq!(
+            fs::read_to_string(copy_dir.join("servers.dat")).expect("read servers"),
+            "local servers"
+        );
+        assert!(!copy_dir.join("logs").join("latest.log").exists());
+
+        let second = store
+            .duplicate(&source.id, None, Some(&mc_dir))
+            .expect("duplicate source again");
+        assert_eq!(second.name, "Survival copy 2");
 
         let _ = fs::remove_dir_all(root);
     }

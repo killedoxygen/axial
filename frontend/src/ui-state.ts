@@ -8,7 +8,6 @@ export type Route =
   | { name: 'instance'; id: string }
   | { name: 'create' }
   | { name: 'dev-lab' }
-  | { name: 'browse' }
   | { name: 'downloads' }
   | { name: 'accounts' }
   | { name: 'settings' };
@@ -56,7 +55,6 @@ function isRoute(value: unknown): value is Route {
     case 'instances':
     case 'create':
     case 'dev-lab':
-    case 'browse':
     case 'downloads':
     case 'accounts':
     case 'settings':

@@ -94,6 +94,10 @@ pub fn router() -> Router<AppState> {
                 .delete(handle_delete_instance),
         )
         .route(
+            "/api/v1/instances/{id}/duplicate",
+            post(handle_duplicate_instance),
+        )
+        .route(
             "/api/v1/instances/{id}/resources",
             get(handle_instance_resources),
         )
@@ -178,6 +182,37 @@ async fn handle_create_instance(
                 status,
                 Json(serde_json::json!({ "error": error.to_string() })),
             )
+        })
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct DuplicateInstanceRequest {
+    name: Option<String>,
+}
+
+async fn handle_duplicate_instance(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    payload: Option<Json<DuplicateInstanceRequest>>,
+) -> Result<Json<croopor_config::Instance>, (StatusCode, Json<serde_json::Value>)> {
+    let payload = payload.map(|Json(payload)| payload).unwrap_or_default();
+    let mc_dir = state.library_dir().map(PathBuf::from);
+    state
+        .instances()
+        .duplicate(&id, payload.name, mc_dir.as_deref())
+        .map(Json)
+        .map_err(|error| {
+            let message = error.to_string();
+            let status = if message.contains("not found") {
+                StatusCode::NOT_FOUND
+            } else if message.contains("already exists") {
+                StatusCode::CONFLICT
+            } else if message.contains("duplicate instance files") {
+                StatusCode::INTERNAL_SERVER_ERROR
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            (status, Json(serde_json::json!({ "error": message })))
         })
 }
 
@@ -644,4 +679,59 @@ fn dir_size(path: &FsPath) -> u64 {
         }
     }
     total
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resource_names_reject_path_traversal_hidden_and_control_names() {
+        for name in ["latest.log", "2026-05-30-1.log.gz", "debug.log"] {
+            assert!(is_safe_resource_name(name), "{name} should be accepted");
+        }
+
+        for name in [
+            "",
+            ".",
+            "..",
+            ".hidden.log",
+            "../latest.log",
+            "nested/latest.log",
+            "nested\\latest.log",
+            "bad\nname.log",
+        ] {
+            assert!(!is_safe_resource_name(name), "{name:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn log_scanner_returns_only_safe_instance_local_file_names() {
+        let root = std::env::temp_dir().join(format!(
+            "croopor-api-instance-logs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or_default()
+        ));
+        let logs_dir = root.join("logs");
+        fs::create_dir_all(&logs_dir).expect("create logs dir");
+        fs::write(logs_dir.join("latest.log"), "latest").expect("write latest");
+        fs::write(logs_dir.join("debug.log"), "debug").expect("write debug");
+        fs::write(logs_dir.join(".hidden.log"), "hidden").expect("write hidden");
+        fs::create_dir_all(logs_dir.join("nested")).expect("create nested dir");
+        fs::write(logs_dir.join("nested").join("nested.log"), "nested").expect("write nested");
+
+        let names = scan_instance_logs(&logs_dir)
+            .into_iter()
+            .map(|log| log.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec!["latest.log".to_string(), "debug.log".to_string()]
+        );
+        let _ = fs::remove_dir_all(root);
+    }
 }

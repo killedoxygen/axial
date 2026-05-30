@@ -10,6 +10,7 @@ import type {
   Instance, Version, Config, SystemInfo, Catalog,
   RunningSession, InstallItem, Page, LaunchNotice,
 } from './types';
+import { launchStageView, launchStageViewFrom, type LaunchStage } from './launch-stages';
 
 // ── Selection ──
 
@@ -61,10 +62,11 @@ export function setInstallEventSource(es: { close(): void } | null): void {
 // ── Launch state transitions ──
 
 export function startLaunch(instanceId: string): void {
-  launchState.value = { status: 'preparing', instanceId, pct: 8, label: 'Preparing launch' };
+  const stage = launchStageView('queued');
+  launchState.value = { status: 'preparing', instanceId, pct: stage.pct, label: stage.label, stage: stage.stage };
 }
 
-export function updateLaunchPrep(instanceId: string, pct: number, label: string): void {
+export function updateLaunchPrep(instanceId: string, pct: number, label: string, stage?: LaunchStage): void {
   const current = launchState.value;
   if (current.status !== 'preparing' || current.instanceId !== instanceId) return;
   launchState.value = {
@@ -72,6 +74,21 @@ export function updateLaunchPrep(instanceId: string, pct: number, label: string)
     instanceId,
     pct: Math.max(current.pct, Math.max(0, Math.min(100, pct))),
     label,
+    stage: stage ?? current.stage,
+  };
+}
+
+export function updateLaunchPrepStage(instanceId: string, backendState: string): void {
+  const current = launchState.value;
+  if (current.status !== 'preparing' || current.instanceId !== instanceId) return;
+  const view = launchStageViewFrom(backendState);
+  if (!view) return;
+  launchState.value = {
+    status: 'preparing',
+    instanceId,
+    pct: Math.max(current.pct, view.pct),
+    label: view.label,
+    stage: view.stage,
   };
 }
 

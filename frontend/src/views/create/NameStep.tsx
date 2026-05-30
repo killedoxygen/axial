@@ -30,6 +30,13 @@ type IdleCapableWindow = Window & {
   cancelIdleCallback?: (handle: IdleHandle) => void;
 };
 
+const COMPACT_JVM_HINTS: Record<JvmPreset, string> = {
+  '': 'Managed JVM.',
+  smooth: 'Steady frames.',
+  performance: 'Higher throughput.',
+  ultra_low_latency: 'Fewer hitches.',
+};
+
 function useDeferredFlag(): boolean {
   const [ready, setReady] = useState(false);
   useEffect(() => {
@@ -294,7 +301,9 @@ export function NameStep({
             <span class="cp-cr-profile-bar" data-bar="4" />
           </span>
           <span class="cp-cr-profile-label">{JVM_PRESET_LABELS[jvmPreset]}</span>
-          <span class="cp-cr-profile-sub">{JVM_PRESET_HINTS[jvmPreset]}</span>
+          <span class="cp-cr-profile-sub" title={JVM_PRESET_HINTS[jvmPreset]}>
+            {COMPACT_JVM_HINTS[jvmPreset]}
+          </span>
         </button>
       </div>
     </section>
