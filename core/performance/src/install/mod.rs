@@ -351,12 +351,12 @@ impl PerformanceManager {
             Ok(candidate) => match self.accept_remote_manifest(config_dir, candidate) {
                 Ok(()) => Ok(self.rules_status()),
                 Err(error) => {
-                    self.record_refresh_warning(format!("Remote rules refresh failed: {error}"));
+                    self.record_refresh_warning(remote_rules_refresh_warning("failed", &error));
                     Ok(self.rules_status())
                 }
             },
             Err(error) => {
-                self.record_refresh_warning(format!("Remote rules refresh rejected: {error}"));
+                self.record_refresh_warning(remote_rules_refresh_warning("rejected", &error));
                 Ok(self.rules_status())
             }
         }
@@ -1026,6 +1026,23 @@ fn normalize_remote_rules_url(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn remote_rules_refresh_warning(action: &str, error: &RulesRefreshError) -> String {
+    match error {
+        RulesRefreshError::Request(_) => {
+            format!("Remote rules refresh {action}: request failed; using previously active rules.")
+        }
+        RulesRefreshError::Cache(_) => format!(
+            "Remote rules refresh {action}: remote rules cache could not be persisted; using previously active rules."
+        ),
+        RulesRefreshError::Unconfigured
+        | RulesRefreshError::HttpStatus(_)
+        | RulesRefreshError::ResponseTooLarge
+        | RulesRefreshError::Parse(_)
+        | RulesRefreshError::Validation(_)
+        | RulesRefreshError::Signature(_) => format!("Remote rules refresh {action}: {error}"),
+    }
 }
 
 fn rules_client() -> reqwest::Client {
@@ -2152,6 +2169,91 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn remote_rules_refresh_request_failure_keeps_previous_rules_and_redacts_url() {
+        let root = test_root("remote-refresh-request-redaction");
+        let builtin = builtin_manifest().expect("builtin manifest");
+        let (public_key, _) = signed_metadata(&builtin);
+        let remote_base_url = spawn_closing_rules_server().await;
+        let remote_url =
+            format!("{remote_base_url}/private-feed/perf.json?api_token=secret-query-token");
+        let manager = PerformanceManager::new_with_config_dir_remote_url_and_public_key(
+            &root,
+            Some(remote_url.clone()),
+            Some(public_key),
+        )
+        .expect("performance manager");
+        let before = manager.rules_status();
+
+        let after = manager
+            .refresh_rules()
+            .await
+            .expect("refresh failure should expose status");
+        let warning = after.warnings.join("\n");
+
+        assert_eq!(after.rule_source, before.rule_source);
+        assert_eq!(after.rule_channel, before.rule_channel);
+        assert_eq!(after.generated_at, before.generated_at);
+        assert_eq!(after.validation, RulesValidation::Valid);
+        assert!(warning.contains("Remote rules refresh rejected: request failed"));
+        assert!(!warning.contains(&remote_url));
+        assert!(!warning.contains("127.0.0.1"));
+        assert!(!warning.contains("private-feed"));
+        assert!(!warning.contains("perf.json"));
+        assert!(!warning.contains("api_token"));
+        assert!(!warning.contains("secret-query-token"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn remote_rules_refresh_cache_failure_keeps_previous_rules_and_redacts_path() {
+        let root = test_root("remote-refresh-cache-path-secret");
+        let mut remote = builtin_manifest().expect("builtin manifest");
+        remote.generated_at = "2026-05-30T13:00:00Z".to_string();
+        let (public_key, signature) = signed_metadata(&remote);
+        let remote_url = spawn_remote_rules_server(remote, signature).await;
+        let manager = PerformanceManager::new_with_config_dir_remote_url_and_public_key(
+            &root,
+            Some(remote_url),
+            Some(public_key),
+        )
+        .expect("performance manager");
+        let before = manager.rules_status();
+        let cache_temp_path =
+            crate::rules_cache::rules_cache_path(&root).with_extension("json.tmp");
+        fs::create_dir_all(&cache_temp_path).expect("create blocking cache temp directory");
+
+        let after = manager
+            .refresh_rules()
+            .await
+            .expect("cache failure should expose status");
+        let warning = after.warnings.join("\n");
+        let synthetic = RulesRefreshError::Cache(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!(
+                "failed to persist {}",
+                root.join("local-path-secret/rules-cache.json").display()
+            ),
+        ));
+        let synthetic_warning = remote_rules_refresh_warning("failed", &synthetic);
+
+        assert_eq!(after.rule_source, before.rule_source);
+        assert_eq!(after.rule_channel, before.rule_channel);
+        assert_eq!(after.generated_at, before.generated_at);
+        assert_eq!(after.validation, RulesValidation::Valid);
+        assert!(
+            warning
+                .contains("Remote rules refresh failed: remote rules cache could not be persisted")
+        );
+        assert!(!warning.contains("remote-refresh-cache-path-secret"));
+        assert!(!warning.contains("rules-cache.json.tmp"));
+        assert!(!synthetic_warning.contains("local-path-secret"));
+        assert!(!synthetic_warning.contains("rules-cache.json"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn rejected_remote_refresh_keeps_previous_rules_and_exposes_warning() {
         let root = test_root("reject-remote-refresh");
@@ -2175,7 +2277,7 @@ mod tests {
                 },
             )
             .expect_err("invalid remote manifest should be rejected");
-        manager.record_refresh_warning(format!("Remote rules refresh rejected: {error}"));
+        manager.record_refresh_warning(remote_rules_refresh_warning("rejected", &error));
         let after = manager.rules_status();
 
         assert_eq!(after.rule_source, before.rule_source);
@@ -2318,6 +2420,65 @@ mod tests {
             None
         };
         spawn_modrinth_server_with_sha512(sha512).await
+    }
+
+    async fn spawn_closing_rules_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind closing rules test server");
+        let addr = listener.local_addr().expect("closing rules test addr");
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        format!("http://{addr}")
+    }
+
+    async fn spawn_remote_rules_server(
+        manifest: crate::types::Manifest,
+        signature: RulesSignatureMetadata,
+    ) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind remote rules test server");
+        let addr = listener.local_addr().expect("remote rules test addr");
+        let body = serde_json::to_vec(&manifest).expect("serialize remote manifest");
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = Vec::new();
+            let mut buf = [0_u8; 1024];
+            loop {
+                let Ok(read) = stream.read(&mut buf).await else {
+                    return;
+                };
+                if read == 0 {
+                    return;
+                }
+                request.extend_from_slice(&buf[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+                if request.len() > 8192 {
+                    return;
+                }
+            }
+
+            let key_id = signature.key_id.unwrap_or_default();
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n{}: {}\r\n{}: {}\r\nconnection: close\r\n\r\n",
+                body.len(),
+                RULES_SIGNATURE_HEADER,
+                signature.signature,
+                RULES_KEY_ID_HEADER,
+                key_id
+            );
+            if stream.write_all(headers.as_bytes()).await.is_err() {
+                return;
+            }
+            let _ = stream.write_all(&body).await;
+        });
+        format!("http://{addr}/remote-rules/performance.json")
     }
 
     #[derive(Clone, Copy)]
