@@ -276,18 +276,25 @@ function guardianOwnsLaunchOutcome(
   healing: LaunchHealingSummary | undefined,
 ): boolean {
   if (!guardian) return false;
-  if (guardian.decision === 'blocked' && guardianHasAuthoredDetails(guardian)) return true;
+  if (guardianHasActionableAuthoredDetails(guardian)) return true;
   if (guardian.decision !== 'intervened') return false;
   if (!healing) return true;
   return !healing.failure_class && !healing.retry_count;
 }
 
 function guardianHasAuthoredDetails(guardian: GuardianSummary | undefined): boolean {
-  return Boolean(guardian?.details && guardian.details.length > 0);
+  return Boolean(guardian?.details?.some((detail) => detail.trim()));
+}
+
+function guardianHasActionableAuthoredDetails(guardian: GuardianSummary | undefined): boolean {
+  return Boolean(
+    guardianHasAuthoredDetails(guardian)
+    && (guardian?.decision === 'blocked' || guardian?.decision === 'warned' || guardian?.decision === 'intervened'),
+  );
 }
 
 function guardianOwnsLeadDetail(guardian: GuardianSummary | undefined): boolean {
-  return Boolean(guardian?.decision === 'blocked' && guardianHasAuthoredDetails(guardian));
+  return guardianHasActionableAuthoredDetails(guardian);
 }
 
 function launchOutcomeDetails(

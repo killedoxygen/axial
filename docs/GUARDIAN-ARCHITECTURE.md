@@ -201,7 +201,7 @@ Current launcher behavior:
 - Guardian `details` are preferred over frontend-synthesized intervention/guidance copy
 - startup `stalled` and pre-startup `exited` observations keep session plumbing as fact collection, but the terminal blocked summary and user guidance are Guardian-authored before launch failure status is emitted
 - `guidance` and `interventions` remain serialized as current bounded diagnostics
-- Healing remains supporting detail for runtime-adjustment specifics and retry/fallback context
+- Healing remains supporting detail for runtime-adjustment specifics and retry/fallback context when Guardian has not already authored actionable `blocked`, `warned`, or `intervened` notice details
 - live launch stage records preserve bounded unique Guardian `details` for `warned`, `intervened`, and `blocked` status payloads before appending Healing warnings without duplicates; Healing `fallback_applied` remains the only source of stage fallback reasons
 - normal frontend launches do not run a separate pre-launch memory-pressure confirmation; backend preparation selects effective memory, Guardian owns memory warnings, and successful launch responses carry the selected `max_memory_mb` and `min_memory_mb`
 
