@@ -20,9 +20,11 @@ async fn main() {
     let paths = AppPaths::detect();
     let config_startup =
         ConfigStore::load_for_startup(paths.clone()).expect("load config store for startup");
-    let startup_warnings = config_startup.warnings;
+    let instance_startup = InstanceStore::load_for_startup(paths.clone());
+    let mut startup_warnings = config_startup.warnings;
+    startup_warnings.extend(instance_startup.warnings);
     let config = Arc::new(config_startup.store);
-    let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instance store"));
+    let instances = Arc::new(instance_startup.store);
     let installs = Arc::new(InstallStore::new());
     let sessions = Arc::new(SessionStore::new());
     let performance = Arc::new(

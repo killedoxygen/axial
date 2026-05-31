@@ -70,6 +70,45 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn status_includes_instance_registry_startup_warning_and_remains_ok() {
+        let root = test_root("status-instance-startup-warning");
+        let paths = test_paths(&root);
+        fs::create_dir_all(&paths.config_dir).expect("create config dir");
+        fs::write(&paths.instances_file, "{not valid json").expect("write malformed registry");
+
+        let config_startup =
+            ConfigStore::load_for_startup(paths.clone()).expect("load config for startup");
+        let instance_startup = InstanceStore::load_for_startup(paths.clone());
+        let mut startup_warnings = config_startup.warnings;
+        startup_warnings.extend(instance_startup.warnings);
+        let state = AppState::new(AppStateInit {
+            app_name: "Croopor".to_string(),
+            version: "test".to_string(),
+            config: Arc::new(config_startup.store),
+            instances: Arc::new(instance_startup.store),
+            installs: Arc::new(InstallStore::new()),
+            sessions: Arc::new(SessionStore::new()),
+            performance: Arc::new(PerformanceManager::new().expect("performance manager")),
+            startup_warnings,
+            frontend_dir: root.join("frontend"),
+        });
+
+        let Json(response) = handle_status(State(state)).await;
+
+        assert_eq!(response.status, "ok");
+        assert_eq!(response.warnings.len(), 1);
+        assert_eq!(
+            response.warnings[0],
+            "Croopor could not load the instance list, so it started with an empty list. Check app data permissions or restore the instance registry."
+        );
+        assert!(!response.warnings[0].contains(&root.to_string_lossy().to_string()));
+        assert!(!response.warnings[0].contains("expected"));
+        assert!(!response.warnings[0].contains("line"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn test_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "croopor-api-status-{name}-{}-{}",

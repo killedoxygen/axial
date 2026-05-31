@@ -16,9 +16,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let paths = AppPaths::detect();
     let config_startup = ConfigStore::load_for_startup(paths.clone())?;
-    let startup_warnings = config_startup.warnings;
+    let instance_startup = InstanceStore::load_for_startup(paths.clone());
+    let mut startup_warnings = config_startup.warnings;
+    startup_warnings.extend(instance_startup.warnings);
     let config = Arc::new(config_startup.store);
-    let instances = Arc::new(InstanceStore::load_from(paths.clone())?);
+    let instances = Arc::new(instance_startup.store);
     let installs = Arc::new(InstallStore::new());
     let sessions = Arc::new(SessionStore::new());
     let performance = Arc::new(PerformanceManager::new_with_config_dir(&paths.config_dir)?);

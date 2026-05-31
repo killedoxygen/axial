@@ -83,6 +83,13 @@ pub struct InstanceStore {
     inner: RwLock<StoredInstances>,
 }
 
+pub struct InstanceStoreStartup {
+    pub store: InstanceStore,
+    pub warnings: Vec<String>,
+}
+
+const INSTANCE_REGISTRY_STARTUP_WARNING: &str = "Croopor could not load the instance list, so it started with an empty list. Check app data permissions or restore the instance registry.";
+
 #[derive(Debug, Error)]
 pub enum InstanceStoreError {
     #[error("failed to read instances: {0}")]
@@ -105,10 +112,38 @@ impl InstanceStore {
             Err(error) => return Err(InstanceStoreError::Read(error)),
         };
 
-        Ok(Self {
+        Ok(Self::from_inner(paths, inner))
+    }
+
+    pub fn load_for_startup(paths: AppPaths) -> InstanceStoreStartup {
+        let (inner, warnings) = match fs::read_to_string(&paths.instances_file) {
+            Ok(data) => match serde_json::from_str::<StoredInstances>(&data) {
+                Ok(inner) => (inner, Vec::new()),
+                Err(_) => (
+                    StoredInstances::default(),
+                    vec![INSTANCE_REGISTRY_STARTUP_WARNING.to_string()],
+                ),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                (StoredInstances::default(), Vec::new())
+            }
+            Err(_) => (
+                StoredInstances::default(),
+                vec![INSTANCE_REGISTRY_STARTUP_WARNING.to_string()],
+            ),
+        };
+
+        InstanceStoreStartup {
+            store: Self::from_inner(paths, inner),
+            warnings,
+        }
+    }
+
+    fn from_inner(paths: AppPaths, inner: StoredInstances) -> Self {
+        Self {
             paths,
             inner: RwLock::new(inner),
-        })
+        }
     }
 
     pub fn list(&self) -> Vec<Instance> {
@@ -597,6 +632,68 @@ mod tests {
                 *preset
             );
         }
+    }
+
+    #[test]
+    fn load_for_startup_uses_empty_store_and_warning_for_malformed_registry_without_rewriting() {
+        let root = test_root("startup-malformed-registry");
+        let paths = test_paths(&root);
+        fs::create_dir_all(&paths.config_dir).expect("create config dir");
+        let malformed = "{not valid json";
+        fs::write(&paths.instances_file, malformed).expect("write malformed registry");
+
+        let startup = InstanceStore::load_for_startup(paths.clone());
+
+        assert!(startup.store.list().is_empty());
+        assert_eq!(
+            startup.warnings,
+            vec![super::INSTANCE_REGISTRY_STARTUP_WARNING.to_string()]
+        );
+        assert_eq!(
+            fs::read_to_string(&paths.instances_file).expect("read registry"),
+            malformed
+        );
+        assert!(matches!(
+            InstanceStore::load_from(paths.clone()),
+            Err(super::InstanceStoreError::Parse(_))
+        ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_for_startup_uses_empty_store_without_warning_when_registry_is_missing() {
+        let root = test_root("startup-missing-registry");
+        let paths = test_paths(&root);
+
+        let startup = InstanceStore::load_for_startup(paths.clone());
+
+        assert!(startup.store.list().is_empty());
+        assert!(startup.warnings.is_empty());
+        assert!(!paths.instances_file.exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_for_startup_uses_empty_store_and_warning_for_registry_read_error() {
+        let root = test_root("startup-registry-read-error");
+        let paths = test_paths(&root);
+        fs::create_dir_all(&paths.instances_file).expect("create registry path as directory");
+
+        let startup = InstanceStore::load_for_startup(paths.clone());
+
+        assert!(startup.store.list().is_empty());
+        assert_eq!(
+            startup.warnings,
+            vec![super::INSTANCE_REGISTRY_STARTUP_WARNING.to_string()]
+        );
+        assert!(matches!(
+            InstanceStore::load_from(paths.clone()),
+            Err(super::InstanceStoreError::Read(_))
+        ));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
