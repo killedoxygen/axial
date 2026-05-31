@@ -392,9 +392,9 @@
 }
 @media (max-width: 1120px) {
   .cp-settings-proof-row {
-    grid-template-columns: minmax(160px, 1fr) minmax(140px, 220px) auto;
+    grid-template-columns: minmax(0, 1fr) auto;
     align-items: start;
-    gap: 5px 12px;
+    gap: 6px 10px;
   }
   .cp-settings-proof-main {
     grid-column: 1;
@@ -402,17 +402,16 @@
   }
   .cp-settings-proof-evidence {
     grid-column: 1 / -1;
-    padding-left: 0;
+    grid-row: 3;
   }
   .cp-settings-proof-compare {
-    grid-column: 2;
-    grid-row: 1;
+    grid-column: 1 / -1;
+    grid-row: 2;
     max-width: 100%;
+    justify-self: start;
+    text-align: left;
   }
-  .cp-settings-proof-action {
-    grid-column: 3;
-    grid-row: 1;
-  }
+  .cp-settings-proof-action { grid-column: 2; grid-row: 1; }
 }
 
 .cp-settings-benchmark-matrix {
