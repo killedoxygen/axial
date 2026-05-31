@@ -12,7 +12,8 @@
   flex-direction: column;
 }
 .cp-instance-page--overview {
-  padding-bottom: 70px;
+  --cp-instance-bottom-reserved-space: 104px;
+  padding-bottom: var(--cp-instance-bottom-reserved-space);
 }
 
 /* ─── Cover strip — atmospheric banner that dissolves into the page bg
@@ -1369,7 +1370,8 @@
     gap: 12px;
   }
   .cp-instance-page--overview {
-    padding-bottom: 0;
+    --cp-instance-bottom-reserved-space: 0px;
+    padding-bottom: var(--cp-instance-bottom-reserved-space);
   }
   .cp-instance-bottom {
     position: static;
