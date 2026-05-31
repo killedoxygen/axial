@@ -46,9 +46,9 @@ async function openInstanceFolder(id: string, sub?: string): Promise<void> {
   try {
     const suffix = sub ? `?sub=${encodeURIComponent(sub)}` : '';
     const res: any = await api('POST', `/instances/${encodeURIComponent(id)}/open-folder${suffix}`);
-    if (res?.error) toast(`Failed: ${res.error}`, 'error');
+    if (res?.error) toast(`Could not open the instance folder: ${res.error}`, 'error');
   } catch (err) {
-    toast(`Failed: ${errMessage(err)}`, 'error');
+    toast(`Could not open the instance folder: ${errMessage(err)}`, 'error');
   }
 }
 
@@ -62,7 +62,7 @@ async function renameInstance(inst: EnrichedInstance): Promise<void> {
     updateInstanceInList(res);
     toast('Renamed');
   } catch (err) {
-    toast(`Failed: ${errMessage(err)}`, 'error');
+    toast(`Could not rename the instance: ${errMessage(err)}`, 'error');
   }
 }
 
@@ -73,7 +73,7 @@ async function duplicateInstance(inst: EnrichedInstance): Promise<void> {
     addInstance(res);
     toast('Duplicated');
   } catch (err) {
-    toast(`Failed: ${errMessage(err)}`, 'error');
+    toast(`Could not duplicate the instance: ${errMessage(err)}`, 'error');
   }
 }
 
@@ -96,7 +96,7 @@ async function deleteInstanceFlow(inst: EnrichedInstance, onDone?: () => void): 
     toast(keepFiles ? 'Removed from launcher; files kept on disk' : 'Instance deleted');
     onDone?.();
   } catch (err) {
-    toast(`Failed: ${errMessage(err)}`, 'error');
+    toast(`Could not remove the instance: ${errMessage(err)}`, 'error');
   }
 }
 
