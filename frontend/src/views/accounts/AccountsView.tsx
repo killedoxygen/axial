@@ -61,6 +61,7 @@ interface AuthStatus {
   msa_authenticated?: boolean;
   msa_provider?: string | null;
   msa_token_expires_in?: number | null;
+  msa_refresh_available: boolean;
 }
 
 type AuthStatusRecord = AuthStatus & MinecraftAuthReadiness;
@@ -474,6 +475,7 @@ function authStatusResponse(value: unknown): AuthStatusRecord | null {
     msa_authenticated: typeof value.msa_authenticated === 'boolean' ? value.msa_authenticated : undefined,
     msa_provider: typeof value.msa_provider === 'string' ? value.msa_provider : value.msa_provider === null ? null : undefined,
     msa_token_expires_in: value.msa_token_expires_in === null ? null : maybeNumber(value.msa_token_expires_in),
+    msa_refresh_available: value.msa_refresh_available === true,
     ...minecraftReadiness(value),
   };
 }
@@ -522,6 +524,10 @@ function loginErrorMessage(value: unknown): string {
 
 function logoutErrorMessage(value: unknown): string {
   return apiErrorMessage(value, 'Could not clear Microsoft sign-in.');
+}
+
+function authRefreshErrorMessage(value: unknown): string {
+  return apiErrorMessage(value, 'Could not refresh Microsoft sign-in. Re-verify with Microsoft or use Offline.');
 }
 
 function configErrorMessage(value: unknown): string {
@@ -698,7 +704,7 @@ function launchAuthModeCopy(
     return {
       tone: 'ok',
       icon: 'check-circle',
-      text: 'Online is selected and the backend reports launch credentials ready. They are volatile: Croopor does not persist or refresh them yet.',
+      text: 'Online is selected and the backend reports launch credentials ready. Croopor can refresh online credentials when secure Microsoft auth is available.',
     };
   }
 
@@ -706,7 +712,7 @@ function launchAuthModeCopy(
     tone: 'warn',
     icon: 'alert',
     text: status.login_available
-      ? 'Online is selected, but launch credentials are missing or expired. Re-verify with Microsoft, or switch to Offline.'
+      ? 'Online is selected, but launch credentials are missing or expired. Refresh if available, re-verify with Microsoft, or switch to Offline.'
       : 'Online is selected, but launch credentials are missing or expired. Sign-in is unavailable right now; switch to Offline.',
   };
 }
@@ -747,7 +753,7 @@ function AuthModeControl({
       setMessage({
         tone: 'ok',
         text: nextMode === 'online'
-          ? 'Online launch mode saved. Credentials are volatile and are not persisted or refreshed yet.'
+          ? 'Online launch mode saved. Croopor can refresh online credentials when secure Microsoft auth is available.'
           : 'Offline launch mode saved. Offline remains the reliable default.',
       });
       onSaved();
@@ -809,7 +815,7 @@ function AuthModeControl({
           icon="globe"
           title={savingMode === 'online' ? 'Saving Online' : 'Online'}
           description={onlineSelectable
-            ? 'Uses the verified Minecraft profile while these volatile credentials are valid.'
+            ? 'Uses the verified Minecraft profile while these credentials are valid.'
             : 'Unavailable until sign-in verifies a Java-owning Minecraft profile.'}
           onClick={() => void saveMode('online')}
           disabled={savingMode !== null || (!onlineSelectable && savedMode !== 'online')}
@@ -845,12 +851,21 @@ function AuthModeControl({
 function pollSuccessMessage(poll: AuthPollAuthenticatedRecord): string {
   const profileName = poll.minecraft_profile?.name;
   if (poll.minecraft_profile_ready && poll.minecraft_ownership_verified) {
-    return `${profileName || 'Minecraft profile'} was verified. Online launch mode can be selected while these volatile credentials remain valid.`;
+    return `${profileName || 'Minecraft profile'} was verified. Online launch mode can be selected while these credentials remain valid. Croopor can refresh them when secure Microsoft auth is available.`;
   }
   if (poll.minecraft_profile_ready) {
     return `${profileName || 'Minecraft profile'} was found, but ownership was not verified. Offline launch mode remains available.`;
   }
   return 'Microsoft sign-in is active, but Minecraft profile verification is not complete. Offline launch mode remains available.';
+}
+
+function authRefreshSuccessMessage(value: unknown): string {
+  const readiness = isRecord(value) ? minecraftReadiness(value) : {};
+  const profileName = readiness.minecraft_profile?.name;
+  if (readiness.minecraft_profile_ready && readiness.minecraft_ownership_verified) {
+    return `${profileName || 'Minecraft profile'} was refreshed. Online launch mode can use it while the refreshed credentials remain valid.`;
+  }
+  return 'Microsoft sign-in refresh completed, but Minecraft profile readiness is still not complete. Re-verify or use Offline if Online remains unavailable.';
 }
 
 function MinecraftProfileReadiness({ status }: { status: AuthStatusRecord }): JSX.Element | null {
@@ -909,7 +924,7 @@ function MinecraftProfileReadiness({ status }: { status: AuthStatusRecord }): JS
         fontSize: 12,
         lineHeight: 1.45,
       }}>
-        Online launch mode can use this profile only while Online is selected and these restart-volatile credentials are inside the reported expiry window. Croopor does not persist or refresh them yet.
+        Online launch mode can use this profile only while Online is selected and these credentials are inside the reported expiry window. Croopor can refresh them when secure Microsoft auth is available; otherwise re-verify with device code or use Offline.
       </div>
       <div style={{
         display: 'grid',
@@ -1079,6 +1094,9 @@ function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Elem
   const [loginSuccess, setLoginSuccess] = useState<string | null>(null);
   const [logoutBusy, setLogoutBusy] = useState(false);
   const [logoutError, setLogoutError] = useState<string | null>(null);
+  const [refreshBusy, setRefreshBusy] = useState(false);
+  const [refreshError, setRefreshError] = useState<string | null>(null);
+  const [refreshSuccess, setRefreshSuccess] = useState<string | null>(null);
   const statusLabel = state === 'ready' && status
     ? status.mode === 'offline' ? 'Offline' : status.mode
     : state === 'loading' ? 'Loading' : 'Unavailable';
@@ -1092,6 +1110,9 @@ function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Elem
     setLoginSuccess(null);
     setLogoutBusy(false);
     setLogoutError(null);
+    setRefreshBusy(false);
+    setRefreshError(null);
+    setRefreshSuccess(null);
   }, [savedUsername]);
 
   useEffect(() => {
@@ -1145,12 +1166,14 @@ function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Elem
   }, [login, refreshStatus]);
 
   const startLogin = async (): Promise<void> => {
-    if (loginBusy) return;
+    if (loginBusy || logoutBusy || refreshBusy) return;
     setLoginBusy(true);
     setLogin(null);
     setLoginError(null);
     setLogoutError(null);
     setLoginSuccess(null);
+    setRefreshError(null);
+    setRefreshSuccess(null);
     setPollHint(null);
     try {
       const response = await api('POST', '/auth/login');
@@ -1170,13 +1193,15 @@ function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Elem
   };
 
   const logout = async (): Promise<void> => {
-    if (logoutBusy) return;
+    if (logoutBusy || loginBusy || refreshBusy) return;
     setLogoutBusy(true);
     setLogin(null);
     setPollHint(null);
     setLoginError(null);
     setLogoutError(null);
     setLoginSuccess(null);
+    setRefreshError(null);
+    setRefreshSuccess(null);
     try {
       const response = await api('POST', '/auth/logout');
       if (typeof response === 'object' && response !== null && typeof response.error === 'string') {
@@ -1189,6 +1214,35 @@ function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Elem
     } finally {
       refreshStatus();
       setLogoutBusy(false);
+    }
+  };
+
+  const refreshAuth = async (): Promise<void> => {
+    if (refreshBusy || loginBusy || logoutBusy || login) return;
+    setRefreshBusy(true);
+    setLogin(null);
+    setPollHint(null);
+    setLoginError(null);
+    setLogoutError(null);
+    setLoginSuccess(null);
+    setRefreshError(null);
+    setRefreshSuccess(null);
+    try {
+      const response = await api('POST', '/auth/refresh');
+      if (isRecord(response) && typeof response.error === 'string') {
+        setRefreshError(authRefreshErrorMessage(response));
+        return;
+      }
+      if (!isRecord(response) || response.status !== 'refreshed') {
+        setRefreshError('Microsoft sign-in refresh returned an unexpected response. Re-verify with Microsoft or use Offline.');
+        return;
+      }
+      setRefreshSuccess(authRefreshSuccessMessage(response));
+    } catch {
+      setRefreshError('Could not reach the local backend to refresh Microsoft sign-in.');
+    } finally {
+      refreshStatus();
+      setRefreshBusy(false);
     }
   };
 
@@ -1205,22 +1259,29 @@ function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Elem
     : 'offline';
   const onlineSelectable = status ? statusCanSelectOnline(status) : false;
   const effectiveModeLabel = status?.mode === 'online' ? 'online' : 'offline';
+  const refreshAvailable = Boolean(status?.login_available && status?.msa_refresh_available);
   const statusCopy = msaActive
     ? minecraftVerified
-      ? `Microsoft sign-in and Minecraft profile are verified. Croopor launches as ${status?.username} when Online is selected and these restart-volatile credentials remain inside their expiry windows.`
+      ? `Microsoft sign-in and Minecraft profile are verified. Croopor launches as ${status?.username} when Online is selected and these credentials remain inside their expiry windows.`
       : minecraftReadinessReported
-        ? `Microsoft sign-in is active, but Minecraft profile ownership is not ready. Re-verify to replace volatile launch credentials, or switch to Offline.`
+        ? `Microsoft sign-in is active, but Minecraft profile ownership is not ready. Refresh if available, re-verify with device code, or switch to Offline.`
         : `Microsoft sign-in is active. Online launch still needs Minecraft profile and ownership readiness; re-verify or use Offline.`
     : `Croopor is using ${status?.username} as the current ${effectiveModeLabel} identity. Online launch credentials are ${status?.online_mode_ready ? 'reported ready by the backend' : 'not ready'}.`;
   const actionGuidance = msaActive
     ? status?.login_available
-      ? 'Re-verifying starts a new Microsoft device-code sign-in and replaces the current volatile launch credentials. It is not a persistent refresh.'
-      : 'Logout clears only volatile Microsoft state. Re-verification is unavailable right now.'
-    : 'Microsoft sign-in prepares Online launch mode. It does not switch launch mode by itself.';
+      ? refreshAvailable
+        ? "Refresh uses Croopor's securely stored Microsoft auth snapshot when available. Re-verify starts a new device-code sign-in."
+        : 'Re-verify starts a new Microsoft device-code sign-in. Use it when refresh is unavailable or rejected.'
+      : 'Logout clears Microsoft sign-in state. Re-verification is unavailable right now.'
+    : refreshAvailable
+      ? "Refresh uses Croopor's securely stored Microsoft auth snapshot when available. Device-code sign-in remains available if refresh is rejected."
+      : 'Microsoft sign-in prepares Online launch mode. It does not switch launch mode by itself.';
   const readinessGuidance = state === 'ready' && status
     ? selectedAuthMode === 'online' && !onlineSelectable
       ? status.login_available
-        ? `${status.login_reason}. Online is selected, but readiness is missing or expired. Re-verify with Microsoft, or switch to Offline.`
+        ? refreshAvailable
+          ? `${status.login_reason}. Online is selected, but readiness is missing or expired. Refresh, re-verify with device code, or switch to Offline.`
+          : `${status.login_reason}. Online is selected, but readiness is missing or expired. Re-verify with device code, or switch to Offline.`
         : `${status.login_reason}. Online is selected, but readiness is missing or expired and sign-in is unavailable. Switch to Offline.`
       : `${status.login_reason}. Offline launches remain available for singleplayer and offline-mode servers.`
     : 'Microsoft sign-in status will appear here when the backend is reachable.';
@@ -1235,6 +1296,7 @@ function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Elem
             <Pill tone={statusTone} icon="user">{statusLabel}</Pill>
             {msaActive && <Pill tone="ok" icon="check-circle">Microsoft active</Pill>}
             {minecraftVerified && <Pill tone="ok" icon="shield-check">Minecraft verified</Pill>}
+            {refreshAvailable && <Pill tone="info" icon="refresh">Refresh available</Pill>}
             {msaActive && (
               <Pill tone={expiryWindowTone(status?.msa_token_expires_in)} icon="clock">
                 {compactExpiryWindow('MS', status?.msa_token_expires_in)}
@@ -1266,6 +1328,12 @@ function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Elem
               <ProfileMetaValue label="UUID" value={shortenUuid(status.uuid)} />
               <ProfileMetaValue label="Skin" value={status.skin_source || 'default'} />
               <ProfileMetaValue label="Login" value={status.login_available ? 'Available' : 'Unavailable'} />
+              <ProfileMetaValue
+                label="Refresh"
+                value={status.msa_refresh_available
+                  ? status.login_available ? 'Available' : 'Sign-in unavailable'
+                  : 'Unavailable'}
+              />
               <ProfileMetaValue label="Microsoft" value={msaActive ? 'Active' : 'Inactive'} />
               {msaActive && (
                 <ProfileMetaValue label="MS window" value={expiryWindowValue(status.msa_token_expires_in)} />
@@ -1281,6 +1349,17 @@ function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Elem
               gap: 10,
               flexWrap: 'wrap',
             }}>
+              {refreshAvailable && (
+                <Button
+                  variant="secondary"
+                  icon="refresh"
+                  onClick={() => void refreshAuth()}
+                  disabled={refreshBusy || loginBusy || logoutBusy || Boolean(login)}
+                  sound="affirm"
+                >
+                  {refreshBusy ? 'Refreshing' : 'Refresh'}
+                </Button>
+              )}
               {msaActive ? (
                 <>
                   {status.login_available && (
@@ -1288,7 +1367,7 @@ function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Elem
                       variant="secondary"
                       icon="globe"
                       onClick={() => void startLogin()}
-                      disabled={loginBusy}
+                      disabled={loginBusy || refreshBusy}
                       sound="affirm"
                     >
                       {loginBusy ? 'Getting code' : 'Re-verify'}
@@ -1298,7 +1377,7 @@ function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Elem
                     variant="secondary"
                     icon="x"
                     onClick={() => void logout()}
-                    disabled={logoutBusy}
+                    disabled={logoutBusy || refreshBusy}
                     sound="affirm"
                   >
                     {logoutBusy ? 'Signing out' : 'Log out'}
@@ -1309,7 +1388,7 @@ function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Elem
                   variant="secondary"
                   icon="globe"
                   onClick={() => void startLogin()}
-                  disabled={loginBusy}
+                  disabled={loginBusy || refreshBusy}
                   sound="affirm"
                 >
                   {loginBusy ? 'Getting code' : 'Get code'}
@@ -1343,6 +1422,16 @@ function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Elem
                 {loginSuccess}
               </div>
             )}
+            {refreshSuccess && (
+              <div style={{
+                color: theme.n.textDim,
+                fontSize: 12,
+                fontWeight: 500,
+                lineHeight: 1.4,
+              }}>
+                {refreshSuccess}
+              </div>
+            )}
             {loginError && (
               <div style={{
                 color: 'var(--err)',
@@ -1351,6 +1440,16 @@ function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Elem
                 lineHeight: 1.4,
               }}>
                 {loginError}
+              </div>
+            )}
+            {refreshError && (
+              <div style={{
+                color: 'var(--err)',
+                fontSize: 12,
+                fontWeight: 500,
+                lineHeight: 1.4,
+              }}>
+                {refreshError}
               </div>
             )}
             {logoutError && (

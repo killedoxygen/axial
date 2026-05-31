@@ -50,6 +50,7 @@ struct AuthStatusResponse {
     msa_provider: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     msa_token_expires_in: Option<u64>,
+    msa_refresh_available: bool,
     minecraft_profile_ready: bool,
     minecraft_ownership_verified: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -64,6 +65,7 @@ struct AuthStatusResponse {
 struct AuthStatusMsaState {
     authenticated: bool,
     token_expires_in: Option<u64>,
+    refresh_available: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -78,6 +80,7 @@ impl AuthStatusMsaState {
         Self {
             authenticated: false,
             token_expires_in: None,
+            refresh_available: false,
         }
     }
 }
@@ -372,6 +375,7 @@ async fn auth_status_for_store(
     login_store: &Arc<AuthLoginStore>,
 ) -> Result<AuthStatusResponse, (StatusCode, Json<serde_json::Value>)> {
     let token_expires_in = login_store.active_msa_auth_remaining_seconds().await;
+    let refresh_available = login_store.active_msa_refresh_token().await.is_some();
     let minecraft_state = login_store
         .active_minecraft_account_state()
         .await
@@ -387,6 +391,7 @@ async fn auth_status_for_store(
         AuthStatusMsaState {
             authenticated: token_expires_in.is_some(),
             token_expires_in,
+            refresh_available,
         },
         minecraft_state,
     )
@@ -444,6 +449,7 @@ fn auth_status_from_username(
         msa_authenticated: msa_state.authenticated,
         msa_provider: msa_state.authenticated.then_some("microsoft"),
         msa_token_expires_in: msa_state.token_expires_in,
+        msa_refresh_available: msa_state.refresh_available,
         minecraft_profile_ready: minecraft_state.account.is_some(),
         minecraft_ownership_verified: minecraft_state
             .account
@@ -1307,6 +1313,7 @@ mod tests {
         assert!(!response.msa_authenticated);
         assert_eq!(response.msa_provider, None);
         assert_eq!(response.msa_token_expires_in, None);
+        assert!(!response.msa_refresh_available);
         assert!(!response.minecraft_profile_ready);
         assert!(!response.minecraft_ownership_verified);
         assert_eq!(response.minecraft_profile, None);
@@ -1328,6 +1335,42 @@ mod tests {
 
         assert!(response.login_available);
         assert_eq!(response.login_reason, LOGIN_AVAILABLE_REASON);
+    }
+
+    #[tokio::test]
+    async fn auth_status_reports_refresh_available_when_msa_refresh_token_exists() {
+        let fixture = TestFixture::new("refresh-available", "ConfigUser");
+        insert_active_refresh_login(fixture.state.auth_logins(), Some("msa-refresh-token")).await;
+
+        let response = auth_status_for_store(
+            &fixture.state.config().current(),
+            AuthLoginConfig::from_env_value(Some(" public-client-id ")),
+            fixture.state.auth_logins(),
+        )
+        .await
+        .expect("auth status");
+
+        assert!(response.msa_refresh_available);
+        assert!(!response.msa_authenticated);
+        assert!(response.login_available);
+    }
+
+    #[tokio::test]
+    async fn auth_status_reports_refresh_unavailable_without_msa_refresh_token() {
+        let fixture = TestFixture::new("refresh-unavailable", "ConfigUser");
+        insert_active_refresh_login(fixture.state.auth_logins(), None).await;
+
+        let response = auth_status_for_store(
+            &fixture.state.config().current(),
+            AuthLoginConfig::from_env_value(Some(" public-client-id ")),
+            fixture.state.auth_logins(),
+        )
+        .await
+        .expect("auth status");
+
+        assert!(!response.msa_refresh_available);
+        assert!(!response.msa_authenticated);
+        assert!(response.login_available);
     }
 
     #[test]
