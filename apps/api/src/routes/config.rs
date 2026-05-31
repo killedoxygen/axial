@@ -11,6 +11,7 @@ use serde::Deserialize;
 #[derive(Debug, Default, Deserialize)]
 struct ConfigPatch {
     username: Option<String>,
+    launch_auth_mode: Option<String>,
     max_memory_mb: Option<i32>,
     min_memory_mb: Option<i32>,
     java_path_override: Option<String>,
@@ -48,6 +49,9 @@ async fn handle_update_config(
     let mut next = state.config().current();
     if let Some(username) = patch.username {
         next.username = username;
+    }
+    if let Some(launch_auth_mode) = patch.launch_auth_mode {
+        next.launch_auth_mode = launch_auth_mode;
     }
     if let Some(max_memory_mb) = patch.max_memory_mb.filter(|value| *value > 0) {
         next.max_memory_mb = max_memory_mb;

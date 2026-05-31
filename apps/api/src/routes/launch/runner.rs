@@ -438,6 +438,11 @@ pub(super) async fn launch_session(
 
                 let healing =
                     build_healing_summary(croopor_launcher::service::HealingSummaryInput {
+                        auth_mode: if intent.auth.user_type == "msa" {
+                            "online"
+                        } else {
+                            "offline"
+                        },
                         requested_java_path: &intent.requested_java,
                         requested_preset: &intent.requested_preset,
                         effective_java_path: Some(prepared.runtime.effective_path.as_str()),

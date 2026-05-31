@@ -1546,6 +1546,7 @@ mod tests {
             instance_id: "instance".to_string(),
             version_id: "1.21.4".to_string(),
             username: "Player".to_string(),
+            auth: croopor_launcher::LaunchAuthContext::offline("Player"),
             requested_java: String::new(),
             requested_preset: String::new(),
             extra_jvm_args: Vec::new(),

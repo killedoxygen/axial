@@ -3,6 +3,8 @@ use thiserror::Error;
 
 pub const USERNAME_MIN_LEN: usize = 3;
 pub const USERNAME_MAX_LEN: usize = 16;
+pub const LAUNCH_AUTH_MODE_OFFLINE: &str = "offline";
+pub const LAUNCH_AUTH_MODE_ONLINE: &str = "online";
 
 pub fn validate_username(raw: &str) -> Result<String, &'static str> {
     let value = raw.trim();
@@ -24,15 +26,31 @@ pub fn validate_username(raw: &str) -> Result<String, &'static str> {
     Ok(value.to_string())
 }
 
+pub fn validate_launch_auth_mode(raw: &str) -> Result<String, &'static str> {
+    match raw.trim() {
+        LAUNCH_AUTH_MODE_OFFLINE => Ok(LAUNCH_AUTH_MODE_OFFLINE.to_string()),
+        LAUNCH_AUTH_MODE_ONLINE => Ok(LAUNCH_AUTH_MODE_ONLINE.to_string()),
+        _ => Err("Use offline or online."),
+    }
+}
+
+fn default_launch_auth_mode() -> String {
+    LAUNCH_AUTH_MODE_OFFLINE.to_string()
+}
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum AppConfigValidationError {
     #[error("invalid username: {0}")]
     InvalidUsername(&'static str),
+    #[error("invalid launch auth mode: {0}")]
+    InvalidLaunchAuthMode(&'static str),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppConfig {
     pub username: String,
+    #[serde(default = "default_launch_auth_mode")]
+    pub launch_auth_mode: String,
     pub max_memory_mb: i32,
     pub min_memory_mb: i32,
     #[serde(default)]
@@ -73,6 +91,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             username: "Player".to_string(),
+            launch_auth_mode: LAUNCH_AUTH_MODE_OFFLINE.to_string(),
             max_memory_mb: 4096,
             min_memory_mb: 512,
             java_path_override: String::new(),
@@ -99,6 +118,8 @@ impl AppConfig {
     pub fn normalized(mut self) -> Result<Self, AppConfigValidationError> {
         self.username =
             validate_username(&self.username).map_err(AppConfigValidationError::InvalidUsername)?;
+        self.launch_auth_mode = validate_launch_auth_mode(&self.launch_auth_mode)
+            .map_err(AppConfigValidationError::InvalidLaunchAuthMode)?;
         if self.max_memory_mb < 512 {
             self.max_memory_mb = 4096;
         }
@@ -124,7 +145,10 @@ impl AppConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppConfig, AppConfigValidationError, validate_username};
+    use super::{
+        AppConfig, AppConfigValidationError, LAUNCH_AUTH_MODE_OFFLINE, LAUNCH_AUTH_MODE_ONLINE,
+        validate_launch_auth_mode, validate_username,
+    };
 
     #[test]
     fn normalized_clamps_min_memory_to_max_memory() {
@@ -146,6 +170,65 @@ mod tests {
             validate_username("  Player_1  "),
             Ok("Player_1".to_string())
         );
+    }
+
+    #[test]
+    fn default_launch_auth_mode_is_offline() {
+        assert_eq!(
+            AppConfig::default().launch_auth_mode,
+            LAUNCH_AUTH_MODE_OFFLINE
+        );
+    }
+
+    #[test]
+    fn missing_launch_auth_mode_deserializes_to_offline() {
+        let config = serde_json::from_value::<AppConfig>(serde_json::json!({
+            "username": "Player",
+            "max_memory_mb": 4096,
+            "min_memory_mb": 512
+        }))
+        .expect("missing auth mode should deserialize");
+
+        assert_eq!(config.launch_auth_mode, LAUNCH_AUTH_MODE_OFFLINE);
+        assert_eq!(
+            config
+                .normalized()
+                .expect("config should normalize")
+                .launch_auth_mode,
+            LAUNCH_AUTH_MODE_OFFLINE
+        );
+    }
+
+    #[test]
+    fn normalized_accepts_supported_launch_auth_modes_only() {
+        assert_eq!(
+            validate_launch_auth_mode(" online "),
+            Ok(LAUNCH_AUTH_MODE_ONLINE.to_string())
+        );
+        assert_eq!(
+            AppConfig {
+                launch_auth_mode: "online".to_string(),
+                ..AppConfig::default()
+            }
+            .normalized()
+            .expect("online mode should normalize")
+            .launch_auth_mode,
+            LAUNCH_AUTH_MODE_ONLINE
+        );
+
+        for value in ["", "ONLINE", "microsoft", "legacy"] {
+            let err = AppConfig {
+                launch_auth_mode: value.to_string(),
+                ..AppConfig::default()
+            }
+            .normalized()
+            .expect_err("unsupported auth mode should fail");
+
+            assert_eq!(
+                err,
+                AppConfigValidationError::InvalidLaunchAuthMode("Use offline or online.")
+            );
+        }
     }
 
     #[test]

@@ -2,7 +2,7 @@ use super::{
     AttemptOverrides, HealingSummaryInput, LaunchIntent, LaunchPreparationError,
     LaunchPreparationMetrics, PreparedLaunchAttempt, build_healing_summary, infer_loader,
 };
-use crate::build::{LaunchAuthContext, VanillaLaunchRequest, plan_resolved_launch};
+use crate::build::{VanillaLaunchRequest, plan_resolved_launch};
 use crate::guardian::resolve_launch_preset;
 use crate::jvm::{boot_throttle_args, gc_preset_args};
 use crate::runtime::RuntimeSelection;
@@ -24,6 +24,7 @@ pub async fn prepare_launch_attempt(
         }
     })?;
     let version_ms = version_started_at.elapsed().as_millis();
+    let auth_mode = launch_auth_mode_for_context(intent);
 
     let runtime_started_at = Instant::now();
     let ensured_runtime = ensure_runtime(
@@ -37,6 +38,7 @@ pub async fn prepare_launch_attempt(
         message: format!("resolve java: {error}"),
         failure_class: Some(LaunchFailureClass::JavaRuntimeMismatch),
         healing: build_healing_summary(HealingSummaryInput {
+            auth_mode,
             requested_java_path: &intent.requested_java,
             requested_preset: &intent.requested_preset,
             effective_java_path: None,
@@ -60,6 +62,7 @@ pub async fn prepare_launch_attempt(
             message,
             failure_class: Some(class),
             healing: build_healing_summary(HealingSummaryInput {
+                auth_mode,
                 requested_java_path: &intent.requested_java,
                 requested_preset: &intent.requested_preset,
                 effective_java_path: Some(ensured_runtime.effective.java_path.as_str()),
@@ -92,6 +95,7 @@ pub async fn prepare_launch_attempt(
             message,
             failure_class: Some(class),
             healing: build_healing_summary(HealingSummaryInput {
+                auth_mode,
                 requested_java_path: &intent.requested_java,
                 requested_preset: &intent.requested_preset,
                 effective_java_path: Some(runtime.effective_path.as_str()),
@@ -118,6 +122,7 @@ pub async fn prepare_launch_attempt(
             message,
             failure_class: Some(class),
             healing: build_healing_summary(HealingSummaryInput {
+                auth_mode,
                 requested_java_path: &intent.requested_java,
                 requested_preset: &intent.requested_preset,
                 effective_java_path: Some(runtime.effective_path.as_str()),
@@ -143,6 +148,7 @@ pub async fn prepare_launch_attempt(
             message,
             failure_class: Some(class),
             healing: build_healing_summary(HealingSummaryInput {
+                auth_mode,
                 requested_java_path: &intent.requested_java,
                 requested_preset: &intent.requested_preset,
                 effective_java_path: Some(runtime.effective_path.as_str()),
@@ -155,6 +161,7 @@ pub async fn prepare_launch_attempt(
     }
 
     let healing = build_healing_summary(HealingSummaryInput {
+        auth_mode,
         requested_java_path: &intent.requested_java,
         requested_preset: &intent.requested_preset,
         effective_java_path: Some(runtime.effective_path.as_str()),
@@ -182,7 +189,7 @@ pub async fn prepare_launch_attempt(
             session_id: intent.session_id.clone(),
             mc_dir: intent.library_dir.clone(),
             version_id: intent.version_id.clone(),
-            auth: LaunchAuthContext::offline(&intent.username),
+            auth: intent.auth.clone(),
             runtime: runtime.clone(),
             game_dir: intent.game_dir.clone(),
             launcher_name: intent.launcher_name.clone(),
@@ -218,6 +225,14 @@ pub async fn prepare_launch_attempt(
 
 fn uses_low_impact_startup(performance_mode: &str) -> bool {
     !matches!(performance_mode.trim(), "custom")
+}
+
+fn launch_auth_mode_for_context(intent: &LaunchIntent) -> &'static str {
+    if intent.auth.user_type == "msa" {
+        "online"
+    } else {
+        "offline"
+    }
 }
 
 fn runtime_selection_from_ensure(
@@ -273,6 +288,7 @@ pub fn sanitize_effective_runtime_major(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::build::LaunchAuthContext;
     use crate::guardian::{GuardianMode, LaunchGuardianContext};
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -317,6 +333,7 @@ mod tests {
                 instance_id: format!("fabric-{}", target.minecraft_version),
                 version_id: version_id.clone(),
                 username: "Player".to_string(),
+                auth: LaunchAuthContext::offline("Player"),
                 requested_java: fake_java.to_string_lossy().to_string(),
                 requested_preset: String::new(),
                 extra_jvm_args: Vec::new(),
@@ -447,6 +464,7 @@ mod tests {
             instance_id: "auth-test".to_string(),
             version_id: version_id.to_string(),
             username: "Player".to_string(),
+            auth: LaunchAuthContext::offline("Player"),
             requested_java: fake_java.to_string_lossy().to_string(),
             requested_preset: String::new(),
             extra_jvm_args: Vec::new(),
@@ -475,6 +493,96 @@ mod tests {
         );
         assert_arg_value(&prepared.plan.game_args, "--accessToken", "null");
         assert_arg_value(&prepared.plan.game_args, "--userType", "legacy");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn prepare_launch_attempt_uses_explicit_online_auth_context() {
+        let root = unique_temp_root("croopor-prepare-online-auth-test");
+        let library_dir = root.join("library");
+        let game_dir = root.join("instances").join("online-auth-test");
+        let fake_java = write_fake_java(&root);
+        let version_id = "online-auth-test";
+        let version_dir = library_dir.join("versions").join(version_id);
+        fs::create_dir_all(&version_dir).expect("version dir");
+        fs::create_dir_all(&game_dir).expect("game dir");
+        fs::write(version_dir.join(format!("{version_id}.jar")), b"client jar")
+            .expect("client jar");
+        write_version_json(
+            &version_dir.join(format!("{version_id}.json")),
+            serde_json::json!({
+                "id": version_id,
+                "type": "release",
+                "mainClass": "net.minecraft.client.main.Main",
+                "javaVersion": {
+                    "component": "java-runtime-delta",
+                    "majorVersion": 21
+                },
+                "assetIndex": { "id": "auth-assets" },
+                "arguments": {
+                    "jvm": [],
+                    "game": [
+                        "--username",
+                        "${auth_player_name}",
+                        "--uuid",
+                        "${auth_uuid}",
+                        "--accessToken",
+                        "${auth_access_token}",
+                        "--userType",
+                        "${user_type}"
+                    ]
+                },
+                "libraries": []
+            }),
+        );
+
+        let intent = LaunchIntent {
+            session_id: "prepare-online-auth-test".to_string(),
+            library_dir: library_dir.clone(),
+            instance_id: "online-auth-test".to_string(),
+            version_id: version_id.to_string(),
+            username: "OfflineName".to_string(),
+            auth: LaunchAuthContext {
+                player_name: "ProfileName".to_string(),
+                uuid: "4f9c7f7d0b1245d9a5c2f03a8c120001".to_string(),
+                access_token: "minecraft-access-token".to_string(),
+                client_id: String::new(),
+                xuid: String::new(),
+                user_type: "msa".to_string(),
+            },
+            requested_java: fake_java.to_string_lossy().to_string(),
+            requested_preset: String::new(),
+            extra_jvm_args: Vec::new(),
+            max_memory_mb: 2048,
+            min_memory_mb: 512,
+            resolution: None,
+            launcher_name: "croopor".to_string(),
+            launcher_version: "test".to_string(),
+            game_dir: Some(game_dir),
+            guardian: LaunchGuardianContext {
+                mode: GuardianMode::Managed,
+                ..LaunchGuardianContext::default()
+            },
+            performance_mode: "managed".to_string(),
+        };
+
+        let prepared = prepare_launch_attempt(&intent, &AttemptOverrides::default())
+            .await
+            .expect("prepared launch");
+
+        assert_arg_value(&prepared.plan.game_args, "--username", "ProfileName");
+        assert_arg_value(
+            &prepared.plan.game_args,
+            "--uuid",
+            "4f9c7f7d0b1245d9a5c2f03a8c120001",
+        );
+        assert_arg_value(
+            &prepared.plan.game_args,
+            "--accessToken",
+            "minecraft-access-token",
+        );
+        assert_arg_value(&prepared.plan.game_args, "--userType", "msa");
 
         let _ = fs::remove_dir_all(root);
     }

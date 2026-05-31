@@ -15,7 +15,7 @@ use axum::{
     http::StatusCode,
     routing::{get, post},
 };
-use croopor_config::validate_username;
+use croopor_config::{AppConfig, LAUNCH_AUTH_MODE_ONLINE, validate_username};
 use croopor_minecraft::offline_uuid;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -35,6 +35,7 @@ const LOGIN_AVAILABLE_REASON: &str = "Microsoft sign-in is configured";
 
 #[derive(Debug, Serialize)]
 struct AuthStatusResponse {
+    launch_auth_mode: String,
     mode: &'static str,
     username: String,
     uuid: String,
@@ -253,7 +254,7 @@ async fn handle_auth_status(
     State(state): State<AppState>,
 ) -> Result<Json<AuthStatusResponse>, (StatusCode, Json<serde_json::Value>)> {
     auth_status_for_store(
-        &state.config().current().username,
+        &state.config().current(),
         AuthLoginConfig::from_env(),
         state.auth_logins(),
     )
@@ -296,7 +297,7 @@ async fn handle_auth_logout(State(state): State<AppState>) -> Json<AuthLogoutRes
 }
 
 async fn auth_status_for_store(
-    config_username: &str,
+    config: &AppConfig,
     login_config: AuthLoginConfig,
     login_store: &Arc<AuthLoginStore>,
 ) -> Result<AuthStatusResponse, (StatusCode, Json<serde_json::Value>)> {
@@ -310,7 +311,8 @@ async fn auth_status_for_store(
             token_expires_in: None,
         });
     auth_status_from_username(
-        config_username,
+        &config.username,
+        &config.launch_auth_mode,
         login_config,
         AuthStatusMsaState {
             authenticated: token_expires_in.is_some(),
@@ -322,6 +324,7 @@ async fn auth_status_for_store(
 
 fn auth_status_from_username(
     config_username: &str,
+    launch_auth_mode: &str,
     login_config: AuthLoginConfig,
     msa_state: AuthStatusMsaState,
     minecraft_state: AuthStatusMinecraftState,
@@ -336,15 +339,38 @@ fn auth_status_from_username(
         .account
         .as_ref()
         .map(|account| auth_minecraft_profile_response(&account.profile));
+    let online_mode_ready = launch_auth_mode == LAUNCH_AUTH_MODE_ONLINE
+        && minecraft_state
+            .account
+            .as_ref()
+            .is_some_and(minecraft_account_can_launch_online);
+    let (mode, provider, verified, skin_source, username, uuid) = if online_mode_ready {
+        let account = minecraft_state
+            .account
+            .as_ref()
+            .expect("ready online mode has account");
+        (
+            "online",
+            "microsoft",
+            true,
+            "minecraft_profile",
+            account.profile.name.clone(),
+            account.profile.id.clone(),
+        )
+    } else {
+        let uuid = offline_uuid(&username);
+        ("offline", "offline", false, "default", username, uuid)
+    };
 
     Ok(AuthStatusResponse {
-        mode: "offline",
-        uuid: offline_uuid(&username),
+        launch_auth_mode: launch_auth_mode.to_string(),
+        mode,
+        uuid,
         username,
-        provider: "offline",
-        verified: false,
-        online_mode_ready: false,
-        skin_source: "default",
+        provider,
+        verified,
+        online_mode_ready,
+        skin_source,
         msa_authenticated: msa_state.authenticated,
         msa_provider: msa_state.authenticated.then_some("microsoft"),
         msa_token_expires_in: msa_state.token_expires_in,
@@ -358,6 +384,13 @@ fn auth_status_from_username(
         login_available: login_config.is_available(),
         login_reason: login_config.reason(),
     })
+}
+
+fn minecraft_account_can_launch_online(account: &AuthLoginMinecraftAccount) -> bool {
+    account.owns_minecraft_java
+        && !account.access_token.trim().is_empty()
+        && !account.profile.id.trim().is_empty()
+        && !account.profile.name.trim().is_empty()
 }
 
 async fn auth_logout(login_store: &Arc<AuthLoginStore>) -> AuthLogoutResponse {
@@ -912,6 +945,7 @@ mod tests {
 
         let response = fixture.status().await.expect("auth status").0;
 
+        assert_eq!(response.launch_auth_mode, "offline");
         assert_eq!(response.mode, "offline");
         assert_eq!(response.username, "ConfigUser");
         assert_eq!(response.uuid, offline_uuid("ConfigUser"));
@@ -934,6 +968,7 @@ mod tests {
     fn auth_status_marks_login_available_when_client_id_is_configured() {
         let response = auth_status_from_username(
             "ConfigUser",
+            "offline",
             AuthLoginConfig::from_env_value(Some(" public-client-id ")),
             AuthStatusMsaState::unauthenticated(),
             AuthStatusMinecraftState::unauthenticated(),
@@ -948,6 +983,7 @@ mod tests {
     fn auth_status_rejects_invalid_configured_username() {
         let error = auth_status_from_username(
             "bad name",
+            "offline",
             AuthLoginConfig::from_env_value(None),
             AuthStatusMsaState::unauthenticated(),
             AuthStatusMinecraftState::unauthenticated(),
@@ -1289,7 +1325,10 @@ mod tests {
         assert!(minecraft.token_expires_in > 0);
 
         let status = auth_status_for_store(
-            "ConfigUser",
+            &AppConfig {
+                username: "ConfigUser".to_string(),
+                ..AppConfig::default()
+            },
             AuthLoginConfig::from_env_value(Some("public-client-id")),
             &store,
         )
@@ -1400,7 +1439,10 @@ mod tests {
         assert_eq!(store.active_minecraft_account().await, None);
 
         let status = auth_status_for_store(
-            "ConfigUser",
+            &AppConfig {
+                username: "ConfigUser".to_string(),
+                ..AppConfig::default()
+            },
             AuthLoginConfig::from_env_value(Some("public-client-id")),
             &store,
         )
@@ -1449,7 +1491,10 @@ mod tests {
             .expect("complete login");
 
         let response = auth_status_for_store(
-            "ConfigUser",
+            &AppConfig {
+                username: "ConfigUser".to_string(),
+                ..AppConfig::default()
+            },
             AuthLoginConfig::from_env_value(Some("public-client-id")),
             &store,
         )
@@ -1475,6 +1520,122 @@ mod tests {
         assert_eq!(response.minecraft_profile, None);
         assert_eq!(response.minecraft_token_expires_in, None);
         assert!(response.login_available);
+    }
+
+    #[tokio::test]
+    async fn auth_status_reports_selected_online_mode_without_ready_credentials() {
+        let store = Arc::new(AuthLoginStore::new());
+
+        let response = auth_status_for_store(
+            &AppConfig {
+                username: "ConfigUser".to_string(),
+                launch_auth_mode: "online".to_string(),
+                ..AppConfig::default()
+            },
+            AuthLoginConfig::from_env_value(Some("public-client-id")),
+            &store,
+        )
+        .await
+        .expect("auth status");
+
+        assert_eq!(response.launch_auth_mode, "online");
+        assert_eq!(response.mode, "offline");
+        assert_eq!(response.username, "ConfigUser");
+        assert_eq!(response.uuid, offline_uuid("ConfigUser"));
+        assert_eq!(response.provider, "offline");
+        assert!(!response.verified);
+        assert!(!response.online_mode_ready);
+        assert!(!response.minecraft_profile_ready);
+        assert!(!response.minecraft_ownership_verified);
+    }
+
+    #[tokio::test]
+    async fn auth_status_marks_online_mode_ready_for_owned_volatile_minecraft_account() {
+        let store = Arc::new(AuthLoginStore::new());
+        let session = insert_pending_login(&store).await;
+        store
+            .complete_with_msa_and_minecraft_account(
+                &session.login_id,
+                NewAuthLoginMsaToken {
+                    access_token: "msa-access-token".to_string(),
+                    refresh_token: None,
+                    id_token: None,
+                    token_type: "Bearer".to_string(),
+                    expires_in: 3600,
+                    scope: Some("XboxLive.signin offline_access".to_string()),
+                },
+                test_minecraft_account("ProfileName"),
+            )
+            .await
+            .expect("complete login");
+
+        let response = auth_status_for_store(
+            &AppConfig {
+                username: "ConfigUser".to_string(),
+                launch_auth_mode: "online".to_string(),
+                ..AppConfig::default()
+            },
+            AuthLoginConfig::from_env_value(Some("public-client-id")),
+            &store,
+        )
+        .await
+        .expect("auth status");
+
+        assert_eq!(response.launch_auth_mode, "online");
+        assert_eq!(response.mode, "online");
+        assert_eq!(response.username, "ProfileName");
+        assert_eq!(response.uuid, "old-minecraft-profile-id");
+        assert_eq!(response.provider, "microsoft");
+        assert!(response.verified);
+        assert!(response.online_mode_ready);
+        assert!(response.minecraft_profile_ready);
+        assert!(response.minecraft_ownership_verified);
+        assert_eq!(
+            response.minecraft_profile.expect("minecraft profile").name,
+            "ProfileName"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_status_keeps_online_mode_not_ready_without_java_ownership() {
+        let store = Arc::new(AuthLoginStore::new());
+        let session = insert_pending_login(&store).await;
+        let mut account = test_minecraft_account("ProfileName");
+        account.owns_minecraft_java = false;
+        store
+            .complete_with_msa_and_minecraft_account(
+                &session.login_id,
+                NewAuthLoginMsaToken {
+                    access_token: "msa-access-token".to_string(),
+                    refresh_token: None,
+                    id_token: None,
+                    token_type: "Bearer".to_string(),
+                    expires_in: 3600,
+                    scope: Some("XboxLive.signin offline_access".to_string()),
+                },
+                account,
+            )
+            .await
+            .expect("complete login");
+
+        let response = auth_status_for_store(
+            &AppConfig {
+                username: "ConfigUser".to_string(),
+                launch_auth_mode: "online".to_string(),
+                ..AppConfig::default()
+            },
+            AuthLoginConfig::from_env_value(Some("public-client-id")),
+            &store,
+        )
+        .await
+        .expect("auth status");
+
+        assert_eq!(response.launch_auth_mode, "online");
+        assert_eq!(response.mode, "offline");
+        assert_eq!(response.username, "ConfigUser");
+        assert!(!response.online_mode_ready);
+        assert!(response.minecraft_profile_ready);
+        assert!(!response.minecraft_ownership_verified);
     }
 
     #[tokio::test]
@@ -1591,6 +1752,7 @@ mod tests {
         ) -> Result<Json<AuthStatusResponse>, (StatusCode, Json<serde_json::Value>)> {
             auth_status_from_username(
                 &self.state.config().current().username,
+                &self.state.config().current().launch_auth_mode,
                 AuthLoginConfig::from_env_value(None),
                 AuthStatusMsaState::unauthenticated(),
                 AuthStatusMinecraftState::unauthenticated(),

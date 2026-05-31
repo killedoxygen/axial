@@ -3,6 +3,7 @@ mod mapping;
 mod prepare;
 mod validation;
 
+use crate::build::LaunchAuthContext;
 use crate::build::VanillaLaunchPlan;
 use crate::guardian::{GuardianIntervention, LaunchGuardianContext};
 use crate::healing::HealingEvent;
@@ -25,6 +26,7 @@ pub struct LaunchIntent {
     pub instance_id: String,
     pub version_id: String,
     pub username: String,
+    pub auth: LaunchAuthContext,
     pub requested_java: String,
     pub requested_preset: String,
     pub extra_jvm_args: Vec<String>,

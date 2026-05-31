@@ -3,6 +3,7 @@ use crate::healing::{HealingEvent, HealingEventKind};
 use crate::types::LaunchFailureClass;
 
 pub struct HealingSummaryInput<'a> {
+    pub auth_mode: &'a str,
     pub requested_java_path: &'a str,
     pub requested_preset: &'a str,
     pub effective_java_path: Option<&'a str>,
@@ -33,6 +34,10 @@ pub fn build_healing_summary(input: HealingSummaryInput<'_>) -> Option<LaunchHea
         .failure_class
         .map(super::mapping::failure_class_name)
         .map(str::to_string);
+    let auth_mode = match input.auth_mode.trim() {
+        "online" => "online",
+        _ => "offline",
+    };
 
     let mut warnings = Vec::new();
     let mut events = Vec::new();
@@ -83,7 +88,7 @@ pub fn build_healing_summary(input: HealingSummaryInput<'_>) -> Option<LaunchHea
         effective_preset,
         requested_java_path,
         effective_java_path,
-        auth_mode: Some("offline".to_string()),
+        auth_mode: Some(auth_mode.to_string()),
         warnings,
         fallback_applied,
         retry_count: (input.retry_count > 0).then_some(input.retry_count),
@@ -129,6 +134,7 @@ mod tests {
     #[test]
     fn ignores_runtime_bypass_when_java_paths_only_differ_by_whitespace() {
         let summary = build_healing_summary(HealingSummaryInput {
+            auth_mode: "offline",
             requested_java_path: " /usr/bin/java ",
             requested_preset: "",
             effective_java_path: Some("/usr/bin/java"),

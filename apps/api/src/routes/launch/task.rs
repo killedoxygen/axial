@@ -4,11 +4,12 @@ use crate::logging::timestamp_utc;
 use crate::state::launch_reports::{
     LAUNCH_DISK_HEADROOM_MB, LaunchBenchmarkMetadata, LaunchProofResourceBudget,
 };
-use crate::state::{AppState, LaunchSessionRecord};
+use crate::state::{ActiveMinecraftAccountState, AppState, LaunchSessionRecord};
 use axum::{Json, http::StatusCode};
-use croopor_config::{AppConfig, Instance, validate_username};
+use croopor_config::{AppConfig, Instance, LAUNCH_AUTH_MODE_ONLINE, validate_username};
 use croopor_launcher::{
-    GuardianMode, GuardianSummary, LaunchGuardianContext, LaunchIntent, LaunchState,
+    GuardianMode, GuardianSummary, LaunchAuthContext, LaunchFailureClass, LaunchGuardianContext,
+    LaunchIntent, LaunchState, failure_class_name,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -144,6 +145,7 @@ pub(super) async fn prepare_launch_session(
         .to_string();
     let username = validate_username(&requested_username)
         .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?;
+    let auth = launch_auth_context_for_config(state, &config, &username).await?;
     let preflight = build_launch_preflight_facts(
         state,
         &instance,
@@ -163,6 +165,7 @@ pub(super) async fn prepare_launch_session(
         instance_id: instance.id.clone(),
         version_id: instance.version_id.clone(),
         username: username.clone(),
+        auth,
         requested_java: preflight.requested_java.clone(),
         requested_preset: preflight.requested_preset.clone(),
         extra_jvm_args: policy::split_jvm_args(&instance.extra_jvm_args),
@@ -319,6 +322,55 @@ async fn build_launch_preflight_facts(
         guardian_summary,
         resource_budget,
     }
+}
+
+async fn launch_auth_context_for_config(
+    state: &AppState,
+    config: &AppConfig,
+    offline_username: &str,
+) -> Result<LaunchAuthContext, (StatusCode, Json<serde_json::Value>)> {
+    if config.launch_auth_mode != LAUNCH_AUTH_MODE_ONLINE {
+        return Ok(LaunchAuthContext::offline(offline_username));
+    }
+
+    let Some(account_state) = state.auth_logins().active_minecraft_account_state().await else {
+        return Err(online_auth_unavailable_response());
+    };
+    online_launch_auth_context(account_state).ok_or_else(online_auth_unavailable_response)
+}
+
+fn online_launch_auth_context(
+    account_state: ActiveMinecraftAccountState,
+) -> Option<LaunchAuthContext> {
+    let account = account_state.account;
+    if !account.owns_minecraft_java
+        || account.access_token.trim().is_empty()
+        || account.profile.name.trim().is_empty()
+        || account.profile.id.trim().is_empty()
+    {
+        return None;
+    }
+
+    Some(LaunchAuthContext {
+        player_name: account.profile.name,
+        uuid: account.profile.id,
+        access_token: account.access_token,
+        client_id: String::new(),
+        xuid: String::new(),
+        user_type: "msa".to_string(),
+    })
+}
+
+fn online_auth_unavailable_response() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::PRECONDITION_FAILED,
+        Json(json!({
+            "error": "Online launch requires an active verified Minecraft Java account",
+            "failure_class": failure_class_name(LaunchFailureClass::AuthModeIncompatible),
+            "launch_auth_mode": LAUNCH_AUTH_MODE_ONLINE,
+            "online_mode_ready": false,
+        })),
+    )
 }
 
 fn guardian_summary_for_preflight(
@@ -831,7 +883,10 @@ fn positive_i32(value: i32) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{AppStateInit, InstallStore, SessionStore};
+    use crate::state::{
+        AppStateInit, AuthLoginMinecraftProfile, InstallStore, NewAuthLoginMinecraftAccount,
+        NewAuthLoginMsaToken, NewAuthLoginSession, SessionStore,
+    };
     use croopor_config::{AppConfig, AppPaths, ConfigStore, InstanceStore};
     use croopor_launcher::{GuardianDecision, OverrideOrigin, SessionId};
     use croopor_performance::PerformanceManager;
@@ -869,6 +924,13 @@ mod tests {
         .expect("prepare launch session");
 
         assert_eq!(prepared.task.intent.game_dir, Some(game_dir.clone()));
+        assert_eq!(prepared.task.intent.auth.player_name, "Player");
+        assert_eq!(
+            prepared.task.intent.auth.uuid,
+            croopor_minecraft::offline_uuid("Player")
+        );
+        assert_eq!(prepared.task.intent.auth.access_token, "null");
+        assert_eq!(prepared.task.intent.auth.user_type, "legacy");
         assert!(game_dir.join("screenshots").is_dir());
         assert!(game_dir.join("logs").is_dir());
         assert_eq!(
@@ -879,6 +941,95 @@ mod tests {
             fs::read_to_string(game_dir.join("servers.dat")).expect("read servers"),
             "shared servers"
         );
+    }
+
+    #[tokio::test]
+    async fn prepare_launch_session_uses_online_auth_context_from_active_minecraft_account() {
+        let fixture = TestFixture::new("prepare-online-auth");
+        fixture.set_launch_auth_mode("online");
+        let instance_id = fixture.add_instance("Survival", "1.21.1");
+        fixture.add_active_minecraft_account(true).await;
+
+        let prepared = fixture
+            .prepare(instance_id, None)
+            .await
+            .expect("prepare launch session");
+
+        assert_eq!(prepared.task.config.username, "Player");
+        assert_eq!(prepared.task.intent.username, "Player");
+        assert_eq!(prepared.task.intent.auth.player_name, "ProfileName");
+        assert_eq!(
+            prepared.task.intent.auth.uuid,
+            "4f9c7f7d0b1245d9a5c2f03a8c120001"
+        );
+        assert_eq!(
+            prepared.task.intent.auth.access_token,
+            "minecraft-access-token"
+        );
+        assert_eq!(prepared.task.intent.auth.user_type, "msa");
+        assert_eq!(prepared.task.intent.auth.client_id, "");
+        assert_eq!(prepared.task.intent.auth.xuid, "");
+    }
+
+    #[tokio::test]
+    async fn prepare_launch_session_rejects_online_auth_without_verified_account_boundedly() {
+        let fixture = TestFixture::new("prepare-online-auth-missing");
+        fixture.set_launch_auth_mode("online");
+        let instance_id = fixture.add_instance("Survival", "1.21.1");
+
+        let error = match fixture.prepare(instance_id.clone(), None).await {
+            Ok(_) => panic!("online auth without account should fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.0, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(
+            error.1.0,
+            serde_json::json!({
+                "error": "Online launch requires an active verified Minecraft Java account",
+                "failure_class": "auth_mode_incompatible",
+                "launch_auth_mode": "online",
+                "online_mode_ready": false,
+            })
+        );
+        let text = error.1.0.to_string();
+        for material in [
+            "minecraft-access-token",
+            "msa-access-token",
+            "raw-device-code",
+            "provider-secret-payload",
+        ] {
+            assert!(
+                !text.contains(material),
+                "public launch error exposed sensitive material {material}"
+            );
+        }
+        assert!(
+            !fixture
+                .state
+                .sessions()
+                .has_active_instance(&instance_id)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_launch_session_rejects_online_auth_without_java_ownership() {
+        let fixture = TestFixture::new("prepare-online-auth-unowned");
+        fixture.set_launch_auth_mode("online");
+        let instance_id = fixture.add_instance("Survival", "1.21.1");
+        fixture.add_active_minecraft_account(false).await;
+
+        let error = match fixture.prepare(instance_id, None).await {
+            Ok(_) => panic!("online auth without ownership should fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.0, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(error.1.0["failure_class"], "auth_mode_incompatible");
+        assert_eq!(error.1.0["online_mode_ready"], false);
+        let text = error.1.0.to_string();
+        assert!(!text.contains("minecraft-access-token"));
     }
 
     #[tokio::test]
@@ -1825,6 +1976,15 @@ mod tests {
                 .expect("set guardian mode");
         }
 
+        fn set_launch_auth_mode(&self, mode: &str) {
+            let mut config = self.state.config().current();
+            config.launch_auth_mode = mode.to_string();
+            self.state
+                .config()
+                .replace_in_memory(config)
+                .expect("set launch auth mode");
+        }
+
         fn set_global_jvm_preset(&self, preset: &str) {
             let mut config = self.state.config().current();
             config.jvm_preset = preset.to_string();
@@ -1891,6 +2051,48 @@ mod tests {
 
         async fn add_active_install(&self, install_id: &str) {
             self.state.installs().insert(install_id.to_string()).await;
+        }
+
+        async fn add_active_minecraft_account(&self, owns_minecraft_java: bool) {
+            let session = self
+                .state
+                .auth_logins()
+                .insert(NewAuthLoginSession {
+                    device_code: "raw-device-code".to_string(),
+                    user_code: "ABCD-EFGH".to_string(),
+                    verification_uri: "https://www.microsoft.com/link".to_string(),
+                    expires_in: 900,
+                    interval: 5,
+                    message: None,
+                })
+                .await;
+            self.state
+                .auth_logins()
+                .complete_with_msa_and_minecraft_account(
+                    &session.login_id,
+                    NewAuthLoginMsaToken {
+                        access_token: "msa-access-token".to_string(),
+                        refresh_token: None,
+                        id_token: None,
+                        token_type: "Bearer".to_string(),
+                        expires_in: 3600,
+                        scope: Some("XboxLive.signin offline_access".to_string()),
+                    },
+                    NewAuthLoginMinecraftAccount {
+                        access_token: "minecraft-access-token".to_string(),
+                        token_type: Some("Bearer".to_string()),
+                        expires_in: 86400,
+                        profile: AuthLoginMinecraftProfile {
+                            id: "4f9c7f7d0b1245d9a5c2f03a8c120001".to_string(),
+                            name: "ProfileName".to_string(),
+                            skins: Vec::new(),
+                            capes: Vec::new(),
+                        },
+                        owns_minecraft_java,
+                    },
+                )
+                .await
+                .expect("active minecraft account");
         }
     }
 
