@@ -58,6 +58,7 @@ pub(super) struct BenchmarkMatrixLimits {
 pub(super) struct BenchmarkSuiteRunSpec {
     pub profile: &'static str,
     pub run_type: &'static str,
+    pub target_id: Option<&'static str>,
 }
 
 pub(super) fn benchmark_matrix() -> BenchmarkMatrix {
@@ -234,10 +235,12 @@ pub(super) fn benchmark_suite_plan(mode: &str) -> Option<Vec<BenchmarkSuiteRunSp
             BenchmarkSuiteRunSpec {
                 profile: "vanilla_baseline",
                 run_type: "coldish",
+                target_id: None,
             },
             BenchmarkSuiteRunSpec {
                 profile: "managed_default",
                 run_type: "repeat",
+                target_id: None,
             },
         ]),
         "qualification" => {
@@ -248,6 +251,7 @@ pub(super) fn benchmark_suite_plan(mode: &str) -> Option<Vec<BenchmarkSuiteRunSp
                     plan.push(BenchmarkSuiteRunSpec {
                         profile: profile.id,
                         run_type: run_type.id,
+                        target_id: None,
                     });
                 }
             }
@@ -257,22 +261,27 @@ pub(super) fn benchmark_suite_plan(mode: &str) -> Option<Vec<BenchmarkSuiteRunSp
             BenchmarkSuiteRunSpec {
                 profile: "vanilla_baseline",
                 run_type: "coldish",
+                target_id: Some("family_c_forge_1_12_2_vanilla_baseline"),
             },
             BenchmarkSuiteRunSpec {
                 profile: "managed_default",
                 run_type: "coldish",
+                target_id: Some("family_c_forge_1_12_2_family_c_forge_core"),
             },
             BenchmarkSuiteRunSpec {
                 profile: "legacy_family",
                 run_type: "coldish",
+                target_id: Some("legacy_1_8_9_forge_pvp"),
             },
             BenchmarkSuiteRunSpec {
                 profile: "degraded_managed_path",
                 run_type: "coldish",
+                target_id: Some("degraded_managed_path"),
             },
             BenchmarkSuiteRunSpec {
                 profile: "repeat_launch",
                 run_type: "repeat",
+                target_id: Some("repeat_managed_launch"),
             },
         ]),
         _ => None,
@@ -368,6 +377,11 @@ mod tests {
             .iter()
             .map(|run_type| run_type.id)
             .collect::<HashSet<_>>();
+        let target_id_set = matrix
+            .representative_targets
+            .iter()
+            .map(|target| target.id)
+            .collect::<HashSet<_>>();
         for target in &matrix.representative_targets {
             assert!(profile_ids.contains(target.profile));
             assert!(run_type_ids.contains(target.run_type));
@@ -379,10 +393,12 @@ mod tests {
                 BenchmarkSuiteRunSpec {
                     profile: "vanilla_baseline",
                     run_type: "coldish",
+                    target_id: None,
                 },
                 BenchmarkSuiteRunSpec {
                     profile: "managed_default",
                     run_type: "repeat",
+                    target_id: None,
                 },
             ]
         );
@@ -398,22 +414,27 @@ mod tests {
                 BenchmarkSuiteRunSpec {
                     profile: "vanilla_baseline",
                     run_type: "coldish",
+                    target_id: Some("family_c_forge_1_12_2_vanilla_baseline"),
                 },
                 BenchmarkSuiteRunSpec {
                     profile: "managed_default",
                     run_type: "coldish",
+                    target_id: Some("family_c_forge_1_12_2_family_c_forge_core"),
                 },
                 BenchmarkSuiteRunSpec {
                     profile: "legacy_family",
                     run_type: "coldish",
+                    target_id: Some("legacy_1_8_9_forge_pvp"),
                 },
                 BenchmarkSuiteRunSpec {
                     profile: "degraded_managed_path",
                     run_type: "coldish",
+                    target_id: Some("degraded_managed_path"),
                 },
                 BenchmarkSuiteRunSpec {
                     profile: "repeat_launch",
                     run_type: "repeat",
+                    target_id: Some("repeat_managed_launch"),
                 },
             ]
         );
@@ -425,6 +446,9 @@ mod tests {
             for run in plan {
                 assert!(profile_ids.contains(run.profile));
                 assert!(run_type_ids.contains(run.run_type));
+                if let Some(target_id) = run.target_id {
+                    assert!(target_id_set.contains(target_id));
+                }
             }
         }
         assert_eq!(benchmark_suite_plan("nightly-check"), None);

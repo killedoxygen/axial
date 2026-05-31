@@ -812,10 +812,13 @@ fn benchmark_suite_run_id(
     run_index: usize,
     run: matrix::BenchmarkSuiteRunSpec,
 ) -> String {
-    format!(
-        "suite-{mode}-{run_index:02}-{}-{}",
-        run.profile, run.run_type
-    )
+    match run.target_id {
+        Some(target_id) => format!("suite-{mode}-{run_index:02}-{target_id}-{}", run.run_type),
+        None => format!(
+            "suite-{mode}-{run_index:02}-{}-{}",
+            run.profile, run.run_type
+        ),
+    }
 }
 
 fn benchmark_suite_run_descriptor(
@@ -827,6 +830,7 @@ fn benchmark_suite_run_descriptor(
         "run_index": run_index,
         "profile": run.profile,
         "run_type": run.run_type,
+        "target_id": run.target_id,
         "benchmark_id": benchmark_suite_run_id(mode, run_index, run),
     })
 }
@@ -842,6 +846,7 @@ fn benchmark_suite_manifest_run_inputs(
                 run_index: index,
                 profile: run.profile.to_string(),
                 run_type: run.run_type.to_string(),
+                target_id: run.target_id.map(str::to_string),
                 benchmark_id: benchmark_suite_run_id(mode, index, *run),
             },
         )
@@ -869,6 +874,7 @@ fn benchmark_suite_status_payload(
         "run_count": plan.len(),
         "selected_profile": selected.profile,
         "selected_run_type": selected.run_type,
+        "selected_target_id": selected.target_id,
         "selected": benchmark_suite_run_descriptor(mode, run_index, selected),
         "remaining": remaining,
     })
@@ -1666,10 +1672,12 @@ mod tests {
                 "run_count": 2,
                 "selected_profile": "vanilla_baseline",
                 "selected_run_type": "coldish",
+                "selected_target_id": null,
                 "selected": {
                     "run_index": 0,
                     "profile": "vanilla_baseline",
                     "run_type": "coldish",
+                    "target_id": null,
                     "benchmark_id": "suite-development-00-vanilla_baseline-coldish",
                 },
                 "remaining": [
@@ -1677,11 +1685,103 @@ mod tests {
                         "run_index": 1,
                         "profile": "managed_default",
                         "run_type": "repeat",
+                        "target_id": null,
                         "benchmark_id": "suite-development-01-managed_default-repeat",
                     }
                 ],
             })
         );
+    }
+
+    #[test]
+    fn benchmark_suite_release_validation_carries_family_c_target_identity() {
+        let plan = matrix::benchmark_suite_plan("release_validation").expect("release plan");
+        let payload =
+            benchmark_suite_status_payload("suite-release", "release_validation", 0, &plan);
+        let manifest_runs = benchmark_suite_manifest_run_inputs("release_validation", &plan);
+
+        assert_eq!(
+            payload["selected_target_id"],
+            serde_json::json!("family_c_forge_1_12_2_vanilla_baseline")
+        );
+        assert_eq!(
+            payload["selected"]["target_id"],
+            serde_json::json!("family_c_forge_1_12_2_vanilla_baseline")
+        );
+        assert_eq!(
+            payload["remaining"][0]["target_id"],
+            serde_json::json!("family_c_forge_1_12_2_family_c_forge_core")
+        );
+        assert_eq!(
+            manifest_runs[0].target_id.as_deref(),
+            Some("family_c_forge_1_12_2_vanilla_baseline")
+        );
+        assert_eq!(
+            manifest_runs[1].target_id.as_deref(),
+            Some("family_c_forge_1_12_2_family_c_forge_core")
+        );
+    }
+
+    #[test]
+    fn benchmark_suite_manifest_persists_family_c_target_identity() {
+        let root = test_root("suite-family-c-target-manifest");
+        let paths = test_paths(&root);
+        let suite_id = "suite-family-c-target-manifest";
+        let plan = matrix::benchmark_suite_plan("release_validation").expect("release plan");
+        let manifest_runs = benchmark_suite_manifest_run_inputs("release_validation", &plan);
+
+        crate::state::benchmark_suites::persist_launched_run(
+            &paths,
+            suite_id,
+            "instance",
+            "release_validation",
+            &manifest_runs,
+            1,
+            "session-1",
+            "2026-01-01T00:00:00.000Z",
+        )
+        .expect("persist launched run");
+        let manifest = crate::state::benchmark_suites::load(&paths, suite_id)
+            .expect("load suite")
+            .expect("suite should exist");
+
+        assert_eq!(manifest.schema_version, 2);
+        assert_eq!(
+            manifest.runs[0].target_id,
+            "family_c_forge_1_12_2_vanilla_baseline"
+        );
+        assert_eq!(
+            manifest.runs[1].target_id,
+            "family_c_forge_1_12_2_family_c_forge_core"
+        );
+        assert!(manifest.runs.len() <= 16);
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn benchmark_suite_ids_include_family_c_target_identity_and_stay_bounded() {
+        let plan = matrix::benchmark_suite_plan("release_validation").expect("release plan");
+        let baseline_id = benchmark_suite_run_id("release_validation", 0, plan[0]);
+        let managed_id = benchmark_suite_run_id("release_validation", 1, plan[1]);
+
+        assert_ne!(baseline_id, managed_id);
+        assert_eq!(
+            baseline_id,
+            "suite-release_validation-00-family_c_forge_1_12_2_vanilla_baseline-coldish"
+        );
+        assert_eq!(
+            managed_id,
+            "suite-release_validation-01-family_c_forge_1_12_2_family_c_forge_core-coldish"
+        );
+        for benchmark_id in [baseline_id, managed_id] {
+            assert!(benchmark_id.len() <= 96);
+            assert!(
+                benchmark_id
+                    .chars()
+                    .all(|value| value.is_ascii_alphanumeric() || matches!(value, '-' | '_'))
+            );
+        }
     }
 
     #[test]
@@ -2499,7 +2599,7 @@ mod tests {
     ) -> crate::state::benchmark_suites::BenchmarkSuiteManifest {
         crate::state::benchmark_suites::BenchmarkSuiteManifest {
             schema: "croopor.launch.benchmark.suite".to_string(),
-            schema_version: 1,
+            schema_version: 2,
             suite_id: "suite-test".to_string(),
             instance_id: "instance".to_string(),
             mode: "development".to_string(),
@@ -2517,6 +2617,7 @@ mod tests {
             run_index,
             profile: "vanilla_baseline".to_string(),
             run_type: "coldish".to_string(),
+            target_id: String::new(),
             benchmark_id: format!("suite-development-{run_index:02}-vanilla_baseline-coldish"),
             session_id: session_id.map(str::to_string),
             launched_at: session_id.map(|_| "2026-01-01T00:00:00.000Z".to_string()),

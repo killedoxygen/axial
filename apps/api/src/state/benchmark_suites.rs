@@ -6,7 +6,7 @@ use std::io;
 use std::path::PathBuf;
 
 const BENCHMARK_SUITE_SCHEMA: &str = "croopor.launch.benchmark.suite";
-const BENCHMARK_SUITE_SCHEMA_VERSION: u32 = 1;
+const BENCHMARK_SUITE_SCHEMA_VERSION: u32 = 2;
 const MAX_SUITE_ID_STEM_CHARS: usize = 96;
 const MAX_DERIVED_INSTANCE_ID_CHARS: usize = 40;
 const MAX_MANIFEST_FIELD_CHARS: usize = 96;
@@ -31,6 +31,7 @@ pub struct BenchmarkSuiteManifestRun {
     pub run_index: usize,
     pub profile: String,
     pub run_type: String,
+    pub target_id: String,
     pub benchmark_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
@@ -44,6 +45,7 @@ pub struct BenchmarkSuiteRunInput {
     pub run_index: usize,
     pub profile: String,
     pub run_type: String,
+    pub target_id: Option<String>,
     pub benchmark_id: String,
 }
 
@@ -243,12 +245,18 @@ pub fn update_run_state_for_session(
 }
 
 fn upsert_plan_run(runs: &mut Vec<BenchmarkSuiteManifestRun>, run: &BenchmarkSuiteRunInput) {
+    let target_id = run
+        .target_id
+        .as_deref()
+        .and_then(safe_manifest_field)
+        .unwrap_or_default();
     if let Some(existing) = runs
         .iter_mut()
         .find(|existing| existing.run_index == run.run_index)
     {
         existing.profile = safe_manifest_field(&run.profile).unwrap_or_default();
         existing.run_type = safe_manifest_field(&run.run_type).unwrap_or_default();
+        existing.target_id = target_id;
         existing.benchmark_id = safe_manifest_field(&run.benchmark_id).unwrap_or_default();
         if existing.state.trim().is_empty() {
             existing.state = "pending".to_string();
@@ -260,6 +268,7 @@ fn upsert_plan_run(runs: &mut Vec<BenchmarkSuiteManifestRun>, run: &BenchmarkSui
         run_index: run.run_index,
         profile: safe_manifest_field(&run.profile).unwrap_or_default(),
         run_type: safe_manifest_field(&run.run_type).unwrap_or_default(),
+        target_id,
         benchmark_id: safe_manifest_field(&run.benchmark_id).unwrap_or_default(),
         session_id: None,
         launched_at: None,
@@ -286,11 +295,31 @@ fn upsert_launched_run(
 
 fn load_file(path: PathBuf) -> io::Result<BenchmarkSuiteManifest> {
     let data = fs::read_to_string(path)?;
-    serde_json::from_str(&data).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    let manifest: BenchmarkSuiteManifest = serde_json::from_str(&data)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    validate_manifest_schema(&manifest)?;
+    Ok(manifest)
 }
 
 fn suite_dir(paths: &AppPaths) -> PathBuf {
     paths.config_dir.join("benchmarks").join("suites")
+}
+
+fn validate_manifest_schema(manifest: &BenchmarkSuiteManifest) -> io::Result<()> {
+    if manifest.schema != BENCHMARK_SUITE_SCHEMA {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "benchmark suite manifest schema is not supported",
+        ));
+    }
+    if manifest.schema_version != BENCHMARK_SUITE_SCHEMA_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "benchmark suite manifest schema version is not supported",
+        ));
+    }
+
+    Ok(())
 }
 
 fn safe_stem(value: &str, max_chars: usize) -> Option<String> {
@@ -497,6 +526,7 @@ mod tests {
                     "run_index": 0,
                     "profile": "vanilla_baseline",
                     "run_type": "coldish",
+                    "target_id": "",
                     "benchmark_id": "suite-development-00-vanilla_baseline-coldish",
                     "state": "pending",
                     "unexpected_state": true
@@ -513,6 +543,42 @@ mod tests {
     }
 
     #[test]
+    fn launch_suite_manifest_with_old_schema_version_is_invalid() {
+        let root = test_root("suite-old-schema");
+        let paths = test_paths(&root);
+        let suite_id = "suite-old-schema";
+        let path = suite_path(&paths, suite_id);
+        fs::create_dir_all(path.parent().expect("suite parent")).expect("create suite dir");
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": BENCHMARK_SUITE_SCHEMA,
+                "schema_version": 1,
+                "suite_id": suite_id,
+                "instance_id": "instance",
+                "mode": "development",
+                "created_at": "2026-01-01T00:00:00.000Z",
+                "updated_at": "2026-01-01T00:00:00.000Z",
+                "runs": [{
+                    "run_index": 0,
+                    "profile": "vanilla_baseline",
+                    "run_type": "coldish",
+                    "target_id": "",
+                    "benchmark_id": "suite-development-00-vanilla_baseline-coldish",
+                    "state": "pending"
+                }]
+            }))
+            .expect("serialize manifest"),
+        )
+        .expect("write manifest");
+
+        let error = load(&paths, suite_id).expect_err("old schema should be invalid");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn launch_suite_manifest_excludes_sensitive_fields_and_path_shapes() {
         let root = test_root("suite-sensitive");
         let paths = test_paths(&root);
@@ -520,6 +586,7 @@ mod tests {
             run_index: 0,
             profile: "vanilla_baseline".to_string(),
             run_type: "coldish".to_string(),
+            target_id: Some("family_c_forge_1_12_2_vanilla_baseline/C:/runtime".to_string()),
             benchmark_id: "suite-development-00-vanilla_baseline-coldish".to_string(),
         }];
 
@@ -546,6 +613,10 @@ mod tests {
         assert!(!lower_data.contains("username"));
         assert!(!lower_data.contains("filesystem"));
         assert!(!lower_data.contains("args"));
+        assert_eq!(
+            manifest.runs[0].target_id,
+            "family_c_forge_1_12_2_vanilla_baselineCruntime"
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -685,6 +756,7 @@ mod tests {
             run_index,
             profile: profile.to_string(),
             run_type: run_type.to_string(),
+            target_id: None,
             benchmark_id: format!("suite-development-{run_index:02}-{profile}-{run_type}"),
         }
     }
