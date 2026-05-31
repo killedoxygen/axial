@@ -1158,7 +1158,7 @@ function guardianDecisionIcon(decision: LaunchPreflightResponse['guardian']['dec
 
 function guardianReadyCopy(preflight: LaunchPreflightResponse): { title: string; detail: string } {
   const guardian = preflight.guardian;
-  const firstDetail = guardian.guidance?.[0] || guardian.details?.[0];
+  const firstDetail = guardian.details?.[0] || guardian.guidance?.[0];
   if (guardian.message) {
     return { title: guardian.message, detail: firstDetail || `${guardianModeLabel(preflight.mode)} preflight is ready.` };
   }
