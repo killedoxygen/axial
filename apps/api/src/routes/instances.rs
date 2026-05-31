@@ -2,7 +2,8 @@ use crate::state::AppState;
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderValue, StatusCode, header},
+    response::{IntoResponse, Response},
     routing::{get, post, put},
 };
 use croopor_config::{EnrichedInstance, InstanceStoreError};
@@ -144,6 +145,11 @@ struct RenameWorldRequest {
     name: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct RenameScreenshotRequest {
+    name: String,
+}
+
 #[derive(Debug, Serialize)]
 struct WorldBackupResponse {
     status: &'static str,
@@ -184,6 +190,14 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/v1/instances/{id}/screenshots",
             get(handle_instance_screenshots),
+        )
+        .route(
+            "/api/v1/instances/{id}/screenshots/{name}",
+            put(handle_rename_instance_screenshot).delete(handle_delete_instance_screenshot),
+        )
+        .route(
+            "/api/v1/instances/{id}/screenshots/{name}/file",
+            get(handle_instance_screenshot_file),
         )
         .route("/api/v1/instances/{id}/logs", get(handle_instance_logs))
         .route(
@@ -530,6 +544,71 @@ async fn handle_instance_screenshots(
     )))
 }
 
+async fn handle_instance_screenshot_file(
+    State(state): State<AppState>,
+    Path((id, name)): Path<(String, String)>,
+) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
+    validate_screenshot_name(&name)?;
+    let content_type = screenshot_content_type(&name)
+        .ok_or_else(|| json_error(StatusCode::BAD_REQUEST, "invalid screenshot filename"))?;
+
+    let game_dir = instance_game_dir(&state, &id)?;
+    let path = game_dir.join("screenshots").join(&name);
+    require_screenshot_file(&path)?;
+
+    let bytes = fs::read(&path).map_err(screenshot_file_read_error_response)?;
+    let mut response = bytes.into_response();
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    Ok(response)
+}
+
+async fn handle_rename_instance_screenshot(
+    State(state): State<AppState>,
+    Path((id, name)): Path<(String, String)>,
+    Json(payload): Json<RenameScreenshotRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_screenshot_name(&name)?;
+    validate_screenshot_name(&payload.name)?;
+    if screenshot_content_type(&name) != screenshot_content_type(&payload.name) {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "screenshot file type cannot change",
+        ));
+    }
+
+    let game_dir = instance_game_dir(&state, &id)?;
+    let screenshots_dir = game_dir.join("screenshots");
+    let source = screenshots_dir.join(&name);
+    let target = screenshots_dir.join(&payload.name);
+    require_screenshot_file(&source)?;
+    if target_exists(&target) {
+        return Err(json_error(
+            StatusCode::CONFLICT,
+            "screenshot already exists",
+        ));
+    }
+
+    fs::rename(source, target).map_err(screenshot_file_write_error_response)?;
+    Ok(Json(
+        serde_json::json!({ "status": "ok", "name": payload.name }),
+    ))
+}
+
+async fn handle_delete_instance_screenshot(
+    State(state): State<AppState>,
+    Path((id, name)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_screenshot_name(&name)?;
+
+    let game_dir = instance_game_dir(&state, &id)?;
+    let source = game_dir.join("screenshots").join(&name);
+    require_screenshot_file(&source)?;
+    fs::remove_file(source).map_err(screenshot_file_write_error_response)?;
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
 async fn handle_instance_logs(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -671,6 +750,29 @@ fn require_world_dir(path: &FsPath) -> Result<(), (StatusCode, Json<serde_json::
         Ok(())
     } else {
         Err(json_error(StatusCode::NOT_FOUND, "world not found"))
+    }
+}
+
+fn validate_screenshot_name(name: &str) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if name.trim() == name && is_screenshot_name(name) {
+        Ok(())
+    } else {
+        Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid screenshot filename",
+        ))
+    }
+}
+
+fn require_screenshot_file(path: &FsPath) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| match error.kind() {
+        ErrorKind::NotFound => json_error(StatusCode::NOT_FOUND, "screenshot not found"),
+        _ => screenshot_file_read_error_response(error),
+    })?;
+    if metadata.file_type().is_file() {
+        Ok(())
+    } else {
+        Err(json_error(StatusCode::NOT_FOUND, "screenshot not found"))
     }
 }
 
@@ -874,6 +976,28 @@ fn world_file_write_error_response(
     )
 }
 
+fn screenshot_file_read_error_response(
+    _error: std::io::Error,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "error": "Could not read screenshot files. Check instance folder permissions and try again."
+        })),
+    )
+}
+
+fn screenshot_file_write_error_response(
+    _error: std::io::Error,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "error": "Could not update screenshot files. Check instance folder permissions and try again."
+        })),
+    )
+}
+
 fn scan_instance_worlds(saves_dir: &FsPath) -> Vec<InstanceWorldInfo> {
     let mut worlds = fs::read_dir(saves_dir)
         .into_iter()
@@ -993,6 +1117,19 @@ fn is_screenshot_name(name: &str) -> bool {
         .iter()
         .any(|suffix| lower.ends_with(suffix))
         && is_safe_resource_name(name)
+}
+
+fn screenshot_content_type(name: &str) -> Option<&'static str> {
+    let lower = name.to_ascii_lowercase();
+    if lower.ends_with(".png") {
+        Some("image/png")
+    } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        Some("image/jpeg")
+    } else if lower.ends_with(".webp") {
+        Some("image/webp")
+    } else {
+        None
+    }
 }
 
 fn is_safe_resource_name(name: &str) -> bool {
@@ -1289,6 +1426,239 @@ mod tests {
             vec!["latest.log".to_string(), "debug.log".to_string()]
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn instance_screenshot_names_reject_path_traversal_hidden_and_control_names() {
+        for name in [
+            "2026-05-31_12.00.00.png",
+            "castle build.jpg",
+            "base.jpeg",
+            "nether.webp",
+        ] {
+            assert!(
+                validate_screenshot_name(name).is_ok(),
+                "{name} should be accepted"
+            );
+        }
+
+        for name in [
+            "",
+            "   ",
+            ".",
+            "..",
+            ".hidden.png",
+            "../shot.png",
+            "nested/shot.png",
+            "nested\\shot.png",
+            "bad\nshot.png",
+            " shot.png",
+            "shot.png ",
+            "notes.txt",
+        ] {
+            let (status, Json(body)) =
+                validate_screenshot_name(name).expect_err("invalid screenshot name should fail");
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{name:?}");
+            assert_bounded_error_body(&body, "invalid screenshot filename");
+        }
+    }
+
+    #[test]
+    fn instance_screenshot_content_type_maps_supported_extensions() {
+        assert_eq!(screenshot_content_type("shot.png"), Some("image/png"));
+        assert_eq!(screenshot_content_type("shot.JPG"), Some("image/jpeg"));
+        assert_eq!(screenshot_content_type("shot.jpeg"), Some("image/jpeg"));
+        assert_eq!(screenshot_content_type("shot.webp"), Some("image/webp"));
+        assert_eq!(screenshot_content_type("shot.gif"), None);
+    }
+
+    #[tokio::test]
+    async fn instance_screenshot_file_serves_valid_local_image() {
+        let fixture = TestFixture::new("screenshot-file");
+        let instance = fixture
+            .state
+            .instances()
+            .add(
+                "Serve screenshots".to_string(),
+                "1.21.1".to_string(),
+                String::new(),
+                String::new(),
+                None,
+            )
+            .expect("add instance");
+        let screenshots_dir = fixture
+            .state
+            .instances()
+            .game_dir(&instance.id)
+            .join("screenshots");
+        fs::create_dir_all(&screenshots_dir).expect("create screenshots dir");
+        fs::write(screenshots_dir.join("shot.PNG"), [137, 80, 78, 71]).expect("write screenshot");
+
+        let response = handle_instance_screenshot_file(
+            State(fixture.state.clone()),
+            Path((instance.id.clone(), "shot.PNG".to_string())),
+        )
+        .await
+        .expect("serve screenshot");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("image/png"))
+        );
+
+        let (status, Json(body)) = handle_instance_screenshot_file(
+            State(fixture.state.clone()),
+            Path((instance.id, "../shot.PNG".to_string())),
+        )
+        .await
+        .expect_err("traversal should fail");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_bounded_error_body(&body, "invalid screenshot filename");
+    }
+
+    #[tokio::test]
+    async fn instance_screenshot_rename_reports_not_found_conflict_and_success() {
+        let fixture = TestFixture::new("screenshot-rename");
+        let instance = fixture
+            .state
+            .instances()
+            .add(
+                "Rename screenshots".to_string(),
+                "1.21.1".to_string(),
+                String::new(),
+                String::new(),
+                None,
+            )
+            .expect("add instance");
+        let screenshots_dir = fixture
+            .state
+            .instances()
+            .game_dir(&instance.id)
+            .join("screenshots");
+        fs::create_dir_all(&screenshots_dir).expect("create screenshots dir");
+
+        let (status, Json(body)) = handle_rename_instance_screenshot(
+            State(fixture.state.clone()),
+            Path((instance.id.clone(), "missing.png".to_string())),
+            Json(RenameScreenshotRequest {
+                name: "target.png".to_string(),
+            }),
+        )
+        .await
+        .expect_err("missing source should fail");
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_bounded_error_body(&body, "screenshot not found");
+
+        fs::write(screenshots_dir.join("source.png"), "source").expect("write source");
+        fs::write(screenshots_dir.join("target.png"), "target").expect("write target");
+        let (status, Json(body)) = handle_rename_instance_screenshot(
+            State(fixture.state.clone()),
+            Path((instance.id.clone(), "source.png".to_string())),
+            Json(RenameScreenshotRequest {
+                name: "target.png".to_string(),
+            }),
+        )
+        .await
+        .expect_err("existing target should fail");
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_bounded_error_body(&body, "screenshot already exists");
+        assert_eq!(
+            fs::read_to_string(screenshots_dir.join("source.png")).expect("read source"),
+            "source"
+        );
+
+        let (status, Json(body)) = handle_rename_instance_screenshot(
+            State(fixture.state.clone()),
+            Path((instance.id.clone(), "source.png".to_string())),
+            Json(RenameScreenshotRequest {
+                name: "renamed.webp".to_string(),
+            }),
+        )
+        .await
+        .expect_err("changing screenshot type should fail");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_bounded_error_body(&body, "screenshot file type cannot change");
+        assert_eq!(
+            fs::read_to_string(screenshots_dir.join("source.png")).expect("read source"),
+            "source"
+        );
+
+        let Json(body) = handle_rename_instance_screenshot(
+            State(fixture.state.clone()),
+            Path((instance.id.clone(), "source.png".to_string())),
+            Json(RenameScreenshotRequest {
+                name: "renamed.png".to_string(),
+            }),
+        )
+        .await
+        .expect("rename screenshot");
+        assert_eq!(
+            body,
+            serde_json::json!({ "status": "ok", "name": "renamed.png" })
+        );
+        assert!(!screenshots_dir.join("source.png").exists());
+        assert_eq!(
+            fs::read_to_string(screenshots_dir.join("renamed.png")).expect("read renamed"),
+            "source"
+        );
+    }
+
+    #[tokio::test]
+    async fn instance_screenshot_delete_removes_only_named_file() {
+        let fixture = TestFixture::new("screenshot-delete");
+        let instance = fixture
+            .state
+            .instances()
+            .add(
+                "Delete screenshots".to_string(),
+                "1.21.1".to_string(),
+                String::new(),
+                String::new(),
+                None,
+            )
+            .expect("add instance");
+        let screenshots_dir = fixture
+            .state
+            .instances()
+            .game_dir(&instance.id)
+            .join("screenshots");
+        fs::create_dir_all(&screenshots_dir).expect("create screenshots dir");
+        fs::write(screenshots_dir.join("delete.png"), "deleted").expect("write deleted");
+        fs::write(screenshots_dir.join("keep.png"), "kept").expect("write kept");
+
+        let Json(body) = handle_delete_instance_screenshot(
+            State(fixture.state.clone()),
+            Path((instance.id, "delete.png".to_string())),
+        )
+        .await
+        .expect("delete screenshot");
+
+        assert_eq!(body, serde_json::json!({ "status": "ok" }));
+        assert!(!screenshots_dir.join("delete.png").exists());
+        assert_eq!(
+            fs::read_to_string(screenshots_dir.join("keep.png")).expect("read kept"),
+            "kept"
+        );
+    }
+
+    #[test]
+    fn instance_screenshot_error_responses_do_not_leak_paths() {
+        for mapper in [
+            screenshot_file_read_error_response
+                as fn(io::Error) -> (StatusCode, Json<serde_json::Value>),
+            screenshot_file_write_error_response,
+        ] {
+            let (status, Json(body)) = mapper(io::Error::other(
+                "failed for /home/zero/.config/Croopor/instances/test/screenshots/shot.png",
+            ));
+
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            let public_message = error_body_text(&body);
+            assert!(!public_message.contains("/home/zero"));
+            assert!(!public_message.contains("shot.png"));
+            assert!(public_message.len() <= 180);
+        }
     }
 
     #[test]
