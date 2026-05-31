@@ -7,7 +7,7 @@ import {
   onNativeEvent, startNativeInstallEvents, startNativeLoaderInstallEvents,
 } from './native';
 import {
-  selectedInstance, selectedVersion, installState, catalog, versions,
+  selectedInstance, selectedVersion, installState, installEventSource, catalog, versions,
 } from './store';
 import {
   enqueueInstall, dequeueNextInstall, startInstall, updateInstallProgress,
@@ -24,6 +24,14 @@ type InstallProgressEvent = {
   done?: boolean;
 };
 
+type CloseableSource = {
+  close(): void;
+};
+
+type PendingInstallEventSource = CloseableSource & {
+  setSource(source: CloseableSource): boolean;
+};
+
 const INSTALL_ETA_PHASES = new Set([
   'libraries',
   'assets',
@@ -31,6 +39,72 @@ const INSTALL_ETA_PHASES = new Set([
   'loader_processors',
   'processors',
 ]);
+
+function isActiveInstall(versionId: string): boolean {
+  const active = installState.value;
+  return active.status === 'active' && active.versionId === versionId;
+}
+
+function isActiveInstallSource(versionId: string, source: CloseableSource | null): boolean {
+  return isActiveInstall(versionId) && source !== null && installEventSource.value === source;
+}
+
+function createPendingInstallEventSource(): PendingInstallEventSource {
+  let closed = false;
+  let source: CloseableSource | null = null;
+
+  return {
+    close(): void {
+      if (closed) return;
+      closed = true;
+      source?.close();
+      source = null;
+    },
+    setSource(nextSource: CloseableSource): boolean {
+      if (closed) {
+        nextSource.close();
+        return false;
+      }
+      source = nextSource;
+      return true;
+    },
+  };
+}
+
+async function connectNativeInstallEventSource(
+  versionId: string,
+  controller: PendingInstallEventSource,
+  eventName: string,
+  onData: (data: InstallProgressEvent) => void,
+  startEvents: () => Promise<boolean>,
+  unavailableMessage: string,
+): Promise<void> {
+  setInstallEventSource(controller);
+
+  let subscription: CloseableSource | null = null;
+  try {
+    subscription = await onNativeEvent(eventName, onData);
+  } catch (err: unknown) {
+    if (!isActiveInstallSource(versionId, controller)) return;
+    throw err;
+  }
+
+  if (!subscription) {
+    if (!isActiveInstallSource(versionId, controller)) return;
+    throw new Error(unavailableMessage);
+  }
+  if (!controller.setSource(subscription)) return;
+  if (!isActiveInstallSource(versionId, controller)) return;
+
+  try {
+    await startEvents();
+  } catch (err: unknown) {
+    if (!isActiveInstallSource(versionId, controller)) return;
+    controller.close();
+    if (installEventSource.value === controller) setInstallEventSource(null);
+    throw err;
+  }
+}
 
 export function handleInstallClick(): void {
   const inst = selectedInstance.value;
@@ -287,10 +361,15 @@ function phaseLabel(data: InstallProgressEvent, loaderInstall: boolean): string 
 }
 
 async function connectVanillaEvents(installId: string, versionId: string): Promise<void> {
+  if (!isActiveInstall(versionId)) return;
+
   const startedAt = Date.now();
   const estimator = createProgressEstimator({ etaPhases: INSTALL_ETA_PHASES });
+  let progressSource: CloseableSource | null = null;
 
   const onProgress = async (data: InstallProgressEvent): Promise<void> => {
+    if (!isActiveInstallSource(versionId, progressSource)) return;
+
     let pct = 0;
     let label = phaseLabel(data, false);
 
@@ -325,22 +404,24 @@ async function connectVanillaEvents(installId: string, versionId: string): Promi
   };
 
   if (hasNativeDesktopRuntime()) {
-    const subscription = await onNativeEvent(nativeInstallEventName(installId), (data) => {
-      void onProgress(data);
-    });
-    if (!subscription) throw new Error('native install stream unavailable');
-    setInstallEventSource(subscription);
-    try {
-      await startNativeInstallEvents(installId);
-    } catch (err: unknown) {
-      subscription.close();
-      setInstallEventSource(null);
-      throw err;
-    }
+    const controller = createPendingInstallEventSource();
+    progressSource = controller;
+
+    await connectNativeInstallEventSource(
+      versionId,
+      controller,
+      nativeInstallEventName(installId),
+      (data) => {
+        void onProgress(data);
+      },
+      () => startNativeInstallEvents(installId),
+      'native install stream unavailable',
+    );
     return;
   }
 
   const es = new EventSource(apiUrl(`/install/${installId}/events`));
+  progressSource = es;
   setInstallEventSource(es);
 
   es.addEventListener('progress', (e: MessageEvent) => {
@@ -350,8 +431,7 @@ async function connectVanillaEvents(installId: string, versionId: string): Promi
   es.onerror = () => {
     if (es.readyState !== EventSource.CLOSED) return;
     void (async () => {
-      const active = installState.value;
-      if (active.status === 'active' && active.versionId === versionId) {
+      if (isActiveInstallSource(versionId, es)) {
         showError('Install event stream closed unexpectedly');
         await onInstallDone();
       }
@@ -360,9 +440,14 @@ async function connectVanillaEvents(installId: string, versionId: string): Promi
 }
 
 async function connectLoaderEvents(installId: string, versionId: string): Promise<void> {
+  if (!isActiveInstall(versionId)) return;
+
   const startedAt = Date.now();
   const estimator = createProgressEstimator({ etaPhases: INSTALL_ETA_PHASES });
+  let progressSource: CloseableSource | null = null;
   const onProgress = (data: InstallProgressEvent): void => {
+    if (!isActiveInstallSource(versionId, progressSource)) return;
+
     let pct = 0;
     let label = phaseLabel(data, true);
 
@@ -410,40 +495,43 @@ async function connectLoaderEvents(installId: string, versionId: string): Promis
   };
 
   const onError = (message: string): void => {
-    const active = installState.value;
-    if (active.status === 'active' && active.versionId === versionId) {
+    if (isActiveInstallSource(versionId, progressSource)) {
       showError(message);
       void onInstallDone();
     }
   };
 
   if (hasNativeDesktopRuntime()) {
-    const subscription = await onNativeEvent(nativeLoaderInstallEventName(installId), (data) => {
-      if (data.phase === 'error' || data.error) {
-        onError(data.error || 'Unknown error');
-        return;
-      }
-      onProgress(data);
-    });
-    if (!subscription) throw new Error('native loader install stream unavailable');
-    setInstallEventSource(subscription);
-    try {
-      await startNativeLoaderInstallEvents(installId);
-    } catch (err: unknown) {
-      subscription.close();
-      setInstallEventSource(null);
-      throw err;
-    }
+    const controller = createPendingInstallEventSource();
+    progressSource = controller;
+
+    await connectNativeInstallEventSource(
+      versionId,
+      controller,
+      nativeLoaderInstallEventName(installId),
+      (data) => {
+        if (data.phase === 'error' || data.error) {
+          onError(data.error || 'Unknown error');
+          return;
+        }
+        onProgress(data);
+      },
+      () => startNativeLoaderInstallEvents(installId),
+      'native loader install stream unavailable',
+    );
     return;
   }
 
   const es = connectLoaderInstallSSE(
     installId,
     onProgress,
-    () => { void onInstallDone(); },
+    () => {
+      if (isActiveInstallSource(versionId, progressSource)) void onInstallDone();
+    },
     onError,
   );
 
+  progressSource = es;
   setInstallEventSource(es);
 }
 
