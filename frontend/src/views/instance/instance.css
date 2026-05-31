@@ -1906,21 +1906,15 @@
 .cp-settings-pane {
   display: flex;
   flex-direction: column;
-  gap: 16px;
-}
-.cp-settings-topline {
-  display: flex;
-  align-items: flex-end;
-  justify-content: space-between;
   gap: 12px;
-  flex-wrap: wrap;
 }
-.cp-settings-topline .cp-section-head {
-  margin: 0;
+.cp-settings-toolbar {
+  align-items: center;
 }
 .cp-settings-save {
   display: inline-flex;
   align-items: center;
+  justify-content: flex-end;
   gap: 10px;
 }
 .cp-settings-save > span {
@@ -1932,8 +1926,25 @@
 .cp-settings-save > span[data-dirty="true"] {
   color: var(--accent);
 }
+.cp-settings-layout {
+  grid-template-columns: minmax(220px, 280px) minmax(0, 1fr);
+  min-height: 560px;
+}
+.cp-settings-list button {
+  gap: 5px;
+  padding: 13px 14px;
+}
+.cp-settings-list small {
+  font-size: 12px;
+  line-height: 1.35;
+  white-space: normal;
+}
+.cp-settings-preview {
+  color: var(--text);
+  background: var(--surface);
+}
 .cp-settings-sheet {
-  border-top: 1px solid color-mix(in oklab, var(--line) 60%, transparent);
+  min-width: 0;
 }
 .cp-settings-section-icon {
   display: inline-flex;
@@ -1949,10 +1960,14 @@
 }
 .cp-settings-row {
   display: grid;
-  grid-template-columns: minmax(200px, 270px) minmax(0, 1fr);
-  gap: 28px;
-  padding: 20px 0;
-  border-bottom: 1px solid color-mix(in oklab, var(--line) 60%, transparent);
+  grid-template-columns: minmax(190px, 250px) minmax(0, 1fr);
+  gap: 22px;
+  padding: 18px;
+  border-bottom: 1px solid var(--line);
+  scroll-margin-top: 12px;
+}
+.cp-settings-row:last-child {
+  border-bottom: none;
 }
 .cp-settings-row-head {
   display: grid;
@@ -2139,13 +2154,13 @@
   text-transform: uppercase;
 }
 @media (max-width: 1180px) {
-  .cp-settings-pane {
-    gap: 12px;
+  .cp-settings-layout {
+    grid-template-columns: minmax(200px, 235px) minmax(0, 1fr);
   }
   .cp-settings-row {
-    grid-template-columns: minmax(174px, 218px) minmax(0, 1fr);
+    grid-template-columns: minmax(168px, 210px) minmax(0, 1fr);
     gap: 14px;
-    padding: 14px 0;
+    padding: 14px;
   }
   .cp-settings-row-head {
     gap: 10px;
@@ -2160,27 +2175,19 @@
     grid-template-columns: repeat(auto-fit, minmax(144px, 1fr));
   }
 }
-@media (max-width: 860px) {
+@media (max-width: 920px) {
+  .cp-settings-layout {
+    grid-template-columns: minmax(170px, 200px) minmax(0, 1fr);
+  }
   .cp-settings-row {
     grid-template-columns: 1fr;
+    padding: 16px;
     gap: 14px;
   }
-}
-@media (max-width: 640px) {
-  .cp-settings-save {
-    width: 100%;
-    justify-content: space-between;
-  }
-  .cp-settings-row {
-    padding: 18px 0;
-  }
-  .cp-settings-identity-control,
-  .cp-settings-dimensions,
   .cp-settings-advanced-grid {
     grid-template-columns: 1fr;
   }
 }
-
 /* ─── Reduced-motion: kill staggered entrances and pulses. ─── */
 @media (prefers-reduced-motion: reduce) {
   .cp-od-stagger {

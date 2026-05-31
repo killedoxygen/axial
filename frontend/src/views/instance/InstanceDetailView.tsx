@@ -1,7 +1,7 @@
 import type { JSX } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { Icon } from '../../ui/Icons';
-import { Button, Card, IconButton, Input, Pill, SectionHeading } from '../../ui/Atoms';
+import { Button, Card, IconButton, Input, Pill } from '../../ui/Atoms';
 import { Slider, type SliderZone } from '../../ui/Slider';
 import { useTheme } from '../../hooks/use-theme';
 import { InstanceArt, artPresetForSeed, artSeedFor, nextArtSeed } from '../../art/InstanceArt';
@@ -1918,6 +1918,7 @@ function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
   const [javaPath, setJavaPath] = useState<string>(inst.java_path ?? '');
   const [jvmArgs, setJvmArgs] = useState<string>(inst.extra_jvm_args ?? '');
   const [advancedOpen, setAdvancedOpen] = useState<boolean>(Boolean(inst.java_path || inst.extra_jvm_args));
+  const [activeSettingsSection, setActiveSettingsSection] = useState<string>('policy');
   const [saving, setSaving] = useState(false);
   const totalGB = systemInfo.value?.total_memory_mb ? Math.max(1, Math.floor(systemInfo.value.total_memory_mb / 1024)) : 32;
   const ramMax = Math.max(2, Math.min(32, totalGB));
@@ -1937,6 +1938,13 @@ function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
     ? `${performanceModeLabel(effectiveSettingsMode)} override`
     : `Inherits ${performanceModeLabel(effectiveSettingsMode)} from global settings`;
   const runtimePresetText = `${JVM_PRESET_LABELS[jvmPreset]}: ${JVM_PRESET_HINTS[jvmPreset]}`;
+  const settingsSections = [
+    { id: 'policy', label: 'Performance policy', meta: performanceModeText },
+    { id: 'memory', label: 'Memory', meta: `${fmtMem(recMin)} to ${fmtMem(recMax)} recommended` },
+    { id: 'runtime', label: 'Runtime', meta: runtimePresetText },
+    { id: 'window', label: 'Window', meta: `${activeWindowLabel} · ${width} × ${height}` },
+    { id: 'identity', label: 'Identity', meta: `${artPreset} artwork style` },
+  ];
   const dirty = (
     artSeed !== initialArtSeed ||
     Math.round(maxMem * 1024) !== (inst.max_memory_mb ?? config.value?.max_memory_mb ?? 4096) ||
@@ -2003,18 +2011,39 @@ function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
     }
   };
 
+  const jumpToSettingsSection = (sectionId: string): void => {
+    setActiveSettingsSection(sectionId);
+    document.getElementById(`cp-settings-${sectionId}`)?.scrollIntoView({ block: 'start' });
+  };
+
   return (
     <div class="cp-instance-body cp-settings-pane">
-      <div class="cp-settings-topline">
-        <SectionHeading eyebrow="Settings" title="Launch profile" />
+      <div class="cp-resource-toolbar cp-settings-toolbar">
+        <strong>Launch profile</strong>
         <div class="cp-settings-save">
           <span data-dirty={dirty}>{dirty ? 'Unsaved changes' : 'Up to date'}</span>
           <Button onClick={save} disabled={saving || !dirty} sound="affirm">{saving ? 'Saving…' : 'Save settings'}</Button>
         </div>
       </div>
 
-      <div class="cp-settings-sheet">
-        <section class="cp-settings-row">
+      <div class="cp-logs-layout cp-settings-layout">
+        <div class="cp-logs-list cp-settings-list" aria-label="Settings sections">
+          {settingsSections.map((section) => (
+            <button
+              key={section.id}
+              type="button"
+              data-active={activeSettingsSection === section.id}
+              onClick={() => jumpToSettingsSection(section.id)}
+            >
+              <span>{section.label}</span>
+              <small>{section.meta}</small>
+            </button>
+          ))}
+        </div>
+
+        <div class="cp-log-preview cp-settings-preview">
+          <div class="cp-settings-sheet">
+        <section id="cp-settings-policy" class="cp-settings-row">
           <div class="cp-settings-row-head">
             <span class="cp-settings-section-icon"><Icon name="shield-check" size={15} /></span>
             <div>
@@ -2043,7 +2072,7 @@ function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
           </div>
         </section>
 
-        <section class="cp-settings-row">
+        <section id="cp-settings-memory" class="cp-settings-row">
           <div class="cp-settings-row-head">
             <span class="cp-settings-section-icon"><Icon name="settings" size={15} /></span>
             <div>
@@ -2088,7 +2117,7 @@ function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
           </div>
         </section>
 
-        <section class="cp-settings-row">
+        <section id="cp-settings-runtime" class="cp-settings-row">
           <div class="cp-settings-row-head">
             <span class="cp-settings-section-icon"><Icon name="terminal" size={15} /></span>
             <div>
@@ -2139,7 +2168,7 @@ function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
           </div>
         </section>
 
-        <section class="cp-settings-row">
+        <section id="cp-settings-window" class="cp-settings-row">
           <div class="cp-settings-row-head">
             <span class="cp-settings-section-icon"><Icon name="rectangle" size={15} /></span>
             <div>
@@ -2184,7 +2213,7 @@ function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
           </div>
         </section>
 
-        <section class="cp-settings-row cp-settings-row--identity">
+        <section id="cp-settings-identity" class="cp-settings-row cp-settings-row--identity">
           <div class="cp-settings-row-head">
             <span class="cp-settings-section-icon"><Icon name="image" size={15} /></span>
             <div>
@@ -2208,6 +2237,8 @@ function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
             </Button>
           </div>
         </section>
+          </div>
+        </div>
       </div>
     </div>
   );
