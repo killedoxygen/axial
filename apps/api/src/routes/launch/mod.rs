@@ -1454,6 +1454,34 @@ fn family_c_qualification_target_payload(
             if target.comparison_required && proof.comparison.is_none() {
                 missing.push("managed_comparison_missing");
             }
+            match proof.resource_budget.as_ref() {
+                Some(resource_budget) => {
+                    if !family_c_qualification_resource_memory_evidence(resource_budget) {
+                        missing.push("proof_resource_memory_evidence_missing");
+                    }
+                    if !family_c_qualification_resource_cpu_evidence(resource_budget) {
+                        missing.push("proof_resource_cpu_evidence_missing");
+                    }
+                    if !family_c_qualification_resource_install_evidence(resource_budget) {
+                        missing.push("proof_resource_install_evidence_missing");
+                    }
+                    if !family_c_qualification_resource_disk_evidence(resource_budget) {
+                        missing.push("proof_resource_disk_evidence_missing");
+                    }
+                }
+                None => {
+                    missing.push("proof_resource_budget_missing");
+                    missing.push("proof_resource_memory_evidence_missing");
+                    missing.push("proof_resource_cpu_evidence_missing");
+                    missing.push("proof_resource_install_evidence_missing");
+                    missing.push("proof_resource_disk_evidence_missing");
+                }
+            }
+            if proof.guardian.is_none() {
+                missing.push("proof_guardian_missing");
+            } else if family_c_qualification_guardian_decision(proof).is_none() {
+                missing.push("proof_guardian_decision_missing");
+            }
         }
         None => missing.push("proof_missing"),
     }
@@ -1564,7 +1592,91 @@ fn family_c_qualification_proof_payload(
             .map(|value| bounded_descriptor_token(value, "version")),
         "outcome": bounded_descriptor_token(&proof.outcome, "outcome"),
         "comparison": comparison.unwrap_or_else(|| json!({ "present": false })),
+        "resource_budget": family_c_qualification_resource_budget_payload(
+            proof.resource_budget.as_ref()
+        ),
+        "guardian": family_c_qualification_guardian_payload(proof),
     })
+}
+
+fn family_c_qualification_resource_budget_payload(
+    resource_budget: Option<&crate::state::launch_reports::LaunchProofResourceBudget>,
+) -> serde_json::Value {
+    let Some(resource_budget) = resource_budget else {
+        return json!({
+            "present": false,
+            "memory": false,
+            "cpu": false,
+            "install": false,
+            "disk": false,
+        });
+    };
+
+    json!({
+        "present": true,
+        "memory": family_c_qualification_resource_memory_evidence(resource_budget),
+        "cpu": family_c_qualification_resource_cpu_evidence(resource_budget),
+        "install": family_c_qualification_resource_install_evidence(resource_budget),
+        "disk": family_c_qualification_resource_disk_evidence(resource_budget),
+    })
+}
+
+fn family_c_qualification_resource_memory_evidence(
+    resource_budget: &crate::state::launch_reports::LaunchProofResourceBudget,
+) -> bool {
+    resource_budget.host_total_memory_mb.is_some()
+        && resource_budget.requested_memory_mb.is_some()
+        && resource_budget.estimated_remaining_memory_mb.is_some()
+}
+
+fn family_c_qualification_resource_cpu_evidence(
+    resource_budget: &crate::state::launch_reports::LaunchProofResourceBudget,
+) -> bool {
+    resource_budget.host_cpu_threads.is_some()
+        || resource_budget.host_cpu_load_1m_x100.is_some()
+        || resource_budget.host_cpu_load_5m_x100.is_some()
+        || resource_budget.host_cpu_load_15m_x100.is_some()
+}
+
+fn family_c_qualification_resource_install_evidence(
+    _resource_budget: &crate::state::launch_reports::LaunchProofResourceBudget,
+) -> bool {
+    true
+}
+
+fn family_c_qualification_resource_disk_evidence(
+    resource_budget: &crate::state::launch_reports::LaunchProofResourceBudget,
+) -> bool {
+    resource_budget.launch_disk_available_mb.is_some()
+}
+
+fn family_c_qualification_guardian_payload(
+    proof: &crate::state::launch_reports::LaunchProofRecord,
+) -> serde_json::Value {
+    let Some(guardian) = proof.guardian.as_ref() else {
+        return json!({ "present": false });
+    };
+    let decision = guardian
+        .get("decision")
+        .and_then(|value| value.as_str())
+        .and_then(trimmed_string);
+
+    json!({
+        "present": true,
+        "decision": decision.map(|value| bounded_descriptor_token(&value, "decision")),
+    })
+}
+
+fn family_c_qualification_guardian_decision(
+    proof: &crate::state::launch_reports::LaunchProofRecord,
+) -> Option<&str> {
+    proof
+        .guardian
+        .as_ref()
+        .and_then(|guardian| guardian.get("decision"))
+        .and_then(|decision| decision.as_str())
+        .map(str::trim)
+        .filter(|decision| !decision.is_empty())
 }
 
 fn family_c_qualification_target_ready(target: &serde_json::Value) -> bool {
@@ -2632,8 +2744,117 @@ mod tests {
             payload["targets"][1]["proof"]["comparison"]["present"],
             serde_json::json!(true)
         );
+        assert_eq!(
+            payload["targets"][0]["proof"]["resource_budget"],
+            serde_json::json!({
+                "present": true,
+                "memory": true,
+                "cpu": true,
+                "install": true,
+                "disk": true,
+            })
+        );
+        assert_eq!(
+            payload["targets"][0]["proof"]["guardian"],
+            serde_json::json!({
+                "present": true,
+                "decision": "allowed",
+            })
+        );
         assert_eq!(payload["targets"][0]["missing"], serde_json::json!([]));
         assert_eq!(payload["targets"][1]["missing"], serde_json::json!([]));
+
+        cleanup(&fixture.root);
+    }
+
+    #[tokio::test]
+    async fn family_c_qualification_proofs_without_guardian_and_resource_budget_are_incomplete() {
+        let fixture = RouteTestFixture::new("family-c-qualification-missing-proof-evidence");
+        let suite_id = "family-c-qualification-missing-proof-evidence";
+        persist_family_c_suite_run(&fixture.paths, suite_id, 0, "baseline-session");
+        persist_family_c_suite_run(&fixture.paths, suite_id, 1, "managed-session");
+        let manifest = crate::state::benchmark_suites::load(&fixture.paths, suite_id)
+            .expect("load suite")
+            .expect("suite exists");
+        let baseline_run = manifest
+            .runs
+            .iter()
+            .find(|run| run.target_id == FAMILY_C_BASELINE_TARGET_ID)
+            .expect("baseline run");
+        let managed_run = manifest
+            .runs
+            .iter()
+            .find(|run| run.target_id == FAMILY_C_MANAGED_TARGET_ID)
+            .expect("managed run");
+        let mut baseline_proof = family_c_proof_record(baseline_run, "vanilla", None);
+        baseline_proof.resource_budget = None;
+        baseline_proof.guardian = None;
+        write_family_c_proof_record(&fixture.paths, &baseline_proof);
+        let mut managed_proof = family_c_proof_record(
+            managed_run,
+            "managed",
+            Some(crate::state::launch_reports::LaunchProofComparison {
+                baseline_session_id: "baseline-session".to_string(),
+                baseline_recorded_at: "2026-01-01T00:01:00.000Z".to_string(),
+                matched_sample_count: 1,
+                metric_name: "total_completed_stage_duration_ms".to_string(),
+                current_value_ms: 90,
+                baseline_value_ms: 120,
+                delta_ms: -30,
+                delta_percent: -25.0,
+            }),
+        );
+        managed_proof.resource_budget = None;
+        managed_proof.guardian = Some(serde_json::json!({
+            "mode": "managed",
+            "decision": "   ",
+        }));
+        write_family_c_proof_record(&fixture.paths, &managed_proof);
+
+        let payload = family_c_qualification_payload(&fixture.state, suite_id)
+            .await
+            .expect("qualification payload");
+
+        let expected_baseline_missing = serde_json::json!([
+            "proof_guardian_missing",
+            "proof_resource_budget_missing",
+            "proof_resource_cpu_evidence_missing",
+            "proof_resource_disk_evidence_missing",
+            "proof_resource_install_evidence_missing",
+            "proof_resource_memory_evidence_missing"
+        ]);
+        let expected_managed_missing = serde_json::json!([
+            "proof_guardian_decision_missing",
+            "proof_resource_budget_missing",
+            "proof_resource_cpu_evidence_missing",
+            "proof_resource_disk_evidence_missing",
+            "proof_resource_install_evidence_missing",
+            "proof_resource_memory_evidence_missing"
+        ]);
+        assert_eq!(payload["status"], serde_json::json!("incomplete"));
+        assert_eq!(payload["targets"][0]["missing"], expected_baseline_missing);
+        assert_eq!(payload["targets"][1]["missing"], expected_managed_missing);
+        assert_eq!(
+            payload["targets"][0]["proof"]["resource_budget"],
+            serde_json::json!({
+                "present": false,
+                "memory": false,
+                "cpu": false,
+                "install": false,
+                "disk": false,
+            })
+        );
+        assert_eq!(
+            payload["targets"][0]["proof"]["guardian"],
+            serde_json::json!({ "present": false })
+        );
+        assert_eq!(
+            payload["targets"][1]["proof"]["guardian"],
+            serde_json::json!({
+                "present": true,
+                "decision": null,
+            })
+        );
 
         cleanup(&fixture.root);
     }
@@ -2880,6 +3101,17 @@ mod tests {
             payload["targets"][1]["proof"]["comparison"]["present"],
             serde_json::json!(true)
         );
+        assert_eq!(
+            payload["targets"][1]["proof"]["resource_budget"]["present"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            payload["targets"][1]["proof"]["guardian"],
+            serde_json::json!({
+                "present": true,
+                "decision": "allowed",
+            })
+        );
         assert_eq!(payload["targets"][0]["missing"], serde_json::json!([]));
         assert_eq!(payload["targets"][1]["missing"], serde_json::json!([]));
         assert!(!lower_data.contains("java_path"));
@@ -3062,6 +3294,11 @@ mod tests {
         );
         managed_proof.failure_detail =
             Some("C:\\Users\\SecretUser\\token --java-args --runtime-arguments".to_string());
+        managed_proof.guardian = Some(serde_json::json!({
+            "mode": "managed",
+            "decision": "allowed",
+            "details": ["C:\\Users\\SecretUser\\token --runtime-arguments"],
+        }));
         write_family_c_proof_record(&fixture.paths, &managed_proof);
 
         let payload = family_c_qualification_payload(&fixture.state, suite_id)
@@ -4199,14 +4436,17 @@ mod tests {
                 total_memory_mb: Some(16_384),
                 cpu_threads: Some(8),
             },
-            resource_budget: None,
+            resource_budget: Some(family_c_resource_budget()),
             pid: None,
             exit_code: Some(0),
             boot_duration_ms: None,
             priority: None,
             failure_class: None,
             failure_detail: None,
-            guardian: None,
+            guardian: Some(json!({
+                "mode": "managed",
+                "decision": "allowed",
+            })),
             healing: None,
             stages: vec![LaunchStageRecord {
                 stage: "launching".to_string(),
@@ -4219,6 +4459,31 @@ mod tests {
                 fallback_reason: None,
             }],
             comparison,
+        }
+    }
+
+    fn family_c_resource_budget() -> crate::state::launch_reports::LaunchProofResourceBudget {
+        crate::state::launch_reports::LaunchProofResourceBudget {
+            host_total_memory_mb: Some(16_384),
+            host_available_memory_mb: Some(12_288),
+            host_used_memory_mb: Some(4_096),
+            host_cpu_threads: Some(8),
+            host_cpu_load_1m_x100: Some(125),
+            host_cpu_load_5m_x100: Some(100),
+            host_cpu_load_15m_x100: Some(75),
+            launcher_process_memory_mb: Some(256),
+            active_session_count: 0,
+            active_install_count: 0,
+            active_memory_allocation_mb: 0,
+            requested_memory_mb: Some(4096),
+            estimated_remaining_memory_mb: Some(12_288),
+            memory_headroom_mb: 2048,
+            memory_pressure: false,
+            cpu_pressure: false,
+            install_pressure: false,
+            launch_disk_available_mb: Some(65_536),
+            launch_disk_headroom_mb: crate::state::launch_reports::LAUNCH_DISK_HEADROOM_MB,
+            disk_pressure: false,
         }
     }
 
