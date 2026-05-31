@@ -2,7 +2,7 @@ use super::{
     AttemptOverrides, HealingSummaryInput, LaunchIntent, LaunchPreparationError,
     LaunchPreparationMetrics, PreparedLaunchAttempt, build_healing_summary, infer_loader,
 };
-use crate::build::{VanillaLaunchRequest, plan_resolved_launch};
+use crate::build::{LaunchAuthContext, VanillaLaunchRequest, plan_resolved_launch};
 use crate::guardian::resolve_launch_preset;
 use crate::jvm::{boot_throttle_args, gc_preset_args};
 use crate::runtime::RuntimeSelection;
@@ -182,7 +182,7 @@ pub async fn prepare_launch_attempt(
             session_id: intent.session_id.clone(),
             mc_dir: intent.library_dir.clone(),
             version_id: intent.version_id.clone(),
-            username: intent.username.clone(),
+            auth: LaunchAuthContext::offline(&intent.username),
             runtime: runtime.clone(),
             game_dir: intent.game_dir.clone(),
             launcher_name: intent.launcher_name.clone(),
@@ -401,6 +401,84 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn prepare_launch_attempt_uses_offline_auth_context_from_intent_username() {
+        let root = unique_temp_root("croopor-prepare-auth-test");
+        let library_dir = root.join("library");
+        let game_dir = root.join("instances").join("auth-test");
+        let fake_java = write_fake_java(&root);
+        let version_id = "auth-test";
+        let version_dir = library_dir.join("versions").join(version_id);
+        fs::create_dir_all(&version_dir).expect("version dir");
+        fs::create_dir_all(&game_dir).expect("game dir");
+        fs::write(version_dir.join(format!("{version_id}.jar")), b"client jar")
+            .expect("client jar");
+        write_version_json(
+            &version_dir.join(format!("{version_id}.json")),
+            serde_json::json!({
+                "id": version_id,
+                "type": "release",
+                "mainClass": "net.minecraft.client.main.Main",
+                "javaVersion": {
+                    "component": "java-runtime-delta",
+                    "majorVersion": 21
+                },
+                "assetIndex": { "id": "auth-assets" },
+                "arguments": {
+                    "jvm": [],
+                    "game": [
+                        "--username",
+                        "${auth_player_name}",
+                        "--uuid",
+                        "${auth_uuid}",
+                        "--accessToken",
+                        "${auth_access_token}",
+                        "--userType",
+                        "${user_type}"
+                    ]
+                },
+                "libraries": []
+            }),
+        );
+
+        let intent = LaunchIntent {
+            session_id: "prepare-auth-test".to_string(),
+            library_dir: library_dir.clone(),
+            instance_id: "auth-test".to_string(),
+            version_id: version_id.to_string(),
+            username: "Player".to_string(),
+            requested_java: fake_java.to_string_lossy().to_string(),
+            requested_preset: String::new(),
+            extra_jvm_args: Vec::new(),
+            max_memory_mb: 2048,
+            min_memory_mb: 512,
+            resolution: None,
+            launcher_name: "croopor".to_string(),
+            launcher_version: "test".to_string(),
+            game_dir: Some(game_dir),
+            guardian: LaunchGuardianContext {
+                mode: GuardianMode::Managed,
+                ..LaunchGuardianContext::default()
+            },
+            performance_mode: "managed".to_string(),
+        };
+
+        let prepared = prepare_launch_attempt(&intent, &AttemptOverrides::default())
+            .await
+            .expect("prepared launch");
+
+        assert_arg_value(&prepared.plan.game_args, "--username", "Player");
+        assert_arg_value(
+            &prepared.plan.game_args,
+            "--uuid",
+            &croopor_minecraft::offline_uuid("Player"),
+        );
+        assert_arg_value(&prepared.plan.game_args, "--accessToken", "null");
+        assert_arg_value(&prepared.plan.game_args, "--userType", "legacy");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[derive(Clone, Copy)]
     struct RepresentativeTarget {
         minecraft_version: &'static str,
@@ -593,5 +671,13 @@ echo 'openjdk version "21.0.3" 2024-04-16' >&2
             serde_json::to_vec_pretty(&value).expect("serialize version json"),
         )
         .expect("version json");
+    }
+
+    fn assert_arg_value(args: &[String], name: &str, expected: &str) {
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == name && pair[1] == expected),
+            "expected {name} to be followed by {expected:?} in {args:?}"
+        );
     }
 }

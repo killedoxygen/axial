@@ -10,8 +10,8 @@ pub mod session;
 pub mod types;
 
 pub use build::{
-    VanillaLaunchPlan, VanillaLaunchPlanError, VanillaLaunchRequest, cleanup_natives_dir,
-    plan_resolved_launch, plan_vanilla_launch,
+    LaunchAuthContext, VanillaLaunchPlan, VanillaLaunchPlanError, VanillaLaunchRequest,
+    cleanup_natives_dir, plan_resolved_launch, plan_vanilla_launch,
 };
 pub use guardian::{
     GuardianDecision, GuardianIntervention, GuardianInterventionKind, GuardianMode,

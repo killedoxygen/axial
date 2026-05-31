@@ -13,12 +13,36 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use zip::ZipArchive;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchAuthContext {
+    pub player_name: String,
+    pub uuid: String,
+    pub access_token: String,
+    pub client_id: String,
+    pub xuid: String,
+    pub user_type: String,
+}
+
+impl LaunchAuthContext {
+    pub fn offline(player_name: impl Into<String>) -> Self {
+        let player_name = player_name.into();
+        Self {
+            uuid: offline_uuid(&player_name),
+            player_name,
+            access_token: "null".to_string(),
+            client_id: String::new(),
+            xuid: String::new(),
+            user_type: "legacy".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct VanillaLaunchRequest {
     pub session_id: String,
     pub mc_dir: PathBuf,
     pub version_id: String,
-    pub username: String,
+    pub auth: LaunchAuthContext,
     pub runtime: RuntimeSelection,
     pub game_dir: Option<PathBuf>,
     pub launcher_name: String,
@@ -115,16 +139,16 @@ pub fn plan_resolved_launch(
         .unwrap_or_default();
 
     let vars = LaunchVars {
-        auth_player_name: request.username.clone(),
+        auth_player_name: request.auth.player_name.clone(),
         version_name: version.id.clone(),
         game_directory: game_dir.to_string_lossy().to_string(),
         assets_root: request.mc_dir.join("assets").to_string_lossy().to_string(),
         asset_index_name: version.asset_index.id.clone(),
-        auth_uuid: offline_uuid(&request.username),
-        auth_access_token: "null".to_string(),
-        client_id: String::new(),
-        auth_xuid: String::new(),
-        user_type: "legacy".to_string(),
+        auth_uuid: request.auth.uuid.clone(),
+        auth_access_token: request.auth.access_token.clone(),
+        client_id: request.auth.client_id.clone(),
+        auth_xuid: request.auth.xuid.clone(),
+        user_type: request.auth.user_type.clone(),
         version_type: version.kind.clone(),
         launcher_name: request.launcher_name.clone(),
         launcher_version: request.launcher_version.clone(),
@@ -455,7 +479,7 @@ mod tests {
                 session_id: "test-session".to_string(),
                 mc_dir: library_dir.clone(),
                 version_id: "test".to_string(),
-                username: "Player".to_string(),
+                auth: LaunchAuthContext::offline("Player"),
                 runtime: RuntimeSelection {
                     requested_path: String::new(),
                     selected_path: String::new(),
@@ -526,6 +550,94 @@ mod tests {
     }
 
     #[test]
+    fn offline_auth_context_preserves_current_command_auth_args() {
+        let root = unique_temp_root("croopor-build-offline-auth-test");
+        let version: VersionJson = auth_version_json();
+
+        let plan = plan_resolved_launch(
+            &VanillaLaunchRequest {
+                session_id: "test-session".to_string(),
+                mc_dir: root.clone(),
+                version_id: "auth-test".to_string(),
+                auth: LaunchAuthContext::offline("Player"),
+                runtime: test_runtime(),
+                game_dir: None,
+                launcher_name: "croopor".to_string(),
+                launcher_version: "test".to_string(),
+                min_memory_mb: None,
+                max_memory_mb: None,
+                extra_jvm_args: Vec::new(),
+                resolution: None,
+            },
+            version,
+        )
+        .expect("launch plan");
+
+        assert_arg_value(&plan.game_args, "--username", "Player");
+        assert_arg_value(&plan.game_args, "--uuid", &offline_uuid("Player"));
+        assert_arg_value(&plan.game_args, "--accessToken", "null");
+        assert_arg_value(&plan.game_args, "--clientId", "");
+        assert_arg_value(&plan.game_args, "--xuid", "");
+        assert_arg_value(&plan.game_args, "--userType", "legacy");
+        assert!(plan.command.iter().any(|arg| arg == "--accessToken"));
+        assert!(plan.command.iter().any(|arg| arg == "null"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_auth_context_flows_into_launch_variables_and_command() {
+        let root = unique_temp_root("croopor-build-explicit-auth-test");
+        let version: VersionJson = auth_version_json();
+        let auth = LaunchAuthContext {
+            player_name: "OnlinePlayer".to_string(),
+            uuid: "11112222333344445555666677778888".to_string(),
+            access_token: "test-access-token".to_string(),
+            client_id: "test-client-id".to_string(),
+            xuid: "test-xuid".to_string(),
+            user_type: "msa".to_string(),
+        };
+
+        let plan = plan_resolved_launch(
+            &VanillaLaunchRequest {
+                session_id: "test-session".to_string(),
+                mc_dir: root.clone(),
+                version_id: "auth-test".to_string(),
+                auth,
+                runtime: test_runtime(),
+                game_dir: None,
+                launcher_name: "croopor".to_string(),
+                launcher_version: "test".to_string(),
+                min_memory_mb: None,
+                max_memory_mb: None,
+                extra_jvm_args: Vec::new(),
+                resolution: None,
+            },
+            version,
+        )
+        .expect("launch plan");
+
+        assert_arg_value(&plan.game_args, "--username", "OnlinePlayer");
+        assert_arg_value(
+            &plan.game_args,
+            "--uuid",
+            "11112222333344445555666677778888",
+        );
+        assert_arg_value(&plan.game_args, "--accessToken", "test-access-token");
+        assert_arg_value(&plan.game_args, "--clientId", "test-client-id");
+        assert_arg_value(&plan.game_args, "--xuid", "test-xuid");
+        assert_arg_value(&plan.game_args, "--userType", "msa");
+        assert!(
+            plan.jvm_args
+                .iter()
+                .any(|arg| arg == "-Dauth.client=test-client-id")
+        );
+        assert!(plan.command.iter().any(|arg| arg == "test-access-token"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn modern_native_libraries_get_explicit_native_and_temp_paths() {
         let root = std::env::temp_dir().join(format!(
             "croopor-build-test-{}",
@@ -584,7 +696,7 @@ mod tests {
             session_id: "test-session".to_string(),
             mc_dir: root.clone(),
             version_id: "test".to_string(),
-            username: "Player".to_string(),
+            auth: LaunchAuthContext::offline("Player"),
             runtime: RuntimeSelection {
                 requested_path: String::new(),
                 selected_path: String::new(),
@@ -646,5 +758,78 @@ mod tests {
 
         let _ = fs::remove_dir_all(root);
         let _ = cleanup_natives_dir(natives_dir);
+    }
+
+    fn auth_version_json() -> VersionJson {
+        serde_json::from_value(serde_json::json!({
+            "id": "auth-test",
+            "type": "release",
+            "mainClass": "net.minecraft.client.main.Main",
+            "arguments": {
+                "game": [
+                    "--username",
+                    "${auth_player_name}",
+                    "--uuid",
+                    "${auth_uuid}",
+                    "--accessToken",
+                    "${auth_access_token}",
+                    "--clientId",
+                    "${clientid}",
+                    "--xuid",
+                    "${auth_xuid}",
+                    "--userType",
+                    "${user_type}"
+                ],
+                "jvm": [
+                    "-Dauth.client=${clientid}"
+                ]
+            },
+            "assetIndex": { "id": "test-assets" },
+            "libraries": []
+        }))
+        .expect("version json")
+    }
+
+    fn assert_arg_value(args: &[String], name: &str, expected: &str) {
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == name && pair[1] == expected),
+            "expected {name} to be followed by {expected:?} in {args:?}"
+        );
+    }
+
+    fn test_runtime() -> RuntimeSelection {
+        RuntimeSelection {
+            requested_path: String::new(),
+            selected_path: String::new(),
+            selected_info: croopor_minecraft::JavaRuntimeInfo {
+                id: String::new(),
+                major: 21,
+                update: 0,
+                distribution: "test".to_string(),
+                path: String::new(),
+            },
+            effective_path: "/usr/bin/java".to_string(),
+            effective_info: croopor_minecraft::JavaRuntimeInfo {
+                id: "java".to_string(),
+                major: 21,
+                update: 0,
+                distribution: "test".to_string(),
+                path: "/usr/bin/java".to_string(),
+            },
+            effective_source: "managed".to_string(),
+            bypassed_requested_runtime: false,
+        }
+    }
+
+    fn unique_temp_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ))
     }
 }
