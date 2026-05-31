@@ -312,14 +312,21 @@ function launchOutcomeMessage(
   return guardianToastMessage(guardian) || healingToastMessage(healing || {}) || fallbackMessage;
 }
 
+function guardianNoticeTone(guardian: GuardianSummary | undefined): import('./types').LaunchNoticeTone | null {
+  if (guardian?.decision === 'blocked') return 'error';
+  if (guardian?.decision === 'warned') return 'warned';
+  if (guardian?.decision === 'intervened') return 'intervened';
+  return null;
+}
+
 function launchOutcomeTone(
   guardian: GuardianSummary | undefined,
   healing: LaunchHealingSummary | undefined,
 ): import('./types').LaunchNoticeTone {
-  if (guardian?.decision === 'blocked' || healing?.failure_class) return 'error';
+  const guardianTone = guardianNoticeTone(guardian);
+  if (guardianTone === 'error' || healing?.failure_class) return 'error';
+  if (guardianTone) return guardianTone;
   if (healing?.retry_count && healing.retry_count > 0) return 'success';
-  if (guardian?.decision === 'warned') return 'warned';
-  if (guardian?.decision === 'intervened') return 'intervened';
   return 'info';
 }
 
