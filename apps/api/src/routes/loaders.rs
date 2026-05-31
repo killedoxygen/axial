@@ -162,19 +162,13 @@ async fn handle_loader_install(
 
         if let Err(error) = result {
             let _ = progress_tx.send(error_progress(error));
-        } else if let Err(error) = prewarm_version_runtime(&library_dir, &version_id, |progress| {
+        } else if prewarm_version_runtime(&library_dir, &version_id, |progress| {
             let _ = progress_tx.send(progress);
         })
         .await
+        .is_err()
         {
-            let _ = progress_tx.send(DownloadProgress {
-                phase: "error".to_string(),
-                current: 0,
-                total: 0,
-                file: None,
-                error: Some(format!("prepare java runtime: {error}")),
-                done: true,
-            });
+            let _ = progress_tx.send(prewarm_runtime_error_progress());
         } else if let Some(progress) = final_progress {
             let _ = progress_tx.send(progress);
         }
@@ -263,7 +257,18 @@ fn error_progress(error: LoaderError) -> DownloadProgress {
         current: 0,
         total: 0,
         file: None,
-        error: Some(error.to_string()),
+        error: Some(public_loader_error_message(&error).to_string()),
+        done: true,
+    }
+}
+
+fn prewarm_runtime_error_progress() -> DownloadProgress {
+    DownloadProgress {
+        phase: "error".to_string(),
+        current: 0,
+        total: 0,
+        file: None,
+        error: Some(public_runtime_error_message().to_string()),
         done: true,
     }
 }
@@ -281,10 +286,43 @@ fn error_response(error: LoaderError) -> (StatusCode, Json<serde_json::Value>) {
     (
         status,
         Json(serde_json::json!({
-            "error": error.to_string(),
+            "error": public_loader_error_message(&error),
             "failure_kind": error.failure_kind(),
         })),
     )
+}
+
+fn public_loader_error_message(error: &LoaderError) -> &'static str {
+    match error {
+        LoaderError::InvalidMinecraftVersion => "Invalid Minecraft version.",
+        LoaderError::InvalidBuildId => "Invalid loader build.",
+        LoaderError::InvalidComponentId => "Invalid loader component.",
+        LoaderError::MissingLibraryDir => "Croopor library is not configured",
+        LoaderError::CatalogUnavailable(_) => {
+            "Loader catalog is unavailable. Check your connection and try again."
+        }
+        LoaderError::BuildNotFound(_) => "Selected loader build is not available.",
+        LoaderError::ArtifactMissing(_) => {
+            "Loader artifact is unavailable. Try another build or component."
+        }
+        LoaderError::InvalidProfile(_) => "Loader profile is invalid. Try another build.",
+        LoaderError::Verify(_) => {
+            "Loader install verification failed. Try again or choose another build."
+        }
+        LoaderError::Request(_) => {
+            "Loader service request failed. Check your connection and try again."
+        }
+        LoaderError::Download(_) => "Loader download failed. Check your connection and try again.",
+        LoaderError::Parse(_) => "Loader service returned unreadable data. Try again later.",
+        LoaderError::Io(_) => {
+            "Could not write loader files. Check app data permissions and try again."
+        }
+        LoaderError::Other(_) => "Loader operation failed. Try again.",
+    }
+}
+
+fn public_runtime_error_message() -> &'static str {
+    "Could not prepare the Java runtime. Check your connection and try again."
 }
 
 fn generate_install_id() -> String {
@@ -293,4 +331,117 @@ fn generate_install_id() -> String {
         .map(|value| value.as_nanos())
         .unwrap_or_default();
     format!("loader-install-{:032x}", nanos)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn error_response_keeps_status_and_failure_kind_without_raw_details() {
+        let (status, Json(body)) = error_response(LoaderError::CatalogUnavailable(
+            "GET https://loader.example.invalid/catalog.json timed out".to_string(),
+        ));
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["failure_kind"], json!("catalog_unavailable"));
+        assert_eq!(
+            body["error"],
+            json!("Loader catalog is unavailable. Check your connection and try again.")
+        );
+        assert_no_raw_fragments(body["error"].as_str().expect("error is a string"));
+
+        let (status, Json(body)) = error_response(LoaderError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "permission denied: /home/zero/.croopor/libraries/example.jar",
+        )));
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["failure_kind"], json!("io_failed"));
+        assert_eq!(
+            body["error"],
+            json!("Could not write loader files. Check app data permissions and try again.")
+        );
+        assert_no_raw_fragments(body["error"].as_str().expect("error is a string"));
+
+        let parse_error = serde_json::from_str::<serde_json::Value>("{\"loader\":")
+            .expect_err("invalid json should fail");
+        let (status, Json(body)) = error_response(LoaderError::Parse(parse_error));
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["failure_kind"], json!("parse_failed"));
+        assert_eq!(
+            body["error"],
+            json!("Loader service returned unreadable data. Try again later.")
+        );
+        assert_no_raw_fragments(body["error"].as_str().expect("error is a string"));
+    }
+
+    #[test]
+    fn error_response_preserves_safe_explicit_messages() {
+        let (status, Json(body)) = error_response(LoaderError::InvalidMinecraftVersion);
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["failure_kind"], json!("other"));
+        assert_eq!(body["error"], json!("Invalid Minecraft version."));
+
+        let (status, Json(body)) = error_response(LoaderError::MissingLibraryDir);
+
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(body["failure_kind"], json!("other"));
+        assert_eq!(body["error"], json!("Croopor library is not configured"));
+    }
+
+    #[test]
+    fn error_progress_hides_raw_details_and_keeps_terminal_shape() {
+        let progress = error_progress(LoaderError::ArtifactMissing(
+            "missing https://cdn.example.invalid/path/mod-loader.jar in /tmp/croopor".to_string(),
+        ));
+
+        assert_eq!(progress.phase, "error");
+        assert_eq!(progress.current, 0);
+        assert_eq!(progress.total, 0);
+        assert_eq!(progress.file, None);
+        assert_eq!(
+            progress.error.as_deref(),
+            Some("Loader artifact is unavailable. Try another build or component.")
+        );
+        assert!(progress.done);
+        assert_no_raw_fragments(progress.error.as_deref().expect("error is present"));
+    }
+
+    #[test]
+    fn prewarm_runtime_error_progress_hides_raw_runtime_error() {
+        let progress = prewarm_runtime_error_progress();
+
+        assert_eq!(progress.phase, "error");
+        assert_eq!(progress.current, 0);
+        assert_eq!(progress.total, 0);
+        assert_eq!(progress.file, None);
+        assert_eq!(
+            progress.error.as_deref(),
+            Some("Could not prepare the Java runtime. Check your connection and try again.")
+        );
+        assert!(progress.done);
+        assert_no_raw_fragments(progress.error.as_deref().expect("error is present"));
+    }
+
+    fn assert_no_raw_fragments(message: &str) {
+        for fragment in [
+            "https://",
+            "loader.example.invalid",
+            "cdn.example.invalid",
+            "/home/zero",
+            "/tmp/croopor",
+            "EOF while parsing",
+            "line 1 column",
+            "mod-loader.jar",
+        ] {
+            assert!(
+                !message.contains(fragment),
+                "message leaked raw fragment {fragment:?}: {message}"
+            );
+        }
+    }
 }
