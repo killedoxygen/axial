@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 pub enum HealingEventKind {
     RuntimeBypassed,
     PresetDowngraded,
-    StartupStalled,
     FallbackApplied,
 }
 

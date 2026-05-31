@@ -345,7 +345,6 @@ export interface LaunchPreflightResponse {
 export type HealingEventKind =
   | 'runtime_bypassed'
   | 'preset_downgraded'
-  | 'startup_stalled'
   | 'fallback_applied';
 
 export interface HealingEvent {

@@ -194,8 +194,6 @@ function formatHealingEvent(event: HealingEvent): string {
       return 'Java override was skipped and the managed runtime was used instead.';
     case 'preset_downgraded':
       return event.detail ? ensureSentence(event.detail) : 'GC preset was adjusted for compatibility.';
-    case 'startup_stalled':
-      return 'Launch was stopped because no startup activity was detected.';
     case 'fallback_applied':
       return event.detail ? ensureSentence(event.detail) : 'Croopor retried startup with safer settings.';
     default:

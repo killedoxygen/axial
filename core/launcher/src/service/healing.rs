@@ -72,16 +72,6 @@ pub fn build_healing_summary(input: HealingSummaryInput<'_>) -> Option<LaunchHea
             detail: Some(detail.clone()),
         });
     }
-    if matches!(
-        input.failure_class,
-        Some(LaunchFailureClass::StartupStalled)
-    ) {
-        events.push(HealingEvent {
-            kind: HealingEventKind::StartupStalled,
-            detail: Some("no startup activity observed".to_string()),
-        });
-    }
-
     let summary = LaunchHealingSummary {
         requested_preset,
         effective_preset,
@@ -125,6 +115,7 @@ pub fn infer_loader(version_id: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{HealingSummaryInput, build_healing_summary};
+    use crate::types::LaunchFailureClass;
     use serde_json::Value;
 
     #[test]
@@ -187,5 +178,51 @@ mod tests {
         let value: Value = serde_json::from_str(&serialized).expect("parse healing summary");
         assert!(value.get("requested_java_path").is_none());
         assert!(value.get("effective_java_path").is_none());
+    }
+
+    #[test]
+    fn startup_stalled_failure_keeps_healing_from_authoring_startup_stalled_copy() {
+        let summary = build_healing_summary(HealingSummaryInput {
+            auth_mode: "offline",
+            requested_java_path: "",
+            requested_preset: "",
+            effective_java_path: None,
+            effective_preset: None,
+            fallback_applied: None,
+            retry_count: 0,
+            failure_class: Some(LaunchFailureClass::StartupStalled),
+        })
+        .expect("expected failure-class evidence summary");
+
+        assert_eq!(summary.failure_class.as_deref(), Some("startup_stalled"));
+        assert!(summary.events.is_empty());
+
+        let serialized = serde_json::to_string(&summary).expect("serialize healing summary");
+        assert!(!serialized.contains("no startup activity observed"));
+        let value: Value = serde_json::from_str(&serialized).expect("parse healing summary");
+        assert!(value.get("events").is_none());
+    }
+
+    #[test]
+    fn non_startup_healing_event_still_appears() {
+        let summary = build_healing_summary(HealingSummaryInput {
+            auth_mode: "online",
+            requested_java_path: "",
+            requested_preset: "graalvm",
+            effective_java_path: None,
+            effective_preset: Some("performance"),
+            fallback_applied: None,
+            retry_count: 0,
+            failure_class: None,
+        })
+        .expect("expected preset downgrade healing summary");
+
+        assert!(summary.events.iter().any(|event| matches!(
+            event.kind,
+            crate::healing::HealingEventKind::PresetDowngraded
+        )));
+        assert!(summary.warnings.iter().any(|warning| {
+            warning.contains("Requested JVM preset \"graalvm\" was downgraded to \"performance\"")
+        }));
     }
 }
