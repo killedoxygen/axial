@@ -5,12 +5,12 @@ use axum::{
     http::StatusCode,
     routing::{get, post},
 };
-use croopor_config::EnrichedInstance;
+use croopor_config::{EnrichedInstance, InstanceStoreError};
 use croopor_minecraft::scan_versions;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    io::{Read, Seek, SeekFrom},
+    io::{ErrorKind, Read, Seek, SeekFrom},
     path::{Path as FsPath, PathBuf},
 };
 
@@ -25,6 +25,59 @@ const INSTANCE_SUBFOLDERS: [&str; 7] = [
     "screenshots",
     "logs",
 ];
+
+#[derive(Clone, Copy)]
+enum InstanceWriteOperation {
+    Create,
+    Duplicate,
+    Update,
+    Delete,
+}
+
+impl InstanceWriteOperation {
+    fn internal_error_message(self) -> &'static str {
+        match self {
+            Self::Create => {
+                "Could not create the instance. Check app data permissions and try again."
+            }
+            Self::Duplicate => {
+                "Could not duplicate the instance. Check app data permissions and try again."
+            }
+            Self::Update => {
+                "Could not save the instance. Check app data permissions and try again."
+            }
+            Self::Delete => {
+                "Could not delete the instance. Check app data permissions and try again."
+            }
+        }
+    }
+}
+
+fn instance_write_error_response(
+    operation: InstanceWriteOperation,
+    error: InstanceStoreError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let (status, message) = match error {
+        InstanceStoreError::Read(error) => match error.kind() {
+            ErrorKind::NotFound => (StatusCode::NOT_FOUND, "instance not found".to_string()),
+            ErrorKind::AlreadyExists => (
+                StatusCode::CONFLICT,
+                "an instance with this name already exists".to_string(),
+            ),
+            ErrorKind::InvalidInput => (StatusCode::BAD_REQUEST, error.to_string()),
+            _ => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                operation.internal_error_message().to_string(),
+            ),
+        },
+        InstanceStoreError::Parse(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            operation.internal_error_message().to_string(),
+        ),
+    };
+
+    (status, Json(serde_json::json!({ "error": message })))
+}
 
 #[derive(Debug, Serialize)]
 struct InstancesResponse {
@@ -172,17 +225,7 @@ async fn handle_create_instance(
             mc_dir.as_deref(),
         )
         .map(Json)
-        .map_err(|error| {
-            let status = if error.to_string().contains("already exists") {
-                StatusCode::CONFLICT
-            } else {
-                StatusCode::BAD_REQUEST
-            };
-            (
-                status,
-                Json(serde_json::json!({ "error": error.to_string() })),
-            )
-        })
+        .map_err(|error| instance_write_error_response(InstanceWriteOperation::Create, error))
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -201,19 +244,7 @@ async fn handle_duplicate_instance(
         .instances()
         .duplicate(&id, payload.name, mc_dir.as_deref())
         .map(Json)
-        .map_err(|error| {
-            let message = error.to_string();
-            let status = if message.contains("not found") {
-                StatusCode::NOT_FOUND
-            } else if message.contains("already exists") {
-                StatusCode::CONFLICT
-            } else if message.contains("duplicate instance files") {
-                StatusCode::INTERNAL_SERVER_ERROR
-            } else {
-                StatusCode::BAD_REQUEST
-            };
-            (status, Json(serde_json::json!({ "error": message })))
-        })
+        .map_err(|error| instance_write_error_response(InstanceWriteOperation::Duplicate, error))
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -289,17 +320,7 @@ async fn handle_update_instance(
         .instances()
         .update(instance)
         .map(Json)
-        .map_err(|error| {
-            let message = error.to_string();
-            let status = if message.contains("not found") {
-                StatusCode::NOT_FOUND
-            } else if message.contains("already exists") {
-                StatusCode::CONFLICT
-            } else {
-                StatusCode::BAD_REQUEST
-            };
-            (status, Json(serde_json::json!({ "error": message })))
-        })
+        .map_err(|error| instance_write_error_response(InstanceWriteOperation::Update, error))
 }
 
 #[derive(Debug, Deserialize)]
@@ -488,17 +509,7 @@ async fn handle_delete_instance(
     state
         .instances()
         .remove(&id, !keep_files)
-        .map_err(|error| {
-            let status = if error.to_string().contains("not found") {
-                StatusCode::NOT_FOUND
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            };
-            (
-                status,
-                Json(serde_json::json!({ "error": format!("failed to delete: {error}") })),
-            )
-        })?;
+        .map_err(|error| instance_write_error_response(InstanceWriteOperation::Delete, error))?;
 
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
@@ -696,7 +707,112 @@ mod tests {
     use crate::state::{AppState, AppStateInit, InstallStore, SessionStore};
     use croopor_config::{AppPaths, ConfigStore, InstanceStore};
     use croopor_performance::PerformanceManager;
-    use std::{collections::HashMap, sync::Arc};
+    use std::{collections::HashMap, io, sync::Arc};
+
+    #[test]
+    fn instance_write_error_mapper_preserves_safe_status_messages() {
+        let cases = [
+            (
+                io::ErrorKind::NotFound,
+                "instance not found",
+                StatusCode::NOT_FOUND,
+                "instance not found",
+            ),
+            (
+                io::ErrorKind::AlreadyExists,
+                "an instance with this name already exists",
+                StatusCode::CONFLICT,
+                "an instance with this name already exists",
+            ),
+            (
+                io::ErrorKind::InvalidInput,
+                "version_id is required",
+                StatusCode::BAD_REQUEST,
+                "version_id is required",
+            ),
+        ];
+
+        for (kind, store_message, expected_status, expected_message) in cases {
+            let (status, Json(body)) = instance_write_error_response(
+                InstanceWriteOperation::Create,
+                InstanceStoreError::Read(io::Error::new(kind, store_message)),
+            );
+
+            assert_eq!(status, expected_status);
+            assert_bounded_error_body(&body, expected_message);
+        }
+    }
+
+    #[test]
+    fn instance_write_error_mapper_bounds_internal_operation_errors() {
+        let cases = [
+            (
+                InstanceWriteOperation::Create,
+                "failed to initialize instance files: /home/zero/.config/Croopor/instances/new/logs",
+                "Could not create the instance. Check app data permissions and try again.",
+            ),
+            (
+                InstanceWriteOperation::Update,
+                "failed to persist /home/zero/.config/Croopor/instances.json",
+                "Could not save the instance. Check app data permissions and try again.",
+            ),
+            (
+                InstanceWriteOperation::Delete,
+                "failed to delete C:\\Users\\Zero\\AppData\\Roaming\\Croopor\\instances\\old",
+                "Could not delete the instance. Check app data permissions and try again.",
+            ),
+        ];
+
+        for (operation, store_message, expected_message) in cases {
+            let (status, Json(body)) = instance_write_error_response(
+                operation,
+                InstanceStoreError::Read(io::Error::other(store_message)),
+            );
+
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_bounded_error_body(&body, expected_message);
+            let public_message = error_body_text(&body);
+            assert!(!public_message.contains("/home/zero"));
+            assert!(!public_message.contains("C:\\Users\\Zero"));
+            assert!(!public_message.contains("instances.json"));
+        }
+    }
+
+    #[test]
+    fn duplicate_instance_write_error_hides_layout_and_persist_paths() {
+        let store_message = concat!(
+            "failed to duplicate instance files: ",
+            "/home/zero/.config/Croopor/instances/source/mods/example.jar; ",
+            "failed to roll back persisted instance: ",
+            "C:\\Users\\Zero\\AppData\\Roaming\\Croopor\\config\\instances.json"
+        );
+
+        let (status, Json(body)) = instance_write_error_response(
+            InstanceWriteOperation::Duplicate,
+            InstanceStoreError::Read(io::Error::other(store_message)),
+        );
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_bounded_error_body(
+            &body,
+            "Could not duplicate the instance. Check app data permissions and try again.",
+        );
+        let public_message = error_body_text(&body);
+        for hidden_fragment in [
+            "/home/zero",
+            ".config",
+            "C:\\Users\\Zero",
+            "AppData",
+            "example.jar",
+            "instances.json",
+            "failed to duplicate instance files",
+        ] {
+            assert!(
+                !public_message.contains(hidden_fragment),
+                "{hidden_fragment:?} leaked in {public_message:?}"
+            );
+        }
+    }
 
     #[test]
     fn instance_folder_resolver_returns_root_when_subfolder_is_omitted() {
@@ -845,7 +961,7 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(
             body,
-            serde_json::json!({ "error": "failed to read instances: an instance with this name already exists" })
+            serde_json::json!({ "error": "an instance with this name already exists" })
         );
         assert_eq!(
             fixture
@@ -957,7 +1073,7 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(
             body,
-            serde_json::json!({ "error": "failed to read instances: an instance with this name already exists" })
+            serde_json::json!({ "error": "an instance with this name already exists" })
         );
         assert_eq!(fixture.state.instances().list().len(), 1);
     }
@@ -1001,7 +1117,7 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(
             body,
-            serde_json::json!({ "error": "failed to read instances: an instance with this name already exists" })
+            serde_json::json!({ "error": "an instance with this name already exists" })
         );
         assert_eq!(fixture.state.instances().list().len(), 2);
     }
@@ -1107,6 +1223,12 @@ mod tests {
             body.get("error").and_then(serde_json::Value::as_str),
             Some(expected)
         );
+    }
+
+    fn error_body_text(body: &serde_json::Value) -> &str {
+        body.get("error")
+            .and_then(serde_json::Value::as_str)
+            .expect("error message should be a string")
     }
 
     struct TestFixture {
