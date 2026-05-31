@@ -388,6 +388,55 @@ function labelFromToken(value: string | undefined, fallback: string): string {
     .join(' ');
 }
 
+type ProofEvidenceTone = 'neutral' | 'ok' | 'warn' | 'err' | 'info';
+
+type ProofEvidenceSummary = {
+  tone: ProofEvidenceTone;
+  label: string;
+  detail?: string;
+};
+
+function proofDetailLooksSensitive(value: string): boolean {
+  return [
+    /(^|[\s"'`([{])(?:[A-Za-z]:[\\/]|~[\\/]|[\\/](?:Users|home|var|tmp|opt|usr|etc|Library|Applications|mnt|Volumes)\b)/,
+    /[\\/][^\s"'`)}\]]+[\\/][^\s"'`)}\]]+/,
+    /(^|\s)(?:\.{1,2}[\\/]|[A-Za-z0-9._-]+[\\/](?:bin|lib|jre|jdk|java|\.minecraft)\b)/i,
+    /\.(?:jar|exe|dll|dylib|so)\b/i,
+    /\b(?:java(?:\.exe)?|cmd(?:\.exe)?|powershell|bash|sh)\s+[-/\\\w"']/i,
+    /(^|\s)-{1,2}(?:Xmx\S*|Xms\S*|XX:\S*|D[a-zA-Z0-9_.-]+=\S*|jar\b|cp\b|classpath\b|add-opens\b|add-modules\b)/,
+    /\b(?:token|access_token|refresh_token|password|secret|username)\s*[=:]/i,
+    /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/,
+  ].some((pattern) => pattern.test(value));
+}
+
+function boundedProofDetail(text: string | undefined): string {
+  const normalized = text?.replace(/\s+/g, ' ').trim() ?? '';
+  if (!normalized || proofDetailLooksSensitive(normalized)) return '';
+  return normalized.length > 150 ? `${normalized.slice(0, 147).trimEnd()}...` : normalized;
+}
+
+function firstBoundedProofDetail(values: Array<string | undefined>): string {
+  for (const value of values) {
+    const detail = boundedProofDetail(value);
+    if (detail) return detail;
+  }
+  return '';
+}
+
+function guardianDecisionLabel(decision: string | undefined): string {
+  if (decision === 'blocked') return 'Guardian blocked';
+  if (decision === 'warned') return 'Guardian warned';
+  if (decision === 'intervened') return 'Guardian intervened';
+  return 'Guardian note';
+}
+
+function guardianDecisionTone(decision: string | undefined): ProofEvidenceTone {
+  if (decision === 'blocked') return 'err';
+  if (decision === 'warned') return 'warn';
+  if (decision === 'intervened') return 'info';
+  return 'info';
+}
+
 function familyLabel(value: string | undefined): string {
   const raw = value?.trim();
   if (!raw) return 'Unknown family';
@@ -632,6 +681,64 @@ function comparisonSummary(comparison: LaunchProofComparison | null | undefined)
   };
 }
 
+function guardianProofSummary(record: LaunchProofRecord): ProofEvidenceSummary | null {
+  const guardian = record.guardian;
+  if (!guardian) return null;
+
+  const detail = firstBoundedProofDetail([
+    guardian.message,
+    ...(guardian.details || []),
+    ...(guardian.guidance || []),
+    ...(guardian.interventions || []).map((intervention) => intervention.detail),
+  ]);
+  const hasGuardianAction = guardian.decision === 'blocked'
+    || guardian.decision === 'warned'
+    || guardian.decision === 'intervened';
+  if (!hasGuardianAction && !detail) return null;
+
+  return {
+    tone: guardianDecisionTone(guardian.decision),
+    label: guardianDecisionLabel(guardian.decision),
+    detail,
+  };
+}
+
+function healingProofSummary(record: LaunchProofRecord): ProofEvidenceSummary | null {
+  const healing = record.healing;
+  if (!healing) return null;
+
+  const retryCount = healing.retry_count && healing.retry_count > 0 ? healing.retry_count : 0;
+  const hasEvidence = retryCount > 0
+    || Boolean(healing.fallback_applied)
+    || Boolean(healing.failure_class)
+    || Boolean(healing.warnings && healing.warnings.length > 0);
+  if (!hasEvidence) return null;
+
+  const detail = firstBoundedProofDetail([
+    healing.fallback_applied,
+    ...(healing.warnings || []),
+    ...(healing.events || []).map((event) => event.detail),
+    healing.failure_class ? `Reason: ${labelFromToken(healing.failure_class, 'launch failure')}` : undefined,
+  ]);
+  const label = retryCount > 0
+    ? `Healing retried ${retryCount} ${retryCount === 1 ? 'time' : 'times'}`
+    : healing.failure_class
+      ? 'Healing failure'
+      : 'Healing applied';
+
+  return {
+    tone: healing.failure_class ? 'err' : retryCount > 0 ? 'ok' : 'info',
+    label,
+    detail,
+  };
+}
+
+function launchProofEvidenceSummary(record: LaunchProofRecord): ProofEvidenceSummary | null {
+  const guardianSummary = guardianProofSummary(record);
+  if (guardianSummary) return guardianSummary;
+  return healingProofSummary(record);
+}
+
 function resourceBudgetSummary(record: LaunchProofRecord): {
   pressureLabel: string;
   details: string[];
@@ -786,6 +893,7 @@ function LaunchProofHistoryBlock({ state }: { state: LaunchReportsState }): JSX.
             };
             const comparison = comparisonSummary(record.comparison);
             const budgetSummary = resourceBudgetSummary(record);
+            const evidenceSummary = launchProofEvidenceSummary(record);
             const memory = scenario.requested_memory_mb
               ? fmtMem(scenario.requested_memory_mb / 1024)
               : null;
@@ -820,6 +928,12 @@ function LaunchProofHistoryBlock({ state }: { state: LaunchReportsState }): JSX.
                     <div class="cp-settings-proof-budget" data-pressure={budgetSummary.pressure ? 'true' : 'false'}>
                       <strong>{budgetSummary.pressureLabel}</strong>
                       {budgetSummary.details.length > 0 && <span>{budgetSummary.details.join(' · ')}</span>}
+                    </div>
+                  )}
+                  {evidenceSummary && (
+                    <div class="cp-settings-proof-guardian">
+                      <Pill tone={evidenceSummary.tone}>{evidenceSummary.label}</Pill>
+                      {evidenceSummary.detail && <span>{evidenceSummary.detail}</span>}
                     </div>
                   )}
                 </div>

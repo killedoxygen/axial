@@ -383,6 +383,8 @@ export interface LaunchProofRecord {
   boot_duration_ms?: number;
   failure_class?: string;
   failure_detail?: string;
+  guardian?: GuardianSummary | null;
+  healing?: LaunchHealingSummary | null;
   comparison?: LaunchProofComparison | null;
   resource_budget?: LaunchProofResourceBudget | null;
 }
