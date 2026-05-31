@@ -2,7 +2,7 @@
 // optionally queue a version install, toast, and navigate to the new instance.
 // Lives at the top level (next to install.ts) so it can import from both
 // install.ts and actions.ts without creating a cycle with actions.ts.
-import { api } from './api';
+import { api, isApiError } from './api';
 import { toast } from './toast';
 import { errMessage } from './utils';
 import { navigate } from './ui-state';
@@ -104,7 +104,12 @@ export async function createInstance(args: CreateInstanceArgs): Promise<CreateIn
       console.error('Create instance returned invalid payload', res);
       break;
     } catch (err: unknown) {
-      lastError = errMessage(err);
+      const message = errMessage(err);
+      if (isApiError(err) && isNameCollision(message) && attempt < MAX_NAME_COLLISION_RETRIES) {
+        name = nextCandidateName(baseName, attempt);
+        continue;
+      }
+      lastError = message;
       break;
     }
   }

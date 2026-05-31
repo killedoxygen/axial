@@ -1,6 +1,6 @@
 import type { JSX } from 'preact';
 import { useCallback, useEffect, useState } from 'preact/hooks';
-import { api, apiResourceUrl } from '../../api';
+import { api, apiResourceUrl, isApiError } from '../../api';
 import { Button, Card, Input, Pill, SectionHeading } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { PlayerHeadPreview } from '../../ui/PlayerHeadPreview';
@@ -637,6 +637,14 @@ function pollTerminalMessage(response: AuthPollTerminal | null): string {
   return boundedMessage(response.error || response.poll_hint, fallback);
 }
 
+function pollErrorMessage(value: unknown): string {
+  const response = pollResponse(value);
+  if (response && response.status !== 'pending' && response.status !== 'msa_authenticated') {
+    return pollTerminalMessage(response);
+  }
+  return apiErrorMessage(value, 'Microsoft sign-in could not be completed.');
+}
+
 function hasMinecraftReadiness(status: MinecraftAuthReadiness): boolean {
   return typeof status.minecraft_profile_ready === 'boolean' ||
     typeof status.minecraft_ownership_verified === 'boolean' ||
@@ -1201,10 +1209,14 @@ function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Elem
           setPollHint(null);
           setLoginError(pollTerminalMessage(poll));
         })
-        .catch(() => {
+        .catch((err: unknown) => {
           if (!active) return;
           setLogin(null);
           setPollHint(null);
+          if (isApiError(err)) {
+            setLoginError(pollErrorMessage(err.payload));
+            return;
+          }
           setLoginError('Could not reach the local backend while polling Microsoft sign-in.');
         });
     }, Math.max(1, login.interval) * 1000);
@@ -1234,8 +1246,12 @@ function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Elem
       }
       setLogin(null);
       setLoginError(loginErrorMessage(response));
-    } catch {
+    } catch (err: unknown) {
       setLogin(null);
+      if (isApiError(err)) {
+        setLoginError(loginErrorMessage(err.payload));
+        return;
+      }
       setLoginError('Could not reach the local backend.');
     } finally {
       setLoginBusy(false);
@@ -1259,8 +1275,10 @@ function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Elem
       } else {
         setLoginSuccess('Microsoft sign-in was cleared. Switch to Offline for the reliable launch path if Online was selected.');
       }
-    } catch {
-      setLogoutError('Could not reach the local backend to clear Microsoft sign-in.');
+    } catch (err: unknown) {
+      setLogoutError(isApiError(err)
+        ? logoutErrorMessage(err.payload)
+        : 'Could not reach the local backend to clear Microsoft sign-in.');
     } finally {
       refreshStatus();
       setLogoutBusy(false);
@@ -1288,8 +1306,10 @@ function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Elem
         return;
       }
       setRefreshSuccess(authRefreshSuccessMessage(response));
-    } catch {
-      setRefreshError('Could not reach the local backend to refresh Microsoft sign-in.');
+    } catch (err: unknown) {
+      setRefreshError(isApiError(err)
+        ? authRefreshErrorMessage(err.payload)
+        : 'Could not reach the local backend to refresh Microsoft sign-in.');
     } finally {
       refreshStatus();
       setRefreshBusy(false);

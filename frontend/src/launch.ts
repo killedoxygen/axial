@@ -1,4 +1,4 @@
-import { api, apiUrl } from './api';
+import { api, apiUrl, isApiError } from './api';
 import { Sound } from './sound';
 import { Music } from './music';
 import { showError, appendLog, errMessage } from './utils';
@@ -495,6 +495,26 @@ export async function launchGame(): Promise<void> {
       };
     }
   } catch (err: unknown) {
+    if (isApiError(err) && err.payload && typeof err.payload === 'object') {
+      const payload = err.payload as {
+        error?: string;
+        guardian?: GuardianSummary;
+        healing?: LaunchHealingSummary;
+      };
+      const detail = friendlyLaunchErrorDetail(payload.error || err.message);
+      const surfaced = surfaceLaunchOutcome(
+        payload.guardian,
+        payload.healing,
+        inst.id,
+        inst.name,
+        true,
+        detail,
+        'Launch stopped before startup.',
+      );
+      if (!surfaced) showError(payload.error || err.message);
+      if (!launchCommitted) rollbackLaunch(inst.id, launchAnimationFrameId);
+      return;
+    }
     showError(errMessage(err));
     if (!launchCommitted) rollbackLaunch(inst.id, launchAnimationFrameId);
   }
