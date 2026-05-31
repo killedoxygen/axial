@@ -1357,11 +1357,15 @@
     gap: 2px;
   }
   .cp-resource-row {
-    grid-template-columns: 34px minmax(0, 1fr);
+    grid-template-columns: 34px minmax(0, 1fr) auto;
   }
   .cp-resource-meta {
     grid-column: 2;
     white-space: normal;
+  }
+  .cp-resource-actions {
+    grid-column: 3;
+    grid-row: 1 / span 2;
   }
   .cp-logs-layout {
     grid-template-columns: 1fr;
@@ -1544,7 +1548,7 @@
 }
 .cp-resource-row {
   display: grid;
-  grid-template-columns: 34px minmax(0, 1fr) auto;
+  grid-template-columns: 34px minmax(0, 1fr) auto auto;
   align-items: center;
   gap: 12px;
   padding: 12px 14px;
@@ -1576,6 +1580,27 @@
   font-size: 12px;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
+}
+.cp-resource-actions {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+}
+.cp-resource-action {
+  width: 28px;
+  height: 28px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-mute);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.cp-resource-action:hover {
+  border-color: var(--line);
+  background: var(--surface-3);
+  color: var(--text);
 }
 .cp-screenshots-grid {
   display: grid;

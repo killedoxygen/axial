@@ -3,7 +3,7 @@ use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use croopor_config::{EnrichedInstance, InstanceStoreError};
 use croopor_minecraft::scan_versions;
@@ -15,6 +15,9 @@ use std::{
 };
 
 const LOG_TAIL_LIMIT: u64 = 128 * 1024;
+const WORLD_BACKUP_MAX_DEPTH: usize = 64;
+const WORLD_BACKUP_MAX_ENTRIES: usize = 100_000;
+const WORLD_BACKUP_MAX_BYTES: u64 = 50 * 1024 * 1024 * 1024;
 const INSTANCE_LOG_READ_ERROR_MESSAGE: &str =
     "Could not read the instance log. Check instance folder permissions and try again.";
 
@@ -136,6 +139,18 @@ struct InstanceLogTailResponse {
     text: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct RenameWorldRequest {
+    name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct WorldBackupResponse {
+    status: &'static str,
+    backup: String,
+    location: String,
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route(
@@ -157,6 +172,14 @@ pub fn router() -> Router<AppState> {
             get(handle_instance_resources),
         )
         .route("/api/v1/instances/{id}/worlds", get(handle_instance_worlds))
+        .route(
+            "/api/v1/instances/{id}/worlds/{name}",
+            put(handle_rename_instance_world).delete(handle_delete_instance_world),
+        )
+        .route(
+            "/api/v1/instances/{id}/worlds/{name}/backup",
+            post(handle_backup_instance_world),
+        )
         .route("/api/v1/instances/{id}/mods", get(handle_instance_mods))
         .route(
             "/api/v1/instances/{id}/screenshots",
@@ -427,6 +450,68 @@ async fn handle_instance_worlds(
     Ok(Json(scan_instance_worlds(&game_dir.join("saves"))))
 }
 
+async fn handle_rename_instance_world(
+    State(state): State<AppState>,
+    Path((id, name)): Path<(String, String)>,
+    Json(payload): Json<RenameWorldRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    reject_running_instance(&state, &id).await?;
+    validate_world_name(&name)?;
+    validate_world_name(&payload.name)?;
+
+    let game_dir = instance_game_dir(&state, &id)?;
+    let saves_dir = game_dir.join("saves");
+    let source = saves_dir.join(&name);
+    let target = saves_dir.join(&payload.name);
+    require_world_dir(&source)?;
+    if target_exists(&target) {
+        return Err(json_error(StatusCode::CONFLICT, "world already exists"));
+    }
+
+    fs::rename(source, target).map_err(world_file_write_error_response)?;
+    Ok(Json(
+        serde_json::json!({ "status": "ok", "name": payload.name }),
+    ))
+}
+
+async fn handle_delete_instance_world(
+    State(state): State<AppState>,
+    Path((id, name)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    reject_running_instance(&state, &id).await?;
+    validate_world_name(&name)?;
+
+    let game_dir = instance_game_dir(&state, &id)?;
+    let source = game_dir.join("saves").join(&name);
+    require_world_dir(&source)?;
+    fs::remove_dir_all(source).map_err(world_file_write_error_response)?;
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+async fn handle_backup_instance_world(
+    State(state): State<AppState>,
+    Path((id, name)): Path<(String, String)>,
+) -> Result<Json<WorldBackupResponse>, (StatusCode, Json<serde_json::Value>)> {
+    reject_running_instance(&state, &id).await?;
+    validate_world_name(&name)?;
+
+    let game_dir = instance_game_dir(&state, &id)?;
+    let source = game_dir.join("saves").join(&name);
+    require_world_dir(&source)?;
+
+    let backup_root = game_dir.join("backups").join("worlds");
+    fs::create_dir_all(&backup_root).map_err(world_file_write_error_response)?;
+    let backup = available_world_backup_name(&backup_root, &name)?;
+    copy_world_backup_staged(&source, &backup_root, &backup)
+        .map_err(world_file_write_error_response)?;
+
+    Ok(Json(WorldBackupResponse {
+        status: "ok",
+        location: format!("backups/worlds/{backup}"),
+        backup,
+    }))
+}
+
 async fn handle_instance_mods(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -553,6 +638,242 @@ fn instance_game_dir(
     Ok(state.instances().game_dir(&instance.id))
 }
 
+async fn reject_running_instance(
+    state: &AppState,
+    id: &str,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if state.instances().get(id).is_none() {
+        return Err(json_error(StatusCode::NOT_FOUND, "instance not found"));
+    }
+    if state.sessions().has_active_instance(id).await {
+        return Err(json_error(
+            StatusCode::CONFLICT,
+            "cannot change worlds while the instance is running; stop the game first",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_world_name(name: &str) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if name.trim() == name && is_safe_resource_name(name) {
+        Ok(())
+    } else {
+        Err(json_error(StatusCode::BAD_REQUEST, "invalid world name"))
+    }
+}
+
+fn require_world_dir(path: &FsPath) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| match error.kind() {
+        ErrorKind::NotFound => json_error(StatusCode::NOT_FOUND, "world not found"),
+        _ => world_file_read_error_response(error),
+    })?;
+    if metadata.file_type().is_dir() {
+        Ok(())
+    } else {
+        Err(json_error(StatusCode::NOT_FOUND, "world not found"))
+    }
+}
+
+fn target_exists(path: &FsPath) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
+fn available_world_backup_name(
+    backup_root: &FsPath,
+    world_name: &str,
+) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+    let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    let base = format!("{world_name}-{timestamp}");
+    if !target_exists(&backup_root.join(&base)) {
+        return Ok(base);
+    }
+    for index in 2..=100 {
+        let candidate = format!("{base}-{index}");
+        if !target_exists(&backup_root.join(&candidate)) {
+            return Ok(candidate);
+        }
+    }
+    Err(json_error(
+        StatusCode::CONFLICT,
+        "world backup already exists; try again in a moment",
+    ))
+}
+
+fn available_temp_world_backup_name(
+    backup_root: &FsPath,
+    backup: &str,
+) -> std::io::Result<PathBuf> {
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or_default();
+    let base = format!("{backup}.tmp-{suffix}");
+    for index in 0..100 {
+        let candidate = if index == 0 {
+            base.clone()
+        } else {
+            format!("{base}-{index}")
+        };
+        if !is_safe_resource_name(&candidate) {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                "invalid world backup temp name",
+            ));
+        }
+        let path = backup_root.join(candidate);
+        if !target_exists(&path) {
+            return Ok(path);
+        }
+    }
+    Err(std::io::Error::new(
+        ErrorKind::AlreadyExists,
+        "world backup temp path already exists",
+    ))
+}
+
+fn copy_world_backup_staged(
+    source: &FsPath,
+    backup_root: &FsPath,
+    backup: &str,
+) -> std::io::Result<()> {
+    if !is_safe_resource_name(backup) {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "invalid world backup name",
+        ));
+    }
+
+    let target = backup_root.join(backup);
+    if target_exists(&target) {
+        return Err(std::io::Error::new(
+            ErrorKind::AlreadyExists,
+            "world backup already exists",
+        ));
+    }
+
+    let temp = available_temp_world_backup_name(backup_root, backup)?;
+    match copy_world_dir_bounded(source, &temp) {
+        Ok(()) => {}
+        Err(error) => {
+            let _ = fs::remove_dir_all(&temp);
+            return Err(error);
+        }
+    }
+
+    if target_exists(&target) {
+        let _ = fs::remove_dir_all(&temp);
+        return Err(std::io::Error::new(
+            ErrorKind::AlreadyExists,
+            "world backup already exists",
+        ));
+    }
+
+    match fs::rename(&temp, &target) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = fs::remove_dir_all(&temp);
+            Err(error)
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CopyBudget {
+    entries: usize,
+    bytes: u64,
+}
+
+fn copy_world_dir_bounded(source: &FsPath, target: &FsPath) -> std::io::Result<()> {
+    let mut budget = CopyBudget {
+        entries: 0,
+        bytes: 0,
+    };
+    copy_world_dir_bounded_inner(source, target, 0, &mut budget)
+}
+
+fn copy_world_dir_bounded_inner(
+    source: &FsPath,
+    target: &FsPath,
+    depth: usize,
+    budget: &mut CopyBudget,
+) -> std::io::Result<()> {
+    if depth > WORLD_BACKUP_MAX_DEPTH {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "world backup is too deeply nested",
+        ));
+    }
+
+    let metadata = fs::symlink_metadata(source)?;
+    if !metadata.file_type().is_dir() {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "world backup source is not a directory",
+        ));
+    }
+
+    fs::create_dir_all(target)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                "world backup cannot include links",
+            ));
+        }
+
+        budget.entries = budget.entries.saturating_add(1);
+        if budget.entries > WORLD_BACKUP_MAX_ENTRIES {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                "world backup has too many files",
+            ));
+        }
+
+        let entry_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_world_dir_bounded_inner(&entry_path, &target_path, depth + 1, budget)?;
+        } else if file_type.is_file() {
+            let len = entry.metadata()?.len();
+            budget.bytes = budget.bytes.saturating_add(len);
+            if budget.bytes > WORLD_BACKUP_MAX_BYTES {
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "world backup is too large",
+                ));
+            }
+            fs::copy(entry_path, target_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn json_error(status: StatusCode, message: &'static str) -> (StatusCode, Json<serde_json::Value>) {
+    (status, Json(serde_json::json!({ "error": message })))
+}
+
+fn world_file_read_error_response(_error: std::io::Error) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "error": "Could not read world files. Check instance folder permissions and try again."
+        })),
+    )
+}
+
+fn world_file_write_error_response(
+    _error: std::io::Error,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "error": "Could not update world files. Check instance folder permissions and try again."
+        })),
+    )
+}
+
 fn scan_instance_worlds(saves_dir: &FsPath) -> Vec<InstanceWorldInfo> {
     let mut worlds = fs::read_dir(saves_dir)
         .into_iter()
@@ -676,6 +997,7 @@ fn is_screenshot_name(name: &str) -> bool {
 
 fn is_safe_resource_name(name: &str) -> bool {
     !name.is_empty()
+        && !name.trim().is_empty()
         && name != "."
         && name != ".."
         && !name.starts_with('.')
@@ -713,6 +1035,7 @@ mod tests {
     use super::*;
     use crate::state::{AppState, AppStateInit, InstallStore, SessionStore};
     use croopor_config::{AppPaths, ConfigStore, InstanceStore};
+    use croopor_launcher::{LaunchSessionRecord, LaunchState, SessionId};
     use croopor_performance::PerformanceManager;
     use std::{collections::HashMap, io, sync::Arc};
 
@@ -923,6 +1246,9 @@ mod tests {
 
         for name in [
             "",
+            "   ",
+            " World",
+            "World ",
             ".",
             "..",
             ".hidden.log",
@@ -963,6 +1289,254 @@ mod tests {
             vec!["latest.log".to_string(), "debug.log".to_string()]
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn instance_world_names_reject_path_traversal_hidden_and_control_names() {
+        for name in ["World", "My World", "World-2026_05_31"] {
+            assert!(
+                validate_world_name(name).is_ok(),
+                "{name} should be accepted"
+            );
+        }
+
+        for name in [
+            "",
+            "   ",
+            ".",
+            "..",
+            ".hidden",
+            "../World",
+            "nested/World",
+            "nested\\World",
+            "bad\nworld",
+        ] {
+            let (status, Json(body)) =
+                validate_world_name(name).expect_err("invalid world name should fail");
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{name:?}");
+            assert_bounded_error_body(&body, "invalid world name");
+        }
+    }
+
+    #[tokio::test]
+    async fn instance_world_rename_reports_not_found_conflict_and_success() {
+        let fixture = TestFixture::new("world-rename");
+        let instance = fixture
+            .state
+            .instances()
+            .add(
+                "Rename worlds".to_string(),
+                "1.21.1".to_string(),
+                String::new(),
+                String::new(),
+                None,
+            )
+            .expect("add instance");
+        let saves_dir = fixture
+            .state
+            .instances()
+            .game_dir(&instance.id)
+            .join("saves");
+
+        let (status, Json(body)) = handle_rename_instance_world(
+            State(fixture.state.clone()),
+            Path((instance.id.clone(), "Missing".to_string())),
+            Json(RenameWorldRequest {
+                name: "Target".to_string(),
+            }),
+        )
+        .await
+        .expect_err("missing source should fail");
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_bounded_error_body(&body, "world not found");
+
+        fs::create_dir_all(saves_dir.join("World A")).expect("create source world");
+        fs::create_dir_all(saves_dir.join("Existing")).expect("create existing world");
+        let (status, Json(body)) = handle_rename_instance_world(
+            State(fixture.state.clone()),
+            Path((instance.id.clone(), "World A".to_string())),
+            Json(RenameWorldRequest {
+                name: "Existing".to_string(),
+            }),
+        )
+        .await
+        .expect_err("existing target should fail");
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_bounded_error_body(&body, "world already exists");
+        assert!(saves_dir.join("World A").is_dir());
+
+        let Json(body) = handle_rename_instance_world(
+            State(fixture.state.clone()),
+            Path((instance.id.clone(), "World A".to_string())),
+            Json(RenameWorldRequest {
+                name: "Renamed".to_string(),
+            }),
+        )
+        .await
+        .expect("rename world");
+        assert_eq!(
+            body,
+            serde_json::json!({ "status": "ok", "name": "Renamed" })
+        );
+        assert!(!saves_dir.join("World A").exists());
+        assert!(saves_dir.join("Renamed").is_dir());
+    }
+
+    #[tokio::test]
+    async fn instance_world_delete_removes_only_named_world_directory() {
+        let fixture = TestFixture::new("world-delete");
+        let instance = fixture
+            .state
+            .instances()
+            .add(
+                "Delete worlds".to_string(),
+                "1.21.1".to_string(),
+                String::new(),
+                String::new(),
+                None,
+            )
+            .expect("add instance");
+        let saves_dir = fixture
+            .state
+            .instances()
+            .game_dir(&instance.id)
+            .join("saves");
+        fs::create_dir_all(saves_dir.join("Delete Me")).expect("create deleted world");
+        fs::write(saves_dir.join("Delete Me").join("level.dat"), "deleted").expect("write level");
+        fs::create_dir_all(saves_dir.join("Keep Me")).expect("create kept world");
+        fs::write(saves_dir.join("Keep Me").join("level.dat"), "kept").expect("write kept");
+
+        let Json(body) = handle_delete_instance_world(
+            State(fixture.state.clone()),
+            Path((instance.id.clone(), "Delete Me".to_string())),
+        )
+        .await
+        .expect("delete world");
+
+        assert_eq!(body, serde_json::json!({ "status": "ok" }));
+        assert!(!saves_dir.join("Delete Me").exists());
+        assert_eq!(
+            fs::read_to_string(saves_dir.join("Keep Me").join("level.dat")).expect("read kept"),
+            "kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn instance_world_backup_copies_directory_to_instance_local_label() {
+        let fixture = TestFixture::new("world-backup");
+        let instance = fixture
+            .state
+            .instances()
+            .add(
+                "Backup worlds".to_string(),
+                "1.21.1".to_string(),
+                String::new(),
+                String::new(),
+                None,
+            )
+            .expect("add instance");
+        let game_dir = fixture.state.instances().game_dir(&instance.id);
+        let world_dir = game_dir.join("saves").join("Backup Me");
+        fs::create_dir_all(world_dir.join("data")).expect("create world data");
+        fs::write(world_dir.join("level.dat"), "level").expect("write level");
+        fs::write(world_dir.join("data").join("map.dat"), "map").expect("write map");
+
+        let Json(body) = handle_backup_instance_world(
+            State(fixture.state.clone()),
+            Path((instance.id.clone(), "Backup Me".to_string())),
+        )
+        .await
+        .expect("backup world");
+
+        assert_eq!(body.status, "ok");
+        assert!(body.backup.starts_with("Backup Me-"));
+        assert_eq!(body.location, format!("backups/worlds/{}", body.backup));
+        assert!(
+            !body
+                .location
+                .contains(&game_dir.to_string_lossy().to_string())
+        );
+
+        let backup_dir = game_dir.join("backups").join("worlds").join(&body.backup);
+        assert_eq!(
+            fs::read_to_string(backup_dir.join("level.dat")).expect("read backup level"),
+            "level"
+        );
+        assert_eq!(
+            fs::read_to_string(backup_dir.join("data").join("map.dat")).expect("read backup map"),
+            "map"
+        );
+        assert_eq!(
+            fs::read_to_string(world_dir.join("level.dat")).expect("read original level"),
+            "level"
+        );
+    }
+
+    #[test]
+    fn instance_world_backup_cleans_temp_directory_after_copy_failure() {
+        let root = test_root("world-backup-copy-failure");
+        let source = root.join("source");
+        let backup_root = root.join("backups").join("worlds");
+        fs::create_dir_all(&source).expect("create source");
+        fs::create_dir_all(&backup_root).expect("create backup root");
+
+        let mut nested = source.clone();
+        for index in 0..=WORLD_BACKUP_MAX_DEPTH + 1 {
+            nested = nested.join(format!("d{index}"));
+            fs::create_dir_all(&nested).expect("create nested source");
+        }
+
+        let error = copy_world_backup_staged(&source, &backup_root, "Failed Backup")
+            .expect_err("deep source should fail bounded copy");
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        assert!(!backup_root.join("Failed Backup").exists());
+        let leftovers = fs::read_dir(&backup_root)
+            .expect("read backup root")
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "backup temp entries should be removed after failure"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn instance_world_mutations_reject_active_instance() {
+        let fixture = TestFixture::new("world-running-conflict");
+        let instance = fixture
+            .state
+            .instances()
+            .add(
+                "Running worlds".to_string(),
+                "1.21.1".to_string(),
+                String::new(),
+                String::new(),
+                None,
+            )
+            .expect("add instance");
+        let game_dir = fixture.state.instances().game_dir(&instance.id);
+        fs::create_dir_all(game_dir.join("saves").join("World")).expect("create world");
+        fixture
+            .state
+            .sessions()
+            .insert(test_launch_record("active-world-session", &instance.id))
+            .await;
+
+        let (status, Json(body)) = handle_delete_instance_world(
+            State(fixture.state.clone()),
+            Path((instance.id, "World".to_string())),
+        )
+        .await
+        .expect_err("running instance should reject world mutation");
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_bounded_error_body(
+            &body,
+            "cannot change worlds while the instance is running; stop the game first",
+        );
+        assert!(game_dir.join("saves").join("World").is_dir());
     }
 
     #[tokio::test]
@@ -1427,6 +2001,30 @@ mod tests {
             music_dir: root.join("music"),
             library_dir: root.join("library"),
             config_dir,
+        }
+    }
+
+    fn test_launch_record(session_id: &str, instance_id: &str) -> LaunchSessionRecord {
+        LaunchSessionRecord {
+            session_id: SessionId(session_id.to_string()),
+            instance_id: instance_id.to_string(),
+            version_id: "1.21.1".to_string(),
+            launched_at: Some("2026-01-01T00:00:00.000Z".to_string()),
+            benchmark: None,
+            state: LaunchState::Queued,
+            pid: None,
+            process_started_at_ms: None,
+            boot_completed_at_ms: None,
+            boot_duration_ms: None,
+            priority: None,
+            exit_code: None,
+            command: Vec::new(),
+            java_path: None,
+            natives_dir: None,
+            failure: None,
+            healing: None,
+            guardian: None,
+            stages: Vec::new(),
         }
     }
 }
