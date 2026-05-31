@@ -419,6 +419,55 @@ impl AuthLoginStore {
         Some((token, account))
     }
 
+    pub async fn refresh_with_msa_token(
+        &self,
+        new_token: NewAuthLoginMsaToken,
+        fallback_refresh_token: &str,
+    ) -> Option<AuthLoginMsaToken> {
+        let now = Utc::now();
+        let login_id = self
+            .active_msa_token
+            .read()
+            .await
+            .as_ref()?
+            .login_id
+            .clone();
+        let refresh_token = new_token
+            .refresh_token
+            .filter(|refresh_token| !refresh_token.trim().is_empty())
+            .or_else(|| Some(fallback_refresh_token.to_string()));
+        let token = AuthLoginMsaToken {
+            login_id: login_id.clone(),
+            access_token: new_token.access_token,
+            refresh_token,
+            id_token: new_token.id_token,
+            token_type: new_token.token_type,
+            expires_in: new_token.expires_in,
+            scope: new_token.scope,
+            authenticated_at: now,
+            expires_at: now
+                + chrono::Duration::seconds(saturating_u64_to_i64(new_token.expires_in)),
+        };
+        let preserved_account = {
+            let mut account = self.active_minecraft_account.write().await;
+            match account.as_ref() {
+                Some(active) if active.login_id == login_id && active.expires_at > now => {
+                    account.clone()
+                }
+                Some(_) => {
+                    *account = None;
+                    None
+                }
+                None => None,
+            }
+        };
+
+        *self.active_msa_token.write().await = Some(token.clone());
+        self.bump_active_auth_generation();
+        self.save_active_snapshot(&token, preserved_account.as_ref());
+        Some(token)
+    }
+
     pub async fn increase_interval(&self, login_id: &str, additional_seconds: u64) -> Option<u64> {
         let now = Utc::now();
         let mut sessions = self.sessions.write().await;
@@ -1367,6 +1416,61 @@ mod tests {
             active.refresh_token,
             Some("new-msa-refresh-token".to_string())
         );
+        assert_eq!(persistence.saves(), 2);
+    }
+
+    #[tokio::test]
+    async fn auth_login_store_persists_msa_only_rotated_refresh_snapshot() {
+        let persistence = Arc::new(MockAuthSnapshotPersistence::default());
+        let store = AuthLoginStore::with_persistence(persistence.clone());
+        let session = store
+            .insert(NewAuthLoginSession {
+                device_code: "raw-device-code".to_string(),
+                user_code: "ABCD-EFGH".to_string(),
+                verification_uri: "https://www.microsoft.com/link".to_string(),
+                expires_in: 900,
+                interval: 5,
+                message: None,
+            })
+            .await;
+        store
+            .complete_with_msa_token(
+                &session.login_id,
+                NewAuthLoginMsaToken {
+                    access_token: "old-msa-access-token".to_string(),
+                    refresh_token: Some("old-msa-refresh-token".to_string()),
+                    id_token: None,
+                    token_type: "Bearer".to_string(),
+                    expires_in: 0,
+                    scope: Some("XboxLive.signin offline_access".to_string()),
+                },
+            )
+            .await
+            .expect("complete login");
+
+        store
+            .refresh_with_msa_token(
+                NewAuthLoginMsaToken {
+                    access_token: "new-msa-access-token".to_string(),
+                    refresh_token: Some("new-msa-refresh-token".to_string()),
+                    id_token: None,
+                    token_type: "Bearer".to_string(),
+                    expires_in: 3600,
+                    scope: Some("XboxLive.signin offline_access".to_string()),
+                },
+                "old-msa-refresh-token",
+            )
+            .await
+            .expect("refresh msa token");
+
+        let restored = AuthLoginStore::with_persistence(persistence.clone());
+        let active = restored.active_msa_token().await.expect("restored token");
+        assert_eq!(active.access_token, "new-msa-access-token");
+        assert_eq!(
+            active.refresh_token,
+            Some("new-msa-refresh-token".to_string())
+        );
+        assert_eq!(restored.active_minecraft_account().await, None);
         assert_eq!(persistence.saves(), 2);
     }
 

@@ -747,6 +747,11 @@ async fn active_auth_refresh_success_from_store(
 ) -> Option<AuthRefreshSuccess> {
     let msa_state = login_store.active_msa_token_state().await?;
     let minecraft_state = login_store.active_minecraft_account_state().await?;
+    if minecraft_state.account.login_id != msa_state.token.login_id
+        || minecraft_state.account.authenticated_at < msa_state.token.authenticated_at
+    {
+        return None;
+    }
     if !minecraft_account_can_launch_online(&minecraft_state.account) {
         return None;
     }
@@ -795,7 +800,21 @@ async fn auth_refresh_success_response(
         .await
     {
         Ok(exchange) => NewAuthLoginMinecraftAccount::from(exchange),
-        Err(error) => return Err(AuthRefreshFailure::auth_chain(error)),
+        Err(error) => {
+            if login_store
+                .refresh_with_msa_token(
+                    NewAuthLoginMsaToken::from(response),
+                    fallback_refresh_token,
+                )
+                .await
+                .is_none()
+            {
+                return Err(AuthRefreshFailure::new(
+                    AuthRefreshFailureKind::StoreUnavailable,
+                ));
+            }
+            return Err(AuthRefreshFailure::auth_chain(error));
+        }
     };
 
     let public_response = AuthRefreshAuthenticatedResponse {
@@ -2120,15 +2139,20 @@ mod tests {
         assert_eq!(response.0, StatusCode::BAD_GATEWAY);
         assert_eq!(response.1.0["status"], "minecraft_auth_chain_failed");
         assert_no_sensitive_public_fields(&response.1.0);
+        assert_eq!(response.1.0.get("minecraft_profile_ready"), None);
+        assert_eq!(response.1.0.get("minecraft_profile"), None);
+        let active = store.active_msa_token().await.expect("active msa token");
+        assert_eq!(active.access_token, "msa-access-token");
         assert_eq!(
-            store
-                .active_msa_token()
-                .await
-                .expect("active msa token")
-                .refresh_token,
-            Some("old-msa-refresh-token".to_string())
+            active.refresh_token,
+            Some("new-msa-refresh-token".to_string())
         );
-        assert!(store.active_minecraft_account().await.is_some());
+        let minecraft = store
+            .active_minecraft_account()
+            .await
+            .expect("existing minecraft account");
+        assert_eq!(minecraft.profile.name, "OldProfileName");
+        assert_eq!(minecraft.access_token, "old-minecraft-access-token");
     }
 
     #[tokio::test]

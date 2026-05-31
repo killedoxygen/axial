@@ -1084,7 +1084,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_launch_session_transient_refresh_chain_failure_is_bounded() {
+    async fn selected_online_launch_refresh_auth_chain_failure_is_bounded() {
         let fixture = TestFixture::new("prepare-online-auth-refresh-chain-failed");
         fixture.set_launch_auth_mode("online");
         let instance_id = fixture.add_instance("Survival", "1.21.1");
@@ -1117,13 +1117,20 @@ mod tests {
         assert_eq!(error.1.0["auth_refresh_status"], "refresh_failed");
         assert_eq!(error.1.0["auth_refresh_reason"], "auth_chain_failed");
         assert_launch_error_is_token_safe(&error.1.0);
-        assert!(
-            fixture
-                .state
-                .auth_logins()
-                .active_msa_token()
-                .await
-                .is_some()
+        let active = fixture
+            .state
+            .auth_logins()
+            .active_msa_token()
+            .await
+            .expect("active msa token");
+        assert_eq!(active.access_token, "new-msa-access-token");
+        assert_eq!(
+            active.refresh_token,
+            Some("new-msa-refresh-token".to_string())
+        );
+        assert_eq!(
+            fixture.state.auth_logins().active_minecraft_account().await,
+            None
         );
     }
 
