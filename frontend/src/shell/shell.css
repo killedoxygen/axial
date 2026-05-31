@@ -487,8 +487,7 @@
   .cp-sidebar-user .cp-player-head,
   .cp-sidebar-user-body,
   .cp-userm,
-  .cp-account-chip,
-  .cp-status-pill--running .cp-status-dot,
+  .cp-status-pill .cp-status-dot,
   .cp-music-eq > span {
     animation: none !important;
     animation-duration: 0s !important;
@@ -522,21 +521,24 @@
   flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
 }
 
 .cp-status-pill {
+  --cp-status-color: var(--text-mute);
+  --cp-status-bg: transparent;
+  --cp-status-border: transparent;
   flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 7px;
   width: 188px;
   height: 28px;
   padding: 0 12px 0 10px;
   border-radius: 999px;
-  border: 1px solid transparent;
-  background: transparent;
-  color: var(--text-mute);
+  border: 1px solid var(--cp-status-border);
+  background: var(--cp-status-bg);
+  color: var(--cp-status-color);
   font-family: inherit;
   font-size: 13px;
   font-weight: 500;
@@ -544,16 +546,29 @@
   overflow: hidden;
 }
 .cp-status-pill--running {
-  border-color: var(--accent-line);
-  background: var(--accent-soft);
-  color: var(--accent);
+  --cp-status-color: var(--accent);
+  --cp-status-bg: var(--accent-softer);
+  --cp-status-border: var(--accent-line);
   cursor: pointer;
+}
+.cp-status-pill--installing {
+  --cp-status-color: oklch(from var(--accent) l calc(c * 0.78) calc(h + 72));
+  --cp-status-bg: color-mix(in oklab, var(--surface-2) 84%, var(--cp-status-color));
+  --cp-status-border: color-mix(in oklab, var(--line) 70%, var(--cp-status-color));
+  cursor: pointer;
+}
+.cp-status-pill--preparing {
+  --cp-status-color: color-mix(in oklab, var(--accent) 42%, var(--text-dim));
+  --cp-status-bg: color-mix(in oklab, var(--surface-2) 88%, var(--accent));
+  --cp-status-border: color-mix(in oklab, var(--line) 74%, var(--accent));
 }
 .cp-status-dot {
   flex: 0 0 auto;
-  width: 7px; height: 7px;
+  width: 7px;
+  height: 7px;
   border-radius: 999px;
-  background: var(--text-mute);
+  background: currentColor;
+  box-shadow: 0 0 0 2px color-mix(in oklab, currentColor 12%, transparent);
 }
 .cp-status-pill-label {
   min-width: 0;
@@ -562,48 +577,11 @@
   white-space: nowrap;
 }
 .cp-status-pill--running .cp-status-dot {
-  background: var(--accent);
-  box-shadow: 0 0 10px var(--accent);
-  animation: cp-pulse 2s ease-in-out infinite;
+  animation: cp-status-dot-pulse 2.4s ease-in-out infinite;
 }
-
-.cp-account-chip {
-  flex: 0 0 150px;
-  width: 150px;
-  height: 30px;
-  padding: 2px 9px 2px 3px;
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  border-radius: 999px;
-  border: 1px solid var(--line);
-  background: var(--surface-2);
-  color: var(--text-dim);
-  font: inherit;
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-  text-align: left;
-  transition: background 140ms, border-color 140ms, color 140ms;
-}
-.cp-account-chip:hover {
-  background: var(--surface-3);
-  border-color: color-mix(in oklab, var(--line) 68%, var(--text-mute));
-  color: var(--text);
-}
-.cp-account-chip:focus-visible {
-  outline: none;
-  border-color: var(--accent-line);
-  box-shadow: 0 0 0 3px var(--accent-ring);
-}
-.cp-account-chip .cp-player-head {
-  flex: 0 0 auto;
-}
-.cp-account-chip-name {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+@keyframes cp-status-dot-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.68; }
 }
 
 /* Music widget ---------------------------------------------------------- */
