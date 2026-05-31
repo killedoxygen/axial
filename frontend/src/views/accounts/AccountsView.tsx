@@ -19,6 +19,33 @@ interface OfflineSkinProfile {
   head_url: string | null;
 }
 
+interface MinecraftSkin {
+  id: string;
+  state: string;
+  url: string;
+  variant: string;
+}
+
+interface MinecraftCape {
+  id: string;
+  state: string;
+  url: string;
+}
+
+interface MinecraftProfile {
+  id: string;
+  name: string;
+  skins: MinecraftSkin[];
+  capes: MinecraftCape[];
+}
+
+interface MinecraftAuthReadiness {
+  minecraft_profile_ready?: boolean;
+  minecraft_ownership_verified?: boolean;
+  minecraft_profile?: MinecraftProfile;
+  minecraft_token_expires_in?: number | null;
+}
+
 interface AuthStatus {
   mode: string;
   username: string;
@@ -33,6 +60,8 @@ interface AuthStatus {
   msa_provider?: string | null;
   msa_token_expires_in?: number | null;
 }
+
+type AuthStatusRecord = AuthStatus & MinecraftAuthReadiness;
 
 interface AuthLoginPending {
   status: 'pending';
@@ -56,15 +85,23 @@ interface AuthPollAuthenticated {
   msa_token_expires_in?: number | null;
 }
 
-type AuthPollTerminalStatus = 'authorization_declined' | 'expired' | 'bad_verification_code' | 'error';
+type AuthPollAuthenticatedRecord = AuthPollAuthenticated & MinecraftAuthReadiness;
+
+type AuthPollTerminalStatus =
+  | 'authorization_declined'
+  | 'expired'
+  | 'bad_verification_code'
+  | 'minecraft_auth_chain_failed'
+  | 'error';
 
 interface AuthPollTerminal {
   status: AuthPollTerminalStatus;
   error?: string;
+  auth_chain_error?: string;
   poll_hint?: string;
 }
 
-type AuthPollResponse = AuthPollPending | AuthPollAuthenticated | AuthPollTerminal;
+type AuthPollResponse = AuthPollPending | AuthPollAuthenticatedRecord | AuthPollTerminal;
 
 type OfflineProfileState = 'loading' | 'ready' | 'unavailable';
 type AuthStatusState = 'loading' | 'ready' | 'unavailable';
@@ -208,11 +245,11 @@ function useOfflineSkinProfile(savedUsername: string): {
 }
 
 function useAuthStatus(savedUsername: string): {
-  status: AuthStatus | null;
+  status: AuthStatusRecord | null;
   state: AuthStatusState;
   refresh: () => void;
 } {
-  const [status, setStatus] = useState<AuthStatus | null>(null);
+  const [status, setStatus] = useState<AuthStatusRecord | null>(null);
   const [state, setState] = useState<AuthStatusState>('loading');
   const [refreshIndex, setRefreshIndex] = useState(0);
 
@@ -226,10 +263,12 @@ function useAuthStatus(savedUsername: string): {
     setStatus(null);
 
     void api('GET', '/auth/status')
-      .then((res: AuthStatus & { error?: string }) => {
+      .then((res: unknown) => {
         if (!active) return;
-        if (res.error) throw new Error(res.error);
-        setStatus(res);
+        if (isRecord(res) && typeof res.error === 'string') throw new Error(res.error);
+        const parsed = authStatusResponse(res);
+        if (!parsed) throw new Error('invalid auth status');
+        setStatus(parsed);
         setState('ready');
       })
       .catch(() => {
@@ -331,9 +370,113 @@ function formatSeconds(seconds: number): string {
   return remaining > 0 ? `${minutes}m ${remaining}s` : `${minutes}m`;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function maybeNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function minecraftSkin(value: unknown): MinecraftSkin | null {
+  if (!isRecord(value)) return null;
+  if (
+    typeof value.id !== 'string' ||
+    typeof value.state !== 'string' ||
+    typeof value.url !== 'string' ||
+    typeof value.variant !== 'string'
+  ) {
+    return null;
+  }
+
+  return {
+    id: value.id,
+    state: value.state,
+    url: value.url,
+    variant: value.variant,
+  };
+}
+
+function minecraftCape(value: unknown): MinecraftCape | null {
+  if (!isRecord(value)) return null;
+  if (
+    typeof value.id !== 'string' ||
+    typeof value.state !== 'string' ||
+    typeof value.url !== 'string'
+  ) {
+    return null;
+  }
+
+  return {
+    id: value.id,
+    state: value.state,
+    url: value.url,
+  };
+}
+
+function minecraftProfile(value: unknown): MinecraftProfile | undefined {
+  if (!isRecord(value)) return undefined;
+  if (typeof value.id !== 'string' || typeof value.name !== 'string') return undefined;
+
+  return {
+    id: value.id,
+    name: value.name,
+    skins: Array.isArray(value.skins) ? value.skins.map(minecraftSkin).filter((skin): skin is MinecraftSkin => Boolean(skin)) : [],
+    capes: Array.isArray(value.capes) ? value.capes.map(minecraftCape).filter((cape): cape is MinecraftCape => Boolean(cape)) : [],
+  };
+}
+
+function minecraftReadiness(record: Record<string, unknown>): MinecraftAuthReadiness {
+  return {
+    minecraft_profile_ready: typeof record.minecraft_profile_ready === 'boolean'
+      ? record.minecraft_profile_ready
+      : undefined,
+    minecraft_ownership_verified: typeof record.minecraft_ownership_verified === 'boolean'
+      ? record.minecraft_ownership_verified
+      : undefined,
+    minecraft_profile: minecraftProfile(record.minecraft_profile),
+    minecraft_token_expires_in: record.minecraft_token_expires_in === null
+      ? null
+      : maybeNumber(record.minecraft_token_expires_in),
+  };
+}
+
+function authStatusResponse(value: unknown): AuthStatusRecord | null {
+  if (!isRecord(value)) return null;
+  if (
+    typeof value.mode !== 'string' ||
+    typeof value.username !== 'string' ||
+    typeof value.uuid !== 'string' ||
+    typeof value.provider !== 'string' ||
+    typeof value.verified !== 'boolean' ||
+    typeof value.online_mode_ready !== 'boolean' ||
+    typeof value.skin_source !== 'string' ||
+    typeof value.login_available !== 'boolean' ||
+    typeof value.login_reason !== 'string'
+  ) {
+    return null;
+  }
+
+  return {
+    mode: value.mode,
+    username: value.username,
+    uuid: value.uuid,
+    provider: value.provider,
+    verified: value.verified,
+    online_mode_ready: value.online_mode_ready,
+    skin_source: value.skin_source,
+    login_available: value.login_available,
+    login_reason: value.login_reason,
+    msa_authenticated: typeof value.msa_authenticated === 'boolean' ? value.msa_authenticated : undefined,
+    msa_provider: typeof value.msa_provider === 'string' ? value.msa_provider : value.msa_provider === null ? null : undefined,
+    msa_token_expires_in: value.msa_token_expires_in === null ? null : maybeNumber(value.msa_token_expires_in),
+    ...minecraftReadiness(value),
+  };
+}
+
 function loginPendingResponse(value: unknown): AuthLoginPending | null {
-  if (typeof value !== 'object' || value === null) return null;
-  const record = value as Record<string, unknown>;
+  if (!isRecord(value)) return null;
+  const record = value;
   if (
     record.status !== 'pending' ||
     typeof record.login_id !== 'string' ||
@@ -363,11 +506,10 @@ function boundedMessage(value: string | undefined, fallback: string): string {
 }
 
 function apiErrorMessage(value: unknown, fallback: string): string {
-  if (typeof value !== 'object' || value === null) {
+  if (!isRecord(value)) {
     return fallback;
   }
-  const record = value as Record<string, unknown>;
-  return boundedMessage(typeof record.error === 'string' ? record.error : undefined, fallback);
+  return boundedMessage(typeof value.error === 'string' ? value.error : undefined, fallback);
 }
 
 function loginErrorMessage(value: unknown): string {
@@ -379,8 +521,8 @@ function logoutErrorMessage(value: unknown): string {
 }
 
 function pollResponse(value: unknown): AuthPollResponse | null {
-  if (typeof value !== 'object' || value === null) return null;
-  const record = value as Record<string, unknown>;
+  if (!isRecord(value)) return null;
+  const record = value;
   if (record.status === 'pending' && typeof record.interval === 'number') {
     return {
       status: 'pending',
@@ -393,9 +535,8 @@ function pollResponse(value: unknown): AuthPollResponse | null {
     return {
       status: 'msa_authenticated',
       msa_provider: typeof record.msa_provider === 'string' ? record.msa_provider : undefined,
-      msa_token_expires_in: typeof record.msa_token_expires_in === 'number'
-        ? record.msa_token_expires_in
-        : undefined,
+      msa_token_expires_in: record.msa_token_expires_in === null ? null : maybeNumber(record.msa_token_expires_in),
+      ...minecraftReadiness(record),
     };
   }
 
@@ -403,11 +544,13 @@ function pollResponse(value: unknown): AuthPollResponse | null {
     record.status === 'authorization_declined' ||
     record.status === 'expired' ||
     record.status === 'bad_verification_code' ||
+    record.status === 'minecraft_auth_chain_failed' ||
     record.status === 'error'
   ) {
     return {
       status: record.status,
       error: typeof record.error === 'string' ? record.error : undefined,
+      auth_chain_error: typeof record.auth_chain_error === 'string' ? record.auth_chain_error : undefined,
       poll_hint: typeof record.poll_hint === 'string' ? record.poll_hint : undefined,
     };
   }
@@ -417,6 +560,9 @@ function pollResponse(value: unknown): AuthPollResponse | null {
 
 function pollTerminalMessage(response: AuthPollTerminal | null): string {
   if (!response) return 'Microsoft sign-in returned an unexpected response.';
+  if (response.status === 'minecraft_auth_chain_failed') {
+    return 'Microsoft sign-in completed, but Croopor could not verify the Minecraft profile or ownership. Offline launches are unchanged.';
+  }
   const fallback = response.status === 'authorization_declined'
     ? 'Microsoft sign-in was declined.'
     : response.status === 'expired'
@@ -425,6 +571,112 @@ function pollTerminalMessage(response: AuthPollTerminal | null): string {
         ? 'Microsoft sign-in code was rejected. Get a new code to try again.'
         : 'Microsoft sign-in could not be completed.';
   return boundedMessage(response.error || response.poll_hint, fallback);
+}
+
+function hasMinecraftReadiness(status: MinecraftAuthReadiness): boolean {
+  return typeof status.minecraft_profile_ready === 'boolean' ||
+    typeof status.minecraft_ownership_verified === 'boolean' ||
+    Boolean(status.minecraft_profile) ||
+    typeof status.minecraft_token_expires_in === 'number';
+}
+
+function readinessValue(value: boolean | undefined, readyLabel: string, notReadyLabel: string): string {
+  if (value === true) return readyLabel;
+  if (value === false) return notReadyLabel;
+  return 'Not reported';
+}
+
+function pollSuccessMessage(poll: AuthPollAuthenticatedRecord): string {
+  const profileName = poll.minecraft_profile?.name;
+  if (poll.minecraft_profile_ready && poll.minecraft_ownership_verified) {
+    return `${profileName || 'Minecraft profile'} was verified. Launch identity remains offline until online launch credentials are wired.`;
+  }
+  if (poll.minecraft_profile_ready) {
+    return `${profileName || 'Minecraft profile'} was found, but ownership was not verified. Offline launches are unchanged.`;
+  }
+  return 'Microsoft sign-in is active, but Minecraft profile verification is not complete. Offline launches are unchanged.';
+}
+
+function MinecraftProfileReadiness({ status }: { status: AuthStatusRecord }): JSX.Element | null {
+  const theme = useTheme();
+  if (!hasMinecraftReadiness(status)) return null;
+
+  const profile = status.minecraft_profile;
+  const profileReady = status.minecraft_profile_ready === true;
+  const ownershipVerified = status.minecraft_ownership_verified === true;
+  const primarySkin = profile?.skins[0];
+  const skinSummary = profile
+    ? `${profile.skins.length}${primarySkin ? `, ${primarySkin.variant || 'classic'} ${primarySkin.state}` : ''}`
+    : 'Not reported';
+  const verificationWindow = typeof status.minecraft_token_expires_in === 'number'
+    ? formatSeconds(status.minecraft_token_expires_in)
+    : 'Not reported';
+
+  return (
+    <div style={{
+      display: 'grid',
+      gap: 10,
+      padding: '12px 14px',
+      border: '1px solid var(--line)',
+      borderRadius: theme.r.md,
+      background: theme.n.surface2,
+    }}>
+      <div style={{
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        gap: 10,
+        flexWrap: 'wrap',
+      }}>
+        <div style={{
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: 7,
+          color: theme.n.textDim,
+          fontSize: 12,
+          fontWeight: 700,
+        }}>
+          <Icon name="shield-check" size={15} color={theme.n.textMute} />
+          Minecraft profile readiness
+        </div>
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+          <Pill tone={profileReady ? 'ok' : 'warn'} icon={profileReady ? 'check-circle' : 'alert'}>
+            {profileReady ? 'Profile verified' : 'Profile not verified'}
+          </Pill>
+          <Pill tone={ownershipVerified ? 'ok' : 'warn'} icon={ownershipVerified ? 'check-circle' : 'alert'}>
+            {ownershipVerified ? 'Ownership verified' : 'Ownership not verified'}
+          </Pill>
+        </div>
+      </div>
+      <div style={{
+        color: theme.n.textDim,
+        fontSize: 12,
+        lineHeight: 1.45,
+      }}>
+        Profile verification can now be active, but launches still remain offline until online launch credentials are wired.
+      </div>
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fit, minmax(124px, 1fr))',
+        gap: 12,
+        alignItems: 'start',
+      }}>
+        <ProfileMetaValue label="Name" value={profile?.name || 'Not reported'} />
+        <ProfileMetaValue label="Profile UUID" value={profile?.id ? shortenUuid(profile.id) : 'Not reported'} />
+        <ProfileMetaValue
+          label="Profile"
+          value={readinessValue(status.minecraft_profile_ready, 'Ready', 'Not verified')}
+        />
+        <ProfileMetaValue
+          label="Ownership"
+          value={readinessValue(status.minecraft_ownership_verified, 'Verified', 'Not verified')}
+        />
+        <ProfileMetaValue label="Skins" value={skinSummary} />
+        <ProfileMetaValue label="Capes" value={profile ? String(profile.capes.length) : 'Not reported'} />
+        <ProfileMetaValue label="Verification window" value={verificationWindow} />
+      </div>
+    </div>
+  );
 }
 
 function DeviceCodePanel({
@@ -501,7 +753,7 @@ function DeviceCodePanel({
           lineHeight: 1.45,
         }}>
           {login.message || 'Enter this code at the Microsoft verification page.'}
-          {' '}This starts sign-in only. Online mode is not ready until the future token flow is added.
+          {' '}Profile verification may complete after sign-in, but launches remain offline until online launch credentials are wired.
         </div>
         <div style={{
           display: 'flex',
@@ -613,7 +865,7 @@ function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Elem
             setLogin(null);
             setPollHint(null);
             setLoginError(null);
-            setLoginSuccess('Microsoft sign-in is active for this launcher session. Launch identity remains offline and unverified.');
+            setLoginSuccess(pollSuccessMessage(poll));
             refreshStatus();
             return;
           }
@@ -686,9 +938,15 @@ function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Elem
 
   const msaActive = Boolean(status?.msa_authenticated);
   const msaProvider = status?.msa_provider || 'Microsoft';
+  const minecraftVerified = Boolean(status?.minecraft_profile_ready === true && status?.minecraft_ownership_verified === true);
+  const minecraftReadinessReported = status ? hasMinecraftReadiness(status) : false;
   const statusCopy = msaActive
-    ? `${msaProvider} sign-in is active. Croopor still launches as ${status?.username}, an offline unverified identity, until the future Minecraft profile chain exists.`
-    : `Croopor is using ${status?.username} as the current ${status?.provider} identity. Online-mode sessions are ${status?.online_mode_ready ? 'ready' : 'not ready'}.`;
+    ? minecraftVerified
+      ? `${msaProvider} sign-in is active and the Minecraft profile is verified. Croopor still launches as ${status?.username}, an offline identity, until online launch credentials are wired.`
+      : minecraftReadinessReported
+        ? `${msaProvider} sign-in is active, but verified Minecraft profile ownership is not ready. Croopor still launches as ${status?.username}, an offline identity, until online launch credentials are wired.`
+        : `${msaProvider} sign-in is active. Croopor still launches as ${status?.username}, an offline identity, until online launch credentials are wired.`
+    : `Croopor is using ${status?.username} as the current ${status?.provider} identity. Online launch credentials are ${status?.online_mode_ready ? 'reported ready by the backend' : 'not ready'}.`;
 
   return (
     <Card>
@@ -699,6 +957,7 @@ function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Elem
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
             <Pill tone={statusTone} icon="user">{statusLabel}</Pill>
             {msaActive && <Pill tone="ok" icon="check-circle">Microsoft active</Pill>}
+            {minecraftVerified && <Pill tone="ok" icon="shield-check">Minecraft verified</Pill>}
           </div>
         )}
       />
@@ -721,6 +980,7 @@ function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Elem
               <ProfileMetaValue label="Login" value={status.login_available ? 'Available' : 'Unavailable'} />
               <ProfileMetaValue label="Microsoft" value={msaActive ? msaProvider : 'Inactive'} />
             </div>
+            <MinecraftProfileReadiness status={status} />
             <div style={{
               display: 'flex',
               alignItems: 'center',
