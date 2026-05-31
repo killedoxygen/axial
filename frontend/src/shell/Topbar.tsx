@@ -64,14 +64,21 @@ function StatusPill(): JSX.Element {
 
   const install = installState.value;
   if (install.status === 'active') {
+    const installPct = Math.round(Math.max(0, Math.min(100, install.pct)));
+    const installPhase = install.phase ? ` · ${install.phase.replace(/_/g, ' ')}` : '';
+    const installTitle = `${install.versionId}: ${install.label} · ${installPct}%${installPhase}`;
+    const installStyle = { '--cp-install-ratio': String(installPct / 100) } as JSX.CSSProperties;
+
     return (
       <button
         class="cp-status-pill cp-status-pill--installing cp-nodrag"
         onClick={() => navigate({ name: 'downloads' })}
-        title={`${install.label} · ${Math.round(install.pct)}%`}
+        title={installTitle}
+        aria-label={`Open downloads. ${installTitle}`}
+        style={installStyle}
       >
         <span class="cp-status-dot" />
-        <span class="cp-status-pill-label">{install.label} · {Math.round(install.pct)}%</span>
+        <span class="cp-status-pill-label">{install.label} · {installPct}%</span>
       </button>
     );
   }

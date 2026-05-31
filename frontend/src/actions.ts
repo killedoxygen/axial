@@ -29,13 +29,20 @@ export function enqueueInstall(item: InstallItem): void {
 }
 
 export function startInstall(versionId: string, label = 'Starting...'): void {
-  installState.value = { status: 'active', versionId, pct: 0, label };
+  installState.value = { status: 'active', versionId, pct: 0, label, phase: 'starting', startedAt: Date.now() };
 }
 
-export function updateInstallProgress(pct: number, label: string): void {
+export function updateInstallProgress(pct: number, label: string, phase?: string): void {
   const current = installState.value;
   if (current.status !== 'active') return;
-  installState.value = { ...current, pct, label };
+  const nextPct = Number.isFinite(pct) ? Math.max(0, Math.min(100, pct)) : current.pct;
+  const regressed = nextPct < current.pct;
+  installState.value = {
+    ...current,
+    pct: Math.max(current.pct, nextPct),
+    label: regressed ? current.label : label,
+    phase: regressed ? current.phase : phase || current.phase,
+  };
 }
 
 export function completeInstall(): void {
