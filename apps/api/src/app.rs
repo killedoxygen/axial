@@ -312,6 +312,7 @@ mod croopor_api_test_support {
                 )
                 .expect("performance manager"),
             ),
+            startup_warnings: Vec::new(),
             frontend_dir: root.join("frontend"),
         })
     }

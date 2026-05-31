@@ -15,7 +15,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let paths = AppPaths::detect();
-    let config = Arc::new(ConfigStore::load_from(paths.clone())?);
+    let config_startup = ConfigStore::load_for_startup(paths.clone())?;
+    let startup_warnings = config_startup.warnings;
+    let config = Arc::new(config_startup.store);
     let instances = Arc::new(InstanceStore::load_from(paths.clone())?);
     let installs = Arc::new(InstallStore::new());
     let sessions = Arc::new(SessionStore::new());
@@ -28,6 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         installs,
         sessions,
         performance,
+        startup_warnings,
         frontend_dir: default_frontend_dir(),
     });
     spawn_performance_operations_resume(&state);

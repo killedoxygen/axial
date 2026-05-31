@@ -18,7 +18,10 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     let paths = AppPaths::detect();
-    let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config store"));
+    let config_startup =
+        ConfigStore::load_for_startup(paths.clone()).expect("load config store for startup");
+    let startup_warnings = config_startup.warnings;
+    let config = Arc::new(config_startup.store);
     let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instance store"));
     let installs = Arc::new(InstallStore::new());
     let sessions = Arc::new(SessionStore::new());
@@ -34,6 +37,7 @@ async fn main() {
         installs,
         sessions,
         performance,
+        startup_warnings,
         frontend_dir: croopor_api::app::default_frontend_dir(),
     });
     spawn_performance_operations_resume(&state);

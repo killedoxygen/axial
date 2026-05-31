@@ -186,6 +186,8 @@ flowchart TD
     E --> F[frontend store updates live config]
 ```
 
+Normal config reads and writes parse and validate the strict current `AppConfig` schema. API and desktop startup use a narrower startup-only load path: if `config.json` parses as current `AppConfig` and validation fails only because `launch_auth_mode` is not `offline` or `online`, startup keeps the file unchanged, uses `offline` in memory, and exposes a bounded warning through `GET /api/v1/status`. Parse failures, invalid usernames, and any other validation failure still fail startup.
+
 ### Install flow
 ```mermaid
 flowchart TD

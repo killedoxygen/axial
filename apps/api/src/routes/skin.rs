@@ -658,6 +658,7 @@ mod tests {
                 installs: Arc::new(InstallStore::new()),
                 sessions: Arc::new(SessionStore::new()),
                 performance: Arc::new(PerformanceManager::new().expect("performance manager")),
+                startup_warnings: Vec::new(),
                 frontend_dir: root.join("frontend"),
             });
 

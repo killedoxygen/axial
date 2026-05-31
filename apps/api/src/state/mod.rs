@@ -14,6 +14,9 @@ use croopor_performance::PerformanceManager;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+const STARTUP_WARNING_LIMIT: usize = 8;
+const STARTUP_WARNING_MAX_CHARS: usize = 240;
+
 pub use auth_logins::{
     ActiveMinecraftAccountState, ActiveMsaTokenState, AuthLoginMinecraftAccount,
     AuthLoginMinecraftCape, AuthLoginMinecraftProfile, AuthLoginMinecraftSkin, AuthLoginSession,
@@ -34,6 +37,7 @@ pub struct AppState {
     benchmark_suite_drivers: Arc<benchmark_suite_drivers::BenchmarkSuiteDriverStore>,
     performance_operations: Arc<performance_operations::PerformanceOperationStore>,
     performance: Arc<PerformanceManager>,
+    startup_warnings: Arc<Vec<String>>,
     library_dir: Arc<RwLock<Option<String>>>,
     frontend_dir: Arc<PathBuf>,
 }
@@ -46,6 +50,7 @@ pub struct AppStateInit {
     pub installs: Arc<InstallStore>,
     pub sessions: Arc<SessionStore>,
     pub performance: Arc<PerformanceManager>,
+    pub startup_warnings: Vec<String>,
     pub frontend_dir: PathBuf,
 }
 
@@ -72,6 +77,7 @@ impl AppState {
             benchmark_suite_drivers,
             performance_operations,
             performance: init.performance,
+            startup_warnings: Arc::new(bound_startup_warnings(init.startup_warnings)),
             library_dir: Arc::new(RwLock::new(if library_dir.is_empty() {
                 None
             } else {
@@ -125,6 +131,10 @@ impl AppState {
         &self.performance
     }
 
+    pub fn startup_warnings(&self) -> Vec<String> {
+        self.startup_warnings.as_ref().clone()
+    }
+
     pub fn library_dir(&self) -> Option<String> {
         self.library_dir.read().ok().and_then(|value| value.clone())
     }
@@ -138,4 +148,12 @@ impl AppState {
     pub fn frontend_dir(&self) -> &Path {
         self.frontend_dir.as_path()
     }
+}
+
+fn bound_startup_warnings(warnings: Vec<String>) -> Vec<String> {
+    warnings
+        .into_iter()
+        .take(STARTUP_WARNING_LIMIT)
+        .map(|warning| warning.chars().take(STARTUP_WARNING_MAX_CHARS).collect())
+        .collect()
 }

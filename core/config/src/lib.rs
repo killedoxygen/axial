@@ -11,4 +11,4 @@ pub use models::{
     USERNAME_MAX_LEN, USERNAME_MIN_LEN, validate_launch_auth_mode, validate_username,
 };
 pub use paths::AppPaths;
-pub use store::{ConfigStore, ConfigStoreError};
+pub use store::{ConfigStartupLoad, ConfigStore, ConfigStoreError};

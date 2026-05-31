@@ -1,4 +1,4 @@
-use crate::models::{AppConfig, AppConfigValidationError};
+use crate::models::{AppConfig, AppConfigValidationError, LAUNCH_AUTH_MODE_OFFLINE};
 use crate::paths::AppPaths;
 use std::fs;
 use std::path::Path;
@@ -8,6 +8,11 @@ use thiserror::Error;
 pub struct ConfigStore {
     paths: AppPaths,
     config: RwLock<AppConfig>,
+}
+
+pub struct ConfigStartupLoad {
+    pub store: ConfigStore,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Error)]
@@ -56,6 +61,24 @@ impl ConfigStore {
         })
     }
 
+    pub fn load_for_startup(paths: AppPaths) -> Result<ConfigStartupLoad, ConfigStoreError> {
+        let (config, warnings) = match fs::read_to_string(&paths.config_file) {
+            Ok(data) => load_config_for_startup(&data)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                (AppConfig::default(), Vec::new())
+            }
+            Err(error) => return Err(ConfigStoreError::Read(error)),
+        };
+
+        Ok(ConfigStartupLoad {
+            store: Self {
+                paths,
+                config: RwLock::new(config),
+            },
+            warnings,
+        })
+    }
+
     pub fn current(&self) -> AppConfig {
         self.config
             .read()
@@ -95,10 +118,30 @@ impl ConfigStore {
     }
 }
 
+fn load_config_for_startup(data: &str) -> Result<(AppConfig, Vec<String>), ConfigStoreError> {
+    let parsed = serde_json::from_str::<AppConfig>(data)?;
+    match parsed.clone().normalized() {
+        Ok(config) => Ok((config, Vec::new())),
+        Err(AppConfigValidationError::InvalidLaunchAuthMode(_)) => {
+            let mut fallback = parsed;
+            fallback.launch_auth_mode = LAUNCH_AUTH_MODE_OFFLINE.to_string();
+            let config = fallback.normalized()?;
+            Ok((
+                config,
+                vec![
+                    "Invalid config launch_auth_mode at startup; using offline mode in memory."
+                        .to_string(),
+                ],
+            ))
+        }
+        Err(error) => Err(ConfigStoreError::Validation(error)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ConfigStore, ConfigStoreError};
-    use crate::{AppConfig, AppPaths};
+    use crate::{AppConfig, AppConfigValidationError, AppPaths, LAUNCH_AUTH_MODE_OFFLINE};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -142,6 +185,91 @@ mod tests {
             Err(err) => err,
         };
         assert!(matches!(err, ConfigStoreError::Validation(_)));
+
+        cleanup(&paths.config_dir);
+    }
+
+    #[test]
+    fn load_from_rejects_invalid_launch_auth_mode() {
+        let paths = test_paths("load-invalid-launch-auth-mode");
+        fs::create_dir_all(&paths.config_dir).expect("should create temp config dir");
+        let data = serde_json::to_string_pretty(&AppConfig {
+            launch_auth_mode: "online-ish".to_string(),
+            ..AppConfig::default()
+        })
+        .expect("should serialize config");
+        fs::write(&paths.config_file, data).expect("should write temp config");
+
+        let err = match ConfigStore::load_from(paths.clone()) {
+            Ok(_) => panic!("invalid config should fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            ConfigStoreError::Validation(AppConfigValidationError::InvalidLaunchAuthMode(_))
+        ));
+
+        cleanup(&paths.config_dir);
+    }
+
+    #[test]
+    fn load_for_startup_falls_back_only_for_invalid_launch_auth_mode_without_rewriting() {
+        let paths = test_paths("startup-invalid-launch-auth-mode");
+        fs::create_dir_all(&paths.config_dir).expect("should create temp config dir");
+        let library_dir = paths.library_dir.to_string_lossy().to_string();
+        let data = serde_json::to_string_pretty(&AppConfig {
+            launch_auth_mode: "online-ish".to_string(),
+            library_dir: library_dir.clone(),
+            max_memory_mb: 600,
+            min_memory_mb: 800,
+            ..AppConfig::default()
+        })
+        .expect("should serialize config");
+        fs::write(&paths.config_file, &data).expect("should write temp config");
+
+        let loaded = ConfigStore::load_for_startup(paths.clone())
+            .expect("startup load should tolerate invalid launch auth mode");
+        let config = loaded.store.current();
+
+        assert_eq!(config.launch_auth_mode, LAUNCH_AUTH_MODE_OFFLINE);
+        assert_eq!(config.library_dir, library_dir);
+        assert_eq!(config.max_memory_mb, 600);
+        assert_eq!(config.min_memory_mb, 600);
+        assert_eq!(
+            loaded.warnings,
+            vec![
+                "Invalid config launch_auth_mode at startup; using offline mode in memory."
+                    .to_string()
+            ]
+        );
+        assert_eq!(
+            fs::read_to_string(&paths.config_file).expect("config file should remain readable"),
+            data
+        );
+
+        cleanup(&paths.config_dir);
+    }
+
+    #[test]
+    fn load_for_startup_keeps_rejecting_invalid_username() {
+        let paths = test_paths("startup-invalid-username");
+        fs::create_dir_all(&paths.config_dir).expect("should create temp config dir");
+        let data = serde_json::to_string_pretty(&AppConfig {
+            username: "bad name".to_string(),
+            launch_auth_mode: "online-ish".to_string(),
+            ..AppConfig::default()
+        })
+        .expect("should serialize config");
+        fs::write(&paths.config_file, data).expect("should write temp config");
+
+        let err = match ConfigStore::load_for_startup(paths.clone()) {
+            Ok(_) => panic!("startup load should keep rejecting invalid username"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            ConfigStoreError::Validation(AppConfigValidationError::InvalidUsername(_))
+        ));
 
         cleanup(&paths.config_dir);
     }
