@@ -334,8 +334,8 @@ function launchOutcomeTone(
   healing: LaunchHealingSummary | undefined,
 ): import('./types').LaunchNoticeTone {
   const guardianTone = guardianNoticeTone(guardian);
-  if (guardianTone === 'error' || healing?.failure_class) return 'error';
   if (guardianTone) return guardianTone;
+  if (healing?.failure_class) return 'error';
   if (healing?.retry_count && healing.retry_count > 0) return 'success';
   return 'info';
 }
