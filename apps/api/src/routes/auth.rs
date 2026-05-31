@@ -4,9 +4,10 @@ use crate::{
         MinecraftProfile, MinecraftSkin,
     },
     state::{
-        ActiveMinecraftAccountState, AppState, AuthLoginMinecraftAccount, AuthLoginMinecraftCape,
-        AuthLoginMinecraftProfile, AuthLoginMinecraftSkin, AuthLoginSession, AuthLoginStore,
-        NewAuthLoginMinecraftAccount, NewAuthLoginMsaToken, NewAuthLoginSession,
+        ActiveMinecraftAccountState, ActiveMsaTokenState, AppState, AuthLoginMinecraftAccount,
+        AuthLoginMinecraftCape, AuthLoginMinecraftProfile, AuthLoginMinecraftSkin,
+        AuthLoginSession, AuthLoginStore, NewAuthLoginMinecraftAccount, NewAuthLoginMsaToken,
+        NewAuthLoginSession,
     },
 };
 use axum::{
@@ -712,6 +713,19 @@ pub(crate) async fn refresh_active_auth_for_config(
             AuthRefreshFailureKind::LoginUnavailable,
         ));
     };
+    let initial_generation = login_store.active_auth_generation();
+    let Some(_initial_refresh_token) = login_store.active_msa_refresh_token().await else {
+        return Err(AuthRefreshFailure::new(
+            AuthRefreshFailureKind::MissingRefreshToken,
+        ));
+    };
+
+    let _refresh_guard = login_store.active_auth_refresh_guard().await;
+    if login_store.active_auth_generation() != initial_generation {
+        if let Some(success) = active_auth_refresh_success_from_store(login_store).await {
+            return Ok(success);
+        }
+    }
     let Some(refresh_token) = login_store.active_msa_refresh_token().await else {
         return Err(AuthRefreshFailure::new(
             AuthRefreshFailureKind::MissingRefreshToken,
@@ -725,6 +739,43 @@ pub(crate) async fn refresh_active_auth_for_config(
         }
         Err(AuthLoginPollError::OAuth(error)) => auth_refresh_oauth_error(login_store, error).await,
         Err(AuthLoginPollError::Request(error)) => Err(AuthRefreshFailure::from(error)),
+    }
+}
+
+async fn active_auth_refresh_success_from_store(
+    login_store: &Arc<AuthLoginStore>,
+) -> Option<AuthRefreshSuccess> {
+    let msa_state = login_store.active_msa_token_state().await?;
+    let minecraft_state = login_store.active_minecraft_account_state().await?;
+    if !minecraft_account_can_launch_online(&minecraft_state.account) {
+        return None;
+    }
+
+    Some(auth_refresh_success_from_active_state(
+        msa_state,
+        minecraft_state,
+    ))
+}
+
+fn auth_refresh_success_from_active_state(
+    msa_state: ActiveMsaTokenState,
+    minecraft_state: ActiveMinecraftAccountState,
+) -> AuthRefreshSuccess {
+    let refresh_available = msa_state
+        .token
+        .refresh_token
+        .as_deref()
+        .is_some_and(|refresh_token: &str| !refresh_token.trim().is_empty());
+    AuthRefreshSuccess {
+        status: "refreshed",
+        token_type: msa_state.token.token_type,
+        expires_in: msa_state.token_expires_in,
+        has_refresh_token: refresh_available,
+        token_scope: msa_state.token.scope,
+        minecraft_profile_ready: true,
+        minecraft_profile: auth_minecraft_profile_response(&minecraft_state.account.profile),
+        minecraft_ownership_verified: minecraft_state.account.owns_minecraft_java,
+        minecraft_token_expires_in: minecraft_state.token_expires_in,
     }
 }
 
@@ -1895,6 +1946,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_auth_refresh_requests_reuse_single_rotated_refresh() {
+        let store = Arc::new(AuthLoginStore::new());
+        insert_active_refresh_login(&store, Some("old-msa-refresh-token")).await;
+        let (token_endpoint, mut token_requests) = delayed_token_test_server(
+            StatusCode::OK,
+            serde_json::json!({
+                "access_token": "msa-access-token",
+                "refresh_token": "new-msa-refresh-token",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "scope": "XboxLive.signin offline_access"
+            }),
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        let (auth_chain_client, mut auth_chain_requests) =
+            auth_chain_route_test_client(AuthChainRouteServerMode::Success).await;
+
+        let first = auth_refresh_for_config(
+            AuthLoginConfig::from_env_value(Some("public-client-id")),
+            &store,
+            &token_endpoint,
+            &auth_chain_client,
+        );
+        let second = auth_refresh_for_config(
+            AuthLoginConfig::from_env_value(Some("public-client-id")),
+            &store,
+            &token_endpoint,
+            &auth_chain_client,
+        );
+        let (first, second) = tokio::join!(first, second);
+
+        assert_eq!(first.0, StatusCode::OK);
+        assert_eq!(second.0, StatusCode::OK);
+        assert_eq!(first.1.0["status"], "refreshed");
+        assert_eq!(second.1.0["status"], "refreshed");
+        assert_no_sensitive_public_fields(&first.1.0);
+        assert_no_sensitive_public_fields(&second.1.0);
+
+        let form = token_requests.recv().await.expect("token request");
+        assert_eq!(form["grant_type"], MSA_REFRESH_TOKEN_GRANT_TYPE);
+        assert_eq!(form["refresh_token"], "old-msa-refresh-token");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), token_requests.recv())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .active_msa_token()
+                .await
+                .expect("active msa token")
+                .refresh_token,
+            Some("new-msa-refresh-token".to_string())
+        );
+
+        let mut paths = Vec::new();
+        for _ in 0..5 {
+            paths.push(
+                auth_chain_requests
+                    .recv()
+                    .await
+                    .expect("auth-chain request")
+                    .path,
+            );
+        }
+        assert_eq!(
+            paths,
+            vec![
+                "/xbl",
+                "/xsts",
+                "/minecraft/login",
+                "/minecraft/profile",
+                "/minecraft/ownership",
+            ]
+        );
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                auth_chain_requests.recv()
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn auth_refresh_missing_refresh_token_returns_bounded_precondition() {
         let store = Arc::new(AuthLoginStore::new());
         insert_active_refresh_login(&store, None).await;
@@ -2458,6 +2596,14 @@ mod tests {
         status: StatusCode,
         body: serde_json::Value,
     ) -> (String, mpsc::UnboundedReceiver<HashMap<String, String>>) {
+        delayed_token_test_server(status, body, std::time::Duration::ZERO).await
+    }
+
+    async fn delayed_token_test_server(
+        status: StatusCode,
+        body: serde_json::Value,
+        delay: std::time::Duration,
+    ) -> (String, mpsc::UnboundedReceiver<HashMap<String, String>>) {
         let (tx, rx) = mpsc::unbounded_channel();
         let app = axum::Router::new().route(
             "/",
@@ -2466,6 +2612,7 @@ mod tests {
                 let body = body.clone();
                 async move {
                     let _ = tx.send(form);
+                    tokio::time::sleep(delay).await;
                     (status, Json(body))
                 }
             }),

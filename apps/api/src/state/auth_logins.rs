@@ -4,7 +4,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, MutexGuard, RwLock};
 
 #[cfg(not(test))]
 use super::auth_persistence::SecureAuthSnapshotPersistence;
@@ -208,10 +208,18 @@ pub struct ActiveMinecraftAccountState {
     pub token_expires_in: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActiveMsaTokenState {
+    pub token: AuthLoginMsaToken,
+    pub token_expires_in: u64,
+}
+
 pub struct AuthLoginStore {
     sessions: RwLock<HashMap<String, AuthLoginSession>>,
     active_msa_token: RwLock<Option<AuthLoginMsaToken>>,
     active_minecraft_account: RwLock<Option<AuthLoginMinecraftAccount>>,
+    active_auth_refresh: Mutex<()>,
+    active_auth_generation: AtomicU64,
     persistence: Option<Arc<dyn AuthSnapshotPersistence>>,
     next_id: AtomicU64,
 }
@@ -222,6 +230,8 @@ impl AuthLoginStore {
             sessions: RwLock::new(HashMap::new()),
             active_msa_token: RwLock::new(None),
             active_minecraft_account: RwLock::new(None),
+            active_auth_refresh: Mutex::new(()),
+            active_auth_generation: AtomicU64::new(0),
             persistence: None,
             next_id: AtomicU64::new(1),
         }
@@ -247,6 +257,8 @@ impl AuthLoginStore {
             sessions: RwLock::new(HashMap::new()),
             active_msa_token: RwLock::new(active_msa_token),
             active_minecraft_account: RwLock::new(active_minecraft_account),
+            active_auth_refresh: Mutex::new(()),
+            active_auth_generation: AtomicU64::new(0),
             persistence: Some(persistence),
             next_id: AtomicU64::new(1),
         }
@@ -310,6 +322,7 @@ impl AuthLoginStore {
 
         *self.active_msa_token.write().await = Some(token.clone());
         *self.active_minecraft_account.write().await = None;
+        self.bump_active_auth_generation();
         self.save_active_snapshot(&token, None);
         Some(token)
     }
@@ -352,6 +365,7 @@ impl AuthLoginStore {
 
         *self.active_msa_token.write().await = Some(token.clone());
         *self.active_minecraft_account.write().await = Some(account.clone());
+        self.bump_active_auth_generation();
         self.save_active_snapshot(&token, Some(&account));
         Some((token, account))
     }
@@ -400,6 +414,7 @@ impl AuthLoginStore {
 
         *self.active_msa_token.write().await = Some(token.clone());
         *self.active_minecraft_account.write().await = Some(account.clone());
+        self.bump_active_auth_generation();
         self.save_active_snapshot(&token, Some(&account));
         Some((token, account))
     }
@@ -457,6 +472,34 @@ impl AuthLoginStore {
             .map(ToOwned::to_owned)
     }
 
+    pub async fn active_msa_token_state(&self) -> Option<ActiveMsaTokenState> {
+        let mut token = self.active_msa_token.write().await;
+        let (expires_at, expires_in, has_refresh_token) = {
+            let active = token.as_ref()?;
+            (
+                active.expires_at,
+                active.expires_in,
+                active
+                    .refresh_token
+                    .as_deref()
+                    .is_some_and(|refresh_token| !refresh_token.trim().is_empty()),
+            )
+        };
+        let remaining = (expires_at - Utc::now()).num_milliseconds();
+        if remaining <= 0 {
+            if !has_refresh_token {
+                *token = None;
+                self.bump_active_auth_generation();
+            }
+            return None;
+        }
+
+        Some(ActiveMsaTokenState {
+            token: token.as_ref()?.clone(),
+            token_expires_in: (((remaining as u64) + 999) / 1000).min(expires_in),
+        })
+    }
+
     pub async fn active_minecraft_account_state(&self) -> Option<ActiveMinecraftAccountState> {
         let mut account = self.active_minecraft_account.write().await;
         let (expires_at, expires_in) = {
@@ -466,6 +509,7 @@ impl AuthLoginStore {
         let remaining = (expires_at - Utc::now()).num_milliseconds();
         if remaining <= 0 {
             *account = None;
+            self.bump_active_auth_generation();
             return None;
         }
 
@@ -484,6 +528,7 @@ impl AuthLoginStore {
         };
         let had_msa_auth = self.active_msa_token.write().await.take().is_some();
         *self.active_minecraft_account.write().await = None;
+        self.bump_active_auth_generation();
         self.delete_active_snapshot();
 
         (cleared_pending_logins, had_msa_auth)
@@ -492,8 +537,19 @@ impl AuthLoginStore {
     pub async fn clear_active_auth(&self) -> bool {
         let had_msa_auth = self.active_msa_token.write().await.take().is_some();
         let had_minecraft_account = self.active_minecraft_account.write().await.take().is_some();
+        if had_msa_auth || had_minecraft_account {
+            self.bump_active_auth_generation();
+        }
         self.delete_active_snapshot();
         had_msa_auth || had_minecraft_account
+    }
+
+    pub(crate) async fn active_auth_refresh_guard(&self) -> MutexGuard<'_, ()> {
+        self.active_auth_refresh.lock().await
+    }
+
+    pub(crate) fn active_auth_generation(&self) -> u64 {
+        self.active_auth_generation.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
@@ -534,6 +590,10 @@ impl AuthLoginStore {
             .map(|value| value.as_nanos())
             .unwrap_or_default();
         format!("msa-{nanos:x}-{sequence:x}")
+    }
+
+    fn bump_active_auth_generation(&self) {
+        self.active_auth_generation.fetch_add(1, Ordering::AcqRel);
     }
 
     fn save_active_snapshot(

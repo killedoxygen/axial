@@ -15,9 +15,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 pub use auth_logins::{
-    ActiveMinecraftAccountState, AuthLoginMinecraftAccount, AuthLoginMinecraftCape,
-    AuthLoginMinecraftProfile, AuthLoginMinecraftSkin, AuthLoginSession, AuthLoginStore,
-    NewAuthLoginMinecraftAccount, NewAuthLoginMsaToken, NewAuthLoginSession,
+    ActiveMinecraftAccountState, ActiveMsaTokenState, AuthLoginMinecraftAccount,
+    AuthLoginMinecraftCape, AuthLoginMinecraftProfile, AuthLoginMinecraftSkin, AuthLoginSession,
+    AuthLoginStore, NewAuthLoginMinecraftAccount, NewAuthLoginMsaToken, NewAuthLoginSession,
 };
 pub use installs::InstallStore;
 pub use sessions::{SessionStore, StartupOutcome};
