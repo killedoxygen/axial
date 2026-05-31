@@ -77,9 +77,17 @@ async function init(): Promise<void> {
     bootstrapError.value = null;
     bootstrapState.value = 'ready';
 
-    const startupWarning = statusRes?.warnings?.[0];
-    if (typeof startupWarning === 'string' && startupWarning.trim()) {
-      toast(startupWarning, 'info');
+    const startupWarnings = Array.isArray(statusRes?.warnings) ? statusRes.warnings : [];
+    const shownStartupWarnings = new Set<string>();
+    for (const startupWarning of startupWarnings) {
+      if (
+        typeof startupWarning === 'string'
+        && startupWarning.trim()
+        && !shownStartupWarnings.has(startupWarning)
+      ) {
+        shownStartupWarnings.add(startupWarning);
+        toast(startupWarning, 'info');
+      }
     }
 
     if (!setupRequired && configRes && configRes.onboarding_done === false) {
