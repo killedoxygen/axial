@@ -790,6 +790,29 @@ function resourceBudgetSummary(record: LaunchProofRecord): {
   };
 }
 
+function stableJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stableJsonValue);
+  if (!value || typeof value !== 'object') return value;
+
+  const source = value as Record<string, unknown>;
+  return Object.keys(source).sort().reduce<Record<string, unknown>>((acc, key) => {
+    acc[key] = stableJsonValue(source[key]);
+    return acc;
+  }, {});
+}
+
+function stablePrettyJson(value: unknown): string {
+  return `${JSON.stringify(stableJsonValue(value), null, 2)}\n`;
+}
+
+function proofCopyFailureMessage(err: unknown): string {
+  const message = errMessage(err).trim().toLowerCase();
+  if (message.includes('clipboard')) return 'Clipboard is unavailable.';
+  if (message.includes('not found') || message.includes('404')) return 'Launch proof was not found.';
+  if (message.includes('network') || message.includes('fetch')) return 'Launch proof service is unreachable.';
+  return 'Launch proof could not be copied.';
+}
+
 function PerformanceRulesStatusBlock({ state }: { state: RulesStatusState }): JSX.Element {
   if (state.status === 'loading') {
     return (
@@ -860,6 +883,26 @@ function PerformanceRulesStatusBlock({ state }: { state: RulesStatusState }): JS
 
 function LaunchProofHistoryBlock({ state }: { state: LaunchReportsState }): JSX.Element {
   const records = state.data.slice(0, 6);
+  const [copyingSessionId, setCopyingSessionId] = useState<string | null>(null);
+
+  const copyProof = async (sessionId: string): Promise<void> => {
+    if (!navigator.clipboard?.writeText) {
+      toast(`Copy failed: ${proofCopyFailureMessage(new Error('clipboard API unavailable'))}`, 'error');
+      return;
+    }
+
+    setCopyingSessionId(sessionId);
+    try {
+      const proof = await api('GET', `/launch/reports/${encodeURIComponent(sessionId)}`);
+      if (proof?.error) throw new Error(proof.error);
+      await navigator.clipboard.writeText(stablePrettyJson(proof));
+      toast('Launch proof copied');
+    } catch (err) {
+      toast(`Copy failed: ${proofCopyFailureMessage(err)}`, 'error');
+    } finally {
+      setCopyingSessionId((current) => current === sessionId ? null : current);
+    }
+  };
 
   return (
     <div class="cp-settings-proof-history" aria-live="polite">
@@ -940,6 +983,18 @@ function LaunchProofHistoryBlock({ state }: { state: LaunchReportsState }): JSX.
                 <div class="cp-settings-proof-compare" data-tone={comparison.tone}>
                   <strong>{comparison.label}</strong>
                   <span>{comparison.detail}</span>
+                </div>
+                <div class="cp-settings-proof-action">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    icon="copy"
+                    disabled={copyingSessionId === record.session_id}
+                    title="Copy full local launch proof JSON"
+                    onClick={() => void copyProof(record.session_id)}
+                  >
+                    {copyingSessionId === record.session_id ? 'Copying' : 'Copy proof'}
+                  </Button>
                 </div>
               </div>
             );
