@@ -78,12 +78,25 @@ pub fn router() -> Router<AppState> {
             "/api/v1/launch/benchmark/matrix",
             get(handle_benchmark_matrix),
         )
+        .route(
+            "/api/v1/launch/preflight/{instance_id}",
+            get(handle_launch_preflight),
+        )
         .route("/api/v1/launch/reports", get(handle_launch_reports))
         .route("/api/v1/launch/reports/{id}", get(handle_launch_report))
         .route("/api/v1/launch/{id}/events", get(handle_launch_events))
         .route("/api/v1/launch/{id}/status", get(handle_launch_status))
         .route("/api/v1/launch/{id}/command", get(handle_launch_command))
         .route("/api/v1/launch/{id}/kill", post(handle_launch_kill))
+}
+
+async fn handle_launch_preflight(
+    State(state): State<AppState>,
+    Path(instance_id): Path<String>,
+) -> Result<Json<task::LaunchPreflightResponse>, (StatusCode, Json<serde_json::Value>)> {
+    task::prepare_launch_preflight(&state, instance_id)
+        .await
+        .map(Json)
 }
 
 async fn handle_launch(
@@ -2452,6 +2465,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn launch_preflight_route_returns_ready_without_creating_session() {
+        let fixture = RouteTestFixture::new("launch-preflight-ready-route");
+        fixture.configure_library();
+        let instance_id = fixture.add_instance("Survival", "1.21.1");
+        fixture.update_instance(&instance_id, |instance| {
+            instance.java_path = "/Users/SecretUser/.jdks/manual/bin/java".to_string();
+            instance.extra_jvm_args = "-Dtoken=secret-token -XX:+UseZGC".to_string();
+        });
+
+        let response = router()
+            .with_state(fixture.state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/api/v1/launch/preflight/{instance_id}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("route response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("preflight json");
+        let data = String::from_utf8(body.to_vec()).expect("utf8 payload");
+
+        assert_eq!(payload["status"], serde_json::json!("ready"));
+        assert_eq!(
+            payload["overrides"]["java"]["present"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            payload["overrides"]["java"]["origin"],
+            serde_json::json!("instance")
+        );
+        assert_eq!(
+            payload["overrides"]["raw_jvm_args"]["present"],
+            serde_json::json!(true)
+        );
+        assert_eq!(fixture.state.sessions().active_session_count().await, 0);
+        assert!(
+            !fixture
+                .state
+                .sessions()
+                .has_active_instance(&instance_id)
+                .await
+        );
+        assert!(!data.contains("/Users/SecretUser"));
+        assert!(!data.contains("manual/bin/java"));
+        assert!(!data.contains("-Dtoken"));
+        assert!(!data.contains("secret-token"));
+
+        cleanup(&fixture.root);
+    }
+
+    #[tokio::test]
+    async fn launch_preflight_route_missing_instance_returns_json_404() {
+        let fixture = RouteTestFixture::new("launch-preflight-missing-route");
+        fixture.configure_library();
+
+        let response = router()
+            .with_state(fixture.state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/launch/preflight/missing-instance")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("route response");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("error json");
+        assert_eq!(
+            payload,
+            serde_json::json!({ "error": "instance not found" })
+        );
+
+        cleanup(&fixture.root);
+    }
+
+    #[tokio::test]
     async fn family_c_qualification_route_returns_ready_for_complete_suite() {
         let fixture = RouteTestFixture::new("family-c-qualification-ready-route");
         let suite_id = "family-c-qualification-ready-route";
@@ -3607,6 +3708,41 @@ mod tests {
             });
 
             Self { state, paths, root }
+        }
+
+        fn configure_library(&self) {
+            std::fs::create_dir_all(&self.paths.library_dir).expect("create library dir");
+            let mut config = self.state.config().current();
+            config.library_dir = self.paths.library_dir.to_string_lossy().to_string();
+            self.state
+                .config()
+                .replace_in_memory(config)
+                .expect("set library dir");
+            self.state
+                .set_library_dir(self.paths.library_dir.to_string_lossy().to_string());
+        }
+
+        fn add_instance(&self, name: &str, version_id: &str) -> String {
+            self.state
+                .instances()
+                .add(
+                    name.to_string(),
+                    version_id.to_string(),
+                    String::new(),
+                    String::new(),
+                    None,
+                )
+                .expect("add instance")
+                .id
+        }
+
+        fn update_instance(&self, id: &str, update: impl FnOnce(&mut croopor_config::Instance)) {
+            let mut instance = self.state.instances().get(id).expect("instance");
+            update(&mut instance);
+            self.state
+                .instances()
+                .update(instance)
+                .expect("update instance");
         }
 
         async fn active_driver(

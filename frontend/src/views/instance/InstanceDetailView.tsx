@@ -18,10 +18,10 @@ import { errMessage, fmtMem, getMemoryRecommendation } from '../../utils';
 import type {
   CompositionTier,
   EnrichedInstance,
-  GuardianMode,
   InstancePerformanceMode,
   InstanceLogTail,
   InstanceResourceSummary,
+  LaunchPreflightResponse,
   LaunchNotice,
   LaunchNoticeTone,
   PerformanceHealthResponse,
@@ -36,7 +36,6 @@ import {
   JVM_PRESET_LABELS,
   JVM_PRESET_ORDER,
   jvmPresetFrom,
-  jvmPresetLabelFor,
   type JvmPreset,
 } from '../create/jvm-presets';
 import './instance.css';
@@ -232,18 +231,8 @@ function performanceModeLabel(mode: PerformanceMode): string {
   return 'Custom';
 }
 
-function guardianModeFrom(value: string | undefined): GuardianMode {
-  return value === 'custom' ? 'custom' : 'managed';
-}
-
-function guardianModeLabel(mode: GuardianMode): string {
+function guardianModeLabel(mode: LaunchPreflightResponse['mode']): string {
   return mode === 'custom' ? 'Custom' : 'Managed';
-}
-
-function compactPath(path: string): string {
-  const trimmed = path.trim();
-  if (!trimmed) return '';
-  return trimmed.split(/[\\/]/).filter(Boolean).pop() || trimmed;
 }
 
 function compositionTierLabel(tier: CompositionTier | ''): string {
@@ -1085,28 +1074,107 @@ function PerformanceCard({ inst, onOpenSettings }: { inst: EnrichedInstance; onO
   );
 }
 
-// ─── Guardian preflight — right rail, frontend summary of launch inputs.
+// ─── Guardian preflight — right rail, backend-authored launch safety facts.
+
+type GuardianPreflightState =
+  | { status: 'loading' }
+  | { status: 'ready'; data: LaunchPreflightResponse }
+  | { status: 'error'; message: string };
+
+function guardianDecisionTone(decision: LaunchPreflightResponse['guardian']['decision'] | undefined): 'ok' | 'warn' | 'err' | 'mute' {
+  if (decision === 'blocked') return 'err';
+  if (decision === 'warned' || decision === 'intervened') return 'warn';
+  if (decision === 'allowed') return 'ok';
+  return 'mute';
+}
+
+function guardianDecisionIcon(decision: LaunchPreflightResponse['guardian']['decision'] | undefined): string {
+  if (decision === 'blocked') return 'alert';
+  if (decision === 'warned' || decision === 'intervened') return 'alert';
+  if (decision === 'allowed') return 'shield-check';
+  return 'info';
+}
+
+function guardianReadyCopy(preflight: LaunchPreflightResponse): { title: string; detail: string } {
+  const guardian = preflight.guardian;
+  const firstDetail = guardian.guidance?.[0] || guardian.details?.[0];
+  if (guardian.message) {
+    return { title: guardian.message, detail: firstDetail || `${guardianModeLabel(preflight.mode)} preflight is ready.` };
+  }
+  if (preflight.mode === 'custom') {
+    return {
+      title: 'Custom mode ready',
+      detail: 'Backend preflight will preserve explicit overrides unless Guardian must block startup.',
+    };
+  }
+  return {
+    title: 'Managed mode ready',
+    detail: 'Backend preflight will let Guardian adjust unsafe Java or JVM choices at launch.',
+  };
+}
+
+function overrideLabel(override: LaunchPreflightResponse['overrides']['java'], emptyLabel: string): string {
+  if (override.origin === 'instance') return 'Instance override';
+  if (override.origin === 'global') return 'Global override';
+  return emptyLabel;
+}
+
+function overrideSubLabel(override: LaunchPreflightResponse['overrides']['java'], presentLabel: string, emptyLabel: string): string {
+  return override.present ? presentLabel : emptyLabel;
+}
 
 function GuardianPreflightCard({ inst, onOpenSettings }: {
   inst: EnrichedInstance;
   onOpenSettings: () => void;
 }): JSX.Element {
   const cfg = config.value;
-  const mode = guardianModeFrom(cfg?.guardian_mode);
-  const instanceJava = (inst.java_path || '').trim();
-  const globalJava = (cfg?.java_path_override || '').trim();
-  const instancePreset = (inst.jvm_preset || '').trim();
-  const globalPreset = (cfg?.jvm_preset || '').trim();
-  const rawJvmArgs = (inst.extra_jvm_args || '').trim();
-  const hasManualOverride = Boolean(instanceJava || globalJava || instancePreset || globalPreset || rawJvmArgs);
-  const modeCopy = mode === 'custom'
-    ? 'Explicit overrides are preserved, but guaranteed-fatal setups may be blocked with guidance.'
-    : 'Guardian may adjust unsafe Java/JVM choices before startup.';
-  const javaTitle = instanceJava ? 'Instance override' : globalJava ? 'Global override' : 'Managed Java';
-  const javaSub = instanceJava ? compactPath(instanceJava) : globalJava ? compactPath(globalJava) : 'Croopor selects runtime';
-  const presetValue = instancePreset || globalPreset;
-  const presetTitle = instancePreset ? 'Instance preset' : globalPreset ? 'Global preset' : 'Auto preset';
-  const presetSub = presetValue ? jvmPresetLabelFor(presetValue) : 'Selected at launch';
+  const [preflight, setPreflight] = useState<GuardianPreflightState>({ status: 'loading' });
+
+  useEffect(() => {
+    let cancelled = false;
+    setPreflight({ status: 'loading' });
+    api('GET', `/launch/preflight/${encodeURIComponent(inst.id)}`)
+      .then((res: LaunchPreflightResponse & { error?: string }) => {
+        if (cancelled) return;
+        if (res?.error) throw new Error(res.error);
+        if (res?.status !== 'ready') throw new Error('preflight unavailable');
+        setPreflight({ status: 'ready', data: res });
+      })
+      .catch((err) => {
+        if (!cancelled) setPreflight({ status: 'error', message: errMessage(err) });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    inst.id,
+    inst.version_id,
+    inst.max_memory_mb,
+    inst.min_memory_mb,
+    inst.java_path,
+    inst.jvm_preset,
+    inst.extra_jvm_args,
+    cfg?.guardian_mode,
+    cfg?.java_path_override,
+    cfg?.jvm_preset,
+    cfg?.max_memory_mb,
+    cfg?.min_memory_mb,
+  ]);
+
+  const ready = preflight.status === 'ready' ? preflight.data : undefined;
+  const copy = ready
+    ? guardianReadyCopy(ready)
+    : preflight.status === 'error'
+      ? { title: 'Preflight unavailable', detail: preflight.message }
+      : {
+          title: 'Checking Guardian preflight',
+          detail: 'Reading backend launch policy for this instance.',
+        };
+  const tone = ready ? guardianDecisionTone(ready.guardian.decision) : preflight.status === 'loading' ? 'mute' : 'warn';
+  const icon = ready ? guardianDecisionIcon(ready.guardian.decision) : preflight.status === 'loading' ? 'info' : 'alert';
+  const java = ready?.overrides.java;
+  const preset = ready?.overrides.preset;
+  const rawJvmArgs = ready?.overrides.raw_jvm_args;
 
   return (
     <Card padding={18} class="cp-od-guardian-card">
@@ -1116,35 +1184,35 @@ function GuardianPreflightCard({ inst, onOpenSettings }: {
           Review <Icon name="chevron-right" size={11} stroke={2.2} />
         </button>
       </div>
-      <div class="cp-od-guardian-posture" data-tone={hasManualOverride ? 'warn' : 'ok'}>
+      <div class="cp-od-guardian-posture" data-tone={tone}>
         <span class="cp-od-guardian-posture-mark">
-          <Icon name={hasManualOverride ? 'alert' : 'shield-check'} size={13} stroke={2.2} />
+          <Icon name={icon} size={13} stroke={2.2} />
         </span>
         <div>
-          <strong>{guardianModeLabel(mode)} mode</strong>
-          <span>{modeCopy}</span>
+          <strong>{copy.title}</strong>
+          <span>{copy.detail}</span>
         </div>
       </div>
       <ul class="cp-od-guardian-list">
         <li class="cp-od-guardian-row">
           <span class="cp-od-guardian-key">Java</span>
-          <span class="cp-od-guardian-val" title={instanceJava || globalJava || undefined}>
-            <strong>{javaTitle}</strong>
-            <small>{javaSub}</small>
+          <span class="cp-od-guardian-val">
+            <strong>{java ? overrideLabel(java, 'Managed') : 'Checking'}</strong>
+            <small>{java ? overrideSubLabel(java, 'Override present', 'Croopor selects runtime') : 'Backend preflight'}</small>
           </span>
         </li>
         <li class="cp-od-guardian-row">
           <span class="cp-od-guardian-key">JVM preset</span>
           <span class="cp-od-guardian-val">
-            <strong>{presetTitle}</strong>
-            <small>{presetSub}</small>
+            <strong>{preset ? overrideLabel(preset, 'Managed') : 'Checking'}</strong>
+            <small>{preset ? overrideSubLabel(preset, 'Override present', 'Selected by Croopor') : 'Backend preflight'}</small>
           </span>
         </li>
         <li class="cp-od-guardian-row">
           <span class="cp-od-guardian-key">Raw JVM args</span>
-          <span class="cp-od-guardian-val" title={rawJvmArgs || undefined}>
-            <strong>{rawJvmArgs ? 'Instance override' : 'None'}</strong>
-            <small>{rawJvmArgs || 'No raw JVM arguments'}</small>
+          <span class="cp-od-guardian-val">
+            <strong>{rawJvmArgs ? overrideLabel(rawJvmArgs, 'None') : 'Checking'}</strong>
+            <small>{rawJvmArgs ? overrideSubLabel(rawJvmArgs, 'Present', 'No raw JVM arguments') : 'Backend preflight'}</small>
           </span>
         </li>
       </ul>

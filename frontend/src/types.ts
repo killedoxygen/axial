@@ -276,6 +276,46 @@ export interface GuardianSummary {
   interventions?: GuardianIntervention[];
 }
 
+export type LaunchOverrideOrigin = 'global' | 'instance';
+
+export interface LaunchPreflightOverride {
+  present: boolean;
+  origin?: LaunchOverrideOrigin;
+}
+
+export interface LaunchPreflightMemory {
+  max_memory_mb: number;
+  min_memory_mb: number;
+  min_clamped: boolean;
+}
+
+export interface LaunchPreflightOverrides {
+  java: LaunchPreflightOverride;
+  preset: LaunchPreflightOverride;
+  raw_jvm_args: LaunchPreflightOverride;
+}
+
+export interface LaunchPreflightResourceBudget {
+  active_session_count: number;
+  active_install_count: number;
+  active_memory_allocation_mb: number;
+  requested_memory_mb?: number;
+  estimated_remaining_memory_mb?: number;
+  memory_pressure: boolean;
+  cpu_pressure: boolean;
+  install_pressure: boolean;
+  disk_pressure: boolean;
+}
+
+export interface LaunchPreflightResponse {
+  status: 'ready';
+  guardian: GuardianSummary;
+  mode: GuardianMode;
+  memory: LaunchPreflightMemory;
+  overrides: LaunchPreflightOverrides;
+  resource_budget: LaunchPreflightResourceBudget;
+}
+
 export type HealingEventKind =
   | 'runtime_bypassed'
   | 'preset_downgraded'

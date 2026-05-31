@@ -10,7 +10,7 @@ use croopor_config::{AppConfig, Instance, validate_username};
 use croopor_launcher::{
     GuardianMode, GuardianSummary, LaunchGuardianContext, LaunchIntent, LaunchState,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use sysinfo::{Disks, ProcessRefreshKind, ProcessesToUpdate, System, get_current_pid};
@@ -41,6 +41,63 @@ pub(super) struct LaunchSessionTask {
 
 pub(super) struct PreparedLaunch {
     pub task: LaunchSessionTask,
+}
+
+#[derive(Clone, Debug)]
+struct LaunchPreflightFacts {
+    config: AppConfig,
+    max_memory_mb: i32,
+    raw_min_memory_mb: i32,
+    min_memory_mb: i32,
+    requested_java: String,
+    requested_preset: String,
+    guardian: LaunchGuardianContext,
+    guardian_summary: GuardianSummary,
+    resource_budget: LaunchProofResourceBudget,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct LaunchPreflightResponse {
+    pub status: &'static str,
+    pub guardian: GuardianSummary,
+    pub mode: GuardianMode,
+    pub memory: LaunchPreflightMemory,
+    pub overrides: LaunchPreflightOverrides,
+    pub resource_budget: LaunchPreflightResourceBudget,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct LaunchPreflightMemory {
+    pub max_memory_mb: i32,
+    pub min_memory_mb: i32,
+    pub min_clamped: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct LaunchPreflightOverrides {
+    pub java: LaunchPreflightOverride,
+    pub preset: LaunchPreflightOverride,
+    pub raw_jvm_args: LaunchPreflightOverride,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct LaunchPreflightOverride {
+    pub present: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<croopor_launcher::OverrideOrigin>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct LaunchPreflightResourceBudget {
+    pub active_session_count: usize,
+    pub active_install_count: usize,
+    pub active_memory_allocation_mb: u64,
+    pub requested_memory_mb: Option<i32>,
+    pub estimated_remaining_memory_mb: Option<i64>,
+    pub memory_pressure: bool,
+    pub cpu_pressure: bool,
+    pub install_pressure: bool,
+    pub disk_pressure: bool,
 }
 
 pub(super) async fn prepare_launch_session(
@@ -87,67 +144,18 @@ pub(super) async fn prepare_launch_session(
         .to_string();
     let username = validate_username(&requested_username)
         .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?;
-    let memory_evidence = capture_launch_memory_evidence();
-    let memory_defaults = policy::derived_launch_memory_defaults(
+    let preflight = build_launch_preflight_facts(
+        state,
         &instance,
         &config,
+        &library_dir,
+        &game_dir,
         payload.max_memory_mb,
         payload.min_memory_mb,
-        memory_evidence.host_total_memory_mb,
-    );
-    let max_memory_mb =
-        policy::effective_max_memory(&instance, &config, payload.max_memory_mb, memory_defaults);
-    let raw_min_memory_mb =
-        policy::selected_raw_min_memory(&instance, &config, payload.min_memory_mb, memory_defaults);
-    let min_memory_mb = policy::effective_min_memory(
-        &instance,
-        &config,
-        payload.min_memory_mb,
-        max_memory_mb,
-        memory_defaults,
-    );
-    let requested_java = policy::selected_java_override(&instance, &config);
-    let requested_preset = policy::selected_jvm_preset(&instance, &config);
+    )
+    .await;
     let launched_at = timestamp_utc();
     let session_id = policy::generate_session_id();
-    let guardian = LaunchGuardianContext {
-        mode: policy::selected_guardian_mode(&config),
-        java_override_origin: policy::java_override_origin(&instance, &config),
-        preset_override_origin: policy::preset_override_origin(&instance, &config),
-        raw_jvm_args_origin: policy::raw_jvm_args_origin(&instance),
-    };
-    let resource_budget = capture_resource_budget_snapshot(
-        memory_evidence,
-        capture_launch_disk_evidence([library_dir.as_path(), game_dir.as_path()]),
-        capture_launch_cpu_load_evidence(),
-        host_cpu_threads(),
-        state.sessions().active_session_count().await,
-        state.installs().active_install_count().await,
-        state.sessions().active_memory_allocation_mb().await,
-        max_memory_mb,
-    );
-    let mut guardian_summary = GuardianSummary::new(guardian.mode);
-    if let Some(guidance) = memory_clamp_warning_guidance(raw_min_memory_mb, max_memory_mb) {
-        guardian_summary.warn_with_guidance(guidance);
-    }
-    if let Some(guidance) = low_memory_allocation_warning_guidance(max_memory_mb) {
-        guardian_summary.warn_with_guidance(guidance);
-    }
-    if let Some(guidance) = memory_budget_warning_guidance(&resource_budget) {
-        guardian_summary.warn_with_guidance(guidance);
-    }
-    if let Some(guidance) = cpu_pressure_warning_guidance(&resource_budget) {
-        guardian_summary.warn_with_guidance(guidance);
-    }
-    if let Some(guidance) = install_pressure_warning_guidance(&resource_budget) {
-        guardian_summary.warn_with_guidance(guidance);
-    }
-    if let Some(guidance) = disk_pressure_warning_guidance(&resource_budget) {
-        guardian_summary.warn_with_guidance(guidance);
-    }
-    if let Some(guidance) = custom_risky_override_warning_guidance(&guardian) {
-        guardian_summary.warn_with_guidance(guidance);
-    }
 
     let intent = LaunchIntent {
         session_id: session_id.0.clone(),
@@ -155,16 +163,16 @@ pub(super) async fn prepare_launch_session(
         instance_id: instance.id.clone(),
         version_id: instance.version_id.clone(),
         username: username.clone(),
-        requested_java: requested_java.clone(),
-        requested_preset: requested_preset.clone(),
+        requested_java: preflight.requested_java.clone(),
+        requested_preset: preflight.requested_preset.clone(),
         extra_jvm_args: policy::split_jvm_args(&instance.extra_jvm_args),
-        max_memory_mb,
-        min_memory_mb,
+        max_memory_mb: preflight.max_memory_mb,
+        min_memory_mb: preflight.min_memory_mb,
         resolution: policy::selected_resolution(&instance, &config),
         launcher_name: "croopor".to_string(),
         launcher_version: state.version().to_string(),
         game_dir: Some(game_dir),
-        guardian: guardian.clone(),
+        guardian: preflight.guardian.clone(),
         performance_mode: policy::selected_performance_mode(&instance, &config),
     };
 
@@ -188,7 +196,7 @@ pub(super) async fn prepare_launch_session(
             natives_dir: None,
             failure: None,
             healing: None,
-            guardian: serde_json::to_value(&guardian_summary).ok(),
+            guardian: serde_json::to_value(&preflight.guardian_summary).ok(),
             stages: Vec::new(),
         })
         .await;
@@ -203,14 +211,193 @@ pub(super) async fn prepare_launch_session(
     Ok(PreparedLaunch {
         task: LaunchSessionTask {
             instance: instance.clone(),
-            config: config.clone(),
+            config: preflight.config.clone(),
             intent,
-            guardian: guardian_summary,
+            guardian: preflight.guardian_summary,
             launched_at,
             benchmark: None,
-            resource_budget: Some(resource_budget),
+            resource_budget: Some(preflight.resource_budget),
         },
     })
+}
+
+pub(super) async fn prepare_launch_preflight(
+    state: &AppState,
+    instance_id: String,
+) -> Result<LaunchPreflightResponse, (StatusCode, Json<serde_json::Value>)> {
+    let library_dir = state.library_dir().ok_or_else(|| {
+        (
+            StatusCode::PRECONDITION_FAILED,
+            Json(json!({ "error": "Croopor library is not configured" })),
+        )
+    })?;
+    let library_dir = PathBuf::from(library_dir);
+
+    let instance = state.instances().get(&instance_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "instance not found" })),
+        )
+    })?;
+    let game_dir = state.instances().game_dir(&instance.id);
+    let config = state.config().current();
+    let facts = build_launch_preflight_facts(
+        state,
+        &instance,
+        &config,
+        &library_dir,
+        &game_dir,
+        None,
+        None,
+    )
+    .await;
+
+    Ok(facts.into_response())
+}
+
+async fn build_launch_preflight_facts(
+    state: &AppState,
+    instance: &Instance,
+    config: &AppConfig,
+    library_dir: &Path,
+    game_dir: &Path,
+    requested_max_memory_mb: Option<i32>,
+    requested_min_memory_mb: Option<i32>,
+) -> LaunchPreflightFacts {
+    let memory_evidence = capture_launch_memory_evidence();
+    let memory_defaults = policy::derived_launch_memory_defaults(
+        instance,
+        config,
+        requested_max_memory_mb,
+        requested_min_memory_mb,
+        memory_evidence.host_total_memory_mb,
+    );
+    let max_memory_mb =
+        policy::effective_max_memory(instance, config, requested_max_memory_mb, memory_defaults);
+    let raw_min_memory_mb =
+        policy::selected_raw_min_memory(instance, config, requested_min_memory_mb, memory_defaults);
+    let min_memory_mb = policy::effective_min_memory(
+        instance,
+        config,
+        requested_min_memory_mb,
+        max_memory_mb,
+        memory_defaults,
+    );
+    let requested_java = policy::selected_java_override(instance, config);
+    let requested_preset = policy::selected_jvm_preset(instance, config);
+    let guardian = LaunchGuardianContext {
+        mode: policy::selected_guardian_mode(config),
+        java_override_origin: policy::java_override_origin(instance, config),
+        preset_override_origin: policy::preset_override_origin(instance, config),
+        raw_jvm_args_origin: policy::raw_jvm_args_origin(instance),
+    };
+    let resource_budget = capture_resource_budget_snapshot(
+        memory_evidence,
+        capture_launch_disk_evidence([library_dir, game_dir]),
+        capture_launch_cpu_load_evidence(),
+        host_cpu_threads(),
+        state.sessions().active_session_count().await,
+        state.installs().active_install_count().await,
+        state.sessions().active_memory_allocation_mb().await,
+        max_memory_mb,
+    );
+    let guardian_summary = guardian_summary_for_preflight(
+        raw_min_memory_mb,
+        max_memory_mb,
+        &resource_budget,
+        &guardian,
+    );
+
+    LaunchPreflightFacts {
+        config: config.clone(),
+        max_memory_mb,
+        raw_min_memory_mb,
+        min_memory_mb,
+        requested_java,
+        requested_preset,
+        guardian,
+        guardian_summary,
+        resource_budget,
+    }
+}
+
+fn guardian_summary_for_preflight(
+    raw_min_memory_mb: i32,
+    max_memory_mb: i32,
+    resource_budget: &LaunchProofResourceBudget,
+    guardian: &LaunchGuardianContext,
+) -> GuardianSummary {
+    let mut guardian_summary = GuardianSummary::new(guardian.mode);
+    if let Some(guidance) = memory_clamp_warning_guidance(raw_min_memory_mb, max_memory_mb) {
+        guardian_summary.warn_with_guidance(guidance);
+    }
+    if let Some(guidance) = low_memory_allocation_warning_guidance(max_memory_mb) {
+        guardian_summary.warn_with_guidance(guidance);
+    }
+    if let Some(guidance) = memory_budget_warning_guidance(resource_budget) {
+        guardian_summary.warn_with_guidance(guidance);
+    }
+    if let Some(guidance) = cpu_pressure_warning_guidance(resource_budget) {
+        guardian_summary.warn_with_guidance(guidance);
+    }
+    if let Some(guidance) = install_pressure_warning_guidance(resource_budget) {
+        guardian_summary.warn_with_guidance(guidance);
+    }
+    if let Some(guidance) = disk_pressure_warning_guidance(resource_budget) {
+        guardian_summary.warn_with_guidance(guidance);
+    }
+    if let Some(guidance) = custom_risky_override_warning_guidance(guardian) {
+        guardian_summary.warn_with_guidance(guidance);
+    }
+    guardian_summary
+}
+
+impl LaunchPreflightFacts {
+    fn into_response(self) -> LaunchPreflightResponse {
+        LaunchPreflightResponse {
+            status: "ready",
+            mode: self.guardian.mode,
+            guardian: self.guardian_summary,
+            memory: LaunchPreflightMemory {
+                max_memory_mb: self.max_memory_mb,
+                min_memory_mb: self.min_memory_mb,
+                min_clamped: self.raw_min_memory_mb > self.max_memory_mb,
+            },
+            overrides: LaunchPreflightOverrides {
+                java: LaunchPreflightOverride::from_origin(self.guardian.java_override_origin),
+                preset: LaunchPreflightOverride::from_origin(self.guardian.preset_override_origin),
+                raw_jvm_args: LaunchPreflightOverride::from_origin(
+                    self.guardian.raw_jvm_args_origin,
+                ),
+            },
+            resource_budget: LaunchPreflightResourceBudget::from_budget(&self.resource_budget),
+        }
+    }
+}
+
+impl LaunchPreflightOverride {
+    fn from_origin(origin: Option<croopor_launcher::OverrideOrigin>) -> Self {
+        Self {
+            present: origin.is_some(),
+            origin,
+        }
+    }
+}
+
+impl LaunchPreflightResourceBudget {
+    fn from_budget(resource_budget: &LaunchProofResourceBudget) -> Self {
+        Self {
+            active_session_count: resource_budget.active_session_count,
+            active_install_count: resource_budget.active_install_count,
+            active_memory_allocation_mb: resource_budget.active_memory_allocation_mb,
+            requested_memory_mb: resource_budget.requested_memory_mb,
+            estimated_remaining_memory_mb: resource_budget.estimated_remaining_memory_mb,
+            memory_pressure: resource_budget.memory_pressure,
+            cpu_pressure: resource_budget.cpu_pressure,
+            install_pressure: resource_budget.install_pressure,
+            disk_pressure: resource_budget.disk_pressure,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -780,6 +967,122 @@ mod tests {
             assert_eq!(prepared.task.intent.max_memory_mb, config.max_memory_mb);
             assert_eq!(prepared.task.intent.min_memory_mb, config.min_memory_mb);
         }
+    }
+
+    #[tokio::test]
+    async fn launch_preflight_ready_payload_for_managed_instance_does_not_create_session() {
+        let fixture = TestFixture::new("preflight-managed-ready");
+        let instance_id = fixture.add_instance("Survival", "1.21.1");
+
+        let preflight = prepare_launch_preflight(&fixture.state, instance_id.clone())
+            .await
+            .expect("prepare preflight");
+
+        assert_eq!(preflight.status, "ready");
+        assert_eq!(preflight.mode, GuardianMode::Managed);
+        assert_eq!(preflight.guardian.mode, GuardianMode::Managed);
+        assert!(!preflight.overrides.java.present);
+        assert_eq!(preflight.overrides.java.origin, None);
+        assert!(!preflight.overrides.preset.present);
+        assert_eq!(preflight.overrides.preset.origin, None);
+        assert!(!preflight.overrides.raw_jvm_args.present);
+        assert_eq!(preflight.overrides.raw_jvm_args.origin, None);
+        assert!(preflight.memory.max_memory_mb > 0);
+        assert!(preflight.memory.min_memory_mb >= 0);
+        assert!(!preflight.memory.min_clamped);
+        assert_eq!(fixture.state.sessions().active_session_count().await, 0);
+        assert!(
+            !fixture
+                .state
+                .sessions()
+                .has_active_instance(&instance_id)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_preflight_custom_override_warns_with_bounded_override_payload() {
+        let fixture = TestFixture::new("preflight-custom-bounded");
+        fixture.set_guardian_mode("custom");
+        let instance_id = fixture.add_instance("Survival", "1.21.1");
+        fixture.update_instance(&instance_id, |instance| {
+            instance.java_path = "/Users/SecretUser/.jdks/manual/bin/java".to_string();
+            instance.extra_jvm_args = "-Dtoken=secret-token -XX:+UseZGC".to_string();
+        });
+
+        let preflight = prepare_launch_preflight(&fixture.state, instance_id)
+            .await
+            .expect("prepare preflight");
+
+        assert_eq!(preflight.status, "ready");
+        assert_eq!(preflight.mode, GuardianMode::Custom);
+        assert_eq!(preflight.guardian.decision, GuardianDecision::Warned);
+        assert_eq!(
+            preflight.overrides.java.origin,
+            Some(OverrideOrigin::Instance)
+        );
+        assert_eq!(
+            preflight.overrides.raw_jvm_args.origin,
+            Some(OverrideOrigin::Instance)
+        );
+        assert!(preflight.guardian.guidance.iter().any(|detail| detail
+            == "Guardian Custom mode will keep the selected Java override for this launch."));
+        assert!(preflight.guardian.guidance.iter().any(|detail| detail
+            == "Guardian Custom mode will keep explicit JVM args; remove them first if startup becomes unstable."));
+
+        let payload = serde_json::to_string(&preflight).expect("serialize preflight");
+        assert!(!payload.contains("/Users/SecretUser"));
+        assert!(!payload.contains("manual/bin/java"));
+        assert!(!payload.contains("-Dtoken"));
+        assert!(!payload.contains("secret-token"));
+        assert!(!payload.contains("requested_java"));
+        assert!(!payload.contains("requested_preset"));
+        assert!(!payload.contains("java_path"));
+        assert!(!payload.contains("command"));
+        assert!(!payload.contains("username"));
+    }
+
+    #[tokio::test]
+    async fn launch_preflight_memory_clamp_warning_is_reflected() {
+        let fixture = TestFixture::new("preflight-memory-clamp");
+        let instance_id = fixture.add_instance("Survival", "1.21.1");
+        fixture.update_instance(&instance_id, |instance| {
+            instance.max_memory_mb = 1024;
+            instance.min_memory_mb = 2048;
+        });
+
+        let preflight = prepare_launch_preflight(&fixture.state, instance_id)
+            .await
+            .expect("prepare preflight");
+
+        assert_eq!(preflight.memory.max_memory_mb, 1024);
+        assert_eq!(preflight.memory.min_memory_mb, 1024);
+        assert!(preflight.memory.min_clamped);
+        assert_eq!(preflight.guardian.decision, GuardianDecision::Warned);
+        assert_has_memory_clamp_warning(&preflight.guardian);
+    }
+
+    #[tokio::test]
+    async fn launch_preflight_resource_warning_path_is_reflected() {
+        let fixture = TestFixture::new("preflight-resource-warning");
+        let instance_id = fixture.add_instance("Survival", "1.21.1");
+
+        let preflight = prepare_launch_preflight(&fixture.state, instance_id)
+            .await
+            .expect("prepare preflight");
+
+        assert_eq!(
+            preflight.resource_budget.active_session_count,
+            fixture.state.sessions().active_session_count().await
+        );
+        assert_eq!(
+            preflight.resource_budget.active_install_count,
+            fixture.state.installs().active_install_count().await
+        );
+        assert_eq!(
+            preflight.resource_budget.requested_memory_mb,
+            Some(preflight.memory.max_memory_mb)
+        );
     }
 
     #[tokio::test]

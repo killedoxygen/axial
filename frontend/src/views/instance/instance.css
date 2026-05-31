@@ -914,6 +914,14 @@
   color: var(--warn);
   background: oklch(0.78 0.14 80 / 0.12);
 }
+.cp-od-guardian-posture[data-tone="err"] .cp-od-guardian-posture-mark {
+  color: var(--err);
+  background: oklch(0.62 0.16 28 / 0.12);
+}
+.cp-od-guardian-posture[data-tone="mute"] .cp-od-guardian-posture-mark {
+  color: var(--text-mute);
+  background: var(--surface-2);
+}
 .cp-od-guardian-posture strong,
 .cp-od-guardian-posture span {
   display: block;

@@ -192,6 +192,7 @@ The preferred shape is:
 - UI copy is backend-authored as much as possible through `guardian.message` and `guardian.details`
 
 Current launcher behavior:
+- `GET /api/v1/launch/preflight/{instance_id}` returns a read-only Guardian preflight for the instance overview. It reuses launch preparation policy for effective memory, memory clamp and low-allocation warnings, resource pressure warnings, Guardian mode, and override origins, but it does not launch Minecraft, create a session, install files, ensure instance layout, write proof state, or expose paths, command lines, raw JVM args, account names, usernames, or tokens.
 - Guardian `message` is preferred for launch notices when present
 - Guardian `details` are preferred over frontend-synthesized intervention/guidance copy
 - `guidance` and `interventions` remain serialized as current bounded diagnostics
@@ -207,7 +208,7 @@ Current launcher behavior:
 - no frontend reinterpretation of policy when backend already decided it
 
 ## Known gaps
-- some policy still leaks into runtime/prepare/Healing/session heuristics/frontend
+- some policy still leaks into runtime/prepare/Healing/session heuristics, while the instance overview preflight now renders bounded backend-authored facts instead of inferring launch-safety copy locally
 - `warned` now covers min-memory clamp, very low launch allocation, memory pressure, conservative CPU/load/install/disk pressure, and Custom-mode risky overrides, but broader warning-only launch-safety paths are not normalized yet
 - the API still exposes Guardian and Healing as separate top-level payload pieces, though Guardian now carries normalized message/details and session stage telemetry preserves those details
 
