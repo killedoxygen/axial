@@ -1181,6 +1181,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn open_instance_folder_missing_instance_returns_not_found_json_error() {
+        let fixture = TestFixture::new("open-folder-missing");
+
+        let (status, Json(body)) = handle_open_instance_folder(
+            State(fixture.state.clone()),
+            Path("missing".to_string()),
+            Query(OpenFolderQuery { sub: None }),
+        )
+        .await
+        .expect_err("missing open-folder should fail");
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_bounded_error_body(&body, "instance not found");
+    }
+
+    #[tokio::test]
+    async fn open_instance_folder_rejects_traversal_subfolder_without_creating_escape_path() {
+        let fixture = TestFixture::new("open-folder-traversal");
+        let instance = fixture
+            .state
+            .instances()
+            .add(
+                "Traversal".to_string(),
+                "1.21.1".to_string(),
+                String::new(),
+                String::new(),
+                None,
+            )
+            .expect("add instance");
+        let game_dir = fixture.state.instances().game_dir(&instance.id);
+        let escaped_dir = game_dir
+            .parent()
+            .expect("game dir parent")
+            .join("escaped-open-folder");
+        assert!(!escaped_dir.exists());
+
+        let (status, Json(body)) = handle_open_instance_folder(
+            State(fixture.state.clone()),
+            Path(instance.id),
+            Query(OpenFolderQuery {
+                sub: Some("../escaped-open-folder".to_string()),
+            }),
+        )
+        .await
+        .expect_err("traversal open-folder should fail");
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_bounded_error_body(&body, "invalid instance folder");
+        assert!(!escaped_dir.exists());
+    }
+
+    #[tokio::test]
     async fn missing_instance_crud_handlers_return_not_found_json_error() {
         let fixture = TestFixture::new("missing-crud");
 
