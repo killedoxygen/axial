@@ -435,6 +435,79 @@ export interface BenchmarkMatrixResponse {
   limits: BenchmarkMatrixLimits;
 }
 
+export interface BenchmarkQualificationSuitePreview {
+  present?: boolean;
+  suite_id?: string;
+  mode?: string;
+  run_count?: number;
+}
+
+export interface BenchmarkQualificationTargetPreview {
+  family: string;
+  loader: string;
+  version: string;
+  mode: string;
+}
+
+export interface BenchmarkQualificationRequiredEvidence {
+  profile: string;
+  run_type: string;
+  mode: string;
+  performance_mode: PerformanceMode | string;
+}
+
+export interface BenchmarkQualificationSuiteRunPreview {
+  present: boolean;
+  run_index?: number;
+  profile?: string;
+  run_type?: string;
+  target_id?: string;
+  benchmark_id?: string;
+  session_id?: string;
+  state?: string;
+}
+
+export interface BenchmarkQualificationProofComparisonPreview {
+  present: boolean;
+  baseline_session_id?: string;
+  metric_name?: string;
+  matched_sample_count?: number;
+}
+
+export interface BenchmarkQualificationProofPreview {
+  present: boolean;
+  session_id?: string;
+  benchmark_id?: string;
+  profile?: string;
+  run_type?: string;
+  mode?: string;
+  performance_mode?: PerformanceMode | string;
+  version?: string;
+  outcome?: string;
+  comparison?: BenchmarkQualificationProofComparisonPreview;
+}
+
+export interface BenchmarkQualificationTargetEvidencePreview {
+  role: string;
+  target_id: string;
+  family: string;
+  loader: string;
+  version: string;
+  required: BenchmarkQualificationRequiredEvidence;
+  suite_run: BenchmarkQualificationSuiteRunPreview;
+  proof: BenchmarkQualificationProofPreview;
+  missing: string[];
+}
+
+export interface BenchmarkQualificationPreviewResponse {
+  schema: string;
+  schema_version: number;
+  status: 'ready' | 'incomplete';
+  suite: BenchmarkQualificationSuitePreview;
+  target: BenchmarkQualificationTargetPreview;
+  targets: BenchmarkQualificationTargetEvidencePreview[];
+}
+
 export interface BenchmarkSuiteDriverStatus {
   id: string;
   state: string;

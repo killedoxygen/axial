@@ -15,6 +15,8 @@ import { clampPlayerNameInput } from '../../player-name';
 import { errMessage, fmtMem, getMemoryRecommendation, validateUsername } from '../../utils';
 import type {
   BenchmarkMatrixResponse,
+  BenchmarkQualificationPreviewResponse,
+  BenchmarkQualificationTargetEvidencePreview,
   BenchmarkSuiteDriverResponse,
   BenchmarkSuiteDriverStatus,
   BenchmarkSuiteDriverSuiteStatus,
@@ -274,6 +276,11 @@ type BenchmarkMatrixState =
   | { status: 'ready'; data: BenchmarkMatrixResponse; error?: undefined }
   | { status: 'error'; data: BenchmarkMatrixResponse | null; error: string };
 
+type BenchmarkQualificationPreviewState =
+  | { status: 'loading'; data: BenchmarkQualificationPreviewResponse | null; error?: undefined }
+  | { status: 'ready'; data: BenchmarkQualificationPreviewResponse; error?: undefined }
+  | { status: 'error'; data: BenchmarkQualificationPreviewResponse | null; error: string };
+
 type BenchmarkDriversState =
   | { status: 'loading'; data: BenchmarkSuiteDriverResponse[]; error?: undefined }
   | { status: 'ready'; data: BenchmarkSuiteDriverResponse[]; error?: undefined }
@@ -373,6 +380,20 @@ function labelFromToken(value: string | undefined, fallback: string): string {
     .join(' ');
 }
 
+function familyLabel(value: string | undefined): string {
+  const raw = value?.trim();
+  if (!raw) return 'Unknown family';
+  return /^[A-Z](?:-[A-Z])?$/.test(raw) ? `Family ${raw}` : labelFromToken(raw, raw);
+}
+
+function qualificationTargetLabel(target: BenchmarkQualificationPreviewResponse['target']): string {
+  const family = familyLabel(target.family);
+  const loader = labelFromToken(target.loader, 'Unknown loader');
+  const version = target.version || 'Unknown version';
+  const mode = labelFromToken(target.mode, 'Unknown mode');
+  return `${family}, ${loader}, ${version}, ${mode}`;
+}
+
 function outcomeTone(outcome: string): 'neutral' | 'ok' | 'warn' | 'err' {
   const normalized = outcome.toLowerCase();
   if (normalized === 'running' || normalized === 'completed' || normalized === 'exited') return 'ok';
@@ -416,6 +437,43 @@ function pendingRunLabel(suite: BenchmarkSuiteDriverSuiteStatus): string {
 
 function driverUpdatedLabel(driver: BenchmarkSuiteDriverStatus): string {
   return driver.updated_at ? `Updated ${formatProofDate(driver.updated_at)}` : 'Updated unknown';
+}
+
+function qualificationRequiredLabel(target: BenchmarkQualificationTargetEvidencePreview): string {
+  const required = target.required;
+  return [
+    required.profile,
+    required.run_type,
+    required.mode,
+    required.performance_mode,
+  ]
+    .filter(Boolean)
+    .map((part) => labelFromToken(part, part))
+    .join(' · ');
+}
+
+function qualificationSuiteLabel(target: BenchmarkQualificationTargetEvidencePreview): string {
+  const run = target.suite_run;
+  if (!run?.present) return 'Suite missing';
+  const state = run.state ? labelFromToken(run.state, run.state) : 'Suite present';
+  if (typeof run.run_index === 'number') return `${state}, run #${run.run_index + 1}`;
+  return state;
+}
+
+function qualificationProofLabel(target: BenchmarkQualificationTargetEvidencePreview): string {
+  const proof = target.proof;
+  if (!proof?.present) return 'Proof missing';
+  const outcome = proof.outcome ? labelFromToken(proof.outcome, proof.outcome) : 'Proof present';
+  const matched = proof.comparison?.present && typeof proof.comparison.matched_sample_count === 'number'
+    ? `, ${proof.comparison.matched_sample_count} matched`
+    : '';
+  return `${outcome}${matched}`;
+}
+
+function qualificationMissingLabel(target: BenchmarkQualificationTargetEvidencePreview): string {
+  const count = Array.isArray(target.missing) ? target.missing.length : 0;
+  if (count === 0) return 'Complete';
+  return `${count} missing`;
 }
 
 function preferredBenchmarkInstanceId(
@@ -770,6 +828,93 @@ function BenchmarkMatrixBlock({ state: matrixState }: { state: BenchmarkMatrixSt
   );
 }
 
+function BenchmarkQualificationPreviewBlock({ state }: { state: BenchmarkQualificationPreviewState }): JSX.Element {
+  const preview = state.data;
+  const rows = preview?.targets ?? [];
+
+  return (
+    <div class="cp-settings-qualification-preview" aria-live="polite">
+      <div class="cp-settings-qualification-head">
+        <div class="cp-settings-rule-status-copy">
+          <strong>Family C qualification</strong>
+          <span>No-launch evidence preview. Incomplete is expected until suite and proof evidence exists.</span>
+        </div>
+        <div class="cp-settings-qualification-status">
+          {state.status === 'loading' && <span class="cp-settings-proof-muted">Loading</span>}
+          {state.status === 'error' && <span class="cp-settings-proof-error">Unavailable</span>}
+          {preview && (
+            <Pill tone={preview.status === 'ready' ? 'ok' : 'warn'}>
+              {preview.status === 'ready' ? 'Ready' : 'Incomplete'}
+            </Pill>
+          )}
+        </div>
+      </div>
+
+      {!preview && (
+        <div class="cp-settings-proof-empty">
+          {state.status === 'loading'
+            ? 'Checking Family C qualification evidence.'
+            : `Family C qualification preview is unavailable. ${state.error}`}
+        </div>
+      )}
+
+      {preview && (
+        <>
+          <div class="cp-settings-qualification-summary">
+            <div>
+              <span>Target</span>
+              <strong>{qualificationTargetLabel(preview.target)}</strong>
+            </div>
+            <div>
+              <span>Suite</span>
+              <strong>
+                {preview.suite?.present
+                  ? `${labelFromToken(preview.suite.mode, 'Suite present')}, ${preview.suite.run_count ?? 0} runs`
+                  : 'Suite evidence missing'}
+              </strong>
+            </div>
+            <div>
+              <span>Schema</span>
+              <strong>v{preview.schema_version}</strong>
+            </div>
+          </div>
+
+          {rows.length === 0 && (
+            <div class="cp-settings-proof-empty">No qualification targets are described yet.</div>
+          )}
+
+          {rows.length > 0 && (
+            <div class="cp-settings-qualification-table">
+              <div class="cp-settings-qualification-table-head">
+                <span>Role</span>
+                <span>Target ID</span>
+                <span>Required evidence</span>
+                <span>Suite</span>
+                <span>Proof</span>
+                <span>Missing</span>
+              </div>
+              {rows.map((row) => (
+                <div class="cp-settings-qualification-row" key={`${row.role}:${row.target_id}`}>
+                  <span data-label="Role">{labelFromToken(row.role, row.role || 'Target')}</span>
+                  <strong data-label="Target ID" title={row.target_id}>{compactId(row.target_id || 'Unknown target')}</strong>
+                  <span data-label="Required evidence">{qualificationRequiredLabel(row) || 'Requirement unknown'}</span>
+                  <span data-label="Suite" data-present={row.suite_run?.present ? 'true' : 'false'}>{qualificationSuiteLabel(row)}</span>
+                  <span data-label="Proof" data-present={row.proof?.present ? 'true' : 'false'}>{qualificationProofLabel(row)}</span>
+                  <span data-label="Missing" data-missing={row.missing?.length ? 'true' : 'false'}>{qualificationMissingLabel(row)}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {state.status === 'error' && (
+            <div class="cp-settings-proof-note">Could not refresh qualification preview. Showing the last loaded evidence state.</div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: BenchmarkMatrixState }): JSX.Element {
   const [driversState, setDriversState] = useState<BenchmarkDriversState>({ status: 'loading', data: [] });
   const [stoppingIds, setStoppingIds] = useState<Set<string>>(() => new Set());
@@ -1108,6 +1253,7 @@ function PerformanceSection(): JSX.Element {
   const [rulesStatus, setRulesStatus] = useState<RulesStatusState>({ status: 'loading', data: null });
   const [launchReports, setLaunchReports] = useState<LaunchReportsState>({ status: 'loading', data: [] });
   const [benchmarkMatrix, setBenchmarkMatrix] = useState<BenchmarkMatrixState>({ status: 'loading', data: null });
+  const [qualificationPreview, setQualificationPreview] = useState<BenchmarkQualificationPreviewState>({ status: 'loading', data: null });
   const [saving, setSaving] = useState<'performance' | 'guardian' | null>(null);
   const requestRef = useRef(0);
 
@@ -1165,6 +1311,29 @@ function PerformanceSection(): JSX.Element {
     return () => { alive = false; };
   }, []);
 
+  useEffect(() => {
+    let alive = true;
+    setQualificationPreview((prev) => ({ status: 'loading', data: prev.data }));
+    api('GET', '/launch/benchmark/qualification/family-c-1-12-2/preview')
+      .then((res) => {
+        if (!alive) return;
+        if (res?.error) throw new Error(res.error);
+        const preview = res as BenchmarkQualificationPreviewResponse;
+        setQualificationPreview({
+          status: 'ready',
+          data: {
+            ...preview,
+            targets: Array.isArray(preview.targets) ? preview.targets : [],
+          },
+        });
+      })
+      .catch((err) => {
+        if (!alive) return;
+        setQualificationPreview((prev) => ({ status: 'error', data: prev.data, error: errMessage(err) }));
+      });
+    return () => { alive = false; };
+  }, []);
+
   const savePatch = async (
     key: 'performance_mode' | 'guardian_mode',
     value: PerformanceMode | GuardianMode,
@@ -1218,6 +1387,7 @@ function PerformanceSection(): JSX.Element {
         <PerformanceRulesStatusBlock state={rulesStatus} />
         <LaunchProofHistoryBlock state={launchReports} />
         <BenchmarkMatrixBlock state={benchmarkMatrix} />
+        <BenchmarkQualificationPreviewBlock state={qualificationPreview} />
         <BenchmarkSuiteDriversBlock matrixState={benchmarkMatrix} />
       </SettingsCard>
       <SettingsCard
