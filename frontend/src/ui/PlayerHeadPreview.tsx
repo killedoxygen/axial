@@ -115,48 +115,60 @@ export function PlayerHeadPreview({
 }): JSX.Element {
   const { palette, pixels, overlays } = useMemo(() => buildPixels(username), [username]);
   const [imageFailed, setImageFailed] = useState(false);
-  const [textureReady, setTextureReady] = useState(false);
-  const [textureFailed, setTextureFailed] = useState(false);
+  const [failedTextureSrcs, setFailedTextureSrcs] = useState<Set<string>>(() => new Set());
   const dim = typeof size === 'number' ? `${size}px` : size;
   const imageSrc = src && !imageFailed ? src : null;
-  const skinTextureSrc = textureSrc && textureReady && !textureFailed ? textureSrc : null;
+  const skinTextureSrc = textureSrc && !failedTextureSrcs.has(textureSrc) ? textureSrc : null;
+  const headSource = skinTextureSrc ? 'texture' : imageSrc ? 'local' : 'generated';
+
+  const markTextureFailed = (failedSrc: string): void => {
+    setFailedTextureSrcs((current) => {
+      if (current.has(failedSrc)) return current;
+      const next = new Set(current);
+      next.add(failedSrc);
+      return next;
+    });
+  };
 
   useEffect(() => {
     setImageFailed(false);
   }, [src]);
 
-  useEffect(() => {
-    setTextureReady(false);
-    setTextureFailed(false);
-  }, [textureSrc]);
-
   return (
     <div
       class={className ? `cp-player-head ${className}` : 'cp-player-head'}
+      data-player-head-source={headSource}
       role={ariaLabel ? 'img' : undefined}
       aria-label={ariaLabel}
       aria-hidden={ariaLabel ? undefined : true}
       title={title}
       style={{ width: dim, height: dim, borderRadius: radius, ...style }}
     >
-      {textureSrc && !textureReady && !textureFailed && (
-        <img
-          class="cp-player-head-preload"
-          src={textureSrc}
-          alt=""
-          aria-hidden="true"
-          draggable={false}
-          onLoad={() => setTextureReady(true)}
-          onError={() => setTextureFailed(true)}
-        />
-      )}
       {skinTextureSrc ? (
-        <svg viewBox="0 0 8 8" width="100%" height="100%" preserveAspectRatio="none" shapeRendering="crispEdges">
-          <image href={skinTextureSrc} x="-8" y="-8" width="64" height="64" />
-          <image href={skinTextureSrc} x="-40" y="-8" width="64" height="64" />
-          <rect x="0" y="0" width="8" height="8" fill="oklch(0.98 0.006 70 / 0.08)" />
-          <rect x="0" y="7" width="8" height="1" fill="oklch(0.16 0.008 70 / 0.13)" />
-        </svg>
+        <div class="cp-player-head-texture" data-player-head-texture="minecraft" aria-hidden="true">
+          <div class="cp-player-head-texture-layer cp-player-head-texture-face">
+            <img
+              class="cp-player-head-texture-img"
+              src={skinTextureSrc}
+              alt=""
+              aria-hidden="true"
+              draggable={false}
+              data-player-head-texture-layer="face"
+              onError={() => markTextureFailed(skinTextureSrc)}
+            />
+          </div>
+          <div class="cp-player-head-texture-layer cp-player-head-texture-hat">
+            <img
+              class="cp-player-head-texture-img"
+              src={skinTextureSrc}
+              alt=""
+              aria-hidden="true"
+              draggable={false}
+              data-player-head-texture-layer="hat"
+              onError={() => markTextureFailed(skinTextureSrc)}
+            />
+          </div>
+        </div>
       ) : imageSrc ? (
         <img
           src={imageSrc}

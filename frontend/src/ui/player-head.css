@@ -28,10 +28,47 @@
   height: 100%;
 }
 
-.cp-player-head-preload {
+.cp-player-head-texture {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
+
+.cp-player-head-texture::after {
+  content: "";
   position: absolute;
-  width: 1px;
-  height: 1px;
-  opacity: 0;
+  inset: 0;
+  background:
+    linear-gradient(
+      to bottom,
+      oklch(0.98 0.006 70 / 0.08) 0 12.5%,
+      transparent 12.5% 87.5%,
+      oklch(0.16 0.008 70 / 0.13) 87.5% 100%
+    );
   pointer-events: none;
+}
+
+.cp-player-head-texture-layer {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+}
+
+.cp-player-head-texture-layer img {
+  position: absolute;
+  display: block;
+  width: 800%;
+  height: 800%;
+  max-width: none;
+  image-rendering: pixelated;
+}
+
+.cp-player-head-texture-face img {
+  left: -100%;
+  top: -100%;
+}
+
+.cp-player-head-texture-hat img {
+  left: -500%;
+  top: -100%;
 }
