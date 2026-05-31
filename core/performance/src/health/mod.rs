@@ -141,6 +141,36 @@ mod tests {
     }
 
     #[test]
+    fn safe_install_failure_evidence_keeps_health_warning_product_safe() {
+        let root = test_root("safe-install-failure-warning");
+        let mut state = test_state(Vec::new());
+        state.failure_count = 1;
+        state.last_failure = "managed artifact install failed".to_string();
+
+        let (health, warnings) = derive_health(Some(&state), None, &root);
+        let warning_text = warnings.join("\n");
+
+        assert_eq!(health, BundleHealth::Degraded);
+        assert_eq!(
+            warnings,
+            vec!["1 managed mod install failure(s): managed artifact install failed"]
+        );
+        for detail in [
+            "https://cdn.modrinth.com/data/private/sodium-secret.jar?token=secret",
+            "sodium-secret.jar",
+            "/home/zero/.minecraft/mods/private/sodium-secret.jar",
+            "C:\\Users\\Zero\\AppData\\Roaming\\.minecraft\\mods\\sodium-secret.jar",
+            "error decoding response body at line 1 column 2",
+            "No such file or directory (os error 2)",
+        ] {
+            assert!(!state.last_failure.contains(detail), "{detail}");
+            assert!(!warning_text.contains(detail), "{detail}");
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn lower_installed_tier_than_current_plan_is_fallback() {
         let root = test_root("lower-tier");
         let state = test_state(Vec::new());

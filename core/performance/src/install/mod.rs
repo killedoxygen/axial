@@ -32,6 +32,7 @@ const REMOTE_RULES_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_RULES_MAX_BYTES: usize = 1024 * 1024;
 const MIN_USEFUL_MANAGED_INSTALLS: usize = 2;
 const MAX_INSTALL_FALLBACK_ATTEMPTS: usize = 4;
+const MANAGED_ARTIFACT_INSTALL_FAILURE: &str = "managed artifact install failed";
 
 #[derive(Debug, Error)]
 pub enum InstallError {
@@ -553,7 +554,7 @@ impl PerformanceManager {
                 Ok(installed) => state.installed_mods.push(installed),
                 Err(error) => {
                     state.failure_count += 1;
-                    state.last_failure = error.to_string();
+                    state.last_failure = managed_artifact_failure_evidence();
                     warn!(
                         "performance install failed for {}: {}",
                         managed_mod.project_id, error
@@ -971,6 +972,10 @@ fn state_tracks_filename(state: Option<&CompositionState>, filename: &str) -> bo
     })
 }
 
+fn managed_artifact_failure_evidence() -> String {
+    MANAGED_ARTIFACT_INSTALL_FAILURE.to_string()
+}
+
 fn promote_file(
     temp_path: &Path,
     final_path: &Path,
@@ -1056,6 +1061,7 @@ fn rules_client() -> reqwest::Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::health::{BundleHealth, derive_health};
     use crate::state::{load_state, save_state};
     use crate::types::{
         CompositionDef, CompositionTier, EmergencyDisable, EmergencyDisableTarget, ManagedMod,
@@ -1574,16 +1580,60 @@ mod tests {
             .expect("install should record failed managed artifact");
 
         assert_eq!(state.failure_count, 1);
-        assert_eq!(
-            state.last_failure,
-            "managed artifact target already exists: sodium.jar"
-        );
+        assert_eq!(state.last_failure, MANAGED_ARTIFACT_INSTALL_FAILURE);
         assert!(state.installed_mods.is_empty());
         assert_eq!(
             fs::read(root.join("sodium.jar")).expect("read existing user file"),
             existing
         );
         assert!(!root.join("sodium.jar.tmp").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn failed_managed_install_stores_product_safe_failure_evidence() {
+        let root = test_root("safe-failure-evidence");
+        let (base_url, leaked_details) = spawn_leaky_download_failure_server().await;
+        let manager =
+            PerformanceManager::new_with_modrinth_base_url(base_url).expect("performance manager");
+        let plan = CompositionPlan {
+            composition_id: "core".to_string(),
+            family: VersionFamily::F,
+            loader: "fabric".to_string(),
+            mode: PerformanceMode::Managed,
+            tier: CompositionTier::Core,
+            mods: vec![managed_mod("sodium", "sodium")],
+            jvm_preset: String::new(),
+            fallback_chain: Vec::new(),
+            warnings: Vec::new(),
+            fallback_reason: String::new(),
+        };
+
+        let state = manager
+            .ensure_installed(&plan, "1.20.4", &root)
+            .await
+            .expect("install should record product-safe failure evidence");
+        let loaded = load_state(&root)
+            .expect("load state")
+            .expect("failed state should be saved");
+        let (health, warnings) = derive_health(Some(&loaded), Some(&plan), &root);
+        let warning_text = warnings.join("\n");
+
+        assert_eq!(state.failure_count, 1);
+        assert_eq!(state.last_failure, MANAGED_ARTIFACT_INSTALL_FAILURE);
+        assert_eq!(loaded.failure_count, 1);
+        assert_eq!(loaded.last_failure, MANAGED_ARTIFACT_INSTALL_FAILURE);
+        assert_eq!(health, BundleHealth::Degraded);
+        assert_eq!(
+            warnings,
+            vec!["1 managed mod install failure(s): managed artifact install failed"]
+        );
+        for detail in leaked_details {
+            assert!(!state.last_failure.contains(&detail), "{detail}");
+            assert!(!loaded.last_failure.contains(&detail), "{detail}");
+            assert!(!warning_text.contains(&detail), "{detail}");
+        }
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2787,6 +2837,80 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    async fn spawn_leaky_download_failure_server() -> (String, Vec<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind leaky modrinth test server");
+        let addr = listener.local_addr().expect("leaky modrinth test addr");
+        let provider_url =
+            format!("http://{addr}/private-provider/sodium-secret.jar?token=provider-secret");
+        let leaked_details = vec![
+            provider_url.clone(),
+            "sodium-secret.jar".to_string(),
+            "/home/zero/.minecraft/mods/private/sodium-secret.jar".to_string(),
+            "C:\\Users\\Zero\\AppData\\Roaming\\.minecraft\\mods\\sodium-secret.jar".to_string(),
+            "error decoding response body at line 1 column 2".to_string(),
+            "No such file or directory (os error 2)".to_string(),
+        ];
+        let leaked_body = leaked_details.join("\n");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let provider_url = provider_url.clone();
+                let leaked_body = leaked_body.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0_u8; 1024];
+                    loop {
+                        let Ok(read) = stream.read(&mut buf).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&buf[..read]);
+                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                        if request.len() > 8192 {
+                            return;
+                        }
+                    }
+
+                    let request = String::from_utf8_lossy(&request);
+                    let first_line = request.lines().next().unwrap_or_default();
+                    let (status, content_type, body) = if first_line
+                        .contains("/v2/project/sodium/version")
+                    {
+                        let body = format!(
+                            r#"[{{"id":"version-a","game_versions":["1.20.4"],"loaders":["fabric"],"featured":true,"date_published":"2026-05-30T00:00:00Z","files":[{{"url":"{provider_url}","filename":"sodium-secret.jar","primary":true,"hashes":{{}}}}]}}]"#
+                        );
+                        ("200 OK", "application/json", body.into_bytes())
+                    } else if first_line.contains("/private-provider/sodium-secret.jar") {
+                        (
+                            "500 Internal Server Error",
+                            "text/plain",
+                            leaked_body.into_bytes(),
+                        )
+                    } else {
+                        ("404 Not Found", "text/plain", b"not found".to_vec())
+                    };
+                    let headers = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    if stream.write_all(headers.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    let _ = stream.write_all(&body).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), leaked_details)
     }
 
     fn selective_modrinth_response(
