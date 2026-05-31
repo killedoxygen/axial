@@ -582,6 +582,45 @@ impl AuthLoginStore {
         Some(minecraft_state)
     }
 
+    pub async fn update_active_current_minecraft_profile(
+        &self,
+        login_id: &str,
+        profile: AuthLoginMinecraftProfile,
+    ) -> bool {
+        let now = Utc::now();
+        let Some(token) = self.active_msa_token.read().await.clone() else {
+            return false;
+        };
+        if token.expires_at <= now {
+            return false;
+        }
+
+        let updated_account = {
+            let mut active_account = self.active_minecraft_account.write().await;
+            let Some(account) = active_account.as_mut() else {
+                return false;
+            };
+            if account.login_id != login_id
+                || account.login_id != token.login_id
+                || account.authenticated_at < token.authenticated_at
+            {
+                return false;
+            }
+            if account.expires_at <= now {
+                *active_account = None;
+                self.bump_active_auth_generation();
+                return false;
+            }
+
+            account.profile = profile;
+            account.clone()
+        };
+
+        self.bump_active_auth_generation();
+        self.save_active_snapshot(&token, Some(&updated_account));
+        true
+    }
+
     pub async fn clear_all(&self) -> (usize, bool) {
         let cleared_pending_logins = {
             let mut sessions = self.sessions.write().await;

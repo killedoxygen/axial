@@ -1,6 +1,9 @@
 use crate::state::AppState;
 use crate::state::skins::SavedSkinRecord;
-use crate::state::{AuthLoginMinecraftAccount, AuthLoginMinecraftSkin};
+use crate::state::{
+    AuthLoginMinecraftAccount, AuthLoginMinecraftCape, AuthLoginMinecraftProfile,
+    AuthLoginMinecraftSkin,
+};
 use axum::{
     Json, Router,
     body::{Body, to_bytes},
@@ -26,6 +29,9 @@ const LEGACY_SKIN_HEIGHT: u32 = 32;
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 const SAVED_SKIN_NAME_MAX_CHARS: usize = 64;
 const SAVED_SKIN_SOURCE: &str = "local_upload";
+const MINECRAFT_SKIN_UPLOAD_ENDPOINT: &str =
+    "https://api.minecraftservices.com/minecraft/profile/skins";
+const CROOPOR_USER_AGENT: &str = concat!("croopor/", env!("CARGO_PKG_VERSION"));
 
 type ApiError = (StatusCode, Json<serde_json::Value>);
 
@@ -68,6 +74,13 @@ struct SavedSkinsResponse {
     skins: Vec<SavedSkinRecord>,
 }
 
+#[derive(Debug, Serialize)]
+struct SkinApplyResponse {
+    status: &'static str,
+    texture_key: String,
+    profile_updated: bool,
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/skin/profile", get(handle_skin_profile))
@@ -81,6 +94,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/v1/skins/{texture_key}/file",
             get(handle_saved_skin_file),
+        )
+        .route(
+            "/api/v1/skins/{texture_key}/apply",
+            post(handle_apply_saved_skin),
         )
 }
 
@@ -295,6 +312,229 @@ async fn handle_saved_skin_file(
                 Json(serde_json::json!({ "error": "failed to build saved skin response" })),
             )
         })
+}
+
+async fn handle_apply_saved_skin(
+    State(state): State<AppState>,
+    Path(texture_key): Path<String>,
+) -> Result<Json<SkinApplyResponse>, ApiError> {
+    handle_apply_saved_skin_with_client(
+        State(state),
+        Path(texture_key),
+        MinecraftSkinUploadClient::default(),
+    )
+    .await
+}
+
+async fn handle_apply_saved_skin_with_client(
+    State(state): State<AppState>,
+    Path(texture_key): Path<String>,
+    client: MinecraftSkinUploadClient,
+) -> Result<Json<SkinApplyResponse>, ApiError> {
+    let texture_key = validate_texture_key(&texture_key)?;
+    let minecraft_state = state
+        .auth_logins()
+        .active_current_minecraft_account_state()
+        .await
+        .ok_or_else(|| {
+            json_status_error(
+                StatusCode::UNAUTHORIZED,
+                "Minecraft account login required",
+                "minecraft_account_required",
+            )
+        })?;
+    let account = minecraft_state.account;
+    if !account.owns_minecraft_java
+        || account.profile.id.trim().is_empty()
+        || account.profile.name.trim().is_empty()
+    {
+        return Err(json_status_error(
+            StatusCode::CONFLICT,
+            "Minecraft account is not ready for skin upload",
+            "minecraft_account_not_ready",
+        ));
+    }
+
+    let saved_skin = state
+        .skins()
+        .list()
+        .map_err(skin_read_error)?
+        .into_iter()
+        .find(|skin| skin.texture_key == texture_key)
+        .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "saved skin not found"))?;
+    let Some(png_bytes) = state
+        .skins()
+        .read_png(&texture_key)
+        .map_err(skin_read_error)?
+    else {
+        return Err(json_error(StatusCode::NOT_FOUND, "saved skin not found"));
+    };
+
+    let uploaded_profile = client
+        .upload(&account.access_token, &saved_skin.variant, png_bytes)
+        .await
+        .map_err(skin_upload_error)?;
+    let profile_updated = if let Some(profile) = uploaded_profile {
+        state
+            .auth_logins()
+            .update_active_current_minecraft_profile(&account.login_id, profile)
+            .await
+    } else {
+        false
+    };
+
+    Ok(Json(SkinApplyResponse {
+        status: "applied",
+        texture_key,
+        profile_updated,
+    }))
+}
+
+#[derive(Clone)]
+struct MinecraftSkinUploadClient {
+    http: reqwest::Client,
+    endpoint: String,
+}
+
+impl MinecraftSkinUploadClient {
+    fn default() -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            endpoint: MINECRAFT_SKIN_UPLOAD_ENDPOINT.to_string(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_endpoint(endpoint: String) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            endpoint,
+        }
+    }
+
+    async fn upload(
+        &self,
+        access_token: &str,
+        variant: &str,
+        png_bytes: Vec<u8>,
+    ) -> Result<Option<AuthLoginMinecraftProfile>, SkinUploadError> {
+        let file = reqwest::multipart::Part::bytes(png_bytes)
+            .file_name("skin.png")
+            .mime_str("image/png")
+            .map_err(|_| SkinUploadError::Unavailable)?;
+        let form = reqwest::multipart::Form::new()
+            .text("variant", skin_variant(variant).to_string())
+            .part("file", file);
+        let response = self
+            .http
+            .post(&self.endpoint)
+            .bearer_auth(access_token)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .header(reqwest::header::USER_AGENT, CROOPOR_USER_AGENT)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|_| SkinUploadError::Unavailable)?;
+        let status = response.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(SkinUploadError::Auth);
+        }
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(SkinUploadError::RateLimited);
+        }
+        if status.is_client_error() {
+            return Err(SkinUploadError::Rejected);
+        }
+        if status.is_server_error() {
+            return Err(SkinUploadError::Unavailable);
+        }
+
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|_| SkinUploadError::Unavailable)?;
+        if bytes.iter().all(|byte| byte.is_ascii_whitespace()) {
+            return Ok(None);
+        }
+
+        let profile = serde_json::from_slice::<SkinUploadMinecraftProfile>(&bytes)
+            .ok()
+            .map(AuthLoginMinecraftProfile::from);
+        Ok(profile)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum SkinUploadError {
+    Auth,
+    RateLimited,
+    Rejected,
+    Unavailable,
+}
+
+#[derive(Debug, Deserialize)]
+struct SkinUploadMinecraftProfile {
+    id: String,
+    name: String,
+    #[serde(default)]
+    skins: Vec<SkinUploadMinecraftSkin>,
+    #[serde(default)]
+    capes: Vec<SkinUploadMinecraftCape>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SkinUploadMinecraftSkin {
+    id: String,
+    state: String,
+    url: String,
+    variant: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SkinUploadMinecraftCape {
+    id: String,
+    state: String,
+    url: String,
+}
+
+impl From<SkinUploadMinecraftProfile> for AuthLoginMinecraftProfile {
+    fn from(profile: SkinUploadMinecraftProfile) -> Self {
+        Self {
+            id: profile.id,
+            name: profile.name,
+            skins: profile
+                .skins
+                .into_iter()
+                .map(AuthLoginMinecraftSkin::from)
+                .collect(),
+            capes: profile
+                .capes
+                .into_iter()
+                .map(AuthLoginMinecraftCape::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<SkinUploadMinecraftSkin> for AuthLoginMinecraftSkin {
+    fn from(skin: SkinUploadMinecraftSkin) -> Self {
+        Self {
+            id: skin.id,
+            state: skin.state,
+            url: skin.url,
+            variant: skin.variant,
+        }
+    }
+}
+
+impl From<SkinUploadMinecraftCape> for AuthLoginMinecraftCape {
+    fn from(cape: SkinUploadMinecraftCape) -> Self {
+        Self {
+            id: cape.id,
+            state: cape.state,
+            url: cape.url,
+        }
+    }
 }
 
 struct NormalizedSkinPng {
@@ -540,6 +780,45 @@ fn json_error(status: StatusCode, message: &'static str) -> ApiError {
     (status, Json(serde_json::json!({ "error": message })))
 }
 
+fn json_status_error(
+    status: StatusCode,
+    message: &'static str,
+    status_code: &'static str,
+) -> ApiError {
+    (
+        status,
+        Json(serde_json::json!({
+            "error": message,
+            "status": status_code,
+        })),
+    )
+}
+
+fn skin_upload_error(error: SkinUploadError) -> ApiError {
+    match error {
+        SkinUploadError::Auth => json_status_error(
+            StatusCode::UNAUTHORIZED,
+            "Minecraft skin upload authorization failed",
+            "minecraft_skin_auth_failed",
+        ),
+        SkinUploadError::RateLimited => json_status_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Minecraft skin upload is rate limited. Try again later.",
+            "minecraft_skin_rate_limited",
+        ),
+        SkinUploadError::Rejected => json_status_error(
+            StatusCode::BAD_REQUEST,
+            "Minecraft rejected the saved skin",
+            "minecraft_skin_rejected",
+        ),
+        SkinUploadError::Unavailable => json_status_error(
+            StatusCode::BAD_GATEWAY,
+            "Minecraft skin upload is unavailable. Try again later.",
+            "minecraft_skin_unavailable",
+        ),
+    }
+}
+
 fn skin_read_error(_error: std::io::Error) -> ApiError {
     json_error(
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -636,10 +915,15 @@ mod tests {
         AuthLoginMinecraftProfile, AuthLoginMinecraftSkin, NewAuthLoginMinecraftAccount,
         NewAuthLoginMsaToken, NewAuthLoginSession,
     };
-    use axum::body::to_bytes;
+    use axum::{
+        body::{Bytes, to_bytes},
+        extract::State as AxumState,
+        http::HeaderMap,
+    };
     use croopor_config::{AppConfig, AppPaths, ConfigStore, InstanceStore};
     use croopor_performance::PerformanceManager;
     use std::{fs, path::PathBuf, sync::Arc};
+    use tokio::sync::mpsc;
 
     #[tokio::test]
     async fn skin_profile_defaults_to_configured_username() {
@@ -1321,6 +1605,211 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn skin_apply_missing_active_account_returns_bounded_error() {
+        let fixture = TestFixture::new("apply-missing-active", "ConfigUser");
+        let saved = fixture
+            .save_skin("Apply Me", None, test_skin_png(SKIN_WIDTH, SKIN_HEIGHT))
+            .await
+            .expect("save skin")
+            .0;
+
+        let error = fixture
+            .apply_saved_skin_with_endpoint(&saved.texture_key, "http://127.0.0.1:9/skins")
+            .await
+            .expect_err("missing active account should fail");
+
+        assert_eq!(error.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            error.1.0,
+            serde_json::json!({
+                "error": "Minecraft account login required",
+                "status": "minecraft_account_required",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn skin_apply_missing_saved_skin_returns_404() {
+        let fixture = TestFixture::new("apply-missing-saved", "ConfigUser");
+        fixture
+            .add_minecraft_account(test_profile("MinecraftName", Vec::new()))
+            .await;
+
+        let error = fixture
+            .apply_saved_skin_with_endpoint(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "http://127.0.0.1:9/skins",
+            )
+            .await
+            .expect_err("missing skin should fail");
+
+        assert_eq!(error.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            error.1.0,
+            serde_json::json!({ "error": "saved skin not found" })
+        );
+    }
+
+    #[tokio::test]
+    async fn skin_apply_rejects_invalid_texture_key() {
+        let fixture = TestFixture::new("apply-invalid-key", "ConfigUser");
+
+        let error = fixture
+            .apply_saved_skin_with_endpoint("../not-a-texture-key", "http://127.0.0.1:9/skins")
+            .await
+            .expect_err("invalid key should fail");
+
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.1.0,
+            serde_json::json!({ "error": "invalid texture key" })
+        );
+    }
+
+    #[tokio::test]
+    async fn skin_apply_upstream_success_uploads_saved_skin_and_updates_profile() {
+        let fixture = TestFixture::new("apply-upstream-success", "ConfigUser");
+        fixture
+            .add_minecraft_account(test_profile("OldMinecraftName", Vec::new()))
+            .await;
+        let png = test_skin_png(SKIN_WIDTH, LEGACY_SKIN_HEIGHT);
+        let saved = fixture
+            .save_skin("Slim Skin", Some("slim".to_string()), png.clone())
+            .await
+            .expect("save skin")
+            .0;
+        let normalized = normalize_skin_png(&png).expect("normalized skin");
+        let (endpoint, mut requests) =
+            skin_apply_route_test_server(SkinApplyServerMode::Success).await;
+
+        let response = fixture
+            .apply_saved_skin_with_endpoint(&saved.texture_key, &endpoint)
+            .await
+            .expect("apply skin")
+            .0;
+        let request = requests.recv().await.expect("skin upload request");
+        let account = fixture
+            .state
+            .auth_logins()
+            .active_minecraft_account()
+            .await
+            .expect("active minecraft account");
+
+        assert_eq!(response.status, "applied");
+        assert_eq!(response.texture_key, saved.texture_key);
+        assert!(response.profile_updated);
+        assert_eq!(request.path, "/minecraft/profile/skins");
+        assert_eq!(
+            request.authorization.as_deref(),
+            Some("Bearer minecraft-access-token")
+        );
+        assert_eq!(request.accept.as_deref(), Some("application/json"));
+        assert_eq!(request.user_agent.as_deref(), Some(CROOPOR_USER_AGENT));
+        assert!(
+            request
+                .content_type
+                .as_deref()
+                .is_some_and(|value| value.starts_with("multipart/form-data; boundary="))
+        );
+        assert!(body_contains(&request.body, b"name=\"variant\""));
+        assert!(body_contains(&request.body, b"slim"));
+        assert!(body_contains(
+            &request.body,
+            b"name=\"file\"; filename=\"skin.png\""
+        ));
+        assert!(body_contains(&request.body, &normalized.png_bytes));
+        assert_eq!(account.profile.name, "UpdatedProfileName");
+        assert_eq!(account.profile.skins[0].variant, "SLIM");
+    }
+
+    #[tokio::test]
+    async fn skin_apply_upstream_429_maps_to_bounded_rate_limit() {
+        let fixture = TestFixture::new("apply-upstream-rate-limit", "ConfigUser");
+        fixture
+            .add_minecraft_account(test_profile("MinecraftName", Vec::new()))
+            .await;
+        let saved = fixture
+            .save_skin("Rate Limited", None, test_skin_png(SKIN_WIDTH, SKIN_HEIGHT))
+            .await
+            .expect("save skin")
+            .0;
+        let (endpoint, mut requests) =
+            skin_apply_route_test_server(SkinApplyServerMode::RateLimited).await;
+
+        let error = fixture
+            .apply_saved_skin_with_endpoint(&saved.texture_key, &endpoint)
+            .await
+            .expect_err("rate limited upload should fail");
+        let _ = requests.recv().await.expect("skin upload request");
+
+        assert_eq!(error.0, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            error.1.0,
+            serde_json::json!({
+                "error": "Minecraft skin upload is rate limited. Try again later.",
+                "status": "minecraft_skin_rate_limited",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn skin_apply_upstream_rejected_error_is_bounded() {
+        let fixture = TestFixture::new("apply-upstream-rejected", "ConfigUser");
+        fixture
+            .add_minecraft_account(test_profile("MinecraftName", Vec::new()))
+            .await;
+        let saved = fixture
+            .save_skin("Rejected", None, test_skin_png(SKIN_WIDTH, SKIN_HEIGHT))
+            .await
+            .expect("save skin")
+            .0;
+        let (endpoint, mut requests) =
+            skin_apply_route_test_server(SkinApplyServerMode::Rejected).await;
+
+        let error = fixture
+            .apply_saved_skin_with_endpoint(&saved.texture_key, &endpoint)
+            .await
+            .expect_err("rejected upload should fail");
+        let _ = requests.recv().await.expect("skin upload request");
+
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.1.0,
+            serde_json::json!({
+                "error": "Minecraft rejected the saved skin",
+                "status": "minecraft_skin_rejected",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn skin_apply_upstream_unavailable_error_is_bounded() {
+        let fixture = TestFixture::new("apply-upstream-unavailable", "ConfigUser");
+        fixture
+            .add_minecraft_account(test_profile("MinecraftName", Vec::new()))
+            .await;
+        let saved = fixture
+            .save_skin("Unavailable", None, test_skin_png(SKIN_WIDTH, SKIN_HEIGHT))
+            .await
+            .expect("save skin")
+            .0;
+
+        let error = fixture
+            .apply_saved_skin_with_endpoint(&saved.texture_key, "http://127.0.0.1:9/skins")
+            .await
+            .expect_err("unavailable upload should fail");
+
+        assert_eq!(error.0, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            error.1.0,
+            serde_json::json!({
+                "error": "Minecraft skin upload is unavailable. Try again later.",
+                "status": "minecraft_skin_unavailable",
+            })
+        );
+    }
+
     struct TestFixture {
         state: AppState,
         root: PathBuf,
@@ -1413,6 +1902,19 @@ mod tests {
             texture_key: &str,
         ) -> Result<Response<Body>, (StatusCode, Json<serde_json::Value>)> {
             handle_saved_skin_file(State(self.state.clone()), Path(texture_key.to_string())).await
+        }
+
+        async fn apply_saved_skin_with_endpoint(
+            &self,
+            texture_key: &str,
+            endpoint: &str,
+        ) -> Result<Json<SkinApplyResponse>, (StatusCode, Json<serde_json::Value>)> {
+            handle_apply_saved_skin_with_client(
+                State(self.state.clone()),
+                Path(texture_key.to_string()),
+                MinecraftSkinUploadClient::with_endpoint(endpoint.to_string()),
+            )
+            .await
         }
 
         async fn add_minecraft_account(&self, profile: AuthLoginMinecraftProfile) {
@@ -1512,6 +2014,105 @@ mod tests {
         body: Vec<u8>,
     ) -> Result<Json<SkinNormalizeResponse>, (StatusCode, Json<serde_json::Value>)> {
         handle_skin_normalize(Body::from(body)).await
+    }
+
+    async fn skin_apply_route_test_server(
+        mode: SkinApplyServerMode,
+    ) -> (String, mpsc::UnboundedReceiver<RecordedSkinApplyRequest>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let app = axum::Router::new()
+            .route("/minecraft/profile/skins", post(record_skin_apply_route))
+            .with_state(SkinApplyRouteState { tx, mode });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind skin apply route test server");
+        let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("skin apply route test server");
+        });
+
+        (format!("{base_url}/minecraft/profile/skins"), rx)
+    }
+
+    #[derive(Clone, Copy)]
+    enum SkinApplyServerMode {
+        Success,
+        RateLimited,
+        Rejected,
+    }
+
+    #[derive(Clone)]
+    struct SkinApplyRouteState {
+        tx: mpsc::UnboundedSender<RecordedSkinApplyRequest>,
+        mode: SkinApplyServerMode,
+    }
+
+    #[derive(Debug)]
+    struct RecordedSkinApplyRequest {
+        path: String,
+        authorization: Option<String>,
+        accept: Option<String>,
+        user_agent: Option<String>,
+        content_type: Option<String>,
+        body: Vec<u8>,
+    }
+
+    async fn record_skin_apply_route(
+        AxumState(state): AxumState<SkinApplyRouteState>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        let _ = state.tx.send(RecordedSkinApplyRequest {
+            path: "/minecraft/profile/skins".to_string(),
+            authorization: header_value(&headers, "authorization"),
+            accept: header_value(&headers, "accept"),
+            user_agent: header_value(&headers, "user-agent"),
+            content_type: header_value(&headers, "content-type"),
+            body: body.to_vec(),
+        });
+
+        match state.mode {
+            SkinApplyServerMode::Success => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "id": "updated-profile-id",
+                    "name": "UpdatedProfileName",
+                    "skins": [{
+                        "id": "updated-skin-id",
+                        "state": "ACTIVE",
+                        "url": "https://textures.minecraft.net/texture/updatedSkin",
+                        "variant": "SLIM"
+                    }],
+                    "capes": []
+                })),
+            ),
+            SkinApplyServerMode::RateLimited => (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "error": "provider-secret-payload",
+                })),
+            ),
+            SkinApplyServerMode::Rejected => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "path": "/home/zero/skin.png",
+                    "error": "provider-secret-payload",
+                })),
+            ),
+        }
+    }
+
+    fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned)
+    }
+
+    fn body_contains(body: &[u8], needle: &[u8]) -> bool {
+        body.windows(needle.len()).any(|window| window == needle)
     }
 
     fn test_skin_png(width: u32, height: u32) -> Vec<u8> {
