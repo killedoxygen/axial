@@ -199,6 +199,7 @@ Current launcher behavior:
 - Guardian `message` is preferred for launch notices when present
 - blocked Guardian `details` include the bounded backend-authored failure reason before guidance when one is available
 - Guardian `details` are preferred over frontend-synthesized intervention/guidance copy
+- when `details` is absent, actionable Guardian `guidance` or `interventions[].detail` still count as backend-authored notice details and are ordered before frontend fallback details
 - startup `stalled` and pre-startup `exited` observations keep session plumbing as fact collection, but the terminal blocked summary and user guidance are Guardian-authored before launch failure status is emitted
 - `guidance` and `interventions` remain serialized as current bounded diagnostics
 - Healing remains supporting detail for runtime-adjustment specifics and retry/fallback context when Guardian has not already authored actionable `blocked`, `warned`, or `intervened` notice details

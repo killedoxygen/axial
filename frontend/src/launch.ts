@@ -274,27 +274,37 @@ function guardianToastMessage(guardian: GuardianSummary | undefined): string {
 function guardianOwnsLaunchOutcome(
   guardian: GuardianSummary | undefined,
   healing: LaunchHealingSummary | undefined,
+  noticeDetails = guardianNoticeDetails(guardian),
 ): boolean {
   if (!guardian) return false;
-  if (guardianHasActionableAuthoredDetails(guardian)) return true;
+  if (guardianHasActionableAuthoredDetails(guardian, noticeDetails)) return true;
   if (guardian.decision !== 'intervened') return false;
   if (!healing) return true;
   return !healing.failure_class && !healing.retry_count;
 }
 
-function guardianHasAuthoredDetails(guardian: GuardianSummary | undefined): boolean {
-  return Boolean(guardian?.details?.some((detail) => detail.trim()));
+function guardianHasAuthoredDetails(
+  guardian: GuardianSummary | undefined,
+  noticeDetails = guardianNoticeDetails(guardian),
+): boolean {
+  return Boolean(guardian && noticeDetails.some((detail) => detail.trim()));
 }
 
-function guardianHasActionableAuthoredDetails(guardian: GuardianSummary | undefined): boolean {
+function guardianHasActionableAuthoredDetails(
+  guardian: GuardianSummary | undefined,
+  noticeDetails = guardianNoticeDetails(guardian),
+): boolean {
   return Boolean(
-    guardianHasAuthoredDetails(guardian)
+    guardianHasAuthoredDetails(guardian, noticeDetails)
     && (guardian?.decision === 'blocked' || guardian?.decision === 'warned' || guardian?.decision === 'intervened'),
   );
 }
 
-function guardianOwnsLeadDetail(guardian: GuardianSummary | undefined): boolean {
-  return guardianHasActionableAuthoredDetails(guardian);
+function guardianOwnsLeadDetail(
+  guardian: GuardianSummary | undefined,
+  noticeDetails = guardianNoticeDetails(guardian),
+): boolean {
+  return guardianHasActionableAuthoredDetails(guardian, noticeDetails);
 }
 
 function launchOutcomeDetails(
@@ -303,17 +313,19 @@ function launchOutcomeDetails(
   leadDetail = '',
 ): string[] {
   const details: string[] = [];
-  const hasGuardianAuthoredDetails = guardianHasAuthoredDetails(guardian);
+  const guardianDetails = guardianNoticeDetails(guardian);
+  const hasGuardianAuthoredDetails = guardianHasAuthoredDetails(guardian, guardianDetails);
+  const guardianOwnsLead = guardianOwnsLeadDetail(guardian, guardianDetails);
   if (!hasGuardianAuthoredDetails) {
     pushUniqueNoticeDetail(details, leadDetail);
   }
-  for (const detail of guardianNoticeDetails(guardian)) {
+  for (const detail of guardianDetails) {
     pushUniqueNoticeDetail(details, detail);
   }
-  if (hasGuardianAuthoredDetails && !guardianOwnsLeadDetail(guardian)) {
+  if (hasGuardianAuthoredDetails && !guardianOwnsLead) {
     pushUniqueNoticeDetail(details, leadDetail);
   }
-  const includeHealing = !guardianOwnsLaunchOutcome(guardian, healing);
+  const includeHealing = !guardianOwnsLaunchOutcome(guardian, healing, guardianDetails);
   if (includeHealing) {
     for (const detail of healingNoticeDetails(healing || {})) {
       pushUniqueNoticeDetail(details, detail);
