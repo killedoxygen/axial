@@ -187,9 +187,18 @@ impl GuardianSummary {
     }
 
     pub fn block_with_guidance(&mut self, guidance: Vec<String>) {
+        self.block_with_reason_and_guidance("", guidance);
+    }
+
+    pub fn block_with_reason_and_guidance(
+        &mut self,
+        reason: impl Into<String>,
+        guidance: Vec<String>,
+    ) {
         self.decision = GuardianDecision::Blocked;
         self.guidance = guidance;
         self.refresh_outcome();
+        prepend_unique_detail(&mut self.details, Some(reason.into()));
     }
 
     pub fn warn_with_guidance(&mut self, guidance: Vec<String>) {
@@ -252,6 +261,18 @@ fn push_unique_detail(details: &mut Vec<String>, detail: Option<String>) {
         return;
     }
     details.push(detail.to_string());
+}
+
+fn prepend_unique_detail(details: &mut Vec<String>, detail: Option<String>) {
+    let Some(detail) = detail else {
+        return;
+    };
+    let detail = detail.trim();
+    if detail.is_empty() {
+        return;
+    }
+    details.retain(|existing| existing != detail);
+    details.insert(0, detail.to_string());
 }
 
 fn user_facing_intervention_detail(intervention: &GuardianIntervention) -> Option<String> {
@@ -777,6 +798,33 @@ mod tests {
         assert_eq!(
             summary.details,
             vec!["Use a compatible Java runtime or let Croopor use the managed runtime."]
+        );
+    }
+
+    #[test]
+    fn blocked_summary_with_reason_orders_reason_before_deduped_guidance() {
+        let mut summary = GuardianSummary::new(GuardianMode::Managed);
+        summary.block_with_reason_and_guidance(
+            " explicit Java override targets Java 8 but this version requires Java 17 ",
+            vec![
+                "Remove the Java override or switch Guardian Mode back to Managed.".to_string(),
+                "explicit Java override targets Java 8 but this version requires Java 17"
+                    .to_string(),
+                "Remove the Java override or switch Guardian Mode back to Managed.".to_string(),
+            ],
+        );
+
+        assert_eq!(summary.decision, super::GuardianDecision::Blocked);
+        assert_eq!(
+            summary.message.as_deref(),
+            Some("Guardian blocked an unsafe launch setup.")
+        );
+        assert_eq!(
+            summary.details,
+            vec![
+                "explicit Java override targets Java 8 but this version requires Java 17",
+                "Remove the Java override or switch Guardian Mode back to Managed.",
+            ]
         );
     }
 

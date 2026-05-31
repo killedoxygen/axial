@@ -196,6 +196,7 @@ The preferred shape is:
 Current launcher behavior:
 - `GET /api/v1/launch/preflight/{instance_id}` returns a read-only Guardian preflight for the instance overview. It reuses launch preparation policy for effective memory, memory clamp and low-allocation warnings, resource pressure warnings, Guardian mode, and override origins, but it does not launch Minecraft, create a session, install files, ensure instance layout, write proof state, or expose paths, command lines, raw JVM args, account names, usernames, or tokens.
 - Guardian `message` is preferred for launch notices when present
+- blocked Guardian `details` include the bounded backend-authored failure reason before guidance when one is available
 - Guardian `details` are preferred over frontend-synthesized intervention/guidance copy
 - `guidance` and `interventions` remain serialized as current bounded diagnostics
 - Healing remains supporting detail for runtime-adjustment specifics and retry/fallback context

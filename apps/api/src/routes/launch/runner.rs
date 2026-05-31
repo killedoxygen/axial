@@ -130,7 +130,11 @@ pub(super) async fn launch_session(
                         message,
                         guidance,
                     } => {
-                        block_guardian_with_guidance(&mut guardian, guidance);
+                        block_guardian_with_reason_and_guidance(
+                            &mut guardian,
+                            bounded_prepare_failure_reason(class, &message),
+                            guidance,
+                        );
                         return Err(fail_launch(
                             &state,
                             &session_id,
@@ -143,8 +147,9 @@ pub(super) async fn launch_session(
                         .await);
                     }
                 }
-                block_guardian_with_guidance(
+                block_guardian_with_reason_and_guidance(
                     &mut guardian,
+                    bounded_prepare_failure_reason(failure_class, &error.message),
                     guidance_for_failure(failure_class, &intent.guardian),
                 );
                 return Err(fail_launch(
@@ -451,10 +456,6 @@ pub(super) async fn launch_session(
                         retry_count: attempt.retry_count,
                         failure_class: Some(failure_class),
                     });
-                block_guardian_with_guidance(
-                    &mut guardian,
-                    guidance_for_failure(failure_class, &intent.guardian),
-                );
                 let message = if failure_class == LaunchFailureClass::StartupStalled {
                     "launch stopped before startup: no startup activity observed".to_string()
                 } else {
@@ -463,6 +464,11 @@ pub(super) async fn launch_session(
                         format_failure_class(failure_class)
                     )
                 };
+                block_guardian_with_reason_and_guidance(
+                    &mut guardian,
+                    Some(message.clone()),
+                    guidance_for_failure(failure_class, &intent.guardian),
+                );
                 return Err(fail_launch(
                     &state,
                     &session_id,
@@ -493,12 +499,56 @@ fn record_guardian_intervention(
     append_guardian_guidance_details(guardian, &existing_guidance);
 }
 
-fn block_guardian_with_guidance(guardian: &mut GuardianSummary, guidance: Vec<String>) {
+fn block_guardian_with_reason_and_guidance(
+    guardian: &mut GuardianSummary,
+    reason: Option<String>,
+    guidance: Vec<String>,
+) {
     let mut merged = guardian.guidance.clone();
     for detail in guidance {
         push_unique_detail(&mut merged, detail);
     }
-    guardian.block_with_guidance(merged);
+    if let Some(reason) = reason {
+        guardian.block_with_reason_and_guidance(reason, merged);
+    } else {
+        guardian.block_with_guidance(merged);
+    }
+}
+
+fn bounded_prepare_failure_reason(
+    failure_class: LaunchFailureClass,
+    message: &str,
+) -> Option<String> {
+    if failure_class == LaunchFailureClass::Unknown {
+        return None;
+    }
+    bounded_guardian_detail(message)
+}
+
+fn bounded_guardian_detail(message: &str) -> Option<String> {
+    let detail = message.trim().replace(
+        "-XX:+UnlockExperimentalVMOptions",
+        "the required experimental JVM unlock flag",
+    );
+    if detail.is_empty() || detail.len() > 240 || contains_guardian_unsafe_detail(&detail) {
+        return None;
+    }
+    Some(detail)
+}
+
+fn contains_guardian_unsafe_detail(detail: impl AsRef<str>) -> bool {
+    let detail = detail.as_ref();
+    let lower = detail.to_ascii_lowercase();
+    lower.contains("token")
+        || lower.contains("account")
+        || lower.contains("username")
+        || detail.contains("-X")
+        || detail.contains("-D")
+        || detail.contains('/')
+        || detail.contains('\\')
+        || detail.contains('\n')
+        || detail.contains('\r')
+        || detail.contains("${")
 }
 
 fn append_guardian_guidance_details(guardian: &mut GuardianSummary, guidance: &[String]) {
@@ -953,6 +1003,26 @@ mod tests {
 
         assert!(guardian.guidance.iter().any(|detail| detail == &warning));
         assert!(guardian.details.iter().any(|detail| detail == &warning));
+    }
+
+    #[test]
+    fn launch_guardian_block_preserves_reason_before_warning_guidance() {
+        let warning = "Launch memory budget is tight.".to_string();
+        let guidance = "Remove the Java override or switch Guardian Mode back to Managed.";
+        let reason = "explicit Java override targets Java 8 but this version requires Java 17";
+        let mut guardian = GuardianSummary::new(GuardianMode::Managed);
+        guardian.warn_with_guidance(vec![warning.clone()]);
+
+        block_guardian_with_reason_and_guidance(
+            &mut guardian,
+            Some(format!(" {reason} ")),
+            vec![guidance.to_string(), warning.clone()],
+        );
+
+        assert_eq!(
+            guardian.details,
+            vec![reason.to_string(), warning, guidance.to_string()]
+        );
     }
 
     #[test]
