@@ -29,6 +29,12 @@ const FAMILY_C_QUALIFICATION_VERSION: &str = "1.12.2";
 const FAMILY_C_QUALIFICATION_LOADER: &str = "Forge";
 const FAMILY_C_BASELINE_TARGET_ID: &str = "family_c_forge_1_12_2_vanilla_baseline";
 const FAMILY_C_MANAGED_TARGET_ID: &str = "family_c_forge_1_12_2_family_c_forge_core";
+const FAMILY_C_MANAGED_COMPOSITION_ID: &str = "family-c-forge-core";
+const FAMILY_C_MANAGED_EXPECTED_ARTIFACTS: [(&str, &str, &str); 3] = [
+    ("foamfix", "jupr7Bf5", "foamfix"),
+    ("ai-improvements", "DSVgwcji", "ai-improvements"),
+    ("clumps", "clumps", "clumps"),
+];
 const LAUNCH_COMMAND_REDACTED_VALUE: &str = "<redacted>";
 
 pub fn router() -> Router<AppState> {
@@ -1247,6 +1253,7 @@ async fn family_c_qualification_payload(
 
     let proofs = family_c_qualification_proofs(state.config().paths(), &manifest)?;
     Ok(family_c_qualification_manifest_payload(
+        Some(state),
         &manifest,
         &proofs,
         [Vec::new(), Vec::new()],
@@ -1257,6 +1264,7 @@ fn family_c_qualification_preview_payload()
 -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
     let manifest = family_c_qualification_preview_manifest()?;
     let mut payload = family_c_qualification_manifest_payload(
+        None,
         &manifest,
         &[],
         [
@@ -1308,6 +1316,7 @@ fn family_c_qualification_preview_manifest() -> Result<
 }
 
 fn family_c_qualification_manifest_payload(
+    state: Option<&AppState>,
     manifest: &crate::state::benchmark_suites::BenchmarkSuiteManifest,
     proofs: &[crate::state::launch_reports::LaunchProofRecord],
     extra_missing: [Vec<&'static str>; 2],
@@ -1315,12 +1324,14 @@ fn family_c_qualification_manifest_payload(
     let [baseline_target, managed_target] = family_c_qualification_targets();
     let [baseline_extra_missing, managed_extra_missing] = extra_missing;
     let baseline = family_c_qualification_target_payload(
+        state,
         baseline_target,
         manifest,
         proofs,
         &baseline_extra_missing,
     );
     let managed = family_c_qualification_target_payload(
+        state,
         managed_target,
         manifest,
         proofs,
@@ -1383,6 +1394,7 @@ fn family_c_qualification_proofs(
 }
 
 fn family_c_qualification_target_payload(
+    state: Option<&AppState>,
     target: FamilyCQualificationTarget,
     manifest: &crate::state::benchmark_suites::BenchmarkSuiteManifest,
     proofs: &[crate::state::launch_reports::LaunchProofRecord],
@@ -1486,6 +1498,9 @@ fn family_c_qualification_target_payload(
         None => missing.push("proof_missing"),
     }
 
+    let managed_install = family_c_qualification_managed_install_evidence(state, target, proof);
+    missing.extend(managed_install.missing.iter().copied());
+
     missing.sort_unstable();
     missing.dedup();
 
@@ -1503,8 +1518,137 @@ fn family_c_qualification_target_payload(
         },
         "suite_run": family_c_qualification_suite_run_payload(run),
         "proof": family_c_qualification_proof_payload(proof),
+        "managed_install": managed_install.payload,
         "missing": missing,
     })
+}
+
+#[derive(Debug)]
+struct FamilyCManagedInstallEvidence {
+    missing: Vec<&'static str>,
+    payload: serde_json::Value,
+}
+
+fn family_c_qualification_managed_install_evidence(
+    state: Option<&AppState>,
+    target: FamilyCQualificationTarget,
+    proof: Option<&crate::state::launch_reports::LaunchProofRecord>,
+) -> FamilyCManagedInstallEvidence {
+    if target.target_id != FAMILY_C_MANAGED_TARGET_ID || target.performance_mode != "managed" {
+        return FamilyCManagedInstallEvidence {
+            missing: Vec::new(),
+            payload: json!({ "required": false }),
+        };
+    }
+
+    let mut evidence = FamilyCManagedInstallEvidence {
+        missing: Vec::new(),
+        payload: json!({
+            "required": true,
+            "present": false,
+            "composition_id": null,
+            "installed_count": 0,
+            "expected_artifacts_present": false,
+            "ownership": false,
+            "source": false,
+            "integrity": false,
+        }),
+    };
+    let (Some(state), Some(proof)) = (state, proof) else {
+        return evidence;
+    };
+    let Some(instance_id) = trimmed_string(&proof.instance_id) else {
+        evidence.missing.push("managed_install_state_missing");
+        return evidence;
+    };
+    if state.instances().get(&instance_id).is_none() {
+        evidence.missing.push("managed_install_state_missing");
+        return evidence;
+    }
+
+    let mods_dir = state.instances().game_dir(&instance_id).join("mods");
+    let composition_state = match croopor_performance::load_state(&mods_dir) {
+        Ok(Some(state)) => state,
+        Ok(None) => {
+            evidence.missing.push("managed_install_state_missing");
+            return evidence;
+        }
+        Err(croopor_performance::StateError::InvalidOwnership { .. }) => {
+            evidence.missing.push("managed_install_ownership_missing");
+            return evidence;
+        }
+        Err(croopor_performance::StateError::InvalidIntegrity { .. }) => {
+            evidence.missing.push("managed_install_integrity_missing");
+            return evidence;
+        }
+        Err(_) => {
+            evidence.missing.push("managed_install_state_invalid");
+            return evidence;
+        }
+    };
+
+    let installed_count = composition_state.installed_mods.len();
+    let has_installed = installed_count > 0;
+    let composition_matches = composition_state.composition_id == FAMILY_C_MANAGED_COMPOSITION_ID;
+    let expected_artifacts_present =
+        has_installed && family_c_managed_expected_artifacts_present(&composition_state);
+    let ownership = has_installed
+        && composition_state.installed_mods.iter().all(|installed| {
+            installed.ownership_class == croopor_performance::OwnershipClass::CompositionManaged
+        });
+    let source = has_installed
+        && composition_state.installed_mods.iter().all(|installed| {
+            installed.source.provider == croopor_performance::ManagedArtifactProvider::Modrinth
+        });
+    let integrity = has_installed
+        && composition_state.installed_mods.iter().all(|installed| {
+            installed.integrity.sha512_verified && !installed.integrity.sha512.trim().is_empty()
+        });
+
+    if !composition_matches {
+        evidence
+            .missing
+            .push("managed_install_composition_mismatch");
+    }
+    if !expected_artifacts_present {
+        evidence.missing.push("managed_install_artifacts_missing");
+    }
+    if has_installed && !ownership {
+        evidence.missing.push("managed_install_ownership_missing");
+    }
+    if has_installed && !source {
+        evidence.missing.push("managed_install_source_missing");
+    }
+    if has_installed && !integrity {
+        evidence.missing.push("managed_install_integrity_missing");
+    }
+
+    evidence.payload = json!({
+        "required": true,
+        "present": true,
+        "composition_id": bounded_descriptor_token(&composition_state.composition_id, "composition"),
+        "installed_count": installed_count,
+        "expected_artifacts_present": expected_artifacts_present,
+        "ownership": ownership,
+        "source": source,
+        "integrity": integrity,
+    });
+    evidence
+}
+
+fn family_c_managed_expected_artifacts_present(
+    composition_state: &croopor_performance::CompositionState,
+) -> bool {
+    FAMILY_C_MANAGED_EXPECTED_ARTIFACTS
+        .iter()
+        .all(|(artifact_id, project_id, slug)| {
+            composition_state.installed_mods.iter().any(|installed| {
+                let installed_project_id = installed.project_id.trim();
+                installed_project_id == *artifact_id
+                    || installed_project_id == *project_id
+                    || installed_project_id == *slug
+            })
+        })
 }
 
 fn family_c_qualification_matching_proof<'a>(
@@ -2666,8 +2810,15 @@ mod tests {
     async fn family_c_qualification_complete_suite_and_proofs_are_ready() {
         let fixture = RouteTestFixture::new("family-c-qualification-ready");
         let suite_id = "family-c-qualification-ready";
-        persist_family_c_suite_run(&fixture.paths, suite_id, 0, "baseline-session");
-        persist_family_c_suite_run(&fixture.paths, suite_id, 1, "managed-session");
+        let instance_id = fixture.add_instance("Family C", FAMILY_C_QUALIFICATION_VERSION);
+        persist_family_c_suite_run(
+            &fixture.paths,
+            suite_id,
+            &instance_id,
+            0,
+            "baseline-session",
+        );
+        persist_family_c_suite_run(&fixture.paths, suite_id, &instance_id, 1, "managed-session");
         let manifest = crate::state::benchmark_suites::load(&fixture.paths, suite_id)
             .expect("load suite")
             .expect("suite exists");
@@ -2681,10 +2832,11 @@ mod tests {
             .iter()
             .find(|run| run.target_id == FAMILY_C_MANAGED_TARGET_ID)
             .expect("managed run");
-        write_family_c_proof(&fixture.paths, baseline_run, "vanilla", None);
+        write_family_c_proof(&fixture.paths, baseline_run, &instance_id, "vanilla", None);
         write_family_c_proof(
             &fixture.paths,
             managed_run,
+            &instance_id,
             "managed",
             Some(crate::state::launch_reports::LaunchProofComparison {
                 baseline_session_id: "baseline-session".to_string(),
@@ -2697,6 +2849,7 @@ mod tests {
                 delta_percent: -25.0,
             }),
         );
+        write_family_c_managed_state(&fixture, &instance_id);
 
         let payload = family_c_qualification_payload(&fixture.state, suite_id)
             .await
@@ -2761,6 +2914,19 @@ mod tests {
                 "decision": "allowed",
             })
         );
+        assert_eq!(
+            payload["targets"][1]["managed_install"],
+            serde_json::json!({
+                "required": true,
+                "present": true,
+                "composition_id": "family-c-forge-core",
+                "installed_count": 3,
+                "expected_artifacts_present": true,
+                "ownership": true,
+                "source": true,
+                "integrity": true,
+            })
+        );
         assert_eq!(payload["targets"][0]["missing"], serde_json::json!([]));
         assert_eq!(payload["targets"][1]["missing"], serde_json::json!([]));
 
@@ -2768,11 +2934,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn family_c_qualification_proofs_without_guardian_and_resource_budget_are_incomplete() {
-        let fixture = RouteTestFixture::new("family-c-qualification-missing-proof-evidence");
-        let suite_id = "family-c-qualification-missing-proof-evidence";
-        persist_family_c_suite_run(&fixture.paths, suite_id, 0, "baseline-session");
-        persist_family_c_suite_run(&fixture.paths, suite_id, 1, "managed-session");
+    async fn family_c_qualification_missing_managed_state_only_blocks_managed_target() {
+        let fixture = RouteTestFixture::new("family-c-qualification-missing-managed-state");
+        let suite_id = "family-c-qualification-missing-managed-state";
+        let instance_id = fixture.add_instance("Family C", FAMILY_C_QUALIFICATION_VERSION);
+        persist_family_c_suite_run(
+            &fixture.paths,
+            suite_id,
+            &instance_id,
+            0,
+            "baseline-session",
+        );
+        persist_family_c_suite_run(&fixture.paths, suite_id, &instance_id, 1, "managed-session");
         let manifest = crate::state::benchmark_suites::load(&fixture.paths, suite_id)
             .expect("load suite")
             .expect("suite exists");
@@ -2786,12 +2959,120 @@ mod tests {
             .iter()
             .find(|run| run.target_id == FAMILY_C_MANAGED_TARGET_ID)
             .expect("managed run");
-        let mut baseline_proof = family_c_proof_record(baseline_run, "vanilla", None);
+        write_family_c_proof(&fixture.paths, baseline_run, &instance_id, "vanilla", None);
+        write_family_c_proof(
+            &fixture.paths,
+            managed_run,
+            &instance_id,
+            "managed",
+            Some(family_c_comparison()),
+        );
+
+        let payload = family_c_qualification_payload(&fixture.state, suite_id)
+            .await
+            .expect("qualification payload");
+
+        assert_eq!(payload["status"], serde_json::json!("incomplete"));
+        assert_eq!(payload["targets"][0]["missing"], serde_json::json!([]));
+        assert_eq!(
+            payload["targets"][1]["missing"],
+            serde_json::json!(["managed_install_state_missing"])
+        );
+        assert_eq!(
+            payload["targets"][1]["managed_install"]["present"],
+            serde_json::json!(false)
+        );
+
+        cleanup(&fixture.root);
+    }
+
+    #[tokio::test]
+    async fn family_c_qualification_invalid_managed_state_only_blocks_managed_target() {
+        let fixture = RouteTestFixture::new("family-c-qualification-invalid-managed-state");
+        let suite_id = "family-c-qualification-invalid-managed-state";
+        let instance_id = fixture.add_instance("Family C", FAMILY_C_QUALIFICATION_VERSION);
+        persist_family_c_suite_run(
+            &fixture.paths,
+            suite_id,
+            &instance_id,
+            0,
+            "baseline-session",
+        );
+        persist_family_c_suite_run(&fixture.paths, suite_id, &instance_id, 1, "managed-session");
+        let manifest = crate::state::benchmark_suites::load(&fixture.paths, suite_id)
+            .expect("load suite")
+            .expect("suite exists");
+        let baseline_run = manifest
+            .runs
+            .iter()
+            .find(|run| run.target_id == FAMILY_C_BASELINE_TARGET_ID)
+            .expect("baseline run");
+        let managed_run = manifest
+            .runs
+            .iter()
+            .find(|run| run.target_id == FAMILY_C_MANAGED_TARGET_ID)
+            .expect("managed run");
+        write_family_c_proof(&fixture.paths, baseline_run, &instance_id, "vanilla", None);
+        write_family_c_proof(
+            &fixture.paths,
+            managed_run,
+            &instance_id,
+            "managed",
+            Some(family_c_comparison()),
+        );
+        write_invalid_family_c_managed_state(&fixture, &instance_id);
+
+        let payload = family_c_qualification_payload(&fixture.state, suite_id)
+            .await
+            .expect("qualification payload");
+
+        assert_eq!(payload["status"], serde_json::json!("incomplete"));
+        assert_eq!(payload["targets"][0]["missing"], serde_json::json!([]));
+        assert_eq!(
+            payload["targets"][1]["missing"],
+            serde_json::json!(["managed_install_state_invalid"])
+        );
+        assert_eq!(
+            payload["targets"][1]["managed_install"]["present"],
+            serde_json::json!(false)
+        );
+
+        cleanup(&fixture.root);
+    }
+
+    #[tokio::test]
+    async fn family_c_qualification_proofs_without_guardian_and_resource_budget_are_incomplete() {
+        let fixture = RouteTestFixture::new("family-c-qualification-missing-proof-evidence");
+        let suite_id = "family-c-qualification-missing-proof-evidence";
+        let instance_id = fixture.add_instance("Family C", FAMILY_C_QUALIFICATION_VERSION);
+        persist_family_c_suite_run(
+            &fixture.paths,
+            suite_id,
+            &instance_id,
+            0,
+            "baseline-session",
+        );
+        persist_family_c_suite_run(&fixture.paths, suite_id, &instance_id, 1, "managed-session");
+        let manifest = crate::state::benchmark_suites::load(&fixture.paths, suite_id)
+            .expect("load suite")
+            .expect("suite exists");
+        let baseline_run = manifest
+            .runs
+            .iter()
+            .find(|run| run.target_id == FAMILY_C_BASELINE_TARGET_ID)
+            .expect("baseline run");
+        let managed_run = manifest
+            .runs
+            .iter()
+            .find(|run| run.target_id == FAMILY_C_MANAGED_TARGET_ID)
+            .expect("managed run");
+        let mut baseline_proof = family_c_proof_record(baseline_run, &instance_id, "vanilla", None);
         baseline_proof.resource_budget = None;
         baseline_proof.guardian = None;
         write_family_c_proof_record(&fixture.paths, &baseline_proof);
         let mut managed_proof = family_c_proof_record(
             managed_run,
+            &instance_id,
             "managed",
             Some(crate::state::launch_reports::LaunchProofComparison {
                 baseline_session_id: "baseline-session".to_string(),
@@ -2810,6 +3091,7 @@ mod tests {
             "decision": "   ",
         }));
         write_family_c_proof_record(&fixture.paths, &managed_proof);
+        write_family_c_managed_state(&fixture, &instance_id);
 
         let payload = family_c_qualification_payload(&fixture.state, suite_id)
             .await
@@ -2863,7 +3145,8 @@ mod tests {
     async fn family_c_qualification_missing_baseline_and_managed_evidence_is_incomplete() {
         let fixture = RouteTestFixture::new("family-c-qualification-incomplete");
         let suite_id = "family-c-qualification-incomplete";
-        persist_family_c_suite_run(&fixture.paths, suite_id, 2, "legacy-session");
+        let instance_id = fixture.add_instance("Family C", FAMILY_C_QUALIFICATION_VERSION);
+        persist_family_c_suite_run(&fixture.paths, suite_id, &instance_id, 2, "legacy-session");
 
         let payload = family_c_qualification_payload(&fixture.state, suite_id)
             .await
@@ -3026,8 +3309,15 @@ mod tests {
     async fn family_c_qualification_route_returns_ready_for_complete_suite() {
         let fixture = RouteTestFixture::new("family-c-qualification-ready-route");
         let suite_id = "family-c-qualification-ready-route";
-        persist_family_c_suite_run(&fixture.paths, suite_id, 0, "baseline-session");
-        persist_family_c_suite_run(&fixture.paths, suite_id, 1, "managed-session");
+        let instance_id = fixture.add_instance("Family C", FAMILY_C_QUALIFICATION_VERSION);
+        persist_family_c_suite_run(
+            &fixture.paths,
+            suite_id,
+            &instance_id,
+            0,
+            "baseline-session",
+        );
+        persist_family_c_suite_run(&fixture.paths, suite_id, &instance_id, 1, "managed-session");
         let manifest = crate::state::benchmark_suites::load(&fixture.paths, suite_id)
             .expect("load suite")
             .expect("suite exists");
@@ -3041,10 +3331,11 @@ mod tests {
             .iter()
             .find(|run| run.target_id == FAMILY_C_MANAGED_TARGET_ID)
             .expect("managed run");
-        write_family_c_proof(&fixture.paths, baseline_run, "vanilla", None);
+        write_family_c_proof(&fixture.paths, baseline_run, &instance_id, "vanilla", None);
         write_family_c_proof(
             &fixture.paths,
             managed_run,
+            &instance_id,
             "managed",
             Some(crate::state::launch_reports::LaunchProofComparison {
                 baseline_session_id: "baseline-session".to_string(),
@@ -3057,6 +3348,7 @@ mod tests {
                 delta_percent: -25.0,
             }),
         );
+        write_family_c_managed_state(&fixture, &instance_id);
 
         let response = router()
             .with_state(fixture.state.clone())
@@ -3206,8 +3498,15 @@ mod tests {
     async fn family_c_qualification_wrong_suite_mode_is_incomplete() {
         let fixture = RouteTestFixture::new("family-c-qualification-wrong-mode");
         let suite_id = "family-c-qualification-wrong-mode";
-        persist_family_c_suite_run(&fixture.paths, suite_id, 0, "baseline-session");
-        persist_family_c_suite_run(&fixture.paths, suite_id, 1, "managed-session");
+        let instance_id = fixture.add_instance("Family C", FAMILY_C_QUALIFICATION_VERSION);
+        persist_family_c_suite_run(
+            &fixture.paths,
+            suite_id,
+            &instance_id,
+            0,
+            "baseline-session",
+        );
+        persist_family_c_suite_run(&fixture.paths, suite_id, &instance_id, 1, "managed-session");
         let mut manifest = crate::state::benchmark_suites::load(&fixture.paths, suite_id)
             .expect("load suite")
             .expect("suite exists");
@@ -3221,10 +3520,11 @@ mod tests {
             .iter()
             .find(|run| run.target_id == FAMILY_C_MANAGED_TARGET_ID)
             .expect("managed run");
-        write_family_c_proof(&fixture.paths, baseline_run, "vanilla", None);
+        write_family_c_proof(&fixture.paths, baseline_run, &instance_id, "vanilla", None);
         write_family_c_proof(
             &fixture.paths,
             managed_run,
+            &instance_id,
             "managed",
             Some(crate::state::launch_reports::LaunchProofComparison {
                 baseline_session_id: "baseline-session".to_string(),
@@ -3237,6 +3537,7 @@ mod tests {
                 delta_percent: -25.0,
             }),
         );
+        write_family_c_managed_state(&fixture, &instance_id);
         manifest.mode = "development".to_string();
         write_family_c_suite_manifest(&fixture.paths, &manifest);
 
@@ -3262,8 +3563,15 @@ mod tests {
     async fn family_c_qualification_payload_excludes_sensitive_fields() {
         let fixture = RouteTestFixture::new("family-c-qualification-sensitive");
         let suite_id = "family-c-qualification-sensitive";
-        persist_family_c_suite_run(&fixture.paths, suite_id, 0, "baseline-session");
-        persist_family_c_suite_run(&fixture.paths, suite_id, 1, "managed-session");
+        let instance_id = fixture.add_instance("Family C", FAMILY_C_QUALIFICATION_VERSION);
+        persist_family_c_suite_run(
+            &fixture.paths,
+            suite_id,
+            &instance_id,
+            0,
+            "baseline-session",
+        );
+        persist_family_c_suite_run(&fixture.paths, suite_id, &instance_id, 1, "managed-session");
         let manifest = crate::state::benchmark_suites::load(&fixture.paths, suite_id)
             .expect("load suite")
             .expect("suite exists");
@@ -3277,9 +3585,10 @@ mod tests {
             .iter()
             .find(|run| run.target_id == FAMILY_C_MANAGED_TARGET_ID)
             .expect("managed run");
-        write_family_c_proof(&fixture.paths, baseline_run, "vanilla", None);
+        write_family_c_proof(&fixture.paths, baseline_run, &instance_id, "vanilla", None);
         let mut managed_proof = family_c_proof_record(
             managed_run,
+            &instance_id,
             "managed",
             Some(crate::state::launch_reports::LaunchProofComparison {
                 baseline_session_id: "baseline-session".to_string(),
@@ -3300,6 +3609,7 @@ mod tests {
             "details": ["C:\\Users\\SecretUser\\token --runtime-arguments"],
         }));
         write_family_c_proof_record(&fixture.paths, &managed_proof);
+        write_family_c_managed_state(&fixture, &instance_id);
 
         let payload = family_c_qualification_payload(&fixture.state, suite_id)
             .await
@@ -4342,6 +4652,7 @@ mod tests {
     fn persist_family_c_suite_run(
         paths: &AppPaths,
         suite_id: &str,
+        instance_id: &str,
         run_index: usize,
         session_id: &str,
     ) {
@@ -4350,7 +4661,7 @@ mod tests {
         crate::state::benchmark_suites::persist_launched_run(
             paths,
             suite_id,
-            "family-c-instance",
+            instance_id,
             "release_validation",
             &manifest_runs,
             run_index,
@@ -4378,10 +4689,11 @@ mod tests {
     fn write_family_c_proof(
         paths: &AppPaths,
         run: &crate::state::benchmark_suites::BenchmarkSuiteManifestRun,
+        instance_id: &str,
         performance_mode: &str,
         comparison: Option<crate::state::launch_reports::LaunchProofComparison>,
     ) {
-        let proof = family_c_proof_record(run, performance_mode, comparison);
+        let proof = family_c_proof_record(run, instance_id, performance_mode, comparison);
         write_family_c_proof_record(paths, &proof);
     }
 
@@ -4400,8 +4712,72 @@ mod tests {
         .expect("write launch proof");
     }
 
+    fn write_family_c_managed_state(fixture: &RouteTestFixture, instance_id: &str) {
+        let mods_dir = fixture.state.instances().game_dir(instance_id).join("mods");
+        croopor_performance::save_state(&mods_dir, &family_c_managed_state())
+            .expect("write family c managed state");
+    }
+
+    fn write_invalid_family_c_managed_state(fixture: &RouteTestFixture, instance_id: &str) {
+        let mods_dir = fixture.state.instances().game_dir(instance_id).join("mods");
+        std::fs::create_dir_all(&mods_dir).expect("create mods dir");
+        std::fs::write(
+            croopor_performance::state::lock_file_path(&mods_dir),
+            "{ invalid",
+        )
+        .expect("write invalid managed state");
+    }
+
+    fn family_c_managed_state() -> croopor_performance::CompositionState {
+        croopor_performance::CompositionState {
+            composition_id: FAMILY_C_MANAGED_COMPOSITION_ID.to_string(),
+            tier: croopor_performance::CompositionTier::Core,
+            installed_mods: vec![
+                family_c_installed_mod("jupr7Bf5", "foamfix.jar"),
+                family_c_installed_mod("DSVgwcji", "ai-improvements.jar"),
+                family_c_installed_mod("clumps", "clumps.jar"),
+            ],
+            installed_at: "2026-01-01T00:00:00.000Z".to_string(),
+            failure_count: 0,
+            last_failure: String::new(),
+        }
+    }
+
+    fn family_c_installed_mod(
+        project_id: &str,
+        filename: &str,
+    ) -> croopor_performance::InstalledMod {
+        croopor_performance::InstalledMod {
+            project_id: project_id.to_string(),
+            version_id: format!("{project_id}-version"),
+            filename: filename.to_string(),
+            ownership_class: croopor_performance::OwnershipClass::CompositionManaged,
+            source: croopor_performance::ManagedArtifactSource {
+                provider: croopor_performance::ManagedArtifactProvider::Modrinth,
+            },
+            integrity: croopor_performance::ManagedArtifactIntegrity {
+                sha512: "a".repeat(128),
+                sha512_verified: true,
+            },
+        }
+    }
+
+    fn family_c_comparison() -> crate::state::launch_reports::LaunchProofComparison {
+        crate::state::launch_reports::LaunchProofComparison {
+            baseline_session_id: "baseline-session".to_string(),
+            baseline_recorded_at: "2026-01-01T00:01:00.000Z".to_string(),
+            matched_sample_count: 1,
+            metric_name: "total_completed_stage_duration_ms".to_string(),
+            current_value_ms: 90,
+            baseline_value_ms: 120,
+            delta_ms: -30,
+            delta_percent: -25.0,
+        }
+    }
+
     fn family_c_proof_record(
         run: &crate::state::benchmark_suites::BenchmarkSuiteManifestRun,
+        instance_id: &str,
         performance_mode: &str,
         comparison: Option<crate::state::launch_reports::LaunchProofComparison>,
     ) -> crate::state::launch_reports::LaunchProofRecord {
@@ -4416,7 +4792,7 @@ mod tests {
             schema: "croopor.launch.proof".to_string(),
             schema_version: 1,
             session_id,
-            instance_id: "family-c-instance".to_string(),
+            instance_id: instance_id.to_string(),
             version_id: "1.12.2".to_string(),
             launched_at: "2026-01-01T00:00:00.000Z".to_string(),
             recorded_at: "2026-01-01T00:01:00.000Z".to_string(),
