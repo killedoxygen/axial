@@ -739,8 +739,10 @@ fn safe_report_filename(session_id: &str) -> String {
 mod tests {
     use super::*;
     use croopor_config::AppPaths;
+    use croopor_launcher::service::HealingSummaryInput;
     use croopor_launcher::{
-        LaunchFailure, LaunchFailureClass, LaunchState, SessionId, launch_stage_label,
+        LaunchFailure, LaunchFailureClass, LaunchState, SessionId, build_healing_summary,
+        launch_stage_label,
     };
     use serde_json::json;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1461,6 +1463,55 @@ mod tests {
         assert!(!persisted_json.contains("java_path"));
         assert!(!persisted_json.contains("/usr/bin/java"));
         assert!(!persisted_json.contains("/tmp/natives"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn launch_report_persists_healing_without_java_path_fragments() {
+        let root = test_root("healing-privacy");
+        let paths = test_paths(&root);
+        let mut record = test_record("healing-privacy");
+        let healing = build_healing_summary(HealingSummaryInput {
+            auth_mode: "offline",
+            requested_java_path: " /home/alice/.sdkman/candidates/java/21/bin/java ",
+            requested_preset: "",
+            effective_java_path: Some(r"C:\Users\alice\AppData\Local\VendorRuntime\java.exe"),
+            effective_preset: None,
+            fallback_applied: None,
+            retry_count: 0,
+            failure_class: None,
+        })
+        .expect("build healing");
+        record.healing = serde_json::to_value(healing).ok();
+
+        let proof = persist_record(&paths, &record, None, "running").expect("persist report");
+
+        assert!(proof.healing.is_some());
+        let persisted_json = fs::read_to_string(report_path(&paths, "healing-privacy"))
+            .expect("read persisted report");
+        let persisted_lower = persisted_json.to_ascii_lowercase();
+        for fragment in [
+            "/usr",
+            "/home",
+            "\\",
+            "java",
+            "alice",
+            "sdkman",
+            "candidates",
+            "bin",
+            "users",
+            "appdata",
+            "vendorruntime",
+            "java.exe",
+        ] {
+            assert!(
+                !persisted_lower.contains(fragment),
+                "persisted healing leaked fragment {fragment:?}: {persisted_json}"
+            );
+        }
+        assert!(!persisted_json.contains("requested_java_path"));
+        assert!(!persisted_json.contains("effective_java_path"));
 
         let _ = fs::remove_dir_all(root);
     }

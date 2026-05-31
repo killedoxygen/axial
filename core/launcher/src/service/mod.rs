@@ -100,10 +100,6 @@ pub struct LaunchHealingSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effective_preset: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub requested_java_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub effective_java_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_mode: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub warnings: Vec<String>,

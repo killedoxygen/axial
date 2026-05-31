@@ -137,6 +137,9 @@ function formatHealingDetail(detail: string): string {
   if (trimmed === 'Requested Java override was bypassed in favor of a safer managed runtime') {
     return 'Java override was skipped and the managed runtime was used instead.';
   }
+  if (trimmed === 'Requested runtime override was bypassed in favor of a safer managed runtime') {
+    return 'Java override was skipped and the managed runtime was used instead.';
+  }
 
   if (trimmed === 'Guardian switched to managed Java before launch') {
     return 'Guardian switched to the managed Java runtime before launch.';

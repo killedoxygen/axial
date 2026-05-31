@@ -356,8 +356,6 @@ export interface HealingEvent {
 export interface LaunchHealingSummary {
   requested_preset?: string;
   effective_preset?: string;
-  requested_java_path?: string;
-  effective_java_path?: string;
   auth_mode?: string;
   warnings?: string[];
   fallback_applied?: string;
