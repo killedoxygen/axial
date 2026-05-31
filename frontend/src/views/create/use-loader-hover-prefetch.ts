@@ -67,6 +67,9 @@ export function useLoaderHoverPrefetch({
       .then(() => {
         prefetchedComponentsRef.current.add(componentId);
       })
+      .catch(() => {
+        // Hover prefetch is opportunistic; selected-loader loading owns visible errors.
+      })
       .finally(() => {
         prefetchingComponentsRef.current.delete(componentId);
       });

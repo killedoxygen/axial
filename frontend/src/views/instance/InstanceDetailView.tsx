@@ -13,13 +13,7 @@ import { navigate } from '../../ui-state';
 import { addInstance, clearLaunchNotice, removeInstance, selectInstance, updateInstanceInList } from '../../actions';
 import { launchGame, killGame } from '../../launch';
 import { handleInstallClick } from '../../install';
-import { api, apiUrl } from '../../api';
-import {
-  hasNativeDesktopRuntime,
-  nativeInstallEventName,
-  onNativeEvent,
-  startNativeInstallEvents,
-} from '../../native';
+import { api } from '../../api';
 import { toast } from '../../toast';
 import { errMessage, fmtMem, getMemoryRecommendation } from '../../utils';
 import type {
@@ -34,7 +28,6 @@ import type {
   PerformanceHealthResponse,
   PerformanceHealthStatus,
   PerformanceInstanceOperationResponse,
-  PerformanceInstallResponse,
   PerformanceMode,
   PerformanceOperationStatus,
   PerformancePlanResponse,
@@ -306,7 +299,7 @@ function performanceSummary(
     return {
       tone: 'mute',
       title: 'Checking plan',
-      detail: 'Memory and Java settings are still available while Croopor reads bundle state.',
+      detail: 'Memory and Java evidence stays visible while Croopor reads bundle state.',
     };
   }
   if (state.status === 'error' && !state.plan && !state.health) {
@@ -320,14 +313,14 @@ function performanceSummary(
     return {
       tone: 'mute',
       title: 'No managed bundle',
-      detail: 'Memory allocation and Java detection remain available below.',
+      detail: 'Memory allocation and Java detection are shown below.',
     };
   }
   if (mode === 'custom') {
     return {
       tone: 'mute',
       title: 'No managed bundle',
-      detail: 'Memory allocation and Java detection remain available below.',
+      detail: 'Memory allocation and Java detection are shown below.',
     };
   }
 
@@ -369,13 +362,6 @@ function performanceSummaryIcon(tone: 'ok' | 'warn' | 'err' | 'mute'): string {
   return 'info';
 }
 
-interface PerformanceLifecycleAction {
-  label: string;
-  busyLabel: string;
-  icon: string;
-  action: 'install' | 'remove';
-}
-
 interface PerformanceInstallProgress {
   phase?: string;
   current?: number;
@@ -383,10 +369,6 @@ interface PerformanceInstallProgress {
   file?: string;
   error?: string;
   done?: boolean;
-}
-
-interface LifecycleProgressSource {
-  close(): void;
 }
 
 function performanceProgressTitle(progress: PerformanceInstallProgress): string {
@@ -437,42 +419,6 @@ function operationStatusAsProgress(status: PerformanceOperationStatus): Performa
     total: 4,
     error: failed ? status.error || 'performance operation failed' : status.error,
     done: isPerformanceOperationTerminal(status),
-  };
-}
-
-function performanceLifecycleAction(
-  mode: PerformanceMode,
-  health: PerformanceHealthResponse | null,
-): PerformanceLifecycleAction | null {
-  if (mode === 'managed') {
-    if (health?.health === 'invalid' || health?.health === 'degraded') {
-      return { label: 'Repair', busyLabel: 'Repairing…', icon: 'refresh', action: 'install' };
-    }
-    if (health?.health === 'fallback') {
-      return { label: 'Apply', busyLabel: 'Applying…', icon: 'download', action: 'install' };
-    }
-    if (health?.health === 'healthy') {
-      return { label: 'Repair', busyLabel: 'Repairing…', icon: 'refresh', action: 'install' };
-    }
-    return { label: 'Prepare', busyLabel: 'Preparing…', icon: 'download', action: 'install' };
-  }
-
-  if (health?.active || health?.installed_count || health?.composition_id) {
-    return { label: 'Remove', busyLabel: 'Removing…', icon: 'trash', action: 'remove' };
-  }
-
-  return null;
-}
-
-function installResponseAsHealth(response: PerformanceInstallResponse): PerformanceHealthResponse {
-  return {
-    active: response.active,
-    health: response.health,
-    composition_id: response.composition_id,
-    tier: response.tier,
-    installed_count: response.installed_count,
-    managed_artifacts: response.managed_artifacts,
-    warnings: response.warnings,
   };
 }
 
@@ -731,104 +677,21 @@ function QuickActionsCard({
   );
 }
 
-// ─── Performance — main-column quick-control card.
-// RAM allocation + preset + Java runtime. The slider writes on commit so
-// instance launch policy sees the same value after reboot. ─────────────
-
-type Preset = 'low' | 'balanced' | 'high' | 'custom';
-
-interface MemoryPreset {
-  id: Exclude<Preset, 'custom'>;
-  value: number;
-}
-
-interface MemoryProfile {
-  max: number;
-  recommended: [number, number];
-  presets: MemoryPreset[];
-}
-
-function roundHalf(value: number): number {
-  return Math.round(value * 2) / 2;
-}
+// ─── Performance — overview health and runtime evidence. Settings owns policy controls.
 
 function memoryGb(valueMb: number | undefined, fallbackMb: number): number {
   const mb = typeof valueMb === 'number' && valueMb > 0 ? valueMb : fallbackMb;
   return Math.max(0.5, mb / 1024);
 }
 
-function clampMemoryGb(value: number, min: number, max: number): number {
-  return roundHalf(Math.max(min, Math.min(max, value)));
-}
-
-function systemMemoryMaxGb(savedGb: number, minGb: number): number {
-  const sys = systemInfo.value;
-  const detected = sys?.max_allocatable_gb || (sys?.total_memory_mb ? Math.floor(sys.total_memory_mb / 1024) : 16);
-  return Math.max(minGb, detected, Math.ceil(savedGb));
-}
-
-function systemMemoryRecommendationGb(totalGb: number, minGb: number): [number, number] {
-  const sys = systemInfo.value;
-  if (sys?.recommended_min_mb && sys.recommended_max_mb) {
-    const min = Math.max(minGb, roundHalf(sys.recommended_min_mb / 1024));
-    const max = Math.max(min, sys.recommended_max_mb / 1024);
-    return [min, clampMemoryGb(max, min, totalGb)];
-  }
-  const rec = getMemoryRecommendation(totalGb);
-  const low = Math.min(Math.max(minGb, rec.rec - 2), totalGb);
-  const high = Math.min(totalGb, Math.max(low, rec.rec + 2));
-  return [low, high];
-}
-
-function memoryProfileForInstance(inst: EnrichedInstance, savedGb: number, minGb: number): MemoryProfile {
-  const max = systemMemoryMaxGb(savedGb, minGb);
-  const recommended = systemMemoryRecommendationGb(max, minGb);
-  const [recMin, recMax] = recommended;
-  const modWeight = Math.min(4, Math.floor((inst.mods_count ?? 0) / 50));
-  const loaderWeight = versions.value.find(v => v.id === inst.version_id)?.loader ? 1 : 0;
-  const headroom = Math.max(0, max - minGb);
-  const estimatedSweetSpot = clampMemoryGb(
-    Math.max(((recMin + recMax) / 2) + loaderWeight + modWeight, recMin + (headroom * 0.2)),
-    minGb,
-    max,
-  );
-  const highHeadroom = Math.max(2, Math.min(8, Math.round(max * 0.12)));
-  const high = clampMemoryGb(Math.max(recMax, estimatedSweetSpot + highHeadroom, recMin + (headroom * 0.45)), minGb, max);
-
-  return {
-    max,
-    recommended,
-    presets: [
-      { id: 'low', value: clampMemoryGb(recMin, minGb, max) },
-      { id: 'balanced', value: estimatedSweetSpot },
-      { id: 'high', value: high },
-    ],
-  };
-}
-
-function inferPreset(maxMem: number, presets: MemoryPreset[]): Preset {
-  return presets.find(preset => preset.value === maxMem)?.id ?? 'custom';
-}
-
-function PerformanceCard({ inst, onOpenSettings }: { inst: EnrichedInstance; onOpenSettings: () => void }): JSX.Element {
-  const RAM_MIN = 2;
+function PerformanceCard({ inst }: { inst: EnrichedInstance }): JSX.Element {
   const version = versions.value.find(v => v.id === inst.version_id);
   const effectiveMode = effectivePerformanceMode(inst);
-  const saved = memoryGb(inst.max_memory_mb, config.value?.max_memory_mb ?? 4096);
-  const memoryProfile = memoryProfileForInstance(inst, saved, RAM_MIN);
-  const ramMax = memoryProfile.max;
-  const [recMin, recMax] = memoryProfile.recommended;
-  const initialMem = clampMemoryGb(saved, RAM_MIN, ramMax);
-  const [maxMem, setMaxMem] = useState<number>(initialMem);
+  const maxMem = memoryGb(inst.max_memory_mb, config.value?.max_memory_mb ?? 4096);
+  const minMem = memoryGb(inst.min_memory_mb, config.value?.min_memory_mb ?? 1024);
+  const modeSourceLabel = effectiveMode.source === 'instance' ? 'instance override' : 'global default';
   const [program, setProgram] = useState<PerformanceProgramState>({ status: 'loading', plan: null, health: null });
-  const [lifecycleBusy, setLifecycleBusy] = useState(false);
-  const [lifecycleProgress, setLifecycleProgress] = useState<{ title: string; detail: string } | null>(null);
   const [lifecycleOperation, setLifecycleOperation] = useState<PerformanceOperationStatus | null>(null);
-  const [saving, setSaving] = useState(false);
-  const savedRef = useRef(initialMem);
-  const saveRequestRef = useRef(0);
-  const saveTimerRef = useRef<number | null>(null);
-  const lifecycleSourceRef = useRef<LifecycleProgressSource | null>(null);
   const operationPollRef = useRef<number | null>(null);
   const operationRequestRef = useRef(0);
 
@@ -858,20 +721,8 @@ function PerformanceCard({ inst, onOpenSettings }: { inst: EnrichedInstance; onO
   }, [inst.id, inst.version_id, version?.id, version?.loader?.component_id, version?.minecraft_meta.effective_version, effectiveMode.mode]);
 
   useEffect(() => {
-    // If the persisted value changes (PUT elsewhere), realign local state.
-    const nextSaved = clampMemoryGb(saved, RAM_MIN, ramMax);
-    if (nextSaved !== savedRef.current) {
-      savedRef.current = nextSaved;
-      setMaxMem(nextSaved);
-    }
-  }, [ramMax, saved]);
-
-  useEffect(() => {
     return () => {
-      if (saveTimerRef.current !== null) window.clearTimeout(saveTimerRef.current);
       if (operationPollRef.current !== null) window.clearInterval(operationPollRef.current);
-      lifecycleSourceRef.current?.close();
-      lifecycleSourceRef.current = null;
     };
   }, []);
 
@@ -913,7 +764,6 @@ function PerformanceCard({ inst, onOpenSettings }: { inst: EnrichedInstance; onO
       if (!alive || requestId !== operationRequestRef.current) return true;
       if (status && isPerformanceOperationComplete(status)) {
         setLifecycleOperation(null);
-        setLifecycleProgress(null);
         return true;
       }
       setLifecycleOperation(status);
@@ -987,199 +837,14 @@ function PerformanceCard({ inst, onOpenSettings }: { inst: EnrichedInstance; onO
     };
   }, [inst.id, fetchPerformanceProgram]);
 
-  const saveMemory = async (nextMem: number): Promise<void> => {
-    const clampedMem = clampMemoryGb(nextMem, RAM_MIN, ramMax);
-    if (clampedMem === savedRef.current) return;
-    const requestId = saveRequestRef.current + 1;
-    saveRequestRef.current = requestId;
-    setSaving(true);
-    try {
-      const res: any = await api('PUT', `/instances/${encodeURIComponent(inst.id)}`, { max_memory_mb: Math.round(clampedMem * 1024) });
-      if (res?.error) throw new Error(res.error);
-      if (requestId !== saveRequestRef.current) return;
-      savedRef.current = clampedMem;
-      updateInstanceInList(res);
-    } catch (err) {
-      if (requestId !== saveRequestRef.current) return;
-      toast(`Failed: ${errMessage(err)}`, 'error');
-    } finally {
-      if (requestId === saveRequestRef.current) setSaving(false);
-    }
-  };
-
-  const scheduleSaveMemory = (nextMem: number): void => {
-    const clampedMem = clampMemoryGb(nextMem, RAM_MIN, ramMax);
-    setMaxMem(clampedMem);
-    if (saveTimerRef.current !== null) window.clearTimeout(saveTimerRef.current);
-    saveTimerRef.current = window.setTimeout(() => {
-      saveTimerRef.current = null;
-      void saveMemory(clampedMem);
-    }, 350);
-  };
-
-  const commitMemory = (nextMem: number): void => {
-    if (saveTimerRef.current !== null) {
-      window.clearTimeout(saveTimerRef.current);
-      saveTimerRef.current = null;
-    }
-    void saveMemory(nextMem);
-  };
-
-  const waitForPerformanceInstall = (installId: string): Promise<void> => {
-    return new Promise((resolve, reject) => {
-      let settled = false;
-      lifecycleSourceRef.current?.close();
-      let source: LifecycleProgressSource | null = null;
-      const controller: LifecycleProgressSource & {
-        closed: boolean;
-        isActive(): boolean;
-        setSource(nextSource: LifecycleProgressSource): void;
-      } = {
-        closed: false,
-        close() {
-          if (this.closed) return;
-          this.closed = true;
-          source?.close();
-        },
-        isActive() {
-          return !this.closed && lifecycleSourceRef.current === this;
-        },
-        setSource(nextSource) {
-          if (this.closed) {
-            nextSource.close();
-            return;
-          }
-          source = nextSource;
-        },
-      };
-      lifecycleSourceRef.current = controller;
-
-      const finish = (error?: Error): void => {
-        if (settled) return;
-        settled = true;
-        controller.close();
-        if (lifecycleSourceRef.current === controller) lifecycleSourceRef.current = null;
-        if (error) reject(error);
-        else resolve();
-      };
-
-      const onProgress = (progress: PerformanceInstallProgress): void => {
-        if (!controller.isActive()) return;
-        setLifecycleProgress({
-          title: performanceProgressTitle(progress),
-          detail: performanceProgressDetail(progress),
-        });
-        if (progress.phase === 'error' || progress.error) {
-          finish(new Error(progress.error || 'Performance update failed'));
-        } else if (progress.done) {
-          finish();
-        }
-      };
-
-      if (hasNativeDesktopRuntime()) {
-        void (async () => {
-          try {
-            const subscription = await onNativeEvent(nativeInstallEventName(installId), (data) => {
-              onProgress(data as PerformanceInstallProgress);
-            });
-            if (!subscription) throw new Error('native install stream unavailable');
-            controller.setSource(subscription);
-            if (!controller.isActive()) return;
-            await startNativeInstallEvents(installId);
-          } catch (err) {
-            if (!controller.isActive()) return;
-            finish(err instanceof Error ? err : new Error(errMessage(err)));
-          }
-        })();
-        return;
-      }
-
-      const es = new EventSource(apiUrl(`/install/${encodeURIComponent(installId)}/events`));
-      controller.setSource(es);
-
-      es.addEventListener('progress', (event: MessageEvent) => {
-        try {
-          onProgress(JSON.parse(event.data) as PerformanceInstallProgress);
-        } catch {
-          finish(new Error('Performance update stream sent invalid progress data'));
-        }
-      });
-
-      es.onerror = () => {
-        if (settled || !controller.isActive() || es.readyState !== EventSource.CLOSED) return;
-        finish(new Error('Performance update stream closed unexpectedly'));
-      };
-    });
-  };
-
-  const runLifecycleAction = async (action: PerformanceLifecycleAction): Promise<void> => {
-    if (lifecycleBusy) return;
-    setLifecycleBusy(true);
-    setLifecycleOperation(null);
-    setLifecycleProgress({
-      title: 'Bundle queued',
-      detail: 'Waiting to update managed performance files.',
-    });
-    try {
-      const body: Record<string, string | boolean> = {
-        instance_id: inst.id,
-        mode: effectiveMode.mode,
-        queued: true,
-      };
-      if (action.action === 'remove') {
-        body.action = 'remove';
-      } else {
-        body.game_version = planGameVersion(version, inst);
-        body.loader = planLoader(version, inst);
-      }
-      const res: any = await api('POST', '/performance/install', body);
-      if (res?.error) throw new Error(res.error);
-      const installResult = res as PerformanceInstallResponse;
-      if (installResult.install_id) {
-        await waitForPerformanceInstall(installResult.install_id);
-      } else {
-        setProgram(current => ({
-          status: 'ready',
-          plan: current.plan,
-          health: installResponseAsHealth(installResult),
-        }));
-      }
-      const refreshed = await fetchPerformanceProgram();
-      setProgram({ status: 'ready', ...refreshed });
-      toast(action.action === 'remove' ? 'Managed bundle removed' : 'Managed bundle updated');
-    } catch (err) {
-      const message = errMessage(err);
-      setProgram(current => ({
-        status: 'error',
-        plan: current.plan,
-        health: current.health,
-        error: message,
-      }));
-      toast(`Performance update failed: ${message}`, 'error');
-    } finally {
-      setLifecycleBusy(false);
-      setLifecycleProgress(null);
-    }
-  };
-
-  const preset = inferPreset(maxMem, memoryProfile.presets);
-  const highStart = Math.min(ramMax, Math.max(recMax, Math.round(ramMax * 0.75)));
-  const memoryZones: SliderZone[] = [
-    { from: RAM_MIN, to: recMin, tone: 'low', label: 'Low' },
-    { from: recMin, to: recMax, tone: 'sweet', label: 'Sweet spot' },
-    { from: recMax, to: highStart, tone: 'high', label: 'High' },
-    { from: highStart, to: ramMax, tone: 'extreme', label: 'Extreme' },
-  ];
-  const lifecycleAction = performanceLifecycleAction(effectiveMode.mode, program.health);
   const baseSummary = performanceSummary(program, effectiveMode.mode);
   const operationProgress = lifecycleOperation ? operationStatusAsProgress(lifecycleOperation) : null;
-  const operationActive = lifecycleOperation ? !isPerformanceOperationTerminal(lifecycleOperation) : false;
-  const visibleLifecycleProgress = lifecycleProgress ?? (operationProgress
+  const visibleLifecycleProgress = operationProgress
     ? {
       title: performanceProgressTitle(operationProgress),
       detail: performanceProgressDetail(operationProgress),
     }
-    : null);
+    : null;
   const summary = visibleLifecycleProgress
     ? {
       tone: operationProgress?.phase === 'error'
@@ -1188,20 +853,18 @@ function PerformanceCard({ inst, onOpenSettings }: { inst: EnrichedInstance; onO
           ? 'ok' as const
           : 'mute' as const,
       title: visibleLifecycleProgress.title || 'Updating bundle',
-      detail: visibleLifecycleProgress.detail || (lifecycleAction?.action === 'remove'
-        ? 'Croopor is removing managed performance files.'
-        : 'Croopor is applying managed performance files.'),
+      detail: visibleLifecycleProgress.detail || 'Croopor is updating managed performance files.',
     }
     : baseSummary;
   const summaryIcon = performanceSummaryIcon(summary.tone);
+  const planTier = program.plan ? compositionTierLabel(program.plan.tier) : performanceModeLabel(effectiveMode.mode);
+  const managedCount = program.plan?.mods?.length ?? program.health?.installed_count ?? 0;
+  const runtimeLabel = inst.java_major ? `Java ${inst.java_major} detected` : 'Managed Java detection';
 
   return (
     <Card padding={18}>
       <div class="cp-od-head">
         <h3>Performance</h3>
-        <button class="cp-od-link" type="button" onClick={onOpenSettings}>
-          Settings <Icon name="chevron-right" size={11} stroke={2.2} />
-        </button>
       </div>
 
       <div class="cp-od-perf-summary" data-tone={summary.tone} aria-live="polite">
@@ -1212,63 +875,25 @@ function PerformanceCard({ inst, onOpenSettings }: { inst: EnrichedInstance; onO
           <strong>{summary.title}</strong>
           <span>{summary.detail}</span>
         </div>
-        {lifecycleAction && (
-          <Button
-            variant="secondary"
-            size="sm"
-            icon={lifecycleBusy || operationActive ? 'refresh' : lifecycleAction.icon}
-            disabled={lifecycleBusy || operationActive || program.status === 'loading'}
-            onClick={() => void runLifecycleAction(lifecycleAction)}
-          >
-            {lifecycleBusy || operationActive ? lifecycleAction.busyLabel : lifecycleAction.label}
-          </Button>
-        )}
       </div>
 
-      <div class="cp-od-perf-row">
-        <span class="cp-od-perf-key">Memory allocation</span>
-        <span class="cp-od-perf-val" aria-live="polite">{fmtMem(maxMem)}</span>
-      </div>
-      <div class="cp-od-perf-slider">
-        <Slider
-          value={maxMem}
-          min={RAM_MIN}
-          max={ramMax}
-          step={0.5}
-          zones={memoryZones}
-          sound="memory"
-          onChange={scheduleSaveMemory}
-          onCommit={commitMemory}
-          ariaLabel="Memory allocation in gigabytes"
-        />
-      </div>
-
-      <div class="cp-od-perf-preset-row">
-        <span class="cp-od-perf-key">Preset</span>
-        <div class="cp-mini-seg" role="radiogroup" aria-label="Performance preset">
-          {memoryProfile.presets.map(p => (
-            <button
-              key={p.id}
-              type="button"
-              role="radio"
-              aria-checked={preset === p.id}
-              data-active={preset === p.id}
-              onClick={() => {
-                const next = p.value;
-                setMaxMem(next);
-                commitMemory(next);
-              }}
-            >
-              {p.id[0].toUpperCase() + p.id.slice(1)}
-            </button>
-          ))}
+      <div class="cp-od-perf-facts">
+        <div class="cp-od-perf-row">
+          <span class="cp-od-perf-key">Mode</span>
+          <span class="cp-od-perf-val">{performanceModeLabel(effectiveMode.mode)} ({modeSourceLabel})</span>
         </div>
-      </div>
-
-      <div class="cp-od-perf-runtime">
-        <span class="cp-od-perf-runtime-mark"><Icon name="check" size={12} stroke={2.6} /></span>
-        <span class="cp-od-perf-runtime-text">{inst.java_major ? `Java ${inst.java_major} detected` : 'Auto-detect Java runtime'}</span>
-        <button class="cp-od-link" type="button" onClick={onOpenSettings}>Change</button>
+        <div class="cp-od-perf-row">
+          <span class="cp-od-perf-key">Memory</span>
+          <span class="cp-od-perf-val">{fmtMem(minMem)} to {fmtMem(maxMem)}</span>
+        </div>
+        <div class="cp-od-perf-row">
+          <span class="cp-od-perf-key">Plan evidence</span>
+          <span class="cp-od-perf-val">{planTier}, {managedCount} managed mod{managedCount === 1 ? '' : 's'}</span>
+        </div>
+        <div class="cp-od-perf-runtime">
+          <span class="cp-od-perf-runtime-mark"><Icon name="check" size={12} stroke={2.6} /></span>
+          <span class="cp-od-perf-runtime-text">{runtimeLabel}</span>
+        </div>
       </div>
     </Card>
   );
@@ -1501,7 +1126,7 @@ function OverviewPane({ inst, resources, running, onLaunch, onStop, onOpenWorlds
   return (
     <div class="cp-instance-body cp-instance-body--overview-bento">
       <div class="cp-od-stagger cp-od-slot cp-od-slot--performance" style={{ '--cp-od-delay': '0ms' } as any}>
-        <PerformanceCard inst={inst} onOpenSettings={onOpenSettings} />
+        <PerformanceCard inst={inst} />
       </div>
       <div class="cp-od-stagger cp-od-slot cp-od-slot--guardian" style={{ '--cp-od-delay': '40ms' } as any}>
         <GuardianPreflightCard inst={inst} onOpenSettings={onOpenSettings} />

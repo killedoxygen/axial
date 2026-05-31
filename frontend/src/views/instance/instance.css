@@ -618,10 +618,7 @@
     margin-bottom: 10px;
   }
   .cp-instance-body--overview-bento .cp-od-perf-row {
-    margin-bottom: 7px;
-  }
-  .cp-instance-body--overview-bento .cp-od-perf-slider {
-    margin-bottom: 7px;
+    margin-bottom: 0;
   }
   .cp-instance-body--overview-bento .cp-od-perf-runtime {
     margin-top: 10px;
@@ -840,10 +837,10 @@
   margin-top: 2px;
 }
 
-/* ─── Performance — RAM slider, presets, runtime line. ──────────────── */
+/* ─── Performance — read-only plan, memory, and runtime evidence. ───── */
 .cp-od-perf-summary {
   display: grid;
-  grid-template-columns: 22px minmax(0, 1fr) auto;
+  grid-template-columns: 22px minmax(0, 1fr);
   align-items: center;
   gap: 10px;
   margin-bottom: 12px;
@@ -894,20 +891,18 @@
   font-size: 11.5px;
   line-height: 1.35;
 }
-.cp-od-perf-summary .cp-btn {
-  align-self: center;
-  min-width: 78px;
-  white-space: nowrap;
+.cp-od-perf-facts {
+  display: grid;
+  gap: 0;
 }
-.cp-od-perf-row,
-.cp-od-perf-preset-row {
+.cp-od-perf-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 14px;
+  min-height: 28px;
+  border-top: 1px solid oklch(1 0 0 / 0.04);
 }
-.cp-od-perf-row { margin-bottom: 8px; }
-.cp-od-perf-preset-row { /* padding: 12px 0; margin-top: 12px; */ }
 .cp-od-perf-key {
   font-size: 12.5px;
   color: var(--text-dim);
@@ -919,15 +914,7 @@
   color: var(--text);
   font-variant-numeric: tabular-nums;
   letter-spacing: -0.2px;
-}
-
-.cp-od-perf-slider {
-  margin-bottom: 8px;
-}
-
-.cp-od-perf-preset-row .cp-mini-seg {
-  background: var(--surface);
-  border: 1px solid var(--line);
+  text-align: right;
 }
 
 .cp-od-perf-runtime {
@@ -1428,11 +1415,6 @@
 @media (max-width: 640px) {
   .cp-od-perf-summary {
     grid-template-columns: 22px minmax(0, 1fr);
-  }
-  .cp-od-perf-summary .cp-btn {
-    grid-column: 2;
-    justify-self: start;
-    min-width: 0;
   }
   .cp-instance-page {
     --cp-instance-dock-pad: 18px;
