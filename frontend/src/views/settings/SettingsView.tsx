@@ -16,6 +16,7 @@ import { errMessage, fmtMem, getMemoryRecommendation, validateUsername } from '.
 import type {
   BenchmarkMatrixResponse,
   BenchmarkQualificationPreviewResponse,
+  BenchmarkQualificationResponse,
   BenchmarkQualificationTargetEvidencePreview,
   BenchmarkSuiteDriverResponse,
   BenchmarkSuiteDriverStatus,
@@ -286,6 +287,13 @@ type BenchmarkDriversState =
   | { status: 'ready'; data: BenchmarkSuiteDriverResponse[]; error?: undefined }
   | { status: 'error'; data: BenchmarkSuiteDriverResponse[]; error: string };
 
+type BenchmarkQualificationRowCheckState =
+  | { status: 'loading'; data: BenchmarkQualificationResponse | null; error?: undefined }
+  | { status: 'ready'; data: BenchmarkQualificationResponse; error?: undefined }
+  | { status: 'error'; data: BenchmarkQualificationResponse | null; error: string };
+
+type BenchmarkQualificationRowChecks = Record<string, BenchmarkQualificationRowCheckState>;
+
 const BENCHMARK_SUITE_DEFAULT_MODE = 'development';
 const BENCHMARK_SUITE_DRIVER_DEFAULT_INTERVAL_SECONDS = 30;
 const BENCHMARK_SUITE_DRIVER_MIN_INTERVAL_SECONDS = 5;
@@ -394,6 +402,13 @@ function qualificationTargetLabel(target: BenchmarkQualificationPreviewResponse[
   return `${family}, ${loader}, ${version}, ${mode}`;
 }
 
+function normalizeBenchmarkQualification(response: BenchmarkQualificationResponse): BenchmarkQualificationResponse {
+  return {
+    ...response,
+    targets: Array.isArray(response.targets) ? response.targets : [],
+  };
+}
+
 function outcomeTone(outcome: string): 'neutral' | 'ok' | 'warn' | 'err' {
   const normalized = outcome.toLowerCase();
   if (normalized === 'running' || normalized === 'completed' || normalized === 'exited') return 'ok';
@@ -460,6 +475,12 @@ function qualificationSuiteLabel(target: BenchmarkQualificationTargetEvidencePre
   return state;
 }
 
+function qualificationSuitePresent(suite: BenchmarkQualificationResponse['suite'] | undefined): boolean {
+  if (!suite || suite.present === false) return false;
+  if (suite.present === true) return true;
+  return Boolean(suite.suite_id || suite.mode || typeof suite.run_count === 'number');
+}
+
 function qualificationProofLabel(target: BenchmarkQualificationTargetEvidencePreview): string {
   const proof = target.proof;
   if (!proof?.present) return 'Proof missing';
@@ -474,6 +495,68 @@ function qualificationMissingLabel(target: BenchmarkQualificationTargetEvidenceP
   const count = Array.isArray(target.missing) ? target.missing.length : 0;
   if (count === 0) return 'Complete';
   return `${count} missing`;
+}
+
+function qualificationStatusLabel(status: BenchmarkQualificationResponse['status']): string {
+  return status === 'ready' ? 'Ready' : 'Incomplete';
+}
+
+function qualificationStatusTone(status: BenchmarkQualificationResponse['status']): 'ok' | 'warn' {
+  return status === 'ready' ? 'ok' : 'warn';
+}
+
+function isReleaseValidationMode(value: string | undefined): boolean {
+  return value?.trim().toLowerCase() === 'release_validation';
+}
+
+function safeQualificationErrorMessage(err: unknown): string {
+  const message = errMessage(err).toLowerCase();
+  if (message.includes('404') || message.includes('not found') || message.includes('missing')) {
+    return 'Suite evidence was not found.';
+  }
+  if (message.includes('network') || message.includes('fetch') || message.includes('failed to fetch')) {
+    return 'Qualification service is unreachable.';
+  }
+  if (message.includes('timeout') || message.includes('timed out')) {
+    return 'Qualification check timed out.';
+  }
+  return 'Qualification check failed.';
+}
+
+function qualificationMissingTokenLabel(value: string): string {
+  const cleaned = value.replace(/[^a-zA-Z0-9 _-]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!cleaned) return 'Evidence';
+  return labelFromToken(cleaned.slice(0, 40), 'Evidence');
+}
+
+function qualificationMissingSummary(qualification: BenchmarkQualificationResponse): string {
+  const missing = qualification.targets.flatMap((target) => Array.isArray(target.missing) ? target.missing : []);
+  if (missing.length === 0) return 'No missing evidence';
+  const labels = Array.from(new Set(missing.map(qualificationMissingTokenLabel))).slice(0, 2);
+  const suffix = missing.length > labels.length ? `, +${missing.length - labels.length}` : '';
+  return `${missing.length} missing: ${labels.join(', ')}${suffix}`;
+}
+
+function qualificationSuiteSummary(qualification: BenchmarkQualificationResponse): string {
+  const suite = qualification.suite;
+  if (!qualificationSuitePresent(suite)) return 'Suite missing';
+  const mode = suite.mode ? labelFromToken(suite.mode, 'Suite') : 'Suite present';
+  if (typeof suite.run_count === 'number') return `${mode}, ${suite.run_count} runs`;
+  return mode;
+}
+
+function qualificationEvidenceSummary(qualification: BenchmarkQualificationResponse): string {
+  const rows = qualification.targets;
+  if (rows.length === 0) return 'No target evidence';
+  const roles = ['baseline', 'managed'];
+  const selected = roles
+    .map((role) => rows.find((target) => target.role.toLowerCase() === role))
+    .filter((target): target is BenchmarkQualificationTargetEvidencePreview => Boolean(target));
+  const fallback = selected.length > 0 ? selected : rows.slice(0, 2);
+  return fallback
+    .slice(0, 2)
+    .map((target) => `${labelFromToken(target.role, 'Target')}: ${qualificationSuiteLabel(target)}, ${qualificationProofLabel(target)}`)
+    .join(' · ');
 }
 
 function preferredBenchmarkInstanceId(
@@ -868,7 +951,7 @@ function BenchmarkQualificationPreviewBlock({ state }: { state: BenchmarkQualifi
             <div>
               <span>Suite</span>
               <strong>
-                {preview.suite?.present
+                {qualificationSuitePresent(preview.suite)
                   ? `${labelFromToken(preview.suite.mode, 'Suite present')}, ${preview.suite.run_count ?? 0} runs`
                   : 'Suite evidence missing'}
               </strong>
@@ -919,6 +1002,7 @@ function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: BenchmarkMat
   const [driversState, setDriversState] = useState<BenchmarkDriversState>({ status: 'loading', data: [] });
   const [stoppingIds, setStoppingIds] = useState<Set<string>>(() => new Set());
   const [resumingIds, setResumingIds] = useState<Set<string>>(() => new Set());
+  const [qualificationChecks, setQualificationChecks] = useState<BenchmarkQualificationRowChecks>({});
   const instanceRows = instances.value;
   const preferredInstanceId = preferredBenchmarkInstanceId(instanceRows, selectedInstanceId.value, lastInstanceId.value);
   const suiteModes = useMemo(() => {
@@ -930,6 +1014,7 @@ function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: BenchmarkMat
   const [intervalSeconds, setIntervalSeconds] = useState(String(BENCHMARK_SUITE_DRIVER_DEFAULT_INTERVAL_SECONDS));
   const [starting, setStarting] = useState(false);
   const requestRef = useRef(0);
+  const qualificationRequestRef = useRef<Record<string, number>>({});
   const aliveRef = useRef(true);
 
   useEffect(() => {
@@ -1025,6 +1110,34 @@ function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: BenchmarkMat
         next.delete(id);
         return next;
       });
+    }
+  };
+
+  const checkFamilyCQualification = async (driverId: string, suiteId: string): Promise<void> => {
+    const requestId = (qualificationRequestRef.current[driverId] ?? 0) + 1;
+    qualificationRequestRef.current[driverId] = requestId;
+    setQualificationChecks((prev) => ({
+      ...prev,
+      [driverId]: { status: 'loading', data: prev[driverId]?.data ?? null },
+    }));
+    try {
+      const res = await api('GET', `/launch/benchmark/qualification/family-c-1-12-2/${encodeURIComponent(suiteId)}`);
+      if (res?.error) throw new Error(res.error);
+      if (!aliveRef.current || qualificationRequestRef.current[driverId] !== requestId) return;
+      setQualificationChecks((prev) => ({
+        ...prev,
+        [driverId]: { status: 'ready', data: normalizeBenchmarkQualification(res as BenchmarkQualificationResponse) },
+      }));
+    } catch (err) {
+      if (!aliveRef.current || qualificationRequestRef.current[driverId] !== requestId) return;
+      setQualificationChecks((prev) => ({
+        ...prev,
+        [driverId]: {
+          status: 'error',
+          data: prev[driverId]?.data ?? null,
+          error: safeQualificationErrorMessage(err),
+        },
+      }));
     }
   };
 
@@ -1177,8 +1290,12 @@ function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: BenchmarkMat
             const driver = row.driver;
             const suite = row.suite;
             const state = driver.state || row.status || 'unknown';
-            const suiteId = suite.suite_id || driver.suite_id || 'Unknown suite';
+            const rawSuiteId = suite.suite_id || driver.suite_id;
+            const suiteId = rawSuiteId || 'Unknown suite';
             const mode = suite.mode || driver.mode;
+            const checkState = qualificationChecks[driver.id];
+            const canCheckQualification = Boolean(driver.id && rawSuiteId && isReleaseValidationMode(mode));
+            const checkingQualification = checkState?.status === 'loading';
             const canStop = Boolean(driver.id) && !isTerminalDriverState(state);
             const canResume = Boolean(driver.id) && isRestartableDriverState(state);
             const stopping = stoppingIds.has(driver.id);
@@ -1208,6 +1325,17 @@ function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: BenchmarkMat
                   {!driver.active_session_id && !driver.last_session_id && <span>No session yet</span>}
                 </div>
                 <div class="cp-settings-driver-control">
+                  {canCheckQualification && (
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      icon="shield-check"
+                      disabled={checkingQualification}
+                      onClick={() => void checkFamilyCQualification(driver.id, rawSuiteId as string)}
+                    >
+                      {checkingQualification ? 'Checking' : 'Check'}
+                    </Button>
+                  )}
                   {canResume && (
                     <Button
                       variant="secondary"
@@ -1231,6 +1359,32 @@ function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: BenchmarkMat
                     </Button>
                   )}
                 </div>
+                {checkState && (
+                  <div class="cp-settings-driver-qualification">
+                    {checkState.status === 'loading' && (
+                      <>
+                        <Pill tone="info">Checking</Pill>
+                        <span>Reading Family C suite evidence.</span>
+                      </>
+                    )}
+                    {checkState.status === 'error' && (
+                      <>
+                        <Pill tone="err">Unavailable</Pill>
+                        <span>{checkState.error}</span>
+                      </>
+                    )}
+                    {checkState.status === 'ready' && (
+                      <>
+                        <Pill tone={qualificationStatusTone(checkState.data.status)}>
+                          {qualificationStatusLabel(checkState.data.status)}
+                        </Pill>
+                        <span>{qualificationMissingSummary(checkState.data)}</span>
+                        <span>{qualificationSuiteSummary(checkState.data)}</span>
+                        <span>{qualificationEvidenceSummary(checkState.data)}</span>
+                      </>
+                    )}
+                  </div>
+                )}
               </div>
             );
           })}
@@ -1321,10 +1475,7 @@ function PerformanceSection(): JSX.Element {
         const preview = res as BenchmarkQualificationPreviewResponse;
         setQualificationPreview({
           status: 'ready',
-          data: {
-            ...preview,
-            targets: Array.isArray(preview.targets) ? preview.targets : [],
-          },
+          data: normalizeBenchmarkQualification(preview),
         });
       })
       .catch((err) => {

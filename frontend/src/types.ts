@@ -508,6 +508,8 @@ export interface BenchmarkQualificationPreviewResponse {
   targets: BenchmarkQualificationTargetEvidencePreview[];
 }
 
+export type BenchmarkQualificationResponse = BenchmarkQualificationPreviewResponse;
+
 export interface BenchmarkSuiteDriverStatus {
   id: string;
   state: string;

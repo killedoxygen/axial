@@ -762,8 +762,28 @@
 .cp-settings-driver-control {
   min-width: 92px;
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   justify-content: flex-end;
+}
+.cp-settings-driver-qualification {
+  grid-column: 1 / -1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 5px 10px;
+  flex-wrap: wrap;
+  padding-top: 7px;
+  color: var(--text-dim);
+  font-size: 11.5px;
+  line-height: 1.35;
+}
+.cp-settings-driver-qualification span {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 @media (max-width: 1160px) {
   .cp-settings-driver-start {
@@ -790,6 +810,9 @@
     grid-column: 3;
     grid-row: 1;
   }
+  .cp-settings-driver-qualification {
+    grid-row: 3;
+  }
 }
 @media (max-width: 980px) {
   .cp-settings-driver-row {
@@ -811,6 +834,10 @@
     grid-column: 2;
     grid-row: 1 / 4;
     align-self: start;
+    max-width: 180px;
+  }
+  .cp-settings-driver-qualification {
+    grid-row: 4;
   }
 }
 /* Toggle ----------------------------------------------------------------- */
