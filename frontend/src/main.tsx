@@ -11,6 +11,7 @@ import { Sound, bindButtonSounds } from './sound';
 import { Music } from './music';
 import { getNativeAppVersion } from './native';
 import { scheduleAutoUpdateCheck } from './updater';
+import { toast } from './toast';
 import { errMessage } from './utils';
 import { restoreRoute, showOnboardingOverlay, showSetupOverlay } from './ui-state';
 
@@ -71,6 +72,11 @@ async function init(): Promise<void> {
     Music.applyConfig(configRes);
     bootstrapError.value = null;
     bootstrapState.value = 'ready';
+
+    const startupWarning = statusRes?.warnings?.[0];
+    if (typeof startupWarning === 'string' && startupWarning.trim()) {
+      toast(startupWarning, 'info');
+    }
 
     if (configRes && configRes.onboarding_done === false) {
       showOnboardingOverlay.value = true;

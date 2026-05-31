@@ -129,7 +129,7 @@ fn load_config_for_startup(data: &str) -> Result<(AppConfig, Vec<String>), Confi
             Ok((
                 config,
                 vec![
-                    "Invalid config launch_auth_mode at startup; using offline mode in memory."
+                    "Croopor ignored an invalid launch auth setting for this session and is using Offline mode."
                         .to_string(),
                 ],
             ))
@@ -238,7 +238,7 @@ mod tests {
         assert_eq!(
             loaded.warnings,
             vec![
-                "Invalid config launch_auth_mode at startup; using offline mode in memory."
+                "Croopor ignored an invalid launch auth setting for this session and is using Offline mode."
                     .to_string()
             ]
         );

@@ -885,7 +885,7 @@ export interface LocalPrefs {
   dismissedUpdateVersion: string;
 }
 
-export type ToastKind = 'success' | 'error';
+export type ToastKind = 'success' | 'error' | 'info';
 
 export interface ToastItem {
   id: number;
