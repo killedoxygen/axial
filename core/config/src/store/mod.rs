@@ -15,6 +15,8 @@ pub struct ConfigStartupLoad {
     pub warnings: Vec<String>,
 }
 
+const CONFIG_STARTUP_WARNING: &str = "Croopor could not load settings, so it started with safe defaults. Check app data permissions or restore the settings file.";
+
 #[derive(Debug, Error)]
 pub enum ConfigStoreError {
     #[error("failed to read config: {0}")]
@@ -63,11 +65,21 @@ impl ConfigStore {
 
     pub fn load_for_startup(paths: AppPaths) -> Result<ConfigStartupLoad, ConfigStoreError> {
         let (config, warnings) = match fs::read_to_string(&paths.config_file) {
-            Ok(data) => load_config_for_startup(&data)?,
+            Ok(data) => match load_config_for_startup(&data) {
+                Ok(loaded) => loaded,
+                Err(ConfigStoreError::Parse(_)) => (
+                    AppConfig::default(),
+                    vec![CONFIG_STARTUP_WARNING.to_string()],
+                ),
+                Err(error) => return Err(error),
+            },
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 (AppConfig::default(), Vec::new())
             }
-            Err(error) => return Err(ConfigStoreError::Read(error)),
+            Err(_) => (
+                AppConfig::default(),
+                vec![CONFIG_STARTUP_WARNING.to_string()],
+            ),
         };
 
         Ok(ConfigStartupLoad {
@@ -246,6 +258,69 @@ mod tests {
             fs::read_to_string(&paths.config_file).expect("config file should remain readable"),
             data
         );
+
+        cleanup(&paths.config_dir);
+    }
+
+    #[test]
+    fn load_for_startup_uses_default_config_and_warning_for_malformed_config_without_rewriting() {
+        let paths = test_paths("startup-malformed-config");
+        fs::create_dir_all(&paths.config_dir).expect("should create temp config dir");
+        let malformed = "{not valid json";
+        fs::write(&paths.config_file, malformed).expect("should write malformed config");
+
+        let loaded = ConfigStore::load_for_startup(paths.clone())
+            .expect("startup load should tolerate malformed config");
+
+        assert_eq!(loaded.store.current(), AppConfig::default());
+        assert_eq!(
+            loaded.warnings,
+            vec![super::CONFIG_STARTUP_WARNING.to_string()]
+        );
+        assert_eq!(
+            fs::read_to_string(&paths.config_file).expect("config file should remain readable"),
+            malformed
+        );
+        assert!(matches!(
+            ConfigStore::load_from(paths.clone()),
+            Err(ConfigStoreError::Parse(_))
+        ));
+
+        cleanup(&paths.config_dir);
+    }
+
+    #[test]
+    fn load_for_startup_uses_default_config_and_warning_for_config_read_error() {
+        let paths = test_paths("startup-config-read-error");
+        fs::create_dir_all(&paths.config_file).expect("should create config path as directory");
+
+        let loaded = ConfigStore::load_for_startup(paths.clone())
+            .expect("startup load should tolerate config read error");
+
+        assert_eq!(loaded.store.current(), AppConfig::default());
+        assert_eq!(
+            loaded.warnings,
+            vec![super::CONFIG_STARTUP_WARNING.to_string()]
+        );
+        assert!(paths.config_file.is_dir());
+        assert!(matches!(
+            ConfigStore::load_from(paths.clone()),
+            Err(ConfigStoreError::Read(_))
+        ));
+
+        cleanup(&paths.config_dir);
+    }
+
+    #[test]
+    fn load_for_startup_uses_default_config_without_warning_when_config_is_missing() {
+        let paths = test_paths("startup-missing-config");
+
+        let loaded = ConfigStore::load_for_startup(paths.clone())
+            .expect("missing config should load for startup");
+
+        assert_eq!(loaded.store.current(), AppConfig::default());
+        assert!(loaded.warnings.is_empty());
+        assert!(!paths.config_file.exists());
 
         cleanup(&paths.config_dir);
     }
