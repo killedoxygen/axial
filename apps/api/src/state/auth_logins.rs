@@ -928,6 +928,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auth_login_store_clears_blank_msa_token_secure_auth_snapshot_on_restore() {
+        let now = Utc::now();
+        let token = AuthLoginMsaToken {
+            login_id: "msa-blank-token".to_string(),
+            access_token: "msa-access-token".to_string(),
+            refresh_token: None,
+            id_token: None,
+            token_type: "Bearer".to_string(),
+            expires_in: 3600,
+            scope: None,
+            authenticated_at: now,
+            expires_at: now + chrono::Duration::seconds(3600),
+        };
+        let snapshot = persisted_snapshot_with_string_field(
+            test_persisted_snapshot(&token, None),
+            &["active_msa_token", "access_token"],
+            "   ",
+        );
+        let persistence = Arc::new(MockAuthSnapshotPersistence::with_snapshot(snapshot));
+
+        let store = AuthLoginStore::with_persistence(persistence.clone());
+
+        assert_eq!(store.active_msa_token().await, None);
+        assert_eq!(persistence.snapshot(), None);
+        assert_eq!(persistence.deletes(), 1);
+    }
+
+    #[tokio::test]
+    async fn auth_login_store_clears_blank_minecraft_snapshot_on_restore() {
+        let now = Utc::now();
+        let token = AuthLoginMsaToken {
+            login_id: "msa-blank-minecraft".to_string(),
+            access_token: "msa-access-token".to_string(),
+            refresh_token: None,
+            id_token: None,
+            token_type: "Bearer".to_string(),
+            expires_in: 3600,
+            scope: None,
+            authenticated_at: now,
+            expires_at: now + chrono::Duration::seconds(3600),
+        };
+        let account = AuthLoginMinecraftAccount {
+            login_id: "msa-blank-minecraft".to_string(),
+            access_token: "minecraft-access-token".to_string(),
+            token_type: Some("Bearer".to_string()),
+            expires_in: 3600,
+            profile: test_profile("BlankMinecraft"),
+            owns_minecraft_java: true,
+            authenticated_at: now,
+            expires_at: now + chrono::Duration::seconds(3600),
+        };
+        let snapshot = persisted_snapshot_with_string_field(
+            persisted_snapshot_with_string_field(
+                test_persisted_snapshot(&token, Some(&account)),
+                &["active_minecraft_account", "access_token"],
+                "   ",
+            ),
+            &["active_minecraft_account", "profile", "name"],
+            "   ",
+        );
+        let persistence = Arc::new(MockAuthSnapshotPersistence::with_snapshot(snapshot));
+
+        let store = AuthLoginStore::with_persistence(persistence.clone());
+
+        assert_eq!(store.active_msa_token().await, None);
+        assert_eq!(store.active_minecraft_account().await, None);
+        assert_eq!(persistence.snapshot(), None);
+        assert_eq!(persistence.deletes(), 1);
+    }
+
+    #[tokio::test]
+    async fn auth_login_store_clears_mismatched_login_ids_secure_auth_snapshot_on_restore() {
+        let now = Utc::now();
+        let token = AuthLoginMsaToken {
+            login_id: "msa-login".to_string(),
+            access_token: "msa-access-token".to_string(),
+            refresh_token: None,
+            id_token: None,
+            token_type: "Bearer".to_string(),
+            expires_in: 3600,
+            scope: None,
+            authenticated_at: now,
+            expires_at: now + chrono::Duration::seconds(3600),
+        };
+        let account = AuthLoginMinecraftAccount {
+            login_id: "minecraft-login".to_string(),
+            access_token: "minecraft-access-token".to_string(),
+            token_type: Some("Bearer".to_string()),
+            expires_in: 3600,
+            profile: test_profile("MismatchedLogin"),
+            owns_minecraft_java: true,
+            authenticated_at: now,
+            expires_at: now + chrono::Duration::seconds(3600),
+        };
+        let persistence = Arc::new(MockAuthSnapshotPersistence::with_snapshot(
+            test_persisted_snapshot(&token, Some(&account)),
+        ));
+
+        let store = AuthLoginStore::with_persistence(persistence.clone());
+
+        assert_eq!(store.active_msa_token().await, None);
+        assert_eq!(store.active_minecraft_account().await, None);
+        assert_eq!(persistence.snapshot(), None);
+        assert_eq!(persistence.deletes(), 1);
+    }
+
+    #[tokio::test]
     async fn auth_login_store_persists_secure_auth_snapshot_on_completion() {
         let persistence = Arc::new(MockAuthSnapshotPersistence::default());
         let store = AuthLoginStore::with_persistence(persistence.clone());
@@ -1019,5 +1126,27 @@ mod tests {
                 url: "https://textures.minecraft.net/texture/cape".to_string(),
             }],
         }
+    }
+
+    fn persisted_snapshot_with_string_field(
+        snapshot: PersistedAuthSnapshot,
+        path: &[&str],
+        value: &str,
+    ) -> PersistedAuthSnapshot {
+        let mut serialized = serde_json::to_value(snapshot).expect("serialize persisted snapshot");
+        let mut cursor = &mut serialized;
+
+        for segment in &path[..path.len() - 1] {
+            cursor = cursor
+                .get_mut(*segment)
+                .unwrap_or_else(|| panic!("snapshot field {segment}"));
+        }
+
+        *cursor
+            .get_mut(path[path.len() - 1])
+            .unwrap_or_else(|| panic!("snapshot field {}", path[path.len() - 1])) =
+            serde_json::Value::String(value.to_string());
+
+        serde_json::from_value(serialized).expect("deserialize persisted snapshot")
     }
 }

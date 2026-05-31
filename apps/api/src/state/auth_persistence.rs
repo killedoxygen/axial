@@ -63,6 +63,12 @@ impl PersistedAuthSnapshot {
             .transpose()?;
         if active_minecraft_account
             .as_ref()
+            .is_some_and(|account| account.login_id != active_msa_token.login_id)
+        {
+            return Err(AuthSnapshotRejection::Malformed);
+        }
+        if active_minecraft_account
+            .as_ref()
             .is_some_and(|account| account.expires_at <= now)
         {
             return Err(AuthSnapshotRejection::Expired);
@@ -99,6 +105,10 @@ struct PersistedMsaToken {
 
 impl PersistedMsaToken {
     fn into_active(self) -> Result<AuthLoginMsaToken, AuthSnapshotRejection> {
+        if is_blank(&self.login_id) || is_blank(&self.access_token) || is_blank(&self.token_type) {
+            return Err(AuthSnapshotRejection::Malformed);
+        }
+
         Ok(AuthLoginMsaToken {
             login_id: self.login_id,
             access_token: self.access_token,
@@ -164,6 +174,14 @@ struct PersistedMinecraftAccount {
 
 impl PersistedMinecraftAccount {
     fn into_active(self) -> Result<AuthLoginMinecraftAccount, AuthSnapshotRejection> {
+        if is_blank(&self.login_id)
+            || is_blank(&self.access_token)
+            || is_blank(&self.profile.id)
+            || is_blank(&self.profile.name)
+        {
+            return Err(AuthSnapshotRejection::Malformed);
+        }
+
         Ok(AuthLoginMinecraftAccount {
             login_id: self.login_id,
             access_token: self.access_token,
@@ -295,6 +313,10 @@ impl AuthSnapshotPersistence for SecureAuthSnapshotPersistence {
 
 fn from_timestamp_millis(value: i64) -> Result<DateTime<Utc>, AuthSnapshotRejection> {
     DateTime::from_timestamp_millis(value).ok_or(AuthSnapshotRejection::Malformed)
+}
+
+fn is_blank(value: &str) -> bool {
+    value.trim().is_empty()
 }
 
 #[cfg(test)]
