@@ -22,6 +22,8 @@ const PREWARM_REDUCED_MAX_FILES: usize = 2;
 const PREWARM_REDUCED_MAX_TOTAL_BYTES: u64 = 512 * 1024;
 const PREWARM_REDUCED_MAX_FILE_BYTES: u64 = 128 * 1024;
 const PREWARM_BUFFER_BYTES: usize = 16 * 1024;
+const LIVE_LAUNCH_FAILURE_MAX_CHARS: usize = 180;
+const LIVE_LAUNCH_FAILURE_SAFE_FALLBACK: &str = "Launch failed before Minecraft could start. Detailed diagnostics were hidden because they may contain local paths or secrets.";
 
 pub(super) struct LaunchSuccess {
     pub session_id: String,
@@ -831,11 +833,12 @@ async fn fail_launch(
     healing: Option<croopor_launcher::LaunchHealingSummary>,
     guardian: Option<GuardianSummary>,
 ) -> LaunchRequestError {
+    let public_message = sanitize_live_launch_failure_message(message);
     emit_terminal_failure(
         state,
         session_id,
         failure_class,
-        message,
+        &public_message,
         healing.clone(),
         guardian.clone(),
     )
@@ -844,9 +847,68 @@ async fn fail_launch(
         .await;
     state.sessions().remove(session_id).await;
     LaunchRequestError {
-        message: message.to_string(),
+        message: public_message,
         healing,
         guardian,
+    }
+}
+
+pub(super) fn sanitize_live_launch_failure_message(message: &str) -> String {
+    let single_line = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = single_line.trim();
+    if trimmed.is_empty() || contains_live_launch_unsafe_failure_detail(message) {
+        return LIVE_LAUNCH_FAILURE_SAFE_FALLBACK.to_string();
+    }
+
+    bound_live_launch_failure_message(trimmed)
+}
+
+fn contains_live_launch_unsafe_failure_detail(detail: &str) -> bool {
+    let lower = detail.to_ascii_lowercase();
+    lower.contains("token")
+        || lower.contains("account")
+        || lower.contains("provider")
+        || lower.contains("username")
+        || lower.contains("user")
+        || lower.contains("secret")
+        || lower.contains("password")
+        || lower.contains("sessionid")
+        || lower.contains("clientid")
+        || lower.contains("java.exe")
+        || detail.contains("-X")
+        || detail.contains("-D")
+        || detail.contains("--")
+        || detail.contains('/')
+        || detail.contains('\\')
+        || detail.contains('\n')
+        || detail.contains('\r')
+        || detail.contains("${")
+        || detail.contains('@')
+        || is_token_like_live_launch_value(detail)
+}
+
+fn is_token_like_live_launch_value(value: &str) -> bool {
+    value
+        .split(|ch: char| ch.is_ascii_whitespace())
+        .any(|part| {
+            let parts: Vec<&str> = part.split('.').collect();
+            parts.len() == 3
+                && parts.iter().all(|segment| {
+                    segment.len() >= 8
+                        && segment
+                            .chars()
+                            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+                })
+        })
+}
+
+fn bound_live_launch_failure_message(message: &str) -> String {
+    let mut chars = message.chars();
+    let bounded: String = chars.by_ref().take(LIVE_LAUNCH_FAILURE_MAX_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{bounded}...")
+    } else {
+        bounded
     }
 }
 
@@ -992,8 +1054,13 @@ fn serialize_guardian(guardian: Option<GuardianSummary>) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use croopor_launcher::GuardianMode;
+    use crate::state::{AppStateInit, InstallStore, LaunchEvent, SessionStore};
+    use croopor_config::{AppPaths, ConfigStore, InstanceStore};
+    use croopor_launcher::{GuardianMode, LaunchSessionRecord, SessionId};
+    use croopor_performance::PerformanceManager;
     use std::fs;
+    use std::sync::Arc;
+    use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -1102,6 +1169,76 @@ mod tests {
         );
         assert_eq!(payload["decision"], serde_json::json!("blocked"));
         assert_eq!(payload["details"][0], serde_json::json!(decision.reason));
+    }
+
+    #[tokio::test]
+    async fn fail_launch_sanitizes_public_error_and_terminal_failure_payloads() {
+        let root = unique_test_dir("live-launch-failure");
+        let state = test_app_state(&root);
+        let session_id = "unsafe-live-failure";
+        state.sessions().insert(test_record(session_id)).await;
+        let mut events = state
+            .sessions()
+            .subscribe(session_id)
+            .await
+            .expect("subscribe");
+        let unsafe_message = "prepare failed for /home/alice/.croopor/instances/secret java.exe --accessToken raw-secret-token -Xmx8192M -Dtoken=raw provider_payload=provider-secret account_id=account-secret username=SecretPlayer\nnext command fragment C:\\Users\\Alice\\AppData\\java.exe eyJheader123456789.abcdEFGH12345678.ijklMNOP12345678";
+
+        let error = fail_launch(
+            &state,
+            session_id,
+            None,
+            LaunchFailureClass::Unknown,
+            unsafe_message,
+            None,
+            None,
+        )
+        .await;
+
+        assert_safe_live_launch_failure_text(&error.message);
+        assert!(
+            error
+                .message
+                .contains("Launch failed before Minecraft could start")
+        );
+
+        let log_event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("log event")
+            .expect("log event result");
+        let log_text = match log_event {
+            LaunchEvent::Log(log) => log.text,
+            other => panic!("expected log event, got {other:?}"),
+        };
+        assert_safe_live_launch_failure_text(&log_text);
+        assert!(log_text.contains("Detailed diagnostics were hidden"));
+
+        let status_event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("status event")
+            .expect("status event result");
+        let failure_detail = match status_event {
+            LaunchEvent::Status(status) => {
+                assert_eq!(status.state, "exited");
+                status.failure_detail.expect("failure detail")
+            }
+            other => panic!("expected status event, got {other:?}"),
+        };
+        assert_safe_live_launch_failure_text(&failure_detail);
+        assert!(failure_detail.contains("Detailed diagnostics were hidden"));
+
+        assert!(state.sessions().get(session_id).await.is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn live_launch_failure_sanitizer_keeps_safe_bounded_errors_useful() {
+        let message = "launch plan did not produce a runnable command after preparation completed";
+
+        let sanitized = sanitize_live_launch_failure_message(message);
+
+        assert_eq!(sanitized, message);
+        assert_safe_live_launch_failure_text(&sanitized);
     }
 
     #[test]
@@ -1230,6 +1367,86 @@ mod tests {
             launch_disk_available_mb: Some(16 * 1024),
             launch_disk_headroom_mb: 2048,
             disk_pressure: false,
+        }
+    }
+
+    fn test_app_state(root: &Path) -> AppState {
+        let paths = test_paths(root);
+        let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
+        let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
+        AppState::new(AppStateInit {
+            app_name: "Croopor".to_string(),
+            version: "test".to_string(),
+            config,
+            instances,
+            installs: Arc::new(InstallStore::new()),
+            sessions: Arc::new(SessionStore::new()),
+            performance: Arc::new(PerformanceManager::new().expect("performance manager")),
+            startup_warnings: Vec::new(),
+            frontend_dir: root.join("frontend"),
+        })
+    }
+
+    fn test_paths(root: &Path) -> AppPaths {
+        let config_dir = root.join("config");
+        AppPaths {
+            config_file: config_dir.join("config.json"),
+            instances_file: config_dir.join("instances.json"),
+            instances_dir: config_dir.join("instances"),
+            music_dir: config_dir.join("music"),
+            library_dir: config_dir.join("library"),
+            config_dir,
+        }
+    }
+
+    fn test_record(session_id: &str) -> LaunchSessionRecord {
+        LaunchSessionRecord {
+            session_id: SessionId(session_id.to_string()),
+            instance_id: "instance".to_string(),
+            version_id: "1.21.1".to_string(),
+            launched_at: Some("2026-01-01T00:00:00.000Z".to_string()),
+            benchmark: None,
+            state: LaunchState::Queued,
+            pid: None,
+            process_started_at_ms: None,
+            boot_completed_at_ms: None,
+            boot_duration_ms: None,
+            priority: None,
+            exit_code: None,
+            command: Vec::new(),
+            java_path: None,
+            natives_dir: None,
+            failure: None,
+            healing: None,
+            guardian: None,
+            stages: Vec::new(),
+        }
+    }
+
+    fn assert_safe_live_launch_failure_text(text: &str) {
+        assert!(text.chars().count() <= LIVE_LAUNCH_FAILURE_MAX_CHARS + 3);
+        assert!(!text.contains('\n'));
+        assert!(!text.contains('\r'));
+        for fragment in [
+            "/home/alice",
+            "C:\\Users",
+            "--accessToken",
+            "-Xmx8192M",
+            "-Dtoken",
+            "raw-secret",
+            "provider_payload",
+            "provider-secret",
+            "account_id",
+            "account-secret",
+            "username",
+            "SecretPlayer",
+            "java.exe",
+            "eyJheader123456789",
+        ] {
+            assert!(
+                !text.contains(fragment),
+                "live launch failure leaked fragment {fragment:?}: {text}"
+            );
         }
     }
 

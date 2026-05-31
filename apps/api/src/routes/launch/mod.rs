@@ -924,10 +924,11 @@ fn launch_request_error_response(
     error: runner::LaunchRequestError,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let status = launch_request_error_status(&error);
+    let public_message = runner::sanitize_live_launch_failure_message(&error.message);
     (
         status,
         Json(json!({
-            "error": error.message,
+            "error": public_message,
             "healing": error.healing,
             "guardian": error.guardian,
         })),
@@ -2330,6 +2331,40 @@ mod tests {
             assert_eq!(
                 launch_request_error_response(error).0,
                 StatusCode::INTERNAL_SERVER_ERROR
+            );
+        }
+    }
+
+    #[test]
+    fn launch_request_error_response_sanitizes_public_error_payload() {
+        let response = launch_request_error_response(runner::LaunchRequestError {
+            message: "prepare failed for /home/alice/.croopor --accessToken raw-secret-token -Xmx8192M -Dtoken=raw provider_payload=provider-secret account_id=account-secret username=SecretPlayer\njava.exe C:\\Users\\Alice\\AppData"
+                .to_string(),
+            healing: None,
+            guardian: None,
+        });
+
+        assert_eq!(response.0, StatusCode::INTERNAL_SERVER_ERROR);
+        let message = response.1.0["error"].as_str().expect("error message");
+        assert!(message.contains("Launch failed before Minecraft could start"));
+        for fragment in [
+            "/home/alice",
+            "C:\\Users",
+            "--accessToken",
+            "-Xmx8192M",
+            "-Dtoken",
+            "raw-secret",
+            "provider_payload",
+            "provider-secret",
+            "account_id",
+            "account-secret",
+            "username",
+            "SecretPlayer",
+            "java.exe",
+        ] {
+            assert!(
+                !message.contains(fragment),
+                "launch error response leaked fragment {fragment:?}: {message}"
             );
         }
     }
