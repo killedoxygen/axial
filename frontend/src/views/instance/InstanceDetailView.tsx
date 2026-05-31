@@ -1338,6 +1338,14 @@ function GuardianPreflightCard({ inst, onOpenSettings }: {
   onOpenSettings: () => void;
 }): JSX.Element {
   const cfg = config.value;
+  const version = versions.value.find(v => v.id === inst.version_id);
+  const versionReadinessKey = [
+    version?.launchable ? 'launchable' : 'blocked',
+    version?.installed ? 'installed' : 'missing',
+    version?.needs_install || '',
+    version?.status || '',
+    version?.status_detail || '',
+  ].join('|');
   const [preflight, setPreflight] = useState<GuardianPreflightState>({ status: 'loading' });
 
   useEffect(() => {
@@ -1369,6 +1377,7 @@ function GuardianPreflightCard({ inst, onOpenSettings }: {
     cfg?.jvm_preset,
     cfg?.max_memory_mb,
     cfg?.min_memory_mb,
+    versionReadinessKey,
   ]);
 
   const ready = preflight.status === 'ready' ? preflight.data : undefined;
