@@ -6,6 +6,7 @@ mod installs;
 pub mod launch_reports;
 pub mod performance_operations;
 mod sessions;
+pub mod skins;
 
 use croopor_config::{ConfigStore, InstanceStore};
 pub use croopor_launcher::{LaunchEvent, LaunchLogEvent, LaunchSessionRecord, LaunchStatusEvent};
@@ -34,6 +35,7 @@ pub struct AppState {
     auth_logins: Arc<AuthLoginStore>,
     installs: Arc<InstallStore>,
     sessions: Arc<SessionStore>,
+    skins: Arc<skins::SavedSkinStore>,
     benchmark_suite_drivers: Arc<benchmark_suite_drivers::BenchmarkSuiteDriverStore>,
     performance_operations: Arc<performance_operations::PerformanceOperationStore>,
     performance: Arc<PerformanceManager>,
@@ -65,6 +67,7 @@ impl AppState {
         let performance_operations = Arc::new(
             performance_operations::PerformanceOperationStore::load_from_paths(init.config.paths()),
         );
+        let skins = Arc::new(skins::SavedSkinStore::load_from_paths(init.config.paths()));
 
         Self {
             app_name: init.app_name,
@@ -74,6 +77,7 @@ impl AppState {
             auth_logins: Arc::new(AuthLoginStore::load_from_secure_store()),
             installs: init.installs,
             sessions: init.sessions,
+            skins,
             benchmark_suite_drivers,
             performance_operations,
             performance: init.performance,
@@ -105,6 +109,10 @@ impl AppState {
 
     pub fn sessions(&self) -> &Arc<SessionStore> {
         &self.sessions
+    }
+
+    pub fn skins(&self) -> &Arc<skins::SavedSkinStore> {
+        &self.skins
     }
 
     pub fn auth_logins(&self) -> &Arc<AuthLoginStore> {

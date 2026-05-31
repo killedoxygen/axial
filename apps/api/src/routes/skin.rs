@@ -1,11 +1,12 @@
 use crate::state::AppState;
+use crate::state::skins::SavedSkinRecord;
 use crate::state::{AuthLoginMinecraftAccount, AuthLoginMinecraftSkin};
 use axum::{
     Json, Router,
     body::{Body, to_bytes},
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::{Response, StatusCode, header},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use croopor_config::validate_username;
 use croopor_minecraft::offline_uuid;
@@ -23,6 +24,8 @@ const SKIN_WIDTH: u32 = 64;
 const SKIN_HEIGHT: u32 = 64;
 const LEGACY_SKIN_HEIGHT: u32 = 32;
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+const SAVED_SKIN_NAME_MAX_CHARS: usize = 64;
+const SAVED_SKIN_SOURCE: &str = "local_upload";
 
 type ApiError = (StatusCode, Json<serde_json::Value>);
 
@@ -54,11 +57,31 @@ struct SkinNormalizeResponse {
     normalized_byte_size: usize,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct SaveSkinQuery {
+    name: Option<String>,
+    variant: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SavedSkinsResponse {
+    skins: Vec<SavedSkinRecord>,
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/skin/profile", get(handle_skin_profile))
         .route("/api/v1/skin/head", get(handle_skin_head))
         .route("/api/v1/skins/normalize", post(handle_skin_normalize))
+        .route(
+            "/api/v1/skins",
+            get(handle_saved_skins).post(handle_save_skin),
+        )
+        .route("/api/v1/skins/{texture_key}", delete(handle_delete_skin))
+        .route(
+            "/api/v1/skins/{texture_key}/file",
+            get(handle_saved_skin_file),
+        )
 }
 
 async fn handle_skin_profile(
@@ -197,6 +220,81 @@ async fn handle_skin_normalize(body: Body) -> Result<Json<SkinNormalizeResponse>
         normalized_height: SKIN_HEIGHT,
         normalized_byte_size: normalized.png_bytes.len(),
     }))
+}
+
+async fn handle_saved_skins(
+    State(state): State<AppState>,
+) -> Result<Json<SavedSkinsResponse>, ApiError> {
+    let skins = state.skins().list().map_err(skin_read_error)?;
+
+    Ok(Json(SavedSkinsResponse { skins }))
+}
+
+async fn handle_save_skin(
+    State(state): State<AppState>,
+    Query(query): Query<SaveSkinQuery>,
+    body: Body,
+) -> Result<Json<SavedSkinRecord>, ApiError> {
+    let name = validate_saved_skin_name(query.name.as_deref().unwrap_or_default())?;
+    let variant = validate_saved_skin_variant(query.variant.as_deref())?;
+    let bytes = to_bytes(body, SKIN_UPLOAD_MAX_BYTES)
+        .await
+        .map_err(|_| json_error(StatusCode::PAYLOAD_TOO_LARGE, "skin upload is too large"))?;
+    let normalized = normalize_skin_png(&bytes)?;
+    let texture_key = texture_key(&normalized.png_bytes);
+    let record = state
+        .skins()
+        .save(
+            texture_key,
+            name,
+            variant,
+            SAVED_SKIN_SOURCE.to_string(),
+            &normalized.png_bytes,
+        )
+        .map_err(skin_write_error)?;
+
+    Ok(Json(record))
+}
+
+async fn handle_delete_skin(
+    State(state): State<AppState>,
+    Path(texture_key): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let texture_key = validate_texture_key(&texture_key)?;
+    let deleted = state
+        .skins()
+        .delete(&texture_key)
+        .map_err(skin_write_error)?;
+    if deleted.is_none() {
+        return Err(json_error(StatusCode::NOT_FOUND, "saved skin not found"));
+    }
+
+    Ok(Json(serde_json::json!({ "status": "deleted" })))
+}
+
+async fn handle_saved_skin_file(
+    State(state): State<AppState>,
+    Path(texture_key): Path<String>,
+) -> Result<Response<Body>, ApiError> {
+    let texture_key = validate_texture_key(&texture_key)?;
+    let Some(bytes) = state
+        .skins()
+        .read_png(&texture_key)
+        .map_err(skin_read_error)?
+    else {
+        return Err(json_error(StatusCode::NOT_FOUND, "saved skin not found"));
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "image/png")
+        .body(Body::from(bytes))
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "failed to build saved skin response" })),
+            )
+        })
 }
 
 struct NormalizedSkinPng {
@@ -357,6 +455,57 @@ fn texture_key(bytes: &[u8]) -> String {
     key
 }
 
+fn validate_saved_skin_name(value: &str) -> Result<String, ApiError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(json_error(StatusCode::BAD_REQUEST, "skin name is required"));
+    }
+    if trimmed.chars().count() > SAVED_SKIN_NAME_MAX_CHARS {
+        return Err(json_error(StatusCode::BAD_REQUEST, "skin name is too long"));
+    }
+    if trimmed
+        .chars()
+        .any(|value| value.is_control() || matches!(value, '/' | '\\'))
+    {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "skin name contains unsupported characters",
+        ));
+    }
+
+    Ok(trimmed.to_string())
+}
+
+fn validate_saved_skin_variant(value: Option<&str>) -> Result<String, ApiError> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok("classic".to_string());
+    };
+    if value.eq_ignore_ascii_case("classic") {
+        return Ok("classic".to_string());
+    }
+    if value.eq_ignore_ascii_case("slim") {
+        return Ok("slim".to_string());
+    }
+
+    Err(json_error(
+        StatusCode::BAD_REQUEST,
+        "skin variant must be classic or slim",
+    ))
+}
+
+fn validate_texture_key(value: &str) -> Result<String, ApiError> {
+    let trimmed = value.trim();
+    if trimmed.len() != 64
+        || !trimmed
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(json_error(StatusCode::BAD_REQUEST, "invalid texture key"));
+    }
+
+    Ok(trimmed.to_string())
+}
+
 struct OfflineIdentity {
     username: String,
     uuid: String,
@@ -389,6 +538,20 @@ fn select_offline_identity(
 
 fn json_error(status: StatusCode, message: &'static str) -> ApiError {
     (status, Json(serde_json::json!({ "error": message })))
+}
+
+fn skin_read_error(_error: std::io::Error) -> ApiError {
+    json_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Could not read saved skins. Check app data permissions and try again.",
+    )
+}
+
+fn skin_write_error(_error: std::io::Error) -> ApiError {
+    json_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Could not update saved skins. Check app data permissions and try again.",
+    )
 }
 
 fn offline_variant(uuid: &str) -> &'static str {
@@ -993,6 +1156,171 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn skin_saved_list_initially_empty() {
+        let fixture = TestFixture::new("saved-list-empty", "ConfigUser");
+
+        let response = fixture.saved_skins().await.expect("saved skins").0;
+
+        assert!(response.skins.is_empty());
+    }
+
+    #[tokio::test]
+    async fn skin_saved_save_lists_metadata_without_bytes() {
+        let fixture = TestFixture::new("saved-save-list", "ConfigUser");
+        let png = test_skin_png(SKIN_WIDTH, LEGACY_SKIN_HEIGHT);
+
+        let saved = fixture
+            .save_skin("  My Skin  ", Some("slim".to_string()), png.clone())
+            .await
+            .expect("save skin")
+            .0;
+        let listed = fixture.saved_skins().await.expect("saved skins").0;
+        let file = fixture
+            .saved_skin_file(&saved.texture_key)
+            .await
+            .expect("saved skin file");
+        let file_bytes = response_bytes(file).await;
+        let normalized = normalize_skin_png(&png).expect("normalized skin");
+
+        assert_eq!(listed.skins, vec![saved.clone()]);
+        assert_eq!(saved.name, "My Skin");
+        assert_eq!(saved.variant, "slim");
+        assert_eq!(saved.source, SAVED_SKIN_SOURCE);
+        assert_eq!(saved.byte_size, normalized.png_bytes.len());
+        assert_eq!(saved.texture_key, texture_key(&normalized.png_bytes));
+        assert_texture_key(&saved.texture_key);
+        assert_eq!(file_bytes, normalized.png_bytes);
+    }
+
+    #[tokio::test]
+    async fn skin_saved_duplicate_texture_key_updates_metadata() {
+        let fixture = TestFixture::new("saved-duplicate", "ConfigUser");
+        let png = test_skin_png(SKIN_WIDTH, SKIN_HEIGHT);
+
+        let first = fixture
+            .save_skin("First", None, png.clone())
+            .await
+            .expect("first save")
+            .0;
+        let second = fixture
+            .save_skin("Second", Some("slim".to_string()), png)
+            .await
+            .expect("second save")
+            .0;
+        let listed = fixture.saved_skins().await.expect("saved skins").0;
+
+        assert_eq!(first.texture_key, second.texture_key);
+        assert_eq!(first.created_at, second.created_at);
+        assert!(second.updated_at >= first.updated_at);
+        assert_eq!(second.name, "Second");
+        assert_eq!(second.variant, "slim");
+        assert_eq!(listed.skins, vec![second]);
+    }
+
+    #[tokio::test]
+    async fn skin_saved_delete_removes_local_skin() {
+        let fixture = TestFixture::new("saved-delete", "ConfigUser");
+        let saved = fixture
+            .save_skin("Delete Me", None, test_skin_png(SKIN_WIDTH, SKIN_HEIGHT))
+            .await
+            .expect("save skin")
+            .0;
+
+        let deleted = fixture
+            .delete_saved_skin(&saved.texture_key)
+            .await
+            .expect("delete skin")
+            .0;
+        let listed = fixture.saved_skins().await.expect("saved skins").0;
+        let file_error = fixture
+            .saved_skin_file(&saved.texture_key)
+            .await
+            .expect_err("file should be gone");
+
+        assert_eq!(deleted, serde_json::json!({ "status": "deleted" }));
+        assert!(listed.skins.is_empty());
+        assert_eq!(file_error.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            file_error.1.0,
+            serde_json::json!({ "error": "saved skin not found" })
+        );
+    }
+
+    #[tokio::test]
+    async fn skin_saved_delete_rejects_invalid_texture_key() {
+        let fixture = TestFixture::new("saved-invalid-delete", "ConfigUser");
+
+        let error = fixture
+            .delete_saved_skin("../not-a-texture-key")
+            .await
+            .expect_err("invalid key should fail");
+
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.1.0,
+            serde_json::json!({ "error": "invalid texture key" })
+        );
+    }
+
+    #[tokio::test]
+    async fn skin_saved_rejects_invalid_name() {
+        let fixture = TestFixture::new("saved-invalid-name", "ConfigUser");
+
+        let error = fixture
+            .save_skin("bad/name", None, test_skin_png(SKIN_WIDTH, SKIN_HEIGHT))
+            .await
+            .expect_err("invalid name should fail");
+
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.1.0,
+            serde_json::json!({ "error": "skin name contains unsupported characters" })
+        );
+    }
+
+    #[tokio::test]
+    async fn skin_saved_read_error_is_bounded_json() {
+        let fixture = TestFixture::new("saved-read-error", "ConfigUser");
+        let skin_dir = fixture.root.join("config").join("skins");
+        fs::create_dir_all(&skin_dir).expect("create skin dir");
+        fs::write(skin_dir.join("index.json"), "{not-json").expect("write bad index");
+
+        let error = fixture
+            .saved_skins()
+            .await
+            .expect_err("bad index should fail");
+
+        assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            error.1.0,
+            serde_json::json!({
+                "error": "Could not read saved skins. Check app data permissions and try again."
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn skin_saved_write_error_is_bounded_json() {
+        let fixture = TestFixture::new("saved-write-error", "ConfigUser");
+        let skin_dir = fixture.root.join("config").join("skins");
+        fs::create_dir_all(&skin_dir).expect("create skin dir");
+        fs::write(skin_dir.join("files"), "blocking file").expect("write blocking file");
+
+        let error = fixture
+            .save_skin("Blocked", None, test_skin_png(SKIN_WIDTH, SKIN_HEIGHT))
+            .await
+            .expect_err("blocked file dir should fail");
+
+        assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            error.1.0,
+            serde_json::json!({
+                "error": "Could not update saved skins. Check app data permissions and try again."
+            })
+        );
+    }
+
     struct TestFixture {
         state: AppState,
         root: PathBuf,
@@ -1048,6 +1376,43 @@ mod tests {
                 Query(SkinQuery { username, size }),
             )
             .await
+        }
+
+        async fn saved_skins(
+            &self,
+        ) -> Result<Json<SavedSkinsResponse>, (StatusCode, Json<serde_json::Value>)> {
+            handle_saved_skins(State(self.state.clone())).await
+        }
+
+        async fn save_skin(
+            &self,
+            name: &str,
+            variant: Option<String>,
+            body: Vec<u8>,
+        ) -> Result<Json<SavedSkinRecord>, (StatusCode, Json<serde_json::Value>)> {
+            handle_save_skin(
+                State(self.state.clone()),
+                Query(SaveSkinQuery {
+                    name: Some(name.to_string()),
+                    variant,
+                }),
+                Body::from(body),
+            )
+            .await
+        }
+
+        async fn delete_saved_skin(
+            &self,
+            texture_key: &str,
+        ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+            handle_delete_skin(State(self.state.clone()), Path(texture_key.to_string())).await
+        }
+
+        async fn saved_skin_file(
+            &self,
+            texture_key: &str,
+        ) -> Result<Response<Body>, (StatusCode, Json<serde_json::Value>)> {
+            handle_saved_skin_file(State(self.state.clone()), Path(texture_key.to_string())).await
         }
 
         async fn add_minecraft_account(&self, profile: AuthLoginMinecraftProfile) {
@@ -1134,6 +1499,13 @@ mod tests {
             .await
             .expect("read response body");
         String::from_utf8(bytes.to_vec()).expect("utf-8 body")
+    }
+
+    async fn response_bytes(response: Response<Body>) -> Vec<u8> {
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read response body")
+            .to_vec()
     }
 
     async fn normalize_skin_body(
