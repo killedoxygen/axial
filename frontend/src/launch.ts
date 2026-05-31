@@ -126,36 +126,41 @@ function ensureSentence(text: string): string {
   return `${trimmed}.`;
 }
 
+function stripFinalSentencePunctuation(text: string): string {
+  return text.replace(/[.!?]+$/, '').trim();
+}
+
 function formatHealingDetail(detail: string): string {
   const trimmed = detail.trim();
   if (!trimmed) return '';
+  const comparable = stripFinalSentencePunctuation(trimmed);
 
-  let match = trimmed.match(/^Requested JVM preset "([^"]+)" was downgraded to "([^"]+)" for compatibility$/);
+  let match = comparable.match(/^Requested JVM preset "([^"]+)" was downgraded to "([^"]+)" for compatibility$/);
   if (match) {
     return `GC preset changed from ${formatPresetName(match[1])} to ${formatPresetName(match[2])} to match this runtime.`;
   }
 
-  if (trimmed === 'Requested Java override was bypassed in favor of a safer managed runtime') {
+  if (comparable === 'Requested Java override was bypassed in favor of a safer managed runtime') {
     return 'Java override was skipped and the managed runtime was used instead.';
   }
-  if (trimmed === 'Requested runtime override was bypassed in favor of a safer managed runtime') {
+  if (comparable === 'Requested runtime override was bypassed in favor of a safer managed runtime') {
     return 'Java override was skipped and the managed runtime was used instead.';
   }
 
-  if (trimmed === 'Guardian switched to managed Java before launch') {
+  if (comparable === 'Guardian switched to managed Java before launch') {
     return 'Guardian switched to the managed Java runtime before launch.';
   }
 
-  match = trimmed.match(/^Automatic retry: downgraded JVM preset to "([^"]+)" after startup failure$/);
+  match = comparable.match(/^Automatic retry: downgraded JVM preset to "([^"]+)" after startup failure$/);
   if (match) {
     return `Croopor retried startup with the ${formatPresetName(match[1])} GC preset.`;
   }
 
-  if (trimmed === 'Automatic retry: disabled custom GC flags after startup failure') {
+  if (comparable === 'Automatic retry: disabled custom GC flags after startup failure') {
     return 'Croopor retried startup without custom GC flags.';
   }
 
-  if (trimmed === 'Automatic retry: switched to managed Java after runtime mismatch') {
+  if (comparable === 'Automatic retry: switched to managed Java after runtime mismatch') {
     return 'Croopor retried startup with the managed Java runtime.';
   }
 
@@ -194,11 +199,11 @@ function formatHealingEvent(event: HealingEvent): string {
     case 'runtime_bypassed':
       return 'Java override was skipped and the managed runtime was used instead.';
     case 'preset_downgraded':
-      return event.detail ? ensureSentence(event.detail) : 'GC preset was adjusted for compatibility.';
+      return event.detail || 'GC preset was adjusted for compatibility.';
     case 'fallback_applied':
-      return event.detail ? ensureSentence(event.detail) : 'Croopor retried startup with safer settings.';
+      return event.detail || 'Croopor retried startup with safer settings.';
     default:
-      return event.detail ? ensureSentence(event.detail) : '';
+      return event.detail || '';
   }
 }
 
