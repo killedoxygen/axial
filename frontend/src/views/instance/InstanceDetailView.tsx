@@ -7,11 +7,12 @@ import { useTheme } from '../../hooks/use-theme';
 import { InstanceArt, artPresetForSeed, artSeedFor, nextArtSeed } from '../../art/InstanceArt';
 import { showChoice } from '../../ui/Dialog';
 import { openContextMenu } from '../../ui/ContextMenu';
-import { config, instances, launchNotices, launchState, runningSessions, systemInfo, versions } from '../../store';
+import { config, installQueue, installState, instances, launchNotices, launchState, runningSessions, systemInfo, versions } from '../../store';
 import type { LaunchState } from '../../store';
 import { navigate } from '../../ui-state';
 import { addInstance, clearLaunchNotice, removeInstance, selectInstance, updateInstanceInList } from '../../actions';
 import { launchGame, killGame } from '../../launch';
+import { handleInstallClick } from '../../install';
 import { api, apiUrl } from '../../api';
 import {
   hasNativeDesktopRuntime,
@@ -222,6 +223,10 @@ function loaderLabel(v: Version | undefined): string {
   if (id.includes('neoforged')) return 'NeoForge';
   if (id.includes('minecraftforge')) return 'Forge';
   return 'Modded';
+}
+
+function installTargetFor(inst: EnrichedInstance, version: Version | undefined): string {
+  return version?.needs_install || version?.id || inst.version_id;
 }
 
 function performanceModeFrom(value: string | undefined): PerformanceMode | null {
@@ -1564,45 +1569,67 @@ function LaunchOutcomeNotice({ inst, notice }: {
 
 function LaunchSplitButton({
   inst,
+  canLaunch,
+  installQueued,
+  installProgress,
   onLaunch,
+  onInstall,
   onOpenLogs,
   onOpenSettings,
   preparing,
 }: {
   inst: EnrichedInstance;
+  canLaunch: boolean;
+  installQueued: boolean;
+  installProgress: { pct: number; label: string } | null;
   onLaunch: () => void;
+  onInstall: () => void;
   onOpenLogs: () => void;
   onOpenSettings: () => void;
   preparing: Extract<LaunchState, { status: 'preparing' }> | null;
 }): JSX.Element {
-  const label = preparing?.label || 'Launch';
-  const pct = preparing?.pct ?? 0;
+  const progress = preparing
+    ? { pct: preparing.pct, label: preparing.label }
+    : installProgress;
+  const needsInstall = !canLaunch;
+  const label = progress?.label || (installQueued ? 'Queued' : needsInstall ? 'Install' : 'Launch');
+  const icon = progress || installQueued ? 'clock' : needsInstall ? 'download' : 'play';
+  const pct = progress?.pct ?? 0;
+  const disabled = Boolean(progress) || installQueued;
+  const primaryAction = needsInstall ? onInstall : onLaunch;
+  const primaryMenuItem = needsInstall
+    ? {
+        icon: installQueued ? 'clock' : 'download',
+        label: installQueued ? 'Queued' : 'Install',
+        onSelect: installQueued ? () => toast('Install already queued') : onInstall,
+      }
+    : { icon: 'play', label: 'Launch now', onSelect: onLaunch };
   return (
     <div
-      class={`cp-instance-split-launch${preparing ? ' cp-instance-split-launch--preparing' : ''}`}
+      class={`cp-instance-split-launch${progress ? ' cp-instance-split-launch--preparing' : ''}`}
       role="group"
-      aria-label="Launch actions"
+      aria-label="Instance actions"
       style={{ '--cp-launch-pct': `${pct}%` } as any}
     >
-      {preparing && <span class="cp-instance-split-launch-fill" aria-hidden="true" />}
+      {progress && <span class="cp-instance-split-launch-fill" aria-hidden="true" />}
       <button
         class="cp-instance-split-launch-main"
         type="button"
-        onClick={preparing ? undefined : onLaunch}
-        data-sound="launchPress"
-        disabled={Boolean(preparing)}
+        onClick={disabled ? undefined : primaryAction}
+        data-sound={needsInstall ? 'bright' : 'launchPress'}
+        disabled={disabled}
       >
-        <Icon name={preparing ? 'clock' : 'play'} size={18} stroke={1.8} />
+        <Icon name={icon} size={18} stroke={1.8} />
         <span>{label}</span>
       </button>
       <button
         class="cp-instance-split-launch-menu"
         type="button"
-        aria-label="Launch options"
+        aria-label="Instance options"
         aria-haspopup="menu"
-        disabled={Boolean(preparing)}
+        disabled={Boolean(progress)}
         onClick={(e) => openContextMenu(e, [
-          { icon: 'play', label: 'Launch now', onSelect: onLaunch },
+          primaryMenuItem,
           { icon: 'settings', label: 'Launch settings', onSelect: onOpenSettings },
           { icon: 'terminal', label: 'View launch logs', onSelect: onOpenLogs },
           { label: '', onSelect: () => {}, divider: true },
@@ -1611,7 +1638,7 @@ function LaunchSplitButton({
       >
         <Icon name="chevron-down" size={16} stroke={2.3} />
       </button>
-      {preparing && <span class="cp-instance-launch-status">{Math.round(pct)}%</span>}
+      {progress && <span class="cp-instance-launch-status">{Math.round(pct)}%</span>}
     </div>
   );
 }
@@ -2307,10 +2334,21 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
 
   const v = versions.value.find(x => x.id === inst.version_id);
   const mcVer = v?.minecraft_meta.display_hint || v?.minecraft_meta.display_name || 'unknown';
+  const canLaunch = Boolean(v?.launchable);
+  const installTarget = installTargetFor(inst, v);
+  const install = installState.value;
+  const installProgress = install.status === 'active' && install.versionId === installTarget
+    ? { pct: install.pct, label: install.label }
+    : null;
+  const installQueued = !installProgress && installQueue.value.some(item => item.versionId === installTarget);
 
   const onPlay = (): void => {
     selectInstance(inst.id);
     void launchGame();
+  };
+  const onInstall = (): void => {
+    selectInstance(inst.id);
+    handleInstallClick();
   };
   const onStop = (): void => {
     selectInstance(inst.id);
@@ -2374,7 +2412,11 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
               ) : (
                 <LaunchSplitButton
                   inst={inst}
+                  canLaunch={canLaunch}
+                  installQueued={installQueued}
+                  installProgress={installProgress}
                   onLaunch={onPlay}
+                  onInstall={onInstall}
                   onOpenLogs={() => setTab('logs')}
                   onOpenSettings={() => setTab('settings')}
                   preparing={preparing}
