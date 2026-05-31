@@ -1396,7 +1396,7 @@ function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Elem
               <ProfileMetaValue label="Identity" value={status.mode === 'online' ? 'Online profile' : 'Offline profile'} />
               <ProfileMetaValue label="Verified" value={status.verified ? 'Yes' : 'No'} />
               <ProfileMetaValue label="UUID" value={shortenUuid(status.uuid)} />
-              <ProfileMetaValue label="Skin" value={status.skin_source || 'default'} />
+              <ProfileMetaValue label="Skin" value={skinSourceLabel(status.skin_source, status.launch_auth_mode)} />
               <ProfileMetaValue label="Login" value={status.login_available ? 'Available' : 'Unavailable'} />
               <ProfileMetaValue
                 label="Refresh"
