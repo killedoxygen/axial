@@ -68,17 +68,17 @@ function PlayCard({ inst }: { inst: EnrichedInstance }): JSX.Element {
   };
   return (
     <div
-      class="cp-card cp-playcard"
+      class="cp-card cp-playcard cp-home-recent-card"
       role="button"
       tabIndex={0}
       aria-label={`Open ${inst.name}`}
       onClick={openInstance}
       onKeyDown={onCardKeyDown}
     >
-      <InstanceArt instance={inst} version={version} aspect="square" radius={theme.r.md} style={{ width: 68, height: 68 }} />
+      <InstanceArt instance={inst} version={version} aspect="square" radius={theme.r.md} className="cp-home-recent-art" />
       <div class="cp-playcard-body">
         <div class="cp-playcard-title">
-          <h3>{inst.name}</h3>
+          <h3 title={inst.name}>{inst.name}</h3>
           {running && <Pill tone="accent" icon="play">Playing</Pill>}
         </div>
         <div class="cp-playcard-meta">
@@ -94,6 +94,7 @@ function PlayCard({ inst }: { inst: EnrichedInstance }): JSX.Element {
       <Button
         size="md"
         icon="play"
+        title={`Play ${inst.name}`}
         onClick={(e) => { e.stopPropagation(); navigate({ name: 'instance', id: inst.id }); }}
         sound="launchPress"
       >Play</Button>
@@ -162,7 +163,7 @@ export function HomeView(): JSX.Element {
             title="Recent instances"
             action={{ label: 'All instances', onClick: () => navigate({ name: 'instances' }) }}
           />
-          <div class="cp-grid-2">
+          <div class="cp-grid-2 cp-home-recent-grid">
             {recent.map(inst => <PlayCard key={inst.id} inst={inst} />)}
           </div>
         </div>
