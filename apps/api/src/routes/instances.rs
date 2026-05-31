@@ -290,15 +290,15 @@ async fn handle_update_instance(
         .update(instance)
         .map(Json)
         .map_err(|error| {
-            let status = if error.to_string().contains("not found") {
+            let message = error.to_string();
+            let status = if message.contains("not found") {
                 StatusCode::NOT_FOUND
+            } else if message.contains("already exists") {
+                StatusCode::CONFLICT
             } else {
                 StatusCode::BAD_REQUEST
             };
-            (
-                status,
-                Json(serde_json::json!({ "error": error.to_string() })),
-            )
+            (status, Json(serde_json::json!({ "error": message })))
         })
 }
 
@@ -693,6 +693,10 @@ fn dir_size(path: &FsPath) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::{AppState, AppStateInit, InstallStore, SessionStore};
+    use croopor_config::{AppPaths, ConfigStore, InstanceStore};
+    use croopor_performance::PerformanceManager;
+    use std::sync::Arc;
 
     #[test]
     fn instance_folder_resolver_returns_root_when_subfolder_is_omitted() {
@@ -785,5 +789,130 @@ mod tests {
             vec!["latest.log".to_string(), "debug.log".to_string()]
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn update_instance_allows_unchanged_name_and_maps_name_collision_to_conflict() {
+        let fixture = TestFixture::new("update-name-collision");
+        let alpha = fixture
+            .state
+            .instances()
+            .add(
+                "Alpha".to_string(),
+                "1.21.1".to_string(),
+                String::new(),
+                String::new(),
+                None,
+            )
+            .expect("add alpha");
+        let beta = fixture
+            .state
+            .instances()
+            .add(
+                "Beta".to_string(),
+                "1.21.1".to_string(),
+                String::new(),
+                String::new(),
+                None,
+            )
+            .expect("add beta");
+
+        let Json(updated) = handle_update_instance(
+            State(fixture.state.clone()),
+            Path(alpha.id.clone()),
+            Json(InstancePatch {
+                name: Some(alpha.name.clone()),
+                version_id: Some("1.21.2".to_string()),
+                ..InstancePatch::default()
+            }),
+        )
+        .await
+        .expect("unchanged name update should succeed");
+        assert_eq!(updated.name, "Alpha");
+        assert_eq!(updated.version_id, "1.21.2");
+
+        let (status, Json(body)) = handle_update_instance(
+            State(fixture.state.clone()),
+            Path(alpha.id.clone()),
+            Json(InstancePatch {
+                name: Some(beta.name.clone()),
+                ..InstancePatch::default()
+            }),
+        )
+        .await
+        .expect_err("duplicate name update should fail");
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body,
+            serde_json::json!({ "error": "failed to read instances: an instance with this name already exists" })
+        );
+        assert_eq!(
+            fixture
+                .state
+                .instances()
+                .get(&alpha.id)
+                .expect("alpha remains")
+                .name,
+            "Alpha"
+        );
+    }
+
+    struct TestFixture {
+        state: AppState,
+        root: PathBuf,
+    }
+
+    impl TestFixture {
+        fn new(name: &str) -> Self {
+            let root = test_root(name);
+            let paths = test_paths(&root);
+            let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
+            let instances =
+                Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
+            let state = AppState::new(AppStateInit {
+                app_name: "Croopor".to_string(),
+                version: "test".to_string(),
+                config,
+                instances,
+                installs: Arc::new(InstallStore::new()),
+                sessions: Arc::new(SessionStore::new()),
+                performance: Arc::new(PerformanceManager::new().expect("performance manager")),
+                frontend_dir: root.join("frontend"),
+            });
+
+            Self { state, root }
+        }
+    }
+
+    impl Drop for TestFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn test_root(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "croopor-api-instances-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or_default()
+        ));
+        fs::create_dir_all(&path).expect("create test root");
+        path
+    }
+
+    fn test_paths(root: &FsPath) -> AppPaths {
+        let config_dir = root.join("config");
+        AppPaths {
+            config_file: config_dir.join("config.json"),
+            instances_file: config_dir.join("instances.json"),
+            instances_dir: root.join("instances"),
+            music_dir: root.join("music"),
+            library_dir: root.join("library"),
+            config_dir,
+        }
     }
 }

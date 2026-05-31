@@ -187,6 +187,17 @@ impl InstanceStore {
                 "instance not found",
             )));
         };
+        if inner
+            .instances
+            .iter()
+            .enumerate()
+            .any(|(stored_index, instance)| stored_index != index && instance.name == next.name)
+        {
+            return Err(InstanceStoreError::Read(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "an instance with this name already exists",
+            )));
+        }
 
         inner.instances[index] = next.clone();
         self.persist_locked(&inner)?;
@@ -549,9 +560,9 @@ pub fn art_preset_for_seed(seed: u32) -> &'static str {
 mod tests {
     use super::{ART_PRESETS, InstanceStore, StoredInstances, art_preset_for_seed};
     use crate::paths::AppPaths;
-    use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::RwLock;
+    use std::{fs, io};
 
     fn test_root(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -724,6 +735,56 @@ mod tests {
         assert_eq!(
             fs::read_to_string(game_dir.join("servers.dat")).expect("read local servers"),
             "local servers"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn update_allows_unchanged_name_but_rejects_exact_name_collision() {
+        let root = test_root("update-name-collision");
+        let paths = test_paths(&root);
+        let store = InstanceStore {
+            paths,
+            inner: RwLock::new(StoredInstances::default()),
+        };
+        let alpha = store
+            .add(
+                "Alpha".to_string(),
+                "1.21.1".to_string(),
+                String::new(),
+                String::new(),
+                None,
+            )
+            .expect("add alpha");
+        let beta = store
+            .add(
+                "Beta".to_string(),
+                "1.21.1".to_string(),
+                String::new(),
+                String::new(),
+                None,
+            )
+            .expect("add beta");
+
+        let mut unchanged = alpha.clone();
+        unchanged.version_id = "1.21.2".to_string();
+        let updated = store.update(unchanged).expect("update unchanged name");
+        assert_eq!(updated.name, "Alpha");
+        assert_eq!(updated.version_id, "1.21.2");
+
+        let mut colliding = updated.clone();
+        colliding.name = beta.name.clone();
+        let error = store.update(colliding).expect_err("reject duplicate name");
+
+        assert!(matches!(error, super::InstanceStoreError::Read(_)));
+        let super::InstanceStoreError::Read(error) = error else {
+            panic!("expected read error");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            store.get(&alpha.id).expect("alpha remains").name,
+            "Alpha".to_string()
         );
 
         let _ = fs::remove_dir_all(root);
