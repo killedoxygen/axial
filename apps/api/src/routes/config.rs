@@ -8,6 +8,9 @@ use axum::{
 use croopor_config::{AppConfig, ConfigStoreError};
 use serde::Deserialize;
 
+const CONFIG_SAVE_ERROR_MESSAGE: &str =
+    "Could not save settings. Check app data permissions and try again.";
+
 #[derive(Debug, Default, Deserialize)]
 struct ConfigPatch {
     username: Option<String>,
@@ -113,13 +116,65 @@ async fn handle_update_config(
             state.set_library_dir(config.library_dir.clone());
             Ok(Json(config))
         }
-        Err(ConfigStoreError::Validation(error)) => Err((
+        Err(error) => Err(config_update_error_response(error)),
+    }
+}
+
+fn config_update_error_response(error: ConfigStoreError) -> (StatusCode, Json<serde_json::Value>) {
+    match error {
+        ConfigStoreError::Validation(error) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": error.to_string() })),
-        )),
-        Err(error) => Err((
+        ),
+        _ => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": error.to_string() })),
-        )),
+            Json(serde_json::json!({ "error": CONFIG_SAVE_ERROR_MESSAGE })),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CONFIG_SAVE_ERROR_MESSAGE, config_update_error_response};
+    use axum::Json;
+    use croopor_config::{AppConfigValidationError, ConfigStoreError};
+
+    #[test]
+    fn config_update_validation_error_keeps_details() {
+        let (status, Json(body)) = config_update_error_response(ConfigStoreError::Validation(
+            AppConfigValidationError::InvalidUsername("Letters, numbers, and underscores only."),
+        ));
+
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "error": "invalid username: Letters, numbers, and underscores only."
+            })
+        );
+    }
+
+    #[test]
+    fn config_update_non_validation_error_hides_local_paths() {
+        let paths = [
+            "/Users/alice/Library/Application Support/Croopor/config.json",
+            r"C:\Users\Alice\AppData\Roaming\Croopor\config.json",
+        ];
+
+        for path in paths {
+            let (status, Json(body)) =
+                config_update_error_response(ConfigStoreError::Read(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("permission denied writing {path}"),
+                )));
+            let message = body
+                .get("error")
+                .and_then(|value| value.as_str())
+                .expect("error response should include a string message");
+
+            assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(message, CONFIG_SAVE_ERROR_MESSAGE);
+            assert!(!message.contains(path));
+        }
     }
 }
