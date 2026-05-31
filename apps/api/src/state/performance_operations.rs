@@ -144,6 +144,32 @@ impl PerformanceOperationStore {
         self.inner.lock().await.operations.get(id).cloned()
     }
 
+    pub async fn current_or_latest_for_instance(
+        &self,
+        instance_id: &str,
+    ) -> Option<PerformanceOperationStatus> {
+        let instance_id = instance_id.trim();
+        if instance_id.is_empty() {
+            return None;
+        }
+
+        let inner = self.inner.lock().await;
+        if let Some(active_id) = inner.active_by_instance.get(instance_id) {
+            if let Some(status) = inner.operations.get(active_id) {
+                if is_non_terminal(&status.state) {
+                    return Some(status.clone());
+                }
+            }
+        }
+
+        inner
+            .operations
+            .values()
+            .filter(|status| status.instance_id == instance_id)
+            .max_by(compare_operation_recency)
+            .cloned()
+    }
+
     pub async fn record_progress(&self, id: &str, state: &str) {
         let status = {
             let mut inner = self.inner.lock().await;
@@ -373,6 +399,16 @@ fn operation_id_index(operation_id: &str) -> Option<u128> {
     u128::from_str_radix(suffix, 16).ok()
 }
 
+fn compare_operation_recency(
+    left: &&PerformanceOperationStatus,
+    right: &&PerformanceOperationStatus,
+) -> std::cmp::Ordering {
+    left.updated_at
+        .cmp(&right.updated_at)
+        .then_with(|| left.created_at.cmp(&right.created_at))
+        .then_with(|| operation_id_index(&left.id).cmp(&operation_id_index(&right.id)))
+}
+
 pub fn generate_performance_operation_id() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -433,6 +469,12 @@ mod tests {
             .expect("loaded resumable operation");
         assert_eq!(resumable.state, "applying");
         assert_eq!(resumable.error, None);
+        let by_instance = reloaded
+            .current_or_latest_for_instance("instance-a")
+            .await
+            .expect("loaded instance operation");
+        assert_eq!(by_instance.id, started.id);
+        assert_eq!(by_instance.state, "applying");
         let pending = reloaded.take_pending_resumable_operations().await;
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id, started.id);
@@ -487,8 +529,44 @@ mod tests {
 
         assert_eq!(status.state, "complete");
         assert_eq!(status.error, None);
+        let by_instance = reloaded
+            .current_or_latest_for_instance("instance-a")
+            .await
+            .expect("loaded terminal instance operation");
+        assert_eq!(by_instance.id, started.id);
+        assert_eq!(by_instance.state, "complete");
 
         cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn current_or_latest_for_instance_prefers_active_over_newer_terminal() {
+        let store = PerformanceOperationStore::new();
+        let failed = store
+            .start(
+                "instance-a".to_string(),
+                "install".to_string(),
+                test_payload(),
+            )
+            .await
+            .expect("operation starts");
+        store.record_failed(&failed.id, "failed").await;
+        let active = store
+            .start(
+                "instance-a".to_string(),
+                "remove".to_string(),
+                test_payload(),
+            )
+            .await
+            .expect("second operation starts");
+
+        let by_instance = store
+            .current_or_latest_for_instance("instance-a")
+            .await
+            .expect("instance operation");
+
+        assert_eq!(by_instance.id, active.id);
+        assert_eq!(by_instance.state, "queued");
     }
 
     #[tokio::test]

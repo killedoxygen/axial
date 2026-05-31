@@ -728,6 +728,43 @@ export interface PerformanceInstallResponse {
   warnings: string[];
 }
 
+export interface PerformanceOperationPayload {
+  version_id: string;
+  instance_performance_mode: string;
+  game_version?: string;
+  loader?: string;
+  mode?: string;
+  rollback_id?: string;
+}
+
+export type PerformanceOperationAction = 'install' | 'remove' | 'rollback';
+
+export type PerformanceOperationState =
+  | 'queued'
+  | 'planning'
+  | 'applying'
+  | 'removing'
+  | 'rolling_back'
+  | 'complete'
+  | 'failed'
+  | 'interrupted'
+  | string;
+
+export interface PerformanceOperationStatus {
+  id: string;
+  instance_id: string;
+  action: PerformanceOperationAction | string;
+  payload: PerformanceOperationPayload;
+  state: PerformanceOperationState;
+  error?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PerformanceInstanceOperationResponse {
+  operation: PerformanceOperationStatus | null;
+}
+
 // ── Version info (detail panel) ──
 
 export interface WorldInfo {

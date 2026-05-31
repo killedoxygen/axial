@@ -32,8 +32,10 @@ import type {
   LaunchNoticeTone,
   PerformanceHealthResponse,
   PerformanceHealthStatus,
+  PerformanceInstanceOperationResponse,
   PerformanceInstallResponse,
   PerformanceMode,
+  PerformanceOperationStatus,
   PerformancePlanResponse,
   Version,
 } from '../../types';
@@ -402,7 +404,35 @@ function performanceProgressDetail(progress: PerformanceInstallProgress): string
   if (progress.phase === 'removing') return 'Removing managed performance files.';
   if (progress.phase === 'rolling_back') return 'Rolling back managed performance files.';
   if (progress.phase === 'complete') return 'Managed performance update complete.';
+  if (progress.phase === 'error') return 'Performance update failed.';
   return 'Updating managed performance files.';
+}
+
+function isPerformanceOperationTerminal(status: PerformanceOperationStatus): boolean {
+  return status.state === 'complete' || status.state === 'failed' || status.state === 'interrupted';
+}
+
+function isPerformanceOperationComplete(status: PerformanceOperationStatus): boolean {
+  return status.state === 'complete';
+}
+
+function operationStatusAsProgress(status: PerformanceOperationStatus): PerformanceInstallProgress {
+  const failed = status.state === 'failed' || status.state === 'interrupted';
+  const phase = failed ? 'error' : status.state;
+  const current = phase === 'queued'
+    ? 0
+    : phase === 'planning'
+      ? 1
+      : phase === 'complete' || phase === 'error'
+        ? 4
+        : 2;
+  return {
+    phase,
+    current,
+    total: 4,
+    error: failed ? status.error || 'performance operation failed' : status.error,
+    done: isPerformanceOperationTerminal(status),
+  };
 }
 
 function performanceLifecycleAction(
@@ -788,11 +818,14 @@ function PerformanceCard({ inst, onOpenSettings }: { inst: EnrichedInstance; onO
   const [program, setProgram] = useState<PerformanceProgramState>({ status: 'loading', plan: null, health: null });
   const [lifecycleBusy, setLifecycleBusy] = useState(false);
   const [lifecycleProgress, setLifecycleProgress] = useState<{ title: string; detail: string } | null>(null);
+  const [lifecycleOperation, setLifecycleOperation] = useState<PerformanceOperationStatus | null>(null);
   const [saving, setSaving] = useState(false);
   const savedRef = useRef(initialMem);
   const saveRequestRef = useRef(0);
   const saveTimerRef = useRef<number | null>(null);
   const lifecycleSourceRef = useRef<LifecycleProgressSource | null>(null);
+  const operationPollRef = useRef<number | null>(null);
+  const operationRequestRef = useRef(0);
 
   const fetchPerformanceProgram = useCallback(async (): Promise<{
     plan: PerformancePlanResponse | null;
@@ -831,6 +864,7 @@ function PerformanceCard({ inst, onOpenSettings }: { inst: EnrichedInstance; onO
   useEffect(() => {
     return () => {
       if (saveTimerRef.current !== null) window.clearTimeout(saveTimerRef.current);
+      if (operationPollRef.current !== null) window.clearInterval(operationPollRef.current);
       lifecycleSourceRef.current?.close();
       lifecycleSourceRef.current = null;
     };
@@ -860,6 +894,93 @@ function PerformanceCard({ inst, onOpenSettings }: { inst: EnrichedInstance; onO
 
     return () => { alive = false; };
   }, [fetchPerformanceProgram]);
+
+  useEffect(() => {
+    let alive = true;
+    const requestId = operationRequestRef.current + 1;
+    operationRequestRef.current = requestId;
+    if (operationPollRef.current !== null) {
+      window.clearInterval(operationPollRef.current);
+      operationPollRef.current = null;
+    }
+
+    const applyStatus = (status: PerformanceOperationStatus | null): boolean => {
+      if (!alive || requestId !== operationRequestRef.current) return true;
+      if (status && isPerformanceOperationComplete(status)) {
+        setLifecycleOperation(null);
+        setLifecycleProgress(null);
+        return true;
+      }
+      setLifecycleOperation(status);
+      return !status || isPerformanceOperationTerminal(status);
+    };
+
+    const refreshAfterComplete = async (): Promise<void> => {
+      const refreshed = await fetchPerformanceProgram();
+      if (alive && requestId === operationRequestRef.current) {
+        setProgram({ status: 'ready', ...refreshed });
+      }
+    };
+
+    const pollStatus = async (operationId: string): Promise<void> => {
+      try {
+        const res: any = await api(
+          'GET',
+          `/performance/operations/${encodeURIComponent(operationId)}`,
+        );
+        if (!res?.id && res?.error) throw new Error(res.error);
+        const status = res as PerformanceOperationStatus;
+        const terminal = applyStatus(status);
+        if (terminal && operationPollRef.current !== null) {
+          window.clearInterval(operationPollRef.current);
+          operationPollRef.current = null;
+        }
+        if (terminal && isPerformanceOperationComplete(status)) {
+          await refreshAfterComplete();
+        }
+      } catch {
+        if (alive && requestId === operationRequestRef.current) {
+          applyStatus(null);
+          if (operationPollRef.current !== null) {
+            window.clearInterval(operationPollRef.current);
+            operationPollRef.current = null;
+          }
+        }
+      }
+    };
+
+    void (async () => {
+      try {
+        const res: PerformanceInstanceOperationResponse & { error?: string } = await api(
+          'GET',
+          `/performance/instances/${encodeURIComponent(inst.id)}/operation`,
+        );
+        if (res?.error) throw new Error(res.error);
+        const operation = res.operation ?? null;
+        const terminal = applyStatus(operation);
+        if (operation && isPerformanceOperationComplete(operation)) {
+          await refreshAfterComplete();
+          return;
+        }
+        if (operation && !terminal) {
+          operationPollRef.current = window.setInterval(() => {
+            void pollStatus(operation.id);
+          }, 1250);
+          void pollStatus(operation.id);
+        }
+      } catch {
+        applyStatus(null);
+      }
+    })();
+
+    return () => {
+      alive = false;
+      if (operationPollRef.current !== null) {
+        window.clearInterval(operationPollRef.current);
+        operationPollRef.current = null;
+      }
+    };
+  }, [inst.id, fetchPerformanceProgram]);
 
   const saveMemory = async (nextMem: number): Promise<void> => {
     const clampedMem = clampMemoryGb(nextMem, RAM_MIN, ramMax);
@@ -989,6 +1110,7 @@ function PerformanceCard({ inst, onOpenSettings }: { inst: EnrichedInstance; onO
   const runLifecycleAction = async (action: PerformanceLifecycleAction): Promise<void> => {
     if (lifecycleBusy) return;
     setLifecycleBusy(true);
+    setLifecycleOperation(null);
     setLifecycleProgress({
       title: 'Bundle queued',
       detail: 'Waiting to update managed performance files.',
@@ -1045,11 +1167,23 @@ function PerformanceCard({ inst, onOpenSettings }: { inst: EnrichedInstance; onO
   ];
   const lifecycleAction = performanceLifecycleAction(effectiveMode.mode, program.health);
   const baseSummary = performanceSummary(program, effectiveMode.mode);
-  const summary = lifecycleBusy
+  const operationProgress = lifecycleOperation ? operationStatusAsProgress(lifecycleOperation) : null;
+  const operationActive = lifecycleOperation ? !isPerformanceOperationTerminal(lifecycleOperation) : false;
+  const visibleLifecycleProgress = lifecycleProgress ?? (operationProgress
     ? {
-      tone: 'mute' as const,
-      title: lifecycleProgress?.title || 'Updating bundle',
-      detail: lifecycleProgress?.detail || (lifecycleAction?.action === 'remove'
+      title: performanceProgressTitle(operationProgress),
+      detail: performanceProgressDetail(operationProgress),
+    }
+    : null);
+  const summary = visibleLifecycleProgress
+    ? {
+      tone: operationProgress?.phase === 'error'
+        ? 'err' as const
+        : operationProgress?.done
+          ? 'ok' as const
+          : 'mute' as const,
+      title: visibleLifecycleProgress.title || 'Updating bundle',
+      detail: visibleLifecycleProgress.detail || (lifecycleAction?.action === 'remove'
         ? 'Croopor is removing managed performance files.'
         : 'Croopor is applying managed performance files.'),
     }
@@ -1077,11 +1211,11 @@ function PerformanceCard({ inst, onOpenSettings }: { inst: EnrichedInstance; onO
           <Button
             variant="secondary"
             size="sm"
-            icon={lifecycleBusy ? 'refresh' : lifecycleAction.icon}
-            disabled={lifecycleBusy || program.status === 'loading'}
+            icon={lifecycleBusy || operationActive ? 'refresh' : lifecycleAction.icon}
+            disabled={lifecycleBusy || operationActive || program.status === 'loading'}
             onClick={() => void runLifecycleAction(lifecycleAction)}
           >
-            {lifecycleBusy ? lifecycleAction.busyLabel : lifecycleAction.label}
+            {lifecycleBusy || operationActive ? lifecycleAction.busyLabel : lifecycleAction.label}
           </Button>
         )}
       </div>

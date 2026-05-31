@@ -81,6 +81,11 @@ struct PerformanceInstallResponse {
     warnings: Vec<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct PerformanceInstanceOperationResponse {
+    operation: Option<PerformanceOperationStatus>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct PerformanceManagedArtifactSummary {
     project_id: String,
@@ -134,6 +139,10 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/performance/health", get(handle_health))
         .route("/api/v1/performance/rollback", get(handle_rollback_list))
         .route("/api/v1/performance/install", post(handle_install))
+        .route(
+            "/api/v1/performance/instances/{instance_id}/operation",
+            get(handle_instance_operation),
+        )
         .route(
             "/api/v1/performance/operations/{id}",
             get(handle_operation_status),
@@ -389,6 +398,24 @@ async fn handle_operation_status(
                 Json(serde_json::json!({ "error": "performance operation not found" })),
             )
         })
+}
+
+async fn handle_instance_operation(
+    State(state): State<AppState>,
+    Path(instance_id): Path<String>,
+) -> Result<Json<PerformanceInstanceOperationResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let instance = state.instances().get(&instance_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "instance not found" })),
+        )
+    })?;
+    let operation = state
+        .performance_operations()
+        .current_or_latest_for_instance(&instance.id)
+        .await;
+
+    Ok(Json(PerformanceInstanceOperationResponse { operation }))
 }
 
 async fn execute_performance_operation(
@@ -2238,6 +2265,90 @@ mod tests {
         assert_eq!(response.action, "install");
         assert_eq!(response.payload.version_id, "1.20.4-fabric");
         assert_eq!(response.state, "applying");
+    }
+
+    #[tokio::test]
+    async fn instance_operation_route_returns_null_when_none_exists() {
+        let fixture = TestFixture::new("instance-operation-empty");
+        let instance_id = fixture.add_instance("Managed", "1.20.4-fabric");
+
+        let response = router()
+            .with_state(fixture.state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/performance/instances/{instance_id}/operation"
+                    ))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("route response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: serde_json::Value =
+            serde_json::from_slice(&body).expect("operation response json");
+        assert_eq!(value, serde_json::json!({ "operation": null }));
+    }
+
+    #[tokio::test]
+    async fn instance_operation_route_discovers_reloaded_pending_operation() {
+        let root = test_root("instance-operation-reloaded");
+        let state = build_test_state(&root, None, None);
+        let instance_id = state
+            .instances()
+            .add(
+                "Managed".to_string(),
+                "1.20.4-fabric".to_string(),
+                String::new(),
+                String::new(),
+                None,
+            )
+            .expect("add instance")
+            .id;
+        let started = state
+            .performance_operations()
+            .start(
+                instance_id.clone(),
+                "remove".to_string(),
+                test_operation_payload("1.20.4-fabric"),
+            )
+            .await
+            .expect("persist pending operation");
+        state
+            .performance_operations()
+            .record_progress(&started.id, "removing")
+            .await;
+        drop(state);
+
+        let reloaded = build_test_state(&root, None, None);
+        let response = router()
+            .with_state(reloaded)
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/performance/instances/{instance_id}/operation"
+                    ))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("route response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: serde_json::Value =
+            serde_json::from_slice(&body).expect("operation response json");
+        assert_eq!(value["operation"]["id"], started.id);
+        assert_eq!(value["operation"]["instance_id"], instance_id);
+        assert_eq!(value["operation"]["state"], "removing");
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
