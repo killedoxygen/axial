@@ -854,8 +854,6 @@
   width: 22px;
   height: 22px;
   box-sizing: border-box;
-  border-radius: 999px;
-  background: var(--surface-3);
   color: var(--text-mute);
   line-height: 0;
 }
@@ -865,15 +863,12 @@
   flex: 0 0 auto;
 }
 .cp-od-perf-summary[data-tone="ok"] .cp-od-perf-summary-mark {
-  background: var(--ok);
-  color: oklch(0.24 0.05 150);
+  color: var(--ok);
 }
 .cp-od-perf-summary[data-tone="warn"] .cp-od-perf-summary-mark {
-  background: oklch(0.78 0.14 80 / 0.14);
   color: var(--warn);
 }
 .cp-od-perf-summary[data-tone="err"] .cp-od-perf-summary-mark {
-  background: oklch(0.65 0.18 25 / 0.14);
   color: var(--err);
 }
 .cp-od-perf-summary-copy strong,
