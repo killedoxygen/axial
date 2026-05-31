@@ -11,7 +11,7 @@ use axum::{
     http::StatusCode,
     routing::{get, post},
 };
-use croopor_launcher::{LaunchState, snapshot_status};
+use croopor_launcher::{LaunchSessionRecord, LaunchState, snapshot_status};
 use serde::Deserialize;
 use serde_json::json;
 use std::time::Duration;
@@ -29,6 +29,7 @@ const FAMILY_C_QUALIFICATION_VERSION: &str = "1.12.2";
 const FAMILY_C_QUALIFICATION_LOADER: &str = "Forge";
 const FAMILY_C_BASELINE_TARGET_ID: &str = "family_c_forge_1_12_2_vanilla_baseline";
 const FAMILY_C_MANAGED_TARGET_ID: &str = "family_c_forge_1_12_2_family_c_forge_core";
+const LAUNCH_COMMAND_REDACTED_VALUE: &str = "<redacted>";
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -748,13 +749,109 @@ async fn handle_launch_command(
         )
     })?;
 
-    Ok(Json(json!({
-        "command": record.command,
-        "java_path": record.java_path,
+    Ok(Json(launch_command_response_payload(&record)))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SanitizedLaunchCommand {
+    command: Vec<String>,
+    redacted: bool,
+}
+
+fn launch_command_response_payload(record: &LaunchSessionRecord) -> serde_json::Value {
+    let command = sanitize_launch_command(&record.command);
+
+    json!({
+        "command": command.command,
+        "command_redacted": command.redacted,
+        "java_path_present": record.java_path.is_some(),
         "session_id": record.session_id.0,
         "healing": record.healing,
         "guardian": record.guardian,
-    })))
+    })
+}
+
+fn sanitize_launch_command(command: &[String]) -> SanitizedLaunchCommand {
+    let mut redacted = false;
+    let mut redact_next = false;
+    let mut sanitized = Vec::with_capacity(command.len());
+
+    for arg in command {
+        if redact_next {
+            let replacement = LAUNCH_COMMAND_REDACTED_VALUE.to_string();
+            redacted |= arg != &replacement;
+            sanitized.push(replacement);
+            redact_next = false;
+            continue;
+        }
+
+        if let Some((key, _value)) = arg.split_once('=')
+            && is_sensitive_command_key(key)
+        {
+            let replacement = format!("{key}={LAUNCH_COMMAND_REDACTED_VALUE}");
+            redacted |= arg != &replacement;
+            sanitized.push(replacement);
+            continue;
+        }
+
+        if is_sensitive_next_arg_flag(arg) {
+            sanitized.push(arg.clone());
+            redact_next = true;
+            continue;
+        }
+
+        if is_token_like_command_value(arg) {
+            redacted = true;
+            sanitized.push(LAUNCH_COMMAND_REDACTED_VALUE.to_string());
+            continue;
+        }
+
+        sanitized.push(arg.clone());
+    }
+
+    SanitizedLaunchCommand {
+        command: sanitized,
+        redacted,
+    }
+}
+
+fn is_sensitive_next_arg_flag(arg: &str) -> bool {
+    arg.starts_with("--") && !arg.contains('=') && is_sensitive_command_key(arg)
+}
+
+fn is_sensitive_command_key(key: &str) -> bool {
+    let key = key
+        .strip_prefix("-D")
+        .unwrap_or(key)
+        .trim_start_matches('-');
+    let canonical: String = key
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect();
+
+    canonical.contains("token")
+        || canonical.contains("devicecode")
+        || canonical.contains("usercode")
+        || canonical.contains("providerpayload")
+        || canonical.contains("providerresponse")
+        || canonical.contains("providerdata")
+}
+
+fn is_token_like_command_value(value: &str) -> bool {
+    let value = value.trim();
+    if value.len() < 48 {
+        return false;
+    }
+
+    let parts: Vec<&str> = value.split('.').collect();
+    parts.len() == 3
+        && parts.iter().all(|part| {
+            part.len() >= 8
+                && part
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+        })
 }
 
 async fn handle_launch_status(
@@ -1869,6 +1966,158 @@ mod tests {
         assert_eq!(payload["status"], serde_json::json!("launching"));
         assert_eq!(payload["max_memory_mb"], serde_json::json!(6144));
         assert_eq!(payload["min_memory_mb"], serde_json::json!(1024));
+    }
+
+    #[test]
+    fn launch_command_sanitizer_redacts_sensitive_auth_values() {
+        let command = vec![
+            "java".to_string(),
+            "-Xmx4096M".to_string(),
+            "--accessToken".to_string(),
+            "online-secret-token".to_string(),
+            "--access_token=snake-secret-token".to_string(),
+            "--auth_access_token".to_string(),
+            "auth-secret-token".to_string(),
+            "-Dauth.accessToken=jvm-secret-token".to_string(),
+            "-Dcustom.auth_token=property-secret-token".to_string(),
+            "--device_code".to_string(),
+            "device-secret-code".to_string(),
+            "--provider_payload=provider-secret-payload".to_string(),
+            "com.mojang.Main".to_string(),
+            "--username".to_string(),
+            "Player".to_string(),
+        ];
+
+        let sanitized = sanitize_launch_command(&command);
+        let data = serde_json::to_string(&sanitized.command).expect("serialize command");
+
+        assert!(sanitized.redacted);
+        assert_eq!(sanitized.command[0], "java");
+        assert_eq!(sanitized.command[1], "-Xmx4096M");
+        assert_eq!(sanitized.command[2], "--accessToken");
+        assert_eq!(sanitized.command[3], LAUNCH_COMMAND_REDACTED_VALUE);
+        assert_eq!(
+            sanitized.command[4],
+            format!("--access_token={LAUNCH_COMMAND_REDACTED_VALUE}")
+        );
+        assert_eq!(sanitized.command[5], "--auth_access_token");
+        assert_eq!(sanitized.command[6], LAUNCH_COMMAND_REDACTED_VALUE);
+        assert_eq!(
+            sanitized.command[7],
+            format!("-Dauth.accessToken={LAUNCH_COMMAND_REDACTED_VALUE}")
+        );
+        assert_eq!(
+            sanitized.command[8],
+            format!("-Dcustom.auth_token={LAUNCH_COMMAND_REDACTED_VALUE}")
+        );
+        assert_eq!(sanitized.command[9], "--device_code");
+        assert_eq!(sanitized.command[10], LAUNCH_COMMAND_REDACTED_VALUE);
+        assert_eq!(
+            sanitized.command[11],
+            format!("--provider_payload={LAUNCH_COMMAND_REDACTED_VALUE}")
+        );
+        assert!(data.contains("com.mojang.Main"));
+        assert!(data.contains("--username"));
+        assert!(data.contains("Player"));
+        assert!(!data.contains("online-secret-token"));
+        assert!(!data.contains("snake-secret-token"));
+        assert!(!data.contains("auth-secret-token"));
+        assert!(!data.contains("jvm-secret-token"));
+        assert!(!data.contains("property-secret-token"));
+        assert!(!data.contains("device-secret-code"));
+        assert!(!data.contains("provider-secret-payload"));
+    }
+
+    #[test]
+    fn launch_command_sanitizer_redacts_token_like_values() {
+        let command = vec![
+            "java".to_string(),
+            "eyJheader12345678.eyJpayload12345678.signature1234567890".to_string(),
+            "-Xms512M".to_string(),
+        ];
+
+        let sanitized = sanitize_launch_command(&command);
+
+        assert!(sanitized.redacted);
+        assert_eq!(sanitized.command[0], "java");
+        assert_eq!(sanitized.command[1], LAUNCH_COMMAND_REDACTED_VALUE);
+        assert_eq!(sanitized.command[2], "-Xms512M");
+    }
+
+    #[test]
+    fn launch_command_sanitizer_leaves_non_sensitive_args_visible() {
+        let command = vec![
+            "java".to_string(),
+            "-Xmx2048M".to_string(),
+            "-cp".to_string(),
+            "libraries/example.jar".to_string(),
+            "net.minecraft.client.main.Main".to_string(),
+            "--username".to_string(),
+            "Player".to_string(),
+        ];
+
+        let sanitized = sanitize_launch_command(&command);
+
+        assert!(!sanitized.redacted);
+        assert_eq!(sanitized.command, command);
+    }
+
+    #[tokio::test]
+    async fn launch_command_route_redacts_access_token_from_json() {
+        let fixture = RouteTestFixture::new("launch-command-redacts");
+        let raw_access_token = "online-access-token-secret";
+        let mut record = test_record("command-sensitive");
+        record.command = vec![
+            "java".to_string(),
+            "-Xmx2048M".to_string(),
+            "--accessToken".to_string(),
+            raw_access_token.to_string(),
+            "--access_token=snake-secret-token".to_string(),
+            "-Dauth.accessToken=jvm-secret-token".to_string(),
+            "net.minecraft.client.main.Main".to_string(),
+        ];
+        record.java_path = Some("/home/SecretUser/bin/java".to_string());
+        fixture.state.sessions().insert(record).await;
+
+        let response = router()
+            .with_state(fixture.state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/launch/command-sensitive/command")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("route response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("command json");
+        let data = String::from_utf8(body.to_vec()).expect("utf8 payload");
+
+        assert_eq!(
+            payload["session_id"],
+            serde_json::json!("command-sensitive")
+        );
+        assert_eq!(payload["command_redacted"], serde_json::json!(true));
+        assert_eq!(payload["java_path_present"], serde_json::json!(true));
+        assert_eq!(payload["command"][0], serde_json::json!("java"));
+        assert_eq!(payload["command"][1], serde_json::json!("-Xmx2048M"));
+        assert_eq!(
+            payload["command"][3],
+            serde_json::json!(LAUNCH_COMMAND_REDACTED_VALUE)
+        );
+        assert!(data.contains("net.minecraft.client.main.Main"));
+        assert!(!data.contains(raw_access_token));
+        assert!(!data.contains("snake-secret-token"));
+        assert!(!data.contains("jvm-secret-token"));
+        assert!(!data.contains("SecretUser"));
+        assert!(!data.contains("java_path\""));
+
+        cleanup(&fixture.root);
     }
 
     #[test]
