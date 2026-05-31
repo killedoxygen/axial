@@ -27,6 +27,7 @@ const MSA_DEVICE_CODE_ENDPOINT: &str =
 const MSA_TOKEN_ENDPOINT: &str = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token";
 const MSA_DEVICE_CODE_SCOPE: &str = "XboxLive.signin offline_access";
 const MSA_TOKEN_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
+const MSA_REFRESH_TOKEN_GRANT_TYPE: &str = "refresh_token";
 const MSA_DEVICE_CODE_TIMEOUT: Duration = Duration::from_secs(20);
 const MSA_TOKEN_POLL_TIMEOUT: Duration = Duration::from_secs(20);
 const MSA_SLOW_DOWN_INTERVAL_INCREMENT: u64 = 5;
@@ -151,6 +152,20 @@ struct AuthLoginMsaAuthenticatedResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct AuthRefreshAuthenticatedResponse {
+    status: &'static str,
+    token_type: String,
+    expires_in: u64,
+    has_refresh_token: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token_scope: Option<String>,
+    minecraft_profile_ready: bool,
+    minecraft_ownership_verified: bool,
+    minecraft_profile: AuthMinecraftProfileResponse,
+    minecraft_token_expires_in: u64,
+}
+
+#[derive(Debug, Serialize)]
 struct AuthLoginMinecraftChainErrorResponse {
     error: &'static str,
     status: &'static str,
@@ -232,6 +247,7 @@ enum MsaTokenErrorCode {
     AuthorizationDeclined,
     BadVerificationCode,
     ExpiredToken,
+    InvalidGrant,
     Other,
 }
 
@@ -239,6 +255,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/auth/status", get(handle_auth_status))
         .route("/api/v1/auth/login", post(handle_auth_login))
+        .route("/api/v1/auth/refresh", post(handle_auth_refresh))
         .route("/api/v1/auth/logout", post(handle_auth_logout))
         .route(
             "/api/v1/auth/login/{login_id}",
@@ -284,6 +301,23 @@ async fn handle_auth_login_poll(
 
     auth_login_poll_for_config(
         &login_id,
+        AuthLoginConfig::from_env(),
+        state.auth_logins(),
+        MSA_TOKEN_ENDPOINT,
+        &auth_chain_client,
+    )
+    .await
+}
+
+async fn handle_auth_refresh(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let auth_chain_client = match AuthChainClient::new() {
+        Ok(client) => client,
+        Err(error) => return auth_chain_error_response(error),
+    };
+
+    auth_refresh_for_config(
         AuthLoginConfig::from_env(),
         state.auth_logins(),
         MSA_TOKEN_ENDPOINT,
@@ -526,6 +560,46 @@ async fn request_msa_token(
     }
 }
 
+async fn request_msa_refresh_token(
+    token_endpoint: &str,
+    client_id: &str,
+    refresh_token: &str,
+) -> Result<MsaTokenSuccessResponse, AuthLoginPollError> {
+    let client = Client::builder()
+        .timeout(MSA_TOKEN_POLL_TIMEOUT)
+        .build()
+        .map_err(|_| AuthLoginPollError::Request(AuthLoginError::ClientBuild))?;
+
+    let response = client
+        .post(token_endpoint)
+        .form(&[
+            ("grant_type", MSA_REFRESH_TOKEN_GRANT_TYPE),
+            ("client_id", client_id),
+            ("refresh_token", refresh_token),
+            ("scope", MSA_DEVICE_CODE_SCOPE),
+        ])
+        .send()
+        .await
+        .map_err(|_| AuthLoginPollError::Request(AuthLoginError::Request))?;
+
+    let status = response.status();
+    if status.is_success() {
+        return response
+            .json::<MsaTokenSuccessResponse>()
+            .await
+            .map_err(|_| AuthLoginPollError::Request(AuthLoginError::Parse));
+    }
+
+    match response.json::<MsaTokenErrorResponse>().await {
+        Ok(response) => Err(AuthLoginPollError::OAuth(MsaTokenErrorCode::from_error(
+            &response.error,
+        ))),
+        Err(_) => Err(AuthLoginPollError::Request(AuthLoginError::UpstreamStatus(
+            status,
+        ))),
+    }
+}
+
 async fn auth_login_poll_success_response(
     login_id: &str,
     response: MsaTokenSuccessResponse,
@@ -569,6 +643,123 @@ async fn auth_login_poll_success_response(
     }
 
     (StatusCode::OK, Json(serde_json::json!(public_response)))
+}
+
+async fn auth_refresh_for_config(
+    config: AuthLoginConfig,
+    login_store: &Arc<AuthLoginStore>,
+    token_endpoint: &str,
+    auth_chain_client: &AuthChainClient,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(client_id) = config.client_id.as_deref() else {
+        return auth_login_unavailable();
+    };
+    let Some(refresh_token) = login_store.active_msa_refresh_token().await else {
+        return auth_refresh_sign_in_required_response(
+            StatusCode::PRECONDITION_FAILED,
+            "Microsoft sign-in refresh is unavailable; sign in again",
+        );
+    };
+
+    match request_msa_refresh_token(token_endpoint, client_id, &refresh_token).await {
+        Ok(response) => {
+            auth_refresh_success_response(response, &refresh_token, login_store, auth_chain_client)
+                .await
+        }
+        Err(AuthLoginPollError::OAuth(error)) => {
+            auth_refresh_oauth_error_response(login_store, error).await
+        }
+        Err(AuthLoginPollError::Request(error)) => auth_login_error_response(error),
+    }
+}
+
+async fn auth_refresh_success_response(
+    response: MsaTokenSuccessResponse,
+    fallback_refresh_token: &str,
+    login_store: &Arc<AuthLoginStore>,
+    auth_chain_client: &AuthChainClient,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let has_refresh_token = response
+        .refresh_token
+        .as_deref()
+        .is_some_and(|refresh_token| !refresh_token.trim().is_empty())
+        || !fallback_refresh_token.trim().is_empty();
+    let minecraft_account = match auth_chain_client
+        .exchange_msa_access_token(&response.access_token)
+        .await
+    {
+        Ok(exchange) => NewAuthLoginMinecraftAccount::from(exchange),
+        Err(error) => return auth_chain_error_response(error),
+    };
+
+    let public_response = AuthRefreshAuthenticatedResponse {
+        status: "refreshed",
+        token_type: response.token_type.clone(),
+        expires_in: response.expires_in,
+        has_refresh_token,
+        token_scope: response.scope.clone(),
+        minecraft_profile_ready: true,
+        minecraft_ownership_verified: minecraft_account.owns_minecraft_java,
+        minecraft_profile: auth_minecraft_profile_response(&minecraft_account.profile),
+        minecraft_token_expires_in: minecraft_account.expires_in,
+    };
+
+    if login_store
+        .refresh_with_msa_and_minecraft_account(
+            NewAuthLoginMsaToken::from(response),
+            minecraft_account,
+            fallback_refresh_token,
+        )
+        .await
+        .is_none()
+    {
+        return auth_refresh_sign_in_required_response(
+            StatusCode::PRECONDITION_FAILED,
+            "Microsoft sign-in refresh is unavailable; sign in again",
+        );
+    }
+
+    (StatusCode::OK, Json(serde_json::json!(public_response)))
+}
+
+async fn auth_refresh_oauth_error_response(
+    login_store: &Arc<AuthLoginStore>,
+    error: MsaTokenErrorCode,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if matches!(
+        error,
+        MsaTokenErrorCode::InvalidGrant
+            | MsaTokenErrorCode::AuthorizationDeclined
+            | MsaTokenErrorCode::BadVerificationCode
+            | MsaTokenErrorCode::ExpiredToken
+    ) {
+        let _ = login_store.clear_active_auth().await;
+        return auth_refresh_sign_in_required_response(
+            StatusCode::UNAUTHORIZED,
+            "Microsoft sign-in expired; sign in again",
+        );
+    }
+
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(serde_json::json!({
+            "error": "Microsoft sign-in refresh failed",
+            "status": "refresh_failed",
+        })),
+    )
+}
+
+fn auth_refresh_sign_in_required_response(
+    status: StatusCode,
+    message: &'static str,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        status,
+        Json(serde_json::json!({
+            "error": message,
+            "status": "sign_in_required",
+        })),
+    )
 }
 
 async fn auth_login_poll_oauth_error_response(
@@ -628,7 +819,7 @@ async fn auth_login_poll_oauth_error_response(
                 })),
             )
         }
-        MsaTokenErrorCode::Other => (
+        MsaTokenErrorCode::InvalidGrant | MsaTokenErrorCode::Other => (
             StatusCode::BAD_GATEWAY,
             Json(serde_json::json!({
                 "error": "Microsoft sign-in polling failed",
@@ -918,6 +1109,7 @@ impl MsaTokenErrorCode {
             "authorization_declined" => Self::AuthorizationDeclined,
             "bad_verification_code" => Self::BadVerificationCode,
             "expired_token" => Self::ExpiredToken,
+            "invalid_grant" => Self::InvalidGrant,
             _ => Self::Other,
         }
     }
@@ -1383,6 +1575,223 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auth_refresh_success_posts_refresh_form_and_rotates_token() {
+        let store = Arc::new(AuthLoginStore::new());
+        insert_active_refresh_login(&store, Some("old-msa-refresh-token")).await;
+        let (token_endpoint, mut token_requests) = token_test_server(
+            StatusCode::OK,
+            serde_json::json!({
+                "access_token": "msa-access-token",
+                "refresh_token": "new-msa-refresh-token",
+                "id_token": "msa-id-token",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "scope": "XboxLive.signin offline_access"
+            }),
+        )
+        .await;
+        let (auth_chain_client, mut auth_chain_requests) =
+            auth_chain_route_test_client(AuthChainRouteServerMode::Success).await;
+
+        let response = auth_refresh_for_config(
+            AuthLoginConfig::from_env_value(Some("public-client-id")),
+            &store,
+            &token_endpoint,
+            &auth_chain_client,
+        )
+        .await;
+
+        assert_eq!(response.0, StatusCode::OK);
+        assert_eq!(response.1.0["status"], "refreshed");
+        assert_eq!(response.1.0["token_type"], "Bearer");
+        assert_eq!(response.1.0["expires_in"], 3600);
+        assert_eq!(response.1.0["has_refresh_token"], true);
+        assert_eq!(
+            response.1.0["token_scope"],
+            "XboxLive.signin offline_access"
+        );
+        assert_eq!(response.1.0["minecraft_profile_ready"], true);
+        assert_eq!(response.1.0["minecraft_ownership_verified"], true);
+        assert_eq!(response.1.0["minecraft_profile"]["name"], "ProfileName");
+        assert_eq!(response.1.0["minecraft_token_expires_in"], 86400);
+        assert_no_sensitive_public_fields(&response.1.0);
+
+        let active = store.active_msa_token().await.expect("active msa token");
+        assert_eq!(active.access_token, "msa-access-token");
+        assert_eq!(
+            active.refresh_token,
+            Some("new-msa-refresh-token".to_string())
+        );
+        assert!(
+            store
+                .active_minecraft_account_state()
+                .await
+                .expect("minecraft account")
+                .account
+                .owns_minecraft_java
+        );
+
+        let form = token_requests.recv().await.expect("token request");
+        assert_eq!(form["grant_type"], MSA_REFRESH_TOKEN_GRANT_TYPE);
+        assert_eq!(form["client_id"], "public-client-id");
+        assert_eq!(form["refresh_token"], "old-msa-refresh-token");
+        assert_eq!(form["scope"], MSA_DEVICE_CODE_SCOPE);
+        assert_eq!(
+            auth_chain_requests.recv().await.expect("xbl request").path,
+            "/xbl"
+        );
+        assert_eq!(
+            auth_chain_requests.recv().await.expect("xsts request").path,
+            "/xsts"
+        );
+        assert_eq!(
+            auth_chain_requests
+                .recv()
+                .await
+                .expect("minecraft login request")
+                .path,
+            "/minecraft/login"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_refresh_success_preserves_old_refresh_token_when_omitted() {
+        let store = Arc::new(AuthLoginStore::new());
+        insert_active_refresh_login(&store, Some("old-msa-refresh-token")).await;
+        let (token_endpoint, _token_requests) = token_test_server(
+            StatusCode::OK,
+            serde_json::json!({
+                "access_token": "msa-access-token",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "scope": "XboxLive.signin offline_access"
+            }),
+        )
+        .await;
+        let (auth_chain_client, _auth_chain_requests) =
+            auth_chain_route_test_client(AuthChainRouteServerMode::Success).await;
+
+        let response = auth_refresh_for_config(
+            AuthLoginConfig::from_env_value(Some("public-client-id")),
+            &store,
+            &token_endpoint,
+            &auth_chain_client,
+        )
+        .await;
+
+        assert_eq!(response.0, StatusCode::OK);
+        assert_eq!(response.1.0["status"], "refreshed");
+        assert_no_sensitive_public_fields(&response.1.0);
+        assert_eq!(
+            store
+                .active_msa_token()
+                .await
+                .expect("active msa token")
+                .refresh_token,
+            Some("old-msa-refresh-token".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_refresh_missing_refresh_token_returns_bounded_precondition() {
+        let store = Arc::new(AuthLoginStore::new());
+        insert_active_refresh_login(&store, None).await;
+
+        let response = auth_refresh_for_config(
+            AuthLoginConfig::from_env_value(Some("public-client-id")),
+            &store,
+            "unused",
+            &unused_auth_chain_client(),
+        )
+        .await;
+
+        assert_eq!(response.0, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(response.1.0["status"], "sign_in_required");
+        assert_eq!(
+            response.1.0["error"],
+            "Microsoft sign-in refresh is unavailable; sign in again"
+        );
+        assert_no_sensitive_public_fields(&response.1.0);
+        assert!(store.active_msa_token().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn auth_refresh_invalid_grant_clears_active_auth() {
+        let store = Arc::new(AuthLoginStore::new());
+        insert_active_refresh_login(&store, Some("old-msa-refresh-token")).await;
+        let (token_endpoint, mut token_requests) = token_test_server(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({
+                "error": "invalid_grant",
+                "error_description": "provider-secret-payload"
+            }),
+        )
+        .await;
+
+        let response = auth_refresh_for_config(
+            AuthLoginConfig::from_env_value(Some("public-client-id")),
+            &store,
+            &token_endpoint,
+            &unused_auth_chain_client(),
+        )
+        .await;
+
+        assert_eq!(response.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(response.1.0["status"], "sign_in_required");
+        assert_eq!(
+            response.1.0["error"],
+            "Microsoft sign-in expired; sign in again"
+        );
+        assert_no_sensitive_public_fields(&response.1.0);
+        assert_eq!(store.active_msa_token().await, None);
+        assert_eq!(store.active_minecraft_account().await, None);
+
+        let form = token_requests.recv().await.expect("token request");
+        assert_eq!(form["grant_type"], MSA_REFRESH_TOKEN_GRANT_TYPE);
+        assert_eq!(form["refresh_token"], "old-msa-refresh-token");
+    }
+
+    #[tokio::test]
+    async fn auth_refresh_auth_chain_failure_preserves_existing_auth() {
+        let store = Arc::new(AuthLoginStore::new());
+        insert_active_refresh_login(&store, Some("old-msa-refresh-token")).await;
+        let (token_endpoint, _token_requests) = token_test_server(
+            StatusCode::OK,
+            serde_json::json!({
+                "access_token": "msa-access-token",
+                "refresh_token": "new-msa-refresh-token",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "scope": "XboxLive.signin offline_access"
+            }),
+        )
+        .await;
+        let (auth_chain_client, _auth_chain_requests) =
+            auth_chain_route_test_client(AuthChainRouteServerMode::XstsRejected).await;
+
+        let response = auth_refresh_for_config(
+            AuthLoginConfig::from_env_value(Some("public-client-id")),
+            &store,
+            &token_endpoint,
+            &auth_chain_client,
+        )
+        .await;
+
+        assert_eq!(response.0, StatusCode::BAD_GATEWAY);
+        assert_eq!(response.1.0["status"], "minecraft_auth_chain_failed");
+        assert_no_sensitive_public_fields(&response.1.0);
+        assert_eq!(
+            store
+                .active_msa_token()
+                .await
+                .expect("active msa token")
+                .refresh_token,
+            Some("old-msa-refresh-token".to_string())
+        );
+        assert!(store.active_minecraft_account().await.is_some());
+    }
+
+    #[tokio::test]
     async fn auth_login_poll_auth_chain_failure_does_not_leave_active_profile_state() {
         let store = Arc::new(AuthLoginStore::new());
         let old_session = insert_pending_login(&store).await;
@@ -1805,6 +2214,29 @@ mod tests {
             .await
     }
 
+    async fn insert_active_refresh_login(
+        store: &Arc<AuthLoginStore>,
+        refresh_token: Option<&str>,
+    ) -> AuthLoginSession {
+        let session = insert_pending_login(store).await;
+        store
+            .complete_with_msa_and_minecraft_account(
+                &session.login_id,
+                NewAuthLoginMsaToken {
+                    access_token: "old-msa-access-token".to_string(),
+                    refresh_token: refresh_token.map(ToOwned::to_owned),
+                    id_token: Some("old-msa-id-token".to_string()),
+                    token_type: "Bearer".to_string(),
+                    expires_in: 0,
+                    scope: Some("XboxLive.signin offline_access".to_string()),
+                },
+                test_minecraft_account("OldProfileName"),
+            )
+            .await
+            .expect("active refresh login");
+        session
+    }
+
     fn test_minecraft_account(profile_name: &str) -> NewAuthLoginMinecraftAccount {
         NewAuthLoginMinecraftAccount {
             access_token: "old-minecraft-access-token".to_string(),
@@ -2046,6 +2478,9 @@ mod tests {
             "minecraft-access-token",
             "old-msa-access-token",
             "old-msa-refresh-token",
+            "old-msa-id-token",
+            "new-msa-refresh-token",
+            "new-msa-access-token",
             "old-minecraft-access-token",
             "xbl-token",
             "xsts-token",

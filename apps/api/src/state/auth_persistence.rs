@@ -53,7 +53,8 @@ impl PersistedAuthSnapshot {
         }
 
         let active_msa_token = self.active_msa_token.into_active()?;
-        if active_msa_token.expires_at <= now {
+        let msa_refresh_capable = has_nonblank_refresh_token(&active_msa_token);
+        if active_msa_token.expires_at <= now && !msa_refresh_capable {
             return Err(AuthSnapshotRejection::Expired);
         }
 
@@ -67,12 +68,8 @@ impl PersistedAuthSnapshot {
         {
             return Err(AuthSnapshotRejection::Malformed);
         }
-        if active_minecraft_account
-            .as_ref()
-            .is_some_and(|account| account.expires_at <= now)
-        {
-            return Err(AuthSnapshotRejection::Expired);
-        }
+        let active_minecraft_account =
+            active_minecraft_account.filter(|account| account.expires_at > now);
 
         Ok((active_msa_token, active_minecraft_account))
     }
@@ -106,6 +103,13 @@ struct PersistedMsaToken {
 impl PersistedMsaToken {
     fn into_active(self) -> Result<AuthLoginMsaToken, AuthSnapshotRejection> {
         if is_blank(&self.login_id) || is_blank(&self.access_token) || is_blank(&self.token_type) {
+            return Err(AuthSnapshotRejection::Malformed);
+        }
+        if self
+            .refresh_token
+            .as_ref()
+            .is_some_and(|refresh_token| is_blank(refresh_token))
+        {
             return Err(AuthSnapshotRejection::Malformed);
         }
 
@@ -317,6 +321,13 @@ fn from_timestamp_millis(value: i64) -> Result<DateTime<Utc>, AuthSnapshotReject
 
 fn is_blank(value: &str) -> bool {
     value.trim().is_empty()
+}
+
+fn has_nonblank_refresh_token(token: &AuthLoginMsaToken) -> bool {
+    token
+        .refresh_token
+        .as_deref()
+        .is_some_and(|refresh_token| !is_blank(refresh_token))
 }
 
 #[cfg(test)]
