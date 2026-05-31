@@ -1761,7 +1761,13 @@ function SkinRestorerHelper({ savedUsername }: { savedUsername: string }): JSX.E
   );
 }
 
-function SavedSkinLibrary(): JSX.Element {
+function SavedSkinLibrary({
+  onlineReady,
+  onApplied,
+}: {
+  onlineReady: boolean;
+  onApplied: () => void;
+}): JSX.Element {
   const theme = useTheme();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const { skins, state, error, refresh } = useSavedSkins();
@@ -1770,6 +1776,7 @@ function SavedSkinLibrary(): JSX.Element {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [deleteKey, setDeleteKey] = useState<string | null>(null);
+  const [applyKey, setApplyKey] = useState<string | null>(null);
   const trimmedName = skinName.trim();
   const canUpload = !busy && trimmedName.length > 0;
 
@@ -1816,6 +1823,20 @@ function SavedSkinLibrary(): JSX.Element {
     }
   };
 
+  const applySkin = async (textureKey: string): Promise<void> => {
+    setApplyKey(textureKey);
+    setMessage(null);
+    try {
+      await api('POST', `/skins/${textureKey}/apply`);
+      onApplied();
+      refresh();
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : 'Could not apply skin.');
+    } finally {
+      setApplyKey(null);
+    }
+  };
+
   return (
     <Card>
       <SectionHeading
@@ -1848,7 +1869,7 @@ function SavedSkinLibrary(): JSX.Element {
           />
           <Button
             variant="secondary"
-            icon="upload"
+            icon="plus"
             disabled={!canUpload}
             onClick={() => fileInputRef.current?.click()}
           >
@@ -1903,7 +1924,7 @@ function SavedSkinLibrary(): JSX.Element {
                 key={skin.texture_key}
                 style={{
                   display: 'grid',
-                  gridTemplateColumns: '42px minmax(0, 1fr) auto auto',
+                  gridTemplateColumns: '42px minmax(0, 1fr) auto auto auto',
                   gap: 12,
                   alignItems: 'center',
                   padding: '10px 12px',
@@ -1952,6 +1973,16 @@ function SavedSkinLibrary(): JSX.Element {
                 </div>
                 <Pill tone="neutral">{skin.variant}</Pill>
                 <Button
+                  variant="secondary"
+                  size="sm"
+                  icon={applyKey === skin.texture_key ? 'refresh' : 'check'}
+                  disabled={!onlineReady || applyKey === skin.texture_key}
+                  onClick={() => void applySkin(skin.texture_key)}
+                  title={onlineReady ? 'Apply to active Minecraft account' : 'Online Minecraft account required'}
+                >
+                  Apply
+                </Button>
+                <Button
                   variant="ghost"
                   size="sm"
                   icon="trash"
@@ -1985,6 +2016,8 @@ function formatByteSize(bytes: number): string {
 export function AccountsView(): JSX.Element {
   const cfg = config.value;
   const savedUsername = cfg?.username || 'Player';
+  const { status, state, refresh } = useAuthStatus(savedUsername);
+  const onlineReady = state === 'ready' && Boolean(status?.online_mode_ready);
 
   return (
     <div class="cp-view-page" style={{ gap: 20 }}>
@@ -1999,7 +2032,7 @@ export function AccountsView(): JSX.Element {
 
       <AccountBoundary savedUsername={savedUsername} />
 
-      <SavedSkinLibrary />
+      <SavedSkinLibrary onlineReady={onlineReady} onApplied={refresh} />
 
       <SkinRestorerHelper savedUsername={savedUsername} />
     </div>
