@@ -5,14 +5,19 @@ use crate::paths::{assets_dir, libraries_dir, versions_dir};
 use crate::rules::{current_os_arch, default_environment, evaluate_rules};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
 
-const LIBRARY_DOWNLOAD_CONCURRENCY: usize = 4;
-const ASSET_DOWNLOAD_CONCURRENCY: usize = 8;
+const MIN_LIBRARY_DOWNLOAD_CONCURRENCY: usize = 4;
+const MAX_LIBRARY_DOWNLOAD_CONCURRENCY: usize = 16;
+const LIBRARY_DOWNLOADS_PER_CORE: usize = 2;
+const MIN_ASSET_DOWNLOAD_CONCURRENCY: usize = 8;
+const MAX_ASSET_DOWNLOAD_CONCURRENCY: usize = 32;
+const ASSET_DOWNLOADS_PER_CORE: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DownloadProgress {
@@ -192,7 +197,7 @@ impl Downloader {
                     Ok::<String, DownloadError>(job.name)
                 }
             }))
-            .buffer_unordered(LIBRARY_DOWNLOAD_CONCURRENCY);
+            .buffer_unordered(library_download_concurrency());
         while let Some(result) = library_downloads.next().await {
             let name = result?;
             completed_library_jobs += 1;
@@ -307,7 +312,11 @@ impl Downloader {
         let index = serde_json::from_str::<AssetIndex>(&fs::read_to_string(asset_index_path)?)?;
         let objects_dir = assets_dir(&self.mc_dir).join("objects");
         let mut jobs = Vec::new();
+        let mut queued_hashes = HashSet::new();
         for object in index.objects.values() {
+            if !queued_hashes.insert(object.hash.clone()) {
+                continue;
+            }
             let prefix = &object.hash[..2];
             let path = objects_dir.join(prefix).join(&object.hash);
             if !path.is_file() {
@@ -331,7 +340,7 @@ impl Downloader {
                     download_file_with_client(&client, &url, &path).await
                 }
             }))
-            .buffer_unordered(ASSET_DOWNLOAD_CONCURRENCY);
+            .buffer_unordered(asset_download_concurrency());
         while let Some(result) = asset_downloads.next().await {
             result?;
             completed_jobs += 1;
@@ -423,7 +432,7 @@ where
             Ok::<String, DownloadError>(job.name)
         }
     }))
-    .buffer_unordered(LIBRARY_DOWNLOAD_CONCURRENCY);
+    .buffer_unordered(library_download_concurrency());
     while let Some(result) = downloads.next().await {
         let name = result?;
         completed_jobs += 1;
@@ -438,6 +447,41 @@ fn build_http_client(timeout: Duration) -> reqwest::Client {
         .timeout(timeout)
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+fn library_download_concurrency() -> usize {
+    adaptive_download_concurrency(
+        available_parallelism(),
+        MIN_LIBRARY_DOWNLOAD_CONCURRENCY,
+        MAX_LIBRARY_DOWNLOAD_CONCURRENCY,
+        LIBRARY_DOWNLOADS_PER_CORE,
+    )
+}
+
+fn asset_download_concurrency() -> usize {
+    adaptive_download_concurrency(
+        available_parallelism(),
+        MIN_ASSET_DOWNLOAD_CONCURRENCY,
+        MAX_ASSET_DOWNLOAD_CONCURRENCY,
+        ASSET_DOWNLOADS_PER_CORE,
+    )
+}
+
+fn available_parallelism() -> usize {
+    std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(MIN_LIBRARY_DOWNLOAD_CONCURRENCY)
+}
+
+fn adaptive_download_concurrency(
+    cores: usize,
+    minimum: usize,
+    maximum: usize,
+    per_core: usize,
+) -> usize {
+    cores
+        .saturating_mul(per_core)
+        .clamp(minimum, maximum.max(minimum))
 }
 
 fn progress(phase: &str, current: i32, total: i32, file: Option<String>) -> DownloadProgress {
@@ -596,6 +640,7 @@ fn library_jobs_for(
     env: &crate::rules::Environment,
 ) -> Vec<DownloadJob> {
     let mut jobs = Vec::new();
+    let mut queued_paths = HashSet::new();
 
     for lib in libraries {
         if !evaluate_rules(&lib.rules, env) {
@@ -606,10 +651,14 @@ fn library_jobs_for(
             continue;
         }
 
-        if let Some(job) = resolve_library_download(lib, mc_dir) {
+        if let Some(job) = resolve_library_download(lib, mc_dir)
+            && queued_paths.insert(job.path.clone())
+        {
             jobs.push(job);
         }
-        if let Some(job) = resolve_native_download(lib, mc_dir, &env.os_name) {
+        if let Some(job) = resolve_native_download(lib, mc_dir, &env.os_name)
+            && queued_paths.insert(job.path.clone())
+        {
             jobs.push(job);
         }
     }
@@ -777,7 +826,47 @@ mod tests {
         assert!(!job.name.contains("-x86.jar"));
     }
 
+    #[test]
+    fn adaptive_download_concurrency_scales_with_bounds() {
+        assert_eq!(adaptive_download_concurrency(1, 4, 16, 2), 4);
+        assert_eq!(adaptive_download_concurrency(4, 4, 16, 2), 8);
+        assert_eq!(adaptive_download_concurrency(32, 4, 16, 2), 16);
+        assert_eq!(adaptive_download_concurrency(0, 8, 32, 4), 8);
+    }
+
+    #[test]
+    fn library_jobs_deduplicate_same_destination() {
+        let env = Environment {
+            os_name: "linux".to_string(),
+            os_arch: "x86_64".to_string(),
+            os_version: String::new(),
+            features: HashMap::new(),
+        };
+        let mc_dir = Path::new("/tmp/croopor-test");
+        let libraries = vec![
+            normal_library("org.example:duplicate:1.0.0"),
+            normal_library("org.example:duplicate:1.0.0"),
+        ];
+
+        let jobs = library_jobs_for(mc_dir, &libraries, &env);
+
+        assert_eq!(jobs.len(), 1);
+        assert!(jobs[0].name.contains("duplicate-1.0.0.jar"));
+    }
+
     fn native_library(name: &str) -> Library {
+        let artifact_path = maven_to_path(name).to_string_lossy().replace('\\', "/");
+        Library {
+            name: name.to_string(),
+            downloads: Some(LibraryDownload {
+                artifact: Some(artifact(&artifact_path)),
+                classifiers: HashMap::new(),
+            }),
+            ..Library::default()
+        }
+    }
+
+    fn normal_library(name: &str) -> Library {
         let artifact_path = maven_to_path(name).to_string_lossy().replace('\\', "/");
         Library {
             name: name.to_string(),
