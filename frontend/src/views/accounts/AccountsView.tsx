@@ -1595,12 +1595,12 @@ function SkinRestorerHelper({ savedUsername }: { savedUsername: string }): JSX.E
         </div>
 
         <div style={{
-          display: 'grid',
-          gridTemplateColumns: 'minmax(220px, 360px) minmax(220px, 1fr) auto',
+          display: 'flex',
           gap: 10,
+          flexWrap: 'wrap',
           alignItems: 'end',
         }}>
-          <label style={{ display: 'grid', gap: 6, minWidth: 0 }}>
+          <label style={{ display: 'grid', gap: 6, flex: '1 1 260px', maxWidth: 360, minWidth: 220 }}>
             <span style={{
               fontSize: 11,
               fontWeight: 600,
@@ -1619,7 +1619,7 @@ function SkinRestorerHelper({ savedUsername }: { savedUsername: string }): JSX.E
             />
           </label>
 
-          <div style={{ display: 'grid', gap: 6, minWidth: 0 }}>
+          <div style={{ display: 'grid', gap: 6, flex: '999 1 320px', minWidth: 240 }}>
             <div style={{
               fontSize: 11,
               fontWeight: 600,
@@ -1633,16 +1633,17 @@ function SkinRestorerHelper({ savedUsername }: { savedUsername: string }): JSX.E
                 minHeight: 38,
                 display: 'flex',
                 alignItems: 'center',
-                padding: '0 12px',
+                padding: '9px 12px',
                 border: '1px solid var(--line)',
                 borderRadius: theme.r.md,
                 background: theme.n.surface2,
                 color: canCopy ? theme.n.text : theme.n.textMute,
                 fontFamily: theme.font.mono,
                 fontSize: 12,
-                overflow: 'hidden',
-                whiteSpace: 'nowrap',
-                textOverflow: 'ellipsis',
+                lineHeight: 1.45,
+                overflowWrap: 'anywhere',
+                userSelect: 'text',
+                cursor: 'text',
               }}
             >
               {command}
