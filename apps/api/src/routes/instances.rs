@@ -696,7 +696,7 @@ mod tests {
     use crate::state::{AppState, AppStateInit, InstallStore, SessionStore};
     use croopor_config::{AppPaths, ConfigStore, InstanceStore};
     use croopor_performance::PerformanceManager;
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
 
     #[test]
     fn instance_folder_resolver_returns_root_when_subfolder_is_omitted() {
@@ -855,6 +855,257 @@ mod tests {
                 .expect("alpha remains")
                 .name,
             "Alpha"
+        );
+    }
+
+    #[tokio::test]
+    async fn instance_crud_handlers_create_list_get_update_and_delete() {
+        let fixture = TestFixture::new("crud-happy-path");
+
+        let Json(created) = handle_create_instance(
+            State(fixture.state.clone()),
+            Json(CreateInstanceRequest {
+                name: "Survival".to_string(),
+                version_id: "1.21.1".to_string(),
+                icon: "grass".to_string(),
+                accent: "#5aa469".to_string(),
+            }),
+        )
+        .await
+        .expect("create instance");
+        assert_eq!(created.name, "Survival");
+        assert_eq!(created.version_id, "1.21.1");
+        assert_eq!(created.icon, "grass");
+        assert_eq!(created.accent, "#5aa469");
+
+        let Json(listed) = handle_list_instances(State(fixture.state.clone())).await;
+        assert_eq!(listed.last_instance_id, None);
+        assert_eq!(listed.instances.len(), 1);
+        assert_eq!(listed.instances[0].instance.id, created.id);
+        assert_eq!(listed.instances[0].instance.name, "Survival");
+        assert!(!listed.instances[0].launchable);
+        assert_eq!(listed.instances[0].status_detail, "version not installed");
+
+        let Json(fetched) =
+            handle_get_instance(State(fixture.state.clone()), Path(created.id.clone()))
+                .await
+                .expect("get instance");
+        assert_eq!(fetched, created);
+
+        let Json(updated) = handle_update_instance(
+            State(fixture.state.clone()),
+            Path(created.id.clone()),
+            Json(InstancePatch {
+                name: Some("Skyblock".to_string()),
+                version_id: Some("1.21.2".to_string()),
+                max_memory_mb: Some(4096),
+                icon: Some("cloud".to_string()),
+                ..InstancePatch::default()
+            }),
+        )
+        .await
+        .expect("update instance");
+        assert_eq!(updated.id, created.id);
+        assert_eq!(updated.name, "Skyblock");
+        assert_eq!(updated.version_id, "1.21.2");
+        assert_eq!(updated.max_memory_mb, 4096);
+        assert_eq!(updated.icon, "cloud");
+
+        let game_dir = fixture.state.instances().game_dir(&created.id);
+        fs::write(game_dir.join("logs").join("latest.log"), "started").expect("write log");
+
+        let Json(body) = handle_delete_instance(
+            State(fixture.state.clone()),
+            Path(created.id.clone()),
+            Query(HashMap::new()),
+        )
+        .await
+        .expect("delete instance");
+        assert_eq!(body, serde_json::json!({ "status": "ok" }));
+        assert!(fixture.state.instances().get(&created.id).is_none());
+        assert!(!game_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn create_instance_duplicate_name_maps_to_conflict_json_error() {
+        let fixture = TestFixture::new("create-name-conflict");
+        let Json(original) = handle_create_instance(
+            State(fixture.state.clone()),
+            Json(CreateInstanceRequest {
+                name: "Survival".to_string(),
+                version_id: "1.21.1".to_string(),
+                icon: String::new(),
+                accent: String::new(),
+            }),
+        )
+        .await
+        .expect("create original instance");
+        assert_eq!(original.name, "Survival");
+
+        let (status, Json(body)) = handle_create_instance(
+            State(fixture.state.clone()),
+            Json(CreateInstanceRequest {
+                name: "Survival".to_string(),
+                version_id: "1.21.2".to_string(),
+                icon: String::new(),
+                accent: String::new(),
+            }),
+        )
+        .await
+        .expect_err("duplicate name should fail");
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body,
+            serde_json::json!({ "error": "failed to read instances: an instance with this name already exists" })
+        );
+        assert_eq!(fixture.state.instances().list().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn duplicate_instance_existing_name_maps_to_conflict_json_error() {
+        let fixture = TestFixture::new("duplicate-name-conflict");
+        let source = fixture
+            .state
+            .instances()
+            .add(
+                "Source".to_string(),
+                "1.21.1".to_string(),
+                String::new(),
+                String::new(),
+                None,
+            )
+            .expect("add source instance");
+        fixture
+            .state
+            .instances()
+            .add(
+                "Existing".to_string(),
+                "1.21.1".to_string(),
+                String::new(),
+                String::new(),
+                None,
+            )
+            .expect("add existing instance");
+
+        let (status, Json(body)) = handle_duplicate_instance(
+            State(fixture.state.clone()),
+            Path(source.id),
+            Some(Json(DuplicateInstanceRequest {
+                name: Some("Existing".to_string()),
+            })),
+        )
+        .await
+        .expect_err("duplicate name should fail");
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body,
+            serde_json::json!({ "error": "failed to read instances: an instance with this name already exists" })
+        );
+        assert_eq!(fixture.state.instances().list().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn missing_instance_crud_handlers_return_not_found_json_error() {
+        let fixture = TestFixture::new("missing-crud");
+
+        let (status, Json(body)) =
+            handle_get_instance(State(fixture.state.clone()), Path("missing".to_string()))
+                .await
+                .expect_err("missing get should fail");
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_bounded_error_body(&body, "instance not found");
+
+        let (status, Json(body)) = handle_update_instance(
+            State(fixture.state.clone()),
+            Path("missing".to_string()),
+            Json(InstancePatch {
+                name: Some("Nope".to_string()),
+                ..InstancePatch::default()
+            }),
+        )
+        .await
+        .expect_err("missing update should fail");
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_bounded_error_body(&body, "instance not found");
+
+        let (status, Json(body)) = handle_delete_instance(
+            State(fixture.state.clone()),
+            Path("missing".to_string()),
+            Query(HashMap::new()),
+        )
+        .await
+        .expect_err("missing delete should fail");
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_bounded_error_body(&body, "instance not found");
+    }
+
+    #[tokio::test]
+    async fn delete_instance_default_removes_files_and_keep_files_preserves_them() {
+        let fixture = TestFixture::new("delete-files");
+        let remove_files = fixture
+            .state
+            .instances()
+            .add(
+                "Remove files".to_string(),
+                "1.21.1".to_string(),
+                String::new(),
+                String::new(),
+                None,
+            )
+            .expect("add remove-files instance");
+        let remove_game_dir = fixture.state.instances().game_dir(&remove_files.id);
+        fs::write(remove_game_dir.join("mods").join("example.jar"), "mod").expect("write mod");
+
+        let Json(body) = handle_delete_instance(
+            State(fixture.state.clone()),
+            Path(remove_files.id.clone()),
+            Query(HashMap::new()),
+        )
+        .await
+        .expect("delete with default file removal");
+        assert_eq!(body, serde_json::json!({ "status": "ok" }));
+        assert!(!remove_game_dir.exists());
+
+        let keep_files = fixture
+            .state
+            .instances()
+            .add(
+                "Keep files".to_string(),
+                "1.21.1".to_string(),
+                String::new(),
+                String::new(),
+                None,
+            )
+            .expect("add keep-files instance");
+        let keep_game_dir = fixture.state.instances().game_dir(&keep_files.id);
+        let keep_marker = keep_game_dir.join("saves").join("world").join("level.dat");
+        fs::create_dir_all(keep_marker.parent().expect("marker parent")).expect("create world");
+        fs::write(&keep_marker, "level").expect("write level");
+
+        let Json(body) = handle_delete_instance(
+            State(fixture.state.clone()),
+            Path(keep_files.id.clone()),
+            Query(HashMap::from([(
+                "keep_files".to_string(),
+                "true".to_string(),
+            )])),
+        )
+        .await
+        .expect("delete while keeping files");
+        assert_eq!(body, serde_json::json!({ "status": "ok" }));
+
+        assert!(fixture.state.instances().get(&keep_files.id).is_none());
+        assert!(keep_marker.exists());
+    }
+
+    fn assert_bounded_error_body(body: &serde_json::Value, expected: &str) {
+        let object = body.as_object().expect("error body should be an object");
+        assert_eq!(object.len(), 1);
+        assert_eq!(
+            body.get("error").and_then(serde_json::Value::as_str),
+            Some(expected)
         );
     }
 
