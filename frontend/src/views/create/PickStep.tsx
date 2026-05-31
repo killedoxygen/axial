@@ -14,14 +14,6 @@ import {
 import { LoaderLogo } from './loader-logos';
 import { CHANNEL_LABEL, type VersionRowModel } from './view-model';
 
-const SOURCE_RAIL_TAGS: Record<LoaderKey, string> = {
-  vanilla: 'No mods',
-  fabric: 'Modern mods',
-  forge: 'Large mods',
-  neoforge: 'Modern Forge',
-  quilt: 'Curated mods',
-};
-
 export function PickStep({
   source,
   onSourcePick,
@@ -92,7 +84,6 @@ export function PickStep({
             class="cp-cr-rail-item"
             data-active={source === key}
             data-label={LOADER_LABELS[key]}
-            data-tag={LOADER_TAGLINES[key]}
             role="radio"
             aria-checked={source === key}
             aria-label={`${LOADER_LABELS[key]}: ${LOADER_TAGLINES[key]}`}
@@ -105,36 +96,14 @@ export function PickStep({
             <span class="cp-cr-rail-glyph">
               {renderSourceGlyph(key)}
             </span>
-            <span class="cp-cr-rail-copy">
-              <span class="cp-cr-rail-label">{LOADER_LABELS[key]}</span>
-              <span class="cp-cr-rail-tag">{SOURCE_RAIL_TAGS[key]}</span>
-            </span>
-            {source === key && (
-              <span class="cp-cr-rail-check" aria-hidden="true">
+            <span class="cp-cr-rail-label">{LOADER_LABELS[key]}</span>
+            <span class="cp-cr-rail-check" aria-hidden="true">
+              {source === key && (
                 <Icon name="check" size={13} stroke={2.2} />
-              </span>
-            )}
+              )}
+            </span>
           </button>
         ))}
-        <button
-          type="button"
-          class="cp-cr-rail-item cp-cr-rail-item--future"
-          data-label="Modpack"
-          data-tag="Import support planned"
-          role="radio"
-          aria-checked={false}
-          aria-disabled="true"
-          aria-label="Modpack import: import support is planned."
-          disabled
-        >
-          <span class="cp-cr-rail-glyph">
-            <Icon name="archive" size={15} stroke={1.8} />
-          </span>
-          <span class="cp-cr-rail-copy">
-            <span class="cp-cr-rail-label">Modpack</span>
-            <span class="cp-cr-rail-tag">Import planned</span>
-          </span>
-        </button>
       </aside>
       <p class="cp-cr-source-status" aria-live="polite">{selectedSourceText}</p>
 

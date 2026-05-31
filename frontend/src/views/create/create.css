@@ -178,9 +178,9 @@ button.cp-cr-stepper-item:focus-visible {
   position: relative;
   z-index: 4;
   flex-shrink: 0;
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  align-items: stretch;
+  display: flex;
+  align-items: center;
+  flex-wrap: nowrap;
   gap: 6px;
   padding: 0 0 10px;
   border-bottom: 1px solid var(--line);
@@ -189,15 +189,15 @@ button.cp-cr-stepper-item:focus-visible {
 .cp-cr-rail-item {
   position: relative;
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: flex-start;
   gap: 7px;
   min-width: 0;
-  min-height: 58px;
-  padding: 8px 8px 9px 7px;
+  height: 38px;
+  padding: 0 7px;
   border: 0;
   background: transparent;
-  border-radius: 10px;
+  border-radius: 9px;
   font: inherit;
   color: var(--text-dim);
   cursor: pointer;
@@ -220,13 +220,6 @@ button.cp-cr-stepper-item:focus-visible {
 }
 
 .cp-cr-rail-item:hover { color: var(--text); background: var(--surface-2); }
-.cp-cr-rail-item:disabled {
-  color: var(--text-mute);
-  cursor: not-allowed;
-  background: color-mix(in oklab, var(--surface-2) 48%, transparent);
-  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--line) 72%, transparent);
-}
-.cp-cr-rail-item:disabled::before { background: var(--text-mute); opacity: 0.35; }
 .cp-cr-rail-item:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
@@ -256,42 +249,27 @@ button.cp-cr-stepper-item:focus-visible {
 }
 .cp-cr-rail-label {
   min-width: 0;
-  font-size: 12px;
+  font-size: 12.5px;
   font-weight: 600;
   letter-spacing: -0.05px;
   line-height: 1;
   color: currentColor;
   white-space: nowrap;
 }
-.cp-cr-rail-copy {
-  display: flex;
-  flex: 1;
-  min-width: 0;
-  flex-direction: column;
-  gap: 4px;
-  padding-top: 1px;
-}
-.cp-cr-rail-tag {
-  display: block;
-  min-width: 0;
-  color: var(--text-mute);
-  font-size: 10.5px;
-  font-weight: 500;
-  letter-spacing: 0;
-  line-height: 1.22;
-  white-space: normal;
-}
 .cp-cr-rail-check {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 16px;
-  height: 16px;
-  margin-left: auto;
+  width: 15px;
+  height: 15px;
+  margin-left: 1px;
   border-radius: 50%;
   background: color-mix(in oklab, var(--accent) 18%, var(--surface));
   color: var(--accent);
   flex-shrink: 0;
+}
+.cp-cr-rail-check:empty {
+  background: transparent;
 }
 .cp-cr-source-status {
   margin: -8px 0 0;
@@ -1224,12 +1202,8 @@ button.cp-cr-tile:focus-visible {
 
 /* ── Tight viewports ──────────────────────────────────────────────────── */
 
-/* Mid widths: source tiles stay wide enough for readable descriptions. */
 @media (max-width: 980px) and (min-width: 721px) {
   .cp-cr-step--pick { max-width: 780px; }
-  .cp-cr-rail-item { min-height: 58px; padding-right: 7px; }
-  .cp-cr-rail-glyph { width: 22px; height: 22px; }
-  .cp-cr-rail-check { width: 15px; height: 15px; }
   .cp-cr-bento { grid-template-rows: minmax(140px, 1fr) minmax(140px, 1fr); }
   .cp-cr-tile { padding: 12px; }
   .cp-cr-tile--identity { padding: 14px; }
