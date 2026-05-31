@@ -274,13 +274,19 @@ function guardianOwnsLaunchOutcome(
   guardian: GuardianSummary | undefined,
   healing: LaunchHealingSummary | undefined,
 ): boolean {
-  if (!guardian || guardian.decision !== 'intervened') return false;
+  if (!guardian) return false;
+  if (guardian.decision === 'blocked' && guardianHasAuthoredDetails(guardian)) return true;
+  if (guardian.decision !== 'intervened') return false;
   if (!healing) return true;
   return !healing.failure_class && !healing.retry_count;
 }
 
+function guardianHasAuthoredDetails(guardian: GuardianSummary | undefined): boolean {
+  return Boolean(guardian?.details && guardian.details.length > 0);
+}
+
 function guardianOwnsLeadDetail(guardian: GuardianSummary | undefined): boolean {
-  return Boolean(guardian?.decision === 'blocked' && guardian.details && guardian.details.length > 0);
+  return Boolean(guardian?.decision === 'blocked' && guardianHasAuthoredDetails(guardian));
 }
 
 function launchOutcomeDetails(
@@ -289,14 +295,14 @@ function launchOutcomeDetails(
   leadDetail = '',
 ): string[] {
   const details: string[] = [];
-  const guardianHasAuthoredDetails = Boolean(guardian?.details && guardian.details.length > 0);
-  if (!guardianHasAuthoredDetails) {
+  const hasGuardianAuthoredDetails = guardianHasAuthoredDetails(guardian);
+  if (!hasGuardianAuthoredDetails) {
     pushUniqueNoticeDetail(details, leadDetail);
   }
   for (const detail of guardianNoticeDetails(guardian)) {
     pushUniqueNoticeDetail(details, detail);
   }
-  if (guardianHasAuthoredDetails && !guardianOwnsLeadDetail(guardian)) {
+  if (hasGuardianAuthoredDetails && !guardianOwnsLeadDetail(guardian)) {
     pushUniqueNoticeDetail(details, leadDetail);
   }
   const includeHealing = !guardianOwnsLaunchOutcome(guardian, healing);
