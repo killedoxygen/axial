@@ -238,7 +238,7 @@ pub fn cleanup_natives_dir(dir: &Path) -> io::Result<()> {
     fs::remove_dir_all(dir)
 }
 
-fn find_client_jar(
+pub(crate) fn find_client_jar(
     mc_dir: &Path,
     version: &VersionJson,
     original_version_id: &str,
@@ -287,7 +287,7 @@ fn find_client_jar(
     None
 }
 
-fn uses_module_bootstrap(version: &VersionJson) -> bool {
+pub(crate) fn uses_module_bootstrap(version: &VersionJson) -> bool {
     let Some(arguments) = &version.arguments else {
         return false;
     };

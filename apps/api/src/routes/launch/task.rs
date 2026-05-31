@@ -12,8 +12,8 @@ use croopor_config::{AppConfig, Instance, LAUNCH_AUTH_MODE_ONLINE, validate_user
 use croopor_launcher::{
     GuardianMode, GuardianSummary, LAUNCH_DISK_HEADROOM_MB, LAUNCH_MEMORY_HEADROOM_MB,
     LaunchAuthContext, LaunchCpuLoadWarningFacts, LaunchFailureClass, LaunchGuardianContext,
-    LaunchIntent, LaunchResourceWarningFacts, LaunchState, LaunchWarningFacts, failure_class_name,
-    summarize_launch_warnings,
+    LaunchIntent, LaunchReadiness, LaunchReadinessRequest, LaunchResourceWarningFacts, LaunchState,
+    LaunchWarningFacts, failure_class_name, inspect_launch_readiness, summarize_launch_warnings,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -53,6 +53,7 @@ struct LaunchPreflightFacts {
     requested_preset: String,
     guardian: LaunchGuardianContext,
     guardian_summary: GuardianSummary,
+    readiness: LaunchReadiness,
     resource_budget: LaunchProofResourceBudget,
 }
 
@@ -70,6 +71,7 @@ pub(super) struct LaunchPreflightResponse {
     pub mode: GuardianMode,
     pub memory: LaunchPreflightMemory,
     pub overrides: LaunchPreflightOverrides,
+    pub readiness: LaunchReadiness,
     pub resource_budget: LaunchPreflightResourceBudget,
 }
 
@@ -328,6 +330,12 @@ async fn build_launch_preflight_facts(
         &resource_budget,
         &guardian,
     );
+    let readiness = inspect_launch_readiness(&LaunchReadinessRequest {
+        library_dir: library_dir.to_path_buf(),
+        version_id: instance.version_id.clone(),
+        requested_java: requested_java.clone(),
+        guardian_mode: guardian.mode,
+    });
 
     LaunchPreflightFacts {
         config: config.clone(),
@@ -338,6 +346,7 @@ async fn build_launch_preflight_facts(
         requested_preset,
         guardian,
         guardian_summary,
+        readiness,
         resource_budget,
     }
 }
@@ -497,6 +506,7 @@ impl LaunchPreflightFacts {
                     self.guardian.raw_jvm_args_origin,
                 ),
             },
+            readiness: self.readiness,
             resource_budget: LaunchPreflightResourceBudget::from_budget(&self.resource_budget),
         }
     }
@@ -745,9 +755,15 @@ mod tests {
         routing::{get, post},
     };
     use croopor_config::{AppConfig, AppPaths, ConfigStore, InstanceStore};
-    use croopor_launcher::{GuardianDecision, OverrideOrigin, SessionId};
+    use croopor_launcher::{GuardianDecision, LaunchReadinessReasonId, OverrideOrigin, SessionId};
     use croopor_performance::PerformanceManager;
-    use std::{collections::HashMap, fs, path::PathBuf, sync::Arc, time::Duration};
+    use std::{
+        collections::HashMap,
+        fs,
+        path::{Path, PathBuf},
+        sync::Arc,
+        time::Duration,
+    };
     use tokio::sync::mpsc;
 
     #[tokio::test]
@@ -1275,6 +1291,8 @@ mod tests {
         assert!(preflight.memory.max_memory_mb > 0);
         assert!(preflight.memory.min_memory_mb >= 0);
         assert!(!preflight.memory.min_clamped);
+        assert!(!preflight.readiness.launchable);
+        assert_readiness_reason(&preflight, LaunchReadinessReasonId::VersionJsonMissing);
         assert_eq!(fixture.state.sessions().active_session_count().await, 0);
         assert!(
             !fixture
@@ -1283,6 +1301,45 @@ mod tests {
                 .has_active_instance(&instance_id)
                 .await
         );
+    }
+
+    #[tokio::test]
+    async fn launch_preflight_readiness_reports_missing_version_json() {
+        let fixture = TestFixture::new("preflight-readiness-missing-version-json");
+        let instance_id = fixture.add_instance("Survival", "1.21.1");
+
+        let preflight = prepare_launch_preflight(&fixture.state, instance_id)
+            .await
+            .expect("prepare preflight");
+
+        assert!(!preflight.readiness.launchable);
+        assert_eq!(preflight.readiness.reasons.len(), 1);
+        assert_readiness_reason(&preflight, LaunchReadinessReasonId::VersionJsonMissing);
+    }
+
+    #[tokio::test]
+    async fn launch_preflight_readiness_reports_missing_client_jar() {
+        let fixture = TestFixture::new("preflight-readiness-missing-client-jar");
+        fixture.write_version_json(
+            "1.21.1",
+            serde_json::json!({
+                "id": "1.21.1",
+                "type": "release",
+                "mainClass": "net.minecraft.client.main.Main",
+                "assetIndex": {},
+                "javaVersion": { "component": "java-runtime-delta", "majorVersion": 21 },
+                "libraries": []
+            }),
+        );
+        let instance_id = fixture.add_instance("Survival", "1.21.1");
+
+        let preflight = prepare_launch_preflight(&fixture.state, instance_id)
+            .await
+            .expect("prepare preflight");
+
+        assert!(!preflight.readiness.launchable);
+        assert_readiness_reason(&preflight, LaunchReadinessReasonId::ClientJarMissing);
+        assert_readiness_reason(&preflight, LaunchReadinessReasonId::ManagedRuntimeMissing);
     }
 
     #[tokio::test]
@@ -1310,6 +1367,7 @@ mod tests {
             preflight.overrides.raw_jvm_args.origin,
             Some(OverrideOrigin::Instance)
         );
+        assert_readiness_reason(&preflight, LaunchReadinessReasonId::JavaOverrideMissing);
         assert!(preflight.guardian.guidance.iter().any(|detail| detail
             == "Guardian Custom mode will keep the selected Java override for this launch."));
         assert!(preflight.guardian.guidance.iter().any(|detail| detail
@@ -1325,6 +1383,11 @@ mod tests {
         assert!(!payload.contains("java_path"));
         assert!(!payload.contains("command"));
         assert!(!payload.contains("username"));
+        for reason in &preflight.readiness.reasons {
+            assert!(!reason.message.contains("/Users/SecretUser"));
+            assert!(!reason.message.contains("manual/bin/java"));
+            assert!(!reason.message.contains("secret-token"));
+        }
     }
 
     #[tokio::test]
@@ -1920,6 +1983,16 @@ mod tests {
                 .expect("set global jvm preset");
         }
 
+        fn write_version_json(&self, version_id: &str, value: serde_json::Value) {
+            let version_dir = self.paths.library_dir.join("versions").join(version_id);
+            fs::create_dir_all(&version_dir).expect("version dir");
+            fs::write(
+                version_dir.join(format!("{version_id}.json")),
+                serde_json::to_vec(&value).expect("version json"),
+            )
+            .expect("write version json");
+        }
+
         async fn prepare(
             &self,
             instance_id: String,
@@ -2095,7 +2168,7 @@ mod tests {
         path
     }
 
-    fn test_paths(root: &std::path::Path) -> AppPaths {
+    fn test_paths(root: &Path) -> AppPaths {
         let config_dir = root.join("config");
         AppPaths {
             config_file: config_dir.join("config.json"),
@@ -2105,6 +2178,21 @@ mod tests {
             library_dir: root.join("library"),
             config_dir,
         }
+    }
+
+    fn assert_readiness_reason(
+        preflight: &LaunchPreflightResponse,
+        expected: LaunchReadinessReasonId,
+    ) {
+        assert!(
+            preflight
+                .readiness
+                .reasons
+                .iter()
+                .any(|reason| reason.id == expected),
+            "missing readiness reason {expected:?}: {:?}",
+            preflight.readiness.reasons
+        );
     }
 
     async fn token_test_server(

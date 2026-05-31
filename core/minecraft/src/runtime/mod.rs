@@ -184,6 +184,17 @@ pub fn list_java_runtimes(library_dir: &Path) -> Vec<JavaRuntimeResult> {
         .collect()
 }
 
+pub fn runtime_component_ready_without_probe(library_dir: &Path, component: &str) -> bool {
+    let mut dirs = runtime_dirs(library_dir);
+    dirs.push(runtime_cache_dir());
+    dirs.into_iter()
+        .any(|dir| component_runtime_ready_without_probe(&dir, component))
+}
+
+pub fn runtime_executable_ready_without_probe(java_exe: &Path) -> bool {
+    runtime_executable_ready(java_exe)
+}
+
 pub fn find_java_runtime(
     library_dir: &Path,
     java_version: &JavaVersion,
@@ -339,6 +350,20 @@ fn resolve_component_runtime(
         component: component.0.clone(),
         major: required_major,
     })
+}
+
+fn component_runtime_ready_without_probe(base_dir: &Path, component: &str) -> bool {
+    if !base_dir.exists() {
+        return false;
+    }
+
+    let os_arch = runtime_os_arch();
+    [
+        base_dir.join(component).join(&os_arch).join(component),
+        base_dir.join(component),
+    ]
+    .into_iter()
+    .any(|candidate| detect_runtime_state(&candidate) == RuntimeInstallState::Ready)
 }
 
 fn resolve_managed_runtime(

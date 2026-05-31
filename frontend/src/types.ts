@@ -310,12 +310,35 @@ export interface LaunchPreflightResourceBudget {
   disk_pressure: boolean;
 }
 
+export type LaunchReadinessReasonId =
+  | 'version_json_missing'
+  | 'client_jar_missing'
+  | 'parent_version_missing'
+  | 'libraries_missing'
+  | 'asset_index_missing'
+  | 'managed_runtime_missing'
+  | 'java_override_missing';
+
+export type LaunchReadinessSeverity = 'blocking';
+
+export interface LaunchReadinessReason {
+  id: LaunchReadinessReasonId;
+  severity: LaunchReadinessSeverity;
+  message: string;
+}
+
+export interface LaunchReadiness {
+  launchable: boolean;
+  reasons: LaunchReadinessReason[];
+}
+
 export interface LaunchPreflightResponse {
   status: 'ready';
   guardian: GuardianSummary;
   mode: GuardianMode;
   memory: LaunchPreflightMemory;
   overrides: LaunchPreflightOverrides;
+  readiness: LaunchReadiness;
   resource_budget: LaunchPreflightResourceBudget;
 }
 

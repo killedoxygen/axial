@@ -48,7 +48,8 @@ pub use rules::{
 pub use runtime::{
     RuntimeEnsureAction, RuntimeEnsureResult, RuntimeId, RuntimeInstallState, RuntimeOverride,
     RuntimeRecord, RuntimeRequirement, RuntimeSource, ensure_runtime, list_runtime_records,
-    parse_runtime_override, runtime_requirement,
+    parse_runtime_override, runtime_component_ready_without_probe,
+    runtime_executable_ready_without_probe, runtime_requirement,
 };
 pub use types::{VersionEntry, VersionLoaderAttachment, VersionSubjectKind};
 pub use version::scan_versions;

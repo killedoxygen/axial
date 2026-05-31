@@ -1293,6 +1293,16 @@ function guardianDecisionIcon(decision: LaunchPreflightResponse['guardian']['dec
 function guardianReadyCopy(preflight: LaunchPreflightResponse): { title: string; detail: string } {
   const guardian = preflight.guardian;
   const firstDetail = guardian.details?.[0] || guardian.guidance?.[0];
+  if (guardian.decision === 'blocked' && guardian.message) {
+    return { title: guardian.message, detail: firstDetail || `${guardianModeLabel(preflight.mode)} preflight is ready.` };
+  }
+  const firstBlockingReadiness = preflight.readiness.reasons.find(reason => reason.severity === 'blocking');
+  if (!preflight.readiness.launchable && firstBlockingReadiness) {
+    return {
+      title: 'Launch setup incomplete',
+      detail: firstBlockingReadiness.message,
+    };
+  }
   if (guardian.message) {
     return { title: guardian.message, detail: firstDetail || `${guardianModeLabel(preflight.mode)} preflight is ready.` };
   }
@@ -1365,8 +1375,12 @@ function GuardianPreflightCard({ inst, onOpenSettings }: {
           title: 'Checking Guardian preflight',
           detail: 'Reading backend launch policy for this instance.',
         };
-  const tone = ready ? guardianDecisionTone(ready.guardian.decision) : preflight.status === 'loading' ? 'mute' : 'warn';
-  const icon = ready ? guardianDecisionIcon(ready.guardian.decision) : preflight.status === 'loading' ? 'info' : 'alert';
+  const tone = ready
+    ? ready.readiness.launchable ? guardianDecisionTone(ready.guardian.decision) : 'err'
+    : preflight.status === 'loading' ? 'mute' : 'warn';
+  const icon = ready
+    ? ready.readiness.launchable ? guardianDecisionIcon(ready.guardian.decision) : 'alert'
+    : preflight.status === 'loading' ? 'info' : 'alert';
   const java = ready?.overrides.java;
   const preset = ready?.overrides.preset;
   const rawJvmArgs = ready?.overrides.raw_jvm_args;
