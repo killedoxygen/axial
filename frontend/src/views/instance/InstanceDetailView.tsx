@@ -5,7 +5,7 @@ import { Button, Card, IconButton, Input, Pill, SectionHeading } from '../../ui/
 import { Slider, type SliderZone } from '../../ui/Slider';
 import { useTheme } from '../../hooks/use-theme';
 import { InstanceArt, artPresetForSeed, artSeedFor, nextArtSeed } from '../../art/InstanceArt';
-import { showConfirm } from '../../ui/Dialog';
+import { showChoice } from '../../ui/Dialog';
 import { openContextMenu } from '../../ui/ContextMenu';
 import { config, instances, launchNotices, launchState, runningSessions, systemInfo, versions } from '../../store';
 import type { LaunchState } from '../../store';
@@ -82,16 +82,22 @@ async function duplicateInstance(inst: EnrichedInstance): Promise<void> {
 }
 
 async function deleteInstanceFlow(inst: EnrichedInstance, onDone?: () => void): Promise<void> {
-  const ok = await showConfirm(
-    `Delete "${inst.name}" and everything inside it? Saves, mods, and config will be removed.`,
-    { title: 'Delete instance', destructive: true, confirmText: 'Delete' },
+  const choice = await showChoice<'keep-files' | 'delete-files'>(
+    `Remove "${inst.name}" from the launcher but keep files on disk, or delete the instance and its saves, mods, and config.`,
+    [
+      { value: 'keep-files', label: 'Remove, keep files', variant: 'secondary' },
+      { value: 'delete-files', label: 'Delete instance and files', variant: 'danger' },
+    ],
+    { title: 'Remove instance' },
   );
-  if (!ok) return;
+  if (!choice) return;
+  const keepFiles = choice === 'keep-files';
   try {
-    const res: any = await api('DELETE', `/instances/${encodeURIComponent(inst.id)}`);
+    const suffix = keepFiles ? '?keep_files=true' : '';
+    const res: any = await api('DELETE', `/instances/${encodeURIComponent(inst.id)}${suffix}`);
     if (res?.error) throw new Error(res.error);
     removeInstance(inst.id);
-    toast('Instance deleted');
+    toast(keepFiles ? 'Removed from launcher; files kept on disk' : 'Instance deleted');
     onDone?.();
   } catch (err) {
     toast(`Failed: ${errMessage(err)}`, 'error');

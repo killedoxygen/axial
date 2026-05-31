@@ -5,6 +5,13 @@ import { Button, Input } from './Atoms';
 import './dialog.css';
 
 type DialogResult = boolean | string | null;
+type DialogButtonVariant = 'primary' | 'secondary' | 'soft' | 'ghost' | 'danger';
+
+interface DialogChoice<T extends string = string> {
+  value: T;
+  label: string;
+  variant?: DialogButtonVariant;
+}
 
 interface PromptOptions {
   title?: string;
@@ -17,7 +24,7 @@ interface PromptOptions {
 }
 
 interface DialogSpec {
-  kind: 'confirm' | 'prompt' | 'alert';
+  kind: 'confirm' | 'prompt' | 'alert' | 'choice';
   title?: string;
   message: string;
   initialValue?: string;
@@ -25,6 +32,7 @@ interface DialogSpec {
   confirmText?: string;
   cancelText?: string | null;
   destructive?: boolean;
+  choices?: DialogChoice[];
   validate?: (value: string) => string | null;
   normalizeInput?: (value: string) => string;
   normalizeValue?: (value: string) => string;
@@ -36,7 +44,7 @@ const current = signal<DialogSpec | null>(null);
 function cancelCurrent(): void {
   const spec = current.value;
   if (!spec) return;
-  spec.resolve(spec.kind === 'prompt' ? null : false);
+  spec.resolve(spec.kind === 'prompt' || spec.kind === 'choice' ? null : false);
   current.value = null;
 }
 
@@ -69,6 +77,24 @@ export function showAlert(message: string, title?: string): Promise<void> {
   });
 }
 
+export function showChoice<T extends string>(
+  message: string,
+  choices: Array<DialogChoice<T>>,
+  opts: { title?: string; cancelText?: string | null } = {},
+): Promise<T | null> {
+  return new Promise(resolve => {
+    cancelCurrent();
+    current.value = {
+      kind: 'choice',
+      title: opts.title,
+      message,
+      cancelText: opts.cancelText === null ? null : (opts.cancelText || 'Cancel'),
+      choices,
+      resolve: (v) => resolve(typeof v === 'string' ? v as T : null),
+    };
+  });
+}
+
 export function prompt(message: string, initial = '', opts: PromptOptions = {}): Promise<string | null> {
   return new Promise(resolve => {
     cancelCurrent();
@@ -95,6 +121,7 @@ export function DialogHost(): JSX.Element | null {
   const [touched, setTouched] = useState(false);
   const dialogRef = useRef<HTMLDivElement>(null);
   const primaryRef = useRef<HTMLButtonElement>(null);
+  const cancelRef = useRef<HTMLButtonElement>(null);
 
   const promptError = spec?.kind === 'prompt' ? (spec.validate?.(draft) ?? null) : null;
   const showPromptError = spec?.kind === 'prompt' && promptError !== null && (touched || draft.length > 0);
@@ -117,6 +144,12 @@ export function DialogHost(): JSX.Element | null {
     current.value = null;
   };
 
+  const resolveChoice = (value: string): void => {
+    if (!spec || spec.kind !== 'choice') return;
+    spec.resolve(value);
+    current.value = null;
+  };
+
   useEffect(() => {
     if (!spec) return;
     if (spec.kind === 'prompt') {
@@ -128,7 +161,11 @@ export function DialogHost(): JSX.Element | null {
   useEffect(() => {
     if (!spec) return;
     const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    if (spec.kind !== 'prompt') {
+    if (spec.kind === 'choice') {
+      window.requestAnimationFrame(() => {
+        (cancelRef.current || dialogRef.current?.querySelector<HTMLButtonElement>('button'))?.focus();
+      });
+    } else if (spec.kind !== 'prompt') {
       window.requestAnimationFrame(() => primaryRef.current?.focus());
     }
     const dialog = dialogRef.current;
@@ -167,7 +204,7 @@ export function DialogHost(): JSX.Element | null {
 
   return (
     <div class="cp-dialog-overlay" onClick={(e) => { if (e.target === e.currentTarget) resolveAs(false); }}>
-      <div ref={dialogRef} class="cp-dialog" role="dialog" aria-modal="true" aria-labelledby={spec.title ? 'cp-dlg-title' : undefined}>
+      <div ref={dialogRef} class={`cp-dialog${spec.kind === 'choice' ? ' cp-dialog--choice' : ''}`} role="dialog" aria-modal="true" aria-labelledby={spec.title ? 'cp-dlg-title' : undefined}>
         {spec.title && <h2 id="cp-dlg-title" class="cp-dialog-title">{spec.title}</h2>}
         {spec.message && <p class="cp-dialog-body">{spec.message}</p>}
         {spec.kind === 'prompt' && (
@@ -185,16 +222,28 @@ export function DialogHost(): JSX.Element | null {
             {showPromptError && <div class="cp-dialog-error">{promptError}</div>}
           </>
         )}
-        <div class="cp-dialog-actions">
+        <div class={`cp-dialog-actions${spec.kind === 'choice' ? ' cp-dialog-actions--choice' : ''}`}>
           {spec.cancelText && (
-            <Button variant="ghost" onClick={() => resolveAs(false)}>{spec.cancelText}</Button>
+            <Button buttonRef={cancelRef} variant="ghost" onClick={() => resolveAs(false)}>{spec.cancelText}</Button>
           )}
-          <Button
-            buttonRef={primaryRef}
-            variant={spec.destructive ? 'danger' : 'primary'}
-            disabled={spec.kind === 'prompt' && promptError !== null}
-            onClick={() => resolveAs(true)}
-          >{spec.confirmText}</Button>
+          {spec.kind === 'choice'
+            ? spec.choices?.map((choice) => (
+              <Button
+                key={choice.value}
+                variant={choice.variant || 'secondary'}
+                onClick={() => resolveChoice(choice.value)}
+              >
+                {choice.label}
+              </Button>
+            ))
+            : (
+              <Button
+                buttonRef={primaryRef}
+                variant={spec.destructive ? 'danger' : 'primary'}
+                disabled={spec.kind === 'prompt' && promptError !== null}
+                onClick={() => resolveAs(true)}
+              >{spec.confirmText}</Button>
+            )}
         </div>
       </div>
     </div>

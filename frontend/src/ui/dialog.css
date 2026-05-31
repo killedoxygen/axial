@@ -23,6 +23,9 @@
   gap: 16px;
   animation: cp-float-up 160ms ease;
 }
+.cp-dialog--choice {
+  width: min(520px, 100%);
+}
 .cp-dialog-title {
   margin: 0;
   font-size: 17px;
@@ -40,6 +43,9 @@
   display: flex;
   gap: 8px;
   justify-content: flex-end;
+}
+.cp-dialog-actions--choice {
+  flex-wrap: wrap;
 }
 .cp-dialog-error {
   margin-top: -6px;
