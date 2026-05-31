@@ -23,6 +23,7 @@ ed25519-dalek = "2.2.0"
 futures-util = "0.3.32"
 include_dir = "0.7.4"
 md5 = "0.8.0"
+png = "0.17.16"
 reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls"] }
 regex = "1.12.2"
 serde = { version = "1.0.228", features = ["derive"] }

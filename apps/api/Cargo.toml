@@ -12,9 +12,11 @@ chrono.workspace = true
 futures-util.workspace = true
 include_dir.workspace = true
 keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "windows-native", "linux-native-sync-persistent", "crypto-rust"] }
+png.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 shlex.workspace = true
 sysinfo.workspace = true
 thiserror.workspace = true

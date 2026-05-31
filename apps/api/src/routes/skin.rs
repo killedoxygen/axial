@@ -2,21 +2,29 @@ use crate::state::AppState;
 use crate::state::{AuthLoginMinecraftAccount, AuthLoginMinecraftSkin};
 use axum::{
     Json, Router,
-    body::Body,
+    body::{Body, to_bytes},
     extract::{Query, State},
     http::{Response, StatusCode, header},
-    routing::get,
+    routing::{get, post},
 };
 use croopor_config::validate_username;
 use croopor_minecraft::offline_uuid;
 use serde::{Deserialize, Serialize};
-use std::fmt::Write;
+use sha2::{Digest, Sha256};
+use std::{fmt::Write, io::Cursor};
 
 const DEFAULT_HEAD_SIZE: u32 = 64;
 const MIN_HEAD_SIZE: u32 = 16;
 const MAX_HEAD_SIZE: u32 = 256;
 const HEAD_CACHE_CONTROL: &str = "private, max-age=86400";
 const MINECRAFT_TEXTURE_URL_PREFIX: &str = "https://textures.minecraft.net/texture/";
+const SKIN_UPLOAD_MAX_BYTES: usize = 256 * 1024;
+const SKIN_WIDTH: u32 = 64;
+const SKIN_HEIGHT: u32 = 64;
+const LEGACY_SKIN_HEIGHT: u32 = 32;
+const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+
+type ApiError = (StatusCode, Json<serde_json::Value>);
 
 #[derive(Debug, Default, Deserialize)]
 struct SkinQuery {
@@ -35,10 +43,22 @@ struct SkinProfileResponse {
     head_url: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct SkinNormalizeResponse {
+    texture_key: String,
+    variant_suggestion: &'static str,
+    original_width: u32,
+    original_height: u32,
+    normalized_width: u32,
+    normalized_height: u32,
+    normalized_byte_size: usize,
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/skin/profile", get(handle_skin_profile))
         .route("/api/v1/skin/head", get(handle_skin_head))
+        .route("/api/v1/skins/normalize", post(handle_skin_normalize))
 }
 
 async fn handle_skin_profile(
@@ -143,7 +163,7 @@ fn sane_minecraft_texture_url(url: &str) -> Option<String> {
 async fn handle_skin_head(
     State(state): State<AppState>,
     Query(query): Query<SkinQuery>,
-) -> Result<Response<Body>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Response<Body>, ApiError> {
     let config = state.config().current();
     let identity = select_offline_identity(query.username.as_deref(), &config.username)?;
     let size = clamp_head_size(query.size);
@@ -162,6 +182,181 @@ async fn handle_skin_head(
         })
 }
 
+async fn handle_skin_normalize(body: Body) -> Result<Json<SkinNormalizeResponse>, ApiError> {
+    let bytes = to_bytes(body, SKIN_UPLOAD_MAX_BYTES)
+        .await
+        .map_err(|_| json_error(StatusCode::PAYLOAD_TOO_LARGE, "skin upload is too large"))?;
+    let normalized = normalize_skin_png(&bytes)?;
+
+    Ok(Json(SkinNormalizeResponse {
+        texture_key: texture_key(&normalized.png_bytes),
+        variant_suggestion: "classic",
+        original_width: normalized.original_width,
+        original_height: normalized.original_height,
+        normalized_width: SKIN_WIDTH,
+        normalized_height: SKIN_HEIGHT,
+        normalized_byte_size: normalized.png_bytes.len(),
+    }))
+}
+
+struct NormalizedSkinPng {
+    original_width: u32,
+    original_height: u32,
+    png_bytes: Vec<u8>,
+}
+
+fn normalize_skin_png(bytes: &[u8]) -> Result<NormalizedSkinPng, ApiError> {
+    if !bytes.starts_with(PNG_SIGNATURE) {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "skin upload must be a PNG",
+        ));
+    }
+
+    let decoded = decode_skin_png(bytes)?;
+    if decoded.width != SKIN_WIDTH || !matches!(decoded.height, LEGACY_SKIN_HEIGHT | SKIN_HEIGHT) {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "skin image must be 64x64 or 64x32",
+        ));
+    }
+
+    let normalized_rgba = if decoded.height == LEGACY_SKIN_HEIGHT {
+        normalize_legacy_skin_rgba(&decoded.rgba)
+    } else {
+        decoded.rgba
+    };
+    let png_bytes = encode_skin_png(&normalized_rgba)?;
+
+    Ok(NormalizedSkinPng {
+        original_width: decoded.width,
+        original_height: decoded.height,
+        png_bytes,
+    })
+}
+
+struct DecodedSkinPng {
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+}
+
+fn decode_skin_png(bytes: &[u8]) -> Result<DecodedSkinPng, ApiError> {
+    let mut decoder = png::Decoder::new(Cursor::new(bytes));
+    decoder.set_transformations(
+        png::Transformations::EXPAND | png::Transformations::ALPHA | png::Transformations::STRIP_16,
+    );
+    let mut reader = decoder
+        .read_info()
+        .map_err(|_| json_error(StatusCode::BAD_REQUEST, "skin upload must be a valid PNG"))?;
+    let info = reader.info();
+    if info.width != SKIN_WIDTH || !matches!(info.height, LEGACY_SKIN_HEIGHT | SKIN_HEIGHT) {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "skin image must be 64x64 or 64x32",
+        ));
+    }
+
+    let mut buffer = vec![0; reader.output_buffer_size()];
+    let frame = reader
+        .next_frame(&mut buffer)
+        .map_err(|_| json_error(StatusCode::BAD_REQUEST, "skin upload must be a valid PNG"))?;
+    let rgba = png_frame_to_rgba(
+        &buffer[..frame.buffer_size()],
+        frame.color_type,
+        frame.bit_depth,
+    )?;
+
+    Ok(DecodedSkinPng {
+        width: frame.width,
+        height: frame.height,
+        rgba,
+    })
+}
+
+fn png_frame_to_rgba(
+    data: &[u8],
+    color_type: png::ColorType,
+    bit_depth: png::BitDepth,
+) -> Result<Vec<u8>, ApiError> {
+    if bit_depth != png::BitDepth::Eight {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "skin upload must be a valid PNG",
+        ));
+    }
+
+    match color_type {
+        png::ColorType::Rgba => Ok(data.to_vec()),
+        png::ColorType::Rgb => {
+            let mut rgba = Vec::with_capacity(data.len() / 3 * 4);
+            for pixel in data.chunks_exact(3) {
+                rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
+            }
+            Ok(rgba)
+        }
+        png::ColorType::GrayscaleAlpha => {
+            let mut rgba = Vec::with_capacity(data.len() / 2 * 4);
+            for pixel in data.chunks_exact(2) {
+                rgba.extend_from_slice(&[pixel[0], pixel[0], pixel[0], pixel[1]]);
+            }
+            Ok(rgba)
+        }
+        png::ColorType::Grayscale => {
+            let mut rgba = Vec::with_capacity(data.len() * 4);
+            for value in data {
+                rgba.extend_from_slice(&[*value, *value, *value, 255]);
+            }
+            Ok(rgba)
+        }
+        png::ColorType::Indexed => Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "skin upload must be a valid PNG",
+        )),
+    }
+}
+
+fn normalize_legacy_skin_rgba(rgba: &[u8]) -> Vec<u8> {
+    let mut normalized = vec![0; (SKIN_WIDTH * SKIN_HEIGHT * 4) as usize];
+    let row_len = (SKIN_WIDTH * 4) as usize;
+    for row in 0..LEGACY_SKIN_HEIGHT as usize {
+        let offset = row * row_len;
+        normalized[offset..offset + row_len].copy_from_slice(&rgba[offset..offset + row_len]);
+    }
+    normalized
+}
+
+fn encode_skin_png(rgba: &[u8]) -> Result<Vec<u8>, ApiError> {
+    let mut bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut bytes, SKIN_WIDTH, SKIN_HEIGHT);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().map_err(|_| {
+            json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to normalize skin image",
+            )
+        })?;
+        writer.write_image_data(rgba).map_err(|_| {
+            json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to normalize skin image",
+            )
+        })?;
+    }
+    Ok(bytes)
+}
+
+fn texture_key(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut key = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut key, "{byte:02x}").expect("write sha256 hex");
+    }
+    key
+}
+
 struct OfflineIdentity {
     username: String,
     uuid: String,
@@ -171,7 +366,7 @@ struct OfflineIdentity {
 fn select_offline_identity(
     query_username: Option<&str>,
     config_username: &str,
-) -> Result<OfflineIdentity, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<OfflineIdentity, ApiError> {
     let selected_username = query_username
         .map(str::trim)
         .filter(|username| !username.is_empty())
@@ -190,6 +385,10 @@ fn select_offline_identity(
         uuid,
         variant,
     })
+}
+
+fn json_error(status: StatusCode, message: &'static str) -> ApiError {
+    (status, Json(serde_json::json!({ "error": message })))
 }
 
 fn offline_variant(uuid: &str) -> &'static str {
@@ -703,6 +902,97 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn skin_normalize_64x64_png_succeeds() {
+        let png = test_skin_png(SKIN_WIDTH, SKIN_HEIGHT);
+
+        let response = normalize_skin_body(png)
+            .await
+            .expect("normalize response")
+            .0;
+
+        assert_eq!(response.variant_suggestion, "classic");
+        assert_eq!(response.original_width, SKIN_WIDTH);
+        assert_eq!(response.original_height, SKIN_HEIGHT);
+        assert_eq!(response.normalized_width, SKIN_WIDTH);
+        assert_eq!(response.normalized_height, SKIN_HEIGHT);
+        assert!(response.normalized_byte_size > 0);
+        assert_texture_key(&response.texture_key);
+    }
+
+    #[tokio::test]
+    async fn skin_normalize_64x32_png_normalizes_to_64x64() {
+        let png = test_skin_png(SKIN_WIDTH, LEGACY_SKIN_HEIGHT);
+
+        let response = normalize_skin_body(png.clone())
+            .await
+            .expect("normalize response")
+            .0;
+        let repeated = normalize_skin_body(png)
+            .await
+            .expect("repeat normalize response")
+            .0;
+
+        assert_eq!(response.original_width, SKIN_WIDTH);
+        assert_eq!(response.original_height, LEGACY_SKIN_HEIGHT);
+        assert_eq!(response.normalized_width, SKIN_WIDTH);
+        assert_eq!(response.normalized_height, SKIN_HEIGHT);
+        assert_eq!(response.texture_key, repeated.texture_key);
+        assert_eq!(response.normalized_byte_size, repeated.normalized_byte_size);
+        assert_texture_key(&response.texture_key);
+    }
+
+    #[tokio::test]
+    async fn skin_normalize_rejects_non_png() {
+        let error = normalize_skin_body(b"/home/zero/not-a-skin".to_vec())
+            .await
+            .expect_err("non-png should fail");
+
+        assert_skin_normalize_error(error, StatusCode::BAD_REQUEST, "skin upload must be a PNG");
+    }
+
+    #[tokio::test]
+    async fn skin_normalize_rejects_bad_dimensions() {
+        let error = normalize_skin_body(test_skin_png(32, 32))
+            .await
+            .expect_err("bad dimensions should fail");
+
+        assert_skin_normalize_error(
+            error,
+            StatusCode::BAD_REQUEST,
+            "skin image must be 64x64 or 64x32",
+        );
+    }
+
+    #[tokio::test]
+    async fn skin_normalize_rejects_malformed_png_with_bounded_error() {
+        let mut body = PNG_SIGNATURE.to_vec();
+        body.extend_from_slice(b"/home/zero/corrupt-skin");
+
+        let error = normalize_skin_body(body)
+            .await
+            .expect_err("malformed png should fail");
+
+        assert_skin_normalize_error(
+            error,
+            StatusCode::BAD_REQUEST,
+            "skin upload must be a valid PNG",
+        );
+    }
+
+    #[tokio::test]
+    async fn skin_normalize_rejects_oversized_body() {
+        let error = normalize_skin_body(vec![0; SKIN_UPLOAD_MAX_BYTES + 1])
+            .await
+            .expect_err("oversized body should fail");
+
+        assert_skin_normalize_error(
+            error,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "skin upload is too large",
+        );
+    }
+
     struct TestFixture {
         state: AppState,
         root: PathBuf,
@@ -844,6 +1134,51 @@ mod tests {
             .await
             .expect("read response body");
         String::from_utf8(bytes.to_vec()).expect("utf-8 body")
+    }
+
+    async fn normalize_skin_body(
+        body: Vec<u8>,
+    ) -> Result<Json<SkinNormalizeResponse>, (StatusCode, Json<serde_json::Value>)> {
+        handle_skin_normalize(Body::from(body)).await
+    }
+
+    fn test_skin_png(width: u32, height: u32) -> Vec<u8> {
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                rgba.extend_from_slice(&[
+                    x.wrapping_mul(3) as u8,
+                    y.wrapping_mul(5) as u8,
+                    x.wrapping_add(y) as u8,
+                    255,
+                ]);
+            }
+        }
+
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, width, height);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().expect("write png header");
+            writer.write_image_data(&rgba).expect("write png pixels");
+        }
+        bytes
+    }
+
+    fn assert_texture_key(value: &str) {
+        assert_eq!(value.len(), 64);
+        assert!(value.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    fn assert_skin_normalize_error(
+        error: (StatusCode, Json<serde_json::Value>),
+        expected_status: StatusCode,
+        expected_message: &'static str,
+    ) {
+        assert_eq!(error.0, expected_status);
+        assert_eq!(error.1.0, serde_json::json!({ "error": expected_message }));
+        assert_eq!(error.1.0.as_object().expect("json object").len(), 1);
     }
 
     fn test_profile(name: &str, skins: Vec<AuthLoginMinecraftSkin>) -> AuthLoginMinecraftProfile {
