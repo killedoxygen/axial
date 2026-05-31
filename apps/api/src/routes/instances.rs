@@ -15,6 +15,8 @@ use std::{
 };
 
 const LOG_TAIL_LIMIT: u64 = 128 * 1024;
+const INSTANCE_LOG_READ_ERROR_MESSAGE: &str =
+    "Could not read the instance log. Check instance folder permissions and try again.";
 
 const INSTANCE_SUBFOLDERS: [&str; 7] = [
     "mods",
@@ -376,6 +378,17 @@ fn instance_folder_open_error_response(
     )
 }
 
+fn instance_log_read_error_response(
+    _error: std::io::Error,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "error": INSTANCE_LOG_READ_ERROR_MESSAGE
+        })),
+    )
+}
+
 fn resolve_instance_folder(game_dir: &FsPath, sub: Option<&str>) -> Result<PathBuf, &'static str> {
     match sub {
         None => Ok(game_dir.to_path_buf()),
@@ -460,33 +473,15 @@ async fn handle_instance_log_tail(
         ));
     }
 
-    let metadata = fs::metadata(&path).map_err(|error| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": format!("failed to read log metadata: {error}") })),
-        )
-    })?;
+    let metadata = fs::metadata(&path).map_err(instance_log_read_error_response)?;
     let size = metadata.len();
     let start = size.saturating_sub(LOG_TAIL_LIMIT);
-    let mut file = fs::File::open(&path).map_err(|error| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": format!("failed to open log: {error}") })),
-        )
-    })?;
-    file.seek(SeekFrom::Start(start)).map_err(|error| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": format!("failed to read log: {error}") })),
-        )
-    })?;
+    let mut file = fs::File::open(&path).map_err(instance_log_read_error_response)?;
+    file.seek(SeekFrom::Start(start))
+        .map_err(instance_log_read_error_response)?;
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(|error| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": format!("failed to read log: {error}") })),
-        )
-    })?;
+    file.read_to_end(&mut bytes)
+        .map_err(instance_log_read_error_response)?;
 
     Ok(Json(InstanceLogTailResponse {
         name,
@@ -840,6 +835,41 @@ mod tests {
             instance_folder_open_error_response,
             "Could not open the instance folder. Check desktop permissions and try again.",
         );
+    }
+
+    #[test]
+    fn instance_log_read_error_response_bounds_public_metadata_open_and_read_messages() {
+        let cases = [
+            "metadata failed for /home/zero/.config/Croopor/instances/test/logs/latest.log",
+            "open failed for C:\\Users\\Zero\\AppData\\Roaming\\Croopor\\instances\\test\\logs\\debug.log",
+            "Permission denied (os error 13) while reading logs/latest.log",
+        ];
+
+        for internal_message in cases {
+            let (status, Json(body)) =
+                instance_log_read_error_response(io::Error::other(internal_message));
+
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_bounded_error_body(&body, INSTANCE_LOG_READ_ERROR_MESSAGE);
+            let public_message = error_body_text(&body);
+            for hidden_fragment in [
+                "/home/zero",
+                ".config",
+                "C:\\Users\\Zero",
+                "AppData",
+                "Permission denied",
+                "os error 13",
+                "latest.log",
+                "debug.log",
+                "logs/",
+                "\\logs\\",
+            ] {
+                assert!(
+                    !public_message.contains(hidden_fragment),
+                    "{hidden_fragment:?} leaked in {public_message:?}"
+                );
+            }
+        }
     }
 
     #[test]
