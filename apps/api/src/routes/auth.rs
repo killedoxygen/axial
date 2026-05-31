@@ -1067,11 +1067,11 @@ fn auth_login_error_response(error: AuthLoginError) -> (StatusCode, Json<serde_j
     let (status, message) = match error {
         AuthLoginError::ClientBuild => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to initialize Microsoft sign-in request",
+            "Could not start Microsoft sign-in. Restart Croopor and try again.",
         ),
         AuthLoginError::Request => (
             StatusCode::BAD_GATEWAY,
-            "failed to reach Microsoft sign-in service",
+            "Could not reach Microsoft sign-in. Check your connection and try again.",
         ),
         AuthLoginError::UpstreamStatus(status) => {
             if status.as_u16() >= 500 {
@@ -1088,7 +1088,7 @@ fn auth_login_error_response(error: AuthLoginError) -> (StatusCode, Json<serde_j
         }
         AuthLoginError::Parse => (
             StatusCode::BAD_GATEWAY,
-            "failed to parse Microsoft sign-in response",
+            "Microsoft sign-in returned an unexpected response. Try again later.",
         ),
     };
 
@@ -1471,6 +1471,88 @@ mod tests {
 
         assert_eq!(response.0, StatusCode::NOT_IMPLEMENTED);
         assert_eq!(response.1.0, unavailable_json());
+    }
+
+    #[test]
+    fn auth_login_error_response_returns_product_copy_with_existing_statuses() {
+        for (error, expected_status, expected_message) in [
+            (
+                AuthLoginError::ClientBuild,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not start Microsoft sign-in. Restart Croopor and try again.",
+            ),
+            (
+                AuthLoginError::Request,
+                StatusCode::BAD_GATEWAY,
+                "Could not reach Microsoft sign-in. Check your connection and try again.",
+            ),
+            (
+                AuthLoginError::Parse,
+                StatusCode::BAD_GATEWAY,
+                "Microsoft sign-in returned an unexpected response. Try again later.",
+            ),
+        ] {
+            let response = auth_login_error_response(error);
+
+            assert_eq!(response.0, expected_status);
+            assert_eq!(
+                response.1.0,
+                serde_json::json!({ "error": expected_message })
+            );
+            assert_no_auth_login_error_diagnostic_fragments(&response.1.0);
+        }
+    }
+
+    #[test]
+    fn auth_login_error_response_preserves_upstream_status_copy() {
+        let rejected =
+            auth_login_error_response(AuthLoginError::UpstreamStatus(StatusCode::BAD_REQUEST));
+        let unavailable = auth_login_error_response(AuthLoginError::UpstreamStatus(
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ));
+
+        assert_eq!(rejected.0, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            rejected.1.0,
+            serde_json::json!({ "error": "Microsoft sign-in request was rejected" })
+        );
+        assert_no_auth_login_error_diagnostic_fragments(&rejected.1.0);
+        assert_eq!(unavailable.0, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            unavailable.1.0,
+            serde_json::json!({ "error": "Microsoft sign-in service is unavailable" })
+        );
+        assert_no_auth_login_error_diagnostic_fragments(&unavailable.1.0);
+    }
+
+    #[test]
+    fn auth_refresh_error_response_reuses_login_error_product_copy() {
+        for (kind, expected_status, expected_message) in [
+            (
+                AuthRefreshFailureKind::MicrosoftClientBuild,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not start Microsoft sign-in. Restart Croopor and try again.",
+            ),
+            (
+                AuthRefreshFailureKind::MicrosoftRequest,
+                StatusCode::BAD_GATEWAY,
+                "Could not reach Microsoft sign-in. Check your connection and try again.",
+            ),
+            (
+                AuthRefreshFailureKind::MicrosoftParse,
+                StatusCode::BAD_GATEWAY,
+                "Microsoft sign-in returned an unexpected response. Try again later.",
+            ),
+        ] {
+            let response = auth_refresh_error_response(AuthRefreshFailure::new(kind));
+
+            assert_eq!(response.0, expected_status);
+            assert_eq!(
+                response.1.0,
+                serde_json::json!({ "error": expected_message })
+            );
+            assert_no_auth_login_error_diagnostic_fragments(&response.1.0);
+        }
     }
 
     #[test]
@@ -2883,6 +2965,23 @@ mod tests {
             assert!(
                 !text.contains(material),
                 "public JSON exposed sensitive material {material}"
+            );
+        }
+    }
+
+    fn assert_no_auth_login_error_diagnostic_fragments(value: &serde_json::Value) {
+        assert_no_sensitive_public_fields(value);
+        let text = value.to_string();
+        for material in [
+            MSA_DEVICE_CODE_ENDPOINT,
+            "error sending request for url",
+            "reqwest::Error",
+            "expected value at line 1 column 1",
+            "parser-secret-fragment",
+        ] {
+            assert!(
+                !text.contains(material),
+                "public JSON exposed diagnostic material {material}"
             );
         }
     }
