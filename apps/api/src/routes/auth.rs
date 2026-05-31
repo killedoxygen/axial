@@ -1,5 +1,13 @@
-use crate::state::{
-    AppState, AuthLoginSession, AuthLoginStore, NewAuthLoginMsaToken, NewAuthLoginSession,
+use crate::{
+    auth_chain::{
+        AuthChainClient, AuthChainError, AuthChainErrorKind, AuthChainExchange, MinecraftCape,
+        MinecraftProfile, MinecraftSkin,
+    },
+    state::{
+        ActiveMinecraftAccountState, AppState, AuthLoginMinecraftAccount, AuthLoginMinecraftCape,
+        AuthLoginMinecraftProfile, AuthLoginMinecraftSkin, AuthLoginSession, AuthLoginStore,
+        NewAuthLoginMinecraftAccount, NewAuthLoginMsaToken, NewAuthLoginSession,
+    },
 };
 use axum::{
     Json, Router,
@@ -39,6 +47,12 @@ struct AuthStatusResponse {
     msa_provider: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     msa_token_expires_in: Option<u64>,
+    minecraft_profile_ready: bool,
+    minecraft_ownership_verified: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    minecraft_profile: Option<AuthMinecraftProfileResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    minecraft_token_expires_in: Option<u64>,
     login_available: bool,
     login_reason: &'static str,
 }
@@ -46,6 +60,12 @@ struct AuthStatusResponse {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AuthStatusMsaState {
     authenticated: bool,
+    token_expires_in: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AuthStatusMinecraftState {
+    account: Option<AuthLoginMinecraftAccount>,
     token_expires_in: Option<u64>,
 }
 
@@ -57,6 +77,39 @@ impl AuthStatusMsaState {
             token_expires_in: None,
         }
     }
+}
+
+#[cfg(test)]
+impl AuthStatusMinecraftState {
+    fn unauthenticated() -> Self {
+        Self {
+            account: None,
+            token_expires_in: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
+struct AuthMinecraftProfileResponse {
+    id: String,
+    name: String,
+    skins: Vec<AuthMinecraftSkinResponse>,
+    capes: Vec<AuthMinecraftCapeResponse>,
+}
+
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
+struct AuthMinecraftSkinResponse {
+    id: String,
+    state: String,
+    url: String,
+    variant: String,
+}
+
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
+struct AuthMinecraftCapeResponse {
+    id: String,
+    state: String,
+    url: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -90,6 +143,17 @@ struct AuthLoginMsaAuthenticatedResponse {
     has_refresh_token: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     token_scope: Option<String>,
+    minecraft_profile_ready: bool,
+    minecraft_ownership_verified: bool,
+    minecraft_profile: AuthMinecraftProfileResponse,
+    minecraft_token_expires_in: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct AuthLoginMinecraftChainErrorResponse {
+    error: &'static str,
+    status: &'static str,
+    auth_chain_error: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -109,7 +173,7 @@ struct MsaDeviceCodeResponse {
     message: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Deserialize, Eq, PartialEq)]
 struct MsaTokenSuccessResponse {
     access_token: String,
     refresh_token: Option<String>,
@@ -117,6 +181,23 @@ struct MsaTokenSuccessResponse {
     token_type: String,
     expires_in: u64,
     scope: Option<String>,
+}
+
+impl std::fmt::Debug for MsaTokenSuccessResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MsaTokenSuccessResponse")
+            .field("access_token", &"[redacted]")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "[redacted]"),
+            )
+            .field("id_token", &self.id_token.as_ref().map(|_| "[redacted]"))
+            .field("token_type", &self.token_type)
+            .field("expires_in", &self.expires_in)
+            .field("scope", &self.scope)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -195,11 +276,17 @@ async fn handle_auth_login_poll(
     Path(login_id): Path<String>,
     State(state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    let auth_chain_client = match AuthChainClient::new() {
+        Ok(client) => client,
+        Err(error) => return auth_chain_error_response(error),
+    };
+
     auth_login_poll_for_config(
         &login_id,
         AuthLoginConfig::from_env(),
         state.auth_logins(),
         MSA_TOKEN_ENDPOINT,
+        &auth_chain_client,
     )
     .await
 }
@@ -214,6 +301,14 @@ async fn auth_status_for_store(
     login_store: &Arc<AuthLoginStore>,
 ) -> Result<AuthStatusResponse, (StatusCode, Json<serde_json::Value>)> {
     let token_expires_in = login_store.active_msa_auth_remaining_seconds().await;
+    let minecraft_state = login_store
+        .active_minecraft_account_state()
+        .await
+        .map(AuthStatusMinecraftState::from)
+        .unwrap_or_else(|| AuthStatusMinecraftState {
+            account: None,
+            token_expires_in: None,
+        });
     auth_status_from_username(
         config_username,
         login_config,
@@ -221,6 +316,7 @@ async fn auth_status_for_store(
             authenticated: token_expires_in.is_some(),
             token_expires_in,
         },
+        minecraft_state,
     )
 }
 
@@ -228,6 +324,7 @@ fn auth_status_from_username(
     config_username: &str,
     login_config: AuthLoginConfig,
     msa_state: AuthStatusMsaState,
+    minecraft_state: AuthStatusMinecraftState,
 ) -> Result<AuthStatusResponse, (StatusCode, Json<serde_json::Value>)> {
     let username = validate_username(config_username).map_err(|error| {
         (
@@ -235,6 +332,10 @@ fn auth_status_from_username(
             Json(serde_json::json!({ "error": error })),
         )
     })?;
+    let minecraft_profile = minecraft_state
+        .account
+        .as_ref()
+        .map(|account| auth_minecraft_profile_response(&account.profile));
 
     Ok(AuthStatusResponse {
         mode: "offline",
@@ -247,6 +348,13 @@ fn auth_status_from_username(
         msa_authenticated: msa_state.authenticated,
         msa_provider: msa_state.authenticated.then_some("microsoft"),
         msa_token_expires_in: msa_state.token_expires_in,
+        minecraft_profile_ready: minecraft_state.account.is_some(),
+        minecraft_ownership_verified: minecraft_state
+            .account
+            .as_ref()
+            .is_some_and(|account| account.owns_minecraft_java),
+        minecraft_profile,
+        minecraft_token_expires_in: minecraft_state.token_expires_in,
         login_available: login_config.is_available(),
         login_reason: login_config.reason(),
     })
@@ -324,6 +432,7 @@ async fn auth_login_poll_for_config(
     config: AuthLoginConfig,
     login_store: &Arc<AuthLoginStore>,
     token_endpoint: &str,
+    auth_chain_client: &AuthChainClient,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let Some(client_id) = config.client_id.as_deref() else {
         return auth_login_unavailable();
@@ -334,7 +443,10 @@ async fn auth_login_poll_for_config(
     };
 
     match request_msa_token(token_endpoint, client_id, &session.device_code).await {
-        Ok(response) => auth_login_poll_success_response(login_id, response, login_store).await,
+        Ok(response) => {
+            auth_login_poll_success_response(login_id, response, login_store, auth_chain_client)
+                .await
+        }
         Err(AuthLoginPollError::OAuth(error)) => {
             auth_login_poll_oauth_error_response(login_id, &session, login_store, error).await
         }
@@ -385,7 +497,20 @@ async fn auth_login_poll_success_response(
     login_id: &str,
     response: MsaTokenSuccessResponse,
     login_store: &Arc<AuthLoginStore>,
+    auth_chain_client: &AuthChainClient,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    let minecraft_account = match auth_chain_client
+        .exchange_msa_access_token(&response.access_token)
+        .await
+    {
+        Ok(exchange) => NewAuthLoginMinecraftAccount::from(exchange),
+        Err(error) => {
+            let _ = login_store.remove(login_id).await;
+            let _ = login_store.clear_active_auth().await;
+            return auth_chain_error_response(error);
+        }
+    };
+
     let public_response = AuthLoginMsaAuthenticatedResponse {
         status: "msa_authenticated",
         login_id: login_id.to_string(),
@@ -393,9 +518,17 @@ async fn auth_login_poll_success_response(
         expires_in: response.expires_in,
         has_refresh_token: response.refresh_token.is_some(),
         token_scope: response.scope.clone(),
+        minecraft_profile_ready: true,
+        minecraft_ownership_verified: minecraft_account.owns_minecraft_java,
+        minecraft_profile: auth_minecraft_profile_response(&minecraft_account.profile),
+        minecraft_token_expires_in: minecraft_account.expires_in,
     };
     if login_store
-        .complete_with_msa_token(login_id, NewAuthLoginMsaToken::from(response))
+        .complete_with_msa_and_minecraft_account(
+            login_id,
+            NewAuthLoginMsaToken::from(response),
+            minecraft_account,
+        )
         .await
         .is_none()
     {
@@ -571,6 +704,65 @@ fn auth_login_error_response(error: AuthLoginError) -> (StatusCode, Json<serde_j
     (status, Json(serde_json::json!({ "error": message })))
 }
 
+fn auth_chain_error_response(error: AuthChainError) -> (StatusCode, Json<serde_json::Value>) {
+    let status = match error.kind() {
+        AuthChainErrorKind::ClientBuild => StatusCode::INTERNAL_SERVER_ERROR,
+        AuthChainErrorKind::Request
+        | AuthChainErrorKind::UpstreamRejected
+        | AuthChainErrorKind::UpstreamUnavailable
+        | AuthChainErrorKind::Parse
+        | AuthChainErrorKind::MissingUserHash => StatusCode::BAD_GATEWAY,
+    };
+
+    (
+        status,
+        Json(serde_json::json!(AuthLoginMinecraftChainErrorResponse {
+            error: "Minecraft account verification failed",
+            status: "minecraft_auth_chain_failed",
+            auth_chain_error: auth_chain_error_code(error.kind()),
+        })),
+    )
+}
+
+fn auth_chain_error_code(kind: AuthChainErrorKind) -> &'static str {
+    match kind {
+        AuthChainErrorKind::ClientBuild => "client_build",
+        AuthChainErrorKind::Request => "request",
+        AuthChainErrorKind::UpstreamRejected => "upstream_rejected",
+        AuthChainErrorKind::UpstreamUnavailable => "upstream_unavailable",
+        AuthChainErrorKind::Parse => "parse",
+        AuthChainErrorKind::MissingUserHash => "missing_user_hash",
+    }
+}
+
+fn auth_minecraft_profile_response(
+    profile: &AuthLoginMinecraftProfile,
+) -> AuthMinecraftProfileResponse {
+    AuthMinecraftProfileResponse {
+        id: profile.id.clone(),
+        name: profile.name.clone(),
+        skins: profile
+            .skins
+            .iter()
+            .map(|skin| AuthMinecraftSkinResponse {
+                id: skin.id.clone(),
+                state: skin.state.clone(),
+                url: skin.url.clone(),
+                variant: skin.variant.clone(),
+            })
+            .collect(),
+        capes: profile
+            .capes
+            .iter()
+            .map(|cape| AuthMinecraftCapeResponse {
+                id: cape.id.clone(),
+                state: cape.state.clone(),
+                url: cape.url.clone(),
+            })
+            .collect(),
+    }
+}
+
 impl From<MsaDeviceCodeResponse> for NewAuthLoginSession {
     fn from(response: MsaDeviceCodeResponse) -> Self {
         Self {
@@ -593,6 +785,67 @@ impl From<MsaTokenSuccessResponse> for NewAuthLoginMsaToken {
             token_type: response.token_type,
             expires_in: response.expires_in,
             scope: response.scope,
+        }
+    }
+}
+
+impl From<ActiveMinecraftAccountState> for AuthStatusMinecraftState {
+    fn from(state: ActiveMinecraftAccountState) -> Self {
+        Self {
+            account: Some(state.account),
+            token_expires_in: Some(state.token_expires_in),
+        }
+    }
+}
+
+impl From<AuthChainExchange> for NewAuthLoginMinecraftAccount {
+    fn from(exchange: AuthChainExchange) -> Self {
+        Self {
+            access_token: exchange.minecraft.access_token().to_string(),
+            token_type: exchange.minecraft.token_type,
+            expires_in: exchange.minecraft.expires_in,
+            profile: AuthLoginMinecraftProfile::from(exchange.profile),
+            owns_minecraft_java: exchange.ownership.owns_minecraft_java,
+        }
+    }
+}
+
+impl From<MinecraftProfile> for AuthLoginMinecraftProfile {
+    fn from(profile: MinecraftProfile) -> Self {
+        Self {
+            id: profile.id,
+            name: profile.name,
+            skins: profile
+                .skins
+                .into_iter()
+                .map(AuthLoginMinecraftSkin::from)
+                .collect(),
+            capes: profile
+                .capes
+                .into_iter()
+                .map(AuthLoginMinecraftCape::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<MinecraftSkin> for AuthLoginMinecraftSkin {
+    fn from(skin: MinecraftSkin) -> Self {
+        Self {
+            id: skin.id,
+            state: skin.state,
+            url: skin.url,
+            variant: skin.variant,
+        }
+    }
+}
+
+impl From<MinecraftCape> for AuthLoginMinecraftCape {
+    fn from(cape: MinecraftCape) -> Self {
+        Self {
+            id: cape.id,
+            state: cape.state,
+            url: cape.url,
         }
     }
 }
@@ -640,8 +893,14 @@ impl MsaTokenErrorCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth_chain::AuthChainEndpoints;
     use crate::state::{AppStateInit, InstallStore, SessionStore};
-    use axum::extract::Form;
+    use axum::{
+        body::Bytes,
+        extract::{Form, State},
+        http::HeaderMap,
+        routing::{get, post},
+    };
     use croopor_config::{AppConfig, AppPaths, ConfigStore, InstanceStore};
     use croopor_performance::PerformanceManager;
     use std::{collections::HashMap, fs, path::PathBuf, sync::Arc};
@@ -663,6 +922,10 @@ mod tests {
         assert!(!response.msa_authenticated);
         assert_eq!(response.msa_provider, None);
         assert_eq!(response.msa_token_expires_in, None);
+        assert!(!response.minecraft_profile_ready);
+        assert!(!response.minecraft_ownership_verified);
+        assert_eq!(response.minecraft_profile, None);
+        assert_eq!(response.minecraft_token_expires_in, None);
         assert!(!response.login_available);
         assert_eq!(response.login_reason, LOGIN_UNAVAILABLE_REASON);
     }
@@ -673,6 +936,7 @@ mod tests {
             "ConfigUser",
             AuthLoginConfig::from_env_value(Some(" public-client-id ")),
             AuthStatusMsaState::unauthenticated(),
+            AuthStatusMinecraftState::unauthenticated(),
         )
         .expect("auth status");
 
@@ -686,6 +950,7 @@ mod tests {
             "bad name",
             AuthLoginConfig::from_env_value(None),
             AuthStatusMsaState::unauthenticated(),
+            AuthStatusMinecraftState::unauthenticated(),
         )
         .expect_err("invalid username should fail");
 
@@ -828,6 +1093,7 @@ mod tests {
             AuthLoginConfig::from_env_value(Some("public-client-id")),
             &store,
             &token_endpoint,
+            &unused_auth_chain_client(),
         )
         .await;
 
@@ -859,6 +1125,7 @@ mod tests {
             AuthLoginConfig::from_env_value(None),
             &store,
             "unused",
+            &unused_auth_chain_client(),
         )
         .await;
 
@@ -953,21 +1220,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auth_login_poll_success_stores_tokens_server_side_only() {
+    async fn auth_login_poll_success_stores_profile_and_tokens_server_side_only() {
         let store = Arc::new(AuthLoginStore::new());
         let session = insert_pending_login(&store).await;
+        let (token_endpoint, mut token_requests) = token_test_server(
+            StatusCode::OK,
+            serde_json::json!({
+                "access_token": "msa-access-token",
+                "refresh_token": "msa-refresh-token",
+                "id_token": "msa-id-token",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "scope": "XboxLive.signin offline_access"
+            }),
+        )
+        .await;
+        let (auth_chain_client, mut auth_chain_requests) =
+            auth_chain_route_test_client(AuthChainRouteServerMode::Success).await;
 
-        let response = auth_login_poll_success_response(
+        let response = auth_login_poll_for_config(
             &session.login_id,
-            MsaTokenSuccessResponse {
-                access_token: "msa-access-token".to_string(),
-                refresh_token: Some("msa-refresh-token".to_string()),
-                id_token: Some("msa-id-token".to_string()),
-                token_type: "Bearer".to_string(),
-                expires_in: 3600,
-                scope: Some("XboxLive.signin offline_access".to_string()),
-            },
+            AuthLoginConfig::from_env_value(Some("public-client-id")),
             &store,
+            &token_endpoint,
+            &auth_chain_client,
         )
         .await;
 
@@ -980,6 +1256,18 @@ mod tests {
             response.1.0["token_scope"],
             "XboxLive.signin offline_access"
         );
+        assert_eq!(response.1.0["minecraft_profile_ready"], true);
+        assert_eq!(response.1.0["minecraft_ownership_verified"], true);
+        assert_eq!(
+            response.1.0["minecraft_profile"]["id"],
+            "4f9c7f7d0b1245d9a5c2f03a8c120001"
+        );
+        assert_eq!(response.1.0["minecraft_profile"]["name"], "ProfileName");
+        assert_eq!(
+            response.1.0["minecraft_profile"]["skins"][0]["variant"],
+            "SLIM"
+        );
+        assert_eq!(response.1.0["minecraft_token_expires_in"], 86400);
         assert_no_sensitive_public_fields(&response.1.0);
         assert_eq!(store.get(&session.login_id).await, None);
         assert!(store.has_active_msa_auth().await);
@@ -988,6 +1276,156 @@ mod tests {
                 .active_msa_auth_remaining_seconds()
                 .await
                 .is_some_and(|value| value > 0 && value <= 3600)
+        );
+        let minecraft = store
+            .active_minecraft_account_state()
+            .await
+            .expect("minecraft account");
+        assert_eq!(
+            minecraft.account.profile.id,
+            "4f9c7f7d0b1245d9a5c2f03a8c120001"
+        );
+        assert!(minecraft.account.owns_minecraft_java);
+        assert!(minecraft.token_expires_in > 0);
+
+        let status = auth_status_for_store(
+            "ConfigUser",
+            AuthLoginConfig::from_env_value(Some("public-client-id")),
+            &store,
+        )
+        .await
+        .expect("auth status");
+        assert_eq!(status.mode, "offline");
+        assert!(!status.online_mode_ready);
+        assert!(status.msa_authenticated);
+        assert!(status.minecraft_profile_ready);
+        assert!(status.minecraft_ownership_verified);
+        assert_eq!(
+            status.minecraft_profile.expect("minecraft profile").name,
+            "ProfileName"
+        );
+
+        let form = token_requests.recv().await.expect("token request");
+        assert_eq!(form["device_code"], "raw-device-code");
+        assert_eq!(
+            auth_chain_requests.recv().await.expect("xbl request").path,
+            "/xbl"
+        );
+        assert_eq!(
+            auth_chain_requests.recv().await.expect("xsts request").path,
+            "/xsts"
+        );
+        assert_eq!(
+            auth_chain_requests
+                .recv()
+                .await
+                .expect("minecraft login request")
+                .path,
+            "/minecraft/login"
+        );
+        assert_eq!(
+            auth_chain_requests
+                .recv()
+                .await
+                .expect("minecraft profile request")
+                .authorization
+                .as_deref(),
+            Some("Bearer minecraft-access-token")
+        );
+        assert_eq!(
+            auth_chain_requests
+                .recv()
+                .await
+                .expect("minecraft ownership request")
+                .authorization
+                .as_deref(),
+            Some("Bearer minecraft-access-token")
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_login_poll_auth_chain_failure_does_not_leave_active_profile_state() {
+        let store = Arc::new(AuthLoginStore::new());
+        let old_session = insert_pending_login(&store).await;
+        store
+            .complete_with_msa_and_minecraft_account(
+                &old_session.login_id,
+                NewAuthLoginMsaToken {
+                    access_token: "old-msa-access-token".to_string(),
+                    refresh_token: Some("old-msa-refresh-token".to_string()),
+                    id_token: None,
+                    token_type: "Bearer".to_string(),
+                    expires_in: 3600,
+                    scope: Some("XboxLive.signin offline_access".to_string()),
+                },
+                test_minecraft_account("OldProfileName"),
+            )
+            .await
+            .expect("old active auth");
+        let session = insert_pending_login(&store).await;
+        let (token_endpoint, _token_requests) = token_test_server(
+            StatusCode::OK,
+            serde_json::json!({
+                "access_token": "msa-access-token",
+                "refresh_token": "msa-refresh-token",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "scope": "XboxLive.signin offline_access"
+            }),
+        )
+        .await;
+        let (auth_chain_client, mut auth_chain_requests) =
+            auth_chain_route_test_client(AuthChainRouteServerMode::XstsRejected).await;
+
+        let response = auth_login_poll_for_config(
+            &session.login_id,
+            AuthLoginConfig::from_env_value(Some("public-client-id")),
+            &store,
+            &token_endpoint,
+            &auth_chain_client,
+        )
+        .await;
+
+        assert_eq!(response.0, StatusCode::BAD_GATEWAY);
+        assert_eq!(response.1.0["status"], "minecraft_auth_chain_failed");
+        assert_eq!(
+            response.1.0["error"],
+            "Minecraft account verification failed"
+        );
+        assert_eq!(response.1.0["auth_chain_error"], "upstream_rejected");
+        assert_no_sensitive_public_fields(&response.1.0);
+        assert_eq!(store.get(&session.login_id).await, None);
+        assert_eq!(store.get(&old_session.login_id).await, None);
+        assert!(!store.has_active_msa_auth().await);
+        assert_eq!(store.active_minecraft_account().await, None);
+
+        let status = auth_status_for_store(
+            "ConfigUser",
+            AuthLoginConfig::from_env_value(Some("public-client-id")),
+            &store,
+        )
+        .await
+        .expect("auth status");
+        assert!(!status.msa_authenticated);
+        assert!(!status.minecraft_profile_ready);
+        assert!(!status.minecraft_ownership_verified);
+        assert_eq!(status.minecraft_profile, None);
+
+        assert_eq!(
+            auth_chain_requests.recv().await.expect("xbl request").path,
+            "/xbl"
+        );
+        assert_eq!(
+            auth_chain_requests.recv().await.expect("xsts request").path,
+            "/xsts"
+        );
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                auth_chain_requests.recv()
+            )
+            .await
+            .is_err()
         );
     }
 
@@ -1032,6 +1470,10 @@ mod tests {
                 .msa_token_expires_in
                 .is_some_and(|value| value > 0 && value <= 3600)
         );
+        assert!(!response.minecraft_profile_ready);
+        assert!(!response.minecraft_ownership_verified);
+        assert_eq!(response.minecraft_profile, None);
+        assert_eq!(response.minecraft_token_expires_in, None);
         assert!(response.login_available);
     }
 
@@ -1151,6 +1593,7 @@ mod tests {
                 &self.state.config().current().username,
                 AuthLoginConfig::from_env_value(None),
                 AuthStatusMsaState::unauthenticated(),
+                AuthStatusMinecraftState::unauthenticated(),
             )
             .map(Json)
         }
@@ -1200,6 +1643,21 @@ mod tests {
             .await
     }
 
+    fn test_minecraft_account(profile_name: &str) -> NewAuthLoginMinecraftAccount {
+        NewAuthLoginMinecraftAccount {
+            access_token: "old-minecraft-access-token".to_string(),
+            token_type: Some("Bearer".to_string()),
+            expires_in: 86400,
+            profile: AuthLoginMinecraftProfile {
+                id: "old-minecraft-profile-id".to_string(),
+                name: profile_name.to_string(),
+                skins: vec![],
+                capes: vec![],
+            },
+            owns_minecraft_java: true,
+        }
+    }
+
     async fn token_test_server(
         status: StatusCode,
         body: serde_json::Value,
@@ -1226,9 +1684,239 @@ mod tests {
         (url, rx)
     }
 
+    fn unused_auth_chain_client() -> AuthChainClient {
+        AuthChainClient::with_endpoints(AuthChainEndpoints {
+            xbox_user_authenticate: "http://127.0.0.1:9/xbl".to_string(),
+            xsts_authorize: "http://127.0.0.1:9/xsts".to_string(),
+            minecraft_login_with_xbox: "http://127.0.0.1:9/minecraft/login".to_string(),
+            minecraft_profile: "http://127.0.0.1:9/minecraft/profile".to_string(),
+            minecraft_ownership: "http://127.0.0.1:9/minecraft/ownership".to_string(),
+        })
+        .expect("unused auth chain client")
+    }
+
+    async fn auth_chain_route_test_client(
+        mode: AuthChainRouteServerMode,
+    ) -> (
+        AuthChainClient,
+        mpsc::UnboundedReceiver<RecordedAuthChainRequest>,
+    ) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let app = axum::Router::new()
+            .route("/xbl", post(record_route_xbl))
+            .route("/xsts", post(record_route_xsts))
+            .route("/minecraft/login", post(record_route_minecraft_login))
+            .route("/minecraft/profile", get(record_route_minecraft_profile))
+            .route(
+                "/minecraft/ownership",
+                get(record_route_minecraft_ownership),
+            )
+            .with_state(AuthChainRouteState { tx, mode });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind auth chain route test server");
+        let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("auth chain route test server");
+        });
+        let client = AuthChainClient::with_endpoints(AuthChainEndpoints {
+            xbox_user_authenticate: format!("{base_url}/xbl"),
+            xsts_authorize: format!("{base_url}/xsts"),
+            minecraft_login_with_xbox: format!("{base_url}/minecraft/login"),
+            minecraft_profile: format!("{base_url}/minecraft/profile"),
+            minecraft_ownership: format!("{base_url}/minecraft/ownership"),
+        })
+        .expect("auth chain route test client");
+
+        (client, rx)
+    }
+
+    #[derive(Clone, Copy)]
+    enum AuthChainRouteServerMode {
+        Success,
+        XstsRejected,
+    }
+
+    #[derive(Clone)]
+    struct AuthChainRouteState {
+        tx: mpsc::UnboundedSender<RecordedAuthChainRequest>,
+        mode: AuthChainRouteServerMode,
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct RecordedAuthChainRequest {
+        path: String,
+        authorization: Option<String>,
+    }
+
+    async fn record_route_xbl(
+        State(state): State<AuthChainRouteState>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        record_auth_chain_route_request(&state.tx, "/xbl", &headers, &body);
+
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "Token": "xbl-token",
+                "DisplayClaims": {
+                    "xui": [{ "uhs": "xbl-user-hash" }]
+                },
+            })),
+        )
+    }
+
+    async fn record_route_xsts(
+        State(state): State<AuthChainRouteState>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        record_auth_chain_route_request(&state.tx, "/xsts", &headers, &body);
+
+        if matches!(state.mode, AuthChainRouteServerMode::XstsRejected) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "provider-secret-payload",
+                    "Token": "xsts-token"
+                })),
+            );
+        }
+
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "Token": "xsts-token",
+                "DisplayClaims": {
+                    "xui": [{ "uhs": "xsts-user-hash" }]
+                },
+            })),
+        )
+    }
+
+    async fn record_route_minecraft_login(
+        State(state): State<AuthChainRouteState>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        record_auth_chain_route_request(&state.tx, "/minecraft/login", &headers, &body);
+
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "access_token": "minecraft-access-token",
+                "expires_in": 86400,
+                "token_type": "Bearer"
+            })),
+        )
+    }
+
+    async fn record_route_minecraft_profile(
+        State(state): State<AuthChainRouteState>,
+        headers: HeaderMap,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        record_auth_chain_route_request(&state.tx, "/minecraft/profile", &headers, &Bytes::new());
+
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "id": "4f9c7f7d0b1245d9a5c2f03a8c120001",
+                "name": "ProfileName",
+                "skins": [{
+                    "id": "skin-id",
+                    "state": "ACTIVE",
+                    "url": "https://textures.minecraft.net/texture/skin",
+                    "variant": "SLIM"
+                }],
+                "capes": [{
+                    "id": "cape-id",
+                    "state": "INACTIVE",
+                    "url": "https://textures.minecraft.net/texture/cape"
+                }]
+            })),
+        )
+    }
+
+    async fn record_route_minecraft_ownership(
+        State(state): State<AuthChainRouteState>,
+        headers: HeaderMap,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        record_auth_chain_route_request(&state.tx, "/minecraft/ownership", &headers, &Bytes::new());
+
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "items": [{ "name": "game_minecraft" }]
+            })),
+        )
+    }
+
+    fn record_auth_chain_route_request(
+        tx: &mpsc::UnboundedSender<RecordedAuthChainRequest>,
+        path: &str,
+        headers: &HeaderMap,
+        _body: &Bytes,
+    ) {
+        tx.send(RecordedAuthChainRequest {
+            path: path.to_string(),
+            authorization: header_value(headers, "authorization"),
+        })
+        .expect("record auth chain route request");
+    }
+
+    fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned)
+    }
+
     fn assert_no_sensitive_public_fields(value: &serde_json::Value) {
-        for field in ["access_token", "refresh_token", "id_token", "device_code"] {
-            assert_eq!(value.get(field), None, "public JSON exposed {field}");
+        assert_no_sensitive_public_field_keys(value);
+        let text = value.to_string();
+        for material in [
+            "msa-access-token",
+            "msa-refresh-token",
+            "msa-id-token",
+            "minecraft-access-token",
+            "old-msa-access-token",
+            "old-msa-refresh-token",
+            "old-minecraft-access-token",
+            "xbl-token",
+            "xsts-token",
+            "raw-device-code",
+            "provider-secret-payload",
+        ] {
+            assert!(
+                !text.contains(material),
+                "public JSON exposed sensitive material {material}"
+            );
+        }
+    }
+
+    fn assert_no_sensitive_public_field_keys(value: &serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, value) in map {
+                    assert!(
+                        !matches!(
+                            key.as_str(),
+                            "access_token" | "refresh_token" | "id_token" | "device_code"
+                        ),
+                        "public JSON exposed {key}"
+                    );
+                    assert_no_sensitive_public_field_keys(value);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    assert_no_sensitive_public_field_keys(value);
+                }
+            }
+            _ => {}
         }
     }
 

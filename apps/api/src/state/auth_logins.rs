@@ -1,10 +1,11 @@
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct AuthLoginSession {
     pub login_id: String,
     pub device_code: String,
@@ -17,7 +18,24 @@ pub struct AuthLoginSession {
     pub expires_at: DateTime<Utc>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+impl fmt::Debug for AuthLoginSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthLoginSession")
+            .field("login_id", &self.login_id)
+            .field("device_code", &"[redacted]")
+            .field("user_code", &self.user_code)
+            .field("verification_uri", &self.verification_uri)
+            .field("expires_in", &self.expires_in)
+            .field("interval", &self.interval)
+            .field("message", &self.message)
+            .field("created_at", &self.created_at)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
 pub struct AuthLoginMsaToken {
     pub login_id: String,
     pub access_token: String,
@@ -30,7 +48,78 @@ pub struct AuthLoginMsaToken {
     pub expires_at: DateTime<Utc>,
 }
 
+impl fmt::Debug for AuthLoginMsaToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthLoginMsaToken")
+            .field("login_id", &self.login_id)
+            .field("access_token", &"[redacted]")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "[redacted]"),
+            )
+            .field("id_token", &self.id_token.as_ref().map(|_| "[redacted]"))
+            .field("token_type", &self.token_type)
+            .field("expires_in", &self.expires_in)
+            .field("scope", &self.scope)
+            .field("authenticated_at", &self.authenticated_at)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct AuthLoginMinecraftAccount {
+    pub login_id: String,
+    pub access_token: String,
+    pub token_type: Option<String>,
+    pub expires_in: u64,
+    pub profile: AuthLoginMinecraftProfile,
+    pub owns_minecraft_java: bool,
+    pub authenticated_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+impl fmt::Debug for AuthLoginMinecraftAccount {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthLoginMinecraftAccount")
+            .field("login_id", &self.login_id)
+            .field("access_token", &"[redacted]")
+            .field("token_type", &self.token_type)
+            .field("expires_in", &self.expires_in)
+            .field("profile", &self.profile)
+            .field("owns_minecraft_java", &self.owns_minecraft_java)
+            .field("authenticated_at", &self.authenticated_at)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthLoginMinecraftProfile {
+    pub id: String,
+    pub name: String,
+    pub skins: Vec<AuthLoginMinecraftSkin>,
+    pub capes: Vec<AuthLoginMinecraftCape>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthLoginMinecraftSkin {
+    pub id: String,
+    pub state: String,
+    pub url: String,
+    pub variant: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthLoginMinecraftCape {
+    pub id: String,
+    pub state: String,
+    pub url: String,
+}
+
+#[derive(Clone, Eq, PartialEq)]
 pub struct NewAuthLoginMsaToken {
     pub access_token: String,
     pub refresh_token: Option<String>,
@@ -40,7 +129,46 @@ pub struct NewAuthLoginMsaToken {
     pub scope: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+impl fmt::Debug for NewAuthLoginMsaToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NewAuthLoginMsaToken")
+            .field("access_token", &"[redacted]")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "[redacted]"),
+            )
+            .field("id_token", &self.id_token.as_ref().map(|_| "[redacted]"))
+            .field("token_type", &self.token_type)
+            .field("expires_in", &self.expires_in)
+            .field("scope", &self.scope)
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct NewAuthLoginMinecraftAccount {
+    pub access_token: String,
+    pub token_type: Option<String>,
+    pub expires_in: u64,
+    pub profile: AuthLoginMinecraftProfile,
+    pub owns_minecraft_java: bool,
+}
+
+impl fmt::Debug for NewAuthLoginMinecraftAccount {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NewAuthLoginMinecraftAccount")
+            .field("access_token", &"[redacted]")
+            .field("token_type", &self.token_type)
+            .field("expires_in", &self.expires_in)
+            .field("profile", &self.profile)
+            .field("owns_minecraft_java", &self.owns_minecraft_java)
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
 pub struct NewAuthLoginSession {
     pub device_code: String,
     pub user_code: String,
@@ -50,9 +178,30 @@ pub struct NewAuthLoginSession {
     pub message: Option<String>,
 }
 
+impl fmt::Debug for NewAuthLoginSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NewAuthLoginSession")
+            .field("device_code", &"[redacted]")
+            .field("user_code", &self.user_code)
+            .field("verification_uri", &self.verification_uri)
+            .field("expires_in", &self.expires_in)
+            .field("interval", &self.interval)
+            .field("message", &self.message)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActiveMinecraftAccountState {
+    pub account: AuthLoginMinecraftAccount,
+    pub token_expires_in: u64,
+}
+
 pub struct AuthLoginStore {
     sessions: RwLock<HashMap<String, AuthLoginSession>>,
     active_msa_token: RwLock<Option<AuthLoginMsaToken>>,
+    active_minecraft_account: RwLock<Option<AuthLoginMinecraftAccount>>,
     next_id: AtomicU64,
 }
 
@@ -61,6 +210,7 @@ impl AuthLoginStore {
         Self {
             sessions: RwLock::new(HashMap::new()),
             active_msa_token: RwLock::new(None),
+            active_minecraft_account: RwLock::new(None),
             next_id: AtomicU64::new(1),
         }
     }
@@ -122,7 +272,49 @@ impl AuthLoginStore {
         };
 
         *self.active_msa_token.write().await = Some(token.clone());
+        *self.active_minecraft_account.write().await = None;
         Some(token)
+    }
+
+    pub async fn complete_with_msa_and_minecraft_account(
+        &self,
+        login_id: &str,
+        new_token: NewAuthLoginMsaToken,
+        new_account: NewAuthLoginMinecraftAccount,
+    ) -> Option<(AuthLoginMsaToken, AuthLoginMinecraftAccount)> {
+        let now = Utc::now();
+        let session = self.sessions.write().await.remove(login_id);
+        if !session.is_some_and(|session| session.expires_at > now) {
+            return None;
+        }
+
+        let token = AuthLoginMsaToken {
+            login_id: login_id.to_string(),
+            access_token: new_token.access_token,
+            refresh_token: new_token.refresh_token,
+            id_token: new_token.id_token,
+            token_type: new_token.token_type,
+            expires_in: new_token.expires_in,
+            scope: new_token.scope,
+            authenticated_at: now,
+            expires_at: now
+                + chrono::Duration::seconds(saturating_u64_to_i64(new_token.expires_in)),
+        };
+        let account = AuthLoginMinecraftAccount {
+            login_id: login_id.to_string(),
+            access_token: new_account.access_token,
+            token_type: new_account.token_type,
+            expires_in: new_account.expires_in,
+            profile: new_account.profile,
+            owns_minecraft_java: new_account.owns_minecraft_java,
+            authenticated_at: now,
+            expires_at: now
+                + chrono::Duration::seconds(saturating_u64_to_i64(new_account.expires_in)),
+        };
+
+        *self.active_msa_token.write().await = Some(token.clone());
+        *self.active_minecraft_account.write().await = Some(account.clone());
+        Some((token, account))
     }
 
     pub async fn increase_interval(&self, login_id: &str, additional_seconds: u64) -> Option<u64> {
@@ -158,6 +350,24 @@ impl AuthLoginStore {
         Some((((remaining as u64) + 999) / 1000).min(expires_in))
     }
 
+    pub async fn active_minecraft_account_state(&self) -> Option<ActiveMinecraftAccountState> {
+        let mut account = self.active_minecraft_account.write().await;
+        let (expires_at, expires_in) = {
+            let active = account.as_ref()?;
+            (active.expires_at, active.expires_in)
+        };
+        let remaining = (expires_at - Utc::now()).num_milliseconds();
+        if remaining <= 0 {
+            *account = None;
+            return None;
+        }
+
+        Some(ActiveMinecraftAccountState {
+            account: account.as_ref()?.clone(),
+            token_expires_in: (((remaining as u64) + 999) / 1000).min(expires_in),
+        })
+    }
+
     pub async fn clear_all(&self) -> (usize, bool) {
         let cleared_pending_logins = {
             let mut sessions = self.sessions.write().await;
@@ -166,13 +376,25 @@ impl AuthLoginStore {
             len
         };
         let had_msa_auth = self.active_msa_token.write().await.take().is_some();
+        *self.active_minecraft_account.write().await = None;
 
         (cleared_pending_logins, had_msa_auth)
+    }
+
+    pub async fn clear_active_auth(&self) -> bool {
+        let had_msa_auth = self.active_msa_token.write().await.take().is_some();
+        let had_minecraft_account = self.active_minecraft_account.write().await.take().is_some();
+        had_msa_auth || had_minecraft_account
     }
 
     #[cfg(test)]
     pub async fn active_msa_token(&self) -> Option<AuthLoginMsaToken> {
         self.active_msa_token.read().await.clone()
+    }
+
+    #[cfg(test)]
+    pub async fn active_minecraft_account(&self) -> Option<AuthLoginMinecraftAccount> {
+        self.active_minecraft_account.read().await.clone()
     }
 
     pub async fn remove_expired(&self, login_id: &str) -> bool {
