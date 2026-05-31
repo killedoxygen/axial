@@ -1,4 +1,5 @@
 mod auth_logins;
+mod auth_persistence;
 pub mod benchmark_suite_drivers;
 pub mod benchmark_suites;
 mod installs;
@@ -65,7 +66,7 @@ impl AppState {
             version: init.version,
             config: init.config,
             instances: init.instances,
-            auth_logins: Arc::new(AuthLoginStore::new()),
+            auth_logins: Arc::new(AuthLoginStore::load_from_secure_store()),
             installs: init.installs,
             sessions: init.sessions,
             benchmark_suite_drivers,

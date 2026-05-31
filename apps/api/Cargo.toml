@@ -11,6 +11,7 @@ axum.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
 include_dir.workspace = true
+keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "windows-native", "linux-native-sync-persistent", "crypto-rust"] }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
