@@ -38,6 +38,12 @@ const FAMILY_C_MANAGED_EXPECTED_ARTIFACTS: [(&str, &str, &str); 3] = [
     ("clumps", "clumps", "clumps"),
 ];
 const LAUNCH_COMMAND_REDACTED_VALUE: &str = "<redacted>";
+const LAUNCH_KILL_INTERNAL_ERROR_MESSAGE: &str =
+    "Could not stop the launch session. Try again from the launcher.";
+const LAUNCH_REPORT_STORAGE_ERROR_MESSAGE: &str =
+    "Could not load launch reports. Check app data permissions and try again.";
+const BENCHMARK_SUITE_STORAGE_ERROR_MESSAGE: &str =
+    "Could not load benchmark suite data. Check app data permissions and try again.";
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -337,9 +343,8 @@ impl BenchmarkLaunchRequest {
             });
         let plan = matrix::benchmark_suite_plan(&mode).ok_or_else(unsupported_suite_mode_error)?;
         let manifest = match paths {
-            Some(paths) => {
-                crate::state::benchmark_suites::load(paths, &suite_id).map_err(internal_error)?
-            }
+            Some(paths) => crate::state::benchmark_suites::load(paths, &suite_id)
+                .map_err(benchmark_suite_storage_error_response)?,
             None => None,
         };
 
@@ -414,7 +419,7 @@ async fn handle_benchmark_suite_launch(
                 crate::state::benchmark_suites::derive_suite_id(&launch.instance_id, &mode)
             });
         let manifest = crate::state::benchmark_suites::load(state.config().paths(), &suite_id)
-            .map_err(internal_error)?;
+            .map_err(benchmark_suite_storage_error_response)?;
         ensure_no_active_benchmark_suite_auto_run(
             state.sessions().as_ref(),
             manifest.as_ref(),
@@ -558,7 +563,7 @@ async fn resume_benchmark_suite_driver(
     }
 
     let manifest = crate::state::benchmark_suites::load(state.config().paths(), &status.suite_id)
-        .map_err(internal_error)?
+        .map_err(benchmark_suite_storage_error_response)?
         .ok_or_else(benchmark_suite_not_found_error)?;
     let suite_id = crate::state::benchmark_suites::normalize_suite_id(&status.suite_id)
         .or_else(|| crate::state::benchmark_suites::normalize_suite_id(&manifest.suite_id))
@@ -645,7 +650,7 @@ async fn launch_benchmark_suite_run(
         &launched.session_id,
         &launched.launched_at,
     )
-    .map_err(internal_error)?;
+    .map_err(benchmark_suite_storage_error_response)?;
 
     let mut response = launch_success_response_payload(&launched);
     response["benchmark"] = benchmark_response;
@@ -662,7 +667,7 @@ async fn handle_benchmark_suite_manifest(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let manifest = crate::state::benchmark_suites::load(state.config().paths(), &id)
-        .map_err(internal_error)?
+        .map_err(benchmark_suite_storage_error_response)?
         .ok_or_else(benchmark_suite_not_found_error)?;
 
     Ok(Json(json!(manifest)))
@@ -686,7 +691,7 @@ async fn handle_launch_reports(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let reports = crate::state::launch_reports::list_recent_exports(state.config().paths(), 25)
-        .map_err(internal_error)?;
+        .map_err(launch_report_storage_error_response)?;
 
     Ok(Json(json!({ "reports": reports })))
 }
@@ -696,7 +701,7 @@ async fn handle_launch_report(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let report = crate::state::launch_reports::load_export(state.config().paths(), &id)
-        .map_err(internal_error)?
+        .map_err(launch_report_storage_error_response)?
         .ok_or_else(|| {
             (
                 StatusCode::NOT_FOUND,
@@ -876,14 +881,11 @@ async fn handle_launch_kill(
         )
     })?;
 
-    state.sessions().kill(&id).await.map_err(|error| {
-        let status = if error.kind() == std::io::ErrorKind::NotFound {
-            StatusCode::NOT_FOUND
-        } else {
-            StatusCode::INTERNAL_SERVER_ERROR
-        };
-        (status, Json(json!({ "error": error.to_string() })))
-    })?;
+    state
+        .sessions()
+        .kill(&id)
+        .await
+        .map_err(|error| launch_kill_error_response(error))?;
 
     runner::trace_launch_event(&id, "kill requested by client");
     state
@@ -913,10 +915,35 @@ async fn handle_launch_kill(
     Ok(Json(json!({ "status": "killed" })))
 }
 
-fn internal_error(error: std::io::Error) -> (StatusCode, Json<serde_json::Value>) {
+fn launch_kill_error_response(error: std::io::Error) -> (StatusCode, Json<serde_json::Value>) {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "session not found" })),
+        );
+    }
+
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({ "error": error.to_string() })),
+        Json(json!({ "error": LAUNCH_KILL_INTERNAL_ERROR_MESSAGE })),
+    )
+}
+
+fn benchmark_suite_storage_error_response(
+    _error: std::io::Error,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": BENCHMARK_SUITE_STORAGE_ERROR_MESSAGE })),
+    )
+}
+
+fn launch_report_storage_error_response(
+    _error: std::io::Error,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": LAUNCH_REPORT_STORAGE_ERROR_MESSAGE })),
     )
 }
 
@@ -1244,7 +1271,7 @@ async fn family_c_qualification_payload(
         .ok_or_else(benchmark_suite_not_found_error)?;
     let manifest =
         crate::state::benchmark_suites::load(state.config().paths(), &normalized_suite_id)
-            .map_err(internal_error)?
+            .map_err(benchmark_suite_storage_error_response)?
             .ok_or_else(benchmark_suite_not_found_error)?;
     if manifest.schema != "croopor.launch.benchmark.suite" || manifest.schema_version != 2 {
         return Err((
@@ -1380,7 +1407,7 @@ fn family_c_qualification_proofs(
 > {
     let mut proofs =
         crate::state::launch_reports::list_recent(paths, FAMILY_C_QUALIFICATION_PROOF_SCAN_LIMIT)
-            .map_err(internal_error)?;
+            .map_err(launch_report_storage_error_response)?;
     for session_id in manifest
         .runs
         .iter()
@@ -1390,8 +1417,8 @@ fn family_c_qualification_proofs(
         if already_loaded {
             continue;
         }
-        if let Some(proof) =
-            crate::state::launch_reports::load(paths, session_id).map_err(internal_error)?
+        if let Some(proof) = crate::state::launch_reports::load(paths, session_id)
+            .map_err(launch_report_storage_error_response)?
         {
             proofs.push(proof);
         }
@@ -2365,6 +2392,72 @@ mod tests {
             assert!(
                 !message.contains(fragment),
                 "launch error response leaked fragment {fragment:?}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn launch_kill_not_found_error_response_uses_session_not_found() {
+        let response = launch_kill_error_response(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "failed to kill process 4242 at /home/alice/.croopor/secret",
+        ));
+
+        assert_eq!(response.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            response.1.0,
+            serde_json::json!({ "error": "session not found" })
+        );
+    }
+
+    #[test]
+    fn launch_kill_internal_error_response_hides_raw_io_details() {
+        let response = launch_kill_error_response(raw_launch_control_io_error());
+
+        assert_public_error_excludes_raw_launch_control_fragments(
+            response,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            LAUNCH_KILL_INTERNAL_ERROR_MESSAGE,
+        );
+    }
+
+    #[test]
+    fn launch_report_internal_error_response_hides_raw_io_details() {
+        let response = launch_report_storage_error_response(raw_launch_control_io_error());
+
+        assert_public_error_excludes_raw_launch_control_fragments(
+            response,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            LAUNCH_REPORT_STORAGE_ERROR_MESSAGE,
+        );
+    }
+
+    #[test]
+    fn benchmark_suite_storage_error_response_hides_raw_io_details() {
+        let response =
+            benchmark_suite_storage_error_response(raw_benchmark_suite_storage_io_error());
+
+        assert_eq!(response.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response.1.0,
+            serde_json::json!({ "error": BENCHMARK_SUITE_STORAGE_ERROR_MESSAGE })
+        );
+        let data = serde_json::to_string(&response.1.0).expect("serialize public error");
+        for fragment in [
+            "/home/alice",
+            ".croopor",
+            "C:\\Users\\Alice",
+            "AppData",
+            "Permission denied",
+            "os error 13",
+            "family-c-1-12-2",
+            "suite-release_validation-00-family_c_forge",
+            "benchmark-suites",
+            "family-c-1-12-2.json",
+        ] {
+            assert!(
+                !data.contains(fragment),
+                "benchmark suite storage error leaked fragment {fragment:?}: {data}"
             );
         }
     }
@@ -5402,6 +5495,51 @@ mod tests {
                 guidance: Vec::new(),
                 interventions: Vec::new(),
             }),
+        }
+    }
+
+    fn raw_launch_control_io_error() -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "failed to kill process 4242 while reading /home/alice/.croopor/launch-reports/sensitive-proof.json from C:\\Users\\Alice\\AppData\\Roaming\\Croopor\\launch-reports\\secret-report.json: Permission denied (os error 13)",
+        )
+    }
+
+    fn raw_benchmark_suite_storage_io_error() -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "failed to load benchmark suite manifest family-c-1-12-2 from /home/alice/.croopor/benchmark-suites/family-c-1-12-2.json and C:\\Users\\Alice\\AppData\\Roaming\\Croopor\\benchmark-suites\\suite-release_validation-00-family_c_forge.json: Permission denied (os error 13)",
+        )
+    }
+
+    fn assert_public_error_excludes_raw_launch_control_fragments(
+        response: (StatusCode, Json<serde_json::Value>),
+        expected_status: StatusCode,
+        expected_message: &str,
+    ) {
+        assert_eq!(response.0, expected_status);
+        assert_eq!(
+            response.1.0,
+            serde_json::json!({ "error": expected_message })
+        );
+        let data = serde_json::to_string(&response.1.0).expect("serialize public error");
+        for fragment in [
+            "/home/alice",
+            ".croopor",
+            "C:\\Users\\Alice",
+            "AppData",
+            "failed to kill",
+            "process 4242",
+            "Permission denied",
+            "os error 13",
+            "sensitive-proof.json",
+            "secret-report.json",
+            "launch-reports\\secret-report",
+        ] {
+            assert!(
+                !data.contains(fragment),
+                "public error leaked fragment {fragment:?}: {data}"
+            );
         }
     }
 
