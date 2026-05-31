@@ -98,7 +98,7 @@ async fn handle_setup_set_dir(
     let mut config = state.config().current();
     config.library_dir = payload.path.clone();
     config.library_mode = "existing".to_string();
-    state.config().update(config).map_err(internal_error)?;
+    state.config().update(config).map_err(setup_config_error)?;
     state.set_library_dir(payload.path.clone());
     let _ = ensure_launcher_profiles(&path, "");
 
@@ -127,13 +127,13 @@ async fn handle_setup_init(
         ));
     }
 
-    create_minecraft_dir(&path).map_err(internal_error)?;
+    create_minecraft_dir(&path).map_err(setup_managed_create_error)?;
     let _ = ensure_launcher_profiles(&path, "");
 
     let mut config = state.config().current();
     config.library_dir = path.to_string_lossy().to_string();
     config.library_mode = "managed".to_string();
-    state.config().update(config).map_err(internal_error)?;
+    state.config().update(config).map_err(setup_config_error)?;
     state.set_library_dir(path.to_string_lossy().to_string());
 
     Ok(Json(serde_json::json!({
@@ -152,13 +152,79 @@ async fn handle_onboarding_complete(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let mut config = state.config().current();
     config.onboarding_done = true;
-    state.config().update(config).map_err(internal_error)?;
+    state
+        .config()
+        .update(config)
+        .map_err(onboarding_save_error)?;
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
-fn internal_error(error: impl std::fmt::Display) -> (StatusCode, Json<serde_json::Value>) {
+fn setup_managed_create_error(
+    _error: impl std::fmt::Display,
+) -> (StatusCode, Json<serde_json::Value>) {
+    internal_error(
+        "Could not create the managed library folder. Check folder permissions and try again.",
+    )
+}
+
+fn setup_config_error(_error: impl std::fmt::Display) -> (StatusCode, Json<serde_json::Value>) {
+    internal_error(
+        "Could not save the selected library folder. Check app data permissions and try again.",
+    )
+}
+
+fn onboarding_save_error(_error: impl std::fmt::Display) -> (StatusCode, Json<serde_json::Value>) {
+    internal_error("Could not save onboarding progress. Check app data permissions and try again.")
+}
+
+fn internal_error(message: &'static str) -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(serde_json::json!({ "error": error.to_string() })),
+        Json(serde_json::json!({ "error": message })),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_bounded_setup_error(
+        error: (StatusCode, Json<serde_json::Value>),
+        expected_message: &str,
+    ) {
+        let (status, Json(body)) = error;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"], expected_message);
+
+        let rendered = body.to_string();
+        assert!(!rendered.contains("/Users/alice/.croopor"));
+        assert!(!rendered.contains("permission denied"));
+        assert!(!rendered.contains("config.toml"));
+    }
+
+    #[test]
+    fn setup_managed_create_error_does_not_expose_raw_error_fragments() {
+        assert_bounded_setup_error(
+            setup_managed_create_error(
+                "permission denied creating /Users/alice/.croopor/libraries",
+            ),
+            "Could not create the managed library folder. Check folder permissions and try again.",
+        );
+    }
+
+    #[test]
+    fn setup_config_error_does_not_expose_raw_error_fragments() {
+        assert_bounded_setup_error(
+            setup_config_error("failed to write /Users/alice/.croopor/config.toml"),
+            "Could not save the selected library folder. Check app data permissions and try again.",
+        );
+    }
+
+    #[test]
+    fn setup_onboarding_save_error_does_not_expose_raw_error_fragments() {
+        assert_bounded_setup_error(
+            onboarding_save_error("permission denied writing /Users/alice/.croopor/config.toml"),
+            "Could not save onboarding progress. Check app data permissions and try again.",
+        );
+    }
 }
