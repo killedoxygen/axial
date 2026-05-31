@@ -17,6 +17,7 @@ import { launchStageView, type LaunchStage } from './launch-stages';
 import type { Config, GuardianSummary, HealingEvent, Instance, LaunchHealingSummary } from './types';
 
 const PRE_RESPONSE_STAGE_CAP_PCT = 87;
+const LIVE_LAUNCH_UPDATES_UNAVAILABLE = 'Live launch updates are unavailable.';
 const PRE_RESPONSE_STAGE_TICKS: Array<{ atMs: number; stage: LaunchStage }> = [
   { atMs: 700, stage: 'preparing' },
   { atMs: 1800, stage: 'prewarming' },
@@ -622,7 +623,7 @@ async function connectLaunchEvents(sessionId: string, instanceId: string, instan
     logSubscription = await onNativeEvent(nativeLaunchLogEventName(sessionId), onLog);
     if (!statusSubscription || !logSubscription) {
       streamHandle.close();
-      throw new Error('native launch stream unavailable');
+      throw new Error(LIVE_LAUNCH_UPDATES_UNAVAILABLE);
     }
     pollSubscription = makeLaunchStatusPoller(sessionId, instanceId, (data) => {
       onStatus(data, streamHandle);
@@ -636,7 +637,7 @@ async function connectLaunchEvents(sessionId: string, instanceId: string, instan
     }
     if (!started) {
       streamHandle.close();
-      throw new Error('native launch stream unavailable');
+      throw new Error(LIVE_LAUNCH_UPDATES_UNAVAILABLE);
     }
     return;
   }
@@ -693,11 +694,11 @@ export async function killGame(): Promise<void> {
     const res = await api('POST', `/launch/${session.sessionId}/kill`);
     if (res?.error) {
       updateRunningSessionState(inst.id, { stopping: false });
-      showError(`Failed to kill: ${res.error}`);
+      showError(`Could not stop the game: ${res.error}`);
       return;
     }
   } catch (err: unknown) {
     updateRunningSessionState(inst.id, { stopping: false });
-    showError(`Failed to kill: ${errMessage(err)}`);
+    showError(`Could not stop the game: ${errMessage(err)}`);
   }
 }
