@@ -1178,8 +1178,7 @@
   letter-spacing: -0.05px;
 }
 
-/* Compact Logs strip pinned at the bottom of the overview.
- * Promote on error in a follow-up by expanding into a log preview. */
+/* Compact Logs strip pinned at the bottom of the overview. */
 .cp-od-logs-card {
   border: none;
   border-radius: 0;
@@ -1222,6 +1221,19 @@
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+.cp-od-log-tail {
+  margin-top: 10px;
+  display: grid;
+  gap: 2px;
+  max-height: 86px;
+  overflow: hidden;
+  padding-left: 46px;
+}
+.cp-od-log-note {
+  margin: 8px 0 0 46px;
+  color: var(--text-mute);
+  font-size: 11.5px;
 }
 
 @media (max-width: 1180px) {
@@ -1724,6 +1736,12 @@
   display: flex;
   flex-direction: column;
 }
+.cp-logs-toolbar {
+  align-items: center;
+}
+.cp-logs-tools {
+  justify-content: flex-end;
+}
 .cp-logs-layout {
   display: grid;
   grid-template-columns: minmax(180px, 260px) minmax(0, 1fr);
@@ -1775,15 +1793,78 @@
   overflow: auto;
   background: oklch(0.17 0.01 260);
 }
-.cp-log-preview pre {
-  margin: 0;
+.cp-log-lines {
   padding: 14px;
+  display: grid;
+  gap: 1px;
+}
+.cp-log-line {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  min-height: 19px;
   color: oklch(0.88 0.01 260);
   font-family: ui-monospace, "Geist Mono", SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12px;
   line-height: 1.55;
+}
+.cp-log-line--compact {
+  grid-template-columns: 38px minmax(0, 1fr);
+  min-height: 17px;
+  color: var(--text-dim);
+  font-size: 11.5px;
+  line-height: 1.35;
+}
+.cp-log-line-label {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  height: 16px;
+  margin-top: 1px;
+  border-radius: 5px;
+  border: 1px solid oklch(1 0 0 / 0.07);
+  background: oklch(1 0 0 / 0.04);
+  color: oklch(0.78 0.015 260);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0;
+  line-height: 1;
+}
+.cp-log-line-text {
+  min-width: 0;
   white-space: pre-wrap;
   word-break: break-word;
+}
+.cp-log-line[data-kind="error"] {
+  color: oklch(0.86 0.08 25);
+}
+.cp-log-line[data-kind="error"] .cp-log-line-label {
+  border-color: oklch(0.72 0.16 25 / 0.36);
+  background: oklch(0.28 0.07 25 / 0.42);
+  color: oklch(0.88 0.08 25);
+}
+.cp-log-line[data-kind="warning"] {
+  color: oklch(0.86 0.06 80);
+}
+.cp-log-line[data-kind="warning"] .cp-log-line-label {
+  border-color: oklch(0.78 0.12 82 / 0.32);
+  background: oklch(0.29 0.05 82 / 0.4);
+  color: oklch(0.88 0.07 82);
+}
+.cp-log-line[data-kind="system"] {
+  color: oklch(0.82 0.05 205);
+}
+.cp-log-line[data-kind="system"] .cp-log-line-label {
+  border-color: oklch(0.72 0.1 205 / 0.3);
+  background: oklch(0.25 0.045 205 / 0.38);
+  color: oklch(0.82 0.055 205);
+}
+.cp-log-empty {
+  padding: 14px;
+  color: oklch(0.68 0.01 260);
+  font-size: 12px;
 }
 .cp-log-truncated {
   padding: 8px 12px;

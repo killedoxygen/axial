@@ -299,6 +299,113 @@ async function fetchInstanceResources(id: string): Promise<InstanceResourceSumma
   };
 }
 
+type InstanceLogEntry = InstanceResourceSummary['logs'][number];
+type LogSort = 'current' | 'newest' | 'name' | 'size';
+type LogFilter = 'all' | 'important' | 'errors' | 'warnings' | 'system-info';
+type LogLineKind = 'error' | 'warning' | 'system' | 'info';
+
+interface ClassifiedLogLine {
+  index: number;
+  text: string;
+  kind: LogLineKind;
+  label: string;
+  important: boolean;
+}
+
+const LOG_SORT_LABELS: Record<LogSort, string> = {
+  current: 'Current/latest',
+  newest: 'Newest',
+  name: 'Name',
+  size: 'Size',
+};
+
+const LOG_FILTER_LABELS: Record<LogFilter, string> = {
+  all: 'All',
+  important: 'Important',
+  errors: 'Errors',
+  warnings: 'Warnings',
+  'system-info': 'System/info',
+};
+
+const LOG_TAIL_POLL_MS = 2500;
+const LOG_RESOURCE_POLL_MS = 10000;
+
+function currentLogRank(name: string): number {
+  const lower = name.toLowerCase();
+  if (lower === 'latest.log') return 0;
+  if (lower === 'current.log') return 1;
+  if (lower.includes('latest')) return 2;
+  if (lower.includes('current')) return 3;
+  return 10;
+}
+
+function isCurrentLog(name: string): boolean {
+  return currentLogRank(name) < 10;
+}
+
+function sortLogs(logs: InstanceLogEntry[], sort: LogSort): InstanceLogEntry[] {
+  const next = [...logs];
+  next.sort((a, b) => {
+    if (sort === 'name') return a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+    if (sort === 'size') return b.size - a.size || a.name.localeCompare(b.name);
+    if (sort === 'current') {
+      const current = currentLogRank(a.name) - currentLogRank(b.name);
+      if (current !== 0) return current;
+    }
+    return b.modified_at.localeCompare(a.modified_at) || a.name.localeCompare(b.name);
+  });
+  return next;
+}
+
+function pickInitialLog(logs: InstanceLogEntry[]): string {
+  return sortLogs(logs, 'current')[0]?.name ?? '';
+}
+
+function classifyLogLine(text: string): LogLineKind {
+  const lower = text.toLowerCase();
+  if (/\b(errors?|fatal|exceptions?|crashes?|crashed)\b/.test(lower)) return 'error';
+  if (/\bwarn(?:ing|ings|ed)?\b/.test(lower)) return 'warning';
+  if (/\b(launcher|system|guardian|healing|croopor)\b/.test(lower)) return 'system';
+  return 'info';
+}
+
+function logLineLabel(kind: LogLineKind): string {
+  if (kind === 'error') return 'ERR';
+  if (kind === 'warning') return 'WARN';
+  if (kind === 'system') return 'SYS';
+  return 'INFO';
+}
+
+function classifyLogText(text: string): ClassifiedLogLine[] {
+  if (!text) return [];
+  const normalized = text.replace(/\r\n?/g, '\n');
+  const rawLines = normalized.endsWith('\n') ? normalized.slice(0, -1).split('\n') : normalized.split('\n');
+  return rawLines.map((line, index) => {
+    const kind = classifyLogLine(line);
+    return {
+      index,
+      text: line,
+      kind,
+      label: logLineLabel(kind),
+      important: kind !== 'info',
+    };
+  });
+}
+
+function logLineMatchesFilter(line: ClassifiedLogLine, filter: LogFilter): boolean {
+  if (filter === 'all') return true;
+  if (filter === 'important') return line.important;
+  if (filter === 'errors') return line.kind === 'error';
+  if (filter === 'warnings') return line.kind === 'warning';
+  return line.kind === 'system' || line.kind === 'info';
+}
+
+async function fetchLogTail(id: string, name: string): Promise<InstanceLogTail> {
+  const res: InstanceLogTail & { error?: string } = await api('GET', `/instances/${encodeURIComponent(id)}/logs/${encodeURIComponent(name)}`);
+  if (res?.error) throw new Error(res.error);
+  return res;
+}
+
 function ResourceStatus({
   state,
   onRetry,
@@ -711,15 +818,52 @@ function ActivityCard({
 // ─── Logs — demoted to a compact card at the bottom of the main column ──
 
 function LogsCard({
+  inst,
   resources,
+  running,
   onOpenLogs,
 }: {
+  inst: EnrichedInstance;
   resources: InstanceResourceSummary | null;
+  running: boolean;
   onOpenLogs: () => void;
 }): JSX.Element {
-  const latest = resources?.logs[0];
+  const latest = pickInitialLog(resources?.logs ?? []);
+  const latestLog = latest ? resources?.logs.find((log) => log.name === latest) : undefined;
   const count = resources?.logs_count ?? 0;
-  const summary = latest ? `${latest.name} · ${fmtRelative(latest.modified_at)}` : 'No launch logs on disk yet';
+  const [tail, setTail] = useState<{ status: 'idle' | 'loading' | 'ready' | 'error'; data?: InstanceLogTail; error?: string }>({ status: 'idle' });
+  const importantLines = useMemo(() => {
+    if (tail.status !== 'ready') return [];
+    return classifyLogText(tail.data?.text ?? '').filter((line) => line.important).slice(-3);
+  }, [tail.data?.text, tail.status]);
+  const summary = latestLog ? `${latestLog.name} · ${fmtRelative(latestLog.modified_at)}` : 'No launch logs on disk yet';
+
+  useEffect(() => {
+    if (!latest) {
+      setTail({ status: 'idle' });
+      return;
+    }
+    let alive = true;
+    const load = (showLoading: boolean): void => {
+      if (showLoading) {
+        setTail((current) => current.data?.name === latest ? current : { status: 'loading' });
+      }
+      void fetchLogTail(inst.id, latest)
+        .then((data) => {
+          if (alive) setTail({ status: 'ready', data });
+        })
+        .catch((err) => {
+          if (alive) setTail({ status: 'error', error: errMessage(err) });
+        });
+    };
+    load(true);
+    const timer = running ? window.setInterval(() => load(false), LOG_TAIL_POLL_MS) : 0;
+    return () => {
+      alive = false;
+      if (timer) window.clearInterval(timer);
+    };
+  }, [inst.id, latest, running]);
+
   return (
     <Card padding={16} class="cp-od-logs-card">
       <div class="cp-od-logs-summary">
@@ -732,6 +876,15 @@ function LogsCard({
           {count > 0 ? `View ${count}` : 'View logs'} <Icon name="chevron-right" size={11} stroke={2.2} />
         </button>
       </div>
+      {importantLines.length > 0 ? (
+        <div class="cp-od-log-tail" aria-label="Important latest log lines">
+          {importantLines.map((line) => (
+            <LogLine line={line} compact key={line.index} />
+          ))}
+        </div>
+      ) : tail.status === 'error' ? (
+        <div class="cp-od-log-note">Could not load latest log.</div>
+      ) : null}
     </Card>
   );
 }
@@ -1527,18 +1680,51 @@ function ScreenshotsPane({
   );
 }
 
+function LogLine({ line, compact = false }: { line: ClassifiedLogLine; compact?: boolean }): JSX.Element {
+  return (
+    <div class={`cp-log-line${compact ? ' cp-log-line--compact' : ''}`} data-kind={line.kind}>
+      <span class="cp-log-line-label" aria-label={`${line.kind} log line`}>{line.label}</span>
+      <span class="cp-log-line-text">{line.text || ' '}</span>
+    </div>
+  );
+}
+
+function LogLines({ text, filter }: { text: string; filter: LogFilter }): JSX.Element {
+  const lines = useMemo(() => classifyLogText(text), [text]);
+  const filteredLines = useMemo(() => lines.filter((line) => logLineMatchesFilter(line, filter)), [filter, lines]);
+
+  if (lines.length === 0) {
+    return <div class="cp-log-empty">Log file is empty.</div>;
+  }
+  if (filteredLines.length === 0) {
+    return <div class="cp-log-empty">No lines match this filter.</div>;
+  }
+  return (
+    <div class="cp-log-lines" role="log" aria-label="Log preview">
+      {filteredLines.map((line) => (
+        <LogLine line={line} key={line.index} />
+      ))}
+    </div>
+  );
+}
+
 function LogsPane({
   inst,
   resources,
+  running,
   onRefresh,
 }: {
   inst: EnrichedInstance;
   resources: ResourceLoadState;
+  running: boolean;
   onRefresh: () => void;
 }): JSX.Element {
   const logs = resources.data?.logs ?? [];
   const [selected, setSelected] = useState<string>('');
+  const [sort, setSort] = useState<LogSort>('current');
+  const [filter, setFilter] = useState<LogFilter>('all');
   const [tail, setTail] = useState<{ status: 'idle' | 'loading' | 'ready' | 'error'; data?: InstanceLogTail; error?: string }>({ status: 'idle' });
+  const sortedLogs = useMemo(() => sortLogs(logs, sort), [logs, sort]);
 
   useEffect(() => {
     if (!logs.length) {
@@ -1546,7 +1732,7 @@ function LogsPane({
       return;
     }
     if (!selected || !logs.some((log) => log.name === selected)) {
-      setSelected(logs[0].name);
+      setSelected(pickInitialLog(logs));
     }
   }, [logs, selected]);
 
@@ -1556,36 +1742,73 @@ function LogsPane({
       return;
     }
     let alive = true;
-    setTail({ status: 'loading' });
-    api('GET', `/instances/${encodeURIComponent(inst.id)}/logs/${encodeURIComponent(selected)}`)
-      .then((res: InstanceLogTail & { error?: string }) => {
-        if (!alive) return;
-        if (res?.error) throw new Error(res.error);
-        setTail({ status: 'ready', data: res });
-      })
-      .catch((err) => {
-        if (alive) setTail({ status: 'error', error: errMessage(err) });
-      });
-    return () => { alive = false; };
-  }, [inst.id, selected]);
+    const load = (showLoading: boolean): void => {
+      if (showLoading) {
+        setTail((current) => current.data?.name === selected ? current : { status: 'loading' });
+      }
+      void fetchLogTail(inst.id, selected)
+        .then((data) => {
+          if (alive) setTail({ status: 'ready', data });
+        })
+        .catch((err) => {
+          if (alive) setTail({ status: 'error', error: errMessage(err) });
+        });
+    };
+    load(true);
+    const timer = running ? window.setInterval(() => load(false), LOG_TAIL_POLL_MS) : 0;
+    return () => {
+      alive = false;
+      if (timer) window.clearInterval(timer);
+    };
+  }, [inst.id, running, selected]);
 
   return (
     <div class="cp-instance-body cp-logs-pane">
-      <ResourceToolbar
-        title={`${logs.length} log file${logs.length === 1 ? '' : 's'}`}
-        onRefresh={onRefresh}
-        action={{ icon: 'folder', label: 'Open logs', onClick: () => void openInstanceFolder(inst.id, 'logs') }}
-      />
+      <div class="cp-resource-toolbar cp-logs-toolbar">
+        <strong>{logs.length} log file{logs.length === 1 ? '' : 's'}</strong>
+        <div class="cp-logs-tools">
+          <div class="cp-mini-seg" role="tablist" aria-label="Sort logs">
+            {(Object.keys(LOG_SORT_LABELS) as LogSort[]).map((item) => (
+              <button
+                key={item}
+                type="button"
+                role="tab"
+                aria-selected={sort === item}
+                data-active={sort === item}
+                onClick={() => setSort(item)}
+              >
+                {LOG_SORT_LABELS[item]}
+              </button>
+            ))}
+          </div>
+          <div class="cp-mini-seg" role="tablist" aria-label="Filter log lines">
+            {(Object.keys(LOG_FILTER_LABELS) as LogFilter[]).map((item) => (
+              <button
+                key={item}
+                type="button"
+                role="tab"
+                aria-selected={filter === item}
+                data-active={filter === item}
+                onClick={() => setFilter(item)}
+              >
+                {LOG_FILTER_LABELS[item]}
+              </button>
+            ))}
+          </div>
+          <Button variant="secondary" size="sm" icon="refresh" onClick={onRefresh}>Refresh</Button>
+          <Button variant="soft" size="sm" icon="folder" onClick={() => void openInstanceFolder(inst.id, 'logs')}>Open logs</Button>
+        </div>
+      </div>
       <ResourceStatus state={resources} onRetry={onRefresh} />
       {logs.length === 0 && resources.status !== 'loading' ? (
         <ResourceEmpty icon="terminal" title="No logs yet" hint="Launch this instance and Minecraft log files will appear here." />
       ) : (
         <div class="cp-logs-layout">
           <div class="cp-logs-list">
-            {logs.map((log) => (
+            {sortedLogs.map((log) => (
               <button key={log.name} type="button" data-active={selected === log.name} onClick={() => setSelected(log.name)}>
                 <span>{log.name}</span>
-                <small>{fmtBytes(log.size)} · {fmtRelative(log.modified_at)}</small>
+                <small>{isCurrentLog(log.name) ? 'Current/latest · ' : ''}{fmtBytes(log.size)} · {fmtRelative(log.modified_at)}</small>
               </button>
             ))}
           </div>
@@ -1595,7 +1818,7 @@ function LogsPane({
             {tail.status === 'ready' && (
               <>
                 {tail.data?.truncated && <div class="cp-log-truncated">Showing the last {fmtBytes(tail.data.size > 0 ? Math.min(tail.data.size, 128 * 1024) : 0)} of this log.</div>}
-                <pre>{tail.data?.text || 'Log file is empty.'}</pre>
+                <LogLines text={tail.data?.text ?? ''} filter={filter} />
               </>
             )}
           </div>
@@ -2026,6 +2249,32 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
     return () => { alive = false; };
   }, [inst?.id]);
 
+  useEffect(() => {
+    if (!inst || !running) return;
+    let alive = true;
+    const refreshQuietly = (): void => {
+      void fetchInstanceResources(inst.id)
+        .then((data) => {
+          if (alive) setResources({ status: 'ready', data });
+        })
+        .catch((err) => {
+          if (alive) {
+            setResources((current) => ({
+              status: 'error',
+              data: current.data ?? null,
+              error: errMessage(err),
+            }));
+          }
+        });
+    };
+    refreshQuietly();
+    const timer = window.setInterval(refreshQuietly, LOG_RESOURCE_POLL_MS);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, [inst?.id, running]);
+
   if (!inst) {
     return (
       <div class="cp-view-page">
@@ -2181,14 +2430,14 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
             onOpenLogs={() => setTab('logs')}
           />
           <div class="cp-instance-bottom">
-            <LogsCard resources={resources.data} onOpenLogs={() => setTab('logs')} />
+            <LogsCard inst={inst} resources={resources.data} running={running} onOpenLogs={() => setTab('logs')} />
           </div>
         </>
       )}
       {tab === 'mods' && <ModsPane inst={inst} resources={resources} onRefresh={reloadResources} />}
       {tab === 'worlds' && <WorldsPane inst={inst} resources={resources} onRefresh={reloadResources} />}
       {tab === 'screenshots' && <ScreenshotsPane inst={inst} resources={resources} onRefresh={reloadResources} />}
-      {tab === 'logs' && <LogsPane inst={inst} resources={resources} onRefresh={reloadResources} />}
+      {tab === 'logs' && <LogsPane inst={inst} resources={resources} running={running} onRefresh={reloadResources} />}
       {tab === 'settings' && <SettingsPane inst={inst} />}
     </div>
   );
