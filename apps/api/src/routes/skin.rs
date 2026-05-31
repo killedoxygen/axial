@@ -1,4 +1,5 @@
 use crate::state::AppState;
+use crate::state::{AuthLoginMinecraftAccount, AuthLoginMinecraftSkin};
 use axum::{
     Json, Router,
     body::Body,
@@ -15,6 +16,7 @@ const DEFAULT_HEAD_SIZE: u32 = 64;
 const MIN_HEAD_SIZE: u32 = 16;
 const MAX_HEAD_SIZE: u32 = 256;
 const HEAD_CACHE_CONTROL: &str = "private, max-age=86400";
+const MINECRAFT_TEXTURE_URL_PREFIX: &str = "https://textures.minecraft.net/texture/";
 
 #[derive(Debug, Default, Deserialize)]
 struct SkinQuery {
@@ -44,6 +46,18 @@ async fn handle_skin_profile(
     Query(query): Query<SkinQuery>,
 ) -> Result<Json<SkinProfileResponse>, (StatusCode, Json<serde_json::Value>)> {
     let config = state.config().current();
+    if query.username.is_none() {
+        if let Some(profile) = online_skin_profile(
+            state
+                .auth_logins()
+                .active_minecraft_account_state()
+                .await
+                .map(|state| state.account),
+        ) {
+            return Ok(Json(profile));
+        }
+    }
+
     let identity = select_offline_identity(query.username.as_deref(), &config.username)?;
 
     Ok(Json(SkinProfileResponse {
@@ -55,6 +69,75 @@ async fn handle_skin_profile(
         texture_url: None,
         head_url: Some(format!("/api/v1/skin/head?username={}", identity.username)),
     }))
+}
+
+fn online_skin_profile(account: Option<AuthLoginMinecraftAccount>) -> Option<SkinProfileResponse> {
+    let account = account?;
+    let profile_name = account.profile.name.trim();
+    let profile_id = account.profile.id.trim();
+    if profile_name.is_empty() || profile_id.is_empty() {
+        return None;
+    }
+
+    let selected_skin = select_minecraft_skin(&account.profile.skins);
+    let texture_url = selected_skin.and_then(|skin| sane_minecraft_texture_url(&skin.url));
+    let variant = selected_skin
+        .map(|skin| skin_variant(&skin.variant))
+        .unwrap_or("classic");
+    let source = if selected_skin.is_some() {
+        "minecraft_profile_skin"
+    } else {
+        "default"
+    };
+
+    Some(SkinProfileResponse {
+        auth_mode: "online",
+        username: profile_name.to_string(),
+        uuid: profile_id.to_string(),
+        source,
+        variant,
+        texture_url,
+        head_url: None,
+    })
+}
+
+fn select_minecraft_skin(skins: &[AuthLoginMinecraftSkin]) -> Option<&AuthLoginMinecraftSkin> {
+    skins
+        .iter()
+        .find(|skin| skin.state.eq_ignore_ascii_case("ACTIVE"))
+        .or_else(|| {
+            skins
+                .iter()
+                .find(|skin| sane_minecraft_texture_url(&skin.url).is_some())
+        })
+}
+
+fn skin_variant(variant: &str) -> &'static str {
+    if variant.eq_ignore_ascii_case("slim") {
+        "slim"
+    } else {
+        "classic"
+    }
+}
+
+fn sane_minecraft_texture_url(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    if trimmed != url || !trimmed.starts_with(MINECRAFT_TEXTURE_URL_PREFIX) {
+        return None;
+    }
+
+    let texture_id = &trimmed[MINECRAFT_TEXTURE_URL_PREFIX.len()..];
+    if texture_id.is_empty() || texture_id.len() > 128 {
+        return None;
+    }
+    if !texture_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        return None;
+    }
+
+    Some(trimmed.to_string())
 }
 
 async fn handle_skin_head(
@@ -187,6 +270,10 @@ fn mix_color(seed: u64, first: u32, second: u32) -> u32 {
 mod tests {
     use super::*;
     use crate::state::{AppStateInit, InstallStore, SessionStore};
+    use crate::state::{
+        AuthLoginMinecraftProfile, AuthLoginMinecraftSkin, NewAuthLoginMinecraftAccount,
+        NewAuthLoginMsaToken, NewAuthLoginSession,
+    };
     use axum::body::to_bytes;
     use croopor_config::{AppConfig, AppPaths, ConfigStore, InstanceStore};
     use croopor_performance::PerformanceManager;
@@ -239,6 +326,190 @@ mod tests {
 
         assert_eq!(response.username, "ConfigUser");
         assert_eq!(response.uuid, offline_uuid("ConfigUser"));
+    }
+
+    #[tokio::test]
+    async fn skin_profile_uses_active_minecraft_profile_when_no_username_query() {
+        let fixture = TestFixture::new("online-profile", "ConfigUser");
+        fixture
+            .add_minecraft_account(test_profile(
+                "MinecraftName",
+                vec![
+                    minecraft_skin(
+                        "inactive",
+                        "INACTIVE",
+                        "https://textures.minecraft.net/texture/inactive",
+                        "classic",
+                    ),
+                    minecraft_skin(
+                        "active",
+                        "ACTIVE",
+                        "https://textures.minecraft.net/texture/activeTexture123",
+                        "SLIM",
+                    ),
+                ],
+            ))
+            .await;
+
+        let response = fixture
+            .profile(None, None)
+            .await
+            .expect("profile response")
+            .0;
+
+        assert_eq!(response.auth_mode, "online");
+        assert_eq!(response.username, "MinecraftName");
+        assert_eq!(response.uuid, "MinecraftName-id");
+        assert_eq!(response.source, "minecraft_profile_skin");
+        assert_eq!(response.variant, "slim");
+        assert_eq!(
+            response.texture_url.as_deref(),
+            Some("https://textures.minecraft.net/texture/activeTexture123")
+        );
+        assert_eq!(response.head_url, None);
+    }
+
+    #[tokio::test]
+    async fn skin_profile_username_query_keeps_offline_override_with_active_minecraft_profile() {
+        let fixture = TestFixture::new("online-query-override", "ConfigUser");
+        fixture
+            .add_minecraft_account(test_profile(
+                "MinecraftName",
+                vec![minecraft_skin(
+                    "active",
+                    "ACTIVE",
+                    "https://textures.minecraft.net/texture/active",
+                    "slim",
+                )],
+            ))
+            .await;
+
+        let response = fixture
+            .profile(Some("QueryUser".to_string()), None)
+            .await
+            .expect("profile response")
+            .0;
+
+        assert_eq!(response.auth_mode, "offline");
+        assert_eq!(response.username, "QueryUser");
+        assert_eq!(response.uuid, offline_uuid("QueryUser"));
+        assert_eq!(response.texture_url, None);
+    }
+
+    #[tokio::test]
+    async fn skin_profile_expired_minecraft_profile_falls_back_to_offline() {
+        let fixture = TestFixture::new("online-expired", "ConfigUser");
+        fixture
+            .add_minecraft_account_with_expiry(
+                test_profile(
+                    "MinecraftName",
+                    vec![minecraft_skin(
+                        "active",
+                        "ACTIVE",
+                        "https://textures.minecraft.net/texture/active",
+                        "slim",
+                    )],
+                ),
+                0,
+            )
+            .await;
+
+        let response = fixture
+            .profile(None, None)
+            .await
+            .expect("profile response")
+            .0;
+
+        assert_eq!(response.auth_mode, "offline");
+        assert_eq!(response.username, "ConfigUser");
+        assert_eq!(response.uuid, offline_uuid("ConfigUser"));
+        assert_eq!(
+            fixture.state.auth_logins().active_minecraft_account().await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn skin_profile_omits_unsane_minecraft_texture_url() {
+        let fixture = TestFixture::new("online-bad-texture", "ConfigUser");
+        fixture
+            .add_minecraft_account(test_profile(
+                "MinecraftName",
+                vec![minecraft_skin(
+                    "active",
+                    "ACTIVE",
+                    "https://example.com/texture/active",
+                    "unknown",
+                )],
+            ))
+            .await;
+
+        let response = fixture
+            .profile(None, None)
+            .await
+            .expect("profile response")
+            .0;
+
+        assert_eq!(response.auth_mode, "online");
+        assert_eq!(response.source, "minecraft_profile_skin");
+        assert_eq!(response.variant, "classic");
+        assert_eq!(response.texture_url, None);
+    }
+
+    #[tokio::test]
+    async fn skin_profile_without_active_skin_uses_first_sane_skin() {
+        let fixture = TestFixture::new("online-first-sane-texture", "ConfigUser");
+        fixture
+            .add_minecraft_account(test_profile(
+                "MinecraftName",
+                vec![
+                    minecraft_skin("bad", "INACTIVE", "https://example.com/texture/bad", "slim"),
+                    minecraft_skin(
+                        "good",
+                        "INACTIVE",
+                        "https://textures.minecraft.net/texture/goodTexture123",
+                        "classic",
+                    ),
+                ],
+            ))
+            .await;
+
+        let response = fixture
+            .profile(None, None)
+            .await
+            .expect("profile response")
+            .0;
+
+        assert_eq!(response.source, "minecraft_profile_skin");
+        assert_eq!(response.variant, "classic");
+        assert_eq!(
+            response.texture_url.as_deref(),
+            Some("https://textures.minecraft.net/texture/goodTexture123")
+        );
+    }
+
+    #[test]
+    fn minecraft_texture_url_sanitization_is_strict() {
+        assert_eq!(
+            sane_minecraft_texture_url("https://textures.minecraft.net/texture/abcDEF123"),
+            Some("https://textures.minecraft.net/texture/abcDEF123".to_string())
+        );
+        assert_eq!(
+            sane_minecraft_texture_url("http://textures.minecraft.net/texture/abc"),
+            None
+        );
+        assert_eq!(
+            sane_minecraft_texture_url("https://textures.minecraft.net.evil/texture/abc"),
+            None
+        );
+        assert_eq!(
+            sane_minecraft_texture_url("https://textures.minecraft.net/texture/abc?token=secret"),
+            None
+        );
+        assert_eq!(
+            sane_minecraft_texture_url(" https://textures.minecraft.net/texture/abc"),
+            None
+        );
     }
 
     #[tokio::test]
@@ -416,6 +687,53 @@ mod tests {
             )
             .await
         }
+
+        async fn add_minecraft_account(&self, profile: AuthLoginMinecraftProfile) {
+            self.add_minecraft_account_with_expiry(profile, 86_400)
+                .await;
+        }
+
+        async fn add_minecraft_account_with_expiry(
+            &self,
+            profile: AuthLoginMinecraftProfile,
+            expires_in: u64,
+        ) {
+            let session = self
+                .state
+                .auth_logins()
+                .insert(NewAuthLoginSession {
+                    device_code: "raw-device-code".to_string(),
+                    user_code: "ABCD-EFGH".to_string(),
+                    verification_uri: "https://www.microsoft.com/link".to_string(),
+                    expires_in: 900,
+                    interval: 5,
+                    message: None,
+                })
+                .await;
+
+            self.state
+                .auth_logins()
+                .complete_with_msa_and_minecraft_account(
+                    &session.login_id,
+                    NewAuthLoginMsaToken {
+                        access_token: "msa-access-token".to_string(),
+                        refresh_token: Some("msa-refresh-token".to_string()),
+                        id_token: None,
+                        token_type: "Bearer".to_string(),
+                        expires_in: 3600,
+                        scope: Some("XboxLive.signin offline_access".to_string()),
+                    },
+                    NewAuthLoginMinecraftAccount {
+                        access_token: "minecraft-access-token".to_string(),
+                        token_type: Some("Bearer".to_string()),
+                        expires_in,
+                        profile,
+                        owns_minecraft_java: true,
+                    },
+                )
+                .await
+                .expect("complete minecraft account login");
+        }
     }
 
     impl Drop for TestFixture {
@@ -454,5 +772,23 @@ mod tests {
             .await
             .expect("read response body");
         String::from_utf8(bytes.to_vec()).expect("utf-8 body")
+    }
+
+    fn test_profile(name: &str, skins: Vec<AuthLoginMinecraftSkin>) -> AuthLoginMinecraftProfile {
+        AuthLoginMinecraftProfile {
+            id: format!("{name}-id"),
+            name: name.to_string(),
+            skins,
+            capes: vec![],
+        }
+    }
+
+    fn minecraft_skin(id: &str, state: &str, url: &str, variant: &str) -> AuthLoginMinecraftSkin {
+        AuthLoginMinecraftSkin {
+            id: id.to_string(),
+            state: state.to_string(),
+            url: url.to_string(),
+            variant: variant.to_string(),
+        }
     }
 }

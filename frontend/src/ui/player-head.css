@@ -27,3 +27,11 @@
   width: 100%;
   height: 100%;
 }
+
+.cp-player-head-preload {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}

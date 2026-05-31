@@ -95,6 +95,7 @@ function buildPixels(username: string): { palette: HeadPalette; pixels: HeadPixe
 export function PlayerHeadPreview({
   username,
   src,
+  textureSrc,
   size = 48,
   radius = 8,
   ariaLabel,
@@ -104,6 +105,7 @@ export function PlayerHeadPreview({
 }: {
   username: string;
   src?: string;
+  textureSrc?: string;
   size?: number | string;
   radius?: number;
   ariaLabel?: string;
@@ -113,12 +115,20 @@ export function PlayerHeadPreview({
 }): JSX.Element {
   const { palette, pixels, overlays } = useMemo(() => buildPixels(username), [username]);
   const [imageFailed, setImageFailed] = useState(false);
+  const [textureReady, setTextureReady] = useState(false);
+  const [textureFailed, setTextureFailed] = useState(false);
   const dim = typeof size === 'number' ? `${size}px` : size;
   const imageSrc = src && !imageFailed ? src : null;
+  const skinTextureSrc = textureSrc && textureReady && !textureFailed ? textureSrc : null;
 
   useEffect(() => {
     setImageFailed(false);
   }, [src]);
+
+  useEffect(() => {
+    setTextureReady(false);
+    setTextureFailed(false);
+  }, [textureSrc]);
 
   return (
     <div
@@ -129,7 +139,25 @@ export function PlayerHeadPreview({
       title={title}
       style={{ width: dim, height: dim, borderRadius: radius, ...style }}
     >
-      {imageSrc ? (
+      {textureSrc && !textureReady && !textureFailed && (
+        <img
+          class="cp-player-head-preload"
+          src={textureSrc}
+          alt=""
+          aria-hidden="true"
+          draggable={false}
+          onLoad={() => setTextureReady(true)}
+          onError={() => setTextureFailed(true)}
+        />
+      )}
+      {skinTextureSrc ? (
+        <svg viewBox="0 0 8 8" width="100%" height="100%" preserveAspectRatio="none" shapeRendering="crispEdges">
+          <image href={skinTextureSrc} x="-8" y="-8" width="64" height="64" />
+          <image href={skinTextureSrc} x="-40" y="-8" width="64" height="64" />
+          <rect x="0" y="0" width="8" height="8" fill="oklch(0.98 0.006 70 / 0.08)" />
+          <rect x="0" y="7" width="8" height="1" fill="oklch(0.16 0.008 70 / 0.13)" />
+        </svg>
+      ) : imageSrc ? (
         <img
           src={imageSrc}
           alt=""

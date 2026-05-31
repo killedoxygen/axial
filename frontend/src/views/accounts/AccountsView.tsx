@@ -10,7 +10,7 @@ import { config } from '../../store';
 import type { LaunchAuthMode } from '../../types';
 import { validateUsername } from '../../utils';
 
-interface OfflineSkinProfile {
+interface SkinProfile {
   auth_mode: string;
   username: string;
   uuid: string;
@@ -113,9 +113,15 @@ type CopyTarget = 'code' | 'url';
 function PlayerIdentityEditor({
   savedUsername,
   headSrc,
+  textureSrc,
+  profileUsername,
+  profileSource,
 }: {
   savedUsername: string;
   headSrc?: string;
+  textureSrc?: string;
+  profileUsername?: string;
+  profileSource?: string;
 }): JSX.Element {
   const theme = useTheme();
   const [username, setUsername] = useState(savedUsername);
@@ -125,6 +131,9 @@ function PlayerIdentityEditor({
   const nameValid = nameError === null;
   const showNameError = username.length > 0 && !nameValid;
   const previewSrc = username.trim() === savedUsername ? headSrc : undefined;
+  const previewTextureSrc = username.trim() === savedUsername ? textureSrc : undefined;
+  const previewProfileName = profileUsername || username.trim() || 'Player';
+  const previewOnline = profileSource === 'minecraft_profile_skin' && Boolean(previewTextureSrc);
 
   const save = async (): Promise<void> => {
     const next = username.trim();
@@ -146,10 +155,11 @@ function PlayerIdentityEditor({
       <PlayerHeadPreview
         username={username}
         src={previewSrc}
+        textureSrc={previewTextureSrc}
         size={96}
         radius={theme.r.md}
-        ariaLabel={`Offline skin preview for ${username.trim() || 'Player'}`}
-        title="Offline skin preview"
+        ariaLabel={`${previewOnline ? 'Minecraft profile skin' : 'Offline skin preview'} for ${previewProfileName}`}
+        title={previewOnline ? 'Minecraft profile skin' : 'Offline skin preview'}
       />
       <div style={{ flex: 1, minWidth: 240 }}>
         <div style={{
@@ -215,10 +225,10 @@ function ProfileMetaValue({ label, value }: { label: string; value: string }): J
 }
 
 function useOfflineSkinProfile(savedUsername: string): {
-  profile: OfflineSkinProfile | null;
+  profile: SkinProfile | null;
   state: OfflineProfileState;
 } {
-  const [profile, setProfile] = useState<OfflineSkinProfile | null>(null);
+  const [profile, setProfile] = useState<SkinProfile | null>(null);
   const [state, setState] = useState<OfflineProfileState>('loading');
 
   useEffect(() => {
@@ -227,7 +237,7 @@ function useOfflineSkinProfile(savedUsername: string): {
     setProfile(null);
 
     void api('GET', '/skin/profile')
-      .then((res: OfflineSkinProfile & { error?: string }) => {
+      .then((res: SkinProfile & { error?: string }) => {
         if (!active) return;
         if (res.error) throw new Error(res.error);
         setProfile(res);
@@ -288,11 +298,17 @@ function useAuthStatus(savedUsername: string): {
   return { status, state, refresh };
 }
 
-function OfflineProfileMeta({
+function skinSourceLabel(source: string, authMode: string): string {
+  if (source === 'minecraft_profile_skin') return 'Minecraft profile skin';
+  if (authMode === 'online') return 'Default skin';
+  return 'Offline default';
+}
+
+function SkinProfileMeta({
   profile,
   state,
 }: {
-  profile: OfflineSkinProfile | null;
+  profile: SkinProfile | null;
   state: OfflineProfileState;
 }): JSX.Element {
   const theme = useTheme();
@@ -316,7 +332,7 @@ function OfflineProfileMeta({
         fontWeight: 600,
       }}>
         <Icon name="tag" size={14} color={theme.n.textMute} />
-        Offline profile
+        Skin profile
       </div>
 
       {state === 'ready' && profile ? (
@@ -328,7 +344,7 @@ function OfflineProfileMeta({
         }}>
           <ProfileMetaValue label="UUID" value={shortenUuid(profile.uuid)} />
           <ProfileMetaValue label="Variant" value={profile.variant || 'classic'} />
-          <ProfileMetaValue label="Source" value={profile.source || 'default'} />
+          <ProfileMetaValue label="Source" value={skinSourceLabel(profile.source, profile.auth_mode)} />
         </div>
       ) : (
         <div style={{
@@ -345,15 +361,25 @@ function OfflineProfileMeta({
 
 function PlayerIdentityCard({ savedUsername }: { savedUsername: string }): JSX.Element {
   const { profile, state } = useOfflineSkinProfile(savedUsername);
-  const headSrc = state === 'ready' && profile?.username === savedUsername && profile.head_url
+  const headSrc = state === 'ready' && profile?.head_url
     ? apiResourceUrl(profile.head_url)
+    : undefined;
+  const textureSrc = state === 'ready' && profile?.texture_url
+    ? profile.texture_url
     : undefined;
 
   return (
     <Card>
       <SectionHeading eyebrow="Player" title="Identity" />
-      <PlayerIdentityEditor key={savedUsername} savedUsername={savedUsername} headSrc={headSrc} />
-      <OfflineProfileMeta profile={profile} state={state} />
+      <PlayerIdentityEditor
+        key={savedUsername}
+        savedUsername={savedUsername}
+        headSrc={headSrc}
+        textureSrc={textureSrc}
+        profileUsername={profile?.username}
+        profileSource={profile?.source}
+      />
+      <SkinProfileMeta profile={profile} state={state} />
     </Card>
   );
 }
