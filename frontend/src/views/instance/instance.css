@@ -565,6 +565,81 @@
   left: calc(76px + var(--cp-instance-dock-pad));
 }
 
+@media (min-width: 1181px) {
+  .cp-instance-cover {
+    height: 172px;
+  }
+  .cp-instance-titlebar {
+    padding: 0 32px 22px;
+    margin-top: -124px;
+  }
+  .cp-instance-titlebar-row {
+    gap: 18px;
+  }
+  .cp-instance-titlebar-left {
+    gap: 18px;
+  }
+  .cp-instance-avatar {
+    width: 94px;
+    height: 94px;
+  }
+  .cp-instance-title {
+    font-size: 36px;
+    line-height: 1.04;
+  }
+  .cp-instance-pills-row {
+    gap: 8px;
+    margin-bottom: 7px;
+  }
+  .cp-instance-subtitle {
+    margin-top: 7px;
+  }
+  .cp-instance-actions {
+    padding-bottom: 0;
+  }
+  .cp-instance-tabs {
+    padding-bottom: 8px;
+  }
+  .cp-instance-body--overview-bento {
+    padding-top: 12px;
+    grid-template-areas:
+      "performance guardian"
+      "worlds details"
+      "quick activity";
+    gap: 12px 15px;
+  }
+  .cp-instance-body--overview-bento > .cp-od-slot > .cp-card {
+    padding: 16px !important;
+  }
+  .cp-instance-body--overview-bento .cp-od-head {
+    margin-bottom: 10px;
+  }
+  .cp-instance-body--overview-bento .cp-od-perf-summary {
+    margin-bottom: 10px;
+  }
+  .cp-instance-body--overview-bento .cp-od-perf-row {
+    margin-bottom: 7px;
+  }
+  .cp-instance-body--overview-bento .cp-od-perf-slider {
+    margin-bottom: 7px;
+  }
+  .cp-instance-body--overview-bento .cp-od-perf-runtime {
+    margin-top: 10px;
+    padding-top: 9px;
+  }
+  .cp-instance-body--overview-bento .cp-od-guardian-list {
+    margin-top: 8px;
+  }
+  .cp-instance-body--overview-bento .cp-od-guardian-row,
+  .cp-instance-body--overview-bento .cp-od-kv-row {
+    padding: 6px 0;
+  }
+  .cp-instance-body--overview-bento .cp-od-quick-action {
+    min-height: 50px;
+    padding: 8px 9px;
+  }
+}
+
 /* ─── Stagger fade-up entrance ─── */
 .cp-od-stagger {
   opacity: 0;
