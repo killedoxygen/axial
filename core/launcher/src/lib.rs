@@ -16,8 +16,9 @@ pub use build::{
 pub use guardian::{
     GuardianDecision, GuardianIntervention, GuardianInterventionKind, GuardianMode,
     GuardianSummary, LaunchGuardianContext, OverrideOrigin, PreLaunchAction, PreLaunchDecision,
-    RecoveryAction, RecoveryPlan, ResolvedGuardianPreset, conservative_healing_preset,
-    decide_prepare_failure, guidance_for_failure, recovery_plan_for_startup_failure,
+    RecoveryAction, RecoveryPlan, ResolvedGuardianPreset, StartupFailureDecision,
+    StartupFailureObservation, conservative_healing_preset, decide_prepare_failure,
+    decide_startup_failure, guidance_for_failure, recovery_plan_for_startup_failure,
     resolve_launch_preset,
 };
 pub use healing::{HealingEvent, HealingEventKind};

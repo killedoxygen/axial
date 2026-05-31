@@ -132,10 +132,10 @@ Guardian should produce one normalized outcome for the pipeline:
 
 ### Startup failure
 1. Session layer reports observations about exit/stall/failure text
-2. runner resolves a failure class
+2. runner keeps the session observation plumbing and maps `stalled`/`exited` observations into bounded Guardian startup-failure facts
 3. Guardian decides whether startup recovery is allowed
 4. if allowed, Healing executes the recovery plan
-5. if not allowed, Guardian blocks with guidance
+5. if not allowed, Guardian converts the startup observation into a blocked message, details, and guidance before the runner emits terminal launch failure status
 
 ## Guardian and Healing
 Healing is narrower than Guardian.
@@ -199,6 +199,7 @@ Current launcher behavior:
 - Guardian `message` is preferred for launch notices when present
 - blocked Guardian `details` include the bounded backend-authored failure reason before guidance when one is available
 - Guardian `details` are preferred over frontend-synthesized intervention/guidance copy
+- startup `stalled` and pre-startup `exited` observations keep session plumbing as fact collection, but the terminal blocked summary and user guidance are Guardian-authored before launch failure status is emitted
 - `guidance` and `interventions` remain serialized as current bounded diagnostics
 - Healing remains supporting detail for runtime-adjustment specifics and retry/fallback context
 - live launch stage records preserve bounded unique Guardian `details` for `warned`, `intervened`, and `blocked` status payloads before appending Healing warnings without duplicates; Healing `fallback_applied` remains the only source of stage fallback reasons

@@ -93,7 +93,7 @@ flowchart TD
     Q --> R[wait_for_startup observation window]
     R -->|stable or timed out| S[return HTTP success with pid + guardian + healing]
     R -->|stalled or exited| T[collect failure observations]
-    T --> U[Guardian decides whether startup recovery is allowed]
+    T --> U[Guardian decides whether startup recovery or a blocked startup summary is allowed]
     U -->|recover| V[apply one startup recovery plan and retry]
     U -->|block| W[emit terminal failure + guardian guidance]
     V --> I
@@ -258,7 +258,7 @@ The API also exposes `GET /api/v1/skin/profile` as the local skin-profile bounda
 - Guardian is the authority for launch-safety policy.
 - Healing is a capability used by Guardian, not the authority.
 - Runtime/JVM/validation layers should produce facts and execution helpers, not user-policy decisions.
-- Session heuristics are observations. They should not invent user-policy outcomes on their own.
+- Session heuristics are observations. They should not invent user-policy outcomes on their own; stalled and pre-startup exited observations are converted into Guardian-authored blocked summaries before terminal launch failure status is emitted.
 - Guardian summaries carry additive backend-authored `message` and `details` fields for user-facing non-allowed outcomes.
 - Live and persisted launch stage histories preserve bounded Guardian `details` for non-allowed status payloads, with Healing warnings retained as supporting detail and Healing fallback metadata retained as the fallback source.
 - Launch preparation computes conservative host resource warnings from active session allocations, requested launch memory, active launch count, CPU thread count, best-effort CPU load averages, active install/download sessions, and launch-relevant disk free space. It also warns when the selected minimum memory exceeds the effective maximum and is clamped down for launch, and when the effective maximum memory allocation is below the conservative 2 GB startup threshold. Tight memory headroom, high launch concurrency, saturated measured CPU load, concurrent install pressure, low disk headroom, very low launch allocation, or memory-bound clamping produce non-blocking Guardian `warned` outcomes.

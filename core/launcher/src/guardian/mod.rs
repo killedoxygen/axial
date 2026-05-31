@@ -140,6 +140,20 @@ pub enum PreLaunchDecision {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupFailureObservation {
+    Stalled,
+    Exited { failure_class: LaunchFailureClass },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupFailureDecision {
+    pub class: LaunchFailureClass,
+    pub message: String,
+    pub reason: String,
+    pub guidance: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct RecoveryPlan {
     pub description: String,
@@ -199,6 +213,19 @@ impl GuardianSummary {
         self.guidance = guidance;
         self.refresh_outcome();
         prepend_unique_detail(&mut self.details, Some(reason.into()));
+    }
+
+    pub fn block_with_message_reason_and_guidance(
+        &mut self,
+        message: impl Into<String>,
+        reason: impl Into<String>,
+        guidance: Vec<String>,
+    ) {
+        self.block_with_reason_and_guidance(reason, guidance);
+        let message = message.into();
+        if !message.trim().is_empty() {
+            self.message = Some(message.trim().to_string());
+        }
     }
 
     pub fn warn_with_guidance(&mut self, guidance: Vec<String>) {
@@ -423,6 +450,90 @@ pub fn decide_prepare_failure(
     }
 }
 
+pub fn decide_startup_failure(
+    context: &LaunchGuardianContext,
+    observation: StartupFailureObservation,
+) -> StartupFailureDecision {
+    let class = match observation {
+        StartupFailureObservation::Stalled => LaunchFailureClass::StartupStalled,
+        StartupFailureObservation::Exited { failure_class } => failure_class,
+    };
+    StartupFailureDecision {
+        class,
+        message: "Guardian blocked launch startup.".to_string(),
+        reason: startup_failure_reason(observation),
+        guidance: startup_failure_guidance(class, context),
+    }
+}
+
+fn startup_failure_reason(observation: StartupFailureObservation) -> String {
+    match observation {
+        StartupFailureObservation::Stalled => {
+            "No startup activity was observed before the startup window ended.".to_string()
+        }
+        StartupFailureObservation::Exited { failure_class } => match failure_class {
+            LaunchFailureClass::JvmUnsupportedOption
+            | LaunchFailureClass::JvmExperimentalUnlock
+            | LaunchFailureClass::JvmOptionOrdering => {
+                "Minecraft exited before startup completed with a detected JVM option compatibility failure.".to_string()
+            }
+            LaunchFailureClass::JavaRuntimeMismatch => {
+                "Minecraft exited before startup completed with a detected Java runtime mismatch."
+                    .to_string()
+            }
+            LaunchFailureClass::ClasspathModuleConflict => {
+                "Minecraft exited before startup completed with a detected classpath or module conflict."
+                    .to_string()
+            }
+            LaunchFailureClass::AuthModeIncompatible => {
+                "Minecraft exited before startup completed because the selected auth mode was not launch-ready."
+                    .to_string()
+            }
+            LaunchFailureClass::LoaderBootstrapFailure => {
+                "Minecraft exited before startup completed with a detected loader bootstrap failure."
+                    .to_string()
+            }
+            LaunchFailureClass::StartupStalled => {
+                "Minecraft exited before startup completed after startup activity stalled."
+                    .to_string()
+            }
+            LaunchFailureClass::Unknown => {
+                "Minecraft exited before Guardian could verify a completed startup.".to_string()
+            }
+        },
+    }
+}
+
+fn startup_failure_guidance(
+    class: LaunchFailureClass,
+    context: &LaunchGuardianContext,
+) -> Vec<String> {
+    if class == LaunchFailureClass::StartupStalled {
+        return if context.has_risky_overrides() {
+            vec![
+                "Review recent Java, JVM preset, or JVM argument overrides before retrying."
+                    .to_string(),
+            ]
+        } else {
+            vec!["Review the latest game log before retrying.".to_string()]
+        };
+    }
+
+    let mut guidance = guidance_for_failure(class, context);
+    if !guidance.is_empty() {
+        return guidance;
+    }
+    if context.has_risky_overrides() {
+        guidance.push(
+            "Review recent Java, JVM preset, or JVM argument overrides before retrying."
+                .to_string(),
+        );
+    } else {
+        guidance.push("Review the latest game log before retrying.".to_string());
+    }
+    guidance
+}
+
 pub fn resolve_launch_preset(
     context: &LaunchGuardianContext,
     requested_preset: &str,
@@ -547,8 +658,8 @@ mod tests {
     use super::{
         GuardianInterventionKind, GuardianMode, GuardianSummary, LaunchGuardianContext,
         OverrideOrigin, PreLaunchAction, PreLaunchDecision, RecoveryAction,
-        conservative_healing_preset, decide_prepare_failure, recovery_plan_for_startup_failure,
-        resolve_launch_preset,
+        StartupFailureObservation, conservative_healing_preset, decide_prepare_failure,
+        decide_startup_failure, recovery_plan_for_startup_failure, resolve_launch_preset,
     };
     use crate::types::LaunchFailureClass;
     use croopor_minecraft::JavaRuntimeInfo;
@@ -826,6 +937,76 @@ mod tests {
                 "Remove the Java override or switch Guardian Mode back to Managed.",
             ]
         );
+    }
+
+    #[test]
+    fn startup_stalled_decision_is_guardian_authored_and_bounded() {
+        let context = LaunchGuardianContext {
+            mode: GuardianMode::Managed,
+            ..LaunchGuardianContext::default()
+        };
+
+        let decision = decide_startup_failure(&context, StartupFailureObservation::Stalled);
+
+        assert_eq!(decision.class, LaunchFailureClass::StartupStalled);
+        assert_eq!(decision.message, "Guardian blocked launch startup.");
+        assert_eq!(
+            decision.reason,
+            "No startup activity was observed before the startup window ended."
+        );
+        assert_eq!(
+            decision.guidance,
+            vec!["Review the latest game log before retrying."]
+        );
+        assert!(!decision.reason.contains('/'));
+        assert!(!decision.reason.contains('\\'));
+    }
+
+    #[test]
+    fn startup_stalled_decision_points_to_overrides_only_when_present() {
+        let context = LaunchGuardianContext {
+            mode: GuardianMode::Custom,
+            java_override_origin: Some(OverrideOrigin::Instance),
+            preset_override_origin: Some(OverrideOrigin::Instance),
+            raw_jvm_args_origin: Some(OverrideOrigin::Instance),
+        };
+
+        let decision = decide_startup_failure(&context, StartupFailureObservation::Stalled);
+
+        assert_eq!(decision.class, LaunchFailureClass::StartupStalled);
+        assert_eq!(
+            decision.guidance,
+            vec!["Review recent Java, JVM preset, or JVM argument overrides before retrying."]
+        );
+    }
+
+    #[test]
+    fn startup_exited_decision_uses_observed_class_without_raw_details() {
+        let context = LaunchGuardianContext {
+            mode: GuardianMode::Custom,
+            raw_jvm_args_origin: Some(OverrideOrigin::Instance),
+            ..LaunchGuardianContext::default()
+        };
+
+        let decision = decide_startup_failure(
+            &context,
+            StartupFailureObservation::Exited {
+                failure_class: LaunchFailureClass::JvmUnsupportedOption,
+            },
+        );
+
+        assert_eq!(decision.class, LaunchFailureClass::JvmUnsupportedOption);
+        assert_eq!(decision.message, "Guardian blocked launch startup.");
+        assert_eq!(
+            decision.reason,
+            "Minecraft exited before startup completed with a detected JVM option compatibility failure."
+        );
+        assert_eq!(
+            decision.guidance,
+            vec!["Remove the explicit JVM args or switch Guardian Mode back to Managed."]
+        );
+        assert!(!decision.reason.contains("-X"));
+        assert!(!decision.reason.contains("-D"));
     }
 
     #[test]

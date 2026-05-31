@@ -4,9 +4,10 @@ use crate::state::{AppState, LaunchStatusEvent, StartupOutcome};
 use croopor_config::{AppConfig, Instance};
 use croopor_launcher::{
     GuardianInterventionKind, GuardianSummary, LaunchFailureClass, LaunchState, PreLaunchAction,
-    PreLaunchDecision, RecoveryAction, build_healing_summary, decide_prepare_failure,
-    failure_class_name, format_failure_class, guidance_for_failure, launch_state_name,
-    prepare_launch_attempt, recovery_plan_for_startup_failure,
+    PreLaunchDecision, RecoveryAction, StartupFailureDecision, StartupFailureObservation,
+    build_healing_summary, decide_prepare_failure, decide_startup_failure, failure_class_name,
+    guidance_for_failure, launch_state_name, prepare_launch_attempt,
+    recovery_plan_for_startup_failure,
 };
 use serde_json::Value;
 use std::collections::HashSet;
@@ -379,16 +380,20 @@ pub(super) async fn launch_session(
                     let _ = state.sessions().kill(&session_id).await;
                 }
 
-                let failure_class = if stalled {
-                    LaunchFailureClass::StartupStalled
+                let observation = if stalled {
+                    StartupFailureObservation::Stalled
                 } else {
-                    state
-                        .sessions()
-                        .observed_failure(&session_id)
-                        .await
-                        .map(|failure| failure.class)
-                        .unwrap_or(LaunchFailureClass::Unknown)
+                    StartupFailureObservation::Exited {
+                        failure_class: state
+                            .sessions()
+                            .observed_failure(&session_id)
+                            .await
+                            .map(|failure| failure.class)
+                            .unwrap_or(LaunchFailureClass::Unknown),
+                    }
                 };
+                let startup_decision = decide_startup_failure(&intent.guardian, observation);
+                let failure_class = startup_decision.class;
                 if !attempt.startup_recovery_applied
                     && let Some(recovery) = recovery_plan_for_startup_failure(
                         failure_class,
@@ -456,25 +461,13 @@ pub(super) async fn launch_session(
                         retry_count: attempt.retry_count,
                         failure_class: Some(failure_class),
                     });
-                let message = if failure_class == LaunchFailureClass::StartupStalled {
-                    "launch stopped before startup: no startup activity observed".to_string()
-                } else {
-                    format!(
-                        "launch failed during startup: {}",
-                        format_failure_class(failure_class)
-                    )
-                };
-                block_guardian_with_reason_and_guidance(
-                    &mut guardian,
-                    Some(message.clone()),
-                    guidance_for_failure(failure_class, &intent.guardian),
-                );
+                apply_startup_failure_guardian_decision(&mut guardian, &startup_decision);
                 return Err(fail_launch(
                     &state,
                     &session_id,
                     Some(&proof_context),
                     failure_class,
-                    &message,
+                    &startup_decision.message,
                     healing,
                     Some(guardian.clone()),
                 )
@@ -513,6 +506,21 @@ fn block_guardian_with_reason_and_guidance(
     } else {
         guardian.block_with_guidance(merged);
     }
+}
+
+fn apply_startup_failure_guardian_decision(
+    guardian: &mut GuardianSummary,
+    decision: &StartupFailureDecision,
+) {
+    let mut merged = guardian.guidance.clone();
+    for detail in &decision.guidance {
+        push_unique_detail(&mut merged, detail.clone());
+    }
+    guardian.block_with_message_reason_and_guidance(
+        decision.message.clone(),
+        decision.reason.clone(),
+        merged,
+    );
 }
 
 fn bounded_prepare_failure_reason(
@@ -1023,6 +1031,77 @@ mod tests {
             guardian.details,
             vec![reason.to_string(), warning, guidance.to_string()]
         );
+    }
+
+    #[test]
+    fn startup_stalled_blocks_with_guardian_authored_status_payload() {
+        let warning = "Launch memory budget is tight.".to_string();
+        let mut guardian = GuardianSummary::new(GuardianMode::Managed);
+        guardian.warn_with_guidance(vec![warning.clone()]);
+        let context = croopor_launcher::LaunchGuardianContext {
+            mode: GuardianMode::Managed,
+            ..croopor_launcher::LaunchGuardianContext::default()
+        };
+
+        let decision = decide_startup_failure(&context, StartupFailureObservation::Stalled);
+        apply_startup_failure_guardian_decision(&mut guardian, &decision);
+        let payload = serialize_guardian(Some(guardian.clone())).expect("guardian payload");
+
+        assert_eq!(decision.class, LaunchFailureClass::StartupStalled);
+        assert_eq!(
+            guardian.decision,
+            croopor_launcher::GuardianDecision::Blocked
+        );
+        assert_eq!(guardian.message.as_deref(), Some(decision.message.as_str()));
+        assert_eq!(guardian.details.first(), Some(&decision.reason));
+        assert!(guardian.details.iter().any(|detail| detail == &warning));
+        assert!(
+            guardian
+                .details
+                .iter()
+                .any(|detail| detail == "Review the latest game log before retrying.")
+        );
+        assert_eq!(payload["decision"], serde_json::json!("blocked"));
+        assert_eq!(payload["message"], serde_json::json!(decision.message));
+        assert_eq!(payload["details"][0], serde_json::json!(decision.reason));
+    }
+
+    #[test]
+    fn startup_exited_blocks_with_observed_failure_guardian_summary() {
+        let mut guardian = GuardianSummary::new(GuardianMode::Custom);
+        let context = croopor_launcher::LaunchGuardianContext {
+            mode: GuardianMode::Custom,
+            raw_jvm_args_origin: Some(croopor_launcher::OverrideOrigin::Instance),
+            ..croopor_launcher::LaunchGuardianContext::default()
+        };
+
+        let decision = decide_startup_failure(
+            &context,
+            StartupFailureObservation::Exited {
+                failure_class: LaunchFailureClass::JvmUnsupportedOption,
+            },
+        );
+        apply_startup_failure_guardian_decision(&mut guardian, &decision);
+        let payload = serialize_guardian(Some(guardian.clone())).expect("guardian payload");
+
+        assert_eq!(decision.class, LaunchFailureClass::JvmUnsupportedOption);
+        assert_eq!(
+            guardian.decision,
+            croopor_launcher::GuardianDecision::Blocked
+        );
+        assert_eq!(
+            guardian.message.as_deref(),
+            Some("Guardian blocked launch startup.")
+        );
+        assert_eq!(
+            guardian.details,
+            vec![
+                "Minecraft exited before startup completed with a detected JVM option compatibility failure.",
+                "Remove the explicit JVM args or switch Guardian Mode back to Managed.",
+            ]
+        );
+        assert_eq!(payload["decision"], serde_json::json!("blocked"));
+        assert_eq!(payload["details"][0], serde_json::json!(decision.reason));
     }
 
     #[test]
