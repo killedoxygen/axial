@@ -1,4 +1,5 @@
 pub mod app;
+pub(crate) mod auth_chain;
 pub mod dto;
 pub mod install_runtime;
 pub mod logging;
