@@ -2391,6 +2391,126 @@ mod tests {
         cleanup(&fixture.root);
     }
 
+    #[tokio::test]
+    async fn family_c_qualification_route_returns_ready_for_complete_suite() {
+        let fixture = RouteTestFixture::new("family-c-qualification-ready-route");
+        let suite_id = "family-c-qualification-ready-route";
+        persist_family_c_suite_run(&fixture.paths, suite_id, 0, "baseline-session");
+        persist_family_c_suite_run(&fixture.paths, suite_id, 1, "managed-session");
+        let manifest = crate::state::benchmark_suites::load(&fixture.paths, suite_id)
+            .expect("load suite")
+            .expect("suite exists");
+        let baseline_run = manifest
+            .runs
+            .iter()
+            .find(|run| run.target_id == FAMILY_C_BASELINE_TARGET_ID)
+            .expect("baseline run");
+        let managed_run = manifest
+            .runs
+            .iter()
+            .find(|run| run.target_id == FAMILY_C_MANAGED_TARGET_ID)
+            .expect("managed run");
+        write_family_c_proof(&fixture.paths, baseline_run, "vanilla", None);
+        write_family_c_proof(
+            &fixture.paths,
+            managed_run,
+            "managed",
+            Some(crate::state::launch_reports::LaunchProofComparison {
+                baseline_session_id: "baseline-session".to_string(),
+                baseline_recorded_at: "2026-01-01T00:01:00.000Z".to_string(),
+                matched_sample_count: 1,
+                metric_name: "total_completed_stage_duration_ms".to_string(),
+                current_value_ms: 90,
+                baseline_value_ms: 120,
+                delta_ms: -30,
+                delta_percent: -25.0,
+            }),
+        );
+
+        let response = router()
+            .with_state(fixture.state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "/api/v1/launch/benchmark/qualification/family-c-1-12-2/{suite_id}"
+                    ))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("route response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("qualification json");
+        let data = serde_json::to_string(&payload).expect("serialize payload");
+        let lower_data = data.to_ascii_lowercase();
+
+        assert_eq!(payload["status"], serde_json::json!("ready"));
+        assert_eq!(
+            payload["targets"][0]["target_id"],
+            serde_json::json!(FAMILY_C_BASELINE_TARGET_ID)
+        );
+        assert_eq!(
+            payload["targets"][1]["target_id"],
+            serde_json::json!(FAMILY_C_MANAGED_TARGET_ID)
+        );
+        assert_eq!(
+            payload["targets"][0]["proof"]["present"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            payload["targets"][1]["proof"]["present"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            payload["targets"][1]["proof"]["comparison"]["present"],
+            serde_json::json!(true)
+        );
+        assert_eq!(payload["targets"][0]["missing"], serde_json::json!([]));
+        assert_eq!(payload["targets"][1]["missing"], serde_json::json!([]));
+        assert!(!lower_data.contains("java_path"));
+        assert!(!lower_data.contains("command"));
+        assert!(!lower_data.contains("java-args"));
+        assert!(!lower_data.contains("account"));
+        assert!(!lower_data.contains("token"));
+
+        cleanup(&fixture.root);
+    }
+
+    #[tokio::test]
+    async fn family_c_qualification_route_missing_suite_returns_json_404() {
+        let fixture = RouteTestFixture::new("family-c-qualification-missing-route");
+
+        let response = router()
+            .with_state(fixture.state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/launch/benchmark/qualification/family-c-1-12-2/missing-suite")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("route response");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("qualification error json");
+        assert_eq!(
+            payload,
+            serde_json::json!({ "error": "benchmark suite not found" })
+        );
+
+        cleanup(&fixture.root);
+    }
+
     #[test]
     fn family_c_qualification_preview_payload_is_descriptor_only() {
         let payload =
