@@ -594,6 +594,22 @@ function readinessValue(value: boolean | undefined, readyLabel: string, notReady
   return 'Not reported';
 }
 
+function expiryWindowValue(seconds: number | null | undefined): string {
+  if (typeof seconds !== 'number' || !Number.isFinite(seconds)) return 'Not reported';
+  if (seconds <= 0) return 'Expired';
+  return `Expires in ${formatSeconds(seconds)}`;
+}
+
+function compactExpiryWindow(label: string, seconds: number | null | undefined): string {
+  if (typeof seconds !== 'number' || !Number.isFinite(seconds)) return `${label} not reported`;
+  if (seconds <= 0) return `${label} expired`;
+  return `${label} ${formatSeconds(seconds)}`;
+}
+
+function expiryWindowTone(seconds: number | null | undefined): 'info' | 'warn' {
+  return typeof seconds === 'number' && Number.isFinite(seconds) && seconds > 300 ? 'info' : 'warn';
+}
+
 function launchAuthMode(value: unknown): LaunchAuthMode {
   return value === 'online' ? 'online' : 'offline';
 }
@@ -689,7 +705,9 @@ function launchAuthModeCopy(
   return {
     tone: 'warn',
     icon: 'alert',
-    text: 'Online is selected, but launch credentials are not ready. Sign in and verify Minecraft ownership again, or switch to Offline for the reliable path.',
+    text: status.login_available
+      ? 'Online is selected, but launch credentials are missing or expired. Re-verify with Microsoft, or switch to Offline.'
+      : 'Online is selected, but launch credentials are missing or expired. Sign-in is unavailable right now; switch to Offline.',
   };
 }
 
@@ -847,7 +865,7 @@ function MinecraftProfileReadiness({ status }: { status: AuthStatusRecord }): JS
     ? `${profile.skins.length}${primarySkin ? `, ${primarySkin.variant || 'classic'} ${primarySkin.state}` : ''}`
     : 'Not reported';
   const verificationWindow = typeof status.minecraft_token_expires_in === 'number'
-    ? formatSeconds(status.minecraft_token_expires_in)
+    ? expiryWindowValue(status.minecraft_token_expires_in)
     : 'Not reported';
 
   return (
@@ -891,7 +909,7 @@ function MinecraftProfileReadiness({ status }: { status: AuthStatusRecord }): JS
         fontSize: 12,
         lineHeight: 1.45,
       }}>
-        Online launch mode can use this profile only while Online is selected and the volatile credentials remain valid. Croopor does not persist or refresh them yet.
+        Online launch mode can use this profile only while Online is selected and these restart-volatile credentials are inside the reported expiry window. Croopor does not persist or refresh them yet.
       </div>
       <div style={{
         display: 'grid',
@@ -1177,14 +1195,35 @@ function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Elem
   const msaActive = Boolean(status?.msa_authenticated);
   const minecraftVerified = Boolean(status?.minecraft_profile_ready === true && status?.minecraft_ownership_verified === true);
   const minecraftReadinessReported = status ? hasMinecraftReadiness(status) : false;
+  const minecraftCredentialsActive = Boolean(status && (
+    status.minecraft_profile_ready === true ||
+    status.minecraft_ownership_verified === true ||
+    typeof status.minecraft_token_expires_in === 'number'
+  ));
+  const selectedAuthMode = status
+    ? launchAuthMode(config.value?.launch_auth_mode ?? status.launch_auth_mode)
+    : 'offline';
+  const onlineSelectable = status ? statusCanSelectOnline(status) : false;
   const effectiveModeLabel = status?.mode === 'online' ? 'online' : 'offline';
   const statusCopy = msaActive
     ? minecraftVerified
-      ? `Microsoft sign-in is active and the Minecraft profile is verified. Croopor launches as ${status?.username} when Online is selected and the volatile credentials remain valid.`
+      ? `Microsoft sign-in and Minecraft profile are verified. Croopor launches as ${status?.username} when Online is selected and these restart-volatile credentials remain inside their expiry windows.`
       : minecraftReadinessReported
-        ? `Microsoft sign-in is active, but verified Minecraft profile ownership is not ready. Offline launch remains available.`
-        : `Microsoft sign-in is active. Online launch still needs Minecraft profile and ownership readiness; offline launch remains available.`
+        ? `Microsoft sign-in is active, but Minecraft profile ownership is not ready. Re-verify to replace volatile launch credentials, or switch to Offline.`
+        : `Microsoft sign-in is active. Online launch still needs Minecraft profile and ownership readiness; re-verify or use Offline.`
     : `Croopor is using ${status?.username} as the current ${effectiveModeLabel} identity. Online launch credentials are ${status?.online_mode_ready ? 'reported ready by the backend' : 'not ready'}.`;
+  const actionGuidance = msaActive
+    ? status?.login_available
+      ? 'Re-verifying starts a new Microsoft device-code sign-in and replaces the current volatile launch credentials. It is not a persistent refresh.'
+      : 'Logout clears only volatile Microsoft state. Re-verification is unavailable right now.'
+    : 'Microsoft sign-in prepares Online launch mode. It does not switch launch mode by itself.';
+  const readinessGuidance = state === 'ready' && status
+    ? selectedAuthMode === 'online' && !onlineSelectable
+      ? status.login_available
+        ? `${status.login_reason}. Online is selected, but readiness is missing or expired. Re-verify with Microsoft, or switch to Offline.`
+        : `${status.login_reason}. Online is selected, but readiness is missing or expired and sign-in is unavailable. Switch to Offline.`
+      : `${status.login_reason}. Offline launches remain available for singleplayer and offline-mode servers.`
+    : 'Microsoft sign-in status will appear here when the backend is reachable.';
 
   return (
     <Card>
@@ -1196,6 +1235,16 @@ function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Elem
             <Pill tone={statusTone} icon="user">{statusLabel}</Pill>
             {msaActive && <Pill tone="ok" icon="check-circle">Microsoft active</Pill>}
             {minecraftVerified && <Pill tone="ok" icon="shield-check">Minecraft verified</Pill>}
+            {msaActive && (
+              <Pill tone={expiryWindowTone(status?.msa_token_expires_in)} icon="clock">
+                {compactExpiryWindow('MS', status?.msa_token_expires_in)}
+              </Pill>
+            )}
+            {minecraftCredentialsActive && (
+              <Pill tone={expiryWindowTone(status?.minecraft_token_expires_in)} icon="clock">
+                {compactExpiryWindow('MC', status?.minecraft_token_expires_in)}
+              </Pill>
+            )}
           </div>
         )}
       />
@@ -1218,6 +1267,12 @@ function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Elem
               <ProfileMetaValue label="Skin" value={status.skin_source || 'default'} />
               <ProfileMetaValue label="Login" value={status.login_available ? 'Available' : 'Unavailable'} />
               <ProfileMetaValue label="Microsoft" value={msaActive ? 'Active' : 'Inactive'} />
+              {msaActive && (
+                <ProfileMetaValue label="MS window" value={expiryWindowValue(status.msa_token_expires_in)} />
+              )}
+              {minecraftCredentialsActive && (
+                <ProfileMetaValue label="MC window" value={expiryWindowValue(status.minecraft_token_expires_in)} />
+              )}
             </div>
             <MinecraftProfileReadiness status={status} />
             <div style={{
@@ -1227,15 +1282,28 @@ function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Elem
               flexWrap: 'wrap',
             }}>
               {msaActive ? (
-                <Button
-                  variant="secondary"
-                  icon="x"
-                  onClick={() => void logout()}
-                  disabled={logoutBusy}
-                  sound="affirm"
-                >
-                  {logoutBusy ? 'Signing out' : 'Log out'}
-                </Button>
+                <>
+                  {status.login_available && (
+                    <Button
+                      variant="secondary"
+                      icon="globe"
+                      onClick={() => void startLogin()}
+                      disabled={loginBusy}
+                      sound="affirm"
+                    >
+                      {loginBusy ? 'Getting code' : 'Re-verify'}
+                    </Button>
+                  )}
+                  <Button
+                    variant="secondary"
+                    icon="x"
+                    onClick={() => void logout()}
+                    disabled={logoutBusy}
+                    sound="affirm"
+                  >
+                    {logoutBusy ? 'Signing out' : 'Log out'}
+                  </Button>
+                </>
               ) : status.login_available ? (
                 <Button
                   variant="secondary"
@@ -1261,9 +1329,7 @@ function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Elem
                 fontSize: 12,
                 lineHeight: 1.4,
               }}>
-                {msaActive
-                  ? 'Logout clears only volatile Microsoft state. Offline identity and launches remain available.'
-                  : 'Microsoft sign-in prepares Online launch mode. It does not switch launch mode by itself.'}
+                {actionGuidance}
               </span>
             </div>
             {login && <DeviceCodePanel login={login} pollHint={pollHint} />}
@@ -1319,9 +1385,7 @@ function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Elem
         }}>
           <Icon name="shield-check" size={16} color={theme.n.textMute} style={{ marginTop: 1 }} />
           <div>
-            {state === 'ready' && status
-              ? `${status.login_reason}. Offline launches remain available for singleplayer and offline-mode servers.`
-              : 'Microsoft sign-in status will appear here when the backend is reachable.'}
+            {readinessGuidance}
           </div>
         </div>
       </div>
