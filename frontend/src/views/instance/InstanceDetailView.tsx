@@ -355,7 +355,7 @@ function performanceSummary(
 }
 
 function performanceSummaryIcon(tone: 'ok' | 'warn' | 'err' | 'mute'): string {
-  if (tone === 'ok') return 'check-circle';
+  if (tone === 'ok') return 'check';
   if (tone === 'warn' || tone === 'err') return 'alert';
   return 'info';
 }
@@ -1016,7 +1016,7 @@ function PerformanceCard({ inst, onOpenSettings }: { inst: EnrichedInstance; onO
 
       <div class="cp-od-perf-summary" data-tone={summary.tone} aria-live="polite">
         <span class="cp-od-perf-summary-mark">
-          <Icon name={summaryIcon} size={summaryIcon === 'check-circle' ? 13 : 12} stroke={2.4} />
+          <Icon name={summaryIcon} size={12} stroke={2.4} />
         </span>
         <div class="cp-od-perf-summary-copy">
           <strong>{summary.title}</strong>
