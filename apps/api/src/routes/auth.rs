@@ -378,7 +378,7 @@ async fn auth_status_for_store(
     let token_expires_in = login_store.active_msa_auth_remaining_seconds().await;
     let refresh_available = login_store.active_msa_refresh_token().await.is_some();
     let minecraft_state = login_store
-        .active_minecraft_account_state()
+        .active_current_minecraft_account_state()
         .await
         .map(AuthStatusMinecraftState::from)
         .unwrap_or_else(|| AuthStatusMinecraftState {
@@ -746,12 +746,7 @@ async fn active_auth_refresh_success_from_store(
     login_store: &Arc<AuthLoginStore>,
 ) -> Option<AuthRefreshSuccess> {
     let msa_state = login_store.active_msa_token_state().await?;
-    let minecraft_state = login_store.active_minecraft_account_state().await?;
-    if minecraft_state.account.login_id != msa_state.token.login_id
-        || minecraft_state.account.authenticated_at < msa_state.token.authenticated_at
-    {
-        return None;
-    }
+    let minecraft_state = login_store.active_current_minecraft_account_state().await?;
     if !minecraft_account_can_launch_online(&minecraft_state.account) {
         return None;
     }
@@ -2153,6 +2148,30 @@ mod tests {
             .expect("existing minecraft account");
         assert_eq!(minecraft.profile.name, "OldProfileName");
         assert_eq!(minecraft.access_token, "old-minecraft-access-token");
+
+        let status = auth_status_for_store(
+            &AppConfig {
+                username: "ConfigUser".to_string(),
+                launch_auth_mode: "online".to_string(),
+                ..AppConfig::default()
+            },
+            AuthLoginConfig::from_env_value(Some("public-client-id")),
+            &store,
+        )
+        .await
+        .expect("auth status");
+        assert_eq!(status.mode, "offline");
+        assert_eq!(status.username, "ConfigUser");
+        assert_eq!(status.uuid, offline_uuid("ConfigUser"));
+        assert_eq!(status.provider, "offline");
+        assert!(!status.verified);
+        assert!(!status.online_mode_ready);
+        assert_eq!(status.skin_source, "default");
+        assert!(status.msa_authenticated);
+        assert!(!status.minecraft_profile_ready);
+        assert!(!status.minecraft_ownership_verified);
+        assert_eq!(status.minecraft_profile, None);
+        assert_eq!(status.minecraft_token_expires_in, None);
     }
 
     #[tokio::test]

@@ -50,7 +50,7 @@ async fn handle_skin_profile(
         if let Some(profile) = online_skin_profile(
             state
                 .auth_logins()
-                .active_minecraft_account_state()
+                .active_current_minecraft_account_state()
                 .await
                 .map(|state| state.account),
         ) {
@@ -367,6 +367,77 @@ mod tests {
             Some("https://textures.minecraft.net/texture/activeTexture123")
         );
         assert_eq!(response.head_url, None);
+    }
+
+    #[tokio::test]
+    async fn skin_profile_ignores_preserved_stale_minecraft_profile() {
+        let fixture = TestFixture::new("online-profile-stale", "ConfigUser");
+        fixture
+            .add_minecraft_account(test_profile(
+                "OldMinecraftName",
+                vec![minecraft_skin(
+                    "active",
+                    "ACTIVE",
+                    "https://textures.minecraft.net/texture/oldTexture123",
+                    "slim",
+                )],
+            ))
+            .await;
+        fixture
+            .state
+            .auth_logins()
+            .refresh_with_msa_token(
+                NewAuthLoginMsaToken {
+                    access_token: "new-msa-access-token".to_string(),
+                    refresh_token: Some("new-msa-refresh-token".to_string()),
+                    id_token: None,
+                    token_type: "Bearer".to_string(),
+                    expires_in: 3600,
+                    scope: Some("XboxLive.signin offline_access".to_string()),
+                },
+                "old-msa-refresh-token",
+            )
+            .await
+            .expect("msa-only refresh");
+
+        let response = fixture
+            .profile(None, None)
+            .await
+            .expect("profile response")
+            .0;
+
+        assert_eq!(response.auth_mode, "offline");
+        assert_eq!(response.username, "ConfigUser");
+        assert_eq!(response.uuid, offline_uuid("ConfigUser"));
+        assert_eq!(response.source, "default");
+        assert_eq!(
+            response.variant,
+            offline_variant(&offline_uuid("ConfigUser"))
+        );
+        assert_eq!(response.texture_url, None);
+        assert_eq!(
+            response.head_url,
+            Some("/api/v1/skin/head?username=ConfigUser".to_string())
+        );
+        assert_eq!(
+            fixture
+                .state
+                .auth_logins()
+                .active_minecraft_account()
+                .await
+                .expect("preserved raw minecraft account")
+                .profile
+                .name,
+            "OldMinecraftName"
+        );
+        assert_eq!(
+            fixture
+                .state
+                .auth_logins()
+                .active_current_minecraft_account_state()
+                .await,
+            None
+        );
     }
 
     #[tokio::test]

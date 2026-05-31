@@ -568,6 +568,20 @@ impl AuthLoginStore {
         })
     }
 
+    pub async fn active_current_minecraft_account_state(
+        &self,
+    ) -> Option<ActiveMinecraftAccountState> {
+        let msa_state = self.active_msa_token_state().await?;
+        let minecraft_state = self.active_minecraft_account_state().await?;
+        if minecraft_state.account.login_id != msa_state.token.login_id
+            || minecraft_state.account.authenticated_at < msa_state.token.authenticated_at
+        {
+            return None;
+        }
+
+        Some(minecraft_state)
+    }
+
     pub async fn clear_all(&self) -> (usize, bool) {
         let cleared_pending_logins = {
             let mut sessions = self.sessions.write().await;
@@ -1472,6 +1486,69 @@ mod tests {
         );
         assert_eq!(restored.active_minecraft_account().await, None);
         assert_eq!(persistence.saves(), 2);
+    }
+
+    #[tokio::test]
+    async fn current_minecraft_account_ignores_account_older_than_active_msa_token() {
+        let store = AuthLoginStore::new();
+        let session = store
+            .insert(NewAuthLoginSession {
+                device_code: "raw-device-code".to_string(),
+                user_code: "ABCD-EFGH".to_string(),
+                verification_uri: "https://www.microsoft.com/link".to_string(),
+                expires_in: 900,
+                interval: 5,
+                message: None,
+            })
+            .await;
+        store
+            .complete_with_msa_and_minecraft_account(
+                &session.login_id,
+                NewAuthLoginMsaToken {
+                    access_token: "old-msa-access-token".to_string(),
+                    refresh_token: Some("old-msa-refresh-token".to_string()),
+                    id_token: None,
+                    token_type: "Bearer".to_string(),
+                    expires_in: 3600,
+                    scope: Some("XboxLive.signin offline_access".to_string()),
+                },
+                NewAuthLoginMinecraftAccount {
+                    access_token: "old-minecraft-access-token".to_string(),
+                    token_type: Some("Bearer".to_string()),
+                    expires_in: 3600,
+                    profile: test_profile("PreservedPlayer"),
+                    owns_minecraft_java: true,
+                },
+            )
+            .await
+            .expect("complete login");
+
+        store
+            .refresh_with_msa_token(
+                NewAuthLoginMsaToken {
+                    access_token: "new-msa-access-token".to_string(),
+                    refresh_token: Some("new-msa-refresh-token".to_string()),
+                    id_token: None,
+                    token_type: "Bearer".to_string(),
+                    expires_in: 3600,
+                    scope: Some("XboxLive.signin offline_access".to_string()),
+                },
+                "old-msa-refresh-token",
+            )
+            .await
+            .expect("refresh msa token");
+
+        assert_eq!(
+            store
+                .active_minecraft_account_state()
+                .await
+                .expect("raw minecraft account")
+                .account
+                .profile
+                .name,
+            "PreservedPlayer"
+        );
+        assert_eq!(store.active_current_minecraft_account_state().await, None);
     }
 
     #[tokio::test]

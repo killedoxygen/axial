@@ -381,7 +381,7 @@ async fn launch_auth_context_for_config_with_refresh(
 
     if let Some(auth) = state
         .auth_logins()
-        .active_minecraft_account_state()
+        .active_current_minecraft_account_state()
         .await
         .and_then(online_launch_auth_context)
     {
@@ -409,7 +409,7 @@ async fn launch_auth_context_for_config_with_refresh(
 
     state
         .auth_logins()
-        .active_minecraft_account_state()
+        .active_current_minecraft_account_state()
         .await
         .and_then(online_launch_auth_context)
         .ok_or_else(|| {
@@ -1130,6 +1130,83 @@ mod tests {
         );
         assert_eq!(
             fixture.state.auth_logins().active_minecraft_account().await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_online_launch_rejects_preserved_stale_minecraft_account() {
+        let fixture = TestFixture::new("prepare-online-auth-stale-minecraft");
+        fixture.set_launch_auth_mode("online");
+        let instance_id = fixture.add_instance("Survival", "1.21.1");
+        fixture.add_active_minecraft_account(true).await;
+        fixture
+            .state
+            .auth_logins()
+            .refresh_with_msa_token(
+                NewAuthLoginMsaToken {
+                    access_token: "new-msa-access-token".to_string(),
+                    refresh_token: Some("new-msa-refresh-token".to_string()),
+                    id_token: None,
+                    token_type: "Bearer".to_string(),
+                    expires_in: 3600,
+                    scope: Some("XboxLive.signin offline_access".to_string()),
+                },
+                "old-msa-refresh-token",
+            )
+            .await
+            .expect("msa-only refresh");
+        let (token_endpoint, _token_requests) = token_test_server(
+            StatusCode::OK,
+            serde_json::json!({
+                "access_token": "latest-msa-access-token",
+                "refresh_token": "latest-msa-refresh-token",
+                "token_type": "Bearer",
+                "expires_in": 3600
+            }),
+        )
+        .await;
+        let (auth_chain_client, _auth_chain_requests) =
+            auth_chain_route_test_client(AuthChainRouteServerMode::XstsUnavailable).await;
+
+        let error = match fixture
+            .prepare_with_auth_refresh(instance_id.clone(), &token_endpoint, &auth_chain_client)
+            .await
+        {
+            Ok(prepared) => panic!(
+                "stale minecraft account should not launch with token {}",
+                prepared.task.intent.auth.access_token
+            ),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.0, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(error.1.0["failure_class"], "auth_mode_incompatible");
+        assert_eq!(error.1.0["launch_auth_mode"], "online");
+        assert_eq!(error.1.0["online_mode_ready"], false);
+        assert_eq!(error.1.0["auth_refresh_status"], "refresh_failed");
+        assert_eq!(error.1.0["auth_refresh_reason"], "auth_chain_failed");
+        assert_launch_error_is_token_safe(&error.1.0);
+        assert!(
+            !fixture
+                .state
+                .sessions()
+                .has_active_instance(&instance_id)
+                .await
+        );
+        let raw_minecraft = fixture
+            .state
+            .auth_logins()
+            .active_minecraft_account()
+            .await
+            .expect("preserved raw minecraft account");
+        assert_eq!(raw_minecraft.access_token, "minecraft-access-token");
+        assert_eq!(
+            fixture
+                .state
+                .auth_logins()
+                .active_current_minecraft_account_state()
+                .await,
             None
         );
     }
