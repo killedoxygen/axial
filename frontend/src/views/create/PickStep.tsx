@@ -14,6 +14,14 @@ import {
 import { LoaderLogo } from './loader-logos';
 import { CHANNEL_LABEL, type VersionRowModel } from './view-model';
 
+const SOURCE_RAIL_TAGS: Record<LoaderKey, string> = {
+  vanilla: 'No mods',
+  fabric: 'Modern mods',
+  forge: 'Large mods',
+  neoforge: 'Modern Forge',
+  quilt: 'Curated mods',
+};
+
 export function PickStep({
   source,
   onSourcePick,
@@ -67,6 +75,7 @@ export function PickStep({
   const subtitle = source === 'vanilla'
     ? 'Pure Minecraft. Pick a version to begin.'
     : `${LOADER_LABELS[source]}. Pick the Minecraft version it should target.`;
+  const selectedSourceText = `${LOADER_LABELS[source]} selected. ${LOADER_TAGLINES[source]}.`;
 
   return (
     <section class="cp-cr-step cp-cr-step--pick">
@@ -96,10 +105,38 @@ export function PickStep({
             <span class="cp-cr-rail-glyph">
               {renderSourceGlyph(key)}
             </span>
-            <span class="cp-cr-rail-label">{LOADER_LABELS[key]}</span>
+            <span class="cp-cr-rail-copy">
+              <span class="cp-cr-rail-label">{LOADER_LABELS[key]}</span>
+              <span class="cp-cr-rail-tag">{SOURCE_RAIL_TAGS[key]}</span>
+            </span>
+            {source === key && (
+              <span class="cp-cr-rail-check" aria-hidden="true">
+                <Icon name="check" size={13} stroke={2.2} />
+              </span>
+            )}
           </button>
         ))}
+        <button
+          type="button"
+          class="cp-cr-rail-item cp-cr-rail-item--future"
+          data-label="Modpack"
+          data-tag="Import support planned"
+          role="radio"
+          aria-checked={false}
+          aria-disabled="true"
+          aria-label="Modpack import: import support is planned."
+          disabled
+        >
+          <span class="cp-cr-rail-glyph">
+            <Icon name="archive" size={15} stroke={1.8} />
+          </span>
+          <span class="cp-cr-rail-copy">
+            <span class="cp-cr-rail-label">Modpack</span>
+            <span class="cp-cr-rail-tag">Import planned</span>
+          </span>
+        </button>
       </aside>
+      <p class="cp-cr-source-status" aria-live="polite">{selectedSourceText}</p>
 
       <div class="cp-cr-vpane">
         <div class="cp-cr-vbar">

@@ -31,10 +31,10 @@ type IdleCapableWindow = Window & {
 };
 
 const COMPACT_JVM_HINTS: Record<JvmPreset, string> = {
-  '': 'Managed JVM.',
+  '': 'Safe flags.',
   smooth: 'Steady frames.',
-  performance: 'Throughput.',
-  ultra_low_latency: 'Fewer hitches.',
+  performance: 'More throughput.',
+  ultra_low_latency: 'Fewer pauses.',
   graalvm: 'Graal flags.',
   legacy: 'Old Java.',
   legacy_pvp: 'Input bias.',
