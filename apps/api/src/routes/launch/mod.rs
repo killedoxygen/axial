@@ -67,6 +67,10 @@ pub fn router() -> Router<AppState> {
             get(handle_benchmark_suite_manifest),
         )
         .route(
+            "/api/v1/launch/benchmark/qualification/family-c-1-12-2/preview",
+            get(handle_family_c_qualification_preview),
+        )
+        .route(
             "/api/v1/launch/benchmark/qualification/family-c-1-12-2/{suite_id}",
             get(handle_family_c_qualification),
         )
@@ -618,6 +622,11 @@ async fn handle_family_c_qualification(
         .map(Json)
 }
 
+async fn handle_family_c_qualification_preview()
+-> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    family_c_qualification_preview_payload().map(Json)
+}
+
 async fn handle_launch_reports(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
@@ -1028,6 +1037,27 @@ struct FamilyCQualificationTarget {
     comparison_required: bool,
 }
 
+fn family_c_qualification_targets() -> [FamilyCQualificationTarget; 2] {
+    [
+        FamilyCQualificationTarget {
+            role: "baseline",
+            target_id: FAMILY_C_BASELINE_TARGET_ID,
+            profile: "vanilla_baseline",
+            run_type: "coldish",
+            performance_mode: "vanilla",
+            comparison_required: false,
+        },
+        FamilyCQualificationTarget {
+            role: "managed",
+            target_id: FAMILY_C_MANAGED_TARGET_ID,
+            profile: "managed_default",
+            run_type: "coldish",
+            performance_mode: "managed",
+            comparison_required: true,
+        },
+    ]
+}
+
 async fn family_c_qualification_payload(
     state: &AppState,
     suite_id: &str,
@@ -1046,29 +1076,85 @@ async fn family_c_qualification_payload(
     }
 
     let proofs = family_c_qualification_proofs(state.config().paths(), &manifest)?;
-    let baseline = family_c_qualification_target_payload(
-        FamilyCQualificationTarget {
-            role: "baseline",
-            target_id: FAMILY_C_BASELINE_TARGET_ID,
-            profile: "vanilla_baseline",
-            run_type: "coldish",
-            performance_mode: "vanilla",
-            comparison_required: false,
-        },
+    Ok(family_c_qualification_manifest_payload(
         &manifest,
         &proofs,
+        [Vec::new(), Vec::new()],
+    ))
+}
+
+fn family_c_qualification_preview_payload()
+-> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
+    let manifest = family_c_qualification_preview_manifest()?;
+    let mut payload = family_c_qualification_manifest_payload(
+        &manifest,
+        &[],
+        [
+            vec!["suite_manifest_missing"],
+            vec!["suite_manifest_missing", "managed_comparison_missing"],
+        ],
+    );
+    payload["suite"] = json!({
+        "present": false,
+        "mode": FAMILY_C_QUALIFICATION_MODE,
+        "run_count": manifest.runs.len(),
+    });
+
+    Ok(payload)
+}
+
+fn family_c_qualification_preview_manifest() -> Result<
+    crate::state::benchmark_suites::BenchmarkSuiteManifest,
+    (StatusCode, Json<serde_json::Value>),
+> {
+    let plan = matrix::benchmark_suite_plan(FAMILY_C_QUALIFICATION_MODE)
+        .ok_or_else(unsupported_suite_mode_error)?;
+    let runs = benchmark_suite_manifest_run_inputs(FAMILY_C_QUALIFICATION_MODE, &plan)
+        .into_iter()
+        .map(
+            |run| crate::state::benchmark_suites::BenchmarkSuiteManifestRun {
+                run_index: run.run_index,
+                profile: run.profile,
+                run_type: run.run_type,
+                target_id: run.target_id.unwrap_or_default(),
+                benchmark_id: run.benchmark_id,
+                session_id: None,
+                launched_at: None,
+                state: "pending".to_string(),
+            },
+        )
+        .collect();
+
+    Ok(crate::state::benchmark_suites::BenchmarkSuiteManifest {
+        schema: "croopor.launch.benchmark.suite".to_string(),
+        schema_version: 2,
+        suite_id: "family-c-1-12-2-preview".to_string(),
+        instance_id: "preview".to_string(),
+        mode: FAMILY_C_QUALIFICATION_MODE.to_string(),
+        created_at: "preview".to_string(),
+        updated_at: "preview".to_string(),
+        runs,
+    })
+}
+
+fn family_c_qualification_manifest_payload(
+    manifest: &crate::state::benchmark_suites::BenchmarkSuiteManifest,
+    proofs: &[crate::state::launch_reports::LaunchProofRecord],
+    extra_missing: [Vec<&'static str>; 2],
+) -> serde_json::Value {
+    let [baseline_target, managed_target] = family_c_qualification_targets();
+    let [baseline_extra_missing, managed_extra_missing] = extra_missing;
+    let baseline = family_c_qualification_target_payload(
+        baseline_target,
+        manifest,
+        proofs,
+        &baseline_extra_missing,
     );
     let managed = family_c_qualification_target_payload(
-        FamilyCQualificationTarget {
-            role: "managed",
-            target_id: FAMILY_C_MANAGED_TARGET_ID,
-            profile: "managed_default",
-            run_type: "coldish",
-            performance_mode: "managed",
-            comparison_required: true,
-        },
-        &manifest,
-        &proofs,
+        managed_target,
+        manifest,
+        proofs,
+        &managed_extra_missing,
     );
     let status = if family_c_qualification_target_ready(&baseline)
         && family_c_qualification_target_ready(&managed)
@@ -1078,7 +1164,7 @@ async fn family_c_qualification_payload(
         "incomplete"
     };
 
-    Ok(json!({
+    json!({
         "schema": FAMILY_C_QUALIFICATION_SCHEMA,
         "schema_version": FAMILY_C_QUALIFICATION_SCHEMA_VERSION,
         "status": status,
@@ -1094,7 +1180,7 @@ async fn family_c_qualification_payload(
             "mode": FAMILY_C_QUALIFICATION_MODE,
         },
         "targets": [baseline, managed],
-    }))
+    })
 }
 
 fn family_c_qualification_proofs(
@@ -1130,8 +1216,10 @@ fn family_c_qualification_target_payload(
     target: FamilyCQualificationTarget,
     manifest: &crate::state::benchmark_suites::BenchmarkSuiteManifest,
     proofs: &[crate::state::launch_reports::LaunchProofRecord],
+    extra_missing: &[&'static str],
 ) -> serde_json::Value {
     let mut missing = Vec::new();
+    missing.extend(extra_missing.iter().copied());
     let run = manifest
         .runs
         .iter()
@@ -1642,12 +1730,17 @@ fn status_hash(value: &str) -> u64 {
 mod tests {
     use super::*;
     use crate::state::{AppStateInit, InstallStore, SessionStore};
+    use axum::{
+        body::{Body, to_bytes},
+        http::Request,
+    };
     use croopor_config::{AppPaths, ConfigStore, InstanceStore};
     use croopor_launcher::{LaunchSessionRecord, LaunchStageRecord, LaunchState, SessionId};
     use croopor_performance::PerformanceManager;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tower::ServiceExt;
 
     #[test]
     fn benchmark_launch_request_missing_instance_id_returns_json_error() {
@@ -2244,6 +2337,107 @@ mod tests {
         );
 
         cleanup(&fixture.root);
+    }
+
+    #[tokio::test]
+    async fn family_c_qualification_preview_route_is_incomplete_without_suite_id() {
+        let fixture = RouteTestFixture::new("family-c-qualification-preview-route");
+
+        let response = router()
+            .with_state(fixture.state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/launch/benchmark/qualification/family-c-1-12-2/preview")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("route response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("preview json");
+        assert_eq!(payload["status"], serde_json::json!("incomplete"));
+        assert_eq!(payload["suite"]["present"], serde_json::json!(false));
+        assert_eq!(
+            payload["targets"][0]["target_id"],
+            serde_json::json!(FAMILY_C_BASELINE_TARGET_ID)
+        );
+        assert_eq!(
+            payload["targets"][1]["target_id"],
+            serde_json::json!(FAMILY_C_MANAGED_TARGET_ID)
+        );
+        assert_eq!(
+            payload["targets"][0]["missing"],
+            serde_json::json!([
+                "proof_missing",
+                "suite_manifest_missing",
+                "suite_run_session_missing"
+            ])
+        );
+        assert_eq!(
+            payload["targets"][1]["missing"],
+            serde_json::json!([
+                "managed_comparison_missing",
+                "proof_missing",
+                "suite_manifest_missing",
+                "suite_run_session_missing"
+            ])
+        );
+
+        cleanup(&fixture.root);
+    }
+
+    #[test]
+    fn family_c_qualification_preview_payload_is_descriptor_only() {
+        let payload =
+            family_c_qualification_preview_payload().expect("family c qualification preview");
+        let data = serde_json::to_string(&payload).expect("serialize payload");
+        let lower_data = data.to_ascii_lowercase();
+
+        assert_eq!(payload["status"], serde_json::json!("incomplete"));
+        assert_eq!(
+            payload["target"],
+            serde_json::json!({
+                "family": "C",
+                "loader": "Forge",
+                "version": "1.12.2",
+                "mode": "release_validation",
+            })
+        );
+        assert_eq!(
+            payload["targets"][0]["target_id"],
+            serde_json::json!(FAMILY_C_BASELINE_TARGET_ID)
+        );
+        assert_eq!(
+            payload["targets"][1]["target_id"],
+            serde_json::json!(FAMILY_C_MANAGED_TARGET_ID)
+        );
+        assert_eq!(
+            payload["targets"][0]["suite_run"]["benchmark_id"],
+            serde_json::json!(
+                "suite-release_validation-00-family_c_forge_1_12_2_vanilla_baseline-coldish"
+            )
+        );
+        assert_eq!(
+            payload["targets"][1]["suite_run"]["benchmark_id"],
+            serde_json::json!(
+                "suite-release_validation-01-family_c_forge_1_12_2_family_c_forge_core-coldish"
+            )
+        );
+
+        assert!(data.len() < 4096);
+        assert!(!data.contains('/'));
+        assert!(!data.contains('\\'));
+        assert!(!lower_data.contains("java_path"));
+        assert!(!lower_data.contains("command"));
+        assert!(!lower_data.contains("java-args"));
+        assert!(!lower_data.contains("account"));
+        assert!(!lower_data.contains("token"));
+        assert!(!lower_data.contains("runtime"));
     }
 
     #[tokio::test]
