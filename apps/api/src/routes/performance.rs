@@ -19,6 +19,11 @@ use serde::{Deserialize, Serialize};
 
 const PERFORMANCE_MANAGED_ARTIFACT_SUMMARY_LIMIT: usize = 50;
 const INVALID_PERSISTED_OPERATION_ERROR: &str = "invalid persisted performance operation payload";
+const PERFORMANCE_DATA_INTERNAL_ERROR: &str =
+    "Could not load performance data. Check app data permissions and try again.";
+const PERFORMANCE_INSTALL_INTERNAL_ERROR: &str =
+    "Could not update managed performance files. Check instance folder permissions and try again.";
+const PERFORMANCE_STATE_PARSE_WARNING: &str = "failed to parse performance state";
 
 #[derive(Debug, Deserialize)]
 struct PlanQuery {
@@ -261,38 +266,20 @@ async fn handle_health(
     let mods_dir = state.instances().game_dir(&instance.id).join("mods");
     let state_file = match load_state(&mods_dir) {
         Ok(state_file) => state_file,
-        Err(StateError::Parse(error)) => {
-            return Ok(Json(PerformanceHealthResponse {
-                active: true,
-                health: BundleHealth::Invalid,
-                composition_id: String::new(),
-                tier: String::new(),
-                installed_count: 0,
-                managed_artifacts: Vec::new(),
-                warnings: vec![format!("failed to parse performance state: {error}")],
-            }));
+        Err(StateError::Parse(_)) => {
+            return Ok(Json(invalid_health_response(
+                PERFORMANCE_STATE_PARSE_WARNING,
+            )));
         }
         Err(StateError::InvalidOwnership { .. }) => {
-            return Ok(Json(PerformanceHealthResponse {
-                active: true,
-                health: BundleHealth::Invalid,
-                composition_id: String::new(),
-                tier: String::new(),
-                installed_count: 0,
-                managed_artifacts: Vec::new(),
-                warnings: vec!["invalid performance artifact ownership metadata".to_string()],
-            }));
+            return Ok(Json(invalid_health_response(
+                "invalid performance artifact ownership metadata",
+            )));
         }
         Err(StateError::InvalidIntegrity { .. }) => {
-            return Ok(Json(PerformanceHealthResponse {
-                active: true,
-                health: BundleHealth::Invalid,
-                composition_id: String::new(),
-                tier: String::new(),
-                installed_count: 0,
-                managed_artifacts: Vec::new(),
-                warnings: vec!["invalid performance artifact integrity metadata".to_string()],
-            }));
+            return Ok(Json(invalid_health_response(
+                "invalid performance artifact integrity metadata",
+            )));
         }
         Err(error) => return Err(internal_error(error)),
     };
@@ -807,6 +794,18 @@ fn disabled_health_response() -> PerformanceHealthResponse {
     }
 }
 
+fn invalid_health_response(warning: impl Into<String>) -> PerformanceHealthResponse {
+    PerformanceHealthResponse {
+        active: true,
+        health: BundleHealth::Invalid,
+        composition_id: String::new(),
+        tier: String::new(),
+        installed_count: 0,
+        managed_artifacts: Vec::new(),
+        warnings: vec![warning.into()],
+    }
+}
+
 fn removed_install_response() -> PerformanceInstallResponse {
     PerformanceInstallResponse {
         active: false,
@@ -995,10 +994,17 @@ fn response_warnings(plan: &CompositionPlan, health_warnings: Vec<String>) -> Ve
     warnings
 }
 
-fn internal_error(error: impl std::fmt::Display) -> (StatusCode, Json<serde_json::Value>) {
+fn internal_error(_error: impl std::fmt::Display) -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(serde_json::json!({ "error": error.to_string() })),
+        Json(serde_json::json!({ "error": PERFORMANCE_DATA_INTERNAL_ERROR })),
+    )
+}
+
+fn internal_install_error(_error: impl std::fmt::Display) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({ "error": PERFORMANCE_INSTALL_INTERNAL_ERROR })),
     )
 }
 
@@ -1024,7 +1030,7 @@ fn performance_install_error(error: InstallError) -> (StatusCode, Json<serde_jso
                 "error": "invalid performance artifact integrity metadata"
             })),
         ),
-        error => internal_error(error),
+        error => internal_install_error(error),
     }
 }
 
@@ -1048,6 +1054,7 @@ mod tests {
         http::Request,
     };
     use croopor_config::{AppPaths, ConfigStore, InstanceStore};
+    use croopor_performance::modrinth::ModrinthError;
     use croopor_performance::{CompositionState, InstalledMod, PerformanceManager};
     use ed25519_dalek::{Signer, SigningKey};
     use std::{
@@ -1229,6 +1236,79 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("signature header is missing"))
         );
+    }
+
+    #[test]
+    fn bounded_performance_data_error_omits_raw_internal_details() {
+        let raw_parser = serde_json::from_str::<serde_json::Value>("{not json")
+            .expect_err("invalid json")
+            .to_string();
+        let raw_error = format!(
+            "failed to read /home/zero/.config/croopor/performance.json and C:\\Users\\Zero\\AppData\\Roaming\\Croopor\\performance.json: {raw_parser}: Permission denied (os error 13)"
+        );
+
+        let error = internal_error(&raw_error);
+        let body = json_error_message(&error);
+
+        assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body, PERFORMANCE_DATA_INTERNAL_ERROR);
+        assert_omits_raw_fragments(
+            &body,
+            &[
+                "/home/zero/.config/croopor/performance.json",
+                "C:\\Users\\Zero\\AppData\\Roaming\\Croopor\\performance.json",
+                raw_parser.as_str(),
+                "Permission denied",
+                "os error 13",
+            ],
+        );
+    }
+
+    #[test]
+    fn bounded_install_errors_omit_raw_provider_artifact_and_os_details() {
+        let cases = [
+            performance_install_error(InstallError::Modrinth(ModrinthError::Http {
+                status: 500,
+                body: "provider failure from https://api.modrinth.com/v2/project/sodium/version"
+                    .to_string(),
+            })),
+            performance_install_error(InstallError::ManagedArtifactTargetExists(
+                "sodium-fabric-mc1.20.4-0.5.8.jar".to_string(),
+            )),
+            performance_install_error(InstallError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Permission denied (os error 13)",
+            ))),
+        ];
+
+        for error in cases {
+            let body = json_error_message(&error);
+
+            assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(body, PERFORMANCE_INSTALL_INTERNAL_ERROR);
+            assert_omits_raw_fragments(
+                &body,
+                &[
+                    "https://api.modrinth.com",
+                    "modrinth",
+                    "sodium-fabric-mc1.20.4-0.5.8.jar",
+                    "Permission denied",
+                    "os error 13",
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn health_parse_warning_omits_raw_parser_text() {
+        let raw_parser = serde_json::from_str::<serde_json::Value>("{not json")
+            .expect_err("invalid json")
+            .to_string();
+        let response = invalid_health_response(PERFORMANCE_STATE_PARSE_WARNING);
+        let warnings = response.warnings.join("\n");
+
+        assert_eq!(warnings, PERFORMANCE_STATE_PARSE_WARNING);
+        assert!(!warnings.contains(&raw_parser));
     }
 
     #[tokio::test]
@@ -2447,6 +2527,25 @@ mod tests {
             if terminal {
                 return events;
             }
+        }
+    }
+
+    fn json_error_message(error: &(StatusCode, Json<serde_json::Value>)) -> String {
+        error
+            .1
+            .0
+            .get("error")
+            .and_then(|value| value.as_str())
+            .expect("json error message")
+            .to_string()
+    }
+
+    fn assert_omits_raw_fragments(body: &str, fragments: &[&str]) {
+        for fragment in fragments {
+            assert!(
+                !body.contains(fragment),
+                "bounded error body should not contain {fragment:?}: {body}"
+            );
         }
     }
 
