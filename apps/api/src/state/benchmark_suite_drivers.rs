@@ -11,7 +11,11 @@ use tracing::warn;
 const MAX_DRIVER_ERROR_CHARS: usize = 160;
 const DRIVER_ID_PREFIX: &str = "benchmark-suite-driver-";
 const INTERRUPTED_BY_RESTART_ERROR: &str = "driver interrupted by restart";
+const AUTOMATIC_RESUME_QUEUED_ERROR: &str = "driver automatic resume queued after restart";
+const AUTOMATIC_RESUME_STARTED_ERROR: &str = "driver automatic resume started after restart";
+const AUTOMATIC_RESUME_LIMIT_ERROR: &str = "driver ignored after restart resume limit";
 const MAX_DRIVER_FILENAME_STEM: usize = 96;
+const MAX_RESUMABLE_DRIVERS: usize = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -63,6 +67,7 @@ struct BenchmarkSuiteDriverInner {
     next_id: u64,
     drivers: HashMap<String, BenchmarkSuiteDriverEntry>,
     active_by_suite: HashMap<String, String>,
+    pending_resume_ids: Vec<String>,
 }
 
 pub struct BenchmarkSuiteDriverStore {
@@ -159,6 +164,49 @@ impl BenchmarkSuiteDriverStore {
             .drivers
             .get(id)
             .map(|entry| entry.status.clone())
+    }
+
+    pub async fn take_restart_interrupted_resumable_drivers(
+        &self,
+    ) -> Vec<BenchmarkSuiteDriverStatus> {
+        let (drivers, transitions) = {
+            let mut inner = self.inner.lock().await;
+            let ids = std::mem::take(&mut inner.pending_resume_ids);
+            let mut drivers = Vec::new();
+            let mut transitions = Vec::new();
+            for id in ids {
+                let Some(entry) = inner.drivers.get_mut(&id) else {
+                    continue;
+                };
+                if !is_restart_interrupted_driver(&entry.status) {
+                    continue;
+                }
+                drivers.push(entry.status.clone());
+                entry.status.error = Some(AUTOMATIC_RESUME_QUEUED_ERROR.to_string());
+                entry.status.updated_at = timestamp_utc();
+                transitions.push(entry.status.clone());
+            }
+            (drivers, transitions)
+        };
+        for status in transitions {
+            self.persist_transition(&status);
+        }
+
+        drivers
+    }
+
+    pub async fn record_restart_resume_started(&self, id: &str) {
+        self.update_restart_resume_consumed_error(id, AUTOMATIC_RESUME_STARTED_ERROR.to_string())
+            .await;
+    }
+
+    pub async fn record_restart_resume_failed(&self, id: &str, error: &str) {
+        let error = sanitize_driver_error(error);
+        self.update_restart_resume_consumed_error(
+            id,
+            format!("driver automatic resume failed: {error}"),
+        )
+        .await;
     }
 
     pub async fn stop(&self, id: &str) -> Option<BenchmarkSuiteDriverStatus> {
@@ -304,6 +352,27 @@ impl BenchmarkSuiteDriverStore {
         self.persist_transition(&status);
     }
 
+    async fn update_restart_resume_consumed_error(&self, id: &str, error: String) {
+        let status = {
+            let mut inner = self.inner.lock().await;
+            let Some(entry) = inner.drivers.get_mut(id) else {
+                return;
+            };
+            if entry.status.state != "interrupted"
+                || !matches!(
+                    entry.status.error.as_deref(),
+                    Some(AUTOMATIC_RESUME_QUEUED_ERROR) | Some(AUTOMATIC_RESUME_STARTED_ERROR)
+                )
+            {
+                return;
+            }
+            entry.status.error = Some(sanitize_driver_error(&error));
+            entry.status.updated_at = timestamp_utc();
+            entry.status.clone()
+        };
+        self.persist_transition(&status);
+    }
+
     fn persist_transition(&self, status: &BenchmarkSuiteDriverStatus) {
         let Some(storage_dir) = &self.storage_dir else {
             return;
@@ -329,6 +398,10 @@ fn apply_summary(
 
 fn is_non_terminal(state: &str) -> bool {
     !matches!(state, "complete" | "failed" | "stopped" | "interrupted")
+}
+
+fn is_restart_interrupted_driver(status: &BenchmarkSuiteDriverStatus) -> bool {
+    status.state == "interrupted" && status.error.as_deref() == Some(INTERRUPTED_BY_RESTART_ERROR)
 }
 
 fn load_persisted_driver_inner(
@@ -375,11 +448,24 @@ fn load_persisted_driver_inner(
         if let Some(error) = status.error.take() {
             status.error = Some(sanitize_driver_error(&error));
         }
+        let mut should_persist = false;
         if is_non_terminal(&status.state) {
             status.state = "interrupted".to_string();
             status.active_session_id = None;
             status.error = Some(INTERRUPTED_BY_RESTART_ERROR.to_string());
             status.updated_at = timestamp_utc();
+            should_persist = true;
+        }
+        if is_restart_interrupted_driver(&status) {
+            if inner.pending_resume_ids.len() < MAX_RESUMABLE_DRIVERS {
+                inner.pending_resume_ids.push(status.id.clone());
+            } else {
+                status.error = Some(AUTOMATIC_RESUME_LIMIT_ERROR.to_string());
+                status.updated_at = timestamp_utc();
+                should_persist = true;
+            }
+        }
+        if should_persist {
             interrupted.push(status.clone());
         }
         let (stop_tx, _stop_rx) = watch::channel(!is_non_terminal(&status.state));
@@ -679,6 +765,17 @@ mod tests {
         let rewritten = load_status_file(&path).expect("rewritten status should load");
         assert_eq!(rewritten.state, "interrupted");
 
+        let pending = reloaded.take_restart_interrupted_resumable_drivers().await;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, started.status.id);
+        assert_eq!(
+            reloaded
+                .take_restart_interrupted_resumable_drivers()
+                .await
+                .len(),
+            0
+        );
+
         let next = reloaded
             .start(
                 "suite-dev".to_string(),
@@ -690,6 +787,67 @@ mod tests {
             .expect("interrupted driver should not conflict");
         assert_eq!(next.status.id, "benchmark-suite-driver-0000000000000002");
 
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn restart_resume_queue_skips_terminal_and_manual_interrupted_drivers() {
+        let root = test_root("resume-skip-terminal");
+        let paths = test_paths(&root);
+        let dir = driver_dir(&paths);
+        fs::create_dir_all(&dir).expect("create driver dir");
+        for (index, state, error) in [
+            (1, "stopped", None),
+            (2, "failed", Some("manual failure")),
+            (3, "complete", None),
+            (4, "interrupted", Some("driver stopped by user")),
+        ] {
+            let status = status_fixture(index, state, error);
+            fs::write(
+                driver_path(&dir, &status.id),
+                serde_json::to_string_pretty(&status).expect("serialize driver"),
+            )
+            .expect("write driver");
+        }
+
+        let store = BenchmarkSuiteDriverStore::load_from_paths(&paths);
+
+        assert!(
+            store
+                .take_restart_interrupted_resumable_drivers()
+                .await
+                .is_empty()
+        );
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn restart_resume_queue_is_capped() {
+        let root = test_root("resume-cap");
+        let paths = test_paths(&root);
+        let dir = driver_dir(&paths);
+        fs::create_dir_all(&dir).expect("create driver dir");
+        let total = MAX_RESUMABLE_DRIVERS + 3;
+        for index in 1..=total {
+            let status = status_fixture(index as u64, "active", None);
+            fs::write(
+                driver_path(&dir, &status.id),
+                serde_json::to_string_pretty(&status).expect("serialize driver"),
+            )
+            .expect("write driver");
+        }
+
+        let store = BenchmarkSuiteDriverStore::load_from_paths(&paths);
+        let pending = store.take_restart_interrupted_resumable_drivers().await;
+        let limited = store
+            .list_recent(total)
+            .await
+            .into_iter()
+            .filter(|status| status.error.as_deref() == Some(AUTOMATIC_RESUME_LIMIT_ERROR))
+            .count();
+
+        assert_eq!(pending.len(), MAX_RESUMABLE_DRIVERS);
+        assert_eq!(limited, total - MAX_RESUMABLE_DRIVERS);
         cleanup(&root);
     }
 
@@ -820,6 +978,25 @@ mod tests {
             music_dir: config_dir.join("music"),
             library_dir: config_dir.join("library"),
             config_dir,
+        }
+    }
+
+    fn status_fixture(index: u64, state: &str, error: Option<&str>) -> BenchmarkSuiteDriverStatus {
+        BenchmarkSuiteDriverStatus {
+            id: format!("benchmark-suite-driver-{index:016x}"),
+            suite_id: format!("suite-{index}"),
+            mode: "development".to_string(),
+            state: state.to_string(),
+            interval_ms: 30_000,
+            run_count: 2,
+            launched_run_count: 0,
+            pending_run_index: Some(0),
+            active_session_id: Some(format!("session-{index}")),
+            last_run_index: None,
+            last_session_id: None,
+            error: error.map(str::to_string),
+            created_at: "2026-01-01T00:00:00.000Z".to_string(),
+            updated_at: "2026-01-01T00:01:00.000Z".to_string(),
         }
     }
 

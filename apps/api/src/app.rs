@@ -128,6 +128,10 @@ pub fn spawn_performance_operations_resume(state: &AppState) -> bool {
     crate::routes::spawn_pending_performance_operations(state)
 }
 
+pub fn spawn_benchmark_suite_drivers_resume(state: &AppState) -> bool {
+    crate::routes::spawn_restart_interrupted_benchmark_suite_drivers(state)
+}
+
 #[derive(Debug)]
 pub struct ServerHandle {
     pub addr: SocketAddr,

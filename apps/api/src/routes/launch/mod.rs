@@ -170,6 +170,66 @@ enum BenchmarkSuiteDriverDecision {
     Launch(BenchmarkSuiteLaunchInput),
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct BenchmarkSuiteDriverResumeSummary {
+    pub pending: usize,
+    pub resumed: usize,
+    pub failed: usize,
+}
+
+pub(crate) fn spawn_restart_interrupted_benchmark_suite_drivers(state: &AppState) -> bool {
+    let state = state.clone();
+    tokio::spawn(async move {
+        let summary = resume_restart_interrupted_benchmark_suite_drivers(state).await;
+        if summary.pending > 0 {
+            tracing::info!(
+                pending = summary.pending,
+                resumed = summary.resumed,
+                failed = summary.failed,
+                "benchmark suite drivers resumed after restart"
+            );
+        }
+    });
+    true
+}
+
+pub(crate) async fn resume_restart_interrupted_benchmark_suite_drivers(
+    state: AppState,
+) -> BenchmarkSuiteDriverResumeSummary {
+    let pending = state
+        .benchmark_suite_drivers()
+        .take_restart_interrupted_resumable_drivers()
+        .await;
+    let mut summary = BenchmarkSuiteDriverResumeSummary {
+        pending: pending.len(),
+        ..BenchmarkSuiteDriverResumeSummary::default()
+    };
+
+    for status in pending {
+        match resume_benchmark_suite_driver(state.clone(), status.id.clone()).await {
+            Ok(_) => {
+                summary.resumed += 1;
+                state
+                    .benchmark_suite_drivers()
+                    .record_restart_resume_started(&status.id)
+                    .await;
+            }
+            Err(error) => {
+                summary.failed += 1;
+                state
+                    .benchmark_suite_drivers()
+                    .record_restart_resume_failed(
+                        &status.id,
+                        &benchmark_suite_api_error_message(&error),
+                    )
+                    .await;
+            }
+        }
+    }
+
+    summary
+}
+
 impl BenchmarkLaunchRequest {
     fn into_launch_input(
         self,
@@ -3014,6 +3074,134 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn benchmark_suite_driver_startup_resume_starts_fresh_driver_from_restart_interruption() {
+        let fixture = RouteTestFixture::new("driver-auto-resume-success");
+        let suite_id = "suite-auto-resume-success";
+        fixture.persist_suite_runs(suite_id, &[0]);
+        let interrupted = fixture.active_driver(suite_id, "development", 45_000).await;
+        let reloaded = fixture.reload();
+        reloaded
+            .state
+            .sessions()
+            .insert(test_record("session-0"))
+            .await;
+
+        let summary =
+            resume_restart_interrupted_benchmark_suite_drivers(reloaded.state.clone()).await;
+
+        assert_eq!(
+            summary,
+            BenchmarkSuiteDriverResumeSummary {
+                pending: 1,
+                resumed: 1,
+                failed: 0,
+            }
+        );
+        let original = reloaded
+            .state
+            .benchmark_suite_drivers()
+            .get(&interrupted.id)
+            .await
+            .expect("interrupted driver remains visible");
+        assert_eq!(original.state, "interrupted");
+        assert_eq!(
+            original.error.as_deref(),
+            Some("driver automatic resume started after restart")
+        );
+        let drivers = reloaded
+            .state
+            .benchmark_suite_drivers()
+            .list_recent(5)
+            .await;
+        let fresh = drivers
+            .iter()
+            .find(|driver| driver.id != interrupted.id && driver.suite_id == suite_id)
+            .expect("fresh resumed driver should be visible");
+        assert_eq!(fresh.interval_ms, 45_000);
+        assert!(matches!(
+            fresh.state.as_str(),
+            "scheduled" | "active" | "launched_next"
+        ));
+        reloaded
+            .state
+            .benchmark_suite_drivers()
+            .stop(&fresh.id)
+            .await
+            .expect("stop fresh driver");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        cleanup(&fixture.root);
+    }
+
+    #[tokio::test]
+    async fn benchmark_suite_driver_startup_resume_missing_manifest_fails_boundedly() {
+        let fixture = RouteTestFixture::new("driver-auto-resume-missing-manifest");
+        let interrupted = fixture
+            .active_driver("suite-auto-resume-missing-manifest", "development", 30_000)
+            .await;
+        let reloaded = fixture.reload();
+
+        let summary =
+            resume_restart_interrupted_benchmark_suite_drivers(reloaded.state.clone()).await;
+
+        assert_eq!(
+            summary,
+            BenchmarkSuiteDriverResumeSummary {
+                pending: 1,
+                resumed: 0,
+                failed: 1,
+            }
+        );
+        let original = reloaded
+            .state
+            .benchmark_suite_drivers()
+            .get(&interrupted.id)
+            .await
+            .expect("interrupted driver remains visible");
+        assert_eq!(original.state, "interrupted");
+        assert_eq!(
+            original.error.as_deref(),
+            Some("driver automatic resume failed: benchmark suite not found")
+        );
+
+        cleanup(&fixture.root);
+    }
+
+    #[tokio::test]
+    async fn benchmark_suite_driver_startup_resume_complete_manifest_fails_boundedly() {
+        let fixture = RouteTestFixture::new("driver-auto-resume-complete-manifest");
+        let suite_id = "suite-auto-resume-complete-manifest";
+        fixture.persist_suite_runs(suite_id, &[0, 1]);
+        let interrupted = fixture.active_driver(suite_id, "development", 30_000).await;
+        let reloaded = fixture.reload();
+
+        let summary =
+            resume_restart_interrupted_benchmark_suite_drivers(reloaded.state.clone()).await;
+
+        assert_eq!(
+            summary,
+            BenchmarkSuiteDriverResumeSummary {
+                pending: 1,
+                resumed: 0,
+                failed: 1,
+            }
+        );
+        let original = reloaded
+            .state
+            .benchmark_suite_drivers()
+            .get(&interrupted.id)
+            .await
+            .expect("interrupted driver remains visible");
+        assert_eq!(original.state, "interrupted");
+        assert_eq!(
+            original.error.as_deref(),
+            Some("driver automatic resume failed: benchmark suite is complete")
+        );
+
+        cleanup(&fixture.root);
+    }
+
+    #[tokio::test]
     async fn benchmark_suite_driver_error_status_payload_is_bounded_and_sanitized() {
         let store = crate::state::benchmark_suite_drivers::BenchmarkSuiteDriverStore::new();
         let summary = crate::state::benchmark_suite_drivers::BenchmarkSuiteDriverSuiteSummary {
@@ -3396,6 +3584,14 @@ mod tests {
         fn new(name: &str) -> Self {
             let root = test_root(name);
             let paths = test_paths(&root);
+            Self::from_root_paths(root, paths)
+        }
+
+        fn reload(&self) -> Self {
+            Self::from_root_paths(self.root.clone(), self.paths.clone())
+        }
+
+        fn from_root_paths(root: PathBuf, paths: AppPaths) -> Self {
             let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
             let instances =
                 Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
@@ -3411,6 +3607,43 @@ mod tests {
             });
 
             Self { state, paths, root }
+        }
+
+        async fn active_driver(
+            &self,
+            suite_id: &str,
+            mode: &str,
+            interval_ms: u64,
+        ) -> crate::state::benchmark_suite_drivers::BenchmarkSuiteDriverStatus {
+            let summary = crate::state::benchmark_suite_drivers::BenchmarkSuiteDriverSuiteSummary {
+                run_count: 2,
+                launched_run_count: 1,
+                pending_run_index: Some(1),
+            };
+            let started = self
+                .state
+                .benchmark_suite_drivers()
+                .start(
+                    suite_id.to_string(),
+                    mode.to_string(),
+                    interval_ms,
+                    summary.clone(),
+                )
+                .await
+                .expect("driver starts");
+            self.state
+                .benchmark_suite_drivers()
+                .record_active(
+                    &started.status.id,
+                    summary,
+                    Some("session-before-restart".to_string()),
+                )
+                .await;
+            self.state
+                .benchmark_suite_drivers()
+                .get(&started.status.id)
+                .await
+                .expect("active driver status")
         }
 
         async fn stopped_driver(
