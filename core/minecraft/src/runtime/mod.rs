@@ -11,8 +11,12 @@ use std::process::Command;
 use std::sync::{Arc, OnceLock};
 use thiserror::Error;
 use tokio::sync::Mutex;
+use tokio::task::JoinSet;
 
 const RUNTIME_MANIFEST_URL: &str = "https://launchermeta.mojang.com/v1/products/java-runtime/2ec0cc96c44e5a76b9c8b7c39df7210883d12871/all.json";
+const MIN_RUNTIME_FILE_DOWNLOAD_CONCURRENCY: usize = 2;
+const MAX_RUNTIME_FILE_DOWNLOAD_CONCURRENCY: usize = 8;
+const RUNTIME_FILE_DOWNLOADS_PER_CORE: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JavaRuntimeInfo {
@@ -573,9 +577,7 @@ async fn install_managed_runtime(
 
         let component_manifest = fetch_runtime_json::<ComponentManifest>(&manifest_url).await?;
 
-        for (relative_path, file) in component_manifest.files {
-            install_runtime_manifest_file(&temp_dir, &relative_path, file).await?;
-        }
+        install_runtime_manifest_files(&temp_dir, component_manifest.files).await?;
 
         let java_exe = java_executable(&temp_dir);
         if !runtime_executable_ready(&java_exe) {
@@ -605,6 +607,91 @@ async fn install_managed_runtime(
     }
 
     Ok(())
+}
+
+async fn install_runtime_manifest_files(
+    temp_dir: &Path,
+    files: HashMap<String, ComponentManifestFile>,
+) -> Result<(), JavaRuntimeLookupError> {
+    let plan = plan_runtime_manifest_files(files);
+
+    for (relative_path, file) in plan.directory_entries.into_iter().chain(plan.other_entries) {
+        install_runtime_manifest_file(temp_dir, &relative_path, file).await?;
+    }
+
+    let mut entries = plan.file_entries.into_iter();
+    let mut tasks = JoinSet::new();
+    for _ in 0..runtime_file_download_concurrency() {
+        let Some(entry) = entries.next() else {
+            break;
+        };
+        spawn_runtime_manifest_file_install(&mut tasks, temp_dir, entry);
+    }
+
+    let mut first_error = None;
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(JavaRuntimeLookupError::Download(error.to_string()));
+                }
+            }
+        }
+
+        if first_error.is_none()
+            && let Some(entry) = entries.next()
+        {
+            spawn_runtime_manifest_file_install(&mut tasks, temp_dir, entry);
+        }
+    }
+
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+
+    Ok(())
+}
+
+fn spawn_runtime_manifest_file_install(
+    tasks: &mut JoinSet<Result<(), JavaRuntimeLookupError>>,
+    temp_dir: &Path,
+    entry: (String, ComponentManifestFile),
+) {
+    let temp_dir = temp_dir.to_path_buf();
+    let (relative_path, file) = entry;
+    tasks
+        .spawn(async move { install_runtime_manifest_file(&temp_dir, &relative_path, file).await });
+}
+
+#[derive(Debug, Default)]
+struct RuntimeManifestInstallPlan {
+    directory_entries: Vec<(String, ComponentManifestFile)>,
+    file_entries: Vec<(String, ComponentManifestFile)>,
+    other_entries: Vec<(String, ComponentManifestFile)>,
+}
+
+fn plan_runtime_manifest_files(
+    files: HashMap<String, ComponentManifestFile>,
+) -> RuntimeManifestInstallPlan {
+    let mut entries = files.into_iter().collect::<Vec<_>>();
+    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+    let mut plan = RuntimeManifestInstallPlan::default();
+    for (relative_path, file) in entries {
+        match file.kind.as_str() {
+            "directory" => plan.directory_entries.push((relative_path, file)),
+            "file" => plan.file_entries.push((relative_path, file)),
+            _ => plan.other_entries.push((relative_path, file)),
+        }
+    }
+
+    plan
 }
 
 async fn install_runtime_manifest_file(
@@ -650,6 +737,23 @@ async fn install_runtime_manifest_file(
     }
 
     Ok(())
+}
+
+fn runtime_file_download_concurrency() -> usize {
+    runtime_file_download_concurrency_for(available_runtime_parallelism())
+}
+
+fn available_runtime_parallelism() -> usize {
+    std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(MIN_RUNTIME_FILE_DOWNLOAD_CONCURRENCY)
+}
+
+fn runtime_file_download_concurrency_for(cores: usize) -> usize {
+    cores.saturating_mul(RUNTIME_FILE_DOWNLOADS_PER_CORE).clamp(
+        MIN_RUNTIME_FILE_DOWNLOAD_CONCURRENCY,
+        MAX_RUNTIME_FILE_DOWNLOAD_CONCURRENCY,
+    )
 }
 
 fn component_manifest_destination(
@@ -1108,10 +1212,12 @@ fn runtime_config_candidates(runtime_root: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        JavaRuntimeLookupError, RuntimeDownloadActual, RuntimeDownloadEvidence,
-        RuntimeDownloadIntegrityError, component_manifest_destination, detect_distribution,
+        ComponentManifestFile, JavaRuntimeLookupError, RuntimeDownloadActual,
+        RuntimeDownloadEvidence, RuntimeDownloadIntegrityError, component_manifest_destination,
+        detect_distribution, plan_runtime_manifest_files, runtime_file_download_concurrency_for,
         verify_runtime_download,
     };
+    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
 
     fn expected(size: Option<u64>, sha1: Option<&str>) -> RuntimeDownloadEvidence {
@@ -1126,6 +1232,21 @@ mod tests {
             size,
             sha1: sha1.to_string(),
         }
+    }
+
+    fn manifest_file(kind: &str) -> ComponentManifestFile {
+        ComponentManifestFile {
+            kind: kind.to_string(),
+            executable: false,
+            downloads: None,
+        }
+    }
+
+    fn planned_paths(entries: &[(String, ComponentManifestFile)]) -> Vec<&str> {
+        entries
+            .iter()
+            .map(|(relative_path, _)| relative_path.as_str())
+            .collect()
     }
 
     fn unsafe_manifest_path_message(result: Result<PathBuf, JavaRuntimeLookupError>) -> String {
@@ -1272,6 +1393,38 @@ mod tests {
         assert!(message.contains("unsafe runtime manifest path"));
         assert!(message.contains(r"C:\Windows\System32"));
         assert!(!message.contains("runtime-temp"));
+    }
+
+    #[test]
+    fn runtime_file_download_concurrency_is_adaptive_and_bounded() {
+        assert_eq!(runtime_file_download_concurrency_for(0), 2);
+        assert_eq!(runtime_file_download_concurrency_for(1), 2);
+        assert_eq!(runtime_file_download_concurrency_for(2), 4);
+        assert_eq!(runtime_file_download_concurrency_for(3), 6);
+        assert_eq!(runtime_file_download_concurrency_for(4), 8);
+        assert_eq!(runtime_file_download_concurrency_for(64), 8);
+    }
+
+    #[test]
+    fn runtime_manifest_install_plan_sorts_directories_before_files() {
+        let mut files = HashMap::new();
+        files.insert("lib/server/libjvm.so".to_string(), manifest_file("file"));
+        files.insert("bin/java".to_string(), manifest_file("file"));
+        files.insert("lib/server".to_string(), manifest_file("directory"));
+        files.insert("bin".to_string(), manifest_file("directory"));
+        files.insert("ignored-entry".to_string(), manifest_file("link"));
+
+        let plan = plan_runtime_manifest_files(files);
+
+        assert_eq!(
+            planned_paths(&plan.directory_entries),
+            vec!["bin", "lib/server"]
+        );
+        assert_eq!(
+            planned_paths(&plan.file_entries),
+            vec!["bin/java", "lib/server/libjvm.so"]
+        );
+        assert_eq!(planned_paths(&plan.other_entries), vec!["ignored-entry"]);
     }
 
     #[test]
