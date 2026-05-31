@@ -13,6 +13,12 @@ import { navigate } from '../../ui-state';
 import { addInstance, clearLaunchNotice, removeInstance, selectInstance, updateInstanceInList } from '../../actions';
 import { launchGame, killGame } from '../../launch';
 import { api, apiUrl } from '../../api';
+import {
+  hasNativeDesktopRuntime,
+  nativeInstallEventName,
+  onNativeEvent,
+  startNativeInstallEvents,
+} from '../../native';
 import { toast } from '../../toast';
 import { errMessage, fmtMem, getMemoryRecommendation } from '../../utils';
 import type {
@@ -364,6 +370,10 @@ interface PerformanceInstallProgress {
   file?: string;
   error?: string;
   done?: boolean;
+}
+
+interface LifecycleProgressSource {
+  close(): void;
 }
 
 function performanceProgressTitle(progress: PerformanceInstallProgress): string {
@@ -776,7 +786,7 @@ function PerformanceCard({ inst, onOpenSettings }: { inst: EnrichedInstance; onO
   const savedRef = useRef(initialMem);
   const saveRequestRef = useRef(0);
   const saveTimerRef = useRef<number | null>(null);
-  const lifecycleSourceRef = useRef<EventSource | null>(null);
+  const lifecycleSourceRef = useRef<LifecycleProgressSource | null>(null);
 
   const fetchPerformanceProgram = useCallback(async (): Promise<{
     plan: PerformancePlanResponse | null;
@@ -885,28 +895,21 @@ function PerformanceCard({ inst, onOpenSettings }: { inst: EnrichedInstance; onO
 
   const waitForPerformanceInstall = (installId: string): Promise<void> => {
     return new Promise((resolve, reject) => {
-      const es = new EventSource(apiUrl(`/install/${encodeURIComponent(installId)}/events`));
       let settled = false;
       lifecycleSourceRef.current?.close();
-      lifecycleSourceRef.current = es;
+      lifecycleSourceRef.current = null;
+      let source: LifecycleProgressSource | null = null;
 
       const finish = (error?: Error): void => {
         if (settled) return;
         settled = true;
-        es.close();
-        if (lifecycleSourceRef.current === es) lifecycleSourceRef.current = null;
+        source?.close();
+        if (lifecycleSourceRef.current === source) lifecycleSourceRef.current = null;
         if (error) reject(error);
         else resolve();
       };
 
-      es.addEventListener('progress', (event: MessageEvent) => {
-        let progress: PerformanceInstallProgress;
-        try {
-          progress = JSON.parse(event.data) as PerformanceInstallProgress;
-        } catch {
-          finish(new Error('Performance update stream sent invalid progress data'));
-          return;
-        }
+      const onProgress = (progress: PerformanceInstallProgress): void => {
         setLifecycleProgress({
           title: performanceProgressTitle(progress),
           detail: performanceProgressDetail(progress),
@@ -915,6 +918,35 @@ function PerformanceCard({ inst, onOpenSettings }: { inst: EnrichedInstance; onO
           finish(new Error(progress.error || 'Performance update failed'));
         } else if (progress.done) {
           finish();
+        }
+      };
+
+      if (hasNativeDesktopRuntime()) {
+        void (async () => {
+          try {
+            const subscription = await onNativeEvent(nativeInstallEventName(installId), (data) => {
+              onProgress(data as PerformanceInstallProgress);
+            });
+            if (!subscription) throw new Error('native install stream unavailable');
+            source = subscription;
+            lifecycleSourceRef.current = subscription;
+            await startNativeInstallEvents(installId);
+          } catch (err) {
+            finish(err instanceof Error ? err : new Error(errMessage(err)));
+          }
+        })();
+        return;
+      }
+
+      const es = new EventSource(apiUrl(`/install/${encodeURIComponent(installId)}/events`));
+      source = es;
+      lifecycleSourceRef.current = es;
+
+      es.addEventListener('progress', (event: MessageEvent) => {
+        try {
+          onProgress(JSON.parse(event.data) as PerformanceInstallProgress);
+        } catch {
+          finish(new Error('Performance update stream sent invalid progress data'));
         }
       });
 
