@@ -48,17 +48,21 @@ async function init(): Promise<void> {
     Music.setTrackCount(musicStatusRes?.count);
 
     // Library setup overlay opens when the backend says a library is missing
-    if (statusRes?.setup_required) {
+    const setupRequired = statusRes?.setup_required === true;
+    if (setupRequired) {
       showSetupOverlay.value = true;
+      versions.value = [];
+      instances.value = [];
+      lastInstanceId.value = null;
+    } else {
+      const [versionsRes, instancesRes] = await Promise.all([
+        api('GET', '/versions'),
+        api('GET', '/instances'),
+      ]);
+      versions.value = versionsRes.versions || [];
+      instances.value = instancesRes.instances || [];
+      lastInstanceId.value = instancesRes.last_instance_id || null;
     }
-
-    const [versionsRes, instancesRes] = await Promise.all([
-      api('GET', '/versions'),
-      api('GET', '/instances'),
-    ]);
-    versions.value = versionsRes.versions || [];
-    instances.value = instancesRes.instances || [];
-    lastInstanceId.value = instancesRes.last_instance_id || null;
 
     // Apply backend-persisted theme if our local default won
     if (configRes.theme && local.theme === 'obsidian' && configRes.theme !== 'obsidian') {
@@ -78,9 +82,9 @@ async function init(): Promise<void> {
       toast(startupWarning, 'info');
     }
 
-    if (configRes && configRes.onboarding_done === false) {
+    if (!setupRequired && configRes && configRes.onboarding_done === false) {
       showOnboardingOverlay.value = true;
-    } else if (Music.enabled) {
+    } else if (!setupRequired && Music.enabled) {
       const startMusic = (): void => { void Music.play(); };
       window.addEventListener('pointerdown', startMusic, { once: true, capture: true });
       window.addEventListener('keydown', startMusic, { once: true, capture: true });
