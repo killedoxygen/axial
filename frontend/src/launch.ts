@@ -627,11 +627,16 @@ async function connectLaunchEvents(sessionId: string, instanceId: string, instan
     pollSubscription = makeLaunchStatusPoller(sessionId, instanceId, (data) => {
       onStatus(data, streamHandle);
     });
+    let started = false;
     try {
-      await startNativeLaunchEvents(sessionId);
+      started = await startNativeLaunchEvents(sessionId);
     } catch (err: unknown) {
       streamHandle.close();
       throw err;
+    }
+    if (!started) {
+      streamHandle.close();
+      throw new Error('native launch stream unavailable');
     }
     return;
   }

@@ -96,13 +96,20 @@ async function connectNativeInstallEventSource(
   if (!controller.setSource(subscription)) return;
   if (!isActiveInstallSource(versionId, controller)) return;
 
+  let started = false;
   try {
-    await startEvents();
+    started = await startEvents();
   } catch (err: unknown) {
     if (!isActiveInstallSource(versionId, controller)) return;
     controller.close();
     if (installEventSource.value === controller) setInstallEventSource(null);
     throw err;
+  }
+
+  if (!started) {
+    controller.close();
+    if (installEventSource.value === controller) setInstallEventSource(null);
+    throw new Error(unavailableMessage);
   }
 }
 
