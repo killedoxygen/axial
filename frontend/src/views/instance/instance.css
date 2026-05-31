@@ -1335,16 +1335,6 @@
     width: min(360px, 100%);
     flex-direction: row;
   }
-  .cp-settings-pane {
-    gap: 12px;
-  }
-  .cp-settings-row {
-    gap: 16px;
-    padding: 16px 0;
-  }
-  .cp-settings-row-control {
-    gap: 10px;
-  }
 }
 
 @media (max-width: 860px) {
@@ -1996,7 +1986,29 @@
   letter-spacing: 0.4px;
   text-transform: uppercase;
 }
-@media (max-width: 1080px) {
+@media (max-width: 1180px) {
+  .cp-settings-pane {
+    gap: 12px;
+  }
+  .cp-settings-row {
+    grid-template-columns: minmax(174px, 218px) minmax(0, 1fr);
+    gap: 14px;
+    padding: 14px 0;
+  }
+  .cp-settings-row-head {
+    gap: 10px;
+  }
+  .cp-settings-row-control {
+    gap: 10px;
+  }
+  .cp-settings-memory-grid {
+    gap: 14px;
+  }
+  .cp-settings-runtime-presets {
+    grid-template-columns: repeat(auto-fit, minmax(144px, 1fr));
+  }
+}
+@media (max-width: 860px) {
   .cp-settings-row {
     grid-template-columns: 1fr;
     gap: 14px;
