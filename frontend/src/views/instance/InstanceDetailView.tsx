@@ -1706,7 +1706,7 @@ function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
       updateInstanceInList(res);
       toast('Saved instance settings');
     } catch (err) {
-      toast(`Failed: ${errMessage(err)}`, 'error');
+      toast(`Could not save instance settings: ${errMessage(err)}`, 'error');
     } finally {
       setSaving(false);
     }

@@ -36,7 +36,7 @@ export async function savePlayerName(
     toast(successMessage);
     return true;
   } catch (err) {
-    toast(`Failed: ${errMessage(err)}`, 'error');
+    toast(`Could not save player name: ${errMessage(err)}`, 'error');
     return false;
   }
 }

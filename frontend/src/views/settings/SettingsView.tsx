@@ -201,7 +201,7 @@ function GameplaySection(): JSX.Element {
       toast('Saved');
     } catch (err) {
       if (requestId !== lastSaveRequest.current) return;
-      toast(`Failed: ${errMessage(err)}`);
+      toast(`Could not save settings: ${errMessage(err)}`);
     }
   };
 
@@ -1672,7 +1672,8 @@ function PerformanceSection(): JSX.Element {
       if (requestId !== requestRef.current) return;
       setPerformanceMode(savedPerformance);
       setGuardianMode(savedGuardian);
-      toast(`Failed: ${errMessage(err)}`, 'error');
+      const settingLabel = key === 'performance_mode' ? 'performance settings' : 'Guardian settings';
+      toast(`Could not save ${settingLabel}: ${errMessage(err)}`, 'error');
     } finally {
       if (requestId === requestRef.current) setSaving(null);
     }
