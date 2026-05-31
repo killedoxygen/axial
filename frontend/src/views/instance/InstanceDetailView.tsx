@@ -610,11 +610,13 @@ function LogsCard({
 }
 
 function QuickActionsCard({
+  inst,
   running,
   onLaunch,
   onStop,
   onOpenLogs,
 }: {
+  inst: EnrichedInstance;
   running: boolean;
   onLaunch: () => void;
   onStop: () => void;
@@ -629,12 +631,12 @@ function QuickActionsCard({
         <button
           class="cp-od-quick-action"
           type="button"
-          onClick={() => toast('Manual backups will land in a follow-up release')}
+          onClick={() => void openInstanceFolder(inst.id, 'resourcepacks')}
         >
-          <span class="cp-od-quick-icon"><Icon name="archive" size={15} stroke={1.9} /></span>
+          <span class="cp-od-quick-icon"><Icon name="image" size={15} stroke={1.9} /></span>
           <span class="cp-od-quick-copy">
-            <strong>Backup world</strong>
-            <span>Create a manual backup</span>
+            <strong>Resource packs</strong>
+            <span>Open resource packs</span>
           </span>
         </button>
         <button
@@ -1139,6 +1141,7 @@ function OverviewPane({ inst, resources, running, onLaunch, onStop, onOpenWorlds
       </div>
       <div class="cp-od-stagger cp-od-slot cp-od-slot--quick" style={{ '--cp-od-delay': '160ms' } as any}>
         <QuickActionsCard
+          inst={inst}
           running={running}
           onLaunch={onLaunch}
           onStop={onStop}
@@ -1268,6 +1271,8 @@ function LaunchSplitButton({
           { icon: 'terminal', label: 'View launch logs', onSelect: onOpenLogs },
           { label: '', onSelect: () => {}, divider: true },
           { icon: 'folder', label: 'Open instance folder', onSelect: () => void openInstanceFolder(inst.id) },
+          { icon: 'folder', label: 'Open resource packs folder', onSelect: () => void openInstanceFolder(inst.id, 'resourcepacks') },
+          { icon: 'folder', label: 'Open shader packs folder', onSelect: () => void openInstanceFolder(inst.id, 'shaderpacks') },
         ])}
       >
         <Icon name="chevron-down" size={16} stroke={2.3} />
@@ -2064,6 +2069,8 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
             <IconButton icon="dots" tooltip="More"
               onClick={(e) => openContextMenu(e, [
                 { icon: 'folder', label: 'Open folder', onSelect: () => void openInstanceFolder(inst.id) },
+                { icon: 'folder', label: 'Open resource packs folder', onSelect: () => void openInstanceFolder(inst.id, 'resourcepacks') },
+                { icon: 'folder', label: 'Open shader packs folder', onSelect: () => void openInstanceFolder(inst.id, 'shaderpacks') },
                 { icon: 'copy', label: 'Duplicate', onSelect: () => void duplicateInstance(inst) },
                 { icon: 'edit', label: 'Rename', onSelect: () => void renameInstance(inst) },
                 { label: '', onSelect: () => {}, divider: true },
