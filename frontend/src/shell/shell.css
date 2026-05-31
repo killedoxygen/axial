@@ -487,6 +487,7 @@
   .cp-sidebar-user .cp-player-head,
   .cp-sidebar-user-body,
   .cp-userm,
+  .cp-account-chip,
   .cp-status-pill--running .cp-status-dot,
   .cp-music-eq > span {
     animation: none !important;
@@ -517,11 +518,19 @@
 .cp-topbar-crumb { color: var(--text-dim); font-weight: 500; }
 .cp-topbar-crumb--last { color: var(--text); font-weight: 600; }
 .cp-topbar-spacer { flex: 1; }
+.cp-topbar-actions {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
 
 .cp-status-pill {
+  flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
   gap: 8px;
+  width: 188px;
   height: 28px;
   padding: 0 12px 0 10px;
   border-radius: 999px;
@@ -532,6 +541,7 @@
   font-size: 13px;
   font-weight: 500;
   cursor: default;
+  overflow: hidden;
 }
 .cp-status-pill--running {
   border-color: var(--accent-line);
@@ -540,9 +550,16 @@
   cursor: pointer;
 }
 .cp-status-dot {
+  flex: 0 0 auto;
   width: 7px; height: 7px;
   border-radius: 999px;
   background: var(--text-mute);
+}
+.cp-status-pill-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .cp-status-pill--running .cp-status-dot {
   background: var(--accent);
@@ -550,8 +567,48 @@
   animation: cp-pulse 2s ease-in-out infinite;
 }
 
+.cp-account-chip {
+  flex: 0 0 150px;
+  width: 150px;
+  height: 30px;
+  padding: 2px 9px 2px 3px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  text-align: left;
+  transition: background 140ms, border-color 140ms, color 140ms;
+}
+.cp-account-chip:hover {
+  background: var(--surface-3);
+  border-color: color-mix(in oklab, var(--line) 68%, var(--text-mute));
+  color: var(--text);
+}
+.cp-account-chip:focus-visible {
+  outline: none;
+  border-color: var(--accent-line);
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.cp-account-chip .cp-player-head {
+  flex: 0 0 auto;
+}
+.cp-account-chip-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* Music widget ---------------------------------------------------------- */
 .cp-music-widget {
+  flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
   gap: 2px;
