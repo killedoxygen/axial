@@ -7,6 +7,7 @@ import { PlayerHeadPreview } from '../../ui/PlayerHeadPreview';
 import { useTheme } from '../../hooks/use-theme';
 import { clampPlayerNameInput, savePlayerName } from '../../player-name';
 import { config } from '../../store';
+import type { LaunchAuthMode } from '../../types';
 import { validateUsername } from '../../utils';
 
 interface OfflineSkinProfile {
@@ -47,6 +48,7 @@ interface MinecraftAuthReadiness {
 }
 
 interface AuthStatus {
+  launch_auth_mode: LaunchAuthMode;
   mode: string;
   username: string;
   uuid: string;
@@ -444,6 +446,7 @@ function minecraftReadiness(record: Record<string, unknown>): MinecraftAuthReadi
 function authStatusResponse(value: unknown): AuthStatusRecord | null {
   if (!isRecord(value)) return null;
   if (
+    (value.launch_auth_mode !== 'offline' && value.launch_auth_mode !== 'online') ||
     typeof value.mode !== 'string' ||
     typeof value.username !== 'string' ||
     typeof value.uuid !== 'string' ||
@@ -458,6 +461,7 @@ function authStatusResponse(value: unknown): AuthStatusRecord | null {
   }
 
   return {
+    launch_auth_mode: value.launch_auth_mode,
     mode: value.mode,
     username: value.username,
     uuid: value.uuid,
@@ -520,6 +524,10 @@ function logoutErrorMessage(value: unknown): string {
   return apiErrorMessage(value, 'Could not clear Microsoft sign-in.');
 }
 
+function configErrorMessage(value: unknown): string {
+  return apiErrorMessage(value, 'Could not save launch mode.');
+}
+
 function pollResponse(value: unknown): AuthPollResponse | null {
   if (!isRecord(value)) return null;
   const record = value;
@@ -561,7 +569,7 @@ function pollResponse(value: unknown): AuthPollResponse | null {
 function pollTerminalMessage(response: AuthPollTerminal | null): string {
   if (!response) return 'Microsoft sign-in returned an unexpected response.';
   if (response.status === 'minecraft_auth_chain_failed') {
-    return 'Microsoft sign-in completed, but Croopor could not verify the Minecraft profile or ownership. Offline launches are unchanged.';
+    return 'Microsoft sign-in completed, but Croopor could not verify the Minecraft profile or ownership. Offline launch mode remains available.';
   }
   const fallback = response.status === 'authorization_declined'
     ? 'Microsoft sign-in was declined.'
@@ -586,15 +594,245 @@ function readinessValue(value: boolean | undefined, readyLabel: string, notReady
   return 'Not reported';
 }
 
+function launchAuthMode(value: unknown): LaunchAuthMode {
+  return value === 'online' ? 'online' : 'offline';
+}
+
+function statusCanSelectOnline(status: AuthStatusRecord): boolean {
+  if (status.online_mode_ready) return true;
+  return status.minecraft_profile_ready === true &&
+    status.minecraft_ownership_verified === true &&
+    typeof status.minecraft_token_expires_in === 'number' &&
+    status.minecraft_token_expires_in > 0;
+}
+
+function LaunchAuthModeOption({
+  active,
+  disabled,
+  icon,
+  title,
+  description,
+  onClick,
+}: {
+  active: boolean;
+  disabled?: boolean;
+  icon: string;
+  title: string;
+  description: string;
+  onClick: () => void;
+}): JSX.Element {
+  const theme = useTheme();
+
+  return (
+    <button
+      type="button"
+      onClick={disabled ? undefined : onClick}
+      disabled={disabled}
+      aria-pressed={active}
+      style={{
+        display: 'grid',
+        gridTemplateColumns: 'auto 1fr',
+        gap: 10,
+        alignItems: 'start',
+        minWidth: 0,
+        padding: '12px 13px',
+        border: `1px solid ${active ? 'var(--accent)' : 'var(--line)'}`,
+        borderRadius: theme.r.md,
+        background: active ? theme.n.surface : theme.n.surface2,
+        color: disabled ? theme.n.textMute : theme.n.text,
+        cursor: disabled ? 'not-allowed' : 'pointer',
+        opacity: disabled ? 0.62 : 1,
+        textAlign: 'left',
+      }}
+      title={disabled ? `${title} is unavailable until a verified Minecraft account is ready.` : title}
+    >
+      <Icon name={active ? 'check-circle' : icon} size={16} color={active ? 'var(--accent)' : theme.n.textMute} />
+      <span style={{ display: 'grid', gap: 4, minWidth: 0 }}>
+        <span style={{
+          fontSize: 13,
+          fontWeight: 750,
+          lineHeight: 1.2,
+        }}>{title}</span>
+        <span style={{
+          color: disabled ? theme.n.textMute : theme.n.textDim,
+          fontSize: 12,
+          lineHeight: 1.4,
+        }}>{description}</span>
+      </span>
+    </button>
+  );
+}
+
+function launchAuthModeCopy(
+  mode: LaunchAuthMode,
+  status: AuthStatusRecord,
+  onlineSelectable: boolean,
+): { tone: 'info' | 'ok' | 'warn'; icon: string; text: string } {
+  if (mode === 'offline') {
+    return {
+      tone: onlineSelectable ? 'info' : 'ok',
+      icon: 'shield-check',
+      text: onlineSelectable
+        ? 'Offline is selected. It is the reliable default; Online is available while the verified account credentials remain valid.'
+        : 'Offline is selected. It stays available for singleplayer and offline-mode servers even when Microsoft sign-in is unavailable.',
+    };
+  }
+
+  if (status.online_mode_ready) {
+    return {
+      tone: 'ok',
+      icon: 'check-circle',
+      text: 'Online is selected and the backend reports launch credentials ready. They are volatile: Croopor does not persist or refresh them yet.',
+    };
+  }
+
+  return {
+    tone: 'warn',
+    icon: 'alert',
+    text: 'Online is selected, but launch credentials are not ready. Sign in and verify Minecraft ownership again, or switch to Offline for the reliable path.',
+  };
+}
+
+function AuthModeControl({
+  status,
+  onSaved,
+}: {
+  status: AuthStatusRecord;
+  onSaved: () => void;
+}): JSX.Element {
+  const theme = useTheme();
+  const savedMode = launchAuthMode(config.value?.launch_auth_mode ?? status.launch_auth_mode);
+  const onlineSelectable = statusCanSelectOnline(status);
+  const [savingMode, setSavingMode] = useState<LaunchAuthMode | null>(null);
+  const [message, setMessage] = useState<{ tone: 'ok' | 'err'; text: string } | null>(null);
+  const modeCopy = launchAuthModeCopy(savedMode, status, onlineSelectable);
+
+  const saveMode = async (nextMode: LaunchAuthMode): Promise<void> => {
+    if (nextMode === savedMode || savingMode) return;
+    if (nextMode === 'online' && !onlineSelectable) {
+      setMessage({
+        tone: 'err',
+        text: 'Online cannot be selected until a non-expired, Java-owning Minecraft account is verified.',
+      });
+      return;
+    }
+
+    setSavingMode(nextMode);
+    setMessage(null);
+    try {
+      const response = await api('PUT', '/config', { launch_auth_mode: nextMode });
+      if (isRecord(response) && typeof response.error === 'string') {
+        setMessage({ tone: 'err', text: configErrorMessage(response) });
+        return;
+      }
+      config.value = response;
+      setMessage({
+        tone: 'ok',
+        text: nextMode === 'online'
+          ? 'Online launch mode saved. Credentials are volatile and are not persisted or refreshed yet.'
+          : 'Offline launch mode saved. Offline remains the reliable default.',
+      });
+      onSaved();
+    } catch {
+      setMessage({ tone: 'err', text: 'Could not reach the local backend to save launch mode.' });
+    } finally {
+      setSavingMode(null);
+    }
+  };
+
+  return (
+    <div style={{
+      display: 'grid',
+      gap: 10,
+      padding: '12px 14px',
+      border: '1px solid var(--line)',
+      borderRadius: theme.r.md,
+      background: theme.n.surface2,
+    }}>
+      <div style={{
+        display: 'flex',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        gap: 12,
+        flexWrap: 'wrap',
+      }}>
+        <div style={{ display: 'grid', gap: 3 }}>
+          <div style={{
+            fontSize: 11,
+            fontWeight: 700,
+            color: theme.n.textMute,
+            textTransform: 'uppercase',
+            letterSpacing: 0.7,
+          }}>Launch auth mode</div>
+          <div style={{ color: theme.n.textDim, fontSize: 12, lineHeight: 1.4 }}>
+            Choose the identity Croopor should use when launching Minecraft.
+          </div>
+        </div>
+        <Pill tone={modeCopy.tone} icon={modeCopy.icon}>
+          {savedMode === 'online' ? 'Online selected' : 'Offline selected'}
+        </Pill>
+      </div>
+
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: 'repeat(2, minmax(220px, 1fr))',
+        gap: 10,
+      }}>
+        <LaunchAuthModeOption
+          active={savedMode === 'offline'}
+          icon="shield-check"
+          title={savingMode === 'offline' ? 'Saving Offline' : 'Offline'}
+          description="Reliable default. Uses the offline profile and does not need Microsoft credentials."
+          onClick={() => void saveMode('offline')}
+          disabled={savingMode !== null}
+        />
+        <LaunchAuthModeOption
+          active={savedMode === 'online'}
+          icon="globe"
+          title={savingMode === 'online' ? 'Saving Online' : 'Online'}
+          description={onlineSelectable
+            ? 'Uses the verified Minecraft profile while these volatile credentials are valid.'
+            : 'Unavailable until sign-in verifies a Java-owning Minecraft profile.'}
+          onClick={() => void saveMode('online')}
+          disabled={savingMode !== null || (!onlineSelectable && savedMode !== 'online')}
+        />
+      </div>
+
+      <div style={{
+        display: 'flex',
+        alignItems: 'flex-start',
+        gap: 8,
+        color: theme.n.textDim,
+        fontSize: 12,
+        lineHeight: 1.45,
+      }}>
+        <Icon name={modeCopy.icon} size={15} color={modeCopy.tone === 'warn' ? 'var(--warn)' : theme.n.textMute} style={{ marginTop: 1 }} />
+        <span>{modeCopy.text}</span>
+      </div>
+
+      {message && (
+        <div style={{
+          color: message.tone === 'err' ? 'var(--err)' : theme.n.textDim,
+          fontSize: 12,
+          fontWeight: 500,
+          lineHeight: 1.4,
+        }}>
+          {message.text}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function pollSuccessMessage(poll: AuthPollAuthenticatedRecord): string {
   const profileName = poll.minecraft_profile?.name;
   if (poll.minecraft_profile_ready && poll.minecraft_ownership_verified) {
-    return `${profileName || 'Minecraft profile'} was verified. Launch identity remains offline until online launch credentials are wired.`;
+    return `${profileName || 'Minecraft profile'} was verified. Online launch mode can be selected while these volatile credentials remain valid.`;
   }
   if (poll.minecraft_profile_ready) {
-    return `${profileName || 'Minecraft profile'} was found, but ownership was not verified. Offline launches are unchanged.`;
+    return `${profileName || 'Minecraft profile'} was found, but ownership was not verified. Offline launch mode remains available.`;
   }
-  return 'Microsoft sign-in is active, but Minecraft profile verification is not complete. Offline launches are unchanged.';
+  return 'Microsoft sign-in is active, but Minecraft profile verification is not complete. Offline launch mode remains available.';
 }
 
 function MinecraftProfileReadiness({ status }: { status: AuthStatusRecord }): JSX.Element | null {
@@ -653,7 +891,7 @@ function MinecraftProfileReadiness({ status }: { status: AuthStatusRecord }): JS
         fontSize: 12,
         lineHeight: 1.45,
       }}>
-        Profile verification can now be active, but launches still remain offline until online launch credentials are wired.
+        Online launch mode can use this profile only while Online is selected and the volatile credentials remain valid. Croopor does not persist or refresh them yet.
       </div>
       <div style={{
         display: 'grid',
@@ -753,7 +991,7 @@ function DeviceCodePanel({
           lineHeight: 1.45,
         }}>
           {login.message || 'Enter this code at the Microsoft verification page.'}
-          {' '}Profile verification may complete after sign-in, but launches remain offline until online launch credentials are wired.
+          {' '}Profile verification may complete after sign-in. Online launch mode can be selected only while the verified account credentials remain valid.
         </div>
         <div style={{
           display: 'flex',
@@ -926,7 +1164,7 @@ function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Elem
       if (typeof response === 'object' && response !== null && typeof response.error === 'string') {
         setLogoutError(logoutErrorMessage(response));
       } else {
-        setLoginSuccess('Microsoft sign-in was cleared. Offline launches are unchanged.');
+        setLoginSuccess('Microsoft sign-in was cleared. Switch to Offline for the reliable launch path if Online was selected.');
       }
     } catch {
       setLogoutError('Could not reach the local backend to clear Microsoft sign-in.');
@@ -937,16 +1175,16 @@ function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Elem
   };
 
   const msaActive = Boolean(status?.msa_authenticated);
-  const msaProvider = status?.msa_provider || 'Microsoft';
   const minecraftVerified = Boolean(status?.minecraft_profile_ready === true && status?.minecraft_ownership_verified === true);
   const minecraftReadinessReported = status ? hasMinecraftReadiness(status) : false;
+  const effectiveModeLabel = status?.mode === 'online' ? 'online' : 'offline';
   const statusCopy = msaActive
     ? minecraftVerified
-      ? `${msaProvider} sign-in is active and the Minecraft profile is verified. Croopor still launches as ${status?.username}, an offline identity, until online launch credentials are wired.`
+      ? `Microsoft sign-in is active and the Minecraft profile is verified. Croopor launches as ${status?.username} when Online is selected and the volatile credentials remain valid.`
       : minecraftReadinessReported
-        ? `${msaProvider} sign-in is active, but verified Minecraft profile ownership is not ready. Croopor still launches as ${status?.username}, an offline identity, until online launch credentials are wired.`
-        : `${msaProvider} sign-in is active. Croopor still launches as ${status?.username}, an offline identity, until online launch credentials are wired.`
-    : `Croopor is using ${status?.username} as the current ${status?.provider} identity. Online launch credentials are ${status?.online_mode_ready ? 'reported ready by the backend' : 'not ready'}.`;
+        ? `Microsoft sign-in is active, but verified Minecraft profile ownership is not ready. Offline launch remains available.`
+        : `Microsoft sign-in is active. Online launch still needs Minecraft profile and ownership readiness; offline launch remains available.`
+    : `Croopor is using ${status?.username} as the current ${effectiveModeLabel} identity. Online launch credentials are ${status?.online_mode_ready ? 'reported ready by the backend' : 'not ready'}.`;
 
   return (
     <Card>
@@ -967,18 +1205,19 @@ function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Elem
             <div style={{ fontSize: 13, color: theme.n.textDim, lineHeight: 1.5, maxWidth: 780 }}>
               {statusCopy}
             </div>
+            <AuthModeControl status={status} onSaved={refreshStatus} />
             <div style={{
               display: 'grid',
               gridTemplateColumns: 'repeat(auto-fit, minmax(124px, 1fr))',
               gap: 12,
               alignItems: 'start',
             }}>
-              <ProfileMetaValue label="Provider" value={status.provider} />
+              <ProfileMetaValue label="Identity" value={status.mode === 'online' ? 'Online profile' : 'Offline profile'} />
               <ProfileMetaValue label="Verified" value={status.verified ? 'Yes' : 'No'} />
               <ProfileMetaValue label="UUID" value={shortenUuid(status.uuid)} />
               <ProfileMetaValue label="Skin" value={status.skin_source || 'default'} />
               <ProfileMetaValue label="Login" value={status.login_available ? 'Available' : 'Unavailable'} />
-              <ProfileMetaValue label="Microsoft" value={msaActive ? msaProvider : 'Inactive'} />
+              <ProfileMetaValue label="Microsoft" value={msaActive ? 'Active' : 'Inactive'} />
             </div>
             <MinecraftProfileReadiness status={status} />
             <div style={{
@@ -1024,7 +1263,7 @@ function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Elem
               }}>
                 {msaActive
                   ? 'Logout clears only volatile Microsoft state. Offline identity and launches remain available.'
-                  : 'Microsoft sign-in is a setup step. It does not switch this launcher to online mode yet.'}
+                  : 'Microsoft sign-in prepares Online launch mode. It does not switch launch mode by itself.'}
               </span>
             </div>
             {login && <DeviceCodePanel login={login} pollHint={pollHint} />}

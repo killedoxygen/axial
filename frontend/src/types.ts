@@ -82,6 +82,8 @@ export type LoaderComponentId =
 
 export type LoaderType = 'fabric' | 'quilt' | 'forge' | 'neoforge';
 
+export type LaunchAuthMode = 'offline' | 'online';
+
 export type LoaderTerm =
   | 'recommended'
   | 'latest'
@@ -163,6 +165,7 @@ export interface Version {
 
 export interface Config {
   username: string;
+  launch_auth_mode?: LaunchAuthMode;
   max_memory_mb: number;
   min_memory_mb: number;
   java_path_override?: string;
