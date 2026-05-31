@@ -138,6 +138,16 @@
   margin-bottom: 16px;
   transition: margin 140ms cubic-bezier(0.22, 1, 0.36, 1);
 }
+.cp-sidebar-main {
+  flex: 0 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: none;
+}
+.cp-sidebar-main::-webkit-scrollbar {
+  display: none;
+}
 .cp-sidebar-group-title {
   height: 22px;
   padding: 3px 10px 6px;
@@ -224,6 +234,29 @@
   flex-direction: column;
   gap: 3px;
   overflow: hidden;
+}
+.cp-sidebar-children[data-scrollable="true"] {
+  max-height: min(44vh, 360px);
+  padding-right: 2px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in oklab, var(--text-mute) 28%, transparent) transparent;
+}
+.cp-sidebar-children[data-scrollable="true"]::-webkit-scrollbar {
+  width: 5px;
+}
+.cp-sidebar-children[data-scrollable="true"]::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--text-mute) 28%, transparent);
+}
+.cp-sidebar-instance-art {
+  width: 28px;
+  height: 28px;
+  box-shadow: 0 0 0 1px color-mix(in oklab, var(--line) 82%, transparent);
+}
+.cp-sidebar-item[data-active="true"] .cp-sidebar-instance-art {
+  box-shadow: 0 0 0 1px color-mix(in oklab, var(--accent) 70%, transparent);
 }
 
 .cp-sidebar-spacer { flex: 1; }
@@ -430,6 +463,15 @@
 }
 .cp-sidebar[data-compact="true"] .cp-sidebar-group {
   margin-bottom: 12px;
+}
+.cp-sidebar[data-compact="true"] .cp-sidebar-main {
+  max-height: min(52vh, 430px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: none;
+}
+.cp-sidebar[data-compact="true"] .cp-sidebar-main::-webkit-scrollbar {
+  display: none;
 }
 .cp-sidebar[data-compact="true"] .cp-sidebar-items {
   gap: 8px;

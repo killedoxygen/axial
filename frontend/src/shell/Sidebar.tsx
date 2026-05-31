@@ -1,14 +1,16 @@
 import type { JSX } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
+import { InstanceArt } from '../art/InstanceArt';
 import { Icon } from '../ui/Icons';
 import { Kbd } from '../ui/Atoms';
 import { PlayerHeadPreview } from '../ui/PlayerHeadPreview';
 import { route, navigate, commandPaletteOpen, type Route } from '../ui-state';
-import { runningSessions, config } from '../store';
+import { runningSessions, config, instances } from '../store';
 import { promptPlayerName, savePlayerName } from '../player-name';
 import { Music, musicStateVersion } from '../music';
 import { local, localStateVersion, saveLocalState } from '../state';
 import { Sound } from '../sound';
+import type { Instance } from '../types';
 
 function CommandTrigger({ compact }: { compact: boolean }): JSX.Element {
   const isMac = typeof navigator !== 'undefined' && /Mac/i.test(navigator.platform);
@@ -28,10 +30,13 @@ function CommandTrigger({ compact }: { compact: boolean }): JSX.Element {
 }
 
 interface SidebarItem {
+  key?: string;
   icon: string;
   label: string;
   route: Route;
   showConnector?: boolean;
+  instance?: Instance;
+  scrollableChildren?: boolean;
   children?: SidebarItem[];
 }
 
@@ -51,6 +56,28 @@ function isItemActive(item: SidebarItem, current: Route): boolean {
 function isRouteInsideItem(target: Route, current: Route): boolean {
   if (target.name === 'instances' && current.name === 'instance') return true;
   return false;
+}
+
+function recentTime(inst: Instance): number {
+  const lastPlayed = inst.last_played_at ? Date.parse(inst.last_played_at) : 0;
+  const created = Date.parse(inst.created_at);
+  return Math.max(
+    Number.isFinite(lastPlayed) ? lastPlayed : 0,
+    Number.isFinite(created) ? created : 0,
+  );
+}
+
+function sidebarInstanceItems(list: Instance[]): SidebarItem[] {
+  return [...list]
+    .sort((a, b) => recentTime(b) - recentTime(a) || a.name.localeCompare(b.name))
+    .map(inst => ({
+      key: `instance:${inst.id}`,
+      icon: 'cube',
+      label: inst.name,
+      route: { name: 'instance', id: inst.id },
+      showConnector: true,
+      instance: inst,
+    }));
 }
 
 function SidebarItemNode({ item, depth = 0, compact = false }: { item: SidebarItem; depth?: number; compact?: boolean }): JSX.Element {
@@ -84,12 +111,18 @@ function SidebarItemNode({ item, depth = 0, compact = false }: { item: SidebarIt
             />
           </span>
         )}
-        <Icon name={item.icon} size={iconSize} stroke={compact ? 1.9 : 1.7} />
+        {item.instance && compact ? (
+          <InstanceArt instance={item.instance} aspect="thumb" radius={11} className="cp-sidebar-instance-art" />
+        ) : (
+          <Icon name={item.icon} size={iconSize} stroke={compact ? 1.9 : 1.7} />
+        )}
         <span class="cp-sidebar-label">{item.label}</span>
       </button>
       {item.children?.length ? (
-        <div class="cp-sidebar-children">
-          {item.children.map(child => <SidebarItemNode key={child.label} item={child} depth={depth + 1} compact={compact} />)}
+        <div class="cp-sidebar-children" data-scrollable={item.scrollableChildren}>
+          {item.children.map(child => (
+            <SidebarItemNode key={child.key ?? child.label} item={child} depth={depth + 1} compact={compact} />
+          ))}
         </div>
       ) : null}
     </div>
@@ -216,6 +249,7 @@ function UserTrigger({ compact }: { compact: boolean }): JSX.Element {
 export function Sidebar(): JSX.Element {
   localStateVersion.value;
   const compact = local.sidebarCompact;
+  const instanceItems = sidebarInstanceItems(instances.value);
 
   const toggleSidebarMode = (): void => {
     local.sidebarCompact = !local.sidebarCompact;
@@ -231,8 +265,10 @@ export function Sidebar(): JSX.Element {
           icon: 'cube',
           label: 'Instances',
           route: { name: 'instances' },
+          scrollableChildren: true,
           children: [
             { icon: 'plus', label: 'New', route: { name: 'create' }, showConnector: false },
+            ...instanceItems,
           ],
         },
       ],
@@ -272,14 +308,18 @@ export function Sidebar(): JSX.Element {
         </button>
       </div>
       <CommandTrigger compact={compact} />
-      {mainGroups.map(g => (
-        <div class="cp-sidebar-group" key={g.title}>
-          <div class="cp-sidebar-group-title">{g.title}</div>
-          <div class="cp-sidebar-items">
-            {compactItems(g.items).map(it => <SidebarItemNode key={it.label} item={it} compact={compact} />)}
+      <div class="cp-sidebar-main">
+        {mainGroups.map(g => (
+          <div class="cp-sidebar-group" key={g.title}>
+            <div class="cp-sidebar-group-title">{g.title}</div>
+            <div class="cp-sidebar-items">
+              {compactItems(g.items).map(it => (
+                <SidebarItemNode key={it.key ?? it.label} item={it} compact={compact} />
+              ))}
+            </div>
           </div>
-        </div>
-      ))}
+        ))}
+      </div>
       <div class="cp-sidebar-spacer" />
       <div class="cp-sidebar-group">
         <div class="cp-sidebar-group-title">You</div>
