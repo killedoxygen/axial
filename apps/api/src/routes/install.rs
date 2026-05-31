@@ -11,6 +11,9 @@ use serde::Deserialize;
 use std::{convert::Infallible, path::PathBuf, time::SystemTime};
 use tokio::sync::mpsc;
 
+const INSTALL_FAILURE_MESSAGE: &str =
+    "Install failed. Check your connection and app data permissions, then try again.";
+
 #[derive(Debug, Deserialize)]
 struct InstallRequest {
     version_id: String,
@@ -67,7 +70,9 @@ async fn handle_install(
             let install_id = install_id_task.clone();
             tokio::spawn(async move {
                 while let Some(progress) = progress_rx.recv().await {
-                    store.emit(&install_id, progress).await;
+                    store
+                        .emit(&install_id, sanitize_install_progress(progress))
+                        .await;
                 }
             })
         };
@@ -91,6 +96,13 @@ async fn handle_install(
 
 fn is_loader_version_id(version_id: &str) -> bool {
     infer_build_from_version_id(version_id).is_some()
+}
+
+fn sanitize_install_progress(mut progress: DownloadProgress) -> DownloadProgress {
+    if progress.done && progress.error.is_some() {
+        progress.error = Some(INSTALL_FAILURE_MESSAGE.to_string());
+    }
+    progress
 }
 
 async fn handle_install_events(
@@ -157,4 +169,92 @@ fn generate_install_id() -> String {
         .map(|value| value.as_nanos())
         .unwrap_or_default();
     format!("install-{:032x}", nanos)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_install_progress_leaves_non_error_progress_unchanged() {
+        let progress = DownloadProgress {
+            phase: "libraries".to_string(),
+            current: 7,
+            total: 42,
+            file: Some("example-library.jar".to_string()),
+            error: None,
+            done: false,
+        };
+
+        assert_eq!(sanitize_install_progress(progress.clone()), progress);
+    }
+
+    #[test]
+    fn sanitize_install_progress_hides_raw_terminal_error_fragments() {
+        let progress = DownloadProgress {
+            phase: "error".to_string(),
+            current: 0,
+            total: 0,
+            file: None,
+            error: Some(
+                "request failed: GET https://piston-meta.mojang.com/mc/game/version_manifest_v2.json \
+                 parse version json: expected value at line 1 column 1 \
+                 prepare java runtime: failed in /home/zero/.croopor/runtime/java \
+                 and C:\\Users\\zero\\AppData\\Roaming\\Croopor\\runtime\\java"
+                    .to_string(),
+            ),
+            done: true,
+        };
+
+        let sanitized = sanitize_install_progress(progress);
+        let message = sanitized.error.as_deref().expect("error is present");
+
+        assert_eq!(message, INSTALL_FAILURE_MESSAGE);
+        assert_no_raw_fragments(message);
+    }
+
+    #[test]
+    fn sanitize_install_progress_preserves_shape_and_only_changes_error_text() {
+        let progress = DownloadProgress {
+            phase: "error".to_string(),
+            current: 13,
+            total: 21,
+            file: Some("1.20.1.json".to_string()),
+            error: Some(
+                "request failed for https://example.invalid/manifest.json in /tmp/croopor"
+                    .to_string(),
+            ),
+            done: true,
+        };
+
+        let sanitized = sanitize_install_progress(progress.clone());
+
+        assert_eq!(sanitized.phase, progress.phase);
+        assert_eq!(sanitized.current, progress.current);
+        assert_eq!(sanitized.total, progress.total);
+        assert_eq!(sanitized.file, progress.file);
+        assert_eq!(sanitized.done, progress.done);
+        assert_eq!(sanitized.error.as_deref(), Some(INSTALL_FAILURE_MESSAGE));
+    }
+
+    fn assert_no_raw_fragments(message: &str) {
+        for fragment in [
+            "/home/zero",
+            "/tmp/croopor",
+            "C:\\Users\\zero",
+            "AppData\\Roaming",
+            "https://",
+            "piston-meta.mojang.com",
+            "request failed",
+            "parse version json",
+            "expected value",
+            "line 1 column",
+            "prepare java runtime",
+        ] {
+            assert!(
+                !message.contains(fragment),
+                "message exposed raw fragment {fragment:?}: {message}"
+            );
+        }
+    }
 }
