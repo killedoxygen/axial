@@ -307,7 +307,7 @@ export interface InstanceLaunchDraft {
   dirty: boolean;
 }
 
-export type LaunchNoticeTone = 'info' | 'success' | 'error';
+export type LaunchNoticeTone = 'info' | 'success' | 'warned' | 'intervened' | 'error';
 
 export interface LaunchNotice {
   message: string;

@@ -388,11 +388,25 @@
   color: var(--accent);
   background: color-mix(in oklab, var(--accent) 14%, var(--surface-3));
 }
-.cp-launch-notice[data-tone="warned"] .cp-launch-notice-mark,
-.cp-launch-notice[data-tone="intervened"] .cp-launch-notice-mark,
 .cp-launch-notice[data-tone="info"] .cp-launch-notice-mark {
   color: var(--accent);
   background: color-mix(in oklab, var(--accent) 14%, var(--surface-3));
+}
+.cp-launch-notice[data-tone="warned"] {
+  border-color: color-mix(in oklab, var(--warn) 34%, var(--line));
+  background: color-mix(in oklab, var(--surface-2) 88%, oklch(0.80 0.14 70 / 0.12));
+}
+.cp-launch-notice[data-tone="warned"] .cp-launch-notice-mark {
+  color: var(--warn);
+  background: oklch(0.80 0.14 70 / 0.14);
+}
+.cp-launch-notice[data-tone="intervened"] {
+  border-color: color-mix(in oklab, var(--ok) 30%, var(--line));
+  background: color-mix(in oklab, var(--surface-2) 88%, oklch(0.78 0.14 150 / 0.10));
+}
+.cp-launch-notice[data-tone="intervened"] .cp-launch-notice-mark {
+  color: var(--ok);
+  background: oklch(0.78 0.14 150 / 0.12);
 }
 .cp-launch-notice[data-tone="success"] .cp-launch-notice-mark {
   color: var(--ok);

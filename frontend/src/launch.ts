@@ -261,6 +261,9 @@ function guardianToastMessage(guardian: GuardianSummary | undefined): string {
   if (guardian.decision === 'blocked') {
     return 'Guardian blocked an unsafe launch setup.';
   }
+  if (guardian.decision === 'warned') {
+    return 'Guardian found launch settings to review.';
+  }
   if (guardian.decision === 'intervened') {
     return 'Guardian adjusted launch settings for safety.';
   }
@@ -315,6 +318,8 @@ function launchOutcomeTone(
 ): import('./types').LaunchNoticeTone {
   if (guardian?.decision === 'blocked' || healing?.failure_class) return 'error';
   if (healing?.retry_count && healing.retry_count > 0) return 'success';
+  if (guardian?.decision === 'warned') return 'warned';
+  if (guardian?.decision === 'intervened') return 'intervened';
   return 'info';
 }
 

@@ -23,6 +23,7 @@ import type {
   InstanceLogTail,
   InstanceResourceSummary,
   LaunchNotice,
+  LaunchNoticeTone,
   PerformanceHealthResponse,
   PerformanceHealthStatus,
   PerformanceInstallResponse,
@@ -1235,10 +1236,12 @@ function OverviewPane({ inst, resources, running, onLaunch, onStop, onOpenWorlds
   );
 }
 
-function launchNoticeIcon(tone: string): string {
+function launchNoticeIcon(tone: LaunchNoticeTone): string {
   if (tone === 'success') return 'check-circle';
   if (tone === 'error') return 'alert';
-  return 'shield-check';
+  if (tone === 'warned') return 'alert';
+  if (tone === 'intervened') return 'shield-check';
+  return 'info';
 }
 
 function LaunchOutcomeNotice({ inst, notice }: {
