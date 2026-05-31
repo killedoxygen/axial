@@ -19,6 +19,7 @@ use crate::types::{
     ManagedMod, Manifest, OwnershipClass, PerformanceMode, ResolutionRequest, VersionFamily,
 };
 use chrono::Utc;
+use futures_util::{StreamExt, stream};
 use sha2::Digest;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -32,6 +33,7 @@ const REMOTE_RULES_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_RULES_MAX_BYTES: usize = 1024 * 1024;
 const MIN_USEFUL_MANAGED_INSTALLS: usize = 2;
 const MAX_INSTALL_FALLBACK_ATTEMPTS: usize = 4;
+const MANAGED_ARTIFACT_INSTALL_CONCURRENCY: usize = 4;
 const MANAGED_ARTIFACT_INSTALL_FAILURE: &str = "managed artifact install failed";
 
 #[derive(Debug, Error)]
@@ -500,7 +502,7 @@ impl PerformanceManager {
             }
         }
 
-        let temp_path = PathBuf::from(format!("{}.tmp", final_path.display()));
+        let temp_path = managed_artifact_temp_path(&final_path, managed_mod);
         self.modrinth
             .download_file_to_path(&file.url, &expected_sha, &temp_path)
             .await?;
@@ -540,25 +542,38 @@ impl PerformanceManager {
             last_failure: String::new(),
         };
 
-        for managed_mod in &plan.mods {
-            match self
-                .install_mod(
-                    managed_mod,
-                    game_version,
-                    &plan.loader,
-                    instance_mods_dir,
-                    previous_state,
-                )
-                .await
-            {
+        let loader = plan.loader.clone();
+        let game_version = game_version.to_string();
+        let instance_mods_dir = instance_mods_dir.to_path_buf();
+        let previous_state = previous_state.cloned();
+        let mut installs = stream::iter(plan.mods.iter().cloned().map(|managed_mod| {
+            let loader = loader.clone();
+            let game_version = game_version.clone();
+            let instance_mods_dir = instance_mods_dir.clone();
+            let previous_state = previous_state.clone();
+            async move {
+                let project_id = managed_mod.project_id.clone();
+                let result = self
+                    .install_mod(
+                        &managed_mod,
+                        &game_version,
+                        &loader,
+                        &instance_mods_dir,
+                        previous_state.as_ref(),
+                    )
+                    .await;
+                (project_id, result)
+            }
+        }))
+        .buffer_unordered(managed_artifact_install_concurrency(plan.mods.len()));
+
+        while let Some((project_id, result)) = installs.next().await {
+            match result {
                 Ok(installed) => state.installed_mods.push(installed),
                 Err(error) => {
                     state.failure_count += 1;
                     state.last_failure = managed_artifact_failure_evidence();
-                    warn!(
-                        "performance install failed for {}: {}",
-                        managed_mod.project_id, error
-                    );
+                    warn!("performance install failed for {project_id}: {error}");
                 }
             }
         }
@@ -848,6 +863,29 @@ impl PerformanceManager {
     }
 }
 
+fn managed_artifact_install_concurrency(mod_count: usize) -> usize {
+    mod_count.max(1).min(MANAGED_ARTIFACT_INSTALL_CONCURRENCY)
+}
+
+fn managed_artifact_temp_path(final_path: &Path, managed_mod: &ManagedMod) -> PathBuf {
+    let suffix = safe_temp_suffix(&managed_mod.project_id);
+    PathBuf::from(format!("{}.{}.tmp", final_path.display(), suffix))
+}
+
+fn safe_temp_suffix(value: &str) -> String {
+    let suffix: String = value
+        .bytes()
+        .filter(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_'))
+        .take(48)
+        .map(char::from)
+        .collect();
+    if suffix.is_empty() {
+        "managed".to_string()
+    } else {
+        suffix
+    }
+}
+
 #[derive(Debug, Clone)]
 struct RemoteRulesCandidate {
     manifest: crate::types::Manifest,
@@ -1072,6 +1110,35 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const CURRENT_FAMILY_F_REPRESENTATIVE: &str = "1.21.1";
+
+    #[test]
+    fn managed_artifact_install_concurrency_is_bounded() {
+        assert_eq!(managed_artifact_install_concurrency(0), 1);
+        assert_eq!(managed_artifact_install_concurrency(1), 1);
+        assert_eq!(managed_artifact_install_concurrency(3), 3);
+        assert_eq!(managed_artifact_install_concurrency(12), 4);
+    }
+
+    #[test]
+    fn managed_artifact_temp_path_uses_safe_project_suffix() {
+        let managed_mod = ManagedMod {
+            artifact_id: "artifact".to_string(),
+            project_id: "../project id/with/slash".to_string(),
+            slug: "slug".to_string(),
+            name: "Managed Mod".to_string(),
+            condition: ModCondition::Always,
+            version_range: String::new(),
+            hardware_req: None,
+            mutual_exclusions: Vec::new(),
+        };
+
+        let temp_path = managed_artifact_temp_path(Path::new("/tmp/mods/mod.jar"), &managed_mod);
+
+        assert_eq!(
+            temp_path,
+            PathBuf::from("/tmp/mods/mod.jar.projectidwithslash.tmp")
+        );
+    }
 
     #[tokio::test]
     async fn ensure_installed_writes_composition_managed_ownership() {
