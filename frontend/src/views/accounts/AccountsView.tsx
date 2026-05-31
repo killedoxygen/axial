@@ -134,6 +134,7 @@ function PlayerIdentityEditor({
   const previewTextureSrc = username.trim() === savedUsername ? textureSrc : undefined;
   const previewProfileName = profileUsername || username.trim() || 'Player';
   const previewOnline = profileSource === 'minecraft_profile_skin' && Boolean(previewTextureSrc);
+  const playerNameLabel = previewOnline ? 'Offline player name' : 'Player name';
 
   const save = async (): Promise<void> => {
     const next = username.trim();
@@ -165,7 +166,7 @@ function PlayerIdentityEditor({
         <div style={{
           fontSize: 11, fontWeight: 600, color: theme.n.textMute,
           textTransform: 'uppercase', letterSpacing: 0.8, marginBottom: 6,
-        }}>Player name</div>
+        }}>{playerNameLabel}</div>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
           <Input
             value={username}
@@ -190,6 +191,18 @@ function PlayerIdentityEditor({
             </span>
           )}
         </div>
+        {previewOnline && (
+          <div style={{
+            marginTop: 7,
+            color: theme.n.textMute,
+            fontSize: 12,
+            fontWeight: 500,
+            lineHeight: 1.35,
+            overflowWrap: 'anywhere',
+          }}>
+            Showing {previewProfileName} skin from Minecraft profile.
+          </div>
+        )}
       </div>
     </div>
   );
