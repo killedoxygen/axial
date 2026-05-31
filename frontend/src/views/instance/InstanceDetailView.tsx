@@ -22,7 +22,6 @@ import type {
   InstancePerformanceMode,
   InstanceLogTail,
   InstanceResourceSummary,
-  LaunchPreflightResponse,
   LaunchNotice,
   LaunchNoticeTone,
   PerformanceHealthResponse,
@@ -241,10 +240,6 @@ function performanceModeLabel(mode: PerformanceMode): string {
   if (mode === 'managed') return 'Managed';
   if (mode === 'vanilla') return 'Vanilla';
   return 'Custom';
-}
-
-function guardianModeLabel(mode: LaunchPreflightResponse['mode']): string {
-  return mode === 'custom' ? 'Custom' : 'Managed';
 }
 
 function compositionTierLabel(tier: CompositionTier | ''): string {
@@ -901,175 +896,6 @@ function PerformanceCard({ inst }: { inst: EnrichedInstance }): JSX.Element {
   );
 }
 
-// ─── Guardian preflight — right rail, backend-authored launch safety facts.
-
-type GuardianPreflightState =
-  | { status: 'loading' }
-  | { status: 'ready'; data: LaunchPreflightResponse }
-  | { status: 'error'; message: string };
-
-function guardianDecisionTone(decision: LaunchPreflightResponse['guardian']['decision'] | undefined): 'ok' | 'warn' | 'err' | 'mute' {
-  if (decision === 'blocked') return 'err';
-  if (decision === 'warned' || decision === 'intervened') return 'warn';
-  if (decision === 'allowed') return 'ok';
-  return 'mute';
-}
-
-function guardianDecisionIcon(decision: LaunchPreflightResponse['guardian']['decision'] | undefined): string {
-  if (decision === 'blocked') return 'alert';
-  if (decision === 'warned' || decision === 'intervened') return 'alert';
-  if (decision === 'allowed') return 'shield-check';
-  return 'info';
-}
-
-function guardianReadyCopy(preflight: LaunchPreflightResponse): { title: string; detail: string } {
-  const guardian = preflight.guardian;
-  const firstDetail = guardian.details?.[0] || guardian.guidance?.[0];
-  if (guardian.decision === 'blocked' && guardian.message) {
-    return { title: guardian.message, detail: firstDetail || `${guardianModeLabel(preflight.mode)} preflight is ready.` };
-  }
-  const firstBlockingReadiness = preflight.readiness.reasons.find(reason => reason.severity === 'blocking');
-  if (!preflight.readiness.launchable && firstBlockingReadiness) {
-    return {
-      title: 'Launch setup incomplete',
-      detail: firstBlockingReadiness.message,
-    };
-  }
-  if (guardian.message) {
-    return { title: guardian.message, detail: firstDetail || `${guardianModeLabel(preflight.mode)} preflight is ready.` };
-  }
-  if (preflight.mode === 'custom') {
-    return {
-      title: 'Custom mode ready',
-      detail: 'Backend preflight will preserve explicit overrides unless Guardian must block startup.',
-    };
-  }
-  return {
-    title: 'Managed mode ready',
-    detail: 'Backend preflight will let Guardian adjust unsafe Java or JVM choices at launch.',
-  };
-}
-
-function overrideLabel(override: LaunchPreflightResponse['overrides']['java'], emptyLabel: string): string {
-  if (override.origin === 'instance') return 'Instance override';
-  if (override.origin === 'global') return 'Global override';
-  return emptyLabel;
-}
-
-function overrideSubLabel(override: LaunchPreflightResponse['overrides']['java'], presentLabel: string, emptyLabel: string): string {
-  return override.present ? presentLabel : emptyLabel;
-}
-
-function GuardianPreflightCard({ inst, onOpenSettings }: {
-  inst: EnrichedInstance;
-  onOpenSettings: () => void;
-}): JSX.Element {
-  const cfg = config.value;
-  const version = versions.value.find(v => v.id === inst.version_id);
-  const versionReadinessKey = [
-    version?.launchable ? 'launchable' : 'blocked',
-    version?.installed ? 'installed' : 'missing',
-    version?.needs_install || '',
-    version?.status || '',
-    version?.status_detail || '',
-  ].join('|');
-  const [preflight, setPreflight] = useState<GuardianPreflightState>({ status: 'loading' });
-
-  useEffect(() => {
-    let cancelled = false;
-    setPreflight({ status: 'loading' });
-    api('GET', `/launch/preflight/${encodeURIComponent(inst.id)}`)
-      .then((res: LaunchPreflightResponse & { error?: string }) => {
-        if (cancelled) return;
-        if (res?.error) throw new Error(res.error);
-        if (res?.status !== 'ready') throw new Error('preflight unavailable');
-        setPreflight({ status: 'ready', data: res });
-      })
-      .catch((err) => {
-        if (!cancelled) setPreflight({ status: 'error', message: errMessage(err) });
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [
-    inst.id,
-    inst.version_id,
-    inst.max_memory_mb,
-    inst.min_memory_mb,
-    inst.java_path,
-    inst.jvm_preset,
-    inst.extra_jvm_args,
-    cfg?.guardian_mode,
-    cfg?.java_path_override,
-    cfg?.jvm_preset,
-    cfg?.max_memory_mb,
-    cfg?.min_memory_mb,
-    versionReadinessKey,
-  ]);
-
-  const ready = preflight.status === 'ready' ? preflight.data : undefined;
-  const copy = ready
-    ? guardianReadyCopy(ready)
-    : preflight.status === 'error'
-      ? { title: 'Preflight unavailable', detail: preflight.message }
-      : {
-          title: 'Checking Guardian preflight',
-          detail: 'Reading backend launch policy for this instance.',
-        };
-  const tone = ready
-    ? ready.readiness.launchable ? guardianDecisionTone(ready.guardian.decision) : 'err'
-    : preflight.status === 'loading' ? 'mute' : 'warn';
-  const icon = ready
-    ? ready.readiness.launchable ? guardianDecisionIcon(ready.guardian.decision) : 'alert'
-    : preflight.status === 'loading' ? 'info' : 'alert';
-  const java = ready?.overrides.java;
-  const preset = ready?.overrides.preset;
-  const rawJvmArgs = ready?.overrides.raw_jvm_args;
-
-  return (
-    <Card padding={18} class="cp-od-guardian-card">
-      <div class="cp-od-head">
-        <h3>Guardian preflight</h3>
-        <button class="cp-od-link" type="button" onClick={onOpenSettings}>
-          Review <Icon name="chevron-right" size={11} stroke={2.2} />
-        </button>
-      </div>
-      <div class="cp-od-guardian-posture" data-tone={tone}>
-        <span class="cp-od-guardian-posture-mark">
-          <Icon name={icon} size={13} stroke={2.2} />
-        </span>
-        <div>
-          <strong>{copy.title}</strong>
-          <span>{copy.detail}</span>
-        </div>
-      </div>
-      <ul class="cp-od-guardian-list">
-        <li class="cp-od-guardian-row">
-          <span class="cp-od-guardian-key">Java</span>
-          <span class="cp-od-guardian-val">
-            <strong>{java ? overrideLabel(java, 'Managed') : 'Checking'}</strong>
-            <small>{java ? overrideSubLabel(java, 'Override present', 'Croopor selects runtime') : 'Backend preflight'}</small>
-          </span>
-        </li>
-        <li class="cp-od-guardian-row">
-          <span class="cp-od-guardian-key">JVM preset</span>
-          <span class="cp-od-guardian-val">
-            <strong>{preset ? overrideLabel(preset, 'Managed') : 'Checking'}</strong>
-            <small>{preset ? overrideSubLabel(preset, 'Override present', 'Selected by Croopor') : 'Backend preflight'}</small>
-          </span>
-        </li>
-        <li class="cp-od-guardian-row">
-          <span class="cp-od-guardian-key">Raw JVM args</span>
-          <span class="cp-od-guardian-val">
-            <strong>{rawJvmArgs ? overrideLabel(rawJvmArgs, 'None') : 'Checking'}</strong>
-            <small>{rawJvmArgs ? overrideSubLabel(rawJvmArgs, 'Present', 'No raw JVM arguments') : 'Backend preflight'}</small>
-          </span>
-        </li>
-      </ul>
-    </Card>
-  );
-}
-
 // ─── Details — quiet glanceable KV; duplicates header on purpose. ──────
 
 function DetailsCard({ inst, running }: { inst: EnrichedInstance; running: boolean }): JSX.Element {
@@ -1115,7 +941,7 @@ function DetailsCard({ inst, running }: { inst: EnrichedInstance; running: boole
 
 // ─── Overview pane — original bento, Play replaces Summary ──────────────
 
-function OverviewPane({ inst, resources, running, onLaunch, onStop, onOpenWorlds, onOpenLogs, onOpenSettings }: {
+function OverviewPane({ inst, resources, running, onLaunch, onStop, onOpenWorlds, onOpenLogs }: {
   inst: EnrichedInstance;
   resources: InstanceResourceSummary | null;
   running: boolean;
@@ -1123,15 +949,11 @@ function OverviewPane({ inst, resources, running, onLaunch, onStop, onOpenWorlds
   onStop: () => void;
   onOpenWorlds: () => void;
   onOpenLogs: () => void;
-  onOpenSettings: () => void;
 }): JSX.Element {
   return (
     <div class="cp-instance-body cp-instance-body--overview-bento">
       <div class="cp-od-stagger cp-od-slot cp-od-slot--performance" style={{ '--cp-od-delay': '0ms' } as any}>
         <PerformanceCard inst={inst} />
-      </div>
-      <div class="cp-od-stagger cp-od-slot cp-od-slot--guardian" style={{ '--cp-od-delay': '40ms' } as any}>
-        <GuardianPreflightCard inst={inst} onOpenSettings={onOpenSettings} />
       </div>
       <div class="cp-od-stagger cp-od-slot cp-od-slot--worlds cp-od-worlds-slot" style={{ '--cp-od-delay': '80ms' } as any}>
         <WorldsCard inst={inst} resources={resources} onOpenWorlds={onOpenWorlds} />
@@ -2111,7 +1933,6 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
             onStop={onStop}
             onOpenWorlds={() => setTab('worlds')}
             onOpenLogs={() => setTab('logs')}
-            onOpenSettings={() => setTab('settings')}
           />
           <div class="cp-instance-bottom">
             <LogsCard resources={resources.data} onOpenLogs={() => setTab('logs')} />
