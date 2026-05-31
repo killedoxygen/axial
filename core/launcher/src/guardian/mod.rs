@@ -781,6 +781,47 @@ pub fn decide_startup_failure(
     }
 }
 
+pub fn classify_startup_failure_text(text: &str) -> LaunchFailureClass {
+    let lower = text.trim().to_lowercase();
+    if lower.is_empty() {
+        return LaunchFailureClass::Unknown;
+    }
+    if lower.contains("unrecognized vm option") || lower.contains("unsupported vm option") {
+        return LaunchFailureClass::JvmUnsupportedOption;
+    }
+    if lower.contains("must be enabled via -xx:+unlockexperimentalvmoptions") {
+        return LaunchFailureClass::JvmExperimentalUnlock;
+    }
+    if lower.contains("unlock option must precede") || lower.contains("must precede") {
+        return LaunchFailureClass::JvmOptionOrdering;
+    }
+    if lower.contains("unsupportedclassversionerror")
+        || lower.contains("compiled by a more recent version of the java runtime")
+        || lower.contains("requires java")
+    {
+        return LaunchFailureClass::JavaRuntimeMismatch;
+    }
+    if lower.contains("resolutionexception: modules")
+        || lower.contains("export package")
+        || lower.contains("modulelayerhandler.buildlayer")
+    {
+        return LaunchFailureClass::ClasspathModuleConflict;
+    }
+    if lower.contains("bootstraplauncher")
+        || lower.contains("modlauncher")
+        || lower.contains("nosuchelementexception: no value present")
+    {
+        return LaunchFailureClass::LoaderBootstrapFailure;
+    }
+    if lower.contains("microsoft account")
+        || lower.contains("check your microsoft account")
+        || lower.contains("multiplayer is disabled")
+    {
+        return LaunchFailureClass::AuthModeIncompatible;
+    }
+    LaunchFailureClass::Unknown
+}
+
 fn startup_failure_reason(observation: StartupFailureObservation) -> String {
     match observation {
         StartupFailureObservation::Stalled => {
@@ -975,8 +1016,9 @@ mod tests {
         LOW_MEMORY_ALLOCATION_WARNING_THRESHOLD_MB, LaunchCpuLoadWarningFacts,
         LaunchGuardianContext, LaunchResourceWarningFacts, LaunchWarningFacts, OverrideOrigin,
         PreLaunchAction, PreLaunchDecision, RecoveryAction, StartupFailureObservation,
-        conservative_healing_preset, decide_prepare_failure, decide_startup_failure,
-        recovery_plan_for_startup_failure, resolve_launch_preset, summarize_launch_warnings,
+        classify_startup_failure_text, conservative_healing_preset, decide_prepare_failure,
+        decide_startup_failure, recovery_plan_for_startup_failure, resolve_launch_preset,
+        summarize_launch_warnings,
     };
     use crate::types::LaunchFailureClass;
     use croopor_minecraft::JavaRuntimeInfo;
@@ -1324,6 +1366,26 @@ mod tests {
         );
         assert!(!decision.reason.contains("-X"));
         assert!(!decision.reason.contains("-D"));
+    }
+
+    #[test]
+    fn startup_failure_text_classification_is_bounded_to_failure_class() {
+        assert_eq!(
+            classify_startup_failure_text(
+                "Unrecognized VM option '-XX:+UseZGC' in /home/alice/.croopor/instances/secret"
+            ),
+            LaunchFailureClass::JvmUnsupportedOption
+        );
+        assert_eq!(
+            classify_startup_failure_text(
+                "java.lang.UnsupportedClassVersionError: compiled by a more recent version of the Java Runtime"
+            ),
+            LaunchFailureClass::JavaRuntimeMismatch
+        );
+        assert_eq!(
+            classify_startup_failure_text("ordinary launcher output"),
+            LaunchFailureClass::Unknown
+        );
     }
 
     #[test]

@@ -69,11 +69,8 @@ pub(super) fn spawn_wait_task(
                             pid: None,
                             exit_code: status.code(),
                             failure_class: observed_failure
-                                .as_ref()
-                                .map(|failure| failure.class.as_str().to_string()),
-                            failure_detail: observed_failure
-                                .as_ref()
-                                .and_then(|failure| failure.detail.clone()),
+                                .map(|failure_class| failure_class.as_str().to_string()),
+                            failure_detail: None,
                             healing: existing.as_ref().and_then(|record| record.healing.clone()),
                             guardian: existing.as_ref().and_then(|record| record.guardian.clone()),
                             stages: Vec::new(),

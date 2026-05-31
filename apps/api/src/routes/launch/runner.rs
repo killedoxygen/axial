@@ -390,7 +390,6 @@ pub(super) async fn launch_session(
                             .sessions()
                             .observed_failure(&session_id)
                             .await
-                            .map(|failure| failure.class)
                             .unwrap_or(LaunchFailureClass::Unknown),
                     }
                 };

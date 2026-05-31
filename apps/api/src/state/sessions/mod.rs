@@ -4,8 +4,8 @@ mod supervisor;
 
 use croopor_launcher::{
     LaunchEvent, LaunchFailure, LaunchFailureClass, LaunchLogEvent, LaunchPriorityEvidence,
-    LaunchSessionRecord, LaunchStageRecord, LaunchState, LaunchStatusEvent, launch_stage_label,
-    launch_state_name,
+    LaunchSessionRecord, LaunchStageRecord, LaunchState, LaunchStatusEvent,
+    classify_startup_failure_text, launch_stage_label, launch_state_name,
 };
 use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
@@ -24,7 +24,7 @@ struct SessionEntry {
     startup_observed: Arc<AtomicBool>,
     boot_completed: Arc<AtomicBool>,
     log_count: Arc<AtomicUsize>,
-    observed_failure: Option<LaunchFailure>,
+    observed_failure: Option<LaunchFailureClass>,
 }
 
 pub struct SessionStore {
@@ -141,12 +141,9 @@ impl SessionStore {
                 apply_status_update(entry, &mut status);
                 let _ = entry.events.send(LaunchEvent::Status(status));
             }
-            let failure_class = classify::classify_failure_text(&text);
+            let failure_class = classify_startup_failure_text(&text);
             if failure_class != LaunchFailureClass::Unknown {
-                entry.observed_failure = Some(LaunchFailure {
-                    class: failure_class,
-                    detail: Some(text.clone()),
-                });
+                entry.observed_failure = Some(failure_class);
             }
             let _ = entry
                 .events
@@ -303,12 +300,12 @@ impl SessionStore {
         self.sessions.write().await.remove(session_id);
     }
 
-    pub async fn observed_failure(&self, session_id: &str) -> Option<LaunchFailure> {
+    pub async fn observed_failure(&self, session_id: &str) -> Option<LaunchFailureClass> {
         self.sessions
             .read()
             .await
             .get(session_id)
-            .and_then(|entry| entry.observed_failure.clone())
+            .and_then(|entry| entry.observed_failure)
     }
 
     pub async fn terminate_all(&self) {
@@ -1018,6 +1015,55 @@ mod tests {
             .expect("stored record");
         assert_eq!(stored.process_started_at_ms, Some(process_started_at_ms));
         assert_eq!(stored.priority, launched.priority);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn launch_process_exit_preserves_observed_failure_class_without_raw_detail() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "class-only-observed-failure";
+        store.insert(test_record(session_id)).await;
+        let mut receiver = store.subscribe(session_id).await.expect("subscribe");
+
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(
+            "printf '%s\\n' \"Unrecognized VM option '-XX:+UseZGC' /home/alice/.croopor/secret\" >&2; sleep 0.2; exit 1",
+        );
+
+        store
+            .start_process(test_record(session_id), command)
+            .await
+            .expect("spawn failing process");
+
+        let mut terminal_status = None;
+        for _ in 0..8 {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+                .await
+                .expect("status event")
+                .expect("broadcast event");
+            if let LaunchEvent::Status(status) = event
+                && status.state == "exited"
+            {
+                terminal_status = Some(status);
+                break;
+            }
+        }
+
+        let status = terminal_status.expect("terminal status");
+        assert_eq!(
+            status.failure_class.as_deref(),
+            Some(LaunchFailureClass::JvmUnsupportedOption.as_str())
+        );
+        assert_eq!(status.failure_detail, None);
+        assert_eq!(
+            store.observed_failure(session_id).await,
+            Some(LaunchFailureClass::JvmUnsupportedOption)
+        );
+
+        let stored = store.get(session_id).await.expect("stored record");
+        let failure = stored.failure.expect("stored failure");
+        assert_eq!(failure.class, LaunchFailureClass::JvmUnsupportedOption);
+        assert_eq!(failure.detail, None);
     }
 
     #[tokio::test]

@@ -72,7 +72,7 @@ Policy:
 - `core/launcher jvm`: compute preset/JVM args from a chosen policy outcome
 - `core/launcher validation`: report why a requested configuration is incompatible
 - `core/launcher healing`: execute recovery plans and format healing summaries
-- `apps/api session store`: capture observations from the running process and preserve Guardian-authored stage telemetry details
+- `apps/api session store`: capture running-process facts, store only bounded startup failure class observations, and preserve Guardian-authored stage telemetry details
 - `frontend`: render the backend-authored Guardian outcome
 
 Lower layers should not decide:
@@ -131,7 +131,7 @@ Guardian should produce one normalized outcome for the pipeline:
    - blocks and returns guidance
 
 ### Startup failure
-1. Session layer reports observations about exit/stall/failure text
+1. Session layer reports observations about exit/stall/log output and stores only Guardian-classified startup failure classes
 2. runner keeps the session observation plumbing and maps `stalled`/`exited` observations into bounded Guardian startup-failure facts
 3. Guardian decides whether startup recovery is allowed
 4. if allowed, Healing executes the recovery plan
