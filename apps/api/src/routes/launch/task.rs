@@ -144,12 +144,7 @@ async fn prepare_launch_session_with_auth_refresh(
     state
         .instances()
         .ensure_instance_layout(&instance.id, Some(&library_dir))
-        .map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("failed to prepare instance layout: {error}") })),
-            )
-        })?;
+        .map_err(launch_layout_error_response)?;
     let game_dir = state.instances().game_dir(&instance.id);
 
     let config = state.config().current();
@@ -242,6 +237,17 @@ async fn prepare_launch_session_with_auth_refresh(
             resource_budget: Some(preflight.resource_budget),
         },
     })
+}
+
+fn launch_layout_error_response(
+    _error: impl std::fmt::Display,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "error": "Could not prepare the instance folder. Check app data permissions and try again."
+        })),
+    )
 }
 
 pub(super) async fn prepare_launch_preflight(
@@ -765,6 +771,61 @@ mod tests {
         time::Duration,
     };
     use tokio::sync::mpsc;
+
+    #[test]
+    fn launch_layout_error_response_keeps_500_and_hides_unix_path_material() {
+        let (status, Json(body)) = launch_layout_error_response(
+            "/Users/alice/Library/Application Support/Croopor/instances/survival: Permission denied (os error 13)",
+        );
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "error": "Could not prepare the instance folder. Check app data permissions and try again."
+            })
+        );
+        let body = body.to_string();
+        for fragment in [
+            "/Users/alice",
+            "Library/Application Support",
+            "instances/survival",
+            "Permission denied",
+            "os error 13",
+        ] {
+            assert!(
+                !body.contains(fragment),
+                "launch layout error exposed raw fragment {fragment}"
+            );
+        }
+    }
+
+    #[test]
+    fn launch_layout_error_response_hides_windows_path_material_and_raw_io_text() {
+        let (status, Json(body)) = launch_layout_error_response(
+            r"C:\Users\Alice\AppData\Roaming\Croopor\instances\creative: Access is denied. Read-only file system (os error 5)",
+        );
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            body["error"],
+            "Could not prepare the instance folder. Check app data permissions and try again."
+        );
+        let body = body.to_string();
+        for fragment in [
+            r"C:\Users\Alice",
+            "AppData",
+            r"instances\creative",
+            "Access is denied",
+            "Read-only file system",
+            "os error 5",
+        ] {
+            assert!(
+                !body.contains(fragment),
+                "launch layout error exposed raw fragment {fragment}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn prepare_launch_session_ensures_instance_layout_before_building_intent() {
