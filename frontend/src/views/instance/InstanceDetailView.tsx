@@ -476,8 +476,16 @@ function WorldsCard({
   onOpenWorlds: () => void;
 }): JSX.Element {
   const worlds = resources?.worlds ?? [];
-  const count = resources?.worlds_count ?? inst.saves_count ?? 0;
-  const firstWorld = worlds[0];
+  const count = resources
+    ? Math.max(resources.worlds_count ?? 0, worlds.length)
+    : inst.saves_count ?? 0;
+  const visibleWorlds = worlds.slice(0, 3);
+  const hiddenWorlds = visibleWorlds.length > 0 ? Math.max(count - visibleWorlds.length, 0) : 0;
+  const footerCopy = visibleWorlds.length === 0
+    ? 'Open the Worlds tab to see saves'
+    : hiddenWorlds > 0
+      ? `${hiddenWorlds} more world${hiddenWorlds === 1 ? '' : 's'} in Worlds`
+      : `${count} world${count === 1 ? '' : 's'} available`;
   return (
     <Card padding={18} class={`cp-od-worlds-card${count === 0 ? ' cp-od-worlds-card--empty' : ''}`}>
       <div class="cp-od-head">
@@ -506,16 +514,27 @@ function WorldsCard({
         </div>
       ) : (
         <div class="cp-od-worlds-list">
-          <div class="cp-od-world-row">
-            <div class="cp-od-world-mark"><Icon name="globe" size={16} /></div>
-            <div class="cp-od-world-body">
-              <div class="cp-od-world-name">{firstWorld?.name || `${count} save${count === 1 ? '' : 's'} on disk`}</div>
-              <div class="cp-od-world-sub">
-                {firstWorld ? `${fmtBytes(firstWorld.size)} · changed ${fmtRelative(firstWorld.modified_at)}` : `Last touched ${fmtRelative(inst.last_played_at)}`}
+          {visibleWorlds.length > 0 ? visibleWorlds.map((world) => (
+            <div class="cp-od-world-row" key={world.name}>
+              <div class="cp-od-world-mark"><Icon name="globe" size={16} /></div>
+              <div class="cp-od-world-body">
+                <div class="cp-od-world-name" title={world.name}>{world.name}</div>
+                <div class="cp-od-world-sub">{fmtBytes(world.size)} · changed {fmtRelative(world.modified_at)}</div>
               </div>
             </div>
+          )) : (
+            <div class="cp-od-world-row">
+              <div class="cp-od-world-mark"><Icon name="globe" size={16} /></div>
+              <div class="cp-od-world-body">
+                <div class="cp-od-world-name">{count} save{count === 1 ? '' : 's'} on disk</div>
+                <div class="cp-od-world-sub">Last touched {fmtRelative(inst.last_played_at)}</div>
+              </div>
+            </div>
+          )}
+          <div class="cp-od-worlds-footer">
+            <span>{footerCopy}</span>
             <button class="cp-od-link" type="button" onClick={onOpenWorlds}>
-              View all <Icon name="chevron-right" size={11} stroke={2.2} />
+              View worlds <Icon name="chevron-right" size={11} stroke={2.2} />
             </button>
           </div>
         </div>

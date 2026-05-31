@@ -798,17 +798,17 @@
 }
 .cp-od-world-row {
   display: grid;
-  grid-template-columns: 36px 1fr auto;
+  grid-template-columns: 32px minmax(0, 1fr);
   align-items: center;
-  gap: 12px;
-  padding: 10px 0;
+  gap: 10px;
+  padding: 7px 0;
 }
 .cp-od-world-row + .cp-od-world-row {
   border-top: 1px solid oklch(1 0 0 / 0.04);
 }
 .cp-od-world-mark {
-  width: 36px;
-  height: 36px;
+  width: 32px;
+  height: 32px;
   border-radius: 9px;
   background: var(--surface-3);
   color: var(--text-dim);
@@ -830,6 +830,27 @@
   font-size: 11.5px;
   color: var(--text-mute);
   margin-top: 2px;
+}
+.cp-od-worlds-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: auto;
+  padding-top: 9px;
+  border-top: 1px solid oklch(1 0 0 / 0.04);
+  color: var(--text-mute);
+  font-size: 11.5px;
+  min-width: 0;
+}
+.cp-od-worlds-footer span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cp-od-worlds-footer .cp-od-link {
+  flex: 0 0 auto;
 }
 
 /* ─── Performance — read-only plan, memory, and runtime evidence. ───── */
