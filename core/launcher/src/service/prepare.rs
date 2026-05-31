@@ -289,7 +289,7 @@ pub fn sanitize_effective_runtime_major(
 mod tests {
     use super::*;
     use crate::build::LaunchAuthContext;
-    use crate::guardian::{GuardianMode, LaunchGuardianContext};
+    use crate::guardian::{GuardianMode, LaunchGuardianContext, OverrideOrigin};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -498,6 +498,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn custom_explicit_unsupported_named_preset_fails_before_command_planning() {
+        let root = unique_temp_root("croopor-prepare-custom-preset-block-test");
+        let library_dir = root.join("library");
+        let game_dir = root.join("instances").join("custom-preset-block-test");
+        let fake_java = write_fake_openj9_java(&root);
+        let version_id = "custom-preset-block-test";
+        let version_dir = library_dir.join("versions").join(version_id);
+        fs::create_dir_all(&version_dir).expect("version dir");
+        fs::create_dir_all(&game_dir).expect("game dir");
+        fs::write(version_dir.join(format!("{version_id}.jar")), b"client jar")
+            .expect("client jar");
+        write_version_json(
+            &version_dir.join(format!("{version_id}.json")),
+            serde_json::json!({
+                "id": version_id,
+                "type": "release",
+                "mainClass": "net.minecraft.client.main.Main",
+                "javaVersion": {
+                    "component": "java-runtime-delta",
+                    "majorVersion": 21
+                },
+                "assetIndex": { "id": "custom-preset-assets" },
+                "arguments": {
+                    "jvm": [],
+                    "game": []
+                },
+                "libraries": []
+            }),
+        );
+
+        let intent = LaunchIntent {
+            session_id: "prepare-custom-preset-block-test".to_string(),
+            library_dir: library_dir.clone(),
+            instance_id: "custom-preset-block-test".to_string(),
+            version_id: version_id.to_string(),
+            username: "Player".to_string(),
+            auth: LaunchAuthContext::offline("Player"),
+            requested_java: fake_java.to_string_lossy().to_string(),
+            requested_preset: crate::jvm::PRESET_SMOOTH.to_string(),
+            extra_jvm_args: Vec::new(),
+            max_memory_mb: 2048,
+            min_memory_mb: 512,
+            resolution: None,
+            launcher_name: "croopor".to_string(),
+            launcher_version: "test".to_string(),
+            game_dir: Some(game_dir),
+            guardian: LaunchGuardianContext {
+                mode: GuardianMode::Custom,
+                java_override_origin: Some(OverrideOrigin::Instance),
+                preset_override_origin: Some(OverrideOrigin::Instance),
+                raw_jvm_args_origin: None,
+            },
+            performance_mode: "managed".to_string(),
+        };
+
+        let error = prepare_launch_attempt(&intent, &AttemptOverrides::default())
+            .await
+            .expect_err("known-fatal custom preset should fail during preparation");
+
+        assert_eq!(
+            error.failure_class,
+            Some(LaunchFailureClass::JvmUnsupportedOption)
+        );
+        assert!(error.message.contains("Smooth"));
+        assert!(error.message.contains("HotSpot JVM tuning flags"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn prepare_launch_attempt_uses_explicit_online_auth_context() {
         let root = unique_temp_root("croopor-prepare-online-auth-test");
         let library_dir = root.join("library");
@@ -607,18 +677,32 @@ mod tests {
     }
 
     fn write_fake_java(root: &Path) -> PathBuf {
-        let bin_dir = root.join("fake-java").join("bin");
-        fs::create_dir_all(&bin_dir).expect("fake java dir");
-        let java_path = bin_dir.join("java");
-        fs::write(
-            &java_path,
+        write_fake_java_with_probe(
+            root,
             r#"#!/bin/sh
 echo 'java.vendor = OpenJDK' >&2
 echo 'java.vm.name = OpenJDK 64-Bit Server VM' >&2
 echo 'openjdk version "21.0.3" 2024-04-16' >&2
 "#,
         )
-        .expect("fake java");
+    }
+
+    fn write_fake_openj9_java(root: &Path) -> PathBuf {
+        write_fake_java_with_probe(
+            root,
+            r#"#!/bin/sh
+echo 'java.vendor = IBM Corporation' >&2
+echo 'java.vm.name = Eclipse OpenJ9 VM' >&2
+echo 'openjdk version "21.0.3" 2024-04-16' >&2
+"#,
+        )
+    }
+
+    fn write_fake_java_with_probe(root: &Path, probe_output_script: &str) -> PathBuf {
+        let bin_dir = root.join("fake-java").join("bin");
+        fs::create_dir_all(&bin_dir).expect("fake java dir");
+        let java_path = bin_dir.join("java");
+        fs::write(&java_path, probe_output_script).expect("fake java");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;

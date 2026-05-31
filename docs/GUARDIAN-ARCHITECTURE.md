@@ -55,6 +55,7 @@ Policy:
 - Guardian does not silently change explicit launch intent
 - Guardian warns when explicit Java, JVM preset, or raw JVM argument overrides will be preserved
 - Guardian blocks guaranteed-fatal override combinations before spawn
+- Guardian blocks explicit named JVM presets before spawn when the selected runtime is known not to support the flags emitted by that preset
 - Guardian returns guidance instead of auto-healing explicit unsafe choices
 - valid explicit overrides still pass unchanged
 
@@ -125,6 +126,7 @@ Guardian should produce one normalized outcome for the pipeline:
    - warns when active install/download work may add disk or network pressure during startup
    - warns when launch-relevant storage has less than the conservative free-space headroom
    - warns in Custom mode when risky manual overrides are preserved
+   - blocks Custom-mode explicit named JVM presets that would emit known unsupported flags for the selected runtime
    - intervenes and mutates attempt overrides
    - blocks and returns guidance
 

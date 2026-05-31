@@ -433,6 +433,19 @@ pub fn resolve_launch_preset(
         });
     }
 
+    if matches!(context.mode, GuardianMode::Custom)
+        && context.has_named_preset()
+        && let Some(reason) = crate::jvm::known_fatal_explicit_preset_reason(requested, info)
+    {
+        return Err((
+            LaunchFailureClass::JvmUnsupportedOption,
+            format!(
+                "Guardian blocked JVM preset \"{}\" because {reason}.",
+                format_preset_name(requested)
+            ),
+        ));
+    }
+
     Ok(ResolvedGuardianPreset {
         effective_preset: requested.to_string(),
         intervention: None,
@@ -514,6 +527,7 @@ mod tests {
         GuardianInterventionKind, GuardianMode, GuardianSummary, LaunchGuardianContext,
         OverrideOrigin, PreLaunchAction, PreLaunchDecision, RecoveryAction,
         conservative_healing_preset, decide_prepare_failure, recovery_plan_for_startup_failure,
+        resolve_launch_preset,
     };
     use crate::types::LaunchFailureClass;
     use croopor_minecraft::JavaRuntimeInfo;
@@ -581,6 +595,82 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn managed_explicit_smooth_on_unsupported_runtime_downgrades_instead_of_blocking() {
+        let info = java_info(8, "openjdk");
+        let context = LaunchGuardianContext {
+            mode: GuardianMode::Managed,
+            java_override_origin: None,
+            preset_override_origin: Some(OverrideOrigin::Instance),
+            raw_jvm_args_origin: None,
+        };
+
+        let resolved = resolve_launch_preset(
+            &context,
+            crate::jvm::PRESET_SMOOTH,
+            "1.20.4",
+            "vanilla",
+            false,
+            &info,
+        )
+        .expect("managed mode should downgrade");
+
+        assert_eq!(resolved.effective_preset, crate::jvm::PRESET_LEGACY);
+        assert!(matches!(
+            resolved.intervention.map(|intervention| intervention.kind),
+            Some(GuardianInterventionKind::DowngradePreset)
+        ));
+    }
+
+    #[test]
+    fn custom_explicit_smooth_on_unsupported_runtime_blocks_before_planning() {
+        let info = java_info(21, "openj9");
+        let context = LaunchGuardianContext {
+            mode: GuardianMode::Custom,
+            java_override_origin: None,
+            preset_override_origin: Some(OverrideOrigin::Instance),
+            raw_jvm_args_origin: None,
+        };
+
+        let error = resolve_launch_preset(
+            &context,
+            crate::jvm::PRESET_SMOOTH,
+            "1.20.4",
+            "vanilla",
+            false,
+            &info,
+        )
+        .expect_err("custom mode should block known-fatal presets");
+
+        assert_eq!(error.0, LaunchFailureClass::JvmUnsupportedOption);
+        assert!(error.1.contains("Smooth"));
+        assert!(error.1.contains("HotSpot JVM tuning flags"));
+    }
+
+    #[test]
+    fn custom_explicit_valid_preset_passes_unchanged() {
+        let info = java_info(21, "openjdk");
+        let context = LaunchGuardianContext {
+            mode: GuardianMode::Custom,
+            java_override_origin: None,
+            preset_override_origin: Some(OverrideOrigin::Instance),
+            raw_jvm_args_origin: None,
+        };
+
+        let resolved = resolve_launch_preset(
+            &context,
+            crate::jvm::PRESET_SMOOTH,
+            "1.20.4",
+            "vanilla",
+            false,
+            &info,
+        )
+        .expect("valid explicit preset should pass unchanged");
+
+        assert_eq!(resolved.effective_preset, crate::jvm::PRESET_SMOOTH);
+        assert!(resolved.intervention.is_none());
     }
 
     #[test]
@@ -756,5 +846,15 @@ mod tests {
 
         assert_eq!(conservative_healing_preset("b1.8.1", &info), "legacy");
         assert_eq!(conservative_healing_preset("a1.2.6", &info), "legacy");
+    }
+
+    fn java_info(major: u32, distribution: &str) -> JavaRuntimeInfo {
+        JavaRuntimeInfo {
+            id: "test".to_string(),
+            major,
+            update: 0,
+            distribution: distribution.to_string(),
+            path: "/usr/bin/java".to_string(),
+        }
     }
 }
