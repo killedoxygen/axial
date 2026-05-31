@@ -896,7 +896,7 @@ function LaunchProofHistoryBlock({ state }: { state: LaunchReportsState }): JSX.
       const proof = await api('GET', `/launch/reports/${encodeURIComponent(sessionId)}`);
       if (proof?.error) throw new Error(proof.error);
       await navigator.clipboard.writeText(stablePrettyJson(proof));
-      toast('Launch proof copied');
+      toast('Sanitized launch proof copied');
     } catch (err) {
       toast(`Copy failed: ${proofCopyFailureMessage(err)}`, 'error');
     } finally {
@@ -990,7 +990,7 @@ function LaunchProofHistoryBlock({ state }: { state: LaunchReportsState }): JSX.
                     size="sm"
                     icon="copy"
                     disabled={copyingSessionId === record.session_id}
-                    title="Copy full local launch proof JSON"
+                    title="Copy sanitized launch proof JSON"
                     onClick={() => void copyProof(record.session_id)}
                   >
                     {copyingSessionId === record.session_id ? 'Copying' : 'Copy proof'}

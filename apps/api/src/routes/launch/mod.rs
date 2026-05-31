@@ -685,7 +685,7 @@ async fn handle_family_c_qualification_preview()
 async fn handle_launch_reports(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let reports = crate::state::launch_reports::list_recent(state.config().paths(), 25)
+    let reports = crate::state::launch_reports::list_recent_exports(state.config().paths(), 25)
         .map_err(internal_error)?;
 
     Ok(Json(json!({ "reports": reports })))
@@ -695,7 +695,7 @@ async fn handle_launch_report(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let report = crate::state::launch_reports::load(state.config().paths(), &id)
+    let report = crate::state::launch_reports::load_export(state.config().paths(), &id)
         .map_err(internal_error)?
         .ok_or_else(|| {
             (
@@ -2482,6 +2482,67 @@ mod tests {
         assert!(!data.contains("jvm-secret-token"));
         assert!(!data.contains("SecretUser"));
         assert!(!data.contains("java_path\""));
+
+        cleanup(&fixture.root);
+    }
+
+    #[tokio::test]
+    async fn launch_reports_route_exports_sanitized_proof_records() {
+        let fixture = RouteTestFixture::new("launch-reports-sanitized-list");
+        write_family_c_proof_record(&fixture.paths, &sensitive_launch_proof_record());
+
+        let response = router()
+            .with_state(fixture.state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/launch/reports")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("route response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("reports json");
+        let data = String::from_utf8(body.to_vec()).expect("utf8 payload");
+        let report = &payload["reports"][0];
+
+        assert_sanitized_launch_proof_payload(report);
+        assert_launch_proof_payload_excludes_sensitive_content(&data);
+
+        cleanup(&fixture.root);
+    }
+
+    #[tokio::test]
+    async fn launch_report_route_exports_sanitized_proof_record() {
+        let fixture = RouteTestFixture::new("launch-reports-sanitized-detail");
+        write_family_c_proof_record(&fixture.paths, &sensitive_launch_proof_record());
+
+        let response = router()
+            .with_state(fixture.state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/launch/reports/sensitive-proof")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("route response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("report json");
+        let data = String::from_utf8(body.to_vec()).expect("utf8 payload");
+
+        assert_sanitized_launch_proof_payload(&payload);
+        assert_launch_proof_payload_excludes_sensitive_content(&data);
 
         cleanup(&fixture.root);
     }
@@ -4667,6 +4728,203 @@ mod tests {
                 "mode": "release_validation",
             })
         );
+    }
+
+    fn sensitive_launch_proof_record() -> crate::state::launch_reports::LaunchProofRecord {
+        crate::state::launch_reports::LaunchProofRecord {
+            schema: "croopor.launch.proof".to_string(),
+            schema_version: 1,
+            session_id: "sensitive-proof".to_string(),
+            instance_id: "instance-safe".to_string(),
+            version_id: "1.21.1".to_string(),
+            launched_at: "2026-01-01T00:00:00.000Z".to_string(),
+            recorded_at: "2026-01-01T00:01:00.000Z".to_string(),
+            outcome: "failed".to_string(),
+            scenario: crate::state::launch_reports::LaunchProofScenario {
+                scenario_id: "managed_launch".to_string(),
+                performance_mode: "managed".to_string(),
+                requested_memory_mb: Some(4096),
+                version_id: Some("1.21.1".to_string()),
+                benchmark_profile: Some("release-default".to_string()),
+                benchmark_run_type: Some("repeat".to_string()),
+                benchmark_mode: Some("release_validation".to_string()),
+                benchmark_id: Some("release-default-repeat".to_string()),
+            },
+            device: crate::state::launch_reports::LaunchProofDevice {
+                tier: "mid".to_string(),
+                total_memory_mb: Some(16_384),
+                cpu_threads: Some(8),
+            },
+            resource_budget: Some(family_c_resource_budget()),
+            pid: Some(4242),
+            exit_code: Some(1),
+            boot_duration_ms: Some(3_250),
+            priority: Some(crate::state::launch_reports::LaunchProofPriority {
+                start_mode: "below_normal_until_boot".to_string(),
+                start_error: Some(
+                    "failed at /home/alice/.minecraft with -Xmx8192M token=priority-secret"
+                        .to_string(),
+                ),
+                promotion: Some("promoted".to_string()),
+                promotion_error: Some("account_id=priority-account".to_string()),
+            }),
+            failure_class: Some("jvm_unsupported_option".to_string()),
+            failure_detail: Some(
+                "Java failed in /home/alice/.minecraft with --accessToken raw-secret -Xmx8192M username=SecretPlayer account_id=abc provider_payload={} eyJheader123456789.eyJpayload123456789.signature123456789".to_string(),
+            ),
+            guardian: Some(json!({
+                "mode": "managed",
+                "decision": "warned",
+                "message": "Guardian flagged launch settings for review.",
+                "details": [
+                    "Safe bounded guardian detail.",
+                    "Leaked /Users/Alice/.minecraft --accessToken raw-secret -Xmx4096M username=SecretPlayer",
+                    "Suspicious eyJheader123456789.eyJpayload123456789.signature123456789"
+                ],
+                "guidance": [
+                    "Switch Guardian back to Managed if you want Croopor to adjust unsafe choices.",
+                    "provider_payload={\"token\":\"provider-secret\"}"
+                ],
+                "interventions": [
+                    {
+                        "kind": "strip_jvm_args",
+                        "detail": "Explicit JVM args were removed before launch because they were incompatible."
+                    },
+                    {
+                        "kind": "downgrade_preset",
+                        "detail": "-XX:+UseZGC token=guardian-secret"
+                    }
+                ],
+                "provider_payload": {
+                    "access_token": "provider-secret"
+                }
+            })),
+            healing: Some(json!({
+                "requested_preset": "graalvm",
+                "effective_preset": "performance",
+                "auth_mode": "offline",
+                "warnings": [
+                    "Requested JVM preset was downgraded for compatibility.",
+                    "Used C:\\Users\\Alice\\java.exe --username SecretPlayer -Dtoken=healing-secret"
+                ],
+                "fallback_applied": "/tmp/secret-fallback --accessToken healing-secret",
+                "retry_count": 1,
+                "failure_class": "jvm_unsupported_option",
+                "events": [
+                    {
+                        "kind": "preset_downgraded",
+                        "detail": "Requested JVM preset was downgraded for compatibility."
+                    },
+                    {
+                        "kind": "fallback_applied",
+                        "detail": "Fallback used /var/tmp/secret --accessToken healing-secret"
+                    }
+                ],
+                "account_id": "healing-account"
+            })),
+            stages: vec![LaunchStageRecord {
+                stage: "launching".to_string(),
+                label: "Launching".to_string(),
+                started_at_ms: 1_000,
+                ended_at_ms: Some(1_250),
+                duration_ms: Some(250),
+                result: Some("completed".to_string()),
+                warnings: vec![
+                    "Cache warmed successfully.".to_string(),
+                    "Bad stage path C:\\Users\\Alice\\.minecraft -Xmx8192M token=stage-secret"
+                        .to_string(),
+                ],
+                fallback_reason: Some("Vanilla fallback selected.".to_string()),
+            }],
+            comparison: Some(crate::state::launch_reports::LaunchProofComparison {
+                baseline_session_id: "baseline-session".to_string(),
+                baseline_recorded_at: "2026-01-01T00:00:00.000Z".to_string(),
+                matched_sample_count: 2,
+                metric_name: "boot_duration_ms".to_string(),
+                current_value_ms: 3_250,
+                baseline_value_ms: 4_000,
+                delta_ms: -750,
+                delta_percent: -18.75,
+            }),
+        }
+    }
+
+    fn assert_sanitized_launch_proof_payload(report: &serde_json::Value) {
+        assert_eq!(report["session_id"], serde_json::json!("sensitive-proof"));
+        assert_eq!(report["instance_id"], serde_json::json!("instance-safe"));
+        assert_eq!(report["version_id"], serde_json::json!("1.21.1"));
+        assert_eq!(report["outcome"], serde_json::json!("failed"));
+        assert_eq!(
+            report["scenario"]["performance_mode"],
+            serde_json::json!("managed")
+        );
+        assert_eq!(
+            report["scenario"]["requested_memory_mb"],
+            serde_json::json!(4096)
+        );
+        assert_eq!(
+            report["failure_class"],
+            serde_json::json!("jvm_unsupported_option")
+        );
+        assert!(report.get("failure_detail").is_none());
+        assert!(report.get("priority").is_none());
+        assert_eq!(
+            report["resource_budget"]["memory_headroom_mb"],
+            serde_json::json!(2048)
+        );
+        assert_eq!(report["guardian"]["decision"], serde_json::json!("warned"));
+        assert_eq!(
+            report["guardian"]["details"][0],
+            serde_json::json!("Safe bounded guardian detail.")
+        );
+        assert_eq!(report["healing"]["retry_count"], serde_json::json!(1));
+        assert_eq!(
+            report["healing"]["events"][0]["kind"],
+            serde_json::json!("preset_downgraded")
+        );
+        assert_eq!(
+            report["stages"][0]["warnings"][0],
+            serde_json::json!("Cache warmed successfully.")
+        );
+        assert_eq!(
+            report["stages"][0]["fallback_reason"],
+            serde_json::json!("Vanilla fallback selected.")
+        );
+        assert_eq!(
+            report["comparison"]["metric_name"],
+            serde_json::json!("boot_duration_ms")
+        );
+        assert_eq!(report["comparison"]["delta_ms"], serde_json::json!(-750));
+    }
+
+    fn assert_launch_proof_payload_excludes_sensitive_content(data: &str) {
+        for fragment in [
+            "/home/alice",
+            "/Users/Alice",
+            "C:\\\\Users",
+            "/tmp/secret-fallback",
+            "/var/tmp/secret",
+            "--accessToken",
+            "-Xmx8192M",
+            "-Xmx4096M",
+            "-XX:+UseZGC",
+            "-Dtoken",
+            "SecretPlayer",
+            "account_id",
+            "provider_payload",
+            "raw-secret",
+            "priority-secret",
+            "provider-secret",
+            "healing-secret",
+            "stage-secret",
+            "java.exe",
+            "eyJheader123456789",
+        ] {
+            assert!(
+                !data.contains(fragment),
+                "sanitized launch proof leaked fragment {fragment:?}: {data}"
+            );
+        }
     }
 
     struct RouteTestFixture {

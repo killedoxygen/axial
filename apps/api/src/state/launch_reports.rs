@@ -1,7 +1,8 @@
 use crate::logging::timestamp_utc;
 use croopor_config::AppPaths;
 use croopor_launcher::{
-    LaunchIntent, LaunchPriorityEvidence, LaunchSessionRecord, LaunchStageRecord, launch_state_name,
+    GuardianSummary, LaunchHealingSummary, LaunchIntent, LaunchPriorityEvidence,
+    LaunchSessionRecord, LaunchStageRecord, launch_state_name,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -16,6 +17,10 @@ const LAUNCH_STAGE_COMPARISON_METRIC_NAME: &str = "total_completed_stage_duratio
 const LAUNCH_BOOT_COMPARISON_METRIC_NAME: &str = "boot_duration_ms";
 const MAX_REPORT_FILENAME_STEM: usize = 96;
 const MAX_BENCHMARK_METADATA_CHARS: usize = 96;
+const MAX_EXPORT_TOKEN_CHARS: usize = 96;
+const MAX_EXPORT_DETAIL_CHARS: usize = 180;
+const MAX_EXPORT_DETAILS: usize = 8;
+const MAX_EXPORT_STAGES: usize = 32;
 // Conservative free-space warning threshold for launch caches, natives, and prewarm writes.
 pub const LAUNCH_DISK_HEADROOM_MB: u64 = 2048;
 
@@ -53,6 +58,55 @@ pub struct LaunchProofRecord {
     pub stages: Vec<LaunchStageRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub comparison: Option<LaunchProofComparison>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LaunchProofExport {
+    pub schema: String,
+    pub schema_version: u32,
+    pub session_id: String,
+    pub instance_id: String,
+    pub version_id: String,
+    pub launched_at: String,
+    pub recorded_at: String,
+    pub outcome: String,
+    pub scenario: LaunchProofScenario,
+    pub device: LaunchProofDevice,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_budget: Option<LaunchProofResourceBudget>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boot_duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guardian: Option<GuardianSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub healing: Option<LaunchHealingSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stages: Vec<LaunchProofStageExport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comparison: Option<LaunchProofComparison>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct LaunchProofStageExport {
+    pub stage: String,
+    pub label: String,
+    pub started_at_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -295,6 +349,11 @@ pub fn list_recent(paths: &AppPaths, limit: usize) -> io::Result<Vec<LaunchProof
     Ok(reports)
 }
 
+pub fn list_recent_exports(paths: &AppPaths, limit: usize) -> io::Result<Vec<LaunchProofExport>> {
+    list_recent(paths, limit)
+        .map(|reports| reports.iter().map(LaunchProofExport::from_record).collect())
+}
+
 pub fn load(paths: &AppPaths, session_id: &str) -> io::Result<Option<LaunchProofRecord>> {
     let path = report_path(paths, session_id);
     match load_file(&path) {
@@ -304,8 +363,296 @@ pub fn load(paths: &AppPaths, session_id: &str) -> io::Result<Option<LaunchProof
     }
 }
 
+pub fn load_export(paths: &AppPaths, session_id: &str) -> io::Result<Option<LaunchProofExport>> {
+    load(paths, session_id).map(|report| report.as_ref().map(LaunchProofExport::from_record))
+}
+
 pub fn report_path(paths: &AppPaths, session_id: &str) -> PathBuf {
     report_dir(paths).join(safe_report_filename(session_id))
+}
+
+impl LaunchProofExport {
+    pub fn from_record(record: &LaunchProofRecord) -> Self {
+        Self {
+            schema: sanitized_required_token(&record.schema, LAUNCH_PROOF_SCHEMA),
+            schema_version: record.schema_version,
+            session_id: sanitized_required_token(&record.session_id, "redacted"),
+            instance_id: sanitized_required_token(&record.instance_id, "redacted"),
+            version_id: sanitized_required_token(&record.version_id, "unknown"),
+            launched_at: sanitized_required_token(&record.launched_at, "unknown"),
+            recorded_at: sanitized_required_token(&record.recorded_at, "unknown"),
+            outcome: sanitized_required_token(&record.outcome, "unknown"),
+            scenario: sanitized_export_scenario(&record.scenario),
+            device: sanitized_export_device(&record.device),
+            resource_budget: record.resource_budget.clone(),
+            pid: record.pid,
+            exit_code: record.exit_code,
+            boot_duration_ms: record.boot_duration_ms,
+            failure_class: record
+                .failure_class
+                .as_deref()
+                .and_then(sanitized_optional_token),
+            guardian: record.guardian.as_ref().and_then(sanitized_guardian),
+            healing: record.healing.as_ref().and_then(sanitized_healing),
+            stages: record
+                .stages
+                .iter()
+                .take(MAX_EXPORT_STAGES)
+                .map(sanitized_stage)
+                .collect(),
+            comparison: record.comparison.as_ref().map(sanitized_comparison),
+        }
+    }
+}
+
+fn sanitized_export_scenario(scenario: &LaunchProofScenario) -> LaunchProofScenario {
+    LaunchProofScenario {
+        scenario_id: sanitized_required_token(&scenario.scenario_id, "unknown_launch"),
+        performance_mode: sanitized_required_token(&scenario.performance_mode, "unknown"),
+        requested_memory_mb: scenario.requested_memory_mb,
+        version_id: scenario
+            .version_id
+            .as_deref()
+            .and_then(sanitized_optional_token),
+        benchmark_profile: scenario
+            .benchmark_profile
+            .as_deref()
+            .and_then(sanitized_optional_token),
+        benchmark_run_type: scenario
+            .benchmark_run_type
+            .as_deref()
+            .and_then(sanitized_optional_token),
+        benchmark_mode: scenario
+            .benchmark_mode
+            .as_deref()
+            .and_then(sanitized_optional_token),
+        benchmark_id: scenario
+            .benchmark_id
+            .as_deref()
+            .and_then(sanitized_optional_token),
+    }
+}
+
+fn sanitized_export_device(device: &LaunchProofDevice) -> LaunchProofDevice {
+    LaunchProofDevice {
+        tier: sanitized_required_token(&device.tier, "unknown"),
+        total_memory_mb: device.total_memory_mb,
+        cpu_threads: device.cpu_threads,
+    }
+}
+
+fn sanitized_stage(stage: &LaunchStageRecord) -> LaunchProofStageExport {
+    let stage_name = sanitized_required_token(&stage.stage, "unknown");
+    LaunchProofStageExport {
+        stage: stage_name.clone(),
+        label: sanitized_bounded_text(&stage.label).unwrap_or_else(|| stage_name.clone()),
+        started_at_ms: stage.started_at_ms,
+        ended_at_ms: stage.ended_at_ms,
+        duration_ms: stage.duration_ms,
+        result: stage.result.as_deref().and_then(sanitized_optional_token),
+        warnings: stage
+            .warnings
+            .iter()
+            .filter_map(|warning| sanitized_bounded_text(warning))
+            .take(MAX_EXPORT_DETAILS)
+            .collect(),
+        fallback_reason: stage
+            .fallback_reason
+            .as_deref()
+            .and_then(sanitized_bounded_text),
+    }
+}
+
+fn sanitized_guardian(value: &Value) -> Option<GuardianSummary> {
+    let mut guardian = serde_json::from_value::<GuardianSummary>(value.clone()).ok()?;
+    guardian.message = guardian.message.as_deref().and_then(sanitized_bounded_text);
+    guardian.details = guardian
+        .details
+        .iter()
+        .filter_map(|detail| sanitized_bounded_text(detail))
+        .take(MAX_EXPORT_DETAILS)
+        .collect();
+    guardian.guidance = guardian
+        .guidance
+        .iter()
+        .filter_map(|detail| sanitized_bounded_text(detail))
+        .take(MAX_EXPORT_DETAILS)
+        .collect();
+    guardian.interventions = guardian
+        .interventions
+        .into_iter()
+        .map(|mut intervention| {
+            intervention.detail = intervention
+                .detail
+                .as_deref()
+                .and_then(sanitized_bounded_text);
+            intervention
+        })
+        .take(MAX_EXPORT_DETAILS)
+        .collect();
+    Some(guardian)
+}
+
+fn sanitized_healing(value: &Value) -> Option<LaunchHealingSummary> {
+    let mut healing = serde_json::from_value::<LaunchHealingSummary>(value.clone()).ok()?;
+    healing.requested_preset = healing
+        .requested_preset
+        .as_deref()
+        .and_then(sanitized_optional_token);
+    healing.effective_preset = healing
+        .effective_preset
+        .as_deref()
+        .and_then(sanitized_optional_token);
+    healing.auth_mode = healing
+        .auth_mode
+        .as_deref()
+        .and_then(sanitized_optional_token);
+    healing.failure_class = healing
+        .failure_class
+        .as_deref()
+        .and_then(sanitized_optional_token);
+    healing.warnings = healing
+        .warnings
+        .iter()
+        .filter_map(|warning| sanitized_bounded_text(warning))
+        .take(MAX_EXPORT_DETAILS)
+        .collect();
+    healing.fallback_applied = healing
+        .fallback_applied
+        .as_deref()
+        .and_then(sanitized_bounded_text);
+    healing.events = healing
+        .events
+        .into_iter()
+        .map(|mut event| {
+            event.detail = event.detail.as_deref().and_then(sanitized_bounded_text);
+            event
+        })
+        .take(MAX_EXPORT_DETAILS)
+        .collect();
+    Some(healing)
+}
+
+fn sanitized_comparison(comparison: &LaunchProofComparison) -> LaunchProofComparison {
+    LaunchProofComparison {
+        baseline_session_id: sanitized_required_token(&comparison.baseline_session_id, "redacted"),
+        baseline_recorded_at: sanitized_required_token(&comparison.baseline_recorded_at, "unknown"),
+        matched_sample_count: comparison.matched_sample_count,
+        metric_name: sanitized_required_token(&comparison.metric_name, "unknown"),
+        current_value_ms: comparison.current_value_ms,
+        baseline_value_ms: comparison.baseline_value_ms,
+        delta_ms: comparison.delta_ms,
+        delta_percent: comparison.delta_percent,
+    }
+}
+
+fn sanitized_required_token(value: &str, fallback: &str) -> String {
+    sanitized_optional_token(value).unwrap_or_else(|| fallback.to_string())
+}
+
+fn sanitized_optional_token(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.chars().any(char::is_control)
+        || value.chars().count() > MAX_EXPORT_TOKEN_CHARS
+        || export_text_looks_sensitive(value)
+        || !value.chars().all(|value| {
+            value.is_ascii_alphanumeric() || matches!(value, '-' | '_' | '.' | '+' | ':')
+        })
+    {
+        return None;
+    }
+
+    Some(value.to_string())
+}
+
+fn sanitized_bounded_text(value: &str) -> Option<String> {
+    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if value.is_empty()
+        || value.chars().any(char::is_control)
+        || value.chars().count() > MAX_EXPORT_DETAIL_CHARS
+        || export_text_looks_sensitive(&value)
+    {
+        return None;
+    }
+
+    Some(value)
+}
+
+fn export_text_looks_sensitive(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    if value.contains('/') || value.contains('\\') {
+        return true;
+    }
+    if lower.contains(".jar")
+        || lower.contains(".exe")
+        || lower.contains(".dll")
+        || lower.contains(".dylib")
+        || lower.contains(".so")
+    {
+        return true;
+    }
+    if lower.contains("-xmx")
+        || lower.contains("-xms")
+        || lower.contains("-xx:")
+        || lower.starts_with("-d")
+        || lower.contains(" -d")
+        || lower.contains("--access")
+        || lower.contains("--username")
+        || lower.contains("--uuid")
+        || lower.contains("--xuid")
+        || lower.contains("--user_properties")
+        || lower.contains("--classpath")
+        || lower.contains(" -cp ")
+        || lower.contains(" -classpath ")
+    {
+        return true;
+    }
+    if lower.contains("token")
+        || lower.contains("secret")
+        || lower.contains("password")
+        || lower.contains("provider_payload")
+        || lower.contains("account_id")
+        || lower.contains("username=")
+        || lower.contains("xuid=")
+        || lower.contains("bearer ")
+    {
+        return true;
+    }
+    if value.contains('@') && value.contains('.') {
+        return true;
+    }
+    if looks_like_jwt(value) || has_long_secret_like_run(value) {
+        return true;
+    }
+
+    false
+}
+
+fn looks_like_jwt(value: &str) -> bool {
+    value.split_whitespace().any(|token| {
+        let token = token.trim_matches(|value: char| {
+            !(value.is_ascii_alphanumeric() || matches!(value, '-' | '_' | '.'))
+        });
+        let parts = token.split('.').collect::<Vec<_>>();
+        parts.len() >= 3
+            && parts.iter().take(3).all(|part| {
+                part.len() >= 12
+                    && part
+                        .chars()
+                        .all(|value| value.is_ascii_alphanumeric() || matches!(value, '-' | '_'))
+            })
+    })
+}
+
+fn has_long_secret_like_run(value: &str) -> bool {
+    value
+        .split(|value: char| !(value.is_ascii_alphanumeric() || matches!(value, '-' | '_')))
+        .any(|part| {
+            part.len() >= 48
+                && part.chars().any(|value| value.is_ascii_alphabetic())
+                && part.chars().any(|value| value.is_ascii_digit())
+        })
 }
 
 fn build_record(
