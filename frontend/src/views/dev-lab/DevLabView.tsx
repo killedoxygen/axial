@@ -45,7 +45,6 @@ function ArtWorkbench(): JSX.Element {
     <div class="cp-dev-lab-stack">
       <Card>
         <SectionHeading
-          eyebrow="Procedural art"
           title="Instance identity generator"
           right={(
             <div class="cp-dev-lab-actions">

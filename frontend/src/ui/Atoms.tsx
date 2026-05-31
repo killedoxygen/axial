@@ -194,8 +194,7 @@ export function Card({ children, padding = 18, style, onClick, class: cls }: {
   );
 }
 
-export function SectionHeading({ eyebrow, title, action, right }: {
-  eyebrow?: string;
+export function SectionHeading({ title, action, right }: {
   title?: string;
   action?: { label: string; onClick?: () => void };
   right?: ComponentChildren;
@@ -203,7 +202,6 @@ export function SectionHeading({ eyebrow, title, action, right }: {
   return (
     <div class="cp-section-head">
       <div style={{ flex: 1, minWidth: 0 }}>
-        {eyebrow && <div class="cp-section-eyebrow">{eyebrow}</div>}
         {title && <h2>{title}</h2>}
       </div>
       {right}

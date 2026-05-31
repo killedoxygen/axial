@@ -159,7 +159,6 @@ export function HomeView(): JSX.Element {
       ) : (
         <div>
           <SectionHeading
-            eyebrow="Continue"
             title="Recent instances"
             action={{ label: 'All instances', onClick: () => navigate({ name: 'instances' }) }}
           />
@@ -170,7 +169,7 @@ export function HomeView(): JSX.Element {
       )}
 
       <div>
-        <SectionHeading eyebrow="Library" title="At a glance" />
+        <SectionHeading title="At a glance" />
         <div class="cp-grid-3">
           <Card>
             <div style={{ fontSize: 11, fontWeight: 600, color: theme.n.textMute, letterSpacing: 0.6, textTransform: 'uppercase' }}>Instances</div>

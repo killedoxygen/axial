@@ -24,7 +24,7 @@ export function DownloadsView(): JSX.Element {
 
       {hasActive ? (
         <Card>
-          <SectionHeading eyebrow="In progress" title={state.versionId} />
+          <SectionHeading title={state.versionId} />
           <div style={{ fontSize: 12, color: theme.n.textDim, marginBottom: 6 }}>{state.label}</div>
           <Meter value={state.pct} />
           <div style={{ fontSize: 11, color: theme.n.textMute, marginTop: 6, textAlign: 'right' }}>
