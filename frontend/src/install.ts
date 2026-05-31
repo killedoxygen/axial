@@ -358,7 +358,7 @@ function phaseLabel(data: InstallProgressEvent, loaderInstall: boolean): string 
     case 'done':
       return 'Complete!';
     case 'error':
-      return data.error || 'Install failed.';
+      return data.error || 'Install failed before Croopor received error details.';
     default:
       if (typeof data.file === 'string' && data.file.trim()) {
         return data.file;
@@ -399,7 +399,7 @@ async function connectVanillaEvents(installId: string, versionId: string): Promi
     } else if (data.phase === 'done') {
       pct = 100;
     } else if (data.phase === 'error') {
-      showError(data.error || 'Install failed.');
+      showError(data.error || 'Install failed before Croopor received error details.');
       await onInstallDone();
       return;
     } else {
@@ -422,7 +422,7 @@ async function connectVanillaEvents(installId: string, versionId: string): Promi
         void onProgress(data);
       },
       () => startNativeInstallEvents(installId),
-      'native install stream unavailable',
+      'Desktop install progress is unavailable.',
     );
     return;
   }
@@ -439,7 +439,7 @@ async function connectVanillaEvents(installId: string, versionId: string): Promi
     if (es.readyState !== EventSource.CLOSED) return;
     void (async () => {
       if (isActiveInstallSource(versionId, es)) {
-        showError('Install event stream closed unexpectedly');
+        showError('Install progress stopped unexpectedly. Retry the install from the launcher.');
         await onInstallDone();
       }
     })();
@@ -491,7 +491,7 @@ async function connectLoaderEvents(installId: string, versionId: string): Promis
     } else if (data.phase === 'done') {
       pct = 100;
     } else if (data.phase === 'error') {
-      onError(data.error || 'Unknown error');
+      onError(data.error || 'Loader install failed before Croopor received error details.');
       return;
     } else {
       pct = installState.value.status === 'active' ? installState.value.pct : 0;
@@ -518,13 +518,13 @@ async function connectLoaderEvents(installId: string, versionId: string): Promis
       nativeLoaderInstallEventName(installId),
       (data) => {
         if (data.phase === 'error' || data.error) {
-          onError(data.error || 'Unknown error');
+          onError(data.error || 'Loader install failed before Croopor received error details.');
           return;
         }
         onProgress(data);
       },
       () => startNativeLoaderInstallEvents(installId),
-      'native loader install stream unavailable',
+      'Desktop loader install progress is unavailable.',
     );
     return;
   }
