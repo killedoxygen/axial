@@ -566,6 +566,17 @@ function logoutErrorMessage(value: unknown): string {
 }
 
 function authRefreshErrorMessage(value: unknown): string {
+  if (isRecord(value)) {
+    if (value.status === 'minecraft_auth_chain_failed') {
+      return 'Croopor could not verify the Minecraft profile or ownership during refresh. Online is not ready. Offline remains available. Re-verify with Microsoft if Online is needed.';
+    }
+    if (value.status === 'sign_in_required') {
+      return 'Microsoft sign-in needs re-verification before Online can be used. Offline remains available.';
+    }
+    if (value.status === 'refresh_failed') {
+      return 'Microsoft sign-in could not be refreshed. Offline remains available. Re-verify with Microsoft if Online is needed.';
+    }
+  }
   return apiErrorMessage(value, 'Could not refresh Microsoft sign-in. Re-verify with Microsoft or use Offline.');
 }
 
