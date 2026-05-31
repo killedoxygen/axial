@@ -348,20 +348,32 @@ async fn handle_open_instance_folder(
         )
     })?;
 
-    std::fs::create_dir_all(&dir).map_err(|error| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": format!("failed to create folder: {error}") })),
-        )
-    })?;
-    open_path(&dir).map_err(|error| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": format!("failed to open folder: {error}") })),
-        )
-    })?;
+    std::fs::create_dir_all(&dir).map_err(instance_folder_prepare_error_response)?;
+    open_path(&dir).map_err(instance_folder_open_error_response)?;
 
     Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+fn instance_folder_prepare_error_response(
+    _error: std::io::Error,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "error": "Could not prepare the instance folder. Check app data permissions and try again."
+        })),
+    )
+}
+
+fn instance_folder_open_error_response(
+    _error: std::io::Error,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "error": "Could not open the instance folder. Check desktop permissions and try again."
+        })),
+    )
 }
 
 fn resolve_instance_folder(game_dir: &FsPath, sub: Option<&str>) -> Result<PathBuf, &'static str> {
@@ -815,6 +827,22 @@ mod tests {
     }
 
     #[test]
+    fn instance_folder_prepare_error_response_bounds_public_message() {
+        assert_instance_folder_error_response_is_bounded(
+            instance_folder_prepare_error_response,
+            "Could not prepare the instance folder. Check app data permissions and try again.",
+        );
+    }
+
+    #[test]
+    fn instance_folder_open_error_response_bounds_public_message() {
+        assert_instance_folder_error_response_is_bounded(
+            instance_folder_open_error_response,
+            "Could not open the instance folder. Check desktop permissions and try again.",
+        );
+    }
+
+    #[test]
     fn instance_folder_resolver_returns_root_when_subfolder_is_omitted() {
         let game_dir = FsPath::new("/tmp/croopor-instance");
 
@@ -1229,6 +1257,36 @@ mod tests {
         body.get("error")
             .and_then(serde_json::Value::as_str)
             .expect("error message should be a string")
+    }
+
+    fn assert_instance_folder_error_response_is_bounded(
+        mapper: fn(io::Error) -> (StatusCode, Json<serde_json::Value>),
+        expected_message: &str,
+    ) {
+        for internal_message in [
+            "failed for /home/zero/.config/Croopor/instances/test/mods",
+            "failed for C:\\Users\\Zero\\AppData\\Roaming\\Croopor\\instances\\test\\logs",
+            "Permission denied (os error 13)",
+        ] {
+            let (status, Json(body)) = mapper(io::Error::other(internal_message));
+
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_bounded_error_body(&body, expected_message);
+            let public_message = error_body_text(&body);
+            for hidden_fragment in [
+                "/home/zero",
+                ".config",
+                "C:\\Users\\Zero",
+                "AppData",
+                "Permission denied",
+                "os error 13",
+            ] {
+                assert!(
+                    !public_message.contains(hidden_fragment),
+                    "{hidden_fragment:?} leaked in {public_message:?}"
+                );
+            }
+        }
     }
 
     struct TestFixture {
