@@ -279,6 +279,10 @@ function guardianOwnsLaunchOutcome(
   return !healing.failure_class && !healing.retry_count;
 }
 
+function guardianOwnsLeadDetail(guardian: GuardianSummary | undefined): boolean {
+  return Boolean(guardian?.decision === 'blocked' && guardian.details && guardian.details.length > 0);
+}
+
 function launchOutcomeDetails(
   guardian: GuardianSummary | undefined,
   healing: LaunchHealingSummary | undefined,
@@ -292,7 +296,7 @@ function launchOutcomeDetails(
   for (const detail of guardianNoticeDetails(guardian)) {
     pushUniqueNoticeDetail(details, detail);
   }
-  if (guardianHasAuthoredDetails) {
+  if (guardianHasAuthoredDetails && !guardianOwnsLeadDetail(guardian)) {
     pushUniqueNoticeDetail(details, leadDetail);
   }
   const includeHealing = !guardianOwnsLaunchOutcome(guardian, healing);
