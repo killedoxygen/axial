@@ -897,19 +897,42 @@ function PerformanceCard({ inst, onOpenSettings }: { inst: EnrichedInstance; onO
     return new Promise((resolve, reject) => {
       let settled = false;
       lifecycleSourceRef.current?.close();
-      lifecycleSourceRef.current = null;
       let source: LifecycleProgressSource | null = null;
+      const controller: LifecycleProgressSource & {
+        closed: boolean;
+        isActive(): boolean;
+        setSource(nextSource: LifecycleProgressSource): void;
+      } = {
+        closed: false,
+        close() {
+          if (this.closed) return;
+          this.closed = true;
+          source?.close();
+        },
+        isActive() {
+          return !this.closed && lifecycleSourceRef.current === this;
+        },
+        setSource(nextSource) {
+          if (this.closed) {
+            nextSource.close();
+            return;
+          }
+          source = nextSource;
+        },
+      };
+      lifecycleSourceRef.current = controller;
 
       const finish = (error?: Error): void => {
         if (settled) return;
         settled = true;
-        source?.close();
-        if (lifecycleSourceRef.current === source) lifecycleSourceRef.current = null;
+        controller.close();
+        if (lifecycleSourceRef.current === controller) lifecycleSourceRef.current = null;
         if (error) reject(error);
         else resolve();
       };
 
       const onProgress = (progress: PerformanceInstallProgress): void => {
+        if (!controller.isActive()) return;
         setLifecycleProgress({
           title: performanceProgressTitle(progress),
           detail: performanceProgressDetail(progress),
@@ -928,10 +951,11 @@ function PerformanceCard({ inst, onOpenSettings }: { inst: EnrichedInstance; onO
               onProgress(data as PerformanceInstallProgress);
             });
             if (!subscription) throw new Error('native install stream unavailable');
-            source = subscription;
-            lifecycleSourceRef.current = subscription;
+            controller.setSource(subscription);
+            if (!controller.isActive()) return;
             await startNativeInstallEvents(installId);
           } catch (err) {
+            if (!controller.isActive()) return;
             finish(err instanceof Error ? err : new Error(errMessage(err)));
           }
         })();
@@ -939,8 +963,7 @@ function PerformanceCard({ inst, onOpenSettings }: { inst: EnrichedInstance; onO
       }
 
       const es = new EventSource(apiUrl(`/install/${encodeURIComponent(installId)}/events`));
-      source = es;
-      lifecycleSourceRef.current = es;
+      controller.setSource(es);
 
       es.addEventListener('progress', (event: MessageEvent) => {
         try {
@@ -951,7 +974,7 @@ function PerformanceCard({ inst, onOpenSettings }: { inst: EnrichedInstance; onO
       });
 
       es.onerror = () => {
-        if (settled || es.readyState !== EventSource.CLOSED) return;
+        if (settled || !controller.isActive() || es.readyState !== EventSource.CLOSED) return;
         finish(new Error('Performance update stream closed unexpectedly'));
       };
     });
