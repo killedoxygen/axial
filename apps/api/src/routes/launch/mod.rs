@@ -11,7 +11,7 @@ use axum::{
     http::StatusCode,
     routing::{get, post},
 };
-use croopor_launcher::{LaunchSessionRecord, LaunchState, snapshot_status};
+use croopor_launcher::{GuardianDecision, LaunchSessionRecord, LaunchState, snapshot_status};
 use serde::Deserialize;
 use serde_json::json;
 use std::time::Duration;
@@ -115,16 +115,7 @@ async fn handle_launch(
     let prepared = task::prepare_launch_session(&state, payload).await?;
     let launched = runner::launch_session(state.clone(), prepared.task)
         .await
-        .map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "error": error.message,
-                    "healing": error.healing,
-                    "guardian": error.guardian,
-                })),
-            )
-        })?;
+        .map_err(launch_request_error_response)?;
 
     Ok(Json(launch_success_response_payload(&launched)))
 }
@@ -399,16 +390,7 @@ async fn handle_benchmark_launch(
     prepared.task.benchmark = Some(benchmark.clone());
     let launched = runner::launch_session(state.clone(), prepared.task)
         .await
-        .map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "error": error.message,
-                    "healing": error.healing,
-                    "guardian": error.guardian,
-                })),
-            )
-        })?;
+        .map_err(launch_request_error_response)?;
 
     let mut response = launch_success_response_payload(&launched);
     response["benchmark"] = benchmark_response;
@@ -651,16 +633,7 @@ async fn launch_benchmark_suite_run(
     prepared.task.benchmark = Some(benchmark.clone());
     let launched = runner::launch_session(state.clone(), prepared.task)
         .await
-        .map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "error": error.message,
-                    "healing": error.healing,
-                    "guardian": error.guardian,
-                })),
-            )
-        })?;
+        .map_err(launch_request_error_response)?;
     let manifest_runs = benchmark_suite_manifest_run_inputs(&input.mode, &input.plan);
     crate::state::benchmark_suites::persist_launched_run(
         state.config().paths(),
@@ -945,6 +918,32 @@ fn internal_error(error: std::io::Error) -> (StatusCode, Json<serde_json::Value>
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(json!({ "error": error.to_string() })),
     )
+}
+
+fn launch_request_error_response(
+    error: runner::LaunchRequestError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let status = launch_request_error_status(&error);
+    (
+        status,
+        Json(json!({
+            "error": error.message,
+            "healing": error.healing,
+            "guardian": error.guardian,
+        })),
+    )
+}
+
+fn launch_request_error_status(error: &runner::LaunchRequestError) -> StatusCode {
+    if error
+        .guardian
+        .as_ref()
+        .is_some_and(|guardian| guardian.decision == GuardianDecision::Blocked)
+    {
+        StatusCode::UNPROCESSABLE_ENTITY
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
 }
 
 fn trimmed_string(value: &str) -> Option<String> {
@@ -2299,6 +2298,40 @@ mod tests {
         assert_eq!(payload["status"], serde_json::json!("launching"));
         assert_eq!(payload["max_memory_mb"], serde_json::json!(6144));
         assert_eq!(payload["min_memory_mb"], serde_json::json!(1024));
+    }
+
+    #[test]
+    fn launch_request_error_status_maps_guardian_blocked_to_unprocessable_entity() {
+        let error = launch_request_error(Some(GuardianDecision::Blocked));
+
+        assert_eq!(
+            launch_request_error_status(&error),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        let response = launch_request_error_response(error);
+        assert_eq!(response.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(response.1.0["error"], serde_json::json!("launch rejected"));
+        assert_eq!(
+            response.1.0["guardian"]["decision"],
+            serde_json::json!("blocked")
+        );
+    }
+
+    #[test]
+    fn launch_request_error_status_keeps_non_guardian_blocked_errors_internal() {
+        for error in [
+            launch_request_error(None),
+            launch_request_error(Some(GuardianDecision::Warned)),
+        ] {
+            assert_eq!(
+                launch_request_error_status(&error),
+                StatusCode::INTERNAL_SERVER_ERROR
+            );
+            assert_eq!(
+                launch_request_error_response(error).0,
+                StatusCode::INTERNAL_SERVER_ERROR
+            );
+        }
     }
 
     #[test]
@@ -5060,6 +5093,21 @@ mod tests {
             } else {
                 "pending".to_string()
             },
+        }
+    }
+
+    fn launch_request_error(decision: Option<GuardianDecision>) -> runner::LaunchRequestError {
+        runner::LaunchRequestError {
+            message: "launch rejected".to_string(),
+            healing: None,
+            guardian: decision.map(|decision| croopor_launcher::GuardianSummary {
+                mode: croopor_launcher::GuardianMode::Managed,
+                decision,
+                message: None,
+                details: Vec::new(),
+                guidance: Vec::new(),
+                interventions: Vec::new(),
+            }),
         }
     }
 

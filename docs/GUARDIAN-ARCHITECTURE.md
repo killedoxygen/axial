@@ -195,6 +195,7 @@ The preferred shape is:
 
 Current launcher behavior:
 - `GET /api/v1/launch/preflight/{instance_id}` returns a read-only Guardian preflight for the instance overview. It reuses launch preparation policy for effective memory, memory clamp and low-allocation warnings, resource pressure warnings, Guardian mode, and override origins, but it does not launch Minecraft, create a session, install files, ensure instance layout, write proof state, or expose paths, command lines, raw JVM args, account names, usernames, or tokens.
+- Launch routes return HTTP `422 Unprocessable Entity` when a launch request fails because Guardian authored a `blocked` decision. The response body keeps the normal bounded launch-error JSON shape with Guardian details; non-Guardian launch request failures remain server errors unless a route has a more specific status.
 - Guardian `message` is preferred for launch notices when present
 - blocked Guardian `details` include the bounded backend-authored failure reason before guidance when one is available
 - Guardian `details` are preferred over frontend-synthesized intervention/guidance copy
