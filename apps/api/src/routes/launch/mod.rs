@@ -30,6 +30,8 @@ const FAMILY_C_QUALIFICATION_LOADER: &str = "Forge";
 const FAMILY_C_BASELINE_TARGET_ID: &str = "family_c_forge_1_12_2_vanilla_baseline";
 const FAMILY_C_MANAGED_TARGET_ID: &str = "family_c_forge_1_12_2_family_c_forge_core";
 const FAMILY_C_MANAGED_COMPOSITION_ID: &str = "family-c-forge-core";
+const FAMILY_C_COMPARISON_STAGE_METRIC_NAME: &str = "total_completed_stage_duration_ms";
+const FAMILY_C_COMPARISON_BOOT_METRIC_NAME: &str = "boot_duration_ms";
 const FAMILY_C_MANAGED_EXPECTED_ARTIFACTS: [(&str, &str, &str); 3] = [
     ("foamfix", "jupr7Bf5", "foamfix"),
     ("ai-improvements", "DSVgwcji", "ai-improvements"),
@@ -1323,11 +1325,15 @@ fn family_c_qualification_manifest_payload(
 ) -> serde_json::Value {
     let [baseline_target, managed_target] = family_c_qualification_targets();
     let [baseline_extra_missing, managed_extra_missing] = extra_missing;
+    let baseline_proof_session_id =
+        family_c_qualification_target_proof(baseline_target, manifest, proofs)
+            .map(|proof| proof.session_id.as_str());
     let baseline = family_c_qualification_target_payload(
         state,
         baseline_target,
         manifest,
         proofs,
+        baseline_proof_session_id,
         &baseline_extra_missing,
     );
     let managed = family_c_qualification_target_payload(
@@ -1335,6 +1341,7 @@ fn family_c_qualification_manifest_payload(
         managed_target,
         manifest,
         proofs,
+        baseline_proof_session_id,
         &managed_extra_missing,
     );
     let status = if family_c_qualification_target_ready(&baseline)
@@ -1398,6 +1405,7 @@ fn family_c_qualification_target_payload(
     target: FamilyCQualificationTarget,
     manifest: &crate::state::benchmark_suites::BenchmarkSuiteManifest,
     proofs: &[crate::state::launch_reports::LaunchProofRecord],
+    baseline_proof_session_id: Option<&str>,
     extra_missing: &[&'static str],
 ) -> serde_json::Value {
     let mut missing = Vec::new();
@@ -1463,8 +1471,28 @@ fn family_c_qualification_target_payload(
             if !family_c_qualification_outcome_is_acceptable(&proof.outcome) {
                 missing.push("proof_outcome_not_comparable");
             }
-            if target.comparison_required && proof.comparison.is_none() {
-                missing.push("managed_comparison_missing");
+            if target.comparison_required {
+                match proof.comparison.as_ref() {
+                    Some(comparison) => {
+                        let evidence = family_c_qualification_managed_comparison_evidence(
+                            comparison,
+                            baseline_proof_session_id,
+                        );
+                        if !evidence.baseline_matches {
+                            missing.push("managed_comparison_baseline_mismatch");
+                        }
+                        if !evidence.metric_valid {
+                            missing.push("managed_comparison_metric_missing");
+                        }
+                        if !evidence.samples_present {
+                            missing.push("managed_comparison_sample_missing");
+                        }
+                        if !evidence.values_present {
+                            missing.push("managed_comparison_value_missing");
+                        }
+                    }
+                    None => missing.push("managed_comparison_missing"),
+                }
             }
             match proof.resource_budget.as_ref() {
                 Some(resource_budget) => {
@@ -1517,7 +1545,7 @@ fn family_c_qualification_target_payload(
             "performance_mode": target.performance_mode,
         },
         "suite_run": family_c_qualification_suite_run_payload(run),
-        "proof": family_c_qualification_proof_payload(proof),
+        "proof": family_c_qualification_proof_payload(proof, target, baseline_proof_session_id),
         "managed_install": managed_install.payload,
         "missing": missing,
     })
@@ -1651,6 +1679,18 @@ fn family_c_managed_expected_artifacts_present(
         })
 }
 
+fn family_c_qualification_target_proof<'a>(
+    target: FamilyCQualificationTarget,
+    manifest: &crate::state::benchmark_suites::BenchmarkSuiteManifest,
+    proofs: &'a [crate::state::launch_reports::LaunchProofRecord],
+) -> Option<&'a crate::state::launch_reports::LaunchProofRecord> {
+    manifest
+        .runs
+        .iter()
+        .find(|run| run.target_id.trim() == target.target_id)
+        .and_then(|run| family_c_qualification_matching_proof(run, proofs))
+}
+
 fn family_c_qualification_matching_proof<'a>(
     run: &crate::state::benchmark_suites::BenchmarkSuiteManifestRun,
     proofs: &'a [crate::state::launch_reports::LaunchProofRecord],
@@ -1669,6 +1709,30 @@ fn family_c_qualification_matching_proof<'a>(
                 .as_deref()
                 .is_some_and(|benchmark_id| benchmark_id.contains(run.target_id.as_str()))
     })
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FamilyCManagedComparisonEvidence {
+    baseline_matches: bool,
+    metric_valid: bool,
+    samples_present: bool,
+    values_present: bool,
+}
+
+fn family_c_qualification_managed_comparison_evidence(
+    comparison: &crate::state::launch_reports::LaunchProofComparison,
+    baseline_proof_session_id: Option<&str>,
+) -> FamilyCManagedComparisonEvidence {
+    FamilyCManagedComparisonEvidence {
+        baseline_matches: baseline_proof_session_id
+            .is_some_and(|session_id| comparison.baseline_session_id == session_id),
+        metric_valid: matches!(
+            comparison.metric_name.as_str(),
+            FAMILY_C_COMPARISON_STAGE_METRIC_NAME | FAMILY_C_COMPARISON_BOOT_METRIC_NAME
+        ),
+        samples_present: comparison.matched_sample_count > 0,
+        values_present: comparison.baseline_value_ms > 0 && comparison.current_value_ms > 0,
+    }
 }
 
 fn family_c_qualification_suite_run_payload(
@@ -1692,12 +1756,14 @@ fn family_c_qualification_suite_run_payload(
 
 fn family_c_qualification_proof_payload(
     proof: Option<&crate::state::launch_reports::LaunchProofRecord>,
+    target: FamilyCQualificationTarget,
+    baseline_proof_session_id: Option<&str>,
 ) -> serde_json::Value {
     let Some(proof) = proof else {
         return json!({ "present": false });
     };
     let comparison = proof.comparison.as_ref().map(|comparison| {
-        json!({
+        let mut payload = json!({
             "present": true,
             "baseline_session_id": bounded_descriptor_token(
                 &comparison.baseline_session_id,
@@ -1705,7 +1771,18 @@ fn family_c_qualification_proof_payload(
             ),
             "metric_name": bounded_descriptor_token(&comparison.metric_name, "metric"),
             "matched_sample_count": comparison.matched_sample_count,
-        })
+        });
+        if target.comparison_required {
+            let evidence = family_c_qualification_managed_comparison_evidence(
+                comparison,
+                baseline_proof_session_id,
+            );
+            payload["baseline_matches"] = json!(evidence.baseline_matches);
+            payload["metric_valid"] = json!(evidence.metric_valid);
+            payload["samples_present"] = json!(evidence.samples_present);
+            payload["values_present"] = json!(evidence.values_present);
+        }
+        payload
     });
 
     json!({
@@ -2898,6 +2975,22 @@ mod tests {
             serde_json::json!(true)
         );
         assert_eq!(
+            payload["targets"][1]["proof"]["comparison"]["baseline_matches"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            payload["targets"][1]["proof"]["comparison"]["metric_valid"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            payload["targets"][1]["proof"]["comparison"]["samples_present"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            payload["targets"][1]["proof"]["comparison"]["values_present"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
             payload["targets"][0]["proof"]["resource_budget"],
             serde_json::json!({
                 "present": true,
@@ -2929,6 +3022,78 @@ mod tests {
         );
         assert_eq!(payload["targets"][0]["missing"], serde_json::json!([]));
         assert_eq!(payload["targets"][1]["missing"], serde_json::json!([]));
+
+        cleanup(&fixture.root);
+    }
+
+    #[tokio::test]
+    async fn family_c_qualification_managed_comparison_must_match_suite_baseline() {
+        let fixture = RouteTestFixture::new("family-c-qualification-wrong-comparison-baseline");
+        let suite_id = "family-c-qualification-wrong-comparison-baseline";
+        let instance_id = fixture.add_instance("Family C", FAMILY_C_QUALIFICATION_VERSION);
+        persist_family_c_suite_run(
+            &fixture.paths,
+            suite_id,
+            &instance_id,
+            0,
+            "baseline-session",
+        );
+        persist_family_c_suite_run(&fixture.paths, suite_id, &instance_id, 1, "managed-session");
+        let manifest = crate::state::benchmark_suites::load(&fixture.paths, suite_id)
+            .expect("load suite")
+            .expect("suite exists");
+        let baseline_run = manifest
+            .runs
+            .iter()
+            .find(|run| run.target_id == FAMILY_C_BASELINE_TARGET_ID)
+            .expect("baseline run");
+        let managed_run = manifest
+            .runs
+            .iter()
+            .find(|run| run.target_id == FAMILY_C_MANAGED_TARGET_ID)
+            .expect("managed run");
+        write_family_c_proof(&fixture.paths, baseline_run, &instance_id, "vanilla", None);
+        let mut comparison = family_c_comparison();
+        comparison.baseline_session_id = "unrelated-baseline-session".to_string();
+        write_family_c_proof(
+            &fixture.paths,
+            managed_run,
+            &instance_id,
+            "managed",
+            Some(comparison),
+        );
+        write_family_c_managed_state(&fixture, &instance_id);
+
+        let payload = family_c_qualification_payload(&fixture.state, suite_id)
+            .await
+            .expect("qualification payload");
+
+        assert_eq!(payload["status"], serde_json::json!("incomplete"));
+        assert_eq!(payload["targets"][0]["missing"], serde_json::json!([]));
+        assert_eq!(
+            payload["targets"][1]["missing"],
+            serde_json::json!(["managed_comparison_baseline_mismatch"])
+        );
+        assert_eq!(
+            payload["targets"][1]["proof"]["comparison"]["present"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            payload["targets"][1]["proof"]["comparison"]["baseline_matches"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            payload["targets"][1]["proof"]["comparison"]["metric_valid"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            payload["targets"][1]["proof"]["comparison"]["samples_present"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            payload["targets"][1]["proof"]["comparison"]["values_present"],
+            serde_json::json!(true)
+        );
 
         cleanup(&fixture.root);
     }
