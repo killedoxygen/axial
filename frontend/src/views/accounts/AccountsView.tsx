@@ -1,7 +1,7 @@
 import type { JSX } from 'preact';
-import { useCallback, useEffect, useState } from 'preact/hooks';
-import { api, apiResourceUrl, isApiError } from '../../api';
-import { Button, Card, Input, Pill, SectionHeading } from '../../ui/Atoms';
+import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
+import { api, apiResourceUrl, apiUrl, isApiError } from '../../api';
+import { Button, Card, Input, Pill, SectionHeading, Segmented } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { PlayerHeadPreview } from '../../ui/PlayerHeadPreview';
 import { useTheme } from '../../hooks/use-theme';
@@ -109,6 +109,17 @@ type AuthPollResponse = AuthPollPending | AuthPollAuthenticatedRecord | AuthPoll
 type OfflineProfileState = 'loading' | 'ready' | 'unavailable';
 type AuthStatusState = 'loading' | 'ready' | 'unavailable';
 type CopyTarget = 'code' | 'url';
+type SkinVariant = 'classic' | 'slim';
+
+interface SavedSkinRecord {
+  texture_key: string;
+  name: string;
+  variant: SkinVariant;
+  source: string;
+  created_at: string;
+  updated_at: string;
+  byte_size: number;
+}
 
 function PlayerIdentityEditor({
   savedUsername,
@@ -311,6 +322,49 @@ function useAuthStatus(savedUsername: string): {
   return { status, state, refresh };
 }
 
+function useSavedSkins(): {
+  skins: SavedSkinRecord[];
+  state: AuthStatusState;
+  error: string | null;
+  refresh: () => void;
+} {
+  const [skins, setSkins] = useState<SavedSkinRecord[]>([]);
+  const [state, setState] = useState<AuthStatusState>('loading');
+  const [error, setError] = useState<string | null>(null);
+  const [refreshIndex, setRefreshIndex] = useState(0);
+
+  const refresh = useCallback(() => {
+    setRefreshIndex((value) => value + 1);
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    setState('loading');
+    setError(null);
+
+    void api('GET', '/skins')
+      .then((res: unknown) => {
+        if (!active) return;
+        const parsed = savedSkinsResponse(res);
+        if (!parsed) throw new Error('invalid saved skins response');
+        setSkins(parsed);
+        setState('ready');
+      })
+      .catch((err: unknown) => {
+        if (!active) return;
+        setSkins([]);
+        setState('unavailable');
+        setError(err instanceof Error ? err.message : 'Saved skins are unavailable.');
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [refreshIndex]);
+
+  return { skins, state, error, refresh };
+}
+
 function skinSourceLabel(source: string, authMode: string): string {
   if (source === 'minecraft_profile_skin') return 'Minecraft profile skin';
   if (authMode === 'online') return 'Default skin';
@@ -383,7 +437,7 @@ function PlayerIdentityCard({ savedUsername }: { savedUsername: string }): JSX.E
 
   return (
     <Card>
-      <SectionHeading eyebrow="Player" title="Identity" />
+      <SectionHeading title="Identity" />
       <PlayerIdentityEditor
         key={savedUsername}
         savedUsername={savedUsername}
@@ -454,6 +508,36 @@ function minecraftCape(value: unknown): MinecraftCape | null {
     state: value.state,
     url: value.url,
   };
+}
+
+function savedSkinRecord(value: unknown): SavedSkinRecord | null {
+  if (!isRecord(value)) return null;
+  if (
+    typeof value.texture_key !== 'string' ||
+    typeof value.name !== 'string' ||
+    (value.variant !== 'classic' && value.variant !== 'slim') ||
+    typeof value.source !== 'string' ||
+    typeof value.created_at !== 'string' ||
+    typeof value.updated_at !== 'string' ||
+    typeof value.byte_size !== 'number'
+  ) {
+    return null;
+  }
+
+  return {
+    texture_key: value.texture_key,
+    name: value.name,
+    variant: value.variant,
+    source: value.source,
+    created_at: value.created_at,
+    updated_at: value.updated_at,
+    byte_size: value.byte_size,
+  };
+}
+
+function savedSkinsResponse(value: unknown): SavedSkinRecord[] | null {
+  if (!isRecord(value) || !Array.isArray(value.skins)) return null;
+  return value.skins.map(savedSkinRecord).filter((skin): skin is SavedSkinRecord => Boolean(skin));
 }
 
 function minecraftProfile(value: unknown): MinecraftProfile | undefined {
@@ -1359,7 +1443,6 @@ function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Elem
   return (
     <Card>
       <SectionHeading
-        eyebrow="Account"
         title="Minecraft account"
         right={(
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
@@ -1585,7 +1668,6 @@ function SkinRestorerHelper({ savedUsername }: { savedUsername: string }): JSX.E
   return (
     <Card>
       <SectionHeading
-        eyebrow="Skins"
         title="Server skin helper"
         right={<Pill tone="neutral" icon="terminal">SkinRestorer</Pill>}
       />
@@ -1679,6 +1761,227 @@ function SkinRestorerHelper({ savedUsername }: { savedUsername: string }): JSX.E
   );
 }
 
+function SavedSkinLibrary(): JSX.Element {
+  const theme = useTheme();
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const { skins, state, error, refresh } = useSavedSkins();
+  const [skinName, setSkinName] = useState('');
+  const [variant, setVariant] = useState<SkinVariant>('classic');
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+  const [deleteKey, setDeleteKey] = useState<string | null>(null);
+  const trimmedName = skinName.trim();
+  const canUpload = !busy && trimmedName.length > 0;
+
+  const upload = async (file: File): Promise<void> => {
+    const name = trimmedName || file.name.replace(/\.[^.]+$/, '').trim();
+    if (!name) {
+      setMessage('Name the skin before uploading.');
+      return;
+    }
+
+    setBusy(true);
+    setMessage(null);
+    try {
+      const params = new URLSearchParams({ name, variant });
+      const response = await fetch(apiUrl(`/skins?${params.toString()}`), {
+        method: 'POST',
+        headers: { 'Content-Type': 'image/png' },
+        body: file,
+      });
+      const payload = await response.json().catch(() => undefined);
+      if (!response.ok) {
+        throw new Error(readApiPayloadMessage(payload, `Upload failed with HTTP ${response.status}`));
+      }
+      setSkinName('');
+      refresh();
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : 'Could not save skin.');
+    } finally {
+      setBusy(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  };
+
+  const deleteSkin = async (textureKey: string): Promise<void> => {
+    setDeleteKey(textureKey);
+    setMessage(null);
+    try {
+      await api('DELETE', `/skins/${textureKey}`);
+      refresh();
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : 'Could not delete skin.');
+    } finally {
+      setDeleteKey(null);
+    }
+  };
+
+  return (
+    <Card>
+      <SectionHeading
+        title="Saved skins"
+        right={<Pill tone="neutral" icon="image">{state === 'ready' ? String(skins.length) : '...'}</Pill>}
+      />
+      <div style={{ display: 'grid', gap: 16 }}>
+        <div style={{
+          display: 'grid',
+          gridTemplateColumns: 'minmax(220px, 1fr) auto auto',
+          gap: 10,
+          alignItems: 'center',
+        }}>
+          <Input
+            value={skinName}
+            onChange={(value) => {
+              setSkinName(value.slice(0, 64));
+              setMessage(null);
+            }}
+            placeholder="Skin name"
+            icon="tag"
+          />
+          <Segmented<SkinVariant>
+            options={[
+              { value: 'classic', label: 'Classic' },
+              { value: 'slim', label: 'Slim' },
+            ]}
+            value={variant}
+            onChange={setVariant}
+          />
+          <Button
+            variant="secondary"
+            icon="upload"
+            disabled={!canUpload}
+            onClick={() => fileInputRef.current?.click()}
+          >
+            Upload PNG
+          </Button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/png"
+            style={{ display: 'none' }}
+            onChange={(event) => {
+              const file = event.currentTarget.files?.[0];
+              if (file) void upload(file);
+            }}
+          />
+        </div>
+
+        {message && (
+          <div style={{
+            color: 'var(--err)',
+            fontSize: 12,
+            fontWeight: 500,
+            lineHeight: 1.4,
+          }}>
+            {message}
+          </div>
+        )}
+
+        {state === 'unavailable' && (
+          <div style={{ color: 'var(--err)', fontSize: 12, fontWeight: 500 }}>
+            {error || 'Saved skins are unavailable.'}
+          </div>
+        )}
+
+        <div style={{
+          border: '1px solid var(--line)',
+          borderRadius: theme.r.md,
+          overflow: 'hidden',
+          background: theme.n.surface2,
+        }}>
+          {state === 'loading' ? (
+            <div style={{ padding: 14, color: theme.n.textMute, fontSize: 13, fontWeight: 500 }}>
+              Loading saved skins...
+            </div>
+          ) : skins.length === 0 ? (
+            <div style={{ padding: 14, color: theme.n.textMute, fontSize: 13, fontWeight: 500 }}>
+              No saved skins yet.
+            </div>
+          ) : (
+            skins.map((skin, index) => (
+              <div
+                key={skin.texture_key}
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: '42px minmax(0, 1fr) auto auto',
+                  gap: 12,
+                  alignItems: 'center',
+                  padding: '10px 12px',
+                  borderTop: index === 0 ? undefined : '1px solid var(--line)',
+                }}
+              >
+                <img
+                  src={apiResourceUrl(`/skins/${skin.texture_key}/file`)}
+                  alt=""
+                  width={32}
+                  height={32}
+                  style={{
+                    width: 32,
+                    height: 32,
+                    objectFit: 'cover',
+                    imageRendering: 'pixelated',
+                    border: '1px solid var(--line)',
+                    borderRadius: theme.r.sm,
+                    background: theme.n.surface,
+                  }}
+                />
+                <div style={{ minWidth: 0 }}>
+                  <div style={{
+                    color: theme.n.text,
+                    fontSize: 13,
+                    fontWeight: 700,
+                    lineHeight: 1.25,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                  }}>
+                    {skin.name}
+                  </div>
+                  <div style={{
+                    color: theme.n.textMute,
+                    fontSize: 11,
+                    fontWeight: 500,
+                    lineHeight: 1.35,
+                    fontFamily: theme.font.mono,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                  }}>
+                    {skin.texture_key.slice(0, 12)} / {formatByteSize(skin.byte_size)}
+                  </div>
+                </div>
+                <Pill tone="neutral">{skin.variant}</Pill>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  icon="trash"
+                  disabled={deleteKey === skin.texture_key}
+                  onClick={() => void deleteSkin(skin.texture_key)}
+                >
+                  Delete
+                </Button>
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+    </Card>
+  );
+}
+
+function readApiPayloadMessage(payload: unknown, fallback: string): string {
+  if (isRecord(payload) && typeof payload.error === 'string' && payload.error.trim()) {
+    return payload.error.trim();
+  }
+  return fallback;
+}
+
+function formatByteSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return '0 B';
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
+  return `${(bytes / 1024).toFixed(1)} KiB`;
+}
+
 export function AccountsView(): JSX.Element {
   const cfg = config.value;
   const savedUsername = cfg?.username || 'Player';
@@ -1695,6 +1998,8 @@ export function AccountsView(): JSX.Element {
       <PlayerIdentityCard savedUsername={savedUsername} />
 
       <AccountBoundary savedUsername={savedUsername} />
+
+      <SavedSkinLibrary />
 
       <SkinRestorerHelper savedUsername={savedUsername} />
     </div>
