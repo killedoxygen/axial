@@ -113,7 +113,7 @@ Guardian should produce one normalized outcome for the pipeline:
 ### Pre-launch
 1. Route builds `LaunchIntent`
 2. `LaunchGuardianContext` is assembled from config + instance overrides
-3. preparation checks selected memory bounds, low effective maximum memory allocation, host resource pressure from memory headroom, active launch count, CPU thread count, best-effort CPU load averages, active install/download sessions, and launch-relevant disk free space
+3. preparation captures selected memory bounds, host resource observations, active launch/install counts, CPU thread/load observations, and launch-relevant disk free space as Guardian warning facts
 4. preparation gathers runtime and override facts
 5. Guardian evaluates those facts
 6. Guardian either:
@@ -194,7 +194,7 @@ The preferred shape is:
 - UI copy is backend-authored as much as possible through `guardian.message` and `guardian.details`
 
 Current launcher behavior:
-- `GET /api/v1/launch/preflight/{instance_id}` returns a read-only Guardian preflight for the instance overview. It reuses launch preparation policy for effective memory, memory clamp and low-allocation warnings, resource pressure warnings, Guardian mode, and override origins, but it does not launch Minecraft, create a session, install files, ensure instance layout, write proof state, or expose paths, command lines, raw JVM args, account names, usernames, or tokens.
+- `GET /api/v1/launch/preflight/{instance_id}` returns a read-only Guardian preflight for the instance overview. It reuses launch preparation fact gathering for effective memory, Guardian-owned memory clamp, low-allocation, resource pressure, and Custom override warnings, Guardian mode, and override origins, but it does not launch Minecraft, create a session, install files, ensure instance layout, write proof state, or expose paths, command lines, raw JVM args, account names, usernames, or tokens.
 - Launch routes return HTTP `422 Unprocessable Entity` when a launch request fails because Guardian authored a `blocked` decision. The response body keeps the normal bounded launch-error JSON shape with Guardian details; non-Guardian launch request failures remain server errors unless a route has a more specific status.
 - Guardian `message` is preferred for launch notices when present
 - blocked Guardian `details` include the bounded backend-authored failure reason before guidance when one is available
@@ -213,7 +213,7 @@ Current launcher behavior:
 - no frontend reinterpretation of policy when backend already decided it
 
 ## Known gaps
-- some policy still leaks into runtime/prepare/Healing/session heuristics, while the instance overview preflight now renders bounded backend-authored facts instead of inferring launch-safety copy locally
+- some policy still leaks into runtime/prepare/Healing/session heuristics, while the instance overview preflight now renders bounded Guardian-authored warning summaries from backend-captured facts instead of inferring launch-safety copy locally
 - `warned` now covers min-memory clamp, very low launch allocation, memory pressure, conservative CPU/load/install/disk pressure, and Custom-mode risky overrides, but broader warning-only launch-safety paths are not normalized yet
 - the API still exposes Guardian and Healing as separate top-level payload pieces, though Guardian now carries normalized message/details and session stage telemetry preserves those details
 

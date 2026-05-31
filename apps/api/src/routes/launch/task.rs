@@ -5,25 +5,20 @@ use crate::logging::timestamp_utc;
 use crate::routes::auth::{
     AuthLoginConfig, AuthRefreshFailure, MSA_TOKEN_ENDPOINT, refresh_active_auth_for_config,
 };
-use crate::state::launch_reports::{
-    LAUNCH_DISK_HEADROOM_MB, LaunchBenchmarkMetadata, LaunchProofResourceBudget,
-};
+use crate::state::launch_reports::{LaunchBenchmarkMetadata, LaunchProofResourceBudget};
 use crate::state::{ActiveMinecraftAccountState, AppState, LaunchSessionRecord};
 use axum::{Json, http::StatusCode};
 use croopor_config::{AppConfig, Instance, LAUNCH_AUTH_MODE_ONLINE, validate_username};
 use croopor_launcher::{
-    GuardianMode, GuardianSummary, LaunchAuthContext, LaunchFailureClass, LaunchGuardianContext,
-    LaunchIntent, LaunchState, failure_class_name,
+    GuardianMode, GuardianSummary, LAUNCH_DISK_HEADROOM_MB, LAUNCH_MEMORY_HEADROOM_MB,
+    LaunchAuthContext, LaunchCpuLoadWarningFacts, LaunchFailureClass, LaunchGuardianContext,
+    LaunchIntent, LaunchResourceWarningFacts, LaunchState, LaunchWarningFacts, failure_class_name,
+    summarize_launch_warnings,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use sysinfo::{Disks, ProcessRefreshKind, ProcessesToUpdate, System, get_current_pid};
-
-const OS_MEMORY_HEADROOM_MB: u64 = 2048;
-const LOW_MEMORY_ALLOCATION_WARNING_THRESHOLD_MB: i32 = 2048;
-const MEMORY_CLAMP_WARNING: &str = "Minimum memory was higher than maximum memory, so Croopor clamped the launch minimum to match the maximum allocation.";
-const MEMORY_CLAMP_GUIDANCE: &str = "Lower the minimum memory setting or raise the maximum memory allocation if this was intentional.";
 
 #[derive(Clone, Debug, Deserialize)]
 pub(super) struct LaunchRequest {
@@ -474,29 +469,14 @@ fn guardian_summary_for_preflight(
     resource_budget: &LaunchProofResourceBudget,
     guardian: &LaunchGuardianContext,
 ) -> GuardianSummary {
-    let mut guardian_summary = GuardianSummary::new(guardian.mode);
-    if let Some(guidance) = memory_clamp_warning_guidance(raw_min_memory_mb, max_memory_mb) {
-        guardian_summary.warn_with_guidance(guidance);
-    }
-    if let Some(guidance) = low_memory_allocation_warning_guidance(max_memory_mb) {
-        guardian_summary.warn_with_guidance(guidance);
-    }
-    if let Some(guidance) = memory_budget_warning_guidance(resource_budget) {
-        guardian_summary.warn_with_guidance(guidance);
-    }
-    if let Some(guidance) = cpu_pressure_warning_guidance(resource_budget) {
-        guardian_summary.warn_with_guidance(guidance);
-    }
-    if let Some(guidance) = install_pressure_warning_guidance(resource_budget) {
-        guardian_summary.warn_with_guidance(guidance);
-    }
-    if let Some(guidance) = disk_pressure_warning_guidance(resource_budget) {
-        guardian_summary.warn_with_guidance(guidance);
-    }
-    if let Some(guidance) = custom_risky_override_warning_guidance(guardian) {
-        guardian_summary.warn_with_guidance(guidance);
-    }
-    guardian_summary
+    summarize_launch_warnings(
+        guardian,
+        &LaunchWarningFacts {
+            raw_min_memory_mb,
+            max_memory_mb,
+            resource: launch_resource_warning_facts(resource_budget),
+        },
+    )
 }
 
 impl LaunchPreflightFacts {
@@ -667,6 +647,22 @@ fn capture_resource_budget_snapshot(
     requested_allocation_mb: i32,
 ) -> LaunchProofResourceBudget {
     let requested_memory_mb = positive_i32(requested_allocation_mb);
+    let warning_facts = LaunchResourceWarningFacts {
+        host_total_memory_mb: memory_evidence.host_total_memory_mb,
+        host_cpu_threads,
+        cpu_load: LaunchCpuLoadWarningFacts {
+            host_cpu_load_1m_x100: cpu_load_evidence.host_cpu_load_1m_x100,
+            host_cpu_load_5m_x100: cpu_load_evidence.host_cpu_load_5m_x100,
+            host_cpu_load_15m_x100: cpu_load_evidence.host_cpu_load_15m_x100,
+        },
+        active_session_count,
+        active_install_count,
+        active_memory_allocation_mb,
+        requested_memory_mb,
+        launch_disk_available_mb: disk_evidence.launch_disk_available_mb,
+        memory_headroom_mb: LAUNCH_MEMORY_HEADROOM_MB,
+        launch_disk_headroom_mb: LAUNCH_DISK_HEADROOM_MB,
+    };
     LaunchProofResourceBudget {
         host_total_memory_mb: memory_evidence.host_total_memory_mb,
         host_available_memory_mb: memory_evidence.host_available_memory_mb,
@@ -685,17 +681,34 @@ fn capture_resource_budget_snapshot(
             active_memory_allocation_mb,
             requested_memory_mb,
         ),
-        memory_headroom_mb: OS_MEMORY_HEADROOM_MB,
-        memory_pressure: memory_budget_pressure(
-            memory_evidence.host_total_memory_mb,
-            active_memory_allocation_mb,
-            requested_memory_mb,
-        ),
-        cpu_pressure: cpu_pressure(host_cpu_threads, active_session_count, cpu_load_evidence),
-        install_pressure: active_install_count > 0,
+        memory_headroom_mb: LAUNCH_MEMORY_HEADROOM_MB,
+        memory_pressure: warning_facts.memory_pressure(),
+        cpu_pressure: warning_facts.cpu_pressure(),
+        install_pressure: warning_facts.install_pressure(),
         launch_disk_available_mb: disk_evidence.launch_disk_available_mb,
         launch_disk_headroom_mb: LAUNCH_DISK_HEADROOM_MB,
-        disk_pressure: disk_pressure(disk_evidence.launch_disk_available_mb),
+        disk_pressure: warning_facts.disk_pressure(),
+    }
+}
+
+fn launch_resource_warning_facts(
+    resource_budget: &LaunchProofResourceBudget,
+) -> LaunchResourceWarningFacts {
+    LaunchResourceWarningFacts {
+        host_total_memory_mb: resource_budget.host_total_memory_mb,
+        host_cpu_threads: resource_budget.host_cpu_threads,
+        cpu_load: LaunchCpuLoadWarningFacts {
+            host_cpu_load_1m_x100: resource_budget.host_cpu_load_1m_x100,
+            host_cpu_load_5m_x100: resource_budget.host_cpu_load_5m_x100,
+            host_cpu_load_15m_x100: resource_budget.host_cpu_load_15m_x100,
+        },
+        active_session_count: resource_budget.active_session_count,
+        active_install_count: resource_budget.active_install_count,
+        active_memory_allocation_mb: resource_budget.active_memory_allocation_mb,
+        requested_memory_mb: resource_budget.requested_memory_mb,
+        launch_disk_available_mb: resource_budget.launch_disk_available_mb,
+        memory_headroom_mb: resource_budget.memory_headroom_mb,
+        launch_disk_headroom_mb: resource_budget.launch_disk_headroom_mb,
     }
 }
 
@@ -710,265 +723,6 @@ fn estimated_remaining_memory_mb(
         - i128::from(active_allocation_mb)
         - i128::from(requested_allocation_mb);
     Some(remaining.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64)
-}
-
-fn memory_budget_pressure(
-    total_memory_mb: Option<u64>,
-    active_allocation_mb: u64,
-    requested_allocation_mb: Option<i32>,
-) -> bool {
-    let Some(total_memory_mb) = total_memory_mb else {
-        return false;
-    };
-    let Some(requested_allocation_mb) =
-        requested_allocation_mb.and_then(|value| u64::try_from(value).ok())
-    else {
-        return false;
-    };
-    let remaining_mb = total_memory_mb
-        .saturating_sub(active_allocation_mb.saturating_add(requested_allocation_mb));
-    remaining_mb < OS_MEMORY_HEADROOM_MB
-}
-
-fn memory_budget_warning_guidance(
-    resource_budget: &LaunchProofResourceBudget,
-) -> Option<Vec<String>> {
-    if !resource_budget.memory_pressure {
-        return None;
-    }
-    Some(vec![
-        "Launch memory budget is tight: active sessions plus this launch may leave less than 2 GB for the OS.".to_string(),
-        "Close another running session or lower this instance's memory allocation if startup or gameplay becomes unstable.".to_string(),
-    ])
-}
-
-fn memory_clamp_warning_guidance(
-    raw_min_memory_mb: i32,
-    max_memory_mb: i32,
-) -> Option<Vec<String>> {
-    (raw_min_memory_mb > max_memory_mb).then(|| {
-        vec![
-            MEMORY_CLAMP_WARNING.to_string(),
-            MEMORY_CLAMP_GUIDANCE.to_string(),
-        ]
-    })
-}
-
-fn low_memory_allocation_warning_guidance(max_memory_mb: i32) -> Option<Vec<String>> {
-    (max_memory_mb > 0 && max_memory_mb < LOW_MEMORY_ALLOCATION_WARNING_THRESHOLD_MB).then(|| {
-        vec![
-            format!(
-                "Launch memory allocation is very low: this instance is limited to less than 2 GB of RAM ({max_memory_mb} MB selected)."
-            ),
-            "Raise the maximum memory allocation if Minecraft crashes during startup, stalls while loading, or exits with out-of-memory errors.".to_string(),
-        ]
-    })
-}
-
-fn disk_pressure(launch_disk_available_mb: Option<u64>) -> bool {
-    launch_disk_available_mb.is_some_and(|available_mb| available_mb < LAUNCH_DISK_HEADROOM_MB)
-}
-
-fn disk_pressure_warning_guidance(
-    resource_budget: &LaunchProofResourceBudget,
-) -> Option<Vec<String>> {
-    if !resource_budget.disk_pressure {
-        return None;
-    }
-    let available_mb = resource_budget.launch_disk_available_mb?;
-
-    Some(vec![
-        format!(
-            "Launch disk space is tight: launch-relevant storage reports less than 2 GB free ({available_mb} MB available)."
-        ),
-        "Free disk space before launching if caches, natives, or prewarm steps become unreliable."
-            .to_string(),
-    ])
-}
-
-fn cpu_pressure(
-    cpu_threads: Option<usize>,
-    active_launch_count: usize,
-    cpu_load_evidence: LaunchCpuLoadEvidence,
-) -> bool {
-    active_launch_cpu_pressure(cpu_threads, active_launch_count)
-        || measured_cpu_load_pressure(cpu_threads, cpu_load_evidence)
-}
-
-fn active_launch_cpu_pressure(cpu_threads: Option<usize>, active_launch_count: usize) -> bool {
-    let Some(cpu_threads) = cpu_threads.filter(|value| *value > 0) else {
-        return false;
-    };
-    let queued_launch_count = active_launch_count.saturating_add(1);
-    if cpu_threads <= 4 {
-        active_launch_count >= 1
-    } else if cpu_threads <= 8 {
-        queued_launch_count >= 3
-    } else {
-        queued_launch_count >= 5
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CpuLoadPressureEvidence {
-    window_label: &'static str,
-    load_x100: u64,
-}
-
-fn measured_cpu_load_pressure(
-    cpu_threads: Option<usize>,
-    cpu_load_evidence: LaunchCpuLoadEvidence,
-) -> bool {
-    measured_cpu_load_pressure_evidence(cpu_threads, cpu_load_evidence).is_some()
-}
-
-fn measured_cpu_load_pressure_evidence(
-    cpu_threads: Option<usize>,
-    cpu_load_evidence: LaunchCpuLoadEvidence,
-) -> Option<CpuLoadPressureEvidence> {
-    let cpu_threads = cpu_threads.filter(|value| *value > 0)?;
-    let sample = most_recent_cpu_load_sample(cpu_load_evidence)?;
-    let threshold_x100 = measured_cpu_load_threshold_x100(cpu_threads);
-    (sample.load_x100 >= threshold_x100).then_some(sample)
-}
-
-fn most_recent_cpu_load_sample(
-    cpu_load_evidence: LaunchCpuLoadEvidence,
-) -> Option<CpuLoadPressureEvidence> {
-    cpu_load_evidence
-        .host_cpu_load_1m_x100
-        .map(|load_x100| CpuLoadPressureEvidence {
-            window_label: "1-minute",
-            load_x100,
-        })
-        .or_else(|| {
-            cpu_load_evidence
-                .host_cpu_load_5m_x100
-                .map(|load_x100| CpuLoadPressureEvidence {
-                    window_label: "5-minute",
-                    load_x100,
-                })
-        })
-        .or_else(|| {
-            cpu_load_evidence
-                .host_cpu_load_15m_x100
-                .map(|load_x100| CpuLoadPressureEvidence {
-                    window_label: "15-minute",
-                    load_x100,
-                })
-        })
-}
-
-fn measured_cpu_load_threshold_x100(cpu_threads: usize) -> u64 {
-    let headroom_percent = if cpu_threads <= 4 {
-        75_u64
-    } else if cpu_threads <= 8 {
-        85
-    } else {
-        95
-    };
-    u64::try_from(cpu_threads)
-        .unwrap_or(u64::MAX / 100)
-        .saturating_mul(headroom_percent)
-}
-
-fn cpu_load_evidence_from_budget(
-    resource_budget: &LaunchProofResourceBudget,
-) -> LaunchCpuLoadEvidence {
-    LaunchCpuLoadEvidence {
-        host_cpu_load_1m_x100: resource_budget.host_cpu_load_1m_x100,
-        host_cpu_load_5m_x100: resource_budget.host_cpu_load_5m_x100,
-        host_cpu_load_15m_x100: resource_budget.host_cpu_load_15m_x100,
-    }
-}
-
-fn format_load_x100(value: u64) -> String {
-    format!("{}.{:02}", value / 100, value % 100)
-}
-
-fn cpu_pressure_warning_guidance(
-    resource_budget: &LaunchProofResourceBudget,
-) -> Option<Vec<String>> {
-    if !resource_budget.cpu_pressure {
-        return None;
-    }
-    let cpu_threads = resource_budget.host_cpu_threads?;
-    let active_session_count = resource_budget.active_session_count;
-    let cpu_load_evidence = cpu_load_evidence_from_budget(resource_budget);
-    let load_pressure =
-        measured_cpu_load_pressure_evidence(resource_budget.host_cpu_threads, cpu_load_evidence);
-    let launch_pressure =
-        active_launch_cpu_pressure(resource_budget.host_cpu_threads, active_session_count);
-    let mut guidance = Vec::new();
-
-    if let Some(load_pressure) = load_pressure {
-        guidance.push(format!(
-            "Host CPU load is already high: {} load average is {} on {cpu_threads} CPU threads before launch.",
-            load_pressure.window_label,
-            format_load_x100(load_pressure.load_x100)
-        ));
-        guidance.push(
-            "Close CPU-heavy apps or wait for background work to settle if startup feels sluggish."
-                .to_string(),
-        );
-    }
-
-    if launch_pressure {
-        guidance.push(format!(
-            "Launch concurrency may be tight: this device reports {cpu_threads} CPU threads, and other active launch sessions before this one: {active_session_count}."
-        ));
-        guidance.push(
-            "Multiple launches can saturate low-end CPUs; wait for another launch to finish if startup feels sluggish.".to_string(),
-        );
-    }
-
-    (!guidance.is_empty()).then_some(guidance)
-}
-
-fn install_pressure_warning_guidance(
-    resource_budget: &LaunchProofResourceBudget,
-) -> Option<Vec<String>> {
-    if !resource_budget.install_pressure {
-        return None;
-    }
-    let active_install_count = resource_budget.active_install_count;
-
-    Some(vec![
-        format!(
-            "Active install/download sessions: {active_install_count}. Launching now can add disk and network pressure during startup."
-        ),
-        "On low-end devices, wait for the install or download to finish if startup feels slow."
-            .to_string(),
-    ])
-}
-
-fn custom_risky_override_warning_guidance(guardian: &LaunchGuardianContext) -> Option<Vec<String>> {
-    if !matches!(guardian.mode, GuardianMode::Custom) || !guardian.has_risky_overrides() {
-        return None;
-    }
-
-    let mut guidance = Vec::new();
-    if guardian.has_java_override() {
-        guidance.push(
-            "Guardian Custom mode will keep the selected Java override for this launch."
-                .to_string(),
-        );
-    }
-    if guardian.has_named_preset() {
-        guidance.push(
-            "Guardian Custom mode will keep the selected JVM preset for this launch.".to_string(),
-        );
-    }
-    if guardian.has_raw_jvm_args() {
-        guidance.push(
-            "Guardian Custom mode will keep explicit JVM args; remove them first if startup becomes unstable."
-                .to_string(),
-        );
-    }
-    guidance.push(
-        "Switch Guardian back to Managed if you want Croopor to adjust unsafe choices.".to_string(),
-    );
-    Some(guidance)
 }
 
 fn positive_i32(value: i32) -> Option<i32> {
@@ -1810,7 +1564,6 @@ mod tests {
         assert_eq!(prepared.task.intent.max_memory_mb, 4096);
         assert_eq!(prepared.task.intent.min_memory_mb, 1024);
         assert_no_memory_clamp_warning(&prepared.task.guardian);
-        assert_eq!(memory_clamp_warning_guidance(1024, 4096), None);
     }
 
     #[tokio::test]
@@ -1989,214 +1742,6 @@ mod tests {
     }
 
     #[test]
-    fn memory_budget_warning_is_conservative_and_host_independent() {
-        assert_eq!(
-            memory_budget_warning_guidance(&test_budget(None, None, 0, 0, 4096, 4096)),
-            None
-        );
-        assert_eq!(
-            memory_budget_warning_guidance(&test_budget(Some(16_384), None, 0, 0, 4096, 4096)),
-            None
-        );
-
-        let warning =
-            memory_budget_warning_guidance(&test_budget(Some(8192), None, 0, 0, 3072, 4096))
-                .expect("warning guidance");
-        assert_eq!(
-            warning,
-            vec![
-                "Launch memory budget is tight: active sessions plus this launch may leave less than 2 GB for the OS.",
-                "Close another running session or lower this instance's memory allocation if startup or gameplay becomes unstable.",
-            ]
-        );
-
-        assert_eq!(
-            memory_budget_warning_guidance(&test_budget(Some(4096), None, 0, 0, 2048, 0)),
-            None
-        );
-    }
-
-    #[test]
-    fn low_memory_allocation_warning_uses_strict_positive_threshold() {
-        assert_eq!(low_memory_allocation_warning_guidance(0), None);
-        assert_eq!(low_memory_allocation_warning_guidance(-512), None);
-        assert_eq!(
-            low_memory_allocation_warning_guidance(LOW_MEMORY_ALLOCATION_WARNING_THRESHOLD_MB),
-            None
-        );
-        assert_eq!(
-            low_memory_allocation_warning_guidance(LOW_MEMORY_ALLOCATION_WARNING_THRESHOLD_MB + 1),
-            None
-        );
-
-        assert_eq!(
-            low_memory_allocation_warning_guidance(
-                LOW_MEMORY_ALLOCATION_WARNING_THRESHOLD_MB - 1
-            ),
-            Some(vec![
-                "Launch memory allocation is very low: this instance is limited to less than 2 GB of RAM (2047 MB selected).".to_string(),
-                "Raise the maximum memory allocation if Minecraft crashes during startup, stalls while loading, or exits with out-of-memory errors.".to_string(),
-            ])
-        );
-    }
-
-    #[test]
-    fn cpu_pressure_warning_is_conservative_and_host_independent() {
-        assert_eq!(
-            cpu_pressure_warning_guidance(&test_budget(None, None, 4, 0, 0, 0)),
-            None
-        );
-        assert_eq!(
-            cpu_pressure_warning_guidance(&test_budget(None, Some(4), 0, 0, 0, 0)),
-            None
-        );
-        assert_eq!(
-            cpu_pressure_warning_guidance(&test_budget(None, Some(8), 1, 0, 0, 0)),
-            None
-        );
-        assert_eq!(
-            cpu_pressure_warning_guidance(&test_budget(None, Some(16), 3, 0, 0, 0)),
-            None
-        );
-
-        assert!(cpu_pressure_warning_guidance(&test_budget(None, Some(4), 1, 0, 0, 0)).is_some());
-        assert!(cpu_pressure_warning_guidance(&test_budget(None, Some(8), 2, 0, 0, 0)).is_some());
-        assert!(cpu_pressure_warning_guidance(&test_budget(None, Some(16), 4, 0, 0, 0)).is_some());
-    }
-
-    #[test]
-    fn measured_cpu_load_pressure_is_conservative_and_host_independent() {
-        assert!(!measured_cpu_load_pressure(
-            None,
-            LaunchCpuLoadEvidence {
-                host_cpu_load_1m_x100: Some(300),
-                ..LaunchCpuLoadEvidence::default()
-            }
-        ));
-        assert!(!measured_cpu_load_pressure(
-            Some(4),
-            LaunchCpuLoadEvidence::default()
-        ));
-        assert!(!measured_cpu_load_pressure(
-            Some(4),
-            LaunchCpuLoadEvidence {
-                host_cpu_load_1m_x100: Some(299),
-                ..LaunchCpuLoadEvidence::default()
-            }
-        ));
-        assert!(measured_cpu_load_pressure(
-            Some(4),
-            LaunchCpuLoadEvidence {
-                host_cpu_load_1m_x100: Some(300),
-                ..LaunchCpuLoadEvidence::default()
-            }
-        ));
-        assert!(!measured_cpu_load_pressure(
-            Some(8),
-            LaunchCpuLoadEvidence {
-                host_cpu_load_1m_x100: Some(679),
-                ..LaunchCpuLoadEvidence::default()
-            }
-        ));
-        assert!(measured_cpu_load_pressure(
-            Some(8),
-            LaunchCpuLoadEvidence {
-                host_cpu_load_1m_x100: Some(680),
-                ..LaunchCpuLoadEvidence::default()
-            }
-        ));
-        assert!(!measured_cpu_load_pressure(
-            Some(16),
-            LaunchCpuLoadEvidence {
-                host_cpu_load_1m_x100: Some(1519),
-                ..LaunchCpuLoadEvidence::default()
-            }
-        ));
-        assert!(measured_cpu_load_pressure(
-            Some(16),
-            LaunchCpuLoadEvidence {
-                host_cpu_load_1m_x100: Some(1520),
-                ..LaunchCpuLoadEvidence::default()
-            }
-        ));
-    }
-
-    #[test]
-    fn measured_cpu_load_pressure_uses_most_recent_available_load_sample() {
-        assert!(!measured_cpu_load_pressure(
-            Some(4),
-            LaunchCpuLoadEvidence {
-                host_cpu_load_1m_x100: Some(100),
-                host_cpu_load_5m_x100: Some(300),
-                host_cpu_load_15m_x100: Some(300),
-            }
-        ));
-        assert!(measured_cpu_load_pressure(
-            Some(4),
-            LaunchCpuLoadEvidence {
-                host_cpu_load_1m_x100: None,
-                host_cpu_load_5m_x100: Some(300),
-                host_cpu_load_15m_x100: Some(100),
-            }
-        ));
-    }
-
-    #[test]
-    fn measured_cpu_load_warning_guidance_distinguishes_host_load_from_launch_concurrency() {
-        let warning = cpu_pressure_warning_guidance(&test_budget_with_cpu_load(
-            LaunchCpuLoadEvidence {
-                host_cpu_load_1m_x100: Some(300),
-                ..LaunchCpuLoadEvidence::default()
-            },
-            Some(4),
-            0,
-        ))
-        .expect("measured load warning");
-        assert_eq!(
-            warning,
-            vec![
-                "Host CPU load is already high: 1-minute load average is 3.00 on 4 CPU threads before launch.",
-                "Close CPU-heavy apps or wait for background work to settle if startup feels sluggish.",
-            ]
-        );
-
-        let warning = cpu_pressure_warning_guidance(&test_budget_with_cpu_load(
-            LaunchCpuLoadEvidence::default(),
-            Some(4),
-            1,
-        ))
-        .expect("concurrent launch warning");
-        assert_eq!(
-            warning,
-            vec![
-                "Launch concurrency may be tight: this device reports 4 CPU threads, and other active launch sessions before this one: 1.",
-                "Multiple launches can saturate low-end CPUs; wait for another launch to finish if startup feels sluggish.",
-            ]
-        );
-    }
-
-    #[test]
-    fn disk_pressure_warning_is_conservative_and_host_independent() {
-        let unknown = test_budget_with_disk(None);
-        assert!(!unknown.disk_pressure);
-        assert_eq!(disk_pressure_warning_guidance(&unknown), None);
-
-        let clear = test_budget_with_disk(Some(LAUNCH_DISK_HEADROOM_MB));
-        assert!(!clear.disk_pressure);
-        assert_eq!(disk_pressure_warning_guidance(&clear), None);
-
-        let pressured = test_budget_with_disk(Some(1400));
-        assert!(pressured.disk_pressure);
-        assert_eq!(
-            disk_pressure_warning_guidance(&pressured),
-            Some(vec![
-                "Launch disk space is tight: launch-relevant storage reports less than 2 GB free (1400 MB available).".to_string(),
-                "Free disk space before launching if caches, natives, or prewarm steps become unreliable.".to_string(),
-            ])
-        );
-    }
-
-    #[test]
     fn resource_budget_snapshot_marks_pressure_flags_and_signed_remaining_memory() {
         let pressured = test_budget_with_memory_and_disk(
             LaunchMemoryEvidence {
@@ -2233,7 +1778,7 @@ mod tests {
         assert_eq!(pressured.active_memory_allocation_mb, 3072);
         assert_eq!(pressured.requested_memory_mb, Some(4096));
         assert_eq!(pressured.estimated_remaining_memory_mb, Some(1024));
-        assert_eq!(pressured.memory_headroom_mb, OS_MEMORY_HEADROOM_MB);
+        assert_eq!(pressured.memory_headroom_mb, LAUNCH_MEMORY_HEADROOM_MB);
         assert!(pressured.memory_pressure);
         assert!(pressured.cpu_pressure);
         assert!(pressured.install_pressure);
@@ -2810,27 +2355,6 @@ mod tests {
         }
     }
 
-    fn test_budget(
-        host_total_memory_mb: Option<u64>,
-        host_cpu_threads: Option<usize>,
-        active_session_count: usize,
-        active_install_count: usize,
-        active_memory_allocation_mb: u64,
-        requested_memory_mb: i32,
-    ) -> LaunchProofResourceBudget {
-        test_budget_with_memory(
-            LaunchMemoryEvidence {
-                host_total_memory_mb,
-                ..LaunchMemoryEvidence::default()
-            },
-            host_cpu_threads,
-            active_session_count,
-            active_install_count,
-            active_memory_allocation_mb,
-            requested_memory_mb,
-        )
-    }
-
     fn test_budget_with_memory(
         memory_evidence: LaunchMemoryEvidence,
         host_cpu_threads: Option<usize>,
@@ -2848,38 +2372,6 @@ mod tests {
             active_install_count,
             active_memory_allocation_mb,
             requested_memory_mb,
-        )
-    }
-
-    fn test_budget_with_disk(launch_disk_available_mb: Option<u64>) -> LaunchProofResourceBudget {
-        test_budget_with_memory_and_disk(
-            LaunchMemoryEvidence::default(),
-            LaunchDiskEvidence {
-                launch_disk_available_mb,
-            },
-            LaunchCpuLoadEvidence::default(),
-            None,
-            0,
-            0,
-            0,
-            4096,
-        )
-    }
-
-    fn test_budget_with_cpu_load(
-        cpu_load_evidence: LaunchCpuLoadEvidence,
-        host_cpu_threads: Option<usize>,
-        active_session_count: usize,
-    ) -> LaunchProofResourceBudget {
-        test_budget_with_memory_and_disk(
-            LaunchMemoryEvidence::default(),
-            LaunchDiskEvidence::default(),
-            cpu_load_evidence,
-            host_cpu_threads,
-            active_session_count,
-            0,
-            0,
-            4096,
         )
     }
 
@@ -2906,7 +2398,10 @@ mod tests {
     }
 
     fn assert_has_memory_clamp_warning(guardian: &GuardianSummary) {
-        for expected in [MEMORY_CLAMP_WARNING, MEMORY_CLAMP_GUIDANCE] {
+        for expected in [
+            "Minimum memory was higher than maximum memory, so Croopor clamped the launch minimum to match the maximum allocation.",
+            "Lower the minimum memory setting or raise the maximum memory allocation if this was intentional.",
+        ] {
             assert!(
                 guardian.guidance.iter().any(|detail| detail == expected),
                 "missing clamp guidance: {expected}"
@@ -2919,7 +2414,10 @@ mod tests {
     }
 
     fn assert_no_memory_clamp_warning(guardian: &GuardianSummary) {
-        for unexpected in [MEMORY_CLAMP_WARNING, MEMORY_CLAMP_GUIDANCE] {
+        for unexpected in [
+            "Minimum memory was higher than maximum memory, so Croopor clamped the launch minimum to match the maximum allocation.",
+            "Lower the minimum memory setting or raise the maximum memory allocation if this was intentional.",
+        ] {
             assert!(
                 !guardian.guidance.iter().any(|detail| detail == unexpected),
                 "unexpected clamp guidance: {unexpected}"
