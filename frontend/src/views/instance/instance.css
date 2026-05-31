@@ -1318,6 +1318,16 @@
   }
 }
 
+@media (min-width: 861px) and (max-width: 1180px) {
+  .cp-instance-tabs {
+    padding-inline: 16px;
+  }
+  .cp-instance-tabs button {
+    gap: 6px;
+    padding-inline: 7px;
+  }
+}
+
 @media (max-width: 860px) {
   .cp-instance-body--overview-bento {
     grid-template-columns: minmax(0, 1fr);
