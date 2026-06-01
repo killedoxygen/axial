@@ -437,6 +437,39 @@ async fn download_and_cache_artifact(url: &str, path: &Path) -> Result<Vec<u8>, 
     Ok(bytes)
 }
 
+async fn promote_cached_artifact_tmp(tmp_path: &Path, path: &Path) -> Result<(), LoaderError> {
+    let first_error = match async_fs::rename(tmp_path, path).await {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+
+    match async_fs::symlink_metadata(tmp_path).await {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(first_error.into());
+        }
+        Err(error) => return Err(error.into()),
+    }
+
+    match async_fs::symlink_metadata(path).await {
+        Ok(metadata) if metadata.file_type().is_dir() => return Err(first_error.into()),
+        Ok(metadata) if metadata.file_type().is_file() || metadata.file_type().is_symlink() => {
+            async_fs::remove_file(path).await?;
+        }
+        Ok(_) => return Err(first_error.into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    match async_fs::rename(tmp_path, path).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = async_fs::remove_file(tmp_path).await;
+            Err(error.into())
+        }
+    }
+}
+
 async fn write_cached_artifact(path: &Path, bytes: &[u8]) -> Result<(), LoaderError> {
     if let Some(parent) = path.parent() {
         async_fs::create_dir_all(parent).await?;
@@ -445,7 +478,7 @@ async fn write_cached_artifact(path: &Path, bytes: &[u8]) -> Result<(), LoaderEr
     let tmp_path = artifact_tmp_path(path);
     let result = async {
         async_fs::write(&tmp_path, bytes).await?;
-        async_fs::rename(&tmp_path, path).await?;
+        promote_cached_artifact_tmp(&tmp_path, path).await?;
         Ok::<_, LoaderError>(())
     }
     .await;
@@ -509,7 +542,7 @@ fn done() -> DownloadProgress {
 
 #[cfg(test)]
 mod tests {
-    use super::{cleanup_on_error, write_cached_artifact};
+    use super::{cleanup_on_error, promote_cached_artifact_tmp, write_cached_artifact};
     use crate::loaders::types::LoaderError;
     use crate::loaders::validate_version_id;
     use crate::paths::versions_dir;
@@ -554,6 +587,46 @@ mod tests {
                 .to_string_lossy()
                 .contains(".tmp-")
         }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn cached_artifact_write_replaces_existing_file() {
+        let root = temp_dir("cached-artifact-replace");
+        fs::create_dir_all(&root).expect("root");
+        let path = root.join("installer.jar");
+        fs::write(&path, b"stale bytes").expect("stale artifact");
+
+        write_cached_artifact(&path, b"fresh bytes")
+            .await
+            .expect("replace cached artifact");
+
+        assert_eq!(fs::read(&path).expect("read artifact"), b"fresh bytes");
+        assert!(fs::read_dir(&root).expect("read root").all(|entry| {
+            !entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp-")
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn cached_artifact_promotion_preserves_destination_when_temp_missing() {
+        let root = temp_dir("cached-artifact-missing-temp");
+        fs::create_dir_all(&root).expect("root");
+        let path = root.join("installer.jar");
+        let tmp_path = root.join("installer.tmp");
+        fs::write(&path, b"existing bytes").expect("existing artifact");
+
+        let result = promote_cached_artifact_tmp(&tmp_path, &path).await;
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(&path).expect("read artifact"), b"existing bytes");
+        assert!(!tmp_path.exists());
 
         let _ = fs::remove_dir_all(root);
     }
