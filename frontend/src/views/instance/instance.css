@@ -1012,9 +1012,13 @@
   width: 17px;
   height: 17px;
   border-radius: 999px;
+  background: var(--surface-3);
+  color: var(--text-mute);
+  flex-shrink: 0;
+}
+.cp-od-perf-runtime[data-detected="true"] .cp-od-perf-runtime-mark {
   background: oklch(0.78 0.14 150 / 0.10);
   color: var(--ok);
-  flex-shrink: 0;
 }
 .cp-od-perf-runtime-text {
   flex: 1;

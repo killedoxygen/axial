@@ -1141,7 +1141,8 @@ function PerformanceCard({ inst }: { inst: EnrichedInstance }): JSX.Element {
   const summaryIcon = performanceSummaryIcon(summary.tone);
   const planTier = program.plan ? compositionTierLabel(program.plan.tier) : performanceModeLabel(effectiveMode.mode);
   const managedCount = program.plan?.mods?.length ?? program.health?.installed_count ?? 0;
-  const runtimeLabel = inst.java_major ? `Java ${inst.java_major} detected` : 'Managed Java detection';
+  const runtimeDetected = Boolean(inst.java_major);
+  const runtimeLabel = runtimeDetected ? `Java ${inst.java_major} detected` : 'Managed Java selected at launch';
 
   return (
     <Card padding={18}>
@@ -1172,8 +1173,10 @@ function PerformanceCard({ inst }: { inst: EnrichedInstance }): JSX.Element {
           <span class="cp-od-perf-key">Plan evidence</span>
           <span class="cp-od-perf-val">{planTier}, {managedCount} managed mod{managedCount === 1 ? '' : 's'}</span>
         </div>
-        <div class="cp-od-perf-runtime">
-          <span class="cp-od-perf-runtime-mark"><Icon name="check" size={12} stroke={2.6} /></span>
+        <div class="cp-od-perf-runtime" data-detected={runtimeDetected}>
+          <span class="cp-od-perf-runtime-mark">
+            <Icon name={runtimeDetected ? 'check' : 'clock'} size={12} stroke={2.6} />
+          </span>
           <span class="cp-od-perf-runtime-text">{runtimeLabel}</span>
         </div>
       </div>
