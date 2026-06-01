@@ -1801,9 +1801,11 @@ function SavedSkinLibrary({
   const uploadDragDepthRef = useRef(0);
   const { skins, state, error, refresh } = useSavedSkins();
   const [skinName, setSkinName] = useState('');
+  const [lookupUsername, setLookupUsername] = useState('');
   const [variant, setVariant] = useState<SkinVariant>('classic');
   const [busy, setBusy] = useState(false);
   const [profileBusy, setProfileBusy] = useState(false);
+  const [lookupBusy, setLookupBusy] = useState(false);
   const [uploadDragActive, setUploadDragActive] = useState(false);
   const [uploadHover, setUploadHover] = useState(false);
   const [uploadFocused, setUploadFocused] = useState(false);
@@ -1822,9 +1824,16 @@ function SavedSkinLibrary({
   const profileSkin = activeMinecraftSkin(minecraftProfile);
   const profileSkinVariant = skinVariantValue(profileSkin?.variant);
   const trimmedName = skinName.trim();
+  const trimmedLookupUsername = lookupUsername.trim();
   const trimmedEditName = editName.trim();
-  const canUpload = !busy && !profileBusy;
-  const canSaveProfileSkin = onlineReady && Boolean(profileSkin) && !busy && !profileBusy;
+  const lookupUsernameError = trimmedLookupUsername ? validateUsername(trimmedLookupUsername) : null;
+  const canUpload = !busy && !profileBusy && !lookupBusy;
+  const canSaveProfileSkin = onlineReady && Boolean(profileSkin) && !busy && !profileBusy && !lookupBusy;
+  const canSaveLookupSkin = Boolean(trimmedLookupUsername)
+    && !lookupUsernameError
+    && !busy
+    && !profileBusy
+    && !lookupBusy;
   const equippedSkin = skins.find((skin) => Boolean(skin.applied_at)) ?? null;
   const selectedSkin = skins.find((skin) => skin.texture_key === selectedKey)
     ?? equippedSkin
@@ -1933,6 +1942,37 @@ function SavedSkinLibrary({
     }
   };
 
+  const saveUsernameSkin = async (): Promise<void> => {
+    if (!trimmedLookupUsername) {
+      setMessage({ tone: 'err', text: 'Enter a Minecraft username.' });
+      return;
+    }
+    if (lookupUsernameError) {
+      setMessage({ tone: 'err', text: lookupUsernameError });
+      return;
+    }
+
+    setLookupBusy(true);
+    setMessage(null);
+    try {
+      const payload = await api('POST', '/skins/from-username', {
+        username: trimmedLookupUsername,
+      });
+      const saved = savedSkinRecord(payload);
+      if (saved) setSelectedKey(saved.texture_key);
+      setLookupUsername('');
+      refresh();
+      setMessage({ tone: 'ok', text: 'Player skin saved.' });
+    } catch (err) {
+      setMessage({
+        tone: 'err',
+        text: err instanceof Error ? err.message : 'Could not save player skin.',
+      });
+    } finally {
+      setLookupBusy(false);
+    }
+  };
+
   const startEdit = (skin: SavedSkinRecord): void => {
     setEditKey(skin.texture_key);
     setEditName(skin.name);
@@ -2022,7 +2062,7 @@ function SavedSkinLibrary({
       setMessage({ tone: 'err', text: 'Upload a PNG skin file.' });
       return;
     }
-    if (busy || profileBusy) {
+    if (busy || profileBusy || lookupBusy) {
       setMessage({ tone: 'err', text: 'Wait for the current skin action to finish.' });
       return;
     }
@@ -2041,7 +2081,7 @@ function SavedSkinLibrary({
   const handleUploadDragOver = (event: DragEvent): void => {
     if (!Array.from(event.dataTransfer?.types ?? []).includes('Files')) return;
     event.preventDefault();
-    if (event.dataTransfer) event.dataTransfer.dropEffect = busy || profileBusy ? 'none' : 'copy';
+    if (event.dataTransfer) event.dataTransfer.dropEffect = busy || profileBusy || lookupBusy ? 'none' : 'copy';
   };
 
   const handleUploadDragLeave = (event: DragEvent): void => {
@@ -2222,6 +2262,41 @@ function SavedSkinLibrary({
             </Button>
           </div>
         )}
+
+        <div style={{
+          display: 'grid',
+          gridTemplateColumns: 'minmax(180px, 1fr) auto auto',
+          gap: 10,
+          alignItems: 'center',
+          padding: minecraftProfile ? '0 0 12px' : '12px 0',
+          borderBottom: '1px solid var(--line)',
+        }}>
+          <Input
+            value={lookupUsername}
+            onChange={(value) => {
+              setLookupUsername(clampPlayerNameInput(value));
+              setMessage(null);
+            }}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter' && canSaveLookupSkin) void saveUsernameSkin();
+            }}
+            placeholder="Minecraft username"
+            icon="search"
+          />
+          <Pill tone={lookupUsernameError ? 'warn' : 'neutral'} icon={lookupUsernameError ? 'alert' : 'user'}>
+            Player skin
+          </Pill>
+          <Button
+            variant="secondary"
+            size="sm"
+            icon={lookupBusy ? 'refresh' : 'download'}
+            disabled={!canSaveLookupSkin}
+            onClick={() => void saveUsernameSkin()}
+            title={lookupUsernameError || undefined}
+          >
+            Save skin
+          </Button>
+        </div>
 
         {state === 'unavailable' && (
           <div style={{ color: 'var(--err)', fontSize: 12, fontWeight: 500 }}>

@@ -8,6 +8,7 @@ authors.workspace = true
 [dependencies]
 async-stream.workspace = true
 axum.workspace = true
+base64.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
 include_dir.workspace = true

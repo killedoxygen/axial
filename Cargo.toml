@@ -18,6 +18,7 @@ authors = ["Mateoltd"]
 [workspace.dependencies]
 async-stream = "0.3.6"
 axum = { version = "0.8.6", features = ["macros"] }
+base64 = "0.22.1"
 chrono = { version = "0.4.44", default-features = true, features = ["clock"] }
 ed25519-dalek = "2.2.0"
 futures-util = "0.3.32"
