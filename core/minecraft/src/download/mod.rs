@@ -1,5 +1,7 @@
 use crate::java::ensure_java_runtime;
-use crate::launch::{JavaVersion, Library, VersionJson, maven_to_path};
+use crate::launch::{
+    AssetIndex as VersionAssetIndex, JavaVersion, Library, VersionJson, maven_to_path,
+};
 use crate::manifest::{ManifestEntry, fetch_version_manifest_cached};
 use crate::paths::{assets_dir, libraries_dir, versions_dir};
 use crate::rules::{current_os_arch, default_environment, evaluate_rules};
@@ -13,6 +15,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::fs as async_fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
 
 const MIN_LIBRARY_DOWNLOAD_CONCURRENCY: usize = 4;
 const MAX_LIBRARY_DOWNLOAD_CONCURRENCY: usize = 16;
@@ -67,6 +70,11 @@ struct VersionJsonDownload {
     url: String,
     expected: ExpectedIntegrity,
     force_download: bool,
+}
+
+struct AssetDownloadPipeline {
+    task: tokio::task::JoinHandle<Result<(), DownloadError>>,
+    progress_rx: mpsc::UnboundedReceiver<DownloadProgress>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -298,6 +306,11 @@ impl Downloader {
             } else {
                 None
             };
+            let mut asset_pipeline = spawn_asset_download_pipeline(
+                self.mc_dir.clone(),
+                self.client.clone(),
+                version.asset_index.clone(),
+            );
 
             let library_jobs = self.library_jobs(&version);
             send(progress("libraries", 0, library_jobs.len() as i32, None));
@@ -322,15 +335,48 @@ impl Downloader {
                         }
                     }))
                     .buffer_unordered(library_download_concurrency());
-                while let Some(result) = library_downloads.next().await {
-                    let name = result?;
-                    completed_library_jobs += 1;
-                    send(progress(
-                        "libraries",
-                        completed_library_jobs,
-                        total_library_jobs,
-                        Some(name),
-                    ));
+                let mut asset_progress_open = asset_pipeline.is_some();
+                loop {
+                    if asset_progress_open {
+                        let asset_progress_rx = &mut asset_pipeline
+                            .as_mut()
+                            .expect("asset pipeline should exist")
+                            .progress_rx;
+                        tokio::select! {
+                            progress = asset_progress_rx.recv() => {
+                                if let Some(progress) = progress {
+                                    send(progress);
+                                } else {
+                                    asset_progress_open = false;
+                                }
+                            }
+                            result = library_downloads.next() => {
+                                let Some(result) = result else {
+                                    break;
+                                };
+                                let name = result?;
+                                completed_library_jobs += 1;
+                                send(progress(
+                                    "libraries",
+                                    completed_library_jobs,
+                                    total_library_jobs,
+                                    Some(name),
+                                ));
+                            }
+                        }
+                    } else {
+                        let Some(result) = library_downloads.next().await else {
+                            break;
+                        };
+                        let name = result?;
+                        completed_library_jobs += 1;
+                        send(progress(
+                            "libraries",
+                            completed_library_jobs,
+                            total_library_jobs,
+                            Some(name),
+                        ));
+                    }
                 }
                 Ok::<(), DownloadError>(())
             }
@@ -344,29 +390,13 @@ impl Downloader {
                     Some(format!("{version_id}.jar")),
                 ));
             }
+            if client_jar_result.is_err() || library_result.is_err() {
+                abort_asset_download_pipeline(asset_pipeline).await;
+            } else {
+                await_asset_download_pipeline(asset_pipeline, send).await?;
+            }
             client_jar_result?;
             library_result?;
-
-            if !version.asset_index.url.is_empty() {
-                let asset_index_path = assets_dir(&self.mc_dir)
-                    .join("indexes")
-                    .join(format!("{}.json", version.asset_index.id));
-                send(progress(
-                    "asset_index",
-                    0,
-                    1,
-                    Some(format!("{}.json", version.asset_index.id)),
-                ));
-                let expected = ExpectedIntegrity::from_mojang(
-                    version.asset_index.size,
-                    &version.asset_index.sha1,
-                );
-                if !existing_file_satisfies(&asset_index_path, &expected).await? {
-                    self.download_file(&version.asset_index.url, &asset_index_path, &expected)
-                        .await?;
-                }
-                self.download_asset_objects(&asset_index_path, send).await?;
-            }
 
             if let Some(logging) = version
                 .logging
@@ -435,83 +465,6 @@ impl Downloader {
         library_jobs_for(&self.mc_dir, &version.libraries, &env)
     }
 
-    async fn download_asset_objects<F>(
-        &self,
-        asset_index_path: &Path,
-        send: &mut F,
-    ) -> Result<(), DownloadError>
-    where
-        F: FnMut(DownloadProgress),
-    {
-        #[derive(Deserialize)]
-        struct AssetIndex {
-            objects: std::collections::HashMap<String, AssetObject>,
-            #[serde(default, rename = "virtual")]
-            virtual_flag: bool,
-            #[serde(default, rename = "map_to_resources")]
-            map_to_resources: bool,
-        }
-
-        #[derive(Deserialize)]
-        struct AssetObject {
-            hash: String,
-            #[serde(default)]
-            size: i64,
-        }
-
-        let index =
-            serde_json::from_str::<AssetIndex>(&async_fs::read_to_string(asset_index_path).await?)?;
-        let objects_dir = assets_dir(&self.mc_dir).join("objects");
-        let jobs = missing_asset_object_jobs(unique_asset_object_jobs(
-            &objects_dir,
-            index
-                .objects
-                .values()
-                .map(|object| (object.hash.as_str(), object.size)),
-        )?)
-        .await?;
-
-        send(progress("assets", 0, jobs.len() as i32, None));
-        let client = self.client.clone();
-        let total_jobs = jobs.len() as i32;
-        let mut completed_jobs = 0;
-        let mut asset_downloads = futures_util::stream::iter(jobs.into_iter().map(|job| {
-            let client = client.clone();
-            async move {
-                let hash = job.hash;
-                let path = job.path;
-                let expected = job.expected;
-                let url = format!(
-                    "https://resources.download.minecraft.net/{}/{}",
-                    &hash[..2],
-                    hash
-                );
-                download_file_with_client(&client, &url, &path, &expected).await
-            }
-        }))
-        .buffer_unordered(asset_download_concurrency());
-        while let Some(result) = asset_downloads.next().await {
-            result?;
-            completed_jobs += 1;
-            if completed_jobs == total_jobs || completed_jobs % 50 == 0 {
-                send(progress("assets", completed_jobs, total_jobs, None));
-            }
-        }
-
-        if index.virtual_flag || index.map_to_resources {
-            let virtual_dir = assets_dir(&self.mc_dir).join("virtual").join("legacy");
-            for (name, object) in index.objects {
-                let src = objects_dir
-                    .join(asset_object_hash_prefix(&object.hash)?)
-                    .join(&object.hash);
-                let dst = virtual_dir.join(PathBuf::from(name));
-                copy_virtual_asset_if_missing(&src, &dst).await?;
-            }
-        }
-
-        Ok(())
-    }
-
     async fn download_file(
         &self,
         url: &str,
@@ -551,6 +504,158 @@ impl Downloader {
         Err(last_error
             .unwrap_or_else(|| DownloadError::ResolveManifest("download failed".to_string())))
     }
+}
+
+fn spawn_asset_download_pipeline(
+    mc_dir: PathBuf,
+    client: reqwest::Client,
+    asset_index: VersionAssetIndex,
+) -> Option<AssetDownloadPipeline> {
+    if asset_index.url.is_empty() {
+        return None;
+    }
+
+    let (progress_tx, progress_rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(async move {
+        let asset_index_path = assets_dir(&mc_dir)
+            .join("indexes")
+            .join(format!("{}.json", asset_index.id));
+        let _ = progress_tx.send(progress(
+            "asset_index",
+            0,
+            1,
+            Some(format!("{}.json", asset_index.id)),
+        ));
+        let expected = ExpectedIntegrity::from_mojang(asset_index.size, &asset_index.sha1);
+        if !existing_file_satisfies(&asset_index_path, &expected).await? {
+            download_file_with_client(&client, &asset_index.url, &asset_index_path, &expected)
+                .await?;
+        }
+        download_asset_objects_with_client(&mc_dir, client, &asset_index_path, |progress| {
+            let _ = progress_tx.send(progress);
+        })
+        .await
+    });
+
+    Some(AssetDownloadPipeline { task, progress_rx })
+}
+
+async fn await_asset_download_pipeline<F>(
+    pipeline: Option<AssetDownloadPipeline>,
+    send: &mut F,
+) -> Result<(), DownloadError>
+where
+    F: FnMut(DownloadProgress),
+{
+    let Some(AssetDownloadPipeline {
+        mut task,
+        mut progress_rx,
+    }) = pipeline
+    else {
+        return Ok(());
+    };
+
+    loop {
+        tokio::select! {
+            progress = progress_rx.recv() => {
+                if let Some(progress) = progress {
+                    send(progress);
+                }
+            }
+            result = &mut task => {
+                while let Ok(progress) = progress_rx.try_recv() {
+                    send(progress);
+                }
+                return result.map_err(|error| {
+                    DownloadError::ResolveManifest(format!("asset download task {error}"))
+                })?;
+            }
+        }
+    }
+}
+
+async fn abort_asset_download_pipeline(pipeline: Option<AssetDownloadPipeline>) {
+    if let Some(AssetDownloadPipeline { task, .. }) = pipeline {
+        task.abort();
+        let _ = task.await;
+    }
+}
+
+async fn download_asset_objects_with_client<F>(
+    mc_dir: &Path,
+    client: reqwest::Client,
+    asset_index_path: &Path,
+    mut send: F,
+) -> Result<(), DownloadError>
+where
+    F: FnMut(DownloadProgress),
+{
+    #[derive(Deserialize)]
+    struct AssetIndex {
+        objects: std::collections::HashMap<String, AssetObject>,
+        #[serde(default, rename = "virtual")]
+        virtual_flag: bool,
+        #[serde(default, rename = "map_to_resources")]
+        map_to_resources: bool,
+    }
+
+    #[derive(Deserialize)]
+    struct AssetObject {
+        hash: String,
+        #[serde(default)]
+        size: i64,
+    }
+
+    let index =
+        serde_json::from_str::<AssetIndex>(&async_fs::read_to_string(asset_index_path).await?)?;
+    let objects_dir = assets_dir(mc_dir).join("objects");
+    let jobs = missing_asset_object_jobs(unique_asset_object_jobs(
+        &objects_dir,
+        index
+            .objects
+            .values()
+            .map(|object| (object.hash.as_str(), object.size)),
+    )?)
+    .await?;
+
+    send(progress("assets", 0, jobs.len() as i32, None));
+    let total_jobs = jobs.len() as i32;
+    let mut completed_jobs = 0;
+    let mut asset_downloads = futures_util::stream::iter(jobs.into_iter().map(|job| {
+        let client = client.clone();
+        async move {
+            let hash = job.hash;
+            let path = job.path;
+            let expected = job.expected;
+            let url = format!(
+                "https://resources.download.minecraft.net/{}/{}",
+                &hash[..2],
+                hash
+            );
+            download_file_with_client(&client, &url, &path, &expected).await
+        }
+    }))
+    .buffer_unordered(asset_download_concurrency());
+    while let Some(result) = asset_downloads.next().await {
+        result?;
+        completed_jobs += 1;
+        if completed_jobs == total_jobs || completed_jobs % 50 == 0 {
+            send(progress("assets", completed_jobs, total_jobs, None));
+        }
+    }
+
+    if index.virtual_flag || index.map_to_resources {
+        let virtual_dir = assets_dir(mc_dir).join("virtual").join("legacy");
+        for (name, object) in index.objects {
+            let src = objects_dir
+                .join(asset_object_hash_prefix(&object.hash)?)
+                .join(&object.hash);
+            let dst = virtual_dir.join(PathBuf::from(name));
+            copy_virtual_asset_if_missing(&src, &dst).await?;
+        }
+    }
+
+    Ok(())
 }
 
 fn version_json_download_from_manifest_entry(entry: ManifestEntry) -> VersionJsonDownload {
@@ -1275,7 +1380,7 @@ mod tests {
         atomic::{AtomicBool, Ordering},
     };
     use std::time::{SystemTime, UNIX_EPOCH};
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::oneshot;
     use tokio::time::{Duration, timeout};
 
@@ -1302,6 +1407,37 @@ mod tests {
         assert!(event.done);
 
         let _ = fs::remove_file(root.join("versions"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn install_version_starts_asset_index_before_library_download_finishes() {
+        let root = temp_dir("overlap-assets-libraries");
+        let (version_url, mut requests, release_library) = spawn_overlapped_install_server().await;
+        let downloader = Downloader::new(&root);
+        let install = tokio::spawn(async move {
+            downloader
+                .install_version("overlap", Some(&version_url), |_| {})
+                .await
+        });
+
+        let mut saw_asset_index = false;
+        while !saw_asset_index {
+            let path = timeout(Duration::from_secs(2), requests.recv())
+                .await
+                .expect("request should arrive before library release")
+                .expect("request event");
+            if path == "/asset-index.json" {
+                saw_asset_index = true;
+            }
+        }
+
+        release_library.send(()).expect("release library response");
+        install
+            .await
+            .expect("install task should join")
+            .expect("install should succeed");
+
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1997,5 +2133,106 @@ mod tests {
             }
         });
         url
+    }
+
+    async fn spawn_overlapped_install_server()
+    -> (String, mpsc::UnboundedReceiver<String>, oneshot::Sender<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind install overlap server");
+        let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (request_tx, request_rx) = mpsc::unbounded_channel();
+        let (release_library_tx, release_library_rx) = oneshot::channel();
+        let library_body = b"library".to_vec();
+        let library_sha1 = sha1_hex(&library_body);
+        let asset_index_body = br#"{"objects":{}}"#.to_vec();
+        let asset_index_sha1 = sha1_hex(&asset_index_body);
+        let version_body = serde_json::json!({
+            "id": "overlap",
+            "assetIndex": {
+                "id": "overlap-assets",
+                "sha1": asset_index_sha1,
+                "size": asset_index_body.len(),
+                "url": format!("{base_url}/asset-index.json")
+            },
+            "libraries": [{
+                "name": "org.example:lib:1.0.0",
+                "downloads": {
+                    "artifact": {
+                        "path": "org/example/lib/1.0.0/lib-1.0.0.jar",
+                        "url": format!("{base_url}/libraries/lib.jar"),
+                        "sha1": library_sha1,
+                        "size": library_body.len()
+                    }
+                }
+            }]
+        })
+        .to_string()
+        .into_bytes();
+
+        tokio::spawn(async move {
+            let mut release_library_rx = Some(release_library_rx);
+            for _ in 0..4 {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let request_path = match read_request_path(&mut socket).await {
+                    Some(path) => path,
+                    None => return,
+                };
+                let _ = request_tx.send(request_path.clone());
+                let body = match request_path.as_str() {
+                    "/version.json" => version_body.clone(),
+                    "/asset-index.json" => asset_index_body.clone(),
+                    "/libraries/lib.jar" => {
+                        if let Some(receiver) = release_library_rx.take() {
+                            let _ = receiver.await;
+                        }
+                        library_body.clone()
+                    }
+                    _ => {
+                        write_raw_response(&mut socket, "404 Not Found", b"not found").await;
+                        continue;
+                    }
+                };
+                write_raw_response(&mut socket, "200 OK", &body).await;
+            }
+        });
+
+        (
+            format!("{base_url}/version.json"),
+            request_rx,
+            release_library_tx,
+        )
+    }
+
+    async fn read_request_path(socket: &mut tokio::net::TcpStream) -> Option<String> {
+        let mut buffer = vec![0_u8; 1024];
+        let mut received = Vec::new();
+        loop {
+            let read = socket.read(&mut buffer).await.ok()?;
+            if read == 0 {
+                return None;
+            }
+            received.extend_from_slice(&buffer[..read]);
+            if received.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let request = String::from_utf8_lossy(&received);
+        request
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .map(ToOwned::to_owned)
+    }
+
+    async fn write_raw_response(socket: &mut tokio::net::TcpStream, status: &str, body: &[u8]) {
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = socket.write_all(response.as_bytes()).await;
+        let _ = socket.write_all(body).await;
     }
 }
