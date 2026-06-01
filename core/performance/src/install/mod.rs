@@ -9,8 +9,9 @@ use crate::signature::{
 };
 use crate::state::{
     RollbackSnapshotSummary, StateError, list_rollback_snapshots, load_rollback_snapshot,
-    load_rollback_snapshot_by_id, load_state, managed_artifact_path, remove_state,
-    restore_rollback_snapshot, save_rollback_snapshot, save_rollback_snapshot_async, save_state,
+    load_rollback_snapshot_async, load_rollback_snapshot_by_id, load_state, managed_artifact_path,
+    remove_state, restore_rollback_snapshot, restore_rollback_snapshot_async,
+    save_rollback_snapshot, save_rollback_snapshot_async, save_state,
 };
 use crate::status::{RuleChannel, RuleSource, RulesValidation};
 use crate::types::{
@@ -210,11 +211,12 @@ impl PerformanceManager {
         let mut selected_state = None;
 
         for (index, attempt_plan) in attempt_plans.iter().enumerate() {
-            self.restore_after_error(
+            self.restore_after_error_async(
                 instance_mods_dir,
                 self.remove_stale_managed(instance_mods_dir, previous_state.as_ref(), attempt_plan),
                 snapshot_available,
-            )?;
+            )
+            .await?;
 
             let state = self
                 .attempt_install_plan(
@@ -233,11 +235,12 @@ impl PerformanceManager {
                     "performance composition {} had severe install failure; trying fallback {}",
                     attempt_plan.composition_id, next_plan.composition_id
                 );
-                self.restore_after_error(
+                self.restore_after_error_async(
                     instance_mods_dir,
                     self.remove_attempt_mods_not_in_plan(instance_mods_dir, &state, next_plan),
                     snapshot_available,
-                )?;
+                )
+                .await?;
                 abandoned_states.push(state);
                 continue;
             }
@@ -247,21 +250,24 @@ impl PerformanceManager {
         }
 
         let state = selected_state.expect("at least the requested performance plan is attempted");
-        self.restore_after_error(
+        self.restore_after_error_async(
             instance_mods_dir,
             save_state(instance_mods_dir, &state).map_err(InstallError::State),
             snapshot_available,
-        )?;
-        self.restore_after_error(
+        )
+        .await?;
+        self.restore_after_error_async(
             instance_mods_dir,
             self.remove_superseded_managed(instance_mods_dir, previous_state.as_ref(), &state),
             snapshot_available,
-        )?;
-        self.restore_after_error(
+        )
+        .await?;
+        self.restore_after_error_async(
             instance_mods_dir,
             self.remove_abandoned_attempt_mods(instance_mods_dir, &abandoned_states, &state),
             snapshot_available,
-        )?;
+        )
+        .await?;
         Ok(state)
     }
 
@@ -292,6 +298,16 @@ impl PerformanceManager {
         let snapshot =
             load_rollback_snapshot(instance_mods_dir)?.ok_or(InstallError::NoRollbackSnapshot)?;
         Ok(restore_rollback_snapshot(instance_mods_dir, &snapshot)?)
+    }
+
+    async fn rollback_managed_async(
+        &self,
+        instance_mods_dir: &Path,
+    ) -> Result<CompositionState, InstallError> {
+        let snapshot = load_rollback_snapshot_async(instance_mods_dir)
+            .await?
+            .ok_or(InstallError::NoRollbackSnapshot)?;
+        Ok(restore_rollback_snapshot_async(instance_mods_dir, &snapshot).await?)
     }
 
     pub fn rollback_managed_snapshot(
@@ -841,6 +857,29 @@ impl PerformanceManager {
             Err(error) => {
                 if snapshot_available
                     && let Err(rollback_error) = self.rollback_managed(instance_mods_dir)
+                {
+                    warn!(
+                        "failed to restore performance rollback snapshot after error: {}",
+                        rollback_error
+                    );
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn restore_after_error_async<T>(
+        &self,
+        instance_mods_dir: &Path,
+        result: Result<T, InstallError>,
+        snapshot_available: bool,
+    ) -> Result<T, InstallError> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                if snapshot_available
+                    && let Err(rollback_error) =
+                        self.rollback_managed_async(instance_mods_dir).await
                 {
                     warn!(
                         "failed to restore performance rollback snapshot after error: {}",

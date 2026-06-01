@@ -77,6 +77,21 @@ pub fn load_state(instance_mods_dir: &Path) -> Result<Option<CompositionState>, 
     }
 }
 
+async fn load_state_async(
+    instance_mods_dir: &Path,
+) -> Result<Option<CompositionState>, StateError> {
+    let path = lock_file_path(instance_mods_dir);
+    match async_fs::read_to_string(path).await {
+        Ok(data) => {
+            let state = serde_json::from_str(&data)?;
+            validate_state(&state)?;
+            Ok(Some(state))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(StateError::Read(error)),
+    }
+}
+
 pub fn save_state(instance_mods_dir: &Path, state: &CompositionState) -> Result<(), StateError> {
     validate_state(state)?;
     fs::create_dir_all(instance_mods_dir)?;
@@ -85,6 +100,20 @@ pub fn save_state(instance_mods_dir: &Path, state: &CompositionState) -> Result<
     let temp_path = path.with_extension("json.tmp");
     fs::write(&temp_path, data)?;
     replace_file_atomic(&temp_path, &path)?;
+    Ok(())
+}
+
+async fn save_state_async(
+    instance_mods_dir: &Path,
+    state: &CompositionState,
+) -> Result<(), StateError> {
+    validate_state(state)?;
+    async_fs::create_dir_all(instance_mods_dir).await?;
+    let data = serde_json::to_string_pretty(state)?;
+    let path = lock_file_path(instance_mods_dir);
+    let temp_path = path.with_extension("json.tmp");
+    async_fs::write(&temp_path, data).await?;
+    replace_file_atomic_async(&temp_path, &path).await?;
     Ok(())
 }
 
@@ -205,6 +234,19 @@ pub fn load_rollback_snapshot(
     Ok(Some(snapshot))
 }
 
+pub async fn load_rollback_snapshot_async(
+    instance_mods_dir: &Path,
+) -> Result<Option<RollbackSnapshot>, StateError> {
+    let path = rollback_file_path(instance_mods_dir);
+    let snapshot = match async_fs::read_to_string(path).await {
+        Ok(data) => serde_json::from_str::<RollbackSnapshot>(&data)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(StateError::Read(error)),
+    };
+    validate_rollback_snapshot(&snapshot)?;
+    Ok(Some(snapshot))
+}
+
 pub fn load_rollback_snapshot_by_id(
     instance_mods_dir: &Path,
     snapshot_id: &str,
@@ -286,6 +328,53 @@ pub fn restore_rollback_snapshot(
     }
 
     save_state(instance_mods_dir, &snapshot.state)?;
+    Ok(snapshot.state.clone())
+}
+
+pub async fn restore_rollback_snapshot_async(
+    instance_mods_dir: &Path,
+    snapshot: &RollbackSnapshot,
+) -> Result<CompositionState, StateError> {
+    validate_rollback_snapshot(snapshot)?;
+
+    let snapshot_filenames: HashSet<String> = snapshot
+        .state
+        .installed_mods
+        .iter()
+        .map(|installed| installed.filename.clone())
+        .collect();
+
+    if let Ok(Some(current_state)) = load_state_async(instance_mods_dir).await {
+        validate_state(&current_state)?;
+        for installed in current_state.installed_mods {
+            if snapshot_filenames.contains(&installed.filename) {
+                continue;
+            }
+            let path = managed_artifact_path(instance_mods_dir, &installed.filename)?;
+            match async_fs::remove_file(path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(StateError::Read(error)),
+            }
+        }
+    }
+
+    let files_dir = rollback_files_dir_path(instance_mods_dir);
+    for artifact in &snapshot.artifacts {
+        let source_path = files_dir.join(&artifact.stored_filename);
+        if !matches!(async_fs::metadata(&source_path).await, Ok(metadata) if metadata.is_file()) {
+            return Err(StateError::InvalidRollback(format!(
+                "missing rollback artifact {}",
+                artifact.stored_filename
+            )));
+        }
+        let final_path = managed_artifact_path(instance_mods_dir, &artifact.filename)?;
+        let temp_path = final_path.with_extension("rollback.tmp");
+        async_fs::copy(&source_path, &temp_path).await?;
+        replace_file_atomic_async(&temp_path, &final_path).await?;
+    }
+
+    save_state_async(instance_mods_dir, &snapshot.state).await?;
     Ok(snapshot.state.clone())
 }
 
@@ -730,6 +819,44 @@ mod tests {
             .expect("load older snapshot")
             .expect("older snapshot exists");
         let restored = restore_rollback_snapshot(&root, &snapshot).expect("restore older");
+
+        assert_eq!(restored.composition_id, "core-a");
+        assert_eq!(
+            fs::read(root.join("managed-a.jar")).expect("read managed a"),
+            b"managed-a"
+        );
+        assert!(!root.join("managed-b.jar").exists());
+        assert_eq!(
+            fs::read(root.join("user.jar")).expect("read user"),
+            b"user-v2"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn async_rollback_snapshot_restores_tracked_state_only() {
+        let root = test_root("async-restore");
+        fs::write(root.join("managed-a.jar"), b"managed-a").expect("write managed a");
+        fs::write(root.join("user.jar"), b"user-v1").expect("write user");
+        let snapshot = save_rollback_snapshot_async(
+            &root,
+            &test_state("core-a", vec![test_mod("sodium", "managed-a.jar")]),
+        )
+        .await
+        .expect("save snapshot");
+
+        fs::write(root.join("managed-b.jar"), b"managed-b").expect("write managed b");
+        save_state(
+            &root,
+            &test_state("core-b", vec![test_mod("lithium", "managed-b.jar")]),
+        )
+        .expect("save current state");
+        fs::write(root.join("user.jar"), b"user-v2").expect("mutate user");
+
+        let restored = restore_rollback_snapshot_async(&root, &snapshot)
+            .await
+            .expect("restore async");
 
         assert_eq!(restored.composition_id, "core-a");
         assert_eq!(
