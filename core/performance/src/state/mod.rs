@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
+use tokio::fs as async_fs;
 
 const LOCK_FILE_NAME: &str = ".croopor-lock.json";
 const STATE_DIR_NAME: &str = ".croopor-performance";
@@ -139,6 +140,52 @@ pub fn save_rollback_snapshot(
         &snapshot,
     )?;
     write_rollback_snapshot(&rollback_file_path(instance_mods_dir), &snapshot)?;
+    prune_rollback_history(instance_mods_dir)?;
+    let snapshots = load_retained_rollback_snapshots(instance_mods_dir)?;
+    cleanup_unreferenced_rollback_artifacts(instance_mods_dir, &snapshots);
+    Ok(snapshot)
+}
+
+pub async fn save_rollback_snapshot_async(
+    instance_mods_dir: &Path,
+    state: &CompositionState,
+) -> Result<RollbackSnapshot, StateError> {
+    validate_state(state)?;
+
+    let files_dir = rollback_files_dir_path(instance_mods_dir);
+    async_fs::create_dir_all(&files_dir).await?;
+
+    let snapshot_id = new_rollback_snapshot_id();
+    let mut artifacts = Vec::new();
+
+    for (index, installed) in state.installed_mods.iter().enumerate() {
+        let source_path = managed_artifact_path(instance_mods_dir, &installed.filename)?;
+        if !matches!(async_fs::metadata(&source_path).await, Ok(metadata) if metadata.is_file()) {
+            continue;
+        }
+
+        let stored_filename = format!("{snapshot_id}-{index}.bin");
+        validate_managed_filename(&stored_filename)?;
+        async_fs::copy(&source_path, files_dir.join(&stored_filename)).await?;
+        artifacts.push(RollbackArtifact {
+            filename: installed.filename.clone(),
+            stored_filename,
+        });
+    }
+
+    let snapshot = RollbackSnapshot {
+        id: snapshot_id.clone(),
+        schema_version: ROLLBACK_SCHEMA_VERSION,
+        created_at: Utc::now().to_rfc3339(),
+        state: state.clone(),
+        artifacts,
+    };
+    write_rollback_snapshot_async(
+        &rollback_history_file_path(instance_mods_dir, &snapshot_id),
+        &snapshot,
+    )
+    .await?;
+    write_rollback_snapshot_async(&rollback_file_path(instance_mods_dir), &snapshot).await?;
     prune_rollback_history(instance_mods_dir)?;
     let snapshots = load_retained_rollback_snapshots(instance_mods_dir)?;
     cleanup_unreferenced_rollback_artifacts(instance_mods_dir, &snapshots);
@@ -417,6 +464,20 @@ fn write_rollback_snapshot(path: &Path, snapshot: &RollbackSnapshot) -> Result<(
     Ok(())
 }
 
+async fn write_rollback_snapshot_async(
+    path: &Path,
+    snapshot: &RollbackSnapshot,
+) -> Result<(), StateError> {
+    if let Some(parent) = path.parent() {
+        async_fs::create_dir_all(parent).await?;
+    }
+    let data = serde_json::to_string_pretty(snapshot)?;
+    let temp_path = path.with_extension("json.tmp");
+    async_fs::write(&temp_path, data).await?;
+    replace_file_atomic_async(&temp_path, path).await?;
+    Ok(())
+}
+
 fn new_rollback_snapshot_id() -> String {
     format!(
         "rb-{}-{}",
@@ -549,6 +610,27 @@ fn replace_file_atomic(temp_path: &Path, final_path: &Path) -> Result<(), std::i
     }
 }
 
+async fn replace_file_atomic_async(
+    temp_path: &Path,
+    final_path: &Path,
+) -> Result<(), std::io::Error> {
+    if async_fs::rename(temp_path, final_path).await.is_ok() {
+        return Ok(());
+    }
+
+    if async_fs::metadata(final_path).await.is_ok() {
+        let _ = async_fs::remove_file(final_path).await;
+    }
+
+    match async_fs::rename(temp_path, final_path).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = async_fs::remove_file(temp_path).await;
+            Err(error)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -586,6 +668,35 @@ mod tests {
         assert!(!listed_ids.contains(&saved_ids[1]));
         assert!(listed_ids.contains(saved_ids.last().expect("latest id")));
         assert_eq!(summaries.iter().filter(|summary| summary.latest).count(), 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn async_rollback_snapshot_saves_managed_artifacts() {
+        let root = test_root("async-save-rollback");
+        fs::write(root.join("managed-a.jar"), b"managed-a").expect("write managed");
+        fs::write(root.join("user.jar"), b"user").expect("write user");
+
+        let snapshot = save_rollback_snapshot_async(
+            &root,
+            &test_state("core-a", vec![test_mod("sodium", "managed-a.jar")]),
+        )
+        .await
+        .expect("save rollback snapshot async");
+
+        assert_eq!(snapshot.artifacts.len(), 1);
+        let artifact = &snapshot.artifacts[0];
+        assert_eq!(artifact.filename, "managed-a.jar");
+        assert_eq!(
+            fs::read(rollback_files_dir_path(&root).join(&artifact.stored_filename))
+                .expect("read stored artifact"),
+            b"managed-a"
+        );
+        let latest = load_rollback_snapshot(&root)
+            .expect("load latest")
+            .expect("latest snapshot");
+        assert_eq!(latest.id, snapshot.id);
 
         let _ = fs::remove_dir_all(root);
     }

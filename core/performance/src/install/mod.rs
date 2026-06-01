@@ -10,7 +10,7 @@ use crate::signature::{
 use crate::state::{
     RollbackSnapshotSummary, StateError, list_rollback_snapshots, load_rollback_snapshot,
     load_rollback_snapshot_by_id, load_state, managed_artifact_path, remove_state,
-    restore_rollback_snapshot, save_rollback_snapshot, save_state,
+    restore_rollback_snapshot, save_rollback_snapshot, save_rollback_snapshot_async, save_state,
 };
 use crate::status::{RuleChannel, RuleSource, RulesValidation};
 use crate::types::{
@@ -202,7 +202,7 @@ impl PerformanceManager {
         let previous_state = load_state(instance_mods_dir)?;
         let snapshot_available = previous_state.is_some();
         if let Some(previous_state) = previous_state.as_ref() {
-            save_rollback_snapshot(instance_mods_dir, previous_state)?;
+            save_rollback_snapshot_async(instance_mods_dir, previous_state).await?;
         }
 
         let attempt_plans = self.install_attempt_plans(plan);
