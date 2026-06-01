@@ -13,9 +13,15 @@ use crate::paths::{loader_artifacts_dir, versions_dir};
 use crate::profiles::ensure_launcher_profiles;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs as async_fs;
 
 const MAX_INSTALLER_DOWNLOAD_SIZE: u64 = 50 << 20;
+
+struct CachedArtifact {
+    bytes: Vec<u8>,
+    cache_hit: bool,
+}
 
 pub async fn install_from_profile_source<F>(
     library_dir: &Path,
@@ -125,16 +131,7 @@ where
             plan.record.component_name
         )),
     ));
-    let installer_data = if installer_path.is_file() {
-        async_fs::read(&installer_path).await?
-    } else {
-        let bytes = download_to_memory(installer_url).await?;
-        if let Some(parent) = installer_path.parent() {
-            async_fs::create_dir_all(parent).await?;
-        }
-        async_fs::write(&installer_path, &bytes).await?;
-        bytes
-    };
+    let cached_installer = read_or_download_cached_artifact(&installer_path, installer_url).await?;
 
     send(progress(
         "profile",
@@ -145,12 +142,18 @@ where
             plan.record.component_name
         )),
     ));
-    let extracted = extract_installer(&installer_data).map_err(|error| {
-        LoaderError::InvalidProfile(format!(
-            "extracting {} installer: {error}",
-            plan.record.component_name
-        ))
-    })?;
+    let (installer_data, extracted) = match extract_installer(&cached_installer.bytes) {
+        Ok(extracted) => (cached_installer.bytes, extracted),
+        Err(error) if cached_installer.cache_hit => {
+            let _ = async_fs::remove_file(&installer_path).await;
+            let bytes = download_and_cache_artifact(installer_url, &installer_path).await?;
+            let extracted = extract_installer(&bytes).map_err(|fresh_error| {
+                installer_extract_error(&plan.record.component_name, fresh_error)
+            })?;
+            (bytes, extracted)
+        }
+        Err(error) => return Err(installer_extract_error(&plan.record.component_name, error)),
+    };
     let installed_version_id = if extracted.version_id.trim().is_empty() {
         plan.record.version_id.clone()
     } else {
@@ -280,16 +283,9 @@ where
             plan.record.component_name
         )),
     ));
-    let archive_data = if archive_path.is_file() {
-        async_fs::read(&archive_path).await?
-    } else {
-        let bytes = download_to_memory(archive_url).await?;
-        if let Some(parent) = archive_path.parent() {
-            async_fs::create_dir_all(parent).await?;
-        }
-        async_fs::write(&archive_path, &bytes).await?;
-        bytes
-    };
+    let archive_data = read_or_download_cached_artifact(&archive_path, archive_url)
+        .await?
+        .bytes;
 
     let fragment = LoaderProfileFragment {
         id: plan.record.version_id.clone(),
@@ -418,6 +414,63 @@ async fn download_to_memory(url: &str) -> Result<Vec<u8>, LoaderError> {
     fetch_bytes(url, MAX_INSTALLER_DOWNLOAD_SIZE).await
 }
 
+async fn read_or_download_cached_artifact(
+    path: &Path,
+    url: &str,
+) -> Result<CachedArtifact, LoaderError> {
+    if path_is_file(path).await {
+        return Ok(CachedArtifact {
+            bytes: async_fs::read(path).await?,
+            cache_hit: true,
+        });
+    }
+
+    Ok(CachedArtifact {
+        bytes: download_and_cache_artifact(url, path).await?,
+        cache_hit: false,
+    })
+}
+
+async fn download_and_cache_artifact(url: &str, path: &Path) -> Result<Vec<u8>, LoaderError> {
+    let bytes = download_to_memory(url).await?;
+    write_cached_artifact(path, &bytes).await?;
+    Ok(bytes)
+}
+
+async fn write_cached_artifact(path: &Path, bytes: &[u8]) -> Result<(), LoaderError> {
+    if let Some(parent) = path.parent() {
+        async_fs::create_dir_all(parent).await?;
+    }
+
+    let tmp_path = artifact_tmp_path(path);
+    let result = async {
+        async_fs::write(&tmp_path, bytes).await?;
+        async_fs::rename(&tmp_path, path).await?;
+        Ok::<_, LoaderError>(())
+    }
+    .await;
+    if result.is_err() {
+        let _ = async_fs::remove_file(&tmp_path).await;
+    }
+    result
+}
+
+async fn path_is_file(path: &Path) -> bool {
+    matches!(async_fs::metadata(path).await, Ok(metadata) if metadata.is_file())
+}
+
+fn artifact_tmp_path(path: &Path) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or_default();
+    path.with_extension(format!("tmp-{}-{nanos:x}", std::process::id()))
+}
+
+fn installer_extract_error(component_name: &str, error: impl std::fmt::Display) -> LoaderError {
+    LoaderError::InvalidProfile(format!("extracting {component_name} installer: {error}"))
+}
+
 fn cached_installer_path(library_dir: &Path, record: &LoaderBuildRecord) -> PathBuf {
     loader_artifacts_dir(library_dir)
         .join(record.component_id.short_key())
@@ -456,7 +509,7 @@ fn done() -> DownloadProgress {
 
 #[cfg(test)]
 mod tests {
-    use super::cleanup_on_error;
+    use super::{cleanup_on_error, write_cached_artifact};
     use crate::loaders::types::LoaderError;
     use crate::loaders::validate_version_id;
     use crate::paths::versions_dir;
@@ -479,6 +532,50 @@ mod tests {
 
         assert!(result.is_err());
         assert!(!version_dir.exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn cached_artifact_write_uses_temp_file_then_rename() {
+        let root = temp_dir("cached-artifact-write");
+        fs::create_dir_all(&root).expect("root");
+        let path = root.join("installer.jar");
+
+        write_cached_artifact(&path, b"installer bytes")
+            .await
+            .expect("write cached artifact");
+
+        assert_eq!(fs::read(&path).expect("read artifact"), b"installer bytes");
+        assert!(fs::read_dir(&root).expect("read root").all(|entry| {
+            !entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp-")
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn cached_artifact_write_cleans_temp_file_on_rename_failure() {
+        let root = temp_dir("cached-artifact-write-failure");
+        fs::create_dir_all(&root).expect("root");
+        let path = root.join("installer.jar");
+        fs::create_dir_all(&path).expect("directory at destination");
+
+        let result = write_cached_artifact(&path, b"installer bytes").await;
+
+        assert!(result.is_err());
+        assert!(path.is_dir());
+        assert!(fs::read_dir(&root).expect("read root").all(|entry| {
+            !entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp-")
+        }));
 
         let _ = fs::remove_dir_all(root);
     }
