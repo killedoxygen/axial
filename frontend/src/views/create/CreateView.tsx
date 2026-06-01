@@ -358,7 +358,7 @@ function CreateWizard(): JSX.Element {
       }
       if (e.key === 'Enter' && e.ctrlKey) {
         e.preventDefault();
-        if (stepValid) void submit();
+        if (step === 'name' && stepValid) void submit();
         return;
       }
       if (e.key === 'Enter') {
