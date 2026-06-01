@@ -1,6 +1,7 @@
 use super::types::LoaderError;
 use serde::de::DeserializeOwned;
 use std::io::Read;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 const USER_AGENT: &str = "croopor/0.3";
@@ -79,11 +80,14 @@ fn fetch_bytes_blocking(url: &str, max_size: u64) -> Result<Vec<u8>, LoaderError
     Ok(bytes)
 }
 
-fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(20))
-        .timeout_read(Duration::from_secs(120))
-        .timeout_write(Duration::from_secs(120))
-        .user_agent(USER_AGENT)
-        .build()
+fn agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(20))
+            .timeout_read(Duration::from_secs(120))
+            .timeout_write(Duration::from_secs(120))
+            .user_agent(USER_AGENT)
+            .build()
+    })
 }
