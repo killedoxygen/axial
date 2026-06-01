@@ -1792,10 +1792,26 @@ function SavedSkinLibrary({
   const [editBusyKey, setEditBusyKey] = useState<string | null>(null);
   const [deleteKey, setDeleteKey] = useState<string | null>(null);
   const [applyKey, setApplyKey] = useState<string | null>(null);
+  const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const trimmedName = skinName.trim();
   const trimmedEditName = editName.trim();
   const canUpload = !busy && !profileBusy && trimmedName.length > 0;
   const canSaveProfileSkin = onlineReady && !busy && !profileBusy;
+  const selectedSkin = skins.find((skin) => skin.texture_key === selectedKey)
+    ?? skins.find((skin) => Boolean(skin.applied_at))
+    ?? skins[0]
+    ?? null;
+
+  useEffect(() => {
+    if (state !== 'ready') return;
+    if (skins.length === 0) {
+      if (selectedKey !== null) setSelectedKey(null);
+      return;
+    }
+    if (selectedKey && skins.some((skin) => skin.texture_key === selectedKey)) return;
+    const next = skins.find((skin) => Boolean(skin.applied_at)) ?? skins[0];
+    setSelectedKey(next.texture_key);
+  }, [skins, selectedKey, state]);
 
   const upload = async (file: File): Promise<void> => {
     const name = trimmedName || file.name.replace(/\.[^.]+$/, '').trim();
@@ -1821,6 +1837,7 @@ function SavedSkinLibrary({
       }
       setSkinName('');
       refresh();
+      setSelectedKey(null);
     } catch (err) {
       setMessage({
         tone: 'err',
@@ -1837,6 +1854,7 @@ function SavedSkinLibrary({
     setMessage(null);
     try {
       await api('DELETE', `/skins/${textureKey}`);
+      if (selectedKey === textureKey) setSelectedKey(null);
       refresh();
     } catch (err) {
       setMessage({
@@ -1855,6 +1873,7 @@ function SavedSkinLibrary({
     setMessage(null);
     try {
       await api('POST', '/skins/from-profile', {});
+      setSelectedKey(null);
       refresh();
       setMessage({ tone: 'ok', text: 'Minecraft profile skin saved.' });
     } catch (err) {
@@ -1915,6 +1934,7 @@ function SavedSkinLibrary({
     try {
       await api('POST', `/skins/${textureKey}/apply`);
       onApplied();
+      setSelectedKey(textureKey);
       refresh();
       setMessage({ tone: 'ok', text: 'Skin applied to Minecraft profile.' });
     } catch (err) {
@@ -2005,6 +2025,74 @@ function SavedSkinLibrary({
           </div>
         )}
 
+        {selectedSkin && (
+          <div style={{
+            display: 'grid',
+            gridTemplateColumns: 'auto minmax(0, 1fr) auto',
+            gap: 18,
+            alignItems: 'center',
+            padding: '2px 0 14px',
+            borderBottom: '1px solid var(--line)',
+          }}>
+            <SavedSkinBodyPreview skin={selectedSkin} />
+            <div style={{ minWidth: 0, display: 'grid', gap: 8 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                <Pill tone={selectedSkin.applied_at ? 'ok' : 'info'} icon={selectedSkin.applied_at ? 'check-circle' : 'image'}>
+                  {selectedSkin.applied_at ? 'Equipped' : 'Previewing'}
+                </Pill>
+                <Pill tone="neutral">{selectedSkin.variant}</Pill>
+              </div>
+              <div style={{
+                color: theme.n.text,
+                fontSize: 18,
+                fontWeight: 700,
+                lineHeight: 1.15,
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+              }}>
+                {selectedSkin.name}
+              </div>
+              <div style={{
+                color: theme.n.textMute,
+                fontSize: 12,
+                fontFamily: theme.font.mono,
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+              }}>
+                {selectedSkin.texture_key.slice(0, 16)} / {formatByteSize(selectedSkin.byte_size)}
+              </div>
+              <div style={{ color: theme.n.textDim, fontSize: 12.5, lineHeight: 1.45, maxWidth: 560 }}>
+                Preview selection is local. Applying changes the active Minecraft profile only after the online upload succeeds.
+              </div>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 8, flexWrap: 'wrap' }}>
+              <Button
+                variant={selectedSkin.applied_at ? 'ghost' : 'secondary'}
+                size="sm"
+                icon={selectedSkin.applied_at ? 'check-circle' : applyKey === selectedSkin.texture_key ? 'refresh' : 'check'}
+                disabled={!onlineReady || Boolean(selectedSkin.applied_at) || applyKey === selectedSkin.texture_key}
+                onClick={() => void applySkin(selectedSkin.texture_key)}
+                title={selectedSkin.applied_at
+                  ? 'Already applied to the active Minecraft account'
+                  : onlineReady ? 'Apply to active Minecraft account' : 'Online Minecraft account required'}
+              >
+                {selectedSkin.applied_at ? 'Applied' : 'Apply'}
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                icon="edit"
+                disabled={deleteKey === selectedSkin.texture_key || applyKey === selectedSkin.texture_key}
+                onClick={() => startEdit(selectedSkin)}
+              >
+                Edit
+              </Button>
+            </div>
+          </div>
+        )}
+
         <div style={{
           border: '1px solid var(--line)',
           borderRadius: theme.r.md,
@@ -2023,6 +2111,7 @@ function SavedSkinLibrary({
             skins.map((skin, index) => {
               const applied = Boolean(skin.applied_at);
               const editing = editKey === skin.texture_key;
+              const selected = selectedSkin?.texture_key === skin.texture_key;
 
               return (
                 <div
@@ -2033,6 +2122,7 @@ function SavedSkinLibrary({
                     gap: 12,
                     alignItems: 'center',
                     padding: '10px 12px',
+                    background: selected ? 'var(--accent-softer)' : undefined,
                     borderTop: index === 0 ? undefined : '1px solid var(--line)',
                   }}
                 >
@@ -2129,6 +2219,15 @@ function SavedSkinLibrary({
                         flexWrap: 'wrap',
                       }}>
                         <Button
+                          variant={selected ? 'secondary' : 'ghost'}
+                          size="sm"
+                          icon="image"
+                          disabled={deleteKey === skin.texture_key}
+                          onClick={() => setSelectedKey(skin.texture_key)}
+                        >
+                          View
+                        </Button>
+                        <Button
                           variant={applied ? 'ghost' : 'secondary'}
                           size="sm"
                           icon={applied
@@ -2184,6 +2283,94 @@ function formatByteSize(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes < 0) return '0 B';
   if (bytes < 1024) return `${Math.round(bytes)} B`;
   return `${(bytes / 1024).toFixed(1)} KiB`;
+}
+
+function savedSkinFileUrl(skin: SavedSkinRecord): string {
+  return apiResourceUrl(`/skins/${skin.texture_key}/file`);
+}
+
+function SkinPreviewPart({
+  src,
+  x,
+  y,
+  w,
+  h,
+  scale,
+  style,
+}: {
+  src: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  scale: number;
+  style?: JSX.CSSProperties;
+}): JSX.Element {
+  return (
+    <span
+      aria-hidden="true"
+      style={{
+        display: 'block',
+        width: w * scale,
+        height: h * scale,
+        backgroundImage: `url("${src}")`,
+        backgroundRepeat: 'no-repeat',
+        backgroundSize: `${64 * scale}px ${64 * scale}px`,
+        backgroundPosition: `-${x * scale}px -${y * scale}px`,
+        imageRendering: 'pixelated',
+        ...style,
+      }}
+    />
+  );
+}
+
+function SavedSkinBodyPreview({ skin }: { skin: SavedSkinRecord }): JSX.Element {
+  const src = savedSkinFileUrl(skin);
+  const scale = 6;
+  const slim = skin.variant === 'slim';
+  const armWidth = slim ? 3 : 4;
+
+  return (
+    <div
+      role="img"
+      aria-label={`${skin.name} full skin preview`}
+      style={{
+        width: 118,
+        minHeight: 208,
+        display: 'grid',
+        alignContent: 'center',
+        justifyItems: 'center',
+        gap: 0,
+        padding: 12,
+        border: '1px solid var(--line)',
+        borderRadius: 'var(--r-md)',
+        background: 'var(--surface-2)',
+        boxShadow: 'inset 0 1px 0 color-mix(in oklab, var(--text) 5%, transparent)',
+      }}
+    >
+      <div style={{ position: 'relative', width: 8 * scale, height: 8 * scale, marginBottom: 2 }}>
+        <SkinPreviewPart src={src} x={8} y={8} w={8} h={8} scale={scale} />
+        <SkinPreviewPart
+          src={src}
+          x={40}
+          y={8}
+          w={8}
+          h={8}
+          scale={scale}
+          style={{ position: 'absolute', inset: 0 }}
+        />
+      </div>
+      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'center' }}>
+        <SkinPreviewPart src={src} x={44} y={20} w={armWidth} h={12} scale={scale} />
+        <SkinPreviewPart src={src} x={20} y={20} w={8} h={12} scale={scale} />
+        <SkinPreviewPart src={src} x={36} y={52} w={armWidth} h={12} scale={scale} />
+      </div>
+      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'center' }}>
+        <SkinPreviewPart src={src} x={4} y={20} w={4} h={12} scale={scale} />
+        <SkinPreviewPart src={src} x={20} y={52} w={4} h={12} scale={scale} />
+      </div>
+    </div>
+  );
 }
 
 export function AccountsView(): JSX.Element {
