@@ -650,7 +650,7 @@ where
             let src = objects_dir
                 .join(asset_object_hash_prefix(&object.hash)?)
                 .join(&object.hash);
-            let dst = virtual_dir.join(PathBuf::from(name));
+            let dst = virtual_asset_destination(&virtual_dir, &name)?;
             copy_virtual_asset_if_missing(&src, &dst).await?;
         }
     }
@@ -1336,6 +1336,18 @@ fn bounded_download_file_label(path: &Path) -> String {
     }
 }
 
+fn bounded_provider_path_label(path: &str) -> String {
+    const MAX_LABEL_CHARS: usize = 120;
+    let sanitized = path.replace(['\r', '\n'], "?");
+    let mut chars = sanitized.chars();
+    let label = chars.by_ref().take(MAX_LABEL_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        format!("{label}...")
+    } else {
+        label
+    }
+}
+
 async fn path_is_file(path: &Path) -> bool {
     matches!(async_fs::metadata(path).await, Ok(metadata) if metadata.is_file())
 }
@@ -1349,6 +1361,34 @@ async fn copy_virtual_asset_if_missing(src: &Path, dst: &Path) -> Result<(), Dow
     }
     async_fs::copy(src, dst).await?;
     Ok(())
+}
+
+fn virtual_asset_destination(root: &Path, asset_name: &str) -> Result<PathBuf, DownloadError> {
+    if asset_name.trim().is_empty() {
+        return Err(unsafe_virtual_asset_path_error(asset_name));
+    }
+
+    let mut destination = root.to_path_buf();
+    for segment in asset_name.split(['/', '\\']) {
+        if segment.is_empty()
+            || segment.contains(':')
+            || Path::new(segment)
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(unsafe_virtual_asset_path_error(asset_name));
+        }
+        destination.push(segment);
+    }
+
+    Ok(destination)
+}
+
+fn unsafe_virtual_asset_path_error(asset_name: &str) -> DownloadError {
+    DownloadError::Integrity(format!(
+        "unsafe virtual asset path: {}",
+        bounded_provider_path_label(asset_name)
+    ))
 }
 
 fn resolve_path_under_root(root: &Path, relative: &str) -> Option<PathBuf> {
@@ -1836,6 +1876,34 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn virtual_asset_destination_rejects_unsafe_provider_paths() {
+        let root = Path::new("/tmp/croopor-test/assets/virtual/legacy");
+
+        assert_eq!(
+            virtual_asset_destination(root, "sounds/step.ogg").expect("safe path"),
+            root.join("sounds").join("step.ogg")
+        );
+
+        for unsafe_name in [
+            "",
+            "/absolute.ogg",
+            "../escape.ogg",
+            "sounds/../escape.ogg",
+            "sounds//step.ogg",
+            "C:\\escape.ogg",
+        ] {
+            assert!(
+                matches!(
+                    virtual_asset_destination(root, unsafe_name),
+                    Err(DownloadError::Integrity(message))
+                        if message.contains("unsafe virtual asset path")
+                ),
+                "expected unsafe virtual asset path rejection for {unsafe_name:?}"
+            );
+        }
     }
 
     #[tokio::test]
