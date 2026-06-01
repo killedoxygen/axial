@@ -7,10 +7,11 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
+use tokio::io::AsyncWriteExt;
 
 const MIN_LIBRARY_DOWNLOAD_CONCURRENCY: usize = 4;
 const MAX_LIBRARY_DOWNLOAD_CONCURRENCY: usize = 16;
@@ -378,14 +379,14 @@ impl Downloader {
         for attempt in 0..3 {
             let result = async {
                 let response = self.client.get(url).send().await?.error_for_status()?;
-                let mut output = fs::File::create(&tmp_path)?;
+                let mut output = tokio::fs::File::create(&tmp_path).await?;
                 let mut stream = response.bytes_stream();
                 while let Some(chunk) = stream.next().await {
                     let chunk = chunk?;
-                    output.write_all(&chunk)?;
+                    output.write_all(&chunk).await?;
                 }
-                output.flush()?;
-                fs::rename(&tmp_path, destination)?;
+                output.flush().await?;
+                tokio::fs::rename(&tmp_path, destination).await?;
                 Ok::<(), DownloadError>(())
             }
             .await;
@@ -712,14 +713,14 @@ async fn download_file_with_client(
     for attempt in 0..3 {
         let result = async {
             let response = client.get(url).send().await?.error_for_status()?;
-            let mut output = fs::File::create(&tmp_path)?;
+            let mut output = tokio::fs::File::create(&tmp_path).await?;
             let mut stream = response.bytes_stream();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk?;
-                output.write_all(&chunk)?;
+                output.write_all(&chunk).await?;
             }
-            output.flush()?;
-            fs::rename(&tmp_path, destination)?;
+            output.flush().await?;
+            tokio::fs::rename(&tmp_path, destination).await?;
             Ok::<(), DownloadError>(())
         }
         .await;

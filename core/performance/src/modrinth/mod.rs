@@ -3,10 +3,11 @@ use reqwest::{Client, Response, StatusCode, Url};
 use serde::Deserialize;
 use sha2::{Digest, Sha512};
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
+use tokio::io::AsyncWriteExt;
 
 const USER_AGENT: &str = "croopor/0.3.1 (github.com/mateoltd/croopor)";
 const RATE_LIMIT_BODY_LIMIT: usize = 4096;
@@ -132,14 +133,14 @@ impl ModrinthClient {
         }
 
         let result = async {
-            let mut output = fs::File::create(temp_path)?;
+            let mut output = tokio::fs::File::create(temp_path).await?;
             let mut hasher = Sha512::new();
             let mut response = response;
             while let Some(chunk) = response.chunk().await? {
                 hasher.update(&chunk);
-                output.write_all(&chunk)?;
+                output.write_all(&chunk).await?;
             }
-            output.flush()?;
+            output.flush().await?;
             Ok::<String, ModrinthError>(encode(hasher.finalize()))
         }
         .await;
