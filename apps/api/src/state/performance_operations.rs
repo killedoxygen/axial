@@ -423,6 +423,29 @@ pub fn sanitize_operation_error(value: &str) -> String {
         return "performance operation failed".to_string();
     }
 
+    let lower = value.to_ascii_lowercase();
+    let sensitive = [
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "auth_token",
+        "token",
+        "password",
+        "secret",
+        "credential",
+        "authorization",
+        "bearer",
+        "username",
+        "command",
+        "jvm",
+        "java_path",
+        "java path",
+        "args",
+    ];
+    if sensitive.iter().any(|token| lower.contains(token)) {
+        return "performance operation failed".to_string();
+    }
+
     let sanitized = value
         .chars()
         .filter(|value| !value.is_control() && !matches!(value, '/' | '\\' | ';'))
@@ -771,6 +794,25 @@ mod tests {
         assert!(error.len() <= MAX_OPERATION_ERROR_CHARS);
         assert!(!error.contains(';'));
         assert_eq!(sanitize_operation_error(""), "performance operation failed");
+    }
+
+    #[test]
+    fn operation_error_sanitizer_rejects_sensitive_fragments() {
+        let cases = [
+            "provider returned token=secret-token",
+            "refresh_token=secret-refresh-token",
+            "Authorization: Bearer raw-provider-token",
+            "java_path=C:\\Users\\Alice\\secret\\java.exe",
+            "command failed with -Dauth_token=secret",
+            "username=SecretPlayer",
+        ];
+
+        for case in cases {
+            assert_eq!(
+                sanitize_operation_error(case),
+                "performance operation failed"
+            );
+        }
     }
 
     fn test_payload() -> PerformanceOperationPayload {
