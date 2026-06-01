@@ -103,11 +103,37 @@ where
     let tmp_path = cache_tmp_path(path);
     let result = (|| -> Result<(), LoaderError> {
         fs::write(&tmp_path, data)?;
-        fs::rename(&tmp_path, path)?;
+        promote_cache_tmp_file(&tmp_path, path)?;
         Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&tmp_path);
+    }
+    result
+}
+
+fn promote_cache_tmp_file(tmp_path: &Path, path: &Path) -> std::io::Result<()> {
+    let first_error = match fs::rename(tmp_path, path) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+
+    match fs::symlink_metadata(tmp_path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(first_error),
+        Err(error) => return Err(error),
+    }
+
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        let file_type = metadata.file_type();
+        if file_type.is_file() || file_type.is_symlink() {
+            fs::remove_file(path)?;
+        }
+    }
+
+    let result = fs::rename(tmp_path, path);
+    if result.is_err() {
+        let _ = fs::remove_file(tmp_path);
     }
     result
 }
@@ -185,6 +211,58 @@ mod tests {
                 .to_string_lossy()
                 .contains(".tmp-")
         }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn promote_cache_tmp_file_replaces_existing_destination() {
+        let root = temp_dir("promote-replaces-destination");
+        fs::create_dir_all(&root).expect("create root");
+        let tmp_path = root.join("catalog.tmp");
+        let cache_path = root.join("catalog.json");
+        fs::write(&cache_path, b"old").expect("write old cache");
+        fs::write(&tmp_path, b"new").expect("write temp cache");
+
+        promote_cache_tmp_file(&tmp_path, &cache_path).expect("promote temp cache");
+
+        assert_eq!(fs::read(&cache_path).expect("read promoted cache"), b"new");
+        assert!(!tmp_path.exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn promote_cache_tmp_file_preserves_destination_when_temp_is_missing() {
+        let root = temp_dir("promote-missing-temp");
+        fs::create_dir_all(&root).expect("create root");
+        let tmp_path = root.join("missing.tmp");
+        let cache_path = root.join("catalog.json");
+        fs::write(&cache_path, b"old").expect("write old cache");
+
+        let error =
+            promote_cache_tmp_file(&tmp_path, &cache_path).expect_err("missing temp should fail");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(fs::read(&cache_path).expect("read old cache"), b"old");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn promote_cache_tmp_file_preserves_directory_destination_on_retry_failure() {
+        let root = temp_dir("promote-directory-destination");
+        fs::create_dir_all(&root).expect("create root");
+        let tmp_path = root.join("catalog.tmp");
+        let cache_path = root.join("catalog.json");
+        fs::create_dir_all(&cache_path).expect("create cache directory");
+        fs::write(&tmp_path, b"new").expect("write temp cache");
+
+        let result = promote_cache_tmp_file(&tmp_path, &cache_path);
+
+        assert!(result.is_err());
+        assert!(cache_path.is_dir());
+        assert!(!tmp_path.exists());
 
         let _ = fs::remove_dir_all(root);
     }
