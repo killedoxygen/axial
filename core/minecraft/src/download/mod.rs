@@ -437,7 +437,7 @@ impl Downloader {
                 .objects
                 .values()
                 .map(|object| (object.hash.as_str(), object.size)),
-        ))
+        )?)
         .await?;
 
         send(progress("assets", 0, jobs.len() as i32, None));
@@ -470,7 +470,9 @@ impl Downloader {
         if index.virtual_flag || index.map_to_resources {
             let virtual_dir = assets_dir(&self.mc_dir).join("virtual").join("legacy");
             for (name, object) in index.objects {
-                let src = objects_dir.join(&object.hash[..2]).join(&object.hash);
+                let src = objects_dir
+                    .join(asset_object_hash_prefix(&object.hash)?)
+                    .join(&object.hash);
                 let dst = virtual_dir.join(PathBuf::from(name));
                 copy_virtual_asset_if_missing(&src, &dst).await?;
             }
@@ -620,15 +622,15 @@ struct AssetObjectDownloadJob {
 fn unique_asset_object_jobs<'a>(
     objects_dir: &Path,
     objects: impl IntoIterator<Item = (&'a str, i64)>,
-) -> Vec<AssetObjectDownloadJob> {
+) -> Result<Vec<AssetObjectDownloadJob>, DownloadError> {
     let mut jobs = Vec::new();
     let mut queued_hashes = HashSet::new();
 
     for (hash, size) in objects {
+        let prefix = asset_object_hash_prefix(hash)?;
         if !queued_hashes.insert(hash.to_string()) {
             continue;
         }
-        let prefix = &hash[..2];
         jobs.push(AssetObjectDownloadJob {
             hash: hash.to_string(),
             path: objects_dir.join(prefix).join(hash),
@@ -636,7 +638,23 @@ fn unique_asset_object_jobs<'a>(
         });
     }
 
-    jobs
+    Ok(jobs)
+}
+
+fn asset_object_hash_prefix(hash: &str) -> Result<&str, DownloadError> {
+    const SHA1_HEX_LEN: usize = 40;
+    if hash.len() != SHA1_HEX_LEN {
+        return Err(DownloadError::Integrity(format!(
+            "malformed asset object hash: expected {SHA1_HEX_LEN} hex characters, got {}",
+            hash.len()
+        )));
+    }
+    if !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(DownloadError::Integrity(
+            "malformed asset object hash: expected hex characters".to_string(),
+        ));
+    }
+    Ok(&hash[..2])
 }
 
 async fn missing_asset_object_jobs(
@@ -1245,7 +1263,8 @@ mod tests {
         let hash_a = "abcdef1234567890abcdef1234567890abcdef12";
         let hash_b = "1234567890abcdef1234567890abcdef12345678";
 
-        let jobs = unique_asset_object_jobs(objects_dir, [(hash_a, 4), (hash_a, 4), (hash_b, 8)]);
+        let jobs = unique_asset_object_jobs(objects_dir, [(hash_a, 4), (hash_a, 4), (hash_b, 8)])
+            .expect("valid asset jobs");
 
         assert_eq!(jobs.len(), 2);
         assert_eq!(jobs[0].hash, hash_a);
@@ -1254,6 +1273,25 @@ mod tests {
         assert_eq!(jobs[1].hash, hash_b);
         assert_eq!(jobs[1].path, objects_dir.join("12").join(hash_b));
         assert_eq!(jobs[1].expected, ExpectedIntegrity::from_mojang(8, hash_b));
+    }
+
+    #[test]
+    fn unique_asset_object_jobs_rejects_one_character_hash() {
+        let objects_dir = Path::new("/tmp/croopor-test/assets/objects");
+        let result = unique_asset_object_jobs(objects_dir, [("a", 4)]);
+
+        assert!(matches!(result, Err(DownloadError::Integrity(_))));
+    }
+
+    #[test]
+    fn unique_asset_object_jobs_rejects_non_hex_hash() {
+        let objects_dir = Path::new("/tmp/croopor-test/assets/objects");
+        let result = unique_asset_object_jobs(
+            objects_dir,
+            [("abcdef1234567890abcdef1234567890abcdef1z", 4)],
+        );
+
+        assert!(matches!(result, Err(DownloadError::Integrity(_))));
     }
 
     #[tokio::test]
