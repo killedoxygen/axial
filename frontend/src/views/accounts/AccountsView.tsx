@@ -373,6 +373,19 @@ function skinSourceLabel(source: string, authMode: string): string {
   return 'Offline default';
 }
 
+function savedSkinSourceLabel(source: string): string {
+  switch (source) {
+    case 'minecraft_profile_skin':
+      return 'Minecraft profile';
+    case 'minecraft_username_skin':
+      return 'Player lookup';
+    case 'local_upload':
+      return 'Upload';
+    default:
+      return 'Saved skin';
+  }
+}
+
 function SkinProfileMeta({
   profile,
   state,
@@ -2354,6 +2367,7 @@ function SavedSkinLibrary({
                 <Pill tone={selectedSkin.applied_at ? 'ok' : 'info'} icon={selectedSkin.applied_at ? 'check-circle' : 'image'}>
                   {selectedSkin.applied_at ? 'Equipped' : 'Previewing'}
                 </Pill>
+                <Pill tone="neutral" icon="tag">{savedSkinSourceLabel(selectedSkin.source)}</Pill>
                 <Pill tone="neutral">{selectedSkin.variant}</Pill>
               </div>
               <div style={{
@@ -2535,6 +2549,7 @@ function SavedSkinLibrary({
                         justifyContent: 'flex-end',
                       }}>
                         <Pill tone="neutral">{skin.variant}</Pill>
+                        <Pill tone="neutral" icon="tag">{savedSkinSourceLabel(skin.source)}</Pill>
                         {applied && <Pill tone="ok" icon="check-circle">Equipped</Pill>}
                       </div>
                       <div style={{
