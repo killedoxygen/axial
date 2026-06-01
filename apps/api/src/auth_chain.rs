@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{fmt, time::Duration};
 
 const AUTH_CHAIN_TIMEOUT: Duration = Duration::from_secs(20);
+const MAX_AUTH_CHAIN_RESPONSE_BYTES: usize = 1024 * 1024;
 const XBOX_USER_AUTHENTICATE_ENDPOINT: &str = "https://user.auth.xboxlive.com/user/authenticate";
 const XSTS_AUTHORIZE_ENDPOINT: &str = "https://xsts.auth.xboxlive.com/xsts/authorize";
 const MINECRAFT_LOGIN_WITH_XBOX_ENDPOINT: &str =
@@ -489,10 +490,31 @@ where
         return Err(AuthChainError::new(error_kind_for_status(status)));
     }
 
-    response
-        .json::<R>()
+    let body = bounded_response_body(response).await?;
+    serde_json::from_slice::<R>(&body).map_err(|_| AuthChainError::new(AuthChainErrorKind::Parse))
+}
+
+async fn bounded_response_body(mut response: reqwest::Response) -> Result<Vec<u8>, AuthChainError> {
+    if response
+        .content_length()
+        .is_some_and(|content_length| content_length > MAX_AUTH_CHAIN_RESPONSE_BYTES as u64)
+    {
+        return Err(AuthChainError::new(AuthChainErrorKind::Parse));
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|_| AuthChainError::new(AuthChainErrorKind::Parse))
+        .map_err(|_| AuthChainError::new(AuthChainErrorKind::Parse))?
+    {
+        if body.len().saturating_add(chunk.len()) > MAX_AUTH_CHAIN_RESPONSE_BYTES {
+            return Err(AuthChainError::new(AuthChainErrorKind::Parse));
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    Ok(body)
 }
 
 fn error_kind_for_status(status: StatusCode) -> AuthChainErrorKind {
@@ -514,6 +536,7 @@ mod tests {
         routing::{get, post},
     };
     use serde_json::Value;
+    use tokio::io::AsyncWriteExt;
     use tokio::sync::mpsc;
 
     #[tokio::test]
@@ -643,6 +666,52 @@ mod tests {
             .expect("ownership response");
 
         assert!(!ownership.owns_minecraft_java);
+    }
+
+    #[tokio::test]
+    async fn auth_chain_rejects_oversized_provider_content_length() {
+        let endpoint = spawn_raw_auth_response(
+            "200 OK",
+            vec![
+                ("Content-Type".to_string(), "application/json".to_string()),
+                (
+                    "Content-Length".to_string(),
+                    (MAX_AUTH_CHAIN_RESPONSE_BYTES + 1).to_string(),
+                ),
+            ],
+            b"[]".to_vec(),
+        )
+        .await;
+        let client =
+            AuthChainClient::with_endpoints(single_endpoint_auth_chain_endpoints(endpoint))
+                .expect("auth chain client");
+
+        let error = client
+            .authenticate_xbox_live("msa-access-token")
+            .await
+            .expect_err("oversized content length should fail");
+
+        assert_eq!(error.kind(), AuthChainErrorKind::Parse);
+    }
+
+    #[tokio::test]
+    async fn auth_chain_rejects_stream_past_response_limit() {
+        let endpoint = spawn_raw_auth_response(
+            "200 OK",
+            vec![("Content-Type".to_string(), "application/json".to_string())],
+            vec![b' '; MAX_AUTH_CHAIN_RESPONSE_BYTES + 1],
+        )
+        .await;
+        let client =
+            AuthChainClient::with_endpoints(single_endpoint_auth_chain_endpoints(endpoint))
+                .expect("auth chain client");
+
+        let error = client
+            .authenticate_xbox_live("msa-access-token")
+            .await
+            .expect_err("oversized stream should fail");
+
+        assert_eq!(error.kind(), AuthChainErrorKind::Parse);
     }
 
     #[derive(Clone, Copy)]
@@ -843,5 +912,40 @@ mod tests {
             .get(name)
             .and_then(|value| value.to_str().ok())
             .map(ToOwned::to_owned)
+    }
+
+    fn single_endpoint_auth_chain_endpoints(endpoint: String) -> AuthChainEndpoints {
+        AuthChainEndpoints {
+            xbox_user_authenticate: endpoint.clone(),
+            xsts_authorize: endpoint.clone(),
+            minecraft_login_with_xbox: endpoint.clone(),
+            minecraft_profile: endpoint.clone(),
+            minecraft_ownership: endpoint,
+        }
+    }
+
+    async fn spawn_raw_auth_response(
+        status: &str,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    ) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind raw auth response server");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let status = status.to_string();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut response = format!("HTTP/1.1 {status}\r\nConnection: close\r\n");
+                for (name, value) in headers {
+                    response.push_str(&format!("{name}: {value}\r\n"));
+                }
+                response.push_str("\r\n");
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.write_all(&body).await;
+            }
+        });
+
+        endpoint
     }
 }
