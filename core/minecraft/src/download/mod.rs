@@ -517,6 +517,7 @@ impl Downloader {
 
         for attempt in 0..3 {
             let result = async {
+                remove_stale_download_temp(&tmp_path).await?;
                 let response = self.client.get(url).send().await?.error_for_status()?;
                 let mut output = tokio::fs::File::create(&tmp_path).await?;
                 let mut stream = response.bytes_stream();
@@ -535,7 +536,7 @@ impl Downloader {
                 Ok(()) => return Ok(()),
                 Err(error) => {
                     last_error = Some(error);
-                    let _ = async_fs::remove_file(&tmp_path).await;
+                    let _ = remove_stale_download_temp(&tmp_path).await;
                     if attempt < 2 {
                         tokio::time::sleep(Duration::from_millis(250 * (attempt + 1) as u64)).await;
                     }
@@ -956,6 +957,7 @@ async fn download_file_with_client(
     let mut last_error: Option<DownloadError> = None;
     for attempt in 0..3 {
         let result = async {
+            remove_stale_download_temp(&tmp_path).await?;
             let response = client.get(url).send().await?.error_for_status()?;
             let mut output = tokio::fs::File::create(&tmp_path).await?;
             let mut stream = response.bytes_stream();
@@ -974,7 +976,7 @@ async fn download_file_with_client(
             Ok(()) => return Ok(()),
             Err(error) => {
                 last_error = Some(error);
-                let _ = async_fs::remove_file(&tmp_path).await;
+                let _ = remove_stale_download_temp(&tmp_path).await;
                 if attempt < 2 {
                     tokio::time::sleep(Duration::from_millis(250 * (attempt + 1) as u64)).await;
                 }
@@ -982,6 +984,22 @@ async fn download_file_with_client(
         }
     }
     Err(last_error.unwrap_or_else(|| DownloadError::ResolveManifest("download failed".to_string())))
+}
+
+async fn remove_stale_download_temp(temp_path: &Path) -> Result<(), DownloadError> {
+    let metadata = match async_fs::symlink_metadata(temp_path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(DownloadError::FileOperation(error)),
+    };
+    let file_type = metadata.file_type();
+    let result = if metadata.is_dir() && !file_type.is_symlink() {
+        async_fs::remove_dir_all(temp_path).await
+    } else {
+        async_fs::remove_file(temp_path).await
+    };
+
+    result.map_err(DownloadError::FileOperation)
 }
 
 async fn promote_download_temp(temp_path: &Path, destination: &Path) -> Result<(), DownloadError> {
@@ -1511,6 +1529,46 @@ mod tests {
         assert!(!temp_path.exists());
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn remove_stale_download_temp_removes_directory() {
+        let root = temp_dir("temp-cleanup-dir");
+        fs::create_dir_all(root.join("artifact.tmp")).expect("create stale temp directory");
+
+        remove_stale_download_temp(&root.join("artifact.tmp"))
+            .await
+            .expect("remove stale temp directory");
+
+        assert!(!root.join("artifact.tmp").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn remove_stale_download_temp_removes_file() {
+        let root = temp_dir("temp-cleanup-file");
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(root.join("artifact.tmp"), b"stale").expect("write stale temp file");
+
+        remove_stale_download_temp(&root.join("artifact.tmp"))
+            .await
+            .expect("remove stale temp file");
+
+        assert!(!root.join("artifact.tmp").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn remove_stale_download_temp_accepts_missing_path() {
+        let root = temp_dir("temp-cleanup-missing");
+
+        remove_stale_download_temp(&root.join("artifact.tmp"))
+            .await
+            .expect("missing temp path is clean");
+
+        assert!(!root.join("artifact.tmp").exists());
     }
 
     #[tokio::test]
