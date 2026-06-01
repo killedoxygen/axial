@@ -13,6 +13,7 @@ use crate::paths::{loader_artifacts_dir, versions_dir};
 use crate::profiles::ensure_launcher_profiles;
 use std::fs;
 use std::path::{Path, PathBuf};
+use tokio::fs as async_fs;
 
 const MAX_INSTALLER_DOWNLOAD_SIZE: u64 = 50 << 20;
 
@@ -125,13 +126,13 @@ where
         )),
     ));
     let installer_data = if installer_path.is_file() {
-        fs::read(&installer_path)?
+        async_fs::read(&installer_path).await?
     } else {
         let bytes = download_to_memory(installer_url).await?;
         if let Some(parent) = installer_path.parent() {
-            fs::create_dir_all(parent)?;
+            async_fs::create_dir_all(parent).await?;
         }
-        fs::write(&installer_path, &bytes)?;
+        async_fs::write(&installer_path, &bytes).await?;
         bytes
     };
 
@@ -280,13 +281,13 @@ where
         )),
     ));
     let archive_data = if archive_path.is_file() {
-        fs::read(&archive_path)?
+        async_fs::read(&archive_path).await?
     } else {
         let bytes = download_to_memory(archive_url).await?;
         if let Some(parent) = archive_path.parent() {
-            fs::create_dir_all(parent)?;
+            async_fs::create_dir_all(parent).await?;
         }
-        fs::write(&archive_path, &bytes)?;
+        async_fs::write(&archive_path, &bytes).await?;
         bytes
     };
 
@@ -316,7 +317,7 @@ where
         .join(&plan.record.version_id)
         .join(format!("{}.jar", plan.record.version_id));
     cleanup_on_error(
-        fs::write(&version_jar, archive_data),
+        async_fs::write(&version_jar, archive_data).await,
         library_dir,
         &plan.record.version_id,
     )?;
