@@ -98,7 +98,7 @@
    between the top strip and the fixed bottom bar. */
 @media (max-height: 720px) {
   .cp-ob-stage { gap: 16px; }
-  .cp-ob-headline { font-size: clamp(24px, 3.4vw, 32px); }
+  .cp-ob-headline { font-size: 30px; }
   .cp-ob-statusbar { padding: 10px clamp(20px, 4vw, 40px); }
 }
 
@@ -201,7 +201,7 @@ button.cp-ob-stepper-item:focus-visible {
 .cp-ob-stepper-num {
   font-size: 11px;
   font-weight: 700;
-  letter-spacing: 0.6px;
+  letter-spacing: 0;
   font-variant-numeric: tabular-nums;
   opacity: 0.55;
   transition: color 200ms ease, opacity 200ms ease;
@@ -220,7 +220,7 @@ button.cp-ob-stepper-item:focus-visible {
 .cp-ob-stepper-label {
   font-size: 13px;
   font-weight: 500;
-  letter-spacing: -0.1px;
+  letter-spacing: 0;
   white-space: nowrap;
   transition: font-weight 200ms ease;
 }
@@ -253,9 +253,9 @@ button.cp-ob-stepper-item:focus-visible {
 
 .cp-ob-headline {
   margin: 0;
-  font-size: clamp(28px, 4.4vw, 40px);
+  font-size: 36px;
   font-weight: 500;
-  letter-spacing: -0.7px;
+  letter-spacing: 0;
   line-height: 1.12;
   color: var(--text);
 }
@@ -276,7 +276,7 @@ button.cp-ob-stepper-item:focus-visible {
   font-size: 14px;
   color: var(--text-dim);
   line-height: 1.55;
-  letter-spacing: -0.1px;
+  letter-spacing: 0;
 }
 
 /* Widget area ------------------------------------------------------------- */
@@ -393,7 +393,7 @@ button.cp-ob-stepper-item:focus-visible {
   flex-shrink: 0;
   font-size: 10.5px;
   font-weight: 600;
-  letter-spacing: 0.3px;
+  letter-spacing: 0;
   text-transform: uppercase;
   padding: 3px 8px;
   border-radius: 999px;
@@ -417,7 +417,7 @@ button.cp-ob-stepper-item:focus-visible {
 .cp-ob-memreading {
   font-size: 28px;
   font-weight: 500;
-  letter-spacing: -0.5px;
+  letter-spacing: 0;
   color: var(--text);
   font-variant-numeric: tabular-nums;
   transition: color 240ms ease;
@@ -444,7 +444,7 @@ button.cp-ob-stepper-item:focus-visible {
   padding: 4px 10px;
   font-size: 11px;
   font-weight: 700;
-  letter-spacing: 0.3px;
+  letter-spacing: 0;
   color: var(--text);
   background: var(--surface-2);
   border: 1px solid var(--line);
@@ -497,7 +497,7 @@ button.cp-ob-stepper-item:focus-visible {
 .cp-ob-footnote {
   font-size: 11px;
   font-weight: 500;
-  letter-spacing: 0.1px;
+  letter-spacing: 0;
   color: var(--text-mute);
   pointer-events: none;
   text-align: center;

@@ -115,7 +115,7 @@
   font-size: 13px;
   color: #fff;
   font-variant-numeric: tabular-nums;
-  letter-spacing: 0.1px;
+  letter-spacing: 0;
   text-shadow: 0 1px 6px rgba(0,0,0,0.55);
 }
 .cp-instance-title {
@@ -123,7 +123,7 @@
   font-size: 40px;
   font-weight: 600;
   color: var(--text);
-  letter-spacing: -1.1px;
+  letter-spacing: 0;
   line-height: 1.03;
   word-break: break-word;
   text-shadow:
@@ -138,7 +138,7 @@
   gap: 6px 10px;
   font-size: 13px;
   color: var(--text-dim);
-  letter-spacing: -0.05px;
+  letter-spacing: 0;
   text-shadow: 0 1px 8px rgba(0,0,0,0.6);
 }
 .cp-instance-subtitle b {
@@ -210,7 +210,7 @@
   font-size: 14px;
   font-style: normal;
   font-weight: 600;
-  letter-spacing: -0.1px;
+  letter-spacing: 0;
   cursor: pointer;
   transition: background 120ms ease, transform 120ms ease;
 }
@@ -304,7 +304,7 @@
   font-weight: 600;
   cursor: pointer;
   border-radius: var(--r-sm);
-  letter-spacing: -0.1px;
+  letter-spacing: 0;
   display: inline-flex;
   align-items: center;
   gap: 8px;
@@ -398,7 +398,7 @@
   font-size: 13px;
   font-weight: 700;
   line-height: 1.35;
-  letter-spacing: -0.05px;
+  letter-spacing: 0;
   overflow-wrap: anywhere;
 }
 .cp-launch-notice-copy p {
@@ -507,7 +507,7 @@
   font-size: 18px;
   font-weight: 650;
   line-height: 1.2;
-  letter-spacing: -0.18px;
+  letter-spacing: 0;
 }
 .cp-instance-install-lock-copy p {
   margin: 5px 0 0;
@@ -742,7 +742,7 @@
   font-size: 14px;
   font-weight: 600;
   color: var(--text);
-  letter-spacing: -0.2px;
+  letter-spacing: 0;
   display: inline-flex;
   align-items: baseline;
   gap: 6px;
@@ -776,7 +776,7 @@
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  letter-spacing: -0.05px;
+  letter-spacing: 0;
   transition: color 120ms ease;
 }
 .cp-od-link:hover { color: var(--text); }
@@ -838,7 +838,7 @@
   font-size: 14px;
   font-weight: 600;
   color: var(--text);
-  letter-spacing: -0.15px;
+  letter-spacing: 0;
 }
 .cp-od-worlds-copy p {
   margin: 0;
@@ -887,7 +887,7 @@
   font-size: 13px;
   font-weight: 600;
   color: var(--text);
-  letter-spacing: -0.1px;
+  letter-spacing: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -961,7 +961,7 @@
   color: var(--text);
   font-size: 12.5px;
   font-weight: 700;
-  letter-spacing: -0.05px;
+  letter-spacing: 0;
 }
 .cp-od-perf-summary-copy span {
   margin-top: 2px;
@@ -985,14 +985,14 @@
 .cp-od-perf-key {
   font-size: 12px;
   color: var(--text-mute);
-  letter-spacing: -0.05px;
+  letter-spacing: 0;
 }
 .cp-od-perf-val {
   font-size: 12.5px;
   font-weight: 500;
   color: var(--text);
   font-variant-numeric: tabular-nums;
-  letter-spacing: -0.1px;
+  letter-spacing: 0;
   text-align: right;
 }
 
@@ -1020,7 +1020,7 @@
   flex: 1;
   min-width: 0;
   color: var(--text);
-  letter-spacing: -0.05px;
+  letter-spacing: 0;
 }
 
 /* Quick actions: compact command surface in the main column. */
@@ -1085,7 +1085,7 @@
   font-size: 13px;
   font-weight: 600;
   color: var(--text);
-  letter-spacing: -0.1px;
+  letter-spacing: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1093,7 +1093,7 @@
 .cp-od-quick-copy span {
   font-size: 11.5px;
   color: var(--text-mute);
-  letter-spacing: -0.05px;
+  letter-spacing: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1127,7 +1127,7 @@
 .cp-od-event-msg {
   font-size: 13px;
   color: var(--text);
-  letter-spacing: -0.05px;
+  letter-spacing: 0;
   min-width: 0;
   white-space: nowrap;
   overflow: hidden;
@@ -1159,13 +1159,13 @@
 .cp-od-kv-key {
   font-size: 12px;
   color: var(--text-mute);
-  letter-spacing: -0.05px;
+  letter-spacing: 0;
 }
 .cp-od-kv-val {
   font-size: 12.5px;
   color: var(--text);
   font-weight: 500;
-  letter-spacing: -0.1px;
+  letter-spacing: 0;
   text-align: right;
   font-variant-numeric: tabular-nums;
   word-break: break-word;
@@ -1233,7 +1233,7 @@
   font-size: 13px;
   font-weight: 600;
   color: var(--text);
-  letter-spacing: -0.1px;
+  letter-spacing: 0;
 }
 .cp-od-logs-sub {
   font-size: 12px;
@@ -1473,7 +1473,7 @@
   font-weight: 600;
   color: var(--text-mute);
   text-transform: uppercase;
-  letter-spacing: 0.6px;
+  letter-spacing: 0;
   padding: 8px 12px;
 }
 .cp-mods-table-row {
@@ -1919,7 +1919,7 @@
   color: var(--text-dim);
   font-size: 11.5px;
   font-weight: 600;
-  letter-spacing: -0.1px;
+  letter-spacing: 0;
   padding: 4px 10px;
   border-radius: 6px;
   cursor: pointer;
@@ -2011,7 +2011,7 @@
   color: var(--text);
   font-size: 14px;
   font-weight: 600;
-  letter-spacing: -0.15px;
+  letter-spacing: 0;
 }
 .cp-settings-row-head p {
   margin: 4px 0 0;
@@ -2099,7 +2099,7 @@
   color: var(--text);
   font-size: 12.5px;
   font-weight: 650;
-  letter-spacing: -0.05px;
+  letter-spacing: 0;
   line-height: 1.2;
   white-space: nowrap;
   text-overflow: ellipsis;
@@ -2127,7 +2127,7 @@
   color: var(--text-mute);
   font-size: 11px;
   font-weight: 600;
-  letter-spacing: 0.4px;
+  letter-spacing: 0;
   text-transform: uppercase;
 }
 .cp-settings-memory-grid {
@@ -2153,7 +2153,7 @@
   color: var(--text);
   font-size: 14px;
   font-weight: 680;
-  letter-spacing: -0.2px;
+  letter-spacing: 0;
   font-variant-numeric: tabular-nums;
 }
 .cp-settings-advanced-toggle {
@@ -2180,7 +2180,7 @@
   color: var(--text-mute);
   font-size: 11px;
   font-weight: 600;
-  letter-spacing: 0.4px;
+  letter-spacing: 0;
   text-transform: uppercase;
 }
 @media (max-width: 1180px) {
