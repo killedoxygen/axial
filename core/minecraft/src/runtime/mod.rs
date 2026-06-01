@@ -1,15 +1,17 @@
 use crate::launch::JavaVersion;
 use crate::paths::runtime_dirs;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest as _, Sha1};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, OnceLock};
 use thiserror::Error;
+use tokio::fs as async_fs;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 
@@ -677,10 +679,10 @@ async fn install_runtime_manifest_files(
     files: HashMap<String, ComponentManifestFile>,
 ) -> Result<(), JavaRuntimeLookupError> {
     let plan = plan_runtime_manifest_files(files);
-    let download_agent = runtime_download_agent();
+    let download_client = runtime_download_client();
 
     for (relative_path, file) in plan.directory_entries.into_iter().chain(plan.other_entries) {
-        install_runtime_manifest_file(download_agent.clone(), temp_dir, &relative_path, file)
+        install_runtime_manifest_file(download_client.clone(), temp_dir, &relative_path, file)
             .await?;
     }
 
@@ -690,7 +692,7 @@ async fn install_runtime_manifest_files(
         let Some(entry) = entries.next() else {
             break;
         };
-        spawn_runtime_manifest_file_install(&mut tasks, download_agent.clone(), temp_dir, entry);
+        spawn_runtime_manifest_file_install(&mut tasks, download_client.clone(), temp_dir, entry);
     }
 
     let mut first_error = None;
@@ -714,7 +716,7 @@ async fn install_runtime_manifest_files(
         {
             spawn_runtime_manifest_file_install(
                 &mut tasks,
-                download_agent.clone(),
+                download_client.clone(),
                 temp_dir,
                 entry,
             );
@@ -730,14 +732,14 @@ async fn install_runtime_manifest_files(
 
 fn spawn_runtime_manifest_file_install(
     tasks: &mut JoinSet<Result<(), JavaRuntimeLookupError>>,
-    download_agent: ureq::Agent,
+    download_client: reqwest::Client,
     temp_dir: &Path,
     entry: (String, ComponentManifestFile),
 ) {
     let temp_dir = temp_dir.to_path_buf();
     let (relative_path, file) = entry;
     tasks.spawn(async move {
-        install_runtime_manifest_file(download_agent, &temp_dir, &relative_path, file).await
+        install_runtime_manifest_file(download_client, &temp_dir, &relative_path, file).await
     });
 }
 
@@ -767,14 +769,15 @@ fn plan_runtime_manifest_files(
 }
 
 async fn install_runtime_manifest_file(
-    download_agent: ureq::Agent,
+    download_client: reqwest::Client,
     temp_dir: &Path,
     relative_path: &str,
     file: ComponentManifestFile,
 ) -> Result<(), JavaRuntimeLookupError> {
     let destination = component_manifest_destination(temp_dir, relative_path)?;
     if file.kind == "directory" {
-        fs::create_dir_all(&destination)
+        async_fs::create_dir_all(&destination)
+            .await
             .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
         return Ok(());
     }
@@ -786,33 +789,36 @@ async fn install_runtime_manifest_file(
     };
 
     if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)
+        async_fs::create_dir_all(parent)
+            .await
             .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
     }
 
     let temp_path = runtime_download_temp_path(&destination);
     let expected = RuntimeDownloadEvidence::from(&raw);
     fetch_runtime_file(
-        download_agent,
+        &download_client,
         &raw.url,
         &temp_path,
         expected,
         relative_path,
     )
     .await?;
-    if let Err(error) = fs::rename(&temp_path, &destination) {
-        let _ = fs::remove_file(&temp_path);
+    if let Err(error) = async_fs::rename(&temp_path, &destination).await {
+        let _ = async_fs::remove_file(&temp_path).await;
         return Err(JavaRuntimeLookupError::Download(error.to_string()));
     }
     #[cfg(unix)]
     if file.executable {
         use std::os::unix::fs::PermissionsExt;
 
-        let metadata = fs::metadata(&destination)
+        let metadata = async_fs::metadata(&destination)
+            .await
             .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
         let mut permissions = metadata.permissions();
         permissions.set_mode(0o755);
-        fs::set_permissions(&destination, permissions)
+        async_fs::set_permissions(&destination, permissions)
+            .await
             .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
     }
 
@@ -879,63 +885,59 @@ fn runtime_download_temp_path(destination: &Path) -> PathBuf {
 }
 
 async fn fetch_runtime_file(
-    download_agent: ureq::Agent,
+    download_client: &reqwest::Client,
     url: &str,
     temp_path: &Path,
     expected: RuntimeDownloadEvidence,
     relative_path: &str,
 ) -> Result<(), JavaRuntimeLookupError> {
-    let url = url.to_string();
-    let temp_path = temp_path.to_path_buf();
-    let relative_path = relative_path.to_string();
-    let cleanup_path = temp_path.clone();
-
-    let result = tokio::task::spawn_blocking(move || {
-        stream_runtime_file_to_temp(&download_agent, &url, &temp_path, &expected, &relative_path)
-    })
-    .await
-    .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+    let result =
+        stream_runtime_file_to_temp(download_client, url, temp_path, &expected, relative_path)
+            .await;
 
     if result.is_err() {
-        let _ = fs::remove_file(cleanup_path);
+        let _ = async_fs::remove_file(temp_path).await;
     }
 
     result
 }
 
-fn stream_runtime_file_to_temp(
-    download_agent: &ureq::Agent,
+async fn stream_runtime_file_to_temp(
+    download_client: &reqwest::Client,
     url: &str,
     temp_path: &Path,
     expected: &RuntimeDownloadEvidence,
     relative_path: &str,
 ) -> Result<(), JavaRuntimeLookupError> {
-    let response = download_agent
+    let response = download_client
         .get(url)
-        .call()
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
         .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
-    let mut reader = response.into_reader();
-    let mut output = fs::File::create(temp_path)
+    let mut output = async_fs::File::create(temp_path)
+        .await
         .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+    let mut stream = response.bytes_stream();
     let mut hasher = Sha1::new();
     let mut actual_size = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
 
-    loop {
-        let read = reader
-            .read(&mut buffer)
-            .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
-        if read == 0 {
-            break;
-        }
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
         output
-            .write_all(&buffer[..read])
+            .write_all(&chunk)
+            .await
             .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
-        hasher.update(&buffer[..read]);
-        actual_size += read as u64;
+        hasher.update(&chunk);
+        actual_size += chunk.len() as u64;
     }
     output
+        .flush()
+        .await
+        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+    output
         .sync_all()
+        .await
         .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
 
     let actual = RuntimeDownloadActual {
@@ -946,11 +948,12 @@ fn stream_runtime_file_to_temp(
         .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))
 }
 
-fn runtime_download_agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
+fn runtime_download_client() -> reqwest::Client {
+    reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
         .user_agent("croopor/0.3")
         .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1308,15 +1311,18 @@ mod tests {
     use super::{
         ComponentManifestFile, JavaRuntimeLookupError, RuntimeDownloadActual,
         RuntimeDownloadEvidence, RuntimeDownloadIntegrityError, RuntimeInstallState,
-        component_manifest_destination, detect_distribution, detect_runtime_state, java_executable,
-        plan_runtime_manifest_files, runtime_file_download_concurrency_for,
-        runtime_install_lock_from_map, verify_runtime_download,
+        component_manifest_destination, detect_distribution, detect_runtime_state,
+        fetch_runtime_file, java_executable, plan_runtime_manifest_files, runtime_download_client,
+        runtime_file_download_concurrency_for, runtime_install_lock_from_map,
+        verify_runtime_download,
     };
     use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     fn expected(size: Option<u64>, sha1: Option<&str>) -> RuntimeDownloadEvidence {
         RuntimeDownloadEvidence {
@@ -1642,6 +1648,50 @@ mod tests {
         assert_eq!(result, Ok(()));
     }
 
+    #[tokio::test]
+    async fn runtime_file_download_streams_and_verifies_to_temp() {
+        let root = unique_temp_root("croopor-runtime-download-stream-test");
+        fs::create_dir_all(&root).expect("download root");
+        let temp_path = root.join("java.croopor-tmp");
+        let url = serve_runtime_download(b"hello".to_vec()).await;
+        let client = runtime_download_client();
+
+        fetch_runtime_file(
+            &client,
+            &url,
+            &temp_path,
+            expected(Some(5), Some("aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d")),
+            "bin/java",
+        )
+        .await
+        .expect("runtime download");
+
+        assert_eq!(fs::read(&temp_path).expect("downloaded file"), b"hello");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn runtime_file_download_removes_temp_on_verification_error() {
+        let root = unique_temp_root("croopor-runtime-download-cleanup-test");
+        fs::create_dir_all(&root).expect("download root");
+        let temp_path = root.join("java.croopor-tmp");
+        let url = serve_runtime_download(b"hello".to_vec()).await;
+        let client = runtime_download_client();
+
+        let result = fetch_runtime_file(
+            &client,
+            &url,
+            &temp_path,
+            expected(Some(6), None),
+            "bin/java",
+        )
+        .await;
+
+        assert!(matches!(result, Err(JavaRuntimeLookupError::Download(_))));
+        assert!(!temp_path.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn unique_temp_root(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "{label}-{}-{}",
@@ -1662,5 +1712,32 @@ mod tests {
             fs::create_dir_all(config.parent().expect("config parent")).expect("config parent dir");
             fs::write(config, b"jvm").expect("runtime config");
         }
+    }
+
+    async fn serve_runtime_download(body: Vec<u8>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("runtime test listener");
+        let address = listener
+            .local_addr()
+            .expect("runtime test listener address");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("runtime test connection");
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await;
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket
+                .write_all(headers.as_bytes())
+                .await
+                .expect("runtime test response headers");
+            socket
+                .write_all(&body)
+                .await
+                .expect("runtime test response body");
+        });
+        format!("http://{address}/runtime.bin")
     }
 }
