@@ -1873,8 +1873,14 @@ function SavedSkinLibrary({
       setSkinName('');
       if (saved) setSelectedKey(saved.texture_key);
       if (saved && applyAfterSave) {
-        await applySavedSkin(saved.texture_key);
-        setMessage({ tone: 'ok', text: 'Skin saved and applied to Minecraft profile.' });
+        try {
+          await applySavedSkin(saved.texture_key);
+          setMessage({ tone: 'ok', text: 'Skin saved and applied to Minecraft profile.' });
+        } catch (err) {
+          setSelectedKey(saved.texture_key);
+          refresh();
+          setMessage({ tone: 'err', text: savedSkinApplyErrorMessage(err) });
+        }
       } else {
         refresh();
       }
@@ -2499,6 +2505,12 @@ function readApiPayloadMessage(payload: unknown, fallback: string): string {
     return payload.error.trim();
   }
   return fallback;
+}
+
+function savedSkinApplyErrorMessage(error: unknown): string {
+  return `Skin saved locally, but could not apply to Minecraft profile: ${
+    boundedMessage(error instanceof Error ? error.message : undefined, 'Minecraft profile apply failed.')
+  }`;
 }
 
 function formatByteSize(bytes: number): string {
