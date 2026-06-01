@@ -293,7 +293,9 @@ fn error_response(error: LoaderError) -> (StatusCode, Json<serde_json::Value>) {
         | LoaderError::InvalidComponentId => StatusCode::BAD_REQUEST,
         LoaderError::BuildNotFound(_) => StatusCode::NOT_FOUND,
         LoaderError::MissingLibraryDir => StatusCode::PRECONDITION_FAILED,
-        LoaderError::CatalogUnavailable(_) => StatusCode::BAD_GATEWAY,
+        LoaderError::CatalogUnavailable(_) | LoaderError::ArtifactMissing(_) => {
+            StatusCode::BAD_GATEWAY
+        }
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (
@@ -387,6 +389,18 @@ mod tests {
         assert_eq!(
             body["error"],
             json!("Loader service returned unreadable data. Try again later.")
+        );
+        assert_no_raw_fragments(body["error"].as_str().expect("error is a string"));
+
+        let (status, Json(body)) = error_response(LoaderError::ArtifactMissing(
+            "missing https://cdn.example.invalid/path/mod-loader.jar in /tmp/croopor".to_string(),
+        ));
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["failure_kind"], json!("artifact_missing"));
+        assert_eq!(
+            body["error"],
+            json!("Loader artifact is unavailable. Try another build or component.")
         );
         assert_no_raw_fragments(body["error"].as_str().expect("error is a string"));
     }
