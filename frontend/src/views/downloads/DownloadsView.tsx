@@ -1,8 +1,25 @@
 import type { JSX } from 'preact';
+import type { InstallItem, LoaderComponentId } from '../../types';
 import { Card, Meter, Pill, SectionHeading } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { useTheme } from '../../hooks/use-theme';
 import { installQueue, installState } from '../../store';
+
+const QUEUED_LOADER_LABELS: Record<LoaderComponentId, string> = {
+  'net.fabricmc.fabric-loader': 'Fabric',
+  'org.quiltmc.quilt-loader': 'Quilt',
+  'net.minecraftforge': 'Forge',
+  'net.neoforged': 'NeoForge',
+};
+
+function formatQueuedLoaderLabel(loader: NonNullable<InstallItem['loader']>): string {
+  const loaderName = QUEUED_LOADER_LABELS[loader.componentId];
+  const loaderVersion = loader.loaderVersion.trim();
+  const minecraftVersion = loader.minecraftVersion.trim();
+  const label = loaderVersion ? `${loaderName} ${loaderVersion}` : `${loaderName} loader`;
+
+  return minecraftVersion ? `${label} for Minecraft ${minecraftVersion}` : label;
+}
 
 export function DownloadsView(): JSX.Element {
   const theme = useTheme();
@@ -77,7 +94,7 @@ export function DownloadsView(): JSX.Element {
                 {i + 1}
               </span>
               <span style={{ fontSize: 13, color: theme.n.text }}>{item.versionId}</span>
-              {item.loader && <span style={{ fontSize: 11, color: theme.n.textMute }}>· {item.loader.componentId}</span>}
+              {item.loader && <span style={{ fontSize: 11, color: theme.n.textMute }}>· {formatQueuedLoaderLabel(item.loader)}</span>}
             </div>
           ))}
         </Card>
