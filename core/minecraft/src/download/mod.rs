@@ -6,11 +6,11 @@ use crate::rules::{current_os_arch, default_environment, evaluate_rules};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
+use tokio::fs as async_fs;
 use tokio::io::AsyncWriteExt;
 
 const MIN_LIBRARY_DOWNLOAD_CONCURRENCY: usize = 4;
@@ -76,10 +76,10 @@ impl Downloader {
         F: FnMut(DownloadProgress),
     {
         let version_dir = versions_dir(&self.mc_dir).join(version_id);
-        fs::create_dir_all(&version_dir)?;
+        async_fs::create_dir_all(&version_dir).await?;
 
         let marker_path = version_dir.join(".incomplete");
-        fs::write(&marker_path, b"installing")?;
+        async_fs::write(&marker_path, b"installing").await?;
 
         let install_result = self
             .install_version_inner(version_id, manifest_url, &mut send)
@@ -87,7 +87,7 @@ impl Downloader {
 
         match install_result {
             Ok(()) => {
-                let _ = fs::remove_file(&marker_path);
+                let _ = async_fs::remove_file(&marker_path).await;
                 send(DownloadProgress {
                     phase: "done".to_string(),
                     current: 1,
@@ -132,7 +132,7 @@ impl Downloader {
 
         let url = if let Some(url) = manifest_url.filter(|value| !value.trim().is_empty()) {
             url.to_string()
-        } else if json_path.is_file() {
+        } else if path_is_file(&json_path).await {
             String::new()
         } else {
             self.resolve_manifest_url(version_id).await?
@@ -141,7 +141,8 @@ impl Downloader {
             self.download_file(&url, &json_path).await?;
         }
 
-        let version = serde_json::from_str::<VersionJson>(&fs::read_to_string(&json_path)?)?;
+        let version =
+            serde_json::from_str::<VersionJson>(&async_fs::read_to_string(&json_path).await?)?;
         let runtime_task = if version.java_version.major_version > 0 {
             send(progress(
                 "java_runtime",
@@ -178,7 +179,7 @@ impl Downloader {
         ));
         if let Some(client) = &version.downloads.client {
             let jar_path = version_dir.join(format!("{version_id}.jar"));
-            if !jar_path.is_file() {
+            if !path_is_file(&jar_path).await {
                 self.download_file(&client.url, &jar_path).await?;
             }
         }
@@ -192,7 +193,7 @@ impl Downloader {
             futures_util::stream::iter(library_jobs.into_iter().map(|job| {
                 let client = client.clone();
                 async move {
-                    if !job.path.is_file() {
+                    if !path_is_file(&job.path).await {
                         download_file_with_client(&client, &job.url, &job.path).await?;
                     }
                     Ok::<String, DownloadError>(job.name)
@@ -220,7 +221,7 @@ impl Downloader {
                 1,
                 Some(format!("{}.json", version.asset_index.id)),
             ));
-            if !asset_index_path.is_file() {
+            if !path_is_file(&asset_index_path).await {
                 self.download_file(&version.asset_index.url, &asset_index_path)
                     .await?;
             }
@@ -237,7 +238,7 @@ impl Downloader {
                 .join("log_configs")
                 .join(&logging.file.id);
             send(progress("log_config", 0, 1, Some(logging.file.id.clone())));
-            if !log_config_path.is_file() {
+            if !path_is_file(&log_config_path).await {
                 self.download_file(&logging.file.url, &log_config_path)
                     .await?;
             }
@@ -310,7 +311,8 @@ impl Downloader {
             hash: String,
         }
 
-        let index = serde_json::from_str::<AssetIndex>(&fs::read_to_string(asset_index_path)?)?;
+        let index =
+            serde_json::from_str::<AssetIndex>(&async_fs::read_to_string(asset_index_path).await?)?;
         let objects_dir = assets_dir(&self.mc_dir).join("objects");
         let mut jobs = Vec::new();
         let mut queued_hashes = HashSet::new();
@@ -355,13 +357,13 @@ impl Downloader {
             for (name, object) in index.objects {
                 let src = objects_dir.join(&object.hash[..2]).join(&object.hash);
                 let dst = virtual_dir.join(PathBuf::from(name));
-                if dst.is_file() || !src.is_file() {
+                if path_is_file(&dst).await || !path_is_file(&src).await {
                     continue;
                 }
                 if let Some(parent) = dst.parent() {
-                    fs::create_dir_all(parent)?;
+                    async_fs::create_dir_all(parent).await?;
                 }
-                let _ = fs::copy(src, dst);
+                let _ = async_fs::copy(src, dst).await;
             }
         }
 
@@ -370,7 +372,7 @@ impl Downloader {
 
     async fn download_file(&self, url: &str, destination: &Path) -> Result<(), DownloadError> {
         if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)?;
+            async_fs::create_dir_all(parent).await?;
         }
 
         let tmp_path = destination.with_extension("tmp");
@@ -395,7 +397,7 @@ impl Downloader {
                 Ok(()) => return Ok(()),
                 Err(error) => {
                     last_error = Some(error);
-                    let _ = fs::remove_file(&tmp_path);
+                    let _ = async_fs::remove_file(&tmp_path).await;
                     if attempt < 2 {
                         tokio::time::sleep(Duration::from_millis(250 * (attempt + 1) as u64)).await;
                     }
@@ -427,7 +429,7 @@ where
     let mut downloads = futures_util::stream::iter(jobs.into_iter().map(|job| {
         let client = client.clone();
         async move {
-            if !job.path.is_file() {
+            if !path_is_file(&job.path).await {
                 download_file_with_client(&client, &job.url, &job.path).await?;
             }
             Ok::<String, DownloadError>(job.name)
@@ -705,7 +707,7 @@ async fn download_file_with_client(
     destination: &Path,
 ) -> Result<(), DownloadError> {
     if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)?;
+        async_fs::create_dir_all(parent).await?;
     }
 
     let tmp_path = destination.with_extension("tmp");
@@ -729,7 +731,7 @@ async fn download_file_with_client(
             Ok(()) => return Ok(()),
             Err(error) => {
                 last_error = Some(error);
-                let _ = fs::remove_file(&tmp_path);
+                let _ = async_fs::remove_file(&tmp_path).await;
                 if attempt < 2 {
                     tokio::time::sleep(Duration::from_millis(250 * (attempt + 1) as u64)).await;
                 }
@@ -737,6 +739,10 @@ async fn download_file_with_client(
         }
     }
     Err(last_error.unwrap_or_else(|| DownloadError::ResolveManifest("download failed".to_string())))
+}
+
+async fn path_is_file(path: &Path) -> bool {
+    matches!(async_fs::metadata(path).await, Ok(metadata) if metadata.is_file())
 }
 
 fn resolve_path_under_root(root: &Path, relative: &str) -> Option<PathBuf> {
