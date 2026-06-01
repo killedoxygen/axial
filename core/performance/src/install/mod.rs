@@ -494,7 +494,7 @@ impl PerformanceManager {
 
         let temp_path = managed_artifact_temp_path(&final_path, managed_mod);
         self.modrinth
-            .download_file_to_path(&file.url, &expected_sha, &temp_path)
+            .download_file_to_path(&file.url, &expected_sha, file.size, &temp_path)
             .await?;
         if final_path.try_exists()? && !was_previously_tracked {
             let _ = fs::remove_file(&temp_path);
@@ -1841,6 +1841,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ensure_installed_passes_modrinth_file_size_to_download() {
+        let root = test_root("ensure-installed-file-size");
+        let manager = PerformanceManager::new_with_modrinth_base_url(
+            spawn_modrinth_server_with_sha512_and_size(None, Some(4)).await,
+        )
+        .expect("performance manager");
+        let plan = CompositionPlan {
+            composition_id: "core".to_string(),
+            family: VersionFamily::F,
+            loader: "fabric".to_string(),
+            mode: PerformanceMode::Managed,
+            tier: CompositionTier::Core,
+            mods: vec![ManagedMod {
+                artifact_id: "sodium".to_string(),
+                project_id: "sodium".to_string(),
+                slug: "sodium".to_string(),
+                name: "Sodium".to_string(),
+                condition: ModCondition::Always,
+                version_range: String::new(),
+                hardware_req: None,
+                mutual_exclusions: Vec::new(),
+            }],
+            jvm_preset: String::new(),
+            fallback_chain: Vec::new(),
+            warnings: Vec::new(),
+            fallback_reason: String::new(),
+        };
+
+        let state = manager
+            .ensure_installed(&plan, "1.20.4", &root)
+            .await
+            .expect("install should record failed managed artifact");
+
+        assert_eq!(state.failure_count, 1);
+        assert!(state.installed_mods.is_empty());
+        assert!(!root.join("sodium.jar").exists());
+        assert!(!root.join("sodium.jar.tmp").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn severe_extended_failure_installs_and_saves_core_fallback() {
         let root = test_root("install-severe-fallback-core");
         let manager = PerformanceManager::new_with_modrinth_base_url(
@@ -3043,6 +3085,13 @@ mod tests {
     }
 
     async fn spawn_modrinth_server_with_sha512(sha512: Option<String>) -> String {
+        spawn_modrinth_server_with_sha512_and_size(sha512, None).await
+    }
+
+    async fn spawn_modrinth_server_with_sha512_and_size(
+        sha512: Option<String>,
+        size: Option<u64>,
+    ) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind modrinth test server");
@@ -3053,6 +3102,7 @@ mod tests {
                     break;
                 };
                 let sha512 = sha512.clone();
+                let size = size;
                 tokio::spawn(async move {
                     let mut request = Vec::new();
                     let mut buf = [0_u8; 1024];
@@ -3080,11 +3130,14 @@ mod tests {
                     } else {
                         String::new()
                     };
+                    let size = size
+                        .map(|size| format!(r#","size":{size}"#))
+                        .unwrap_or_default();
                     let (status, content_type, body) = if first_line
                         .contains("/v2/project/sodium/version")
                     {
                         let body = format!(
-                            r#"[{{"id":"version-a","game_versions":["1.20.4"],"loaders":["fabric"],"featured":true,"date_published":"2026-05-30T00:00:00Z","files":[{{"url":"{file_url}","filename":"sodium.jar","primary":true,"hashes":{{{hashes}}}}}]}}]"#
+                            r#"[{{"id":"version-a","game_versions":["1.20.4"],"loaders":["fabric"],"featured":true,"date_published":"2026-05-30T00:00:00Z","files":[{{"url":"{file_url}","filename":"sodium.jar","primary":true,"hashes":{{{hashes}}}{size}}}]}}]"#
                         );
                         ("200 OK", "application/json", body.into_bytes())
                     } else if first_line.contains("/files/sodium.jar") {

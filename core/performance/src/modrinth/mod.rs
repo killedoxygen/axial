@@ -30,6 +30,8 @@ pub enum ModrinthError {
     Http { status: u16, body: String },
     #[error("hash mismatch: expected {expected} got {actual}")]
     HashMismatch { expected: String, actual: String },
+    #[error("download size exceeded: expected {expected} bytes got at least {actual} bytes")]
+    SizeExceeded { expected: u64, actual: u64 },
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +111,7 @@ impl ModrinthClient {
         &self,
         url: &str,
         expected_sha512: &str,
+        expected_size: Option<u64>,
         temp_path: &Path,
     ) -> Result<(), ModrinthError> {
         let response = self.client.get(url).send().await?;
@@ -121,6 +124,12 @@ impl ModrinthClient {
             let body = response.text().await.unwrap_or_default();
             return Err(ModrinthError::Http { status, body });
         }
+        if let Some(expected) = expected_size
+            && let Some(actual) = response.content_length()
+            && actual > expected
+        {
+            return Err(ModrinthError::SizeExceeded { expected, actual });
+        }
 
         if let Some(parent) = temp_path
             .parent()
@@ -132,8 +141,18 @@ impl ModrinthClient {
         let result = async {
             let mut output = tokio::fs::File::create(temp_path).await?;
             let mut hasher = Sha512::new();
+            let mut actual_size = 0_u64;
             let mut response = response;
             while let Some(chunk) = response.chunk().await? {
+                actual_size = actual_size.saturating_add(chunk.len() as u64);
+                if let Some(expected) = expected_size
+                    && actual_size > expected
+                {
+                    return Err(ModrinthError::SizeExceeded {
+                        expected,
+                        actual: actual_size,
+                    });
+                }
                 hasher.update(&chunk);
                 output.write_all(&chunk).await?;
             }
@@ -206,6 +225,8 @@ pub struct VersionFile {
     pub primary: bool,
     #[serde(default)]
     pub hashes: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub size: Option<u64>,
 }
 
 impl Version {
@@ -303,7 +324,7 @@ mod tests {
         let client = ModrinthClient::new();
 
         client
-            .download_file_to_path(&url, &sha512, &temp_path)
+            .download_file_to_path(&url, &sha512, Some(body.len() as u64), &temp_path)
             .await
             .expect("download verified file");
 
@@ -324,7 +345,7 @@ mod tests {
         let client = ModrinthClient::new();
 
         let error = client
-            .download_file_to_path(&url, "", &temp_path)
+            .download_file_to_path(&url, "", None, &temp_path)
             .await
             .expect_err("429 should return typed rate-limit error");
 
@@ -351,11 +372,76 @@ mod tests {
         let client = ModrinthClient::new();
 
         let error = client
-            .download_file_to_path(&url, "not-the-right-hash", &temp_path)
+            .download_file_to_path(&url, "not-the-right-hash", None, &temp_path)
             .await
             .expect_err("hash mismatch should fail");
 
         assert!(matches!(error, ModrinthError::HashMismatch { .. }));
+        assert!(!temp_path.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn download_file_to_path_rejects_oversized_content_length_before_temp_file() {
+        let url = spawn_response_server_with_content_length(
+            "200 OK",
+            vec![(
+                "content-type".to_string(),
+                "application/octet-stream".to_string(),
+            )],
+            b"oversized".to_vec(),
+            Some(64),
+        )
+        .await;
+        let root = test_root("download-oversized-content-length");
+        let temp_path = root.join("nested").join("sodium.jar.tmp");
+        let client = ModrinthClient::new();
+
+        let error = client
+            .download_file_to_path(&url, "", Some(8), &temp_path)
+            .await
+            .expect_err("oversized content-length should fail");
+
+        assert!(matches!(
+            error,
+            ModrinthError::SizeExceeded {
+                expected: 8,
+                actual: 64
+            }
+        ));
+        assert!(!temp_path.exists());
+        assert!(!temp_path.parent().expect("temp path parent").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn download_file_to_path_rejects_stream_past_expected_size_and_removes_temp_file() {
+        let url = spawn_response_server_with_content_length(
+            "200 OK",
+            vec![(
+                "content-type".to_string(),
+                "application/octet-stream".to_string(),
+            )],
+            b"managed-jar".to_vec(),
+            None,
+        )
+        .await;
+        let root = test_root("download-stream-oversized");
+        let temp_path = root.join("sodium.jar.tmp");
+        let client = ModrinthClient::new();
+
+        let error = client
+            .download_file_to_path(&url, "", Some(4), &temp_path)
+            .await
+            .expect_err("stream exceeding expected size should fail");
+
+        assert!(matches!(
+            error,
+            ModrinthError::SizeExceeded {
+                expected: 4,
+                actual
+            } if actual > 4
+        ));
         assert!(!temp_path.exists());
         let _ = fs::remove_dir_all(root);
     }
@@ -378,6 +464,16 @@ mod tests {
         headers: Vec<(String, String)>,
         body: Vec<u8>,
     ) -> String {
+        spawn_response_server_with_content_length(status, headers, body.clone(), Some(body.len()))
+            .await
+    }
+
+    async fn spawn_response_server_with_content_length(
+        status: &'static str,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+        content_length: Option<usize>,
+    ) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind response server");
@@ -389,6 +485,7 @@ mod tests {
                 };
                 let body = body.clone();
                 let headers = headers.clone();
+                let content_length = content_length;
                 tokio::spawn(async move {
                     let mut request = Vec::new();
                     let mut buf = [0_u8; 1024];
@@ -408,10 +505,10 @@ mod tests {
                         }
                     }
 
-                    let mut response = format!(
-                        "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n",
-                        body.len(),
-                    );
+                    let mut response = format!("HTTP/1.1 {status}\r\nconnection: close\r\n");
+                    if let Some(content_length) = content_length {
+                        response.push_str(&format!("content-length: {content_length}\r\n"));
+                    }
                     for (name, value) in headers {
                         response.push_str(&name);
                         response.push_str(": ");
