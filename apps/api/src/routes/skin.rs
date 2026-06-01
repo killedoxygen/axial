@@ -23,12 +23,14 @@ const MAX_HEAD_SIZE: u32 = 256;
 const HEAD_CACHE_CONTROL: &str = "private, max-age=86400";
 const MINECRAFT_TEXTURE_URL_PREFIX: &str = "https://textures.minecraft.net/texture/";
 const SKIN_UPLOAD_MAX_BYTES: usize = 256 * 1024;
+const SAVE_SKIN_FROM_PROFILE_REQUEST_MAX_BYTES: usize = 4 * 1024;
 const SKIN_WIDTH: u32 = 64;
 const SKIN_HEIGHT: u32 = 64;
 const LEGACY_SKIN_HEIGHT: u32 = 32;
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 const SAVED_SKIN_NAME_MAX_CHARS: usize = 64;
 const SAVED_SKIN_SOURCE: &str = "local_upload";
+const SAVED_SKIN_PROFILE_SOURCE: &str = "minecraft_profile_skin";
 const MINECRAFT_SKIN_UPLOAD_ENDPOINT: &str =
     "https://api.minecraftservices.com/minecraft/profile/skins";
 const CROOPOR_USER_AGENT: &str = concat!("croopor/", env!("CARGO_PKG_VERSION"));
@@ -70,6 +72,13 @@ struct SaveSkinQuery {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SaveSkinFromProfileRequest {
+    name: Option<String>,
+    variant: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct UpdateSavedSkinRequest {
     name: Option<String>,
     variant: Option<String>,
@@ -95,6 +104,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/v1/skins",
             get(handle_saved_skins).post(handle_save_skin),
+        )
+        .route(
+            "/api/v1/skins/from-profile",
+            post(handle_save_skin_from_profile),
         )
         .route(
             "/api/v1/skins/{texture_key}",
@@ -171,13 +184,37 @@ fn online_skin_profile(account: Option<AuthLoginMinecraftAccount>) -> Option<Ski
 }
 
 fn select_minecraft_skin(skins: &[AuthLoginMinecraftSkin]) -> Option<&AuthLoginMinecraftSkin> {
+    select_minecraft_skin_with_prefix(skins, MINECRAFT_TEXTURE_URL_PREFIX)
+}
+
+fn select_minecraft_skin_with_prefix<'a>(
+    skins: &'a [AuthLoginMinecraftSkin],
+    allowed_prefix: &str,
+) -> Option<&'a AuthLoginMinecraftSkin> {
     skins
         .iter()
         .find(|skin| skin.state.eq_ignore_ascii_case("ACTIVE"))
         .or_else(|| {
-            skins
-                .iter()
-                .find(|skin| sane_minecraft_texture_url(&skin.url).is_some())
+            skins.iter().find(|skin| {
+                sane_minecraft_texture_url_with_prefix(&skin.url, allowed_prefix).is_some()
+            })
+        })
+}
+
+fn select_sane_minecraft_skin_with_prefix<'a>(
+    skins: &'a [AuthLoginMinecraftSkin],
+    allowed_prefix: &str,
+) -> Option<&'a AuthLoginMinecraftSkin> {
+    skins
+        .iter()
+        .find(|skin| {
+            skin.state.eq_ignore_ascii_case("ACTIVE")
+                && sane_minecraft_texture_url_with_prefix(&skin.url, allowed_prefix).is_some()
+        })
+        .or_else(|| {
+            skins.iter().find(|skin| {
+                sane_minecraft_texture_url_with_prefix(&skin.url, allowed_prefix).is_some()
+            })
         })
 }
 
@@ -190,12 +227,16 @@ fn skin_variant(variant: &str) -> &'static str {
 }
 
 fn sane_minecraft_texture_url(url: &str) -> Option<String> {
+    sane_minecraft_texture_url_with_prefix(url, MINECRAFT_TEXTURE_URL_PREFIX)
+}
+
+fn sane_minecraft_texture_url_with_prefix(url: &str, allowed_prefix: &str) -> Option<String> {
     let trimmed = url.trim();
-    if trimmed != url || !trimmed.starts_with(MINECRAFT_TEXTURE_URL_PREFIX) {
+    if trimmed != url || !trimmed.starts_with(allowed_prefix) {
         return None;
     }
 
-    let texture_id = &trimmed[MINECRAFT_TEXTURE_URL_PREFIX.len()..];
+    let texture_id = &trimmed[allowed_prefix.len()..];
     if texture_id.is_empty() || texture_id.len() > 128 {
         return None;
     }
@@ -275,6 +316,116 @@ async fn handle_save_skin(
             name,
             variant,
             SAVED_SKIN_SOURCE.to_string(),
+            &normalized.png_bytes,
+        )
+        .map_err(skin_write_error)?;
+
+    Ok(Json(record))
+}
+
+async fn handle_save_skin_from_profile(
+    State(state): State<AppState>,
+    body: Body,
+) -> Result<Json<SavedSkinRecord>, ApiError> {
+    let payload = read_save_skin_from_profile_request(body).await?;
+    handle_save_skin_from_profile_with_client(
+        State(state),
+        payload,
+        MinecraftSkinTextureClient::default(),
+    )
+    .await
+}
+
+async fn read_save_skin_from_profile_request(
+    body: Body,
+) -> Result<SaveSkinFromProfileRequest, ApiError> {
+    let bytes = to_bytes(body, SAVE_SKIN_FROM_PROFILE_REQUEST_MAX_BYTES)
+        .await
+        .map_err(|_| {
+            json_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "skin profile save request is too large",
+            )
+        })?;
+    if bytes.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return Ok(SaveSkinFromProfileRequest::default());
+    }
+
+    serde_json::from_slice(&bytes).map_err(|_| {
+        json_error(
+            StatusCode::BAD_REQUEST,
+            "skin profile save request must be JSON",
+        )
+    })
+}
+
+async fn handle_save_skin_from_profile_with_client(
+    State(state): State<AppState>,
+    payload: SaveSkinFromProfileRequest,
+    client: MinecraftSkinTextureClient,
+) -> Result<Json<SavedSkinRecord>, ApiError> {
+    let minecraft_state = state
+        .auth_logins()
+        .active_current_minecraft_account_state()
+        .await
+        .ok_or_else(|| {
+            json_status_error(
+                StatusCode::UNAUTHORIZED,
+                "Minecraft account login required",
+                "minecraft_account_required",
+            )
+        })?;
+    let account = minecraft_state.account;
+    if !account.owns_minecraft_java
+        || account.profile.id.trim().is_empty()
+        || account.profile.name.trim().is_empty()
+    {
+        return Err(json_status_error(
+            StatusCode::CONFLICT,
+            "Minecraft account is not ready for profile skin save",
+            "minecraft_account_not_ready",
+        ));
+    }
+
+    let selected_skin =
+        select_sane_minecraft_skin_with_prefix(&account.profile.skins, client.allowed_prefix())
+            .ok_or_else(|| {
+                json_status_error(
+                    StatusCode::CONFLICT,
+                    "Minecraft profile does not have a usable skin texture",
+                    "minecraft_profile_skin_missing",
+                )
+            })?;
+    let texture_url =
+        sane_minecraft_texture_url_with_prefix(&selected_skin.url, client.allowed_prefix())
+            .ok_or_else(|| {
+                json_status_error(
+                    StatusCode::CONFLICT,
+                    "Minecraft profile does not have a usable skin texture",
+                    "minecraft_profile_skin_missing",
+                )
+            })?;
+    let name = match payload.name.as_deref() {
+        Some(name) => validate_saved_skin_name(name)?,
+        None => validate_saved_skin_name(&default_profile_skin_name(&account.profile.name))?,
+    };
+    let variant = match payload.variant.as_deref() {
+        Some(_) => validate_saved_skin_variant(payload.variant.as_deref())?,
+        None => skin_variant(&selected_skin.variant).to_string(),
+    };
+    let bytes = client
+        .download(&texture_url)
+        .await
+        .map_err(skin_texture_download_error)?;
+    let normalized = normalize_skin_png(&bytes)?;
+    let texture_key = texture_key(&normalized.png_bytes);
+    let record = state
+        .skins()
+        .save(
+            texture_key,
+            name,
+            variant,
+            SAVED_SKIN_PROFILE_SOURCE.to_string(),
             &normalized.png_bytes,
         )
         .map_err(skin_write_error)?;
@@ -427,6 +578,84 @@ async fn handle_apply_saved_skin_with_client(
         texture_key,
         profile_updated,
     }))
+}
+
+#[derive(Clone)]
+struct MinecraftSkinTextureClient {
+    http: reqwest::Client,
+    allowed_prefix: String,
+}
+
+impl MinecraftSkinTextureClient {
+    fn default() -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            allowed_prefix: MINECRAFT_TEXTURE_URL_PREFIX.to_string(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_allowed_prefix(allowed_prefix: String) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            allowed_prefix,
+        }
+    }
+
+    fn allowed_prefix(&self) -> &str {
+        &self.allowed_prefix
+    }
+
+    async fn download(&self, url: &str) -> Result<Vec<u8>, SkinTextureDownloadError> {
+        if sane_minecraft_texture_url_with_prefix(url, &self.allowed_prefix).is_none() {
+            return Err(SkinTextureDownloadError::InvalidUrl);
+        }
+
+        let response = self
+            .http
+            .get(url)
+            .header(reqwest::header::ACCEPT, "image/png")
+            .header(reqwest::header::USER_AGENT, CROOPOR_USER_AGENT)
+            .send()
+            .await
+            .map_err(|_| SkinTextureDownloadError::Unavailable)?;
+        let status = response.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(SkinTextureDownloadError::RateLimited);
+        }
+        if status.is_client_error() || status.is_server_error() {
+            return Err(SkinTextureDownloadError::Unavailable);
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > SKIN_UPLOAD_MAX_BYTES as u64)
+        {
+            return Err(SkinTextureDownloadError::TooLarge);
+        }
+
+        let mut bytes = Vec::new();
+        let mut response = response;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| SkinTextureDownloadError::Unavailable)?
+        {
+            if bytes.len().saturating_add(chunk.len()) > SKIN_UPLOAD_MAX_BYTES {
+                return Err(SkinTextureDownloadError::TooLarge);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+
+        Ok(bytes)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum SkinTextureDownloadError {
+    InvalidUrl,
+    RateLimited,
+    TooLarge,
+    Unavailable,
 }
 
 #[derive(Clone)]
@@ -755,6 +984,13 @@ fn validate_saved_skin_name(value: &str) -> Result<String, ApiError> {
     Ok(trimmed.to_string())
 }
 
+fn default_profile_skin_name(profile_name: &str) -> String {
+    format!("{} profile skin", profile_name.trim())
+        .chars()
+        .take(SAVED_SKIN_NAME_MAX_CHARS)
+        .collect()
+}
+
 fn validate_saved_skin_variant(value: Option<&str>) -> Result<String, ApiError> {
     let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok("classic".to_string());
@@ -854,6 +1090,31 @@ fn skin_upload_error(error: SkinUploadError) -> ApiError {
             StatusCode::BAD_GATEWAY,
             "Minecraft skin upload is unavailable. Try again later.",
             "minecraft_skin_unavailable",
+        ),
+    }
+}
+
+fn skin_texture_download_error(error: SkinTextureDownloadError) -> ApiError {
+    match error {
+        SkinTextureDownloadError::InvalidUrl => json_status_error(
+            StatusCode::CONFLICT,
+            "Minecraft profile does not have a usable skin texture",
+            "minecraft_profile_skin_missing",
+        ),
+        SkinTextureDownloadError::RateLimited => json_status_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Minecraft profile skin download is rate limited. Try again later.",
+            "minecraft_profile_skin_rate_limited",
+        ),
+        SkinTextureDownloadError::TooLarge => json_status_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Minecraft profile skin is too large",
+            "minecraft_profile_skin_too_large",
+        ),
+        SkinTextureDownloadError::Unavailable => json_status_error(
+            StatusCode::BAD_GATEWAY,
+            "Minecraft profile skin download is unavailable. Try again later.",
+            "minecraft_profile_skin_unavailable",
         ),
     }
 }
@@ -963,6 +1224,11 @@ mod tests {
     use croopor_performance::PerformanceManager;
     use std::{fs, path::PathBuf, sync::Arc};
     use tokio::sync::mpsc;
+
+    #[test]
+    fn skin_profile_router_builds_with_from_profile_route() {
+        let _ = router();
+    }
 
     #[tokio::test]
     async fn skin_profile_defaults_to_configured_username() {
@@ -1731,6 +1997,186 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn skin_profile_save_from_profile_downloads_normalizes_and_saves_active_skin() {
+        let fixture = TestFixture::new("profile-save-active", "ConfigUser");
+        let png = test_skin_png(SKIN_WIDTH, LEGACY_SKIN_HEIGHT);
+        let normalized = normalize_skin_png(&png).expect("normalized skin");
+        let (texture_prefix, mut requests) =
+            skin_profile_texture_test_server(SkinProfileTextureServerMode::Png(png)).await;
+        fixture
+            .add_minecraft_account(test_profile(
+                "MinecraftName",
+                vec![
+                    minecraft_skin(
+                        "inactive",
+                        "INACTIVE",
+                        &format!("{texture_prefix}inactiveTexture123"),
+                        "classic",
+                    ),
+                    minecraft_skin(
+                        "active",
+                        "ACTIVE",
+                        &format!("{texture_prefix}activeTexture123"),
+                        "SLIM",
+                    ),
+                ],
+            ))
+            .await;
+
+        let saved = fixture
+            .save_skin_from_profile(
+                SaveSkinFromProfileRequest::default(),
+                texture_prefix.clone(),
+            )
+            .await
+            .expect("save profile skin")
+            .0;
+        let request = requests.recv().await.expect("texture request");
+        let listed = fixture.saved_skins().await.expect("saved skins").0;
+        let file = fixture
+            .saved_skin_file(&saved.texture_key)
+            .await
+            .expect("saved skin file");
+
+        assert_eq!(request.path, "/texture/activeTexture123");
+        assert_eq!(request.accept.as_deref(), Some("image/png"));
+        assert_eq!(request.user_agent.as_deref(), Some(CROOPOR_USER_AGENT));
+        assert_eq!(saved.name, "MinecraftName profile skin");
+        assert_eq!(saved.variant, "slim");
+        assert_eq!(saved.source, SAVED_SKIN_PROFILE_SOURCE);
+        assert_eq!(saved.texture_key, texture_key(&normalized.png_bytes));
+        assert_eq!(saved.byte_size, normalized.png_bytes.len());
+        assert_eq!(listed.skins, vec![saved.clone()]);
+        assert_eq!(response_bytes(file).await, normalized.png_bytes);
+    }
+
+    #[tokio::test]
+    async fn skin_profile_save_from_profile_accepts_name_and_variant_override() {
+        let fixture = TestFixture::new("profile-save-overrides", "ConfigUser");
+        let (texture_prefix, mut requests) = skin_profile_texture_test_server(
+            SkinProfileTextureServerMode::Png(test_skin_png(SKIN_WIDTH, SKIN_HEIGHT)),
+        )
+        .await;
+        fixture
+            .add_minecraft_account(test_profile(
+                "MinecraftName",
+                vec![minecraft_skin(
+                    "active",
+                    "ACTIVE",
+                    &format!("{texture_prefix}activeTexture123"),
+                    "classic",
+                )],
+            ))
+            .await;
+
+        let saved = fixture
+            .save_skin_from_profile(
+                SaveSkinFromProfileRequest {
+                    name: Some("  Profile Copy  ".to_string()),
+                    variant: Some("SLIM".to_string()),
+                },
+                texture_prefix,
+            )
+            .await
+            .expect("save profile skin")
+            .0;
+        let _ = requests.recv().await.expect("texture request");
+
+        assert_eq!(saved.name, "Profile Copy");
+        assert_eq!(saved.variant, "slim");
+    }
+
+    #[tokio::test]
+    async fn skin_profile_save_from_profile_missing_active_account_returns_bounded_error() {
+        let fixture = TestFixture::new("profile-save-missing-active", "ConfigUser");
+
+        let error = fixture
+            .save_skin_from_profile(
+                SaveSkinFromProfileRequest::default(),
+                "http://127.0.0.1:9/texture/".to_string(),
+            )
+            .await
+            .expect_err("missing active account should fail");
+
+        assert_eq!(error.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            error.1.0,
+            serde_json::json!({
+                "error": "Minecraft account login required",
+                "status": "minecraft_account_required",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn skin_profile_save_from_profile_requires_sane_texture_url() {
+        let fixture = TestFixture::new("profile-save-bad-texture", "ConfigUser");
+        fixture
+            .add_minecraft_account(test_profile(
+                "MinecraftName",
+                vec![minecraft_skin(
+                    "active",
+                    "ACTIVE",
+                    "https://example.com/texture/active?token=secret",
+                    "slim",
+                )],
+            ))
+            .await;
+
+        let error = fixture
+            .save_skin_from_profile(
+                SaveSkinFromProfileRequest::default(),
+                "http://127.0.0.1:9/texture/".to_string(),
+            )
+            .await
+            .expect_err("unsane texture should fail");
+
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert_eq!(
+            error.1.0,
+            serde_json::json!({
+                "error": "Minecraft profile does not have a usable skin texture",
+                "status": "minecraft_profile_skin_missing",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn skin_profile_save_from_profile_bounds_texture_download_size() {
+        let fixture = TestFixture::new("profile-save-oversized-texture", "ConfigUser");
+        let (texture_prefix, mut requests) =
+            skin_profile_texture_test_server(SkinProfileTextureServerMode::Oversized).await;
+        fixture
+            .add_minecraft_account(test_profile(
+                "MinecraftName",
+                vec![minecraft_skin(
+                    "active",
+                    "ACTIVE",
+                    &format!("{texture_prefix}activeTexture123"),
+                    "slim",
+                )],
+            ))
+            .await;
+
+        let error = fixture
+            .save_skin_from_profile(SaveSkinFromProfileRequest::default(), texture_prefix)
+            .await
+            .expect_err("oversized texture should fail");
+        let _ = requests.recv().await.expect("texture request");
+        let listed = fixture.saved_skins().await.expect("saved skins").0;
+
+        assert_eq!(error.0, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            error.1.0,
+            serde_json::json!({
+                "error": "Minecraft profile skin is too large",
+                "status": "minecraft_profile_skin_too_large",
+            })
+        );
+        assert!(listed.skins.is_empty());
+    }
+
+    #[tokio::test]
     async fn skin_apply_missing_active_account_returns_bounded_error() {
         let fixture = TestFixture::new("apply-missing-active", "ConfigUser");
         let saved = fixture
@@ -2142,6 +2588,19 @@ mod tests {
             handle_saved_skin_file(State(self.state.clone()), Path(texture_key.to_string())).await
         }
 
+        async fn save_skin_from_profile(
+            &self,
+            payload: SaveSkinFromProfileRequest,
+            allowed_prefix: String,
+        ) -> Result<Json<SavedSkinRecord>, (StatusCode, Json<serde_json::Value>)> {
+            handle_save_skin_from_profile_with_client(
+                State(self.state.clone()),
+                payload,
+                MinecraftSkinTextureClient::with_allowed_prefix(allowed_prefix),
+            )
+            .await
+        }
+
         async fn apply_saved_skin_with_endpoint(
             &self,
             texture_key: &str,
@@ -2274,6 +2733,32 @@ mod tests {
         (format!("{base_url}/minecraft/profile/skins"), rx)
     }
 
+    async fn skin_profile_texture_test_server(
+        mode: SkinProfileTextureServerMode,
+    ) -> (
+        String,
+        mpsc::UnboundedReceiver<RecordedSkinProfileTextureRequest>,
+    ) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let app = axum::Router::new()
+            .route(
+                "/texture/{texture_id}",
+                get(record_skin_profile_texture_route),
+            )
+            .with_state(SkinProfileTextureRouteState { tx, mode });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind skin profile texture test server");
+        let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("skin profile texture test server");
+        });
+
+        (format!("{base_url}/texture/"), rx)
+    }
+
     #[derive(Clone, Copy)]
     enum SkinApplyServerMode {
         Success,
@@ -2282,9 +2767,21 @@ mod tests {
     }
 
     #[derive(Clone)]
+    enum SkinProfileTextureServerMode {
+        Png(Vec<u8>),
+        Oversized,
+    }
+
+    #[derive(Clone)]
     struct SkinApplyRouteState {
         tx: mpsc::UnboundedSender<RecordedSkinApplyRequest>,
         mode: SkinApplyServerMode,
+    }
+
+    #[derive(Clone)]
+    struct SkinProfileTextureRouteState {
+        tx: mpsc::UnboundedSender<RecordedSkinProfileTextureRequest>,
+        mode: SkinProfileTextureServerMode,
     }
 
     #[derive(Debug)]
@@ -2295,6 +2792,13 @@ mod tests {
         user_agent: Option<String>,
         content_type: Option<String>,
         body: Vec<u8>,
+    }
+
+    #[derive(Debug)]
+    struct RecordedSkinProfileTextureRequest {
+        path: String,
+        accept: Option<String>,
+        user_agent: Option<String>,
     }
 
     async fn record_skin_apply_route(
@@ -2340,6 +2844,31 @@ mod tests {
                 })),
             ),
         }
+    }
+
+    async fn record_skin_profile_texture_route(
+        AxumState(state): AxumState<SkinProfileTextureRouteState>,
+        Path(texture_id): Path<String>,
+        headers: HeaderMap,
+    ) -> Response<Body> {
+        let _ = state.tx.send(RecordedSkinProfileTextureRequest {
+            path: format!("/texture/{texture_id}"),
+            accept: header_value(&headers, "accept"),
+            user_agent: header_value(&headers, "user-agent"),
+        });
+
+        let (status, body) = match state.mode {
+            SkinProfileTextureServerMode::Png(bytes) => (StatusCode::OK, bytes),
+            SkinProfileTextureServerMode::Oversized => {
+                (StatusCode::OK, vec![0; SKIN_UPLOAD_MAX_BYTES + 1])
+            }
+        };
+
+        Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "image/png")
+            .body(Body::from(body))
+            .expect("skin profile texture response")
     }
 
     fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
