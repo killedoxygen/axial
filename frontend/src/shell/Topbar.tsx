@@ -57,7 +57,7 @@ function StatusPill(): JSX.Element {
         onClick={() => navigate({ name: 'instance', id: inst.id })}
         title="Jump to running instance"
       >
-        <span class="cp-status-dot" />
+        <span class="cp-status-dot" aria-hidden="true" />
         <span class="cp-status-pill-label">{label} · {inst.name}</span>
       </button>
     );
@@ -81,7 +81,7 @@ function StatusPill(): JSX.Element {
         aria-label={`Open downloads. ${installTitle}`}
         style={installStyle}
       >
-        <span class="cp-status-dot" />
+        <span class="cp-status-dot" aria-hidden="true" />
         <span class="cp-status-pill-label">{install.label} · {installPct}%{queuedLabel}</span>
       </button>
     );
@@ -92,7 +92,7 @@ function StatusPill(): JSX.Element {
     const li = instances.value.find(i => i.id === launch.instanceId);
     return (
       <span class="cp-status-pill cp-status-pill--preparing cp-nodrag" title={`${launch.label} · ${li?.name || 'launch'}`}>
-        <span class="cp-status-dot" />
+        <span class="cp-status-dot" aria-hidden="true" />
         <span class="cp-status-pill-label">{launch.label} · {li?.name || 'launch'}</span>
       </span>
     );
@@ -110,7 +110,7 @@ function StatusPill(): JSX.Element {
         title={queuedTitle}
         aria-label={`Open downloads. ${queuedTitle}`}
       >
-        <span class="cp-status-dot" />
+        <span class="cp-status-dot" aria-hidden="true" />
         <span class="cp-status-pill-label">{queuedLabel}</span>
       </button>
     );
@@ -126,7 +126,7 @@ function StatusPill(): JSX.Element {
         title={title}
         aria-label={`Open downloads. Install failed: ${title}`}
       >
-        <span class="cp-status-dot" />
+        <span class="cp-status-dot" aria-hidden="true" />
         <span class="cp-status-pill-label">install failed</span>
       </button>
     );
@@ -134,7 +134,7 @@ function StatusPill(): JSX.Element {
 
   return (
     <span class="cp-status-pill cp-nodrag">
-      <span class="cp-status-dot" />
+      <span class="cp-status-dot" aria-hidden="true" />
       <span class="cp-status-pill-label">idle</span>
     </span>
   );

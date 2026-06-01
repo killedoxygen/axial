@@ -550,6 +550,8 @@
   --cp-status-color: var(--text-mute);
   --cp-status-bg: transparent;
   --cp-status-border: transparent;
+  --cp-status-dot-fill: color-mix(in oklab, var(--text-mute) 78%, var(--surface));
+  --cp-status-dot-ring: color-mix(in oklab, var(--text-mute) 24%, transparent);
   flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
@@ -578,6 +580,8 @@
   --cp-status-color: var(--accent);
   --cp-status-bg: var(--accent-softer);
   --cp-status-border: var(--accent-line);
+  --cp-status-dot-fill: color-mix(in oklab, var(--accent) 62%, var(--text-dim));
+  --cp-status-dot-ring: color-mix(in oklab, var(--accent) 26%, transparent);
   cursor: pointer;
 }
 .cp-status-pill--installing {
@@ -586,6 +590,8 @@
   --cp-status-color: color-mix(in oklab, var(--cp-install-color) 78%, var(--text-dim));
   --cp-status-bg: color-mix(in oklab, var(--surface-2) 90%, var(--cp-install-color));
   --cp-status-border: color-mix(in oklab, var(--line) 76%, var(--cp-install-color));
+  --cp-status-dot-fill: color-mix(in oklab, var(--cp-install-color) 34%, var(--text-dim));
+  --cp-status-dot-ring: color-mix(in oklab, var(--cp-install-color) 18%, transparent);
   --cp-install-fill: color-mix(in oklab, var(--cp-install-color) 18%, transparent);
   --cp-install-shine: color-mix(in oklab, var(--cp-install-color) 30%, transparent);
   cursor: pointer;
@@ -611,18 +617,24 @@
   --cp-status-color: color-mix(in oklab, var(--accent) 42%, var(--text-dim));
   --cp-status-bg: color-mix(in oklab, var(--surface-2) 88%, var(--accent));
   --cp-status-border: color-mix(in oklab, var(--line) 74%, var(--accent));
+  --cp-status-dot-fill: color-mix(in oklab, var(--accent) 42%, var(--text-dim));
+  --cp-status-dot-ring: color-mix(in oklab, var(--accent) 18%, transparent);
 }
 .cp-status-pill--queued {
   --cp-install-color: oklch(from var(--accent) l calc(c * 0.7) calc(h + 180));
   --cp-status-color: color-mix(in oklab, var(--cp-install-color) 64%, var(--text-dim));
   --cp-status-bg: color-mix(in oklab, var(--surface-2) 94%, var(--cp-install-color));
   --cp-status-border: color-mix(in oklab, var(--line) 82%, var(--cp-install-color));
+  --cp-status-dot-fill: color-mix(in oklab, var(--cp-install-color) 30%, var(--text-dim));
+  --cp-status-dot-ring: color-mix(in oklab, var(--cp-install-color) 16%, transparent);
   cursor: pointer;
 }
 .cp-status-pill--failed {
   --cp-status-color: color-mix(in oklab, var(--err) 74%, var(--text-dim));
   --cp-status-bg: color-mix(in oklab, var(--surface-2) 91%, var(--err));
   --cp-status-border: color-mix(in oklab, var(--line) 76%, var(--err));
+  --cp-status-dot-fill: color-mix(in oklab, var(--err) 58%, var(--text-dim));
+  --cp-status-dot-ring: color-mix(in oklab, var(--err) 22%, transparent);
   cursor: pointer;
 }
 .cp-status-dot {
@@ -630,8 +642,8 @@
   width: 7px;
   height: 7px;
   border-radius: 999px;
-  background: currentColor;
-  box-shadow: 0 0 0 1px color-mix(in oklab, currentColor 10%, transparent);
+  background: var(--cp-status-dot-fill);
+  box-shadow: 0 0 0 1px var(--cp-status-dot-ring);
 }
 .cp-status-pill-label {
   min-width: 0;
