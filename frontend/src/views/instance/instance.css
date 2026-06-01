@@ -641,10 +641,6 @@
   }
   .cp-instance-body--overview-bento {
     padding-top: 12px;
-    grid-template-areas:
-      "worlds activity"
-      "performance details"
-      "quick details";
     gap: 12px 15px;
   }
   .cp-instance-body--overview-bento > .cp-od-slot > .cp-card {
@@ -1309,8 +1305,8 @@
   .cp-instance-body--overview-bento {
     grid-template-columns: minmax(0, 1fr) minmax(244px, 268px);
     grid-template-areas:
-      "performance activity"
-      "worlds details"
+      "worlds activity"
+      "performance details"
       "quick details";
     gap: 12px;
   }
