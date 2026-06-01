@@ -111,6 +111,12 @@
    AccentEditor itself is layout-agnostic, so we add the breathing room here. */
 .cp-settings-card--stack .cp-accent-pane { margin-top: 14px; }
 
+.cp-settings-lab-action {
+  margin-top: 14px;
+  display: flex;
+  justify-content: flex-start;
+}
+
 /* Compact mode pickers --------------------------------------------------- */
 .cp-settings-mode-choice {
   margin-top: 14px;

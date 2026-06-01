@@ -1597,6 +1597,7 @@ function PerformanceSection(): JSX.Element {
   const [launchReports, setLaunchReports] = useState<LaunchReportsState>({ status: 'loading', data: [] });
   const [benchmarkMatrix, setBenchmarkMatrix] = useState<BenchmarkMatrixState>({ status: 'loading', data: null });
   const [qualificationPreview, setQualificationPreview] = useState<BenchmarkQualificationPreviewState>({ status: 'loading', data: null });
+  const [labOpen, setLabOpen] = useState(false);
   const [saving, setSaving] = useState<'performance' | 'guardian' | null>(null);
   const requestRef = useRef(0);
 
@@ -1604,6 +1605,10 @@ function PerformanceSection(): JSX.Element {
     setPerformanceMode(savedPerformance);
     setGuardianMode(savedGuardian);
   }, [savedPerformance, savedGuardian]);
+
+  useEffect(() => {
+    if (!isDev) setLabOpen(false);
+  }, [isDev]);
 
   useEffect(() => {
     let alive = true;
@@ -1622,10 +1627,7 @@ function PerformanceSection(): JSX.Element {
   }, []);
 
   useEffect(() => {
-    if (!isDev) {
-      setLaunchReports({ status: 'ready', data: [] });
-      return;
-    }
+    if (!isDev || !labOpen) return;
     let alive = true;
     setLaunchReports({ status: 'loading', data: [] });
     api('GET', '/launch/reports')
@@ -1640,10 +1642,10 @@ function PerformanceSection(): JSX.Element {
         setLaunchReports((prev) => ({ status: 'error', data: prev.data, error: errMessage(err) }));
       });
     return () => { alive = false; };
-  }, [isDev]);
+  }, [isDev, labOpen]);
 
   useEffect(() => {
-    if (!isDev) return;
+    if (!isDev || !labOpen) return;
     let alive = true;
     setBenchmarkMatrix((prev) => ({ status: 'loading', data: prev.data }));
     api('GET', '/launch/benchmark/matrix')
@@ -1657,10 +1659,10 @@ function PerformanceSection(): JSX.Element {
         setBenchmarkMatrix((prev) => ({ status: 'error', data: prev.data, error: errMessage(err) }));
       });
     return () => { alive = false; };
-  }, [isDev]);
+  }, [isDev, labOpen]);
 
   useEffect(() => {
-    if (!isDev) return;
+    if (!isDev || !labOpen) return;
     let alive = true;
     setQualificationPreview((prev) => ({ status: 'loading', data: prev.data }));
     api('GET', '/launch/benchmark/qualification/family-c-1-12-2/preview')
@@ -1678,7 +1680,7 @@ function PerformanceSection(): JSX.Element {
         setQualificationPreview((prev) => ({ status: 'error', data: prev.data, error: errMessage(err) }));
       });
     return () => { alive = false; };
-  }, [isDev]);
+  }, [isDev, labOpen]);
 
   const savePatch = async (
     key: 'performance_mode' | 'guardian_mode',
@@ -1740,16 +1742,46 @@ function PerformanceSection(): JSX.Element {
         />
         <PerformanceRulesStatusBlock state={rulesStatus} />
       </SettingsCard>
-      {isDev && (
+      {isDev && !labOpen && (
         <SettingsCard
           title="Performance lab"
-          desc="Developer-only benchmark descriptors, qualification evidence, and suite drivers."
+          desc="Developer-only launch proof and benchmark tools."
+          control={(
+            <Button
+              variant="secondary"
+              size="sm"
+              icon="chevron-down"
+              onClick={() => setLabOpen(true)}
+            >
+              Open
+            </Button>
+          )}
+        />
+      )}
+      {isDev && labOpen && (
+        <SettingsCard
+          title="Performance lab"
+          desc="Developer-only launch proof and benchmark tools."
           stack
         >
-          <LaunchProofHistoryBlock state={launchReports} />
-          <BenchmarkMatrixBlock state={benchmarkMatrix} />
-          <BenchmarkQualificationPreviewBlock state={qualificationPreview} />
-          <BenchmarkSuiteDriversBlock matrixState={benchmarkMatrix} />
+          <div class="cp-settings-lab-action">
+            <Button
+              variant="secondary"
+              size="sm"
+              icon="chevron-up"
+              onClick={() => setLabOpen(false)}
+            >
+              Close
+            </Button>
+          </div>
+          {labOpen && (
+            <>
+              <LaunchProofHistoryBlock state={launchReports} />
+              <BenchmarkMatrixBlock state={benchmarkMatrix} />
+              <BenchmarkQualificationPreviewBlock state={qualificationPreview} />
+              <BenchmarkSuiteDriversBlock matrixState={benchmarkMatrix} />
+            </>
+          )}
         </SettingsCard>
       )}
     </>
