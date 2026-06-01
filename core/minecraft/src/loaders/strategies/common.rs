@@ -11,9 +11,11 @@ use crate::loaders::types::{LoaderBuildRecord, LoaderError, LoaderInstallPlan};
 use crate::loaders::validate_version_id;
 use crate::paths::{loader_artifacts_dir, versions_dir};
 use crate::profiles::ensure_launcher_profiles;
+use std::collections::HashMap;
 use std::fs;
 use std::io::sink;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs as async_fs;
 use zip::ZipArchive;
@@ -368,6 +370,12 @@ where
         return Ok(());
     }
 
+    let install_lock = base_version_install_lock(library_dir, version_id);
+    let _guard = install_lock.lock().await;
+    if is_base_game_installed(library_dir, version_id) {
+        return Ok(());
+    }
+
     let downloader = Downloader::new(library_dir.to_path_buf());
     Box::pin(downloader.install_version(version_id, None, |progress| {
         if !progress.done {
@@ -376,6 +384,29 @@ where
     }))
     .await?;
     Ok(())
+}
+
+fn base_version_install_lock(library_dir: &Path, version_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: OnceLock<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+        OnceLock::new();
+    let mutex = LOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    base_version_install_lock_from_map(mutex, library_dir, version_id)
+}
+
+fn base_version_install_lock_from_map(
+    mutex: &std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    library_dir: &Path,
+    version_id: &str,
+) -> Arc<tokio::sync::Mutex<()>> {
+    let key = format!("{}\n{}", library_dir.to_string_lossy(), version_id.trim());
+    let mut guard = match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard
+        .entry(key)
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
 }
 
 fn is_base_game_installed(library_dir: &Path, game_version: &str) -> bool {
@@ -637,9 +668,10 @@ fn done() -> DownloadProgress {
 #[cfg(test)]
 mod tests {
     use super::{
-        cleanup_on_error, ensure_base_version, install_from_installer_source,
-        install_from_legacy_archive, install_from_profile_source, promote_cached_artifact_tmp,
-        read_valid_legacy_archive, read_valid_profile_json, write_cached_artifact,
+        base_version_install_lock_from_map, cleanup_on_error, ensure_base_version,
+        install_from_installer_source, install_from_legacy_archive, install_from_profile_source,
+        promote_cached_artifact_tmp, read_valid_legacy_archive, read_valid_profile_json,
+        write_cached_artifact,
     };
     use crate::download::DownloadProgress;
     use crate::loaders::types::LoaderError;
@@ -650,6 +682,7 @@ mod tests {
     };
     use crate::loaders::validate_version_id;
     use crate::paths::versions_dir;
+    use std::collections::HashMap;
     use std::fs;
     use std::io::{ErrorKind, Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -749,6 +782,57 @@ mod tests {
             )) < 4096,
             "public loader install future should not embed the strategy dispatcher"
         );
+    }
+
+    #[tokio::test]
+    async fn base_version_install_lock_serializes_same_library_version() {
+        let locks = std::sync::Mutex::new(HashMap::new());
+        let root = PathBuf::from("/tmp/croopor-loader-base-lock");
+        let first = base_version_install_lock_from_map(&locks, &root, "1.21.5");
+        let second = base_version_install_lock_from_map(&locks, &root, "1.21.5");
+        let other_version = base_version_install_lock_from_map(&locks, &root, "1.21.4");
+        let other_library =
+            base_version_install_lock_from_map(&locks, &root.join("other"), "1.21.5");
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(!Arc::ptr_eq(&first, &other_version));
+        assert!(!Arc::ptr_eq(&first, &other_library));
+
+        let first_guard = first.lock().await;
+        let second_wait = tokio::spawn(async move {
+            let _guard = second.lock().await;
+        });
+        tokio::task::yield_now().await;
+        assert!(!second_wait.is_finished());
+
+        drop(first_guard);
+        tokio::time::timeout(Duration::from_secs(1), second_wait)
+            .await
+            .expect("second waiter should acquire after first guard drops")
+            .expect("second waiter should not panic");
+    }
+
+    #[test]
+    fn base_version_install_lock_recovers_from_poisoned_map_lock() {
+        let locks = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let root = PathBuf::from("/tmp/croopor-loader-poisoned-base-lock");
+        let seeded_install_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let poison_target = Arc::clone(&locks);
+        let poison_seed = Arc::clone(&seeded_install_lock);
+        let poison_root = root.clone();
+
+        let _ = std::thread::spawn(move || {
+            let key = format!("{}\n{}", poison_root.to_string_lossy(), "1.21.5");
+            let mut guard = poison_target.lock().unwrap();
+            guard.insert(key, poison_seed);
+            panic!("poison base install lock map");
+        })
+        .join();
+
+        assert!(locks.is_poisoned());
+        let recovered_lock = base_version_install_lock_from_map(&locks, &root, "1.21.5");
+
+        assert!(Arc::ptr_eq(&recovered_lock, &seeded_install_lock));
     }
 
     #[tokio::test]
