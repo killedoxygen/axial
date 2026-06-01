@@ -171,6 +171,8 @@ async fn handle_loader_install(
             let _ = progress_tx.send(prewarm_runtime_error_progress());
         } else if let Some(progress) = final_progress {
             let _ = progress_tx.send(progress);
+        } else {
+            let _ = progress_tx.send(loader_install_done_progress());
         }
 
         drop(progress_tx);
@@ -269,6 +271,17 @@ fn prewarm_runtime_error_progress() -> DownloadProgress {
         total: 0,
         file: None,
         error: Some(public_runtime_error_message().to_string()),
+        done: true,
+    }
+}
+
+fn loader_install_done_progress() -> DownloadProgress {
+    DownloadProgress {
+        phase: "done".to_string(),
+        current: 1,
+        total: 1,
+        file: None,
+        error: None,
         done: true,
     }
 }
@@ -425,6 +438,18 @@ mod tests {
         );
         assert!(progress.done);
         assert_no_raw_fragments(progress.error.as_deref().expect("error is present"));
+    }
+
+    #[test]
+    fn loader_install_done_progress_marks_session_terminal() {
+        let progress = loader_install_done_progress();
+
+        assert_eq!(progress.phase, "done");
+        assert_eq!(progress.current, 1);
+        assert_eq!(progress.total, 1);
+        assert_eq!(progress.file, None);
+        assert_eq!(progress.error, None);
+        assert!(progress.done);
     }
 
     fn assert_no_raw_fragments(message: &str) {

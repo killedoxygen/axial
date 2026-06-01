@@ -76,14 +76,15 @@ impl Downloader {
         F: FnMut(DownloadProgress),
     {
         let version_dir = versions_dir(&self.mc_dir).join(version_id);
-        async_fs::create_dir_all(&version_dir).await?;
-
         let marker_path = version_dir.join(".incomplete");
-        async_fs::write(&marker_path, b"installing").await?;
 
-        let install_result = self
-            .install_version_inner(version_id, manifest_url, &mut send)
-            .await;
+        let install_result = async {
+            async_fs::create_dir_all(&version_dir).await?;
+            async_fs::write(&marker_path, b"installing").await?;
+            self.install_version_inner(version_id, manifest_url, &mut send)
+                .await
+        }
+        .await;
 
         match install_result {
             Ok(()) => {
@@ -767,7 +768,35 @@ mod tests {
     use crate::launch::{Library, LibraryArtifact, LibraryDownload};
     use crate::rules::Environment;
     use std::collections::HashMap;
+    use std::fs;
     use std::path::Path;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[tokio::test]
+    async fn install_version_emits_terminal_error_when_setup_fails() {
+        let root = temp_dir("setup-failure");
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(versions_dir(&root), b"not a directory").expect("write versions sentinel");
+
+        let downloader = Downloader::new(&root);
+        let mut events = Vec::new();
+        let result = downloader
+            .install_version("1.20.1", None, |progress| events.push(progress))
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.phase, "error");
+        assert_eq!(event.current, 0);
+        assert_eq!(event.total, 0);
+        assert_eq!(event.file, None);
+        assert!(event.error.is_some());
+        assert!(event.done);
+
+        let _ = fs::remove_file(root.join("versions"));
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn mixed_windows_native_libraries_only_download_matching_arch() {
@@ -891,5 +920,16 @@ mod tests {
             url: format!("https://libraries.minecraft.net/{path}"),
             ..LibraryArtifact::default()
         }
+    }
+
+    fn temp_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or_default();
+        std::env::temp_dir().join(format!(
+            "croopor-download-{prefix}-{}-{nanos:x}",
+            std::process::id()
+        ))
     }
 }
