@@ -395,7 +395,8 @@ fn write_snapshot(path: &Path, snapshot: &RulesCacheSnapshot) -> Result<(), std:
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let data = serde_json::to_string_pretty(snapshot).expect("rules cache snapshot serializes");
+    let data = serde_json::to_string_pretty(snapshot)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     let temp_path = path.with_extension("json.tmp");
     fs::write(&temp_path, data)?;
     replace_file(&temp_path, path)
@@ -475,6 +476,32 @@ mod tests {
                 .expect("cache json");
         assert!(raw.get("manifest").is_some_and(serde_json::Value::is_null));
         assert!(raw.get("signature").is_some_and(serde_json::Value::is_null));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_cache_write_failure_is_reported_without_panic() {
+        let root = test_root("missing-write-failure");
+        let manifest = builtin_manifest().expect("builtin manifest");
+        let cache_parent = rules_cache_path(&root)
+            .parent()
+            .expect("cache parent")
+            .to_path_buf();
+        fs::create_dir_all(&cache_parent).expect("create cache parent");
+        fs::create_dir_all(rules_cache_path(&root).with_extension("json.tmp"))
+            .expect("create blocked temp path");
+
+        let status = load_or_create_rules_cache(&root, &manifest);
+
+        assert!(!status.recorded);
+        assert_eq!(status.state, RulesCacheState::Unavailable);
+        assert_eq!(status.updated_at, None);
+        assert!(status.loaded_at.is_some());
+        assert_eq!(
+            status.warning.as_deref(),
+            Some("Rules cache could not be written locally.")
+        );
 
         let _ = fs::remove_dir_all(root);
     }
