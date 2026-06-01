@@ -1,6 +1,7 @@
 use croopor_minecraft::download::DownloadProgress;
-use std::collections::HashMap;
+use std::{collections::HashMap, future::Future, sync::Arc};
 use tokio::sync::{RwLock, broadcast};
+use tokio::task::JoinHandle;
 
 struct InstallEntry {
     key: Option<InstallKey>,
@@ -89,6 +90,39 @@ impl InstallStore {
             entry.history.push(progress.clone());
             let _ = entry.events.send(progress);
         }
+    }
+
+    pub async fn finish_if_active(&self, install_id: &str, mut progress: DownloadProgress) -> bool {
+        let mut installs = self.installs.write().await;
+        let Some(entry) = installs.get_mut(install_id) else {
+            return false;
+        };
+        if entry.done {
+            return false;
+        }
+
+        progress.done = true;
+        entry.done = true;
+        entry.history.push(progress.clone());
+        let _ = entry.events.send(progress);
+        true
+    }
+
+    pub fn spawn_tracked_worker<F>(
+        store: Arc<Self>,
+        install_id: String,
+        interrupted_progress: DownloadProgress,
+        worker: F,
+    ) -> JoinHandle<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        tokio::spawn(async move {
+            let _ = tokio::spawn(worker).await;
+            store
+                .finish_if_active(&install_id, interrupted_progress)
+                .await;
+        })
     }
 
     pub async fn subscribe(
@@ -312,6 +346,107 @@ mod tests {
         assert_eq!(install_id, "fresh-install");
         assert!(inserted);
         assert_eq!(store.active_install_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn finish_if_active_marks_session_done_and_allows_fresh_retry() {
+        let store = InstallStore::new();
+        store
+            .insert_or_existing_active(
+                "interrupted-install".to_string(),
+                "1.21.5".to_string(),
+                String::new(),
+            )
+            .await;
+
+        assert!(
+            store
+                .finish_if_active("interrupted-install", failed_progress())
+                .await
+        );
+        assert_eq!(store.active_install_count().await, 0);
+
+        let (install_id, inserted) = store
+            .insert_or_existing_active(
+                "fresh-install".to_string(),
+                "1.21.5".to_string(),
+                String::new(),
+            )
+            .await;
+
+        assert_eq!(install_id, "fresh-install");
+        assert!(inserted);
+        assert!(store.subscribe("interrupted-install").await.is_none());
+        assert_eq!(store.active_install_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn finish_if_active_ignores_already_done_sessions() {
+        let store = InstallStore::new();
+        store.insert("done-install".to_string()).await;
+        store.emit("done-install", done_progress()).await;
+
+        assert!(
+            !store
+                .finish_if_active("done-install", failed_progress())
+                .await
+        );
+
+        let (history, _, done) = store
+            .subscribe("done-install")
+            .await
+            .expect("done install remains until pruned");
+        assert!(done);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].phase, "done");
+    }
+
+    #[tokio::test]
+    async fn tracked_worker_finishes_active_session_after_panic() {
+        let store = Arc::new(InstallStore::new());
+        store
+            .insert_or_existing_active(
+                "panic-install".to_string(),
+                "1.21.5".to_string(),
+                String::new(),
+            )
+            .await;
+
+        InstallStore::spawn_tracked_worker(
+            Arc::clone(&store),
+            "panic-install".to_string(),
+            failed_progress(),
+            async {
+                panic!("install worker panic");
+            },
+        )
+        .await
+        .expect("tracked worker should absorb inner panic");
+
+        assert_eq!(store.active_install_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn tracked_worker_finishes_active_session_after_early_return() {
+        let store = Arc::new(InstallStore::new());
+        store
+            .insert_or_existing_active(
+                "early-install".to_string(),
+                "1.21.5".to_string(),
+                String::new(),
+            )
+            .await;
+
+        InstallStore::spawn_tracked_worker(
+            Arc::clone(&store),
+            "early-install".to_string(),
+            failed_progress(),
+            async {},
+        )
+        .await
+        .expect("tracked worker should complete");
+
+        assert_eq!(store.active_install_count().await, 0);
     }
 
     #[tokio::test]

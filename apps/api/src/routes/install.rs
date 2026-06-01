@@ -1,4 +1,4 @@
-use crate::state::{AppState, DownloadProgress};
+use crate::state::{AppState, DownloadProgress, InstallStore};
 use axum::{
     Json, Router,
     extract::{Path, State},
@@ -68,33 +68,40 @@ async fn handle_install(
     let mc_dir = PathBuf::from(mc_dir);
     let install_id_task = install_id.clone();
 
-    tokio::spawn(async move {
-        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<DownloadProgress>();
-        let store_task = {
-            let store = store.clone();
-            let install_id = install_id_task.clone();
-            tokio::spawn(async move {
-                while let Some(progress) = progress_rx.recv().await {
-                    store
-                        .emit(&install_id, sanitize_install_progress(progress))
-                        .await;
-                }
-            })
-        };
+    let worker_store = store.clone();
+    let worker_install_id = install_id_task.clone();
+    InstallStore::spawn_tracked_worker(
+        store,
+        install_id_task,
+        interrupted_install_progress(),
+        async move {
+            let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<DownloadProgress>();
+            let store_task = {
+                let store = worker_store.clone();
+                let install_id = worker_install_id.clone();
+                tokio::spawn(async move {
+                    while let Some(progress) = progress_rx.recv().await {
+                        store
+                            .emit(&install_id, sanitize_install_progress(progress))
+                            .await;
+                    }
+                })
+            };
 
-        let downloader = Downloader::new(mc_dir);
-        let _ = downloader
-            .install_version(
-                &version_id,
-                (!manifest_url.is_empty()).then_some(manifest_url.as_str()),
-                |progress| {
-                    let _ = progress_tx.send(progress);
-                },
-            )
-            .await;
-        drop(progress_tx);
-        let _ = store_task.await;
-    });
+            let downloader = Downloader::new(mc_dir);
+            let _ = downloader
+                .install_version(
+                    &version_id,
+                    (!manifest_url.is_empty()).then_some(manifest_url.as_str()),
+                    |progress| {
+                        let _ = progress_tx.send(progress);
+                    },
+                )
+                .await;
+            drop(progress_tx);
+            let _ = store_task.await;
+        },
+    );
 
     Ok(Json(serde_json::json!({ "install_id": install_id })))
 }
@@ -115,6 +122,17 @@ fn sanitize_install_progress(mut progress: DownloadProgress) -> DownloadProgress
         progress.error = Some(INSTALL_FAILURE_MESSAGE.to_string());
     }
     progress
+}
+
+fn interrupted_install_progress() -> DownloadProgress {
+    DownloadProgress {
+        phase: "error".to_string(),
+        current: 0,
+        total: 0,
+        file: None,
+        error: Some(INSTALL_FAILURE_MESSAGE.to_string()),
+        done: true,
+    }
 }
 
 async fn handle_install_events(

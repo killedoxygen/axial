@@ -20,6 +20,8 @@ use tokio::sync::mpsc;
 
 const LOADER_INSTALL_SCOPE: &str = "loader";
 const VANILLA_INSTALL_SCOPE: &str = "vanilla";
+const LOADER_INSTALL_INTERRUPTED_MESSAGE: &str =
+    "Loader install stopped before completing. Try again.";
 
 #[derive(Debug, Deserialize)]
 struct LoaderBuildQuery {
@@ -153,49 +155,61 @@ async fn handle_loader_install(
     let library_dir = PathBuf::from(library_dir);
     let install_id_task = install_id.clone();
 
-    tokio::spawn(async move {
-        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<DownloadProgress>();
-        let store_task = {
-            let store = store.clone();
-            let install_id = install_id_task.clone();
-            tokio::spawn(async move {
-                while let Some(progress) = progress_rx.recv().await {
-                    store.emit(&install_id, progress).await;
+    let worker_store = store.clone();
+    let worker_install_id = install_id_task.clone();
+    InstallStore::spawn_tracked_worker(
+        store,
+        install_id_task,
+        interrupted_loader_install_progress(),
+        async move {
+            let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<DownloadProgress>();
+            let store_task = {
+                let store = worker_store.clone();
+                let install_id = worker_install_id.clone();
+                tokio::spawn(async move {
+                    while let Some(progress) = progress_rx.recv().await {
+                        store.emit(&install_id, progress).await;
+                    }
+                })
+            };
+
+            let version_id = build.version_id.clone();
+            wait_for_active_vanilla_base_install(
+                &worker_store,
+                &build.minecraft_version,
+                &progress_tx,
+            )
+            .await;
+
+            let mut final_progress: Option<DownloadProgress> = None;
+            let result = install_build(&library_dir, build, |progress| {
+                if progress.done && progress.phase == "done" {
+                    final_progress = Some(progress);
+                } else {
+                    let _ = progress_tx.send(progress);
                 }
             })
-        };
+            .await;
 
-        let version_id = build.version_id.clone();
-        wait_for_active_vanilla_base_install(&store, &build.minecraft_version, &progress_tx).await;
-
-        let mut final_progress: Option<DownloadProgress> = None;
-        let result = install_build(&library_dir, build, |progress| {
-            if progress.done && progress.phase == "done" {
-                final_progress = Some(progress);
-            } else {
+            if let Err(error) = result {
+                let _ = progress_tx.send(error_progress(error));
+            } else if prewarm_version_runtime(&library_dir, &version_id, |progress| {
                 let _ = progress_tx.send(progress);
+            })
+            .await
+            .is_err()
+            {
+                let _ = progress_tx.send(prewarm_runtime_error_progress());
+            } else if let Some(progress) = final_progress {
+                let _ = progress_tx.send(progress);
+            } else {
+                let _ = progress_tx.send(loader_install_done_progress());
             }
-        })
-        .await;
 
-        if let Err(error) = result {
-            let _ = progress_tx.send(error_progress(error));
-        } else if prewarm_version_runtime(&library_dir, &version_id, |progress| {
-            let _ = progress_tx.send(progress);
-        })
-        .await
-        .is_err()
-        {
-            let _ = progress_tx.send(prewarm_runtime_error_progress());
-        } else if let Some(progress) = final_progress {
-            let _ = progress_tx.send(progress);
-        } else {
-            let _ = progress_tx.send(loader_install_done_progress());
-        }
-
-        drop(progress_tx);
-        let _ = store_task.await;
-    });
+            drop(progress_tx);
+            let _ = store_task.await;
+        },
+    );
 
     Ok(Json(serde_json::json!({ "install_id": install_id })))
 }
@@ -351,6 +365,17 @@ fn loader_install_done_progress() -> DownloadProgress {
         total: 1,
         file: None,
         error: None,
+        done: true,
+    }
+}
+
+fn interrupted_loader_install_progress() -> DownloadProgress {
+    DownloadProgress {
+        phase: "error".to_string(),
+        current: 0,
+        total: 0,
+        file: None,
+        error: Some(LOADER_INSTALL_INTERRUPTED_MESSAGE.to_string()),
         done: true,
     }
 }
