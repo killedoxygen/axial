@@ -37,6 +37,9 @@ pub async fn fetch_bytes(url: &str, max_size: u64) -> Result<Vec<u8>, LoaderErro
         for attempt in 0..3 {
             match fetch_bytes_blocking(&url, max_size) {
                 Ok(value) => return Ok(value),
+                Err(LoaderError::ArtifactMissing(message)) => {
+                    return Err(LoaderError::ArtifactMissing(message));
+                }
                 Err(error) => {
                     last_error = Some(error);
                     if attempt < 2 {
@@ -105,20 +108,42 @@ fn agent() -> &'static ureq::Agent {
 mod tests {
     use super::fetch_bytes;
     use crate::loaders::types::LoaderError;
-    use std::io::{Read, Write};
+    use std::io::{ErrorKind, Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
     use std::thread;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn fetch_bytes_maps_http_404_to_artifact_missing() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        listener
+            .set_nonblocking(true)
+            .expect("set test server nonblocking");
         let url = format!(
             "http://{}/missing-installer.jar",
             listener.local_addr().expect("server addr")
         );
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let server_request_count = Arc::clone(&request_count);
+        let (stop_server, server_stopped) = mpsc::channel();
         let server = thread::spawn(move || {
-            for stream in listener.incoming().take(3) {
-                respond_404(stream.expect("connection"));
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        server_request_count.fetch_add(1, Ordering::SeqCst);
+                        respond_404(stream);
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        if server_stopped.try_recv().is_ok() {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept connection: {error}"),
+                }
             }
         });
 
@@ -132,7 +157,9 @@ mod tests {
             error => panic!("expected ArtifactMissing, got {error:?}"),
         }
 
+        stop_server.send(()).expect("stop test server");
         server.join().expect("server thread");
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
     }
 
     fn respond_404(mut stream: TcpStream) {
