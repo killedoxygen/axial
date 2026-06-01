@@ -31,14 +31,15 @@ async fn handle_install(
     State(state): State<AppState>,
     Json(payload): Json<InstallRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    if payload.version_id.trim().is_empty() {
+    let (version_id, manifest_url) = effective_install_fields(&payload);
+    if version_id.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": "version_id is required" })),
         ));
     }
 
-    if is_loader_version_id(payload.version_id.trim()) {
+    if is_loader_version_id(&version_id) {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -55,11 +56,15 @@ async fn handle_install(
     })?;
 
     let install_id = generate_install_id();
-    state.installs().insert(install_id.clone()).await;
+    let (install_id, inserted) = state
+        .installs()
+        .insert_or_existing_active(install_id, version_id.clone(), manifest_url.clone())
+        .await;
+    if !inserted {
+        return Ok(Json(serde_json::json!({ "install_id": install_id })));
+    }
 
     let store = state.installs().clone();
-    let version_id = payload.version_id.trim().to_string();
-    let manifest_url = payload.manifest_url.trim().to_string();
     let mc_dir = PathBuf::from(mc_dir);
     let install_id_task = install_id.clone();
 
@@ -92,6 +97,13 @@ async fn handle_install(
     });
 
     Ok(Json(serde_json::json!({ "install_id": install_id })))
+}
+
+fn effective_install_fields(payload: &InstallRequest) -> (String, String) {
+    (
+        payload.version_id.trim().to_string(),
+        payload.manifest_url.trim().to_string(),
+    )
 }
 
 fn is_loader_version_id(version_id: &str) -> bool {
@@ -174,6 +186,39 @@ fn generate_install_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effective_install_fields_trims_version_id_and_manifest_url() {
+        let payload = InstallRequest {
+            version_id: " 1.21.5 ".to_string(),
+            manifest_url: " https://example.invalid/manifest.json ".to_string(),
+        };
+
+        assert_eq!(
+            effective_install_fields(&payload),
+            (
+                "1.21.5".to_string(),
+                "https://example.invalid/manifest.json".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn effective_install_fields_preserves_explicit_manifest_url() {
+        let normal = InstallRequest {
+            version_id: "1.21.5".to_string(),
+            manifest_url: String::new(),
+        };
+        let explicit = InstallRequest {
+            version_id: "1.21.5".to_string(),
+            manifest_url: "https://example.invalid/manifest.json".to_string(),
+        };
+
+        assert_ne!(
+            effective_install_fields(&normal),
+            effective_install_fields(&explicit)
+        );
+    }
 
     #[test]
     fn sanitize_install_progress_leaves_non_error_progress_unchanged() {

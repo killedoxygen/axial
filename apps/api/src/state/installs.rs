@@ -3,9 +3,25 @@ use std::collections::HashMap;
 use tokio::sync::{RwLock, broadcast};
 
 struct InstallEntry {
+    key: Option<InstallKey>,
     history: Vec<DownloadProgress>,
     events: broadcast::Sender<DownloadProgress>,
     done: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InstallKey {
+    version_id: String,
+    manifest_url: String,
+}
+
+impl InstallKey {
+    fn new(version_id: String, manifest_url: String) -> Self {
+        Self {
+            version_id: version_id.trim().to_string(),
+            manifest_url: manifest_url.trim().to_string(),
+        }
+    }
 }
 
 pub struct InstallStore {
@@ -20,16 +36,30 @@ impl InstallStore {
     }
 
     pub async fn insert(&self, install_id: String) {
-        let (events, _) = broadcast::channel(256);
+        self.insert_entry(install_id, None).await;
+    }
+
+    pub async fn insert_or_existing_active(
+        &self,
+        install_id: String,
+        version_id: String,
+        manifest_url: String,
+    ) -> (String, bool) {
+        let key = InstallKey::new(version_id, manifest_url);
         let mut installs = self.installs.write().await;
-        installs.insert(
-            install_id,
-            InstallEntry {
-                history: Vec::new(),
-                events,
-                done: false,
-            },
-        );
+        if let Some(existing_id) = installs.iter().find_map(|(existing_id, entry)| {
+            (!entry.done && entry.key.as_ref() == Some(&key)).then(|| existing_id.clone())
+        }) {
+            return (existing_id, false);
+        }
+
+        installs.insert(install_id.clone(), new_install_entry(Some(key)));
+        (install_id, true)
+    }
+
+    async fn insert_entry(&self, install_id: String, key: Option<InstallKey>) {
+        let mut installs = self.installs.write().await;
+        installs.insert(install_id, new_install_entry(key));
     }
 
     pub async fn emit(&self, install_id: &str, progress: DownloadProgress) {
@@ -74,6 +104,16 @@ impl InstallStore {
     }
 }
 
+fn new_install_entry(key: Option<InstallKey>) -> InstallEntry {
+    let (events, _) = broadcast::channel(256);
+    InstallEntry {
+        key,
+        history: Vec::new(),
+        events,
+        done: false,
+    }
+}
+
 impl Default for InstallStore {
     fn default() -> Self {
         Self::new()
@@ -83,6 +123,162 @@ impl Default for InstallStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn install_insert_or_existing_reuses_active_matching_key() {
+        let store = InstallStore::new();
+        let (first_id, first_inserted) = store
+            .insert_or_existing_active(
+                "first-install".to_string(),
+                "1.21.5".to_string(),
+                String::new(),
+            )
+            .await;
+        let (second_id, second_inserted) = store
+            .insert_or_existing_active(
+                "second-install".to_string(),
+                "1.21.5".to_string(),
+                String::new(),
+            )
+            .await;
+
+        assert_eq!(first_id, "first-install");
+        assert!(first_inserted);
+        assert_eq!(second_id, "first-install");
+        assert!(!second_inserted);
+        assert_eq!(store.active_install_count().await, 1);
+        assert!(store.subscribe("second-install").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn install_insert_or_existing_trims_matching_key_fields() {
+        let store = InstallStore::new();
+        store
+            .insert_or_existing_active(
+                "trimmed-install".to_string(),
+                " 1.21.5 ".to_string(),
+                " https://example.invalid/manifest.json ".to_string(),
+            )
+            .await;
+
+        let (install_id, inserted) = store
+            .insert_or_existing_active(
+                "duplicate-install".to_string(),
+                "1.21.5".to_string(),
+                "https://example.invalid/manifest.json".to_string(),
+            )
+            .await;
+
+        assert_eq!(install_id, "trimmed-install");
+        assert!(!inserted);
+    }
+
+    #[tokio::test]
+    async fn install_insert_or_existing_allows_fresh_install_after_done() {
+        let store = InstallStore::new();
+        store
+            .insert_or_existing_active(
+                "done-install".to_string(),
+                "1.21.5".to_string(),
+                String::new(),
+            )
+            .await;
+        store.emit("done-install", done_progress()).await;
+
+        let (install_id, inserted) = store
+            .insert_or_existing_active(
+                "fresh-install".to_string(),
+                "1.21.5".to_string(),
+                String::new(),
+            )
+            .await;
+
+        assert_eq!(install_id, "fresh-install");
+        assert!(inserted);
+        assert_eq!(store.active_install_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn install_insert_or_existing_allows_fresh_install_after_remove() {
+        let store = InstallStore::new();
+        store
+            .insert_or_existing_active(
+                "removed-install".to_string(),
+                "1.21.5".to_string(),
+                String::new(),
+            )
+            .await;
+        store.remove("removed-install").await;
+
+        let (install_id, inserted) = store
+            .insert_or_existing_active(
+                "fresh-install".to_string(),
+                "1.21.5".to_string(),
+                String::new(),
+            )
+            .await;
+
+        assert_eq!(install_id, "fresh-install");
+        assert!(inserted);
+        assert_eq!(store.active_install_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn install_insert_or_existing_keeps_different_versions_independent() {
+        let store = InstallStore::new();
+        store
+            .insert_or_existing_active(
+                "first-install".to_string(),
+                "1.21.5".to_string(),
+                String::new(),
+            )
+            .await;
+
+        let (install_id, inserted) = store
+            .insert_or_existing_active(
+                "second-install".to_string(),
+                "1.21.6".to_string(),
+                String::new(),
+            )
+            .await;
+
+        assert_eq!(install_id, "second-install");
+        assert!(inserted);
+        assert_eq!(store.active_install_count().await, 2);
+    }
+
+    #[tokio::test]
+    async fn install_insert_or_existing_keeps_manifest_urls_independent() {
+        let store = InstallStore::new();
+        store
+            .insert_or_existing_active(
+                "normal-install".to_string(),
+                "1.21.5".to_string(),
+                String::new(),
+            )
+            .await;
+
+        let (explicit_id, explicit_inserted) = store
+            .insert_or_existing_active(
+                "explicit-install".to_string(),
+                "1.21.5".to_string(),
+                "https://example.invalid/manifest.json".to_string(),
+            )
+            .await;
+        let (duplicate_explicit_id, duplicate_explicit_inserted) = store
+            .insert_or_existing_active(
+                "duplicate-explicit-install".to_string(),
+                "1.21.5".to_string(),
+                "https://example.invalid/manifest.json".to_string(),
+            )
+            .await;
+
+        assert_eq!(explicit_id, "explicit-install");
+        assert!(explicit_inserted);
+        assert_eq!(duplicate_explicit_id, "explicit-install");
+        assert!(!duplicate_explicit_inserted);
+        assert_eq!(store.active_install_count().await, 2);
+    }
 
     #[tokio::test]
     async fn launch_active_install_count_excludes_done_sessions() {
@@ -104,5 +300,16 @@ mod tests {
             .await;
 
         assert_eq!(store.active_install_count().await, 1);
+    }
+
+    fn done_progress() -> DownloadProgress {
+        DownloadProgress {
+            phase: "done".to_string(),
+            current: 1,
+            total: 1,
+            file: None,
+            error: None,
+            done: true,
+        }
     }
 }
