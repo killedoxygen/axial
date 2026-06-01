@@ -1,5 +1,5 @@
 import type { JSX } from 'preact';
-import { Card, Meter, SectionHeading } from '../../ui/Atoms';
+import { Card, Meter, Pill, SectionHeading } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { useTheme } from '../../hooks/use-theme';
 import { installQueue, installState } from '../../store';
@@ -9,22 +9,35 @@ export function DownloadsView(): JSX.Element {
   const state = installState.value;
   const queue = installQueue.value;
   const hasActive = state.status === 'active';
+  const queuedLabel = `${queue.length} queued`;
+  const queuedItemLabel = queue.length === 1 ? '1 item queued' : `${queue.length} items queued`;
+  const phaseLabel = hasActive && state.phase ? state.phase.replace(/_/g, ' ') : '';
+  const pageStatus = hasActive
+    ? `1 active task${queue.length > 0 ? ` · ${queuedLabel}` : ''}`
+    : queue.length > 0
+      ? `No active task · ${queuedLabel}`
+      : 'Nothing downloading';
 
   return (
     <div class="cp-view-page" style={{ gap: 20 }}>
       <div class="cp-page-header">
         <div>
           <h1>Downloads</h1>
-          <div class="cp-page-sub">
-            {hasActive ? '1 active task' : 'Nothing downloading'}
-            {queue.length > 0 ? ` · ${queue.length} queued` : ''}
-          </div>
+          <div class="cp-page-sub">{pageStatus}</div>
         </div>
       </div>
 
       {hasActive ? (
         <Card>
-          <SectionHeading title={state.versionId} />
+          <SectionHeading
+            title={state.versionId}
+            right={(
+              <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                {phaseLabel && <Pill>{phaseLabel}</Pill>}
+                {queue.length > 0 && <Pill icon="clock">{queuedLabel}</Pill>}
+              </div>
+            )}
+          />
           <div style={{ fontSize: 12, color: theme.n.textDim, marginBottom: 6 }}>{state.label}</div>
           <Meter value={state.pct} />
           <div style={{ fontSize: 11, color: theme.n.textMute, marginTop: 6, textAlign: 'right' }}>
@@ -35,8 +48,17 @@ export function DownloadsView(): JSX.Element {
         <Card padding={32}>
           <div class="cp-empty">
             <Icon name="download" size={36} color="var(--text-mute)" />
-            <h2>Nothing downloading</h2>
-            <p>Launch an instance that needs a download, or install a new Minecraft version, and it'll show up here.</p>
+            {queue.length > 0 ? (
+              <>
+                <h2>Downloads queued</h2>
+                <p>{queuedItemLabel} and waiting to start. The next item will begin automatically.</p>
+              </>
+            ) : (
+              <>
+                <h2>Nothing downloading</h2>
+                <p>Launch an instance that needs a download, or install a new Minecraft version, and it'll show up here.</p>
+              </>
+            )}
           </div>
         </Card>
       )}
@@ -51,7 +73,9 @@ export function DownloadsView(): JSX.Element {
               display: 'flex', alignItems: 'center', gap: 10,
               padding: '10px', borderTop: `1px solid ${theme.n.line}`,
             }}>
-              <Icon name="clock" size={15} color="var(--text-mute)" />
+              <span style={{ width: 18, fontSize: 11, color: theme.n.textMute, fontVariantNumeric: 'tabular-nums' }}>
+                {i + 1}
+              </span>
               <span style={{ fontSize: 13, color: theme.n.text }}>{item.versionId}</span>
               {item.loader && <span style={{ fontSize: 11, color: theme.n.textMute }}>· {item.loader.componentId}</span>}
             </div>
