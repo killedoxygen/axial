@@ -129,6 +129,8 @@ The API exposes `GET /api/v1/launch/preflight/{instance_id}` as a read-only back
 
 Effective JVM preset selection is backend-owned. With no explicit preset override, HotSpot runtimes select from the current presets using version, loader/modded state, detected Java distribution, and host CPU/RAM evidence: supported GraalVM runtimes use the GraalVM preset, Java 8 legacy targets use the specific legacy preset for 1.8.9 PvP and modded 1.12.2 heavy launches when applicable, other Java 8 legacy targets use the conservative legacy preset, modern modded launches use the performance preset, high-end modern vanilla Java 21+ launches with at least 8 logical cores and 8 GiB total RAM use the ultra-low-latency preset, and other supported modern vanilla launches use the smooth preset. OpenJ9 and other unsupported HotSpot-tuning targets receive no Croopor GC flags.
 
+Native library extraction is launch-planning owned in `core/launcher`. When a resolved launch includes native libraries, the planner extracts them into the Croopor natives cache under the OS cache directory, writes through a process-local staging directory, marks completed directories with `.ready`, and only reuses a cached extraction when the cache key still matches the version id plus native artifact identity and current file metadata. This keeps interrupted or repaired native artifacts from being treated as ready launch input.
+
 ### Live session and event flow
 ```mermaid
 flowchart TD

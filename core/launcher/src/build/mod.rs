@@ -403,23 +403,53 @@ fn natives_cache_root() -> io::Result<PathBuf> {
 }
 
 fn native_cache_key(version_id: &str, libraries: &[ResolvedLibrary]) -> String {
-    let mut native_paths = libraries
+    let mut native_artifacts = libraries
         .iter()
         .filter(|library| library.is_native)
-        .map(|library| library.abs_path.to_string_lossy().to_string())
+        .map(native_artifact_cache_key_part)
         .collect::<Vec<_>>();
-    native_paths.sort();
+    native_artifacts.sort();
 
     let mut seed = String::new();
     seed.push_str(version_id);
     seed.push('\n');
-    for path in native_paths {
-        seed.push_str(&path);
+    for artifact in native_artifacts {
+        seed.push_str(&artifact);
         seed.push('\n');
     }
 
     let digest = md5_compute(seed.as_bytes());
     format!("{version_id}-{:x}", digest)
+}
+
+fn native_artifact_cache_key_part(library: &ResolvedLibrary) -> String {
+    let mut part = String::new();
+    part.push_str(&library.name);
+    part.push('\n');
+    part.push_str(&library.abs_path.to_string_lossy());
+
+    match fs::metadata(&library.abs_path) {
+        Ok(metadata) => {
+            part.push_str("\nfile=");
+            part.push_str(if metadata.is_file() { "1" } else { "0" });
+            part.push_str("\nlen=");
+            part.push_str(&metadata.len().to_string());
+            if let Ok(modified) = metadata.modified()
+                && let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH)
+            {
+                part.push_str("\nmodified=");
+                part.push_str(&duration.as_secs().to_string());
+                part.push('.');
+                part.push_str(&duration.subsec_nanos().to_string());
+            }
+        }
+        Err(error) => {
+            part.push_str("\nmissing=");
+            part.push_str(error.kind().to_string().as_str());
+        }
+    }
+
+    part
 }
 
 #[cfg(test)]
@@ -760,6 +790,26 @@ mod tests {
         let _ = cleanup_natives_dir(natives_dir);
     }
 
+    #[test]
+    fn native_cache_key_changes_when_native_artifact_changes() {
+        let root = unique_temp_root("croopor-build-native-cache-key-test");
+        fs::create_dir_all(&root).expect("root");
+        let native_jar = root.join("demo-natives.jar");
+        write_native_zip(&native_jar, b"native-v1").expect("write native v1");
+        let libraries = vec![ResolvedLibrary {
+            abs_path: native_jar.clone(),
+            is_native: true,
+            name: "org.lwjgl:lwjgl:3.3.3:natives-linux".to_string(),
+        }];
+
+        let first_key = native_cache_key("test", &libraries);
+        write_native_zip(&native_jar, b"native-v2-with-different-size").expect("write native v2");
+        let second_key = native_cache_key("test", &libraries);
+
+        assert_ne!(first_key, second_key);
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn auth_version_json() -> VersionJson {
         serde_json::from_value(serde_json::json!({
             "id": "auth-test",
@@ -831,5 +881,16 @@ mod tests {
                 .expect("time")
                 .as_nanos()
         ))
+    }
+
+    fn write_native_zip(path: &Path, contents: &[u8]) -> io::Result<()> {
+        let file = fs::File::create(path)?;
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("libdemo.so", options)?;
+        use std::io::Write as _;
+        zip.write_all(contents)?;
+        zip.finish()?;
+        Ok(())
     }
 }
