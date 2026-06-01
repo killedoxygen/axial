@@ -372,8 +372,10 @@ async fn handle_auth_refresh(
     .await
 }
 
-async fn handle_auth_logout(State(state): State<AppState>) -> Json<AuthLogoutResponse> {
-    Json(auth_logout(state.auth_logins()).await)
+async fn handle_auth_logout(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    auth_logout(state.auth_logins()).await
 }
 
 async fn auth_status_for_store(
@@ -476,12 +478,17 @@ fn minecraft_account_can_launch_online(account: &AuthLoginMinecraftAccount) -> b
         && !account.profile.name.trim().is_empty()
 }
 
-async fn auth_logout(login_store: &Arc<AuthLoginStore>) -> AuthLogoutResponse {
-    let (cleared_pending_logins, had_msa_auth) = login_store.clear_all().await;
-    AuthLogoutResponse {
-        status: "logged_out",
-        cleared_pending_logins,
-        had_msa_auth,
+async fn auth_logout(login_store: &Arc<AuthLoginStore>) -> (StatusCode, Json<serde_json::Value>) {
+    match login_store.clear_all().await {
+        Ok((cleared_pending_logins, had_msa_auth)) => (
+            StatusCode::OK,
+            Json(serde_json::json!(AuthLogoutResponse {
+                status: "logged_out",
+                cleared_pending_logins,
+                had_msa_auth,
+            })),
+        ),
+        Err(_) => auth_clear_failed_response(),
     }
 }
 
@@ -677,7 +684,9 @@ async fn auth_login_poll_success_response(
         Ok(exchange) => NewAuthLoginMinecraftAccount::from(exchange),
         Err(error) => {
             let _ = login_store.remove(login_id).await;
-            let _ = login_store.clear_active_auth().await;
+            if login_store.clear_active_auth().await.is_err() {
+                return auth_clear_failed_response();
+            }
             return auth_chain_error_response(error);
         }
     };
@@ -883,7 +892,10 @@ async fn auth_refresh_oauth_error(
             | MsaTokenErrorCode::BadVerificationCode
             | MsaTokenErrorCode::ExpiredToken
     ) {
-        let _ = login_store.clear_active_auth().await;
+        login_store
+            .clear_active_auth()
+            .await
+            .map_err(|_| AuthRefreshFailure::new(AuthRefreshFailureKind::StoreUnavailable))?;
         return Err(AuthRefreshFailure::new(
             AuthRefreshFailureKind::RefreshRejected,
         ));
@@ -897,12 +909,11 @@ async fn auth_refresh_oauth_error(
 fn auth_refresh_error_response(error: AuthRefreshFailure) -> (StatusCode, Json<serde_json::Value>) {
     match error.kind {
         AuthRefreshFailureKind::LoginUnavailable => auth_login_unavailable(),
-        AuthRefreshFailureKind::MissingRefreshToken | AuthRefreshFailureKind::StoreUnavailable => {
-            auth_refresh_sign_in_required_response(
-                StatusCode::PRECONDITION_FAILED,
-                "Microsoft sign-in refresh is unavailable; sign in again",
-            )
-        }
+        AuthRefreshFailureKind::MissingRefreshToken => auth_refresh_sign_in_required_response(
+            StatusCode::PRECONDITION_FAILED,
+            "Microsoft sign-in refresh is unavailable; sign in again",
+        ),
+        AuthRefreshFailureKind::StoreUnavailable => auth_clear_failed_response(),
         AuthRefreshFailureKind::RefreshRejected => auth_refresh_sign_in_required_response(
             StatusCode::UNAUTHORIZED,
             "Microsoft sign-in expired; sign in again",
@@ -946,6 +957,16 @@ fn auth_refresh_sign_in_required_response(
         Json(serde_json::json!({
             "error": message,
             "status": "sign_in_required",
+        })),
+    )
+}
+
+fn auth_clear_failed_response() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "error": "Could not clear Microsoft sign-in. Restart Croopor and try again.",
+            "status": "auth_clear_failed",
         })),
     )
 }
@@ -2555,16 +2576,18 @@ mod tests {
 
         let response = auth_logout(&store).await;
 
-        assert_eq!(response.status, "logged_out");
-        assert_eq!(response.cleared_pending_logins, 1);
-        assert!(response.had_msa_auth);
+        assert_eq!(response.0, StatusCode::OK);
+        assert_eq!(response.1.0["status"], "logged_out");
+        assert_eq!(response.1.0["cleared_pending_logins"], 1);
+        assert_eq!(response.1.0["had_msa_auth"], true);
         assert_eq!(store.get(&pending.login_id).await, None);
         assert!(!store.has_active_msa_auth().await);
 
         let second_response = auth_logout(&store).await;
-        assert_eq!(second_response.status, "logged_out");
-        assert_eq!(second_response.cleared_pending_logins, 0);
-        assert!(!second_response.had_msa_auth);
+        assert_eq!(second_response.0, StatusCode::OK);
+        assert_eq!(second_response.1.0["status"], "logged_out");
+        assert_eq!(second_response.1.0["cleared_pending_logins"], 0);
+        assert_eq!(second_response.1.0["had_msa_auth"], false);
     }
 
     #[tokio::test]

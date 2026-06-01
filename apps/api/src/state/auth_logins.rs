@@ -621,7 +621,9 @@ impl AuthLoginStore {
         true
     }
 
-    pub async fn clear_all(&self) -> (usize, bool) {
+    pub(crate) async fn clear_all(&self) -> Result<(usize, bool), AuthPersistenceError> {
+        self.delete_active_snapshot()?;
+
         let cleared_pending_logins = {
             let mut sessions = self.sessions.write().await;
             let len = sessions.len();
@@ -631,19 +633,20 @@ impl AuthLoginStore {
         let had_msa_auth = self.active_msa_token.write().await.take().is_some();
         *self.active_minecraft_account.write().await = None;
         self.bump_active_auth_generation();
-        self.delete_active_snapshot();
 
-        (cleared_pending_logins, had_msa_auth)
+        Ok((cleared_pending_logins, had_msa_auth))
     }
 
-    pub async fn clear_active_auth(&self) -> bool {
+    pub(crate) async fn clear_active_auth(&self) -> Result<bool, AuthPersistenceError> {
+        self.delete_active_snapshot()?;
+
         let had_msa_auth = self.active_msa_token.write().await.take().is_some();
         let had_minecraft_account = self.active_minecraft_account.write().await.take().is_some();
         if had_msa_auth || had_minecraft_account {
             self.bump_active_auth_generation();
         }
-        self.delete_active_snapshot();
-        had_msa_auth || had_minecraft_account
+
+        Ok(had_msa_auth || had_minecraft_account)
     }
 
     pub(crate) async fn active_auth_refresh_guard(&self) -> MutexGuard<'_, ()> {
@@ -713,14 +716,12 @@ impl AuthLoginStore {
         }
     }
 
-    fn delete_active_snapshot(&self) {
+    fn delete_active_snapshot(&self) -> Result<(), AuthPersistenceError> {
         let Some(persistence) = &self.persistence else {
-            return;
+            return Ok(());
         };
 
-        if let Err(error) = persistence.delete_snapshot() {
-            tracing::warn!("auth snapshot persistence delete failed: {error}");
-        }
+        persistence.delete_snapshot()
     }
 }
 
@@ -783,12 +784,14 @@ mod tests {
         test_persisted_snapshot, test_persisted_snapshot_with_version,
     };
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
 
     #[derive(Default)]
     struct MockAuthSnapshotPersistence {
         snapshot: Mutex<Option<PersistedAuthSnapshot>>,
         saves: AtomicU64,
         deletes: AtomicU64,
+        fail_deletes: AtomicBool,
     }
 
     impl MockAuthSnapshotPersistence {
@@ -797,6 +800,16 @@ mod tests {
                 snapshot: Mutex::new(Some(snapshot)),
                 saves: AtomicU64::new(0),
                 deletes: AtomicU64::new(0),
+                fail_deletes: AtomicBool::new(false),
+            }
+        }
+
+        fn with_failing_deletes(snapshot: PersistedAuthSnapshot) -> Self {
+            Self {
+                snapshot: Mutex::new(Some(snapshot)),
+                saves: AtomicU64::new(0),
+                deletes: AtomicU64::new(0),
+                fail_deletes: AtomicBool::new(true),
             }
         }
 
@@ -828,8 +841,14 @@ mod tests {
         }
 
         fn delete_snapshot(&self) -> Result<(), AuthPersistenceError> {
-            *self.snapshot.lock().expect("snapshot lock") = None;
             self.deletes.fetch_add(1, Ordering::Relaxed);
+            if self.fail_deletes.load(Ordering::Relaxed) {
+                return Err(AuthPersistenceError::Unavailable(
+                    "delete failed".to_string(),
+                ));
+            }
+
+            *self.snapshot.lock().expect("snapshot lock") = None;
             Ok(())
         }
     }
@@ -1029,13 +1048,16 @@ mod tests {
             })
             .await;
 
-        let summary = store.clear_all().await;
+        let summary = store.clear_all().await.expect("clear auth");
 
         assert_eq!(summary, (1, true));
         assert_eq!(store.get(&pending.login_id).await, None);
         assert_eq!(store.active_msa_token().await, None);
 
-        assert_eq!(store.clear_all().await, (0, false));
+        assert_eq!(
+            store.clear_all().await.expect("clear empty auth"),
+            (0, false)
+        );
     }
 
     #[tokio::test]
@@ -1619,9 +1641,40 @@ mod tests {
             .await
             .expect("complete login");
 
-        assert!(store.clear_active_auth().await);
+        assert!(store.clear_active_auth().await.expect("clear auth"));
 
         assert_eq!(persistence.snapshot(), None);
+        assert_eq!(persistence.deletes(), 1);
+    }
+
+    #[tokio::test]
+    async fn auth_login_store_keeps_auth_when_secure_clear_fails() {
+        let now = DateTime::from_timestamp_millis(Utc::now().timestamp_millis())
+            .expect("valid current timestamp");
+        let token = AuthLoginMsaToken {
+            login_id: "msa-delete-fails".to_string(),
+            access_token: "msa-access-token".to_string(),
+            refresh_token: Some("msa-refresh-token".to_string()),
+            id_token: None,
+            token_type: "Bearer".to_string(),
+            expires_in: 3600,
+            scope: Some("XboxLive.signin offline_access".to_string()),
+            authenticated_at: now,
+            expires_at: now + chrono::Duration::seconds(3600),
+        };
+        let persistence = Arc::new(MockAuthSnapshotPersistence::with_failing_deletes(
+            test_persisted_snapshot(&token, None),
+        ));
+        let store = AuthLoginStore::with_persistence(persistence.clone());
+
+        let error = store
+            .clear_active_auth()
+            .await
+            .expect_err("secure delete failure should be visible");
+
+        assert!(matches!(error, AuthPersistenceError::Unavailable(_)));
+        assert_eq!(store.active_msa_token().await, Some(token));
+        assert!(persistence.snapshot().is_some());
         assert_eq!(persistence.deletes(), 1);
     }
 
