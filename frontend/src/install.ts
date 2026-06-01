@@ -12,7 +12,7 @@ import {
 import {
   enqueueInstall, dequeueNextInstall, startInstall, updateInstallProgress,
   completeInstall, setInstallEventSource, recordInstallFailure, clearInstallFailureForItem,
-  requeueFailedInstall,
+  requeueFailedInstall, isActiveInstallItem,
 } from './actions';
 import { formatInstallItemLabel } from './install-labels';
 import type { InstallItem, LoaderBuildRecord, LoaderComponentId } from './types';
@@ -42,13 +42,12 @@ const INSTALL_ETA_PHASES = new Set([
   'processors',
 ]);
 
-function isActiveInstall(versionId: string): boolean {
-  const active = installState.value;
-  return active.status === 'active' && active.versionId === versionId;
+function isActiveInstall(item: InstallItem): boolean {
+  return isActiveInstallItem(item);
 }
 
-function isActiveInstallSource(versionId: string, source: CloseableSource | null): boolean {
-  return isActiveInstall(versionId) && source !== null && installEventSource.value === source;
+function isActiveInstallSource(item: InstallItem, source: CloseableSource | null): boolean {
+  return isActiveInstall(item) && source !== null && installEventSource.value === source;
 }
 
 function createPendingInstallEventSource(): PendingInstallEventSource {
@@ -74,7 +73,7 @@ function createPendingInstallEventSource(): PendingInstallEventSource {
 }
 
 async function connectNativeInstallEventSource(
-  versionId: string,
+  item: InstallItem,
   controller: PendingInstallEventSource,
   eventName: string,
   onData: (data: InstallProgressEvent) => void,
@@ -87,22 +86,22 @@ async function connectNativeInstallEventSource(
   try {
     subscription = await onNativeEvent(eventName, onData);
   } catch (err: unknown) {
-    if (!isActiveInstallSource(versionId, controller)) return;
+    if (!isActiveInstallSource(item, controller)) return;
     throw err;
   }
 
   if (!subscription) {
-    if (!isActiveInstallSource(versionId, controller)) return;
+    if (!isActiveInstallSource(item, controller)) return;
     throw new Error(unavailableMessage);
   }
   if (!controller.setSource(subscription)) return;
-  if (!isActiveInstallSource(versionId, controller)) return;
+  if (!isActiveInstallSource(item, controller)) return;
 
   let started = false;
   try {
     started = await startEvents();
   } catch (err: unknown) {
-    if (!isActiveInstallSource(versionId, controller)) return;
+    if (!isActiveInstallSource(item, controller)) return;
     controller.close();
     if (installEventSource.value === controller) setInstallEventSource(null);
     throw err;
@@ -163,8 +162,7 @@ export function installVersion(target: string): void {
   if (!target) return;
   const item: InstallItem = { versionId: target };
   clearInstallFailureForItem(item);
-  const active = installState.value;
-  if (active.status === 'active' && active.versionId === target) return;
+  if (isActiveInstall(item)) return;
   enqueueInstall(item);
   if (installState.value.status === 'idle') processNextInstall();
 }
@@ -270,8 +268,7 @@ export function installLoaderVersion(build: LoaderBuildRecord): void {
     },
   };
   clearInstallFailureForItem(item);
-  const active = installState.value;
-  if (active.status === 'active' && active.versionId === build.version_id) return;
+  if (isActiveInstall(item)) return;
   enqueueInstall(item);
   if (installState.value.status === 'idle') processNextInstall();
 }
@@ -290,7 +287,7 @@ function processNextInstall(): void {
 }
 
 async function processVanillaInstall(next: InstallItem): Promise<void> {
-  startInstall(next.versionId, 'Starting download...', formatInstallItemLabel(next));
+  startInstall(next, 'Starting download...', formatInstallItemLabel(next));
 
   try {
     const res = await api('POST', '/install', { version_id: next.versionId });
@@ -312,7 +309,7 @@ async function processVanillaInstall(next: InstallItem): Promise<void> {
 async function processLoaderInstall(next: InstallItem): Promise<void> {
   if (!next.loader) return;
 
-  startInstall(next.versionId, 'Starting loader install...', formatInstallItemLabel(next));
+  startInstall(next, 'Starting loader install...', formatInstallItemLabel(next));
 
   try {
     const installId = await startLoaderInstall(
@@ -384,15 +381,14 @@ function phaseLabel(data: InstallProgressEvent, loaderInstall: boolean): string 
 }
 
 async function connectVanillaEvents(installId: string, item: InstallItem): Promise<void> {
-  const versionId = item.versionId;
-  if (!isActiveInstall(versionId)) return;
+  if (!isActiveInstall(item)) return;
 
   const startedAt = Date.now();
   const estimator = createProgressEstimator({ etaPhases: INSTALL_ETA_PHASES });
   let progressSource: CloseableSource | null = null;
 
   const onProgress = async (data: InstallProgressEvent): Promise<void> => {
-    if (!isActiveInstallSource(versionId, progressSource)) return;
+    if (!isActiveInstallSource(item, progressSource)) return;
 
     let pct = 0;
     let label = phaseLabel(data, false);
@@ -434,7 +430,7 @@ async function connectVanillaEvents(installId: string, item: InstallItem): Promi
     progressSource = controller;
 
     await connectNativeInstallEventSource(
-      versionId,
+      item,
       controller,
       nativeInstallEventName(installId),
       (data) => {
@@ -457,7 +453,7 @@ async function connectVanillaEvents(installId: string, item: InstallItem): Promi
   es.onerror = () => {
     if (es.readyState !== EventSource.CLOSED) return;
     void (async () => {
-      if (isActiveInstallSource(versionId, es)) {
+      if (isActiveInstallSource(item, es)) {
         const message = 'Install progress stopped unexpectedly. Retry the install from the launcher.';
         recordInstallFailure(item, message);
         showError(message);
@@ -468,14 +464,13 @@ async function connectVanillaEvents(installId: string, item: InstallItem): Promi
 }
 
 async function connectLoaderEvents(installId: string, item: InstallItem): Promise<void> {
-  const versionId = item.versionId;
-  if (!isActiveInstall(versionId)) return;
+  if (!isActiveInstall(item)) return;
 
   const startedAt = Date.now();
   const estimator = createProgressEstimator({ etaPhases: INSTALL_ETA_PHASES });
   let progressSource: CloseableSource | null = null;
   const onProgress = (data: InstallProgressEvent): void => {
-    if (!isActiveInstallSource(versionId, progressSource)) return;
+    if (!isActiveInstallSource(item, progressSource)) return;
 
     let pct = 0;
     let label = phaseLabel(data, true);
@@ -524,7 +519,7 @@ async function connectLoaderEvents(installId: string, item: InstallItem): Promis
   };
 
   const onError = (message: string): void => {
-    if (isActiveInstallSource(versionId, progressSource)) {
+    if (isActiveInstallSource(item, progressSource)) {
       recordInstallFailure(item, message);
       showError(message);
       void onInstallDone();
@@ -536,7 +531,7 @@ async function connectLoaderEvents(installId: string, item: InstallItem): Promis
     progressSource = controller;
 
     await connectNativeInstallEventSource(
-      versionId,
+      item,
       controller,
       nativeLoaderInstallEventName(installId),
       (data) => {
@@ -556,7 +551,7 @@ async function connectLoaderEvents(installId: string, item: InstallItem): Promis
     installId,
     onProgress,
     () => {
-      if (isActiveInstallSource(versionId, progressSource)) void onInstallDone(item);
+      if (isActiveInstallSource(item, progressSource)) void onInstallDone(item);
     },
     onError,
   );

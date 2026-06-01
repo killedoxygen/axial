@@ -30,12 +30,20 @@ function cloneInstallItem(item: InstallItem): InstallItem {
     : { versionId: item.versionId };
 }
 
-function isSameInstallItem(left: InstallItem, right: InstallItem): boolean {
+let activeInstallItem: InstallItem | null = null;
+
+export function isSameInstallItem(left: InstallItem, right: InstallItem): boolean {
   if (left.versionId !== right.versionId) return false;
   if (!left.loader && !right.loader) return true;
   if (!left.loader || !right.loader) return false;
   return left.loader.componentId === right.loader.componentId
     && left.loader.buildId === right.loader.buildId;
+}
+
+export function isActiveInstallItem(item: InstallItem): boolean {
+  return installState.value.status === 'active'
+    && activeInstallItem !== null
+    && isSameInstallItem(activeInstallItem, item);
 }
 
 function boundedInstallFailureMessage(message: string): string {
@@ -51,9 +59,8 @@ function boundedInstallFailureMessage(message: string): string {
 }
 
 export function enqueueInstall(item: InstallItem): void {
-  const active = installState.value;
-  if (active.status === 'active' && active.versionId === item.versionId) return;
-  if (installQueue.value.some(q => q.versionId === item.versionId)) return;
+  if (isActiveInstallItem(item)) return;
+  if (installQueue.value.some(q => isSameInstallItem(q, item))) return;
   installQueue.value = [...installQueue.value, item];
 }
 
@@ -80,20 +87,20 @@ export function requeueFailedInstall(): boolean {
   const failure = installFailure.value;
   if (!failure) return false;
   const item = cloneInstallItem(failure.item);
-  const active = installState.value;
   const wasIdle = installState.value.status === 'idle';
   batch(() => {
     installFailure.value = null;
-    const rest = installQueue.value.filter(q => q.versionId !== item.versionId);
-    installQueue.value = active.status === 'active' && active.versionId === item.versionId
+    const rest = installQueue.value.filter(q => !isSameInstallItem(q, item));
+    installQueue.value = isActiveInstallItem(item)
       ? rest
       : [item, ...rest];
   });
   return wasIdle;
 }
 
-export function startInstall(versionId: string, label = 'Starting...', displayName?: string): void {
-  installState.value = { status: 'active', versionId, displayName, pct: 0, label, phase: 'starting', startedAt: Date.now() };
+export function startInstall(item: InstallItem, label = 'Starting...', displayName?: string): void {
+  activeInstallItem = cloneInstallItem(item);
+  installState.value = { status: 'active', versionId: item.versionId, displayName, pct: 0, label, phase: 'starting', startedAt: Date.now() };
 }
 
 export function updateInstallProgress(pct: number, label: string, phase?: string): void {
@@ -110,6 +117,7 @@ export function updateInstallProgress(pct: number, label: string, phase?: string
 }
 
 export function completeInstall(): void {
+  activeInstallItem = null;
   installState.value = { status: 'idle' };
   if (installEventSource.value) {
     installEventSource.value.close();
