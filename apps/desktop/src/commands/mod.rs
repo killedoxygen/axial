@@ -16,6 +16,12 @@ pub fn api_base_url(state: State<'_, ApiRuntimeState>) -> String {
 }
 
 #[tauri::command]
+pub fn app_restart(app: AppHandle) -> Result<(), String> {
+    app.request_restart();
+    Ok(())
+}
+
+#[tauri::command]
 pub fn window_minimize(app: AppHandle) -> Result<(), String> {
     let window = app
         .get_webview_window("main")

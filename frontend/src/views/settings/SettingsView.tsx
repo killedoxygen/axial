@@ -21,6 +21,7 @@ import {
 import { navigate, ROUTE_STORAGE_KEY } from '../../ui-state';
 import { api } from '../../api';
 import { toast } from '../../toast';
+import { hasNativeDesktopRuntime } from '../../native';
 import { clampPlayerNameInput } from '../../player-name';
 import { errMessage, fmtMem, getMemoryRecommendation, validateUsername } from '../../utils';
 import {
@@ -30,6 +31,7 @@ import {
   hasVisibleUpdate,
   openUpdateAction,
   openUpdateNotes,
+  restartDesktopApp,
 } from '../../updater';
 import type {
   BenchmarkMatrixResponse,
@@ -1955,6 +1957,9 @@ function AboutSection(): JSX.Element {
         <Button variant="secondary" icon="refresh" disabled={checking} onClick={() => void checkForUpdates({ force: true })}>
           {checking ? 'Checking...' : 'Check'}
         </Button>
+        {hasNativeDesktopRuntime() && (
+          <Button variant="secondary" icon="refresh" onClick={() => void restartDesktopApp()}>Restart</Button>
+        )}
       </div>
       <div style={{ marginTop: 12, color: 'var(--text)', fontSize: 13, fontWeight: 700 }}>{status}</div>
       <div style={{ marginTop: 4, color: 'var(--text-mute)', fontSize: 12 }}>Last checked: {checkedAt}</div>

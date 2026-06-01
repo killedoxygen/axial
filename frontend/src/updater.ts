@@ -1,7 +1,7 @@
 import { local, saveLocalState } from './state';
 import { api } from './api';
 import { toast } from './toast';
-import { hasNativeDesktopRuntime, openExternalURL } from './native';
+import { hasNativeDesktopRuntime, openExternalURL, requestNativeAppRestart } from './native';
 import { appVersion, bootstrapState, installState, launchState, updateCheckState, updateInfo } from './store';
 import type { UpdateInfo } from './types';
 import { errMessage } from './utils';
@@ -68,6 +68,20 @@ export async function openUpdateNotes(): Promise<void> {
     toast('Opened release notes');
   } catch (err: unknown) {
     toast(`Failed to open release notes: ${errMessage(err)}`, 'error');
+  }
+}
+
+export async function restartDesktopApp(): Promise<void> {
+  if (!hasNativeDesktopRuntime()) {
+    toast('Restart is only available in the desktop app', 'error');
+    return;
+  }
+  try {
+    const requested = await requestNativeAppRestart();
+    if (!requested) throw new Error('desktop runtime unavailable');
+    toast('Restarting Croopor');
+  } catch (err: unknown) {
+    toast(`Failed to restart: ${errMessage(err)}`, 'error');
   }
 }
 

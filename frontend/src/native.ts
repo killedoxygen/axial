@@ -83,6 +83,13 @@ export async function getNativeApiBaseUrl(): Promise<string | null> {
   return tauri.core.invoke<string>('api_base_url');
 }
 
+export async function requestNativeAppRestart(): Promise<boolean> {
+  const tauri = getTauriBinding();
+  if (!tauri?.core) return false;
+  await tauri.core.invoke('app_restart');
+  return true;
+}
+
 export async function browseDirectory(defaultPath = ''): Promise<string | null> {
   const tauri = getTauriBinding();
   if (!tauri?.dialog) return null;
