@@ -367,7 +367,10 @@ fn component_runtime_ready_without_probe(base_dir: &Path, component: &str) -> bo
         base_dir.join(component),
     ]
     .into_iter()
-    .any(|candidate| detect_runtime_state(&candidate) == RuntimeInstallState::Ready)
+    .any(|candidate| {
+        detect_runtime_state(&candidate, runtime_requires_ready_marker(base_dir))
+            == RuntimeInstallState::Ready
+    })
 }
 
 fn resolve_managed_runtime(
@@ -464,7 +467,7 @@ fn inspect_component_runtime(base_dir: &Path, component: &str) -> Option<Runtime
         base_dir.join(component).join(&os_arch).join(component),
         base_dir.join(component),
     ] {
-        let state = detect_runtime_state(&candidate);
+        let state = detect_runtime_state(&candidate, runtime_requires_ready_marker(base_dir));
         if state == RuntimeInstallState::Missing {
             continue;
         }
@@ -502,6 +505,10 @@ fn inspect_component_runtime(base_dir: &Path, component: &str) -> Option<Runtime
     None
 }
 
+fn runtime_requires_ready_marker(base_dir: &Path) -> bool {
+    base_dir == runtime_cache_dir()
+}
+
 fn classify_runtime_source(base_dir: &Path) -> RuntimeSource {
     let label = base_dir.to_string_lossy();
     if label.contains("Packages") {
@@ -513,10 +520,23 @@ fn classify_runtime_source(base_dir: &Path) -> RuntimeSource {
     }
 }
 
-fn detect_runtime_state(runtime_root: &Path) -> RuntimeInstallState {
+fn detect_runtime_state(runtime_root: &Path, require_ready_marker: bool) -> RuntimeInstallState {
     let installing_marker = runtime_root.join(".croopor-installing");
     let ready_marker = runtime_root.join(".croopor-ready");
     let java_exe = java_executable(runtime_root);
+
+    if require_ready_marker {
+        if installing_marker.exists() {
+            return RuntimeInstallState::Installing;
+        }
+        if ready_marker.is_file() && runtime_executable_ready(&java_exe) {
+            return RuntimeInstallState::Ready;
+        }
+        if ready_marker.exists() || runtime_root.exists() {
+            return RuntimeInstallState::Broken;
+        }
+        return RuntimeInstallState::Missing;
+    }
 
     if runtime_executable_ready(&java_exe) {
         return RuntimeInstallState::Ready;
@@ -1236,12 +1256,15 @@ fn runtime_config_candidates(runtime_root: &Path) -> Vec<PathBuf> {
 mod tests {
     use super::{
         ComponentManifestFile, JavaRuntimeLookupError, RuntimeDownloadActual,
-        RuntimeDownloadEvidence, RuntimeDownloadIntegrityError, component_manifest_destination,
-        detect_distribution, plan_runtime_manifest_files, runtime_file_download_concurrency_for,
+        RuntimeDownloadEvidence, RuntimeDownloadIntegrityError, RuntimeInstallState,
+        component_manifest_destination, detect_distribution, detect_runtime_state, java_executable,
+        plan_runtime_manifest_files, runtime_file_download_concurrency_for,
         verify_runtime_download,
     };
     use std::collections::HashMap;
+    use std::fs;
     use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn expected(size: Option<u64>, sha1: Option<&str>) -> RuntimeDownloadEvidence {
         RuntimeDownloadEvidence {
@@ -1451,6 +1474,45 @@ mod tests {
     }
 
     #[test]
+    fn managed_runtime_requires_ready_marker_even_when_java_exists() {
+        let root = unique_temp_root("croopor-managed-runtime-ready-marker-test");
+        write_runtime_executable_fixture(&root);
+
+        assert_eq!(
+            detect_runtime_state(&root, true),
+            RuntimeInstallState::Broken
+        );
+
+        fs::write(root.join(".croopor-installing"), b"installing").expect("installing marker");
+        assert_eq!(
+            detect_runtime_state(&root, true),
+            RuntimeInstallState::Installing
+        );
+
+        fs::remove_file(root.join(".croopor-installing")).expect("remove installing marker");
+        fs::write(root.join(".croopor-ready"), b"ready").expect("ready marker");
+        assert_eq!(
+            detect_runtime_state(&root, true),
+            RuntimeInstallState::Ready
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bundled_runtime_keeps_executable_readiness_without_marker() {
+        let root = unique_temp_root("croopor-bundled-runtime-ready-test");
+        write_runtime_executable_fixture(&root);
+
+        assert_eq!(
+            detect_runtime_state(&root, false),
+            RuntimeInstallState::Ready
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn runtime_download_verification_accepts_matching_metadata() {
         let result = verify_runtime_download(
             "bin/java",
@@ -1506,5 +1568,27 @@ mod tests {
         );
 
         assert_eq!(result, Ok(()));
+    }
+
+    fn unique_temp_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ))
+    }
+
+    fn write_runtime_executable_fixture(root: &Path) {
+        let java = java_executable(root);
+        fs::create_dir_all(java.parent().expect("java parent")).expect("java parent dir");
+        fs::write(&java, b"java").expect("java executable");
+        if cfg!(target_os = "windows") {
+            let config = root.join("lib").join("jvm.cfg");
+            fs::create_dir_all(config.parent().expect("config parent")).expect("config parent dir");
+            fs::write(config, b"jvm").expect("runtime config");
+        }
     }
 }
