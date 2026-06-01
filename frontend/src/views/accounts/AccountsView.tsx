@@ -1942,7 +1942,7 @@ function SavedSkinLibrary({
     }
   };
 
-  const saveUsernameSkin = async (): Promise<void> => {
+  const saveUsernameSkin = async (applyAfterSave: boolean): Promise<void> => {
     if (!trimmedLookupUsername) {
       setMessage({ tone: 'err', text: 'Enter a Minecraft username.' });
       return;
@@ -1961,8 +1961,19 @@ function SavedSkinLibrary({
       const saved = savedSkinRecord(payload);
       if (saved) setSelectedKey(saved.texture_key);
       setLookupUsername('');
-      refresh();
-      setMessage({ tone: 'ok', text: 'Player skin saved.' });
+      if (saved && applyAfterSave) {
+        try {
+          await applySavedSkin(saved.texture_key);
+          setMessage({ tone: 'ok', text: 'Player skin saved and applied to Minecraft profile.' });
+        } catch (err) {
+          setSelectedKey(saved.texture_key);
+          refresh();
+          setMessage({ tone: 'err', text: savedSkinApplyErrorMessage(err) });
+        }
+      } else {
+        refresh();
+        setMessage({ tone: 'ok', text: 'Player skin saved.' });
+      }
     } catch (err) {
       setMessage({
         tone: 'err',
@@ -2265,7 +2276,7 @@ function SavedSkinLibrary({
 
         <div style={{
           display: 'grid',
-          gridTemplateColumns: 'minmax(180px, 1fr) auto auto',
+          gridTemplateColumns: 'minmax(180px, 1fr) auto auto auto',
           gap: 10,
           alignItems: 'center',
           padding: minecraftProfile ? '0 0 12px' : '12px 0',
@@ -2278,7 +2289,7 @@ function SavedSkinLibrary({
               setMessage(null);
             }}
             onKeyDown={(event) => {
-              if (event.key === 'Enter' && canSaveLookupSkin) void saveUsernameSkin();
+              if (event.key === 'Enter' && canSaveLookupSkin) void saveUsernameSkin(false);
             }}
             placeholder="Minecraft username"
             icon="search"
@@ -2291,10 +2302,22 @@ function SavedSkinLibrary({
             size="sm"
             icon={lookupBusy ? 'refresh' : 'download'}
             disabled={!canSaveLookupSkin}
-            onClick={() => void saveUsernameSkin()}
+            onClick={() => void saveUsernameSkin(false)}
             title={lookupUsernameError || undefined}
           >
             Save skin
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            icon={lookupBusy ? 'refresh' : 'check'}
+            disabled={!canSaveLookupSkin || !onlineReady}
+            onClick={() => void saveUsernameSkin(true)}
+            title={onlineReady
+              ? lookupUsernameError || 'Save locally, then apply to the active Minecraft account'
+              : 'Online Minecraft account required'}
+          >
+            Save & apply
           </Button>
         </div>
 
