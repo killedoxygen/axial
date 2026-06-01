@@ -752,7 +752,13 @@ fn spawn_runtime_manifest_file_install(
     let temp_dir = temp_dir.to_path_buf();
     let (relative_path, file) = entry;
     tasks.spawn(async move {
-        install_runtime_manifest_file(download_client, &temp_dir, &relative_path, file).await
+        Box::pin(install_runtime_manifest_file(
+            download_client,
+            &temp_dir,
+            &relative_path,
+            file,
+        ))
+        .await
     });
 }
 
@@ -809,13 +815,13 @@ async fn install_runtime_manifest_file(
 
     let temp_path = runtime_download_temp_path(&destination);
     let expected = RuntimeDownloadEvidence::from(&raw);
-    fetch_runtime_file(
+    Box::pin(fetch_runtime_file(
         &download_client,
         &raw.url,
         &temp_path,
         expected,
         relative_path,
-    )
+    ))
     .await?;
     if let Err(error) = async_fs::rename(&temp_path, &destination).await {
         let _ = async_fs::remove_file(&temp_path).await;
@@ -928,6 +934,19 @@ async fn stream_runtime_file_to_temp(
         .await
         .and_then(reqwest::Response::error_for_status)
         .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+    if let Some(expected_size) = expected.size
+        && let Some(content_length) = response.content_length()
+        && content_length > expected_size
+    {
+        return Err(JavaRuntimeLookupError::Download(
+            RuntimeDownloadIntegrityError::SizeMismatch {
+                file: bounded_manifest_file_label(relative_path),
+                expected: expected_size,
+                actual: content_length,
+            }
+            .to_string(),
+        ));
+    }
     let mut output = async_fs::File::create(temp_path)
         .await
         .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
@@ -937,12 +956,25 @@ async fn stream_runtime_file_to_temp(
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+        let next_size = actual_size.saturating_add(chunk.len() as u64);
+        if let Some(expected_size) = expected.size
+            && next_size > expected_size
+        {
+            return Err(JavaRuntimeLookupError::Download(
+                RuntimeDownloadIntegrityError::SizeMismatch {
+                    file: bounded_manifest_file_label(relative_path),
+                    expected: expected_size,
+                    actual: next_size,
+                }
+                .to_string(),
+            ));
+        }
         output
             .write_all(&chunk)
             .await
             .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
         hasher.update(&chunk);
-        actual_size += chunk.len() as u64;
+        actual_size = next_size;
     }
     output
         .flush()
@@ -1149,7 +1181,7 @@ struct ComponentManifest {
     files: HashMap<String, ComponentManifestFile>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ComponentManifestFile {
     #[serde(rename = "type")]
     kind: String,
@@ -1160,13 +1192,13 @@ struct ComponentManifestFile {
     downloads: Option<ComponentManifestDownloads>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ComponentManifestDownloads {
     #[serde(default)]
     raw: Option<ComponentManifestDownload>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ComponentManifestDownload {
     url: String,
     #[serde(default)]
@@ -1342,10 +1374,11 @@ fn runtime_config_candidates(runtime_root: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ComponentManifestFile, JavaRuntimeLookupError, RuntimeDownloadActual,
-        RuntimeDownloadEvidence, RuntimeDownloadIntegrityError, RuntimeInstallState,
-        component_manifest_destination, detect_distribution, detect_runtime_state,
-        fetch_runtime_file, fetch_runtime_json, java_executable, plan_runtime_manifest_files,
+        ComponentManifestDownload, ComponentManifestDownloads, ComponentManifestFile,
+        JavaRuntimeLookupError, RuntimeDownloadActual, RuntimeDownloadEvidence,
+        RuntimeDownloadIntegrityError, RuntimeInstallState, component_manifest_destination,
+        detect_distribution, detect_runtime_state, fetch_runtime_file, fetch_runtime_json,
+        install_runtime_manifest_file, java_executable, plan_runtime_manifest_files,
         remove_runtime_install_path, runtime_download_client,
         runtime_file_download_concurrency_for, runtime_install_lock_from_map,
         verify_runtime_download,
@@ -1378,6 +1411,20 @@ mod tests {
             kind: kind.to_string(),
             executable: false,
             downloads: None,
+        }
+    }
+
+    fn downloadable_manifest_file(url: &str, size: u64, sha1: &str) -> ComponentManifestFile {
+        ComponentManifestFile {
+            kind: "file".to_string(),
+            executable: false,
+            downloads: Some(ComponentManifestDownloads {
+                raw: Some(ComponentManifestDownload {
+                    url: url.to_string(),
+                    sha1: Some(sha1.to_string()),
+                    size: Some(size),
+                }),
+            }),
         }
     }
 
@@ -1798,9 +1845,113 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(result, Err(JavaRuntimeLookupError::Download(_))));
+        assert!(matches!(&result, Err(JavaRuntimeLookupError::Download(_))));
         assert!(!temp_path.exists());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn runtime_file_download_rejects_oversized_content_length() {
+        let root = unique_temp_root("croopor-runtime-download-content-length-test");
+        fs::create_dir_all(&root).expect("download root");
+        let temp_path = root.join("java.croopor-tmp");
+        let url = serve_runtime_response(200, b"hello".to_vec(), Some(6), "/runtime.bin").await;
+        let client = runtime_download_client();
+
+        let result = fetch_runtime_file(
+            &client,
+            &url,
+            &temp_path,
+            expected(Some(5), None),
+            "bin/java",
+        )
+        .await;
+
+        assert!(matches!(&result, Err(JavaRuntimeLookupError::Download(_))));
+        assert!(!temp_path.exists());
+        assert!(
+            result
+                .expect_err("oversized content length should fail")
+                .to_string()
+                .contains("runtime file bin/java size mismatch: expected 5, got 6")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn runtime_file_download_rejects_stream_past_expected_size_and_removes_temp() {
+        let root = unique_temp_root("croopor-runtime-download-stream-bound-test");
+        fs::create_dir_all(&root).expect("download root");
+        let temp_path = root.join("java.croopor-tmp");
+        let url = serve_runtime_response(200, b"hello!".to_vec(), None, "/runtime.bin").await;
+        let client = runtime_download_client();
+
+        let result = fetch_runtime_file(
+            &client,
+            &url,
+            &temp_path,
+            expected(Some(5), None),
+            "bin/java",
+        )
+        .await;
+
+        assert!(matches!(&result, Err(JavaRuntimeLookupError::Download(_))));
+        assert!(!temp_path.exists());
+        assert!(
+            result
+                .expect_err("oversized stream should fail")
+                .to_string()
+                .contains("runtime file bin/java size mismatch: expected 5, got 6")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_install_futures_stay_small_enough_for_tokio_workers() {
+        let root = Path::new("/tmp/croopor-runtime-future-size");
+        let client = runtime_download_client();
+        let expected = expected(Some(8), Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        let file = downloadable_manifest_file(
+            "https://example.test/runtime.bin",
+            8,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        let spawned_client = client.clone();
+        let spawned_root = root.to_path_buf();
+        let spawned_file = file.clone();
+        let spawned_future = async move {
+            Box::pin(install_runtime_manifest_file(
+                spawned_client,
+                &spawned_root,
+                "bin/java",
+                spawned_file,
+            ))
+            .await
+        };
+
+        assert!(
+            std::mem::size_of_val(&fetch_runtime_file(
+                &client,
+                "https://example.test/runtime.bin",
+                &root.join("java.croopor-tmp"),
+                expected,
+                "bin/java",
+            )) < 4096,
+            "runtime file download future should stay small"
+        );
+        assert!(
+            std::mem::size_of_val(&install_runtime_manifest_file(
+                client.clone(),
+                root,
+                "bin/java",
+                file.clone(),
+            )) < 4096,
+            "runtime manifest file install future should stay small"
+        );
+        assert!(
+            std::mem::size_of_val(&spawned_future) < 4096,
+            "spawned runtime manifest file install future should stay small"
+        );
     }
 
     fn unique_temp_root(label: &str) -> PathBuf {
@@ -1827,18 +1978,18 @@ mod tests {
 
     async fn serve_runtime_download(body: Vec<u8>) -> String {
         let content_length = body.len() as u64;
-        serve_runtime_response(200, body, content_length, "/runtime.bin").await
+        serve_runtime_response(200, body, Some(content_length), "/runtime.bin").await
     }
 
     async fn serve_runtime_json(status: u16, body: Vec<u8>, content_length: Option<u64>) -> String {
         let content_length = content_length.unwrap_or(body.len() as u64);
-        serve_runtime_response(status, body, content_length, "/runtime.json").await
+        serve_runtime_response(status, body, Some(content_length), "/runtime.json").await
     }
 
     async fn serve_runtime_response(
         status: u16,
         body: Vec<u8>,
-        content_length: u64,
+        content_length: Option<u64>,
         path: &str,
     ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -1852,9 +2003,13 @@ mod tests {
             let mut request = [0_u8; 1024];
             let _ = socket.read(&mut request).await;
             let reason = if status == 200 { "OK" } else { "Error" };
-            let headers = format!(
-                "HTTP/1.1 {status} {reason}\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
-            );
+            let headers = if let Some(content_length) = content_length {
+                format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
+                )
+            } else {
+                format!("HTTP/1.1 {status} {reason}\r\nConnection: close\r\n\r\n")
+            };
             socket
                 .write_all(headers.as_bytes())
                 .await
