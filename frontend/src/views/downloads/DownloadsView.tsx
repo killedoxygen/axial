@@ -1,32 +1,17 @@
 import type { JSX } from 'preact';
-import type { InstallItem, LoaderComponentId } from '../../types';
 import { Card, IconButton, Meter, Pill, SectionHeading } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { useTheme } from '../../hooks/use-theme';
 import { installQueue, installState } from '../../store';
 import { removeQueuedInstallAt } from '../../actions';
-
-const QUEUED_LOADER_LABELS: Record<LoaderComponentId, string> = {
-  'net.fabricmc.fabric-loader': 'Fabric',
-  'org.quiltmc.quilt-loader': 'Quilt',
-  'net.minecraftforge': 'Forge',
-  'net.neoforged': 'NeoForge',
-};
-
-function formatQueuedLoaderLabel(loader: NonNullable<InstallItem['loader']>): string {
-  const loaderName = QUEUED_LOADER_LABELS[loader.componentId];
-  const loaderVersion = loader.loaderVersion.trim();
-  const minecraftVersion = loader.minecraftVersion.trim();
-  const label = loaderVersion ? `${loaderName} ${loaderVersion}` : `${loaderName} loader`;
-
-  return minecraftVersion ? `${label} for Minecraft ${minecraftVersion}` : label;
-}
+import { formatInstallItemLabel } from '../../install-labels';
 
 export function DownloadsView(): JSX.Element {
   const theme = useTheme();
   const state = installState.value;
   const queue = installQueue.value;
   const hasActive = state.status === 'active';
+  const activeTitle = hasActive ? state.displayName || state.versionId : '';
   const queuedLabel = `${queue.length} queued`;
   const queuedItemLabel = queue.length === 1 ? '1 item queued' : `${queue.length} items queued`;
   const phaseLabel = hasActive && state.phase ? state.phase.replace(/_/g, ' ') : '';
@@ -48,7 +33,7 @@ export function DownloadsView(): JSX.Element {
       {hasActive ? (
         <Card>
           <SectionHeading
-            title={state.versionId}
+            title={activeTitle}
             right={(
               <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
                 {phaseLabel && <Pill>{phaseLabel}</Pill>}
@@ -86,33 +71,36 @@ export function DownloadsView(): JSX.Element {
           <div style={{ fontSize: 11, fontWeight: 600, textTransform: 'uppercase', letterSpacing: 0, color: theme.n.textMute, padding: '8px 10px' }}>
             Queue
           </div>
-          {queue.map((item, i) => (
-            <div key={item.versionId + i} style={{
-              display: 'flex', alignItems: 'center', gap: 10,
-              padding: '10px', borderTop: `1px solid ${theme.n.line}`,
-            }}>
-              <span style={{ width: 18, fontSize: 11, color: theme.n.textMute, fontVariantNumeric: 'tabular-nums' }}>
-                {i + 1}
-              </span>
-              <div style={{ display: 'flex', alignItems: 'baseline', gap: 6, minWidth: 0, flex: 1 }}>
-                <span style={{ fontSize: 13, color: theme.n.text, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {item.versionId}
+          {queue.map((item, i) => {
+            const itemLabel = formatInstallItemLabel(item);
+            return (
+              <div key={item.versionId + i} style={{
+                display: 'flex', alignItems: 'center', gap: 10,
+                padding: '10px', borderTop: `1px solid ${theme.n.line}`,
+              }}>
+                <span style={{ width: 18, fontSize: 11, color: theme.n.textMute, fontVariantNumeric: 'tabular-nums' }}>
+                  {i + 1}
                 </span>
-                {item.loader && (
-                  <span style={{ fontSize: 11, color: theme.n.textMute, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    · {formatQueuedLoaderLabel(item.loader)}
+                <div style={{ display: 'flex', alignItems: 'baseline', gap: 6, minWidth: 0, flex: 1 }}>
+                  <span style={{ fontSize: 13, color: theme.n.text, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {itemLabel}
                   </span>
-                )}
+                  {item.loader && (
+                    <span style={{ fontSize: 11, color: theme.n.textMute, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      · {item.versionId}
+                    </span>
+                  )}
+                </div>
+                <IconButton
+                  icon="trash"
+                  size={28}
+                  danger
+                  tooltip={`Remove ${itemLabel} from queue`}
+                  onClick={() => removeQueuedInstallAt(i)}
+                />
               </div>
-              <IconButton
-                icon="trash"
-                size={28}
-                danger
-                tooltip={`Remove ${item.versionId} from queue`}
-                onClick={() => removeQueuedInstallAt(i)}
-              />
-            </div>
-          ))}
+            );
+          })}
         </Card>
       )}
     </div>

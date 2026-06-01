@@ -13,6 +13,7 @@ import {
   enqueueInstall, dequeueNextInstall, startInstall, updateInstallProgress,
   completeInstall, setInstallEventSource,
 } from './actions';
+import { formatInstallItemLabel } from './install-labels';
 import type { InstallItem, LoaderBuildRecord, LoaderComponentId } from './types';
 
 type InstallProgressEvent = {
@@ -279,7 +280,7 @@ function processNextInstall(): void {
 }
 
 async function processVanillaInstall(next: InstallItem): Promise<void> {
-  startInstall(next.versionId, 'Starting download...');
+  startInstall(next.versionId, 'Starting download...', formatInstallItemLabel(next));
 
   try {
     const res = await api('POST', '/install', { version_id: next.versionId });
@@ -298,7 +299,7 @@ async function processVanillaInstall(next: InstallItem): Promise<void> {
 async function processLoaderInstall(next: InstallItem): Promise<void> {
   if (!next.loader) return;
 
-  startInstall(next.versionId, 'Starting loader install...');
+  startInstall(next.versionId, 'Starting loader install...', formatInstallItemLabel(next));
 
   try {
     const installId = await startLoaderInstall(

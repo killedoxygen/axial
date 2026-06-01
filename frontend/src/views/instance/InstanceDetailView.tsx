@@ -13,6 +13,7 @@ import { navigate } from '../../ui-state';
 import { addInstance, clearLaunchNotice, removeInstance, selectInstance, updateInstanceInList } from '../../actions';
 import { launchGame, killGame } from '../../launch';
 import { handleInstallClick } from '../../install';
+import { formatInstallItemLabel } from '../../install-labels';
 import { api, apiResourceUrl } from '../../api';
 import { toast } from '../../toast';
 import { errMessage, fmtMem, getMemoryRecommendation } from '../../utils';
@@ -1391,12 +1392,14 @@ function LaunchSplitButton({
 
 function InstallBarrierPane({
   installTarget,
+  installLabel,
   installQueued,
   installProgress,
 }: {
   installTarget: string;
+  installLabel: string;
   installQueued: boolean;
-  installProgress: { pct: number; label: string } | null;
+  installProgress: { pct: number; label: string; displayName?: string } | null;
 }): JSX.Element {
   const pct = installProgress ? Math.max(0, Math.min(100, Math.round(installProgress.pct))) : 0;
   const label = installProgress?.label || (installQueued ? 'Waiting for the current download slot' : 'Preparing install');
@@ -1414,7 +1417,7 @@ function InstallBarrierPane({
         </span>
         <div class="cp-instance-install-lock-copy">
           <h2>{installQueued ? 'Install queued' : 'Installing required files'}</h2>
-          <p>{label} for {installTarget}.</p>
+          <p>{label} for {installLabel || installTarget}.</p>
         </div>
       </div>
 
@@ -2368,9 +2371,12 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
   const installTarget = installTargetFor(inst, v);
   const install = installState.value;
   const installProgress = install.status === 'active' && install.versionId === installTarget
-    ? { pct: install.pct, label: install.label }
+    ? { pct: install.pct, label: install.label, displayName: install.displayName }
     : null;
-  const installQueued = !installProgress && installQueue.value.some(item => item.versionId === installTarget);
+  const queuedInstall = installQueue.value.find(item => item.versionId === installTarget);
+  const installQueued = !installProgress && Boolean(queuedInstall);
+  const installLabel = installProgress?.displayName
+    || (queuedInstall ? formatInstallItemLabel(queuedInstall) : installTarget);
   const installLocked = !canLaunch && (Boolean(installProgress) || installQueued);
 
   const onPlay = (): void => {
@@ -2498,6 +2504,7 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
       {installLocked && (
         <InstallBarrierPane
           installTarget={installTarget}
+          installLabel={installLabel}
           installQueued={installQueued}
           installProgress={installProgress}
         />

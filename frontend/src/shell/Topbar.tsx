@@ -8,6 +8,7 @@ import { goBack, goForward, navigate, route } from '../ui-state';
 import { runningSessions, instances, launchState, installState, installQueue } from '../store';
 import { windowStartDragging, windowToggleMaximize, hasNativeDesktopRuntime } from '../native';
 import { launchStageViewFrom } from '../launch-stages';
+import { formatInstallItemLabel } from '../install-labels';
 
 function assertUnreachable(value: never): never {
   throw new Error(`Unhandled route: ${JSON.stringify(value)}`);
@@ -68,7 +69,8 @@ function StatusPill(): JSX.Element {
     const queuedLabel = queuedCount > 0 ? ` · ${queuedCount} queued` : '';
     const installPct = Math.round(Math.max(0, Math.min(100, install.pct)));
     const installPhase = install.phase ? ` · ${install.phase.replace(/_/g, ' ')}` : '';
-    const installTitle = `${install.versionId}: ${install.label} · ${installPct}%${queuedLabel}${installPhase}`;
+    const installName = install.displayName || install.versionId;
+    const installTitle = `${installName}: ${install.label} · ${installPct}%${queuedLabel}${installPhase}`;
     const installStyle = { '--cp-install-ratio': String(installPct / 100) } as JSX.CSSProperties;
 
     return (
@@ -100,7 +102,7 @@ function StatusPill(): JSX.Element {
   if (queued.length > 0) {
     const firstQueued = queued[0];
     const queuedLabel = queued.length === 1 ? '1 queued' : `${queued.length} queued`;
-    const queuedTitle = `${queuedLabel}. Next: ${firstQueued.versionId}`;
+    const queuedTitle = `${queuedLabel}. Next: ${formatInstallItemLabel(firstQueued)}`;
     return (
       <button
         class="cp-status-pill cp-status-pill--queued cp-nodrag"

@@ -28,8 +28,8 @@ export function enqueueInstall(item: InstallItem): void {
   installQueue.value = [...installQueue.value, item];
 }
 
-export function startInstall(versionId: string, label = 'Starting...'): void {
-  installState.value = { status: 'active', versionId, pct: 0, label, phase: 'starting', startedAt: Date.now() };
+export function startInstall(versionId: string, label = 'Starting...', displayName?: string): void {
+  installState.value = { status: 'active', versionId, displayName, pct: 0, label, phase: 'starting', startedAt: Date.now() };
 }
 
 export function updateInstallProgress(pct: number, label: string, phase?: string): void {
