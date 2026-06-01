@@ -12,9 +12,12 @@ use crate::loaders::validate_version_id;
 use crate::paths::{loader_artifacts_dir, versions_dir};
 use crate::profiles::ensure_launcher_profiles;
 use std::fs;
+use std::io::sink;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs as async_fs;
+use zip::ZipArchive;
+use zip::result::ZipError;
 
 const MAX_INSTALLER_DOWNLOAD_SIZE: u64 = 50 << 20;
 
@@ -283,9 +286,8 @@ where
             plan.record.component_name
         )),
     ));
-    let archive_data = read_or_download_cached_artifact(&archive_path, archive_url)
-        .await?
-        .bytes;
+    let archive_data =
+        read_valid_legacy_archive(&archive_path, archive_url, &plan.record.component_name).await?;
 
     let fragment = LoaderProfileFragment {
         id: plan.record.version_id.clone(),
@@ -437,6 +439,39 @@ async fn download_and_cache_artifact(url: &str, path: &Path) -> Result<Vec<u8>, 
     Ok(bytes)
 }
 
+async fn read_valid_legacy_archive(
+    path: &Path,
+    url: &str,
+    component_name: &str,
+) -> Result<Vec<u8>, LoaderError> {
+    let cached_archive = read_or_download_cached_artifact(path, url).await?;
+    match validate_legacy_archive(&cached_archive.bytes) {
+        Ok(()) => Ok(cached_archive.bytes),
+        Err(_) if cached_archive.cache_hit => {
+            let _ = async_fs::remove_file(path).await;
+            let bytes = download_and_cache_artifact(url, path).await?;
+            if let Err(error) = validate_legacy_archive(&bytes) {
+                let _ = async_fs::remove_file(path).await;
+                return Err(legacy_archive_error(component_name, error));
+            }
+            Ok(bytes)
+        }
+        Err(error) => {
+            let _ = async_fs::remove_file(path).await;
+            Err(legacy_archive_error(component_name, error))
+        }
+    }
+}
+
+fn validate_legacy_archive(bytes: &[u8]) -> Result<(), ZipError> {
+    let mut archive = ZipArchive::new(std::io::Cursor::new(bytes))?;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index)?;
+        std::io::copy(&mut entry, &mut sink()).map_err(ZipError::Io)?;
+    }
+    Ok(())
+}
+
 async fn promote_cached_artifact_tmp(tmp_path: &Path, path: &Path) -> Result<(), LoaderError> {
     let first_error = match async_fs::rename(tmp_path, path).await {
         Ok(()) => return Ok(()),
@@ -504,6 +539,12 @@ fn installer_extract_error(component_name: &str, error: impl std::fmt::Display) 
     LoaderError::InvalidProfile(format!("extracting {component_name} installer: {error}"))
 }
 
+fn legacy_archive_error(component_name: &str, error: impl std::fmt::Display) -> LoaderError {
+    LoaderError::InvalidProfile(format!(
+        "validating {component_name} legacy archive: {error}"
+    ))
+}
+
 fn cached_installer_path(library_dir: &Path, record: &LoaderBuildRecord) -> PathBuf {
     loader_artifacts_dir(library_dir)
         .join(record.component_id.short_key())
@@ -542,12 +583,22 @@ fn done() -> DownloadProgress {
 
 #[cfg(test)]
 mod tests {
-    use super::{cleanup_on_error, promote_cached_artifact_tmp, write_cached_artifact};
+    use super::{
+        cleanup_on_error, promote_cached_artifact_tmp, read_valid_legacy_archive,
+        write_cached_artifact,
+    };
     use crate::loaders::types::LoaderError;
     use crate::loaders::validate_version_id;
     use crate::paths::versions_dir;
     use std::fs;
+    use std::io::{ErrorKind, Read, Write};
+    use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -653,6 +704,57 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn cached_legacy_archive_corruption_fetches_provider_once() {
+        let root = temp_dir("legacy-archive-corrupt-cache");
+        let path = root.join("artifacts/forge/1.2.4/2.0.0.68-client.zip");
+        fs::create_dir_all(path.parent().expect("parent")).expect("artifact parent");
+        fs::write(&path, b"corrupt cached archive").expect("cached archive");
+        let fresh_archive = empty_zip();
+        let server = TestByteServer::start(fresh_archive.clone());
+
+        let bytes = read_valid_legacy_archive(&path, &server.url, "Forge")
+            .await
+            .expect("legacy archive");
+
+        assert_eq!(bytes, fresh_archive);
+        assert_eq!(
+            fs::read(&path).expect("cached fresh archive"),
+            fresh_archive
+        );
+        assert_eq!(server.request_count(), 1);
+
+        server.stop();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn fresh_invalid_legacy_archive_returns_bounded_error() {
+        let root = temp_dir("legacy-archive-invalid-fresh");
+        let path = root.join("artifacts/forge/1.2.4/2.0.0.68-client.zip");
+        let server = TestByteServer::start(b"invalid provider archive".to_vec());
+
+        let error = read_valid_legacy_archive(&path, &server.url, "Forge")
+            .await
+            .expect_err("invalid archive");
+
+        match error {
+            LoaderError::InvalidProfile(message) => {
+                assert!(
+                    message.starts_with("validating Forge legacy archive: "),
+                    "{message}"
+                );
+                assert!(!message.contains(&server.url), "{message}");
+            }
+            error => panic!("expected invalid profile error, got {error:?}"),
+        }
+        assert_eq!(server.request_count(), 1);
+        assert!(!path.exists());
+
+        server.stop();
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn rejects_whitespace_only_installed_version_id() {
         let error = validate_version_id(" \n ", "installed loader version id").expect_err("error");
@@ -675,5 +777,82 @@ mod tests {
             .map(|value| value.as_nanos())
             .unwrap_or_default();
         std::env::temp_dir().join(format!("croopor-{prefix}-{nanos:x}"))
+    }
+
+    fn empty_zip() -> Vec<u8> {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        zip::ZipWriter::new(&mut cursor)
+            .finish()
+            .expect("finish empty zip");
+        cursor.into_inner()
+    }
+
+    struct TestByteServer {
+        url: String,
+        request_count: Arc<AtomicUsize>,
+        stop_server: mpsc::Sender<()>,
+        server: thread::JoinHandle<()>,
+    }
+
+    impl TestByteServer {
+        fn start(body: Vec<u8>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+            listener
+                .set_nonblocking(true)
+                .expect("set test server nonblocking");
+            let url = format!(
+                "http://{}/legacy-client.zip",
+                listener.local_addr().expect("server addr")
+            );
+            let request_count = Arc::new(AtomicUsize::new(0));
+            let server_request_count = Arc::clone(&request_count);
+            let (stop_server, server_stopped) = mpsc::channel();
+            let server = thread::spawn(move || {
+                loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            server_request_count.fetch_add(1, Ordering::SeqCst);
+                            respond_ok(stream, &body);
+                        }
+                        Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                            if server_stopped.try_recv().is_ok() {
+                                break;
+                            }
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("accept connection: {error}"),
+                    }
+                }
+            });
+
+            Self {
+                url,
+                request_count,
+                stop_server,
+                server,
+            }
+        }
+
+        fn request_count(&self) -> usize {
+            self.request_count.load(Ordering::SeqCst)
+        }
+
+        fn stop(self) {
+            self.stop_server.send(()).expect("stop test server");
+            self.server.join().expect("server thread");
+        }
+    }
+
+    fn respond_ok(mut stream: TcpStream, body: &[u8]) {
+        let mut buffer = [0_u8; 1024];
+        let _ = stream.read(&mut buffer);
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream
+            .write_all(header.as_bytes())
+            .expect("write response header");
+        stream.write_all(body).expect("write response body");
     }
 }
