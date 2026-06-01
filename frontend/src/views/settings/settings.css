@@ -180,14 +180,11 @@
 
 .cp-settings-rule-status {
   margin-top: 14px;
-  padding: 12px;
-  border: 1px solid var(--line);
-  border-radius: var(--r-sm);
-  background: var(--surface-2);
+  padding-top: 12px;
+  border-top: 1px solid color-mix(in oklab, var(--line) 72%, transparent);
 }
 .cp-settings-rule-status--warn {
-  border-color: oklch(0.80 0.14 70 / 0.28);
-  background: oklch(0.80 0.14 70 / 0.08);
+  border-top-color: color-mix(in oklab, var(--warn) 42%, var(--line));
 }
 .cp-settings-rule-status-head {
   display: flex;
