@@ -17,6 +17,7 @@ import { formatInstallItemLabel } from '../../install-labels';
 import { api, apiResourceUrl } from '../../api';
 import { toast } from '../../toast';
 import { errMessage, fmtMem, getMemoryRecommendation } from '../../utils';
+import { loaderKeyFromVersion, LOADER_LABELS } from '../create/defaults';
 import type {
   CompositionTier,
   EnrichedInstance,
@@ -429,13 +430,7 @@ function ResourceStatus({
 }
 
 function loaderLabel(v: Version | undefined): string {
-  if (!v?.loader) return 'Vanilla';
-  const id = v.loader.component_id;
-  if (id.includes('fabric')) return 'Fabric';
-  if (id.includes('quilt')) return 'Quilt';
-  if (id.includes('neoforged')) return 'NeoForge';
-  if (id.includes('minecraftforge')) return 'Forge';
-  return 'Modded';
+  return LOADER_LABELS[loaderKeyFromVersion(v)];
 }
 
 function installTargetFor(inst: EnrichedInstance, version: Version | undefined): string {
@@ -501,11 +496,8 @@ function healthTone(health: PerformanceHealthStatus | undefined): 'ok' | 'warn' 
 }
 
 function planLoader(v: Version | undefined, inst: EnrichedInstance): string {
-  const componentId = v?.loader?.component_id ?? '';
-  if (componentId.includes('neoforged')) return 'neoforge';
-  if (componentId.includes('minecraftforge')) return 'forge';
-  if (componentId.includes('fabric')) return 'fabric';
-  if (componentId.includes('quilt')) return 'quilt';
+  const typedLoader = loaderKeyFromVersion(v);
+  if (typedLoader !== 'vanilla') return typedLoader;
   const raw = inst.version_id.toLowerCase();
   if (raw.includes('neoforge')) return 'neoforge';
   if (raw.includes('fabric')) return 'fabric';

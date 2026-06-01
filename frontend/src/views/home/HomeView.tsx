@@ -6,6 +6,7 @@ import { Icon } from '../../ui/Icons';
 import { useTheme } from '../../hooks/use-theme';
 import { navigate } from '../../ui-state';
 import { config, instances, runningSessions, versions } from '../../store';
+import { loaderKeyFromVersion, LOADER_LABELS } from '../create/defaults';
 import type { EnrichedInstance, Version } from '../../types';
 
 function greetingFor(date: Date): string {
@@ -45,13 +46,7 @@ function versionBadge(v: Version | undefined): string {
 }
 
 function loaderLabel(v: Version | undefined): string {
-  if (!v?.loader) return 'Vanilla';
-  const componentId = v.loader.component_id;
-  if (componentId.includes('fabric')) return 'Fabric';
-  if (componentId.includes('quilt')) return 'Quilt';
-  if (componentId.includes('neoforged')) return 'NeoForge';
-  if (componentId.includes('minecraftforge')) return 'Forge';
-  return 'Mods';
+  return LOADER_LABELS[loaderKeyFromVersion(v)];
 }
 
 function PlayCard({ inst }: { inst: EnrichedInstance }): JSX.Element {
