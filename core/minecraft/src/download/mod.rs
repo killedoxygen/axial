@@ -5,13 +5,14 @@ use crate::paths::{assets_dir, libraries_dir, versions_dir};
 use crate::rules::{current_os_arch, default_environment, evaluate_rules};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use sha1::{Digest as _, Sha1};
 use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::fs as async_fs;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const MIN_LIBRARY_DOWNLOAD_CONCURRENCY: usize = 4;
 const MAX_LIBRARY_DOWNLOAD_CONCURRENCY: usize = 16;
@@ -39,8 +40,8 @@ pub struct Downloader {
 
 #[derive(Debug, Error)]
 pub enum DownloadError {
-    #[error("create directory: {0}")]
-    CreateDirectory(#[from] io::Error),
+    #[error("file operation failed: {0}")]
+    FileOperation(#[from] io::Error),
     #[error("resolve manifest url: {0}")]
     ResolveManifest(String),
     #[error("request failed: {0}")]
@@ -49,6 +50,8 @@ pub enum DownloadError {
     ParseVersion(#[from] serde_json::Error),
     #[error("prepare java runtime: {0}")]
     PrepareRuntime(String),
+    #[error("download integrity: {0}")]
+    Integrity(String),
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +59,75 @@ struct DownloadJob {
     path: PathBuf,
     url: String,
     name: String,
+    expected: ExpectedIntegrity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ExpectedIntegrity {
+    size: Option<u64>,
+    sha1: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActualIntegrity {
+    size: u64,
+    sha1: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DownloadIntegrityError {
+    SizeMismatch {
+        file: String,
+        expected: u64,
+        actual: u64,
+    },
+    Sha1Mismatch {
+        file: String,
+        expected: String,
+        actual: String,
+    },
+    MissingSha1 {
+        file: String,
+    },
+}
+
+impl std::fmt::Display for DownloadIntegrityError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SizeMismatch {
+                file,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "{file} size mismatch: expected {expected}, got {actual}"
+            ),
+            Self::Sha1Mismatch {
+                file,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "{file} sha1 mismatch: expected {expected}, got {actual}"
+            ),
+            Self::MissingSha1 { file } => {
+                write!(formatter, "{file} sha1 was not computed")
+            }
+        }
+    }
+}
+
+impl ExpectedIntegrity {
+    fn from_mojang(size: i64, sha1: &str) -> Self {
+        Self {
+            size: u64::try_from(size).ok().filter(|value| *value > 0),
+            sha1: non_empty_sha1(sha1),
+        }
+    }
+
+    fn has_evidence(&self) -> bool {
+        self.size.is_some() || self.sha1.is_some()
+    }
 }
 
 impl Downloader {
@@ -139,7 +211,8 @@ impl Downloader {
             self.resolve_manifest_url(version_id).await?
         };
         if !url.is_empty() {
-            self.download_file(&url, &json_path).await?;
+            self.download_file(&url, &json_path, &ExpectedIntegrity::default())
+                .await?;
         }
 
         let version =
@@ -180,8 +253,10 @@ impl Downloader {
         ));
         if let Some(client) = &version.downloads.client {
             let jar_path = version_dir.join(format!("{version_id}.jar"));
-            if !path_is_file(&jar_path).await {
-                self.download_file(&client.url, &jar_path).await?;
+            let expected = ExpectedIntegrity::from_mojang(client.size, &client.sha1);
+            if !existing_file_satisfies(&jar_path, &expected).await? {
+                self.download_file(&client.url, &jar_path, &expected)
+                    .await?;
             }
         }
 
@@ -194,8 +269,9 @@ impl Downloader {
             futures_util::stream::iter(library_jobs.into_iter().map(|job| {
                 let client = client.clone();
                 async move {
-                    if !path_is_file(&job.path).await {
-                        download_file_with_client(&client, &job.url, &job.path).await?;
+                    if !existing_file_satisfies(&job.path, &job.expected).await? {
+                        download_file_with_client(&client, &job.url, &job.path, &job.expected)
+                            .await?;
                     }
                     Ok::<String, DownloadError>(job.name)
                 }
@@ -222,8 +298,10 @@ impl Downloader {
                 1,
                 Some(format!("{}.json", version.asset_index.id)),
             ));
-            if !path_is_file(&asset_index_path).await {
-                self.download_file(&version.asset_index.url, &asset_index_path)
+            let expected =
+                ExpectedIntegrity::from_mojang(version.asset_index.size, &version.asset_index.sha1);
+            if !existing_file_satisfies(&asset_index_path, &expected).await? {
+                self.download_file(&version.asset_index.url, &asset_index_path, &expected)
                     .await?;
             }
             self.download_asset_objects(&asset_index_path, send).await?;
@@ -239,8 +317,9 @@ impl Downloader {
                 .join("log_configs")
                 .join(&logging.file.id);
             send(progress("log_config", 0, 1, Some(logging.file.id.clone())));
-            if !path_is_file(&log_config_path).await {
-                self.download_file(&logging.file.url, &log_config_path)
+            let expected = ExpectedIntegrity::from_mojang(logging.file.size, &logging.file.sha1);
+            if !existing_file_satisfies(&log_config_path, &expected).await? {
+                self.download_file(&logging.file.url, &log_config_path, &expected)
                     .await?;
             }
         }
@@ -310,6 +389,8 @@ impl Downloader {
         #[derive(Deserialize)]
         struct AssetObject {
             hash: String,
+            #[serde(default)]
+            size: i64,
         }
 
         let index =
@@ -317,27 +398,32 @@ impl Downloader {
         let objects_dir = assets_dir(&self.mc_dir).join("objects");
         let jobs = missing_asset_object_jobs(unique_asset_object_jobs(
             &objects_dir,
-            index.objects.values().map(|object| object.hash.as_str()),
+            index
+                .objects
+                .values()
+                .map(|object| (object.hash.as_str(), object.size)),
         ))
-        .await;
+        .await?;
 
         send(progress("assets", 0, jobs.len() as i32, None));
         let client = self.client.clone();
         let total_jobs = jobs.len() as i32;
         let mut completed_jobs = 0;
-        let mut asset_downloads =
-            futures_util::stream::iter(jobs.into_iter().map(|(hash, path)| {
-                let client = client.clone();
-                async move {
-                    let url = format!(
-                        "https://resources.download.minecraft.net/{}/{}",
-                        &hash[..2],
-                        hash
-                    );
-                    download_file_with_client(&client, &url, &path).await
-                }
-            }))
-            .buffer_unordered(asset_download_concurrency());
+        let mut asset_downloads = futures_util::stream::iter(jobs.into_iter().map(|job| {
+            let client = client.clone();
+            async move {
+                let hash = job.hash;
+                let path = job.path;
+                let expected = job.expected;
+                let url = format!(
+                    "https://resources.download.minecraft.net/{}/{}",
+                    &hash[..2],
+                    hash
+                );
+                download_file_with_client(&client, &url, &path, &expected).await
+            }
+        }))
+        .buffer_unordered(asset_download_concurrency());
         while let Some(result) = asset_downloads.next().await {
             result?;
             completed_jobs += 1;
@@ -364,7 +450,12 @@ impl Downloader {
         Ok(())
     }
 
-    async fn download_file(&self, url: &str, destination: &Path) -> Result<(), DownloadError> {
+    async fn download_file(
+        &self,
+        url: &str,
+        destination: &Path,
+        expected: &ExpectedIntegrity,
+    ) -> Result<(), DownloadError> {
         if let Some(parent) = destination.parent() {
             async_fs::create_dir_all(parent).await?;
         }
@@ -382,6 +473,7 @@ impl Downloader {
                     output.write_all(&chunk).await?;
                 }
                 output.flush().await?;
+                verify_downloaded_file(&tmp_path, expected).await?;
                 tokio::fs::rename(&tmp_path, destination).await?;
                 Ok::<(), DownloadError>(())
             }
@@ -423,8 +515,8 @@ where
     let mut downloads = futures_util::stream::iter(jobs.into_iter().map(|job| {
         let client = client.clone();
         async move {
-            if !path_is_file(&job.path).await {
-                download_file_with_client(&client, &job.url, &job.path).await?;
+            if !existing_file_satisfies(&job.path, &job.expected).await? {
+                download_file_with_client(&client, &job.url, &job.path, &job.expected).await?;
             }
             Ok::<String, DownloadError>(job.name)
         }
@@ -481,36 +573,55 @@ fn adaptive_download_concurrency(
         .clamp(minimum, maximum.max(minimum))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AssetObjectDownloadJob {
+    hash: String,
+    path: PathBuf,
+    expected: ExpectedIntegrity,
+}
+
 fn unique_asset_object_jobs<'a>(
     objects_dir: &Path,
-    hashes: impl IntoIterator<Item = &'a str>,
-) -> Vec<(String, PathBuf)> {
+    objects: impl IntoIterator<Item = (&'a str, i64)>,
+) -> Vec<AssetObjectDownloadJob> {
     let mut jobs = Vec::new();
     let mut queued_hashes = HashSet::new();
 
-    for hash in hashes {
+    for (hash, size) in objects {
         if !queued_hashes.insert(hash.to_string()) {
             continue;
         }
         let prefix = &hash[..2];
-        jobs.push((hash.to_string(), objects_dir.join(prefix).join(hash)));
+        jobs.push(AssetObjectDownloadJob {
+            hash: hash.to_string(),
+            path: objects_dir.join(prefix).join(hash),
+            expected: ExpectedIntegrity::from_mojang(size, hash),
+        });
     }
 
     jobs
 }
 
-async fn missing_asset_object_jobs(candidates: Vec<(String, PathBuf)>) -> Vec<(String, PathBuf)> {
-    futures_util::stream::iter(candidates.into_iter().map(|(hash, path)| async move {
-        if path_is_file(&path).await {
-            None
+async fn missing_asset_object_jobs(
+    candidates: Vec<AssetObjectDownloadJob>,
+) -> Result<Vec<AssetObjectDownloadJob>, DownloadError> {
+    let mut missing = Vec::new();
+    let mut checks = futures_util::stream::iter(candidates.into_iter().map(|job| async move {
+        if existing_asset_object_satisfies(&job.path, &job.expected).await? {
+            Ok::<Option<AssetObjectDownloadJob>, DownloadError>(None)
         } else {
-            Some((hash, path))
+            Ok::<Option<AssetObjectDownloadJob>, DownloadError>(Some(job))
         }
     }))
-    .buffer_unordered(asset_download_concurrency())
-    .filter_map(|job| async move { job })
-    .collect()
-    .await
+    .buffer_unordered(asset_download_concurrency());
+
+    while let Some(result) = checks.next().await {
+        if let Some(job) = result? {
+            missing.push(job);
+        }
+    }
+
+    Ok(missing)
 }
 
 fn progress(phase: &str, current: i32, total: i32, file: Option<String>) -> DownloadProgress {
@@ -549,6 +660,7 @@ fn resolve_library_download(lib: &Library, mc_dir: &Path) -> Option<DownloadJob>
                     .unwrap_or_else(|| lib.name.clone()),
                 path,
                 url: artifact.url.clone(),
+                expected: ExpectedIntegrity::from_mojang(artifact.size, &artifact.sha1),
             });
         }
         return None;
@@ -577,6 +689,7 @@ fn resolve_library_download(lib: &Library, mc_dir: &Path) -> Option<DownloadJob>
             base_url,
             maven_path.to_string_lossy().replace('\\', "/")
         ),
+        expected: ExpectedIntegrity::from_mojang(lib.size, &lib.sha1),
     })
 }
 
@@ -597,6 +710,7 @@ fn resolve_native_download(lib: &Library, mc_dir: &Path, os_name: &str) -> Optio
                     .unwrap_or_else(|| format!("{}:{classifier_key}", lib.name)),
                 path,
                 url: artifact.url.clone(),
+                expected: ExpectedIntegrity::from_mojang(artifact.size, &artifact.sha1),
             });
         }
     }
@@ -627,6 +741,7 @@ fn resolve_native_download(lib: &Library, mc_dir: &Path, os_name: &str) -> Optio
             base_url,
             maven_path.to_string_lossy().replace('\\', "/")
         ),
+        expected: ExpectedIntegrity::from_mojang(lib.size, &lib.sha1),
     })
 }
 
@@ -731,6 +846,7 @@ async fn download_file_with_client(
     client: &reqwest::Client,
     url: &str,
     destination: &Path,
+    expected: &ExpectedIntegrity,
 ) -> Result<(), DownloadError> {
     if let Some(parent) = destination.parent() {
         async_fs::create_dir_all(parent).await?;
@@ -748,6 +864,7 @@ async fn download_file_with_client(
                 output.write_all(&chunk).await?;
             }
             output.flush().await?;
+            verify_downloaded_file(&tmp_path, expected).await?;
             tokio::fs::rename(&tmp_path, destination).await?;
             Ok::<(), DownloadError>(())
         }
@@ -765,6 +882,136 @@ async fn download_file_with_client(
         }
     }
     Err(last_error.unwrap_or_else(|| DownloadError::ResolveManifest("download failed".to_string())))
+}
+
+async fn existing_file_satisfies(
+    path: &Path,
+    expected: &ExpectedIntegrity,
+) -> Result<bool, DownloadError> {
+    let Ok(metadata) = async_fs::metadata(path).await else {
+        return Ok(false);
+    };
+    if !metadata.is_file() {
+        return Ok(false);
+    }
+    if !expected.has_evidence() {
+        return Ok(true);
+    }
+    if let Some(expected_size) = expected.size
+        && metadata.len() != expected_size
+    {
+        return Ok(false);
+    }
+    if expected.sha1.is_some() {
+        let actual = hash_file(path).await?;
+        return Ok(verify_download_integrity(path, expected, &actual).is_ok());
+    }
+    Ok(true)
+}
+
+async fn existing_asset_object_satisfies(
+    path: &Path,
+    expected: &ExpectedIntegrity,
+) -> Result<bool, DownloadError> {
+    let Ok(metadata) = async_fs::metadata(path).await else {
+        return Ok(false);
+    };
+    if !metadata.is_file() {
+        return Ok(false);
+    }
+    if let Some(expected_size) = expected.size {
+        return Ok(metadata.len() == expected_size);
+    }
+    Ok(true)
+}
+
+async fn verify_downloaded_file(
+    path: &Path,
+    expected: &ExpectedIntegrity,
+) -> Result<(), DownloadError> {
+    if !expected.has_evidence() {
+        return Ok(());
+    }
+    let actual = if expected.sha1.is_some() {
+        hash_file(path).await?
+    } else {
+        let metadata = async_fs::metadata(path).await?;
+        ActualIntegrity {
+            size: metadata.len(),
+            sha1: None,
+        }
+    };
+    verify_download_integrity(path, expected, &actual)
+        .map_err(|error| DownloadError::Integrity(error.to_string()))?;
+    Ok(())
+}
+
+async fn hash_file(path: &Path) -> Result<ActualIntegrity, DownloadError> {
+    let mut file = async_fs::File::open(path).await?;
+    let mut hasher = Sha1::new();
+    let mut size = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        size += read as u64;
+    }
+
+    Ok(ActualIntegrity {
+        size,
+        sha1: Some(format!("{:x}", hasher.finalize())),
+    })
+}
+
+fn verify_download_integrity(
+    path: &Path,
+    expected: &ExpectedIntegrity,
+    actual: &ActualIntegrity,
+) -> Result<(), DownloadIntegrityError> {
+    let file = bounded_download_file_label(path);
+    if let Some(expected_size) = expected.size
+        && actual.size != expected_size
+    {
+        return Err(DownloadIntegrityError::SizeMismatch {
+            file,
+            expected: expected_size,
+            actual: actual.size,
+        });
+    }
+    if let Some(expected_sha1) = expected.sha1.as_deref() {
+        let Some(actual_sha1) = actual.sha1.as_deref() else {
+            return Err(DownloadIntegrityError::MissingSha1 { file });
+        };
+        if !actual_sha1.eq_ignore_ascii_case(expected_sha1) {
+            return Err(DownloadIntegrityError::Sha1Mismatch {
+                file,
+                expected: expected_sha1.to_string(),
+                actual: actual_sha1.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn non_empty_sha1(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn bounded_download_file_label(path: &Path) -> String {
+    const MAX_LABEL_CHARS: usize = 120;
+    let sanitized = path.to_string_lossy().replace(['\r', '\n'], "?");
+    let mut chars = sanitized.chars();
+    let label = chars.by_ref().take(MAX_LABEL_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        format!("{label}...")
+    } else {
+        label
+    }
 }
 
 async fn path_is_file(path: &Path) -> bool {
@@ -792,7 +1039,7 @@ mod tests {
     use super::*;
     use crate::launch::{Library, LibraryArtifact, LibraryDownload};
     use crate::rules::Environment;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -921,36 +1168,200 @@ mod tests {
         let hash_a = "abcdef1234567890abcdef1234567890abcdef12";
         let hash_b = "1234567890abcdef1234567890abcdef12345678";
 
-        let jobs = unique_asset_object_jobs(objects_dir, [hash_a, hash_a, hash_b]);
+        let jobs = unique_asset_object_jobs(objects_dir, [(hash_a, 4), (hash_a, 4), (hash_b, 8)]);
 
         assert_eq!(jobs.len(), 2);
-        assert_eq!(jobs[0].0, hash_a);
-        assert_eq!(jobs[0].1, objects_dir.join("ab").join(hash_a));
-        assert_eq!(jobs[1].0, hash_b);
-        assert_eq!(jobs[1].1, objects_dir.join("12").join(hash_b));
+        assert_eq!(jobs[0].hash, hash_a);
+        assert_eq!(jobs[0].path, objects_dir.join("ab").join(hash_a));
+        assert_eq!(jobs[0].expected, ExpectedIntegrity::from_mojang(4, hash_a));
+        assert_eq!(jobs[1].hash, hash_b);
+        assert_eq!(jobs[1].path, objects_dir.join("12").join(hash_b));
+        assert_eq!(jobs[1].expected, ExpectedIntegrity::from_mojang(8, hash_b));
     }
 
     #[tokio::test]
-    async fn missing_asset_object_jobs_filters_existing_files() {
+    async fn missing_asset_object_jobs_uses_bounded_size_prefilter() {
         let root = temp_dir("asset-filter");
         let objects_dir = root.join("assets").join("objects");
         let existing_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let missing_hash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let wrong_size_hash = "cccccccccccccccccccccccccccccccccccccccc";
         let existing_path = objects_dir.join("aa").join(existing_hash);
         let missing_path = objects_dir.join("bb").join(missing_hash);
+        let wrong_size_path = objects_dir.join("cc").join(wrong_size_hash);
         fs::create_dir_all(existing_path.parent().expect("existing parent"))
             .expect("create existing parent");
+        fs::create_dir_all(wrong_size_path.parent().expect("wrong size parent"))
+            .expect("create wrong size parent");
         fs::write(&existing_path, b"asset").expect("write existing asset");
+        fs::write(&wrong_size_path, b"short").expect("write wrong size asset");
 
         let jobs = missing_asset_object_jobs(vec![
-            (existing_hash.to_string(), existing_path),
-            (missing_hash.to_string(), missing_path.clone()),
+            AssetObjectDownloadJob {
+                hash: existing_hash.to_string(),
+                path: existing_path,
+                expected: ExpectedIntegrity::from_mojang(5, existing_hash),
+            },
+            AssetObjectDownloadJob {
+                hash: missing_hash.to_string(),
+                path: missing_path.clone(),
+                expected: ExpectedIntegrity::from_mojang(5, missing_hash),
+            },
+            AssetObjectDownloadJob {
+                hash: wrong_size_hash.to_string(),
+                path: wrong_size_path.clone(),
+                expected: ExpectedIntegrity::from_mojang(6, wrong_size_hash),
+            },
         ])
-        .await;
+        .await
+        .expect("filter jobs");
 
-        assert_eq!(jobs, vec![(missing_hash.to_string(), missing_path)]);
+        let paths = jobs.into_iter().map(|job| job.path).collect::<HashSet<_>>();
+
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains(&missing_path));
+        assert!(paths.contains(&wrong_size_path));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn existing_file_satisfies_rejects_size_and_sha1_mismatch() {
+        let root = temp_dir("existing-integrity");
+        fs::create_dir_all(&root).expect("create root");
+        let path = root.join("artifact.jar");
+        fs::write(&path, b"artifact").expect("write artifact");
+        let good_sha1 = sha1_hex(b"artifact");
+
+        assert!(
+            existing_file_satisfies(&path, &ExpectedIntegrity::from_mojang(8, &good_sha1))
+                .await
+                .expect("matching file")
+        );
+        assert!(
+            !existing_file_satisfies(&path, &ExpectedIntegrity::from_mojang(7, &good_sha1))
+                .await
+                .expect("size mismatch")
+        );
+        assert!(
+            !existing_file_satisfies(
+                &path,
+                &ExpectedIntegrity::from_mojang(8, "0000000000000000000000000000000000000000")
+            )
+            .await
+            .expect("sha1 mismatch")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn verify_download_integrity_rejects_mismatches() {
+        let path = Path::new("/tmp/croopor-test/artifact.jar");
+        let expected =
+            ExpectedIntegrity::from_mojang(8, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let wrong_size = ActualIntegrity {
+            size: 7,
+            sha1: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
+        };
+        let wrong_sha1 = ActualIntegrity {
+            size: 8,
+            sha1: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()),
+        };
+
+        assert!(matches!(
+            verify_download_integrity(path, &expected, &wrong_size),
+            Err(DownloadIntegrityError::SizeMismatch { .. })
+        ));
+        assert!(matches!(
+            verify_download_integrity(path, &expected, &wrong_sha1),
+            Err(DownloadIntegrityError::Sha1Mismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn library_artifact_job_carries_expected_integrity() {
+        let artifact_path = "org/example/lib/1.0.0/lib-1.0.0.jar";
+        let sha1 = "abcdef1234567890abcdef1234567890abcdef12";
+        let lib = Library {
+            name: "org.example:lib:1.0.0".to_string(),
+            downloads: Some(LibraryDownload {
+                artifact: Some(LibraryArtifact {
+                    path: artifact_path.to_string(),
+                    url: format!("https://libraries.minecraft.net/{artifact_path}"),
+                    sha1: sha1.to_string(),
+                    size: 1234,
+                }),
+                classifiers: HashMap::new(),
+            }),
+            ..Library::default()
+        };
+
+        let job =
+            resolve_library_download(&lib, Path::new("/tmp/croopor-test")).expect("library job");
+
+        assert_eq!(job.expected, ExpectedIntegrity::from_mojang(1234, sha1));
+    }
+
+    #[test]
+    fn native_classifier_job_carries_expected_integrity() {
+        let artifact_path = "org/example/lib/1.0.0/lib-1.0.0-natives-windows.jar";
+        let sha1 = "1234567890abcdef1234567890abcdef12345678";
+        let mut natives = HashMap::new();
+        natives.insert("windows".to_string(), "natives-windows".to_string());
+        let mut classifiers = HashMap::new();
+        classifiers.insert(
+            "natives-windows".to_string(),
+            LibraryArtifact {
+                path: artifact_path.to_string(),
+                url: format!("https://libraries.minecraft.net/{artifact_path}"),
+                sha1: sha1.to_string(),
+                size: 4321,
+            },
+        );
+        let lib = Library {
+            name: "org.example:lib:1.0.0".to_string(),
+            downloads: Some(LibraryDownload {
+                artifact: None,
+                classifiers,
+            }),
+            natives,
+            ..Library::default()
+        };
+
+        let job = resolve_native_download(&lib, Path::new("/tmp/croopor-test"), "windows")
+            .expect("native job");
+
+        assert_eq!(job.expected, ExpectedIntegrity::from_mojang(4321, sha1));
+    }
+
+    #[test]
+    fn library_maven_fallback_job_reuses_when_metadata_missing() {
+        let lib = Library {
+            name: "org.example:lib:1.0.0".to_string(),
+            downloads: None,
+            ..Library::default()
+        };
+
+        let job =
+            resolve_library_download(&lib, Path::new("/tmp/croopor-test")).expect("library job");
+
+        assert_eq!(job.expected, ExpectedIntegrity::default());
+        assert!(!job.expected.has_evidence());
+    }
+
+    #[test]
+    fn expected_integrity_ignores_default_mojang_metadata() {
+        let expected = ExpectedIntegrity::from_mojang(0, " ");
+
+        assert_eq!(expected, ExpectedIntegrity::default());
+        assert!(!expected.has_evidence());
+    }
+
+    fn sha1_hex(bytes: &[u8]) -> String {
+        let mut hasher = Sha1::new();
+        hasher.update(bytes);
+        format!("{:x}", hasher.finalize())
     }
 
     fn native_library(name: &str) -> Library {
