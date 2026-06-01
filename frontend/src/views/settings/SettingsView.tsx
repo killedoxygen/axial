@@ -1569,6 +1569,7 @@ function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: BenchmarkMat
 
 function PerformanceSection(): JSX.Element {
   const cfg = config.value;
+  const isDev = devMode.value;
   const savedPerformance = performanceModeFrom(cfg?.performance_mode);
   const savedGuardian = guardianModeFrom(cfg?.guardian_mode);
   const [performanceMode, setPerformanceMode] = useState<PerformanceMode>(savedPerformance);
@@ -1619,6 +1620,7 @@ function PerformanceSection(): JSX.Element {
   }, []);
 
   useEffect(() => {
+    if (!isDev) return;
     let alive = true;
     setBenchmarkMatrix((prev) => ({ status: 'loading', data: prev.data }));
     api('GET', '/launch/benchmark/matrix')
@@ -1632,9 +1634,10 @@ function PerformanceSection(): JSX.Element {
         setBenchmarkMatrix((prev) => ({ status: 'error', data: prev.data, error: errMessage(err) }));
       });
     return () => { alive = false; };
-  }, []);
+  }, [isDev]);
 
   useEffect(() => {
+    if (!isDev) return;
     let alive = true;
     setQualificationPreview((prev) => ({ status: 'loading', data: prev.data }));
     api('GET', '/launch/benchmark/qualification/family-c-1-12-2/preview')
@@ -1652,7 +1655,7 @@ function PerformanceSection(): JSX.Element {
         setQualificationPreview((prev) => ({ status: 'error', data: prev.data, error: errMessage(err) }));
       });
     return () => { alive = false; };
-  }, []);
+  }, [isDev]);
 
   const savePatch = async (
     key: 'performance_mode' | 'guardian_mode',
@@ -1707,10 +1710,18 @@ function PerformanceSection(): JSX.Element {
         />
         <PerformanceRulesStatusBlock state={rulesStatus} />
         <LaunchProofHistoryBlock state={launchReports} />
-        <BenchmarkMatrixBlock state={benchmarkMatrix} />
-        <BenchmarkQualificationPreviewBlock state={qualificationPreview} />
-        <BenchmarkSuiteDriversBlock matrixState={benchmarkMatrix} />
       </SettingsCard>
+      {isDev && (
+        <SettingsCard
+          title="Performance lab"
+          desc="Developer-only benchmark descriptors, qualification evidence, and suite drivers."
+          stack
+        >
+          <BenchmarkMatrixBlock state={benchmarkMatrix} />
+          <BenchmarkQualificationPreviewBlock state={qualificationPreview} />
+          <BenchmarkSuiteDriversBlock matrixState={benchmarkMatrix} />
+        </SettingsCard>
+      )}
       <SettingsCard
         title="Guardian"
         desc="Launch safety policy for Java, JVM arguments, and risky runtime changes."
