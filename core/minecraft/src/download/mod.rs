@@ -322,7 +322,7 @@ impl Downloader {
             }
             let prefix = &object.hash[..2];
             let path = objects_dir.join(prefix).join(&object.hash);
-            if !path.is_file() {
+            if !path_is_file(&path).await {
                 jobs.push((object.hash.clone(), path));
             }
         }
