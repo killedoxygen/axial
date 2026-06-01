@@ -18,6 +18,8 @@ use serde::Deserialize;
 use std::{convert::Infallible, path::PathBuf, time::SystemTime};
 use tokio::sync::mpsc;
 
+const LOADER_INSTALL_SCOPE: &str = "loader";
+
 #[derive(Debug, Deserialize)]
 struct LoaderBuildQuery {
     mc_version: String,
@@ -130,8 +132,21 @@ async fn handle_loader_install(
     .await
     .map_err(error_response)?;
 
+    let (install_version_key, install_manifest_key) =
+        loader_install_key_fields(build.component_id, &build.build_id, &build.version_id);
     let install_id = generate_install_id();
-    state.installs().insert(install_id.clone()).await;
+    let (install_id, inserted) = state
+        .installs()
+        .insert_or_existing_active_scoped(
+            LOADER_INSTALL_SCOPE.to_string(),
+            install_id,
+            install_version_key,
+            install_manifest_key,
+        )
+        .await;
+    if !inserted {
+        return Ok(Json(serde_json::json!({ "install_id": install_id })));
+    }
 
     let store = state.installs().clone();
     let library_dir = PathBuf::from(library_dir);
@@ -245,6 +260,17 @@ fn parse_component_id(
             })),
         )
     })
+}
+
+fn loader_install_key_fields(
+    component_id: LoaderComponentId,
+    build_id: &str,
+    version_id: &str,
+) -> (String, String) {
+    (
+        format!("loader:{}:{}", component_id.as_str(), version_id.trim()),
+        format!("loader:{}:{}", component_id.as_str(), build_id.trim()),
+    )
 }
 
 fn progress_event(progress: &DownloadProgress) -> Event {
@@ -464,6 +490,45 @@ mod tests {
         assert_eq!(progress.file, None);
         assert_eq!(progress.error, None);
         assert!(progress.done);
+    }
+
+    #[test]
+    fn loader_install_key_fields_are_scoped_to_component_and_build() {
+        let fabric_key = loader_install_key_fields(
+            LoaderComponentId::Fabric,
+            "fabric:1.21.5:0.16.14",
+            "fabric-loader-0.16.14-1.21.5",
+        );
+        let quilt_key = loader_install_key_fields(
+            LoaderComponentId::Quilt,
+            "quilt:1.21.5:0.16.14",
+            "fabric-loader-0.16.14-1.21.5",
+        );
+        let next_build_key = loader_install_key_fields(
+            LoaderComponentId::Fabric,
+            "fabric:1.21.5:0.16.15",
+            "fabric-loader-0.16.14-1.21.5",
+        );
+
+        assert_ne!(fabric_key, quilt_key);
+        assert_ne!(fabric_key, next_build_key);
+        assert!(fabric_key.0.starts_with("loader:"));
+        assert!(fabric_key.1.starts_with("loader:"));
+    }
+
+    #[test]
+    fn loader_install_key_fields_trim_resolved_fields() {
+        assert_eq!(
+            loader_install_key_fields(
+                LoaderComponentId::Forge,
+                " forge:1.20.1:47.4.0 ",
+                " 1.20.1-forge-47.4.0 ",
+            ),
+            (
+                "loader:net.minecraftforge:1.20.1-forge-47.4.0".to_string(),
+                "loader:net.minecraftforge:forge:1.20.1:47.4.0".to_string()
+            )
+        );
     }
 
     fn assert_no_raw_fragments(message: &str) {

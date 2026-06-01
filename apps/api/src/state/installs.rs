@@ -11,13 +11,15 @@ struct InstallEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InstallKey {
+    scope: String,
     version_id: String,
     manifest_url: String,
 }
 
 impl InstallKey {
-    fn new(version_id: String, manifest_url: String) -> Self {
+    fn new(scope: String, version_id: String, manifest_url: String) -> Self {
         Self {
+            scope: scope.trim().to_string(),
             version_id: version_id.trim().to_string(),
             manifest_url: manifest_url.trim().to_string(),
         }
@@ -45,7 +47,23 @@ impl InstallStore {
         version_id: String,
         manifest_url: String,
     ) -> (String, bool) {
-        let key = InstallKey::new(version_id, manifest_url);
+        self.insert_or_existing_active_scoped(
+            "vanilla".to_string(),
+            install_id,
+            version_id,
+            manifest_url,
+        )
+        .await
+    }
+
+    pub async fn insert_or_existing_active_scoped(
+        &self,
+        scope: String,
+        install_id: String,
+        version_id: String,
+        manifest_url: String,
+    ) -> (String, bool) {
+        let key = InstallKey::new(scope, version_id, manifest_url);
         let mut installs = self.installs.write().await;
         if let Some(existing_id) = installs.iter().find_map(|(existing_id, entry)| {
             (!entry.done && entry.key.as_ref() == Some(&key)).then(|| existing_id.clone())
@@ -277,6 +295,41 @@ mod tests {
         assert!(explicit_inserted);
         assert_eq!(duplicate_explicit_id, "explicit-install");
         assert!(!duplicate_explicit_inserted);
+        assert_eq!(store.active_install_count().await, 2);
+    }
+
+    #[tokio::test]
+    async fn install_insert_or_existing_keeps_scopes_independent() {
+        let store = InstallStore::new();
+        store
+            .insert_or_existing_active(
+                "vanilla-install".to_string(),
+                "1.21.5".to_string(),
+                String::new(),
+            )
+            .await;
+
+        let (loader_id, loader_inserted) = store
+            .insert_or_existing_active_scoped(
+                "loader".to_string(),
+                "loader-install".to_string(),
+                "1.21.5".to_string(),
+                String::new(),
+            )
+            .await;
+        let (duplicate_loader_id, duplicate_loader_inserted) = store
+            .insert_or_existing_active_scoped(
+                " loader ".to_string(),
+                "duplicate-loader-install".to_string(),
+                "1.21.5".to_string(),
+                String::new(),
+            )
+            .await;
+
+        assert_eq!(loader_id, "loader-install");
+        assert!(loader_inserted);
+        assert_eq!(duplicate_loader_id, "loader-install");
+        assert!(!duplicate_loader_inserted);
         assert_eq!(store.active_install_count().await, 2);
     }
 
