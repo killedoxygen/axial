@@ -5,7 +5,7 @@ import { IconButton } from '../ui/Atoms';
 import { WindowControls } from './WindowControls';
 import { MusicWidget } from './MusicWidget';
 import { goBack, goForward, navigate, route } from '../ui-state';
-import { runningSessions, instances, launchState, installState } from '../store';
+import { runningSessions, instances, launchState, installState, installQueue } from '../store';
 import { windowStartDragging, windowToggleMaximize, hasNativeDesktopRuntime } from '../native';
 import { launchStageViewFrom } from '../launch-stages';
 
@@ -64,9 +64,11 @@ function StatusPill(): JSX.Element {
 
   const install = installState.value;
   if (install.status === 'active') {
+    const queuedCount = installQueue.value.length;
+    const queuedLabel = queuedCount > 0 ? ` · ${queuedCount} queued` : '';
     const installPct = Math.round(Math.max(0, Math.min(100, install.pct)));
     const installPhase = install.phase ? ` · ${install.phase.replace(/_/g, ' ')}` : '';
-    const installTitle = `${install.versionId}: ${install.label} · ${installPct}%${installPhase}`;
+    const installTitle = `${install.versionId}: ${install.label} · ${installPct}%${queuedLabel}${installPhase}`;
     const installStyle = { '--cp-install-ratio': String(installPct / 100) } as JSX.CSSProperties;
 
     return (
@@ -78,7 +80,7 @@ function StatusPill(): JSX.Element {
         style={installStyle}
       >
         <span class="cp-status-dot" />
-        <span class="cp-status-pill-label">{install.label} · {installPct}%</span>
+        <span class="cp-status-pill-label">{install.label} · {installPct}%{queuedLabel}</span>
       </button>
     );
   }
