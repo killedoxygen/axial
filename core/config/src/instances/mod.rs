@@ -234,8 +234,12 @@ impl InstanceStore {
             )));
         }
 
+        let previous = inner.instances[index].clone();
         inner.instances[index] = next.clone();
-        self.persist_locked(&inner)?;
+        if let Err(error) = self.persist_locked(&inner) {
+            inner.instances[index] = previous;
+            return Err(error);
+        }
         Ok(next)
     }
 
@@ -901,6 +905,36 @@ mod tests {
             store.get(&alpha.id).expect("alpha remains").name,
             "Alpha".to_string()
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn update_restores_in_memory_instance_when_persist_fails() {
+        let root = test_root("update-persist-failure");
+        let paths = test_paths(&root);
+        let store = InstanceStore {
+            paths: paths.clone(),
+            inner: RwLock::new(StoredInstances::default()),
+        };
+        let previous = store
+            .add(
+                "Stable".to_string(),
+                "1.21.1".to_string(),
+                String::new(),
+                String::new(),
+                None,
+            )
+            .expect("add instance");
+        fs::remove_dir_all(&paths.config_dir).expect("remove config dir");
+        fs::write(&paths.config_dir, "not a dir").expect("block config dir");
+
+        let mut next = previous.clone();
+        next.performance_mode = "managed".to_string();
+        let error = store.update(next).expect_err("persist should fail");
+
+        assert!(matches!(error, super::InstanceStoreError::Read(_)));
+        assert_eq!(store.get(&previous.id).expect("instance remains"), previous);
 
         let _ = fs::remove_dir_all(root);
     }
