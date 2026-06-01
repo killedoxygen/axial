@@ -19,7 +19,7 @@ use axum::{
 use croopor_config::{AppConfig, LAUNCH_AUTH_MODE_ONLINE, validate_username};
 use croopor_minecraft::offline_uuid;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     sync::{Arc, OnceLock},
     time::Duration,
@@ -35,6 +35,7 @@ const MSA_TOKEN_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code
 const MSA_REFRESH_TOKEN_GRANT_TYPE: &str = "refresh_token";
 const MSA_DEVICE_CODE_TIMEOUT: Duration = Duration::from_secs(20);
 const MSA_TOKEN_POLL_TIMEOUT: Duration = Duration::from_secs(20);
+const MAX_MSA_RESPONSE_BYTES: usize = 1024 * 1024;
 const MSA_SLOW_DOWN_INTERVAL_INCREMENT: u64 = 5;
 const LOGIN_UNAVAILABLE_REASON: &str = "Microsoft sign-in is not configured in this build";
 const LOGIN_AVAILABLE_REASON: &str = "Microsoft sign-in is configured";
@@ -541,10 +542,7 @@ async fn request_msa_device_code(client_id: &str) -> Result<MsaDeviceCodeRespons
         return Err(AuthLoginError::UpstreamStatus(status));
     }
 
-    response
-        .json::<MsaDeviceCodeResponse>()
-        .await
-        .map_err(|_| AuthLoginError::Parse)
+    bounded_msa_json_response(response).await
 }
 
 async fn auth_login_poll_for_config(
@@ -594,13 +592,12 @@ async fn request_msa_token(
 
     let status = response.status();
     if status.is_success() {
-        return response
-            .json::<MsaTokenSuccessResponse>()
+        return bounded_msa_json_response(response)
             .await
-            .map_err(|_| AuthLoginPollError::Request(AuthLoginError::Parse));
+            .map_err(AuthLoginPollError::Request);
     }
 
-    match response.json::<MsaTokenErrorResponse>().await {
+    match bounded_msa_json_response::<MsaTokenErrorResponse>(response).await {
         Ok(response) => Err(AuthLoginPollError::OAuth(MsaTokenErrorCode::from_error(
             &response.error,
         ))),
@@ -631,13 +628,12 @@ async fn request_msa_refresh_token(
 
     let status = response.status();
     if status.is_success() {
-        return response
-            .json::<MsaTokenSuccessResponse>()
+        return bounded_msa_json_response(response)
             .await
-            .map_err(|_| AuthLoginPollError::Request(AuthLoginError::Parse));
+            .map_err(AuthLoginPollError::Request);
     }
 
-    match response.json::<MsaTokenErrorResponse>().await {
+    match bounded_msa_json_response::<MsaTokenErrorResponse>(response).await {
         Ok(response) => Err(AuthLoginPollError::OAuth(MsaTokenErrorCode::from_error(
             &response.error,
         ))),
@@ -645,6 +641,32 @@ async fn request_msa_refresh_token(
             status,
         ))),
     }
+}
+
+async fn bounded_msa_json_response<T>(mut response: reqwest::Response) -> Result<T, AuthLoginError>
+where
+    T: DeserializeOwned,
+{
+    if response
+        .content_length()
+        .is_some_and(|content_length| content_length > MAX_MSA_RESPONSE_BYTES as u64)
+    {
+        return Err(AuthLoginError::Parse);
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| AuthLoginError::Request)?
+    {
+        if body.len().saturating_add(chunk.len()) > MAX_MSA_RESPONSE_BYTES {
+            return Err(AuthLoginError::Parse);
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    serde_json::from_slice::<T>(&body).map_err(|_| AuthLoginError::Parse)
 }
 
 fn msa_device_code_client() -> Result<&'static Client, AuthLoginError> {
@@ -1401,6 +1423,7 @@ mod tests {
     use croopor_config::{AppConfig, AppPaths, ConfigStore, InstanceStore};
     use croopor_performance::PerformanceManager;
     use std::{collections::HashMap, fs, path::PathBuf, sync::Arc};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::mpsc;
 
     #[tokio::test]
@@ -1732,6 +1755,51 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn auth_login_poll_rejects_oversized_msa_success_response() {
+        let token_endpoint = raw_token_response_server(
+            "200 OK",
+            vec![
+                ("Content-Type".to_string(), "application/json".to_string()),
+                (
+                    "Content-Length".to_string(),
+                    (MAX_MSA_RESPONSE_BYTES + 1).to_string(),
+                ),
+            ],
+            b"{}".to_vec(),
+        )
+        .await;
+
+        let error = request_msa_token(&token_endpoint, "public-client-id", "raw-device-code")
+            .await
+            .expect_err("oversized token response should fail");
+
+        assert!(matches!(
+            error,
+            AuthLoginPollError::Request(AuthLoginError::Parse)
+        ));
+    }
+
+    #[tokio::test]
+    async fn auth_login_poll_bounds_oversized_msa_error_response() {
+        let token_endpoint = raw_token_response_server(
+            "400 Bad Request",
+            vec![("Content-Type".to_string(), "application/json".to_string())],
+            vec![b' '; MAX_MSA_RESPONSE_BYTES + 1],
+        )
+        .await;
+
+        let error = request_msa_token(&token_endpoint, "public-client-id", "raw-device-code")
+            .await
+            .expect_err("oversized token error response should fail");
+
+        assert!(matches!(
+            error,
+            AuthLoginPollError::Request(AuthLoginError::UpstreamStatus(status))
+                if status == StatusCode::BAD_REQUEST
+        ));
     }
 
     #[tokio::test]
@@ -2795,6 +2863,46 @@ mod tests {
             axum::serve(listener, app).await.expect("token test server");
         });
         (url, rx)
+    }
+
+    async fn raw_token_response_server(
+        status: &str,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    ) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind raw token response server");
+        let url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let status = status.to_string();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let _ = read_raw_http_request(&mut socket).await;
+                let mut response = format!("HTTP/1.1 {status}\r\nConnection: close\r\n");
+                for (name, value) in headers {
+                    response.push_str(&format!("{name}: {value}\r\n"));
+                }
+                response.push_str("\r\n");
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.write_all(&body).await;
+            }
+        });
+        url
+    }
+
+    async fn read_raw_http_request(socket: &mut tokio::net::TcpStream) -> Option<()> {
+        let mut buffer = vec![0_u8; 1024];
+        let mut received = Vec::new();
+        loop {
+            let read = socket.read(&mut buffer).await.ok()?;
+            if read == 0 {
+                return None;
+            }
+            received.extend_from_slice(&buffer[..read]);
+            if received.windows(4).any(|window| window == b"\r\n\r\n") {
+                return Some(());
+            }
+        }
     }
 
     fn unused_auth_chain_client() -> AuthChainClient {
