@@ -270,14 +270,14 @@ function GameplaySection(): JSX.Element {
 // ── Performance ─────────────────────────────────────────────────────────
 
 const PERFORMANCE_OPTIONS: Array<ModeOption<PerformanceMode>> = [
-  { value: 'managed', label: 'Managed', note: 'Croopor plans safe defaults' },
-  { value: 'vanilla', label: 'Vanilla', note: 'No managed add-ons' },
-  { value: 'custom', label: 'Custom', note: 'Keep manual tuning' },
+  { value: 'managed', label: 'Managed', note: 'Recommended defaults' },
+  { value: 'vanilla', label: 'Vanilla', note: 'No add-ons' },
+  { value: 'custom', label: 'Custom', note: 'Manual tuning' },
 ];
 
 const GUARDIAN_OPTIONS: Array<ModeOption<GuardianMode>> = [
-  { value: 'managed', label: 'Managed', note: 'Warns and can intervene' },
-  { value: 'custom', label: 'Custom', note: 'Preserves choices; blocks fatal setups' },
+  { value: 'managed', label: 'Managed', note: 'Warns and protects' },
+  { value: 'custom', label: 'Custom', note: 'Preserves; blocks fatal' },
 ];
 
 type RulesStatusState =
@@ -1719,16 +1719,23 @@ function PerformanceSection(): JSX.Element {
   return (
     <>
       <SettingsCard
-        title="Performance program"
-        desc="Global default for new and inherited instances. Instance settings can still opt out when needed."
+        title="Launch behavior"
+        desc="Defaults for performance and safety."
         stack
       >
         <ModeChoice
-          label="Default mode"
+          label="Performance mode"
           value={performanceMode}
           options={PERFORMANCE_OPTIONS}
           disabled={saving !== null}
           onChange={changePerformance}
+        />
+        <ModeChoice
+          label="Guardian mode"
+          value={guardianMode}
+          options={GUARDIAN_OPTIONS}
+          disabled={saving !== null}
+          onChange={changeGuardian}
         />
         <PerformanceRulesStatusBlock state={rulesStatus} />
       </SettingsCard>
@@ -1744,19 +1751,6 @@ function PerformanceSection(): JSX.Element {
           <BenchmarkSuiteDriversBlock matrixState={benchmarkMatrix} />
         </SettingsCard>
       )}
-      <SettingsCard
-        title="Guardian"
-        desc="Launch safety policy for Java, JVM arguments, and risky runtime changes."
-        stack
-      >
-        <ModeChoice
-          label="Support mode"
-          value={guardianMode}
-          options={GUARDIAN_OPTIONS}
-          disabled={saving !== null}
-          onChange={changeGuardian}
-        />
-      </SettingsCard>
     </>
   );
 }
