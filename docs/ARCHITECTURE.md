@@ -279,4 +279,4 @@ The API also exposes `GET /api/v1/skin/profile` as the local skin-profile bounda
 ## Current architectural pressure points
 - Guardian authority is still being tightened across runtime, Healing, session heuristics, and frontend rendering.
 - Session startup/failure inference still depends on log heuristics.
-- Update flow exists but is still not a full native updater/distribution pipeline.
+- `/api/v1/update` performs a bounded GitHub latest-release check for release-page detection only; provider errors fall back to no-update, and Croopor still has no native updater/distribution pipeline.
