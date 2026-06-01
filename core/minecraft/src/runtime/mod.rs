@@ -450,7 +450,17 @@ async fn ensure_managed_runtime(
 fn runtime_install_lock(component: &str) -> Arc<Mutex<()>> {
     static LOCKS: OnceLock<std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
     let mutex = LOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    let mut guard = mutex.lock().expect("runtime install lock poisoned");
+    runtime_install_lock_from_map(mutex, component)
+}
+
+fn runtime_install_lock_from_map(
+    mutex: &std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    component: &str,
+) -> Arc<Mutex<()>> {
+    let mut guard = match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
     guard
         .entry(component.to_string())
         .or_insert_with(|| Arc::new(Mutex::new(())))
@@ -1259,11 +1269,12 @@ mod tests {
         RuntimeDownloadEvidence, RuntimeDownloadIntegrityError, RuntimeInstallState,
         component_manifest_destination, detect_distribution, detect_runtime_state, java_executable,
         plan_runtime_manifest_files, runtime_file_download_concurrency_for,
-        verify_runtime_download,
+        runtime_install_lock_from_map, verify_runtime_download,
     };
     use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn expected(size: Option<u64>, sha1: Option<&str>) -> RuntimeDownloadEvidence {
@@ -1471,6 +1482,26 @@ mod tests {
             vec!["bin/java", "lib/server/libjvm.so"]
         );
         assert_eq!(planned_paths(&plan.other_entries), vec!["ignored-entry"]);
+    }
+
+    #[test]
+    fn runtime_install_lock_recovers_from_poisoned_map_lock() {
+        let locks = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let seeded_install_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let poison_target = Arc::clone(&locks);
+        let poison_seed = Arc::clone(&seeded_install_lock);
+
+        let _ = std::thread::spawn(move || {
+            let mut guard = poison_target.lock().unwrap();
+            guard.insert("java-runtime-delta".to_string(), poison_seed);
+            panic!("poison runtime lock map");
+        })
+        .join();
+
+        assert!(locks.is_poisoned());
+        let recovered_lock = runtime_install_lock_from_map(&locks, "java-runtime-delta");
+
+        assert!(Arc::ptr_eq(&recovered_lock, &seeded_install_lock));
     }
 
     #[test]
