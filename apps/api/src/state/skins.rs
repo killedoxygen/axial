@@ -256,10 +256,14 @@ fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
 }
 
 fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
-    if fs::rename(source, destination).is_ok() {
-        return Ok(());
+    let first_error = match fs::rename(source, destination) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    if !source.exists() {
+        return Err(first_error);
     }
-    if destination.exists() {
+    if destination.exists() && !destination.is_dir() {
         let _ = fs::remove_file(destination);
     }
     match fs::rename(source, destination) {
@@ -273,4 +277,62 @@ fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
 
 fn lock_error() -> io::Error {
     io::Error::new(io::ErrorKind::Other, "saved skin store lock poisoned")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn replace_file_preserves_existing_destination_when_source_is_missing() {
+        let root = test_root("missing-source");
+        fs::create_dir_all(&root).expect("create test root");
+        let source = root.join("skin.tmp");
+        let destination = root.join("skin.png");
+        fs::write(&destination, b"existing").expect("write destination");
+
+        let error = replace_file(&source, &destination).expect_err("replace should fail");
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(
+            fs::read(&destination).expect("destination should remain readable"),
+            b"existing"
+        );
+        assert!(!source.exists());
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn replace_file_preserves_directory_destination_on_failed_promotion() {
+        let root = test_root("directory-destination");
+        fs::create_dir_all(&root).expect("create test root");
+        let source = root.join("skin.tmp");
+        let destination = root.join("skin.png");
+        fs::write(&source, b"replacement").expect("write source");
+        fs::create_dir(&destination).expect("create destination directory");
+
+        replace_file(&source, &destination).expect_err("replace should fail");
+
+        assert!(destination.is_dir());
+        assert!(!source.exists());
+
+        cleanup(&root);
+    }
+
+    fn test_root(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "croopor-skins-{name}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    fn cleanup(root: &Path) {
+        let _ = fs::remove_dir_all(root);
+    }
 }

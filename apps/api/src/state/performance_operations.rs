@@ -344,10 +344,14 @@ fn persist_status_to_dir(
 }
 
 fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
-    if fs::rename(source, destination).is_ok() {
-        return Ok(());
+    let first_error = match fs::rename(source, destination) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    if !source.exists() {
+        return Err(first_error);
     }
-    if destination.exists() {
+    if destination.exists() && !destination.is_dir() {
         let _ = fs::remove_file(destination);
     }
     match fs::rename(source, destination) {
@@ -813,6 +817,43 @@ mod tests {
                 "performance operation failed"
             );
         }
+    }
+
+    #[test]
+    fn replace_file_preserves_existing_destination_when_source_is_missing() {
+        let root = test_root("missing-source");
+        fs::create_dir_all(&root).expect("create test root");
+        let source = root.join("operation.json.tmp");
+        let destination = root.join("operation.json");
+        fs::write(&destination, b"{\"state\":\"existing\"}").expect("write destination");
+
+        let error = replace_file(&source, &destination).expect_err("replace should fail");
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(
+            fs::read(&destination).expect("destination should remain readable"),
+            b"{\"state\":\"existing\"}"
+        );
+        assert!(!source.exists());
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn replace_file_preserves_directory_destination_on_failed_promotion() {
+        let root = test_root("directory-destination");
+        fs::create_dir_all(&root).expect("create test root");
+        let source = root.join("operation.json.tmp");
+        let destination = root.join("operation.json");
+        fs::write(&source, b"{\"state\":\"replacement\"}").expect("write source");
+        fs::create_dir(&destination).expect("create destination directory");
+
+        replace_file(&source, &destination).expect_err("replace should fail");
+
+        assert!(destination.is_dir());
+        assert!(!source.exists());
+
+        cleanup(&root);
     }
 
     fn test_payload() -> PerformanceOperationPayload {
