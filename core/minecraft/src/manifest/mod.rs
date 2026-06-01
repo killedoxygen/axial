@@ -67,12 +67,14 @@ pub async fn fetch_version_manifest() -> Result<VersionManifest, String> {
 }
 
 pub async fn fetch_version_manifest_cached(library_dir: &Path) -> Result<VersionManifest, String> {
+    let cache_path = version_manifest_cache_path(library_dir);
+
     if let Some(value) = fresh_cached_manifest() {
+        let _ = write_persistent_manifest_cache_value(&cache_path, &value);
         return Ok(value);
     }
 
     let cached_stale = stale_cached_manifest();
-    let cache_path = version_manifest_cache_path(library_dir);
     let (manifest, live_body) = resolve_manifest_from_live_or_cache(
         &cache_path,
         fetch_manifest_live_body().await,
@@ -200,6 +202,15 @@ fn write_persistent_manifest_cache(path: &Path, data: &[u8]) -> Result<(), Strin
     result
 }
 
+fn write_persistent_manifest_cache_value(
+    path: &Path,
+    manifest: &VersionManifest,
+) -> Result<(), String> {
+    let data = serde_json::to_vec(manifest)
+        .map_err(|error| format!("serializing version manifest cache: {error}"))?;
+    write_persistent_manifest_cache(path, &data)
+}
+
 fn promote_manifest_cache_tmp_file(tmp_path: &Path, path: &Path) -> std::io::Result<()> {
     let first_error = match fs::rename(tmp_path, path) {
         Ok(()) => return Ok(()),
@@ -287,6 +298,21 @@ mod tests {
 
         assert_eq!(manifest.latest.release, "1.21.4");
         assert!(live_body.is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fresh_manifest_value_can_seed_a_requested_library_cache() {
+        let root = temp_dir("manifest-cache-fresh-library");
+        let cache_path = root.join("cache").join("version_manifest_v2.json");
+        let manifest =
+            parse_manifest_body(sample_manifest_body("1.21.6").as_bytes()).expect("parse manifest");
+
+        write_persistent_manifest_cache_value(&cache_path, &manifest).expect("write cache value");
+
+        let cached = read_persistent_manifest_cache(&cache_path).expect("read cache");
+        assert_eq!(cached.latest.release, "1.21.6");
 
         let _ = fs::remove_dir_all(root);
     }
