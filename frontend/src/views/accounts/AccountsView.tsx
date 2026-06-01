@@ -1796,6 +1796,7 @@ function SavedSkinLibrary({
 }): JSX.Element {
   const theme = useTheme();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const uploadApplyAfterSaveRef = useRef(false);
   const uploadDragDepthRef = useRef(0);
   const { skins, state, error, refresh } = useSavedSkins();
   const [skinName, setSkinName] = useState('');
@@ -1844,7 +1845,7 @@ function SavedSkinLibrary({
     setSelectedKey(next.texture_key);
   }, [skins, selectedKey, state]);
 
-  const upload = async (file: File): Promise<void> => {
+  const upload = async (file: File, applyAfterSave = false): Promise<void> => {
     const name = trimmedName || file.name.replace(/\.[^.]+$/, '').trim();
     if (!name) {
       setMessage({ tone: 'err', text: 'Name the skin before uploading.' });
@@ -1869,7 +1870,12 @@ function SavedSkinLibrary({
       const saved = savedSkinRecord(payload);
       setSkinName('');
       if (saved) setSelectedKey(saved.texture_key);
-      refresh();
+      if (saved && applyAfterSave) {
+        await applySavedSkin(saved.texture_key);
+        setMessage({ tone: 'ok', text: 'Skin saved and applied to Minecraft profile.' });
+      } else {
+        refresh();
+      }
     } catch (err) {
       setMessage({
         tone: 'err',
@@ -1958,6 +1964,13 @@ function SavedSkinLibrary({
     }
   };
 
+  const applySavedSkin = async (textureKey: string): Promise<void> => {
+    await api('POST', `/skins/${textureKey}/apply`);
+    onApplied();
+    setSelectedKey(textureKey);
+    refresh();
+  };
+
   const applySkin = async (textureKey: string): Promise<void> => {
     const skin = skins.find((saved) => saved.texture_key === textureKey);
     if (skin?.applied_at) return;
@@ -1965,10 +1978,7 @@ function SavedSkinLibrary({
     setApplyKey(textureKey);
     setMessage(null);
     try {
-      await api('POST', `/skins/${textureKey}/apply`);
-      onApplied();
-      setSelectedKey(textureKey);
-      refresh();
+      await applySavedSkin(textureKey);
       setMessage({ tone: 'ok', text: 'Skin applied to Minecraft profile.' });
     } catch (err) {
       setMessage({
@@ -2034,13 +2044,18 @@ function SavedSkinLibrary({
     if (uploadDragDepthRef.current === 0) setUploadDragActive(false);
   };
 
-  const handleUploadFile = (file: File): void => {
+  const handleUploadFile = (file: File, applyAfterSave: boolean): void => {
     if (!isPngFile(file)) {
       setMessage({ tone: 'err', text: 'Upload a PNG skin file.' });
       if (fileInputRef.current) fileInputRef.current.value = '';
       return;
     }
-    void upload(file);
+    void upload(file, applyAfterSave);
+  };
+
+  const openUploadPicker = (applyAfterSave: boolean): void => {
+    uploadApplyAfterSaveRef.current = applyAfterSave;
+    fileInputRef.current?.click();
   };
 
   const uploadActive = uploadDragActive || uploadHover || uploadFocused;
@@ -2073,7 +2088,7 @@ function SavedSkinLibrary({
         >
           <div style={{
             display: 'grid',
-            gridTemplateColumns: 'minmax(220px, 1fr) auto auto',
+            gridTemplateColumns: 'minmax(220px, 1fr) auto auto auto',
             gap: 10,
             alignItems: 'center',
           }}>
@@ -2098,9 +2113,18 @@ function SavedSkinLibrary({
               variant="secondary"
               icon="plus"
               disabled={!canUpload}
-              onClick={() => fileInputRef.current?.click()}
+              onClick={() => openUploadPicker(false)}
             >
               Upload PNG
+            </Button>
+            <Button
+              variant="ghost"
+              icon="check"
+              disabled={!canUpload || !onlineReady}
+              onClick={() => openUploadPicker(true)}
+              title={onlineReady ? 'Save locally, then apply to the active Minecraft account' : 'Online Minecraft account required'}
+            >
+              Upload & apply
             </Button>
           </div>
           <div style={{
@@ -2118,7 +2142,8 @@ function SavedSkinLibrary({
             style={{ display: 'none' }}
             onChange={(event) => {
               const file = event.currentTarget.files?.[0];
-              if (file) handleUploadFile(file);
+              if (file) handleUploadFile(file, uploadApplyAfterSaveRef.current);
+              uploadApplyAfterSaveRef.current = false;
             }}
           />
         </div>
