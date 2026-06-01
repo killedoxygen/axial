@@ -277,7 +277,7 @@ const PERFORMANCE_OPTIONS: Array<ModeOption<PerformanceMode>> = [
 
 const GUARDIAN_OPTIONS: Array<ModeOption<GuardianMode>> = [
   { value: 'managed', label: 'Managed', note: 'Warns and can intervene' },
-  { value: 'custom', label: 'Custom', note: 'Warns without changing choices' },
+  { value: 'custom', label: 'Custom', note: 'Preserves choices; blocks fatal setups' },
 ];
 
 type RulesStatusState =

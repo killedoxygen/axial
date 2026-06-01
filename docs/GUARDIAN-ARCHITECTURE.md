@@ -71,7 +71,7 @@ Policy:
 - `core/minecraft runtime`: discover requested/effective runtimes, report facts, install managed runtime when asked
 - `core/launcher jvm`: compute preset/JVM args from a chosen policy outcome
 - `core/launcher validation`: report why a requested configuration is incompatible
-- `core/launcher healing`: execute recovery plans and format healing summaries
+- `core/launcher healing`: format compatibility and recovery summaries after Guardian-approved actions
 - `apps/api session store`: capture running-process facts, store only bounded startup failure class observations, and preserve Guardian-authored stage telemetry details
 - `frontend`: render the backend-authored Guardian outcome
 
@@ -134,7 +134,7 @@ Guardian should produce one normalized outcome for the pipeline:
 1. Session layer reports observations about exit/stall/log output and stores only Guardian-classified startup failure classes
 2. runner keeps the session observation plumbing and maps `stalled`/`exited` observations into bounded Guardian startup-failure facts
 3. Guardian decides whether startup recovery is allowed
-4. if allowed, Healing executes the recovery plan
+4. if allowed, the launch runner executes the Guardian-approved recovery action and Healing records supporting retry/fallback detail
 5. if not allowed, Guardian converts the startup observation into a blocked message, details, and guidance before the runner emits terminal launch failure status
 
 ## Guardian and Healing
@@ -142,7 +142,7 @@ Healing is narrower than Guardian.
 
 Healing is responsible for:
 - summarizing compatibility adjustments
-- applying approved recovery plans
+- recording supporting retry/fallback summaries for Guardian-approved recovery plans
 - emitting healing events/details for UI/logs
 
 Healing is not supposed to decide:
