@@ -892,7 +892,7 @@
   min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 10px;
 }
 /* On wide cards, set the summary beside the meter so neither side reads empty;
    the bar stays full-width (and wide enough for its axis labels) below this. */
@@ -908,6 +908,29 @@
   .cp-od-perf-meter {
     flex: 1 1 58%;
   }
+}
+.cp-od-perf-meter-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+.cp-od-perf-meter-head span {
+  min-width: 0;
+  color: var(--text-dim);
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.2;
+}
+.cp-od-perf-meter-head strong {
+  flex: 0 0 auto;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.2;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
 }
 .cp-od-perf-summary-mark {
   display: grid;

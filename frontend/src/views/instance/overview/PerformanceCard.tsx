@@ -207,6 +207,10 @@ function fmtHeap(gb: number): string {
   return Number.isInteger(gb) ? String(gb) : gb.toFixed(1);
 }
 
+function heapLabel(minGb: number, maxGb: number): string {
+  return minGb === maxGb ? `${fmtHeap(maxGb)} GB` : `${fmtHeap(minGb)} to ${fmtHeap(maxGb)} GB`;
+}
+
 function MemoryBar({ minGb, maxGb, totalGb }: { minGb: number; maxGb: number; totalGb: number }): JSX.Element {
   const clampFrac = (v: number): number => (Number.isFinite(v) ? Math.max(0, Math.min(1, v)) : 0);
   const maxFrac = clampFrac(maxGb / totalGb);
@@ -432,6 +436,10 @@ export function PerformanceCard({ inst }: { inst: EnrichedInstance }): JSX.Eleme
         </div>
 
         <div class="cp-od-perf-meter">
+          <div class="cp-od-perf-meter-head">
+            <span>Memory allocation</span>
+            <strong>{heapLabel(minMem, maxMem)}</strong>
+          </div>
           <MemoryBar minGb={minMem} maxGb={maxMem} totalGb={totalGb} />
           <div class="cp-od-perf-footer">
             <div class="cp-od-perf-runtime" data-detected={runtimeDetected}>
