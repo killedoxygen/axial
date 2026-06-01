@@ -16,7 +16,7 @@ use croopor_config::validate_username;
 use croopor_minecraft::offline_uuid;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{fmt::Write, io::Cursor};
+use std::{fmt::Write, io::Cursor, sync::OnceLock, time::Duration};
 
 const DEFAULT_HEAD_SIZE: u32 = 64;
 const MIN_HEAD_SIZE: u32 = 16;
@@ -30,6 +30,8 @@ const SAVE_SKIN_FROM_USERNAME_REQUEST_MAX_BYTES: usize = 4 * 1024;
 const MOJANG_PROFILE_RESPONSE_MAX_BYTES: usize = 16 * 1024;
 const MINECRAFT_SESSION_PROFILE_RESPONSE_MAX_BYTES: usize = 64 * 1024;
 const MINECRAFT_SESSION_TEXTURES_PROPERTY_MAX_BYTES: usize = 16 * 1024;
+const MINECRAFT_SKIN_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const MINECRAFT_SKIN_HTTP_TIMEOUT: Duration = Duration::from_secs(25);
 const SKIN_WIDTH: u32 = 64;
 const SKIN_HEIGHT: u32 = 64;
 const LEGACY_SKIN_HEIGHT: u32 = 32;
@@ -691,7 +693,7 @@ struct MinecraftSkinUsernameClient {
 impl MinecraftSkinUsernameClient {
     fn default() -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: minecraft_skin_http_client(),
             profile_endpoint: MOJANG_PROFILE_ENDPOINT.to_string(),
             session_profile_endpoint: MINECRAFT_SESSION_PROFILE_ENDPOINT.to_string(),
         }
@@ -700,7 +702,7 @@ impl MinecraftSkinUsernameClient {
     #[cfg(test)]
     fn with_endpoints(profile_endpoint: String, session_profile_endpoint: String) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: minecraft_skin_http_client(),
             profile_endpoint,
             session_profile_endpoint,
         }
@@ -916,7 +918,7 @@ struct MinecraftSkinTextureClient {
 impl MinecraftSkinTextureClient {
     fn default() -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: minecraft_skin_http_client(),
             allowed_prefix: MINECRAFT_TEXTURE_URL_PREFIX.to_string(),
         }
     }
@@ -924,7 +926,7 @@ impl MinecraftSkinTextureClient {
     #[cfg(test)]
     fn with_allowed_prefix(allowed_prefix: String) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: minecraft_skin_http_client(),
             allowed_prefix,
         }
     }
@@ -994,7 +996,7 @@ struct MinecraftSkinUploadClient {
 impl MinecraftSkinUploadClient {
     fn default() -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: minecraft_skin_http_client(),
             endpoint: MINECRAFT_SKIN_UPLOAD_ENDPOINT.to_string(),
         }
     }
@@ -1002,7 +1004,7 @@ impl MinecraftSkinUploadClient {
     #[cfg(test)]
     fn with_endpoint(endpoint: String) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: minecraft_skin_http_client(),
             endpoint,
         }
     }
@@ -1057,6 +1059,20 @@ impl MinecraftSkinUploadClient {
             .map(AuthLoginMinecraftProfile::from);
         Ok(profile)
     }
+}
+
+fn minecraft_skin_http_client() -> reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .connect_timeout(MINECRAFT_SKIN_HTTP_CONNECT_TIMEOUT)
+                .timeout(MINECRAFT_SKIN_HTTP_TIMEOUT)
+                .user_agent(CROOPOR_USER_AGENT)
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new())
+        })
+        .clone()
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
