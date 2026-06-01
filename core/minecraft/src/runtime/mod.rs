@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use sha1::{Digest as _, Sha1};
 use std::collections::HashMap;
 use std::ffi::OsStr;
+#[cfg(test)]
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -604,17 +605,22 @@ async fn install_managed_runtime(
     let parent_dir = dest_dir.parent().ok_or_else(|| {
         JavaRuntimeLookupError::Download("invalid runtime destination".to_string())
     })?;
-    fs::create_dir_all(parent_dir)
+    async_fs::create_dir_all(parent_dir)
+        .await
         .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
 
     let temp_dir = dest_dir.with_extension("installing");
-    remove_runtime_install_path(&temp_dir)
+    remove_runtime_install_path_async(&temp_dir)
+        .await
         .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
-    remove_runtime_install_path(dest_dir)
+    remove_runtime_install_path_async(dest_dir)
+        .await
         .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
-    fs::create_dir_all(&temp_dir)
+    async_fs::create_dir_all(&temp_dir)
+        .await
         .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
-    fs::write(temp_dir.join(".croopor-installing"), b"installing")
+    async_fs::write(temp_dir.join(".croopor-installing"), b"installing")
+        .await
         .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
 
     let install_result = async {
@@ -656,23 +662,24 @@ async fn install_managed_runtime(
     .await;
 
     if let Err(error) = install_result {
-        let _ = fs::remove_dir_all(&temp_dir);
+        let _ = async_fs::remove_dir_all(&temp_dir).await;
         return Err(error);
     }
 
-    let _ = fs::remove_file(temp_dir.join(".croopor-installing"));
-    if let Err(error) = fs::write(temp_dir.join(".croopor-ready"), b"ready") {
-        let _ = fs::remove_dir_all(&temp_dir);
+    let _ = async_fs::remove_file(temp_dir.join(".croopor-installing")).await;
+    if let Err(error) = async_fs::write(temp_dir.join(".croopor-ready"), b"ready").await {
+        let _ = async_fs::remove_dir_all(&temp_dir).await;
         return Err(JavaRuntimeLookupError::Download(error.to_string()));
     }
-    if let Err(error) = fs::rename(&temp_dir, dest_dir) {
-        let _ = fs::remove_dir_all(&temp_dir);
+    if let Err(error) = async_fs::rename(&temp_dir, dest_dir).await {
+        let _ = async_fs::remove_dir_all(&temp_dir).await;
         return Err(JavaRuntimeLookupError::Download(error.to_string()));
     }
 
     Ok(())
 }
 
+#[cfg(test)]
 fn remove_runtime_install_path(path: &Path) -> std::io::Result<()> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -684,6 +691,20 @@ fn remove_runtime_install_path(path: &Path) -> std::io::Result<()> {
         fs::remove_dir_all(path)
     } else {
         fs::remove_file(path)
+    }
+}
+
+async fn remove_runtime_install_path_async(path: &Path) -> std::io::Result<()> {
+    let metadata = match async_fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+
+    if metadata.is_dir() {
+        async_fs::remove_dir_all(path).await
+    } else {
+        async_fs::remove_file(path).await
     }
 }
 
@@ -1379,7 +1400,8 @@ mod tests {
         RuntimeDownloadIntegrityError, RuntimeInstallState, component_manifest_destination,
         detect_distribution, detect_runtime_state, ensure_java_runtime, fetch_runtime_file,
         fetch_runtime_json, install_runtime_manifest_file, java_executable,
-        plan_runtime_manifest_files, remove_runtime_install_path, runtime_download_client,
+        plan_runtime_manifest_files, remove_runtime_install_path,
+        remove_runtime_install_path_async, runtime_download_client,
         runtime_file_download_concurrency_for, runtime_install_lock_from_map,
         verify_runtime_download,
     };
@@ -1732,6 +1754,42 @@ mod tests {
         let root = unique_temp_root("croopor-runtime-cleanup-missing-test");
 
         remove_runtime_install_path(&root).expect("missing runtime path is clean");
+
+        assert!(!root.exists());
+    }
+
+    #[tokio::test]
+    async fn async_runtime_install_cleanup_removes_stale_directory_destination() {
+        let root = unique_temp_root("croopor-runtime-async-cleanup-dir-test");
+        fs::create_dir_all(root.join("bin")).expect("create stale runtime dir");
+        fs::write(root.join("bin").join("java"), b"stale").expect("write stale java");
+
+        remove_runtime_install_path_async(&root)
+            .await
+            .expect("remove stale runtime dir");
+
+        assert!(!root.exists());
+    }
+
+    #[tokio::test]
+    async fn async_runtime_install_cleanup_removes_stale_file_destination() {
+        let root = unique_temp_root("croopor-runtime-async-cleanup-file-test");
+        fs::write(&root, b"blocking file").expect("write stale runtime file");
+
+        remove_runtime_install_path_async(&root)
+            .await
+            .expect("remove stale runtime file");
+
+        assert!(!root.exists());
+    }
+
+    #[tokio::test]
+    async fn async_runtime_install_cleanup_accepts_missing_destination() {
+        let root = unique_temp_root("croopor-runtime-async-cleanup-missing-test");
+
+        remove_runtime_install_path_async(&root)
+            .await
+            .expect("missing runtime path is clean");
 
         assert!(!root.exists());
     }
