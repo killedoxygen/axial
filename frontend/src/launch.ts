@@ -485,15 +485,13 @@ export async function launchGame(): Promise<void> {
       return;
     }
 
-    updateLaunchPrep(inst.id, 72, 'Starting Minecraft', 'starting');
     const launchedAt = res.launched_at || new Date().toISOString();
     const allocatedMB = selectedLaunchMaxMemoryMB(res, launchInst, cfg);
-    updateLaunchPrep(inst.id, 88, 'Stabilizing startup', 'monitoring');
     confirmLaunch(inst.id, {
       sessionId: res.session_id,
       versionId: launchInst.version_id,
       pid: typeof res.pid === 'number' ? res.pid : 0,
-      state: 'monitoring',
+      state: typeof res.state === 'string' ? res.state : 'queued',
       launchedAt,
       allocatedMB,
       benchmark: res.benchmark,
@@ -502,17 +500,21 @@ export async function launchGame(): Promise<void> {
     });
     launchCommitted = true;
     surfaceLaunchOutcome(res.guardian, res.healing, inst.id, inst.name);
-    
+
     Music.suppress();
-    Sound.ui('launchSuccess');
+    let launchStarted = false;
     try {
-      await connectLaunchEvents(res.session_id, inst.id, inst.name);
+      await connectLaunchEvents(res.session_id, inst.id, inst.name, () => {
+        if (launchStarted) return;
+        launchStarted = true;
+        Sound.ui('launchSuccess');
+        updateInstanceInList({ ...launchInst, last_played_at: launchedAt });
+      });
     } catch (err: unknown) {
-      showError(`Game launched, but live updates failed: ${errMessage(err)}`);
+      showError(`Launch session started, but live updates failed: ${errMessage(err)}`);
       appendLog('system', `Live updates unavailable for ${inst.name}; stop detection may be delayed.`, inst.id, inst.name);
     }
 
-    updateInstanceInList({ ...launchInst, last_played_at: launchedAt });
     if (config.value) {
       config.value = {
         ...config.value,
@@ -587,7 +589,12 @@ function makeLaunchStatusPoller(
   return handle;
 }
 
-async function connectLaunchEvents(sessionId: string, instanceId: string, instanceName: string): Promise<void> {
+async function connectLaunchEvents(
+  sessionId: string,
+  instanceId: string,
+  instanceName: string,
+  onStarted?: () => void,
+): Promise<void> {
   const onStatus = (data: any, handle: { close(): void }): void => {
     const session = runningSessions.value[instanceId];
     const prep = launchState.value;
@@ -603,6 +610,7 @@ async function connectLaunchEvents(sessionId: string, instanceId: string, instan
         guardian: data.guardian || session.guardian,
       });
     }
+    if (data.state === 'running') onStarted?.();
     if (data.state === 'exited') onGameExited(data, instanceId, instanceName, sessionId, handle);
   };
 

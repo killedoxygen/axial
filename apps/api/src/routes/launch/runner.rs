@@ -858,7 +858,6 @@ async fn fail_launch(
     .await;
     persist_launch_proof_best_effort_with_context(state, session_id, None, "failed", proof_context)
         .await;
-    state.sessions().remove(session_id).await;
     LaunchRequestError {
         message: public_message,
         healing,
@@ -1247,7 +1246,13 @@ mod tests {
         assert_safe_live_launch_failure_text(&failure_detail);
         assert!(failure_detail.contains("Detailed diagnostics were hidden"));
 
-        assert!(state.sessions().get(session_id).await.is_none());
+        let record = state
+            .sessions()
+            .get(session_id)
+            .await
+            .expect("terminal failure session record");
+        assert_eq!(record.state, LaunchState::Exited);
+        assert!(record.failure.is_some());
         let _ = fs::remove_dir_all(root);
     }
 

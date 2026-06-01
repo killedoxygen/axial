@@ -78,21 +78,21 @@ flowchart TD
     C --> D[apps/api routes/launch/task.rs validates request and builds LaunchIntent]
     D --> E[Create LaunchGuardianContext from config + instance overrides]
     E --> F[Reserve queued session in SessionStore]
-    F --> G[routes/launch/runner.rs starts synchronous launch flow]
-    G --> H[emit status: validating]
+    F --> G[normal route returns queued session id + launch metadata]
+    F --> H[spawn routes/launch/runner.rs launch flow]
     H --> I[core/launcher service prepares attempt]
     I --> J[resolve version metadata]
     J --> K[emit runtime ensure/download statuses while runtime work runs]
     K --> L[collect runtime facts and effective runtime candidate]
     L --> M[Guardian-driven pre-launch decision]
-    M -->|block| N[return HTTP error with guardian + healing]
+    M -->|block| N[emit terminal failure with guardian + healing]
     M -->|intervene| O[mutate attempt overrides and re-run prepare]
     M -->|allow| P[plan launch command]
     O --> I
     P --> Q[spawn process via SessionStore]
     Q --> R[emit starting + monitoring status]
     R --> S[wait_for_startup observation window]
-    S -->|stable or timed out| T[return HTTP success with pid + guardian + healing]
+    S -->|stable or timed out| T[emit running status with pid + guardian + healing]
     S -->|stalled or exited| U[collect failure observations]
     U --> V[Guardian decides whether startup recovery or a blocked startup summary is allowed]
     V -->|recover| W[apply one startup recovery plan and retry]
@@ -125,11 +125,11 @@ flowchart TD
     O --> P[PreparedLaunchAttempt]
 ```
 
-Effective launch memory selection is backend-owned at launch request time. Per-instance memory values remain the highest-precedence explicit selection, explicit launch request memory remains next, and customized global config memory remains the global default. Fresh instances whose global config still has the built-in memory pair use launch-time host total RAM and the current version target to derive defaults before the Guardian/resource-budget snapshot is recorded: legacy vanilla targets use a smaller allocation, modern vanilla targets use the standard allocation, and loader/modded targets use a larger allocation, all bounded by the launcher OS-headroom policy when host memory evidence is available. Successful launch responses include the effective `max_memory_mb` and `min_memory_mb` selected by backend preparation so the frontend can record the running session allocation without recomputing memory policy locally.
+Effective launch memory selection is backend-owned at launch request time. Per-instance memory values remain the highest-precedence explicit selection, explicit launch request memory remains next, and customized global config memory remains the global default. Fresh instances whose global config still has the built-in memory pair use launch-time host total RAM and the current version target to derive defaults before the Guardian/resource-budget snapshot is recorded: legacy vanilla targets use a smaller allocation, modern vanilla targets use the standard allocation, and loader/modded targets use a larger allocation, all bounded by the launcher OS-headroom policy when host memory evidence is available. Normal launch responses return as soon as a queued session exists and include the session id, `state: "queued"`, `pid: null`, launch timestamp, Guardian summary, and the effective `max_memory_mb` and `min_memory_mb` selected by backend preparation so the frontend can subscribe to live events before runtime preparation starts and record the running session allocation without recomputing memory policy locally. Benchmark launch routes still await the runner and return the normal post-spawn success payload plus benchmark metadata.
 
 Launch preparation emits live status observations while runtime resolution is running: `ensuring_runtime` after version resolution and before runtime selection begins, and `downloading_runtime` immediately before the task that owns a missing managed Java runtime install enters the install path. These are status events on the existing session stream, not a new frontend workflow or per-file runtime download progress channel. A concurrent launch waiting on the same runtime install lock can remain at `ensuring_runtime` until the owning install completes.
 
-When Guardian blocks a launch before a process is available, the launch, benchmark launch, and benchmark suite launch routes return HTTP `422 Unprocessable Entity` with the normal bounded launch-error JSON (`error`, optional `healing`, optional `guardian`). This keeps a deliberate Guardian safety block distinct from an internal API failure, while non-Guardian launch request failures remain HTTP `500` unless a more specific route-level status applies.
+When Guardian blocks a launch before a process is available, benchmark launch and benchmark suite launch routes return HTTP `422 Unprocessable Entity` with the normal bounded launch-error JSON (`error`, optional `healing`, optional `guardian`). Normal launches have already returned the queued session response by that point, so the runner emits the same bounded Guardian/Healing failure through the session log/status stream and leaves a terminal session snapshot available through `/api/v1/launch/{id}/status`. Pre-session validation errors from the normal launch route still return their route-level HTTP errors before any session id is created. This keeps a deliberate Guardian safety block distinct from an internal API failure, while non-Guardian launch request failures remain HTTP `500` unless a more specific route-level status applies.
 
 The API exposes `GET /api/v1/launch/preflight/{instance_id}` as a read-only backend-authored Guardian preflight. The endpoint validates the configured library and instance existence, captures launch-preparation facts for Guardian mode, override origins, effective memory, selected-memory bounds, resource pressure, Custom-mode risky overrides, and no-download local launch-readiness diagnostics, then lets Guardian produce the warning summary and copy. It returns only bounded JSON facts: Guardian summary, effective memory, override origins/booleans, scalar resource pressure, and additive readiness state with stable reason ids such as missing installed version metadata, client jar, libraries, asset index, managed runtime, or explicit Java override. It never creates a launch session, starts Minecraft, installs files, ensures instance layout, writes proof state, probes Java by spawning a process, or exposes filesystem paths, command lines, raw JVM args, account names, usernames, or tokens. The current InstanceDetail overview does not render a persistent preflight panel; it keeps launch safety user-facing through launch/install affordances and backend-authored launch outcome notices.
 
@@ -173,7 +173,7 @@ flowchart TD
     B --> C[POST /launch]
     C --> D{HTTP result}
     D -->|error| E[render guardian/healing failure notice]
-    D -->|success| F[store running session]
+    D -->|queued session| F[store running session shell]
     F --> G[connect SSE or Tauri event stream]
     G --> H[status updates patch launch prep and runningSessions]
     G --> I[log updates append launch log]
@@ -182,7 +182,7 @@ flowchart TD
     J -->|yes| L[render terminal notice and clear session]
 ```
 
-Before `/launch` returns a session id, the frontend uses a bounded local launch-stage placeholder sequence from the same stage vocabulary. Those placeholders are conservative estimates only; backend status events replace them as soon as a session exists. Normal frontend launches post the instance id, username, and client start timestamp; memory warnings and effective memory selection are backend/Guardian authority.
+Before `/launch` returns a session id, the frontend uses a bounded local launch-stage placeholder sequence from the same stage vocabulary. Those placeholders are conservative estimates only; the normal route now returns immediately after the queued session is inserted, and backend status events drive the visible session state and pid from that point forward. Normal frontend launches post the instance id, username, and client start timestamp; memory warnings and effective memory selection are backend/Guardian authority.
 
 ### Config/settings flow
 ```mermaid

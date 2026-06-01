@@ -119,11 +119,23 @@ async fn handle_launch(
     Json(payload): Json<task::LaunchRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let prepared = task::prepare_launch_session(&state, payload).await?;
-    let launched = runner::launch_session(state.clone(), prepared.task)
-        .await
-        .map_err(launch_request_error_response)?;
+    let response = launch_prepared_response_payload(&prepared.task);
+    spawn_launch_session(state, prepared.task);
 
-    Ok(Json(launch_success_response_payload(&launched)))
+    Ok(Json(response))
+}
+
+fn spawn_launch_session(state: AppState, task: task::LaunchSessionTask) {
+    let session_id = task.intent.session_id.clone();
+    tokio::spawn(async move {
+        if let Err(error) = runner::launch_session(state, task).await {
+            tracing::warn!(
+                session_id,
+                error = %error.message,
+                "background launch session ended with terminal error"
+            );
+        }
+    });
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1004,6 +1016,21 @@ fn launch_success_response_payload(launched: &runner::LaunchSuccess) -> serde_js
         "min_memory_mb": launched.min_memory_mb,
         "healing": &launched.healing,
         "guardian": &launched.guardian,
+    })
+}
+
+fn launch_prepared_response_payload(task: &task::LaunchSessionTask) -> serde_json::Value {
+    json!({
+        "status": "launching",
+        "state": "queued",
+        "session_id": &task.intent.session_id,
+        "instance_id": &task.intent.instance_id,
+        "pid": null,
+        "launched_at": &task.launched_at,
+        "max_memory_mb": task.intent.max_memory_mb,
+        "min_memory_mb": task.intent.min_memory_mb,
+        "healing": null,
+        "guardian": &task.guardian,
     })
 }
 
@@ -2264,8 +2291,11 @@ mod tests {
         body::{Body, to_bytes},
         http::Request,
     };
-    use croopor_config::{AppPaths, ConfigStore, InstanceStore};
-    use croopor_launcher::{LaunchSessionRecord, LaunchStageRecord, LaunchState, SessionId};
+    use croopor_config::{AppConfig, AppPaths, ConfigStore, Instance, InstanceStore};
+    use croopor_launcher::{
+        GuardianMode, GuardianSummary, LaunchAuthContext, LaunchGuardianContext, LaunchIntent,
+        LaunchSessionRecord, LaunchStageRecord, LaunchState, SessionId,
+    };
     use croopor_performance::PerformanceManager;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -2326,6 +2356,29 @@ mod tests {
         assert_eq!(payload["status"], serde_json::json!("launching"));
         assert_eq!(payload["max_memory_mb"], serde_json::json!(6144));
         assert_eq!(payload["min_memory_mb"], serde_json::json!(1024));
+    }
+
+    #[test]
+    fn launch_prepared_response_payload_exposes_queued_session_metadata() {
+        let task = test_launch_session_task();
+        let payload = launch_prepared_response_payload(&task);
+
+        assert_eq!(payload["status"], serde_json::json!("launching"));
+        assert_eq!(payload["state"], serde_json::json!("queued"));
+        assert_eq!(payload["session_id"], serde_json::json!("session-queued"));
+        assert_eq!(payload["instance_id"], serde_json::json!("instance-queued"));
+        assert_eq!(payload["pid"], serde_json::Value::Null);
+        assert_eq!(
+            payload["launched_at"],
+            serde_json::json!("2026-05-30T00:00:00Z")
+        );
+        assert_eq!(payload["max_memory_mb"], serde_json::json!(6144));
+        assert_eq!(payload["min_memory_mb"], serde_json::json!(1024));
+        assert_eq!(payload["healing"], serde_json::Value::Null);
+        assert_eq!(
+            payload["guardian"]["decision"],
+            serde_json::json!("allowed")
+        );
     }
 
     #[test]
@@ -5564,6 +5617,54 @@ mod tests {
             healing: None,
             guardian: None,
             stages: Vec::new(),
+        }
+    }
+
+    fn test_launch_session_task() -> task::LaunchSessionTask {
+        task::LaunchSessionTask {
+            instance: Instance {
+                id: "instance-queued".to_string(),
+                name: "Queued Instance".to_string(),
+                version_id: "1.21.1".to_string(),
+                created_at: "2026-05-01T00:00:00Z".to_string(),
+                last_played_at: String::new(),
+                art_seed: 0,
+                art_preset: String::new(),
+                max_memory_mb: 6144,
+                min_memory_mb: 1024,
+                java_path: String::new(),
+                window_width: 0,
+                window_height: 0,
+                jvm_preset: String::new(),
+                performance_mode: "managed".to_string(),
+                extra_jvm_args: String::new(),
+                icon: String::new(),
+                accent: String::new(),
+            },
+            config: AppConfig::default(),
+            intent: LaunchIntent {
+                session_id: "session-queued".to_string(),
+                library_dir: PathBuf::from("/tmp/croopor-test-library"),
+                instance_id: "instance-queued".to_string(),
+                version_id: "1.21.1".to_string(),
+                username: "Player".to_string(),
+                auth: LaunchAuthContext::offline("Player"),
+                requested_java: String::new(),
+                requested_preset: String::new(),
+                extra_jvm_args: Vec::new(),
+                max_memory_mb: 6144,
+                min_memory_mb: 1024,
+                resolution: None,
+                launcher_name: "croopor".to_string(),
+                launcher_version: "test".to_string(),
+                game_dir: None,
+                guardian: LaunchGuardianContext::default(),
+                performance_mode: "managed".to_string(),
+            },
+            guardian: GuardianSummary::new(GuardianMode::Managed),
+            launched_at: "2026-05-30T00:00:00Z".to_string(),
+            benchmark: None,
+            resource_budget: None,
         }
     }
 }
