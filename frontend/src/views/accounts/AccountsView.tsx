@@ -110,6 +110,7 @@ type OfflineProfileState = 'loading' | 'ready' | 'unavailable';
 type AuthStatusState = 'loading' | 'ready' | 'unavailable';
 type CopyTarget = 'code' | 'url';
 type SkinVariant = 'classic' | 'slim';
+type UploadSkinVariant = SkinVariant | 'auto';
 type SavedSkinPreviewSide = 'front' | 'back';
 
 interface SavedSkinRecord {
@@ -576,6 +577,41 @@ function isPngFile(file: File): boolean {
   const type = file.type.trim().toLowerCase();
   if (type) return type === 'image/png';
   return file.name.toLowerCase().endsWith('.png');
+}
+
+async function detectSkinVariantFromPng(file: File): Promise<SkinVariant> {
+  const url = URL.createObjectURL(file);
+  try {
+    const image = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const next = new Image();
+      next.onload = () => resolve(next);
+      next.onerror = () => reject(new Error('Could not inspect skin image.'));
+      next.src = url;
+    });
+
+    if (image.width < 64 || image.height < 64) return 'classic';
+
+    const canvas = document.createElement('canvas');
+    canvas.width = image.width;
+    canvas.height = image.height;
+    const context = canvas.getContext('2d', { willReadFrequently: true });
+    if (!context) return 'classic';
+
+    context.drawImage(image, 0, 0);
+    const armAlpha = context.getImageData(54, 20, 2, 12).data;
+    for (let index = 3; index < armAlpha.length; index += 4) {
+      if (armAlpha[index] !== 0) return 'classic';
+    }
+    return 'slim';
+  } catch {
+    return 'classic';
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+async function resolveUploadSkinVariant(file: File, value: UploadSkinVariant): Promise<SkinVariant> {
+  return value === 'auto' ? detectSkinVariantFromPng(file) : value;
 }
 
 function minecraftProfile(value: unknown): MinecraftProfile | undefined {
@@ -1815,7 +1851,7 @@ function SavedSkinLibrary({
   const { skins, state, error, refresh } = useSavedSkins();
   const [skinName, setSkinName] = useState('');
   const [lookupUsername, setLookupUsername] = useState('');
-  const [variant, setVariant] = useState<SkinVariant>('classic');
+  const [uploadVariant, setUploadVariant] = useState<UploadSkinVariant>('auto');
   const [busy, setBusy] = useState(false);
   const [profileBusy, setProfileBusy] = useState(false);
   const [lookupBusy, setLookupBusy] = useState(false);
@@ -1879,7 +1915,8 @@ function SavedSkinLibrary({
     setBusy(true);
     setMessage(null);
     try {
-      const params = new URLSearchParams({ name, variant });
+      const resolvedVariant = await resolveUploadSkinVariant(file, uploadVariant);
+      const params = new URLSearchParams({ name, variant: resolvedVariant });
       const response = await fetch(apiUrl(`/skins?${params.toString()}`), {
         method: 'POST',
         headers: { 'Content-Type': 'image/png' },
@@ -2173,13 +2210,14 @@ function SavedSkinLibrary({
               placeholder="Skin name, optional"
               icon="tag"
             />
-            <Segmented<SkinVariant>
+            <Segmented<UploadSkinVariant>
               options={[
+                { value: 'auto', label: 'Auto' },
                 { value: 'classic', label: 'Classic' },
                 { value: 'slim', label: 'Slim' },
               ]}
-              value={variant}
-              onChange={setVariant}
+              value={uploadVariant}
+              onChange={setUploadVariant}
             />
             <Button
               variant="secondary"
