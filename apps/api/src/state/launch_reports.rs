@@ -316,13 +316,35 @@ pub fn persist_record_with_context(
     let mut proof = build_record(record, launched_at, outcome, context);
     proof.comparison = build_local_comparison(paths, &proof)?;
     let path = report_path(paths, &record.session_id.0);
+    write_json_file(&path, &proof)?;
+    Ok(proof)
+}
+
+fn write_json_file<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let data = serde_json::to_string_pretty(&proof)
+    let data = serde_json::to_string_pretty(value)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    fs::write(path, data)?;
-    Ok(proof)
+    let temp_path = path.with_extension("json.tmp");
+    fs::write(&temp_path, data)?;
+    replace_file(&temp_path, path)
+}
+
+fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
+    if fs::rename(source, destination).is_ok() {
+        return Ok(());
+    }
+    if destination.exists() {
+        let _ = fs::remove_file(destination);
+    }
+    match fs::rename(source, destination) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = fs::remove_file(source);
+            Err(error)
+        }
+    }
 }
 
 pub fn list_recent(paths: &AppPaths, limit: usize) -> io::Result<Vec<LaunchProofRecord>> {
@@ -1128,6 +1150,16 @@ mod tests {
         let second = persist_record(&paths, &test_record("second"), None, "running")
             .expect("persist second report");
 
+        assert!(
+            !report_path(&paths, "first")
+                .with_extension("json.tmp")
+                .exists()
+        );
+        assert!(
+            !report_path(&paths, "second")
+                .with_extension("json.tmp")
+                .exists()
+        );
         assert_eq!(first_proof.schema, LAUNCH_PROOF_SCHEMA);
         assert_eq!(first_proof.schema_version, LAUNCH_PROOF_SCHEMA_VERSION);
         assert_eq!(
