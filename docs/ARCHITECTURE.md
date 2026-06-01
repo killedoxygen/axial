@@ -208,6 +208,8 @@ flowchart TD
     F --> G[frontend refreshes versions/catalog/instance state]
 ```
 
+Loader installs resolve strategy data in `core/minecraft/src/loaders/strategies/`. Installer jars, legacy archives, and profile JSON sources are cached under `cache/loaders/artifacts/<component>/<minecraft-version>/` with temp-file promotion before use. Fabric/Quilt profile JSON caches are parsed as the current `LoaderProfileFragment` shape before reuse; corrupt cached profiles are removed and replaced from the provider, while invalid fresh provider profiles are rejected without being cached.
+
 ### Version and lifecycle pipeline
 ```mermaid
 flowchart TD

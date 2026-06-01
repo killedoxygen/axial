@@ -26,6 +26,12 @@ struct CachedArtifact {
     cache_hit: bool,
 }
 
+#[derive(Debug)]
+struct CachedProfile {
+    bytes: Vec<u8>,
+    fragment: LoaderProfileFragment,
+}
+
 pub async fn install_from_profile_source<F>(
     library_dir: &Path,
     plan: &LoaderInstallPlan,
@@ -41,9 +47,15 @@ where
         1,
         Some("Fetching loader profile...".to_string()),
     ));
-    let profile_bytes = download_to_memory(profile_url).await?;
-    let fragment = serde_json::from_slice::<LoaderProfileFragment>(&profile_bytes)
-        .map_err(|error| LoaderError::InvalidProfile(error.to_string()))?;
+    let profile_cache_path = cached_profile_path(library_dir, &plan.record);
+    let cached_profile = read_valid_profile_json(
+        &profile_cache_path,
+        profile_url,
+        &plan.record.component_name,
+    )
+    .await?;
+    let profile_bytes = cached_profile.bytes;
+    let fragment = cached_profile.fragment;
     let installed_version_id = if fragment.id.trim().is_empty() {
         plan.record.version_id.clone()
     } else {
@@ -416,6 +428,35 @@ async fn download_to_memory(url: &str) -> Result<Vec<u8>, LoaderError> {
     fetch_bytes(url, MAX_INSTALLER_DOWNLOAD_SIZE).await
 }
 
+async fn read_valid_profile_json(
+    path: &Path,
+    url: &str,
+    component_name: &str,
+) -> Result<CachedProfile, LoaderError> {
+    if path_is_file(path).await {
+        let bytes = async_fs::read(path).await?;
+        match parse_profile_json(&bytes, component_name) {
+            Ok(fragment) => return Ok(CachedProfile { bytes, fragment }),
+            Err(_) => {
+                let _ = async_fs::remove_file(path).await;
+            }
+        }
+    }
+
+    let bytes = download_to_memory(url).await?;
+    let fragment = parse_profile_json(&bytes, component_name)?;
+    let _ = write_cached_artifact(path, &bytes).await;
+    Ok(CachedProfile { bytes, fragment })
+}
+
+fn parse_profile_json(
+    bytes: &[u8],
+    component_name: &str,
+) -> Result<LoaderProfileFragment, LoaderError> {
+    serde_json::from_slice::<LoaderProfileFragment>(bytes)
+        .map_err(|error| LoaderError::InvalidProfile(format!("{component_name} profile: {error}")))
+}
+
 async fn read_or_download_cached_artifact(
     path: &Path,
     url: &str,
@@ -552,6 +593,13 @@ fn cached_installer_path(library_dir: &Path, record: &LoaderBuildRecord) -> Path
         .join(format!("{}-installer.jar", record.loader_version))
 }
 
+fn cached_profile_path(library_dir: &Path, record: &LoaderBuildRecord) -> PathBuf {
+    loader_artifacts_dir(library_dir)
+        .join(record.component_id.short_key())
+        .join(&record.minecraft_version)
+        .join(format!("{}-profile.json", record.loader_version))
+}
+
 fn cached_legacy_archive_path(library_dir: &Path, record: &LoaderBuildRecord) -> PathBuf {
     loader_artifacts_dir(library_dir)
         .join(record.component_id.short_key())
@@ -585,9 +633,13 @@ fn done() -> DownloadProgress {
 mod tests {
     use super::{
         cleanup_on_error, promote_cached_artifact_tmp, read_valid_legacy_archive,
-        write_cached_artifact,
+        read_valid_profile_json, write_cached_artifact,
     };
     use crate::loaders::types::LoaderError;
+    use crate::loaders::types::{
+        LoaderArtifactKind, LoaderBuildMetadata, LoaderBuildRecord, LoaderBuildSubjectKind,
+        LoaderComponentId, LoaderInstallSource, LoaderInstallStrategy, LoaderInstallability,
+    };
     use crate::loaders::validate_version_id;
     use crate::paths::versions_dir;
     use std::fs;
@@ -705,6 +757,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cached_valid_profile_is_used_when_provider_is_unavailable() {
+        let root = temp_dir("profile-cache-offline");
+        let path = root.join("artifacts/fabric/1.21.5/0.16.14-profile.json");
+        fs::create_dir_all(path.parent().expect("profile parent")).expect("profile parent");
+        fs::write(&path, profile_json("cached-profile")).expect("cached profile");
+
+        let profile = read_valid_profile_json(&path, "http://127.0.0.1:9/profile/json", "Fabric")
+            .await
+            .expect("cached profile");
+
+        assert_eq!(profile.fragment.id, "cached-profile");
+        assert_eq!(profile.bytes, profile_json("cached-profile"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn corrupt_cached_profile_is_removed_and_replaced_from_provider() {
+        let root = temp_dir("profile-cache-corrupt");
+        let path = root.join("artifacts/fabric/1.21.5/0.16.14-profile.json");
+        fs::create_dir_all(path.parent().expect("profile parent")).expect("profile parent");
+        fs::write(&path, b"{not-json").expect("corrupt cached profile");
+        let fresh = profile_json("fresh-profile");
+        let server = TestByteServer::start(fresh.clone());
+
+        let profile = read_valid_profile_json(&path, &server.url, "Fabric")
+            .await
+            .expect("fresh profile");
+
+        assert_eq!(profile.fragment.id, "fresh-profile");
+        assert_eq!(fs::read(&path).expect("cached fresh profile"), fresh);
+        assert_eq!(server.request_count(), 1);
+
+        server.stop();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn fresh_invalid_profile_is_not_cached() {
+        let root = temp_dir("profile-cache-invalid-fresh");
+        let path = root.join("artifacts/fabric/1.21.5/0.16.14-profile.json");
+        let server = TestByteServer::start(b"{not-json".to_vec());
+
+        let error = read_valid_profile_json(&path, &server.url, "Fabric")
+            .await
+            .expect_err("invalid provider profile");
+
+        match error {
+            LoaderError::InvalidProfile(message) => {
+                assert!(message.starts_with("Fabric profile: "), "{message}");
+                assert!(!message.contains(&server.url), "{message}");
+            }
+            error => panic!("expected invalid profile error, got {error:?}"),
+        }
+        assert_eq!(server.request_count(), 1);
+        assert!(!path.exists());
+
+        server.stop();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn fresh_valid_profile_survives_cache_write_failure() {
+        let root = temp_dir("profile-cache-write-failure");
+        let path = root.join("artifacts/fabric/1.21.5/0.16.14-profile.json");
+        fs::create_dir_all(&path).expect("blocking profile cache directory");
+        let fresh = profile_json("fresh-profile");
+        let server = TestByteServer::start(fresh.clone());
+
+        let profile = read_valid_profile_json(&path, &server.url, "Fabric")
+            .await
+            .expect("fresh profile should win over cache persistence failure");
+
+        assert_eq!(profile.fragment.id, "fresh-profile");
+        assert_eq!(profile.bytes, fresh);
+        assert!(path.is_dir());
+        assert_eq!(server.request_count(), 1);
+
+        server.stop();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cached_profile_path_is_component_and_version_scoped() {
+        let root = PathBuf::from("/library");
+        let path = super::cached_profile_path(&root, &profile_record());
+
+        assert_eq!(
+            path,
+            root.join("cache")
+                .join("loaders")
+                .join("artifacts")
+                .join("fabric")
+                .join("1.21.5")
+                .join("0.16.14-profile.json")
+        );
+    }
+
+    #[tokio::test]
     async fn cached_legacy_archive_corruption_fetches_provider_once() {
         let root = temp_dir("legacy-archive-corrupt-cache");
         let path = root.join("artifacts/forge/1.2.4/2.0.0.68-client.zip");
@@ -785,6 +936,30 @@ mod tests {
             .finish()
             .expect("finish empty zip");
         cursor.into_inner()
+    }
+
+    fn profile_json(id: &str) -> Vec<u8> {
+        format!(r#"{{"id":"{id}","mainClass":"net.fabricmc.loader.impl.launch.knot.KnotClient"}}"#)
+            .into_bytes()
+    }
+
+    fn profile_record() -> LoaderBuildRecord {
+        LoaderBuildRecord {
+            subject_kind: LoaderBuildSubjectKind::LoaderBuild,
+            component_id: LoaderComponentId::Fabric,
+            component_name: "Fabric".to_string(),
+            build_id: "fabric-1.21.5-0.16.14".to_string(),
+            minecraft_version: "1.21.5".to_string(),
+            loader_version: "0.16.14".to_string(),
+            version_id: "fabric-loader-0.16.14-1.21.5".to_string(),
+            build_meta: LoaderBuildMetadata::default(),
+            strategy: LoaderInstallStrategy::FabricProfile,
+            artifact_kind: LoaderArtifactKind::ProfileJson,
+            installability: LoaderInstallability::Installable,
+            install_source: LoaderInstallSource::ProfileJson {
+                url: "https://meta.fabricmc.net/profile/json".to_string(),
+            },
+        }
     }
 
     struct TestByteServer {
