@@ -1621,6 +1621,10 @@ function PerformanceSection(): JSX.Element {
   }, []);
 
   useEffect(() => {
+    if (!isDev) {
+      setLaunchReports({ status: 'ready', data: [] });
+      return;
+    }
     let alive = true;
     setLaunchReports({ status: 'loading', data: [] });
     api('GET', '/launch/reports')
@@ -1635,7 +1639,7 @@ function PerformanceSection(): JSX.Element {
         setLaunchReports((prev) => ({ status: 'error', data: prev.data, error: errMessage(err) }));
       });
     return () => { alive = false; };
-  }, []);
+  }, [isDev]);
 
   useEffect(() => {
     if (!isDev) return;
@@ -1727,7 +1731,6 @@ function PerformanceSection(): JSX.Element {
           onChange={changePerformance}
         />
         <PerformanceRulesStatusBlock state={rulesStatus} />
-        <LaunchProofHistoryBlock state={launchReports} />
       </SettingsCard>
       {isDev && (
         <SettingsCard
@@ -1735,6 +1738,7 @@ function PerformanceSection(): JSX.Element {
           desc="Developer-only benchmark descriptors, qualification evidence, and suite drivers."
           stack
         >
+          <LaunchProofHistoryBlock state={launchReports} />
           <BenchmarkMatrixBlock state={benchmarkMatrix} />
           <BenchmarkQualificationPreviewBlock state={qualificationPreview} />
           <BenchmarkSuiteDriversBlock matrixState={benchmarkMatrix} />
