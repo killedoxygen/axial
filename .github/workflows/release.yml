@@ -34,6 +34,27 @@ jobs:
           cache: pnpm
           cache-dependency-path: frontend/pnpm-lock.yaml
 
+      - name: Verify release version coherence
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if [ "$TAG_VERSION" = "$GITHUB_REF_NAME" ] || [ -z "$TAG_VERSION" ]; then
+            echo "Release tags must be named v<version>; got '$GITHUB_REF_NAME'." >&2
+            exit 1
+          fi
+
+          CARGO_VERSION="$(sed -n '/^\[workspace.package\]/,/^\[/{s/^version = "\(.*\)"/\1/p}' Cargo.toml)"
+          TAURI_VERSION="$(node -p "require('./apps/desktop/tauri.conf.json').version")"
+
+          if [ "$CARGO_VERSION" != "$TAG_VERSION" ]; then
+            echo "Release tag version '$TAG_VERSION' does not match Cargo workspace version '$CARGO_VERSION'." >&2
+            exit 1
+          fi
+
+          if [ "$TAURI_VERSION" != "$TAG_VERSION" ]; then
+            echo "Release tag version '$TAG_VERSION' does not match Tauri config version '$TAURI_VERSION'." >&2
+            exit 1
+          fi
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
