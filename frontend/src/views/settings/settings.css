@@ -223,6 +223,31 @@
   font-weight: 600;
   line-height: 1.35;
 }
+.cp-settings-rule-details {
+  margin-top: 8px;
+}
+.cp-settings-rule-details summary {
+  width: max-content;
+  max-width: 100%;
+  color: var(--text-mute);
+  font-size: 12px;
+  font-weight: 650;
+  cursor: pointer;
+  list-style-position: inside;
+}
+.cp-settings-rule-details summary:hover {
+  color: var(--text-dim);
+}
+.cp-settings-rule-details summary:focus-visible {
+  outline: 2px solid var(--accent-line);
+  outline-offset: 2px;
+  border-radius: var(--r-sm);
+}
+.cp-settings-rule-details .cp-settings-rule-status-grid {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid color-mix(in oklab, var(--line) 64%, transparent);
+}
 .cp-settings-rule-status-warnings {
   margin-top: 10px;
   display: grid;

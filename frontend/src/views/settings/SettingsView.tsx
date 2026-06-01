@@ -885,15 +885,20 @@ function PerformanceRulesStatusBlock({ state }: { state: RulesStatusState }): JS
         <strong>{channel}</strong>
         <span>Refresh</span>
         <strong>{refresh}</strong>
-        <span>Rules cache</span>
-        <strong>{rulesCacheSummary(status)}</strong>
-        <span>Emergency disables</span>
-        <strong>{emergencyDisableSummary(status)}</strong>
-        <span>Bundle health</span>
-        <strong>{status.health_states.map(healthStateLabel).join(', ')}</strong>
-        <span>Ownership</span>
-        <strong>{status.ownership_classes.map(ownershipLabel).join(', ')}</strong>
       </div>
+      <details class="cp-settings-rule-details">
+        <summary>Rule details</summary>
+        <div class="cp-settings-rule-status-grid">
+          <span>Rules cache</span>
+          <strong>{rulesCacheSummary(status)}</strong>
+          <span>Emergency disables</span>
+          <strong>{emergencyDisableSummary(status)}</strong>
+          <span>Bundle health</span>
+          <strong>{status.health_states.map(healthStateLabel).join(', ')}</strong>
+          <span>Ownership</span>
+          <strong>{status.ownership_classes.map(ownershipLabel).join(', ')}</strong>
+        </div>
+      </details>
       {status.warnings.length > 0 && (
         <div class="cp-settings-rule-status-warnings">
           {status.warnings.map((warning) => <span key={warning}>{warning}</span>)}
