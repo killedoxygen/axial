@@ -65,6 +65,7 @@ impl InstallStore {
     ) -> (String, bool) {
         let key = InstallKey::new(scope, version_id, manifest_url);
         let mut installs = self.installs.write().await;
+        prune_done_entries(&mut installs);
         if let Some(existing_id) = installs.iter().find_map(|(existing_id, entry)| {
             (!entry.done && entry.key.as_ref() == Some(&key)).then(|| existing_id.clone())
         }) {
@@ -77,6 +78,7 @@ impl InstallStore {
 
     async fn insert_entry(&self, install_id: String, key: Option<InstallKey>) {
         let mut installs = self.installs.write().await;
+        prune_done_entries(&mut installs);
         installs.insert(install_id, new_install_entry(key));
     }
 
@@ -132,6 +134,10 @@ fn new_install_entry(key: Option<InstallKey>) -> InstallEntry {
     }
 }
 
+fn prune_done_entries(installs: &mut HashMap<String, InstallEntry>) {
+    installs.retain(|_, entry| !entry.done);
+}
+
 impl Default for InstallStore {
     fn default() -> Self {
         Self::new()
@@ -166,6 +172,55 @@ mod tests {
         assert!(!second_inserted);
         assert_eq!(store.active_install_count().await, 1);
         assert!(store.subscribe("second-install").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn install_insert_prunes_done_entries() {
+        let store = InstallStore::new();
+        store.insert("done-install".to_string()).await;
+        store.insert("active-install".to_string()).await;
+        store.emit("done-install", done_progress()).await;
+
+        store.insert("fresh-install".to_string()).await;
+
+        assert!(store.subscribe("done-install").await.is_none());
+        assert!(store.subscribe("active-install").await.is_some());
+        assert!(store.subscribe("fresh-install").await.is_some());
+        assert_eq!(store.active_install_count().await, 2);
+    }
+
+    #[tokio::test]
+    async fn install_insert_or_existing_prunes_done_entries_and_reuses_active_match() {
+        let store = InstallStore::new();
+        store
+            .insert_or_existing_active(
+                "done-install".to_string(),
+                "1.21.4".to_string(),
+                String::new(),
+            )
+            .await;
+        store
+            .insert_or_existing_active(
+                "active-install".to_string(),
+                "1.21.5".to_string(),
+                String::new(),
+            )
+            .await;
+        store.emit("done-install", done_progress()).await;
+
+        let (install_id, inserted) = store
+            .insert_or_existing_active(
+                "duplicate-active-install".to_string(),
+                "1.21.5".to_string(),
+                String::new(),
+            )
+            .await;
+
+        assert_eq!(install_id, "active-install");
+        assert!(!inserted);
+        assert!(store.subscribe("done-install").await.is_none());
+        assert!(store.subscribe("duplicate-active-install").await.is_none());
+        assert_eq!(store.active_install_count().await, 1);
     }
 
     #[tokio::test]
