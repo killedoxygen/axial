@@ -23,7 +23,7 @@ use futures_util::{StreamExt, stream};
 use sha2::Digest;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 use thiserror::Error;
 use tracing::warn;
@@ -183,7 +183,7 @@ impl PerformanceManager {
     }
 
     pub fn get_plan(&self, request: ResolutionRequest) -> CompositionPlan {
-        let active = self.active.read().expect("performance rules lock poisoned");
+        let active = active_rules_read(&self.active);
         resolve_plan(Some(&active.manifest), request)
     }
 
@@ -312,15 +312,11 @@ impl PerformanceManager {
     }
 
     pub fn manifest(&self) -> crate::types::Manifest {
-        self.active
-            .read()
-            .expect("performance rules lock poisoned")
-            .manifest
-            .clone()
+        active_rules_read(&self.active).manifest.clone()
     }
 
     pub fn rules_status(&self) -> crate::status::PerformanceRulesStatus {
-        let active = self.active.read().expect("performance rules lock poisoned");
+        let active = active_rules_read(&self.active);
         crate::status::rules_status_for(
             &active.manifest,
             active.rule_source,
@@ -432,10 +428,7 @@ impl PerformanceManager {
             .verify_manifest(&manifest, &signature)?;
         let rules_cache = write_remote_rules_cache(config_dir, &manifest, signature)?;
         let last_refresh_at = rules_cache.updated_at.clone();
-        let mut active = self
-            .active
-            .write()
-            .expect("performance rules lock poisoned");
+        let mut active = active_rules_write(&self.active);
         *active = ActiveRules {
             manifest,
             rule_source: RuleSource::Remote,
@@ -449,10 +442,7 @@ impl PerformanceManager {
     }
 
     fn record_refresh_warning(&self, warning: String) {
-        let mut active = self
-            .active
-            .write()
-            .expect("performance rules lock poisoned");
+        let mut active = active_rules_write(&self.active);
         active.rules_cache.warning = Some(bounded_warning(warning));
     }
 
@@ -585,7 +575,7 @@ impl PerformanceManager {
     }
 
     fn install_attempt_plans(&self, plan: &CompositionPlan) -> Vec<CompositionPlan> {
-        let active = self.active.read().expect("performance rules lock poisoned");
+        let active = active_rules_read(&self.active);
         let manifest = &active.manifest;
         let mut plans = vec![plan.clone()];
         let mut seen = std::collections::HashSet::new();
@@ -863,6 +853,20 @@ impl PerformanceManager {
     }
 }
 
+fn active_rules_read(active: &RwLock<ActiveRules>) -> RwLockReadGuard<'_, ActiveRules> {
+    active.read().unwrap_or_else(|poisoned| {
+        warn!("performance rules lock poisoned during read; recovering active rules");
+        poisoned.into_inner()
+    })
+}
+
+fn active_rules_write(active: &RwLock<ActiveRules>) -> RwLockWriteGuard<'_, ActiveRules> {
+    active.write().unwrap_or_else(|poisoned| {
+        warn!("performance rules lock poisoned during write; recovering active rules");
+        poisoned.into_inner()
+    })
+}
+
 fn managed_artifact_install_concurrency(mod_count: usize) -> usize {
     mod_count.max(1).min(MANAGED_ARTIFACT_INSTALL_CONCURRENCY)
 }
@@ -1117,6 +1121,39 @@ mod tests {
         assert_eq!(managed_artifact_install_concurrency(1), 1);
         assert_eq!(managed_artifact_install_concurrency(3), 3);
         assert_eq!(managed_artifact_install_concurrency(12), 4);
+    }
+
+    #[test]
+    fn active_rules_helpers_recover_poisoned_read_and_write() {
+        let manager = PerformanceManager::new().expect("performance manager");
+        let active = Arc::clone(&manager.active);
+
+        let poison = std::thread::spawn(move || {
+            let mut active = active.write().expect("active rules lock");
+            active.rules_cache.warning = Some("poisoned while updating rules".to_string());
+            panic!("poison active rules lock");
+        })
+        .join();
+        assert!(poison.is_err());
+
+        {
+            let active = active_rules_read(&manager.active);
+            assert_eq!(
+                active.rules_cache.warning.as_deref(),
+                Some("poisoned while updating rules")
+            );
+        }
+
+        {
+            let mut active = active_rules_write(&manager.active);
+            active.rules_cache.warning = Some("recovered write".to_string());
+        }
+
+        let active = active_rules_read(&manager.active);
+        assert_eq!(
+            active.rules_cache.warning.as_deref(),
+            Some("recovered write")
+        );
     }
 
     #[test]
