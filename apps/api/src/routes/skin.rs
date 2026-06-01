@@ -69,6 +69,12 @@ struct SaveSkinQuery {
     variant: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct UpdateSavedSkinRequest {
+    name: Option<String>,
+    variant: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct SavedSkinsResponse {
     skins: Vec<SavedSkinRecord>,
@@ -90,7 +96,10 @@ pub fn router() -> Router<AppState> {
             "/api/v1/skins",
             get(handle_saved_skins).post(handle_save_skin),
         )
-        .route("/api/v1/skins/{texture_key}", delete(handle_delete_skin))
+        .route(
+            "/api/v1/skins/{texture_key}",
+            delete(handle_delete_skin).put(handle_update_saved_skin),
+        )
         .route(
             "/api/v1/skins/{texture_key}/file",
             get(handle_saved_skin_file),
@@ -287,6 +296,31 @@ async fn handle_delete_skin(
     }
 
     Ok(Json(serde_json::json!({ "status": "deleted" })))
+}
+
+async fn handle_update_saved_skin(
+    State(state): State<AppState>,
+    Path(texture_key): Path<String>,
+    Json(payload): Json<UpdateSavedSkinRequest>,
+) -> Result<Json<SavedSkinRecord>, ApiError> {
+    let texture_key = validate_texture_key(&texture_key)?;
+    let name = payload
+        .name
+        .as_deref()
+        .map(validate_saved_skin_name)
+        .transpose()?;
+    let variant = if payload.variant.is_some() {
+        Some(validate_saved_skin_variant(payload.variant.as_deref())?)
+    } else {
+        None
+    };
+    let updated = state
+        .skins()
+        .update_metadata(&texture_key, name, variant)
+        .map_err(skin_write_error)?
+        .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "saved skin not found"))?;
+
+    Ok(Json(updated))
 }
 
 async fn handle_saved_skin_file(
@@ -1508,6 +1542,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn skin_saved_update_metadata_changes_name_and_variant() {
+        let fixture = TestFixture::new("saved-update-metadata", "ConfigUser");
+        let saved = fixture
+            .save_skin("Original", None, test_skin_png(SKIN_WIDTH, SKIN_HEIGHT))
+            .await
+            .expect("save skin")
+            .0;
+
+        let updated = fixture
+            .update_saved_skin(
+                &saved.texture_key,
+                serde_json::json!({
+                    "name": " Renamed Skin ",
+                    "variant": "slim"
+                }),
+            )
+            .await
+            .expect("update skin")
+            .0;
+        let listed = fixture.saved_skins().await.expect("saved skins").0;
+
+        assert_eq!(updated.texture_key, saved.texture_key);
+        assert_eq!(updated.created_at, saved.created_at);
+        assert!(updated.updated_at >= saved.updated_at);
+        assert_eq!(updated.name, "Renamed Skin");
+        assert_eq!(updated.variant, "slim");
+        assert_eq!(updated.applied_at, saved.applied_at);
+        assert_eq!(updated.byte_size, saved.byte_size);
+        assert_eq!(listed.skins, vec![updated]);
+    }
+
+    #[tokio::test]
+    async fn skin_saved_update_metadata_rejects_invalid_values() {
+        let fixture = TestFixture::new("saved-update-invalid", "ConfigUser");
+        let saved = fixture
+            .save_skin("Original", None, test_skin_png(SKIN_WIDTH, SKIN_HEIGHT))
+            .await
+            .expect("save skin")
+            .0;
+
+        let invalid_name = fixture
+            .update_saved_skin(
+                &saved.texture_key,
+                serde_json::json!({ "name": "bad/name" }),
+            )
+            .await
+            .expect_err("invalid name should fail");
+        let invalid_variant = fixture
+            .update_saved_skin(&saved.texture_key, serde_json::json!({ "variant": "wide" }))
+            .await
+            .expect_err("invalid variant should fail");
+        let invalid_key = fixture
+            .update_saved_skin(
+                "../not-a-texture-key",
+                serde_json::json!({ "name": "Valid" }),
+            )
+            .await
+            .expect_err("invalid key should fail");
+        let missing = fixture
+            .update_saved_skin(&"0".repeat(64), serde_json::json!({ "name": "Missing" }))
+            .await
+            .expect_err("missing skin should fail");
+
+        assert_eq!(invalid_name.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            invalid_name.1.0,
+            serde_json::json!({ "error": "skin name contains unsupported characters" })
+        );
+        assert_eq!(invalid_variant.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            invalid_variant.1.0,
+            serde_json::json!({ "error": "skin variant must be classic or slim" })
+        );
+        assert_eq!(invalid_key.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            invalid_key.1.0,
+            serde_json::json!({ "error": "invalid texture key" })
+        );
+        assert_eq!(missing.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            missing.1.0,
+            serde_json::json!({ "error": "saved skin not found" })
+        );
+    }
+
+    #[tokio::test]
     async fn skin_saved_delete_removes_local_skin() {
         let fixture = TestFixture::new("saved-delete", "ConfigUser");
         let saved = fixture
@@ -1998,6 +2118,21 @@ mod tests {
             texture_key: &str,
         ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
             handle_delete_skin(State(self.state.clone()), Path(texture_key.to_string())).await
+        }
+
+        async fn update_saved_skin(
+            &self,
+            texture_key: &str,
+            payload: serde_json::Value,
+        ) -> Result<Json<SavedSkinRecord>, (StatusCode, Json<serde_json::Value>)> {
+            let payload = serde_json::from_value::<UpdateSavedSkinRequest>(payload)
+                .expect("valid update payload");
+            handle_update_saved_skin(
+                State(self.state.clone()),
+                Path(texture_key.to_string()),
+                Json(payload),
+            )
+            .await
         }
 
         async fn saved_skin_file(

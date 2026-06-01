@@ -134,6 +134,36 @@ impl SavedSkinStore {
         Ok(Some(record))
     }
 
+    pub fn update_metadata(
+        &self,
+        texture_key: &str,
+        name: Option<String>,
+        variant: Option<String>,
+    ) -> io::Result<Option<SavedSkinRecord>> {
+        let _guard = self.lock.lock().map_err(|_| lock_error())?;
+        let mut index = self.load_index()?;
+        let Some(position) = index
+            .skins
+            .iter()
+            .position(|skin| skin.texture_key == texture_key)
+        else {
+            return Ok(None);
+        };
+
+        let record = &mut index.skins[position];
+        if let Some(name) = name {
+            record.name = name;
+        }
+        if let Some(variant) = variant {
+            record.variant = variant;
+        }
+        record.updated_at = chrono::Utc::now().to_rfc3339();
+        let updated = record.clone();
+        self.persist_index(&index)?;
+
+        Ok(Some(updated))
+    }
+
     pub fn mark_applied(&self, texture_key: &str) -> io::Result<Option<String>> {
         let _guard = self.lock.lock().map_err(|_| lock_error())?;
         let mut index = self.load_index()?;

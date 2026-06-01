@@ -1785,9 +1785,14 @@ function SavedSkinLibrary({
     tone: 'ok' | 'err';
     text: string;
   } | null>(null);
+  const [editKey, setEditKey] = useState<string | null>(null);
+  const [editName, setEditName] = useState('');
+  const [editVariant, setEditVariant] = useState<SkinVariant>('classic');
+  const [editBusyKey, setEditBusyKey] = useState<string | null>(null);
   const [deleteKey, setDeleteKey] = useState<string | null>(null);
   const [applyKey, setApplyKey] = useState<string | null>(null);
   const trimmedName = skinName.trim();
+  const trimmedEditName = editName.trim();
   const canUpload = !busy && trimmedName.length > 0;
 
   const upload = async (file: File): Promise<void> => {
@@ -1838,6 +1843,45 @@ function SavedSkinLibrary({
       });
     } finally {
       setDeleteKey(null);
+    }
+  };
+
+  const startEdit = (skin: SavedSkinRecord): void => {
+    setEditKey(skin.texture_key);
+    setEditName(skin.name);
+    setEditVariant(skin.variant === 'slim' ? 'slim' : 'classic');
+    setMessage(null);
+  };
+
+  const cancelEdit = (): void => {
+    setEditKey(null);
+    setEditName('');
+    setEditVariant('classic');
+  };
+
+  const saveSkinMetadata = async (textureKey: string): Promise<void> => {
+    if (!trimmedEditName) {
+      setMessage({ tone: 'err', text: 'Name the skin before saving.' });
+      return;
+    }
+
+    setEditBusyKey(textureKey);
+    setMessage(null);
+    try {
+      await api('PUT', `/skins/${textureKey}`, {
+        name: trimmedEditName,
+        variant: editVariant,
+      });
+      cancelEdit();
+      refresh();
+      setMessage({ tone: 'ok', text: 'Skin details updated.' });
+    } catch (err) {
+      setMessage({
+        tone: 'err',
+        text: err instanceof Error ? err.message : 'Could not update skin details.',
+      });
+    } finally {
+      setEditBusyKey(null);
     }
   };
 
@@ -1946,13 +1990,14 @@ function SavedSkinLibrary({
           ) : (
             skins.map((skin, index) => {
               const applied = Boolean(skin.applied_at);
+              const editing = editKey === skin.texture_key;
 
               return (
                 <div
                   key={skin.texture_key}
                   style={{
                     display: 'grid',
-                    gridTemplateColumns: '42px minmax(0, 1fr) auto auto auto',
+                    gridTemplateColumns: editing ? '42px minmax(0, 1fr)' : '42px minmax(0, 1fr) auto auto',
                     gap: 12,
                     alignItems: 'center',
                     padding: '10px 12px',
@@ -1966,64 +2011,126 @@ function SavedSkinLibrary({
                     radius={6}
                     ariaLabel={`${skin.name} skin preview`}
                   />
-                  <div style={{ minWidth: 0 }}>
+                  {editing ? (
                     <div style={{
-                      color: theme.n.text,
-                      fontSize: 13,
-                      fontWeight: 700,
-                      lineHeight: 1.25,
-                      overflow: 'hidden',
-                      textOverflow: 'ellipsis',
-                      whiteSpace: 'nowrap',
+                      display: 'grid',
+                      gridTemplateColumns: 'minmax(180px, 1fr) auto auto auto',
+                      gap: 8,
+                      alignItems: 'center',
+                      minWidth: 0,
                     }}>
-                      {skin.name}
+                      <Input
+                        value={editName}
+                        onChange={(value) => setEditName(value.slice(0, 64))}
+                        icon="tag"
+                        placeholder="Skin name"
+                      />
+                      <Segmented<SkinVariant>
+                        options={[
+                          { value: 'classic', label: 'Classic' },
+                          { value: 'slim', label: 'Slim' },
+                        ]}
+                        value={editVariant}
+                        onChange={setEditVariant}
+                      />
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        icon={editBusyKey === skin.texture_key ? 'refresh' : 'check'}
+                        disabled={editBusyKey === skin.texture_key || trimmedEditName.length === 0}
+                        onClick={() => void saveSkinMetadata(skin.texture_key)}
+                      >
+                        Save
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        icon="x"
+                        disabled={editBusyKey === skin.texture_key}
+                        onClick={cancelEdit}
+                      >
+                        Cancel
+                      </Button>
                     </div>
-                    <div style={{
-                      color: theme.n.textMute,
-                      fontSize: 11,
-                      fontWeight: 500,
-                      lineHeight: 1.35,
-                      fontFamily: theme.font.mono,
-                      overflow: 'hidden',
-                      textOverflow: 'ellipsis',
-                      whiteSpace: 'nowrap',
-                    }}>
-                      {skin.texture_key.slice(0, 12)} / {formatByteSize(skin.byte_size)}
-                    </div>
-                  </div>
-                  <div style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: 6,
-                    flexWrap: 'wrap',
-                    justifyContent: 'flex-end',
-                  }}>
-                    <Pill tone="neutral">{skin.variant}</Pill>
-                    {applied && <Pill tone="ok" icon="check-circle">Equipped</Pill>}
-                  </div>
-                  <Button
-                    variant={applied ? 'ghost' : 'secondary'}
-                    size="sm"
-                    icon={applied
-                      ? 'check-circle'
-                      : applyKey === skin.texture_key ? 'refresh' : 'check'}
-                    disabled={!onlineReady || applied || applyKey === skin.texture_key}
-                    onClick={() => void applySkin(skin.texture_key)}
-                    title={applied
-                      ? 'Already applied to the active Minecraft account'
-                      : onlineReady ? 'Apply to active Minecraft account' : 'Online Minecraft account required'}
-                  >
-                    {applied ? 'Applied' : 'Apply'}
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    icon="trash"
-                    disabled={deleteKey === skin.texture_key}
-                    onClick={() => void deleteSkin(skin.texture_key)}
-                  >
-                    Delete
-                  </Button>
+                  ) : (
+                    <>
+                      <div style={{ minWidth: 0 }}>
+                        <div style={{
+                          color: theme.n.text,
+                          fontSize: 13,
+                          fontWeight: 700,
+                          lineHeight: 1.25,
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          whiteSpace: 'nowrap',
+                        }}>
+                          {skin.name}
+                        </div>
+                        <div style={{
+                          color: theme.n.textMute,
+                          fontSize: 11,
+                          fontWeight: 500,
+                          lineHeight: 1.35,
+                          fontFamily: theme.font.mono,
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          whiteSpace: 'nowrap',
+                        }}>
+                          {skin.texture_key.slice(0, 12)} / {formatByteSize(skin.byte_size)}
+                        </div>
+                      </div>
+                      <div style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 6,
+                        flexWrap: 'wrap',
+                        justifyContent: 'flex-end',
+                      }}>
+                        <Pill tone="neutral">{skin.variant}</Pill>
+                        {applied && <Pill tone="ok" icon="check-circle">Equipped</Pill>}
+                      </div>
+                      <div style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'flex-end',
+                        gap: 8,
+                        flexWrap: 'wrap',
+                      }}>
+                        <Button
+                          variant={applied ? 'ghost' : 'secondary'}
+                          size="sm"
+                          icon={applied
+                            ? 'check-circle'
+                            : applyKey === skin.texture_key ? 'refresh' : 'check'}
+                          disabled={!onlineReady || applied || applyKey === skin.texture_key}
+                          onClick={() => void applySkin(skin.texture_key)}
+                          title={applied
+                            ? 'Already applied to the active Minecraft account'
+                            : onlineReady ? 'Apply to active Minecraft account' : 'Online Minecraft account required'}
+                        >
+                          {applied ? 'Applied' : 'Apply'}
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          icon="edit"
+                          disabled={deleteKey === skin.texture_key || applyKey === skin.texture_key}
+                          onClick={() => startEdit(skin)}
+                        >
+                          Edit
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          icon="trash"
+                          disabled={deleteKey === skin.texture_key}
+                          onClick={() => void deleteSkin(skin.texture_key)}
+                        >
+                          Delete
+                        </Button>
+                      </div>
+                    </>
+                  )}
                 </div>
               );
             })
