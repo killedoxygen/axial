@@ -529,13 +529,7 @@ impl Downloader {
             let result = async {
                 remove_stale_download_temp(&tmp_path).await?;
                 let response = self.client.get(url).send().await?.error_for_status()?;
-                let mut output = tokio::fs::File::create(&tmp_path).await?;
-                let mut stream = response.bytes_stream();
-                while let Some(chunk) = stream.next().await {
-                    let chunk = chunk?;
-                    output.write_all(&chunk).await?;
-                }
-                output.flush().await?;
+                write_download_response(response, &tmp_path, destination, expected).await?;
                 verify_downloaded_file(&tmp_path, expected).await?;
                 promote_download_temp(&tmp_path, destination).await?;
                 Ok::<(), DownloadError>(())
@@ -991,13 +985,7 @@ async fn download_file_with_client(
         let result = async {
             remove_stale_download_temp(&tmp_path).await?;
             let response = client.get(url).send().await?.error_for_status()?;
-            let mut output = tokio::fs::File::create(&tmp_path).await?;
-            let mut stream = response.bytes_stream();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk?;
-                output.write_all(&chunk).await?;
-            }
-            output.flush().await?;
+            write_download_response(response, &tmp_path, destination, expected).await?;
             verify_downloaded_file(&tmp_path, expected).await?;
             promote_download_temp(&tmp_path, destination).await?;
             Ok::<(), DownloadError>(())
@@ -1016,6 +1004,45 @@ async fn download_file_with_client(
         }
     }
     Err(last_error.unwrap_or_else(|| DownloadError::ResolveManifest("download failed".to_string())))
+}
+
+async fn write_download_response(
+    response: reqwest::Response,
+    tmp_path: &Path,
+    destination: &Path,
+    expected: &ExpectedIntegrity,
+) -> Result<(), DownloadError> {
+    if let Some(expected_size) = expected.size
+        && let Some(content_length) = response.content_length()
+        && content_length > expected_size
+    {
+        return Err(download_size_mismatch(
+            destination,
+            expected_size,
+            content_length,
+        ));
+    }
+
+    let mut output = tokio::fs::File::create(tmp_path).await?;
+    let mut stream = response.bytes_stream();
+    let mut written = 0_u64;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        let next_written = written.saturating_add(chunk.len() as u64);
+        if let Some(expected_size) = expected.size
+            && next_written > expected_size
+        {
+            return Err(download_size_mismatch(
+                destination,
+                expected_size,
+                next_written,
+            ));
+        }
+        output.write_all(&chunk).await?;
+        written = next_written;
+    }
+    output.flush().await?;
+    Ok(())
 }
 
 async fn remove_stale_download_temp(temp_path: &Path) -> Result<(), DownloadError> {
@@ -1176,6 +1203,17 @@ fn verify_download_integrity(
     Ok(())
 }
 
+fn download_size_mismatch(path: &Path, expected: u64, actual: u64) -> DownloadError {
+    DownloadError::Integrity(
+        DownloadIntegrityError::SizeMismatch {
+            file: bounded_download_file_label(path),
+            expected,
+            actual,
+        }
+        .to_string(),
+    )
+}
+
 fn non_empty_sha1(value: &str) -> Option<String> {
     let trimmed = value.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
@@ -1237,6 +1275,7 @@ mod tests {
         atomic::{AtomicBool, Ordering},
     };
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::io::AsyncWriteExt;
     use tokio::sync::oneshot;
     use tokio::time::{Duration, timeout};
 
@@ -1524,6 +1563,65 @@ mod tests {
             .await
             .expect("sha1 mismatch")
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn download_file_with_client_rejects_oversized_content_length_before_temp_file() {
+        let root = temp_dir("oversized-content-length");
+        let destination = root.join("nested").join("artifact.jar");
+        let tmp_path = destination.with_extension("tmp");
+        let expected =
+            ExpectedIntegrity::from_mojang(8, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let url = spawn_download_response_server(
+            "200 OK",
+            vec![
+                (
+                    "Content-Type".to_string(),
+                    "application/octet-stream".to_string(),
+                ),
+                ("Content-Length".to_string(), "9".to_string()),
+            ],
+            b"short".to_vec(),
+            3,
+        )
+        .await;
+        let client = build_http_client(Duration::from_secs(5));
+
+        let result = download_file_with_client(&client, &url, &destination, &expected).await;
+
+        assert!(matches!(result, Err(DownloadError::Integrity(_))));
+        assert!(!tmp_path.exists());
+        assert!(!destination.exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn download_file_with_client_rejects_stream_past_expected_size_and_cleans_temp() {
+        let root = temp_dir("oversized-stream");
+        let destination = root.join("nested").join("artifact.jar");
+        let tmp_path = destination.with_extension("tmp");
+        let expected =
+            ExpectedIntegrity::from_mojang(8, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let url = spawn_download_response_server(
+            "200 OK",
+            vec![(
+                "Content-Type".to_string(),
+                "application/octet-stream".to_string(),
+            )],
+            b"123456789".to_vec(),
+            3,
+        )
+        .await;
+        let client = build_http_client(Duration::from_secs(5));
+
+        let result = download_file_with_client(&client, &url, &destination, &expected).await;
+
+        assert!(matches!(result, Err(DownloadError::Integrity(_))));
+        assert!(!tmp_path.exists());
+        assert!(!destination.exists());
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1871,5 +1969,33 @@ mod tests {
             "croopor-download-{prefix}-{}-{nanos:x}",
             std::process::id()
         ))
+    }
+
+    async fn spawn_download_response_server(
+        status: &str,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+        responses: usize,
+    ) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind download response server");
+        let url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let status = status.to_string();
+        tokio::spawn(async move {
+            for _ in 0..responses {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut response = format!("HTTP/1.1 {status}\r\nConnection: close\r\n");
+                for (name, value) in &headers {
+                    response.push_str(&format!("{name}: {value}\r\n"));
+                }
+                response.push_str("\r\n");
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.write_all(&body).await;
+            }
+        });
+        url
     }
 }
