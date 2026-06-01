@@ -1610,31 +1610,49 @@ function AccountBoundary({ savedUsername }: { savedUsername: string }): JSX.Elem
               {statusCopy}
             </div>
             <AuthModeControl status={status} onSaved={refreshStatus} />
-            <div style={{
+            <details style={{
               display: 'grid',
-              gridTemplateColumns: 'repeat(auto-fit, minmax(124px, 1fr))',
-              gap: 12,
-              alignItems: 'start',
+              gap: 10,
+              paddingTop: 2,
             }}>
-              <ProfileMetaValue label="Identity" value={status.mode === 'online' ? 'Online profile' : 'Offline profile'} />
-              <ProfileMetaValue label="Verified" value={status.verified ? 'Yes' : 'No'} />
-              <ProfileMetaValue label="UUID" value={shortenUuid(status.uuid)} />
-              <ProfileMetaValue label="Skin" value={skinSourceLabel(status.skin_source, status.launch_auth_mode)} />
-              <ProfileMetaValue label="Login" value={status.login_available ? 'Available' : 'Unavailable'} />
-              <ProfileMetaValue
-                label="Refresh"
-                value={status.msa_refresh_available
-                  ? status.login_available ? 'Available' : 'Sign-in unavailable'
-                  : 'Unavailable'}
-              />
-              <ProfileMetaValue label="Microsoft" value={msaActive ? 'Active' : 'Inactive'} />
-              {msaActive && (
-                <ProfileMetaValue label="MS window" value={expiryWindowValue(status.msa_token_expires_in)} />
-              )}
-              {minecraftCredentialsActive && (
-                <ProfileMetaValue label="MC window" value={expiryWindowValue(status.minecraft_token_expires_in)} />
-              )}
-            </div>
+              <summary style={{
+                width: 'max-content',
+                maxWidth: '100%',
+                color: theme.n.textMute,
+                fontSize: 12,
+                fontWeight: 650,
+                cursor: 'pointer',
+                listStylePosition: 'inside',
+              }}>
+                Profile details
+              </summary>
+              <div style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(auto-fit, minmax(124px, 1fr))',
+                gap: 12,
+                alignItems: 'start',
+                paddingTop: 10,
+              }}>
+                <ProfileMetaValue label="Identity" value={status.mode === 'online' ? 'Online profile' : 'Offline profile'} />
+                <ProfileMetaValue label="Verified" value={status.verified ? 'Yes' : 'No'} />
+                <ProfileMetaValue label="UUID" value={shortenUuid(status.uuid)} />
+                <ProfileMetaValue label="Skin" value={skinSourceLabel(status.skin_source, status.launch_auth_mode)} />
+                <ProfileMetaValue label="Login" value={status.login_available ? 'Available' : 'Unavailable'} />
+                <ProfileMetaValue
+                  label="Refresh"
+                  value={status.msa_refresh_available
+                    ? status.login_available ? 'Available' : 'Sign-in unavailable'
+                    : 'Unavailable'}
+                />
+                <ProfileMetaValue label="Microsoft" value={msaActive ? 'Active' : 'Inactive'} />
+                {msaActive && (
+                  <ProfileMetaValue label="MS window" value={expiryWindowValue(status.msa_token_expires_in)} />
+                )}
+                {minecraftCredentialsActive && (
+                  <ProfileMetaValue label="MC window" value={expiryWindowValue(status.minecraft_token_expires_in)} />
+                )}
+              </div>
+            </details>
             <MinecraftProfileReadiness status={status} />
             <div style={{
               display: 'flex',
