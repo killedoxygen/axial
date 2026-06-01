@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use tokio::process::Command;
@@ -212,13 +212,18 @@ fn build_data_vars(
         }
 
         if let Some(entry_path) = value.strip_prefix('/') {
+            let destination_path = safe_installer_entry_path(entry_path)?;
             if temp_dir.is_none() {
                 temp_dir = Some(create_temp_dir(work_dir)?);
             }
+            let temp_dir_path = temp_dir.as_deref().ok_or_else(|| {
+                ProcessorError::Command("processor temp directory unavailable".to_string())
+            })?;
             let extracted = extract_from_installer_jar(
                 installer_data,
                 entry_path,
-                temp_dir.as_ref().expect("temp dir just set"),
+                &destination_path,
+                temp_dir_path,
             )?;
             vars.insert(key.clone(), extracted.to_string_lossy().to_string());
             continue;
@@ -263,19 +268,48 @@ fn create_temp_dir(work_dir: &Path) -> Result<PathBuf, std::io::Error> {
 fn extract_from_installer_jar(
     jar_data: &[u8],
     entry_path: &str,
+    destination_path: &Path,
     temp_dir: &Path,
 ) -> Result<PathBuf, ProcessorError> {
     let mut archive = ZipArchive::new(std::io::Cursor::new(jar_data))?;
     let mut file = archive
         .by_name(entry_path)
         .map_err(|_| ProcessorError::Command(format!("extracting {entry_path} from installer")))?;
-    let destination = temp_dir.join(Path::new(entry_path));
+    let destination = temp_dir.join(destination_path);
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
     }
     let mut output = fs::File::create(&destination)?;
     std::io::copy(&mut file, &mut output)?;
     Ok(destination)
+}
+
+fn safe_installer_entry_path(entry_path: &str) -> Result<PathBuf, ProcessorError> {
+    let path = Path::new(entry_path);
+    if entry_path.trim().is_empty() {
+        return Err(unsafe_installer_entry_error(entry_path));
+    }
+
+    let mut safe = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(segment) => safe.push(segment),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(unsafe_installer_entry_error(entry_path));
+            }
+        }
+    }
+
+    if safe.as_os_str().is_empty() {
+        return Err(unsafe_installer_entry_error(entry_path));
+    }
+
+    Ok(safe)
+}
+
+fn unsafe_installer_entry_error(entry_path: &str) -> ProcessorError {
+    ProcessorError::Command(format!("unsafe installer entry path: {entry_path}"))
 }
 
 async fn run_processor(
@@ -429,5 +463,86 @@ fn substitute_arg(
         arg.to_string()
     } else {
         substitute_arg(&replaced, lib_paths, data_vars, lib_dir, depth + 1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_data_vars_rejects_unsafe_installer_entry_path() {
+        let root = test_root("unsafe-installer-entry");
+        let mut data = HashMap::new();
+        data.insert(
+            "EXTRACTED".to_string(),
+            DataEntry {
+                client: "/../outside.txt".to_string(),
+            },
+        );
+
+        let error = build_data_vars(
+            &data,
+            &root,
+            "1.20.1",
+            &empty_zip(),
+            &root,
+            &root.join("installer.jar"),
+        )
+        .expect_err("unsafe installer entry path should fail");
+
+        assert!(
+            matches!(error, ProcessorError::Command(message) if message.contains("unsafe installer entry path"))
+        );
+        assert!(!root.join("outside.txt").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn build_data_vars_reports_missing_installer_entry_without_panic() {
+        let root = test_root("missing-installer-entry");
+        let mut data = HashMap::new();
+        data.insert(
+            "EXTRACTED".to_string(),
+            DataEntry {
+                client: "/missing.txt".to_string(),
+            },
+        );
+
+        let error = build_data_vars(
+            &data,
+            &root,
+            "1.20.1",
+            &empty_zip(),
+            &root,
+            &root.join("installer.jar"),
+        )
+        .expect_err("missing installer entry should fail");
+
+        assert!(
+            matches!(error, ProcessorError::Command(message) if message.contains("extracting missing.txt from installer"))
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn empty_zip() -> Vec<u8> {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        zip::ZipWriter::new(&mut cursor)
+            .finish()
+            .expect("finish empty zip");
+        cursor.into_inner()
+    }
+
+    fn test_root(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or_default();
+        let root = std::env::temp_dir().join(format!(
+            "croopor-processors-{name}-{}-{nanos:x}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create test root");
+        root
     }
 }
