@@ -252,21 +252,6 @@ button.cp-cr-stepper-item:focus-visible {
   color: currentColor;
   white-space: nowrap;
 }
-.cp-cr-rail-check {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 15px;
-  height: 15px;
-  margin-left: 1px;
-  border-radius: 50%;
-  background: color-mix(in oklab, var(--accent) 18%, var(--surface));
-  color: var(--accent);
-  flex-shrink: 0;
-}
-.cp-cr-rail-check:empty {
-  background: transparent;
-}
 .cp-cr-source-status {
   margin: -8px 0 0;
   color: var(--text-mute);

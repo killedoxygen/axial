@@ -97,11 +97,6 @@ export function PickStep({
               {renderSourceGlyph(key)}
             </span>
             <span class="cp-cr-rail-label">{LOADER_LABELS[key]}</span>
-            <span class="cp-cr-rail-check" aria-hidden="true">
-              {source === key && (
-                <Icon name="check" size={13} stroke={2.2} />
-              )}
-            </span>
           </button>
         ))}
       </aside>
