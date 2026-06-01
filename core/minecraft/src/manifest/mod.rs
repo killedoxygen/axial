@@ -78,12 +78,7 @@ pub async fn fetch_version_manifest() -> Result<VersionManifest, String> {
 
 async fn fetch_manifest_live() -> Result<VersionManifest, String> {
     tokio::task::spawn_blocking(|| {
-        let response = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(10))
-            .timeout_read(Duration::from_secs(15))
-            .timeout_write(Duration::from_secs(15))
-            .user_agent("croopor/0.3")
-            .build()
+        let response = manifest_agent()
             .get(MANIFEST_URL)
             .call()
             .map_err(|error| format!("fetching version manifest: {error}"))?;
@@ -98,4 +93,16 @@ async fn fetch_manifest_live() -> Result<VersionManifest, String> {
     })
     .await
     .map_err(|error| format!("fetching version manifest: {error}"))?
+}
+
+fn manifest_agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(10))
+            .timeout_read(Duration::from_secs(15))
+            .timeout_write(Duration::from_secs(15))
+            .user_agent("croopor/0.3")
+            .build()
+    })
 }
