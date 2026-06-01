@@ -1,6 +1,6 @@
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -9,6 +9,7 @@ use crate::paths::version_manifest_cache_path;
 
 const MANIFEST_URL: &str = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
 const CACHE_TTL: Duration = Duration::from_secs(600);
+const MAX_MANIFEST_BYTES: u64 = 8 << 20;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VersionManifest {
@@ -135,21 +136,36 @@ async fn fetch_manifest_live() -> Result<VersionManifest, String> {
 }
 
 async fn fetch_manifest_live_body() -> Result<Vec<u8>, String> {
-    tokio::task::spawn_blocking(|| {
-        let response = manifest_agent()
-            .get(MANIFEST_URL)
-            .call()
-            .map_err(|error| format!("fetching version manifest: {error}"))?;
+    fetch_manifest_live_body_from_url(MANIFEST_URL).await
+}
 
-        let mut reader = response.into_reader();
-        let mut body = Vec::new();
-        reader
-            .read_to_end(&mut body)
-            .map_err(|error| format!("reading version manifest: {error}"))?;
-        Ok(body)
-    })
-    .await
-    .map_err(|error| format!("fetching version manifest: {error}"))?
+async fn fetch_manifest_live_body_from_url(url: &str) -> Result<Vec<u8>, String> {
+    let response = manifest_client()
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| format!("fetching version manifest: {error}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("fetching version manifest: HTTP {status}"));
+    }
+    if response
+        .content_length()
+        .is_some_and(|content_length| content_length > MAX_MANIFEST_BYTES)
+    {
+        return Err("reading version manifest: response too large".to_string());
+    }
+
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| format!("reading version manifest: {error}"))?;
+        if body.len() as u64 + chunk.len() as u64 > MAX_MANIFEST_BYTES {
+            return Err("reading version manifest: response too large".to_string());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 fn resolve_manifest_from_live_or_cache(
@@ -251,21 +267,24 @@ fn parse_manifest_body(data: &[u8]) -> Result<VersionManifest, String> {
         .map_err(|error| format!("parsing version manifest: {error}"))
 }
 
-fn manifest_agent() -> &'static ureq::Agent {
-    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
-    AGENT.get_or_init(|| {
-        ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(10))
-            .timeout_read(Duration::from_secs(15))
-            .timeout_write(Duration::from_secs(15))
+fn manifest_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .read_timeout(Duration::from_secs(15))
             .user_agent("croopor/0.3")
             .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
 
     #[test]
     fn writes_and_reads_persistent_manifest_cache() {
@@ -353,6 +372,48 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn live_manifest_fetch_reads_async_http_body() {
+        let server = TestManifestServer::start(200, sample_manifest_body("1.21.7"));
+
+        let body = fetch_manifest_live_body_from_url(&server.url())
+            .await
+            .expect("fetch live manifest body");
+        let manifest = parse_manifest_body(&body).expect("parse fetched manifest body");
+
+        assert_eq!(manifest.latest.release, "1.21.7");
+        assert_eq!(manifest.versions[0].id, "1.21.7");
+        server.join();
+    }
+
+    #[tokio::test]
+    async fn live_manifest_fetch_rejects_http_errors() {
+        let server = TestManifestServer::start(503, "unavailable".to_string());
+
+        let error = fetch_manifest_live_body_from_url(&server.url())
+            .await
+            .expect_err("HTTP error should fail");
+
+        assert!(error.contains("HTTP 503"), "{error}");
+        server.join();
+    }
+
+    #[tokio::test]
+    async fn live_manifest_fetch_rejects_oversized_content_length() {
+        let server = TestManifestServer::start_with_content_length(
+            200,
+            "ignored".to_string(),
+            MAX_MANIFEST_BYTES + 1,
+        );
+
+        let error = fetch_manifest_live_body_from_url(&server.url())
+            .await
+            .expect_err("oversized manifest should fail");
+
+        assert_eq!(error, "reading version manifest: response too large");
+        server.join();
+    }
+
     #[test]
     fn temp_promotion_replaces_existing_manifest_cache() {
         let root = temp_dir("manifest-cache-promote");
@@ -404,6 +465,54 @@ mod tests {
   ]
 }}"#
         )
+    }
+
+    struct TestManifestServer {
+        address: String,
+        server: thread::JoinHandle<()>,
+    }
+
+    impl TestManifestServer {
+        fn start(status: u16, body: String) -> Self {
+            Self::start_with_content_length(status, body.clone(), body.len() as u64)
+        }
+
+        fn start_with_content_length(status: u16, body: String, content_length: u64) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind manifest test server");
+            let address = listener.local_addr().expect("manifest test server addr");
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept manifest request");
+                let mut request = [0_u8; 1024];
+                let _ = stream.read(&mut request);
+                write_response(&mut stream, status, &body, content_length);
+            });
+
+            Self {
+                address: address.to_string(),
+                server,
+            }
+        }
+
+        fn url(&self) -> String {
+            format!("http://{}/version_manifest_v2.json", self.address)
+        }
+
+        fn join(self) {
+            self.server.join().expect("manifest test server join");
+        }
+    }
+
+    fn write_response(stream: &mut TcpStream, status: u16, body: &str, content_length: u64) {
+        let reason = if status == 200 { "OK" } else { "Error" };
+        let headers = format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
+        );
+        stream
+            .write_all(headers.as_bytes())
+            .expect("write response headers");
+        stream
+            .write_all(body.as_bytes())
+            .expect("write response body");
     }
 
     fn temp_dir(prefix: &str) -> PathBuf {
