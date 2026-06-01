@@ -1835,9 +1835,10 @@ function SavedSkinLibrary({
           readApiPayloadMessage(payload, `Upload failed with HTTP ${response.status}`),
         );
       }
+      const saved = savedSkinRecord(payload);
       setSkinName('');
+      if (saved) setSelectedKey(saved.texture_key);
       refresh();
-      setSelectedKey(null);
     } catch (err) {
       setMessage({
         tone: 'err',
@@ -1872,8 +1873,9 @@ function SavedSkinLibrary({
     setProfileBusy(true);
     setMessage(null);
     try {
-      await api('POST', '/skins/from-profile', {});
-      setSelectedKey(null);
+      const payload = await api('POST', '/skins/from-profile', {});
+      const saved = savedSkinRecord(payload);
+      if (saved) setSelectedKey(saved.texture_key);
       refresh();
       setMessage({ tone: 'ok', text: 'Minecraft profile skin saved.' });
     } catch (err) {
