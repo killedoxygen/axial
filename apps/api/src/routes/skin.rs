@@ -374,6 +374,11 @@ async fn handle_apply_saved_skin_with_client(
         .upload(&account.access_token, &saved_skin.variant, png_bytes)
         .await
         .map_err(skin_upload_error)?;
+    state
+        .skins()
+        .mark_applied(&texture_key)
+        .map_err(skin_write_error)?
+        .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "saved skin not found"))?;
     let profile_updated = if let Some(profile) = uploaded_profile {
         state
             .auth_logins()
@@ -1721,6 +1726,104 @@ mod tests {
         assert!(body_contains(&request.body, &normalized.png_bytes));
         assert_eq!(account.profile.name, "UpdatedProfileName");
         assert_eq!(account.profile.skins[0].variant, "SLIM");
+    }
+
+    #[tokio::test]
+    async fn skin_apply_success_marks_saved_skin_applied_and_clears_prior_marker() {
+        let fixture = TestFixture::new("apply-marks-active", "ConfigUser");
+        fixture
+            .add_minecraft_account(test_profile("MinecraftName", Vec::new()))
+            .await;
+        let prior = fixture
+            .save_skin("Prior", None, test_skin_png(SKIN_WIDTH, LEGACY_SKIN_HEIGHT))
+            .await
+            .expect("save prior skin")
+            .0;
+        let next = fixture
+            .save_skin(
+                "Next",
+                Some("slim".to_string()),
+                test_skin_png(SKIN_WIDTH, SKIN_HEIGHT),
+            )
+            .await
+            .expect("save next skin")
+            .0;
+        fixture
+            .state
+            .skins()
+            .mark_applied(&prior.texture_key)
+            .expect("mark prior skin applied");
+        let (endpoint, mut requests) =
+            skin_apply_route_test_server(SkinApplyServerMode::Success).await;
+
+        let _ = fixture
+            .apply_saved_skin_with_endpoint(&next.texture_key, &endpoint)
+            .await
+            .expect("apply next skin");
+        let _ = requests.recv().await.expect("skin upload request");
+        let listed = fixture.saved_skins().await.expect("saved skins").0;
+        let prior_after = listed
+            .skins
+            .iter()
+            .find(|skin| skin.texture_key == prior.texture_key)
+            .expect("prior skin listed");
+        let next_after = listed
+            .skins
+            .iter()
+            .find(|skin| skin.texture_key == next.texture_key)
+            .expect("next skin listed");
+
+        assert_eq!(prior_after.applied_at, None);
+        assert!(next_after.applied_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn skin_apply_upstream_failure_does_not_mark_saved_skin_applied() {
+        let fixture = TestFixture::new("apply-failure-keeps-marker", "ConfigUser");
+        fixture
+            .add_minecraft_account(test_profile("MinecraftName", Vec::new()))
+            .await;
+        let prior = fixture
+            .save_skin("Prior", None, test_skin_png(SKIN_WIDTH, LEGACY_SKIN_HEIGHT))
+            .await
+            .expect("save prior skin")
+            .0;
+        let rejected = fixture
+            .save_skin("Rejected", None, test_skin_png(SKIN_WIDTH, SKIN_HEIGHT))
+            .await
+            .expect("save rejected skin")
+            .0;
+        let prior_applied_at = fixture
+            .state
+            .skins()
+            .mark_applied(&prior.texture_key)
+            .expect("mark prior skin applied")
+            .expect("prior skin exists");
+        let (endpoint, mut requests) =
+            skin_apply_route_test_server(SkinApplyServerMode::Rejected).await;
+
+        let _ = fixture
+            .apply_saved_skin_with_endpoint(&rejected.texture_key, &endpoint)
+            .await
+            .expect_err("rejected upload should fail");
+        let _ = requests.recv().await.expect("skin upload request");
+        let listed = fixture.saved_skins().await.expect("saved skins").0;
+        let prior_after = listed
+            .skins
+            .iter()
+            .find(|skin| skin.texture_key == prior.texture_key)
+            .expect("prior skin listed");
+        let rejected_after = listed
+            .skins
+            .iter()
+            .find(|skin| skin.texture_key == rejected.texture_key)
+            .expect("rejected skin listed");
+
+        assert_eq!(
+            prior_after.applied_at.as_deref(),
+            Some(prior_applied_at.as_str())
+        );
+        assert_eq!(rejected_after.applied_at, None);
     }
 
     #[tokio::test]

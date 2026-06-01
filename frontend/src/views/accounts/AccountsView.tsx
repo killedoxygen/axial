@@ -118,6 +118,7 @@ interface SavedSkinRecord {
   source: string;
   created_at: string;
   updated_at: string;
+  applied_at: string | null;
   byte_size: number;
 }
 
@@ -519,6 +520,11 @@ function savedSkinRecord(value: unknown): SavedSkinRecord | null {
     typeof value.source !== 'string' ||
     typeof value.created_at !== 'string' ||
     typeof value.updated_at !== 'string' ||
+    (
+      value.applied_at !== undefined &&
+      value.applied_at !== null &&
+      typeof value.applied_at !== 'string'
+    ) ||
     typeof value.byte_size !== 'number'
   ) {
     return null;
@@ -531,6 +537,7 @@ function savedSkinRecord(value: unknown): SavedSkinRecord | null {
     source: value.source,
     created_at: value.created_at,
     updated_at: value.updated_at,
+    applied_at: typeof value.applied_at === 'string' ? value.applied_at : null,
     byte_size: value.byte_size,
   };
 }
@@ -1774,7 +1781,10 @@ function SavedSkinLibrary({
   const [skinName, setSkinName] = useState('');
   const [variant, setVariant] = useState<SkinVariant>('classic');
   const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState<string | null>(null);
+  const [message, setMessage] = useState<{
+    tone: 'ok' | 'err';
+    text: string;
+  } | null>(null);
   const [deleteKey, setDeleteKey] = useState<string | null>(null);
   const [applyKey, setApplyKey] = useState<string | null>(null);
   const trimmedName = skinName.trim();
@@ -1783,7 +1793,7 @@ function SavedSkinLibrary({
   const upload = async (file: File): Promise<void> => {
     const name = trimmedName || file.name.replace(/\.[^.]+$/, '').trim();
     if (!name) {
-      setMessage('Name the skin before uploading.');
+      setMessage({ tone: 'err', text: 'Name the skin before uploading.' });
       return;
     }
 
@@ -1798,12 +1808,17 @@ function SavedSkinLibrary({
       });
       const payload = await response.json().catch(() => undefined);
       if (!response.ok) {
-        throw new Error(readApiPayloadMessage(payload, `Upload failed with HTTP ${response.status}`));
+        throw new Error(
+          readApiPayloadMessage(payload, `Upload failed with HTTP ${response.status}`),
+        );
       }
       setSkinName('');
       refresh();
     } catch (err) {
-      setMessage(err instanceof Error ? err.message : 'Could not save skin.');
+      setMessage({
+        tone: 'err',
+        text: err instanceof Error ? err.message : 'Could not save skin.',
+      });
     } finally {
       setBusy(false);
       if (fileInputRef.current) fileInputRef.current.value = '';
@@ -1817,21 +1832,31 @@ function SavedSkinLibrary({
       await api('DELETE', `/skins/${textureKey}`);
       refresh();
     } catch (err) {
-      setMessage(err instanceof Error ? err.message : 'Could not delete skin.');
+      setMessage({
+        tone: 'err',
+        text: err instanceof Error ? err.message : 'Could not delete skin.',
+      });
     } finally {
       setDeleteKey(null);
     }
   };
 
   const applySkin = async (textureKey: string): Promise<void> => {
+    const skin = skins.find((saved) => saved.texture_key === textureKey);
+    if (skin?.applied_at) return;
+
     setApplyKey(textureKey);
     setMessage(null);
     try {
       await api('POST', `/skins/${textureKey}/apply`);
       onApplied();
       refresh();
+      setMessage({ tone: 'ok', text: 'Skin applied to Minecraft profile.' });
     } catch (err) {
-      setMessage(err instanceof Error ? err.message : 'Could not apply skin.');
+      setMessage({
+        tone: 'err',
+        text: err instanceof Error ? err.message : 'Could not apply skin.',
+      });
     } finally {
       setApplyKey(null);
     }
@@ -1889,12 +1914,12 @@ function SavedSkinLibrary({
 
         {message && (
           <div style={{
-            color: 'var(--err)',
+            color: message.tone === 'err' ? 'var(--err)' : theme.n.textDim,
             fontSize: 12,
             fontWeight: 500,
             lineHeight: 1.4,
           }}>
-            {message}
+            {message.text}
           </div>
         )}
 
@@ -1919,80 +1944,97 @@ function SavedSkinLibrary({
               No saved skins yet.
             </div>
           ) : (
-            skins.map((skin, index) => (
-              <div
-                key={skin.texture_key}
-                style={{
-                  display: 'grid',
-                  gridTemplateColumns: '42px minmax(0, 1fr) auto auto auto',
-                  gap: 12,
-                  alignItems: 'center',
-                  padding: '10px 12px',
-                  borderTop: index === 0 ? undefined : '1px solid var(--line)',
-                }}
-              >
-                <img
-                  src={apiResourceUrl(`/skins/${skin.texture_key}/file`)}
-                  alt=""
-                  width={32}
-                  height={32}
+            skins.map((skin, index) => {
+              const applied = Boolean(skin.applied_at);
+
+              return (
+                <div
+                  key={skin.texture_key}
                   style={{
-                    width: 32,
-                    height: 32,
-                    objectFit: 'cover',
-                    imageRendering: 'pixelated',
-                    border: '1px solid var(--line)',
-                    borderRadius: theme.r.sm,
-                    background: theme.n.surface,
+                    display: 'grid',
+                    gridTemplateColumns: '42px minmax(0, 1fr) auto auto auto',
+                    gap: 12,
+                    alignItems: 'center',
+                    padding: '10px 12px',
+                    borderTop: index === 0 ? undefined : '1px solid var(--line)',
                   }}
-                />
-                <div style={{ minWidth: 0 }}>
-                  <div style={{
-                    color: theme.n.text,
-                    fontSize: 13,
-                    fontWeight: 700,
-                    lineHeight: 1.25,
-                    overflow: 'hidden',
-                    textOverflow: 'ellipsis',
-                    whiteSpace: 'nowrap',
-                  }}>
-                    {skin.name}
+                >
+                  <img
+                    src={apiResourceUrl(`/skins/${skin.texture_key}/file`)}
+                    alt=""
+                    width={32}
+                    height={32}
+                    style={{
+                      width: 32,
+                      height: 32,
+                      objectFit: 'cover',
+                      imageRendering: 'pixelated',
+                      border: '1px solid var(--line)',
+                      borderRadius: theme.r.sm,
+                      background: theme.n.surface,
+                    }}
+                  />
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{
+                      color: theme.n.text,
+                      fontSize: 13,
+                      fontWeight: 700,
+                      lineHeight: 1.25,
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                    }}>
+                      {skin.name}
+                    </div>
+                    <div style={{
+                      color: theme.n.textMute,
+                      fontSize: 11,
+                      fontWeight: 500,
+                      lineHeight: 1.35,
+                      fontFamily: theme.font.mono,
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                    }}>
+                      {skin.texture_key.slice(0, 12)} / {formatByteSize(skin.byte_size)}
+                    </div>
                   </div>
                   <div style={{
-                    color: theme.n.textMute,
-                    fontSize: 11,
-                    fontWeight: 500,
-                    lineHeight: 1.35,
-                    fontFamily: theme.font.mono,
-                    overflow: 'hidden',
-                    textOverflow: 'ellipsis',
-                    whiteSpace: 'nowrap',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 6,
+                    flexWrap: 'wrap',
+                    justifyContent: 'flex-end',
                   }}>
-                    {skin.texture_key.slice(0, 12)} / {formatByteSize(skin.byte_size)}
+                    <Pill tone="neutral">{skin.variant}</Pill>
+                    {applied && <Pill tone="ok" icon="check-circle">Equipped</Pill>}
                   </div>
+                  <Button
+                    variant={applied ? 'ghost' : 'secondary'}
+                    size="sm"
+                    icon={applied
+                      ? 'check-circle'
+                      : applyKey === skin.texture_key ? 'refresh' : 'check'}
+                    disabled={!onlineReady || applied || applyKey === skin.texture_key}
+                    onClick={() => void applySkin(skin.texture_key)}
+                    title={applied
+                      ? 'Already applied to the active Minecraft account'
+                      : onlineReady ? 'Apply to active Minecraft account' : 'Online Minecraft account required'}
+                  >
+                    {applied ? 'Applied' : 'Apply'}
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    icon="trash"
+                    disabled={deleteKey === skin.texture_key}
+                    onClick={() => void deleteSkin(skin.texture_key)}
+                  >
+                    Delete
+                  </Button>
                 </div>
-                <Pill tone="neutral">{skin.variant}</Pill>
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  icon={applyKey === skin.texture_key ? 'refresh' : 'check'}
-                  disabled={!onlineReady || applyKey === skin.texture_key}
-                  onClick={() => void applySkin(skin.texture_key)}
-                  title={onlineReady ? 'Apply to active Minecraft account' : 'Online Minecraft account required'}
-                >
-                  Apply
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  icon="trash"
-                  disabled={deleteKey === skin.texture_key}
-                  onClick={() => void deleteSkin(skin.texture_key)}
-                >
-                  Delete
-                </Button>
-              </div>
-            ))
+              );
+            })
           )}
         </div>
       </div>

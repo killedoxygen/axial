@@ -7,7 +7,7 @@ use std::{
 };
 
 const SKIN_STORE_SCHEMA: &str = "croopor.skins.saved";
-const SKIN_STORE_SCHEMA_VERSION: u32 = 1;
+const SKIN_STORE_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -18,6 +18,7 @@ pub struct SavedSkinRecord {
     pub source: String,
     pub created_at: String,
     pub updated_at: String,
+    pub applied_at: Option<String>,
     pub byte_size: usize,
 }
 
@@ -84,6 +85,9 @@ impl SavedSkinStore {
             .and_then(|position| index.skins.get(position))
             .map(|skin| skin.created_at.clone())
             .unwrap_or_else(|| now.clone());
+        let applied_at = existing
+            .and_then(|position| index.skins.get(position))
+            .and_then(|skin| skin.applied_at.clone());
 
         let record = SavedSkinRecord {
             texture_key,
@@ -92,6 +96,7 @@ impl SavedSkinStore {
             source,
             created_at,
             updated_at: now,
+            applied_at,
             byte_size: png_bytes.len(),
         };
 
@@ -127,6 +132,30 @@ impl SavedSkinStore {
         self.persist_index(&index)?;
 
         Ok(Some(record))
+    }
+
+    pub fn mark_applied(&self, texture_key: &str) -> io::Result<Option<String>> {
+        let _guard = self.lock.lock().map_err(|_| lock_error())?;
+        let mut index = self.load_index()?;
+        if !index
+            .skins
+            .iter()
+            .any(|skin| skin.texture_key == texture_key)
+        {
+            return Ok(None);
+        }
+
+        let applied_at = chrono::Utc::now().to_rfc3339();
+        for skin in &mut index.skins {
+            skin.applied_at = if skin.texture_key == texture_key {
+                Some(applied_at.clone())
+            } else {
+                None
+            };
+        }
+        self.persist_index(&index)?;
+
+        Ok(Some(applied_at))
     }
 
     pub fn read_png(&self, texture_key: &str) -> io::Result<Option<Vec<u8>>> {
