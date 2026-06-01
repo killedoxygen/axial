@@ -67,7 +67,6 @@ export function PickStep({
   const subtitle = source === 'vanilla'
     ? 'Pure Minecraft. Pick a version to begin.'
     : `${LOADER_LABELS[source]}. Pick the Minecraft version it should target.`;
-  const selectedSourceText = `${LOADER_LABELS[source]} selected. ${LOADER_TAGLINES[source]}.`;
 
   return (
     <section class="cp-cr-step cp-cr-step--pick">
@@ -84,6 +83,7 @@ export function PickStep({
             class="cp-cr-rail-item"
             data-active={source === key}
             data-label={LOADER_LABELS[key]}
+            data-tag={LOADER_TAGLINES[key]}
             role="radio"
             aria-checked={source === key}
             aria-label={`${LOADER_LABELS[key]}: ${LOADER_TAGLINES[key]}`}
@@ -100,7 +100,6 @@ export function PickStep({
           </button>
         ))}
       </aside>
-      <p class="cp-cr-source-status" aria-live="polite">{selectedSourceText}</p>
 
       <div class="cp-cr-vpane">
         <div class="cp-cr-vbar">
