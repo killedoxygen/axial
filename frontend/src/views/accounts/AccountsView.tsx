@@ -558,6 +558,12 @@ function activeMinecraftSkin(profile: MinecraftProfile | undefined): MinecraftSk
     ?? null;
 }
 
+function isPngFile(file: File): boolean {
+  const type = file.type.trim().toLowerCase();
+  if (type) return type === 'image/png';
+  return file.name.toLowerCase().endsWith('.png');
+}
+
 function minecraftProfile(value: unknown): MinecraftProfile | undefined {
   if (!isRecord(value)) return undefined;
   if (typeof value.id !== 'string' || typeof value.name !== 'string') return undefined;
@@ -1790,11 +1796,15 @@ function SavedSkinLibrary({
 }): JSX.Element {
   const theme = useTheme();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const uploadDragDepthRef = useRef(0);
   const { skins, state, error, refresh } = useSavedSkins();
   const [skinName, setSkinName] = useState('');
   const [variant, setVariant] = useState<SkinVariant>('classic');
   const [busy, setBusy] = useState(false);
   const [profileBusy, setProfileBusy] = useState(false);
+  const [uploadDragActive, setUploadDragActive] = useState(false);
+  const [uploadHover, setUploadHover] = useState(false);
+  const [uploadFocused, setUploadFocused] = useState(false);
   const [message, setMessage] = useState<{
     tone: 'ok' | 'err';
     text: string;
@@ -1976,6 +1986,65 @@ function SavedSkinLibrary({
     setMessage(null);
   };
 
+  const handleUploadDrop = (event: DragEvent): void => {
+    event.preventDefault();
+    event.stopPropagation();
+    uploadDragDepthRef.current = 0;
+    setUploadDragActive(false);
+
+    const files = event.dataTransfer?.files;
+    if (!files || files.length === 0) return;
+    if (files.length !== 1) {
+      setMessage({ tone: 'err', text: 'Drop one PNG skin file.' });
+      return;
+    }
+
+    const file = files[0];
+    if (!isPngFile(file)) {
+      setMessage({ tone: 'err', text: 'Upload a PNG skin file.' });
+      return;
+    }
+    if (busy || profileBusy) {
+      setMessage({ tone: 'err', text: 'Wait for the current skin action to finish.' });
+      return;
+    }
+
+    void upload(file);
+  };
+
+  const handleUploadDragEnter = (event: DragEvent): void => {
+    if (!Array.from(event.dataTransfer?.types ?? []).includes('Files')) return;
+    event.preventDefault();
+    event.stopPropagation();
+    uploadDragDepthRef.current += 1;
+    setUploadDragActive(true);
+  };
+
+  const handleUploadDragOver = (event: DragEvent): void => {
+    if (!Array.from(event.dataTransfer?.types ?? []).includes('Files')) return;
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = busy || profileBusy ? 'none' : 'copy';
+  };
+
+  const handleUploadDragLeave = (event: DragEvent): void => {
+    if (!Array.from(event.dataTransfer?.types ?? []).includes('Files')) return;
+    event.preventDefault();
+    event.stopPropagation();
+    uploadDragDepthRef.current = Math.max(0, uploadDragDepthRef.current - 1);
+    if (uploadDragDepthRef.current === 0) setUploadDragActive(false);
+  };
+
+  const handleUploadFile = (file: File): void => {
+    if (!isPngFile(file)) {
+      setMessage({ tone: 'err', text: 'Upload a PNG skin file.' });
+      if (fileInputRef.current) fileInputRef.current.value = '';
+      return;
+    }
+    void upload(file);
+  };
+
+  const uploadActive = uploadDragActive || uploadHover || uploadFocused;
+
   return (
     <Card>
       <SectionHeading
@@ -1983,37 +2052,65 @@ function SavedSkinLibrary({
         right={<Pill tone="neutral" icon="image">{state === 'ready' ? String(skins.length) : '...'}</Pill>}
       />
       <div style={{ display: 'grid', gap: 16 }}>
-        <div style={{
-          display: 'grid',
-          gridTemplateColumns: 'minmax(220px, 1fr) auto auto',
-          gap: 10,
-          alignItems: 'center',
-        }}>
-          <Input
-            value={skinName}
-            onChange={(value) => {
-              setSkinName(value.slice(0, 64));
-              setMessage(null);
-            }}
-            placeholder="Skin name"
-            icon="tag"
-          />
-          <Segmented<SkinVariant>
-            options={[
-              { value: 'classic', label: 'Classic' },
-              { value: 'slim', label: 'Slim' },
-            ]}
-            value={variant}
-            onChange={setVariant}
-          />
-          <Button
-            variant="secondary"
-            icon="plus"
-            disabled={!canUpload}
-            onClick={() => fileInputRef.current?.click()}
-          >
-            Upload PNG
-          </Button>
+        <div
+          style={{
+            display: 'grid',
+            gap: 10,
+            padding: 12,
+            border: uploadActive ? '1px dashed var(--accent-line)' : '1px dashed var(--line)',
+            borderRadius: theme.r.md,
+            background: uploadActive ? 'var(--accent-softer)' : theme.n.surface2,
+            boxShadow: uploadActive ? '0 0 0 3px var(--accent-ring)' : undefined,
+          }}
+          onDragEnter={handleUploadDragEnter}
+          onDragOver={handleUploadDragOver}
+          onDragLeave={handleUploadDragLeave}
+          onDrop={handleUploadDrop}
+          onMouseEnter={() => setUploadHover(true)}
+          onMouseLeave={() => setUploadHover(false)}
+          onFocusCapture={() => setUploadFocused(true)}
+          onBlurCapture={() => setUploadFocused(false)}
+        >
+          <div style={{
+            display: 'grid',
+            gridTemplateColumns: 'minmax(220px, 1fr) auto auto',
+            gap: 10,
+            alignItems: 'center',
+          }}>
+            <Input
+              value={skinName}
+              onChange={(value) => {
+                setSkinName(value.slice(0, 64));
+                setMessage(null);
+              }}
+              placeholder="Skin name"
+              icon="tag"
+            />
+            <Segmented<SkinVariant>
+              options={[
+                { value: 'classic', label: 'Classic' },
+                { value: 'slim', label: 'Slim' },
+              ]}
+              value={variant}
+              onChange={setVariant}
+            />
+            <Button
+              variant="secondary"
+              icon="plus"
+              disabled={!canUpload}
+              onClick={() => fileInputRef.current?.click()}
+            >
+              Upload PNG
+            </Button>
+          </div>
+          <div style={{
+            color: uploadDragActive ? 'var(--accent)' : theme.n.textMute,
+            fontSize: 12,
+            fontWeight: 500,
+            lineHeight: 1.4,
+          }}>
+            {uploadDragActive ? 'Drop one PNG skin file to upload.' : 'Drag a PNG skin file here, or use Upload PNG.'}
+          </div>
           <input
             ref={fileInputRef}
             type="file"
@@ -2021,7 +2118,7 @@ function SavedSkinLibrary({
             style={{ display: 'none' }}
             onChange={(event) => {
               const file = event.currentTarget.files?.[0];
-              if (file) void upload(file);
+              if (file) handleUploadFile(file);
             }}
           />
         </div>
