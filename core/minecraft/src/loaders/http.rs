@@ -66,7 +66,7 @@ fn fetch_bytes_blocking(url: &str, max_size: u64) -> Result<Vec<u8>, LoaderError
     let response = agent()
         .get(url)
         .call()
-        .map_err(|error| LoaderError::Other(format!("request failed for {url}: {error}")))?;
+        .map_err(|error| map_bytes_request_error(url, error))?;
 
     let mut reader = response.into_reader();
     let mut limited = (&mut reader).take(max_size + 1);
@@ -80,6 +80,15 @@ fn fetch_bytes_blocking(url: &str, max_size: u64) -> Result<Vec<u8>, LoaderError
     Ok(bytes)
 }
 
+fn map_bytes_request_error(url: &str, error: ureq::Error) -> LoaderError {
+    match error {
+        ureq::Error::Status(404, _) => {
+            LoaderError::ArtifactMissing(format!("artifact returned HTTP 404 for {url}"))
+        }
+        error => LoaderError::Other(format!("request failed for {url}: {error}")),
+    }
+}
+
 fn agent() -> &'static ureq::Agent {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
     AGENT.get_or_init(|| {
@@ -90,4 +99,49 @@ fn agent() -> &'static ureq::Agent {
             .user_agent(USER_AGENT)
             .build()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fetch_bytes;
+    use crate::loaders::types::LoaderError;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
+
+    #[tokio::test]
+    async fn fetch_bytes_maps_http_404_to_artifact_missing() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let url = format!(
+            "http://{}/missing-installer.jar",
+            listener.local_addr().expect("server addr")
+        );
+        let server = thread::spawn(move || {
+            for stream in listener.incoming().take(3) {
+                respond_404(stream.expect("connection"));
+            }
+        });
+
+        let error = fetch_bytes(&url, 1024).await.expect_err("404 error");
+
+        match error {
+            LoaderError::ArtifactMissing(message) => {
+                assert!(message.contains("HTTP 404"), "{message}");
+                assert!(message.contains(&url), "{message}");
+            }
+            error => panic!("expected ArtifactMissing, got {error:?}"),
+        }
+
+        server.join().expect("server thread");
+    }
+
+    fn respond_404(mut stream: TcpStream) {
+        let mut buffer = [0_u8; 1024];
+        let _ = stream.read(&mut buffer);
+        stream
+            .write_all(
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 7\r\nConnection: close\r\n\r\nmissing",
+            )
+            .expect("write response");
+    }
 }
