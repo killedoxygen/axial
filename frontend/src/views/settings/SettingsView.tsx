@@ -1829,8 +1829,34 @@ function ShortcutsSection(): JSX.Element {
 // ── Advanced ────────────────────────────────────────────────────────────
 
 function AdvancedSection(): JSX.Element {
+  const cfg = config.value;
   const isDev = devMode.value;
+  const savedTelemetry = cfg?.telemetry_enabled === true;
+  const [telemetryEnabled, setTelemetryEnabled] = useState(savedTelemetry);
+  const [savingTelemetry, setSavingTelemetry] = useState(false);
   const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    setTelemetryEnabled(savedTelemetry);
+  }, [savedTelemetry]);
+
+  const toggleTelemetry = async (): Promise<void> => {
+    if (savingTelemetry) return;
+    const next = !telemetryEnabled;
+    setTelemetryEnabled(next);
+    setSavingTelemetry(true);
+    try {
+      const res: any = await api('PUT', '/config', { telemetry_enabled: next });
+      if (res?.error) throw new Error(res.error);
+      config.value = res;
+      toast('Saved');
+    } catch (err) {
+      setTelemetryEnabled(savedTelemetry);
+      toast(`Could not save diagnostics setting: ${errMessage(err)}`, 'error');
+    } finally {
+      setSavingTelemetry(false);
+    }
+  };
 
   const flush = async (): Promise<void> => {
     const { showConfirm } = await import('../../ui/Dialog');
@@ -1850,6 +1876,11 @@ function AdvancedSection(): JSX.Element {
 
   return (
     <>
+      <SettingsCard
+        title="Optional diagnostics"
+        desc="Stores consent for future lightweight diagnostics. Current builds do not upload telemetry or open a remote diagnostics channel."
+        control={<Toggle on={telemetryEnabled} onChange={() => void toggleTelemetry()} />}
+      />
       <SettingsCard
         title="Reload launcher"
         desc="Useful if the launcher gets out of sync with the backend."
