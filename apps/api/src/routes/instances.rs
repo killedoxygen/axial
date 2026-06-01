@@ -1135,6 +1135,7 @@ fn screenshot_content_type(name: &str) -> Option<&'static str> {
 fn is_safe_resource_name(name: &str) -> bool {
     !name.is_empty()
         && !name.trim().is_empty()
+        && name.trim() == name
         && name != "."
         && name != ".."
         && !name.starts_with('.')
