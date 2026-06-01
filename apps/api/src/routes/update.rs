@@ -2,7 +2,10 @@ use crate::state::AppState;
 use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
 use reqwest::header::{ACCEPT, USER_AGENT};
 use serde::{Deserialize, Serialize};
-use std::time::{Duration, SystemTime};
+use std::{
+    sync::OnceLock,
+    time::{Duration, SystemTime},
+};
 
 const GITHUB_LATEST_RELEASE_URL: &str =
     "https://api.github.com/repos/mateoltd/croopor/releases/latest";
@@ -10,6 +13,7 @@ const GITHUB_RELEASE_PAGE_PREFIX: &str = "https://github.com/mateoltd/croopor/re
 const GITHUB_RELEASE_DOWNLOAD_PREFIX: &str =
     "https://github.com/mateoltd/croopor/releases/download/";
 const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
+const UPDATE_CHECK_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const UPDATE_CHECK_UNAVAILABLE_MESSAGE: &str = "update check unavailable";
 
 type ApiErrorResponse = (StatusCode, Json<serde_json::Value>);
@@ -63,11 +67,7 @@ async fn handle_update(
 async fn fetch_latest_release(
     current_version: &str,
 ) -> Result<GithubLatestRelease, reqwest::Error> {
-    let client = reqwest::Client::builder()
-        .timeout(UPDATE_CHECK_TIMEOUT)
-        .build()?;
-
-    client
+    update_http_client()
         .get(GITHUB_LATEST_RELEASE_URL)
         .header(USER_AGENT, format!("Croopor/{current_version}"))
         .header(ACCEPT, "application/vnd.github+json")
@@ -76,6 +76,19 @@ async fn fetch_latest_release(
         .error_for_status()?
         .json::<GithubLatestRelease>()
         .await
+}
+
+fn update_http_client() -> reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .connect_timeout(UPDATE_CHECK_CONNECT_TIMEOUT)
+                .timeout(UPDATE_CHECK_TIMEOUT)
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new())
+        })
+        .clone()
 }
 
 fn fallback_response(current_version: &str, checked_at: &str) -> UpdateResponse {
