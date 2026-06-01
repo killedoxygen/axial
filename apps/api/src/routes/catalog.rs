@@ -2,7 +2,7 @@ use crate::state::AppState;
 use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
 use croopor_minecraft::{
     LifecycleMeta, MinecraftVersionMeta, VersionSubjectKind, analyze_minecraft_version,
-    fetch_version_manifest, manifest_release_references, scan_versions,
+    fetch_version_manifest_cached, manifest_release_references, scan_versions,
 };
 use serde::Serialize;
 use std::collections::HashSet;
@@ -40,11 +40,12 @@ async fn handle_catalog(
         ));
     };
 
-    let manifest = fetch_version_manifest()
+    let mc_dir = PathBuf::from(mc_dir);
+    let manifest = fetch_version_manifest_cached(&mc_dir)
         .await
         .map_err(catalog_fetch_error_response)?;
 
-    let installed: HashSet<String> = scan_versions(&PathBuf::from(mc_dir))
+    let installed: HashSet<String> = scan_versions(&mc_dir)
         .unwrap_or_default()
         .into_iter()
         .filter(|version| version.launchable)

@@ -7,8 +7,8 @@ use axum::{
     routing::get,
 };
 use croopor_minecraft::{
-    VersionEntry, enrich_version_entries, fetch_version_manifest, manifest_release_references,
-    scan_versions,
+    VersionEntry, enrich_version_entries, fetch_version_manifest_cached,
+    manifest_release_references, scan_versions,
 };
 use serde::Serialize;
 use std::{convert::Infallible, path::PathBuf, time::Duration};
@@ -35,9 +35,9 @@ async fn handle_versions(
         ));
     };
 
-    let mut versions =
-        scan_versions(&PathBuf::from(mc_dir)).map_err(scan_versions_error_response)?;
-    if let Ok(manifest) = fetch_version_manifest().await {
+    let mc_dir = PathBuf::from(mc_dir);
+    let mut versions = scan_versions(&mc_dir).map_err(scan_versions_error_response)?;
+    if let Ok(manifest) = fetch_version_manifest_cached(&mc_dir).await {
         let releases = manifest_release_references(&manifest);
         enrich_version_entries(&mut versions, &releases);
     }
@@ -66,7 +66,7 @@ async fn handle_version_watch(
         loop {
             ticker.tick().await;
             let mut versions = scan_versions(&mc_dir).unwrap_or_default();
-            if let Ok(manifest) = fetch_version_manifest().await {
+            if let Ok(manifest) = fetch_version_manifest_cached(&mc_dir).await {
                 let releases = manifest_release_references(&manifest);
                 enrich_version_entries(&mut versions, &releases);
             }

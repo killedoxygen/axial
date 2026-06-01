@@ -1,6 +1,6 @@
 use crate::java::ensure_java_runtime;
 use crate::launch::{Library, VersionJson, maven_to_path};
-use crate::manifest::{ManifestEntry, fetch_version_manifest};
+use crate::manifest::{ManifestEntry, fetch_version_manifest_cached};
 use crate::paths::{assets_dir, libraries_dir, versions_dir};
 use crate::rules::{current_os_arch, default_environment, evaluate_rules};
 use futures_util::StreamExt;
@@ -384,7 +384,7 @@ impl Downloader {
         &self,
         version_id: &str,
     ) -> Result<VersionJsonDownload, DownloadError> {
-        let manifest = fetch_version_manifest()
+        let manifest = fetch_version_manifest_cached(&self.mc_dir)
             .await
             .map_err(|error| DownloadError::ResolveManifest(error.to_string()))?;
         manifest
