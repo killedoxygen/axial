@@ -110,6 +110,7 @@ type OfflineProfileState = 'loading' | 'ready' | 'unavailable';
 type AuthStatusState = 'loading' | 'ready' | 'unavailable';
 type CopyTarget = 'code' | 'url';
 type SkinVariant = 'classic' | 'slim';
+type SavedSkinPreviewSide = 'front' | 'back';
 
 interface SavedSkinRecord {
   texture_key: string;
@@ -1817,6 +1818,7 @@ function SavedSkinLibrary({
   const [deleteKey, setDeleteKey] = useState<string | null>(null);
   const [applyKey, setApplyKey] = useState<string | null>(null);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
+  const [previewSide, setPreviewSide] = useState<SavedSkinPreviewSide>('front');
   const profileSkin = activeMinecraftSkin(minecraftProfile);
   const profileSkinVariant = skinVariantValue(profileSkin?.variant);
   const trimmedName = skinName.trim();
@@ -2230,7 +2232,19 @@ function SavedSkinLibrary({
             padding: '2px 0 14px',
             borderBottom: '1px solid var(--line)',
           }}>
-            <SavedSkinBodyPreview skin={selectedSkin} />
+            <div style={{ display: 'grid', gap: 8, justifyItems: 'center' }}>
+              <SavedSkinBodyPreview skin={selectedSkin} side={previewSide} />
+              <div role="group" aria-label={`${selectedSkin.name} body preview side`}>
+                <Segmented<SavedSkinPreviewSide>
+                  options={[
+                    { value: 'front', label: 'Front' },
+                    { value: 'back', label: 'Back' },
+                  ]}
+                  value={previewSide}
+                  onChange={setPreviewSide}
+                />
+              </div>
+            </div>
             <div style={{ minWidth: 0, display: 'grid', gap: 8 }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
                 <Pill tone={selectedSkin.applied_at ? 'ok' : 'info'} icon={selectedSkin.applied_at ? 'check-circle' : 'image'}>
@@ -2532,16 +2546,41 @@ function SkinPreviewPart({
   );
 }
 
-function SavedSkinBodyPreview({ skin }: { skin: SavedSkinRecord }): JSX.Element {
+function SavedSkinBodyPreview({
+  skin,
+  side,
+}: {
+  skin: SavedSkinRecord;
+  side: SavedSkinPreviewSide;
+}): JSX.Element {
   const src = savedSkinFileUrl(skin);
   const scale = 6;
   const slim = skin.variant === 'slim';
   const armWidth = slim ? 3 : 4;
+  const parts = side === 'front'
+    ? {
+      head: { x: 8, y: 8 },
+      headOverlay: { x: 40, y: 8 },
+      rightArm: { x: 44, y: 20, w: armWidth },
+      body: { x: 20, y: 20 },
+      leftArm: { x: 36, y: 52, w: armWidth },
+      rightLeg: { x: 4, y: 20 },
+      leftLeg: { x: 20, y: 52 },
+    }
+    : {
+      head: { x: 24, y: 8 },
+      headOverlay: { x: 56, y: 8 },
+      rightArm: { x: slim ? 51 : 52, y: 20, w: armWidth },
+      body: { x: 32, y: 20 },
+      leftArm: { x: slim ? 43 : 44, y: 52, w: armWidth },
+      rightLeg: { x: 12, y: 20 },
+      leftLeg: { x: 28, y: 52 },
+    };
 
   return (
     <div
       role="img"
-      aria-label={`${skin.name} full skin preview`}
+      aria-label={`${skin.name} ${side} full skin preview`}
       style={{
         width: 118,
         minHeight: 208,
@@ -2557,11 +2596,11 @@ function SavedSkinBodyPreview({ skin }: { skin: SavedSkinRecord }): JSX.Element 
       }}
     >
       <div style={{ position: 'relative', width: 8 * scale, height: 8 * scale, marginBottom: 2 }}>
-        <SkinPreviewPart src={src} x={8} y={8} w={8} h={8} scale={scale} />
+        <SkinPreviewPart src={src} x={parts.head.x} y={parts.head.y} w={8} h={8} scale={scale} />
         <SkinPreviewPart
           src={src}
-          x={40}
-          y={8}
+          x={parts.headOverlay.x}
+          y={parts.headOverlay.y}
           w={8}
           h={8}
           scale={scale}
@@ -2569,13 +2608,13 @@ function SavedSkinBodyPreview({ skin }: { skin: SavedSkinRecord }): JSX.Element 
         />
       </div>
       <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'center' }}>
-        <SkinPreviewPart src={src} x={44} y={20} w={armWidth} h={12} scale={scale} />
-        <SkinPreviewPart src={src} x={20} y={20} w={8} h={12} scale={scale} />
-        <SkinPreviewPart src={src} x={36} y={52} w={armWidth} h={12} scale={scale} />
+        <SkinPreviewPart src={src} x={parts.rightArm.x} y={parts.rightArm.y} w={parts.rightArm.w} h={12} scale={scale} />
+        <SkinPreviewPart src={src} x={parts.body.x} y={parts.body.y} w={8} h={12} scale={scale} />
+        <SkinPreviewPart src={src} x={parts.leftArm.x} y={parts.leftArm.y} w={parts.leftArm.w} h={12} scale={scale} />
       </div>
       <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'center' }}>
-        <SkinPreviewPart src={src} x={4} y={20} w={4} h={12} scale={scale} />
-        <SkinPreviewPart src={src} x={20} y={52} w={4} h={12} scale={scale} />
+        <SkinPreviewPart src={src} x={parts.rightLeg.x} y={parts.rightLeg.y} w={4} h={12} scale={scale} />
+        <SkinPreviewPart src={src} x={parts.leftLeg.x} y={parts.leftLeg.y} w={4} h={12} scale={scale} />
       </div>
     </div>
   );
