@@ -19,6 +19,7 @@ const RUNTIME_MANIFEST_URL: &str = "https://launchermeta.mojang.com/v1/products/
 const MIN_RUNTIME_FILE_DOWNLOAD_CONCURRENCY: usize = 2;
 const MAX_RUNTIME_FILE_DOWNLOAD_CONCURRENCY: usize = 8;
 const RUNTIME_FILE_DOWNLOADS_PER_CORE: usize = 2;
+const MAX_RUNTIME_MANIFEST_BYTES: u64 = 16 << 20;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JavaRuntimeInfo {
@@ -1070,30 +1071,50 @@ fn bounded_manifest_file_label(relative_path: &str) -> String {
 
 async fn fetch_runtime_json<T>(url: &str) -> Result<T, JavaRuntimeLookupError>
 where
-    T: serde::de::DeserializeOwned + Send + 'static,
+    T: serde::de::DeserializeOwned,
 {
-    let url = url.to_string();
-    let agent = runtime_manifest_agent().clone();
-    tokio::task::spawn_blocking(move || {
-        let response = agent
-            .get(&url)
-            .call()
-            .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
-        response
-            .into_json::<T>()
-            .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))
-    })
-    .await
-    .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?
+    let response = runtime_manifest_client()
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(JavaRuntimeLookupError::Download(format!("HTTP {status}")));
+    }
+    if response
+        .content_length()
+        .is_some_and(|content_length| content_length > MAX_RUNTIME_MANIFEST_BYTES)
+    {
+        return Err(JavaRuntimeLookupError::Download(
+            "runtime manifest response too large".to_string(),
+        ));
+    }
+
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+        if body.len() as u64 + chunk.len() as u64 > MAX_RUNTIME_MANIFEST_BYTES {
+            return Err(JavaRuntimeLookupError::Download(
+                "runtime manifest response too large".to_string(),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    serde_json::from_slice::<T>(&body)
+        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))
 }
 
-fn runtime_manifest_agent() -> &'static ureq::Agent {
-    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
-    AGENT.get_or_init(|| {
-        ureq::AgentBuilder::new()
+fn runtime_manifest_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .user_agent("croopor/0.3")
             .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
     })
 }
 
@@ -1324,11 +1345,12 @@ mod tests {
         ComponentManifestFile, JavaRuntimeLookupError, RuntimeDownloadActual,
         RuntimeDownloadEvidence, RuntimeDownloadIntegrityError, RuntimeInstallState,
         component_manifest_destination, detect_distribution, detect_runtime_state,
-        fetch_runtime_file, java_executable, plan_runtime_manifest_files,
+        fetch_runtime_file, fetch_runtime_json, java_executable, plan_runtime_manifest_files,
         remove_runtime_install_path, runtime_download_client,
         runtime_file_download_concurrency_for, runtime_install_lock_from_map,
         verify_runtime_download,
     };
+    use serde::Deserialize;
     use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1542,6 +1564,52 @@ mod tests {
             vec!["bin/java", "lib/server/libjvm.so"]
         );
         assert_eq!(planned_paths(&plan.other_entries), vec!["ignored-entry"]);
+    }
+
+    #[tokio::test]
+    async fn runtime_manifest_json_fetch_reads_async_http_body() {
+        #[derive(Debug, Deserialize)]
+        struct SampleRuntimeManifest {
+            ok: bool,
+        }
+
+        let url = serve_runtime_json(200, r#"{"ok":true}"#.as_bytes().to_vec(), None).await;
+
+        let manifest = fetch_runtime_json::<SampleRuntimeManifest>(&url)
+            .await
+            .expect("runtime manifest json");
+
+        assert!(manifest.ok);
+    }
+
+    #[tokio::test]
+    async fn runtime_manifest_json_fetch_rejects_http_errors() {
+        let url = serve_runtime_json(503, b"unavailable".to_vec(), None).await;
+
+        let error = fetch_runtime_json::<serde_json::Value>(&url)
+            .await
+            .expect_err("HTTP error should fail");
+
+        assert!(error.to_string().contains("HTTP 503"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn runtime_manifest_json_fetch_rejects_oversized_content_length() {
+        let url = serve_runtime_json(
+            200,
+            b"ignored".to_vec(),
+            Some(super::MAX_RUNTIME_MANIFEST_BYTES + 1),
+        )
+        .await;
+
+        let error = fetch_runtime_json::<serde_json::Value>(&url)
+            .await
+            .expect_err("oversized manifest should fail");
+
+        assert_eq!(
+            error.to_string(),
+            "failed to install java runtime: runtime manifest response too large"
+        );
     }
 
     #[test]
@@ -1758,6 +1826,21 @@ mod tests {
     }
 
     async fn serve_runtime_download(body: Vec<u8>) -> String {
+        let content_length = body.len() as u64;
+        serve_runtime_response(200, body, content_length, "/runtime.bin").await
+    }
+
+    async fn serve_runtime_json(status: u16, body: Vec<u8>, content_length: Option<u64>) -> String {
+        let content_length = content_length.unwrap_or(body.len() as u64);
+        serve_runtime_response(status, body, content_length, "/runtime.json").await
+    }
+
+    async fn serve_runtime_response(
+        status: u16,
+        body: Vec<u8>,
+        content_length: u64,
+        path: &str,
+    ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("runtime test listener");
@@ -1768,9 +1851,9 @@ mod tests {
             let (mut socket, _) = listener.accept().await.expect("runtime test connection");
             let mut request = [0_u8; 1024];
             let _ = socket.read(&mut request).await;
+            let reason = if status == 200 { "OK" } else { "Error" };
             let headers = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
+                "HTTP/1.1 {status} {reason}\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
             );
             socket
                 .write_all(headers.as_bytes())
@@ -1781,6 +1864,6 @@ mod tests {
                 .await
                 .expect("runtime test response body");
         });
-        format!("http://{address}/runtime.bin")
+        format!("http://{address}{path}")
     }
 }
