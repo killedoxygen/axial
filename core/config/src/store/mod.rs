@@ -29,11 +29,18 @@ pub enum ConfigStoreError {
 
 impl ConfigStore {
     fn replace_file(source: &Path, destination: &Path) -> Result<(), std::io::Error> {
-        if fs::rename(source, destination).is_ok() {
-            return Ok(());
+        let first_error = match fs::rename(source, destination) {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+
+        match fs::symlink_metadata(source) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(first_error),
+            Err(error) => return Err(error),
         }
 
-        if destination.exists() {
+        if destination.exists() && !destination.is_dir() {
             let _ = fs::remove_file(destination);
         }
 
@@ -363,6 +370,61 @@ mod tests {
 
         assert!(matches!(err, ConfigStoreError::Validation(_)));
         assert!(!paths.config_file.exists());
+
+        cleanup(&paths.config_dir);
+    }
+
+    #[test]
+    fn replace_file_replaces_existing_config_file() {
+        let paths = test_paths("replace-existing-config");
+        fs::create_dir_all(&paths.config_dir).expect("should create temp config dir");
+        let temp_path = paths.config_file.with_extension("json.tmp");
+        fs::write(&paths.config_file, "old config").expect("should write existing config");
+        fs::write(&temp_path, "new config").expect("should write temp config");
+
+        ConfigStore::replace_file(&temp_path, &paths.config_file).expect("replace config");
+
+        assert_eq!(
+            fs::read_to_string(&paths.config_file).expect("config should remain readable"),
+            "new config"
+        );
+        assert!(!temp_path.exists());
+
+        cleanup(&paths.config_dir);
+    }
+
+    #[test]
+    fn replace_file_preserves_existing_config_when_temp_is_missing() {
+        let paths = test_paths("replace-missing-temp");
+        fs::create_dir_all(&paths.config_dir).expect("should create temp config dir");
+        let temp_path = paths.config_file.with_extension("json.tmp");
+        fs::write(&paths.config_file, "existing config").expect("should write existing config");
+
+        let error = ConfigStore::replace_file(&temp_path, &paths.config_file)
+            .expect_err("missing temp should fail");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(
+            fs::read_to_string(&paths.config_file).expect("config should remain readable"),
+            "existing config"
+        );
+        assert!(!temp_path.exists());
+
+        cleanup(&paths.config_dir);
+    }
+
+    #[test]
+    fn replace_file_preserves_directory_destination_on_failed_promotion() {
+        let paths = test_paths("replace-directory-destination");
+        fs::create_dir_all(&paths.config_file).expect("should create config path as directory");
+        let temp_path = paths.config_file.with_extension("json.tmp");
+        fs::write(&temp_path, "new config").expect("should write temp config");
+
+        ConfigStore::replace_file(&temp_path, &paths.config_file)
+            .expect_err("directory destination should fail");
+
+        assert!(paths.config_file.is_dir());
+        assert!(!temp_path.exists());
 
         cleanup(&paths.config_dir);
     }
