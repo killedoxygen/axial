@@ -22,6 +22,7 @@ const DEFAULT_HEAD_SIZE: u32 = 64;
 const MIN_HEAD_SIZE: u32 = 16;
 const MAX_HEAD_SIZE: u32 = 256;
 const HEAD_CACHE_CONTROL: &str = "private, max-age=86400";
+const SAVED_SKIN_FILE_CACHE_CONTROL: &str = "private, max-age=31536000, immutable";
 const MINECRAFT_TEXTURE_URL_PREFIX: &str = "https://textures.minecraft.net/texture/";
 const SKIN_UPLOAD_MAX_BYTES: usize = 256 * 1024;
 const SAVE_SKIN_FROM_PROFILE_REQUEST_MAX_BYTES: usize = 4 * 1024;
@@ -589,6 +590,7 @@ async fn handle_saved_skin_file(
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "image/png")
+        .header(header::CACHE_CONTROL, SAVED_SKIN_FILE_CACHE_CONTROL)
         .body(Body::from(bytes))
         .map_err(|_| {
             (
@@ -2131,6 +2133,16 @@ mod tests {
             .saved_skin_file(&saved.texture_key)
             .await
             .expect("saved skin file");
+        let content_type = file
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let cache_control = file
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
         let file_bytes = response_bytes(file).await;
         let normalized = normalize_skin_png(&png).expect("normalized skin");
 
@@ -2141,6 +2153,11 @@ mod tests {
         assert_eq!(saved.byte_size, normalized.png_bytes.len());
         assert_eq!(saved.texture_key, texture_key(&normalized.png_bytes));
         assert_texture_key(&saved.texture_key);
+        assert_eq!(content_type.as_deref(), Some("image/png"));
+        assert_eq!(
+            cache_control.as_deref(),
+            Some(SAVED_SKIN_FILE_CACHE_CONTROL)
+        );
         assert_eq!(file_bytes, normalized.png_bytes);
     }
 
