@@ -2,7 +2,7 @@ use crate::dto::loaders::{
     LoaderBuildsResponse, LoaderComponentsResponse, LoaderGameVersionsResponse,
 };
 use crate::install_runtime::prewarm_version_runtime;
-use crate::state::AppState;
+use crate::state::{AppState, InstallStore};
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
@@ -19,6 +19,7 @@ use std::{convert::Infallible, path::PathBuf, time::SystemTime};
 use tokio::sync::mpsc;
 
 const LOADER_INSTALL_SCOPE: &str = "loader";
+const VANILLA_INSTALL_SCOPE: &str = "vanilla";
 
 #[derive(Debug, Deserialize)]
 struct LoaderBuildQuery {
@@ -165,6 +166,8 @@ async fn handle_loader_install(
         };
 
         let version_id = build.version_id.clone();
+        wait_for_active_vanilla_base_install(&store, &build.minecraft_version, &progress_tx).await;
+
         let mut final_progress: Option<DownloadProgress> = None;
         let result = install_build(&library_dir, build, |progress| {
             if progress.done && progress.phase == "done" {
@@ -273,6 +276,46 @@ fn loader_install_key_fields(
     )
 }
 
+async fn wait_for_active_vanilla_base_install(
+    store: &InstallStore,
+    version_id: &str,
+    progress_tx: &mpsc::UnboundedSender<DownloadProgress>,
+) {
+    let Some(install_id) = store
+        .active_install_for_scope_and_version(VANILLA_INSTALL_SCOPE, version_id)
+        .await
+    else {
+        return;
+    };
+
+    let Some((history, mut receiver, done)) = store.subscribe(&install_id).await else {
+        return;
+    };
+
+    for progress in history {
+        if progress.done {
+            return;
+        }
+        let _ = progress_tx.send(progress);
+    }
+    if done {
+        return;
+    }
+
+    loop {
+        match receiver.recv().await {
+            Ok(progress) => {
+                if progress.done {
+                    return;
+                }
+                let _ = progress_tx.send(progress);
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        }
+    }
+}
+
 fn progress_event(progress: &DownloadProgress) -> Event {
     Event::default()
         .event("progress")
@@ -378,6 +421,8 @@ fn generate_install_id() -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::{sync::Arc, time::Duration};
+    use tokio::time::timeout;
 
     #[test]
     fn error_response_keeps_status_and_failure_kind_without_raw_details() {
@@ -531,6 +576,99 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn wait_for_active_vanilla_base_install_waits_and_forwards_progress() {
+        let store = Arc::new(InstallStore::new());
+        store
+            .insert_or_existing_active(
+                "vanilla-install".to_string(),
+                "1.21.5".to_string(),
+                String::new(),
+            )
+            .await;
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+
+        let wait_store = store.clone();
+        let waiter = tokio::spawn(async move {
+            wait_for_active_vanilla_base_install(wait_store.as_ref(), "1.21.5", &progress_tx).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiter.is_finished());
+
+        let progress = base_progress("client");
+        store.emit("vanilla-install", progress.clone()).await;
+        assert_eq!(
+            timeout(Duration::from_secs(1), progress_rx.recv())
+                .await
+                .expect("progress should arrive"),
+            Some(progress)
+        );
+
+        store.emit("vanilla-install", done_progress()).await;
+        timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter should finish")
+            .expect("waiter should not panic");
+        assert_eq!(
+            timeout(Duration::from_millis(50), progress_rx.recv())
+                .await
+                .expect("progress sender should close"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_active_vanilla_base_install_does_not_block_done_removed_or_failed_sessions() {
+        let store = InstallStore::new();
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
+
+        store
+            .insert_or_existing_active(
+                "done-install".to_string(),
+                "1.21.5".to_string(),
+                String::new(),
+            )
+            .await;
+        store.emit("done-install", done_progress()).await;
+        timeout(
+            Duration::from_secs(1),
+            wait_for_active_vanilla_base_install(&store, "1.21.5", &progress_tx),
+        )
+        .await
+        .expect("done session should not block");
+
+        store
+            .insert_or_existing_active(
+                "failed-install".to_string(),
+                "1.21.5".to_string(),
+                String::new(),
+            )
+            .await;
+        store.emit("failed-install", failed_progress()).await;
+        timeout(
+            Duration::from_secs(1),
+            wait_for_active_vanilla_base_install(&store, "1.21.5", &progress_tx),
+        )
+        .await
+        .expect("failed session should not block");
+
+        store
+            .insert_or_existing_active(
+                "removed-install".to_string(),
+                "1.21.5".to_string(),
+                String::new(),
+            )
+            .await;
+        store.remove("removed-install").await;
+        timeout(
+            Duration::from_secs(1),
+            wait_for_active_vanilla_base_install(&store, "1.21.5", &progress_tx),
+        )
+        .await
+        .expect("removed session should not block");
+    }
+
     fn assert_no_raw_fragments(message: &str) {
         for fragment in [
             "https://",
@@ -546,6 +684,39 @@ mod tests {
                 !message.contains(fragment),
                 "message leaked raw fragment {fragment:?}: {message}"
             );
+        }
+    }
+
+    fn base_progress(phase: &str) -> DownloadProgress {
+        DownloadProgress {
+            phase: phase.to_string(),
+            current: 1,
+            total: 2,
+            file: Some("base game".to_string()),
+            error: None,
+            done: false,
+        }
+    }
+
+    fn done_progress() -> DownloadProgress {
+        DownloadProgress {
+            phase: "done".to_string(),
+            current: 1,
+            total: 1,
+            file: None,
+            error: None,
+            done: true,
+        }
+    }
+
+    fn failed_progress() -> DownloadProgress {
+        DownloadProgress {
+            phase: "error".to_string(),
+            current: 0,
+            total: 0,
+            file: None,
+            error: Some("failed".to_string()),
+            done: true,
         }
     }
 }

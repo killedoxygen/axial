@@ -106,6 +106,24 @@ impl InstallStore {
             .map(|entry| (entry.history.clone(), entry.events.subscribe(), entry.done))
     }
 
+    pub async fn active_install_for_scope_and_version(
+        &self,
+        scope: &str,
+        version_id: &str,
+    ) -> Option<String> {
+        let scope = scope.trim();
+        let version_id = version_id.trim();
+        self.installs
+            .read()
+            .await
+            .iter()
+            .find_map(|(install_id, entry)| {
+                let key = entry.key.as_ref()?;
+                (!entry.done && key.scope == scope && key.version_id == version_id)
+                    .then(|| install_id.clone())
+            })
+    }
+
     pub async fn active_install_count(&self) -> usize {
         self.installs
             .read()
@@ -389,6 +407,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_install_for_scope_and_version_finds_active_vanilla_by_version() {
+        let store = InstallStore::new();
+        store
+            .insert_or_existing_active(
+                "vanilla-install".to_string(),
+                "1.21.5".to_string(),
+                "https://example.invalid/manifest.json".to_string(),
+            )
+            .await;
+        store
+            .insert_or_existing_active_scoped(
+                "loader".to_string(),
+                "loader-install".to_string(),
+                "1.21.5".to_string(),
+                String::new(),
+            )
+            .await;
+
+        assert_eq!(
+            store
+                .active_install_for_scope_and_version(" vanilla ", " 1.21.5 ")
+                .await,
+            Some("vanilla-install".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn active_install_for_scope_and_version_ignores_done_removed_and_failed_sessions() {
+        let store = InstallStore::new();
+        store
+            .insert_or_existing_active(
+                "done-install".to_string(),
+                "1.21.5".to_string(),
+                String::new(),
+            )
+            .await;
+        store.emit("done-install", done_progress()).await;
+        assert_eq!(
+            store
+                .active_install_for_scope_and_version("vanilla", "1.21.5")
+                .await,
+            None
+        );
+
+        store
+            .insert_or_existing_active(
+                "failed-install".to_string(),
+                "1.21.5".to_string(),
+                String::new(),
+            )
+            .await;
+        store.emit("failed-install", failed_progress()).await;
+        assert_eq!(
+            store
+                .active_install_for_scope_and_version("vanilla", "1.21.5")
+                .await,
+            None
+        );
+
+        store
+            .insert_or_existing_active(
+                "removed-install".to_string(),
+                "1.21.5".to_string(),
+                String::new(),
+            )
+            .await;
+        store.remove("removed-install").await;
+        assert_eq!(
+            store
+                .active_install_for_scope_and_version("vanilla", "1.21.5")
+                .await,
+            None
+        );
+
+        let (install_id, inserted) = store
+            .insert_or_existing_active(
+                "fresh-install".to_string(),
+                "1.21.5".to_string(),
+                String::new(),
+            )
+            .await;
+
+        assert_eq!(install_id, "fresh-install");
+        assert!(inserted);
+    }
+
+    #[tokio::test]
     async fn launch_active_install_count_excludes_done_sessions() {
         let store = InstallStore::new();
         store.insert("active-install".to_string()).await;
@@ -417,6 +522,17 @@ mod tests {
             total: 1,
             file: None,
             error: None,
+            done: true,
+        }
+    }
+
+    fn failed_progress() -> DownloadProgress {
+        DownloadProgress {
+            phase: "error".to_string(),
+            current: 0,
+            total: 0,
+            file: None,
+            error: Some("failed".to_string()),
             done: true,
         }
     }
