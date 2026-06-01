@@ -2,7 +2,7 @@ import { batch } from '@preact/signals';
 import {
   instances, versions, config, systemInfo, devMode, catalog,
   selectedInstanceId, lastInstanceId,
-  installState, installQueue, installEventSource,
+  installState, installQueue, installFailure, installEventSource,
   launchState, runningSessions, launchNotices,
   currentPage, searchQuery, sidebarFilter, logLines,
 } from './store';
@@ -10,6 +10,7 @@ import type {
   Instance, Version, Config, SystemInfo, Catalog,
   RunningSession, InstallItem, Page, LaunchNotice,
 } from './types';
+import { formatInstallItemLabel } from './install-labels';
 import { launchStageView, launchStageViewFrom, type LaunchStage } from './launch-stages';
 
 // ── Selection ──
@@ -21,11 +22,60 @@ export function selectInstance(id: string | null): void {
 
 // ── Install state transitions ──
 
+const INSTALL_FAILURE_MESSAGE_LIMIT = 220;
+
+function cloneInstallItem(item: InstallItem): InstallItem {
+  return item.loader
+    ? { versionId: item.versionId, loader: { ...item.loader } }
+    : { versionId: item.versionId };
+}
+
+function boundedInstallFailureMessage(message: string): string {
+  const firstUsefulLine = String(message || '')
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .find(line => line && !line.startsWith('at '));
+  const squashed = (firstUsefulLine || 'Install failed before Croopor received error details.')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (squashed.length <= INSTALL_FAILURE_MESSAGE_LIMIT) return squashed;
+  return `${squashed.slice(0, INSTALL_FAILURE_MESSAGE_LIMIT - 3).trimEnd()}...`;
+}
+
 export function enqueueInstall(item: InstallItem): void {
   const active = installState.value;
   if (active.status === 'active' && active.versionId === item.versionId) return;
   if (installQueue.value.some(q => q.versionId === item.versionId)) return;
   installQueue.value = [...installQueue.value, item];
+}
+
+export function recordInstallFailure(item: InstallItem, message: string): void {
+  installFailure.value = {
+    item: cloneInstallItem(item),
+    displayName: formatInstallItemLabel(item),
+    message: boundedInstallFailureMessage(message),
+    failedAt: Date.now(),
+  };
+}
+
+export function clearInstallFailure(): void {
+  installFailure.value = null;
+}
+
+export function requeueFailedInstall(): boolean {
+  const failure = installFailure.value;
+  if (!failure) return false;
+  const item = cloneInstallItem(failure.item);
+  const active = installState.value;
+  const wasIdle = installState.value.status === 'idle';
+  batch(() => {
+    installFailure.value = null;
+    const rest = installQueue.value.filter(q => q.versionId !== item.versionId);
+    installQueue.value = active.status === 'active' && active.versionId === item.versionId
+      ? rest
+      : [item, ...rest];
+  });
+  return wasIdle;
 }
 
 export function startInstall(versionId: string, label = 'Starting...', displayName?: string): void {

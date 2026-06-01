@@ -1,15 +1,21 @@
 import type { JSX } from 'preact';
-import { Card, IconButton, Meter, Pill, SectionHeading } from '../../ui/Atoms';
+import { Button, Card, IconButton, Meter, Pill, SectionHeading } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { useTheme } from '../../hooks/use-theme';
-import { installQueue, installState } from '../../store';
-import { removeQueuedInstallAt } from '../../actions';
+import { installFailure, installQueue, installState } from '../../store';
+import { clearInstallFailure, removeQueuedInstallAt } from '../../actions';
+import { retryFailedInstall } from '../../install';
 import { formatInstallItemLabel } from '../../install-labels';
+
+function formatFailureTime(timestamp: number): string {
+  return new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
 
 export function DownloadsView(): JSX.Element {
   const theme = useTheme();
   const state = installState.value;
   const queue = installQueue.value;
+  const failure = installFailure.value;
   const hasActive = state.status === 'active';
   const activeTitle = hasActive ? state.displayName || state.versionId : '';
   const queuedLabel = `${queue.length} queued`;
@@ -17,9 +23,44 @@ export function DownloadsView(): JSX.Element {
   const phaseLabel = hasActive && state.phase ? state.phase.replace(/_/g, ' ') : '';
   const pageStatus = hasActive
     ? `1 active task${queue.length > 0 ? ` · ${queuedLabel}` : ''}`
+    : failure
+      ? `Install failed${queue.length > 0 ? ` · ${queuedLabel}` : ''}`
     : queue.length > 0
       ? `No active task · ${queuedLabel}`
       : 'Nothing downloading';
+  const failureCard = failure ? (
+    <Card>
+      <SectionHeading
+        title="Install failed"
+        right={<Pill tone="err" icon="alert">Failed</Pill>}
+      />
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+        <div style={{ minWidth: 0, flex: '1 1 260px' }}>
+          <div style={{
+            fontSize: 13, fontWeight: 600, color: theme.n.text,
+            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+          }}>
+            {failure.displayName}
+          </div>
+          <div style={{ fontSize: 12, color: theme.n.textDim, marginTop: 4, lineHeight: 1.45, overflowWrap: 'anywhere' }}>
+            {failure.message}
+          </div>
+          <div style={{ fontSize: 11, color: theme.n.textMute, marginTop: 6 }}>
+            Failed at {formatFailureTime(failure.failedAt)}
+          </div>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginLeft: 'auto' }}>
+          <Button variant="secondary" size="sm" icon="refresh" onClick={retryFailedInstall}>Retry</Button>
+          <IconButton
+            icon="x"
+            size={28}
+            tooltip="Dismiss failed install"
+            onClick={clearInstallFailure}
+          />
+        </div>
+      </div>
+    </Card>
+  ) : null;
 
   return (
     <div class="cp-view-page" style={{ gap: 20 }}>
@@ -47,6 +88,8 @@ export function DownloadsView(): JSX.Element {
             {Math.round(state.pct)}%
           </div>
         </Card>
+      ) : failureCard ? (
+        failureCard
       ) : (
         <Card padding={32}>
           <div class="cp-empty">
@@ -65,6 +108,8 @@ export function DownloadsView(): JSX.Element {
           </div>
         </Card>
       )}
+
+      {hasActive && failureCard}
 
       {queue.length > 0 && (
         <Card padding={10}>

@@ -11,7 +11,7 @@ import {
 } from './store';
 import {
   enqueueInstall, dequeueNextInstall, startInstall, updateInstallProgress,
-  completeInstall, setInstallEventSource,
+  completeInstall, setInstallEventSource, recordInstallFailure, requeueFailedInstall,
 } from './actions';
 import { formatInstallItemLabel } from './install-labels';
 import type { InstallItem, LoaderBuildRecord, LoaderComponentId } from './types';
@@ -271,6 +271,11 @@ export function installLoaderVersion(build: LoaderBuildRecord): void {
   if (installState.value.status === 'idle') processNextInstall();
 }
 
+export function retryFailedInstall(): void {
+  const shouldProcess = requeueFailedInstall();
+  if (shouldProcess) processNextInstall();
+}
+
 function processNextInstall(): void {
   if (installState.value.status !== 'idle') return;
   const next = dequeueNextInstall();
@@ -285,13 +290,16 @@ async function processVanillaInstall(next: InstallItem): Promise<void> {
   try {
     const res = await api('POST', '/install', { version_id: next.versionId });
     if (res.error) {
+      recordInstallFailure(next, res.error);
       showError(res.error);
       await onInstallDone();
       return;
     }
-    await connectVanillaEvents(res.install_id, next.versionId);
+    await connectVanillaEvents(res.install_id, next);
   } catch (err: unknown) {
-    showError(`Install failed: ${errMessage(err)}`);
+    const message = errMessage(err);
+    recordInstallFailure(next, message);
+    showError(`Install failed: ${message}`);
     await onInstallDone();
   }
 }
@@ -306,9 +314,11 @@ async function processLoaderInstall(next: InstallItem): Promise<void> {
       next.loader.componentId,
       next.loader.buildId,
     );
-    await connectLoaderEvents(installId, next.versionId);
+    await connectLoaderEvents(installId, next);
   } catch (err: unknown) {
-    showError(`Loader install failed: ${errMessage(err)}`);
+    const message = errMessage(err);
+    recordInstallFailure(next, message);
+    showError(`Loader install failed: ${message}`);
     await onInstallDone();
   }
 }
@@ -368,7 +378,8 @@ function phaseLabel(data: InstallProgressEvent, loaderInstall: boolean): string 
   }
 }
 
-async function connectVanillaEvents(installId: string, versionId: string): Promise<void> {
+async function connectVanillaEvents(installId: string, item: InstallItem): Promise<void> {
+  const versionId = item.versionId;
   if (!isActiveInstall(versionId)) return;
 
   const startedAt = Date.now();
@@ -400,7 +411,9 @@ async function connectVanillaEvents(installId: string, versionId: string): Promi
     } else if (data.phase === 'done') {
       pct = 100;
     } else if (data.phase === 'error') {
-      showError(data.error || 'Install failed before Croopor received error details.');
+      const message = data.error || 'Install failed before Croopor received error details.';
+      recordInstallFailure(item, message);
+      showError(message);
       await onInstallDone();
       return;
     } else {
@@ -440,14 +453,17 @@ async function connectVanillaEvents(installId: string, versionId: string): Promi
     if (es.readyState !== EventSource.CLOSED) return;
     void (async () => {
       if (isActiveInstallSource(versionId, es)) {
-        showError('Install progress stopped unexpectedly. Retry the install from the launcher.');
+        const message = 'Install progress stopped unexpectedly. Retry the install from the launcher.';
+        recordInstallFailure(item, message);
+        showError(message);
         await onInstallDone();
       }
     })();
   };
 }
 
-async function connectLoaderEvents(installId: string, versionId: string): Promise<void> {
+async function connectLoaderEvents(installId: string, item: InstallItem): Promise<void> {
+  const versionId = item.versionId;
   if (!isActiveInstall(versionId)) return;
 
   const startedAt = Date.now();
@@ -504,6 +520,7 @@ async function connectLoaderEvents(installId: string, versionId: string): Promis
 
   const onError = (message: string): void => {
     if (isActiveInstallSource(versionId, progressSource)) {
+      recordInstallFailure(item, message);
       showError(message);
       void onInstallDone();
     }

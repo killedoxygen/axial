@@ -37,8 +37,16 @@ export type InstallState =
   | { status: 'idle' }
   | { status: 'active'; versionId: string; displayName?: string; pct: number; label: string; phase?: string; startedAt: number };
 
+export type InstallFailure = {
+  item: InstallItem;
+  displayName: string;
+  message: string;
+  failedAt: number;
+};
+
 export const installState = signal<InstallState>({ status: 'idle' });
 export const installQueue = signal<InstallItem[]>([]);
+export const installFailure = signal<InstallFailure | null>(null);
 export const installEventSource = signal<{ close(): void } | null>(null);
 
 // ── Launch state machine ──
