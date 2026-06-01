@@ -9,6 +9,7 @@ const strictDevPort = process.argv.includes('--strict-port');
 const portOverride = process.env.PORT;
 const defaultDevPort = 3000;
 const webApiBase = process.env.CROOPOR_WEB_API_BASE ?? 'http://127.0.0.1:43430';
+const enableDevLab = mode === 'serve' || mode === 'watch';
 
 const reactCompatAliases = new Map([
   ['react', 'preact/compat'],
@@ -49,6 +50,7 @@ const shared = {
   jsxImportSource: 'preact',
   define: {
     __CROOPOR_WEB_API_BASE__: JSON.stringify(webApiBase),
+    __CROOPOR_ENABLE_DEV_LAB__: JSON.stringify(enableDevLab),
   },
   plugins: [openaiIconSubsetPlugin, preactCompatAliasPlugin],
 };

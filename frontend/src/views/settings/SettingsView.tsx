@@ -1888,19 +1888,19 @@ function AdvancedSection(): JSX.Element {
         desc="Useful if the launcher gets out of sync with the backend."
         control={<Button variant="secondary" icon="refresh" onClick={() => location.reload()}>Reload</Button>}
       />
+      {__CROOPOR_ENABLE_DEV_LAB__ && isDev && (
+        <SettingsCard
+          title="Dev lab"
+          desc="Developer-only workbench for procedural art and future internal experiments."
+          control={<Button variant="secondary" icon="palette" onClick={() => navigate({ name: 'dev-lab' })}>Open lab</Button>}
+        />
+      )}
       {isDev && (
-        <>
-          <SettingsCard
-            title="Dev lab"
-            desc="Developer-only workbench for procedural art and future internal experiments."
-            control={<Button variant="secondary" icon="palette" onClick={() => navigate({ name: 'dev-lab' })}>Open lab</Button>}
-          />
-          <SettingsCard
-            title="Flush all data"
-            desc="Deletes every Croopor-managed file and restarts from first run. Existing libraries selected through 'Use existing' are preserved."
-            control={<Button variant="danger" icon="trash" disabled={busy} onClick={flush}>{busy ? 'Flushing…' : 'Flush'}</Button>}
-          />
-        </>
+        <SettingsCard
+          title="Flush all data"
+          desc="Deletes every Croopor-managed file and restarts from first run. Existing libraries selected through 'Use existing' are preserved."
+          control={<Button variant="danger" icon="trash" disabled={busy} onClick={flush}>{busy ? 'Flushing…' : 'Flush'}</Button>}
+        />
       )}
     </>
   );

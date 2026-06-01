@@ -1,10 +1,10 @@
 import type { JSX } from 'preact';
+import { useEffect, useState } from 'preact/hooks';
 import { AppFrame } from './shell/AppFrame';
 import { HomeView } from './views/home/HomeView';
 import { InstancesView } from './views/instances/InstancesView';
 import { InstanceDetailView } from './views/instance/InstanceDetailView';
 import { CreateView } from './views/create/CreateView';
-import { DevLabView } from './views/dev-lab/DevLabView';
 import { DownloadsView } from './views/downloads/DownloadsView';
 import { AccountsView } from './views/accounts/AccountsView';
 import { SettingsView } from './views/settings/SettingsView';
@@ -18,6 +18,12 @@ import { route, showOnboardingOverlay, showSetupOverlay } from './ui-state';
 import { bootstrapError, bootstrapState, devMode } from './store';
 import { useShortcuts } from './hooks/use-shortcuts';
 import './views/views.css';
+
+type DevLabViewComponent = typeof import('./views/dev-lab/DevLabView')['DevLabView'];
+
+const loadDevLabView = __CROOPOR_ENABLE_DEV_LAB__
+  ? async (): Promise<DevLabViewComponent> => (await import('./views/dev-lab/DevLabView')).DevLabView
+  : null;
 
 function BootState(): JSX.Element | null {
   const s = bootstrapState.value;
@@ -48,6 +54,25 @@ function BootState(): JSX.Element | null {
   );
 }
 
+function DevLabRoute(): JSX.Element {
+  if (!loadDevLabView || !devMode.value) return <SettingsView />;
+  return <DevLabLoader load={loadDevLabView} />;
+}
+
+function DevLabLoader({ load }: { load: () => Promise<DevLabViewComponent> }): JSX.Element {
+  const [DevLabView, setDevLabView] = useState<DevLabViewComponent | null>(null);
+
+  useEffect(() => {
+    let mounted = true;
+    void load().then((view) => {
+      if (mounted) setDevLabView(() => view);
+    });
+    return () => { mounted = false; };
+  }, [load]);
+
+  return DevLabView ? <DevLabView /> : <SettingsView />;
+}
+
 function CurrentView(): JSX.Element {
   const r = route.value;
   switch (r.name) {
@@ -55,7 +80,7 @@ function CurrentView(): JSX.Element {
     case 'instances': return <InstancesView />;
     case 'instance': return <InstanceDetailView id={r.id} />;
     case 'create': return <CreateView />;
-    case 'dev-lab': return devMode.value ? <DevLabView /> : <SettingsView />;
+    case 'dev-lab': return <DevLabRoute />;
     case 'downloads': return <DownloadsView />;
     case 'accounts': return <AccountsView />;
     case 'settings': return <SettingsView />;
