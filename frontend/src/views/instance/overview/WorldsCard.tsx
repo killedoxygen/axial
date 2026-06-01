@@ -75,14 +75,6 @@ export function WorldsCard({
       : `${count} world${count === 1 ? '' : 's'} available`;
   return (
     <Card padding={18} class={`cp-od-worlds-card${count === 0 ? ' cp-od-worlds-card--empty' : ''}`}>
-      <div class="cp-od-head">
-        <h3>Worlds{count > 0 ? <span class="cp-od-head-count">· {count}</span> : null}</h3>
-        <button class="cp-od-overflow" type="button" aria-label="More" onClick={(e) => openContextMenu(e, [
-          { icon: 'folder', label: 'Open saves folder', onSelect: () => void openInstanceFolder(inst.id, 'saves') },
-        ])}>
-          <Icon name="dots" size={14} stroke={2} />
-        </button>
-      </div>
       {count === 0 ? (
         <div class="cp-od-worlds-empty">
           <div class="cp-od-worlds-art" aria-hidden="true">
