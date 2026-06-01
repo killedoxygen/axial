@@ -614,9 +614,11 @@ async fn install_runtime_manifest_files(
     files: HashMap<String, ComponentManifestFile>,
 ) -> Result<(), JavaRuntimeLookupError> {
     let plan = plan_runtime_manifest_files(files);
+    let download_agent = runtime_download_agent();
 
     for (relative_path, file) in plan.directory_entries.into_iter().chain(plan.other_entries) {
-        install_runtime_manifest_file(temp_dir, &relative_path, file).await?;
+        install_runtime_manifest_file(download_agent.clone(), temp_dir, &relative_path, file)
+            .await?;
     }
 
     let mut entries = plan.file_entries.into_iter();
@@ -625,7 +627,7 @@ async fn install_runtime_manifest_files(
         let Some(entry) = entries.next() else {
             break;
         };
-        spawn_runtime_manifest_file_install(&mut tasks, temp_dir, entry);
+        spawn_runtime_manifest_file_install(&mut tasks, download_agent.clone(), temp_dir, entry);
     }
 
     let mut first_error = None;
@@ -647,7 +649,12 @@ async fn install_runtime_manifest_files(
         if first_error.is_none()
             && let Some(entry) = entries.next()
         {
-            spawn_runtime_manifest_file_install(&mut tasks, temp_dir, entry);
+            spawn_runtime_manifest_file_install(
+                &mut tasks,
+                download_agent.clone(),
+                temp_dir,
+                entry,
+            );
         }
     }
 
@@ -660,13 +667,15 @@ async fn install_runtime_manifest_files(
 
 fn spawn_runtime_manifest_file_install(
     tasks: &mut JoinSet<Result<(), JavaRuntimeLookupError>>,
+    download_agent: ureq::Agent,
     temp_dir: &Path,
     entry: (String, ComponentManifestFile),
 ) {
     let temp_dir = temp_dir.to_path_buf();
     let (relative_path, file) = entry;
-    tasks
-        .spawn(async move { install_runtime_manifest_file(&temp_dir, &relative_path, file).await });
+    tasks.spawn(async move {
+        install_runtime_manifest_file(download_agent, &temp_dir, &relative_path, file).await
+    });
 }
 
 #[derive(Debug, Default)]
@@ -695,6 +704,7 @@ fn plan_runtime_manifest_files(
 }
 
 async fn install_runtime_manifest_file(
+    download_agent: ureq::Agent,
     temp_dir: &Path,
     relative_path: &str,
     file: ComponentManifestFile,
@@ -719,7 +729,14 @@ async fn install_runtime_manifest_file(
 
     let temp_path = runtime_download_temp_path(&destination);
     let expected = RuntimeDownloadEvidence::from(&raw);
-    fetch_runtime_file(&raw.url, &temp_path, expected, relative_path).await?;
+    fetch_runtime_file(
+        download_agent,
+        &raw.url,
+        &temp_path,
+        expected,
+        relative_path,
+    )
+    .await?;
     if let Err(error) = fs::rename(&temp_path, &destination) {
         let _ = fs::remove_file(&temp_path);
         return Err(JavaRuntimeLookupError::Download(error.to_string()));
@@ -799,6 +816,7 @@ fn runtime_download_temp_path(destination: &Path) -> PathBuf {
 }
 
 async fn fetch_runtime_file(
+    download_agent: ureq::Agent,
     url: &str,
     temp_path: &Path,
     expected: RuntimeDownloadEvidence,
@@ -810,7 +828,7 @@ async fn fetch_runtime_file(
     let cleanup_path = temp_path.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        stream_runtime_file_to_temp(&url, &temp_path, &expected, &relative_path)
+        stream_runtime_file_to_temp(&download_agent, &url, &temp_path, &expected, &relative_path)
     })
     .await
     .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
@@ -823,15 +841,13 @@ async fn fetch_runtime_file(
 }
 
 fn stream_runtime_file_to_temp(
+    download_agent: &ureq::Agent,
     url: &str,
     temp_path: &Path,
     expected: &RuntimeDownloadEvidence,
     relative_path: &str,
 ) -> Result<(), JavaRuntimeLookupError> {
-    let response = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(300))
-        .user_agent("croopor/0.3")
-        .build()
+    let response = download_agent
         .get(url)
         .call()
         .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
@@ -865,6 +881,13 @@ fn stream_runtime_file_to_temp(
     };
     verify_runtime_download(relative_path, expected, &actual)
         .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))
+}
+
+fn runtime_download_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(300))
+        .user_agent("croopor/0.3")
+        .build()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
