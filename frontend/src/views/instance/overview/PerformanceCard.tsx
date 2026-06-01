@@ -431,18 +431,19 @@ export function PerformanceCard({ inst }: { inst: EnrichedInstance }): JSX.Eleme
           </div>
         </div>
 
-        <MemoryBar minGb={minMem} maxGb={maxMem} totalGb={totalGb} />
-
-        <div class="cp-od-perf-footer">
-          <div class="cp-od-perf-runtime" data-detected={runtimeDetected}>
-            <span class="cp-od-perf-runtime-mark"><Icon name="check" size={11} stroke={2.8} /></span>
-            <span class="cp-od-perf-runtime-text">{runtimeDetected ? `Java ${inst.java_major}` : 'Managed Java'}</span>
+        <div class="cp-od-perf-meter">
+          <MemoryBar minGb={minMem} maxGb={maxMem} totalGb={totalGb} />
+          <div class="cp-od-perf-footer">
+            <div class="cp-od-perf-runtime" data-detected={runtimeDetected}>
+              <span class="cp-od-perf-runtime-mark"><Icon name="check" size={11} stroke={2.8} /></span>
+              <span class="cp-od-perf-runtime-text">{runtimeDetected ? `Java ${inst.java_major}` : 'Managed Java'}</span>
+            </div>
+            <span class="cp-od-perf-footer-mode">
+              {performanceModeLabel(effectiveMode.mode)}
+              <span class="cp-od-perf-footer-sep">·</span>
+              {effectiveMode.source === 'instance' ? 'Per instance' : 'Global default'}
+            </span>
           </div>
-          <span class="cp-od-perf-footer-mode">
-            {performanceModeLabel(effectiveMode.mode)}
-            <span class="cp-od-perf-footer-sep">·</span>
-            {effectiveMode.source === 'instance' ? 'Per instance' : 'Global default'}
-          </span>
         </div>
       </div>
     </Card>

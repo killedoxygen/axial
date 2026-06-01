@@ -869,12 +869,36 @@
   gap: 18px;
 }
 .cp-od-perf-summary {
+  min-width: 0;
   display: grid;
   grid-template-columns: 20px minmax(0, 1fr);
   align-items: start;
   gap: 10px;
   margin-bottom: 0;
   color: var(--text-dim);
+}
+/* Meter zone: the memory bar and runtime line share one width so they stack
+   cleanly instead of clashing against each other. */
+.cp-od-perf-meter {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+/* On wide cards, set the summary beside the meter so neither side reads empty;
+   the bar stays full-width (and wide enough for its axis labels) below this. */
+@media (min-width: 1181px) {
+  .cp-od-perf-body {
+    flex-direction: row;
+    align-items: center;
+    gap: 38px;
+  }
+  .cp-od-perf-summary {
+    flex: 1 1 42%;
+  }
+  .cp-od-perf-meter {
+    flex: 1 1 58%;
+  }
 }
 .cp-od-perf-summary-mark {
   display: grid;
@@ -973,14 +997,12 @@
   right: 0;
 }
 
-/* Footer: detected runtime on the left, configured mode source on the right. */
+/* Footer line under the bar: detected runtime left, configured mode right. */
 .cp-od-perf-footer {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding-top: 13px;
-  border-top: 1px solid oklch(1 0 0 / 0.05);
 }
 .cp-od-perf-runtime {
   display: flex;
