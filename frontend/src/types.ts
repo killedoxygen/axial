@@ -947,7 +947,7 @@ export interface LoaderComponentsResponse {
   components: LoaderComponentRecord[];
 }
 
-export type UpdateKind = 'none' | 'release-page' | 'appimage';
+export type UpdateKind = 'none' | 'release-page' | 'release-asset' | 'appimage';
 
 export interface UpdateInfo {
   current_version: string;

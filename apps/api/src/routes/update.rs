@@ -7,6 +7,8 @@ use std::time::{Duration, SystemTime};
 const GITHUB_LATEST_RELEASE_URL: &str =
     "https://api.github.com/repos/mateoltd/croopor/releases/latest";
 const GITHUB_RELEASE_PAGE_PREFIX: &str = "https://github.com/mateoltd/croopor/releases/";
+const GITHUB_RELEASE_DOWNLOAD_PREFIX: &str =
+    "https://github.com/mateoltd/croopor/releases/download/";
 const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 const UPDATE_CHECK_UNAVAILABLE_MESSAGE: &str = "update check unavailable";
 
@@ -30,6 +32,14 @@ struct UpdateResponse {
 struct GithubLatestRelease {
     tag_name: String,
     html_url: String,
+    #[serde(default)]
+    assets: Vec<GithubReleaseAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubReleaseAsset {
+    name: String,
+    browser_download_url: String,
 }
 
 pub fn router() -> Router<AppState> {
@@ -88,6 +98,22 @@ fn release_response(
     checked_at: &str,
     release: GithubLatestRelease,
 ) -> UpdateResponse {
+    release_response_for_platform(
+        current_version,
+        checked_at,
+        release,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    )
+}
+
+fn release_response_for_platform(
+    current_version: &str,
+    checked_at: &str,
+    release: GithubLatestRelease,
+    os: &str,
+    arch: &str,
+) -> UpdateResponse {
     let latest_version = normalized_version(&release.tag_name);
     let Some(release_url) = sane_release_page_url(&release.html_url) else {
         return fallback_response(current_version, checked_at);
@@ -96,12 +122,28 @@ fn release_response(
         return fallback_response(current_version, checked_at);
     }
 
+    let asset_url = matching_release_asset_url(&release.assets, &latest_version, os, arch);
+    if let Some(asset_url) = asset_url {
+        return UpdateResponse {
+            current_version: current_version.to_string(),
+            latest_version,
+            available: true,
+            platform: os.to_string(),
+            arch: arch.to_string(),
+            kind: "release-asset",
+            notes_url: release_url,
+            action_url: asset_url,
+            action_label: "Download update".to_string(),
+            checked_at: checked_at.to_string(),
+        };
+    }
+
     UpdateResponse {
         current_version: current_version.to_string(),
         latest_version,
         available: true,
-        platform: std::env::consts::OS.to_string(),
-        arch: std::env::consts::ARCH.to_string(),
+        platform: os.to_string(),
+        arch: arch.to_string(),
         kind: "release-page",
         notes_url: release_url.clone(),
         action_url: release_url,
@@ -134,6 +176,51 @@ fn normalized_version(version: &str) -> String {
 fn sane_release_page_url(url: &str) -> Option<String> {
     let trimmed = url.trim();
     if trimmed != url || !trimmed.starts_with(GITHUB_RELEASE_PAGE_PREFIX) {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn matching_release_asset_url(
+    assets: &[GithubReleaseAsset],
+    latest_version: &str,
+    os: &str,
+    arch: &str,
+) -> Option<String> {
+    let expected_name = release_asset_name(latest_version, os, arch)?;
+    assets
+        .iter()
+        .filter(|asset| asset.name == expected_name)
+        .find_map(|asset| sane_release_asset_url(&asset.browser_download_url, &expected_name))
+}
+
+fn release_asset_name(latest_version: &str, os: &str, arch: &str) -> Option<String> {
+    let platform = match os {
+        "linux" => "linux",
+        "windows" => "windows",
+        _ => return None,
+    };
+    let archive_ext = match os {
+        "linux" => "tar.gz",
+        "windows" => "zip",
+        _ => return None,
+    };
+    let package_arch = match arch {
+        "x86_64" => "amd64",
+        _ => return None,
+    };
+
+    Some(format!(
+        "croopor-{platform}-{package_arch}-{latest_version}.{archive_ext}"
+    ))
+}
+
+fn sane_release_asset_url(url: &str, expected_name: &str) -> Option<String> {
+    let trimmed = url.trim();
+    if trimmed != url
+        || !trimmed.starts_with(GITHUB_RELEASE_DOWNLOAD_PREFIX)
+        || !trimmed.ends_with(&format!("/{expected_name}"))
+    {
         return None;
     }
     Some(trimmed.to_string())
@@ -186,6 +273,13 @@ fn timestamp_utc() -> String {
 mod tests {
     use super::*;
 
+    fn release_asset(name: &str, browser_download_url: &str) -> GithubReleaseAsset {
+        GithubReleaseAsset {
+            name: name.to_string(),
+            browser_download_url: browser_download_url.to_string(),
+        }
+    }
+
     #[test]
     fn version_comparison_strips_leading_v_and_compares_numeric_parts() {
         assert!(is_version_greater("v1.2.4", "1.2.3"));
@@ -211,6 +305,7 @@ mod tests {
             GithubLatestRelease {
                 tag_name: "v1.2.4".to_string(),
                 html_url: "https://github.com/mateoltd/croopor/releases/tag/v1.2.4".to_string(),
+                assets: Vec::new(),
             },
         );
 
@@ -229,6 +324,7 @@ mod tests {
             GithubLatestRelease {
                 tag_name: "v1.2.3".to_string(),
                 html_url: "https://github.com/mateoltd/croopor/releases/tag/v1.2.3".to_string(),
+                assets: Vec::new(),
             },
         );
         assert!(!same.available);
@@ -242,6 +338,7 @@ mod tests {
                 tag_name: "v1.2.4-beta".to_string(),
                 html_url: "https://github.com/mateoltd/croopor/releases/tag/v1.2.4-beta"
                     .to_string(),
+                assets: Vec::new(),
             },
         );
         assert!(!suffix.available);
@@ -254,6 +351,7 @@ mod tests {
             GithubLatestRelease {
                 tag_name: "v1.2.4".to_string(),
                 html_url: "https://example.com/mateoltd/croopor/releases/tag/v1.2.4".to_string(),
+                assets: Vec::new(),
             },
         );
         assert!(!wrong_url.available);
@@ -275,6 +373,168 @@ mod tests {
     }
 
     #[test]
+    fn linux_asset_selection_matches_packaged_archive() {
+        let asset_url = matching_release_asset_url(
+            &[
+                release_asset(
+                    "croopor-windows-amd64-1.2.4.zip",
+                    "https://github.com/mateoltd/croopor/releases/download/v1.2.4/croopor-windows-amd64-1.2.4.zip",
+                ),
+                release_asset(
+                    "croopor-linux-amd64-1.2.4.tar.gz",
+                    "https://github.com/mateoltd/croopor/releases/download/v1.2.4/croopor-linux-amd64-1.2.4.tar.gz",
+                ),
+            ],
+            "1.2.4",
+            "linux",
+            "x86_64",
+        )
+        .expect("linux x86_64 should select tar.gz asset");
+
+        assert_eq!(
+            asset_url,
+            "https://github.com/mateoltd/croopor/releases/download/v1.2.4/croopor-linux-amd64-1.2.4.tar.gz"
+        );
+    }
+
+    #[test]
+    fn windows_asset_selection_matches_packaged_archive() {
+        let asset_url = matching_release_asset_url(
+            &[
+                release_asset(
+                    "croopor-linux-amd64-1.2.4.tar.gz",
+                    "https://github.com/mateoltd/croopor/releases/download/v1.2.4/croopor-linux-amd64-1.2.4.tar.gz",
+                ),
+                release_asset(
+                    "croopor-windows-amd64-1.2.4.zip",
+                    "https://github.com/mateoltd/croopor/releases/download/v1.2.4/croopor-windows-amd64-1.2.4.zip",
+                ),
+            ],
+            "1.2.4",
+            "windows",
+            "x86_64",
+        )
+        .expect("windows x86_64 should select zip asset");
+
+        assert_eq!(
+            asset_url,
+            "https://github.com/mateoltd/croopor/releases/download/v1.2.4/croopor-windows-amd64-1.2.4.zip"
+        );
+    }
+
+    #[test]
+    fn asset_selection_rejects_missing_or_unsafe_assets() {
+        let missing = matching_release_asset_url(
+            &[release_asset(
+                "croopor-linux-amd64-1.2.3.tar.gz",
+                "https://github.com/mateoltd/croopor/releases/download/v1.2.3/croopor-linux-amd64-1.2.3.tar.gz",
+            )],
+            "1.2.4",
+            "linux",
+            "x86_64",
+        );
+        assert!(missing.is_none());
+
+        let unsafe_url = matching_release_asset_url(
+            &[release_asset(
+                "croopor-linux-amd64-1.2.4.tar.gz",
+                "https://example.com/mateoltd/croopor/releases/download/v1.2.4/croopor-linux-amd64-1.2.4.tar.gz",
+            )],
+            "1.2.4",
+            "linux",
+            "x86_64",
+        );
+        assert!(unsafe_url.is_none());
+
+        let mismatched_filename = matching_release_asset_url(
+            &[release_asset(
+                "croopor-linux-amd64-1.2.4.tar.gz",
+                "https://github.com/mateoltd/croopor/releases/download/v1.2.4/other.tar.gz",
+            )],
+            "1.2.4",
+            "linux",
+            "x86_64",
+        );
+        assert!(mismatched_filename.is_none());
+
+        let unsupported_arch = matching_release_asset_url(
+            &[release_asset(
+                "croopor-linux-amd64-1.2.4.tar.gz",
+                "https://github.com/mateoltd/croopor/releases/download/v1.2.4/croopor-linux-amd64-1.2.4.tar.gz",
+            )],
+            "1.2.4",
+            "linux",
+            "aarch64",
+        );
+        assert!(unsupported_arch.is_none());
+    }
+
+    #[test]
+    fn release_response_prefers_matching_asset_over_release_page() {
+        let response = release_response_for_platform(
+            "1.2.3",
+            "2026-01-01T00:00:00Z",
+            GithubLatestRelease {
+                tag_name: "v1.2.4".to_string(),
+                html_url: "https://github.com/mateoltd/croopor/releases/tag/v1.2.4".to_string(),
+                assets: vec![release_asset(
+                    "croopor-linux-amd64-1.2.4.tar.gz",
+                    "https://github.com/mateoltd/croopor/releases/download/v1.2.4/croopor-linux-amd64-1.2.4.tar.gz",
+                )],
+            },
+            "linux",
+            "x86_64",
+        );
+
+        assert_eq!(response.kind, "release-asset");
+        assert_eq!(response.action_label, "Download update");
+        assert_eq!(
+            response.notes_url,
+            "https://github.com/mateoltd/croopor/releases/tag/v1.2.4"
+        );
+        assert_eq!(
+            response.action_url,
+            "https://github.com/mateoltd/croopor/releases/download/v1.2.4/croopor-linux-amd64-1.2.4.tar.gz"
+        );
+    }
+
+    #[test]
+    fn release_response_falls_back_to_release_page_for_missing_or_unsafe_asset() {
+        let missing = release_response_for_platform(
+            "1.2.3",
+            "2026-01-01T00:00:00Z",
+            GithubLatestRelease {
+                tag_name: "v1.2.4".to_string(),
+                html_url: "https://github.com/mateoltd/croopor/releases/tag/v1.2.4".to_string(),
+                assets: Vec::new(),
+            },
+            "linux",
+            "x86_64",
+        );
+        assert!(missing.available);
+        assert_eq!(missing.kind, "release-page");
+        assert_eq!(missing.action_label, "Open release");
+
+        let unsafe_asset = release_response_for_platform(
+            "1.2.3",
+            "2026-01-01T00:00:00Z",
+            GithubLatestRelease {
+                tag_name: "v1.2.4".to_string(),
+                html_url: "https://github.com/mateoltd/croopor/releases/tag/v1.2.4".to_string(),
+                assets: vec![release_asset(
+                    "croopor-linux-amd64-1.2.4.tar.gz",
+                    "https://example.com/mateoltd/croopor/releases/download/v1.2.4/croopor-linux-amd64-1.2.4.tar.gz",
+                )],
+            },
+            "linux",
+            "x86_64",
+        );
+        assert!(unsafe_asset.available);
+        assert_eq!(unsafe_asset.kind, "release-page");
+        assert_eq!(unsafe_asset.action_label, "Open release");
+    }
+
+    #[test]
     fn update_fetch_success_preserves_no_update_fallbacks() {
         let response = update_response_from_release_fetch::<()>(
             "1.2.3",
@@ -282,6 +542,7 @@ mod tests {
             Ok(GithubLatestRelease {
                 tag_name: "v1.2.4".to_string(),
                 html_url: "https://example.com/mateoltd/croopor/releases/tag/v1.2.4".to_string(),
+                assets: Vec::new(),
             }),
         )
         .expect("unusable release URL should remain a successful no-update response");
