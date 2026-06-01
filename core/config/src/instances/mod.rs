@@ -510,11 +510,18 @@ impl InstanceStore {
 }
 
 fn promote_replacement(source: &Path, destination: &Path) -> Result<(), std::io::Error> {
-    if fs::rename(source, destination).is_ok() {
-        return Ok(());
+    let first_error = match fs::rename(source, destination) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+
+    match fs::symlink_metadata(source) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(first_error),
+        Err(error) => return Err(error),
     }
 
-    if destination.exists() {
+    if destination.exists() && !destination.is_dir() {
         let _ = fs::remove_file(destination);
     }
 
@@ -1092,6 +1099,44 @@ mod tests {
             fs::read_to_string(&paths.instances_file).expect("read promoted registry"),
             "new registry"
         );
+        assert!(!temp_path.exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn promote_replacement_preserves_registry_when_temp_is_missing() {
+        let root = test_root("promote-replacement-missing-temp");
+        let paths = test_paths(&root);
+        fs::create_dir_all(&paths.config_dir).expect("create config dir");
+        let temp_path = paths.instances_file.with_extension("json.tmp");
+        fs::write(&paths.instances_file, "old registry").expect("write existing registry");
+
+        let error = super::promote_replacement(&temp_path, &paths.instances_file)
+            .expect_err("missing temp should fail");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(
+            fs::read_to_string(&paths.instances_file).expect("read old registry"),
+            "old registry"
+        );
+        assert!(!temp_path.exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn promote_replacement_preserves_directory_destination_on_retry_failure() {
+        let root = test_root("promote-replacement-directory");
+        let paths = test_paths(&root);
+        fs::create_dir_all(&paths.instances_file).expect("create registry path as directory");
+        let temp_path = paths.instances_file.with_extension("json.tmp");
+        fs::write(&temp_path, "new registry").expect("write temp registry");
+
+        super::promote_replacement(&temp_path, &paths.instances_file)
+            .expect_err("directory destination should fail");
+
+        assert!(paths.instances_file.is_dir());
         assert!(!temp_path.exists());
 
         let _ = fs::remove_dir_all(root);
