@@ -1047,22 +1047,72 @@ fn promote_file(
 }
 
 fn promote_file_with_overwrite(temp_path: &Path, final_path: &Path) -> Result<(), InstallError> {
-    if fs::rename(temp_path, final_path).is_ok() {
-        return Ok(());
+    let first_error = match fs::rename(temp_path, final_path) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+
+    match fs::symlink_metadata(temp_path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(InstallError::Io(first_error));
+        }
+        Err(error) => return Err(InstallError::Io(error)),
     }
-    if let Err(error) = fs::remove_file(final_path)
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        let _ = fs::remove_file(temp_path);
-        return Err(InstallError::Io(error));
-    }
-    match fs::rename(temp_path, final_path) {
-        Ok(()) => Ok(()),
+
+    let final_metadata = match fs::symlink_metadata(final_path) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => {
+            let _ = fs::remove_file(temp_path);
+            return Err(InstallError::Io(error));
+        }
+    };
+
+    let Some(final_metadata) = final_metadata else {
+        return match fs::rename(temp_path, final_path) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let _ = fs::remove_file(temp_path);
+                Err(InstallError::Io(error))
+            }
+        };
+    };
+
+    if final_metadata.is_dir() && !final_metadata.file_type().is_symlink() {
+        let _ = fs::remove_file(temp_path);
+        return Err(InstallError::Io(first_error));
+    }
+
+    let backup_path = managed_artifact_replace_backup_path(final_path);
+    fs::rename(final_path, &backup_path).map_err(|error| {
+        let _ = fs::remove_file(temp_path);
+        InstallError::Io(error)
+    })?;
+
+    match fs::rename(temp_path, final_path) {
+        Ok(()) => {
+            let _ = fs::remove_file(&backup_path);
+            Ok(())
+        }
+        Err(error) => {
+            let _ = fs::rename(&backup_path, final_path);
             let _ = fs::remove_file(temp_path);
             Err(InstallError::Io(error))
         }
     }
+}
+
+fn managed_artifact_replace_backup_path(final_path: &Path) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or_default();
+    PathBuf::from(format!(
+        "{}.replace-{}-{nanos:x}.tmp",
+        final_path.display(),
+        std::process::id()
+    ))
 }
 
 fn configured_remote_rules_url() -> Option<String> {
@@ -1175,6 +1225,63 @@ mod tests {
             temp_path,
             PathBuf::from("/tmp/mods/mod.jar.projectidwithslash.tmp")
         );
+    }
+
+    #[test]
+    fn promote_file_with_overwrite_replaces_existing_file() {
+        let root = test_root("promote-overwrite-replaces-file");
+        let temp_path = root.join("sodium.jar.tmp");
+        let final_path = root.join("sodium.jar");
+        fs::write(&temp_path, b"fresh").expect("write temp artifact");
+        fs::write(&final_path, b"existing").expect("write existing artifact");
+
+        promote_file_with_overwrite(&temp_path, &final_path).expect("promote replacement");
+
+        assert_eq!(
+            fs::read(&final_path).expect("read promoted artifact"),
+            b"fresh"
+        );
+        assert!(!temp_path.exists());
+        assert_no_replace_backups(&root);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn promote_file_with_overwrite_preserves_existing_file_when_temp_is_missing() {
+        let root = test_root("promote-overwrite-missing-temp");
+        let temp_path = root.join("sodium.jar.tmp");
+        let final_path = root.join("sodium.jar");
+        fs::write(&final_path, b"existing").expect("write existing artifact");
+
+        promote_file_with_overwrite(&temp_path, &final_path).expect_err("missing temp should fail");
+
+        assert_eq!(
+            fs::read(&final_path).expect("read existing artifact"),
+            b"existing"
+        );
+        assert!(!temp_path.exists());
+        assert_no_replace_backups(&root);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn promote_file_with_overwrite_preserves_directory_destination_and_removes_temp() {
+        let root = test_root("promote-overwrite-directory");
+        let temp_path = root.join("sodium.jar.tmp");
+        let final_path = root.join("sodium.jar");
+        fs::write(&temp_path, b"fresh").expect("write temp artifact");
+        fs::create_dir(&final_path).expect("create directory destination");
+
+        promote_file_with_overwrite(&temp_path, &final_path)
+            .expect_err("directory destination should fail");
+
+        assert!(final_path.is_dir());
+        assert!(!temp_path.exists());
+        assert_no_replace_backups(&root);
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -3174,5 +3281,17 @@ mod tests {
         ));
         fs::create_dir_all(&path).expect("create test root");
         path
+    }
+
+    fn assert_no_replace_backups(root: &Path) {
+        let entries = fs::read_dir(root).expect("read test root");
+        for entry in entries {
+            let entry = entry.expect("read test entry");
+            assert!(
+                !entry.file_name().to_string_lossy().contains(".replace-"),
+                "replacement backup should be cleaned up: {:?}",
+                entry.path()
+            );
+        }
     }
 }
