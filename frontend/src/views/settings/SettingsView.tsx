@@ -4,11 +4,11 @@ import { Button, Card, Input, Pill } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { Slider } from '../../ui/Slider';
 import { AccentField, AccentModeToggle } from './AccentEditor';
-import { local, saveLocalState } from '../../state';
+import { local, saveLocalState, STORAGE_KEY } from '../../state';
 import { Sound } from '../../sound';
 import { Music, musicStateVersion } from '../../music';
 import { config, systemInfo, devMode, appVersion, instances, lastInstanceId, selectedInstanceId } from '../../store';
-import { navigate } from '../../ui-state';
+import { navigate, ROUTE_STORAGE_KEY } from '../../ui-state';
 import { api } from '../../api';
 import { toast } from '../../toast';
 import { clampPlayerNameInput } from '../../player-name';
@@ -1865,7 +1865,9 @@ function AdvancedSection(): JSX.Element {
     setBusy(true);
     try {
       await api('POST', '/dev/flush');
-      localStorage.clear();
+      for (const key of [STORAGE_KEY, ROUTE_STORAGE_KEY]) {
+        localStorage.removeItem(key);
+      }
       location.reload();
     } catch (err) {
       toast(`Failed: ${errMessage(err)}`);

@@ -12,6 +12,8 @@ export type Route =
   | { name: 'accounts' }
   | { name: 'settings' };
 
+export const ROUTE_STORAGE_KEY = 'croopor:route';
+
 export const route = signal<Route>({ name: 'home' });
 
 const routeBackStack: Route[] = [];
@@ -23,7 +25,7 @@ function sameRoute(a: Route, b: Route): boolean {
 
 function setRoute(r: Route): void {
   route.value = r;
-  try { localStorage.setItem('croopor:route', JSON.stringify(r)); } catch {}
+  try { localStorage.setItem(ROUTE_STORAGE_KEY, JSON.stringify(r)); } catch {}
 }
 
 export function navigate(r: Route): void {
@@ -68,7 +70,7 @@ function isRoute(value: unknown): value is Route {
 
 export function restoreRoute(): void {
   try {
-    const raw = localStorage.getItem('croopor:route');
+    const raw = localStorage.getItem(ROUTE_STORAGE_KEY);
     if (!raw) return;
     const parsed = JSON.parse(raw) as unknown;
     if (isRoute(parsed)) setRoute(parsed);
