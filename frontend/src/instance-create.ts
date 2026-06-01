@@ -137,14 +137,17 @@ export async function createInstance(args: CreateInstanceArgs): Promise<CreateIn
   }
 
   addInstance(created);
-  toast(`Created ${created.name}`);
-  navigate({ name: 'instance', id: created.id });
-
+  let queuedInstall = false;
   if (install.kind === 'vanilla') {
     installVersion(install.versionId);
+    queuedInstall = true;
   } else if (install.kind === 'loader') {
     installLoaderVersion(install.build);
+    queuedInstall = true;
   }
+
+  toast(queuedInstall ? `Created ${created.name}; download queued` : `Created ${created.name}`);
+  navigate({ name: 'instance', id: created.id });
 
   return { ok: true, instance: created };
 }
