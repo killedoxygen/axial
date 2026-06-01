@@ -16,5 +16,4 @@ serde_json.workspace = true
 sha1.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-ureq = { version = "2.12.1", features = ["json"] }
 zip.workspace = true
