@@ -28,6 +28,7 @@ struct ConfigPatch {
     custom_hue: Option<i32>,
     custom_vibrancy: Option<i32>,
     lightness: Option<i32>,
+    telemetry_enabled: Option<bool>,
     music_enabled: Option<bool>,
     music_volume: Option<i32>,
     music_track: Option<i32>,
@@ -95,6 +96,9 @@ async fn handle_update_config(
     if let Some(lightness) = patch.lightness {
         next.lightness = Some(lightness);
     }
+    if let Some(telemetry_enabled) = patch.telemetry_enabled {
+        next.telemetry_enabled = telemetry_enabled;
+    }
     if let Some(music_enabled) = patch.music_enabled {
         next.music_enabled = Some(music_enabled);
     }
@@ -135,9 +139,19 @@ fn config_update_error_response(error: ConfigStoreError) -> (StatusCode, Json<se
 
 #[cfg(test)]
 mod tests {
-    use super::{CONFIG_SAVE_ERROR_MESSAGE, config_update_error_response};
+    use super::{CONFIG_SAVE_ERROR_MESSAGE, ConfigPatch, config_update_error_response};
     use axum::Json;
     use croopor_config::{AppConfigValidationError, ConfigStoreError};
+
+    #[test]
+    fn config_patch_accepts_telemetry_enabled() {
+        let patch = serde_json::from_value::<ConfigPatch>(serde_json::json!({
+            "telemetry_enabled": true
+        }))
+        .expect("telemetry consent patch should deserialize");
+
+        assert_eq!(patch.telemetry_enabled, Some(true));
+    }
 
     #[test]
     fn config_update_validation_error_keeps_details() {

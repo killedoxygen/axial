@@ -179,6 +179,7 @@ export interface Config {
   custom_vibrancy?: number;
   lightness?: number;
   onboarding_done: boolean;
+  telemetry_enabled: boolean;
   library_dir?: string;
   library_mode?: string;
   music_enabled?: boolean;

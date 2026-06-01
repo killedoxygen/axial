@@ -76,6 +76,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub onboarding_done: bool,
     #[serde(default)]
+    pub telemetry_enabled: bool,
+    #[serde(default)]
     pub library_dir: String,
     #[serde(default)]
     pub library_mode: String,
@@ -105,6 +107,7 @@ impl Default for AppConfig {
             custom_vibrancy: None,
             lightness: None,
             onboarding_done: false,
+            telemetry_enabled: false,
             library_dir: String::new(),
             library_mode: "managed".to_string(),
             music_enabled: None,
@@ -190,6 +193,7 @@ mod tests {
         .expect("missing auth mode should deserialize");
 
         assert_eq!(config.launch_auth_mode, LAUNCH_AUTH_MODE_OFFLINE);
+        assert!(!config.telemetry_enabled);
         assert_eq!(
             config
                 .normalized()
