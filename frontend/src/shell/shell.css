@@ -608,6 +608,7 @@
   --cp-status-bg: color-mix(in oklab, var(--surface-2) 90%, var(--cp-install-color));
   --cp-status-border: color-mix(in oklab, var(--line) 76%, var(--cp-install-color));
   --cp-install-fill: color-mix(in oklab, var(--cp-install-color) 18%, transparent);
+  --cp-install-shine: color-mix(in oklab, var(--cp-install-color) 30%, transparent);
   cursor: pointer;
 }
 .cp-status-pill--installing::after {
@@ -616,9 +617,14 @@
   z-index: 0;
   inset: 0;
   border-radius: inherit;
-  background: var(--cp-install-fill);
+  background:
+    linear-gradient(105deg, transparent 0 38%, var(--cp-install-shine) 48%, transparent 58%),
+    var(--cp-install-fill);
+  background-position: 140% 0, 0 0;
+  background-size: 180% 100%, auto;
   transform: scaleX(var(--cp-install-ratio));
   transform-origin: left center;
+  animation: cp-install-shimmer 1800ms ease-in-out infinite;
   transition: transform 180ms cubic-bezier(0.22, 1, 0.36, 1);
   pointer-events: none;
 }
@@ -648,6 +654,11 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+@keyframes cp-install-shimmer {
+  from { background-position: 140% 0, 0 0; }
+  to { background-position: -80% 0, 0 0; }
 }
 
 /* Music widget ---------------------------------------------------------- */
