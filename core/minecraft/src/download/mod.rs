@@ -472,13 +472,7 @@ impl Downloader {
             for (name, object) in index.objects {
                 let src = objects_dir.join(&object.hash[..2]).join(&object.hash);
                 let dst = virtual_dir.join(PathBuf::from(name));
-                if path_is_file(&dst).await || !path_is_file(&src).await {
-                    continue;
-                }
-                if let Some(parent) = dst.parent() {
-                    async_fs::create_dir_all(parent).await?;
-                }
-                let _ = async_fs::copy(src, dst).await;
+                copy_virtual_asset_if_missing(&src, &dst).await?;
             }
         }
 
@@ -1090,6 +1084,17 @@ async fn path_is_file(path: &Path) -> bool {
     matches!(async_fs::metadata(path).await, Ok(metadata) if metadata.is_file())
 }
 
+async fn copy_virtual_asset_if_missing(src: &Path, dst: &Path) -> Result<(), DownloadError> {
+    if path_is_file(dst).await || !path_is_file(src).await {
+        return Ok(());
+    }
+    if let Some(parent) = dst.parent() {
+        async_fs::create_dir_all(parent).await?;
+    }
+    async_fs::copy(src, dst).await?;
+    Ok(())
+}
+
 fn resolve_path_under_root(root: &Path, relative: &str) -> Option<PathBuf> {
     let clean = PathBuf::from(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
     if clean.as_os_str().is_empty() || clean.is_absolute() {
@@ -1322,6 +1327,55 @@ mod tests {
             )
             .await
             .expect("sha1 mismatch")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn virtual_asset_copy_reports_destination_errors() {
+        let root = temp_dir("virtual-asset-copy-error");
+        let src = root.join("objects").join("aa").join("asset");
+        let dst = root
+            .join("virtual")
+            .join("legacy")
+            .join("sounds")
+            .join("step.ogg");
+        fs::create_dir_all(src.parent().expect("source parent")).expect("create source parent");
+        fs::create_dir_all(&dst).expect("create destination directory");
+        fs::write(&src, b"asset").expect("write source asset");
+
+        let result = copy_virtual_asset_if_missing(&src, &dst).await;
+
+        assert!(result.is_err());
+        assert!(src.is_file());
+        assert!(dst.is_dir());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn virtual_asset_copy_skips_existing_destination() {
+        let root = temp_dir("virtual-asset-copy-existing");
+        let src = root.join("objects").join("aa").join("asset");
+        let dst = root
+            .join("virtual")
+            .join("legacy")
+            .join("sounds")
+            .join("step.ogg");
+        fs::create_dir_all(src.parent().expect("source parent")).expect("create source parent");
+        fs::create_dir_all(dst.parent().expect("destination parent"))
+            .expect("create destination parent");
+        fs::write(&src, b"source").expect("write source asset");
+        fs::write(&dst, b"existing").expect("write existing virtual asset");
+
+        copy_virtual_asset_if_missing(&src, &dst)
+            .await
+            .expect("existing virtual asset should be kept");
+
+        assert_eq!(
+            fs::read(&dst).expect("read existing virtual asset"),
+            b"existing"
         );
 
         let _ = fs::remove_dir_all(root);
