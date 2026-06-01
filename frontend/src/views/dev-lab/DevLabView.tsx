@@ -1,5 +1,6 @@
 import type { JSX } from 'preact';
 import { useState } from 'preact/hooks';
+import './dev-lab.css';
 import { ART_PRESETS, InstanceArt, artPresetForSeed, artSeedForPreset, nextArtSeed, versionIdentityForVersionId, type ArtPreset } from '../../art/InstanceArt';
 import { Button, Card, Input, SectionHeading } from '../../ui/Atoms';
 import { hashStr } from '../../tokens';

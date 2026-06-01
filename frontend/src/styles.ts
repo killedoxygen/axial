@@ -9,7 +9,6 @@ import './ui/toast.css';
 import './ui/player-head.css';
 import './views/setup/setup.css';
 import './views/onboarding/onboarding.css';
-import './views/dev-lab/dev-lab.css';
 import './views/settings/accent.css';
 import './views/create/create.css';
 import './views/instance/instance.css';
