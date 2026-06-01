@@ -1,4 +1,5 @@
 import net from 'node:net';
+import { rm } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { context, build } from 'esbuild';
@@ -19,6 +20,7 @@ const reactCompatAliases = new Map([
 ]);
 
 const openaiIconSubsetPath = fileURLToPath(new URL('./src/vendor/openai-icons-subset.js', import.meta.url));
+const generatedOutputs = ['static/app.js', 'static/app.css', 'static/chunks'];
 
 const openaiIconSubsetPlugin = {
   name: 'openai-icon-subset',
@@ -128,6 +130,10 @@ async function resolveDevPort() {
   throw new Error('Could not find a free dev server port');
 }
 
+async function cleanGeneratedOutputs() {
+  await Promise.all(generatedOutputs.map(path => rm(path, { recursive: true, force: true })));
+}
+
 if (mode === 'serve') {
   // Standalone dev server, rebuilds per request and does not write to disk
   const port = await resolveDevPort();
@@ -147,6 +153,7 @@ if (mode === 'serve') {
   await new Promise(() => {});
 } else {
   // Production build
+  await cleanGeneratedOutputs();
   const result = await build({ ...shared, minify: true, metafile: true });
   const bytes = result.metafile?.outputs['static/app.js']?.bytes ?? 0;
   console.log(`static/app.js  ${(bytes / 1024).toFixed(1)}kb`);
