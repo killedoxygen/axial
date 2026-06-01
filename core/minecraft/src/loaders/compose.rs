@@ -6,6 +6,7 @@ use crate::paths::versions_dir;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
+use tokio::fs as async_fs;
 
 use super::types::LoaderError;
 use super::validate_version_id;
@@ -124,7 +125,7 @@ pub fn compose_loader_version(
     Ok(composed)
 }
 
-pub fn write_composed_version(
+pub async fn write_composed_version(
     mc_dir: &Path,
     version_id: &str,
     version: &VersionJson,
@@ -133,14 +134,15 @@ pub fn write_composed_version(
     validate_version_id(base_version_id, "base minecraft version id")?;
     validate_version_id(version_id, "installed loader version id")?;
     let version_dir = versions_dir(mc_dir).join(version_id);
-    fs::create_dir_all(&version_dir)?;
+    async_fs::create_dir_all(&version_dir).await?;
     let marker = version_dir.join(".incomplete");
-    fs::write(&marker, b"installing")?;
-    fs::write(
+    async_fs::write(&marker, b"installing").await?;
+    async_fs::write(
         version_dir.join(format!("{version_id}.json")),
         serde_json::to_vec_pretty(version)?,
-    )?;
-    link_or_copy_base_jar(mc_dir, base_version_id, version_id)?;
+    )
+    .await?;
+    link_or_copy_base_jar(mc_dir, base_version_id, version_id).await?;
     Ok(())
 }
 
@@ -182,7 +184,7 @@ fn merge_arguments(
     Some(merged)
 }
 
-fn link_or_copy_base_jar(
+async fn link_or_copy_base_jar(
     mc_dir: &Path,
     base_version_id: &str,
     version_id: &str,
@@ -192,7 +194,7 @@ fn link_or_copy_base_jar(
     let base_jar = versions_dir(mc_dir)
         .join(base_version_id)
         .join(format!("{base_version_id}.jar"));
-    if !base_jar.is_file() {
+    if !matches!(async_fs::metadata(&base_jar).await, Ok(metadata) if metadata.is_file()) {
         return Err(LoaderError::Verify(format!(
             "base client jar is missing for {base_version_id}"
         )));
@@ -200,13 +202,13 @@ fn link_or_copy_base_jar(
     let dst_jar = versions_dir(mc_dir)
         .join(version_id)
         .join(format!("{version_id}.jar"));
-    if dst_jar.exists() {
+    if async_fs::metadata(&dst_jar).await.is_ok() {
         return Ok(());
     }
-    match fs::hard_link(&base_jar, &dst_jar) {
+    match async_fs::hard_link(&base_jar, &dst_jar).await {
         Ok(()) => Ok(()),
         Err(_) => {
-            fs::copy(base_jar, dst_jar)?;
+            async_fs::copy(base_jar, dst_jar).await?;
             Ok(())
         }
     }
@@ -373,8 +375,8 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn write_composed_version_rejects_traversal_base_version_id() {
+    #[tokio::test]
+    async fn write_composed_version_rejects_traversal_base_version_id() {
         let root = temp_dir("write-composed-version-base-traversal");
         create_minecraft_dir(&root).expect("library");
         let version = VersionJson {
@@ -397,6 +399,7 @@ mod tests {
         };
 
         let error = write_composed_version(&root, "loader-test", &version, "../escape")
+            .await
             .expect_err("traversal should fail");
 
         assert_eq!(

@@ -12,7 +12,6 @@ use crate::loaders::validate_version_id;
 use crate::paths::{loader_artifacts_dir, versions_dir};
 use crate::profiles::ensure_launcher_profiles;
 use std::collections::HashMap;
-use std::fs;
 use std::io::sink;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -66,7 +65,7 @@ where
     validate_version_id(&installed_version_id, "installed loader version id")?;
 
     cleanup_on_error(
-        write_raw_profile_version(library_dir, &installed_version_id, &profile_bytes),
+        write_raw_profile_version(library_dir, &installed_version_id, &profile_bytes).await,
         library_dir,
         &installed_version_id,
     )?;
@@ -106,7 +105,8 @@ where
             &installed_version_id,
             &version,
             &plan.record.minecraft_version,
-        ),
+        )
+        .await,
         library_dir,
         &installed_version_id,
     )?;
@@ -196,7 +196,8 @@ where
             &installed_version_id,
             &version,
             &plan.record.minecraft_version,
-        ),
+        )
+        .await,
         library_dir,
         &installed_version_id,
     )?;
@@ -326,7 +327,8 @@ where
             &plan.record.version_id,
             &version,
             &plan.record.minecraft_version,
-        ),
+        )
+        .await,
         library_dir,
         &plan.record.version_id,
     )?;
@@ -444,19 +446,20 @@ fn verify_install(library_dir: &Path, version_id: &str) -> Result<(), LoaderErro
     Ok(())
 }
 
-fn write_raw_profile_version(
+async fn write_raw_profile_version(
     library_dir: &Path,
     version_id: &str,
     profile_bytes: &[u8],
 ) -> Result<(), LoaderError> {
     validate_version_id(version_id, "installed loader version id")?;
     let version_dir = versions_dir(library_dir).join(version_id);
-    fs::create_dir_all(&version_dir)?;
-    fs::write(version_dir.join(".incomplete"), b"installing")?;
-    fs::write(
+    async_fs::create_dir_all(&version_dir).await?;
+    async_fs::write(version_dir.join(".incomplete"), b"installing").await?;
+    async_fs::write(
         version_dir.join(format!("{version_id}.json")),
         profile_bytes,
-    )?;
+    )
+    .await?;
     Ok(())
 }
 
