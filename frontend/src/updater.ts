@@ -152,6 +152,7 @@ async function runAutoUpdateCheck(): Promise<void> {
     return;
   }
   await checkForUpdates({ silent: true });
+  stampUpdateCheck();
   if (shouldAutoCheck()) queueAutoUpdateCheck(AUTO_CHECK_RETRY_MS);
   else queueAutoUpdateCheck(AUTO_CHECK_INTERVAL_MS);
 }
