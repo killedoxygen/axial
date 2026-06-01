@@ -1,5 +1,5 @@
 use crate::state::AppState;
-use axum::{Json, Router, extract::State, routing::get};
+use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
 use reqwest::header::{ACCEPT, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime};
@@ -8,6 +8,9 @@ const GITHUB_LATEST_RELEASE_URL: &str =
     "https://api.github.com/repos/mateoltd/croopor/releases/latest";
 const GITHUB_RELEASE_PAGE_PREFIX: &str = "https://github.com/mateoltd/croopor/releases/";
 const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
+const UPDATE_CHECK_UNAVAILABLE_MESSAGE: &str = "update check unavailable";
+
+type ApiErrorResponse = (StatusCode, Json<serde_json::Value>);
 
 #[derive(Debug, Serialize)]
 struct UpdateResponse {
@@ -33,17 +36,18 @@ pub fn router() -> Router<AppState> {
     Router::new().route("/api/v1/update", get(handle_update))
 }
 
-async fn handle_update(State(state): State<AppState>) -> Json<UpdateResponse> {
+async fn handle_update(
+    State(state): State<AppState>,
+) -> Result<Json<UpdateResponse>, ApiErrorResponse> {
     let current_version = state.version().to_string();
     let checked_at = timestamp_utc();
-    let fallback = || fallback_response(&current_version, &checked_at);
 
-    let response = match fetch_latest_release(&current_version).await {
-        Ok(release) => release_response(&current_version, &checked_at, release),
-        Err(_) => fallback(),
-    };
-
-    Json(response)
+    update_response_from_release_fetch(
+        &current_version,
+        &checked_at,
+        fetch_latest_release(&current_version).await,
+    )
+    .map(Json)
 }
 
 async fn fetch_latest_release(
@@ -104,6 +108,23 @@ fn release_response(
         action_label: "Open release".to_string(),
         checked_at: checked_at.to_string(),
     }
+}
+
+fn update_response_from_release_fetch<E>(
+    current_version: &str,
+    checked_at: &str,
+    result: Result<GithubLatestRelease, E>,
+) -> Result<UpdateResponse, ApiErrorResponse> {
+    result
+        .map(|release| release_response(current_version, checked_at, release))
+        .map_err(|_| update_unavailable_response())
+}
+
+fn update_unavailable_response() -> ApiErrorResponse {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({ "error": UPDATE_CHECK_UNAVAILABLE_MESSAGE })),
+    )
 }
 
 fn normalized_version(version: &str) -> String {
@@ -238,5 +259,35 @@ mod tests {
         assert!(!wrong_url.available);
         assert_eq!(wrong_url.latest_version, "1.2.3");
         assert_eq!(wrong_url.kind, "none");
+    }
+
+    #[test]
+    fn update_fetch_failure_maps_to_service_unavailable_error() {
+        let error =
+            update_response_from_release_fetch::<()>("1.2.3", "2026-01-01T00:00:00Z", Err(()))
+                .expect_err("fetch failure should not become no-update success");
+
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error.1.0,
+            serde_json::json!({ "error": UPDATE_CHECK_UNAVAILABLE_MESSAGE })
+        );
+    }
+
+    #[test]
+    fn update_fetch_success_preserves_no_update_fallbacks() {
+        let response = update_response_from_release_fetch::<()>(
+            "1.2.3",
+            "2026-01-01T00:00:00Z",
+            Ok(GithubLatestRelease {
+                tag_name: "v1.2.4".to_string(),
+                html_url: "https://example.com/mateoltd/croopor/releases/tag/v1.2.4".to_string(),
+            }),
+        )
+        .expect("unusable release URL should remain a successful no-update response");
+
+        assert!(!response.available);
+        assert_eq!(response.latest_version, "1.2.3");
+        assert_eq!(response.kind, "none");
     }
 }
