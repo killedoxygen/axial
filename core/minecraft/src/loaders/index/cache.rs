@@ -182,6 +182,39 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn stale_cache_is_returned_when_live_fetch_response_is_too_large() {
+        let root = temp_dir("stale-cache-oversized-live-fetch");
+        fs::create_dir_all(&root).expect("create root");
+        let cache_path = root.join("catalog.json");
+        let cached = CachedCatalog {
+            schema_version: CATALOG_SCHEMA_VERSION,
+            fetched_at_ms: 1,
+            value: vec!["cached".to_string()],
+        };
+        write_cache(&cache_path, &cached).expect("write stale cache");
+
+        let (value, state) = resolve_cached(cache_path, Duration::ZERO, || async {
+            Err::<Vec<String>, _>(LoaderError::Other(
+                "loader provider response too large".to_string(),
+            ))
+        })
+        .await
+        .expect("stale cache should cover oversized live fetch");
+
+        assert_eq!(value, vec!["cached".to_string()]);
+        assert!(!state.availability.fresh);
+        assert!(state.availability.stale);
+        assert!(state.availability.cache_hit);
+        assert_eq!(state.availability.last_success_at_ms, Some(1));
+        assert_eq!(
+            state.availability.last_error.as_deref(),
+            Some("loader provider response too large")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn write_cache_uses_temp_file_before_replacement() {
         let root = temp_dir("atomic-cache-write");

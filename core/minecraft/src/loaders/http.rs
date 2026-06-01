@@ -5,6 +5,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 const USER_AGENT: &str = "croopor/0.3";
+const MAX_LOADER_JSON_BYTES: usize = 8 * 1024 * 1024;
 
 pub async fn fetch_json<T>(url: &str) -> Result<T, LoaderError>
 where
@@ -59,11 +60,28 @@ where
             response.status()
         )));
     }
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|error| LoaderError::Other(format!("request failed for {url}: {error}")))?;
+    if response
+        .content_length()
+        .is_some_and(|content_length| content_length > MAX_LOADER_JSON_BYTES as u64)
+    {
+        return Err(loader_json_too_large());
+    }
+
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk
+            .map_err(|error| LoaderError::Other(format!("request failed for {url}: {error}")))?;
+        if bytes.len().saturating_add(chunk.len()) > MAX_LOADER_JSON_BYTES {
+            return Err(loader_json_too_large());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
     serde_json::from_slice(&bytes).map_err(LoaderError::Parse)
+}
+
+fn loader_json_too_large() -> LoaderError {
+    LoaderError::Other("loader provider response too large".to_string())
 }
 
 async fn fetch_bytes_once(url: &str, max_size: u64) -> Result<Vec<u8>, LoaderError> {
@@ -126,9 +144,10 @@ fn client() -> &'static reqwest::Client {
 
 #[cfg(test)]
 mod tests {
-    use super::{fetch_bytes, fetch_json};
+    use super::{MAX_LOADER_JSON_BYTES, fetch_bytes, fetch_json, fetch_json_once};
     use crate::loaders::types::LoaderError;
     use serde::Deserialize;
+    use serde_json::Value;
     use std::io::{ErrorKind, Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::Arc;
@@ -226,6 +245,34 @@ mod tests {
         assert_eq!(payload.value, "ok");
     }
 
+    #[tokio::test]
+    async fn fetch_json_rejects_oversized_content_length() {
+        let server = TestServer::spawn(|stream| {
+            respond_oversized_json_content_length(stream);
+        });
+
+        let error = fetch_json_once::<Value>(&server.url("/metadata.json"))
+            .await
+            .expect_err("oversized response");
+
+        assert_loader_json_too_large(error);
+        assert_eq!(server.request_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn fetch_json_rejects_chunked_response_past_max_size() {
+        let server = TestServer::spawn(|stream| {
+            respond_oversized_chunked_json(stream);
+        });
+
+        let error = fetch_json_once::<Value>(&server.url("/metadata.json"))
+            .await
+            .expect_err("oversized response");
+
+        assert_loader_json_too_large(error);
+        assert_eq!(server.request_count(), 1);
+    }
+
     fn respond_404(stream: TcpStream) {
         respond(
             stream,
@@ -233,10 +280,42 @@ mod tests {
         );
     }
 
+    fn respond_oversized_json_content_length(stream: TcpStream) {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            MAX_LOADER_JSON_BYTES + 1
+        );
+        respond(stream, response.as_bytes());
+    }
+
+    fn respond_oversized_chunked_json(mut stream: TcpStream) {
+        let mut buffer = [0_u8; 1024];
+        let _ = stream.read(&mut buffer);
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n",
+            MAX_LOADER_JSON_BYTES + 1
+        )
+        .expect("write response headers");
+        stream
+            .write_all(&vec![b' '; MAX_LOADER_JSON_BYTES + 1])
+            .expect("write response body");
+        stream.write_all(b"\r\n0\r\n\r\n").expect("finish response");
+    }
+
     fn respond(mut stream: TcpStream, response: &[u8]) {
         let mut buffer = [0_u8; 1024];
         let _ = stream.read(&mut buffer);
         stream.write_all(response).expect("write response");
+    }
+
+    fn assert_loader_json_too_large(error: LoaderError) {
+        match error {
+            LoaderError::Other(message) => {
+                assert_eq!(message, "loader provider response too large");
+            }
+            error => panic!("expected Other, got {error:?}"),
+        }
     }
 
     struct TestServer {
