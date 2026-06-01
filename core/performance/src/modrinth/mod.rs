@@ -5,12 +5,15 @@ use sha2::{Digest, Sha512};
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 
 const USER_AGENT: &str = "croopor/0.3.1 (github.com/mateoltd/croopor)";
 const RATE_LIMIT_BODY_LIMIT: usize = 4096;
+const MODRINTH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const MODRINTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Error)]
 pub enum ModrinthError {
@@ -37,14 +40,8 @@ pub struct ModrinthClient {
 
 impl ModrinthClient {
     pub fn new() -> Self {
-        let client = Client::builder()
-            .user_agent(USER_AGENT)
-            .timeout(Duration::from_secs(30))
-            .build()
-            .expect("build modrinth client");
-
         Self {
-            client,
+            client: modrinth_http_client(),
             base_url: "https://api.modrinth.com".to_string(),
         }
     }
@@ -164,6 +161,20 @@ impl ModrinthClient {
         }
         Ok(())
     }
+}
+
+fn modrinth_http_client() -> Client {
+    static CLIENT: OnceLock<Client> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            Client::builder()
+                .user_agent(USER_AGENT)
+                .connect_timeout(MODRINTH_CONNECT_TIMEOUT)
+                .timeout(MODRINTH_REQUEST_TIMEOUT)
+                .build()
+                .unwrap_or_else(|_| Client::new())
+        })
+        .clone()
 }
 
 impl Default for ModrinthClient {
