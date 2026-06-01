@@ -130,8 +130,6 @@
     0 2px 18px rgba(0,0,0,0.55),
     0 1px 2px rgba(0,0,0,0.3);
 }
-/* State chip + metadata share one line. State is the first item, with
- * a small accent (or pulse-green when running) dot. */
 .cp-instance-subtitle {
   margin-top: 10px;
   display: flex;
@@ -151,33 +149,6 @@
 .cp-instance-subtitle-sep {
   color: var(--text-mute);
   opacity: 0.55;
-}
-.cp-instance-state-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  font-weight: 600;
-  color: var(--text);
-  letter-spacing: -0.1px;
-}
-.cp-instance-state-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 999px;
-  background: var(--accent);
-  box-shadow:
-    0 0 0 3px oklch(from var(--accent) l c h / 0.18),
-    0 0 6px oklch(from var(--accent) l c h / 0.4);
-}
-.cp-instance-state-chip[data-running="true"] {
-  color: var(--ok);
-}
-.cp-instance-state-chip[data-running="true"] .cp-instance-state-dot {
-  background: var(--ok);
-  box-shadow:
-    0 0 0 3px oklch(0.78 0.14 150 / 0.22),
-    0 0 6px oklch(0.78 0.14 150 / 0.55);
-  animation: cp-pulse 1.8s ease-in-out infinite;
 }
 
 /* Action cluster — Launch button is the only saturated control here.
@@ -1128,54 +1099,6 @@
     0 0 0 3px oklch(0.78 0.14 150 / 0.18),
     0 0 4px oklch(0.78 0.14 150 / 0.55);
   animation: cp-pulse 1.8s ease-in-out infinite;
-}
-
-/* ─── Maintenance — single compact rail list ─── */
-.cp-od-maint-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-}
-.cp-od-maint-row {
-  display: grid;
-  grid-template-columns: 26px minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 12px;
-  padding: 10px 0;
-}
-.cp-od-maint-row + .cp-od-maint-row {
-  border-top: 1px solid oklch(1 0 0 / 0.04);
-}
-.cp-od-maint-icon {
-  width: 26px;
-  height: 26px;
-  border-radius: 8px;
-  background: var(--surface-3);
-  color: var(--text-dim);
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  flex-shrink: 0;
-}
-.cp-od-maint-icon[data-tone="ok"] {
-  background: oklch(0.78 0.14 150 / 0.10);
-  color: var(--ok);
-}
-.cp-od-maint-icon[data-tone="mute"] { color: var(--text-mute); }
-.cp-od-maint-body { min-width: 0; }
-.cp-od-maint-title {
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--text);
-  letter-spacing: -0.1px;
-}
-.cp-od-maint-sub {
-  font-size: 11.5px;
-  color: var(--text-mute);
-  margin-top: 2px;
-  letter-spacing: -0.05px;
 }
 
 /* Compact Logs strip pinned at the bottom of the overview. */
@@ -2205,6 +2128,5 @@
     opacity: 1 !important;
     transform: none !important;
   }
-  .cp-instance-state-chip[data-running="true"] .cp-instance-state-dot,
   .cp-od-status[data-running="true"] .cp-od-status-dot { animation: none !important; }
 }
