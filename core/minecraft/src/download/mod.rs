@@ -1,6 +1,6 @@
 use crate::java::ensure_java_runtime;
 use crate::launch::{Library, VersionJson, maven_to_path};
-use crate::manifest::fetch_version_manifest;
+use crate::manifest::{ManifestEntry, fetch_version_manifest};
 use crate::paths::{assets_dir, libraries_dir, versions_dir};
 use crate::rules::{current_os_arch, default_environment, evaluate_rules};
 use futures_util::StreamExt;
@@ -62,6 +62,13 @@ struct DownloadJob {
     expected: ExpectedIntegrity,
 }
 
+#[derive(Debug, Clone)]
+struct VersionJsonDownload {
+    url: String,
+    expected: ExpectedIntegrity,
+    force_download: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct ExpectedIntegrity {
     size: Option<u64>,
@@ -121,6 +128,13 @@ impl ExpectedIntegrity {
     fn from_mojang(size: i64, sha1: &str) -> Self {
         Self {
             size: u64::try_from(size).ok().filter(|value| *value > 0),
+            sha1: non_empty_sha1(sha1),
+        }
+    }
+
+    fn from_sha1(sha1: &str) -> Self {
+        Self {
+            size: None,
             sha1: non_empty_sha1(sha1),
         }
     }
@@ -203,16 +217,34 @@ impl Downloader {
             Some(format!("{version_id}.json")),
         ));
 
-        let url = if let Some(url) = manifest_url.filter(|value| !value.trim().is_empty()) {
-            url.to_string()
-        } else if path_is_file(&json_path).await {
-            String::new()
-        } else {
-            self.resolve_manifest_url(version_id).await?
-        };
-        if !url.is_empty() {
-            self.download_file(&url, &json_path, &ExpectedIntegrity::default())
-                .await?;
+        let version_json_download =
+            if let Some(url) = manifest_url.filter(|value| !value.trim().is_empty()) {
+                VersionJsonDownload {
+                    url: url.to_string(),
+                    expected: ExpectedIntegrity::default(),
+                    force_download: true,
+                }
+            } else {
+                match self.resolve_manifest_download(version_id).await {
+                    Ok(download) => download,
+                    Err(error) if path_is_file(&json_path).await => VersionJsonDownload {
+                        url: String::new(),
+                        expected: ExpectedIntegrity::default(),
+                        force_download: false,
+                    },
+                    Err(error) => return Err(error),
+                }
+            };
+        let should_download_version_json = !version_json_download.url.is_empty()
+            && (version_json_download.force_download
+                || !existing_file_satisfies(&json_path, &version_json_download.expected).await?);
+        if should_download_version_json {
+            self.download_file(
+                &version_json_download.url,
+                &json_path,
+                &version_json_download.expected,
+            )
+            .await?;
         }
 
         let version =
@@ -348,7 +380,10 @@ impl Downloader {
         Ok(())
     }
 
-    async fn resolve_manifest_url(&self, version_id: &str) -> Result<String, DownloadError> {
+    async fn resolve_manifest_download(
+        &self,
+        version_id: &str,
+    ) -> Result<VersionJsonDownload, DownloadError> {
         let manifest = fetch_version_manifest()
             .await
             .map_err(|error| DownloadError::ResolveManifest(error.to_string()))?;
@@ -356,7 +391,7 @@ impl Downloader {
             .versions
             .into_iter()
             .find(|entry| entry.id == version_id)
-            .map(|entry| entry.url)
+            .map(version_json_download_from_manifest_entry)
             .ok_or_else(|| {
                 DownloadError::ResolveManifest(format!(
                     "version {version_id} not found in manifest"
@@ -493,6 +528,14 @@ impl Downloader {
 
         Err(last_error
             .unwrap_or_else(|| DownloadError::ResolveManifest("download failed".to_string())))
+    }
+}
+
+fn version_json_download_from_manifest_entry(entry: ManifestEntry) -> VersionJsonDownload {
+    VersionJsonDownload {
+        url: entry.url,
+        expected: ExpectedIntegrity::from_sha1(&entry.sha1),
+        force_download: false,
     }
 }
 
@@ -1356,6 +1399,24 @@ mod tests {
 
         assert_eq!(expected, ExpectedIntegrity::default());
         assert!(!expected.has_evidence());
+    }
+
+    #[test]
+    fn manifest_entry_download_carries_sha1_without_forcing_download() {
+        let sha1 = "abcdef1234567890abcdef1234567890abcdef12";
+        let download = version_json_download_from_manifest_entry(ManifestEntry {
+            id: "1.20.1".to_string(),
+            kind: "release".to_string(),
+            url: "https://example.invalid/1.20.1.json".to_string(),
+            time: String::new(),
+            release_time: String::new(),
+            sha1: sha1.to_string(),
+            compliance_level: 1,
+        });
+
+        assert_eq!(download.url, "https://example.invalid/1.20.1.json");
+        assert_eq!(download.expected, ExpectedIntegrity::from_sha1(sha1));
+        assert!(!download.force_download);
     }
 
     fn sha1_hex(bytes: &[u8]) -> String {
