@@ -230,12 +230,27 @@ fn release_asset_name(latest_version: &str, os: &str, arch: &str) -> Option<Stri
 
 fn sane_release_asset_url(url: &str, expected_name: &str) -> Option<String> {
     let trimmed = url.trim();
-    if trimmed != url
-        || !trimmed.starts_with(GITHUB_RELEASE_DOWNLOAD_PREFIX)
-        || !trimmed.ends_with(&format!("/{expected_name}"))
-    {
+    let Some(download_path) = trimmed.strip_prefix(GITHUB_RELEASE_DOWNLOAD_PREFIX) else {
+        return None;
+    };
+    if trimmed != url {
         return None;
     }
+    let (tag, filename) = download_path.split_once('/')?;
+    if filename != expected_name {
+        return None;
+    }
+    let expected_version = expected_name
+        .rsplit_once('-')?
+        .1
+        .strip_suffix(".tar.gz")
+        .or_else(|| expected_name.rsplit_once('-')?.1.strip_suffix(".zip"))?;
+    let expected_v_tag = format!("v{expected_version}");
+    let expected_upper_v_tag = format!("V{expected_version}");
+    if tag != expected_version && tag != expected_v_tag && tag != expected_upper_v_tag {
+        return None;
+    }
+
     Some(trimmed.to_string())
 }
 
@@ -469,6 +484,17 @@ mod tests {
             "x86_64",
         );
         assert!(mismatched_filename.is_none());
+
+        let mismatched_release_tag = matching_release_asset_url(
+            &[release_asset(
+                "croopor-linux-amd64-1.2.4.tar.gz",
+                "https://github.com/mateoltd/croopor/releases/download/v1.2.5/croopor-linux-amd64-1.2.4.tar.gz",
+            )],
+            "1.2.4",
+            "linux",
+            "x86_64",
+        );
+        assert!(mismatched_release_tag.is_none());
 
         let unsupported_arch = matching_release_asset_url(
             &[release_asset(
