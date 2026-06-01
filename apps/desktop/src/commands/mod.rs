@@ -5,6 +5,8 @@ use croopor_launcher::LaunchState;
 use tauri::webview::Color;
 use tauri::{AppHandle, Emitter, Manager, State};
 
+const RESTART_BUSY_MESSAGE: &str = "Restart is blocked while installs or launches are active.";
+
 #[tauri::command]
 pub fn app_version(state: State<'_, DesktopState>) -> String {
     state.version().to_string()
@@ -16,9 +18,20 @@ pub fn api_base_url(state: State<'_, ApiRuntimeState>) -> String {
 }
 
 #[tauri::command]
-pub fn app_restart(app: AppHandle) -> Result<(), String> {
+pub async fn app_restart(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let active_installs = state.installs().active_install_count().await;
+    let active_sessions = state.sessions().active_session_count().await;
+    restart_readiness(active_installs, active_sessions)?;
     app.request_restart();
     Ok(())
+}
+
+fn restart_readiness(active_installs: usize, active_sessions: usize) -> Result<(), String> {
+    if active_installs > 0 || active_sessions > 0 {
+        Err(RESTART_BUSY_MESSAGE.to_string())
+    } else {
+        Ok(())
+    }
 }
 
 #[tauri::command]
@@ -266,5 +279,39 @@ fn launch_state_name(state: LaunchState) -> &'static str {
         LaunchState::Degraded => "degraded",
         LaunchState::Failed => "failed",
         LaunchState::Exited => "exited",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RESTART_BUSY_MESSAGE, restart_readiness};
+
+    #[test]
+    fn restart_readiness_allows_idle_app() {
+        assert_eq!(restart_readiness(0, 0), Ok(()));
+    }
+
+    #[test]
+    fn restart_readiness_blocks_active_installs() {
+        assert_eq!(
+            restart_readiness(1, 0),
+            Err(RESTART_BUSY_MESSAGE.to_string())
+        );
+    }
+
+    #[test]
+    fn restart_readiness_blocks_active_sessions() {
+        assert_eq!(
+            restart_readiness(0, 1),
+            Err(RESTART_BUSY_MESSAGE.to_string())
+        );
+    }
+
+    #[test]
+    fn restart_readiness_blocks_mixed_activity() {
+        assert_eq!(
+            restart_readiness(2, 3),
+            Err(RESTART_BUSY_MESSAGE.to_string())
+        );
     }
 }
