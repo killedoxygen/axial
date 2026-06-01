@@ -327,11 +327,14 @@ async fn handle_save_skin(
     body: Body,
 ) -> Result<Json<SavedSkinRecord>, ApiError> {
     let name = validate_saved_skin_name(query.name.as_deref().unwrap_or_default())?;
-    let variant = validate_saved_skin_variant(query.variant.as_deref())?;
     let bytes = to_bytes(body, SKIN_UPLOAD_MAX_BYTES)
         .await
         .map_err(|_| json_error(StatusCode::PAYLOAD_TOO_LARGE, "skin upload is too large"))?;
     let normalized = normalize_skin_png(&bytes)?;
+    let variant = match query.variant.as_deref() {
+        Some(_) => validate_saved_skin_variant(query.variant.as_deref())?,
+        None => normalized.variant_suggestion.to_string(),
+    };
     let texture_key = texture_key(&normalized.png_bytes);
     let record = state
         .skins()
@@ -2211,6 +2214,20 @@ mod tests {
             Some(SAVED_SKIN_FILE_CACHE_CONTROL)
         );
         assert_eq!(file_bytes, normalized.png_bytes);
+    }
+
+    #[tokio::test]
+    async fn skin_saved_save_uses_normalized_slim_suggestion_when_variant_is_omitted() {
+        let fixture = TestFixture::new("saved-save-slim-suggestion", "ConfigUser");
+        let png = test_slim_skin_png();
+
+        let saved = fixture
+            .save_skin("Detected Slim", None, png)
+            .await
+            .expect("save skin")
+            .0;
+
+        assert_eq!(saved.variant, "slim");
     }
 
     #[tokio::test]
