@@ -4,7 +4,9 @@ use crate::loaders::compose::{
     LoaderProfileFragment, cleanup_incomplete_version, compose_loader_version,
     finalize_version_install, write_composed_version,
 };
-use crate::loaders::forge_installer::{extract_installer, extract_maven_entries};
+use crate::loaders::forge_installer::{
+    ExtractedForgeInstaller, ForgeInstallerError, extract_installer, extract_maven_entries,
+};
 use crate::loaders::http::fetch_bytes;
 use crate::loaders::processors::run_processors;
 use crate::loaders::types::{LoaderBuildRecord, LoaderError, LoaderInstallPlan};
@@ -31,6 +33,21 @@ struct CachedArtifact {
 struct CachedProfile {
     bytes: Vec<u8>,
     fragment: LoaderProfileFragment,
+}
+
+#[derive(Debug)]
+enum InstallerTaskError {
+    Extract(ForgeInstallerError),
+    Task(tokio::task::JoinError),
+}
+
+impl std::fmt::Display for InstallerTaskError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Extract(error) => write!(formatter, "{error}"),
+            Self::Task(error) => write!(formatter, "blocking task failed: {error}"),
+        }
+    }
 }
 
 pub async fn install_from_profile_source<F>(
@@ -166,17 +183,24 @@ where
             plan.record.component_name
         )),
     ));
-    let (installer_data, extracted) = match extract_installer(&cached_installer.bytes) {
-        Ok(extracted) => (cached_installer.bytes, extracted),
-        Err(error) if cached_installer.cache_hit => {
+    let (installer_data, extracted) = match extract_installer_blocking(cached_installer.bytes).await
+    {
+        Ok(extracted) => extracted,
+        Err(InstallerTaskError::Extract(_)) if cached_installer.cache_hit => {
             let _ = async_fs::remove_file(&installer_path).await;
             let bytes = download_and_cache_artifact(installer_url, &installer_path).await?;
-            let extracted = extract_installer(&bytes).map_err(|fresh_error| {
-                installer_extract_error(&plan.record.component_name, fresh_error)
-            })?;
-            (bytes, extracted)
+            extract_installer_blocking(bytes)
+                .await
+                .map_err(|fresh_error| {
+                    installer_task_extract_error(&plan.record.component_name, fresh_error)
+                })?
         }
-        Err(error) => return Err(installer_extract_error(&plan.record.component_name, error)),
+        Err(error) => {
+            return Err(installer_task_extract_error(
+                &plan.record.component_name,
+                error,
+            ));
+        }
     };
     let installed_version_id = if extracted.version_id.trim().is_empty() {
         plan.record.version_id.clone()
@@ -201,13 +225,15 @@ where
         library_dir,
         &installed_version_id,
     )?;
-    cleanup_on_error(
-        extract_maven_entries(&installer_data, library_dir).map_err(|error| {
-            LoaderError::Other(format!(
-                "extracting {} installer libraries: {error}",
-                plan.record.component_name
-            ))
-        }),
+    let installer_data = cleanup_on_error(
+        extract_maven_entries_blocking(installer_data, library_dir.to_path_buf())
+            .await
+            .map_err(|error| {
+                LoaderError::Other(format!(
+                    "extracting {} installer libraries: {error}",
+                    plan.record.component_name
+                ))
+            }),
         library_dir,
         &installed_version_id,
     )?;
@@ -552,6 +578,30 @@ fn validate_legacy_archive(bytes: &[u8]) -> Result<(), ZipError> {
     Ok(())
 }
 
+async fn extract_installer_blocking(
+    installer_data: Vec<u8>,
+) -> Result<(Vec<u8>, ExtractedForgeInstaller), InstallerTaskError> {
+    tokio::task::spawn_blocking(move || {
+        let extracted = extract_installer(&installer_data).map_err(InstallerTaskError::Extract)?;
+        Ok((installer_data, extracted))
+    })
+    .await
+    .map_err(InstallerTaskError::Task)?
+}
+
+async fn extract_maven_entries_blocking(
+    installer_data: Vec<u8>,
+    library_dir: PathBuf,
+) -> Result<Vec<u8>, InstallerTaskError> {
+    tokio::task::spawn_blocking(move || {
+        extract_maven_entries(&installer_data, &library_dir)
+            .map_err(InstallerTaskError::Extract)?;
+        Ok(installer_data)
+    })
+    .await
+    .map_err(InstallerTaskError::Task)?
+}
+
 async fn promote_cached_artifact_tmp(tmp_path: &Path, path: &Path) -> Result<(), LoaderError> {
     let first_error = match async_fs::rename(tmp_path, path).await {
         Ok(()) => return Ok(()),
@@ -617,6 +667,15 @@ fn artifact_tmp_path(path: &Path) -> PathBuf {
 
 fn installer_extract_error(component_name: &str, error: impl std::fmt::Display) -> LoaderError {
     LoaderError::InvalidProfile(format!("extracting {component_name} installer: {error}"))
+}
+
+fn installer_task_extract_error(component_name: &str, error: InstallerTaskError) -> LoaderError {
+    match error {
+        InstallerTaskError::Extract(error) => installer_extract_error(component_name, error),
+        InstallerTaskError::Task(error) => LoaderError::Other(format!(
+            "extracting {component_name} installer: blocking task failed: {error}"
+        )),
+    }
 }
 
 fn legacy_archive_error(component_name: &str, error: impl std::fmt::Display) -> LoaderError {
