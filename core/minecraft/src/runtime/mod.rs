@@ -1377,12 +1377,13 @@ mod tests {
         ComponentManifestDownload, ComponentManifestDownloads, ComponentManifestFile,
         JavaRuntimeLookupError, RuntimeDownloadActual, RuntimeDownloadEvidence,
         RuntimeDownloadIntegrityError, RuntimeInstallState, component_manifest_destination,
-        detect_distribution, detect_runtime_state, fetch_runtime_file, fetch_runtime_json,
-        install_runtime_manifest_file, java_executable, plan_runtime_manifest_files,
-        remove_runtime_install_path, runtime_download_client,
+        detect_distribution, detect_runtime_state, ensure_java_runtime, fetch_runtime_file,
+        fetch_runtime_json, install_runtime_manifest_file, java_executable,
+        plan_runtime_manifest_files, remove_runtime_install_path, runtime_download_client,
         runtime_file_download_concurrency_for, runtime_install_lock_from_map,
         verify_runtime_download,
     };
+    use crate::JavaVersion;
     use serde::Deserialize;
     use std::collections::HashMap;
     use std::fs;
@@ -1951,6 +1952,17 @@ mod tests {
         assert!(
             std::mem::size_of_val(&spawned_future) < 4096,
             "spawned runtime manifest file install future should stay small"
+        );
+        assert!(
+            std::mem::size_of_val(&ensure_java_runtime(
+                root,
+                &JavaVersion {
+                    component: "java-runtime-delta".to_string(),
+                    major_version: 21,
+                },
+                "",
+            )) < 4096,
+            "managed-runtime ensure future should stay small"
         );
     }
 
