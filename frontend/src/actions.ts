@@ -30,6 +30,14 @@ function cloneInstallItem(item: InstallItem): InstallItem {
     : { versionId: item.versionId };
 }
 
+function isSameInstallItem(left: InstallItem, right: InstallItem): boolean {
+  if (left.versionId !== right.versionId) return false;
+  if (!left.loader && !right.loader) return true;
+  if (!left.loader || !right.loader) return false;
+  return left.loader.componentId === right.loader.componentId
+    && left.loader.buildId === right.loader.buildId;
+}
+
 function boundedInstallFailureMessage(message: string): string {
   const firstUsefulLine = String(message || '')
     .split(/\r?\n/)
@@ -59,6 +67,12 @@ export function recordInstallFailure(item: InstallItem, message: string): void {
 }
 
 export function clearInstallFailure(): void {
+  installFailure.value = null;
+}
+
+export function clearInstallFailureForItem(item: InstallItem): void {
+  const failure = installFailure.value;
+  if (!failure || !isSameInstallItem(failure.item, item)) return;
   installFailure.value = null;
 }
 

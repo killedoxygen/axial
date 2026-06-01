@@ -11,7 +11,8 @@ import {
 } from './store';
 import {
   enqueueInstall, dequeueNextInstall, startInstall, updateInstallProgress,
-  completeInstall, setInstallEventSource, recordInstallFailure, requeueFailedInstall,
+  completeInstall, setInstallEventSource, recordInstallFailure, clearInstallFailureForItem,
+  requeueFailedInstall,
 } from './actions';
 import { formatInstallItemLabel } from './install-labels';
 import type { InstallItem, LoaderBuildRecord, LoaderComponentId } from './types';
@@ -160,9 +161,11 @@ export function handleInstallClick(): void {
 
 export function installVersion(target: string): void {
   if (!target) return;
+  const item: InstallItem = { versionId: target };
+  clearInstallFailureForItem(item);
   const active = installState.value;
   if (active.status === 'active' && active.versionId === target) return;
-  enqueueInstall({ versionId: target });
+  enqueueInstall(item);
   if (installState.value.status === 'idle') processNextInstall();
 }
 
@@ -257,9 +260,7 @@ function inferMinecraftVersionFromCompositeId(id: string): string {
 
 export function installLoaderVersion(build: LoaderBuildRecord): void {
   if (!build.component_id || !build.build_id || !build.version_id) return;
-  const active = installState.value;
-  if (active.status === 'active' && active.versionId === build.version_id) return;
-  enqueueInstall({
+  const item: InstallItem = {
     versionId: build.version_id,
     loader: {
       componentId: build.component_id,
@@ -267,7 +268,11 @@ export function installLoaderVersion(build: LoaderBuildRecord): void {
       minecraftVersion: build.minecraft_version,
       loaderVersion: build.loader_version,
     },
-  });
+  };
+  clearInstallFailureForItem(item);
+  const active = installState.value;
+  if (active.status === 'active' && active.versionId === build.version_id) return;
+  enqueueInstall(item);
   if (installState.value.status === 'idle') processNextInstall();
 }
 
@@ -421,7 +426,7 @@ async function connectVanillaEvents(installId: string, item: InstallItem): Promi
     }
 
     updateInstallProgress(pct, estimator.formatLabel(label, data, pct, startedAt), data.phase);
-    if (data.done) await onInstallDone();
+    if (data.done) await onInstallDone(item);
   };
 
   if (hasNativeDesktopRuntime()) {
@@ -515,7 +520,7 @@ async function connectLoaderEvents(installId: string, item: InstallItem): Promis
     }
 
     updateInstallProgress(pct, estimator.formatLabel(label, data, pct, startedAt), data.phase);
-    if (data.done) void onInstallDone();
+    if (data.done) void onInstallDone(item);
   };
 
   const onError = (message: string): void => {
@@ -551,7 +556,7 @@ async function connectLoaderEvents(installId: string, item: InstallItem): Promis
     installId,
     onProgress,
     () => {
-      if (isActiveInstallSource(versionId, progressSource)) void onInstallDone();
+      if (isActiveInstallSource(versionId, progressSource)) void onInstallDone(item);
     },
     onError,
   );
@@ -560,8 +565,9 @@ async function connectLoaderEvents(installId: string, item: InstallItem): Promis
   setInstallEventSource(es);
 }
 
-async function onInstallDone(): Promise<void> {
+async function onInstallDone(completedItem?: InstallItem): Promise<void> {
   completeInstall();
+  if (completedItem) clearInstallFailureForItem(completedItem);
 
   try {
     const res = await api('GET', '/versions');
