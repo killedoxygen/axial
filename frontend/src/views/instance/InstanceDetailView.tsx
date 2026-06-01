@@ -1395,18 +1395,28 @@ function InstallBarrierPane({
   installLabel,
   installQueued,
   installProgress,
+  installQueuePosition,
+  installQueueCount,
 }: {
   installTarget: string;
   installLabel: string;
   installQueued: boolean;
   installProgress: { pct: number; label: string; displayName?: string } | null;
+  installQueuePosition?: number;
+  installQueueCount?: number;
 }): JSX.Element {
   const pct = installProgress ? Math.max(0, Math.min(100, Math.round(installProgress.pct))) : 0;
-  const label = installProgress?.label || (installQueued ? 'Waiting for the current download slot' : 'Preparing install');
+  const queuedBehind = installQueuePosition != null ? installQueuePosition - 1 : undefined;
+  const queuedDetail = installQueuePosition != null && installQueueCount != null
+    ? installQueuePosition === 1
+      ? `Position 1 of ${installQueueCount}; next to start when the download slot opens.`
+      : `Position ${installQueuePosition} of ${installQueueCount}; waiting behind ${queuedBehind} item${queuedBehind === 1 ? '' : 's'}.`
+    : 'This instance will unlock automatically after its version install starts and finishes.';
+  const label = installProgress?.label || (installQueued ? 'Install waiting in queue' : 'Preparing install');
   const detail = installProgress
     ? `${pct}% complete`
     : installQueued
-      ? 'This instance will unlock automatically after its version install starts and finishes.'
+      ? queuedDetail
       : 'Croopor is preparing the required version files.';
 
   return (
@@ -2373,8 +2383,11 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
   const installProgress = install.status === 'active' && install.versionId === installTarget
     ? { pct: install.pct, label: install.label, displayName: install.displayName }
     : null;
-  const queuedInstall = installQueue.value.find(item => item.versionId === installTarget);
+  const queuedInstallIndex = installQueue.value.findIndex(item => item.versionId === installTarget);
+  const queuedInstall = queuedInstallIndex >= 0 ? installQueue.value[queuedInstallIndex] : undefined;
   const installQueued = !installProgress && Boolean(queuedInstall);
+  const installQueuePosition = installQueued ? queuedInstallIndex + 1 : undefined;
+  const installQueueCount = installQueued ? installQueue.value.length : undefined;
   const installLabel = installProgress?.displayName
     || (queuedInstall ? formatInstallItemLabel(queuedInstall) : installTarget);
   const installLocked = !canLaunch && (Boolean(installProgress) || installQueued);
@@ -2507,6 +2520,8 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
           installLabel={installLabel}
           installQueued={installQueued}
           installProgress={installProgress}
+          installQueuePosition={installQueuePosition}
+          installQueueCount={installQueueCount}
         />
       )}
       {!installLocked && tab === 'overview' && (
