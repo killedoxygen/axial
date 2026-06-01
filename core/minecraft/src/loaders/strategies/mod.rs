@@ -20,22 +20,27 @@ where
 {
     match plan.record.strategy {
         LoaderInstallStrategy::FabricProfile => {
-            fabric_profile::install(library_dir, plan, &mut send).await
+            Box::pin(fabric_profile::install(library_dir, plan, &mut send)).await
         }
         LoaderInstallStrategy::QuiltProfile => {
-            quilt_profile::install(library_dir, plan, &mut send).await
+            Box::pin(quilt_profile::install(library_dir, plan, &mut send)).await
         }
         LoaderInstallStrategy::ForgeModern => {
-            forge_modern::install(library_dir, plan, &mut send).await
+            Box::pin(forge_modern::install(library_dir, plan, &mut send)).await
         }
         LoaderInstallStrategy::ForgeLegacyInstaller => {
-            forge_legacy_installer::install(library_dir, plan, &mut send).await
+            Box::pin(forge_legacy_installer::install(
+                library_dir,
+                plan,
+                &mut send,
+            ))
+            .await
         }
         LoaderInstallStrategy::ForgeEarliestLegacy => {
-            forge_earliest_legacy::install(library_dir, plan, &mut send).await
+            Box::pin(forge_earliest_legacy::install(library_dir, plan, &mut send)).await
         }
         LoaderInstallStrategy::NeoForgeModern => {
-            neoforge_modern::install(library_dir, plan, &mut send).await
+            Box::pin(neoforge_modern::install(library_dir, plan, &mut send)).await
         }
     }
 }

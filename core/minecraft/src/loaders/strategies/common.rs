@@ -68,20 +68,22 @@ where
         library_dir,
         &installed_version_id,
     )?;
-    cleanup_on_error(
-        download_libraries(
-            library_dir,
-            &fragment.libraries,
-            "loader_libraries",
-            &mut *send,
-        )
-        .await
-        .map_err(|error| LoaderError::Other(format!("downloading loader libraries: {error}"))),
+    let library_download_result = Box::pin(download_libraries(
         library_dir,
-        &installed_version_id,
-    )?;
+        &fragment.libraries,
+        "loader_libraries",
+        &mut *send,
+    ))
+    .await
+    .map_err(|error| LoaderError::Other(format!("downloading loader libraries: {error}")));
+    cleanup_on_error(library_download_result, library_dir, &installed_version_id)?;
     cleanup_on_error(
-        ensure_base_version(library_dir, &plan.record.minecraft_version, send).await,
+        Box::pin(ensure_base_version(
+            library_dir,
+            &plan.record.minecraft_version,
+            send,
+        ))
+        .await,
         library_dir,
         &installed_version_id,
     )?;
@@ -134,7 +136,12 @@ pub async fn install_from_installer_source<F>(
 where
     F: FnMut(DownloadProgress),
 {
-    ensure_base_version(library_dir, &plan.record.minecraft_version, send).await?;
+    Box::pin(ensure_base_version(
+        library_dir,
+        &plan.record.minecraft_version,
+        send,
+    ))
+    .await?;
     let installer_path = cached_installer_path(library_dir, &plan.record);
 
     send(progress(
@@ -201,23 +208,20 @@ where
         library_dir,
         &installed_version_id,
     )?;
-    cleanup_on_error(
-        download_libraries(
-            library_dir,
-            &extracted.libraries,
-            "loader_libraries",
-            &mut *send,
-        )
-        .await
-        .map_err(|error| {
-            LoaderError::Other(format!(
-                "downloading {} libraries: {error}",
-                plan.record.component_name
-            ))
-        }),
+    let library_download_result = Box::pin(download_libraries(
         library_dir,
-        &installed_version_id,
-    )?;
+        &extracted.libraries,
+        "loader_libraries",
+        &mut *send,
+    ))
+    .await
+    .map_err(|error| {
+        LoaderError::Other(format!(
+            "downloading {} libraries: {error}",
+            plan.record.component_name
+        ))
+    });
+    cleanup_on_error(library_download_result, library_dir, &installed_version_id)?;
 
     if let Some(install_profile_json) = extracted.install_profile_json.as_deref() {
         send(progress(
@@ -226,35 +230,32 @@ where
             1,
             Some("Running processors...".to_string()),
         ));
-        cleanup_on_error(
-            run_processors(
-                library_dir,
-                &plan.record.minecraft_version,
-                install_profile_json,
-                &installer_data,
-                &plan.stage_dir,
-                &installer_path,
-                |current, total, detail| {
-                    send(DownloadProgress {
-                        phase: "processors".to_string(),
-                        current: current as i32,
-                        total: total as i32,
-                        file: Some(detail),
-                        error: None,
-                        done: false,
-                    });
-                },
-            )
-            .await
-            .map_err(|error| {
-                LoaderError::Other(format!(
-                    "running {} processors: {error}",
-                    plan.record.component_name
-                ))
-            }),
+        let processor_result = Box::pin(run_processors(
             library_dir,
-            &installed_version_id,
-        )?;
+            &plan.record.minecraft_version,
+            install_profile_json,
+            &installer_data,
+            &plan.stage_dir,
+            &installer_path,
+            |current, total, detail| {
+                send(DownloadProgress {
+                    phase: "processors".to_string(),
+                    current: current as i32,
+                    total: total as i32,
+                    file: Some(detail),
+                    error: None,
+                    done: false,
+                });
+            },
+        ))
+        .await
+        .map_err(|error| {
+            LoaderError::Other(format!(
+                "running {} processors: {error}",
+                plan.record.component_name
+            ))
+        });
+        cleanup_on_error(processor_result, library_dir, &installed_version_id)?;
     }
 
     cleanup_on_error(
@@ -285,7 +286,12 @@ pub async fn install_from_legacy_archive<F>(
 where
     F: FnMut(DownloadProgress),
 {
-    ensure_base_version(library_dir, &plan.record.minecraft_version, send).await?;
+    Box::pin(ensure_base_version(
+        library_dir,
+        &plan.record.minecraft_version,
+        send,
+    ))
+    .await?;
     validate_version_id(&plan.record.version_id, "installed loader version id")?;
 
     let archive_path = cached_legacy_archive_path(library_dir, &plan.record);
@@ -363,13 +369,12 @@ where
     }
 
     let downloader = Downloader::new(library_dir.to_path_buf());
-    downloader
-        .install_version(version_id, None, |progress| {
-            if !progress.done {
-                send(progress);
-            }
-        })
-        .await?;
+    Box::pin(downloader.install_version(version_id, None, |progress| {
+        if !progress.done {
+            send(progress);
+        }
+    }))
+    .await?;
     Ok(())
 }
 
@@ -632,13 +637,16 @@ fn done() -> DownloadProgress {
 #[cfg(test)]
 mod tests {
     use super::{
-        cleanup_on_error, promote_cached_artifact_tmp, read_valid_legacy_archive,
-        read_valid_profile_json, write_cached_artifact,
+        cleanup_on_error, ensure_base_version, install_from_installer_source,
+        install_from_legacy_archive, install_from_profile_source, promote_cached_artifact_tmp,
+        read_valid_legacy_archive, read_valid_profile_json, write_cached_artifact,
     };
+    use crate::download::DownloadProgress;
     use crate::loaders::types::LoaderError;
     use crate::loaders::types::{
         LoaderArtifactKind, LoaderBuildMetadata, LoaderBuildRecord, LoaderBuildSubjectKind,
-        LoaderComponentId, LoaderInstallSource, LoaderInstallStrategy, LoaderInstallability,
+        LoaderComponentId, LoaderInstallPlan, LoaderInstallSource, LoaderInstallStrategy,
+        LoaderInstallability,
     };
     use crate::loaders::validate_version_id;
     use crate::paths::versions_dir;
@@ -670,6 +678,77 @@ mod tests {
         assert!(!version_dir.exists());
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn loader_install_futures_stay_small_enough_for_tokio_workers() {
+        let root = PathBuf::from("/tmp/croopor-loader-future-size");
+        let profile_plan = LoaderInstallPlan {
+            record: profile_record(),
+            stage_dir: root.join("profile-stage"),
+        };
+        let installer_plan = LoaderInstallPlan {
+            record: installer_record(),
+            stage_dir: root.join("installer-stage"),
+        };
+        let legacy_plan = LoaderInstallPlan {
+            record: legacy_archive_record(),
+            stage_dir: root.join("legacy-stage"),
+        };
+
+        let mut send = |_progress: DownloadProgress| {};
+        assert!(
+            std::mem::size_of_val(&ensure_base_version(&root, "1.21.5", &mut send)) < 4096,
+            "loader base-version future should not embed the full vanilla install future"
+        );
+
+        let mut send = |_progress: DownloadProgress| {};
+        assert!(
+            std::mem::size_of_val(&install_from_profile_source(
+                &root,
+                &profile_plan,
+                "https://example.test/profile.json",
+                &mut send,
+            )) < 4096,
+            "profile-backed loader install future should stay small"
+        );
+
+        let mut send = |_progress: DownloadProgress| {};
+        assert!(
+            std::mem::size_of_val(&install_from_installer_source(
+                &root,
+                &installer_plan,
+                "https://example.test/installer.jar",
+                &mut send,
+            )) < 4096,
+            "installer-backed loader install future should stay small"
+        );
+
+        let mut send = |_progress: DownloadProgress| {};
+        assert!(
+            std::mem::size_of_val(&install_from_legacy_archive(
+                &root,
+                &legacy_plan,
+                "https://example.test/legacy.jar",
+                &mut send,
+            )) < 4096,
+            "legacy archive loader install future should stay small"
+        );
+
+        assert!(
+            std::mem::size_of_val(&super::super::install_build(&root, &installer_plan, |_| {}))
+                < 4096,
+            "loader strategy dispatcher future should not embed the largest strategy branch"
+        );
+
+        assert!(
+            std::mem::size_of_val(&crate::loaders::install_build(
+                &root,
+                installer_plan.record.clone(),
+                |_| {}
+            )) < 4096,
+            "public loader install future should not embed the strategy dispatcher"
+        );
     }
 
     #[tokio::test]
@@ -960,6 +1039,37 @@ mod tests {
                 url: "https://meta.fabricmc.net/profile/json".to_string(),
             },
         }
+    }
+
+    fn installer_record() -> LoaderBuildRecord {
+        let mut record = profile_record();
+        record.component_id = LoaderComponentId::Forge;
+        record.component_name = "Forge".to_string();
+        record.build_id = "forge-1.21.5-55.0.0".to_string();
+        record.loader_version = "55.0.0".to_string();
+        record.version_id = "forge-1.21.5-55.0.0".to_string();
+        record.strategy = LoaderInstallStrategy::ForgeModern;
+        record.artifact_kind = LoaderArtifactKind::InstallerJar;
+        record.install_source = LoaderInstallSource::InstallerJar {
+            url: "https://example.test/installer.jar".to_string(),
+        };
+        record
+    }
+
+    fn legacy_archive_record() -> LoaderBuildRecord {
+        let mut record = profile_record();
+        record.component_id = LoaderComponentId::Forge;
+        record.component_name = "Forge".to_string();
+        record.build_id = "forge-1.2.5-3.4.9.171".to_string();
+        record.minecraft_version = "1.2.5".to_string();
+        record.loader_version = "3.4.9.171".to_string();
+        record.version_id = "forge-1.2.5-3.4.9.171".to_string();
+        record.strategy = LoaderInstallStrategy::ForgeEarliestLegacy;
+        record.artifact_kind = LoaderArtifactKind::LegacyArchive;
+        record.install_source = LoaderInstallSource::LegacyArchive {
+            url: "https://example.test/legacy.jar".to_string(),
+        };
+        record
     }
 
     struct TestByteServer {

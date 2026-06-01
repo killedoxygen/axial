@@ -45,7 +45,7 @@ where
     fs::create_dir_all(&stage_dir)?;
 
     let plan = LoaderInstallPlan { record, stage_dir };
-    let result = strategies::install_build(library_dir, &plan, send).await;
+    let result = Box::pin(strategies::install_build(library_dir, &plan, send)).await;
     let _ = fs::remove_dir_all(&plan.stage_dir);
     result
 }
