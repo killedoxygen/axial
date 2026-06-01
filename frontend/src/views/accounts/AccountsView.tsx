@@ -1781,6 +1781,7 @@ function SavedSkinLibrary({
   const [skinName, setSkinName] = useState('');
   const [variant, setVariant] = useState<SkinVariant>('classic');
   const [busy, setBusy] = useState(false);
+  const [profileBusy, setProfileBusy] = useState(false);
   const [message, setMessage] = useState<{
     tone: 'ok' | 'err';
     text: string;
@@ -1793,7 +1794,8 @@ function SavedSkinLibrary({
   const [applyKey, setApplyKey] = useState<string | null>(null);
   const trimmedName = skinName.trim();
   const trimmedEditName = editName.trim();
-  const canUpload = !busy && trimmedName.length > 0;
+  const canUpload = !busy && !profileBusy && trimmedName.length > 0;
+  const canSaveProfileSkin = onlineReady && !busy && !profileBusy;
 
   const upload = async (file: File): Promise<void> => {
     const name = trimmedName || file.name.replace(/\.[^.]+$/, '').trim();
@@ -1843,6 +1845,25 @@ function SavedSkinLibrary({
       });
     } finally {
       setDeleteKey(null);
+    }
+  };
+
+  const saveProfileSkin = async (): Promise<void> => {
+    if (!onlineReady) return;
+
+    setProfileBusy(true);
+    setMessage(null);
+    try {
+      await api('POST', '/skins/from-profile', {});
+      refresh();
+      setMessage({ tone: 'ok', text: 'Minecraft profile skin saved.' });
+    } catch (err) {
+      setMessage({
+        tone: 'err',
+        text: err instanceof Error ? err.message : 'Could not save Minecraft profile skin.',
+      });
+    } finally {
+      setProfileBusy(false);
     }
   };
 
@@ -1915,7 +1936,7 @@ function SavedSkinLibrary({
       <div style={{ display: 'grid', gap: 16 }}>
         <div style={{
           display: 'grid',
-          gridTemplateColumns: 'minmax(220px, 1fr) auto auto',
+          gridTemplateColumns: 'minmax(220px, 1fr) auto auto auto',
           gap: 10,
           alignItems: 'center',
         }}>
@@ -1954,6 +1975,17 @@ function SavedSkinLibrary({
               if (file) void upload(file);
             }}
           />
+          <Button
+            variant="secondary"
+            icon={profileBusy ? 'refresh' : 'download'}
+            disabled={!canSaveProfileSkin}
+            onClick={() => void saveProfileSkin()}
+            title={onlineReady
+              ? 'Save active Minecraft profile skin'
+              : 'Online Minecraft account required'}
+          >
+            Save profile
+          </Button>
         </div>
 
         {message && (
