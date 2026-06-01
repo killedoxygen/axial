@@ -129,7 +129,20 @@ interface StagedSkinUpload {
   objectUrl: string;
   detectedVariant: SkinVariant;
   detectingVariant: boolean;
+  normalizeStatus: 'checking' | 'ready' | 'error';
+  normalizeError?: string;
+  textureKey?: string;
+  originalWidth?: number;
+  originalHeight?: number;
+  normalizedByteSize?: number;
   applyAfterSave: boolean;
+}
+
+interface SkinNormalizeMetadata {
+  textureKey: string;
+  originalWidth: number;
+  originalHeight: number;
+  normalizedByteSize: number;
 }
 
 function PlayerIdentityEditor({
@@ -570,6 +583,25 @@ function savedSkinsResponse(value: unknown): SavedSkinRecord[] | null {
   return value.skins.map(savedSkinRecord).filter((skin): skin is SavedSkinRecord => Boolean(skin));
 }
 
+function skinNormalizeMetadata(value: unknown): SkinNormalizeMetadata | null {
+  if (!isRecord(value)) return null;
+  if (
+    typeof value.texture_key !== 'string' ||
+    typeof value.original_width !== 'number' ||
+    typeof value.original_height !== 'number' ||
+    typeof value.normalized_byte_size !== 'number'
+  ) {
+    return null;
+  }
+
+  return {
+    textureKey: value.texture_key,
+    originalWidth: value.original_width,
+    originalHeight: value.original_height,
+    normalizedByteSize: value.normalized_byte_size,
+  };
+}
+
 function skinVariantValue(value: string | undefined): SkinVariant {
   return value?.toLowerCase() === 'slim' ? 'slim' : 'classic';
 }
@@ -620,6 +652,21 @@ async function detectSkinVariantFromPng(file: File): Promise<SkinVariant> {
   } finally {
     URL.revokeObjectURL(url);
   }
+}
+
+async function normalizeSkinUpload(file: File): Promise<SkinNormalizeMetadata> {
+  const response = await fetch(apiUrl('/skins/normalize'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'image/png' },
+    body: file,
+  });
+  const payload = await response.json().catch(() => undefined);
+  if (!response.ok) {
+    throw new Error(readApiPayloadMessage(payload, `Skin validation failed with HTTP ${response.status}`));
+  }
+  const metadata = skinNormalizeMetadata(payload);
+  if (!metadata) throw new Error('Skin validation returned an invalid response.');
+  return metadata;
 }
 
 async function resolveUploadSkinVariant(file: File, value: UploadSkinVariant): Promise<SkinVariant> {
@@ -1919,13 +1966,21 @@ function SavedSkinLibrary({
   const stagedVariantReady = Boolean(
     stagedUpload && (uploadVariant !== 'auto' || !stagedUpload.detectingVariant),
   );
-  const stagedCanSave = Boolean(stagedUpload && canUpload && stagedVariantReady);
+  const stagedValidated = stagedUpload?.normalizeStatus === 'ready';
+  const stagedCanSave = Boolean(stagedUpload && canUpload && stagedVariantReady && stagedValidated);
   const stagedVariantLabel = stagedUpload && stagedVariant
     ? uploadVariant === 'auto'
       ? stagedUpload.detectingVariant
         ? 'Detecting model'
         : `Inferred ${stagedVariant}`
       : `Manual ${stagedVariant}`
+    : '';
+  const stagedValidationLabel = stagedUpload
+    ? stagedUpload.normalizeStatus === 'ready'
+      ? 'Validated'
+      : stagedUpload.normalizeStatus === 'error'
+        ? 'Invalid skin'
+        : 'Validating'
     : '';
 
   const clearStagedUpload = (): void => {
@@ -2188,7 +2243,32 @@ function SavedSkinLibrary({
       objectUrl,
       detectedVariant: 'classic',
       detectingVariant: true,
+      normalizeStatus: 'checking',
       applyAfterSave,
+    });
+
+    void normalizeSkinUpload(file).then((metadata) => {
+      if (token !== stagedUploadTokenRef.current) return;
+      setStagedUpload((current) => current?.objectUrl === objectUrl
+        ? {
+            ...current,
+            normalizeStatus: 'ready',
+            normalizeError: undefined,
+            textureKey: metadata.textureKey,
+            originalWidth: metadata.originalWidth,
+            originalHeight: metadata.originalHeight,
+            normalizedByteSize: metadata.normalizedByteSize,
+          }
+        : current);
+    }).catch((err) => {
+      if (token !== stagedUploadTokenRef.current) return;
+      setStagedUpload((current) => current?.objectUrl === objectUrl
+        ? {
+            ...current,
+            normalizeStatus: 'error',
+            normalizeError: boundedMessage(err instanceof Error ? err.message : undefined, 'Skin validation failed.'),
+          }
+        : current);
     });
 
     void detectSkinVariantFromPng(file).then((detectedVariant) => {
@@ -2363,6 +2443,12 @@ function SavedSkinLibrary({
               <div style={{ minWidth: 0, display: 'grid', gap: 7 }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 7, flexWrap: 'wrap' }}>
                   <Pill tone="info" icon="image">Staged PNG</Pill>
+                  <Pill
+                    tone={stagedUpload.normalizeStatus === 'ready' ? 'ok' : stagedUpload.normalizeStatus === 'error' ? 'err' : 'neutral'}
+                    icon={stagedUpload.normalizeStatus === 'ready' ? 'check-circle' : stagedUpload.normalizeStatus === 'error' ? 'alert' : 'refresh'}
+                  >
+                    {stagedValidationLabel}
+                  </Pill>
                   <Pill tone="neutral">
                     {stagedVariantLabel}
                   </Pill>
@@ -2391,10 +2477,16 @@ function SavedSkinLibrary({
                   textOverflow: 'ellipsis',
                   whiteSpace: 'nowrap',
                 }}>
-                  {stagedUpload.file.name} / {formatByteSize(stagedUpload.file.size)}
+                  {stagedUpload.normalizeStatus === 'ready' && stagedUpload.textureKey
+                    ? `${stagedUpload.textureKey.slice(0, 16)} / ${stagedUpload.originalWidth}x${stagedUpload.originalHeight} -> 64x64 / ${formatByteSize(stagedUpload.normalizedByteSize ?? stagedUpload.file.size)}`
+                    : `${stagedUpload.file.name} / ${formatByteSize(stagedUpload.file.size)}`}
                 </div>
                 <div style={{ color: theme.n.textDim, fontSize: 12, lineHeight: 1.4, maxWidth: 560 }}>
-                  Review the PNG before saving it to your local skin library.
+                  {stagedUpload.normalizeStatus === 'error'
+                    ? stagedUpload.normalizeError || 'Skin validation failed.'
+                    : stagedUpload.normalizeStatus === 'checking'
+                      ? 'Croopor is validating and normalizing this skin before it can be saved.'
+                      : 'Review the normalized PNG before saving it to your local skin library.'}
                 </div>
               </div>
               <div style={{
