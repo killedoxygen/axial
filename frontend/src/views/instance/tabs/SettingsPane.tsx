@@ -1,6 +1,6 @@
 import type { JSX } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
-import { Button, Input } from '../../../ui/Atoms';
+import { Button, Input, Segmented } from '../../../ui/Atoms';
 import { Slider, type SliderZone } from '../../../ui/Slider';
 import { InstanceArt, artPresetForSeed, artSeedFor, nextArtSeed } from '../../../art/InstanceArt';
 import { api } from '../../../api';
@@ -159,7 +159,7 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
   return (
     <div class="cp-instance-body cp-settings-pane">
       <div class="cp-resource-toolbar cp-settings-toolbar">
-        <strong>Launch profile</strong>
+        <strong>Instance settings</strong>
         <div class="cp-settings-save">
           <span data-dirty={dirty}>{dirty ? 'Unsaved changes' : 'Up to date'}</span>
           <Button onClick={save} disabled={saving || !dirty} sound="affirm">{saving ? 'Saving…' : 'Save settings'}</Button>
@@ -182,197 +182,188 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
         </div>
 
         <div class="cp-log-preview cp-settings-preview">
-          <div class="cp-settings-sheet">
-        <section id="cp-settings-policy" class="cp-settings-row">
-          <div class="cp-settings-row-head">
-            <div>
-              <h3>Performance policy</h3>
-              <p>{performanceModeText}.</p>
+          <section id="cp-settings-policy" class="cp-settings-row">
+            <div class="cp-settings-row-head">
+              <div>
+                <h3>Performance policy</h3>
+                <p>{performanceModeText}.</p>
+              </div>
             </div>
-          </div>
-          <div class="cp-settings-row-control">
-            <div class="cp-settings-button-strip" aria-label="Instance performance mode">
-              {INSTANCE_PERFORMANCE_OPTIONS.map((option) => (
+            <div class="cp-settings-row-control">
+              <div class="cp-settings-segment" aria-label="Instance performance mode">
+                <Segmented<InstancePerformanceMode>
+                  options={INSTANCE_PERFORMANCE_OPTIONS}
+                  value={performanceMode}
+                  onChange={setPerformanceMode}
+                />
+              </div>
+              <div class="cp-settings-mode-note">
+                {performanceMode
+                  ? 'This instance will use its own performance mode.'
+                  : 'This instance follows the global Performance setting.'}
+              </div>
+            </div>
+          </section>
+
+          <section id="cp-settings-memory" class="cp-settings-row">
+            <div class="cp-settings-row-head">
+              <div>
+                <h3>Memory</h3>
+                <p>Recommended range: {fmtMem(recMin)} to {fmtMem(recMax)}.</p>
+              </div>
+            </div>
+            <div class="cp-settings-row-control">
+              <div class="cp-settings-memory-grid">
+                <div class="cp-settings-slider-row">
+                  <div class="cp-settings-slider-label">
+                    <span>Maximum heap</span>
+                    <strong>{fmtMem(maxMem)}</strong>
+                  </div>
+                  <Slider
+                    value={maxMem}
+                    min={1}
+                    max={ramMax}
+                    step={0.5}
+                    zones={memoryZones}
+                    sound="memory"
+                    onChange={setMaxMem}
+                    ariaLabel="Maximum heap in gigabytes"
+                  />
+                </div>
+                <div class="cp-settings-slider-row">
+                  <div class="cp-settings-slider-label">
+                    <span>Minimum heap</span>
+                    <strong>{fmtMem(minMem)}</strong>
+                  </div>
+                  <Slider
+                    value={minMem}
+                    min={0.5}
+                    max={maxMem}
+                    step={0.5}
+                    sound="memory"
+                    onChange={setMinMem}
+                    ariaLabel="Minimum heap in gigabytes"
+                  />
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section id="cp-settings-runtime" class="cp-settings-row">
+            <div class="cp-settings-row-head">
+              <div>
+                <h3>Runtime</h3>
+                <p>{runtimePresetText}</p>
+              </div>
+            </div>
+            <div class="cp-settings-row-control">
+              <div class="cp-settings-runtime-presets" role="radiogroup" aria-label="Runtime preset">
+                {JVM_PRESET_ORDER.map((preset) => (
+                  <button
+                    key={preset || 'auto'}
+                    type="button"
+                    role="radio"
+                    aria-checked={jvmPreset === preset}
+                    class="cp-settings-runtime-preset"
+                    data-active={jvmPreset === preset}
+                    onClick={() => setJvmPreset(preset)}
+                    title={`${JVM_PRESET_LABELS[preset]}: ${JVM_PRESET_HINTS[preset]}`}
+                  >
+                    <span class="cp-settings-runtime-preset-label">{JVM_PRESET_LABELS[preset]}</span>
+                    <span class="cp-settings-runtime-preset-hint">{JVM_PRESET_HINTS[preset]}</span>
+                  </button>
+                ))}
+              </div>
+              <div class="cp-settings-advanced-toggle">
                 <Button
-                  key={option.value || 'inherit'}
-                  variant={performanceMode === option.value ? 'primary' : 'secondary'}
+                  variant="secondary"
                   size="sm"
-                  onClick={() => setPerformanceMode(option.value)}
+                  icon={advancedOpen ? 'chevron-up' : 'chevron-down'}
+                  onClick={() => setAdvancedOpen(open => !open)}
                 >
-                  {option.label}
+                  Advanced overrides
                 </Button>
-              ))}
-            </div>
-            <div class="cp-settings-mode-note">
-              {performanceMode
-                ? 'This instance will use its own performance mode.'
-                : 'This instance follows the global Performance setting.'}
-            </div>
-          </div>
-        </section>
-
-        <section id="cp-settings-memory" class="cp-settings-row">
-          <div class="cp-settings-row-head">
-            <div>
-              <h3>Memory</h3>
-              <p>Recommended range: {fmtMem(recMin)} to {fmtMem(recMax)}.</p>
-            </div>
-          </div>
-          <div class="cp-settings-row-control">
-            <div class="cp-settings-memory-grid">
-              <div class="cp-settings-slider-row">
-                <div class="cp-settings-slider-label">
-                  <span>Maximum heap</span>
-                  <strong>{fmtMem(maxMem)}</strong>
-                </div>
-                <Slider
-                  value={maxMem}
-                  min={1}
-                  max={ramMax}
-                  step={0.5}
-                  zones={memoryZones}
-                  sound="memory"
-                  onChange={setMaxMem}
-                  ariaLabel="Maximum heap in gigabytes"
-                />
               </div>
-              <div class="cp-settings-slider-row">
-                <div class="cp-settings-slider-label">
-                  <span>Minimum heap</span>
-                  <strong>{fmtMem(minMem)}</strong>
+              {advancedOpen && (
+                <div class="cp-settings-advanced-grid">
+                  <label>
+                    <span>Java path</span>
+                    <Input value={javaPath} onChange={setJavaPath} placeholder="Managed Java" />
+                  </label>
+                  <label>
+                    <span>Extra JVM arguments</span>
+                    <Input value={jvmArgs} onChange={setJvmArgs} placeholder="-Dfoo=bar -Xss2m" />
+                  </label>
                 </div>
-                <Slider
-                  value={minMem}
-                  min={0.5}
-                  max={maxMem}
-                  step={0.5}
-                  sound="memory"
-                  onChange={setMinMem}
-                  ariaLabel="Minimum heap in gigabytes"
-                />
+              )}
+            </div>
+          </section>
+
+          <section id="cp-settings-window" class="cp-settings-row">
+            <div class="cp-settings-row-head">
+              <div>
+                <h3>Window</h3>
+                <p>{activeWindowLabel} · {width} × {height}</p>
               </div>
             </div>
-          </div>
-        </section>
+            <div class="cp-settings-row-control cp-settings-window-control">
+              <div class="cp-settings-segment" aria-label="Window size">
+                <Segmented<string>
+                  options={WINDOW_PRESETS.map((preset) => ({ value: preset.id, label: preset.label }))}
+                  value={activeWindowPreset}
+                  onChange={(presetId) => {
+                    const preset = WINDOW_PRESETS.find((item) => item.id === presetId);
+                    if (preset) {
+                      setWidth(preset.w);
+                      setHeight(preset.h);
+                    }
+                  }}
+                />
+              </div>
+              <div class="cp-settings-dimensions">
+                <label>
+                  <span>Width</span>
+                  <Input
+                    type="number"
+                    value={String(width)}
+                    onChange={(v) => setWidth(clampWindowDimension(v, width))}
+                  />
+                </label>
+                <label>
+                  <span>Height</span>
+                  <Input
+                    type="number"
+                    value={String(height)}
+                    onChange={(v) => setHeight(clampWindowDimension(v, height))}
+                  />
+                </label>
+              </div>
+            </div>
+          </section>
 
-        <section id="cp-settings-runtime" class="cp-settings-row">
-          <div class="cp-settings-row-head">
-            <div>
-              <h3>Runtime</h3>
-              <p>{runtimePresetText}</p>
+          <section id="cp-settings-identity" class="cp-settings-row cp-settings-row--identity">
+            <div class="cp-settings-row-head">
+              <div>
+                <h3>Identity</h3>
+                <p>Artwork used for this instance.</p>
+              </div>
             </div>
-          </div>
-          <div class="cp-settings-row-control">
-            <div class="cp-settings-runtime-presets" role="radiogroup" aria-label="Runtime preset">
-              {JVM_PRESET_ORDER.map((preset) => (
-                <button
-                  key={preset || 'auto'}
-                  type="button"
-                  role="radio"
-                  aria-checked={jvmPreset === preset}
-                  class="cp-settings-runtime-preset"
-                  data-active={jvmPreset === preset}
-                  onClick={() => setJvmPreset(preset)}
-                  title={`${JVM_PRESET_LABELS[preset]}: ${JVM_PRESET_HINTS[preset]}`}
-                >
-                  <span class="cp-settings-runtime-preset-label">{JVM_PRESET_LABELS[preset]}</span>
-                  <span class="cp-settings-runtime-preset-hint">{JVM_PRESET_HINTS[preset]}</span>
-                </button>
-              ))}
-            </div>
-            <div class="cp-settings-advanced-toggle">
-              <Button
-                variant="secondary"
-                size="sm"
-                icon={advancedOpen ? 'chevron-up' : 'chevron-down'}
-                onClick={() => setAdvancedOpen(open => !open)}
-              >
-                Advanced overrides
+            <div class="cp-settings-row-control cp-settings-identity-control">
+              <InstanceArt
+                instance={{ ...inst, art_seed: artSeed }}
+                aspect="square"
+                radius={12}
+                className="cp-settings-avatar"
+              />
+              <div>
+                <strong>{artPreset}</strong>
+                <span>Current style</span>
+              </div>
+              <Button variant="secondary" size="sm" icon="refresh" onClick={() => setArtSeed(seed => nextArtSeed(seed))}>
+                Regenerate
               </Button>
             </div>
-            {advancedOpen && (
-              <div class="cp-settings-advanced-grid">
-                <label>
-                  <span>Java path</span>
-                  <Input value={javaPath} onChange={setJavaPath} placeholder="Managed Java" />
-                </label>
-                <label>
-                  <span>Extra JVM arguments</span>
-                  <Input value={jvmArgs} onChange={setJvmArgs} placeholder="-Dfoo=bar -Xss2m" />
-                </label>
-              </div>
-            )}
-          </div>
-        </section>
-
-        <section id="cp-settings-window" class="cp-settings-row">
-          <div class="cp-settings-row-head">
-            <div>
-              <h3>Window</h3>
-              <p>{activeWindowLabel} · {width} × {height}</p>
-            </div>
-          </div>
-          <div class="cp-settings-row-control cp-settings-window-control">
-            <div class="cp-settings-button-strip" aria-label="Window size">
-              {WINDOW_PRESETS.map((preset) => (
-                <Button
-                  key={preset.id}
-                  variant={activeWindowPreset === preset.id ? 'primary' : 'secondary'}
-                  size="sm"
-                  onClick={() => {
-                    setWidth(preset.w);
-                    setHeight(preset.h);
-                  }}
-                >
-                  {preset.label}
-                </Button>
-              ))}
-            </div>
-            <div class="cp-settings-dimensions">
-              <label>
-                <span>Width</span>
-                <Input
-                  type="number"
-                  value={String(width)}
-                  onChange={(v) => setWidth(clampWindowDimension(v, width))}
-                />
-              </label>
-              <label>
-                <span>Height</span>
-                <Input
-                  type="number"
-                  value={String(height)}
-                  onChange={(v) => setHeight(clampWindowDimension(v, height))}
-                />
-              </label>
-            </div>
-          </div>
-        </section>
-
-        <section id="cp-settings-identity" class="cp-settings-row cp-settings-row--identity">
-          <div class="cp-settings-row-head">
-            <div>
-              <h3>Identity</h3>
-              <p>Artwork used for this instance.</p>
-            </div>
-          </div>
-          <div class="cp-settings-row-control cp-settings-identity-control">
-            <InstanceArt
-              instance={{ ...inst, art_seed: artSeed }}
-              aspect="square"
-              radius={12}
-              className="cp-settings-avatar"
-            />
-            <div>
-              <strong>{artPreset}</strong>
-              <span>Current style</span>
-            </div>
-            <Button variant="secondary" size="sm" icon="refresh" onClick={() => setArtSeed(seed => nextArtSeed(seed))}>
-              Regenerate
-            </Button>
-          </div>
-        </section>
-          </div>
+          </section>
         </div>
       </div>
     </div>
