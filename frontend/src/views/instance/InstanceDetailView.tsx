@@ -2100,7 +2100,6 @@ function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
           <div class="cp-settings-sheet">
         <section id="cp-settings-policy" class="cp-settings-row">
           <div class="cp-settings-row-head">
-            <span class="cp-settings-section-icon"><Icon name="shield-check" size={15} /></span>
             <div>
               <h3>Performance policy</h3>
               <p>{performanceModeText}.</p>
@@ -2129,7 +2128,6 @@ function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
 
         <section id="cp-settings-memory" class="cp-settings-row">
           <div class="cp-settings-row-head">
-            <span class="cp-settings-section-icon"><Icon name="settings" size={15} /></span>
             <div>
               <h3>Memory</h3>
               <p>Recommended range: {fmtMem(recMin)} to {fmtMem(recMax)}.</p>
@@ -2174,7 +2172,6 @@ function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
 
         <section id="cp-settings-runtime" class="cp-settings-row">
           <div class="cp-settings-row-head">
-            <span class="cp-settings-section-icon"><Icon name="terminal" size={15} /></span>
             <div>
               <h3>Runtime</h3>
               <p>{runtimePresetText}</p>
@@ -2225,7 +2222,6 @@ function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
 
         <section id="cp-settings-window" class="cp-settings-row">
           <div class="cp-settings-row-head">
-            <span class="cp-settings-section-icon"><Icon name="rectangle" size={15} /></span>
             <div>
               <h3>Window</h3>
               <p>{activeWindowLabel} · {width} × {height}</p>
@@ -2270,7 +2266,6 @@ function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
 
         <section id="cp-settings-identity" class="cp-settings-row cp-settings-row--identity">
           <div class="cp-settings-row-head">
-            <span class="cp-settings-section-icon"><Icon name="image" size={15} /></span>
             <div>
               <h3>Identity</h3>
               <p>Artwork used for this instance.</p>
