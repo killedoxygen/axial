@@ -283,42 +283,63 @@ impl Downloader {
             1,
             Some(format!("{version_id}.jar")),
         ));
-        if let Some(client) = &version.downloads.client {
+        let client_jar_task = if let Some(client) = &version.downloads.client {
+            let http_client = self.client.clone();
+            let url = client.url.clone();
             let jar_path = version_dir.join(format!("{version_id}.jar"));
             let expected = ExpectedIntegrity::from_mojang(client.size, &client.sha1);
-            if !existing_file_satisfies(&jar_path, &expected).await? {
-                self.download_file(&client.url, &jar_path, &expected)
-                    .await?;
-            }
-        }
+            Some(tokio::spawn(async move {
+                if !existing_file_satisfies(&jar_path, &expected).await? {
+                    download_file_with_client(&http_client, &url, &jar_path, &expected).await?;
+                }
+                Ok::<(), DownloadError>(())
+            }))
+        } else {
+            None
+        };
 
         let library_jobs = self.library_jobs(&version);
         send(progress("libraries", 0, library_jobs.len() as i32, None));
         let client = self.client.clone();
         let total_library_jobs = library_jobs.len() as i32;
         let mut completed_library_jobs = 0;
-        let mut library_downloads =
-            futures_util::stream::iter(library_jobs.into_iter().map(|job| {
-                let client = client.clone();
-                async move {
-                    if !existing_file_satisfies(&job.path, &job.expected).await? {
-                        download_file_with_client(&client, &job.url, &job.path, &job.expected)
-                            .await?;
+        let library_result = async {
+            let mut library_downloads =
+                futures_util::stream::iter(library_jobs.into_iter().map(|job| {
+                    let client = client.clone();
+                    async move {
+                        if !existing_file_satisfies(&job.path, &job.expected).await? {
+                            download_file_with_client(&client, &job.url, &job.path, &job.expected)
+                                .await?;
+                        }
+                        Ok::<String, DownloadError>(job.name)
                     }
-                    Ok::<String, DownloadError>(job.name)
-                }
-            }))
-            .buffer_unordered(library_download_concurrency());
-        while let Some(result) = library_downloads.next().await {
-            let name = result?;
-            completed_library_jobs += 1;
+                }))
+                .buffer_unordered(library_download_concurrency());
+            while let Some(result) = library_downloads.next().await {
+                let name = result?;
+                completed_library_jobs += 1;
+                send(progress(
+                    "libraries",
+                    completed_library_jobs,
+                    total_library_jobs,
+                    Some(name),
+                ));
+            }
+            Ok::<(), DownloadError>(())
+        }
+        .await;
+        let client_jar_result = await_client_jar_download(client_jar_task).await;
+        if client_jar_result.is_ok() && version.downloads.client.is_some() {
             send(progress(
-                "libraries",
-                completed_library_jobs,
-                total_library_jobs,
-                Some(name),
+                "client_jar",
+                1,
+                1,
+                Some(format!("{version_id}.jar")),
             ));
         }
+        client_jar_result?;
+        library_result?;
 
         if !version.asset_index.url.is_empty() {
             let asset_index_path = assets_dir(&self.mc_dir)
@@ -688,6 +709,30 @@ fn progress(phase: &str, current: i32, total: i32, file: Option<String>) -> Down
         error: None,
         done: false,
     }
+}
+
+async fn await_client_jar_download(
+    task: Option<tokio::task::JoinHandle<Result<(), DownloadError>>>,
+) -> Result<(), DownloadError> {
+    let Some(task) = task else {
+        return Ok(());
+    };
+
+    task.await.map_err(client_jar_task_error)??;
+    Ok(())
+}
+
+fn client_jar_task_error(error: tokio::task::JoinError) -> DownloadError {
+    let reason = if error.is_cancelled() {
+        "cancelled"
+    } else if error.is_panic() {
+        "panicked"
+    } else {
+        "failed"
+    };
+    DownloadError::FileOperation(io::Error::other(format!(
+        "client jar download task {reason}"
+    )))
 }
 
 fn resolve_library_download(lib: &Library, mc_dir: &Path) -> Option<DownloadJob> {
