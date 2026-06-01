@@ -640,6 +640,12 @@
   --cp-status-border: color-mix(in oklab, var(--line) 82%, var(--cp-install-color));
   cursor: pointer;
 }
+.cp-status-pill--failed {
+  --cp-status-color: color-mix(in oklab, var(--err) 74%, var(--text-dim));
+  --cp-status-bg: color-mix(in oklab, var(--surface-2) 91%, var(--err));
+  --cp-status-border: color-mix(in oklab, var(--line) 76%, var(--err));
+  cursor: pointer;
+}
 .cp-status-dot {
   flex: 0 0 auto;
   width: 7px;

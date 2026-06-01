@@ -5,7 +5,7 @@ import { IconButton } from '../ui/Atoms';
 import { WindowControls } from './WindowControls';
 import { MusicWidget } from './MusicWidget';
 import { goBack, goForward, navigate, route } from '../ui-state';
-import { runningSessions, instances, launchState, installState, installQueue } from '../store';
+import { runningSessions, instances, launchState, installState, installQueue, installFailure } from '../store';
 import { windowStartDragging, windowToggleMaximize, hasNativeDesktopRuntime } from '../native';
 import { launchStageViewFrom } from '../launch-stages';
 import { formatInstallItemLabel } from '../install-labels';
@@ -42,7 +42,7 @@ function crumbsFor(): { label: string; onClick?: () => void }[] {
 }
 
 // Topbar status pill
-// Priority: running instance > active install > launch preparing > queued install > idle
+// Priority: running instance > active install > launch preparing > queued install > failure > idle
 function StatusPill(): JSX.Element {
   const sessions = runningSessions.value;
   const runIds = Object.keys(sessions);
@@ -112,6 +112,22 @@ function StatusPill(): JSX.Element {
       >
         <span class="cp-status-dot" />
         <span class="cp-status-pill-label">{queuedLabel}</span>
+      </button>
+    );
+  }
+
+  const failure = installFailure.value;
+  if (failure) {
+    const title = `${failure.displayName}: ${failure.message}`;
+    return (
+      <button
+        class="cp-status-pill cp-status-pill--failed cp-nodrag"
+        onClick={() => navigate({ name: 'downloads' })}
+        title={title}
+        aria-label={`Open downloads. Install failed: ${title}`}
+      >
+        <span class="cp-status-dot" />
+        <span class="cp-status-pill-label">install failed</span>
       </button>
     );
   }
