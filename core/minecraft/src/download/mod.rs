@@ -315,18 +315,11 @@ impl Downloader {
         let index =
             serde_json::from_str::<AssetIndex>(&async_fs::read_to_string(asset_index_path).await?)?;
         let objects_dir = assets_dir(&self.mc_dir).join("objects");
-        let mut jobs = Vec::new();
-        let mut queued_hashes = HashSet::new();
-        for object in index.objects.values() {
-            if !queued_hashes.insert(object.hash.clone()) {
-                continue;
-            }
-            let prefix = &object.hash[..2];
-            let path = objects_dir.join(prefix).join(&object.hash);
-            if !path_is_file(&path).await {
-                jobs.push((object.hash.clone(), path));
-            }
-        }
+        let jobs = missing_asset_object_jobs(unique_asset_object_jobs(
+            &objects_dir,
+            index.objects.values().map(|object| object.hash.as_str()),
+        ))
+        .await;
 
         send(progress("assets", 0, jobs.len() as i32, None));
         let client = self.client.clone();
@@ -486,6 +479,38 @@ fn adaptive_download_concurrency(
     cores
         .saturating_mul(per_core)
         .clamp(minimum, maximum.max(minimum))
+}
+
+fn unique_asset_object_jobs<'a>(
+    objects_dir: &Path,
+    hashes: impl IntoIterator<Item = &'a str>,
+) -> Vec<(String, PathBuf)> {
+    let mut jobs = Vec::new();
+    let mut queued_hashes = HashSet::new();
+
+    for hash in hashes {
+        if !queued_hashes.insert(hash.to_string()) {
+            continue;
+        }
+        let prefix = &hash[..2];
+        jobs.push((hash.to_string(), objects_dir.join(prefix).join(hash)));
+    }
+
+    jobs
+}
+
+async fn missing_asset_object_jobs(candidates: Vec<(String, PathBuf)>) -> Vec<(String, PathBuf)> {
+    futures_util::stream::iter(candidates.into_iter().map(|(hash, path)| async move {
+        if path_is_file(&path).await {
+            None
+        } else {
+            Some((hash, path))
+        }
+    }))
+    .buffer_unordered(asset_download_concurrency())
+    .filter_map(|job| async move { job })
+    .collect()
+    .await
 }
 
 fn progress(phase: &str, current: i32, total: i32, file: Option<String>) -> DownloadProgress {
@@ -888,6 +913,44 @@ mod tests {
 
         assert_eq!(jobs.len(), 1);
         assert!(jobs[0].name.contains("duplicate-1.0.0.jar"));
+    }
+
+    #[test]
+    fn unique_asset_object_jobs_deduplicate_same_hash() {
+        let objects_dir = Path::new("/tmp/croopor-test/assets/objects");
+        let hash_a = "abcdef1234567890abcdef1234567890abcdef12";
+        let hash_b = "1234567890abcdef1234567890abcdef12345678";
+
+        let jobs = unique_asset_object_jobs(objects_dir, [hash_a, hash_a, hash_b]);
+
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0].0, hash_a);
+        assert_eq!(jobs[0].1, objects_dir.join("ab").join(hash_a));
+        assert_eq!(jobs[1].0, hash_b);
+        assert_eq!(jobs[1].1, objects_dir.join("12").join(hash_b));
+    }
+
+    #[tokio::test]
+    async fn missing_asset_object_jobs_filters_existing_files() {
+        let root = temp_dir("asset-filter");
+        let objects_dir = root.join("assets").join("objects");
+        let existing_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let missing_hash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let existing_path = objects_dir.join("aa").join(existing_hash);
+        let missing_path = objects_dir.join("bb").join(missing_hash);
+        fs::create_dir_all(existing_path.parent().expect("existing parent"))
+            .expect("create existing parent");
+        fs::write(&existing_path, b"asset").expect("write existing asset");
+
+        let jobs = missing_asset_object_jobs(vec![
+            (existing_hash.to_string(), existing_path),
+            (missing_hash.to_string(), missing_path.clone()),
+        ])
+        .await;
+
+        assert_eq!(jobs, vec![(missing_hash.to_string(), missing_path)]);
+
+        let _ = fs::remove_dir_all(root);
     }
 
     fn native_library(name: &str) -> Library {
