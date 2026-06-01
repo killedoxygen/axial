@@ -1079,7 +1079,7 @@ async fn hash_file(path: &Path) -> Result<ActualIntegrity, DownloadError> {
     let mut file = async_fs::File::open(path).await?;
     let mut hasher = Sha1::new();
     let mut size = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024];
 
     loop {
         let read = file.read(&mut buffer).await?;
@@ -1413,6 +1413,33 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn download_integrity_futures_stay_small_enough_for_tokio_workers() {
+        let path = Path::new("/tmp/croopor-test/artifact.jar");
+        let expected =
+            ExpectedIntegrity::from_mojang(8, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+        assert!(
+            std::mem::size_of_val(&hash_file(path)) < 4096,
+            "hash_file future should not embed the hash buffer on the task stack"
+        );
+        assert!(
+            std::mem::size_of_val(&verify_downloaded_file(path, &expected)) < 4096,
+            "download verification future should stay small"
+        );
+        assert!(
+            std::mem::size_of_val(&existing_file_satisfies(path, &expected)) < 4096,
+            "existing-file integrity future should stay small"
+        );
+
+        let root = temp_dir("install-version-future-size");
+        let downloader = Downloader::new(&root);
+        assert!(
+            std::mem::size_of_val(&downloader.install_version("1.21.1", None, |_| {})) < 8192,
+            "version-install future should stay comfortably below tokio worker stack limits"
+        );
     }
 
     #[tokio::test]
