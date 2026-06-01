@@ -42,7 +42,6 @@ import {
   type WindowPresetSpec,
 } from './screen-presets';
 import { JVM_PRESET_CREATE_ORDER, type JvmPreset } from './jvm-presets';
-import './create.css';
 
 export function CreateView(): JSX.Element {
   const libraryDir = config.value?.library_dir ?? '';

@@ -1,4 +1,5 @@
 import { render } from 'preact';
+import './styles';
 import { App } from './App';
 import { local } from './state';
 import {

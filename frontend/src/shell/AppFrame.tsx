@@ -1,7 +1,6 @@
 import type { JSX, ComponentChildren } from 'preact';
 import { Sidebar } from './Sidebar';
 import { Topbar } from './Topbar';
-import './shell.css';
 
 export function AppFrame({ children }: { children: ComponentChildren }): JSX.Element {
   return (

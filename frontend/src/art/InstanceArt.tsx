@@ -4,7 +4,6 @@ import { useTheme } from '../hooks/use-theme';
 import { hashStr } from '../tokens';
 import type { Instance, LoaderComponentId, Version } from '../types';
 import { renderInstanceArt, type VersionIdentity, type VersionLoaderTrait } from './art-engine';
-import './instance-art.css';
 
 export type ArtPreset = 'aurora' | 'silk' | 'mineral' | 'ember' | 'vapor' | 'topo' | 'prism' | 'dune' | 'orbit';
 export type ArtAspect = 'square' | 'banner' | 'thumb';

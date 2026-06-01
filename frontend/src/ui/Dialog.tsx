@@ -2,7 +2,6 @@ import type { JSX } from 'preact';
 import { signal } from '@preact/signals';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { Button, Input } from './Atoms';
-import './dialog.css';
 
 type DialogResult = boolean | string | null;
 type DialogButtonVariant = 'primary' | 'secondary' | 'soft' | 'ghost' | 'danger';

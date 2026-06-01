@@ -47,7 +47,6 @@ import type {
   PerformanceMode,
   PerformanceRulesStatus,
 } from '../../types';
-import './settings.css';
 
 type SectionId = 'appearance' | 'gameplay' | 'performance' | 'audio' | 'shortcuts' | 'advanced' | 'about';
 

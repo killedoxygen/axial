@@ -14,7 +14,6 @@ import { showOnboardingOverlay } from '../../ui-state';
 import { toast } from '../../toast';
 import { clampPlayerNameInput } from '../../player-name';
 import { errMessage, fmtMem, getMemoryRecommendation, validateUsername } from '../../utils';
-import './onboarding.css';
 
 type Stage = 'name' | 'memory' | 'color' | 'music';
 const ORDER: Stage[] = ['name', 'memory', 'color', 'music'];

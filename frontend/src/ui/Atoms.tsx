@@ -1,7 +1,6 @@
 import type { JSX, ComponentChildren } from 'preact';
 import { useState } from 'preact/hooks';
 import { Icon } from './Icons';
-import './atoms.css';
 
 type Tone = 'neutral' | 'accent' | 'ok' | 'warn' | 'err' | 'info';
 type BtnVariant = 'primary' | 'secondary' | 'soft' | 'ghost' | 'danger';

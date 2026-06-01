@@ -59,7 +59,7 @@ keep this short and real. if the codebase changes, update this file.
 
 ## Build shape
 - frontend entry is `frontend/src/main.tsx`
-- frontend bundle output is `frontend/static/app.js`
+- frontend JS entry output is `frontend/static/app.js`; additional generated chunks may be emitted under `frontend/static/chunks/`
 - frontend package manager is `pnpm`, pinned through `frontend/package.json`
 - the Rust workspace root is `Cargo.toml`
 - release/build automation lives in `.github/workflows/`

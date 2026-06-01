@@ -7,7 +7,6 @@ import { browseDirectory } from '../../native';
 import { errMessage } from '../../utils';
 import { config, devMode, instances, lastInstanceId, versions } from '../../store';
 import { showOnboardingOverlay, showSetupOverlay } from '../../ui-state';
-import './setup.css';
 
 // Library setup overlay
 // Creates a managed library at the recommended path or points at an existing one

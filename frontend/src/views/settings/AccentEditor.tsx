@@ -5,7 +5,6 @@ import { ColorField } from './ColorField';
 import { applyTheme } from '../../theme';
 import { local, PRESET_HUES } from '../../state';
 import { Sound, playSliderSound } from '../../sound';
-import './accent.css';
 
 export function AccentModeToggle({
   onChange,

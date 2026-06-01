@@ -1,13 +1,10 @@
-import type { JSX } from 'preact';
+import { h } from 'preact';
+import type { ComponentType, JSX } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
 import { AppFrame } from './shell/AppFrame';
 import { HomeView } from './views/home/HomeView';
 import { InstancesView } from './views/instances/InstancesView';
-import { InstanceDetailView } from './views/instance/InstanceDetailView';
-import { CreateView } from './views/create/CreateView';
 import { DownloadsView } from './views/downloads/DownloadsView';
-import { AccountsView } from './views/accounts/AccountsView';
-import { SettingsView } from './views/settings/SettingsView';
 import { Onboarding } from './views/onboarding/Onboarding';
 import { DialogHost } from './ui/Dialog';
 import { SetupOverlay } from './views/setup/SetupOverlay';
@@ -17,13 +14,68 @@ import { CommandPalette } from './ui/CommandPalette';
 import { route, showOnboardingOverlay, showSetupOverlay } from './ui-state';
 import { bootstrapError, bootstrapState, devMode } from './store';
 import { useShortcuts } from './hooks/use-shortcuts';
-import './views/views.css';
 
 type DevLabViewComponent = typeof import('./views/dev-lab/DevLabView')['DevLabView'];
+
+const InstanceDetailRoute = createRouteLoader<{ id: string }>(
+  async () => (await import('./views/instance/InstanceDetailView')).InstanceDetailView,
+);
+
+const CreateRoute = createRouteLoader(
+  async () => (await import('./views/create/CreateView')).CreateView,
+);
+
+const AccountsRoute = createRouteLoader(
+  async () => (await import('./views/accounts/AccountsView')).AccountsView,
+);
+
+const SettingsRoute = createRouteLoader(
+  async () => (await import('./views/settings/SettingsView')).SettingsView,
+);
 
 const loadDevLabView = __CROOPOR_ENABLE_DEV_LAB__
   ? async (): Promise<DevLabViewComponent> => (await import('./views/dev-lab/DevLabView')).DevLabView
   : null;
+
+function createRouteLoader<P extends object>(load: () => Promise<ComponentType<P>>): ComponentType<P> {
+  return function LazyRouteView(props: P): JSX.Element {
+    const [View, setView] = useState<ComponentType<P> | null>(null);
+    const [failed, setFailed] = useState(false);
+
+    useEffect(() => {
+      let mounted = true;
+      setFailed(false);
+      void load()
+        .then((view) => {
+          if (mounted) setView(() => view);
+        })
+        .catch(() => {
+          if (mounted) setFailed(true);
+        });
+      return () => { mounted = false; };
+    }, []);
+
+    return View ? h(View, props) : <RouteLoadingFallback failed={failed} />;
+  };
+}
+
+function RouteLoadingFallback({ failed = false }: { failed?: boolean }): JSX.Element {
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      style={{
+        minHeight: 'min(420px, 64vh)',
+        display: 'grid',
+        placeItems: 'center',
+        color: 'var(--text-dim)',
+        fontSize: 13,
+      }}
+    >
+      {failed ? 'Could not load view.' : 'Loading view...'}
+    </div>
+  );
+}
 
 function BootState(): JSX.Element | null {
   const s = bootstrapState.value;
@@ -55,7 +107,7 @@ function BootState(): JSX.Element | null {
 }
 
 function DevLabRoute(): JSX.Element {
-  if (!loadDevLabView || !devMode.value) return <SettingsView />;
+  if (!loadDevLabView || !devMode.value) return <SettingsRoute />;
   return <DevLabLoader load={loadDevLabView} />;
 }
 
@@ -70,7 +122,7 @@ function DevLabLoader({ load }: { load: () => Promise<DevLabViewComponent> }): J
     return () => { mounted = false; };
   }, [load]);
 
-  return DevLabView ? <DevLabView /> : <SettingsView />;
+  return DevLabView ? <DevLabView /> : <SettingsRoute />;
 }
 
 function CurrentView(): JSX.Element {
@@ -78,12 +130,12 @@ function CurrentView(): JSX.Element {
   switch (r.name) {
     case 'home': return <HomeView />;
     case 'instances': return <InstancesView />;
-    case 'instance': return <InstanceDetailView id={r.id} />;
-    case 'create': return <CreateView />;
+    case 'instance': return <InstanceDetailRoute id={r.id} />;
+    case 'create': return <CreateRoute />;
     case 'dev-lab': return <DevLabRoute />;
     case 'downloads': return <DownloadsView />;
-    case 'accounts': return <AccountsView />;
-    case 'settings': return <SettingsView />;
+    case 'accounts': return <AccountsRoute />;
+    case 'settings': return <SettingsRoute />;
   }
 }
 

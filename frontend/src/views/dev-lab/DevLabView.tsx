@@ -4,7 +4,6 @@ import { ART_PRESETS, InstanceArt, artPresetForSeed, artSeedForPreset, nextArtSe
 import { Button, Card, Input, SectionHeading } from '../../ui/Atoms';
 import { hashStr } from '../../tokens';
 import type { Instance } from '../../types';
-import './dev-lab.css';
 
 type LabTab = 'art';
 

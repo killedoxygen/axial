@@ -1,7 +1,6 @@
 import type { JSX } from 'preact';
 import { useEffect, useMemo, useState } from 'preact/hooks';
 import { hashStr } from '../tokens';
-import './player-head.css';
 
 type PixelTone = 'skin' | 'skinLight' | 'skinShade' | 'hair' | 'hairLight' | 'hairShade' | 'eye' | 'mouth';
 

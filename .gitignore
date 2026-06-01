@@ -9,6 +9,7 @@ node_modules
 # Frontend build artifacts
 frontend/static/app.js
 frontend/static/app.css
+frontend/static/chunks/
 frontend/package.json.md5
 target/
 

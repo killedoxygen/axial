@@ -10,7 +10,6 @@ import { Sound } from '../sound';
 import { applyTheme } from '../theme';
 import { promptPlayerName, savePlayerName } from '../player-name';
 import type { EnrichedInstance } from '../types';
-import './command-palette.css';
 
 type Group = 'jump' | 'instance' | 'action';
 

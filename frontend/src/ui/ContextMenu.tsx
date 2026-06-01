@@ -2,7 +2,6 @@ import type { JSX } from 'preact';
 import { signal } from '@preact/signals';
 import { useEffect, useRef } from 'preact/hooks';
 import { Icon } from './Icons';
-import './context-menu.css';
 
 export interface ContextMenuItem {
   icon?: string;

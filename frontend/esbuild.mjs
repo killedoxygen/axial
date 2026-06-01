@@ -44,7 +44,9 @@ const shared = {
   entryPoints: { app: 'src/main.tsx' },
   bundle: true,
   outdir: 'static',
-  format: 'iife',
+  format: 'esm',
+  splitting: true,
+  chunkNames: 'chunks/[name]-[hash]',
   target: ['es2020'],
   jsx: 'automatic',
   jsxImportSource: 'preact',
@@ -60,8 +62,11 @@ const sizeReporter = {
   setup(b) {
     b.onEnd(result => {
       if (result.errors.length) return;
-      const out = result.metafile?.outputs['static/app.js'];
-      if (out) console.log(`  static/app.js  ${(out.bytes / 1024).toFixed(1)}kb`);
+      for (const [path, out] of Object.entries(result.metafile?.outputs ?? {})) {
+        if (out.entryPoint || out.imports.some(imported => imported.kind === 'dynamic-import')) {
+          console.log(`  ${path}  ${(out.bytes / 1024).toFixed(1)}kb`);
+        }
+      }
     });
   },
 };

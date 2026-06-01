@@ -1,6 +1,5 @@
 import type { JSX } from 'preact';
 import { playSliderSound } from '../sound';
-import './slider.css';
 
 export interface SliderZone {
   from: number;

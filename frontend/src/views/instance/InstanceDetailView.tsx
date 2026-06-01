@@ -40,7 +40,6 @@ import {
   jvmPresetFrom,
   type JvmPreset,
 } from '../create/jvm-presets';
-import './instance.css';
 
 async function openInstanceFolder(id: string, sub?: string): Promise<void> {
   try {
