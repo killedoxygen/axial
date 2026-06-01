@@ -547,6 +547,17 @@ function savedSkinsResponse(value: unknown): SavedSkinRecord[] | null {
   return value.skins.map(savedSkinRecord).filter((skin): skin is SavedSkinRecord => Boolean(skin));
 }
 
+function skinVariantValue(value: string | undefined): SkinVariant {
+  return value?.toLowerCase() === 'slim' ? 'slim' : 'classic';
+}
+
+function activeMinecraftSkin(profile: MinecraftProfile | undefined): MinecraftSkin | null {
+  if (!profile) return null;
+  return profile.skins.find((skin) => skin.state.toLowerCase() === 'active')
+    ?? profile.skins[0]
+    ?? null;
+}
+
 function minecraftProfile(value: unknown): MinecraftProfile | undefined {
   if (!isRecord(value)) return undefined;
   if (typeof value.id !== 'string' || typeof value.name !== 'string') return undefined;
@@ -1770,9 +1781,11 @@ function SkinRestorerHelper({ savedUsername }: { savedUsername: string }): JSX.E
 
 function SavedSkinLibrary({
   onlineReady,
+  minecraftProfile,
   onApplied,
 }: {
   onlineReady: boolean;
+  minecraftProfile?: MinecraftProfile;
   onApplied: () => void;
 }): JSX.Element {
   const theme = useTheme();
@@ -1793,10 +1806,12 @@ function SavedSkinLibrary({
   const [deleteKey, setDeleteKey] = useState<string | null>(null);
   const [applyKey, setApplyKey] = useState<string | null>(null);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
+  const profileSkin = activeMinecraftSkin(minecraftProfile);
+  const profileSkinVariant = skinVariantValue(profileSkin?.variant);
   const trimmedName = skinName.trim();
   const trimmedEditName = editName.trim();
   const canUpload = !busy && !profileBusy && trimmedName.length > 0;
-  const canSaveProfileSkin = onlineReady && !busy && !profileBusy;
+  const canSaveProfileSkin = onlineReady && Boolean(profileSkin) && !busy && !profileBusy;
   const selectedSkin = skins.find((skin) => skin.texture_key === selectedKey)
     ?? skins.find((skin) => Boolean(skin.applied_at))
     ?? skins[0]
@@ -1958,7 +1973,7 @@ function SavedSkinLibrary({
       <div style={{ display: 'grid', gap: 16 }}>
         <div style={{
           display: 'grid',
-          gridTemplateColumns: 'minmax(220px, 1fr) auto auto auto',
+          gridTemplateColumns: 'minmax(220px, 1fr) auto auto',
           gap: 10,
           alignItems: 'center',
         }}>
@@ -1997,17 +2012,6 @@ function SavedSkinLibrary({
               if (file) void upload(file);
             }}
           />
-          <Button
-            variant="secondary"
-            icon={profileBusy ? 'refresh' : 'download'}
-            disabled={!canSaveProfileSkin}
-            onClick={() => void saveProfileSkin()}
-            title={onlineReady
-              ? 'Save active Minecraft profile skin'
-              : 'Online Minecraft account required'}
-          >
-            Save profile
-          </Button>
         </div>
 
         {message && (
@@ -2018,6 +2022,62 @@ function SavedSkinLibrary({
             lineHeight: 1.4,
           }}>
             {message.text}
+          </div>
+        )}
+
+        {minecraftProfile && (
+          <div style={{
+            display: 'grid',
+            gridTemplateColumns: '42px minmax(0, 1fr) auto',
+            gap: 12,
+            alignItems: 'center',
+            padding: '12px 0',
+            borderTop: '1px solid var(--line)',
+            borderBottom: '1px solid var(--line)',
+          }}>
+            <PlayerHeadPreview
+              username={minecraftProfile.name}
+              textureSrc={profileSkin?.url}
+              size={36}
+              radius={7}
+              ariaLabel={`${minecraftProfile.name} Minecraft profile skin`}
+            />
+            <div style={{ minWidth: 0, display: 'grid', gap: 4 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                <Pill tone={onlineReady ? 'ok' : 'warn'} icon={onlineReady ? 'check-circle' : 'alert'}>
+                  Current Minecraft profile
+                </Pill>
+                {profileSkin && <Pill tone="neutral">{profileSkinVariant}</Pill>}
+              </div>
+              <div style={{
+                color: theme.n.text,
+                fontSize: 13,
+                fontWeight: 700,
+                lineHeight: 1.25,
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+              }}>
+                {minecraftProfile.name}
+              </div>
+              <div style={{ color: theme.n.textMute, fontSize: 12, lineHeight: 1.4 }}>
+                {profileSkin
+                  ? 'Save this skin locally before editing, previewing, or reapplying it later.'
+                  : 'This profile does not report an active skin texture yet.'}
+              </div>
+            </div>
+            <Button
+              variant="secondary"
+              size="sm"
+              icon={profileBusy ? 'refresh' : 'download'}
+              disabled={!canSaveProfileSkin}
+              onClick={() => void saveProfileSkin()}
+              title={onlineReady
+                ? profileSkin ? 'Save active Minecraft profile skin' : 'No active Minecraft profile skin reported'
+                : 'Online Minecraft account required'}
+            >
+              Save locally
+            </Button>
           </div>
         )}
 
@@ -2394,7 +2454,11 @@ export function AccountsView(): JSX.Element {
 
       <AccountBoundary savedUsername={savedUsername} />
 
-      <SavedSkinLibrary onlineReady={onlineReady} onApplied={refresh} />
+      <SavedSkinLibrary
+        onlineReady={onlineReady}
+        minecraftProfile={status?.minecraft_profile}
+        onApplied={refresh}
+      />
 
       <SkinRestorerHelper savedUsername={savedUsername} />
     </div>
