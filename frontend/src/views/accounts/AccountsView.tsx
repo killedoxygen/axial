@@ -1823,7 +1823,7 @@ function SavedSkinLibrary({
   const profileSkinVariant = skinVariantValue(profileSkin?.variant);
   const trimmedName = skinName.trim();
   const trimmedEditName = editName.trim();
-  const canUpload = !busy && !profileBusy && trimmedName.length > 0;
+  const canUpload = !busy && !profileBusy;
   const canSaveProfileSkin = onlineReady && Boolean(profileSkin) && !busy && !profileBusy;
   const equippedSkin = skins.find((skin) => Boolean(skin.applied_at)) ?? null;
   const selectedSkin = skins.find((skin) => skin.texture_key === selectedKey)
@@ -2100,7 +2100,7 @@ function SavedSkinLibrary({
                 setSkinName(value.slice(0, 64));
                 setMessage(null);
               }}
-              placeholder="Skin name"
+              placeholder="Skin name, optional"
               icon="tag"
             />
             <Segmented<SkinVariant>
