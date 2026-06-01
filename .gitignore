@@ -15,6 +15,7 @@ target/
 
 # Local-only
 plans/
+tmp/
 assets/*.mp3
 assets/*.wav
 CHANGELOG-next.md
