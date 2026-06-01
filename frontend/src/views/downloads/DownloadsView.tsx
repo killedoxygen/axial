@@ -1,9 +1,10 @@
 import type { JSX } from 'preact';
 import type { InstallItem, LoaderComponentId } from '../../types';
-import { Card, Meter, Pill, SectionHeading } from '../../ui/Atoms';
+import { Card, IconButton, Meter, Pill, SectionHeading } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { useTheme } from '../../hooks/use-theme';
 import { installQueue, installState } from '../../store';
+import { removeQueuedInstallAt } from '../../actions';
 
 const QUEUED_LOADER_LABELS: Record<LoaderComponentId, string> = {
   'net.fabricmc.fabric-loader': 'Fabric',
@@ -93,8 +94,23 @@ export function DownloadsView(): JSX.Element {
               <span style={{ width: 18, fontSize: 11, color: theme.n.textMute, fontVariantNumeric: 'tabular-nums' }}>
                 {i + 1}
               </span>
-              <span style={{ fontSize: 13, color: theme.n.text }}>{item.versionId}</span>
-              {item.loader && <span style={{ fontSize: 11, color: theme.n.textMute }}>· {formatQueuedLoaderLabel(item.loader)}</span>}
+              <div style={{ display: 'flex', alignItems: 'baseline', gap: 6, minWidth: 0, flex: 1 }}>
+                <span style={{ fontSize: 13, color: theme.n.text, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {item.versionId}
+                </span>
+                {item.loader && (
+                  <span style={{ fontSize: 11, color: theme.n.textMute, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    · {formatQueuedLoaderLabel(item.loader)}
+                  </span>
+                )}
+              </div>
+              <IconButton
+                icon="trash"
+                size={28}
+                danger
+                tooltip={`Remove ${item.versionId} from queue`}
+                onClick={() => removeQueuedInstallAt(i)}
+              />
             </div>
           ))}
         </Card>

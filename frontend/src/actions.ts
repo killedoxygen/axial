@@ -61,6 +61,12 @@ export function dequeueNextInstall(): InstallItem | null {
   return next;
 }
 
+export function removeQueuedInstallAt(index: number): void {
+  const queue = installQueue.value;
+  if (!Number.isInteger(index) || index < 0 || index >= queue.length) return;
+  installQueue.value = queue.filter((_, i) => i !== index);
+}
+
 export function setInstallEventSource(es: { close(): void } | null): void {
   if (installEventSource.value) installEventSource.value.close();
   installEventSource.value = es;
