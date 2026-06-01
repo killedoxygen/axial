@@ -1078,6 +1078,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_refresh_and_online_launch_share_refresh_result() {
+        let fixture = TestFixture::new("prepare-online-auth-explicit-refresh-race");
+        fixture.set_launch_auth_mode("online");
+        let instance_id = fixture.add_instance("Survival", "1.21.1");
+        fixture
+            .add_active_msa_refresh_token(Some("old-msa-refresh-token"))
+            .await;
+        let (token_endpoint, mut token_requests) = delayed_token_test_server(
+            StatusCode::OK,
+            serde_json::json!({
+                "access_token": "new-msa-access-token",
+                "refresh_token": "new-msa-refresh-token",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "scope": "XboxLive.signin offline_access"
+            }),
+            Duration::from_millis(100),
+        )
+        .await;
+        let (auth_chain_client, mut auth_chain_requests) =
+            auth_chain_route_test_client(AuthChainRouteServerMode::Success).await;
+
+        let launch =
+            fixture.prepare_with_auth_refresh(instance_id, &token_endpoint, &auth_chain_client);
+        let explicit = refresh_active_auth_for_config(
+            AuthLoginConfig::from_env_value(Some("public-client-id")),
+            fixture.state.auth_logins(),
+            &token_endpoint,
+            &auth_chain_client,
+        );
+        let (launch, explicit) = tokio::join!(launch, explicit);
+        let launch = launch.expect("launch preparation");
+        let explicit = explicit.expect("explicit refresh");
+        let explicit = serde_json::to_value(explicit).expect("serialize explicit refresh response");
+
+        assert_eq!(launch.task.intent.auth.player_name, "ProfileName");
+        assert_eq!(explicit["minecraft_profile"]["name"], "ProfileName");
+
+        let form = token_requests.recv().await.expect("token request");
+        assert_eq!(form["grant_type"], "refresh_token");
+        assert_eq!(form["refresh_token"], "old-msa-refresh-token");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), token_requests.recv())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            fixture
+                .state
+                .auth_logins()
+                .active_msa_token()
+                .await
+                .expect("active msa token")
+                .refresh_token,
+            Some("new-msa-refresh-token".to_string())
+        );
+
+        let mut paths = Vec::new();
+        for _ in 0..5 {
+            paths.push(
+                auth_chain_requests
+                    .recv()
+                    .await
+                    .expect("auth-chain request")
+                    .path,
+            );
+        }
+        assert_eq!(
+            paths,
+            vec![
+                "/xbl",
+                "/xsts",
+                "/minecraft/login",
+                "/minecraft/profile",
+                "/minecraft/ownership",
+            ]
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), auth_chain_requests.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn prepare_launch_session_rejects_online_auth_missing_refresh_token_boundedly() {
         let fixture = TestFixture::new("prepare-online-auth-no-refresh");
         fixture.set_launch_auth_mode("online");
