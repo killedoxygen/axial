@@ -7,9 +7,16 @@ use axum::{
     response::IntoResponse,
     routing::get,
 };
+use futures_util::StreamExt;
 use reqwest::Client;
 use serde::Serialize;
-use std::sync::{Arc, OnceLock};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
+use tokio::fs as async_fs;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
 const MUSIC_TRACKS: [(&str, &str); 2] = [
@@ -25,6 +32,9 @@ const MUSIC_TRACKS: [(&str, &str); 2] = [
 
 const MUSIC_DOWNLOAD_FAILURE_COPY: &str =
     "Could not load background music. Check your connection and try again.";
+const MUSIC_DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const MUSIC_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+const MUSIC_DOWNLOAD_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Debug, Serialize)]
 struct MusicTrackStatus {
@@ -110,29 +120,109 @@ async fn handle_music_track(
     }
 }
 
-async fn download_music_file(path: &std::path::Path, url: &str) -> Result<(), String> {
+async fn download_music_file(path: &Path, url: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        async_fs::create_dir_all(parent)
+            .await
+            .map_err(|error| error.to_string())?;
     }
 
-    let bytes = Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .map_err(|error| error.to_string())?
+    let response = music_download_client()
         .get(url)
         .send()
         .await
         .map_err(|error| error.to_string())?
         .error_for_status()
-        .map_err(|error| error.to_string())?
-        .bytes()
-        .await
         .map_err(|error| error.to_string())?;
 
-    let temp_path = path.with_extension("tmp");
-    std::fs::write(&temp_path, &bytes).map_err(|error| error.to_string())?;
-    std::fs::rename(&temp_path, path).map_err(|error| error.to_string())?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MUSIC_DOWNLOAD_MAX_BYTES)
+    {
+        return Err("music download is too large".to_string());
+    }
+
+    let temp_path = music_temp_path(path);
+    let result = write_music_response_to_temp(response, &temp_path).await;
+    if result.is_err() {
+        let _ = async_fs::remove_file(&temp_path).await;
+        return result;
+    }
+
+    promote_music_temp(&temp_path, path)
+        .await
+        .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+fn music_download_client() -> Client {
+    static CLIENT: OnceLock<Client> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            Client::builder()
+                .connect_timeout(MUSIC_DOWNLOAD_CONNECT_TIMEOUT)
+                .timeout(MUSIC_DOWNLOAD_TIMEOUT)
+                .build()
+                .unwrap_or_else(|_| Client::new())
+        })
+        .clone()
+}
+
+async fn write_music_response_to_temp(
+    response: reqwest::Response,
+    temp_path: &Path,
+) -> Result<(), String> {
+    let mut output = async_fs::File::create(temp_path)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut total = 0_u64;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| error.to_string())?;
+        total = total.saturating_add(chunk.len() as u64);
+        if total > MUSIC_DOWNLOAD_MAX_BYTES {
+            return Err("music download is too large".to_string());
+        }
+        output
+            .write_all(&chunk)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    output.flush().await.map_err(|error| error.to_string())
+}
+
+async fn promote_music_temp(temp_path: &Path, destination: &Path) -> std::io::Result<()> {
+    let first_error = match async_fs::rename(temp_path, destination).await {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+
+    match async_fs::symlink_metadata(temp_path).await {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(first_error),
+        Err(error) => return Err(error),
+    }
+
+    if let Ok(metadata) = async_fs::symlink_metadata(destination).await {
+        let file_type = metadata.file_type();
+        if file_type.is_file() || file_type.is_symlink() {
+            async_fs::remove_file(destination).await?;
+        }
+    }
+
+    let result = async_fs::rename(temp_path, destination).await;
+    if result.is_err() {
+        let _ = async_fs::remove_file(temp_path).await;
+    }
+    result
+}
+
+fn music_temp_path(path: &Path) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or_default();
+    path.with_extension(format!("tmp-{}-{nanos:x}", std::process::id()))
 }
 
 fn music_download_failure_body(_internal_error: &str) -> serde_json::Value {
@@ -142,9 +232,67 @@ fn music_download_failure_body(_internal_error: &str) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn public_error_json_for(internal_error: &str) -> String {
         serde_json::to_string(&music_download_failure_body(internal_error)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn music_temp_promotion_replaces_existing_file() {
+        let root = test_root("music-promote-replace");
+        let destination = root.join("track.mp3");
+        let temp_path = root.join("track.tmp");
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(&destination, b"stale music").expect("write stale file");
+        fs::write(&temp_path, b"fresh music").expect("write temp file");
+
+        promote_music_temp(&temp_path, &destination)
+            .await
+            .expect("promote music temp");
+
+        assert_eq!(
+            fs::read(&destination).expect("read promoted file"),
+            b"fresh music"
+        );
+        assert!(!temp_path.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn music_temp_promotion_preserves_destination_when_temp_is_missing() {
+        let root = test_root("music-promote-missing-temp");
+        let destination = root.join("track.mp3");
+        let temp_path = root.join("missing.tmp");
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(&destination, b"existing music").expect("write existing file");
+
+        let error = promote_music_temp(&temp_path, &destination)
+            .await
+            .expect_err("missing temp should fail");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(
+            fs::read(&destination).expect("read existing file"),
+            b"existing music"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn music_temp_promotion_cleans_temp_when_destination_is_directory() {
+        let root = test_root("music-promote-directory");
+        let destination = root.join("track.mp3");
+        let temp_path = root.join("track.tmp");
+        fs::create_dir_all(&destination).expect("create destination directory");
+        fs::write(&temp_path, b"fresh music").expect("write temp file");
+
+        let result = promote_music_temp(&temp_path, &destination).await;
+
+        assert!(result.is_err());
+        assert!(destination.is_dir());
+        assert!(!temp_path.exists());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -198,5 +346,16 @@ mod tests {
 
         assert!(!public_json.contains("Permission denied"));
         assert!(!public_json.contains("os error 13"));
+    }
+
+    fn test_root(prefix: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or_default();
+        std::env::temp_dir().join(format!(
+            "croopor-music-{prefix}-{}-{nanos:x}",
+            std::process::id()
+        ))
     }
 }
