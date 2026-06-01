@@ -10,7 +10,7 @@ import { openContextMenu } from '../../ui/ContextMenu';
 import { config, installQueue, installState, instances, launchNotices, launchState, runningSessions, systemInfo, versions } from '../../store';
 import type { LaunchState } from '../../store';
 import { navigate } from '../../ui-state';
-import { addInstance, clearLaunchNotice, removeInstance, selectInstance, updateInstanceInList } from '../../actions';
+import { addInstance, clearLaunchNotice, isActiveInstallItem, isSameInstallItem, removeInstance, selectInstance, updateInstanceInList } from '../../actions';
 import { launchGame, killGame } from '../../launch';
 import { handleInstallClick } from '../../install';
 import { formatInstallItemLabel } from '../../install-labels';
@@ -32,6 +32,7 @@ import type {
   PerformanceOperationStatus,
   PerformancePlanResponse,
   Version,
+  InstallItem,
 } from '../../types';
 import {
   JVM_PRESET_HINTS,
@@ -439,6 +440,20 @@ function loaderLabel(v: Version | undefined): string {
 
 function installTargetFor(inst: EnrichedInstance, version: Version | undefined): string {
   return version?.needs_install || version?.id || inst.version_id;
+}
+
+function installItemFor(inst: EnrichedInstance, version: Version | undefined): InstallItem {
+  const versionId = installTargetFor(inst, version);
+  if (!version?.loader) return { versionId };
+  return {
+    versionId,
+    loader: {
+      componentId: version.loader.component_id,
+      buildId: version.loader.build_id,
+      minecraftVersion: version.inherits_from || '',
+      loaderVersion: version.loader.loader_version,
+    },
+  };
 }
 
 function performanceModeFrom(value: string | undefined): PerformanceMode | null {
@@ -2381,11 +2396,12 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
   const mcVer = v?.minecraft_meta.display_hint || v?.minecraft_meta.display_name || 'unknown';
   const canLaunch = Boolean(v?.launchable);
   const installTarget = installTargetFor(inst, v);
+  const installItem = installItemFor(inst, v);
   const install = installState.value;
-  const installProgress = install.status === 'active' && install.versionId === installTarget
+  const installProgress = install.status === 'active' && isActiveInstallItem(installItem)
     ? { pct: install.pct, label: install.label, displayName: install.displayName }
     : null;
-  const queuedInstallIndex = installQueue.value.findIndex(item => item.versionId === installTarget);
+  const queuedInstallIndex = installQueue.value.findIndex(item => isSameInstallItem(item, installItem));
   const queuedInstall = queuedInstallIndex >= 0 ? installQueue.value[queuedInstallIndex] : undefined;
   const installQueued = !installProgress && Boolean(queuedInstall);
   const installQueuePosition = installQueued ? queuedInstallIndex + 1 : undefined;
