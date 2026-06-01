@@ -872,23 +872,25 @@ function PerformanceRulesStatusBlock({ state }: { state: RulesStatusState }): JS
       <div class="cp-settings-rule-status-head">
         <div class="cp-settings-rule-status-copy">
           <strong>{source} active</strong>
-          <span>
-            {status.composition_count} compositions, schema v{status.schema_version}, generated {formatRuleDate(status.generated_at)}.
-          </span>
+          <span>{channel}. {refresh}.</span>
         </div>
         <Pill tone={status.validation === 'valid' ? 'ok' : 'err'} icon={status.validation === 'valid' ? 'check' : 'alert'}>
           {status.validation === 'valid' ? 'Valid' : 'Invalid'}
         </Pill>
       </div>
-      <div class="cp-settings-rule-status-grid">
-        <span>Source</span>
-        <strong>{channel}</strong>
-        <span>Refresh</span>
-        <strong>{refresh}</strong>
-      </div>
       <details class="cp-settings-rule-details">
         <summary>Rule details</summary>
         <div class="cp-settings-rule-status-grid">
+          <span>Source</span>
+          <strong>{channel}</strong>
+          <span>Refresh</span>
+          <strong>{refresh}</strong>
+          <span>Compositions</span>
+          <strong>{status.composition_count}</strong>
+          <span>Schema</span>
+          <strong>v{status.schema_version}</strong>
+          <span>Generated</span>
+          <strong>{formatRuleDate(status.generated_at)}</strong>
           <span>Rules cache</span>
           <strong>{rulesCacheSummary(status)}</strong>
           <span>Emergency disables</span>
