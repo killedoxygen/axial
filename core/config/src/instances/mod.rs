@@ -482,8 +482,26 @@ impl InstanceStore {
         let data = serde_json::to_string_pretty(inner)?;
         let temp_path = self.paths.instances_file.with_extension("json.tmp");
         fs::write(&temp_path, data)?;
-        fs::rename(temp_path, &self.paths.instances_file)?;
+        promote_replacement(&temp_path, &self.paths.instances_file)?;
         Ok(())
+    }
+}
+
+fn promote_replacement(source: &Path, destination: &Path) -> Result<(), std::io::Error> {
+    if fs::rename(source, destination).is_ok() {
+        return Ok(());
+    }
+
+    if destination.exists() {
+        let _ = fs::remove_file(destination);
+    }
+
+    match fs::rename(source, destination) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = fs::remove_file(source);
+            Err(error)
+        }
     }
 }
 
@@ -883,6 +901,26 @@ mod tests {
             store.get(&alpha.id).expect("alpha remains").name,
             "Alpha".to_string()
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn promote_replacement_replaces_existing_registry_file() {
+        let root = test_root("promote-replacement-existing");
+        let paths = test_paths(&root);
+        fs::create_dir_all(&paths.config_dir).expect("create config dir");
+        let temp_path = paths.instances_file.with_extension("json.tmp");
+        fs::write(&paths.instances_file, "old registry").expect("write existing registry");
+        fs::write(&temp_path, "new registry").expect("write temp registry");
+
+        super::promote_replacement(&temp_path, &paths.instances_file).expect("promote replacement");
+
+        assert_eq!(
+            fs::read_to_string(&paths.instances_file).expect("read promoted registry"),
+            "new registry"
+        );
+        assert!(!temp_path.exists());
 
         let _ = fs::remove_dir_all(root);
     }
