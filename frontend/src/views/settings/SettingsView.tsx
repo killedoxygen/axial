@@ -104,24 +104,27 @@ function ModeChoice<T extends string>({
   disabled?: boolean;
   onChange: (value: T) => void;
 }): JSX.Element {
+  const selected = options.find((option) => option.value === value) ?? options[0];
+  const selectId = `cp-settings-mode-${label.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
+
   return (
     <div class="cp-settings-mode-choice">
-      <div class="cp-settings-mode-choice-label">{label}</div>
-      <div class="cp-settings-mode-seg" role="radiogroup" aria-label={label}>
-        {options.map((option) => (
-          <button
-            key={option.value}
-            type="button"
-            role="radio"
-            aria-checked={option.value === value}
-            data-active={option.value === value}
-            disabled={disabled}
-            onClick={() => onChange(option.value)}
-          >
-            <span>{option.label}</span>
-            <small>{option.note}</small>
-          </button>
-        ))}
+      <label class="cp-settings-mode-choice-label" htmlFor={selectId}>{label}</label>
+      <div class="cp-settings-mode-field">
+        <select
+          id={selectId}
+          value={value}
+          disabled={disabled}
+          aria-describedby={`${selectId}-note`}
+          onChange={(event) => onChange((event.currentTarget as HTMLSelectElement).value as T)}
+        >
+          {options.map((option) => (
+            <option key={option.value} value={option.value}>{option.label}</option>
+          ))}
+        </select>
+        <div id={`${selectId}-note`} class="cp-settings-mode-note">
+          {selected?.note ?? ''}
+        </div>
       </div>
     </div>
   );

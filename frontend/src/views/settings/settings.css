@@ -121,67 +121,60 @@
 .cp-settings-mode-choice {
   margin-top: 14px;
   display: grid;
-  grid-template-columns: 116px minmax(0, 1fr);
-  align-items: start;
+  grid-template-columns: 132px minmax(180px, 320px);
+  align-items: center;
   gap: 12px;
 }
 .cp-settings-mode-choice-label {
-  padding-top: 9px;
   color: var(--text-mute);
   font-size: 11px;
   font-weight: 700;
   letter-spacing: 0;
   text-transform: uppercase;
 }
-.cp-settings-mode-seg {
+.cp-settings-mode-field {
   min-width: 0;
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(138px, 1fr));
-  gap: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
 }
-.cp-settings-mode-seg button {
-  min-width: 0;
-  padding: 9px 10px;
+.cp-settings-mode-field select {
+  width: 100%;
+  min-height: 36px;
+  padding: 0 10px;
   border: 1px solid var(--line);
   border-radius: var(--r-sm);
   background: var(--surface-2);
-  color: var(--text-dim);
+  color: var(--text);
   font: inherit;
-  text-align: left;
   cursor: pointer;
-  transition: background 140ms ease, border-color 140ms ease, color 140ms ease, transform 120ms ease;
+  transition: background 140ms ease, border-color 140ms ease, color 140ms ease;
 }
-.cp-settings-mode-seg button:hover:not([disabled]) {
+.cp-settings-mode-field select:hover:not(:disabled) {
   background: var(--surface-3);
-  color: var(--text);
+  border-color: var(--line-strong);
 }
-.cp-settings-mode-seg button:active:not([disabled]) {
-  transform: translateY(0.5px);
+.cp-settings-mode-field select:focus-visible {
+  outline: 2px solid var(--accent-line);
+  outline-offset: 2px;
 }
-.cp-settings-mode-seg button[data-active="true"] {
-  background: var(--accent-softer);
-  border-color: var(--accent-line);
-  color: var(--text);
-}
-.cp-settings-mode-seg button[disabled] {
+.cp-settings-mode-field select:disabled {
   cursor: wait;
   opacity: 0.68;
 }
-.cp-settings-mode-seg span,
-.cp-settings-mode-seg small {
-  display: block;
-  min-width: 0;
-}
-.cp-settings-mode-seg span {
-  font-size: 12.5px;
-  font-weight: 700;
-  letter-spacing: 0;
-}
-.cp-settings-mode-seg small {
-  margin-top: 3px;
+.cp-settings-mode-note {
   color: var(--text-mute);
   font-size: 11.5px;
   line-height: 1.35;
+}
+@media (max-width: 720px) {
+  .cp-settings-mode-choice {
+    grid-template-columns: 1fr;
+    gap: 7px;
+  }
+  .cp-settings-mode-field {
+    max-width: 320px;
+  }
 }
 
 .cp-settings-rule-status {
