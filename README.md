@@ -75,6 +75,7 @@ windows powershell:
 - `rust:test`: run the Rust workspace tests
 - `rust:api`: run the Rust Axum API
 - `rust:desktop`: run the Rust Tauri desktop shell
+- `host:launch-evidence`: from WSL, report Windows host Java and common Minecraft/Croopor folders without printing paths
 - `build`: build the release desktop binary
 - `build-dev`: build the dev desktop binary
 - `build --target windows`: build the release Windows desktop binary from Linux/WSL

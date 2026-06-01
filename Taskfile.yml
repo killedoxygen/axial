@@ -61,6 +61,12 @@ tasks:
           Write-Host 'wsl      no'"
         platforms: [windows]
 
+  host:launch-evidence:
+    desc: show WSL-visible Windows host Java and Minecraft/Croopor launch evidence
+    platforms: [linux]
+    cmds:
+      - ./dev host:launch-evidence
+
   frontend:install:
     desc: install frontend deps
     aliases: [setup:frontend]
