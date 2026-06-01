@@ -247,9 +247,14 @@ impl InstanceStore {
         let mut inner = self.inner.write().map_err(|_| {
             InstanceStoreError::Read(std::io::Error::other("instance store lock poisoned"))
         })?;
+        let previous = inner.clone();
         inner.instances.clear();
         inner.last_instance_id.clear();
-        self.persist_locked(&inner)
+        if let Err(error) = self.persist_locked(&inner) {
+            *inner = previous;
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn paths(&self) -> &AppPaths {
@@ -271,22 +276,35 @@ impl InstanceStore {
             )));
         };
 
-        inner.instances.remove(index);
+        let removed = inner.instances.remove(index);
+        let previous_last_instance_id = inner.last_instance_id.clone();
         if inner.last_instance_id == id {
             inner.last_instance_id.clear();
         }
+        if let Err(error) = self.persist_locked(&inner) {
+            inner.instances.insert(index, removed);
+            inner.last_instance_id = previous_last_instance_id;
+            return Err(error);
+        }
+        drop(inner);
+
         if delete_files {
             let _ = fs::remove_dir_all(self.paths.instances_dir.join(id));
         }
-        self.persist_locked(&inner)
+        Ok(())
     }
 
     pub fn set_last_instance_id(&self, id: impl Into<String>) -> Result<(), InstanceStoreError> {
         let mut inner = self.inner.write().map_err(|_| {
             InstanceStoreError::Read(std::io::Error::other("instance store lock poisoned"))
         })?;
+        let previous = inner.last_instance_id.clone();
         inner.last_instance_id = id.into();
-        self.persist_locked(&inner)
+        if let Err(error) = self.persist_locked(&inner) {
+            inner.last_instance_id = previous;
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn add(
@@ -935,6 +953,126 @@ mod tests {
 
         assert!(matches!(error, super::InstanceStoreError::Read(_)));
         assert_eq!(store.get(&previous.id).expect("instance remains"), previous);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn remove_restores_in_memory_instance_and_files_when_persist_fails() {
+        let root = test_root("remove-persist-failure");
+        let paths = test_paths(&root);
+        let store = InstanceStore {
+            paths: paths.clone(),
+            inner: RwLock::new(StoredInstances::default()),
+        };
+        let instance = store
+            .add(
+                "Keep on failure".to_string(),
+                "1.21.1".to_string(),
+                String::new(),
+                String::new(),
+                None,
+            )
+            .expect("add instance");
+        store
+            .set_last_instance_id(instance.id.clone())
+            .expect("set last instance");
+        let marker = store
+            .game_dir(&instance.id)
+            .join("mods")
+            .join("example.jar");
+        fs::write(&marker, "mod").expect("write marker");
+        fs::remove_dir_all(&paths.config_dir).expect("remove config dir");
+        fs::write(&paths.config_dir, "not a dir").expect("block config dir");
+
+        let error = store
+            .remove(&instance.id, true)
+            .expect_err("persist should fail");
+
+        assert!(matches!(error, super::InstanceStoreError::Read(_)));
+        assert_eq!(store.get(&instance.id), Some(instance.clone()));
+        assert_eq!(
+            store.last_instance_id().as_deref(),
+            Some(instance.id.as_str())
+        );
+        assert!(marker.exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn clear_restores_in_memory_instances_when_persist_fails() {
+        let root = test_root("clear-persist-failure");
+        let paths = test_paths(&root);
+        let store = InstanceStore {
+            paths: paths.clone(),
+            inner: RwLock::new(StoredInstances::default()),
+        };
+        let instance = store
+            .add(
+                "Clear rollback".to_string(),
+                "1.21.1".to_string(),
+                String::new(),
+                String::new(),
+                None,
+            )
+            .expect("add instance");
+        store
+            .set_last_instance_id(instance.id.clone())
+            .expect("set last instance");
+        fs::remove_dir_all(&paths.config_dir).expect("remove config dir");
+        fs::write(&paths.config_dir, "not a dir").expect("block config dir");
+
+        let error = store.clear().expect_err("persist should fail");
+
+        assert!(matches!(error, super::InstanceStoreError::Read(_)));
+        assert_eq!(store.get(&instance.id), Some(instance.clone()));
+        assert_eq!(
+            store.last_instance_id().as_deref(),
+            Some(instance.id.as_str())
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn set_last_instance_id_restores_previous_value_when_persist_fails() {
+        let root = test_root("last-instance-persist-failure");
+        let paths = test_paths(&root);
+        let store = InstanceStore {
+            paths: paths.clone(),
+            inner: RwLock::new(StoredInstances::default()),
+        };
+        let first = store
+            .add(
+                "First".to_string(),
+                "1.21.1".to_string(),
+                String::new(),
+                String::new(),
+                None,
+            )
+            .expect("add first");
+        let second = store
+            .add(
+                "Second".to_string(),
+                "1.21.1".to_string(),
+                String::new(),
+                String::new(),
+                None,
+            )
+            .expect("add second");
+        store
+            .set_last_instance_id(first.id.clone())
+            .expect("set first as last");
+        fs::remove_dir_all(&paths.config_dir).expect("remove config dir");
+        fs::write(&paths.config_dir, "not a dir").expect("block config dir");
+
+        let error = store
+            .set_last_instance_id(second.id.clone())
+            .expect_err("persist should fail");
+
+        assert!(matches!(error, super::InstanceStoreError::Read(_)));
+        assert_eq!(store.last_instance_id().as_deref(), Some(first.id.as_str()));
 
         let _ = fs::remove_dir_all(root);
     }
