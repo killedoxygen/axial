@@ -41,7 +41,7 @@ This is the current map of the launcher. Keep it accurate. If the architecture c
 - `apps/api/src/state/sessions/`: live launch session store, subscriptions, process supervision
 - `core/launcher/src/guardian/`: launch-safety authority and intervention model
 - `core/launcher/src/service/`: launch preparation, mappings, Healing summary/recovery helpers
-- `core/minecraft/src/runtime/`: runtime discovery and managed runtime installation; managed Java runtime files are streamed to temporary files and validated against Mojang component-manifest size/SHA-1 metadata when present before the ready marker is written, and the Croopor-managed runtime cache requires that ready marker before reusing an executable
+- `core/minecraft/src/runtime/`: runtime discovery and managed runtime installation; managed Java runtime files are streamed to temporary files and validated against Mojang component-manifest size/SHA-1 metadata when present before the ready marker is written, and the Croopor-managed runtime cache requires that ready marker before reusing an executable. Before repair installs, stale managed runtime temp and destination paths are removed as files/symlinks or directories, and cleanup failures stop the install instead of being ignored.
 - `core/minecraft/src/version_meta/`: Minecraft version interpretation, lifecycle classification, effective-version resolution, display metadata, deterministic ordering
 - `core/minecraft/src/lifecycle.rs`: launcher-owned lifecycle model for Minecraft versions
 - `core/minecraft/src/loaders/types.rs`: loader build metadata contract, explicit upstream terms, evidence, backend display tags, and default-selection policy

@@ -607,12 +607,10 @@ async fn install_managed_runtime(
         .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
 
     let temp_dir = dest_dir.with_extension("installing");
-    if temp_dir.exists() {
-        let _ = fs::remove_dir_all(&temp_dir);
-    }
-    if dest_dir.exists() {
-        let _ = fs::remove_dir_all(dest_dir);
-    }
+    remove_runtime_install_path(&temp_dir)
+        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+    remove_runtime_install_path(dest_dir)
+        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
     fs::create_dir_all(&temp_dir)
         .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
     fs::write(temp_dir.join(".croopor-installing"), b"installing")
@@ -672,6 +670,20 @@ async fn install_managed_runtime(
     }
 
     Ok(())
+}
+
+fn remove_runtime_install_path(path: &Path) -> std::io::Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+
+    if metadata.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
 }
 
 async fn install_runtime_manifest_files(
@@ -1312,7 +1324,8 @@ mod tests {
         ComponentManifestFile, JavaRuntimeLookupError, RuntimeDownloadActual,
         RuntimeDownloadEvidence, RuntimeDownloadIntegrityError, RuntimeInstallState,
         component_manifest_destination, detect_distribution, detect_runtime_state,
-        fetch_runtime_file, java_executable, plan_runtime_manifest_files, runtime_download_client,
+        fetch_runtime_file, java_executable, plan_runtime_manifest_files,
+        remove_runtime_install_path, runtime_download_client,
         runtime_file_download_concurrency_for, runtime_install_lock_from_map,
         verify_runtime_download,
     };
@@ -1575,6 +1588,36 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_install_cleanup_removes_stale_directory_destination() {
+        let root = unique_temp_root("croopor-runtime-cleanup-dir-test");
+        fs::create_dir_all(root.join("bin")).expect("create stale runtime dir");
+        fs::write(root.join("bin").join("java"), b"stale").expect("write stale java");
+
+        remove_runtime_install_path(&root).expect("remove stale runtime dir");
+
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn runtime_install_cleanup_removes_stale_file_destination() {
+        let root = unique_temp_root("croopor-runtime-cleanup-file-test");
+        fs::write(&root, b"blocking file").expect("write stale runtime file");
+
+        remove_runtime_install_path(&root).expect("remove stale runtime file");
+
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn runtime_install_cleanup_accepts_missing_destination() {
+        let root = unique_temp_root("croopor-runtime-cleanup-missing-test");
+
+        remove_runtime_install_path(&root).expect("missing runtime path is clean");
+
+        assert!(!root.exists());
     }
 
     #[test]
