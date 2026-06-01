@@ -70,11 +70,46 @@ mod platform {
     use super::{LaunchPriorityMode, PriorityPromotion};
     use std::io;
     use tokio::process::Command;
-    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::Threading::{
         BELOW_NORMAL_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, OpenProcess, PROCESS_SET_INFORMATION,
         SetPriorityClass,
     };
+
+    struct ProcessHandle(HANDLE);
+
+    impl ProcessHandle {
+        fn open_for_priority(pid: u32) -> io::Result<Self> {
+            // SAFETY: OpenProcess is called with a constant access mask, no inherited handle,
+            // and a pid value supplied by the launched child process metadata. A non-null
+            // return value is an owned handle that must be closed exactly once.
+            let handle = unsafe { OpenProcess(PROCESS_SET_INFORMATION, 0, pid) };
+            if handle.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+
+            Ok(Self(handle))
+        }
+
+        fn set_normal_priority(&self) -> io::Result<()> {
+            // SAFETY: self.0 is a live process handle owned by this wrapper and opened with
+            // PROCESS_SET_INFORMATION. NORMAL_PRIORITY_CLASS is a valid process priority class.
+            let result = unsafe { SetPriorityClass(self.0, NORMAL_PRIORITY_CLASS) };
+            if result == 0 {
+                return Err(io::Error::last_os_error());
+            }
+
+            Ok(())
+        }
+    }
+
+    impl Drop for ProcessHandle {
+        fn drop(&mut self) {
+            // SAFETY: ProcessHandle is constructed only from a successful OpenProcess call
+            // and owns that handle. Drop runs once, so CloseHandle is paired exactly once.
+            let _ = unsafe { CloseHandle(self.0) };
+        }
+    }
 
     pub(super) fn configure_start_priority(
         command: &mut Command,
@@ -88,24 +123,8 @@ mod platform {
             return Ok(PriorityPromotion::MissingPid);
         };
 
-        unsafe {
-            let handle = OpenProcess(PROCESS_SET_INFORMATION, 0, pid);
-            if handle.is_null() {
-                return Err(io::Error::last_os_error());
-            }
-
-            let result = SetPriorityClass(handle, NORMAL_PRIORITY_CLASS);
-            let set_error = if result == 0 {
-                Some(io::Error::last_os_error())
-            } else {
-                None
-            };
-            let _ = CloseHandle(handle);
-
-            if let Some(error) = set_error {
-                return Err(error);
-            }
-        }
+        let handle = ProcessHandle::open_for_priority(pid)?;
+        handle.set_normal_priority()?;
 
         Ok(PriorityPromotion::Promoted)
     }
