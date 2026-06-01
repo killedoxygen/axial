@@ -82,7 +82,7 @@ export function DownloadsView(): JSX.Element {
 
       {queue.length > 0 && (
         <Card padding={10}>
-          <div style={{ fontSize: 11, fontWeight: 600, textTransform: 'uppercase', letterSpacing: 0.8, color: theme.n.textMute, padding: '8px 10px' }}>
+          <div style={{ fontSize: 11, fontWeight: 600, textTransform: 'uppercase', letterSpacing: 0, color: theme.n.textMute, padding: '8px 10px' }}>
             Queue
           </div>
           {queue.map((item, i) => (

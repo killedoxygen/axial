@@ -177,7 +177,7 @@ function PlayerIdentityEditor({
       <div style={{ flex: 1, minWidth: 240 }}>
         <div style={{
           fontSize: 11, fontWeight: 600, color: theme.n.textMute,
-          textTransform: 'uppercase', letterSpacing: 0.8, marginBottom: 6,
+          textTransform: 'uppercase', letterSpacing: 0, marginBottom: 6,
         }}>{playerNameLabel}</div>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
           <Input
@@ -234,7 +234,7 @@ function ProfileMetaValue({ label, value }: { label: string; value: string }): J
         fontWeight: 700,
         color: theme.n.textMute,
         textTransform: 'uppercase',
-        letterSpacing: 0.7,
+        letterSpacing: 0,
       }}>{label}</div>
       <div style={{
         color: theme.n.textDim,
@@ -952,7 +952,7 @@ function AuthModeControl({
             fontWeight: 700,
             color: theme.n.textMute,
             textTransform: 'uppercase',
-            letterSpacing: 0.7,
+            letterSpacing: 0,
           }}>Launch auth mode</div>
           <div style={{ color: theme.n.textDim, fontSize: 12, lineHeight: 1.4 }}>
             Choose the identity Croopor should use when launching Minecraft.
@@ -1160,7 +1160,7 @@ function DeviceCodePanel({
             fontWeight: 700,
             color: theme.n.textMute,
             textTransform: 'uppercase',
-            letterSpacing: 0.7,
+            letterSpacing: 0,
           }}>Microsoft code</div>
           <div style={{
             color: theme.n.text,
@@ -1712,7 +1712,7 @@ function SkinRestorerHelper({ savedUsername }: { savedUsername: string }): JSX.E
               fontWeight: 600,
               color: theme.n.textMute,
               textTransform: 'uppercase',
-              letterSpacing: 0.8,
+              letterSpacing: 0,
             }}>Skin username</span>
             <Input
               value={skinUsername}
@@ -1731,7 +1731,7 @@ function SkinRestorerHelper({ savedUsername }: { savedUsername: string }): JSX.E
               fontWeight: 600,
               color: theme.n.textMute,
               textTransform: 'uppercase',
-              letterSpacing: 0.8,
+              letterSpacing: 0,
             }}>Command</div>
             <div
               aria-label="SkinRestorer command"

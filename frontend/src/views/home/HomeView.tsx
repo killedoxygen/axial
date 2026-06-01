@@ -172,16 +172,16 @@ export function HomeView(): JSX.Element {
         <SectionHeading title="At a glance" />
         <div class="cp-grid-3">
           <Card>
-            <div style={{ fontSize: 11, fontWeight: 600, color: theme.n.textMute, letterSpacing: 0.6, textTransform: 'uppercase' }}>Instances</div>
-            <div style={{ fontSize: 32, fontWeight: 600, marginTop: 6, letterSpacing: -0.6 }}>{all.length}</div>
+            <div style={{ fontSize: 11, fontWeight: 600, color: theme.n.textMute, letterSpacing: 0, textTransform: 'uppercase' }}>Instances</div>
+            <div style={{ fontSize: 32, fontWeight: 600, marginTop: 6, letterSpacing: 0 }}>{all.length}</div>
           </Card>
           <Card>
-            <div style={{ fontSize: 11, fontWeight: 600, color: theme.n.textMute, letterSpacing: 0.6, textTransform: 'uppercase' }}>Mods installed</div>
-            <div style={{ fontSize: 32, fontWeight: 600, marginTop: 6, letterSpacing: -0.6 }}>{totalMods}</div>
+            <div style={{ fontSize: 11, fontWeight: 600, color: theme.n.textMute, letterSpacing: 0, textTransform: 'uppercase' }}>Mods installed</div>
+            <div style={{ fontSize: 32, fontWeight: 600, marginTop: 6, letterSpacing: 0 }}>{totalMods}</div>
           </Card>
           <Card>
-            <div style={{ fontSize: 11, fontWeight: 600, color: theme.n.textMute, letterSpacing: 0.6, textTransform: 'uppercase' }}>World saves</div>
-            <div style={{ fontSize: 32, fontWeight: 600, marginTop: 6, letterSpacing: -0.6 }}>{totalSaves}</div>
+            <div style={{ fontSize: 11, fontWeight: 600, color: theme.n.textMute, letterSpacing: 0, textTransform: 'uppercase' }}>World saves</div>
+            <div style={{ fontSize: 32, fontWeight: 600, marginTop: 6, letterSpacing: 0 }}>{totalSaves}</div>
           </Card>
         </div>
       </div>
