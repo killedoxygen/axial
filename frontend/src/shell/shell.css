@@ -253,10 +253,6 @@
 .cp-sidebar-instance-art {
   width: 28px;
   height: 28px;
-  box-shadow: 0 0 0 1px color-mix(in oklab, var(--line) 82%, transparent);
-}
-.cp-sidebar-item[data-active="true"] .cp-sidebar-instance-art {
-  box-shadow: 0 0 0 1px color-mix(in oklab, var(--accent) 70%, transparent);
 }
 
 .cp-sidebar-spacer { flex: 1; }
