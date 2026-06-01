@@ -30,6 +30,7 @@ const SAVE_SKIN_FROM_USERNAME_REQUEST_MAX_BYTES: usize = 4 * 1024;
 const MOJANG_PROFILE_RESPONSE_MAX_BYTES: usize = 16 * 1024;
 const MINECRAFT_SESSION_PROFILE_RESPONSE_MAX_BYTES: usize = 64 * 1024;
 const MINECRAFT_SESSION_TEXTURES_PROPERTY_MAX_BYTES: usize = 16 * 1024;
+const MINECRAFT_SKIN_UPLOAD_RESPONSE_MAX_BYTES: usize = 64 * 1024;
 const MINECRAFT_SKIN_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MINECRAFT_SKIN_HTTP_TIMEOUT: Duration = Duration::from_secs(25);
 const SKIN_WIDTH: u32 = 64;
@@ -1049,10 +1050,7 @@ impl MinecraftSkinUploadClient {
             return Err(SkinUploadError::Unavailable);
         }
 
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|_| SkinUploadError::Unavailable)?;
+        let bytes = read_skin_upload_response(response).await?;
         if bytes.iter().all(|byte| byte.is_ascii_whitespace()) {
             return Ok(None);
         }
@@ -1062,6 +1060,31 @@ impl MinecraftSkinUploadClient {
             .map(AuthLoginMinecraftProfile::from);
         Ok(profile)
     }
+}
+
+async fn read_skin_upload_response(
+    mut response: reqwest::Response,
+) -> Result<Vec<u8>, SkinUploadError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MINECRAFT_SKIN_UPLOAD_RESPONSE_MAX_BYTES as u64)
+    {
+        return Err(SkinUploadError::TooLarge);
+    }
+
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| SkinUploadError::Unavailable)?
+    {
+        if bytes.len().saturating_add(chunk.len()) > MINECRAFT_SKIN_UPLOAD_RESPONSE_MAX_BYTES {
+            return Err(SkinUploadError::TooLarge);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+
+    Ok(bytes)
 }
 
 fn minecraft_skin_http_client() -> reqwest::Client {
@@ -1083,6 +1106,7 @@ enum SkinUploadError {
     Auth,
     RateLimited,
     Rejected,
+    TooLarge,
     Unavailable,
 }
 
@@ -1458,6 +1482,11 @@ fn skin_upload_error(error: SkinUploadError) -> ApiError {
             StatusCode::BAD_REQUEST,
             "Minecraft rejected the saved skin",
             "minecraft_skin_rejected",
+        ),
+        SkinUploadError::TooLarge => json_status_error(
+            StatusCode::BAD_GATEWAY,
+            "Minecraft skin upload response is too large",
+            "minecraft_skin_response_too_large",
         ),
         SkinUploadError::Unavailable => json_status_error(
             StatusCode::BAD_GATEWAY,
@@ -3025,6 +3054,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn skin_apply_oversized_success_response_is_bounded() {
+        let fixture = TestFixture::new("apply-oversized-success-response", "ConfigUser");
+        fixture
+            .add_minecraft_account(test_profile("MinecraftName", Vec::new()))
+            .await;
+        let saved = fixture
+            .save_skin(
+                "Oversized Response",
+                None,
+                test_skin_png(SKIN_WIDTH, SKIN_HEIGHT),
+            )
+            .await
+            .expect("save skin")
+            .0;
+        let (endpoint, mut requests) =
+            skin_apply_route_test_server(SkinApplyServerMode::OversizedSuccess).await;
+
+        let error = fixture
+            .apply_saved_skin_with_endpoint(&saved.texture_key, &endpoint)
+            .await
+            .expect_err("oversized upload response should fail");
+        let _ = requests.recv().await.expect("skin upload request");
+        let listed = fixture.saved_skins().await.expect("saved skins").0;
+        let saved_after = listed
+            .skins
+            .iter()
+            .find(|skin| skin.texture_key == saved.texture_key)
+            .expect("saved skin listed");
+
+        assert_eq!(error.0, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            error.1.0,
+            serde_json::json!({
+                "error": "Minecraft skin upload response is too large",
+                "status": "minecraft_skin_response_too_large",
+            })
+        );
+        assert_eq!(saved_after.applied_at, None);
+    }
+
+    #[tokio::test]
     async fn skin_apply_upstream_429_maps_to_bounded_rate_limit() {
         let fixture = TestFixture::new("apply-upstream-rate-limit", "ConfigUser");
         fixture
@@ -3448,6 +3518,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum SkinApplyServerMode {
         Success,
+        OversizedSuccess,
         RateLimited,
         Rejected,
     }
@@ -3538,6 +3609,12 @@ mod tests {
                         "variant": "SLIM"
                     }],
                     "capes": []
+                })),
+            ),
+            SkinApplyServerMode::OversizedSuccess => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "payload": "x".repeat(MINECRAFT_SKIN_UPLOAD_RESPONSE_MAX_BYTES + 1),
                 })),
             ),
             SkinApplyServerMode::RateLimited => (
