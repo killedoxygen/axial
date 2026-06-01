@@ -82,21 +82,22 @@ flowchart TD
     G --> H[emit status: validating]
     H --> I[core/launcher service prepares attempt]
     I --> J[resolve version metadata]
-    J --> K[collect runtime facts and effective runtime candidate]
-    K --> L[Guardian-driven pre-launch decision]
-    L -->|block| M[return HTTP error with guardian + healing]
-    L -->|intervene| N[mutate attempt overrides and re-run prepare]
-    L -->|allow| O[plan launch command]
-    N --> I
-    O --> P[spawn process via SessionStore]
-    P --> Q[emit starting + monitoring status]
-    Q --> R[wait_for_startup observation window]
-    R -->|stable or timed out| S[return HTTP success with pid + guardian + healing]
-    R -->|stalled or exited| T[collect failure observations]
-    T --> U[Guardian decides whether startup recovery or a blocked startup summary is allowed]
-    U -->|recover| V[apply one startup recovery plan and retry]
-    U -->|block| W[emit terminal failure + guardian guidance]
-    V --> I
+    J --> K[emit runtime ensure/download statuses while runtime work runs]
+    K --> L[collect runtime facts and effective runtime candidate]
+    L --> M[Guardian-driven pre-launch decision]
+    M -->|block| N[return HTTP error with guardian + healing]
+    M -->|intervene| O[mutate attempt overrides and re-run prepare]
+    M -->|allow| P[plan launch command]
+    O --> I
+    P --> Q[spawn process via SessionStore]
+    Q --> R[emit starting + monitoring status]
+    R --> S[wait_for_startup observation window]
+    S -->|stable or timed out| T[return HTTP success with pid + guardian + healing]
+    S -->|stalled or exited| U[collect failure observations]
+    U --> V[Guardian decides whether startup recovery or a blocked startup summary is allowed]
+    V -->|recover| W[apply one startup recovery plan and retry]
+    V -->|block| X[emit terminal failure + guardian guidance]
+    W --> I
 ```
 
 ### Launch pipeline: backend detail
@@ -104,24 +105,29 @@ flowchart TD
 flowchart TD
     A[LaunchIntent] --> B[prepare_launch_attempt]
     B --> C[resolve_version]
-    C --> D[runtime fact gathering]
-    D --> E[manual override fact gathering]
-    E --> F[Guardian evaluates facts]
-    F -->|allow| G[compute effective preset + JVM args]
-    F -->|switch runtime| H[set force_managed_runtime]
-    F -->|strip raw JVM args| I[set ignore_extra_jvm_args]
-    F -->|downgrade preset| J[set preset_override]
-    F -->|disable custom GC| K[set disable_custom_gc]
-    F -->|block| L[LaunchPreparationError + Guardian guidance]
-    H --> B
-    I --> B
+    C --> D[emit ensuring_runtime]
+    D --> E[runtime fact gathering]
+    E -->|managed runtime install needed| F[emit downloading_runtime before install]
+    E --> G[manual override fact gathering]
+    F --> G
+    G --> H[Guardian evaluates facts]
+    H -->|allow| I[compute effective preset + JVM args]
+    H -->|switch runtime| J[set force_managed_runtime]
+    H -->|strip raw JVM args| K[set ignore_extra_jvm_args]
+    H -->|downgrade preset| L[set preset_override]
+    H -->|disable custom GC| M[set disable_custom_gc]
+    H -->|block| N[LaunchPreparationError + Guardian guidance]
     J --> B
     K --> B
-    G --> M[plan_resolved_launch]
-    M --> N[PreparedLaunchAttempt]
+    L --> B
+    M --> B
+    I --> O[plan_resolved_launch]
+    O --> P[PreparedLaunchAttempt]
 ```
 
 Effective launch memory selection is backend-owned at launch request time. Per-instance memory values remain the highest-precedence explicit selection, explicit launch request memory remains next, and customized global config memory remains the global default. Fresh instances whose global config still has the built-in memory pair use launch-time host total RAM and the current version target to derive defaults before the Guardian/resource-budget snapshot is recorded: legacy vanilla targets use a smaller allocation, modern vanilla targets use the standard allocation, and loader/modded targets use a larger allocation, all bounded by the launcher OS-headroom policy when host memory evidence is available. Successful launch responses include the effective `max_memory_mb` and `min_memory_mb` selected by backend preparation so the frontend can record the running session allocation without recomputing memory policy locally.
+
+Launch preparation emits live status observations while runtime resolution is running: `ensuring_runtime` after version resolution and before runtime selection begins, and `downloading_runtime` immediately before the task that owns a missing managed Java runtime install enters the install path. These are status events on the existing session stream, not a new frontend workflow or per-file runtime download progress channel. A concurrent launch waiting on the same runtime install lock can remain at `ensuring_runtime` until the owning install completes.
 
 When Guardian blocks a launch before a process is available, the launch, benchmark launch, and benchmark suite launch routes return HTTP `422 Unprocessable Entity` with the normal bounded launch-error JSON (`error`, optional `healing`, optional `guardian`). This keeps a deliberate Guardian safety block distinct from an internal API failure, while non-Guardian launch request failures remain HTTP `500` unless a more specific route-level status applies.
 

@@ -48,10 +48,11 @@ pub use rules::{
     is_native_library, native_classifier_key,
 };
 pub use runtime::{
-    RuntimeEnsureAction, RuntimeEnsureResult, RuntimeId, RuntimeInstallState, RuntimeOverride,
-    RuntimeRecord, RuntimeRequirement, RuntimeSource, ensure_runtime, list_runtime_records,
-    parse_runtime_override, runtime_component_ready_without_probe,
-    runtime_executable_ready_without_probe, runtime_requirement,
+    RuntimeEnsureAction, RuntimeEnsureEvent, RuntimeEnsureResult, RuntimeId, RuntimeInstallState,
+    RuntimeOverride, RuntimeRecord, RuntimeRequirement, RuntimeSource, ensure_runtime,
+    ensure_runtime_with_events, list_runtime_records, parse_runtime_override,
+    runtime_component_ready_without_probe, runtime_executable_ready_without_probe,
+    runtime_requirement,
 };
 pub use types::{VersionEntry, VersionLoaderAttachment, VersionSubjectKind};
 pub use version::scan_versions;

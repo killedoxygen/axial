@@ -7,13 +7,32 @@ use crate::guardian::resolve_launch_preset;
 use crate::jvm::{boot_throttle_args, gc_preset_args};
 use crate::runtime::RuntimeSelection;
 use crate::types::LaunchFailureClass;
-use croopor_minecraft::{JavaRuntimeInfo, JavaVersion, ensure_runtime, resolve_version};
+use croopor_minecraft::{
+    JavaRuntimeInfo, JavaVersion, RuntimeEnsureEvent, ensure_runtime_with_events, resolve_version,
+};
 use std::time::Instant;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchPreparationEvent {
+    EnsuringRuntime,
+    DownloadingRuntime,
+}
 
 pub async fn prepare_launch_attempt(
     intent: &LaunchIntent,
     attempt: &AttemptOverrides,
 ) -> Result<PreparedLaunchAttempt, LaunchPreparationError> {
+    prepare_launch_attempt_with_events(intent, attempt, |_| {}).await
+}
+
+pub async fn prepare_launch_attempt_with_events<F>(
+    intent: &LaunchIntent,
+    attempt: &AttemptOverrides,
+    mut observer: F,
+) -> Result<PreparedLaunchAttempt, LaunchPreparationError>
+where
+    F: FnMut(LaunchPreparationEvent),
+{
     let started_at = Instant::now();
     let version_started_at = Instant::now();
     let version = resolve_version(&intent.library_dir, &intent.version_id).map_err(|error| {
@@ -27,11 +46,13 @@ pub async fn prepare_launch_attempt(
     let auth_mode = launch_auth_mode_for_context(intent);
 
     let runtime_started_at = Instant::now();
-    let ensured_runtime = ensure_runtime(
+    observer(LaunchPreparationEvent::EnsuringRuntime);
+    let ensured_runtime = ensure_runtime_with_events(
         &intent.library_dir,
         &version.java_version,
         &intent.requested_java,
         attempt.force_managed_runtime,
+        |event| observer(launch_preparation_event_for_runtime_event(event)),
     )
     .await
     .map_err(|error| LaunchPreparationError {
@@ -221,6 +242,14 @@ pub async fn prepare_launch_attempt(
             total_ms: started_at.elapsed().as_millis(),
         },
     })
+}
+
+fn launch_preparation_event_for_runtime_event(event: RuntimeEnsureEvent) -> LaunchPreparationEvent {
+    match event {
+        RuntimeEnsureEvent::DownloadingManagedRuntime { .. } => {
+            LaunchPreparationEvent::DownloadingRuntime
+        }
+    }
 }
 
 fn uses_low_impact_startup(performance_mode: &str) -> bool {
@@ -655,6 +684,86 @@ mod tests {
         assert_arg_value(&prepared.plan.game_args, "--userType", "msa");
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn prepare_launch_attempt_with_events_observes_runtime_resolution() {
+        let root = unique_temp_root("croopor-prepare-runtime-event-test");
+        let library_dir = root.join("library");
+        let game_dir = root.join("instances").join("runtime-event-test");
+        let fake_java = write_fake_java(&root);
+        let version_id = "runtime-event-test";
+        let version_dir = library_dir.join("versions").join(version_id);
+        fs::create_dir_all(&version_dir).expect("version dir");
+        fs::create_dir_all(&game_dir).expect("game dir");
+        fs::write(version_dir.join(format!("{version_id}.jar")), b"client jar")
+            .expect("client jar");
+        write_version_json(
+            &version_dir.join(format!("{version_id}.json")),
+            serde_json::json!({
+                "id": version_id,
+                "type": "release",
+                "mainClass": "net.minecraft.client.main.Main",
+                "javaVersion": {
+                    "component": "java-runtime-delta",
+                    "majorVersion": 21
+                },
+                "assetIndex": { "id": "runtime-event-assets" },
+                "arguments": {
+                    "jvm": [],
+                    "game": []
+                },
+                "libraries": []
+            }),
+        );
+
+        let intent = LaunchIntent {
+            session_id: "prepare-runtime-event-test".to_string(),
+            library_dir,
+            instance_id: "runtime-event-test".to_string(),
+            version_id: version_id.to_string(),
+            username: "Player".to_string(),
+            auth: LaunchAuthContext::offline("Player"),
+            requested_java: fake_java.to_string_lossy().to_string(),
+            requested_preset: String::new(),
+            extra_jvm_args: Vec::new(),
+            max_memory_mb: 2048,
+            min_memory_mb: 512,
+            resolution: None,
+            launcher_name: "croopor".to_string(),
+            launcher_version: "test".to_string(),
+            game_dir: Some(game_dir),
+            guardian: LaunchGuardianContext {
+                mode: GuardianMode::Managed,
+                ..LaunchGuardianContext::default()
+            },
+            performance_mode: "managed".to_string(),
+        };
+        let mut events = Vec::new();
+
+        let prepared =
+            prepare_launch_attempt_with_events(&intent, &AttemptOverrides::default(), |event| {
+                events.push(event);
+            })
+            .await
+            .expect("prepared launch");
+
+        assert_eq!(prepared.runtime.effective_source, "override");
+        assert_eq!(events, vec![LaunchPreparationEvent::EnsuringRuntime]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_download_event_maps_to_launch_preparation_download() {
+        assert_eq!(
+            launch_preparation_event_for_runtime_event(
+                RuntimeEnsureEvent::DownloadingManagedRuntime {
+                    component: "java-runtime-delta".to_string(),
+                },
+            ),
+            LaunchPreparationEvent::DownloadingRuntime
+        );
     }
 
     #[derive(Clone, Copy)]

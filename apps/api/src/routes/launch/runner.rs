@@ -3,11 +3,11 @@ use crate::state::launch_reports::{LaunchProofContext, LaunchProofResourceBudget
 use crate::state::{AppState, LaunchStatusEvent, StartupOutcome};
 use croopor_config::{AppConfig, Instance};
 use croopor_launcher::{
-    GuardianInterventionKind, GuardianSummary, LaunchFailureClass, LaunchState, PreLaunchAction,
-    PreLaunchDecision, RecoveryAction, StartupFailureDecision, StartupFailureObservation,
-    build_healing_summary, decide_prepare_failure, decide_startup_failure, failure_class_name,
-    guidance_for_failure, launch_state_name, prepare_launch_attempt,
-    recovery_plan_for_startup_failure,
+    GuardianInterventionKind, GuardianSummary, LaunchFailureClass, LaunchPreparationEvent,
+    LaunchState, PreLaunchAction, PreLaunchDecision, RecoveryAction, StartupFailureDecision,
+    StartupFailureObservation, build_healing_summary, decide_prepare_failure,
+    decide_startup_failure, failure_class_name, guidance_for_failure, launch_state_name,
+    prepare_launch_attempt_with_events, recovery_plan_for_startup_failure,
 };
 use serde_json::Value;
 use std::collections::HashSet;
@@ -88,7 +88,34 @@ pub(super) async fn launch_session(
             )
             .await;
 
-        let prepared = match prepare_launch_attempt(&intent, &attempt).await {
+        let (preparation_event_tx, mut preparation_event_rx) =
+            tokio::sync::mpsc::unbounded_channel();
+        let preparation_event_sender = preparation_event_tx.clone();
+        let preparation_status_state = state.clone();
+        let preparation_status_session_id = session_id.clone();
+        let preparation_status_guardian = guardian.clone();
+        let preparation_status_task = tokio::spawn(async move {
+            while let Some(event) = preparation_event_rx.recv().await {
+                emit_status(
+                    &preparation_status_state,
+                    &preparation_status_session_id,
+                    launch_state_for_preparation_event(event),
+                    None,
+                    None,
+                    None,
+                    Some(preparation_status_guardian.clone()),
+                )
+                .await;
+            }
+        });
+        let prepared_result = prepare_launch_attempt_with_events(&intent, &attempt, move |event| {
+            let _ = preparation_event_sender.send(event);
+        })
+        .await;
+        drop(preparation_event_tx);
+        let _ = preparation_status_task.await;
+
+        let prepared = match prepared_result {
             Ok(prepared) => prepared,
             Err(error) => {
                 trace_launch_event(&session_id, &format!("prepare failed: {}", error.message));
@@ -202,19 +229,6 @@ pub(super) async fn launch_session(
                 ),
             )
             .await;
-
-        if prepared.runtime.effective_source == "managed" {
-            emit_status(
-                &state,
-                &session_id,
-                LaunchState::EnsuringRuntime,
-                None,
-                None,
-                prepared.healing.clone(),
-                Some(guardian.clone()),
-            )
-            .await;
-        }
 
         emit_status(
             &state,
@@ -911,6 +925,13 @@ fn bound_live_launch_failure_message(message: &str) -> String {
     }
 }
 
+fn launch_state_for_preparation_event(event: LaunchPreparationEvent) -> LaunchState {
+    match event {
+        LaunchPreparationEvent::EnsuringRuntime => LaunchState::EnsuringRuntime,
+        LaunchPreparationEvent::DownloadingRuntime => LaunchState::DownloadingRuntime,
+    }
+}
+
 async fn emit_status(
     state: &AppState,
     session_id: &str,
@@ -1238,6 +1259,18 @@ mod tests {
 
         assert_eq!(sanitized, message);
         assert_safe_live_launch_failure_text(&sanitized);
+    }
+
+    #[test]
+    fn preparation_events_map_to_existing_launch_states() {
+        assert_eq!(
+            launch_state_for_preparation_event(LaunchPreparationEvent::EnsuringRuntime),
+            LaunchState::EnsuringRuntime
+        );
+        assert_eq!(
+            launch_state_for_preparation_event(LaunchPreparationEvent::DownloadingRuntime),
+            LaunchState::DownloadingRuntime
+        );
     }
 
     #[test]

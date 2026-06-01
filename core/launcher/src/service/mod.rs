@@ -17,7 +17,10 @@ pub use mapping::{
     failure_class_name, format_failure_class, is_terminal_state, is_terminal_status,
     launch_stage_label, launch_state_name, snapshot_status,
 };
-pub use prepare::{prepare_launch_attempt, sanitize_effective_runtime_major};
+pub use prepare::{
+    LaunchPreparationEvent, prepare_launch_attempt, prepare_launch_attempt_with_events,
+    sanitize_effective_runtime_major,
+};
 
 #[derive(Debug, Clone)]
 pub struct LaunchIntent {

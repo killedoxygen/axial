@@ -126,6 +126,11 @@ pub struct RuntimeEnsureResult {
     pub action: RuntimeEnsureAction,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeEnsureEvent {
+    DownloadingManagedRuntime { component: String },
+}
+
 #[derive(Debug, Error)]
 pub enum JavaRuntimeLookupError {
     #[error("java runtime not found: {component} (Java {major}) not installed")]
@@ -244,6 +249,26 @@ pub async fn ensure_runtime(
     override_path: &str,
     force_managed: bool,
 ) -> Result<RuntimeEnsureResult, JavaRuntimeLookupError> {
+    ensure_runtime_with_events(
+        library_dir,
+        java_version,
+        override_path,
+        force_managed,
+        |_| {},
+    )
+    .await
+}
+
+pub async fn ensure_runtime_with_events<F>(
+    library_dir: &Path,
+    java_version: &JavaVersion,
+    override_path: &str,
+    force_managed: bool,
+    mut observer: F,
+) -> Result<RuntimeEnsureResult, JavaRuntimeLookupError>
+where
+    F: FnMut(RuntimeEnsureEvent),
+{
     let requirement = runtime_requirement(java_version);
     let requested_override = parse_runtime_override(override_path);
 
@@ -274,7 +299,8 @@ pub async fn ensure_runtime(
         });
     }
 
-    let managed = ensure_managed_runtime(library_dir, &requirement).await?;
+    let managed =
+        ensure_managed_runtime_with_events(library_dir, &requirement, &mut observer).await?;
 
     Ok(RuntimeEnsureResult {
         requested,
@@ -412,10 +438,14 @@ struct ManagedEnsure {
     install_performed: bool,
 }
 
-async fn ensure_managed_runtime(
+async fn ensure_managed_runtime_with_events<F>(
     library_dir: &Path,
     requirement: &RuntimeRequirement,
-) -> Result<ManagedEnsure, JavaRuntimeLookupError> {
+    observer: &mut F,
+) -> Result<ManagedEnsure, JavaRuntimeLookupError>
+where
+    F: FnMut(RuntimeEnsureEvent),
+{
     let preferred = &requirement.preferred_component;
     if let Ok(runtime) = resolve_managed_runtime(library_dir, preferred) {
         return Ok(ManagedEnsure {
@@ -435,6 +465,9 @@ async fn ensure_managed_runtime(
         });
     }
 
+    observer(RuntimeEnsureEvent::DownloadingManagedRuntime {
+        component: preferred.as_str().to_string(),
+    });
     install_managed_runtime(preferred, &install_root).await?;
     let runtime = resolve_component_runtime(
         library_dir,
