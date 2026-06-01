@@ -1,6 +1,5 @@
 import { signal } from '@preact/signals';
 import { api, apiUrl } from './api';
-import { byId } from './dom';
 
 const DEFAULT_TRACK_COUNT = 2;
 let trackCount = DEFAULT_TRACK_COUNT;
@@ -190,30 +189,8 @@ export const Music = {
 
   // -- UI sync --
 
-  /** Update header icon, equalizer, and settings form to reflect current state. */
+  /** Notify Preact music controls that state changed. */
   syncUI(): void {
-    const btn = byId<HTMLElement>('music-btn');
-    if (btn) {
-      btn.classList.toggle('active', this.enabled);
-      btn.title = this.enabled ? (suppressed ? 'Music (paused for game)' : 'Music on') : 'Music off';
-      const iconOn = btn.querySelector('.music-icon-on') as HTMLElement | null;
-      const iconOff = btn.querySelector('.music-icon-off') as HTMLElement | null;
-      if (iconOn) iconOn.style.display = this.enabled ? '' : 'none';
-      if (iconOff) iconOff.style.display = this.enabled ? 'none' : '';
-    }
-    // Equalizer: visible only when actually producing audible output
-    const audible = this.enabled && this.playing && !suppressed;
-    byId<HTMLElement>('music-eq')?.classList.toggle('cp-hidden', !audible);
-
-    // Settings form (if open)
-    const musicToggle = byId<HTMLInputElement>('music-toggle');
-    const musicVolumeSlider = byId<HTMLInputElement>('music-volume-slider');
-    const musicVolumeValue = byId<HTMLElement>('music-volume-value');
-    const musicVolumeRow = byId<HTMLElement>('music-volume-row');
-    if (musicToggle) musicToggle.checked = this.enabled;
-    if (musicVolumeSlider) musicVolumeSlider.value = String(this.volume);
-    if (musicVolumeValue) musicVolumeValue.textContent = `${this.volume}%`;
-    if (musicVolumeRow) musicVolumeRow.style.display = this.enabled ? '' : 'none';
     notifyMusicState();
   },
 };

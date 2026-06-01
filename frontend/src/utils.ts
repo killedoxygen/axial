@@ -132,12 +132,6 @@ export function errMessage(err: unknown): string {
   return 'Unknown error';
 }
 
-export function esc(s: string): string {
-  const d = document.createElement('div');
-  d.textContent = s;
-  return d.innerHTML;
-}
-
 interface VersionDisplay {
   name: string;
   hint: string | null;
