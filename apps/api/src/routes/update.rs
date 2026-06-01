@@ -1,5 +1,6 @@
 use crate::state::AppState;
 use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
+use futures_util::StreamExt;
 use reqwest::header::{ACCEPT, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -15,6 +16,7 @@ const GITHUB_RELEASE_DOWNLOAD_PREFIX: &str =
 const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 const UPDATE_CHECK_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const UPDATE_CHECK_UNAVAILABLE_MESSAGE: &str = "update check unavailable";
+const MAX_UPDATE_RELEASE_BYTES: u64 = 512 << 10;
 
 type ApiErrorResponse = (StatusCode, Json<serde_json::Value>);
 
@@ -66,16 +68,62 @@ async fn handle_update(
 
 async fn fetch_latest_release(
     current_version: &str,
-) -> Result<GithubLatestRelease, reqwest::Error> {
-    update_http_client()
-        .get(GITHUB_LATEST_RELEASE_URL)
+) -> Result<GithubLatestRelease, UpdateFetchError> {
+    fetch_latest_release_from_url(GITHUB_LATEST_RELEASE_URL, current_version).await
+}
+
+async fn fetch_latest_release_from_url(
+    url: &str,
+    current_version: &str,
+) -> Result<GithubLatestRelease, UpdateFetchError> {
+    let response = update_http_client()
+        .get(url)
         .header(USER_AGENT, format!("Croopor/{current_version}"))
         .header(ACCEPT, "application/vnd.github+json")
         .send()
-        .await?
-        .error_for_status()?
-        .json::<GithubLatestRelease>()
         .await
+        .map_err(UpdateFetchError::Request)?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(UpdateFetchError::HttpStatus(status));
+    }
+    if response
+        .content_length()
+        .is_some_and(|content_length| content_length > MAX_UPDATE_RELEASE_BYTES)
+    {
+        return Err(UpdateFetchError::TooLarge);
+    }
+
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(UpdateFetchError::Request)?;
+        if body.len() as u64 + chunk.len() as u64 > MAX_UPDATE_RELEASE_BYTES {
+            return Err(UpdateFetchError::TooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    serde_json::from_slice::<GithubLatestRelease>(&body).map_err(UpdateFetchError::Json)
+}
+
+#[derive(Debug)]
+enum UpdateFetchError {
+    Request(reqwest::Error),
+    HttpStatus(StatusCode),
+    Json(serde_json::Error),
+    TooLarge,
+}
+
+impl std::fmt::Display for UpdateFetchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Request(error) => write!(formatter, "request failed: {error}"),
+            Self::HttpStatus(status) => write!(formatter, "HTTP {status}"),
+            Self::Json(error) => write!(formatter, "parse failed: {error}"),
+            Self::TooLarge => write!(formatter, "response too large"),
+        }
+    }
 }
 
 fn update_http_client() -> reqwest::Client {
@@ -300,6 +348,8 @@ fn timestamp_utc() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     fn release_asset(name: &str, browser_download_url: &str) -> GithubReleaseAsset {
         GithubReleaseAsset {
@@ -398,6 +448,51 @@ mod tests {
             error.1.0,
             serde_json::json!({ "error": UPDATE_CHECK_UNAVAILABLE_MESSAGE })
         );
+    }
+
+    #[tokio::test]
+    async fn update_fetch_reads_bounded_release_json() {
+        let url =
+            serve_update_release_json(200, sample_release_json("v1.2.4").into_bytes(), None).await;
+
+        let release = fetch_latest_release_from_url(&url, "1.2.3")
+            .await
+            .expect("release json");
+
+        assert_eq!(release.tag_name, "v1.2.4");
+        assert_eq!(
+            release.html_url,
+            "https://github.com/mateoltd/croopor/releases/tag/v1.2.4"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_fetch_rejects_http_errors() {
+        let url = serve_update_release_json(503, b"unavailable".to_vec(), None).await;
+
+        let error = fetch_latest_release_from_url(&url, "1.2.3")
+            .await
+            .expect_err("HTTP error should fail");
+
+        match error {
+            UpdateFetchError::HttpStatus(status) => {
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE)
+            }
+            error => panic!("expected HTTP status error, got {error:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn update_fetch_rejects_oversized_content_length() {
+        let url =
+            serve_update_release_json(200, b"{}".to_vec(), Some(MAX_UPDATE_RELEASE_BYTES + 1))
+                .await;
+
+        let error = fetch_latest_release_from_url(&url, "1.2.3")
+            .await
+            .expect_err("oversized release response should fail");
+
+        assert!(matches!(error, UpdateFetchError::TooLarge));
     }
 
     #[test]
@@ -589,5 +684,45 @@ mod tests {
         assert!(!response.available);
         assert_eq!(response.latest_version, "1.2.3");
         assert_eq!(response.kind, "none");
+    }
+
+    async fn serve_update_release_json(
+        status: u16,
+        body: Vec<u8>,
+        content_length: Option<u64>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind update test server");
+        let address = listener.local_addr().expect("update test server address");
+        let content_length = content_length.unwrap_or(body.len() as u64);
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept update request");
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await;
+            let reason = if status == 200 { "OK" } else { "Error" };
+            let headers = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
+            );
+            socket
+                .write_all(headers.as_bytes())
+                .await
+                .expect("write update response headers");
+            socket
+                .write_all(&body)
+                .await
+                .expect("write update response body");
+        });
+        format!("http://{address}/latest")
+    }
+
+    fn sample_release_json(tag: &str) -> String {
+        format!(
+            r#"{{
+                "tag_name": "{tag}",
+                "html_url": "https://github.com/mateoltd/croopor/releases/tag/{tag}",
+                "assets": []
+            }}"#
+        )
     }
 }
