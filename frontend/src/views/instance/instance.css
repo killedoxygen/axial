@@ -680,14 +680,10 @@
     margin-bottom: 10px;
   }
   .cp-instance-body--overview-bento .cp-od-perf-summary {
-    margin-bottom: 10px;
+    margin-bottom: 0;
   }
   .cp-instance-body--overview-bento .cp-od-perf-row {
     margin-bottom: 0;
-  }
-  .cp-instance-body--overview-bento .cp-od-perf-runtime {
-    margin-top: 10px;
-    padding-top: 9px;
   }
   .cp-instance-body--overview-bento .cp-od-kv-row {
     padding: 6px 0;
@@ -920,20 +916,26 @@
 }
 
 /* ─── Performance — read-only plan, memory, and runtime evidence. ───── */
+.cp-od-perf-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(246px, 0.86fr);
+  align-items: start;
+  gap: 18px;
+}
 .cp-od-perf-summary {
   display: grid;
-  grid-template-columns: 22px minmax(0, 1fr);
-  align-items: center;
+  grid-template-columns: 20px minmax(0, 1fr);
+  align-items: start;
   gap: 10px;
-  margin-bottom: 12px;
+  margin-bottom: 0;
   color: var(--text-dim);
 }
 .cp-od-perf-summary-mark {
   display: grid;
   place-items: center;
-  flex: 0 0 22px;
-  width: 22px;
-  height: 22px;
+  flex: 0 0 20px;
+  width: 20px;
+  height: 20px;
   box-sizing: border-box;
   color: var(--text-mute);
   line-height: 0;
@@ -960,8 +962,9 @@
 .cp-od-perf-summary-copy strong {
   color: var(--text);
   font-size: 12.5px;
-  font-weight: 700;
+  font-weight: 620;
   letter-spacing: 0;
+  line-height: 1.25;
 }
 .cp-od-perf-summary-copy span {
   margin-top: 2px;
@@ -969,15 +972,16 @@
   line-height: 1.35;
 }
 .cp-od-perf-facts {
-  display: grid;
-  gap: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
 }
 .cp-od-perf-row {
-  display: flex;
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
   align-items: center;
-  justify-content: space-between;
   gap: 12px;
-  padding: 7px 0;
+  padding: 6px 0;
 }
 .cp-od-perf-row + .cp-od-perf-row {
   border-top: 1px solid oklch(1 0 0 / 0.04);
@@ -986,24 +990,25 @@
   font-size: 12px;
   color: var(--text-mute);
   letter-spacing: 0;
+  white-space: nowrap;
 }
 .cp-od-perf-val {
+  min-width: 0;
   font-size: 12.5px;
   font-weight: 500;
   color: var(--text);
   font-variant-numeric: tabular-nums;
   letter-spacing: 0;
   text-align: right;
+  overflow-wrap: anywhere;
 }
 
-.cp-od-perf-runtime {
-  display: flex;
+.cp-od-perf-runtime-val {
+  display: inline-flex;
   align-items: center;
+  justify-content: flex-end;
   gap: 10px;
-  margin-top: 12px;
-  padding-top: 10px;
-  border-top: 1px solid oklch(1 0 0 / 0.04);
-  font-size: 12.5px;
+  justify-self: end;
 }
 .cp-od-perf-runtime-mark {
   display: inline-flex;
@@ -1016,15 +1021,13 @@
   color: var(--text-mute);
   flex-shrink: 0;
 }
-.cp-od-perf-runtime[data-detected="true"] .cp-od-perf-runtime-mark {
+.cp-od-perf-runtime-val[data-detected="true"] .cp-od-perf-runtime-mark {
   background: oklch(0.78 0.14 150 / 0.10);
   color: var(--ok);
 }
-.cp-od-perf-runtime-text {
-  flex: 1;
+.cp-od-perf-runtime-val > span:last-child {
   min-width: 0;
-  color: var(--text);
-  letter-spacing: 0;
+  overflow-wrap: anywhere;
 }
 
 /* Quick actions: compact command surface in the main column. */
@@ -1340,6 +1343,10 @@
 }
 
 @media (min-width: 861px) and (max-width: 1180px) {
+  .cp-od-perf-body {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
   .cp-instance-tabs {
     padding-inline: 16px;
   }
@@ -1362,8 +1369,12 @@
 }
 
 @media (max-width: 640px) {
+  .cp-od-perf-body {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
   .cp-od-perf-summary {
-    grid-template-columns: 22px minmax(0, 1fr);
+    grid-template-columns: 20px minmax(0, 1fr);
   }
   .cp-instance-page {
     --cp-instance-dock-pad: 18px;

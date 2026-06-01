@@ -1150,34 +1150,39 @@ function PerformanceCard({ inst }: { inst: EnrichedInstance }): JSX.Element {
         <h3>Performance</h3>
       </div>
 
-      <div class="cp-od-perf-summary" data-tone={summary.tone} aria-live="polite">
-        <span class="cp-od-perf-summary-mark">
-          <Icon name={summaryIcon} size={16} stroke={2.4} />
-        </span>
-        <div class="cp-od-perf-summary-copy">
-          <strong>{summary.title}</strong>
-          <span>{summary.detail}</span>
-        </div>
-      </div>
-
-      <div class="cp-od-perf-facts">
-        <div class="cp-od-perf-row">
-          <span class="cp-od-perf-key">Mode</span>
-          <span class="cp-od-perf-val">{performanceModeLabel(effectiveMode.mode)} ({modeSourceLabel})</span>
-        </div>
-        <div class="cp-od-perf-row">
-          <span class="cp-od-perf-key">Memory</span>
-          <span class="cp-od-perf-val">{fmtMem(minMem)} to {fmtMem(maxMem)}</span>
-        </div>
-        <div class="cp-od-perf-row">
-          <span class="cp-od-perf-key">Plan evidence</span>
-          <span class="cp-od-perf-val">{planTier}, {managedCount} managed mod{managedCount === 1 ? '' : 's'}</span>
-        </div>
-        <div class="cp-od-perf-runtime" data-detected={runtimeDetected}>
-          <span class="cp-od-perf-runtime-mark">
-            <Icon name={runtimeDetected ? 'check' : 'clock'} size={12} stroke={2.6} />
+      <div class="cp-od-perf-body">
+        <div class="cp-od-perf-summary" data-tone={summary.tone} aria-live="polite">
+          <span class="cp-od-perf-summary-mark">
+            <Icon name={summaryIcon} size={16} stroke={2.4} />
           </span>
-          <span class="cp-od-perf-runtime-text">{runtimeLabel}</span>
+          <div class="cp-od-perf-summary-copy">
+            <strong>{summary.title}</strong>
+            <span>{summary.detail}</span>
+          </div>
+        </div>
+
+        <div class="cp-od-perf-facts">
+          <div class="cp-od-perf-row">
+            <span class="cp-od-perf-key">Mode</span>
+            <span class="cp-od-perf-val">{performanceModeLabel(effectiveMode.mode)} ({modeSourceLabel})</span>
+          </div>
+          <div class="cp-od-perf-row">
+            <span class="cp-od-perf-key">Memory</span>
+            <span class="cp-od-perf-val">{fmtMem(minMem)} to {fmtMem(maxMem)}</span>
+          </div>
+          <div class="cp-od-perf-row">
+            <span class="cp-od-perf-key">Plan evidence</span>
+            <span class="cp-od-perf-val">{planTier}, {managedCount} managed mod{managedCount === 1 ? '' : 's'}</span>
+          </div>
+          <div class="cp-od-perf-row">
+            <span class="cp-od-perf-key">Runtime</span>
+            <span class="cp-od-perf-val cp-od-perf-runtime-val" data-detected={runtimeDetected}>
+              <span class="cp-od-perf-runtime-mark">
+                <Icon name={runtimeDetected ? 'check' : 'clock'} size={12} stroke={2.6} />
+              </span>
+              <span>{runtimeLabel}</span>
+            </span>
+          </div>
         </div>
       </div>
     </Card>
