@@ -176,7 +176,7 @@ button.cp-cr-stepper-item:focus-visible {
   flex-shrink: 0;
   display: flex;
   align-items: center;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   gap: 6px;
   padding: 0 0 10px;
   border-bottom: 1px solid var(--line);
@@ -230,7 +230,7 @@ button.cp-cr-stepper-item:focus-visible {
   font-size: 12px;
   font-weight: 500;
   line-height: 1.2;
-  letter-spacing: 0;
+  letter-spacing: -0.05px;
   white-space: nowrap;
   pointer-events: none;
   opacity: 0;
