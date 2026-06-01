@@ -14,12 +14,11 @@ use tauri::{Emitter, Manager};
 use tracing::info;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let paths = AppPaths::detect();
-    let config_startup =
-        ConfigStore::load_for_startup(paths.clone()).expect("load config store for startup");
+    let config_startup = ConfigStore::load_for_startup(paths.clone())?;
     let instance_startup = InstanceStore::load_for_startup(paths.clone());
     let mut startup_warnings = config_startup.warnings;
     startup_warnings.extend(instance_startup.warnings);
@@ -27,10 +26,7 @@ async fn main() {
     let instances = Arc::new(instance_startup.store);
     let installs = Arc::new(InstallStore::new());
     let sessions = Arc::new(SessionStore::new());
-    let performance = Arc::new(
-        PerformanceManager::new_with_config_dir(&paths.config_dir)
-            .expect("load performance manager"),
-    );
+    let performance = Arc::new(PerformanceManager::new_with_config_dir(&paths.config_dir)?);
     let state = AppState::new(AppStateInit {
         app_name: "Croopor".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -47,9 +43,7 @@ async fn main() {
     spawn_performance_rules_refresh(&state);
     let desktop_state = state::DesktopState::new(env!("CARGO_PKG_VERSION").to_string());
 
-    let api = spawn_background(state.clone())
-        .await
-        .expect("bind local croopor api server");
+    let api = spawn_background(state.clone()).await?;
 
     info!("desktop shell connected to {}", api.addr);
 
@@ -80,6 +74,7 @@ async fn main() {
             });
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("run tauri desktop shell");
+        .run(tauri::generate_context!())?;
+
+    Ok(())
 }
