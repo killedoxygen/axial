@@ -12,6 +12,7 @@ use tokio::io::AsyncWriteExt;
 
 const USER_AGENT: &str = "croopor/0.3.1 (github.com/mateoltd/croopor)";
 const RATE_LIMIT_BODY_LIMIT: usize = 4096;
+const MAX_MODRINTH_VERSION_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MODRINTH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MODRINTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -19,6 +20,8 @@ const MODRINTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub enum ModrinthError {
     #[error("modrinth request failed: {0}")]
     Request(#[from] reqwest::Error),
+    #[error("modrinth response parse failed: {0}")]
+    Parse(#[from] serde_json::Error),
     #[error("modrinth download failed: {0}")]
     Io(#[from] io::Error),
     #[error("modrinth API rate limited; reset after {reset_after_seconds:?} seconds: {body}")]
@@ -28,6 +31,8 @@ pub enum ModrinthError {
     },
     #[error("modrinth API returned HTTP {status}: {body}")]
     Http { status: u16, body: String },
+    #[error("modrinth response too large")]
+    ResponseTooLarge,
     #[error("hash mismatch: expected {expected} got {actual}")]
     HashMismatch { expected: String, actual: String },
     #[error("download size exceeded: expected {expected} bytes got at least {actual} bytes")]
@@ -87,11 +92,13 @@ impl ModrinthClient {
             }
 
             let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
+            let body = bounded_response_text(response, RATE_LIMIT_BODY_LIMIT).await;
             return Err(ModrinthError::Http { status, body });
         }
 
-        let versions = response.json::<Vec<Version>>().await?;
+        let versions = serde_json::from_slice::<Vec<Version>>(
+            &bounded_version_response_body(response).await?,
+        )?;
         let mut compatible: Vec<Version> = versions
             .into_iter()
             .filter(|version| matches_any(&version.game_versions, game_versions))
@@ -121,7 +128,7 @@ impl ModrinthClient {
             }
 
             let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
+            let body = bounded_response_text(response, RATE_LIMIT_BODY_LIMIT).await;
             return Err(ModrinthError::Http { status, body });
         }
         if let Some(expected) = expected_size
@@ -267,6 +274,24 @@ async fn rate_limited_error(response: Response) -> ModrinthError {
     }
 }
 
+async fn bounded_version_response_body(mut response: Response) -> Result<Vec<u8>, ModrinthError> {
+    if response
+        .content_length()
+        .is_some_and(|content_length| content_length > MAX_MODRINTH_VERSION_RESPONSE_BYTES as u64)
+    {
+        return Err(ModrinthError::ResponseTooLarge);
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len().saturating_add(chunk.len()) > MAX_MODRINTH_VERSION_RESPONSE_BYTES {
+            return Err(ModrinthError::ResponseTooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 async fn bounded_response_text(mut response: Response, limit: usize) -> String {
     let mut body = Vec::new();
     while body.len() < limit {
@@ -315,6 +340,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_versions_rejects_oversized_content_length() {
+        let base_url = spawn_response_server_with_content_length(
+            "200 OK",
+            vec![("content-type".to_string(), "application/json".to_string())],
+            b"[]".to_vec(),
+            Some(MAX_MODRINTH_VERSION_RESPONSE_BYTES + 1),
+        )
+        .await;
+        let client = ModrinthClient::new_with_base_url(base_url);
+
+        let error = client
+            .list_versions("sodium", &["1.21.1".to_string()], &["fabric".to_string()])
+            .await
+            .expect_err("oversized content-length should fail");
+
+        assert!(matches!(error, ModrinthError::ResponseTooLarge));
+    }
+
+    #[tokio::test]
+    async fn list_versions_rejects_stream_past_limit_without_content_length() {
+        let base_url = spawn_response_server_with_content_length(
+            "200 OK",
+            vec![("content-type".to_string(), "application/json".to_string())],
+            vec![b' '; MAX_MODRINTH_VERSION_RESPONSE_BYTES + 1],
+            None,
+        )
+        .await;
+        let client = ModrinthClient::new_with_base_url(base_url);
+
+        let error = client
+            .list_versions("sodium", &["1.21.1".to_string()], &["fabric".to_string()])
+            .await
+            .expect_err("oversized stream should fail");
+
+        assert!(matches!(error, ModrinthError::ResponseTooLarge));
+    }
+
+    #[tokio::test]
+    async fn list_versions_bounds_non_429_error_body() {
+        let base_url = spawn_response_server(
+            "502 Bad Gateway",
+            vec![("content-type".to_string(), "text/plain".to_string())],
+            vec![b'x'; RATE_LIMIT_BODY_LIMIT + 64],
+        )
+        .await;
+        let client = ModrinthClient::new_with_base_url(base_url);
+
+        let error = client
+            .list_versions("sodium", &["1.21.1".to_string()], &["fabric".to_string()])
+            .await
+            .expect_err("provider error should fail");
+
+        match error {
+            ModrinthError::Http { status, body } => {
+                assert_eq!(status, 502);
+                assert_eq!(body.len(), RATE_LIMIT_BODY_LIMIT);
+            }
+            other => panic!("expected HTTP error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn download_file_to_path_streams_and_verifies_sha512() {
         let body = b"managed-jar".to_vec();
         let sha512 = encode(Sha512::digest(&body));
@@ -358,6 +445,35 @@ mod tests {
                 assert_eq!(body.len(), RATE_LIMIT_BODY_LIMIT);
             }
             other => panic!("expected rate-limit error, got {other:?}"),
+        }
+        assert!(!temp_path.exists());
+        assert!(!temp_path.parent().expect("temp path parent").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn download_file_to_path_bounds_non_429_error_body() {
+        let url = spawn_response_server(
+            "502 Bad Gateway",
+            vec![("content-type".to_string(), "text/plain".to_string())],
+            vec![b'x'; RATE_LIMIT_BODY_LIMIT + 64],
+        )
+        .await;
+        let root = test_root("download-http-error-body-limit");
+        let temp_path = root.join("nested").join("sodium.jar.tmp");
+        let client = ModrinthClient::new();
+
+        let error = client
+            .download_file_to_path(&url, "", None, &temp_path)
+            .await
+            .expect_err("provider error should fail");
+
+        match error {
+            ModrinthError::Http { status, body } => {
+                assert_eq!(status, 502);
+                assert_eq!(body.len(), RATE_LIMIT_BODY_LIMIT);
+            }
+            other => panic!("expected HTTP error, got {other:?}"),
         }
         assert!(!temp_path.exists());
         assert!(!temp_path.parent().expect("temp path parent").exists());
