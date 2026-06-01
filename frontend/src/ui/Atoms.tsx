@@ -105,17 +105,27 @@ export function Divider({ vertical, style }: { vertical?: boolean; style?: JSX.C
   );
 }
 
-export function Meter({ value, tone = 'accent', height = 4, style }: {
+export function Meter({ value, tone = 'accent', height = 4, style, ariaLabel }: {
   value: number;
   tone?: 'accent' | 'ok' | 'warn' | 'err';
   height?: number;
   style?: JSX.CSSProperties;
+  ariaLabel?: string;
 }): JSX.Element {
   const cls = tone === 'accent' ? 'cp-meter' : `cp-meter cp-meter--${tone}`;
   const finiteValue = Number.isFinite(value) ? value : 0;
+  const boundedValue = Math.max(0, Math.min(100, finiteValue));
   return (
-    <div class={cls} style={{ height, ...style }}>
-      <span style={{ width: `${Math.max(0, Math.min(100, finiteValue))}%` }} />
+    <div
+      class={cls}
+      style={{ height, ...style }}
+      role="progressbar"
+      aria-label={ariaLabel}
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-valuenow={Math.round(boundedValue)}
+    >
+      <span style={{ width: `${boundedValue}%` }} />
     </div>
   );
 }

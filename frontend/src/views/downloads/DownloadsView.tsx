@@ -11,6 +11,17 @@ function formatFailureTime(timestamp: number): string {
   return new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
+function formatElapsedTime(startedAt: number): string {
+  const elapsedSeconds = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+  if (elapsedSeconds < 60) return `${elapsedSeconds}s elapsed`;
+  const minutes = Math.floor(elapsedSeconds / 60);
+  const seconds = elapsedSeconds % 60;
+  if (minutes < 60) return `${minutes}m ${seconds.toString().padStart(2, '0')}s elapsed`;
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return `${hours}h ${remainingMinutes.toString().padStart(2, '0')}m elapsed`;
+}
+
 export function DownloadsView(): JSX.Element {
   const theme = useTheme();
   const state = installState.value;
@@ -21,6 +32,8 @@ export function DownloadsView(): JSX.Element {
   const queuedLabel = `${queue.length} queued`;
   const queuedItemLabel = queue.length === 1 ? '1 item queued' : `${queue.length} items queued`;
   const phaseLabel = hasActive && state.phase ? state.phase.replace(/_/g, ' ') : '';
+  const activePct = hasActive ? Math.round(Math.max(0, Math.min(100, state.pct))) : 0;
+  const nextQueuedLabel = queue.length > 0 ? formatInstallItemLabel(queue[0]) : '';
   const pageStatus = hasActive
     ? `1 active task${queue.length > 0 ? ` · ${queuedLabel}` : ''}`
     : failure
@@ -82,11 +95,27 @@ export function DownloadsView(): JSX.Element {
               </div>
             )}
           />
-          <div style={{ fontSize: 12, color: theme.n.textDim, marginBottom: 6 }}>{state.label}</div>
-          <Meter value={state.pct} />
-          <div style={{ fontSize: 11, color: theme.n.textMute, marginTop: 6, textAlign: 'right' }}>
-            {Math.round(state.pct)}%
+          <div style={{ fontSize: 12, color: theme.n.textDim, marginBottom: 8, lineHeight: 1.45, overflowWrap: 'anywhere' }}>
+            {state.label}
           </div>
+          <Meter value={state.pct} ariaLabel={`Install progress for ${activeTitle}`} />
+          <div style={{
+            display: 'flex',
+            justifyContent: 'space-between',
+            gap: 12,
+            marginTop: 7,
+            color: theme.n.textMute,
+            fontSize: 11,
+            lineHeight: 1.35,
+          }}>
+            <span>{formatElapsedTime(state.startedAt)}</span>
+            <span style={{ fontVariantNumeric: 'tabular-nums' }}>{activePct}%</span>
+          </div>
+          {nextQueuedLabel && (
+            <div style={{ fontSize: 11.5, color: theme.n.textMute, marginTop: 10, lineHeight: 1.4, overflowWrap: 'anywhere' }}>
+              Next: {nextQueuedLabel}
+            </div>
+          )}
         </Card>
       ) : failureCard ? (
         failureCard
