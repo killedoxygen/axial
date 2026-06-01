@@ -1188,14 +1188,11 @@
   background: var(--text-mute);
 }
 .cp-od-status[data-running="true"] {
-  color: var(--ok);
+  color: color-mix(in oklab, var(--accent) 68%, var(--text-dim));
 }
 .cp-od-status[data-running="true"] .cp-od-status-dot {
-  background: var(--ok);
-  box-shadow:
-    0 0 0 3px oklch(0.78 0.14 150 / 0.18),
-    0 0 4px oklch(0.78 0.14 150 / 0.55);
-  animation: cp-pulse 1.8s ease-in-out infinite;
+  background: currentColor;
+  box-shadow: 0 0 0 1px color-mix(in oklab, currentColor 18%, transparent);
 }
 
 /* Compact Logs strip pinned at the bottom of the overview. */
@@ -2218,12 +2215,11 @@
     grid-template-columns: 1fr;
   }
 }
-/* ─── Reduced-motion: kill staggered entrances and pulses. ─── */
+/* ─── Reduced-motion: kill staggered entrances. ─── */
 @media (prefers-reduced-motion: reduce) {
   .cp-od-stagger {
     animation: none !important;
     opacity: 1 !important;
     transform: none !important;
   }
-  .cp-od-status[data-running="true"] .cp-od-status-dot { animation: none !important; }
 }
