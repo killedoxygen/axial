@@ -577,7 +577,8 @@
   gap: 7px;
   position: relative;
   isolation: isolate;
-  width: 188px;
+  min-width: 76px;
+  max-width: min(230px, 28vw);
   height: 28px;
   padding: 0 12px 0 10px;
   border-radius: 999px;
@@ -632,20 +633,14 @@
   height: 7px;
   border-radius: 999px;
   background: currentColor;
-  box-shadow: 0 0 0 2px color-mix(in oklab, currentColor 12%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in oklab, currentColor 10%, transparent);
 }
 .cp-status-pill-label {
   min-width: 0;
+  max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-.cp-status-pill--running .cp-status-dot {
-  animation: cp-status-dot-pulse 2.4s ease-in-out infinite;
-}
-@keyframes cp-status-dot-pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.68; }
 }
 
 /* Music widget ---------------------------------------------------------- */
