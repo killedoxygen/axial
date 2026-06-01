@@ -20,7 +20,10 @@ use croopor_config::{AppConfig, LAUNCH_AUTH_MODE_ONLINE, validate_username};
 use croopor_minecraft::offline_uuid;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 const MSA_CLIENT_ID_ENV: &str = "CROOPOR_MSA_CLIENT_ID";
 const MSA_DEVICE_CODE_ENDPOINT: &str =
@@ -35,6 +38,9 @@ const MSA_TOKEN_POLL_TIMEOUT: Duration = Duration::from_secs(20);
 const MSA_SLOW_DOWN_INTERVAL_INCREMENT: u64 = 5;
 const LOGIN_UNAVAILABLE_REASON: &str = "Microsoft sign-in is not configured in this build";
 const LOGIN_AVAILABLE_REASON: &str = "Microsoft sign-in is configured";
+
+static MSA_DEVICE_CODE_CLIENT: OnceLock<Result<Client, AuthLoginError>> = OnceLock::new();
+static MSA_TOKEN_POLL_CLIENT: OnceLock<Result<Client, AuthLoginError>> = OnceLock::new();
 
 #[derive(Debug, Serialize)]
 struct AuthStatusResponse {
@@ -266,7 +272,7 @@ pub(crate) enum AuthRefreshFailureKind {
     StoreUnavailable,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AuthLoginError {
     ClientBuild,
     Request,
@@ -514,10 +520,7 @@ fn auth_login_unavailable() -> (StatusCode, Json<serde_json::Value>) {
 }
 
 async fn request_msa_device_code(client_id: &str) -> Result<MsaDeviceCodeResponse, AuthLoginError> {
-    let client = Client::builder()
-        .timeout(MSA_DEVICE_CODE_TIMEOUT)
-        .build()
-        .map_err(|_| AuthLoginError::ClientBuild)?;
+    let client = msa_device_code_client()?;
 
     let response = client
         .post(MSA_DEVICE_CODE_ENDPOINT)
@@ -569,10 +572,7 @@ async fn request_msa_token(
     client_id: &str,
     device_code: &str,
 ) -> Result<MsaTokenSuccessResponse, AuthLoginPollError> {
-    let client = Client::builder()
-        .timeout(MSA_TOKEN_POLL_TIMEOUT)
-        .build()
-        .map_err(|_| AuthLoginPollError::Request(AuthLoginError::ClientBuild))?;
+    let client = msa_token_poll_client().map_err(AuthLoginPollError::Request)?;
 
     let response = client
         .post(token_endpoint)
@@ -608,10 +608,7 @@ async fn request_msa_refresh_token(
     client_id: &str,
     refresh_token: &str,
 ) -> Result<MsaTokenSuccessResponse, AuthLoginPollError> {
-    let client = Client::builder()
-        .timeout(MSA_TOKEN_POLL_TIMEOUT)
-        .build()
-        .map_err(|_| AuthLoginPollError::Request(AuthLoginError::ClientBuild))?;
+    let client = msa_token_poll_client().map_err(AuthLoginPollError::Request)?;
 
     let response = client
         .post(token_endpoint)
@@ -641,6 +638,30 @@ async fn request_msa_refresh_token(
             status,
         ))),
     }
+}
+
+fn msa_device_code_client() -> Result<&'static Client, AuthLoginError> {
+    MSA_DEVICE_CODE_CLIENT
+        .get_or_init(|| {
+            Client::builder()
+                .timeout(MSA_DEVICE_CODE_TIMEOUT)
+                .build()
+                .map_err(|_| AuthLoginError::ClientBuild)
+        })
+        .as_ref()
+        .map_err(|error| *error)
+}
+
+fn msa_token_poll_client() -> Result<&'static Client, AuthLoginError> {
+    MSA_TOKEN_POLL_CLIENT
+        .get_or_init(|| {
+            Client::builder()
+                .timeout(MSA_TOKEN_POLL_TIMEOUT)
+                .build()
+                .map_err(|_| AuthLoginError::ClientBuild)
+        })
+        .as_ref()
+        .map_err(|error| *error)
 }
 
 async fn auth_login_poll_success_response(
