@@ -41,7 +41,7 @@ function crumbsFor(): { label: string; onClick?: () => void }[] {
 }
 
 // Topbar status pill
-// Priority: running instance > active install > launch preparing > idle
+// Priority: running instance > active install > launch preparing > queued install > idle
 function StatusPill(): JSX.Element {
   const sessions = runningSessions.value;
   const runIds = Object.keys(sessions);
@@ -93,6 +93,24 @@ function StatusPill(): JSX.Element {
         <span class="cp-status-dot" />
         <span class="cp-status-pill-label">{launch.label} · {li?.name || 'launch'}</span>
       </span>
+    );
+  }
+
+  const queued = installQueue.value;
+  if (queued.length > 0) {
+    const firstQueued = queued[0];
+    const queuedLabel = queued.length === 1 ? '1 queued' : `${queued.length} queued`;
+    const queuedTitle = `${queuedLabel}. Next: ${firstQueued.versionId}`;
+    return (
+      <button
+        class="cp-status-pill cp-status-pill--queued cp-nodrag"
+        onClick={() => navigate({ name: 'downloads' })}
+        title={queuedTitle}
+        aria-label={`Open downloads. ${queuedTitle}`}
+      >
+        <span class="cp-status-dot" />
+        <span class="cp-status-pill-label">{queuedLabel}</span>
+      </button>
     );
   }
 

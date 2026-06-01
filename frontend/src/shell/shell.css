@@ -627,6 +627,13 @@
   --cp-status-bg: color-mix(in oklab, var(--surface-2) 88%, var(--accent));
   --cp-status-border: color-mix(in oklab, var(--line) 74%, var(--accent));
 }
+.cp-status-pill--queued {
+  --cp-install-color: oklch(from var(--accent) l calc(c * 0.7) calc(h + 180));
+  --cp-status-color: color-mix(in oklab, var(--cp-install-color) 64%, var(--text-dim));
+  --cp-status-bg: color-mix(in oklab, var(--surface-2) 94%, var(--cp-install-color));
+  --cp-status-border: color-mix(in oklab, var(--line) 82%, var(--cp-install-color));
+  cursor: pointer;
+}
 .cp-status-dot {
   flex: 0 0 auto;
   width: 7px;
