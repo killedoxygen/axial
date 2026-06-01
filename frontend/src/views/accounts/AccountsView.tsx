@@ -1959,20 +1959,12 @@ function SavedSkinLibrary({
                     borderTop: index === 0 ? undefined : '1px solid var(--line)',
                   }}
                 >
-                  <img
-                    src={apiResourceUrl(`/skins/${skin.texture_key}/file`)}
-                    alt=""
-                    width={32}
-                    height={32}
-                    style={{
-                      width: 32,
-                      height: 32,
-                      objectFit: 'cover',
-                      imageRendering: 'pixelated',
-                      border: '1px solid var(--line)',
-                      borderRadius: theme.r.sm,
-                      background: theme.n.surface,
-                    }}
+                  <PlayerHeadPreview
+                    username={skin.name}
+                    textureSrc={apiResourceUrl(`/skins/${skin.texture_key}/file`)}
+                    size={32}
+                    radius={6}
+                    ariaLabel={`${skin.name} skin preview`}
                   />
                   <div style={{ minWidth: 0 }}>
                     <div style={{
