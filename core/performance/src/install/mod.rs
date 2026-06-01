@@ -1097,7 +1097,7 @@ fn rules_client() -> reqwest::Client {
         .user_agent("croopor/0.3.1 performance-rules")
         .timeout(REMOTE_RULES_TIMEOUT)
         .build()
-        .expect("build performance rules client")
+        .unwrap_or_else(|_| reqwest::Client::new())
 }
 
 #[cfg(test)]
