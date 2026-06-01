@@ -163,6 +163,49 @@ export function NameStep({
         <p class="cp-cr-subline">A few defaults you can tune before the instance lands.</p>
       </header>
 
+      <div class="cp-cr-hero">
+        <div class="cp-cr-hero-cover" aria-hidden="true">
+          {showArt ? (
+            <InstanceArt instance={previewInstance} aspect="banner" className="cp-cr-hero-art" />
+          ) : (
+            <div class="cp-cr-blob cp-cr-blob--banner" />
+          )}
+          <div class="cp-cr-hero-glow" />
+          <div class="cp-cr-hero-veil" />
+        </div>
+
+        <div class="cp-cr-hero-stamp">
+          <span class="cp-cr-hero-stamp-key">{previewPreset}</span>
+          <span class="cp-cr-hero-stamp-sep" aria-hidden="true">·</span>
+          <span class="cp-cr-hero-stamp-num">{serial}</span>
+        </div>
+
+        <div class="cp-cr-hero-identity">
+          <div class="cp-cr-hero-avatar">
+            {showArt ? (
+              <InstanceArt instance={previewInstance} versionIdentity={versionIdentity} aspect="square" radius={16} />
+            ) : (
+              <div class="cp-cr-blob cp-cr-blob--avatar" />
+            )}
+          </div>
+          <div class="cp-cr-hero-text">
+            <div class="cp-cr-hero-pills">
+              <span class="cp-cr-hero-pill">
+                {source !== 'vanilla' && (
+                  <LoaderLogo loader={source} size={11} class="cp-cr-loader-mark" />
+                )}
+                <span>{loaderLabel}{buildLabel ? ` ${buildLabel}` : ''}</span>
+              </span>
+              <span class="cp-cr-hero-mc">Minecraft {mcVersionId}</span>
+            </div>
+            <h2 class="cp-cr-hero-name" title={displayName}>{displayName}</h2>
+            <p class={alreadyInstalled ? 'cp-cr-hero-status is-ok' : 'cp-cr-hero-status'}>
+              {alreadyInstalled ? 'Already installed, ready to play' : 'Downloads on create'}
+            </p>
+          </div>
+        </div>
+      </div>
+
       <label class="cp-cr-name-row">
         <span class="cp-cr-name-label">Name</span>
         <Input
@@ -174,147 +217,94 @@ export function NameStep({
         />
       </label>
 
-      <div class="cp-cr-name-grid">
-        <article class="cp-cr-preview" aria-label="Identity preview">
-          <div class="cp-cr-preview-bg" aria-hidden="true">
-            {showArt ? (
-              <InstanceArt instance={previewInstance} aspect="banner" />
+      <div class="cp-cr-defaults">
+        <section class="cp-cr-mem" aria-label="Memory">
+          <div class="cp-cr-mem-head">
+            <span class="cp-cr-field-label">Memory</span>
+            <span class="cp-cr-mem-reading" aria-live="polite">{fmtMem(memoryGB)}</span>
+          </div>
+          <div class="cp-cr-mem-slider">
+            {memReady ? (
+              <Slider
+                value={memoryGB}
+                min={1}
+                max={totalGB}
+                step={0.5}
+                recommended={[Math.max(2, memoryRec - 2), Math.min(totalGB, memoryRec + 2)]}
+                sound="memory"
+                onChange={onMemoryChange}
+                ariaLabel="Max memory in gigabytes"
+              />
             ) : (
-              <div class="cp-cr-blob cp-cr-blob--banner" />
+              <div class="cp-cr-blob cp-cr-blob--slider" />
             )}
-            <div class="cp-cr-preview-veil" />
           </div>
-          <div class="cp-cr-preview-top">
-            <div class="cp-cr-preview-avatar">
-              {showArt ? (
-                <InstanceArt instance={previewInstance} versionIdentity={versionIdentity} aspect="square" radius={14} />
-              ) : (
-                <div class="cp-cr-blob cp-cr-blob--avatar" />
-              )}
-            </div>
-            <div class="cp-cr-preview-stamp">
-              <span class="cp-cr-preview-stamp-key">{previewPreset}</span>
-              <span class="cp-cr-preview-stamp-sep" aria-hidden="true">·</span>
-              <span class="cp-cr-preview-stamp-num">{serial}</span>
-            </div>
-          </div>
-          <div class="cp-cr-preview-foot">
-            <h2 class="cp-cr-preview-name" title={displayName}>{displayName}</h2>
-            <dl class="cp-cr-preview-meta">
-              <div class="cp-cr-preview-meta-col">
-                <dt>Loader</dt>
-                <dd class="cp-cr-preview-meta-loader">
-                  {source !== 'vanilla' && (
-                    <LoaderLogo loader={source} size={12} class="cp-cr-loader-mark" />
-                  )}
-                  <span>{loaderLabel}{buildLabel ? ` ${buildLabel}` : ''}</span>
-                </dd>
-              </div>
-              <div class="cp-cr-preview-meta-col">
-                <dt>Version</dt>
-                <dd>{mcVersionId}</dd>
-              </div>
-              <div class="cp-cr-preview-meta-col">
-                <dt>Status</dt>
-                <dd>
-                  <span class={alreadyInstalled ? 'cp-cr-preview-status is-ok' : 'cp-cr-preview-status'}>
-                    {alreadyInstalled ? 'Ready' : 'Download'}
-                  </span>
-                </dd>
-              </div>
-            </dl>
-          </div>
-        </article>
+          <span class="cp-cr-mem-hint">
+            {memoryGB < 2
+              ? 'Low. May stutter.'
+              : memoryGB > totalGB * 0.75
+                ? 'High. Leave room for the OS.'
+                : `Comfortable start: ${memoryRec} GB.`}
+          </span>
+        </section>
 
-        <aside class="cp-cr-tune" aria-label="Instance defaults">
-          <section class="cp-cr-tune-memory" aria-label="Memory">
-            <div class="cp-cr-tune-head">
-              <span class="cp-cr-tune-label">Memory</span>
-              <span class="cp-cr-tune-reading" aria-live="polite">{fmtMem(memoryGB)}</span>
-            </div>
-            <div class="cp-cr-tune-slider">
-              {memReady ? (
-                <Slider
-                  value={memoryGB}
-                  min={1}
-                  max={totalGB}
-                  step={0.5}
-                  recommended={[Math.max(2, memoryRec - 2), Math.min(totalGB, memoryRec + 2)]}
-                  sound="memory"
-                  onChange={onMemoryChange}
-                  ariaLabel="Max memory in gigabytes"
-                />
-              ) : (
-                <div class="cp-cr-blob cp-cr-blob--slider" />
-              )}
-            </div>
-            <span class="cp-cr-tune-hint">
-              {memoryGB < 2
-                ? 'Low. May stutter.'
-                : memoryGB > totalGB * 0.75
-                  ? 'High. Leave room for the OS.'
-                  : `Comfortable start: ${memoryRec} GB.`}
+        <div class="cp-cr-toggles" role="group" aria-label="Instance defaults">
+          <button
+            type="button"
+            class="cp-cr-toggle cp-cr-toggle--reroll"
+            onClick={handleReroll}
+            aria-label="Reroll artwork"
+            data-rerolling={rerolling ? 'true' : 'false'}
+          >
+            <span class="cp-cr-toggle-icon cp-cr-reroll-icon" aria-hidden="true">
+              <Icon name="refresh" size={17} stroke={2} />
             </span>
-          </section>
+            <span class="cp-cr-toggle-copy">
+              <span class="cp-cr-toggle-label">{rerolling ? 'Rerolling' : 'Artwork'}</span>
+              <span class="cp-cr-toggle-value">{previewPreset}</span>
+            </span>
+          </button>
 
-          <div class="cp-cr-options">
-            <button
-              type="button"
-              class="cp-cr-option cp-cr-option--reroll"
-              onClick={handleReroll}
-              aria-label="Reroll artwork"
-              data-rerolling={rerolling ? 'true' : 'false'}
-            >
-              <span class="cp-cr-option-icon cp-cr-reroll-icon" aria-hidden="true">
-                <Icon name="refresh" size={18} stroke={2} />
-              </span>
-              <span class="cp-cr-option-copy">
-                <span class="cp-cr-option-label">{rerolling ? 'Rerolling' : 'Artwork'}</span>
-                <span class="cp-cr-option-sub">{previewPreset}</span>
-              </span>
-            </button>
+          <button
+            type="button"
+            class="cp-cr-toggle cp-cr-toggle--window"
+            onClick={onCycleWindow}
+            aria-label="Cycle window size"
+            data-preset={windowPresetId}
+          >
+            <span class="cp-cr-toggle-icon cp-cr-window-frame" aria-hidden="true">
+              <span class="cp-cr-window-frame-inner" data-preset={windowPresetId} />
+            </span>
+            <span class="cp-cr-toggle-copy">
+              <span class="cp-cr-toggle-label">Window</span>
+              <span class="cp-cr-toggle-value">{winSpec.label}</span>
+              <span class="cp-cr-toggle-sub">{winSubtitle}</span>
+            </span>
+          </button>
 
-            <button
-              type="button"
-              class="cp-cr-option cp-cr-option--window"
-              onClick={onCycleWindow}
-              aria-label="Cycle window size"
-              data-preset={windowPresetId}
-            >
-              <span class="cp-cr-option-icon cp-cr-window-frame" aria-hidden="true">
-                <span class="cp-cr-window-frame-inner" data-preset={windowPresetId} />
+          <button
+            type="button"
+            class="cp-cr-toggle cp-cr-toggle--profile"
+            onClick={onCycleJvm}
+            aria-label="Cycle performance profile"
+            data-profile={jvmPreset || 'auto'}
+            title={JVM_PRESET_HINTS[jvmPreset]}
+          >
+            <span class="cp-cr-toggle-icon cp-cr-profile-glyph" aria-hidden="true">
+              <span class="cp-cr-profile-bar" data-bar="1" />
+              <span class="cp-cr-profile-bar" data-bar="2" />
+              <span class="cp-cr-profile-bar" data-bar="3" />
+              <span class="cp-cr-profile-bar" data-bar="4" />
+            </span>
+            <span class="cp-cr-toggle-copy">
+              <span class="cp-cr-toggle-label">Profile</span>
+              <span class="cp-cr-toggle-value">{JVM_PRESET_LABELS[jvmPreset]}</span>
+              <span class="cp-cr-toggle-sub" title={JVM_PRESET_HINTS[jvmPreset]}>
+                {COMPACT_JVM_HINTS[jvmPreset]}
               </span>
-              <span class="cp-cr-option-copy">
-                <span class="cp-cr-option-label">Window</span>
-                <span class="cp-cr-option-sub">{winSubtitle}</span>
-              </span>
-              <span class="cp-cr-option-value">{winSpec.label}</span>
-            </button>
-
-            <button
-              type="button"
-              class="cp-cr-option cp-cr-option--profile"
-              onClick={onCycleJvm}
-              aria-label="Cycle performance profile"
-              data-profile={jvmPreset || 'auto'}
-              title={JVM_PRESET_HINTS[jvmPreset]}
-            >
-              <span class="cp-cr-option-icon cp-cr-profile-glyph" aria-hidden="true">
-                <span class="cp-cr-profile-bar" data-bar="1" />
-                <span class="cp-cr-profile-bar" data-bar="2" />
-                <span class="cp-cr-profile-bar" data-bar="3" />
-                <span class="cp-cr-profile-bar" data-bar="4" />
-              </span>
-              <span class="cp-cr-option-copy">
-                <span class="cp-cr-option-label">Profile</span>
-                <span class="cp-cr-option-sub" title={JVM_PRESET_HINTS[jvmPreset]}>
-                  {COMPACT_JVM_HINTS[jvmPreset]}
-                </span>
-              </span>
-              <span class="cp-cr-option-value">{JVM_PRESET_LABELS[jvmPreset]}</span>
-            </button>
-          </div>
-        </aside>
+            </span>
+          </button>
+        </div>
       </div>
     </section>
   );
