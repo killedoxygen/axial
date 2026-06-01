@@ -1025,11 +1025,9 @@ where
     T: serde::de::DeserializeOwned + Send + 'static,
 {
     let url = url.to_string();
+    let agent = runtime_manifest_agent().clone();
     tokio::task::spawn_blocking(move || {
-        let response = ureq::AgentBuilder::new()
-            .timeout(std::time::Duration::from_secs(30))
-            .user_agent("croopor/0.3")
-            .build()
+        let response = agent
             .get(&url)
             .call()
             .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
@@ -1039,6 +1037,16 @@ where
     })
     .await
     .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?
+}
+
+fn runtime_manifest_agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(30))
+            .user_agent("croopor/0.3")
+            .build()
+    })
 }
 
 fn runtime_cache_dir() -> PathBuf {
