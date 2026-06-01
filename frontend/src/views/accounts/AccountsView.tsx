@@ -2672,20 +2672,49 @@ function SavedSkinBodyPreview({
       head: { x: 8, y: 8 },
       headOverlay: { x: 40, y: 8 },
       rightArm: { x: 44, y: 20, w: armWidth },
+      rightArmOverlay: { x: 44, y: 36 },
       body: { x: 20, y: 20 },
+      bodyOverlay: { x: 20, y: 36 },
       leftArm: { x: 36, y: 52, w: armWidth },
+      leftArmOverlay: { x: 52, y: 52 },
       rightLeg: { x: 4, y: 20 },
+      rightLegOverlay: { x: 4, y: 36 },
       leftLeg: { x: 20, y: 52 },
+      leftLegOverlay: { x: 4, y: 52 },
     }
     : {
       head: { x: 24, y: 8 },
       headOverlay: { x: 56, y: 8 },
       rightArm: { x: slim ? 51 : 52, y: 20, w: armWidth },
+      rightArmOverlay: { x: slim ? 51 : 52, y: 36 },
       body: { x: 32, y: 20 },
+      bodyOverlay: { x: 32, y: 36 },
       leftArm: { x: slim ? 43 : 44, y: 52, w: armWidth },
+      leftArmOverlay: { x: slim ? 59 : 60, y: 52 },
       rightLeg: { x: 12, y: 20 },
+      rightLegOverlay: { x: 12, y: 36 },
       leftLeg: { x: 28, y: 52 },
+      leftLegOverlay: { x: 12, y: 52 },
     };
+  const previewPart = (
+    part: { x: number; y: number },
+    overlay: { x: number; y: number },
+    w: number,
+    h: number,
+  ): JSX.Element => (
+    <span style={{ display: 'block', position: 'relative', width: w * scale, height: h * scale }}>
+      <SkinPreviewPart src={src} x={part.x} y={part.y} w={w} h={h} scale={scale} />
+      <SkinPreviewPart
+        src={src}
+        x={overlay.x}
+        y={overlay.y}
+        w={w}
+        h={h}
+        scale={scale}
+        style={{ position: 'absolute', inset: 0 }}
+      />
+    </span>
+  );
 
   return (
     <div
@@ -2718,13 +2747,13 @@ function SavedSkinBodyPreview({
         />
       </div>
       <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'center' }}>
-        <SkinPreviewPart src={src} x={parts.rightArm.x} y={parts.rightArm.y} w={parts.rightArm.w} h={12} scale={scale} />
-        <SkinPreviewPart src={src} x={parts.body.x} y={parts.body.y} w={8} h={12} scale={scale} />
-        <SkinPreviewPart src={src} x={parts.leftArm.x} y={parts.leftArm.y} w={parts.leftArm.w} h={12} scale={scale} />
+        {previewPart(parts.rightArm, parts.rightArmOverlay, parts.rightArm.w, 12)}
+        {previewPart(parts.body, parts.bodyOverlay, 8, 12)}
+        {previewPart(parts.leftArm, parts.leftArmOverlay, parts.leftArm.w, 12)}
       </div>
       <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'center' }}>
-        <SkinPreviewPart src={src} x={parts.rightLeg.x} y={parts.rightLeg.y} w={4} h={12} scale={scale} />
-        <SkinPreviewPart src={src} x={parts.leftLeg.x} y={parts.leftLeg.y} w={4} h={12} scale={scale} />
+        {previewPart(parts.rightLeg, parts.rightLegOverlay, 4, 12)}
+        {previewPart(parts.leftLeg, parts.leftLegOverlay, 4, 12)}
       </div>
     </div>
   );
