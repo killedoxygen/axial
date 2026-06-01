@@ -1,9 +1,3 @@
-/* Instance detail layout — Croopor.
- * Borderless, atmospheric, Linear/Raycast-flavored aesthetic. Procedural
- * InstanceArt stands in for the design's gradient/pattern cover. Hero
- * owns the Launch action cluster; Resources/Performance lives in the main
- * content column; the right rail carries quiet glanceable cards. */
-
 .cp-instance-page {
   --cp-instance-dock-pad: 32px;
   --cp-scrollbar-lane: 16px;
@@ -16,8 +10,6 @@
   padding-bottom: var(--cp-instance-bottom-reserved-space);
 }
 
-/* ─── Cover strip — atmospheric banner that dissolves into the page bg
- * via a radial mask (no hard seam). ─── */
 .cp-instance-cover {
   position: relative;
   height: 200px;
@@ -60,8 +52,6 @@
   pointer-events: none;
 }
 
-/* ─── Title bar — pulled high into the banner. The right cluster
- * carries the primary Launch action alongside quiet ghost utilities. ─── */
 .cp-instance-titlebar {
   padding: 0 32px 32px;
   margin-top: -150px;
@@ -151,8 +141,6 @@
   opacity: 0.55;
 }
 
-/* Action cluster — Launch button is the only saturated control here.
- * The IconButtons are smaller and dimmer ghost glyphs alongside it. ─── */
 .cp-instance-actions {
   display: flex;
   gap: 6px;
@@ -283,8 +271,6 @@
   color: rgba(255,255,255,0.95);
 }
 
-/* ─── Tab strip (pills) — lifted inactive-label contrast to --text-dim
- * so the row stops reading as half-disabled. ─── */
 .cp-instance-tabs {
   display: flex;
   gap: 2px;
@@ -551,18 +537,6 @@
   overflow-wrap: anywhere;
 }
 
-/* ─── Body — intrinsic two-column bento.
- *
- * Uses flex-wrap with flex-basis rather than a viewport media query: the
- * right rail naturally drops below the main column when there isn't
- * enough room for both at their declared basis. No fixed breakpoint, no
- * "between 970 and 1400 it feels cramped" — the layout chooses for
- * itself. The grow factor 999 on .cp-instance-main means main soaks up
- * any extra width while the rail stays close to its 320px basis.
- *
- * Wrap point ≈ 720 + 20 (gap) + 320 = 1060px of body width. With 32px
- * page padding either side, that's a viewport of ~1124px. Above that:
- * two columns. Below: one column with the rail stacked underneath. ─── */
 .cp-instance-body {
   padding: 18px 32px 24px;
   display: flex;
@@ -589,8 +563,8 @@
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(292px, 320px);
   grid-template-areas:
-    "performance activity"
-    "worlds details"
+    "worlds activity"
+    "performance details"
     "quick details";
   align-items: stretch;
   gap: 14px 15px;
@@ -668,8 +642,8 @@
   .cp-instance-body--overview-bento {
     padding-top: 12px;
     grid-template-areas:
-      "performance activity"
-      "worlds details"
+      "worlds activity"
+      "performance details"
       "quick details";
     gap: 12px 15px;
   }
@@ -682,9 +656,6 @@
   .cp-instance-body--overview-bento .cp-od-perf-summary {
     margin-bottom: 0;
   }
-  .cp-instance-body--overview-bento .cp-od-perf-row {
-    margin-bottom: 0;
-  }
   .cp-instance-body--overview-bento .cp-od-kv-row {
     padding: 6px 0;
   }
@@ -694,17 +665,7 @@
   }
 }
 
-/* ─── Stagger fade-up entrance ─── */
-.cp-od-stagger {
-  opacity: 0;
-  transform: translateY(6px);
-  animation: cp-od-rise 480ms cubic-bezier(0.2, 0.7, 0.2, 1) forwards;
-  animation-delay: var(--cp-od-delay, 0ms);
-  display: block;
-  min-width: 0;
-}
-.cp-od-stagger.cp-od-worlds-slot {
-  display: flex;
+.cp-od-worlds-slot {
   min-height: 154px;
 }
 .cp-od-worlds-card {
@@ -719,11 +680,6 @@
 .cp-od-worlds-card .cp-od-worlds-list {
   flex: 1;
 }
-@keyframes cp-od-rise {
-  to { opacity: 1; transform: translateY(0); }
-}
-
-/* ─── Card head ─── */
 .cp-od-head {
   display: flex;
   align-items: center;
@@ -792,14 +748,6 @@
 }
 .cp-od-overflow:hover { background: var(--surface-3); color: var(--text); }
 
-/* ─── Worlds — left-aligned compact empty state.
- *
- * Two flex children: a "lead" group (mark + copy) and the CTA cluster.
- * Both wrap when the card can't hold them on one row, so the buttons
- * drop below the copy instead of squeezing into a single narrow column.
- * The lead group's 320px basis is the trigger: if (lead + gap + CTAs)
- * exceeds the card's content width, CTAs wrap underneath. No media
- * query needed — the wrap is driven by the card's intrinsic size. ─── */
 .cp-od-worlds-empty {
   position: relative;
   z-index: 1;
@@ -915,11 +863,9 @@
   flex: 0 0 auto;
 }
 
-/* ─── Performance — read-only plan, memory, and runtime evidence. ───── */
 .cp-od-perf-body {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(246px, 0.86fr);
-  align-items: start;
+  display: flex;
+  flex-direction: column;
   gap: 18px;
 }
 .cp-od-perf-summary {
@@ -971,63 +917,114 @@
   font-size: 11.5px;
   line-height: 1.35;
 }
-.cp-od-perf-facts {
-  min-width: 0;
+/* Memory allocation bar: a full-width capacity track where two tones split the
+   reserved minimum heap from the max-heap ceiling, each value anchored under
+   its real position so the numbers act as the axis. */
+.cp-od-perf-mem {
   display: flex;
   flex-direction: column;
-}
-.cp-od-perf-row {
-  display: grid;
-  grid-template-columns: max-content minmax(0, 1fr);
-  align-items: center;
-  gap: 12px;
-  padding: 6px 0;
-}
-.cp-od-perf-row + .cp-od-perf-row {
-  border-top: 1px solid oklch(1 0 0 / 0.04);
-}
-.cp-od-perf-key {
-  font-size: 12px;
-  color: var(--text-mute);
-  letter-spacing: 0;
-  white-space: nowrap;
-}
-.cp-od-perf-val {
+  gap: 9px;
   min-width: 0;
-  font-size: 12.5px;
-  font-weight: 500;
-  color: var(--text);
+}
+.cp-od-perf-mem-track {
+  position: relative;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--surface-3);
+  overflow: hidden;
+}
+.cp-od-perf-mem-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: 999px;
+  transition: width 480ms cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+.cp-od-perf-mem-fill--max {
+  background: color-mix(in oklab, var(--accent) 50%, var(--surface-3));
+}
+.cp-od-perf-mem-fill--min {
+  background: var(--accent);
+}
+.cp-od-perf-mem-scale {
+  position: relative;
+  height: 15px;
+  font-size: 11.5px;
   font-variant-numeric: tabular-nums;
   letter-spacing: 0;
-  text-align: right;
-  overflow-wrap: anywhere;
+}
+.cp-od-perf-mem-mark {
+  position: absolute;
+  top: 0;
+  white-space: nowrap;
+  color: var(--text-mute);
+  line-height: 1;
+}
+.cp-od-perf-mem-mark--min {
+  /* anchored just past its tick; min sits near the start of the track */
+  transform: translateX(0);
+}
+.cp-od-perf-mem-mark--max {
+  transform: translateX(-50%);
+  color: var(--text);
+  font-weight: 600;
+}
+.cp-od-perf-mem-mark--total {
+  left: auto;
+  right: 0;
 }
 
-.cp-od-perf-runtime-val {
-  display: inline-flex;
+/* Footer: detected runtime on the left, configured mode source on the right. */
+.cp-od-perf-footer {
+  display: flex;
   align-items: center;
-  justify-content: flex-end;
-  gap: 10px;
-  justify-self: end;
+  justify-content: space-between;
+  gap: 12px;
+  padding-top: 13px;
+  border-top: 1px solid oklch(1 0 0 / 0.05);
+}
+.cp-od-perf-runtime {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: 0;
+  color: var(--text);
 }
 .cp-od-perf-runtime-mark {
-  display: inline-flex;
+  display: none;
   align-items: center;
   justify-content: center;
+  flex: 0 0 auto;
   width: 17px;
   height: 17px;
   border-radius: 999px;
-  background: var(--surface-3);
-  color: var(--text-mute);
-  flex-shrink: 0;
-}
-.cp-od-perf-runtime-val[data-detected="true"] .cp-od-perf-runtime-mark {
-  background: oklch(0.78 0.14 150 / 0.10);
+  background: color-mix(in oklab, var(--ok) 18%, transparent);
   color: var(--ok);
 }
-.cp-od-perf-runtime-val > span:last-child {
-  min-width: 0;
-  overflow-wrap: anywhere;
+.cp-od-perf-runtime[data-detected="true"] .cp-od-perf-runtime-mark {
+  display: inline-flex;
+}
+.cp-od-perf-runtime[data-detected="false"] .cp-od-perf-runtime-text {
+  color: var(--text-dim);
+  font-weight: 500;
+}
+.cp-od-perf-footer-mode {
+  font-size: 11.5px;
+  color: var(--text-mute);
+  letter-spacing: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cp-od-perf-footer-sep {
+  margin: 0 6px;
+  color: var(--text-dim);
+}
+@media (prefers-reduced-motion: reduce) {
+  .cp-od-perf-mem-fill {
+    transition: none;
+  }
 }
 
 /* Quick actions: compact command surface in the main column. */
@@ -1106,7 +1103,6 @@
   text-overflow: ellipsis;
 }
 
-/* ─── Activity — slim list, capped at 3 events ─── */
 .cp-od-events {
   list-style: none;
   margin: 0;
@@ -1148,7 +1144,6 @@
   white-space: nowrap;
 }
 
-/* ─── KV rows (Details card) ─── */
 .cp-od-kv {
   display: flex;
   flex-direction: column;
@@ -1246,19 +1241,6 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.cp-od-log-tail {
-  margin-top: 10px;
-  display: grid;
-  gap: 2px;
-  max-height: 86px;
-  overflow: hidden;
-  padding-left: 46px;
-}
-.cp-od-log-note {
-  margin: 8px 0 0 46px;
-  color: var(--text-mute);
-  font-size: 11.5px;
-}
 
 @media (max-width: 1180px) {
   .cp-instance-cover {
@@ -1324,7 +1306,7 @@
   .cp-od-quick-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
-  .cp-od-stagger.cp-od-worlds-slot {
+  .cp-od-worlds-slot {
     min-height: 146px;
   }
   .cp-od-worlds-card {
@@ -1343,10 +1325,6 @@
 }
 
 @media (min-width: 861px) and (max-width: 1180px) {
-  .cp-od-perf-body {
-    grid-template-columns: 1fr;
-    gap: 10px;
-  }
   .cp-instance-tabs {
     padding-inline: 16px;
   }
@@ -1360,8 +1338,8 @@
   .cp-instance-body--overview-bento {
     grid-template-columns: minmax(0, 1fr);
     grid-template-areas:
-      "performance"
       "worlds"
+      "performance"
       "activity"
       "quick"
       "details";
@@ -1369,10 +1347,6 @@
 }
 
 @media (max-width: 640px) {
-  .cp-od-perf-body {
-    grid-template-columns: 1fr;
-    gap: 10px;
-  }
   .cp-od-perf-summary {
     grid-template-columns: 20px minmax(0, 1fr);
   }
@@ -1385,7 +1359,7 @@
   .cp-od-quick-grid {
     grid-template-columns: 1fr;
   }
-  .cp-od-stagger.cp-od-worlds-slot {
+  .cp-od-worlds-slot {
     min-height: 390px;
   }
   .cp-od-worlds-empty {
@@ -1434,7 +1408,6 @@
   }
 }
 
-/* ─── Mods tab ─── */
 .cp-mods-toolbar {
   display: flex;
   gap: 8px;
@@ -1522,7 +1495,6 @@
   letter-spacing: 0;
 }
 
-/* ─── Resource tabs ─── */
 .cp-resource-toolbar {
   display: flex;
   justify-content: space-between;
@@ -1916,7 +1888,6 @@
   font-size: 12px;
 }
 
-/* ─── Segmented (mods toolbar + perf preset) ─── */
 .cp-mini-seg {
   display: inline-flex;
   background: var(--surface);
@@ -1944,7 +1915,6 @@
   box-shadow: 0 1px 2px rgba(0,0,0,0.15);
 }
 
-/* ─── Settings tab ─── */
 .cp-settings-pane {
   display: flex;
   flex-direction: column;
@@ -2210,13 +2180,5 @@
   }
   .cp-settings-advanced-grid {
     grid-template-columns: 1fr;
-  }
-}
-/* ─── Reduced-motion: kill staggered entrances. ─── */
-@media (prefers-reduced-motion: reduce) {
-  .cp-od-stagger {
-    animation: none !important;
-    opacity: 1 !important;
-    transform: none !important;
   }
 }

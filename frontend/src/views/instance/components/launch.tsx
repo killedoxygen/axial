@@ -1,0 +1,192 @@
+import type { JSX } from 'preact';
+import { Icon } from '../../../ui/Icons';
+import { Button } from '../../../ui/Atoms';
+import { openContextMenu } from '../../../ui/ContextMenu';
+import { navigate } from '../../../ui-state';
+import { clearLaunchNotice } from '../../../actions';
+import { toast } from '../../../toast';
+import type { LaunchState } from '../../../store';
+import type { EnrichedInstance, LaunchNotice, LaunchNoticeTone } from '../../../types';
+import { openInstanceFolder } from '../instance-actions';
+
+function launchNoticeIcon(tone: LaunchNoticeTone): string {
+  if (tone === 'success') return 'check-circle';
+  if (tone === 'error') return 'alert';
+  if (tone === 'warned') return 'alert';
+  if (tone === 'intervened') return 'shield-check';
+  return 'info';
+}
+
+export function LaunchOutcomeNotice({ inst, notice }: {
+  inst: EnrichedInstance;
+  notice: LaunchNotice;
+}): JSX.Element {
+  const details = (notice.details ?? []).map(detail => detail.trim()).filter(Boolean);
+  const primaryDetail = notice.detail?.trim() || (details.length === 1 ? details[0] : '');
+  const listDetails = details.length > 1
+    ? details.filter(detail => !primaryDetail || detail !== primaryDetail)
+    : [];
+
+  return (
+    <div class="cp-instance-notice-shell">
+      <section class="cp-launch-notice" data-tone={notice.tone} aria-live="polite">
+        <span class="cp-launch-notice-mark" aria-hidden="true">
+          <Icon name={launchNoticeIcon(notice.tone)} size={15} stroke={2.2} />
+        </span>
+        <div class="cp-launch-notice-copy">
+          <strong>{notice.message}</strong>
+          {primaryDetail && <p>{primaryDetail}</p>}
+          {listDetails.length > 0 && (
+            <details class="cp-launch-notice-details">
+              <summary>Details</summary>
+              <ul>
+                {listDetails.map((detail, index) => <li key={`${index}:${detail}`}>{detail}</li>)}
+              </ul>
+            </details>
+          )}
+        </div>
+        <button
+          class="cp-launch-notice-dismiss"
+          type="button"
+          aria-label="Dismiss launch notice"
+          onClick={() => clearLaunchNotice(inst.id)}
+        >
+          <Icon name="x" size={13} stroke={2.2} />
+        </button>
+      </section>
+    </div>
+  );
+}
+
+export function LaunchSplitButton({
+  inst,
+  canLaunch,
+  installQueued,
+  installProgress,
+  onLaunch,
+  onInstall,
+  onOpenLogs,
+  onOpenSettings,
+  preparing,
+}: {
+  inst: EnrichedInstance;
+  canLaunch: boolean;
+  installQueued: boolean;
+  installProgress: { pct: number; label: string } | null;
+  onLaunch: () => void;
+  onInstall: () => void;
+  onOpenLogs: () => void;
+  onOpenSettings: () => void;
+  preparing: Extract<LaunchState, { status: 'preparing' }> | null;
+}): JSX.Element {
+  const progress = preparing
+    ? { pct: preparing.pct, label: preparing.label }
+    : installProgress;
+  const needsInstall = !canLaunch;
+  const label = progress?.label || (installQueued ? 'Queued' : needsInstall ? 'Install' : 'Launch');
+  const icon = progress || installQueued ? 'clock' : needsInstall ? 'download' : 'play';
+  const pct = progress?.pct ?? 0;
+  const disabled = Boolean(progress) || installQueued;
+  const primaryAction = needsInstall ? onInstall : onLaunch;
+  const primaryMenuItem = needsInstall
+    ? {
+        icon: installQueued ? 'clock' : 'download',
+        label: installQueued ? 'Queued' : 'Install',
+        onSelect: installQueued ? () => toast('Install already queued') : onInstall,
+      }
+    : { icon: 'play', label: 'Launch now', onSelect: onLaunch };
+  return (
+    <div
+      class={`cp-instance-split-launch${progress ? ' cp-instance-split-launch--preparing' : ''}`}
+      role="group"
+      aria-label="Instance actions"
+      style={{ '--cp-launch-pct': `${pct}%` } as any}
+    >
+      {progress && <span class="cp-instance-split-launch-fill" aria-hidden="true" />}
+      <button
+        class="cp-instance-split-launch-main"
+        type="button"
+        onClick={disabled ? undefined : primaryAction}
+        data-sound={needsInstall ? 'bright' : 'launchPress'}
+        disabled={disabled}
+      >
+        <Icon name={icon} size={18} stroke={1.8} />
+        <span>{label}</span>
+      </button>
+      <button
+        class="cp-instance-split-launch-menu"
+        type="button"
+        aria-label="Instance options"
+        aria-haspopup="menu"
+        disabled={Boolean(progress)}
+        onClick={(e) => openContextMenu(e, [
+          primaryMenuItem,
+          { icon: 'settings', label: 'Launch settings', onSelect: onOpenSettings },
+          { icon: 'terminal', label: 'View launch logs', onSelect: onOpenLogs },
+          { label: '', onSelect: () => {}, divider: true },
+          { icon: 'folder', label: 'Open instance folder', onSelect: () => void openInstanceFolder(inst.id) },
+          { icon: 'folder', label: 'Open resource packs folder', onSelect: () => void openInstanceFolder(inst.id, 'resourcepacks') },
+          { icon: 'folder', label: 'Open shader packs folder', onSelect: () => void openInstanceFolder(inst.id, 'shaderpacks') },
+        ])}
+      >
+        <Icon name="chevron-down" size={16} stroke={2.3} />
+      </button>
+      {progress && <span class="cp-instance-launch-status">{Math.round(pct)}%</span>}
+    </div>
+  );
+}
+
+export function InstallBarrierPane({
+  installTarget,
+  installLabel,
+  installQueued,
+  installProgress,
+  installQueuePosition,
+  installQueueCount,
+}: {
+  installTarget: string;
+  installLabel: string;
+  installQueued: boolean;
+  installProgress: { pct: number; label: string; displayName?: string } | null;
+  installQueuePosition?: number;
+  installQueueCount?: number;
+}): JSX.Element {
+  const pct = installProgress ? Math.max(0, Math.min(100, Math.round(installProgress.pct))) : 0;
+  const queuedBehind = installQueuePosition != null ? installQueuePosition - 1 : undefined;
+  const queuedDetail = installQueuePosition != null && installQueueCount != null
+    ? installQueuePosition === 1
+      ? `Position 1 of ${installQueueCount}; next to start when the download slot opens.`
+      : `Position ${installQueuePosition} of ${installQueueCount}; waiting behind ${queuedBehind} item${queuedBehind === 1 ? '' : 's'}.`
+    : 'This instance will unlock automatically after its version install starts and finishes.';
+  const label = installProgress?.label || (installQueued ? 'Install waiting in queue' : 'Preparing install');
+  const detail = installProgress
+    ? `${pct}% complete`
+    : installQueued
+      ? queuedDetail
+      : 'Croopor is preparing the required version files.';
+
+  return (
+    <div class="cp-instance-install-lock" aria-live="polite">
+      <div class="cp-instance-install-lock-main">
+        <span class="cp-instance-install-lock-icon" aria-hidden="true">
+          <Icon name={installQueued ? 'clock' : 'download'} size={18} stroke={2} />
+        </span>
+        <div class="cp-instance-install-lock-copy">
+          <h2>{installQueued ? 'Install queued' : 'Installing required files'}</h2>
+          <p>{label} for {installLabel || installTarget}.</p>
+        </div>
+      </div>
+
+      <div class="cp-instance-install-lock-progress" style={{ '--cp-install-lock-pct': `${pct}%` } as any}>
+        <span aria-hidden="true" />
+      </div>
+
+      <div class="cp-instance-install-lock-foot">
+        <span>{detail}</span>
+        <Button variant="secondary" size="sm" icon="download" onClick={() => navigate({ name: 'downloads' })}>
+          Downloads
+        </Button>
+      </div>
+    </div>
+  );
+}
