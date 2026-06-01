@@ -34,7 +34,6 @@ interface SidebarItem {
   icon: string;
   label: string;
   route: Route;
-  showConnector?: boolean;
   instance?: Instance;
   scrollableChildren?: boolean;
   children?: SidebarItem[];
@@ -75,7 +74,6 @@ function sidebarInstanceItems(list: Instance[]): SidebarItem[] {
       icon: 'cube',
       label: inst.name,
       route: { name: 'instance', id: inst.id },
-      showConnector: true,
       instance: inst,
     }));
 }
@@ -100,21 +98,10 @@ function SidebarItemNode({ item, depth = 0, compact = false }: { item: SidebarIt
         title={compact ? item.label : undefined}
         aria-label={item.label}
       >
-        {depth > 0 && item.showConnector && (
-          <span class="cp-sidebar-tree-icon" aria-hidden="true">
-            <Icon
-              name="border-corner-rounded"
-              size={14}
-              stroke={1.35}
-              color="currentColor"
-              style={{ transform: 'scaleY(-1)' }}
-            />
-          </span>
-        )}
         {item.instance && compact ? (
           <InstanceArt instance={item.instance} aspect="thumb" radius={11} className="cp-sidebar-instance-art" />
         ) : (
-          <Icon name={item.icon} size={iconSize} stroke={compact ? 1.9 : 1.7} />
+          <Icon name={item.icon} size={iconSize} stroke={1.7} />
         )}
         <span class="cp-sidebar-label">{item.label}</span>
       </button>
@@ -267,7 +254,7 @@ export function Sidebar(): JSX.Element {
           route: { name: 'instances' },
           scrollableChildren: true,
           children: [
-            { icon: 'plus', label: 'New', route: { name: 'create' }, showConnector: false },
+            { icon: 'plus', label: 'New', route: { name: 'create' } },
             ...instanceItems,
           ],
         },

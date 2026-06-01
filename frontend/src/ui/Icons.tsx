@@ -61,7 +61,6 @@ type IconComponent = FunctionComponent<{
 const REGISTRY: Record<string, IconComponent> = {
   'activity': Pulse as IconComponent,
   'archive': Archive as IconComponent,
-  'border-corner-rounded': SquareCheckboxUnchecked as IconComponent,
   'arrow-left': ArrowLeft as IconComponent,
   'arrow-right': ArrowRight as IconComponent,
   'check': Check as IconComponent,
