@@ -315,6 +315,7 @@ export type LaunchReadinessReasonId =
   | 'version_json_missing'
   | 'client_jar_missing'
   | 'parent_version_missing'
+  | 'incomplete_install'
   | 'libraries_missing'
   | 'asset_index_missing'
   | 'managed_runtime_missing'

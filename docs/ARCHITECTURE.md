@@ -75,29 +75,30 @@ flowchart TD
 flowchart TD
     A[User clicks Play] --> B[frontend/src/launch.ts persists dirty per-instance overrides]
     B --> C[POST /api/v1/launch]
-    C --> D[apps/api routes/launch/task.rs validates request and builds LaunchIntent]
-    D --> E[Create LaunchGuardianContext from config + instance overrides]
-    E --> F[Reserve queued session in SessionStore]
-    F --> G[normal route returns queued session id + launch metadata]
-    F --> H[spawn routes/launch/runner.rs launch flow]
-    H --> I[core/launcher service prepares attempt]
-    I --> J[resolve version metadata]
-    J --> K[emit runtime ensure/download statuses while runtime work runs]
-    K --> L[collect runtime facts and effective runtime candidate]
-    L --> M[Guardian-driven pre-launch decision]
-    M -->|block| N[emit terminal failure with guardian + healing]
-    M -->|intervene| O[mutate attempt overrides and re-run prepare]
-    M -->|allow| P[plan launch command]
-    O --> I
-    P --> Q[spawn process via SessionStore]
-    Q --> R[emit starting + monitoring status]
-    R --> S[wait_for_startup observation window]
-    S -->|stable or timed out| T[emit running status with pid + guardian + healing]
-    S -->|stalled or exited| U[collect failure observations]
-    U --> V[Guardian decides whether startup recovery or a blocked startup summary is allowed]
-    V -->|recover| W[apply one startup recovery plan and retry]
-    V -->|block| X[emit terminal failure + guardian guidance]
-    W --> I
+    C --> D[apps/api routes/launch/task.rs validates request and captures preflight facts]
+    D --> E[Reject non-launchable readiness before session creation]
+    E --> F[Build LaunchIntent + LaunchGuardianContext]
+    F --> G[Reserve queued session in SessionStore]
+    G --> H[normal route returns queued session id + launch metadata]
+    G --> I[spawn routes/launch/runner.rs launch flow]
+    I --> J[core/launcher service prepares attempt]
+    J --> K[resolve version metadata]
+    K --> L[emit runtime ensure/download statuses while runtime work runs]
+    L --> M[collect runtime facts and effective runtime candidate]
+    M --> N[Guardian-driven pre-launch decision]
+    N -->|block| O[emit terminal failure with guardian + healing]
+    N -->|intervene| P[mutate attempt overrides and re-run prepare]
+    N -->|allow| Q[plan launch command]
+    P --> J
+    Q --> R[spawn process via SessionStore]
+    R --> S[emit starting + monitoring status]
+    S --> T[wait_for_startup observation window]
+    T -->|stable or timed out| U[emit running status with pid + guardian + healing]
+    T -->|stalled or exited| V[collect failure observations]
+    V --> W[Guardian decides whether startup recovery or a blocked startup summary is allowed]
+    W -->|recover| X[apply one startup recovery plan and retry]
+    W -->|block| Y[emit terminal failure + guardian guidance]
+    X --> J
 ```
 
 ### Launch pipeline: backend detail
@@ -125,13 +126,13 @@ flowchart TD
     O --> P[PreparedLaunchAttempt]
 ```
 
-Effective launch memory selection is backend-owned at launch request time. Per-instance memory values remain the highest-precedence explicit selection, explicit launch request memory remains next, and customized global config memory remains the global default. Fresh instances whose global config still has the built-in memory pair use launch-time host total RAM and the current version target to derive defaults before the Guardian/resource-budget snapshot is recorded: legacy vanilla targets use a smaller allocation, modern vanilla targets use the standard allocation, and loader/modded targets use a larger allocation, all bounded by the launcher OS-headroom policy when host memory evidence is available. Normal launch responses return as soon as a queued session exists and include the session id, `state: "queued"`, `pid: null`, launch timestamp, Guardian summary, and the effective `max_memory_mb` and `min_memory_mb` selected by backend preparation so the frontend can subscribe to live events before runtime preparation starts and record the running session allocation without recomputing memory policy locally. Benchmark launch routes still await the runner and return the normal post-spawn success payload plus benchmark metadata.
+Effective launch memory selection is backend-owned at launch request time. Per-instance memory values remain the highest-precedence explicit selection, explicit launch request memory remains next, and customized global config memory remains the global default. Fresh instances whose global config still has the built-in memory pair use launch-time host total RAM and the current version target to derive defaults before the Guardian/resource-budget snapshot is recorded: legacy vanilla targets use a smaller allocation, modern vanilla targets use the standard allocation, and loader/modded targets use a larger allocation, all bounded by the launcher OS-headroom policy when host memory evidence is available. Normal launch preparation rejects non-launchable local readiness, including incomplete version-install markers on the target or inherited base version, before inserting a session and returns bounded readiness reasons without paths. Normal launch responses return as soon as a queued session exists and include the session id, `state: "queued"`, `pid: null`, launch timestamp, Guardian summary, and the effective `max_memory_mb` and `min_memory_mb` selected by backend preparation so the frontend can subscribe to live events before runtime preparation starts and record the running session allocation without recomputing memory policy locally. Benchmark launch routes still await the runner and return the normal post-spawn success payload plus benchmark metadata.
 
 Launch preparation emits live status observations while runtime resolution is running: `ensuring_runtime` after version resolution and before runtime selection begins, and `downloading_runtime` immediately before the task that owns a missing managed Java runtime install enters the install path. These are status events on the existing session stream, not a new frontend workflow or per-file runtime download progress channel. A concurrent launch waiting on the same runtime install lock can remain at `ensuring_runtime` until the owning install completes.
 
 When Guardian blocks a launch before a process is available, benchmark launch and benchmark suite launch routes return HTTP `422 Unprocessable Entity` with the normal bounded launch-error JSON (`error`, optional `healing`, optional `guardian`). Normal launches have already returned the queued session response by that point, so the runner emits the same bounded Guardian/Healing failure through the session log/status stream and leaves a terminal session snapshot available through `/api/v1/launch/{id}/status`. Pre-session validation errors from the normal launch route still return their route-level HTTP errors before any session id is created. This keeps a deliberate Guardian safety block distinct from an internal API failure, while non-Guardian launch request failures remain HTTP `500` unless a more specific route-level status applies.
 
-The API exposes `GET /api/v1/launch/preflight/{instance_id}` as a read-only backend-authored Guardian preflight. The endpoint validates the configured library and instance existence, captures launch-preparation facts for Guardian mode, override origins, effective memory, selected-memory bounds, resource pressure, Custom-mode risky overrides, and no-download local launch-readiness diagnostics, then lets Guardian produce the warning summary and copy. It returns only bounded JSON facts: Guardian summary, effective memory, override origins/booleans, scalar resource pressure, and additive readiness state with stable reason ids such as missing installed version metadata, client jar, libraries, asset index, managed runtime, or explicit Java override. It never creates a launch session, starts Minecraft, installs files, ensures instance layout, writes proof state, probes Java by spawning a process, or exposes filesystem paths, command lines, raw JVM args, account names, usernames, or tokens. The current InstanceDetail overview does not render a persistent preflight panel; it keeps launch safety user-facing through launch/install affordances and backend-authored launch outcome notices.
+The API exposes `GET /api/v1/launch/preflight/{instance_id}` as a read-only backend-authored Guardian preflight. The endpoint validates the configured library and instance existence, captures launch-preparation facts for Guardian mode, override origins, effective memory, selected-memory bounds, resource pressure, Custom-mode risky overrides, and no-download local launch-readiness diagnostics, then lets Guardian produce the warning summary and copy. It returns only bounded JSON facts: Guardian summary, effective memory, override origins/booleans, scalar resource pressure, and additive readiness state with stable reason ids such as missing installed version metadata, incomplete install marker, client jar, libraries, asset index, managed runtime, or explicit Java override. It never creates a launch session, starts Minecraft, installs files, ensures instance layout, writes proof state, probes Java by spawning a process, or exposes filesystem paths, command lines, raw JVM args, account names, usernames, or tokens. The current InstanceDetail overview does not render a persistent preflight panel; it keeps launch safety user-facing through launch/install affordances and backend-authored launch outcome notices.
 
 Effective JVM preset selection is backend-owned. With no explicit preset override, HotSpot runtimes select from the current presets using version, loader/modded state, detected Java distribution, and host CPU/RAM evidence: supported GraalVM runtimes use the GraalVM preset, Java 8 legacy targets use the specific legacy preset for 1.8.9 PvP and modded 1.12.2 heavy launches when applicable, other Java 8 legacy targets use the conservative legacy preset, modern modded launches use the performance preset, high-end modern vanilla Java 21+ launches with at least 8 logical cores and 8 GiB total RAM use the ultra-low-latency preset, and other supported modern vanilla launches use the smooth preset. OpenJ9 and other unsupported HotSpot-tuning targets receive no Croopor GC flags.
 

@@ -1,11 +1,12 @@
 use crate::GuardianMode;
 use crate::build::{find_client_jar, uses_module_bootstrap};
 use croopor_minecraft::{
-    LaunchModelError, RuntimeOverride, VersionJson, default_environment, parse_runtime_override,
-    preferred_runtime_component, resolve_libraries, resolve_version,
+    LaunchModelError, RuntimeOverride, VersionJson, default_environment, load_version_json,
+    parse_runtime_override, preferred_runtime_component, resolve_libraries, resolve_version,
     runtime_component_ready_without_probe, runtime_executable_ready_without_probe,
 };
 use serde::Serialize;
+use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
@@ -35,6 +36,7 @@ pub struct LaunchReadinessReason {
 pub enum LaunchReadinessReasonId {
     VersionJsonMissing,
     ParentVersionMissing,
+    IncompleteInstall,
     ClientJarMissing,
     LibrariesMissing,
     AssetIndexMissing,
@@ -50,6 +52,7 @@ pub enum LaunchReadinessSeverity {
 
 pub fn inspect_launch_readiness(request: &LaunchReadinessRequest) -> LaunchReadiness {
     let mut reasons = Vec::new();
+    inspect_incomplete_install_markers(&request.library_dir, &request.version_id, &mut reasons);
 
     let version = match resolve_version(&request.library_dir, &request.version_id) {
         Ok(version) => {
@@ -74,6 +77,33 @@ pub fn inspect_launch_readiness(request: &LaunchReadinessRequest) -> LaunchReadi
             .iter()
             .all(|reason| reason.severity != LaunchReadinessSeverity::Blocking),
         reasons,
+    }
+}
+
+fn inspect_incomplete_install_markers(
+    library_dir: &Path,
+    version_id: &str,
+    reasons: &mut Vec<LaunchReadinessReason>,
+) {
+    let mut current_id = version_id.trim().to_string();
+    let mut seen = HashSet::new();
+    let mut depth = 0;
+
+    while !current_id.is_empty() && seen.insert(current_id.clone()) && depth <= 10 {
+        let version_dir = library_dir.join("versions").join(&current_id);
+        if version_dir.join(".incomplete").exists() {
+            reasons.push(reason(
+                LaunchReadinessReasonId::IncompleteInstall,
+                "Installation is incomplete. Finish or repair this version before launching.",
+            ));
+            return;
+        }
+
+        let Ok(version) = load_version_json(library_dir, &current_id) else {
+            return;
+        };
+        current_id = version.inherits_from.trim().to_string();
+        depth += 1;
     }
 }
 

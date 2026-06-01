@@ -171,6 +171,10 @@ async fn prepare_launch_session_with_auth_refresh(
         payload.min_memory_mb,
     )
     .await;
+    if !preflight.readiness.launchable {
+        return Err(launch_readiness_error_response(preflight.readiness));
+    }
+
     let launched_at = timestamp_utc();
     let session_id = policy::generate_session_id();
 
@@ -246,6 +250,18 @@ fn launch_layout_error_response(
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(json!({
             "error": "Could not prepare the instance folder. Check app data permissions and try again."
+        })),
+    )
+}
+
+fn launch_readiness_error_response(
+    readiness: LaunchReadiness,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::PRECONDITION_FAILED,
+        Json(json!({
+            "error": "Installed version is not ready to launch",
+            "readiness": readiness,
         })),
     )
 }
@@ -830,6 +846,7 @@ mod tests {
     #[tokio::test]
     async fn prepare_launch_session_ensures_instance_layout_before_building_intent() {
         let fixture = TestFixture::new("prepare-ensures-layout");
+        fixture.write_ready_install("1.21.1");
         fs::write(
             fixture.paths.library_dir.join("options.txt"),
             "shared options",
@@ -1573,6 +1590,134 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn launch_preflight_readiness_reports_incomplete_install_marker() {
+        let fixture = TestFixture::new("preflight-readiness-incomplete-install");
+        fixture.write_ready_install("1.21.1");
+        fs::write(
+            fixture
+                .paths
+                .library_dir
+                .join("versions")
+                .join("1.21.1")
+                .join(".incomplete"),
+            b"installing",
+        )
+        .expect("incomplete marker");
+        let instance_id = fixture.add_instance("Survival", "1.21.1");
+
+        let preflight = prepare_launch_preflight(&fixture.state, instance_id)
+            .await
+            .expect("prepare preflight");
+
+        assert!(!preflight.readiness.launchable);
+        assert_eq!(preflight.readiness.reasons.len(), 1);
+        assert_readiness_reason(&preflight, LaunchReadinessReasonId::IncompleteInstall);
+    }
+
+    #[tokio::test]
+    async fn prepare_launch_session_rejects_incomplete_install_without_session() {
+        let fixture = TestFixture::new("prepare-rejects-incomplete-install");
+        fixture.write_ready_install("1.21.1");
+        fs::write(
+            fixture
+                .paths
+                .library_dir
+                .join("versions")
+                .join("1.21.1")
+                .join(".incomplete"),
+            b"installing",
+        )
+        .expect("incomplete marker");
+        let instance_id = fixture.add_instance("Survival", "1.21.1");
+
+        let error = match prepare_launch_session(
+            &fixture.state,
+            LaunchRequest {
+                instance_id: instance_id.clone(),
+                username: None,
+                max_memory_mb: None,
+                min_memory_mb: None,
+                client_started_at_ms: None,
+            },
+        )
+        .await
+        {
+            Ok(_) => panic!("incomplete install should not queue"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.0, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(
+            error.1.0["error"],
+            "Installed version is not ready to launch"
+        );
+        assert_eq!(error.1.0["readiness"]["launchable"], false);
+        assert_eq!(
+            error.1.0["readiness"]["reasons"][0]["id"],
+            "incomplete_install"
+        );
+        assert_eq!(fixture.state.sessions().active_session_count().await, 0);
+        assert!(
+            !fixture
+                .state
+                .sessions()
+                .has_active_instance(&instance_id)
+                .await
+        );
+        let payload = error.1.0.to_string();
+        assert!(!payload.contains(&fixture.root.to_string_lossy().to_string()));
+        assert!(!payload.contains(".incomplete"));
+    }
+
+    #[tokio::test]
+    async fn prepare_launch_session_rejects_incomplete_parent_without_session() {
+        let fixture = TestFixture::new("prepare-rejects-incomplete-parent");
+        fixture.write_ready_install("1.21.1");
+        fixture.write_child_version("fabric-loader-0.16.10-1.21.1", "1.21.1");
+        fs::write(
+            fixture
+                .paths
+                .library_dir
+                .join("versions")
+                .join("1.21.1")
+                .join(".incomplete"),
+            b"installing",
+        )
+        .expect("incomplete marker");
+        let instance_id = fixture.add_instance("Modded", "fabric-loader-0.16.10-1.21.1");
+
+        let error = match prepare_launch_session(
+            &fixture.state,
+            LaunchRequest {
+                instance_id: instance_id.clone(),
+                username: None,
+                max_memory_mb: None,
+                min_memory_mb: None,
+                client_started_at_ms: None,
+            },
+        )
+        .await
+        {
+            Ok(_) => panic!("incomplete parent install should not queue"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.0, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(
+            error.1.0["readiness"]["reasons"][0]["id"],
+            "incomplete_install"
+        );
+        assert_eq!(fixture.state.sessions().active_session_count().await, 0);
+        assert!(
+            !fixture
+                .state
+                .sessions()
+                .has_active_instance(&instance_id)
+                .await
+        );
+    }
+
+    #[tokio::test]
     async fn launch_preflight_custom_override_warns_with_bounded_override_payload() {
         let fixture = TestFixture::new("preflight-custom-bounded");
         fixture.set_guardian_mode("custom");
@@ -1668,8 +1813,9 @@ mod tests {
         let fixture = TestFixture::new("prepare-custom-java-warning");
         fixture.set_guardian_mode("custom");
         let instance_id = fixture.add_instance("Survival", "1.21.1");
+        let java_path = fixture.write_manual_java_override();
         fixture.update_instance(&instance_id, |instance| {
-            instance.java_path = "/manual/java/bin/java".to_string();
+            instance.java_path = java_path.clone();
         });
 
         let prepared = fixture
@@ -1678,7 +1824,7 @@ mod tests {
             .expect("prepare launch session");
 
         assert_eq!(prepared.task.guardian.decision, GuardianDecision::Warned);
-        assert_eq!(prepared.task.intent.requested_java, "/manual/java/bin/java");
+        assert_eq!(prepared.task.intent.requested_java, java_path);
         assert_eq!(
             prepared.task.intent.guardian.java_override_origin,
             Some(OverrideOrigin::Instance)
@@ -1776,8 +1922,9 @@ mod tests {
         let fixture = TestFixture::new("prepare-managed-overrides-no-custom-warning");
         fixture.set_guardian_mode("managed");
         let instance_id = fixture.add_instance("Survival", "1.21.1");
+        let java_path = fixture.write_manual_java_override();
         fixture.update_instance(&instance_id, |instance| {
-            instance.java_path = "/manual/java/bin/java".to_string();
+            instance.java_path = java_path.clone();
             instance.jvm_preset = "graalvm".to_string();
             instance.extra_jvm_args = "-XX:+UseZGC".to_string();
         });
@@ -1803,7 +1950,7 @@ mod tests {
                 .iter()
                 .any(|detail| detail.starts_with("Guardian Custom mode will keep"))
         );
-        assert_eq!(prepared.task.intent.requested_java, "/manual/java/bin/java");
+        assert_eq!(prepared.task.intent.requested_java, java_path);
         assert_eq!(prepared.task.intent.requested_preset, "graalvm");
         assert_eq!(prepared.task.intent.extra_jvm_args, vec!["-XX:+UseZGC"]);
     }
@@ -1881,8 +2028,9 @@ mod tests {
         let fixture = TestFixture::new("prepare-memory-clamp-custom-merged-warning");
         fixture.set_guardian_mode("custom");
         let instance_id = fixture.add_instance("Survival", "1.21.1");
+        let java_path = fixture.write_manual_java_override();
         fixture.update_instance(&instance_id, |instance| {
-            instance.java_path = "/manual/java/bin/java".to_string();
+            instance.java_path = java_path;
         });
 
         let prepared = fixture
@@ -1905,8 +2053,9 @@ mod tests {
         let fixture = TestFixture::new("prepare-low-memory-custom-merged-warning");
         fixture.set_guardian_mode("custom");
         let instance_id = fixture.add_instance("Survival", "1.21.1");
+        let java_path = fixture.write_manual_java_override();
         fixture.update_instance(&instance_id, |instance| {
-            instance.java_path = "/manual/java/bin/java".to_string();
+            instance.java_path = java_path;
         });
 
         let prepared = fixture
@@ -1929,8 +2078,9 @@ mod tests {
         let fixture = TestFixture::new("prepare-merged-warning");
         fixture.set_guardian_mode("custom");
         let instance_id = fixture.add_instance("Survival", "1.21.1");
+        let java_path = fixture.write_manual_java_override();
         fixture.update_instance(&instance_id, |instance| {
-            instance.java_path = "/manual/java/bin/java".to_string();
+            instance.java_path = java_path;
         });
 
         let prepared = fixture
@@ -1981,8 +2131,9 @@ mod tests {
         let fixture = TestFixture::new("prepare-resource-merged-warning");
         fixture.set_guardian_mode("custom");
         let instance_id = fixture.add_instance("Survival", "1.21.1");
+        let java_path = fixture.write_manual_java_override();
         fixture.update_instance(&instance_id, |instance| {
-            instance.java_path = "/manual/java/bin/java".to_string();
+            instance.java_path = java_path;
         });
         for index in 0..4 {
             fixture
@@ -2177,6 +2328,66 @@ mod tests {
                 .id
         }
 
+        fn write_ready_install(&self, version_id: &str) {
+            self.write_version_json(
+                version_id,
+                serde_json::json!({
+                    "id": version_id,
+                    "type": "release",
+                    "mainClass": "net.minecraft.client.main.Main",
+                    "assetIndex": {},
+                    "javaVersion": { "component": "java-runtime-delta", "majorVersion": 21 },
+                    "libraries": []
+                }),
+            );
+            let version_dir = self.paths.library_dir.join("versions").join(version_id);
+            fs::write(version_dir.join(format!("{version_id}.jar")), b"client jar")
+                .expect("write client jar");
+            self.write_ready_runtime("java-runtime-delta");
+        }
+
+        fn write_child_version(&self, version_id: &str, parent_id: &str) {
+            self.write_version_json(
+                version_id,
+                serde_json::json!({
+                    "id": version_id,
+                    "inheritsFrom": parent_id,
+                    "type": "release",
+                    "mainClass": "net.minecraft.client.main.Main",
+                    "assetIndex": {},
+                    "libraries": []
+                }),
+            );
+        }
+
+        fn write_ready_runtime(&self, component: &str) {
+            let runtime_bin = self
+                .paths
+                .library_dir
+                .join("runtime")
+                .join(component)
+                .join("bin");
+            fs::create_dir_all(&runtime_bin).expect("runtime bin");
+            let java_name = if cfg!(target_os = "windows") {
+                "javaw.exe"
+            } else {
+                "java"
+            };
+            fs::write(runtime_bin.join(java_name), b"java").expect("runtime java");
+        }
+
+        fn write_manual_java_override(&self) -> String {
+            let bin_dir = self.root.join("manual-java").join("bin");
+            fs::create_dir_all(&bin_dir).expect("manual java bin");
+            let java_path = bin_dir.join(if cfg!(target_os = "windows") {
+                "javaw.exe"
+            } else {
+                "java"
+            });
+            fs::write(&java_path, b"java").expect("manual java");
+            java_path.to_string_lossy().to_string()
+        }
+
         fn update_instance(&self, id: &str, update: impl FnOnce(&mut Instance)) {
             let mut instance = self.state.instances().get(id).expect("instance");
             update(&mut instance);
@@ -2238,6 +2449,9 @@ mod tests {
             max_memory_mb: Option<i32>,
             min_memory_mb: Option<i32>,
         ) -> Result<PreparedLaunch, (StatusCode, Json<serde_json::Value>)> {
+            if let Some(instance) = self.state.instances().get(&instance_id) {
+                self.write_ready_install(&instance.version_id);
+            }
             prepare_launch_session(
                 &self.state,
                 LaunchRequest {
@@ -2257,6 +2471,9 @@ mod tests {
             token_endpoint: &str,
             auth_chain_client: &AuthChainClient,
         ) -> Result<PreparedLaunch, (StatusCode, Json<serde_json::Value>)> {
+            if let Some(instance) = self.state.instances().get(&instance_id) {
+                self.write_ready_install(&instance.version_id);
+            }
             prepare_launch_session_with_auth_refresh(
                 &self.state,
                 LaunchRequest {
