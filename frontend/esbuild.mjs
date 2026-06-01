@@ -1,5 +1,6 @@
 import net from 'node:net';
 import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
 import { context, build } from 'esbuild';
 
 const require = createRequire(import.meta.url);
@@ -15,6 +16,17 @@ const reactCompatAliases = new Map([
   ['react/jsx-runtime', 'preact/jsx-runtime'],
   ['react/jsx-dev-runtime', 'preact/jsx-runtime'],
 ]);
+
+const openaiIconSubsetPath = fileURLToPath(new URL('./src/vendor/openai-icons-subset.js', import.meta.url));
+
+const openaiIconSubsetPlugin = {
+  name: 'openai-icon-subset',
+  setup(b) {
+    b.onResolve({ filter: /^@openai\/apps-sdk-ui\/components\/Icon$/ }, () => ({
+      path: openaiIconSubsetPath,
+    }));
+  },
+};
 
 const preactCompatAliasPlugin = {
   name: 'preact-compat-alias',
@@ -38,7 +50,7 @@ const shared = {
   define: {
     __CROOPOR_WEB_API_BASE__: JSON.stringify(webApiBase),
   },
-  plugins: [preactCompatAliasPlugin],
+  plugins: [openaiIconSubsetPlugin, preactCompatAliasPlugin],
 };
 
 const sizeReporter = {
