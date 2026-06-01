@@ -1389,6 +1389,49 @@ function LaunchSplitButton({
   );
 }
 
+function InstallBarrierPane({
+  installTarget,
+  installQueued,
+  installProgress,
+}: {
+  installTarget: string;
+  installQueued: boolean;
+  installProgress: { pct: number; label: string } | null;
+}): JSX.Element {
+  const pct = installProgress ? Math.max(0, Math.min(100, Math.round(installProgress.pct))) : 0;
+  const label = installProgress?.label || (installQueued ? 'Waiting for the current download slot' : 'Preparing install');
+  const detail = installProgress
+    ? `${pct}% complete`
+    : installQueued
+      ? 'This instance will unlock automatically after its version install starts and finishes.'
+      : 'Croopor is preparing the required version files.';
+
+  return (
+    <div class="cp-instance-install-lock" aria-live="polite">
+      <div class="cp-instance-install-lock-main">
+        <span class="cp-instance-install-lock-icon" aria-hidden="true">
+          <Icon name={installQueued ? 'clock' : 'download'} size={18} stroke={2} />
+        </span>
+        <div class="cp-instance-install-lock-copy">
+          <h2>{installQueued ? 'Install queued' : 'Installing required files'}</h2>
+          <p>{label} for {installTarget}.</p>
+        </div>
+      </div>
+
+      <div class="cp-instance-install-lock-progress" style={{ '--cp-install-lock-pct': `${pct}%` } as any}>
+        <span aria-hidden="true" />
+      </div>
+
+      <div class="cp-instance-install-lock-foot">
+        <span>{detail}</span>
+        <Button variant="secondary" size="sm" icon="download" onClick={() => navigate({ name: 'downloads' })}>
+          Downloads
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 function PlaceholderPane({ title, hint, icon }: { title: string; hint: string; icon: string }): JSX.Element {
   const theme = useTheme();
   return (
@@ -2328,6 +2371,7 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
     ? { pct: install.pct, label: install.label }
     : null;
   const installQueued = !installProgress && installQueue.value.some(item => item.versionId === installTarget);
+  const installLocked = !canLaunch && (Boolean(installProgress) || installQueued);
 
   const onPlay = (): void => {
     selectInstance(inst.id);
@@ -2428,28 +2472,37 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
         </div>
       </div>
 
-      <div class="cp-instance-tabs" role="tablist">
-        {TABS.map(t => {
-          const count = tabCount(t.id);
-          return (
-            <button
-              key={t.id}
-              role="tab"
-              aria-selected={tab === t.id}
-              data-active={tab === t.id}
-              onClick={() => setTab(t.id)}
-            >
-              <Icon name={t.icon} size={15} />
-              {t.label}
-              {count != null && <span class="cp-tab-count">{count}</span>}
-            </button>
-          );
-        })}
-      </div>
+      {!installLocked && (
+        <div class="cp-instance-tabs" role="tablist">
+          {TABS.map(t => {
+            const count = tabCount(t.id);
+            return (
+              <button
+                key={t.id}
+                role="tab"
+                aria-selected={tab === t.id}
+                data-active={tab === t.id}
+                onClick={() => setTab(t.id)}
+              >
+                <Icon name={t.icon} size={15} />
+                {t.label}
+                {count != null && <span class="cp-tab-count">{count}</span>}
+              </button>
+            );
+          })}
+        </div>
+      )}
 
       {launchNotice && <LaunchOutcomeNotice inst={inst} notice={launchNotice} />}
 
-      {tab === 'overview' && (
+      {installLocked && (
+        <InstallBarrierPane
+          installTarget={installTarget}
+          installQueued={installQueued}
+          installProgress={installProgress}
+        />
+      )}
+      {!installLocked && tab === 'overview' && (
         <>
           <OverviewPane
             inst={inst}
@@ -2465,11 +2518,11 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
           </div>
         </>
       )}
-      {tab === 'mods' && <ModsPane inst={inst} resources={resources} onRefresh={reloadResources} />}
-      {tab === 'worlds' && <WorldsPane inst={inst} resources={resources} onRefresh={reloadResources} />}
-      {tab === 'screenshots' && <ScreenshotsPane inst={inst} resources={resources} onRefresh={reloadResources} />}
-      {tab === 'logs' && <LogsPane inst={inst} resources={resources} running={running} onRefresh={reloadResources} />}
-      {tab === 'settings' && <SettingsPane inst={inst} />}
+      {!installLocked && tab === 'mods' && <ModsPane inst={inst} resources={resources} onRefresh={reloadResources} />}
+      {!installLocked && tab === 'worlds' && <WorldsPane inst={inst} resources={resources} onRefresh={reloadResources} />}
+      {!installLocked && tab === 'screenshots' && <ScreenshotsPane inst={inst} resources={resources} onRefresh={reloadResources} />}
+      {!installLocked && tab === 'logs' && <LogsPane inst={inst} resources={resources} running={running} onRefresh={reloadResources} />}
+      {!installLocked && tab === 'settings' && <SettingsPane inst={inst} />}
     </div>
   );
 }
