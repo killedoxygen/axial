@@ -124,6 +124,14 @@ interface SavedSkinRecord {
   byte_size: number;
 }
 
+interface StagedSkinUpload {
+  file: File;
+  objectUrl: string;
+  detectedVariant: SkinVariant;
+  detectingVariant: boolean;
+  applyAfterSave: boolean;
+}
+
 function PlayerIdentityEditor({
   savedUsername,
   headSrc,
@@ -566,6 +574,10 @@ function skinVariantValue(value: string | undefined): SkinVariant {
   return value?.toLowerCase() === 'slim' ? 'slim' : 'classic';
 }
 
+function stagedSkinVariant(staged: StagedSkinUpload, selectedVariant: UploadSkinVariant): SkinVariant {
+  return selectedVariant === 'auto' ? staged.detectedVariant : selectedVariant;
+}
+
 function activeMinecraftSkin(profile: MinecraftProfile | undefined): MinecraftSkin | null {
   if (!profile) return null;
   return profile.skins.find((skin) => skin.state.toLowerCase() === 'active')
@@ -612,6 +624,10 @@ async function detectSkinVariantFromPng(file: File): Promise<SkinVariant> {
 
 async function resolveUploadSkinVariant(file: File, value: UploadSkinVariant): Promise<SkinVariant> {
   return value === 'auto' ? detectSkinVariantFromPng(file) : value;
+}
+
+function uploadSkinName(file: File): string {
+  return file.name.replace(/\.[^.]+$/, '').trim();
 }
 
 function minecraftProfile(value: unknown): MinecraftProfile | undefined {
@@ -1848,10 +1864,13 @@ function SavedSkinLibrary({
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const uploadApplyAfterSaveRef = useRef(false);
   const uploadDragDepthRef = useRef(0);
+  const stagedUploadUrlRef = useRef<string | null>(null);
+  const stagedUploadTokenRef = useRef(0);
   const { skins, state, error, refresh } = useSavedSkins();
   const [skinName, setSkinName] = useState('');
   const [lookupUsername, setLookupUsername] = useState('');
   const [uploadVariant, setUploadVariant] = useState<UploadSkinVariant>('auto');
+  const [stagedUpload, setStagedUpload] = useState<StagedSkinUpload | null>(null);
   const [busy, setBusy] = useState(false);
   const [profileBusy, setProfileBusy] = useState(false);
   const [lookupBusy, setLookupBusy] = useState(false);
@@ -1893,6 +1912,32 @@ function SavedSkinLibrary({
       && equippedSkin
       && selectedSkin.texture_key !== equippedSkin.texture_key,
   );
+  const stagedVariant = stagedUpload ? stagedSkinVariant(stagedUpload, uploadVariant) : null;
+  const stagedName = stagedUpload
+    ? trimmedName || uploadSkinName(stagedUpload.file) || 'Uploaded skin'
+    : '';
+  const stagedVariantReady = Boolean(
+    stagedUpload && (uploadVariant !== 'auto' || !stagedUpload.detectingVariant),
+  );
+  const stagedCanSave = Boolean(stagedUpload && canUpload && stagedVariantReady);
+  const stagedVariantLabel = stagedUpload && stagedVariant
+    ? uploadVariant === 'auto'
+      ? stagedUpload.detectingVariant
+        ? 'Detecting model'
+        : `Inferred ${stagedVariant}`
+      : `Manual ${stagedVariant}`
+    : '';
+
+  const clearStagedUpload = (): void => {
+    stagedUploadTokenRef.current += 1;
+    if (stagedUploadUrlRef.current) {
+      URL.revokeObjectURL(stagedUploadUrlRef.current);
+      stagedUploadUrlRef.current = null;
+    }
+    setStagedUpload(null);
+    uploadApplyAfterSaveRef.current = false;
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
 
   useEffect(() => {
     if (state !== 'ready') return;
@@ -1905,8 +1950,22 @@ function SavedSkinLibrary({
     setSelectedKey(next.texture_key);
   }, [skins, selectedKey, state]);
 
-  const upload = async (file: File, applyAfterSave = false): Promise<void> => {
-    const name = trimmedName || file.name.replace(/\.[^.]+$/, '').trim();
+  useEffect(() => {
+    return () => {
+      stagedUploadTokenRef.current += 1;
+      if (stagedUploadUrlRef.current) {
+        URL.revokeObjectURL(stagedUploadUrlRef.current);
+        stagedUploadUrlRef.current = null;
+      }
+    };
+  }, []);
+
+  const upload = async (
+    file: File,
+    applyAfterSave = false,
+    variantOverride?: SkinVariant,
+  ): Promise<void> => {
+    const name = trimmedName || uploadSkinName(file);
     if (!name) {
       setMessage({ tone: 'err', text: 'Name the skin before uploading.' });
       return;
@@ -1915,7 +1974,7 @@ function SavedSkinLibrary({
     setBusy(true);
     setMessage(null);
     try {
-      const resolvedVariant = await resolveUploadSkinVariant(file, uploadVariant);
+      const resolvedVariant = variantOverride ?? await resolveUploadSkinVariant(file, uploadVariant);
       const params = new URLSearchParams({ name, variant: resolvedVariant });
       const response = await fetch(apiUrl(`/skins?${params.toString()}`), {
         method: 'POST',
@@ -1930,6 +1989,7 @@ function SavedSkinLibrary({
       }
       const saved = savedSkinRecord(payload);
       setSkinName('');
+      clearStagedUpload();
       if (saved) setSelectedKey(saved.texture_key);
       if (saved && applyAfterSave) {
         try {
@@ -2105,6 +2165,51 @@ function SavedSkinLibrary({
     setMessage(null);
   };
 
+  const stageUploadFile = (file: File, applyAfterSave: boolean): void => {
+    if (!isPngFile(file)) {
+      setMessage({ tone: 'err', text: 'Upload a PNG skin file.' });
+      if (fileInputRef.current) fileInputRef.current.value = '';
+      return;
+    }
+    if (busy || profileBusy || lookupBusy) {
+      setMessage({ tone: 'err', text: 'Wait for the current skin action to finish.' });
+      if (fileInputRef.current) fileInputRef.current.value = '';
+      return;
+    }
+
+    const objectUrl = URL.createObjectURL(file);
+    stagedUploadTokenRef.current += 1;
+    const token = stagedUploadTokenRef.current;
+    if (stagedUploadUrlRef.current) URL.revokeObjectURL(stagedUploadUrlRef.current);
+    stagedUploadUrlRef.current = objectUrl;
+    setMessage(null);
+    setStagedUpload({
+      file,
+      objectUrl,
+      detectedVariant: 'classic',
+      detectingVariant: true,
+      applyAfterSave,
+    });
+
+    void detectSkinVariantFromPng(file).then((detectedVariant) => {
+      if (token !== stagedUploadTokenRef.current) return;
+      setStagedUpload((current) => current?.objectUrl === objectUrl
+        ? { ...current, detectedVariant, detectingVariant: false }
+        : current);
+    }).catch(() => {
+      if (token !== stagedUploadTokenRef.current) return;
+      setStagedUpload((current) => current?.objectUrl === objectUrl
+        ? { ...current, detectedVariant: 'classic', detectingVariant: false }
+        : current);
+    });
+  };
+
+  const saveStagedUpload = (applyAfterSave: boolean): void => {
+    if (!stagedUpload || !stagedVariant || !stagedCanSave) return;
+    if (applyAfterSave && !onlineReady) return;
+    void upload(stagedUpload.file, applyAfterSave, stagedVariant);
+  };
+
   const handleUploadDrop = (event: DragEvent): void => {
     event.preventDefault();
     event.stopPropagation();
@@ -2118,17 +2223,7 @@ function SavedSkinLibrary({
       return;
     }
 
-    const file = files[0];
-    if (!isPngFile(file)) {
-      setMessage({ tone: 'err', text: 'Upload a PNG skin file.' });
-      return;
-    }
-    if (busy || profileBusy || lookupBusy) {
-      setMessage({ tone: 'err', text: 'Wait for the current skin action to finish.' });
-      return;
-    }
-
-    void upload(file);
+    stageUploadFile(files[0], false);
   };
 
   const handleUploadDragEnter = (event: DragEvent): void => {
@@ -2154,16 +2249,12 @@ function SavedSkinLibrary({
   };
 
   const handleUploadFile = (file: File, applyAfterSave: boolean): void => {
-    if (!isPngFile(file)) {
-      setMessage({ tone: 'err', text: 'Upload a PNG skin file.' });
-      if (fileInputRef.current) fileInputRef.current.value = '';
-      return;
-    }
-    void upload(file, applyAfterSave);
+    stageUploadFile(file, applyAfterSave);
   };
 
   const openUploadPicker = (applyAfterSave: boolean): void => {
     uploadApplyAfterSaveRef.current = applyAfterSave;
+    if (fileInputRef.current) fileInputRef.current.value = '';
     fileInputRef.current?.click();
   };
 
@@ -2196,10 +2287,11 @@ function SavedSkinLibrary({
           onBlurCapture={() => setUploadFocused(false)}
         >
           <div style={{
-            display: 'grid',
-            gridTemplateColumns: 'minmax(220px, 1fr) auto auto auto',
+            display: 'flex',
+            flexWrap: 'wrap',
             gap: 10,
             alignItems: 'center',
+            minWidth: 0,
           }}>
             <Input
               value={skinName}
@@ -2209,16 +2301,22 @@ function SavedSkinLibrary({
               }}
               placeholder="Skin name, optional"
               icon="tag"
+              style={{ flex: '1 1 220px', minWidth: 0 }}
             />
-            <Segmented<UploadSkinVariant>
-              options={[
-                { value: 'auto', label: 'Auto' },
-                { value: 'classic', label: 'Classic' },
-                { value: 'slim', label: 'Slim' },
-              ]}
-              value={uploadVariant}
-              onChange={setUploadVariant}
-            />
+            <div style={{ flex: '0 1 auto', minWidth: 0 }}>
+              <Segmented<UploadSkinVariant>
+                options={[
+                  { value: 'auto', label: 'Auto' },
+                  { value: 'classic', label: 'Classic' },
+                  { value: 'slim', label: 'Slim' },
+                ]}
+                value={uploadVariant}
+                onChange={(value) => {
+                  setUploadVariant(value);
+                  setMessage(null);
+                }}
+              />
+            </div>
             <Button
               variant="secondary"
               icon="plus"
@@ -2243,8 +2341,110 @@ function SavedSkinLibrary({
             fontWeight: 500,
             lineHeight: 1.4,
           }}>
-            {uploadDragActive ? 'Drop one PNG skin file to upload.' : 'Drag a PNG skin file here, or use Upload PNG.'}
+            {uploadDragActive ? 'Drop one PNG skin file to preview.' : 'Drag a PNG skin file here, or use Upload PNG.'}
           </div>
+          {stagedUpload && stagedVariant && (
+            <div style={{
+              display: 'grid',
+              gridTemplateColumns: 'auto minmax(0, 1fr)',
+              gap: 14,
+              alignItems: 'center',
+              minWidth: 0,
+              paddingTop: 12,
+              marginTop: 2,
+              borderTop: '1px solid var(--line)',
+            }}>
+              <SkinBodyPreview
+                src={stagedUpload.objectUrl}
+                name={stagedName}
+                variant={stagedVariant}
+                side="front"
+              />
+              <div style={{ minWidth: 0, display: 'grid', gap: 7 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 7, flexWrap: 'wrap' }}>
+                  <Pill tone="info" icon="image">Staged PNG</Pill>
+                  <Pill tone="neutral">
+                    {stagedVariantLabel}
+                  </Pill>
+                  {stagedUpload.applyAfterSave && (
+                    <Pill tone={onlineReady ? 'ok' : 'warn'} icon={onlineReady ? 'check-circle' : 'alert'}>
+                      Apply requested
+                    </Pill>
+                  )}
+                </div>
+                <div style={{
+                  color: theme.n.text,
+                  fontSize: 14,
+                  fontWeight: 700,
+                  lineHeight: 1.25,
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                }}>
+                  {stagedName}
+                </div>
+                <div style={{
+                  color: theme.n.textMute,
+                  fontSize: 12,
+                  fontFamily: theme.font.mono,
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                }}>
+                  {stagedUpload.file.name} / {formatByteSize(stagedUpload.file.size)}
+                </div>
+                <div style={{ color: theme.n.textDim, fontSize: 12, lineHeight: 1.4, maxWidth: 560 }}>
+                  Review the PNG before saving it to your local skin library.
+                </div>
+              </div>
+              <div style={{
+                display: 'flex',
+                gridColumn: '1 / -1',
+                justifyContent: 'flex-end',
+                alignItems: 'center',
+                gap: 8,
+                flexWrap: 'wrap',
+              }}>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  icon="x"
+                  disabled={busy}
+                  onClick={clearStagedUpload}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  icon="plus"
+                  disabled={!canUpload}
+                  onClick={() => openUploadPicker(stagedUpload.applyAfterSave)}
+                >
+                  Replace
+                </Button>
+                <Button
+                  variant={stagedUpload.applyAfterSave ? 'ghost' : 'secondary'}
+                  size="sm"
+                  icon={busy ? 'refresh' : 'download'}
+                  disabled={!stagedCanSave}
+                  onClick={() => saveStagedUpload(false)}
+                >
+                  Save locally
+                </Button>
+                <Button
+                  variant={stagedUpload.applyAfterSave ? 'secondary' : 'ghost'}
+                  size="sm"
+                  icon={busy ? 'refresh' : 'check'}
+                  disabled={!stagedCanSave || !onlineReady}
+                  onClick={() => saveStagedUpload(true)}
+                  title={onlineReady ? 'Save locally, then apply to the active Minecraft account' : 'Online Minecraft account required'}
+                >
+                  Save & apply
+                </Button>
+              </div>
+            </div>
+          )}
           <input
             ref={fileInputRef}
             type="file"
@@ -2709,16 +2909,19 @@ function SkinPreviewPart({
   );
 }
 
-function SavedSkinBodyPreview({
-  skin,
+function SkinBodyPreview({
+  src,
+  name,
+  variant,
   side,
 }: {
-  skin: SavedSkinRecord;
+  src: string;
+  name: string;
+  variant: SkinVariant;
   side: SavedSkinPreviewSide;
 }): JSX.Element {
-  const src = savedSkinFileUrl(skin);
   const scale = 6;
-  const slim = skin.variant === 'slim';
+  const slim = variant === 'slim';
   const armWidth = slim ? 3 : 4;
   const parts = side === 'front'
     ? {
@@ -2772,7 +2975,7 @@ function SavedSkinBodyPreview({
   return (
     <div
       role="img"
-      aria-label={`${skin.name} ${side} full skin preview`}
+      aria-label={`${name} ${side} full skin preview`}
       style={{
         width: 118,
         minHeight: 208,
@@ -2809,6 +3012,23 @@ function SavedSkinBodyPreview({
         {previewPart(parts.leftLeg, parts.leftLegOverlay, 4, 12)}
       </div>
     </div>
+  );
+}
+
+function SavedSkinBodyPreview({
+  skin,
+  side,
+}: {
+  skin: SavedSkinRecord;
+  side: SavedSkinPreviewSide;
+}): JSX.Element {
+  return (
+    <SkinBodyPreview
+      src={savedSkinFileUrl(skin)}
+      name={skin.name}
+      variant={skin.variant}
+      side={side}
+    />
   );
 }
 
