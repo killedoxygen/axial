@@ -1812,10 +1812,16 @@ function SavedSkinLibrary({
   const trimmedEditName = editName.trim();
   const canUpload = !busy && !profileBusy && trimmedName.length > 0;
   const canSaveProfileSkin = onlineReady && Boolean(profileSkin) && !busy && !profileBusy;
+  const equippedSkin = skins.find((skin) => Boolean(skin.applied_at)) ?? null;
   const selectedSkin = skins.find((skin) => skin.texture_key === selectedKey)
-    ?? skins.find((skin) => Boolean(skin.applied_at))
+    ?? equippedSkin
     ?? skins[0]
     ?? null;
+  const previewPending = Boolean(
+    selectedSkin
+      && equippedSkin
+      && selectedSkin.texture_key !== equippedSkin.texture_key,
+  );
 
   useEffect(() => {
     if (state !== 'ready') return;
@@ -1962,6 +1968,12 @@ function SavedSkinLibrary({
     } finally {
       setApplyKey(null);
     }
+  };
+
+  const resetPreview = (): void => {
+    if (!equippedSkin) return;
+    setSelectedKey(equippedSkin.texture_key);
+    setMessage(null);
   };
 
   return (
@@ -2130,6 +2142,18 @@ function SavedSkinLibrary({
               </div>
             </div>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 8, flexWrap: 'wrap' }}>
+              {previewPending && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  icon="refresh"
+                  disabled={applyKey === selectedSkin.texture_key}
+                  onClick={resetPreview}
+                  title="Return preview to the equipped skin"
+                >
+                  Reset
+                </Button>
+              )}
               <Button
                 variant={selectedSkin.applied_at ? 'ghost' : 'secondary'}
                 size="sm"
