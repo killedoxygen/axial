@@ -570,6 +570,7 @@ fn gpu_vendor_from_model_name(value: &str) -> Option<&'static str> {
     }
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn nvidia_model_from_information(contents: &str) -> Option<String> {
     contents.lines().find_map(|line| {
         let (key, value) = line.split_once(':')?;
