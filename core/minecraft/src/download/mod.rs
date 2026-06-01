@@ -1,5 +1,5 @@
 use crate::java::ensure_java_runtime;
-use crate::launch::{Library, VersionJson, maven_to_path};
+use crate::launch::{JavaVersion, Library, VersionJson, maven_to_path};
 use crate::manifest::{ManifestEntry, fetch_version_manifest_cached};
 use crate::paths::{assets_dir, libraries_dir, versions_dir};
 use crate::rules::{current_os_arch, default_environment, evaluate_rules};
@@ -277,111 +277,121 @@ impl Downloader {
             None
         };
 
-        send(progress(
-            "client_jar",
-            0,
-            1,
-            Some(format!("{version_id}.jar")),
-        ));
-        let client_jar_task = if let Some(client) = &version.downloads.client {
-            let http_client = self.client.clone();
-            let url = client.url.clone();
-            let jar_path = version_dir.join(format!("{version_id}.jar"));
-            let expected = ExpectedIntegrity::from_mojang(client.size, &client.sha1);
-            Some(tokio::spawn(async move {
-                if !existing_file_satisfies(&jar_path, &expected).await? {
-                    download_file_with_client(&http_client, &url, &jar_path, &expected).await?;
+        let artifact_result = async {
+            send(progress(
+                "client_jar",
+                0,
+                1,
+                Some(format!("{version_id}.jar")),
+            ));
+            let client_jar_task = if let Some(client) = &version.downloads.client {
+                let http_client = self.client.clone();
+                let url = client.url.clone();
+                let jar_path = version_dir.join(format!("{version_id}.jar"));
+                let expected = ExpectedIntegrity::from_mojang(client.size, &client.sha1);
+                Some(tokio::spawn(async move {
+                    if !existing_file_satisfies(&jar_path, &expected).await? {
+                        download_file_with_client(&http_client, &url, &jar_path, &expected).await?;
+                    }
+                    Ok::<(), DownloadError>(())
+                }))
+            } else {
+                None
+            };
+
+            let library_jobs = self.library_jobs(&version);
+            send(progress("libraries", 0, library_jobs.len() as i32, None));
+            let client = self.client.clone();
+            let total_library_jobs = library_jobs.len() as i32;
+            let mut completed_library_jobs = 0;
+            let library_result = async {
+                let mut library_downloads =
+                    futures_util::stream::iter(library_jobs.into_iter().map(|job| {
+                        let client = client.clone();
+                        async move {
+                            if !existing_file_satisfies(&job.path, &job.expected).await? {
+                                download_file_with_client(
+                                    &client,
+                                    &job.url,
+                                    &job.path,
+                                    &job.expected,
+                                )
+                                .await?;
+                            }
+                            Ok::<String, DownloadError>(job.name)
+                        }
+                    }))
+                    .buffer_unordered(library_download_concurrency());
+                while let Some(result) = library_downloads.next().await {
+                    let name = result?;
+                    completed_library_jobs += 1;
+                    send(progress(
+                        "libraries",
+                        completed_library_jobs,
+                        total_library_jobs,
+                        Some(name),
+                    ));
                 }
                 Ok::<(), DownloadError>(())
-            }))
-        } else {
-            None
-        };
-
-        let library_jobs = self.library_jobs(&version);
-        send(progress("libraries", 0, library_jobs.len() as i32, None));
-        let client = self.client.clone();
-        let total_library_jobs = library_jobs.len() as i32;
-        let mut completed_library_jobs = 0;
-        let library_result = async {
-            let mut library_downloads =
-                futures_util::stream::iter(library_jobs.into_iter().map(|job| {
-                    let client = client.clone();
-                    async move {
-                        if !existing_file_satisfies(&job.path, &job.expected).await? {
-                            download_file_with_client(&client, &job.url, &job.path, &job.expected)
-                                .await?;
-                        }
-                        Ok::<String, DownloadError>(job.name)
-                    }
-                }))
-                .buffer_unordered(library_download_concurrency());
-            while let Some(result) = library_downloads.next().await {
-                let name = result?;
-                completed_library_jobs += 1;
+            }
+            .await;
+            let client_jar_result = await_client_jar_download(client_jar_task).await;
+            if client_jar_result.is_ok() && version.downloads.client.is_some() {
                 send(progress(
-                    "libraries",
-                    completed_library_jobs,
-                    total_library_jobs,
-                    Some(name),
+                    "client_jar",
+                    1,
+                    1,
+                    Some(format!("{version_id}.jar")),
                 ));
+            }
+            client_jar_result?;
+            library_result?;
+
+            if !version.asset_index.url.is_empty() {
+                let asset_index_path = assets_dir(&self.mc_dir)
+                    .join("indexes")
+                    .join(format!("{}.json", version.asset_index.id));
+                send(progress(
+                    "asset_index",
+                    0,
+                    1,
+                    Some(format!("{}.json", version.asset_index.id)),
+                ));
+                let expected = ExpectedIntegrity::from_mojang(
+                    version.asset_index.size,
+                    &version.asset_index.sha1,
+                );
+                if !existing_file_satisfies(&asset_index_path, &expected).await? {
+                    self.download_file(&version.asset_index.url, &asset_index_path, &expected)
+                        .await?;
+                }
+                self.download_asset_objects(&asset_index_path, send).await?;
+            }
+
+            if let Some(logging) = version
+                .logging
+                .as_ref()
+                .and_then(|logging| logging.client.as_ref())
+                && !logging.file.url.is_empty()
+            {
+                let log_config_path = assets_dir(&self.mc_dir)
+                    .join("log_configs")
+                    .join(&logging.file.id);
+                send(progress("log_config", 0, 1, Some(logging.file.id.clone())));
+                let expected =
+                    ExpectedIntegrity::from_mojang(logging.file.size, &logging.file.sha1);
+                if !existing_file_satisfies(&log_config_path, &expected).await? {
+                    self.download_file(&logging.file.url, &log_config_path, &expected)
+                        .await?;
+                }
             }
             Ok::<(), DownloadError>(())
         }
         .await;
-        let client_jar_result = await_client_jar_download(client_jar_task).await;
-        if client_jar_result.is_ok() && version.downloads.client.is_some() {
-            send(progress(
-                "client_jar",
-                1,
-                1,
-                Some(format!("{version_id}.jar")),
-            ));
-        }
-        client_jar_result?;
-        library_result?;
 
-        if !version.asset_index.url.is_empty() {
-            let asset_index_path = assets_dir(&self.mc_dir)
-                .join("indexes")
-                .join(format!("{}.json", version.asset_index.id));
-            send(progress(
-                "asset_index",
-                0,
-                1,
-                Some(format!("{}.json", version.asset_index.id)),
-            ));
-            let expected =
-                ExpectedIntegrity::from_mojang(version.asset_index.size, &version.asset_index.sha1);
-            if !existing_file_satisfies(&asset_index_path, &expected).await? {
-                self.download_file(&version.asset_index.url, &asset_index_path, &expected)
-                    .await?;
-            }
-            self.download_asset_objects(&asset_index_path, send).await?;
-        }
-
-        if let Some(logging) = version
-            .logging
-            .as_ref()
-            .and_then(|logging| logging.client.as_ref())
-            && !logging.file.url.is_empty()
+        if let Some(java_version) =
+            finish_runtime_task_after_artifacts(runtime_task, artifact_result).await?
         {
-            let log_config_path = assets_dir(&self.mc_dir)
-                .join("log_configs")
-                .join(&logging.file.id);
-            send(progress("log_config", 0, 1, Some(logging.file.id.clone())));
-            let expected = ExpectedIntegrity::from_mojang(logging.file.size, &logging.file.sha1);
-            if !existing_file_satisfies(&log_config_path, &expected).await? {
-                self.download_file(&logging.file.url, &log_config_path, &expected)
-                    .await?;
-            }
-        }
-
-        if let Some(task) = runtime_task {
-            let java_version = task
-                .await
-                .map_err(|error| DownloadError::PrepareRuntime(error.to_string()))?
-                .map_err(DownloadError::PrepareRuntime)?;
             send(progress(
                 "java_runtime",
                 1,
@@ -721,6 +731,28 @@ async fn await_client_jar_download(
 
     task.await.map_err(client_jar_task_error)??;
     Ok(())
+}
+
+async fn finish_runtime_task_after_artifacts(
+    task: Option<tokio::task::JoinHandle<Result<JavaVersion, String>>>,
+    artifact_result: Result<(), DownloadError>,
+) -> Result<Option<JavaVersion>, DownloadError> {
+    let Some(task) = task else {
+        return artifact_result.map(|_| None);
+    };
+
+    let runtime_result = match task.await {
+        Ok(result) => result.map_err(DownloadError::PrepareRuntime),
+        Err(error) => Err(DownloadError::PrepareRuntime(error.to_string())),
+    };
+
+    match artifact_result {
+        Ok(()) => runtime_result.map(Some),
+        Err(error) => {
+            let _ = runtime_result;
+            Err(error)
+        }
+    }
 }
 
 fn client_jar_task_error(error: tokio::task::JoinError) -> DownloadError {
@@ -1200,7 +1232,13 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::path::Path;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::sync::oneshot;
+    use tokio::time::{Duration, timeout};
 
     #[tokio::test]
     async fn install_version_emits_terminal_error_when_setup_fails() {
@@ -1226,6 +1264,63 @@ mod tests {
 
         let _ = fs::remove_file(root.join("versions"));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn runtime_task_is_joined_when_artifact_install_fails() {
+        let joined = Arc::new(AtomicBool::new(false));
+        let joined_in_task = Arc::clone(&joined);
+        let (release_tx, release_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _ = release_rx.await;
+            joined_in_task.store(true, Ordering::SeqCst);
+            Ok(JavaVersion::default())
+        });
+        let artifact_error = DownloadError::ResolveManifest("artifact failed".to_string());
+        let mut result = Box::pin(finish_runtime_task_after_artifacts(
+            Some(task),
+            Err(artifact_error),
+        ));
+
+        assert!(
+            timeout(Duration::from_millis(25), &mut result)
+                .await
+                .is_err()
+        );
+
+        release_tx.send(()).expect("release runtime task");
+        let result = result.await;
+
+        assert!(matches!(
+            result,
+            Err(DownloadError::ResolveManifest(message)) if message == "artifact failed"
+        ));
+        assert!(joined.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn runtime_error_is_reported_when_artifact_install_succeeds() {
+        let task = tokio::spawn(async { Err::<JavaVersion, String>("runtime failed".to_string()) });
+
+        let result = finish_runtime_task_after_artifacts(Some(task), Ok(())).await;
+
+        assert!(matches!(
+            result,
+            Err(DownloadError::PrepareRuntime(message)) if message == "runtime failed"
+        ));
+    }
+
+    #[tokio::test]
+    async fn artifact_error_is_preserved_when_runtime_also_fails() {
+        let task = tokio::spawn(async { Err::<JavaVersion, String>("runtime failed".to_string()) });
+        let artifact_error = DownloadError::ResolveManifest("artifact failed".to_string());
+
+        let result = finish_runtime_task_after_artifacts(Some(task), Err(artifact_error)).await;
+
+        assert!(matches!(
+            result,
+            Err(DownloadError::ResolveManifest(message)) if message == "artifact failed"
+        ));
     }
 
     #[test]
