@@ -140,6 +140,7 @@ interface StagedSkinUpload {
 
 interface SkinNormalizeMetadata {
   textureKey: string;
+  variantSuggestion: SkinVariant;
   originalWidth: number;
   originalHeight: number;
   normalizedByteSize: number;
@@ -587,6 +588,7 @@ function skinNormalizeMetadata(value: unknown): SkinNormalizeMetadata | null {
   if (!isRecord(value)) return null;
   if (
     typeof value.texture_key !== 'string' ||
+    (value.variant_suggestion !== 'classic' && value.variant_suggestion !== 'slim') ||
     typeof value.original_width !== 'number' ||
     typeof value.original_height !== 'number' ||
     typeof value.normalized_byte_size !== 'number'
@@ -596,6 +598,7 @@ function skinNormalizeMetadata(value: unknown): SkinNormalizeMetadata | null {
 
   return {
     textureKey: value.texture_key,
+    variantSuggestion: value.variant_suggestion,
     originalWidth: value.original_width,
     originalHeight: value.original_height,
     normalizedByteSize: value.normalized_byte_size,
@@ -2252,6 +2255,8 @@ function SavedSkinLibrary({
       setStagedUpload((current) => current?.objectUrl === objectUrl
         ? {
             ...current,
+            detectedVariant: metadata.variantSuggestion,
+            detectingVariant: false,
             normalizeStatus: 'ready',
             normalizeError: undefined,
             textureKey: metadata.textureKey,
@@ -2265,21 +2270,10 @@ function SavedSkinLibrary({
       setStagedUpload((current) => current?.objectUrl === objectUrl
         ? {
             ...current,
+            detectingVariant: false,
             normalizeStatus: 'error',
             normalizeError: boundedMessage(err instanceof Error ? err.message : undefined, 'Skin validation failed.'),
           }
-        : current);
-    });
-
-    void detectSkinVariantFromPng(file).then((detectedVariant) => {
-      if (token !== stagedUploadTokenRef.current) return;
-      setStagedUpload((current) => current?.objectUrl === objectUrl
-        ? { ...current, detectedVariant, detectingVariant: false }
-        : current);
-    }).catch(() => {
-      if (token !== stagedUploadTokenRef.current) return;
-      setStagedUpload((current) => current?.objectUrl === objectUrl
-        ? { ...current, detectedVariant: 'classic', detectingVariant: false }
         : current);
     });
   };

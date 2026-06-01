@@ -304,7 +304,7 @@ async fn handle_skin_normalize(body: Body) -> Result<Json<SkinNormalizeResponse>
 
     Ok(Json(SkinNormalizeResponse {
         texture_key: texture_key(&normalized.png_bytes),
-        variant_suggestion: "classic",
+        variant_suggestion: normalized.variant_suggestion,
         original_width: normalized.original_width,
         original_height: normalized.original_height,
         normalized_width: SKIN_WIDTH,
@@ -1151,6 +1151,7 @@ impl From<SkinUploadMinecraftCape> for AuthLoginMinecraftCape {
 struct NormalizedSkinPng {
     original_width: u32,
     original_height: u32,
+    variant_suggestion: &'static str,
     png_bytes: Vec<u8>,
 }
 
@@ -1170,16 +1171,23 @@ fn normalize_skin_png(bytes: &[u8]) -> Result<NormalizedSkinPng, ApiError> {
         ));
     }
 
-    let normalized_rgba = if decoded.height == LEGACY_SKIN_HEIGHT {
+    let original_height = decoded.height;
+    let normalized_rgba = if original_height == LEGACY_SKIN_HEIGHT {
         normalize_legacy_skin_rgba(&decoded.rgba)
     } else {
         decoded.rgba
+    };
+    let variant_suggestion = if original_height == LEGACY_SKIN_HEIGHT {
+        "classic"
+    } else {
+        suggest_skin_variant(&normalized_rgba)
     };
     let png_bytes = encode_skin_png(&normalized_rgba)?;
 
     Ok(NormalizedSkinPng {
         original_width: decoded.width,
-        original_height: decoded.height,
+        original_height,
+        variant_suggestion,
         png_bytes,
     })
 }
@@ -1273,6 +1281,18 @@ fn normalize_legacy_skin_rgba(rgba: &[u8]) -> Vec<u8> {
         normalized[offset..offset + row_len].copy_from_slice(&rgba[offset..offset + row_len]);
     }
     normalized
+}
+
+fn suggest_skin_variant(rgba: &[u8]) -> &'static str {
+    for y in 20..32 {
+        for x in 54..56 {
+            let alpha_index = ((y * SKIN_WIDTH + x) * 4 + 3) as usize;
+            if rgba.get(alpha_index).copied().unwrap_or(255) != 0 {
+                return "classic";
+            }
+        }
+    }
+    "slim"
 }
 
 fn encode_skin_png(rgba: &[u8]) -> Result<Vec<u8>, ApiError> {
@@ -2053,6 +2073,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn skin_normalize_64x64_png_suggests_slim_when_arm_region_is_transparent() {
+        let png = test_slim_skin_png();
+
+        let response = normalize_skin_body(png)
+            .await
+            .expect("normalize response")
+            .0;
+
+        assert_eq!(response.variant_suggestion, "slim");
+        assert_eq!(response.original_width, SKIN_WIDTH);
+        assert_eq!(response.original_height, SKIN_HEIGHT);
+        assert_texture_key(&response.texture_key);
+    }
+
+    #[tokio::test]
     async fn skin_normalize_64x32_png_normalizes_to_64x64() {
         let png = test_skin_png(SKIN_WIDTH, LEGACY_SKIN_HEIGHT);
 
@@ -2067,6 +2102,7 @@ mod tests {
 
         assert_eq!(response.original_width, SKIN_WIDTH);
         assert_eq!(response.original_height, LEGACY_SKIN_HEIGHT);
+        assert_eq!(response.variant_suggestion, "classic");
         assert_eq!(response.normalized_width, SKIN_WIDTH);
         assert_eq!(response.normalized_height, SKIN_HEIGHT);
         assert_eq!(response.texture_key, repeated.texture_key);
@@ -3640,6 +3676,23 @@ mod tests {
     }
 
     fn test_skin_png(width: u32, height: u32) -> Vec<u8> {
+        let rgba = test_skin_rgba(width, height);
+        encode_test_png(width, height, &rgba)
+    }
+
+    fn test_slim_skin_png() -> Vec<u8> {
+        let mut rgba = test_skin_rgba(SKIN_WIDTH, SKIN_HEIGHT);
+        for y in 20..32 {
+            for x in 54..56 {
+                let alpha_index = ((y * SKIN_WIDTH + x) * 4 + 3) as usize;
+                rgba[alpha_index] = 0;
+            }
+        }
+
+        encode_test_png(SKIN_WIDTH, SKIN_HEIGHT, &rgba)
+    }
+
+    fn test_skin_rgba(width: u32, height: u32) -> Vec<u8> {
         let mut rgba = Vec::with_capacity((width * height * 4) as usize);
         for y in 0..height {
             for x in 0..width {
@@ -3651,7 +3704,10 @@ mod tests {
                 ]);
             }
         }
+        rgba
+    }
 
+    fn encode_test_png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
         let mut bytes = Vec::new();
         {
             let mut encoder = png::Encoder::new(&mut bytes, width, height);
