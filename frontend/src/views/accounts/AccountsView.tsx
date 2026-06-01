@@ -1939,6 +1939,7 @@ function SavedSkinLibrary({
   const [lookupUsername, setLookupUsername] = useState('');
   const [uploadVariant, setUploadVariant] = useState<UploadSkinVariant>('auto');
   const [stagedUpload, setStagedUpload] = useState<StagedSkinUpload | null>(null);
+  const [stagedPreviewSide, setStagedPreviewSide] = useState<SavedSkinPreviewSide>('front');
   const [busy, setBusy] = useState(false);
   const [profileBusy, setProfileBusy] = useState(false);
   const [lookupBusy, setLookupBusy] = useState(false);
@@ -2011,6 +2012,7 @@ function SavedSkinLibrary({
       stagedUploadUrlRef.current = null;
     }
     setStagedUpload(null);
+    setStagedPreviewSide('front');
     uploadApplyAfterSaveRef.current = false;
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
@@ -2259,6 +2261,7 @@ function SavedSkinLibrary({
     if (stagedUploadUrlRef.current) URL.revokeObjectURL(stagedUploadUrlRef.current);
     stagedUploadUrlRef.current = objectUrl;
     setMessage(null);
+    setStagedPreviewSide('front');
     setStagedUpload({
       file,
       objectUrl,
@@ -2446,12 +2449,24 @@ function SavedSkinLibrary({
               marginTop: 2,
               borderTop: '1px solid var(--line)',
             }}>
-              <SkinBodyPreview
-                src={stagedUpload.objectUrl}
-                name={stagedName}
-                variant={stagedVariant}
-                side="front"
-              />
+              <div style={{ display: 'grid', gap: 8, justifyItems: 'center' }}>
+                <SkinBodyPreview
+                  src={stagedUpload.objectUrl}
+                  name={stagedName}
+                  variant={stagedVariant}
+                  side={stagedPreviewSide}
+                />
+                <div role="group" aria-label={`${stagedName} staged body preview side`}>
+                  <Segmented<SavedSkinPreviewSide>
+                    options={[
+                      { value: 'front', label: 'Front' },
+                      { value: 'back', label: 'Back' },
+                    ]}
+                    value={stagedPreviewSide}
+                    onChange={setStagedPreviewSide}
+                  />
+                </div>
+              </div>
               <div style={{ minWidth: 0, display: 'grid', gap: 7 }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 7, flexWrap: 'wrap' }}>
                   <Pill tone="info" icon="image">Staged PNG</Pill>
