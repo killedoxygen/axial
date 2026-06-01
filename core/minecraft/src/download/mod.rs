@@ -509,7 +509,7 @@ impl Downloader {
                 }
                 output.flush().await?;
                 verify_downloaded_file(&tmp_path, expected).await?;
-                tokio::fs::rename(&tmp_path, destination).await?;
+                promote_download_temp(&tmp_path, destination).await?;
                 Ok::<(), DownloadError>(())
             }
             .await;
@@ -908,7 +908,7 @@ async fn download_file_with_client(
             }
             output.flush().await?;
             verify_downloaded_file(&tmp_path, expected).await?;
-            tokio::fs::rename(&tmp_path, destination).await?;
+            promote_download_temp(&tmp_path, destination).await?;
             Ok::<(), DownloadError>(())
         }
         .await;
@@ -925,6 +925,35 @@ async fn download_file_with_client(
         }
     }
     Err(last_error.unwrap_or_else(|| DownloadError::ResolveManifest("download failed".to_string())))
+}
+
+async fn promote_download_temp(temp_path: &Path, destination: &Path) -> Result<(), DownloadError> {
+    match async_fs::rename(temp_path, destination).await {
+        Ok(()) => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(DownloadError::FileOperation(error));
+        }
+        Err(_) => {}
+    }
+
+    remove_existing_download_destination(destination).await;
+    match async_fs::rename(temp_path, destination).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = async_fs::remove_file(temp_path).await;
+            Err(DownloadError::FileOperation(error))
+        }
+    }
+}
+
+async fn remove_existing_download_destination(destination: &Path) {
+    let Ok(metadata) = async_fs::symlink_metadata(destination).await else {
+        return;
+    };
+    let file_type = metadata.file_type();
+    if metadata.is_file() || file_type.is_symlink() {
+        let _ = async_fs::remove_file(destination).await;
+    }
 }
 
 async fn existing_file_satisfies(
@@ -1293,6 +1322,65 @@ mod tests {
             )
             .await
             .expect("sha1 mismatch")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn promote_download_temp_replaces_existing_destination() {
+        let root = temp_dir("promote-replace");
+        fs::create_dir_all(&root).expect("create root");
+        let destination = root.join("artifact.jar");
+        let temp_path = root.join("artifact.tmp");
+        fs::write(&destination, b"stale").expect("write stale artifact");
+        fs::write(&temp_path, b"fresh").expect("write temp artifact");
+
+        promote_download_temp(&temp_path, &destination)
+            .await
+            .expect("promote temp");
+
+        assert_eq!(
+            fs::read(&destination).expect("read promoted artifact"),
+            b"fresh"
+        );
+        assert!(!temp_path.exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn promote_download_temp_removes_temp_when_retry_fails() {
+        let root = temp_dir("promote-cleanup");
+        fs::create_dir_all(&root).expect("create root");
+        let destination = root.join("artifact.jar");
+        let temp_path = root.join("artifact.tmp");
+        fs::create_dir_all(&destination).expect("create destination directory");
+        fs::write(&temp_path, b"fresh").expect("write temp artifact");
+
+        let result = promote_download_temp(&temp_path, &destination).await;
+
+        assert!(result.is_err());
+        assert!(!temp_path.exists());
+        assert!(destination.is_dir());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn promote_download_temp_preserves_destination_when_temp_is_missing() {
+        let root = temp_dir("promote-missing-temp");
+        fs::create_dir_all(&root).expect("create root");
+        let destination = root.join("artifact.jar");
+        let temp_path = root.join("missing.tmp");
+        fs::write(&destination, b"existing").expect("write existing artifact");
+
+        let result = promote_download_temp(&temp_path, &destination).await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read(&destination).expect("read existing artifact"),
+            b"existing"
         );
 
         let _ = fs::remove_dir_all(root);
