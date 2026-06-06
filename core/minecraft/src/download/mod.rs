@@ -339,10 +339,11 @@ impl Downloader {
                 let mut asset_progress_open = asset_pipeline.is_some();
                 loop {
                     if asset_progress_open {
-                        let asset_progress_rx = &mut asset_pipeline
-                            .as_mut()
-                            .expect("asset pipeline should exist")
-                            .progress_rx;
+                        let Some(asset_pipeline) = asset_pipeline.as_mut() else {
+                            asset_progress_open = false;
+                            continue;
+                        };
+                        let asset_progress_rx = &mut asset_pipeline.progress_rx;
                         tokio::select! {
                             progress = asset_progress_rx.recv() => {
                                 if let Some(progress) = progress {
