@@ -2849,7 +2849,7 @@ function SavedSkinLibrary({
                   key={skin.texture_key}
                   style={{
                     display: 'grid',
-                    gridTemplateColumns: editing ? '42px minmax(0, 1fr)' : '42px minmax(0, 1fr) auto auto',
+                    gridTemplateColumns: editing ? '44px minmax(0, 1fr)' : '44px minmax(0, 1fr) auto auto',
                     gap: 12,
                     alignItems: 'center',
                     padding: '10px 12px',
@@ -2857,12 +2857,12 @@ function SavedSkinLibrary({
                     borderTop: index === 0 ? undefined : '1px solid var(--line)',
                   }}
                 >
-                  <PlayerHeadPreview
-                    username={skin.name}
-                    textureSrc={apiResourceUrl(`/skins/${skin.texture_key}/file`)}
-                    size={32}
-                    radius={6}
-                    ariaLabel={`${skin.name} skin preview`}
+                  <SavedSkinBodyPreview
+                    skin={skin}
+                    side="front"
+                    showOuterLayers
+                    scale={2}
+                    compact
                   />
                   {editing ? (
                     <div style={{
@@ -3068,16 +3068,38 @@ function SkinBodyPreview({
   variant,
   side,
   showOuterLayers,
+  scale = 6,
+  compact = false,
 }: {
   src: string;
   name: string;
   variant: SkinVariant;
   side: SavedSkinPreviewSide;
   showOuterLayers: boolean;
+  scale?: number;
+  compact?: boolean;
 }): JSX.Element {
-  const scale = 6;
   const slim = variant === 'slim';
   const armWidth = slim ? 3 : 4;
+  const frameStyle: JSX.CSSProperties = compact
+    ? {
+        width: 40,
+        minHeight: 64,
+        padding: 0,
+        border: '0',
+        borderRadius: 0,
+        background: 'transparent',
+        boxShadow: 'none',
+      }
+    : {
+        width: 118,
+        minHeight: 208,
+        padding: 12,
+        border: '1px solid var(--line)',
+        borderRadius: 'var(--r-md)',
+        background: 'var(--surface-2)',
+        boxShadow: 'inset 0 1px 0 color-mix(in oklab, var(--text) 5%, transparent)',
+      };
   const parts = side === 'front'
     ? {
       head: { x: 8, y: 8 },
@@ -3134,17 +3156,11 @@ function SkinBodyPreview({
       role="img"
       aria-label={`${name} ${side} ${showOuterLayers ? 'full' : 'base'} skin preview`}
       style={{
-        width: 118,
-        minHeight: 208,
+        ...frameStyle,
         display: 'grid',
         alignContent: 'center',
         justifyItems: 'center',
         gap: 0,
-        padding: 12,
-        border: '1px solid var(--line)',
-        borderRadius: 'var(--r-md)',
-        background: 'var(--surface-2)',
-        boxShadow: 'inset 0 1px 0 color-mix(in oklab, var(--text) 5%, transparent)',
       }}
     >
       <div style={{ position: 'relative', width: 8 * scale, height: 8 * scale, marginBottom: 2 }}>
@@ -3178,10 +3194,14 @@ function SavedSkinBodyPreview({
   skin,
   side,
   showOuterLayers,
+  scale,
+  compact,
 }: {
   skin: SavedSkinRecord;
   side: SavedSkinPreviewSide;
   showOuterLayers: boolean;
+  scale?: number;
+  compact?: boolean;
 }): JSX.Element {
   return (
     <SkinBodyPreview
@@ -3190,6 +3210,8 @@ function SavedSkinBodyPreview({
       variant={skin.variant}
       side={side}
       showOuterLayers={showOuterLayers}
+      scale={scale}
+      compact={compact}
     />
   );
 }
