@@ -1,4 +1,5 @@
 import type { JSX } from 'preact';
+import { useEffect, useState } from 'preact/hooks';
 import { Button, Card, IconButton, Meter, Pill, SectionHeading } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { useTheme } from '../../hooks/use-theme';
@@ -12,8 +13,8 @@ function formatFailureTime(timestamp: number): string {
   return new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
-function formatElapsedTime(startedAt: number): string {
-  const elapsedSeconds = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+function formatElapsedTime(startedAt: number, now: number): string {
+  const elapsedSeconds = Math.max(0, Math.floor((now - startedAt) / 1000));
   if (elapsedSeconds < 60) return `${elapsedSeconds}s elapsed`;
   const minutes = Math.floor(elapsedSeconds / 60);
   const seconds = elapsedSeconds % 60;
@@ -29,6 +30,20 @@ export function DownloadsView(): JSX.Element {
   const queue = installQueue.value;
   const failure = installFailure.value;
   const hasActive = state.status === 'active';
+  const activeStartedAt = hasActive ? state.startedAt : 0;
+  const [elapsedNow, setElapsedNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    if (!hasActive) return;
+    setElapsedNow(Date.now());
+    const intervalId = window.setInterval(() => {
+      setElapsedNow(Date.now());
+    }, 1000);
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [hasActive, activeStartedAt]);
+
   const activeTitle = hasActive ? state.displayName || state.versionId : '';
   const queuedLabel = `${queue.length} queued`;
   const queuedItemLabel = queue.length === 1 ? '1 item queued' : `${queue.length} items queued`;
@@ -111,7 +126,7 @@ export function DownloadsView(): JSX.Element {
             fontSize: 11,
             lineHeight: 1.35,
           }}>
-            <span>{formatElapsedTime(state.startedAt)}</span>
+            <span>{formatElapsedTime(state.startedAt, elapsedNow)}</span>
             <span style={{ fontVariantNumeric: 'tabular-nums' }}>
               {activeEta ? `${activeEta} · ` : ''}{activePct}%
             </span>
