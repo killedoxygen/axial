@@ -2891,6 +2891,15 @@ function SavedSkinLibrary({
               >
                 Edit
               </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                icon="trash"
+                disabled={deleteKey === selectedSkin.texture_key || applyKey === selectedSkin.texture_key}
+                onClick={() => void deleteSkin(selectedSkin.texture_key)}
+              >
+                Delete
+              </Button>
             </div>
           </div>
         )}
