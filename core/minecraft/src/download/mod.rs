@@ -11,6 +11,7 @@ use sha1::{Digest as _, Sha1};
 use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::fs as async_fs;
@@ -156,7 +157,7 @@ impl Downloader {
     pub fn new(mc_dir: impl Into<PathBuf>) -> Self {
         Self {
             mc_dir: mc_dir.into(),
-            client: build_http_client(Duration::from_secs(300)),
+            client: standard_minecraft_download_client(),
         }
     }
 
@@ -675,7 +676,7 @@ pub async fn download_libraries<F>(
 where
     F: FnMut(DownloadProgress),
 {
-    let client = build_http_client(Duration::from_secs(300));
+    let client = standard_minecraft_download_client();
     let env = default_environment();
     let jobs = library_jobs_for(mc_dir, libraries, &env);
 
@@ -706,6 +707,13 @@ fn build_http_client(timeout: Duration) -> reqwest::Client {
         .timeout(timeout)
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+fn standard_minecraft_download_client() -> reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| build_http_client(Duration::from_secs(300)))
+        .clone()
 }
 
 fn library_download_concurrency() -> usize {
