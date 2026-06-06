@@ -154,3 +154,22 @@ export function formatRemainingTime(seconds: number): string {
   }
   return `~${Math.ceil(seconds / 3_600)}h`;
 }
+
+export function countDownRemainingSeconds(
+  remainingSeconds: number | undefined,
+  updatedAt: number | undefined,
+  now: number,
+): number | undefined {
+  if (
+    typeof remainingSeconds !== 'number'
+    || !Number.isFinite(remainingSeconds)
+    || remainingSeconds <= 0
+    || typeof updatedAt !== 'number'
+    || !Number.isFinite(updatedAt)
+  ) {
+    return undefined;
+  }
+  const elapsedSeconds = Math.max(0, Math.floor((now - updatedAt) / 1000));
+  const countedDown = Math.max(0, remainingSeconds - elapsedSeconds);
+  return countedDown > 0 ? countedDown : undefined;
+}

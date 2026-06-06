@@ -43,6 +43,7 @@ export type InstallState =
     label: string;
     phase?: string;
     remainingSeconds?: number;
+    remainingSecondsUpdatedAt?: number;
     startedAt: number;
   };
 

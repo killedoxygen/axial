@@ -115,12 +115,14 @@ export function updateInstallProgress(pct: number, label: string, phase?: string
   const nextPct = Number.isFinite(pct) ? Math.max(0, Math.min(100, pct)) : current.pct;
   const regressed = nextPct < current.pct;
   const nextRemainingSeconds = cleanRemainingSeconds(remainingSeconds);
+  const remainingSecondsUpdatedAt = nextRemainingSeconds ? Date.now() : undefined;
   installState.value = {
     ...current,
     pct: Math.max(current.pct, nextPct),
     label: regressed ? current.label : label,
     phase: regressed ? current.phase : phase || current.phase,
     remainingSeconds: regressed ? current.remainingSeconds : nextRemainingSeconds,
+    remainingSecondsUpdatedAt: regressed ? current.remainingSecondsUpdatedAt : remainingSecondsUpdatedAt,
   };
 }
 

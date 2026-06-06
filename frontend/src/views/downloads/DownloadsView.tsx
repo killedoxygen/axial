@@ -7,7 +7,7 @@ import { installFailure, installQueue, installState } from '../../store';
 import { clearInstallFailure, removeQueuedInstallAt } from '../../actions';
 import { retryFailedInstall } from '../../install';
 import { formatInstallItemLabel } from '../../install-labels';
-import { formatRemainingTime } from '../../progress-estimation';
+import { countDownRemainingSeconds, formatRemainingTime } from '../../progress-estimation';
 
 function formatFailureTime(timestamp: number): string {
   return new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -49,7 +49,10 @@ export function DownloadsView(): JSX.Element {
   const queuedItemLabel = queue.length === 1 ? '1 item queued' : `${queue.length} items queued`;
   const phaseLabel = hasActive && state.phase ? state.phase.replace(/_/g, ' ') : '';
   const activePct = hasActive ? Math.round(Math.max(0, Math.min(100, state.pct))) : 0;
-  const activeEta = hasActive && state.remainingSeconds ? `${formatRemainingTime(state.remainingSeconds)} left` : '';
+  const activeRemainingSeconds = hasActive
+    ? countDownRemainingSeconds(state.remainingSeconds, state.remainingSecondsUpdatedAt, elapsedNow)
+    : undefined;
+  const activeEta = activeRemainingSeconds ? `${formatRemainingTime(activeRemainingSeconds)} left` : '';
   const nextQueuedLabel = queue.length > 0 ? formatInstallItemLabel(queue[0]) : '';
   const pageStatus = hasActive
     ? `1 active task${queue.length > 0 ? ` · ${queuedLabel}` : ''}`
