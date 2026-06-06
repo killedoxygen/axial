@@ -880,14 +880,25 @@ function PerformanceRulesStatusBlock({
       <div class="cp-settings-rule-status-head">
         <div class="cp-settings-rule-status-copy">
           <strong>{source} active</strong>
-          <span>{channel}. {refresh}.</span>
+          <span>
+            {status.validation === 'valid'
+              ? 'Managed performance defaults are ready.'
+              : 'Managed performance rules need attention.'}
+          </span>
         </div>
         <Pill tone={status.validation === 'valid' ? 'ok' : 'err'} icon={status.validation === 'valid' ? 'check' : 'alert'}>
           {status.validation === 'valid' ? 'Valid' : 'Invalid'}
         </Pill>
       </div>
       <details class="cp-settings-rule-details">
-        <summary>Rule details</summary>
+        <summary>
+          Rule details{status.warnings.length > 0 ? `, ${status.warnings.length} warning${status.warnings.length === 1 ? '' : 's'}` : ''}
+        </summary>
+        {status.warnings.length > 0 && (
+          <div class="cp-settings-rule-status-warnings">
+            {status.warnings.map((warning) => <span key={warning}>{warning}</span>)}
+          </div>
+        )}
         <div class="cp-settings-rule-status-grid">
           <span>Source</span>
           <strong>{channel}</strong>
@@ -909,11 +920,6 @@ function PerformanceRulesStatusBlock({
           <strong>{status.ownership_classes.map(ownershipLabel).join(', ')}</strong>
         </div>
       </details>
-      {status.warnings.length > 0 && (
-        <div class="cp-settings-rule-status-warnings">
-          {status.warnings.map((warning) => <span key={warning}>{warning}</span>)}
-        </div>
-      )}
     </div>
   );
 }
