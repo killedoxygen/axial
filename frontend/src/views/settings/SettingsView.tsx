@@ -835,10 +835,18 @@ function proofCopyFailureMessage(err: unknown): string {
   return 'Launch proof could not be copied.';
 }
 
-function PerformanceRulesStatusBlock({ state }: { state: RulesStatusState }): JSX.Element {
+function PerformanceRulesStatusBlock({
+  state,
+  standalone = false,
+}: {
+  state: RulesStatusState;
+  standalone?: boolean;
+}): JSX.Element {
+  const className = `cp-settings-rule-status${standalone ? ' cp-settings-rule-status--standalone' : ''}`;
+
   if (state.status === 'loading') {
     return (
-      <div class="cp-settings-rule-status" aria-live="polite">
+      <div class={className} aria-live="polite">
         <div class="cp-settings-rule-status-copy">
           <strong>Loading rule status</strong>
           <span>Checking the active performance rule source.</span>
@@ -849,7 +857,7 @@ function PerformanceRulesStatusBlock({ state }: { state: RulesStatusState }): JS
 
   if (state.status === 'error') {
     return (
-      <div class="cp-settings-rule-status cp-settings-rule-status--warn" aria-live="polite">
+      <div class={`${className} cp-settings-rule-status--warn`} aria-live="polite">
         <div class="cp-settings-rule-status-copy">
           <strong>Rule status unavailable</strong>
           <span>{state.error || 'Performance controls still use saved settings.'}</span>
@@ -868,7 +876,7 @@ function PerformanceRulesStatusBlock({ state }: { state: RulesStatusState }): JS
     : 'Remote refresh off';
 
   return (
-    <div class="cp-settings-rule-status" aria-live="polite">
+    <div class={className} aria-live="polite">
       <div class="cp-settings-rule-status-head">
         <div class="cp-settings-rule-status-copy">
           <strong>{source} active</strong>
@@ -1750,7 +1758,13 @@ function PerformanceSection(): JSX.Element {
           disabled={saving !== null}
           onChange={changeGuardian}
         />
-        <PerformanceRulesStatusBlock state={rulesStatus} />
+      </SettingsCard>
+      <SettingsCard
+        title="Performance rules"
+        desc="Active rule source and validation for managed performance defaults."
+        stack
+      >
+        <PerformanceRulesStatusBlock state={rulesStatus} standalone />
       </SettingsCard>
       {isDev && !labOpen && (
         <SettingsCard
