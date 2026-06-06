@@ -2616,13 +2616,25 @@ function SavedSkinLibrary({
             borderTop: '1px solid var(--line)',
             borderBottom: '1px solid var(--line)',
           }}>
-            <PlayerHeadPreview
-              username={minecraftProfile.name}
-              textureSrc={profileSkin?.url}
-              size={36}
-              radius={7}
-              ariaLabel={`${minecraftProfile.name} Minecraft profile skin`}
-            />
+            {profileSkin ? (
+              <SkinBodyPreview
+                src={profileSkin.url}
+                name={minecraftProfile.name}
+                variant={profileSkinVariant}
+                side="front"
+                showOuterLayers
+                scale={2}
+                compact
+              />
+            ) : (
+              <PlayerHeadPreview
+                username={minecraftProfile.name}
+                textureSrc={undefined}
+                size={36}
+                radius={7}
+                ariaLabel={`${minecraftProfile.name} Minecraft profile skin`}
+              />
+            )}
             <div style={{ minWidth: 0, display: 'grid', gap: 4 }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
                 <Pill tone={onlineReady ? 'ok' : 'warn'} icon={onlineReady ? 'check-circle' : 'alert'}>
