@@ -7,13 +7,14 @@ use croopor_minecraft::{
     resolve_libraries, resolve_version,
 };
 use md5::compute as md5_compute;
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use zip::ZipArchive;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct LaunchAuthContext {
     pub player_name: String,
     pub uuid: String,
@@ -34,6 +35,20 @@ impl LaunchAuthContext {
             xuid: String::new(),
             user_type: "legacy".to_string(),
         }
+    }
+}
+
+impl fmt::Debug for LaunchAuthContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LaunchAuthContext")
+            .field("player_name", &self.player_name)
+            .field("uuid", &self.uuid)
+            .field("access_token", &"[redacted]")
+            .field("client_id", &self.client_id)
+            .field("xuid", &self.xuid)
+            .field("user_type", &self.user_type)
+            .finish()
     }
 }
 
@@ -613,6 +628,23 @@ mod tests {
         assert!(plan.command.iter().any(|arg| arg == "null"));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn launch_auth_context_debug_redacts_access_token() {
+        let auth = LaunchAuthContext {
+            player_name: "OnlinePlayer".to_string(),
+            uuid: "11112222333344445555666677778888".to_string(),
+            access_token: "test-access-token".to_string(),
+            client_id: "test-client-id".to_string(),
+            xuid: "test-xuid".to_string(),
+            user_type: "msa".to_string(),
+        };
+
+        let debug = format!("{auth:?}");
+
+        assert!(!debug.contains("test-access-token"), "{debug}");
+        assert!(debug.contains(r#"access_token: "[redacted]""#), "{debug}");
     }
 
     #[test]
