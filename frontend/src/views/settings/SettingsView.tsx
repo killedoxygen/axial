@@ -1612,16 +1612,11 @@ function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: BenchmarkMat
 
 function PerformanceSection(): JSX.Element {
   const cfg = config.value;
-  const isDev = devMode.value;
   const savedPerformance = performanceModeFrom(cfg?.performance_mode);
   const savedGuardian = guardianModeFrom(cfg?.guardian_mode);
   const [performanceMode, setPerformanceMode] = useState<PerformanceMode>(savedPerformance);
   const [guardianMode, setGuardianMode] = useState<GuardianMode>(savedGuardian);
   const [rulesStatus, setRulesStatus] = useState<RulesStatusState>({ status: 'loading', data: null });
-  const [launchReports, setLaunchReports] = useState<LaunchReportsState>({ status: 'loading', data: [] });
-  const [benchmarkMatrix, setBenchmarkMatrix] = useState<BenchmarkMatrixState>({ status: 'loading', data: null });
-  const [qualificationPreview, setQualificationPreview] = useState<BenchmarkQualificationPreviewState>({ status: 'loading', data: null });
-  const [labOpen, setLabOpen] = useState(false);
   const [saving, setSaving] = useState<'performance' | 'guardian' | null>(null);
   const requestRef = useRef(0);
 
@@ -1629,10 +1624,6 @@ function PerformanceSection(): JSX.Element {
     setPerformanceMode(savedPerformance);
     setGuardianMode(savedGuardian);
   }, [savedPerformance, savedGuardian]);
-
-  useEffect(() => {
-    if (!isDev) setLabOpen(false);
-  }, [isDev]);
 
   useEffect(() => {
     let alive = true;
@@ -1649,62 +1640,6 @@ function PerformanceSection(): JSX.Element {
       });
     return () => { alive = false; };
   }, []);
-
-  useEffect(() => {
-    if (!isDev || !labOpen) return;
-    let alive = true;
-    setLaunchReports({ status: 'loading', data: [] });
-    api('GET', '/launch/reports')
-      .then((res) => {
-        if (!alive) return;
-        if (res?.error) throw new Error(res.error);
-        const reports = (res as LaunchReportsResponse).reports;
-        setLaunchReports({ status: 'ready', data: Array.isArray(reports) ? reports : [] });
-      })
-      .catch((err) => {
-        if (!alive) return;
-        setLaunchReports((prev) => ({ status: 'error', data: prev.data, error: errMessage(err) }));
-      });
-    return () => { alive = false; };
-  }, [isDev, labOpen]);
-
-  useEffect(() => {
-    if (!isDev || !labOpen) return;
-    let alive = true;
-    setBenchmarkMatrix((prev) => ({ status: 'loading', data: prev.data }));
-    api('GET', '/launch/benchmark/matrix')
-      .then((res) => {
-        if (!alive) return;
-        if (res?.error) throw new Error(res.error);
-        setBenchmarkMatrix({ status: 'ready', data: res as BenchmarkMatrixResponse });
-      })
-      .catch((err) => {
-        if (!alive) return;
-        setBenchmarkMatrix((prev) => ({ status: 'error', data: prev.data, error: errMessage(err) }));
-      });
-    return () => { alive = false; };
-  }, [isDev, labOpen]);
-
-  useEffect(() => {
-    if (!isDev || !labOpen) return;
-    let alive = true;
-    setQualificationPreview((prev) => ({ status: 'loading', data: prev.data }));
-    api('GET', '/launch/benchmark/qualification/family-c-1-12-2/preview')
-      .then((res) => {
-        if (!alive) return;
-        if (res?.error) throw new Error(res.error);
-        const preview = res as BenchmarkQualificationPreviewResponse;
-        setQualificationPreview({
-          status: 'ready',
-          data: normalizeBenchmarkQualification(preview),
-        });
-      })
-      .catch((err) => {
-        if (!alive) return;
-        setQualificationPreview((prev) => ({ status: 'error', data: prev.data, error: errMessage(err) }));
-      });
-    return () => { alive = false; };
-  }, [isDev, labOpen]);
 
   const savePatch = async (
     key: 'performance_mode' | 'guardian_mode',
@@ -1772,49 +1707,119 @@ function PerformanceSection(): JSX.Element {
       >
         <PerformanceRulesStatusBlock state={rulesStatus} standalone />
       </SettingsCard>
-      {isDev && !labOpen && (
-        <SettingsCard
-          title="Performance lab"
-          desc="Developer-only launch proof and benchmark tools."
-          control={(
-            <Button
-              variant="secondary"
-              size="sm"
-              icon="chevron-down"
-              onClick={() => setLabOpen(true)}
-            >
-              Open
-            </Button>
-          )}
-        />
-      )}
-      {isDev && labOpen && (
-        <SettingsCard
-          title="Performance lab"
-          desc="Developer-only launch proof and benchmark tools."
-          stack
-        >
-          <div class="cp-settings-lab-action">
-            <Button
-              variant="secondary"
-              size="sm"
-              icon="chevron-up"
-              onClick={() => setLabOpen(false)}
-            >
-              Close
-            </Button>
-          </div>
-          {labOpen && (
-            <>
-              <LaunchProofHistoryBlock state={launchReports} />
-              <BenchmarkMatrixBlock state={benchmarkMatrix} />
-              <BenchmarkQualificationPreviewBlock state={qualificationPreview} />
-              <BenchmarkSuiteDriversBlock matrixState={benchmarkMatrix} />
-            </>
-          )}
-        </SettingsCard>
-      )}
     </>
+  );
+}
+
+function PerformanceLabCard(): JSX.Element | null {
+  const isDev = devMode.value;
+  const [launchReports, setLaunchReports] = useState<LaunchReportsState>({ status: 'loading', data: [] });
+  const [benchmarkMatrix, setBenchmarkMatrix] = useState<BenchmarkMatrixState>({ status: 'loading', data: null });
+  const [qualificationPreview, setQualificationPreview] = useState<BenchmarkQualificationPreviewState>({ status: 'loading', data: null });
+  const [labOpen, setLabOpen] = useState(false);
+
+  useEffect(() => {
+    if (!isDev) setLabOpen(false);
+  }, [isDev]);
+
+  useEffect(() => {
+    if (!isDev || !labOpen) return;
+    let alive = true;
+    setLaunchReports({ status: 'loading', data: [] });
+    api('GET', '/launch/reports')
+      .then((res) => {
+        if (!alive) return;
+        if (res?.error) throw new Error(res.error);
+        const reports = (res as LaunchReportsResponse).reports;
+        setLaunchReports({ status: 'ready', data: Array.isArray(reports) ? reports : [] });
+      })
+      .catch((err) => {
+        if (!alive) return;
+        setLaunchReports((prev) => ({ status: 'error', data: prev.data, error: errMessage(err) }));
+      });
+    return () => { alive = false; };
+  }, [isDev, labOpen]);
+
+  useEffect(() => {
+    if (!isDev || !labOpen) return;
+    let alive = true;
+    setBenchmarkMatrix((prev) => ({ status: 'loading', data: prev.data }));
+    api('GET', '/launch/benchmark/matrix')
+      .then((res) => {
+        if (!alive) return;
+        if (res?.error) throw new Error(res.error);
+        setBenchmarkMatrix({ status: 'ready', data: res as BenchmarkMatrixResponse });
+      })
+      .catch((err) => {
+        if (!alive) return;
+        setBenchmarkMatrix((prev) => ({ status: 'error', data: prev.data, error: errMessage(err) }));
+      });
+    return () => { alive = false; };
+  }, [isDev, labOpen]);
+
+  useEffect(() => {
+    if (!isDev || !labOpen) return;
+    let alive = true;
+    setQualificationPreview((prev) => ({ status: 'loading', data: prev.data }));
+    api('GET', '/launch/benchmark/qualification/family-c-1-12-2/preview')
+      .then((res) => {
+        if (!alive) return;
+        if (res?.error) throw new Error(res.error);
+        const preview = res as BenchmarkQualificationPreviewResponse;
+        setQualificationPreview({
+          status: 'ready',
+          data: normalizeBenchmarkQualification(preview),
+        });
+      })
+      .catch((err) => {
+        if (!alive) return;
+        setQualificationPreview((prev) => ({ status: 'error', data: prev.data, error: errMessage(err) }));
+      });
+    return () => { alive = false; };
+  }, [isDev, labOpen]);
+
+  if (!isDev) return null;
+
+  if (!labOpen) {
+    return (
+      <SettingsCard
+        title="Performance lab"
+        desc="Developer-only launch proof and benchmark tools."
+        control={(
+          <Button
+            variant="secondary"
+            size="sm"
+            icon="chevron-down"
+            onClick={() => setLabOpen(true)}
+          >
+            Open
+          </Button>
+        )}
+      />
+    );
+  }
+
+  return (
+    <SettingsCard
+      title="Performance lab"
+      desc="Developer-only launch proof and benchmark tools."
+      stack
+    >
+      <div class="cp-settings-lab-action">
+        <Button
+          variant="secondary"
+          size="sm"
+          icon="chevron-up"
+          onClick={() => setLabOpen(false)}
+        >
+          Close
+        </Button>
+      </div>
+      <LaunchProofHistoryBlock state={launchReports} />
+      <BenchmarkMatrixBlock state={benchmarkMatrix} />
+      <BenchmarkQualificationPreviewBlock state={qualificationPreview} />
+      <BenchmarkSuiteDriversBlock matrixState={benchmarkMatrix} />
+    </SettingsCard>
   );
 }
 
@@ -1974,6 +1979,7 @@ function AdvancedSection(): JSX.Element {
           control={<Button variant="secondary" icon="palette" onClick={() => navigate({ name: 'dev-lab' })}>Open lab</Button>}
         />
       )}
+      {isDev && <PerformanceLabCard />}
       {isDev && (
         <SettingsCard
           title="Flush all data"
