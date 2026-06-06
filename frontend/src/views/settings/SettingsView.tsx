@@ -890,6 +890,14 @@ function PerformanceRulesStatusBlock({
           {status.validation === 'valid' ? 'Valid' : 'Invalid'}
         </Pill>
       </div>
+      <div class="cp-settings-rule-status-meta">
+        <span>Source</span>
+        <strong>{channel}</strong>
+        <span>Refresh</span>
+        <strong>{refresh}</strong>
+        <span>Compositions</span>
+        <strong>{status.composition_count}</strong>
+      </div>
       <details class="cp-settings-rule-details">
         <summary>
           Rule details{status.warnings.length > 0 ? `, ${status.warnings.length} warning${status.warnings.length === 1 ? '' : 's'}` : ''}
@@ -900,12 +908,6 @@ function PerformanceRulesStatusBlock({
           </div>
         )}
         <div class="cp-settings-rule-status-grid">
-          <span>Source</span>
-          <strong>{channel}</strong>
-          <span>Refresh</span>
-          <strong>{refresh}</strong>
-          <span>Compositions</span>
-          <strong>{status.composition_count}</strong>
           <span>Schema</span>
           <strong>v{status.schema_version}</strong>
           <span>Generated</span>

@@ -211,6 +211,27 @@
   font-size: 12px;
   line-height: 1.45;
 }
+.cp-settings-rule-status-meta {
+  margin-top: 9px;
+  display: grid;
+  grid-template-columns: repeat(3, max-content minmax(0, 1fr));
+  gap: 5px 8px;
+  align-items: baseline;
+  font-size: 11.5px;
+  line-height: 1.35;
+}
+.cp-settings-rule-status-meta span {
+  color: var(--text-mute);
+  font-weight: 650;
+}
+.cp-settings-rule-status-meta strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-dim);
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .cp-settings-rule-status-grid {
   margin-top: 12px;
   display: grid;
