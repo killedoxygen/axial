@@ -1,5 +1,5 @@
 import type { JSX } from 'preact';
-import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { api, apiResourceUrl, apiUrl, isApiError } from '../../api';
 import { Button, Card, Input, Pill, SectionHeading, Segmented } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
@@ -113,6 +113,7 @@ type SkinVariant = 'classic' | 'slim';
 type UploadSkinVariant = SkinVariant | 'auto';
 type SavedSkinPreviewSide = 'front' | 'back';
 type SavedSkinLayerMode = 'full' | 'base';
+type SavedSkinSort = 'recent' | 'name' | 'equipped' | 'source';
 
 interface SavedSkinRecord {
   texture_key: string;
@@ -408,6 +409,46 @@ function savedSkinSourceLabel(source: string): string {
     default:
       return 'Saved skin';
   }
+}
+
+function savedSkinRecentTime(skin: SavedSkinRecord): number {
+  const updatedAt = Date.parse(skin.updated_at);
+  if (Number.isFinite(updatedAt)) return updatedAt;
+  const createdAt = Date.parse(skin.created_at);
+  return Number.isFinite(createdAt) ? createdAt : 0;
+}
+
+function savedSkinCompareByName(left: SavedSkinRecord, right: SavedSkinRecord): number {
+  return left.name.localeCompare(right.name, undefined, { numeric: true, sensitivity: 'base' });
+}
+
+function sortSavedSkins(skins: SavedSkinRecord[], sort: SavedSkinSort): SavedSkinRecord[] {
+  return skins
+    .map((skin, index) => ({ skin, index }))
+    .sort((left, right) => {
+      const nameCompare = savedSkinCompareByName(left.skin, right.skin);
+      const recentCompare = savedSkinRecentTime(right.skin) - savedSkinRecentTime(left.skin);
+
+      let result = 0;
+      if (sort === 'name') {
+        result = nameCompare || recentCompare;
+      } else if (sort === 'equipped') {
+        result = Number(Boolean(right.skin.applied_at)) - Number(Boolean(left.skin.applied_at))
+          || recentCompare
+          || nameCompare;
+      } else if (sort === 'source') {
+        result = savedSkinSourceLabel(left.skin.source).localeCompare(
+          savedSkinSourceLabel(right.skin.source),
+          undefined,
+          { numeric: true, sensitivity: 'base' },
+        ) || nameCompare || recentCompare;
+      } else {
+        result = recentCompare || nameCompare;
+      }
+
+      return result || left.index - right.index;
+    })
+    .map(({ skin }) => skin);
 }
 
 function SkinProfileMeta({
@@ -1959,6 +2000,7 @@ function SavedSkinLibrary({
   const [deleteKey, setDeleteKey] = useState<string | null>(null);
   const [applyKey, setApplyKey] = useState<string | null>(null);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
+  const [skinSort, setSkinSort] = useState<SavedSkinSort>('recent');
   const [previewSide, setPreviewSide] = useState<SavedSkinPreviewSide>('front');
   const [previewLayerMode, setPreviewLayerMode] = useState<SavedSkinLayerMode>('full');
   const profileSkin = activeMinecraftSkin(minecraftProfile);
@@ -1979,6 +2021,7 @@ function SavedSkinLibrary({
     ?? equippedSkin
     ?? skins[0]
     ?? null;
+  const sortedSkins = useMemo(() => sortSavedSkins(skins, skinSort), [skins, skinSort]);
   const previewPending = Boolean(
     selectedSkin
       && equippedSkin
@@ -2364,7 +2407,23 @@ function SavedSkinLibrary({
     <Card>
       <SectionHeading
         title="Saved skins"
-        right={<Pill tone="neutral" icon="image">{state === 'ready' ? String(skins.length) : '...'}</Pill>}
+        right={(
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+            <Pill tone="neutral" icon="image">{state === 'ready' ? String(skins.length) : '...'}</Pill>
+            <div role="group" aria-label="Saved skins sort">
+              <Segmented<SavedSkinSort>
+                options={[
+                  { value: 'recent', label: 'Recent' },
+                  { value: 'name', label: 'Name' },
+                  { value: 'equipped', label: 'Equipped' },
+                  { value: 'source', label: 'Source' },
+                ]}
+                value={skinSort}
+                onChange={setSkinSort}
+              />
+            </div>
+          </div>
+        )}
       />
       <div style={{ display: 'grid', gap: 16 }}>
         <div
@@ -2851,7 +2910,7 @@ function SavedSkinLibrary({
               No saved skins yet.
             </div>
           ) : (
-            skins.map((skin, index) => {
+            sortedSkins.map((skin, index) => {
               const applied = Boolean(skin.applied_at);
               const editing = editKey === skin.texture_key;
               const selected = selectedSkin?.texture_key === skin.texture_key;
