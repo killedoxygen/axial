@@ -1871,92 +1871,109 @@ function SkinRestorerHelper({ savedUsername }: { savedUsername: string }): JSX.E
         title="Server skin helper"
         right={<Pill tone="neutral" icon="terminal">SkinRestorer</Pill>}
       />
-      <div style={{ display: 'grid', gap: 14 }}>
-        <div style={{ fontSize: 13, color: theme.n.textDim, lineHeight: 1.5, maxWidth: 760 }}>
-          For servers that use SkinRestorer, copy a command that points your server skin at a Minecraft username. This is a server-side command helper only; Croopor does not upload skins or contact skin services from this page.
-        </div>
-
-        <div style={{
-          display: 'flex',
-          gap: 10,
-          flexWrap: 'wrap',
-          alignItems: 'end',
+      <details style={{
+        display: 'grid',
+        gap: 10,
+        paddingTop: 2,
+      }}>
+        <summary style={{
+          width: 'max-content',
+          maxWidth: '100%',
+          color: theme.n.textMute,
+          fontSize: 12,
+          fontWeight: 650,
+          cursor: 'pointer',
+          listStylePosition: 'inside',
         }}>
-          <label style={{ display: 'grid', gap: 6, flex: '1 1 260px', maxWidth: 360, minWidth: 220 }}>
-            <span style={{
-              fontSize: 11,
-              fontWeight: 600,
-              color: theme.n.textMute,
-              textTransform: 'uppercase',
-              letterSpacing: 0,
-            }}>Skin username</span>
-            <Input
-              value={skinUsername}
-              onChange={(v) => {
-                setSkinUsername(clampPlayerNameInput(v));
-                setCopyState('idle');
-              }}
-              placeholder={savedUsername}
-              icon="user"
-            />
-          </label>
-
-          <div style={{ display: 'grid', gap: 6, flex: '999 1 320px', minWidth: 240 }}>
-            <div style={{
-              fontSize: 11,
-              fontWeight: 600,
-              color: theme.n.textMute,
-              textTransform: 'uppercase',
-              letterSpacing: 0,
-            }}>Command</div>
-            <div
-              aria-label="SkinRestorer command"
-              style={{
-                minHeight: 38,
-                display: 'flex',
-                alignItems: 'center',
-                padding: '9px 12px',
-                border: '1px solid var(--line)',
-                borderRadius: theme.r.md,
-                background: theme.n.surface2,
-                color: canCopy ? theme.n.text : theme.n.textMute,
-                fontFamily: theme.font.mono,
-                fontSize: 12,
-                lineHeight: 1.45,
-                overflowWrap: 'anywhere',
-                userSelect: 'text',
-                cursor: 'text',
-              }}
-            >
-              {command}
-            </div>
+          SkinRestorer command helper
+        </summary>
+        <div style={{ display: 'grid', gap: 14, paddingTop: 10 }}>
+          <div style={{ fontSize: 13, color: theme.n.textDim, lineHeight: 1.5, maxWidth: 760 }}>
+            For servers that use SkinRestorer, copy a command that points your server skin at a Minecraft username. This is a server-side command helper only; Croopor does not upload skins or contact skin services from this page.
           </div>
 
-          <Button
-            onClick={() => void copyCommand()}
-            disabled={!canCopy}
-            variant="secondary"
-            icon={copyState === 'copied' ? 'check' : 'copy'}
-            sound="affirm"
-            title="Copy SkinRestorer command"
-          >
-            {copyState === 'copied' ? 'Copied' : 'Copy'}
-          </Button>
-        </div>
-
-        {(usernameError || copyState === 'failed') && (
           <div style={{
-            fontSize: 12,
-            fontWeight: 500,
-            color: copyState === 'failed' ? 'var(--err)' : theme.n.textMute,
-            lineHeight: 1.4,
+            display: 'flex',
+            gap: 10,
+            flexWrap: 'wrap',
+            alignItems: 'end',
           }}>
-            {copyState === 'failed'
-              ? 'Copy failed. Select the command and copy it manually.'
-              : usernameError}
+            <label style={{ display: 'grid', gap: 6, flex: '1 1 260px', maxWidth: 360, minWidth: 220 }}>
+              <span style={{
+                fontSize: 11,
+                fontWeight: 600,
+                color: theme.n.textMute,
+                textTransform: 'uppercase',
+                letterSpacing: 0,
+              }}>Skin username</span>
+              <Input
+                value={skinUsername}
+                onChange={(v) => {
+                  setSkinUsername(clampPlayerNameInput(v));
+                  setCopyState('idle');
+                }}
+                placeholder={savedUsername}
+                icon="user"
+              />
+            </label>
+
+            <div style={{ display: 'grid', gap: 6, flex: '999 1 320px', minWidth: 240 }}>
+              <div style={{
+                fontSize: 11,
+                fontWeight: 600,
+                color: theme.n.textMute,
+                textTransform: 'uppercase',
+                letterSpacing: 0,
+              }}>Command</div>
+              <div
+                aria-label="SkinRestorer command"
+                style={{
+                  minHeight: 38,
+                  display: 'flex',
+                  alignItems: 'center',
+                  padding: '9px 12px',
+                  border: '1px solid var(--line)',
+                  borderRadius: theme.r.md,
+                  background: theme.n.surface2,
+                  color: canCopy ? theme.n.text : theme.n.textMute,
+                  fontFamily: theme.font.mono,
+                  fontSize: 12,
+                  lineHeight: 1.45,
+                  overflowWrap: 'anywhere',
+                  userSelect: 'text',
+                  cursor: 'text',
+                }}
+              >
+                {command}
+              </div>
+            </div>
+
+            <Button
+              onClick={() => void copyCommand()}
+              disabled={!canCopy}
+              variant="secondary"
+              icon={copyState === 'copied' ? 'check' : 'copy'}
+              sound="affirm"
+              title="Copy SkinRestorer command"
+            >
+              {copyState === 'copied' ? 'Copied' : 'Copy'}
+            </Button>
           </div>
-        )}
-      </div>
+
+          {(usernameError || copyState === 'failed') && (
+            <div style={{
+              fontSize: 12,
+              fontWeight: 500,
+              color: copyState === 'failed' ? 'var(--err)' : theme.n.textMute,
+              lineHeight: 1.4,
+            }}>
+              {copyState === 'failed'
+                ? 'Copy failed. Select the command and copy it manually.'
+                : usernameError}
+            </div>
+          )}
+        </div>
+      </details>
     </Card>
   );
 }
