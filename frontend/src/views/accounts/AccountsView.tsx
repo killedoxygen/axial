@@ -112,6 +112,7 @@ type CopyTarget = 'code' | 'url';
 type SkinVariant = 'classic' | 'slim';
 type UploadSkinVariant = SkinVariant | 'auto';
 type SavedSkinPreviewSide = 'front' | 'back';
+type SavedSkinLayerMode = 'full' | 'base';
 
 interface SavedSkinRecord {
   texture_key: string;
@@ -1940,6 +1941,7 @@ function SavedSkinLibrary({
   const [uploadVariant, setUploadVariant] = useState<UploadSkinVariant>('auto');
   const [stagedUpload, setStagedUpload] = useState<StagedSkinUpload | null>(null);
   const [stagedPreviewSide, setStagedPreviewSide] = useState<SavedSkinPreviewSide>('front');
+  const [stagedLayerMode, setStagedLayerMode] = useState<SavedSkinLayerMode>('full');
   const [busy, setBusy] = useState(false);
   const [profileBusy, setProfileBusy] = useState(false);
   const [lookupBusy, setLookupBusy] = useState(false);
@@ -1958,6 +1960,7 @@ function SavedSkinLibrary({
   const [applyKey, setApplyKey] = useState<string | null>(null);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [previewSide, setPreviewSide] = useState<SavedSkinPreviewSide>('front');
+  const [previewLayerMode, setPreviewLayerMode] = useState<SavedSkinLayerMode>('full');
   const profileSkin = activeMinecraftSkin(minecraftProfile);
   const profileSkinVariant = skinVariantValue(profileSkin?.variant);
   const trimmedName = skinName.trim();
@@ -2013,6 +2016,7 @@ function SavedSkinLibrary({
     }
     setStagedUpload(null);
     setStagedPreviewSide('front');
+    setStagedLayerMode('full');
     uploadApplyAfterSaveRef.current = false;
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
@@ -2262,6 +2266,7 @@ function SavedSkinLibrary({
     stagedUploadUrlRef.current = objectUrl;
     setMessage(null);
     setStagedPreviewSide('front');
+    setStagedLayerMode('full');
     setStagedUpload({
       file,
       objectUrl,
@@ -2455,16 +2460,29 @@ function SavedSkinLibrary({
                   name={stagedName}
                   variant={stagedVariant}
                   side={stagedPreviewSide}
+                  showOuterLayers={stagedLayerMode === 'full'}
                 />
-                <div role="group" aria-label={`${stagedName} staged body preview side`}>
-                  <Segmented<SavedSkinPreviewSide>
-                    options={[
-                      { value: 'front', label: 'Front' },
-                      { value: 'back', label: 'Back' },
-                    ]}
-                    value={stagedPreviewSide}
-                    onChange={setStagedPreviewSide}
-                  />
+                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'center' }}>
+                  <div role="group" aria-label={`${stagedName} staged body preview side`}>
+                    <Segmented<SavedSkinPreviewSide>
+                      options={[
+                        { value: 'front', label: 'Front' },
+                        { value: 'back', label: 'Back' },
+                      ]}
+                      value={stagedPreviewSide}
+                      onChange={setStagedPreviewSide}
+                    />
+                  </div>
+                  <div role="group" aria-label={`${stagedName} staged body preview layers`}>
+                    <Segmented<SavedSkinLayerMode>
+                      options={[
+                        { value: 'full', label: 'Full' },
+                        { value: 'base', label: 'Base' },
+                      ]}
+                      value={stagedLayerMode}
+                      onChange={setStagedLayerMode}
+                    />
+                  </div>
                 </div>
               </div>
               <div style={{ minWidth: 0, display: 'grid', gap: 7 }}>
@@ -2707,16 +2725,32 @@ function SavedSkinLibrary({
             borderBottom: '1px solid var(--line)',
           }}>
             <div style={{ display: 'grid', gap: 8, justifyItems: 'center' }}>
-              <SavedSkinBodyPreview skin={selectedSkin} side={previewSide} />
-              <div role="group" aria-label={`${selectedSkin.name} body preview side`}>
-                <Segmented<SavedSkinPreviewSide>
-                  options={[
-                    { value: 'front', label: 'Front' },
-                    { value: 'back', label: 'Back' },
-                  ]}
-                  value={previewSide}
-                  onChange={setPreviewSide}
-                />
+              <SavedSkinBodyPreview
+                skin={selectedSkin}
+                side={previewSide}
+                showOuterLayers={previewLayerMode === 'full'}
+              />
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'center' }}>
+                <div role="group" aria-label={`${selectedSkin.name} body preview side`}>
+                  <Segmented<SavedSkinPreviewSide>
+                    options={[
+                      { value: 'front', label: 'Front' },
+                      { value: 'back', label: 'Back' },
+                    ]}
+                    value={previewSide}
+                    onChange={setPreviewSide}
+                  />
+                </div>
+                <div role="group" aria-label={`${selectedSkin.name} body preview layers`}>
+                  <Segmented<SavedSkinLayerMode>
+                    options={[
+                      { value: 'full', label: 'Full' },
+                      { value: 'base', label: 'Base' },
+                    ]}
+                    value={previewLayerMode}
+                    onChange={setPreviewLayerMode}
+                  />
+                </div>
               </div>
             </div>
             <div style={{ minWidth: 0, display: 'grid', gap: 8 }}>
@@ -3033,11 +3067,13 @@ function SkinBodyPreview({
   name,
   variant,
   side,
+  showOuterLayers,
 }: {
   src: string;
   name: string;
   variant: SkinVariant;
   side: SavedSkinPreviewSide;
+  showOuterLayers: boolean;
 }): JSX.Element {
   const scale = 6;
   const slim = variant === 'slim';
@@ -3079,22 +3115,24 @@ function SkinBodyPreview({
   ): JSX.Element => (
     <span style={{ display: 'block', position: 'relative', width: w * scale, height: h * scale }}>
       <SkinPreviewPart src={src} x={part.x} y={part.y} w={w} h={h} scale={scale} />
-      <SkinPreviewPart
-        src={src}
-        x={overlay.x}
-        y={overlay.y}
-        w={w}
-        h={h}
-        scale={scale}
-        style={{ position: 'absolute', inset: 0 }}
-      />
+      {showOuterLayers && (
+        <SkinPreviewPart
+          src={src}
+          x={overlay.x}
+          y={overlay.y}
+          w={w}
+          h={h}
+          scale={scale}
+          style={{ position: 'absolute', inset: 0 }}
+        />
+      )}
     </span>
   );
 
   return (
     <div
       role="img"
-      aria-label={`${name} ${side} full skin preview`}
+      aria-label={`${name} ${side} ${showOuterLayers ? 'full' : 'base'} skin preview`}
       style={{
         width: 118,
         minHeight: 208,
@@ -3111,15 +3149,17 @@ function SkinBodyPreview({
     >
       <div style={{ position: 'relative', width: 8 * scale, height: 8 * scale, marginBottom: 2 }}>
         <SkinPreviewPart src={src} x={parts.head.x} y={parts.head.y} w={8} h={8} scale={scale} />
-        <SkinPreviewPart
-          src={src}
-          x={parts.headOverlay.x}
-          y={parts.headOverlay.y}
-          w={8}
-          h={8}
-          scale={scale}
-          style={{ position: 'absolute', inset: 0 }}
-        />
+        {showOuterLayers && (
+          <SkinPreviewPart
+            src={src}
+            x={parts.headOverlay.x}
+            y={parts.headOverlay.y}
+            w={8}
+            h={8}
+            scale={scale}
+            style={{ position: 'absolute', inset: 0 }}
+          />
+        )}
       </div>
       <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'center' }}>
         {previewPart(parts.rightArm, parts.rightArmOverlay, parts.rightArm.w, 12)}
@@ -3137,9 +3177,11 @@ function SkinBodyPreview({
 function SavedSkinBodyPreview({
   skin,
   side,
+  showOuterLayers,
 }: {
   skin: SavedSkinRecord;
   side: SavedSkinPreviewSide;
+  showOuterLayers: boolean;
 }): JSX.Element {
   return (
     <SkinBodyPreview
@@ -3147,6 +3189,7 @@ function SavedSkinBodyPreview({
       name={skin.name}
       variant={skin.variant}
       side={side}
+      showOuterLayers={showOuterLayers}
     />
   );
 }
