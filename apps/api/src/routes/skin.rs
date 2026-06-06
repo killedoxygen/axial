@@ -1347,8 +1347,10 @@ fn encode_skin_png(rgba: &[u8]) -> Result<Vec<u8>, ApiError> {
 fn texture_key(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut key = String::with_capacity(digest.len() * 2);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     for byte in digest {
-        write!(&mut key, "{byte:02x}").expect("write sha256 hex");
+        key.push(HEX[(byte >> 4) as usize] as char);
+        key.push(HEX[(byte & 0x0f) as usize] as char);
     }
     key
 }
@@ -1589,11 +1591,10 @@ fn offline_head_svg(uuid: &str, size: u32) -> String {
     let mut state = seed;
 
     let mut svg = String::with_capacity(2600);
-    write!(
+    let _ = write!(
         svg,
         r#"<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 8 8" shape-rendering="crispEdges">"#
-    )
-    .expect("write svg header");
+    );
 
     for y in 0..8 {
         for x in 0..8 {
@@ -1603,12 +1604,11 @@ fn offline_head_svg(uuid: &str, size: u32) -> String {
             } else {
                 (state as usize % (palette.len() - 2)) + 2
             };
-            write!(
+            let _ = write!(
                 svg,
                 r##"<rect x="{x}" y="{y}" width="1" height="1" fill="#{:06x}"/>"##,
                 palette[palette_index]
-            )
-            .expect("write svg pixel");
+            );
         }
     }
 
