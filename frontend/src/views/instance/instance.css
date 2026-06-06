@@ -873,9 +873,9 @@
 }
 
 .cp-od-perf-body {
-  display: flex;
-  flex-direction: column;
-  gap: 18px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 16px;
 }
 .cp-od-perf-summary {
   min-width: 0;
@@ -893,21 +893,6 @@
   display: flex;
   flex-direction: column;
   gap: 10px;
-}
-/* On wide cards, set the summary beside the meter so neither side reads empty;
-   the bar stays full-width (and wide enough for its axis labels) below this. */
-@media (min-width: 1181px) {
-  .cp-od-perf-body {
-    flex-direction: row;
-    align-items: center;
-    gap: 38px;
-  }
-  .cp-od-perf-summary {
-    flex: 1 1 42%;
-  }
-  .cp-od-perf-meter {
-    flex: 1 1 58%;
-  }
 }
 .cp-od-perf-meter-head {
   display: flex;
