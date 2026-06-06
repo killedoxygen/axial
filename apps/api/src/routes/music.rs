@@ -63,13 +63,13 @@ pub fn router() -> Router<AppState> {
 
 async fn handle_music_status(State(state): State<AppState>) -> Json<MusicStatusResponse> {
     let paths = state.config().paths();
-    let tracks = MUSIC_TRACKS
-        .into_iter()
-        .map(|(file, _)| MusicTrackStatus {
-            cached: paths.music_dir.join(file).is_file(),
+    let mut tracks = Vec::with_capacity(MUSIC_TRACKS.len());
+    for (file, _) in MUSIC_TRACKS {
+        tracks.push(MusicTrackStatus {
+            cached: is_regular_file(&paths.music_dir.join(file)).await,
             file: file.to_string(),
-        })
-        .collect::<Vec<_>>();
+        });
+    }
 
     Json(MusicStatusResponse {
         count: tracks.len(),
@@ -100,7 +100,7 @@ async fn handle_music_track(
     });
     let _guard = locks[index].lock().await;
 
-    if !local_path.is_file()
+    if !is_regular_file(&local_path).await
         && let Err(error) = download_music_file(&local_path, url).await
     {
         return (
@@ -110,7 +110,7 @@ async fn handle_music_track(
             .into_response();
     }
 
-    match std::fs::read(&local_path) {
+    match async_fs::read(&local_path).await {
         Ok(bytes) => Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "audio/mpeg")
@@ -118,6 +118,12 @@ async fn handle_music_track(
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+async fn is_regular_file(path: &Path) -> bool {
+    async_fs::metadata(path)
+        .await
+        .is_ok_and(|metadata| metadata.is_file())
 }
 
 async fn download_music_file(path: &Path, url: &str) -> Result<(), String> {
