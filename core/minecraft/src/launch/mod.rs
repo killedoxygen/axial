@@ -227,7 +227,7 @@ pub struct ResolvedLibrary {
     pub name: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct LaunchVars {
     pub auth_player_name: String,
     pub version_name: String,
@@ -249,6 +249,33 @@ pub struct LaunchVars {
     pub resolution_width: String,
     pub resolution_height: String,
     pub game_assets: String,
+}
+
+impl std::fmt::Debug for LaunchVars {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LaunchVars")
+            .field("auth_player_name", &self.auth_player_name)
+            .field("version_name", &self.version_name)
+            .field("game_directory", &self.game_directory)
+            .field("assets_root", &self.assets_root)
+            .field("asset_index_name", &self.asset_index_name)
+            .field("auth_uuid", &self.auth_uuid)
+            .field("auth_access_token", &"[redacted]")
+            .field("client_id", &self.client_id)
+            .field("auth_xuid", &self.auth_xuid)
+            .field("user_type", &self.user_type)
+            .field("version_type", &self.version_type)
+            .field("launcher_name", &self.launcher_name)
+            .field("launcher_version", &self.launcher_version)
+            .field("natives_directory", &self.natives_directory)
+            .field("classpath", &self.classpath)
+            .field("library_directory", &self.library_directory)
+            .field("classpath_separator", &self.classpath_separator)
+            .field("resolution_width", &self.resolution_width)
+            .field("resolution_height", &self.resolution_height)
+            .field("game_assets", &self.game_assets)
+            .finish()
+    }
 }
 
 #[derive(Debug, Error)]
@@ -865,6 +892,23 @@ mod tests {
         assert_eq!(
             game_args,
             vec!["--username".to_string(), "Player".to_string()]
+        );
+    }
+
+    #[test]
+    fn launch_vars_debug_redacts_auth_access_token() {
+        let raw_token = "secret-auth-access-token";
+        let mut vars = default_launch_vars();
+        vars.auth_access_token = raw_token.to_string();
+
+        let debug = format!("{vars:?}");
+        assert!(!debug.contains(raw_token));
+        assert!(debug.contains("auth_access_token: \"[redacted]\""));
+        assert_eq!(
+            vars.build_var_map()
+                .get("auth_access_token")
+                .map(String::as_str),
+            Some(raw_token)
         );
     }
 
