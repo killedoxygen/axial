@@ -4,6 +4,11 @@ type ProgressEstimateEvent = {
   total?: number;
 };
 
+export type ProgressEstimate = {
+  label: string;
+  remainingSeconds?: number;
+};
+
 type EstimateSample = {
   at: number;
   pct: number;
@@ -51,7 +56,7 @@ const DEFAULT_OPTIONS: Omit<ProgressEstimatorOptions, 'etaPhases'> = {
 export function createProgressEstimator(
   overrides: Partial<ProgressEstimatorOptions> & Pick<ProgressEstimatorOptions, 'etaPhases'>,
 ): {
-  formatLabel(label: string, event: ProgressEstimateEvent, pct: number, startedAt: number): string;
+  estimate(label: string, event: ProgressEstimateEvent, pct: number, startedAt: number): ProgressEstimate;
 } {
   const options: ProgressEstimatorOptions = {
     ...DEFAULT_OPTIONS,
@@ -67,13 +72,13 @@ export function createProgressEstimator(
   };
 
   return {
-    formatLabel(label: string, event: ProgressEstimateEvent, pct: number, startedAt: number): string {
+    estimate(label: string, event: ProgressEstimateEvent, pct: number, startedAt: number): ProgressEstimate {
       const now = Date.now();
       trackProgress(state, event, pct, now, options);
 
       const remaining = estimateRemainingSeconds(state, event, pct, startedAt, now, options);
-      if (remaining == null) return label;
-      return `${label} — ${formatRemainingTime(remaining)} left`;
+      if (remaining == null) return { label };
+      return { label, remainingSeconds: remaining };
     },
   };
 }
@@ -140,7 +145,7 @@ function estimateRemainingSeconds(
   return remaining;
 }
 
-function formatRemainingTime(seconds: number): string {
+export function formatRemainingTime(seconds: number): string {
   if (seconds < 90) {
     return `~${Math.max(5, Math.ceil(seconds / 5) * 5)}s`;
   }

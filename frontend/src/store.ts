@@ -35,7 +35,16 @@ export const selectedVersion = computed<Version | null>(() => {
 
 export type InstallState =
   | { status: 'idle' }
-  | { status: 'active'; versionId: string; displayName?: string; pct: number; label: string; phase?: string; startedAt: number };
+  | {
+    status: 'active';
+    versionId: string;
+    displayName?: string;
+    pct: number;
+    label: string;
+    phase?: string;
+    remainingSeconds?: number;
+    startedAt: number;
+  };
 
 export type InstallFailure = {
   item: InstallItem;

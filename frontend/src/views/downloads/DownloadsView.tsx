@@ -6,6 +6,7 @@ import { installFailure, installQueue, installState } from '../../store';
 import { clearInstallFailure, removeQueuedInstallAt } from '../../actions';
 import { retryFailedInstall } from '../../install';
 import { formatInstallItemLabel } from '../../install-labels';
+import { formatRemainingTime } from '../../progress-estimation';
 
 function formatFailureTime(timestamp: number): string {
   return new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -33,6 +34,7 @@ export function DownloadsView(): JSX.Element {
   const queuedItemLabel = queue.length === 1 ? '1 item queued' : `${queue.length} items queued`;
   const phaseLabel = hasActive && state.phase ? state.phase.replace(/_/g, ' ') : '';
   const activePct = hasActive ? Math.round(Math.max(0, Math.min(100, state.pct))) : 0;
+  const activeEta = hasActive && state.remainingSeconds ? `${formatRemainingTime(state.remainingSeconds)} left` : '';
   const nextQueuedLabel = queue.length > 0 ? formatInstallItemLabel(queue[0]) : '';
   const pageStatus = hasActive
     ? `1 active task${queue.length > 0 ? ` · ${queuedLabel}` : ''}`
@@ -91,6 +93,7 @@ export function DownloadsView(): JSX.Element {
             right={(
               <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
                 {phaseLabel && <Pill>{phaseLabel}</Pill>}
+                {activeEta && <Pill icon="clock">{activeEta}</Pill>}
                 {queue.length > 0 && <Pill icon="clock">{queuedLabel}</Pill>}
               </div>
             )}
@@ -109,7 +112,9 @@ export function DownloadsView(): JSX.Element {
             lineHeight: 1.35,
           }}>
             <span>{formatElapsedTime(state.startedAt)}</span>
-            <span style={{ fontVariantNumeric: 'tabular-nums' }}>{activePct}%</span>
+            <span style={{ fontVariantNumeric: 'tabular-nums' }}>
+              {activeEta ? `${activeEta} · ` : ''}{activePct}%
+            </span>
           </div>
           {nextQueuedLabel && (
             <div style={{ fontSize: 11.5, color: theme.n.textMute, marginTop: 10, lineHeight: 1.4, overflowWrap: 'anywhere' }}>

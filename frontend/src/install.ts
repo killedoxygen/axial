@@ -421,7 +421,8 @@ async function connectVanillaEvents(installId: string, item: InstallItem): Promi
       pct = installState.value.status === 'active' ? installState.value.pct : 0;
     }
 
-    updateInstallProgress(pct, estimator.formatLabel(label, data, pct, startedAt), data.phase);
+    const estimate = estimator.estimate(label, data, pct, startedAt);
+    updateInstallProgress(pct, estimate.label, data.phase, estimate.remainingSeconds);
     if (data.done) await onInstallDone(item);
   };
 
@@ -514,7 +515,8 @@ async function connectLoaderEvents(installId: string, item: InstallItem): Promis
       pct = installState.value.status === 'active' ? installState.value.pct : 0;
     }
 
-    updateInstallProgress(pct, estimator.formatLabel(label, data, pct, startedAt), data.phase);
+    const estimate = estimator.estimate(label, data, pct, startedAt);
+    updateInstallProgress(pct, estimate.label, data.phase, estimate.remainingSeconds);
     if (data.done) void onInstallDone(item);
   };
 

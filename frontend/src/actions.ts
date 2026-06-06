@@ -103,16 +103,24 @@ export function startInstall(item: InstallItem, label = 'Starting...', displayNa
   installState.value = { status: 'active', versionId: item.versionId, displayName, pct: 0, label, phase: 'starting', startedAt: Date.now() };
 }
 
-export function updateInstallProgress(pct: number, label: string, phase?: string): void {
+function cleanRemainingSeconds(remainingSeconds: number | undefined): number | undefined {
+  return typeof remainingSeconds === 'number' && Number.isFinite(remainingSeconds) && remainingSeconds > 0
+    ? remainingSeconds
+    : undefined;
+}
+
+export function updateInstallProgress(pct: number, label: string, phase?: string, remainingSeconds?: number): void {
   const current = installState.value;
   if (current.status !== 'active') return;
   const nextPct = Number.isFinite(pct) ? Math.max(0, Math.min(100, pct)) : current.pct;
   const regressed = nextPct < current.pct;
+  const nextRemainingSeconds = cleanRemainingSeconds(remainingSeconds);
   installState.value = {
     ...current,
     pct: Math.max(current.pct, nextPct),
     label: regressed ? current.label : label,
     phase: regressed ? current.phase : phase || current.phase,
+    remainingSeconds: regressed ? current.remainingSeconds : nextRemainingSeconds,
   };
 }
 
