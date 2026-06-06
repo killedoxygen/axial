@@ -487,9 +487,9 @@ impl PerformanceManager {
         let final_path = instance_mods_dir.join(&filename);
         let was_previously_tracked = state_tracks_filename(previous_state, &filename);
 
-        if final_path.try_exists()? {
+        if tokio::fs::try_exists(&final_path).await? {
             if !expected_sha.trim().is_empty()
-                && let Ok(existing) = fs::read(&final_path)
+                && let Ok(existing) = tokio::fs::read(&final_path).await
             {
                 let actual = hex::encode(sha2::Sha512::digest(&existing));
                 if actual.eq_ignore_ascii_case(&expected_sha) {
@@ -512,11 +512,11 @@ impl PerformanceManager {
         self.modrinth
             .download_file_to_path(&file.url, &expected_sha, file.size, &temp_path)
             .await?;
-        if final_path.try_exists()? && !was_previously_tracked {
-            let _ = fs::remove_file(&temp_path);
+        if tokio::fs::try_exists(&final_path).await? && !was_previously_tracked {
+            let _ = tokio::fs::remove_file(&temp_path).await;
             return Err(InstallError::ManagedArtifactTargetExists(filename));
         }
-        promote_file(&temp_path, &final_path, &filename, was_previously_tracked)?;
+        promote_file_async(&temp_path, &final_path, &filename, was_previously_tracked).await?;
 
         Ok(InstalledMod {
             project_id: managed_mod.project_id.clone(),
@@ -1057,34 +1057,35 @@ fn managed_artifact_failure_evidence() -> String {
     MANAGED_ARTIFACT_INSTALL_FAILURE.to_string()
 }
 
-fn promote_file(
+async fn promote_file_async(
     temp_path: &Path,
     final_path: &Path,
     filename: &str,
     allow_overwrite: bool,
 ) -> Result<(), InstallError> {
     if allow_overwrite {
-        return promote_file_with_overwrite(temp_path, final_path);
+        return promote_file_with_overwrite_async(temp_path, final_path).await;
     }
 
-    match fs::hard_link(temp_path, final_path) {
+    match tokio::fs::hard_link(temp_path, final_path).await {
         Ok(()) => {
-            let _ = fs::remove_file(temp_path);
+            let _ = tokio::fs::remove_file(temp_path).await;
             Ok(())
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let _ = fs::remove_file(temp_path);
+            let _ = tokio::fs::remove_file(temp_path).await;
             Err(InstallError::ManagedArtifactTargetExists(
                 filename.to_string(),
             ))
         }
         Err(error) => {
-            let _ = fs::remove_file(temp_path);
+            let _ = tokio::fs::remove_file(temp_path).await;
             Err(InstallError::Io(error))
         }
     }
 }
 
+#[cfg(test)]
 fn promote_file_with_overwrite(temp_path: &Path, final_path: &Path) -> Result<(), InstallError> {
     let first_error = match fs::rename(temp_path, final_path) {
         Ok(()) => return Ok(()),
@@ -1137,6 +1138,66 @@ fn promote_file_with_overwrite(temp_path: &Path, final_path: &Path) -> Result<()
         Err(error) => {
             let _ = fs::rename(&backup_path, final_path);
             let _ = fs::remove_file(temp_path);
+            Err(InstallError::Io(error))
+        }
+    }
+}
+
+async fn promote_file_with_overwrite_async(
+    temp_path: &Path,
+    final_path: &Path,
+) -> Result<(), InstallError> {
+    let first_error = match tokio::fs::rename(temp_path, final_path).await {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+
+    match tokio::fs::symlink_metadata(temp_path).await {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(InstallError::Io(first_error));
+        }
+        Err(error) => return Err(InstallError::Io(error)),
+    }
+
+    let final_metadata = match tokio::fs::symlink_metadata(final_path).await {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(temp_path).await;
+            return Err(InstallError::Io(error));
+        }
+    };
+
+    let Some(final_metadata) = final_metadata else {
+        return match tokio::fs::rename(temp_path, final_path).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let _ = tokio::fs::remove_file(temp_path).await;
+                Err(InstallError::Io(error))
+            }
+        };
+    };
+
+    if final_metadata.is_dir() && !final_metadata.file_type().is_symlink() {
+        let _ = tokio::fs::remove_file(temp_path).await;
+        return Err(InstallError::Io(first_error));
+    }
+
+    let backup_path = managed_artifact_replace_backup_path(final_path);
+    if let Err(error) = tokio::fs::rename(final_path, &backup_path).await {
+        let _ = tokio::fs::remove_file(temp_path).await;
+        return Err(InstallError::Io(error));
+    }
+
+    match tokio::fs::rename(temp_path, final_path).await {
+        Ok(()) => {
+            let _ = tokio::fs::remove_file(&backup_path).await;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = tokio::fs::rename(&backup_path, final_path).await;
+            let _ = tokio::fs::remove_file(temp_path).await;
             Err(InstallError::Io(error))
         }
     }
@@ -1314,6 +1375,25 @@ mod tests {
         fs::create_dir(&final_path).expect("create directory destination");
 
         promote_file_with_overwrite(&temp_path, &final_path)
+            .expect_err("directory destination should fail");
+
+        assert!(final_path.is_dir());
+        assert!(!temp_path.exists());
+        assert_no_replace_backups(&root);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn async_promote_file_with_overwrite_preserves_directory_destination_and_removes_temp() {
+        let root = test_root("async-promote-overwrite-directory");
+        let temp_path = root.join("sodium.jar.tmp");
+        let final_path = root.join("sodium.jar");
+        fs::write(&temp_path, b"fresh").expect("write temp artifact");
+        fs::create_dir(&final_path).expect("create directory destination");
+
+        promote_file_with_overwrite_async(&temp_path, &final_path)
+            .await
             .expect_err("directory destination should fail");
 
         assert!(final_path.is_dir());
