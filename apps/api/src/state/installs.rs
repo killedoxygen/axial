@@ -232,6 +232,13 @@ mod tests {
         store.insert("done-install".to_string()).await;
         store.insert("active-install".to_string()).await;
         store.emit("done-install", done_progress()).await;
+        let (history, _, done) = store
+            .subscribe("done-install")
+            .await
+            .expect("terminal install remains subscribable until pruned");
+        assert!(done);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].phase, "done");
 
         store.insert("fresh-install".to_string()).await;
 
@@ -259,6 +266,13 @@ mod tests {
             )
             .await;
         store.emit("done-install", done_progress()).await;
+        let (history, _, done) = store
+            .subscribe("done-install")
+            .await
+            .expect("terminal install remains subscribable until pruned");
+        assert!(done);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].phase, "done");
 
         let (install_id, inserted) = store
             .insert_or_existing_active(
@@ -309,6 +323,13 @@ mod tests {
             )
             .await;
         store.emit("done-install", done_progress()).await;
+        let (history, _, done) = store
+            .subscribe("done-install")
+            .await
+            .expect("terminal install remains subscribable until pruned");
+        assert!(done);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].phase, "done");
 
         let (install_id, inserted) = store
             .insert_or_existing_active(
@@ -320,6 +341,8 @@ mod tests {
 
         assert_eq!(install_id, "fresh-install");
         assert!(inserted);
+        assert!(store.subscribe("done-install").await.is_none());
+        assert!(store.subscribe("fresh-install").await.is_some());
         assert_eq!(store.active_install_count().await, 1);
     }
 

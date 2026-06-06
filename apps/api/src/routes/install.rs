@@ -156,12 +156,10 @@ async fn handle_install_events(
             let terminal = progress.done;
             yield Ok(progress_event(&progress));
             if terminal {
-                store.remove(&install_id).await;
                 return;
             }
         }
         if done {
-            store.remove(&install_id).await;
             return;
         }
 
@@ -171,7 +169,6 @@ async fn handle_install_events(
                     let terminal = progress.done;
                     yield Ok(progress_event(&progress));
                     if terminal {
-                        store.remove(&install_id).await;
                         return;
                     }
                 }
@@ -204,6 +201,11 @@ fn generate_install_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::{AppStateInit, SessionStore};
+    use axum::{body::to_bytes, response::IntoResponse};
+    use croopor_config::{AppPaths, ConfigStore, InstanceStore};
+    use croopor_performance::PerformanceManager;
+    use std::{fs, path::Path as FsPath, sync::Arc};
 
     #[test]
     fn effective_install_fields_trims_version_id_and_manifest_url() {
@@ -300,6 +302,36 @@ mod tests {
         assert_eq!(sanitized.error.as_deref(), Some(INSTALL_FAILURE_MESSAGE));
     }
 
+    #[tokio::test]
+    async fn install_events_keep_terminal_installs_subscribable_after_stream_ends() {
+        let root = test_root("install-events-terminal-retention");
+        let state = build_test_state(&root);
+        state.installs().insert("done-install".to_string()).await;
+        state.installs().emit("done-install", done_progress()).await;
+
+        let response =
+            handle_install_events(State(state.clone()), Path("done-install".to_string()))
+                .await
+                .expect("terminal install events should be served")
+                .into_response();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("sse body should complete");
+        let body = String::from_utf8(body.to_vec()).expect("sse body is utf8");
+
+        assert!(body.contains("event: progress"));
+        assert!(body.contains("\"phase\":\"done\""));
+        let (history, _, done) = state
+            .installs()
+            .subscribe("done-install")
+            .await
+            .expect("terminal install remains subscribable after stream completion");
+        assert!(done);
+        assert_eq!(history.len(), 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn assert_no_raw_fragments(message: &str) {
         for fragment in [
             "/home/zero",
@@ -319,5 +351,58 @@ mod tests {
                 "message exposed raw fragment {fragment:?}: {message}"
             );
         }
+    }
+
+    fn done_progress() -> DownloadProgress {
+        DownloadProgress {
+            phase: "done".to_string(),
+            current: 1,
+            total: 1,
+            file: None,
+            error: None,
+            done: true,
+        }
+    }
+
+    fn build_test_state(root: &FsPath) -> AppState {
+        let paths = test_paths(root);
+        let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
+        let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
+        AppState::new(AppStateInit {
+            app_name: "Croopor".to_string(),
+            version: "test".to_string(),
+            config,
+            instances,
+            installs: Arc::new(InstallStore::new()),
+            sessions: Arc::new(SessionStore::new()),
+            performance: Arc::new(PerformanceManager::new().expect("performance manager")),
+            startup_warnings: Vec::new(),
+            frontend_dir: root.join("frontend"),
+        })
+    }
+
+    fn test_paths(root: &FsPath) -> AppPaths {
+        let config_dir = root.join("config");
+        AppPaths {
+            config_file: config_dir.join("config.json"),
+            instances_file: config_dir.join("instances.json"),
+            instances_dir: root.join("instances"),
+            music_dir: root.join("music"),
+            library_dir: root.join("library"),
+            config_dir,
+        }
+    }
+
+    fn test_root(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "croopor-api-install-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or_default()
+        ));
+        fs::create_dir_all(&path).expect("create test root");
+        path
     }
 }
