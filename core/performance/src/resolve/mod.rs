@@ -33,6 +33,8 @@ pub enum ResolveError {
     MissingMinimumAppVersion,
     #[error("minimum_app_version is invalid: {0}")]
     InvalidMinimumAppVersion(String),
+    #[error("running app version is invalid: {0}")]
+    InvalidRunningAppVersion(String),
     #[error("manifest requires app version {required}, but running app version is {running}")]
     UnsupportedAppVersion { required: String, running: String },
     #[error("rule_channel is required")]
@@ -307,13 +309,21 @@ fn declared_artifact_targets(
 }
 
 fn validate_app_version_compatibility(minimum_app_version: &str) -> Result<(), ResolveError> {
+    validate_app_version_compatibility_with_running(minimum_app_version, RUNNING_APP_VERSION)
+}
+
+fn validate_app_version_compatibility_with_running(
+    minimum_app_version: &str,
+    running_app_version: &str,
+) -> Result<(), ResolveError> {
     let minimum = parse_app_version(minimum_app_version)?;
-    let running = parse_app_version(RUNNING_APP_VERSION)
-        .expect("CARGO_PKG_VERSION should be a numeric dotted app version");
+    let running = parse_app_version(running_app_version).map_err(|_| {
+        ResolveError::InvalidRunningAppVersion(running_app_version.trim().to_string())
+    })?;
     if compare_app_versions(&minimum, &running).is_gt() {
         return Err(ResolveError::UnsupportedAppVersion {
             required: minimum_app_version.trim().to_string(),
-            running: RUNNING_APP_VERSION.to_string(),
+            running: running_app_version.to_string(),
         });
     }
     Ok(())
@@ -1218,7 +1228,8 @@ mod tests {
         ResolutionRequest, ResolveError, builtin_manifest, decode_windows_command_output,
         gpu_vendor_from_model_name, gpu_vendor_from_pci_id, is_drm_card_path,
         nvidia_arch_from_model, nvidia_model_from_information, parse_mode, parse_windows_gpu_names,
-        resolve_plan, select_gpu_from_names, select_gpu_vendor_from_vendors, validate_manifest,
+        resolve_plan, select_gpu_from_names, select_gpu_vendor_from_vendors,
+        validate_app_version_compatibility_with_running, validate_manifest,
     };
     use crate::types::{
         CompositionPlan, CompositionTier, EmergencyDisable, EmergencyDisableTarget,
@@ -1919,6 +1930,14 @@ mod tests {
 
             validate_manifest(&manifest).expect("manifest minimum should be compatible");
         }
+    }
+
+    #[test]
+    fn validation_rejects_invalid_running_app_version_without_panicking() {
+        assert_error_kind(
+            validate_app_version_compatibility_with_running("0.3.1", "development-build"),
+            ResolveError::InvalidRunningAppVersion("development-build".to_string()),
+        );
     }
 
     #[test]
