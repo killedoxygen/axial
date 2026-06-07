@@ -48,7 +48,7 @@ struct Processor {
     sides: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct DataEntry {
     #[serde(default)]
     client: String,
@@ -81,14 +81,15 @@ where
         }
     }
 
-    let (data_vars, temp_dir) = build_data_vars(
+    let (data_vars, temp_dir) = build_data_vars_blocking(
         &profile.data,
         mc_dir,
         mc_version,
         installer_data,
         work_dir,
         installer_path,
-    )?;
+    )
+    .await?;
     let processors = profile
         .processors
         .into_iter()
@@ -253,6 +254,35 @@ fn build_data_vars(
     );
 
     Ok((vars, temp_dir))
+}
+
+async fn build_data_vars_blocking(
+    data: &HashMap<String, DataEntry>,
+    mc_dir: &Path,
+    mc_version: &str,
+    installer_data: &[u8],
+    work_dir: &Path,
+    installer_path: &Path,
+) -> Result<(HashMap<String, String>, Option<PathBuf>), ProcessorError> {
+    let data = data.clone();
+    let mc_dir = mc_dir.to_path_buf();
+    let mc_version = mc_version.to_string();
+    let installer_data = installer_data.to_vec();
+    let work_dir = work_dir.to_path_buf();
+    let installer_path = installer_path.to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        build_data_vars(
+            &data,
+            &mc_dir,
+            &mc_version,
+            &installer_data,
+            &work_dir,
+            &installer_path,
+        )
+    })
+    .await
+    .map_err(|error| ProcessorError::Command(format!("blocking task failed: {error}")))?
 }
 
 fn create_temp_dir(work_dir: &Path) -> Result<PathBuf, std::io::Error> {
