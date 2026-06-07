@@ -22,6 +22,7 @@ const DEFAULT_HEAD_SIZE: u32 = 64;
 const MIN_HEAD_SIZE: u32 = 16;
 const MAX_HEAD_SIZE: u32 = 256;
 const HEAD_CACHE_CONTROL: &str = "private, max-age=86400";
+const PROFILE_SKIN_FILE_CACHE_CONTROL: &str = "private, max-age=300";
 const SAVED_SKIN_FILE_CACHE_CONTROL: &str = "private, max-age=31536000, immutable";
 const MINECRAFT_TEXTURE_URL_PREFIX: &str = "https://textures.minecraft.net/texture/";
 const SKIN_UPLOAD_MAX_BYTES: usize = 256 * 1024;
@@ -120,6 +121,7 @@ struct SkinApplyResponse {
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/skin/profile", get(handle_skin_profile))
+        .route("/api/v1/skin/profile/file", get(handle_skin_profile_file))
         .route("/api/v1/skin/head", get(handle_skin_head))
         .route("/api/v1/skins/normalize", post(handle_skin_normalize))
         .route(
@@ -205,6 +207,64 @@ fn online_skin_profile(account: Option<AuthLoginMinecraftAccount>) -> Option<Ski
         variant,
         texture_url,
         head_url: None,
+    })
+}
+
+struct ActiveMinecraftProfileSkin {
+    account: AuthLoginMinecraftAccount,
+    texture_url: String,
+}
+
+async fn active_minecraft_profile_skin(
+    state: &AppState,
+    allowed_prefix: &str,
+    not_ready_message: &'static str,
+) -> Result<ActiveMinecraftProfileSkin, ApiError> {
+    let minecraft_state = state
+        .auth_logins()
+        .active_current_minecraft_account_state()
+        .await
+        .ok_or_else(|| {
+            json_status_error(
+                StatusCode::UNAUTHORIZED,
+                "Minecraft account login required",
+                "minecraft_account_required",
+            )
+        })?;
+    let account = minecraft_state.account;
+    if !account.owns_minecraft_java
+        || account.profile.id.trim().is_empty()
+        || account.profile.name.trim().is_empty()
+    {
+        return Err(json_status_error(
+            StatusCode::CONFLICT,
+            not_ready_message,
+            "minecraft_account_not_ready",
+        ));
+    }
+
+    let selected_skin =
+        select_sane_minecraft_skin_with_prefix(&account.profile.skins, allowed_prefix).ok_or_else(
+            || {
+                json_status_error(
+                    StatusCode::CONFLICT,
+                    "Minecraft profile does not have a usable skin texture",
+                    "minecraft_profile_skin_missing",
+                )
+            },
+        )?;
+    let texture_url = sane_minecraft_texture_url_with_prefix(&selected_skin.url, allowed_prefix)
+        .ok_or_else(|| {
+            json_status_error(
+                StatusCode::CONFLICT,
+                "Minecraft profile does not have a usable skin texture",
+                "minecraft_profile_skin_missing",
+            )
+        })?;
+
+    Ok(ActiveMinecraftProfileSkin {
+        account,
+        texture_url,
     })
 }
 
@@ -314,6 +374,41 @@ async fn handle_skin_normalize(body: Body) -> Result<Json<SkinNormalizeResponse>
     }))
 }
 
+async fn handle_skin_profile_file(
+    State(state): State<AppState>,
+) -> Result<Response<Body>, ApiError> {
+    handle_skin_profile_file_with_client(State(state), MinecraftSkinTextureClient::default()).await
+}
+
+async fn handle_skin_profile_file_with_client(
+    State(state): State<AppState>,
+    client: MinecraftSkinTextureClient,
+) -> Result<Response<Body>, ApiError> {
+    let profile_skin = active_minecraft_profile_skin(
+        &state,
+        client.allowed_prefix(),
+        "Minecraft account is not ready for profile skin preview",
+    )
+    .await?;
+    let bytes = client
+        .download(&profile_skin.texture_url)
+        .await
+        .map_err(skin_texture_download_error)?;
+    let normalized = normalize_skin_png(&bytes)?;
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "image/png")
+        .header(header::CACHE_CONTROL, PROFILE_SKIN_FILE_CACHE_CONTROL)
+        .body(Body::from(normalized.png_bytes))
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "failed to build profile skin response" })),
+            )
+        })
+}
+
 async fn handle_saved_skins(
     State(state): State<AppState>,
 ) -> Result<Json<SavedSkinsResponse>, ApiError> {
@@ -392,47 +487,13 @@ async fn handle_save_skin_from_profile_with_client(
     payload: SaveSkinFromProfileRequest,
     client: MinecraftSkinTextureClient,
 ) -> Result<Json<SavedSkinRecord>, ApiError> {
-    let minecraft_state = state
-        .auth_logins()
-        .active_current_minecraft_account_state()
-        .await
-        .ok_or_else(|| {
-            json_status_error(
-                StatusCode::UNAUTHORIZED,
-                "Minecraft account login required",
-                "minecraft_account_required",
-            )
-        })?;
-    let account = minecraft_state.account;
-    if !account.owns_minecraft_java
-        || account.profile.id.trim().is_empty()
-        || account.profile.name.trim().is_empty()
-    {
-        return Err(json_status_error(
-            StatusCode::CONFLICT,
-            "Minecraft account is not ready for profile skin save",
-            "minecraft_account_not_ready",
-        ));
-    }
-
-    let selected_skin =
-        select_sane_minecraft_skin_with_prefix(&account.profile.skins, client.allowed_prefix())
-            .ok_or_else(|| {
-                json_status_error(
-                    StatusCode::CONFLICT,
-                    "Minecraft profile does not have a usable skin texture",
-                    "minecraft_profile_skin_missing",
-                )
-            })?;
-    let texture_url =
-        sane_minecraft_texture_url_with_prefix(&selected_skin.url, client.allowed_prefix())
-            .ok_or_else(|| {
-                json_status_error(
-                    StatusCode::CONFLICT,
-                    "Minecraft profile does not have a usable skin texture",
-                    "minecraft_profile_skin_missing",
-                )
-            })?;
+    let profile_skin = active_minecraft_profile_skin(
+        &state,
+        client.allowed_prefix(),
+        "Minecraft account is not ready for profile skin save",
+    )
+    .await?;
+    let account = profile_skin.account;
     let name = match payload.name.as_deref() {
         Some(name) => validate_saved_skin_name(name)?,
         None => validate_saved_skin_name(&default_profile_skin_name(&account.profile.name))?,
@@ -442,7 +503,7 @@ async fn handle_save_skin_from_profile_with_client(
         None => None,
     };
     let bytes = client
-        .download(&texture_url)
+        .download(&profile_skin.texture_url)
         .await
         .map_err(skin_texture_download_error)?;
     let normalized = normalize_skin_png(&bytes)?;
@@ -1927,6 +1988,142 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn skin_profile_file_downloads_normalizes_active_skin() {
+        let fixture = TestFixture::new("profile-file-active", "ConfigUser");
+        let png = test_skin_png(SKIN_WIDTH, LEGACY_SKIN_HEIGHT);
+        let normalized = normalize_skin_png(&png).expect("normalized skin");
+        let (texture_prefix, mut requests) =
+            skin_profile_texture_test_server(SkinProfileTextureServerMode::Png(png)).await;
+        fixture
+            .add_minecraft_account(test_profile(
+                "MinecraftName",
+                vec![
+                    minecraft_skin(
+                        "inactive",
+                        "INACTIVE",
+                        &format!("{texture_prefix}inactiveTexture123"),
+                        "classic",
+                    ),
+                    minecraft_skin(
+                        "active",
+                        "ACTIVE",
+                        &format!("{texture_prefix}activeTexture123"),
+                        "slim",
+                    ),
+                ],
+            ))
+            .await;
+
+        let file = fixture
+            .profile_file(texture_prefix.clone())
+            .await
+            .expect("profile skin file");
+        let request = requests.recv().await.expect("texture request");
+        let content_type = file
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let cache_control = file
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+
+        assert_eq!(request.path, "/texture/activeTexture123");
+        assert_eq!(request.accept.as_deref(), Some("image/png"));
+        assert_eq!(request.user_agent.as_deref(), Some(CROOPOR_USER_AGENT));
+        assert_eq!(content_type.as_deref(), Some("image/png"));
+        assert_eq!(
+            cache_control.as_deref(),
+            Some(PROFILE_SKIN_FILE_CACHE_CONTROL)
+        );
+        assert_eq!(response_bytes(file).await, normalized.png_bytes);
+    }
+
+    #[tokio::test]
+    async fn skin_profile_file_missing_active_account_returns_bounded_error() {
+        let fixture = TestFixture::new("profile-file-missing-active", "ConfigUser");
+
+        let error = fixture
+            .profile_file("http://127.0.0.1:9/texture/".to_string())
+            .await
+            .expect_err("missing active account should fail");
+
+        assert_eq!(error.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            error.1.0,
+            serde_json::json!({
+                "error": "Minecraft account login required",
+                "status": "minecraft_account_required",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn skin_profile_file_not_ready_account_returns_bounded_error() {
+        let fixture = TestFixture::new("profile-file-not-ready", "ConfigUser");
+        fixture
+            .add_minecraft_account_with_ownership(
+                test_profile(
+                    "MinecraftName",
+                    vec![minecraft_skin(
+                        "active",
+                        "ACTIVE",
+                        "https://textures.minecraft.net/texture/activeTexture123",
+                        "slim",
+                    )],
+                ),
+                false,
+            )
+            .await;
+
+        let error = fixture
+            .profile_file("http://127.0.0.1:9/texture/".to_string())
+            .await
+            .expect_err("not ready account should fail");
+
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert_eq!(
+            error.1.0,
+            serde_json::json!({
+                "error": "Minecraft account is not ready for profile skin preview",
+                "status": "minecraft_account_not_ready",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn skin_profile_file_requires_sane_texture_url() {
+        let fixture = TestFixture::new("profile-file-bad-texture", "ConfigUser");
+        fixture
+            .add_minecraft_account(test_profile(
+                "MinecraftName",
+                vec![minecraft_skin(
+                    "active",
+                    "ACTIVE",
+                    "https://example.com/texture/active?token=secret",
+                    "slim",
+                )],
+            ))
+            .await;
+
+        let error = fixture
+            .profile_file("http://127.0.0.1:9/texture/".to_string())
+            .await
+            .expect_err("unsane texture should fail");
+
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert_eq!(
+            error.1.0,
+            serde_json::json!({
+                "error": "Minecraft profile does not have a usable skin texture",
+                "status": "minecraft_profile_skin_missing",
+            })
+        );
+    }
+
     #[test]
     fn minecraft_texture_url_sanitization_is_strict() {
         assert_eq!(
@@ -3262,6 +3459,17 @@ mod tests {
             .await
         }
 
+        async fn profile_file(
+            &self,
+            allowed_prefix: String,
+        ) -> Result<Response<Body>, (StatusCode, Json<serde_json::Value>)> {
+            handle_skin_profile_file_with_client(
+                State(self.state.clone()),
+                MinecraftSkinTextureClient::with_allowed_prefix(allowed_prefix),
+            )
+            .await
+        }
+
         async fn saved_skins(
             &self,
         ) -> Result<Json<SavedSkinsResponse>, (StatusCode, Json<serde_json::Value>)> {
@@ -3364,10 +3572,33 @@ mod tests {
                 .await;
         }
 
+        async fn add_minecraft_account_with_ownership(
+            &self,
+            profile: AuthLoginMinecraftProfile,
+            owns_minecraft_java: bool,
+        ) {
+            self.add_minecraft_account_with_expiry_and_ownership(
+                profile,
+                86_400,
+                owns_minecraft_java,
+            )
+            .await;
+        }
+
         async fn add_minecraft_account_with_expiry(
             &self,
             profile: AuthLoginMinecraftProfile,
             expires_in: u64,
+        ) {
+            self.add_minecraft_account_with_expiry_and_ownership(profile, expires_in, true)
+                .await;
+        }
+
+        async fn add_minecraft_account_with_expiry_and_ownership(
+            &self,
+            profile: AuthLoginMinecraftProfile,
+            expires_in: u64,
+            owns_minecraft_java: bool,
         ) {
             let session = self
                 .state
@@ -3399,7 +3630,7 @@ mod tests {
                         token_type: Some("Bearer".to_string()),
                         expires_in,
                         profile,
-                        owns_minecraft_java: true,
+                        owns_minecraft_java,
                     },
                 )
                 .await

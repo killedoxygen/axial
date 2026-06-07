@@ -521,8 +521,10 @@ function PlayerIdentityCard({ savedUsername }: { savedUsername: string }): JSX.E
   const headSrc = state === 'ready' && profile?.head_url
     ? apiResourceUrl(profile.head_url)
     : undefined;
-  const textureSrc = state === 'ready' && profile?.texture_url
-    ? profile.texture_url
+  const textureSrc = state === 'ready'
+    && profile?.source === 'minecraft_profile_skin'
+    && profile.texture_url
+    ? apiResourceUrl('/skin/profile/file')
     : undefined;
 
   return (
