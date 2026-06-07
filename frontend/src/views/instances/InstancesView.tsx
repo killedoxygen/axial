@@ -8,7 +8,7 @@ import { useTheme } from '../../hooks/use-theme';
 import { instances, versions, runningSessions } from '../../store';
 import { navigate } from '../../ui-state';
 import { loaderKeyFromVersion, LOADER_LABELS } from '../create/defaults';
-import { deleteInstanceFlow, duplicateInstance, openInstanceFolder, renameInstance } from '../instance/InstanceDetailView';
+import { deleteInstanceFlow, duplicateInstance, openInstanceFolder, renameInstance } from '../instance/instance-actions';
 import type { EnrichedInstance, Version } from '../../types';
 
 function fmtRelative(iso?: string): string {
