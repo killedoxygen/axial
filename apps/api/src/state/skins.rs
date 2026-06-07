@@ -124,12 +124,17 @@ impl SavedSkinStore {
 
         let record = index.skins.remove(position);
         let file_path = self.skin_file_path(texture_key);
-        match fs::remove_file(&file_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
+        let parked_file_path = self.skin_delete_file_path(texture_key);
+        let parked_file = park_file_for_delete(&file_path, &parked_file_path)?;
+        if let Err(error) = self.persist_index(&index) {
+            if parked_file {
+                let _ = restore_parked_file(&parked_file_path, &file_path);
+            }
+            return Err(error);
         }
-        self.persist_index(&index)?;
+        if parked_file {
+            let _ = fs::remove_file(&parked_file_path);
+        }
 
         Ok(Some(record))
     }
@@ -236,6 +241,12 @@ impl SavedSkinStore {
     fn skin_file_path(&self, texture_key: &str) -> PathBuf {
         self.file_dir.join(format!("{texture_key}.png"))
     }
+
+    fn skin_delete_file_path(&self, texture_key: &str) -> PathBuf {
+        self.root_dir
+            .join("pending-delete")
+            .join(format!("{texture_key}.png"))
+    }
 }
 
 fn empty_index() -> SavedSkinIndex {
@@ -253,6 +264,33 @@ fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
     let temp_path = path.with_extension("tmp");
     fs::write(&temp_path, data)?;
     replace_file(&temp_path, path)
+}
+
+fn park_file_for_delete(source: &Path, parked: &Path) -> io::Result<bool> {
+    let Some(parent) = parked.parent() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "saved skin delete path has no parent",
+        ));
+    };
+    fs::create_dir_all(parent)?;
+    match fs::remove_file(parked) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    match fs::rename(source, parked) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn restore_parked_file(parked: &Path, destination: &Path) -> io::Result<()> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::rename(parked, destination)
 }
 
 fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
@@ -319,6 +357,55 @@ mod tests {
         assert!(!source.exists());
 
         cleanup(&root);
+    }
+
+    #[test]
+    fn saved_skin_delete_restores_png_when_index_persistence_fails() {
+        let root = test_root("delete-persist-failure");
+        let store = test_store(&root);
+        let texture_key = "saved-skin";
+        let png_bytes = b"skin bytes";
+        let saved = store
+            .save(
+                texture_key.to_string(),
+                "Saved Skin".to_string(),
+                "classic".to_string(),
+                "test".to_string(),
+                png_bytes,
+            )
+            .expect("save skin");
+        fs::create_dir(store.index_path.with_extension("tmp")).expect("block index temp path");
+
+        store
+            .delete(texture_key)
+            .expect_err("delete should fail when index cannot persist");
+
+        assert_eq!(
+            store
+                .list()
+                .expect("list should still load persisted index"),
+            vec![saved]
+        );
+        assert_eq!(
+            store
+                .read_png(texture_key)
+                .expect("read should not fail")
+                .expect("skin png should still be indexed and readable"),
+            png_bytes
+        );
+        assert!(!store.skin_delete_file_path(texture_key).exists());
+
+        cleanup(&root);
+    }
+
+    fn test_store(root: &Path) -> SavedSkinStore {
+        let root_dir = root.join("skins");
+        SavedSkinStore {
+            file_dir: root_dir.join("files"),
+            index_path: root_dir.join("index.json"),
+            root_dir,
+            lock: Mutex::new(()),
+        }
     }
 
     fn test_root(name: &str) -> PathBuf {
