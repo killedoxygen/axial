@@ -591,7 +591,7 @@ function ShortcutsSection(): JSX.Element {
     ['Close dialogs', 'Esc'],
   ];
   return (
-    <SettingsCard title="Keyboard shortcuts" desc="Global shortcuts built into the launcher. Custom rebinding is coming." stack>
+    <SettingsCard title="Keyboard shortcuts" desc="Global shortcuts available in the launcher." stack>
       <div style={{ marginTop: 14, display: 'flex', flexDirection: 'column', gap: 2 }}>
         {rows.map(([label, combo]) => (
           <div key={label} style={{
@@ -661,7 +661,7 @@ function AdvancedSection(): JSX.Element {
     <>
       <SettingsCard
         title="Optional diagnostics"
-        desc="Stores consent for future lightweight diagnostics. Current builds do not upload telemetry or open a remote diagnostics channel."
+        desc="Stores diagnostics consent. Current builds do not upload telemetry or open a remote diagnostics channel."
         control={<Toggle on={telemetryEnabled} onChange={() => void toggleTelemetry()} />}
       />
       <SettingsCard
@@ -672,7 +672,7 @@ function AdvancedSection(): JSX.Element {
       {__CROOPOR_ENABLE_DEV_LAB__ && isDev && (
         <SettingsCard
           title="Dev lab"
-          desc="Developer-only workbench for procedural art and future internal experiments."
+          desc="Developer-only workbench for procedural art and internal experiments."
           control={<Button variant="secondary" icon="palette" onClick={() => navigate({ name: 'dev-lab' })}>Open lab</Button>}
         />
       )}
