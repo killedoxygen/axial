@@ -1687,20 +1687,22 @@ function PerformanceSection(): JSX.Element {
         desc="Launch behavior and managed rule readiness."
         stack
       >
-        <ModeChoice
-          label="Performance mode"
-          value={performanceMode}
-          options={PERFORMANCE_OPTIONS}
-          disabled={saving !== null}
-          onChange={changePerformance}
-        />
-        <ModeChoice
-          label="Guardian mode"
-          value={guardianMode}
-          options={GUARDIAN_OPTIONS}
-          disabled={saving !== null}
-          onChange={changeGuardian}
-        />
+        <div class="cp-settings-mode-grid">
+          <ModeChoice
+            label="Performance mode"
+            value={performanceMode}
+            options={PERFORMANCE_OPTIONS}
+            disabled={saving !== null}
+            onChange={changePerformance}
+          />
+          <ModeChoice
+            label="Guardian mode"
+            value={guardianMode}
+            options={GUARDIAN_OPTIONS}
+            disabled={saving !== null}
+            onChange={changeGuardian}
+          />
+        </div>
         <PerformanceRulesStatusBlock state={rulesStatus} />
       </SettingsCard>
     </>
