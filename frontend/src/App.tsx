@@ -159,7 +159,7 @@ function DevLabLoader({ load }: { load: () => Promise<DevLabViewComponent> }): J
 }
 
 function LazyCommandPalette(): JSX.Element | null {
-  const [CommandPaletteView, setCommandPaletteView] = useState<CommandPaletteComponent | null>(loadedCommandPalette);
+  const [CommandPaletteView, setCommandPaletteView] = useState<CommandPaletteComponent | null>(() => loadedCommandPalette);
 
   useEffect(() => {
     if (CommandPaletteView) return;
