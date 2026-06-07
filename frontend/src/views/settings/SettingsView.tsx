@@ -1683,8 +1683,8 @@ function PerformanceSection(): JSX.Element {
   return (
     <>
       <SettingsCard
-        title="Launch behavior"
-        desc="Defaults for performance and safety."
+        title="Performance"
+        desc="Launch behavior and managed rule readiness."
         stack
       >
         <ModeChoice
@@ -1701,13 +1701,7 @@ function PerformanceSection(): JSX.Element {
           disabled={saving !== null}
           onChange={changeGuardian}
         />
-      </SettingsCard>
-      <SettingsCard
-        title="Performance rules"
-        desc="Active rule source and validation for managed performance defaults."
-        stack
-      >
-        <PerformanceRulesStatusBlock state={rulesStatus} standalone />
+        <PerformanceRulesStatusBlock state={rulesStatus} />
       </SettingsCard>
     </>
   );
