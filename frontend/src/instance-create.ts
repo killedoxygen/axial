@@ -101,7 +101,7 @@ export async function createInstance(args: CreateInstanceArgs): Promise<CreateIn
         break;
       }
       lastError = 'server returned an incomplete instance';
-      console.error('Create instance returned invalid payload', res);
+      console.error('Create instance returned invalid payload');
       break;
     } catch (err: unknown) {
       const message = errMessage(err);
