@@ -488,7 +488,7 @@ impl Downloader {
                 remove_stale_download_temp(&tmp_path).await?;
                 let response = self.client.get(url).send().await?.error_for_status()?;
                 write_download_response(response, &tmp_path, destination, expected).await?;
-                verify_downloaded_file(&tmp_path, expected).await?;
+                verify_downloaded_file(&tmp_path, destination, expected).await?;
                 promote_download_temp(&tmp_path, destination).await?;
                 Ok::<(), DownloadError>(())
             }
@@ -1133,7 +1133,7 @@ async fn download_file_with_client(
             remove_stale_download_temp(&tmp_path).await?;
             let response = client.get(url).send().await?.error_for_status()?;
             write_download_response(response, &tmp_path, destination, expected).await?;
-            verify_downloaded_file(&tmp_path, expected).await?;
+            verify_downloaded_file(&tmp_path, destination, expected).await?;
             promote_download_temp(&tmp_path, destination).await?;
             Ok::<(), DownloadError>(())
         }
@@ -1280,6 +1280,7 @@ async fn existing_asset_object_satisfies(
 
 async fn verify_downloaded_file(
     path: &Path,
+    label_path: &Path,
     expected: &ExpectedIntegrity,
 ) -> Result<(), DownloadError> {
     if !expected.has_evidence() {
@@ -1294,7 +1295,7 @@ async fn verify_downloaded_file(
             sha1: None,
         }
     };
-    verify_download_integrity(path, expected, &actual)
+    verify_download_integrity(label_path, expected, &actual)
         .map_err(|error| DownloadError::Integrity(error.to_string()))?;
     Ok(())
 }
@@ -1368,7 +1369,12 @@ fn non_empty_sha1(value: &str) -> Option<String> {
 
 fn bounded_download_file_label(path: &Path) -> String {
     const MAX_LABEL_CHARS: usize = 120;
-    let sanitized = path.to_string_lossy().replace(['\r', '\n'], "?");
+    let sanitized = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("artifact")
+        .replace(['\r', '\n'], "?");
     let mut chars = sanitized.chars();
     let label = chars.by_ref().take(MAX_LABEL_CHARS).collect::<String>();
     if chars.next().is_some() {
@@ -1855,7 +1861,7 @@ mod tests {
             "hash_file future should not embed the hash buffer on the task stack"
         );
         assert!(
-            std::mem::size_of_val(&verify_downloaded_file(path, &expected)) < 4096,
+            std::mem::size_of_val(&verify_downloaded_file(path, path, &expected)) < 4096,
             "download verification future should stay small"
         );
         assert!(
@@ -2156,6 +2162,33 @@ mod tests {
             verify_download_integrity(path, &expected, &wrong_sha1),
             Err(DownloadIntegrityError::Sha1Mismatch { .. })
         ));
+    }
+
+    #[test]
+    fn download_integrity_errors_report_file_name_without_local_path() {
+        let path = Path::new("/home/alice/.minecraft/libraries/org/example/lib.jar");
+        let expected =
+            ExpectedIntegrity::from_mojang(8, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let wrong_size = ActualIntegrity {
+            size: 7,
+            sha1: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
+        };
+
+        let message = verify_download_integrity(path, &expected, &wrong_size)
+            .expect_err("expected size mismatch")
+            .to_string();
+        let early_size_message = download_size_mismatch(path, 8, 9).to_string();
+
+        for message in [message, early_size_message] {
+            assert!(message.contains("lib.jar"));
+            assert!(!message.contains("/home/alice"));
+            assert!(!message.contains(".minecraft"));
+        }
+    }
+
+    #[test]
+    fn download_integrity_file_label_falls_back_to_generic_artifact() {
+        assert_eq!(bounded_download_file_label(Path::new("/")), "artifact");
     }
 
     #[test]
