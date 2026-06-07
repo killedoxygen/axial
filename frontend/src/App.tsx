@@ -50,22 +50,26 @@ const loadDevLabView = __CROOPOR_ENABLE_DEV_LAB__
   : null;
 
 function createRouteLoader<P extends object>(load: () => Promise<ComponentType<P>>): ComponentType<P> {
+  let loadedView: ComponentType<P> | null = null;
+
   return function LazyRouteView(props: P): JSX.Element {
-    const [View, setView] = useState<ComponentType<P> | null>(null);
+    const [View, setView] = useState<ComponentType<P> | null>(() => loadedView);
     const [failed, setFailed] = useState(false);
 
     useEffect(() => {
+      if (View) return;
       let mounted = true;
       setFailed(false);
       void load()
         .then((view) => {
+          loadedView = view;
           if (mounted) setView(() => view);
         })
         .catch(() => {
           if (mounted) setFailed(true);
         });
       return () => { mounted = false; };
-    }, []);
+    }, [View]);
 
     return View ? h(View, props) : <RouteLoadingFallback failed={failed} />;
   };
