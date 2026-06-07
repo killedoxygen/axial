@@ -8,12 +8,14 @@ import { DialogHost } from './ui/Dialog';
 import { SetupOverlay } from './views/setup/SetupOverlay';
 import { ContextMenuHost } from './ui/ContextMenu';
 import { ToastHost } from './ui/ToastHost';
-import { CommandPalette } from './ui/CommandPalette';
-import { route, showOnboardingOverlay, showSetupOverlay } from './ui-state';
+import { commandPaletteOpen, route, showOnboardingOverlay, showSetupOverlay } from './ui-state';
 import { bootstrapError, bootstrapState, devMode } from './store';
 import { useShortcuts } from './hooks/use-shortcuts';
 
 type DevLabViewComponent = typeof import('./views/dev-lab/DevLabView')['DevLabView'];
+type CommandPaletteComponent = typeof import('./ui/CommandPalette')['CommandPalette'];
+
+let loadedCommandPalette: CommandPaletteComponent | null = null;
 
 const InstanceDetailRoute = createRouteLoader<{ id: string }>(
   async () => (await import('./views/instance/InstanceDetailView')).InstanceDetailView,
@@ -131,6 +133,22 @@ function DevLabLoader({ load }: { load: () => Promise<DevLabViewComponent> }): J
   return DevLabView ? <DevLabView /> : <SettingsRoute />;
 }
 
+function LazyCommandPalette(): JSX.Element | null {
+  const [CommandPaletteView, setCommandPaletteView] = useState<CommandPaletteComponent | null>(loadedCommandPalette);
+
+  useEffect(() => {
+    if (CommandPaletteView) return;
+    let mounted = true;
+    void import('./ui/CommandPalette').then((module) => {
+      loadedCommandPalette = module.CommandPalette;
+      if (mounted) setCommandPaletteView(() => module.CommandPalette);
+    });
+    return () => { mounted = false; };
+  }, [CommandPaletteView]);
+
+  return CommandPaletteView ? <CommandPaletteView /> : null;
+}
+
 function CurrentView(): JSX.Element {
   const r = route.value;
   switch (r.name) {
@@ -155,7 +173,7 @@ export function App(): JSX.Element {
       <DialogHost />
       <ContextMenuHost />
       <ToastHost />
-      <CommandPalette />
+      {commandPaletteOpen.value && <LazyCommandPalette />}
       <BootState />
     </>
   );
