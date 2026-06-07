@@ -437,15 +437,16 @@ async fn handle_save_skin_from_profile_with_client(
         Some(name) => validate_saved_skin_name(name)?,
         None => validate_saved_skin_name(&default_profile_skin_name(&account.profile.name))?,
     };
-    let variant = match payload.variant.as_deref() {
-        Some(_) => validate_saved_skin_variant(payload.variant.as_deref())?,
-        None => skin_variant(&selected_skin.variant).to_string(),
+    let variant_override = match payload.variant.as_deref() {
+        Some(variant) => Some(validate_saved_skin_variant(Some(variant))?),
+        None => None,
     };
     let bytes = client
         .download(&texture_url)
         .await
         .map_err(skin_texture_download_error)?;
     let normalized = normalize_skin_png(&bytes)?;
+    let variant = variant_override.unwrap_or_else(|| normalized.variant_suggestion.to_string());
     let texture_key = texture_key(&normalized.png_bytes);
     let record = state
         .skins()
@@ -515,15 +516,16 @@ async fn handle_save_skin_from_username_with_clients(
         Some(name) => validate_saved_skin_name(name)?,
         None => validate_saved_skin_name(&default_username_skin_name(&profile.name))?,
     };
-    let variant = match payload.variant.as_deref() {
-        Some(_) => validate_saved_skin_variant(payload.variant.as_deref())?,
-        None => profile.variant.to_string(),
+    let variant_override = match payload.variant.as_deref() {
+        Some(variant) => Some(validate_saved_skin_variant(Some(variant))?),
+        None => None,
     };
     let bytes = texture_client
         .download(&profile.texture_url)
         .await
         .map_err(skin_texture_download_error)?;
     let normalized = normalize_skin_png(&bytes)?;
+    let variant = variant_override.unwrap_or_else(|| normalized.variant_suggestion.to_string());
     let texture_key = texture_key(&normalized.png_bytes);
     let record = state
         .skins()
@@ -728,7 +730,6 @@ impl MinecraftSkinUsernameClient {
             .map(|skin| MinecraftUsernameSkinProfile {
                 name: mojang_profile.name,
                 texture_url: skin.texture_url,
-                variant: skin.variant,
             })
     }
 
@@ -775,7 +776,6 @@ impl MinecraftSkinUsernameClient {
 struct MinecraftUsernameSkinProfile {
     name: String,
     texture_url: String,
-    variant: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -827,16 +827,8 @@ impl MinecraftSessionProfile {
             .ok_or(MinecraftUsernameSkinError::MissingSkin)?;
         let texture_url = sane_minecraft_texture_url_with_prefix(&skin.url, allowed_texture_prefix)
             .ok_or(MinecraftUsernameSkinError::MissingSkin)?;
-        let variant = skin
-            .metadata
-            .and_then(|metadata| metadata.model)
-            .map(|model| skin_variant(&model))
-            .unwrap_or("classic");
 
-        Ok(MinecraftSessionSkinProfile {
-            texture_url,
-            variant,
-        })
+        Ok(MinecraftSessionSkinProfile { texture_url })
     }
 }
 
@@ -860,17 +852,10 @@ struct MinecraftSessionTextureMap {
 #[derive(Debug, Deserialize)]
 struct MinecraftSessionSkinTexture {
     url: String,
-    metadata: Option<MinecraftSessionSkinMetadata>,
-}
-
-#[derive(Debug, Deserialize)]
-struct MinecraftSessionSkinMetadata {
-    model: Option<String>,
 }
 
 struct MinecraftSessionSkinProfile {
     texture_url: String,
-    variant: &'static str,
 }
 
 async fn read_minecraft_json_response(
@@ -2519,7 +2504,8 @@ mod tests {
         assert_eq!(request.accept.as_deref(), Some("image/png"));
         assert_eq!(request.user_agent.as_deref(), Some(CROOPOR_USER_AGENT));
         assert_eq!(saved.name, "MinecraftName profile skin");
-        assert_eq!(saved.variant, "slim");
+        assert_eq!(normalized.variant_suggestion, "classic");
+        assert_eq!(saved.variant, normalized.variant_suggestion);
         assert_eq!(saved.source, SAVED_SKIN_PROFILE_SOURCE);
         assert_eq!(saved.texture_key, texture_key(&normalized.png_bytes));
         assert_eq!(saved.byte_size, normalized.png_bytes.len());
@@ -2708,12 +2694,50 @@ mod tests {
         assert_eq!(texture_request.path, "/texture/usernameTexture123");
         assert_eq!(texture_request.accept.as_deref(), Some("image/png"));
         assert_eq!(saved.name, "ResolvedName skin");
-        assert_eq!(saved.variant, "slim");
+        assert_eq!(normalized.variant_suggestion, "classic");
+        assert_eq!(saved.variant, normalized.variant_suggestion);
         assert_eq!(saved.source, SAVED_SKIN_USERNAME_SOURCE);
         assert_eq!(saved.texture_key, texture_key(&normalized.png_bytes));
         assert_eq!(saved.byte_size, normalized.png_bytes.len());
         assert_eq!(listed.skins, vec![saved.clone()]);
         assert_eq!(response_bytes(file).await, normalized.png_bytes);
+    }
+
+    #[tokio::test]
+    async fn skin_username_save_accepts_name_and_variant_override() {
+        let fixture = TestFixture::new("username-save-overrides", "ConfigUser");
+        let png = test_slim_skin_png();
+        let normalized = normalize_skin_png(&png).expect("normalized skin");
+        let (texture_prefix, mut texture_requests) =
+            skin_profile_texture_test_server(SkinProfileTextureServerMode::Png(png)).await;
+        let (profile_endpoint, session_endpoint, mut profile_requests) =
+            minecraft_username_test_server(MinecraftUsernameServerMode::Success {
+                texture_url: format!("{texture_prefix}usernameTexture123"),
+                model: Some("slim".to_string()),
+            })
+            .await;
+
+        let saved = fixture
+            .save_skin_from_username(
+                SaveSkinFromUsernameRequest {
+                    username: "QueryUser".to_string(),
+                    name: Some("  Username Copy  ".to_string()),
+                    variant: Some("CLASSIC".to_string()),
+                },
+                profile_endpoint,
+                session_endpoint,
+                texture_prefix,
+            )
+            .await
+            .expect("save username skin")
+            .0;
+        let _ = profile_requests.recv().await.expect("profile request");
+        let _ = profile_requests.recv().await.expect("session request");
+        let _ = texture_requests.recv().await.expect("texture request");
+
+        assert_eq!(normalized.variant_suggestion, "slim");
+        assert_eq!(saved.name, "Username Copy");
+        assert_eq!(saved.variant, "classic");
     }
 
     #[tokio::test]
