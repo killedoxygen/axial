@@ -1,7 +1,8 @@
 import type { JSX } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { api, apiResourceUrl, apiUrl, isApiError } from '../../api';
-import { Button, Card, Input, Pill, SectionHeading, Segmented } from '../../ui/Atoms';
+import { Button, Card, IconButton, Input, Pill, SectionHeading, Segmented } from '../../ui/Atoms';
+import { openContextMenu, type ContextMenuItem } from '../../ui/ContextMenu';
 import { showConfirm } from '../../ui/Dialog';
 import { Icon } from '../../ui/Icons';
 import { PlayerHeadPreview } from '../../ui/PlayerHeadPreview';
@@ -1987,6 +1988,50 @@ function SkinRestorerHelper({ savedUsername }: { savedUsername: string }): JSX.E
   );
 }
 
+function menuItemsForSavedSkin({
+  skin,
+  selectedPreviewEditing,
+  onlineReady,
+  applying,
+  deleting,
+  onView,
+  onApply,
+  onEdit,
+  onDownload,
+  onDelete,
+}: {
+  skin: SavedSkinRecord;
+  selectedPreviewEditing: boolean;
+  onlineReady: boolean;
+  applying: boolean;
+  deleting: boolean;
+  onView: () => void;
+  onApply: () => void;
+  onEdit: () => void;
+  onDownload: () => void;
+  onDelete: () => void;
+}): ContextMenuItem[] {
+  const applied = Boolean(skin.applied_at);
+  const items: ContextMenuItem[] = [];
+
+  if (!deleting) {
+    items.push({ icon: 'image', label: 'View', onSelect: onView });
+  }
+  if (onlineReady && !applied && !applying) {
+    items.push({ icon: 'check', label: 'Apply', onSelect: onApply });
+  }
+  if (!selectedPreviewEditing && !deleting && !applying) {
+    items.push({ icon: 'edit', label: 'Edit', onSelect: onEdit });
+  }
+  if (!deleting) {
+    items.push({ icon: 'download', label: 'Download PNG', onSelect: onDownload });
+    items.push({ label: '', onSelect: () => {}, divider: true });
+    items.push({ icon: 'trash', label: 'Delete', onSelect: onDelete, danger: true });
+  }
+
+  return items;
+}
+
 function SavedSkinLibrary({
   onlineReady,
   minecraftProfile,
@@ -3098,6 +3143,20 @@ function SavedSkinLibrary({
               const applied = Boolean(skin.applied_at);
               const selected = selectedSkin?.texture_key === skin.texture_key;
               const editing = editKey === skin.texture_key && !(selected && selectedPreviewEditing);
+              const applying = applyKey === skin.texture_key;
+              const deleting = deleteKey === skin.texture_key;
+              const rowMenuItems = menuItemsForSavedSkin({
+                skin,
+                selectedPreviewEditing: selected && selectedPreviewEditing,
+                onlineReady,
+                applying,
+                deleting,
+                onView: () => setSelectedKey(skin.texture_key),
+                onApply: () => void applySkin(skin.texture_key),
+                onEdit: () => startEdit(skin),
+                onDownload: () => downloadSavedSkin(skin),
+                onDelete: () => void confirmDeleteSkin(skin),
+              });
 
               return (
                 <div
@@ -3111,6 +3170,9 @@ function SavedSkinLibrary({
                     background: selected ? 'var(--accent-softer)' : undefined,
                     borderTop: index === 0 ? undefined : '1px solid var(--line)',
                   }}
+                  onContextMenu={editing || rowMenuItems.length === 0
+                    ? undefined
+                    : (event) => openContextMenu(event, rowMenuItems)}
                 >
                   <SavedSkinBodyPreview
                     skin={skin}
@@ -3176,7 +3238,7 @@ function SavedSkinLibrary({
                           variant={selected ? 'secondary' : 'ghost'}
                           size="sm"
                           icon="image"
-                          disabled={deleteKey === skin.texture_key}
+                          disabled={deleting}
                           onClick={() => setSelectedKey(skin.texture_key)}
                         >
                           View
@@ -3186,8 +3248,8 @@ function SavedSkinLibrary({
                           size="sm"
                           icon={applied
                             ? 'check-circle'
-                            : applyKey === skin.texture_key ? 'refresh' : 'check'}
-                          disabled={!onlineReady || applied || applyKey === skin.texture_key}
+                            : applying ? 'refresh' : 'check'}
+                          disabled={!onlineReady || applied || applying}
                           onClick={() => void applySkin(skin.texture_key)}
                           title={applied
                             ? 'Already applied to the active Minecraft account'
@@ -3195,28 +3257,16 @@ function SavedSkinLibrary({
                         >
                           {applied ? 'Applied' : 'Apply'}
                         </Button>
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          icon="edit"
-                          disabled={
-                            (selected && selectedPreviewEditing)
-                            || deleteKey === skin.texture_key
-                            || applyKey === skin.texture_key
-                          }
-                          onClick={() => startEdit(skin)}
-                        >
-                          Edit
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          icon="trash"
-                          disabled={deleteKey === skin.texture_key}
-                          onClick={() => void confirmDeleteSkin(skin)}
-                        >
-                          Delete
-                        </Button>
+                        <IconButton
+                          icon="dots"
+                          size={28}
+                          tooltip="More skin actions"
+                          disabled={rowMenuItems.length === 0}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            openContextMenu(event, rowMenuItems);
+                          }}
+                        />
                       </div>
                     </>
                   )}
