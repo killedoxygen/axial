@@ -312,7 +312,7 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
             onOpenLogs={() => setTab('logs')}
           />
           <div class="cp-instance-bottom">
-            <LogsCard resources={resources.data} onOpenLogs={() => setTab('logs')} />
+            <LogsCard instanceId={inst.id} resources={resources.data} running={running} onOpenLogs={() => setTab('logs')} />
           </div>
         </>
       )}
