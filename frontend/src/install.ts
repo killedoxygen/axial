@@ -448,7 +448,21 @@ async function connectVanillaEvents(installId: string, item: InstallItem): Promi
   setInstallEventSource(es);
 
   es.addEventListener('progress', (e: MessageEvent) => {
-    void onProgress(JSON.parse(e.data));
+    let data: InstallProgressEvent;
+    try {
+      data = JSON.parse(e.data) as InstallProgressEvent;
+    } catch {
+      void (async () => {
+        if (isActiveInstallSource(item, es)) {
+          const message = 'Install progress data was invalid. Retry from Downloads.';
+          recordInstallFailure(item, message);
+          showError(message);
+          await onInstallDone();
+        }
+      })();
+      return;
+    }
+    void onProgress(data);
   });
 
   es.onerror = () => {
