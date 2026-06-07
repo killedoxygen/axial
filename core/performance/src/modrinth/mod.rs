@@ -2,7 +2,6 @@ use hex::encode;
 use reqwest::{Client, Response, StatusCode, Url};
 use serde::Deserialize;
 use sha2::{Digest, Sha512};
-use std::fs;
 use std::io;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -142,7 +141,7 @@ impl ModrinthClient {
             .parent()
             .filter(|path| !path.as_os_str().is_empty())
         {
-            fs::create_dir_all(parent)?;
+            tokio::fs::create_dir_all(parent).await?;
         }
 
         let result = async {
@@ -171,14 +170,14 @@ impl ModrinthClient {
         let actual = match result {
             Ok(actual) => actual,
             Err(error) => {
-                let _ = fs::remove_file(temp_path);
+                let _ = tokio::fs::remove_file(temp_path).await;
                 return Err(error);
             }
         };
 
         if !expected_sha512.trim().is_empty() {
             if !actual.eq_ignore_ascii_case(expected_sha512) {
-                let _ = fs::remove_file(temp_path);
+                let _ = tokio::fs::remove_file(temp_path).await;
                 return Err(ModrinthError::HashMismatch {
                     expected: expected_sha512.to_string(),
                     actual,
