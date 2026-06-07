@@ -29,7 +29,11 @@ export function apiUrl(path: string): string {
 
 export function apiResourceUrl(path: string): string {
   const trimmed = path.trim();
-  if (/^[a-z][a-z\d+\-.]*:/i.test(trimmed) || trimmed.startsWith('//')) return trimmed;
+  if (isAbsoluteLikeUrl(trimmed)) {
+    const apiPath = apiOwnedResourcePath(trimmed);
+    if (apiPath !== null) return apiPath ? apiUrl(apiPath) : API;
+    return apiUrl(trimmed);
+  }
   if (trimmed === API_PATH) return API;
   if (trimmed.startsWith(`${API_PATH}/`)) return apiUrl(trimmed.slice(API_PATH.length));
   return apiUrl(trimmed);
@@ -66,6 +70,35 @@ function normalizeApiBaseUrl(baseUrl: string): string {
   const trimmed = baseUrl.trim().replace(/\/+$/, '');
   if (trimmed.endsWith(API_PATH)) return trimmed.slice(0, -API_PATH.length);
   return trimmed;
+}
+
+function isAbsoluteLikeUrl(value: string): boolean {
+  return /^[a-z][a-z\d+\-.]*:/i.test(value) || value.startsWith('//');
+}
+
+function apiOwnedResourcePath(value: string): string | null {
+  const currentApiUrl = parseUrl(API);
+  const resourceUrl = parseUrl(value);
+  if (!currentApiUrl || !resourceUrl) return null;
+  if (resourceUrl.protocol !== currentApiUrl.protocol || resourceUrl.host !== currentApiUrl.host) return null;
+
+  const apiPath = currentApiUrl.pathname.replace(/\/+$/, '');
+  if (resourceUrl.pathname === apiPath) return '';
+  if (!resourceUrl.pathname.startsWith(`${apiPath}/`)) return null;
+  return `${resourceUrl.pathname.slice(apiPath.length)}${resourceUrl.search}${resourceUrl.hash}`;
+}
+
+function parseUrl(value: string): URL | null {
+  try {
+    return new URL(value, browserBaseUrl());
+  } catch {
+    return null;
+  }
+}
+
+function browserBaseUrl(): string {
+  if (typeof location !== 'undefined' && location.href) return location.href;
+  return 'http://localhost/';
 }
 
 async function readJsonPayload(response: Response): Promise<unknown> {
