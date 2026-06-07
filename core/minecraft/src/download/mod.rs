@@ -651,13 +651,15 @@ where
 
     if index.virtual_flag || index.map_to_resources {
         let virtual_dir = assets_dir(mc_dir).join("virtual").join("legacy");
-        for (name, object) in index.objects {
-            let src = objects_dir
-                .join(asset_object_hash_prefix(&object.hash)?)
-                .join(&object.hash);
-            let dst = virtual_asset_destination(&virtual_dir, &name)?;
-            copy_virtual_asset_if_missing(&src, &dst).await?;
-        }
+        copy_virtual_assets(
+            &objects_dir,
+            &virtual_dir,
+            index
+                .objects
+                .into_iter()
+                .map(|(name, object)| (name, object.hash)),
+        )
+        .await?;
     }
 
     Ok(())
@@ -823,6 +825,31 @@ async fn missing_asset_object_jobs(
     }
 
     Ok(missing)
+}
+
+async fn copy_virtual_assets(
+    objects_dir: &Path,
+    virtual_dir: &Path,
+    assets: impl IntoIterator<Item = (String, String)>,
+) -> Result<(), DownloadError> {
+    let mut copies = futures_util::stream::iter(assets.into_iter().map(|(name, hash)| {
+        let objects_dir = objects_dir.to_path_buf();
+        let virtual_dir = virtual_dir.to_path_buf();
+        async move {
+            let src = objects_dir
+                .join(asset_object_hash_prefix(&hash)?)
+                .join(&hash);
+            let dst = virtual_asset_destination(&virtual_dir, &name)?;
+            copy_virtual_asset_if_missing(&src, &dst).await
+        }
+    }))
+    .buffer_unordered(asset_download_concurrency());
+
+    while let Some(result) = copies.next().await {
+        result?;
+    }
+
+    Ok(())
 }
 
 fn progress(phase: &str, current: i32, total: i32, file: Option<String>) -> DownloadProgress {
@@ -1889,6 +1916,93 @@ mod tests {
             fs::read(&dst).expect("read existing virtual asset"),
             b"existing"
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn virtual_asset_mapping_copies_multiple_assets() {
+        let root = temp_dir("virtual-asset-mapping-copy");
+        let objects_dir = root.join("objects");
+        let virtual_dir = root.join("virtual").join("legacy");
+        let hash_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let hash_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        fs::create_dir_all(objects_dir.join("aa")).expect("create first object parent");
+        fs::create_dir_all(objects_dir.join("bb")).expect("create second object parent");
+        fs::write(objects_dir.join("aa").join(hash_a), b"step").expect("write first object");
+        fs::write(objects_dir.join("bb").join(hash_b), b"hit").expect("write second object");
+
+        copy_virtual_assets(
+            &objects_dir,
+            &virtual_dir,
+            [
+                ("sounds/step.ogg".to_string(), hash_a.to_string()),
+                ("sounds/hit.ogg".to_string(), hash_b.to_string()),
+            ],
+        )
+        .await
+        .expect("copy virtual assets");
+
+        assert_eq!(
+            fs::read(virtual_dir.join("sounds").join("step.ogg"))
+                .expect("read first virtual asset"),
+            b"step"
+        );
+        assert_eq!(
+            fs::read(virtual_dir.join("sounds").join("hit.ogg"))
+                .expect("read second virtual asset"),
+            b"hit"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn virtual_asset_mapping_rejects_unsafe_provider_paths() {
+        let root = temp_dir("virtual-asset-mapping-unsafe");
+        let objects_dir = root.join("objects");
+        let virtual_dir = root.join("virtual").join("legacy");
+        let hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        fs::create_dir_all(objects_dir.join("aa")).expect("create object parent");
+        fs::write(objects_dir.join("aa").join(hash), b"asset").expect("write object");
+
+        let result = copy_virtual_assets(
+            &objects_dir,
+            &virtual_dir,
+            [("../escape.ogg".to_string(), hash.to_string())],
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(DownloadError::Integrity(message))
+                if message.contains("unsafe virtual asset path")
+        ));
+        assert!(!root.join("escape.ogg").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn virtual_asset_mapping_reports_destination_errors() {
+        let root = temp_dir("virtual-asset-mapping-destination-error");
+        let objects_dir = root.join("objects");
+        let virtual_dir = root.join("virtual").join("legacy");
+        let hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let dst = virtual_dir.join("sounds").join("step.ogg");
+        fs::create_dir_all(objects_dir.join("aa")).expect("create object parent");
+        fs::create_dir_all(&dst).expect("create destination directory");
+        fs::write(objects_dir.join("aa").join(hash), b"asset").expect("write object");
+
+        let result = copy_virtual_assets(
+            &objects_dir,
+            &virtual_dir,
+            [("sounds/step.ogg".to_string(), hash.to_string())],
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(dst.is_dir());
 
         let _ = fs::remove_dir_all(root);
     }
