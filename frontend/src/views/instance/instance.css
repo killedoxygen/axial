@@ -1359,10 +1359,17 @@
     gap: 14px;
   }
   .cp-od-worlds-cta {
-    grid-column: 2;
-    justify-self: start;
-    width: min(360px, 100%);
+    grid-column: 1 / -1;
+    justify-self: stretch;
+    width: 100%;
+    min-width: 0;
     flex-direction: row;
+    flex-wrap: wrap;
+  }
+  .cp-od-worlds-cta .cp-btn {
+    width: auto;
+    flex: 1 1 0;
+    min-width: 0;
   }
 }
 
