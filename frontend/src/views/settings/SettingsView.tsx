@@ -21,7 +21,7 @@ import {
 import { navigate, ROUTE_STORAGE_KEY } from '../../ui-state';
 import { api } from '../../api';
 import { toast } from '../../toast';
-import { hasNativeDesktopRuntime } from '../../native';
+import { hasNativeDesktopRuntime, openExternalURL } from '../../native';
 import { clampPlayerNameInput } from '../../player-name';
 import { errMessage, fmtMem, getMemoryRecommendation, validateUsername } from '../../utils';
 import {
@@ -1999,6 +1999,15 @@ function displayReleaseVersion(version: string): string {
   return version.startsWith('v') || version.startsWith('V') ? version : `v${version}`;
 }
 
+async function openHomepage(): Promise<void> {
+  try {
+    await openExternalURL('https://github.com/mateoltd/croopor');
+    toast('Opened homepage');
+  } catch (err: unknown) {
+    toast(`Failed to open homepage: ${errMessage(err)}`, 'error');
+  }
+}
+
 function AboutSection(): JSX.Element {
   const info = updateInfo.value;
   const checkState = updateCheckState.value;
@@ -2023,7 +2032,7 @@ function AboutSection(): JSX.Element {
   return (
     <SettingsCard title="Croopor" desc={`Version ${appVersion.value}. A focused Minecraft launcher.`} stack>
       <div style={{ marginTop: 12, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-        <Button variant="secondary" icon="globe" onClick={() => window.open('https://github.com/mateoltd/croopor', '_blank', 'noopener')}>Homepage</Button>
+        <Button variant="secondary" icon="globe" onClick={() => void openHomepage()}>Homepage</Button>
         <Button variant="secondary" icon="refresh" disabled={checking} onClick={() => void checkForUpdates({ force: true })}>
           {checking ? 'Checking...' : 'Check'}
         </Button>
