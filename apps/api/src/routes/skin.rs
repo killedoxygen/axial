@@ -475,7 +475,7 @@ async fn write_profile_skin_file_cache(path: &FsPath, bytes: &[u8]) -> Result<()
 async fn handle_saved_skins(
     State(state): State<AppState>,
 ) -> Result<Json<SavedSkinsResponse>, ApiError> {
-    let skins = state.skins().list().map_err(skin_read_error)?;
+    let skins = list_saved_skins(&state).await?;
 
     Ok(Json(SavedSkinsResponse { skins }))
 }
@@ -495,16 +495,15 @@ async fn handle_save_skin(
         None => normalized.variant_suggestion.to_string(),
     };
     let texture_key = texture_key(&normalized.png_bytes);
-    let record = state
-        .skins()
-        .save(
-            texture_key,
-            name,
-            variant,
-            SAVED_SKIN_SOURCE.to_string(),
-            &normalized.png_bytes,
-        )
-        .map_err(skin_write_error)?;
+    let record = save_saved_skin(
+        &state,
+        texture_key,
+        name,
+        variant,
+        SAVED_SKIN_SOURCE.to_string(),
+        normalized.png_bytes,
+    )
+    .await?;
 
     Ok(Json(record))
 }
@@ -572,16 +571,15 @@ async fn handle_save_skin_from_profile_with_client(
     let normalized = normalize_skin_png(&bytes)?;
     let variant = variant_override.unwrap_or_else(|| normalized.variant_suggestion.to_string());
     let texture_key = texture_key(&normalized.png_bytes);
-    let record = state
-        .skins()
-        .save(
-            texture_key,
-            name,
-            variant,
-            SAVED_SKIN_PROFILE_SOURCE.to_string(),
-            &normalized.png_bytes,
-        )
-        .map_err(skin_write_error)?;
+    let record = save_saved_skin(
+        &state,
+        texture_key,
+        name,
+        variant,
+        SAVED_SKIN_PROFILE_SOURCE.to_string(),
+        normalized.png_bytes,
+    )
+    .await?;
 
     Ok(Json(record))
 }
@@ -651,16 +649,15 @@ async fn handle_save_skin_from_username_with_clients(
     let normalized = normalize_skin_png(&bytes)?;
     let variant = variant_override.unwrap_or_else(|| normalized.variant_suggestion.to_string());
     let texture_key = texture_key(&normalized.png_bytes);
-    let record = state
-        .skins()
-        .save(
-            texture_key,
-            name,
-            variant,
-            SAVED_SKIN_USERNAME_SOURCE.to_string(),
-            &normalized.png_bytes,
-        )
-        .map_err(skin_write_error)?;
+    let record = save_saved_skin(
+        &state,
+        texture_key,
+        name,
+        variant,
+        SAVED_SKIN_USERNAME_SOURCE.to_string(),
+        normalized.png_bytes,
+    )
+    .await?;
 
     Ok(Json(record))
 }
@@ -670,10 +667,7 @@ async fn handle_delete_skin(
     Path(texture_key): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let texture_key = validate_texture_key(&texture_key)?;
-    let deleted = state
-        .skins()
-        .delete(&texture_key)
-        .map_err(skin_write_error)?;
+    let deleted = delete_saved_skin(&state, texture_key).await?;
     if deleted.is_none() {
         return Err(json_error(StatusCode::NOT_FOUND, "saved skin not found"));
     }
@@ -697,10 +691,8 @@ async fn handle_update_saved_skin(
     } else {
         None
     };
-    let updated = state
-        .skins()
-        .update_metadata(&texture_key, name, variant)
-        .map_err(skin_write_error)?
+    let updated = update_saved_skin_metadata(&state, texture_key, name, variant)
+        .await?
         .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "saved skin not found"))?;
 
     Ok(Json(updated))
@@ -711,11 +703,7 @@ async fn handle_saved_skin_file(
     Path(texture_key): Path<String>,
 ) -> Result<Response<Body>, ApiError> {
     let texture_key = validate_texture_key(&texture_key)?;
-    let Some(bytes) = state
-        .skins()
-        .read_png(&texture_key)
-        .map_err(skin_read_error)?
-    else {
+    let Some(bytes) = read_saved_skin_png(&state, texture_key).await? else {
         return Err(json_error(StatusCode::NOT_FOUND, "saved skin not found"));
     };
 
@@ -773,18 +761,12 @@ async fn handle_apply_saved_skin_with_client(
         ));
     }
 
-    let saved_skin = state
-        .skins()
-        .list()
-        .map_err(skin_read_error)?
+    let saved_skin = list_saved_skins(&state)
+        .await?
         .into_iter()
         .find(|skin| skin.texture_key == texture_key)
         .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "saved skin not found"))?;
-    let Some(png_bytes) = state
-        .skins()
-        .read_png(&texture_key)
-        .map_err(skin_read_error)?
-    else {
+    let Some(png_bytes) = read_saved_skin_png(&state, texture_key.clone()).await? else {
         return Err(json_error(StatusCode::NOT_FOUND, "saved skin not found"));
     };
 
@@ -792,10 +774,8 @@ async fn handle_apply_saved_skin_with_client(
         .upload(&account.access_token, &saved_skin.variant, png_bytes)
         .await
         .map_err(skin_upload_error)?;
-    state
-        .skins()
-        .mark_applied(&texture_key)
-        .map_err(skin_write_error)?
+    mark_saved_skin_applied(&state, texture_key.clone())
+        .await?
         .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "saved skin not found"))?;
     let profile_updated = if let Some(profile) = uploaded_profile {
         state
@@ -811,6 +791,79 @@ async fn handle_apply_saved_skin_with_client(
         texture_key,
         profile_updated,
     }))
+}
+
+async fn list_saved_skins(state: &AppState) -> Result<Vec<SavedSkinRecord>, ApiError> {
+    let skins = state.skins().clone();
+    tokio::task::spawn_blocking(move || skins.list())
+        .await
+        .map_err(|_| skin_read_error(saved_skin_store_task_error()))?
+        .map_err(skin_read_error)
+}
+
+async fn save_saved_skin(
+    state: &AppState,
+    texture_key: String,
+    name: String,
+    variant: String,
+    source: String,
+    png_bytes: Vec<u8>,
+) -> Result<SavedSkinRecord, ApiError> {
+    let skins = state.skins().clone();
+    tokio::task::spawn_blocking(move || skins.save(texture_key, name, variant, source, &png_bytes))
+        .await
+        .map_err(|_| skin_write_error(saved_skin_store_task_error()))?
+        .map_err(skin_write_error)
+}
+
+async fn delete_saved_skin(
+    state: &AppState,
+    texture_key: String,
+) -> Result<Option<SavedSkinRecord>, ApiError> {
+    let skins = state.skins().clone();
+    tokio::task::spawn_blocking(move || skins.delete(&texture_key))
+        .await
+        .map_err(|_| skin_write_error(saved_skin_store_task_error()))?
+        .map_err(skin_write_error)
+}
+
+async fn update_saved_skin_metadata(
+    state: &AppState,
+    texture_key: String,
+    name: Option<String>,
+    variant: Option<String>,
+) -> Result<Option<SavedSkinRecord>, ApiError> {
+    let skins = state.skins().clone();
+    tokio::task::spawn_blocking(move || skins.update_metadata(&texture_key, name, variant))
+        .await
+        .map_err(|_| skin_write_error(saved_skin_store_task_error()))?
+        .map_err(skin_write_error)
+}
+
+async fn read_saved_skin_png(
+    state: &AppState,
+    texture_key: String,
+) -> Result<Option<Vec<u8>>, ApiError> {
+    let skins = state.skins().clone();
+    tokio::task::spawn_blocking(move || skins.read_png(&texture_key))
+        .await
+        .map_err(|_| skin_read_error(saved_skin_store_task_error()))?
+        .map_err(skin_read_error)
+}
+
+async fn mark_saved_skin_applied(
+    state: &AppState,
+    texture_key: String,
+) -> Result<Option<String>, ApiError> {
+    let skins = state.skins().clone();
+    tokio::task::spawn_blocking(move || skins.mark_applied(&texture_key))
+        .await
+        .map_err(|_| skin_write_error(saved_skin_store_task_error()))?
+        .map_err(skin_write_error)
+}
+
+fn saved_skin_store_task_error() -> std::io::Error {
+    std::io::Error::other("saved skin store task failed")
 }
 
 #[derive(Clone)]
