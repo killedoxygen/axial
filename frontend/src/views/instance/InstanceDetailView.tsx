@@ -145,7 +145,13 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
   const installItem = installItemFor(inst, v);
   const install = installState.value;
   const installProgress = install.status === 'active' && isActiveInstallItem(installItem)
-    ? { pct: install.pct, label: install.label, displayName: install.displayName }
+    ? {
+        pct: install.pct,
+        label: install.label,
+        displayName: install.displayName,
+        remainingSeconds: install.remainingSeconds,
+        remainingSecondsUpdatedAt: install.remainingSecondsUpdatedAt,
+      }
     : null;
   const queuedInstallIndex = installQueue.value.findIndex(item => isSameInstallItem(item, installItem));
   const queuedInstall = queuedInstallIndex >= 0 ? installQueue.value[queuedInstallIndex] : undefined;

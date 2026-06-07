@@ -1,4 +1,5 @@
 import type { JSX } from 'preact';
+import { useEffect, useState } from 'preact/hooks';
 import { Icon } from '../../../ui/Icons';
 import { Button } from '../../../ui/Atoms';
 import { openContextMenu } from '../../../ui/ContextMenu';
@@ -7,7 +8,16 @@ import { clearLaunchNotice } from '../../../actions';
 import { toast } from '../../../toast';
 import type { InstallFailure, LaunchState } from '../../../store';
 import type { EnrichedInstance, LaunchNotice, LaunchNoticeTone } from '../../../types';
+import { countDownRemainingSeconds, formatRemainingTime } from '../../../progress-estimation';
 import { openInstanceFolder } from '../instance-actions';
+
+type InstallBarrierProgress = {
+  pct: number;
+  label: string;
+  displayName?: string;
+  remainingSeconds?: number;
+  remainingSecondsUpdatedAt?: number;
+};
 
 function launchNoticeIcon(tone: LaunchNoticeTone): string {
   if (tone === 'success') return 'check-circle';
@@ -149,12 +159,26 @@ export function InstallBarrierPane({
   installTarget: string;
   installLabel: string;
   installQueued: boolean;
-  installProgress: { pct: number; label: string; displayName?: string } | null;
+  installProgress: InstallBarrierProgress | null;
   installFailure: InstallFailure | null;
   installQueuePosition?: number;
   installQueueCount?: number;
   onRetryInstall: () => void;
 }): JSX.Element {
+  const [etaNow, setEtaNow] = useState(() => Date.now());
+  const hasActiveEta = Boolean(installProgress?.remainingSeconds);
+
+  useEffect(() => {
+    if (!hasActiveEta) return;
+    setEtaNow(Date.now());
+    const intervalId = window.setInterval(() => {
+      setEtaNow(Date.now());
+    }, 1000);
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [hasActiveEta, installProgress?.remainingSeconds, installProgress?.remainingSecondsUpdatedAt]);
+
   const pct = installProgress ? Math.max(0, Math.min(100, Math.round(installProgress.pct))) : 0;
   const failed = Boolean(installFailure);
   const queuedBehind = installQueuePosition != null ? installQueuePosition - 1 : undefined;
@@ -165,10 +189,14 @@ export function InstallBarrierPane({
     : 'This instance will unlock automatically after its version install starts and finishes.';
   const label = installFailure?.message || installProgress?.label || (installQueued ? 'Install waiting in queue' : 'Preparing install');
   const targetLabel = installLabel || installTarget;
+  const remainingSeconds = installProgress
+    ? countDownRemainingSeconds(installProgress.remainingSeconds, installProgress.remainingSecondsUpdatedAt, etaNow)
+    : undefined;
+  const activeEta = remainingSeconds ? `${formatRemainingTime(remainingSeconds)} left` : '';
   const detail = failed
     ? 'Retry the required install or open Downloads for more context.'
     : installProgress
-    ? `${pct}% complete`
+    ? activeEta ? `${activeEta} · ${pct}% complete` : `${pct}% complete`
     : installQueued
       ? queuedDetail
       : 'Croopor is preparing the required version files.';
