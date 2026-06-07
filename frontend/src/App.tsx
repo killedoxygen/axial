@@ -4,7 +4,6 @@ import { useEffect, useState } from 'preact/hooks';
 import { AppFrame } from './shell/AppFrame';
 import { HomeView } from './views/home/HomeView';
 import { InstancesView } from './views/instances/InstancesView';
-import { DownloadsView } from './views/downloads/DownloadsView';
 import { Onboarding } from './views/onboarding/Onboarding';
 import { DialogHost } from './ui/Dialog';
 import { SetupOverlay } from './views/setup/SetupOverlay';
@@ -31,6 +30,10 @@ const AccountsRoute = createRouteLoader(
 
 const SettingsRoute = createRouteLoader(
   async () => (await import('./views/settings/SettingsView')).SettingsView,
+);
+
+const DownloadsRoute = createRouteLoader(
+  async () => (await import('./views/downloads/DownloadsView')).DownloadsView,
 );
 
 const loadDevLabView = __CROOPOR_ENABLE_DEV_LAB__
@@ -133,7 +136,7 @@ function CurrentView(): JSX.Element {
     case 'instance': return <InstanceDetailRoute id={r.id} />;
     case 'create': return <CreateRoute />;
     case 'dev-lab': return <DevLabRoute />;
-    case 'downloads': return <DownloadsView />;
+    case 'downloads': return <DownloadsRoute />;
     case 'accounts': return <AccountsRoute />;
     case 'settings': return <SettingsRoute />;
   }
