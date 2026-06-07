@@ -20,6 +20,8 @@ const RUNTIME_MANIFEST_URL: &str = "https://launchermeta.mojang.com/v1/products/
 const MIN_RUNTIME_FILE_DOWNLOAD_CONCURRENCY: usize = 2;
 const MAX_RUNTIME_FILE_DOWNLOAD_CONCURRENCY: usize = 8;
 const RUNTIME_FILE_DOWNLOADS_PER_CORE: usize = 2;
+const RUNTIME_DOWNLOAD_CLIENT_POOL_IDLE_TIMEOUT_SECS: u64 = 120;
+const RUNTIME_DOWNLOAD_CLIENT_TCP_KEEPALIVE_SECS: u64 = 60;
 const MAX_RUNTIME_MANIFEST_BYTES: u64 = 16 << 20;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1018,6 +1020,13 @@ fn runtime_download_client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
         .user_agent("croopor/0.3")
+        .pool_max_idle_per_host(MAX_RUNTIME_FILE_DOWNLOAD_CONCURRENCY)
+        .pool_idle_timeout(std::time::Duration::from_secs(
+            RUNTIME_DOWNLOAD_CLIENT_POOL_IDLE_TIMEOUT_SECS,
+        ))
+        .tcp_keepalive(std::time::Duration::from_secs(
+            RUNTIME_DOWNLOAD_CLIENT_TCP_KEEPALIVE_SECS,
+        ))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 }

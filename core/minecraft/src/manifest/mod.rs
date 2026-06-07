@@ -10,6 +10,9 @@ use crate::paths::version_manifest_cache_path;
 const MANIFEST_URL: &str = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
 const CACHE_TTL: Duration = Duration::from_secs(600);
 const MAX_MANIFEST_BYTES: u64 = 8 << 20;
+const MANIFEST_CLIENT_MAX_IDLE_PER_HOST: usize = 4;
+const MANIFEST_CLIENT_POOL_IDLE_TIMEOUT_SECS: u64 = 60;
+const MANIFEST_CLIENT_TCP_KEEPALIVE_SECS: u64 = 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VersionManifest {
@@ -274,6 +277,9 @@ fn manifest_client() -> &'static reqwest::Client {
             .connect_timeout(Duration::from_secs(10))
             .read_timeout(Duration::from_secs(15))
             .user_agent("croopor/0.3")
+            .pool_max_idle_per_host(MANIFEST_CLIENT_MAX_IDLE_PER_HOST)
+            .pool_idle_timeout(Duration::from_secs(MANIFEST_CLIENT_POOL_IDLE_TIMEOUT_SECS))
+            .tcp_keepalive(Duration::from_secs(MANIFEST_CLIENT_TCP_KEEPALIVE_SECS))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new())
     })

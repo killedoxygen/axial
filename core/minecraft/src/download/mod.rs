@@ -24,6 +24,9 @@ const LIBRARY_DOWNLOADS_PER_CORE: usize = 2;
 const MIN_ASSET_DOWNLOAD_CONCURRENCY: usize = 8;
 const MAX_ASSET_DOWNLOAD_CONCURRENCY: usize = 32;
 const ASSET_DOWNLOADS_PER_CORE: usize = 4;
+const DOWNLOAD_CLIENT_MAX_IDLE_PER_HOST: usize = MAX_ASSET_DOWNLOAD_CONCURRENCY;
+const DOWNLOAD_CLIENT_POOL_IDLE_TIMEOUT_SECS: u64 = 120;
+const DOWNLOAD_CLIENT_TCP_KEEPALIVE_SECS: u64 = 60;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DownloadProgress {
@@ -706,6 +709,9 @@ fn build_http_client(timeout: Duration) -> reqwest::Client {
     reqwest::Client::builder()
         .user_agent("croopor/0.3")
         .timeout(timeout)
+        .pool_max_idle_per_host(DOWNLOAD_CLIENT_MAX_IDLE_PER_HOST)
+        .pool_idle_timeout(Duration::from_secs(DOWNLOAD_CLIENT_POOL_IDLE_TIMEOUT_SECS))
+        .tcp_keepalive(Duration::from_secs(DOWNLOAD_CLIENT_TCP_KEEPALIVE_SECS))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 }

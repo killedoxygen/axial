@@ -6,6 +6,9 @@ use std::time::Duration;
 
 const USER_AGENT: &str = "croopor/0.3";
 const MAX_LOADER_JSON_BYTES: usize = 8 * 1024 * 1024;
+const LOADER_HTTP_CLIENT_MAX_IDLE_PER_HOST: usize = 8;
+const LOADER_HTTP_CLIENT_POOL_IDLE_TIMEOUT_SECS: u64 = 120;
+const LOADER_HTTP_CLIENT_TCP_KEEPALIVE_SECS: u64 = 60;
 
 pub async fn fetch_json<T>(url: &str) -> Result<T, LoaderError>
 where
@@ -137,6 +140,11 @@ fn client() -> &'static reqwest::Client {
             .connect_timeout(Duration::from_secs(20))
             .read_timeout(Duration::from_secs(120))
             .user_agent(USER_AGENT)
+            .pool_max_idle_per_host(LOADER_HTTP_CLIENT_MAX_IDLE_PER_HOST)
+            .pool_idle_timeout(Duration::from_secs(
+                LOADER_HTTP_CLIENT_POOL_IDLE_TIMEOUT_SECS,
+            ))
+            .tcp_keepalive(Duration::from_secs(LOADER_HTTP_CLIENT_TCP_KEEPALIVE_SECS))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new())
     })
