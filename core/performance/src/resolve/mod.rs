@@ -1101,17 +1101,19 @@ struct MCVersion {
 }
 
 fn parse_version(value: &str) -> Result<MCVersion, ()> {
-    static RELEASE_PATTERN: OnceLock<Regex> = OnceLock::new();
-    static SNAPSHOT_PATTERN: OnceLock<Regex> = OnceLock::new();
+    static RELEASE_PATTERN: OnceLock<Result<Regex, regex::Error>> = OnceLock::new();
+    static SNAPSHOT_PATTERN: OnceLock<Result<Regex, regex::Error>> = OnceLock::new();
 
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return Err(());
     }
 
-    let snapshot = SNAPSHOT_PATTERN
-        .get_or_init(|| Regex::new(r"^\d+w\d+[a-z]$").expect("snapshot regex"))
-        .is_match(&trimmed.to_lowercase());
+    let snapshot_pattern = SNAPSHOT_PATTERN
+        .get_or_init(|| Regex::new(r"^\d+w\d+[a-z]$"))
+        .as_ref()
+        .map_err(|_| ())?;
+    let snapshot = snapshot_pattern.is_match(&trimmed.to_lowercase());
     if snapshot {
         return Ok(MCVersion {
             major: 0,
@@ -1122,10 +1124,11 @@ fn parse_version(value: &str) -> Result<MCVersion, ()> {
         });
     }
 
-    let captures = RELEASE_PATTERN
-        .get_or_init(|| Regex::new(r"^(\d+)\.(\d+)(?:\.(\d+))?$").expect("release regex"))
-        .captures(trimmed)
-        .ok_or(())?;
+    let release_pattern = RELEASE_PATTERN
+        .get_or_init(|| Regex::new(r"^(\d+)\.(\d+)(?:\.(\d+))?$"))
+        .as_ref()
+        .map_err(|_| ())?;
+    let captures = release_pattern.captures(trimmed).ok_or(())?;
 
     Ok(MCVersion {
         major: captures

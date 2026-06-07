@@ -3,7 +3,6 @@ use crate::loaders::types::{
     LoaderBuildMetadata, LoaderError, LoaderSelectionMeta, LoaderSelectionReason,
     LoaderSelectionSource, LoaderTerm, LoaderTermEvidence, LoaderTermSource,
 };
-use regex::Regex;
 
 pub const FABRIC_META_BASE: &str = "https://meta.fabricmc.net/v2/versions";
 pub const QUILT_META_BASE: &str = "https://meta.quiltmc.org/v3/versions";
@@ -23,11 +22,25 @@ pub async fn fetch_text(url: &str) -> Result<String, LoaderError> {
 }
 
 pub fn parse_maven_versions(xml: &str) -> Vec<String> {
-    let pattern = Regex::new(r"<version>([^<]+)</version>").expect("valid regex");
-    pattern
-        .captures_iter(xml)
-        .filter_map(|capture| capture.get(1).map(|value| value.as_str().to_string()))
-        .collect()
+    let open = "<version>";
+    let close = "</version>";
+    let mut versions = Vec::new();
+    let mut rest = xml;
+
+    while let Some(start) = rest.find(open) {
+        rest = &rest[start + open.len()..];
+        let Some(end) = rest.find(close) else {
+            break;
+        };
+
+        let version = &rest[..end];
+        if !version.is_empty() && !version.contains('<') {
+            versions.push(version.to_string());
+        }
+        rest = &rest[end + close.len()..];
+    }
+
+    versions
 }
 
 pub fn extract_forge_minecraft_version(entry: &str) -> String {
@@ -372,7 +385,7 @@ pub fn neoforge_to_minecraft_version(version: &str) -> Option<String> {
 mod tests {
     use super::{
         apply_forge_promotion_selection, infer_loader_build_metadata, is_prerelease_loader_version,
-        neoforge_to_minecraft_version,
+        neoforge_to_minecraft_version, parse_maven_versions,
     };
     use crate::loaders::types::{
         LoaderSelectionReason, LoaderSelectionSource, LoaderTerm, LoaderTermEvidence,
@@ -387,6 +400,16 @@ mod tests {
         assert!(!is_prerelease_loader_version("61.1.5"));
         assert!(!is_prerelease_loader_version("1.0.0+source"));
         assert!(!is_prerelease_loader_version("from-src-1.0"));
+    }
+
+    #[test]
+    fn parses_literal_maven_version_entries() {
+        let xml = "<metadata><versions><version>1.20.1-47.4.0</version><version>bad<nested></version><version>1.21.1-52.0.1</version></versions></metadata>";
+
+        assert_eq!(
+            parse_maven_versions(xml),
+            vec!["1.20.1-47.4.0".to_string(), "1.21.1-52.0.1".to_string()]
+        );
     }
 
     #[test]
