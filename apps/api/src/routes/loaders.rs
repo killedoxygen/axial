@@ -22,6 +22,8 @@ const LOADER_INSTALL_SCOPE: &str = "loader";
 const VANILLA_INSTALL_SCOPE: &str = "vanilla";
 const LOADER_INSTALL_INTERRUPTED_MESSAGE: &str =
     "Loader install stopped before completing. Try again.";
+const BASE_INSTALL_FAILED_MESSAGE: &str =
+    "Base game install failed. Retry the install from Downloads.";
 
 #[derive(Debug, Deserialize)]
 struct LoaderBuildQuery {
@@ -174,12 +176,18 @@ async fn handle_loader_install(
             };
 
             let version_id = build.version_id.clone();
-            wait_for_active_vanilla_base_install(
+            if let Err(progress) = wait_for_active_vanilla_base_install(
                 &worker_store,
                 &build.minecraft_version,
                 &progress_tx,
             )
-            .await;
+            .await
+            {
+                let _ = progress_tx.send(progress);
+                drop(progress_tx);
+                let _ = store_task.await;
+                return;
+            }
 
             let mut final_progress: Option<DownloadProgress> = None;
             let result = install_build(&library_dir, build, |progress| {
@@ -291,38 +299,46 @@ async fn wait_for_active_vanilla_base_install(
     store: &InstallStore,
     version_id: &str,
     progress_tx: &mpsc::UnboundedSender<DownloadProgress>,
-) {
+) -> Result<(), DownloadProgress> {
     let Some(install_id) = store
         .active_install_for_scope_and_version(VANILLA_INSTALL_SCOPE, version_id)
         .await
     else {
-        return;
+        return Ok(());
     };
 
     let Some((history, mut receiver, done)) = store.subscribe(&install_id).await else {
-        return;
+        return Ok(());
     };
 
     for progress in history {
         if progress.done {
-            return;
+            return if progress.error.is_some() {
+                Err(base_install_failed_progress())
+            } else {
+                Ok(())
+            };
         }
         let _ = progress_tx.send(progress);
     }
     if done {
-        return;
+        return Ok(());
     }
 
     loop {
         match receiver.recv().await {
             Ok(progress) => {
                 if progress.done {
-                    return;
+                    return if progress.error.is_some() {
+                        Err(base_install_failed_progress())
+                    } else {
+                        Ok(())
+                    };
                 }
                 let _ = progress_tx.send(progress);
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
         }
     }
 }
@@ -351,6 +367,17 @@ fn prewarm_runtime_error_progress() -> DownloadProgress {
         total: 0,
         file: None,
         error: Some(public_runtime_error_message().to_string()),
+        done: true,
+    }
+}
+
+fn base_install_failed_progress() -> DownloadProgress {
+    DownloadProgress {
+        phase: "error".to_string(),
+        current: 0,
+        total: 0,
+        file: None,
+        error: Some(BASE_INSTALL_FAILED_MESSAGE.to_string()),
         done: true,
     }
 }
@@ -646,7 +673,7 @@ mod tests {
 
         let wait_store = store.clone();
         let waiter = tokio::spawn(async move {
-            wait_for_active_vanilla_base_install(wait_store.as_ref(), "1.21.5", &progress_tx).await;
+            wait_for_active_vanilla_base_install(wait_store.as_ref(), "1.21.5", &progress_tx).await
         });
 
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -665,7 +692,8 @@ mod tests {
         timeout(Duration::from_secs(1), waiter)
             .await
             .expect("waiter should finish")
-            .expect("waiter should not panic");
+            .expect("waiter should not panic")
+            .expect("successful base install should not fail loader wait");
         assert_eq!(
             timeout(Duration::from_millis(50), progress_rx.recv())
                 .await
@@ -692,7 +720,8 @@ mod tests {
             wait_for_active_vanilla_base_install(&store, "1.21.5", &progress_tx),
         )
         .await
-        .expect("done session should not block");
+        .expect("done session should not block")
+        .expect("done session should not fail loader wait");
 
         store
             .insert_or_existing_active(
@@ -707,7 +736,8 @@ mod tests {
             wait_for_active_vanilla_base_install(&store, "1.21.5", &progress_tx),
         )
         .await
-        .expect("failed session should not block");
+        .expect("failed session should not block")
+        .expect("already failed session should not fail loader wait");
 
         store
             .insert_or_existing_active(
@@ -722,7 +752,48 @@ mod tests {
             wait_for_active_vanilla_base_install(&store, "1.21.5", &progress_tx),
         )
         .await
-        .expect("removed session should not block");
+        .expect("removed session should not block")
+        .expect("removed session should not fail loader wait");
+    }
+
+    #[tokio::test]
+    async fn wait_for_active_vanilla_base_install_fails_loader_when_base_fails_while_waiting() {
+        let store = Arc::new(InstallStore::new());
+        store
+            .insert_or_existing_active(
+                "vanilla-install".to_string(),
+                "1.21.5".to_string(),
+                String::new(),
+            )
+            .await;
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+
+        let wait_store = store.clone();
+        let waiter = tokio::spawn(async move {
+            wait_for_active_vanilla_base_install(wait_store.as_ref(), "1.21.5", &progress_tx).await
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        store.emit("vanilla-install", failed_progress()).await;
+
+        let progress = timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter should finish")
+            .expect("waiter should not panic")
+            .expect_err("base failure should fail loader wait");
+
+        assert_eq!(progress.phase, "error");
+        assert_eq!(progress.current, 0);
+        assert_eq!(progress.total, 0);
+        assert_eq!(progress.file, None);
+        assert_eq!(progress.error.as_deref(), Some(BASE_INSTALL_FAILED_MESSAGE));
+        assert!(progress.done);
+        assert_eq!(
+            timeout(Duration::from_millis(50), progress_rx.recv())
+                .await
+                .expect("progress sender should close"),
+            None
+        );
     }
 
     fn assert_no_raw_fragments(message: &str) {
