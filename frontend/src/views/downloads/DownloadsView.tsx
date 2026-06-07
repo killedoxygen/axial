@@ -119,7 +119,9 @@ export function DownloadsView(): JSX.Element {
           <div style={{ fontSize: 12, color: theme.n.textDim, marginBottom: 8, lineHeight: 1.45, overflowWrap: 'anywhere' }}>
             {state.label}
           </div>
-          <Meter value={state.pct} ariaLabel={`Install progress for ${activeTitle}`} />
+          <div class="cp-download-active-meter">
+            <Meter value={state.pct} ariaLabel={`Install progress for ${activeTitle}`} />
+          </div>
           <div style={{
             display: 'flex',
             justifyContent: 'space-between',

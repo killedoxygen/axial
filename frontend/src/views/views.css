@@ -221,3 +221,30 @@
   color: var(--text-dim);
   margin-top: 2px;
 }
+
+/* Downloads */
+.cp-download-active-meter {
+  --cp-install-color: oklch(from var(--accent) l calc(c * 0.58) calc(h + 210));
+  --cp-download-install-track: color-mix(in oklab, var(--surface-3) 90%, var(--cp-install-color));
+  --cp-download-install-fill: color-mix(in oklab, var(--cp-install-color) 64%, var(--text-dim));
+  --cp-download-install-fill-soft: color-mix(in oklab, var(--cp-install-color) 42%, var(--surface-3));
+  --cp-download-install-shine: color-mix(in oklab, var(--cp-install-color) 26%, transparent);
+}
+.cp-download-active-meter .cp-meter {
+  background: var(--cp-download-install-track);
+  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--cp-install-color) 12%, transparent);
+}
+.cp-download-active-meter .cp-meter > span {
+  background:
+    linear-gradient(105deg, transparent 0 38%, var(--cp-download-install-shine) 48%, transparent 58%),
+    linear-gradient(90deg, var(--cp-download-install-fill-soft), var(--cp-download-install-fill));
+  background-position: 140% 0, 0 0;
+  background-size: 180% 100%, auto;
+  animation: cp-install-shimmer 1800ms ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cp-download-active-meter .cp-meter > span {
+    animation: none !important;
+  }
+}
