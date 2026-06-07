@@ -738,7 +738,7 @@ function AboutSection(): JSX.Element {
       <div style={{ marginTop: 12, color: 'var(--text)', fontSize: 13, fontWeight: 700 }}>{status}</div>
       <div style={{ marginTop: 4, color: 'var(--text-mute)', fontSize: 12 }}>Last checked: {checkedAt}</div>
       {checkState === 'error' && (
-        <div style={{ marginTop: 8, color: 'var(--danger)', fontSize: 12 }}>Could not check for updates.</div>
+        <div style={{ marginTop: 8, color: 'var(--err)', fontSize: 12 }}>Could not check for updates.</div>
       )}
       {visibleUpdate && (
         <div style={{ marginTop: 12, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
