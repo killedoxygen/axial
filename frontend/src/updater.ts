@@ -2,7 +2,7 @@ import { local, saveLocalState } from './state';
 import { api } from './api';
 import { toast } from './toast';
 import { hasNativeDesktopRuntime, openExternalURL, requestNativeAppRestart } from './native';
-import { appVersion, bootstrapState, installState, launchState, updateCheckState, updateInfo } from './store';
+import { appVersion, bootstrapState, installQueue, installState, launchState, updateCheckState, updateInfo } from './store';
 import type { UpdateInfo } from './types';
 import { errMessage } from './utils';
 
@@ -71,9 +71,19 @@ export async function openUpdateNotes(): Promise<void> {
   }
 }
 
+export function restartBlockedByActivity(): boolean {
+  return installState.value.status !== 'idle'
+    || installQueue.value.length > 0
+    || launchState.value.status !== 'idle';
+}
+
 export async function restartDesktopApp(): Promise<void> {
   if (!hasNativeDesktopRuntime()) {
     toast('Restart is only available in the desktop app', 'error');
+    return;
+  }
+  if (restartBlockedByActivity()) {
+    toast('Restart is blocked while downloads or launches are active.', 'error');
     return;
   }
   try {
