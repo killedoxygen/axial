@@ -452,6 +452,14 @@ function sortSavedSkins(skins: SavedSkinRecord[], sort: SavedSkinSort): SavedSki
     .map(({ skin }) => skin);
 }
 
+function savedSkinMatchesFilter(skin: SavedSkinRecord, filter: string): boolean {
+  if (!filter) return true;
+  return skin.name.toLowerCase().includes(filter) ||
+    savedSkinSourceLabel(skin.source).toLowerCase().includes(filter) ||
+    skin.variant.toLowerCase().includes(filter) ||
+    skin.texture_key.toLowerCase().startsWith(filter);
+}
+
 function SkinProfileMeta({
   profile,
   state,
@@ -2019,6 +2027,7 @@ function SavedSkinLibrary({
   const [applyKey, setApplyKey] = useState<string | null>(null);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [skinSort, setSkinSort] = useState<SavedSkinSort>('recent');
+  const [skinFilter, setSkinFilter] = useState('');
   const [previewSide, setPreviewSide] = useState<SavedSkinPreviewSide>('front');
   const [previewLayerMode, setPreviewLayerMode] = useState<SavedSkinLayerMode>('full');
   const profileSkin = activeMinecraftSkin(minecraftProfile);
@@ -2040,6 +2049,11 @@ function SavedSkinLibrary({
     ?? skins[0]
     ?? null;
   const sortedSkins = useMemo(() => sortSavedSkins(skins, skinSort), [skins, skinSort]);
+  const normalizedSkinFilter = skinFilter.trim().toLowerCase();
+  const visibleSkins = useMemo(
+    () => sortedSkins.filter((skin) => savedSkinMatchesFilter(skin, normalizedSkinFilter)),
+    [normalizedSkinFilter, sortedSkins],
+  );
   const selectedPreviewEditing = Boolean(selectedSkin && editKey === selectedSkin.texture_key);
   const previewPending = Boolean(
     selectedSkin
@@ -2477,6 +2491,13 @@ function SavedSkinLibrary({
         right={(
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
             <Pill tone="neutral" icon="image">{state === 'ready' ? String(skins.length) : '...'}</Pill>
+            <Input
+              value={skinFilter}
+              onChange={(value) => setSkinFilter(value.slice(0, 80))}
+              placeholder="Filter skins"
+              icon="search"
+              style={{ width: 190 }}
+            />
             <div role="group" aria-label="Saved skins sort">
               <Segmented<SavedSkinSort>
                 options={[
@@ -2996,8 +3017,32 @@ function SavedSkinLibrary({
             <div style={{ padding: 14, color: theme.n.textMute, fontSize: 13, fontWeight: 500 }}>
               No saved skins yet.
             </div>
+          ) : visibleSkins.length === 0 ? (
+            <div style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: 10,
+              flexWrap: 'wrap',
+              padding: 14,
+              color: theme.n.textMute,
+              fontSize: 13,
+              fontWeight: 500,
+            }}>
+              <span>No saved skins match this filter.</span>
+              {normalizedSkinFilter && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  icon="x"
+                  onClick={() => setSkinFilter('')}
+                >
+                  Clear
+                </Button>
+              )}
+            </div>
           ) : (
-            sortedSkins.map((skin, index) => {
+            visibleSkins.map((skin, index) => {
               const applied = Boolean(skin.applied_at);
               const selected = selectedSkin?.texture_key === skin.texture_key;
               const editing = editKey === skin.texture_key && !(selected && selectedPreviewEditing);
