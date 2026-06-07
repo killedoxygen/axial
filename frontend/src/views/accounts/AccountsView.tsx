@@ -2343,6 +2343,16 @@ function SavedSkinLibrary({
     }
   };
 
+  const downloadSavedSkin = (skin: SavedSkinRecord): void => {
+    const anchor = document.createElement('a');
+    anchor.href = savedSkinFileUrl(skin);
+    anchor.download = savedSkinDownloadFilename(skin);
+    anchor.style.display = 'none';
+    document.body.append(anchor);
+    anchor.click();
+    anchor.remove();
+  };
+
   const resetPreview = (): void => {
     if (!equippedSkin) return;
     setSelectedKey(equippedSkin.texture_key);
@@ -3002,6 +3012,16 @@ function SavedSkinLibrary({
                 </Button>
               )}
               <Button
+                variant="ghost"
+                size="sm"
+                icon="download"
+                disabled={deleteKey === selectedSkin.texture_key}
+                onClick={() => downloadSavedSkin(selectedSkin)}
+                title="Download the normalized saved skin PNG"
+              >
+                Download PNG
+              </Button>
+              <Button
                 variant={selectedSkin.applied_at ? 'ghost' : 'secondary'}
                 size="sm"
                 icon={selectedSkin.applied_at ? 'check-circle' : applyKey === selectedSkin.texture_key ? 'refresh' : 'check'}
@@ -3231,6 +3251,16 @@ function formatByteSize(bytes: number): string {
 
 function savedSkinFileUrl(skin: SavedSkinRecord): string {
   return apiResourceUrl(`/skins/${skin.texture_key}/file`);
+}
+
+function savedSkinDownloadFilename(skin: SavedSkinRecord): string {
+  const name = skin.name
+    .trim()
+    .replace(/[\\/:*?"<>|\x00-\x1f]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .slice(0, 80)
+    .trim();
+  return `${name || 'saved-skin'}.png`;
 }
 
 function SkinPreviewPart({
