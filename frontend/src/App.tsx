@@ -3,7 +3,6 @@ import type { ComponentType, JSX } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
 import { AppFrame } from './shell/AppFrame';
 import { HomeView } from './views/home/HomeView';
-import { InstancesView } from './views/instances/InstancesView';
 import { DialogHost } from './ui/Dialog';
 import { SetupOverlay } from './views/setup/SetupOverlay';
 import { ContextMenuHost } from './ui/ContextMenu';
@@ -19,6 +18,10 @@ let loadedCommandPalette: CommandPaletteComponent | null = null;
 
 const InstanceDetailRoute = createRouteLoader<{ id: string }>(
   async () => (await import('./views/instance/InstanceDetailView')).InstanceDetailView,
+);
+
+const InstancesRoute = createRouteLoader(
+  async () => (await import('./views/instances/InstancesView')).InstancesView,
 );
 
 const CreateRoute = createRouteLoader(
@@ -153,7 +156,7 @@ function CurrentView(): JSX.Element {
   const r = route.value;
   switch (r.name) {
     case 'home': return <HomeView />;
-    case 'instances': return <InstancesView />;
+    case 'instances': return <InstancesRoute />;
     case 'instance': return <InstanceDetailRoute id={r.id} />;
     case 'create': return <CreateRoute />;
     case 'dev-lab': return <DevLabRoute />;
