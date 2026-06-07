@@ -14,6 +14,8 @@ import {
 import { LoaderLogo } from './loader-logos';
 import { CHANNEL_LABEL, type VersionRowModel } from './view-model';
 
+const BASE_CHANNEL_TABS: Channel[] = ['release', 'snapshot', 'legacy'];
+
 export function PickStep({
   source,
   onSourcePick,
@@ -64,15 +66,17 @@ export function PickStep({
     return <LoaderLogo loader={key} size={15} class="cp-cr-loader-mark" />;
   };
 
-  const subtitle = source === 'vanilla'
-    ? 'Pure Minecraft. Pick a version to begin.'
-    : `${LOADER_LABELS[source]}. Pick the Minecraft version it should target.`;
+  const availableChannels = new Set(channels);
+  const channelTabs: Channel[] = [
+    ...BASE_CHANNEL_TABS,
+    ...channels.filter((c) => !BASE_CHANNEL_TABS.includes(c)),
+  ];
 
   return (
     <section class="cp-cr-step cp-cr-step--pick">
       <header class="cp-cr-head">
         <h1 class="cp-cr-headline">A new world.</h1>
-        <p class="cp-cr-subline">{subtitle}</p>
+        <p class="cp-cr-subline">Pick a source, then the Minecraft version to build on.</p>
       </header>
 
       <aside class="cp-cr-rail" role="radiogroup" aria-label="Instance source" aria-orientation="horizontal">
@@ -112,23 +116,28 @@ export function PickStep({
               inputRef={searchRef}
             />
           </div>
-          {channels.length > 1 && (
-            <div class="cp-cr-channels" role="tablist" aria-label="Release channel">
-              {channels.map((value) => (
+          <div class="cp-cr-channels" role="tablist" aria-label="Release channel">
+            {channelTabs.map((value) => {
+              const available = availableChannels.has(value);
+              const active = channel === value;
+              return (
                 <button
                   key={value}
                   type="button"
                   class="cp-cr-chan"
-                  data-active={channel === value}
+                  data-active={active}
                   role="tab"
-                  aria-selected={channel === value}
-                  onClick={() => onChannelChange(value)}
+                  aria-selected={active}
+                  aria-disabled={!available}
+                  disabled={!available}
+                  title={available ? undefined : `No ${CHANNEL_LABEL[value].toLowerCase()} versions here`}
+                  onClick={() => { if (available) onChannelChange(value); }}
                 >
                   {CHANNEL_LABEL[value]}
                 </button>
-              ))}
-            </div>
-          )}
+              );
+            })}
+          </div>
         </div>
 
         <div class="cp-cr-vbody" ref={versionListRef}>
