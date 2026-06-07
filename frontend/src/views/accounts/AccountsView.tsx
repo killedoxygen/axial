@@ -678,32 +678,53 @@ function isPngFile(file: File): boolean {
   return file.name.toLowerCase().endsWith('.png');
 }
 
+function loadSkinImage(url: string): Promise<HTMLImageElement> {
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    const next = new Image();
+    next.onload = () => resolve(next);
+    next.onerror = () => reject(new Error('Could not inspect skin image.'));
+    next.src = url;
+  });
+}
+
+function inferSkinVariantFromImage(image: HTMLImageElement): SkinVariant {
+  if (image.width < 64 || image.height < 64) return 'classic';
+
+  const canvas = document.createElement('canvas');
+  canvas.width = image.width;
+  canvas.height = image.height;
+  const context = canvas.getContext('2d', { willReadFrequently: true });
+  if (!context) throw new Error('Could not inspect skin image.');
+
+  context.drawImage(image, 0, 0);
+  const armAlpha = context.getImageData(54, 20, 2, 12).data;
+  for (let index = 3; index < armAlpha.length; index += 4) {
+    if (armAlpha[index] !== 0) return 'classic';
+  }
+  return 'slim';
+}
+
 async function detectSkinVariantFromPng(file: File): Promise<SkinVariant> {
   const url = URL.createObjectURL(file);
   try {
-    const image = await new Promise<HTMLImageElement>((resolve, reject) => {
-      const next = new Image();
-      next.onload = () => resolve(next);
-      next.onerror = () => reject(new Error('Could not inspect skin image.'));
-      next.src = url;
-    });
-
-    if (image.width < 64 || image.height < 64) return 'classic';
-
-    const canvas = document.createElement('canvas');
-    canvas.width = image.width;
-    canvas.height = image.height;
-    const context = canvas.getContext('2d', { willReadFrequently: true });
-    if (!context) return 'classic';
-
-    context.drawImage(image, 0, 0);
-    const armAlpha = context.getImageData(54, 20, 2, 12).data;
-    for (let index = 3; index < armAlpha.length; index += 4) {
-      if (armAlpha[index] !== 0) return 'classic';
-    }
-    return 'slim';
+    return inferSkinVariantFromImage(await loadSkinImage(url));
   } catch {
     return 'classic';
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+async function detectSkinVariantFromSavedSkin(skin: SavedSkinRecord): Promise<SkinVariant> {
+  const response = await fetch(savedSkinFileUrl(skin));
+  if (!response.ok) {
+    throw new Error(`Could not load saved skin PNG (${response.status}).`);
+  }
+
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  try {
+    return inferSkinVariantFromImage(await loadSkinImage(url));
   } finally {
     URL.revokeObjectURL(url);
   }
@@ -2047,6 +2068,7 @@ function SavedSkinLibrary({
   const uploadDragDepthRef = useRef(0);
   const stagedUploadUrlRef = useRef<string | null>(null);
   const stagedUploadTokenRef = useRef(0);
+  const editDetectTokenRef = useRef(0);
   const { skins, state, error, refresh } = useSavedSkins();
   const [skinName, setSkinName] = useState('');
   const [lookupUsername, setLookupUsername] = useState('');
@@ -2068,6 +2090,8 @@ function SavedSkinLibrary({
   const [editName, setEditName] = useState('');
   const [editVariant, setEditVariant] = useState<SkinVariant>('classic');
   const [editBusyKey, setEditBusyKey] = useState<string | null>(null);
+  const [editDetectBusyKey, setEditDetectBusyKey] = useState<string | null>(null);
+  const [editDetectError, setEditDetectError] = useState<string | null>(null);
   const [deleteKey, setDeleteKey] = useState<string | null>(null);
   const [applyKey, setApplyKey] = useState<string | null>(null);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
@@ -2324,16 +2348,42 @@ function SavedSkinLibrary({
   };
 
   const startEdit = (skin: SavedSkinRecord): void => {
+    editDetectTokenRef.current += 1;
     setEditKey(skin.texture_key);
     setEditName(skin.name);
     setEditVariant(skin.variant === 'slim' ? 'slim' : 'classic');
+    setEditDetectBusyKey(null);
+    setEditDetectError(null);
     setMessage(null);
   };
 
   const cancelEdit = (): void => {
+    editDetectTokenRef.current += 1;
     setEditKey(null);
     setEditName('');
     setEditVariant('classic');
+    setEditDetectBusyKey(null);
+    setEditDetectError(null);
+  };
+
+  const detectSavedSkinModel = async (skin: SavedSkinRecord): Promise<void> => {
+    const token = editDetectTokenRef.current + 1;
+    editDetectTokenRef.current = token;
+    setEditDetectBusyKey(skin.texture_key);
+    setEditDetectError(null);
+    setMessage(null);
+    try {
+      const detectedVariant = await detectSkinVariantFromSavedSkin(skin);
+      if (token !== editDetectTokenRef.current) return;
+      setEditVariant(detectedVariant);
+    } catch (err) {
+      if (token !== editDetectTokenRef.current) return;
+      setEditDetectError(
+        boundedMessage(err instanceof Error ? err.message : undefined, 'Could not detect skin model.'),
+      );
+    } finally {
+      if (token === editDetectTokenRef.current) setEditDetectBusyKey(null);
+    }
   };
 
   const saveSkinMetadata = async (textureKey: string): Promise<void> => {
@@ -2530,13 +2580,30 @@ function SavedSkinLibrary({
           { value: 'slim', label: 'Slim' },
         ]}
         value={editVariant}
-        onChange={setEditVariant}
+        onChange={(value) => {
+          setEditVariant(value);
+          setEditDetectError(null);
+        }}
       />
+      <Button
+        variant="ghost"
+        size="sm"
+        icon={editDetectBusyKey === skin.texture_key ? 'refresh' : 'search'}
+        disabled={editBusyKey === skin.texture_key || editDetectBusyKey === skin.texture_key}
+        onClick={() => void detectSavedSkinModel(skin)}
+        title="Detect model from the saved PNG"
+      >
+        {editDetectBusyKey === skin.texture_key ? 'Detecting' : 'Detect'}
+      </Button>
       <Button
         variant="secondary"
         size="sm"
         icon={editBusyKey === skin.texture_key ? 'refresh' : 'check'}
-        disabled={editBusyKey === skin.texture_key || trimmedEditName.length === 0}
+        disabled={
+          editBusyKey === skin.texture_key ||
+          editDetectBusyKey === skin.texture_key ||
+          trimmedEditName.length === 0
+        }
         onClick={() => void saveSkinMetadata(skin.texture_key)}
       >
         Save
@@ -2550,6 +2617,17 @@ function SavedSkinLibrary({
       >
         Cancel
       </Button>
+      {editDetectError && editKey === skin.texture_key && (
+        <div style={{
+          gridColumn: '1 / -1',
+          color: 'var(--err)',
+          fontSize: 12,
+          fontWeight: 500,
+          lineHeight: 1.4,
+        }}>
+          {editDetectError}
+        </div>
+      )}
     </div>
   );
 
@@ -3010,7 +3088,7 @@ function SavedSkinLibrary({
               {selectedPreviewEditing ? (
                 skinMetadataEditor(selectedSkin, {
                   display: 'grid',
-                  gridTemplateColumns: 'minmax(180px, 360px) auto auto auto',
+                  gridTemplateColumns: 'minmax(180px, 360px) auto auto auto auto',
                   gap: 8,
                   alignItems: 'center',
                   minWidth: 0,
@@ -3184,7 +3262,7 @@ function SavedSkinLibrary({
                   {editing ? (
                     skinMetadataEditor(skin, {
                       display: 'grid',
-                      gridTemplateColumns: 'minmax(180px, 1fr) auto auto auto',
+                      gridTemplateColumns: 'minmax(180px, 1fr) auto auto auto auto',
                       gap: 8,
                       alignItems: 'center',
                       minWidth: 0,
