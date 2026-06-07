@@ -13,10 +13,10 @@ use croopor_minecraft::scan_versions;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    io::{ErrorKind, Read, Seek, SeekFrom},
+    io::{ErrorKind, SeekFrom},
     path::{Path as FsPath, PathBuf},
 };
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 const LOG_TAIL_LIMIT: u64 = 128 * 1024;
 const SCREENSHOT_FILE_MAX_BYTES: u64 = 32 * 1024 * 1024;
@@ -660,22 +660,44 @@ async fn handle_instance_log_tail(
     }
 
     let path = game_dir.join("logs").join(&name);
-    if !path.is_file() {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "log not found" })),
-        ));
-    }
-
-    let metadata = fs::metadata(&path).map_err(instance_log_read_error_response)?;
+    let metadata = match tokio::fs::metadata(&path).await {
+        Ok(metadata) if metadata.is_file() => metadata,
+        Ok(_) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "log not found" })),
+            ));
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "log not found" })),
+            ));
+        }
+        Err(error) => return Err(instance_log_read_error_response(error)),
+    };
     let size = metadata.len();
     let start = size.saturating_sub(LOG_TAIL_LIMIT);
-    let mut file = fs::File::open(&path).map_err(instance_log_read_error_response)?;
+    let tail_len = (size - start) as usize;
+    let mut file = tokio::fs::File::open(&path)
+        .await
+        .map_err(instance_log_read_error_response)?;
     file.seek(SeekFrom::Start(start))
+        .await
         .map_err(instance_log_read_error_response)?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .map_err(instance_log_read_error_response)?;
+    let mut bytes = vec![0_u8; tail_len];
+    let mut bytes_read = 0;
+    while bytes_read < bytes.len() {
+        let read = file
+            .read(&mut bytes[bytes_read..])
+            .await
+            .map_err(instance_log_read_error_response)?;
+        if read == 0 {
+            break;
+        }
+        bytes_read += read;
+    }
+    bytes.truncate(bytes_read);
 
     Ok(Json(InstanceLogTailResponse {
         name,
@@ -1473,6 +1495,71 @@ mod tests {
             vec!["latest.log".to_string(), "debug.log".to_string()]
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn instance_log_tail_rejects_unsafe_log_name() {
+        let fixture = TestFixture::new("log-tail-invalid-name");
+        let instance = fixture
+            .state
+            .instances()
+            .add(
+                "Tail invalid log".to_string(),
+                "1.21.1".to_string(),
+                String::new(),
+                String::new(),
+                None,
+            )
+            .expect("add instance");
+
+        let (status, Json(body)) = handle_instance_log_tail(
+            State(fixture.state.clone()),
+            Path((instance.id, "../latest.log".to_string())),
+        )
+        .await
+        .expect_err("unsafe log name should fail");
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_bounded_error_body(&body, "invalid log filename");
+    }
+
+    #[tokio::test]
+    async fn instance_log_tail_returns_bounded_truncated_tail() {
+        let fixture = TestFixture::new("log-tail-truncated");
+        let instance = fixture
+            .state
+            .instances()
+            .add(
+                "Tail truncated log".to_string(),
+                "1.21.1".to_string(),
+                String::new(),
+                String::new(),
+                None,
+            )
+            .expect("add instance");
+        let logs_dir = fixture
+            .state
+            .instances()
+            .game_dir(&instance.id)
+            .join("logs");
+        fs::create_dir_all(&logs_dir).expect("create logs dir");
+        let discarded = b"discarded";
+        let mut bytes = discarded.to_vec();
+        bytes.resize(discarded.len() + LOG_TAIL_LIMIT as usize, b't');
+        fs::write(logs_dir.join("latest.log"), &bytes).expect("write log");
+
+        let Json(response) = handle_instance_log_tail(
+            State(fixture.state.clone()),
+            Path((instance.id, "latest.log".to_string())),
+        )
+        .await
+        .expect("tail log");
+
+        assert_eq!(response.name, "latest.log");
+        assert_eq!(response.size, LOG_TAIL_LIMIT + discarded.len() as u64);
+        assert!(response.truncated);
+        assert_eq!(response.text.len(), LOG_TAIL_LIMIT as usize);
+        assert!(response.text.bytes().all(|byte| byte == b't'));
     }
 
     #[test]
