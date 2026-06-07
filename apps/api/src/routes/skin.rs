@@ -16,7 +16,13 @@ use croopor_config::validate_username;
 use croopor_minecraft::offline_uuid;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{fmt::Write, io::Cursor, sync::OnceLock, time::Duration};
+use std::{
+    fmt::Write,
+    io::Cursor,
+    path::{Path as FsPath, PathBuf},
+    sync::OnceLock,
+    time::Duration,
+};
 
 const DEFAULT_HEAD_SIZE: u32 = 64;
 const MIN_HEAD_SIZE: u32 = 16;
@@ -25,6 +31,7 @@ const HEAD_CACHE_CONTROL: &str = "private, max-age=86400";
 const PROFILE_SKIN_FILE_CACHE_CONTROL: &str = "private, max-age=300";
 const SAVED_SKIN_FILE_CACHE_CONTROL: &str = "private, max-age=31536000, immutable";
 const MINECRAFT_TEXTURE_URL_PREFIX: &str = "https://textures.minecraft.net/texture/";
+const PROFILE_SKIN_FILE_CACHE_DIR: &str = "profile-cache";
 const SKIN_UPLOAD_MAX_BYTES: usize = 256 * 1024;
 const SAVE_SKIN_FROM_PROFILE_REQUEST_MAX_BYTES: usize = 4 * 1024;
 const SAVE_SKIN_FROM_USERNAME_REQUEST_MAX_BYTES: usize = 4 * 1024;
@@ -390,23 +397,79 @@ async fn handle_skin_profile_file_with_client(
         "Minecraft account is not ready for profile skin preview",
     )
     .await?;
+    let cache_path = profile_skin_file_cache_path(
+        &state.config().paths().config_dir,
+        &profile_skin.texture_url,
+    );
+    if let Some(bytes) = read_profile_skin_file_cache(&cache_path).await {
+        return profile_skin_file_response(bytes);
+    }
+
     let bytes = client
         .download(&profile_skin.texture_url)
         .await
         .map_err(skin_texture_download_error)?;
     let normalized = normalize_skin_png(&bytes)?;
+    let png_bytes = normalized.png_bytes;
+    let _ = write_profile_skin_file_cache(&cache_path, &png_bytes).await;
 
+    profile_skin_file_response(png_bytes)
+}
+
+fn profile_skin_file_response(png_bytes: Vec<u8>) -> Result<Response<Body>, ApiError> {
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "image/png")
         .header(header::CACHE_CONTROL, PROFILE_SKIN_FILE_CACHE_CONTROL)
-        .body(Body::from(normalized.png_bytes))
+        .body(Body::from(png_bytes))
         .map_err(|_| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": "failed to build profile skin response" })),
             )
         })
+}
+
+fn profile_skin_file_cache_path(config_dir: &FsPath, texture_url: &str) -> PathBuf {
+    config_dir
+        .join("skins")
+        .join(PROFILE_SKIN_FILE_CACHE_DIR)
+        .join(format!("{}.png", profile_skin_file_cache_key(texture_url)))
+}
+
+fn profile_skin_file_cache_key(texture_url: &str) -> String {
+    texture_key(texture_url.as_bytes())
+}
+
+async fn read_profile_skin_file_cache(path: &FsPath) -> Option<Vec<u8>> {
+    let metadata = tokio::fs::metadata(path).await.ok()?;
+    if !metadata.is_file() || metadata.len() > SKIN_UPLOAD_MAX_BYTES as u64 {
+        return None;
+    }
+
+    let bytes = tokio::fs::read(path).await.ok()?;
+    if bytes.len() > SKIN_UPLOAD_MAX_BYTES || !is_valid_normalized_skin_cache_png(&bytes) {
+        return None;
+    }
+
+    Some(bytes)
+}
+
+fn is_valid_normalized_skin_cache_png(bytes: &[u8]) -> bool {
+    if !bytes.starts_with(PNG_SIGNATURE) {
+        return false;
+    }
+
+    decode_skin_png(bytes)
+        .is_ok_and(|decoded| decoded.width == SKIN_WIDTH && decoded.height == SKIN_HEIGHT)
+}
+
+async fn write_profile_skin_file_cache(path: &FsPath, bytes: &[u8]) -> Result<(), std::io::Error> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    tokio::fs::write(path, bytes).await
 }
 
 async fn handle_saved_skins(
@@ -2040,6 +2103,87 @@ mod tests {
             Some(PROFILE_SKIN_FILE_CACHE_CONTROL)
         );
         assert_eq!(response_bytes(file).await, normalized.png_bytes);
+    }
+
+    #[tokio::test]
+    async fn skin_profile_file_cache_hit_avoids_second_texture_request() {
+        let fixture = TestFixture::new("profile-file-cache-hit", "ConfigUser");
+        let png = test_skin_png(SKIN_WIDTH, LEGACY_SKIN_HEIGHT);
+        let normalized = normalize_skin_png(&png).expect("normalized skin");
+        let (texture_prefix, mut requests) =
+            skin_profile_texture_test_server(SkinProfileTextureServerMode::Png(png)).await;
+        let texture_url = format!("{texture_prefix}activeTexture123");
+        fixture
+            .add_minecraft_account(test_profile(
+                "MinecraftName",
+                vec![minecraft_skin("active", "ACTIVE", &texture_url, "slim")],
+            ))
+            .await;
+
+        let first = fixture
+            .profile_file(texture_prefix.clone())
+            .await
+            .expect("first profile skin file");
+        let request = requests.recv().await.expect("texture request");
+        let second = fixture
+            .profile_file(texture_prefix)
+            .await
+            .expect("second profile skin file");
+        let cache_path =
+            profile_skin_file_cache_path(&fixture.state.config().paths().config_dir, &texture_url);
+
+        assert_eq!(request.path, "/texture/activeTexture123");
+        assert!(matches!(
+            requests.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(response_bytes(first).await, normalized.png_bytes);
+        assert_eq!(response_bytes(second).await, normalized.png_bytes);
+        assert_eq!(
+            tokio::fs::read(cache_path)
+                .await
+                .expect("read profile cache"),
+            normalized.png_bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn skin_profile_file_corrupt_cache_redownloads_and_refreshes_cache() {
+        let fixture = TestFixture::new("profile-file-corrupt-cache", "ConfigUser");
+        let png = test_skin_png(SKIN_WIDTH, LEGACY_SKIN_HEIGHT);
+        let normalized = normalize_skin_png(&png).expect("normalized skin");
+        let (texture_prefix, mut requests) =
+            skin_profile_texture_test_server(SkinProfileTextureServerMode::Png(png)).await;
+        let texture_url = format!("{texture_prefix}activeTexture123");
+        let cache_path =
+            profile_skin_file_cache_path(&fixture.state.config().paths().config_dir, &texture_url);
+        tokio::fs::create_dir_all(cache_path.parent().expect("profile cache parent"))
+            .await
+            .expect("create profile cache dir");
+        tokio::fs::write(&cache_path, b"\x89PNG\r\n\x1a\n/home/zero/corrupt-cache")
+            .await
+            .expect("write corrupt profile cache");
+        fixture
+            .add_minecraft_account(test_profile(
+                "MinecraftName",
+                vec![minecraft_skin("active", "ACTIVE", &texture_url, "slim")],
+            ))
+            .await;
+
+        let file = fixture
+            .profile_file(texture_prefix)
+            .await
+            .expect("profile skin file");
+        let request = requests.recv().await.expect("texture request");
+
+        assert_eq!(request.path, "/texture/activeTexture123");
+        assert_eq!(response_bytes(file).await, normalized.png_bytes);
+        assert_eq!(
+            tokio::fs::read(cache_path)
+                .await
+                .expect("read refreshed cache"),
+            normalized.png_bytes
+        );
     }
 
     #[tokio::test]
