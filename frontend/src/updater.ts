@@ -9,8 +9,15 @@ import { errMessage } from './utils';
 const AUTO_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const AUTO_CHECK_DELAY_MS = 1600;
 const AUTO_CHECK_RETRY_MS = 15000;
+const AUTO_CHECK_FAILURE_RETRY_DELAYS_MS = [
+  60 * 1000,
+  5 * 60 * 1000,
+  15 * 60 * 1000,
+  60 * 60 * 1000,
+] as const;
 
 let autoCheckTimer: number | null = null;
+let autoCheckFailureCount = 0;
 let pendingCheck: Promise<UpdateInfo | null> | null = null;
 let pendingCheckSeq = 0;
 let pendingCheckToken: symbol | null = null;
@@ -28,6 +35,18 @@ function shouldAutoCheck(): boolean {
 function stampUpdateCheck(): void {
   local.lastUpdateCheckAt = new Date().toISOString();
   saveLocalState();
+}
+
+function resetAutoCheckFailureBackoff(): void {
+  autoCheckFailureCount = 0;
+}
+
+function nextFailedAutoCheckDelay(): number {
+  const delay = AUTO_CHECK_FAILURE_RETRY_DELAYS_MS[
+    Math.min(autoCheckFailureCount, AUTO_CHECK_FAILURE_RETRY_DELAYS_MS.length - 1)
+  ];
+  autoCheckFailureCount += 1;
+  return delay;
 }
 
 export function hasVisibleUpdate(): boolean {
@@ -114,6 +133,7 @@ export async function checkForUpdates(options: { force?: boolean; silent?: boole
         }
         updateCheckState.value = 'ready';
         stampUpdateCheck();
+        resetAutoCheckFailureBackoff();
         if (!silent) {
           if (res.available) toast(`Update ${displayVersion(res.latest_version)} available`);
           else toast(`You already have ${displayVersion(appVersion.value)}`);
@@ -141,6 +161,7 @@ export async function checkForUpdates(options: { force?: boolean; silent?: boole
 export function scheduleAutoUpdateCheck(): void {
   if (!hasNativeDesktopRuntime()) return;
   if (!shouldAutoCheck()) {
+    resetAutoCheckFailureBackoff();
     queueAutoUpdateCheck(AUTO_CHECK_INTERVAL_MS);
     return;
   }
@@ -154,6 +175,7 @@ export function scheduleAutoUpdateCheck(): void {
 async function runAutoUpdateCheck(): Promise<void> {
   if (!hasNativeDesktopRuntime()) return;
   if (!shouldAutoCheck()) {
+    resetAutoCheckFailureBackoff();
     queueAutoUpdateCheck(AUTO_CHECK_INTERVAL_MS);
     return;
   }
@@ -163,7 +185,7 @@ async function runAutoUpdateCheck(): Promise<void> {
   }
   const info = await checkForUpdates({ silent: true });
   if (!info) {
-    queueAutoUpdateCheck(AUTO_CHECK_RETRY_MS);
+    queueAutoUpdateCheck(nextFailedAutoCheckDelay());
     return;
   }
   if (shouldAutoCheck()) queueAutoUpdateCheck(AUTO_CHECK_RETRY_MS);
