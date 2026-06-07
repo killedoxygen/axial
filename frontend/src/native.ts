@@ -104,13 +104,24 @@ export async function browseDirectory(defaultPath = ''): Promise<string | null> 
 }
 
 export async function openExternalURL(url: string): Promise<void> {
+  let externalUrl: URL;
+  try {
+    externalUrl = new URL(url);
+  } catch {
+    throw new Error('External URL must be an absolute HTTPS URL');
+  }
+
+  if (externalUrl.protocol !== 'https:') {
+    throw new Error('External URL must be an absolute HTTPS URL');
+  }
+
   const tauri = getTauriBinding();
   if (tauri?.opener) {
-    await tauri.opener.openUrl(url);
+    await tauri.opener.openUrl(externalUrl.href);
     return;
   }
 
-  window.open(url, '_blank', 'noopener,noreferrer');
+  window.open(externalUrl.href, '_blank', 'noopener,noreferrer');
 }
 
 export async function showNativeNotice(title: string, message: string): Promise<boolean> {
