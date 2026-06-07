@@ -2026,6 +2026,7 @@ function SavedSkinLibrary({
   const [deleteKey, setDeleteKey] = useState<string | null>(null);
   const [applyKey, setApplyKey] = useState<string | null>(null);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
+  const [sourceDetailsOpen, setSourceDetailsOpen] = useState(false);
   const [skinSort, setSkinSort] = useState<SavedSkinSort>('recent');
   const [skinFilter, setSkinFilter] = useState('');
   const [previewSide, setPreviewSide] = useState<SavedSkinPreviewSide>('front');
@@ -2083,6 +2084,13 @@ function SavedSkinLibrary({
         ? 'Invalid skin'
         : 'Validating'
     : '';
+  const sourceControlsNeedAttention = (state === 'ready' && skins.length === 0)
+    || Boolean(stagedUpload)
+    || busy
+    || profileBusy
+    || lookupBusy
+    || uploadDragActive
+    || message?.tone === 'err';
 
   const clearStagedUpload = (): void => {
     stagedUploadTokenRef.current += 1;
@@ -2107,6 +2115,12 @@ function SavedSkinLibrary({
     const next = skins.find((skin) => Boolean(skin.applied_at)) ?? skins[0];
     setSelectedKey(next.texture_key);
   }, [skins, selectedKey, state]);
+
+  useEffect(() => {
+    if (sourceControlsNeedAttention && !sourceDetailsOpen) {
+      setSourceDetailsOpen(true);
+    }
+  }, [sourceControlsNeedAttention, sourceDetailsOpen]);
 
   useEffect(() => {
     return () => {
@@ -2514,233 +2528,366 @@ function SavedSkinLibrary({
         )}
       />
       <div style={{ display: 'grid', gap: 16 }}>
-        <div
+        <details
+          open={sourceDetailsOpen}
+          onToggle={(event) => setSourceDetailsOpen(event.currentTarget.open)}
           style={{
-            display: 'grid',
-            gap: 10,
-            padding: 12,
-            border: uploadActive ? '1px dashed var(--accent-line)' : '1px dashed var(--line)',
-            borderRadius: theme.r.md,
-            background: uploadActive ? 'var(--accent-softer)' : theme.n.surface2,
-            boxShadow: uploadActive ? '0 0 0 3px var(--accent-ring)' : undefined,
+            borderBottom: '1px solid var(--line)',
+            paddingBottom: 12,
           }}
-          onDragEnter={handleUploadDragEnter}
-          onDragOver={handleUploadDragOver}
-          onDragLeave={handleUploadDragLeave}
-          onDrop={handleUploadDrop}
-          onMouseEnter={() => setUploadHover(true)}
-          onMouseLeave={() => setUploadHover(false)}
-          onFocusCapture={() => setUploadFocused(true)}
-          onBlurCapture={() => setUploadFocused(false)}
         >
-          <div style={{
-            display: 'flex',
-            flexWrap: 'wrap',
-            gap: 10,
-            alignItems: 'center',
-            minWidth: 0,
+          <summary style={{
+            cursor: 'pointer',
+            color: theme.n.text,
+            fontSize: 13,
+            fontWeight: 700,
+            lineHeight: 1.4,
           }}>
-            <Input
-              value={skinName}
-              onChange={(value) => {
-                setSkinName(value.slice(0, 64));
-                setMessage(null);
+            Add a skin
+          </summary>
+          <div style={{ display: 'grid', gap: 12, marginTop: 12 }}>
+            <div
+              style={{
+                display: 'grid',
+                gap: 10,
+                padding: 12,
+                border: uploadActive ? '1px dashed var(--accent-line)' : '1px dashed var(--line)',
+                borderRadius: theme.r.md,
+                background: uploadActive ? 'var(--accent-softer)' : theme.n.surface2,
+                boxShadow: uploadActive ? '0 0 0 3px var(--accent-ring)' : undefined,
               }}
-              placeholder="Skin name, optional"
-              icon="tag"
-              style={{ flex: '1 1 220px', minWidth: 0 }}
-            />
-            <div style={{ flex: '0 1 auto', minWidth: 0 }}>
-              <Segmented<UploadSkinVariant>
-                options={[
-                  { value: 'auto', label: 'Auto' },
-                  { value: 'classic', label: 'Classic' },
-                  { value: 'slim', label: 'Slim' },
-                ]}
-                value={uploadVariant}
-                onChange={(value) => {
-                  setUploadVariant(value);
-                  setMessage(null);
+              onDragEnter={handleUploadDragEnter}
+              onDragOver={handleUploadDragOver}
+              onDragLeave={handleUploadDragLeave}
+              onDrop={handleUploadDrop}
+              onMouseEnter={() => setUploadHover(true)}
+              onMouseLeave={() => setUploadHover(false)}
+              onFocusCapture={() => setUploadFocused(true)}
+              onBlurCapture={() => setUploadFocused(false)}
+            >
+              <div style={{
+                display: 'flex',
+                flexWrap: 'wrap',
+                gap: 10,
+                alignItems: 'center',
+                minWidth: 0,
+              }}>
+                <Input
+                  value={skinName}
+                  onChange={(value) => {
+                    setSkinName(value.slice(0, 64));
+                    setMessage(null);
+                  }}
+                  placeholder="Skin name, optional"
+                  icon="tag"
+                  style={{ flex: '1 1 220px', minWidth: 0 }}
+                />
+                <div style={{ flex: '0 1 auto', minWidth: 0 }}>
+                  <Segmented<UploadSkinVariant>
+                    options={[
+                      { value: 'auto', label: 'Auto' },
+                      { value: 'classic', label: 'Classic' },
+                      { value: 'slim', label: 'Slim' },
+                    ]}
+                    value={uploadVariant}
+                    onChange={(value) => {
+                      setUploadVariant(value);
+                      setMessage(null);
+                    }}
+                  />
+                </div>
+                <Button
+                  variant="secondary"
+                  icon="plus"
+                  disabled={!canUpload}
+                  onClick={() => openUploadPicker(false)}
+                >
+                  Upload PNG
+                </Button>
+                <Button
+                  variant="ghost"
+                  icon="check"
+                  disabled={!canUpload || !onlineReady}
+                  onClick={() => openUploadPicker(true)}
+                  title={onlineReady ? 'Save locally, then apply to the active Minecraft account' : 'Online Minecraft account required'}
+                >
+                  Upload & apply
+                </Button>
+              </div>
+              <div style={{
+                color: uploadDragActive ? 'var(--accent)' : theme.n.textMute,
+                fontSize: 12,
+                fontWeight: 500,
+                lineHeight: 1.4,
+              }}>
+                {uploadDragActive ? 'Drop one PNG skin file to preview.' : 'Drag a PNG skin file here, or use Upload PNG.'}
+              </div>
+              {stagedUpload && stagedVariant && (
+                <div style={{
+                  display: 'grid',
+                  gridTemplateColumns: 'auto minmax(0, 1fr)',
+                  gap: 14,
+                  alignItems: 'center',
+                  minWidth: 0,
+                  paddingTop: 12,
+                  marginTop: 2,
+                  borderTop: '1px solid var(--line)',
+                }}>
+                  <div style={{ display: 'grid', gap: 8, justifyItems: 'center' }}>
+                    <SkinBodyPreview
+                      src={stagedUpload.objectUrl}
+                      name={stagedName}
+                      variant={stagedVariant}
+                      side={stagedPreviewSide}
+                      showOuterLayers={stagedLayerMode === 'full'}
+                    />
+                    <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'center' }}>
+                      <div role="group" aria-label={`${stagedName} staged body preview side`}>
+                        <Segmented<SavedSkinPreviewSide>
+                          options={[
+                            { value: 'front', label: 'Front' },
+                            { value: 'back', label: 'Back' },
+                          ]}
+                          value={stagedPreviewSide}
+                          onChange={setStagedPreviewSide}
+                        />
+                      </div>
+                      <div role="group" aria-label={`${stagedName} staged body preview layers`}>
+                        <Segmented<SavedSkinLayerMode>
+                          options={[
+                            { value: 'full', label: 'Full' },
+                            { value: 'base', label: 'Base' },
+                          ]}
+                          value={stagedLayerMode}
+                          onChange={setStagedLayerMode}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                  <div style={{ minWidth: 0, display: 'grid', gap: 7 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 7, flexWrap: 'wrap' }}>
+                      <Pill tone="info" icon="image">Staged PNG</Pill>
+                      <Pill
+                        tone={stagedUpload.normalizeStatus === 'ready' ? 'ok' : stagedUpload.normalizeStatus === 'error' ? 'err' : 'neutral'}
+                        icon={stagedUpload.normalizeStatus === 'ready' ? 'check-circle' : stagedUpload.normalizeStatus === 'error' ? 'alert' : 'refresh'}
+                      >
+                        {stagedValidationLabel}
+                      </Pill>
+                      <Pill tone="neutral">
+                        {stagedVariantLabel}
+                      </Pill>
+                      {stagedUpload.applyAfterSave && (
+                        <Pill tone={onlineReady ? 'ok' : 'warn'} icon={onlineReady ? 'check-circle' : 'alert'}>
+                          Apply requested
+                        </Pill>
+                      )}
+                    </div>
+                    <div style={{
+                      color: theme.n.text,
+                      fontSize: 14,
+                      fontWeight: 700,
+                      lineHeight: 1.25,
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                    }}>
+                      {stagedName}
+                    </div>
+                    <div style={{
+                      color: theme.n.textMute,
+                      fontSize: 12,
+                      fontFamily: theme.font.mono,
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                    }}>
+                      {stagedUpload.normalizeStatus === 'ready' && stagedUpload.textureKey
+                        ? `${stagedUpload.textureKey.slice(0, 16)} / ${stagedUpload.originalWidth}x${stagedUpload.originalHeight} -> 64x64 / ${formatByteSize(stagedUpload.normalizedByteSize ?? stagedUpload.file.size)}`
+                        : `${stagedUpload.file.name} / ${formatByteSize(stagedUpload.file.size)}`}
+                    </div>
+                    <div style={{ color: theme.n.textDim, fontSize: 12, lineHeight: 1.4, maxWidth: 560 }}>
+                      {stagedUpload.normalizeStatus === 'error'
+                        ? stagedUpload.normalizeError || 'Skin validation failed.'
+                        : stagedUpload.normalizeStatus === 'checking'
+                          ? 'Croopor is validating and normalizing this skin before it can be saved.'
+                          : 'Review the normalized PNG before saving it to your local skin library.'}
+                    </div>
+                  </div>
+                  <div style={{
+                    display: 'flex',
+                    gridColumn: '1 / -1',
+                    justifyContent: 'flex-end',
+                    alignItems: 'center',
+                    gap: 8,
+                    flexWrap: 'wrap',
+                  }}>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      icon="x"
+                      disabled={busy}
+                      onClick={clearStagedUpload}
+                    >
+                      Cancel
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      icon="plus"
+                      disabled={!canUpload}
+                      onClick={() => openUploadPicker(stagedUpload.applyAfterSave)}
+                    >
+                      Replace
+                    </Button>
+                    <Button
+                      variant={stagedUpload.applyAfterSave ? 'ghost' : 'secondary'}
+                      size="sm"
+                      icon={busy ? 'refresh' : 'download'}
+                      disabled={!stagedCanSave}
+                      onClick={() => saveStagedUpload(false)}
+                    >
+                      Save locally
+                    </Button>
+                    <Button
+                      variant={stagedUpload.applyAfterSave ? 'secondary' : 'ghost'}
+                      size="sm"
+                      icon={busy ? 'refresh' : 'check'}
+                      disabled={!stagedCanSave || !onlineReady}
+                      onClick={() => saveStagedUpload(true)}
+                      title={onlineReady ? 'Save locally, then apply to the active Minecraft account' : 'Online Minecraft account required'}
+                    >
+                      Save & apply
+                    </Button>
+                  </div>
+                </div>
+              )}
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/png"
+                style={{ display: 'none' }}
+                onChange={(event) => {
+                  const file = event.currentTarget.files?.[0];
+                  if (file) handleUploadFile(file, uploadApplyAfterSaveRef.current);
+                  uploadApplyAfterSaveRef.current = false;
                 }}
               />
             </div>
-            <Button
-              variant="secondary"
-              icon="plus"
-              disabled={!canUpload}
-              onClick={() => openUploadPicker(false)}
-            >
-              Upload PNG
-            </Button>
-            <Button
-              variant="ghost"
-              icon="check"
-              disabled={!canUpload || !onlineReady}
-              onClick={() => openUploadPicker(true)}
-              title={onlineReady ? 'Save locally, then apply to the active Minecraft account' : 'Online Minecraft account required'}
-            >
-              Upload & apply
-            </Button>
-          </div>
-          <div style={{
-            color: uploadDragActive ? 'var(--accent)' : theme.n.textMute,
-            fontSize: 12,
-            fontWeight: 500,
-            lineHeight: 1.4,
-          }}>
-            {uploadDragActive ? 'Drop one PNG skin file to preview.' : 'Drag a PNG skin file here, or use Upload PNG.'}
-          </div>
-          {stagedUpload && stagedVariant && (
-            <div style={{
-              display: 'grid',
-              gridTemplateColumns: 'auto minmax(0, 1fr)',
-              gap: 14,
-              alignItems: 'center',
-              minWidth: 0,
-              paddingTop: 12,
-              marginTop: 2,
-              borderTop: '1px solid var(--line)',
-            }}>
-              <div style={{ display: 'grid', gap: 8, justifyItems: 'center' }}>
-                <SkinBodyPreview
-                  src={stagedUpload.objectUrl}
-                  name={stagedName}
-                  variant={stagedVariant}
-                  side={stagedPreviewSide}
-                  showOuterLayers={stagedLayerMode === 'full'}
-                />
-                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'center' }}>
-                  <div role="group" aria-label={`${stagedName} staged body preview side`}>
-                    <Segmented<SavedSkinPreviewSide>
-                      options={[
-                        { value: 'front', label: 'Front' },
-                        { value: 'back', label: 'Back' },
-                      ]}
-                      value={stagedPreviewSide}
-                      onChange={setStagedPreviewSide}
-                    />
-                  </div>
-                  <div role="group" aria-label={`${stagedName} staged body preview layers`}>
-                    <Segmented<SavedSkinLayerMode>
-                      options={[
-                        { value: 'full', label: 'Full' },
-                        { value: 'base', label: 'Base' },
-                      ]}
-                      value={stagedLayerMode}
-                      onChange={setStagedLayerMode}
-                    />
-                  </div>
-                </div>
-              </div>
-              <div style={{ minWidth: 0, display: 'grid', gap: 7 }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 7, flexWrap: 'wrap' }}>
-                  <Pill tone="info" icon="image">Staged PNG</Pill>
-                  <Pill
-                    tone={stagedUpload.normalizeStatus === 'ready' ? 'ok' : stagedUpload.normalizeStatus === 'error' ? 'err' : 'neutral'}
-                    icon={stagedUpload.normalizeStatus === 'ready' ? 'check-circle' : stagedUpload.normalizeStatus === 'error' ? 'alert' : 'refresh'}
-                  >
-                    {stagedValidationLabel}
-                  </Pill>
-                  <Pill tone="neutral">
-                    {stagedVariantLabel}
-                  </Pill>
-                  {stagedUpload.applyAfterSave && (
-                    <Pill tone={onlineReady ? 'ok' : 'warn'} icon={onlineReady ? 'check-circle' : 'alert'}>
-                      Apply requested
-                    </Pill>
-                  )}
-                </div>
-                <div style={{
-                  color: theme.n.text,
-                  fontSize: 14,
-                  fontWeight: 700,
-                  lineHeight: 1.25,
-                  overflow: 'hidden',
-                  textOverflow: 'ellipsis',
-                  whiteSpace: 'nowrap',
-                }}>
-                  {stagedName}
-                </div>
-                <div style={{
-                  color: theme.n.textMute,
-                  fontSize: 12,
-                  fontFamily: theme.font.mono,
-                  overflow: 'hidden',
-                  textOverflow: 'ellipsis',
-                  whiteSpace: 'nowrap',
-                }}>
-                  {stagedUpload.normalizeStatus === 'ready' && stagedUpload.textureKey
-                    ? `${stagedUpload.textureKey.slice(0, 16)} / ${stagedUpload.originalWidth}x${stagedUpload.originalHeight} -> 64x64 / ${formatByteSize(stagedUpload.normalizedByteSize ?? stagedUpload.file.size)}`
-                    : `${stagedUpload.file.name} / ${formatByteSize(stagedUpload.file.size)}`}
-                </div>
-                <div style={{ color: theme.n.textDim, fontSize: 12, lineHeight: 1.4, maxWidth: 560 }}>
-                  {stagedUpload.normalizeStatus === 'error'
-                    ? stagedUpload.normalizeError || 'Skin validation failed.'
-                    : stagedUpload.normalizeStatus === 'checking'
-                      ? 'Croopor is validating and normalizing this skin before it can be saved.'
-                      : 'Review the normalized PNG before saving it to your local skin library.'}
-                </div>
-              </div>
+
+            {minecraftProfile && (
               <div style={{
-                display: 'flex',
-                gridColumn: '1 / -1',
-                justifyContent: 'flex-end',
+                display: 'grid',
+                gridTemplateColumns: '42px minmax(0, 1fr) auto',
+                gap: 12,
                 alignItems: 'center',
-                gap: 8,
-                flexWrap: 'wrap',
+                padding: '12px 0',
+                borderTop: '1px solid var(--line)',
+                borderBottom: '1px solid var(--line)',
               }}>
+                {profileSkin ? (
+                  <SkinBodyPreview
+                    src={profileSkin.url}
+                    name={minecraftProfile.name}
+                    variant={profileSkinVariant}
+                    side="front"
+                    showOuterLayers
+                    scale={2}
+                    compact
+                  />
+                ) : (
+                  <PlayerHeadPreview
+                    username={minecraftProfile.name}
+                    textureSrc={undefined}
+                    size={36}
+                    radius={7}
+                    ariaLabel={`${minecraftProfile.name} Minecraft profile skin`}
+                  />
+                )}
+                <div style={{ minWidth: 0, display: 'grid', gap: 4 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                    <Pill tone={onlineReady ? 'ok' : 'warn'} icon={onlineReady ? 'check-circle' : 'alert'}>
+                      Current Minecraft profile
+                    </Pill>
+                    {profileSkin && <Pill tone="neutral">{profileSkinVariant}</Pill>}
+                  </div>
+                  <div style={{
+                    color: theme.n.text,
+                    fontSize: 13,
+                    fontWeight: 700,
+                    lineHeight: 1.25,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                  }}>
+                    {minecraftProfile.name}
+                  </div>
+                  <div style={{ color: theme.n.textMute, fontSize: 12, lineHeight: 1.4 }}>
+                    {profileSkin
+                      ? 'Save this skin locally before editing, previewing, or reapplying it later.'
+                      : 'This profile does not report an active skin texture yet.'}
+                  </div>
+                </div>
                 <Button
-                  variant="ghost"
+                  variant="secondary"
                   size="sm"
-                  icon="x"
-                  disabled={busy}
-                  onClick={clearStagedUpload}
-                >
-                  Cancel
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  icon="plus"
-                  disabled={!canUpload}
-                  onClick={() => openUploadPicker(stagedUpload.applyAfterSave)}
-                >
-                  Replace
-                </Button>
-                <Button
-                  variant={stagedUpload.applyAfterSave ? 'ghost' : 'secondary'}
-                  size="sm"
-                  icon={busy ? 'refresh' : 'download'}
-                  disabled={!stagedCanSave}
-                  onClick={() => saveStagedUpload(false)}
+                  icon={profileBusy ? 'refresh' : 'download'}
+                  disabled={!canSaveProfileSkin}
+                  onClick={() => void saveProfileSkin()}
+                  title={onlineReady
+                    ? profileSkin ? 'Save active Minecraft profile skin' : 'No active Minecraft profile skin reported'
+                    : 'Online Minecraft account required'}
                 >
                   Save locally
                 </Button>
-                <Button
-                  variant={stagedUpload.applyAfterSave ? 'secondary' : 'ghost'}
-                  size="sm"
-                  icon={busy ? 'refresh' : 'check'}
-                  disabled={!stagedCanSave || !onlineReady}
-                  onClick={() => saveStagedUpload(true)}
-                  title={onlineReady ? 'Save locally, then apply to the active Minecraft account' : 'Online Minecraft account required'}
-                >
-                  Save & apply
-                </Button>
               </div>
+            )}
+
+            <div style={{
+              display: 'grid',
+              gridTemplateColumns: 'minmax(180px, 1fr) auto auto auto',
+              gap: 10,
+              alignItems: 'center',
+            }}>
+              <Input
+                value={lookupUsername}
+                onChange={(value) => {
+                  setLookupUsername(clampPlayerNameInput(value));
+                  setMessage(null);
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' && canSaveLookupSkin) void saveUsernameSkin(false);
+                }}
+                placeholder="Minecraft username"
+                icon="search"
+              />
+              <Pill tone={lookupUsernameError ? 'warn' : 'neutral'} icon={lookupUsernameError ? 'alert' : 'user'}>
+                Player skin
+              </Pill>
+              <Button
+                variant="secondary"
+                size="sm"
+                icon={lookupBusy ? 'refresh' : 'download'}
+                disabled={!canSaveLookupSkin}
+                onClick={() => void saveUsernameSkin(false)}
+                title={lookupUsernameError || undefined}
+              >
+                Save skin
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                icon={lookupBusy ? 'refresh' : 'check'}
+                disabled={!canSaveLookupSkin || !onlineReady}
+                onClick={() => void saveUsernameSkin(true)}
+                title={onlineReady
+                  ? lookupUsernameError || 'Save locally, then apply to the active Minecraft account'
+                  : 'Online Minecraft account required'}
+              >
+                Save & apply
+              </Button>
             </div>
-          )}
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="image/png"
-            style={{ display: 'none' }}
-            onChange={(event) => {
-              const file = event.currentTarget.files?.[0];
-              if (file) handleUploadFile(file, uploadApplyAfterSaveRef.current);
-              uploadApplyAfterSaveRef.current = false;
-            }}
-          />
-        </div>
+          </div>
+        </details>
 
         {message && (
           <div style={{
@@ -2752,121 +2899,6 @@ function SavedSkinLibrary({
             {message.text}
           </div>
         )}
-
-        {minecraftProfile && (
-          <div style={{
-            display: 'grid',
-            gridTemplateColumns: '42px minmax(0, 1fr) auto',
-            gap: 12,
-            alignItems: 'center',
-            padding: '12px 0',
-            borderTop: '1px solid var(--line)',
-            borderBottom: '1px solid var(--line)',
-          }}>
-            {profileSkin ? (
-              <SkinBodyPreview
-                src={profileSkin.url}
-                name={minecraftProfile.name}
-                variant={profileSkinVariant}
-                side="front"
-                showOuterLayers
-                scale={2}
-                compact
-              />
-            ) : (
-              <PlayerHeadPreview
-                username={minecraftProfile.name}
-                textureSrc={undefined}
-                size={36}
-                radius={7}
-                ariaLabel={`${minecraftProfile.name} Minecraft profile skin`}
-              />
-            )}
-            <div style={{ minWidth: 0, display: 'grid', gap: 4 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                <Pill tone={onlineReady ? 'ok' : 'warn'} icon={onlineReady ? 'check-circle' : 'alert'}>
-                  Current Minecraft profile
-                </Pill>
-                {profileSkin && <Pill tone="neutral">{profileSkinVariant}</Pill>}
-              </div>
-              <div style={{
-                color: theme.n.text,
-                fontSize: 13,
-                fontWeight: 700,
-                lineHeight: 1.25,
-                overflow: 'hidden',
-                textOverflow: 'ellipsis',
-                whiteSpace: 'nowrap',
-              }}>
-                {minecraftProfile.name}
-              </div>
-              <div style={{ color: theme.n.textMute, fontSize: 12, lineHeight: 1.4 }}>
-                {profileSkin
-                  ? 'Save this skin locally before editing, previewing, or reapplying it later.'
-                  : 'This profile does not report an active skin texture yet.'}
-              </div>
-            </div>
-            <Button
-              variant="secondary"
-              size="sm"
-              icon={profileBusy ? 'refresh' : 'download'}
-              disabled={!canSaveProfileSkin}
-              onClick={() => void saveProfileSkin()}
-              title={onlineReady
-                ? profileSkin ? 'Save active Minecraft profile skin' : 'No active Minecraft profile skin reported'
-                : 'Online Minecraft account required'}
-            >
-              Save locally
-            </Button>
-          </div>
-        )}
-
-        <div style={{
-          display: 'grid',
-          gridTemplateColumns: 'minmax(180px, 1fr) auto auto auto',
-          gap: 10,
-          alignItems: 'center',
-          padding: minecraftProfile ? '0 0 12px' : '12px 0',
-          borderBottom: '1px solid var(--line)',
-        }}>
-          <Input
-            value={lookupUsername}
-            onChange={(value) => {
-              setLookupUsername(clampPlayerNameInput(value));
-              setMessage(null);
-            }}
-            onKeyDown={(event) => {
-              if (event.key === 'Enter' && canSaveLookupSkin) void saveUsernameSkin(false);
-            }}
-            placeholder="Minecraft username"
-            icon="search"
-          />
-          <Pill tone={lookupUsernameError ? 'warn' : 'neutral'} icon={lookupUsernameError ? 'alert' : 'user'}>
-            Player skin
-          </Pill>
-          <Button
-            variant="secondary"
-            size="sm"
-            icon={lookupBusy ? 'refresh' : 'download'}
-            disabled={!canSaveLookupSkin}
-            onClick={() => void saveUsernameSkin(false)}
-            title={lookupUsernameError || undefined}
-          >
-            Save skin
-          </Button>
-          <Button
-            variant="ghost"
-            size="sm"
-            icon={lookupBusy ? 'refresh' : 'check'}
-            disabled={!canSaveLookupSkin || !onlineReady}
-            onClick={() => void saveUsernameSkin(true)}
-            title={onlineReady
-              ? lookupUsernameError || 'Save locally, then apply to the active Minecraft account'
-              : 'Online Minecraft account required'}
-          >
-            Save & apply
-          </Button>
-        </div>
 
         {state === 'unavailable' && (
           <div style={{ color: 'var(--err)', fontSize: 12, fontWeight: 500 }}>
