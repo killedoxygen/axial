@@ -11,8 +11,8 @@ use croopor_launcher::{
 };
 use serde_json::Value;
 use std::collections::HashSet;
-use std::io::Read;
 use std::path::{Path, PathBuf};
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 const PREWARM_MAX_FILES: usize = 8;
@@ -275,7 +275,8 @@ pub(super) async fn launch_session(
             Some(guardian.clone()),
         )
         .await;
-        let prewarm = prewarm_launch_plan(&prepared.plan, proof_context.resource_budget.as_ref());
+        let prewarm =
+            prewarm_launch_plan(&prepared.plan, proof_context.resource_budget.as_ref()).await;
         let prewarm_summary = format_prewarm_run_summary(&prewarm);
         trace_launch_event(&session_id, &prewarm_summary);
         state
@@ -680,14 +681,14 @@ struct LaunchPrewarmRunSummary {
     skipped_files: usize,
 }
 
-fn prewarm_launch_plan(
+async fn prewarm_launch_plan(
     plan: &croopor_launcher::VanillaLaunchPlan,
     resource_budget: Option<&LaunchProofResourceBudget>,
 ) -> LaunchPrewarmRunSummary {
     let selection = select_prewarm_budget(resource_budget);
     let candidate_paths = prewarm_candidate_paths(plan);
     let summary = match selection.budget {
-        Some(budget) => prewarm_candidate_files(candidate_paths, budget),
+        Some(budget) => prewarm_candidate_files(candidate_paths, budget).await,
         None => LaunchPrewarmSummary {
             skipped_files: candidate_paths.len(),
             ..LaunchPrewarmSummary::default()
@@ -778,7 +779,7 @@ fn is_jar_path(path: &Path) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("jar"))
 }
 
-fn prewarm_candidate_files<I, P>(
+async fn prewarm_candidate_files<I, P>(
     candidate_paths: I,
     budget: LaunchPrewarmBudget,
 ) -> LaunchPrewarmSummary
@@ -803,7 +804,7 @@ where
         }
 
         attempted_files += 1;
-        match prewarm_file_prefix(path.as_ref(), max_bytes) {
+        match prewarm_file_prefix(path.as_ref(), max_bytes).await {
             Ok(bytes) => {
                 summary.warmed_files += 1;
                 summary.warmed_bytes = summary.warmed_bytes.saturating_add(bytes);
@@ -817,8 +818,8 @@ where
     summary
 }
 
-fn prewarm_file_prefix(path: &Path, max_bytes: u64) -> std::io::Result<u64> {
-    let mut file = std::fs::File::open(path)?;
+async fn prewarm_file_prefix(path: &Path, max_bytes: u64) -> std::io::Result<u64> {
+    let mut file = tokio::fs::File::open(path).await?;
     let mut warmed = 0u64;
     let mut buffer = [0u8; PREWARM_BUFFER_BYTES];
 
@@ -827,7 +828,7 @@ fn prewarm_file_prefix(path: &Path, max_bytes: u64) -> std::io::Result<u64> {
         let limit = buffer
             .len()
             .min(usize::try_from(remaining).unwrap_or(usize::MAX));
-        let read = file.read(&mut buffer[..limit])?;
+        let read = file.read(&mut buffer[..limit]).await?;
         if read == 0 {
             break;
         }
@@ -1317,8 +1318,8 @@ mod tests {
         assert_eq!(selection.reason, Some("cpu_and_install_pressure"));
     }
 
-    #[test]
-    fn launch_prewarm_reads_bounded_prefixes_and_skips_best_effort() {
+    #[tokio::test]
+    async fn launch_prewarm_reads_bounded_prefixes_and_skips_best_effort() {
         let dir = unique_test_dir("launch-prewarm");
         fs::create_dir_all(&dir).expect("create test dir");
         let first = dir.join("first.jar");
@@ -1336,7 +1337,8 @@ mod tests {
                 max_total_bytes: 12,
                 max_file_bytes: 8,
             },
-        );
+        )
+        .await;
 
         assert_eq!(
             summary,
@@ -1350,8 +1352,8 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    #[test]
-    fn launch_prewarm_caps_attempted_file_count() {
+    #[tokio::test]
+    async fn launch_prewarm_caps_attempted_file_count() {
         let dir = unique_test_dir("launch-prewarm-file-cap");
         fs::create_dir_all(&dir).expect("create test dir");
         let first = dir.join("first.jar");
@@ -1368,7 +1370,8 @@ mod tests {
                 max_total_bytes: 1024,
                 max_file_bytes: 8,
             },
-        );
+        )
+        .await;
 
         assert_eq!(
             summary,
