@@ -5,7 +5,7 @@ import { openContextMenu } from '../../../ui/ContextMenu';
 import { navigate } from '../../../ui-state';
 import { clearLaunchNotice } from '../../../actions';
 import { toast } from '../../../toast';
-import type { LaunchState } from '../../../store';
+import type { InstallFailure, LaunchState } from '../../../store';
 import type { EnrichedInstance, LaunchNotice, LaunchNoticeTone } from '../../../types';
 import { openInstanceFolder } from '../instance-actions';
 
@@ -141,25 +141,33 @@ export function InstallBarrierPane({
   installLabel,
   installQueued,
   installProgress,
+  installFailure,
   installQueuePosition,
   installQueueCount,
+  onRetryInstall,
 }: {
   installTarget: string;
   installLabel: string;
   installQueued: boolean;
   installProgress: { pct: number; label: string; displayName?: string } | null;
+  installFailure: InstallFailure | null;
   installQueuePosition?: number;
   installQueueCount?: number;
+  onRetryInstall: () => void;
 }): JSX.Element {
   const pct = installProgress ? Math.max(0, Math.min(100, Math.round(installProgress.pct))) : 0;
+  const failed = Boolean(installFailure);
   const queuedBehind = installQueuePosition != null ? installQueuePosition - 1 : undefined;
   const queuedDetail = installQueuePosition != null && installQueueCount != null
     ? installQueuePosition === 1
       ? `Position 1 of ${installQueueCount}; next to start when the download slot opens.`
       : `Position ${installQueuePosition} of ${installQueueCount}; waiting behind ${queuedBehind} item${queuedBehind === 1 ? '' : 's'}.`
     : 'This instance will unlock automatically after its version install starts and finishes.';
-  const label = installProgress?.label || (installQueued ? 'Install waiting in queue' : 'Preparing install');
-  const detail = installProgress
+  const label = installFailure?.message || installProgress?.label || (installQueued ? 'Install waiting in queue' : 'Preparing install');
+  const targetLabel = installLabel || installTarget;
+  const detail = failed
+    ? 'Retry the required install or open Downloads for more context.'
+    : installProgress
     ? `${pct}% complete`
     : installQueued
       ? queuedDetail
@@ -169,11 +177,18 @@ export function InstallBarrierPane({
     <div class="cp-instance-install-lock" aria-live="polite">
       <div class="cp-instance-install-lock-main">
         <span class="cp-instance-install-lock-icon" aria-hidden="true">
-          <Icon name={installQueued ? 'clock' : 'download'} size={18} stroke={2} />
+          <Icon name={failed ? 'alert' : installQueued ? 'clock' : 'download'} size={18} stroke={2} />
         </span>
         <div class="cp-instance-install-lock-copy">
-          <h2>{installQueued ? 'Install queued' : 'Installing required files'}</h2>
-          <p>{label} for {installLabel || installTarget}.</p>
+          <h2>{failed ? 'Install failed' : installQueued ? 'Install queued' : 'Installing required files'}</h2>
+          {failed ? (
+            <>
+              <p>Could not install {targetLabel}.</p>
+              <p>{label}</p>
+            </>
+          ) : (
+            <p>{label} for {targetLabel}.</p>
+          )}
         </div>
       </div>
 
@@ -183,9 +198,12 @@ export function InstallBarrierPane({
 
       <div class="cp-instance-install-lock-foot">
         <span>{detail}</span>
-        <Button variant="secondary" size="sm" icon="download" onClick={() => navigate({ name: 'downloads' })}>
-          Downloads
-        </Button>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginLeft: 'auto' }}>
+          {failed && <Button variant="secondary" size="sm" icon="refresh" onClick={onRetryInstall}>Retry</Button>}
+          <Button variant="secondary" size="sm" icon="download" onClick={() => navigate({ name: 'downloads' })}>
+            Downloads
+          </Button>
+        </div>
       </div>
     </div>
   );

@@ -5,11 +5,11 @@ import { Button, IconButton, Pill } from '../../ui/Atoms';
 import { useTheme } from '../../hooks/use-theme';
 import { InstanceArt } from '../../art/InstanceArt';
 import { openContextMenu } from '../../ui/ContextMenu';
-import { installQueue, installState, instances, launchNotices, launchState, runningSessions, versions } from '../../store';
+import { installFailure, installQueue, installState, instances, launchNotices, launchState, runningSessions, versions } from '../../store';
 import { navigate } from '../../ui-state';
 import { isActiveInstallItem, isSameInstallItem, selectInstance } from '../../actions';
 import { launchGame, killGame } from '../../launch';
-import { handleInstallClick } from '../../install';
+import { handleInstallClick, retryFailedInstall } from '../../install';
 import { formatInstallItemLabel } from '../../install-labels';
 import { errMessage } from '../../utils';
 import { loaderKeyFromVersion, LOADER_LABELS } from '../create/defaults';
@@ -152,9 +152,13 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
   const installQueued = !installProgress && Boolean(queuedInstall);
   const installQueuePosition = installQueued ? queuedInstallIndex + 1 : undefined;
   const installQueueCount = installQueued ? installQueue.value.length : undefined;
+  const failedInstall = installFailure.value;
+  const matchingInstallFailure = failedInstall && isSameInstallItem(failedInstall.item, installItem)
+    ? failedInstall
+    : null;
   const installLabel = installProgress?.displayName
-    || (queuedInstall ? formatInstallItemLabel(queuedInstall) : installTarget);
-  const installLocked = !canLaunch && (Boolean(installProgress) || installQueued);
+    || (queuedInstall ? formatInstallItemLabel(queuedInstall) : matchingInstallFailure?.displayName || installTarget);
+  const installLocked = !canLaunch && (Boolean(installProgress) || installQueued || Boolean(matchingInstallFailure));
 
   const onPlay = (): void => {
     selectInstance(inst.id);
@@ -284,8 +288,10 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
           installLabel={installLabel}
           installQueued={installQueued}
           installProgress={installProgress}
+          installFailure={matchingInstallFailure}
           installQueuePosition={installQueuePosition}
           installQueueCount={installQueueCount}
+          onRetryInstall={retryFailedInstall}
         />
       )}
       {!installLocked && tab === 'overview' && (
