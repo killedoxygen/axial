@@ -179,7 +179,12 @@ async function runAutoUpdateCheck(): Promise<void> {
     queueAutoUpdateCheck(AUTO_CHECK_INTERVAL_MS);
     return;
   }
-  if (bootstrapState.value !== 'ready' || installState.value.status !== 'idle' || launchState.value.status !== 'idle') {
+  if (
+    bootstrapState.value !== 'ready'
+    || installState.value.status !== 'idle'
+    || installQueue.value.length > 0
+    || launchState.value.status !== 'idle'
+  ) {
     queueAutoUpdateCheck(AUTO_CHECK_RETRY_MS);
     return;
   }
