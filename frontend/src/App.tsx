@@ -4,7 +4,6 @@ import { useEffect, useState } from 'preact/hooks';
 import { AppFrame } from './shell/AppFrame';
 import { HomeView } from './views/home/HomeView';
 import { InstancesView } from './views/instances/InstancesView';
-import { Onboarding } from './views/onboarding/Onboarding';
 import { DialogHost } from './ui/Dialog';
 import { SetupOverlay } from './views/setup/SetupOverlay';
 import { ContextMenuHost } from './ui/ContextMenu';
@@ -34,6 +33,10 @@ const SettingsRoute = createRouteLoader(
 
 const DownloadsRoute = createRouteLoader(
   async () => (await import('./views/downloads/DownloadsView')).DownloadsView,
+);
+
+const OnboardingOverlay = createRouteLoader(
+  async () => (await import('./views/onboarding/Onboarding')).Onboarding,
 );
 
 const loadDevLabView = __CROOPOR_ENABLE_DEV_LAB__
@@ -148,7 +151,7 @@ export function App(): JSX.Element {
     <>
       <AppFrame><CurrentView /></AppFrame>
       {showSetupOverlay.value && <SetupOverlay />}
-      {showOnboardingOverlay.value && <Onboarding />}
+      {showOnboardingOverlay.value && <OnboardingOverlay />}
       <DialogHost />
       <ContextMenuHost />
       <ToastHost />
