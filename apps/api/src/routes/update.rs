@@ -10,7 +10,7 @@ use std::{
 
 const GITHUB_LATEST_RELEASE_URL: &str =
     "https://api.github.com/repos/mateoltd/croopor/releases/latest";
-const GITHUB_RELEASE_PAGE_PREFIX: &str = "https://github.com/mateoltd/croopor/releases/";
+const GITHUB_RELEASE_PAGE_TAG_PREFIX: &str = "https://github.com/mateoltd/croopor/releases/tag/";
 const GITHUB_RELEASE_DOWNLOAD_PREFIX: &str =
     "https://github.com/mateoltd/croopor/releases/download/";
 const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
@@ -176,7 +176,7 @@ fn release_response_for_platform(
     arch: &str,
 ) -> UpdateResponse {
     let latest_version = normalized_version(&release.tag_name);
-    let Some(release_url) = sane_release_page_url(&release.html_url) else {
+    let Some(release_url) = sane_release_page_url(&release.html_url, &latest_version) else {
         return fallback_response(current_version, checked_at);
     };
     if !is_version_greater(&latest_version, current_version) {
@@ -234,9 +234,16 @@ fn normalized_version(version: &str) -> String {
     version.trim().trim_start_matches(['v', 'V']).to_string()
 }
 
-fn sane_release_page_url(url: &str) -> Option<String> {
+fn sane_release_page_url(url: &str, latest_version: &str) -> Option<String> {
     let trimmed = url.trim();
-    if trimmed != url || !trimmed.starts_with(GITHUB_RELEASE_PAGE_PREFIX) {
+    let Some(tag) = trimmed.strip_prefix(GITHUB_RELEASE_PAGE_TAG_PREFIX) else {
+        return None;
+    };
+    if trimmed != url
+        || tag.is_empty()
+        || tag.contains(['/', '?', '#'])
+        || normalized_version(tag) != latest_version
+    {
         return None;
     }
     Some(trimmed.to_string())
@@ -435,6 +442,19 @@ mod tests {
         assert!(!wrong_url.available);
         assert_eq!(wrong_url.latest_version, "1.2.3");
         assert_eq!(wrong_url.kind, "none");
+
+        let mismatched_page_tag = release_response(
+            "1.2.3",
+            "2026-01-01T00:00:00Z",
+            GithubLatestRelease {
+                tag_name: "v1.2.4".to_string(),
+                html_url: "https://github.com/mateoltd/croopor/releases/tag/v1.2.5".to_string(),
+                assets: Vec::new(),
+            },
+        );
+        assert!(!mismatched_page_tag.available);
+        assert_eq!(mismatched_page_tag.latest_version, "1.2.3");
+        assert_eq!(mismatched_page_tag.kind, "none");
     }
 
     #[test]
