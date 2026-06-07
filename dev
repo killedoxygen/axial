@@ -620,6 +620,7 @@ main() {
         echo "build:api does not accept extra arguments" >&2
         exit 1
       fi
+      run_frontend run build
       cargo build --locked -p croopor-api
       ;;
     build:api:release)
@@ -627,6 +628,7 @@ main() {
         echo "build:api:release does not accept extra arguments" >&2
         exit 1
       fi
+      run_frontend run build
       cargo build --locked -p croopor-api --release
       ;;
     clean)

@@ -264,8 +264,18 @@ switch ($Command) {
     cargo build --locked -p croopor-desktop
     exit $LASTEXITCODE
   }
-  'build:api' { cargo build --locked -p croopor-api; exit $LASTEXITCODE }
-  'build:api:release' { cargo build --locked -p croopor-api --release; exit $LASTEXITCODE }
+  'build:api' {
+    Invoke-Frontend run build
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    cargo build --locked -p croopor-api
+    exit $LASTEXITCODE
+  }
+  'build:api:release' {
+    Invoke-Frontend run build
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    cargo build --locked -p croopor-api --release
+    exit $LASTEXITCODE
+  }
   'clean' {
     cargo clean
     if (Test-Path (Join-Path $Root 'dist')) {

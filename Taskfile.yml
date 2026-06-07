@@ -212,11 +212,15 @@ tasks:
 
   build:api:
     desc: build the API binary in dev mode
+    deps:
+      - frontend:build
     cmds:
       - cargo build --locked -p croopor-api
 
   build:api:release:
     desc: build the API binary in release mode
+    deps:
+      - frontend:build
     cmds:
       - cargo build --locked -p croopor-api --release
 
@@ -235,11 +239,10 @@ tasks:
 
   verify:
     desc: run checks, tests, and a release desktop build
-    deps:
-      - frontend:build
-      - check
-      - test
     cmds:
+      - task frontend:build
+      - task check
+      - task test
       - cargo build --locked -p croopor-desktop --release
 
   clean:

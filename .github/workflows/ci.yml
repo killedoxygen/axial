@@ -71,6 +71,12 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm --dir frontend install --frozen-lockfile --ignore-scripts
 
+      - name: Frontend typecheck
+        run: pnpm --dir frontend run check
+
+      - name: Frontend build
+        run: pnpm --dir frontend run build
+
       - name: Rust fmt
         run: cargo fmt --all --check
 
@@ -82,12 +88,6 @@ jobs:
 
       - name: Rust tests
         run: cargo test --workspace --locked
-
-      - name: Frontend typecheck
-        run: pnpm --dir frontend run check
-
-      - name: Frontend build
-        run: pnpm --dir frontend run build
 
       - name: Release desktop build
         run: cargo build --locked -p croopor-desktop --release
