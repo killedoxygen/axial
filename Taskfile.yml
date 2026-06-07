@@ -62,10 +62,12 @@ tasks:
         platforms: [windows]
 
   host:launch-evidence:
-    desc: show WSL-visible Windows host Java and Minecraft/Croopor launch evidence
-    platforms: [linux]
+    desc: show Windows host Java and Minecraft/Croopor launch evidence without paths
     cmds:
-      - ./dev host:launch-evidence
+      - cmd: ./dev host:launch-evidence
+        platforms: [linux]
+      - cmd: powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./dev.ps1 host:launch-evidence
+        platforms: [windows]
 
   frontend:install:
     desc: install frontend deps
