@@ -373,7 +373,7 @@ async fn run_processor(
         .map(|path| path.to_string_lossy().to_string())
         .collect::<Vec<_>>()
         .join(separator);
-    let main_class = read_main_class_from_jar(&proc_jar_path)?;
+    let main_class = read_main_class_from_jar_blocking(proc_jar_path.clone()).await?;
 
     let mut args = vec!["-cp".to_string(), classpath, main_class];
     for arg in &processor.args {
@@ -423,6 +423,12 @@ fn read_main_class_from_jar(jar_path: &Path) -> Result<String, ProcessorError> {
     manifest.read_to_end(&mut data)?;
     parse_manifest_main_class(&data)
         .ok_or_else(|| ProcessorError::Command("no Main-Class in manifest".to_string()))
+}
+
+async fn read_main_class_from_jar_blocking(jar_path: PathBuf) -> Result<String, ProcessorError> {
+    tokio::task::spawn_blocking(move || read_main_class_from_jar(&jar_path))
+        .await
+        .map_err(|error| ProcessorError::Command(format!("blocking task failed: {error}")))?
 }
 
 fn parse_manifest_main_class(data: &[u8]) -> Option<String> {
