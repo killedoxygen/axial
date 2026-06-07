@@ -976,11 +976,16 @@ fn auth_refresh_error_response(error: AuthRefreshFailure) -> (StatusCode, Json<s
             Json(serde_json::json!({ "error": "Microsoft sign-in service is unavailable" })),
         ),
         AuthRefreshFailureKind::MicrosoftParse => auth_login_error_response(AuthLoginError::Parse),
-        AuthRefreshFailureKind::AuthChainFailed => auth_chain_error_response(
-            error
-                .auth_chain_error
-                .expect("auth-chain failure has error"),
-        ),
+        AuthRefreshFailureKind::AuthChainFailed => match error.auth_chain_error {
+            Some(error) => auth_chain_error_response(error),
+            None => (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": "Microsoft sign-in refresh failed",
+                    "status": "refresh_failed",
+                })),
+            ),
+        },
     }
 }
 
@@ -1632,6 +1637,23 @@ mod tests {
             );
             assert_no_auth_login_error_diagnostic_fragments(&response.1.0);
         }
+    }
+
+    #[test]
+    fn auth_refresh_error_response_handles_missing_auth_chain_detail() {
+        let response = auth_refresh_error_response(AuthRefreshFailure::new(
+            AuthRefreshFailureKind::AuthChainFailed,
+        ));
+
+        assert_eq!(response.0, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response.1.0,
+            serde_json::json!({
+                "error": "Microsoft sign-in refresh failed",
+                "status": "refresh_failed",
+            })
+        );
+        assert_no_auth_login_error_diagnostic_fragments(&response.1.0);
     }
 
     #[test]
