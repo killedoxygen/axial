@@ -9,6 +9,7 @@ keep this short and real. if the codebase changes, update this file.
 
 ## Frontend
 - prefer preact components over hand-built dom
+- for UI layout/design work, read and follow `docs/DESIGN.md`
 - keep modules flat, named exports only
 - no classes, no default exports
 - use signals/actions for cross-module state, not custom event spaghetti
