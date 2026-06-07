@@ -1,6 +1,8 @@
 use crate::state::AppState;
+use async_stream::stream;
 use axum::{
     Json, Router,
+    body::{Body, Bytes},
     extract::{Path, Query, State},
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
@@ -14,8 +16,11 @@ use std::{
     io::{ErrorKind, Read, Seek, SeekFrom},
     path::{Path as FsPath, PathBuf},
 };
+use tokio::io::AsyncReadExt;
 
 const LOG_TAIL_LIMIT: u64 = 128 * 1024;
+const SCREENSHOT_FILE_MAX_BYTES: u64 = 32 * 1024 * 1024;
+const SCREENSHOT_FILE_STREAM_CHUNK_BYTES: usize = 64 * 1024;
 const WORLD_BACKUP_MAX_DEPTH: usize = 64;
 const WORLD_BACKUP_MAX_ENTRIES: usize = 100_000;
 const WORLD_BACKUP_MAX_BYTES: u64 = 50 * 1024 * 1024 * 1024;
@@ -554,10 +559,35 @@ async fn handle_instance_screenshot_file(
 
     let game_dir = instance_game_dir(&state, &id)?;
     let path = game_dir.join("screenshots").join(&name);
-    require_screenshot_file(&path)?;
+    let metadata = require_screenshot_file_async(&path).await?;
+    if metadata.len() > SCREENSHOT_FILE_MAX_BYTES {
+        return Err(json_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "screenshot file is too large",
+        ));
+    }
 
-    let bytes = fs::read(&path).map_err(screenshot_file_read_error_response)?;
-    let mut response = bytes.into_response();
+    let mut file = tokio::fs::File::open(&path)
+        .await
+        .map_err(screenshot_file_read_error_response)?;
+    let stream = stream! {
+        let mut buffer = vec![0_u8; SCREENSHOT_FILE_STREAM_CHUNK_BYTES];
+        loop {
+            match file.read(&mut buffer).await {
+                Ok(0) => break,
+                Ok(bytes_read) => {
+                    yield Ok::<Bytes, std::io::Error>(Bytes::copy_from_slice(
+                        &buffer[..bytes_read],
+                    ));
+                }
+                Err(error) => {
+                    yield Err::<Bytes, std::io::Error>(error);
+                    break;
+                }
+            }
+        }
+    };
+    let mut response = Body::from_stream(stream).into_response();
     response
         .headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
@@ -771,6 +801,22 @@ fn require_screenshot_file(path: &FsPath) -> Result<(), (StatusCode, Json<serde_
     })?;
     if metadata.file_type().is_file() {
         Ok(())
+    } else {
+        Err(json_error(StatusCode::NOT_FOUND, "screenshot not found"))
+    }
+}
+
+async fn require_screenshot_file_async(
+    path: &FsPath,
+) -> Result<fs::Metadata, (StatusCode, Json<serde_json::Value>)> {
+    let metadata = tokio::fs::symlink_metadata(path)
+        .await
+        .map_err(|error| match error.kind() {
+            ErrorKind::NotFound => json_error(StatusCode::NOT_FOUND, "screenshot not found"),
+            _ => screenshot_file_read_error_response(error),
+        })?;
+    if metadata.file_type().is_file() {
+        Ok(metadata)
     } else {
         Err(json_error(StatusCode::NOT_FOUND, "screenshot not found"))
     }
@@ -1507,6 +1553,10 @@ mod tests {
             response.headers().get(header::CONTENT_TYPE),
             Some(&HeaderValue::from_static("image/png"))
         );
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("read screenshot body");
+        assert_eq!(&body[..], &[137, 80, 78, 71]);
 
         let (status, Json(body)) = handle_instance_screenshot_file(
             State(fixture.state.clone()),
@@ -1516,6 +1566,42 @@ mod tests {
         .expect_err("traversal should fail");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_bounded_error_body(&body, "invalid screenshot filename");
+    }
+
+    #[tokio::test]
+    async fn instance_screenshot_file_rejects_too_large_image() {
+        let fixture = TestFixture::new("screenshot-file-too-large");
+        let instance = fixture
+            .state
+            .instances()
+            .add(
+                "Large screenshot".to_string(),
+                "1.21.1".to_string(),
+                String::new(),
+                String::new(),
+                None,
+            )
+            .expect("add instance");
+        let screenshots_dir = fixture
+            .state
+            .instances()
+            .game_dir(&instance.id)
+            .join("screenshots");
+        fs::create_dir_all(&screenshots_dir).expect("create screenshots dir");
+        let file = fs::File::create(screenshots_dir.join("too-large.png"))
+            .expect("create large screenshot");
+        file.set_len(SCREENSHOT_FILE_MAX_BYTES + 1)
+            .expect("size large screenshot");
+
+        let (status, Json(body)) = handle_instance_screenshot_file(
+            State(fixture.state.clone()),
+            Path((instance.id, "too-large.png".to_string())),
+        )
+        .await
+        .expect_err("too-large screenshot should fail");
+
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_bounded_error_body(&body, "screenshot file is too large");
     }
 
     #[tokio::test]
