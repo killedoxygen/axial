@@ -2,6 +2,7 @@ import type { JSX } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { api, apiResourceUrl, apiUrl, isApiError } from '../../api';
 import { Button, Card, Input, Pill, SectionHeading, Segmented } from '../../ui/Atoms';
+import { showConfirm } from '../../ui/Dialog';
 import { Icon } from '../../ui/Icons';
 import { PlayerHeadPreview } from '../../ui/PlayerHeadPreview';
 import { useTheme } from '../../hooks/use-theme';
@@ -2173,6 +2174,18 @@ function SavedSkinLibrary({
     }
   };
 
+  const confirmDeleteSkin = async (skin: SavedSkinRecord): Promise<void> => {
+    const name = skin.name.trim();
+    const ok = await showConfirm(
+      name
+        ? `Delete saved skin "${name}"? This removes it from local saved skins only.`
+        : 'Delete this saved skin? This removes it from local saved skins only.',
+      { title: 'Delete saved skin', destructive: true, confirmText: 'Delete' },
+    );
+    if (!ok) return;
+    await deleteSkin(skin.texture_key);
+  };
+
   const saveProfileSkin = async (): Promise<void> => {
     if (!onlineReady) return;
 
@@ -2913,7 +2926,7 @@ function SavedSkinLibrary({
                 size="sm"
                 icon="trash"
                 disabled={deleteKey === selectedSkin.texture_key || applyKey === selectedSkin.texture_key}
-                onClick={() => void deleteSkin(selectedSkin.texture_key)}
+                onClick={() => void confirmDeleteSkin(selectedSkin)}
               >
                 Delete
               </Button>
@@ -3084,7 +3097,7 @@ function SavedSkinLibrary({
                           size="sm"
                           icon="trash"
                           disabled={deleteKey === skin.texture_key}
-                          onClick={() => void deleteSkin(skin.texture_key)}
+                          onClick={() => void confirmDeleteSkin(skin)}
                         >
                           Delete
                         </Button>
