@@ -4,7 +4,6 @@ import { useEffect, useState } from 'preact/hooks';
 import { AppFrame } from './shell/AppFrame';
 import { HomeView } from './views/home/HomeView';
 import { DialogHost } from './ui/Dialog';
-import { SetupOverlay } from './views/setup/SetupOverlay';
 import { ContextMenuHost } from './ui/ContextMenu';
 import { ToastHost } from './ui/ToastHost';
 import { commandPaletteOpen, route, showOnboardingOverlay, showSetupOverlay } from './ui-state';
@@ -13,8 +12,10 @@ import { useShortcuts } from './hooks/use-shortcuts';
 
 type DevLabViewComponent = typeof import('./views/dev-lab/DevLabView')['DevLabView'];
 type CommandPaletteComponent = typeof import('./ui/CommandPalette')['CommandPalette'];
+type SetupOverlayComponent = typeof import('./views/setup/SetupOverlay')['SetupOverlay'];
 
 let loadedCommandPalette: CommandPaletteComponent | null = null;
+let loadedSetupOverlay: SetupOverlayComponent | null = null;
 
 const InstanceDetailRoute = createRouteLoader<{ id: string }>(
   async () => (await import('./views/instance/InstanceDetailView')).InstanceDetailView,
@@ -88,6 +89,23 @@ function RouteLoadingFallback({ failed = false }: { failed?: boolean }): JSX.Ele
   );
 }
 
+function SetupLoadingFallback({ failed = false }: { failed?: boolean }): JSX.Element {
+  return (
+    <div class="cp-setup-overlay" role="status" aria-live="polite">
+      <div class="cp-setup-card">
+        <img src="logo.png" alt="" class="cp-logo" width="48" height="48" />
+        <h1 class="cp-setup-title">{failed ? 'Could not load setup' : 'Loading setup...'}</h1>
+        <p class="cp-setup-sub">
+          {failed
+            ? 'Restart the launcher and try again.'
+            : 'Preparing the library setup flow.'}
+        </p>
+        {!failed && <div class="cp-setup-progress" />}
+      </div>
+    </div>
+  );
+}
+
 function BootState(): JSX.Element | null {
   const s = bootstrapState.value;
   if (s === 'ready') return null;
@@ -152,6 +170,28 @@ function LazyCommandPalette(): JSX.Element | null {
   return CommandPaletteView ? <CommandPaletteView /> : null;
 }
 
+function LazySetupOverlay(): JSX.Element {
+  const [SetupOverlayView, setSetupOverlayView] = useState<SetupOverlayComponent | null>(loadedSetupOverlay);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    if (SetupOverlayView) return;
+    let mounted = true;
+    setFailed(false);
+    void import('./views/setup/SetupOverlay')
+      .then((module) => {
+        loadedSetupOverlay = module.SetupOverlay;
+        if (mounted) setSetupOverlayView(() => module.SetupOverlay);
+      })
+      .catch(() => {
+        if (mounted) setFailed(true);
+      });
+    return () => { mounted = false; };
+  }, [SetupOverlayView]);
+
+  return SetupOverlayView ? <SetupOverlayView /> : <SetupLoadingFallback failed={failed} />;
+}
+
 function CurrentView(): JSX.Element {
   const r = route.value;
   switch (r.name) {
@@ -171,7 +211,7 @@ export function App(): JSX.Element {
   return (
     <>
       <AppFrame><CurrentView /></AppFrame>
-      {showSetupOverlay.value && <SetupOverlay />}
+      {showSetupOverlay.value && <LazySetupOverlay />}
       {showOnboardingOverlay.value && <OnboardingOverlay />}
       <DialogHost />
       <ContextMenuHost />
