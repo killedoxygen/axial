@@ -191,7 +191,7 @@ struct AuthLogoutResponse {
     had_msa_auth: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct MsaDeviceCodeResponse {
     device_code: String,
     user_code: String,
@@ -199,6 +199,20 @@ struct MsaDeviceCodeResponse {
     expires_in: u64,
     interval: u64,
     message: Option<String>,
+}
+
+impl std::fmt::Debug for MsaDeviceCodeResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MsaDeviceCodeResponse")
+            .field("device_code", &"[redacted]")
+            .field("user_code", &self.user_code)
+            .field("verification_uri", &self.verification_uri)
+            .field("expires_in", &self.expires_in)
+            .field("interval", &self.interval)
+            .field("message", &self.message)
+            .finish()
+    }
 }
 
 #[derive(Clone, Deserialize, Eq, PartialEq)]
@@ -1633,6 +1647,28 @@ mod tests {
             AuthLoginConfig::from_env_value(Some(" public-client-id ")).client_id,
             Some("public-client-id".to_string())
         );
+    }
+
+    #[test]
+    fn msa_device_code_response_debug_redacts_device_code() {
+        let response = MsaDeviceCodeResponse {
+            device_code: "super-secret-device-code".to_string(),
+            user_code: "ABCD-EFGH".to_string(),
+            verification_uri: "https://www.microsoft.com/link".to_string(),
+            expires_in: 900,
+            interval: 5,
+            message: Some("Open the link and enter the code.".to_string()),
+        };
+
+        let formatted = format!("{response:?}");
+
+        assert!(!formatted.contains("super-secret-device-code"));
+        assert!(formatted.contains("device_code: \"[redacted]\""));
+        assert!(formatted.contains("user_code: \"ABCD-EFGH\""));
+        assert!(formatted.contains("verification_uri: \"https://www.microsoft.com/link\""));
+        assert!(formatted.contains("expires_in: 900"));
+        assert!(formatted.contains("interval: 5"));
+        assert!(formatted.contains("message: Some(\"Open the link and enter the code.\")"));
     }
 
     #[tokio::test]
