@@ -2040,6 +2040,7 @@ function SavedSkinLibrary({
     ?? skins[0]
     ?? null;
   const sortedSkins = useMemo(() => sortSavedSkins(skins, skinSort), [skins, skinSort]);
+  const selectedPreviewEditing = Boolean(selectedSkin && editKey === selectedSkin.texture_key);
   const previewPending = Boolean(
     selectedSkin
       && equippedSkin
@@ -2432,6 +2433,42 @@ function SavedSkinLibrary({
   };
 
   const uploadActive = uploadDragActive || uploadHover || uploadFocused;
+  const skinMetadataEditor = (skin: SavedSkinRecord, style: JSX.CSSProperties): JSX.Element => (
+    <div style={style}>
+      <Input
+        value={editName}
+        onChange={(value) => setEditName(value.slice(0, 64))}
+        icon="tag"
+        placeholder="Skin name"
+      />
+      <Segmented<SkinVariant>
+        options={[
+          { value: 'classic', label: 'Classic' },
+          { value: 'slim', label: 'Slim' },
+        ]}
+        value={editVariant}
+        onChange={setEditVariant}
+      />
+      <Button
+        variant="secondary"
+        size="sm"
+        icon={editBusyKey === skin.texture_key ? 'refresh' : 'check'}
+        disabled={editBusyKey === skin.texture_key || trimmedEditName.length === 0}
+        onClick={() => void saveSkinMetadata(skin.texture_key)}
+      >
+        Save
+      </Button>
+      <Button
+        variant="ghost"
+        size="sm"
+        icon="x"
+        disabled={editBusyKey === skin.texture_key}
+        onClick={cancelEdit}
+      >
+        Cancel
+      </Button>
+    </div>
+  );
 
   return (
     <Card>
@@ -2860,19 +2897,30 @@ function SavedSkinLibrary({
                   {selectedSkin.applied_at ? 'Equipped' : 'Previewing'}
                 </Pill>
                 <Pill tone="neutral" icon="tag">{savedSkinSourceLabel(selectedSkin.source)}</Pill>
-                <Pill tone="neutral">{selectedSkin.variant}</Pill>
+                {!selectedPreviewEditing && <Pill tone="neutral">{selectedSkin.variant}</Pill>}
               </div>
-              <div style={{
-                color: theme.n.text,
-                fontSize: 18,
-                fontWeight: 700,
-                lineHeight: 1.15,
-                overflow: 'hidden',
-                textOverflow: 'ellipsis',
-                whiteSpace: 'nowrap',
-              }}>
-                {selectedSkin.name}
-              </div>
+              {selectedPreviewEditing ? (
+                skinMetadataEditor(selectedSkin, {
+                  display: 'grid',
+                  gridTemplateColumns: 'minmax(180px, 360px) auto auto auto',
+                  gap: 8,
+                  alignItems: 'center',
+                  minWidth: 0,
+                  maxWidth: 720,
+                })
+              ) : (
+                <div style={{
+                  color: theme.n.text,
+                  fontSize: 18,
+                  fontWeight: 700,
+                  lineHeight: 1.15,
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                }}>
+                  {selectedSkin.name}
+                </div>
+              )}
               <div style={{
                 color: theme.n.textMute,
                 fontSize: 12,
@@ -2916,7 +2964,7 @@ function SavedSkinLibrary({
                 variant="ghost"
                 size="sm"
                 icon="edit"
-                disabled={deleteKey === selectedSkin.texture_key || applyKey === selectedSkin.texture_key}
+                disabled={selectedPreviewEditing || deleteKey === selectedSkin.texture_key || applyKey === selectedSkin.texture_key}
                 onClick={() => startEdit(selectedSkin)}
               >
                 Edit
@@ -2951,8 +2999,8 @@ function SavedSkinLibrary({
           ) : (
             sortedSkins.map((skin, index) => {
               const applied = Boolean(skin.applied_at);
-              const editing = editKey === skin.texture_key;
               const selected = selectedSkin?.texture_key === skin.texture_key;
+              const editing = editKey === skin.texture_key && !(selected && selectedPreviewEditing);
 
               return (
                 <div
@@ -2975,46 +3023,13 @@ function SavedSkinLibrary({
                     compact
                   />
                   {editing ? (
-                    <div style={{
+                    skinMetadataEditor(skin, {
                       display: 'grid',
                       gridTemplateColumns: 'minmax(180px, 1fr) auto auto auto',
                       gap: 8,
                       alignItems: 'center',
                       minWidth: 0,
-                    }}>
-                      <Input
-                        value={editName}
-                        onChange={(value) => setEditName(value.slice(0, 64))}
-                        icon="tag"
-                        placeholder="Skin name"
-                      />
-                      <Segmented<SkinVariant>
-                        options={[
-                          { value: 'classic', label: 'Classic' },
-                          { value: 'slim', label: 'Slim' },
-                        ]}
-                        value={editVariant}
-                        onChange={setEditVariant}
-                      />
-                      <Button
-                        variant="secondary"
-                        size="sm"
-                        icon={editBusyKey === skin.texture_key ? 'refresh' : 'check'}
-                        disabled={editBusyKey === skin.texture_key || trimmedEditName.length === 0}
-                        onClick={() => void saveSkinMetadata(skin.texture_key)}
-                      >
-                        Save
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        icon="x"
-                        disabled={editBusyKey === skin.texture_key}
-                        onClick={cancelEdit}
-                      >
-                        Cancel
-                      </Button>
-                    </div>
+                    })
                   ) : (
                     <>
                       <div style={{ minWidth: 0 }}>
@@ -3087,7 +3102,11 @@ function SavedSkinLibrary({
                           variant="ghost"
                           size="sm"
                           icon="edit"
-                          disabled={deleteKey === skin.texture_key || applyKey === skin.texture_key}
+                          disabled={
+                            (selected && selectedPreviewEditing)
+                            || deleteKey === skin.texture_key
+                            || applyKey === skin.texture_key
+                          }
                           onClick={() => startEdit(skin)}
                         >
                           Edit
