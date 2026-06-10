@@ -247,10 +247,6 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
                 />
               )}
             </div>
-            <IconButton icon="folder" tooltip="Open folder"
-              onClick={() => void openInstanceFolder(inst.id)} />
-            <IconButton icon="edit" tooltip="Rename"
-              onClick={() => void renameInstance(inst)} />
             <IconButton icon="dots" tooltip="More"
               onClick={(e) => openContextMenu(e, [
                 { icon: 'folder', label: 'Open folder', onSelect: () => void openInstanceFolder(inst.id) },

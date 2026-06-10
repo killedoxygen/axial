@@ -12,11 +12,12 @@ This project is a desktop Minecraft launcher, not a marketing site. Keep UI work
   - `Button`, `IconButton`, `Input`, `Pill`, `Segmented`, `Card`, `SectionHeading`, dialogs, context menus, resource/log layouts.
 - Use the Modrinth App as a product reference where a launcher workflow needs precedent, but do not copy its code, Vue components, or exact layout.
 - Depth model: elevation does hierarchy, accent does action. A deep chassis (`--bg-deep`) holds the content panel (`--bg`); cards are solid raised surfaces (`--surface`, `--shadow-raised`, no border); controls on cards sit at `--surface-2`; hover is `--surface-3`. Recessed wells (search fields, segmented tracks) use `color-mix(in oklab, var(--bg) 55%, var(--surface))`.
+- Neutrals are not gray: the whole surface stack carries a low-chroma tint of the accent hue, rebuilt at runtime by `applyCssVars()` and `buildNeutrals(dark, hue)`. Never hardcode a neutral with a hue that fights the accent.
 - Borders are reserved for genuine separators (row dividers, table heads), dashed empty states, selection states, and floating overlays. Never use a border to frame a card or a button.
 - Accent is rationed: primary action, active nav, selection. Everything else is raised neutral or ghost. Row-level Play buttons are secondary; only the featured action is primary.
 - Typography is one voice: Geist everywhere (vendored in `frontend/static/fonts/`). Monospace only for actual log output. Use tabular figures (`font-variant-numeric`) for aligned numbers, not a different font.
 - Radii are generous and friendly: `--r-xs` 8 / `--r-sm` 12 / `--r-md` 16 / `--r-lg` 20 / `--r-xl` 28. Cards use `--r-lg`, buttons and inputs `--r-sm`. Do not hardcode radii; consume the vars.
-- Home is workflow-first: continue strip plus recent rows, no greeting hero or vanity stat cards.
+- Home is workflow-first: a full-width featured banner for the last-played instance (`.cp-feature`) over a fluid cover-card library grid (`.cp-cover-grid` / `InstanceCard`), no vanity stat cards. Instances uses the same cover grid as its default view; the table is the secondary mode. Layouts must fill wide viewports with fluid `auto-fill` grids rather than capping into empty margins.
 - Keep controls familiar:
   - icons for small actions;
   - segmented controls for small mode sets;

@@ -3,7 +3,7 @@ import { useMemo } from 'preact/hooks';
 import { InstanceArt } from '../../art/InstanceArt';
 import { Button, SectionHeading, Card, Pill } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
-import { useTheme } from '../../hooks/use-theme';
+import { InstanceCard } from '../../ui/InstanceCard';
 import { navigate } from '../../ui-state';
 import { config, instances, runningSessions, versions } from '../../store';
 import { loaderKeyFromVersion, LOADER_LABELS } from '../create/defaults';
@@ -15,12 +15,6 @@ function greetingFor(date: Date): string {
   if (h < 12) return 'Good morning';
   if (h < 18) return 'Good afternoon';
   return 'Good evening';
-}
-
-function formatDayDate(d: Date): string {
-  const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-  return `${days[d.getDay()]} · ${months[d.getMonth()]} ${d.getDate()}`;
 }
 
 function relativeTime(iso?: string): string {
@@ -45,89 +39,52 @@ function versionBadge(v: Version | undefined): string {
   return v.minecraft_meta.display_hint || v.minecraft_meta.display_name || v.id;
 }
 
-function loaderLabel(v: Version | undefined): string {
-  return LOADER_LABELS[loaderKeyFromVersion(v)];
-}
-
-function ContinueStrip({ inst }: { inst: EnrichedInstance }): JSX.Element {
-  const theme = useTheme();
+function FeatureBanner({ inst }: { inst: EnrichedInstance }): JSX.Element {
   const version = versions.value.find(v => v.id === inst.version_id);
   const running = !!runningSessions.value[inst.id];
   const mods = inst.mods_count ?? 0;
-  const openInstance = (): void => navigate({ name: 'instance', id: inst.id });
+  const open = (): void => navigate({ name: 'instance', id: inst.id });
   const onKeyDown = (e: KeyboardEvent): void => {
     if (e.target !== e.currentTarget) return;
     if (e.key !== 'Enter' && e.key !== ' ') return;
     e.preventDefault();
-    openInstance();
+    open();
   };
   return (
     <div
-      class="cp-card cp-continue"
+      class="cp-feature"
       role="button"
       tabIndex={0}
       aria-label={`Open ${inst.name}`}
-      onClick={openInstance}
+      onClick={open}
       onKeyDown={onKeyDown}
     >
-      <InstanceArt instance={inst} version={version} aspect="square" radius={theme.r.md} className="cp-continue-art" />
-      <div class="cp-continue-body">
-        <div class="cp-continue-kicker">{running ? 'Now playing' : 'Jump back in'}</div>
-        <h2 title={inst.name}>{inst.name}</h2>
-        <div class="cp-meta">
-          <span>{loaderLabel(version)}</span>
-          <span class="cp-dot" />
-          <span>MC {versionBadge(version)}</span>
-          <span class="cp-dot" />
-          <span>{mods} mods</span>
-          <span class="cp-dot" />
-          <span>{relativeTime(inst.last_played_at)}</span>
+      <InstanceArt instance={inst} version={version} aspect="banner" radius={0} className="cp-feature-art" />
+      <div class="cp-feature-scrim" />
+      <div class="cp-feature-content">
+        <div class="cp-feature-id">
+          <div class="cp-feature-kicker">{running ? 'Now playing' : 'Jump back in'}</div>
+          <h2 title={inst.name}>{inst.name}</h2>
+          <div class="cp-meta">
+            <span>{LOADER_LABELS[loaderKeyFromVersion(version)]}</span>
+            <span class="cp-dot" />
+            <span>MC {versionBadge(version)}</span>
+            <span class="cp-dot" />
+            <span>{mods} mods</span>
+            <span class="cp-dot" />
+            <span>{relativeTime(inst.last_played_at)}</span>
+          </div>
         </div>
-      </div>
-      <div class="cp-continue-actions">
-        {running && <Pill tone="accent" icon="play">Playing</Pill>}
-        <Button
-          size="lg"
-          icon="play"
-          title={`Play ${inst.name}`}
-          onClick={(e) => { e.stopPropagation(); openInstance(); }}
-          sound="launchPress"
-        >Play</Button>
-      </div>
-    </div>
-  );
-}
-
-const RECENT_COLS = '44px 2.4fr 1fr 1fr 1fr 84px';
-
-function RecentRow({ inst }: { inst: EnrichedInstance }): JSX.Element {
-  const theme = useTheme();
-  const v = versions.value.find(x => x.id === inst.version_id);
-  const running = !!runningSessions.value[inst.id];
-  return (
-    <div
-      class="cp-table-row"
-      style={{ gridTemplateColumns: RECENT_COLS }}
-      onClick={() => navigate({ name: 'instance', id: inst.id })}
-    >
-      <InstanceArt instance={inst} aspect="thumb" radius={theme.r.sm} style={{ width: 32, height: 32 }} />
-      <div style={{ minWidth: 0 }}>
-        <div class="cp-table-row-title" style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-          {inst.name}
+        <div class="cp-feature-actions">
           {running && <Pill tone="accent" icon="play">Playing</Pill>}
+          <Button
+            size="lg"
+            icon="play"
+            title={`Play ${inst.name}`}
+            onClick={(e) => { e.stopPropagation(); open(); }}
+            sound="launchPress"
+          >Play</Button>
         </div>
-        <div class="cp-table-row-sub">{loaderLabel(v)}</div>
-      </div>
-      <div class="cp-table-cell">MC {versionBadge(v)}</div>
-      <div class="cp-table-cell">{inst.mods_count ?? 0} mods</div>
-      <div class="cp-table-cell">{relativeTime(inst.last_played_at)}</div>
-      <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-        <Button
-          size="sm"
-          variant="secondary"
-          icon="play"
-          onClick={(e) => { e.stopPropagation(); navigate({ name: 'instance', id: inst.id }); }}
-        >Play</Button>
       </div>
     </div>
   );
@@ -157,10 +114,8 @@ export function HomeView(): JSX.Element {
         const tb = b.last_played_at ? new Date(b.last_played_at).getTime() : 0;
         return tb - ta;
       })
-      .slice(0, 6);
+      .slice(0, 13);
   }, [all]);
-  const totalMods = all.reduce((s, i) => s + (i.mods_count ?? 0), 0);
-  const totalSaves = all.reduce((s, i) => s + (i.saves_count ?? 0), 0);
   const rest = recent.slice(1);
 
   return (
@@ -170,8 +125,8 @@ export function HomeView(): JSX.Element {
           <h1>{greetingFor(now)}{cfg?.username ? `, ${cfg.username}` : ''}.</h1>
           <div class="cp-page-sub">
             {all.length === 0
-              ? formatDayDate(now)
-              : `${formatDayDate(now)} · ${all.length} instance${all.length === 1 ? '' : 's'} · ${totalMods} mods · ${totalSaves} saves`}
+              ? 'Set up your first instance to start playing.'
+              : `${all.length} instance${all.length === 1 ? '' : 's'} in your library`}
           </div>
         </div>
         <div style={{ flex: 1 }} />
@@ -182,15 +137,15 @@ export function HomeView(): JSX.Element {
         <EmptyHome />
       ) : (
         <>
-          <ContinueStrip inst={recent[0]} />
+          <FeatureBanner inst={recent[0]} />
           {rest.length > 0 && (
             <div>
               <SectionHeading
-                title="Recent"
-                action={{ label: 'All instances', onClick: () => navigate({ name: 'instances' }) }}
+                title="Library"
+                action={{ label: 'See all', onClick: () => navigate({ name: 'instances' }) }}
               />
-              <div class="cp-card cp-table">
-                {rest.map(inst => <RecentRow key={inst.id} inst={inst} />)}
+              <div class="cp-cover-grid">
+                {rest.map(inst => <InstanceCard key={inst.id} inst={inst} />)}
               </div>
             </div>
           )}

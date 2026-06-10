@@ -3,6 +3,7 @@ import { useState } from 'preact/hooks';
 import { InstanceArt } from '../../art/InstanceArt';
 import { Button, IconButton, Input, Segmented, Pill } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
+import { InstanceCard } from '../../ui/InstanceCard';
 import { openContextMenu } from '../../ui/ContextMenu';
 import { useTheme } from '../../hooks/use-theme';
 import { instances, versions, runningSessions } from '../../store';
@@ -88,53 +89,15 @@ function ListRow({ inst }: { inst: EnrichedInstance }): JSX.Element {
   );
 }
 
-function GridCard({ inst }: { inst: EnrichedInstance }): JSX.Element {
-  const theme = useTheme();
-  const v = versions.value.find(x => x.id === inst.version_id);
-  const openInstance = (): void => navigate({ name: 'instance', id: inst.id });
-  const onCardKeyDown = (e: KeyboardEvent): void => {
-    if (e.target !== e.currentTarget) return;
-    if (e.key !== 'Enter' && e.key !== ' ') return;
-    e.preventDefault();
-    openInstance();
-  };
-  return (
-    <div
-      class="cp-card cp-playcard"
-      role="button"
-      tabIndex={0}
-      aria-label={`Open ${inst.name}`}
-      onClick={openInstance}
-      onKeyDown={onCardKeyDown}
-    >
-      <InstanceArt instance={inst} version={v} aspect="square" radius={theme.r.md} style={{ width: 68, height: 68 }} />
-      <div class="cp-playcard-body">
-        <div class="cp-playcard-title">
-          <h3>{inst.name}</h3>
-        </div>
-        <div class="cp-meta">
-          <span>{loaderLabel(v)}</span>
-          <span class="cp-dot" />
-          <span>MC {versionLabel(v)}</span>
-          <span class="cp-dot" />
-          <span>{inst.mods_count ?? 0} mods</span>
-        </div>
-      </div>
-      <Button size="sm" variant="secondary" icon="play" onClick={(e) => { e.stopPropagation(); navigate({ name: 'instance', id: inst.id }); }}>Play</Button>
-    </div>
-  );
-}
-
 export function InstancesView(): JSX.Element {
-  const theme = useTheme();
-  const [view, setView] = useState<'list' | 'grid'>('list');
+  const [view, setView] = useState<'grid' | 'list'>('grid');
   const [q, setQ] = useState('');
   const all = instances.value as EnrichedInstance[];
   const query = q.trim().toLowerCase();
   const filtered = all.filter(i => i.name.toLowerCase().includes(query));
 
   return (
-    <div class="cp-view-page" style={{ gap: 16 }}>
+    <div class="cp-view-page" style={{ gap: 18 }}>
       <div class="cp-page-header">
         <div>
           <h1>Instances</h1>
@@ -144,8 +107,8 @@ export function InstancesView(): JSX.Element {
         </div>
         <div style={{ flex: 1 }} />
         <Input value={q} onChange={setQ} placeholder="Filter instances…" icon="search" style={{ width: 260 }} />
-        <Segmented<'list' | 'grid'> value={view} onChange={setView}
-          options={[{ value: 'list', label: 'List' }, { value: 'grid', label: 'Grid' }]} />
+        <Segmented<'grid' | 'list'> value={view} onChange={setView}
+          options={[{ value: 'grid', label: 'Grid' }, { value: 'list', label: 'List' }]} />
         <Button icon="plus" onClick={() => navigate({ name: 'create' })}>New</Button>
       </div>
 
@@ -156,7 +119,17 @@ export function InstancesView(): JSX.Element {
           <p>{q ? 'Try a different search term.' : 'Create your first Minecraft instance to get started.'}</p>
           {!q && <Button icon="plus" onClick={() => navigate({ name: 'create' })}>New instance</Button>}
         </div>
-      ) : view === 'list' ? (
+      ) : view === 'grid' ? (
+        <div class="cp-cover-grid">
+          {filtered.map(i => (
+            <InstanceCard
+              key={i.id}
+              inst={i}
+              onContextMenu={(e) => openContextMenu(e, menuItemsFor(i))}
+            />
+          ))}
+        </div>
+      ) : (
         <div class="cp-card cp-table">
           <div class="cp-table-head" style={{ gridTemplateColumns: LIST_COLS }}>
             <span />
@@ -167,10 +140,6 @@ export function InstancesView(): JSX.Element {
             <span />
           </div>
           {filtered.map(i => <ListRow key={i.id} inst={i} />)}
-        </div>
-      ) : (
-        <div class="cp-grid-3">
-          {filtered.map(i => <GridCard key={i.id} inst={i} />)}
         </div>
       )}
     </div>
