@@ -68,12 +68,13 @@ function ListRow({ inst }: { inst: EnrichedInstance }): JSX.Element {
         </div>
         <div class="cp-table-row-sub">{loaderLabel(v)} · {v?.loader?.loader_version || 'vanilla'}</div>
       </div>
-      <div style={{ fontSize: 12, color: theme.n.textDim }}>{versionLabel(v)}</div>
-      <div style={{ fontSize: 12, color: theme.n.textDim }}>{inst.mods_count ?? 0} mods</div>
-      <div style={{ fontSize: 12, color: theme.n.textDim }}>{fmtRelative(inst.last_played_at)}</div>
+      <div class="cp-table-cell">{versionLabel(v)}</div>
+      <div class="cp-table-cell">{inst.mods_count ?? 0} mods</div>
+      <div class="cp-table-cell">{fmtRelative(inst.last_played_at)}</div>
       <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 4 }}>
         <Button
           size="sm"
+          variant="secondary"
           icon="play"
           onClick={(e) => { e.stopPropagation(); navigate({ name: 'instance', id: inst.id }); }}
         >Play</Button>
@@ -111,7 +112,7 @@ function GridCard({ inst }: { inst: EnrichedInstance }): JSX.Element {
         <div class="cp-playcard-title">
           <h3>{inst.name}</h3>
         </div>
-        <div class="cp-playcard-meta">
+        <div class="cp-meta">
           <span>{loaderLabel(v)}</span>
           <span class="cp-dot" />
           <span>MC {versionLabel(v)}</span>
@@ -119,7 +120,7 @@ function GridCard({ inst }: { inst: EnrichedInstance }): JSX.Element {
           <span>{inst.mods_count ?? 0} mods</span>
         </div>
       </div>
-      <Button size="sm" icon="play" onClick={(e) => { e.stopPropagation(); navigate({ name: 'instance', id: inst.id }); }}>Play</Button>
+      <Button size="sm" variant="secondary" icon="play" onClick={(e) => { e.stopPropagation(); navigate({ name: 'instance', id: inst.id }); }}>Play</Button>
     </div>
   );
 }

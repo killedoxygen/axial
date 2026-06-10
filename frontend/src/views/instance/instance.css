@@ -38,8 +38,8 @@
   inset: -20% 0 auto 0;
   height: 80%;
   background:
-    radial-gradient(60% 75% at 50% 0%, oklch(0.92 0.13 70 / 0.22), transparent 70%),
-    radial-gradient(35% 50% at 30% 10%, oklch(0.96 0.10 40 / 0.14), transparent 80%);
+    radial-gradient(60% 75% at 50% 0%, oklch(from var(--accent) 0.92 calc(c * 0.9) h / 0.20), transparent 70%),
+    radial-gradient(35% 50% at 30% 10%, oklch(from var(--accent) 0.96 calc(c * 0.7) calc(h - 30) / 0.12), transparent 80%);
   pointer-events: none;
   mix-blend-mode: screen;
 }
@@ -298,10 +298,11 @@
   white-space: nowrap;
   position: relative;
 }
-.cp-instance-tabs button:hover { background: var(--surface-2); color: var(--text); }
+.cp-instance-tabs button:hover { background: var(--surface); color: var(--text); }
 .cp-instance-tabs button[data-active="true"] {
-  background: var(--surface-2);
+  background: var(--surface);
   color: var(--text);
+  box-shadow: var(--shadow-raised);
 }
 .cp-tab-count {
   font-size: 11px;
@@ -327,10 +328,10 @@
   align-items: start;
   gap: 12px;
   padding: 12px;
-  border: 1px solid color-mix(in oklab, var(--line) 70%, transparent);
+  border: 1px solid transparent;
   border-radius: var(--r-md);
-  background: color-mix(in oklab, var(--surface-2) 86%, transparent);
-  box-shadow: inset 0 1px 0 color-mix(in oklab, var(--text) 5%, transparent);
+  background: var(--surface);
+  box-shadow: var(--shadow-raised);
 }
 .cp-launch-notice-mark,
 .cp-launch-notice-dismiss {
@@ -461,13 +462,10 @@
   justify-content: center;
   gap: 18px;
   padding: 30px;
-  border: 1px solid color-mix(in oklab, var(--line) 72%, transparent);
-  border-radius: var(--r-md);
-  background:
-    linear-gradient(180deg,
-      color-mix(in oklab, var(--surface-2) 92%, transparent),
-      color-mix(in oklab, var(--surface-1) 94%, transparent));
-  box-shadow: inset 0 1px 0 color-mix(in oklab, var(--text) 4%, transparent);
+  border: none;
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow-raised);
 }
 .cp-instance-install-lock-main {
   display: flex;
@@ -600,21 +598,17 @@
 .cp-od-slot--details { grid-area: details; }
 .cp-instance-bottom {
   position: fixed;
-  left: calc(244px + var(--cp-instance-dock-pad));
+  left: calc(68px + var(--cp-instance-dock-pad));
   right: calc(var(--cp-instance-dock-pad) + var(--cp-scrollbar-lane));
   bottom: -1px;
   width: auto;
   min-width: 0;
   z-index: 18;
   pointer-events: none;
-  border: 1px solid color-mix(in oklab, var(--line) 48%, transparent);
-  border-bottom: none;
-  border-radius: var(--r-md) var(--r-md) 0 0;
-  background: var(--surface-2);
-  box-shadow: inset 0 1px 0 oklch(1 0 0 / 0.035);
-}
-.cp-sidebar[data-compact="true"] ~ .cp-main .cp-instance-bottom {
-  left: calc(76px + var(--cp-instance-dock-pad));
+  border: none;
+  border-radius: var(--r-lg) var(--r-lg) 0 0;
+  background: var(--surface);
+  box-shadow: var(--shadow-raised);
 }
 
 @media (min-width: 1181px) {
@@ -1486,11 +1480,11 @@
   gap: 8px;
   align-items: center;
   padding: 10px 12px;
-  border: 1px solid var(--line);
-  border-bottom: none;
-  border-top-left-radius: var(--r-md);
-  border-top-right-radius: var(--r-md);
-  background: var(--surface-2);
+  border: none;
+  border-bottom: 1px solid var(--line);
+  border-top-left-radius: var(--r-lg);
+  border-top-right-radius: var(--r-lg);
+  background: var(--surface);
   flex-wrap: wrap;
 }
 .cp-mods-toolbar .cp-mods-search {
@@ -1510,11 +1504,12 @@
   font: inherit;
 }
 .cp-mods-table {
-  border: 1px solid var(--line);
-  border-bottom-left-radius: var(--r-md);
-  border-bottom-right-radius: var(--r-md);
+  border: none;
+  border-bottom-left-radius: var(--r-lg);
+  border-bottom-right-radius: var(--r-lg);
   overflow: hidden;
   background: var(--surface);
+  box-shadow: var(--shadow-raised);
 }
 .cp-mods-table-head,
 .cp-mods-table-row {
@@ -1525,7 +1520,7 @@
   align-items: center;
 }
 .cp-mods-table-head {
-  background: var(--surface-2);
+  background: color-mix(in oklab, var(--surface) 78%, var(--surface-2));
   border-bottom: 1px solid var(--line);
   font-size: 10.5px;
   font-weight: 600;
@@ -1589,9 +1584,9 @@
 }
 .cp-resource-note {
   padding: 12px 14px;
-  border: 1px solid var(--line);
+  border: none;
   border-radius: var(--r-md);
-  background: var(--surface-2);
+  background: var(--surface);
   color: var(--text-dim);
   font-size: 13px;
   margin-bottom: 12px;
@@ -1605,9 +1600,9 @@
 }
 .cp-resource-empty {
   min-height: 220px;
-  border: 1px dashed var(--line);
-  border-radius: var(--r-md);
-  background: var(--surface-2);
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--r-lg);
+  background: transparent;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -1640,10 +1635,11 @@
   line-height: 1.5;
 }
 .cp-resource-list {
-  border: 1px solid var(--line);
-  border-radius: var(--r-md);
+  border: none;
+  border-radius: var(--r-lg);
   overflow: hidden;
   background: var(--surface);
+  box-shadow: var(--shadow-raised);
 }
 .cp-resource-row {
   display: grid;
@@ -1713,9 +1709,10 @@
   gap: 12px;
 }
 .cp-screenshot-tile {
-  border: 1px solid var(--line);
+  border: none;
   border-radius: var(--r-md);
   background: var(--surface);
+  box-shadow: var(--shadow-raised);
   overflow: hidden;
 }
 .cp-screenshot-thumb {
@@ -1780,7 +1777,7 @@
   border: 1px solid oklch(1 0 0 / 0.13);
   border-radius: var(--r-md);
   background: var(--surface);
-  box-shadow: var(--shadow-lg);
+  box-shadow: var(--shadow);
   overflow: hidden;
 }
 .cp-screenshot-viewer-panel > img {
@@ -1833,10 +1830,11 @@
   display: grid;
   grid-template-columns: minmax(180px, 260px) minmax(0, 1fr);
   min-height: 420px;
-  border: 1px solid var(--line);
-  border-radius: var(--r-md);
+  border: none;
+  border-radius: var(--r-lg);
   overflow: hidden;
   background: var(--surface);
+  box-shadow: var(--shadow-raised);
 }
 .cp-logs-list {
   border-right: 1px solid var(--line);
@@ -1963,8 +1961,8 @@
 
 .cp-mini-seg {
   display: inline-flex;
-  background: var(--surface);
-  border: 1px solid var(--line);
+  background: color-mix(in oklab, var(--bg) 55%, var(--surface));
+  border: none;
   border-radius: var(--r-sm);
   padding: 2px;
   gap: 0;
@@ -2102,9 +2100,9 @@
   min-width: 0;
   min-height: 66px;
   padding: 8px 10px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--surface);
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
   color: var(--text);
   text-align: left;
   font: inherit;
@@ -2118,8 +2116,7 @@
     color 140ms ease;
 }
 .cp-settings-runtime-preset:hover {
-  background: var(--surface-2);
-  border-color: color-mix(in oklab, var(--line) 70%, var(--text-mute));
+  background: var(--surface-3);
 }
 .cp-settings-runtime-preset:focus-visible {
   outline: 2px solid var(--accent);

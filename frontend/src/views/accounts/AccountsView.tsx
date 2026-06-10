@@ -266,7 +266,7 @@ function ProfileMetaValue({ label, value }: { label: string; value: string }): J
       }}>{label}</div>
       <div style={{
         color: theme.n.textDim,
-        fontFamily: label === 'UUID' ? theme.font.mono : undefined,
+        fontFamily: label === 'UUID' ? theme.font.sans : undefined,
         fontSize: 12,
         lineHeight: 1.35,
         minWidth: 0,
@@ -1355,7 +1355,7 @@ function DeviceCodePanel({
           }}>Microsoft code</div>
           <div style={{
             color: theme.n.text,
-            fontFamily: theme.font.mono,
+            fontFamily: theme.font.sans,
             fontSize: 22,
             fontWeight: 800,
             letterSpacing: 0,
@@ -1969,7 +1969,7 @@ function SkinRestorerHelper({ savedUsername }: { savedUsername: string }): JSX.E
                   borderRadius: theme.r.md,
                   background: theme.n.surface2,
                   color: canCopy ? theme.n.text : theme.n.textMute,
-                  fontFamily: theme.font.mono,
+                  fontFamily: theme.font.sans,
                   fontSize: 12,
                   lineHeight: 1.45,
                   overflowWrap: 'anywhere',
@@ -2831,7 +2831,7 @@ function SavedSkinLibrary({
                     <div style={{
                       color: theme.n.textMute,
                       fontSize: 12,
-                      fontFamily: theme.font.mono,
+                      fontFamily: theme.font.sans,
                       overflow: 'hidden',
                       textOverflow: 'ellipsis',
                       whiteSpace: 'nowrap',
@@ -3112,7 +3112,7 @@ function SavedSkinLibrary({
               <div style={{
                 color: theme.n.textMute,
                 fontSize: 12,
-                fontFamily: theme.font.mono,
+                fontFamily: theme.font.sans,
                 overflow: 'hidden',
                 textOverflow: 'ellipsis',
                 whiteSpace: 'nowrap',
@@ -3288,7 +3288,7 @@ function SavedSkinLibrary({
                           fontSize: 11,
                           fontWeight: 500,
                           lineHeight: 1.35,
-                          fontFamily: theme.font.mono,
+                          fontFamily: theme.font.sans,
                           overflow: 'hidden',
                           textOverflow: 'ellipsis',
                           whiteSpace: 'nowrap',

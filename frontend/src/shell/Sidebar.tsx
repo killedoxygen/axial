@@ -2,59 +2,19 @@ import type { JSX } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { InstanceArt } from '../art/InstanceArt';
 import { Icon } from '../ui/Icons';
-import { Kbd } from '../ui/Atoms';
 import { PlayerHeadPreview } from '../ui/PlayerHeadPreview';
 import { route, navigate, commandPaletteOpen, type Route } from '../ui-state';
 import { runningSessions, config, instances } from '../store';
 import { promptPlayerName, savePlayerName } from '../player-name';
 import { Music, musicStateVersion } from '../music';
-import { local, localStateVersion, saveLocalState } from '../state';
+import { local, saveLocalState } from '../state';
 import { Sound } from '../sound';
 import type { Instance } from '../types';
-
-function CommandTrigger({ compact }: { compact: boolean }): JSX.Element {
-  const isMac = typeof navigator !== 'undefined' && /Mac/i.test(navigator.platform);
-  return (
-    <button
-      class="cp-sidebar-search"
-      onClick={() => { commandPaletteOpen.value = true; }}
-      title="Search and jump to"
-      data-sound-silent="true"
-      aria-label="Search and jump to"
-    >
-      <Icon name="search" size={compact ? 20 : 13} color="var(--text-mute)" />
-      <span class="cp-sidebar-search-label">Search…</span>
-      <span class="cp-sidebar-search-kbd"><Kbd>{isMac ? '⌘K' : 'Ctrl K'}</Kbd></span>
-    </button>
-  );
-}
-
-interface SidebarItem {
-  key?: string;
-  icon: string;
-  label: string;
-  route: Route;
-  instance?: Instance;
-  scrollableChildren?: boolean;
-  children?: SidebarItem[];
-}
-
-interface SidebarGroup { title: string; items: SidebarItem[]; }
 
 function isRouteActive(target: Route, current: Route): boolean {
   if (target.name !== current.name) return false;
   if ('id' in target || 'id' in current) return 'id' in target && 'id' in current && target.id === current.id;
   return true;
-}
-
-function isItemActive(item: SidebarItem, current: Route): boolean {
-  if (isRouteActive(item.route, current)) return true;
-  return item.children?.some(child => isItemActive(child, current)) ?? false;
-}
-
-function isRouteInsideItem(target: Route, current: Route): boolean {
-  if (target.name === 'instances' && current.name === 'instance') return true;
-  return false;
 }
 
 function recentTime(inst: Instance): number {
@@ -66,52 +26,54 @@ function recentTime(inst: Instance): number {
   );
 }
 
-function sidebarInstanceItems(list: Instance[]): SidebarItem[] {
-  return [...list]
-    .sort((a, b) => recentTime(b) - recentTime(a) || a.name.localeCompare(b.name))
-    .map(inst => ({
-      key: `instance:${inst.id}`,
-      icon: 'cube',
-      label: inst.name,
-      route: { name: 'instance', id: inst.id },
-      instance: inst,
-    }));
+function RailButton({ icon, label, target, accent }: {
+  icon: string;
+  label: string;
+  target: Route;
+  accent?: boolean;
+}): JSX.Element {
+  const current = route.value;
+  const active = isRouteActive(target, current)
+    || (target.name === 'instances' && current.name === 'instance');
+  return (
+    <button
+      class="cp-rail-btn"
+      data-active={active}
+      data-accent={accent}
+      onClick={() => navigate(target)}
+      title={label}
+      aria-label={label}
+    >
+      <Icon name={icon} size={20} stroke={1.7} />
+    </button>
+  );
 }
 
-function SidebarItemNode({ item, depth = 0, compact = false }: { item: SidebarItem; depth?: number; compact?: boolean }): JSX.Element {
+function RailInstances(): JSX.Element | null {
   const current = route.value;
-  const active = isRouteActive(item.route, current);
-  const childActive = !active && (
-    isRouteInsideItem(item.route, current)
-    || (item.children?.some(child => isItemActive(child, current)) ?? false)
-  );
-  const iconSize = compact ? 20 : (depth > 0 ? 15 : 17);
-
+  const list = [...instances.value]
+    .sort((a, b) => recentTime(b) - recentTime(a) || a.name.localeCompare(b.name));
+  if (list.length === 0) return null;
   return (
-    <div class="cp-sidebar-branch" data-depth={depth}>
-      <button
-        class="cp-sidebar-item"
-        data-active={active}
-        data-child-active={childActive}
-        data-depth={depth}
-        onClick={() => navigate(item.route)}
-        title={compact ? item.label : undefined}
-        aria-label={item.label}
-      >
-        {item.instance && compact ? (
-          <InstanceArt instance={item.instance} aspect="thumb" radius={11} className="cp-sidebar-instance-art" />
-        ) : (
-          <Icon name={item.icon} size={iconSize} stroke={1.7} />
-        )}
-        <span class="cp-sidebar-label">{item.label}</span>
-      </button>
-      {item.children?.length ? (
-        <div class="cp-sidebar-children" data-scrollable={item.scrollableChildren}>
-          {item.children.map(child => (
-            <SidebarItemNode key={child.key ?? child.label} item={child} depth={depth + 1} compact={compact} />
-          ))}
-        </div>
-      ) : null}
+    <div class="cp-rail-instances">
+      {list.map(inst => {
+        const active = current.name === 'instance' && current.id === inst.id;
+        const running = !!runningSessions.value[inst.id];
+        return (
+          <button
+            key={inst.id}
+            class="cp-rail-tile"
+            data-active={active}
+            data-running={running}
+            onClick={() => navigate({ name: 'instance', id: inst.id })}
+            title={inst.name}
+            aria-label={inst.name}
+          >
+            <InstanceArt instance={inst} aspect="thumb" radius={12} className="cp-rail-tile-art" />
+            {running && <span class="cp-rail-tile-dot" aria-hidden="true" />}
+          </button>
+        );
+      })}
     </div>
   );
 }
@@ -180,10 +142,9 @@ function UserMenu({ onClose }: { onClose: () => void }): JSX.Element {
   );
 }
 
-function UserTrigger({ compact }: { compact: boolean }): JSX.Element {
+function UserTrigger(): JSX.Element {
   const [open, setOpen] = useState(false);
   const username = (config.value?.username || 'Player').slice(0, 24);
-  const running = Object.keys(runningSessions.value).length;
   const rootRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -204,117 +165,44 @@ function UserTrigger({ compact }: { compact: boolean }): JSX.Element {
     <div class="cp-user-shell" ref={rootRef}>
       {open && <UserMenu onClose={() => setOpen(false)} />}
       <button
-        class="cp-sidebar-user"
+        class="cp-rail-user"
         type="button"
         data-open={open}
-        data-compact={compact}
         aria-haspopup="menu"
         aria-expanded={open}
         onClick={() => setOpen(o => !o)}
-        title={compact ? username : undefined}
+        title={username}
+        aria-label={`${username} — account menu`}
       >
-        <PlayerHeadPreview
-          username={username}
-          size={compact ? 34 : 30}
-          radius={compact ? 10 : 9}
-        />
-        <div class="cp-sidebar-user-body">
-          <div class="cp-sidebar-user-name">{username}</div>
-          <div class="cp-sidebar-user-sub">{running > 0 ? `${running} playing` : 'offline identity'}</div>
-        </div>
-        {!compact && (
-          <Icon name="chevron-up" size={14} color="var(--text-mute)" style={{
-            transform: open ? 'rotate(0deg)' : 'rotate(180deg)',
-            transition: 'transform 160ms ease',
-          }} />
-        )}
+        <PlayerHeadPreview username={username} size={34} radius={11} />
       </button>
     </div>
   );
 }
 
 export function Sidebar(): JSX.Element {
-  localStateVersion.value;
-  const compact = local.sidebarCompact;
-  const instanceItems = sidebarInstanceItems(instances.value);
-
-  const toggleSidebarMode = (): void => {
-    local.sidebarCompact = !local.sidebarCompact;
-    saveLocalState();
-  };
-
-  const mainGroups: SidebarGroup[] = [
-    {
-      title: 'Play',
-      items: [
-        { icon: 'home', label: 'Home', route: { name: 'home' } },
-        {
-          icon: 'cube',
-          label: 'Instances',
-          route: { name: 'instances' },
-          scrollableChildren: true,
-          children: [
-            { icon: 'plus', label: 'New', route: { name: 'create' } },
-            ...instanceItems,
-          ],
-        },
-      ],
-    },
-  ];
-
-  const utilityItems: SidebarItem[] = [
-    { icon: 'user', label: 'Accounts & skins', route: { name: 'accounts' } },
-    { icon: 'settings', label: 'Settings', route: { name: 'settings' } },
-  ];
-
-  const compactItems = (items: SidebarItem[]): SidebarItem[] => items.flatMap(item => {
-    if (!compact || !item.children?.length) return [item];
-    return [
-      { ...item, children: undefined },
-      ...item.children.map(child => ({ ...child, children: undefined })),
-    ];
-  });
-
   return (
-    <aside class="cp-sidebar" data-compact={compact}>
-      <div class="cp-sidebar-brand">
-        <div class="cp-sidebar-brand-lockup">
-          <img class="cp-logo" src="logo.png" alt="" width="22" height="22" />
-          <span class="cp-brand-name">Croopor</span>
-        </div>
-        <button
-          class="cp-sidebar-mode"
-          type="button"
-          onClick={toggleSidebarMode}
-          title={compact ? 'Expand sidebar' : 'Compact sidebar'}
-          aria-label={compact ? 'Expand sidebar' : 'Compact sidebar'}
-        >
-          <span class="cp-sidebar-mode-icon" aria-hidden="true">
-            <Icon name="chevron-left" size={16} stroke={1.9} />
-          </span>
-        </button>
+    <aside class="cp-rail">
+      <div class="cp-rail-brand" title="Croopor">
+        <img class="cp-logo" src="logo.png" alt="" width="26" height="26" />
       </div>
-      <CommandTrigger compact={compact} />
-      <div class="cp-sidebar-main">
-        {mainGroups.map(g => (
-          <div class="cp-sidebar-group" key={g.title}>
-            <div class="cp-sidebar-group-title">{g.title}</div>
-            <div class="cp-sidebar-items">
-              {compactItems(g.items).map(it => (
-                <SidebarItemNode key={it.key ?? it.label} item={it} compact={compact} />
-              ))}
-            </div>
-          </div>
-        ))}
-      </div>
-      <div class="cp-sidebar-spacer" />
-      <div class="cp-sidebar-group">
-        <div class="cp-sidebar-group-title">You</div>
-        <div class="cp-sidebar-items">
-          {utilityItems.map(it => <SidebarItemNode key={it.label} item={it} compact={compact} />)}
-        </div>
-      </div>
-      <UserTrigger compact={compact} />
+      <button
+        class="cp-rail-btn"
+        onClick={() => { commandPaletteOpen.value = true; }}
+        title="Search (Ctrl K)"
+        data-sound-silent="true"
+        aria-label="Search and jump to"
+      >
+        <Icon name="search" size={20} stroke={1.7} />
+      </button>
+      <RailButton icon="home" label="Home" target={{ name: 'home' }} />
+      <RailButton icon="cube" label="Instances" target={{ name: 'instances' }} />
+      <RailButton icon="plus" label="New instance" target={{ name: 'create' }} accent />
+      <div class="cp-rail-sep" aria-hidden="true" />
+      <RailInstances />
+      <div class="cp-rail-spacer" />
+      <RailButton icon="settings" label="Settings" target={{ name: 'settings' }} />
+      <UserTrigger />
     </aside>
   );
 }

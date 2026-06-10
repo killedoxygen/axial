@@ -66,33 +66,36 @@ export function buildAccent(hue: number, dark: boolean, vibrancy = 100): AccentS
   };
 }
 
+// Depth model: deep chassis < page bg < raised card (surface) < control
+// (surface-2) < hover (surface-3). Elevation jumps carry hierarchy; borders
+// are reserved for genuine separators.
 export function buildNeutrals(dark: boolean): NeutralScale {
   if (dark) {
     return {
-      bg: 'oklch(0.16 0.008 70)',
-      bgDeep: 'oklch(0.12 0.008 70)',
-      surface: 'oklch(0.20 0.008 70)',
-      surface2: 'oklch(0.24 0.008 70)',
-      surface3: 'oklch(0.28 0.008 70)',
-      line: 'oklch(1 0 0 / 0.06)',
-      lineStrong: 'oklch(1 0 0 / 0.12)',
-      text: 'oklch(0.97 0.005 70)',
-      textDim: 'oklch(0.72 0.008 70)',
-      textMute: 'oklch(0.56 0.008 70)',
+      bg: 'oklch(0.17 0.008 250)',
+      bgDeep: 'oklch(0.135 0.008 250)',
+      surface: 'oklch(0.235 0.009 250)',
+      surface2: 'oklch(0.295 0.010 250)',
+      surface3: 'oklch(0.345 0.011 250)',
+      line: 'oklch(1 0 0 / 0.07)',
+      lineStrong: 'oklch(1 0 0 / 0.14)',
+      text: 'oklch(0.96 0.004 250)',
+      textDim: 'oklch(0.74 0.008 250)',
+      textMute: 'oklch(0.58 0.010 250)',
       shadow: '0 24px 60px -20px rgba(0,0,0,0.6), 0 2px 6px rgba(0,0,0,0.3)',
     };
   }
   return {
-    bg: 'oklch(0.96 0.006 70)',
-    bgDeep: 'oklch(0.94 0.006 70)',
-    surface: 'oklch(0.99 0.004 70)',
-    surface2: 'oklch(0.97 0.006 70)',
-    surface3: 'oklch(0.93 0.008 70)',
-    line: 'oklch(0 0 0 / 0.06)',
-    lineStrong: 'oklch(0 0 0 / 0.12)',
-    text: 'oklch(0.22 0.008 70)',
-    textDim: 'oklch(0.45 0.008 70)',
-    textMute: 'oklch(0.60 0.008 70)',
+    bg: 'oklch(0.95 0.004 250)',
+    bgDeep: 'oklch(0.92 0.005 250)',
+    surface: 'oklch(0.995 0.002 250)',
+    surface2: 'oklch(0.945 0.004 250)',
+    surface3: 'oklch(0.905 0.006 250)',
+    line: 'oklch(0 0 0 / 0.07)',
+    lineStrong: 'oklch(0 0 0 / 0.14)',
+    text: 'oklch(0.21 0.008 250)',
+    textDim: 'oklch(0.45 0.008 250)',
+    textMute: 'oklch(0.58 0.008 250)',
     shadow: '0 24px 60px -20px rgba(0,0,0,0.25), 0 2px 6px rgba(0,0,0,0.08)',
   };
 }
@@ -109,9 +112,9 @@ export function buildTheme(opts: { dark?: boolean; hue?: number; vibrancy?: numb
     accent: buildAccent(hue, dark, vibrancy),
     n: buildNeutrals(dark),
     r: {
-      xs: 6 * radius,
-      sm: 10 * radius,
-      md: 14 * radius,
+      xs: 8 * radius,
+      sm: 12 * radius,
+      md: 16 * radius,
       lg: 20 * radius,
       xl: 28 * radius,
     },

@@ -874,7 +874,6 @@ export interface LocalPrefs {
   customHue: number;
   customVibrancy: number;
   lightness: number;
-  sidebarCompact: boolean;
   logHeight: number;
   collapsedGroups: Record<string, boolean>;
   sidebarFilter: string;

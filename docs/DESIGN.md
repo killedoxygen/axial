@@ -11,6 +11,12 @@ This project is a desktop Minecraft launcher, not a marketing site. Keep UI work
 - Use existing Croopor primitives before inventing new ones:
   - `Button`, `IconButton`, `Input`, `Pill`, `Segmented`, `Card`, `SectionHeading`, dialogs, context menus, resource/log layouts.
 - Use the Modrinth App as a product reference where a launcher workflow needs precedent, but do not copy its code, Vue components, or exact layout.
+- Depth model: elevation does hierarchy, accent does action. A deep chassis (`--bg-deep`) holds the content panel (`--bg`); cards are solid raised surfaces (`--surface`, `--shadow-raised`, no border); controls on cards sit at `--surface-2`; hover is `--surface-3`. Recessed wells (search fields, segmented tracks) use `color-mix(in oklab, var(--bg) 55%, var(--surface))`.
+- Borders are reserved for genuine separators (row dividers, table heads), dashed empty states, selection states, and floating overlays. Never use a border to frame a card or a button.
+- Accent is rationed: primary action, active nav, selection. Everything else is raised neutral or ghost. Row-level Play buttons are secondary; only the featured action is primary.
+- Typography is one voice: Geist everywhere (vendored in `frontend/static/fonts/`). Monospace only for actual log output. Use tabular figures (`font-variant-numeric`) for aligned numbers, not a different font.
+- Radii are generous and friendly: `--r-xs` 8 / `--r-sm` 12 / `--r-md` 16 / `--r-lg` 20 / `--r-xl` 28. Cards use `--r-lg`, buttons and inputs `--r-sm`. Do not hardcode radii; consume the vars.
+- Home is workflow-first: continue strip plus recent rows, no greeting hero or vanity stat cards.
 - Keep controls familiar:
   - icons for small actions;
   - segmented controls for small mode sets;
@@ -20,6 +26,10 @@ This project is a desktop Minecraft launcher, not a marketing site. Keep UI work
 - Do not use `cp-section-eyebrow`.
 - Do not add broad card-heavy layouts. Avoid nested cards.
 - Cards are acceptable for repeated items, existing framed tools, and current surfaces that already use them. Do not introduce cards as a default spacing device.
+
+## Shell
+- The sidebar is a fixed 68px icon rail (`.cp-rail`): brand, search, Home/Instances/New, instance art tiles, settings, player head. There is no expanded sidebar mode; labels live in tooltips and the command palette.
+- The active instance tile gets an accent ring; running instances get a status dot. Keep rail items 44px.
 
 ## Layout Rules
 - Preserve existing grid and bento alignment unless a planned visual pass explicitly changes it.

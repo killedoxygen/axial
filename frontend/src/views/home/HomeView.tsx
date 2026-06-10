@@ -49,13 +49,13 @@ function loaderLabel(v: Version | undefined): string {
   return LOADER_LABELS[loaderKeyFromVersion(v)];
 }
 
-function PlayCard({ inst }: { inst: EnrichedInstance }): JSX.Element {
+function ContinueStrip({ inst }: { inst: EnrichedInstance }): JSX.Element {
   const theme = useTheme();
   const version = versions.value.find(v => v.id === inst.version_id);
-  const running = runningSessions.value[inst.id];
+  const running = !!runningSessions.value[inst.id];
   const mods = inst.mods_count ?? 0;
   const openInstance = (): void => navigate({ name: 'instance', id: inst.id });
-  const onCardKeyDown = (e: KeyboardEvent): void => {
+  const onKeyDown = (e: KeyboardEvent): void => {
     if (e.target !== e.currentTarget) return;
     if (e.key !== 'Enter' && e.key !== ' ') return;
     e.preventDefault();
@@ -63,20 +63,18 @@ function PlayCard({ inst }: { inst: EnrichedInstance }): JSX.Element {
   };
   return (
     <div
-      class="cp-card cp-playcard cp-home-recent-card"
+      class="cp-card cp-continue"
       role="button"
       tabIndex={0}
       aria-label={`Open ${inst.name}`}
       onClick={openInstance}
-      onKeyDown={onCardKeyDown}
+      onKeyDown={onKeyDown}
     >
-      <InstanceArt instance={inst} version={version} aspect="square" radius={theme.r.md} className="cp-home-recent-art" />
-      <div class="cp-playcard-body">
-        <div class="cp-playcard-title">
-          <h3 title={inst.name}>{inst.name}</h3>
-          {running && <Pill tone="accent" icon="play">Playing</Pill>}
-        </div>
-        <div class="cp-playcard-meta">
+      <InstanceArt instance={inst} version={version} aspect="square" radius={theme.r.md} className="cp-continue-art" />
+      <div class="cp-continue-body">
+        <div class="cp-continue-kicker">{running ? 'Now playing' : 'Jump back in'}</div>
+        <h2 title={inst.name}>{inst.name}</h2>
+        <div class="cp-meta">
           <span>{loaderLabel(version)}</span>
           <span class="cp-dot" />
           <span>MC {versionBadge(version)}</span>
@@ -86,13 +84,51 @@ function PlayCard({ inst }: { inst: EnrichedInstance }): JSX.Element {
           <span>{relativeTime(inst.last_played_at)}</span>
         </div>
       </div>
-      <Button
-        size="md"
-        icon="play"
-        title={`Play ${inst.name}`}
-        onClick={(e) => { e.stopPropagation(); navigate({ name: 'instance', id: inst.id }); }}
-        sound="launchPress"
-      >Play</Button>
+      <div class="cp-continue-actions">
+        {running && <Pill tone="accent" icon="play">Playing</Pill>}
+        <Button
+          size="lg"
+          icon="play"
+          title={`Play ${inst.name}`}
+          onClick={(e) => { e.stopPropagation(); openInstance(); }}
+          sound="launchPress"
+        >Play</Button>
+      </div>
+    </div>
+  );
+}
+
+const RECENT_COLS = '44px 2.4fr 1fr 1fr 1fr 84px';
+
+function RecentRow({ inst }: { inst: EnrichedInstance }): JSX.Element {
+  const theme = useTheme();
+  const v = versions.value.find(x => x.id === inst.version_id);
+  const running = !!runningSessions.value[inst.id];
+  return (
+    <div
+      class="cp-table-row"
+      style={{ gridTemplateColumns: RECENT_COLS }}
+      onClick={() => navigate({ name: 'instance', id: inst.id })}
+    >
+      <InstanceArt instance={inst} aspect="thumb" radius={theme.r.sm} style={{ width: 32, height: 32 }} />
+      <div style={{ minWidth: 0 }}>
+        <div class="cp-table-row-title" style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          {inst.name}
+          {running && <Pill tone="accent" icon="play">Playing</Pill>}
+        </div>
+        <div class="cp-table-row-sub">{loaderLabel(v)}</div>
+      </div>
+      <div class="cp-table-cell">MC {versionBadge(v)}</div>
+      <div class="cp-table-cell">{inst.mods_count ?? 0} mods</div>
+      <div class="cp-table-cell">{relativeTime(inst.last_played_at)}</div>
+      <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+        <Button
+          size="sm"
+          variant="secondary"
+          icon="play"
+          onClick={(e) => { e.stopPropagation(); navigate({ name: 'instance', id: inst.id }); }}
+        >Play</Button>
+      </div>
     </div>
   );
 }
@@ -111,7 +147,6 @@ function EmptyHome(): JSX.Element {
 }
 
 export function HomeView(): JSX.Element {
-  const theme = useTheme();
   const cfg = config.value;
   const all = instances.value as EnrichedInstance[];
   const now = new Date();
@@ -122,64 +157,45 @@ export function HomeView(): JSX.Element {
         const tb = b.last_played_at ? new Date(b.last_played_at).getTime() : 0;
         return tb - ta;
       })
-      .slice(0, 4);
+      .slice(0, 6);
   }, [all]);
   const totalMods = all.reduce((s, i) => s + (i.mods_count ?? 0), 0);
   const totalSaves = all.reduce((s, i) => s + (i.saves_count ?? 0), 0);
+  const rest = recent.slice(1);
 
   return (
     <div class="cp-view-page">
-      <div class="cp-hero">
+      <div class="cp-page-header">
         <div>
-          <div class="cp-hero-eyebrow">{formatDayDate(now)}</div>
           <h1>{greetingFor(now)}{cfg?.username ? `, ${cfg.username}` : ''}.</h1>
-          <div class="cp-hero-sub">
+          <div class="cp-page-sub">
             {all.length === 0
-              ? 'Nothing installed yet, spin up your first instance'
-              : `${all.length} instance${all.length === 1 ? '' : 's'} · ${totalMods} mods · ${totalSaves} saves`}
+              ? formatDayDate(now)
+              : `${formatDayDate(now)} · ${all.length} instance${all.length === 1 ? '' : 's'} · ${totalMods} mods · ${totalSaves} saves`}
           </div>
         </div>
-        <div class="cp-hero-actions">
-          <Button variant="secondary" icon="plus" onClick={() => navigate({ name: 'create' })}>New instance</Button>
-          {recent[0] && (
-            <Button icon="play" onClick={() => navigate({ name: 'instance', id: recent[0].id })} sound="launchPress">
-              Resume {recent[0].name}
-            </Button>
-          )}
-        </div>
+        <div style={{ flex: 1 }} />
+        <Button variant="secondary" icon="plus" onClick={() => navigate({ name: 'create' })}>New instance</Button>
       </div>
 
       {all.length === 0 ? (
         <EmptyHome />
       ) : (
-        <div>
-          <SectionHeading
-            title="Recent instances"
-            action={{ label: 'All instances', onClick: () => navigate({ name: 'instances' }) }}
-          />
-          <div class="cp-grid-2 cp-home-recent-grid">
-            {recent.map(inst => <PlayCard key={inst.id} inst={inst} />)}
-          </div>
-        </div>
+        <>
+          <ContinueStrip inst={recent[0]} />
+          {rest.length > 0 && (
+            <div>
+              <SectionHeading
+                title="Recent"
+                action={{ label: 'All instances', onClick: () => navigate({ name: 'instances' }) }}
+              />
+              <div class="cp-card cp-table">
+                {rest.map(inst => <RecentRow key={inst.id} inst={inst} />)}
+              </div>
+            </div>
+          )}
+        </>
       )}
-
-      <div>
-        <SectionHeading title="At a glance" />
-        <div class="cp-grid-3">
-          <Card>
-            <div style={{ fontSize: 11, fontWeight: 600, color: theme.n.textMute, letterSpacing: 0, textTransform: 'uppercase' }}>Instances</div>
-            <div style={{ fontSize: 32, fontWeight: 600, marginTop: 6, letterSpacing: 0 }}>{all.length}</div>
-          </Card>
-          <Card>
-            <div style={{ fontSize: 11, fontWeight: 600, color: theme.n.textMute, letterSpacing: 0, textTransform: 'uppercase' }}>Mods installed</div>
-            <div style={{ fontSize: 32, fontWeight: 600, marginTop: 6, letterSpacing: 0 }}>{totalMods}</div>
-          </Card>
-          <Card>
-            <div style={{ fontSize: 11, fontWeight: 600, color: theme.n.textMute, letterSpacing: 0, textTransform: 'uppercase' }}>World saves</div>
-            <div style={{ fontSize: 32, fontWeight: 600, marginTop: 6, letterSpacing: 0 }}>{totalSaves}</div>
-          </Card>
-        </div>
-      </div>
     </div>
   );
 }

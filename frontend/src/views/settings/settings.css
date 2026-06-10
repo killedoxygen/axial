@@ -153,7 +153,7 @@
   width: 100%;
   min-height: 36px;
   padding: 0 10px;
-  border: 1px solid var(--line);
+  border: none;
   border-radius: var(--r-sm);
   background: var(--surface-2);
   color: var(--text);
@@ -304,9 +304,9 @@
 .cp-settings-proof-history {
   margin-top: 10px;
   padding: 12px;
-  border: 1px solid var(--line);
+  border: none;
   border-radius: var(--r-sm);
-  background: var(--surface-2);
+  background: color-mix(in oklab, var(--bg) 45%, var(--surface));
 }
 .cp-settings-proof-history-head {
   display: flex;
@@ -482,9 +482,9 @@
 .cp-settings-benchmark-matrix {
   margin-top: 10px;
   padding: 12px;
-  border: 1px solid var(--line);
+  border: none;
   border-radius: var(--r-sm);
-  background: var(--surface-2);
+  background: color-mix(in oklab, var(--bg) 45%, var(--surface));
 }
 .cp-settings-benchmark-matrix-head {
   display: flex;
@@ -547,9 +547,9 @@
 .cp-settings-qualification-preview {
   margin-top: 10px;
   padding: 12px;
-  border: 1px solid var(--line);
+  border: none;
   border-radius: var(--r-sm);
-  background: var(--surface-2);
+  background: color-mix(in oklab, var(--bg) 45%, var(--surface));
 }
 .cp-settings-qualification-head {
   display: flex;
@@ -701,9 +701,9 @@
 .cp-settings-driver-history {
   margin-top: 10px;
   padding: 12px;
-  border: 1px solid var(--line);
+  border: none;
   border-radius: var(--r-sm);
-  background: var(--surface-2);
+  background: color-mix(in oklab, var(--bg) 45%, var(--surface));
 }
 .cp-settings-driver-history-head {
   display: flex;
@@ -743,9 +743,10 @@
   width: 100%;
   min-width: 0;
   height: 32px;
-  border: 1px solid var(--line);
+  border: none;
   border-radius: var(--r-sm);
-  background: var(--surface-1);
+  background: color-mix(in oklab, var(--bg) 55%, var(--surface));
+  box-shadow: inset 0 0 0 1px var(--line);
   color: var(--text);
   font: inherit;
   font-size: 12.5px;
@@ -962,7 +963,7 @@
   width: 42px; height: 24px;
   border-radius: 999px;
   background: var(--surface-3);
-  border: 1px solid var(--line);
+  border: none;
   position: relative;
   cursor: pointer;
   transition: background 160ms, border-color 160ms;
