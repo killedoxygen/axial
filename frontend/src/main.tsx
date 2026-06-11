@@ -11,6 +11,7 @@ import { applyTheme } from './theme';
 import { Sound, bindButtonSounds } from './sound';
 import { Music } from './music';
 import { getNativeAppVersion } from './native';
+import { refreshAccountSkin } from './player-skin';
 import { scheduleAutoUpdateCheck } from './updater';
 import { toast } from './toast';
 import { errMessage } from './utils';
@@ -77,6 +78,7 @@ async function init(): Promise<void> {
     Music.applyConfig(configRes);
     bootstrapError.value = null;
     bootstrapState.value = 'ready';
+    if (!setupRequired) refreshAccountSkin();
 
     const startupWarnings = Array.isArray(statusRes?.warnings) ? statusRes.warnings : [];
     const shownStartupWarnings = new Set<string>();

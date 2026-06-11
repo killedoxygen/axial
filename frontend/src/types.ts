@@ -883,6 +883,8 @@ export interface LocalPrefs {
   collapsedGroups: Record<string, boolean>;
   sidebarFilter: string;
   sounds: boolean;
+  hideSkinNametag: boolean;
+  selectedSkin: string;
   shortcuts: Record<string, ShortcutBinding>;
   overlayPositions: Record<string, OverlayPosition>;
   lastUpdateCheckAt: string;

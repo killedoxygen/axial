@@ -17,6 +17,8 @@ export const defaults: LocalPrefs = {
   collapsedGroups: {},
   sidebarFilter: 'all',
   sounds: true,
+  hideSkinNametag: false,
+  selectedSkin: '',
   shortcuts: {},
   overlayPositions: {},
   lastUpdateCheckAt: '',
@@ -27,8 +29,11 @@ export function loadLocalState(): LocalPrefs {
   try {
     const raw: string | null = localStorage.getItem(STORAGE_KEY);
     if (!raw) return { ...defaults };
-    const { logExpanded: _ignored, ...saved } = JSON.parse(raw) as Partial<LocalPrefs & { logExpanded?: boolean }>;
-    return { ...defaults, ...saved };
+    const { logExpanded: _ignored, offlineSkin, ...saved } = JSON.parse(raw) as Partial<LocalPrefs & {
+      logExpanded?: boolean;
+      offlineSkin?: string;
+    }>;
+    return { ...defaults, ...saved, selectedSkin: saved.selectedSkin ?? offlineSkin ?? defaults.selectedSkin };
   } catch {
     return { ...defaults };
   }

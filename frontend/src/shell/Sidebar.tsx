@@ -7,6 +7,7 @@ import { PlayerHeadPreview } from '../ui/PlayerHeadPreview';
 import { route, navigate, commandPaletteOpen, type Route, openCreate } from '../ui-state';
 import { runningSessions, config, instances } from '../store';
 import { promptPlayerName, savePlayerName } from '../player-name';
+import { accountSkinSrc } from '../player-skin';
 import { Music, musicStateVersion } from '../music';
 import { local, saveLocalState } from '../state';
 import { Sound } from '../sound';
@@ -199,7 +200,7 @@ function UserTrigger({ tooltip }: { tooltip: RailTooltipController }): JSX.Eleme
         aria-label={`${username} — account menu`}
         {...railTipAttrs(username, tooltip)}
       >
-        <PlayerHeadPreview username={username} size={34} radius={11} />
+        <PlayerHeadPreview username={username} textureSrc={accountSkinSrc.value ?? undefined} size={34} radius={11} />
       </button>
     </div>
   );

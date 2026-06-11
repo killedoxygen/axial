@@ -70,15 +70,19 @@ This project is a desktop Minecraft launcher, not a marketing site. Keep UI work
 - Source picker stays a straight-line row of icon-plus-label tiles, not a card grid.
 
 ### Accounts & Skins
-- Uploaded skins are v1 scope.
-- Use the planned selected-preview plus saved-library model from `tmp/launcher-quality/PHASE3-SKINS-PLAN.md`.
-- Prefer workflow additions over page redesign:
-  - save locally;
-  - preview selected skin;
-  - apply explicitly;
-  - edit metadata;
-  - inspect layers/front/back;
-  - use context menus for secondary row actions.
+- The sticky 3D stage on the left is a recessed display case (`.cp-skinstage` uses the recessed-well mix on `--r-xl`), holding a transparent canvas over a soft dark contact shadow, with exactly one action cluster and an optional one-line caption under the model. No pills, badges, hashes, or segmented controls on the stage.
+- The model always plays a gentle ambient walk (limb swing plus bob, paused while dragging) and faces slightly toward the content column; tile snapshots face slightly back toward the stage. Do not gate the canvas idle animation on reduced motion.
+- The stage nametag is the in-game-style dark tag; when the offline identity is active it is an editable button that opens the rename prompt.
+- The right column is two headed sections (`.cp-skin-section__head`, no disclosure chrome): "Library" (count chip, dashed Add tile, current-profile tile, saved tiles), a compact "Default skins" strip (`.cp-skin-strip`) of the nine bundled Mojang defaults (`src/default-skins.ts`), and the cape picker when the active Minecraft account exposes capes.
+- Default skins never duplicate into the Library: their backend texture keys come from `/skins/normalize` lazily (`defaultSkinTextureKey`, `defaultSkinTextureKeys`), matching records are hidden from the saved grid, and the default tile itself carries selection plus the equipped/queued chip. Applying a default reuses its existing record instead of saving a copy.
+- Saved skins render as large tiles (`.cp-skin-grid`) using static 3D bust snapshots from the shared offscreen renderer (`skin-snapshot.ts`, one WebGL rig, module-level cache keyed by texture/variant/cape). Selection is an accent inset border plus tint; equipped/queued is a small corner chip; names appear only on hover/selection overlays.
+- Player heads everywhere (`PlayerHeadPreview`) render real skin textures: the unified local wardrobe selection via the `accountSkinSrc` signal (`src/player-skin.ts`), falling back to Steve. There is no generated avatar art and no separate offline/online skin-selection flow.
+- One interaction model: clicking anything (saved tile, default tile, profile tile, username search result) previews it on the stage; the stage's single primary action commits, saving into the local library first when the source is not saved yet. Tiles never trigger side effects on click.
+- Sources stay first-class and minimal: the username lookup row on top (`/skin/lookup` + `/skins/from-username`, result previews directly on the stage with Dismiss/Save/Apply), the dashed Add skin tile/drop zone, and the current-profile tile with a context menu for resets.
+- Feedback discipline: successes are transient toasts; only contextual errors render inline. When online apply is unavailable, Apply is replaced by Save plus a one-line sign-in hint instead of disabled buttons.
+- Upload and edit happen in modals (`.cp-skinedit-modal`): live 3D preview left, name/model/cape/texture fields right, Save / Save & apply footer. No inline edit panels on the page.
+- Save before apply: fetched/uploaded skins are stored locally first, then queued via the deferred apply flow with visible queued state and cancel.
+- Account switching lives in a header chip plus modal (`AccountSwitcher`): Microsoft account (device-code sign-in, refresh, sign out) and the offline identity with rename; switching writes `launch_auth_mode`.
 - NameMC skin discovery remains deferred until a stable allowed API boundary is verified.
 
 ### Settings Performance
