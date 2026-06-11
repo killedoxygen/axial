@@ -3,7 +3,7 @@ import { toast } from '../../toast';
 import { errMessage } from '../../utils';
 import { prompt, showChoice } from '../../ui/Dialog';
 import { addInstance, removeInstance, updateInstanceInList } from '../../actions';
-import type { EnrichedInstance } from '../../types';
+import type { Instance } from '../../types';
 
 // Instance-level actions shared between InstanceDetailView and InstancesView,
 // plus the folder helper used across this view's cards and panes.
@@ -18,7 +18,7 @@ export async function openInstanceFolder(id: string, sub?: string): Promise<void
   }
 }
 
-export async function renameInstance(inst: EnrichedInstance): Promise<void> {
+export async function renameInstance(inst: Instance): Promise<void> {
   const next = await prompt('New name for this instance', inst.name, { title: 'Rename instance', confirmText: 'Rename' });
   if (!next || next === inst.name) return;
   try {
@@ -31,7 +31,7 @@ export async function renameInstance(inst: EnrichedInstance): Promise<void> {
   }
 }
 
-export async function duplicateInstance(inst: EnrichedInstance): Promise<void> {
+export async function duplicateInstance(inst: Instance): Promise<void> {
   try {
     const res: any = await api('POST', `/instances/${encodeURIComponent(inst.id)}/duplicate`, {});
     if (res.error) throw new Error(res.error);
@@ -42,7 +42,7 @@ export async function duplicateInstance(inst: EnrichedInstance): Promise<void> {
   }
 }
 
-export async function deleteInstanceFlow(inst: EnrichedInstance, onDone?: () => void): Promise<void> {
+export async function deleteInstanceFlow(inst: Instance, onDone?: () => void): Promise<void> {
   const choice = await showChoice<'keep-files' | 'delete-files'>(
     `Remove "${inst.name}" from the launcher but keep files on disk, or delete the instance and its saves, mods, and config.`,
     [

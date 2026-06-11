@@ -1,6 +1,3 @@
-/* SelectField dropdown. Recessed trigger like cp-field; the popover is a
- * raised floating panel; selection uses the accent fill. */
-
 .cp-select-trigger {
   display: inline-flex;
   align-items: center;

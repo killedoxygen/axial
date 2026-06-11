@@ -1,5 +1,3 @@
-// Cross module UI state: route, overlays, command palette
-// Instance data and selection live in store.ts
 import { signal } from '@preact/signals';
 
 export type Route =
@@ -79,7 +77,6 @@ export const commandPaletteOpen = signal(false);
 export const showOnboardingOverlay = signal(false);
 export const showSetupOverlay = signal(false);
 
-// Create-instance modal: pops over the current view, no route change.
 export const createOpen = signal(false);
 
 export function openCreate(): void {

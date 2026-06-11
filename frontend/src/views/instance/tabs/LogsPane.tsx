@@ -11,6 +11,7 @@ import {
   LOG_FILTER_LABELS,
   LOG_TAIL_POLL_MS,
   fetchLogTail,
+  isCompressedLogArchive,
   isCurrentLog,
   pickInitialLog,
   sortLogs,
@@ -38,6 +39,7 @@ export function LogsPane({
   const sortedLogs = useMemo(() => sortLogs(logs), [logs]);
   const selectedEntry = sortedLogs.find((log) => log.name === selected);
   const isLive = running && isCurrentLog(selected);
+  const selectedIsCompressedArchive = isCompressedLogArchive(selected);
 
   useEffect(() => {
     if (!logs.length) {
@@ -50,7 +52,7 @@ export function LogsPane({
   }, [logs, selected]);
 
   useEffect(() => {
-    if (!selected) {
+    if (!selected || selectedIsCompressedArchive) {
       setTail({ status: 'idle' });
       return;
     }
@@ -73,7 +75,7 @@ export function LogsPane({
       alive = false;
       if (timer) window.clearInterval(timer);
     };
-  }, [inst.id, running, selected]);
+  }, [inst.id, running, selected, selectedIsCompressedArchive]);
 
   return (
     <div class="cp-instance-body cp-logs-pane">
@@ -125,9 +127,14 @@ export function LogsPane({
             )}
           </div>
           <div class="cp-logview-body">
-            {tail.status === 'loading' && <div class="cp-logview-note">Loading log…</div>}
-            {tail.status === 'error' && <div class="cp-logview-note cp-logview-note--error">{tail.error}</div>}
-            {tail.status === 'ready' && (
+            {selectedIsCompressedArchive && (
+              <div class="cp-logview-note">
+                This is a compressed log archive. Croopor cannot preview .log.gz files here; use Open folder to extract it, or select an uncompressed .log file.
+              </div>
+            )}
+            {!selectedIsCompressedArchive && tail.status === 'loading' && <div class="cp-logview-note">Loading log…</div>}
+            {!selectedIsCompressedArchive && tail.status === 'error' && <div class="cp-logview-note cp-logview-note--error">{tail.error}</div>}
+            {!selectedIsCompressedArchive && tail.status === 'ready' && (
               <>
                 {tail.data?.truncated && (
                   <div class="cp-logview-truncated">

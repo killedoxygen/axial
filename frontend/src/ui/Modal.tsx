@@ -1,9 +1,3 @@
-/* Modal primitive with the shadcn dialog API shape (Modal/ModalContent/
- * ModalHeader/ModalFooter/ModalTitle/ModalDescription/ModalClose), but
- * implemented directly in Preact instead of Radix: the Radix dialog's
- * internals do not render under preact/compat. Behavior matches the
- * upstream contract: portal rendering, scrim + Escape dismiss, focus
- * moves into the panel on open and restores on close, Tab is trapped. */
 import type { ComponentChildren, JSX } from 'preact';
 import { createContext } from 'preact';
 import { createPortal } from 'preact/compat';

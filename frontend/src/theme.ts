@@ -3,7 +3,7 @@
 // Vars mirror the :root block in style.css, components consume either
 // those CSS vars or the Theme object from tokens.ts (rebuilt on every change)
 import { signal } from '@preact/signals';
-import { local, saveLocalState, PRESET_HUES } from './state';
+import { defaults, local, saveLocalState, PRESET_HUES } from './state';
 import { api } from './api';
 import { config } from './store';
 import { Sound } from './sound';
@@ -40,7 +40,26 @@ function chromaFor(vibrancy: number): number {
   return 0.14 * Math.max(0, Math.min(100, vibrancy)) / 100;
 }
 
-function applyCssVars(hue: number, dark: boolean, vibrancy: number): void {
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function wrapHue(hue: number): number {
+  return ((hue % 360) + 360) % 360;
+}
+
+function signedHueDelta(from: number, to: number): number {
+  return ((wrapHue(to) - wrapHue(from) + 540) % 360) - 180;
+}
+
+function applyLogoCssVars(set: (k: string, v: string) => void, hue: number, vibrancy: number): void {
+  const hueDelta = signedHueDelta(140, hue);
+  const saturation = clamp(vibrancy, 35, 100) / 100;
+  const neutral = Math.abs(hueDelta) < 0.1 && saturation === 1;
+  set('--logo-filter', neutral ? 'none' : `hue-rotate(${hueDelta}deg) saturate(${saturation})`);
+}
+
+function applyCssVars(hue: number, dark: boolean, vibrancy: number, deferLogo = false): void {
   const el = document.documentElement;
   const C = chromaFor(vibrancy);
   const Cf = 0.15 * Math.max(0.6, vibrancy / 100);
@@ -82,6 +101,7 @@ function applyCssVars(hue: number, dark: boolean, vibrancy: number): void {
   set('--accent-softer',    `oklch(${L} ${C} ${hue} / 0.08)`);
   set('--accent-ring',      `oklch(${L} ${C} ${hue} / 0.40)`);
   set('--accent-line',      `oklch(${L} ${C} ${hue} / 0.28)`);
+  if (!deferLogo) applyLogoCssVars(set, hue, vibrancy);
 
   el.setAttribute('data-color-mode', dark ? 'dark' : 'light');
 }
@@ -90,10 +110,13 @@ interface ApplyOptions {
   silent?: boolean;
   vibrancy?: number;
   lightness?: number;
+  deferLogo?: boolean;
+  transient?: boolean;
 }
 
 export function applyTheme(theme: string, hue: number | null, options: ApplyOptions = {}): void {
   const { silent = false } = options;
+  const transient = options.transient === true;
 
   const previousTheme = local.theme;
   const previousHue = local.customHue;
@@ -110,13 +133,17 @@ export function applyTheme(theme: string, hue: number | null, options: ApplyOpti
   let resolvedHue: number;
   if (theme === 'custom') {
     resolvedHue = hue ?? local.customHue;
-    local.customHue = resolvedHue;
-    local.customVibrancy = vibrancy;
+    if (!transient) {
+      local.customHue = resolvedHue;
+      local.customVibrancy = vibrancy;
+    }
   } else {
     resolvedHue = PRESET_HUES[theme] ?? local.customHue;
   }
 
-  applyCssVars(resolvedHue, dark, vibrancy);
+  applyCssVars(resolvedHue, dark, vibrancy, options.deferLogo === true);
+  if (transient) return;
+
   themeSignal.value = buildTheme({ dark, hue: resolvedHue, vibrancy });
   syncNativeResizeBackground(dark);
 
@@ -152,6 +179,60 @@ export function applyTheme(theme: string, hue: number | null, options: ApplyOpti
         toast('Failed to save theme', 'error');
       });
   }
+}
+
+export function resetThemeToDefault(): void {
+  const previousTheme = local.theme;
+  const previousHue = local.customHue;
+  const previousVibrancy = local.customVibrancy;
+  const previousLightness = local.lightness;
+  const previousResolvedHue = previousTheme === 'custom'
+    ? previousHue
+    : (PRESET_HUES[previousTheme] ?? previousHue);
+
+  const nextTheme = defaults.theme;
+  const nextHue = defaults.customHue;
+  const nextVibrancy = defaults.customVibrancy;
+  const nextLightness = defaults.lightness;
+  const nextDark = nextLightness < 50;
+
+  applyCssVars(nextHue, nextDark, nextVibrancy);
+  themeSignal.value = buildTheme({ dark: nextDark, hue: nextHue, vibrancy: nextVibrancy });
+  syncNativeResizeBackground(nextDark);
+
+  local.theme = nextTheme;
+  local.customHue = nextHue;
+  local.customVibrancy = nextVibrancy;
+  local.lightness = nextLightness;
+
+  api('PUT', '/config', {
+    theme: nextTheme,
+    lightness: nextLightness,
+    custom_hue: nextHue,
+    custom_vibrancy: nextVibrancy,
+  })
+    .then((r: any) => {
+      if (r.error) throw new Error(r.error);
+      config.value = r;
+      saveLocalState();
+      Sound.ui('theme');
+    })
+    .catch(() => {
+      local.theme = previousTheme;
+      local.customHue = previousHue;
+      local.customVibrancy = previousVibrancy;
+      local.lightness = previousLightness;
+      const previousDark = previousLightness < 50;
+      applyCssVars(previousResolvedHue, previousDark, previousVibrancy);
+      themeSignal.value = buildTheme({
+        dark: previousDark,
+        hue: previousResolvedHue,
+        vibrancy: previousVibrancy,
+      });
+      syncNativeResizeBackground(previousDark);
+      saveLocalState();
+      toast('Failed to reset theme', 'error');
+    });
 }
 
 // ── Color field (hue × vibrancy picker). Pointer-driven square surface. ─────

@@ -37,6 +37,10 @@ export function isCurrentLog(name: string): boolean {
   return currentLogRank(name) < 10;
 }
 
+export function isCompressedLogArchive(name: string): boolean {
+  return name.toLowerCase().endsWith('.log.gz');
+}
+
 export function sortLogs(logs: InstanceLogEntry[]): InstanceLogEntry[] {
   const next = [...logs];
   next.sort((a, b) => {

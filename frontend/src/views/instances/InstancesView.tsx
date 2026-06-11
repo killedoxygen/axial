@@ -4,13 +4,12 @@ import { InstanceArt } from '../../art/InstanceArt';
 import { Button, IconButton, Input, Segmented, Pill } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { InstanceCard } from '../../ui/InstanceCard';
-import { openContextMenu } from '../../ui/ContextMenu';
 import { useTheme } from '../../hooks/use-theme';
 import { instances, versions, runningSessions } from '../../store';
 import { navigate, openCreate } from '../../ui-state';
 import { loaderKeyFromVersion, LOADER_LABELS } from '../create/defaults';
-import { instanceMenuItems } from '../instance/instance-menu';
-import { isVanillaVersion } from '../../utils';
+import { openInstanceContextMenu } from '../instance/instance-menu';
+import { supportsMods } from '../../utils';
 import type { EnrichedInstance, Version } from '../../types';
 
 function fmtRelative(iso?: string): string {
@@ -44,13 +43,13 @@ function ListRow({ inst }: { inst: EnrichedInstance }): JSX.Element {
   const theme = useTheme();
   const v = versions.value.find(x => x.id === inst.version_id);
   const running = !!runningSessions.value[inst.id];
-  const showModsCount = !isVanillaVersion(v);
+  const showModsCount = supportsMods(v);
   return (
     <div
       class="cp-table-row"
       style={{ gridTemplateColumns: LIST_COLS }}
       onClick={() => navigate({ name: 'instance', id: inst.id })}
-      onContextMenu={(e) => openContextMenu(e, instanceMenuItems(inst))}
+      onContextMenu={(e) => openInstanceContextMenu(e, inst)}
     >
       <InstanceArt instance={inst} aspect="thumb" radius={theme.r.sm} style={{ width: 36, height: 36 }} />
       <div>
@@ -73,7 +72,7 @@ function ListRow({ inst }: { inst: EnrichedInstance }): JSX.Element {
         <IconButton
           icon="dots"
           size={28}
-          onClick={(e: any) => { e.stopPropagation(); openContextMenu(e, instanceMenuItems(inst)); }}
+          onClick={(e: any) => { e.stopPropagation(); openInstanceContextMenu(e, inst); }}
         />
       </div>
     </div>
@@ -116,7 +115,7 @@ export function InstancesView(): JSX.Element {
             <InstanceCard
               key={i.id}
               inst={i}
-              onContextMenu={(e) => openContextMenu(e, instanceMenuItems(i))}
+              onContextMenu={(e) => openInstanceContextMenu(e, i)}
             />
           ))}
         </div>

@@ -11,11 +11,9 @@ function match(e: KeyboardEvent, key: string, ctrl = true): boolean {
   return ek === k && !!e.ctrlKey === ctrl && !e.shiftKey && !e.altKey && !e.metaKey;
 }
 
-// Global keyboard shortcuts, wired to the ui-state signals
 export function useShortcuts(): void {
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent): void => {
-      // Don't steal typing shortcuts from fields except the global ones
       const target = e.target as HTMLElement | null;
       const typing = !!target?.closest('input, textarea, [contenteditable]');
 

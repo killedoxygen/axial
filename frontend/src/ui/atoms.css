@@ -102,8 +102,6 @@
   transition: box-shadow 120ms;
   min-width: 0;
 }
-/* Focus is neutral: a stronger hairline plus a soft text-tinted halo.
- * Accent is reserved for actions and selection, not text entry. */
 .cp-field--focused {
   box-shadow:
     inset 0 0 0 1px var(--line-strong),

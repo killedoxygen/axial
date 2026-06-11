@@ -17,14 +17,14 @@ import { errMessage } from './utils';
 import { restoreRoute, showOnboardingOverlay, showSetupOverlay } from './ui-state';
 
 async function init(): Promise<void> {
-  render(<App />, document.getElementById('app')!);
-
   // Theme before anything else so the first paint is tinted correctly
   applyTheme(local.theme, local.customHue, {
     silent: true,
     vibrancy: local.customVibrancy,
     lightness: local.lightness,
   });
+
+  render(<App />, document.getElementById('app')!);
   restoreRoute();
 
   Sound.enabled = local.sounds;

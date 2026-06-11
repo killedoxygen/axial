@@ -1,8 +1,3 @@
-/* Dropdown with the shadcn select's look and contract, implemented
- * directly in Preact: Radix primitives do not render reliably under
- * preact/compat (see ui/Modal.tsx). Combobox/listbox semantics, full
- * keyboard support (arrows, Home/End, Enter/Space, Escape, typeahead),
- * outside-click dismiss, and viewport-aware popover placement. */
 import type { JSX } from 'preact';
 import { createPortal } from 'preact/compat';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';

@@ -1,6 +1,6 @@
 import type { JSX } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
-import { Button, Input, Segmented } from '../../../ui/Atoms';
+import { Button, Card, Input, Segmented } from '../../../ui/Atoms';
 import { Slider, type SliderZone } from '../../../ui/Slider';
 import { InstanceArt, artPresetForSeed, artSeedFor, nextArtSeed } from '../../../art/InstanceArt';
 import { api } from '../../../api';
@@ -57,7 +57,6 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
   const [jvmPreset, setJvmPreset] = useState<JvmPreset>(jvmPresetFrom(inst.jvm_preset));
   const [javaPath, setJavaPath] = useState<string>(inst.java_path ?? '');
   const [jvmArgs, setJvmArgs] = useState<string>(inst.extra_jvm_args ?? '');
-  const [advancedOpen, setAdvancedOpen] = useState<boolean>(Boolean(inst.java_path || inst.extra_jvm_args));
   const [saving, setSaving] = useState(false);
   const totalGB = systemInfo.value?.total_memory_mb ? Math.max(1, Math.floor(systemInfo.value.total_memory_mb / 1024)) : 32;
   const ramMax = Math.max(2, Math.min(32, totalGB));
@@ -104,7 +103,6 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
     setJvmPreset(jvmPresetFrom(inst.jvm_preset));
     setJavaPath(inst.java_path ?? '');
     setJvmArgs(inst.extra_jvm_args ?? '');
-    setAdvancedOpen(Boolean(inst.java_path || inst.extra_jvm_args));
   }, [
     inst.id,
     inst.art_seed,
@@ -153,8 +151,9 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
         </div>
       </div>
 
-      <div class="cp-iset">
-          <section id="cp-settings-policy" class="cp-iset-card">
+      <div class="cp-iset cp-iset--bento">
+        <div id="cp-settings-policy" class="cp-iset-slot cp-iset-slot--policy">
+          <Card padding={18} class="cp-iset-card">
             <div class="cp-iset-head">
               <div>
                 <h3>Performance policy</h3>
@@ -175,9 +174,11 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
                   : 'This instance follows the global Performance setting.'}
               </div>
             </div>
-          </section>
+          </Card>
+        </div>
 
-          <section id="cp-settings-memory" class="cp-iset-card cp-iset-card--wide">
+        <div id="cp-settings-memory" class="cp-iset-slot cp-iset-slot--memory">
+          <Card padding={18} class="cp-iset-card">
             <div class="cp-iset-head">
               <div>
                 <h3>Memory</h3>
@@ -219,9 +220,11 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
                 </div>
               </div>
             </div>
-          </section>
+          </Card>
+        </div>
 
-          <section id="cp-settings-runtime" class="cp-iset-card cp-iset-card--wide">
+        <div id="cp-settings-runtime" class="cp-iset-slot cp-iset-slot--runtime">
+          <Card padding={18} class="cp-iset-card">
             <div class="cp-iset-head">
               <div>
                 <h3>Runtime</h3>
@@ -246,32 +249,23 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
                   </button>
                 ))}
               </div>
-              <div class="cp-settings-advanced-toggle">
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  icon={advancedOpen ? 'chevron-up' : 'chevron-down'}
-                  onClick={() => setAdvancedOpen(open => !open)}
-                >
-                  Advanced overrides
-                </Button>
+              <div class="cp-settings-advanced-label">Advanced overrides</div>
+              <div class="cp-settings-advanced-grid">
+                <label>
+                  <span>Java path</span>
+                  <Input value={javaPath} onChange={setJavaPath} placeholder="Managed Java" />
+                </label>
+                <label>
+                  <span>Extra JVM arguments</span>
+                  <Input value={jvmArgs} onChange={setJvmArgs} placeholder="-Dfoo=bar -Xss2m" />
+                </label>
               </div>
-              {advancedOpen && (
-                <div class="cp-settings-advanced-grid">
-                  <label>
-                    <span>Java path</span>
-                    <Input value={javaPath} onChange={setJavaPath} placeholder="Managed Java" />
-                  </label>
-                  <label>
-                    <span>Extra JVM arguments</span>
-                    <Input value={jvmArgs} onChange={setJvmArgs} placeholder="-Dfoo=bar -Xss2m" />
-                  </label>
-                </div>
-              )}
             </div>
-          </section>
+          </Card>
+        </div>
 
-          <section id="cp-settings-window" class="cp-iset-card">
+        <div id="cp-settings-window" class="cp-iset-slot cp-iset-slot--window">
+          <Card padding={18} class="cp-iset-card">
             <div class="cp-iset-head">
               <div>
                 <h3>Window</h3>
@@ -311,9 +305,11 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
                 </label>
               </div>
             </div>
-          </section>
+          </Card>
+        </div>
 
-          <section id="cp-settings-identity" class="cp-iset-card">
+        <div id="cp-settings-identity" class="cp-iset-slot cp-iset-slot--identity">
+          <Card padding={18} class="cp-iset-card">
             <div class="cp-iset-head">
               <div>
                 <h3>Identity</h3>
@@ -335,7 +331,8 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
                 Regenerate
               </Button>
             </div>
-          </section>
+          </Card>
+        </div>
       </div>
     </div>
   );

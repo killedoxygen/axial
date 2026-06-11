@@ -4,12 +4,11 @@ import { InstanceArt } from '../../art/InstanceArt';
 import { Button, SectionHeading, Card, Pill } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { InstanceCard } from '../../ui/InstanceCard';
-import { openContextMenu } from '../../ui/ContextMenu';
 import { navigate, openCreate } from '../../ui-state';
 import { config, instances, runningSessions, versions } from '../../store';
 import { loaderKeyFromVersion, LOADER_LABELS } from '../create/defaults';
-import { instanceMenuItems } from '../instance/instance-menu';
-import { isVanillaVersion } from '../../utils';
+import { openInstanceContextMenu } from '../instance/instance-menu';
+import { supportsMods } from '../../utils';
 import type { EnrichedInstance, Version } from '../../types';
 
 function greetingFor(date: Date): string {
@@ -46,7 +45,7 @@ function FeatureBanner({ inst }: { inst: EnrichedInstance }): JSX.Element {
   const version = versions.value.find(v => v.id === inst.version_id);
   const running = !!runningSessions.value[inst.id];
   const mods = inst.mods_count ?? 0;
-  const showModsCount = !isVanillaVersion(version);
+  const showModsCount = supportsMods(version);
   const open = (): void => navigate({ name: 'instance', id: inst.id });
   const onKeyDown = (e: KeyboardEvent): void => {
     if (e.target !== e.currentTarget) return;
@@ -62,7 +61,7 @@ function FeatureBanner({ inst }: { inst: EnrichedInstance }): JSX.Element {
       aria-label={`Open ${inst.name}`}
       onClick={open}
       onKeyDown={onKeyDown}
-      onContextMenu={(e) => openContextMenu(e, instanceMenuItems(inst))}
+      onContextMenu={(e) => openInstanceContextMenu(e, inst)}
     >
       <InstanceArt instance={inst} version={version} aspect="banner" radius={0} className="cp-feature-art" />
       <div class="cp-feature-scrim" />
@@ -158,7 +157,7 @@ export function HomeView(): JSX.Element {
                   <InstanceCard
                     key={inst.id}
                     inst={inst}
-                    onContextMenu={(e) => openContextMenu(e, instanceMenuItems(inst))}
+                    onContextMenu={(e) => openInstanceContextMenu(e, inst)}
                   />
                 ))}
               </div>

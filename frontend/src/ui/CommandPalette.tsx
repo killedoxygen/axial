@@ -10,6 +10,7 @@ import { Sound } from '../sound';
 import { applyTheme } from '../theme';
 import { promptPlayerName, savePlayerName } from '../player-name';
 import type { EnrichedInstance } from '../types';
+import { useDraggableOverlay } from '../hooks/use-draggable-overlay';
 
 type Group = 'jump' | 'instance' | 'action';
 
@@ -137,6 +138,10 @@ export function CommandPalette(): JSX.Element | null {
   const [active, setActive] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
+  const commandCenterDrag = useDraggableOverlay<HTMLDivElement>({
+    id: 'command-center',
+    enabled: open,
+  });
 
   const commands = open ? buildCommands() : [];
 
@@ -214,10 +219,20 @@ export function CommandPalette(): JSX.Element | null {
   return (
     <div
       class="cp-cmd-overlay"
+      data-dragging={commandCenterDrag.isDragging}
       onClick={(e) => { if (e.target === e.currentTarget) commandPaletteOpen.value = false; }}
     >
-      <div class="cp-cmd" role="dialog" aria-modal="true" aria-label="Command palette">
-        <div class="cp-cmd-head">
+      <div
+        class="cp-cmd"
+        ref={commandCenterDrag.surfaceRef}
+        style={commandCenterDrag.style}
+        data-dragging={commandCenterDrag.isDragging}
+        data-positioned={commandCenterDrag.isPositioned}
+        role="dialog"
+        aria-modal="true"
+        aria-label="Command palette"
+      >
+        <div class="cp-cmd-head" {...commandCenterDrag.dragHandleProps}>
           <Icon name="search" size={15} color="var(--text-dim)" />
           <input
             class="cp-cmd-input"
@@ -227,6 +242,7 @@ export function CommandPalette(): JSX.Element | null {
             value={query}
             onInput={(e: any) => setQuery(e.currentTarget.value)}
           />
+          <span class="cp-cmd-drag-handle" aria-hidden="true" />
           <Kbd>esc</Kbd>
         </div>
         <div class="cp-cmd-list" ref={listRef}>

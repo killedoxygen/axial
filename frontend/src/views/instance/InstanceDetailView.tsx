@@ -11,7 +11,7 @@ import { isActiveInstallItem, isSameInstallItem, selectInstance } from '../../ac
 import { launchGame, killGame } from '../../launch';
 import { handleInstallClick, retryFailedInstall } from '../../install';
 import { formatInstallItemLabel } from '../../install-labels';
-import { errMessage, isVanillaVersion } from '../../utils';
+import { errMessage, supportsMods } from '../../utils';
 import { loaderKeyFromVersion, LOADER_LABELS } from '../create/defaults';
 import type { EnrichedInstance, InstallItem, Version } from '../../types';
 import { fmtJoined, fmtRelative } from './format';
@@ -27,8 +27,6 @@ import { LogsPane } from './tabs/LogsPane';
 import { SettingsPane } from './tabs/SettingsPane';
 import { InstallBarrierPane, LaunchOutcomeNotice, LaunchSplitButton } from './components/launch';
 
-// Instance-level actions live in ./instance-actions and are re-exported here so
-// InstancesView can keep importing them from this view entry point.
 export { deleteInstanceFlow, duplicateInstance, openInstanceFolder, renameInstance } from './instance-actions';
 
 type Tab = 'overview' | 'mods' | 'worlds' | 'screenshots' | 'logs' | 'settings';
@@ -139,7 +137,9 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
   }
 
   const v = versions.value.find(x => x.id === inst.version_id);
-  const showModsCount = !isVanillaVersion(v);
+  const showModsTab = supportsMods(v);
+  const activeTab: Tab = !showModsTab && tab === 'mods' ? 'overview' : tab;
+  const visibleTabs = showModsTab ? TABS : TABS.filter((t) => t.id !== 'mods');
   const mcVer = v?.minecraft_meta.display_hint || v?.minecraft_meta.display_name || 'unknown';
   const canLaunch = Boolean(v?.launchable);
   const installTarget = installTargetFor(inst, v);
@@ -182,7 +182,7 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
 
   const tabCount = (t: Tab): number | undefined => {
     if (t === 'mods') {
-      if (!showModsCount) return undefined;
+      if (!showModsTab) return undefined;
       const n = resources.data?.mods_count ?? inst.mods_count ?? 0;
       return n > 0 ? n : undefined;
     }
@@ -205,7 +205,7 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
   const launchNotice = launchNotices.value[inst.id];
 
   return (
-    <div class={`cp-instance-page${tab === 'overview' ? ' cp-instance-page--overview' : ''}`}>
+    <div class={`cp-instance-page${activeTab === 'overview' ? ' cp-instance-page--overview' : ''}`}>
       <div class="cp-instance-cover">
         <InstanceArt instance={inst} aspect="banner" className="cp-instance-cover-art" />
         <div class="cp-instance-cover-vignette" aria-hidden="true" />
@@ -265,14 +265,14 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
 
       {!installLocked && (
         <div class="cp-instance-tabs" role="tablist">
-          {TABS.map(t => {
+          {visibleTabs.map(t => {
             const count = tabCount(t.id);
             return (
               <button
                 key={t.id}
                 role="tab"
-                aria-selected={tab === t.id}
-                data-active={tab === t.id}
+                aria-selected={activeTab === t.id}
+                data-active={activeTab === t.id}
                 onClick={() => setTab(t.id)}
               >
                 <Icon name={t.icon} size={15} />
@@ -298,7 +298,7 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
           onRetryInstall={retryFailedInstall}
         />
       )}
-      {!installLocked && tab === 'overview' && (
+      {!installLocked && activeTab === 'overview' && (
         <>
           <OverviewPane
             inst={inst}
@@ -315,11 +315,11 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
           </div>
         </>
       )}
-      {!installLocked && tab === 'mods' && <ModsPane inst={inst} resources={resources} onRefresh={reloadResources} />}
-      {!installLocked && tab === 'worlds' && <WorldsPane inst={inst} resources={resources} onRefresh={reloadResources} />}
-      {!installLocked && tab === 'screenshots' && <ScreenshotsPane inst={inst} resources={resources} onRefresh={reloadResources} />}
-      {!installLocked && tab === 'logs' && <LogsPane inst={inst} resources={resources} running={running} onRefresh={reloadResources} />}
-      {!installLocked && tab === 'settings' && <SettingsPane inst={inst} />}
+      {!installLocked && activeTab === 'mods' && <ModsPane inst={inst} resources={resources} onRefresh={reloadResources} />}
+      {!installLocked && activeTab === 'worlds' && <WorldsPane inst={inst} resources={resources} onRefresh={reloadResources} />}
+      {!installLocked && activeTab === 'screenshots' && <ScreenshotsPane inst={inst} resources={resources} onRefresh={reloadResources} />}
+      {!installLocked && activeTab === 'logs' && <LogsPane inst={inst} resources={resources} running={running} onRefresh={reloadResources} />}
+      {!installLocked && activeTab === 'settings' && <SettingsPane inst={inst} />}
     </div>
   );
 }

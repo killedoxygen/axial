@@ -1,7 +1,3 @@
-// Design tokens
-// Accent engine derives a full scale from a single hue so user-chosen
-// accents can't break contrast
-// Mirrors the :root CSS variables in style.css, components can consume either
 
 export interface AccentScale {
   base: string;
@@ -66,11 +62,6 @@ export function buildAccent(hue: number, dark: boolean, vibrancy = 100): AccentS
   };
 }
 
-// Depth model: deep chassis < page bg < raised card (surface) < control
-// (surface-2) < hover (surface-3). Elevation jumps carry hierarchy; borders
-// are reserved for genuine separators.
-// Neutrals carry a low-chroma tint of the accent hue so the chassis
-// harmonizes with whatever accent the user picks.
 export function buildNeutrals(dark: boolean, hue = 140): NeutralScale {
   if (dark) {
     return {
@@ -132,7 +123,6 @@ export function buildTheme(opts: { dark?: boolean; hue?: number; vibrancy?: numb
   };
 }
 
-// Deterministic hash used by Thumb and gradient helpers
 export function hashStr(s: string): number {
   let h = 2166136261;
   for (let i = 0; i < s.length; i++) {

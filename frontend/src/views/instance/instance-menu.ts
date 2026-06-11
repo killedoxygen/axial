@@ -1,9 +1,9 @@
-import type { ContextMenuItem } from '../../ui/ContextMenu';
+import { openContextMenu, type ContextMenuItem } from '../../ui/ContextMenu';
 import { navigate } from '../../ui-state';
-import type { EnrichedInstance } from '../../types';
+import type { Instance } from '../../types';
 import { deleteInstanceFlow, duplicateInstance, openInstanceFolder, renameInstance } from './instance-actions';
 
-export function instanceMenuItems(inst: EnrichedInstance): ContextMenuItem[] {
+export function instanceMenuItems(inst: Instance): ContextMenuItem[] {
   return [
     { icon: 'play', label: 'Open detail', onSelect: () => navigate({ name: 'instance', id: inst.id }) },
     { icon: 'folder', label: 'Open folder', onSelect: () => void openInstanceFolder(inst.id) },
@@ -12,4 +12,8 @@ export function instanceMenuItems(inst: EnrichedInstance): ContextMenuItem[] {
     { label: '', onSelect: () => {}, divider: true },
     { icon: 'trash', label: 'Delete', onSelect: () => void deleteInstanceFlow(inst), danger: true },
   ];
+}
+
+export function openInstanceContextMenu(e: MouseEvent, inst: Instance): void {
+  openContextMenu(e, instanceMenuItems(inst));
 }

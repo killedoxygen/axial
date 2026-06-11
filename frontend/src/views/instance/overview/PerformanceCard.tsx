@@ -41,10 +41,10 @@ function effectivePerformanceMode(inst: EnrichedInstance): { mode: PerformanceMo
 }
 
 function compositionTierLabel(tier: CompositionTier | ''): string {
-  if (tier === 'extended') return 'Extended';
-  if (tier === 'core') return 'Core';
-  if (tier === 'vanilla_enhanced') return 'Vanilla enhanced';
-  return 'Managed';
+  if (tier === 'extended') return 'Full mod bundle';
+  if (tier === 'core') return 'Core mod bundle';
+  if (tier === 'vanilla_enhanced') return 'Launcher tuning';
+  return 'Performance bundle';
 }
 
 function healthLabel(health: PerformanceHealthStatus | undefined): string {
@@ -61,6 +61,24 @@ function healthTone(health: PerformanceHealthStatus | undefined): 'ok' | 'warn' 
   if (health === 'degraded' || health === 'fallback' || health === 'disabled') return 'warn';
   if (health === 'invalid') return 'err';
   return 'mute';
+}
+
+function userPerformanceNotice(raw: string, fallback: boolean): string {
+  if (!raw) return '';
+  if (raw.includes('temporarily unavailable')) return raw;
+  if (raw.includes('not compatible with this instance')) return raw;
+  if (raw.includes('skipped by emergency disable')) {
+    return fallback
+      ? 'A performance bundle is temporarily unavailable, so Croopor chose the safest available option.'
+      : 'One performance mod is temporarily unavailable, so Croopor left it out.';
+  }
+  if (raw.includes('not enough compatible performance mods')) {
+    return 'A faster performance bundle is not compatible with this instance, so Croopor chose a safer option.';
+  }
+  if (raw.includes('no NVIDIA Turing+ GPU detected')) {
+    return 'Nvidium was left out because this device does not have a supported NVIDIA GPU.';
+  }
+  return raw.replace('managed mod', 'installed mod');
 }
 
 function planLoader(v: Version | undefined, inst: EnrichedInstance): string {
@@ -126,23 +144,32 @@ function performanceSummary(
 
   const tier = compositionTierLabel(plan.tier);
   const modCount = plan.mods?.length ?? 0;
-  const composition = plan.composition_id ? `Composition ${plan.composition_id}` : 'No managed composition selected';
   const healthText = health ? `bundle ${healthLabel(health.health)}` : 'health not checked';
-  const warning = health?.warnings?.[0] || plan.warnings?.[0] || plan.fallback_reason || '';
+  const fallback = Boolean(plan.fallback_reason) || health?.health === 'fallback';
+  const warning = userPerformanceNotice(plan.fallback_reason || health?.warnings?.[0] || plan.warnings?.[0] || '', fallback);
+  const launcherTuning = plan.tier === 'vanilla_enhanced' || modCount === 0;
 
   if (health?.health === 'fallback') {
-    const fallbackTier = health.tier ? compositionTierLabel(health.tier) : 'Managed';
+    const fallbackTier = health.tier ? compositionTierLabel(health.tier) : compositionTierLabel('');
     return {
       tone: healthTone(health.health),
-      title: `${fallbackTier} fallback`,
-      detail: warning || `Croopor safely lowered the requested ${tier} plan.`,
+      title: fallbackTier === 'Launcher tuning' ? 'Using launcher tuning' : 'Using fallback bundle',
+      detail: warning || `Croopor chose ${fallbackTier.toLowerCase()} because the preferred bundle could not be applied.`,
+    };
+  }
+
+  if (launcherTuning) {
+    return {
+      tone: healthTone(health?.health),
+      title: 'Launcher tuning',
+      detail: warning || 'Croopor will tune Java and memory for this version; no performance mod bundle is available.',
     };
   }
 
   return {
     tone: healthTone(health?.health),
-    title: `${tier} plan`,
-    detail: warning || `${composition}, ${modCount} managed mod${modCount === 1 ? '' : 's'}, ${healthText}.`,
+    title: tier,
+    detail: warning || `${modCount} performance mod${modCount === 1 ? '' : 's'} selected; ${healthText}.`,
   };
 }
 

@@ -554,11 +554,7 @@ function CreateCard(): JSX.Element {
                   {mcVersionId
                     ? <Pill>MC {mcVersionId}</Pill>
                     : <Pill>No version yet</Pill>}
-                  {versionReady && (
-                    <Pill tone={effectiveAlreadyInstalled ? 'ok' : 'neutral'}>
-                      {effectiveAlreadyInstalled ? 'Installed' : 'Downloads on create'}
-                    </Pill>
-                  )}
+                 
                 </div>
               </div>
             </div>

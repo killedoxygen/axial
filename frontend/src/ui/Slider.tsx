@@ -44,8 +44,6 @@ function snapToStep(value: number, min: number, max: number, step: number): numb
   return Number(clamp(snapped, min, max).toFixed(decimals));
 }
 
-// Slider wraps a hidden native range input so keyboard and a11y come for free
-// Track, fill, recommendation zones, and thumb are painted on top
 export function Slider({
   value,
   min = 0,

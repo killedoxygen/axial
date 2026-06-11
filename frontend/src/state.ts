@@ -18,6 +18,7 @@ export const defaults: LocalPrefs = {
   sidebarFilter: 'all',
   sounds: true,
   shortcuts: {},
+  overlayPositions: {},
   lastUpdateCheckAt: '',
   dismissedUpdateVersion: '',
 };

@@ -137,6 +137,48 @@
 
 .cp-rail-spacer { flex: 1; min-height: 8px; }
 
+.cp-rail-tip {
+  position: absolute;
+  left: 58px;
+  top: var(--cp-rail-tip-top, 0);
+  z-index: 70;
+  max-width: min(260px, calc(100vw - 88px));
+  min-height: 30px;
+  padding: 6px 11px;
+  border-radius: var(--r-sm);
+  background: color-mix(in oklab, var(--surface) 94%, var(--bg));
+  color: var(--text);
+  box-shadow:
+    inset 0 1px 0 color-mix(in oklab, var(--surface-3) 58%, transparent),
+    var(--shadow);
+  pointer-events: none;
+  transform: translateY(-50%);
+  animation: cp-rail-tip-in 120ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.cp-rail-tip::before {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: -5px;
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  background: inherit;
+  transform: translateY(-50%) rotate(45deg);
+}
+.cp-rail-tip > span {
+  position: relative;
+  z-index: 1;
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12.5px;
+  line-height: 18px;
+  font-weight: 750;
+}
+
 .cp-user-shell {
   position: relative;
   z-index: 1;
@@ -234,13 +276,18 @@
   from { opacity: 0; transform: translateY(6px) scale(0.97); }
   to   { opacity: 1; transform: translateY(0) scale(1); }
 }
+@keyframes cp-rail-tip-in {
+  from { opacity: 0; transform: translate(-4px, -50%) scale(0.98); }
+  to   { opacity: 1; transform: translate(0, -50%) scale(1); }
+}
 
 @media (prefers-reduced-motion: reduce) {
   .cp-rail-tile,
   .cp-rail-tile-art,
+  .cp-rail-tip,
   .cp-userm,
-  .cp-status-pill .cp-status-dot,
-  .cp-status-pill--installing::after,
+  .cp-status-pill .cp-status-mark,
+  .cp-status-pill--installing::before,
   .cp-music-eq > span {
     animation: none !important;
     animation-duration: 0s !important;
@@ -278,102 +325,100 @@
 
 .cp-status-pill {
   --cp-status-color: var(--text-mute);
-  --cp-status-bg: transparent;
-  --cp-status-border: transparent;
-  --cp-status-dot-fill: color-mix(in oklab, var(--text-mute) 78%, var(--surface));
-  --cp-status-dot-ring: color-mix(in oklab, var(--text-mute) 24%, transparent);
+  --cp-status-bg: color-mix(in oklab, var(--surface) 92%, var(--bg));
+  --cp-status-raise: color-mix(in oklab, var(--surface-3) 62%, transparent);
+  --cp-status-accent: color-mix(in oklab, var(--text-mute) 82%, var(--surface));
+  --cp-status-accent-soft: color-mix(in oklab, var(--text-mute) 14%, transparent);
   flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
-  gap: 7px;
+  gap: 8px;
   position: relative;
   isolation: isolate;
-  min-width: 76px;
-  max-width: min(230px, 28vw);
-  height: 28px;
-  padding: 0 12px 0 10px;
+  min-width: 70px;
+  max-width: min(300px, 32vw);
+  height: 30px;
+  padding: 0 13px 0 9px;
   border-radius: 999px;
-  border: 1px solid var(--cp-status-border);
+  border: 0;
   background: var(--cp-status-bg);
   color: var(--cp-status-color);
   font-family: inherit;
   font-size: 13px;
-  font-weight: 500;
+  font-weight: 650;
   cursor: default;
   overflow: hidden;
+  box-shadow:
+    inset 0 1px 0 var(--cp-status-raise),
+    0 5px 13px color-mix(in oklab, var(--bg-deep) 20%, transparent);
 }
 .cp-status-pill > * {
   position: relative;
   z-index: 1;
 }
 .cp-status-pill--running {
-  --cp-status-color: color-mix(in oklab, var(--accent) 68%, var(--text-dim));
-  --cp-status-bg: color-mix(in oklab, var(--surface) 90%, var(--accent));
-  --cp-status-border: color-mix(in oklab, var(--line) 78%, var(--accent));
-  --cp-status-dot-fill: color-mix(in oklab, var(--accent) 44%, var(--text-dim));
-  --cp-status-dot-ring: color-mix(in oklab, var(--accent) 12%, transparent);
+  --cp-status-color: color-mix(in oklab, var(--accent) 72%, var(--text));
+  --cp-status-bg: color-mix(in oklab, var(--surface) 88%, var(--accent));
+  --cp-status-accent: color-mix(in oklab, var(--accent) 64%, var(--text));
+  --cp-status-accent-soft: color-mix(in oklab, var(--accent) 18%, transparent);
   cursor: pointer;
 }
 .cp-status-pill--installing {
   --cp-install-ratio: 0;
   --cp-install-color: oklch(from var(--accent) l calc(c * 0.58) calc(h + 210));
-  --cp-status-color: color-mix(in oklab, var(--cp-install-color) 70%, var(--text-dim));
+  --cp-status-color: color-mix(in oklab, var(--cp-install-color) 74%, var(--text));
   --cp-status-bg: color-mix(in oklab, var(--surface) 92%, var(--cp-install-color));
-  --cp-status-border: color-mix(in oklab, var(--line) 80%, var(--cp-install-color));
-  --cp-status-dot-fill: color-mix(in oklab, var(--cp-install-color) 40%, var(--text-dim));
-  --cp-status-dot-ring: color-mix(in oklab, var(--cp-install-color) 12%, transparent);
-  --cp-install-fill: color-mix(in oklab, var(--cp-install-color) 15%, transparent);
-  --cp-install-shine: color-mix(in oklab, var(--cp-install-color) 24%, transparent);
+  --cp-status-accent: color-mix(in oklab, var(--cp-install-color) 66%, var(--text));
+  --cp-status-accent-soft: color-mix(in oklab, var(--cp-install-color) 16%, transparent);
   cursor: pointer;
 }
-.cp-status-pill--installing::after {
+.cp-status-pill--installing::before {
   content: "";
   position: absolute;
-  z-index: 0;
   inset: 0;
-  border-radius: inherit;
-  background:
-    linear-gradient(105deg, transparent 0 38%, var(--cp-install-shine) 48%, transparent 58%),
-    var(--cp-install-fill);
-  background-position: 140% 0, 0 0;
-  background-size: 180% 100%, auto;
-  transform: scaleX(var(--cp-install-ratio));
-  transform-origin: left center;
-  animation: cp-install-shimmer 1800ms ease-in-out infinite;
-  transition: transform 180ms cubic-bezier(0.22, 1, 0.36, 1);
+  right: calc((1 - var(--cp-install-ratio)) * 100%);
+  z-index: 0;
+  background: linear-gradient(
+    90deg,
+    color-mix(in oklab, var(--cp-install-color) 8%, transparent),
+    color-mix(in oklab, var(--cp-install-color) 20%, transparent)
+  );
+  box-shadow: inset -1px 0 0 color-mix(in oklab, var(--cp-install-color) 32%, transparent);
+  transition: right 280ms cubic-bezier(0.22, 1, 0.36, 1);
   pointer-events: none;
 }
 .cp-status-pill--preparing {
-  --cp-status-color: color-mix(in oklab, var(--accent) 42%, var(--text-dim));
-  --cp-status-bg: color-mix(in oklab, var(--surface) 88%, var(--accent));
-  --cp-status-border: color-mix(in oklab, var(--line) 74%, var(--accent));
-  --cp-status-dot-fill: color-mix(in oklab, var(--accent) 42%, var(--text-dim));
-  --cp-status-dot-ring: color-mix(in oklab, var(--accent) 18%, transparent);
+  --cp-status-color: color-mix(in oklab, var(--accent) 56%, var(--text));
+  --cp-status-bg: color-mix(in oklab, var(--surface) 90%, var(--accent));
+  --cp-status-accent: color-mix(in oklab, var(--accent) 58%, var(--text));
+  --cp-status-accent-soft: color-mix(in oklab, var(--accent) 16%, transparent);
 }
 .cp-status-pill--queued {
   --cp-install-color: oklch(from var(--accent) l calc(c * 0.58) calc(h + 210));
-  --cp-status-color: color-mix(in oklab, var(--cp-install-color) 58%, var(--text-dim));
-  --cp-status-bg: color-mix(in oklab, var(--surface) 95%, var(--cp-install-color));
-  --cp-status-border: color-mix(in oklab, var(--line) 84%, var(--cp-install-color));
-  --cp-status-dot-fill: color-mix(in oklab, var(--cp-install-color) 34%, var(--text-dim));
-  --cp-status-dot-ring: color-mix(in oklab, var(--cp-install-color) 10%, transparent);
+  --cp-status-color: color-mix(in oklab, var(--cp-install-color) 62%, var(--text));
+  --cp-status-bg: color-mix(in oklab, var(--surface) 94%, var(--cp-install-color));
+  --cp-status-accent: color-mix(in oklab, var(--cp-install-color) 54%, var(--text));
+  --cp-status-accent-soft: color-mix(in oklab, var(--cp-install-color) 12%, transparent);
   cursor: pointer;
 }
 .cp-status-pill--failed {
-  --cp-status-color: color-mix(in oklab, var(--err) 74%, var(--text-dim));
-  --cp-status-bg: color-mix(in oklab, var(--surface) 91%, var(--err));
-  --cp-status-border: color-mix(in oklab, var(--line) 76%, var(--err));
-  --cp-status-dot-fill: color-mix(in oklab, var(--err) 58%, var(--text-dim));
-  --cp-status-dot-ring: color-mix(in oklab, var(--err) 22%, transparent);
+  --cp-status-color: color-mix(in oklab, var(--err) 78%, var(--text));
+  --cp-status-bg: color-mix(in oklab, var(--surface) 90%, var(--err));
+  --cp-status-accent: color-mix(in oklab, var(--err) 72%, var(--text));
+  --cp-status-accent-soft: color-mix(in oklab, var(--err) 20%, transparent);
   cursor: pointer;
 }
-.cp-status-dot {
+.cp-status-mark {
   flex: 0 0 auto;
-  width: 7px;
-  height: 7px;
-  border-radius: 999px;
-  background: var(--cp-status-dot-fill);
-  box-shadow: 0 0 0 1px var(--cp-status-dot-ring);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 15px;
+  height: 15px;
+  color: var(--cp-status-accent);
+}
+.cp-status-mark svg {
+  display: block;
 }
 .cp-status-pill-label {
   min-width: 0;
@@ -382,31 +427,58 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-
-@keyframes cp-install-shimmer {
-  from { background-position: 140% 0, 0 0; }
-  to { background-position: -80% 0, 0 0; }
+.cp-status-pill-pct {
+  flex: 0 0 auto;
+  font-size: 12px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--cp-status-accent);
+}
+.cp-status-pill-eta {
+  flex: 0 0 auto;
+  font-size: 11.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: color-mix(in oklab, var(--cp-status-color) 68%, transparent);
+}
+.cp-status-pill-chip {
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  font-weight: 700;
+  line-height: 1;
+  padding: 3px 6px;
+  border-radius: 999px;
+  background: var(--cp-status-accent-soft);
+  color: var(--cp-status-accent);
 }
 
 .cp-music-widget {
+  --cp-music-color: var(--text-mute);
+  --cp-music-bg: color-mix(in oklab, var(--surface) 92%, var(--bg));
+  --cp-music-raise: color-mix(in oklab, var(--surface-3) 62%, transparent);
   flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
   gap: 2px;
   padding: 2px;
+  height: 30px;
   border-radius: 999px;
-  background: var(--surface);
+  background: var(--cp-music-bg);
   border: none;
-  transition: background 160ms;
+  box-shadow:
+    inset 0 1px 0 var(--cp-music-raise),
+    0 5px 13px color-mix(in oklab, var(--bg-deep) 20%, transparent);
+  transition: background 160ms, color 160ms;
 }
 .cp-music-widget--on {
-  background: var(--accent-softer);
+  --cp-music-color: color-mix(in oklab, var(--accent) 72%, var(--text));
+  --cp-music-bg: color-mix(in oklab, var(--surface) 88%, var(--accent));
 }
 .cp-music-btn {
   width: 26px; height: 26px;
   border: none;
   background: transparent;
-  color: var(--text-mute);
+  color: var(--cp-music-color);
   border-radius: 999px;
   cursor: pointer;
   display: inline-flex;
@@ -414,11 +486,11 @@
   justify-content: center;
   transition: color 140ms, background 140ms;
 }
-.cp-music-btn[data-active="true"] { color: var(--accent); }
-.cp-music-btn:hover { background: var(--surface-2); color: var(--text); }
-.cp-music-widget--on .cp-music-btn:hover { background: var(--accent-soft); color: var(--accent); }
-.cp-music-btn--skip { color: var(--text-mute); }
-.cp-music-widget--on .cp-music-btn--skip { color: var(--accent); opacity: 0.75; }
+.cp-music-btn:hover {
+  background: color-mix(in oklab, var(--cp-music-color) 10%, transparent);
+  color: color-mix(in oklab, var(--cp-music-color) 72%, var(--text));
+}
+.cp-music-btn--skip { color: var(--cp-music-color); opacity: 0.68; }
 .cp-music-widget--on .cp-music-btn--skip:hover { opacity: 1; }
 
 .cp-music-eq {
@@ -472,4 +544,80 @@
   background-repeat: repeat;
   background-size: 140px 140px;
   border-top-left-radius: var(--r-lg);
+}
+
+.cp-boot {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-deep);
+  color: var(--text);
+  opacity: 1;
+  transition: opacity 320ms ease;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.cp-boot[data-leaving] {
+  opacity: 0;
+  pointer-events: none;
+}
+.cp-boot-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 18px;
+  width: min(360px, 80vw);
+  animation: cp-boot-enter 480ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.cp-boot-logo {
+  display: block;
+}
+.cp-boot-bar {
+  width: min(260px, 100%);
+  height: 4px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+.cp-boot-bar-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 220ms ease-out;
+}
+.cp-boot-label {
+  font-size: 13px;
+  color: var(--text-dim);
+}
+.cp-boot-error-title {
+  font-size: 15px;
+  font-weight: 600;
+}
+.cp-boot-error-msg {
+  font-size: 13px;
+  color: var(--text-dim);
+  text-align: center;
+  line-height: 1.5;
+  max-width: 360px;
+}
+@keyframes cp-boot-enter {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .cp-boot,
+  .cp-boot-stack,
+  .cp-boot-bar-fill {
+    animation: none;
+    transition: none;
+  }
 }

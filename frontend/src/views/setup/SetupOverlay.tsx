@@ -2,6 +2,7 @@ import type { JSX } from 'preact';
 import { batch } from '@preact/signals';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { Button, Input } from '../../ui/Atoms';
+import { Logo } from '../../ui/Logo';
 import { api } from '../../api';
 import { browseDirectory } from '../../native';
 import { errMessage } from '../../utils';
@@ -104,7 +105,7 @@ export function SetupOverlay(): JSX.Element {
   return (
     <div class="cp-setup-overlay">
       <div class="cp-setup-card">
-        <img src="logo.png" alt="" class="cp-logo" width="48" height="48" />
+        <Logo className="cp-logo" size={48} />
         <h1 class="cp-setup-title">Set up your library</h1>
         <p class="cp-setup-sub">
           Croopor needs a folder for instances, installed versions, and assets. It can manage one

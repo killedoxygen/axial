@@ -1,6 +1,3 @@
-/* Modal primitive: scrim + centered panel. Panels bring their own
- * surface styling; this file owns positioning and dismissal affordance. */
-
 .cp-modal-overlay {
   position: fixed;
   inset: 0;
@@ -11,9 +8,6 @@
   animation: cp-fade-in 160ms ease both;
 }
 
-/* Centering uses inset + auto margins, NOT transform: panel classes
- * (e.g. cp-cr-card) bring their own entrance animations that overwrite
- * transform, which must never break positioning. */
 .cp-modal-panel {
   position: fixed;
   inset: 0;
@@ -32,8 +26,6 @@
   to   { opacity: 1; }
 }
 
-/* Default close button (ModalContent showCloseButton). Panels that carry
- * their own close affordance pass showCloseButton={false}. */
 .cp-modal-x {
   position: absolute;
   top: 14px;
@@ -56,7 +48,6 @@
   box-shadow: 0 0 0 3px var(--accent-ring);
 }
 
-/* Structural slots for composed modals. */
 .cp-modal-head {
   display: flex;
   flex-direction: column;

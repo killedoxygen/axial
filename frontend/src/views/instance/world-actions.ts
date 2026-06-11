@@ -1,4 +1,3 @@
-// World row actions shared by the Worlds tab and the overview Worlds card.
 import { prompt, showChoice } from '../../ui/Dialog';
 import type { ContextMenuItem } from '../../ui/ContextMenu';
 import { api } from '../../api';

@@ -14,9 +14,6 @@ import type {
 
 import type { LogSeverity } from './store';
 
-// Class-name joiner for the shadcn-ported primitives (no Tailwind, so a
-// plain filter-join replaces clsx + tailwind-merge). Accepts unknown so
-// preact's Signalish className prop types pass through; non-strings drop.
 export function cn(...inputs: unknown[]): string {
   return inputs.filter((v): v is string => typeof v === 'string' && v.length > 0).join(' ');
 }
@@ -91,8 +88,8 @@ export function isOldAlphaVersion(version: Pick<Version, 'lifecycle'> | Pick<Cat
   return hasLifecycleLabel(version?.lifecycle, 'old_alpha');
 }
 
-export function isVanillaVersion(version: Pick<Version, 'loader'> | null | undefined): boolean {
-  return !version?.loader;
+export function supportsMods(version: Pick<Version, 'loader'> | null | undefined): boolean {
+  return !!version?.loader;
 }
 
 export function matchesVersionFilter(
@@ -168,14 +165,11 @@ function parseModded(id: string, base: string, version?: Version | null): Versio
   if (lo.startsWith('neoforge-')) {
     return loaderDisplay('neoforge', base, id.slice('neoforge-'.length));
   }
-  // optifine
   const m = id.match(/-optifine[_-](.*)/i);
   if (m) return { name: `OptiFine ${base}`, hint: m[1].replace(/_/g, ' ').trim(), loader: null };
-  // X.X.X-fabric (simple)
   if (lo.includes('fabric')) return { name: `Fabric ${base}`, hint: null, loader: 'fabric' };
   if (lo.includes('quilt')) return { name: `Quilt ${base}`, hint: null, loader: 'quilt' };
   if (lo.includes('liteloader')) return { name: `LiteLoader ${base}`, hint: null, loader: null };
-  // generic fallback
   return { name: base, hint: id !== base ? id : null, loader: null };
 }
 
@@ -228,16 +222,13 @@ function parseSnapshot(id: string, version: VersionLike | null | undefined, vers
       hint: version.minecraft_meta.display_hint || null,
     };
   }
-  // pre-release / release candidate: 1.20.5-pre1, 1.20.5-rc1
   const m = id.match(/^(\d+\.\d+(?:\.\d+)?)-(?:pre|rc)\d+$/);
   if (m) return { name: id, hint: null };
-  // weekly snapshot: find nearest release by time
   if (versions?.length && version?.release_time) {
     const t = version.release_time as string;
     const rel = versions
       .filter((v) => isReleaseVersion(v) && v.release_time)
       .sort((a, b) => (a.release_time as string).localeCompare(b.release_time as string));
-    // first release at or after snapshot
     let nearest: VersionLike | null = null;
     for (const r of rel) {
       if ((r.release_time || '') >= t) {
@@ -245,7 +236,6 @@ function parseSnapshot(id: string, version: VersionLike | null | undefined, vers
         break;
       }
     }
-    // if none after, use last release before
     if (!nearest) {
       for (let i = rel.length - 1; i >= 0; i--) {
         if ((rel[i]?.release_time || '') <= t) {
@@ -281,10 +271,6 @@ export function formatRelativeTime(date: Date): string {
   return new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' }).format(date);
 }
 
-// ── Player name validation ──────────────────────────────────────────────
-// Minecraft (offline + MSA) accepts [A-Za-z0-9_]{3,16}. Anything outside that
-// range breaks launch arg construction (spaces, quotes, semicolons, etc.).
-// Frontend gates every input site; the backend is a last-resort defense.
 
 export const USERNAME_MIN_LEN = 3;
 export const USERNAME_MAX_LEN = 16;

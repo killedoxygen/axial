@@ -1598,27 +1598,36 @@
 .cp-settings-save > span[data-dirty="true"] {
   color: var(--accent);
 }
-/* Instance settings: a fluid grid of section cards that fills the
- * viewport instead of pooling into a left column. Memory and Runtime
- * span the full row; the compact sections share it. */
 .cp-iset {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-  gap: 14px;
+  grid-template-columns: minmax(0, 1fr) minmax(292px, 320px);
+  grid-template-areas:
+    "memory policy"
+    "runtime window"
+    "runtime identity";
+  gap: 14px 15px;
   align-items: stretch;
 }
+.cp-iset-slot {
+  min-width: 0;
+  display: flex;
+}
+.cp-iset-slot > .cp-card {
+  width: 100%;
+  height: 100%;
+  box-sizing: border-box;
+}
+.cp-iset-slot--policy { grid-area: policy; }
+.cp-iset-slot--memory { grid-area: memory; }
+.cp-iset-slot--runtime { grid-area: runtime; }
+.cp-iset-slot--window { grid-area: window; }
+.cp-iset-slot--identity { grid-area: identity; }
 .cp-iset-card {
   min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 14px;
-  padding: 16px 18px 18px;
-  background: var(--surface);
-  border-radius: var(--r-lg);
-  box-shadow: var(--shadow-raised);
-}
-@media (min-width: 980px) {
-  .cp-iset-card--wide { grid-column: 1 / -1; }
+  overflow: hidden;
 }
 .cp-iset-head {
   display: block;
@@ -1783,14 +1792,17 @@
   letter-spacing: 0;
   font-variant-numeric: tabular-nums;
 }
-.cp-settings-advanced-toggle {
-  display: flex;
-  justify-content: flex-start;
-}
 .cp-settings-mode-note {
   color: var(--text-mute);
   font-size: 12px;
   line-height: 1.45;
+}
+.cp-settings-advanced-label {
+  color: var(--text-mute);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: uppercase;
 }
 .cp-settings-advanced-grid {
   display: grid;
@@ -1811,11 +1823,15 @@
   text-transform: uppercase;
 }
 @media (max-width: 1180px) {
+  .cp-iset {
+    grid-template-columns: minmax(0, 1fr) minmax(244px, 268px);
+    gap: 12px;
+  }
   .cp-settings-memory-grid {
     gap: 14px;
   }
   .cp-settings-runtime-presets {
-    grid-template-columns: repeat(auto-fit, minmax(144px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
   }
 }
 @media (max-width: 920px) {
@@ -1823,10 +1839,27 @@
     grid-template-columns: 1fr;
   }
 }
+@media (max-width: 860px) {
+  .cp-iset {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas:
+      "policy"
+      "memory"
+      "runtime"
+      "window"
+      "identity";
+  }
+}
+@media (max-width: 640px) {
+  .cp-settings-identity-control {
+    grid-template-columns: 52px minmax(0, 1fr);
+  }
+  .cp-settings-identity-control .cp-btn {
+    grid-column: 1 / -1;
+    width: 100%;
+  }
+}
 
-/* ── Tab surfaces: shared toolbar, resource lists, mods table, screenshots ──
- * One structure for every operational tab so switching tabs never shifts
- * the layout: toolbar row (30px controls), then a raised panel. */
 .cp-resource-toolbar {
   display: flex;
   justify-content: space-between;
@@ -1967,7 +2000,6 @@
   color: var(--text);
 }
 
-/* Mods table */
 .cp-mods-table {
   border-radius: var(--r-lg);
   overflow: hidden;
@@ -2025,7 +2057,6 @@
   letter-spacing: 0;
 }
 
-/* Screenshots */
 .cp-logs-pane {
   display: flex;
   flex-direction: column;

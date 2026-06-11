@@ -38,8 +38,14 @@ function crumbsFor(): { label: string; onClick?: () => void }[] {
   }
 }
 
-// Topbar status pill
-// Priority: running instance > active install > launch preparing > queued install > failure > idle
+function StatusMark({ icon }: { icon: string }): JSX.Element {
+  return (
+    <span class="cp-status-mark" aria-hidden="true">
+      <Icon name={icon} size={14} stroke={2.1} />
+    </span>
+  );
+}
+
 function StatusPill(): JSX.Element {
   const sessions = runningSessions.value;
   const install = installState.value;
@@ -72,7 +78,7 @@ function StatusPill(): JSX.Element {
         onClick={() => navigate({ name: 'instance', id: inst.id })}
         title="Jump to running instance"
       >
-        <span class="cp-status-dot" aria-hidden="true" />
+        <StatusMark icon="play" />
         <span class="cp-status-pill-label">{label} · {inst.name}</span>
       </button>
     );
@@ -84,9 +90,9 @@ function StatusPill(): JSX.Element {
     const installPct = Math.round(Math.max(0, Math.min(100, install.pct)));
     const installPhase = install.phase ? ` · ${install.phase.replace(/_/g, ' ')}` : '';
     const installRemainingSeconds = countDownRemainingSeconds(install.remainingSeconds, install.remainingSecondsUpdatedAt, etaNow);
-    const installEta = installRemainingSeconds ? ` · ${formatRemainingTime(installRemainingSeconds)} left` : '';
+    const installEta = installRemainingSeconds ? formatRemainingTime(installRemainingSeconds) : null;
     const installName = install.displayName || install.versionId;
-    const installTitle = `${installName}: ${install.label}${installEta} · ${installPct}%${queuedLabel}${installPhase}`;
+    const installTitle = `${installName}: ${install.label} · ${installPct}%${installEta ? ` · ${installEta} left` : ''}${queuedLabel}${installPhase}`;
     const installStyle = { '--cp-install-ratio': String(installPct / 100) } as JSX.CSSProperties;
 
     return (
@@ -97,8 +103,11 @@ function StatusPill(): JSX.Element {
         aria-label={`Open downloads. ${installTitle}`}
         style={installStyle}
       >
-        <span class="cp-status-dot" aria-hidden="true" />
-        <span class="cp-status-pill-label">{install.label}{installEta} · {installPct}%{queuedLabel}</span>
+        <StatusMark icon="download" />
+        <span class="cp-status-pill-label">{installName}</span>
+        {queuedCount > 0 && <span class="cp-status-pill-chip">+{queuedCount}</span>}
+        {installEta && <span class="cp-status-pill-eta">{installEta}</span>}
+        <span class="cp-status-pill-pct">{installPct}%</span>
       </button>
     );
   }
@@ -108,7 +117,7 @@ function StatusPill(): JSX.Element {
     const li = instances.value.find(i => i.id === launch.instanceId);
     return (
       <span class="cp-status-pill cp-status-pill--preparing cp-nodrag" title={`${launch.label} · ${li?.name || 'launch'}`}>
-        <span class="cp-status-dot" aria-hidden="true" />
+        <StatusMark icon="clock" />
         <span class="cp-status-pill-label">{launch.label} · {li?.name || 'launch'}</span>
       </span>
     );
@@ -126,7 +135,7 @@ function StatusPill(): JSX.Element {
         title={queuedTitle}
         aria-label={`Open downloads. ${queuedTitle}`}
       >
-        <span class="cp-status-dot" aria-hidden="true" />
+        <StatusMark icon="archive" />
         <span class="cp-status-pill-label">{queuedLabel}</span>
       </button>
     );
@@ -142,7 +151,7 @@ function StatusPill(): JSX.Element {
         title={title}
         aria-label={`Open downloads. Install failed: ${title}`}
       >
-        <span class="cp-status-dot" aria-hidden="true" />
+        <StatusMark icon="alert" />
         <span class="cp-status-pill-label">install failed</span>
       </button>
     );
@@ -150,7 +159,7 @@ function StatusPill(): JSX.Element {
 
   return (
     <span class="cp-status-pill cp-nodrag">
-      <span class="cp-status-dot" aria-hidden="true" />
+      <StatusMark icon="circle-dashed" />
       <span class="cp-status-pill-label">idle</span>
     </span>
   );

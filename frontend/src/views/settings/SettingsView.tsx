@@ -135,7 +135,6 @@ function Toggle({ on, onChange }: { on: boolean; onChange: () => void }): JSX.El
   );
 }
 
-// ── Appearance ─────────────────────────────────────────────────────────
 
 function AppearanceSection(): JSX.Element {
   return (
@@ -156,7 +155,6 @@ function AppearanceSection(): JSX.Element {
   );
 }
 
-// ── Gameplay ────────────────────────────────────────────────────────────
 
 function GameplaySection(): JSX.Element {
   const cfg = config.value;
@@ -255,7 +253,6 @@ function GameplaySection(): JSX.Element {
   );
 }
 
-// ── Performance ─────────────────────────────────────────────────────────
 
 const PERFORMANCE_OPTIONS: Array<ModeOption<PerformanceMode>> = [
   { value: 'managed', label: 'Managed', note: 'Recommended defaults' },
@@ -518,10 +515,8 @@ function PerformanceLabSlot(): JSX.Element | null {
   return <Lab />;
 }
 
-// ── Audio ────────────────────────────────────────────────────────────
 
 function AudioSection(): JSX.Element {
-  // Reactive subscription to Music state
   musicStateVersion.value;
   const [soundsOn, setSoundsOn] = useState<boolean>(local.sounds);
   const [musicOn, setMusicOn] = useState<boolean>(Music.enabled);
@@ -578,7 +573,6 @@ function AudioSection(): JSX.Element {
   );
 }
 
-// ── Shortcuts ────────────────────────────────────────────────────────────
 
 function ShortcutsSection(): JSX.Element {
   const rows: Array<[string, string]> = [
@@ -605,7 +599,6 @@ function ShortcutsSection(): JSX.Element {
   );
 }
 
-// ── Advanced ────────────────────────────────────────────────────────────
 
 function AdvancedSection(): JSX.Element {
   const cfg = config.value;
@@ -686,7 +679,6 @@ function AdvancedSection(): JSX.Element {
   );
 }
 
-// ── About ──────────────────────────────────────────────────────────────
 
 function displayReleaseVersion(version: string): string {
   return version.startsWith('v') || version.startsWith('V') ? version : `v${version}`;

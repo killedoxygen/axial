@@ -869,6 +869,11 @@ export interface ShortcutBinding {
   desc: string;
 }
 
+export interface OverlayPosition {
+  x: number;
+  y: number;
+}
+
 export interface LocalPrefs {
   theme: string;
   customHue: number;
@@ -879,6 +884,7 @@ export interface LocalPrefs {
   sidebarFilter: string;
   sounds: boolean;
   shortcuts: Record<string, ShortcutBinding>;
+  overlayPositions: Record<string, OverlayPosition>;
   lastUpdateCheckAt: string;
   dismissedUpdateVersion: string;
 }

@@ -1,10 +1,3 @@
-/* Croopor — global base for the refactored UI.
- * Components do their own layout with inline styles + CSS variables;
- * this file only covers resets, the theme variable surface, scrollbars,
- * and animation keyframes. */
-
-/* Typeface: Manrope everywhere; Geist Mono exists only for log output.
- * Vendored, the launcher must render identically offline. */
 @font-face {
   font-family: "Manrope";
   src: url("fonts/Manrope-cyrillic-ext.woff2") format("woff2-variations");
@@ -90,17 +83,9 @@ body {
 button, input, select, textarea { font: inherit; color: inherit; }
 input::placeholder { color: var(--text-mute); }
 
-/* Drag region hooks (Tauri). */
 .cp-drag { -webkit-app-region: drag; app-region: drag; }
 .cp-nodrag { -webkit-app-region: no-drag; app-region: no-drag; }
 
-/* Theme variables — hue-driven engine. Dark defaults.
- * applyTheme() mutates these on document.documentElement.
- *
- * Depth model: a deep chassis (--bg-deep) holds a dark content panel
- * (--bg); cards are solid raised surfaces (--surface) a full elevation
- * step above the page, and controls sit on cards at --surface-2.
- * Hierarchy comes from those elevation jumps, not from borders. */
 :root {
   color-scheme: dark;
   --bg-deep: oklch(0.14 0.012 140);
@@ -124,6 +109,7 @@ input::placeholder { color: var(--text-mute); }
   --accent-softer: oklch(0.78 0.14 140 / 0.08);
   --accent-ring: oklch(0.78 0.14 140 / 0.40);
   --accent-line: oklch(0.78 0.14 140 / 0.28);
+  --logo-filter: none;
   --ok: oklch(0.78 0.14 150);
   --warn: oklch(0.80 0.14 70);
   --err: oklch(0.70 0.18 25);
@@ -156,7 +142,6 @@ html[data-color-mode="light"] {
   --shadow-raised: 0 1px 2px rgba(0,0,0,0.06), 0 6px 18px -10px rgba(0,0,0,0.10);
 }
 
-/* Scrollbars. */
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb {
@@ -170,7 +155,6 @@ html[data-color-mode="light"] {
   background-clip: padding-box;
 }
 
-/* Keyframes shared across components. */
 @keyframes cp-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.55; } }
 @keyframes cp-spin { to { transform: rotate(360deg); } }
 @keyframes cp-float-up {

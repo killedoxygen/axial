@@ -2,12 +2,14 @@ import { h } from 'preact';
 import type { ComponentType, JSX } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
 import { AppFrame } from './shell/AppFrame';
+import { BootSplash } from './shell/BootSplash';
 import { HomeView } from './views/home/HomeView';
 import { DialogHost } from './ui/Dialog';
 import { ContextMenuHost } from './ui/ContextMenu';
 import { ToastHost } from './ui/ToastHost';
+import { Logo } from './ui/Logo';
 import { commandPaletteOpen, createOpen, route, showOnboardingOverlay, showSetupOverlay } from './ui-state';
-import { bootstrapError, bootstrapState, devMode } from './store';
+import { devMode } from './store';
 import { useShortcuts } from './hooks/use-shortcuts';
 
 type DevLabViewComponent = typeof import('./views/dev-lab/DevLabView')['DevLabView'];
@@ -97,7 +99,7 @@ function SetupLoadingFallback({ failed = false }: { failed?: boolean }): JSX.Ele
   return (
     <div class="cp-setup-overlay" role="status" aria-live="polite">
       <div class="cp-setup-card">
-        <img src="logo.png" alt="" class="cp-logo" width="48" height="48" />
+        <Logo className="cp-logo" size={48} />
         <h1 class="cp-setup-title">{failed ? 'Could not load setup' : 'Loading setup...'}</h1>
         <p class="cp-setup-sub">
           {failed
@@ -105,35 +107,6 @@ function SetupLoadingFallback({ failed = false }: { failed?: boolean }): JSX.Ele
             : 'Preparing the library setup flow.'}
         </p>
         {!failed && <div class="cp-setup-progress" />}
-      </div>
-    </div>
-  );
-}
-
-function BootState(): JSX.Element | null {
-  const s = bootstrapState.value;
-  if (s === 'ready') return null;
-  const err = bootstrapError.value;
-  return (
-    <div style={{
-      position: 'fixed', inset: 0,
-      display: 'flex', alignItems: 'center', justifyContent: 'center',
-      background: 'var(--bg)', color: 'var(--text)',
-      zIndex: 2000,
-      fontFamily: 'inherit',
-    }}>
-      <div style={{
-        padding: 24, borderRadius: 'var(--r-lg)',
-        background: 'var(--surface)', border: '1px solid var(--line)',
-        maxWidth: 440, textAlign: 'center',
-      }}>
-        {s === 'loading' && <div style={{ fontSize: 14, color: 'var(--text-dim)' }}>Starting Croopor…</div>}
-        {s === 'error' && (
-          <>
-            <div style={{ fontSize: 16, fontWeight: 600, marginBottom: 6 }}>Failed to connect</div>
-            <div style={{ fontSize: 13, color: 'var(--text-dim)' }}>{err || 'The launcher could not load its initial state.'}</div>
-          </>
-        )}
       </div>
     </div>
   );
@@ -221,7 +194,7 @@ export function App(): JSX.Element {
       <ContextMenuHost />
       <ToastHost />
       {commandPaletteOpen.value && <LazyCommandPalette />}
-      <BootState />
+      <BootSplash />
     </>
   );
 }

@@ -9,6 +9,7 @@ export { default as ChevronDown } from '../../node_modules/@openai/apps-sdk-ui/d
 export { default as ChevronLeft } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/ChevronLeft.js';
 export { default as ChevronRight } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/ChevronRight.js';
 export { default as ChevronUp } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/ChevronUp.js';
+export { default as CircleDashed } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/CircleDashed.js';
 export { default as Clock } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/Clock.js';
 export { default as ColorTheme } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/ColorTheme.js';
 export { default as Compass } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/Compass.js';
