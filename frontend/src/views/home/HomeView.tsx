@@ -41,6 +41,8 @@ function versionBadge(v: Version | undefined): string {
   return minecraftVersionLabel(v, '—');
 }
 
+const HOME_LIBRARY_CARD_LIMIT = 14;
+
 function FeatureBanner({ inst }: { inst: EnrichedInstance }): JSX.Element {
   const version = versions.value.find(v => v.id === inst.version_id);
   const running = !!runningSessions.value[inst.id];
@@ -127,7 +129,7 @@ export function HomeView(): JSX.Element {
         const tb = b.last_played_at ? new Date(b.last_played_at).getTime() : 0;
         return tb - ta;
       })
-      .slice(0, 13);
+      .slice(0, HOME_LIBRARY_CARD_LIMIT + 1);
   }, [all]);
   const rest = recent.slice(1);
 
