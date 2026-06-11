@@ -121,6 +121,7 @@ export function DialogHost(): JSX.Element | null {
   const dialogRef = useRef<HTMLDivElement>(null);
   const primaryRef = useRef<HTMLButtonElement>(null);
   const cancelRef = useRef<HTMLButtonElement>(null);
+  const choicePrimaryRef = useRef<HTMLButtonElement>(null);
 
   const promptError = spec?.kind === 'prompt' ? (spec.validate?.(draft) ?? null) : null;
   const showPromptError = spec?.kind === 'prompt' && promptError !== null && (touched || draft.length > 0);
@@ -162,7 +163,7 @@ export function DialogHost(): JSX.Element | null {
     const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     if (spec.kind === 'choice') {
       window.requestAnimationFrame(() => {
-        (cancelRef.current || dialogRef.current?.querySelector<HTMLButtonElement>('button'))?.focus();
+        (choicePrimaryRef.current || dialogRef.current?.querySelector<HTMLButtonElement>('button'))?.focus();
       });
     } else if (spec.kind !== 'prompt') {
       window.requestAnimationFrame(() => primaryRef.current?.focus());
@@ -226,9 +227,10 @@ export function DialogHost(): JSX.Element | null {
             <Button buttonRef={cancelRef} variant="ghost" onClick={() => resolveAs(false)}>{spec.cancelText}</Button>
           )}
           {spec.kind === 'choice'
-            ? spec.choices?.map((choice) => (
+            ? spec.choices?.map((choice, index) => (
               <Button
                 key={choice.value}
+                buttonRef={index === 0 ? choicePrimaryRef : undefined}
                 variant={choice.variant || 'secondary'}
                 onClick={() => resolveChoice(choice.value)}
               >

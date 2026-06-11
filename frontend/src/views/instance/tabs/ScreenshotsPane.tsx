@@ -1,76 +1,16 @@
 import type { JSX } from 'preact';
-import { useEffect, useMemo, useState } from 'preact/hooks';
+import { useCallback, useEffect, useMemo, useState } from 'preact/hooks';
 import { Icon } from '../../../ui/Icons';
 import { Button } from '../../../ui/Atoms';
 import { openContextMenu } from '../../../ui/ContextMenu';
-import { prompt, showChoice } from '../../../ui/Dialog';
-import { api, apiResourceUrl } from '../../../api';
-import { toast } from '../../../toast';
-import { errMessage } from '../../../utils';
-import type { EnrichedInstance } from '../../../types';
+import { SelectionActionPill, SelectionCheckbox } from '../../../ui/SelectionActionPill';
+import { selectionMenuItem, selectionToggleLabel, useSelection } from '../../../ui/selection';
+import type { EnrichedInstance, InstanceScreenshot } from '../../../types';
 import { fmtBytes, fmtRelative } from '../format';
 import type { ResourceLoadState } from '../resources';
 import { openInstanceFolder } from '../instance-actions';
 import { ResourceEmpty, ResourceStatus } from '../components/resource-bits';
-
-function screenshotKind(name: string): 'png' | 'jpeg' | 'webp' | '' {
-  const lower = name.toLowerCase();
-  if (lower.endsWith('.png')) return 'png';
-  if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'jpeg';
-  if (lower.endsWith('.webp')) return 'webp';
-  return '';
-}
-
-function screenshotNameError(value: string, currentName?: string): string | null {
-  const name = value.trim();
-  if (!name || name === '.' || name === '..') return 'Use a screenshot filename.';
-  if (name !== value) return 'Screenshot names cannot start or end with spaces.';
-  if (name.startsWith('.')) return 'Screenshot names cannot start with a dot.';
-  if (/[\\/]/.test(name)) return 'Screenshot names cannot include folders.';
-  if (/[\u0000-\u001f\u007f]/.test(name)) return 'Screenshot names cannot include control characters.';
-  if (!/\.(png|jpe?g|webp)$/i.test(name)) return 'Use a PNG, JPG, JPEG, or WEBP filename.';
-  if (currentName && screenshotKind(name) !== screenshotKind(currentName)) return 'Keep the same screenshot file type.';
-  return null;
-}
-
-function screenshotFileUrl(inst: EnrichedInstance, name: string): string {
-  return apiResourceUrl(`/instances/${encodeURIComponent(inst.id)}/screenshots/${encodeURIComponent(name)}/file`);
-}
-
-async function renameScreenshot(inst: EnrichedInstance, screenshotName: string, onDone: () => void): Promise<void> {
-  const next = await prompt('New name for this screenshot', screenshotName, {
-    title: 'Rename screenshot',
-    confirmText: 'Rename',
-    validate: (value) => screenshotNameError(value, screenshotName),
-  });
-  const nextName = next ?? '';
-  if (!nextName || nextName === screenshotName) return;
-  try {
-    const res: any = await api('PUT', `/instances/${encodeURIComponent(inst.id)}/screenshots/${encodeURIComponent(screenshotName)}`, { name: nextName });
-    if (res?.error) throw new Error(res.error);
-    toast('Screenshot renamed');
-    onDone();
-  } catch (err) {
-    toast(`Could not rename the screenshot: ${errMessage(err)}`, 'error');
-  }
-}
-
-async function deleteScreenshot(inst: EnrichedInstance, screenshotName: string, onDone: () => void): Promise<void> {
-  const choice = await showChoice<'delete'>(
-    `Delete "${screenshotName}" from this instance. This removes the screenshot file from disk.`,
-    [{ value: 'delete', label: 'Delete screenshot', variant: 'danger' }],
-    { title: 'Delete screenshot' },
-  );
-  if (choice !== 'delete') return;
-  try {
-    const res: any = await api('DELETE', `/instances/${encodeURIComponent(inst.id)}/screenshots/${encodeURIComponent(screenshotName)}`);
-    if (res?.error) throw new Error(res.error);
-    toast('Screenshot deleted');
-    onDone();
-  } catch (err) {
-    toast(`Could not delete the screenshot: ${errMessage(err)}`, 'error');
-  }
-}
+import { deleteScreenshots, screenshotFileUrl, screenshotMenuItems } from '../screenshot-actions';
 
 type ScreenshotSort = 'newest' | 'name' | 'size';
 
@@ -102,6 +42,21 @@ export function ScreenshotsPane({
     return next;
   }, [screenshots, sort]);
   const viewedShot = viewer ? screenshots.find((shot) => shot.name === viewer) : undefined;
+  const selection = useSelection(sortedScreenshots, useCallback((shot: InstanceScreenshot) => shot.name, []));
+  const menuItems = (shot: InstanceScreenshot) => screenshotMenuItems({
+    inst,
+    shot,
+    selectionItem: selectionMenuItem(selection, shot.name),
+    onView: () => setViewer(shot.name),
+    onRefresh,
+  });
+  const deleteSelected = async (): Promise<void> => {
+    await deleteScreenshots(inst, selection.selectedItems, clearAndRefresh);
+  };
+  const clearAndRefresh = (): void => {
+    selection.clear();
+    onRefresh();
+  };
 
   useEffect(() => {
     if (viewer && !screenshots.some((shot) => shot.name === viewer)) setViewer('');
@@ -138,15 +93,19 @@ export function ScreenshotsPane({
           {sortedScreenshots.map((shot) => (
             <div
               class="cp-screenshot-tile"
+              data-selected={selection.isSelected(shot.name)}
               key={shot.name}
-              onContextMenu={(e) => openContextMenu(e, [
-                { icon: 'image', label: 'View', onSelect: () => setViewer(shot.name) },
-                { icon: 'edit', label: 'Rename', onSelect: () => void renameScreenshot(inst, shot.name, onRefresh) },
-                { icon: 'folder', label: 'Open screenshots folder', onSelect: () => void openInstanceFolder(inst.id, 'screenshots') },
-                { divider: true, label: '', onSelect: () => undefined },
-                { icon: 'trash', label: 'Delete', onSelect: () => void deleteScreenshot(inst, shot.name, onRefresh), danger: true },
-              ])}
+              onContextMenu={(e) => openContextMenu(e, menuItems(shot))}
             >
+              <SelectionCheckbox
+                className="cp-screenshot-select"
+                selected={selection.isSelected(shot.name)}
+                label={selectionToggleLabel(selection.isSelected(shot.name), shot.name)}
+                onToggle={(e) => {
+                  e.stopPropagation();
+                  selection.toggle(shot.name);
+                }}
+              />
               <button
                 class="cp-screenshot-thumb"
                 type="button"
@@ -164,12 +123,7 @@ export function ScreenshotsPane({
                   class="cp-resource-action"
                   type="button"
                   aria-label={`Screenshot actions for ${shot.name}`}
-                  onClick={(e) => openContextMenu(e, [
-                    { icon: 'image', label: 'View', onSelect: () => setViewer(shot.name) },
-                    { icon: 'edit', label: 'Rename', onSelect: () => void renameScreenshot(inst, shot.name, onRefresh) },
-                    { divider: true, label: '', onSelect: () => undefined },
-                    { icon: 'trash', label: 'Delete', onSelect: () => void deleteScreenshot(inst, shot.name, onRefresh), danger: true },
-                  ])}
+                  onClick={(e) => openContextMenu(e, menuItems(shot))}
                 >
                   <Icon name="dots" size={15} />
                 </button>
@@ -201,6 +155,13 @@ export function ScreenshotsPane({
           </div>
         </div>
       ) : null}
+      <SelectionActionPill
+        selection={selection}
+        itemLabel="screenshot"
+        actions={[
+          { label: 'Delete', icon: 'trash', danger: true, onClick: () => void deleteSelected() },
+        ]}
+      />
     </div>
   );
 }

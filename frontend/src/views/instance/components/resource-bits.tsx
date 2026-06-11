@@ -55,12 +55,16 @@ export function ResourceEmpty({ icon, title, hint }: { icon: string; title: stri
 }
 
 export function ResourceRow({
+  leading,
+  selected,
   icon,
   name,
   meta,
   actions,
   onContextMenu,
 }: {
+  leading?: JSX.Element;
+  selected?: boolean;
   icon: string;
   name: string;
   meta: string;
@@ -68,7 +72,12 @@ export function ResourceRow({
   onContextMenu?: (e: MouseEvent) => void;
 }): JSX.Element {
   return (
-    <div class="cp-resource-row" onContextMenu={onContextMenu}>
+    <div
+      class={`cp-resource-row cp-selection-row${leading ? ' cp-resource-row--selectable' : ''}`}
+      data-selected={selected === true}
+      onContextMenu={onContextMenu}
+    >
+      {leading}
       <span class="cp-resource-row-icon"><Icon name={icon} size={15} /></span>
       <span class="cp-resource-name" title={name}>{name}</span>
       <span class="cp-resource-meta">{meta}</span>

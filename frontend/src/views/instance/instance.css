@@ -1945,6 +1945,9 @@ html[data-color-mode="light"] .cp-instance-cover-vignette {
   padding: 12px 14px;
   border-bottom: 1px solid var(--line);
 }
+.cp-resource-row--selectable {
+  grid-template-columns: 24px 34px minmax(0, 1fr) auto auto;
+}
 .cp-resource-row:last-child { border-bottom: none; }
 .cp-resource-row:hover { background: var(--surface-2); }
 .cp-resource-row-icon {
@@ -2004,7 +2007,7 @@ html[data-color-mode="light"] .cp-instance-cover-vignette {
 .cp-mods-table-head,
 .cp-mods-table-row {
   display: grid;
-  grid-template-columns: 28px 36px 1fr 110px 90px 80px 28px;
+  grid-template-columns: 28px 28px 36px 1fr 110px 90px 80px 28px;
   gap: 12px;
   padding: 10px 12px;
   align-items: center;
@@ -2070,6 +2073,18 @@ html[data-color-mode="light"] .cp-instance-cover-vignette {
   background: var(--surface);
   box-shadow: var(--shadow-raised);
   overflow: hidden;
+  position: relative;
+}
+.cp-screenshot-tile[data-selected="true"] {
+  box-shadow:
+    var(--shadow-raised),
+    0 0 0 2px var(--accent-fill);
+}
+.cp-screenshot-select {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 2;
 }
 .cp-screenshot-thumb {
   width: 100%;

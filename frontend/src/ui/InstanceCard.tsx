@@ -1,6 +1,8 @@
 import type { JSX } from 'preact';
 import { InstanceTile } from './InstanceVisual';
 import { Icon } from './Icons';
+import { SelectionCheckbox } from './SelectionActionPill';
+import { selectionToggleLabel } from './selection';
 import { navigate } from '../ui-state';
 import { runningSessions, versions } from '../store';
 import { instanceInstallStatus } from '../instance-install-status';
@@ -16,9 +18,11 @@ function versionLabel(inst: EnrichedInstance): { loader: string; mc: string } {
 
 /* Cover card: square art on top, identity below, play overlay on hover.
  * The shared library tile for Home and Instances. */
-export function InstanceCard({ inst, onContextMenu }: {
+export function InstanceCard({ inst, onContextMenu, selected, onToggleSelect }: {
   inst: EnrichedInstance;
   onContextMenu?: (e: MouseEvent) => void;
+  selected?: boolean;
+  onToggleSelect?: (e: MouseEvent) => void;
 }): JSX.Element {
   const running = !!runningSessions.value[inst.id];
   const version = versions.value.find(x => x.id === inst.version_id);
@@ -41,12 +45,24 @@ export function InstanceCard({ inst, onContextMenu }: {
       aria-label={installing ? `Open ${inst.name}. ${installBadge}` : `Open ${inst.name}`}
       data-running={running}
       data-installing={installing}
+      data-selected={selected === true}
       onClick={open}
       onKeyDown={onKeyDown}
       onContextMenu={onContextMenu}
     >
       <div class="cp-icard-art">
         <InstanceTile inst={inst} radius={0} className="cp-icard-canvas" />
+        {onToggleSelect && (
+          <SelectionCheckbox
+            className="cp-icard-select"
+            selected={selected === true}
+            label={selectionToggleLabel(selected === true, inst.name)}
+            onToggle={(e) => {
+              e.stopPropagation();
+              onToggleSelect(e);
+            }}
+          />
+        )}
         {running && <span class="cp-icard-live" aria-label="Running"><span /> Live</span>}
         {installing && (
           <span class="cp-icard-install" aria-label={installBadge}>

@@ -1,15 +1,19 @@
 import type { JSX } from 'preact';
-import { useState } from 'preact/hooks';
+import { useCallback, useState } from 'preact/hooks';
 import { InstanceTile } from '../../ui/InstanceVisual';
 import { Button, IconButton, Input, Segmented, Pill } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { InstanceCard } from '../../ui/InstanceCard';
+import { openContextMenu } from '../../ui/ContextMenu';
+import { SelectionActionPill, SelectionCheckbox } from '../../ui/SelectionActionPill';
+import { selectionMenuItem, selectionToggleLabel, useSelection } from '../../ui/selection';
 import { useTheme } from '../../hooks/use-theme';
 import { instances, versions, runningSessions } from '../../store';
 import { instanceInstallStatus } from '../../instance-install-status';
 import { navigate, openCreate } from '../../ui-state';
 import { loaderKeyFromVersion, LOADER_LABELS } from '../create/defaults';
-import { openInstanceContextMenu } from '../instance/instance-menu';
+import { instanceMenuItems } from '../instance/instance-menu';
+import { deleteInstancesFlow } from '../instance/instance-actions';
 import { supportsMods } from '../../utils';
 import { minecraftVersionLabel } from '../../version-display';
 import type { EnrichedInstance, Version } from '../../types';
@@ -38,9 +42,19 @@ function loaderLabel(v: Version | undefined): string {
   return LOADER_LABELS[loaderKeyFromVersion(v)];
 }
 
-const LIST_COLS = '52px 2.4fr 1fr 1fr 1fr 140px';
+const LIST_COLS = '28px 52px 2.4fr 1fr 1fr 1fr 140px';
 
-function ListRow({ inst }: { inst: EnrichedInstance }): JSX.Element {
+function ListRow({
+  inst,
+  selected,
+  onToggleSelect,
+  onContextMenu,
+}: {
+  inst: EnrichedInstance;
+  selected: boolean;
+  onToggleSelect: (e: MouseEvent) => void;
+  onContextMenu: (e: MouseEvent) => void;
+}): JSX.Element {
   const theme = useTheme();
   const v = versions.value.find(x => x.id === inst.version_id);
   const running = !!runningSessions.value[inst.id];
@@ -50,11 +64,20 @@ function ListRow({ inst }: { inst: EnrichedInstance }): JSX.Element {
   const showModsCount = supportsMods(v);
   return (
     <div
-      class="cp-table-row"
+      class="cp-table-row cp-selection-row"
       style={{ gridTemplateColumns: LIST_COLS }}
+      data-selected={selected}
       onClick={() => navigate({ name: 'instance', id: inst.id })}
-      onContextMenu={(e) => openInstanceContextMenu(e, inst)}
+      onContextMenu={onContextMenu}
     >
+      <SelectionCheckbox
+        selected={selected}
+        label={selectionToggleLabel(selected, inst.name)}
+        onToggle={(e) => {
+          e.stopPropagation();
+          onToggleSelect(e);
+        }}
+      />
       <InstanceTile inst={inst} radius={theme.r.sm} style={{ width: 36, height: 36 }} />
       <div>
         <div class="cp-table-row-title" style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
@@ -78,7 +101,7 @@ function ListRow({ inst }: { inst: EnrichedInstance }): JSX.Element {
         <IconButton
           icon="dots"
           size={28}
-          onClick={(e: any) => { e.stopPropagation(); openInstanceContextMenu(e, inst); }}
+          onClick={(e: any) => { e.stopPropagation(); onContextMenu(e); }}
         />
       </div>
     </div>
@@ -91,6 +114,21 @@ export function InstancesView(): JSX.Element {
   const all = instances.value as EnrichedInstance[];
   const query = q.trim().toLowerCase();
   const filtered = all.filter(i => i.name.toLowerCase().includes(query));
+  const selection = useSelection(filtered, useCallback((inst: EnrichedInstance) => inst.id, []));
+
+  const menuItems = (inst: EnrichedInstance) => [
+    selectionMenuItem(selection, inst.id),
+    { divider: true, label: '', onSelect: () => undefined },
+    ...instanceMenuItems(inst),
+  ];
+
+  const openMenu = (e: MouseEvent, inst: EnrichedInstance): void => {
+    openContextMenu(e, menuItems(inst));
+  };
+
+  const deleteSelected = async (): Promise<void> => {
+    await deleteInstancesFlow(selection.selectedItems, selection.clear);
+  };
 
   return (
     <div class="cp-view-page" style={{ gap: 18 }}>
@@ -121,7 +159,9 @@ export function InstancesView(): JSX.Element {
             <InstanceCard
               key={i.id}
               inst={i}
-              onContextMenu={(e) => openInstanceContextMenu(e, i)}
+              selected={selection.isSelected(i.id)}
+              onToggleSelect={() => selection.toggle(i.id)}
+              onContextMenu={(e) => openMenu(e, i)}
             />
           ))}
         </div>
@@ -129,15 +169,31 @@ export function InstancesView(): JSX.Element {
         <div class="cp-card cp-table">
           <div class="cp-table-head" style={{ gridTemplateColumns: LIST_COLS }}>
             <span />
+            <span />
             <span>Instance</span>
             <span>Version</span>
             <span>Mods</span>
             <span>Last played</span>
             <span />
           </div>
-          {filtered.map(i => <ListRow key={i.id} inst={i} />)}
+          {filtered.map(i => (
+            <ListRow
+              key={i.id}
+              inst={i}
+              selected={selection.isSelected(i.id)}
+              onToggleSelect={() => selection.toggle(i.id)}
+              onContextMenu={(e) => openMenu(e, i)}
+            />
+          ))}
         </div>
       )}
+      <SelectionActionPill
+        selection={selection}
+        itemLabel="instance"
+        actions={[
+          { label: 'Delete', icon: 'trash', danger: true, onClick: () => void deleteSelected() },
+        ]}
+      />
     </div>
   );
 }

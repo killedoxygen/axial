@@ -155,6 +155,11 @@ struct RenameScreenshotRequest {
     name: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct UpdateModRequest {
+    enabled: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct WorldBackupResponse {
     status: &'static str,
@@ -192,6 +197,10 @@ pub fn router() -> Router<AppState> {
             post(handle_backup_instance_world),
         )
         .route("/api/v1/instances/{id}/mods", get(handle_instance_mods))
+        .route(
+            "/api/v1/instances/{id}/mods/{name}",
+            put(handle_update_instance_mod).delete(handle_delete_instance_mod),
+        )
         .route(
             "/api/v1/instances/{id}/screenshots",
             get(handle_instance_screenshots),
@@ -473,7 +482,7 @@ async fn handle_rename_instance_world(
     Path((id, name)): Path<(String, String)>,
     Json(payload): Json<RenameWorldRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    reject_running_instance(&state, &id).await?;
+    reject_running_instance(&state, &id, "worlds").await?;
     validate_world_name(&name)?;
     validate_world_name(&payload.name)?;
 
@@ -496,7 +505,7 @@ async fn handle_delete_instance_world(
     State(state): State<AppState>,
     Path((id, name)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    reject_running_instance(&state, &id).await?;
+    reject_running_instance(&state, &id, "worlds").await?;
     validate_world_name(&name)?;
 
     let game_dir = instance_game_dir(&state, &id)?;
@@ -510,7 +519,7 @@ async fn handle_backup_instance_world(
     State(state): State<AppState>,
     Path((id, name)): Path<(String, String)>,
 ) -> Result<Json<WorldBackupResponse>, (StatusCode, Json<serde_json::Value>)> {
-    reject_running_instance(&state, &id).await?;
+    reject_running_instance(&state, &id, "worlds").await?;
     validate_world_name(&name)?;
 
     let game_dir = instance_game_dir(&state, &id)?;
@@ -536,6 +545,50 @@ async fn handle_instance_mods(
 ) -> Result<Json<Vec<InstanceModInfo>>, (StatusCode, Json<serde_json::Value>)> {
     let game_dir = instance_game_dir(&state, &id)?;
     Ok(Json(scan_instance_mods(&game_dir.join("mods"))))
+}
+
+async fn handle_update_instance_mod(
+    State(state): State<AppState>,
+    Path((id, name)): Path<(String, String)>,
+    Json(payload): Json<UpdateModRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    reject_running_instance(&state, &id, "mods").await?;
+    validate_mod_name(&name)?;
+
+    let game_dir = instance_game_dir(&state, &id)?;
+    let mods_dir = game_dir.join("mods");
+    let source = mods_dir.join(&name);
+    require_mod_file(&source)?;
+    let target_name = mod_enabled_name(&name, payload.enabled)?;
+    if target_name == name {
+        return Ok(Json(
+            serde_json::json!({ "status": "ok", "name": name, "enabled": payload.enabled }),
+        ));
+    }
+
+    let target = mods_dir.join(&target_name);
+    if target_exists(&target) {
+        return Err(json_error(StatusCode::CONFLICT, "mod already exists"));
+    }
+
+    fs::rename(source, target).map_err(mod_file_write_error_response)?;
+    Ok(Json(
+        serde_json::json!({ "status": "ok", "name": target_name, "enabled": payload.enabled }),
+    ))
+}
+
+async fn handle_delete_instance_mod(
+    State(state): State<AppState>,
+    Path((id, name)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    reject_running_instance(&state, &id, "mods").await?;
+    validate_mod_name(&name)?;
+
+    let game_dir = instance_game_dir(&state, &id)?;
+    let source = game_dir.join("mods").join(&name);
+    require_mod_file(&source)?;
+    fs::remove_file(source).map_err(mod_file_write_error_response)?;
+    Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
 async fn handle_instance_screenshots(
@@ -771,6 +824,7 @@ fn instance_game_dir(
 async fn reject_running_instance(
     state: &AppState,
     id: &str,
+    resource_label: &'static str,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     if state.instances().get(id).is_none() {
         return Err(json_error(StatusCode::NOT_FOUND, "instance not found"));
@@ -778,7 +832,10 @@ async fn reject_running_instance(
     if state.sessions().has_active_instance(id).await {
         return Err(json_error(
             StatusCode::CONFLICT,
-            "cannot change worlds while the instance is running; stop the game first",
+            match resource_label {
+                "mods" => "cannot change mods while the instance is running; stop the game first",
+                _ => "cannot change worlds while the instance is running; stop the game first",
+            },
         ));
     }
     Ok(())
@@ -801,6 +858,26 @@ fn require_world_dir(path: &FsPath) -> Result<(), (StatusCode, Json<serde_json::
         Ok(())
     } else {
         Err(json_error(StatusCode::NOT_FOUND, "world not found"))
+    }
+}
+
+fn validate_mod_name(name: &str) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if name.trim() == name && is_mod_name(name) {
+        Ok(())
+    } else {
+        Err(json_error(StatusCode::BAD_REQUEST, "invalid mod filename"))
+    }
+}
+
+fn require_mod_file(path: &FsPath) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| match error.kind() {
+        ErrorKind::NotFound => json_error(StatusCode::NOT_FOUND, "mod not found"),
+        _ => mod_file_read_error_response(error),
+    })?;
+    if metadata.file_type().is_file() {
+        Ok(())
+    } else {
+        Err(json_error(StatusCode::NOT_FOUND, "mod not found"))
     }
 }
 
@@ -1043,6 +1120,24 @@ fn world_file_write_error_response(
     )
 }
 
+fn mod_file_read_error_response(_error: std::io::Error) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "error": "Could not read mod files. Check instance folder permissions and try again."
+        })),
+    )
+}
+
+fn mod_file_write_error_response(_error: std::io::Error) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "error": "Could not update mod files. Check instance folder permissions and try again."
+        })),
+    )
+}
+
 fn screenshot_file_read_error_response(
     _error: std::io::Error,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -1184,6 +1279,33 @@ fn is_screenshot_name(name: &str) -> bool {
         .iter()
         .any(|suffix| lower.ends_with(suffix))
         && is_safe_resource_name(name)
+}
+
+fn is_mod_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    (lower.ends_with(".jar") || lower.ends_with(".jar.disabled")) && is_safe_resource_name(name)
+}
+
+fn mod_enabled_name(
+    name: &str,
+    enabled: bool,
+) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+    let lower = name.to_ascii_lowercase();
+    if enabled {
+        if lower.ends_with(".jar") {
+            Ok(name.to_string())
+        } else if lower.ends_with(".jar.disabled") {
+            Ok(name[..name.len() - ".disabled".len()].to_string())
+        } else {
+            Err(json_error(StatusCode::BAD_REQUEST, "invalid mod filename"))
+        }
+    } else if lower.ends_with(".jar.disabled") {
+        Ok(name.to_string())
+    } else if lower.ends_with(".jar") {
+        Ok(format!("{name}.disabled"))
+    } else {
+        Err(json_error(StatusCode::BAD_REQUEST, "invalid mod filename"))
+    }
 }
 
 fn screenshot_content_type(name: &str) -> Option<&'static str> {
@@ -1832,6 +1954,139 @@ mod tests {
             assert!(!public_message.contains("shot.png"));
             assert!(public_message.len() <= 180);
         }
+    }
+
+    #[test]
+    fn instance_mod_names_reject_path_traversal_hidden_and_non_mod_names() {
+        for name in ["sodium.jar", "Sodium.JAR", "sodium.jar.disabled"] {
+            assert!(validate_mod_name(name).is_ok(), "{name} should be accepted");
+        }
+
+        for name in [
+            "",
+            "   ",
+            ".",
+            "..",
+            ".hidden.jar",
+            "../mod.jar",
+            "nested/mod.jar",
+            "nested\\mod.jar",
+            "bad\nmod.jar",
+            "notes.txt",
+            "mod.disabled",
+        ] {
+            let (status, Json(body)) =
+                validate_mod_name(name).expect_err("invalid mod name should fail");
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{name:?}");
+            assert_bounded_error_body(&body, "invalid mod filename");
+        }
+    }
+
+    #[tokio::test]
+    async fn instance_mod_update_reports_not_found_conflict_and_success() {
+        let fixture = TestFixture::new("mod-update");
+        let instance = fixture
+            .state
+            .instances()
+            .add(
+                "Update mods".to_string(),
+                "1.21.1".to_string(),
+                String::new(),
+                String::new(),
+                None,
+            )
+            .expect("add instance");
+        let mods_dir = fixture.state.instances().game_dir(&instance.id).join("mods");
+        fs::create_dir_all(&mods_dir).expect("create mods dir");
+
+        let (status, Json(body)) = handle_update_instance_mod(
+            State(fixture.state.clone()),
+            Path((instance.id.clone(), "missing.jar".to_string())),
+            Json(UpdateModRequest { enabled: false }),
+        )
+        .await
+        .expect_err("missing source should fail");
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_bounded_error_body(&body, "mod not found");
+
+        fs::write(mods_dir.join("source.jar.disabled"), "source").expect("write disabled mod");
+        fs::write(mods_dir.join("source.jar"), "target").expect("write existing target");
+        let (status, Json(body)) = handle_update_instance_mod(
+            State(fixture.state.clone()),
+            Path((instance.id.clone(), "source.jar.disabled".to_string())),
+            Json(UpdateModRequest { enabled: true }),
+        )
+        .await
+        .expect_err("existing target should fail");
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_bounded_error_body(&body, "mod already exists");
+        assert!(mods_dir.join("source.jar.disabled").is_file());
+
+        fs::write(mods_dir.join("toggle.jar"), "toggle").expect("write enabled mod");
+        let Json(body) = handle_update_instance_mod(
+            State(fixture.state.clone()),
+            Path((instance.id.clone(), "toggle.jar".to_string())),
+            Json(UpdateModRequest { enabled: false }),
+        )
+        .await
+        .expect("disable mod");
+        assert_eq!(
+            body,
+            serde_json::json!({ "status": "ok", "name": "toggle.jar.disabled", "enabled": false })
+        );
+        assert!(!mods_dir.join("toggle.jar").exists());
+        assert_eq!(
+            fs::read_to_string(mods_dir.join("toggle.jar.disabled")).expect("read disabled mod"),
+            "toggle"
+        );
+
+        let Json(body) = handle_update_instance_mod(
+            State(fixture.state.clone()),
+            Path((instance.id.clone(), "toggle.jar.disabled".to_string())),
+            Json(UpdateModRequest { enabled: true }),
+        )
+        .await
+        .expect("enable mod");
+        assert_eq!(
+            body,
+            serde_json::json!({ "status": "ok", "name": "toggle.jar", "enabled": true })
+        );
+        assert!(mods_dir.join("toggle.jar").is_file());
+        assert!(!mods_dir.join("toggle.jar.disabled").exists());
+    }
+
+    #[tokio::test]
+    async fn instance_mod_delete_removes_only_named_mod_file() {
+        let fixture = TestFixture::new("mod-delete");
+        let instance = fixture
+            .state
+            .instances()
+            .add(
+                "Delete mods".to_string(),
+                "1.21.1".to_string(),
+                String::new(),
+                String::new(),
+                None,
+            )
+            .expect("add instance");
+        let mods_dir = fixture.state.instances().game_dir(&instance.id).join("mods");
+        fs::create_dir_all(&mods_dir).expect("create mods dir");
+        fs::write(mods_dir.join("delete.jar"), "deleted").expect("write deleted mod");
+        fs::write(mods_dir.join("keep.jar"), "kept").expect("write kept mod");
+
+        let Json(body) = handle_delete_instance_mod(
+            State(fixture.state.clone()),
+            Path((instance.id, "delete.jar".to_string())),
+        )
+        .await
+        .expect("delete mod");
+
+        assert_eq!(body, serde_json::json!({ "status": "ok" }));
+        assert!(!mods_dir.join("delete.jar").exists());
+        assert_eq!(
+            fs::read_to_string(mods_dir.join("keep.jar")).expect("read kept mod"),
+            "kept"
+        );
     }
 
     #[test]

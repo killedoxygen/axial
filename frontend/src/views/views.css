@@ -137,6 +137,11 @@
 .cp-icard[data-installing="true"]:hover {
   transform: translateY(-1px);
 }
+.cp-icard[data-selected="true"] {
+  box-shadow:
+    var(--shadow-raised),
+    0 0 0 2px var(--accent-fill);
+}
 .cp-icard-art {
   position: relative;
   aspect-ratio: 16 / 10;
@@ -152,6 +157,12 @@
 .cp-icard[data-installing="true"] .cp-icard-canvas {
   opacity: 0.52;
   filter: saturate(0.6);
+}
+.cp-icard-select {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 2;
 }
 .cp-icard-play {
   position: absolute;

@@ -5,6 +5,7 @@ import { toast } from '../../toast';
 import { errMessage } from '../../utils';
 import type { EnrichedInstance } from '../../types';
 import { openInstanceFolder } from './instance-actions';
+import { confirmDeleteItems, partialFailureMessage, runBulkMutation } from './bulk-actions';
 
 function worldNameError(value: string): string | null {
   const name = value.trim();
@@ -48,6 +49,27 @@ export async function deleteWorld(inst: EnrichedInstance, worldName: string, onD
   } catch (err) {
     toast(`Could not delete the world: ${errMessage(err)}`, 'error');
   }
+}
+
+export async function deleteWorlds(inst: EnrichedInstance, worldNames: string[], onDone: () => void): Promise<void> {
+  const confirmed = await confirmDeleteItems({
+    count: worldNames.length,
+    itemLabel: 'world',
+    message: worldNames.length === 1
+      ? `Delete "${worldNames[0]!}" from this instance. This removes the save folder from disk.`
+      : `Delete ${worldNames.length} worlds from this instance. This removes the selected save folders from disk.`,
+  });
+  if (!confirmed) return;
+  await runBulkMutation({
+    items: worldNames,
+    action: async (worldName) => {
+      const res: any = await api('DELETE', `/instances/${encodeURIComponent(inst.id)}/worlds/${encodeURIComponent(worldName)}`);
+      if (res?.error) throw new Error(res.error);
+    },
+    success: (count) => count === 1 ? 'World deleted' : `${count} worlds deleted`,
+    partial: (done, total, err) => partialFailureMessage('Deleted', done, total, err),
+    onDone,
+  });
 }
 
 export async function backupWorld(inst: EnrichedInstance, worldName: string, onDone: () => void): Promise<void> {

@@ -4,6 +4,7 @@ import { errMessage } from '../../utils';
 import { prompt, showChoice } from '../../ui/Dialog';
 import { addInstance, removeInstance, updateInstanceInList } from '../../actions';
 import type { Instance } from '../../types';
+import { partialFailureMessage, runBulkMutation } from './bulk-actions';
 
 // Instance-level actions shared between InstanceDetailView and InstancesView,
 // plus the folder helper used across this view's cards and panes.
@@ -63,4 +64,34 @@ export async function deleteInstanceFlow(inst: Instance, onDone?: () => void): P
   } catch (err) {
     toast(`Could not remove the instance: ${errMessage(err)}`, 'error');
   }
+}
+
+export async function deleteInstancesFlow(selected: Instance[], onDone?: () => void): Promise<void> {
+  if (selected.length === 0) return;
+  if (selected.length === 1) {
+    await deleteInstanceFlow(selected[0]!, onDone);
+    return;
+  }
+  const choice = await showChoice<'keep-files' | 'delete-files'>(
+    `Remove ${selected.length} instances from the launcher. You can keep files on disk, or delete the selected instances and their saves, mods, and config.`,
+    [
+      { value: 'keep-files', label: 'Remove, keep files', variant: 'secondary' },
+      { value: 'delete-files', label: 'Delete instances and files', variant: 'danger' },
+    ],
+    { title: 'Remove selected instances' },
+  );
+  if (!choice) return;
+  const keepFiles = choice === 'keep-files';
+  await runBulkMutation({
+    items: selected,
+    action: async (inst) => {
+      const suffix = keepFiles ? '?keep_files=true' : '';
+      const res: any = await api('DELETE', `/instances/${encodeURIComponent(inst.id)}${suffix}`);
+      if (res?.error) throw new Error(res.error);
+      removeInstance(inst.id);
+    },
+    success: (count) => keepFiles ? `${count} instances removed; files kept on disk` : `${count} instances deleted`,
+    partial: (done, total, err) => partialFailureMessage('Removed', done, total, err),
+    onDone: () => onDone?.(),
+  });
 }
