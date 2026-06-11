@@ -643,7 +643,8 @@ pub fn resolve_plan(manifest: Option<&Manifest>, request: ResolutionRequest) -> 
         .map(|value| value.to_lowercase())
         .collect();
 
-    let mut skipped_warnings = Vec::new();
+    let mut fallback_warnings = Vec::new();
+    let mut fallback_reason = String::new();
     for tier in [
         CompositionTier::Extended,
         CompositionTier::Core,
@@ -652,17 +653,26 @@ pub fn resolve_plan(manifest: Option<&Manifest>, request: ResolutionRequest) -> 
         for definition in matching_compositions(manifest, family, &loader, tier) {
             if let Some(disable) = active_composition_disable(manifest, definition, family, &loader)
             {
-                skipped_warnings.push(composition_disable_warning(disable, &definition.id));
+                push_unique_warning(
+                    &mut fallback_warnings,
+                    composition_disable_warning(disable, &definition.id),
+                );
+                if fallback_reason.is_empty() {
+                    fallback_reason = "A faster performance bundle is temporarily unavailable, so Croopor chose the safest available option.".to_string();
+                }
                 continue;
             }
 
             let mut active_mods = Vec::new();
-            let mut warnings = skipped_warnings.clone();
+            let mut warnings = fallback_warnings.clone();
+            let mut inactive_warnings = Vec::new();
             for managed_mod in &definition.mods {
                 if let Some(disable) =
                     active_artifact_disable(manifest, managed_mod, family, &loader, definition.tier)
                 {
-                    warnings.push(artifact_disable_warning(disable, managed_mod));
+                    let warning = artifact_disable_warning(disable, managed_mod);
+                    push_unique_warning(&mut warnings, warning.clone());
+                    push_unique_warning(&mut inactive_warnings, warning);
                     continue;
                 }
 
@@ -673,7 +683,8 @@ pub fn resolve_plan(manifest: Option<&Manifest>, request: ResolutionRequest) -> 
                     &installed_set,
                 );
                 if !warning.is_empty() {
-                    warnings.push(warning);
+                    push_unique_warning(&mut warnings, warning.clone());
+                    push_unique_warning(&mut inactive_warnings, warning);
                 }
                 if include {
                     active_mods.push(managed_mod.clone());
@@ -681,7 +692,7 @@ pub fn resolve_plan(manifest: Option<&Manifest>, request: ResolutionRequest) -> 
             }
 
             if active_mods.len() >= 2 || matches!(tier, CompositionTier::VanillaEnhanced) {
-                let mut plan = CompositionPlan {
+                let plan = CompositionPlan {
                     composition_id: definition.id.clone(),
                     family,
                     loader: loader.clone(),
@@ -691,25 +702,37 @@ pub fn resolve_plan(manifest: Option<&Manifest>, request: ResolutionRequest) -> 
                     jvm_preset: definition.jvm_preset.clone(),
                     fallback_chain: fallback_chain(manifest, &definition.id),
                     warnings,
-                    fallback_reason: String::new(),
+                    fallback_reason: fallback_reason.clone(),
                 };
-                if !matches!(tier, CompositionTier::Extended) {
-                    plan.fallback_reason = if skipped_warnings.is_empty() {
-                        "higher-tier managed composition is unavailable for this combination"
-                            .to_string()
-                    } else {
-                        "a higher-tier managed composition is temporarily disabled".to_string()
-                    };
-                }
                 return plan;
+            }
+
+            if !matches!(tier, CompositionTier::VanillaEnhanced) {
+                for warning in inactive_warnings {
+                    push_unique_warning(&mut fallback_warnings, warning);
+                }
+                push_unique_warning(
+                    &mut fallback_warnings,
+                    format!(
+                        "{} skipped: not enough compatible performance mods for this instance",
+                        definition.id
+                    ),
+                );
+                if fallback_reason.is_empty() {
+                    fallback_reason = "A faster performance bundle is not compatible with this instance, so Croopor chose a safer option.".to_string();
+                }
             }
         }
     }
 
     let mut plan = vanilla_enhanced_plan(family, loader, mode);
-    plan.warnings = skipped_warnings;
+    plan.warnings = fallback_warnings;
     if !plan.warnings.is_empty() {
-        plan.fallback_reason = "managed compositions are temporarily disabled".to_string();
+        plan.fallback_reason = if fallback_reason.is_empty() {
+            "Managed performance bundles are temporarily unavailable, so Croopor will only tune launcher settings.".to_string()
+        } else {
+            fallback_reason
+        };
     }
     plan
 }
@@ -908,6 +931,12 @@ fn artifact_disable_warning(disable: &EmergencyDisable, managed_mod: &ManagedMod
         "{} skipped by emergency disable {}: {}",
         managed_mod.slug, disable.id, disable.reason
     )
+}
+
+fn push_unique_warning(warnings: &mut Vec<String>, warning: String) {
+    if !warnings.iter().any(|existing| existing == &warning) {
+        warnings.push(warning);
+    }
 }
 
 fn fallback_chain(manifest: &Manifest, start_id: &str) -> Vec<String> {
@@ -1236,7 +1265,7 @@ mod tests {
     };
     use crate::types::{
         CompositionPlan, CompositionTier, EmergencyDisable, EmergencyDisableTarget,
-        HardwareProfile, HardwareRequirement, ManagedMod, Manifest, OwnershipClass,
+        HardwareProfile, HardwareRequirement, ManagedMod, Manifest, ModCondition, OwnershipClass,
         PerformanceMode, VersionFamily,
     };
     use std::path::Path;
@@ -1274,6 +1303,7 @@ mod tests {
                 assert_eq!(plan.loader, loader);
                 assert_eq!(plan.tier, CompositionTier::VanillaEnhanced);
                 assert!(plan.mods.is_empty());
+                assert!(plan.fallback_reason.is_empty());
             }
         }
     }
@@ -1304,6 +1334,7 @@ mod tests {
         assert_eq!(count_mods_with_slug(&plan.mods, "foamfix"), 1);
         assert_eq!(count_mods_with_slug(&plan.mods, "ai-improvements"), 1);
         assert_eq!(count_mods_with_slug(&plan.mods, "clumps"), 1);
+        assert!(plan.fallback_reason.is_empty());
     }
 
     #[test]
@@ -1327,6 +1358,7 @@ mod tests {
             assert_eq!(plan.loader, loader);
             assert_eq!(plan.tier, CompositionTier::VanillaEnhanced);
             assert!(plan.mods.is_empty());
+            assert!(plan.fallback_reason.is_empty());
         }
     }
 
@@ -1356,7 +1388,7 @@ mod tests {
         assert!(plan.mods.is_empty());
         assert_eq!(
             plan.fallback_reason,
-            "a higher-tier managed composition is temporarily disabled"
+            "A faster performance bundle is temporarily unavailable, so Croopor chose the safest available option."
         );
         assert!(plan.warnings.iter().any(|warning| {
             warning.contains("family-c-forge-core skipped by emergency disable")
@@ -1480,7 +1512,7 @@ mod tests {
                 assert_eq!(count_mods_with_slug(&fallback_plan.mods, "ferrite-core"), 1);
                 assert_eq!(
                     fallback_plan.fallback_reason,
-                    "a higher-tier managed composition is temporarily disabled"
+                    "A faster performance bundle is temporarily unavailable, so Croopor chose the safest available option."
                 );
                 let expected_warning =
                     format!("{extended_composition_id} skipped by emergency disable");
@@ -2322,11 +2354,70 @@ mod tests {
         }
         assert_eq!(
             plan.fallback_reason,
-            "a higher-tier managed composition is temporarily disabled"
+            "A faster performance bundle is temporarily unavailable, so Croopor chose the safest available option."
         );
         assert!(plan.warnings.iter().any(|warning| {
             warning.contains("family-f-fabric-extended skipped by emergency disable")
                 && warning.contains("Temporary hold.")
+        }));
+    }
+
+    #[test]
+    fn depleted_higher_bundle_falls_back_with_compatibility_reason() {
+        let mut manifest = builtin_manifest().expect("manifest");
+        let extended = manifest
+            .compositions
+            .iter_mut()
+            .find(|composition| composition.id == "family-f-fabric-extended")
+            .expect("extended composition");
+        extended.mods = vec![
+            ManagedMod {
+                artifact_id: "nvidium".to_string(),
+                project_id: "nvidium".to_string(),
+                slug: "nvidium".to_string(),
+                name: "Nvidium".to_string(),
+                condition: ModCondition::Hardware,
+                version_range: ">=1.20.1".to_string(),
+                hardware_req: Some(HardwareRequirement {
+                    gpu_vendor: "nvidia".to_string(),
+                    gpu_arch_min: 2,
+                    min_ram_mb: 0,
+                    min_cores: 0,
+                }),
+                mutual_exclusions: Vec::new(),
+            },
+            ManagedMod {
+                artifact_id: "sodium".to_string(),
+                project_id: "sodium".to_string(),
+                slug: "sodium".to_string(),
+                name: "Sodium".to_string(),
+                condition: ModCondition::Recommend,
+                version_range: String::new(),
+                hardware_req: None,
+                mutual_exclusions: Vec::new(),
+            },
+        ];
+
+        let plan = resolve_plan(
+            Some(&manifest),
+            ResolutionRequest {
+                game_version: "1.20.4".to_string(),
+                loader: "fabric".to_string(),
+                mode: PerformanceMode::Managed,
+                hardware: HardwareProfile::default(),
+                installed_mods: Vec::new(),
+            },
+        );
+
+        assert_eq!(plan.composition_id, "family-f-fabric-core");
+        assert_eq!(plan.tier, CompositionTier::Core);
+        assert_eq!(
+            plan.fallback_reason,
+            "A faster performance bundle is not compatible with this instance, so Croopor chose a safer option."
+        );
+        assert!(plan.warnings.iter().any(|warning| {
+            warning
+                == "family-f-fabric-extended skipped: not enough compatible performance mods for this instance"
         }));
     }
 
