@@ -81,37 +81,40 @@ function RailInstances({ tooltip }: { tooltip: RailTooltipController }): JSX.Ele
     .sort((a, b) => recentTime(b) - recentTime(a) || a.name.localeCompare(b.name));
   if (list.length === 0) return null;
   return (
-    <div class="cp-rail-instances">
-      {list.map(inst => {
-        const active = current.name === 'instance' && current.id === inst.id;
-        const running = !!runningSessions.value[inst.id];
-        const version = versions.value.find(v => v.id === inst.version_id);
-        const install = instanceInstallStatus(inst, version);
-        const installing = install.installing;
-        const installLabel = install.state === 'queued' ? 'Install queued' : 'Installing';
-        return (
-          <button
-            key={inst.id}
-            class="cp-rail-tile"
-            data-active={active}
-            data-running={running}
-            data-installing={installing}
-            onClick={() => { tooltip.hide(); navigate({ name: 'instance', id: inst.id }); }}
-            onContextMenu={(e) => { tooltip.hide(); openInstanceContextMenu(e, inst); }}
-            aria-label={installing ? `${inst.name}: ${installLabel}` : inst.name}
-            {...railTipAttrs(installing ? `${inst.name} · ${installLabel}` : inst.name, tooltip)}
-          >
-            <InstanceTile inst={inst} radius={12} className="cp-rail-tile-art" />
-            {installing && (
-              <span class="cp-rail-tile-install" aria-hidden="true">
-                <Icon name={install.state === 'queued' ? 'clock' : 'download'} size={10} stroke={2.4} />
-              </span>
-            )}
-            {running && <span class="cp-rail-tile-dot" aria-hidden="true" />}
-          </button>
-        );
-      })}
-    </div>
+    <>
+      <div class="cp-rail-sep" aria-hidden="true" />
+      <div class="cp-rail-instances">
+        {list.map(inst => {
+          const active = current.name === 'instance' && current.id === inst.id;
+          const running = !!runningSessions.value[inst.id];
+          const version = versions.value.find(v => v.id === inst.version_id);
+          const install = instanceInstallStatus(inst, version);
+          const installing = install.installing;
+          const installLabel = install.state === 'queued' ? 'Install queued' : 'Installing';
+          return (
+            <button
+              key={inst.id}
+              class="cp-rail-tile"
+              data-active={active}
+              data-running={running}
+              data-installing={installing}
+              onClick={() => { tooltip.hide(); navigate({ name: 'instance', id: inst.id }); }}
+              onContextMenu={(e) => { tooltip.hide(); openInstanceContextMenu(e, inst); }}
+              aria-label={installing ? `${inst.name}: ${installLabel}` : inst.name}
+              {...railTipAttrs(installing ? `${inst.name} · ${installLabel}` : inst.name, tooltip)}
+            >
+              <InstanceTile inst={inst} radius={12} className="cp-rail-tile-art" />
+              {installing && (
+                <span class="cp-rail-tile-install" aria-hidden="true">
+                  <Icon name={install.state === 'queued' ? 'clock' : 'download'} size={10} stroke={2.4} />
+                </span>
+              )}
+              {running && <span class="cp-rail-tile-dot" aria-hidden="true" />}
+            </button>
+          );
+        })}
+      </div>
+    </>
   );
 }
 
@@ -257,7 +260,6 @@ export function Sidebar(): JSX.Element {
       >
         <Icon name="plus" size={20} stroke={1.7} />
       </button>
-      <div class="cp-rail-sep" aria-hidden="true" />
       <RailInstances tooltip={tooltip} />
       <div class="cp-rail-spacer" />
       <RailButton icon="settings" label="Settings" target={{ name: 'settings' }} tooltip={tooltip} />
