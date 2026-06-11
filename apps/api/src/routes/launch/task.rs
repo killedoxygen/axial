@@ -161,6 +161,9 @@ async fn prepare_launch_session_with_auth_refresh(
     } else {
         launch_auth_context_for_config(state, &config, &username).await?
     };
+    if config.launch_auth_mode == LAUNCH_AUTH_MODE_ONLINE {
+        super::super::skin::flush_pending_saved_skin_applies_for_launch(state).await?;
+    }
     let preflight = build_launch_preflight_facts(
         state,
         &instance,

@@ -657,6 +657,14 @@ impl AuthLoginStore {
         self.active_auth_generation.load(Ordering::Acquire)
     }
 
+    pub(crate) async fn active_minecraft_login_id(&self) -> Option<String> {
+        self.active_minecraft_account
+            .read()
+            .await
+            .as_ref()
+            .map(|account| account.login_id.clone())
+    }
+
     #[cfg(test)]
     pub async fn active_msa_token(&self) -> Option<AuthLoginMsaToken> {
         self.active_msa_token.read().await.clone()

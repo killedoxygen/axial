@@ -7,7 +7,7 @@ use std::{
 };
 
 const SKIN_STORE_SCHEMA: &str = "croopor.skins.saved";
-const SKIN_STORE_SCHEMA_VERSION: u32 = 2;
+const SKIN_STORE_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -16,10 +16,18 @@ pub struct SavedSkinRecord {
     pub name: String,
     pub variant: String,
     pub source: String,
+    pub cape_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub applied_at: Option<String>,
     pub byte_size: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SavedSkinDeleteResult {
+    Deleted(SavedSkinRecord),
+    Applied,
+    Missing,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -70,6 +78,7 @@ impl SavedSkinStore {
         name: String,
         variant: String,
         source: String,
+        cape_id: Option<String>,
         png_bytes: &[u8],
     ) -> io::Result<SavedSkinRecord> {
         let _guard = self.lock.lock().map_err(|_| lock_error())?;
@@ -94,6 +103,7 @@ impl SavedSkinStore {
             name,
             variant,
             source,
+            cape_id,
             created_at,
             updated_at: now,
             applied_at,
@@ -112,6 +122,21 @@ impl SavedSkinStore {
     }
 
     pub fn delete(&self, texture_key: &str) -> io::Result<Option<SavedSkinRecord>> {
+        match self.delete_record(texture_key, false)? {
+            SavedSkinDeleteResult::Deleted(record) => Ok(Some(record)),
+            SavedSkinDeleteResult::Applied | SavedSkinDeleteResult::Missing => Ok(None),
+        }
+    }
+
+    pub fn delete_unapplied(&self, texture_key: &str) -> io::Result<SavedSkinDeleteResult> {
+        self.delete_record(texture_key, true)
+    }
+
+    fn delete_record(
+        &self,
+        texture_key: &str,
+        protect_applied: bool,
+    ) -> io::Result<SavedSkinDeleteResult> {
         let _guard = self.lock.lock().map_err(|_| lock_error())?;
         let mut index = self.load_index()?;
         let Some(position) = index
@@ -119,8 +144,12 @@ impl SavedSkinStore {
             .iter()
             .position(|skin| skin.texture_key == texture_key)
         else {
-            return Ok(None);
+            return Ok(SavedSkinDeleteResult::Missing);
         };
+
+        if protect_applied && index.skins[position].applied_at.is_some() {
+            return Ok(SavedSkinDeleteResult::Applied);
+        }
 
         let record = index.skins.remove(position);
         let file_path = self.skin_file_path(texture_key);
@@ -136,7 +165,7 @@ impl SavedSkinStore {
             let _ = fs::remove_file(&parked_file_path);
         }
 
-        Ok(Some(record))
+        Ok(SavedSkinDeleteResult::Deleted(record))
     }
 
     pub fn update_metadata(
@@ -144,6 +173,7 @@ impl SavedSkinStore {
         texture_key: &str,
         name: Option<String>,
         variant: Option<String>,
+        cape_id: Option<Option<String>>,
     ) -> io::Result<Option<SavedSkinRecord>> {
         let _guard = self.lock.lock().map_err(|_| lock_error())?;
         let mut index = self.load_index()?;
@@ -156,17 +186,113 @@ impl SavedSkinStore {
         };
 
         let record = &mut index.skins[position];
+        let applied_profile_changed = record.applied_at.is_some()
+            && (variant
+                .as_ref()
+                .is_some_and(|variant| variant != &record.variant)
+                || cape_id
+                    .as_ref()
+                    .is_some_and(|cape_id| cape_id != &record.cape_id));
         if let Some(name) = name {
             record.name = name;
         }
         if let Some(variant) = variant {
             record.variant = variant;
         }
+        if let Some(cape_id) = cape_id {
+            record.cape_id = cape_id;
+        }
+        if applied_profile_changed {
+            record.applied_at = None;
+        }
         record.updated_at = chrono::Utc::now().to_rfc3339();
         let updated = record.clone();
         self.persist_index(&index)?;
 
         Ok(Some(updated))
+    }
+
+    pub fn replace_texture(
+        &self,
+        texture_key: &str,
+        new_texture_key: String,
+        name: String,
+        variant: String,
+        cape_id: Option<String>,
+        png_bytes: &[u8],
+    ) -> io::Result<Option<SavedSkinRecord>> {
+        let _guard = self.lock.lock().map_err(|_| lock_error())?;
+        fs::create_dir_all(&self.file_dir)?;
+        let mut index = self.load_index()?;
+        let Some(position) = index
+            .skins
+            .iter()
+            .position(|skin| skin.texture_key == texture_key)
+        else {
+            return Ok(None);
+        };
+
+        let old_record = index.skins[position].clone();
+        let same_texture = old_record.texture_key == new_texture_key;
+        let applied_profile_changed =
+            old_record.variant != variant || old_record.cape_id != cape_id || !same_texture;
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut record = SavedSkinRecord {
+            texture_key: new_texture_key.clone(),
+            name,
+            variant,
+            source: old_record.source.clone(),
+            cape_id,
+            created_at: old_record.created_at.clone(),
+            updated_at: now,
+            applied_at: if applied_profile_changed {
+                None
+            } else {
+                old_record.applied_at.clone()
+            },
+            byte_size: png_bytes.len(),
+        };
+
+        let new_file_path = self.skin_file_path(&new_texture_key);
+        let new_file_existed = new_file_path.exists();
+        write_atomic(&new_file_path, png_bytes)?;
+
+        if same_texture {
+            index.skins[position] = record.clone();
+        } else if let Some(existing_position) = index
+            .skins
+            .iter()
+            .position(|skin| skin.texture_key == new_texture_key)
+        {
+            let existing_applied_at = index.skins[existing_position].applied_at.clone();
+            record.applied_at = if index.skins[existing_position].variant == record.variant
+                && index.skins[existing_position].cape_id == record.cape_id
+            {
+                existing_applied_at
+            } else {
+                None
+            };
+            index.skins[existing_position] = record.clone();
+            index.skins.remove(position);
+        } else {
+            index.skins[position] = record.clone();
+        }
+
+        if let Err(error) = self.persist_index(&index) {
+            if !new_file_existed {
+                let _ = fs::remove_file(&new_file_path);
+            }
+            return Err(error);
+        }
+
+        if !same_texture {
+            let old_file_path = self.skin_file_path(&old_record.texture_key);
+            if old_file_path != new_file_path {
+                let _ = fs::remove_file(old_file_path);
+            }
+        }
+
+        Ok(Some(record))
     }
 
     pub fn mark_applied(&self, texture_key: &str) -> io::Result<Option<String>> {
@@ -191,6 +317,19 @@ impl SavedSkinStore {
         self.persist_index(&index)?;
 
         Ok(Some(applied_at))
+    }
+
+    pub fn clear_applied(&self) -> io::Result<()> {
+        let _guard = self.lock.lock().map_err(|_| lock_error())?;
+        let mut index = self.load_index()?;
+        if !index.skins.iter().any(|skin| skin.applied_at.is_some()) {
+            return Ok(());
+        }
+
+        for skin in &mut index.skins {
+            skin.applied_at = None;
+        }
+        self.persist_index(&index)
     }
 
     pub fn read_png(&self, texture_key: &str) -> io::Result<Option<Vec<u8>>> {
@@ -371,6 +510,7 @@ mod tests {
                 "Saved Skin".to_string(),
                 "classic".to_string(),
                 "test".to_string(),
+                None,
                 png_bytes,
             )
             .expect("save skin");
@@ -394,6 +534,155 @@ mod tests {
             png_bytes
         );
         assert!(!store.skin_delete_file_path(texture_key).exists());
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn saved_skin_delete_unapplied_preserves_applied_record() {
+        let root = test_root("delete-applied-preserved");
+        let store = test_store(&root);
+        let texture_key = "saved-skin";
+        let png_bytes = b"skin bytes";
+        let saved = store
+            .save(
+                texture_key.to_string(),
+                "Saved Skin".to_string(),
+                "classic".to_string(),
+                "test".to_string(),
+                None,
+                png_bytes,
+            )
+            .expect("save skin");
+        store
+            .mark_applied(texture_key)
+            .expect("mark applied")
+            .expect("skin should exist");
+
+        let result = store
+            .delete_unapplied(texture_key)
+            .expect("delete should return a protected result");
+
+        assert_eq!(result, SavedSkinDeleteResult::Applied);
+        let listed = store.list().expect("list saved skins");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].texture_key, saved.texture_key);
+        assert!(listed[0].applied_at.is_some());
+        assert_eq!(
+            store
+                .read_png(texture_key)
+                .expect("read should not fail")
+                .expect("skin png should remain readable"),
+            png_bytes
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn saved_skin_name_update_preserves_applied_marker() {
+        let root = test_root("name-update-preserves-applied");
+        let store = test_store(&root);
+        let texture_key = "saved-skin";
+        store
+            .save(
+                texture_key.to_string(),
+                "Saved Skin".to_string(),
+                "classic".to_string(),
+                "test".to_string(),
+                Some("cape-one".to_string()),
+                b"skin bytes",
+            )
+            .expect("save skin");
+        let applied_at = store
+            .mark_applied(texture_key)
+            .expect("mark applied")
+            .expect("applied timestamp");
+
+        let updated = store
+            .update_metadata(texture_key, Some("Renamed Skin".to_string()), None, None)
+            .expect("update metadata")
+            .expect("saved skin should exist");
+
+        assert_eq!(updated.name, "Renamed Skin");
+        assert_eq!(updated.applied_at.as_deref(), Some(applied_at.as_str()));
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn saved_skin_profile_metadata_update_clears_applied_marker() {
+        let root = test_root("profile-metadata-clears-applied");
+        let store = test_store(&root);
+        let texture_key = "saved-skin";
+        store
+            .save(
+                texture_key.to_string(),
+                "Saved Skin".to_string(),
+                "classic".to_string(),
+                "test".to_string(),
+                Some("cape-one".to_string()),
+                b"skin bytes",
+            )
+            .expect("save skin");
+        store
+            .mark_applied(texture_key)
+            .expect("mark applied")
+            .expect("applied timestamp");
+
+        let updated = store
+            .update_metadata(
+                texture_key,
+                None,
+                Some("slim".to_string()),
+                Some(Some("cape-two".to_string())),
+            )
+            .expect("update metadata")
+            .expect("saved skin should exist");
+
+        assert_eq!(updated.variant, "slim");
+        assert_eq!(updated.cape_id.as_deref(), Some("cape-two"));
+        assert_eq!(updated.applied_at, None);
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn saved_skin_same_texture_replacement_clears_applied_marker_when_profile_metadata_changes() {
+        let root = test_root("same-texture-replace-clears-applied");
+        let store = test_store(&root);
+        let texture_key = "saved-skin";
+        let png_bytes = b"skin bytes";
+        store
+            .save(
+                texture_key.to_string(),
+                "Saved Skin".to_string(),
+                "classic".to_string(),
+                "test".to_string(),
+                None,
+                png_bytes,
+            )
+            .expect("save skin");
+        store
+            .mark_applied(texture_key)
+            .expect("mark applied")
+            .expect("applied timestamp");
+
+        let updated = store
+            .replace_texture(
+                texture_key,
+                texture_key.to_string(),
+                "Saved Skin".to_string(),
+                "slim".to_string(),
+                None,
+                png_bytes,
+            )
+            .expect("replace texture")
+            .expect("saved skin should exist");
+
+        assert_eq!(updated.texture_key, texture_key);
+        assert_eq!(updated.variant, "slim");
+        assert_eq!(updated.applied_at, None);
 
         cleanup(&root);
     }

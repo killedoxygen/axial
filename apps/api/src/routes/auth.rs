@@ -393,6 +393,10 @@ async fn handle_auth_logout(
     auth_logout(state.auth_logins()).await
 }
 
+async fn active_minecraft_login_id(login_store: &Arc<AuthLoginStore>) -> Option<String> {
+    login_store.active_minecraft_login_id().await
+}
+
 async fn auth_status_for_store(
     config: &AppConfig,
     login_config: AuthLoginConfig,
@@ -494,17 +498,36 @@ fn minecraft_account_can_launch_online(account: &AuthLoginMinecraftAccount) -> b
 }
 
 async fn auth_logout(login_store: &Arc<AuthLoginStore>) -> (StatusCode, Json<serde_json::Value>) {
+    let active_login_id = active_minecraft_login_id(login_store).await;
     match login_store.clear_all().await {
-        Ok((cleared_pending_logins, had_msa_auth)) => (
-            StatusCode::OK,
-            Json(serde_json::json!(AuthLogoutResponse {
-                status: "logged_out",
-                cleared_pending_logins,
-                had_msa_auth,
-            })),
-        ),
+        Ok((cleared_pending_logins, had_msa_auth)) => {
+            if let Some(login_id) = active_login_id {
+                super::skin::clear_pending_saved_skin_apply_for_login_id(&login_id).await;
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!(AuthLogoutResponse {
+                    status: "logged_out",
+                    cleared_pending_logins,
+                    had_msa_auth,
+                })),
+            )
+        }
         Err(_) => auth_clear_failed_response(),
     }
+}
+
+async fn clear_active_auth_and_pending_skin_apply(
+    login_store: &Arc<AuthLoginStore>,
+) -> Result<bool, ()> {
+    let active_login_id = active_minecraft_login_id(login_store).await;
+    let cleared = login_store.clear_active_auth().await.map_err(|_| ())?;
+    if cleared {
+        if let Some(login_id) = active_login_id {
+            super::skin::clear_pending_saved_skin_apply_for_login_id(&login_id).await;
+        }
+    }
+    Ok(cleared)
 }
 
 async fn auth_login_for_config(
@@ -720,7 +743,10 @@ async fn auth_login_poll_success_response(
         Ok(exchange) => NewAuthLoginMinecraftAccount::from(exchange),
         Err(error) => {
             let _ = login_store.remove(login_id).await;
-            if login_store.clear_active_auth().await.is_err() {
+            if clear_active_auth_and_pending_skin_apply(login_store)
+                .await
+                .is_err()
+            {
                 return auth_clear_failed_response();
             }
             return auth_chain_error_response(error);
@@ -928,8 +954,7 @@ async fn auth_refresh_oauth_error(
             | MsaTokenErrorCode::BadVerificationCode
             | MsaTokenErrorCode::ExpiredToken
     ) {
-        login_store
-            .clear_active_auth()
+        clear_active_auth_and_pending_skin_apply(login_store)
             .await
             .map_err(|_| AuthRefreshFailure::new(AuthRefreshFailureKind::StoreUnavailable))?;
         return Err(AuthRefreshFailure::new(
