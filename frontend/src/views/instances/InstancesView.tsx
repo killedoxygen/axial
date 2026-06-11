@@ -1,6 +1,6 @@
 import type { JSX } from 'preact';
 import { useState } from 'preact/hooks';
-import { InstanceArt } from '../../art/InstanceArt';
+import { InstanceTile } from '../../ui/InstanceVisual';
 import { Button, IconButton, Input, Segmented, Pill } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { InstanceCard } from '../../ui/InstanceCard';
@@ -10,6 +10,7 @@ import { navigate, openCreate } from '../../ui-state';
 import { loaderKeyFromVersion, LOADER_LABELS } from '../create/defaults';
 import { openInstanceContextMenu } from '../instance/instance-menu';
 import { supportsMods } from '../../utils';
+import { minecraftVersionLabel } from '../../version-display';
 import type { EnrichedInstance, Version } from '../../types';
 
 function fmtRelative(iso?: string): string {
@@ -29,8 +30,7 @@ function fmtRelative(iso?: string): string {
 }
 
 function versionLabel(v: Version | undefined): string {
-  if (!v) return '—';
-  return v.minecraft_meta.display_hint || v.minecraft_meta.display_name || v.id;
+  return minecraftVersionLabel(v, '—');
 }
 
 function loaderLabel(v: Version | undefined): string {
@@ -51,7 +51,7 @@ function ListRow({ inst }: { inst: EnrichedInstance }): JSX.Element {
       onClick={() => navigate({ name: 'instance', id: inst.id })}
       onContextMenu={(e) => openInstanceContextMenu(e, inst)}
     >
-      <InstanceArt instance={inst} aspect="thumb" radius={theme.r.sm} style={{ width: 36, height: 36 }} />
+      <InstanceTile inst={inst} radius={theme.r.sm} style={{ width: 36, height: 36 }} />
       <div>
         <div class="cp-table-row-title" style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           {inst.name}

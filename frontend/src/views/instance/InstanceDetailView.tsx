@@ -3,7 +3,7 @@ import { useEffect, useState } from 'preact/hooks';
 import { Icon } from '../../ui/Icons';
 import { Button, IconButton, Pill } from '../../ui/Atoms';
 import { useTheme } from '../../hooks/use-theme';
-import { InstanceArt } from '../../art/InstanceArt';
+import { InstanceTile } from '../../ui/InstanceVisual';
 import { openContextMenu } from '../../ui/ContextMenu';
 import { installFailure, installQueue, installState, instances, launchNotices, launchState, runningSessions, versions } from '../../store';
 import { navigate } from '../../ui-state';
@@ -12,6 +12,7 @@ import { launchGame, killGame } from '../../launch';
 import { handleInstallClick, retryFailedInstall } from '../../install';
 import { formatInstallItemLabel } from '../../install-labels';
 import { errMessage, supportsMods } from '../../utils';
+import { minecraftVersionLabel } from '../../version-display';
 import { loaderKeyFromVersion, LOADER_LABELS } from '../create/defaults';
 import type { EnrichedInstance, InstallItem, Version } from '../../types';
 import { fmtJoined, fmtRelative } from './format';
@@ -56,7 +57,7 @@ function installItemFor(inst: EnrichedInstance, version: Version | undefined): I
     loader: {
       componentId: version.loader.component_id,
       buildId: version.loader.build_id,
-      minecraftVersion: version.inherits_from || '',
+      minecraftVersion: minecraftVersionLabel(version, ''),
       loaderVersion: version.loader.loader_version,
     },
   };
@@ -140,7 +141,7 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
   const showModsTab = supportsMods(v);
   const activeTab: Tab = !showModsTab && tab === 'mods' ? 'overview' : tab;
   const visibleTabs = showModsTab ? TABS : TABS.filter((t) => t.id !== 'mods');
-  const mcVer = v?.minecraft_meta.display_hint || v?.minecraft_meta.display_name || 'unknown';
+  const mcVer = minecraftVersionLabel(v);
   const canLaunch = Boolean(v?.launchable);
   const installTarget = installTargetFor(inst, v);
   const installItem = installItemFor(inst, v);
@@ -207,7 +208,6 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
   return (
     <div class={`cp-instance-page${activeTab === 'overview' ? ' cp-instance-page--overview' : ''}`}>
       <div class="cp-instance-cover">
-        <InstanceArt instance={inst} aspect="banner" className="cp-instance-cover-art" />
         <div class="cp-instance-cover-vignette" aria-hidden="true" />
         <div class="cp-instance-cover-glow" aria-hidden="true" />
       </div>
@@ -216,7 +216,7 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
         <div class="cp-instance-titlebar-row">
           <div class="cp-instance-titlebar-left">
             <div class="cp-instance-avatar">
-              <InstanceArt instance={inst} aspect="square" radius={theme.r.lg} />
+              <InstanceTile inst={inst} radius={theme.r.lg} />
             </div>
             <div class="cp-instance-titlebar-text">
               <div class="cp-instance-pills-row">

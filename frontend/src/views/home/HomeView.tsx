@@ -1,6 +1,5 @@
 import type { JSX } from 'preact';
 import { useMemo } from 'preact/hooks';
-import { InstanceArt } from '../../art/InstanceArt';
 import { Button, SectionHeading, Card, Pill } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { InstanceCard } from '../../ui/InstanceCard';
@@ -9,6 +8,7 @@ import { config, instances, runningSessions, versions } from '../../store';
 import { loaderKeyFromVersion, LOADER_LABELS } from '../create/defaults';
 import { openInstanceContextMenu } from '../instance/instance-menu';
 import { supportsMods } from '../../utils';
+import { minecraftVersionLabel } from '../../version-display';
 import type { EnrichedInstance, Version } from '../../types';
 
 function greetingFor(date: Date): string {
@@ -37,8 +37,7 @@ function relativeTime(iso?: string): string {
 }
 
 function versionBadge(v: Version | undefined): string {
-  if (!v) return '—';
-  return v.minecraft_meta.display_hint || v.minecraft_meta.display_name || v.id;
+  return minecraftVersionLabel(v, '—');
 }
 
 function FeatureBanner({ inst }: { inst: EnrichedInstance }): JSX.Element {
@@ -63,8 +62,7 @@ function FeatureBanner({ inst }: { inst: EnrichedInstance }): JSX.Element {
       onKeyDown={onKeyDown}
       onContextMenu={(e) => openInstanceContextMenu(e, inst)}
     >
-      <InstanceArt instance={inst} version={version} aspect="banner" radius={0} className="cp-feature-art" />
-      <div class="cp-feature-scrim" />
+      <div class="cp-feature-glow" aria-hidden="true" />
       <div class="cp-feature-content">
         <div class="cp-feature-id">
           <div class="cp-feature-kicker">{running ? 'Now playing' : 'Jump back in'}</div>

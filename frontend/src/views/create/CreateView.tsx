@@ -3,14 +3,7 @@ import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { Button, IconButton, Input, Pill } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { Slider } from '../../ui/Slider';
-import {
-  InstanceArt,
-  artPresetForSeed,
-  loaderTraitForComponentId,
-  nextArtSeed,
-  versionIdentityForVersion,
-  versionIdentityForVersionId,
-} from '../../art/InstanceArt';
+import { InstanceTile, nextArtSeed } from '../../ui/InstanceVisual';
 import { catalog, config, systemInfo, versions } from '../../store';
 import { setCatalog } from '../../actions';
 import { closeCreate, createOpen } from '../../ui-state';
@@ -51,6 +44,7 @@ import {
   type ScreenSize,
   type WindowPresetSpec,
 } from './screen-presets';
+import { versionSearchText } from '../../version-display';
 import {
   JVM_PRESET_CREATE_ORDER,
   JVM_PRESET_HINTS,
@@ -206,12 +200,13 @@ function CreateCard(): JSX.Element {
     const q = query.trim().toLowerCase();
     const rows = availableForSource
       .filter((v) => channelOfVersion(v) === channel)
-      .filter((v) => !q
-        || v.id.toLowerCase().includes(q)
-        || v.minecraft_meta.display_name.toLowerCase().includes(q));
+      .filter((v) => !q || versionSearchText(v, releaseAnchors).includes(q));
     rows.sort((a, b) => (b.release_time || '').localeCompare(a.release_time || ''));
     return rows.map((v) => buildRowModel(v, releaseAnchors, installedSet, source));
   }, [catalog.value, versions.value, channel, query, availableForSource, releaseAnchors, source]);
+  const selectedVersionRow = mcVersionId
+    ? versionRows.find((row) => row.id === mcVersionId) ?? null
+    : null;
 
   const selectedBuild: LoaderBuildRecord | null = useMemo(() => {
     if (!currentComponentId || !mcVersionId) return null;
@@ -228,11 +223,6 @@ function CreateCard(): JSX.Element {
     }
     return pickPreferredBuild(builds ?? []);
   }, [currentComponentId, mcVersionId, loaderState]);
-
-  const selectedMinecraftVersion = useMemo(() => {
-    if (!mcVersionId) return null;
-    return availableForSource.find((version) => version.id === mcVersionId) ?? null;
-  }, [availableForSource, mcVersionId]);
 
   const effectiveVersionId: string = useMemo(() => {
     if (source === 'vanilla') return mcVersionId ?? '';
@@ -258,13 +248,6 @@ function CreateCard(): JSX.Element {
     return hashStr(`${previewId}:${displayName}:${mcVersionId ?? 'preview'}`) || 1;
   }, [seedOverride, source, mcVersionId, displayName]);
 
-  const previewPreset = artPresetForSeed(previewSeed);
-  const loaderTrait = source === 'vanilla' ? null : loaderTraitForComponentId(LOADER_COMPONENT_IDS[source]);
-  const versionIdentity = (() => {
-    const fromVersion = versionIdentityForVersion(selectedMinecraftVersion);
-    if (fromVersion) return { ...fromVersion, loaderTrait };
-    return versionIdentityForVersionId(mcVersionId ?? '', loaderTrait);
-  })();
   const previewInstance = {
     id: `preview:${source}:${mcVersionId ?? 'none'}`,
     name: displayName,
@@ -531,17 +514,12 @@ function CreateCard(): JSX.Element {
           <section class="cp-cr-side" aria-label="Instance details">
             <div class="cp-cr-identity">
               <div class="cp-cr-avatar">
-                <InstanceArt
-                  instance={previewInstance}
-                  versionIdentity={versionIdentity}
-                  aspect="square"
-                  radius={16}
-                />
+                <InstanceTile inst={previewInstance} radius={16} />
                 <button
                   type="button"
                   class="cp-cr-reroll"
-                  title={`Reroll artwork (${previewPreset})`}
-                  aria-label="Reroll artwork"
+                  title="Shuffle tile colors"
+                  aria-label="Shuffle tile colors"
                   onClick={rerollSeed}
                 >
                   <Icon name="refresh" size={13} stroke={2} />
@@ -552,7 +530,7 @@ function CreateCard(): JSX.Element {
                 <div class="cp-cr-identity-pills">
                   <Pill>{source === 'vanilla' ? 'Vanilla' : LOADER_LABELS[source]}</Pill>
                   {mcVersionId
-                    ? <Pill>MC {mcVersionId}</Pill>
+                    ? <Pill>MC {selectedVersionRow?.displayName ?? mcVersionId}</Pill>
                     : <Pill>No version yet</Pill>}
                  
                 </div>

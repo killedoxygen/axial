@@ -394,7 +394,6 @@ mod tests {
             created_at: "2026-05-30T00:00:00Z".to_string(),
             last_played_at: String::new(),
             art_seed: 0,
-            art_preset: String::new(),
             max_memory_mb: 0,
             min_memory_mb: 0,
             java_path: String::new(),

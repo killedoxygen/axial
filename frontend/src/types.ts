@@ -7,7 +7,6 @@ export interface Instance {
   created_at: string;
   last_played_at?: string;
   art_seed?: number;
-  art_preset?: string;
   max_memory_mb?: number;
   min_memory_mb?: number;
   java_path?: string;

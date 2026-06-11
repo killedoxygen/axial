@@ -14,6 +14,7 @@
   position: relative;
   height: 200px;
   overflow: hidden;
+  background: color-mix(in oklab, var(--bg-deep) 45%, var(--bg));
   -webkit-mask-image:
     radial-gradient(170% 80% at 50% 0%,
       #000 0%,
@@ -24,14 +25,6 @@
       #000 0%,
       #000 55%,
       transparent 100%);
-}
-.cp-instance-cover-art {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  border-radius: 0 !important;
-  filter: saturate(0.92) brightness(0.84);
 }
 .cp-instance-cover-glow {
   position: absolute;
@@ -50,6 +43,9 @@
     radial-gradient(130% 100% at 50% 30%, transparent 35%, rgba(0,0,0,0.55) 100%),
     linear-gradient(180deg, rgba(0,0,0,0.05) 0%, rgba(0,0,0,0.0) 30%, rgba(0,0,0,0.35) 75%, rgba(0,0,0,0.55) 100%);
   pointer-events: none;
+}
+html[data-color-mode="light"] .cp-instance-cover-vignette {
+  opacity: 0.18;
 }
 
 .cp-instance-titlebar {
@@ -84,7 +80,7 @@
     0 0 0 4px var(--bg),
     inset 0 0 0 1px oklch(1 0 0 / 0.06);
 }
-.cp-instance-avatar .cp-instance-art { position: absolute; inset: 0; }
+.cp-instance-avatar .cp-tile { position: absolute; inset: 0; }
 .cp-instance-titlebar-text {
   min-width: 0;
   padding-bottom: 4px;
@@ -1668,7 +1664,6 @@
   color: var(--text);
   font-size: 13px;
   font-weight: 600;
-  text-transform: capitalize;
 }
 .cp-settings-identity-control span {
   display: block;

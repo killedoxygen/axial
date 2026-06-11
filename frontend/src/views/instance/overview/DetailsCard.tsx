@@ -1,6 +1,7 @@
 import type { JSX } from 'preact';
 import { Card } from '../../../ui/Atoms';
 import { versions } from '../../../store';
+import { minecraftVersionLabel } from '../../../version-display';
 import type { EnrichedInstance } from '../../../types';
 import { loaderKeyFromVersion, LOADER_LABELS } from '../../create/defaults';
 import { fmtJoined, fmtRelative } from '../format';
@@ -9,7 +10,7 @@ export function DetailsCard({ inst, running }: { inst: EnrichedInstance; running
   const v = versions.value.find(x => x.id === inst.version_id);
   const loader = LOADER_LABELS[loaderKeyFromVersion(v)];
   const loaderVer = v?.loader?.loader_version ? ` ${v.loader.loader_version}` : '';
-  const mcVer = v?.minecraft_meta.display_name || v?.minecraft_meta.display_hint || 'unknown';
+  const mcVer = minecraftVersionLabel(v);
   return (
     <Card padding={18}>
       <div class="cp-od-head">

@@ -2,6 +2,7 @@ import type { JSX } from 'preact';
 import type { LoaderKey } from './defaults';
 
 const LOADER_LOGO_SRC: Partial<Record<LoaderKey, string>> = {
+  vanilla: 'vanilla_icon.svg',
   fabric: 'fabric_icon.svg',
   forge: 'forge_icon.svg',
   neoforge: 'neoforge_icon.svg',

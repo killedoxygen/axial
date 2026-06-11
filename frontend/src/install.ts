@@ -15,6 +15,7 @@ import {
   requeueFailedInstall, isActiveInstallItem,
 } from './actions';
 import { formatInstallItemLabel } from './install-labels';
+import { minecraftVersionLabel } from './version-display';
 import type { InstallItem, LoaderBuildRecord, LoaderComponentId } from './types';
 
 type InstallProgressEvent = {
@@ -124,7 +125,7 @@ export function handleInstallClick(): void {
     ? {
         componentId: version.loader.component_id as LoaderComponentId,
         buildId: version.loader.build_id,
-        minecraftVersion: version.inherits_from || '',
+        minecraftVersion: minecraftVersionLabel(version, ''),
         loaderVersion: version.loader.loader_version,
         versionId: target,
       }

@@ -52,6 +52,8 @@ Instances are direct Minecraft game directories under `<config_dir>/instances/<i
 
 The mutable game-state boundary is instance-local. Croopor creates and reads user-visible folders such as `mods/`, `saves/`, `resourcepacks/`, `shaderpacks/`, `config/`, `screenshots/`, and `logs/` under the instance directory. The folder-opening API accepts an omitted `sub` query to open the instance root, or one of those explicit subfolder names; any other `sub` value returns a bounded JSON `400` instead of falling back to the root. Resource listing APIs scan fixed instance-local subdirectories and never accept caller-provided paths. Direct log tailing accepts only a single safe filename and rejects traversal, hidden, separator-containing, and control-character names.
 
+Instance chrome does not serve screenshot or world imagery. The frontend renders deterministic `art_seed`-derived identity tiles with loader-specific SVG masks and plain themed banner surfaces. Screenshots remain available only through the instance Screenshots tab file endpoint, which is scoped to the fixed `screenshots/` subdirectory and validates screenshot filenames before streaming.
+
 ## Full launcher pipeline
 
 ### High-level launcher lifecycle

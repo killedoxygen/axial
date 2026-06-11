@@ -4,8 +4,9 @@ import { Button, Card, Pill } from '../../ui/Atoms';
 import { SelectField } from '../../ui/Select';
 import { api } from '../../api';
 import { toast } from '../../toast';
-import { devMode, instances, lastInstanceId, selectedInstanceId } from '../../store';
+import { devMode, instances, lastInstanceId, selectedInstanceId, versions } from '../../store';
 import { errMessage, fmtMem } from '../../utils';
+import { minecraftVersionLabel } from '../../version-display';
 import type {
   BenchmarkMatrixResponse,
   BenchmarkQualificationPreviewResponse,
@@ -622,7 +623,9 @@ function LaunchProofHistoryBlock({ state }: { state: LaunchReportsState }): JSX.
               scenario.benchmark_profile?.trim(),
               scenario.benchmark_run_type?.trim(),
             ].filter(Boolean);
-            const version = scenario.version_id || record.version_id || 'Unknown version';
+            const versionId = scenario.version_id || record.version_id || '';
+            const versionRecord = versions.value.find((version) => version.id === versionId);
+            const version = minecraftVersionLabel(versionRecord, versionId || 'Unknown version');
 
             return (
               <div class="cp-settings-proof-row" key={record.session_id}>
@@ -1062,7 +1065,10 @@ function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: BenchmarkMat
               ? [{ value: '', label: 'No instances' }]
               : instanceRows.map((instance) => ({
                   value: instance.id,
-                  label: `${instance.name} (${instance.version_id})`,
+                  label: `${instance.name} (${minecraftVersionLabel(
+                    versions.value.find((version) => version.id === instance.version_id),
+                    instance.version_id,
+                  )})`,
                 }))}
           />
         </label>

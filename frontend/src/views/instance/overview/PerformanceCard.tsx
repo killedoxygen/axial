@@ -5,6 +5,7 @@ import { Card } from '../../../ui/Atoms';
 import { api } from '../../../api';
 import { config, systemInfo, versions } from '../../../store';
 import { errMessage } from '../../../utils';
+import { minecraftVersionLabel } from '../../../version-display';
 import { loaderKeyFromVersion } from '../../create/defaults';
 import type {
   CompositionTier,
@@ -93,10 +94,7 @@ function planLoader(v: Version | undefined, inst: EnrichedInstance): string {
 }
 
 function planGameVersion(v: Version | undefined, inst: EnrichedInstance): string {
-  return v?.minecraft_meta.effective_version
-    || v?.minecraft_meta.base_id
-    || v?.minecraft_meta.display_name
-    || inst.version_id;
+  return minecraftVersionLabel(v, inst.version_id);
 }
 
 function performanceSummary(

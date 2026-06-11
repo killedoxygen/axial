@@ -1,6 +1,6 @@
 import './ui/atoms.css';
 import './shell/shell.css';
-import './art/instance-art.css';
+import './ui/instance-visual.css';
 import './ui/slider.css';
 import './ui/select.css';
 import './ui/modal.css';

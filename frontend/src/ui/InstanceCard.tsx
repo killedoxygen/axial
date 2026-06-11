@@ -1,14 +1,15 @@
 import type { JSX } from 'preact';
-import { InstanceArt } from '../art/InstanceArt';
+import { InstanceTile } from './InstanceVisual';
 import { Icon } from './Icons';
 import { navigate } from '../ui-state';
 import { runningSessions, versions } from '../store';
+import { minecraftVersionLabel } from '../version-display';
 import { loaderKeyFromVersion, LOADER_LABELS } from '../views/create/defaults';
 import type { EnrichedInstance } from '../types';
 
 function versionLabel(inst: EnrichedInstance): { loader: string; mc: string } {
   const v = versions.value.find(x => x.id === inst.version_id);
-  const mc = v ? (v.minecraft_meta.display_hint || v.minecraft_meta.display_name || v.id) : '—';
+  const mc = minecraftVersionLabel(v, '—');
   return { loader: LOADER_LABELS[loaderKeyFromVersion(v)], mc };
 }
 
@@ -39,7 +40,7 @@ export function InstanceCard({ inst, onContextMenu }: {
       onContextMenu={onContextMenu}
     >
       <div class="cp-icard-art">
-        <InstanceArt instance={inst} aspect="square" radius={0} className="cp-icard-canvas" />
+        <InstanceTile inst={inst} radius={0} className="cp-icard-canvas" />
         {running && <span class="cp-icard-live" aria-label="Running"><span /> Live</span>}
         <span class="cp-icard-play" aria-hidden="true">
           <Icon name="play" size={20} stroke={2} />

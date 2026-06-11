@@ -166,7 +166,10 @@ The fallback comparator stays deterministic even for unknown shapes.
 ## Frontend contract
 Frontend code should:
 
-- render `minecraft_meta.display_name` and `minecraft_meta.display_hint`
+- render version labels through `frontend/src/version-display.ts`
+- use `minecraftVersionLabel()` for Minecraft-only UI labels
+- never render composite loader ids such as `quilt-loader-0.29.2-1.16.5`, `1.19-forge-41.1.0`, or `neoforge-26.1.0.19-beta` as the Minecraft version; the helper extracts the Minecraft target from `inherits_from` or known loader id shapes
+- use `normalizeVersionDisplay()` / `versionSearchText()` for version picker rows and filtering
 - use `lifecycle` for filtering and badges
 - avoid re-parsing vanilla-like version ids locally
 

@@ -328,7 +328,6 @@ async fn handle_update_instance(
     }
     if let Some(art_seed) = patch.art_seed {
         instance.art_seed = art_seed;
-        instance.art_preset = croopor_config::art_preset_for_seed(art_seed).to_string();
     }
     if let Some(max_memory_mb) = patch.max_memory_mb {
         instance.max_memory_mb = max_memory_mb.max(0);

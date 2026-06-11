@@ -1,6 +1,6 @@
 import type { JSX } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { InstanceArt } from '../art/InstanceArt';
+import { InstanceTile } from '../ui/InstanceVisual';
 import { Icon } from '../ui/Icons';
 import { Logo } from '../ui/Logo';
 import { PlayerHeadPreview } from '../ui/PlayerHeadPreview';
@@ -95,7 +95,7 @@ function RailInstances({ tooltip }: { tooltip: RailTooltipController }): JSX.Ele
             aria-label={inst.name}
             {...railTipAttrs(inst.name, tooltip)}
           >
-            <InstanceArt instance={inst} aspect="thumb" radius={12} className="cp-rail-tile-art" />
+            <InstanceTile inst={inst} radius={12} className="cp-rail-tile-art" />
             {running && <span class="cp-rail-tile-dot" aria-hidden="true" />}
           </button>
         );

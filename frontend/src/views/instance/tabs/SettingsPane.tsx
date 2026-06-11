@@ -2,7 +2,7 @@ import type { JSX } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
 import { Button, Card, Input, Segmented } from '../../../ui/Atoms';
 import { Slider, type SliderZone } from '../../../ui/Slider';
-import { InstanceArt, artPresetForSeed, artSeedFor, nextArtSeed } from '../../../art/InstanceArt';
+import { InstanceTile, artSeedFor, nextArtSeed } from '../../../ui/InstanceVisual';
 import { api } from '../../../api';
 import { config, systemInfo } from '../../../store';
 import { updateInstanceInList } from '../../../actions';
@@ -48,7 +48,6 @@ function instancePerformanceModeFrom(value: string | undefined): InstancePerform
 export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
   const initialArtSeed = artSeedFor(inst);
   const [artSeed, setArtSeed] = useState<number>(initialArtSeed);
-  const artPreset = artPresetForSeed(artSeed);
   const [maxMem, setMaxMem] = useState<number>(memoryGb(inst.max_memory_mb, config.value?.max_memory_mb ?? 4096));
   const [minMem, setMinMem] = useState<number>(memoryGb(inst.min_memory_mb, config.value?.min_memory_mb ?? 1024));
   const [width, setWidth] = useState<number>(inst.window_width ?? 854);
@@ -313,22 +312,21 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
             <div class="cp-iset-head">
               <div>
                 <h3>Identity</h3>
-                <p>Artwork used for this instance.</p>
+                <p>Tile shown for this instance across the library.</p>
               </div>
             </div>
             <div class="cp-iset-body cp-settings-identity-control">
-              <InstanceArt
-                instance={{ ...inst, art_seed: artSeed }}
-                aspect="square"
+              <InstanceTile
+                inst={{ ...inst, art_seed: artSeed }}
                 radius={12}
                 className="cp-settings-avatar"
               />
               <div>
-                <strong>{artPreset}</strong>
-                <span>Current style</span>
+                <strong>Identity tile</strong>
+                <span>Used anywhere the instance needs a compact visual mark</span>
               </div>
               <Button variant="secondary" size="sm" icon="refresh" onClick={() => setArtSeed(seed => nextArtSeed(seed))}>
-                Regenerate
+                Shuffle colors
               </Button>
             </div>
           </Card>

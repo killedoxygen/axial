@@ -18,6 +18,7 @@ This project is a desktop Minecraft launcher, not a marketing site. Keep UI work
 - Typography is one voice: Manrope everywhere (vendored in `frontend/static/fonts/`). Monospace only for actual log output. Use tabular figures (`font-variant-numeric`) for aligned numbers, not a different font.
 - Radii are generous and friendly: `--r-xs` 8 / `--r-sm` 12 / `--r-md` 16 / `--r-lg` 20 / `--r-xl` 28. Cards use `--r-lg`, buttons and inputs `--r-sm`. Do not hardcode radii; consume the vars.
 - Home is workflow-first: a full-width featured banner for the last-played instance (`.cp-feature`) over a fluid cover-card library grid (`.cp-cover-grid` / `InstanceCard`), no vanity stat cards. Instances uses the same cover grid as its default view; the table is the secondary mode. Layouts must fill wide viewports with fluid `auto-fill` grids rather than capping into empty margins.
+- Instance chrome uses deterministic square identity tiles (`ui/InstanceVisual.tsx`): the surface stack carries a low-chroma tint of the instance hue (`art_seed` -> `--cp-tile-h`, mixed via `color-mix` so it tracks the theme) with a dim loader mark, using the creeper face for vanilla. Banners are never generated imagery: the home hero is a raised surface panel with a quiet accent glow (`.cp-feature-glow`); the instance cover is the deep backdrop with its accent glow and vignette. No screenshots, world images, or version text in UI chrome, no procedural noise art, no saturated gradient avatars, no monograms.
 - Keep controls familiar:
   - icons for small actions;
   - segmented controls for small mode sets;
@@ -33,8 +34,8 @@ This project is a desktop Minecraft launcher, not a marketing site. Keep UI work
 - Cards are acceptable for repeated items, existing framed tools, and current surfaces that already use them. Do not introduce cards as a default spacing device.
 
 ## Shell
-- The sidebar is a fixed 68px icon rail (`.cp-rail`): brand, search, Home/Instances/New, instance art tiles, settings, player head. There is no expanded sidebar mode; labels live in tooltips and the command palette.
-- Active instance tile: full-color art plus raised shadow while siblings sit dimmed — no rings or borders (they clip in the scroll container). Running instances get a status dot. Keep rail items 44px.
+- The sidebar is a fixed 68px icon rail (`.cp-rail`): brand, search, Home/Instances/New, instance identity tiles, settings, player head. There is no expanded sidebar mode; labels live in tooltips and the command palette.
+- Active instance tile: full-color tile plus raised shadow while siblings sit dimmed — no rings or borders (they clip in the scroll container). Running instances get a status dot. Keep rail items 44px.
 
 ## Selection & Active States
 - One selection language everywhere: solid `--accent-fill` background with `--accent-on` content (the onboarding pill pattern). No translucent accent washes, no accent borders for selection. Applies to rail nav, version rows, source tiles, runtime presets, icon-button active, settings rail, on/off pills.

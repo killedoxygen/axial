@@ -8,17 +8,8 @@ use std::path::Path;
 use std::sync::RwLock;
 use thiserror::Error;
 
-/// Deterministic instance-art variants. Order is part of the seed contract and
-/// must match `ART_PRESETS` in `frontend/src/art/InstanceArt.tsx`.
-///
-/// `art_seed` is the artwork source of truth. The preset is derived with
-/// `ART_PRESETS[art_seed % ART_PRESETS.len()]`, and every renderer detail is
-/// expected to derive from the same seed. `art_preset` is a denormalized label
-/// recalculated from the seed whenever an instance is created or updated.
-pub const ART_PRESETS: [&str; 9] = [
-    "aurora", "silk", "mineral", "ember", "vapor", "topo", "prism", "dune", "orbit",
-];
-
+/// `art_seed` is the source of truth for the instance identity tile: the
+/// frontend derives the tile hues from it, and "shuffle" rewrites it.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Instance {
     pub id: String,
@@ -29,8 +20,6 @@ pub struct Instance {
     pub last_played_at: String,
     #[serde(default)]
     pub art_seed: u32,
-    #[serde(default)]
-    pub art_preset: String,
     #[serde(default)]
     pub max_memory_mb: i32,
     #[serde(default)]
@@ -348,7 +337,6 @@ impl InstanceStore {
                 .to_rfc3339(),
             last_played_at: String::new(),
             art_seed,
-            art_preset: art_preset_for_seed(art_seed).to_string(),
             max_memory_mb: 0,
             min_memory_mb: 0,
             java_path: String::new(),
@@ -428,7 +416,6 @@ impl InstanceStore {
                 .to_rfc3339(),
             last_played_at: String::new(),
             art_seed,
-            art_preset: art_preset_for_seed(art_seed).to_string(),
             max_memory_mb: source.max_memory_mb,
             min_memory_mb: source.min_memory_mb,
             java_path: source.java_path.clone(),
@@ -634,13 +621,9 @@ fn derive_art_seed(id: &str, name: &str, version_id: &str) -> u32 {
     h
 }
 
-pub fn art_preset_for_seed(seed: u32) -> &'static str {
-    ART_PRESETS[(seed as usize) % ART_PRESETS.len()]
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{ART_PRESETS, InstanceStore, StoredInstances, art_preset_for_seed};
+    use super::{InstanceStore, StoredInstances};
     use crate::paths::AppPaths;
     use std::path::{Path, PathBuf};
     use std::sync::RwLock;
@@ -667,17 +650,6 @@ mod tests {
             music_dir: root.join("music"),
             library_dir: root.join("library"),
             config_dir,
-        }
-    }
-
-    #[test]
-    fn art_preset_is_derived_from_seed_modulo_preset_order() {
-        for (index, preset) in ART_PRESETS.iter().enumerate() {
-            assert_eq!(art_preset_for_seed(index as u32), *preset);
-            assert_eq!(
-                art_preset_for_seed((index + ART_PRESETS.len() * 17) as u32),
-                *preset
-            );
         }
     }
 
