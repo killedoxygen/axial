@@ -765,6 +765,7 @@ dependencies = [
  "croopor-config",
  "croopor-launcher",
  "croopor-performance",
+ "serde",
  "serde_json",
  "tauri",
  "tauri-build",

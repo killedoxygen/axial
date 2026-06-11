@@ -3,12 +3,28 @@ import { getNativeApiBaseUrl } from './native';
 declare const __CROOPOR_WEB_API_BASE__: string;
 
 const API_PATH = '/api/v1';
+const WEB_API_BASE = normalizeApiBaseUrl(__CROOPOR_WEB_API_BASE__ ?? '');
 
-let apiBaseUrl = '';
+let apiBaseUrl = WEB_API_BASE;
+let apiBaseInitialized = false;
+let apiBaseInitPromise: Promise<void> | null = null;
 
-export let API = API_PATH;
+export let API = `${apiBaseUrl}${API_PATH}`;
 
 export async function initializeApiBase(): Promise<void> {
+  if (apiBaseInitialized) return;
+  if (apiBaseInitPromise) return apiBaseInitPromise;
+
+  apiBaseInitPromise = resolveApiBase();
+  try {
+    await apiBaseInitPromise;
+  } catch (error) {
+    apiBaseInitPromise = null;
+    throw error;
+  }
+}
+
+async function resolveApiBase(): Promise<void> {
   let nativeBaseUrl: string | null | undefined;
   try {
     nativeBaseUrl = await getNativeApiBaseUrl();
@@ -16,6 +32,7 @@ export async function initializeApiBase(): Promise<void> {
     nativeBaseUrl = undefined;
   }
   setApiBaseUrl(nativeBaseUrl ?? __CROOPOR_WEB_API_BASE__ ?? '');
+  apiBaseInitialized = true;
 }
 
 export function setApiBaseUrl(baseUrl: string): void {
@@ -53,6 +70,7 @@ export function isApiError(error: unknown): error is ApiError {
 }
 
 export async function api(method: string, path: string, body?: unknown): Promise<any> {
+  await initializeApiBase();
   const opts: RequestInit = { method };
   if (body !== undefined) {
     opts.headers = { 'Content-Type': 'application/json' };

@@ -1,11 +1,23 @@
 use crate::events;
 use crate::state::{ApiRuntimeState, DesktopState};
+use croopor_api::routes::flush_pending_saved_skin_applies_for_shutdown;
 use croopor_api::state::{AppState, LaunchEvent, LaunchSessionRecord, LaunchStatusEvent};
 use croopor_launcher::LaunchState;
+use serde::Serialize;
+use std::fs;
+use std::path::PathBuf;
 use tauri::webview::Color;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 const RESTART_BUSY_MESSAGE: &str = "Restart is blocked while installs or launches are active.";
+const SKIN_FILE_MAX_BYTES: u64 = 256 * 1024;
+const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+
+#[derive(Debug, Eq, PartialEq, Serialize)]
+pub struct NativeSkinFile {
+    name: String,
+    bytes: Vec<u8>,
+}
 
 #[tauri::command]
 pub fn app_version(state: State<'_, DesktopState>) -> String {
@@ -15,6 +27,48 @@ pub fn app_version(state: State<'_, DesktopState>) -> String {
 #[tauri::command]
 pub fn api_base_url(state: State<'_, ApiRuntimeState>) -> String {
     format!("http://{}", state.addr())
+}
+
+#[tauri::command]
+pub async fn read_skin_file(path: String) -> Result<NativeSkinFile, String> {
+    tauri::async_runtime::spawn_blocking(move || read_skin_file_from_path(PathBuf::from(path)))
+        .await
+        .map_err(|err| err.to_string())?
+}
+
+fn read_skin_file_from_path(path: PathBuf) -> Result<NativeSkinFile, String> {
+    let extension_is_png = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("png"));
+    if !extension_is_png {
+        return Err("Choose a PNG skin file.".to_string());
+    }
+
+    let metadata = fs::metadata(&path).map_err(|_| "Could not read skin file.".to_string())?;
+    if !metadata.is_file() {
+        return Err("Choose a PNG skin file.".to_string());
+    }
+    if metadata.len() > SKIN_FILE_MAX_BYTES {
+        return Err("Skin file is too large; choose a PNG under 256 KiB.".to_string());
+    }
+
+    let bytes = fs::read(&path).map_err(|_| "Could not read skin file.".to_string())?;
+    if bytes.len() as u64 > SKIN_FILE_MAX_BYTES {
+        return Err("Skin file is too large; choose a PNG under 256 KiB.".to_string());
+    }
+    if !bytes.starts_with(PNG_SIGNATURE) {
+        return Err("Choose a PNG skin file.".to_string());
+    }
+
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("skin.png")
+        .to_string();
+
+    Ok(NativeSkinFile { name, bytes })
 }
 
 #[tauri::command]
@@ -58,7 +112,14 @@ pub fn window_toggle_maximize(app: AppHandle) -> Result<bool, String> {
 }
 
 #[tauri::command]
-pub fn window_close(app: AppHandle) -> Result<(), String> {
+pub async fn window_close(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    if let Err((status, _)) = flush_pending_saved_skin_applies_for_shutdown(state.inner()).await {
+        tracing::warn!(
+            "failed to flush pending skin changes before desktop close: HTTP {}",
+            status
+        );
+    }
+
     let window = app
         .get_webview_window("main")
         .ok_or_else(|| "main window missing".to_string())?;
@@ -284,7 +345,26 @@ fn launch_state_name(state: LaunchState) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{RESTART_BUSY_MESSAGE, restart_readiness};
+    use super::{
+        PNG_SIGNATURE, RESTART_BUSY_MESSAGE, SKIN_FILE_MAX_BYTES, read_skin_file_from_path,
+        restart_readiness,
+    };
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_dir(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test clock should be after unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "croopor-desktop-{name}-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("test dir");
+        dir
+    }
 
     #[test]
     fn restart_readiness_allows_idle_app() {
@@ -313,5 +393,48 @@ mod tests {
             restart_readiness(2, 3),
             Err(RESTART_BUSY_MESSAGE.to_string())
         );
+    }
+
+    #[test]
+    fn read_skin_file_accepts_png_file() {
+        let dir = test_dir("read-skin-ok");
+        let path = dir.join("player.png");
+        let mut png = PNG_SIGNATURE.to_vec();
+        png.extend_from_slice(b"smoke");
+        fs::write(&path, &png).expect("write png");
+
+        let file = read_skin_file_from_path(path).expect("native skin file");
+
+        assert_eq!(file.name, "player.png");
+        assert_eq!(file.bytes, png);
+        fs::remove_dir_all(dir).expect("cleanup test dir");
+    }
+
+    #[test]
+    fn read_skin_file_rejects_non_png_extension() {
+        let dir = test_dir("read-skin-extension");
+        let path = dir.join("player.txt");
+        fs::write(&path, PNG_SIGNATURE).expect("write file");
+
+        let result = read_skin_file_from_path(path);
+
+        assert_eq!(result, Err("Choose a PNG skin file.".to_string()));
+        fs::remove_dir_all(dir).expect("cleanup test dir");
+    }
+
+    #[test]
+    fn read_skin_file_rejects_oversized_png() {
+        let dir = test_dir("read-skin-oversized");
+        let path = dir.join("large.png");
+        fs::write(&path, vec![0; (SKIN_FILE_MAX_BYTES + 1) as usize])
+            .expect("write oversized file");
+
+        let result = read_skin_file_from_path(path);
+
+        assert_eq!(
+            result,
+            Err("Skin file is too large; choose a PNG under 256 KiB.".to_string())
+        );
+        fs::remove_dir_all(dir).expect("cleanup test dir");
     }
 }

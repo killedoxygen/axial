@@ -32,6 +32,14 @@ function getTauriBinding(): TauriBinding | null {
   return window.__TAURI__ ?? null;
 }
 
+export type NativeDragDropType = 'enter' | 'over' | 'drop' | 'leave';
+
+export interface NativeDragDropPayload {
+  type: NativeDragDropType;
+  paths: string[];
+  position: { x: number; y: number } | null;
+}
+
 export function isTauriRuntime(): boolean {
   return getTauriBinding() !== null;
 }
@@ -71,6 +79,38 @@ export async function onNativeEvent(eventName: string, callback: (data: any) => 
   };
 }
 
+function nativeDragDropPayload(type: NativeDragDropType, payload: any): NativeDragDropPayload {
+  const paths = Array.isArray(payload?.paths)
+    ? payload.paths.filter((path: unknown): path is string => typeof path === 'string')
+    : [];
+  const x = payload?.position?.x;
+  const y = payload?.position?.y;
+  const position = typeof x === 'number' && typeof y === 'number' && Number.isFinite(x) && Number.isFinite(y)
+    ? { x, y }
+    : null;
+  return { type, paths, position };
+}
+
+export async function onNativeDragDrop(
+  callback: (payload: NativeDragDropPayload) => void,
+): Promise<{ close(): void } | null> {
+  const tauri = getTauriBinding();
+  if (!tauri?.event) return null;
+
+  const unsubscribe = await Promise.all([
+    tauri.event.listen('tauri://drag-enter', (event) => callback(nativeDragDropPayload('enter', event.payload))),
+    tauri.event.listen('tauri://drag-over', (event) => callback(nativeDragDropPayload('over', event.payload))),
+    tauri.event.listen('tauri://drag-drop', (event) => callback(nativeDragDropPayload('drop', event.payload))),
+    tauri.event.listen('tauri://drag-leave', (event) => callback(nativeDragDropPayload('leave', event.payload))),
+  ]);
+
+  return {
+    close(): void {
+      unsubscribe.forEach((close) => close());
+    },
+  };
+}
+
 export async function getNativeAppVersion(): Promise<string | null> {
   const tauri = getTauriBinding();
   if (!tauri?.core) return null;
@@ -101,6 +141,55 @@ export async function browseDirectory(defaultPath = ''): Promise<string | null> 
 
   if (Array.isArray(result)) return result[0] ?? null;
   return result;
+}
+
+function nativeSkinFileFromPayload(payload: unknown): File {
+  if (!payload || typeof payload !== 'object') {
+    throw new Error('Native skin picker returned an invalid file.');
+  }
+
+  const record = payload as { name?: unknown; bytes?: unknown };
+  if (!Array.isArray(record.bytes)) {
+    throw new Error('Native skin picker returned an invalid file.');
+  }
+
+  const bytes = new Uint8Array(record.bytes.length);
+  record.bytes.forEach((value, index) => {
+    if (!Number.isInteger(value) || value < 0 || value > 255) {
+      throw new Error('Native skin picker returned an invalid file.');
+    }
+    bytes[index] = value;
+  });
+
+  const name = typeof record.name === 'string' && record.name.trim()
+    ? record.name.trim()
+    : 'skin.png';
+
+  return new File([bytes], name, { type: 'image/png' });
+}
+
+export async function pickNativeSkinFile(): Promise<File | null | undefined> {
+  const tauri = getTauriBinding();
+  if (!tauri?.dialog || !tauri.core) return undefined;
+
+  const result = await tauri.dialog.open({
+    directory: false,
+    multiple: false,
+    filters: [{ name: 'PNG skin', extensions: ['png'] }],
+  });
+
+  const path = Array.isArray(result) ? result[0] : result;
+  if (!path) return null;
+
+  return readNativeSkinFile(path);
+}
+
+export async function readNativeSkinFile(path: string): Promise<File | undefined> {
+  const tauri = getTauriBinding();
+  if (!tauri?.core) return undefined;
+
+  const payload = await tauri.core.invoke<unknown>('read_skin_file', { path });
+  return nativeSkinFileFromPayload(payload);
 }
 
 export async function openExternalURL(url: string): Promise<void> {
