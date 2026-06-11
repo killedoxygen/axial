@@ -447,7 +447,7 @@ html[data-color-mode="light"] .cp-instance-cover-vignette {
 }
 
 .cp-instance-install-lock {
-  --cp-install-color: oklch(from var(--accent) l calc(c * 0.7) calc(h + 180));
+  --cp-install-color: var(--accent);
   --cp-install-fill: color-mix(in oklab, var(--cp-install-color) 34%, var(--surface-3));
   --cp-install-shine: color-mix(in oklab, var(--cp-install-color) 42%, transparent);
   margin: 18px 32px 24px;

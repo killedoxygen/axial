@@ -124,6 +124,28 @@
   filter: none;
   box-shadow: var(--shadow-raised);
 }
+.cp-rail-tile[data-installing="true"] .cp-rail-tile-art {
+  opacity: 0.42;
+  filter: saturate(0.55);
+}
+.cp-rail-tile[data-installing="true"]:hover .cp-rail-tile-art {
+  opacity: 0.58;
+  filter: saturate(0.72);
+}
+.cp-rail-tile-install {
+  position: absolute;
+  right: 0;
+  top: 0;
+  width: 17px;
+  height: 17px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent-on);
+  background: var(--accent-fill);
+  box-shadow: 0 0 0 2px var(--bg-deep);
+}
 .cp-rail-tile-dot {
   position: absolute;
   right: 1px;
@@ -365,7 +387,7 @@
 }
 .cp-status-pill--installing {
   --cp-install-ratio: 0;
-  --cp-install-color: oklch(from var(--accent) l calc(c * 0.58) calc(h + 210));
+  --cp-install-color: var(--accent);
   --cp-status-color: color-mix(in oklab, var(--cp-install-color) 74%, var(--text));
   --cp-status-bg: color-mix(in oklab, var(--surface) 92%, var(--cp-install-color));
   --cp-status-accent: color-mix(in oklab, var(--cp-install-color) 66%, var(--text));
@@ -394,7 +416,7 @@
   --cp-status-accent-soft: color-mix(in oklab, var(--accent) 16%, transparent);
 }
 .cp-status-pill--queued {
-  --cp-install-color: oklch(from var(--accent) l calc(c * 0.58) calc(h + 210));
+  --cp-install-color: var(--accent);
   --cp-status-color: color-mix(in oklab, var(--cp-install-color) 62%, var(--text));
   --cp-status-bg: color-mix(in oklab, var(--surface) 94%, var(--cp-install-color));
   --cp-status-accent: color-mix(in oklab, var(--cp-install-color) 54%, var(--text));

@@ -37,6 +37,7 @@ export type InstallState =
   | { status: 'idle' }
   | {
     status: 'active';
+    item: InstallItem;
     versionId: string;
     displayName?: string;
     pct: number;

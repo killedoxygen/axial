@@ -3,6 +3,7 @@ import { InstanceTile } from './InstanceVisual';
 import { Icon } from './Icons';
 import { navigate } from '../ui-state';
 import { runningSessions, versions } from '../store';
+import { instanceInstallStatus } from '../instance-install-status';
 import { minecraftVersionLabel } from '../version-display';
 import { loaderKeyFromVersion, LOADER_LABELS } from '../views/create/defaults';
 import type { EnrichedInstance } from '../types';
@@ -20,7 +21,11 @@ export function InstanceCard({ inst, onContextMenu }: {
   onContextMenu?: (e: MouseEvent) => void;
 }): JSX.Element {
   const running = !!runningSessions.value[inst.id];
+  const version = versions.value.find(x => x.id === inst.version_id);
   const { loader, mc } = versionLabel(inst);
+  const install = instanceInstallStatus(inst, version);
+  const installing = install.installing;
+  const installBadge = install.state === 'queued' ? 'Queued' : 'Installing';
   const open = (): void => navigate({ name: 'instance', id: inst.id });
   const onKeyDown = (e: KeyboardEvent): void => {
     if (e.target !== e.currentTarget) return;
@@ -33,8 +38,9 @@ export function InstanceCard({ inst, onContextMenu }: {
       class="cp-icard"
       role="button"
       tabIndex={0}
-      aria-label={`Open ${inst.name}`}
+      aria-label={installing ? `Open ${inst.name}. ${installBadge}` : `Open ${inst.name}`}
       data-running={running}
+      data-installing={installing}
       onClick={open}
       onKeyDown={onKeyDown}
       onContextMenu={onContextMenu}
@@ -42,13 +48,21 @@ export function InstanceCard({ inst, onContextMenu }: {
       <div class="cp-icard-art">
         <InstanceTile inst={inst} radius={0} className="cp-icard-canvas" />
         {running && <span class="cp-icard-live" aria-label="Running"><span /> Live</span>}
-        <span class="cp-icard-play" aria-hidden="true">
-          <Icon name="play" size={20} stroke={2} />
-        </span>
+        {installing && (
+          <span class="cp-icard-install" aria-label={installBadge}>
+            <Icon name={install.state === 'queued' ? 'clock' : 'download'} size={13} stroke={2} />
+            {installBadge}
+          </span>
+        )}
+        {!installing && (
+          <span class="cp-icard-play" aria-hidden="true">
+            <Icon name="play" size={20} stroke={2} />
+          </span>
+        )}
       </div>
       <div class="cp-icard-body">
         <div class="cp-icard-name" title={inst.name}>{inst.name}</div>
-        <div class="cp-icard-sub">{loader} · {mc}</div>
+        <div class="cp-icard-sub">{installing ? `${installBadge} · ` : ''}{loader} · {mc}</div>
       </div>
     </div>
   );

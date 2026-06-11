@@ -6,6 +6,7 @@ import { Icon } from '../../ui/Icons';
 import { InstanceCard } from '../../ui/InstanceCard';
 import { useTheme } from '../../hooks/use-theme';
 import { instances, versions, runningSessions } from '../../store';
+import { instanceInstallStatus } from '../../instance-install-status';
 import { navigate, openCreate } from '../../ui-state';
 import { loaderKeyFromVersion, LOADER_LABELS } from '../create/defaults';
 import { openInstanceContextMenu } from '../instance/instance-menu';
@@ -43,6 +44,9 @@ function ListRow({ inst }: { inst: EnrichedInstance }): JSX.Element {
   const theme = useTheme();
   const v = versions.value.find(x => x.id === inst.version_id);
   const running = !!runningSessions.value[inst.id];
+  const install = instanceInstallStatus(inst, v);
+  const installing = install.installing;
+  const installLabel = install.state === 'queued' ? 'Queued' : 'Installing';
   const showModsCount = supportsMods(v);
   return (
     <div
@@ -56,6 +60,7 @@ function ListRow({ inst }: { inst: EnrichedInstance }): JSX.Element {
         <div class="cp-table-row-title" style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           {inst.name}
           {running && <Pill tone="accent" icon="play">Live</Pill>}
+          {installing && <Pill icon={install.state === 'queued' ? 'clock' : 'download'}>{installLabel}</Pill>}
         </div>
         <div class="cp-table-row-sub">{loaderLabel(v)} · {v?.loader?.loader_version || 'vanilla'}</div>
       </div>
@@ -66,9 +71,10 @@ function ListRow({ inst }: { inst: EnrichedInstance }): JSX.Element {
         <Button
           size="sm"
           variant="secondary"
-          icon="play"
+          icon={installing ? install.state === 'queued' ? 'clock' : 'download' : 'play'}
+          disabled={installing}
           onClick={(e) => { e.stopPropagation(); navigate({ name: 'instance', id: inst.id }); }}
-        >Play</Button>
+        >{installing ? installLabel : 'Play'}</Button>
         <IconButton
           icon="dots"
           size={28}

@@ -5,7 +5,8 @@ import { Icon } from '../ui/Icons';
 import { Logo } from '../ui/Logo';
 import { PlayerHeadPreview } from '../ui/PlayerHeadPreview';
 import { route, navigate, commandPaletteOpen, type Route, openCreate } from '../ui-state';
-import { runningSessions, config, instances } from '../store';
+import { runningSessions, config, instances, versions } from '../store';
+import { instanceInstallStatus } from '../instance-install-status';
 import { promptPlayerName, savePlayerName } from '../player-name';
 import { accountSkinSrc } from '../player-skin';
 import { Music, musicStateVersion } from '../music';
@@ -84,18 +85,28 @@ function RailInstances({ tooltip }: { tooltip: RailTooltipController }): JSX.Ele
       {list.map(inst => {
         const active = current.name === 'instance' && current.id === inst.id;
         const running = !!runningSessions.value[inst.id];
+        const version = versions.value.find(v => v.id === inst.version_id);
+        const install = instanceInstallStatus(inst, version);
+        const installing = install.installing;
+        const installLabel = install.state === 'queued' ? 'Install queued' : 'Installing';
         return (
           <button
             key={inst.id}
             class="cp-rail-tile"
             data-active={active}
             data-running={running}
+            data-installing={installing}
             onClick={() => { tooltip.hide(); navigate({ name: 'instance', id: inst.id }); }}
             onContextMenu={(e) => { tooltip.hide(); openInstanceContextMenu(e, inst); }}
-            aria-label={inst.name}
-            {...railTipAttrs(inst.name, tooltip)}
+            aria-label={installing ? `${inst.name}: ${installLabel}` : inst.name}
+            {...railTipAttrs(installing ? `${inst.name} · ${installLabel}` : inst.name, tooltip)}
           >
             <InstanceTile inst={inst} radius={12} className="cp-rail-tile-art" />
+            {installing && (
+              <span class="cp-rail-tile-install" aria-hidden="true">
+                <Icon name={install.state === 'queued' ? 'clock' : 'download'} size={10} stroke={2.4} />
+              </span>
+            )}
             {running && <span class="cp-rail-tile-dot" aria-hidden="true" />}
           </button>
         );

@@ -99,8 +99,18 @@ export function requeueFailedInstall(): boolean {
 }
 
 export function startInstall(item: InstallItem, label = 'Starting...', displayName?: string): void {
-  activeInstallItem = cloneInstallItem(item);
-  installState.value = { status: 'active', versionId: item.versionId, displayName, pct: 0, label, phase: 'starting', startedAt: Date.now() };
+  const installItem = cloneInstallItem(item);
+  activeInstallItem = installItem;
+  installState.value = {
+    status: 'active',
+    item: installItem,
+    versionId: item.versionId,
+    displayName,
+    pct: 0,
+    label,
+    phase: 'starting',
+    startedAt: Date.now(),
+  };
 }
 
 function cleanRemainingSeconds(remainingSeconds: number | undefined): number | undefined {

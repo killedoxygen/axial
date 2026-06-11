@@ -5,6 +5,7 @@ import { Icon } from '../../ui/Icons';
 import { InstanceCard } from '../../ui/InstanceCard';
 import { navigate, openCreate } from '../../ui-state';
 import { config, instances, runningSessions, versions } from '../../store';
+import { instanceInstallStatus } from '../../instance-install-status';
 import { loaderKeyFromVersion, LOADER_LABELS } from '../create/defaults';
 import { openInstanceContextMenu } from '../instance/instance-menu';
 import { supportsMods } from '../../utils';
@@ -43,6 +44,9 @@ function versionBadge(v: Version | undefined): string {
 function FeatureBanner({ inst }: { inst: EnrichedInstance }): JSX.Element {
   const version = versions.value.find(v => v.id === inst.version_id);
   const running = !!runningSessions.value[inst.id];
+  const install = instanceInstallStatus(inst, version);
+  const installing = install.installing;
+  const installBadge = install.state === 'queued' ? 'Install queued' : 'Installing';
   const mods = inst.mods_count ?? 0;
   const showModsCount = supportsMods(version);
   const open = (): void => navigate({ name: 'instance', id: inst.id });
@@ -57,7 +61,8 @@ function FeatureBanner({ inst }: { inst: EnrichedInstance }): JSX.Element {
       class="cp-feature"
       role="button"
       tabIndex={0}
-      aria-label={`Open ${inst.name}`}
+      aria-label={installing ? `Open ${inst.name}. ${installBadge}` : `Open ${inst.name}`}
+      data-installing={installing}
       onClick={open}
       onKeyDown={onKeyDown}
       onContextMenu={(e) => openInstanceContextMenu(e, inst)}
@@ -65,7 +70,7 @@ function FeatureBanner({ inst }: { inst: EnrichedInstance }): JSX.Element {
       <div class="cp-feature-glow" aria-hidden="true" />
       <div class="cp-feature-content">
         <div class="cp-feature-id">
-          <div class="cp-feature-kicker">{running ? 'Now playing' : 'Jump back in'}</div>
+          <div class="cp-feature-kicker">{running ? 'Now playing' : installing ? installBadge : 'Jump back in'}</div>
           <h2 title={inst.name}>{inst.name}</h2>
           <div class="cp-meta">
             <span>{LOADER_LABELS[loaderKeyFromVersion(version)]}</span>
@@ -83,13 +88,15 @@ function FeatureBanner({ inst }: { inst: EnrichedInstance }): JSX.Element {
         </div>
         <div class="cp-feature-actions">
           {running && <Pill tone="accent" icon="play">Playing</Pill>}
+          {installing && <Pill icon={install.state === 'queued' ? 'clock' : 'download'}>{installBadge}</Pill>}
           <Button
             size="lg"
-            icon="play"
-            title={`Play ${inst.name}`}
+            icon={installing ? install.state === 'queued' ? 'clock' : 'download' : 'play'}
+            title={installing ? installBadge : `Play ${inst.name}`}
+            disabled={installing}
             onClick={(e) => { e.stopPropagation(); open(); }}
             sound="launchPress"
-          >Play</Button>
+          >{installing ? installBadge : 'Play'}</Button>
         </div>
       </div>
     </div>

@@ -1,7 +1,8 @@
 import type { JSX } from 'preact';
 import { versions } from '../store';
+import { instanceInstallStatus } from '../instance-install-status';
 import { hashStr } from '../tokens';
-import { loaderKeyFromVersion } from '../views/create/defaults';
+import { loaderKeyFromComponentId, loaderKeyFromVersion, type LoaderKey } from '../views/create/defaults';
 import { loaderLogoSrc } from '../views/create/loader-logos';
 import { Icon } from './Icons';
 import type { Instance, Version } from '../types';
@@ -23,8 +24,15 @@ function hueFor(inst: VisualInstance): number {
   return artSeedFor(inst) % 360;
 }
 
-function GlyphMark({ version, className }: { version: Version | undefined; className: string }): JSX.Element {
-  const src = loaderLogoSrc(loaderKeyFromVersion(version));
+function loaderKeyForInstance(inst: VisualInstance, version: Version | undefined): LoaderKey {
+  const versionLoader = loaderKeyFromVersion(version);
+  if (versionLoader !== 'vanilla') return versionLoader;
+  const installLoader = instanceInstallStatus(inst, version).item.loader;
+  return loaderKeyFromComponentId(installLoader?.componentId);
+}
+
+function GlyphMark({ loader, className }: { loader: LoaderKey; className: string }): JSX.Element {
+  const src = loaderLogoSrc(loader);
   if (src) {
     return (
       <span
@@ -48,6 +56,7 @@ export function InstanceTile({ inst, radius, className, style }: {
   style?: JSX.CSSProperties;
 }): JSX.Element {
   const version = versions.value.find((v) => v.id === inst.version_id);
+  const loader = loaderKeyForInstance(inst, version);
 
   return (
     <div
@@ -56,7 +65,7 @@ export function InstanceTile({ inst, radius, className, style }: {
       aria-hidden="true"
     >
       <div class="cp-tile-identity">
-        <GlyphMark version={version} className="cp-tile-glyph" />
+        <GlyphMark loader={loader} className="cp-tile-glyph" />
       </div>
     </div>
   );

@@ -63,6 +63,9 @@
   outline: none;
   box-shadow: var(--shadow-raised), 0 0 0 3px var(--accent-ring);
 }
+.cp-feature[data-installing="true"] {
+  cursor: pointer;
+}
 .cp-feature-glow {
   position: absolute;
   inset: 0;
@@ -131,6 +134,9 @@
   outline: none;
   box-shadow: var(--shadow-raised), 0 0 0 3px var(--accent-ring);
 }
+.cp-icard[data-installing="true"]:hover {
+  transform: translateY(-1px);
+}
 .cp-icard-art {
   position: relative;
   aspect-ratio: 16 / 10;
@@ -142,6 +148,10 @@
   width: 100%;
   height: 100%;
   border-radius: 0 !important;
+}
+.cp-icard[data-installing="true"] .cp-icard-canvas {
+  opacity: 0.52;
+  filter: saturate(0.6);
 }
 .cp-icard-play {
   position: absolute;
@@ -186,6 +196,25 @@
   height: 6px;
   border-radius: 999px;
   background: var(--ok);
+}
+.cp-icard-install {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: calc(100% - 20px);
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 700;
+  color: var(--accent-on);
+  background: var(--accent-fill);
+  box-shadow: 0 6px 16px -10px color-mix(in oklab, var(--accent) 64%, transparent);
+}
+.cp-icard-install svg {
+  flex: 0 0 auto;
 }
 .cp-icard-body {
   padding: 11px 13px 12px;
@@ -298,7 +327,7 @@
 
 /* Downloads */
 .cp-download-active-meter {
-  --cp-install-color: oklch(from var(--accent) l calc(c * 0.58) calc(h + 210));
+  --cp-install-color: var(--accent);
   --cp-download-install-track: color-mix(in oklab, var(--surface-3) 90%, var(--cp-install-color));
   --cp-download-install-fill: color-mix(in oklab, var(--cp-install-color) 64%, var(--text-dim));
   --cp-download-install-fill-soft: color-mix(in oklab, var(--cp-install-color) 42%, var(--surface-3));

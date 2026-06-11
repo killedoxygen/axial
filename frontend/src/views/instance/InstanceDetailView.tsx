@@ -5,16 +5,16 @@ import { Button, IconButton, Pill } from '../../ui/Atoms';
 import { useTheme } from '../../hooks/use-theme';
 import { InstanceTile } from '../../ui/InstanceVisual';
 import { openContextMenu } from '../../ui/ContextMenu';
-import { installFailure, installQueue, installState, instances, launchNotices, launchState, runningSessions, versions } from '../../store';
+import { instances, launchNotices, launchState, runningSessions, versions } from '../../store';
 import { navigate } from '../../ui-state';
-import { isActiveInstallItem, isSameInstallItem, selectInstance } from '../../actions';
+import { selectInstance } from '../../actions';
 import { launchGame, killGame } from '../../launch';
 import { handleInstallClick, retryFailedInstall } from '../../install';
-import { formatInstallItemLabel } from '../../install-labels';
 import { errMessage, supportsMods } from '../../utils';
 import { minecraftVersionLabel } from '../../version-display';
 import { loaderKeyFromVersion, LOADER_LABELS } from '../create/defaults';
-import type { EnrichedInstance, InstallItem, Version } from '../../types';
+import { instanceInstallStatus } from '../../instance-install-status';
+import type { EnrichedInstance, Version } from '../../types';
 import { fmtJoined, fmtRelative } from './format';
 import { fetchInstanceResources, type ResourceLoadState } from './resources';
 import { LOG_RESOURCE_POLL_MS } from './logs';
@@ -43,24 +43,6 @@ const TABS: Array<{ id: Tab; icon: string; label: string }> = [
 
 function loaderLabel(v: Version | undefined): string {
   return LOADER_LABELS[loaderKeyFromVersion(v)];
-}
-
-function installTargetFor(inst: EnrichedInstance, version: Version | undefined): string {
-  return version?.needs_install || version?.id || inst.version_id;
-}
-
-function installItemFor(inst: EnrichedInstance, version: Version | undefined): InstallItem {
-  const versionId = installTargetFor(inst, version);
-  if (!version?.loader) return { versionId };
-  return {
-    versionId,
-    loader: {
-      componentId: version.loader.component_id,
-      buildId: version.loader.build_id,
-      minecraftVersion: minecraftVersionLabel(version, ''),
-      loaderVersion: version.loader.loader_version,
-    },
-  };
 }
 
 export function InstanceDetailView({ id }: { id: string }): JSX.Element {
@@ -142,31 +124,14 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
   const activeTab: Tab = !showModsTab && tab === 'mods' ? 'overview' : tab;
   const visibleTabs = showModsTab ? TABS : TABS.filter((t) => t.id !== 'mods');
   const mcVer = minecraftVersionLabel(v);
-  const canLaunch = Boolean(v?.launchable);
-  const installTarget = installTargetFor(inst, v);
-  const installItem = installItemFor(inst, v);
-  const install = installState.value;
-  const installProgress = install.status === 'active' && isActiveInstallItem(installItem)
-    ? {
-        pct: install.pct,
-        label: install.label,
-        displayName: install.displayName,
-        remainingSeconds: install.remainingSeconds,
-        remainingSecondsUpdatedAt: install.remainingSecondsUpdatedAt,
-      }
-    : null;
-  const queuedInstallIndex = installQueue.value.findIndex(item => isSameInstallItem(item, installItem));
-  const queuedInstall = queuedInstallIndex >= 0 ? installQueue.value[queuedInstallIndex] : undefined;
-  const installQueued = !installProgress && Boolean(queuedInstall);
-  const installQueuePosition = installQueued ? queuedInstallIndex + 1 : undefined;
-  const installQueueCount = installQueued ? installQueue.value.length : undefined;
-  const failedInstall = installFailure.value;
-  const matchingInstallFailure = failedInstall && isSameInstallItem(failedInstall.item, installItem)
-    ? failedInstall
-    : null;
-  const installLabel = installProgress?.displayName
-    || (queuedInstall ? formatInstallItemLabel(queuedInstall) : matchingInstallFailure?.displayName || installTarget);
-  const installLocked = !canLaunch && (Boolean(installProgress) || installQueued || Boolean(matchingInstallFailure));
+  const canLaunch = Boolean(v?.launchable ?? inst.launchable);
+  const installStatus = instanceInstallStatus(inst, v);
+  const installTarget = installStatus.target;
+  const installProgress = installStatus.progress;
+  const installQueued = installStatus.state === 'queued';
+  const matchingInstallFailure = installStatus.failure;
+  const installLabel = installStatus.label;
+  const installLocked = !canLaunch && (installStatus.installing || Boolean(matchingInstallFailure));
 
   const onPlay = (): void => {
     selectInstance(inst.id);
@@ -293,8 +258,8 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
           installQueued={installQueued}
           installProgress={installProgress}
           installFailure={matchingInstallFailure}
-          installQueuePosition={installQueuePosition}
-          installQueueCount={installQueueCount}
+          installQueuePosition={installStatus.queuePosition}
+          installQueueCount={installStatus.queueCount}
           onRetryInstall={retryFailedInstall}
         />
       )}
