@@ -38,6 +38,7 @@ function GlyphMark({ loader, className }: { loader: LoaderKey; className: string
       <span
         aria-hidden="true"
         class={`${className} ${className}--mask`}
+        data-loader={loader}
         style={{ ['--cp-loader-src' as any]: `url("${src}")` }}
       />
     );

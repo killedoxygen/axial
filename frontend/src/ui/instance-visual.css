@@ -52,3 +52,11 @@
   -webkit-mask-size: contain;
   mask-size: contain;
 }
+
+.cp-tile-glyph--mask[data-loader="quilt"] {
+  translate: 2.1cqmin 2.1cqmin;
+}
+
+.cp-tile-glyph--mask[data-loader="forge"] {
+  translate: 0 2.1cqmin;
+}
