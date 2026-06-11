@@ -6,7 +6,7 @@ import { ActivityCard } from './ActivityCard';
 import { QuickActionsCard } from './QuickActionsCard';
 import { DetailsCard } from './DetailsCard';
 
-export function OverviewPane({ inst, resources, running, onLaunch, onStop, onOpenWorlds, onOpenLogs }: {
+export function OverviewPane({ inst, resources, running, onLaunch, onStop, onOpenWorlds, onOpenLogs, onRefreshResources }: {
   inst: EnrichedInstance;
   resources: InstanceResourceSummary | null;
   running: boolean;
@@ -14,11 +14,12 @@ export function OverviewPane({ inst, resources, running, onLaunch, onStop, onOpe
   onStop: () => void;
   onOpenWorlds: () => void;
   onOpenLogs: () => void;
+  onRefreshResources: () => void;
 }): JSX.Element {
   return (
     <div class="cp-instance-body cp-instance-body--overview-bento">
       <div class="cp-od-slot cp-od-slot--worlds cp-od-worlds-slot">
-        <WorldsCard inst={inst} resources={resources} onOpenWorlds={onOpenWorlds} />
+        <WorldsCard inst={inst} resources={resources} onOpenWorlds={onOpenWorlds} onRefresh={onRefreshResources} />
       </div>
       <div class="cp-od-slot cp-od-slot--performance">
         <PerformanceCard inst={inst} />

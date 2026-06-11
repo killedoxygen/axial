@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { InstanceArt } from '../art/InstanceArt';
 import { Icon } from '../ui/Icons';
 import { PlayerHeadPreview } from '../ui/PlayerHeadPreview';
-import { route, navigate, commandPaletteOpen, type Route } from '../ui-state';
+import { route, navigate, commandPaletteOpen, type Route, openCreate } from '../ui-state';
 import { runningSessions, config, instances } from '../store';
 import { promptPlayerName, savePlayerName } from '../player-name';
 import { Music, musicStateVersion } from '../music';
@@ -197,7 +197,15 @@ export function Sidebar(): JSX.Element {
       </button>
       <RailButton icon="home" label="Home" target={{ name: 'home' }} />
       <RailButton icon="cube" label="Instances" target={{ name: 'instances' }} />
-      <RailButton icon="plus" label="New instance" target={{ name: 'create' }} accent />
+      <button
+        class="cp-rail-btn"
+        data-accent="true"
+        onClick={openCreate}
+        title="New instance"
+        aria-label="New instance"
+      >
+        <Icon name="plus" size={20} stroke={1.7} />
+      </button>
       <div class="cp-rail-sep" aria-hidden="true" />
       <RailInstances />
       <div class="cp-rail-spacer" />

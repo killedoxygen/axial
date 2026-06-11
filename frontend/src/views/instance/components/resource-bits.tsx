@@ -59,14 +59,16 @@ export function ResourceRow({
   name,
   meta,
   actions,
+  onContextMenu,
 }: {
   icon: string;
   name: string;
   meta: string;
   actions?: JSX.Element;
+  onContextMenu?: (e: MouseEvent) => void;
 }): JSX.Element {
   return (
-    <div class="cp-resource-row">
+    <div class="cp-resource-row" onContextMenu={onContextMenu}>
       <span class="cp-resource-row-icon"><Icon name={icon} size={15} /></span>
       <span class="cp-resource-name" title={name}>{name}</span>
       <span class="cp-resource-meta">{meta}</span>

@@ -136,7 +136,17 @@ export function ScreenshotsPane({
       ) : (
         <div class="cp-screenshots-grid">
           {sortedScreenshots.map((shot) => (
-            <div class="cp-screenshot-tile" key={shot.name}>
+            <div
+              class="cp-screenshot-tile"
+              key={shot.name}
+              onContextMenu={(e) => openContextMenu(e, [
+                { icon: 'image', label: 'View', onSelect: () => setViewer(shot.name) },
+                { icon: 'edit', label: 'Rename', onSelect: () => void renameScreenshot(inst, shot.name, onRefresh) },
+                { icon: 'folder', label: 'Open screenshots folder', onSelect: () => void openInstanceFolder(inst.id, 'screenshots') },
+                { divider: true, label: '', onSelect: () => undefined },
+                { icon: 'trash', label: 'Delete', onSelect: () => void deleteScreenshot(inst, shot.name, onRefresh), danger: true },
+              ])}
+            >
               <button
                 class="cp-screenshot-thumb"
                 type="button"

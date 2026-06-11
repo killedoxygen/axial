@@ -1,6 +1,7 @@
 import type { JSX, ComponentChildren } from 'preact';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { Button, Card, Input, Pill } from '../../ui/Atoms';
+import { SelectField } from '../../ui/Select';
 import { Icon } from '../../ui/Icons';
 import { Slider } from '../../ui/Slider';
 import { AccentField, AccentModeToggle } from './AccentEditor';
@@ -97,17 +98,13 @@ function ModeChoice<T extends string>({
     <div class="cp-settings-mode-choice">
       <label class="cp-settings-mode-choice-label" htmlFor={selectId}>{label}</label>
       <div class="cp-settings-mode-field">
-        <select
-          id={selectId}
+        <SelectField<T>
           value={value}
           disabled={disabled}
-          aria-describedby={`${selectId}-note`}
-          onChange={(event) => onChange((event.currentTarget as HTMLSelectElement).value as T)}
-        >
-          {options.map((option) => (
-            <option key={option.value} value={option.value}>{option.label}</option>
-          ))}
-        </select>
+          ariaLabel={label}
+          onChange={onChange}
+          options={options.map((option) => ({ value: option.value, label: option.label }))}
+        />
         <div id={`${selectId}-note`} class="cp-settings-mode-note">
           {selected?.note ?? ''}
         </div>
@@ -194,14 +191,15 @@ function GameplaySection(): JSX.Element {
   const showNameError = username.length > 0 && !nameValid;
   const dirty = username !== savedUsername || memGB !== savedMemGB;
 
-  const save = async (): Promise<void> => {
-    if (!dirty || !nameValid) return;
+  const save = async (nextMemoryGB = memGB): Promise<void> => {
+    const nextDirty = username !== savedUsername || nextMemoryGB !== savedMemGB;
+    if (!nextDirty || !nameValid) return;
     const requestId = lastSaveRequest.current + 1;
     lastSaveRequest.current = requestId;
     try {
       const res: any = await api('PUT', '/config', {
         username: username.trim(),
-        max_memory_mb: Math.round(memGB * 1024),
+        max_memory_mb: Math.round(nextMemoryGB * 1024),
       });
       if (res.error) throw new Error(res.error);
       if (requestId !== lastSaveRequest.current) return;
@@ -227,7 +225,7 @@ function GameplaySection(): JSX.Element {
             placeholder="Player"
             style={{ width: 240 }}
           />
-          {dirty && <Button size="sm" onClick={save} disabled={!nameValid} sound="affirm">Save</Button>}
+          {dirty && <Button size="sm" onClick={() => { void save(); }} disabled={!nameValid} sound="affirm">Save</Button>}
           {showNameError && <span class="cp-settings-name-err">{nameError}</span>}
         </div>
       </SettingsCard>
@@ -248,7 +246,7 @@ function GameplaySection(): JSX.Element {
             ticks={memoryTicks}
             sound="memory"
             onChange={setMemGB}
-            onCommit={() => { if (dirty) void save(); }}
+            onCommit={(next) => { void save(next); }}
             ariaLabel="Max memory in gigabytes"
           />
         </div>

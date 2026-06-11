@@ -1,10 +1,3 @@
-/* UI primitives, visuals driven by the :root CSS vars from style.css
- * so the theme engine repaints them without any rerender.
- *
- * Language: solid raised surfaces, no decorative borders, generous radii.
- * Accent is rationed: primary actions and active states only. */
-
-/* Button ------------------------------------------------------------------ */
 .cp-btn {
   display: inline-flex;
   align-items: center;
@@ -30,7 +23,7 @@
 .cp-btn[disabled] { cursor: not-allowed; opacity: 0.5; }
 
 .cp-btn--sm { height: 30px; padding: 0 12px; font-size: 12px; gap: 6px; border-radius: var(--r-xs); }
-.cp-btn--md { /* default */ }
+.cp-btn--md { }
 .cp-btn--lg { height: 44px; padding: 0 22px; font-size: 14px; gap: 10px; border-radius: var(--r-md); }
 .cp-btn--full { width: 100%; }
 
@@ -49,7 +42,6 @@
 .cp-btn--danger { background: oklch(0.60 0.18 25); color: oklch(0.99 0.02 25); }
 .cp-btn--danger:hover:not([disabled]) { background: oklch(0.65 0.18 25); }
 
-/* IconButton -------------------------------------------------------------- */
 .cp-ibtn {
   display: inline-flex;
   align-items: center;
@@ -64,11 +56,10 @@
 }
 .cp-ibtn:hover:not([disabled]) { background: var(--surface-3); color: var(--text); }
 .cp-ibtn:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--accent-ring); }
-.cp-ibtn--active { background: var(--accent-soft); color: var(--accent); }
+.cp-ibtn--active { background: var(--accent-fill); color: var(--accent-on); }
 .cp-ibtn[disabled] { opacity: 0.45; cursor: not-allowed; }
 .cp-ibtn--danger:hover:not([disabled]) { background: oklch(0.70 0.18 25 / 0.18); color: var(--err); }
 
-/* Pill -------------------------------------------------------------------- */
 .cp-pill {
   display: inline-flex;
   align-items: center;
@@ -88,7 +79,6 @@
 .cp-pill--err  { background: oklch(0.70 0.18 25  / 0.16); color: var(--err); }
 .cp-pill--info { background: oklch(0.78 0.10 240 / 0.16); color: var(--info); }
 
-/* Kbd --------------------------------------------------------------------- */
 .cp-kbd {
   font-family: inherit;
   font-size: 10.5px;
@@ -99,7 +89,6 @@
   color: var(--text-dim);
 }
 
-/* Input ------------------------------------------------------------------- */
 .cp-field {
   display: flex;
   align-items: center;
@@ -113,7 +102,13 @@
   transition: box-shadow 120ms;
   min-width: 0;
 }
-.cp-field--focused { box-shadow: inset 0 0 0 1px var(--accent-line), 0 0 0 3px var(--accent-ring); }
+/* Focus is neutral: a stronger hairline plus a soft text-tinted halo.
+ * Accent is reserved for actions and selection, not text entry. */
+.cp-field--focused {
+  box-shadow:
+    inset 0 0 0 1px var(--line-strong),
+    0 0 0 3px color-mix(in oklab, var(--text) 8%, transparent);
+}
 .cp-field input {
   flex: 1;
   min-width: 0;
@@ -124,7 +119,6 @@
   font-size: 13px;
 }
 
-/* Card -------------------------------------------------------------------- */
 .cp-card {
   background: var(--surface);
   border: none;
@@ -133,7 +127,6 @@
   position: relative;
 }
 
-/* Segmented --------------------------------------------------------------- */
 .cp-seg {
   display: inline-flex;
   padding: 3px;
@@ -161,7 +154,6 @@
   box-shadow: 0 1px 2px rgba(0,0,0,0.18);
 }
 
-/* Meter ------------------------------------------------------------------- */
 .cp-meter {
   height: 4px;
   border-radius: 999px;
@@ -179,7 +171,6 @@
 .cp-meter--warn > span { background: var(--warn); }
 .cp-meter--err > span  { background: var(--err); }
 
-/* Section heading --------------------------------------------------------- */
 .cp-section-head {
   display: flex;
   align-items: center;

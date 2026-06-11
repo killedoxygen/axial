@@ -2,7 +2,6 @@ import { api } from '../../api';
 import type { InstanceResourceSummary, InstanceLogTail } from '../../types';
 
 export type InstanceLogEntry = InstanceResourceSummary['logs'][number];
-export type LogSort = 'current' | 'newest' | 'name' | 'size';
 export type LogFilter = 'all' | 'important' | 'errors' | 'warnings' | 'system-info';
 export type LogLineKind = 'error' | 'warning' | 'system' | 'info';
 
@@ -13,13 +12,6 @@ export interface ClassifiedLogLine {
   label: string;
   important: boolean;
 }
-
-export const LOG_SORT_LABELS: Record<LogSort, string> = {
-  current: 'Current/latest',
-  newest: 'Newest',
-  name: 'Name',
-  size: 'Size',
-};
 
 export const LOG_FILTER_LABELS: Record<LogFilter, string> = {
   all: 'All',
@@ -45,22 +37,18 @@ export function isCurrentLog(name: string): boolean {
   return currentLogRank(name) < 10;
 }
 
-export function sortLogs(logs: InstanceLogEntry[], sort: LogSort): InstanceLogEntry[] {
+export function sortLogs(logs: InstanceLogEntry[]): InstanceLogEntry[] {
   const next = [...logs];
   next.sort((a, b) => {
-    if (sort === 'name') return a.name.toLowerCase().localeCompare(b.name.toLowerCase());
-    if (sort === 'size') return b.size - a.size || a.name.localeCompare(b.name);
-    if (sort === 'current') {
-      const current = currentLogRank(a.name) - currentLogRank(b.name);
-      if (current !== 0) return current;
-    }
+    const current = currentLogRank(a.name) - currentLogRank(b.name);
+    if (current !== 0) return current;
     return b.modified_at.localeCompare(a.modified_at) || a.name.localeCompare(b.name);
   });
   return next;
 }
 
 export function pickInitialLog(logs: InstanceLogEntry[]): string {
-  return sortLogs(logs, 'current')[0]?.name ?? '';
+  return sortLogs(logs)[0]?.name ?? '';
 }
 
 export function classifyLogLine(text: string): LogLineKind {

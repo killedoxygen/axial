@@ -14,6 +14,13 @@ import type {
 
 import type { LogSeverity } from './store';
 
+// Class-name joiner for the shadcn-ported primitives (no Tailwind, so a
+// plain filter-join replaces clsx + tailwind-merge). Accepts unknown so
+// preact's Signalish className prop types pass through; non-strings drop.
+export function cn(...inputs: unknown[]): string {
+  return inputs.filter((v): v is string => typeof v === 'string' && v.length > 0).join(' ');
+}
+
 const SEVERITY_RANK: Record<LogSeverity, number> = { error: 3, system: 2, info: 1 };
 
 function logSeverityFromSource(source: string): LogSeverity {
@@ -82,6 +89,10 @@ export function isOldBetaVersion(version: Pick<Version, 'lifecycle'> | Pick<Cata
 
 export function isOldAlphaVersion(version: Pick<Version, 'lifecycle'> | Pick<CatalogVersion, 'lifecycle'> | null | undefined): boolean {
   return hasLifecycleLabel(version?.lifecycle, 'old_alpha');
+}
+
+export function isVanillaVersion(version: Pick<Version, 'loader'> | null | undefined): boolean {
+  return !version?.loader;
 }
 
 export function matchesVersionFilter(

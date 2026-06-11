@@ -1,6 +1,7 @@
 import type { JSX, ComponentChildren } from 'preact';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { Button, Card, Pill } from '../../ui/Atoms';
+import { SelectField } from '../../ui/Select';
 import { api } from '../../api';
 import { toast } from '../../toast';
 import { devMode, instances, lastInstanceId, selectedInstanceId } from '../../store';
@@ -1052,32 +1053,28 @@ function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: BenchmarkMat
       <div class="cp-settings-driver-start">
         <label class="cp-settings-driver-start-field cp-settings-driver-start-field--instance">
           <span>Instance</span>
-          <select
+          <SelectField
             value={startInstanceId}
             disabled={starting || instanceRows.length === 0}
-            onChange={(event) => setStartInstanceId((event.currentTarget as HTMLSelectElement).value)}
-            aria-label="Benchmark driver instance"
-          >
-            {instanceRows.length === 0 && <option value="">No instances</option>}
-            {instanceRows.map((instance) => (
-              <option key={instance.id} value={instance.id}>
-                {instance.name} ({instance.version_id})
-              </option>
-            ))}
-          </select>
+            onChange={setStartInstanceId}
+            ariaLabel="Benchmark driver instance"
+            options={instanceRows.length === 0
+              ? [{ value: '', label: 'No instances' }]
+              : instanceRows.map((instance) => ({
+                  value: instance.id,
+                  label: `${instance.name} (${instance.version_id})`,
+                }))}
+          />
         </label>
         <label class="cp-settings-driver-start-field cp-settings-driver-start-field--mode">
           <span>Suite mode</span>
-          <select
+          <SelectField
             value={startSuiteMode}
             disabled={starting}
-            onChange={(event) => setStartSuiteMode((event.currentTarget as HTMLSelectElement).value)}
-            aria-label="Benchmark suite mode"
-          >
-            {suiteModes.map((mode) => (
-              <option key={mode} value={mode}>{labelFromToken(mode, mode)}</option>
-            ))}
-          </select>
+            onChange={setStartSuiteMode}
+            ariaLabel="Benchmark suite mode"
+            options={suiteModes.map((mode) => ({ value: mode, label: labelFromToken(mode, mode) }))}
+          />
         </label>
         <label class="cp-settings-driver-start-field cp-settings-driver-start-field--interval" data-invalid={showIntervalError ? 'true' : 'false'}>
           <span>Interval</span>

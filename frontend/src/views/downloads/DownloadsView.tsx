@@ -97,12 +97,6 @@ export function DownloadsView(): JSX.Element {
 
   return (
     <div class="cp-view-page" style={{ gap: 20 }}>
-      <div class="cp-page-header">
-        <div>
-          <h1>Downloads</h1>
-          <div class="cp-page-sub">{pageStatus}</div>
-        </div>
-      </div>
 
       {hasActive ? (
         <Card>

@@ -6,7 +6,7 @@ import { HomeView } from './views/home/HomeView';
 import { DialogHost } from './ui/Dialog';
 import { ContextMenuHost } from './ui/ContextMenu';
 import { ToastHost } from './ui/ToastHost';
-import { commandPaletteOpen, route, showOnboardingOverlay, showSetupOverlay } from './ui-state';
+import { commandPaletteOpen, createOpen, route, showOnboardingOverlay, showSetupOverlay } from './ui-state';
 import { bootstrapError, bootstrapState, devMode } from './store';
 import { useShortcuts } from './hooks/use-shortcuts';
 
@@ -25,7 +25,7 @@ const InstancesRoute = createRouteLoader(
   async () => (await import('./views/instances/InstancesView')).InstancesView,
 );
 
-const CreateRoute = createRouteLoader(
+const CreateOverlay = createRouteLoader(
   async () => (await import('./views/create/CreateView')).CreateView,
 );
 
@@ -202,7 +202,6 @@ function CurrentView(): JSX.Element {
     case 'home': return <HomeView />;
     case 'instances': return <InstancesRoute />;
     case 'instance': return <InstanceDetailRoute id={r.id} />;
-    case 'create': return <CreateRoute />;
     case 'dev-lab': return <DevLabRoute />;
     case 'downloads': return <DownloadsRoute />;
     case 'accounts': return <AccountsRoute />;
@@ -215,6 +214,7 @@ export function App(): JSX.Element {
   return (
     <>
       <AppFrame><CurrentView /></AppFrame>
+      {createOpen.value && <CreateOverlay />}
       {showSetupOverlay.value && <LazySetupOverlay />}
       {showOnboardingOverlay.value && <OnboardingOverlay />}
       <DialogHost />

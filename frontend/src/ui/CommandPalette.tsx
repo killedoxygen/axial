@@ -2,7 +2,7 @@ import type { JSX } from 'preact';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { Icon } from './Icons';
 import { Kbd } from './Atoms';
-import { commandPaletteOpen, navigate, type Route } from '../ui-state';
+import { commandPaletteOpen, navigate, type Route, openCreate } from '../ui-state';
 import { instances, runningSessions, config } from '../store';
 import { Music } from '../music';
 import { local, saveLocalState } from '../state';
@@ -37,7 +37,7 @@ function buildCommands(): Command[] {
   list.push(
     { id: 'jump:home', group: 'jump', icon: 'home', label: 'Home', perform: goto({ name: 'home' }) },
     { id: 'jump:instances', group: 'jump', icon: 'cube', label: 'Instances', perform: goto({ name: 'instances' }) },
-    { id: 'jump:create', group: 'jump', icon: 'plus', label: 'New instance', hint: 'Ctrl N', perform: goto({ name: 'create' }) },
+    { id: 'jump:create', group: 'jump', icon: 'plus', label: 'New instance', hint: 'Ctrl N', perform: () => { openCreate(); close(); } },
     { id: 'jump:downloads', group: 'jump', icon: 'download', label: 'Downloads', perform: goto({ name: 'downloads' }) },
     { id: 'jump:accounts', group: 'jump', icon: 'user', label: 'Accounts and skins', perform: goto({ name: 'accounts' }) },
     { id: 'jump:settings', group: 'jump', icon: 'settings', label: 'Settings', hint: 'Ctrl ,', perform: goto({ name: 'settings' }) },

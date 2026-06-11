@@ -1,5 +1,3 @@
-/* Settings page: left rail nav + stacked SettingsCard sections. */
-
 .cp-settings {
   display: grid;
   grid-template-columns: 220px minmax(0, 1fr);
@@ -39,8 +37,8 @@
 }
 .cp-settings-rail-btn:hover { background: var(--surface-3); color: var(--text); }
 .cp-settings-rail-btn[data-active="true"] {
-  background: var(--accent-soft);
-  color: var(--accent);
+  background: var(--accent-fill);
+  color: var(--accent-on);
   font-weight: 600;
 }
 
@@ -76,8 +74,6 @@
   margin-top: 4px;
   max-width: 460px;
   line-height: 1.5;
-  /* Distribute words more evenly on multi-line descriptions where supported.
-     Ignored on older WebKit; greedy wrap is the fallback. */
   text-wrap: balance;
 }
 .cp-settings-card-control {
@@ -90,7 +86,6 @@
   justify-content: stretch;
 }
 
-/* Player name row: input + save + error, wraps on narrow cards */
 .cp-settings-name {
   margin-top: 14px;
   display: flex;
@@ -104,11 +99,6 @@
   color: var(--err);
 }
 
-/* Accent editor styles live in ./accent.css (co-located with AccentEditor.tsx)
-   so Onboarding can reuse the exact same component. */
-
-/* Stack-layout cards (e.g. Accent) need top spacing between title and content.
-   AccentEditor itself is layout-agnostic, so we add the breathing room here. */
 .cp-settings-card--stack .cp-accent-pane { margin-top: 14px; }
 
 .cp-settings-lab-action {
@@ -117,7 +107,6 @@
   justify-content: flex-start;
 }
 
-/* Compact mode pickers --------------------------------------------------- */
 .cp-settings-mode-grid {
   margin-top: 14px;
   display: grid;
@@ -148,30 +137,6 @@
   display: flex;
   flex-direction: column;
   gap: 5px;
-}
-.cp-settings-mode-field select {
-  width: 100%;
-  min-height: 36px;
-  padding: 0 10px;
-  border: none;
-  border-radius: var(--r-sm);
-  background: var(--surface-2);
-  color: var(--text);
-  font: inherit;
-  cursor: pointer;
-  transition: background 140ms ease, border-color 140ms ease, color 140ms ease;
-}
-.cp-settings-mode-field select:hover:not(:disabled) {
-  background: var(--surface-3);
-  border-color: var(--line-strong);
-}
-.cp-settings-mode-field select:focus-visible {
-  outline: 2px solid var(--accent-line);
-  outline-offset: 2px;
-}
-.cp-settings-mode-field select:disabled {
-  cursor: wait;
-  opacity: 0.68;
 }
 .cp-settings-mode-note {
   color: var(--text-mute);
@@ -738,7 +703,6 @@
   line-height: 1.2;
   text-transform: uppercase;
 }
-.cp-settings-driver-start-field select,
 .cp-settings-driver-interval-input {
   width: 100%;
   min-width: 0;
@@ -751,10 +715,6 @@
   font: inherit;
   font-size: 12.5px;
 }
-.cp-settings-driver-start-field select {
-  padding: 0 28px 0 9px;
-}
-.cp-settings-driver-start-field select:disabled,
 .cp-settings-driver-interval-input:has(input:disabled) {
   cursor: not-allowed;
   opacity: 0.68;
@@ -958,7 +918,6 @@
     white-space: normal;
   }
 }
-/* Toggle ----------------------------------------------------------------- */
 .cp-toggle {
   width: 42px; height: 24px;
   border-radius: 999px;

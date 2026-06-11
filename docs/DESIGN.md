@@ -15,22 +15,40 @@ This project is a desktop Minecraft launcher, not a marketing site. Keep UI work
 - Neutrals are not gray: the whole surface stack carries a low-chroma tint of the accent hue, rebuilt at runtime by `applyCssVars()` and `buildNeutrals(dark, hue)`. Never hardcode a neutral with a hue that fights the accent.
 - Borders are reserved for genuine separators (row dividers, table heads), dashed empty states, selection states, and floating overlays. Never use a border to frame a card or a button.
 - Accent is rationed: primary action, active nav, selection. Everything else is raised neutral or ghost. Row-level Play buttons are secondary; only the featured action is primary.
-- Typography is one voice: Geist everywhere (vendored in `frontend/static/fonts/`). Monospace only for actual log output. Use tabular figures (`font-variant-numeric`) for aligned numbers, not a different font.
+- Typography is one voice: Manrope everywhere (vendored in `frontend/static/fonts/`). Monospace only for actual log output. Use tabular figures (`font-variant-numeric`) for aligned numbers, not a different font.
 - Radii are generous and friendly: `--r-xs` 8 / `--r-sm` 12 / `--r-md` 16 / `--r-lg` 20 / `--r-xl` 28. Cards use `--r-lg`, buttons and inputs `--r-sm`. Do not hardcode radii; consume the vars.
 - Home is workflow-first: a full-width featured banner for the last-played instance (`.cp-feature`) over a fluid cover-card library grid (`.cp-cover-grid` / `InstanceCard`), no vanity stat cards. Instances uses the same cover grid as its default view; the table is the secondary mode. Layouts must fill wide viewports with fluid `auto-fill` grids rather than capping into empty margins.
 - Keep controls familiar:
   - icons for small actions;
   - segmented controls for small mode sets;
-  - dropdown/select controls for larger option sets;
+  - dropdowns for larger option sets — always `ui/Select.tsx` (`SelectField`), never a native `<select>`;
   - native disclosures for secondary or developer-only detail;
   - context menus for secondary row actions.
+- Modals use `ui/Modal.tsx` (`Modal`/`ModalContent`/`ModalHeader`/`ModalFooter`/`ModalTitle`/`ModalDescription`/`ModalClose`): portal rendering, scrim + Escape dismiss, focus trap and focus restore. Panels style themselves via `className`; pass `showCloseButton={false}` when the panel carries its own close.
+- Primitive policy: shadcn/ui is the **design and API reference** (component decomposition, `data-slot` conventions, behavior contract), but its Radix runtime does not render reliably under preact/compat — the dialog mounted only its overlay. Behavioral primitives are therefore implemented directly in Preact inside `ui/`, matching the shadcn contract, styled with `cp-*` classes. Do not add `@radix-ui/*` dependencies without smoke-testing the rendered output in the app first.
+- Text inputs and select triggers focus with a neutral ring (stronger hairline + text-tinted halo), never accent. Accent rings are for interactive focus-visible on buttons only.
+- "Already installed" on version rows is the `download` icon (OpenAI icon set), not a colored status dot.
 - Do not use `cp-section-eyebrow`.
 - Do not add broad card-heavy layouts. Avoid nested cards.
 - Cards are acceptable for repeated items, existing framed tools, and current surfaces that already use them. Do not introduce cards as a default spacing device.
 
 ## Shell
 - The sidebar is a fixed 68px icon rail (`.cp-rail`): brand, search, Home/Instances/New, instance art tiles, settings, player head. There is no expanded sidebar mode; labels live in tooltips and the command palette.
-- The active instance tile gets an accent ring; running instances get a status dot. Keep rail items 44px.
+- Active instance tile: full-color art plus raised shadow while siblings sit dimmed — no rings or borders (they clip in the scroll container). Running instances get a status dot. Keep rail items 44px.
+
+## Selection & Active States
+- One selection language everywhere: solid `--accent-fill` background with `--accent-on` content (the onboarding pill pattern). No translucent accent washes, no accent borders for selection. Applies to rail nav, version rows, source tiles, runtime presets, icon-button active, settings rail, on/off pills.
+- Mode switches (segmented controls, channel tabs, mini-seg) stay neutral: raised `--surface-2` thumb on a recessed track.
+
+## Create Instance
+- Creating an instance is a modal (`createOpen` signal in `ui-state.ts`), not a route: it pops over the current view with a scrim and closes on Esc/Cancel/success. One screen, no steps: source tiles, channel tabs, searchable version list in a recessed well (left) and identity preview, name, memory, window/profile rows (right).
+
+## Instance Tabs
+- Every tab is "toolbar row (30px controls) + raised panel" so switching tabs never shifts layout (`.cp-resource-toolbar` + panel).
+- Logs: the latest/current log renders by default at a fixed-height viewer (`.cp-logview`); past logs live behind a select. Log line colors derive from theme tokens, never hardcoded hues.
+- Instance settings: one raised sheet (`.cp-iset`) of hairline-divided sections, no master-detail nav, decoupled from the logs UI.
+- Overview first bento row (Worlds/Activity) is fixed-height so empty and populated states don't reflow.
+- Context menus are expected on operational rows: worlds (tab and overview card), screenshots, mods, instance rows/cards.
 
 ## Layout Rules
 - Preserve existing grid and bento alignment unless a planned visual pass explicitly changes it.
@@ -48,9 +66,8 @@ This project is a desktop Minecraft launcher, not a marketing site. Keep UI work
 - Preserve Worlds, Screenshots, Logs, and Settings as operational tabs using existing resource/log primitives.
 
 ### CreateView
-- Treat user-owned `cp-cr-channels`, `cp-cr-subline`, source rail wrapping, tooltip/hover spacing, and adjacent create-flow styling as protected unless explicit direction says otherwise.
-- The source picker direction is a straight-line rail with icon plus label, not a two-row card grid.
-- Avoid broad CreateView redesigns while local CreateView files are dirty.
+- The create modal is a single-screen card; do not reintroduce a multi-step wizard, stepper, or full-page create route.
+- Source picker stays a straight-line row of icon-plus-label tiles, not a card grid.
 
 ### Accounts & Skins
 - Uploaded skins are v1 scope.

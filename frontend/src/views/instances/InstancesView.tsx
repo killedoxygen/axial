@@ -7,9 +7,10 @@ import { InstanceCard } from '../../ui/InstanceCard';
 import { openContextMenu } from '../../ui/ContextMenu';
 import { useTheme } from '../../hooks/use-theme';
 import { instances, versions, runningSessions } from '../../store';
-import { navigate } from '../../ui-state';
+import { navigate, openCreate } from '../../ui-state';
 import { loaderKeyFromVersion, LOADER_LABELS } from '../create/defaults';
-import { deleteInstanceFlow, duplicateInstance, openInstanceFolder, renameInstance } from '../instance/instance-actions';
+import { instanceMenuItems } from '../instance/instance-menu';
+import { isVanillaVersion } from '../../utils';
 import type { EnrichedInstance, Version } from '../../types';
 
 function fmtRelative(iso?: string): string {
@@ -39,27 +40,17 @@ function loaderLabel(v: Version | undefined): string {
 
 const LIST_COLS = '52px 2.4fr 1fr 1fr 1fr 140px';
 
-function menuItemsFor(inst: EnrichedInstance): Parameters<typeof openContextMenu>[1] {
-  return [
-    { icon: 'play', label: 'Open detail', onSelect: () => navigate({ name: 'instance', id: inst.id }) },
-    { icon: 'folder', label: 'Open folder', onSelect: () => void openInstanceFolder(inst.id) },
-    { icon: 'copy', label: 'Duplicate', onSelect: () => void duplicateInstance(inst) },
-    { icon: 'edit', label: 'Rename', onSelect: () => void renameInstance(inst) },
-    { label: '', onSelect: () => {}, divider: true },
-    { icon: 'trash', label: 'Delete', onSelect: () => void deleteInstanceFlow(inst), danger: true },
-  ];
-}
-
 function ListRow({ inst }: { inst: EnrichedInstance }): JSX.Element {
   const theme = useTheme();
   const v = versions.value.find(x => x.id === inst.version_id);
   const running = !!runningSessions.value[inst.id];
+  const showModsCount = !isVanillaVersion(v);
   return (
     <div
       class="cp-table-row"
       style={{ gridTemplateColumns: LIST_COLS }}
       onClick={() => navigate({ name: 'instance', id: inst.id })}
-      onContextMenu={(e) => openContextMenu(e, menuItemsFor(inst))}
+      onContextMenu={(e) => openContextMenu(e, instanceMenuItems(inst))}
     >
       <InstanceArt instance={inst} aspect="thumb" radius={theme.r.sm} style={{ width: 36, height: 36 }} />
       <div>
@@ -70,7 +61,7 @@ function ListRow({ inst }: { inst: EnrichedInstance }): JSX.Element {
         <div class="cp-table-row-sub">{loaderLabel(v)} · {v?.loader?.loader_version || 'vanilla'}</div>
       </div>
       <div class="cp-table-cell">{versionLabel(v)}</div>
-      <div class="cp-table-cell">{inst.mods_count ?? 0} mods</div>
+      <div class="cp-table-cell">{showModsCount ? `${inst.mods_count ?? 0} mods` : null}</div>
       <div class="cp-table-cell">{fmtRelative(inst.last_played_at)}</div>
       <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 4 }}>
         <Button
@@ -82,7 +73,7 @@ function ListRow({ inst }: { inst: EnrichedInstance }): JSX.Element {
         <IconButton
           icon="dots"
           size={28}
-          onClick={(e: any) => { e.stopPropagation(); openContextMenu(e, menuItemsFor(inst)); }}
+          onClick={(e: any) => { e.stopPropagation(); openContextMenu(e, instanceMenuItems(inst)); }}
         />
       </div>
     </div>
@@ -109,7 +100,7 @@ export function InstancesView(): JSX.Element {
         <Input value={q} onChange={setQ} placeholder="Filter instances…" icon="search" style={{ width: 260 }} />
         <Segmented<'grid' | 'list'> value={view} onChange={setView}
           options={[{ value: 'grid', label: 'Grid' }, { value: 'list', label: 'List' }]} />
-        <Button icon="plus" onClick={() => navigate({ name: 'create' })}>New</Button>
+        <Button icon="plus" onClick={openCreate}>New</Button>
       </div>
 
       {filtered.length === 0 ? (
@@ -117,7 +108,7 @@ export function InstancesView(): JSX.Element {
           <Icon name="cube" size={36} color="var(--text-mute)" />
           <h2>{q ? 'No matches' : 'No instances yet'}</h2>
           <p>{q ? 'Try a different search term.' : 'Create your first Minecraft instance to get started.'}</p>
-          {!q && <Button icon="plus" onClick={() => navigate({ name: 'create' })}>New instance</Button>}
+          {!q && <Button icon="plus" onClick={openCreate}>New instance</Button>}
         </div>
       ) : view === 'grid' ? (
         <div class="cp-cover-grid">
@@ -125,7 +116,7 @@ export function InstancesView(): JSX.Element {
             <InstanceCard
               key={i.id}
               inst={i}
-              onContextMenu={(e) => openContextMenu(e, menuItemsFor(i))}
+              onContextMenu={(e) => openContextMenu(e, instanceMenuItems(i))}
             />
           ))}
         </div>

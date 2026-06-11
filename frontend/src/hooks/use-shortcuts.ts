@@ -1,5 +1,5 @@
 import { useEffect } from 'preact/hooks';
-import { navigate, route, commandPaletteOpen } from '../ui-state';
+import { navigate, route, commandPaletteOpen, openCreate } from '../ui-state';
 import { selectedInstance, runningSessions, launchState, instances } from '../store';
 import { selectInstance } from '../actions';
 import { launchGame } from '../launch';
@@ -29,7 +29,7 @@ export function useShortcuts(): void {
       if (match(e, 'n')) {
         if (typing) return;
         e.preventDefault();
-        navigate({ name: 'create' });
+        openCreate();
         Sound.ui('soft');
         return;
       }

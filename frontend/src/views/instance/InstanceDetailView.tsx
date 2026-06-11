@@ -11,7 +11,7 @@ import { isActiveInstallItem, isSameInstallItem, selectInstance } from '../../ac
 import { launchGame, killGame } from '../../launch';
 import { handleInstallClick, retryFailedInstall } from '../../install';
 import { formatInstallItemLabel } from '../../install-labels';
-import { errMessage } from '../../utils';
+import { errMessage, isVanillaVersion } from '../../utils';
 import { loaderKeyFromVersion, LOADER_LABELS } from '../create/defaults';
 import type { EnrichedInstance, InstallItem, Version } from '../../types';
 import { fmtJoined, fmtRelative } from './format';
@@ -139,6 +139,7 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
   }
 
   const v = versions.value.find(x => x.id === inst.version_id);
+  const showModsCount = !isVanillaVersion(v);
   const mcVer = v?.minecraft_meta.display_hint || v?.minecraft_meta.display_name || 'unknown';
   const canLaunch = Boolean(v?.launchable);
   const installTarget = installTargetFor(inst, v);
@@ -181,6 +182,7 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
 
   const tabCount = (t: Tab): number | undefined => {
     if (t === 'mods') {
+      if (!showModsCount) return undefined;
       const n = resources.data?.mods_count ?? inst.mods_count ?? 0;
       return n > 0 ? n : undefined;
     }
@@ -301,6 +303,7 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
           <OverviewPane
             inst={inst}
             resources={resources.data}
+            onRefreshResources={reloadResources}
             running={running}
             onLaunch={onPlay}
             onStop={onStop}

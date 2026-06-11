@@ -1,5 +1,5 @@
 import type { JSX } from 'preact';
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import { Segmented } from '../../ui/Atoms';
 import { ColorField } from './ColorField';
 import { applyTheme } from '../../theme';
@@ -40,17 +40,20 @@ export function AccentField({
 } = {}): JSX.Element {
   const [hue, setHue] = useState<number>(local.customHue);
   const [vibrancy, setVibrancy] = useState<number>(local.customVibrancy);
+  const latest = useRef({ hue: local.customHue, vibrancy: local.customVibrancy });
 
   const applyPreset = (id: string): void => {
     const h = PRESET_HUES[id];
     if (h == null) return;
     const nextVibrancy = local.customVibrancy;
+    latest.current = { hue: h, vibrancy: nextVibrancy };
     setHue(h);
     setVibrancy(nextVibrancy);
     applyTheme(id, null, { vibrancy: nextVibrancy, lightness: local.lightness });
   };
 
   const onDrag = (h: number, v: number): void => {
+    latest.current = { hue: h, vibrancy: v };
     setHue(h);
     setVibrancy(v);
     playSliderSound(h / 360, 'hue');
@@ -58,8 +61,9 @@ export function AccentField({
   };
 
   const onEnd = (): void => {
+    const { hue: nextHue, vibrancy: nextVibrancy } = latest.current;
     Sound.ui('theme');
-    applyTheme('custom', hue, { vibrancy, lightness: local.lightness });
+    applyTheme('custom', nextHue, { vibrancy: nextVibrancy, lightness: local.lightness });
   };
 
   return (

@@ -126,7 +126,7 @@ export function buildTheme(opts: { dark?: boolean; hue?: number; vibrancy?: numb
     err: 'oklch(0.70 0.18 25)',
     info: 'oklch(0.78 0.10 240)',
     font: {
-      sans: '"Geist", ui-sans-serif, system-ui, -apple-system, sans-serif',
+      sans: '"Manrope", ui-sans-serif, system-ui, -apple-system, sans-serif',
       mono: '"Geist Mono", ui-monospace, SFMono-Regular, Menlo, monospace',
     },
   };

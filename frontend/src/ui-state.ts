@@ -6,7 +6,6 @@ export type Route =
   | { name: 'home' }
   | { name: 'instances' }
   | { name: 'instance'; id: string }
-  | { name: 'create' }
   | { name: 'dev-lab' }
   | { name: 'downloads' }
   | { name: 'accounts' }
@@ -55,7 +54,6 @@ function isRoute(value: unknown): value is Route {
   switch (candidate.name) {
     case 'home':
     case 'instances':
-    case 'create':
     case 'dev-lab':
     case 'downloads':
     case 'accounts':
@@ -80,3 +78,14 @@ export function restoreRoute(): void {
 export const commandPaletteOpen = signal(false);
 export const showOnboardingOverlay = signal(false);
 export const showSetupOverlay = signal(false);
+
+// Create-instance modal: pops over the current view, no route change.
+export const createOpen = signal(false);
+
+export function openCreate(): void {
+  createOpen.value = true;
+}
+
+export function closeCreate(): void {
+  createOpen.value = false;
+}

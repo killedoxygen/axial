@@ -58,7 +58,6 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
   const [javaPath, setJavaPath] = useState<string>(inst.java_path ?? '');
   const [jvmArgs, setJvmArgs] = useState<string>(inst.extra_jvm_args ?? '');
   const [advancedOpen, setAdvancedOpen] = useState<boolean>(Boolean(inst.java_path || inst.extra_jvm_args));
-  const [activeSettingsSection, setActiveSettingsSection] = useState<string>('policy');
   const [saving, setSaving] = useState(false);
   const totalGB = systemInfo.value?.total_memory_mb ? Math.max(1, Math.floor(systemInfo.value.total_memory_mb / 1024)) : 32;
   const ramMax = Math.max(2, Math.min(32, totalGB));
@@ -78,13 +77,6 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
     ? `${performanceModeLabel(effectiveSettingsMode)} override`
     : `Inherits ${performanceModeLabel(effectiveSettingsMode)} from global settings`;
   const runtimePresetText = `${JVM_PRESET_LABELS[jvmPreset]}: ${JVM_PRESET_HINTS[jvmPreset]}`;
-  const settingsSections = [
-    { id: 'policy', label: 'Performance policy', meta: performanceModeText },
-    { id: 'memory', label: 'Memory', meta: `${fmtMem(recMin)} to ${fmtMem(recMax)} recommended` },
-    { id: 'runtime', label: 'Runtime', meta: runtimePresetText },
-    { id: 'window', label: 'Window', meta: `${activeWindowLabel} · ${width} × ${height}` },
-    { id: 'identity', label: 'Identity', meta: `${artPreset} artwork style` },
-  ];
   const dirty = (
     artSeed !== initialArtSeed ||
     Math.round(maxMem * 1024) !== (inst.max_memory_mb ?? config.value?.max_memory_mb ?? 4096) ||
@@ -151,11 +143,6 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
     }
   };
 
-  const jumpToSettingsSection = (sectionId: string): void => {
-    setActiveSettingsSection(sectionId);
-    document.getElementById(`cp-settings-${sectionId}`)?.scrollIntoView({ block: 'start' });
-  };
-
   return (
     <div class="cp-instance-body cp-settings-pane">
       <div class="cp-resource-toolbar cp-settings-toolbar">
@@ -166,30 +153,15 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
         </div>
       </div>
 
-      <div class="cp-logs-layout cp-settings-layout">
-        <div class="cp-logs-list cp-settings-list" aria-label="Settings sections">
-          {settingsSections.map((section) => (
-            <button
-              key={section.id}
-              type="button"
-              data-active={activeSettingsSection === section.id}
-              onClick={() => jumpToSettingsSection(section.id)}
-            >
-              <span>{section.label}</span>
-              <small>{section.meta}</small>
-            </button>
-          ))}
-        </div>
-
-        <div class="cp-log-preview cp-settings-preview">
-          <section id="cp-settings-policy" class="cp-settings-row">
-            <div class="cp-settings-row-head">
+      <div class="cp-iset">
+          <section id="cp-settings-policy" class="cp-iset-card">
+            <div class="cp-iset-head">
               <div>
                 <h3>Performance policy</h3>
                 <p>{performanceModeText}.</p>
               </div>
             </div>
-            <div class="cp-settings-row-control">
+            <div class="cp-iset-body">
               <div class="cp-settings-segment" aria-label="Instance performance mode">
                 <Segmented<InstancePerformanceMode>
                   options={INSTANCE_PERFORMANCE_OPTIONS}
@@ -205,14 +177,14 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
             </div>
           </section>
 
-          <section id="cp-settings-memory" class="cp-settings-row">
-            <div class="cp-settings-row-head">
+          <section id="cp-settings-memory" class="cp-iset-card cp-iset-card--wide">
+            <div class="cp-iset-head">
               <div>
                 <h3>Memory</h3>
                 <p>Recommended range: {fmtMem(recMin)} to {fmtMem(recMax)}.</p>
               </div>
             </div>
-            <div class="cp-settings-row-control">
+            <div class="cp-iset-body">
               <div class="cp-settings-memory-grid">
                 <div class="cp-settings-slider-row">
                   <div class="cp-settings-slider-label">
@@ -249,14 +221,14 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
             </div>
           </section>
 
-          <section id="cp-settings-runtime" class="cp-settings-row">
-            <div class="cp-settings-row-head">
+          <section id="cp-settings-runtime" class="cp-iset-card cp-iset-card--wide">
+            <div class="cp-iset-head">
               <div>
                 <h3>Runtime</h3>
                 <p>{runtimePresetText}</p>
               </div>
             </div>
-            <div class="cp-settings-row-control">
+            <div class="cp-iset-body">
               <div class="cp-settings-runtime-presets" role="radiogroup" aria-label="Runtime preset">
                 {JVM_PRESET_ORDER.map((preset) => (
                   <button
@@ -299,14 +271,14 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
             </div>
           </section>
 
-          <section id="cp-settings-window" class="cp-settings-row">
-            <div class="cp-settings-row-head">
+          <section id="cp-settings-window" class="cp-iset-card">
+            <div class="cp-iset-head">
               <div>
                 <h3>Window</h3>
                 <p>{activeWindowLabel} · {width} × {height}</p>
               </div>
             </div>
-            <div class="cp-settings-row-control cp-settings-window-control">
+            <div class="cp-iset-body">
               <div class="cp-settings-segment" aria-label="Window size">
                 <Segmented<string>
                   options={WINDOW_PRESETS.map((preset) => ({ value: preset.id, label: preset.label }))}
@@ -341,14 +313,14 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
             </div>
           </section>
 
-          <section id="cp-settings-identity" class="cp-settings-row cp-settings-row--identity">
-            <div class="cp-settings-row-head">
+          <section id="cp-settings-identity" class="cp-iset-card">
+            <div class="cp-iset-head">
               <div>
                 <h3>Identity</h3>
                 <p>Artwork used for this instance.</p>
               </div>
             </div>
-            <div class="cp-settings-row-control cp-settings-identity-control">
+            <div class="cp-iset-body cp-settings-identity-control">
               <InstanceArt
                 instance={{ ...inst, art_seed: artSeed }}
                 aspect="square"
@@ -364,7 +336,6 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
               </Button>
             </div>
           </section>
-        </div>
       </div>
     </div>
   );

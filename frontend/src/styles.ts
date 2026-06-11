@@ -2,6 +2,8 @@ import './ui/atoms.css';
 import './shell/shell.css';
 import './art/instance-art.css';
 import './ui/slider.css';
+import './ui/select.css';
+import './ui/modal.css';
 import './ui/context-menu.css';
 import './ui/command-palette.css';
 import './ui/dialog.css';

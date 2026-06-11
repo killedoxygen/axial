@@ -1,7 +1,8 @@
 import type { JSX } from 'preact';
 import { useState } from 'preact/hooks';
 import { Icon } from '../../../ui/Icons';
-import { Button } from '../../../ui/Atoms';
+import { Button, Input } from '../../../ui/Atoms';
+import { openContextMenu, type ContextMenuItem } from '../../../ui/ContextMenu';
 import type { EnrichedInstance } from '../../../types';
 import { fmtBytes } from '../format';
 import type { ResourceLoadState } from '../resources';
@@ -9,6 +10,13 @@ import { openInstanceFolder } from '../instance-actions';
 import { ResourceStatus } from '../components/resource-bits';
 
 type ModFilter = 'all' | 'enabled' | 'disabled';
+
+function modMenuItems(inst: EnrichedInstance, onRefresh: () => void): ContextMenuItem[] {
+  return [
+    { icon: 'folder', label: 'Open mods folder', onSelect: () => void openInstanceFolder(inst.id, 'mods') },
+    { icon: 'refresh', label: 'Refresh list', onSelect: onRefresh },
+  ];
+}
 
 export function ModsPane({
   inst,
@@ -30,42 +38,42 @@ export function ModsPane({
 
   return (
     <div class="cp-instance-body" style={{ display: 'block' }}>
-      <div class="cp-mods-toolbar">
-        <div class="cp-mods-search">
-          <Icon name="search" size={14} color="var(--text-mute)" />
-          <input
-            type="text"
-            placeholder="Filter mods…"
+      <div class="cp-resource-toolbar">
+        <strong>{mods.length} mod{mods.length === 1 ? '' : 's'}</strong>
+        <div>
+          <Input
             value={q}
-            autocomplete="off"
-            spellcheck={false}
-            onInput={(e: any) => setQ(e.currentTarget.value)}
+            onChange={setQ}
+            placeholder="Filter mods…"
+            icon="search"
+            style={{ width: 200, height: 30 }}
           />
+          <div class="cp-mini-seg" role="tablist" aria-label="Filter mods">
+            {(['all', 'enabled', 'disabled'] as ModFilter[]).map(f => (
+              <button
+                key={f}
+                type="button"
+                role="tab"
+                aria-selected={filter === f}
+                data-active={filter === f}
+                onClick={() => setFilter(f)}
+              >
+                {f[0].toUpperCase() + f.slice(1)}
+              </button>
+            ))}
+          </div>
+          <Button variant="secondary" size="sm" icon="refresh" onClick={onRefresh}>Refresh</Button>
+          <Button
+            variant="soft"
+            size="sm"
+            icon="plus"
+            onClick={() => void openInstanceFolder(inst.id, 'mods')}
+          >
+            Add mod
+          </Button>
         </div>
-        <div class="cp-mini-seg" role="tablist" aria-label="Filter mods">
-          {(['all', 'enabled', 'disabled'] as ModFilter[]).map(f => (
-            <button
-              key={f}
-              type="button"
-              role="tab"
-              aria-selected={filter === f}
-              data-active={filter === f}
-              onClick={() => setFilter(f)}
-            >
-              {f[0].toUpperCase() + f.slice(1)}
-            </button>
-          ))}
-        </div>
-        <Button variant="secondary" size="sm" icon="refresh" onClick={onRefresh}>Refresh</Button>
-        <Button
-          variant="soft"
-          size="sm"
-          icon="plus"
-          onClick={() => void openInstanceFolder(inst.id, 'mods')}
-        >
-          Add mod
-        </Button>
       </div>
+      <ResourceStatus state={resources} onRetry={onRefresh} />
       <div class="cp-mods-table">
         <div class="cp-mods-table-head" aria-hidden="true">
           <span /><span />
@@ -75,7 +83,6 @@ export function ModsPane({
           <span>State</span>
           <span />
         </div>
-        <ResourceStatus state={resources} onRetry={onRefresh} />
         {resources.status !== 'loading' && filteredMods.length === 0 ? (
           <div class="cp-mods-empty-row">
             <strong>{mods.length === 0 ? 'No mods installed in this instance' : 'No mods match this filter'}</strong>
@@ -83,7 +90,12 @@ export function ModsPane({
           </div>
         ) : (
           filteredMods.map((mod) => (
-            <div class="cp-mods-table-row" data-disabled={!mod.enabled} key={mod.name}>
+            <div
+              class="cp-mods-table-row"
+              data-disabled={!mod.enabled}
+              key={mod.name}
+              onContextMenu={(e) => openContextMenu(e, modMenuItems(inst, onRefresh))}
+            >
               <span><Icon name="puzzle" size={15} color="var(--text-dim)" /></span>
               <span class="cp-mods-file-icon">JAR</span>
               <span class="cp-resource-name" title={mod.name}>{mod.name}</span>

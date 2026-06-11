@@ -1,20 +1,21 @@
 import type { JSX } from 'preact';
 import { useEffect, useMemo, useState } from 'preact/hooks';
-import { Button } from '../../../ui/Atoms';
+import { Button, Pill } from '../../../ui/Atoms';
+import { SelectField } from '../../../ui/Select';
+import { Icon } from '../../../ui/Icons';
 import { errMessage } from '../../../utils';
 import type { EnrichedInstance, InstanceLogTail } from '../../../types';
 import { fmtBytes, fmtRelative } from '../format';
 import type { ResourceLoadState } from '../resources';
 import {
   LOG_FILTER_LABELS,
-  LOG_SORT_LABELS,
   LOG_TAIL_POLL_MS,
   fetchLogTail,
   isCurrentLog,
   pickInitialLog,
   sortLogs,
 } from '../logs';
-import type { LogFilter, LogSort } from '../logs';
+import type { LogFilter } from '../logs';
 import { openInstanceFolder } from '../instance-actions';
 import { ResourceEmpty, ResourceStatus } from '../components/resource-bits';
 import { LogLines } from '../components/log-line';
@@ -32,10 +33,11 @@ export function LogsPane({
 }): JSX.Element {
   const logs = resources.data?.logs ?? [];
   const [selected, setSelected] = useState<string>('');
-  const [sort, setSort] = useState<LogSort>('current');
   const [filter, setFilter] = useState<LogFilter>('all');
   const [tail, setTail] = useState<{ status: 'idle' | 'loading' | 'ready' | 'error'; data?: InstanceLogTail; error?: string }>({ status: 'idle' });
-  const sortedLogs = useMemo(() => sortLogs(logs, sort), [logs, sort]);
+  const sortedLogs = useMemo(() => sortLogs(logs), [logs]);
+  const selectedEntry = sortedLogs.find((log) => log.name === selected);
+  const isLive = running && isCurrentLog(selected);
 
   useEffect(() => {
     if (!logs.length) {
@@ -76,22 +78,8 @@ export function LogsPane({
   return (
     <div class="cp-instance-body cp-logs-pane">
       <div class="cp-resource-toolbar cp-logs-toolbar">
-        <strong>{logs.length} log file{logs.length === 1 ? '' : 's'}</strong>
+        <strong>Logs</strong>
         <div class="cp-logs-tools">
-          <div class="cp-mini-seg" role="tablist" aria-label="Sort logs">
-            {(Object.keys(LOG_SORT_LABELS) as LogSort[]).map((item) => (
-              <button
-                key={item}
-                type="button"
-                role="tab"
-                aria-selected={sort === item}
-                data-active={sort === item}
-                onClick={() => setSort(item)}
-              >
-                {LOG_SORT_LABELS[item]}
-              </button>
-            ))}
-          </div>
           <div class="cp-mini-seg" role="tablist" aria-label="Filter log lines">
             {(Object.keys(LOG_FILTER_LABELS) as LogFilter[]).map((item) => (
               <button
@@ -107,28 +95,45 @@ export function LogsPane({
             ))}
           </div>
           <Button variant="secondary" size="sm" icon="refresh" onClick={onRefresh}>Refresh</Button>
-          <Button variant="soft" size="sm" icon="folder" onClick={() => void openInstanceFolder(inst.id, 'logs')}>Open logs</Button>
+          <Button variant="soft" size="sm" icon="folder" onClick={() => void openInstanceFolder(inst.id, 'logs')}>Open folder</Button>
         </div>
       </div>
       <ResourceStatus state={resources} onRetry={onRefresh} />
       {logs.length === 0 && resources.status !== 'loading' ? (
         <ResourceEmpty icon="terminal" title="No logs yet" hint="Launch this instance and Minecraft log files will appear here." />
       ) : (
-        <div class="cp-logs-layout">
-          <div class="cp-logs-list">
-            {sortedLogs.map((log) => (
-              <button key={log.name} type="button" data-active={selected === log.name} onClick={() => setSelected(log.name)}>
-                <span>{log.name}</span>
-                <small>{isCurrentLog(log.name) ? 'Current/latest · ' : ''}{fmtBytes(log.size)} · {fmtRelative(log.modified_at)}</small>
-              </button>
-            ))}
+        <div class="cp-logview">
+          <div class="cp-logview-bar">
+            <div class="cp-logview-pick">
+              <Icon name="terminal" size={14} color="var(--text-mute)" />
+              <SelectField
+                value={selected}
+                onChange={setSelected}
+                ariaLabel="Log file"
+                width={260}
+                options={sortedLogs.map((log) => ({
+                  value: log.name,
+                  label: isCurrentLog(log.name) ? `${log.name} — latest` : log.name,
+                }))}
+              />
+              {isLive && <Pill tone="accent" icon="play">Live</Pill>}
+            </div>
+            {selectedEntry && (
+              <span class="cp-logview-meta">
+                {fmtBytes(selectedEntry.size)} · {fmtRelative(selectedEntry.modified_at)}
+              </span>
+            )}
           </div>
-          <div class="cp-log-preview">
-            {tail.status === 'loading' && <div class="cp-resource-note">Loading log preview…</div>}
-            {tail.status === 'error' && <div class="cp-resource-note cp-resource-note--error">{tail.error}</div>}
+          <div class="cp-logview-body">
+            {tail.status === 'loading' && <div class="cp-logview-note">Loading log…</div>}
+            {tail.status === 'error' && <div class="cp-logview-note cp-logview-note--error">{tail.error}</div>}
             {tail.status === 'ready' && (
               <>
-                {tail.data?.truncated && <div class="cp-log-truncated">Showing the last {fmtBytes(tail.data.size > 0 ? Math.min(tail.data.size, 128 * 1024) : 0)} of this log.</div>}
+                {tail.data?.truncated && (
+                  <div class="cp-logview-truncated">
+                    Showing the last {fmtBytes(tail.data.size > 0 ? Math.min(tail.data.size, 128 * 1024) : 0)} of this log.
+                  </div>
+                )}
                 <LogLines text={tail.data?.text ?? ''} filter={filter} />
               </>
             )}

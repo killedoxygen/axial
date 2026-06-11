@@ -5,6 +5,7 @@ import { openContextMenu } from '../../../ui/ContextMenu';
 import type { EnrichedInstance, InstanceResourceSummary } from '../../../types';
 import { fmtBytes, fmtRelative } from '../format';
 import { openInstanceFolder } from '../instance-actions';
+import { worldMenuItems } from '../world-actions';
 
 function WorldsEmptyArt(): JSX.Element {
   return (
@@ -57,10 +58,12 @@ export function WorldsCard({
   inst,
   resources,
   onOpenWorlds,
+  onRefresh,
 }: {
   inst: EnrichedInstance;
   resources: InstanceResourceSummary | null;
   onOpenWorlds: () => void;
+  onRefresh: () => void;
 }): JSX.Element {
   const worlds = resources?.worlds ?? [];
   const count = resources
@@ -94,7 +97,11 @@ export function WorldsCard({
       ) : (
         <div class="cp-od-worlds-list">
           {visibleWorlds.length > 0 ? visibleWorlds.map((world) => (
-            <div class="cp-od-world-row" key={world.name}>
+            <div
+              class="cp-od-world-row"
+              key={world.name}
+              onContextMenu={(e) => openContextMenu(e, worldMenuItems(inst, world.name, onRefresh))}
+            >
               <div class="cp-od-world-mark"><Icon name="globe" size={16} /></div>
               <div class="cp-od-world-body">
                 <div class="cp-od-world-name" title={world.name}>{world.name}</div>

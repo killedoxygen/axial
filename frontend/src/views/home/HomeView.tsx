@@ -4,9 +4,12 @@ import { InstanceArt } from '../../art/InstanceArt';
 import { Button, SectionHeading, Card, Pill } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { InstanceCard } from '../../ui/InstanceCard';
-import { navigate } from '../../ui-state';
+import { openContextMenu } from '../../ui/ContextMenu';
+import { navigate, openCreate } from '../../ui-state';
 import { config, instances, runningSessions, versions } from '../../store';
 import { loaderKeyFromVersion, LOADER_LABELS } from '../create/defaults';
+import { instanceMenuItems } from '../instance/instance-menu';
+import { isVanillaVersion } from '../../utils';
 import type { EnrichedInstance, Version } from '../../types';
 
 function greetingFor(date: Date): string {
@@ -43,6 +46,7 @@ function FeatureBanner({ inst }: { inst: EnrichedInstance }): JSX.Element {
   const version = versions.value.find(v => v.id === inst.version_id);
   const running = !!runningSessions.value[inst.id];
   const mods = inst.mods_count ?? 0;
+  const showModsCount = !isVanillaVersion(version);
   const open = (): void => navigate({ name: 'instance', id: inst.id });
   const onKeyDown = (e: KeyboardEvent): void => {
     if (e.target !== e.currentTarget) return;
@@ -58,6 +62,7 @@ function FeatureBanner({ inst }: { inst: EnrichedInstance }): JSX.Element {
       aria-label={`Open ${inst.name}`}
       onClick={open}
       onKeyDown={onKeyDown}
+      onContextMenu={(e) => openContextMenu(e, instanceMenuItems(inst))}
     >
       <InstanceArt instance={inst} version={version} aspect="banner" radius={0} className="cp-feature-art" />
       <div class="cp-feature-scrim" />
@@ -69,8 +74,12 @@ function FeatureBanner({ inst }: { inst: EnrichedInstance }): JSX.Element {
             <span>{LOADER_LABELS[loaderKeyFromVersion(version)]}</span>
             <span class="cp-dot" />
             <span>MC {versionBadge(version)}</span>
-            <span class="cp-dot" />
-            <span>{mods} mods</span>
+            {showModsCount && (
+              <>
+                <span class="cp-dot" />
+                <span>{mods} mods</span>
+              </>
+            )}
             <span class="cp-dot" />
             <span>{relativeTime(inst.last_played_at)}</span>
           </div>
@@ -97,7 +106,7 @@ function EmptyHome(): JSX.Element {
         <Icon name="cube" size={36} color="var(--text-mute)" />
         <h2>Create your first instance</h2>
         <p>Instances are isolated Minecraft setups. Pick a version, bundle mods, and launch without touching your other worlds.</p>
-        <Button icon="plus" onClick={() => navigate({ name: 'create' })}>New instance</Button>
+        <Button icon="plus" onClick={openCreate}>New instance</Button>
       </div>
     </Card>
   );
@@ -130,7 +139,7 @@ export function HomeView(): JSX.Element {
           </div>
         </div>
         <div style={{ flex: 1 }} />
-        <Button variant="secondary" icon="plus" onClick={() => navigate({ name: 'create' })}>New instance</Button>
+        <Button variant="secondary" icon="plus" onClick={openCreate}>New instance</Button>
       </div>
 
       {all.length === 0 ? (
@@ -145,7 +154,13 @@ export function HomeView(): JSX.Element {
                 action={{ label: 'See all', onClick: () => navigate({ name: 'instances' }) }}
               />
               <div class="cp-cover-grid">
-                {rest.map(inst => <InstanceCard key={inst.id} inst={inst} />)}
+                {rest.map(inst => (
+                  <InstanceCard
+                    key={inst.id}
+                    inst={inst}
+                    onContextMenu={(e) => openContextMenu(e, instanceMenuItems(inst))}
+                  />
+                ))}
               </div>
             </div>
           )}
