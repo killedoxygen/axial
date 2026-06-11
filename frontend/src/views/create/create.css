@@ -1,5 +1,5 @@
 .cp-cr-card {
-  width: min(960px, calc(100vw - 48px));
+  width: min(560px, calc(100vw - 48px));
   height: min(640px, calc(100vh - 48px));
   display: flex;
   flex-direction: column;
@@ -12,10 +12,10 @@
 
 .cp-cr-card-head {
   flex-shrink: 0;
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 14px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 12px 14px;
   padding: 18px 22px 14px;
   border-bottom: 1px solid var(--line);
 }
@@ -31,12 +31,63 @@
   font-size: 12.5px;
   color: var(--text-mute);
 }
+.cp-cr-progress {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: auto minmax(36px, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  color: var(--text-mute);
+  font-size: 11.5px;
+  font-weight: 600;
+}
+.cp-cr-progress span {
+  white-space: nowrap;
+  transition: color 140ms ease;
+}
+.cp-cr-progress span[data-active="true"] {
+  color: var(--text);
+}
+.cp-cr-progress i {
+  position: relative;
+  display: block;
+  height: 4px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: color-mix(in oklab, var(--bg) 54%, var(--surface-2));
+}
+.cp-cr-progress i::after {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 50%;
+  border-radius: inherit;
+  background: var(--surface-3);
+  transform: translateX(0);
+  transition: transform 180ms ease;
+}
+.cp-cr-progress[data-step="details"] i::after {
+  transform: translateX(100%);
+}
 
 .cp-cr-card-body {
   flex: 1;
   min-height: 0;
   display: grid;
   grid-template-columns: minmax(0, 1.2fr) minmax(300px, 0.9fr);
+}
+.cp-cr-card-body[data-step="version"] {
+  grid-template-columns: 1fr;
+}
+.cp-cr-card-body[data-step="details"] {
+  display: block;
+  overflow-y: auto;
+}
+.cp-cr-card-body[data-step="details"] .cp-cr-side {
+  max-width: 100%;
+  min-height: 100%;
+  margin: 0 auto;
+  overflow: visible;
 }
 
 .cp-cr-pick {
@@ -47,6 +98,10 @@
   gap: 12px;
   padding: 16px 20px 14px 22px;
   border-right: 1px solid var(--line);
+}
+.cp-cr-card-body[data-step="version"] .cp-cr-pick {
+  border-right: 0;
+  padding-inline: 22px;
 }
 
 .cp-cr-sources {
@@ -206,7 +261,13 @@
   color: var(--text-mute);
   flex-shrink: 0;
 }
+.cp-cr-vrow-installed[data-state="base"] {
+  color: color-mix(in oklab, var(--text-mute) 72%, transparent);
+}
 .cp-cr-vrow[data-active="true"] .cp-cr-vrow-installed { color: var(--accent-on); }
+.cp-cr-vrow[data-active="true"] .cp-cr-vrow-installed[data-state="base"] {
+  color: color-mix(in oklab, var(--accent-on) 62%, transparent);
+}
 .cp-cr-vrow-mark {
   display: inline-flex;
   align-items: center;
@@ -469,6 +530,9 @@
   .cp-cr-pick {
     border-right: none;
     border-bottom: 1px solid var(--line);
+  }
+  .cp-cr-card-body[data-step="version"] .cp-cr-pick {
+    border-bottom: none;
   }
   .cp-cr-vwell {
     flex: none;

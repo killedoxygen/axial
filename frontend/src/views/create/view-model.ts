@@ -2,12 +2,14 @@ import type { CatalogVersion } from '../../types';
 import { channelOfVersion, type Channel, type LoaderKey } from './defaults';
 import { normalizeVersionDisplay, releaseAnchorsFor } from '../../version-display';
 
+export type VersionDownloadState = 'none' | 'base' | 'full';
+
 export interface VersionRowModel {
   id: string;
   displayName: string;
   hint: string | null;
   channel: Channel;
-  installed: boolean;
+  downloadState: VersionDownloadState;
 }
 
 export const CHANNEL_LABEL: Record<Channel, string> = {
@@ -24,14 +26,19 @@ export function buildRowModel(
   releaseAnchors: CatalogVersion[],
   installedSet: Set<string>,
   source: LoaderKey,
+  fullInstalledSet: Set<string> = new Set(),
 ): VersionRowModel {
   const display = normalizeVersionDisplay(version, releaseAnchors);
+  const baseInstalled = version.installed || installedSet.has(version.id);
+  const fullInstalled = source === 'vanilla'
+    ? baseInstalled
+    : fullInstalledSet.has(version.id);
   return {
     id: version.id,
     displayName: display.displayName === version.id ? version.id : display.displayName,
     hint: display.hint,
     channel: channelOfVersion(version),
-    installed: source === 'vanilla' && (version.installed || installedSet.has(version.id)),
+    downloadState: fullInstalled ? 'full' : baseInstalled ? 'base' : 'none',
   };
 }
 

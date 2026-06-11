@@ -34,6 +34,7 @@ import {
   CHANNEL_ORDER,
   CHANNEL_LABEL,
   releaseAnchorsFor,
+  type VersionDownloadState,
   type VersionRowModel,
 } from './view-model';
 import { useLoaderHoverPrefetch } from './use-loader-hover-prefetch';
@@ -53,6 +54,7 @@ import {
 } from './jvm-presets';
 
 const BASE_CHANNEL_TABS: Channel[] = ['release', 'snapshot', 'legacy'];
+type CreateStep = 'version' | 'details';
 
 export function CreateView(): JSX.Element {
   const libraryDir = config.value?.library_dir ?? '';
@@ -70,7 +72,23 @@ export function CreateView(): JSX.Element {
   );
 }
 
+function minecraftVersionFromBuildId(buildId: string): string {
+  const parts = buildId.split(':');
+  return parts.length >= 3 ? parts[1]!.trim() : '';
+}
+
+function versionStatusTitle(state: VersionDownloadState, source: LoaderKey): string {
+  if (state === 'full') return 'Already installed';
+  if (state === 'base') {
+    return source === 'vanilla'
+      ? 'Already installed'
+      : 'Base Minecraft version is installed; loader still needs download';
+  }
+  return '';
+}
+
 function CreateCard(): JSX.Element {
+  const [step, setStep] = useState<CreateStep>('version');
   const [source, setSource] = useState<LoaderKey>('vanilla');
   const [mcVersionId, setMcVersionId] = useState<string | null>(null);
   const [channel, setChannel] = useState<Channel>('release');
@@ -197,13 +215,35 @@ function CreateCard(): JSX.Element {
     const installedSet = new Set(
       versions.value.filter((x) => x.installed && x.launchable).map((x) => x.id),
     );
+    const fullInstalledSet = new Set<string>();
+    if (currentComponentId) {
+      for (const version of versions.value) {
+        if (!version.installed || !version.launchable || !version.loader) continue;
+        if (version.loader.component_id !== currentComponentId) continue;
+        const baseVersion = version.inherits_from || minecraftVersionFromBuildId(version.loader.build_id);
+        if (baseVersion) fullInstalledSet.add(baseVersion);
+      }
+    }
     const q = query.trim().toLowerCase();
     const rows = availableForSource
       .filter((v) => channelOfVersion(v) === channel)
       .filter((v) => !q || versionSearchText(v, releaseAnchors).includes(q));
     rows.sort((a, b) => (b.release_time || '').localeCompare(a.release_time || ''));
-    return rows.map((v) => buildRowModel(v, releaseAnchors, installedSet, source));
-  }, [catalog.value, versions.value, channel, query, availableForSource, releaseAnchors, source]);
+    return rows.map((v) => {
+      let rowFullInstalledSet = fullInstalledSet;
+      const cachedBuilds = currentComponentId ? getCachedLoaderBuilds(currentComponentId, v.id) : null;
+      const preferredBuild = currentComponentId && cachedBuilds ? pickPreferredBuild(cachedBuilds) : null;
+      if (preferredBuild) {
+        rowFullInstalledSet = new Set(fullInstalledSet);
+        if (installedSet.has(preferredBuild.version_id)) {
+          rowFullInstalledSet.add(v.id);
+        } else {
+          rowFullInstalledSet.delete(v.id);
+        }
+      }
+      return buildRowModel(v, releaseAnchors, installedSet, source, rowFullInstalledSet);
+    });
+  }, [catalog.value, versions.value, channel, query, availableForSource, releaseAnchors, source, currentComponentId]);
   const selectedVersionRow = mcVersionId
     ? versionRows.find((row) => row.id === mcVersionId) ?? null
     : null;
@@ -296,6 +336,15 @@ function CreateCard(): JSX.Element {
   const versionReady = Boolean(mcVersionId && (source === 'vanilla' || selectedBuild));
   const canCreate = versionReady && name.trim().length > 0 && !submitting;
 
+  useEffect(() => {
+    if (step === 'details' && !versionReady) setStep('version');
+  }, [step, versionReady]);
+
+  const continueToDetails = (): void => {
+    if (!versionReady) return;
+    setStep('details');
+  };
+
   const submit = async (): Promise<void> => {
     if (submitting || !canCreate) return;
     const trimmed = name.trim();
@@ -340,6 +389,13 @@ function CreateCard(): JSX.Element {
         && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA');
 
       if (e.key === 'Enter' && (e.ctrlKey || (!inField && target?.tagName !== 'BUTTON'))) {
+        if (step === 'version') {
+          if (versionReady) {
+            e.preventDefault();
+            continueToDetails();
+          }
+          return;
+        }
         if (canCreate) {
           e.preventDefault();
           void submit();
@@ -347,13 +403,14 @@ function CreateCard(): JSX.Element {
         return;
       }
       if (e.key === '/' && !inField) {
+        if (step !== 'version') return;
         e.preventDefault();
         searchInputRef.current?.focus();
       }
     };
     window.addEventListener('keydown', handler);
     return () => { window.removeEventListener('keydown', handler); };
-  }, [canCreate, submitting, source, mcVersionId, selectedBuild, name, memoryGB, previewSeed, windowPresets, windowPresetId, jvmPreset]);
+  }, [canCreate, submitting, source, mcVersionId, selectedBuild, name, memoryGB, previewSeed, windowPresets, windowPresetId, jvmPreset, step, versionReady]);
 
   const availableChannelSet = new Set(availableChannels);
   const channelTabs: Channel[] = [
@@ -371,12 +428,23 @@ function CreateCard(): JSX.Element {
         <header class="cp-cr-card-head">
           <div>
             <h1>Create instance</h1>
-            <p>Pick a version, name it, play.</p>
+            <p>{step === 'version' ? 'Choose Minecraft and loader.' : 'Name it and set launch defaults.'}</p>
           </div>
           <IconButton icon="x" tooltip="Close (Esc)" onClick={closeCreate} />
+          <div
+            class="cp-cr-progress"
+            data-step={step}
+            role="status"
+            aria-label={`Create step: ${step === 'version' ? 'Version' : 'Details'}`}
+          >
+            <span data-active={step === 'version'}>Version</span>
+            <i aria-hidden="true" />
+            <span data-active={step === 'details'}>Details</span>
+          </div>
         </header>
 
-        <div class="cp-cr-card-body">
+        <div class="cp-cr-card-body" data-step={step}>
+          {step === 'version' ? (
           <section class="cp-cr-pick" aria-label="Version">
             <div class="cp-cr-sources" role="radiogroup" aria-label="Instance source">
               {LOADER_KEYS.map((key) => (
@@ -486,9 +554,17 @@ function CreateCard(): JSX.Element {
                       <span class="cp-cr-vrow-name">{row.displayName}</span>
                       {row.hint && <span class="cp-cr-vrow-hint">{row.hint}</span>}
                       <span class="cp-cr-vrow-spacer" />
-                      {row.installed && (
-                        <span class="cp-cr-vrow-installed" title="Already installed">
-                          <Icon name="download" size={13} stroke={2} />
+                      {row.downloadState !== 'none' && (
+                        <span
+                          class="cp-cr-vrow-installed"
+                          data-state={row.downloadState}
+                          title={versionStatusTitle(row.downloadState, source)}
+                        >
+                          <Icon
+                            name={row.downloadState === 'base' ? 'circle-dashed' : 'download'}
+                            size={13}
+                            stroke={2}
+                          />
                         </span>
                       )}
                       {mcVersionId === row.id && (
@@ -510,6 +586,7 @@ function CreateCard(): JSX.Element {
                   : <span>{versionRows.length} version{versionRows.length === 1 ? '' : 's'}</span>}
             </div>
           </section>
+          ) : (
 
           <section class="cp-cr-side" aria-label="Instance details">
             <div class="cp-cr-identity">
@@ -594,28 +671,59 @@ function CreateCard(): JSX.Element {
               </button>
             </div>
           </section>
+          )}
         </div>
 
         <footer class="cp-cr-card-foot">
           <span class="cp-cr-footnote" aria-live="polite">
-            {!versionReady
+            {step === 'version'
+              ? (!versionReady
+                ? 'Pick a Minecraft version to continue.'
+                : source === 'vanilla'
+                  ? 'Continue to name and settings.'
+                  : selectedBuild
+                    ? `${LOADER_LABELS[source]} ${selectedBuild.loader_version} selected.`
+                    : `Resolving ${LOADER_LABELS[source]} build...`)
+              : !versionReady
               ? 'Pick a Minecraft version to continue.'
               : canCreate
                 ? 'Enter creates the instance.'
                 : 'Name your instance to create it.'}
           </span>
           <div class="cp-cr-foot-actions">
-            <Button variant="ghost" onClick={closeCreate} disabled={submitting}>
-              Cancel
-            </Button>
-            <Button
-              icon="plus"
-              onClick={() => { void submit(); }}
-              disabled={!canCreate}
-              sound="affirm"
-            >
-              {submitting ? 'Creating…' : 'Create instance'}
-            </Button>
+            {step === 'version' ? (
+              <>
+                <Button variant="ghost" onClick={closeCreate} disabled={submitting}>
+                  Cancel
+                </Button>
+                <Button
+                  trailing={<Icon name="arrow-right" size={15} stroke={1.8} />}
+                  onClick={continueToDetails}
+                  disabled={!versionReady || submitting}
+                >
+                  Continue
+                </Button>
+              </>
+            ) : (
+              <>
+                <Button
+                  variant="ghost"
+                  icon="arrow-left"
+                  onClick={() => setStep('version')}
+                  disabled={submitting}
+                >
+                  Back
+                </Button>
+                <Button
+                  icon="plus"
+                  onClick={() => { void submit(); }}
+                  disabled={!canCreate}
+                  sound="affirm"
+                >
+                  {submitting ? 'Creating…' : 'Create instance'}
+                </Button>
+              </>
+            )}
           </div>
         </footer>
     </>

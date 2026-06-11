@@ -67,7 +67,7 @@ This project is a desktop Minecraft launcher, not a marketing site. Keep UI work
 - Preserve Worlds, Screenshots, Logs, and Settings as operational tabs using existing resource/log primitives.
 
 ### CreateView
-- The create modal is a single-screen card; do not reintroduce a multi-step wizard, stepper, or full-page create route.
+- The create modal is a compact two-step card, not a full-page create route: version/source first, then name and launch defaults.
 - Source picker stays a straight-line row of icon-plus-label tiles, not a card grid.
 
 ### Accounts & Skins
