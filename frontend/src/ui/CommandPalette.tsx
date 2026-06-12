@@ -37,7 +37,7 @@ function buildCommands(): Command[] {
 
   list.push(
     { id: 'jump:home', group: 'jump', icon: 'home', label: 'Home', perform: goto({ name: 'home' }) },
-    { id: 'jump:instances', group: 'jump', icon: 'cube', label: 'Instances', perform: goto({ name: 'instances' }) },
+    { id: 'jump:instances', group: 'jump', icon: 'stack', label: 'Instances', perform: goto({ name: 'instances' }) },
     { id: 'jump:create', group: 'jump', icon: 'plus', label: 'New instance', hint: 'Ctrl N', perform: () => { openCreate(); close(); } },
     { id: 'jump:downloads', group: 'jump', icon: 'download', label: 'Downloads', perform: goto({ name: 'downloads' }) },
     { id: 'jump:accounts', group: 'jump', icon: 'user', label: 'Accounts and skins', perform: goto({ name: 'accounts' }) },
@@ -51,7 +51,7 @@ function buildCommands(): Command[] {
     list.push({
       id: `instance:${inst.id}`,
       group: 'instance',
-      icon: isRunning ? 'play' : 'cube',
+      icon: isRunning ? 'play' : 'stack',
       label: isRunning ? `Jump to ${inst.name}` : `Open ${inst.name}`,
       hint: isRunning ? 'Playing' : undefined,
       keywords: inst.name,

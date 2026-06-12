@@ -14,7 +14,6 @@ export { default as Clock } from '../../node_modules/@openai/apps-sdk-ui/dist/es
 export { default as ColorTheme } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/ColorTheme.js';
 export { default as Compass } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/Compass.js';
 export { default as Copy } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/Copy.js';
-export { default as Cube } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/Cube.js';
 export { default as DotsHorizontal } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/DotsHorizontal.js';
 export { default as Download } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/Download.js';
 export { default as Edit } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/Edit.js';
@@ -40,6 +39,7 @@ export { default as Skip } from '../../node_modules/@openai/apps-sdk-ui/dist/es/
 export { default as SoundOffSimpleMute } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/SoundOffSimpleMute.js';
 export { default as SoundOffSpeaker } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/SoundOffSpeaker.js';
 export { default as SoundOnReadOutLoudSpeaker } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/SoundOnReadOutLoudSpeaker.js';
+export { default as Stack } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/Stack.js';
 export { default as SquareCheckboxUnchecked } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/SquareCheckboxUnchecked.js';
 export { default as Stop } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/Stop.js';
 export { default as Tag } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/Tag.js';

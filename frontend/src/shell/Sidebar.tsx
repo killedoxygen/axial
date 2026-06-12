@@ -295,7 +295,7 @@ export function Sidebar(): JSX.Element {
         <Icon name="search" size={20} stroke={1.7} />
       </button>
       <RailButton icon="home" label="Home" target={{ name: 'home' }} tooltip={tooltip} />
-      <RailButton icon="cube" label="Instances" target={{ name: 'instances' }} tooltip={tooltip} />
+      <RailButton icon="stack" label="Instances" target={{ name: 'instances' }} tooltip={tooltip} />
       <button
         class="cp-rail-btn"
         data-accent="true"

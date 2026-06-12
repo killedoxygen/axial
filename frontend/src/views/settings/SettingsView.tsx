@@ -41,7 +41,7 @@ type SectionId = 'appearance' | 'gameplay' | 'performance' | 'audio' | 'shortcut
 
 const SECTIONS: Array<{ id: SectionId; label: string; icon: string }> = [
   { id: 'appearance', label: 'Appearance', icon: 'palette' },
-  { id: 'gameplay',   label: 'Gameplay',   icon: 'cube' },
+  { id: 'gameplay',   label: 'Gameplay',   icon: 'stack' },
   { id: 'performance', label: 'Performance', icon: 'shield-check' },
   { id: 'audio',      label: 'Audio',      icon: 'headphones' },
   { id: 'shortcuts',  label: 'Shortcuts',  icon: 'keyboard' },
