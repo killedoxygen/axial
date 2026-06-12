@@ -5,7 +5,8 @@ import { IconButton } from '../ui/Atoms';
 import { WindowControls } from './WindowControls';
 import { MusicWidget } from './MusicWidget';
 import { goBack, goForward, navigate, route } from '../ui-state';
-import { runningSessions, instances, launchState, installState, installQueue, installFailure } from '../store';
+import { runningSessions, instances, versionById, launchState, installState, installQueue, installFailure } from '../store';
+import { minecraftVersionLabel } from '../version-display';
 import { windowStartDragging, windowToggleMaximize, hasNativeDesktopRuntime } from '../native';
 import { launchStageViewFrom } from '../launch-stages';
 import { formatInstallItemLabel } from '../install-labels';
@@ -36,6 +37,10 @@ function crumbsFor(): { label: string; onClick?: () => void }[] {
     case 'settings': return [{ label: 'Settings' }];
     default: return assertUnreachable(r);
   }
+}
+
+function versionTag(versionId: string | undefined): string | null {
+  return minecraftVersionLabel(versionById(versionId), '') || null;
 }
 
 function StatusMark({ icon }: { icon: string }): JSX.Element {
@@ -72,14 +77,17 @@ function StatusPill(): JSX.Element {
 
   if (inst && session) {
     const label = session.stopping ? 'Stopping' : launchStageViewFrom(session.state)?.label || 'Playing';
+    const tag = versionTag(inst.version_id);
     return (
       <button
         class="cp-status-pill cp-status-pill--running cp-nodrag"
         onClick={() => navigate({ name: 'instance', id: inst.id })}
-        title="Jump to running instance"
+        title={`${label} · ${inst.name}`}
+        aria-label={`Open running instance. ${label} · ${inst.name}`}
       >
         <StatusMark icon="play" />
-        <span class="cp-status-pill-label">{label} · {inst.name}</span>
+        <span class="cp-status-pill-label">{label}</span>
+        {tag && <span class="cp-status-pill-meta">{tag}</span>}
       </button>
     );
   }
@@ -92,6 +100,7 @@ function StatusPill(): JSX.Element {
     const installRemainingSeconds = countDownRemainingSeconds(install.remainingSeconds, install.remainingSecondsUpdatedAt, etaNow);
     const installEta = installRemainingSeconds ? formatRemainingTime(installRemainingSeconds) : null;
     const installName = install.displayName || install.versionId;
+    const installTag = install.item.loader?.minecraftVersion || versionTag(install.versionId);
     const installTitle = `${installName}: ${install.label} · ${installPct}%${installEta ? ` · ${installEta} left` : ''}${queuedLabel}${installPhase}`;
     const installStyle = { '--cp-install-ratio': String(installPct / 100) } as JSX.CSSProperties;
 
@@ -104,10 +113,10 @@ function StatusPill(): JSX.Element {
         style={installStyle}
       >
         <StatusMark icon="download" />
-        <span class="cp-status-pill-label">{installName}</span>
-        {queuedCount > 0 && <span class="cp-status-pill-chip">+{queuedCount}</span>}
-        {installEta && <span class="cp-status-pill-eta">{installEta}</span>}
+        {installTag && <span class="cp-status-pill-meta">{installTag}</span>}
         <span class="cp-status-pill-pct">{installPct}%</span>
+        {installEta && <span class="cp-status-pill-eta">{installEta}</span>}
+        {queuedCount > 0 && <span class="cp-status-pill-chip">+{queuedCount}</span>}
       </button>
     );
   }
@@ -115,10 +124,12 @@ function StatusPill(): JSX.Element {
   const launch = launchState.value;
   if (launch.status === 'preparing') {
     const li = instances.value.find(i => i.id === launch.instanceId);
+    const prepTag = versionTag(li?.version_id);
     return (
       <span class="cp-status-pill cp-status-pill--preparing cp-nodrag" title={`${launch.label} · ${li?.name || 'launch'}`}>
         <StatusMark icon="clock" />
-        <span class="cp-status-pill-label">{launch.label} · {li?.name || 'launch'}</span>
+        <span class="cp-status-pill-label">{launch.label}</span>
+        {prepTag && <span class="cp-status-pill-meta">{prepTag}</span>}
       </span>
     );
   }
@@ -136,7 +147,8 @@ function StatusPill(): JSX.Element {
         aria-label={`Open downloads. ${queuedTitle}`}
       >
         <StatusMark icon="archive" />
-        <span class="cp-status-pill-label">{queuedLabel}</span>
+        <span class="cp-status-pill-label">Queued</span>
+        {queued.length > 1 && <span class="cp-status-pill-chip">{queued.length}</span>}
       </button>
     );
   }
@@ -152,7 +164,7 @@ function StatusPill(): JSX.Element {
         aria-label={`Open downloads. Install failed: ${title}`}
       >
         <StatusMark icon="alert" />
-        <span class="cp-status-pill-label">install failed</span>
+        <span class="cp-status-pill-label">Failed</span>
       </button>
     );
   }
@@ -160,7 +172,7 @@ function StatusPill(): JSX.Element {
   return (
     <span class="cp-status-pill cp-nodrag">
       <StatusMark icon="circle-dashed" />
-      <span class="cp-status-pill-label">idle</span>
+      <span class="cp-status-pill-label">Idle</span>
     </span>
   );
 }
