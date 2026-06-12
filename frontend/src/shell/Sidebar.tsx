@@ -51,6 +51,33 @@ function railTipAttrs(label: string, tooltip: RailTooltipController) {
   };
 }
 
+function RailIcon({ name, size = 20 }: { name: string; size?: number }): JSX.Element {
+  if (name === 'stack') {
+    return (
+      <span class="cp-rail-icon" aria-hidden="true">
+        <svg
+          class="cp-rail-icon-svg cp-rail-stack"
+          width={size}
+          height={size}
+          viewBox="0 0 24 24"
+          fill="currentColor"
+          focusable="false"
+        >
+          <path class="cp-rail-stack-layer cp-rail-stack-layer--top" d="M4.948 4.683A2 2 0 0 1 6.454 4h11.092a2 2 0 0 1 1.505.683l3.5 4C23.683 9.976 22.764 12 21.046 12H2.954C1.235 12 .317 9.976 1.448 8.683l3.5-4ZM17.546 6H6.454l-3.5 4h18.092l-3.5-4Z" />
+          <path class="cp-rail-stack-layer cp-rail-stack-layer--mid" d="M2 15a1 1 0 0 1 1-1h18a1 1 0 1 1 0 2H3a1 1 0 0 1-1-1Z" />
+          <path class="cp-rail-stack-layer cp-rail-stack-layer--base" d="M3 19a1 1 0 0 1 1-1h16a1 1 0 1 1 0 2H4a1 1 0 0 1-1-1Z" />
+        </svg>
+      </span>
+    );
+  }
+
+  return (
+    <span class="cp-rail-icon" aria-hidden="true">
+      <Icon name={name} size={size} stroke={1.7} />
+    </span>
+  );
+}
+
 function RailButton({ icon, label, target, accent, tooltip }: {
   icon: string;
   label: string;
@@ -66,11 +93,12 @@ function RailButton({ icon, label, target, accent, tooltip }: {
       class="cp-rail-btn"
       data-active={active}
       data-accent={accent}
+      data-icon={icon}
       onClick={() => { tooltip.hide(); navigate(target); }}
       aria-label={label}
       {...railTipAttrs(label, tooltip)}
     >
-      <Icon name={icon} size={20} stroke={1.7} />
+      <RailIcon name={icon} />
     </button>
   );
 }
@@ -287,23 +315,25 @@ export function Sidebar(): JSX.Element {
       </div>
       <button
         class="cp-rail-btn"
+        data-icon="search"
         onClick={() => { tooltip.hide(); commandPaletteOpen.value = true; }}
         data-sound-silent="true"
         aria-label="Search and jump to"
         {...railTipAttrs('Search', tooltip)}
       >
-        <Icon name="search" size={20} stroke={1.7} />
+        <RailIcon name="search" />
       </button>
       <RailButton icon="home" label="Home" target={{ name: 'home' }} tooltip={tooltip} />
       <RailButton icon="stack" label="Instances" target={{ name: 'instances' }} tooltip={tooltip} />
       <button
         class="cp-rail-btn"
         data-accent="true"
+        data-icon="plus"
         onClick={() => { tooltip.hide(); openCreate(); }}
         aria-label="New instance"
         {...railTipAttrs('New instance', tooltip)}
       >
-        <Icon name="plus" size={20} stroke={1.7} />
+        <RailIcon name="plus" />
       </button>
       <RailInstances tooltip={tooltip} />
       <div class="cp-rail-spacer" />
