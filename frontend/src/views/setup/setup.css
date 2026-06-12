@@ -19,7 +19,6 @@
   background: var(--surface);
   border: 1px solid var(--line);
   border-radius: var(--r-xl);
-  box-shadow: var(--shadow);
   display: flex;
   flex-direction: column;
   gap: 18px;

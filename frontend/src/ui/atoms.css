@@ -13,12 +13,12 @@
   border-radius: var(--r-sm);
   cursor: pointer;
   white-space: nowrap;
-  transition: background 120ms ease, color 120ms ease, transform 120ms ease, box-shadow 120ms ease;
+  transition: background 120ms ease, color 120ms ease, scale 70ms ease, box-shadow 120ms ease;
   color: var(--text);
   background: var(--surface-2);
 }
 .cp-btn:hover:not([disabled]) { background: var(--surface-3); }
-.cp-btn:active:not([disabled]) { transform: translateY(1px); }
+.cp-btn:active:not([disabled]) { scale: 0.97; }
 .cp-btn:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--accent-ring); }
 .cp-btn[disabled] { cursor: not-allowed; opacity: 0.5; }
 
@@ -27,8 +27,21 @@
 .cp-btn--lg { height: 44px; padding: 0 22px; font-size: 14px; gap: 10px; border-radius: var(--r-md); }
 .cp-btn--full { width: 100%; }
 
-.cp-btn--primary { background: var(--accent-fill); color: var(--accent-on); }
-.cp-btn--primary:hover:not([disabled]) { background: var(--accent-fill-hover); }
+.cp-btn--primary {
+  background: var(--accent-fill);
+  color: var(--accent-on);
+  box-shadow:
+    inset 0 1px 0 oklch(1 0 0 / 0.14),
+    0 1px 0 oklch(0 0 0 / 0.18),
+    0 10px 24px -16px oklch(from var(--accent-fill) l c h / 0.55);
+}
+.cp-btn--primary:hover:not([disabled]) {
+  background: var(--accent-fill-hover);
+  box-shadow:
+    inset 0 1px 0 oklch(1 0 0 / 0.18),
+    0 1px 0 oklch(0 0 0 / 0.18),
+    0 12px 26px -16px oklch(from var(--accent-fill) l c h / 0.7);
+}
 
 .cp-btn--secondary { background: var(--surface-2); color: var(--text); }
 .cp-btn--secondary:hover:not([disabled]) { background: var(--surface-3); }
@@ -39,7 +52,13 @@
 .cp-btn--ghost { background: transparent; color: var(--text-dim); }
 .cp-btn--ghost:hover:not([disabled]) { background: var(--surface-2); color: var(--text); }
 
-.cp-btn--danger { background: oklch(0.60 0.18 25); color: oklch(0.99 0.02 25); }
+.cp-btn--danger {
+  background: oklch(0.60 0.18 25);
+  color: oklch(0.99 0.02 25);
+  box-shadow:
+    inset 0 1px 0 oklch(1 0 0 / 0.12),
+    0 1px 0 oklch(0 0 0 / 0.18);
+}
 .cp-btn--danger:hover:not([disabled]) { background: oklch(0.65 0.18 25); }
 
 .cp-ibtn {
@@ -52,9 +71,10 @@
   background: transparent;
   color: var(--text-dim);
   cursor: pointer;
-  transition: background 120ms ease, color 120ms ease;
+  transition: background 120ms ease, color 120ms ease, scale 70ms ease;
 }
 .cp-ibtn:hover:not([disabled]) { background: var(--surface-3); color: var(--text); }
+.cp-ibtn:active:not([disabled]) { scale: 0.92; }
 .cp-ibtn:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--accent-ring); }
 .cp-ibtn--active { background: var(--accent-fill); color: var(--accent-on); }
 .cp-ibtn[disabled] { opacity: 0.45; cursor: not-allowed; }
@@ -143,9 +163,10 @@
   font-size: 12px;
   font-weight: 600;
   cursor: pointer;
-  transition: background 120ms, color 120ms;
+  transition: background 120ms, color 120ms, scale 70ms ease;
 }
 .cp-seg > button:hover { color: var(--text); }
+.cp-seg > button:active { scale: 0.96; }
 .cp-seg > button[data-active="true"] {
   background: var(--surface-2);
   color: var(--text);
@@ -194,5 +215,7 @@
   gap: 4px;
   padding: 4px 8px;
   border-radius: var(--r-xs);
+  transition: background 120ms ease, scale 70ms ease;
 }
 .cp-section-head .cp-section-action:hover { background: var(--accent-softer); }
+.cp-section-head .cp-section-action:active { scale: 0.96; }

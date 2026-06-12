@@ -59,10 +59,7 @@
   border: 1px solid var(--line);
   border-radius: var(--r-md);
   overflow: hidden;
-  box-shadow:
-    0 1px 0 color-mix(in oklab, var(--text) 8%, transparent) inset,
-    0 28px 80px -12px rgba(0, 0, 0, 0.55),
-    0 8px 20px -4px rgba(0, 0, 0, 0.28);
+  box-shadow: 0 1px 0 color-mix(in oklab, var(--text) 8%, transparent) inset;
   display: flex;
   flex-direction: column;
   max-height: min(70vh, 620px);

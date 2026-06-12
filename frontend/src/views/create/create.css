@@ -5,7 +5,6 @@
   flex-direction: column;
   background: var(--surface);
   border-radius: var(--r-xl);
-  box-shadow: var(--shadow);
   overflow: hidden;
   animation: cp-float-up 240ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
@@ -21,7 +20,7 @@
 }
 .cp-cr-card-head h1 {
   margin: 0;
-  font-size: 17px;
+  font-size: 24px;
   font-weight: 600;
   letter-spacing: 0;
   color: var(--text);
@@ -62,12 +61,11 @@
   inset: 0 auto 0 0;
   width: 50%;
   border-radius: inherit;
-  background: var(--surface-3);
-  transform: translateX(0);
-  transition: transform 180ms ease;
+  background: color-mix(in oklab, var(--accent-fill) 62%, var(--surface-3));
+  transition: width 200ms cubic-bezier(0.22, 1, 0.36, 1);
 }
 .cp-cr-progress[data-step="details"] i::after {
-  transform: translateX(100%);
+  width: 100%;
 }
 
 .cp-cr-card-body {
@@ -105,35 +103,46 @@
 }
 
 .cp-cr-sources {
-  display: flex;
+  display: inline-flex;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: 2px;
+  padding: 3px;
+  border-radius: var(--r-sm);
+  background: color-mix(in oklab, var(--bg) 55%, var(--surface));
+  align-self: flex-start;
   flex-shrink: 0;
 }
 .cp-cr-source {
   display: inline-flex;
   align-items: center;
   gap: 7px;
-  height: 32px;
+  height: 28px;
   padding: 0 12px;
   border: none;
-  border-radius: var(--r-xs);
-  background: var(--surface-2);
-  color: var(--text-dim);
+  border-radius: calc(var(--r-sm) - 3px);
+  background: transparent;
+  color: var(--text-mute);
   font: inherit;
   font-size: 12.5px;
   font-weight: 600;
   cursor: pointer;
-  transition: background 140ms ease, color 140ms ease;
+  transition: background 140ms ease, color 140ms ease, box-shadow 140ms ease, scale 70ms ease;
 }
-.cp-cr-source:hover { background: var(--surface-3); color: var(--text); }
+.cp-cr-source:hover { color: var(--text); }
+.cp-cr-source:active { scale: 0.96; }
 .cp-cr-source:focus-visible {
   outline: none;
   box-shadow: 0 0 0 3px var(--accent-ring);
 }
 .cp-cr-source[data-active="true"] {
-  background: var(--accent-fill);
-  color: var(--accent-on);
+  background: var(--surface-2);
+  color: var(--text);
+  box-shadow:
+    0 1px 2px rgba(0,0,0,0.18),
+    inset 0 1px 0 oklch(1 0 0 / 0.05);
+}
+.cp-cr-source[data-active="true"] .cp-cr-loader-mark {
+  background-color: var(--accent);
 }
 .cp-cr-loader-mark {
   display: block;
@@ -163,13 +172,11 @@
 }
 .cp-cr-channels {
   display: inline-flex;
-  padding: 2px;
-  gap: 0;
-  background: color-mix(in oklab, var(--bg) 55%, var(--surface));
-  border-radius: var(--r-sm);
+  gap: 2px;
   flex-shrink: 0;
 }
 .cp-cr-chan {
+  position: relative;
   border: 0;
   background: transparent;
   color: var(--text-mute);
@@ -177,16 +184,25 @@
   font-size: 12px;
   font-weight: 600;
   letter-spacing: 0;
-  padding: 6px 12px;
-  border-radius: calc(var(--r-sm) - 3px);
+  padding: 6px 9px;
+  border-radius: var(--r-xs);
   cursor: pointer;
-  transition: background-color 160ms ease, color 160ms ease;
+  transition: color 160ms ease, scale 70ms ease;
 }
 .cp-cr-chan:not(:disabled):hover { color: var(--text); }
+.cp-cr-chan:not(:disabled):active { scale: 0.96; }
 .cp-cr-chan[data-active="true"] {
-  background: var(--surface-2);
   color: var(--text);
-  box-shadow: 0 1px 2px rgba(0,0,0,0.18);
+}
+.cp-cr-chan[data-active="true"]::after {
+  content: "";
+  position: absolute;
+  left: 9px;
+  right: 9px;
+  bottom: 1px;
+  height: 2px;
+  border-radius: 999px;
+  background: var(--accent);
 }
 .cp-cr-chan:disabled {
   opacity: 0.38;
@@ -228,6 +244,7 @@
   transition: background-color 120ms ease, color 120ms ease;
 }
 .cp-cr-vrow:hover { background: var(--surface-2); }
+.cp-cr-vrow:active { background: var(--surface-3); }
 .cp-cr-vrow:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
@@ -235,6 +252,9 @@
 .cp-cr-vrow[data-active="true"] {
   background: var(--accent-fill);
   color: var(--accent-on);
+  box-shadow:
+    inset 0 1px 0 oklch(1 0 0 / 0.12),
+    0 1px 0 oklch(0 0 0 / 0.16);
 }
 .cp-cr-vrow-name {
   font-size: 13px;
@@ -350,13 +370,14 @@
   justify-content: center;
   cursor: pointer;
   box-shadow: 0 0 0 3px var(--surface);
-  transition: background 140ms, color 140ms, transform 200ms cubic-bezier(0.4, 0, 0.2, 1);
+  transition: background 140ms, color 140ms, transform 200ms cubic-bezier(0.4, 0, 0.2, 1), scale 70ms ease;
 }
 .cp-cr-reroll:hover {
   background: var(--accent-fill);
   color: var(--accent-on);
   transform: rotate(-60deg);
 }
+.cp-cr-reroll:active { scale: 0.9; }
 .cp-cr-reroll:focus-visible {
   outline: none;
   box-shadow: 0 0 0 3px var(--accent-ring);
@@ -439,6 +460,7 @@
   transition: background-color 140ms ease;
 }
 .cp-cr-row:hover { background: var(--surface-2); }
+.cp-cr-row:active { background: var(--surface-3); }
 .cp-cr-row:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: -2px;

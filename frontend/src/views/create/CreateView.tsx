@@ -428,7 +428,6 @@ function CreateCard(): JSX.Element {
         <header class="cp-cr-card-head">
           <div>
             <h1>Create instance</h1>
-            <p>{step === 'version' ? 'Choose Minecraft and loader.' : 'Name it and set launch defaults.'}</p>
           </div>
           <IconButton icon="x" tooltip="Close (Esc)" onClick={closeCreate} />
           <div
@@ -462,9 +461,7 @@ function CreateCard(): JSX.Element {
                   onFocus={() => scheduleHoverPrefetch(key)}
                   onBlur={cancelHoverPrefetch}
                 >
-                  {key === 'vanilla'
-                    ? <Icon name="cube" size={14} stroke={1.8} />
-                    : <LoaderLogo loader={key} size={14} class="cp-cr-loader-mark" />}
+                  <LoaderLogo loader={key} size={14} class="cp-cr-loader-mark" />
                   <span>{LOADER_LABELS[key]}</span>
                 </button>
               ))}

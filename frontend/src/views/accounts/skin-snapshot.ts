@@ -14,6 +14,8 @@ const SNAPSHOT_ROTATION = -Math.PI / 9;
 const SNAPSHOT_CENTER_Y = 21.4;
 const SNAPSHOT_HALF_HEIGHT = 13.2;
 
+export type SnapshotSide = 'front' | 'back';
+
 interface SnapshotRig {
   THREE: ThreeModule;
   renderer: import('three').WebGLRenderer;
@@ -50,6 +52,7 @@ async function renderSnapshot(
   src: string,
   variant: SkinVariant,
   capeSrc: string | undefined,
+  side: SnapshotSide,
 ): Promise<string> {
   const { THREE, renderer, canvas } = await snapshotRig();
   const skinBitmap = await loadBitmap(src);
@@ -61,7 +64,7 @@ async function renderSnapshot(
     addSceneLighting(THREE, scene, disposables);
 
     const group = new THREE.Group();
-    group.rotation.y = SNAPSHOT_ROTATION;
+    group.rotation.y = side === 'back' ? SNAPSHOT_ROTATION + Math.PI : SNAPSHOT_ROTATION;
     scene.add(group);
     const parts = buildSkinModel({
       THREE,
@@ -105,17 +108,19 @@ export function skinSnapshot(
   src: string,
   variant: SkinVariant,
   capeSrc?: string,
+  side: SnapshotSide = 'front',
 ): Promise<string> {
-  const existing = cache.get(cacheKey);
+  const key = side === 'back' ? `${cacheKey}:back` : cacheKey;
+  const existing = cache.get(key);
   if (existing) return existing;
 
   const job = queue
     .catch(() => undefined)
-    .then(() => renderSnapshot(src, variant, capeSrc));
+    .then(() => renderSnapshot(src, variant, capeSrc, side));
   queue = job;
-  cache.set(cacheKey, job);
+  cache.set(key, job);
   job.catch(() => {
-    if (cache.get(cacheKey) === job) cache.delete(cacheKey);
+    if (cache.get(key) === job) cache.delete(key);
   });
   return job;
 }

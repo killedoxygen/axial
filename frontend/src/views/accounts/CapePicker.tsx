@@ -151,6 +151,7 @@ function CapeChoiceButton({
     <button
       type="button"
       role="radio"
+      class="cp-cape-choice"
       aria-checked={selected}
       title={label}
       onClick={onClick}

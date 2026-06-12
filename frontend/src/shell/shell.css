@@ -45,12 +45,16 @@
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  transition: background 120ms, color 120ms;
+  transition: background 120ms, color 120ms, box-shadow 120ms ease, scale 70ms ease;
   flex-shrink: 0;
 }
 .cp-rail-btn:hover {
   background: var(--surface);
   color: var(--text);
+  box-shadow: var(--shadow-raised), inset 0 1px 0 oklch(1 0 0 / 0.05);
+}
+.cp-rail-btn:active {
+  scale: 0.92;
 }
 .cp-rail-btn:focus-visible {
   outline: none;
@@ -59,12 +63,17 @@
 .cp-rail-btn[data-active="true"] {
   background: var(--accent-fill);
   color: var(--accent-on);
+  box-shadow:
+    inset 0 1px 0 oklch(1 0 0 / 0.14),
+    0 1px 0 oklch(0 0 0 / 0.18);
 }
 .cp-rail-btn[data-accent="true"] {
   color: var(--accent);
 }
 .cp-rail-btn[data-accent="true"]:hover {
   background: var(--accent-soft);
+  color: var(--accent);
+  box-shadow: var(--shadow-raised), inset 0 1px 0 oklch(1 0 0 / 0.05);
 }
 
 .cp-rail-sep {
@@ -142,9 +151,10 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  transition: transform 140ms cubic-bezier(0.22, 1, 0.36, 1);
+  transition: transform 140ms cubic-bezier(0.22, 1, 0.36, 1), scale 70ms ease;
 }
 .cp-rail-tile:hover { transform: translateY(-1px); }
+.cp-rail-tile:active { scale: 0.92; }
 .cp-rail-tile:focus-visible {
   outline: none;
   box-shadow: 0 0 0 3px var(--accent-ring);
@@ -258,14 +268,21 @@
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  transition: background 120ms;
+  transition: background 120ms, box-shadow 120ms ease, scale 70ms ease;
 }
-.cp-rail-user:hover { background: var(--surface); }
+.cp-rail-user:hover {
+  background: var(--surface);
+  box-shadow: var(--shadow-raised), inset 0 1px 0 oklch(1 0 0 / 0.05);
+}
+.cp-rail-user:active { scale: 0.92; }
 .cp-rail-user:focus-visible {
   outline: none;
   box-shadow: 0 0 0 3px var(--accent-ring);
 }
-.cp-rail-user[data-open="true"] { background: var(--surface); }
+.cp-rail-user[data-open="true"] {
+  background: var(--surface);
+  box-shadow: var(--shadow-raised), inset 0 1px 0 oklch(1 0 0 / 0.05);
+}
 
 .cp-userm {
   position: absolute;
@@ -349,6 +366,7 @@
   .cp-rail-tile-art,
   .cp-rail-tip,
   .cp-userm,
+  .cp-status-pill,
   .cp-status-pill .cp-status-mark,
   .cp-status-pill--installing::before,
   .cp-music-eq > span {
@@ -413,7 +431,22 @@
   overflow: hidden;
   box-shadow:
     inset 0 1px 0 var(--cp-status-raise),
+    0 1px 0 oklch(0 0 0 / 0.14),
     0 5px 13px color-mix(in oklab, var(--bg-deep) 20%, transparent);
+  transition: filter 140ms ease, box-shadow 140ms ease, scale 70ms ease;
+}
+button.cp-status-pill:hover {
+  filter: brightness(1.07);
+  box-shadow:
+    inset 0 1px 0 var(--cp-status-raise),
+    0 1px 0 oklch(0 0 0 / 0.14),
+    0 7px 16px color-mix(in oklab, var(--bg-deep) 32%, transparent);
+}
+html[data-color-mode="light"] button.cp-status-pill:hover {
+  filter: brightness(0.98);
+}
+button.cp-status-pill:active {
+  scale: 0.97;
 }
 .cp-status-pill > * {
   position: relative;

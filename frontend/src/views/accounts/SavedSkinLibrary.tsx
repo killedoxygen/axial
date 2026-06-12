@@ -2235,16 +2235,23 @@ function SkinSnapshotImg({
   alt: string;
 }): JSX.Element {
   const [url, setUrl] = useState<string | null>(null);
+  const [backUrl, setBackUrl] = useState<string | null>(null);
 
   useEffect(() => {
     let active = true;
     setUrl(null);
+    setBackUrl(null);
     skinSnapshot(cacheKey, src, variant, capeSrc)
       .then((nextUrl) => {
-        if (active) setUrl(nextUrl);
+        if (!active) return null;
+        setUrl(nextUrl);
+        return skinSnapshot(cacheKey, src, variant, capeSrc, 'back');
+      })
+      .then((nextBackUrl) => {
+        if (active && nextBackUrl) setBackUrl(nextBackUrl);
       })
       .catch(() => {
-        if (active) setUrl(null);
+        if (active) setBackUrl(null);
       });
     return () => {
       active = false;
@@ -2254,5 +2261,18 @@ function SkinSnapshotImg({
   if (!url) {
     return <span class="cp-skin-tile__img" data-snapshot="loading" aria-hidden="true" />;
   }
-  return <img class="cp-skin-tile__img" src={url} alt={alt} draggable={false} />;
+  return (
+    <span class="cp-skin-tile__flip" data-back={backUrl ? 'ready' : 'none'}>
+      <img class="cp-skin-tile__img" src={url} alt={alt} draggable={false} />
+      {backUrl && (
+        <img
+          class="cp-skin-tile__img cp-skin-tile__img--back"
+          src={backUrl}
+          alt=""
+          aria-hidden="true"
+          draggable={false}
+        />
+      )}
+    </span>
+  );
 }
