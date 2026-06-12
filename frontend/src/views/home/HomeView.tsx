@@ -4,7 +4,7 @@ import { Button, SectionHeading, Card, Pill } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { InstanceCard } from '../../ui/InstanceCard';
 import { navigate, openCreate } from '../../ui-state';
-import { config, instances, runningSessions, versions } from '../../store';
+import { config, instances, runningSessions, versionById } from '../../store';
 import { instanceInstallStatus } from '../../instance-install-status';
 import { loaderKeyFromVersion, LOADER_LABELS } from '../create/defaults';
 import { openInstanceContextMenu } from '../instance/instance-menu';
@@ -44,7 +44,7 @@ function versionBadge(v: Version | undefined): string {
 const HOME_LIBRARY_CARD_LIMIT = 14;
 
 function FeatureBanner({ inst }: { inst: EnrichedInstance }): JSX.Element {
-  const version = versions.value.find(v => v.id === inst.version_id);
+  const version = versionById(inst.version_id);
   const running = !!runningSessions.value[inst.id];
   const install = instanceInstallStatus(inst, version);
   const installing = install.installing;
@@ -109,7 +109,7 @@ function EmptyHome(): JSX.Element {
   return (
     <Card padding={32}>
       <div class="cp-empty">
-        <Icon name="cube" size={36} color="var(--text-mute)" />
+        <Icon name="stack" size={36} color="var(--text-mute)" />
         <h2>Create your first instance</h2>
         <p>Instances are isolated Minecraft setups. Pick a version, bundle mods, and launch without touching your other worlds.</p>
         <Button icon="plus" onClick={openCreate}>New instance</Button>

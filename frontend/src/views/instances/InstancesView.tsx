@@ -8,7 +8,7 @@ import { openContextMenu } from '../../ui/ContextMenu';
 import { SelectionActionPill, SelectionCheckbox } from '../../ui/SelectionActionPill';
 import { selectionMenuItem, selectionToggleLabel, useSelection } from '../../ui/selection';
 import { useTheme } from '../../hooks/use-theme';
-import { instances, versions, runningSessions } from '../../store';
+import { instances, versionById, runningSessions } from '../../store';
 import { instanceInstallStatus } from '../../instance-install-status';
 import { navigate, openCreate } from '../../ui-state';
 import { loaderKeyFromVersion, LOADER_LABELS } from '../create/defaults';
@@ -56,7 +56,7 @@ function ListRow({
   onContextMenu: (e: MouseEvent) => void;
 }): JSX.Element {
   const theme = useTheme();
-  const v = versions.value.find(x => x.id === inst.version_id);
+  const v = versionById(inst.version_id);
   const running = !!runningSessions.value[inst.id];
   const install = instanceInstallStatus(inst, v);
   const installing = install.installing;
@@ -148,7 +148,7 @@ export function InstancesView(): JSX.Element {
 
       {filtered.length === 0 ? (
         <div class="cp-empty">
-          <Icon name="cube" size={36} color="var(--text-mute)" />
+          <Icon name="stack" size={36} color="var(--text-mute)" />
           <h2>{q ? 'No matches' : 'No instances yet'}</h2>
           <p>{q ? 'Try a different search term.' : 'Create your first Minecraft instance to get started.'}</p>
           {!q && <Button icon="plus" onClick={openCreate}>New instance</Button>}

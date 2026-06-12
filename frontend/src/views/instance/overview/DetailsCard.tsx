@@ -1,13 +1,13 @@
 import type { JSX } from 'preact';
 import { Card } from '../../../ui/Atoms';
-import { versions } from '../../../store';
+import { versionById } from '../../../store';
 import { minecraftVersionLabel } from '../../../version-display';
 import type { EnrichedInstance } from '../../../types';
 import { loaderKeyFromVersion, LOADER_LABELS } from '../../create/defaults';
 import { fmtJoined, fmtRelative } from '../format';
 
 export function DetailsCard({ inst, running }: { inst: EnrichedInstance; running: boolean }): JSX.Element {
-  const v = versions.value.find(x => x.id === inst.version_id);
+  const v = versionById(inst.version_id);
   const loader = LOADER_LABELS[loaderKeyFromVersion(v)];
   const loaderVer = v?.loader?.loader_version ? ` ${v.loader.loader_version}` : '';
   const mcVer = minecraftVersionLabel(v);

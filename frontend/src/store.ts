@@ -25,10 +25,13 @@ export const selectedInstance = computed<Instance | null>(() => {
   return instances.value.find(i => i.id === id) ?? null;
 });
 
+export function versionById(id: string | undefined): Version | undefined {
+  if (!id) return undefined;
+  return versions.value.find(v => v.id === id);
+}
+
 export const selectedVersion = computed<Version | null>(() => {
-  const inst = selectedInstance.value;
-  if (!inst) return null;
-  return versions.value.find(v => v.id === inst.version_id) ?? null;
+  return versionById(selectedInstance.value?.version_id) ?? null;
 });
 
 // ── Install state machine ──

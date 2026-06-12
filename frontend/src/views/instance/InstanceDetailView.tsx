@@ -5,7 +5,7 @@ import { Button, IconButton, Pill } from '../../ui/Atoms';
 import { useTheme } from '../../hooks/use-theme';
 import { InstanceTile } from '../../ui/InstanceVisual';
 import { openContextMenu } from '../../ui/ContextMenu';
-import { instances, launchNotices, launchState, runningSessions, versions } from '../../store';
+import { instances, launchNotices, launchState, runningSessions, versionById } from '../../store';
 import { navigate } from '../../ui-state';
 import { selectInstance } from '../../actions';
 import { launchGame, killGame } from '../../launch';
@@ -110,7 +110,7 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
     return (
       <div class="cp-view-page">
         <div class="cp-empty">
-          <Icon name="cube" size={36} color="var(--text-mute)" />
+          <Icon name="stack" size={36} color="var(--text-mute)" />
           <h2>Instance not found</h2>
           <p>That instance might have been deleted.</p>
           <Button icon="chevron-left" onClick={() => navigate({ name: 'instances' })}>Back to instances</Button>
@@ -119,7 +119,7 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
     );
   }
 
-  const v = versions.value.find(x => x.id === inst.version_id);
+  const v = versionById(inst.version_id);
   const showModsTab = supportsMods(v);
   const activeTab: Tab = !showModsTab && tab === 'mods' ? 'overview' : tab;
   const visibleTabs = showModsTab ? TABS : TABS.filter((t) => t.id !== 'mods');

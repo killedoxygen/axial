@@ -1,5 +1,5 @@
 import type { JSX } from 'preact';
-import { versions } from '../store';
+import { versionById } from '../store';
 import { instanceInstallStatus } from '../instance-install-status';
 import { hashStr } from '../tokens';
 import { loaderKeyFromComponentId, loaderKeyFromVersion, type LoaderKey } from '../views/create/defaults';
@@ -45,7 +45,7 @@ function GlyphMark({ loader, className }: { loader: LoaderKey; className: string
   }
   return (
     <span aria-hidden="true" class={className}>
-      <Icon name="cube" stroke={1.5} />
+      <Icon name="stack" stroke={1.5} />
     </span>
   );
 }
@@ -56,7 +56,7 @@ export function InstanceTile({ inst, radius, className, style }: {
   className?: string;
   style?: JSX.CSSProperties;
 }): JSX.Element {
-  const version = versions.value.find((v) => v.id === inst.version_id);
+  const version = versionById(inst.version_id);
   const loader = loaderKeyForInstance(inst, version);
 
   return (

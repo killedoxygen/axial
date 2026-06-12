@@ -4,7 +4,7 @@ import { Button, Card, Pill } from '../../ui/Atoms';
 import { SelectField } from '../../ui/Select';
 import { api } from '../../api';
 import { toast } from '../../toast';
-import { devMode, instances, lastInstanceId, selectedInstanceId, versions } from '../../store';
+import { devMode, instances, lastInstanceId, selectedInstanceId, versionById } from '../../store';
 import { errMessage, fmtMem } from '../../utils';
 import { minecraftVersionLabel } from '../../version-display';
 import type {
@@ -624,7 +624,7 @@ function LaunchProofHistoryBlock({ state }: { state: LaunchReportsState }): JSX.
               scenario.benchmark_run_type?.trim(),
             ].filter(Boolean);
             const versionId = scenario.version_id || record.version_id || '';
-            const versionRecord = versions.value.find((version) => version.id === versionId);
+            const versionRecord = versionById(versionId);
             const version = minecraftVersionLabel(versionRecord, versionId || 'Unknown version');
 
             return (
@@ -1066,7 +1066,7 @@ function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: BenchmarkMat
               : instanceRows.map((instance) => ({
                   value: instance.id,
                   label: `${instance.name} (${minecraftVersionLabel(
-                    versions.value.find((version) => version.id === instance.version_id),
+                    versionById(instance.version_id),
                     instance.version_id,
                   )})`,
                 }))}

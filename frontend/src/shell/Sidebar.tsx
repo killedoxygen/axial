@@ -5,7 +5,7 @@ import { Icon } from '../ui/Icons';
 import { Logo } from '../ui/Logo';
 import { PlayerHeadPreview } from '../ui/PlayerHeadPreview';
 import { route, navigate, commandPaletteOpen, type Route, openCreate } from '../ui-state';
-import { runningSessions, config, instances, versions } from '../store';
+import { runningSessions, config, instances, versionById } from '../store';
 import { instanceInstallStatus } from '../instance-install-status';
 import { promptPlayerName, savePlayerName } from '../player-name';
 import { accountSkinSrc } from '../player-skin';
@@ -129,7 +129,7 @@ function RailInstances({ tooltip }: { tooltip: RailTooltipController }): JSX.Ele
           {list.map(inst => {
             const active = current.name === 'instance' && current.id === inst.id;
             const running = !!runningSessions.value[inst.id];
-            const version = versions.value.find(v => v.id === inst.version_id);
+            const version = versionById(inst.version_id);
             const install = instanceInstallStatus(inst, version);
             const installing = install.installing;
             const installLabel = install.state === 'queued' ? 'Install queued' : 'Installing';

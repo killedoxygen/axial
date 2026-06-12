@@ -3,7 +3,7 @@ import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { Icon } from '../../../ui/Icons';
 import { Card } from '../../../ui/Atoms';
 import { api } from '../../../api';
-import { config, systemInfo, versions } from '../../../store';
+import { config, systemInfo, versionById } from '../../../store';
 import { errMessage } from '../../../utils';
 import { minecraftVersionLabel } from '../../../version-display';
 import { loaderKeyFromVersion } from '../../create/defaults';
@@ -267,7 +267,7 @@ function MemoryBar({ minGb, maxGb, totalGb }: { minGb: number; maxGb: number; to
 }
 
 export function PerformanceCard({ inst }: { inst: EnrichedInstance }): JSX.Element {
-  const version = versions.value.find(v => v.id === inst.version_id);
+  const version = versionById(inst.version_id);
   const effectiveMode = effectivePerformanceMode(inst);
   const maxMem = memoryGb(inst.max_memory_mb, config.value?.max_memory_mb ?? 4096);
   const minMem = memoryGb(inst.min_memory_mb, config.value?.min_memory_mb ?? 1024);
