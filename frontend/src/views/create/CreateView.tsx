@@ -33,7 +33,6 @@ import {
   buildRowModel,
   CHANNEL_ORDER,
   CHANNEL_LABEL,
-  releaseAnchorsFor,
   type VersionDownloadState,
   type VersionRowModel,
 } from './view-model';
@@ -201,10 +200,6 @@ function CreateCard(): JSX.Element {
     return cat.versions.filter((v) => supportedSet == null || supportedSet.has(v.id));
   }, [catalog.value, source, supportedSet]);
 
-  const releaseAnchors = useMemo(() => {
-    return releaseAnchorsFor(availableForSource);
-  }, [availableForSource]);
-
   const availableChannels = useMemo<Channel[]>(() => {
     const has: Record<Channel, boolean> = { release: false, snapshot: false, legacy: false, unknown: false };
     for (const v of availableForSource) has[channelOfVersion(v)] = true;
@@ -235,7 +230,7 @@ function CreateCard(): JSX.Element {
     const q = query.trim().toLowerCase();
     const rows = availableForSource
       .filter((v) => channelOfVersion(v) === channel)
-      .filter((v) => !q || versionSearchText(v, releaseAnchors).includes(q));
+      .filter((v) => !q || versionSearchText(v).includes(q));
     rows.sort((a, b) => (b.release_time || '').localeCompare(a.release_time || ''));
     return rows.map((v) => {
       let rowFullInstalledSet = fullInstalledSet;
@@ -249,9 +244,9 @@ function CreateCard(): JSX.Element {
           rowFullInstalledSet.delete(v.id);
         }
       }
-      return buildRowModel(v, releaseAnchors, installedSet, source, rowFullInstalledSet);
+      return buildRowModel(v, installedSet, source, rowFullInstalledSet);
     });
-  }, [catalog.value, versions.value, channel, query, availableForSource, releaseAnchors, source, currentComponentId]);
+  }, [catalog.value, versions.value, channel, query, availableForSource, source, currentComponentId]);
   const selectedVersionRow = mcVersionId
     ? versionRows.find((row) => row.id === mcVersionId) ?? null
     : null;

@@ -1,5 +1,5 @@
 import type { CatalogVersion, Version } from './types';
-import { isReleaseVersion, isSnapshotVersion, parseVersionDisplay } from './utils';
+import { parseVersionDisplay } from './utils';
 
 type VersionDisplaySource =
   | Pick<Version, 'id' | 'inherits_from' | 'loader' | 'minecraft_meta' | 'lifecycle' | 'release_time'>
@@ -10,20 +10,6 @@ export interface NormalizedVersionDisplay {
   hint: string | null;
   minecraftLabel: string;
   searchText: string;
-}
-
-function isVersionTokenPrefix(anchorId: string, versionId: string): boolean {
-  const anchorTokens = anchorId.split('.');
-  const versionTokens = versionId.split(/[.\-_]/);
-  return versionTokens.length >= anchorTokens.length
-    && anchorTokens.every((token, index) => versionTokens[index] === token);
-}
-
-export function releaseAnchorsFor(versions: CatalogVersion[]): CatalogVersion[] {
-  return versions
-    .filter(isReleaseVersion)
-    .slice()
-    .sort((left, right) => (left.release_time || '').localeCompare(right.release_time || ''));
 }
 
 function inferNeoForgeMinecraftVersion(loaderVersion: string): string {
@@ -78,7 +64,6 @@ function loaderMinecraftVersion(version: VersionDisplaySource): string {
 
 export function normalizeVersionDisplay(
   version: VersionDisplaySource | null | undefined,
-  releaseAnchors: VersionDisplaySource[] = [],
 ): NormalizedVersionDisplay {
   if (!version) {
     return {
@@ -89,24 +74,8 @@ export function normalizeVersionDisplay(
     };
   }
 
-  const display = parseVersionDisplay(version.id, version, releaseAnchors);
-  let hint = display.hint;
-  if (!hint && isSnapshotVersion(version) && version.release_time) {
-    const releaseTime = version.release_time;
-    let nearest: VersionDisplaySource | null = null;
-    for (const anchor of releaseAnchors) {
-      if ((anchor.release_time || '') >= releaseTime) {
-        nearest = anchor;
-        break;
-      }
-    }
-    if (!nearest && releaseAnchors.length > 0) {
-      nearest = releaseAnchors[releaseAnchors.length - 1] ?? null;
-    }
-    if (nearest && !isVersionTokenPrefix(nearest.id, version.id)) {
-      hint = `~ ${nearest.id}`;
-    }
-  }
+  const display = parseVersionDisplay(version.id, version);
+  const hint = display.hint;
 
   const displayName = display.name || version.id;
   const meta = version.minecraft_meta;
@@ -142,9 +111,8 @@ export function normalizeVersionDisplay(
 
 export function versionSearchText(
   version: VersionDisplaySource | null | undefined,
-  releaseAnchors: VersionDisplaySource[] = [],
 ): string {
-  return normalizeVersionDisplay(version, releaseAnchors).searchText;
+  return normalizeVersionDisplay(version).searchText;
 }
 
 export function minecraftVersionLabel(

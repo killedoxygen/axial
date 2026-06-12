@@ -181,6 +181,13 @@ fn classify_lifecycle(
             "ALPH",
             vec!["old_alpha".to_string()],
         ),
+        VersionShape::ReleaseSnapshot { .. } => LifecycleMeta::new(
+            LifecycleChannel::Preview,
+            vec![LifecycleLabel::Snapshot],
+            400,
+            "SNAP",
+            vec!["snapshot".to_string()],
+        ),
         VersionShape::PreRelease { .. } => LifecycleMeta::new(
             LifecycleChannel::Preview,
             vec![LifecycleLabel::PreRelease],
@@ -296,6 +303,7 @@ fn classify_version_family(
         VersionShape::OldAlpha { .. } => "old_alpha",
         VersionShape::ReleaseCandidate { .. } => "release_candidate",
         VersionShape::PreRelease { .. } => "pre_release",
+        VersionShape::ReleaseSnapshot { .. } => "release_snapshot",
         VersionShape::CombatTest { .. } => "combat_test",
         VersionShape::DeepDarkExperimentalSnapshot { .. } => "deep_dark_experimental_snapshot",
         VersionShape::ExperimentalSnapshot { .. } => "experimental_snapshot",
@@ -315,16 +323,50 @@ fn effective_version_for(
     release_time: &str,
     releases: &[ReleaseReference],
 ) -> String {
+    if uses_estimated_target_release(family) {
+        return snapshot_effective_version_for(parsed, release_time, releases);
+    }
     if let Some(base) = parsed.shape.base_release() {
         return base.to_string();
     }
     if family == "release" || family == "old_beta" || family == "old_alpha" {
         return parsed.base_id.clone();
     }
+    String::new()
+}
+
+fn snapshot_effective_version_for(
+    parsed: &ParsedVersionId,
+    release_time: &str,
+    releases: &[ReleaseReference],
+) -> String {
+    if let Some(release) = snapshot_technical_release(parsed) {
+        return next_release_after(release, releases).unwrap_or_else(|| release.to_string());
+    }
     if release_time.trim().is_empty() || releases.is_empty() {
         return String::new();
     }
 
+    let Some(target) = estimated_release_by_timeline(release_time, releases) else {
+        return String::new();
+    };
+    if target.release_time.as_str() <= release_time {
+        return next_release_after(&target.id, releases).unwrap_or_else(|| target.id.clone());
+    }
+    target.id.clone()
+}
+
+fn snapshot_technical_release(parsed: &ParsedVersionId) -> Option<&str> {
+    match &parsed.shape {
+        VersionShape::ReleaseSnapshot { release, .. } => Some(release.as_str()),
+        _ => None,
+    }
+}
+
+fn estimated_release_by_timeline<'a>(
+    release_time: &str,
+    releases: &'a [ReleaseReference],
+) -> Option<&'a ReleaseReference> {
     releases
         .iter()
         .filter(|entry| entry.release_time.as_str() >= release_time)
@@ -335,8 +377,14 @@ fn effective_version_for(
                 .filter(|entry| entry.release_time.as_str() <= release_time)
                 .max_by(|left, right| left.release_time.cmp(&right.release_time))
         })
+}
+
+fn next_release_after(release: &str, releases: &[ReleaseReference]) -> Option<String> {
+    releases
+        .iter()
+        .filter(|entry| compare_version_like(&entry.id, release) == Ordering::Greater)
+        .min_by(|left, right| compare_version_like(&left.id, &right.id))
         .map(|entry| entry.id.clone())
-        .unwrap_or_default()
 }
 
 fn display_name_for(parsed: &ParsedVersionId) -> String {
@@ -345,6 +393,9 @@ fn display_name_for(parsed: &ParsedVersionId) -> String {
         VersionShape::OldAlpha { raw } => format!("Alpha {}", &raw[1..]),
         VersionShape::PreRelease { release, .. } => release.clone(),
         VersionShape::ReleaseCandidate { release, .. } => release.clone(),
+        VersionShape::ReleaseSnapshot { release, label } => {
+            format!("{release} Snapshot {}", normalize_numeric_label(label))
+        }
         VersionShape::CombatTest { release, label } => {
             format!("{release} Combat Test {}", normalize_numeric_label(label))
         }
@@ -394,7 +445,10 @@ fn display_hint_for(parsed: &ParsedVersionId, family: &str, effective_version: &
 }
 
 fn uses_estimated_target_release(family: &str) -> bool {
-    matches!(family, "weekly_snapshot" | "potato_snapshot" | "snapshot")
+    matches!(
+        family,
+        "weekly_snapshot" | "potato_snapshot" | "release_snapshot" | "snapshot"
+    )
 }
 
 fn variant_display_label(variant_kind: &str) -> String {
@@ -478,6 +532,7 @@ fn release_anchor(parsed: &ParsedVersionId) -> Option<Vec<u32>> {
         VersionShape::Release { components } => Some(components.clone()),
         VersionShape::PreRelease { release, .. }
         | VersionShape::ReleaseCandidate { release, .. }
+        | VersionShape::ReleaseSnapshot { release, .. }
         | VersionShape::CombatTest { release, .. }
         | VersionShape::ExperimentalSnapshot { release, .. }
         | VersionShape::DeepDarkExperimentalSnapshot { release, .. } => {
@@ -501,7 +556,8 @@ fn stage_rank(shape: &VersionShape) -> i32 {
         VersionShape::PreRelease { .. } => 6,
         VersionShape::ReleaseCandidate { .. } => 7,
         VersionShape::Release { .. } => 8,
-        VersionShape::Unknown => 9,
+        VersionShape::ReleaseSnapshot { .. } => 9,
+        VersionShape::Unknown => 10,
     }
 }
 
@@ -642,14 +698,15 @@ fn family_priority(family: &str) -> i32 {
         "release_candidate" => 1,
         "pre_release" => 2,
         "weekly_snapshot" => 3,
-        "potato_snapshot" => 4,
-        "experimental_snapshot" => 5,
-        "deep_dark_experimental_snapshot" => 6,
-        "combat_test" => 7,
-        "snapshot" => 8,
-        "old_beta" => 9,
-        "old_alpha" => 10,
-        _ => 11,
+        "release_snapshot" => 4,
+        "potato_snapshot" => 5,
+        "experimental_snapshot" => 6,
+        "deep_dark_experimental_snapshot" => 7,
+        "combat_test" => 8,
+        "snapshot" => 9,
+        "old_beta" => 10,
+        "old_alpha" => 11,
+        _ => 12,
     }
 }
 
@@ -726,6 +783,83 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_estimate_promotes_exact_release_match_to_next_known_release() {
+        let releases = vec![
+            ReleaseReference {
+                id: "26.1.1".to_string(),
+                release_time: "2026-02-01T00:00:00+00:00".to_string(),
+            },
+            ReleaseReference {
+                id: "26.1.2".to_string(),
+                release_time: "2026-02-15T00:00:00+00:00".to_string(),
+            },
+        ];
+
+        let analysis = analyze_minecraft_version(
+            "26w05a",
+            "snapshot",
+            "2026-02-01T00:00:00+00:00",
+            None,
+            &releases,
+        );
+
+        assert_eq!(analysis.minecraft_meta.family, "weekly_snapshot");
+        assert_eq!(analysis.minecraft_meta.effective_version, "26.1.2");
+        assert_eq!(analysis.minecraft_meta.display_hint, "~ 26.1.2");
+    }
+
+    #[test]
+    fn release_snapshot_targets_immediate_next_release_after_anchor() {
+        let releases = vec![
+            ReleaseReference {
+                id: "26.1.2".to_string(),
+                release_time: "2026-02-15T00:00:00+00:00".to_string(),
+            },
+            ReleaseReference {
+                id: "26.1".to_string(),
+                release_time: "2026-01-01T00:00:00+00:00".to_string(),
+            },
+            ReleaseReference {
+                id: "26.1.1".to_string(),
+                release_time: "2026-02-01T00:00:00+00:00".to_string(),
+            },
+        ];
+
+        let analysis = analyze_minecraft_version(
+            "26.1-snapshot-9",
+            "snapshot",
+            "2026-01-15T00:00:00+00:00",
+            None,
+            &releases,
+        );
+
+        assert_eq!(analysis.lifecycle.channel, LifecycleChannel::Preview);
+        assert_eq!(analysis.lifecycle.labels, vec![LifecycleLabel::Snapshot]);
+        assert_eq!(analysis.minecraft_meta.family, "release_snapshot");
+        assert_eq!(analysis.minecraft_meta.base_id, "26.1-snapshot-9");
+        assert_eq!(analysis.minecraft_meta.effective_version, "26.1.1");
+        assert_eq!(analysis.minecraft_meta.display_name, "26.1 Snapshot 9");
+        assert_eq!(analysis.minecraft_meta.display_hint, "~ 26.1.1");
+    }
+
+    #[test]
+    fn release_snapshot_falls_back_to_anchor_when_no_future_release_is_known() {
+        let analysis = analyze_minecraft_version(
+            "26.1-snapshot-9",
+            "snapshot",
+            "2026-01-15T00:00:00+00:00",
+            None,
+            &[ReleaseReference {
+                id: "26.1".to_string(),
+                release_time: "2026-01-01T00:00:00+00:00".to_string(),
+            }],
+        );
+
+        assert_eq!(analysis.minecraft_meta.effective_version, "26.1");
+        assert_eq!(analysis.minecraft_meta.display_hint, "~ 26.1");
+    }
+
+    #[test]
     fn humanizes_experimental_snapshot_names() {
         let analysis = analyze_minecraft_version("1.18_experimentaI-snapshot-6", "", "", None, &[]);
         assert_eq!(analysis.lifecycle.channel, LifecycleChannel::Experimental);
@@ -767,6 +901,18 @@ mod tests {
         assert_eq!(
             compare_version_like("26w01a", "25w46a"),
             std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn orders_release_snapshot_after_anchor_and_before_next_release() {
+        assert_eq!(
+            compare_version_like("26.1-snapshot-9", "26.1"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_version_like("26.1-snapshot-9", "26.1.1"),
+            std::cmp::Ordering::Less
         );
     }
 

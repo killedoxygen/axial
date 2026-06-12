@@ -111,7 +111,7 @@ export function versionBadgeInfo(version: Version | null | undefined): { cls: st
   return { cls: 'badge-old', text: version?.lifecycle?.badge_text || '?' };
 }
 
-export function parseVersionDisplay(versionId: string, version: VersionLike | null | undefined, versions: VersionLike[]): VersionDisplay {
+export function parseVersionDisplay(versionId: string, version: VersionLike | null | undefined): VersionDisplay {
   if (version && 'inherits_from' in version && version.inherits_from) {
     return parseModded(versionId, version.inherits_from, version as Version | null);
   }
@@ -123,7 +123,6 @@ export function parseVersionDisplay(versionId: string, version: VersionLike | nu
   }
   if (isOldBetaVersion(version)) return { name: versionId.replace(/^b/, 'Beta '), hint: null };
   if (isOldAlphaVersion(version)) return { name: versionId.replace(/^a/, 'Alpha '), hint: null };
-  if (isSnapshotVersion(version)) return parseSnapshot(versionId, version, versions);
   return { name: versionId, hint: null };
 }
 
@@ -213,40 +212,6 @@ function loaderDisplay(
     hint: loaderVersion ? `${hintPrefix} ${formatLoaderVersionLabel(loaderVersion, buildMeta)}` : null,
     loader,
   };
-}
-
-function parseSnapshot(id: string, version: VersionLike | null | undefined, versions: VersionLike[]): VersionDisplay {
-  if (version?.minecraft_meta?.display_name) {
-    return {
-      name: version.minecraft_meta.display_name,
-      hint: version.minecraft_meta.display_hint || null,
-    };
-  }
-  const m = id.match(/^(\d+\.\d+(?:\.\d+)?)-(?:pre|rc)\d+$/);
-  if (m) return { name: id, hint: null };
-  if (versions?.length && version?.release_time) {
-    const t = version.release_time as string;
-    const rel = versions
-      .filter((v) => isReleaseVersion(v) && v.release_time)
-      .sort((a, b) => (a.release_time as string).localeCompare(b.release_time as string));
-    let nearest: VersionLike | null = null;
-    for (const r of rel) {
-      if ((r.release_time || '') >= t) {
-        nearest = r;
-        break;
-      }
-    }
-    if (!nearest) {
-      for (let i = rel.length - 1; i >= 0; i--) {
-        if ((rel[i]?.release_time || '') <= t) {
-          nearest = rel[i] || null;
-          break;
-        }
-      }
-    }
-    if (nearest && !id.includes(nearest.id)) return { name: id, hint: `~ ${nearest.id}` };
-  }
-  return { name: id, hint: null };
 }
 
 export function fmtMem(gb: number): string { return gb === Math.floor(gb) ? `${gb}\u00A0GB` : `${gb.toFixed(1)}\u00A0GB`; }

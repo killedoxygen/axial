@@ -1,6 +1,6 @@
 import type { CatalogVersion } from '../../types';
 import { channelOfVersion, type Channel, type LoaderKey } from './defaults';
-import { normalizeVersionDisplay, releaseAnchorsFor } from '../../version-display';
+import { normalizeVersionDisplay } from '../../version-display';
 
 export type VersionDownloadState = 'none' | 'base' | 'full';
 
@@ -23,12 +23,11 @@ export const CHANNEL_ORDER: Channel[] = ['release', 'snapshot', 'legacy', 'unkno
 
 export function buildRowModel(
   version: CatalogVersion,
-  releaseAnchors: CatalogVersion[],
   installedSet: Set<string>,
   source: LoaderKey,
   fullInstalledSet: Set<string> = new Set(),
 ): VersionRowModel {
-  const display = normalizeVersionDisplay(version, releaseAnchors);
+  const display = normalizeVersionDisplay(version);
   const baseInstalled = version.installed || installedSet.has(version.id);
   const fullInstalled = source === 'vanilla'
     ? baseInstalled
@@ -41,5 +40,3 @@ export function buildRowModel(
     downloadState: fullInstalled ? 'full' : baseInstalled ? 'base' : 'none',
   };
 }
-
-export { releaseAnchorsFor };

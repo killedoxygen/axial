@@ -26,6 +26,10 @@ pub(crate) enum VersionShape {
         release: String,
         label: String,
     },
+    ReleaseSnapshot {
+        release: String,
+        label: String,
+    },
     WeeklySnapshot {
         year: u32,
         week: u32,
@@ -52,6 +56,7 @@ impl VersionShape {
         match self {
             Self::PreRelease { release, .. }
             | Self::ReleaseCandidate { release, .. }
+            | Self::ReleaseSnapshot { release, .. }
             | Self::CombatTest { release, .. }
             | Self::ExperimentalSnapshot { release, .. }
             | Self::DeepDarkExperimentalSnapshot { release, .. } => Some(release.as_str()),
@@ -63,6 +68,7 @@ impl VersionShape {
         match self {
             Self::PreRelease { label, .. }
             | Self::ReleaseCandidate { label, .. }
+            | Self::ReleaseSnapshot { label, .. }
             | Self::CombatTest { label, .. }
             | Self::ExperimentalSnapshot { label, .. }
             | Self::DeepDarkExperimentalSnapshot { label, .. } => label.as_str(),
@@ -118,6 +124,10 @@ fn parse_release_stage(base_id: &str) -> Option<VersionShape> {
             label: stage.label,
         }),
         StageKind::ReleaseCandidate => Some(VersionShape::ReleaseCandidate {
+            release,
+            label: stage.label,
+        }),
+        StageKind::Snapshot => Some(VersionShape::ReleaseSnapshot {
             release,
             label: stage.label,
         }),
@@ -273,6 +283,7 @@ fn reconstruct_release(tokens: &[super::tokenize::VersionToken]) -> Option<Strin
 enum StageKind {
     PreRelease,
     ReleaseCandidate,
+    Snapshot,
 }
 
 struct ParsedStage {
@@ -307,6 +318,14 @@ fn parse_stage_marker(tokens: &[super::tokenize::VersionToken]) -> Option<Parsed
         };
         return (!suffix.is_empty()).then_some(ParsedStage {
             kind: StageKind::ReleaseCandidate,
+            label: suffix,
+        });
+    }
+
+    if word == "snapshot" {
+        let suffix = collect_compact_label(&tokens[1..]);
+        return (!suffix.is_empty()).then_some(ParsedStage {
+            kind: StageKind::Snapshot,
             label: suffix,
         });
     }
