@@ -1,5 +1,5 @@
 import type { JSX } from 'preact';
-import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { Button, IconButton, Input, Pill } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { Slider } from '../../ui/Slider';
@@ -97,6 +97,8 @@ function CreateCard(): JSX.Element {
   const [catalogError, setCatalogError] = useState<string | null>(null);
   const [catalogLoading, setCatalogLoading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const versionWellRef = useRef<HTMLDivElement | null>(null);
+  const versionListKey = `${source}:${channel}:${query.trim().toLowerCase()}`;
 
   const totalGB = systemInfo.value?.total_memory_mb
     ? Math.floor(systemInfo.value.total_memory_mb / 1024)
@@ -135,6 +137,12 @@ function CreateCard(): JSX.Element {
   };
 
   const searchInputRef = useRef<HTMLInputElement | null>(null);
+
+  useLayoutEffect(() => {
+    const node = versionWellRef.current;
+    if (!node) return;
+    node.scrollTop = 0;
+  }, [versionListKey]);
 
   const loaderMachine = useMemo(() => createNewInstanceLoaderMachine(), []);
   const loaderState = loaderMachine.state.value;
@@ -498,7 +506,7 @@ function CreateCard(): JSX.Element {
               </div>
             </div>
 
-            <div class="cp-cr-vwell">
+            <div class="cp-cr-vwell" ref={versionWellRef}>
               {catalogLoading && (
                 <div class="cp-cr-state">
                   <span class="cp-cr-spinner" aria-hidden="true" />
