@@ -44,10 +44,20 @@ function storedPosition(id: string): OverlayPosition | null {
   return isOverlayPosition(value) ? value : null;
 }
 
-function clampAxis(value: number, viewportSize: number, surfaceSize: number, margin: number): number {
+interface AxisBounds {
+  min: number;
+  max: number;
+}
+
+function axisBounds(viewportSize: number, surfaceSize: number, margin: number): AxisBounds {
   const widestVisibleOrigin = Math.max(0, viewportSize - surfaceSize);
   const min = Math.min(margin, widestVisibleOrigin);
   const max = Math.max(min, viewportSize - surfaceSize - margin);
+  return { min, max };
+}
+
+function clampAxis(value: number, viewportSize: number, surfaceSize: number, margin: number): number {
+  const { min, max } = axisBounds(viewportSize, surfaceSize, margin);
   return Math.min(Math.max(value, min), max);
 }
 
@@ -58,17 +68,63 @@ function clampPosition(point: OverlayPosition, size: OverlaySize, margin: number
   };
 }
 
+function clampScale(value: number | undefined): number | null {
+  if (value === undefined || !Number.isFinite(value)) return null;
+  return Math.min(Math.max(value, 0), 1);
+}
+
+function axisScale(value: number, viewportSize: number, surfaceSize: number, margin: number, fallback?: number): number {
+  const { min, max } = axisBounds(viewportSize, surfaceSize, margin);
+  if (max === min) return clampScale(fallback) ?? 0.5;
+  return Math.min(Math.max((value - min) / (max - min), 0), 1);
+}
+
+function axisFromScale(scale: number | undefined, fallback: number, viewportSize: number, surfaceSize: number, margin: number): number {
+  const ratio = clampScale(scale);
+  if (ratio === null) return fallback;
+  const { min, max } = axisBounds(viewportSize, surfaceSize, margin);
+  return min + (max - min) * ratio;
+}
+
+function withScales(point: OverlayPosition, size: OverlaySize, margin: number, fallback?: OverlayPosition): OverlayPosition {
+  const clamped = clampPosition(point, size, margin);
+  return {
+    x: clamped.x,
+    y: clamped.y,
+    scaleX: axisScale(clamped.x, window.innerWidth, size.width, margin, fallback?.scaleX),
+    scaleY: axisScale(clamped.y, window.innerHeight, size.height, margin, fallback?.scaleY),
+  };
+}
+
+function resolvePosition(point: OverlayPosition, size: OverlaySize, margin: number): OverlayPosition {
+  return withScales({
+    x: axisFromScale(point.scaleX, point.x, window.innerWidth, size.width, margin),
+    y: axisFromScale(point.scaleY, point.y, window.innerHeight, size.height, margin),
+  }, size, margin, point);
+}
+
+function roundedScale(value: number | undefined): number {
+  return value === undefined ? -1 : Math.round(value * 1000);
+}
+
 function positionsMatch(a: OverlayPosition, b: OverlayPosition): boolean {
-  return Math.round(a.x) === Math.round(b.x) && Math.round(a.y) === Math.round(b.y);
+  return Math.round(a.x) === Math.round(b.x)
+    && Math.round(a.y) === Math.round(b.y)
+    && roundedScale(a.scaleX) === roundedScale(b.scaleX)
+    && roundedScale(a.scaleY) === roundedScale(b.scaleY);
 }
 
 function persistPosition(id: string, point: OverlayPosition): void {
+  const next: OverlayPosition = {
+    x: Math.round(point.x),
+    y: Math.round(point.y),
+  };
+  if (point.scaleX !== undefined) next.scaleX = point.scaleX;
+  if (point.scaleY !== undefined) next.scaleY = point.scaleY;
+
   local.overlayPositions = {
     ...(local.overlayPositions || {}),
-    [id]: {
-      x: Math.round(point.x),
-      y: Math.round(point.y),
-    },
+    [id]: next,
   };
   saveLocalState();
 }
@@ -135,7 +191,7 @@ export function useDraggableOverlay<T extends HTMLElement>({
       const el = surfaceRef.current;
       if (!el) return;
       const rect = el.getBoundingClientRect();
-      const next = clampPosition(saved, { width: rect.width, height: rect.height }, clampMargin);
+      const next = resolvePosition(saved, { width: rect.width, height: rect.height }, clampMargin);
       positionRef.current = next;
       setPosition(next);
       applyPosition(next);
@@ -148,21 +204,28 @@ export function useDraggableOverlay<T extends HTMLElement>({
   useEffect(() => {
     if (!enabled) return;
 
-    const onResize = (): void => {
+    const syncPosition = (): void => {
       const current = positionRef.current;
       const el = surfaceRef.current;
       if (!current || !el) return;
       const rect = el.getBoundingClientRect();
-      const next = clampPosition(current, { width: rect.width, height: rect.height }, clampMargin);
+      const next = resolvePosition(current, { width: rect.width, height: rect.height }, clampMargin);
       positionRef.current = next;
       setPosition(next);
       applyPosition(next);
       if (!positionsMatch(current, next)) persistPosition(id, next);
     };
-    const handleResize = (): void => onResize();
+    const handleResize = (): void => syncPosition();
 
     window.addEventListener('resize', handleResize);
-    return () => window.removeEventListener('resize', handleResize);
+    const resizeObserver = typeof ResizeObserver !== 'undefined'
+      ? new ResizeObserver(() => syncPosition())
+      : null;
+    if (surfaceRef.current) resizeObserver?.observe(surfaceRef.current);
+    return () => {
+      window.removeEventListener('resize', handleResize);
+      resizeObserver?.disconnect();
+    };
   }, [applyPosition, clampMargin, enabled, id]);
 
   useEffect(() => {
@@ -185,12 +248,13 @@ export function useDraggableOverlay<T extends HTMLElement>({
     cleanupDragRef.current = null;
 
     const rect = el.getBoundingClientRect();
-    const origin = clampPosition({ x: rect.left, y: rect.top }, { width: rect.width, height: rect.height }, clampMargin);
+    const size = { width: rect.width, height: rect.height };
+    const origin = withScales({ x: rect.left, y: rect.top }, size, clampMargin);
     dragRef.current = {
       startClientX: event.clientX,
       startClientY: event.clientY,
       origin,
-      size: { width: rect.width, height: rect.height },
+      size,
     };
     positionRef.current = origin;
     setPosition(origin);
@@ -227,10 +291,10 @@ export function useDraggableOverlay<T extends HTMLElement>({
     const onPointerMove = (moveEvent: PointerEvent): void => {
       const drag = dragRef.current;
       if (!drag) return;
-      const next = clampPosition({
+      const next = withScales({
         x: drag.origin.x + moveEvent.clientX - drag.startClientX,
         y: drag.origin.y + moveEvent.clientY - drag.startClientY,
-      }, drag.size, clampMargin);
+      }, drag.size, clampMargin, drag.origin);
       queuePosition(next);
     };
 

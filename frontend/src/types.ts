@@ -871,6 +871,8 @@ export interface ShortcutBinding {
 export interface OverlayPosition {
   x: number;
   y: number;
+  scaleX?: number;
+  scaleY?: number;
 }
 
 export interface LocalPrefs {
