@@ -32,7 +32,13 @@ const CreateOverlay = createRouteLoader(
 );
 
 const AccountsRoute = createRouteLoader(
-  async () => (await import('./views/accounts/AccountsView')).AccountsView,
+  async () => {
+    const view = import('./views/accounts/AccountsView');
+    void import('./views/accounts/skin-three-loader')
+      .then((module) => module.preloadSkinRenderer())
+      .catch(() => {});
+    return (await view).AccountsView;
+  },
 );
 
 const SettingsRoute = createRouteLoader(

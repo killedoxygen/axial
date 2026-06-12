@@ -60,6 +60,7 @@ button.cp-skin-nametag--editable:focus-visible {
 .cp-skin-three__status {
   position: absolute;
   inset: 0;
+  z-index: 1;
   display: grid;
   place-items: center;
   padding: 12px;

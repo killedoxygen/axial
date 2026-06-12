@@ -1,11 +1,10 @@
 import type { JSX } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { api, apiResourceUrl, apiUrl } from '../../api';
-import { Button, IconButton, Input, Segmented } from '../../ui/Atoms';
-import { openContextMenu, type ContextMenuItem } from '../../ui/ContextMenu';
+import { Button, Input } from '../../ui/Atoms';
+import type { ContextMenuItem } from '../../ui/ContextMenu';
 import { showConfirm } from '../../ui/Dialog';
 import { Icon } from '../../ui/Icons';
-import { Modal, ModalContent, ModalHeader, ModalTitle } from '../../ui/Modal';
 import { onNativeDragDrop, pickNativeSkinFile, readNativeSkinFile, type NativeDragDropPayload } from '../../native';
 import { clampPlayerNameInput } from '../../player-name';
 import { resetSelectedSkin, setSelectedSkin } from '../../player-skin';
@@ -27,9 +26,7 @@ import {
   fetchSavedSkinPng,
   isPngFile,
   isPngPath,
-  lookupCapeFileUrl,
   lookupMinecraftSkin,
-  lookupSkinFileUrl,
   nativeDragPositionHitsElement,
   nativeDragTargetElement,
   normalizeSkinUpload,
@@ -51,8 +48,10 @@ import {
 import { CapePicker } from './CapePicker';
 import { DEFAULT_SKINS, type DefaultSkin } from '../../default-skins';
 import { useSavedSkins } from './hooks';
-import { skinSnapshot } from './skin-snapshot';
-import { SkinThreePreview } from './SkinThreePreview';
+import { SkinStage } from './SkinStage';
+import { SkinEditDialog } from './SkinEditDialog';
+import { DefaultSkinTile, ProfileSkinTile, SavedSkinTile } from './SkinTiles';
+import { SkinUploadDialog } from './SkinUploadDialog';
 import {
   NO_CAPE_VALUE,
   type MinecraftProfile,
@@ -226,6 +225,9 @@ export function SavedSkinLibrary({
   const trimmedEditName = editName.trim();
   const lookupUsernameError = trimmedLookupUsername ? validateUsername(trimmedLookupUsername) : null;
   const profileSkinFileSrc = profileSkin ? apiResourceUrl('/skin/profile/file') : undefined;
+  const profileSkinIdentity = profileSkin && minecraftProfile
+    ? `profile:${minecraftProfile.id}:${profileSkin.id}:${profileSkin.url}`
+    : undefined;
   const canUpload = !busy && !profileBusy && !profileResetBusy && !profileCapeResetBusy && !lookupBusy;
   const canSaveProfileSkin = onlineReady && Boolean(profileSkin) && !busy && !profileBusy && !profileResetBusy && !profileCapeResetBusy && !lookupBusy;
   const canResetProfileSkin = onlineReady && Boolean(profileSkin) && !busy && !profileBusy && !profileResetBusy && !profileCapeResetBusy && !lookupBusy;
@@ -308,7 +310,6 @@ export function SavedSkinLibrary({
   };
   const stagedCapeSelected = stagedCapeId !== NO_CAPE_VALUE;
   const stagedCapeSrc = capeSrcForId(stagedCapeSelected ? stagedCapeId : null);
-
   const clearStagedUpload = (): void => {
     stagedUploadTokenRef.current += 1;
     if (stagedUploadUrlRef.current) {
@@ -344,8 +345,7 @@ export function SavedSkinLibrary({
 
   useEffect(() => {
     let active = true;
-    const timer = window.setTimeout(() => {
-      void defaultSkinTextureKeys()
+    void defaultSkinTextureKeys()
       .then((keys) => {
         if (active) {
           setDefaultKeyById(keys);
@@ -353,10 +353,8 @@ export function SavedSkinLibrary({
         }
       })
       .catch(() => {});
-    }, 700);
     return () => {
       active = false;
-      window.clearTimeout(timer);
     };
   }, []);
 
@@ -1454,269 +1452,52 @@ export function SavedSkinLibrary({
         }}
       />
 
-      <section class="cp-skinstage" aria-label="Skin preview">
-        {lookupPreview ? (
-          <>
-            <SkinThreePreview
-              src={lookupSkinFileUrl(lookupPreview)}
-              capeSrc={lookupCapeFileUrl(lookupPreview)}
-              name={lookupPreview.username}
-              nametag={lookupPreview.username}
-              variant={lookupVariant}
-              side="front"
-              showOuterLayers
-            />
-            <div class="cp-skinstage__caption">{lookupPreview.username}'s current skin</div>
-            <div class="cp-skinstage__actions">
-              <Button
-                variant="ghost"
-                icon="x"
-                disabled={lookupBusy}
-                onClick={dismissLookup}
-                title="Stop previewing this player skin"
-              >
-                Dismiss
-              </Button>
-              {onlineReady ? (
-                <>
-                  <Button
-                    variant="secondary"
-                    icon={lookupBusy ? 'refresh' : 'download'}
-                    disabled={!canSaveLookupSkin}
-                    onClick={() => void saveUsernameSkin(false)}
-                    title="Keep a copy in your library without wearing it"
-                  >
-                    Save
-                  </Button>
-                  <Button
-                    variant="primary"
-                    icon={lookupBusy ? 'refresh' : 'check'}
-                    disabled={!canSaveLookupSkin}
-                    onClick={() => void saveUsernameSkin(true)}
-                    title="Save to your library and wear this skin"
-                    sound="affirm"
-                  >
-                    Apply
-                  </Button>
-                </>
-              ) : (
-                <Button
-                  variant="primary"
-                  icon={lookupBusy ? 'refresh' : 'download'}
-                  disabled={!canSaveLookupSkin}
-                  onClick={() => void saveUsernameSkin(false)}
-                  title="Keep a copy in your library"
-                  sound="affirm"
-                >
-                  Save
-                </Button>
-              )}
-            </div>
-          </>
-        ) : stageDefaultSkin ? (
-          <>
-            <SkinThreePreview
-              src={stageDefaultSkin.src}
-              name={stageDefaultSkin.name}
-              nametag={stageNametag}
-              onNametagEdit={onRenameNametag}
-              variant={stageDefaultSkin.variant}
-              side="front"
-              showOuterLayers
-            />
-            <div class="cp-skinstage__caption">Minecraft default skin</div>
-            <div class="cp-skinstage__actions">
-              {selectedDefault && selectedDefault.id !== 'steve' && (
-                <Button
-                  variant="secondary"
-                  size="lg"
-                  icon="refresh"
-                  disabled={busy}
-                  onClick={resetPreview}
-                  title="Reset the account avatar to Steve"
-                >
-                  Reset
-                </Button>
-              )}
-              {onlineReady && (
-                <Button
-                  variant="primary"
-                  size="lg"
-                  icon={busy ? 'refresh' : 'check'}
-                  disabled={!canUpload}
-                  onClick={() => void applyDefaultSkin(stageDefaultSkin)}
-                  title="Wear this default skin on the active Minecraft account"
-                  sound="affirm"
-                >
-                  {busy ? 'Applying' : 'Apply'}
-                </Button>
-              )}
-            </div>
-          </>
-        ) : profilePreviewActive && minecraftProfile && profileSkin ? (
-          <>
-            <SkinThreePreview
-              src={profileSkinFileSrc ?? apiResourceUrl('/skin/profile/file')}
-              capeSrc={profileCape ? capeFileUrl(profileCape) : undefined}
-              name={minecraftProfile.name}
-              nametag={stageNametag}
-              onNametagEdit={onRenameNametag}
-              variant={profileSkinVariant}
-              side="front"
-              showOuterLayers
-            />
-            <div class="cp-skinstage__caption">Current Minecraft profile skin</div>
-            <div class="cp-skinstage__actions">
-              {selectedSkin && (
-                <Button
-                  variant="secondary"
-                  size="lg"
-                  icon="refresh"
-                  disabled={profileBusy}
-                  onClick={() => setPreviewExtra(null)}
-                  title="Return to your skin"
-                >
-                  Reset
-                </Button>
-              )}
-              <Button
-                variant="primary"
-                size="lg"
-                icon={profileBusy ? 'refresh' : 'download'}
-                disabled={!canSaveProfileSkin}
-                onClick={() => void saveProfileSkin()}
-                title="Keep a copy of this skin in your library"
-                sound="affirm"
-              >
-                Save
-              </Button>
-            </div>
-          </>
-        ) : selectedSkin ? (
-          <>
-            <SkinThreePreview
-              src={stageEditingSrc ?? savedSkinFileUrl(selectedSkin)}
-              capeSrc={selectedPreviewEditing ? editPreviewCapeSrc : capeSrcForId(selectedSkin.cape_id)}
-              name={selectedSkin.name}
-              nametag={stageNametag}
-              onNametagEdit={onRenameNametag}
-              variant={selectedPreviewEditing ? editVariant : selectedSkin.variant}
-              side="front"
-              showOuterLayers
-            />
-            <div class="cp-skinstage__actions">
-              {selectedQueued ? (
-                <>
-                  <Button
-                    variant="secondary"
-                    size="lg"
-                    icon={cancelPendingBusy ? 'refresh' : 'x'}
-                    disabled={cancelPendingBusy || flushBusy || applyKey !== null}
-                    onClick={() => void cancelPendingApply()}
-                    title="Cancel the queued skin change"
-                  >
-                    Cancel
-                  </Button>
-                  <Button
-                    variant="primary"
-                    size="lg"
-                    icon={flushBusy ? 'refresh' : 'check'}
-                    disabled={!onlineReady || flushBusy || cancelPendingBusy || applyKey !== null}
-                    onClick={() => void flushPendingApply()}
-                    title="Apply the queued skin change now"
-                    sound="affirm"
-                  >
-                    {flushBusy ? 'Applying' : 'Apply now'}
-                  </Button>
-                </>
-              ) : !selectedSkin.applied_at && !selectedPreviewEditing && onlineReady ? (
-                <>
-                  <Button
-                    variant="secondary"
-                    size="lg"
-                    icon="refresh"
-                    disabled={stageApplyBusy}
-                    onClick={resetPreview}
-                    title="Reset the account avatar to Steve"
-                  >
-                    Reset
-                  </Button>
-                  <Button
-                    variant="primary"
-                    size="lg"
-                    icon={stageApplyBusy ? 'refresh' : 'check'}
-                    disabled={stageApplyBusy || flushBusy || cancelPendingBusy}
-                    onClick={() => void applySkin(selectedSkin.texture_key)}
-                    title="Wear this skin on the active Minecraft account"
-                    sound="affirm"
-                  >
-                    {stageApplyBusy ? 'Applying' : 'Apply'}
-                  </Button>
-                </>
-              ) : !selectedPreviewEditing ? (
-                <>
-                  <Button
-                    variant="secondary"
-                    size="lg"
-                    icon="refresh"
-                    disabled={deleteKey === selectedSkin.texture_key}
-                    onClick={resetPreview}
-                    title="Reset the account avatar to Steve"
-                  >
-                    Reset
-                  </Button>
-                  <Button
-                    variant="secondary"
-                    size="lg"
-                    icon="edit"
-                    disabled={deleteKey === selectedSkin.texture_key}
-                    onClick={() => void startEdit(selectedSkin)}
-                  >
-                    Edit skin
-                  </Button>
-                </>
-              ) : null}
-            </div>
-          </>
-        ) : showProfileSelectedPreview && minecraftProfile && profileSkin ? (
-          <>
-            <SkinThreePreview
-              src={profileSkinFileSrc ?? apiResourceUrl('/skin/profile/file')}
-              capeSrc={profileCape ? capeFileUrl(profileCape) : undefined}
-              name={minecraftProfile.name}
-              nametag={stageNametag}
-              onNametagEdit={onRenameNametag}
-              variant={profileSkinVariant}
-              side="front"
-              showOuterLayers
-            />
-            <div class="cp-skinstage__caption">Current Minecraft profile skin</div>
-            <div class="cp-skinstage__actions">
-              <Button
-                variant="primary"
-                size="lg"
-                icon={profileBusy ? 'refresh' : 'download'}
-                disabled={!canSaveProfileSkin}
-                onClick={() => void saveProfileSkin()}
-                title="Keep a copy of this skin in your library"
-                sound="affirm"
-              >
-                Save
-              </Button>
-            </div>
-          </>
-        ) : (
-          <div class="cp-skinstage__empty">
-            <Icon name="image" size={28} color="var(--text-mute)" />
-            <span>{state === 'loading' ? 'Loading skins' : 'No skin selected yet'}</span>
-            {state !== 'loading' && (
-              <Button variant="secondary" icon="plus" disabled={!canUpload} onClick={() => openUploadPicker(false)}>
-                Add skin
-              </Button>
-            )}
-          </div>
-        )}
-      </section>
+      <SkinStage
+        state={state}
+        onlineReady={onlineReady}
+        lookupPreview={lookupPreview}
+        lookupVariant={lookupVariant}
+        lookupBusy={lookupBusy}
+        canSaveLookupSkin={canSaveLookupSkin}
+        onDismissLookup={dismissLookup}
+        onSaveUsernameSkin={(applyAfterSave) => void saveUsernameSkin(applyAfterSave)}
+        stageDefaultSkin={stageDefaultSkin}
+        selectedDefault={selectedDefault}
+        busy={busy}
+        canUpload={canUpload}
+        stageNametag={stageNametag}
+        onRenameNametag={onRenameNametag}
+        onResetPreview={resetPreview}
+        onApplyDefaultSkin={(skin) => void applyDefaultSkin(skin)}
+        profilePreviewActive={profilePreviewActive}
+        showProfileSelectedPreview={showProfileSelectedPreview}
+        minecraftProfile={minecraftProfile}
+        profileSkin={profileSkin}
+        profileCape={profileCape}
+        profileSkinFileSrc={profileSkinFileSrc}
+        profileSkinVariant={profileSkinVariant}
+        profileBusy={profileBusy}
+        canSaveProfileSkin={canSaveProfileSkin}
+        selectedSkin={selectedSkin}
+        selectedSkinCapeSrc={selectedSkin ? capeSrcForId(selectedSkin.cape_id) : undefined}
+        selectedQueued={selectedQueued}
+        selectedPreviewEditing={selectedPreviewEditing}
+        stageEditingSrc={stageEditingSrc}
+        editPreviewCapeSrc={editPreviewCapeSrc}
+        editVariant={editVariant}
+        stageApplyBusy={stageApplyBusy}
+        cancelPendingBusy={cancelPendingBusy}
+        flushBusy={flushBusy}
+        applyKey={applyKey}
+        deleteKey={deleteKey}
+        onReturnFromProfile={() => setPreviewExtra(null)}
+        onSaveProfileSkin={() => void saveProfileSkin()}
+        onCancelPendingApply={() => void cancelPendingApply()}
+        onFlushPendingApply={() => void flushPendingApply()}
+        onApplySkin={(textureKey) => void applySkin(textureKey)}
+        onStartEdit={(skin) => void startEdit(skin)}
+        onOpenUploadPicker={() => openUploadPicker(false)}
+      />
 
       <section
         ref={savedSkinsDropSurfaceRef}
@@ -1798,27 +1579,18 @@ export function SavedSkinLibrary({
               </button>
 
               {minecraftProfile && profileSkin && !showProfileSelectedPreview && (
-                <div class="cp-skin-tilewrap">
-                  <button
-                    type="button"
-                    class="cp-skin-tile"
-                    data-kind="profile"
-                    data-selected={profilePreviewActive ? 'true' : 'false'}
-                    aria-pressed={profilePreviewActive}
-                    onClick={viewProfileSkin}
-                    onContextMenu={(event) => openContextMenu(event, profileMenuItems)}
-                    title="Preview the current Minecraft profile skin"
-                  >
-                    <SkinSnapshotImg
-                      cacheKey={`profile:${minecraftProfile.id}:${profileSkinVariant}:${profileCape?.id ?? ''}`}
-                      src={profileSkinFileSrc ?? apiResourceUrl('/skin/profile/file')}
-                      variant={profileSkinVariant}
-                      capeSrc={profileCape ? capeFileUrl(profileCape) : undefined}
-                      alt={`${minecraftProfile.name} current profile skin`}
-                    />
-                    <span class="cp-skin-tile__label">Current profile</span>
-                  </button>
-                </div>
+                <ProfileSkinTile
+                  minecraftProfile={minecraftProfile}
+                  profileSkinId={profileSkin.id}
+                  profileSkinUrl={profileSkin.url}
+                  profileSkinFileSrc={profileSkinFileSrc}
+                  profileSkinVariant={profileSkinVariant}
+                  profileCape={profileCape}
+                  profileSkinIdentity={profileSkinIdentity}
+                  selected={profilePreviewActive}
+                  menuItems={profileMenuItems}
+                  onView={viewProfileSkin}
+                />
               )}
 
               {librarySkins.map((skin) => {
@@ -1846,50 +1618,17 @@ export function SavedSkinLibrary({
                 });
 
                 return (
-                  <div class="cp-skin-tilewrap" key={skin.texture_key}>
-                    <button
-                      type="button"
-                      class="cp-skin-tile"
-                      data-selected={selected ? 'true' : 'false'}
-                      aria-pressed={selected}
-                      disabled={deleting}
-                      onClick={() => void viewSavedSkin(skin.texture_key)}
-                      onContextMenu={tileMenuItems.length === 0
-                        ? undefined
-                        : (event) => openContextMenu(event, tileMenuItems)}
-                      title={skin.name}
-                    >
-                      <SkinSnapshotImg
-                        cacheKey={`${skin.texture_key}:${skin.variant}:${skin.cape_id ?? ''}`}
-                        src={savedSkinFileUrl(skin)}
-                        variant={skin.variant}
-                        capeSrc={capeSrcForId(skin.cape_id)}
-                        alt={`${skin.name} skin`}
-                      />
-                      {(queued || (applied && !selected)) && (
-                        <span
-                          class="cp-skin-tile__state"
-                          data-state={queued ? 'queued' : 'equipped'}
-                          title={queued ? 'Queued for apply' : 'Equipped on the Minecraft profile'}
-                        >
-                          <Icon name={queued ? 'refresh' : 'check'} size={11} stroke={2.4} />
-                        </span>
-                      )}
-                      <span class="cp-skin-tile__label">{skin.name}</span>
-                    </button>
-                    <span class="cp-skin-tilewrap__menu">
-                      <IconButton
-                        icon="dots"
-                        size={26}
-                        tooltip="Skin actions"
-                        disabled={tileMenuItems.length === 0}
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          openContextMenu(event, tileMenuItems);
-                        }}
-                      />
-                    </span>
-                  </div>
+                  <SavedSkinTile
+                    key={skin.texture_key}
+                    skin={skin}
+                    selected={selected}
+                    queued={queued}
+                    applied={applied}
+                    deleting={deleting}
+                    capeSrc={capeSrcForId(skin.cape_id)}
+                    menuItems={tileMenuItems}
+                    onView={() => void viewSavedSkin(skin.texture_key)}
+                  />
                 );
               })}
             </div>
@@ -1908,35 +1647,17 @@ export function SavedSkinLibrary({
                 || Boolean(!previewExtra && savedRecord && selectedSkin?.texture_key === savedRecord.texture_key);
               const queued = Boolean(savedRecord && pendingApplyKey === savedRecord.texture_key);
               const applied = Boolean(savedRecord?.applied_at);
-              return (
-                <button
-                  type="button"
-                  key={skin.id}
-                  class="cp-skin-tile cp-skin-tile--compact"
-                  data-selected={selected ? 'true' : 'false'}
-                  aria-pressed={selected}
-                  onClick={() => viewDefaultSkin(skin.id)}
-                  title={skin.name}
-                >
-                  <SkinSnapshotImg
-                    cacheKey={`default:${skin.id}`}
-                    src={skin.src}
-                    variant={skin.variant}
-                    alt={`${skin.name} default skin`}
+                return (
+                  <DefaultSkinTile
+                    key={skin.id}
+                    skin={skin}
+                    selected={selected}
+                    queued={queued}
+                    applied={applied}
+                    onView={() => viewDefaultSkin(skin.id)}
                   />
-                  {(queued || (applied && !selected)) && (
-                    <span
-                      class="cp-skin-tile__state"
-                      data-state={queued ? 'queued' : 'equipped'}
-                      title={queued ? 'Queued for apply' : 'Equipped on the Minecraft profile'}
-                    >
-                      <Icon name={queued ? 'refresh' : 'check'} size={11} stroke={2.4} />
-                    </span>
-                  )}
-                  <span class="cp-skin-tile__label">{skin.name}</span>
-                </button>
-              );
-            })}
+                );
+              })}
           </div>
         </section>
 
@@ -1957,322 +1678,65 @@ export function SavedSkinLibrary({
         )}
       </section>
 
-      <Modal
-        open={Boolean(stagedUpload)}
-        onOpenChange={(next) => {
-          if (!next && !busy) clearStagedUpload();
+      <SkinUploadDialog
+        stagedUpload={stagedUpload}
+        stagedVariant={stagedVariant}
+        stagedName={stagedName}
+        stagedCapeSrc={stagedCapeSrc}
+        stagedCapeId={stagedCapeId}
+        availableCapes={availableCapes}
+        skinName={skinName}
+        uploadVariant={uploadVariant}
+        busy={busy}
+        onlineReady={onlineReady}
+        stagedCanSave={stagedCanSave}
+        onClose={clearStagedUpload}
+        onSkinNameChange={(value) => {
+          setSkinName(value);
+          setMessage(null);
         }}
-      >
-        <ModalContent className="cp-skinedit-modal" aria-label="Add skin" aria-describedby={undefined}>
-          <ModalHeader>
-            <ModalTitle>Add skin</ModalTitle>
-          </ModalHeader>
-          {stagedUpload && stagedVariant && (
-            <div class="cp-skinedit">
-              <div class="cp-skinedit__preview">
-                <SkinThreePreview
-                  src={stagedSkinPreviewSrc(stagedUpload)}
-                  capeSrc={stagedCapeSrc}
-                  name={stagedName}
-                  variant={stagedVariant}
-                  side="front"
-                  showOuterLayers
-                />
-              </div>
-              <div class="cp-skinedit__form">
-                <label class="cp-skinedit__field">
-                  <span>Name</span>
-                  <Input
-                    value={skinName}
-                    onChange={(value) => {
-                      setSkinName(value.slice(0, 64));
-                      setMessage(null);
-                    }}
-                    placeholder={uploadSkinName(stagedUpload.file) || 'Skin name'}
-                  />
-                </label>
-                <div class="cp-skinedit__field">
-                  <span>Model</span>
-                  <Segmented<UploadSkinVariant>
-                    options={[
-                      { value: 'auto', label: 'Auto' },
-                      { value: 'classic', label: 'Classic' },
-                      { value: 'slim', label: 'Slim' },
-                    ]}
-                    value={uploadVariant}
-                    onChange={(value) => {
-                      setUploadVariant(value);
-                      setMessage(null);
-                    }}
-                  />
-                </div>
-                {availableCapes.length > 0 && (
-                  <div class="cp-skinedit__field">
-                    <span>Cape</span>
-                    <CapePicker
-                      capes={availableCapes}
-                      value={stagedCapeId}
-                      onChange={setStagedCapeId}
-                    />
-                  </div>
-                )}
-                {stagedUpload.normalizeStatus === 'error' ? (
-                  <div class="cp-skin-inline-err">
-                    {stagedUpload.normalizeError || 'This file is not a valid Minecraft skin.'}
-                  </div>
-                ) : stagedUpload.normalizeStatus === 'checking' ? (
-                  <div class="cp-skinedit__meta">Checking skin file...</div>
-                ) : null}
-              </div>
-              <div class="cp-skinedit__footer">
-                <Button variant="ghost" disabled={busy} onClick={clearStagedUpload}>
-                  Cancel
-                </Button>
-                <Button
-                  variant="secondary"
-                  icon={busy ? 'refresh' : 'download'}
-                  disabled={!stagedCanSave}
-                  onClick={() => saveStagedUpload(false)}
-                >
-                  Save
-                </Button>
-                <Button
-                  variant="primary"
-                  icon={busy ? 'refresh' : 'check'}
-                  disabled={!stagedCanSave || !onlineReady}
-                  onClick={() => saveStagedUpload(true)}
-                  title={onlineReady ? 'Save locally, then apply to the active Minecraft account' : 'Online Minecraft account required'}
-                  sound="affirm"
-                >
-                  Save & apply
-                </Button>
-              </div>
-            </div>
-          )}
-        </ModalContent>
-      </Modal>
+        onUploadVariantChange={(value) => {
+          setUploadVariant(value);
+          setMessage(null);
+        }}
+        onStagedCapeChange={setStagedCapeId}
+        onSave={saveStagedUpload}
+      />
 
-      <Modal
-        open={Boolean(editingSkin)}
-        onOpenChange={(next) => {
-          if (!next && editBusyKey === null) cancelEdit();
+      <SkinEditDialog
+        editingSkin={editingSkin}
+        editReplacement={editReplacement}
+        editReplacementDragActive={editReplacementDragActive}
+        editPreviewCapeSrc={editPreviewCapeSrc}
+        editName={editName}
+        trimmedEditName={trimmedEditName}
+        editVariant={editVariant}
+        editCapeId={editCapeId}
+        availableCapes={availableCapes}
+        editBusyKey={editBusyKey}
+        editDetectBusyKey={editDetectBusyKey}
+        editDetectError={editDetectError}
+        editReplacementReady={editReplacementReady}
+        editHasChanges={editingSkin ? savedSkinEditHasChanges(editingSkin) : false}
+        onlineReady={onlineReady}
+        deleteKey={deleteKey}
+        onClose={cancelEdit}
+        onEditReplacementDragEnter={handleEditReplacementDragEnter}
+        onEditReplacementDragOver={handleEditReplacementDragOver}
+        onEditReplacementDragLeave={handleEditReplacementDragLeave}
+        onEditReplacementDrop={handleEditReplacementDrop}
+        onEditNameChange={setEditName}
+        onEditVariantChange={(value) => {
+          setEditVariant(value);
+          setEditDetectError(null);
         }}
-      >
-        <ModalContent className="cp-skinedit-modal" aria-label="Edit skin" aria-describedby={undefined}>
-          <ModalHeader>
-            <ModalTitle>Edit skin</ModalTitle>
-          </ModalHeader>
-          {editingSkin && (
-            <div
-              class="cp-skinedit"
-              data-saved-skin-edit-drop-surface={editingSkin.texture_key}
-              data-saved-skin-edit-drop-state={editReplacementDragActive ? 'active' : 'idle'}
-              onDragEnter={handleEditReplacementDragEnter}
-              onDragOver={handleEditReplacementDragOver}
-              onDragLeave={handleEditReplacementDragLeave}
-              onDrop={handleEditReplacementDrop}
-            >
-              <div class="cp-skinedit__preview">
-                <SkinThreePreview
-                  src={editReplacement ? stagedSkinPreviewSrc(editReplacement) : savedSkinFileUrl(editingSkin)}
-                  capeSrc={editPreviewCapeSrc}
-                  name={trimmedEditName || editingSkin.name}
-                  variant={editVariant}
-                  side="front"
-                  showOuterLayers
-                />
-              </div>
-              <div class="cp-skinedit__form">
-                <label class="cp-skinedit__field">
-                  <span>Name</span>
-                  <Input
-                    value={editName}
-                    onChange={(value) => setEditName(value.slice(0, 64))}
-                    placeholder="Skin name"
-                  />
-                </label>
-                <div class="cp-skinedit__field">
-                  <span>Model</span>
-                  <div class="cp-skinedit__inline">
-                    <Segmented<SkinVariant>
-                      options={[
-                        { value: 'classic', label: 'Classic' },
-                        { value: 'slim', label: 'Slim' },
-                      ]}
-                      value={editVariant}
-                      onChange={(value) => {
-                        setEditVariant(value);
-                        setEditDetectError(null);
-                      }}
-                    />
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      icon={editDetectBusyKey === editingSkin.texture_key ? 'refresh' : 'search'}
-                      disabled={editBusyKey !== null || editDetectBusyKey !== null}
-                      onClick={() => void detectSavedSkinModel(editingSkin)}
-                      title="Detect the model from the skin texture"
-                    >
-                      Detect
-                    </Button>
-                  </div>
-                </div>
-                {availableCapes.length > 0 && (
-                  <div class="cp-skinedit__field">
-                    <span>Cape</span>
-                    <CapePicker
-                      capes={availableCapes}
-                      value={editCapeId}
-                      onChange={setEditCapeId}
-                    />
-                  </div>
-                )}
-                <div class="cp-skinedit__field">
-                  <span>Texture</span>
-                  <div class="cp-skinedit__inline">
-                    <Button
-                      variant="secondary"
-                      size="sm"
-                      icon="image"
-                      disabled={editBusyKey !== null || editDetectBusyKey !== null}
-                      onClick={openEditTexturePicker}
-                      title="Replace this skin PNG, or drop a file on this panel"
-                    >
-                      Replace PNG
-                    </Button>
-                    {editReplacement && (
-                      <>
-                        <span class="cp-skinedit__meta">
-                          {editReplacement.normalizeStatus === 'error'
-                            ? editReplacement.normalizeError || 'Skin validation failed.'
-                            : editReplacement.normalizeStatus === 'checking'
-                              ? 'Validating...'
-                              : 'Replacement ready'}
-                        </span>
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          icon="x"
-                          disabled={editBusyKey !== null}
-                          onClick={clearEditReplacement}
-                        >
-                          Remove
-                        </Button>
-                      </>
-                    )}
-                  </div>
-                </div>
-                {editDetectError && <div class="cp-skin-inline-err">{editDetectError}</div>}
-              </div>
-              <div class="cp-skinedit__footer">
-                {!editingSkin.applied_at && (
-                  <Button
-                    variant="ghost"
-                    icon="trash"
-                    disabled={editBusyKey !== null || deleteKey === editingSkin.texture_key}
-                    onClick={() => void confirmDeleteSkin(editingSkin)}
-                    style={{ marginRight: 'auto' }}
-                  >
-                    Delete
-                  </Button>
-                )}
-                <Button variant="ghost" disabled={editBusyKey !== null} onClick={cancelEdit}>
-                  Cancel
-                </Button>
-                <Button
-                  variant="secondary"
-                  icon={editBusyKey === editingSkin.texture_key ? 'refresh' : 'download'}
-                  disabled={
-                    editBusyKey !== null ||
-                    editDetectBusyKey !== null ||
-                    !editReplacementReady ||
-                    !savedSkinEditHasChanges(editingSkin) ||
-                    trimmedEditName.length === 0
-                  }
-                  onClick={() => void saveSkinMetadata(editingSkin.texture_key)}
-                >
-                  Save
-                </Button>
-                <Button
-                  variant="primary"
-                  icon={editBusyKey === editingSkin.texture_key ? 'refresh' : 'check'}
-                  disabled={
-                    editBusyKey !== null ||
-                    editDetectBusyKey !== null ||
-                    !editReplacementReady ||
-                    !savedSkinEditHasChanges(editingSkin) ||
-                    trimmedEditName.length === 0 ||
-                    !onlineReady
-                  }
-                  onClick={() => void saveSkinMetadata(editingSkin.texture_key, true)}
-                  title={onlineReady
-                    ? 'Save changes, then apply to the active Minecraft account'
-                    : 'Online Minecraft account required'}
-                  sound="affirm"
-                >
-                  Save & apply
-                </Button>
-              </div>
-            </div>
-          )}
-        </ModalContent>
-      </Modal>
+        onEditCapeChange={setEditCapeId}
+        onDetectModel={(skin) => void detectSavedSkinModel(skin)}
+        onOpenTexturePicker={openEditTexturePicker}
+        onClearEditReplacement={clearEditReplacement}
+        onDelete={(skin) => void confirmDeleteSkin(skin)}
+        onSave={(textureKey, applyAfterSave) => void saveSkinMetadata(textureKey, applyAfterSave)}
+      />
     </div>
-  );
-}
-
-function SkinSnapshotImg({
-  cacheKey,
-  src,
-  variant,
-  capeSrc,
-  alt,
-}: {
-  cacheKey: string;
-  src: string;
-  variant: SkinVariant;
-  capeSrc?: string;
-  alt: string;
-}): JSX.Element {
-  const [url, setUrl] = useState<string | null>(null);
-  const [backUrl, setBackUrl] = useState<string | null>(null);
-
-  useEffect(() => {
-    let active = true;
-    setUrl(null);
-    setBackUrl(null);
-    skinSnapshot(cacheKey, src, variant, capeSrc)
-      .then((nextUrl) => {
-        if (!active) return null;
-        setUrl(nextUrl);
-        return skinSnapshot(cacheKey, src, variant, capeSrc, 'back');
-      })
-      .then((nextBackUrl) => {
-        if (active && nextBackUrl) setBackUrl(nextBackUrl);
-      })
-      .catch(() => {
-        if (active) setBackUrl(null);
-      });
-    return () => {
-      active = false;
-    };
-  }, [cacheKey, src, variant, capeSrc]);
-
-  if (!url) {
-    return <span class="cp-skin-tile__img" data-snapshot="loading" aria-hidden="true" />;
-  }
-  return (
-    <span class="cp-skin-tile__flip" data-back={backUrl ? 'ready' : 'none'}>
-      <img class="cp-skin-tile__img" src={url} alt={alt} draggable={false} />
-      {backUrl && (
-        <img
-          class="cp-skin-tile__img cp-skin-tile__img--back"
-          src={backUrl}
-          alt=""
-          aria-hidden="true"
-          draggable={false}
-        />
-      )}
-    </span>
   );
 }
