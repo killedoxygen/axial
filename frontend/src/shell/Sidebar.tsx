@@ -1,5 +1,5 @@
 import type { JSX } from 'preact';
-import { useEffect, useRef, useState } from 'preact/hooks';
+import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { InstanceTile } from '../ui/InstanceVisual';
 import { Icon } from '../ui/Icons';
 import { Logo } from '../ui/Logo';
@@ -77,42 +77,87 @@ function RailButton({ icon, label, target, accent, tooltip }: {
 
 function RailInstances({ tooltip }: { tooltip: RailTooltipController }): JSX.Element | null {
   const current = route.value;
+  const listRef = useRef<HTMLDivElement>(null);
+  const [scrollCue, setScrollCue] = useState({ top: false, bottom: false });
   const list = [...instances.value]
     .sort((a, b) => recentTime(b) - recentTime(a) || a.name.localeCompare(b.name));
+  const updateScrollCue = useCallback(() => {
+    const node = listRef.current;
+    if (!node) {
+      setScrollCue({ top: false, bottom: false });
+      return;
+    }
+
+    const scrollable = node.scrollHeight > node.clientHeight + 1;
+    const next = {
+      top: scrollable && node.scrollTop > 2,
+      bottom: scrollable && node.scrollTop < node.scrollHeight - node.clientHeight - 2,
+    };
+    setScrollCue(currentCue => (
+      currentCue.top === next.top && currentCue.bottom === next.bottom ? currentCue : next
+    ));
+  }, []);
+
+  useEffect(() => {
+    updateScrollCue();
+    const node = listRef.current;
+    if (!node) return undefined;
+
+    let resizeObserver: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== 'undefined') {
+      resizeObserver = new ResizeObserver(updateScrollCue);
+      resizeObserver.observe(node);
+    }
+
+    window.addEventListener('resize', updateScrollCue);
+    return () => {
+      resizeObserver?.disconnect();
+      window.removeEventListener('resize', updateScrollCue);
+    };
+  }, [list.length, updateScrollCue]);
+
   if (list.length === 0) return null;
   return (
     <>
       <div class="cp-rail-sep" aria-hidden="true" />
-      <div class="cp-rail-instances">
-        {list.map(inst => {
-          const active = current.name === 'instance' && current.id === inst.id;
-          const running = !!runningSessions.value[inst.id];
-          const version = versions.value.find(v => v.id === inst.version_id);
-          const install = instanceInstallStatus(inst, version);
-          const installing = install.installing;
-          const installLabel = install.state === 'queued' ? 'Install queued' : 'Installing';
-          return (
-            <button
-              key={inst.id}
-              class="cp-rail-tile"
-              data-active={active}
-              data-running={running}
-              data-installing={installing}
-              onClick={() => { tooltip.hide(); navigate({ name: 'instance', id: inst.id }); }}
-              onContextMenu={(e) => { tooltip.hide(); openInstanceContextMenu(e, inst); }}
-              aria-label={installing ? `${inst.name}: ${installLabel}` : inst.name}
-              {...railTipAttrs(installing ? `${inst.name} · ${installLabel}` : inst.name, tooltip)}
-            >
-              <InstanceTile inst={inst} radius={12} className="cp-rail-tile-art" />
-              {installing && (
-                <span class="cp-rail-tile-install" aria-hidden="true">
-                  <Icon name={install.state === 'queued' ? 'clock' : 'download'} size={10} stroke={2.4} />
-                </span>
-              )}
-              {running && <span class="cp-rail-tile-dot" aria-hidden="true" />}
-            </button>
-          );
-        })}
+      <div
+        class="cp-rail-instances-shell"
+        data-rail-instances-fade-top={scrollCue.top ? 'visible' : 'hidden'}
+        data-rail-instances-fade-bottom={scrollCue.bottom ? 'visible' : 'hidden'}
+      >
+        <div class="cp-rail-instances" ref={listRef} onScroll={updateScrollCue}>
+          {list.map(inst => {
+            const active = current.name === 'instance' && current.id === inst.id;
+            const running = !!runningSessions.value[inst.id];
+            const version = versions.value.find(v => v.id === inst.version_id);
+            const install = instanceInstallStatus(inst, version);
+            const installing = install.installing;
+            const installLabel = install.state === 'queued' ? 'Install queued' : 'Installing';
+            return (
+              <button
+                key={inst.id}
+                class="cp-rail-tile"
+                data-active={active}
+                data-running={running}
+                data-installing={installing}
+                onClick={() => { tooltip.hide(); navigate({ name: 'instance', id: inst.id }); }}
+                onContextMenu={(e) => { tooltip.hide(); openInstanceContextMenu(e, inst); }}
+                aria-label={installing ? `${inst.name}: ${installLabel}` : inst.name}
+                {...railTipAttrs(installing ? `${inst.name} · ${installLabel}` : inst.name, tooltip)}
+              >
+                <InstanceTile inst={inst} radius={12} className="cp-rail-tile-art" />
+                {installing && (
+                  <span class="cp-rail-tile-install" aria-hidden="true">
+                    <Icon name={install.state === 'queued' ? 'clock' : 'download'} size={10} stroke={2.4} />
+                  </span>
+                )}
+                {running && <span class="cp-rail-tile-dot" aria-hidden="true" />}
+              </button>
+            );
+          })}
+        </div>
+        <span class="cp-rail-instances-fade cp-rail-instances-fade--top" aria-hidden="true" />
+        <span class="cp-rail-instances-fade cp-rail-instances-fade--bottom" aria-hidden="true" />
       </div>
     </>
   );
