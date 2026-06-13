@@ -13,6 +13,11 @@ use thiserror::Error;
 use tokio::process::Command;
 use zip::ZipArchive;
 
+#[cfg(not(test))]
+const MAX_INSTALLER_DATA_ENTRY_BYTES: u64 = 128 << 20;
+#[cfg(test)]
+const MAX_INSTALLER_DATA_ENTRY_BYTES: u64 = 1024;
+
 #[derive(Debug, Error)]
 pub enum ProcessorError {
     #[error("invalid install profile json: {0}")]
@@ -305,12 +310,20 @@ fn extract_from_installer_jar(
     let mut file = archive
         .by_name(entry_path)
         .map_err(|_| ProcessorError::Command(format!("extracting {entry_path} from installer")))?;
+    if file.size() > MAX_INSTALLER_DATA_ENTRY_BYTES {
+        return Err(oversized_installer_entry_error(entry_path));
+    }
     let destination = temp_dir.join(destination_path);
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
     }
     let mut output = fs::File::create(&destination)?;
-    std::io::copy(&mut file, &mut output)?;
+    let mut bounded = (&mut file).take(MAX_INSTALLER_DATA_ENTRY_BYTES + 1);
+    let copied = std::io::copy(&mut bounded, &mut output)?;
+    if copied > MAX_INSTALLER_DATA_ENTRY_BYTES {
+        let _ = fs::remove_file(&destination);
+        return Err(oversized_installer_entry_error(entry_path));
+    }
     Ok(destination)
 }
 
@@ -340,6 +353,10 @@ fn safe_installer_entry_path(entry_path: &str) -> Result<PathBuf, ProcessorError
 
 fn unsafe_installer_entry_error(entry_path: &str) -> ProcessorError {
     ProcessorError::Command(format!("unsafe installer entry path: {entry_path}"))
+}
+
+fn oversized_installer_entry_error(entry_path: &str) -> ProcessorError {
+    ProcessorError::Command(format!("installer entry too large: {entry_path}"))
 }
 
 async fn run_processor(
@@ -505,6 +522,8 @@ fn substitute_arg(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
 
     #[test]
     fn build_data_vars_rejects_unsafe_installer_entry_path() {
@@ -561,11 +580,56 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn build_data_vars_rejects_oversized_installer_entry() {
+        let root = test_root("oversized-installer-entry");
+        let mut data = HashMap::new();
+        data.insert(
+            "EXTRACTED".to_string(),
+            DataEntry {
+                client: "/large.bin".to_string(),
+            },
+        );
+        let installer = zip_with_entry(
+            "large.bin",
+            vec![b'x'; (MAX_INSTALLER_DATA_ENTRY_BYTES + 1) as usize],
+        );
+
+        let error = build_data_vars(
+            &data,
+            &root,
+            "1.20.1",
+            &installer,
+            &root,
+            &root.join("installer.jar"),
+        )
+        .expect_err("oversized installer entry should fail");
+
+        assert!(
+            matches!(error, ProcessorError::Command(message) if message.contains("installer entry too large"))
+        );
+        assert!(!root.join("large.bin").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn empty_zip() -> Vec<u8> {
         let mut cursor = std::io::Cursor::new(Vec::new());
         zip::ZipWriter::new(&mut cursor)
             .finish()
             .expect("finish empty zip");
+        cursor.into_inner()
+    }
+
+    fn zip_with_entry(name: &str, bytes: Vec<u8>) -> Vec<u8> {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut cursor);
+            writer
+                .start_file(name, SimpleFileOptions::default())
+                .expect("start zip file");
+            writer.write_all(&bytes).expect("write zip file");
+            writer.finish().expect("finish zip");
+        }
         cursor.into_inner()
     }
 

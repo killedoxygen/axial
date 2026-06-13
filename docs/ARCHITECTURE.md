@@ -210,7 +210,7 @@ flowchart TD
     F --> G[frontend refreshes versions/catalog/instance state]
 ```
 
-Loader installs resolve strategy data in `core/minecraft/src/loaders/strategies/`. Installer jars, legacy archives, and profile JSON sources are cached under `cache/loaders/artifacts/<component>/<minecraft-version>/` with temp-file promotion before use. Fabric/Quilt profile JSON caches are parsed as the current `LoaderProfileFragment` shape before reuse; corrupt cached profiles are removed and replaced from the provider, while invalid fresh provider profiles are rejected without being cached.
+Loader installs resolve strategy data in `core/minecraft/src/loaders/strategies/`. Installer jars, legacy archives, and profile JSON sources are cached under `cache/loaders/artifacts/<component>/<minecraft-version>/` with temp-file promotion before use. Fabric/Quilt profile JSON caches are parsed as the current `LoaderProfileFragment` shape before reuse; corrupt cached profiles are removed and replaced from the provider, while invalid fresh provider profiles are rejected without being cached. Forge/NeoForge installer parsing runs through bounded blocking extraction: profile JSON entries, embedded Maven entries, and processor data entries have explicit decompressed-size ceilings before they can become memory buffers or extracted files.
 
 ### Version and lifecycle pipeline
 ```mermaid

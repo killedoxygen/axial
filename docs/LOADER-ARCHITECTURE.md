@@ -194,6 +194,7 @@ Responsibility:
 - `api.rs`: component ids, build ids, version-id inference
 - `types.rs`: normalized types and errors
 - helper modules: install artifacts, work dirs, composition, legacy behavior, processors
+- `forge_installer.rs` and `processors.rs`: parse installer ZIPs through bounded blocking work, with explicit decompressed-entry ceilings for profile JSON, embedded Maven libraries, and processor data extraction
 
 ## Selection flow
 
