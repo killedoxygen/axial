@@ -1996,7 +1996,11 @@ mod tests {
                 None,
             )
             .expect("add instance");
-        let mods_dir = fixture.state.instances().game_dir(&instance.id).join("mods");
+        let mods_dir = fixture
+            .state
+            .instances()
+            .game_dir(&instance.id)
+            .join("mods");
         fs::create_dir_all(&mods_dir).expect("create mods dir");
 
         let (status, Json(body)) = handle_update_instance_mod(
@@ -2069,7 +2073,11 @@ mod tests {
                 None,
             )
             .expect("add instance");
-        let mods_dir = fixture.state.instances().game_dir(&instance.id).join("mods");
+        let mods_dir = fixture
+            .state
+            .instances()
+            .game_dir(&instance.id)
+            .join("mods");
         fs::create_dir_all(&mods_dir).expect("create mods dir");
         fs::write(mods_dir.join("delete.jar"), "deleted").expect("write deleted mod");
         fs::write(mods_dir.join("keep.jar"), "kept").expect("write kept mod");
