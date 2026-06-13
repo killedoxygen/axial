@@ -29,11 +29,10 @@ pub(crate) fn tokenize_version_id(value: &str) -> Vec<VersionToken> {
                 .as_ref()
                 .is_some_and(|kind| !same_group(kind, &next_kind))
                 && !current.is_empty()
+                && let Some(kind) = current_kind.take()
             {
-                if let Some(kind) = current_kind.take() {
-                    tokens.push(build_token(kind, &current));
-                    current.clear();
-                }
+                tokens.push(build_token(kind, &current));
+                current.clear();
             }
 
             current.push(ch);

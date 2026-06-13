@@ -178,14 +178,12 @@ impl ModrinthClient {
             }
         };
 
-        if !expected_sha512.trim().is_empty() {
-            if !actual.eq_ignore_ascii_case(expected_sha512) {
-                let _ = tokio::fs::remove_file(temp_path).await;
-                return Err(ModrinthError::HashMismatch {
-                    expected: expected_sha512.to_string(),
-                    actual,
-                });
-            }
+        if !expected_sha512.trim().is_empty() && !actual.eq_ignore_ascii_case(expected_sha512) {
+            let _ = tokio::fs::remove_file(temp_path).await;
+            return Err(ModrinthError::HashMismatch {
+                expected: expected_sha512.to_string(),
+                actual,
+            });
         }
         Ok(())
     }

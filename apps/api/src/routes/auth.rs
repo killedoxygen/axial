@@ -543,10 +543,8 @@ async fn clear_active_auth_and_pending_skin_apply(
 ) -> Result<bool, ()> {
     let active_login_id = active_minecraft_login_id(login_store).await;
     let cleared = login_store.clear_active_auth().await.map_err(|_| ())?;
-    if cleared {
-        if let Some(login_id) = active_login_id {
-            super::skin::clear_pending_saved_skin_apply_for_login_id(&login_id).await;
-        }
+    if cleared && let Some(login_id) = active_login_id {
+        super::skin::clear_pending_saved_skin_apply_for_login_id(&login_id).await;
     }
     Ok(cleared)
 }
@@ -834,10 +832,10 @@ pub(crate) async fn refresh_active_auth_for_config(
     };
 
     let _refresh_guard = login_store.active_auth_refresh_guard().await;
-    if login_store.active_auth_generation() != initial_generation {
-        if let Some(success) = active_auth_refresh_success_from_store(login_store).await {
-            return Ok(success);
-        }
+    if login_store.active_auth_generation() != initial_generation
+        && let Some(success) = active_auth_refresh_success_from_store(login_store).await
+    {
+        return Ok(success);
     }
     let Some(refresh_token) = login_store.active_msa_refresh_token().await else {
         return Err(AuthRefreshFailure::new(
@@ -1248,7 +1246,7 @@ fn bounded_remaining_seconds(session: &AuthLoginSession) -> u64 {
         return 0;
     }
 
-    (((remaining as u64) + 999) / 1000).min(session.expires_in)
+    (remaining as u64).div_ceil(1000).min(session.expires_in)
 }
 
 fn auth_login_error_response(error: AuthLoginError) -> (StatusCode, Json<serde_json::Value>) {

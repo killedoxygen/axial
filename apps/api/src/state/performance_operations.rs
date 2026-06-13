@@ -97,15 +97,14 @@ impl PerformanceOperationStore {
     ) -> Result<PerformanceOperationStatus, PerformanceOperationConflict> {
         let status = {
             let mut inner = self.inner.lock().await;
-            if let Some(existing_id) = inner.active_by_instance.get(&instance_id) {
-                if inner
+            if let Some(existing_id) = inner.active_by_instance.get(&instance_id)
+                && inner
                     .operations
                     .get(existing_id)
                     .map(|status| is_non_terminal(&status.state))
                     .unwrap_or(false)
-                {
-                    return Err(PerformanceOperationConflict);
-                }
+            {
+                return Err(PerformanceOperationConflict);
             }
 
             let id = generate_performance_operation_id();
@@ -154,12 +153,11 @@ impl PerformanceOperationStore {
         }
 
         let inner = self.inner.lock().await;
-        if let Some(active_id) = inner.active_by_instance.get(instance_id) {
-            if let Some(status) = inner.operations.get(active_id) {
-                if is_non_terminal(&status.state) {
-                    return Some(status.clone());
-                }
-            }
+        if let Some(active_id) = inner.active_by_instance.get(instance_id)
+            && let Some(status) = inner.operations.get(active_id)
+            && is_non_terminal(&status.state)
+        {
+            return Some(status.clone());
         }
 
         inner

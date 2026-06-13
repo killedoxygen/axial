@@ -897,7 +897,7 @@ async fn handle_launch_kill(
         .sessions()
         .kill(&id)
         .await
-        .map_err(|error| launch_kill_error_response(error))?;
+        .map_err(launch_kill_error_response)?;
 
     runner::trace_launch_event(&id, "kill requested by client");
     state
@@ -1749,10 +1749,10 @@ fn family_c_qualification_matching_proof<'a>(
     run: &crate::state::benchmark_suites::BenchmarkSuiteManifestRun,
     proofs: &'a [crate::state::launch_reports::LaunchProofRecord],
 ) -> Option<&'a crate::state::launch_reports::LaunchProofRecord> {
-    if let Some(session_id) = run.session_id.as_deref().and_then(trimmed_string) {
-        if let Some(proof) = proofs.iter().find(|proof| proof.session_id == session_id) {
-            return Some(proof);
-        }
+    if let Some(session_id) = run.session_id.as_deref().and_then(trimmed_string)
+        && let Some(proof) = proofs.iter().find(|proof| proof.session_id == session_id)
+    {
+        return Some(proof);
     }
 
     proofs.iter().find(|proof| {
@@ -2090,14 +2090,13 @@ async fn benchmark_suite_driver_decision(
         pending_run_index,
     );
 
-    if let Some(manifest) = input.manifest.as_ref() {
-        if let Some(active_session_id) = active_benchmark_suite_session_id(sessions, manifest).await
-        {
-            return Ok(BenchmarkSuiteDriverDecision::Active {
-                suite,
-                active_session_id,
-            });
-        }
+    if let Some(manifest) = input.manifest.as_ref()
+        && let Some(active_session_id) = active_benchmark_suite_session_id(sessions, manifest).await
+    {
+        return Ok(BenchmarkSuiteDriverDecision::Active {
+            suite,
+            active_session_id,
+        });
     }
 
     let Some(run_index) = pending_run_index else {

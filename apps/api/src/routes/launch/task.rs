@@ -344,9 +344,11 @@ async fn build_launch_preflight_facts(
         capture_launch_disk_evidence([library_dir, game_dir]),
         capture_launch_cpu_load_evidence(),
         host_cpu_threads(),
-        state.sessions().active_session_count().await,
-        state.installs().active_install_count().await,
-        state.sessions().active_memory_allocation_mb().await,
+        ActiveLaunchResourceUse {
+            session_count: state.sessions().active_session_count().await,
+            install_count: state.installs().active_install_count().await,
+            memory_allocation_mb: state.sessions().active_memory_allocation_mb().await,
+        },
         max_memory_mb,
     );
     let guardian_summary = guardian_summary_for_preflight(
@@ -627,11 +629,11 @@ fn capture_launch_cpu_load_evidence() -> LaunchCpuLoadEvidence {
     #[cfg(unix)]
     {
         let load = System::load_average();
-        return LaunchCpuLoadEvidence {
+        LaunchCpuLoadEvidence {
             host_cpu_load_1m_x100: load_to_x100(load.one),
             host_cpu_load_5m_x100: load_to_x100(load.five),
             host_cpu_load_15m_x100: load_to_x100(load.fifteen),
-        };
+        }
     }
 
     #[cfg(not(unix))]
@@ -671,14 +673,19 @@ fn host_cpu_threads() -> Option<usize> {
     std::thread::available_parallelism().ok().map(usize::from)
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ActiveLaunchResourceUse {
+    session_count: usize,
+    install_count: usize,
+    memory_allocation_mb: u64,
+}
+
 fn capture_resource_budget_snapshot(
     memory_evidence: LaunchMemoryEvidence,
     disk_evidence: LaunchDiskEvidence,
     cpu_load_evidence: LaunchCpuLoadEvidence,
     host_cpu_threads: Option<usize>,
-    active_session_count: usize,
-    active_install_count: usize,
-    active_memory_allocation_mb: u64,
+    active: ActiveLaunchResourceUse,
     requested_allocation_mb: i32,
 ) -> LaunchProofResourceBudget {
     let requested_memory_mb = positive_i32(requested_allocation_mb);
@@ -690,9 +697,9 @@ fn capture_resource_budget_snapshot(
             host_cpu_load_5m_x100: cpu_load_evidence.host_cpu_load_5m_x100,
             host_cpu_load_15m_x100: cpu_load_evidence.host_cpu_load_15m_x100,
         },
-        active_session_count,
-        active_install_count,
-        active_memory_allocation_mb,
+        active_session_count: active.session_count,
+        active_install_count: active.install_count,
+        active_memory_allocation_mb: active.memory_allocation_mb,
         requested_memory_mb,
         launch_disk_available_mb: disk_evidence.launch_disk_available_mb,
         memory_headroom_mb: LAUNCH_MEMORY_HEADROOM_MB,
@@ -707,13 +714,13 @@ fn capture_resource_budget_snapshot(
         host_cpu_load_5m_x100: cpu_load_evidence.host_cpu_load_5m_x100,
         host_cpu_load_15m_x100: cpu_load_evidence.host_cpu_load_15m_x100,
         launcher_process_memory_mb: memory_evidence.launcher_process_memory_mb,
-        active_session_count,
-        active_install_count,
-        active_memory_allocation_mb,
+        active_session_count: active.session_count,
+        active_install_count: active.install_count,
+        active_memory_allocation_mb: active.memory_allocation_mb,
         requested_memory_mb,
         estimated_remaining_memory_mb: estimated_remaining_memory_mb(
             memory_evidence.host_total_memory_mb,
-            active_memory_allocation_mb,
+            active.memory_allocation_mb,
             requested_memory_mb,
         ),
         memory_headroom_mb: LAUNCH_MEMORY_HEADROOM_MB,
@@ -2206,9 +2213,11 @@ mod tests {
                 host_cpu_load_15m_x100: Some(43),
             },
             Some(4),
-            1,
-            1,
-            3072,
+            ActiveLaunchResourceUse {
+                session_count: 1,
+                install_count: 1,
+                memory_allocation_mb: 3072,
+            },
             4096,
         );
 
@@ -2263,9 +2272,7 @@ mod tests {
                 ..LaunchCpuLoadEvidence::default()
             },
             Some(16),
-            0,
-            0,
-            0,
+            ActiveLaunchResourceUse::default(),
             4096,
         );
         assert!(cpu_load_pressured.cpu_pressure);
@@ -2907,9 +2914,11 @@ mod tests {
             LaunchDiskEvidence::default(),
             LaunchCpuLoadEvidence::default(),
             host_cpu_threads,
-            active_session_count,
-            active_install_count,
-            active_memory_allocation_mb,
+            ActiveLaunchResourceUse {
+                session_count: active_session_count,
+                install_count: active_install_count,
+                memory_allocation_mb: active_memory_allocation_mb,
+            },
             requested_memory_mb,
         )
     }
@@ -2919,9 +2928,7 @@ mod tests {
         disk_evidence: LaunchDiskEvidence,
         cpu_load_evidence: LaunchCpuLoadEvidence,
         host_cpu_threads: Option<usize>,
-        active_session_count: usize,
-        active_install_count: usize,
-        active_memory_allocation_mb: u64,
+        active: ActiveLaunchResourceUse,
         requested_memory_mb: i32,
     ) -> LaunchProofResourceBudget {
         capture_resource_budget_snapshot(
@@ -2929,9 +2936,7 @@ mod tests {
             disk_evidence,
             cpu_load_evidence,
             host_cpu_threads,
-            active_session_count,
-            active_install_count,
-            active_memory_allocation_mb,
+            active,
             requested_memory_mb,
         )
     }

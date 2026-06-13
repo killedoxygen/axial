@@ -550,7 +550,8 @@ impl PerformanceManager {
         let game_version = game_version.to_string();
         let instance_mods_dir = instance_mods_dir.to_path_buf();
         let previous_state = previous_state.cloned();
-        let mut installs = stream::iter(plan.mods.iter().cloned().map(|managed_mod| {
+        let managed_mods = plan.mods.iter().map(ManagedMod::clone);
+        let mut installs = stream::iter(managed_mods.map(|managed_mod| {
             let loader = loader.clone();
             let game_version = game_version.clone();
             let instance_mods_dir = instance_mods_dir.clone();
@@ -905,7 +906,7 @@ fn active_rules_write(active: &RwLock<ActiveRules>) -> RwLockWriteGuard<'_, Acti
 }
 
 fn managed_artifact_install_concurrency(mod_count: usize) -> usize {
-    mod_count.max(1).min(MANAGED_ARTIFACT_INSTALL_CONCURRENCY)
+    mod_count.clamp(1, MANAGED_ARTIFACT_INSTALL_CONCURRENCY)
 }
 
 fn managed_artifact_temp_path(final_path: &Path, managed_mod: &ManagedMod) -> PathBuf {
@@ -2750,13 +2751,10 @@ mod tests {
             .await
             .expect("cache failure should expose status");
         let warning = after.warnings.join("\n");
-        let synthetic = RulesRefreshError::Cache(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!(
-                "failed to persist {}",
-                root.join("local-path-secret/rules-cache.json").display()
-            ),
-        ));
+        let synthetic = RulesRefreshError::Cache(std::io::Error::other(format!(
+            "failed to persist {}",
+            root.join("local-path-secret/rules-cache.json").display()
+        )));
         let synthetic_warning = remote_rules_refresh_warning("failed", &synthetic);
 
         assert_eq!(after.rule_source, before.rule_source);

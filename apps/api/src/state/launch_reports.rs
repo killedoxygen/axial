@@ -24,6 +24,8 @@ const MAX_EXPORT_STAGES: usize = 32;
 // Conservative free-space warning threshold for launch caches, natives, and prewarm writes.
 pub const LAUNCH_DISK_HEADROOM_MB: u64 = 2048;
 
+type LaunchComparisonMetric = (&'static str, u64, fn(&LaunchProofRecord) -> Option<u64>);
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LaunchProofRecord {
@@ -810,7 +812,7 @@ fn launch_proof_outcome_is_comparable(outcome: &str) -> bool {
 
 fn launch_comparison_metric_for_current(
     current: &LaunchProofRecord,
-) -> Option<(&'static str, u64, fn(&LaunchProofRecord) -> Option<u64>)> {
+) -> Option<LaunchComparisonMetric> {
     if let Some(boot_duration_ms) = current.boot_duration_ms {
         return Some((
             LAUNCH_BOOT_COMPARISON_METRIC_NAME,
@@ -847,12 +849,12 @@ fn comparison_dimensions_match(current: &LaunchProofRecord, candidate: &LaunchPr
 }
 
 fn launch_modes_are_comparable(current: &LaunchProofRecord, candidate: &LaunchProofRecord) -> bool {
-    match (known_launch_mode(current), known_launch_mode(candidate)) {
-        (Some("managed"), Some("vanilla" | "managed")) => true,
-        (Some("vanilla"), Some("vanilla")) => true,
-        (Some("custom"), Some("custom")) => true,
-        _ => false,
-    }
+    matches!(
+        (known_launch_mode(current), known_launch_mode(candidate)),
+        (Some("managed"), Some("vanilla" | "managed"))
+            | (Some("vanilla"), Some("vanilla"))
+            | (Some("custom"), Some("custom"))
+    )
 }
 
 fn known_launch_mode(report: &LaunchProofRecord) -> Option<&str> {

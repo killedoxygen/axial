@@ -453,7 +453,7 @@ fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
 }
 
 fn lock_error() -> io::Error {
-    io::Error::new(io::ErrorKind::Other, "saved skin store lock poisoned")
+    io::Error::other("saved skin store lock poisoned")
 }
 
 #[cfg(test)]

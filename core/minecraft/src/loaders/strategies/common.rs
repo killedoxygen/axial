@@ -535,13 +535,13 @@ async fn read_or_download_cached_artifact(
     path: &Path,
     url: &str,
 ) -> Result<CachedArtifact, LoaderError> {
-    if path_is_file(path).await {
-        if let Some(bytes) = read_cached_artifact(path).await? {
-            return Ok(CachedArtifact {
-                bytes,
-                cache_hit: true,
-            });
-        }
+    if path_is_file(path).await
+        && let Some(bytes) = read_cached_artifact(path).await?
+    {
+        return Ok(CachedArtifact {
+            bytes,
+            cache_hit: true,
+        });
     }
 
     Ok(CachedArtifact {

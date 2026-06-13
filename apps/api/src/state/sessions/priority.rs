@@ -174,13 +174,10 @@ mod tests {
 
     #[test]
     fn priority_error_text_is_bounded_and_path_scrubbed() {
-        let error = io::Error::new(
-            io::ErrorKind::Other,
-            format!(
-                " /tmp\\secret\n{}",
-                "x".repeat(MAX_PRIORITY_ERROR_CHARS + 40)
-            ),
-        );
+        let error = io::Error::other(format!(
+            " /tmp\\secret\n{}",
+            "x".repeat(MAX_PRIORITY_ERROR_CHARS + 40)
+        ));
 
         let sanitized = sanitize_priority_error(&error).expect("sanitized error");
 

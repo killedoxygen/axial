@@ -240,9 +240,7 @@ fn normalized_version(version: &str) -> String {
 
 fn sane_release_page_url(url: &str, latest_version: &str) -> Option<String> {
     let trimmed = url.trim();
-    let Some(tag) = trimmed.strip_prefix(GITHUB_RELEASE_PAGE_TAG_PREFIX) else {
-        return None;
-    };
+    let tag = trimmed.strip_prefix(GITHUB_RELEASE_PAGE_TAG_PREFIX)?;
     if trimmed != url
         || tag.is_empty()
         || tag.contains(['/', '?', '#'])
@@ -319,9 +317,7 @@ fn release_asset_version_from_name(name: &str) -> Option<&str> {
 
 fn sane_release_asset_url(url: &str, expected_name: &str) -> Option<String> {
     let trimmed = url.trim();
-    let Some(download_path) = trimmed.strip_prefix(GITHUB_RELEASE_DOWNLOAD_PREFIX) else {
-        return None;
-    };
+    let download_path = trimmed.strip_prefix(GITHUB_RELEASE_DOWNLOAD_PREFIX)?;
     if trimmed != url {
         return None;
     }

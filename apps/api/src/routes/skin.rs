@@ -307,16 +307,16 @@ async fn handle_skin_profile(
     Query(query): Query<SkinQuery>,
 ) -> Result<Json<SkinProfileResponse>, (StatusCode, Json<serde_json::Value>)> {
     let config = state.config().current();
-    if query.username.is_none() {
-        if let Some(profile) = online_skin_profile(
+    if query.username.is_none()
+        && let Some(profile) = online_skin_profile(
             state
                 .auth_logins()
                 .active_current_minecraft_account_state()
                 .await
                 .map(|state| state.account),
-        ) {
-            return Ok(Json(profile));
-        }
+        )
+    {
+        return Ok(Json(profile));
     }
 
     let identity = select_offline_identity(query.username.as_deref(), &config.username)?;
@@ -2119,10 +2119,10 @@ impl MinecraftSkinUsernameClient {
         let key = self.lookup_cache_key(username, allowed_texture_prefix);
         let now = Instant::now();
         let mut cache = MINECRAFT_USERNAME_SKIN_CACHE.lock().await;
-        if let Some(entry) = cache.get(&key) {
-            if entry.expires_at > now {
-                return Some(entry.profile.clone());
-            }
+        if let Some(entry) = cache.get(&key)
+            && entry.expires_at > now
+        {
+            return Some(entry.profile.clone());
         }
         cache.remove(&key);
         None
@@ -2593,10 +2593,10 @@ impl MinecraftCapeSyncClient {
         profile: &AuthLoginMinecraftProfile,
         target_cape_id: Option<&str>,
     ) -> Result<Option<AuthLoginMinecraftProfile>, SkinCapeError> {
-        if let Some(cape_id) = target_cape_id {
-            if !profile.capes.iter().any(|cape| cape.id == cape_id) {
-                return Err(SkinCapeError::UnavailableCape);
-            }
+        if let Some(cape_id) = target_cape_id
+            && !profile.capes.iter().any(|cape| cape.id == cape_id)
+        {
+            return Err(SkinCapeError::UnavailableCape);
         }
         if active_minecraft_cape_id(profile).as_deref() == target_cape_id {
             return Ok(None);
@@ -8288,7 +8288,7 @@ mod tests {
             encoder.set_color(png::ColorType::Rgba);
             encoder.set_depth(png::BitDepth::Eight);
             let mut writer = encoder.write_header().expect("write png header");
-            writer.write_image_data(&rgba).expect("write png pixels");
+            writer.write_image_data(rgba).expect("write png pixels");
         }
         bytes
     }

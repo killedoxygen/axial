@@ -133,6 +133,7 @@ pub fn next_pending_run_index(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn persist_launched_run(
     paths: &AppPaths,
     suite_id: &str,
@@ -326,13 +327,7 @@ fn safe_stem(value: &str, max_chars: usize) -> Option<String> {
     let mut stem = value
         .trim()
         .chars()
-        .filter_map(|value| {
-            if value.is_ascii_alphanumeric() || matches!(value, '-' | '_') {
-                Some(value)
-            } else {
-                None
-            }
-        })
+        .filter(|value| value.is_ascii_alphanumeric() || matches!(value, '-' | '_'))
         .take(max_chars)
         .collect::<String>();
     stem = stem.trim_matches('_').to_string();

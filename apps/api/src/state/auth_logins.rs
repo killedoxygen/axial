@@ -303,7 +303,7 @@ impl AuthLoginStore {
     ) -> Option<AuthLoginMsaToken> {
         let now = Utc::now();
         let session = self.sessions.write().await.remove(login_id);
-        if !session.is_some_and(|session| session.expires_at > now) {
+        if session.is_none_or(|session| session.expires_at <= now) {
             return None;
         }
 
@@ -335,7 +335,7 @@ impl AuthLoginStore {
     ) -> Option<(AuthLoginMsaToken, AuthLoginMinecraftAccount)> {
         let now = Utc::now();
         let session = self.sessions.write().await.remove(login_id);
-        if !session.is_some_and(|session| session.expires_at > now) {
+        if session.is_none_or(|session| session.expires_at <= now) {
             return None;
         }
 
@@ -507,7 +507,7 @@ impl AuthLoginStore {
             return None;
         }
 
-        Some((((remaining as u64) + 999) / 1000).min(expires_in))
+        Some((remaining as u64).div_ceil(1000).min(expires_in))
     }
 
     pub async fn active_msa_refresh_token(&self) -> Option<String> {
@@ -545,7 +545,7 @@ impl AuthLoginStore {
 
         Some(ActiveMsaTokenState {
             token: token.as_ref()?.clone(),
-            token_expires_in: (((remaining as u64) + 999) / 1000).min(expires_in),
+            token_expires_in: (remaining as u64).div_ceil(1000).min(expires_in),
         })
     }
 
@@ -564,7 +564,7 @@ impl AuthLoginStore {
 
         Some(ActiveMinecraftAccountState {
             account: account.as_ref()?.clone(),
-            token_expires_in: (((remaining as u64) + 999) / 1000).min(expires_in),
+            token_expires_in: (remaining as u64).div_ceil(1000).min(expires_in),
         })
     }
 
@@ -599,18 +599,14 @@ impl AuthLoginStore {
         owns_minecraft_java: Option<bool>,
     ) -> Option<ActiveMinecraftAccountState> {
         let now = Utc::now();
-        let Some(token) = self.active_msa_token.read().await.clone() else {
-            return None;
-        };
+        let token = self.active_msa_token.read().await.clone()?;
         if token.expires_at <= now {
             return None;
         }
 
         let updated_account = {
             let mut active_account = self.active_minecraft_account.write().await;
-            let Some(account) = active_account.as_mut() else {
-                return None;
-            };
+            let account = active_account.as_mut()?;
             if account.login_id != login_id
                 || account.login_id != token.login_id
                 || account.authenticated_at < token.authenticated_at
@@ -716,6 +712,10 @@ impl AuthLoginStore {
         self.sessions.read().await.len()
     }
 
+    pub async fn is_empty(&self) -> bool {
+        self.sessions.read().await.is_empty()
+    }
+
     fn next_login_id(&self) -> String {
         let sequence = self.next_id.fetch_add(1, Ordering::Relaxed);
         let nanos = SystemTime::now()
@@ -769,7 +769,7 @@ fn remaining_seconds(expires_at: DateTime<Utc>, expires_in: u64) -> u64 {
         return 0;
     }
 
-    (((remaining as u64) + 999) / 1000).min(expires_in)
+    (remaining as u64).div_ceil(1000).min(expires_in)
 }
 
 fn load_active_snapshot(

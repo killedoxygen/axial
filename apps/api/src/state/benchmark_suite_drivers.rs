@@ -111,15 +111,14 @@ impl BenchmarkSuiteDriverStore {
     ) -> Result<BenchmarkSuiteDriverStart, BenchmarkSuiteDriverConflict> {
         let start = {
             let mut inner = self.inner.lock().await;
-            if let Some(existing_id) = inner.active_by_suite.get(&suite_id) {
-                if inner
+            if let Some(existing_id) = inner.active_by_suite.get(&suite_id)
+                && inner
                     .drivers
                     .get(existing_id)
                     .map(|entry| is_non_terminal(&entry.status.state))
                     .unwrap_or(false)
-                {
-                    return Err(BenchmarkSuiteDriverConflict);
-                }
+            {
+                return Err(BenchmarkSuiteDriverConflict);
             }
 
             inner.next_id = inner.next_id.saturating_add(1);
@@ -384,6 +383,12 @@ impl BenchmarkSuiteDriverStore {
                 "failed to persist benchmark suite driver status"
             );
         }
+    }
+}
+
+impl Default for BenchmarkSuiteDriverStore {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
