@@ -18,12 +18,27 @@ import type { Config, GuardianSummary, HealingEvent, Instance, LaunchHealingSumm
 
 const PRE_RESPONSE_STAGE_CAP_PCT = 87;
 const LIVE_LAUNCH_UPDATES_UNAVAILABLE = 'Live launch updates are unavailable.';
+const OFFLINE_LAUNCH_AVAILABLE_DETAIL = 'Offline launch remains available for singleplayer and offline-mode servers.';
 const PRE_RESPONSE_STAGE_TICKS: Array<{ atMs: number; stage: LaunchStage }> = [
   { atMs: 700, stage: 'preparing' },
   { atMs: 1800, stage: 'prewarming' },
   { atMs: 3400, stage: 'starting' },
   { atMs: 6200, stage: 'monitoring' },
 ];
+
+interface LaunchAuthFailurePayload {
+  error?: string;
+  failure_class?: string;
+  launch_auth_mode?: string;
+  online_mode_ready?: boolean;
+  auth_refresh_status?: string;
+  auth_refresh_reason?: string;
+}
+
+interface LaunchAuthFailureNotice {
+  message: string;
+  details: string[];
+}
 
 function rollbackLaunch(instanceId: string, animationFrameId: number | null): void {
   if (animationFrameId !== null) cancelAnimationFrame(animationFrameId);
@@ -245,6 +260,87 @@ function friendlyLaunchErrorDetail(message: string): string {
   return ensureSentence(detail);
 }
 
+function isSelectedOnlineAuthFailure(payload: unknown): payload is LaunchAuthFailurePayload {
+  if (!payload || typeof payload !== 'object') return false;
+  const candidate = payload as LaunchAuthFailurePayload;
+  return candidate.failure_class === 'auth_mode_incompatible'
+    || (candidate.launch_auth_mode === 'online' && candidate.online_mode_ready === false);
+}
+
+function compactTokenLabel(value: string | undefined): string {
+  return String(value || '').trim().toLowerCase();
+}
+
+function isSignInRequiredAuthRefresh(status: string, reason: string): boolean {
+  return status === 'sign_in_required'
+    || reason === 'refresh_token_missing'
+    || reason === 'refresh_token_rejected'
+    || reason === 'refresh_state_unavailable';
+}
+
+function authSignInRequiredDetail(reason: string): string {
+  switch (reason) {
+    case 'refresh_token_missing':
+      return 'Croopor could not refresh the Microsoft session because the saved sign-in is missing or expired.';
+    case 'refresh_token_rejected':
+      return 'Microsoft rejected the saved sign-in session.';
+    case 'refresh_state_unavailable':
+      return 'Croopor could not read the saved sign-in session.';
+    default:
+      return 'Croopor could not use the saved Microsoft session for Online launch.';
+  }
+}
+
+function authRefreshFailedDetail(status: string, reason: string): string {
+  switch (reason) {
+    case 'auth_chain_failed':
+      return 'Croopor refreshed Microsoft sign-in, but Minecraft account verification did not complete.';
+    case 'client_id_missing':
+      return 'Microsoft sign-in is not configured for this build.';
+    case 'client_build':
+    case 'token_client_unavailable':
+      return 'Croopor could not start Microsoft sign-in refresh.';
+    case 'oauth_refresh_failed':
+    case 'token_endpoint_unreachable':
+    case 'token_endpoint_rejected':
+    case 'token_endpoint_unavailable':
+    case 'token_endpoint_parse_failed':
+      return 'Microsoft sign-in refresh is unavailable or did not complete.';
+    case 'refreshed_account_unusable':
+      return 'The refreshed account could not be used for a verified Minecraft Java launch.';
+    default:
+      return status === 'refresh_unavailable'
+        ? 'Microsoft sign-in refresh is unavailable right now.'
+        : 'Croopor could not verify the Microsoft account for Online launch.';
+  }
+}
+
+export function formatSelectedOnlineAuthFailure(payload: unknown): LaunchAuthFailureNotice | null {
+  if (!isSelectedOnlineAuthFailure(payload)) return null;
+
+  const status = compactTokenLabel(payload.auth_refresh_status);
+  const reason = compactTokenLabel(payload.auth_refresh_reason);
+  if (isSignInRequiredAuthRefresh(status, reason)) {
+    return {
+      message: 'Online launch needs you to sign in again.',
+      details: [
+        authSignInRequiredDetail(reason),
+        'Sign in again from Accounts, then retry Online launch.',
+        OFFLINE_LAUNCH_AVAILABLE_DETAIL,
+      ],
+    };
+  }
+
+  return {
+    message: 'Online launch could not verify your Minecraft account.',
+    details: [
+      authRefreshFailedDetail(status, reason),
+      'Refresh or re-verify the account from Accounts, then retry Online launch.',
+      OFFLINE_LAUNCH_AVAILABLE_DETAIL,
+    ],
+  };
+}
+
 function guardianNoticeDetails(guardian: GuardianSummary | undefined): string[] {
   if (!guardian) return [];
   if (guardian.details && guardian.details.length > 0) {
@@ -391,6 +487,21 @@ function surfaceLaunchOutcome(
   return true;
 }
 
+function surfaceSelectedOnlineAuthFailure(payload: unknown, instanceId: string, instanceName: string): boolean {
+  const notice = formatSelectedOnlineAuthFailure(payload);
+  if (!notice) return false;
+  for (const detail of notice.details) {
+    appendLog('system', detail, instanceId, instanceName);
+  }
+  setLaunchNotice(instanceId, {
+    message: notice.message,
+    detail: primaryNoticeDetail(notice.details),
+    details: notice.details,
+    tone: 'error',
+  });
+  return true;
+}
+
 function selectedLaunchMaxMemoryMB(response: any, inst: Instance, cfg: Config | null): number {
   if (typeof response?.max_memory_mb === 'number' && response.max_memory_mb > 0) return response.max_memory_mb;
   if (typeof inst.max_memory_mb === 'number' && inst.max_memory_mb > 0) return inst.max_memory_mb;
@@ -467,16 +578,16 @@ export async function launchGame(): Promise<void> {
     })();
 
     if (res.error) {
-      const detail = friendlyLaunchErrorDetail(res.error);
-      const surfaced = surfaceLaunchOutcome(
-        res.guardian,
-        res.healing,
-        inst.id,
-        inst.name,
-        true,
-        detail,
-        'Launch stopped before startup.',
-      );
+      const surfaced = surfaceSelectedOnlineAuthFailure(res, inst.id, inst.name)
+        || surfaceLaunchOutcome(
+          res.guardian,
+          res.healing,
+          inst.id,
+          inst.name,
+          true,
+          friendlyLaunchErrorDetail(res.error),
+          'Launch stopped before startup.',
+        );
       if (!surfaced) {
         showError(res.error);
       }
@@ -528,16 +639,16 @@ export async function launchGame(): Promise<void> {
         guardian?: GuardianSummary;
         healing?: LaunchHealingSummary;
       };
-      const detail = friendlyLaunchErrorDetail(payload.error || err.message);
-      const surfaced = surfaceLaunchOutcome(
-        payload.guardian,
-        payload.healing,
-        inst.id,
-        inst.name,
-        true,
-        detail,
-        'Launch stopped before startup.',
-      );
+      const surfaced = surfaceSelectedOnlineAuthFailure(payload, inst.id, inst.name)
+        || surfaceLaunchOutcome(
+          payload.guardian,
+          payload.healing,
+          inst.id,
+          inst.name,
+          true,
+          friendlyLaunchErrorDetail(payload.error || err.message),
+          'Launch stopped before startup.',
+        );
       if (!surfaced) showError(payload.error || err.message);
       if (!launchCommitted) rollbackLaunch(inst.id, launchAnimationFrameId);
       return;
