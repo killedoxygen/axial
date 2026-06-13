@@ -15,7 +15,7 @@ const DRAG_THRESHOLD_PX = 4;
 const FIT_FOV_DEGREES = 34;
 const FIT_ZOOM = 0.96;
 
-interface SkinThreePreviewProps {
+export interface SkinThreePreviewProps {
   src: string;
   capeSrc?: string;
   name: string;

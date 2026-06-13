@@ -11,7 +11,3 @@ export function loadThree(): Promise<ThreeModule> {
   }
   return threePromise;
 }
-
-export function preloadSkinRenderer(): Promise<void> {
-  return loadThree().then(() => undefined);
-}

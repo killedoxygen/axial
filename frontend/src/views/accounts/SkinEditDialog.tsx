@@ -3,7 +3,7 @@ import { Button, Input, Segmented } from '../../ui/Atoms';
 import { Modal, ModalContent, ModalHeader, ModalTitle } from '../../ui/Modal';
 import { CapePicker } from './CapePicker';
 import { savedSkinFileUrl, stagedSkinPreviewSrc } from './api';
-import { SkinThreePreview } from './SkinThreePreview';
+import { LazySkinThreePreview as SkinThreePreview } from './LazySkinThreePreview';
 import type { MinecraftCape, SavedSkinRecord, SkinVariant, StagedSkinUpload } from './types';
 
 export function SkinEditDialog({

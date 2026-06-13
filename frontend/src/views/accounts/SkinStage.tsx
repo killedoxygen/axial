@@ -9,7 +9,7 @@ import {
   lookupSkinFileUrl,
   savedSkinFileUrl,
 } from './api';
-import { SkinThreePreview } from './SkinThreePreview';
+import { LazySkinThreePreview as SkinThreePreview } from './LazySkinThreePreview';
 import type {
   AuthStatusState,
   MinecraftCape,
