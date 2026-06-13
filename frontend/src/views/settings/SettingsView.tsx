@@ -28,6 +28,7 @@ import {
   formatUpdateCheckTime,
   hasVisibleUpdate,
   openUpdateAction,
+  openUpdateChecksum,
   openUpdateNotes,
   restartDesktopApp,
 } from '../../updater';
@@ -736,6 +737,9 @@ function AboutSection(): JSX.Element {
             {info?.action_label || 'Open release'}
           </Button>
           <Button variant="secondary" icon="tag" onClick={() => void openUpdateNotes()}>Notes</Button>
+          {info?.checksum_url && (
+            <Button variant="secondary" icon="shield-check" onClick={() => void openUpdateChecksum()}>Checksum</Button>
+          )}
           <Button variant="secondary" icon="x" onClick={dismiss}>Dismiss</Button>
         </div>
       )}

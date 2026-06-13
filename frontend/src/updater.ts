@@ -90,6 +90,17 @@ export async function openUpdateNotes(): Promise<void> {
   }
 }
 
+export async function openUpdateChecksum(): Promise<void> {
+  const url = updateInfo.value?.checksum_url;
+  if (!url) return;
+  try {
+    await openExternalURL(url);
+    toast('Opened release checksum');
+  } catch (err: unknown) {
+    toast(`Failed to open checksum: ${errMessage(err)}`, 'error');
+  }
+}
+
 export function restartBlockedByActivity(): boolean {
   return installState.value.status !== 'idle'
     || installQueue.value.length > 0

@@ -30,6 +30,7 @@ struct UpdateResponse {
     kind: &'static str,
     notes_url: String,
     action_url: String,
+    checksum_url: Option<String>,
     action_label: String,
     checked_at: String,
 }
@@ -149,6 +150,7 @@ fn fallback_response(current_version: &str, checked_at: &str) -> UpdateResponse 
         kind: "none",
         notes_url: String::new(),
         action_url: String::new(),
+        checksum_url: None,
         action_label: String::new(),
         checked_at: checked_at.to_string(),
     }
@@ -183,8 +185,8 @@ fn release_response_for_platform(
         return fallback_response(current_version, checked_at);
     }
 
-    let asset_url = matching_release_asset_url(&release.assets, &latest_version, os, arch);
-    if let Some(asset_url) = asset_url {
+    let asset = matching_release_asset(&release.assets, &latest_version, os, arch);
+    if let Some(asset) = asset {
         return UpdateResponse {
             current_version: current_version.to_string(),
             latest_version,
@@ -193,7 +195,8 @@ fn release_response_for_platform(
             arch: arch.to_string(),
             kind: "release-asset",
             notes_url: release_url,
-            action_url: asset_url,
+            action_url: asset.url,
+            checksum_url: asset.checksum_url,
             action_label: "Download update".to_string(),
             checked_at: checked_at.to_string(),
         };
@@ -208,6 +211,7 @@ fn release_response_for_platform(
         kind: "release-page",
         notes_url: release_url.clone(),
         action_url: release_url,
+        checksum_url: None,
         action_label: "Open release".to_string(),
         checked_at: checked_at.to_string(),
     }
@@ -249,17 +253,39 @@ fn sane_release_page_url(url: &str, latest_version: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
+#[cfg(test)]
 fn matching_release_asset_url(
     assets: &[GithubReleaseAsset],
     latest_version: &str,
     os: &str,
     arch: &str,
 ) -> Option<String> {
+    matching_release_asset(assets, latest_version, os, arch).map(|asset| asset.url)
+}
+
+struct ReleaseAssetSelection {
+    url: String,
+    checksum_url: Option<String>,
+}
+
+fn matching_release_asset(
+    assets: &[GithubReleaseAsset],
+    latest_version: &str,
+    os: &str,
+    arch: &str,
+) -> Option<ReleaseAssetSelection> {
     let expected_name = release_asset_name(latest_version, os, arch)?;
-    assets
+    let url = assets
         .iter()
         .filter(|asset| asset.name == expected_name)
-        .find_map(|asset| sane_release_asset_url(&asset.browser_download_url, &expected_name))
+        .find_map(|asset| sane_release_asset_url(&asset.browser_download_url, &expected_name))?;
+    let checksum_name = format!("{expected_name}.sha256");
+    let checksum_url = assets
+        .iter()
+        .filter(|asset| asset.name == checksum_name)
+        .find_map(|asset| sane_release_asset_url(&asset.browser_download_url, &checksum_name));
+
+    Some(ReleaseAssetSelection { url, checksum_url })
 }
 
 fn release_asset_name(latest_version: &str, os: &str, arch: &str) -> Option<String> {
@@ -283,6 +309,14 @@ fn release_asset_name(latest_version: &str, os: &str, arch: &str) -> Option<Stri
     ))
 }
 
+fn release_asset_version_from_name(name: &str) -> Option<&str> {
+    let archive_name = name.strip_suffix(".sha256").unwrap_or(name);
+    let archive_suffix = archive_name.rsplit_once('-')?.1;
+    archive_suffix
+        .strip_suffix(".tar.gz")
+        .or_else(|| archive_suffix.strip_suffix(".zip"))
+}
+
 fn sane_release_asset_url(url: &str, expected_name: &str) -> Option<String> {
     let trimmed = url.trim();
     let Some(download_path) = trimmed.strip_prefix(GITHUB_RELEASE_DOWNLOAD_PREFIX) else {
@@ -295,11 +329,7 @@ fn sane_release_asset_url(url: &str, expected_name: &str) -> Option<String> {
     if filename != expected_name {
         return None;
     }
-    let expected_version = expected_name
-        .rsplit_once('-')?
-        .1
-        .strip_suffix(".tar.gz")
-        .or_else(|| expected_name.rsplit_once('-')?.1.strip_suffix(".zip"))?;
+    let expected_version = release_asset_version_from_name(expected_name)?;
     let expected_v_tag = format!("v{expected_version}");
     let expected_upper_v_tag = format!("V{expected_version}");
     if tag != expected_version && tag != expected_v_tag && tag != expected_upper_v_tag {
@@ -642,6 +672,7 @@ mod tests {
 
         assert_eq!(response.kind, "release-asset");
         assert_eq!(response.action_label, "Download update");
+        assert_eq!(response.checksum_url, None);
         assert_eq!(
             response.notes_url,
             "https://github.com/mateoltd/croopor/releases/tag/v1.2.4"
@@ -650,6 +681,87 @@ mod tests {
             response.action_url,
             "https://github.com/mateoltd/croopor/releases/download/v1.2.4/croopor-linux-amd64-1.2.4.tar.gz"
         );
+    }
+
+    #[test]
+    fn release_response_includes_matching_checksum_sidecar() {
+        let response = release_response_for_platform(
+            "1.2.3",
+            "2026-01-01T00:00:00Z",
+            GithubLatestRelease {
+                tag_name: "v1.2.4".to_string(),
+                html_url: "https://github.com/mateoltd/croopor/releases/tag/v1.2.4".to_string(),
+                assets: vec![
+                    release_asset(
+                        "croopor-windows-amd64-1.2.4.zip",
+                        "https://github.com/mateoltd/croopor/releases/download/v1.2.4/croopor-windows-amd64-1.2.4.zip",
+                    ),
+                    release_asset(
+                        "croopor-windows-amd64-1.2.4.zip.sha256",
+                        "https://github.com/mateoltd/croopor/releases/download/v1.2.4/croopor-windows-amd64-1.2.4.zip.sha256",
+                    ),
+                ],
+            },
+            "windows",
+            "x86_64",
+        );
+
+        assert_eq!(response.kind, "release-asset");
+        assert_eq!(
+            response.checksum_url.as_deref(),
+            Some(
+                "https://github.com/mateoltd/croopor/releases/download/v1.2.4/croopor-windows-amd64-1.2.4.zip.sha256"
+            )
+        );
+    }
+
+    #[test]
+    fn release_response_omits_missing_or_unsafe_checksum_sidecar() {
+        let wrong_host = release_response_for_platform(
+            "1.2.3",
+            "2026-01-01T00:00:00Z",
+            GithubLatestRelease {
+                tag_name: "v1.2.4".to_string(),
+                html_url: "https://github.com/mateoltd/croopor/releases/tag/v1.2.4".to_string(),
+                assets: vec![
+                    release_asset(
+                        "croopor-linux-amd64-1.2.4.tar.gz",
+                        "https://github.com/mateoltd/croopor/releases/download/v1.2.4/croopor-linux-amd64-1.2.4.tar.gz",
+                    ),
+                    release_asset(
+                        "croopor-linux-amd64-1.2.4.tar.gz.sha256",
+                        "https://example.com/mateoltd/croopor/releases/download/v1.2.4/croopor-linux-amd64-1.2.4.tar.gz.sha256",
+                    ),
+                ],
+            },
+            "linux",
+            "x86_64",
+        );
+        assert_eq!(wrong_host.kind, "release-asset");
+        assert_eq!(wrong_host.checksum_url, None);
+
+        let wrong_tag = release_response_for_platform(
+            "1.2.3",
+            "2026-01-01T00:00:00Z",
+            GithubLatestRelease {
+                tag_name: "v1.2.4".to_string(),
+                html_url: "https://github.com/mateoltd/croopor/releases/tag/v1.2.4".to_string(),
+                assets: vec![
+                    release_asset(
+                        "croopor-linux-amd64-1.2.4.tar.gz",
+                        "https://github.com/mateoltd/croopor/releases/download/v1.2.4/croopor-linux-amd64-1.2.4.tar.gz",
+                    ),
+                    release_asset(
+                        "croopor-linux-amd64-1.2.4.tar.gz.sha256",
+                        "https://github.com/mateoltd/croopor/releases/download/v1.2.5/croopor-linux-amd64-1.2.4.tar.gz.sha256",
+                    ),
+                ],
+            },
+            "linux",
+            "x86_64",
+        );
+        assert_eq!(wrong_tag.kind, "release-asset");
+        assert_eq!(wrong_tag.checksum_url, None);
     }
 
     #[test]

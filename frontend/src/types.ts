@@ -967,6 +967,7 @@ export interface UpdateInfo {
   kind: UpdateKind;
   notes_url: string;
   action_url: string;
+  checksum_url?: string | null;
   action_label: string;
   checked_at: string;
 }
