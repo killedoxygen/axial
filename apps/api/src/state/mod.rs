@@ -1,3 +1,4 @@
+mod accounts;
 mod auth_logins;
 mod auth_persistence;
 pub mod benchmark_suite_drivers;
@@ -18,10 +19,15 @@ use std::sync::{Arc, RwLock};
 const STARTUP_WARNING_LIMIT: usize = 8;
 const STARTUP_WARNING_MAX_CHARS: usize = 240;
 
+pub use accounts::{
+    LauncherAccountKind, LauncherAccountRecord, LauncherAccountStore, microsoft_account_id,
+    offline_account_id,
+};
 pub use auth_logins::{
-    ActiveMinecraftAccountState, ActiveMsaTokenState, AuthLoginMinecraftAccount,
-    AuthLoginMinecraftCape, AuthLoginMinecraftProfile, AuthLoginMinecraftSkin, AuthLoginSession,
-    AuthLoginStore, NewAuthLoginMinecraftAccount, NewAuthLoginMsaToken, NewAuthLoginSession,
+    ActiveMinecraftAccountState, ActiveMsaTokenState, AuthLoginAccountState,
+    AuthLoginMinecraftAccount, AuthLoginMinecraftCape, AuthLoginMinecraftProfile,
+    AuthLoginMinecraftSkin, AuthLoginMsaToken, AuthLoginStore, NewAuthLoginMinecraftAccount,
+    NewAuthLoginMsaToken,
 };
 pub use installs::InstallStore;
 pub use sessions::{SessionStore, StartupOutcome};
@@ -32,6 +38,7 @@ pub struct AppState {
     version: String,
     config: Arc<ConfigStore>,
     instances: Arc<InstanceStore>,
+    accounts: Arc<LauncherAccountStore>,
     auth_logins: Arc<AuthLoginStore>,
     installs: Arc<InstallStore>,
     sessions: Arc<SessionStore>,
@@ -68,12 +75,14 @@ impl AppState {
             performance_operations::PerformanceOperationStore::load_from_paths(init.config.paths()),
         );
         let skins = Arc::new(skins::SavedSkinStore::load_from_paths(init.config.paths()));
+        let accounts = Arc::new(LauncherAccountStore::load_from_paths(init.config.paths()));
 
         Self {
             app_name: init.app_name,
             version: init.version,
             config: init.config,
             instances: init.instances,
+            accounts,
             auth_logins: Arc::new(AuthLoginStore::load_from_secure_store()),
             installs: init.installs,
             sessions: init.sessions,
@@ -105,6 +114,10 @@ impl AppState {
 
     pub fn instances(&self) -> &Arc<InstanceStore> {
         &self.instances
+    }
+
+    pub fn accounts(&self) -> &Arc<LauncherAccountStore> {
+        &self.accounts
     }
 
     pub fn sessions(&self) -> &Arc<SessionStore> {

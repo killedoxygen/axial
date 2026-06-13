@@ -2,7 +2,10 @@ import { api, apiResourceUrl, apiUrl, isApiError } from '../../api';
 import { DEFAULT_SKINS, type DefaultSkin } from '../../default-skins';
 import type { NativeDragDropPayload } from '../../native';
 import type {
+  AuthAccount,
   AuthStatusRecord,
+  LauncherAccount,
+  LauncherAccountsData,
   MinecraftAuthReadiness,
   MinecraftCape,
   MinecraftProfile,
@@ -453,6 +456,68 @@ export function minecraftReadiness(record: Record<string, unknown>): MinecraftAu
   };
 }
 
+function authAccount(value: unknown): AuthAccount | null {
+  if (!isRecord(value) ||
+    typeof value.login_id !== 'string' ||
+    typeof value.active !== 'boolean' ||
+    typeof value.msa_authenticated !== 'boolean' ||
+    typeof value.msa_refresh_available !== 'boolean'
+  ) {
+    return null;
+  }
+
+  return {
+    login_id: value.login_id,
+    active: value.active,
+    msa_authenticated: value.msa_authenticated,
+    msa_token_expires_in: value.msa_token_expires_in === null
+      ? null
+      : maybeNumber(value.msa_token_expires_in),
+    msa_refresh_available: value.msa_refresh_available,
+    ...minecraftReadiness(value),
+  };
+}
+
+function launcherAccount(value: unknown): LauncherAccount | null {
+  if (!isRecord(value) ||
+    typeof value.account_id !== 'string' ||
+    (value.kind !== 'microsoft' && value.kind !== 'offline') ||
+    typeof value.display_name !== 'string' ||
+    typeof value.active !== 'boolean' ||
+    typeof value.msa_authenticated !== 'boolean' ||
+    typeof value.msa_refresh_available !== 'boolean'
+  ) {
+    return null;
+  }
+
+  return {
+    account_id: value.account_id,
+    kind: value.kind,
+    display_name: value.display_name,
+    active: value.active,
+    login_id: typeof value.login_id === 'string' ? value.login_id : undefined,
+    minecraft_profile_id: typeof value.minecraft_profile_id === 'string' ? value.minecraft_profile_id : undefined,
+    offline_uuid: typeof value.offline_uuid === 'string' ? value.offline_uuid : undefined,
+    msa_authenticated: value.msa_authenticated,
+    msa_token_expires_in: value.msa_token_expires_in === null
+      ? null
+      : maybeNumber(value.msa_token_expires_in),
+    msa_refresh_available: value.msa_refresh_available,
+    ...minecraftReadiness(value),
+  };
+}
+
+export function launcherAccountsResponse(value: unknown): LauncherAccountsData | null {
+  if (!isRecord(value) || !Array.isArray(value.accounts)) return null;
+  if (value.active_account_id !== null && typeof value.active_account_id !== 'string') return null;
+  return {
+    active_account_id: value.active_account_id,
+    accounts: value.accounts
+      .map(launcherAccount)
+      .filter((account): account is LauncherAccount => account !== null),
+  };
+}
+
 export function authStatusResponse(value: unknown): AuthStatusRecord | null {
   if (!isRecord(value)) return null;
   if (
@@ -485,6 +550,9 @@ export function authStatusResponse(value: unknown): AuthStatusRecord | null {
     msa_provider: typeof value.msa_provider === 'string' ? value.msa_provider : value.msa_provider === null ? null : undefined,
     msa_token_expires_in: value.msa_token_expires_in === null ? null : maybeNumber(value.msa_token_expires_in),
     msa_refresh_available: value.msa_refresh_available === true,
+    accounts: Array.isArray(value.accounts)
+      ? value.accounts.map(authAccount).filter((account): account is AuthAccount => account !== null)
+      : [],
     ...minecraftReadiness(value),
   };
 }

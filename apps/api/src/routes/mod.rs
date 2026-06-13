@@ -1,3 +1,4 @@
+mod accounts;
 mod auth;
 mod catalog;
 mod config;
@@ -31,6 +32,7 @@ pub use skin::flush_pending_saved_skin_applies_for_shutdown;
 pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(status::router())
+        .merge(accounts::router())
         .merge(auth::router())
         .merge(system::router())
         .merge(config::router())
@@ -61,6 +63,7 @@ fn local_cors_layer() -> CorsLayer {
             Method::GET,
             Method::POST,
             Method::PUT,
+            Method::PATCH,
             Method::DELETE,
             Method::OPTIONS,
         ])

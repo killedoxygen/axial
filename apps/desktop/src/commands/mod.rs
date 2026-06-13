@@ -28,6 +28,7 @@ pub struct NativeSkinFile {
 #[derive(Debug, Eq, PartialEq, Serialize)]
 pub struct NativeMicrosoftSignIn {
     status: &'static str,
+    login_id: Option<String>,
     profile_name: Option<String>,
     owns_minecraft_java: Option<bool>,
 }
@@ -92,6 +93,7 @@ pub async fn microsoft_sign_in(
                         .map_err(|error| error.user_message())?;
                 return Ok(NativeMicrosoftSignIn {
                     status: "authenticated",
+                    login_id: Some(outcome.login_id),
                     profile_name: Some(outcome.profile_name),
                     owns_minecraft_java: Some(outcome.owns_minecraft_java),
                 });
@@ -111,6 +113,7 @@ pub async fn microsoft_sign_in(
 fn microsoft_sign_in_cancelled() -> NativeMicrosoftSignIn {
     NativeMicrosoftSignIn {
         status: "cancelled",
+        login_id: None,
         profile_name: None,
         owns_minecraft_java: None,
     }

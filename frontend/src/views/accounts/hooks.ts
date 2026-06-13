@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from 'preact/hooks';
 import { api, isApiError } from '../../api';
 import { createAccountsSkinsMachine } from '../../machines/accounts-skins';
-import { authStatusResponse, isRecord, savedSkinsResponse } from './api';
-import type { AuthStatusRecord, AuthStatusState, SavedSkinRecord } from './types';
+import { authStatusResponse, isRecord, launcherAccountsResponse, savedSkinsResponse } from './api';
+import type { AuthStatusRecord, AuthStatusState, LauncherAccount, SavedSkinRecord } from './types';
 
 export function useAuthStatus(savedUsername: string): {
   status: AuthStatusRecord | null;
@@ -23,11 +23,27 @@ export function useAuthStatus(savedUsername: string): {
     setStatus(null);
 
     void api('GET', '/auth/status')
-      .then((res: unknown) => {
+      .then(async (res: unknown) => {
         if (!active) return;
         if (isRecord(res) && typeof res.error === 'string') throw new Error(res.error);
-        const parsed = authStatusResponse(res);
+        let parsed = authStatusResponse(res);
         if (!parsed) throw new Error('invalid auth status');
+        if (
+          parsed.launch_auth_mode === 'online' &&
+          !parsed.online_mode_ready &&
+          parsed.msa_refresh_available
+        ) {
+          try {
+            await api('POST', '/auth/refresh');
+            if (!active) return;
+            const refreshed = authStatusResponse(await api('GET', '/auth/status'));
+            if (refreshed) parsed = refreshed;
+          } catch (err: unknown) {
+            // Keep the restored account visible; account actions can surface the
+            // refresh failure when the user re-verifies or launches online.
+            console.warn('Could not refresh restored Microsoft sign-in while loading accounts.', err);
+          }
+        }
         setStatus(parsed);
         setState('ready');
       })
@@ -43,6 +59,70 @@ export function useAuthStatus(savedUsername: string): {
   }, [savedUsername, refreshIndex]);
 
   return { status, state, refresh };
+}
+
+export function useLauncherAccounts(): {
+  accounts: LauncherAccount[];
+  activeAccountId: string | null;
+  state: AuthStatusState;
+  refresh: () => void;
+} {
+  const [accounts, setAccounts] = useState<LauncherAccount[]>([]);
+  const [activeAccountId, setActiveAccountId] = useState<string | null>(null);
+  const [state, setState] = useState<AuthStatusState>('loading');
+  const [refreshIndex, setRefreshIndex] = useState(0);
+
+  const refresh = useCallback(() => {
+    setRefreshIndex((value) => value + 1);
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    setState('loading');
+
+    void api('GET', '/accounts')
+      .then(async (res: unknown) => {
+        if (!active) return;
+        let parsed = launcherAccountsResponse(res);
+        if (!parsed) throw new Error('invalid account list');
+        const activeAccount = parsed.accounts.find((account) => account.active);
+        const activeNeedsRefresh = activeAccount?.kind === 'microsoft' &&
+          activeAccount.msa_refresh_available === true &&
+          !(
+            activeAccount.minecraft_profile_ready === true &&
+            activeAccount.minecraft_ownership_verified === true &&
+            typeof activeAccount.minecraft_token_expires_in === 'number' &&
+            activeAccount.minecraft_token_expires_in > 0
+          );
+        if (activeNeedsRefresh) {
+          try {
+            await api('POST', '/auth/refresh');
+            if (!active) return;
+            const refreshed = launcherAccountsResponse(await api('GET', '/accounts'));
+            if (refreshed) parsed = refreshed;
+          } catch (err: unknown) {
+            // Keep the restored account visible; account actions surface the
+            // refresh failure when the user launches, refreshes, or re-verifies.
+            console.warn('Could not refresh restored Microsoft account while loading account list.', err);
+          }
+        }
+        setAccounts(parsed.accounts);
+        setActiveAccountId(parsed.active_account_id);
+        setState('ready');
+      })
+      .catch(() => {
+        if (!active) return;
+        setAccounts([]);
+        setActiveAccountId(null);
+        setState('unavailable');
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [refreshIndex]);
+
+  return { accounts, activeAccountId, state, refresh };
 }
 
 export function useSavedSkins(): {

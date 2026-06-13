@@ -1,4 +1,4 @@
-use crate::state::AppState;
+use crate::{routes::accounts, state::AppState};
 use axum::{
     Json, Router,
     extract::State,
@@ -51,6 +51,7 @@ async fn handle_update_config(
     Json(patch): Json<ConfigPatch>,
 ) -> Result<Json<AppConfig>, (StatusCode, Json<serde_json::Value>)> {
     let mut next = state.config().current();
+    let sync_offline_username = patch.username.is_some();
     if let Some(username) = patch.username {
         next.username = username;
     }
@@ -118,6 +119,10 @@ async fn handle_update_config(
     match state.config().update(next) {
         Ok(config) => {
             state.set_library_dir(config.library_dir.clone());
+            if sync_offline_username {
+                accounts::sync_active_offline_account_from_username(&state, &config.username)
+                    .map_err(config_account_sync_error_response)?;
+            }
             Ok(Json(config))
         }
         Err(error) => Err(config_update_error_response(error)),
@@ -137,11 +142,32 @@ fn config_update_error_response(error: ConfigStoreError) -> (StatusCode, Json<se
     }
 }
 
+fn config_account_sync_error_response(
+    error: std::io::Error,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let status = if error.kind() == std::io::ErrorKind::InvalidInput {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    (
+        status,
+        Json(serde_json::json!({ "error": CONFIG_SAVE_ERROR_MESSAGE })),
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CONFIG_SAVE_ERROR_MESSAGE, ConfigPatch, config_update_error_response};
-    use axum::Json;
-    use croopor_config::{AppConfigValidationError, ConfigStoreError};
+    use super::{
+        CONFIG_SAVE_ERROR_MESSAGE, ConfigPatch, config_update_error_response, handle_update_config,
+    };
+    use crate::state::{AppState, AppStateInit, InstallStore, SessionStore};
+    use axum::{Json, extract::State};
+    use croopor_config::{
+        AppConfig, AppConfigValidationError, AppPaths, ConfigStore, ConfigStoreError, InstanceStore,
+    };
+    use croopor_performance::PerformanceManager;
+    use std::{fs, path::Path, path::PathBuf, sync::Arc, time::SystemTime, time::UNIX_EPOCH};
 
     #[test]
     fn config_patch_accepts_telemetry_enabled() {
@@ -190,5 +216,95 @@ mod tests {
             assert_eq!(message, CONFIG_SAVE_ERROR_MESSAGE);
             assert!(!message.contains(path));
         }
+    }
+
+    #[tokio::test]
+    async fn config_username_update_renames_active_offline_account() {
+        let fixture = TestFixture::new("username-offline-sync");
+        fixture
+            .state
+            .accounts()
+            .create_offline_account("OldName")
+            .expect("create offline account");
+
+        let Json(config) = handle_update_config(
+            State(fixture.state.clone()),
+            Json(ConfigPatch {
+                username: Some("NewName".to_string()),
+                ..ConfigPatch::default()
+            }),
+        )
+        .await
+        .expect("update config");
+
+        assert_eq!(config.username, "NewName");
+        let active = fixture
+            .state
+            .accounts()
+            .active_account()
+            .expect("active account")
+            .expect("active account");
+        assert_eq!(active.display_name, "NewName");
+        assert_eq!(fixture.state.config().current().username, "NewName");
+    }
+
+    struct TestFixture {
+        state: AppState,
+        root: PathBuf,
+    }
+
+    impl TestFixture {
+        fn new(name: &str) -> Self {
+            let root = test_root(name);
+            let paths = test_paths(&root);
+            let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
+            config
+                .replace_in_memory(AppConfig::default())
+                .expect("set config");
+            let instances =
+                Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
+            let state = AppState::new(AppStateInit {
+                app_name: "Croopor".to_string(),
+                version: "test".to_string(),
+                config,
+                instances,
+                installs: Arc::new(InstallStore::new()),
+                sessions: Arc::new(SessionStore::new()),
+                performance: Arc::new(PerformanceManager::new().expect("performance manager")),
+                startup_warnings: Vec::new(),
+                frontend_dir: root.join("frontend"),
+            });
+
+            Self { state, root }
+        }
+    }
+
+    impl Drop for TestFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn test_paths(root: &Path) -> AppPaths {
+        let config_dir = root.join("config");
+        AppPaths {
+            config_file: config_dir.join("config.json"),
+            instances_file: config_dir.join("instances.json"),
+            instances_dir: root.join("instances"),
+            music_dir: root.join("music"),
+            library_dir: root.join("library"),
+            config_dir,
+        }
+    }
+
+    fn test_root(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "croopor-config-route-{name}-{}-{nonce}",
+            std::process::id()
+        ))
     }
 }

@@ -107,6 +107,11 @@ struct SkinQuery {
     size: Option<u32>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct SkinProfileFileQuery {
+    texture: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct SkinCapeFileQuery {
     id: String,
@@ -166,6 +171,7 @@ struct SaveSkinQuery {
 struct SaveSkinFromProfileRequest {
     name: Option<String>,
     variant: Option<String>,
+    mark_current: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -821,30 +827,47 @@ async fn handle_skin_normalize(body: Body) -> Result<Json<SkinNormalizeResponse>
 
 async fn handle_skin_profile_file(
     State(state): State<AppState>,
+    Query(query): Query<SkinProfileFileQuery>,
 ) -> Result<Response<Body>, ApiError> {
-    handle_skin_profile_file_with_client(State(state), MinecraftSkinTextureClient::default()).await
+    handle_skin_profile_file_with_client(
+        State(state),
+        Query(query),
+        MinecraftSkinTextureClient::default(),
+    )
+    .await
 }
 
 async fn handle_skin_profile_file_with_client(
     State(state): State<AppState>,
+    Query(query): Query<SkinProfileFileQuery>,
     client: MinecraftSkinTextureClient,
 ) -> Result<Response<Body>, ApiError> {
-    let profile_skin = active_minecraft_profile_skin(
-        &state,
-        client.allowed_prefix(),
-        "Minecraft account is not ready for profile skin preview",
-    )
-    .await?;
-    let cache_path = profile_skin_file_cache_path(
-        &state.config().paths().config_dir,
-        &profile_skin.texture_url,
-    );
+    let texture_url = match query.texture.as_deref() {
+        Some(texture) => sane_minecraft_texture_url_with_prefix(texture, client.allowed_prefix())
+            .ok_or_else(|| {
+            json_status_error(
+                StatusCode::BAD_REQUEST,
+                "Minecraft profile skin texture is invalid",
+                "minecraft_profile_skin_invalid",
+            )
+        })?,
+        None => {
+            active_minecraft_profile_skin(
+                &state,
+                client.allowed_prefix(),
+                "Minecraft account is not ready for profile skin preview",
+            )
+            .await?
+            .texture_url
+        }
+    };
+    let cache_path = profile_skin_file_cache_path(&state.config().paths().config_dir, &texture_url);
     if let Some(bytes) = read_profile_skin_file_cache(&cache_path).await {
         return profile_skin_file_response(bytes);
     }
 
     let bytes = client
-        .download(&profile_skin.texture_url)
+        .download(&texture_url)
         .await
         .map_err(skin_texture_download_error)?;
     let normalized = normalize_skin_png(&bytes)?;
@@ -1129,7 +1152,7 @@ async fn handle_save_skin_from_profile_with_client(
     };
     let variant = variant_override.unwrap_or_else(|| normalized.variant_suggestion.to_string());
     let texture_key = texture_key(&normalized.png_bytes);
-    let record = save_saved_skin(
+    let mut record = save_saved_skin(
         &state,
         texture_key,
         name,
@@ -1139,6 +1162,12 @@ async fn handle_save_skin_from_profile_with_client(
         normalized.png_bytes,
     )
     .await?;
+    if payload.mark_current == Some(true)
+        && let Some(applied_at) =
+            mark_saved_skin_applied(&state, record.texture_key.clone()).await?
+    {
+        record.applied_at = Some(applied_at);
+    }
 
     Ok(Json(record))
 }
@@ -1527,6 +1556,47 @@ async fn apply_saved_skin_now_with_clients(
 ) -> Result<SkinApplyResponse, ApiError> {
     let texture_key = validate_texture_key(&texture_key)?;
     let account = active_ready_minecraft_account_for_skin_apply(state).await?;
+    apply_saved_skin_for_account_with_clients(
+        state,
+        account,
+        texture_key,
+        skin_client,
+        cape_client,
+        texture_client,
+    )
+    .await
+}
+
+async fn apply_saved_skin_for_login_with_clients(
+    state: &AppState,
+    login_id: &str,
+    texture_key: String,
+    skin_client: MinecraftSkinUploadClient,
+    cape_client: MinecraftCapeSyncClient,
+    texture_client: MinecraftSkinTextureClient,
+) -> Result<SkinApplyResponse, ApiError> {
+    let texture_key = validate_texture_key(&texture_key)?;
+    let account = ready_minecraft_account_for_login_id_for_skin_apply(state, login_id).await?;
+    apply_saved_skin_for_account_with_clients(
+        state,
+        account,
+        texture_key,
+        skin_client,
+        cape_client,
+        texture_client,
+    )
+    .await
+}
+
+async fn apply_saved_skin_for_account_with_clients(
+    state: &AppState,
+    account: AuthLoginMinecraftAccount,
+    texture_key: String,
+    skin_client: MinecraftSkinUploadClient,
+    cape_client: MinecraftCapeSyncClient,
+    texture_client: MinecraftSkinTextureClient,
+) -> Result<SkinApplyResponse, ApiError> {
+    let texture_key = validate_texture_key(&texture_key)?;
     let saved_skins = list_saved_skins(state).await?;
     let saved_skin = saved_skins
         .iter()
@@ -1646,6 +1716,13 @@ pub(crate) async fn clear_pending_saved_skin_apply_for_login_id(login_id: &str) 
         .is_some()
 }
 
+pub(crate) async fn clear_all_pending_saved_skin_applies() -> usize {
+    let mut pending = PENDING_SKIN_APPLIES.lock().await;
+    let cleared = pending.pending.len();
+    pending.pending.clear();
+    cleared
+}
+
 async fn clear_pending_saved_skin_apply_for_active_account(state: &AppState) -> bool {
     let Some(account_state) = state
         .auth_logins()
@@ -1688,6 +1765,49 @@ async fn active_ready_minecraft_account_for_skin_change(
     let minecraft_state = state
         .auth_logins()
         .active_current_minecraft_account_state()
+        .await
+        .ok_or_else(|| {
+            json_status_error(
+                StatusCode::UNAUTHORIZED,
+                "Minecraft account login required",
+                "minecraft_account_required",
+            )
+        })?;
+    let account = minecraft_state.account;
+    if !account.owns_minecraft_java
+        || account.profile.id.trim().is_empty()
+        || account.profile.name.trim().is_empty()
+    {
+        return Err(json_status_error(
+            StatusCode::CONFLICT,
+            not_ready_message,
+            "minecraft_account_not_ready",
+        ));
+    }
+
+    Ok(account)
+}
+
+async fn ready_minecraft_account_for_login_id_for_skin_apply(
+    state: &AppState,
+    login_id: &str,
+) -> Result<AuthLoginMinecraftAccount, ApiError> {
+    ready_minecraft_account_for_login_id_for_skin_change(
+        state,
+        login_id,
+        "Minecraft account is not ready for skin upload",
+    )
+    .await
+}
+
+async fn ready_minecraft_account_for_login_id_for_skin_change(
+    state: &AppState,
+    login_id: &str,
+    not_ready_message: &'static str,
+) -> Result<AuthLoginMinecraftAccount, ApiError> {
+    let minecraft_state = state
+        .auth_logins()
+        .current_minecraft_account_state_for_login(login_id)
         .await
         .ok_or_else(|| {
             json_status_error(
@@ -1838,8 +1958,9 @@ async fn flush_pending_saved_skin_applies_with_clients(
         return Ok(0);
     };
 
-    let result = apply_saved_skin_now_with_clients(
+    let result = apply_saved_skin_for_login_with_clients(
         state,
+        &entry.change.login_id,
         entry.change.texture_key.clone(),
         skin_client.clone(),
         cape_client.clone(),
@@ -3549,7 +3670,7 @@ mod tests {
     use crate::state::{AppStateInit, InstallStore, SessionStore};
     use crate::state::{
         AuthLoginMinecraftProfile, AuthLoginMinecraftSkin, NewAuthLoginMinecraftAccount,
-        NewAuthLoginMsaToken, NewAuthLoginSession,
+        NewAuthLoginMsaToken,
     };
     use axum::{
         body::{Bytes, to_bytes},
@@ -3898,6 +4019,47 @@ mod tests {
             Some(PROFILE_SKIN_FILE_CACHE_CONTROL)
         );
         assert_eq!(response_bytes(file).await, normalized.png_bytes);
+    }
+
+    #[tokio::test]
+    async fn skin_profile_file_texture_query_fetches_requested_profile_texture() {
+        let fixture = TestFixture::new("profile-file-query-texture", "ConfigUser");
+        let png = test_skin_png(SKIN_WIDTH, LEGACY_SKIN_HEIGHT);
+        let normalized = normalize_skin_png(&png).expect("normalized skin");
+        let (texture_prefix, mut requests) =
+            skin_profile_texture_test_server(SkinProfileTextureServerMode::Png(png)).await;
+        let active_texture_url = format!("{texture_prefix}activeTexture123");
+        let requested_texture_url = format!("{texture_prefix}otherAccountTexture456");
+        fixture
+            .add_minecraft_account(test_profile(
+                "MinecraftName",
+                vec![minecraft_skin(
+                    "active",
+                    "ACTIVE",
+                    &active_texture_url,
+                    "slim",
+                )],
+            ))
+            .await;
+
+        let file = fixture
+            .profile_file_with_texture(texture_prefix.clone(), Some(requested_texture_url.clone()))
+            .await
+            .expect("profile skin file");
+        let request = requests.recv().await.expect("texture request");
+        let cache_path = profile_skin_file_cache_path(
+            &fixture.state.config().paths().config_dir,
+            &requested_texture_url,
+        );
+
+        assert_eq!(request.path, "/texture/otherAccountTexture456");
+        assert_eq!(response_bytes(file).await, normalized.png_bytes);
+        assert_eq!(
+            tokio::fs::read(cache_path)
+                .await
+                .expect("read requested profile cache"),
+            normalized.png_bytes
+        );
     }
 
     #[tokio::test]
@@ -5182,6 +5344,7 @@ mod tests {
                 SaveSkinFromProfileRequest {
                     name: Some("  Profile Copy  ".to_string()),
                     variant: Some("SLIM".to_string()),
+                    mark_current: None,
                 },
                 texture_prefix,
             )
@@ -6757,6 +6920,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn skin_apply_defer_flushes_against_queued_login_after_account_switch() {
+        let fixture = TestFixture::new("apply-defer-original-login", "ConfigUser");
+        let first_account = fixture
+            .add_minecraft_account_with_tokens(
+                test_profile("FirstPlayer", Vec::new()),
+                "first-msa-access-token",
+                "first-minecraft-access-token",
+            )
+            .await;
+        let saved = fixture
+            .save_skin("Queued", None, test_skin_png(SKIN_WIDTH, SKIN_HEIGHT))
+            .await
+            .expect("save skin")
+            .0;
+        let (endpoint, mut requests) =
+            skin_apply_route_test_server(SkinApplyServerMode::Success).await;
+
+        let _ = fixture
+            .queue_saved_skin_apply(&saved.texture_key)
+            .await
+            .expect("queue skin apply");
+        let second_account = fixture
+            .add_minecraft_account_with_tokens(
+                test_profile("SecondPlayer", Vec::new()),
+                "second-msa-access-token",
+                "second-minecraft-access-token",
+            )
+            .await;
+
+        assert_ne!(first_account.login_id, second_account.login_id);
+        assert_eq!(
+            fixture
+                .state
+                .auth_logins()
+                .active_current_minecraft_account_state()
+                .await
+                .expect("second account active")
+                .account
+                .login_id,
+            second_account.login_id
+        );
+
+        let applied = flush_pending_saved_skin_applies_with_clients(
+            &fixture.state,
+            PendingSkinApplyFilter::Generation {
+                login_id: first_account.login_id.clone(),
+                generation: 1,
+            },
+            MinecraftSkinUploadClient::with_endpoint(endpoint),
+            MinecraftCapeSyncClient::with_endpoint("http://127.0.0.1:9/capes".to_string()),
+            MinecraftSkinTextureClient::with_allowed_prefix(
+                "http://127.0.0.1:9/texture/".to_string(),
+            ),
+        )
+        .await
+        .expect("flush queued skin apply");
+        let request = requests.recv().await.expect("skin upload request");
+
+        assert_eq!(applied, 1);
+        assert_eq!(
+            request.authorization.as_deref(),
+            Some("Bearer first-minecraft-access-token")
+        );
+        assert_eq!(
+            fixture
+                .state
+                .auth_logins()
+                .active_current_minecraft_account_state()
+                .await
+                .expect("second account remains active")
+                .account
+                .login_id,
+            second_account.login_id
+        );
+    }
+
+    #[tokio::test]
     async fn skin_apply_flush_requeues_failed_pending_change() {
         let fixture = TestFixture::new("apply-defer-requeues-failure", "ConfigUser");
         fixture
@@ -7351,8 +7591,17 @@ mod tests {
             &self,
             allowed_prefix: String,
         ) -> Result<Response<Body>, (StatusCode, Json<serde_json::Value>)> {
+            self.profile_file_with_texture(allowed_prefix, None).await
+        }
+
+        async fn profile_file_with_texture(
+            &self,
+            allowed_prefix: String,
+            texture: Option<String>,
+        ) -> Result<Response<Body>, (StatusCode, Json<serde_json::Value>)> {
             handle_skin_profile_file_with_client(
                 State(self.state.clone()),
+                Query(SkinProfileFileQuery { texture }),
                 MinecraftSkinTextureClient::with_allowed_prefix(allowed_prefix),
             )
             .await
@@ -7620,26 +7869,47 @@ mod tests {
             profile: AuthLoginMinecraftProfile,
             expires_in: u64,
             owns_minecraft_java: bool,
-        ) {
-            let session = self
+        ) -> AuthLoginMinecraftAccount {
+            self.add_minecraft_account_with_tokens_and_expiry_and_ownership(
+                profile,
+                "msa-access-token",
+                "minecraft-access-token",
+                expires_in,
+                owns_minecraft_java,
+            )
+            .await
+        }
+
+        async fn add_minecraft_account_with_tokens(
+            &self,
+            profile: AuthLoginMinecraftProfile,
+            msa_access_token: &str,
+            minecraft_access_token: &str,
+        ) -> AuthLoginMinecraftAccount {
+            self.add_minecraft_account_with_tokens_and_expiry_and_ownership(
+                profile,
+                msa_access_token,
+                minecraft_access_token,
+                86_400,
+                true,
+            )
+            .await
+        }
+
+        async fn add_minecraft_account_with_tokens_and_expiry_and_ownership(
+            &self,
+            profile: AuthLoginMinecraftProfile,
+            msa_access_token: &str,
+            minecraft_access_token: &str,
+            expires_in: u64,
+            owns_minecraft_java: bool,
+        ) -> AuthLoginMinecraftAccount {
+            let (_token, account) = self
                 .state
                 .auth_logins()
-                .insert(NewAuthLoginSession {
-                    device_code: "raw-device-code".to_string(),
-                    user_code: "ABCD-EFGH".to_string(),
-                    verification_uri: "https://www.microsoft.com/link".to_string(),
-                    expires_in: 900,
-                    interval: 5,
-                    message: None,
-                })
-                .await;
-
-            self.state
-                .auth_logins()
-                .complete_with_msa_and_minecraft_account(
-                    &session.login_id,
+                .replace_with_msa_and_minecraft_account(
                     NewAuthLoginMsaToken {
-                        access_token: "msa-access-token".to_string(),
+                        access_token: msa_access_token.to_string(),
                         refresh_token: Some("msa-refresh-token".to_string()),
                         id_token: None,
                         token_type: "Bearer".to_string(),
@@ -7647,15 +7917,15 @@ mod tests {
                         scope: Some("XboxLive.signin offline_access".to_string()),
                     },
                     NewAuthLoginMinecraftAccount {
-                        access_token: "minecraft-access-token".to_string(),
+                        access_token: minecraft_access_token.to_string(),
                         token_type: Some("Bearer".to_string()),
                         expires_in,
                         profile,
                         owns_minecraft_java,
                     },
                 )
-                .await
-                .expect("complete minecraft account login");
+                .await;
+            account
         }
     }
 

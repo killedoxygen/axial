@@ -1,4 +1,7 @@
 .cp-skin-nametag {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
   max-width: 100%;
   padding: 5px 12px;
   border-radius: 6px;
@@ -11,19 +14,27 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.cp-skin-nametag > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 button.cp-skin-nametag--editable {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
+  position: relative;
   border: 0;
   font: inherit;
   font-size: 13px;
   font-weight: 750;
   cursor: pointer;
+  overflow: visible;
   pointer-events: auto;
   transition: background 140ms ease;
 }
 button.cp-skin-nametag--editable > svg {
+  position: absolute;
+  left: calc(100% + 6px);
+  top: 50%;
+  transform: translateY(-50%);
   color: color-mix(in oklab, oklch(0.98 0 0) 55%, transparent);
   transition: color 140ms ease;
 }
@@ -643,7 +654,61 @@ span.cp-skin-tile__img[data-snapshot='loading'] {
 }
 .cp-account-rows {
   display: grid;
+  gap: 12px;
+}
+.cp-account-section {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+}
+.cp-account-section__title {
+  color: var(--text-mute);
+  font-size: 11px;
+  font-weight: 750;
+  letter-spacing: 0;
+}
+.cp-account-section__rows {
+  display: grid;
   gap: 8px;
+}
+.cp-account-section__empty {
+  padding: 10px 12px;
+  color: var(--text-mute);
+  font-size: 12px;
+  font-weight: 550;
+}
+.cp-account-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  min-width: 0;
+}
+.cp-account-action {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 0;
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 140ms ease;
+}
+.cp-account-action:hover {
+  background: var(--surface-3);
+}
+.cp-account-action:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+.cp-account-action:disabled {
+  cursor: default;
+  opacity: 0.58;
 }
 .cp-account-rowwrap {
   position: relative;
@@ -734,44 +799,6 @@ span.cp-skin-tile__img[data-snapshot='loading'] {
   height: 38px;
   border-radius: 9px;
   background: color-mix(in oklab, var(--bg) 55%, var(--surface));
-}
-
-.cp-account-devicecode {
-  display: grid;
-  gap: 10px;
-  padding: 12px 14px;
-  border-radius: var(--r-md);
-  background: var(--surface-2);
-}
-.cp-account-devicecode__row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-  min-width: 0;
-}
-.cp-account-devicecode__row a {
-  color: var(--text);
-  font-size: 13px;
-  font-weight: 650;
-  overflow-wrap: anywhere;
-  min-width: 0;
-}
-.cp-account-devicecode__code {
-  color: var(--text);
-  font-size: 22px;
-  font-weight: 800;
-  line-height: 1.1;
-  font-variant-numeric: tabular-nums;
-  flex: 1 1 auto;
-}
-.cp-account-devicecode__meta {
-  display: flex;
-  gap: 12px;
-  flex-wrap: wrap;
-  color: var(--text-mute);
-  font-size: 11px;
-  font-weight: 600;
 }
 
 .cp-account-message {

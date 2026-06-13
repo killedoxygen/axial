@@ -14,6 +14,10 @@ const CLICK_PULSE_DURATION_MS = 420;
 const DRAG_THRESHOLD_PX = 4;
 const FIT_FOV_DEGREES = 34;
 const FIT_ZOOM = 0.96;
+const OVERLAY_MODEL_GAP_PX = 14;
+const BADGE_HEIGHT_PX = 22;
+const NAMETAG_HEIGHT_PX = 26;
+const OVERLAY_ROW_GAP_PX = 6;
 
 export interface SkinThreePreviewProps {
   src: string;
@@ -45,17 +49,18 @@ function fitCameraToCanvas({
   camera,
   canvas,
   bounds,
-  hasOverlay,
+  overlayHeightPx,
 }: {
   THREE: ThreeModule;
   camera: import('three').PerspectiveCamera;
   canvas: HTMLCanvasElement;
   bounds: SkinModelBounds;
-  hasOverlay: boolean;
+  overlayHeightPx: number;
 }): SkinThreeFitMetrics {
   const width = Math.max(1, Math.round(canvas.getBoundingClientRect().width));
   const height = Math.max(1, Math.round(canvas.getBoundingClientRect().height));
   const aspect = width / height;
+  const hasOverlay = overlayHeightPx > 0;
   const topPadding = hasOverlay ? 0.2 : 0.12;
   const bottomPadding = 0.18;
   const sidePadding = 0.12;
@@ -86,9 +91,21 @@ function fitCameraToCanvas({
   const modelBottom = projectY(bounds.centerY - bounds.halfHeight);
 
   return {
-    overlayTopPx: Math.round(THREE.MathUtils.clamp(modelTop - 4, 8, Math.max(8, height * 0.18))),
+    overlayTopPx: Math.round(THREE.MathUtils.clamp(
+      modelTop - overlayHeightPx - OVERLAY_MODEL_GAP_PX,
+      8,
+      Math.max(8, height * 0.18),
+    )),
     hintBottomPx: Math.round(THREE.MathUtils.clamp(height - modelBottom + 8, 8, 18)),
   };
+}
+
+function estimateOverlayHeightPx(props: SkinThreePreviewProps): number {
+  const rows = [
+    props.badge ? BADGE_HEIGHT_PX : 0,
+    props.nametag ? NAMETAG_HEIGHT_PX : 0,
+  ].filter((height) => height > 0);
+  return rows.reduce((total, height) => total + height, 0) + Math.max(0, rows.length - 1) * OVERLAY_ROW_GAP_PX;
 }
 
 async function setupScene(
@@ -158,7 +175,7 @@ async function setupScene(
       camera,
       canvas,
       bounds,
-      hasOverlay: Boolean(props.badge || props.nametag),
+      overlayHeightPx: estimateOverlayHeightPx(props),
     }));
     setFitState('fitted');
   }
@@ -358,7 +375,7 @@ export function SkinThreePreview(props: SkinThreePreviewProps): JSX.Element {
                 class="cp-skin-three__nametag cp-skin-nametag cp-skin-nametag--editable"
                 title="Rename player"
                 aria-label={`Rename player ${props.nametag}`}
-                data-skin-three-nametag="visible"
+                data-skin-three-nametag="editable"
                 onClick={props.onNametagEdit}
               >
                 <span>{props.nametag}</span>
@@ -369,9 +386,9 @@ export function SkinThreePreview(props: SkinThreePreviewProps): JSX.Element {
                 class="cp-skin-three__nametag cp-skin-nametag"
                 title="Active player"
                 aria-label={`Active player: ${props.nametag}`}
-                data-skin-three-nametag="visible"
+                data-skin-three-nametag="static"
               >
-                {props.nametag}
+                <span>{props.nametag}</span>
               </div>
             )
           )}

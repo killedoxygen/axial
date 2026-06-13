@@ -1,19 +1,25 @@
 import type { JSX } from 'preact';
 import { promptPlayerName, savePlayerName } from '../../player-name';
-import { refreshAccountSkin } from '../../player-skin';
+import { FALLBACK_SKIN_ACCOUNT_KEY, launcherSkinAccountKey, refreshAccountSkin } from '../../player-skin';
 import { config } from '../../store';
 import { AccountSwitcher } from './AccountSwitcher';
-import { useAuthStatus } from './hooks';
+import { useAuthStatus, useLauncherAccounts } from './hooks';
 import { SavedSkinLibrary } from './SavedSkinLibrary';
 
 export function AccountsView(): JSX.Element {
   const cfg = config.value;
   const savedUsername = cfg?.username || 'Player';
   const { status, state, refresh } = useAuthStatus(savedUsername);
-  const onlineReady = state === 'ready' && Boolean(status?.online_mode_ready);
-  const onlineActive = (cfg?.launch_auth_mode ?? 'offline') === 'online';
-  const profileName = status?.minecraft_profile?.name;
-  const playerName = onlineActive && profileName ? profileName : savedUsername;
+  const accountsState = useLauncherAccounts();
+  const activeAccount = accountsState.accounts.find((account) => account.active) ?? null;
+  const onlineActive = activeAccount?.kind === 'microsoft';
+  const onlineReady = state === 'ready' && onlineActive && Boolean(status?.online_mode_ready);
+  const minecraftProfile = onlineActive ? activeAccount?.minecraft_profile ?? status?.minecraft_profile : undefined;
+  const profileName = minecraftProfile?.name;
+  const playerName = activeAccount?.display_name || (onlineActive && profileName ? profileName : savedUsername);
+  const skinAccountKey = activeAccount
+    ? launcherSkinAccountKey(activeAccount.account_id)
+    : FALLBACK_SKIN_ACCOUNT_KEY;
   const renameNametag = onlineActive && profileName
     ? undefined
     : async (): Promise<void> => {
@@ -33,9 +39,10 @@ export function AccountsView(): JSX.Element {
         <AccountSwitcher
           status={status}
           state={state}
-          savedUsername={savedUsername}
+          accounts={accountsState.accounts}
           onChanged={() => {
             refresh();
+            accountsState.refresh();
             refreshAccountSkin();
           }}
         />
@@ -43,7 +50,8 @@ export function AccountsView(): JSX.Element {
 
       <SavedSkinLibrary
         onlineReady={onlineReady}
-        minecraftProfile={status?.minecraft_profile}
+        minecraftProfile={minecraftProfile}
+        skinAccountKey={skinAccountKey}
         playerName={playerName}
         onRenameNametag={renameNametag ? () => void renameNametag() : undefined}
         onApplied={() => {

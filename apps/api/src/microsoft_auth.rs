@@ -199,8 +199,17 @@ pub async fn finish_login(
         minecraft_session_from_oauth(oauth, &flow.device_pair, Some(&flow.session_id)).await?;
     let profile_name = session.profile_name.clone();
     let (msa, account) = login_store
-        .replace_with_msa_and_minecraft_account(session.msa_token, session.minecraft_account)
-        .await;
+        .replace_with_msa_and_minecraft_account_durable(
+            session.msa_token,
+            session.minecraft_account,
+        )
+        .await
+        .map_err(|_| {
+            MicrosoftAuthError::new(
+                MicrosoftAuthErrorKind::StoreUnavailable,
+                MicrosoftAuthStep::Store,
+            )
+        })?;
 
     Ok(MicrosoftLoginOutcome {
         login_id: msa.login_id,
@@ -213,7 +222,7 @@ pub async fn refresh_login(
     login_store: &Arc<AuthLoginStore>,
 ) -> Result<MicrosoftLoginOutcome, MicrosoftAuthError> {
     let initial_generation = login_store.active_auth_generation();
-    let Some(_) = login_store.active_msa_refresh_token().await else {
+    let Some(_) = login_store.active_msa_refresh_login().await else {
         return Err(MicrosoftAuthError::new(
             MicrosoftAuthErrorKind::MissingRefreshToken,
             MicrosoftAuthStep::OAuthRefresh,
@@ -227,7 +236,7 @@ pub async fn refresh_login(
         return Ok(outcome);
     }
 
-    let Some(refresh_token) = login_store.active_msa_refresh_token().await else {
+    let Some((login_id, refresh_token)) = login_store.active_msa_refresh_login().await else {
         return Err(MicrosoftAuthError::new(
             MicrosoftAuthErrorKind::MissingRefreshToken,
             MicrosoftAuthStep::OAuthRefresh,
@@ -239,7 +248,8 @@ pub async fn refresh_login(
     let session = minecraft_session_from_oauth(oauth, &device_pair, None).await?;
     let profile_name = session.profile_name.clone();
     let Some((msa, account)) = login_store
-        .refresh_with_msa_and_minecraft_account(
+        .refresh_login_with_msa_and_minecraft_account(
+            &login_id,
             session.msa_token,
             session.minecraft_account,
             &refresh_token,

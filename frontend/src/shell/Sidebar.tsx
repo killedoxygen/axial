@@ -8,7 +8,7 @@ import { route, navigate, commandPaletteOpen, type Route, openCreate } from '../
 import { runningSessions, config, instances, versionById } from '../store';
 import { instanceInstallStatus } from '../instance-install-status';
 import { promptPlayerName, savePlayerName } from '../player-name';
-import { accountSkinSrc } from '../player-skin';
+import { accountDisplayName, accountSkinSrc } from '../player-skin';
 import { Music, musicStateVersion } from '../music';
 import { local, saveLocalState } from '../state';
 import { Sound } from '../sound';
@@ -257,7 +257,7 @@ function UserMenu({ onClose }: { onClose: () => void }): JSX.Element {
 
 function UserTrigger({ tooltip }: { tooltip: RailTooltipController }): JSX.Element {
   const [open, setOpen] = useState(false);
-  const username = (config.value?.username || 'Player').slice(0, 24);
+  const username = (accountDisplayName.value || config.value?.username || 'Player').slice(0, 24);
   const rootRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {

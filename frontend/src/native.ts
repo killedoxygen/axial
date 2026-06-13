@@ -42,6 +42,7 @@ export interface NativeDragDropPayload {
 
 export interface NativeMicrosoftSignInResult {
   status: 'authenticated' | 'cancelled';
+  login_id?: string | null;
   profile_name?: string | null;
   owns_minecraft_java?: boolean | null;
 }

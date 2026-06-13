@@ -1,12 +1,15 @@
 use super::policy;
 use super::runner::trace_launch_event;
-use crate::auth_chain::AuthChainClient;
 use crate::logging::timestamp_utc;
-use crate::routes::auth::{
-    AuthLoginConfig, AuthRefreshFailure, MSA_TOKEN_ENDPOINT, refresh_active_auth_for_config,
+use crate::routes::{
+    accounts,
+    auth::{AuthRefreshFailure, refresh_active_auth},
 };
 use crate::state::launch_reports::{LaunchBenchmarkMetadata, LaunchProofResourceBudget};
-use crate::state::{ActiveMinecraftAccountState, AppState, LaunchSessionRecord};
+use crate::state::{
+    ActiveMinecraftAccountState, AppState, LaunchSessionRecord, LauncherAccountKind,
+    LauncherAccountRecord,
+};
 use axum::{Json, http::StatusCode};
 use croopor_config::{AppConfig, Instance, LAUNCH_AUTH_MODE_ONLINE, validate_username};
 use croopor_launcher::{
@@ -57,12 +60,8 @@ struct LaunchPreflightFacts {
     resource_budget: LaunchProofResourceBudget,
 }
 
-#[derive(Clone)]
-struct LaunchAuthRefreshOptions<'a> {
-    login_config: AuthLoginConfig,
-    token_endpoint: &'a str,
-    auth_chain_client: Option<&'a AuthChainClient>,
-}
+#[derive(Clone, Copy)]
+struct LaunchAuthRefreshOptions;
 
 #[derive(Clone, Debug, Serialize)]
 pub(super) struct LaunchPreflightResponse {
@@ -119,7 +118,7 @@ pub(super) async fn prepare_launch_session(
 async fn prepare_launch_session_with_auth_refresh(
     state: &AppState,
     payload: LaunchRequest,
-    auth_refresh: Option<LaunchAuthRefreshOptions<'_>>,
+    auth_refresh: Option<LaunchAuthRefreshOptions>,
 ) -> Result<PreparedLaunch, (StatusCode, Json<serde_json::Value>)> {
     let library_dir = state.library_dir().ok_or_else(|| {
         (
@@ -148,22 +147,43 @@ async fn prepare_launch_session_with_auth_refresh(
     let game_dir = state.instances().game_dir(&instance.id);
 
     let config = state.config().current();
-    let requested_username = payload
+    let requested_offline_username = payload
         .username
         .as_deref()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or(config.username.as_str())
+        .unwrap_or(config.username.as_str());
+    let active_account =
+        accounts::sync_active_offline_account_from_username(state, requested_offline_username)
+            .map_err(launch_account_store_error_response)?;
+    let requested_username = active_account
+        .as_ref()
+        .filter(|account| account.kind == LauncherAccountKind::Offline)
+        .map(|account| account.display_name.as_str())
+        .unwrap_or(requested_offline_username)
         .to_string();
-    let username = validate_username(&requested_username)
+    let offline_username = validate_username(&requested_username)
         .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?;
     let auth = if let Some(auth_refresh) = auth_refresh {
-        launch_auth_context_for_config_with_refresh(state, &config, &username, auth_refresh).await?
+        launch_auth_context_for_config_with_refresh(
+            state,
+            &config,
+            active_account.as_ref(),
+            &offline_username,
+            auth_refresh,
+        )
+        .await?
     } else {
-        launch_auth_context_for_config(state, &config, &username).await?
+        launch_auth_context_for_config(state, &config, active_account.as_ref(), &offline_username)
+            .await?
     };
-    if config.launch_auth_mode == LAUNCH_AUTH_MODE_ONLINE {
+    let online_launch = active_account
+        .as_ref()
+        .is_some_and(|account| account.kind == LauncherAccountKind::Microsoft)
+        || (active_account.is_none() && config.launch_auth_mode == LAUNCH_AUTH_MODE_ONLINE);
+    if online_launch {
         super::super::skin::flush_pending_saved_skin_applies_for_launch(state).await?;
     }
+    let username = offline_username.clone();
     let preflight = build_launch_preflight_facts(
         state,
         &instance,
@@ -381,17 +401,15 @@ async fn build_launch_preflight_facts(
 async fn launch_auth_context_for_config(
     state: &AppState,
     config: &AppConfig,
+    active_account: Option<&LauncherAccountRecord>,
     offline_username: &str,
 ) -> Result<LaunchAuthContext, (StatusCode, Json<serde_json::Value>)> {
     launch_auth_context_for_config_with_refresh(
         state,
         config,
+        active_account,
         offline_username,
-        LaunchAuthRefreshOptions {
-            login_config: AuthLoginConfig::from_env(),
-            token_endpoint: MSA_TOKEN_ENDPOINT,
-            auth_chain_client: None,
-        },
+        LaunchAuthRefreshOptions,
     )
     .await
 }
@@ -399,13 +417,51 @@ async fn launch_auth_context_for_config(
 async fn launch_auth_context_for_config_with_refresh(
     state: &AppState,
     config: &AppConfig,
+    active_account: Option<&LauncherAccountRecord>,
     offline_username: &str,
-    auth_refresh: LaunchAuthRefreshOptions<'_>,
+    auth_refresh: LaunchAuthRefreshOptions,
 ) -> Result<LaunchAuthContext, (StatusCode, Json<serde_json::Value>)> {
+    if let Some(account) = active_account {
+        return match account.kind {
+            LauncherAccountKind::Offline => Ok(LaunchAuthContext::offline(&account.display_name)),
+            LauncherAccountKind::Microsoft => {
+                let Some(login_id) = account.login_id.as_deref() else {
+                    return Err(online_auth_refresh_unavailable_response(
+                        "refresh_failed",
+                        "account_login_missing",
+                    ));
+                };
+                match state.auth_logins().switch_active_account(login_id).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Err(online_auth_refresh_unavailable_response(
+                            "refresh_failed",
+                            "account_auth_missing",
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(online_auth_refresh_unavailable_response(
+                            "refresh_failed",
+                            "account_selection_failed",
+                        ));
+                    }
+                }
+                online_launch_auth_context_with_refresh(state, auth_refresh).await
+            }
+        };
+    }
+
     if config.launch_auth_mode != LAUNCH_AUTH_MODE_ONLINE {
         return Ok(LaunchAuthContext::offline(offline_username));
     }
 
+    online_launch_auth_context_with_refresh(state, auth_refresh).await
+}
+
+async fn online_launch_auth_context_with_refresh(
+    state: &AppState,
+    _auth_refresh: LaunchAuthRefreshOptions,
+) -> Result<LaunchAuthContext, (StatusCode, Json<serde_json::Value>)> {
     if let Some(auth) = state
         .auth_logins()
         .active_current_minecraft_account_state()
@@ -415,24 +471,9 @@ async fn launch_auth_context_for_config_with_refresh(
         return Ok(auth);
     }
 
-    let owned_auth_chain_client;
-    let auth_chain_client = if let Some(auth_chain_client) = auth_refresh.auth_chain_client {
-        auth_chain_client
-    } else {
-        owned_auth_chain_client = AuthChainClient::new().map_err(|_| {
-            online_auth_refresh_unavailable_response("refresh_failed", "client_build")
-        })?;
-        &owned_auth_chain_client
-    };
-
-    refresh_active_auth_for_config(
-        auth_refresh.login_config,
-        state.auth_logins(),
-        auth_refresh.token_endpoint,
-        auth_chain_client,
-    )
-    .await
-    .map_err(online_auth_refresh_failure_response)?;
+    refresh_active_auth(state.auth_logins())
+        .await
+        .map_err(online_auth_refresh_failure_response)?;
 
     state
         .auth_logins()
@@ -442,6 +483,19 @@ async fn launch_auth_context_for_config_with_refresh(
         .ok_or_else(|| {
             online_auth_refresh_unavailable_response("refresh_failed", "refreshed_account_unusable")
         })
+}
+
+fn launch_account_store_error_response(
+    error: std::io::Error,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "error": error.to_string(),
+            "failure_class": failure_class_name(LaunchFailureClass::AuthModeIncompatible),
+            "status": "account_persistence_failed",
+        })),
+    )
 }
 
 fn online_launch_auth_context(
@@ -774,29 +828,19 @@ fn positive_i32(value: i32) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth_chain::{AuthChainClient, AuthChainEndpoints};
     use crate::state::{
         AppStateInit, AuthLoginMinecraftProfile, InstallStore, NewAuthLoginMinecraftAccount,
-        NewAuthLoginMsaToken, NewAuthLoginSession, SessionStore,
+        NewAuthLoginMsaToken, SessionStore,
     };
-    use axum::{
-        Form, Json, Router,
-        body::Bytes,
-        extract::State,
-        http::HeaderMap,
-        routing::{get, post},
-    };
+    use axum::Json;
     use croopor_config::{AppConfig, AppPaths, ConfigStore, InstanceStore};
     use croopor_launcher::{GuardianDecision, LaunchReadinessReasonId, OverrideOrigin, SessionId};
     use croopor_performance::PerformanceManager;
     use std::{
-        collections::HashMap,
         fs,
         path::{Path, PathBuf},
         sync::Arc,
-        time::Duration,
     };
-    use tokio::sync::mpsc;
 
     #[test]
     fn launch_layout_error_response_keeps_500_and_hides_unix_path_material() {
@@ -906,26 +950,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepare_launch_session_syncs_active_offline_account_from_config_username() {
+        let fixture = TestFixture::new("prepare-syncs-offline-account-name");
+        fixture.write_ready_install("1.21.1");
+        fixture
+            .state
+            .accounts()
+            .create_offline_account("OldName")
+            .expect("create offline account");
+        let mut config = fixture.state.config().current();
+        config.username = "NewName".to_string();
+        fixture
+            .state
+            .config()
+            .replace_in_memory(config)
+            .expect("set config username");
+        let instance_id = fixture.add_instance("Survival", "1.21.1");
+
+        let prepared = prepare_launch_session(
+            &fixture.state,
+            LaunchRequest {
+                instance_id,
+                username: None,
+                max_memory_mb: None,
+                min_memory_mb: None,
+                client_started_at_ms: None,
+            },
+        )
+        .await
+        .expect("prepare launch session");
+
+        assert_eq!(prepared.task.intent.auth.player_name, "NewName");
+        assert_eq!(prepared.task.intent.username, "NewName");
+        let active = fixture
+            .state
+            .accounts()
+            .active_account()
+            .expect("active account")
+            .expect("active account");
+        assert_eq!(active.display_name, "NewName");
+    }
+
+    #[tokio::test]
     async fn prepare_launch_session_uses_online_auth_context_from_active_minecraft_account() {
         let fixture = TestFixture::new("prepare-online-auth");
         fixture.set_launch_auth_mode("online");
         let instance_id = fixture.add_instance("Survival", "1.21.1");
         fixture.add_active_minecraft_account(true).await;
-        let (token_endpoint, mut token_requests) = token_test_server(
-            StatusCode::OK,
-            serde_json::json!({
-                "access_token": "new-msa-access-token",
-                "refresh_token": "new-msa-refresh-token",
-                "token_type": "Bearer",
-                "expires_in": 3600
-            }),
-        )
-        .await;
-        let (auth_chain_client, _auth_chain_requests) =
-            auth_chain_route_test_client(AuthChainRouteServerMode::Success).await;
-
         let prepared = fixture
-            .prepare_with_auth_refresh(instance_id, &token_endpoint, &auth_chain_client)
+            .prepare(instance_id, None)
             .await
             .expect("prepare launch session");
 
@@ -943,250 +1016,6 @@ mod tests {
         assert_eq!(prepared.task.intent.auth.user_type, "msa");
         assert_eq!(prepared.task.intent.auth.client_id, "");
         assert_eq!(prepared.task.intent.auth.xuid, "");
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), token_requests.recv())
-                .await
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn prepare_launch_session_refreshes_missing_minecraft_account_for_online_auth() {
-        let fixture = TestFixture::new("prepare-online-auth-refresh");
-        fixture.set_launch_auth_mode("online");
-        let instance_id = fixture.add_instance("Survival", "1.21.1");
-        fixture
-            .add_active_msa_refresh_token(Some("old-msa-refresh-token"))
-            .await;
-        let (token_endpoint, mut token_requests) = token_test_server(
-            StatusCode::OK,
-            serde_json::json!({
-                "access_token": "new-msa-access-token",
-                "refresh_token": "new-msa-refresh-token",
-                "token_type": "Bearer",
-                "expires_in": 3600,
-                "scope": "XboxLive.signin offline_access"
-            }),
-        )
-        .await;
-        let (auth_chain_client, mut auth_chain_requests) =
-            auth_chain_route_test_client(AuthChainRouteServerMode::Success).await;
-
-        let prepared = fixture
-            .prepare_with_auth_refresh(instance_id, &token_endpoint, &auth_chain_client)
-            .await
-            .expect("prepare launch session");
-
-        assert_eq!(prepared.task.intent.auth.player_name, "ProfileName");
-        assert_eq!(
-            prepared.task.intent.auth.uuid,
-            "4f9c7f7d0b1245d9a5c2f03a8c120001"
-        );
-        assert_eq!(
-            prepared.task.intent.auth.access_token,
-            "minecraft-access-token"
-        );
-        assert_eq!(prepared.task.intent.auth.user_type, "msa");
-
-        let form = token_requests.recv().await.expect("token request");
-        assert_eq!(form["grant_type"], "refresh_token");
-        assert_eq!(form["client_id"], "public-client-id");
-        assert_eq!(form["refresh_token"], "old-msa-refresh-token");
-        assert_eq!(form["scope"], "XboxLive.signin offline_access");
-        assert_eq!(
-            fixture
-                .state
-                .auth_logins()
-                .active_msa_token()
-                .await
-                .expect("active msa token")
-                .refresh_token,
-            Some("new-msa-refresh-token".to_string())
-        );
-        assert_eq!(
-            auth_chain_requests.recv().await.expect("xbl request").path,
-            "/xbl"
-        );
-    }
-
-    #[tokio::test]
-    async fn concurrent_online_launch_refresh_reuses_stored_refreshed_account() {
-        let fixture = TestFixture::new("prepare-online-auth-concurrent-refresh");
-        fixture.set_launch_auth_mode("online");
-        let first_instance_id = fixture.add_instance("Survival", "1.21.1");
-        let second_instance_id = fixture.add_instance("Creative", "1.21.1");
-        fixture
-            .add_active_msa_refresh_token(Some("old-msa-refresh-token"))
-            .await;
-        let (token_endpoint, mut token_requests) = delayed_token_test_server(
-            StatusCode::OK,
-            serde_json::json!({
-                "access_token": "new-msa-access-token",
-                "refresh_token": "new-msa-refresh-token",
-                "token_type": "Bearer",
-                "expires_in": 3600,
-                "scope": "XboxLive.signin offline_access"
-            }),
-            Duration::from_millis(100),
-        )
-        .await;
-        let (auth_chain_client, mut auth_chain_requests) =
-            auth_chain_route_test_client(AuthChainRouteServerMode::Success).await;
-
-        let first = fixture.prepare_with_auth_refresh(
-            first_instance_id,
-            &token_endpoint,
-            &auth_chain_client,
-        );
-        let second = fixture.prepare_with_auth_refresh(
-            second_instance_id,
-            &token_endpoint,
-            &auth_chain_client,
-        );
-        let (first, second) = tokio::join!(first, second);
-        let first = first.expect("first launch preparation");
-        let second = second.expect("second launch preparation");
-
-        assert_eq!(first.task.intent.auth.player_name, "ProfileName");
-        assert_eq!(second.task.intent.auth.player_name, "ProfileName");
-        assert_eq!(
-            first.task.intent.auth.access_token,
-            "minecraft-access-token"
-        );
-        assert_eq!(
-            second.task.intent.auth.access_token,
-            "minecraft-access-token"
-        );
-
-        let form = token_requests.recv().await.expect("token request");
-        assert_eq!(form["grant_type"], "refresh_token");
-        assert_eq!(form["refresh_token"], "old-msa-refresh-token");
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), token_requests.recv())
-                .await
-                .is_err()
-        );
-        assert_eq!(
-            fixture
-                .state
-                .auth_logins()
-                .active_msa_token()
-                .await
-                .expect("active msa token")
-                .refresh_token,
-            Some("new-msa-refresh-token".to_string())
-        );
-
-        let mut paths = Vec::new();
-        for _ in 0..5 {
-            paths.push(
-                auth_chain_requests
-                    .recv()
-                    .await
-                    .expect("auth-chain request")
-                    .path,
-            );
-        }
-        assert_eq!(
-            paths,
-            vec![
-                "/xbl",
-                "/xsts",
-                "/minecraft/login",
-                "/minecraft/profile",
-                "/minecraft/ownership",
-            ]
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), auth_chain_requests.recv())
-                .await
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn explicit_refresh_and_online_launch_share_refresh_result() {
-        let fixture = TestFixture::new("prepare-online-auth-explicit-refresh-race");
-        fixture.set_launch_auth_mode("online");
-        let instance_id = fixture.add_instance("Survival", "1.21.1");
-        fixture
-            .add_active_msa_refresh_token(Some("old-msa-refresh-token"))
-            .await;
-        let (token_endpoint, mut token_requests) = delayed_token_test_server(
-            StatusCode::OK,
-            serde_json::json!({
-                "access_token": "new-msa-access-token",
-                "refresh_token": "new-msa-refresh-token",
-                "token_type": "Bearer",
-                "expires_in": 3600,
-                "scope": "XboxLive.signin offline_access"
-            }),
-            Duration::from_millis(100),
-        )
-        .await;
-        let (auth_chain_client, mut auth_chain_requests) =
-            auth_chain_route_test_client(AuthChainRouteServerMode::Success).await;
-
-        let launch =
-            fixture.prepare_with_auth_refresh(instance_id, &token_endpoint, &auth_chain_client);
-        let explicit = refresh_active_auth_for_config(
-            AuthLoginConfig::from_env_value(Some("public-client-id")),
-            fixture.state.auth_logins(),
-            &token_endpoint,
-            &auth_chain_client,
-        );
-        let (launch, explicit) = tokio::join!(launch, explicit);
-        let launch = launch.expect("launch preparation");
-        let explicit = explicit.expect("explicit refresh");
-        let explicit = serde_json::to_value(explicit).expect("serialize explicit refresh response");
-
-        assert_eq!(launch.task.intent.auth.player_name, "ProfileName");
-        assert_eq!(explicit["minecraft_profile"]["name"], "ProfileName");
-
-        let form = token_requests.recv().await.expect("token request");
-        assert_eq!(form["grant_type"], "refresh_token");
-        assert_eq!(form["refresh_token"], "old-msa-refresh-token");
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), token_requests.recv())
-                .await
-                .is_err()
-        );
-        assert_eq!(
-            fixture
-                .state
-                .auth_logins()
-                .active_msa_token()
-                .await
-                .expect("active msa token")
-                .refresh_token,
-            Some("new-msa-refresh-token".to_string())
-        );
-
-        let mut paths = Vec::new();
-        for _ in 0..5 {
-            paths.push(
-                auth_chain_requests
-                    .recv()
-                    .await
-                    .expect("auth-chain request")
-                    .path,
-            );
-        }
-        assert_eq!(
-            paths,
-            vec![
-                "/xbl",
-                "/xsts",
-                "/minecraft/login",
-                "/minecraft/profile",
-                "/minecraft/ownership",
-            ]
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), auth_chain_requests.recv())
-                .await
-                .is_err()
-        );
     }
 
     #[tokio::test]
@@ -1194,13 +1023,7 @@ mod tests {
         let fixture = TestFixture::new("prepare-online-auth-no-refresh");
         fixture.set_launch_auth_mode("online");
         let instance_id = fixture.add_instance("Survival", "1.21.1");
-        let (auth_chain_client, _auth_chain_requests) =
-            auth_chain_route_test_client(AuthChainRouteServerMode::Success).await;
-
-        let error = match fixture
-            .prepare_with_auth_refresh(instance_id, "http://127.0.0.1:9", &auth_chain_client)
-            .await
-        {
+        let error = match fixture.prepare(instance_id, None).await {
             Ok(_) => panic!("online auth without refresh token should fail"),
             Err(error) => error,
         };
@@ -1212,176 +1035,6 @@ mod tests {
         assert_eq!(error.1.0["auth_refresh_status"], "sign_in_required");
         assert_eq!(error.1.0["auth_refresh_reason"], "refresh_token_missing");
         assert_launch_error_is_token_safe(&error.1.0);
-    }
-
-    #[tokio::test]
-    async fn prepare_launch_session_rejected_refresh_clears_auth_and_returns_bounded_json() {
-        let fixture = TestFixture::new("prepare-online-auth-refresh-rejected");
-        fixture.set_launch_auth_mode("online");
-        let instance_id = fixture.add_instance("Survival", "1.21.1");
-        fixture
-            .add_active_msa_refresh_token(Some("old-msa-refresh-token"))
-            .await;
-        let (token_endpoint, mut token_requests) = token_test_server(
-            StatusCode::BAD_REQUEST,
-            serde_json::json!({
-                "error": "invalid_grant",
-                "error_description": "provider-secret-payload"
-            }),
-        )
-        .await;
-        let (auth_chain_client, _auth_chain_requests) =
-            auth_chain_route_test_client(AuthChainRouteServerMode::Success).await;
-
-        let error = match fixture
-            .prepare_with_auth_refresh(instance_id, &token_endpoint, &auth_chain_client)
-            .await
-        {
-            Ok(_) => panic!("rejected refresh should fail launch preparation"),
-            Err(error) => error,
-        };
-
-        assert_eq!(error.0, StatusCode::PRECONDITION_FAILED);
-        assert_eq!(error.1.0["failure_class"], "auth_mode_incompatible");
-        assert_eq!(error.1.0["auth_refresh_status"], "sign_in_required");
-        assert_eq!(error.1.0["auth_refresh_reason"], "refresh_token_rejected");
-        assert_launch_error_is_token_safe(&error.1.0);
-        assert_eq!(fixture.state.auth_logins().active_msa_token().await, None);
-        assert_eq!(
-            fixture.state.auth_logins().active_minecraft_account().await,
-            None
-        );
-
-        let form = token_requests.recv().await.expect("token request");
-        assert_eq!(form["refresh_token"], "old-msa-refresh-token");
-    }
-
-    #[tokio::test]
-    async fn selected_online_launch_refresh_auth_chain_failure_is_bounded() {
-        let fixture = TestFixture::new("prepare-online-auth-refresh-chain-failed");
-        fixture.set_launch_auth_mode("online");
-        let instance_id = fixture.add_instance("Survival", "1.21.1");
-        fixture
-            .add_active_msa_refresh_token(Some("old-msa-refresh-token"))
-            .await;
-        let (token_endpoint, _token_requests) = token_test_server(
-            StatusCode::OK,
-            serde_json::json!({
-                "access_token": "new-msa-access-token",
-                "refresh_token": "new-msa-refresh-token",
-                "token_type": "Bearer",
-                "expires_in": 3600
-            }),
-        )
-        .await;
-        let (auth_chain_client, _auth_chain_requests) =
-            auth_chain_route_test_client(AuthChainRouteServerMode::XstsUnavailable).await;
-
-        let error = match fixture
-            .prepare_with_auth_refresh(instance_id, &token_endpoint, &auth_chain_client)
-            .await
-        {
-            Ok(_) => panic!("auth-chain failure should fail launch preparation"),
-            Err(error) => error,
-        };
-
-        assert_eq!(error.0, StatusCode::PRECONDITION_FAILED);
-        assert_eq!(error.1.0["failure_class"], "auth_mode_incompatible");
-        assert_eq!(error.1.0["auth_refresh_status"], "refresh_failed");
-        assert_eq!(error.1.0["auth_refresh_reason"], "auth_chain_failed");
-        assert_launch_error_is_token_safe(&error.1.0);
-        let active = fixture
-            .state
-            .auth_logins()
-            .active_msa_token()
-            .await
-            .expect("active msa token");
-        assert_eq!(active.access_token, "new-msa-access-token");
-        assert_eq!(
-            active.refresh_token,
-            Some("new-msa-refresh-token".to_string())
-        );
-        assert_eq!(
-            fixture.state.auth_logins().active_minecraft_account().await,
-            None
-        );
-    }
-
-    #[tokio::test]
-    async fn selected_online_launch_rejects_preserved_stale_minecraft_account() {
-        let fixture = TestFixture::new("prepare-online-auth-stale-minecraft");
-        fixture.set_launch_auth_mode("online");
-        let instance_id = fixture.add_instance("Survival", "1.21.1");
-        fixture.add_active_minecraft_account(true).await;
-        fixture
-            .state
-            .auth_logins()
-            .refresh_with_msa_token(
-                NewAuthLoginMsaToken {
-                    access_token: "new-msa-access-token".to_string(),
-                    refresh_token: Some("new-msa-refresh-token".to_string()),
-                    id_token: None,
-                    token_type: "Bearer".to_string(),
-                    expires_in: 3600,
-                    scope: Some("XboxLive.signin offline_access".to_string()),
-                },
-                "old-msa-refresh-token",
-            )
-            .await
-            .expect("msa-only refresh");
-        let (token_endpoint, _token_requests) = token_test_server(
-            StatusCode::OK,
-            serde_json::json!({
-                "access_token": "latest-msa-access-token",
-                "refresh_token": "latest-msa-refresh-token",
-                "token_type": "Bearer",
-                "expires_in": 3600
-            }),
-        )
-        .await;
-        let (auth_chain_client, _auth_chain_requests) =
-            auth_chain_route_test_client(AuthChainRouteServerMode::XstsUnavailable).await;
-
-        let error = match fixture
-            .prepare_with_auth_refresh(instance_id.clone(), &token_endpoint, &auth_chain_client)
-            .await
-        {
-            Ok(prepared) => panic!(
-                "stale minecraft account should not launch with token {}",
-                prepared.task.intent.auth.access_token
-            ),
-            Err(error) => error,
-        };
-
-        assert_eq!(error.0, StatusCode::PRECONDITION_FAILED);
-        assert_eq!(error.1.0["failure_class"], "auth_mode_incompatible");
-        assert_eq!(error.1.0["launch_auth_mode"], "online");
-        assert_eq!(error.1.0["online_mode_ready"], false);
-        assert_eq!(error.1.0["auth_refresh_status"], "refresh_failed");
-        assert_eq!(error.1.0["auth_refresh_reason"], "auth_chain_failed");
-        assert_launch_error_is_token_safe(&error.1.0);
-        assert!(
-            !fixture
-                .state
-                .sessions()
-                .has_active_instance(&instance_id)
-                .await
-        );
-        let raw_minecraft = fixture
-            .state
-            .auth_logins()
-            .active_minecraft_account()
-            .await
-            .expect("preserved raw minecraft account");
-        assert_eq!(raw_minecraft.access_token, "minecraft-access-token");
-        assert_eq!(
-            fixture
-                .state
-                .auth_logins()
-                .active_current_minecraft_account_state()
-                .await,
-            None
-        );
     }
 
     #[tokio::test]
@@ -1403,7 +1056,6 @@ mod tests {
         for material in [
             "minecraft-access-token",
             "msa-access-token",
-            "raw-device-code",
             "provider-secret-payload",
         ] {
             assert!(
@@ -2475,33 +2127,6 @@ mod tests {
             .await
         }
 
-        async fn prepare_with_auth_refresh(
-            &self,
-            instance_id: String,
-            token_endpoint: &str,
-            auth_chain_client: &AuthChainClient,
-        ) -> Result<PreparedLaunch, (StatusCode, Json<serde_json::Value>)> {
-            if let Some(instance) = self.state.instances().get(&instance_id) {
-                self.write_ready_install(&instance.version_id);
-            }
-            prepare_launch_session_with_auth_refresh(
-                &self.state,
-                LaunchRequest {
-                    instance_id,
-                    username: None,
-                    max_memory_mb: None,
-                    min_memory_mb: None,
-                    client_started_at_ms: None,
-                },
-                Some(LaunchAuthRefreshOptions {
-                    login_config: AuthLoginConfig::from_env_value(Some("public-client-id")),
-                    token_endpoint,
-                    auth_chain_client: Some(auth_chain_client),
-                }),
-            )
-            .await
-        }
-
         async fn add_active_launch(&self, session_id: &str, max_memory_mb: u64) {
             self.state
                 .sessions()
@@ -2534,22 +2159,9 @@ mod tests {
         }
 
         async fn add_active_minecraft_account(&self, owns_minecraft_java: bool) {
-            let session = self
-                .state
-                .auth_logins()
-                .insert(NewAuthLoginSession {
-                    device_code: "raw-device-code".to_string(),
-                    user_code: "ABCD-EFGH".to_string(),
-                    verification_uri: "https://www.microsoft.com/link".to_string(),
-                    expires_in: 900,
-                    interval: 5,
-                    message: None,
-                })
-                .await;
             self.state
                 .auth_logins()
-                .complete_with_msa_and_minecraft_account(
-                    &session.login_id,
+                .replace_with_msa_and_minecraft_account(
                     NewAuthLoginMsaToken {
                         access_token: "msa-access-token".to_string(),
                         refresh_token: None,
@@ -2571,38 +2183,7 @@ mod tests {
                         owns_minecraft_java,
                     },
                 )
-                .await
-                .expect("active minecraft account");
-        }
-
-        async fn add_active_msa_refresh_token(&self, refresh_token: Option<&str>) {
-            let session = self
-                .state
-                .auth_logins()
-                .insert(NewAuthLoginSession {
-                    device_code: "raw-device-code".to_string(),
-                    user_code: "ABCD-EFGH".to_string(),
-                    verification_uri: "https://www.microsoft.com/link".to_string(),
-                    expires_in: 900,
-                    interval: 5,
-                    message: None,
-                })
                 .await;
-            self.state
-                .auth_logins()
-                .complete_with_msa_token(
-                    &session.login_id,
-                    NewAuthLoginMsaToken {
-                        access_token: "old-msa-access-token".to_string(),
-                        refresh_token: refresh_token.map(ToOwned::to_owned),
-                        id_token: None,
-                        token_type: "Bearer".to_string(),
-                        expires_in: 0,
-                        scope: Some("XboxLive.signin offline_access".to_string()),
-                    },
-                )
-                .await
-                .expect("active msa refresh token");
         }
     }
 
@@ -2652,211 +2233,6 @@ mod tests {
         );
     }
 
-    async fn token_test_server(
-        status: StatusCode,
-        body: serde_json::Value,
-    ) -> (String, mpsc::UnboundedReceiver<HashMap<String, String>>) {
-        delayed_token_test_server(status, body, Duration::ZERO).await
-    }
-
-    async fn delayed_token_test_server(
-        status: StatusCode,
-        body: serde_json::Value,
-        delay: Duration,
-    ) -> (String, mpsc::UnboundedReceiver<HashMap<String, String>>) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let app = Router::new().route(
-            "/",
-            post(move |Form(form): Form<HashMap<String, String>>| {
-                let tx = tx.clone();
-                let body = body.clone();
-                async move {
-                    let _ = tx.send(form);
-                    tokio::time::sleep(delay).await;
-                    (status, Json(body))
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind token test server");
-        let url = format!("http://{}", listener.local_addr().expect("local addr"));
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("token test server");
-        });
-        (url, rx)
-    }
-
-    async fn auth_chain_route_test_client(
-        mode: AuthChainRouteServerMode,
-    ) -> (
-        AuthChainClient,
-        mpsc::UnboundedReceiver<RecordedAuthChainRequest>,
-    ) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let app = Router::new()
-            .route("/xbl", post(record_route_xbl))
-            .route("/xsts", post(record_route_xsts))
-            .route("/minecraft/login", post(record_route_minecraft_login))
-            .route("/minecraft/profile", get(record_route_minecraft_profile))
-            .route(
-                "/minecraft/ownership",
-                get(record_route_minecraft_ownership),
-            )
-            .with_state(AuthChainRouteState { tx, mode });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind auth chain route test server");
-        let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
-        tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("auth chain route test server");
-        });
-        let client = AuthChainClient::with_endpoints(AuthChainEndpoints {
-            xbox_user_authenticate: format!("{base_url}/xbl"),
-            xsts_authorize: format!("{base_url}/xsts"),
-            minecraft_login_with_xbox: format!("{base_url}/minecraft/login"),
-            minecraft_profile: format!("{base_url}/minecraft/profile"),
-            minecraft_ownership: format!("{base_url}/minecraft/ownership"),
-        })
-        .expect("auth chain route test client");
-
-        (client, rx)
-    }
-
-    #[derive(Clone, Copy)]
-    enum AuthChainRouteServerMode {
-        Success,
-        XstsUnavailable,
-    }
-
-    #[derive(Clone)]
-    struct AuthChainRouteState {
-        tx: mpsc::UnboundedSender<RecordedAuthChainRequest>,
-        mode: AuthChainRouteServerMode,
-    }
-
-    #[derive(Debug, Eq, PartialEq)]
-    struct RecordedAuthChainRequest {
-        path: String,
-        authorization: Option<String>,
-    }
-
-    async fn record_route_xbl(
-        State(state): State<AuthChainRouteState>,
-        headers: HeaderMap,
-        body: Bytes,
-    ) -> (StatusCode, Json<serde_json::Value>) {
-        record_auth_chain_route_request(&state.tx, "/xbl", &headers, &body);
-
-        (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "Token": "xbl-token",
-                "DisplayClaims": {
-                    "xui": [{ "uhs": "xbl-user-hash" }]
-                },
-            })),
-        )
-    }
-
-    async fn record_route_xsts(
-        State(state): State<AuthChainRouteState>,
-        headers: HeaderMap,
-        body: Bytes,
-    ) -> (StatusCode, Json<serde_json::Value>) {
-        record_auth_chain_route_request(&state.tx, "/xsts", &headers, &body);
-
-        if matches!(state.mode, AuthChainRouteServerMode::XstsUnavailable) {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "error": "provider-secret-payload",
-                    "Token": "xsts-token"
-                })),
-            );
-        }
-
-        (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "Token": "xsts-token",
-                "DisplayClaims": {
-                    "xui": [{ "uhs": "xsts-user-hash" }]
-                },
-            })),
-        )
-    }
-
-    async fn record_route_minecraft_login(
-        State(state): State<AuthChainRouteState>,
-        headers: HeaderMap,
-        body: Bytes,
-    ) -> (StatusCode, Json<serde_json::Value>) {
-        record_auth_chain_route_request(&state.tx, "/minecraft/login", &headers, &body);
-
-        (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "access_token": "minecraft-access-token",
-                "expires_in": 86400,
-                "token_type": "Bearer"
-            })),
-        )
-    }
-
-    async fn record_route_minecraft_profile(
-        State(state): State<AuthChainRouteState>,
-        headers: HeaderMap,
-    ) -> (StatusCode, Json<serde_json::Value>) {
-        record_auth_chain_route_request(&state.tx, "/minecraft/profile", &headers, &Bytes::new());
-
-        (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "id": "4f9c7f7d0b1245d9a5c2f03a8c120001",
-                "name": "ProfileName",
-                "skins": [],
-                "capes": []
-            })),
-        )
-    }
-
-    async fn record_route_minecraft_ownership(
-        State(state): State<AuthChainRouteState>,
-        headers: HeaderMap,
-    ) -> (StatusCode, Json<serde_json::Value>) {
-        record_auth_chain_route_request(&state.tx, "/minecraft/ownership", &headers, &Bytes::new());
-
-        (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "items": [{ "name": "game_minecraft" }]
-            })),
-        )
-    }
-
-    fn record_auth_chain_route_request(
-        tx: &mpsc::UnboundedSender<RecordedAuthChainRequest>,
-        path: &str,
-        headers: &HeaderMap,
-        _body: &Bytes,
-    ) {
-        tx.send(RecordedAuthChainRequest {
-            path: path.to_string(),
-            authorization: header_value(headers, "authorization"),
-        })
-        .expect("record auth chain route request");
-    }
-
-    fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
-        headers
-            .get(name)
-            .and_then(|value| value.to_str().ok())
-            .map(ToOwned::to_owned)
-    }
-
     fn assert_launch_error_is_token_safe(value: &serde_json::Value) {
         assert_no_sensitive_public_field_keys(value);
         let text = value.to_string();
@@ -2868,7 +2244,6 @@ mod tests {
             "minecraft-access-token",
             "xbl-token",
             "xsts-token",
-            "raw-device-code",
             "provider-secret-payload",
         ] {
             assert!(

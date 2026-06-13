@@ -886,6 +886,7 @@ export interface LocalPrefs {
   sounds: boolean;
   hideSkinNametag: boolean;
   selectedSkin: string;
+  selectedSkinsByAccount: Record<string, string>;
   shortcuts: Record<string, ShortcutBinding>;
   overlayPositions: Record<string, OverlayPosition>;
   lastUpdateCheckAt: string;

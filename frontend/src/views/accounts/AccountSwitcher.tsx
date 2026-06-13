@@ -1,28 +1,37 @@
 import type { JSX } from 'preact';
 import { useState } from 'preact/hooks';
-import { api, apiResourceUrl, isApiError } from '../../api';
+import { setConfig } from '../../actions';
+import { api, isApiError } from '../../api';
+import { hasNativeDesktopRuntime } from '../../native';
+import {
+  FALLBACK_SKIN_ACCOUNT_KEY,
+  accountSkinSrc,
+  minecraftProfileSkinTextureSrc,
+  launcherSkinAccountKey,
+  refreshAccountSkin,
+  selectedSkinForAccount,
+  selectedSkinTextureSrc,
+} from '../../player-skin';
+import { promptNewPlayerName, promptPlayerName } from '../../player-name';
 import { IconButton } from '../../ui/Atoms';
 import { openContextMenu, type ContextMenuItem } from '../../ui/ContextMenu';
 import { showConfirm } from '../../ui/Dialog';
 import { Icon } from '../../ui/Icons';
+import { MicrosoftMark } from '../../ui/MicrosoftMark';
 import { Modal, ModalContent, ModalHeader, ModalTitle } from '../../ui/Modal';
 import { PlayerHeadPreview } from '../../ui/PlayerHeadPreview';
-import { promptPlayerName, savePlayerName } from '../../player-name';
-import { selectedSkinTextureSrc } from '../../player-skin';
-import { config } from '../../store';
-import { localStateVersion } from '../../state';
-import type { LaunchAuthMode } from '../../types';
-import { isRecord } from './api';
-import {
-  configErrorMessage,
-  launchAuthMode,
-  logoutErrorMessage,
-  authProfileSyncErrorMessage,
-  statusCanSelectOnline,
-  authRefreshErrorMessage,
-} from './auth';
-import type { AuthStatusRecord, AuthStatusState } from './types';
+import { authProfileSyncErrorMessage, authRefreshErrorMessage, configErrorMessage, accountCanSelectOnline, accountHasLaunchReadyMinecraft, logoutErrorMessage } from './auth';
+import { isRecord, launcherAccountsResponse } from './api';
+import type { AuthStatusRecord, AuthStatusState, LauncherAccount } from './types';
 import { useMicrosoftSignIn } from './useMicrosoftSignIn';
+
+async function refreshConfigSignal(): Promise<void> {
+  try {
+    setConfig(await api('GET', '/config'));
+  } catch (err: unknown) {
+    console.warn('Could not refresh config after account change.', err);
+  }
+}
 
 function IdentityRow({
   head,
@@ -85,72 +94,147 @@ function IdentityRow({
   );
 }
 
+function AccountSection({
+  title,
+  emptyText,
+  children,
+}: {
+  title: string;
+  emptyText?: string;
+  children: JSX.Element | JSX.Element[];
+}): JSX.Element {
+  const items = Array.isArray(children) ? children : [children];
+  return (
+    <section class="cp-account-section" aria-label={title}>
+      <div class="cp-account-section__title">{title}</div>
+      <div class="cp-account-section__rows">
+        {items.length > 0 ? items : <div class="cp-account-section__empty">{emptyText}</div>}
+      </div>
+    </section>
+  );
+}
+
+function AccountActionButton({
+  head,
+  name,
+  detail,
+  disabled,
+  onSelect,
+}: {
+  head: JSX.Element;
+  name: string;
+  detail: string;
+  disabled?: boolean;
+  onSelect: () => void;
+}): JSX.Element {
+  return (
+    <button type="button" class="cp-account-action" disabled={disabled} onClick={onSelect}>
+      {head}
+      <span class="cp-account-row__id">
+        <span class="cp-account-row__name">{name}</span>
+        <span class="cp-account-row__detail">{detail}</span>
+      </span>
+    </button>
+  );
+}
+
 export function AccountSwitcher({
   status,
   state,
-  savedUsername,
+  accounts,
   onChanged,
 }: {
   status: AuthStatusRecord | null;
   state: AuthStatusState;
-  savedUsername: string;
+  accounts: LauncherAccount[];
   onChanged: () => void;
 }): JSX.Element {
   const [open, setOpen] = useState(false);
-  const [logoutBusy, setLogoutBusy] = useState(false);
+  const [removeBusy, setRemoveBusy] = useState(false);
   const [refreshBusy, setRefreshBusy] = useState(false);
   const [profileSyncBusy, setProfileSyncBusy] = useState(false);
-  const [modeBusy, setModeBusy] = useState<LaunchAuthMode | null>(null);
+  const [selectBusy, setSelectBusy] = useState(false);
 
-  const msaActive = Boolean(status?.msa_authenticated);
-  const profile = status?.minecraft_profile;
-  const profileName = profile?.name ?? (msaActive ? status?.username ?? '' : '');
-  const onlineSelectable = status ? statusCanSelectOnline(status) : false;
-  const savedMode = launchAuthMode(config.value?.launch_auth_mode ?? status?.launch_auth_mode);
-  const onlineActive = savedMode === 'online';
-  const refreshAvailable = Boolean(status?.login_available && status?.msa_refresh_available);
-  const profileSyncAvailable = Boolean(profile);
-  const profileTextureSrc = profile ? apiResourceUrl('/skin/profile/file') : undefined;
-  localStateVersion.value;
-  const accountTextureSrc = selectedSkinTextureSrc() ?? undefined;
-  const externalBusy = logoutBusy || refreshBusy || profileSyncBusy || modeBusy !== null;
+  const activeAccount = accounts.find((account) => account.active) ?? null;
+  const activeMicrosoftAccount = activeAccount?.kind === 'microsoft' ? activeAccount : null;
+  const activeProfile = activeMicrosoftAccount?.minecraft_profile ?? status?.minecraft_profile;
+  const activeProfileName = activeProfile?.name ?? activeMicrosoftAccount?.display_name ?? '';
+  const onlineActive = activeAccount?.kind === 'microsoft';
+  const activeOfflineAccount = activeAccount?.kind === 'offline' ? activeAccount : null;
+  const activeOfflineKey = activeOfflineAccount
+    ? launcherSkinAccountKey(activeOfflineAccount.account_id)
+    : FALLBACK_SKIN_ACCOUNT_KEY;
+  const activeProfileTextureSrc = minecraftProfileSkinTextureSrc(activeProfile) ?? undefined;
+  const offlineTextureSrc = selectedSkinTextureSrc(selectedSkinForAccount(activeOfflineKey)) ?? undefined;
+  const liveAccountTextureSrc = accountSkinSrc.value ?? undefined;
+  const chipName = activeAccount?.display_name || activeProfileName || 'Select account';
+  const chipHeadName = activeAccount ? chipName : 'Player';
+  const accountTextureSrc = activeAccount
+    ? liveAccountTextureSrc ?? (onlineActive && activeProfileTextureSrc ? activeProfileTextureSrc : offlineTextureSrc)
+    : undefined;
+  const refreshAvailable = Boolean(activeMicrosoftAccount?.msa_refresh_available ?? status?.msa_refresh_available);
+  const profileSyncAvailable = Boolean(activeMicrosoftAccount?.minecraft_profile ?? status?.minecraft_profile);
+  const microsoftAccounts = accounts.filter((account) => account.kind === 'microsoft');
+  const offlineAccounts = accounts.filter((account) => account.kind === 'offline');
+  const externalBusy = removeBusy || refreshBusy || profileSyncBusy || selectBusy;
+  const microsoftSignInAvailable = hasNativeDesktopRuntime() || status?.login_available !== false;
   const loginFlow = useMicrosoftSignIn({
-    canStart: !externalBusy && status?.login_available !== false,
-    onAuthenticated: () => {
+    canStart: !externalBusy && microsoftSignInAvailable,
+    onAuthenticated: async (result) => {
+      const latest = launcherAccountsResponse(await api('GET', '/accounts'));
+      if (!latest) throw new Error('Account list could not be read after Microsoft sign-in.');
+
+      const signedInLoginId = typeof result.login_id === 'string' && result.login_id.trim()
+        ? result.login_id.trim()
+        : null;
+      const signedIn = signedInLoginId
+        ? latest.accounts.find((account) => (
+            account.kind === 'microsoft' &&
+            account.login_id === signedInLoginId
+          )) ?? null
+        : latest.accounts.find((account) => account.active && account.kind === 'microsoft') ?? null;
+
+      let active = signedIn?.active
+        ? signedIn
+        : signedInLoginId
+          ? null
+          : latest.accounts.find((account) => account.active && account.kind === 'microsoft') ?? null;
+      if (signedIn && !signedIn.active) {
+        const selected = await api('POST', `/accounts/${encodeURIComponent(signedIn.account_id)}/select`);
+        if (isRecord(selected) && typeof selected.error === 'string') {
+          await refreshConfigSignal();
+          onChanged();
+          refreshAccountSkin();
+          return { tone: 'err', text: configErrorMessage(selected) };
+        }
+        const selectedLatest = launcherAccountsResponse(await api('GET', '/accounts'));
+        active = selectedLatest?.accounts.find((account) => (
+          account.kind === 'microsoft' &&
+          account.login_id === signedIn.login_id &&
+          account.active
+        )) ?? null;
+      }
+
+      if (!active || !accountHasLaunchReadyMinecraft(active)) {
+        await refreshConfigSignal();
+        onChanged();
+        refreshAccountSkin();
+        return {
+          tone: 'err',
+          text: 'Microsoft sign-in completed, but Minecraft Java ownership or profile readiness could not be verified.',
+        };
+      }
+      try {
+        await api('POST', '/skins/from-profile', { mark_current: true });
+      } catch (err: unknown) {
+        console.warn('Could not seed profile skin after Microsoft sign-in.', err);
+      }
+      await refreshConfigSignal();
       onChanged();
+      refreshAccountSkin();
     },
   });
   const busy = externalBusy || loginFlow.busy;
-  const chipName = onlineActive && profileName ? profileName : savedUsername;
-
-  const logout = async (): Promise<void> => {
-    if (busy) return;
-    const ok = await showConfirm(
-      'Sign out of the Microsoft account? Offline launches stay available.',
-      { title: 'Sign out', destructive: true, confirmText: 'Sign out' },
-    );
-    if (!ok) return;
-    setLogoutBusy(true);
-    loginFlow.clearMessage();
-    try {
-      const response = await api('POST', '/auth/logout');
-      if (isRecord(response) && typeof response.error === 'string') {
-        loginFlow.setMessage({ tone: 'err', text: logoutErrorMessage(response) });
-      } else {
-        loginFlow.setMessage({ tone: 'ok', text: 'Microsoft sign-in cleared.' });
-      }
-    } catch (err: unknown) {
-      loginFlow.setMessage({
-        tone: 'err',
-        text: isApiError(err)
-          ? logoutErrorMessage(err.payload)
-          : 'Could not reach the local backend to clear Microsoft sign-in.',
-      });
-    } finally {
-      onChanged();
-      setLogoutBusy(false);
-    }
-  };
 
   const refreshAuth = async (): Promise<void> => {
     if (busy) return;
@@ -167,6 +251,7 @@ export function AccountSwitcher({
         return;
       }
       loginFlow.setMessage({ tone: 'ok', text: 'Microsoft sign-in refreshed.' });
+      await refreshConfigSignal();
     } catch (err: unknown) {
       loginFlow.setMessage({
         tone: 'err',
@@ -195,6 +280,7 @@ export function AccountSwitcher({
         return;
       }
       loginFlow.setMessage({ tone: 'ok', text: 'Minecraft profile synced.' });
+      await refreshConfigSignal();
     } catch (err: unknown) {
       loginFlow.setMessage({
         tone: 'err',
@@ -208,55 +294,151 @@ export function AccountSwitcher({
     }
   };
 
-  const useMode = async (nextMode: LaunchAuthMode): Promise<void> => {
-    if (busy || nextMode === savedMode) return;
-    if (nextMode === 'online' && !onlineSelectable) {
+  const selectAccount = async (account: LauncherAccount): Promise<void> => {
+    if (busy || account.active) return;
+    if (account.kind === 'microsoft' && !accountCanSelectOnline(account)) {
       loginFlow.setMessage({
         tone: 'err',
         text: 'Online needs a verified, Java-owning Minecraft account with valid credentials.',
       });
       return;
     }
-    setModeBusy(nextMode);
+    setSelectBusy(true);
     loginFlow.clearMessage();
     try {
-      const response = await api('PUT', '/config', { launch_auth_mode: nextMode });
+      const selected = await api('POST', `/accounts/${encodeURIComponent(account.account_id)}/select`);
+      if (isRecord(selected) && typeof selected.error === 'string') {
+        loginFlow.setMessage({ tone: 'err', text: configErrorMessage(selected) });
+        return;
+      }
+      await refreshConfigSignal();
+      onChanged();
+      refreshAccountSkin();
+    } catch (err: unknown) {
+      loginFlow.setMessage({
+        tone: 'err',
+        text: isApiError(err)
+          ? configErrorMessage(err.payload)
+          : 'Could not reach the local backend to switch account.',
+      });
+    } finally {
+      setSelectBusy(false);
+    }
+  };
+
+  const createOffline = async (): Promise<void> => {
+    const next = await promptNewPlayerName();
+    if (!next || busy) return;
+    setSelectBusy(true);
+    loginFlow.clearMessage();
+    try {
+      const response = await api('POST', '/accounts/offline', { username: next });
       if (isRecord(response) && typeof response.error === 'string') {
         loginFlow.setMessage({ tone: 'err', text: configErrorMessage(response) });
         return;
       }
-      config.value = response;
+      await refreshConfigSignal();
       onChanged();
-    } catch {
-      loginFlow.setMessage({ tone: 'err', text: 'Could not reach the local backend to save launch mode.' });
+      refreshAccountSkin();
+    } catch (err: unknown) {
+      loginFlow.setMessage({
+        tone: 'err',
+        text: isApiError(err)
+          ? configErrorMessage(err.payload)
+          : 'Could not reach the local backend to create offline identity.',
+      });
     } finally {
-      setModeBusy(null);
+      setSelectBusy(false);
     }
   };
 
-  const renameOffline = async (): Promise<void> => {
-    const next = await promptPlayerName(savedUsername);
-    if (!next) return;
-    const saved = await savePlayerName(next);
-    if (saved) onChanged();
+  const renameOffline = async (account: LauncherAccount): Promise<void> => {
+    const next = await promptPlayerName(account.display_name);
+    if (!next || busy) return;
+    setSelectBusy(true);
+    loginFlow.clearMessage();
+    try {
+      const response = await api('PATCH', `/accounts/${encodeURIComponent(account.account_id)}`, { username: next });
+      if (isRecord(response) && typeof response.error === 'string') {
+        loginFlow.setMessage({ tone: 'err', text: configErrorMessage(response) });
+        return;
+      }
+      await refreshConfigSignal();
+      onChanged();
+      refreshAccountSkin();
+    } catch (err: unknown) {
+      loginFlow.setMessage({
+        tone: 'err',
+        text: isApiError(err)
+          ? configErrorMessage(err.payload)
+          : 'Could not reach the local backend to rename offline identity.',
+      });
+    } finally {
+      setSelectBusy(false);
+    }
   };
 
-  const microsoftMenuItems: ContextMenuItem[] = [
-    ...(profileSyncAvailable
+  const removeAccount = async (account: LauncherAccount): Promise<void> => {
+    if (busy) return;
+    const actionText = account.kind === 'microsoft' && account.active ? 'Sign out' : 'Remove';
+    const ok = await showConfirm(
+      `${actionText} ${account.display_name} from this launcher?`,
+      {
+        title: account.kind === 'microsoft'
+          ? account.active ? 'Sign out' : 'Remove Microsoft account'
+          : 'Remove identity',
+        destructive: true,
+        confirmText: actionText,
+      },
+    );
+    if (!ok) return;
+
+    setRemoveBusy(true);
+    loginFlow.clearMessage();
+    try {
+      const response = await api('DELETE', `/accounts/${encodeURIComponent(account.account_id)}`);
+      if (isRecord(response) && typeof response.error === 'string') {
+        loginFlow.setMessage({ tone: 'err', text: logoutErrorMessage(response) });
+        return;
+      }
+      loginFlow.setMessage({
+        tone: 'ok',
+        text: account.kind === 'microsoft' && account.active ? 'Microsoft account signed out.' : 'Account removed.',
+      });
+      await refreshConfigSignal();
+      onChanged();
+      refreshAccountSkin();
+    } catch (err: unknown) {
+      loginFlow.setMessage({
+        tone: 'err',
+        text: isApiError(err)
+          ? logoutErrorMessage(err.payload)
+          : 'Could not reach the local backend to remove account.',
+      });
+    } finally {
+      setRemoveBusy(false);
+    }
+  };
+
+  const microsoftMenuItems = (account: LauncherAccount): ContextMenuItem[] => [
+    ...(account.active && profileSyncAvailable
       ? [{ icon: 'refresh', label: 'Sync Minecraft profile', onSelect: () => void syncMinecraftProfile() }]
       : []),
-    ...(refreshAvailable
+    ...(account.active && refreshAvailable
       ? [{ icon: 'refresh', label: 'Refresh credentials', onSelect: () => void refreshAuth() }]
       : []),
-    ...(status?.login_available
+    ...(microsoftSignInAvailable
       ? [{ icon: 'globe', label: 'Re-verify with Microsoft', onSelect: () => void loginFlow.startLogin() }]
       : []),
     { label: '', onSelect: () => {}, divider: true },
-    { icon: 'x', label: 'Sign out', onSelect: () => void logout(), danger: true },
+    account.active
+      ? { icon: 'x', label: 'Sign out', onSelect: () => void removeAccount(account), danger: true }
+      : { icon: 'x', label: 'Remove account', onSelect: () => void removeAccount(account), danger: true },
   ];
 
-  const offlineMenuItems: ContextMenuItem[] = [
-    { icon: 'edit', label: 'Rename', onSelect: () => void renameOffline() },
+  const offlineMenuItems = (account: LauncherAccount): ContextMenuItem[] => [
+    { icon: 'edit', label: 'Rename', onSelect: () => void renameOffline(account) },
+    { icon: 'x', label: 'Remove identity', onSelect: () => void removeAccount(account), danger: true },
   ];
 
   return (
@@ -271,15 +453,17 @@ export function AccountSwitcher({
         title="Switch account or identity"
       >
         <PlayerHeadPreview
-          username={chipName || 'Player'}
+          username={chipHeadName}
           textureSrc={accountTextureSrc}
           size={30}
           radius={7}
-          ariaLabel={`${chipName || 'Player'} account`}
+          ariaLabel={`${chipName} account`}
         />
         <span class="cp-account-chip__id">
-          <span class="cp-account-chip__name">{state === 'loading' ? 'Loading' : chipName || 'Player'}</span>
-          <span class="cp-account-chip__mode">{onlineActive ? 'Microsoft account' : 'Offline identity'}</span>
+          <span class="cp-account-chip__name">{state === 'loading' ? 'Loading' : chipName}</span>
+          <span class="cp-account-chip__mode">
+            {activeAccount ? onlineActive ? 'Microsoft account' : 'Offline identity' : 'No account selected'}
+          </span>
         </span>
         <Icon name="chevron-down" size={14} color="var(--text-dim)" />
       </button>
@@ -290,65 +474,103 @@ export function AccountSwitcher({
             <ModalTitle>Accounts</ModalTitle>
           </ModalHeader>
           <div class="cp-account-rows">
-            {msaActive || profile ? (
-              <IdentityRow
-                head={(
-                  <PlayerHeadPreview
-                    username={profileName || 'Player'}
-                    textureSrc={onlineActive ? accountTextureSrc : profileTextureSrc}
-                    size={38}
-                    radius={9}
-                    ariaLabel={`${profileName || 'Microsoft'} profile head`}
+            <AccountSection title="Online" emptyText="No Microsoft accounts added.">
+              {microsoftAccounts.map((account) => {
+                const profile = account.minecraft_profile;
+                const profileName = (profile?.name ?? account.display_name) || 'Microsoft account';
+                const onlineSelectable = accountCanSelectOnline(account);
+                const profileTextureSrc = account.active
+                  ? liveAccountTextureSrc ?? minecraftProfileSkinTextureSrc(profile) ?? undefined
+                  : minecraftProfileSkinTextureSrc(profile) ?? undefined;
+                return (
+                  <IdentityRow
+                    key={account.account_id}
+                    head={(
+                      <PlayerHeadPreview
+                        username={profileName || 'Player'}
+                        textureSrc={profileTextureSrc}
+                        size={38}
+                        radius={9}
+                        ariaLabel={`${profileName || 'Microsoft'} profile head`}
+                      />
+                    )}
+                    name={profileName}
+                    detail={onlineSelectable ? 'Microsoft account' : 'Microsoft account, not ready for online launch'}
+                    active={account.active}
+                    disabled={busy || (!account.active && !onlineSelectable)}
+                    selectTitle={account.active
+                      ? 'Active account'
+                      : onlineSelectable
+                        ? 'Launch with this Microsoft account'
+                        : 'Online launch is not ready'}
+                    onSelect={account.active ? undefined : () => void selectAccount(account)}
+                    menuItems={microsoftMenuItems(account)}
                   />
-                )}
-                name={profileName || 'Microsoft account'}
-                detail={onlineSelectable ? 'Microsoft account' : 'Microsoft account, not ready for online launch'}
-                active={onlineActive}
-                disabled={busy || (!onlineActive && !onlineSelectable)}
-                selectTitle={onlineActive
-                  ? 'Active account'
-                  : onlineSelectable
-                    ? 'Launch with this Microsoft account'
-                    : 'Online launch is not ready'}
-                onSelect={onlineActive ? undefined : () => void useMode('online')}
-                menuItems={microsoftMenuItems}
-              />
-            ) : (
-              <IdentityRow
+                );
+              })}
+            </AccountSection>
+
+            <AccountSection title="Offline" emptyText="No offline identities added.">
+              {offlineAccounts.map((account) => {
+                const textureSrc = account.active
+                  ? liveAccountTextureSrc ?? selectedSkinTextureSrc(
+                      selectedSkinForAccount(launcherSkinAccountKey(account.account_id)),
+                    ) ?? undefined
+                  : selectedSkinTextureSrc(
+                      selectedSkinForAccount(launcherSkinAccountKey(account.account_id)),
+                    ) ?? undefined;
+                return (
+                  <IdentityRow
+                    key={account.account_id}
+                    head={(
+                      <PlayerHeadPreview
+                        username={account.display_name}
+                        textureSrc={textureSrc}
+                        size={38}
+                        radius={9}
+                        ariaLabel={`${account.display_name} offline head`}
+                      />
+                    )}
+                    name={account.display_name}
+                    detail="Offline identity"
+                    active={account.active}
+                    disabled={busy}
+                    selectTitle={account.active ? 'Active identity' : 'Launch with this offline identity'}
+                    onSelect={account.active ? undefined : () => void selectAccount(account)}
+                    menuItems={offlineMenuItems(account)}
+                  />
+                );
+              })}
+            </AccountSection>
+
+            <div class="cp-account-actions" aria-label="Add account">
+              <AccountActionButton
                 head={(
                   <span class="cp-account-row__addhead">
-                    <Icon name="globe" size={17} color="var(--text-mute)" />
+                    <MicrosoftMark size={18} />
                   </span>
                 )}
-                name="Sign in with Microsoft"
-                detail={status?.login_available === false
-                  ? status.login_reason
-                  : 'Apply skins and launch online'}
-                active={false}
-                disabled={busy || status?.login_available === false}
-                selectTitle="Sign in with Microsoft"
+                name={microsoftAccounts.length === 0 ? 'Sign in with Microsoft' : 'Add Microsoft account'}
+                detail={!microsoftSignInAvailable
+                  ? status?.login_reason ?? 'Microsoft sign-in is unavailable.'
+                  : microsoftAccounts.length === 0
+                    ? 'Apply skins and launch online'
+                    : 'Sign in another Minecraft account'}
+                disabled={busy || !microsoftSignInAvailable}
                 onSelect={() => void loginFlow.startLogin()}
               />
-            )}
-
-            <IdentityRow
-              head={(
-                <PlayerHeadPreview
-                  username={savedUsername}
-                  textureSrc={accountTextureSrc}
-                  size={38}
-                  radius={9}
-                  ariaLabel={`${savedUsername} offline head`}
-                />
-              )}
-              name={savedUsername}
-              detail="Offline identity"
-              active={!onlineActive}
-              disabled={busy && !onlineActive}
-              selectTitle={onlineActive ? 'Launch with the offline identity' : 'Active identity'}
-              onSelect={onlineActive ? () => void useMode('offline') : undefined}
-              menuItems={offlineMenuItems}
-            />
+              <AccountActionButton
+                head={(
+                  <span class="cp-account-row__addhead">
+                    <Icon name="plus" size={17} color="var(--text-mute)" />
+                  </span>
+                )}
+                name="New offline identity"
+                detail="Create local username"
+                disabled={busy}
+                onSelect={() => void createOffline()}
+              />
+            </div>
           </div>
 
           {loginFlow.message && (

@@ -51,10 +51,12 @@ export interface AuthStatus {
   msa_provider?: string | null;
   msa_token_expires_in?: number | null;
   msa_refresh_available: boolean;
+  accounts: AuthAccount[];
 }
 
 export type AuthStatusRecord = AuthStatus & MinecraftAuthReadiness;
 export type AuthStatusState = 'loading' | 'ready' | 'unavailable';
+export type LauncherAccountKind = 'microsoft' | 'offline';
 export type SkinVariant = 'classic' | 'slim';
 export type UploadSkinVariant = SkinVariant | 'auto';
 export type SavedSkinSort = 'recent' | 'name' | 'equipped' | 'source';
@@ -76,6 +78,32 @@ export interface SavedSkinRecord {
 export interface SavedSkinsData {
   skins: SavedSkinRecord[];
   pendingApplyKey: string | null;
+}
+
+export interface AuthAccount extends MinecraftAuthReadiness {
+  login_id: string;
+  active: boolean;
+  msa_authenticated: boolean;
+  msa_token_expires_in?: number | null;
+  msa_refresh_available: boolean;
+}
+
+export interface LauncherAccount extends MinecraftAuthReadiness {
+  account_id: string;
+  kind: LauncherAccountKind;
+  display_name: string;
+  active: boolean;
+  login_id?: string;
+  minecraft_profile_id?: string;
+  offline_uuid?: string;
+  msa_authenticated: boolean;
+  msa_token_expires_in?: number | null;
+  msa_refresh_available: boolean;
+}
+
+export interface LauncherAccountsData {
+  active_account_id: string | null;
+  accounts: LauncherAccount[];
 }
 
 export interface SkinFlushResult {

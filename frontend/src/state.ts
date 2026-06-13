@@ -19,6 +19,7 @@ export const defaults: LocalPrefs = {
   sounds: true,
   hideSkinNametag: false,
   selectedSkin: '',
+  selectedSkinsByAccount: {},
   shortcuts: {},
   overlayPositions: {},
   lastUpdateCheckAt: '',
@@ -33,7 +34,12 @@ export function loadLocalState(): LocalPrefs {
       logExpanded?: boolean;
       offlineSkin?: string;
     }>;
-    return { ...defaults, ...saved, selectedSkin: saved.selectedSkin ?? offlineSkin ?? defaults.selectedSkin };
+    return {
+      ...defaults,
+      ...saved,
+      selectedSkin: saved.selectedSkin ?? offlineSkin ?? defaults.selectedSkin,
+      selectedSkinsByAccount: stringRecord(saved.selectedSkinsByAccount),
+    };
   } catch {
     return { ...defaults };
   }
@@ -45,4 +51,13 @@ export const localStateVersion = signal(0);
 export function saveLocalState(): void {
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify(local)); } catch {}
   localStateVersion.value += 1;
+}
+
+function stringRecord(value: unknown): Record<string, string> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const output: Record<string, string> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (typeof entry === 'string') output[key] = entry;
+  }
+  return output;
 }
