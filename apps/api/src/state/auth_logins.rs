@@ -587,38 +587,58 @@ impl AuthLoginStore {
         login_id: &str,
         profile: AuthLoginMinecraftProfile,
     ) -> bool {
+        self.update_active_current_minecraft_profile_and_ownership(login_id, profile, None)
+            .await
+            .is_some()
+    }
+
+    pub async fn update_active_current_minecraft_profile_and_ownership(
+        &self,
+        login_id: &str,
+        profile: AuthLoginMinecraftProfile,
+        owns_minecraft_java: Option<bool>,
+    ) -> Option<ActiveMinecraftAccountState> {
         let now = Utc::now();
         let Some(token) = self.active_msa_token.read().await.clone() else {
-            return false;
+            return None;
         };
         if token.expires_at <= now {
-            return false;
+            return None;
         }
 
         let updated_account = {
             let mut active_account = self.active_minecraft_account.write().await;
             let Some(account) = active_account.as_mut() else {
-                return false;
+                return None;
             };
             if account.login_id != login_id
                 || account.login_id != token.login_id
                 || account.authenticated_at < token.authenticated_at
             {
-                return false;
+                return None;
             }
             if account.expires_at <= now {
                 *active_account = None;
                 self.bump_active_auth_generation();
-                return false;
+                return None;
             }
 
             account.profile = profile;
+            if let Some(owns_minecraft_java) = owns_minecraft_java {
+                account.owns_minecraft_java = owns_minecraft_java;
+            }
             account.clone()
         };
 
         self.bump_active_auth_generation();
         self.save_active_snapshot(&token, Some(&updated_account));
-        true
+        Some(ActiveMinecraftAccountState {
+            token_expires_in: remaining_seconds(
+                updated_account.expires_at,
+                updated_account.expires_in,
+            ),
+            account: updated_account,
+        })
     }
 
     pub(crate) async fn clear_all(&self) -> Result<(usize, bool), AuthPersistenceError> {
@@ -741,6 +761,15 @@ impl Default for AuthLoginStore {
 
 fn saturating_u64_to_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn remaining_seconds(expires_at: DateTime<Utc>, expires_in: u64) -> u64 {
+    let remaining = (expires_at - Utc::now()).num_milliseconds();
+    if remaining <= 0 {
+        return 0;
+    }
+
+    (((remaining as u64) + 999) / 1000).min(expires_in)
 }
 
 fn load_active_snapshot(

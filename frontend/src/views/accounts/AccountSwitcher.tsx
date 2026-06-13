@@ -25,6 +25,7 @@ import {
   pollResponse,
   pollSuccessMessage,
   pollTerminalMessage,
+  authProfileSyncErrorMessage,
   statusCanSelectOnline,
   authRefreshErrorMessage,
   type AuthLoginPending,
@@ -165,6 +166,7 @@ export function AccountSwitcher({
   const [pollHint, setPollHint] = useState<string | null>(null);
   const [logoutBusy, setLogoutBusy] = useState(false);
   const [refreshBusy, setRefreshBusy] = useState(false);
+  const [profileSyncBusy, setProfileSyncBusy] = useState(false);
   const [modeBusy, setModeBusy] = useState<LaunchAuthMode | null>(null);
   const [message, setMessage] = useState<Message>(null);
 
@@ -175,10 +177,11 @@ export function AccountSwitcher({
   const savedMode = launchAuthMode(config.value?.launch_auth_mode ?? status?.launch_auth_mode);
   const onlineActive = savedMode === 'online';
   const refreshAvailable = Boolean(status?.login_available && status?.msa_refresh_available);
+  const profileSyncAvailable = Boolean(profile);
   const profileTextureSrc = profile ? apiResourceUrl('/skin/profile/file') : undefined;
   localStateVersion.value;
   const accountTextureSrc = selectedSkinTextureSrc() ?? undefined;
-  const busy = loginBusy || logoutBusy || refreshBusy || modeBusy !== null;
+  const busy = loginBusy || logoutBusy || refreshBusy || profileSyncBusy || modeBusy !== null;
   const chipName = onlineActive && profileName ? profileName : savedUsername;
 
   useEffect(() => {
@@ -315,6 +318,34 @@ export function AccountSwitcher({
     }
   };
 
+  const syncMinecraftProfile = async (): Promise<void> => {
+    if (busy || login || !profileSyncAvailable) return;
+    setProfileSyncBusy(true);
+    setMessage(null);
+    try {
+      const response = await api('POST', '/auth/profile/sync');
+      if (isRecord(response) && typeof response.error === 'string') {
+        setMessage({ tone: 'err', text: authProfileSyncErrorMessage(response) });
+        return;
+      }
+      if (!isRecord(response) || response.status !== 'profile_synced') {
+        setMessage({ tone: 'err', text: 'Minecraft profile sync returned an unexpected response.' });
+        return;
+      }
+      setMessage({ tone: 'ok', text: 'Minecraft profile synced.' });
+    } catch (err: unknown) {
+      setMessage({
+        tone: 'err',
+        text: isApiError(err)
+          ? authProfileSyncErrorMessage(err.payload)
+          : 'Could not reach the local backend to sync Minecraft profile.',
+      });
+    } finally {
+      onChanged();
+      setProfileSyncBusy(false);
+    }
+  };
+
   const useMode = async (nextMode: LaunchAuthMode): Promise<void> => {
     if (busy || nextMode === savedMode) return;
     if (nextMode === 'online' && !onlineSelectable) {
@@ -349,6 +380,9 @@ export function AccountSwitcher({
   };
 
   const microsoftMenuItems: ContextMenuItem[] = [
+    ...(profileSyncAvailable
+      ? [{ icon: 'refresh', label: 'Sync Minecraft profile', onSelect: () => void syncMinecraftProfile() }]
+      : []),
     ...(refreshAvailable
       ? [{ icon: 'refresh', label: 'Refresh credentials', onSelect: () => void refreshAuth() }]
       : []),

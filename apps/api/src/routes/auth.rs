@@ -178,6 +178,15 @@ struct AuthRefreshAuthenticatedResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct AuthProfileSyncResponse {
+    status: &'static str,
+    minecraft_profile_ready: bool,
+    minecraft_ownership_verified: bool,
+    minecraft_profile: AuthMinecraftProfileResponse,
+    minecraft_token_expires_in: u64,
+}
+
+#[derive(Debug, Serialize)]
 struct AuthLoginMinecraftChainErrorResponse {
     error: &'static str,
     status: &'static str,
@@ -317,6 +326,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/auth/status", get(handle_auth_status))
         .route("/api/v1/auth/login", post(handle_auth_login))
         .route("/api/v1/auth/refresh", post(handle_auth_refresh))
+        .route("/api/v1/auth/profile/sync", post(handle_auth_profile_sync))
         .route("/api/v1/auth/logout", post(handle_auth_logout))
         .route(
             "/api/v1/auth/login/{login_id}",
@@ -385,6 +395,17 @@ async fn handle_auth_refresh(
         &auth_chain_client,
     )
     .await
+}
+
+async fn handle_auth_profile_sync(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let auth_chain_client = match AuthChainClient::new() {
+        Ok(client) => client,
+        Err(error) => return auth_chain_error_response(error),
+    };
+
+    auth_profile_sync(state.auth_logins(), &auth_chain_client).await
 }
 
 async fn handle_auth_logout(
@@ -943,6 +964,55 @@ async fn auth_refresh_success_response(
     })
 }
 
+async fn auth_profile_sync(
+    login_store: &Arc<AuthLoginStore>,
+    auth_chain_client: &AuthChainClient,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(active) = login_store.active_current_minecraft_account_state().await else {
+        return auth_profile_sync_account_required_response();
+    };
+    if active.account.access_token.trim().is_empty() {
+        return auth_profile_sync_account_required_response();
+    }
+
+    let profile = match auth_chain_client
+        .minecraft_profile(&active.account.access_token)
+        .await
+    {
+        Ok(profile) => AuthLoginMinecraftProfile::from(profile),
+        Err(error) => return auth_chain_error_response(error),
+    };
+    let ownership = match auth_chain_client
+        .minecraft_ownership(&active.account.access_token)
+        .await
+    {
+        Ok(ownership) => ownership,
+        Err(error) => return auth_chain_error_response(error),
+    };
+
+    let Some(updated) = login_store
+        .update_active_current_minecraft_profile_and_ownership(
+            &active.account.login_id,
+            profile,
+            Some(ownership.owns_minecraft_java),
+        )
+        .await
+    else {
+        return auth_profile_sync_account_required_response();
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(AuthProfileSyncResponse {
+            status: "profile_synced",
+            minecraft_profile_ready: true,
+            minecraft_ownership_verified: updated.account.owns_minecraft_java,
+            minecraft_profile: auth_minecraft_profile_response(&updated.account.profile),
+            minecraft_token_expires_in: updated.token_expires_in,
+        })),
+    )
+}
+
 async fn auth_refresh_oauth_error(
     login_store: &Arc<AuthLoginStore>,
     error: MsaTokenErrorCode,
@@ -1023,6 +1093,16 @@ fn auth_refresh_sign_in_required_response(
         Json(serde_json::json!({
             "error": message,
             "status": "sign_in_required",
+        })),
+    )
+}
+
+fn auth_profile_sync_account_required_response() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::PRECONDITION_FAILED,
+        Json(serde_json::json!({
+            "error": "Minecraft profile sync needs an active Minecraft account. Sign in or refresh the account, then try again.",
+            "status": "minecraft_account_required",
         })),
     )
 }
@@ -2495,6 +2575,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auth_profile_sync_updates_profile_and_ownership_with_current_minecraft_token() {
+        let store = Arc::new(AuthLoginStore::new());
+        insert_active_current_login(&store, Some("msa-refresh-token")).await;
+        let (auth_chain_client, mut auth_chain_requests) =
+            auth_chain_route_test_client(AuthChainRouteServerMode::NoJavaOwnership).await;
+
+        let response = auth_profile_sync(&store, &auth_chain_client).await;
+
+        assert_eq!(response.0, StatusCode::OK);
+        assert_eq!(response.1.0["status"], "profile_synced");
+        assert_eq!(response.1.0["minecraft_profile_ready"], true);
+        assert_eq!(response.1.0["minecraft_ownership_verified"], false);
+        assert_eq!(response.1.0["minecraft_profile"]["name"], "ProfileName");
+        assert_eq!(
+            response.1.0["minecraft_profile"]["skins"][0]["variant"],
+            "SLIM"
+        );
+        assert!(
+            response.1.0["minecraft_token_expires_in"]
+                .as_u64()
+                .is_some_and(|value| value > 0 && value <= 86400)
+        );
+        assert_no_sensitive_public_fields(&response.1.0);
+
+        let active_msa = store.active_msa_token().await.expect("active msa token");
+        assert_eq!(active_msa.access_token, "old-msa-access-token");
+        assert_eq!(
+            active_msa.refresh_token,
+            Some("msa-refresh-token".to_string())
+        );
+        let minecraft = store
+            .active_minecraft_account()
+            .await
+            .expect("active minecraft account");
+        assert_eq!(minecraft.access_token, "old-minecraft-access-token");
+        assert_eq!(minecraft.profile.name, "ProfileName");
+        assert!(!minecraft.owns_minecraft_java);
+
+        let status = auth_status_for_store(
+            &AppConfig {
+                username: "ConfigUser".to_string(),
+                launch_auth_mode: "online".to_string(),
+                ..AppConfig::default()
+            },
+            AuthLoginConfig::from_env_value(Some("public-client-id")),
+            &store,
+        )
+        .await
+        .expect("auth status");
+        assert_eq!(status.mode, "offline");
+        assert!(!status.online_mode_ready);
+        assert!(status.minecraft_profile_ready);
+        assert!(!status.minecraft_ownership_verified);
+        assert_eq!(
+            status.minecraft_profile.expect("minecraft profile").name,
+            "ProfileName"
+        );
+
+        assert_eq!(
+            auth_chain_requests
+                .recv()
+                .await
+                .expect("minecraft profile request")
+                .authorization
+                .as_deref(),
+            Some("Bearer old-minecraft-access-token")
+        );
+        assert_eq!(
+            auth_chain_requests
+                .recv()
+                .await
+                .expect("minecraft ownership request")
+                .authorization
+                .as_deref(),
+            Some("Bearer old-minecraft-access-token")
+        );
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                auth_chain_requests.recv()
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_profile_sync_missing_account_returns_bounded_response() {
+        let store = Arc::new(AuthLoginStore::new());
+
+        let response = auth_profile_sync(&store, &unused_auth_chain_client()).await;
+
+        assert_eq!(response.0, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(response.1.0["status"], "minecraft_account_required");
+        assert_eq!(
+            response.1.0["error"],
+            "Minecraft profile sync needs an active Minecraft account. Sign in or refresh the account, then try again."
+        );
+        assert_no_sensitive_public_fields(&response.1.0);
+    }
+
+    #[tokio::test]
+    async fn auth_profile_sync_provider_failure_is_bounded_and_preserves_auth() {
+        let store = Arc::new(AuthLoginStore::new());
+        insert_active_current_login(&store, Some("msa-refresh-token")).await;
+        let (auth_chain_client, mut auth_chain_requests) =
+            auth_chain_route_test_client(AuthChainRouteServerMode::ProfileRejected).await;
+
+        let response = auth_profile_sync(&store, &auth_chain_client).await;
+
+        assert_eq!(response.0, StatusCode::BAD_GATEWAY);
+        assert_eq!(response.1.0["status"], "minecraft_auth_chain_failed");
+        assert_eq!(response.1.0["auth_chain_error"], "upstream_rejected");
+        assert_no_sensitive_public_fields(&response.1.0);
+        let active_msa = store.active_msa_token().await.expect("active msa token");
+        assert_eq!(active_msa.access_token, "old-msa-access-token");
+        assert_eq!(
+            active_msa.refresh_token,
+            Some("msa-refresh-token".to_string())
+        );
+        let minecraft = store
+            .active_minecraft_account()
+            .await
+            .expect("active minecraft account");
+        assert_eq!(minecraft.access_token, "old-minecraft-access-token");
+        assert_eq!(minecraft.profile.name, "OldProfileName");
+        assert!(minecraft.owns_minecraft_java);
+
+        assert_eq!(
+            auth_chain_requests
+                .recv()
+                .await
+                .expect("profile request")
+                .path,
+            "/minecraft/profile"
+        );
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                auth_chain_requests.recv()
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn auth_login_poll_auth_chain_failure_does_not_leave_active_profile_state() {
         let store = Arc::new(AuthLoginStore::new());
         let old_session = insert_pending_login(&store).await;
@@ -2943,6 +3170,29 @@ mod tests {
         session
     }
 
+    async fn insert_active_current_login(
+        store: &Arc<AuthLoginStore>,
+        refresh_token: Option<&str>,
+    ) -> AuthLoginSession {
+        let session = insert_pending_login(store).await;
+        store
+            .complete_with_msa_and_minecraft_account(
+                &session.login_id,
+                NewAuthLoginMsaToken {
+                    access_token: "old-msa-access-token".to_string(),
+                    refresh_token: refresh_token.map(ToOwned::to_owned),
+                    id_token: Some("old-msa-id-token".to_string()),
+                    token_type: "Bearer".to_string(),
+                    expires_in: 3600,
+                    scope: Some("XboxLive.signin offline_access".to_string()),
+                },
+                test_minecraft_account("OldProfileName"),
+            )
+            .await
+            .expect("active current login");
+        session
+    }
+
     fn test_minecraft_account(profile_name: &str) -> NewAuthLoginMinecraftAccount {
         NewAuthLoginMinecraftAccount {
             access_token: "old-minecraft-access-token".to_string(),
@@ -3086,6 +3336,8 @@ mod tests {
     enum AuthChainRouteServerMode {
         Success,
         XstsRejected,
+        ProfileRejected,
+        NoJavaOwnership,
     }
 
     #[derive(Clone)]
@@ -3169,6 +3421,16 @@ mod tests {
     ) -> (StatusCode, Json<serde_json::Value>) {
         record_auth_chain_route_request(&state.tx, "/minecraft/profile", &headers, &Bytes::new());
 
+        if matches!(state.mode, AuthChainRouteServerMode::ProfileRejected) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "provider-secret-payload",
+                    "access_token": "minecraft-access-token"
+                })),
+            );
+        }
+
         (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -3194,6 +3456,15 @@ mod tests {
         headers: HeaderMap,
     ) -> (StatusCode, Json<serde_json::Value>) {
         record_auth_chain_route_request(&state.tx, "/minecraft/ownership", &headers, &Bytes::new());
+
+        if matches!(state.mode, AuthChainRouteServerMode::NoJavaOwnership) {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "items": []
+                })),
+            );
+        }
 
         (
             StatusCode::OK,

@@ -156,6 +156,18 @@ export function authRefreshErrorMessage(value: unknown): string {
   return apiErrorMessage(value, 'Could not refresh Microsoft sign-in.');
 }
 
+export function authProfileSyncErrorMessage(value: unknown): string {
+  if (isRecord(value)) {
+    if (value.status === 'minecraft_account_required') {
+      return 'Minecraft profile sync needs a current account. Sign in or refresh the account, then try again.';
+    }
+    if (value.status === 'minecraft_auth_chain_failed') {
+      return 'Minecraft profile sync could not verify profile or ownership. Refresh credentials or re-verify if Online is needed.';
+    }
+  }
+  return apiErrorMessage(value, 'Could not sync Minecraft profile.');
+}
+
 export function configErrorMessage(value: unknown): string {
   return apiErrorMessage(value, 'Could not save launch mode.');
 }
