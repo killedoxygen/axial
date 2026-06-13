@@ -1351,15 +1351,24 @@ impl From<MinecraftCape> for AuthLoginMinecraftCape {
 
 impl AuthLoginConfig {
     pub(crate) fn from_env() -> Self {
-        Self::from_env_value(std::env::var(MSA_CLIENT_ID_ENV).ok().as_deref())
+        Self::from_sources(
+            std::env::var(MSA_CLIENT_ID_ENV).ok().as_deref(),
+            option_env!("CROOPOR_MSA_CLIENT_ID"),
+        )
     }
 
+    #[cfg(test)]
     pub(crate) fn from_env_value(value: Option<&str>) -> Self {
+        Self::from_sources(value, None)
+    }
+
+    pub(crate) fn from_sources(
+        runtime_value: Option<&str>,
+        build_time_value: Option<&str>,
+    ) -> Self {
         Self {
-            client_id: value
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned),
+            client_id: Self::normalize_client_id(runtime_value)
+                .or_else(|| Self::normalize_client_id(build_time_value)),
         }
     }
 
@@ -1373,6 +1382,13 @@ impl AuthLoginConfig {
         } else {
             LOGIN_UNAVAILABLE_REASON
         }
+    }
+
+    fn normalize_client_id(value: Option<&str>) -> Option<String> {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
     }
 }
 
@@ -1686,6 +1702,11 @@ mod tests {
         assert_eq!(AuthLoginConfig::from_env_value(None).client_id, None);
         assert_eq!(AuthLoginConfig::from_env_value(Some("")).client_id, None);
         assert_eq!(AuthLoginConfig::from_env_value(Some("   ")).client_id, None);
+        assert_eq!(AuthLoginConfig::from_sources(None, None).client_id, None);
+        assert_eq!(
+            AuthLoginConfig::from_sources(Some(""), Some("   ")).client_id,
+            None
+        );
     }
 
     #[test]
@@ -1693,6 +1714,30 @@ mod tests {
         assert_eq!(
             AuthLoginConfig::from_env_value(Some(" public-client-id ")).client_id,
             Some("public-client-id".to_string())
+        );
+    }
+
+    #[test]
+    fn auth_login_config_prefers_runtime_client_id_over_build_time_client_id() {
+        assert_eq!(
+            AuthLoginConfig::from_sources(
+                Some(" runtime-public-client-id "),
+                Some(" build-public-client-id "),
+            )
+            .client_id,
+            Some("runtime-public-client-id".to_string())
+        );
+    }
+
+    #[test]
+    fn auth_login_config_uses_build_time_client_id_when_runtime_is_missing_or_blank() {
+        assert_eq!(
+            AuthLoginConfig::from_sources(None, Some(" build-public-client-id ")).client_id,
+            Some("build-public-client-id".to_string())
+        );
+        assert_eq!(
+            AuthLoginConfig::from_sources(Some("   "), Some(" build-public-client-id ")).client_id,
+            Some("build-public-client-id".to_string())
         );
     }
 
