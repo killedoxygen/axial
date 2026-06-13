@@ -10,6 +10,7 @@ use tauri::webview::Color;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 const RESTART_BUSY_MESSAGE: &str = "Restart is blocked while installs or launches are active.";
+const CLOSE_BUSY_MESSAGE: &str = "Close is blocked while installs or launches are active.";
 const SKIN_FILE_MAX_BYTES: u64 = 256 * 1024;
 const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
 
@@ -81,8 +82,20 @@ pub async fn app_restart(app: AppHandle, state: State<'_, AppState>) -> Result<(
 }
 
 fn restart_readiness(active_installs: usize, active_sessions: usize) -> Result<(), String> {
+    activity_readiness(active_installs, active_sessions, RESTART_BUSY_MESSAGE)
+}
+
+fn close_readiness(active_installs: usize, active_sessions: usize) -> Result<(), String> {
+    activity_readiness(active_installs, active_sessions, CLOSE_BUSY_MESSAGE)
+}
+
+fn activity_readiness(
+    active_installs: usize,
+    active_sessions: usize,
+    busy_message: &str,
+) -> Result<(), String> {
     if active_installs > 0 || active_sessions > 0 {
-        Err(RESTART_BUSY_MESSAGE.to_string())
+        Err(busy_message.to_string())
     } else {
         Ok(())
     }
@@ -113,6 +126,10 @@ pub fn window_toggle_maximize(app: AppHandle) -> Result<bool, String> {
 
 #[tauri::command]
 pub async fn window_close(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let active_installs = state.installs().active_install_count().await;
+    let active_sessions = state.sessions().active_session_count().await;
+    close_readiness(active_installs, active_sessions)?;
+
     if let Err((status, _)) = flush_pending_saved_skin_applies_for_shutdown(state.inner()).await {
         tracing::warn!(
             "failed to flush pending skin changes before desktop close: HTTP {}",
@@ -346,8 +363,8 @@ fn launch_state_name(state: LaunchState) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        PNG_SIGNATURE, RESTART_BUSY_MESSAGE, SKIN_FILE_MAX_BYTES, read_skin_file_from_path,
-        restart_readiness,
+        CLOSE_BUSY_MESSAGE, PNG_SIGNATURE, RESTART_BUSY_MESSAGE, SKIN_FILE_MAX_BYTES,
+        close_readiness, read_skin_file_from_path, restart_readiness,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -393,6 +410,21 @@ mod tests {
             restart_readiness(2, 3),
             Err(RESTART_BUSY_MESSAGE.to_string())
         );
+    }
+
+    #[test]
+    fn close_readiness_allows_idle_app() {
+        assert_eq!(close_readiness(0, 0), Ok(()));
+    }
+
+    #[test]
+    fn close_readiness_blocks_active_installs() {
+        assert_eq!(close_readiness(1, 0), Err(CLOSE_BUSY_MESSAGE.to_string()));
+    }
+
+    #[test]
+    fn close_readiness_blocks_active_sessions() {
+        assert_eq!(close_readiness(0, 1), Err(CLOSE_BUSY_MESSAGE.to_string()));
     }
 
     #[test]

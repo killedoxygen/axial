@@ -1,6 +1,8 @@
 import type { JSX } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
 import { Icon } from '../ui/Icons';
+import { toast } from '../toast';
+import { errMessage } from '../utils';
 import {
   hasNativeDesktopRuntime,
   windowClose,
@@ -32,7 +34,11 @@ export function WindowControls(): JSX.Element | null {
     const next = await windowToggleMaximize();
     if (next != null) setMaximized(next);
   };
-  const onClose = (): void => { void windowClose(); };
+  const onClose = (): void => {
+    void windowClose().catch((err: unknown) => {
+      toast(errMessage(err), 'error');
+    });
+  };
 
   return (
     <div class="cp-winctrls cp-nodrag">
