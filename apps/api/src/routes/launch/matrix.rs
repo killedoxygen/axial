@@ -2,7 +2,7 @@ use serde::Serialize;
 
 const MATRIX_SCHEMA: &str = "croopor.launch.benchmark.matrix";
 const MATRIX_SCHEMA_VERSION: u32 = 1;
-const MAX_MATRIX_JSON_BYTES: usize = 8192;
+const MAX_MATRIX_JSON_BYTES: usize = 12 * 1024;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(super) struct BenchmarkMatrix {
@@ -132,6 +132,26 @@ pub(super) fn benchmark_matrix() -> BenchmarkMatrix {
         ],
         representative_targets: vec![
             BenchmarkTargetDescriptor {
+                id: "family_a_1_5_2_vanilla_enhanced",
+                family: "A",
+                version: "1.5.2",
+                loader: "Vanilla",
+                profile: "managed_default",
+                run_type: "coldish",
+                description: "Family A vanilla-enhanced target for older asset layout behavior.",
+                intended_use: "Keep pre-1.6 coverage represented with the safest managed path.",
+            },
+            BenchmarkTargetDescriptor {
+                id: "family_b_1_7_10_vanilla_enhanced",
+                family: "B",
+                version: "1.7.10",
+                loader: "Vanilla",
+                profile: "managed_default",
+                run_type: "coldish",
+                description: "Family B vanilla-enhanced target for late legacy launch behavior.",
+                intended_use: "Keep 1.6-1.7.10 coverage represented without forcing a modern loader.",
+            },
+            BenchmarkTargetDescriptor {
                 id: "family_e_fabric_1_16_5_managed",
                 family: "E",
                 version: "1.16.5",
@@ -180,6 +200,16 @@ pub(super) fn benchmark_matrix() -> BenchmarkMatrix {
                 run_type: "coldish",
                 description: "Family C Forge 1.12.2 managed target for the family-c-forge-core composition.",
                 intended_use: "Measure the first managed Family C Forge core path against its 1.12.2 baseline.",
+            },
+            BenchmarkTargetDescriptor {
+                id: "family_d_1_15_2_vanilla_enhanced",
+                family: "D",
+                version: "1.15.2",
+                loader: "Vanilla",
+                profile: "managed_default",
+                run_type: "coldish",
+                description: "Family D transitional vanilla-enhanced target.",
+                intended_use: "Keep 1.13-1.15.2 coverage represented until a fuller transitional bundle is promoted.",
             },
             BenchmarkTargetDescriptor {
                 id: "legacy_1_8_9_forge_pvp",
@@ -283,6 +313,21 @@ pub(super) fn benchmark_suite_plan(mode: &str) -> Option<Vec<BenchmarkSuiteRunSp
                 run_type: "repeat",
                 target_id: Some("repeat_managed_launch"),
             },
+            BenchmarkSuiteRunSpec {
+                profile: "managed_default",
+                run_type: "coldish",
+                target_id: Some("family_a_1_5_2_vanilla_enhanced"),
+            },
+            BenchmarkSuiteRunSpec {
+                profile: "managed_default",
+                run_type: "coldish",
+                target_id: Some("family_b_1_7_10_vanilla_enhanced"),
+            },
+            BenchmarkSuiteRunSpec {
+                profile: "managed_default",
+                run_type: "coldish",
+                target_id: Some("family_d_1_15_2_vanilla_enhanced"),
+            },
         ]),
         _ => None,
     }
@@ -332,11 +377,14 @@ mod tests {
         assert_eq!(
             target_ids,
             vec![
+                "family_a_1_5_2_vanilla_enhanced",
+                "family_b_1_7_10_vanilla_enhanced",
                 "family_e_fabric_1_16_5_managed",
                 "family_e_fabric_1_20_1_managed",
                 "family_f_modern_fabric_managed",
                 "family_c_forge_1_12_2_vanilla_baseline",
                 "family_c_forge_1_12_2_family_c_forge_core",
+                "family_d_1_15_2_vanilla_enhanced",
                 "legacy_1_8_9_forge_pvp",
                 "degraded_managed_path",
                 "heavy_modded_launch",
@@ -436,6 +484,21 @@ mod tests {
                     run_type: "repeat",
                     target_id: Some("repeat_managed_launch"),
                 },
+                BenchmarkSuiteRunSpec {
+                    profile: "managed_default",
+                    run_type: "coldish",
+                    target_id: Some("family_a_1_5_2_vanilla_enhanced"),
+                },
+                BenchmarkSuiteRunSpec {
+                    profile: "managed_default",
+                    run_type: "coldish",
+                    target_id: Some("family_b_1_7_10_vanilla_enhanced"),
+                },
+                BenchmarkSuiteRunSpec {
+                    profile: "managed_default",
+                    run_type: "coldish",
+                    target_id: Some("family_d_1_15_2_vanilla_enhanced"),
+                },
             ]
         );
 
@@ -452,6 +515,19 @@ mod tests {
             }
         }
         assert_eq!(benchmark_suite_plan("nightly-check"), None);
+    }
+
+    #[test]
+    fn benchmark_matrix_has_representative_target_for_each_version_family() {
+        let families = benchmark_matrix()
+            .representative_targets
+            .iter()
+            .map(|target| target.family)
+            .collect::<HashSet<_>>();
+
+        for family in ["A", "B", "C", "D", "E", "F"] {
+            assert!(families.contains(family), "missing family {family} target");
+        }
     }
 
     #[test]
