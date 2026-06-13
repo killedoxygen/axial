@@ -124,6 +124,7 @@ windows cross-build note:
 
 on Ubuntu/WSL, `setup` installs the Rust target and `gcc-mingw-w64-x86-64` by default unless `CI=true`.
 this currently builds a raw Windows `.exe`, not a signed installer or updater package.
+tagged GitHub releases publish raw desktop archives plus matching `.sha256` checksum sidecars.
 
 ## taskfile
 `Taskfile.yml` mirrors the same commands as `./dev`, but it is optional.

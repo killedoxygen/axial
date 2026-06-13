@@ -137,11 +137,14 @@ jobs:
           cp target/release/croopor-desktop dist/linux/croopor
           chmod +x dist/linux/croopor
           tar -C dist/linux -czf "dist/croopor-linux-amd64-${VERSION}.tar.gz" croopor
+          sha256sum "dist/croopor-linux-amd64-${VERSION}.tar.gz" > "dist/croopor-linux-amd64-${VERSION}.tar.gz.sha256"
 
       - name: Upload linux release asset
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/croopor-linux-amd64-*.tar.gz
+          files: |
+            dist/croopor-linux-amd64-*.tar.gz
+            dist/croopor-linux-amd64-*.tar.gz.sha256
 
   windows-desktop:
     needs: verify
@@ -179,9 +182,14 @@ jobs:
           $version = $env:GITHUB_REF_NAME.TrimStart('v')
           New-Item -ItemType Directory -Force -Path dist/windows | Out-Null
           Copy-Item target/release/croopor-desktop.exe dist/windows/croopor.exe
-          Compress-Archive -Path dist/windows/croopor.exe -DestinationPath "dist/croopor-windows-amd64-$version.zip" -Force
+          $archive = "dist/croopor-windows-amd64-$version.zip"
+          Compress-Archive -Path dist/windows/croopor.exe -DestinationPath $archive -Force
+          $hash = Get-FileHash -Algorithm SHA256 -Path $archive
+          "$($hash.Hash.ToLowerInvariant())  $(Split-Path -Leaf $archive)" | Set-Content -Path "$archive.sha256" -NoNewline -Encoding ascii
 
       - name: Upload windows release asset
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/croopor-windows-amd64-*.zip
+          files: |
+            dist/croopor-windows-amd64-*.zip
+            dist/croopor-windows-amd64-*.zip.sha256
