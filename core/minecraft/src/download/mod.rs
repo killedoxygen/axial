@@ -487,8 +487,9 @@ impl Downloader {
             let result = async {
                 remove_stale_download_temp(&tmp_path).await?;
                 let response = self.client.get(url).send().await?.error_for_status()?;
-                write_download_response(response, &tmp_path, destination, expected).await?;
-                verify_downloaded_file(&tmp_path, destination, expected).await?;
+                let actual =
+                    write_download_response(response, &tmp_path, destination, expected).await?;
+                verify_downloaded_integrity(destination, expected, &actual)?;
                 promote_download_temp(&tmp_path, destination).await?;
                 Ok::<(), DownloadError>(())
             }
@@ -1132,8 +1133,9 @@ async fn download_file_with_client(
         let result = async {
             remove_stale_download_temp(&tmp_path).await?;
             let response = client.get(url).send().await?.error_for_status()?;
-            write_download_response(response, &tmp_path, destination, expected).await?;
-            verify_downloaded_file(&tmp_path, destination, expected).await?;
+            let actual =
+                write_download_response(response, &tmp_path, destination, expected).await?;
+            verify_downloaded_integrity(destination, expected, &actual)?;
             promote_download_temp(&tmp_path, destination).await?;
             Ok::<(), DownloadError>(())
         }
@@ -1158,7 +1160,7 @@ async fn write_download_response(
     tmp_path: &Path,
     destination: &Path,
     expected: &ExpectedIntegrity,
-) -> Result<(), DownloadError> {
+) -> Result<ActualIntegrity, DownloadError> {
     if let Some(expected_size) = expected.size
         && let Some(content_length) = response.content_length()
         && content_length > expected_size
@@ -1172,6 +1174,7 @@ async fn write_download_response(
 
     let mut output = tokio::fs::File::create(tmp_path).await?;
     let mut stream = response.bytes_stream();
+    let mut hasher = Sha1::new();
     let mut written = 0_u64;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
@@ -1185,11 +1188,15 @@ async fn write_download_response(
                 next_written,
             ));
         }
+        hasher.update(&chunk);
         output.write_all(&chunk).await?;
         written = next_written;
     }
     output.flush().await?;
-    Ok(())
+    Ok(ActualIntegrity {
+        size: written,
+        sha1: Some(format!("{:x}", hasher.finalize())),
+    })
 }
 
 async fn remove_stale_download_temp(temp_path: &Path) -> Result<(), DownloadError> {
@@ -1278,24 +1285,15 @@ async fn existing_asset_object_satisfies(
     Ok(true)
 }
 
-async fn verify_downloaded_file(
-    path: &Path,
+fn verify_downloaded_integrity(
     label_path: &Path,
     expected: &ExpectedIntegrity,
+    actual: &ActualIntegrity,
 ) -> Result<(), DownloadError> {
     if !expected.has_evidence() {
         return Ok(());
     }
-    let actual = if expected.sha1.is_some() {
-        hash_file(path).await?
-    } else {
-        let metadata = async_fs::metadata(path).await?;
-        ActualIntegrity {
-            size: metadata.len(),
-            sha1: None,
-        }
-    };
-    verify_download_integrity(label_path, expected, &actual)
+    verify_download_integrity(label_path, expected, actual)
         .map_err(|error| DownloadError::Integrity(error.to_string()))?;
     Ok(())
 }
@@ -1850,6 +1848,82 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn download_file_with_client_rejects_streamed_sha1_mismatch_and_cleans_temp() {
+        let root = temp_dir("sha1-stream-mismatch");
+        let destination = root.join("nested").join("artifact.jar");
+        let tmp_path = destination.with_extension("tmp");
+        let expected =
+            ExpectedIntegrity::from_mojang(8, "0000000000000000000000000000000000000000");
+        let url = spawn_download_response_server(
+            "200 OK",
+            vec![(
+                "Content-Type".to_string(),
+                "application/octet-stream".to_string(),
+            )],
+            b"artifact".to_vec(),
+            3,
+        )
+        .await;
+        let client = build_http_client(Duration::from_secs(5));
+
+        let result = download_file_with_client(&client, &url, &destination, &expected).await;
+
+        assert!(matches!(result, Err(DownloadError::Integrity(_))));
+        assert!(!tmp_path.exists());
+        assert!(!destination.exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn write_download_response_returns_streamed_integrity() {
+        let root = temp_dir("write-response-integrity");
+        fs::create_dir_all(&root).expect("create root");
+        let destination = root.join("artifact.jar");
+        let tmp_path = destination.with_extension("tmp");
+        let body = b"artifact".to_vec();
+        let url = spawn_download_response_server(
+            "200 OK",
+            vec![(
+                "Content-Type".to_string(),
+                "application/octet-stream".to_string(),
+            )],
+            body.clone(),
+            1,
+        )
+        .await;
+        let client = build_http_client(Duration::from_secs(5));
+        let response = client
+            .get(url)
+            .send()
+            .await
+            .expect("download response")
+            .error_for_status()
+            .expect("successful response");
+
+        let actual = write_download_response(
+            response,
+            &tmp_path,
+            &destination,
+            &ExpectedIntegrity::default(),
+        )
+        .await
+        .expect("write response");
+
+        assert_eq!(
+            actual,
+            ActualIntegrity {
+                size: body.len() as u64,
+                sha1: Some(sha1_hex(&body)),
+            }
+        );
+        assert_eq!(fs::read(&tmp_path).expect("read temp artifact"), body);
+        assert!(!destination.exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn download_integrity_futures_stay_small_enough_for_tokio_workers() {
         let path = Path::new("/tmp/croopor-test/artifact.jar");
@@ -1859,10 +1933,6 @@ mod tests {
         assert!(
             std::mem::size_of_val(&hash_file(path)) < 4096,
             "hash_file future should not embed the hash buffer on the task stack"
-        );
-        assert!(
-            std::mem::size_of_val(&verify_downloaded_file(path, path, &expected)) < 4096,
-            "download verification future should stay small"
         );
         assert!(
             std::mem::size_of_val(&existing_file_satisfies(path, &expected)) < 4096,
