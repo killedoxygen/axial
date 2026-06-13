@@ -6,6 +6,10 @@
 dist/
 node_modules
 
+# Local environment
+.env
+.env.local
+
 # Frontend build artifacts
 frontend/static/app.js
 frontend/static/app.css
