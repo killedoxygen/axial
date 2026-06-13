@@ -1,4 +1,5 @@
 pub const DESKTOP_API_STOPPED: &str = "croopor:desktop:api-stopped";
+pub const DESKTOP_CLOSE_BLOCKED: &str = "croopor:desktop:close-blocked";
 
 pub fn install_progress(install_id: &str) -> String {
     format!("croopor:install:{install_id}:progress")

@@ -3,6 +3,7 @@ use crate::healing::{HealingEvent, HealingEventKind};
 use crate::types::LaunchFailureClass;
 
 pub struct HealingSummaryInput<'a> {
+    pub auth_mode: &'a str,
     pub requested_java_path: &'a str,
     pub requested_preset: &'a str,
     pub effective_java_path: Option<&'a str>,
@@ -13,14 +14,13 @@ pub struct HealingSummaryInput<'a> {
 }
 
 pub fn build_healing_summary(input: HealingSummaryInput<'_>) -> Option<LaunchHealingSummary> {
-    let requested_java_path = (!input.requested_java_path.trim().is_empty())
-        .then(|| input.requested_java_path.trim().to_string());
+    let requested_java_path = input.requested_java_path.trim();
     let requested_preset = (!input.requested_preset.trim().is_empty())
         .then(|| input.requested_preset.trim().to_string());
     let effective_java_path = input
         .effective_java_path
         .filter(|value| !value.trim().is_empty())
-        .map(|value| value.trim().to_string());
+        .map(str::trim);
     let effective_preset = input
         .effective_preset
         .filter(|value| !value.trim().is_empty())
@@ -33,6 +33,10 @@ pub fn build_healing_summary(input: HealingSummaryInput<'_>) -> Option<LaunchHea
         .failure_class
         .map(super::mapping::failure_class_name)
         .map(str::to_string);
+    let auth_mode = match input.auth_mode.trim() {
+        "online" => "online",
+        _ => "offline",
+    };
 
     let mut warnings = Vec::new();
     let mut events = Vec::new();
@@ -50,16 +54,16 @@ pub fn build_healing_summary(input: HealingSummaryInput<'_>) -> Option<LaunchHea
             });
         }
     }
-    if let (Some(requested), Some(effective)) =
-        (requested_java_path.as_ref(), effective_java_path.as_ref())
-        && requested != effective
+    if let Some(effective) = effective_java_path
+        && !requested_java_path.is_empty()
+        && requested_java_path != effective
     {
-        let detail =
-            "Requested Java override was bypassed in favor of a safer managed runtime".to_string();
+        let detail = "Requested runtime override was bypassed in favor of a safer managed runtime"
+            .to_string();
         warnings.push(detail.clone());
         events.push(HealingEvent {
             kind: HealingEventKind::RuntimeBypassed,
-            detail: Some(format!("requested={requested} effective={effective}")),
+            detail: Some(detail),
         });
     }
     if let Some(detail) = fallback_applied.as_ref() {
@@ -68,22 +72,10 @@ pub fn build_healing_summary(input: HealingSummaryInput<'_>) -> Option<LaunchHea
             detail: Some(detail.clone()),
         });
     }
-    if matches!(
-        input.failure_class,
-        Some(LaunchFailureClass::StartupStalled)
-    ) {
-        events.push(HealingEvent {
-            kind: HealingEventKind::StartupStalled,
-            detail: Some("no startup activity observed".to_string()),
-        });
-    }
-
     let summary = LaunchHealingSummary {
         requested_preset,
         effective_preset,
-        requested_java_path,
-        effective_java_path,
-        auth_mode: Some("offline".to_string()),
+        auth_mode: Some(auth_mode.to_string()),
         warnings,
         fallback_applied,
         retry_count: (input.retry_count > 0).then_some(input.retry_count),
@@ -93,8 +85,6 @@ pub fn build_healing_summary(input: HealingSummaryInput<'_>) -> Option<LaunchHea
 
     if summary.requested_preset.is_none()
         && summary.effective_preset.is_none()
-        && summary.requested_java_path.is_none()
-        && summary.effective_java_path.is_none()
         && summary.warnings.is_empty()
         && summary.fallback_applied.is_none()
         && summary.retry_count.is_none()
@@ -125,10 +115,13 @@ pub fn infer_loader(version_id: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{HealingSummaryInput, build_healing_summary};
+    use crate::types::LaunchFailureClass;
+    use serde_json::Value;
 
     #[test]
     fn ignores_runtime_bypass_when_java_paths_only_differ_by_whitespace() {
         let summary = build_healing_summary(HealingSummaryInput {
+            auth_mode: "offline",
             requested_java_path: " /usr/bin/java ",
             requested_preset: "",
             effective_java_path: Some("/usr/bin/java"),
@@ -136,21 +129,100 @@ mod tests {
             fallback_applied: None,
             retry_count: 0,
             failure_class: None,
-        })
-        .expect("expected healing summary");
+        });
 
-        assert_eq!(
-            summary.requested_java_path.as_deref(),
-            Some("/usr/bin/java")
-        );
-        assert_eq!(
-            summary.effective_java_path.as_deref(),
-            Some("/usr/bin/java")
-        );
-        assert!(summary.warnings.is_empty());
-        assert!(summary.events.iter().all(|event| !matches!(
+        assert!(summary.is_none());
+    }
+
+    #[test]
+    fn runtime_bypass_summary_serializes_without_java_path_fragments() {
+        let summary = build_healing_summary(HealingSummaryInput {
+            auth_mode: "offline",
+            requested_java_path: " /home/alice/.sdkman/candidates/java/21/bin/java ",
+            requested_preset: "",
+            effective_java_path: Some(r"C:\Users\alice\AppData\Local\VendorRuntime\java.exe"),
+            effective_preset: None,
+            fallback_applied: None,
+            retry_count: 0,
+            failure_class: None,
+        })
+        .expect("expected runtime bypass healing summary");
+
+        assert!(summary.events.iter().any(|event| matches!(
             event.kind,
             crate::healing::HealingEventKind::RuntimeBypassed
         )));
+
+        let serialized = serde_json::to_string(&summary).expect("serialize healing summary");
+        let serialized_lower = serialized.to_ascii_lowercase();
+        for fragment in [
+            "/usr",
+            "/home",
+            "\\",
+            "java",
+            "alice",
+            "sdkman",
+            "candidates",
+            "bin",
+            "users",
+            "appdata",
+            "vendorruntime",
+            "java.exe",
+        ] {
+            assert!(
+                !serialized_lower.contains(fragment),
+                "serialized healing leaked fragment {fragment:?}: {serialized}"
+            );
+        }
+
+        let value: Value = serde_json::from_str(&serialized).expect("parse healing summary");
+        assert!(value.get("requested_java_path").is_none());
+        assert!(value.get("effective_java_path").is_none());
+    }
+
+    #[test]
+    fn startup_stalled_failure_keeps_healing_from_authoring_startup_stalled_copy() {
+        let summary = build_healing_summary(HealingSummaryInput {
+            auth_mode: "offline",
+            requested_java_path: "",
+            requested_preset: "",
+            effective_java_path: None,
+            effective_preset: None,
+            fallback_applied: None,
+            retry_count: 0,
+            failure_class: Some(LaunchFailureClass::StartupStalled),
+        })
+        .expect("expected failure-class evidence summary");
+
+        assert_eq!(summary.failure_class.as_deref(), Some("startup_stalled"));
+        assert!(summary.events.is_empty());
+
+        let serialized = serde_json::to_string(&summary).expect("serialize healing summary");
+        assert!(!serialized.contains("no startup activity observed"));
+        let value: Value = serde_json::from_str(&serialized).expect("parse healing summary");
+        assert!(value.get("events").is_none());
+    }
+
+    #[test]
+    fn non_startup_healing_event_still_appears() {
+        let summary = build_healing_summary(HealingSummaryInput {
+            auth_mode: "online",
+            requested_java_path: "",
+            requested_preset: "graalvm",
+            effective_java_path: None,
+            effective_preset: Some("performance"),
+            fallback_applied: None,
+            retry_count: 0,
+            failure_class: None,
+        })
+        .expect("expected preset downgrade healing summary");
+
+        assert!(summary.events.iter().any(|event| matches!(
+            event.kind,
+            crate::healing::HealingEventKind::PresetDowngraded
+        )));
+        assert!(summary.warnings.iter().any(|warning| {
+            warning.contains("Requested JVM preset \"graalvm\" was downgraded to \"performance\"")
+        }));
     }
 }

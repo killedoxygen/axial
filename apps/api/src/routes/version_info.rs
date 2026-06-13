@@ -11,6 +11,11 @@ use serde::Serialize;
 use std::fs;
 use std::path::{Path as FsPath, PathBuf};
 
+const VERSION_FOLDER_OPEN_ERROR_MESSAGE: &str =
+    "Could not open the version folder. Check desktop permissions and try again.";
+const VERSION_DELETE_ERROR_MESSAGE: &str =
+    "Could not delete the version files. Check library permissions and try again.";
+
 #[derive(Debug, Serialize)]
 struct WorldInfo {
     name: String,
@@ -112,12 +117,7 @@ async fn handle_open_version_folder(
         ));
     }
 
-    open_path(&path).map_err(|error| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": format!("failed to open folder: {error}") })),
-        )
-    })?;
+    open_path(&path).map_err(version_folder_open_error_response)?;
 
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
@@ -182,24 +182,13 @@ async fn handle_delete_version(
     let mut deleted = Vec::new();
     if payload.cascade_dependents {
         for id in to_delete.iter().filter(|id| *id != &version_id) {
-            fs::remove_dir_all(versions_dir(&mc_dir).join(id)).map_err(|error| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({
-                        "error": format!("failed to delete dependent version {id}: {error}")
-                    })),
-                )
-            })?;
+            fs::remove_dir_all(versions_dir(&mc_dir).join(id))
+                .map_err(version_delete_error_response)?;
             deleted.push(id.clone());
         }
     }
 
-    fs::remove_dir_all(&version_dir).map_err(|error| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": format!("failed to delete version: {error}") })),
-        )
-    })?;
+    fs::remove_dir_all(&version_dir).map_err(version_delete_error_response)?;
     deleted.push(version_id.clone());
 
     let affected_instances = state
@@ -223,6 +212,26 @@ fn valid_version_id(id: &str) -> bool {
         && !id.contains('/')
         && !id.contains('\\')
         && FsPath::new(id) == FsPath::new(id).components().as_path()
+}
+
+fn version_folder_open_error_response(
+    _error: std::io::Error,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "error": VERSION_FOLDER_OPEN_ERROR_MESSAGE
+        })),
+    )
+}
+
+fn version_delete_error_response(_error: std::io::Error) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "error": VERSION_DELETE_ERROR_MESSAGE
+        })),
+    )
 }
 
 fn scan_worlds(saves_dir: &FsPath) -> Vec<WorldInfo> {
@@ -303,4 +312,125 @@ fn open_path(path: &FsPath) -> std::io::Result<()> {
 
     let _child = command.spawn()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn public_error_json(
+        mapper: fn(std::io::Error) -> (StatusCode, Json<serde_json::Value>),
+        internal_error: &str,
+    ) -> String {
+        let (status, Json(body)) = mapper(std::io::Error::other(internal_error));
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        serde_json::to_string(&body).expect("serialize public error body")
+    }
+
+    fn assert_public_error_is_bounded(
+        public_json: &str,
+        expected_message: &str,
+        hidden_fragments: &[&str],
+    ) {
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(public_json)
+                .expect("parse public error body")
+                .get("error")
+                .and_then(serde_json::Value::as_str),
+            Some(expected_message)
+        );
+
+        for hidden_fragment in hidden_fragments {
+            assert!(
+                !public_json.contains(hidden_fragment),
+                "{hidden_fragment:?} leaked in {public_json:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn version_folder_open_error_response_hides_unix_paths() {
+        let public_json = public_error_json(
+            version_folder_open_error_response,
+            "xdg-open failed for /home/zero/.minecraft/versions/1.20.1",
+        );
+
+        assert_public_error_is_bounded(
+            &public_json,
+            VERSION_FOLDER_OPEN_ERROR_MESSAGE,
+            &["xdg-open failed", "/home/zero", ".minecraft", "1.20.1"],
+        );
+    }
+
+    #[test]
+    fn version_folder_open_error_response_hides_shell_and_file_manager_text() {
+        let public_json = public_error_json(
+            version_folder_open_error_response,
+            "gio: file:///home/zero/.minecraft/versions/1.20.1: No application is registered as handling this file",
+        );
+
+        assert_public_error_is_bounded(
+            &public_json,
+            VERSION_FOLDER_OPEN_ERROR_MESSAGE,
+            &[
+                "gio:",
+                "file:///home/zero",
+                "No application is registered",
+                "handling this file",
+            ],
+        );
+    }
+
+    #[test]
+    fn version_delete_error_response_hides_windows_paths() {
+        let public_json = public_error_json(
+            version_delete_error_response,
+            r"failed to remove C:\Users\Zero\AppData\Roaming\.minecraft\versions\1.20.1",
+        );
+
+        assert_public_error_is_bounded(
+            &public_json,
+            VERSION_DELETE_ERROR_MESSAGE,
+            &[
+                r"C:\Users\Zero",
+                "AppData",
+                r".minecraft\versions",
+                "1.20.1",
+            ],
+        );
+    }
+
+    #[test]
+    fn version_delete_error_response_hides_raw_os_text() {
+        let public_json = public_error_json(
+            version_delete_error_response,
+            "Permission denied (os error 13)",
+        );
+
+        assert_public_error_is_bounded(
+            &public_json,
+            VERSION_DELETE_ERROR_MESSAGE,
+            &["Permission denied", "os error 13"],
+        );
+    }
+
+    #[test]
+    fn version_delete_error_response_hides_dependent_delete_details() {
+        let public_json = public_error_json(
+            version_delete_error_response,
+            "failed to delete dependent version fabric-loader-0.15.11-1.20.1: Directory not empty (os error 39)",
+        );
+
+        assert_public_error_is_bounded(
+            &public_json,
+            VERSION_DELETE_ERROR_MESSAGE,
+            &[
+                "fabric-loader-0.15.11-1.20.1",
+                "Directory not empty",
+                "os error 39",
+                "failed to delete dependent",
+            ],
+        );
+    }
 }

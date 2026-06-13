@@ -16,18 +16,20 @@
   color: var(--text);
   border: 1px solid var(--line);
   border-radius: var(--r-lg);
-  box-shadow: var(--shadow);
   padding: 22px;
   display: flex;
   flex-direction: column;
   gap: 16px;
   animation: cp-float-up 160ms ease;
 }
+.cp-dialog--choice {
+  width: min(520px, 100%);
+}
 .cp-dialog-title {
   margin: 0;
   font-size: 17px;
   font-weight: 600;
-  letter-spacing: -0.2px;
+  letter-spacing: 0;
 }
 .cp-dialog-body {
   margin: 0;
@@ -40,6 +42,9 @@
   display: flex;
   gap: 8px;
   justify-content: flex-end;
+}
+.cp-dialog-actions--choice {
+  flex-wrap: wrap;
 }
 .cp-dialog-error {
   margin-top: -6px;

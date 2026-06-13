@@ -10,6 +10,15 @@ use std::path::Path;
 use thiserror::Error;
 use zip::ZipArchive;
 
+#[cfg(not(test))]
+const MAX_INSTALLER_PROFILE_ENTRY_BYTES: u64 = 8 << 20;
+#[cfg(test)]
+const MAX_INSTALLER_PROFILE_ENTRY_BYTES: u64 = 1024;
+#[cfg(not(test))]
+const MAX_INSTALLER_EMBEDDED_ENTRY_BYTES: u64 = 128 << 20;
+#[cfg(test)]
+const MAX_INSTALLER_EMBEDDED_ENTRY_BYTES: u64 = 1024;
+
 #[derive(Debug, Error)]
 pub enum ForgeInstallerError {
     #[error("open installer zip: {0}")]
@@ -22,6 +31,8 @@ pub enum ForgeInstallerError {
     MissingVersionJson,
     #[error("invalid installer entry path")]
     InvalidEntryPath,
+    #[error("installer entry {name} is too large")]
+    EntryTooLarge { name: String },
     #[error("download failed: {0}")]
     Download(#[from] DownloadError),
 }
@@ -112,6 +123,7 @@ pub fn extract_maven_entries(jar_data: &[u8], mc_dir: &Path) -> Result<(), Forge
         let Some(relative) = file.name().strip_prefix("maven/") else {
             continue;
         };
+        let relative = relative.to_string();
         if relative.is_empty() || relative.ends_with('/') {
             continue;
         }
@@ -125,6 +137,11 @@ pub fn extract_maven_entries(jar_data: &[u8], mc_dir: &Path) -> Result<(), Forge
         {
             return Err(ForgeInstallerError::InvalidEntryPath);
         }
+        if file.size() > MAX_INSTALLER_EMBEDDED_ENTRY_BYTES {
+            return Err(ForgeInstallerError::EntryTooLarge {
+                name: relative.to_string(),
+            });
+        }
 
         let destination = libraries_dir.join(relative_path);
         if let Ok(metadata) = fs::metadata(&destination)
@@ -137,7 +154,14 @@ pub fn extract_maven_entries(jar_data: &[u8], mc_dir: &Path) -> Result<(), Forge
             fs::create_dir_all(parent)?;
         }
         let mut output = fs::File::create(&destination)?;
-        std::io::copy(&mut file, &mut output)?;
+        let mut bounded = (&mut file).take(MAX_INSTALLER_EMBEDDED_ENTRY_BYTES + 1);
+        let copied = std::io::copy(&mut bounded, &mut output)?;
+        if copied > MAX_INSTALLER_EMBEDDED_ENTRY_BYTES {
+            let _ = fs::remove_file(&destination);
+            return Err(ForgeInstallerError::EntryTooLarge {
+                name: relative.to_string(),
+            });
+        }
     }
 
     Ok(())
@@ -150,8 +174,19 @@ fn read_optional_entry(
     let Ok(mut file) = archive.by_name(name) else {
         return Ok(None);
     };
+    if file.size() > MAX_INSTALLER_PROFILE_ENTRY_BYTES {
+        return Err(ForgeInstallerError::EntryTooLarge {
+            name: name.to_string(),
+        });
+    }
     let mut data = Vec::new();
-    file.read_to_end(&mut data)?;
+    let mut bounded = (&mut file).take(MAX_INSTALLER_PROFILE_ENTRY_BYTES + 1);
+    bounded.read_to_end(&mut data)?;
+    if data.len() as u64 > MAX_INSTALLER_PROFILE_ENTRY_BYTES {
+        return Err(ForgeInstallerError::EntryTooLarge {
+            name: name.to_string(),
+        });
+    }
     Ok(Some(data))
 }
 
@@ -244,9 +279,16 @@ fn normalize_legacy_forge_version_id(path: &str, minecraft: &str) -> Option<Stri
 #[cfg(test)]
 mod tests {
     use super::{
-        merge_libraries_by_name, normalize_legacy_forge_library, normalize_legacy_forge_version_id,
+        ForgeInstallerError, MAX_INSTALLER_EMBEDDED_ENTRY_BYTES, MAX_INSTALLER_PROFILE_ENTRY_BYTES,
+        extract_installer, extract_maven_entries, merge_libraries_by_name,
+        normalize_legacy_forge_library, normalize_legacy_forge_version_id,
     };
     use crate::launch::Library;
+    use std::fs;
+    use std::io::{Cursor, Write};
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use zip::write::SimpleFileOptions;
 
     #[test]
     fn normalizes_legacy_forge_version_id() {
@@ -310,5 +352,69 @@ mod tests {
                 "net.sf.jopt-simple:jopt-simple:6.0-alpha-3".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn extract_installer_rejects_oversized_profile_entry() {
+        let jar = zip_with_entry(
+            "install_profile.json",
+            vec![b' '; (MAX_INSTALLER_PROFILE_ENTRY_BYTES + 1) as usize],
+        );
+
+        let error = extract_installer(&jar).expect_err("oversized install profile should fail");
+
+        assert!(
+            matches!(error, ForgeInstallerError::EntryTooLarge { name } if name == "install_profile.json")
+        );
+    }
+
+    #[test]
+    fn extract_maven_entries_rejects_oversized_entry() {
+        let root = test_root("oversized-maven-entry");
+        let jar = zip_with_entry(
+            "maven/example/mod.jar",
+            vec![b'j'; (MAX_INSTALLER_EMBEDDED_ENTRY_BYTES + 1) as usize],
+        );
+
+        let error =
+            extract_maven_entries(&jar, &root).expect_err("oversized maven entry should fail");
+
+        assert!(
+            matches!(error, ForgeInstallerError::EntryTooLarge { name } if name == "example/mod.jar")
+        );
+        assert!(
+            !root
+                .join("libraries")
+                .join("example")
+                .join("mod.jar")
+                .exists()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn zip_with_entry(name: &str, bytes: Vec<u8>) -> Vec<u8> {
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut cursor);
+            writer
+                .start_file(name, SimpleFileOptions::default())
+                .expect("start zip file");
+            writer.write_all(&bytes).expect("write zip file");
+            writer.finish().expect("finish zip");
+        }
+        cursor.into_inner()
+    }
+
+    fn test_root(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or_default();
+        let root = std::env::temp_dir().join(format!(
+            "croopor-forge-installer-{name}-{}-{nanos:x}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create test root");
+        root
     }
 }

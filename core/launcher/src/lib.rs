@@ -4,21 +4,26 @@ pub mod healing;
 pub mod jvm;
 pub mod process;
 pub mod profile;
+pub mod readiness;
 pub mod runtime;
 pub mod service;
 pub mod session;
 pub mod types;
 
 pub use build::{
-    VanillaLaunchPlan, VanillaLaunchPlanError, VanillaLaunchRequest, cleanup_natives_dir,
-    plan_resolved_launch, plan_vanilla_launch,
+    LaunchAuthContext, VanillaLaunchPlan, VanillaLaunchPlanError, VanillaLaunchRequest,
+    cleanup_natives_dir, plan_resolved_launch, plan_vanilla_launch,
 };
 pub use guardian::{
     GuardianDecision, GuardianIntervention, GuardianInterventionKind, GuardianMode,
-    GuardianSummary, LaunchGuardianContext, OverrideOrigin, PreLaunchAction, PreLaunchDecision,
-    RecoveryAction, RecoveryPlan, ResolvedGuardianPreset, conservative_healing_preset,
-    decide_prepare_failure, guidance_for_failure, recovery_plan_for_startup_failure,
-    resolve_launch_preset,
+    GuardianSummary, LAUNCH_DISK_HEADROOM_MB, LAUNCH_MEMORY_HEADROOM_MB,
+    LOW_MEMORY_ALLOCATION_WARNING_THRESHOLD_MB, LaunchCpuLoadWarningFacts, LaunchGuardianContext,
+    LaunchResourceWarningFacts, LaunchWarningFacts, OverrideOrigin, PreLaunchAction,
+    PreLaunchDecision, RecoveryAction, RecoveryPlan, ResolvedGuardianPreset,
+    StartupFailureDecision, StartupFailureObservation, classify_startup_failure_text,
+    conservative_healing_preset, decide_prepare_failure, decide_startup_failure,
+    guidance_for_failure, recovery_plan_for_startup_failure, resolve_launch_preset,
+    summarize_launch_warnings,
 };
 pub use healing::{HealingEvent, HealingEventKind};
 pub use jvm::{
@@ -26,12 +31,20 @@ pub use jvm::{
     PRESET_SMOOTH, PRESET_ULTRA_LOW_LATENCY, boot_throttle_args, gc_preset_args,
     recommended_preset, sanitize_preset,
 };
-pub use process::{LaunchEvent, LaunchLogEvent, LaunchSessionRecord, LaunchStatusEvent};
+pub use process::{
+    LaunchEvent, LaunchLogEvent, LaunchPriorityEvidence, LaunchSessionRecord, LaunchStageRecord,
+    LaunchStatusEvent,
+};
+pub use readiness::{
+    LaunchReadiness, LaunchReadinessReason, LaunchReadinessReasonId, LaunchReadinessRequest,
+    LaunchReadinessSeverity, inspect_launch_readiness,
+};
 pub use runtime::RuntimeSelection;
 pub use service::{
-    LaunchHealingSummary, LaunchIntent, LaunchPreparationError, PreparedLaunchAttempt,
-    build_healing_summary, failure_class_name, format_failure_class, infer_loader,
-    is_terminal_state, is_terminal_status, launch_state_name, prepare_launch_attempt,
-    sanitize_effective_runtime_major, snapshot_status,
+    LaunchHealingSummary, LaunchIntent, LaunchPreparationError, LaunchPreparationEvent,
+    PreparedLaunchAttempt, build_healing_summary, failure_class_name, format_failure_class,
+    infer_loader, is_terminal_state, is_terminal_status, launch_stage_label, launch_state_name,
+    prepare_launch_attempt, prepare_launch_attempt_with_events, sanitize_effective_runtime_major,
+    snapshot_status,
 };
 pub use types::{InstanceId, LaunchFailure, LaunchFailureClass, LaunchState, SessionId, VersionId};

@@ -1,5 +1,7 @@
 import net from 'node:net';
+import { rm } from 'node:fs/promises';
 import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
 import { context, build } from 'esbuild';
 
 const require = createRequire(import.meta.url);
@@ -8,6 +10,7 @@ const strictDevPort = process.argv.includes('--strict-port');
 const portOverride = process.env.PORT;
 const defaultDevPort = 3000;
 const webApiBase = process.env.CROOPOR_WEB_API_BASE ?? 'http://127.0.0.1:43430';
+const enableDevLab = mode === 'serve' || mode === 'watch';
 
 const reactCompatAliases = new Map([
   ['react', 'preact/compat'],
@@ -15,6 +18,18 @@ const reactCompatAliases = new Map([
   ['react/jsx-runtime', 'preact/jsx-runtime'],
   ['react/jsx-dev-runtime', 'preact/jsx-runtime'],
 ]);
+
+const openaiIconSubsetPath = fileURLToPath(new URL('./src/vendor/openai-icons-subset.js', import.meta.url));
+const generatedOutputs = ['static/app.js', 'static/app.css', 'static/chunks'];
+
+const openaiIconSubsetPlugin = {
+  name: 'openai-icon-subset',
+  setup(b) {
+    b.onResolve({ filter: /^@openai\/apps-sdk-ui\/components\/Icon$/ }, () => ({
+      path: openaiIconSubsetPath,
+    }));
+  },
+};
 
 const preactCompatAliasPlugin = {
   name: 'preact-compat-alias',
@@ -31,14 +46,17 @@ const shared = {
   entryPoints: { app: 'src/main.tsx' },
   bundle: true,
   outdir: 'static',
-  format: 'iife',
+  format: 'esm',
+  splitting: true,
+  chunkNames: 'chunks/[name]-[hash]',
   target: ['es2020'],
   jsx: 'automatic',
   jsxImportSource: 'preact',
   define: {
     __CROOPOR_WEB_API_BASE__: JSON.stringify(webApiBase),
+    __CROOPOR_ENABLE_DEV_LAB__: JSON.stringify(enableDevLab),
   },
-  plugins: [preactCompatAliasPlugin],
+  plugins: [openaiIconSubsetPlugin, preactCompatAliasPlugin],
 };
 
 const sizeReporter = {
@@ -46,8 +64,11 @@ const sizeReporter = {
   setup(b) {
     b.onEnd(result => {
       if (result.errors.length) return;
-      const out = result.metafile?.outputs['static/app.js'];
-      if (out) console.log(`  static/app.js  ${(out.bytes / 1024).toFixed(1)}kb`);
+      for (const [path, out] of Object.entries(result.metafile?.outputs ?? {})) {
+        if (out.entryPoint || out.imports.some(imported => imported.kind === 'dynamic-import')) {
+          console.log(`  ${path}  ${(out.bytes / 1024).toFixed(1)}kb`);
+        }
+      }
     });
   },
 };
@@ -109,6 +130,10 @@ async function resolveDevPort() {
   throw new Error('Could not find a free dev server port');
 }
 
+async function cleanGeneratedOutputs() {
+  await Promise.all(generatedOutputs.map(path => rm(path, { recursive: true, force: true })));
+}
+
 if (mode === 'serve') {
   // Standalone dev server, rebuilds per request and does not write to disk
   const port = await resolveDevPort();
@@ -128,6 +153,7 @@ if (mode === 'serve') {
   await new Promise(() => {});
 } else {
   // Production build
+  await cleanGeneratedOutputs();
   const result = await build({ ...shared, minify: true, metafile: true });
   const bytes = result.metafile?.outputs['static/app.js']?.bytes ?? 0;
   console.log(`static/app.js  ${(bytes / 1024).toFixed(1)}kb`);

@@ -7,11 +7,16 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use tokio::process::Command;
 use zip::ZipArchive;
+
+#[cfg(not(test))]
+const MAX_INSTALLER_DATA_ENTRY_BYTES: u64 = 128 << 20;
+#[cfg(test)]
+const MAX_INSTALLER_DATA_ENTRY_BYTES: u64 = 1024;
 
 #[derive(Debug, Error)]
 pub enum ProcessorError {
@@ -48,7 +53,7 @@ struct Processor {
     sides: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct DataEntry {
     #[serde(default)]
     client: String,
@@ -81,14 +86,15 @@ where
         }
     }
 
-    let (data_vars, temp_dir) = build_data_vars(
+    let (data_vars, temp_dir) = build_data_vars_blocking(
         &profile.data,
         mc_dir,
         mc_version,
         installer_data,
         work_dir,
         installer_path,
-    )?;
+    )
+    .await?;
     let processors = profile
         .processors
         .into_iter()
@@ -212,13 +218,18 @@ fn build_data_vars(
         }
 
         if let Some(entry_path) = value.strip_prefix('/') {
+            let destination_path = safe_installer_entry_path(entry_path)?;
             if temp_dir.is_none() {
                 temp_dir = Some(create_temp_dir(work_dir)?);
             }
+            let temp_dir_path = temp_dir.as_deref().ok_or_else(|| {
+                ProcessorError::Command("processor temp directory unavailable".to_string())
+            })?;
             let extracted = extract_from_installer_jar(
                 installer_data,
                 entry_path,
-                temp_dir.as_ref().expect("temp dir just set"),
+                &destination_path,
+                temp_dir_path,
             )?;
             vars.insert(key.clone(), extracted.to_string_lossy().to_string());
             continue;
@@ -250,6 +261,35 @@ fn build_data_vars(
     Ok((vars, temp_dir))
 }
 
+async fn build_data_vars_blocking(
+    data: &HashMap<String, DataEntry>,
+    mc_dir: &Path,
+    mc_version: &str,
+    installer_data: &[u8],
+    work_dir: &Path,
+    installer_path: &Path,
+) -> Result<(HashMap<String, String>, Option<PathBuf>), ProcessorError> {
+    let data = data.clone();
+    let mc_dir = mc_dir.to_path_buf();
+    let mc_version = mc_version.to_string();
+    let installer_data = installer_data.to_vec();
+    let work_dir = work_dir.to_path_buf();
+    let installer_path = installer_path.to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        build_data_vars(
+            &data,
+            &mc_dir,
+            &mc_version,
+            &installer_data,
+            &work_dir,
+            &installer_path,
+        )
+    })
+    .await
+    .map_err(|error| ProcessorError::Command(format!("blocking task failed: {error}")))?
+}
+
 fn create_temp_dir(work_dir: &Path) -> Result<PathBuf, std::io::Error> {
     let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -263,19 +303,60 @@ fn create_temp_dir(work_dir: &Path) -> Result<PathBuf, std::io::Error> {
 fn extract_from_installer_jar(
     jar_data: &[u8],
     entry_path: &str,
+    destination_path: &Path,
     temp_dir: &Path,
 ) -> Result<PathBuf, ProcessorError> {
     let mut archive = ZipArchive::new(std::io::Cursor::new(jar_data))?;
     let mut file = archive
         .by_name(entry_path)
         .map_err(|_| ProcessorError::Command(format!("extracting {entry_path} from installer")))?;
-    let destination = temp_dir.join(Path::new(entry_path));
+    if file.size() > MAX_INSTALLER_DATA_ENTRY_BYTES {
+        return Err(oversized_installer_entry_error(entry_path));
+    }
+    let destination = temp_dir.join(destination_path);
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
     }
     let mut output = fs::File::create(&destination)?;
-    std::io::copy(&mut file, &mut output)?;
+    let mut bounded = (&mut file).take(MAX_INSTALLER_DATA_ENTRY_BYTES + 1);
+    let copied = std::io::copy(&mut bounded, &mut output)?;
+    if copied > MAX_INSTALLER_DATA_ENTRY_BYTES {
+        let _ = fs::remove_file(&destination);
+        return Err(oversized_installer_entry_error(entry_path));
+    }
     Ok(destination)
+}
+
+fn safe_installer_entry_path(entry_path: &str) -> Result<PathBuf, ProcessorError> {
+    let path = Path::new(entry_path);
+    if entry_path.trim().is_empty() {
+        return Err(unsafe_installer_entry_error(entry_path));
+    }
+
+    let mut safe = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(segment) => safe.push(segment),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(unsafe_installer_entry_error(entry_path));
+            }
+        }
+    }
+
+    if safe.as_os_str().is_empty() {
+        return Err(unsafe_installer_entry_error(entry_path));
+    }
+
+    Ok(safe)
+}
+
+fn unsafe_installer_entry_error(entry_path: &str) -> ProcessorError {
+    ProcessorError::Command(format!("unsafe installer entry path: {entry_path}"))
+}
+
+fn oversized_installer_entry_error(entry_path: &str) -> ProcessorError {
+    ProcessorError::Command(format!("installer entry too large: {entry_path}"))
 }
 
 async fn run_processor(
@@ -309,7 +390,7 @@ async fn run_processor(
         .map(|path| path.to_string_lossy().to_string())
         .collect::<Vec<_>>()
         .join(separator);
-    let main_class = read_main_class_from_jar(&proc_jar_path)?;
+    let main_class = read_main_class_from_jar_blocking(proc_jar_path.clone()).await?;
 
     let mut args = vec!["-cp".to_string(), classpath, main_class];
     for arg in &processor.args {
@@ -359,6 +440,12 @@ fn read_main_class_from_jar(jar_path: &Path) -> Result<String, ProcessorError> {
     manifest.read_to_end(&mut data)?;
     parse_manifest_main_class(&data)
         .ok_or_else(|| ProcessorError::Command("no Main-Class in manifest".to_string()))
+}
+
+async fn read_main_class_from_jar_blocking(jar_path: PathBuf) -> Result<String, ProcessorError> {
+    tokio::task::spawn_blocking(move || read_main_class_from_jar(&jar_path))
+        .await
+        .map_err(|error| ProcessorError::Command(format!("blocking task failed: {error}")))?
 }
 
 fn parse_manifest_main_class(data: &[u8]) -> Option<String> {
@@ -429,5 +516,133 @@ fn substitute_arg(
         arg.to_string()
     } else {
         substitute_arg(&replaced, lib_paths, data_vars, lib_dir, depth + 1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+
+    #[test]
+    fn build_data_vars_rejects_unsafe_installer_entry_path() {
+        let root = test_root("unsafe-installer-entry");
+        let mut data = HashMap::new();
+        data.insert(
+            "EXTRACTED".to_string(),
+            DataEntry {
+                client: "/../outside.txt".to_string(),
+            },
+        );
+
+        let error = build_data_vars(
+            &data,
+            &root,
+            "1.20.1",
+            &empty_zip(),
+            &root,
+            &root.join("installer.jar"),
+        )
+        .expect_err("unsafe installer entry path should fail");
+
+        assert!(
+            matches!(error, ProcessorError::Command(message) if message.contains("unsafe installer entry path"))
+        );
+        assert!(!root.join("outside.txt").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn build_data_vars_reports_missing_installer_entry_without_panic() {
+        let root = test_root("missing-installer-entry");
+        let mut data = HashMap::new();
+        data.insert(
+            "EXTRACTED".to_string(),
+            DataEntry {
+                client: "/missing.txt".to_string(),
+            },
+        );
+
+        let error = build_data_vars(
+            &data,
+            &root,
+            "1.20.1",
+            &empty_zip(),
+            &root,
+            &root.join("installer.jar"),
+        )
+        .expect_err("missing installer entry should fail");
+
+        assert!(
+            matches!(error, ProcessorError::Command(message) if message.contains("extracting missing.txt from installer"))
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn build_data_vars_rejects_oversized_installer_entry() {
+        let root = test_root("oversized-installer-entry");
+        let mut data = HashMap::new();
+        data.insert(
+            "EXTRACTED".to_string(),
+            DataEntry {
+                client: "/large.bin".to_string(),
+            },
+        );
+        let installer = zip_with_entry(
+            "large.bin",
+            vec![b'x'; (MAX_INSTALLER_DATA_ENTRY_BYTES + 1) as usize],
+        );
+
+        let error = build_data_vars(
+            &data,
+            &root,
+            "1.20.1",
+            &installer,
+            &root,
+            &root.join("installer.jar"),
+        )
+        .expect_err("oversized installer entry should fail");
+
+        assert!(
+            matches!(error, ProcessorError::Command(message) if message.contains("installer entry too large"))
+        );
+        assert!(!root.join("large.bin").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn empty_zip() -> Vec<u8> {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        zip::ZipWriter::new(&mut cursor)
+            .finish()
+            .expect("finish empty zip");
+        cursor.into_inner()
+    }
+
+    fn zip_with_entry(name: &str, bytes: Vec<u8>) -> Vec<u8> {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut cursor);
+            writer
+                .start_file(name, SimpleFileOptions::default())
+                .expect("start zip file");
+            writer.write_all(&bytes).expect("write zip file");
+            writer.finish().expect("finish zip");
+        }
+        cursor.into_inner()
+    }
+
+    fn test_root(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or_default();
+        let root = std::env::temp_dir().join(format!(
+            "croopor-processors-{name}-{}-{nanos:x}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create test root");
+        root
     }
 }

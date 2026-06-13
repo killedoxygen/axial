@@ -29,7 +29,7 @@ export const LOADER_COMPONENT_IDS: Record<Exclude<LoaderKey, 'vanilla'>, LoaderC
 };
 
 const LOADER_DEFAULT_ICON: Record<LoaderKey, string> = {
-  vanilla: 'cube',
+  vanilla: 'stack',
   fabric: 'compass',
   quilt: 'palette',
   forge: 'terminal',
@@ -58,7 +58,7 @@ export function defaultNameFor(loader: LoaderKey, mcVersion: string): string {
 }
 
 export function defaultIconFor(loader: LoaderKey): string {
-  return LOADER_DEFAULT_ICON[loader] ?? 'cube';
+  return LOADER_DEFAULT_ICON[loader] ?? 'stack';
 }
 
 export function channelOf(labelOrChannel: string): Channel {

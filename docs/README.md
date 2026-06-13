@@ -3,9 +3,10 @@ This is the entrypoint for the repo docs. Keep this short, current, and useful.
 
 ## Reading order
 1. `docs/CONVENTIONS.md`
-2. `docs/ARCHITECTURE.md`
-3. subsystem architecture docs relevant to the work
-4. `docs/adr/` for major design decisions and tradeoffs
+2. `docs/DESIGN.md` for frontend/UI work
+3. `docs/ARCHITECTURE.md`
+4. subsystem architecture docs relevant to the work
+5. `docs/adr/` for major design decisions and tradeoffs
 
 ## Doc roles
 ### `docs/CONVENTIONS.md`
@@ -34,6 +35,20 @@ Do not use it for:
 - all subsystem details
 - decision history
 - speculative future design
+
+### `docs/DESIGN.md`
+Frontend/product design guardrails for the desktop launcher.
+
+Use it for:
+- UI workflow changes
+- visual/layout guardrails
+- protected frontend surfaces
+- deciding when desktop smoke is needed
+
+Do not use it for:
+- backend architecture
+- product roadmap status
+- historical implementation logs
 
 ### Subsystem architecture docs
 Current subsystem docs:
@@ -68,6 +83,7 @@ Do not use ADRs for:
 
 ## When to update what
 - If the current pipeline changes: update `docs/ARCHITECTURE.md`.
+- If frontend design guardrails change: update `docs/DESIGN.md`.
 - If one subsystem changes internally: update that subsystem’s architecture doc.
 - If the rules for working in the repo change: update `docs/CONVENTIONS.md`.
 - If a major decision is made and the reasoning matters long-term: add an ADR.

@@ -1,11 +1,13 @@
 import type { JSX } from 'preact';
+import { batch } from '@preact/signals';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { Button, Input } from '../../ui/Atoms';
+import { Logo } from '../../ui/Logo';
 import { api } from '../../api';
 import { browseDirectory } from '../../native';
 import { errMessage } from '../../utils';
-import { showSetupOverlay } from '../../ui-state';
-import './setup.css';
+import { config, devMode, instances, lastInstanceId, versions } from '../../store';
+import { showOnboardingOverlay, showSetupOverlay } from '../../ui-state';
 
 // Library setup overlay
 // Creates a managed library at the recommended path or points at an existing one
@@ -35,8 +37,9 @@ export function SetupOverlay(): JSX.Element {
           const res: any = await api('POST', '/setup/init', { path: managedDefaultPath });
           if (cancelled || userTookOver.current) return;
           if (res.error) { setError(res.error); setStatus('error'); return; }
-          setStatus('ready');
-          showSetupOverlay.value = false;
+          const showOnboarding = await refreshLauncherStateAfterSetup();
+          if (cancelled || userTookOver.current) return;
+          completeSetup(showOnboarding);
         } else {
           setStatus('error');
           setError('No default library path available. Use an existing folder or retry.');
@@ -57,7 +60,7 @@ export function SetupOverlay(): JSX.Element {
     try {
       const res: any = await api('POST', '/setup/init', { path: resolvedManagedPath });
       if (res.error) { setError(res.error); setStatus('error'); return; }
-      showSetupOverlay.value = false;
+      completeSetup(await refreshLauncherStateAfterSetup());
     } catch (err) {
       setError(errMessage(err) || 'Setup failed');
       setStatus('error');
@@ -71,7 +74,7 @@ export function SetupOverlay(): JSX.Element {
     try {
       const res: any = await api('POST', '/setup/set-dir', { path: existingPath.trim() });
       if (res.error) { setError(res.error); setStatus('error'); return; }
-      showSetupOverlay.value = false;
+      completeSetup(await refreshLauncherStateAfterSetup());
     } catch (err) {
       setError(errMessage(err) || 'Could not use that path');
       setStatus('error');
@@ -91,10 +94,18 @@ export function SetupOverlay(): JSX.Element {
     }
   };
 
+  const completeSetup = (showOnboarding: boolean): void => {
+    setStatus('ready');
+    batch(() => {
+      showSetupOverlay.value = false;
+      showOnboardingOverlay.value = showOnboarding;
+    });
+  };
+
   return (
     <div class="cp-setup-overlay">
       <div class="cp-setup-card">
-        <img src="logo.png" alt="" class="cp-logo" width="48" height="48" />
+        <Logo className="cp-logo" size={48} />
         <h1 class="cp-setup-title">Set up your library</h1>
         <p class="cp-setup-sub">
           Croopor needs a folder for instances, installed versions, and assets. It can manage one
@@ -133,4 +144,24 @@ export function SetupOverlay(): JSX.Element {
       </div>
     </div>
   );
+}
+
+async function refreshLauncherStateAfterSetup(): Promise<boolean> {
+  const [configRes, statusRes, versionsRes, instancesRes] = await Promise.all([
+    api('GET', '/config'),
+    api('GET', '/status'),
+    api('GET', '/versions'),
+    api('GET', '/instances'),
+  ]);
+  if (statusRes?.setup_required === true) {
+    throw new Error('Setup did not complete. Check the selected folder and try again.');
+  }
+  batch(() => {
+    config.value = configRes;
+    devMode.value = statusRes?.dev_mode === true;
+    versions.value = versionsRes.versions || [];
+    instances.value = instancesRes.instances || [];
+    lastInstanceId.value = instancesRes.last_instance_id || null;
+  });
+  return configRes?.onboarding_done === false;
 }

@@ -4,10 +4,11 @@ pub mod paths;
 pub mod store;
 
 pub use instances::{
-    ART_PRESETS, EnrichedInstance, Instance, InstanceStore, InstanceStoreError, art_preset_for_seed,
+    EnrichedInstance, Instance, InstanceStore, InstanceStoreError, InstanceStoreStartup,
 };
 pub use models::{
-    AppConfig, AppConfigValidationError, USERNAME_MAX_LEN, USERNAME_MIN_LEN, validate_username,
+    AppConfig, AppConfigValidationError, LAUNCH_AUTH_MODE_OFFLINE, LAUNCH_AUTH_MODE_ONLINE,
+    USERNAME_MAX_LEN, USERNAME_MIN_LEN, validate_launch_auth_mode, validate_username,
 };
 pub use paths::AppPaths;
-pub use store::{ConfigStore, ConfigStoreError};
+pub use store::{ConfigStartupLoad, ConfigStore, ConfigStoreError};

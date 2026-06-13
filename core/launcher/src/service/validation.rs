@@ -102,3 +102,43 @@ pub(crate) fn validate_manual_jvm_args(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(major: u32, update: u32) -> JavaRuntimeInfo {
+        JavaRuntimeInfo {
+            id: "runtime".to_string(),
+            major,
+            update,
+            distribution: "openjdk".to_string(),
+            path: "/java".to_string(),
+        }
+    }
+
+    #[test]
+    fn explicit_java8_override_rejects_updates_before_312() {
+        let (class, message) =
+            validate_requested_java_override("/java", &info(8, 311), 8).unwrap_err();
+
+        assert_eq!(class, LaunchFailureClass::JavaRuntimeMismatch);
+        assert!(message.contains("8u311"));
+    }
+
+    #[test]
+    fn explicit_java8_override_accepts_update_312() {
+        assert!(validate_requested_java_override("/java", &info(8, 312), 8).is_ok());
+    }
+
+    #[test]
+    fn explicit_java9_to_15_override_rejects_java8_targets() {
+        for major in [9, 15] {
+            let (class, message) =
+                validate_requested_java_override("/java", &info(major, 0), 8).unwrap_err();
+
+            assert_eq!(class, LaunchFailureClass::JavaRuntimeMismatch);
+            assert!(message.contains("requires Java 8"));
+        }
+    }
+}

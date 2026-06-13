@@ -21,10 +21,16 @@ It owns:
 - startup-recovery eligibility
 - intervention summaries and user guidance
 - the meaning of `managed` vs `custom`
+- basic launch memory-pressure warnings
+- warnings when the selected minimum memory is clamped down to the effective maximum memory
+- warnings when the effective maximum memory allocation is very low for Minecraft startup
+- conservative launch concurrency, measured CPU load, install/download pressure, and low-disk-space warnings
+- custom-mode warnings for risky manual launch overrides
 
 It does not yet own:
 - install policy
-- multi-instance resource safety
+- active install/download scheduling policy
+- broader measured multi-instance resource coordination
 - updater safety
 - OS/process safety outside the launch flow
 
@@ -47,7 +53,9 @@ Intent:
 
 Policy:
 - Guardian does not silently change explicit launch intent
+- Guardian warns when explicit Java, JVM preset, or raw JVM argument overrides will be preserved
 - Guardian blocks guaranteed-fatal override combinations before spawn
+- Guardian blocks explicit named JVM presets before spawn when the selected runtime is known not to support the flags emitted by that preset
 - Guardian returns guidance instead of auto-healing explicit unsafe choices
 - valid explicit overrides still pass unchanged
 
@@ -63,8 +71,8 @@ Policy:
 - `core/minecraft runtime`: discover requested/effective runtimes, report facts, install managed runtime when asked
 - `core/launcher jvm`: compute preset/JVM args from a chosen policy outcome
 - `core/launcher validation`: report why a requested configuration is incompatible
-- `core/launcher healing`: execute recovery plans and format healing summaries
-- `apps/api session store`: capture observations from the running process
+- `core/launcher healing`: format compatibility and recovery summaries after Guardian-approved actions
+- `apps/api session store`: capture running-process facts, store only bounded startup failure class observations, and preserve Guardian-authored stage telemetry details
 - `frontend`: render the backend-authored Guardian outcome
 
 Lower layers should not decide:
@@ -84,11 +92,18 @@ Guardian should reason from explicit facts, not implicit booleans:
 - required Java major/runtime facts
 - effective runtime facts
 - requested preset and computed preset facts
+- host memory total and active launch allocation
+- selected raw minimum memory and effective maximum memory
+- effective maximum memory allocation threshold facts
+- CPU thread count, active launch count, and best-effort CPU load averages
+- active install/download session count
 - startup failure observations
 
 ### Output
 Guardian should produce one normalized outcome for the pipeline:
 - decision: `allowed | warned | intervened | blocked`
+- message: concise backend-authored user-facing summary for non-allowed outcomes
+- details: backend-authored user-facing details for interventions, warnings, or blocked guidance
 - interventions: list of concrete actions applied
 - guidance: user-facing fix guidance when blocked
 - optional approved recovery plan
@@ -98,26 +113,36 @@ Guardian should produce one normalized outcome for the pipeline:
 ### Pre-launch
 1. Route builds `LaunchIntent`
 2. `LaunchGuardianContext` is assembled from config + instance overrides
-3. preparation gathers runtime and override facts
-4. Guardian evaluates those facts
-5. Guardian either:
+3. preparation captures selected memory bounds, host resource observations, active launch/install counts, CPU thread/load observations, and launch-relevant disk free space as Guardian warning facts
+4. preparation gathers runtime and override facts
+5. Guardian evaluates those facts
+6. Guardian either:
    - allows launch unchanged
+   - warns when the selected minimum memory is higher than the effective maximum and is clamped
+   - warns when the effective maximum memory allocation is below the conservative 2 GB startup threshold
+   - warns when launch is allowed but memory headroom is tight
+   - warns when concurrent launches may saturate the CPU
+   - warns when measured host CPU load already indicates saturated CPU headroom
+   - warns when active install/download work may add disk or network pressure during startup
+   - warns when launch-relevant storage has less than the conservative free-space headroom
+   - warns in Custom mode when risky manual overrides are preserved
+   - blocks Custom-mode explicit named JVM presets that would emit known unsupported flags for the selected runtime
    - intervenes and mutates attempt overrides
    - blocks and returns guidance
 
 ### Startup failure
-1. Session layer reports observations about exit/stall/failure text
-2. runner resolves a failure class
+1. Session layer reports observations about exit/stall/log output and stores only Guardian-classified startup failure classes
+2. runner keeps the session observation plumbing and maps `stalled`/`exited` observations into bounded Guardian startup-failure facts
 3. Guardian decides whether startup recovery is allowed
-4. if allowed, Healing executes the recovery plan
-5. if not allowed, Guardian blocks with guidance
+4. if allowed, the launch runner executes the Guardian-approved recovery action and Healing records supporting retry/fallback detail
+5. if not allowed, Guardian converts the startup observation into a blocked message, details, and guidance before the runner emits terminal launch failure status
 
 ## Guardian and Healing
 Healing is narrower than Guardian.
 
 Healing is responsible for:
 - summarizing compatibility adjustments
-- applying approved recovery plans
+- recording supporting retry/fallback summaries for Guardian-approved recovery plans
 - emitting healing events/details for UI/logs
 
 Healing is not supposed to decide:
@@ -166,11 +191,20 @@ The frontend should not decide which authority wins between Guardian and Healing
 The preferred shape is:
 - Guardian outcome is primary
 - Healing is supporting detail inside or alongside the Guardian outcome
-- UI copy is backend-authored as much as possible
+- UI copy is backend-authored as much as possible through `guardian.message` and `guardian.details`
 
-Until the contract is normalized further:
-- Guardian should be preferred for intervention/block messaging
-- Healing should remain supporting detail for compatibility specifics
+Current launcher behavior:
+- `GET /api/v1/launch/preflight/{instance_id}` returns a read-only Guardian preflight. It reuses launch preparation fact gathering for effective memory, Guardian-owned memory clamp, low-allocation, resource pressure, and Custom override warnings, Guardian mode, and override origins, but it does not launch Minecraft, create a session, install files, ensure instance layout, write proof state, or expose paths, command lines, raw JVM args, account names, usernames, or tokens. InstanceDetail does not currently render a persistent preflight panel; launch safety is surfaced through launch/install affordances and backend-authored launch outcome notices.
+- Launch routes return HTTP `422 Unprocessable Entity` when a launch request fails because Guardian authored a `blocked` decision. The response body keeps the normal bounded launch-error JSON shape with Guardian details; non-Guardian launch request failures remain server errors unless a route has a more specific status.
+- Guardian `message` is preferred for launch notices when present
+- blocked Guardian `details` include the bounded backend-authored failure reason before guidance when one is available
+- Guardian `details` are preferred over frontend-synthesized intervention/guidance copy
+- when `details` is absent, actionable Guardian `guidance` or `interventions[].detail` still count as backend-authored notice details and are ordered before frontend fallback details
+- startup `stalled` and pre-startup `exited` observations keep session plumbing as fact collection, but the terminal blocked summary and user guidance are Guardian-authored before launch failure status is emitted
+- `guidance` and `interventions` remain serialized as current bounded diagnostics
+- Healing remains supporting detail for runtime-adjustment specifics and retry/fallback context when Guardian has not already authored actionable `blocked`, `warned`, or `intervened` notice details
+- live launch stage records preserve bounded unique Guardian `details` for `warned`, `intervened`, and `blocked` status payloads before appending Healing warnings without duplicates; Healing `fallback_applied` remains the only source of stage fallback reasons
+- normal frontend launches do not run a separate pre-launch memory-pressure confirmation; backend preparation selects effective memory, Guardian owns memory warnings, and successful launch responses carry the selected `max_memory_mb` and `min_memory_mb`
 
 ## Invariants
 - one launch-safety authority: Guardian
@@ -180,9 +214,9 @@ Until the contract is normalized further:
 - no frontend reinterpretation of policy when backend already decided it
 
 ## Known gaps
-- some policy still leaks into runtime/prepare/Healing/session heuristics/frontend
-- `warned` is not yet fully used as a first-class Guardian decision
-- the API still exposes Guardian and Healing as separate top-level payload pieces instead of a more normalized outcome object
+- some policy still leaks into runtime/prepare/Healing/session heuristics, while the preflight API can return bounded Guardian-authored warning summaries from backend-captured facts instead of requiring frontend-inferred launch-safety copy
+- `warned` now covers min-memory clamp, very low launch allocation, memory pressure, conservative CPU/load/install/disk pressure, and Custom-mode risky overrides, but broader warning-only launch-safety paths are not normalized yet
+- the API still exposes Guardian and Healing as separate top-level payload pieces, though Guardian now carries normalized message/details and session stage telemetry preserves those details
 
 ## Change rule
 If Guardian behavior, authority boundaries, or the launch pipeline change, update:

@@ -1,16 +1,23 @@
 import { local, saveLocalState } from './state';
 import { api } from './api';
 import { toast } from './toast';
-import { hasNativeDesktopRuntime, openExternalURL } from './native';
-import { appVersion, bootstrapState, installState, launchState, updateCheckState, updateInfo } from './store';
+import { hasNativeDesktopRuntime, openExternalURL, requestNativeAppRestart } from './native';
+import { appVersion, bootstrapState, installQueue, installState, launchState, updateCheckState, updateInfo } from './store';
 import type { UpdateInfo } from './types';
 import { errMessage } from './utils';
 
 const AUTO_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const AUTO_CHECK_DELAY_MS = 1600;
 const AUTO_CHECK_RETRY_MS = 15000;
+const AUTO_CHECK_FAILURE_RETRY_DELAYS_MS = [
+  60 * 1000,
+  5 * 60 * 1000,
+  15 * 60 * 1000,
+  60 * 60 * 1000,
+] as const;
 
 let autoCheckTimer: number | null = null;
+let autoCheckFailureCount = 0;
 let pendingCheck: Promise<UpdateInfo | null> | null = null;
 let pendingCheckSeq = 0;
 let pendingCheckToken: symbol | null = null;
@@ -28,6 +35,18 @@ function shouldAutoCheck(): boolean {
 function stampUpdateCheck(): void {
   local.lastUpdateCheckAt = new Date().toISOString();
   saveLocalState();
+}
+
+function resetAutoCheckFailureBackoff(): void {
+  autoCheckFailureCount = 0;
+}
+
+function nextFailedAutoCheckDelay(): number {
+  const delay = AUTO_CHECK_FAILURE_RETRY_DELAYS_MS[
+    Math.min(autoCheckFailureCount, AUTO_CHECK_FAILURE_RETRY_DELAYS_MS.length - 1)
+  ];
+  autoCheckFailureCount += 1;
+  return delay;
 }
 
 export function hasVisibleUpdate(): boolean {
@@ -71,6 +90,41 @@ export async function openUpdateNotes(): Promise<void> {
   }
 }
 
+export async function openUpdateChecksum(): Promise<void> {
+  const url = updateInfo.value?.checksum_url;
+  if (!url) return;
+  try {
+    await openExternalURL(url);
+    toast('Opened release checksum');
+  } catch (err: unknown) {
+    toast(`Failed to open checksum: ${errMessage(err)}`, 'error');
+  }
+}
+
+export function restartBlockedByActivity(): boolean {
+  return installState.value.status !== 'idle'
+    || installQueue.value.length > 0
+    || launchState.value.status !== 'idle';
+}
+
+export async function restartDesktopApp(): Promise<void> {
+  if (!hasNativeDesktopRuntime()) {
+    toast('Restart is only available in the desktop app', 'error');
+    return;
+  }
+  if (restartBlockedByActivity()) {
+    toast('Restart is blocked while downloads or launches are active.', 'error');
+    return;
+  }
+  try {
+    const requested = await requestNativeAppRestart();
+    if (!requested) throw new Error('desktop runtime unavailable');
+    toast('Restarting Croopor');
+  } catch (err: unknown) {
+    toast(`Failed to restart: ${errMessage(err)}`, 'error');
+  }
+}
+
 export async function checkForUpdates(options: { force?: boolean; silent?: boolean } = {}): Promise<UpdateInfo | null> {
   const { force = false, silent = false } = options;
   if (!force && pendingCheck) return pendingCheck;
@@ -90,6 +144,7 @@ export async function checkForUpdates(options: { force?: boolean; silent?: boole
         }
         updateCheckState.value = 'ready';
         stampUpdateCheck();
+        resetAutoCheckFailureBackoff();
         if (!silent) {
           if (res.available) toast(`Update ${displayVersion(res.latest_version)} available`);
           else toast(`You already have ${displayVersion(appVersion.value)}`);
@@ -117,6 +172,7 @@ export async function checkForUpdates(options: { force?: boolean; silent?: boole
 export function scheduleAutoUpdateCheck(): void {
   if (!hasNativeDesktopRuntime()) return;
   if (!shouldAutoCheck()) {
+    resetAutoCheckFailureBackoff();
     queueAutoUpdateCheck(AUTO_CHECK_INTERVAL_MS);
     return;
   }
@@ -130,14 +186,24 @@ export function scheduleAutoUpdateCheck(): void {
 async function runAutoUpdateCheck(): Promise<void> {
   if (!hasNativeDesktopRuntime()) return;
   if (!shouldAutoCheck()) {
+    resetAutoCheckFailureBackoff();
     queueAutoUpdateCheck(AUTO_CHECK_INTERVAL_MS);
     return;
   }
-  if (bootstrapState.value !== 'ready' || installState.value.status !== 'idle' || launchState.value.status !== 'idle') {
+  if (
+    bootstrapState.value !== 'ready'
+    || installState.value.status !== 'idle'
+    || installQueue.value.length > 0
+    || launchState.value.status !== 'idle'
+  ) {
     queueAutoUpdateCheck(AUTO_CHECK_RETRY_MS);
     return;
   }
-  await checkForUpdates({ silent: true });
+  const info = await checkForUpdates({ silent: true });
+  if (!info) {
+    queueAutoUpdateCheck(nextFailedAutoCheckDelay());
+    return;
+  }
   if (shouldAutoCheck()) queueAutoUpdateCheck(AUTO_CHECK_RETRY_MS);
   else queueAutoUpdateCheck(AUTO_CHECK_INTERVAL_MS);
 }

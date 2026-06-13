@@ -2,7 +2,7 @@ import type { JSX } from 'preact';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { Icon } from './Icons';
 import { Kbd } from './Atoms';
-import { commandPaletteOpen, navigate, type Route } from '../ui-state';
+import { commandPaletteOpen, navigate, type Route, openCreate } from '../ui-state';
 import { instances, runningSessions, config } from '../store';
 import { Music } from '../music';
 import { local, saveLocalState } from '../state';
@@ -10,7 +10,7 @@ import { Sound } from '../sound';
 import { applyTheme } from '../theme';
 import { promptPlayerName, savePlayerName } from '../player-name';
 import type { EnrichedInstance } from '../types';
-import './command-palette.css';
+import { useDraggableOverlay } from '../hooks/use-draggable-overlay';
 
 type Group = 'jump' | 'instance' | 'action';
 
@@ -37,9 +37,8 @@ function buildCommands(): Command[] {
 
   list.push(
     { id: 'jump:home', group: 'jump', icon: 'home', label: 'Home', perform: goto({ name: 'home' }) },
-    { id: 'jump:instances', group: 'jump', icon: 'cube', label: 'Instances', perform: goto({ name: 'instances' }) },
-    { id: 'jump:create', group: 'jump', icon: 'plus', label: 'New instance', hint: 'Ctrl N', perform: goto({ name: 'create' }) },
-    { id: 'jump:browse', group: 'jump', icon: 'compass', label: 'Browse', perform: goto({ name: 'browse' }) },
+    { id: 'jump:instances', group: 'jump', icon: 'stack', label: 'Instances', perform: goto({ name: 'instances' }) },
+    { id: 'jump:create', group: 'jump', icon: 'plus', label: 'New instance', hint: 'Ctrl N', perform: () => { openCreate(); close(); } },
     { id: 'jump:downloads', group: 'jump', icon: 'download', label: 'Downloads', perform: goto({ name: 'downloads' }) },
     { id: 'jump:accounts', group: 'jump', icon: 'user', label: 'Accounts and skins', perform: goto({ name: 'accounts' }) },
     { id: 'jump:settings', group: 'jump', icon: 'settings', label: 'Settings', hint: 'Ctrl ,', perform: goto({ name: 'settings' }) },
@@ -52,7 +51,7 @@ function buildCommands(): Command[] {
     list.push({
       id: `instance:${inst.id}`,
       group: 'instance',
-      icon: isRunning ? 'play' : 'cube',
+      icon: isRunning ? 'play' : 'stack',
       label: isRunning ? `Jump to ${inst.name}` : `Open ${inst.name}`,
       hint: isRunning ? 'Playing' : undefined,
       keywords: inst.name,
@@ -139,6 +138,10 @@ export function CommandPalette(): JSX.Element | null {
   const [active, setActive] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
+  const commandCenterDrag = useDraggableOverlay<HTMLDivElement>({
+    id: 'command-center',
+    enabled: open,
+  });
 
   const commands = open ? buildCommands() : [];
 
@@ -216,10 +219,20 @@ export function CommandPalette(): JSX.Element | null {
   return (
     <div
       class="cp-cmd-overlay"
+      data-dragging={commandCenterDrag.isDragging}
       onClick={(e) => { if (e.target === e.currentTarget) commandPaletteOpen.value = false; }}
     >
-      <div class="cp-cmd" role="dialog" aria-modal="true" aria-label="Command palette">
-        <div class="cp-cmd-head">
+      <div
+        class="cp-cmd"
+        ref={commandCenterDrag.surfaceRef}
+        style={commandCenterDrag.style}
+        data-dragging={commandCenterDrag.isDragging}
+        data-positioned={commandCenterDrag.isPositioned}
+        role="dialog"
+        aria-modal="true"
+        aria-label="Command palette"
+      >
+        <div class="cp-cmd-head" {...commandCenterDrag.dragHandleProps}>
           <Icon name="search" size={15} color="var(--text-dim)" />
           <input
             class="cp-cmd-input"
@@ -229,6 +242,7 @@ export function CommandPalette(): JSX.Element | null {
             value={query}
             onInput={(e: any) => setQuery(e.currentTarget.value)}
           />
+          <span class="cp-cmd-drag-handle" aria-hidden="true" />
           <Kbd>esc</Kbd>
         </div>
         <div class="cp-cmd-list" ref={listRef}>

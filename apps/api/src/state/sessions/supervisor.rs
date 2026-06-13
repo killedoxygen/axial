@@ -65,16 +65,15 @@ pub(super) fn spawn_wait_task(
                         &session_id,
                         LaunchStatusEvent {
                             state: "exited".to_string(),
+                            benchmark: None,
                             pid: None,
                             exit_code: status.code(),
                             failure_class: observed_failure
-                                .as_ref()
-                                .map(|failure| failure.class.as_str().to_string()),
-                            failure_detail: observed_failure
-                                .as_ref()
-                                .and_then(|failure| failure.detail.clone()),
+                                .map(|failure_class| failure_class.as_str().to_string()),
+                            failure_detail: None,
                             healing: existing.as_ref().and_then(|record| record.healing.clone()),
                             guardian: existing.as_ref().and_then(|record| record.guardian.clone()),
+                            stages: Vec::new(),
                         },
                     )
                     .await;
@@ -85,12 +84,14 @@ pub(super) fn spawn_wait_task(
                         &session_id,
                         LaunchStatusEvent {
                             state: "exited".to_string(),
+                            benchmark: None,
                             pid: None,
                             exit_code: Some(-1),
                             failure_class: Some("unknown".to_string()),
                             failure_detail: Some(error.to_string()),
                             healing: existing.as_ref().and_then(|record| record.healing.clone()),
                             guardian: existing.as_ref().and_then(|record| record.guardian.clone()),
+                            stages: Vec::new(),
                         },
                     )
                     .await;
@@ -124,12 +125,14 @@ pub(super) fn spawn_startup_watchdog(
                 &session_id,
                 LaunchStatusEvent {
                     state: "exited".to_string(),
+                    benchmark: None,
                     pid: record.pid,
                     exit_code: Some(-1),
                     failure_class: Some("startup_stalled".to_string()),
                     failure_detail: Some("no startup activity observed".to_string()),
                     healing: record.healing.clone(),
                     guardian: record.guardian.clone(),
+                    stages: Vec::new(),
                 },
             )
             .await;

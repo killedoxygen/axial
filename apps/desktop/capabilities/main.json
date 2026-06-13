@@ -4,7 +4,17 @@
   "description": "Main desktop capability for the Croopor rewrite shell",
   "windows": ["main"],
   "permissions": [
-    "core:default"
+    "core:default",
+    "dialog:allow-open",
+    "dialog:allow-message",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        {
+          "url": "https://*"
+        }
+      ]
+    }
   ],
   "remote": {
     "urls": [

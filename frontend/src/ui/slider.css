@@ -1,12 +1,11 @@
-/* Slider painted on top of a transparent native range input */
-/* keyboard and a11y come for free, visuals are ours */
-
 .cp-slider {
   position: relative;
   width: 100%;
   height: 28px;
   display: flex;
   align-items: center;
+  cursor: pointer;
+  touch-action: none;
   --slider-filled: 0%;
 }
 
@@ -85,8 +84,8 @@
   outline: none;
   margin: 0;
   opacity: 0;
-  cursor: pointer;
   z-index: 2;
+  pointer-events: none;
 }
 .cp-slider > input[type="range"]::-webkit-slider-thumb {
   -webkit-appearance: none;
@@ -99,7 +98,7 @@
   margin-top: 6px;
   font-size: 10.5px;
   color: var(--text-mute);
-  letter-spacing: 0.2px;
+  letter-spacing: 0;
 }
 .cp-slider-ticks button {
   background: none;

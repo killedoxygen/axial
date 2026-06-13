@@ -1,0 +1,68 @@
+.cp-player-head {
+  position: relative;
+  display: inline-flex;
+  align-items: stretch;
+  justify-content: stretch;
+  flex: 0 0 auto;
+  overflow: hidden;
+  background: var(--surface-3);
+  border: 1px solid color-mix(in oklab, var(--line-strong) 76%, transparent);
+  box-shadow:
+    0 1px 0 color-mix(in oklab, var(--text) 8%, transparent) inset,
+    0 10px 20px -14px color-mix(in oklab, var(--text) 34%, transparent);
+  image-rendering: pixelated;
+}
+
+.cp-player-head::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  box-shadow: inset 0 -1px 0 color-mix(in oklab, var(--text) 16%, transparent);
+  pointer-events: none;
+}
+
+.cp-player-head-texture {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
+
+.cp-player-head-texture::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background:
+    linear-gradient(
+      to bottom,
+      oklch(0.98 0.006 70 / 0.08) 0 12.5%,
+      transparent 12.5% 87.5%,
+      oklch(0.16 0.008 70 / 0.13) 87.5% 100%
+    );
+  pointer-events: none;
+}
+
+.cp-player-head-texture-layer {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+}
+
+.cp-player-head-texture-layer img {
+  position: absolute;
+  display: block;
+  width: 800%;
+  height: 800%;
+  max-width: none;
+  image-rendering: pixelated;
+}
+
+.cp-player-head-texture-face img {
+  left: -100%;
+  top: -100%;
+}
+
+.cp-player-head-texture-hat img {
+  left: -500%;
+  top: -100%;
+}

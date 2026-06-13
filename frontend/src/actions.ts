@@ -2,7 +2,7 @@ import { batch } from '@preact/signals';
 import {
   instances, versions, config, systemInfo, devMode, catalog,
   selectedInstanceId, lastInstanceId,
-  installState, installQueue, installEventSource,
+  installState, installQueue, installFailure, installEventSource,
   launchState, runningSessions, launchNotices,
   currentPage, searchQuery, sidebarFilter, logLines,
 } from './store';
@@ -10,6 +10,8 @@ import type {
   Instance, Version, Config, SystemInfo, Catalog,
   RunningSession, InstallItem, Page, LaunchNotice,
 } from './types';
+import { formatInstallItemLabel } from './install-labels';
+import { launchStageView, launchStageViewFrom, type LaunchStage } from './launch-stages';
 
 // ── Selection ──
 
@@ -20,24 +22,122 @@ export function selectInstance(id: string | null): void {
 
 // ── Install state transitions ──
 
+const INSTALL_FAILURE_MESSAGE_LIMIT = 220;
+
+function cloneInstallItem(item: InstallItem): InstallItem {
+  return item.loader
+    ? { versionId: item.versionId, loader: { ...item.loader } }
+    : { versionId: item.versionId };
+}
+
+let activeInstallItem: InstallItem | null = null;
+
+export function isSameInstallItem(left: InstallItem, right: InstallItem): boolean {
+  if (left.versionId !== right.versionId) return false;
+  if (!left.loader && !right.loader) return true;
+  if (!left.loader || !right.loader) return false;
+  return left.loader.componentId === right.loader.componentId
+    && left.loader.buildId === right.loader.buildId;
+}
+
+export function isActiveInstallItem(item: InstallItem): boolean {
+  return installState.value.status === 'active'
+    && activeInstallItem !== null
+    && isSameInstallItem(activeInstallItem, item);
+}
+
+function boundedInstallFailureMessage(message: string): string {
+  const firstUsefulLine = String(message || '')
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .find(line => line && !line.startsWith('at '));
+  const squashed = (firstUsefulLine || 'Install failed before Croopor received error details.')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (squashed.length <= INSTALL_FAILURE_MESSAGE_LIMIT) return squashed;
+  return `${squashed.slice(0, INSTALL_FAILURE_MESSAGE_LIMIT - 3).trimEnd()}...`;
+}
+
 export function enqueueInstall(item: InstallItem): void {
-  const active = installState.value;
-  if (active.status === 'active' && active.versionId === item.versionId) return;
-  if (installQueue.value.some(q => q.versionId === item.versionId)) return;
+  if (isActiveInstallItem(item)) return;
+  if (installQueue.value.some(q => isSameInstallItem(q, item))) return;
   installQueue.value = [...installQueue.value, item];
 }
 
-export function startInstall(versionId: string, label = 'Starting...'): void {
-  installState.value = { status: 'active', versionId, pct: 0, label };
+export function recordInstallFailure(item: InstallItem, message: string): void {
+  installFailure.value = {
+    item: cloneInstallItem(item),
+    displayName: formatInstallItemLabel(item),
+    message: boundedInstallFailureMessage(message),
+    failedAt: Date.now(),
+  };
 }
 
-export function updateInstallProgress(pct: number, label: string): void {
+export function clearInstallFailure(): void {
+  installFailure.value = null;
+}
+
+export function clearInstallFailureForItem(item: InstallItem): void {
+  const failure = installFailure.value;
+  if (!failure || !isSameInstallItem(failure.item, item)) return;
+  installFailure.value = null;
+}
+
+export function requeueFailedInstall(): boolean {
+  const failure = installFailure.value;
+  if (!failure) return false;
+  const item = cloneInstallItem(failure.item);
+  const wasIdle = installState.value.status === 'idle';
+  batch(() => {
+    installFailure.value = null;
+    const rest = installQueue.value.filter(q => !isSameInstallItem(q, item));
+    installQueue.value = isActiveInstallItem(item)
+      ? rest
+      : [item, ...rest];
+  });
+  return wasIdle;
+}
+
+export function startInstall(item: InstallItem, label = 'Starting...', displayName?: string): void {
+  const installItem = cloneInstallItem(item);
+  activeInstallItem = installItem;
+  installState.value = {
+    status: 'active',
+    item: installItem,
+    versionId: item.versionId,
+    displayName,
+    pct: 0,
+    label,
+    phase: 'starting',
+    startedAt: Date.now(),
+  };
+}
+
+function cleanRemainingSeconds(remainingSeconds: number | undefined): number | undefined {
+  return typeof remainingSeconds === 'number' && Number.isFinite(remainingSeconds) && remainingSeconds > 0
+    ? remainingSeconds
+    : undefined;
+}
+
+export function updateInstallProgress(pct: number, label: string, phase?: string, remainingSeconds?: number): void {
   const current = installState.value;
   if (current.status !== 'active') return;
-  installState.value = { ...current, pct, label };
+  const nextPct = Number.isFinite(pct) ? Math.max(0, Math.min(100, pct)) : current.pct;
+  const regressed = nextPct < current.pct;
+  const nextRemainingSeconds = cleanRemainingSeconds(remainingSeconds);
+  const remainingSecondsUpdatedAt = nextRemainingSeconds ? Date.now() : undefined;
+  installState.value = {
+    ...current,
+    pct: Math.max(current.pct, nextPct),
+    label: regressed ? current.label : label,
+    phase: regressed ? current.phase : phase || current.phase,
+    remainingSeconds: regressed ? current.remainingSeconds : nextRemainingSeconds,
+    remainingSecondsUpdatedAt: regressed ? current.remainingSecondsUpdatedAt : remainingSecondsUpdatedAt,
+  };
 }
 
 export function completeInstall(): void {
+  activeInstallItem = null;
   installState.value = { status: 'idle' };
   if (installEventSource.value) {
     installEventSource.value.close();
@@ -53,6 +153,12 @@ export function dequeueNextInstall(): InstallItem | null {
   return next;
 }
 
+export function removeQueuedInstallAt(index: number): void {
+  const queue = installQueue.value;
+  if (!Number.isInteger(index) || index < 0 || index >= queue.length) return;
+  installQueue.value = queue.filter((_, i) => i !== index);
+}
+
 export function setInstallEventSource(es: { close(): void } | null): void {
   if (installEventSource.value) installEventSource.value.close();
   installEventSource.value = es;
@@ -61,10 +167,11 @@ export function setInstallEventSource(es: { close(): void } | null): void {
 // ── Launch state transitions ──
 
 export function startLaunch(instanceId: string): void {
-  launchState.value = { status: 'preparing', instanceId, pct: 8, label: 'Preparing launch' };
+  const stage = launchStageView('queued');
+  launchState.value = { status: 'preparing', instanceId, pct: stage.pct, label: stage.label, stage: stage.stage };
 }
 
-export function updateLaunchPrep(instanceId: string, pct: number, label: string): void {
+export function updateLaunchPrep(instanceId: string, pct: number, label: string, stage?: LaunchStage): void {
   const current = launchState.value;
   if (current.status !== 'preparing' || current.instanceId !== instanceId) return;
   launchState.value = {
@@ -72,6 +179,21 @@ export function updateLaunchPrep(instanceId: string, pct: number, label: string)
     instanceId,
     pct: Math.max(current.pct, Math.max(0, Math.min(100, pct))),
     label,
+    stage: stage ?? current.stage,
+  };
+}
+
+export function updateLaunchPrepStage(instanceId: string, backendState: string): void {
+  const current = launchState.value;
+  if (current.status !== 'preparing' || current.instanceId !== instanceId) return;
+  const view = launchStageViewFrom(backendState);
+  if (!view) return;
+  launchState.value = {
+    status: 'preparing',
+    instanceId,
+    pct: Math.max(current.pct, view.pct),
+    label: view.label,
+    stage: view.stage,
   };
 }
 

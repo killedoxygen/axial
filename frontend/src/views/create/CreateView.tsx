@@ -1,14 +1,16 @@
 import type { JSX } from 'preact';
-import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { Button } from '../../ui/Atoms';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { Button, IconButton, Input, Pill } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
+import { Slider } from '../../ui/Slider';
+import { InstanceTile, nextArtSeed } from '../../ui/InstanceVisual';
 import { catalog, config, systemInfo, versions } from '../../store';
 import { setCatalog } from '../../actions';
-import { navigate } from '../../ui-state';
+import { closeCreate, createOpen } from '../../ui-state';
 import { api } from '../../api';
-import { errMessage, getMemoryRecommendation } from '../../utils';
+import { errMessage, fmtMem, getMemoryRecommendation } from '../../utils';
 import { hashStr } from '../../tokens';
-import { nextArtSeed } from '../../art/InstanceArt';
+import { Sound } from '../../sound';
 import { createNewInstanceLoaderMachine } from '../../machines/new-instance-loader';
 import { pickPreferredBuild } from '../../loaders/view-model';
 import {
@@ -21,16 +23,17 @@ import type {
 } from '../../types';
 import {
   channelOfVersion, defaultIconFor, defaultNameFor,
-  LOADER_COMPONENT_IDS,
+  LOADER_COMPONENT_IDS, LOADER_KEYS, LOADER_LABELS, LOADER_TAGLINES,
   type Channel, type LoaderKey,
 } from './defaults';
-import { PickStep } from './PickStep';
-import { NameStep } from './NameStep';
-import { LibraryBlocker, Stepper, STEP_ORDER, type Step } from './shared';
+import { LoaderLogo } from './loader-logos';
+import { LibraryBlocker } from './shared';
+import { Modal, ModalContent } from '../../ui/Modal';
 import {
   buildRowModel,
   CHANNEL_ORDER,
-  releaseAnchorsFor,
+  CHANNEL_LABEL,
+  type VersionDownloadState,
   type VersionRowModel,
 } from './view-model';
 import { useLoaderHoverPrefetch } from './use-loader-hover-prefetch';
@@ -41,21 +44,50 @@ import {
   type ScreenSize,
   type WindowPresetSpec,
 } from './screen-presets';
-import { JVM_PRESET_ORDER, type JvmPreset } from './jvm-presets';
-import './create.css';
+import { versionSearchText } from '../../version-display';
+import {
+  JVM_PRESET_CREATE_ORDER,
+  JVM_PRESET_HINTS,
+  JVM_PRESET_LABELS,
+  type JvmPreset,
+} from './jvm-presets';
+
+const BASE_CHANNEL_TABS: Channel[] = ['release', 'snapshot', 'legacy'];
+type CreateStep = 'version' | 'details';
 
 export function CreateView(): JSX.Element {
   const libraryDir = config.value?.library_dir ?? '';
-  if (!libraryDir) {
-    return <div class="cp-cr-root"><LibraryBlocker /></div>;
-  }
-  return <CreateWizard />;
+  return (
+    <Modal open={createOpen.value} onOpenChange={(next: boolean) => { if (!next) closeCreate(); }}>
+      <ModalContent
+        className="cp-cr-card"
+        aria-label="Create instance"
+        aria-describedby={undefined}
+        showCloseButton={false}
+      >
+        {libraryDir ? <CreateCard /> : <LibraryBlocker />}
+      </ModalContent>
+    </Modal>
+  );
 }
 
-function CreateWizard(): JSX.Element {
-  const [step, setStep] = useState<Step>('pick');
-  const [maxReached, setMaxReached] = useState<number>(0);
+function minecraftVersionFromBuildId(buildId: string): string {
+  const parts = buildId.split(':');
+  return parts.length >= 3 ? parts[1]!.trim() : '';
+}
 
+function versionStatusTitle(state: VersionDownloadState, source: LoaderKey): string {
+  if (state === 'full') return 'Already installed';
+  if (state === 'base') {
+    return source === 'vanilla'
+      ? 'Already installed'
+      : 'Base Minecraft version is installed; loader still needs download';
+  }
+  return '';
+}
+
+function CreateCard(): JSX.Element {
+  const [step, setStep] = useState<CreateStep>('version');
   const [source, setSource] = useState<LoaderKey>('vanilla');
   const [mcVersionId, setMcVersionId] = useState<string | null>(null);
   const [channel, setChannel] = useState<Channel>('release');
@@ -64,6 +96,8 @@ function CreateWizard(): JSX.Element {
   const [catalogError, setCatalogError] = useState<string | null>(null);
   const [catalogLoading, setCatalogLoading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const versionWellRef = useRef<HTMLDivElement | null>(null);
+  const versionListKey = `${source}:${channel}:${query.trim().toLowerCase()}`;
 
   const totalGB = systemInfo.value?.total_memory_mb
     ? Math.floor(systemInfo.value.total_memory_mb / 1024)
@@ -73,9 +107,6 @@ function CreateWizard(): JSX.Element {
   const [seedOverride, setSeedOverride] = useState<number | null>(null);
   const [jvmPreset, setJvmPreset] = useState<JvmPreset>('');
 
-  // Window presets derive from the largest available display. Start with the
-  // primary screen so first paint isn't blocked, then upgrade once the Window
-  // Management API resolves (if granted).
   const [screenMax, setScreenMax] = useState<ScreenSize>(() => ({
     w: typeof window !== 'undefined' && window.screen ? window.screen.width : 1920,
     h: typeof window !== 'undefined' && window.screen ? window.screen.height : 1080,
@@ -90,8 +121,6 @@ function CreateWizard(): JSX.Element {
     [screenMax],
   );
   const [windowPresetId, setWindowPresetId] = useState<string>('default');
-  // If the dynamic preset list no longer contains the current id (rare), fall
-  // back to default so the cycle stays meaningful.
   useEffect(() => {
     if (!windowPresets.some((p) => p.id === windowPresetId)) {
       setWindowPresetId('default');
@@ -102,19 +131,21 @@ function CreateWizard(): JSX.Element {
     setWindowPresetId(nextWindowPreset(windowPresets, windowPresetId).id);
   };
   const cycleJvmPreset = (): void => {
-    const i = JVM_PRESET_ORDER.indexOf(jvmPreset);
-    setJvmPreset(JVM_PRESET_ORDER[(i + 1) % JVM_PRESET_ORDER.length]!);
+    const i = JVM_PRESET_CREATE_ORDER.indexOf(jvmPreset);
+    setJvmPreset(JVM_PRESET_CREATE_ORDER[(i + 1) % JVM_PRESET_CREATE_ORDER.length]!);
   };
 
   const searchInputRef = useRef<HTMLInputElement | null>(null);
-  const versionListRef = useRef<HTMLDivElement | null>(null);
-  const nameInputRef = useRef<HTMLInputElement | null>(null);
+
+  useLayoutEffect(() => {
+    const node = versionWellRef.current;
+    if (!node) return;
+    node.scrollTop = 0;
+  }, [versionListKey]);
 
   const loaderMachine = useMemo(() => createNewInstanceLoaderMachine(), []);
   const loaderState = loaderMachine.state.value;
   const currentComponentId = source === 'vanilla' ? null : LOADER_COMPONENT_IDS[source];
-
-  const idx = STEP_ORDER.indexOf(step);
 
   const loadCatalog = async (): Promise<void> => {
     setCatalogLoading(true);
@@ -169,10 +200,6 @@ function CreateWizard(): JSX.Element {
     return cat.versions.filter((v) => supportedSet == null || supportedSet.has(v.id));
   }, [catalog.value, source, supportedSet]);
 
-  const releaseAnchors = useMemo(() => {
-    return releaseAnchorsFor(availableForSource);
-  }, [availableForSource]);
-
   const availableChannels = useMemo<Channel[]>(() => {
     const has: Record<Channel, boolean> = { release: false, snapshot: false, legacy: false, unknown: false };
     for (const v of availableForSource) has[channelOfVersion(v)] = true;
@@ -191,15 +218,38 @@ function CreateWizard(): JSX.Element {
     const installedSet = new Set(
       versions.value.filter((x) => x.installed && x.launchable).map((x) => x.id),
     );
+    const fullInstalledSet = new Set<string>();
+    if (currentComponentId) {
+      for (const version of versions.value) {
+        if (!version.installed || !version.launchable || !version.loader) continue;
+        if (version.loader.component_id !== currentComponentId) continue;
+        const baseVersion = version.inherits_from || minecraftVersionFromBuildId(version.loader.build_id);
+        if (baseVersion) fullInstalledSet.add(baseVersion);
+      }
+    }
     const q = query.trim().toLowerCase();
     const rows = availableForSource
       .filter((v) => channelOfVersion(v) === channel)
-      .filter((v) => !q
-        || v.id.toLowerCase().includes(q)
-        || v.minecraft_meta.display_name.toLowerCase().includes(q));
+      .filter((v) => !q || versionSearchText(v).includes(q));
     rows.sort((a, b) => (b.release_time || '').localeCompare(a.release_time || ''));
-    return rows.map((v) => buildRowModel(v, releaseAnchors, installedSet, source));
-  }, [catalog.value, versions.value, channel, query, availableForSource, releaseAnchors, source]);
+    return rows.map((v) => {
+      let rowFullInstalledSet = fullInstalledSet;
+      const cachedBuilds = currentComponentId ? getCachedLoaderBuilds(currentComponentId, v.id) : null;
+      const preferredBuild = currentComponentId && cachedBuilds ? pickPreferredBuild(cachedBuilds) : null;
+      if (preferredBuild) {
+        rowFullInstalledSet = new Set(fullInstalledSet);
+        if (installedSet.has(preferredBuild.version_id)) {
+          rowFullInstalledSet.add(v.id);
+        } else {
+          rowFullInstalledSet.delete(v.id);
+        }
+      }
+      return buildRowModel(v, installedSet, source, rowFullInstalledSet);
+    });
+  }, [catalog.value, versions.value, channel, query, availableForSource, source, currentComponentId]);
+  const selectedVersionRow = mcVersionId
+    ? versionRows.find((row) => row.id === mcVersionId) ?? null
+    : null;
 
   const selectedBuild: LoaderBuildRecord | null = useMemo(() => {
     if (!currentComponentId || !mcVersionId) return null;
@@ -217,11 +267,6 @@ function CreateWizard(): JSX.Element {
     return pickPreferredBuild(builds ?? []);
   }, [currentComponentId, mcVersionId, loaderState]);
 
-  const selectedMinecraftVersion = useMemo(() => {
-    if (!mcVersionId) return null;
-    return availableForSource.find((version) => version.id === mcVersionId) ?? null;
-  }, [availableForSource, mcVersionId]);
-
   const effectiveVersionId: string = useMemo(() => {
     if (source === 'vanilla') return mcVersionId ?? '';
     return selectedBuild?.version_id ?? '';
@@ -238,15 +283,25 @@ function CreateWizard(): JSX.Element {
   }, [source, mcVersionId]);
 
   const name = nameOverride ?? suggestedName;
+  const displayName = name.trim() || suggestedName || 'New instance';
 
   const previewSeed = useMemo(() => {
     if (seedOverride != null) return seedOverride;
     const previewId = `preview:${source}:${mcVersionId ?? 'none'}`;
-    const displayName = name.trim() || suggestedName || 'Untitled';
     return hashStr(`${previewId}:${displayName}:${mcVersionId ?? 'preview'}`) || 1;
-  }, [seedOverride, source, mcVersionId, name, suggestedName]);
+  }, [seedOverride, source, mcVersionId, displayName]);
 
-  const rerollSeed = (): void => { setSeedOverride(nextArtSeed(previewSeed)); };
+  const previewInstance = {
+    id: `preview:${source}:${mcVersionId ?? 'none'}`,
+    name: displayName,
+    version_id: mcVersionId ?? '',
+    art_seed: previewSeed,
+  };
+
+  const rerollSeed = (): void => {
+    Sound.ui('click');
+    setSeedOverride(nextArtSeed(previewSeed));
+  };
 
   const { scheduleHoverPrefetch, cancelHoverPrefetch } = useLoaderHoverPrefetch({
     source,
@@ -281,29 +336,20 @@ function CreateWizard(): JSX.Element {
     ? loaderState.context.errorMessage
     : null;
 
-  const stepValid: boolean =
-    step === 'pick' ? Boolean(mcVersionId && (source === 'vanilla' || selectedBuild)) :
-    step === 'name' ? name.trim().length > 0 && !submitting :
-    false;
+  const versionReady = Boolean(mcVersionId && (source === 'vanilla' || selectedBuild));
+  const canCreate = versionReady && name.trim().length > 0 && !submitting;
 
-  const advance = (): void => {
-    const next = idx + 1;
-    if (next >= STEP_ORDER.length) return;
-    setStep(STEP_ORDER[next]!);
-    setMaxReached((m) => Math.max(m, next));
+  useEffect(() => {
+    if (step === 'details' && !versionReady) setStep('version');
+  }, [step, versionReady]);
+
+  const continueToDetails = (): void => {
+    if (!versionReady) return;
+    setStep('details');
   };
-
-  const jumpTo = (i: number): void => {
-    const target = STEP_ORDER[i];
-    if (!target || i === idx) return;
-    if (i > maxReached) return;
-    setStep(target);
-  };
-
-  const goBack = (): void => { if (idx > 0) jumpTo(idx - 1); };
 
   const submit = async (): Promise<void> => {
-    if (submitting) return;
+    if (submitting || !canCreate) return;
     const trimmed = name.trim();
     if (!trimmed || !effectiveVersionId) return;
     setSubmitting(true);
@@ -313,7 +359,7 @@ function CreateWizard(): JSX.Element {
       const dims = winSpec && winSpec.id !== 'default'
         ? { w: winSpec.w, h: winSpec.h }
         : null;
-      await createInstance({
+      const result = await createInstance({
         name: trimmed,
         versionId: effectiveVersionId,
         icon: defaultIconFor(source),
@@ -332,15 +378,10 @@ function CreateWizard(): JSX.Element {
           ...(jvmPreset ? { jvm_preset: jvmPreset } : {}),
         },
       });
+      if (result.ok) closeCreate();
     } finally {
       setSubmitting(false);
     }
-  };
-
-  const onPrimary = (): void => {
-    if (!stepValid) return;
-    if (step === 'name') void submit();
-    else advance();
   };
 
   useEffect(() => {
@@ -350,155 +391,341 @@ function CreateWizard(): JSX.Element {
       const inField = target != null
         && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA');
 
-      if (e.key === 'Escape' && !inField) {
-        if (idx === 0) { navigate({ name: 'instances' }); return; }
-        e.preventDefault();
-        goBack();
+      if (e.key === 'Enter' && (e.ctrlKey || (!inField && target?.tagName !== 'BUTTON'))) {
+        if (step === 'version') {
+          if (versionReady) {
+            e.preventDefault();
+            continueToDetails();
+          }
+          return;
+        }
+        if (canCreate) {
+          e.preventDefault();
+          void submit();
+        }
         return;
       }
-      if (e.key === 'Enter' && e.ctrlKey) {
-        e.preventDefault();
-        if (stepValid) void submit();
-        return;
-      }
-      if (e.key === 'Enter') {
-        if (inField && step !== 'name') return;
-        if (target?.tagName === 'BUTTON') return;
-        e.preventDefault();
-        onPrimary();
-        return;
-      }
-      if (e.key === 'ArrowRight' && !inField) {
-        if (stepValid && step !== 'name') { e.preventDefault(); advance(); }
-        return;
-      }
-      if (e.key === 'ArrowLeft' && !inField) {
-        if (idx > 0) { e.preventDefault(); goBack(); }
-        return;
-      }
-      if (e.key === '/' && !inField && step === 'pick') {
+      if (e.key === '/' && !inField) {
+        if (step !== 'version') return;
         e.preventDefault();
         searchInputRef.current?.focus();
       }
     };
     window.addEventListener('keydown', handler);
     return () => { window.removeEventListener('keydown', handler); };
-  }, [
-    idx,
-    step,
-    stepValid,
-    submitting,
-    source,
-    mcVersionId,
-    selectedBuild,
-    name,
-    memoryGB,
-    previewSeed,
-    windowPresets,
-    windowPresetId,
-    jvmPreset,
-  ]);
+  }, [canCreate, submitting, source, mcVersionId, selectedBuild, name, memoryGB, previewSeed, windowPresets, windowPresetId, jvmPreset, step, versionReady]);
+
+  const availableChannelSet = new Set(availableChannels);
+  const channelTabs: Channel[] = [
+    ...BASE_CHANNEL_TABS,
+    ...availableChannels.filter((c) => !BASE_CHANNEL_TABS.includes(c)),
+  ];
+
+  const winSpec = windowPresets.find((p) => p.id === windowPresetId)
+    ?? windowPresets[windowPresets.length - 1]
+    ?? { id: 'default', label: 'Default', w: 0, h: 0 };
+  const winSubtitle = winSpec.id === 'default' ? 'Game default' : `${winSpec.w} × ${winSpec.h}`;
 
   return (
-    <div class="cp-cr-root">
-      <header class="cp-cr-top">
-        <Stepper current={idx} maxReached={maxReached} onJump={jumpTo} />
-      </header>
-
-      <main class="cp-cr-main">
-        <div class="cp-cr-canvas" key={step}>
-          {step === 'pick' && (
-            <PickStep
-              source={source}
-              onSourcePick={(k) => { setSource(k); setMcVersionId(null); }}
-              onSourcePreview={scheduleHoverPrefetch}
-              onSourcePreviewCancel={cancelHoverPrefetch}
-              channel={channel}
-              channels={availableChannels}
-              onChannelChange={setChannel}
-              query={query}
-              onQueryChange={setQuery}
-              searchRef={searchInputRef}
-              versionListRef={versionListRef}
-              rows={versionRows}
-              selectedId={mcVersionId}
-              onSelectId={setMcVersionId}
-              loaderLoading={loaderLoading}
-              loaderError={loaderError}
-              loaderMachine={loaderMachine}
-              selectedBuild={selectedBuild}
-              catalogLoading={catalogLoading}
-              catalogError={catalogError}
-              onRetryCatalog={() => { void loadCatalog(); }}
-            />
-          )}
-          {step === 'name' && (
-            <NameStep
-              source={source}
-              mcVersionId={mcVersionId ?? ''}
-              name={name}
-              suggestedName={suggestedName}
-              onNameChange={(v) => setNameOverride(v)}
-              nameInputRef={nameInputRef}
-              alreadyInstalled={effectiveAlreadyInstalled}
-              selectedBuild={selectedBuild}
-              minecraftVersion={selectedMinecraftVersion}
-              previewSeed={previewSeed}
-              onReroll={rerollSeed}
-              memoryGB={memoryGB}
-              onMemoryChange={setMemoryGB}
-              memoryRec={memoryRec.rec}
-              totalGB={totalGB}
-              windowPresets={windowPresets}
-              windowPresetId={windowPresetId}
-              onCycleWindow={cycleWindowPreset}
-              jvmPreset={jvmPreset}
-              onCycleJvm={cycleJvmPreset}
-            />
-          )}
-        </div>
-      </main>
-
-      <footer class="cp-cr-bottom">
-        <div class="cp-cr-actions">
-          <Button variant="ghost" onClick={() => navigate({ name: 'instances' })} disabled={submitting}>
-            Cancel
-          </Button>
-          <div class="cp-cr-nav" role="group" aria-label="Step navigation">
-            <button
-              type="button"
-              class="cp-cr-navbtn"
-              onClick={goBack}
-              disabled={idx === 0 || submitting}
-              aria-label="Previous step"
-              title="Previous  ←"
-            >
-              <Icon name="chevron-left" size={18} stroke={2.2} />
-            </button>
-            <button
-              type="button"
-              class="cp-cr-navbtn"
-              onClick={onPrimary}
-              disabled={!stepValid}
-              aria-label={step === 'name' ? 'Create instance' : 'Next step'}
-              title={step === 'name' ? 'Create  Ctrl+↵' : 'Next  →'}
-            >
-              {step === 'name'
-                ? <Icon name="check" size={18} stroke={2.2} />
-                : <Icon name="chevron-right" size={18} stroke={2.2} />}
-            </button>
+    <>
+        <header class="cp-cr-card-head">
+          <div>
+            <h1>Create instance</h1>
           </div>
+          <IconButton icon="x" tooltip="Close (Esc)" onClick={closeCreate} />
+          <div
+            class="cp-cr-progress"
+            data-step={step}
+            role="status"
+            aria-label={`Create step: ${step === 'version' ? 'Version' : 'Details'}`}
+          >
+            <span data-active={step === 'version'}>Version</span>
+            <i aria-hidden="true" />
+            <span data-active={step === 'details'}>Details</span>
+          </div>
+        </header>
+
+        <div class="cp-cr-card-body" data-step={step}>
+          {step === 'version' ? (
+          <section class="cp-cr-pick" aria-label="Version">
+            <div class="cp-cr-sources" role="radiogroup" aria-label="Instance source">
+              {LOADER_KEYS.map((key) => (
+                <button
+                  key={key}
+                  type="button"
+                  class="cp-cr-source"
+                  data-active={source === key}
+                  role="radio"
+                  aria-checked={source === key}
+                  title={LOADER_TAGLINES[key]}
+                  onClick={() => { setSource(key); setMcVersionId(null); }}
+                  onPointerEnter={() => scheduleHoverPrefetch(key)}
+                  onPointerLeave={cancelHoverPrefetch}
+                  onFocus={() => scheduleHoverPrefetch(key)}
+                  onBlur={cancelHoverPrefetch}
+                >
+                  <LoaderLogo loader={key} size={14} class="cp-cr-loader-mark" />
+                  <span>{LOADER_LABELS[key]}</span>
+                </button>
+              ))}
+            </div>
+
+            <div class="cp-cr-vbar">
+              <Input
+                value={query}
+                onChange={setQuery}
+                placeholder="Filter versions…"
+                icon="search"
+                inputRef={searchInputRef}
+                style={{ flex: 1 }}
+              />
+              <div class="cp-cr-channels" role="tablist" aria-label="Release channel">
+                {channelTabs.map((value) => {
+                  const available = availableChannelSet.has(value);
+                  return (
+                    <button
+                      key={value}
+                      type="button"
+                      class="cp-cr-chan"
+                      data-active={channel === value}
+                      role="tab"
+                      aria-selected={channel === value}
+                      disabled={!available}
+                      title={available ? undefined : `No ${CHANNEL_LABEL[value].toLowerCase()} versions here`}
+                      onClick={() => { if (available) setChannel(value); }}
+                    >
+                      {CHANNEL_LABEL[value]}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div class="cp-cr-vwell" ref={versionWellRef}>
+              {catalogLoading && (
+                <div class="cp-cr-state">
+                  <span class="cp-cr-spinner" aria-hidden="true" />
+                  <span>Loading versions…</span>
+                </div>
+              )}
+              {!catalogLoading && catalogError && (
+                <div class="cp-cr-state is-error" role="alert" aria-live="polite">
+                  <span>Couldn't load the catalog: {catalogError}</span>
+                  <Button variant="ghost" size="sm" onClick={() => { void loadCatalog(); }}>Retry</Button>
+                </div>
+              )}
+              {!catalogLoading && !catalogError && loaderLoading && (
+                <div class="cp-cr-state">
+                  <span class="cp-cr-spinner" aria-hidden="true" />
+                  <span>Fetching {LOADER_LABELS[source]}…</span>
+                </div>
+              )}
+              {!catalogLoading && !catalogError && loaderError && (
+                <div class="cp-cr-state is-error" role="alert" aria-live="polite">
+                  <span>{loaderError}</span>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => {
+                      if (source === 'vanilla') return;
+                      void loaderMachine.changeComponent(LOADER_COMPONENT_IDS[source], mcVersionId);
+                    }}
+                  >
+                    Retry
+                  </Button>
+                </div>
+              )}
+              {!catalogLoading && !catalogError && !loaderLoading && !loaderError && versionRows.length === 0 && (
+                <div class="cp-cr-state is-empty">
+                  <span>Nothing matches.</span>
+                </div>
+              )}
+              {versionRows.length > 0 && (
+                <ul class="cp-cr-vlist" role="listbox" aria-label="Minecraft versions">
+                  {versionRows.map((row) => (
+                    <li
+                      key={row.id}
+                      class="cp-cr-vrow"
+                      data-active={mcVersionId === row.id}
+                      role="option"
+                      aria-selected={mcVersionId === row.id}
+                      onClick={() => setMcVersionId(row.id)}
+                    >
+                      <span class="cp-cr-vrow-name">{row.displayName}</span>
+                      {row.hint && <span class="cp-cr-vrow-hint">{row.hint}</span>}
+                      <span class="cp-cr-vrow-spacer" />
+                      {row.downloadState !== 'none' && (
+                        <span
+                          class="cp-cr-vrow-installed"
+                          data-state={row.downloadState}
+                          title={versionStatusTitle(row.downloadState, source)}
+                        >
+                          <Icon
+                            name={row.downloadState === 'base' ? 'circle-dashed' : 'download'}
+                            size={13}
+                            stroke={2}
+                          />
+                        </span>
+                      )}
+                      {mcVersionId === row.id && (
+                        <span class="cp-cr-vrow-mark" aria-hidden="true">
+                          <Icon name="check" size={14} stroke={2.4} />
+                        </span>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+
+            <div class="cp-cr-pickfoot" aria-live="polite">
+              {source !== 'vanilla' && mcVersionId && selectedBuild
+                ? <span>{LOADER_LABELS[source]} build <b>{selectedBuild.loader_version}</b></span>
+                : source !== 'vanilla' && mcVersionId
+                  ? <span>Resolving {LOADER_LABELS[source]} build…</span>
+                  : <span>{versionRows.length} version{versionRows.length === 1 ? '' : 's'}</span>}
+            </div>
+          </section>
+          ) : (
+
+          <section class="cp-cr-side" aria-label="Instance details">
+            <div class="cp-cr-identity">
+              <div class="cp-cr-avatar">
+                <InstanceTile inst={previewInstance} radius={16} />
+                <button
+                  type="button"
+                  class="cp-cr-reroll"
+                  title="Shuffle tile colors"
+                  aria-label="Shuffle tile colors"
+                  onClick={rerollSeed}
+                >
+                  <Icon name="refresh" size={13} stroke={2} />
+                </button>
+              </div>
+              <div class="cp-cr-identity-text">
+                <h2 title={displayName}>{displayName}</h2>
+                <div class="cp-cr-identity-pills">
+                  <Pill>{source === 'vanilla' ? 'Vanilla' : LOADER_LABELS[source]}</Pill>
+                  {mcVersionId
+                    ? <Pill>MC {selectedVersionRow?.displayName ?? mcVersionId}</Pill>
+                    : <Pill>No version yet</Pill>}
+                 
+                </div>
+              </div>
+            </div>
+
+            <label class="cp-cr-field">
+              <span class="cp-cr-field-label">Name</span>
+              <Input
+                value={name}
+                onChange={(v) => setNameOverride(v)}
+                placeholder={suggestedName || 'New instance'}
+              />
+            </label>
+
+            <div class="cp-cr-field">
+              <div class="cp-cr-mem-head">
+                <span class="cp-cr-field-label">Memory</span>
+                <span class="cp-cr-mem-reading" aria-live="polite">{fmtMem(memoryGB)}</span>
+              </div>
+              <Slider
+                value={memoryGB}
+                min={1}
+                max={totalGB}
+                step={0.5}
+                recommended={[Math.max(2, memoryRec.rec - 2), Math.min(totalGB, memoryRec.rec + 2)]}
+                sound="memory"
+                onChange={setMemoryGB}
+                ariaLabel="Max memory in gigabytes"
+              />
+              <span class="cp-cr-hint">
+                {memoryGB < 2
+                  ? 'Low. May stutter.'
+                  : memoryGB > totalGB * 0.75
+                    ? 'High. Leave room for the OS.'
+                    : `Comfortable start: ${memoryRec.rec} GB.`}
+              </span>
+            </div>
+
+            <div class="cp-cr-rows" role="group" aria-label="Instance defaults">
+              <button type="button" class="cp-cr-row" onClick={cycleWindowPreset} aria-label="Cycle window size">
+                <span class="cp-cr-row-key">Window</span>
+                <span class="cp-cr-row-val">
+                  <span class="cp-cr-row-value">{winSpec.label}</span>
+                  <span class="cp-cr-row-sub">{winSubtitle}</span>
+                  <Icon name="chevron-right" size={13} stroke={2} />
+                </span>
+              </button>
+              <button
+                type="button"
+                class="cp-cr-row"
+                onClick={cycleJvmPreset}
+                aria-label="Cycle performance profile"
+                title={JVM_PRESET_HINTS[jvmPreset]}
+              >
+                <span class="cp-cr-row-key">Profile</span>
+                <span class="cp-cr-row-val">
+                  <span class="cp-cr-row-value">{JVM_PRESET_LABELS[jvmPreset]}</span>
+                  <Icon name="chevron-right" size={13} stroke={2} />
+                </span>
+              </button>
+            </div>
+          </section>
+          )}
         </div>
-        <div class="cp-cr-footnote" aria-live="polite">
-          {step === 'pick'
-            ? mcVersionId
-              ? 'Enter to continue · / to filter · Esc to leave.'
-              : 'Pick a version · / to filter.'
-            : name.trim()
-              ? 'Press Ctrl + Enter to create.'
-              : 'Name your world to create.'}
-        </div>
-      </footer>
-    </div>
+
+        <footer class="cp-cr-card-foot">
+          <span class="cp-cr-footnote" aria-live="polite">
+            {step === 'version'
+              ? (!versionReady
+                ? 'Pick a Minecraft version to continue.'
+                : source === 'vanilla'
+                  ? 'Continue to name and settings.'
+                  : selectedBuild
+                    ? `${LOADER_LABELS[source]} ${selectedBuild.loader_version} selected.`
+                    : `Resolving ${LOADER_LABELS[source]} build...`)
+              : !versionReady
+              ? 'Pick a Minecraft version to continue.'
+              : canCreate
+                ? 'Enter creates the instance.'
+                : 'Name your instance to create it.'}
+          </span>
+          <div class="cp-cr-foot-actions">
+            {step === 'version' ? (
+              <>
+                <Button variant="ghost" onClick={closeCreate} disabled={submitting}>
+                  Cancel
+                </Button>
+                <Button
+                  trailing={<Icon name="arrow-right" size={15} stroke={1.8} />}
+                  onClick={continueToDetails}
+                  disabled={!versionReady || submitting}
+                >
+                  Continue
+                </Button>
+              </>
+            ) : (
+              <>
+                <Button
+                  variant="ghost"
+                  icon="arrow-left"
+                  onClick={() => setStep('version')}
+                  disabled={submitting}
+                >
+                  Back
+                </Button>
+                <Button
+                  icon="plus"
+                  onClick={() => { void submit(); }}
+                  disabled={!canCreate}
+                  sound="affirm"
+                >
+                  {submitting ? 'Creating…' : 'Create instance'}
+                </Button>
+              </>
+            )}
+          </div>
+        </footer>
+    </>
   );
 }

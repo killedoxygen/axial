@@ -1,7 +1,6 @@
 import type { JSX, ComponentChildren } from 'preact';
 import { useState } from 'preact/hooks';
 import { Icon } from './Icons';
-import './atoms.css';
 
 type Tone = 'neutral' | 'accent' | 'ok' | 'warn' | 'err' | 'info';
 type BtnVariant = 'primary' | 'secondary' | 'soft' | 'ghost' | 'danger';
@@ -106,17 +105,27 @@ export function Divider({ vertical, style }: { vertical?: boolean; style?: JSX.C
   );
 }
 
-export function Meter({ value, tone = 'accent', height = 4, style }: {
+export function Meter({ value, tone = 'accent', height = 4, style, ariaLabel }: {
   value: number;
   tone?: 'accent' | 'ok' | 'warn' | 'err';
   height?: number;
   style?: JSX.CSSProperties;
+  ariaLabel?: string;
 }): JSX.Element {
   const cls = tone === 'accent' ? 'cp-meter' : `cp-meter cp-meter--${tone}`;
   const finiteValue = Number.isFinite(value) ? value : 0;
+  const boundedValue = Math.max(0, Math.min(100, finiteValue));
   return (
-    <div class={cls} style={{ height, ...style }}>
-      <span style={{ width: `${Math.max(0, Math.min(100, finiteValue))}%` }} />
+    <div
+      class={cls}
+      style={{ height, ...style }}
+      role="progressbar"
+      aria-label={ariaLabel}
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-valuenow={Math.round(boundedValue)}
+    >
+      <span style={{ width: `${boundedValue}%` }} />
     </div>
   );
 }
@@ -194,8 +203,7 @@ export function Card({ children, padding = 18, style, onClick, class: cls }: {
   );
 }
 
-export function SectionHeading({ eyebrow, title, action, right }: {
-  eyebrow?: string;
+export function SectionHeading({ title, action, right }: {
   title?: string;
   action?: { label: string; onClick?: () => void };
   right?: ComponentChildren;
@@ -203,7 +211,6 @@ export function SectionHeading({ eyebrow, title, action, right }: {
   return (
     <div class="cp-section-head">
       <div style={{ flex: 1, minWidth: 0 }}>
-        {eyebrow && <div class="cp-section-eyebrow">{eyebrow}</div>}
         {title && <h2>{title}</h2>}
       </div>
       {right}

@@ -1,23 +1,21 @@
 import type { JSX } from 'preact';
-import { useEffect, useState } from 'preact/hooks';
-import { Segmented } from '../../ui/Atoms';
+import { useEffect, useRef, useState } from 'preact/hooks';
+import { Button, Segmented } from '../../ui/Atoms';
 import { ColorField } from './ColorField';
-import { applyTheme } from '../../theme';
-import { local, PRESET_HUES } from '../../state';
+import { applyTheme, resetThemeToDefault } from '../../theme';
+import { defaults, local, PRESET_HUES } from '../../state';
 import { Sound, playSliderSound } from '../../sound';
-import './accent.css';
+import { useTheme } from '../../hooks/use-theme';
 
 export function AccentModeToggle({
   onChange,
 }: {
   onChange?: (mode: 'dark' | 'light') => void;
 }): JSX.Element {
-  const [mode, setMode] = useState<'dark' | 'light'>(local.lightness >= 50 ? 'light' : 'dark');
-
-  useEffect(() => { setMode(local.lightness >= 50 ? 'light' : 'dark'); }, []);
+  const theme = useTheme();
+  const mode = theme.dark ? 'dark' : 'light';
 
   const applyMode = (next: 'dark' | 'light'): void => {
-    setMode(next);
     applyTheme(local.theme || 'custom', local.customHue, {
       vibrancy: local.customVibrancy,
       lightness: next === 'light' ? 60 : 0,
@@ -41,26 +39,64 @@ export function AccentField({
 } = {}): JSX.Element {
   const [hue, setHue] = useState<number>(local.customHue);
   const [vibrancy, setVibrancy] = useState<number>(local.customVibrancy);
+  const latest = useRef({ hue: local.customHue, vibrancy: local.customVibrancy });
+  const previewFrame = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (previewFrame.current != null) cancelAnimationFrame(previewFrame.current);
+    };
+  }, []);
+
+  const schedulePreview = (): void => {
+    if (previewFrame.current != null) return;
+    previewFrame.current = requestAnimationFrame(() => {
+      previewFrame.current = null;
+      const { hue: nextHue, vibrancy: nextVibrancy } = latest.current;
+      setHue(nextHue);
+      setVibrancy(nextVibrancy);
+      applyTheme('custom', nextHue, {
+        vibrancy: nextVibrancy,
+        lightness: local.lightness,
+        silent: true,
+        transient: true,
+      });
+    });
+  };
 
   const applyPreset = (id: string): void => {
     const h = PRESET_HUES[id];
     if (h == null) return;
     const nextVibrancy = local.customVibrancy;
+    latest.current = { hue: h, vibrancy: nextVibrancy };
     setHue(h);
     setVibrancy(nextVibrancy);
     applyTheme(id, null, { vibrancy: nextVibrancy, lightness: local.lightness });
   };
 
+  const resetToDefault = (): void => {
+    latest.current = { hue: defaults.customHue, vibrancy: defaults.customVibrancy };
+    setHue(defaults.customHue);
+    setVibrancy(defaults.customVibrancy);
+    resetThemeToDefault();
+  };
+
   const onDrag = (h: number, v: number): void => {
-    setHue(h);
-    setVibrancy(v);
+    latest.current = { hue: h, vibrancy: v };
     playSliderSound(h / 360, 'hue');
-    applyTheme('custom', h, { vibrancy: v, lightness: local.lightness, silent: true });
+    schedulePreview();
   };
 
   const onEnd = (): void => {
+    if (previewFrame.current != null) {
+      cancelAnimationFrame(previewFrame.current);
+      previewFrame.current = null;
+    }
+    const { hue: nextHue, vibrancy: nextVibrancy } = latest.current;
+    setHue(nextHue);
+    setVibrancy(nextVibrancy);
     Sound.ui('theme');
-    applyTheme('custom', hue, { vibrancy, lightness: local.lightness });
+    applyTheme('custom', nextHue, { vibrancy: nextVibrancy, lightness: local.lightness });
   };
 
   return (
@@ -82,7 +118,12 @@ export function AccentField({
       </div>
       {showPresets && (
         <div class="cp-accent-presets">
-          <div class="cp-accent-presets-label">Presets</div>
+          <div class="cp-accent-presets-head">
+            <div class="cp-accent-presets-label">Presets</div>
+            <Button variant="secondary" size="sm" icon="reload" onClick={resetToDefault}>
+              Reset
+            </Button>
+          </div>
           <div class="cp-swatch-row">
             {Object.entries(PRESET_HUES).map(([id, h]) => {
               const active = local.theme === id;

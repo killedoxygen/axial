@@ -6,7 +6,7 @@ use crate::loaders::types::{
     LoaderBuildRecord, LoaderCatalogState, LoaderComponentId, LoaderComponentRecord, LoaderError,
     LoaderGameVersion,
 };
-use crate::manifest::fetch_version_manifest;
+use crate::manifest::fetch_version_manifest_cached;
 use crate::paths::loader_catalog_dir;
 use crate::version_meta::{enrich_loader_game_versions, manifest_release_entries};
 use std::collections::HashMap;
@@ -24,13 +24,16 @@ pub async fn fetch_supported_versions(
     library_dir: &Path,
     component_id: LoaderComponentId,
 ) -> Result<(Vec<LoaderGameVersion>, LoaderCatalogState), LoaderError> {
-    let (mut versions, catalog) = resolve_cached(
+    let supported_versions = resolve_cached(
         supported_versions_cache_path(library_dir, component_id),
         SUPPORTED_VERSIONS_TTL,
         || providers::fetch_supported_versions(component_id),
-    )
-    .await?;
-    let catalog_order = if let Ok(manifest) = fetch_version_manifest().await {
+    );
+    let version_manifest = fetch_version_manifest_cached(library_dir);
+    let (supported_versions, version_manifest) = tokio::join!(supported_versions, version_manifest);
+
+    let (mut versions, catalog) = supported_versions?;
+    let catalog_order = if let Ok(manifest) = version_manifest {
         let releases = manifest_release_entries(&manifest.versions);
         enrich_loader_game_versions(&mut versions, &manifest.versions, &releases);
         Some(catalog_version_order(&manifest.versions))

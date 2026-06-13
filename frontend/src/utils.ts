@@ -1,5 +1,4 @@
-import { byId } from './dom';
-import { collapsedLogSeverity, currentPage, instances, logLines } from './store';
+import { collapsedLogSeverity, currentPage, logLines } from './store';
 import { toast } from './toast';
 import type {
   CatalogVersion,
@@ -13,9 +12,11 @@ import type {
   Version,
 } from './types';
 
-const loggedInstances = new Set<string>();
-let activeLogFilter = 'all';
 import type { LogSeverity } from './store';
+
+export function cn(...inputs: unknown[]): string {
+  return inputs.filter((v): v is string => typeof v === 'string' && v.length > 0).join(' ');
+}
 
 const SEVERITY_RANK: Record<LogSeverity, number> = { error: 3, system: 2, info: 1 };
 
@@ -26,99 +27,18 @@ function logSeverityFromSource(source: string): LogSeverity {
 }
 
 function updateLogIndicator(source: string): void {
-  const panel = byId<HTMLElement>('log-panel');
-  if (panel?.classList.contains('expanded')) return;
-
   const newSeverity = logSeverityFromSource(source);
   const currentSeverity = collapsedLogSeverity.value;
   if (currentSeverity && SEVERITY_RANK[currentSeverity] >= SEVERITY_RANK[newSeverity]) return;
   collapsedLogSeverity.value = newSeverity;
 }
 
-export function clearLogIndicator(): void {
-  collapsedLogSeverity.value = null;
-}
-
-function fmtTime(): string {
-  const d = new Date();
-  return `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}`;
-}
-
 export function appendLog(source: string, text: string, instanceId?: string, instanceName?: string): void {
-  const logLinesEl = byId<HTMLElement>('log-lines');
-  const logCountEl = byId<HTMLElement>('log-count');
-  const logContentEl = byId<HTMLElement>('log-content');
-  const line = document.createElement('div');
-  line.className = `log-line ${source}`;
-  if (instanceId) line.dataset.instance = instanceId;
-
-  // Timestamp
-  const ts = document.createElement('span');
-  ts.className = 'log-ts';
-  ts.textContent = fmtTime();
-  line.appendChild(ts);
-
-  // Instance tag
-  if (instanceName && instanceId) {
-    const tag = document.createElement('span');
-    tag.className = 'log-tag';
-    tag.textContent = instanceName;
-    line.appendChild(tag);
-
-    if (!loggedInstances.has(instanceId)) {
-      loggedInstances.add(instanceId);
-      if (loggedInstances.size > 1) logLinesEl?.classList.add('multi');
-      syncLogFilter();
-    }
-  }
-
-  line.appendChild(document.createTextNode(text));
-
-  // Apply active filter
-  if (activeLogFilter !== 'all' && instanceId && instanceId !== activeLogFilter) {
-    line.classList.add('log-filtered');
-  }
-
-  logLinesEl?.appendChild(line);
+  void text;
+  void instanceId;
+  void instanceName;
   logLines.value += 1;
-  if (logCountEl) logCountEl.textContent = `${logLines.value} line${logLines.value !== 1 ? 's' : ''}`;
   updateLogIndicator(source);
-  if (logContentEl) logContentEl.scrollTop = logContentEl.scrollHeight;
-}
-
-export function setLogFilter(instanceId?: string): void {
-  activeLogFilter = instanceId || 'all';
-  const logLinesEl = byId<HTMLElement>('log-lines');
-  const logContentEl = byId<HTMLElement>('log-content');
-  if (!logLinesEl) return;
-  const lines = logLinesEl.querySelectorAll('.log-line') as NodeListOf<HTMLElement>;
-  for (const line of lines) {
-    const lid = line.dataset.instance;
-    if (activeLogFilter === 'all' || !lid || lid === activeLogFilter) {
-      line.classList.remove('log-filtered');
-    } else {
-      line.classList.add('log-filtered');
-    }
-  }
-  if (logContentEl) logContentEl.scrollTop = logContentEl.scrollHeight;
-}
-
-function syncLogFilter(): void {
-  const filter = byId<HTMLSelectElement>('log-filter');
-  if (!filter) return;
-  // Rebuild filter options
-  const current = filter.value;
-  filter.replaceChildren(new Option('All instances', 'all'));
-  for (const id of loggedInstances) {
-    const inst = instances.value.find((instance) => instance.id === id);
-    const name: string = inst?.name || id.slice(0, 8);
-    const opt = document.createElement('option');
-    opt.value = id;
-    opt.textContent = name;
-    filter.appendChild(opt);
-  }
-  filter.value = current || 'all';
-  filter.classList.toggle('cp-hidden', loggedInstances.size < 2);
 }
 
 export function showError(msg: string): void {
@@ -130,12 +50,6 @@ export function errMessage(err: unknown): string {
   if (err instanceof Error && err.message) return err.message;
   if (typeof err === 'string') return err;
   return 'Unknown error';
-}
-
-export function esc(s: string): string {
-  const d = document.createElement('div');
-  d.textContent = s;
-  return d.innerHTML;
 }
 
 interface VersionDisplay {
@@ -174,6 +88,10 @@ export function isOldAlphaVersion(version: Pick<Version, 'lifecycle'> | Pick<Cat
   return hasLifecycleLabel(version?.lifecycle, 'old_alpha');
 }
 
+export function supportsMods(version: Pick<Version, 'loader'> | null | undefined): boolean {
+  return !!version?.loader;
+}
+
 export function matchesVersionFilter(
   version: Pick<CatalogVersion, 'lifecycle'> | Pick<Version, 'lifecycle'>,
   filter: string,
@@ -193,7 +111,7 @@ export function versionBadgeInfo(version: Version | null | undefined): { cls: st
   return { cls: 'badge-old', text: version?.lifecycle?.badge_text || '?' };
 }
 
-export function parseVersionDisplay(versionId: string, version: VersionLike | null | undefined, versions: VersionLike[]): VersionDisplay {
+export function parseVersionDisplay(versionId: string, version: VersionLike | null | undefined): VersionDisplay {
   if (version && 'inherits_from' in version && version.inherits_from) {
     return parseModded(versionId, version.inherits_from, version as Version | null);
   }
@@ -205,7 +123,6 @@ export function parseVersionDisplay(versionId: string, version: VersionLike | nu
   }
   if (isOldBetaVersion(version)) return { name: versionId.replace(/^b/, 'Beta '), hint: null };
   if (isOldAlphaVersion(version)) return { name: versionId.replace(/^a/, 'Alpha '), hint: null };
-  if (isSnapshotVersion(version)) return parseSnapshot(versionId, version, versions);
   return { name: versionId, hint: null };
 }
 
@@ -247,14 +164,11 @@ function parseModded(id: string, base: string, version?: Version | null): Versio
   if (lo.startsWith('neoforge-')) {
     return loaderDisplay('neoforge', base, id.slice('neoforge-'.length));
   }
-  // optifine
   const m = id.match(/-optifine[_-](.*)/i);
   if (m) return { name: `OptiFine ${base}`, hint: m[1].replace(/_/g, ' ').trim(), loader: null };
-  // X.X.X-fabric (simple)
   if (lo.includes('fabric')) return { name: `Fabric ${base}`, hint: null, loader: 'fabric' };
   if (lo.includes('quilt')) return { name: `Quilt ${base}`, hint: null, loader: 'quilt' };
   if (lo.includes('liteloader')) return { name: `LiteLoader ${base}`, hint: null, loader: null };
-  // generic fallback
   return { name: base, hint: id !== base ? id : null, loader: null };
 }
 
@@ -300,44 +214,6 @@ function loaderDisplay(
   };
 }
 
-function parseSnapshot(id: string, version: VersionLike | null | undefined, versions: VersionLike[]): VersionDisplay {
-  if (version?.minecraft_meta?.display_name) {
-    return {
-      name: version.minecraft_meta.display_name,
-      hint: version.minecraft_meta.display_hint || null,
-    };
-  }
-  // pre-release / release candidate: 1.20.5-pre1, 1.20.5-rc1
-  const m = id.match(/^(\d+\.\d+(?:\.\d+)?)-(?:pre|rc)\d+$/);
-  if (m) return { name: id, hint: null };
-  // weekly snapshot: find nearest release by time
-  if (versions?.length && version?.release_time) {
-    const t = version.release_time as string;
-    const rel = versions
-      .filter((v) => isReleaseVersion(v) && v.release_time)
-      .sort((a, b) => (a.release_time as string).localeCompare(b.release_time as string));
-    // first release at or after snapshot
-    let nearest: VersionLike | null = null;
-    for (const r of rel) {
-      if ((r.release_time || '') >= t) {
-        nearest = r;
-        break;
-      }
-    }
-    // if none after, use last release before
-    if (!nearest) {
-      for (let i = rel.length - 1; i >= 0; i--) {
-        if ((rel[i]?.release_time || '') <= t) {
-          nearest = rel[i] || null;
-          break;
-        }
-      }
-    }
-    if (nearest && !id.includes(nearest.id)) return { name: id, hint: `~ ${nearest.id}` };
-  }
-  return { name: id, hint: null };
-}
-
 export function fmtMem(gb: number): string { return gb === Math.floor(gb) ? `${gb}\u00A0GB` : `${gb.toFixed(1)}\u00A0GB`; }
 
 export function formatBytes(bytes: number): string {
@@ -360,10 +236,6 @@ export function formatRelativeTime(date: Date): string {
   return new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' }).format(date);
 }
 
-// ── Player name validation ──────────────────────────────────────────────
-// Minecraft (offline + MSA) accepts [A-Za-z0-9_]{3,16}. Anything outside that
-// range breaks launch arg construction (spaces, quotes, semicolons, etc.).
-// Frontend gates every input site; the backend is a last-resort defense.
 
 export const USERNAME_MIN_LEN = 3;
 export const USERNAME_MAX_LEN = 16;
@@ -383,12 +255,6 @@ export function getMemoryRecommendation(totalGB: number): { rec: number; text: s
   if (totalGB <= 8) return { rec: 4, text: '4 GB recommended' };
   if (totalGB <= 16) return { rec: 6, text: '6 GB recommended' };
   return { rec: 8, text: '8 GB recommended' };
-}
-
-export function updateMemoryRecText(val: number, totalGB: number): void {
-  const memoryRec = byId<HTMLElement>('memory-rec');
-  if (!totalGB || !memoryRec) return;
-  memoryRec.textContent = val < 2 ? '(low — may lag)' : val > totalGB * 0.75 ? '(high — leave room for OS)' : '';
 }
 
 export function setPage(page: Page): void {

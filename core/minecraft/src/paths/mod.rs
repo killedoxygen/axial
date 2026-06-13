@@ -16,6 +16,10 @@ pub fn cache_dir(mc_dir: &Path) -> PathBuf {
     mc_dir.join("cache")
 }
 
+pub fn version_manifest_cache_path(mc_dir: &Path) -> PathBuf {
+    cache_dir(mc_dir).join("version_manifest_v2.json")
+}
+
 pub fn loader_cache_dir(mc_dir: &Path) -> PathBuf {
     cache_dir(mc_dir).join("loaders")
 }

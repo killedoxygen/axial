@@ -3,6 +3,7 @@ import type {
   Instance, Version, Config, SystemInfo,
   RunningSession, InstallItem, Catalog, Page, ToastItem, UpdateInfo, InstanceLaunchDraft, LaunchNotice,
 } from './types';
+import type { LaunchStage } from './launch-stages';
 
 // ── Core data ──
 
@@ -24,27 +25,49 @@ export const selectedInstance = computed<Instance | null>(() => {
   return instances.value.find(i => i.id === id) ?? null;
 });
 
+export function versionById(id: string | undefined): Version | undefined {
+  if (!id) return undefined;
+  return versions.value.find(v => v.id === id);
+}
+
 export const selectedVersion = computed<Version | null>(() => {
-  const inst = selectedInstance.value;
-  if (!inst) return null;
-  return versions.value.find(v => v.id === inst.version_id) ?? null;
+  return versionById(selectedInstance.value?.version_id) ?? null;
 });
 
 // ── Install state machine ──
 
 export type InstallState =
   | { status: 'idle' }
-  | { status: 'active'; versionId: string; pct: number; label: string };
+  | {
+    status: 'active';
+    item: InstallItem;
+    versionId: string;
+    displayName?: string;
+    pct: number;
+    label: string;
+    phase?: string;
+    remainingSeconds?: number;
+    remainingSecondsUpdatedAt?: number;
+    startedAt: number;
+  };
+
+export type InstallFailure = {
+  item: InstallItem;
+  displayName: string;
+  message: string;
+  failedAt: number;
+};
 
 export const installState = signal<InstallState>({ status: 'idle' });
 export const installQueue = signal<InstallItem[]>([]);
+export const installFailure = signal<InstallFailure | null>(null);
 export const installEventSource = signal<{ close(): void } | null>(null);
 
 // ── Launch state machine ──
 
 export type LaunchState =
   | { status: 'idle' }
-  | { status: 'preparing'; instanceId: string; pct: number; label: string };
+  | { status: 'preparing'; instanceId: string; pct: number; label: string; stage?: LaunchStage };
 
 export const launchState = signal<LaunchState>({ status: 'idle' });
 export const runningSessions = signal<Record<string, RunningSession>>({});

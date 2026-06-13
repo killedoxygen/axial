@@ -1,6 +1,6 @@
 import type { JSX } from 'preact';
+import { useRef } from 'preact/hooks';
 import { playSliderSound } from '../sound';
-import './slider.css';
 
 export interface SliderZone {
   from: number;
@@ -37,8 +37,13 @@ function zonesFromRecommendation(recommended: [number, number] | undefined, min:
   return zones;
 }
 
-// Slider wraps a hidden native range input so keyboard and a11y come for free
-// Track, fill, recommendation zones, and thumb are painted on top
+function snapToStep(value: number, min: number, max: number, step: number): number {
+  const safeStep = step > 0 ? step : 1;
+  const snapped = Math.round((value - min) / safeStep) * safeStep + min;
+  const decimals = Math.max(0, `${safeStep}`.split('.')[1]?.length ?? 0);
+  return Number(clamp(snapped, min, max).toFixed(decimals));
+}
+
 export function Slider({
   value,
   min = 0,
@@ -68,6 +73,7 @@ export function Slider({
   ariaLabel?: string;
   style?: JSX.CSSProperties;
 }): JSX.Element {
+  const inputRef = useRef<HTMLInputElement | null>(null);
   const range = Math.max(1e-9, max - min);
   const clampedValue = clamp(value, min, max);
   const pct = ((clampedValue - min) / range) * 100;
@@ -80,9 +86,41 @@ export function Slider({
     }
     onChange(next);
   };
+  const valueFromPointer = (event: PointerEvent, element: HTMLElement): number => {
+    const rect = element.getBoundingClientRect();
+    const ratio = clamp((event.clientX - rect.left) / Math.max(1, rect.width), 0, 1);
+    return snapToStep(min + ratio * range, min, max, step);
+  };
+  const handlePointer = (event: PointerEvent, commit: boolean): void => {
+    const element = event.currentTarget as HTMLElement;
+    const next = valueFromPointer(event, element);
+    if (inputRef.current) inputRef.current.focus();
+    emit(next);
+    if (commit) onCommit?.(next);
+  };
   return (
     <div>
-      <div class="cp-slider" style={{ ...style, ['--slider-filled' as any]: `${pct}%` }}>
+      <div
+        class="cp-slider"
+        style={{ ...style, ['--slider-filled' as any]: `${pct}%` }}
+        onPointerDown={(event) => {
+          if (event.button !== 0) return;
+          event.preventDefault();
+          (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+          handlePointer(event as unknown as PointerEvent, false);
+        }}
+        onPointerMove={(event) => {
+          if (!(event.currentTarget as HTMLElement).hasPointerCapture(event.pointerId)) return;
+          event.preventDefault();
+          handlePointer(event as unknown as PointerEvent, false);
+        }}
+        onPointerUp={(event) => {
+          if (!(event.currentTarget as HTMLElement).hasPointerCapture(event.pointerId)) return;
+          event.preventDefault();
+          handlePointer(event as unknown as PointerEvent, true);
+          (event.currentTarget as HTMLElement).releasePointerCapture(event.pointerId);
+        }}
+      >
         <div class="cp-slider-track">
           {shownZones.map((zone, index) => (
             <div
@@ -96,6 +134,7 @@ export function Slider({
           <div class="cp-slider-fill" />
         </div>
         <input
+          ref={inputRef}
           type="range"
           min={min} max={max} step={step} value={value}
           aria-label={ariaLabel}

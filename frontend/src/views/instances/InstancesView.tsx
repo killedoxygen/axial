@@ -1,13 +1,21 @@
 import type { JSX } from 'preact';
-import { useState } from 'preact/hooks';
-import { InstanceArt } from '../../art/InstanceArt';
+import { useCallback, useState } from 'preact/hooks';
+import { InstanceTile } from '../../ui/InstanceVisual';
 import { Button, IconButton, Input, Segmented, Pill } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
+import { InstanceCard } from '../../ui/InstanceCard';
 import { openContextMenu } from '../../ui/ContextMenu';
+import { SelectionActionPill, SelectionCheckbox } from '../../ui/SelectionActionPill';
+import { selectionMenuItem, selectionToggleLabel, useSelection } from '../../ui/selection';
 import { useTheme } from '../../hooks/use-theme';
-import { instances, versions, runningSessions } from '../../store';
-import { navigate } from '../../ui-state';
-import { deleteInstanceFlow, duplicateInstance, openInstanceFolder, renameInstance } from '../instance/InstanceDetailView';
+import { instances, versionById, runningSessions } from '../../store';
+import { instanceInstallStatus } from '../../instance-install-status';
+import { navigate, openCreate } from '../../ui-state';
+import { loaderKeyFromVersion, LOADER_LABELS } from '../create/defaults';
+import { instanceMenuItems } from '../instance/instance-menu';
+import { deleteInstancesFlow } from '../instance/instance-actions';
+import { supportsMods } from '../../utils';
+import { minecraftVersionLabel } from '../../version-display';
 import type { EnrichedInstance, Version } from '../../types';
 
 function fmtRelative(iso?: string): string {
@@ -27,117 +35,103 @@ function fmtRelative(iso?: string): string {
 }
 
 function versionLabel(v: Version | undefined): string {
-  if (!v) return '—';
-  return v.minecraft_meta.display_hint || v.minecraft_meta.display_name || v.id;
+  return minecraftVersionLabel(v, '—');
 }
 
 function loaderLabel(v: Version | undefined): string {
-  if (!v?.loader) return 'Vanilla';
-  const id = v.loader.component_id;
-  if (id.includes('fabric')) return 'Fabric';
-  if (id.includes('quilt')) return 'Quilt';
-  if (id.includes('neoforged')) return 'NeoForge';
-  if (id.includes('minecraftforge')) return 'Forge';
-  return 'Modded';
+  return LOADER_LABELS[loaderKeyFromVersion(v)];
 }
 
-const LIST_COLS = '52px 2.4fr 1fr 1fr 1fr 140px';
+const LIST_COLS = '28px 52px 2.4fr 1fr 1fr 1fr 140px';
 
-function menuItemsFor(inst: EnrichedInstance): Parameters<typeof openContextMenu>[1] {
-  return [
-    { icon: 'play', label: 'Open detail', onSelect: () => navigate({ name: 'instance', id: inst.id }) },
-    { icon: 'folder', label: 'Open folder', onSelect: () => void openInstanceFolder(inst.id) },
-    { icon: 'copy', label: 'Duplicate', onSelect: () => void duplicateInstance(inst) },
-    { icon: 'edit', label: 'Rename', onSelect: () => void renameInstance(inst) },
-    { label: '', onSelect: () => {}, divider: true },
-    { icon: 'trash', label: 'Delete', onSelect: () => void deleteInstanceFlow(inst), danger: true },
-  ];
-}
-
-function ListRow({ inst }: { inst: EnrichedInstance }): JSX.Element {
+function ListRow({
+  inst,
+  selected,
+  onToggleSelect,
+  onContextMenu,
+}: {
+  inst: EnrichedInstance;
+  selected: boolean;
+  onToggleSelect: (e: MouseEvent) => void;
+  onContextMenu: (e: MouseEvent) => void;
+}): JSX.Element {
   const theme = useTheme();
-  const v = versions.value.find(x => x.id === inst.version_id);
+  const v = versionById(inst.version_id);
   const running = !!runningSessions.value[inst.id];
+  const install = instanceInstallStatus(inst, v);
+  const installing = install.installing;
+  const installLabel = install.state === 'queued' ? 'Queued' : 'Installing';
+  const showModsCount = supportsMods(v);
   return (
     <div
-      class="cp-table-row"
+      class="cp-table-row cp-selection-row"
       style={{ gridTemplateColumns: LIST_COLS }}
+      data-selected={selected}
       onClick={() => navigate({ name: 'instance', id: inst.id })}
-      onContextMenu={(e) => openContextMenu(e, menuItemsFor(inst))}
+      onContextMenu={onContextMenu}
     >
-      <InstanceArt instance={inst} aspect="thumb" radius={theme.r.sm} style={{ width: 36, height: 36 }} />
+      <SelectionCheckbox
+        selected={selected}
+        label={selectionToggleLabel(selected, inst.name)}
+        onToggle={(e) => {
+          e.stopPropagation();
+          onToggleSelect(e);
+        }}
+      />
+      <InstanceTile inst={inst} radius={theme.r.sm} style={{ width: 36, height: 36 }} />
       <div>
         <div class="cp-table-row-title" style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           {inst.name}
           {running && <Pill tone="accent" icon="play">Live</Pill>}
+          {installing && <Pill icon={install.state === 'queued' ? 'clock' : 'download'}>{installLabel}</Pill>}
         </div>
         <div class="cp-table-row-sub">{loaderLabel(v)} · {v?.loader?.loader_version || 'vanilla'}</div>
       </div>
-      <div style={{ fontSize: 12, color: theme.n.textDim }}>{versionLabel(v)}</div>
-      <div style={{ fontSize: 12, color: theme.n.textDim }}>{inst.mods_count ?? 0} mods</div>
-      <div style={{ fontSize: 12, color: theme.n.textDim }}>{fmtRelative(inst.last_played_at)}</div>
+      <div class="cp-table-cell">{versionLabel(v)}</div>
+      <div class="cp-table-cell">{showModsCount ? `${inst.mods_count ?? 0} mods` : null}</div>
+      <div class="cp-table-cell">{fmtRelative(inst.last_played_at)}</div>
       <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 4 }}>
         <Button
           size="sm"
-          icon="play"
+          variant="secondary"
+          icon={installing ? install.state === 'queued' ? 'clock' : 'download' : 'play'}
+          disabled={installing}
           onClick={(e) => { e.stopPropagation(); navigate({ name: 'instance', id: inst.id }); }}
-        >Play</Button>
+        >{installing ? installLabel : 'Play'}</Button>
         <IconButton
           icon="dots"
           size={28}
-          onClick={(e: any) => { e.stopPropagation(); openContextMenu(e, menuItemsFor(inst)); }}
+          onClick={(e: any) => { e.stopPropagation(); onContextMenu(e); }}
         />
       </div>
     </div>
   );
 }
 
-function GridCard({ inst }: { inst: EnrichedInstance }): JSX.Element {
-  const theme = useTheme();
-  const v = versions.value.find(x => x.id === inst.version_id);
-  const openInstance = (): void => navigate({ name: 'instance', id: inst.id });
-  const onCardKeyDown = (e: KeyboardEvent): void => {
-    if (e.target !== e.currentTarget) return;
-    if (e.key !== 'Enter' && e.key !== ' ') return;
-    e.preventDefault();
-    openInstance();
-  };
-  return (
-    <div
-      class="cp-card cp-playcard"
-      role="button"
-      tabIndex={0}
-      aria-label={`Open ${inst.name}`}
-      onClick={openInstance}
-      onKeyDown={onCardKeyDown}
-    >
-      <InstanceArt instance={inst} version={v} aspect="square" radius={theme.r.md} style={{ width: 68, height: 68 }} />
-      <div class="cp-playcard-body">
-        <div class="cp-playcard-title">
-          <h3>{inst.name}</h3>
-        </div>
-        <div class="cp-playcard-meta">
-          <span>{loaderLabel(v)}</span>
-          <span class="cp-dot" />
-          <span>MC {versionLabel(v)}</span>
-          <span class="cp-dot" />
-          <span>{inst.mods_count ?? 0} mods</span>
-        </div>
-      </div>
-      <Button size="sm" icon="play" onClick={(e) => { e.stopPropagation(); navigate({ name: 'instance', id: inst.id }); }}>Play</Button>
-    </div>
-  );
-}
-
 export function InstancesView(): JSX.Element {
-  const theme = useTheme();
-  const [view, setView] = useState<'list' | 'grid'>('list');
+  const [view, setView] = useState<'grid' | 'list'>('grid');
   const [q, setQ] = useState('');
   const all = instances.value as EnrichedInstance[];
-  const filtered = all.filter(i => i.name.toLowerCase().includes(q.toLowerCase()));
+  const query = q.trim().toLowerCase();
+  const filtered = all.filter(i => i.name.toLowerCase().includes(query));
+  const selection = useSelection(filtered, useCallback((inst: EnrichedInstance) => inst.id, []));
+
+  const menuItems = (inst: EnrichedInstance) => [
+    selectionMenuItem(selection, inst.id),
+    { divider: true, label: '', onSelect: () => undefined },
+    ...instanceMenuItems(inst),
+  ];
+
+  const openMenu = (e: MouseEvent, inst: EnrichedInstance): void => {
+    openContextMenu(e, menuItems(inst));
+  };
+
+  const deleteSelected = async (): Promise<void> => {
+    await deleteInstancesFlow(selection.selectedItems, selection.clear);
+  };
 
   return (
-    <div class="cp-view-page" style={{ gap: 16 }}>
+    <div class="cp-view-page" style={{ gap: 18 }}>
       <div class="cp-page-header">
         <div>
           <h1>Instances</h1>
@@ -147,21 +141,34 @@ export function InstancesView(): JSX.Element {
         </div>
         <div style={{ flex: 1 }} />
         <Input value={q} onChange={setQ} placeholder="Filter instances…" icon="search" style={{ width: 260 }} />
-        <Segmented<'list' | 'grid'> value={view} onChange={setView}
-          options={[{ value: 'list', label: 'List' }, { value: 'grid', label: 'Grid' }]} />
-        <Button icon="plus" onClick={() => navigate({ name: 'create' })}>New</Button>
+        <Segmented<'grid' | 'list'> value={view} onChange={setView}
+          options={[{ value: 'grid', label: 'Grid' }, { value: 'list', label: 'List' }]} />
+        <Button icon="plus" onClick={openCreate}>New</Button>
       </div>
 
       {filtered.length === 0 ? (
         <div class="cp-empty">
-          <Icon name="cube" size={36} color="var(--text-mute)" />
+          <Icon name="stack" size={36} color="var(--text-mute)" />
           <h2>{q ? 'No matches' : 'No instances yet'}</h2>
           <p>{q ? 'Try a different search term.' : 'Create your first Minecraft instance to get started.'}</p>
-          {!q && <Button icon="plus" onClick={() => navigate({ name: 'create' })}>New instance</Button>}
+          {!q && <Button icon="plus" onClick={openCreate}>New instance</Button>}
         </div>
-      ) : view === 'list' ? (
+      ) : view === 'grid' ? (
+        <div class="cp-cover-grid">
+          {filtered.map(i => (
+            <InstanceCard
+              key={i.id}
+              inst={i}
+              selected={selection.isSelected(i.id)}
+              onToggleSelect={() => selection.toggle(i.id)}
+              onContextMenu={(e) => openMenu(e, i)}
+            />
+          ))}
+        </div>
+      ) : (
         <div class="cp-card cp-table">
           <div class="cp-table-head" style={{ gridTemplateColumns: LIST_COLS }}>
+            <span />
             <span />
             <span>Instance</span>
             <span>Version</span>
@@ -169,13 +176,24 @@ export function InstancesView(): JSX.Element {
             <span>Last played</span>
             <span />
           </div>
-          {filtered.map(i => <ListRow key={i.id} inst={i} />)}
-        </div>
-      ) : (
-        <div class="cp-grid-3">
-          {filtered.map(i => <GridCard key={i.id} inst={i} />)}
+          {filtered.map(i => (
+            <ListRow
+              key={i.id}
+              inst={i}
+              selected={selection.isSelected(i.id)}
+              onToggleSelect={() => selection.toggle(i.id)}
+              onContextMenu={(e) => openMenu(e, i)}
+            />
+          ))}
         </div>
       )}
+      <SelectionActionPill
+        selection={selection}
+        itemLabel="instance"
+        actions={[
+          { label: 'Delete', icon: 'trash', danger: true, onClick: () => void deleteSelected() },
+        ]}
+      />
     </div>
   );
 }

@@ -1,7 +1,3 @@
-// Design tokens
-// Accent engine derives a full scale from a single hue so user-chosen
-// accents can't break contrast
-// Mirrors the :root CSS variables in style.css, components can consume either
 
 export interface AccentScale {
   base: string;
@@ -66,40 +62,40 @@ export function buildAccent(hue: number, dark: boolean, vibrancy = 100): AccentS
   };
 }
 
-export function buildNeutrals(dark: boolean): NeutralScale {
+export function buildNeutrals(dark: boolean, hue = 140): NeutralScale {
   if (dark) {
     return {
-      bg: 'oklch(0.16 0.008 70)',
-      bgDeep: 'oklch(0.12 0.008 70)',
-      surface: 'oklch(0.20 0.008 70)',
-      surface2: 'oklch(0.24 0.008 70)',
-      surface3: 'oklch(0.28 0.008 70)',
-      line: 'oklch(1 0 0 / 0.06)',
-      lineStrong: 'oklch(1 0 0 / 0.12)',
-      text: 'oklch(0.97 0.005 70)',
-      textDim: 'oklch(0.72 0.008 70)',
-      textMute: 'oklch(0.56 0.008 70)',
+      bg: `oklch(0.175 0.012 ${hue})`,
+      bgDeep: `oklch(0.14 0.012 ${hue})`,
+      surface: `oklch(0.24 0.014 ${hue})`,
+      surface2: `oklch(0.30 0.015 ${hue})`,
+      surface3: `oklch(0.35 0.016 ${hue})`,
+      line: 'oklch(1 0 0 / 0.07)',
+      lineStrong: 'oklch(1 0 0 / 0.14)',
+      text: `oklch(0.96 0.005 ${hue})`,
+      textDim: `oklch(0.74 0.010 ${hue})`,
+      textMute: `oklch(0.58 0.012 ${hue})`,
       shadow: '0 24px 60px -20px rgba(0,0,0,0.6), 0 2px 6px rgba(0,0,0,0.3)',
     };
   }
   return {
-    bg: 'oklch(0.96 0.006 70)',
-    bgDeep: 'oklch(0.94 0.006 70)',
-    surface: 'oklch(0.99 0.004 70)',
-    surface2: 'oklch(0.97 0.006 70)',
-    surface3: 'oklch(0.93 0.008 70)',
-    line: 'oklch(0 0 0 / 0.06)',
-    lineStrong: 'oklch(0 0 0 / 0.12)',
-    text: 'oklch(0.22 0.008 70)',
-    textDim: 'oklch(0.45 0.008 70)',
-    textMute: 'oklch(0.60 0.008 70)',
+    bg: `oklch(0.95 0.006 ${hue})`,
+    bgDeep: `oklch(0.92 0.008 ${hue})`,
+    surface: `oklch(0.995 0.003 ${hue})`,
+    surface2: `oklch(0.945 0.006 ${hue})`,
+    surface3: `oklch(0.905 0.008 ${hue})`,
+    line: 'oklch(0 0 0 / 0.07)',
+    lineStrong: 'oklch(0 0 0 / 0.14)',
+    text: `oklch(0.21 0.010 ${hue})`,
+    textDim: `oklch(0.45 0.010 ${hue})`,
+    textMute: `oklch(0.58 0.010 ${hue})`,
     shadow: '0 24px 60px -20px rgba(0,0,0,0.25), 0 2px 6px rgba(0,0,0,0.08)',
   };
 }
 
 export function buildTheme(opts: { dark?: boolean; hue?: number; vibrancy?: number; radius?: number; density?: number } = {}): Theme {
   const dark = opts.dark ?? true;
-  const hue = opts.hue ?? 70;
+  const hue = opts.hue ?? 140;
   const vibrancy = opts.vibrancy ?? 100;
   const radius = opts.radius ?? 1;
   const density = opts.density ?? 1;
@@ -107,11 +103,11 @@ export function buildTheme(opts: { dark?: boolean; hue?: number; vibrancy?: numb
     dark,
     hue,
     accent: buildAccent(hue, dark, vibrancy),
-    n: buildNeutrals(dark),
+    n: buildNeutrals(dark, hue),
     r: {
-      xs: 6 * radius,
-      sm: 10 * radius,
-      md: 14 * radius,
+      xs: 8 * radius,
+      sm: 12 * radius,
+      md: 16 * radius,
       lg: 20 * radius,
       xl: 28 * radius,
     },
@@ -121,13 +117,12 @@ export function buildTheme(opts: { dark?: boolean; hue?: number; vibrancy?: numb
     err: 'oklch(0.70 0.18 25)',
     info: 'oklch(0.78 0.10 240)',
     font: {
-      sans: '"Geist", ui-sans-serif, system-ui, -apple-system, sans-serif',
+      sans: '"Manrope", ui-sans-serif, system-ui, -apple-system, sans-serif',
       mono: '"Geist Mono", ui-monospace, SFMono-Regular, Menlo, monospace',
     },
   };
 }
 
-// Deterministic hash used by Thumb and gradient helpers
 export function hashStr(s: string): number {
   let h = 2166136261;
   for (let i = 0; i < s.length; i++) {

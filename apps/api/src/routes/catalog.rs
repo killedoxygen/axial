@@ -2,7 +2,7 @@ use crate::state::AppState;
 use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
 use croopor_minecraft::{
     LifecycleMeta, MinecraftVersionMeta, VersionSubjectKind, analyze_minecraft_version,
-    fetch_version_manifest, manifest_release_references, scan_versions,
+    fetch_version_manifest_cached, manifest_release_references, scan_versions,
 };
 use serde::Serialize;
 use std::collections::HashSet;
@@ -40,14 +40,12 @@ async fn handle_catalog(
         ));
     };
 
-    let manifest = fetch_version_manifest().await.map_err(|error| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": format!("failed to fetch catalog: {error}") })),
-        )
-    })?;
+    let mc_dir = PathBuf::from(mc_dir);
+    let manifest = fetch_version_manifest_cached(&mc_dir)
+        .await
+        .map_err(catalog_fetch_error_response)?;
 
-    let installed: HashSet<String> = scan_versions(&PathBuf::from(mc_dir))
+    let installed: HashSet<String> = scan_versions(&mc_dir)
         .unwrap_or_default()
         .into_iter()
         .filter(|version| version.launchable)
@@ -83,4 +81,54 @@ async fn handle_catalog(
         latest: manifest.latest,
         versions,
     }))
+}
+
+fn catalog_fetch_error_response(
+    _error: impl std::fmt::Display,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(serde_json::json!({
+            "error": "Could not load the Minecraft catalog. Check your connection and try again."
+        })),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catalog_fetch_error_is_bad_gateway_with_bounded_copy() {
+        let (status, Json(body)) = catalog_fetch_error_response(
+            "request failed for https://piston-meta.mojang.com/mc/game/version_manifest_v2.json",
+        );
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            body["error"],
+            "Could not load the Minecraft catalog. Check your connection and try again."
+        );
+    }
+
+    #[test]
+    fn catalog_fetch_error_does_not_expose_upstream_details() {
+        let fragments = [
+            "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json",
+            "error sending request for url",
+            "expected value at line 1 column 1",
+        ];
+
+        for fragment in fragments {
+            let (_status, Json(body)) = catalog_fetch_error_response(format!(
+                "failed to fetch version manifest: {fragment}"
+            ));
+            let rendered = body.to_string();
+
+            assert!(
+                !rendered.contains(fragment),
+                "public response exposed upstream detail: {fragment}"
+            );
+        }
+    }
 }

@@ -9,6 +9,7 @@ keep this short and real. if the codebase changes, update this file.
 
 ## Frontend
 - prefer preact components over hand-built dom
+- for UI layout/design work, read and follow `docs/DESIGN.md`
 - keep modules flat, named exports only
 - no classes, no default exports
 - use signals/actions for cross-module state, not custom event spaghetti
@@ -59,7 +60,7 @@ keep this short and real. if the codebase changes, update this file.
 
 ## Build shape
 - frontend entry is `frontend/src/main.tsx`
-- frontend bundle output is `frontend/static/app.js`
+- frontend JS entry output is `frontend/static/app.js`; additional generated chunks may be emitted under `frontend/static/chunks/`
 - frontend package manager is `pnpm`, pinned through `frontend/package.json`
 - the Rust workspace root is `Cargo.toml`
 - release/build automation lives in `.github/workflows/`

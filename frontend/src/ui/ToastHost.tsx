@@ -2,7 +2,6 @@ import type { JSX } from 'preact';
 import { Icon } from './Icons';
 import { toasts } from '../store';
 import { dismissToast } from '../toast';
-import './toast.css';
 
 const ICON_FOR: Record<string, string> = {
   success: 'check',

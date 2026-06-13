@@ -1,17 +1,15 @@
-// Cross module UI state: route, overlays, command palette
-// Instance data and selection live in store.ts
 import { signal } from '@preact/signals';
 
 export type Route =
   | { name: 'home' }
   | { name: 'instances' }
   | { name: 'instance'; id: string }
-  | { name: 'create' }
   | { name: 'dev-lab' }
-  | { name: 'browse' }
   | { name: 'downloads' }
   | { name: 'accounts' }
   | { name: 'settings' };
+
+export const ROUTE_STORAGE_KEY = 'croopor:route';
 
 export const route = signal<Route>({ name: 'home' });
 
@@ -24,7 +22,7 @@ function sameRoute(a: Route, b: Route): boolean {
 
 function setRoute(r: Route): void {
   route.value = r;
-  try { localStorage.setItem('croopor:route', JSON.stringify(r)); } catch {}
+  try { localStorage.setItem(ROUTE_STORAGE_KEY, JSON.stringify(r)); } catch {}
 }
 
 export function navigate(r: Route): void {
@@ -54,9 +52,7 @@ function isRoute(value: unknown): value is Route {
   switch (candidate.name) {
     case 'home':
     case 'instances':
-    case 'create':
     case 'dev-lab':
-    case 'browse':
     case 'downloads':
     case 'accounts':
     case 'settings':
@@ -70,7 +66,7 @@ function isRoute(value: unknown): value is Route {
 
 export function restoreRoute(): void {
   try {
-    const raw = localStorage.getItem('croopor:route');
+    const raw = localStorage.getItem(ROUTE_STORAGE_KEY);
     if (!raw) return;
     const parsed = JSON.parse(raw) as unknown;
     if (isRoute(parsed)) setRoute(parsed);
@@ -80,3 +76,13 @@ export function restoreRoute(): void {
 export const commandPaletteOpen = signal(false);
 export const showOnboardingOverlay = signal(false);
 export const showSetupOverlay = signal(false);
+
+export const createOpen = signal(false);
+
+export function openCreate(): void {
+  createOpen.value = true;
+}
+
+export function closeCreate(): void {
+  createOpen.value = false;
+}

@@ -121,9 +121,16 @@ export function connectLoaderInstallSSE(
   const es = new EventSource(apiUrl(`/loaders/install/${installId}/events`));
 
   es.addEventListener('progress', (e: MessageEvent) => {
-    const data = JSON.parse(e.data);
+    let data: any;
+    try {
+      data = JSON.parse(e.data);
+    } catch {
+      onError('Loader install progress data was invalid. Retry from Downloads.');
+      es.close();
+      return;
+    }
     if (data.phase === 'error' || data.error) {
-      onError(data.error || 'Unknown error');
+      onError(data.error || 'Loader install failed before Croopor received error details.');
       es.close();
       return;
     }
@@ -136,7 +143,7 @@ export function connectLoaderInstallSSE(
 
   es.onerror = (): void => {
     if (es.readyState !== EventSource.CLOSED) return;
-    onError('Connection lost');
+    onError('Loader install progress stopped unexpectedly. Retry the install from the launcher.');
   };
 
   return es;

@@ -7,12 +7,15 @@ import {
   onNativeEvent, startNativeInstallEvents, startNativeLoaderInstallEvents,
 } from './native';
 import {
-  selectedInstance, selectedVersion, installState, catalog, versions,
+  selectedInstance, selectedVersion, installState, installEventSource, catalog, versions,
 } from './store';
 import {
   enqueueInstall, dequeueNextInstall, startInstall, updateInstallProgress,
-  completeInstall, setInstallEventSource,
+  completeInstall, setInstallEventSource, recordInstallFailure, clearInstallFailureForItem,
+  requeueFailedInstall, isActiveInstallItem,
 } from './actions';
+import { formatInstallItemLabel } from './install-labels';
+import { minecraftVersionLabel } from './version-display';
 import type { InstallItem, LoaderBuildRecord, LoaderComponentId } from './types';
 
 type InstallProgressEvent = {
@@ -24,6 +27,14 @@ type InstallProgressEvent = {
   done?: boolean;
 };
 
+type CloseableSource = {
+  close(): void;
+};
+
+type PendingInstallEventSource = CloseableSource & {
+  setSource(source: CloseableSource): boolean;
+};
+
 const INSTALL_ETA_PHASES = new Set([
   'libraries',
   'assets',
@@ -31,6 +42,78 @@ const INSTALL_ETA_PHASES = new Set([
   'loader_processors',
   'processors',
 ]);
+
+function isActiveInstall(item: InstallItem): boolean {
+  return isActiveInstallItem(item);
+}
+
+function isActiveInstallSource(item: InstallItem, source: CloseableSource | null): boolean {
+  return isActiveInstall(item) && source !== null && installEventSource.value === source;
+}
+
+function createPendingInstallEventSource(): PendingInstallEventSource {
+  let closed = false;
+  let source: CloseableSource | null = null;
+
+  return {
+    close(): void {
+      if (closed) return;
+      closed = true;
+      source?.close();
+      source = null;
+    },
+    setSource(nextSource: CloseableSource): boolean {
+      if (closed) {
+        nextSource.close();
+        return false;
+      }
+      source = nextSource;
+      return true;
+    },
+  };
+}
+
+async function connectNativeInstallEventSource(
+  item: InstallItem,
+  controller: PendingInstallEventSource,
+  eventName: string,
+  onData: (data: InstallProgressEvent) => void,
+  startEvents: () => Promise<boolean>,
+  unavailableMessage: string,
+): Promise<void> {
+  setInstallEventSource(controller);
+
+  let subscription: CloseableSource | null = null;
+  try {
+    subscription = await onNativeEvent(eventName, onData);
+  } catch (err: unknown) {
+    if (!isActiveInstallSource(item, controller)) return;
+    throw err;
+  }
+
+  if (!subscription) {
+    if (!isActiveInstallSource(item, controller)) return;
+    throw new Error(unavailableMessage);
+  }
+  if (!controller.setSource(subscription)) return;
+  if (!isActiveInstallSource(item, controller)) return;
+
+  let started = false;
+  try {
+    started = await startEvents();
+  } catch (err: unknown) {
+    if (!isActiveInstallSource(item, controller)) return;
+    controller.close();
+    if (installEventSource.value === controller) setInstallEventSource(null);
+    throw err;
+  }
+
+  if (!started) {
+    controller.close();
+    if (installEventSource.value === controller) setInstallEventSource(null);
+    throw new Error(unavailableMessage);
+  }
+}
 
 export function handleInstallClick(): void {
   const inst = selectedInstance.value;
@@ -42,7 +125,7 @@ export function handleInstallClick(): void {
     ? {
         componentId: version.loader.component_id as LoaderComponentId,
         buildId: version.loader.build_id,
-        minecraftVersion: version.inherits_from || '',
+        minecraftVersion: minecraftVersionLabel(version, ''),
         loaderVersion: version.loader.loader_version,
         versionId: target,
       }
@@ -78,9 +161,10 @@ export function handleInstallClick(): void {
 
 export function installVersion(target: string): void {
   if (!target) return;
-  const active = installState.value;
-  if (active.status === 'active' && active.versionId === target) return;
-  enqueueInstall({ versionId: target });
+  const item: InstallItem = { versionId: target };
+  clearInstallFailureForItem(item);
+  if (isActiveInstall(item)) return;
+  enqueueInstall(item);
   if (installState.value.status === 'idle') processNextInstall();
 }
 
@@ -175,9 +259,7 @@ function inferMinecraftVersionFromCompositeId(id: string): string {
 
 export function installLoaderVersion(build: LoaderBuildRecord): void {
   if (!build.component_id || !build.build_id || !build.version_id) return;
-  const active = installState.value;
-  if (active.status === 'active' && active.versionId === build.version_id) return;
-  enqueueInstall({
+  const item: InstallItem = {
     versionId: build.version_id,
     loader: {
       componentId: build.component_id,
@@ -185,8 +267,16 @@ export function installLoaderVersion(build: LoaderBuildRecord): void {
       minecraftVersion: build.minecraft_version,
       loaderVersion: build.loader_version,
     },
-  });
+  };
+  clearInstallFailureForItem(item);
+  if (isActiveInstall(item)) return;
+  enqueueInstall(item);
   if (installState.value.status === 'idle') processNextInstall();
+}
+
+export function retryFailedInstall(): void {
+  const shouldProcess = requeueFailedInstall();
+  if (shouldProcess) processNextInstall();
 }
 
 function processNextInstall(): void {
@@ -198,18 +288,21 @@ function processNextInstall(): void {
 }
 
 async function processVanillaInstall(next: InstallItem): Promise<void> {
-  startInstall(next.versionId, 'Starting download...');
+  startInstall(next, 'Starting download...', formatInstallItemLabel(next));
 
   try {
     const res = await api('POST', '/install', { version_id: next.versionId });
     if (res.error) {
+      recordInstallFailure(next, res.error);
       showError(res.error);
       await onInstallDone();
       return;
     }
-    await connectVanillaEvents(res.install_id, next.versionId);
+    await connectVanillaEvents(res.install_id, next);
   } catch (err: unknown) {
-    showError(`Install failed: ${errMessage(err)}`);
+    const message = errMessage(err);
+    recordInstallFailure(next, message);
+    showError(`Install failed: ${message}`);
     await onInstallDone();
   }
 }
@@ -217,16 +310,18 @@ async function processVanillaInstall(next: InstallItem): Promise<void> {
 async function processLoaderInstall(next: InstallItem): Promise<void> {
   if (!next.loader) return;
 
-  startInstall(next.versionId, 'Starting loader install...');
+  startInstall(next, 'Starting loader install...', formatInstallItemLabel(next));
 
   try {
     const installId = await startLoaderInstall(
       next.loader.componentId,
       next.loader.buildId,
     );
-    await connectLoaderEvents(installId, next.versionId);
+    await connectLoaderEvents(installId, next);
   } catch (err: unknown) {
-    showError(`Loader install failed: ${errMessage(err)}`);
+    const message = errMessage(err);
+    recordInstallFailure(next, message);
+    showError(`Loader install failed: ${message}`);
     await onInstallDone();
   }
 }
@@ -277,7 +372,7 @@ function phaseLabel(data: InstallProgressEvent, loaderInstall: boolean): string 
     case 'done':
       return 'Complete!';
     case 'error':
-      return data.error || 'Install failed.';
+      return data.error || 'Install failed before Croopor received error details.';
     default:
       if (typeof data.file === 'string' && data.file.trim()) {
         return data.file;
@@ -286,11 +381,16 @@ function phaseLabel(data: InstallProgressEvent, loaderInstall: boolean): string 
   }
 }
 
-async function connectVanillaEvents(installId: string, versionId: string): Promise<void> {
+async function connectVanillaEvents(installId: string, item: InstallItem): Promise<void> {
+  if (!isActiveInstall(item)) return;
+
   const startedAt = Date.now();
   const estimator = createProgressEstimator({ etaPhases: INSTALL_ETA_PHASES });
+  let progressSource: CloseableSource | null = null;
 
   const onProgress = async (data: InstallProgressEvent): Promise<void> => {
+    if (!isActiveInstallSource(item, progressSource)) return;
+
     let pct = 0;
     let label = phaseLabel(data, false);
 
@@ -313,56 +413,81 @@ async function connectVanillaEvents(installId: string, versionId: string): Promi
     } else if (data.phase === 'done') {
       pct = 100;
     } else if (data.phase === 'error') {
-      showError(data.error || 'Install failed.');
+      const message = data.error || 'Install failed before Croopor received error details.';
+      recordInstallFailure(item, message);
+      showError(message);
       await onInstallDone();
       return;
     } else {
       pct = installState.value.status === 'active' ? installState.value.pct : 0;
     }
 
-    updateInstallProgress(pct, estimator.formatLabel(label, data, pct, startedAt));
-    if (data.done) await onInstallDone();
+    const estimate = estimator.estimate(label, data, pct, startedAt);
+    updateInstallProgress(pct, estimate.label, data.phase, estimate.remainingSeconds);
+    if (data.done) await onInstallDone(item);
   };
 
   if (hasNativeDesktopRuntime()) {
-    const subscription = await onNativeEvent(nativeInstallEventName(installId), (data) => {
-      void onProgress(data);
-    });
-    if (!subscription) throw new Error('native install stream unavailable');
-    setInstallEventSource(subscription);
-    try {
-      await startNativeInstallEvents(installId);
-    } catch (err: unknown) {
-      subscription.close();
-      setInstallEventSource(null);
-      throw err;
-    }
+    const controller = createPendingInstallEventSource();
+    progressSource = controller;
+
+    await connectNativeInstallEventSource(
+      item,
+      controller,
+      nativeInstallEventName(installId),
+      (data) => {
+        void onProgress(data);
+      },
+      () => startNativeInstallEvents(installId),
+      'Desktop install progress is unavailable.',
+    );
     return;
   }
 
   const es = new EventSource(apiUrl(`/install/${installId}/events`));
+  progressSource = es;
   setInstallEventSource(es);
 
   es.addEventListener('progress', (e: MessageEvent) => {
-    void onProgress(JSON.parse(e.data));
+    let data: InstallProgressEvent;
+    try {
+      data = JSON.parse(e.data) as InstallProgressEvent;
+    } catch {
+      void (async () => {
+        if (isActiveInstallSource(item, es)) {
+          const message = 'Install progress data was invalid. Retry from Downloads.';
+          recordInstallFailure(item, message);
+          showError(message);
+          await onInstallDone();
+        }
+      })();
+      return;
+    }
+    void onProgress(data);
   });
 
   es.onerror = () => {
     if (es.readyState !== EventSource.CLOSED) return;
     void (async () => {
-      const active = installState.value;
-      if (active.status === 'active' && active.versionId === versionId) {
-        showError('Install event stream closed unexpectedly');
+      if (isActiveInstallSource(item, es)) {
+        const message = 'Install progress stopped unexpectedly. Retry the install from the launcher.';
+        recordInstallFailure(item, message);
+        showError(message);
         await onInstallDone();
       }
     })();
   };
 }
 
-async function connectLoaderEvents(installId: string, versionId: string): Promise<void> {
+async function connectLoaderEvents(installId: string, item: InstallItem): Promise<void> {
+  if (!isActiveInstall(item)) return;
+
   const startedAt = Date.now();
   const estimator = createProgressEstimator({ etaPhases: INSTALL_ETA_PHASES });
+  let progressSource: CloseableSource | null = null;
   const onProgress = (data: InstallProgressEvent): void => {
+    if (!isActiveInstallSource(item, progressSource)) return;
+
     let pct = 0;
     let label = phaseLabel(data, true);
 
@@ -399,56 +524,62 @@ async function connectLoaderEvents(installId: string, versionId: string): Promis
     } else if (data.phase === 'done') {
       pct = 100;
     } else if (data.phase === 'error') {
-      onError(data.error || 'Unknown error');
+      onError(data.error || 'Loader install failed before Croopor received error details.');
       return;
     } else {
       pct = installState.value.status === 'active' ? installState.value.pct : 0;
     }
 
-    updateInstallProgress(pct, estimator.formatLabel(label, data, pct, startedAt));
-    if (data.done) void onInstallDone();
+    const estimate = estimator.estimate(label, data, pct, startedAt);
+    updateInstallProgress(pct, estimate.label, data.phase, estimate.remainingSeconds);
+    if (data.done) void onInstallDone(item);
   };
 
   const onError = (message: string): void => {
-    const active = installState.value;
-    if (active.status === 'active' && active.versionId === versionId) {
+    if (isActiveInstallSource(item, progressSource)) {
+      recordInstallFailure(item, message);
       showError(message);
       void onInstallDone();
     }
   };
 
   if (hasNativeDesktopRuntime()) {
-    const subscription = await onNativeEvent(nativeLoaderInstallEventName(installId), (data) => {
-      if (data.phase === 'error' || data.error) {
-        onError(data.error || 'Unknown error');
-        return;
-      }
-      onProgress(data);
-    });
-    if (!subscription) throw new Error('native loader install stream unavailable');
-    setInstallEventSource(subscription);
-    try {
-      await startNativeLoaderInstallEvents(installId);
-    } catch (err: unknown) {
-      subscription.close();
-      setInstallEventSource(null);
-      throw err;
-    }
+    const controller = createPendingInstallEventSource();
+    progressSource = controller;
+
+    await connectNativeInstallEventSource(
+      item,
+      controller,
+      nativeLoaderInstallEventName(installId),
+      (data) => {
+        if (data.phase === 'error' || data.error) {
+          onError(data.error || 'Loader install failed before Croopor received error details.');
+          return;
+        }
+        onProgress(data);
+      },
+      () => startNativeLoaderInstallEvents(installId),
+      'Desktop loader install progress is unavailable.',
+    );
     return;
   }
 
   const es = connectLoaderInstallSSE(
     installId,
     onProgress,
-    () => { void onInstallDone(); },
+    () => {
+      if (isActiveInstallSource(item, progressSource)) void onInstallDone(item);
+    },
     onError,
   );
 
+  progressSource = es;
   setInstallEventSource(es);
 }
 
-async function onInstallDone(): Promise<void> {
+async function onInstallDone(completedItem?: InstallItem): Promise<void> {
   completeInstall();
+  if (completedItem) clearInstallFailureForItem(completedItem);
 
   try {
     const res = await api('GET', '/versions');

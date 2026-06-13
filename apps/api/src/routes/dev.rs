@@ -97,6 +97,13 @@ async fn handle_dev_flush(
 
     state.sessions().terminate_all().await;
     state.installs().clear().await;
+    let had_msa_auth = state
+        .auth_logins()
+        .clear_all()
+        .await
+        .map_err(internal_error)?;
+    let had_accounts = state.accounts().clear_all().map_err(internal_error)?;
+    let cleared_pending_skin_applies = super::skin::clear_all_pending_saved_skin_applies().await;
 
     if let Some(managed_library_dir) = managed_library_dir_to_remove(&config_paths, &current_config)
     {
@@ -114,7 +121,10 @@ async fn handle_dev_flush(
 
     Ok(Json(serde_json::json!({
         "status": "flushed",
-        "setup_required": true
+        "setup_required": true,
+        "had_msa_auth": had_msa_auth,
+        "had_accounts": had_accounts,
+        "cleared_pending_skin_applies": cleared_pending_skin_applies
     })))
 }
 
@@ -192,5 +202,91 @@ fn normalize_for_prefix(path: &Path) -> Option<PathBuf> {
         Some(path.to_path_buf())
     } else {
         std::env::current_dir().ok().map(|cwd| cwd.join(path))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::handle_dev_flush;
+    use crate::state::{AppState, AppStateInit, InstallStore, NewAuthLoginMsaToken, SessionStore};
+    use axum::extract::State;
+    use croopor_config::{AppPaths, ConfigStore, InstanceStore};
+    use croopor_performance::PerformanceManager;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[tokio::test]
+    async fn dev_flush_clears_account_state() {
+        let root = test_root("auth");
+        let state = test_state(&root);
+        state
+            .auth_logins()
+            .replace_with_msa_token(NewAuthLoginMsaToken {
+                access_token: "msa-access-token".to_string(),
+                refresh_token: Some("msa-refresh-token".to_string()),
+                id_token: None,
+                token_type: "Bearer".to_string(),
+                expires_in: 3600,
+                scope: None,
+            })
+            .await;
+
+        let response = handle_dev_flush(State(state.clone()))
+            .await
+            .expect("dev flush should succeed");
+
+        assert_eq!(response.0["status"], "flushed");
+        assert_eq!(response.0["had_msa_auth"], true);
+        assert_eq!(state.auth_logins().active_msa_token().await, None);
+        assert!(state.auth_logins().account_states().await.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn test_state(root: &Path) -> AppState {
+        let paths = test_paths(root);
+        let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
+        let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
+        AppState::new(AppStateInit {
+            app_name: "Croopor".to_string(),
+            version: "test".to_string(),
+            config,
+            instances,
+            installs: Arc::new(InstallStore::new()),
+            sessions: Arc::new(SessionStore::new()),
+            performance: Arc::new(
+                PerformanceManager::new_with_config_dir(&paths.config_dir)
+                    .expect("performance manager"),
+            ),
+            startup_warnings: Vec::new(),
+            frontend_dir: root.join("frontend"),
+        })
+    }
+
+    fn test_paths(root: &Path) -> AppPaths {
+        let config_dir = root.join("config");
+        AppPaths {
+            config_file: config_dir.join("config.json"),
+            instances_file: config_dir.join("instances.json"),
+            instances_dir: root.join("instances"),
+            music_dir: root.join("music"),
+            library_dir: root.join("library"),
+            config_dir,
+        }
+    }
+
+    fn test_root(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "croopor-api-dev-{name}-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create test root");
+        root
     }
 }

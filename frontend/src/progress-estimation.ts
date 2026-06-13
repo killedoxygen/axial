@@ -4,6 +4,11 @@ type ProgressEstimateEvent = {
   total?: number;
 };
 
+export type ProgressEstimate = {
+  label: string;
+  remainingSeconds?: number;
+};
+
 type EstimateSample = {
   at: number;
   pct: number;
@@ -51,7 +56,7 @@ const DEFAULT_OPTIONS: Omit<ProgressEstimatorOptions, 'etaPhases'> = {
 export function createProgressEstimator(
   overrides: Partial<ProgressEstimatorOptions> & Pick<ProgressEstimatorOptions, 'etaPhases'>,
 ): {
-  formatLabel(label: string, event: ProgressEstimateEvent, pct: number, startedAt: number): string;
+  estimate(label: string, event: ProgressEstimateEvent, pct: number, startedAt: number): ProgressEstimate;
 } {
   const options: ProgressEstimatorOptions = {
     ...DEFAULT_OPTIONS,
@@ -67,13 +72,13 @@ export function createProgressEstimator(
   };
 
   return {
-    formatLabel(label: string, event: ProgressEstimateEvent, pct: number, startedAt: number): string {
+    estimate(label: string, event: ProgressEstimateEvent, pct: number, startedAt: number): ProgressEstimate {
       const now = Date.now();
       trackProgress(state, event, pct, now, options);
 
       const remaining = estimateRemainingSeconds(state, event, pct, startedAt, now, options);
-      if (remaining == null) return label;
-      return `${label} — ${formatRemainingTime(remaining)} left`;
+      if (remaining == null) return { label };
+      return { label, remainingSeconds: remaining };
     },
   };
 }
@@ -140,7 +145,7 @@ function estimateRemainingSeconds(
   return remaining;
 }
 
-function formatRemainingTime(seconds: number): string {
+export function formatRemainingTime(seconds: number): string {
   if (seconds < 90) {
     return `~${Math.max(5, Math.ceil(seconds / 5) * 5)}s`;
   }
@@ -148,4 +153,23 @@ function formatRemainingTime(seconds: number): string {
     return `~${Math.ceil(seconds / 60)}m`;
   }
   return `~${Math.ceil(seconds / 3_600)}h`;
+}
+
+export function countDownRemainingSeconds(
+  remainingSeconds: number | undefined,
+  updatedAt: number | undefined,
+  now: number,
+): number | undefined {
+  if (
+    typeof remainingSeconds !== 'number'
+    || !Number.isFinite(remainingSeconds)
+    || remainingSeconds <= 0
+    || typeof updatedAt !== 'number'
+    || !Number.isFinite(updatedAt)
+  ) {
+    return undefined;
+  }
+  const elapsedSeconds = Math.max(0, Math.floor((now - updatedAt) / 1000));
+  const countedDown = Math.max(0, remainingSeconds - elapsedSeconds);
+  return countedDown > 0 ? countedDown : undefined;
 }

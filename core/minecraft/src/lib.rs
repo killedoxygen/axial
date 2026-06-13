@@ -34,11 +34,13 @@ pub use loaders::{
     infer_build_from_version_id, infer_neoforge_minecraft_version, install_build,
     installed_version_id_for, loader_components, parse_build_id, resolve_build_record,
 };
-pub use manifest::{ManifestEntry, VersionManifest, fetch_version_manifest};
+pub use manifest::{
+    ManifestEntry, VersionManifest, fetch_version_manifest, fetch_version_manifest_cached,
+};
 pub use paths::{
     cache_dir, create_minecraft_dir, default_minecraft_dir, is_legacy_assets, libraries_dir,
     loader_artifacts_dir, loader_cache_dir, loader_catalog_dir, loader_work_dir, runtime_dirs,
-    validate_installation, versions_dir,
+    validate_installation, version_manifest_cache_path, versions_dir,
 };
 pub use profiles::ensure_launcher_profiles;
 pub use rules::{
@@ -46,9 +48,11 @@ pub use rules::{
     is_native_library, native_classifier_key,
 };
 pub use runtime::{
-    RuntimeEnsureAction, RuntimeEnsureResult, RuntimeId, RuntimeInstallState, RuntimeOverride,
-    RuntimeRecord, RuntimeRequirement, RuntimeSource, ensure_runtime, list_runtime_records,
-    parse_runtime_override, runtime_requirement,
+    RuntimeEnsureAction, RuntimeEnsureEvent, RuntimeEnsureResult, RuntimeId, RuntimeInstallState,
+    RuntimeOverride, RuntimeRecord, RuntimeRequirement, RuntimeSource, ensure_runtime,
+    ensure_runtime_with_events, list_runtime_records, parse_runtime_override,
+    runtime_component_ready_without_probe, runtime_executable_ready_without_probe,
+    runtime_requirement,
 };
 pub use types::{VersionEntry, VersionLoaderAttachment, VersionSubjectKind};
 pub use version::scan_versions;

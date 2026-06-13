@@ -1,20 +1,44 @@
-import { api, apiUrl } from './api';
+import { api, apiUrl, isApiError } from './api';
 import { Sound } from './sound';
 import { Music } from './music';
-import { fmtMem, showError, appendLog, errMessage } from './utils';
-import { showConfirm } from './ui/Dialog';
+import { showError, appendLog, errMessage } from './utils';
 import {
   hasNativeDesktopRuntime, nativeLaunchLogEventName, nativeLaunchStatusEventName,
   onNativeEvent, startNativeLaunchEvents,
 } from './native';
 import {
-  config, launchState, runningSessions, selectedInstance, selectedVersion, systemInfo, instanceLaunchDrafts,
+  config, launchState, runningSessions, selectedInstance, selectedVersion, instanceLaunchDrafts,
 } from './store';
 import {
   clearLaunchNotice, confirmLaunch, endLaunchPrep, endSession, setLaunchNotice, startLaunch,
-  updateInstanceInList, updateLaunchPrep, updateRunningSessionState,
+  updateInstanceInList, updateLaunchPrep, updateLaunchPrepStage, updateRunningSessionState,
 } from './actions';
-import type { GuardianSummary, HealingEvent, LaunchHealingSummary } from './types';
+import { launchStageView, type LaunchStage } from './launch-stages';
+import type { Config, GuardianSummary, HealingEvent, Instance, LaunchHealingSummary } from './types';
+
+const PRE_RESPONSE_STAGE_CAP_PCT = 87;
+const LIVE_LAUNCH_UPDATES_UNAVAILABLE = 'Live launch updates are unavailable.';
+const OFFLINE_LAUNCH_AVAILABLE_DETAIL = 'Offline launch remains available for singleplayer and offline-mode servers.';
+const PRE_RESPONSE_STAGE_TICKS: Array<{ atMs: number; stage: LaunchStage }> = [
+  { atMs: 700, stage: 'preparing' },
+  { atMs: 1800, stage: 'prewarming' },
+  { atMs: 3400, stage: 'starting' },
+  { atMs: 6200, stage: 'monitoring' },
+];
+
+interface LaunchAuthFailurePayload {
+  error?: string;
+  failure_class?: string;
+  launch_auth_mode?: string;
+  online_mode_ready?: boolean;
+  auth_refresh_status?: string;
+  auth_refresh_reason?: string;
+}
+
+interface LaunchAuthFailureNotice {
+  message: string;
+  details: string[];
+}
 
 function rollbackLaunch(instanceId: string, animationFrameId: number | null): void {
   if (animationFrameId !== null) cancelAnimationFrame(animationFrameId);
@@ -22,6 +46,43 @@ function rollbackLaunch(instanceId: string, animationFrameId: number | null): vo
   if (Object.keys(runningSessions.value).length === 0) Music.unsuppress();
 
   endLaunchPrep();
+}
+
+function startPreResponseLaunchStageTicker(instanceId: string): () => void {
+  let stopped = false;
+  let timeoutId: number | null = null;
+  let nextTick = 0;
+  const startedAt = Date.now();
+
+  const scheduleNext = (): void => {
+    if (stopped) return;
+    const tick = PRE_RESPONSE_STAGE_TICKS[nextTick];
+    if (!tick) return;
+    const delayMs = Math.max(0, tick.atMs - (Date.now() - startedAt));
+    timeoutId = window.setTimeout(() => {
+      timeoutId = null;
+      if (stopped) return;
+      const view = launchStageView(tick.stage);
+      updateLaunchPrep(
+        instanceId,
+        Math.min(view.pct, PRE_RESPONSE_STAGE_CAP_PCT),
+        view.label,
+        view.stage,
+      );
+      nextTick += 1;
+      scheduleNext();
+    }, delayMs);
+  };
+
+  scheduleNext();
+
+  return () => {
+    stopped = true;
+    if (timeoutId !== null) {
+      window.clearTimeout(timeoutId);
+      timeoutId = null;
+    }
+  };
 }
 
 function updateRunningSession(instanceId: string, patch: Partial<import('./types').RunningSession>): void {
@@ -33,14 +94,12 @@ function describeFailureClass(failureClass: string | undefined): string {
     case 'jvm_unsupported_option':
       return 'unsupported JVM option';
     case 'jvm_experimental_unlock':
-    case 'jvm_experimental_unlock_required':
       return 'experimental JVM option requires unlock';
     case 'jvm_option_ordering':
       return 'JVM option ordering conflict';
     case 'java_runtime_mismatch':
       return 'Java runtime mismatch';
     case 'classpath_module_conflict':
-    case 'classpath_or_module_conflict':
       return 'classpath or module conflict';
     case 'auth_mode_incompatible':
       return 'auth mode incompatibility';
@@ -82,33 +141,41 @@ function ensureSentence(text: string): string {
   return `${trimmed}.`;
 }
 
+function stripFinalSentencePunctuation(text: string): string {
+  return text.replace(/[.!?]+$/, '').trim();
+}
+
 function formatHealingDetail(detail: string): string {
   const trimmed = detail.trim();
   if (!trimmed) return '';
+  const comparable = stripFinalSentencePunctuation(trimmed);
 
-  let match = trimmed.match(/^Requested JVM preset "([^"]+)" was downgraded to "([^"]+)" for compatibility$/);
+  let match = comparable.match(/^Requested JVM preset "([^"]+)" was downgraded to "([^"]+)" for compatibility$/);
   if (match) {
     return `GC preset changed from ${formatPresetName(match[1])} to ${formatPresetName(match[2])} to match this runtime.`;
   }
 
-  if (trimmed === 'Requested Java override was bypassed in favor of a safer managed runtime') {
+  if (comparable === 'Requested Java override was bypassed in favor of a safer managed runtime') {
+    return 'Java override was skipped and the managed runtime was used instead.';
+  }
+  if (comparable === 'Requested runtime override was bypassed in favor of a safer managed runtime') {
     return 'Java override was skipped and the managed runtime was used instead.';
   }
 
-  if (trimmed === 'Guardian switched to managed Java before launch') {
+  if (comparable === 'Guardian switched to managed Java before launch') {
     return 'Guardian switched to the managed Java runtime before launch.';
   }
 
-  match = trimmed.match(/^Automatic retry: downgraded JVM preset to "([^"]+)" after startup failure$/);
+  match = comparable.match(/^Automatic retry: downgraded JVM preset to "([^"]+)" after startup failure$/);
   if (match) {
     return `Croopor retried startup with the ${formatPresetName(match[1])} GC preset.`;
   }
 
-  if (trimmed === 'Automatic retry: disabled custom GC flags after startup failure') {
+  if (comparable === 'Automatic retry: disabled custom GC flags after startup failure') {
     return 'Croopor retried startup without custom GC flags.';
   }
 
-  if (trimmed === 'Automatic retry: switched to managed Java after runtime mismatch') {
+  if (comparable === 'Automatic retry: switched to managed Java after runtime mismatch') {
     return 'Croopor retried startup with the managed Java runtime.';
   }
 
@@ -147,13 +214,11 @@ function formatHealingEvent(event: HealingEvent): string {
     case 'runtime_bypassed':
       return 'Java override was skipped and the managed runtime was used instead.';
     case 'preset_downgraded':
-      return event.detail ? ensureSentence(event.detail) : 'GC preset was adjusted for compatibility.';
-    case 'startup_stalled':
-      return 'Launch was stopped because no startup activity was detected.';
+      return event.detail || 'GC preset was adjusted for compatibility.';
     case 'fallback_applied':
-      return event.detail ? ensureSentence(event.detail) : 'Croopor retried startup with safer settings.';
+      return event.detail || 'Croopor retried startup with safer settings.';
     default:
-      return event.detail ? ensureSentence(event.detail) : '';
+      return event.detail || '';
   }
 }
 
@@ -195,8 +260,92 @@ function friendlyLaunchErrorDetail(message: string): string {
   return ensureSentence(detail);
 }
 
+function isSelectedOnlineAuthFailure(payload: unknown): payload is LaunchAuthFailurePayload {
+  if (!payload || typeof payload !== 'object') return false;
+  const candidate = payload as LaunchAuthFailurePayload;
+  return candidate.failure_class === 'auth_mode_incompatible'
+    || (candidate.launch_auth_mode === 'online' && candidate.online_mode_ready === false);
+}
+
+function compactTokenLabel(value: string | undefined): string {
+  return String(value || '').trim().toLowerCase();
+}
+
+function isSignInRequiredAuthRefresh(status: string, reason: string): boolean {
+  return status === 'sign_in_required'
+    || reason === 'refresh_token_missing'
+    || reason === 'refresh_token_rejected'
+    || reason === 'refresh_state_unavailable';
+}
+
+function authSignInRequiredDetail(reason: string): string {
+  switch (reason) {
+    case 'refresh_token_missing':
+      return 'Croopor could not refresh the Microsoft session because the saved sign-in is missing or expired.';
+    case 'refresh_token_rejected':
+      return 'Microsoft rejected the saved sign-in session.';
+    case 'refresh_state_unavailable':
+      return 'Croopor could not read the saved sign-in session.';
+    default:
+      return 'Croopor could not use the saved Microsoft session for Online launch.';
+  }
+}
+
+function authRefreshFailedDetail(status: string, reason: string): string {
+  switch (reason) {
+    case 'auth_chain_failed':
+      return 'Croopor refreshed Microsoft sign-in, but Minecraft account verification did not complete.';
+    case 'client_id_missing':
+      return 'Microsoft sign-in is not configured for this build.';
+    case 'client_build':
+    case 'token_client_unavailable':
+      return 'Croopor could not start Microsoft sign-in refresh.';
+    case 'oauth_refresh_failed':
+    case 'token_endpoint_unreachable':
+    case 'token_endpoint_rejected':
+    case 'token_endpoint_unavailable':
+    case 'token_endpoint_parse_failed':
+      return 'Microsoft sign-in refresh is unavailable or did not complete.';
+    case 'refreshed_account_unusable':
+      return 'The refreshed account could not be used for a verified Minecraft Java launch.';
+    default:
+      return status === 'refresh_unavailable'
+        ? 'Microsoft sign-in refresh is unavailable right now.'
+        : 'Croopor could not verify the Microsoft account for Online launch.';
+  }
+}
+
+export function formatSelectedOnlineAuthFailure(payload: unknown): LaunchAuthFailureNotice | null {
+  if (!isSelectedOnlineAuthFailure(payload)) return null;
+
+  const status = compactTokenLabel(payload.auth_refresh_status);
+  const reason = compactTokenLabel(payload.auth_refresh_reason);
+  if (isSignInRequiredAuthRefresh(status, reason)) {
+    return {
+      message: 'Online launch needs you to sign in again.',
+      details: [
+        authSignInRequiredDetail(reason),
+        'Sign in again from Accounts, then retry Online launch.',
+        OFFLINE_LAUNCH_AVAILABLE_DETAIL,
+      ],
+    };
+  }
+
+  return {
+    message: 'Online launch could not verify your Minecraft account.',
+    details: [
+      authRefreshFailedDetail(status, reason),
+      'Refresh or re-verify the account from Accounts, then retry Online launch.',
+      OFFLINE_LAUNCH_AVAILABLE_DETAIL,
+    ],
+  };
+}
+
 function guardianNoticeDetails(guardian: GuardianSummary | undefined): string[] {
   if (!guardian) return [];
+  if (guardian.details && guardian.details.length > 0) {
+    return guardian.details;
+  }
   const details: string[] = [];
   for (const intervention of guardian.interventions || []) {
     pushUniqueNoticeDetail(details, intervention.detail);
@@ -209,8 +358,14 @@ function guardianNoticeDetails(guardian: GuardianSummary | undefined): string[] 
 
 function guardianToastMessage(guardian: GuardianSummary | undefined): string {
   if (!guardian) return '';
+  if (guardian.message?.trim()) {
+    return guardian.message.trim();
+  }
   if (guardian.decision === 'blocked') {
     return 'Guardian blocked an unsafe launch setup.';
+  }
+  if (guardian.decision === 'warned') {
+    return 'Guardian found launch settings to review.';
   }
   if (guardian.decision === 'intervened') {
     return 'Guardian adjusted launch settings for safety.';
@@ -221,10 +376,37 @@ function guardianToastMessage(guardian: GuardianSummary | undefined): string {
 function guardianOwnsLaunchOutcome(
   guardian: GuardianSummary | undefined,
   healing: LaunchHealingSummary | undefined,
+  noticeDetails = guardianNoticeDetails(guardian),
 ): boolean {
-  if (!guardian || guardian.decision !== 'intervened') return false;
+  if (!guardian) return false;
+  if (guardianHasActionableAuthoredDetails(guardian, noticeDetails)) return true;
+  if (guardian.decision !== 'intervened') return false;
   if (!healing) return true;
   return !healing.failure_class && !healing.retry_count;
+}
+
+function guardianHasAuthoredDetails(
+  guardian: GuardianSummary | undefined,
+  noticeDetails = guardianNoticeDetails(guardian),
+): boolean {
+  return Boolean(guardian && noticeDetails.some((detail) => detail.trim()));
+}
+
+function guardianHasActionableAuthoredDetails(
+  guardian: GuardianSummary | undefined,
+  noticeDetails = guardianNoticeDetails(guardian),
+): boolean {
+  return Boolean(
+    guardianHasAuthoredDetails(guardian, noticeDetails)
+    && (guardian?.decision === 'blocked' || guardian?.decision === 'warned' || guardian?.decision === 'intervened'),
+  );
+}
+
+function guardianOwnsLeadDetail(
+  guardian: GuardianSummary | undefined,
+  noticeDetails = guardianNoticeDetails(guardian),
+): boolean {
+  return guardianHasActionableAuthoredDetails(guardian, noticeDetails);
 }
 
 function launchOutcomeDetails(
@@ -233,11 +415,19 @@ function launchOutcomeDetails(
   leadDetail = '',
 ): string[] {
   const details: string[] = [];
-  pushUniqueNoticeDetail(details, leadDetail);
-  for (const detail of guardianNoticeDetails(guardian)) {
+  const guardianDetails = guardianNoticeDetails(guardian);
+  const hasGuardianAuthoredDetails = guardianHasAuthoredDetails(guardian, guardianDetails);
+  const guardianOwnsLead = guardianOwnsLeadDetail(guardian, guardianDetails);
+  if (!hasGuardianAuthoredDetails) {
+    pushUniqueNoticeDetail(details, leadDetail);
+  }
+  for (const detail of guardianDetails) {
     pushUniqueNoticeDetail(details, detail);
   }
-  const includeHealing = !guardianOwnsLaunchOutcome(guardian, healing);
+  if (hasGuardianAuthoredDetails && !guardianOwnsLead) {
+    pushUniqueNoticeDetail(details, leadDetail);
+  }
+  const includeHealing = !guardianOwnsLaunchOutcome(guardian, healing, guardianDetails);
   if (includeHealing) {
     for (const detail of healingNoticeDetails(healing || {})) {
       pushUniqueNoticeDetail(details, detail);
@@ -254,11 +444,20 @@ function launchOutcomeMessage(
   return guardianToastMessage(guardian) || healingToastMessage(healing || {}) || fallbackMessage;
 }
 
+function guardianNoticeTone(guardian: GuardianSummary | undefined): import('./types').LaunchNoticeTone | null {
+  if (guardian?.decision === 'blocked') return 'error';
+  if (guardian?.decision === 'warned') return 'warned';
+  if (guardian?.decision === 'intervened') return 'intervened';
+  return null;
+}
+
 function launchOutcomeTone(
   guardian: GuardianSummary | undefined,
   healing: LaunchHealingSummary | undefined,
 ): import('./types').LaunchNoticeTone {
-  if (guardian?.decision === 'blocked' || healing?.failure_class) return 'error';
+  const guardianTone = guardianNoticeTone(guardian);
+  if (guardianTone) return guardianTone;
+  if (healing?.failure_class) return 'error';
   if (healing?.retry_count && healing.retry_count > 0) return 'success';
   return 'info';
 }
@@ -288,6 +487,28 @@ function surfaceLaunchOutcome(
   return true;
 }
 
+function surfaceSelectedOnlineAuthFailure(payload: unknown, instanceId: string, instanceName: string): boolean {
+  const notice = formatSelectedOnlineAuthFailure(payload);
+  if (!notice) return false;
+  for (const detail of notice.details) {
+    appendLog('system', detail, instanceId, instanceName);
+  }
+  setLaunchNotice(instanceId, {
+    message: notice.message,
+    detail: primaryNoticeDetail(notice.details),
+    details: notice.details,
+    tone: 'error',
+  });
+  return true;
+}
+
+function selectedLaunchMaxMemoryMB(response: any, inst: Instance, cfg: Config | null): number {
+  if (typeof response?.max_memory_mb === 'number' && response.max_memory_mb > 0) return response.max_memory_mb;
+  if (typeof inst.max_memory_mb === 'number' && inst.max_memory_mb > 0) return inst.max_memory_mb;
+  if (typeof cfg?.max_memory_mb === 'number' && cfg.max_memory_mb > 0) return cfg.max_memory_mb;
+  return 4096;
+}
+
 export async function launchGame(): Promise<void> {
   const inst = selectedInstance.value;
   const version = selectedVersion.value;
@@ -297,35 +518,22 @@ export async function launchGame(): Promise<void> {
 
   const cfg = config.value;
   const username = cfg?.username || 'Player';
-  const maxMemMB = cfg?.max_memory_mb || 4096;
-
-  const activeSessions = Object.values(runningSessions.value);
-  if (activeSessions.length > 0) {
-    const totalMB = systemInfo.value?.total_memory_mb || 0;
-    const allocatedMB = activeSessions.reduce((sum, session) => sum + (session.allocatedMB || 0), 0);
-    if (totalMB > 0 && allocatedMB + maxMemMB > totalMB - 2048) {
-      const ok = await showConfirm(
-        `You have ${activeSessions.length} instance${activeSessions.length > 1 ? 's' : ''} running, using ~${fmtMem(allocatedMB / 1024)} of ${fmtMem(totalMB / 1024)} system RAM.\n\nLaunching with ${fmtMem(maxMemMB / 1024)} allocated may cause performance issues.`,
-        { confirmText: 'Launch Anyway' },
-      );
-      if (!ok) return;
-    }
-  }
 
   Sound.init();
 
   clearLaunchNotice(inst.id);
   startLaunch(inst.id);
-  updateLaunchPrep(inst.id, 12, 'Checking running sessions');
+  updateLaunchPrep(inst.id, 8, 'Resolving launch plan', 'planning');
   const launchAnimationFrameId: number | null = null;
 
   let launchCommitted = false;
   let launchInst = inst;
 
   try {
+    updateLaunchPrep(inst.id, 18, 'Checking compatibility', 'validating');
     const launchDraft = instanceLaunchDrafts.value[inst.id];
     if (launchDraft?.dirty) {
-      updateLaunchPrep(inst.id, 24, 'Saving launch overrides');
+      updateLaunchPrep(inst.id, 24, 'Preparing launch files', 'preparing');
       const saved = await api('PUT', `/instances/${encodeURIComponent(inst.id)}`, {
         java_path: launchDraft.javaPath.trim(),
         jvm_preset: launchDraft.jvmPreset,
@@ -355,25 +563,31 @@ export async function launchGame(): Promise<void> {
       appendLog('system', `Applied pending launch overrides for ${inst.name}.`, inst.id, inst.name);
     }
 
-    updateLaunchPrep(inst.id, 46, 'Preparing launcher request');
-    const res = await api('POST', '/launch', {
-      instance_id: launchInst.id,
-      username,
-      max_memory_mb: maxMemMB,
-      client_started_at_ms: Date.now(),
-    });
+    updateLaunchPrep(inst.id, 46, 'Preparing launch files', 'preparing');
+    const stopPreResponseStages = startPreResponseLaunchStageTicker(inst.id);
+    const res = await (async () => {
+      try {
+        return await api('POST', '/launch', {
+          instance_id: launchInst.id,
+          username,
+          client_started_at_ms: Date.now(),
+        });
+      } finally {
+        stopPreResponseStages();
+      }
+    })();
 
     if (res.error) {
-      const detail = friendlyLaunchErrorDetail(res.error);
-      const surfaced = surfaceLaunchOutcome(
-        res.guardian,
-        res.healing,
-        inst.id,
-        inst.name,
-        true,
-        detail,
-        'Launch stopped before startup.',
-      );
+      const surfaced = surfaceSelectedOnlineAuthFailure(res, inst.id, inst.name)
+        || surfaceLaunchOutcome(
+          res.guardian,
+          res.healing,
+          inst.id,
+          inst.name,
+          true,
+          friendlyLaunchErrorDetail(res.error),
+          'Launch stopped before startup.',
+        );
       if (!surfaced) {
         showError(res.error);
       }
@@ -382,40 +596,63 @@ export async function launchGame(): Promise<void> {
       return;
     }
 
-    updateLaunchPrep(inst.id, 72, 'Starting Minecraft process');
     const launchedAt = res.launched_at || new Date().toISOString();
-    updateLaunchPrep(inst.id, 88, 'Connecting live launch events');
+    const allocatedMB = selectedLaunchMaxMemoryMB(res, launchInst, cfg);
     confirmLaunch(inst.id, {
       sessionId: res.session_id,
       versionId: launchInst.version_id,
       pid: typeof res.pid === 'number' ? res.pid : 0,
-      state: 'monitoring',
+      state: typeof res.state === 'string' ? res.state : 'queued',
       launchedAt,
-      allocatedMB: maxMemMB,
+      allocatedMB,
+      benchmark: res.benchmark,
       healing: res.healing,
       guardian: res.guardian,
     });
     launchCommitted = true;
     surfaceLaunchOutcome(res.guardian, res.healing, inst.id, inst.name);
-    
+
     Music.suppress();
-    Sound.ui('launchSuccess');
+    let launchStarted = false;
     try {
-      await connectLaunchEvents(res.session_id, inst.id, inst.name);
+      await connectLaunchEvents(res.session_id, inst.id, inst.name, () => {
+        if (launchStarted) return;
+        launchStarted = true;
+        Sound.ui('launchSuccess');
+        updateInstanceInList({ ...launchInst, last_played_at: launchedAt });
+      });
     } catch (err: unknown) {
-      showError(`Game launched, but live updates failed: ${errMessage(err)}`);
+      showError(`Launch session started, but live updates failed: ${errMessage(err)}`);
       appendLog('system', `Live updates unavailable for ${inst.name}; stop detection may be delayed.`, inst.id, inst.name);
     }
 
-    updateInstanceInList({ ...launchInst, last_played_at: launchedAt });
     if (config.value) {
       config.value = {
         ...config.value,
         username,
-        max_memory_mb: maxMemMB,
       };
     }
   } catch (err: unknown) {
+    if (isApiError(err) && err.payload && typeof err.payload === 'object') {
+      const payload = err.payload as {
+        error?: string;
+        guardian?: GuardianSummary;
+        healing?: LaunchHealingSummary;
+      };
+      const surfaced = surfaceSelectedOnlineAuthFailure(payload, inst.id, inst.name)
+        || surfaceLaunchOutcome(
+          payload.guardian,
+          payload.healing,
+          inst.id,
+          inst.name,
+          true,
+          friendlyLaunchErrorDetail(payload.error || err.message),
+          'Launch stopped before startup.',
+        );
+      if (!surfaced) showError(payload.error || err.message);
+      if (!launchCommitted) rollbackLaunch(inst.id, launchAnimationFrameId);
+      return;
+    }
     showError(errMessage(err));
     if (!launchCommitted) rollbackLaunch(inst.id, launchAnimationFrameId);
   }
@@ -463,17 +700,28 @@ function makeLaunchStatusPoller(
   return handle;
 }
 
-async function connectLaunchEvents(sessionId: string, instanceId: string, instanceName: string): Promise<void> {
+async function connectLaunchEvents(
+  sessionId: string,
+  instanceId: string,
+  instanceName: string,
+  onStarted?: () => void,
+): Promise<void> {
   const onStatus = (data: any, handle: { close(): void }): void => {
-    if (runningSessions.value[instanceId]?.sessionId !== sessionId) return;
-    if (typeof data.pid === 'number' || data.healing || typeof data.state === 'string') {
+    const session = runningSessions.value[instanceId];
+    const prep = launchState.value;
+    const matchingPrep = prep.status === 'preparing' && prep.instanceId === instanceId;
+    if (session?.sessionId !== sessionId && !matchingPrep) return;
+    if (typeof data.state === 'string') updateLaunchPrepStage(instanceId, data.state);
+    if (session && (typeof data.pid === 'number' || data.healing || typeof data.state === 'string')) {
       updateRunningSession(instanceId, {
-        pid: typeof data.pid === 'number' ? data.pid : runningSessions.value[instanceId]?.pid || 0,
-        state: typeof data.state === 'string' ? data.state : runningSessions.value[instanceId]?.state,
-        healing: data.healing || runningSessions.value[instanceId]?.healing,
-        guardian: data.guardian || runningSessions.value[instanceId]?.guardian,
+        pid: typeof data.pid === 'number' ? data.pid : session.pid || 0,
+        state: typeof data.state === 'string' ? data.state : session.state,
+        benchmark: data.benchmark || session.benchmark,
+        healing: data.healing || session.healing,
+        guardian: data.guardian || session.guardian,
       });
     }
+    if (data.state === 'running') onStarted?.();
     if (data.state === 'exited') onGameExited(data, instanceId, instanceName, sessionId, handle);
   };
 
@@ -499,16 +747,21 @@ async function connectLaunchEvents(sessionId: string, instanceId: string, instan
     logSubscription = await onNativeEvent(nativeLaunchLogEventName(sessionId), onLog);
     if (!statusSubscription || !logSubscription) {
       streamHandle.close();
-      throw new Error('native launch stream unavailable');
+      throw new Error(LIVE_LAUNCH_UPDATES_UNAVAILABLE);
     }
     pollSubscription = makeLaunchStatusPoller(sessionId, instanceId, (data) => {
       onStatus(data, streamHandle);
     });
+    let started = false;
     try {
-      await startNativeLaunchEvents(sessionId);
+      started = await startNativeLaunchEvents(sessionId);
     } catch (err: unknown) {
       streamHandle.close();
       throw err;
+    }
+    if (!started) {
+      streamHandle.close();
+      throw new Error(LIVE_LAUNCH_UPDATES_UNAVAILABLE);
     }
     return;
   }
@@ -565,11 +818,11 @@ export async function killGame(): Promise<void> {
     const res = await api('POST', `/launch/${session.sessionId}/kill`);
     if (res?.error) {
       updateRunningSessionState(inst.id, { stopping: false });
-      showError(`Failed to kill: ${res.error}`);
+      showError(`Could not stop the game: ${res.error}`);
       return;
     }
   } catch (err: unknown) {
     updateRunningSessionState(inst.id, { stopping: false });
-    showError(`Failed to kill: ${errMessage(err)}`);
+    showError(`Could not stop the game: ${errMessage(err)}`);
   }
 }

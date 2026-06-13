@@ -90,6 +90,7 @@ Current shapes include:
 - release
 - pre-release
 - release candidate
+- release snapshot
 - weekly snapshot
 - combat test
 - experimental snapshot
@@ -126,6 +127,10 @@ Examples:
   - `family = release_candidate`
   - `lifecycle.channel = preview`
   - `lifecycle.labels = [release_candidate]`
+- `26.1-snapshot-9`
+  - `family = release_snapshot`
+  - `lifecycle.channel = preview`
+  - `lifecycle.labels = [snapshot]`
 - `b1.7.3`
   - `family = old_beta`
   - `lifecycle.channel = legacy`
@@ -142,6 +147,8 @@ Examples:
 
 - `1.21.11-pre5` -> `1.21.11`
 - `1.21.11-rc3` -> `1.21.11`
+- snapshot estimates represent the incoming edition: when a snapshot technically anchors to or timeline-matches an existing release, `effective_version` advances to the immediate next known release
+- `26.1-snapshot-9` -> immediate next known release after `26.1`; falls back to `26.1` when no later release is known
 - `1.16_combat-3` -> `1.16`
 - `25w46a` -> nearest release by manifest timestamp
 
@@ -166,7 +173,10 @@ The fallback comparator stays deterministic even for unknown shapes.
 ## Frontend contract
 Frontend code should:
 
-- render `minecraft_meta.display_name` and `minecraft_meta.display_hint`
+- render version labels through `frontend/src/version-display.ts`
+- use `minecraftVersionLabel()` for Minecraft-only UI labels
+- never render composite loader ids such as `quilt-loader-0.29.2-1.16.5`, `1.19-forge-41.1.0`, or `neoforge-26.1.0.19-beta` as the Minecraft version; the helper extracts the Minecraft target from `inherits_from` or known loader id shapes
+- use `normalizeVersionDisplay()` / `versionSearchText()` for version picker rows and filtering
 - use `lifecycle` for filtering and badges
 - avoid re-parsing vanilla-like version ids locally
 

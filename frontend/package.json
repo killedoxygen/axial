@@ -10,12 +10,14 @@
     "check": "tsc --noEmit"
   },
   "devDependencies": {
+    "@types/three": "^0.184.1",
     "esbuild": "^0.25.0",
     "typescript": "^5.7.0"
   },
   "dependencies": {
     "@openai/apps-sdk-ui": "^0.2.2",
     "@preact/signals": "^2.0.0",
-    "preact": "^10.25.0"
+    "preact": "^10.25.0",
+    "three": "^0.184.0"
   }
 }

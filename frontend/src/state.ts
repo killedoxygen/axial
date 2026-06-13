@@ -13,12 +13,15 @@ export const defaults: LocalPrefs = {
   customHue: 140,
   customVibrancy: 100,
   lightness: 0,
-  sidebarCompact: false,
   logHeight: 0,
   collapsedGroups: {},
   sidebarFilter: 'all',
   sounds: true,
+  hideSkinNametag: false,
+  selectedSkin: '',
+  selectedSkinsByAccount: {},
   shortcuts: {},
+  overlayPositions: {},
   lastUpdateCheckAt: '',
   dismissedUpdateVersion: '',
 };
@@ -27,8 +30,16 @@ export function loadLocalState(): LocalPrefs {
   try {
     const raw: string | null = localStorage.getItem(STORAGE_KEY);
     if (!raw) return { ...defaults };
-    const { logExpanded: _ignored, ...saved } = JSON.parse(raw) as Partial<LocalPrefs & { logExpanded?: boolean }>;
-    return { ...defaults, ...saved };
+    const { logExpanded: _ignored, offlineSkin, ...saved } = JSON.parse(raw) as Partial<LocalPrefs & {
+      logExpanded?: boolean;
+      offlineSkin?: string;
+    }>;
+    return {
+      ...defaults,
+      ...saved,
+      selectedSkin: saved.selectedSkin ?? offlineSkin ?? defaults.selectedSkin,
+      selectedSkinsByAccount: stringRecord(saved.selectedSkinsByAccount),
+    };
   } catch {
     return { ...defaults };
   }
@@ -40,4 +51,13 @@ export const localStateVersion = signal(0);
 export function saveLocalState(): void {
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify(local)); } catch {}
   localStateVersion.value += 1;
+}
+
+function stringRecord(value: unknown): Record<string, string> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const output: Record<string, string> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (typeof entry === 'string') output[key] = entry;
+  }
+  return output;
 }

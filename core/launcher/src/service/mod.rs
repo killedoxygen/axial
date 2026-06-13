@@ -3,6 +3,7 @@ mod mapping;
 mod prepare;
 mod validation;
 
+use crate::build::LaunchAuthContext;
 use crate::build::VanillaLaunchPlan;
 use crate::guardian::{GuardianIntervention, LaunchGuardianContext};
 use crate::healing::HealingEvent;
@@ -14,9 +15,12 @@ pub use crate::guardian::{RecoveryAction, RecoveryPlan, conservative_healing_pre
 pub use healing::{HealingSummaryInput, build_healing_summary, infer_loader};
 pub use mapping::{
     failure_class_name, format_failure_class, is_terminal_state, is_terminal_status,
-    launch_state_name, snapshot_status,
+    launch_stage_label, launch_state_name, snapshot_status,
 };
-pub use prepare::{prepare_launch_attempt, sanitize_effective_runtime_major};
+pub use prepare::{
+    LaunchPreparationEvent, prepare_launch_attempt, prepare_launch_attempt_with_events,
+    sanitize_effective_runtime_major,
+};
 
 #[derive(Debug, Clone)]
 pub struct LaunchIntent {
@@ -25,6 +29,7 @@ pub struct LaunchIntent {
     pub instance_id: String,
     pub version_id: String,
     pub username: String,
+    pub auth: LaunchAuthContext,
     pub requested_java: String,
     pub requested_preset: String,
     pub extra_jvm_args: Vec<String>,
@@ -97,10 +102,6 @@ pub struct LaunchHealingSummary {
     pub requested_preset: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effective_preset: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub requested_java_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub effective_java_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_mode: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]

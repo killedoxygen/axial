@@ -1,4 +1,5 @@
 use croopor_minecraft::JavaRuntimeInfo;
+use sysinfo::System;
 
 pub const PRESET_SMOOTH: &str = "smooth";
 pub const PRESET_PERFORMANCE: &str = "performance";
@@ -7,6 +8,9 @@ pub const PRESET_GRAALVM: &str = "graalvm";
 pub const PRESET_LEGACY: &str = "legacy";
 pub const PRESET_LEGACY_PVP: &str = "legacy_pvp";
 pub const PRESET_LEGACY_HEAVY: &str = "legacy_heavy";
+
+const ULTRA_LOW_LATENCY_MIN_LOGICAL_CORES: usize = 8;
+const ULTRA_LOW_LATENCY_MIN_TOTAL_MEMORY_MB: u64 = 8 * 1024;
 
 pub fn recommended_preset(
     requested: &str,
@@ -85,7 +89,15 @@ pub fn sanitize_preset(
     let preset = preset.trim();
 
     if info.major <= 8 {
-        return PRESET_LEGACY.to_string();
+        if legacy_family
+            && matches!(
+                preset,
+                PRESET_LEGACY | PRESET_LEGACY_PVP | PRESET_LEGACY_HEAVY
+            )
+        {
+            return preset.to_string();
+        }
+        return legacy_preset_for_target(version_id, loader, is_modded).to_string();
     }
 
     match preset {
@@ -110,13 +122,37 @@ pub fn sanitize_preset(
     if legacy_family && matches!(preset, PRESET_ULTRA_LOW_LATENCY | PRESET_SMOOTH) {
         return PRESET_PERFORMANCE.to_string();
     }
-    if (loader == "forge" || loader == "neoforge" || is_modded)
-        && preset == PRESET_ULTRA_LOW_LATENCY
-    {
+    if is_modded_launch(loader, is_modded) && preset == PRESET_ULTRA_LOW_LATENCY {
         return PRESET_PERFORMANCE.to_string();
     }
 
     preset.to_string()
+}
+
+pub fn known_fatal_explicit_preset_reason(
+    preset: &str,
+    info: &JavaRuntimeInfo,
+) -> Option<&'static str> {
+    let preset = preset.trim();
+    if !is_known_preset(preset) {
+        return None;
+    }
+    if !supports_hotspot_tuning(info) {
+        return Some("the selected runtime does not support HotSpot JVM tuning flags");
+    }
+
+    match preset {
+        PRESET_SMOOTH if !supports_shenandoah(info) => {
+            Some("the selected runtime does not support Shenandoah GC flags")
+        }
+        PRESET_ULTRA_LOW_LATENCY if !supports_zgc(info) => {
+            Some("the selected runtime does not support ZGC flags")
+        }
+        PRESET_GRAALVM if info.distribution != "graalvm" || info.major < 17 => {
+            Some("the GraalVM preset requires GraalVM Java 17 or newer")
+        }
+        _ => None,
+    }
 }
 
 pub fn supports_hotspot_tuning(info: &JavaRuntimeInfo) -> bool {
@@ -124,7 +160,7 @@ pub fn supports_hotspot_tuning(info: &JavaRuntimeInfo) -> bool {
 }
 
 pub fn supports_shenandoah(info: &JavaRuntimeInfo) -> bool {
-    supports_hotspot_tuning(info) && info.major >= 17 && info.distribution != "graalvm"
+    supports_hotspot_tuning(info) && info.major >= 11 && info.distribution != "graalvm"
 }
 
 pub fn supports_zgc(info: &JavaRuntimeInfo) -> bool {
@@ -132,7 +168,7 @@ pub fn supports_zgc(info: &JavaRuntimeInfo) -> bool {
 }
 
 pub fn supports_generational_zgc(info: &JavaRuntimeInfo) -> bool {
-    supports_zgc(info) && (21..=23).contains(&info.major)
+    supports_zgc(info) && info.major >= 21
 }
 
 fn auto_select_preset(
@@ -141,25 +177,66 @@ fn auto_select_preset(
     is_modded: bool,
     info: &JavaRuntimeInfo,
 ) -> String {
+    let (logical_cores, total_memory_mb) = host_evidence();
+    auto_select_preset_with_host(
+        version_id,
+        loader,
+        is_modded,
+        info,
+        logical_cores,
+        total_memory_mb,
+    )
+}
+
+fn auto_select_preset_with_host(
+    version_id: &str,
+    loader: &str,
+    is_modded: bool,
+    info: &JavaRuntimeInfo,
+    logical_cores: Option<usize>,
+    total_memory_mb: Option<u64>,
+) -> String {
     if !supports_hotspot_tuning(info) {
         return String::new();
     }
-    if info.distribution == "graalvm" && info.major >= 17 && !is_modded {
+    if info.distribution == "graalvm" && info.major >= 17 {
         return PRESET_GRAALVM.to_string();
     }
     if info.major <= 8 {
-        return PRESET_LEGACY.to_string();
+        return legacy_preset_for_target(version_id, loader, is_modded).to_string();
     }
     if is_legacy_family(version_id) {
         return PRESET_PERFORMANCE.to_string();
     }
-    if loader == "forge" || loader == "neoforge" || is_modded {
+    if is_modded_launch(loader, is_modded) {
         return PRESET_PERFORMANCE.to_string();
+    }
+    if supports_generational_zgc(info) && is_ultra_low_latency_host(logical_cores, total_memory_mb)
+    {
+        return PRESET_ULTRA_LOW_LATENCY.to_string();
     }
     if supports_shenandoah(info) {
         return PRESET_SMOOTH.to_string();
     }
     PRESET_PERFORMANCE.to_string()
+}
+
+fn host_evidence() -> (Option<usize>, Option<u64>) {
+    let logical_cores = std::thread::available_parallelism().ok().map(usize::from);
+
+    let mut system = System::new();
+    system.refresh_memory();
+    let total_memory_mb = system.total_memory() / (1024 * 1024);
+
+    (
+        logical_cores,
+        (total_memory_mb > 0).then_some(total_memory_mb),
+    )
+}
+
+fn is_ultra_low_latency_host(logical_cores: Option<usize>, total_memory_mb: Option<u64>) -> bool {
+    logical_cores.is_some_and(|value| value >= ULTRA_LOW_LATENCY_MIN_LOGICAL_CORES)
+        && total_memory_mb.is_some_and(|value| value >= ULTRA_LOW_LATENCY_MIN_TOTAL_MEMORY_MB)
 }
 
 fn ultra_low_latency_args(info: &JavaRuntimeInfo, low_impact_startup: bool) -> Vec<String> {
@@ -232,6 +309,34 @@ fn is_legacy_family(version_id: &str) -> bool {
     parts[0] == 1 && parts[1] <= 12
 }
 
+fn legacy_preset_for_target(version_id: &str, loader: &str, is_modded: bool) -> &'static str {
+    let version = base_version_id(version_id);
+    if version == "1.8.9" {
+        return PRESET_LEGACY_PVP;
+    }
+    if version == "1.12.2" && is_modded_launch(loader, is_modded) {
+        return PRESET_LEGACY_HEAVY;
+    }
+    PRESET_LEGACY
+}
+
+fn is_modded_launch(loader: &str, is_modded: bool) -> bool {
+    loader == "forge" || loader == "neoforge" || is_modded
+}
+
+fn is_known_preset(preset: &str) -> bool {
+    matches!(
+        preset,
+        PRESET_SMOOTH
+            | PRESET_PERFORMANCE
+            | PRESET_ULTRA_LOW_LATENCY
+            | PRESET_GRAALVM
+            | PRESET_LEGACY
+            | PRESET_LEGACY_PVP
+            | PRESET_LEGACY_HEAVY
+    )
+}
+
 fn base_version_id(version_id: &str) -> String {
     if let Some((base, _)) = version_id.split_once("-forge-") {
         return base.to_string();
@@ -254,20 +359,317 @@ mod tests {
     use super::*;
 
     fn info(major: u32) -> JavaRuntimeInfo {
+        info_with_distribution(major, "openjdk")
+    }
+
+    fn info_with_distribution(major: u32, distribution: &str) -> JavaRuntimeInfo {
         JavaRuntimeInfo {
             id: "runtime".to_string(),
             major,
             update: 0,
-            distribution: "openjdk".to_string(),
+            distribution: distribution.to_string(),
             path: "/java".to_string(),
         }
     }
 
     #[test]
-    fn legacy_runtime_forces_legacy_preset() {
+    fn phase1_auto_select_preset_gate_matrix() {
+        struct Case {
+            name: &'static str,
+            version_id: &'static str,
+            loader: &'static str,
+            is_modded: bool,
+            info: JavaRuntimeInfo,
+            logical_cores: Option<usize>,
+            total_memory_mb: Option<u64>,
+            expected: &'static str,
+        }
+
+        let cases = [
+            Case {
+                name: "java 11 modern vanilla smooth on lower-spec host",
+                version_id: "1.20.4",
+                loader: "vanilla",
+                is_modded: false,
+                info: info(11),
+                logical_cores: Some(4),
+                total_memory_mb: Some(4096),
+                expected: PRESET_SMOOTH,
+            },
+            Case {
+                name: "java 17 modern vanilla smooth on non-ultra host",
+                version_id: "1.20.4",
+                loader: "vanilla",
+                is_modded: false,
+                info: info(17),
+                logical_cores: Some(8),
+                total_memory_mb: Some(8191),
+                expected: PRESET_SMOOTH,
+            },
+            Case {
+                name: "java 21 high-end modern vanilla ultra low latency",
+                version_id: "1.21.1",
+                loader: "vanilla",
+                is_modded: false,
+                info: info(21),
+                logical_cores: Some(8),
+                total_memory_mb: Some(8192),
+                expected: PRESET_ULTRA_LOW_LATENCY,
+            },
+            Case {
+                name: "high-end modern modded performance",
+                version_id: "1.21.1",
+                loader: "fabric",
+                is_modded: true,
+                info: info(21),
+                logical_cores: Some(16),
+                total_memory_mb: Some(32_768),
+                expected: PRESET_PERFORMANCE,
+            },
+            Case {
+                name: "graalvm java 17 vanilla preserves graalvm tuning",
+                version_id: "1.20.4",
+                loader: "vanilla",
+                is_modded: false,
+                info: info_with_distribution(17, "graalvm"),
+                logical_cores: Some(4),
+                total_memory_mb: Some(4096),
+                expected: PRESET_GRAALVM,
+            },
+            Case {
+                name: "graalvm java 21 modded preserves graalvm tuning",
+                version_id: "1.20.4",
+                loader: "forge",
+                is_modded: true,
+                info: info_with_distribution(21, "graalvm"),
+                logical_cores: Some(16),
+                total_memory_mb: Some(32_768),
+                expected: PRESET_GRAALVM,
+            },
+            Case {
+                name: "normalized openj9 semeru ibm runtime disables hotspot tuning",
+                version_id: "1.20.4",
+                loader: "vanilla",
+                is_modded: false,
+                info: info_with_distribution(21, "openj9"),
+                logical_cores: Some(16),
+                total_memory_mb: Some(32_768),
+                expected: "",
+            },
+            Case {
+                name: "java 8 1.8.9 uses legacy pvp",
+                version_id: "1.8.9",
+                loader: "vanilla",
+                is_modded: false,
+                info: info(8),
+                logical_cores: Some(4),
+                total_memory_mb: Some(4096),
+                expected: PRESET_LEGACY_PVP,
+            },
+            Case {
+                name: "java 8 modded 1.12.2 uses legacy heavy",
+                version_id: "1.12.2",
+                loader: "forge",
+                is_modded: true,
+                info: info(8),
+                logical_cores: Some(4),
+                total_memory_mb: Some(4096),
+                expected: PRESET_LEGACY_HEAVY,
+            },
+            Case {
+                name: "java 8 other legacy target uses conservative legacy",
+                version_id: "1.7.10",
+                loader: "vanilla",
+                is_modded: false,
+                info: info(8),
+                logical_cores: Some(4),
+                total_memory_mb: Some(4096),
+                expected: PRESET_LEGACY,
+            },
+            Case {
+                name: "modern java targeting legacy vanilla uses safe hotspot preset",
+                version_id: "1.8.9",
+                loader: "vanilla",
+                is_modded: false,
+                info: info(17),
+                logical_cores: Some(16),
+                total_memory_mb: Some(32_768),
+                expected: PRESET_PERFORMANCE,
+            },
+            Case {
+                name: "modern java targeting legacy modded uses safe hotspot preset",
+                version_id: "1.12.2",
+                loader: "forge",
+                is_modded: true,
+                info: info(21),
+                logical_cores: Some(16),
+                total_memory_mb: Some(32_768),
+                expected: PRESET_PERFORMANCE,
+            },
+        ];
+
+        for case in cases {
+            assert_eq!(
+                auto_select_preset_with_host(
+                    case.version_id,
+                    case.loader,
+                    case.is_modded,
+                    &case.info,
+                    case.logical_cores,
+                    case.total_memory_mb,
+                ),
+                case.expected,
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn openj9_runtime_skips_hotspot_tuning() {
+        let info = info_with_distribution(21, "openj9");
+
+        assert_eq!(
+            recommended_preset("", "1.20.4", "vanilla", false, &info),
+            ""
+        );
+        assert_eq!(
+            sanitize_preset(PRESET_PERFORMANCE, "1.20.4", "vanilla", false, &info),
+            ""
+        );
+    }
+
+    #[test]
+    fn modern_non_graalvm_defaults_stay_on_hotspot_presets() {
+        assert_eq!(
+            auto_select_preset_with_host(
+                "1.20.4",
+                "vanilla",
+                false,
+                &info(21),
+                Some(4),
+                Some(8192)
+            ),
+            PRESET_SMOOTH
+        );
+        assert_eq!(
+            auto_select_preset_with_host(
+                "1.20.4",
+                "forge",
+                true,
+                &info(21),
+                Some(16),
+                Some(32_768)
+            ),
+            PRESET_PERFORMANCE
+        );
+    }
+
+    #[test]
+    fn high_end_modern_vanilla_auto_selects_ultra_low_latency() {
+        assert_eq!(
+            auto_select_preset_with_host(
+                "1.20.6",
+                "vanilla",
+                false,
+                &info(21),
+                Some(8),
+                Some(8192)
+            ),
+            PRESET_ULTRA_LOW_LATENCY
+        );
+        assert_eq!(
+            auto_select_preset_with_host(
+                "1.21.1",
+                "vanilla",
+                false,
+                &info(24),
+                Some(12),
+                Some(16_384)
+            ),
+            PRESET_ULTRA_LOW_LATENCY
+        );
+    }
+
+    #[test]
+    fn modern_vanilla_below_high_end_threshold_keeps_smooth() {
+        assert_eq!(
+            auto_select_preset_with_host(
+                "1.20.6",
+                "vanilla",
+                false,
+                &info(21),
+                Some(7),
+                Some(8192)
+            ),
+            PRESET_SMOOTH
+        );
+        assert_eq!(
+            auto_select_preset_with_host(
+                "1.20.6",
+                "vanilla",
+                false,
+                &info(21),
+                Some(8),
+                Some(8191)
+            ),
+            PRESET_SMOOTH
+        );
+    }
+
+    #[test]
+    fn graalvm_runtime_auto_selects_graalvm_for_modded_launch() {
+        let info = info_with_distribution(21, "graalvm");
+
+        assert_eq!(
+            recommended_preset("", "1.20.4", "forge", true, &info),
+            PRESET_GRAALVM
+        );
+    }
+
+    #[test]
+    fn explicit_graalvm_preset_survives_modded_graalvm_runtime() {
+        let info = info_with_distribution(21, "graalvm");
+
+        assert_eq!(
+            sanitize_preset(PRESET_GRAALVM, "1.20.4", "forge", true, &info),
+            PRESET_GRAALVM
+        );
+    }
+
+    #[test]
+    fn java8_legacy_targets_auto_select_specific_legacy_presets() {
+        assert_eq!(
+            recommended_preset("", "1.8.9", "vanilla", false, &info(8)),
+            PRESET_LEGACY_PVP
+        );
+        assert_eq!(
+            recommended_preset("", "1.12.2", "forge", true, &info(8)),
+            PRESET_LEGACY_HEAVY
+        );
+        assert_eq!(
+            recommended_preset("", "1.12.2", "vanilla", false, &info(8)),
+            PRESET_LEGACY
+        );
+    }
+
+    #[test]
+    fn legacy_runtime_uses_target_specific_safe_preset() {
         assert_eq!(
             sanitize_preset(PRESET_PERFORMANCE, "1.8.9", "vanilla", false, &info(8)),
-            PRESET_LEGACY
+            PRESET_LEGACY_PVP
+        );
+    }
+
+    #[test]
+    fn java8_legacy_targets_preserve_legacy_variants() {
+        assert_eq!(
+            sanitize_preset(PRESET_LEGACY_PVP, "1.8.9", "vanilla", false, &info(8)),
+            PRESET_LEGACY_PVP
+        );
+        assert_eq!(
+            sanitize_preset(PRESET_LEGACY_HEAVY, "1.12.2", "forge", true, &info(8)),
+            PRESET_LEGACY_HEAVY
         );
     }
 
@@ -276,6 +678,22 @@ mod tests {
         assert_eq!(
             sanitize_preset(PRESET_LEGACY, "1.20.4", "vanilla", false, &info(21)),
             PRESET_PERFORMANCE
+        );
+        assert_eq!(
+            sanitize_preset(PRESET_LEGACY_HEAVY, "1.20.4", "vanilla", false, &info(21)),
+            PRESET_PERFORMANCE
+        );
+    }
+
+    #[test]
+    fn unsafe_modern_presets_downgrade_on_java8_legacy_targets() {
+        assert_eq!(
+            sanitize_preset(PRESET_SMOOTH, "1.8.9", "vanilla", false, &info(8)),
+            PRESET_LEGACY_PVP
+        );
+        assert_eq!(
+            sanitize_preset(PRESET_ULTRA_LOW_LATENCY, "1.12.2", "forge", true, &info(8)),
+            PRESET_LEGACY_HEAVY
         );
     }
 

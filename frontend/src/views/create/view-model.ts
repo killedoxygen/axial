@@ -1,13 +1,15 @@
 import type { CatalogVersion } from '../../types';
-import { isReleaseVersion, isSnapshotVersion, parseVersionDisplay } from '../../utils';
 import { channelOfVersion, type Channel, type LoaderKey } from './defaults';
+import { normalizeVersionDisplay } from '../../version-display';
+
+export type VersionDownloadState = 'none' | 'base' | 'full';
 
 export interface VersionRowModel {
   id: string;
   displayName: string;
   hint: string | null;
   channel: Channel;
-  installed: boolean;
+  downloadState: VersionDownloadState;
 }
 
 export const CHANNEL_LABEL: Record<Channel, string> = {
@@ -19,49 +21,22 @@ export const CHANNEL_LABEL: Record<Channel, string> = {
 
 export const CHANNEL_ORDER: Channel[] = ['release', 'snapshot', 'legacy', 'unknown'];
 
-function isVersionTokenPrefix(anchorId: string, versionId: string): boolean {
-  const anchorTokens = anchorId.split('.');
-  const versionTokens = versionId.split(/[.\-_]/);
-  return versionTokens.length >= anchorTokens.length
-    && anchorTokens.every((token, index) => versionTokens[index] === token);
-}
-
 export function buildRowModel(
   version: CatalogVersion,
-  releaseAnchors: CatalogVersion[],
   installedSet: Set<string>,
   source: LoaderKey,
+  fullInstalledSet: Set<string> = new Set(),
 ): VersionRowModel {
-  const display = parseVersionDisplay(version.id, version, releaseAnchors);
-  let hint = display.hint;
-  if (!hint && isSnapshotVersion(version) && version.release_time) {
-    const releaseTime = version.release_time;
-    let nearest: CatalogVersion | null = null;
-    for (const anchor of releaseAnchors) {
-      if ((anchor.release_time || '') >= releaseTime) {
-        nearest = anchor;
-        break;
-      }
-    }
-    if (!nearest && releaseAnchors.length > 0) {
-      nearest = releaseAnchors[releaseAnchors.length - 1] ?? null;
-    }
-    if (nearest && !isVersionTokenPrefix(nearest.id, version.id)) {
-      hint = `~ ${nearest.id}`;
-    }
-  }
+  const display = normalizeVersionDisplay(version);
+  const baseInstalled = version.installed || installedSet.has(version.id);
+  const fullInstalled = source === 'vanilla'
+    ? baseInstalled
+    : fullInstalledSet.has(version.id);
   return {
     id: version.id,
-    displayName: display.name === version.id ? version.id : display.name,
-    hint: hint && hint !== display.name ? hint : null,
+    displayName: display.displayName === version.id ? version.id : display.displayName,
+    hint: display.hint,
     channel: channelOfVersion(version),
-    installed: source === 'vanilla' && (version.installed || installedSet.has(version.id)),
+    downloadState: fullInstalled ? 'full' : baseInstalled ? 'base' : 'none',
   };
-}
-
-export function releaseAnchorsFor(versions: CatalogVersion[]): CatalogVersion[] {
-  return versions
-    .filter(isReleaseVersion)
-    .slice()
-    .sort((left, right) => (left.release_time || '').localeCompare(right.release_time || ''));
 }

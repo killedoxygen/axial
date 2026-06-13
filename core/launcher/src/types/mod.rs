@@ -34,6 +34,7 @@ pub enum LaunchState {
     EnsuringRuntime,
     DownloadingRuntime,
     Preparing,
+    Prewarming,
     Starting,
     Monitoring,
     Running,
@@ -47,11 +48,9 @@ pub enum LaunchState {
 pub enum LaunchFailureClass {
     Unknown,
     JvmUnsupportedOption,
-    #[serde(alias = "jvm_experimental_unlock_required")]
     JvmExperimentalUnlock,
     JvmOptionOrdering,
     JavaRuntimeMismatch,
-    #[serde(alias = "classpath_or_module_conflict")]
     ClasspathModuleConflict,
     AuthModeIncompatible,
     LoaderBootstrapFailure,
@@ -77,14 +76,10 @@ impl LaunchFailureClass {
         Some(match raw {
             "unknown" => Self::Unknown,
             "jvm_unsupported_option" => Self::JvmUnsupportedOption,
-            "jvm_experimental_unlock" | "jvm_experimental_unlock_required" => {
-                Self::JvmExperimentalUnlock
-            }
+            "jvm_experimental_unlock" => Self::JvmExperimentalUnlock,
             "jvm_option_ordering" => Self::JvmOptionOrdering,
             "java_runtime_mismatch" => Self::JavaRuntimeMismatch,
-            "classpath_module_conflict" | "classpath_or_module_conflict" => {
-                Self::ClasspathModuleConflict
-            }
+            "classpath_module_conflict" => Self::ClasspathModuleConflict,
             "auth_mode_incompatible" => Self::AuthModeIncompatible,
             "loader_bootstrap_failure" => Self::LoaderBootstrapFailure,
             "startup_stalled" => Self::StartupStalled,
@@ -131,24 +126,18 @@ mod tests {
     }
 
     #[test]
-    fn launch_failure_class_parses_legacy_aliases() {
+    fn launch_failure_class_rejects_old_aliases() {
         assert_eq!(
             LaunchFailureClass::from_name("jvm_experimental_unlock_required"),
-            Some(LaunchFailureClass::JvmExperimentalUnlock)
+            None
         );
         assert_eq!(
             LaunchFailureClass::from_name("classpath_or_module_conflict"),
-            Some(LaunchFailureClass::ClasspathModuleConflict)
+            None
         );
-        assert_eq!(
-            serde_json::from_str::<LaunchFailureClass>("\"jvm_experimental_unlock_required\"")
-                .expect("legacy alias"),
-            LaunchFailureClass::JvmExperimentalUnlock
-        );
-        assert_eq!(
-            serde_json::from_str::<LaunchFailureClass>("\"classpath_or_module_conflict\"")
-                .expect("legacy alias"),
-            LaunchFailureClass::ClasspathModuleConflict
-        );
+        serde_json::from_str::<LaunchFailureClass>("\"jvm_experimental_unlock_required\"")
+            .expect_err("old alias should not deserialize");
+        serde_json::from_str::<LaunchFailureClass>("\"classpath_or_module_conflict\"")
+            .expect_err("old alias should not deserialize");
     }
 }

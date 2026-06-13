@@ -41,6 +41,71 @@ pub enum ModCondition {
     Recommend,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EmergencyDisableTarget {
+    Composition,
+    Artifact,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnershipClass {
+    CompositionManaged,
+    UserManaged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedArtifactType {
+    #[serde(rename = "mod")]
+    Mod,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedArtifactProvider {
+    Modrinth,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedArtifactChecksumPolicy {
+    ProviderSha512,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedArtifactSource {
+    pub provider: ManagedArtifactProvider,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedArtifactDefinitionSource {
+    pub provider: ManagedArtifactProvider,
+    pub project_id: String,
+    pub slug: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedArtifactDefinition {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub artifact_type: ManagedArtifactType,
+    pub source: ManagedArtifactDefinitionSource,
+    pub checksum_policy: ManagedArtifactChecksumPolicy,
+    pub ownership_class: OwnershipClass,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedArtifactIntegrity {
+    pub sha512: String,
+    pub sha512_verified: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct HardwareRequirement {
     #[serde(default)]
@@ -55,6 +120,7 @@ pub struct HardwareRequirement {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManagedMod {
+    pub artifact_id: String,
     pub project_id: String,
     pub slug: String,
     pub name: String,
@@ -96,13 +162,19 @@ pub struct ResolutionRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub schema_version: i32,
     pub generated_at: String,
+    pub minimum_app_version: String,
+    pub rule_channel: String,
+    pub artifacts: Vec<ManagedArtifactDefinition>,
     pub compositions: Vec<CompositionDef>,
+    pub emergency_disables: Vec<EmergencyDisable>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompositionDef {
     pub id: String,
     pub display_name: String,
@@ -118,6 +190,21 @@ pub struct CompositionDef {
     pub jvm_preset: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmergencyDisable {
+    pub id: String,
+    pub target: EmergencyDisableTarget,
+    pub target_id: String,
+    pub reason: String,
+    #[serde(default)]
+    pub families: Vec<VersionFamily>,
+    #[serde(default)]
+    pub loaders: Vec<String>,
+    #[serde(default)]
+    pub tiers: Vec<CompositionTier>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HardwareProfile {
     pub total_ram_mb: i32,
@@ -127,21 +214,23 @@ pub struct HardwareProfile {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InstalledMod {
     pub project_id: String,
     pub version_id: String,
     pub filename: String,
-    pub sha512: String,
+    pub ownership_class: OwnershipClass,
+    pub source: ManagedArtifactSource,
+    pub integrity: ManagedArtifactIntegrity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompositionState {
     pub composition_id: String,
     pub tier: CompositionTier,
     pub installed_mods: Vec<InstalledMod>,
     pub installed_at: String,
-    #[serde(default)]
     pub failure_count: i32,
-    #[serde(default)]
     pub last_failure: String,
 }

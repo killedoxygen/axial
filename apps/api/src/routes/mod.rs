@@ -1,3 +1,5 @@
+mod accounts;
+mod auth;
 mod catalog;
 mod config;
 mod dev;
@@ -9,6 +11,7 @@ mod loaders;
 mod music;
 mod performance;
 mod setup;
+mod skin;
 mod status;
 mod system;
 mod update;
@@ -22,9 +25,15 @@ use axum::{
 };
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
+pub(crate) use launch::spawn_restart_interrupted_benchmark_suite_drivers;
+pub(crate) use performance::spawn_pending_performance_operations;
+pub use skin::flush_pending_saved_skin_applies_for_shutdown;
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(status::router())
+        .merge(accounts::router())
+        .merge(auth::router())
         .merge(system::router())
         .merge(config::router())
         .merge(dev::router())
@@ -34,6 +43,7 @@ pub fn router(state: AppState) -> Router {
         .merge(install::router())
         .merge(music::router())
         .merge(performance::router())
+        .merge(skin::router())
         .merge(update::router())
         .merge(launch::router())
         .merge(loaders::router())
@@ -53,6 +63,7 @@ fn local_cors_layer() -> CorsLayer {
             Method::GET,
             Method::POST,
             Method::PUT,
+            Method::PATCH,
             Method::DELETE,
             Method::OPTIONS,
         ])

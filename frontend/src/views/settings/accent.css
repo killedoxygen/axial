@@ -47,9 +47,15 @@
 .cp-accent-presets-label {
   font-size: 10.5px;
   text-transform: uppercase;
-  letter-spacing: 0.8px;
+  letter-spacing: 0;
   font-weight: 600;
   color: var(--text-mute);
+}
+.cp-accent-presets-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
 }
 
 /* Swatch row */

@@ -2,12 +2,13 @@ use crate::state::AppState;
 use axum::{
     Json, Router,
     extract::State,
+    http::StatusCode,
     response::sse::{Event, Sse},
     routing::get,
 };
 use croopor_minecraft::{
-    VersionEntry, enrich_version_entries, fetch_version_manifest, manifest_release_references,
-    scan_versions,
+    VersionEntry, enrich_version_entries, fetch_version_manifest_cached,
+    manifest_release_references, scan_versions,
 };
 use serde::Serialize;
 use std::{convert::Infallible, path::PathBuf, time::Duration};
@@ -26,21 +27,17 @@ pub fn router() -> Router<AppState> {
 
 async fn handle_versions(
     State(state): State<AppState>,
-) -> Result<Json<VersionsResponse>, (axum::http::StatusCode, Json<serde_json::Value>)> {
+) -> Result<Json<VersionsResponse>, (StatusCode, Json<serde_json::Value>)> {
     let Some(mc_dir) = state.library_dir() else {
         return Err((
-            axum::http::StatusCode::PRECONDITION_FAILED,
+            StatusCode::PRECONDITION_FAILED,
             Json(serde_json::json!({ "error": "Croopor library is not configured" })),
         ));
     };
 
-    let mut versions = scan_versions(&PathBuf::from(mc_dir)).map_err(|error| {
-        (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": format!("failed to scan versions: {error}") })),
-        )
-    })?;
-    if let Ok(manifest) = fetch_version_manifest().await {
+    let mc_dir = PathBuf::from(mc_dir);
+    let mut versions = scan_versions(&mc_dir).map_err(scan_versions_error_response)?;
+    if let Ok(manifest) = fetch_version_manifest_cached(&mc_dir).await {
         let releases = manifest_release_references(&manifest);
         enrich_version_entries(&mut versions, &releases);
     }
@@ -52,11 +49,11 @@ async fn handle_version_watch(
     State(state): State<AppState>,
 ) -> Result<
     Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>,
-    (axum::http::StatusCode, Json<serde_json::Value>),
+    (StatusCode, Json<serde_json::Value>),
 > {
     let Some(mc_dir) = state.library_dir() else {
         return Err((
-            axum::http::StatusCode::PRECONDITION_FAILED,
+            StatusCode::PRECONDITION_FAILED,
             Json(serde_json::json!({ "error": "Croopor library is not configured" })),
         ));
     };
@@ -69,7 +66,7 @@ async fn handle_version_watch(
         loop {
             ticker.tick().await;
             let mut versions = scan_versions(&mc_dir).unwrap_or_default();
-            if let Ok(manifest) = fetch_version_manifest().await {
+            if let Ok(manifest) = fetch_version_manifest_cached(&mc_dir).await {
                 let releases = manifest_release_references(&manifest);
                 enrich_version_entries(&mut versions, &releases);
             }
@@ -82,4 +79,53 @@ async fn handle_version_watch(
     };
 
     Ok(Sse::new(stream))
+}
+
+fn scan_versions_error_response(_error: std::io::Error) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "error": "Could not scan installed versions. Check the library folder and try again."
+        })),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+
+    #[test]
+    fn scan_versions_error_response_hides_unix_path_fragments() {
+        let (status, Json(body)) = scan_versions_error_response(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "permission denied reading /home/alice/Croopor Library/versions",
+        ));
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            body.get("error").and_then(serde_json::Value::as_str),
+            Some("Could not scan installed versions. Check the library folder and try again.")
+        );
+        let body = body.to_string();
+        assert!(!body.contains("/home/alice"));
+        assert!(!body.contains("Croopor Library"));
+    }
+
+    #[test]
+    fn scan_versions_error_response_hides_windows_path_fragments() {
+        let (status, Json(body)) = scan_versions_error_response(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            r"permission denied reading C:\Users\Alice\AppData\Roaming\Croopor\versions",
+        ));
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            body.get("error").and_then(serde_json::Value::as_str),
+            Some("Could not scan installed versions. Check the library folder and try again.")
+        );
+        let body = body.to_string();
+        assert!(!body.contains(r"C:\Users\Alice"));
+        assert!(!body.contains("AppData"));
+    }
 }

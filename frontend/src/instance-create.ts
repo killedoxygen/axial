@@ -2,7 +2,7 @@
 // optionally queue a version install, toast, and navigate to the new instance.
 // Lives at the top level (next to install.ts) so it can import from both
 // install.ts and actions.ts without creating a cycle with actions.ts.
-import { api } from './api';
+import { api, isApiError } from './api';
 import { toast } from './toast';
 import { errMessage } from './utils';
 import { navigate } from './ui-state';
@@ -101,10 +101,15 @@ export async function createInstance(args: CreateInstanceArgs): Promise<CreateIn
         break;
       }
       lastError = 'server returned an incomplete instance';
-      console.error('Create instance returned invalid payload', res);
+      console.error('Create instance returned invalid payload');
       break;
     } catch (err: unknown) {
-      lastError = errMessage(err);
+      const message = errMessage(err);
+      if (isApiError(err) && isNameCollision(message) && attempt < MAX_NAME_COLLISION_RETRIES) {
+        name = nextCandidateName(baseName, attempt);
+        continue;
+      }
+      lastError = message;
       break;
     }
   }
@@ -132,14 +137,17 @@ export async function createInstance(args: CreateInstanceArgs): Promise<CreateIn
   }
 
   addInstance(created);
-  toast(`Created ${created.name}`);
-  navigate({ name: 'instance', id: created.id });
-
+  let queuedInstall = false;
   if (install.kind === 'vanilla') {
     installVersion(install.versionId);
+    queuedInstall = true;
   } else if (install.kind === 'loader') {
     installLoaderVersion(install.build);
+    queuedInstall = true;
   }
+
+  toast(queuedInstall ? `Created ${created.name}; download queued` : `Created ${created.name}`);
+  navigate({ name: 'instance', id: created.id });
 
   return { ok: true, instance: created };
 }

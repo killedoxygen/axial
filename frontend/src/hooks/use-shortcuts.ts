@@ -1,5 +1,5 @@
 import { useEffect } from 'preact/hooks';
-import { navigate, route, commandPaletteOpen } from '../ui-state';
+import { navigate, route, commandPaletteOpen, openCreate } from '../ui-state';
 import { selectedInstance, runningSessions, launchState, instances } from '../store';
 import { selectInstance } from '../actions';
 import { launchGame } from '../launch';
@@ -11,11 +11,9 @@ function match(e: KeyboardEvent, key: string, ctrl = true): boolean {
   return ek === k && !!e.ctrlKey === ctrl && !e.shiftKey && !e.altKey && !e.metaKey;
 }
 
-// Global keyboard shortcuts, wired to the ui-state signals
 export function useShortcuts(): void {
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent): void => {
-      // Don't steal typing shortcuts from fields except the global ones
       const target = e.target as HTMLElement | null;
       const typing = !!target?.closest('input, textarea, [contenteditable]');
 
@@ -29,7 +27,7 @@ export function useShortcuts(): void {
       if (match(e, 'n')) {
         if (typing) return;
         e.preventDefault();
-        navigate({ name: 'create' });
+        openCreate();
         Sound.ui('soft');
         return;
       }

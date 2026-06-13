@@ -46,11 +46,12 @@ pub async fn fetch_game_versions()
 pub async fn fetch_builds(
     minecraft_version: &str,
 ) -> Result<LoaderVersionIndex, crate::loaders::types::LoaderError> {
-    let xml = fetch_text(FORGE_MAVEN_META).await?;
-    let promotions = fetch_json::<Promotions>(FORGE_PROMOTIONS_URL)
-        .await
-        .ok()
-        .unwrap_or_default();
+    let maven_metadata = fetch_text(FORGE_MAVEN_META);
+    let promotions = fetch_json::<Promotions>(FORGE_PROMOTIONS_URL);
+    let (maven_metadata, promotions) = tokio::join!(maven_metadata, promotions);
+
+    let xml = maven_metadata?;
+    let promotions = promotions.ok().unwrap_or_default();
     let recommended = promotions
         .promos
         .get(&format!("{minecraft_version}-recommended"))

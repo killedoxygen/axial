@@ -7,14 +7,13 @@ export interface Instance {
   created_at: string;
   last_played_at?: string;
   art_seed?: number;
-  art_preset?: string;
   max_memory_mb?: number;
   min_memory_mb?: number;
   java_path?: string;
   window_width?: number;
   window_height?: number;
   jvm_preset?: string;
-  performance_mode?: string;
+  performance_mode?: InstancePerformanceMode;
   extra_jvm_args?: string;
   icon?: string;
   accent?: string;
@@ -81,6 +80,8 @@ export type LoaderComponentId =
   | 'net.neoforged';
 
 export type LoaderType = 'fabric' | 'quilt' | 'forge' | 'neoforge';
+
+export type LaunchAuthMode = 'offline' | 'online';
 
 export type LoaderTerm =
   | 'recommended'
@@ -163,19 +164,21 @@ export interface Version {
 
 export interface Config {
   username: string;
+  launch_auth_mode?: LaunchAuthMode;
   max_memory_mb: number;
   min_memory_mb: number;
   java_path_override?: string;
   window_width?: number;
   window_height?: number;
   jvm_preset?: string;
-  performance_mode?: string;
-  guardian_mode?: string;
+  performance_mode?: PerformanceMode;
+  guardian_mode?: GuardianMode;
   theme?: string;
   custom_hue?: number;
   custom_vibrancy?: number;
   lightness?: number;
   onboarding_done: boolean;
+  telemetry_enabled: boolean;
   library_dir?: string;
   library_mode?: string;
   music_enabled?: boolean;
@@ -226,6 +229,13 @@ export interface ActiveInstall {
 
 // ── Launch / session types ──
 
+export interface LaunchBenchmarkMetadata {
+  id?: string;
+  profile?: string;
+  run_type?: string;
+  mode?: string;
+}
+
 export interface RunningSession {
   sessionId: string;
   versionId: string;
@@ -234,10 +244,15 @@ export interface RunningSession {
   stopping?: boolean;
   launchedAt: string;
   allocatedMB: number;
+  benchmark?: LaunchBenchmarkMetadata;
   healing?: LaunchHealingSummary;
   guardian?: GuardianSummary;
   eventSource?: EventSource;
 }
+
+export type PerformanceMode = 'managed' | 'vanilla' | 'custom';
+
+export type InstancePerformanceMode = PerformanceMode | '';
 
 export type GuardianMode = 'managed' | 'custom';
 
@@ -258,14 +273,79 @@ export interface GuardianIntervention {
 export interface GuardianSummary {
   mode: GuardianMode;
   decision: GuardianDecision;
+  message?: string;
+  details?: string[];
   guidance?: string[];
   interventions?: GuardianIntervention[];
+}
+
+export type LaunchOverrideOrigin = 'global' | 'instance';
+
+export interface LaunchPreflightOverride {
+  present: boolean;
+  origin?: LaunchOverrideOrigin;
+}
+
+export interface LaunchPreflightMemory {
+  max_memory_mb: number;
+  min_memory_mb: number;
+  min_clamped: boolean;
+}
+
+export interface LaunchPreflightOverrides {
+  java: LaunchPreflightOverride;
+  preset: LaunchPreflightOverride;
+  raw_jvm_args: LaunchPreflightOverride;
+}
+
+export interface LaunchPreflightResourceBudget {
+  active_session_count: number;
+  active_install_count: number;
+  active_memory_allocation_mb: number;
+  requested_memory_mb?: number;
+  estimated_remaining_memory_mb?: number;
+  memory_pressure: boolean;
+  cpu_pressure: boolean;
+  install_pressure: boolean;
+  disk_pressure: boolean;
+}
+
+export type LaunchReadinessReasonId =
+  | 'version_json_missing'
+  | 'client_jar_missing'
+  | 'parent_version_missing'
+  | 'incomplete_install'
+  | 'libraries_missing'
+  | 'asset_index_missing'
+  | 'managed_runtime_missing'
+  | 'java_override_missing';
+
+export type LaunchReadinessSeverity = 'blocking';
+
+export interface LaunchReadinessReason {
+  id: LaunchReadinessReasonId;
+  severity: LaunchReadinessSeverity;
+  message: string;
+}
+
+export interface LaunchReadiness {
+  launchable: boolean;
+  reasons: LaunchReadinessReason[];
+}
+
+export interface LaunchPreflightResponse {
+  status: 'ready';
+  guardian: GuardianSummary;
+  mode: GuardianMode;
+  memory: LaunchPreflightMemory;
+  overrides: LaunchPreflightOverrides;
+  readiness: LaunchReadiness;
+  resource_budget: LaunchPreflightResourceBudget;
 }
 
 export type HealingEventKind =
   | 'runtime_bypassed'
   | 'preset_downgraded'
-  | 'startup_stalled'
   | 'fallback_applied';
 
 export interface HealingEvent {
@@ -276,8 +356,6 @@ export interface HealingEvent {
 export interface LaunchHealingSummary {
   requested_preset?: string;
   effective_preset?: string;
-  requested_java_path?: string;
-  effective_java_path?: string;
   auth_mode?: string;
   warnings?: string[];
   fallback_applied?: string;
@@ -293,13 +371,419 @@ export interface InstanceLaunchDraft {
   dirty: boolean;
 }
 
-export type LaunchNoticeTone = 'info' | 'success' | 'error';
+export type LaunchNoticeTone = 'info' | 'success' | 'warned' | 'intervened' | 'error';
 
 export interface LaunchNotice {
   message: string;
   detail?: string;
   details?: string[];
   tone: LaunchNoticeTone;
+}
+
+export interface LaunchProofScenario {
+  scenario_id: string;
+  performance_mode: string;
+  requested_memory_mb?: number;
+  version_id?: string;
+  benchmark_profile?: string;
+  benchmark_run_type?: string;
+  benchmark_mode?: string;
+  benchmark_id?: string;
+}
+
+export interface LaunchProofDevice {
+  tier: string;
+  total_memory_mb?: number;
+  cpu_threads?: number;
+}
+
+export interface LaunchProofComparison {
+  baseline_session_id: string;
+  baseline_recorded_at: string;
+  matched_sample_count: number;
+  metric_name: string;
+  current_value_ms: number;
+  baseline_value_ms: number;
+  delta_ms: number;
+  delta_percent: number;
+}
+
+export interface LaunchProofResourceBudget {
+  host_total_memory_mb?: number;
+  host_available_memory_mb?: number;
+  host_used_memory_mb?: number;
+  host_cpu_threads?: number;
+  host_cpu_load_1m_x100?: number;
+  host_cpu_load_5m_x100?: number;
+  host_cpu_load_15m_x100?: number;
+  launcher_process_memory_mb?: number;
+  active_session_count: number;
+  active_install_count: number;
+  active_memory_allocation_mb: number;
+  requested_memory_mb?: number;
+  estimated_remaining_memory_mb?: number;
+  memory_headroom_mb: number;
+  memory_pressure: boolean;
+  cpu_pressure: boolean;
+  install_pressure: boolean;
+  launch_disk_available_mb?: number;
+  launch_disk_headroom_mb?: number;
+  disk_pressure?: boolean;
+}
+
+export interface LaunchProofRecord {
+  schema: string;
+  schema_version: number;
+  session_id: string;
+  instance_id: string;
+  version_id: string;
+  launched_at: string;
+  recorded_at: string;
+  outcome: string;
+  scenario: LaunchProofScenario;
+  device: LaunchProofDevice;
+  pid?: number;
+  exit_code?: number;
+  boot_duration_ms?: number;
+  failure_class?: string;
+  failure_detail?: string;
+  guardian?: GuardianSummary | null;
+  healing?: LaunchHealingSummary | null;
+  comparison?: LaunchProofComparison | null;
+  resource_budget?: LaunchProofResourceBudget | null;
+}
+
+export interface LaunchReportsResponse {
+  reports: LaunchProofRecord[];
+}
+
+export interface BenchmarkMatrixModeDescriptor {
+  id: string;
+  description: string;
+  intended_use: string;
+}
+
+export interface BenchmarkMatrixRunTypeDescriptor {
+  id: string;
+  description: string;
+}
+
+export interface BenchmarkMatrixProfileDescriptor {
+  id: string;
+  scenario: string;
+  description: string;
+  intended_use: string;
+}
+
+export interface BenchmarkMatrixTargetDescriptor {
+  id: string;
+  family: string;
+  version: string;
+  loader: string;
+  profile: string;
+  run_type: string;
+  description: string;
+  intended_use: string;
+}
+
+export interface BenchmarkMatrixLimits {
+  max_payload_bytes: number;
+  custom_post_values_allowed: boolean;
+}
+
+export interface BenchmarkMatrixResponse {
+  schema: string;
+  schema_version: number;
+  modes: BenchmarkMatrixModeDescriptor[];
+  run_types: BenchmarkMatrixRunTypeDescriptor[];
+  profiles: BenchmarkMatrixProfileDescriptor[];
+  representative_targets: BenchmarkMatrixTargetDescriptor[];
+  limits: BenchmarkMatrixLimits;
+}
+
+export interface BenchmarkQualificationSuitePreview {
+  present?: boolean;
+  suite_id?: string;
+  mode?: string;
+  run_count?: number;
+}
+
+export interface BenchmarkQualificationTargetPreview {
+  family: string;
+  loader: string;
+  version: string;
+  mode: string;
+}
+
+export interface BenchmarkQualificationRequiredEvidence {
+  profile: string;
+  run_type: string;
+  mode: string;
+  performance_mode: PerformanceMode | string;
+}
+
+export interface BenchmarkQualificationSuiteRunPreview {
+  present: boolean;
+  run_index?: number;
+  profile?: string;
+  run_type?: string;
+  target_id?: string;
+  benchmark_id?: string;
+  session_id?: string;
+  state?: string;
+}
+
+export interface BenchmarkQualificationProofComparisonPreview {
+  present: boolean;
+  baseline_session_id?: string;
+  metric_name?: string;
+  matched_sample_count?: number;
+}
+
+export interface BenchmarkQualificationProofPreview {
+  present: boolean;
+  session_id?: string;
+  benchmark_id?: string;
+  profile?: string;
+  run_type?: string;
+  mode?: string;
+  performance_mode?: PerformanceMode | string;
+  version?: string;
+  outcome?: string;
+  comparison?: BenchmarkQualificationProofComparisonPreview;
+}
+
+export interface BenchmarkQualificationTargetEvidencePreview {
+  role: string;
+  target_id: string;
+  family: string;
+  loader: string;
+  version: string;
+  required: BenchmarkQualificationRequiredEvidence;
+  suite_run: BenchmarkQualificationSuiteRunPreview;
+  proof: BenchmarkQualificationProofPreview;
+  missing: string[];
+}
+
+export interface BenchmarkQualificationPreviewResponse {
+  schema: string;
+  schema_version: number;
+  status: 'ready' | 'incomplete';
+  suite: BenchmarkQualificationSuitePreview;
+  target: BenchmarkQualificationTargetPreview;
+  targets: BenchmarkQualificationTargetEvidencePreview[];
+}
+
+export type BenchmarkQualificationResponse = BenchmarkQualificationPreviewResponse;
+
+export interface BenchmarkSuiteDriverStatus {
+  id: string;
+  state: string;
+  suite_id?: string;
+  mode?: string;
+  interval_ms?: number;
+  created_at?: string;
+  updated_at?: string;
+  active_session_id?: string;
+  last_run_index?: number;
+  last_session_id?: string;
+  error?: string;
+}
+
+export interface BenchmarkSuiteDriverSuiteStatus {
+  suite_id?: string;
+  mode?: string;
+  run_count?: number;
+  launched_run_count?: number;
+  pending_run_index?: number | null;
+}
+
+export interface BenchmarkSuiteDriverResponse {
+  status: string;
+  driver: BenchmarkSuiteDriverStatus;
+  suite: BenchmarkSuiteDriverSuiteStatus;
+  resumed_from?: string;
+}
+
+export interface BenchmarkSuiteDriversResponse {
+  status: string;
+  drivers: BenchmarkSuiteDriverResponse[];
+}
+
+// ── Performance program ──
+
+export type CompositionFamily = 'A' | 'B' | 'C' | 'D' | 'E' | 'F';
+
+export type CompositionTier = 'extended' | 'core' | 'vanilla_enhanced';
+
+export type ModCondition = 'always' | 'hardware' | 'version_range' | 'recommend';
+
+export interface PerformanceHardwareRequirement {
+  gpu_vendor: string;
+  gpu_arch_min: number;
+  min_ram_mb: number;
+  min_cores: number;
+}
+
+export interface ManagedPerformanceMod {
+  project_id: string;
+  slug: string;
+  name: string;
+  condition: ModCondition;
+  version_range?: string;
+  hardware_req?: PerformanceHardwareRequirement | null;
+  mutual_exclusions?: string[];
+}
+
+export interface PerformancePlanResponse {
+  active: boolean;
+  composition_id: string;
+  family: CompositionFamily;
+  loader: string;
+  mode: PerformanceMode;
+  tier: CompositionTier;
+  mods: ManagedPerformanceMod[];
+  jvm_preset?: string;
+  fallback_chain?: string[];
+  warnings?: string[];
+  fallback_reason?: string;
+}
+
+export type PerformanceHealthStatus =
+  | 'healthy'
+  | 'degraded'
+  | 'fallback'
+  | 'disabled'
+  | 'invalid';
+
+export type PerformanceRuleSource = 'built_in' | 'remote';
+
+export type PerformanceRuleChannel = 'bundled' | 'local' | 'remote';
+
+export type PerformanceRulesValidation = 'valid' | 'invalid';
+
+export type PerformanceRulesCacheState = 'recorded' | 'invalid' | 'unavailable';
+
+export interface PerformanceRulesCacheStatus {
+  recorded: boolean;
+  state: PerformanceRulesCacheState;
+  updated_at: string | null;
+  loaded_at: string | null;
+  warning?: string | null;
+}
+
+export type PerformanceOwnershipClass = 'composition_managed' | 'user_managed';
+
+export type PerformanceManagedArtifactProvider = 'modrinth';
+
+export type EmergencyDisableTarget = 'composition' | 'artifact';
+
+export interface PerformanceEmergencyDisable {
+  id: string;
+  target: EmergencyDisableTarget;
+  target_id: string;
+  reason: string;
+  families: CompositionFamily[];
+  loaders: string[];
+  tiers: CompositionTier[];
+}
+
+export interface PerformanceFamilyCoverage {
+  family: CompositionFamily;
+  composition_count: number;
+  loaders: string[];
+  tiers: CompositionTier[];
+  managed_mod_count: number;
+  warnings: string[];
+}
+
+export interface PerformanceRulesStatus {
+  rule_source: PerformanceRuleSource;
+  rule_channel: PerformanceRuleChannel;
+  rules_cache: PerformanceRulesCacheStatus;
+  schema_version: number;
+  generated_at: string;
+  composition_count: number;
+  family_coverage: PerformanceFamilyCoverage[];
+  remote_refresh: boolean;
+  last_refresh_at: string | null;
+  validation: PerformanceRulesValidation;
+  health_states: PerformanceHealthStatus[];
+  ownership_classes: PerformanceOwnershipClass[];
+  emergency_disable_count: number;
+  emergency_disables: PerformanceEmergencyDisable[];
+  warnings: string[];
+}
+
+export interface PerformanceHealthResponse {
+  active: boolean;
+  health: PerformanceHealthStatus;
+  composition_id: string;
+  tier: CompositionTier | '';
+  installed_count: number;
+  managed_artifacts: PerformanceManagedArtifactSummary[];
+  warnings: string[];
+}
+
+export type PerformanceInstallStatus = 'queued' | 'complete' | 'removed' | 'rolled_back';
+
+export interface PerformanceManagedArtifactSummary {
+  project_id: string;
+  version_id: string;
+  filename: string;
+  ownership_class: PerformanceOwnershipClass;
+  source_provider: PerformanceManagedArtifactProvider;
+  sha512_present: boolean;
+  sha512_verified: boolean;
+}
+
+export interface PerformanceInstallResponse {
+  active: boolean;
+  status: PerformanceInstallStatus;
+  install_id?: string;
+  health: PerformanceHealthStatus;
+  composition_id: string;
+  tier: CompositionTier | '';
+  installed_count: number;
+  managed_artifacts: PerformanceManagedArtifactSummary[];
+  warnings: string[];
+}
+
+export interface PerformanceOperationPayload {
+  version_id: string;
+  instance_performance_mode: string;
+  game_version?: string;
+  loader?: string;
+  mode?: string;
+  rollback_id?: string;
+}
+
+export type PerformanceOperationAction = 'install' | 'remove' | 'rollback';
+
+export type PerformanceOperationState =
+  | 'queued'
+  | 'planning'
+  | 'applying'
+  | 'removing'
+  | 'rolling_back'
+  | 'complete'
+  | 'failed'
+  | 'interrupted'
+  | string;
+
+export interface PerformanceOperationStatus {
+  id: string;
+  instance_id: string;
+  action: PerformanceOperationAction | string;
+  payload: PerformanceOperationPayload;
+  state: PerformanceOperationState;
+  error?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PerformanceInstanceOperationResponse {
+  operation: PerformanceOperationStatus | null;
 }
 
 // ── Version info (detail panel) ──
@@ -384,22 +868,32 @@ export interface ShortcutBinding {
   desc: string;
 }
 
+export interface OverlayPosition {
+  x: number;
+  y: number;
+  scaleX?: number;
+  scaleY?: number;
+}
+
 export interface LocalPrefs {
   theme: string;
   customHue: number;
   customVibrancy: number;
   lightness: number;
-  sidebarCompact: boolean;
   logHeight: number;
   collapsedGroups: Record<string, boolean>;
   sidebarFilter: string;
   sounds: boolean;
+  hideSkinNametag: boolean;
+  selectedSkin: string;
+  selectedSkinsByAccount: Record<string, string>;
   shortcuts: Record<string, ShortcutBinding>;
+  overlayPositions: Record<string, OverlayPosition>;
   lastUpdateCheckAt: string;
   dismissedUpdateVersion: string;
 }
 
-export type ToastKind = 'success' | 'error';
+export type ToastKind = 'success' | 'error' | 'info';
 
 export interface ToastItem {
   id: number;
@@ -463,7 +957,7 @@ export interface LoaderComponentsResponse {
   components: LoaderComponentRecord[];
 }
 
-export type UpdateKind = 'none' | 'release-page' | 'appimage';
+export type UpdateKind = 'none' | 'release-page' | 'release-asset';
 
 export interface UpdateInfo {
   current_version: string;
@@ -474,6 +968,7 @@ export interface UpdateInfo {
   kind: UpdateKind;
   notes_url: string;
   action_url: string;
+  checksum_url?: string | null;
   action_label: string;
   checked_at: string;
 }

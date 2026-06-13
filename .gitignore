@@ -6,14 +6,20 @@
 dist/
 node_modules
 
+# Local environment
+.env
+.env.local
+
 # Frontend build artifacts
 frontend/static/app.js
 frontend/static/app.css
+frontend/static/chunks/
 frontend/package.json.md5
 target/
 
 # Local-only
 plans/
+tmp/
 assets/*.mp3
 assets/*.wav
 CHANGELOG-next.md

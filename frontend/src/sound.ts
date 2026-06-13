@@ -265,7 +265,7 @@ export function inferButtonSound(btn: HTMLElement): SoundKind | null {
 
   if (btn.classList.contains('cp-ibtn')) return 'click';
   if (btn.classList.contains('cp-quick-action')) return 'click';
-  if (btn.classList.contains('cp-status-pill--running')) return 'soft';
+  if (btn.classList.contains('cp-status-pill')) return 'soft';
   if (btn.classList.contains('cp-userm-row')) return 'soft';
   if (btn.classList.contains('cp-music-btn')) return 'soft';
   if (btn.classList.contains('cp-swatch')) return 'soft';
