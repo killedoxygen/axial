@@ -12,6 +12,7 @@ import type {
 } from './types';
 import { formatInstallItemLabel } from './install-labels';
 import { launchStageView, launchStageViewFrom, type LaunchStage } from './launch-stages';
+import type { InstallStepProgress } from './store';
 
 // ── Selection ──
 
@@ -119,7 +120,13 @@ function cleanRemainingSeconds(remainingSeconds: number | undefined): number | u
     : undefined;
 }
 
-export function updateInstallProgress(pct: number, label: string, phase?: string, remainingSeconds?: number): void {
+export function updateInstallProgress(
+  pct: number,
+  label: string,
+  phase?: string,
+  remainingSeconds?: number,
+  activeStep?: InstallStepProgress,
+): void {
   const current = installState.value;
   if (current.status !== 'active') return;
   const nextPct = Number.isFinite(pct) ? Math.max(0, Math.min(100, pct)) : current.pct;
@@ -131,6 +138,7 @@ export function updateInstallProgress(pct: number, label: string, phase?: string
     pct: Math.max(current.pct, nextPct),
     label: regressed ? current.label : label,
     phase: regressed ? current.phase : phase || current.phase,
+    activeStep: regressed ? current.activeStep : activeStep,
     remainingSeconds: regressed ? current.remainingSeconds : nextRemainingSeconds,
     remainingSecondsUpdatedAt: regressed ? current.remainingSecondsUpdatedAt : remainingSecondsUpdatedAt,
   };

@@ -1,10 +1,10 @@
-use crate::java::ensure_java_runtime;
 use crate::launch::{
     AssetIndex as VersionAssetIndex, JavaVersion, Library, VersionJson, maven_to_path,
 };
 use crate::manifest::{ManifestEntry, fetch_version_manifest_cached};
 use crate::paths::{assets_dir, libraries_dir, versions_dir};
 use crate::rules::{current_os_arch, default_environment, evaluate_rules};
+use crate::runtime::{RuntimeEnsureEvent, ensure_runtime_with_events};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest as _, Sha1};
@@ -78,6 +78,11 @@ struct VersionJsonDownload {
 
 struct AssetDownloadPipeline {
     task: tokio::task::JoinHandle<Result<(), DownloadError>>,
+    progress_rx: mpsc::UnboundedReceiver<DownloadProgress>,
+}
+
+struct RuntimeEnsurePipeline {
+    task: tokio::task::JoinHandle<Result<JavaVersion, String>>,
     progress_rx: mpsc::UnboundedReceiver<DownloadProgress>,
 }
 
@@ -261,11 +266,11 @@ impl Downloader {
 
         let version =
             serde_json::from_str::<VersionJson>(&async_fs::read_to_string(&json_path).await?)?;
-        let runtime_task = if version.java_version.major_version > 0 {
+        let mut runtime_pipeline = if version.java_version.major_version > 0 {
             send(progress(
                 "java_runtime",
                 0,
-                1,
+                0,
                 Some(format!(
                     "Preparing {} (Java {})",
                     if version.java_version.component.trim().is_empty() {
@@ -279,12 +284,7 @@ impl Downloader {
 
             let mc_dir = self.mc_dir.clone();
             let java_version = version.java_version.clone();
-            Some(tokio::spawn(async move {
-                ensure_java_runtime(&mc_dir, &java_version, "")
-                    .await
-                    .map_err(|error| error.to_string())?;
-                Ok::<_, String>(java_version)
-            }))
+            Some(spawn_runtime_ensure_pipeline(mc_dir, java_version))
         } else {
             None
         };
@@ -340,47 +340,36 @@ impl Downloader {
                     }))
                     .buffer_unordered(library_download_concurrency());
                 let mut asset_progress_open = asset_pipeline.is_some();
+                let mut runtime_progress_open = runtime_pipeline.is_some();
                 loop {
-                    if asset_progress_open {
-                        let Some(asset_pipeline) = asset_pipeline.as_mut() else {
-                            asset_progress_open = false;
-                            continue;
-                        };
-                        let asset_progress_rx = &mut asset_pipeline.progress_rx;
-                        tokio::select! {
-                            progress = asset_progress_rx.recv() => {
-                                if let Some(progress) = progress {
-                                    send(progress);
-                                } else {
-                                    asset_progress_open = false;
-                                }
-                            }
-                            result = library_downloads.next() => {
-                                let Some(result) = result else {
-                                    break;
-                                };
-                                let name = result?;
-                                completed_library_jobs += 1;
-                                send(progress(
-                                    "libraries",
-                                    completed_library_jobs,
-                                    total_library_jobs,
-                                    Some(name),
-                                ));
+                    tokio::select! {
+                        progress = recv_asset_progress(&mut asset_pipeline), if asset_progress_open => {
+                            if let Some(progress) = progress {
+                                send(progress);
+                            } else {
+                                asset_progress_open = false;
                             }
                         }
-                    } else {
-                        let Some(result) = library_downloads.next().await else {
-                            break;
-                        };
-                        let name = result?;
-                        completed_library_jobs += 1;
-                        send(progress(
-                            "libraries",
-                            completed_library_jobs,
-                            total_library_jobs,
-                            Some(name),
-                        ));
+                        progress = recv_runtime_progress(&mut runtime_pipeline), if runtime_progress_open => {
+                            if let Some(progress) = progress {
+                                send(progress);
+                            } else {
+                                runtime_progress_open = false;
+                            }
+                        }
+                        result = library_downloads.next() => {
+                            let Some(result) = result else {
+                                break;
+                            };
+                            let name = result?;
+                            completed_library_jobs += 1;
+                            send(progress(
+                                "libraries",
+                                completed_library_jobs,
+                                total_library_jobs,
+                                Some(name),
+                            ));
+                        }
                     }
                 }
                 Ok::<(), DownloadError>(())
@@ -425,7 +414,7 @@ impl Downloader {
         .await;
 
         if let Some(java_version) =
-            finish_runtime_task_after_artifacts(runtime_task, artifact_result).await?
+            finish_runtime_pipeline_after_artifacts(runtime_pipeline, artifact_result, send).await?
         {
             send(progress(
                 "java_runtime",
@@ -875,11 +864,105 @@ async fn await_client_jar_download(
     Ok(())
 }
 
-async fn finish_runtime_task_after_artifacts(
-    task: Option<tokio::task::JoinHandle<Result<JavaVersion, String>>>,
+fn spawn_runtime_ensure_pipeline(
+    mc_dir: PathBuf,
+    java_version: JavaVersion,
+) -> RuntimeEnsurePipeline {
+    let (progress_tx, progress_rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(async move {
+        let event_java_version = java_version.clone();
+        let progress_tx = progress_tx.clone();
+        ensure_runtime_with_events(&mc_dir, &java_version, "", false, |event| {
+            let _ = progress_tx.send(runtime_ensure_progress(&event_java_version, event));
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+        Ok::<_, String>(java_version)
+    });
+
+    RuntimeEnsurePipeline { task, progress_rx }
+}
+
+fn runtime_ensure_progress(
+    java_version: &JavaVersion,
+    event: RuntimeEnsureEvent,
+) -> DownloadProgress {
+    match event {
+        RuntimeEnsureEvent::DownloadingManagedRuntime { component } => progress(
+            "java_runtime",
+            0,
+            0,
+            Some(format!(
+                "Downloading {} (Java {})",
+                runtime_component_label(&component),
+                java_version.major_version
+            )),
+        ),
+        RuntimeEnsureEvent::InstallingManagedRuntimeFiles {
+            component,
+            current,
+            total,
+            file,
+        } => {
+            let detail = match file {
+                Some(file) if current > 0 && total > 0 => {
+                    format!("Runtime files ({current}/{total}): {file}")
+                }
+                Some(file) => file,
+                None if total > 0 => format!("Runtime files ({current}/{total})"),
+                None => format!(
+                    "Installing {} (Java {})",
+                    runtime_component_label(&component),
+                    java_version.major_version
+                ),
+            };
+            progress(
+                "java_runtime",
+                bounded_progress_count(current),
+                bounded_progress_count(total),
+                Some(detail),
+            )
+        }
+    }
+}
+
+fn runtime_component_label(component: &str) -> String {
+    if component.trim().is_empty() {
+        "managed runtime".to_string()
+    } else {
+        component.to_string()
+    }
+}
+
+fn bounded_progress_count(value: usize) -> i32 {
+    i32::try_from(value).unwrap_or(i32::MAX)
+}
+
+async fn recv_asset_progress(
+    pipeline: &mut Option<AssetDownloadPipeline>,
+) -> Option<DownloadProgress> {
+    pipeline.as_mut()?.progress_rx.recv().await
+}
+
+async fn recv_runtime_progress(
+    pipeline: &mut Option<RuntimeEnsurePipeline>,
+) -> Option<DownloadProgress> {
+    pipeline.as_mut()?.progress_rx.recv().await
+}
+
+async fn finish_runtime_pipeline_after_artifacts<F>(
+    pipeline: Option<RuntimeEnsurePipeline>,
     artifact_result: Result<(), DownloadError>,
-) -> Result<Option<JavaVersion>, DownloadError> {
-    let Some(task) = task else {
+    send: &mut F,
+) -> Result<Option<JavaVersion>, DownloadError>
+where
+    F: FnMut(DownloadProgress),
+{
+    let Some(RuntimeEnsurePipeline {
+        mut task,
+        mut progress_rx,
+    }) = pipeline
+    else {
         return artifact_result.map(|_| None);
     };
 
@@ -889,11 +972,28 @@ async fn finish_runtime_task_after_artifacts(
             Err(error)
         }
         Ok(()) => {
-            let runtime_result = match task.await {
-                Ok(result) => result.map_err(DownloadError::PrepareRuntime),
-                Err(error) => Err(DownloadError::PrepareRuntime(error.to_string())),
-            };
-            runtime_result.map(Some)
+            let mut progress_open = true;
+            loop {
+                tokio::select! {
+                    progress = progress_rx.recv(), if progress_open => {
+                        if let Some(progress) = progress {
+                            send(progress);
+                        } else {
+                            progress_open = false;
+                        }
+                    }
+                    result = &mut task => {
+                        while let Ok(progress) = progress_rx.try_recv() {
+                            send(progress);
+                        }
+                        let runtime_result = match result {
+                            Ok(result) => result.map_err(DownloadError::PrepareRuntime),
+                            Err(error) => Err(DownloadError::PrepareRuntime(error.to_string())),
+                        };
+                        return runtime_result.map(Some);
+                    }
+                }
+            }
         }
     }
 }
@@ -1468,7 +1568,7 @@ mod tests {
     };
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::sync::oneshot;
+    use tokio::sync::{mpsc, oneshot};
     use tokio::time::{Duration, timeout};
 
     #[tokio::test]
@@ -1551,7 +1651,11 @@ mod tests {
 
         let result = timeout(
             Duration::from_millis(100),
-            finish_runtime_task_after_artifacts(Some(task), Err(artifact_error)),
+            finish_runtime_pipeline_after_artifacts(
+                Some(runtime_pipeline(task)),
+                Err(artifact_error),
+                &mut |_| {},
+            ),
         )
         .await
         .expect("artifact error should return without waiting for runtime task");
@@ -1573,7 +1677,12 @@ mod tests {
     async fn runtime_error_is_reported_when_artifact_install_succeeds() {
         let task = tokio::spawn(async { Err::<JavaVersion, String>("runtime failed".to_string()) });
 
-        let result = finish_runtime_task_after_artifacts(Some(task), Ok(())).await;
+        let result = finish_runtime_pipeline_after_artifacts(
+            Some(runtime_pipeline(task)),
+            Ok(()),
+            &mut |_| {},
+        )
+        .await;
 
         assert!(matches!(
             result,
@@ -1586,12 +1695,24 @@ mod tests {
         let task = tokio::spawn(async { Err::<JavaVersion, String>("runtime failed".to_string()) });
         let artifact_error = DownloadError::ResolveManifest("artifact failed".to_string());
 
-        let result = finish_runtime_task_after_artifacts(Some(task), Err(artifact_error)).await;
+        let result = finish_runtime_pipeline_after_artifacts(
+            Some(runtime_pipeline(task)),
+            Err(artifact_error),
+            &mut |_| {},
+        )
+        .await;
 
         assert!(matches!(
             result,
             Err(DownloadError::ResolveManifest(message)) if message == "artifact failed"
         ));
+    }
+
+    fn runtime_pipeline(
+        task: tokio::task::JoinHandle<Result<JavaVersion, String>>,
+    ) -> RuntimeEnsurePipeline {
+        let (_progress_tx, progress_rx) = mpsc::unbounded_channel();
+        RuntimeEnsurePipeline { task, progress_rx }
     }
 
     #[test]

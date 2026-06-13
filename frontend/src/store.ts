@@ -36,6 +36,14 @@ export const selectedVersion = computed<Version | null>(() => {
 
 // ── Install state machine ──
 
+export type InstallStepProgress = {
+  phase: string;
+  label: string;
+  pct: number;
+  current?: number;
+  total?: number;
+};
+
 export type InstallState =
   | { status: 'idle' }
   | {
@@ -46,6 +54,7 @@ export type InstallState =
     pct: number;
     label: string;
     phase?: string;
+    activeStep?: InstallStepProgress;
     remainingSeconds?: number;
     remainingSecondsUpdatedAt?: number;
     startedAt: number;

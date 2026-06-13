@@ -134,7 +134,15 @@ pub struct RuntimeEnsureResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeEnsureEvent {
-    DownloadingManagedRuntime { component: String },
+    DownloadingManagedRuntime {
+        component: String,
+    },
+    InstallingManagedRuntimeFiles {
+        component: String,
+        current: usize,
+        total: usize,
+        file: Option<String>,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -474,7 +482,7 @@ where
     observer(RuntimeEnsureEvent::DownloadingManagedRuntime {
         component: preferred.as_str().to_string(),
     });
-    install_managed_runtime(preferred, &install_root).await?;
+    install_managed_runtime(preferred, &install_root, observer).await?;
     let runtime = resolve_component_runtime(
         library_dir,
         preferred,
@@ -602,6 +610,7 @@ fn detect_runtime_state(runtime_root: &Path, require_ready_marker: bool) -> Runt
 async fn install_managed_runtime(
     component: &RuntimeId,
     dest_dir: &Path,
+    observer: &mut impl FnMut(RuntimeEnsureEvent),
 ) -> Result<(), JavaRuntimeLookupError> {
     let os_arch = runtime_os_arch();
     let parent_dir = dest_dir.parent().ok_or_else(|| {
@@ -649,7 +658,13 @@ async fn install_managed_runtime(
 
         let component_manifest = fetch_runtime_json::<ComponentManifest>(&manifest_url).await?;
 
-        install_runtime_manifest_files(&temp_dir, component_manifest.files).await?;
+        install_runtime_manifest_files(
+            component.as_str(),
+            &temp_dir,
+            component_manifest.files,
+            observer,
+        )
+        .await?;
 
         let java_exe = java_executable(&temp_dir);
         if !runtime_executable_ready(&java_exe) {
@@ -711,8 +726,10 @@ async fn remove_runtime_install_path_async(path: &Path) -> std::io::Result<()> {
 }
 
 async fn install_runtime_manifest_files(
+    component: &str,
     temp_dir: &Path,
     files: HashMap<String, ComponentManifestFile>,
+    observer: &mut impl FnMut(RuntimeEnsureEvent),
 ) -> Result<(), JavaRuntimeLookupError> {
     let plan = plan_runtime_manifest_files(files);
     let download_client = runtime_download_client();
@@ -720,6 +737,16 @@ async fn install_runtime_manifest_files(
     for (relative_path, file) in plan.directory_entries.into_iter().chain(plan.other_entries) {
         install_runtime_manifest_file(download_client.clone(), temp_dir, &relative_path, file)
             .await?;
+    }
+
+    let total_files = plan.file_entries.len();
+    if total_files > 0 {
+        observer(RuntimeEnsureEvent::InstallingManagedRuntimeFiles {
+            component: component.to_string(),
+            current: 0,
+            total: total_files,
+            file: Some("Downloading runtime files".to_string()),
+        });
     }
 
     let mut entries = plan.file_entries.into_iter();
@@ -732,9 +759,18 @@ async fn install_runtime_manifest_files(
     }
 
     let mut first_error = None;
+    let mut completed_files = 0;
     while let Some(result) = tasks.join_next().await {
         match result {
-            Ok(Ok(())) => {}
+            Ok(Ok(relative_path)) => {
+                completed_files += 1;
+                observer(RuntimeEnsureEvent::InstallingManagedRuntimeFiles {
+                    component: component.to_string(),
+                    current: completed_files,
+                    total: total_files,
+                    file: Some(bounded_manifest_file_label(&relative_path)),
+                });
+            }
             Ok(Err(error)) => {
                 if first_error.is_none() {
                     first_error = Some(error);
@@ -767,7 +803,7 @@ async fn install_runtime_manifest_files(
 }
 
 fn spawn_runtime_manifest_file_install(
-    tasks: &mut JoinSet<Result<(), JavaRuntimeLookupError>>,
+    tasks: &mut JoinSet<Result<String, JavaRuntimeLookupError>>,
     download_client: reqwest::Client,
     temp_dir: &Path,
     entry: (String, ComponentManifestFile),
@@ -775,13 +811,15 @@ fn spawn_runtime_manifest_file_install(
     let temp_dir = temp_dir.to_path_buf();
     let (relative_path, file) = entry;
     tasks.spawn(async move {
+        let completed_path = relative_path.clone();
         Box::pin(install_runtime_manifest_file(
             download_client,
             &temp_dir,
             &relative_path,
             file,
         ))
-        .await
+        .await?;
+        Ok(completed_path)
     });
 }
 
@@ -1406,11 +1444,11 @@ mod tests {
     use super::{
         ComponentManifestDownload, ComponentManifestDownloads, ComponentManifestFile,
         JavaRuntimeLookupError, RuntimeDownloadActual, RuntimeDownloadEvidence,
-        RuntimeDownloadIntegrityError, RuntimeInstallState, component_manifest_destination,
-        detect_distribution, detect_runtime_state, ensure_java_runtime, fetch_runtime_file,
-        fetch_runtime_json, install_runtime_manifest_file, java_executable,
-        plan_runtime_manifest_files, remove_runtime_install_path,
-        remove_runtime_install_path_async, runtime_download_client,
+        RuntimeDownloadIntegrityError, RuntimeEnsureEvent, RuntimeInstallState,
+        component_manifest_destination, detect_distribution, detect_runtime_state,
+        ensure_java_runtime, fetch_runtime_file, fetch_runtime_json, install_runtime_manifest_file,
+        install_runtime_manifest_files, java_executable, plan_runtime_manifest_files,
+        remove_runtime_install_path, remove_runtime_install_path_async, runtime_download_client,
         runtime_file_download_concurrency_for, runtime_install_lock_from_map,
         verify_runtime_download,
     };
@@ -1643,6 +1681,63 @@ mod tests {
             vec!["bin/java", "lib/server/libjvm.so"]
         );
         assert_eq!(planned_paths(&plan.other_entries), vec!["ignored-entry"]);
+    }
+
+    #[tokio::test]
+    async fn runtime_manifest_install_reports_file_progress() {
+        let root = unique_temp_root("croopor-runtime-progress-test");
+        let mut files = HashMap::new();
+        files.insert("bin".to_string(), manifest_file("directory"));
+        files.insert("bin/java".to_string(), manifest_file("file"));
+        files.insert("lib/jvm.cfg".to_string(), manifest_file("file"));
+        let mut events = Vec::new();
+
+        install_runtime_manifest_files("java-runtime-delta", &root, files, &mut |event| {
+            events.push(event);
+        })
+        .await
+        .expect("runtime manifest files");
+
+        assert_eq!(
+            events.first(),
+            Some(&RuntimeEnsureEvent::InstallingManagedRuntimeFiles {
+                component: "java-runtime-delta".to_string(),
+                current: 0,
+                total: 2,
+                file: Some("Downloading runtime files".to_string()),
+            })
+        );
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    RuntimeEnsureEvent::InstallingManagedRuntimeFiles {
+                        current, total, ..
+                    } => {
+                        Some((*current, *total))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![(0, 2), (1, 2), (2, 2)]
+        );
+        let completed_files = events
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEnsureEvent::InstallingManagedRuntimeFiles { file, current, .. }
+                    if *current > 0 =>
+                {
+                    file.as_deref()
+                }
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            completed_files,
+            std::collections::HashSet::from(["bin/java", "lib/jvm.cfg"])
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]

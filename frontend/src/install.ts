@@ -17,6 +17,7 @@ import {
 import { formatInstallItemLabel } from './install-labels';
 import { minecraftVersionLabel } from './version-display';
 import type { InstallItem, LoaderBuildRecord, LoaderComponentId } from './types';
+import type { InstallStepProgress } from './store';
 
 type InstallProgressEvent = {
   phase?: string;
@@ -39,6 +40,12 @@ const INSTALL_ETA_PHASES = new Set([
   'libraries',
   'assets',
   'loader_libraries',
+  'loader_processors',
+  'processors',
+]);
+
+const ACTIVE_STEP_PHASES = new Set([
+  'java_runtime',
   'loader_processors',
   'processors',
 ]);
@@ -340,6 +347,35 @@ function progressFraction(data: InstallProgressEvent): number {
   return data.current / data.total;
 }
 
+function currentInstallPct(): number {
+  return installState.value.status === 'active' ? installState.value.pct : 0;
+}
+
+function isJavaRuntimeReadyEvent(data: InstallProgressEvent): boolean {
+  return data.phase === 'java_runtime'
+    && data.current === 1
+    && data.total === 1
+    && typeof data.file === 'string'
+    && data.file.trim().toLowerCase().startsWith('ready ');
+}
+
+function activeStepProgress(data: InstallProgressEvent, label: string): InstallStepProgress | undefined {
+  const phase = data.phase || '';
+  if (!ACTIVE_STEP_PHASES.has(phase)) return undefined;
+  if (typeof data.current !== 'number' || typeof data.total !== 'number' || data.total <= 0) {
+    return undefined;
+  }
+
+  const fraction = Math.max(0, Math.min(1, data.current / data.total));
+  return {
+    phase,
+    label,
+    pct: Math.round(fraction * 100),
+    current: data.current,
+    total: data.total,
+  };
+}
+
 function phaseLabel(data: InstallProgressEvent, loaderInstall: boolean): string {
   switch (data.phase) {
     case 'loader_meta':
@@ -409,7 +445,7 @@ async function connectVanillaEvents(installId: string, item: InstallItem): Promi
     } else if (data.phase === 'log_config') {
       pct = 94;
     } else if (data.phase === 'java_runtime') {
-      pct = 95;
+      pct = isJavaRuntimeReadyEvent(data) ? 95 : currentInstallPct();
     } else if (data.phase === 'done') {
       pct = 100;
     } else if (data.phase === 'error') {
@@ -423,7 +459,13 @@ async function connectVanillaEvents(installId: string, item: InstallItem): Promi
     }
 
     const estimate = estimator.estimate(label, data, pct, startedAt);
-    updateInstallProgress(pct, estimate.label, data.phase, estimate.remainingSeconds);
+    updateInstallProgress(
+      pct,
+      estimate.label,
+      data.phase,
+      estimate.remainingSeconds,
+      activeStepProgress(data, estimate.label),
+    );
     if (data.done) await onInstallDone(item);
   };
 
@@ -520,7 +562,7 @@ async function connectLoaderEvents(installId: string, item: InstallItem): Promis
     } else if (data.phase === 'log_config') {
       pct = 94;
     } else if (data.phase === 'java_runtime') {
-      pct = 95;
+      pct = isJavaRuntimeReadyEvent(data) ? 95 : currentInstallPct();
     } else if (data.phase === 'done') {
       pct = 100;
     } else if (data.phase === 'error') {
@@ -531,7 +573,13 @@ async function connectLoaderEvents(installId: string, item: InstallItem): Promis
     }
 
     const estimate = estimator.estimate(label, data, pct, startedAt);
-    updateInstallProgress(pct, estimate.label, data.phase, estimate.remainingSeconds);
+    updateInstallProgress(
+      pct,
+      estimate.label,
+      data.phase,
+      estimate.remainingSeconds,
+      activeStepProgress(data, estimate.label),
+    );
     if (data.done) void onInstallDone(item);
   };
 

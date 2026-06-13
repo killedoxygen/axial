@@ -24,6 +24,23 @@ function formatElapsedTime(startedAt: number, now: number): string {
   return `${hours}h ${remainingMinutes.toString().padStart(2, '0')}m elapsed`;
 }
 
+function activeStepTitle(phase: string): string {
+  switch (phase) {
+    case 'java_runtime':
+      return 'Java runtime';
+    case 'loader_processors':
+    case 'processors':
+      return 'Processors';
+    default:
+      return phase.replace(/_/g, ' ');
+  }
+}
+
+function activeStepRatio(current: number | undefined, total: number | undefined): string {
+  if (typeof current !== 'number' || typeof total !== 'number' || total <= 0) return '';
+  return `${current}/${total}`;
+}
+
 export function DownloadsView(): JSX.Element {
   const theme = useTheme();
   const state = installState.value;
@@ -49,6 +66,10 @@ export function DownloadsView(): JSX.Element {
   const queuedItemLabel = queue.length === 1 ? '1 item queued' : `${queue.length} items queued`;
   const phaseLabel = hasActive && state.phase ? state.phase.replace(/_/g, ' ') : '';
   const activePct = hasActive ? Math.round(Math.max(0, Math.min(100, state.pct))) : 0;
+  const activeStep = hasActive ? state.activeStep : undefined;
+  const stepTitle = activeStep ? activeStepTitle(activeStep.phase) : '';
+  const stepPct = activeStep ? Math.round(Math.max(0, Math.min(100, activeStep.pct))) : 0;
+  const stepRatio = activeStep ? activeStepRatio(activeStep.current, activeStep.total) : '';
   const activeRemainingSeconds = hasActive
     ? countDownRemainingSeconds(state.remainingSeconds, state.remainingSecondsUpdatedAt, elapsedNow)
     : undefined;
@@ -116,6 +137,20 @@ export function DownloadsView(): JSX.Element {
           <div class="cp-download-active-meter">
             <Meter value={state.pct} ariaLabel={`Install progress for ${activeTitle}`} />
           </div>
+          {activeStep && (
+            <div class="cp-download-step">
+              <div class="cp-download-step-head">
+                <span>{stepTitle}</span>
+                <span>{stepRatio ? `${stepRatio} · ` : ''}{stepPct}%</span>
+              </div>
+              <div class="cp-download-active-meter cp-download-active-meter--step">
+                <Meter value={stepPct} ariaLabel={`${stepTitle} progress for ${activeTitle}`} />
+              </div>
+              <div class="cp-download-step-label">
+                {activeStep.label}
+              </div>
+            </div>
+          )}
           <div style={{
             display: 'flex',
             justifyContent: 'space-between',
@@ -127,7 +162,8 @@ export function DownloadsView(): JSX.Element {
           }}>
             <span>{formatElapsedTime(state.startedAt, elapsedNow)}</span>
             <span style={{ fontVariantNumeric: 'tabular-nums' }}>
-              {activeEta ? `${activeEta} · ` : ''}{activePct}%
+              {activeEta ? `${activeEta} · ` : ''}
+              {activeStep ? `${stepTitle} ${stepPct}% · overall ${activePct}%` : `${activePct}%`}
             </span>
           </div>
           {nextQueuedLabel && (

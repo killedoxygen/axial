@@ -252,7 +252,8 @@ where
 
 fn launch_preparation_event_for_runtime_event(event: RuntimeEnsureEvent) -> LaunchPreparationEvent {
     match event {
-        RuntimeEnsureEvent::DownloadingManagedRuntime { .. } => {
+        RuntimeEnsureEvent::DownloadingManagedRuntime { .. }
+        | RuntimeEnsureEvent::InstallingManagedRuntimeFiles { .. } => {
             LaunchPreparationEvent::DownloadingRuntime
         }
     }
@@ -774,6 +775,17 @@ mod tests {
             launch_preparation_event_for_runtime_event(
                 RuntimeEnsureEvent::DownloadingManagedRuntime {
                     component: "java-runtime-delta".to_string(),
+                },
+            ),
+            LaunchPreparationEvent::DownloadingRuntime
+        );
+        assert_eq!(
+            launch_preparation_event_for_runtime_event(
+                RuntimeEnsureEvent::InstallingManagedRuntimeFiles {
+                    component: "java-runtime-delta".to_string(),
+                    current: 1,
+                    total: 2,
+                    file: Some("bin/java".to_string()),
                 },
             ),
             LaunchPreparationEvent::DownloadingRuntime
