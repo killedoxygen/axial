@@ -134,7 +134,29 @@ export function pollErrorMessage(value: unknown): string {
 }
 
 export function loginErrorMessage(value: unknown): string {
-  return apiErrorMessage(value, 'Could not start Microsoft sign-in.');
+  const message = apiErrorMessage(value, 'Could not start Microsoft sign-in.');
+  const diagnostic = providerDiagnostic(value);
+  if (!diagnostic) return message;
+  return `${message.replace(/\.$/, '')} (${diagnostic}).`;
+}
+
+function providerDiagnostic(value: unknown): string | null {
+  if (!isRecord(value)) return null;
+  const parts: string[] = [];
+  if (typeof value.provider_error === 'string' && value.provider_error.trim()) {
+    parts.push(value.provider_error.trim());
+  }
+  if (typeof value.provider_error_code === 'string' && value.provider_error_code.trim()) {
+    parts.push(value.provider_error_code.trim());
+  }
+  if (
+    parts.length === 0 &&
+    typeof value.provider_status === 'number' &&
+    Number.isFinite(value.provider_status)
+  ) {
+    parts.push(`HTTP ${Math.round(value.provider_status)}`);
+  }
+  return parts.length > 0 ? parts.join(', ') : null;
 }
 
 export function logoutErrorMessage(value: unknown): string {

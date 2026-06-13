@@ -256,6 +256,41 @@ struct MsaTokenErrorResponse {
     error: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+struct MsaOAuthErrorResponse {
+    error: String,
+    error_description: Option<String>,
+    error_codes: Option<Vec<i64>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MsaProviderError {
+    status: StatusCode,
+    error: Option<String>,
+    aadsts_code: Option<String>,
+    error_codes: Vec<i64>,
+}
+
+impl MsaProviderError {
+    fn from_oauth_response(status: StatusCode, response: MsaOAuthErrorResponse) -> Self {
+        Self {
+            status,
+            error: bounded_provider_error(&response.error),
+            aadsts_code: response
+                .error_description
+                .as_deref()
+                .and_then(extract_aadsts_code),
+            error_codes: response
+                .error_codes
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|code| *code >= 0)
+                .take(4)
+                .collect(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AuthLoginConfig {
     client_id: Option<String>,
@@ -296,11 +331,12 @@ pub(crate) enum AuthRefreshFailureKind {
     StoreUnavailable,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum AuthLoginError {
     ClientBuild,
     Request,
     UpstreamStatus(StatusCode),
+    UpstreamRejected(MsaProviderError),
     Parse,
 }
 
@@ -595,7 +631,12 @@ async fn request_msa_device_code(client_id: &str) -> Result<MsaDeviceCodeRespons
 
     let status = response.status();
     if !status.is_success() {
-        return Err(AuthLoginError::UpstreamStatus(status));
+        return match bounded_msa_json_response::<MsaOAuthErrorResponse>(response).await {
+            Ok(error_response) => Err(AuthLoginError::UpstreamRejected(
+                MsaProviderError::from_oauth_response(status, error_response),
+            )),
+            Err(_) => Err(AuthLoginError::UpstreamStatus(status)),
+        };
     }
 
     bounded_msa_json_response(response).await
@@ -734,7 +775,7 @@ fn msa_device_code_client() -> Result<&'static Client, AuthLoginError> {
                 .map_err(|_| AuthLoginError::ClientBuild)
         })
         .as_ref()
-        .map_err(|error| *error)
+        .map_err(Clone::clone)
 }
 
 fn msa_token_poll_client() -> Result<&'static Client, AuthLoginError> {
@@ -746,7 +787,7 @@ fn msa_token_poll_client() -> Result<&'static Client, AuthLoginError> {
                 .map_err(|_| AuthLoginError::ClientBuild)
         })
         .as_ref()
-        .map_err(|error| *error)
+        .map_err(Clone::clone)
 }
 
 async fn auth_login_poll_success_response(
@@ -1250,35 +1291,114 @@ fn bounded_remaining_seconds(session: &AuthLoginSession) -> u64 {
 }
 
 fn auth_login_error_response(error: AuthLoginError) -> (StatusCode, Json<serde_json::Value>) {
-    let (status, message) = match error {
+    let (status, message, provider_error) = match &error {
         AuthLoginError::ClientBuild => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "Could not start Microsoft sign-in. Restart Croopor and try again.",
+            None,
         ),
         AuthLoginError::Request => (
             StatusCode::BAD_GATEWAY,
             "Could not reach Microsoft sign-in. Check your connection and try again.",
+            None,
         ),
         AuthLoginError::UpstreamStatus(status) => {
             if status.as_u16() >= 500 {
                 (
                     StatusCode::BAD_GATEWAY,
                     "Microsoft sign-in service is unavailable",
+                    None,
                 )
             } else {
                 (
                     StatusCode::BAD_GATEWAY,
                     "Microsoft sign-in request was rejected",
+                    None,
                 )
             }
         }
+        AuthLoginError::UpstreamRejected(error) => (
+            StatusCode::BAD_GATEWAY,
+            if error.status.as_u16() >= 500 {
+                "Microsoft sign-in service is unavailable"
+            } else {
+                "Microsoft sign-in request was rejected"
+            },
+            Some(error),
+        ),
         AuthLoginError::Parse => (
             StatusCode::BAD_GATEWAY,
             "Microsoft sign-in returned an unexpected response. Try again later.",
+            None,
         ),
     };
 
-    (status, Json(serde_json::json!({ "error": message })))
+    let mut body = serde_json::json!({ "error": message });
+    if let Some(error) = provider_error
+        && let Some(map) = body.as_object_mut()
+    {
+        map.insert(
+            "status".to_string(),
+            serde_json::Value::String("provider_rejected".to_string()),
+        );
+        map.insert(
+            "provider_status".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(error.status.as_u16())),
+        );
+        if let Some(provider_error) = &error.error {
+            map.insert(
+                "provider_error".to_string(),
+                serde_json::Value::String(provider_error.clone()),
+            );
+        }
+        if let Some(aadsts_code) = &error.aadsts_code {
+            map.insert(
+                "provider_error_code".to_string(),
+                serde_json::Value::String(aadsts_code.clone()),
+            );
+        }
+        if !error.error_codes.is_empty() {
+            map.insert(
+                "provider_error_codes".to_string(),
+                serde_json::Value::Array(
+                    error
+                        .error_codes
+                        .iter()
+                        .copied()
+                        .map(|code| serde_json::Value::Number(serde_json::Number::from(code)))
+                        .collect(),
+                ),
+            );
+        }
+    }
+
+    (status, Json(body))
+}
+
+fn bounded_provider_error(value: &str) -> Option<String> {
+    let mut normalized = String::new();
+    for ch in value.trim().chars() {
+        if normalized.len() >= 64 {
+            break;
+        }
+        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.') {
+            normalized.push(ch);
+        }
+    }
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn extract_aadsts_code(value: &str) -> Option<String> {
+    let start = value.find("AADSTS")?;
+    let digits: String = value[start + "AADSTS".len()..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .take(12)
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    Some(format!("AADSTS{digits}"))
 }
 
 fn auth_chain_error_response(error: AuthChainError) -> (StatusCode, Json<serde_json::Value>) {
@@ -1527,6 +1647,12 @@ impl From<AuthLoginError> for AuthRefreshFailure {
                 AuthRefreshFailureKind::MicrosoftUpstreamUnavailable
             }
             AuthLoginError::UpstreamStatus(_) => AuthRefreshFailureKind::MicrosoftUpstreamRejected,
+            AuthLoginError::UpstreamRejected(error) if error.status.as_u16() >= 500 => {
+                AuthRefreshFailureKind::MicrosoftUpstreamUnavailable
+            }
+            AuthLoginError::UpstreamRejected(_) => {
+                AuthRefreshFailureKind::MicrosoftUpstreamRejected
+            }
             AuthLoginError::Parse => AuthRefreshFailureKind::MicrosoftParse,
         };
         Self::new(kind)
@@ -1710,6 +1836,13 @@ mod tests {
     fn auth_login_error_response_preserves_upstream_status_copy() {
         let rejected =
             auth_login_error_response(AuthLoginError::UpstreamStatus(StatusCode::BAD_REQUEST));
+        let detailed_rejected =
+            auth_login_error_response(AuthLoginError::UpstreamRejected(MsaProviderError {
+                status: StatusCode::BAD_REQUEST,
+                error: Some("invalid_client".to_string()),
+                aadsts_code: Some("AADSTS700016".to_string()),
+                error_codes: vec![700016],
+            }));
         let unavailable = auth_login_error_response(AuthLoginError::UpstreamStatus(
             StatusCode::INTERNAL_SERVER_ERROR,
         ));
@@ -1720,12 +1853,48 @@ mod tests {
             serde_json::json!({ "error": "Microsoft sign-in request was rejected" })
         );
         assert_no_auth_login_error_diagnostic_fragments(&rejected.1.0);
+        assert_eq!(detailed_rejected.0, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            detailed_rejected.1.0,
+            serde_json::json!({
+                "error": "Microsoft sign-in request was rejected",
+                "status": "provider_rejected",
+                "provider_status": 400,
+                "provider_error": "invalid_client",
+                "provider_error_code": "AADSTS700016",
+                "provider_error_codes": [700016],
+            })
+        );
+        assert_no_auth_login_error_diagnostic_fragments(&detailed_rejected.1.0);
         assert_eq!(unavailable.0, StatusCode::BAD_GATEWAY);
         assert_eq!(
             unavailable.1.0,
             serde_json::json!({ "error": "Microsoft sign-in service is unavailable" })
         );
         assert_no_auth_login_error_diagnostic_fragments(&unavailable.1.0);
+    }
+
+    #[test]
+    fn msa_provider_error_extracts_only_bounded_public_diagnostics() {
+        let error = MsaProviderError::from_oauth_response(
+            StatusCode::BAD_REQUEST,
+            MsaOAuthErrorResponse {
+                error: " invalid client with spaces and #symbols ".to_string(),
+                error_description: Some(
+                    "AADSTS700016: Application with identifier 'public-client-id' was not found."
+                        .to_string(),
+                ),
+                error_codes: Some(vec![700016, -1, 123, 456, 789, 101112]),
+            },
+        );
+
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.error.as_deref(),
+            Some("invalidclientwithspacesandsymbols")
+        );
+        assert_eq!(error.aadsts_code.as_deref(), Some("AADSTS700016"));
+        assert_eq!(error.error_codes, vec![700016, 123, 456, 789]);
     }
 
     #[test]
