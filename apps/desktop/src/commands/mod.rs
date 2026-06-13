@@ -77,6 +77,7 @@ pub async fn app_restart(app: AppHandle, state: State<'_, AppState>) -> Result<(
     let active_installs = state.installs().active_install_count().await;
     let active_sessions = state.sessions().active_session_count().await;
     restart_readiness(active_installs, active_sessions)?;
+    flush_pending_saved_skin_applies("restart", state.inner()).await;
     app.request_restart();
     Ok(())
 }
@@ -130,17 +131,21 @@ pub async fn window_close(app: AppHandle, state: State<'_, AppState>) -> Result<
     let active_sessions = state.sessions().active_session_count().await;
     close_readiness(active_installs, active_sessions)?;
 
-    if let Err((status, _)) = flush_pending_saved_skin_applies_for_shutdown(state.inner()).await {
-        tracing::warn!(
-            "failed to flush pending skin changes before desktop close: HTTP {}",
-            status
-        );
-    }
+    flush_pending_saved_skin_applies("desktop close", state.inner()).await;
 
     let window = app
         .get_webview_window("main")
         .ok_or_else(|| "main window missing".to_string())?;
     window.close().map_err(|e| e.to_string())
+}
+
+async fn flush_pending_saved_skin_applies(action: &str, state: &AppState) {
+    if let Err((status, _)) = flush_pending_saved_skin_applies_for_shutdown(state).await {
+        tracing::warn!(
+            "failed to flush pending skin changes before {action}: HTTP {}",
+            status
+        );
+    }
 }
 
 #[tauri::command]
