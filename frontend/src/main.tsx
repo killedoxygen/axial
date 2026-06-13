@@ -10,7 +10,12 @@ import { api, initializeApiBase } from './api';
 import { applyTheme } from './theme';
 import { Sound, bindButtonSounds } from './sound';
 import { Music } from './music';
-import { getNativeAppVersion } from './native';
+import {
+  getNativeAppVersion,
+  hasNativeDesktopRuntime,
+  nativeDesktopCloseBlockedEventName,
+  onNativeEvent,
+} from './native';
 import { refreshAccountSkin } from './player-skin';
 import { scheduleAutoUpdateCheck } from './updater';
 import { toast } from './toast';
@@ -27,6 +32,7 @@ async function init(): Promise<void> {
 
   render(<App />, document.getElementById('app')!);
   restoreRoute();
+  registerNativeCloseBlockedToast();
 
   Sound.enabled = local.sounds;
   Sound.warmup();
@@ -115,6 +121,18 @@ async function init(): Promise<void> {
   window.addEventListener('pointerdown', activateSound, { once: true, capture: true });
   window.addEventListener('touchstart', activateSound, { once: true, capture: true });
   window.addEventListener('keydown', activateSound, { once: true, capture: true });
+}
+
+function registerNativeCloseBlockedToast(): void {
+  if (!hasNativeDesktopRuntime()) return;
+  void onNativeEvent(nativeDesktopCloseBlockedEventName, (data: any) => {
+    const message = typeof data?.error === 'string' && data.error.trim()
+      ? data.error.trim()
+      : 'Close is blocked while installs or launches are active.';
+    toast(message, 'error');
+  }).catch((err: unknown) => {
+    console.error('Failed to register native close guard listener', err);
+  });
 }
 
 void init();

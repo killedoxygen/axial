@@ -10,7 +10,7 @@ use croopor_api::state::{AppState, AppStateInit, InstallStore, SessionStore};
 use croopor_config::{AppPaths, ConfigStore, InstanceStore};
 use croopor_performance::PerformanceManager;
 use std::sync::Arc;
-use tauri::{Emitter, Manager};
+use tauri::{Emitter, Manager, WindowEvent};
 use tokio::runtime::Builder as TokioRuntimeBuilder;
 use tracing::info;
 
@@ -51,6 +51,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     spawn_performance_operations_resume(&state);
     spawn_benchmark_suite_drivers_resume(&state);
     spawn_performance_rules_refresh(&state);
+    let close_event_state = state.clone();
     let desktop_state = state::DesktopState::new(env!("CARGO_PKG_VERSION").to_string());
 
     let api = spawn_background(state.clone()).await?;
@@ -77,6 +78,27 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             commands::window_start_dragging,
             commands::window_set_resize_background
         ])
+        .on_window_event(move |window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let window = window.clone();
+                let state = close_event_state.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Some(error) = commands::close_blocking_error(&state).await {
+                        let _ = window.emit(
+                            events::DESKTOP_CLOSE_BLOCKED,
+                            serde_json::json!({ "error": error }),
+                        );
+                        return;
+                    }
+                    commands::flush_pending_saved_skin_applies("window close request", &state)
+                        .await;
+                    if let Err(error) = window.destroy() {
+                        tracing::warn!("failed to destroy window after close request: {error}");
+                    }
+                });
+            }
+        })
         .setup(move |app| {
             app.manage(state::ApiRuntimeState::new(api.addr));
             let handle = app.handle().clone();

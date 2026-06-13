@@ -127,19 +127,25 @@ pub fn window_toggle_maximize(app: AppHandle) -> Result<bool, String> {
 
 #[tauri::command]
 pub async fn window_close(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    let active_installs = state.installs().active_install_count().await;
-    let active_sessions = state.sessions().active_session_count().await;
-    close_readiness(active_installs, active_sessions)?;
+    if let Some(error) = close_blocking_error(state.inner()).await {
+        return Err(error);
+    }
 
     flush_pending_saved_skin_applies("desktop close", state.inner()).await;
 
     let window = app
         .get_webview_window("main")
         .ok_or_else(|| "main window missing".to_string())?;
-    window.close().map_err(|e| e.to_string())
+    window.destroy().map_err(|e| e.to_string())
 }
 
-async fn flush_pending_saved_skin_applies(action: &str, state: &AppState) {
+pub async fn close_blocking_error(state: &AppState) -> Option<String> {
+    let active_installs = state.installs().active_install_count().await;
+    let active_sessions = state.sessions().active_session_count().await;
+    close_readiness(active_installs, active_sessions).err()
+}
+
+pub async fn flush_pending_saved_skin_applies(action: &str, state: &AppState) {
     if let Err((status, _)) = flush_pending_saved_skin_applies_for_shutdown(state).await {
         tracing::warn!(
             "failed to flush pending skin changes before {action}: HTTP {}",

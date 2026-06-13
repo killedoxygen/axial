@@ -64,6 +64,8 @@ export function nativeLaunchLogEventName(sessionId: string): string {
   return `croopor:launch:${sessionId}:log`;
 }
 
+export const nativeDesktopCloseBlockedEventName = 'croopor:desktop:close-blocked';
+
 export async function onNativeEvent(eventName: string, callback: (data: any) => void): Promise<{ close(): void } | null> {
   const tauri = getTauriBinding();
   if (!tauri?.event) return null;
