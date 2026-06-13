@@ -40,6 +40,12 @@ export interface NativeDragDropPayload {
   position: { x: number; y: number } | null;
 }
 
+export interface NativeMicrosoftSignInResult {
+  status: 'authenticated' | 'cancelled';
+  profile_name?: string | null;
+  owns_minecraft_java?: boolean | null;
+}
+
 export function isTauriRuntime(): boolean {
   return getTauriBinding() !== null;
 }
@@ -123,6 +129,12 @@ export async function getNativeApiBaseUrl(): Promise<string | null> {
   const tauri = getTauriBinding();
   if (!tauri?.core) return null;
   return tauri.core.invoke<string>('api_base_url');
+}
+
+export async function signInWithMicrosoft(): Promise<NativeMicrosoftSignInResult | undefined> {
+  const tauri = getTauriBinding();
+  if (!tauri?.core) return undefined;
+  return tauri.core.invoke<NativeMicrosoftSignInResult>('microsoft_sign_in');
 }
 
 export async function requestNativeAppRestart(): Promise<boolean> {

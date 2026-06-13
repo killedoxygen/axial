@@ -15,14 +15,9 @@ import { toast } from '../../toast';
 import { clampPlayerNameInput } from '../../player-name';
 import { errMessage, fmtMem, getMemoryRecommendation, validateUsername } from '../../utils';
 import { authStatusResponse, isRecord } from '../accounts/api';
-import {
-  copyText,
-  formatSeconds,
-  statusCanSelectOnline,
-  type AuthLoginPending,
-} from '../accounts/auth';
+import { statusCanSelectOnline } from '../accounts/auth';
 import type { AuthStatusRecord, AuthStatusState } from '../accounts/types';
-import { useMicrosoftDeviceLogin } from '../accounts/useMicrosoftDeviceLogin';
+import { useMicrosoftSignIn } from '../accounts/useMicrosoftSignIn';
 
 type Stage = 'name' | 'memory' | 'color' | 'music';
 const ORDER: Stage[] = ['name', 'memory', 'color', 'music'];
@@ -51,58 +46,6 @@ function MicrosoftMark(): JSX.Element {
       <rect x="0" y="9" width="7" height="7" fill="#00a4ef" />
       <rect x="9" y="9" width="7" height="7" fill="#ffb900" />
     </svg>
-  );
-}
-
-function OnboardingDeviceCodePanel({
-  login,
-  pollHint,
-  onCancel,
-}: {
-  login: AuthLoginPending;
-  pollHint: string | null;
-  onCancel: () => void;
-}): JSX.Element {
-  const [copied, setCopied] = useState<'code' | 'url' | null>(null);
-
-  const copy = (target: 'code' | 'url', value: string): void => {
-    void copyText(value)
-      .then(() => setCopied(target))
-      .catch(() => setCopied(null));
-  };
-
-  return (
-    <div class="cp-ob-devicecode">
-      <div class="cp-ob-devicecode-row">
-        <span class="cp-ob-devicecode-code">{login.user_code}</span>
-        <button
-          class="cp-ob-devicecode-action"
-          type="button"
-          onClick={() => copy('code', login.user_code)}
-        >
-          {copied === 'code' ? 'Copied' : 'Copy'}
-        </button>
-        <button class="cp-ob-devicecode-action" type="button" onClick={onCancel}>
-          Cancel
-        </button>
-      </div>
-      <div class="cp-ob-devicecode-row">
-        <a href={login.verification_uri} target="_blank" rel="noreferrer">
-          {login.verification_uri}
-        </a>
-        <button
-          class="cp-ob-devicecode-action"
-          type="button"
-          onClick={() => copy('url', login.verification_uri)}
-        >
-          {copied === 'url' ? 'Copied' : 'Copy link'}
-        </button>
-      </div>
-      <div class="cp-ob-devicecode-meta">
-        <span>Expires in {formatSeconds(login.expires_in)}</span>
-        <span>{pollHint || 'Waiting for approval'}</span>
-      </div>
-    </div>
   );
 }
 
@@ -205,9 +148,9 @@ export function Onboarding(): JSX.Element | null {
   const [authStatus, setAuthStatus] = useState<AuthStatusRecord | null>(null);
   const [authState, setAuthState] = useState<AuthStatusState>('loading');
   const [onlineAfterOnboarding, setOnlineAfterOnboarding] = useState(false);
-  const microsoftLogin = useMicrosoftDeviceLogin({
+  const microsoftLogin = useMicrosoftSignIn({
     canStart: !saving && authState === 'ready' && authStatus?.login_available !== false,
-    onAuthenticated: async (poll) => {
+    onAuthenticated: async (result) => {
       let refreshedStatus: AuthStatusRecord | null = null;
       try {
         refreshedStatus = await readAuthStatus();
@@ -219,8 +162,8 @@ export function Onboarding(): JSX.Element | null {
         setAuthStatus(refreshedStatus);
         setAuthState('ready');
       }
-      const profileName = poll.minecraft_profile?.name
-        ?? refreshedStatus?.minecraft_profile?.name
+      const profileName = refreshedStatus?.minecraft_profile?.name
+        ?? result.profile_name
         ?? refreshedStatus?.username
         ?? '';
       const nextUsername = clampPlayerNameInput(profileName);
@@ -246,7 +189,7 @@ export function Onboarding(): JSX.Element | null {
   // Single source of truth for whether the user can move off the current stage.
   // Every forward path (button, keyboard Enter) funnels through this.
   const canAdvance: boolean =
-    stage === 'name'   ? nameValid && !microsoftLogin.busy && !microsoftLogin.login :
+    stage === 'name'   ? nameValid && !microsoftLogin.busy :
     stage === 'memory' ? true :
     stage === 'color'  ? true :
     stage === 'music'  ? (!saving && musicEnabled != null) :
@@ -379,7 +322,6 @@ export function Onboarding(): JSX.Element | null {
     idx,
     maxReached,
     microsoftLogin.busy,
-    microsoftLogin.login,
   ]);
 
   let headline = '';
@@ -391,15 +333,12 @@ export function Onboarding(): JSX.Element | null {
     const authUnavailable = authState === 'unavailable' || authStatus?.login_available === false;
     const authDisabled = saving ||
       microsoftLogin.busy ||
-      Boolean(microsoftLogin.login) ||
       authState === 'loading' ||
       authUnavailable ||
       authSignedIn;
     const authStateText = authSignedIn
       ? 'Signed in'
-      : microsoftLogin.login
-        ? 'Waiting'
-        : microsoftLogin.busy
+      : microsoftLogin.busy
           ? 'Starting'
           : authState === 'loading'
             ? 'Checking'
@@ -447,29 +386,20 @@ export function Onboarding(): JSX.Element | null {
             ? 'signed-in'
             : authUnavailable
               ? 'unavailable'
-              : microsoftLogin.login
+              : microsoftLogin.busy
                 ? 'pending'
                 : 'ready'}
           disabled={authDisabled}
           type="button"
           title={authUnavailable
             ? authStatus?.login_reason ?? 'Microsoft sign-in is unavailable.'
-            : 'Start Microsoft device-code sign-in'}
+            : 'Sign in with Microsoft'}
           onClick={() => void microsoftLogin.startLogin()}
         >
           <MicrosoftMark />
           <span class="cp-ob-msa-label">{authLabel}</span>
           <span class="cp-ob-msa-state">{authStateText}</span>
         </button>
-        {microsoftLogin.login && (
-          <OnboardingDeviceCodePanel
-            login={microsoftLogin.login}
-            pollHint={microsoftLogin.pollHint}
-            onCancel={() => {
-              microsoftLogin.cancelLogin();
-            }}
-          />
-        )}
         {microsoftLogin.message && (
           <div class="cp-ob-auth-message" data-tone={microsoftLogin.message.tone}>
             {microsoftLogin.message.text}

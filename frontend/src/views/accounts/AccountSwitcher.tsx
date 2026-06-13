@@ -1,7 +1,7 @@
 import type { JSX } from 'preact';
 import { useState } from 'preact/hooks';
 import { api, apiResourceUrl, isApiError } from '../../api';
-import { Button, IconButton } from '../../ui/Atoms';
+import { IconButton } from '../../ui/Atoms';
 import { openContextMenu, type ContextMenuItem } from '../../ui/ContextMenu';
 import { showConfirm } from '../../ui/Dialog';
 import { Icon } from '../../ui/Icons';
@@ -15,17 +15,14 @@ import type { LaunchAuthMode } from '../../types';
 import { isRecord } from './api';
 import {
   configErrorMessage,
-  copyText,
-  formatSeconds,
   launchAuthMode,
   logoutErrorMessage,
   authProfileSyncErrorMessage,
   statusCanSelectOnline,
   authRefreshErrorMessage,
-  type AuthLoginPending,
 } from './auth';
 import type { AuthStatusRecord, AuthStatusState } from './types';
-import { useMicrosoftDeviceLogin } from './useMicrosoftDeviceLogin';
+import { useMicrosoftSignIn } from './useMicrosoftSignIn';
 
 function IdentityRow({
   head,
@@ -88,60 +85,6 @@ function IdentityRow({
   );
 }
 
-function DeviceCodePanel({
-  login,
-  pollHint,
-  onCancel,
-}: {
-  login: AuthLoginPending;
-  pollHint: string | null;
-  onCancel: () => void;
-}): JSX.Element {
-  const [copied, setCopied] = useState<'code' | 'url' | null>(null);
-
-  const copy = (target: 'code' | 'url', value: string): void => {
-    void copyText(value)
-      .then(() => setCopied(target))
-      .catch(() => setCopied(null));
-  };
-
-  return (
-    <div class="cp-account-devicecode">
-      <div class="cp-account-devicecode__row">
-        <span class="cp-account-devicecode__code">{login.user_code}</span>
-        <Button
-          variant="secondary"
-          size="sm"
-          icon={copied === 'code' ? 'check' : 'copy'}
-          onClick={() => copy('code', login.user_code)}
-          sound="affirm"
-        >
-          {copied === 'code' ? 'Copied' : 'Copy code'}
-        </Button>
-        <Button variant="ghost" size="sm" icon="x" onClick={onCancel}>
-          Cancel
-        </Button>
-      </div>
-      <div class="cp-account-devicecode__row">
-        <a href={login.verification_uri} target="_blank" rel="noreferrer">
-          {login.verification_uri}
-        </a>
-        <IconButton
-          icon={copied === 'url' ? 'check' : 'copy'}
-          size={26}
-          tooltip="Copy verification URL"
-          onClick={() => copy('url', login.verification_uri)}
-        />
-      </div>
-      <div class="cp-account-devicecode__meta">
-        <span>Enter the code at the Microsoft page.</span>
-        <span>Expires in {formatSeconds(login.expires_in)}</span>
-        <span>{pollHint || 'Waiting for approval'}</span>
-      </div>
-    </div>
-  );
-}
-
 export function AccountSwitcher({
   status,
   state,
@@ -171,7 +114,7 @@ export function AccountSwitcher({
   localStateVersion.value;
   const accountTextureSrc = selectedSkinTextureSrc() ?? undefined;
   const externalBusy = logoutBusy || refreshBusy || profileSyncBusy || modeBusy !== null;
-  const loginFlow = useMicrosoftDeviceLogin({
+  const loginFlow = useMicrosoftSignIn({
     canStart: !externalBusy && status?.login_available !== false,
     onAuthenticated: () => {
       onChanged();
@@ -188,7 +131,6 @@ export function AccountSwitcher({
     );
     if (!ok) return;
     setLogoutBusy(true);
-    loginFlow.cancelLogin();
     loginFlow.clearMessage();
     try {
       const response = await api('POST', '/auth/logout');
@@ -211,7 +153,7 @@ export function AccountSwitcher({
   };
 
   const refreshAuth = async (): Promise<void> => {
-    if (busy || loginFlow.login) return;
+    if (busy) return;
     setRefreshBusy(true);
     loginFlow.clearMessage();
     try {
@@ -239,7 +181,7 @@ export function AccountSwitcher({
   };
 
   const syncMinecraftProfile = async (): Promise<void> => {
-    if (busy || loginFlow.login || !profileSyncAvailable) return;
+    if (busy || !profileSyncAvailable) return;
     setProfileSyncBusy(true);
     loginFlow.clearMessage();
     try {
@@ -307,7 +249,7 @@ export function AccountSwitcher({
       ? [{ icon: 'refresh', label: 'Refresh credentials', onSelect: () => void refreshAuth() }]
       : []),
     ...(status?.login_available
-      ? [{ icon: 'globe', label: 'Re-verify with device code', onSelect: () => void loginFlow.startLogin() }]
+      ? [{ icon: 'globe', label: 'Re-verify with Microsoft', onSelect: () => void loginFlow.startLogin() }]
       : []),
     { label: '', onSelect: () => {}, divider: true },
     { icon: 'x', label: 'Sign out', onSelect: () => void logout(), danger: true },
@@ -383,8 +325,8 @@ export function AccountSwitcher({
                   ? status.login_reason
                   : 'Apply skins and launch online'}
                 active={false}
-                disabled={busy || Boolean(loginFlow.login) || status?.login_available === false}
-                selectTitle="Start Microsoft device-code sign-in"
+                disabled={busy || status?.login_available === false}
+                selectTitle="Sign in with Microsoft"
                 onSelect={() => void loginFlow.startLogin()}
               />
             )}
@@ -408,16 +350,6 @@ export function AccountSwitcher({
               menuItems={offlineMenuItems}
             />
           </div>
-
-          {loginFlow.login && (
-            <DeviceCodePanel
-              login={loginFlow.login}
-              pollHint={loginFlow.pollHint}
-              onCancel={() => {
-                loginFlow.cancelLogin();
-              }}
-            />
-          )}
 
           {loginFlow.message && (
             <div class="cp-account-message" data-tone={loginFlow.message.tone}>
