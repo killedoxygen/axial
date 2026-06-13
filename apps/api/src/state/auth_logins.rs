@@ -370,6 +370,45 @@ impl AuthLoginStore {
         Some((token, account))
     }
 
+    pub async fn replace_with_msa_and_minecraft_account(
+        &self,
+        new_token: NewAuthLoginMsaToken,
+        new_account: NewAuthLoginMinecraftAccount,
+    ) -> (AuthLoginMsaToken, AuthLoginMinecraftAccount) {
+        let now = Utc::now();
+        let login_id = self.next_login_id();
+        let token = AuthLoginMsaToken {
+            login_id: login_id.clone(),
+            access_token: new_token.access_token,
+            refresh_token: new_token.refresh_token,
+            id_token: new_token.id_token,
+            token_type: new_token.token_type,
+            expires_in: new_token.expires_in,
+            scope: new_token.scope,
+            authenticated_at: now,
+            expires_at: now
+                + chrono::Duration::seconds(saturating_u64_to_i64(new_token.expires_in)),
+        };
+        let account = AuthLoginMinecraftAccount {
+            login_id,
+            access_token: new_account.access_token,
+            token_type: new_account.token_type,
+            expires_in: new_account.expires_in,
+            profile: new_account.profile,
+            owns_minecraft_java: new_account.owns_minecraft_java,
+            authenticated_at: now,
+            expires_at: now
+                + chrono::Duration::seconds(saturating_u64_to_i64(new_account.expires_in)),
+        };
+
+        self.sessions.write().await.clear();
+        *self.active_msa_token.write().await = Some(token.clone());
+        *self.active_minecraft_account.write().await = Some(account.clone());
+        self.bump_active_auth_generation();
+        self.save_active_snapshot(&token, Some(&account));
+        (token, account)
+    }
+
     pub async fn refresh_with_msa_and_minecraft_account(
         &self,
         new_token: NewAuthLoginMsaToken,

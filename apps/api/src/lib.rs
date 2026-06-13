@@ -3,6 +3,7 @@ pub(crate) mod auth_chain;
 pub mod dto;
 pub mod install_runtime;
 pub mod logging;
+pub mod microsoft_auth;
 pub mod routes;
 pub mod sse;
 pub mod state;

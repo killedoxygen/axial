@@ -6,18 +6,30 @@ use croopor_launcher::LaunchState;
 use serde::Serialize;
 use std::fs;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 use tauri::webview::Color;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{
+    AppHandle, Emitter, Manager, State, UserAttentionType, WebviewUrl, WebviewWindowBuilder,
+};
 
 const RESTART_BUSY_MESSAGE: &str = "Restart is blocked while installs or launches are active.";
 const CLOSE_BUSY_MESSAGE: &str = "Close is blocked while installs or launches are active.";
 const SKIN_FILE_MAX_BYTES: u64 = 256 * 1024;
 const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+const MICROSOFT_SIGN_IN_WINDOW_LABEL: &str = "microsoft-signin";
+const MICROSOFT_SIGN_IN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, Eq, PartialEq, Serialize)]
 pub struct NativeSkinFile {
     name: String,
     bytes: Vec<u8>,
+}
+
+#[derive(Debug, Eq, PartialEq, Serialize)]
+pub struct NativeMicrosoftSignIn {
+    status: &'static str,
+    profile_name: Option<String>,
+    owns_minecraft_java: Option<bool>,
 }
 
 #[tauri::command]
@@ -28,6 +40,80 @@ pub fn app_version(state: State<'_, DesktopState>) -> String {
 #[tauri::command]
 pub fn api_base_url(state: State<'_, ApiRuntimeState>) -> String {
     format!("http://{}", state.addr())
+}
+
+#[tauri::command]
+pub async fn microsoft_sign_in(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<NativeMicrosoftSignIn, String> {
+    let flow = croopor_api::microsoft_auth::begin_login()
+        .await
+        .map_err(|error| error.user_message())?;
+    let url = flow
+        .auth_request_uri()
+        .parse()
+        .map_err(|_| "Microsoft sign-in returned an invalid URL.".to_string())?;
+
+    if let Some(window) = app.get_webview_window(MICROSOFT_SIGN_IN_WINDOW_LABEL) {
+        let _ = window.close();
+    }
+
+    let window = WebviewWindowBuilder::new(
+        &app,
+        MICROSOFT_SIGN_IN_WINDOW_LABEL,
+        WebviewUrl::External(url),
+    )
+    .title("Sign in with Microsoft")
+    .inner_size(520.0, 720.0)
+    .resizable(true)
+    .center()
+    .build()
+    .map_err(|error| format!("Could not open Microsoft sign-in window: {error}"))?;
+
+    let _ = window.request_user_attention(Some(UserAttentionType::Informational));
+    let start = Instant::now();
+
+    while start.elapsed() < MICROSOFT_SIGN_IN_TIMEOUT {
+        if window.title().is_err() {
+            return Ok(microsoft_sign_in_cancelled());
+        }
+
+        if let Ok(url) = window.url()
+            && url
+                .as_str()
+                .starts_with(croopor_api::microsoft_auth::MICROSOFT_AUTH_REDIRECT_URL)
+        {
+            if let Some(code) = croopor_api::microsoft_auth::redirect_code_from_url(&url) {
+                let _ = window.close();
+                let outcome =
+                    croopor_api::microsoft_auth::finish_login(flow, &code, state.auth_logins())
+                        .await
+                        .map_err(|error| error.user_message())?;
+                return Ok(NativeMicrosoftSignIn {
+                    status: "authenticated",
+                    profile_name: Some(outcome.profile_name),
+                    owns_minecraft_java: Some(outcome.owns_minecraft_java),
+                });
+            }
+
+            let _ = window.close();
+            return Err("Microsoft sign-in was cancelled or rejected.".to_string());
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let _ = window.close();
+    Err("Microsoft sign-in timed out.".to_string())
+}
+
+fn microsoft_sign_in_cancelled() -> NativeMicrosoftSignIn {
+    NativeMicrosoftSignIn {
+        status: "cancelled",
+        profile_name: None,
+        owns_minecraft_java: None,
+    }
 }
 
 #[tauri::command]
