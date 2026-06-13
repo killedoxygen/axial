@@ -883,16 +883,17 @@ async fn finish_runtime_task_after_artifacts(
         return artifact_result.map(|_| None);
     };
 
-    let runtime_result = match task.await {
-        Ok(result) => result.map_err(DownloadError::PrepareRuntime),
-        Err(error) => Err(DownloadError::PrepareRuntime(error.to_string())),
-    };
-
     match artifact_result {
-        Ok(()) => runtime_result.map(Some),
         Err(error) => {
-            let _ = runtime_result;
+            task.abort();
             Err(error)
+        }
+        Ok(()) => {
+            let runtime_result = match task.await {
+                Ok(result) => result.map_err(DownloadError::PrepareRuntime),
+                Err(error) => Err(DownloadError::PrepareRuntime(error.to_string())),
+            };
+            runtime_result.map(Some)
         }
     }
 }
@@ -1528,35 +1529,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_task_is_joined_when_artifact_install_fails() {
-        let joined = Arc::new(AtomicBool::new(false));
-        let joined_in_task = Arc::clone(&joined);
-        let (release_tx, release_rx) = oneshot::channel();
+    async fn runtime_task_is_aborted_when_artifact_install_fails() {
+        struct RuntimeGuard(Arc<AtomicBool>);
+
+        impl Drop for RuntimeGuard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_in_task = Arc::clone(&cancelled);
+        let (started_tx, started_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
-            let _ = release_rx.await;
-            joined_in_task.store(true, Ordering::SeqCst);
-            Ok(JavaVersion::default())
+            let _guard = RuntimeGuard(cancelled_in_task);
+            let _ = started_tx.send(());
+            std::future::pending::<Result<JavaVersion, String>>().await
         });
+        started_rx.await.expect("runtime task should start");
         let artifact_error = DownloadError::ResolveManifest("artifact failed".to_string());
-        let mut result = Box::pin(finish_runtime_task_after_artifacts(
-            Some(task),
-            Err(artifact_error),
-        ));
 
-        assert!(
-            timeout(Duration::from_millis(25), &mut result)
-                .await
-                .is_err()
-        );
-
-        release_tx.send(()).expect("release runtime task");
-        let result = result.await;
+        let result = timeout(
+            Duration::from_millis(100),
+            finish_runtime_task_after_artifacts(Some(task), Err(artifact_error)),
+        )
+        .await
+        .expect("artifact error should return without waiting for runtime task");
 
         assert!(matches!(
             result,
             Err(DownloadError::ResolveManifest(message)) if message == "artifact failed"
         ));
-        assert!(joined.load(Ordering::SeqCst));
+        timeout(Duration::from_millis(100), async {
+            while !cancelled.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("runtime task should be aborted");
     }
 
     #[tokio::test]
