@@ -21,12 +21,13 @@ use crate::types::{
 };
 use chrono::Utc;
 use futures_util::{StreamExt, stream};
-use sha2::Digest;
+use sha2::{Digest, Sha512};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 use thiserror::Error;
+use tokio::io::AsyncReadExt;
 use tracing::warn;
 
 pub const PERFORMANCE_RULES_URL_ENV: &str = "CROOPOR_PERFORMANCE_RULES_URL";
@@ -489,19 +490,16 @@ impl PerformanceManager {
 
         if tokio::fs::try_exists(&final_path).await? {
             if !expected_sha.trim().is_empty()
-                && let Ok(existing) = tokio::fs::read(&final_path).await
+                && let Ok(true) = file_matches_sha512(&final_path, &expected_sha, file.size).await
             {
-                let actual = hex::encode(sha2::Sha512::digest(&existing));
-                if actual.eq_ignore_ascii_case(&expected_sha) {
-                    return Ok(InstalledMod {
-                        project_id: managed_mod.project_id.clone(),
-                        version_id: version.id,
-                        filename,
-                        ownership_class: OwnershipClass::CompositionManaged,
-                        source: modrinth_source(),
-                        integrity: verified_sha512_integrity(expected_sha),
-                    });
-                }
+                return Ok(InstalledMod {
+                    project_id: managed_mod.project_id.clone(),
+                    version_id: version.id,
+                    filename,
+                    ownership_class: OwnershipClass::CompositionManaged,
+                    source: modrinth_source(),
+                    integrity: verified_sha512_integrity(expected_sha),
+                });
             }
             if !was_previously_tracked {
                 return Err(InstallError::ManagedArtifactTargetExists(filename));
@@ -1020,6 +1018,31 @@ fn unverified_sha512_integrity(sha512: String) -> ManagedArtifactIntegrity {
         sha512,
         sha512_verified: false,
     }
+}
+
+async fn file_matches_sha512(
+    path: &Path,
+    expected_sha512: &str,
+    expected_size: Option<u64>,
+) -> Result<bool, std::io::Error> {
+    if let Some(expected_size) = expected_size
+        && tokio::fs::metadata(path).await?.len() != expected_size
+    {
+        return Ok(false);
+    }
+
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = Sha512::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    Ok(hex::encode(hasher.finalize()).eq_ignore_ascii_case(expected_sha512))
 }
 
 fn parent_minor_version(game_version: &str) -> Option<String> {
@@ -1827,11 +1850,13 @@ mod tests {
         let root = test_root("ensure-installed-reuse-verified-final");
         let existing = b"already-present-jar";
         fs::write(root.join("sodium.jar"), existing).expect("write existing final file");
-        let manager = PerformanceManager::new_with_modrinth_base_url(
-            spawn_modrinth_server_with_sha512(Some(hex::encode(sha2::Sha512::digest(existing))))
-                .await,
+        let (base_url, requests) = spawn_modrinth_server_with_sha512_size_and_requests(
+            Some(hex::encode(sha2::Sha512::digest(existing))),
+            Some(existing.len() as u64),
         )
-        .expect("performance manager");
+        .await;
+        let manager =
+            PerformanceManager::new_with_modrinth_base_url(base_url).expect("performance manager");
         let plan = CompositionPlan {
             composition_id: "core".to_string(),
             family: VersionFamily::F,
@@ -1866,8 +1891,82 @@ mod tests {
             existing
         );
         assert!(!root.join("sodium.jar.tmp").exists());
+        let requests = requests.lock().expect("request log").clone();
+        assert!(request_log_contains(
+            &requests,
+            "/v2/project/sodium/version"
+        ));
+        assert!(!request_log_contains(&requests, "/files/sodium.jar"));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn ensure_installed_rejects_existing_final_file_with_wrong_size() {
+        let root = test_root("ensure-installed-reject-wrong-size-final");
+        let existing = b"already-present-jar";
+        fs::write(root.join("sodium.jar"), existing).expect("write existing final file");
+        let (base_url, requests) = spawn_modrinth_server_with_sha512_size_and_requests(
+            Some(hex::encode(sha2::Sha512::digest(existing))),
+            Some(existing.len() as u64 + 1),
+        )
+        .await;
+        let manager =
+            PerformanceManager::new_with_modrinth_base_url(base_url).expect("performance manager");
+        let plan = CompositionPlan {
+            composition_id: "core".to_string(),
+            family: VersionFamily::F,
+            loader: "fabric".to_string(),
+            mode: PerformanceMode::Managed,
+            tier: CompositionTier::Core,
+            mods: vec![ManagedMod {
+                artifact_id: "sodium".to_string(),
+                project_id: "sodium".to_string(),
+                slug: "sodium".to_string(),
+                name: "Sodium".to_string(),
+                condition: ModCondition::Always,
+                version_range: String::new(),
+                hardware_req: None,
+                mutual_exclusions: Vec::new(),
+            }],
+            jvm_preset: String::new(),
+            fallback_chain: Vec::new(),
+            warnings: Vec::new(),
+            fallback_reason: String::new(),
+        };
+
+        let state = manager
+            .ensure_installed(&plan, "1.20.4", &root)
+            .await
+            .expect("install should record failed managed artifact");
+
+        assert_eq!(state.failure_count, 1);
+        assert!(state.installed_mods.is_empty());
+        assert_eq!(
+            fs::read(root.join("sodium.jar")).expect("read protected file"),
+            existing
+        );
+        assert!(!root.join("sodium.jar.tmp").exists());
+        let requests = requests.lock().expect("request log").clone();
+        assert!(request_log_contains(
+            &requests,
+            "/v2/project/sodium/version"
+        ));
+        assert!(!request_log_contains(&requests, "/files/sodium.jar"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn managed_artifact_reuse_future_stays_small_enough_for_tokio_workers() {
+        assert!(
+            std::mem::size_of_val(&file_matches_sha512(
+                Path::new("/tmp/croopor-test/sodium.jar"),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                Some(8),
+            )) < 4096,
+            "managed artifact reuse hash future should not embed the hash buffer on the task stack"
+        );
     }
 
     #[tokio::test]
@@ -3318,10 +3417,21 @@ mod tests {
         sha512: Option<String>,
         size: Option<u64>,
     ) -> String {
+        spawn_modrinth_server_with_sha512_size_and_requests(sha512, size)
+            .await
+            .0
+    }
+
+    async fn spawn_modrinth_server_with_sha512_size_and_requests(
+        sha512: Option<String>,
+        size: Option<u64>,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind modrinth test server");
         let addr = listener.local_addr().expect("modrinth test addr");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let request_log = Arc::clone(&requests);
         tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
@@ -3329,6 +3439,7 @@ mod tests {
                 };
                 let sha512 = sha512.clone();
                 let size = size;
+                let request_log = Arc::clone(&request_log);
                 tokio::spawn(async move {
                     let mut request = Vec::new();
                     let mut buf = [0_u8; 1024];
@@ -3349,7 +3460,11 @@ mod tests {
                     }
 
                     let request = String::from_utf8_lossy(&request);
-                    let first_line = request.lines().next().unwrap_or_default();
+                    let first_line = request.lines().next().unwrap_or_default().to_string();
+                    request_log
+                        .lock()
+                        .expect("record request")
+                        .push(first_line.clone());
                     let file_url = format!("http://{addr}/files/sodium.jar");
                     let hashes = if let Some(sha512) = sha512.as_ref() {
                         format!(r#""sha512":"{sha512}""#)
@@ -3386,7 +3501,7 @@ mod tests {
                 });
             }
         });
-        format!("http://{addr}")
+        (format!("http://{addr}"), requests)
     }
 
     fn test_root(name: &str) -> PathBuf {

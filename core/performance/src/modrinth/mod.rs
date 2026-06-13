@@ -14,6 +14,9 @@ const RATE_LIMIT_BODY_LIMIT: usize = 4096;
 const MAX_MODRINTH_VERSION_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MODRINTH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MODRINTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const MODRINTH_CLIENT_MAX_IDLE_PER_HOST: usize = 4;
+const MODRINTH_CLIENT_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const MODRINTH_CLIENT_TCP_KEEPALIVE: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Error)]
 pub enum ModrinthError {
@@ -196,6 +199,9 @@ fn modrinth_http_client() -> Client {
                 .user_agent(USER_AGENT)
                 .connect_timeout(MODRINTH_CONNECT_TIMEOUT)
                 .timeout(MODRINTH_REQUEST_TIMEOUT)
+                .pool_max_idle_per_host(MODRINTH_CLIENT_MAX_IDLE_PER_HOST)
+                .pool_idle_timeout(MODRINTH_CLIENT_POOL_IDLE_TIMEOUT)
+                .tcp_keepalive(MODRINTH_CLIENT_TCP_KEEPALIVE)
                 .build()
                 .unwrap_or_else(|_| Client::new())
         })
