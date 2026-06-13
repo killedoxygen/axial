@@ -1,5 +1,5 @@
 import type { JSX } from 'preact';
-import { useEffect, useState } from 'preact/hooks';
+import { useState } from 'preact/hooks';
 import { api, apiResourceUrl, isApiError } from '../../api';
 import { Button, IconButton } from '../../ui/Atoms';
 import { openContextMenu, type ContextMenuItem } from '../../ui/ContextMenu';
@@ -18,21 +18,14 @@ import {
   copyText,
   formatSeconds,
   launchAuthMode,
-  loginErrorMessage,
-  loginPendingResponse,
   logoutErrorMessage,
-  pollErrorMessage,
-  pollResponse,
-  pollSuccessMessage,
-  pollTerminalMessage,
   authProfileSyncErrorMessage,
   statusCanSelectOnline,
   authRefreshErrorMessage,
   type AuthLoginPending,
 } from './auth';
 import type { AuthStatusRecord, AuthStatusState } from './types';
-
-type Message = { tone: 'ok' | 'err'; text: string } | null;
+import { useMicrosoftDeviceLogin } from './useMicrosoftDeviceLogin';
 
 function IdentityRow({
   head,
@@ -161,14 +154,10 @@ export function AccountSwitcher({
   onChanged: () => void;
 }): JSX.Element {
   const [open, setOpen] = useState(false);
-  const [login, setLogin] = useState<AuthLoginPending | null>(null);
-  const [loginBusy, setLoginBusy] = useState(false);
-  const [pollHint, setPollHint] = useState<string | null>(null);
   const [logoutBusy, setLogoutBusy] = useState(false);
   const [refreshBusy, setRefreshBusy] = useState(false);
   const [profileSyncBusy, setProfileSyncBusy] = useState(false);
   const [modeBusy, setModeBusy] = useState<LaunchAuthMode | null>(null);
-  const [message, setMessage] = useState<Message>(null);
 
   const msaActive = Boolean(status?.msa_authenticated);
   const profile = status?.minecraft_profile;
@@ -181,83 +170,15 @@ export function AccountSwitcher({
   const profileTextureSrc = profile ? apiResourceUrl('/skin/profile/file') : undefined;
   localStateVersion.value;
   const accountTextureSrc = selectedSkinTextureSrc() ?? undefined;
-  const busy = loginBusy || logoutBusy || refreshBusy || profileSyncBusy || modeBusy !== null;
+  const externalBusy = logoutBusy || refreshBusy || profileSyncBusy || modeBusy !== null;
+  const loginFlow = useMicrosoftDeviceLogin({
+    canStart: !externalBusy && status?.login_available !== false,
+    onAuthenticated: () => {
+      onChanged();
+    },
+  });
+  const busy = externalBusy || loginFlow.busy;
   const chipName = onlineActive && profileName ? profileName : savedUsername;
-
-  useEffect(() => {
-    if (!login) return undefined;
-    let active = true;
-    const timeout = window.setTimeout(() => {
-      void api('POST', `/auth/login/${encodeURIComponent(login.login_id)}/poll`)
-        .then((response: unknown) => {
-          if (!active) return;
-          const poll = pollResponse(response);
-          if (!poll) {
-            setLogin(null);
-            setPollHint(null);
-            setMessage({ tone: 'err', text: pollTerminalMessage(null) });
-            return;
-          }
-          if (poll.status === 'pending') {
-            setPollHint(poll.poll_hint ?? null);
-            setLogin((current) => current?.login_id === login.login_id
-              ? { ...current, interval: poll.interval }
-              : current);
-            return;
-          }
-          if (poll.status === 'msa_authenticated') {
-            setLogin(null);
-            setPollHint(null);
-            setMessage({ tone: 'ok', text: pollSuccessMessage(poll) });
-            onChanged();
-            return;
-          }
-          setLogin(null);
-          setPollHint(null);
-          setMessage({ tone: 'err', text: pollTerminalMessage(poll) });
-        })
-        .catch((err: unknown) => {
-          if (!active) return;
-          setLogin(null);
-          setPollHint(null);
-          setMessage({
-            tone: 'err',
-            text: isApiError(err)
-              ? pollErrorMessage(err.payload)
-              : 'Could not reach the local backend while polling Microsoft sign-in.',
-          });
-        });
-    }, Math.max(1, login.interval) * 1000);
-
-    return () => {
-      active = false;
-      window.clearTimeout(timeout);
-    };
-  }, [login, onChanged]);
-
-  const startLogin = async (): Promise<void> => {
-    if (busy) return;
-    setLoginBusy(true);
-    setLogin(null);
-    setMessage(null);
-    setPollHint(null);
-    try {
-      const response = await api('POST', '/auth/login');
-      const pending = loginPendingResponse(response);
-      if (pending) {
-        setLogin(pending);
-        return;
-      }
-      setMessage({ tone: 'err', text: loginErrorMessage(response) });
-    } catch (err: unknown) {
-      setMessage({
-        tone: 'err',
-        text: isApiError(err) ? loginErrorMessage(err.payload) : 'Could not reach the local backend.',
-      });
-    } finally {
-      setLoginBusy(false);
-    }
-  };
 
   const logout = async (): Promise<void> => {
     if (busy) return;
@@ -267,18 +188,17 @@ export function AccountSwitcher({
     );
     if (!ok) return;
     setLogoutBusy(true);
-    setLogin(null);
-    setPollHint(null);
-    setMessage(null);
+    loginFlow.cancelLogin();
+    loginFlow.clearMessage();
     try {
       const response = await api('POST', '/auth/logout');
       if (isRecord(response) && typeof response.error === 'string') {
-        setMessage({ tone: 'err', text: logoutErrorMessage(response) });
+        loginFlow.setMessage({ tone: 'err', text: logoutErrorMessage(response) });
       } else {
-        setMessage({ tone: 'ok', text: 'Microsoft sign-in cleared.' });
+        loginFlow.setMessage({ tone: 'ok', text: 'Microsoft sign-in cleared.' });
       }
     } catch (err: unknown) {
-      setMessage({
+      loginFlow.setMessage({
         tone: 'err',
         text: isApiError(err)
           ? logoutErrorMessage(err.payload)
@@ -291,22 +211,22 @@ export function AccountSwitcher({
   };
 
   const refreshAuth = async (): Promise<void> => {
-    if (busy || login) return;
+    if (busy || loginFlow.login) return;
     setRefreshBusy(true);
-    setMessage(null);
+    loginFlow.clearMessage();
     try {
       const response = await api('POST', '/auth/refresh');
       if (isRecord(response) && typeof response.error === 'string') {
-        setMessage({ tone: 'err', text: authRefreshErrorMessage(response) });
+        loginFlow.setMessage({ tone: 'err', text: authRefreshErrorMessage(response) });
         return;
       }
       if (!isRecord(response) || response.status !== 'refreshed') {
-        setMessage({ tone: 'err', text: 'Microsoft sign-in refresh returned an unexpected response.' });
+        loginFlow.setMessage({ tone: 'err', text: 'Microsoft sign-in refresh returned an unexpected response.' });
         return;
       }
-      setMessage({ tone: 'ok', text: 'Microsoft sign-in refreshed.' });
+      loginFlow.setMessage({ tone: 'ok', text: 'Microsoft sign-in refreshed.' });
     } catch (err: unknown) {
-      setMessage({
+      loginFlow.setMessage({
         tone: 'err',
         text: isApiError(err)
           ? authRefreshErrorMessage(err.payload)
@@ -319,22 +239,22 @@ export function AccountSwitcher({
   };
 
   const syncMinecraftProfile = async (): Promise<void> => {
-    if (busy || login || !profileSyncAvailable) return;
+    if (busy || loginFlow.login || !profileSyncAvailable) return;
     setProfileSyncBusy(true);
-    setMessage(null);
+    loginFlow.clearMessage();
     try {
       const response = await api('POST', '/auth/profile/sync');
       if (isRecord(response) && typeof response.error === 'string') {
-        setMessage({ tone: 'err', text: authProfileSyncErrorMessage(response) });
+        loginFlow.setMessage({ tone: 'err', text: authProfileSyncErrorMessage(response) });
         return;
       }
       if (!isRecord(response) || response.status !== 'profile_synced') {
-        setMessage({ tone: 'err', text: 'Minecraft profile sync returned an unexpected response.' });
+        loginFlow.setMessage({ tone: 'err', text: 'Minecraft profile sync returned an unexpected response.' });
         return;
       }
-      setMessage({ tone: 'ok', text: 'Minecraft profile synced.' });
+      loginFlow.setMessage({ tone: 'ok', text: 'Minecraft profile synced.' });
     } catch (err: unknown) {
-      setMessage({
+      loginFlow.setMessage({
         tone: 'err',
         text: isApiError(err)
           ? authProfileSyncErrorMessage(err.payload)
@@ -349,24 +269,24 @@ export function AccountSwitcher({
   const useMode = async (nextMode: LaunchAuthMode): Promise<void> => {
     if (busy || nextMode === savedMode) return;
     if (nextMode === 'online' && !onlineSelectable) {
-      setMessage({
+      loginFlow.setMessage({
         tone: 'err',
         text: 'Online needs a verified, Java-owning Minecraft account with valid credentials.',
       });
       return;
     }
     setModeBusy(nextMode);
-    setMessage(null);
+    loginFlow.clearMessage();
     try {
       const response = await api('PUT', '/config', { launch_auth_mode: nextMode });
       if (isRecord(response) && typeof response.error === 'string') {
-        setMessage({ tone: 'err', text: configErrorMessage(response) });
+        loginFlow.setMessage({ tone: 'err', text: configErrorMessage(response) });
         return;
       }
       config.value = response;
       onChanged();
     } catch {
-      setMessage({ tone: 'err', text: 'Could not reach the local backend to save launch mode.' });
+      loginFlow.setMessage({ tone: 'err', text: 'Could not reach the local backend to save launch mode.' });
     } finally {
       setModeBusy(null);
     }
@@ -387,7 +307,7 @@ export function AccountSwitcher({
       ? [{ icon: 'refresh', label: 'Refresh credentials', onSelect: () => void refreshAuth() }]
       : []),
     ...(status?.login_available
-      ? [{ icon: 'globe', label: 'Re-verify with device code', onSelect: () => void startLogin() }]
+      ? [{ icon: 'globe', label: 'Re-verify with device code', onSelect: () => void loginFlow.startLogin() }]
       : []),
     { label: '', onSelect: () => {}, divider: true },
     { icon: 'x', label: 'Sign out', onSelect: () => void logout(), danger: true },
@@ -403,7 +323,7 @@ export function AccountSwitcher({
         type="button"
         class="cp-account-chip"
         onClick={() => {
-          setMessage(null);
+          loginFlow.clearMessage();
           setOpen(true);
         }}
         title="Switch account or identity"
@@ -463,9 +383,9 @@ export function AccountSwitcher({
                   ? status.login_reason
                   : 'Apply skins and launch online'}
                 active={false}
-                disabled={busy || Boolean(login) || status?.login_available === false}
+                disabled={busy || Boolean(loginFlow.login) || status?.login_available === false}
                 selectTitle="Start Microsoft device-code sign-in"
-                onSelect={() => void startLogin()}
+                onSelect={() => void loginFlow.startLogin()}
               />
             )}
 
@@ -489,20 +409,19 @@ export function AccountSwitcher({
             />
           </div>
 
-          {login && (
+          {loginFlow.login && (
             <DeviceCodePanel
-              login={login}
-              pollHint={pollHint}
+              login={loginFlow.login}
+              pollHint={loginFlow.pollHint}
               onCancel={() => {
-                setLogin(null);
-                setPollHint(null);
+                loginFlow.cancelLogin();
               }}
             />
           )}
 
-          {message && (
-            <div class="cp-account-message" data-tone={message.tone}>
-              {message.text}
+          {loginFlow.message && (
+            <div class="cp-account-message" data-tone={loginFlow.message.tone}>
+              {loginFlow.message.text}
             </div>
           )}
         </ModalContent>

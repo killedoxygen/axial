@@ -357,7 +357,6 @@ button.cp-ob-stepper-item:focus-visible {
   border: 1px solid transparent;
 }
 
-/* Disabled MSA sign-in placeholder */
 .cp-ob-msa {
   display: flex;
   align-items: center;
@@ -373,9 +372,24 @@ button.cp-ob-stepper-item:focus-visible {
   font-size: 13px;
   font-weight: 500;
   text-align: left;
-  opacity: 0.58;
+  cursor: pointer;
+  transition: background-color 180ms ease, border-color 180ms ease, color 180ms ease;
+}
+
+.cp-ob-msa:not(:disabled):hover {
+  background: var(--surface-3);
+  border-color: color-mix(in srgb, var(--accent) 24%, transparent);
+  color: var(--text);
+}
+
+.cp-ob-msa:disabled {
+  opacity: 0.62;
   cursor: not-allowed;
-  transition: background-color 240ms ease, border-color 240ms ease;
+}
+
+.cp-ob-msa[data-state="signed-in"] {
+  border-color: color-mix(in srgb, var(--ok) 28%, transparent);
+  color: var(--text);
 }
 
 .cp-ob-msa-mark {
@@ -392,7 +406,7 @@ button.cp-ob-stepper-item:focus-visible {
   white-space: nowrap;
 }
 
-.cp-ob-msa-soon {
+.cp-ob-msa-state {
   flex-shrink: 0;
   font-size: 10.5px;
   font-weight: 600;
@@ -403,6 +417,74 @@ button.cp-ob-stepper-item:focus-visible {
   background: var(--surface-3);
   color: var(--text-mute);
 }
+
+.cp-ob-devicecode {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--text) 10%, transparent);
+  border-radius: 12px;
+  background: var(--surface-2);
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.cp-ob-devicecode-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.cp-ob-devicecode-code {
+  flex: 1;
+  min-width: 0;
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  color: var(--text);
+}
+
+.cp-ob-devicecode-row a {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-dim);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cp-ob-devicecode-action {
+  flex-shrink: 0;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: var(--surface-3);
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.cp-ob-devicecode-action:hover {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--accent) 20%, transparent);
+}
+
+.cp-ob-devicecode-meta,
+.cp-ob-auth-message {
+  display: flex;
+  gap: 10px;
+  color: var(--text-mute);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.cp-ob-auth-message[data-tone="ok"] { color: var(--ok); }
+.cp-ob-auth-message[data-tone="err"] { color: var(--err); }
 
 /* Memory reading */
 .cp-ob-memory {

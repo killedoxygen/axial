@@ -14,6 +14,15 @@ import { showOnboardingOverlay } from '../../ui-state';
 import { toast } from '../../toast';
 import { clampPlayerNameInput } from '../../player-name';
 import { errMessage, fmtMem, getMemoryRecommendation, validateUsername } from '../../utils';
+import { authStatusResponse, isRecord } from '../accounts/api';
+import {
+  copyText,
+  formatSeconds,
+  statusCanSelectOnline,
+  type AuthLoginPending,
+} from '../accounts/auth';
+import type { AuthStatusRecord, AuthStatusState } from '../accounts/types';
+import { useMicrosoftDeviceLogin } from '../accounts/useMicrosoftDeviceLogin';
 
 type Stage = 'name' | 'memory' | 'color' | 'music';
 const ORDER: Stage[] = ['name', 'memory', 'color', 'music'];
@@ -23,6 +32,79 @@ const STAGE_LABELS: Record<Stage, string> = {
   color: 'Mood',
   music: 'Sound',
 };
+
+async function readAuthStatus(): Promise<AuthStatusRecord> {
+  const response = await api('GET', '/auth/status');
+  if (isRecord(response) && typeof response.error === 'string') {
+    throw new Error(response.error);
+  }
+  const parsed = authStatusResponse(response);
+  if (!parsed) throw new Error('invalid auth status');
+  return parsed;
+}
+
+function MicrosoftMark(): JSX.Element {
+  return (
+    <svg class="cp-ob-msa-mark" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+      <rect x="0" y="0" width="7" height="7" fill="#f25022" />
+      <rect x="9" y="0" width="7" height="7" fill="#7fba00" />
+      <rect x="0" y="9" width="7" height="7" fill="#00a4ef" />
+      <rect x="9" y="9" width="7" height="7" fill="#ffb900" />
+    </svg>
+  );
+}
+
+function OnboardingDeviceCodePanel({
+  login,
+  pollHint,
+  onCancel,
+}: {
+  login: AuthLoginPending;
+  pollHint: string | null;
+  onCancel: () => void;
+}): JSX.Element {
+  const [copied, setCopied] = useState<'code' | 'url' | null>(null);
+
+  const copy = (target: 'code' | 'url', value: string): void => {
+    void copyText(value)
+      .then(() => setCopied(target))
+      .catch(() => setCopied(null));
+  };
+
+  return (
+    <div class="cp-ob-devicecode">
+      <div class="cp-ob-devicecode-row">
+        <span class="cp-ob-devicecode-code">{login.user_code}</span>
+        <button
+          class="cp-ob-devicecode-action"
+          type="button"
+          onClick={() => copy('code', login.user_code)}
+        >
+          {copied === 'code' ? 'Copied' : 'Copy'}
+        </button>
+        <button class="cp-ob-devicecode-action" type="button" onClick={onCancel}>
+          Cancel
+        </button>
+      </div>
+      <div class="cp-ob-devicecode-row">
+        <a href={login.verification_uri} target="_blank" rel="noreferrer">
+          {login.verification_uri}
+        </a>
+        <button
+          class="cp-ob-devicecode-action"
+          type="button"
+          onClick={() => copy('url', login.verification_uri)}
+        >
+          {copied === 'url' ? 'Copied' : 'Copy link'}
+        </button>
+      </div>
+      <div class="cp-ob-devicecode-meta">
+        <span>Expires in {formatSeconds(login.expires_in)}</span>
+        <span>{pollHint || 'Waiting for approval'}</span>
+      </div>
+    </div>
+  );
+}
 
 function Words({ text }: { text: string }): JSX.Element {
   // Keep the space as a sibling text node between word spans, not inside them.
@@ -120,6 +202,39 @@ export function Onboarding(): JSX.Element | null {
   // Enter works from inside the input; → does NOT (arrow keys move the cursor
   // there). Showing → while focused would mislead the user.
   const [nameFocused, setNameFocused] = useState(false);
+  const [authStatus, setAuthStatus] = useState<AuthStatusRecord | null>(null);
+  const [authState, setAuthState] = useState<AuthStatusState>('loading');
+  const [onlineAfterOnboarding, setOnlineAfterOnboarding] = useState(false);
+  const microsoftLogin = useMicrosoftDeviceLogin({
+    canStart: !saving && authState === 'ready' && authStatus?.login_available !== false,
+    onAuthenticated: async (poll) => {
+      let refreshedStatus: AuthStatusRecord | null = null;
+      try {
+        refreshedStatus = await readAuthStatus();
+      } catch {
+        refreshedStatus = null;
+      }
+
+      if (refreshedStatus) {
+        setAuthStatus(refreshedStatus);
+        setAuthState('ready');
+      }
+      const profileName = poll.minecraft_profile?.name
+        ?? refreshedStatus?.minecraft_profile?.name
+        ?? refreshedStatus?.username
+        ?? '';
+      const nextUsername = clampPlayerNameInput(profileName);
+      if (nextUsername) setUsername(nextUsername);
+
+      const onlineReady = refreshedStatus ? statusCanSelectOnline(refreshedStatus) : false;
+      setOnlineAfterOnboarding(onlineReady);
+      if (onlineReady && nextUsername && validateUsername(nextUsername) === null && stage === 'name') {
+        setStage('memory');
+        setMaxReached((m) => Math.max(m, 1));
+        Sound.ui('affirm');
+      }
+    },
+  });
 
   const idx = ORDER.indexOf(stage);
   const nameError = validateUsername(username);
@@ -131,7 +246,7 @@ export function Onboarding(): JSX.Element | null {
   // Single source of truth for whether the user can move off the current stage.
   // Every forward path (button, keyboard Enter) funnels through this.
   const canAdvance: boolean =
-    stage === 'name'   ? nameValid :
+    stage === 'name'   ? nameValid && !microsoftLogin.busy && !microsoftLogin.login :
     stage === 'memory' ? true :
     stage === 'color'  ? true :
     stage === 'music'  ? (!saving && musicEnabled != null) :
@@ -155,6 +270,27 @@ export function Onboarding(): JSX.Element | null {
     Sound.ui('soft');
   };
 
+  useEffect(() => {
+    let active = true;
+    setAuthState('loading');
+    void readAuthStatus()
+      .then((status) => {
+        if (!active) return;
+        setAuthStatus(status);
+        setOnlineAfterOnboarding(statusCanSelectOnline(status));
+        setAuthState('ready');
+      })
+      .catch(() => {
+        if (!active) return;
+        setAuthStatus(null);
+        setAuthState('unavailable');
+      });
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
   const commit = async (): Promise<void> => {
     if (saving) return;
     if (!nameValid) {
@@ -165,12 +301,16 @@ export function Onboarding(): JSX.Element | null {
     setSaving(true);
     const prevConfig = config.value;
     try {
-      const r: any = await api('PUT', '/config', {
+      const patch: Record<string, unknown> = {
         username: username.trim(),
         max_memory_mb: Math.round(memory * 1024),
         music_enabled: musicEnabled,
         music_volume: 5,
-      });
+      };
+      if (onlineAfterOnboarding) {
+        patch.launch_auth_mode = 'online';
+      }
+      const r: any = await api('PUT', '/config', patch);
       if (r.error) throw new Error(r.error);
       config.value = r;
       const complete = async (): Promise<void> => {
@@ -230,13 +370,46 @@ export function Onboarding(): JSX.Element | null {
     };
     window.addEventListener('keydown', h);
     return () => { window.removeEventListener('keydown', h); };
-  }, [stage, nameValid, musicEnabled, saving, dissolving, idx, maxReached]);
+  }, [
+    stage,
+    nameValid,
+    musicEnabled,
+    saving,
+    dissolving,
+    idx,
+    maxReached,
+    microsoftLogin.busy,
+    microsoftLogin.login,
+  ]);
 
   let headline = '';
   let subline: JSX.Element | null = null;
   let widget: JSX.Element;
 
   if (stage === 'name') {
+    const authSignedIn = Boolean(authStatus?.msa_authenticated || onlineAfterOnboarding);
+    const authUnavailable = authState === 'unavailable' || authStatus?.login_available === false;
+    const authDisabled = saving ||
+      microsoftLogin.busy ||
+      Boolean(microsoftLogin.login) ||
+      authState === 'loading' ||
+      authUnavailable ||
+      authSignedIn;
+    const authStateText = authSignedIn
+      ? 'Signed in'
+      : microsoftLogin.login
+        ? 'Waiting'
+        : microsoftLogin.busy
+          ? 'Starting'
+          : authState === 'loading'
+            ? 'Checking'
+            : authUnavailable
+              ? 'Unavailable'
+              : 'Sign in';
+    const authProfileName = authStatus?.minecraft_profile?.name ?? authStatus?.username ?? '';
+    const authLabel = authSignedIn && authProfileName
+      ? `Signed in as ${authProfileName}`
+      : 'Sign in with your Minecraft account';
     headline = 'What should Minecraft call you?';
     subline = (
       <p class="cp-ob-subline">
@@ -268,18 +441,40 @@ export function Onboarding(): JSX.Element | null {
           onFocus={() => setNameFocused(true)}
           onBlur={() => setNameFocused(false)}
         />
-        {/* Placeholder slot for future Microsoft-auth sign-in. Disabled on purpose;
-            when MSA lands, this becomes the primary path and the input the fallback. */}
-        <button class="cp-ob-msa" disabled type="button" aria-disabled="true" tabIndex={-1}>
-          <svg class="cp-ob-msa-mark" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
-            <rect x="0" y="0" width="7" height="7" fill="#f25022" />
-            <rect x="9" y="0" width="7" height="7" fill="#7fba00" />
-            <rect x="0" y="9" width="7" height="7" fill="#00a4ef" />
-            <rect x="9" y="9" width="7" height="7" fill="#ffb900" />
-          </svg>
-          <span class="cp-ob-msa-label">Sign in with your Minecraft account</span>
-          <span class="cp-ob-msa-soon">Coming soon</span>
+        <button
+          class="cp-ob-msa"
+          data-state={authSignedIn
+            ? 'signed-in'
+            : authUnavailable
+              ? 'unavailable'
+              : microsoftLogin.login
+                ? 'pending'
+                : 'ready'}
+          disabled={authDisabled}
+          type="button"
+          title={authUnavailable
+            ? authStatus?.login_reason ?? 'Microsoft sign-in is unavailable.'
+            : 'Start Microsoft device-code sign-in'}
+          onClick={() => void microsoftLogin.startLogin()}
+        >
+          <MicrosoftMark />
+          <span class="cp-ob-msa-label">{authLabel}</span>
+          <span class="cp-ob-msa-state">{authStateText}</span>
         </button>
+        {microsoftLogin.login && (
+          <OnboardingDeviceCodePanel
+            login={microsoftLogin.login}
+            pollHint={microsoftLogin.pollHint}
+            onCancel={() => {
+              microsoftLogin.cancelLogin();
+            }}
+          />
+        )}
+        {microsoftLogin.message && (
+          <div class="cp-ob-auth-message" data-tone={microsoftLogin.message.tone}>
+            {microsoftLogin.message.text}
+          </div>
+        )}
       </div>
     );
   } else if (stage === 'memory') {
