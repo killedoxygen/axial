@@ -3,6 +3,7 @@ use crate::{
         AuthChainClient, AuthChainError, AuthChainErrorKind, AuthChainExchange, MinecraftCape,
         MinecraftProfile, MinecraftSkin,
     },
+    microsoft_auth::{MicrosoftAuthError, MicrosoftAuthErrorKind, MicrosoftAuthStep},
     state::{
         ActiveMinecraftAccountState, ActiveMsaTokenState, AppState, AuthLoginMinecraftAccount,
         AuthLoginMinecraftCape, AuthLoginMinecraftProfile, AuthLoginMinecraftSkin,
@@ -32,13 +33,14 @@ pub(crate) const MSA_TOKEN_ENDPOINT: &str =
     "https://login.microsoftonline.com/consumers/oauth2/v2.0/token";
 const MSA_DEVICE_CODE_SCOPE: &str = "XboxLive.signin offline_access";
 const MSA_TOKEN_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
+#[cfg(test)]
 const MSA_REFRESH_TOKEN_GRANT_TYPE: &str = "refresh_token";
 const MSA_DEVICE_CODE_TIMEOUT: Duration = Duration::from_secs(20);
 const MSA_TOKEN_POLL_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_MSA_RESPONSE_BYTES: usize = 1024 * 1024;
 const MSA_SLOW_DOWN_INTERVAL_INCREMENT: u64 = 5;
 const LOGIN_UNAVAILABLE_REASON: &str = "Microsoft sign-in is not configured in this build";
-const LOGIN_AVAILABLE_REASON: &str = "Microsoft sign-in is configured";
+const LOGIN_AVAILABLE_REASON: &str = "Microsoft sign-in opens in a secure desktop window";
 
 static MSA_DEVICE_CODE_CLIENT: OnceLock<Result<Client, AuthLoginError>> = OnceLock::new();
 static MSA_TOKEN_POLL_CLIENT: OnceLock<Result<Client, AuthLoginError>> = OnceLock::new();
@@ -152,20 +154,6 @@ struct AuthLoginPendingResponse {
 struct AuthLoginMsaAuthenticatedResponse {
     status: &'static str,
     login_id: String,
-    token_type: String,
-    expires_in: u64,
-    has_refresh_token: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    token_scope: Option<String>,
-    minecraft_profile_ready: bool,
-    minecraft_ownership_verified: bool,
-    minecraft_profile: AuthMinecraftProfileResponse,
-    minecraft_token_expires_in: u64,
-}
-
-#[derive(Debug, Serialize)]
-struct AuthRefreshAuthenticatedResponse {
-    status: &'static str,
     token_type: String,
     expires_in: u64,
     has_refresh_token: bool,
@@ -318,10 +306,8 @@ pub(crate) struct AuthRefreshFailure {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AuthRefreshFailureKind {
-    LoginUnavailable,
     MissingRefreshToken,
     RefreshRejected,
-    RefreshFailed,
     MicrosoftClientBuild,
     MicrosoftRequest,
     MicrosoftUpstreamRejected,
@@ -419,18 +405,7 @@ async fn handle_auth_login_poll(
 async fn handle_auth_refresh(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let auth_chain_client = match AuthChainClient::new() {
-        Ok(client) => client,
-        Err(error) => return auth_chain_error_response(error),
-    };
-
-    auth_refresh_for_config(
-        AuthLoginConfig::from_env(),
-        state.auth_logins(),
-        MSA_TOKEN_ENDPOINT,
-        &auth_chain_client,
-    )
-    .await
+    auth_refresh(state.auth_logins()).await
 }
 
 async fn handle_auth_profile_sync(
@@ -485,7 +460,7 @@ async fn auth_status_for_store(
 fn auth_status_from_username(
     config_username: &str,
     launch_auth_mode: &str,
-    login_config: AuthLoginConfig,
+    _login_config: AuthLoginConfig,
     msa_state: AuthStatusMsaState,
     minecraft_state: AuthStatusMinecraftState,
 ) -> Result<AuthStatusResponse, (StatusCode, Json<serde_json::Value>)> {
@@ -542,8 +517,8 @@ fn auth_status_from_username(
             .is_some_and(|account| account.owns_minecraft_java),
         minecraft_profile,
         minecraft_token_expires_in: minecraft_state.token_expires_in,
-        login_available: login_config.is_available(),
-        login_reason: login_config.reason(),
+        login_available: true,
+        login_reason: LOGIN_AVAILABLE_REASON,
     })
 }
 
@@ -704,42 +679,6 @@ async fn request_msa_token(
     }
 }
 
-async fn request_msa_refresh_token(
-    token_endpoint: &str,
-    client_id: &str,
-    refresh_token: &str,
-) -> Result<MsaTokenSuccessResponse, AuthLoginPollError> {
-    let client = msa_token_poll_client().map_err(AuthLoginPollError::Request)?;
-
-    let response = client
-        .post(token_endpoint)
-        .form(&[
-            ("grant_type", MSA_REFRESH_TOKEN_GRANT_TYPE),
-            ("client_id", client_id),
-            ("refresh_token", refresh_token),
-            ("scope", MSA_DEVICE_CODE_SCOPE),
-        ])
-        .send()
-        .await
-        .map_err(|_| AuthLoginPollError::Request(AuthLoginError::Request))?;
-
-    let status = response.status();
-    if status.is_success() {
-        return bounded_msa_json_response(response)
-            .await
-            .map_err(AuthLoginPollError::Request);
-    }
-
-    match bounded_msa_json_response::<MsaTokenErrorResponse>(response).await {
-        Ok(response) => Err(AuthLoginPollError::OAuth(MsaTokenErrorCode::from_error(
-            &response.error,
-        ))),
-        Err(_) => Err(AuthLoginPollError::Request(AuthLoginError::UpstreamStatus(
-            status,
-        ))),
-    }
-}
-
 async fn bounded_msa_json_response<T>(mut response: reqwest::Response) -> Result<T, AuthLoginError>
 where
     T: DeserializeOwned,
@@ -840,6 +779,14 @@ async fn auth_login_poll_success_response(
     (StatusCode::OK, Json(serde_json::json!(public_response)))
 }
 
+async fn auth_refresh(login_store: &Arc<AuthLoginStore>) -> (StatusCode, Json<serde_json::Value>) {
+    match refresh_active_auth(login_store).await {
+        Ok(success) => (StatusCode::OK, Json(serde_json::json!(success))),
+        Err(error) => auth_refresh_error_response(error),
+    }
+}
+
+#[cfg(test)]
 async fn auth_refresh_for_config(
     config: AuthLoginConfig,
     login_store: &Arc<AuthLoginStore>,
@@ -855,42 +802,26 @@ async fn auth_refresh_for_config(
 }
 
 pub(crate) async fn refresh_active_auth_for_config(
-    config: AuthLoginConfig,
+    _config: AuthLoginConfig,
     login_store: &Arc<AuthLoginStore>,
-    token_endpoint: &str,
-    auth_chain_client: &AuthChainClient,
+    _token_endpoint: &str,
+    _auth_chain_client: &AuthChainClient,
 ) -> Result<AuthRefreshSuccess, AuthRefreshFailure> {
-    let Some(client_id) = config.client_id.as_deref() else {
-        return Err(AuthRefreshFailure::new(
-            AuthRefreshFailureKind::LoginUnavailable,
-        ));
-    };
-    let initial_generation = login_store.active_auth_generation();
-    let Some(_initial_refresh_token) = login_store.active_msa_refresh_token().await else {
-        return Err(AuthRefreshFailure::new(
-            AuthRefreshFailureKind::MissingRefreshToken,
-        ));
-    };
+    refresh_active_auth(login_store).await
+}
 
-    let _refresh_guard = login_store.active_auth_refresh_guard().await;
-    if login_store.active_auth_generation() != initial_generation
-        && let Some(success) = active_auth_refresh_success_from_store(login_store).await
-    {
+async fn refresh_active_auth(
+    login_store: &Arc<AuthLoginStore>,
+) -> Result<AuthRefreshSuccess, AuthRefreshFailure> {
+    if let Some(success) = active_auth_refresh_success_from_store(login_store).await {
         return Ok(success);
     }
-    let Some(refresh_token) = login_store.active_msa_refresh_token().await else {
-        return Err(AuthRefreshFailure::new(
-            AuthRefreshFailureKind::MissingRefreshToken,
-        ));
-    };
 
-    match request_msa_refresh_token(token_endpoint, client_id, &refresh_token).await {
-        Ok(response) => {
-            auth_refresh_success_response(response, &refresh_token, login_store, auth_chain_client)
-                .await
-        }
-        Err(AuthLoginPollError::OAuth(error)) => auth_refresh_oauth_error(login_store, error).await,
-        Err(AuthLoginPollError::Request(error)) => Err(AuthRefreshFailure::from(error)),
+    match crate::microsoft_auth::refresh_login(login_store).await {
+        Ok(_) => active_auth_refresh_success_from_store(login_store)
+            .await
+            .ok_or_else(|| AuthRefreshFailure::new(AuthRefreshFailureKind::StoreUnavailable)),
+        Err(error) => Err(AuthRefreshFailure::from(error)),
     }
 }
 
@@ -929,78 +860,6 @@ fn auth_refresh_success_from_active_state(
         minecraft_ownership_verified: minecraft_state.account.owns_minecraft_java,
         minecraft_token_expires_in: minecraft_state.token_expires_in,
     }
-}
-
-async fn auth_refresh_success_response(
-    response: MsaTokenSuccessResponse,
-    fallback_refresh_token: &str,
-    login_store: &Arc<AuthLoginStore>,
-    auth_chain_client: &AuthChainClient,
-) -> Result<AuthRefreshSuccess, AuthRefreshFailure> {
-    let has_refresh_token = response
-        .refresh_token
-        .as_deref()
-        .is_some_and(|refresh_token| !refresh_token.trim().is_empty())
-        || !fallback_refresh_token.trim().is_empty();
-    let minecraft_account = match auth_chain_client
-        .exchange_msa_access_token(&response.access_token)
-        .await
-    {
-        Ok(exchange) => NewAuthLoginMinecraftAccount::from(exchange),
-        Err(error) => {
-            if login_store
-                .refresh_with_msa_token(
-                    NewAuthLoginMsaToken::from(response),
-                    fallback_refresh_token,
-                )
-                .await
-                .is_none()
-            {
-                return Err(AuthRefreshFailure::new(
-                    AuthRefreshFailureKind::StoreUnavailable,
-                ));
-            }
-            return Err(AuthRefreshFailure::auth_chain(error));
-        }
-    };
-
-    let public_response = AuthRefreshAuthenticatedResponse {
-        status: "refreshed",
-        token_type: response.token_type.clone(),
-        expires_in: response.expires_in,
-        has_refresh_token,
-        token_scope: response.scope.clone(),
-        minecraft_profile_ready: true,
-        minecraft_ownership_verified: minecraft_account.owns_minecraft_java,
-        minecraft_profile: auth_minecraft_profile_response(&minecraft_account.profile),
-        minecraft_token_expires_in: minecraft_account.expires_in,
-    };
-
-    if login_store
-        .refresh_with_msa_and_minecraft_account(
-            NewAuthLoginMsaToken::from(response),
-            minecraft_account,
-            fallback_refresh_token,
-        )
-        .await
-        .is_none()
-    {
-        return Err(AuthRefreshFailure::new(
-            AuthRefreshFailureKind::StoreUnavailable,
-        ));
-    }
-
-    Ok(AuthRefreshSuccess {
-        status: public_response.status,
-        token_type: public_response.token_type,
-        expires_in: public_response.expires_in,
-        has_refresh_token: public_response.has_refresh_token,
-        token_scope: public_response.token_scope,
-        minecraft_profile_ready: public_response.minecraft_profile_ready,
-        minecraft_profile: public_response.minecraft_profile,
-        minecraft_ownership_verified: public_response.minecraft_ownership_verified,
-        minecraft_token_expires_in: public_response.minecraft_token_expires_in,
-    })
 }
 
 async fn auth_profile_sync(
@@ -1052,33 +911,8 @@ async fn auth_profile_sync(
     )
 }
 
-async fn auth_refresh_oauth_error(
-    login_store: &Arc<AuthLoginStore>,
-    error: MsaTokenErrorCode,
-) -> Result<AuthRefreshSuccess, AuthRefreshFailure> {
-    if matches!(
-        error,
-        MsaTokenErrorCode::InvalidGrant
-            | MsaTokenErrorCode::AuthorizationDeclined
-            | MsaTokenErrorCode::BadVerificationCode
-            | MsaTokenErrorCode::ExpiredToken
-    ) {
-        clear_active_auth_and_pending_skin_apply(login_store)
-            .await
-            .map_err(|_| AuthRefreshFailure::new(AuthRefreshFailureKind::StoreUnavailable))?;
-        return Err(AuthRefreshFailure::new(
-            AuthRefreshFailureKind::RefreshRejected,
-        ));
-    }
-
-    Err(AuthRefreshFailure::new(
-        AuthRefreshFailureKind::RefreshFailed,
-    ))
-}
-
 fn auth_refresh_error_response(error: AuthRefreshFailure) -> (StatusCode, Json<serde_json::Value>) {
     match error.kind {
-        AuthRefreshFailureKind::LoginUnavailable => auth_login_unavailable(),
         AuthRefreshFailureKind::MissingRefreshToken => auth_refresh_sign_in_required_response(
             StatusCode::PRECONDITION_FAILED,
             "Microsoft sign-in refresh is unavailable; sign in again",
@@ -1087,13 +921,6 @@ fn auth_refresh_error_response(error: AuthRefreshFailure) -> (StatusCode, Json<s
         AuthRefreshFailureKind::RefreshRejected => auth_refresh_sign_in_required_response(
             StatusCode::UNAUTHORIZED,
             "Microsoft sign-in expired; sign in again",
-        ),
-        AuthRefreshFailureKind::RefreshFailed => (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({
-                "error": "Microsoft sign-in refresh failed",
-                "status": "refresh_failed",
-            })),
         ),
         AuthRefreshFailureKind::MicrosoftClientBuild => {
             auth_login_error_response(AuthLoginError::ClientBuild)
@@ -1570,18 +1397,6 @@ impl AuthLoginConfig {
         }
     }
 
-    fn is_available(&self) -> bool {
-        self.client_id.is_some()
-    }
-
-    fn reason(&self) -> &'static str {
-        if self.is_available() {
-            LOGIN_AVAILABLE_REASON
-        } else {
-            LOGIN_UNAVAILABLE_REASON
-        }
-    }
-
     fn normalize_client_id(value: Option<&str>) -> Option<String> {
         value
             .map(str::trim)
@@ -1598,21 +1413,12 @@ impl AuthRefreshFailure {
         }
     }
 
-    fn auth_chain(error: AuthChainError) -> Self {
-        Self {
-            kind: AuthRefreshFailureKind::AuthChainFailed,
-            auth_chain_error: Some(error),
-        }
-    }
-
     pub(crate) fn launch_status_id(&self) -> &'static str {
         match self.kind {
-            AuthRefreshFailureKind::LoginUnavailable => "refresh_unavailable",
             AuthRefreshFailureKind::MissingRefreshToken
             | AuthRefreshFailureKind::RefreshRejected
             | AuthRefreshFailureKind::StoreUnavailable => "sign_in_required",
-            AuthRefreshFailureKind::RefreshFailed
-            | AuthRefreshFailureKind::MicrosoftClientBuild
+            AuthRefreshFailureKind::MicrosoftClientBuild
             | AuthRefreshFailureKind::MicrosoftRequest
             | AuthRefreshFailureKind::MicrosoftUpstreamRejected
             | AuthRefreshFailureKind::MicrosoftUpstreamUnavailable
@@ -1623,10 +1429,8 @@ impl AuthRefreshFailure {
 
     pub(crate) fn launch_reason_id(&self) -> &'static str {
         match self.kind {
-            AuthRefreshFailureKind::LoginUnavailable => "client_id_missing",
             AuthRefreshFailureKind::MissingRefreshToken => "refresh_token_missing",
             AuthRefreshFailureKind::RefreshRejected => "refresh_token_rejected",
-            AuthRefreshFailureKind::RefreshFailed => "oauth_refresh_failed",
             AuthRefreshFailureKind::MicrosoftClientBuild => "token_client_unavailable",
             AuthRefreshFailureKind::MicrosoftRequest => "token_endpoint_unreachable",
             AuthRefreshFailureKind::MicrosoftUpstreamRejected => "token_endpoint_rejected",
@@ -1654,6 +1458,35 @@ impl From<AuthLoginError> for AuthRefreshFailure {
                 AuthRefreshFailureKind::MicrosoftUpstreamRejected
             }
             AuthLoginError::Parse => AuthRefreshFailureKind::MicrosoftParse,
+        };
+        Self::new(kind)
+    }
+}
+
+impl From<MicrosoftAuthError> for AuthRefreshFailure {
+    fn from(error: MicrosoftAuthError) -> Self {
+        let kind = match error.kind() {
+            MicrosoftAuthErrorKind::ClientBuild => AuthRefreshFailureKind::MicrosoftClientBuild,
+            MicrosoftAuthErrorKind::Request => AuthRefreshFailureKind::MicrosoftRequest,
+            MicrosoftAuthErrorKind::UpstreamRejected
+                if error.step() == MicrosoftAuthStep::OAuthRefresh =>
+            {
+                AuthRefreshFailureKind::RefreshRejected
+            }
+            MicrosoftAuthErrorKind::UpstreamRejected => {
+                AuthRefreshFailureKind::MicrosoftUpstreamRejected
+            }
+            MicrosoftAuthErrorKind::UpstreamUnavailable => {
+                AuthRefreshFailureKind::MicrosoftUpstreamUnavailable
+            }
+            MicrosoftAuthErrorKind::Parse => AuthRefreshFailureKind::MicrosoftParse,
+            MicrosoftAuthErrorKind::MissingRefreshToken => {
+                AuthRefreshFailureKind::MissingRefreshToken
+            }
+            MicrosoftAuthErrorKind::MissingSessionId | MicrosoftAuthErrorKind::MissingUserHash => {
+                AuthRefreshFailureKind::AuthChainFailed
+            }
+            MicrosoftAuthErrorKind::StoreUnavailable => AuthRefreshFailureKind::StoreUnavailable,
         };
         Self::new(kind)
     }

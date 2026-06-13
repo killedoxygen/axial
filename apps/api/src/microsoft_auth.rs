@@ -59,6 +59,7 @@ pub enum MicrosoftAuthErrorKind {
     UpstreamRejected,
     UpstreamUnavailable,
     Parse,
+    MissingRefreshToken,
     MissingSessionId,
     MissingUserHash,
     StoreUnavailable,
@@ -109,6 +110,9 @@ impl MicrosoftAuthError {
                 "Microsoft sign-in services are unavailable"
             }
             MicrosoftAuthErrorKind::Parse => "failed to parse Microsoft sign-in response",
+            MicrosoftAuthErrorKind::MissingRefreshToken => {
+                "Microsoft sign-in needs re-verification"
+            }
             MicrosoftAuthErrorKind::MissingSessionId => {
                 "Microsoft sign-in response missed a session id"
             }
@@ -191,40 +195,62 @@ pub async fn finish_login(
     login_store: &Arc<AuthLoginStore>,
 ) -> Result<MicrosoftLoginOutcome, MicrosoftAuthError> {
     let oauth = oauth_token(code, &flow.verifier).await?;
-    let authorized = sisu_authorize(
-        Some(&flow.session_id),
-        &oauth.access_token,
-        &flow.device_pair,
-        oauth.current_date,
-    )
-    .await?;
-    let xsts = xsts_authorize(&authorized, &flow.device_pair, authorized.current_date).await?;
-    let minecraft = minecraft_token(&xsts).await?;
-    minecraft_entitlements(&minecraft.access_token).await?;
-    let profile = minecraft_profile(&minecraft.access_token).await?;
-
-    let profile_name = profile.name.clone();
+    let session =
+        minecraft_session_from_oauth(oauth, &flow.device_pair, Some(&flow.session_id)).await?;
+    let profile_name = session.profile_name.clone();
     let (msa, account) = login_store
-        .replace_with_msa_and_minecraft_account(
-            NewAuthLoginMsaToken {
-                access_token: oauth.access_token,
-                refresh_token: oauth.refresh_token,
-                id_token: oauth.id_token,
-                token_type: oauth.token_type.unwrap_or_else(|| "Bearer".to_string()),
-                expires_in: oauth.expires_in,
-                scope: oauth.scope,
-            },
-            NewAuthLoginMinecraftAccount {
-                access_token: minecraft.access_token,
-                token_type: minecraft.token_type,
-                expires_in: minecraft
-                    .expires_in
-                    .unwrap_or(MINECRAFT_ACCESS_TOKEN_EXPIRES_IN),
-                profile: auth_login_minecraft_profile(profile),
-                owns_minecraft_java: true,
-            },
-        )
+        .replace_with_msa_and_minecraft_account(session.msa_token, session.minecraft_account)
         .await;
+
+    Ok(MicrosoftLoginOutcome {
+        login_id: msa.login_id,
+        profile_name,
+        owns_minecraft_java: account.owns_minecraft_java,
+    })
+}
+
+pub async fn refresh_login(
+    login_store: &Arc<AuthLoginStore>,
+) -> Result<MicrosoftLoginOutcome, MicrosoftAuthError> {
+    let initial_generation = login_store.active_auth_generation();
+    let Some(_) = login_store.active_msa_refresh_token().await else {
+        return Err(MicrosoftAuthError::new(
+            MicrosoftAuthErrorKind::MissingRefreshToken,
+            MicrosoftAuthStep::OAuthRefresh,
+        ));
+    };
+
+    let _refresh_guard = login_store.active_auth_refresh_guard().await;
+    if login_store.active_auth_generation() != initial_generation
+        && let Some(outcome) = active_login_outcome(login_store).await
+    {
+        return Ok(outcome);
+    }
+
+    let Some(refresh_token) = login_store.active_msa_refresh_token().await else {
+        return Err(MicrosoftAuthError::new(
+            MicrosoftAuthErrorKind::MissingRefreshToken,
+            MicrosoftAuthStep::OAuthRefresh,
+        ));
+    };
+
+    let oauth = oauth_refresh(&refresh_token).await?;
+    let device_pair = DeviceTokenPair::new(oauth.current_date).await?;
+    let session = minecraft_session_from_oauth(oauth, &device_pair, None).await?;
+    let profile_name = session.profile_name.clone();
+    let Some((msa, account)) = login_store
+        .refresh_with_msa_and_minecraft_account(
+            session.msa_token,
+            session.minecraft_account,
+            &refresh_token,
+        )
+        .await
+    else {
+        return Err(MicrosoftAuthError::new(
+            MicrosoftAuthErrorKind::StoreUnavailable,
+            MicrosoftAuthStep::Store,
+        ));
+    };
 
     Ok(MicrosoftLoginOutcome {
         login_id: msa.login_id,
@@ -242,6 +268,12 @@ pub fn redirect_code_from_url(url: &url::Url) -> Option<String> {
         .find(|(key, _)| key == "code")
         .map(|(_, value)| value.into_owned())
         .filter(|code| !code.trim().is_empty())
+}
+
+struct MicrosoftMinecraftSession {
+    msa_token: NewAuthLoginMsaToken,
+    minecraft_account: NewAuthLoginMinecraftAccount,
+    profile_name: String,
 }
 
 #[derive(Debug)]
@@ -481,6 +513,82 @@ async fn oauth_token(code: &str, verifier: &str) -> Result<OAuthToken, Microsoft
     })
 }
 
+async fn oauth_refresh(refresh_token: &str) -> Result<OAuthToken, MicrosoftAuthError> {
+    let client = auth_client()?;
+    let response = client
+        .post(MICROSOFT_TOKEN_ENDPOINT)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .form(&[
+            ("client_id", MICROSOFT_CLIENT_ID),
+            ("refresh_token", refresh_token),
+            ("grant_type", "refresh_token"),
+            ("redirect_uri", MICROSOFT_AUTH_REDIRECT_URL),
+            ("scope", REQUESTED_SCOPE),
+        ])
+        .send()
+        .await
+        .map_err(|_| {
+            MicrosoftAuthError::new(
+                MicrosoftAuthErrorKind::Request,
+                MicrosoftAuthStep::OAuthRefresh,
+            )
+        })?;
+
+    let current_date = get_date_header(response.headers());
+    let body: OAuthTokenResponse =
+        parse_response(response, MicrosoftAuthStep::OAuthRefresh).await?;
+
+    Ok(OAuthToken {
+        access_token: body.access_token,
+        refresh_token: body.refresh_token,
+        id_token: body.id_token,
+        token_type: body.token_type,
+        expires_in: body.expires_in,
+        scope: body.scope,
+        current_date,
+    })
+}
+
+async fn minecraft_session_from_oauth(
+    oauth: OAuthToken,
+    device_pair: &DeviceTokenPair,
+    session_id: Option<&str>,
+) -> Result<MicrosoftMinecraftSession, MicrosoftAuthError> {
+    let authorized = sisu_authorize(
+        session_id,
+        &oauth.access_token,
+        device_pair,
+        oauth.current_date,
+    )
+    .await?;
+    let xsts = xsts_authorize(&authorized, device_pair, authorized.current_date).await?;
+    let minecraft = minecraft_token(&xsts).await?;
+    minecraft_entitlements(&minecraft.access_token).await?;
+    let profile = minecraft_profile(&minecraft.access_token).await?;
+    let profile_name = profile.name.clone();
+
+    Ok(MicrosoftMinecraftSession {
+        msa_token: NewAuthLoginMsaToken {
+            access_token: oauth.access_token,
+            refresh_token: oauth.refresh_token,
+            id_token: oauth.id_token,
+            token_type: oauth.token_type.unwrap_or_else(|| "Bearer".to_string()),
+            expires_in: oauth.expires_in,
+            scope: oauth.scope,
+        },
+        minecraft_account: NewAuthLoginMinecraftAccount {
+            access_token: minecraft.access_token,
+            token_type: minecraft.token_type,
+            expires_in: minecraft
+                .expires_in
+                .unwrap_or(MINECRAFT_ACCESS_TOKEN_EXPIRES_IN),
+            profile: auth_login_minecraft_profile(profile),
+            owns_minecraft_java: true,
+        },
+        profile_name,
+    })
+}
+
 async fn sisu_authorize(
     session_id: Option<&str>,
     access_token: &str,
@@ -518,6 +626,15 @@ async fn sisu_authorize(
     Ok(SisuAuthorize {
         current_date: response.current_date,
         ..response.body
+    })
+}
+
+async fn active_login_outcome(login_store: &Arc<AuthLoginStore>) -> Option<MicrosoftLoginOutcome> {
+    let state = login_store.active_current_minecraft_account_state().await?;
+    Some(MicrosoftLoginOutcome {
+        login_id: state.account.login_id,
+        profile_name: state.account.profile.name,
+        owns_minecraft_java: state.account.owns_minecraft_java,
     })
 }
 
