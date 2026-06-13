@@ -69,16 +69,6 @@ pub(super) async fn launch_session(
 
     loop {
         trace_launch_event(&session_id, "launch_session entered");
-        emit_status(
-            &state,
-            &session_id,
-            LaunchState::Validating,
-            None,
-            None,
-            None,
-            Some(guardian.clone()),
-        )
-        .await;
         state
             .sessions()
             .emit_log(
@@ -233,7 +223,7 @@ pub(super) async fn launch_session(
         emit_status(
             &state,
             &session_id,
-            LaunchState::Planning,
+            LaunchState::Preparing,
             None,
             None,
             prepared.healing.clone(),
@@ -927,8 +917,11 @@ fn bound_live_launch_failure_message(message: &str) -> String {
 
 fn launch_state_for_preparation_event(event: LaunchPreparationEvent) -> LaunchState {
     match event {
+        LaunchPreparationEvent::Planning => LaunchState::Planning,
         LaunchPreparationEvent::EnsuringRuntime => LaunchState::EnsuringRuntime,
         LaunchPreparationEvent::DownloadingRuntime => LaunchState::DownloadingRuntime,
+        LaunchPreparationEvent::Validating => LaunchState::Validating,
+        LaunchPreparationEvent::Preparing => LaunchState::Preparing,
     }
 }
 
@@ -1270,12 +1263,24 @@ mod tests {
     #[test]
     fn preparation_events_map_to_existing_launch_states() {
         assert_eq!(
+            launch_state_for_preparation_event(LaunchPreparationEvent::Planning),
+            LaunchState::Planning
+        );
+        assert_eq!(
             launch_state_for_preparation_event(LaunchPreparationEvent::EnsuringRuntime),
             LaunchState::EnsuringRuntime
         );
         assert_eq!(
             launch_state_for_preparation_event(LaunchPreparationEvent::DownloadingRuntime),
             LaunchState::DownloadingRuntime
+        );
+        assert_eq!(
+            launch_state_for_preparation_event(LaunchPreparationEvent::Validating),
+            LaunchState::Validating
+        );
+        assert_eq!(
+            launch_state_for_preparation_event(LaunchPreparationEvent::Preparing),
+            LaunchState::Preparing
         );
     }
 

@@ -14,8 +14,11 @@ use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchPreparationEvent {
+    Planning,
     EnsuringRuntime,
     DownloadingRuntime,
+    Validating,
+    Preparing,
 }
 
 pub async fn prepare_launch_attempt(
@@ -34,6 +37,7 @@ where
     F: FnMut(LaunchPreparationEvent),
 {
     let started_at = Instant::now();
+    observer(LaunchPreparationEvent::Planning);
     let version_started_at = Instant::now();
     let version = resolve_version(&intent.library_dir, &intent.version_id).map_err(|error| {
         LaunchPreparationError {
@@ -98,6 +102,7 @@ where
     let mut runtime = runtime_selection_from_ensure(&intent.requested_java, ensured_runtime);
     sanitize_effective_runtime_major(&mut runtime, &version.java_version);
 
+    observer(LaunchPreparationEvent::Validating);
     let loader = infer_loader(&intent.version_id);
     let is_modded = loader != "vanilla" || !version.inherits_from.trim().is_empty();
     let mut guardian_interventions = Vec::new();
@@ -204,6 +209,7 @@ where
     }
     extra_jvm_args.extend(effective_extra_jvm_args);
 
+    observer(LaunchPreparationEvent::Preparing);
     let planning_started_at = Instant::now();
     let plan = plan_resolved_launch(
         &VanillaLaunchRequest {
@@ -687,7 +693,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_launch_attempt_with_events_observes_runtime_resolution() {
+    async fn prepare_launch_attempt_with_events_observes_staged_preparation() {
         let root = unique_temp_root("croopor-prepare-runtime-event-test");
         let library_dir = root.join("library");
         let game_dir = root.join("instances").join("runtime-event-test");
@@ -749,7 +755,15 @@ mod tests {
             .expect("prepared launch");
 
         assert_eq!(prepared.runtime.effective_source, "override");
-        assert_eq!(events, vec![LaunchPreparationEvent::EnsuringRuntime]);
+        assert_eq!(
+            events,
+            vec![
+                LaunchPreparationEvent::Planning,
+                LaunchPreparationEvent::EnsuringRuntime,
+                LaunchPreparationEvent::Validating,
+                LaunchPreparationEvent::Preparing,
+            ]
+        );
 
         let _ = fs::remove_dir_all(root);
     }
