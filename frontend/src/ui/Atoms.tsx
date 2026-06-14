@@ -162,7 +162,7 @@ export function Segmented<T extends string>({
   value,
   onChange,
 }: {
-  options: Array<T | { value: T; label: string }>;
+  options: Array<T | { value: T; label: string; icon?: string }>;
   value: T;
   onChange: (v: T) => void;
 }): JSX.Element {
@@ -171,8 +171,10 @@ export function Segmented<T extends string>({
       {options.map((opt) => {
         const v = typeof opt === 'string' ? opt : opt.value;
         const label = typeof opt === 'string' ? opt : opt.label;
+        const icon = typeof opt === 'string' ? undefined : opt.icon;
         return (
           <button key={v} data-active={v === value} onClick={() => onChange(v)}>
+            {icon && <Icon name={icon} size={15} />}
             {label}
           </button>
         );

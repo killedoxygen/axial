@@ -1,8 +1,9 @@
-import type { JSX } from 'preact';
+import type { ComponentChildren, JSX } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
-import { Button, Card, Input, Segmented } from '../../../ui/Atoms';
-import { Slider, type SliderZone } from '../../../ui/Slider';
-import { InstanceTile, artSeedFor, nextArtSeed } from '../../../ui/InstanceVisual';
+import { Button, Segmented } from '../../../ui/Atoms';
+import { SelectField } from '../../../ui/Select';
+import { type SliderZone } from '../../../ui/Slider';
+import { RangeSlider } from '../../../ui/RangeSlider';
 import { api } from '../../../api';
 import { config, systemInfo } from '../../../store';
 import { updateInstanceInList } from '../../../actions';
@@ -18,40 +19,66 @@ import {
 } from '../../create/jvm-presets';
 import { memoryGb } from '../format';
 import { globalPerformanceMode, performanceModeFrom, performanceModeLabel } from '../performance-mode';
+import type { PerformanceMode } from '../../../types';
+import { JavaPathField, JvmArgsInput } from './AdvancedOverrides';
+import { WindowSizeField, type WindowPreset } from './WindowSizeField';
 
-type InstanceWindowPreset = { id: string; label: string; w: number; h: number };
-
-const WINDOW_PRESETS: InstanceWindowPreset[] = [
+const WINDOW_PRESETS: WindowPreset[] = [
   { id: 'default', label: 'Default', w: 854, h: 480 },
   { id: 'hd', label: '720p', w: 1280, h: 720 },
   { id: 'fhd', label: '1080p', w: 1920, h: 1080 },
   { id: '2k', label: '2K', w: 2560, h: 1440 },
 ];
 
-const INSTANCE_PERFORMANCE_OPTIONS: Array<{ value: InstancePerformanceMode; label: string }> = [
-  { value: '', label: 'Inherit' },
-  { value: 'managed', label: 'Managed' },
-  { value: 'vanilla', label: 'Vanilla' },
-  { value: 'custom', label: 'Custom' },
+function windowDimension(value: number | undefined, fallback: number): number {
+  return Number.isFinite(value) && (value ?? 0) > 0 ? value! : fallback;
+}
+
+const INSTANCE_PERFORMANCE_OPTIONS: Array<{ value: InstancePerformanceMode; label: string; icon: string }> = [
+  { value: '', label: 'Inherit', icon: 'globe' },
+  { value: 'managed', label: 'Managed', icon: 'sparkles' },
+  { value: 'vanilla', label: 'Vanilla', icon: 'cube' },
+  { value: 'custom', label: 'Custom', icon: 'sliders' },
 ];
 
-function clampWindowDimension(value: string, fallback: number): number {
-  const parsed = Number.parseInt(value, 10);
-  if (!Number.isFinite(parsed)) return fallback;
-  return Math.max(320, Math.min(3840, parsed));
+function instancePerformanceNote(mode: InstancePerformanceMode, globalMode: PerformanceMode): string {
+  if (!mode) return `Follows the global Performance setting, currently ${performanceModeLabel(globalMode)}.`;
+  if (mode === 'managed') return 'Croopor applies recommended tuning and optimizations for this instance.';
+  if (mode === 'vanilla') return 'Pure Minecraft. No tweaks or add-ons applied at launch.';
+  return 'You set the tuning. Your manual choices are kept as-is.';
 }
 
 function instancePerformanceModeFrom(value: string | undefined): InstancePerformanceMode {
   return performanceModeFrom(value) ?? '';
 }
 
+function SettingRow({
+  title,
+  description,
+  className,
+  children,
+}: {
+  title: string;
+  description?: ComponentChildren;
+  className?: string;
+  children: ComponentChildren;
+}): JSX.Element {
+  return (
+    <div class={`cp-iset-row${className ? ` ${className}` : ''}`}>
+      <div class="cp-iset-row-copy">
+        <strong>{title}</strong>
+        {description && <p>{description}</p>}
+      </div>
+      <div class="cp-iset-row-control">{children}</div>
+    </div>
+  );
+}
+
 export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
-  const initialArtSeed = artSeedFor(inst);
-  const [artSeed, setArtSeed] = useState<number>(initialArtSeed);
   const [maxMem, setMaxMem] = useState<number>(memoryGb(inst.max_memory_mb, config.value?.max_memory_mb ?? 4096));
   const [minMem, setMinMem] = useState<number>(memoryGb(inst.min_memory_mb, config.value?.min_memory_mb ?? 1024));
-  const [width, setWidth] = useState<number>(inst.window_width ?? 854);
-  const [height, setHeight] = useState<number>(inst.window_height ?? 480);
+  const [width, setWidth] = useState<number>(windowDimension(inst.window_width, 854));
+  const [height, setHeight] = useState<number>(windowDimension(inst.window_height, 480));
   const [performanceMode, setPerformanceMode] = useState<InstancePerformanceMode>(
     instancePerformanceModeFrom(inst.performance_mode),
   );
@@ -67,7 +94,7 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
   const recMin = Math.min(ramMax, Math.max(1, rec.rec - 2));
   const recMax = Math.min(ramMax, rec.rec + 2);
   const memoryZones: SliderZone[] = [
-    { from: 0.5, to: recMin, tone: 'low', label: 'Low' },
+    { from: 1, to: recMin, tone: 'low', label: 'Low' },
     { from: recMin, to: recMax, tone: 'sweet', label: 'Recommended' },
     { from: recMax, to: Math.min(ramMax, Math.max(recMax, ramMax * 0.75)), tone: 'high', label: 'High' },
     { from: Math.min(ramMax, Math.max(recMax, ramMax * 0.75)), to: ramMax, tone: 'extreme', label: 'Aggressive' },
@@ -78,13 +105,13 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
   const performanceModeText = performanceMode
     ? `${performanceModeLabel(effectiveSettingsMode)} override`
     : `Inherits ${performanceModeLabel(effectiveSettingsMode)} from global settings`;
-  const runtimePresetText = `${JVM_PRESET_LABELS[jvmPreset]}: ${JVM_PRESET_HINTS[jvmPreset]}`;
+  const persistedWidth = inst.window_width ?? 854;
+  const persistedHeight = inst.window_height ?? 480;
   const dirty =
-    artSeed !== initialArtSeed ||
     Math.round(maxMem * 1024) !== (inst.max_memory_mb ?? config.value?.max_memory_mb ?? 4096) ||
     Math.round(Math.min(minMem, maxMem) * 1024) !== (inst.min_memory_mb ?? config.value?.min_memory_mb ?? 1024) ||
-    width !== (inst.window_width ?? 854) ||
-    height !== (inst.window_height ?? 480) ||
+    width !== persistedWidth ||
+    height !== persistedHeight ||
     performanceMode !== instancePerformanceModeFrom(inst.performance_mode) ||
     jvmPreset !== jvmPresetFrom(inst.jvm_preset) ||
     javaPath !== (inst.java_path ?? '') ||
@@ -95,19 +122,16 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
   }, [maxMem]);
 
   useEffect(() => {
-    const nextSeed = artSeedFor(inst);
-    setArtSeed(nextSeed);
     setMaxMem(memoryGb(inst.max_memory_mb, config.value?.max_memory_mb ?? 4096));
     setMinMem(memoryGb(inst.min_memory_mb, config.value?.min_memory_mb ?? 1024));
-    setWidth(inst.window_width ?? 854);
-    setHeight(inst.window_height ?? 480);
+    setWidth(windowDimension(inst.window_width, 854));
+    setHeight(windowDimension(inst.window_height, 480));
     setPerformanceMode(instancePerformanceModeFrom(inst.performance_mode));
     setJvmPreset(jvmPresetFrom(inst.jvm_preset));
     setJavaPath(inst.java_path ?? '');
     setJvmArgs(inst.extra_jvm_args ?? '');
   }, [
     inst.id,
-    inst.art_seed,
     inst.max_memory_mb,
     inst.min_memory_mb,
     inst.window_width,
@@ -125,7 +149,7 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
       const res: any = await api('PUT', `/instances/${encodeURIComponent(inst.id)}`, {
         max_memory_mb: Math.round(maxMem * 1024),
         min_memory_mb: Math.round(clampedMinMem * 1024),
-        art_seed: artSeed,
+        art_seed: inst.art_seed,
         window_width: width,
         window_height: height,
         performance_mode: performanceMode,
@@ -155,191 +179,100 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
         </div>
       </div>
 
-      <div class="cp-iset cp-iset--bento">
-        <div id="cp-settings-policy" class="cp-iset-slot cp-iset-slot--policy">
-          <Card padding={18} class="cp-iset-card">
-            <div class="cp-iset-head">
-              <div>
-                <h3>Performance policy</h3>
-                <p>{performanceModeText}.</p>
-              </div>
+      <div class="cp-iset">
+        <div class="cp-iset-rows">
+          <SettingRow
+            title="Launch profile"
+            description={
+              <>
+                {performanceModeText}. {instancePerformanceNote(performanceMode, globalPerformanceMode())}
+              </>
+            }
+            className="cp-iset-row--performance"
+          >
+            <div class="cp-iset-seg" aria-label="Instance performance mode">
+              <Segmented<InstancePerformanceMode>
+                options={INSTANCE_PERFORMANCE_OPTIONS}
+                value={performanceMode}
+                onChange={setPerformanceMode}
+              />
             </div>
-            <div class="cp-iset-body">
-              <div class="cp-settings-segment" aria-label="Instance performance mode">
-                <Segmented<InstancePerformanceMode>
-                  options={INSTANCE_PERFORMANCE_OPTIONS}
-                  value={performanceMode}
-                  onChange={setPerformanceMode}
-                />
-              </div>
-              <div class="cp-settings-mode-note">
-                {performanceMode
-                  ? 'This instance will use its own performance mode.'
-                  : 'This instance follows the global Performance setting.'}
-              </div>
-            </div>
-          </Card>
-        </div>
+          </SettingRow>
 
-        <div id="cp-settings-memory" class="cp-iset-slot cp-iset-slot--memory">
-          <Card padding={18} class="cp-iset-card">
-            <div class="cp-iset-head">
-              <div>
-                <h3>Memory</h3>
-                <p>
-                  Recommended range: {fmtMem(recMin)} to {fmtMem(recMax)}.
-                </p>
-              </div>
-            </div>
-            <div class="cp-iset-body">
-              <div class="cp-settings-memory-grid">
-                <div class="cp-settings-slider-row">
-                  <div class="cp-settings-slider-label">
-                    <span>Maximum heap</span>
-                    <strong>{fmtMem(maxMem)}</strong>
-                  </div>
-                  <Slider
-                    value={maxMem}
-                    min={1}
-                    max={ramMax}
-                    step={0.5}
-                    zones={memoryZones}
-                    sound="memory"
-                    onChange={setMaxMem}
-                    ariaLabel="Maximum heap in gigabytes"
+          <SettingRow title="Runtime" description={JVM_PRESET_HINTS[jvmPreset]} className="cp-iset-row--runtime">
+            <div class="cp-runtime-control">
+              <div class="cp-iset-duo">
+                <label class="cp-ovr-field">
+                  <span>JVM preset</span>
+                  <SelectField<JvmPreset>
+                    value={jvmPreset}
+                    ariaLabel="JVM preset"
+                    onChange={setJvmPreset}
+                    options={JVM_PRESET_ORDER.map((preset) => ({ value: preset, label: JVM_PRESET_LABELS[preset] }))}
                   />
-                </div>
-                <div class="cp-settings-slider-row">
-                  <div class="cp-settings-slider-label">
-                    <span>Minimum heap</span>
-                    <strong>{fmtMem(minMem)}</strong>
-                  </div>
-                  <Slider
-                    value={minMem}
-                    min={0.5}
-                    max={maxMem}
-                    step={0.5}
-                    sound="memory"
-                    onChange={setMinMem}
-                    ariaLabel="Minimum heap in gigabytes"
-                  />
-                </div>
-              </div>
-            </div>
-          </Card>
-        </div>
-
-        <div id="cp-settings-runtime" class="cp-iset-slot cp-iset-slot--runtime">
-          <Card padding={18} class="cp-iset-card">
-            <div class="cp-iset-head">
-              <div>
-                <h3>Runtime</h3>
-                <p>{runtimePresetText}</p>
-              </div>
-            </div>
-            <div class="cp-iset-body">
-              <div class="cp-settings-runtime-presets" role="radiogroup" aria-label="Runtime preset">
-                {JVM_PRESET_ORDER.map((preset) => (
-                  <button
-                    key={preset || 'auto'}
-                    type="button"
-                    role="radio"
-                    aria-checked={jvmPreset === preset}
-                    class="cp-settings-runtime-preset"
-                    data-active={jvmPreset === preset}
-                    onClick={() => setJvmPreset(preset)}
-                    title={`${JVM_PRESET_LABELS[preset]}: ${JVM_PRESET_HINTS[preset]}`}
-                  >
-                    <span class="cp-settings-runtime-preset-label">{JVM_PRESET_LABELS[preset]}</span>
-                    <span class="cp-settings-runtime-preset-hint">{JVM_PRESET_HINTS[preset]}</span>
-                  </button>
-                ))}
-              </div>
-              <div class="cp-settings-advanced-label">Advanced overrides</div>
-              <div class="cp-settings-advanced-grid">
-                <label>
-                  <span>Java path</span>
-                  <Input value={javaPath} onChange={setJavaPath} placeholder="Managed Java" />
                 </label>
-                <label>
-                  <span>Extra JVM arguments</span>
-                  <Input value={jvmArgs} onChange={setJvmArgs} placeholder="-Dfoo=bar -Xss2m" />
-                </label>
-              </div>
-            </div>
-          </Card>
-        </div>
 
-        <div id="cp-settings-window" class="cp-iset-slot cp-iset-slot--window">
-          <Card padding={18} class="cp-iset-card">
-            <div class="cp-iset-head">
-              <div>
-                <h3>Window</h3>
-                <p>
-                  {activeWindowLabel} · {width} × {height}
-                </p>
+                <JavaPathField value={javaPath} onChange={setJavaPath} />
               </div>
+
+              <JvmArgsInput value={jvmArgs} onChange={setJvmArgs} />
             </div>
-            <div class="cp-iset-body">
-              <div class="cp-settings-segment" aria-label="Window size">
-                <Segmented<string>
-                  options={WINDOW_PRESETS.map((preset) => ({ value: preset.id, label: preset.label }))}
-                  value={activeWindowPreset}
-                  onChange={(presetId) => {
-                    const preset = WINDOW_PRESETS.find((item) => item.id === presetId);
-                    if (preset) {
-                      setWidth(preset.w);
-                      setHeight(preset.h);
-                    }
+          </SettingRow>
+
+          <SettingRow
+            title="Memory"
+            description={
+              <>
+                Recommended {fmtMem(recMin)} to {fmtMem(recMax)} for this system.
+              </>
+            }
+            className="cp-iset-row--memory"
+          >
+            <div class="cp-settings-heap">
+              <div class="cp-settings-heap-readout">
+                <span>
+                  Min <strong>{fmtMem(minMem)}</strong>
+                </span>
+                <span class="cp-settings-heap-band">{fmtMem(maxMem - minMem)} elastic</span>
+                <span>
+                  Max <strong>{fmtMem(maxMem)}</strong>
+                </span>
+              </div>
+              <div class="cp-settings-range-wrap">
+                <RangeSlider
+                  low={minMem}
+                  high={maxMem}
+                  min={1}
+                  max={ramMax}
+                  step={0.5}
+                  zones={memoryZones}
+                  sound="memory"
+                  onChange={(low, high) => {
+                    setMinMem(low);
+                    setMaxMem(high);
                   }}
+                  ariaLabelLow="Minimum heap in gigabytes"
+                  ariaLabelHigh="Maximum heap in gigabytes"
                 />
               </div>
-              <div class="cp-settings-dimensions">
-                <label>
-                  <span>Width</span>
-                  <Input
-                    type="number"
-                    value={String(width)}
-                    onChange={(v) => setWidth(clampWindowDimension(v, width))}
-                  />
-                </label>
-                <label>
-                  <span>Height</span>
-                  <Input
-                    type="number"
-                    value={String(height)}
-                    onChange={(v) => setHeight(clampWindowDimension(v, height))}
-                  />
-                </label>
-              </div>
             </div>
-          </Card>
-        </div>
+          </SettingRow>
 
-        <div id="cp-settings-identity" class="cp-iset-slot cp-iset-slot--identity">
-          <Card padding={18} class="cp-iset-card">
-            <div class="cp-iset-head">
-              <div>
-                <h3>Identity</h3>
-                <p>Tile shown for this instance across the library.</p>
-              </div>
-            </div>
-            <div class="cp-iset-body cp-settings-identity-control">
-              <InstanceTile inst={{ ...inst, art_seed: artSeed }} radius={12} className="cp-settings-avatar" />
-              <div>
-                <strong>Identity tile</strong>
-                <span>Used anywhere the instance needs a compact visual mark</span>
-              </div>
-              <Button
-                variant="secondary"
-                size="sm"
-                icon="refresh"
-                onClick={() => setArtSeed((seed) => nextArtSeed(seed))}
-              >
-                Shuffle colors
-              </Button>
-            </div>
-          </Card>
+          <SettingRow
+            title="Window"
+            description={`${activeWindowLabel} · ${width} x ${height}.`}
+            className="cp-iset-row--window"
+          >
+            <WindowSizeField
+              width={width}
+              height={height}
+              presets={WINDOW_PRESETS}
+              onChange={(w, h) => {
+                setWidth(w);
+                setHeight(h);
+              }}
+            />
+          </SettingRow>
         </div>
       </div>
     </div>

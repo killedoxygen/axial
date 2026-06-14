@@ -246,10 +246,23 @@
   font-size: 12px;
   font-weight: 600;
   cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
   transition:
     background 120ms,
     color 120ms,
     scale 70ms ease;
+}
+.cp-seg > button > svg {
+  flex-shrink: 0;
+  color: var(--text-mute);
+  transition: color 120ms;
+}
+.cp-seg > button:hover > svg,
+.cp-seg > button[data-active='true'] > svg {
+  color: var(--text);
 }
 .cp-seg > button:hover {
   color: var(--text);

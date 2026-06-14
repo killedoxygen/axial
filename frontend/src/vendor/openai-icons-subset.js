@@ -14,6 +14,7 @@ export { default as Clock } from '../../node_modules/@openai/apps-sdk-ui/dist/es
 export { default as ColorTheme } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/ColorTheme.js';
 export { default as Compass } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/Compass.js';
 export { default as Copy } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/Copy.js';
+export { default as Cube } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/Cube.js';
 export { default as DotsHorizontal } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/DotsHorizontal.js';
 export { default as Download } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/Download.js';
 export { default as Edit } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/Edit.js';
@@ -34,8 +35,11 @@ export { default as Pulse } from '../../node_modules/@openai/apps-sdk-ui/dist/es
 export { default as Reload } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/Reload.js';
 export { default as Search } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/Search.js';
 export { default as Settings } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/Settings.js';
+export { default as SettingsSlider } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/SettingsSlider.js';
 export { default as ShieldCheck } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/ShieldCheck.js';
+export { default as ShieldPerson } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/ShieldPerson.js';
 export { default as Skip } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/Skip.js';
+export { default as Sparkles } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/Sparkles.js';
 export { default as SoundOffSimpleMute } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/SoundOffSimpleMute.js';
 export { default as SoundOffSpeaker } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/SoundOffSpeaker.js';
 export { default as SoundOnReadOutLoudSpeaker } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/SoundOnReadOutLoudSpeaker.js';

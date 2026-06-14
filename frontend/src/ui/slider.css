@@ -97,6 +97,44 @@
   height: 28px;
 }
 
+.cp-rslider {
+  --lo: 0%;
+  --hi: 100%;
+}
+.cp-rslider-band {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: var(--lo);
+  right: calc(100% - var(--hi));
+  background: linear-gradient(90deg, var(--accent-strong), var(--accent));
+  opacity: 0.72;
+  border-radius: 999px;
+  z-index: 2;
+}
+.cp-rslider-input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  appearance: none;
+  -webkit-appearance: none;
+  background: transparent;
+  outline: none;
+  margin: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+.cp-rslider-thumb {
+  left: auto;
+}
+.cp-rslider-thumb--lo {
+  left: var(--lo);
+}
+.cp-rslider-thumb--hi {
+  left: var(--hi);
+}
+
 .cp-slider-ticks {
   display: flex;
   justify-content: space-between;

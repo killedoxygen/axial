@@ -1,7 +1,6 @@
 import type { JSX, ComponentChildren } from 'preact';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { Button, Card, Input, Pill } from '../../ui/Atoms';
-import { SelectField } from '../../ui/Select';
+import { Button, Card, Input, Pill, Segmented } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { Slider } from '../../ui/Slider';
 import { AccentField, AccentModeToggle } from './AccentEditor';
@@ -67,6 +66,7 @@ function SettingsCard({
 type ModeOption<T extends string> = {
   value: T;
   label: string;
+  icon: string;
   note: string;
 };
 
@@ -84,25 +84,23 @@ function ModeChoice<T extends string>({
   onChange: (value: T) => void;
 }): JSX.Element {
   const selected = options.find((option) => option.value === value) ?? options[0];
-  const selectId = `cp-settings-mode-${label.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
 
   return (
-    <div class="cp-settings-mode-choice">
-      <label class="cp-settings-mode-choice-label" htmlFor={selectId}>
-        {label}
-      </label>
-      <div class="cp-settings-mode-field">
-        <SelectField<T>
+    <div class="cp-settings-mode-choice" data-disabled={disabled ? 'true' : 'false'}>
+      <span class="cp-settings-mode-choice-label">{label}</span>
+      <div class="cp-settings-mode-seg" aria-label={label}>
+        <Segmented<T>
           value={value}
-          disabled={disabled}
-          ariaLabel={label}
-          onChange={onChange}
-          options={options.map((option) => ({ value: option.value, label: option.label }))}
+          onChange={(next) => {
+            if (disabled) return;
+            onChange(next);
+          }}
+          options={options.map((option) => ({ value: option.value, label: option.label, icon: option.icon }))}
         />
-        <div id={`${selectId}-note`} class="cp-settings-mode-note">
-          {selected?.note ?? ''}
-        </div>
       </div>
+      <p class="cp-settings-mode-note" aria-live="polite">
+        {selected?.note ?? ''}
+      </p>
     </div>
   );
 }
@@ -283,14 +281,34 @@ function GameplaySection(): JSX.Element {
 }
 
 const PERFORMANCE_OPTIONS: Array<ModeOption<PerformanceMode>> = [
-  { value: 'managed', label: 'Managed', note: 'Recommended defaults' },
-  { value: 'vanilla', label: 'Vanilla', note: 'No add-ons' },
-  { value: 'custom', label: 'Custom', note: 'Manual tuning' },
+  {
+    value: 'managed',
+    label: 'Managed',
+    icon: 'sparkles',
+    note: 'Croopor applies recommended tuning and optimizations for you.',
+  },
+  { value: 'vanilla', label: 'Vanilla', icon: 'cube', note: 'Pure Minecraft. No tweaks or add-ons applied at launch.' },
+  {
+    value: 'custom',
+    label: 'Custom',
+    icon: 'sliders',
+    note: 'You set the tuning. Your manual choices are kept as-is.',
+  },
 ];
 
 const GUARDIAN_OPTIONS: Array<ModeOption<GuardianMode>> = [
-  { value: 'managed', label: 'Managed', note: 'Warns and protects' },
-  { value: 'custom', label: 'Custom', note: 'Preserves; blocks fatal' },
+  {
+    value: 'managed',
+    label: 'Managed',
+    icon: 'shield-check',
+    note: 'Catches risky launch settings and fixes them automatically.',
+  },
+  {
+    value: 'custom',
+    label: 'Custom',
+    icon: 'shield-person',
+    note: 'Keeps your choices, warns instead of changing, blocks only fatal setups.',
+  },
 ];
 
 type RulesStatusState =
