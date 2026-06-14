@@ -256,10 +256,6 @@ async fn handle_auth_logout(
     auth_logout_for_state(&state).await
 }
 
-async fn active_minecraft_login_id(login_store: &Arc<AuthLoginStore>) -> Option<String> {
-    login_store.active_minecraft_login_id().await
-}
-
 async fn auth_status_for_store(
     config: &AppConfig,
     login_store: &Arc<AuthLoginStore>,
@@ -387,12 +383,9 @@ fn minecraft_account_can_launch_online(account: &AuthLoginMinecraftAccount) -> b
 }
 
 async fn auth_logout(login_store: &Arc<AuthLoginStore>) -> (StatusCode, Json<serde_json::Value>) {
-    let active_login_id = active_minecraft_login_id(login_store).await;
     match login_store.clear_all().await {
         Ok(had_msa_auth) => {
-            if let Some(login_id) = active_login_id {
-                super::skin::clear_pending_saved_skin_apply_for_login_id(&login_id).await;
-            }
+            super::skin::clear_all_pending_saved_skin_applies().await;
             (
                 StatusCode::OK,
                 Json(serde_json::json!(AuthLogoutResponse {
@@ -808,6 +801,7 @@ impl From<MicrosoftAuthError> for AuthRefreshFailure {
 mod tests {
     use super::*;
     use crate::auth_chain::AuthChainEndpoints;
+    use crate::routes::skin;
     use crate::state::{
         AppStateInit, AuthLoginMsaToken, InstallStore, NewAuthLoginMinecraftAccount,
         NewAuthLoginMsaToken, SessionStore,
@@ -1340,6 +1334,20 @@ mod tests {
         assert_eq!(second_response.0, StatusCode::OK);
         assert_eq!(second_response.1.0["status"], "logged_out");
         assert_eq!(second_response.1.0["had_msa_auth"], false);
+    }
+
+    #[tokio::test]
+    async fn auth_logout_clears_all_pending_skin_applies() {
+        let store = Arc::new(AuthLoginStore::new());
+        skin::clear_all_pending_saved_skin_applies().await;
+        skin::test_set_pending_saved_skin_apply_for_login_id("login-a").await;
+        skin::test_set_pending_saved_skin_apply_for_login_id("login-b").await;
+
+        let response = auth_logout(&store).await;
+
+        assert_eq!(response.0, StatusCode::OK);
+        assert_eq!(response.1.0["status"], "logged_out");
+        assert_eq!(skin::clear_all_pending_saved_skin_applies().await, 0);
     }
 
     #[tokio::test]

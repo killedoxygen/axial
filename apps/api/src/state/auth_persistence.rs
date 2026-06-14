@@ -12,6 +12,8 @@ const AUTH_SNAPSHOT_MAX_CHUNKS: usize = 128;
 #[cfg(not(test))]
 const AUTH_SNAPSHOT_SERVICE: &str = "croopor-auth";
 #[cfg(not(test))]
+const AUTH_SNAPSHOT_PREVIOUS_USER: &str = "minecraft-auth";
+#[cfg(not(test))]
 const AUTH_SNAPSHOT_CHUNK_INDEX_USER: &str = "minecraft-auth-v2-index";
 #[cfg(not(test))]
 const AUTH_SNAPSHOT_CHUNK_USER_PREFIX: &str = "minecraft-auth-v2";
@@ -498,6 +500,7 @@ impl AuthSnapshotPersistence for SecureAuthSnapshotPersistence {
                 .set_password(&value)
                 .map_err(|error| AuthPersistenceError::Unavailable(error.to_string()))?;
 
+            self.delete_entry_best_effort(AUTH_SNAPSHOT_PREVIOUS_USER);
             self.delete_chunk_range_best_effort(next_slot, chunks.len(), AUTH_SNAPSHOT_MAX_CHUNKS);
             if let Some(index) = previous_index
                 && index.active_slot < AUTH_SNAPSHOT_CHUNK_SLOT_COUNT
@@ -521,6 +524,7 @@ impl AuthSnapshotPersistence for SecureAuthSnapshotPersistence {
         #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         {
             let mut first_error = None;
+            self.delete_entry_best_effort(AUTH_SNAPSHOT_PREVIOUS_USER);
             if let Err(error) = self.delete_entry(AUTH_SNAPSHOT_CHUNK_INDEX_USER) {
                 first_error.get_or_insert_with(|| error.to_string());
             }

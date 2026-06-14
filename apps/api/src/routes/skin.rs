@@ -1723,6 +1723,21 @@ pub(crate) async fn clear_all_pending_saved_skin_applies() -> usize {
     cleared
 }
 
+#[cfg(test)]
+pub(crate) async fn test_set_pending_saved_skin_apply_for_login_id(login_id: &str) {
+    let mut pending = PENDING_SKIN_APPLIES.lock().await;
+    pending.pending.insert(
+        login_id.to_string(),
+        PendingSkinApplyEntry {
+            change: PendingSkinApplyChange {
+                login_id: login_id.to_string(),
+                texture_key: format!("test-texture-{login_id}"),
+            },
+            generation: 1,
+        },
+    );
+}
+
 async fn clear_pending_saved_skin_apply_for_active_account(state: &AppState) -> bool {
     let Some(account_state) = state
         .auth_logins()

@@ -152,14 +152,16 @@ async fn prepare_launch_session_with_auth_refresh(
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or(config.username.as_str());
+    let requested_offline_username = validate_username(requested_offline_username)
+        .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?;
     let active_account =
-        accounts::sync_active_offline_account_from_username(state, requested_offline_username)
+        accounts::sync_active_offline_account_from_username(state, &requested_offline_username)
             .map_err(launch_account_store_error_response)?;
     let requested_username = active_account
         .as_ref()
         .filter(|account| account.kind == LauncherAccountKind::Offline)
         .map(|account| account.display_name.as_str())
-        .unwrap_or(requested_offline_username)
+        .unwrap_or(requested_offline_username.as_str())
         .to_string();
     let offline_username = validate_username(&requested_username)
         .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?;
@@ -989,6 +991,39 @@ mod tests {
             .expect("active account")
             .expect("active account");
         assert_eq!(active.display_name, "NewName");
+    }
+
+    #[tokio::test]
+    async fn prepare_launch_session_rejects_invalid_offline_request_username_as_bad_request() {
+        let fixture = TestFixture::new("prepare-invalid-offline-name");
+        fixture
+            .state
+            .accounts()
+            .create_offline_account("LocalUser")
+            .expect("create offline account");
+        let instance_id = fixture.add_instance("Survival", "1.21.1");
+
+        let error = match prepare_launch_session(
+            &fixture.state,
+            LaunchRequest {
+                instance_id,
+                username: Some("Bad Name!".to_string()),
+                max_memory_mb: None,
+                min_memory_mb: None,
+                client_started_at_ms: None,
+            },
+        )
+        .await
+        {
+            Ok(_) => panic!("invalid username should fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.1.0["error"],
+            "Letters, numbers, and underscores only."
+        );
     }
 
     #[tokio::test]
