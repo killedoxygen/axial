@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { Icon } from '../../ui/Icons';
 import { addFloorSpotlight, addSceneLighting, buildSkinModel, modelBounds, type SkinModelBounds } from './skin-model';
 import { loadThree, type ThreeModule } from './skin-three-loader';
-import { loadBitmap, loadOptionalBitmap } from './skin-textures';
+import { loadOptionalBitmap, loadSkinBitmap } from './skin-textures';
 import type { SkinVariant } from './types';
 
 type SkinPreviewSide = 'front' | 'back';
@@ -114,7 +114,7 @@ async function setupScene(
 ): Promise<SceneHandle> {
   const THREE = await loadThree();
   const disposables: Array<() => void> = [];
-  const skinBitmap = await loadBitmap(props.src);
+  const skinBitmap = await loadSkinBitmap(props.src);
   const capeBitmap = await loadOptionalBitmap(props.capeSrc, 'cape');
   setCapeState(props.capeSrc ? (capeBitmap ? 'loaded' : 'omitted') : 'none');
   const renderer = new THREE.WebGLRenderer({

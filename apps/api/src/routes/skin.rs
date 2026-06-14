@@ -1000,8 +1000,13 @@ fn is_valid_normalized_skin_cache_png(bytes: &[u8]) -> bool {
         return false;
     }
 
-    decode_skin_png(bytes)
-        .is_ok_and(|decoded| decoded.width == SKIN_WIDTH && decoded.height == SKIN_HEIGHT)
+    decode_skin_png(bytes).is_ok_and(|decoded| {
+        decoded.width == SKIN_WIDTH
+            && decoded.height == SKIN_HEIGHT
+            && !has_transparent_skin_base_pixels(&decoded.rgba, suggest_skin_variant(&decoded.rgba))
+            && !(legacy_head_overlay_is_fully_opaque(&decoded.rgba)
+                && has_legacy_copied_limb_regions(&decoded.rgba))
+    })
 }
 
 fn is_valid_cape_texture_png(bytes: &[u8]) -> bool {
@@ -2945,16 +2950,22 @@ fn normalize_skin_png(bytes: &[u8]) -> Result<NormalizedSkinPng, ApiError> {
     }
 
     let original_height = decoded.height;
-    let normalized_rgba = if original_height == LEGACY_SKIN_HEIGHT {
+    let legacy_shaped = original_height == LEGACY_SKIN_HEIGHT
+        || (original_height == SKIN_HEIGHT
+            && (is_padded_legacy_skin_rgba(&decoded.rgba)
+                || (legacy_head_overlay_is_fully_opaque(&decoded.rgba)
+                    && has_legacy_copied_limb_regions(&decoded.rgba))));
+    let mut normalized_rgba = if legacy_shaped {
         normalize_legacy_skin_rgba(&decoded.rgba)
     } else {
         decoded.rgba
     };
-    let variant_suggestion = if original_height == LEGACY_SKIN_HEIGHT {
+    let variant_suggestion = if legacy_shaped {
         "classic"
     } else {
         suggest_skin_variant(&normalized_rgba)
     };
+    force_skin_base_alpha(&mut normalized_rgba, variant_suggestion);
     let png_bytes = encode_skin_png(&normalized_rgba)?;
 
     Ok(NormalizedSkinPng {
@@ -3053,7 +3064,184 @@ fn normalize_legacy_skin_rgba(rgba: &[u8]) -> Vec<u8> {
         let offset = row * row_len;
         normalized[offset..offset + row_len].copy_from_slice(&rgba[offset..offset + row_len]);
     }
+    if legacy_head_overlay_is_fully_opaque(&normalized) {
+        clear_skin_region(&mut normalized, 32, 0, 32, 16);
+    }
+    copy_legacy_limb_region(&mut normalized, 4, 16, 4, 4, 20, 48);
+    copy_legacy_limb_region(&mut normalized, 8, 16, 4, 4, 24, 48);
+    copy_legacy_limb_region(&mut normalized, 0, 20, 4, 12, 24, 52);
+    copy_legacy_limb_region(&mut normalized, 4, 20, 4, 12, 20, 52);
+    copy_legacy_limb_region(&mut normalized, 8, 20, 4, 12, 16, 52);
+    copy_legacy_limb_region(&mut normalized, 12, 20, 4, 12, 28, 52);
+
+    copy_legacy_limb_region(&mut normalized, 44, 16, 4, 4, 36, 48);
+    copy_legacy_limb_region(&mut normalized, 48, 16, 4, 4, 40, 48);
+    copy_legacy_limb_region(&mut normalized, 40, 20, 4, 12, 40, 52);
+    copy_legacy_limb_region(&mut normalized, 44, 20, 4, 12, 36, 52);
+    copy_legacy_limb_region(&mut normalized, 48, 20, 4, 12, 32, 52);
+    copy_legacy_limb_region(&mut normalized, 52, 20, 4, 12, 44, 52);
+
     normalized
+}
+
+fn copy_legacy_limb_region(
+    rgba: &mut [u8],
+    source_x: u32,
+    source_y: u32,
+    width: u32,
+    height: u32,
+    target_x: u32,
+    target_y: u32,
+) {
+    for y in 0..height {
+        for x in 0..width {
+            let source_index = (((source_y + y) * SKIN_WIDTH + source_x + x) * 4) as usize;
+            let target_index = (((target_y + y) * SKIN_WIDTH + target_x + x) * 4) as usize;
+            let pixel = [
+                rgba[source_index],
+                rgba[source_index + 1],
+                rgba[source_index + 2],
+                rgba[source_index + 3],
+            ];
+            rgba[target_index..target_index + 4].copy_from_slice(&pixel);
+        }
+    }
+}
+
+fn is_padded_legacy_skin_rgba(rgba: &[u8]) -> bool {
+    if rgba.len() < (SKIN_WIDTH * SKIN_HEIGHT * 4) as usize {
+        return false;
+    }
+
+    for y in LEGACY_SKIN_HEIGHT..SKIN_HEIGHT {
+        for x in 0..SKIN_WIDTH {
+            let alpha_index = ((y * SKIN_WIDTH + x) * 4 + 3) as usize;
+            if rgba[alpha_index] != 0 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn legacy_head_overlay_is_fully_opaque(rgba: &[u8]) -> bool {
+    if rgba.len() < (SKIN_WIDTH * SKIN_HEIGHT * 4) as usize {
+        return false;
+    }
+
+    for y in 0..16 {
+        for x in 32..64 {
+            let alpha_index = ((y * SKIN_WIDTH + x) * 4 + 3) as usize;
+            if rgba[alpha_index] != 255 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn has_legacy_copied_limb_regions(rgba: &[u8]) -> bool {
+    skin_regions_match(rgba, 0, 20, 24, 52, 4, 12)
+        && skin_regions_match(rgba, 4, 20, 20, 52, 4, 12)
+        && skin_regions_match(rgba, 40, 20, 40, 52, 4, 12)
+        && skin_regions_match(rgba, 44, 20, 36, 52, 4, 12)
+}
+
+fn skin_regions_match(
+    rgba: &[u8],
+    source_x: u32,
+    source_y: u32,
+    target_x: u32,
+    target_y: u32,
+    width: u32,
+    height: u32,
+) -> bool {
+    if rgba.len() < (SKIN_WIDTH * SKIN_HEIGHT * 4) as usize {
+        return false;
+    }
+
+    for y in 0..height {
+        for x in 0..width {
+            let source_index = (((source_y + y) * SKIN_WIDTH + source_x + x) * 4) as usize;
+            let target_index = (((target_y + y) * SKIN_WIDTH + target_x + x) * 4) as usize;
+            if rgba[source_index..source_index + 4] != rgba[target_index..target_index + 4] {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn clear_skin_region(rgba: &mut [u8], start_x: u32, start_y: u32, width: u32, height: u32) {
+    for y in start_y..start_y + height {
+        for x in start_x..start_x + width {
+            let index = ((y * SKIN_WIDTH + x) * 4) as usize;
+            if let Some(pixel) = rgba.get_mut(index..index + 4) {
+                pixel.copy_from_slice(&[0, 0, 0, 0]);
+            }
+        }
+    }
+}
+
+fn force_skin_base_alpha(rgba: &mut [u8], variant: &str) {
+    set_skin_base_region_alpha(rgba, 0, 0, 32, 16, variant);
+    set_skin_base_region_alpha(rgba, 0, 16, 64, 16, variant);
+    set_skin_base_region_alpha(rgba, 16, 48, 32, 16, variant);
+}
+
+fn has_transparent_skin_base_pixels(rgba: &[u8], variant: &str) -> bool {
+    skin_base_region_has_transparent_pixels(rgba, 0, 0, 32, 16, variant)
+        || skin_base_region_has_transparent_pixels(rgba, 0, 16, 64, 16, variant)
+        || skin_base_region_has_transparent_pixels(rgba, 16, 48, 32, 16, variant)
+}
+
+fn set_skin_base_region_alpha(
+    rgba: &mut [u8],
+    start_x: u32,
+    start_y: u32,
+    width: u32,
+    height: u32,
+    variant: &str,
+) {
+    for y in start_y..start_y + height {
+        for x in start_x..start_x + width {
+            if is_slim_unused_arm_pixel(x, y, variant) {
+                continue;
+            }
+            let alpha_index = ((y * SKIN_WIDTH + x) * 4 + 3) as usize;
+            if let Some(alpha) = rgba.get_mut(alpha_index) {
+                *alpha = 255;
+            }
+        }
+    }
+}
+
+fn skin_base_region_has_transparent_pixels(
+    rgba: &[u8],
+    start_x: u32,
+    start_y: u32,
+    width: u32,
+    height: u32,
+    variant: &str,
+) -> bool {
+    for y in start_y..start_y + height {
+        for x in start_x..start_x + width {
+            if is_slim_unused_arm_pixel(x, y, variant) {
+                continue;
+            }
+            let alpha_index = ((y * SKIN_WIDTH + x) * 4 + 3) as usize;
+            if rgba.get(alpha_index).copied().unwrap_or(255) != 255 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_slim_unused_arm_pixel(x: u32, y: u32, variant: &str) -> bool {
+    variant == "slim"
+        && (((54..56).contains(&x) && (20..32).contains(&y))
+            || ((46..48).contains(&x) && (52..64).contains(&y)))
 }
 
 fn suggest_skin_variant(rgba: &[u8]) -> &'static str {
@@ -4549,6 +4737,8 @@ mod tests {
     #[tokio::test]
     async fn skin_normalize_64x64_png_suggests_slim_when_arm_region_is_transparent() {
         let png = test_slim_skin_png();
+        let normalized = normalize_skin_png(&png).expect("normalized slim skin");
+        let decoded = decode_skin_png(&normalized.png_bytes).expect("normalized slim pixels");
 
         let response = normalize_skin_body(png)
             .await
@@ -4558,6 +4748,8 @@ mod tests {
         assert_eq!(response.variant_suggestion, "slim");
         assert_eq!(response.original_width, SKIN_WIDTH);
         assert_eq!(response.original_height, SKIN_HEIGHT);
+        assert_eq!(skin_rgba_pixel(&decoded.rgba, 54, 20)[3], 0);
+        assert_eq!(skin_rgba_pixel(&decoded.rgba, 8, 8)[3], 255);
         assert_texture_key(&response.texture_key);
     }
 
@@ -4583,6 +4775,15 @@ mod tests {
         assert_eq!(response.texture_key, repeated.texture_key);
         assert_eq!(response.normalized_byte_size, repeated.normalized_byte_size);
         assert_eq!(response.normalized_byte_size, expected.png_bytes.len());
+        let decoded = decode_skin_png(&expected.png_bytes).expect("normalized legacy pixels");
+        assert_eq!(
+            skin_rgba_pixel(&decoded.rgba, 20, 52),
+            skin_rgba_pixel(&decoded.rgba, 4, 20)
+        );
+        assert_eq!(
+            skin_rgba_pixel(&decoded.rgba, 36, 52),
+            skin_rgba_pixel(&decoded.rgba, 44, 20)
+        );
         assert_eq!(
             response.normalized_data_url,
             format!(
@@ -4591,6 +4792,78 @@ mod tests {
             )
         );
         assert_texture_key(&response.texture_key);
+    }
+
+    #[tokio::test]
+    async fn skin_normalize_legacy_base_pixels_are_opaque() {
+        let mut rgba = test_skin_rgba(SKIN_WIDTH, LEGACY_SKIN_HEIGHT);
+        set_skin_rgba_alpha(&mut rgba, 8, 8, 0);
+        set_skin_rgba_alpha(&mut rgba, 4, 31, 0);
+        set_skin_rgba_alpha(&mut rgba, 44, 31, 0);
+        let bad_cached =
+            encode_test_png(SKIN_WIDTH, SKIN_HEIGHT, &normalize_legacy_skin_rgba(&rgba));
+
+        let normalized =
+            normalize_skin_png(&encode_test_png(SKIN_WIDTH, LEGACY_SKIN_HEIGHT, &rgba))
+                .expect("transparent legacy base pixels should normalize");
+        let decoded = decode_skin_png(&normalized.png_bytes).expect("normalized legacy pixels");
+
+        assert!(!is_valid_normalized_skin_cache_png(&bad_cached));
+        assert_eq!(skin_rgba_pixel(&decoded.rgba, 8, 8), [24, 40, 16, 255]);
+        assert_eq!(skin_rgba_pixel(&decoded.rgba, 4, 31), [12, 155, 35, 255]);
+        assert_eq!(skin_rgba_pixel(&decoded.rgba, 20, 63), [12, 155, 35, 255]);
+        assert_eq!(skin_rgba_pixel(&decoded.rgba, 36, 63), [132, 155, 75, 255]);
+        assert!(is_valid_normalized_skin_cache_png(&normalized.png_bytes));
+    }
+
+    #[tokio::test]
+    async fn skin_normalize_fully_opaque_legacy_head_overlay_is_cleared() {
+        let mut rgba = test_skin_rgba(SKIN_WIDTH, LEGACY_SKIN_HEIGHT);
+        fill_skin_rgba_region(&mut rgba, 32, 0, 32, 16, [12, 34, 56, 255]);
+
+        let normalized =
+            normalize_skin_png(&encode_test_png(SKIN_WIDTH, LEGACY_SKIN_HEIGHT, &rgba))
+                .expect("fully opaque legacy overlay should normalize");
+        let decoded = decode_skin_png(&normalized.png_bytes).expect("normalized legacy pixels");
+        let mut stale_cached = normalize_legacy_skin_rgba(&rgba);
+        fill_skin_rgba_region(&mut stale_cached, 32, 0, 32, 16, [12, 34, 56, 255]);
+
+        assert_eq!(skin_rgba_pixel(&decoded.rgba, 8, 8), [24, 40, 16, 255]);
+        assert_eq!(skin_rgba_pixel(&decoded.rgba, 40, 8), [0, 0, 0, 0]);
+        assert!(!is_valid_normalized_skin_cache_png(&encode_test_png(
+            SKIN_WIDTH,
+            SKIN_HEIGHT,
+            &stale_cached
+        )));
+        assert!(is_valid_normalized_skin_cache_png(&normalized.png_bytes));
+    }
+
+    #[tokio::test]
+    async fn skin_normalize_padded_legacy_64x64_repairs_left_limbs() {
+        let legacy = test_skin_rgba(SKIN_WIDTH, LEGACY_SKIN_HEIGHT);
+        let mut padded = vec![0; (SKIN_WIDTH * SKIN_HEIGHT * 4) as usize];
+        let row_len = (SKIN_WIDTH * 4) as usize;
+        for row in 0..LEGACY_SKIN_HEIGHT as usize {
+            let offset = row * row_len;
+            padded[offset..offset + row_len].copy_from_slice(&legacy[offset..offset + row_len]);
+        }
+
+        let normalized = normalize_skin_png(&encode_test_png(SKIN_WIDTH, SKIN_HEIGHT, &padded))
+            .expect("padded legacy skin should normalize");
+        let decoded =
+            decode_skin_png(&normalized.png_bytes).expect("normalized padded legacy pixels");
+
+        assert_eq!(normalized.original_width, SKIN_WIDTH);
+        assert_eq!(normalized.original_height, SKIN_HEIGHT);
+        assert_eq!(normalized.variant_suggestion, "classic");
+        assert_eq!(
+            skin_rgba_pixel(&decoded.rgba, 24, 52),
+            skin_rgba_pixel(&decoded.rgba, 0, 20)
+        );
+        assert_eq!(
+            skin_rgba_pixel(&decoded.rgba, 40, 52),
+            skin_rgba_pixel(&decoded.rgba, 40, 20)
+        );
     }
 
     #[tokio::test]
@@ -8570,6 +8843,37 @@ mod tests {
             }
         }
         rgba
+    }
+
+    fn skin_rgba_pixel(rgba: &[u8], x: u32, y: u32) -> [u8; 4] {
+        let index = ((y * SKIN_WIDTH + x) * 4) as usize;
+        [
+            rgba[index],
+            rgba[index + 1],
+            rgba[index + 2],
+            rgba[index + 3],
+        ]
+    }
+
+    fn set_skin_rgba_alpha(rgba: &mut [u8], x: u32, y: u32, alpha: u8) {
+        let index = ((y * SKIN_WIDTH + x) * 4 + 3) as usize;
+        rgba[index] = alpha;
+    }
+
+    fn fill_skin_rgba_region(
+        rgba: &mut [u8],
+        start_x: u32,
+        start_y: u32,
+        width: u32,
+        height: u32,
+        pixel: [u8; 4],
+    ) {
+        for y in start_y..start_y + height {
+            for x in start_x..start_x + width {
+                let index = ((y * SKIN_WIDTH + x) * 4) as usize;
+                rgba[index..index + 4].copy_from_slice(&pixel);
+            }
+        }
     }
 
     fn encode_test_png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {

@@ -1,6 +1,6 @@
 import { addSceneLighting, buildSkinModel } from './skin-model';
 import { loadThree, type ThreeModule } from './skin-three-loader';
-import { loadBitmap, loadOptionalBitmap } from './skin-textures';
+import { loadOptionalBitmap, loadSkinBitmap } from './skin-textures';
 import type { SkinVariant } from './types';
 
 const SNAPSHOT_WIDTH = 320;
@@ -11,7 +11,7 @@ const SNAPSHOT_CENTER_Y = 21.4;
 const SNAPSHOT_HALF_HEIGHT = 13.2;
 const MAX_SNAPSHOT_CACHE_SIZE = 180;
 const MAX_STORED_SNAPSHOT_CACHE_SIZE = 320;
-const SNAPSHOT_RENDER_VERSION = 2;
+const SNAPSHOT_RENDER_VERSION = 3;
 const SNAPSHOT_DB_NAME = 'croopor-skin-snapshots';
 const SNAPSHOT_DB_VERSION = 1;
 const SNAPSHOT_STORE_NAME = 'snapshots';
@@ -162,7 +162,7 @@ function canvasBlob(canvas: HTMLCanvasElement): Promise<Blob> {
 
 async function renderSnapshot(input: SkinSnapshotInput, side: SnapshotSide): Promise<Blob> {
   const { THREE, renderer, canvas } = await snapshotRig();
-  const skinBitmap = await loadBitmap(input.src, input.textureIdentity);
+  const skinBitmap = await loadSkinBitmap(input.src, input.textureIdentity);
   const capeBitmap = await loadOptionalBitmap(input.capeSrc, 'cape snapshot', input.capeIdentity);
   const disposables: Array<() => void> = [];
 

@@ -30,6 +30,13 @@ export interface SkinModelBounds {
   halfHeight: number;
 }
 
+const CAPE_WIDTH = 10;
+const CAPE_HEIGHT = 16;
+const CAPE_DEPTH = 1;
+const CAPE_PIVOT_Y = 24;
+const CAPE_PIVOT_Z = -2.65;
+const CAPE_LEAN_RADIANS = 0.12;
+
 function region(x: number, y: number, w: number, h: number): Region {
   return { x, y, w, h };
 }
@@ -78,6 +85,27 @@ function legFaces(frontX: number, rowX: number, topY: number, rowY: number): Fac
     ny: region(frontX + 4, topY, 4, 4),
     pz: region(frontX, rowY, 4, 12),
     nz: region(frontX + 8, rowY, 4, 12),
+  };
+}
+
+function capeRegion(image: ImageBitmap, x: number, y: number, w: number, h: number): Region {
+  const scale = image.width >= 64 && image.height >= 32 ? image.width / 64 : 1;
+  return region(
+    Math.round(x * scale),
+    Math.round(y * scale),
+    Math.max(1, Math.round(w * scale)),
+    Math.max(1, Math.round(h * scale)),
+  );
+}
+
+function capeFaces(image: ImageBitmap): FaceRegions {
+  return {
+    px: capeRegion(image, 11, 1, 1, 16),
+    nx: capeRegion(image, 0, 1, 1, 16),
+    py: capeRegion(image, 1, 0, 10, 1),
+    ny: capeRegion(image, 11, 0, 10, 1),
+    pz: capeRegion(image, 12, 1, 10, 16),
+    nz: capeRegion(image, 1, 1, 10, 16),
   };
 }
 
@@ -163,17 +191,29 @@ function addCape({
   image: ImageBitmap;
   disposables: Array<() => void>;
 }): void {
-  const { texture, material } = textureFromRegion(THREE, image, region(1, 1, 10, 16), true);
-  material.side = THREE.DoubleSide;
-  const geometry = new THREE.PlaneGeometry(10, 16);
-  const mesh = new THREE.Mesh(geometry, material);
-  mesh.position.set(0, 16, -3.05);
-  mesh.rotation.x = -0.06;
-  group.add(mesh);
+  const pivot = new THREE.Group();
+  pivot.position.set(0, CAPE_PIVOT_Y, CAPE_PIVOT_Z);
+  pivot.rotation.x = CAPE_LEAN_RADIANS;
+
+  const faces = capeFaces(image);
+  const faceOrder: Region[] = [faces.px, faces.nx, faces.py, faces.ny, faces.pz, faces.nz];
+  const materialPairs = faceOrder.map((face) => textureFromRegion(THREE, image, face, true));
+  const geometry = new THREE.BoxGeometry(CAPE_WIDTH, CAPE_HEIGHT, CAPE_DEPTH);
+  const mesh = new THREE.Mesh(
+    geometry,
+    materialPairs.map((pair) => pair.material),
+  );
+  mesh.position.set(0, -CAPE_HEIGHT / 2, -CAPE_DEPTH / 2);
+  pivot.add(mesh);
+  group.add(pivot);
+
   disposables.push(() => {
+    group.remove(pivot);
     geometry.dispose();
-    texture.dispose();
-    material.dispose();
+    for (const pair of materialPairs) {
+      pair.texture.dispose();
+      pair.material.dispose();
+    }
   });
 }
 
