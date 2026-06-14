@@ -244,7 +244,7 @@ impl Downloader {
             } else {
                 match self.resolve_manifest_download(version_id).await {
                     Ok(download) => download,
-                    Err(error) if path_is_file(&json_path).await => VersionJsonDownload {
+                    Err(_) if path_is_file(&json_path).await => VersionJsonDownload {
                         url: String::new(),
                         expected: ExpectedIntegrity::default(),
                         force_download: false,

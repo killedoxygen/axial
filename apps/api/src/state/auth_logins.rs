@@ -474,7 +474,7 @@ impl AuthLoginStore {
             let mut minecraft_accounts = self.minecraft_accounts.write().await;
             if minecraft_accounts
                 .get(&login_id)
-                .map_or(true, |account| account.expires_at <= now)
+                .is_none_or(|account| account.expires_at <= now)
             {
                 minecraft_accounts.remove(&login_id);
             }

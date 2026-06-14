@@ -201,19 +201,21 @@ async fn handle_auth_refresh(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let response = auth_refresh(state.auth_logins()).await;
-    if response.0 == StatusCode::OK {
-        if let Some(active) = state
+    let active = if response.0 == StatusCode::OK {
+        state
             .auth_logins()
             .active_current_minecraft_account_state()
             .await
-        {
-            if let Ok(account) = accounts::upsert_microsoft_account(&state, &active.account) {
-                if let Err(error) = accounts::sync_config_for_account(&state, &account) {
-                    tracing::warn!("account config sync after auth refresh failed: {error}");
-                }
-            } else {
-                tracing::warn!("account store sync after auth refresh failed");
+    } else {
+        None
+    };
+    if let Some(active) = active {
+        if let Ok(account) = accounts::upsert_microsoft_account(&state, &active.account) {
+            if let Err(error) = accounts::sync_config_for_account(&state, &account) {
+                tracing::warn!("account config sync after auth refresh failed: {error}");
             }
+        } else {
+            tracing::warn!("account store sync after auth refresh failed");
         }
     }
     response
@@ -228,19 +230,21 @@ async fn handle_auth_profile_sync(
     };
 
     let response = auth_profile_sync(state.auth_logins(), &auth_chain_client).await;
-    if response.0 == StatusCode::OK {
-        if let Some(active) = state
+    let active = if response.0 == StatusCode::OK {
+        state
             .auth_logins()
             .active_current_minecraft_account_state()
             .await
-        {
-            if let Ok(account) = accounts::upsert_microsoft_account(&state, &active.account) {
-                if let Err(error) = accounts::sync_config_for_account(&state, &account) {
-                    tracing::warn!("account config sync after profile sync failed: {error}");
-                }
-            } else {
-                tracing::warn!("account store sync after profile sync failed");
+    } else {
+        None
+    };
+    if let Some(active) = active {
+        if let Ok(account) = accounts::upsert_microsoft_account(&state, &active.account) {
+            if let Err(error) = accounts::sync_config_for_account(&state, &account) {
+                tracing::warn!("account config sync after profile sync failed: {error}");
             }
+        } else {
+            tracing::warn!("account store sync after profile sync failed");
         }
     }
     response

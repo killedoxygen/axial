@@ -499,12 +499,11 @@ impl AuthSnapshotPersistence for SecureAuthSnapshotPersistence {
                 .map_err(|error| AuthPersistenceError::Unavailable(error.to_string()))?;
 
             self.delete_chunk_range_best_effort(next_slot, chunks.len(), AUTH_SNAPSHOT_MAX_CHUNKS);
-            if let Some(index) = previous_index {
-                if index.active_slot < AUTH_SNAPSHOT_CHUNK_SLOT_COUNT
-                    && index.active_slot != next_slot
-                {
-                    self.delete_chunk_range_best_effort(index.active_slot, 0, index.chunks);
-                }
+            if let Some(index) = previous_index
+                && index.active_slot < AUTH_SNAPSHOT_CHUNK_SLOT_COUNT
+                && index.active_slot != next_slot
+            {
+                self.delete_chunk_range_best_effort(index.active_slot, 0, index.chunks);
             }
 
             Ok(())

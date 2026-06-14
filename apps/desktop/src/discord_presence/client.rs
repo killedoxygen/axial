@@ -125,6 +125,28 @@ impl DiscordRpcClient {
     }
 }
 
+fn rpc_error_message(payload: &Value) -> Option<String> {
+    let is_error = payload.get("evt").and_then(Value::as_str) == Some("ERROR")
+        || payload.get("cmd").and_then(Value::as_str) == Some("ERROR");
+    if !is_error {
+        return None;
+    }
+
+    let code = payload
+        .pointer("/data/code")
+        .and_then(Value::as_i64)
+        .map(|value| value.to_string());
+    let message = payload
+        .pointer("/data/message")
+        .and_then(Value::as_str)
+        .unwrap_or("Discord RPC returned an error");
+
+    Some(match code {
+        Some(code) => format!("{message} ({code})"),
+        None => message.to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::transport::{IpcStream, read_frame, write_frame};
@@ -250,26 +272,4 @@ mod tests {
         ));
         server.join().expect("server should join");
     }
-}
-
-fn rpc_error_message(payload: &Value) -> Option<String> {
-    let is_error = payload.get("evt").and_then(Value::as_str) == Some("ERROR")
-        || payload.get("cmd").and_then(Value::as_str) == Some("ERROR");
-    if !is_error {
-        return None;
-    }
-
-    let code = payload
-        .pointer("/data/code")
-        .and_then(Value::as_i64)
-        .map(|value| value.to_string());
-    let message = payload
-        .pointer("/data/message")
-        .and_then(Value::as_str)
-        .unwrap_or("Discord RPC returned an error");
-
-    Some(match code {
-        Some(code) => format!("{message} ({code})"),
-        None => message.to_string(),
-    })
 }
