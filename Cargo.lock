@@ -721,7 +721,7 @@ dependencies = [
 
 [[package]]
 name = "croopor-api"
-version = "0.3.1"
+version = "0.4.0-alpha"
 dependencies = [
  "async-stream",
  "axum",
@@ -758,7 +758,7 @@ dependencies = [
 
 [[package]]
 name = "croopor-config"
-version = "0.3.1"
+version = "0.4.0-alpha"
 dependencies = [
  "chrono",
  "croopor-minecraft",
@@ -769,7 +769,7 @@ dependencies = [
 
 [[package]]
 name = "croopor-desktop"
-version = "0.3.1"
+version = "0.4.0-alpha"
 dependencies = [
  "croopor-api",
  "croopor-config",
@@ -788,7 +788,7 @@ dependencies = [
 
 [[package]]
 name = "croopor-launcher"
-version = "0.3.1"
+version = "0.4.0-alpha"
 dependencies = [
  "croopor-minecraft",
  "md5",
@@ -803,7 +803,7 @@ dependencies = [
 
 [[package]]
 name = "croopor-minecraft"
-version = "0.3.1"
+version = "0.4.0-alpha"
 dependencies = [
  "chrono",
  "futures-util",
@@ -820,7 +820,7 @@ dependencies = [
 
 [[package]]
 name = "croopor-performance"
-version = "0.3.1"
+version = "0.4.0-alpha"
 dependencies = [
  "chrono",
  "ed25519-dalek",

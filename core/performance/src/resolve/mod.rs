@@ -1861,7 +1861,7 @@ mod tests {
         let error = serde_json::from_value::<Manifest>(serde_json::json!({
             "schema_version": 1,
             "generated_at": "2026-04-02T00:00:00Z",
-            "minimum_app_version": "0.3.1",
+            "minimum_app_version": "0.4.0-alpha",
             "rule_channel": "bundled",
             "artifacts": [],
             "compositions": []
@@ -1876,7 +1876,7 @@ mod tests {
         let error = serde_json::from_value::<Manifest>(serde_json::json!({
             "schema_version": 1,
             "generated_at": "2026-04-02T00:00:00Z",
-            "minimum_app_version": "0.3.1",
+            "minimum_app_version": "0.4.0-alpha",
             "rule_channel": "bundled",
             "compositions": [],
             "emergency_disables": []
@@ -1906,7 +1906,7 @@ mod tests {
         let error = serde_json::from_value::<Manifest>(serde_json::json!({
             "schema_version": 1,
             "generated_at": "2026-04-02T00:00:00Z",
-            "minimum_app_version": "0.3.1",
+            "minimum_app_version": "0.4.0-alpha",
             "artifacts": [],
             "compositions": [],
             "emergency_disables": []
@@ -1919,11 +1919,11 @@ mod tests {
     #[test]
     fn validation_rejects_incompatible_or_invalid_manifest_metadata() {
         let mut too_new = builtin_manifest().expect("manifest");
-        too_new.minimum_app_version = "0.3.2".to_string();
+        too_new.minimum_app_version = "0.4.0".to_string();
         assert_error_kind(
             validate_manifest(&too_new),
             ResolveError::UnsupportedAppVersion {
-                required: "0.3.2".to_string(),
+                required: "0.4.0".to_string(),
                 running: env!("CARGO_PKG_VERSION").to_string(),
             },
         );
@@ -1970,7 +1970,7 @@ mod tests {
     #[test]
     fn validation_rejects_invalid_running_app_version_without_panicking() {
         assert_error_kind(
-            validate_app_version_compatibility_with_running("0.3.1", "development-build"),
+            validate_app_version_compatibility_with_running("0.4.0-alpha", "development-build"),
             ResolveError::InvalidRunningAppVersion("development-build".to_string()),
         );
     }
@@ -2020,7 +2020,7 @@ mod tests {
         let error = serde_json::from_value::<Manifest>(serde_json::json!({
             "schema_version": 1,
             "generated_at": "2026-04-02T00:00:00Z",
-            "minimum_app_version": "0.3.1",
+            "minimum_app_version": "0.4.0-alpha",
             "rule_channel": "bundled",
             "artifacts": [{
                 "id": "sodium",
