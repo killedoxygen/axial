@@ -64,9 +64,7 @@ export interface ApiError extends Error {
 }
 
 export function isApiError(error: unknown): error is ApiError {
-  return error instanceof Error
-    && error.name === 'ApiError'
-    && typeof (error as Partial<ApiError>).status === 'number';
+  return error instanceof Error && error.name === 'ApiError' && typeof (error as Partial<ApiError>).status === 'number';
 }
 
 export async function api(method: string, path: string, body?: unknown): Promise<any> {
@@ -153,10 +151,12 @@ function apiErrorMessage(response: Response, payload: unknown): string {
 }
 
 function isErrorPayload(payload: unknown): payload is { error: string } {
-  return typeof payload === 'object'
-    && payload !== null
-    && typeof (payload as { error?: unknown }).error === 'string'
-    && (payload as { error: string }).error.trim().length > 0;
+  return (
+    typeof payload === 'object' &&
+    payload !== null &&
+    typeof (payload as { error?: unknown }).error === 'string' &&
+    (payload as { error: string }).error.trim().length > 0
+  );
 }
 
 function boundedErrorMessage(value: string): string {

@@ -28,9 +28,7 @@ export interface SkinSnapshotInput {
   capeIdentity?: string;
 }
 
-export type SnapshotState =
-  | { status: 'idle' | 'queued' | 'loading' | 'error' }
-  | { status: 'ready'; url: string };
+export type SnapshotState = { status: 'idle' | 'queued' | 'loading' | 'error' } | { status: 'ready'; url: string };
 
 interface SnapshotRig {
   THREE: ThreeModule;
@@ -104,8 +102,9 @@ async function pruneStoredSnapshots(database: IDBDatabase): Promise<void> {
     const request = store.getAll();
     request.onerror = () => resolve();
     request.onsuccess = () => {
-      const records = (request.result as Array<{ key: string; updatedAt?: number }>)
-        .sort((left, right) => (left.updatedAt ?? 0) - (right.updatedAt ?? 0));
+      const records = (request.result as Array<{ key: string; updatedAt?: number }>).sort(
+        (left, right) => (left.updatedAt ?? 0) - (right.updatedAt ?? 0),
+      );
       for (const record of records.slice(0, Math.max(0, records.length - MAX_STORED_SNAPSHOT_CACHE_SIZE))) {
         store.delete(record.key);
       }
@@ -190,12 +189,7 @@ async function renderSnapshot(input: SkinSnapshotInput, side: SnapshotSide): Pro
     parts.rightLeg.rotation.x = -0.06;
     parts.leftLeg.rotation.x = 0.06;
 
-    const camera = new THREE.PerspectiveCamera(
-      SNAPSHOT_FOV,
-      SNAPSHOT_WIDTH / SNAPSHOT_HEIGHT,
-      0.1,
-      500,
-    );
+    const camera = new THREE.PerspectiveCamera(SNAPSHOT_FOV, SNAPSHOT_WIDTH / SNAPSHOT_HEIGHT, 0.1, 500);
     const distance = SNAPSHOT_HALF_HEIGHT / Math.tan(THREE.MathUtils.degToRad(SNAPSHOT_FOV) / 2);
     camera.position.set(0, SNAPSHOT_CENTER_Y, distance);
     camera.lookAt(0, SNAPSHOT_CENTER_Y, 0);
@@ -240,9 +234,11 @@ function pruneSnapshotCache(): void {
 }
 
 function idle(callback: () => void): void {
-  const requestIdle = (window as Window & {
-    requestIdleCallback?: (next: () => void, options?: { timeout: number }) => number;
-  }).requestIdleCallback;
+  const requestIdle = (
+    window as Window & {
+      requestIdleCallback?: (next: () => void, options?: { timeout: number }) => number;
+    }
+  ).requestIdleCallback;
   if (requestIdle) {
     requestIdle(callback, { timeout: 700 });
     return;
@@ -349,11 +345,7 @@ export function getSkinSnapshot(input: SkinSnapshotInput, side: SnapshotSide = '
   return ensureEntry(input, side).state;
 }
 
-export function requestSkinSnapshot(
-  input: SkinSnapshotInput,
-  side: SnapshotSide = 'front',
-  priority = 0,
-): void {
+export function requestSkinSnapshot(input: SkinSnapshotInput, side: SnapshotSide = 'front', priority = 0): void {
   const entry = ensureEntry(input, side);
   if (entry.state.status === 'ready' || entry.state.status === 'loading') return;
   entry.generationRequested = true;
@@ -364,11 +356,7 @@ export function requestSkinSnapshot(
   if (entry.hydrated) queueEntry(entry);
 }
 
-export function subscribeSkinSnapshot(
-  input: SkinSnapshotInput,
-  side: SnapshotSide,
-  listener: () => void,
-): () => void {
+export function subscribeSkinSnapshot(input: SkinSnapshotInput, side: SnapshotSide, listener: () => void): () => void {
   const entry = ensureEntry(input, side);
   entry.listeners.add(listener);
   return () => {

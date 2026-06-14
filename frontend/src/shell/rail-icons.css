@@ -29,25 +29,25 @@
 .cp-rail-stack-layer--base {
   transition-duration: 420ms;
 }
-.cp-rail-btn[data-icon="stack"]:is(:hover, :focus-visible) .cp-rail-stack-layer--top {
+.cp-rail-btn[data-icon='stack']:is(:hover, :focus-visible) .cp-rail-stack-layer--top {
   transform: translateY(-2.25px);
 }
-.cp-rail-btn[data-icon="stack"]:is(:hover, :focus-visible) .cp-rail-stack-layer--mid {
+.cp-rail-btn[data-icon='stack']:is(:hover, :focus-visible) .cp-rail-stack-layer--mid {
   transform: translateY(0.55px) scaleX(0.96);
 }
-.cp-rail-btn[data-icon="stack"]:is(:hover, :focus-visible) .cp-rail-stack-layer--base {
+.cp-rail-btn[data-icon='stack']:is(:hover, :focus-visible) .cp-rail-stack-layer--base {
   transform: translateY(1.65px) scaleX(0.92);
 }
-.cp-rail-btn[data-icon="search"]:is(:hover, :focus-visible) .cp-rail-icon > svg {
+.cp-rail-btn[data-icon='search']:is(:hover, :focus-visible) .cp-rail-icon > svg {
   transform: rotate(-7deg) translate(-0.4px, -0.1px) scale(1.03);
 }
-.cp-rail-btn[data-icon="home"]:is(:hover, :focus-visible) .cp-rail-icon > svg {
+.cp-rail-btn[data-icon='home']:is(:hover, :focus-visible) .cp-rail-icon > svg {
   transform: translateY(-1.1px) scale(1.025);
 }
-.cp-rail-btn[data-icon="plus"]:is(:hover, :focus-visible) .cp-rail-icon > svg {
+.cp-rail-btn[data-icon='plus']:is(:hover, :focus-visible) .cp-rail-icon > svg {
   transform: rotate(90deg) scale(1.02);
 }
-.cp-rail-btn[data-icon="settings"]:is(:hover, :focus-visible) .cp-rail-icon > svg > path:first-child {
+.cp-rail-btn[data-icon='settings']:is(:hover, :focus-visible) .cp-rail-icon > svg > path:first-child {
   transform: rotate(48deg);
   transform-box: fill-box;
   transform-origin: center;

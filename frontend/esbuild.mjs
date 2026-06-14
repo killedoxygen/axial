@@ -34,7 +34,7 @@ const openaiIconSubsetPlugin = {
 const preactCompatAliasPlugin = {
   name: 'preact-compat-alias',
   setup(b) {
-    b.onResolve({ filter: /^react(?:-dom|\/jsx-runtime|\/jsx-dev-runtime)?$/ }, args => {
+    b.onResolve({ filter: /^react(?:-dom|\/jsx-runtime|\/jsx-dev-runtime)?$/ }, (args) => {
       const target = reactCompatAliases.get(args.path);
       if (!target) return;
       return { path: require.resolve(target, { paths: [process.cwd()] }) };
@@ -62,10 +62,10 @@ const shared = {
 const sizeReporter = {
   name: 'size',
   setup(b) {
-    b.onEnd(result => {
+    b.onEnd((result) => {
       if (result.errors.length) return;
       for (const [path, out] of Object.entries(result.metafile?.outputs ?? {})) {
-        if (out.entryPoint || out.imports.some(imported => imported.kind === 'dynamic-import')) {
+        if (out.entryPoint || out.imports.some((imported) => imported.kind === 'dynamic-import')) {
           console.log(`  ${path}  ${(out.bytes / 1024).toFixed(1)}kb`);
         }
       }
@@ -102,7 +102,7 @@ function isValidPort(value) {
 }
 
 function canListenOn(port) {
-  return new Promise(resolve => {
+  return new Promise((resolve) => {
     const server = net.createServer();
     server.unref();
     server.once('error', () => resolve(false));
@@ -131,14 +131,17 @@ async function resolveDevPort() {
 }
 
 async function cleanGeneratedOutputs() {
-  await Promise.all(generatedOutputs.map(path => rm(path, { recursive: true, force: true })));
+  await Promise.all(generatedOutputs.map((path) => rm(path, { recursive: true, force: true })));
 }
 
 if (mode === 'serve') {
   // Standalone dev server, rebuilds per request and does not write to disk
   const port = await resolveDevPort();
   currentCtx = await context({
-    ...shared, sourcemap: 'inline', metafile: true, plugins: [...shared.plugins, sizeReporter],
+    ...shared,
+    sourcemap: 'inline',
+    metafile: true,
+    plugins: [...shared.plugins, sizeReporter],
   });
   const server = await currentCtx.serve({ servedir: 'static', port });
   console.log(`dev → http://localhost:${server.port}`);
@@ -146,7 +149,10 @@ if (mode === 'serve') {
 } else if (mode === 'watch') {
   // File watcher for desktop development, rebuilds to disk on source change
   currentCtx = await context({
-    ...shared, sourcemap: 'inline', metafile: true, plugins: [...shared.plugins, sizeReporter],
+    ...shared,
+    sourcemap: 'inline',
+    metafile: true,
+    plugins: [...shared.plugins, sizeReporter],
   });
   await currentCtx.watch();
   console.log('watching → static/app.js');

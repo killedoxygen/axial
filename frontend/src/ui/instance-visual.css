@@ -7,14 +7,15 @@
   justify-content: center;
   container-type: size;
   isolation: isolate;
-  background:
-    linear-gradient(170deg,
-      color-mix(in oklab, var(--surface-3) 74%, oklch(0.58 0.16 var(--cp-tile-h))),
-      color-mix(in oklab, var(--surface) 84%, oklch(0.45 0.14 var(--cp-tile-h))));
+  background: linear-gradient(
+    170deg,
+    color-mix(in oklab, var(--surface-3) 74%, oklch(0.58 0.16 var(--cp-tile-h))),
+    color-mix(in oklab, var(--surface) 84%, oklch(0.45 0.14 var(--cp-tile-h)))
+  );
 }
 
 .cp-tile::after {
-  content: "";
+  content: '';
   position: absolute;
   inset: 0;
   pointer-events: none;
@@ -53,10 +54,10 @@
   mask-size: contain;
 }
 
-.cp-tile-glyph--mask[data-loader="quilt"] {
+.cp-tile-glyph--mask[data-loader='quilt'] {
   translate: 2.1cqmin 2.1cqmin;
 }
 
-.cp-tile-glyph--mask[data-loader="forge"] {
+.cp-tile-glyph--mask[data-loader='forge'] {
   translate: 0 2.1cqmin;
 }

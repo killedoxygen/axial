@@ -24,8 +24,7 @@ function textureCacheKey(src: string, identity?: string): string | null {
 
 function pruneTextureBlobCache(): void {
   if (textureBlobCache.size <= MAX_TEXTURE_BLOB_CACHE_SIZE) return;
-  const entries = [...textureBlobCache.entries()]
-    .sort((left, right) => left[1].lastUsed - right[1].lastUsed);
+  const entries = [...textureBlobCache.entries()].sort((left, right) => left[1].lastUsed - right[1].lastUsed);
   for (const [key] of entries.slice(0, textureBlobCache.size - MAX_TEXTURE_BLOB_CACHE_SIZE)) {
     textureBlobCache.delete(key);
   }

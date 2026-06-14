@@ -1,15 +1,14 @@
 import { useRef, useState } from 'preact/hooks';
-import {
-  signInWithMicrosoft,
-  type NativeMicrosoftSignInResult,
-} from '../../native';
+import { signInWithMicrosoft, type NativeMicrosoftSignInResult } from '../../native';
 import { boundedMessage } from './api';
 
 export type MicrosoftSignInMessage = { tone: 'ok' | 'err'; text: string } | null;
 
 interface MicrosoftSignInOptions {
   canStart?: boolean;
-  onAuthenticated?: (result: NativeMicrosoftSignInResult) => Promise<MicrosoftSignInMessage | void> | MicrosoftSignInMessage | void;
+  onAuthenticated?: (
+    result: NativeMicrosoftSignInResult,
+  ) => Promise<MicrosoftSignInMessage | void> | MicrosoftSignInMessage | void;
 }
 
 export function useMicrosoftSignIn(options: MicrosoftSignInOptions = {}): {
@@ -59,9 +58,10 @@ export function useMicrosoftSignIn(options: MicrosoftSignInOptions = {}): {
         return;
       }
 
-      const profileName = typeof result.profile_name === 'string' && result.profile_name.trim()
-        ? result.profile_name.trim()
-        : 'Minecraft profile';
+      const profileName =
+        typeof result.profile_name === 'string' && result.profile_name.trim()
+          ? result.profile_name.trim()
+          : 'Minecraft profile';
       setMessage({ tone: 'ok', text: `${profileName} verified. Online launch is ready.` });
     } catch (err: unknown) {
       setMessage({

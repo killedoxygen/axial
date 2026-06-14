@@ -97,19 +97,33 @@
    inside the column so the centered stage + status row still fit comfortably
    between the top strip and the fixed bottom bar. */
 @media (max-height: 720px) {
-  .cp-ob-stage { gap: 16px; }
-  .cp-ob-headline { font-size: 30px; }
-  .cp-ob-statusbar { padding: 10px clamp(20px, 4vw, 40px); }
+  .cp-ob-stage {
+    gap: 16px;
+  }
+  .cp-ob-headline {
+    font-size: 30px;
+  }
+  .cp-ob-statusbar {
+    padding: 10px clamp(20px, 4vw, 40px);
+  }
 }
 
 @media (max-height: 600px) {
-  .cp-ob-stage { gap: 12px; }
-  .cp-ob-statusbar { padding: 8px clamp(20px, 4vw, 40px); }
+  .cp-ob-stage {
+    gap: 12px;
+  }
+  .cp-ob-statusbar {
+    padding: 8px clamp(20px, 4vw, 40px);
+  }
 }
 
 @keyframes cp-ob-root-in {
-  from { opacity: 0; }
-  to   { opacity: 1; }
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
 }
 
 .cp-ob-root.is-dissolving {
@@ -118,8 +132,14 @@
 }
 
 @keyframes cp-ob-dissolve {
-  from { opacity: 1; transform: scale(1); }
-  to   { opacity: 0; transform: scale(1.015); }
+  from {
+    opacity: 1;
+    transform: scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: scale(1.015);
+  }
 }
 
 /* Top strip (drag region + window controls) ------------------------------ */
@@ -161,8 +181,14 @@
 }
 
 @keyframes cp-ob-stepper-in {
-  from { opacity: 0; transform: translateY(-4px); }
-  to   { opacity: 1; transform: none; }
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
 }
 
 .cp-ob-stepper-item {
@@ -176,10 +202,14 @@
   font: inherit;
   color: var(--text-mute);
   cursor: default;
-  transition: background-color 200ms ease, color 200ms ease;
+  transition:
+    background-color 200ms ease,
+    color 200ms ease;
 }
 
-button.cp-ob-stepper-item { cursor: pointer; }
+button.cp-ob-stepper-item {
+  cursor: pointer;
+}
 
 button.cp-ob-stepper-item:hover {
   background: var(--surface-2);
@@ -191,9 +221,11 @@ button.cp-ob-stepper-item:focus-visible {
   outline-offset: 2px;
 }
 
-.cp-ob-stepper-item[data-state="past"] { color: var(--text-dim); }
+.cp-ob-stepper-item[data-state='past'] {
+  color: var(--text-dim);
+}
 
-.cp-ob-stepper-item[data-state="active"] {
+.cp-ob-stepper-item[data-state='active'] {
   color: var(--text);
   background: var(--accent-softer);
 }
@@ -204,15 +236,17 @@ button.cp-ob-stepper-item:focus-visible {
   letter-spacing: 0;
   font-variant-numeric: tabular-nums;
   opacity: 0.55;
-  transition: color 200ms ease, opacity 200ms ease;
+  transition:
+    color 200ms ease,
+    opacity 200ms ease;
 }
 
-.cp-ob-stepper-item[data-state="past"] .cp-ob-stepper-num {
+.cp-ob-stepper-item[data-state='past'] .cp-ob-stepper-num {
   color: var(--accent);
   opacity: 0.85;
 }
 
-.cp-ob-stepper-item[data-state="active"] .cp-ob-stepper-num {
+.cp-ob-stepper-item[data-state='active'] .cp-ob-stepper-num {
   color: var(--accent);
   opacity: 1;
 }
@@ -225,7 +259,7 @@ button.cp-ob-stepper-item:focus-visible {
   transition: font-weight 200ms ease;
 }
 
-.cp-ob-stepper-item[data-state="active"] .cp-ob-stepper-label {
+.cp-ob-stepper-item[data-state='active'] .cp-ob-stepper-label {
   font-weight: 600;
 }
 
@@ -247,8 +281,14 @@ button.cp-ob-stepper-item:focus-visible {
 }
 
 @keyframes cp-ob-stage-in {
-  from { opacity: 0; transform: translateY(10px); }
-  to   { opacity: 1; transform: none; }
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
 }
 
 .cp-ob-headline {
@@ -267,8 +307,14 @@ button.cp-ob-stepper-item:focus-visible {
 }
 
 @keyframes cp-ob-word-rise {
-  from { opacity: 0; transform: translateY(8px); }
-  to   { opacity: 1; transform: none; }
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
 }
 
 .cp-ob-subline {
@@ -292,7 +338,10 @@ button.cp-ob-stepper-item:focus-visible {
   height: 52px;
   padding: 0 18px;
   border-radius: 14px;
-  transition: box-shadow 200ms ease, border-color 200ms ease, background-color 240ms ease;
+  transition:
+    box-shadow 200ms ease,
+    border-color 200ms ease,
+    background-color 240ms ease;
 }
 
 /* Override the Atom's accent-colored focus ring: a neutral high-contrast border
@@ -336,8 +385,14 @@ button.cp-ob-stepper-item:focus-visible {
 }
 
 @keyframes cp-ob-feedback-in {
-  from { opacity: 0; transform: translateY(-2px); }
-  to   { opacity: 1; transform: none; }
+  from {
+    opacity: 0;
+    transform: translateY(-2px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
 }
 
 .cp-ob-feedback kbd {
@@ -373,7 +428,10 @@ button.cp-ob-stepper-item:focus-visible {
   font-weight: 500;
   text-align: left;
   cursor: pointer;
-  transition: background-color 180ms ease, border-color 180ms ease, color 180ms ease;
+  transition:
+    background-color 180ms ease,
+    border-color 180ms ease,
+    color 180ms ease;
 }
 
 .cp-ob-msa:not(:disabled):hover {
@@ -387,7 +445,7 @@ button.cp-ob-stepper-item:focus-visible {
   cursor: not-allowed;
 }
 
-.cp-ob-msa[data-state="signed-in"] {
+.cp-ob-msa[data-state='signed-in'] {
   border-color: color-mix(in srgb, var(--ok) 28%, transparent);
   color: var(--text);
 }
@@ -426,8 +484,12 @@ button.cp-ob-stepper-item:focus-visible {
   line-height: 1.35;
 }
 
-.cp-ob-auth-message[data-tone="ok"] { color: var(--ok); }
-.cp-ob-auth-message[data-tone="err"] { color: var(--err); }
+.cp-ob-auth-message[data-tone='ok'] {
+  color: var(--ok);
+}
+.cp-ob-auth-message[data-tone='err'] {
+  color: var(--err);
+}
 
 /* Memory reading */
 .cp-ob-memory {
@@ -482,8 +544,14 @@ button.cp-ob-stepper-item:focus-visible {
 }
 
 @keyframes cp-ob-weirdo-in {
-  from { opacity: 0; transform: translateX(-6px) rotate(-5deg); }
-  to   { opacity: 1; transform: none; }
+  from {
+    opacity: 0;
+    transform: translateX(-6px) rotate(-5deg);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
 }
 
 /* Music pills ------------------------------------------------------------- */
@@ -509,12 +577,17 @@ button.cp-ob-stepper-item:focus-visible {
   font-size: 14px;
   font-weight: 500;
   cursor: pointer;
-  transition: background-color 200ms ease, color 200ms ease, border-color 200ms ease;
+  transition:
+    background-color 200ms ease,
+    color 200ms ease,
+    border-color 200ms ease;
 }
 
-.cp-ob-pill:hover { background: var(--surface-3); }
+.cp-ob-pill:hover {
+  background: var(--surface-3);
+}
 
-.cp-ob-pill[data-active="true"] {
+.cp-ob-pill[data-active='true'] {
   background: var(--accent-fill);
   color: var(--accent-on);
   border-color: transparent;
@@ -534,8 +607,14 @@ button.cp-ob-stepper-item:focus-visible {
 }
 
 @keyframes cp-ob-footnote-in {
-  from { opacity: 0; transform: translateY(4px); }
-  to   { opacity: 0.85; transform: none; }
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 0.85;
+    transform: none;
+  }
 }
 
 /* Reduced motion ---------------------------------------------------------- */
@@ -546,7 +625,13 @@ button.cp-ob-stepper-item:focus-visible {
   .cp-ob-root *::before,
   .cp-ob-root *::after {
     animation: none !important;
-    transition: opacity 120ms linear, background-color 160ms linear, color 160ms linear !important;
+    transition:
+      opacity 120ms linear,
+      background-color 160ms linear,
+      color 160ms linear !important;
   }
-  .cp-ob-word { opacity: 1 !important; transform: none !important; }
+  .cp-ob-word {
+    opacity: 1 !important;
+    transform: none !important;
+  }
 }

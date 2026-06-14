@@ -28,11 +28,7 @@ export function useAuthStatus(savedUsername: string): {
         if (isRecord(res) && typeof res.error === 'string') throw new Error(res.error);
         let parsed = authStatusResponse(res);
         if (!parsed) throw new Error('invalid auth status');
-        if (
-          parsed.launch_auth_mode === 'online' &&
-          !parsed.online_mode_ready &&
-          parsed.msa_refresh_available
-        ) {
+        if (parsed.launch_auth_mode === 'online' && !parsed.online_mode_ready && parsed.msa_refresh_available) {
           try {
             await api('POST', '/auth/refresh');
             if (!active) return;
@@ -86,7 +82,8 @@ export function useLauncherAccounts(): {
         let parsed = launcherAccountsResponse(res);
         if (!parsed) throw new Error('invalid account list');
         const activeAccount = parsed.accounts.find((account) => account.active);
-        const activeNeedsRefresh = activeAccount?.kind === 'microsoft' &&
+        const activeNeedsRefresh =
+          activeAccount?.kind === 'microsoft' &&
           activeAccount.msa_refresh_available === true &&
           !(
             activeAccount.minecraft_profile_ready === true &&
@@ -150,9 +147,12 @@ export function useSavedSkins(): {
         machine.dispatch({
           type: 'load_failed',
           requestId,
-          error: isApiError(err) && isRecord(err.payload) && typeof err.payload.error === 'string'
-            ? err.payload.error
-            : err instanceof Error ? err.message : 'Saved skins are unavailable.',
+          error:
+            isApiError(err) && isRecord(err.payload) && typeof err.payload.error === 'string'
+              ? err.payload.error
+              : err instanceof Error
+                ? err.message
+                : 'Saved skins are unavailable.',
         });
       });
   }, [machine]);

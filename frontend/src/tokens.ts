@@ -1,4 +1,3 @@
-
 export interface AccentScale {
   base: string;
   strong: string;
@@ -26,7 +25,13 @@ export interface NeutralScale {
   shadow: string;
 }
 
-export interface Radii { xs: number; sm: number; md: number; lg: number; xl: number; }
+export interface Radii {
+  xs: number;
+  sm: number;
+  md: number;
+  lg: number;
+  xl: number;
+}
 
 export interface Theme {
   dark: boolean;
@@ -45,7 +50,7 @@ export interface Theme {
 export function buildAccent(hue: number, dark: boolean, vibrancy = 100): AccentScale {
   const L = dark ? 0.78 : 0.62;
   const clampedVibrancy = Math.max(0, Math.min(100, vibrancy));
-  const C = 0.14 * clampedVibrancy / 100;
+  const C = (0.14 * clampedVibrancy) / 100;
   const Lf = dark ? 0.58 : 0.52;
   const Cf = 0.15 * Math.max(0.6, clampedVibrancy / 100);
   return {
@@ -93,7 +98,9 @@ export function buildNeutrals(dark: boolean, hue = 140): NeutralScale {
   };
 }
 
-export function buildTheme(opts: { dark?: boolean; hue?: number; vibrancy?: number; radius?: number; density?: number } = {}): Theme {
+export function buildTheme(
+  opts: { dark?: boolean; hue?: number; vibrancy?: number; radius?: number; density?: number } = {},
+): Theme {
   const dark = opts.dark ?? true;
   const hue = opts.hue ?? 140;
   const vibrancy = opts.vibrancy ?? 100;
@@ -132,7 +139,10 @@ export function hashStr(s: string): number {
   return h >>> 0;
 }
 
-export function gradientFor(name: string, dark: boolean): { bg: string; hue1: number; hue2: number; angle: number; accent: string } {
+export function gradientFor(
+  name: string,
+  dark: boolean,
+): { bg: string; hue1: number; hue2: number; angle: number; accent: string } {
   const h = hashStr(name || 'x');
   const hue1 = h % 360;
   const hue2 = (hue1 + 40 + ((h >> 8) % 80)) % 360;
@@ -141,7 +151,9 @@ export function gradientFor(name: string, dark: boolean): { bg: string; hue1: nu
   const L2 = dark ? 0.22 : 0.86;
   const C = 0.12;
   return {
-    hue1, hue2, angle,
+    hue1,
+    hue2,
+    angle,
     bg: `linear-gradient(${angle}deg, oklch(${L1} ${C} ${hue1}), oklch(${L2} ${C} ${hue2}))`,
     accent: `oklch(${L1} ${C} ${hue1})`,
   };

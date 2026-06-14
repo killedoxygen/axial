@@ -42,14 +42,18 @@ export function ScreenshotsPane({
     return next;
   }, [screenshots, sort]);
   const viewedShot = viewer ? screenshots.find((shot) => shot.name === viewer) : undefined;
-  const selection = useSelection(sortedScreenshots, useCallback((shot: InstanceScreenshot) => shot.name, []));
-  const menuItems = (shot: InstanceScreenshot) => screenshotMenuItems({
-    inst,
-    shot,
-    selectionItem: selectionMenuItem(selection, shot.name),
-    onView: () => setViewer(shot.name),
-    onRefresh,
-  });
+  const selection = useSelection(
+    sortedScreenshots,
+    useCallback((shot: InstanceScreenshot) => shot.name, []),
+  );
+  const menuItems = (shot: InstanceScreenshot) =>
+    screenshotMenuItems({
+      inst,
+      shot,
+      selectionItem: selectionMenuItem(selection, shot.name),
+      onView: () => setViewer(shot.name),
+      onRefresh,
+    });
   const deleteSelected = async (): Promise<void> => {
     await deleteScreenshots(inst, selection.selectedItems, clearAndRefresh);
   };
@@ -65,7 +69,9 @@ export function ScreenshotsPane({
   return (
     <div class="cp-instance-body" style={{ display: 'block' }}>
       <div class="cp-resource-toolbar cp-screenshots-toolbar">
-        <strong>{screenshots.length} screenshot{screenshots.length === 1 ? '' : 's'}</strong>
+        <strong>
+          {screenshots.length} screenshot{screenshots.length === 1 ? '' : 's'}
+        </strong>
         <div class="cp-screenshots-tools">
           <div class="cp-mini-seg" role="tablist" aria-label="Sort screenshots">
             {(Object.keys(SCREENSHOT_SORT_LABELS) as ScreenshotSort[]).map((item) => (
@@ -81,13 +87,26 @@ export function ScreenshotsPane({
               </button>
             ))}
           </div>
-          <Button variant="secondary" size="sm" icon="refresh" onClick={onRefresh}>Refresh</Button>
-          <Button variant="soft" size="sm" icon="folder" onClick={() => void openInstanceFolder(inst.id, 'screenshots')}>Open screenshots</Button>
+          <Button variant="secondary" size="sm" icon="refresh" onClick={onRefresh}>
+            Refresh
+          </Button>
+          <Button
+            variant="soft"
+            size="sm"
+            icon="folder"
+            onClick={() => void openInstanceFolder(inst.id, 'screenshots')}
+          >
+            Open screenshots
+          </Button>
         </div>
       </div>
       <ResourceStatus state={resources} onRetry={onRefresh} />
       {screenshots.length === 0 && resources.status !== 'loading' ? (
-        <ResourceEmpty icon="image" title="No screenshots yet" hint="Minecraft saves screenshots here after you capture them in game." />
+        <ResourceEmpty
+          icon="image"
+          title="No screenshots yet"
+          hint="Minecraft saves screenshots here after you capture them in game."
+        />
       ) : (
         <div class="cp-screenshots-grid">
           {sortedScreenshots.map((shot) => (
@@ -116,8 +135,12 @@ export function ScreenshotsPane({
               </button>
               <div class="cp-screenshot-caption">
                 <div class="cp-screenshot-text">
-                  <div class="cp-screenshot-name" title={shot.name}>{shot.name}</div>
-                  <div class="cp-screenshot-meta">{fmtBytes(shot.size)} · {fmtRelative(shot.modified_at)}</div>
+                  <div class="cp-screenshot-name" title={shot.name}>
+                    {shot.name}
+                  </div>
+                  <div class="cp-screenshot-meta">
+                    {fmtBytes(shot.size)} · {fmtRelative(shot.modified_at)}
+                  </div>
                 </div>
                 <button
                   class="cp-resource-action"
@@ -139,15 +162,24 @@ export function ScreenshotsPane({
           aria-modal="true"
           aria-label={viewedShot.name}
           onClick={() => setViewer('')}
-          onKeyDown={(e: KeyboardEvent) => { if (e.key === 'Escape') setViewer(''); }}
+          onKeyDown={(e: KeyboardEvent) => {
+            if (e.key === 'Escape') setViewer('');
+          }}
         >
           <div class="cp-screenshot-viewer-panel" onClick={(e) => e.stopPropagation()}>
             <div class="cp-screenshot-viewer-bar">
               <div>
                 <strong title={viewedShot.name}>{viewedShot.name}</strong>
-                <span>{fmtBytes(viewedShot.size)} · {fmtRelative(viewedShot.modified_at)}</span>
+                <span>
+                  {fmtBytes(viewedShot.size)} · {fmtRelative(viewedShot.modified_at)}
+                </span>
               </div>
-              <button class="cp-resource-action" type="button" aria-label="Close screenshot viewer" onClick={() => setViewer('')}>
+              <button
+                class="cp-resource-action"
+                type="button"
+                aria-label="Close screenshot viewer"
+                onClick={() => setViewer('')}
+              >
                 <Icon name="x" size={15} />
               </button>
             </div>
@@ -158,9 +190,7 @@ export function ScreenshotsPane({
       <SelectionActionPill
         selection={selection}
         itemLabel="screenshot"
-        actions={[
-          { label: 'Delete', icon: 'trash', danger: true, onClick: () => void deleteSelected() },
-        ]}
+        actions={[{ label: 'Delete', icon: 'trash', danger: true, onClick: () => void deleteSelected() }]}
       />
     </div>
   );

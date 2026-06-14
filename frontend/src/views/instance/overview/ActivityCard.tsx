@@ -5,7 +5,10 @@ import { Card } from '../../../ui/Atoms';
 import type { EnrichedInstance, InstanceResourceSummary } from '../../../types';
 import { fmtRelative } from '../format';
 
-interface ActivityItem { label: string; relative: string }
+interface ActivityItem {
+  label: string;
+  relative: string;
+}
 
 export function ActivityCard({
   inst,
@@ -36,7 +39,9 @@ export function ActivityCard({
   return (
     <Card padding={18}>
       <div class="cp-od-head cp-od-head--iconed">
-        <div class="cp-od-head-tile"><Icon name="activity" size={13} stroke={1.9} /></div>
+        <div class="cp-od-head-tile">
+          <Icon name="activity" size={13} stroke={1.9} />
+        </div>
         <h3>Activity</h3>
         <button class="cp-od-link" type="button" onClick={onOpenLogs}>
           View all <Icon name="chevron-right" size={11} stroke={2.2} />

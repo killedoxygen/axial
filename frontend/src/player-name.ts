@@ -38,10 +38,7 @@ export async function promptNewPlayerName(): Promise<string | null> {
   return next || null;
 }
 
-export async function savePlayerName(
-  raw: string,
-  successMessage = 'Player name updated',
-): Promise<boolean> {
+export async function savePlayerName(raw: string, successMessage = 'Player name updated'): Promise<boolean> {
   const validationError = validateUsername(raw);
   if (validationError !== null) {
     toast(`Invalid name: ${validationError}`, 'error');
@@ -55,11 +52,9 @@ export async function savePlayerName(
       return false;
     }
     if (activeAccount?.kind === 'offline') {
-      const response: any = await api(
-        'PATCH',
-        `/accounts/${encodeURIComponent(activeAccount.account_id)}`,
-        { username: nextName },
-      );
+      const response: any = await api('PATCH', `/accounts/${encodeURIComponent(activeAccount.account_id)}`, {
+        username: nextName,
+      });
       if (response.error) throw new Error(response.error);
       config.value = await api('GET', '/config');
     } else {

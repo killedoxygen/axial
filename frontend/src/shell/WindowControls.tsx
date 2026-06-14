@@ -29,7 +29,9 @@ export function WindowControls(): JSX.Element | null {
 
   if (!isNative) return null;
 
-  const onMin = (): void => { void windowMinimize(); };
+  const onMin = (): void => {
+    void windowMinimize();
+  };
   const onMax = async (): Promise<void> => {
     const next = await windowToggleMaximize();
     if (next != null) setMaximized(next);

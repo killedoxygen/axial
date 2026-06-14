@@ -89,16 +89,25 @@ function FeatureBanner({ inst }: { inst: EnrichedInstance }): JSX.Element {
           </div>
         </div>
         <div class="cp-feature-actions">
-          {running && <Pill tone="accent" icon="play">Playing</Pill>}
+          {running && (
+            <Pill tone="accent" icon="play">
+              Playing
+            </Pill>
+          )}
           {installing && <Pill icon={install.state === 'queued' ? 'clock' : 'download'}>{installBadge}</Pill>}
           <Button
             size="lg"
-            icon={installing ? install.state === 'queued' ? 'clock' : 'download' : 'play'}
+            icon={installing ? (install.state === 'queued' ? 'clock' : 'download') : 'play'}
             title={installing ? installBadge : `Play ${inst.name}`}
             disabled={installing}
-            onClick={(e) => { e.stopPropagation(); open(); }}
+            onClick={(e) => {
+              e.stopPropagation();
+              open();
+            }}
             sound="launchPress"
-          >{installing ? installBadge : 'Play'}</Button>
+          >
+            {installing ? installBadge : 'Play'}
+          </Button>
         </div>
       </div>
     </div>
@@ -111,8 +120,13 @@ function EmptyHome(): JSX.Element {
       <div class="cp-empty">
         <Icon name="stack" size={36} color="var(--text-mute)" />
         <h2>Create your first instance</h2>
-        <p>Instances are isolated Minecraft setups. Pick a version, bundle mods, and launch without touching your other worlds.</p>
-        <Button icon="plus" onClick={openCreate}>New instance</Button>
+        <p>
+          Instances are isolated Minecraft setups. Pick a version, bundle mods, and launch without touching your other
+          worlds.
+        </p>
+        <Button icon="plus" onClick={openCreate}>
+          New instance
+        </Button>
       </div>
     </Card>
   );
@@ -137,7 +151,10 @@ export function HomeView(): JSX.Element {
     <div class="cp-view-page">
       <div class="cp-page-header">
         <div>
-          <h1>{greetingFor(now)}{cfg?.username ? `, ${cfg.username}` : ''}.</h1>
+          <h1>
+            {greetingFor(now)}
+            {cfg?.username ? `, ${cfg.username}` : ''}.
+          </h1>
           <div class="cp-page-sub">
             {all.length === 0
               ? 'Set up your first instance to start playing.'
@@ -145,7 +162,9 @@ export function HomeView(): JSX.Element {
           </div>
         </div>
         <div style={{ flex: 1 }} />
-        <Button variant="secondary" icon="plus" onClick={openCreate}>New instance</Button>
+        <Button variant="secondary" icon="plus" onClick={openCreate}>
+          New instance
+        </Button>
       </div>
 
       {all.length === 0 ? (
@@ -160,12 +179,8 @@ export function HomeView(): JSX.Element {
                 action={{ label: 'See all', onClick: () => navigate({ name: 'instances' }) }}
               />
               <div class="cp-cover-grid">
-                {rest.map(inst => (
-                  <InstanceCard
-                    key={inst.id}
-                    inst={inst}
-                    onContextMenu={(e) => openInstanceContextMenu(e, inst)}
-                  />
+                {rest.map((inst) => (
+                  <InstanceCard key={inst.id} inst={inst} onContextMenu={(e) => openInstanceContextMenu(e, inst)} />
                 ))}
               </div>
             </div>

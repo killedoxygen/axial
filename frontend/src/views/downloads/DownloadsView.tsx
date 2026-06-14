@@ -79,24 +79,36 @@ export function DownloadsView(): JSX.Element {
     ? `1 active task${queue.length > 0 ? ` · ${queuedLabel}` : ''}`
     : failure
       ? `Install failed${queue.length > 0 ? ` · ${queuedLabel}` : ''}`
-    : queue.length > 0
-      ? `No active task · ${queuedLabel}`
-      : 'Nothing downloading';
+      : queue.length > 0
+        ? `No active task · ${queuedLabel}`
+        : 'Nothing downloading';
   const failureCard = failure ? (
     <Card>
       <SectionHeading
         title="Install failed"
-        right={<Pill tone="err" icon="alert">Failed</Pill>}
+        right={
+          <Pill tone="err" icon="alert">
+            Failed
+          </Pill>
+        }
       />
       <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
         <div style={{ minWidth: 0, flex: '1 1 260px' }}>
-          <div style={{
-            fontSize: 13, fontWeight: 600, color: theme.n.text,
-            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-          }}>
+          <div
+            style={{
+              fontSize: 13,
+              fontWeight: 600,
+              color: theme.n.text,
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            }}
+          >
             {failure.displayName}
           </div>
-          <div style={{ fontSize: 12, color: theme.n.textDim, marginTop: 4, lineHeight: 1.45, overflowWrap: 'anywhere' }}>
+          <div
+            style={{ fontSize: 12, color: theme.n.textDim, marginTop: 4, lineHeight: 1.45, overflowWrap: 'anywhere' }}
+          >
             {failure.message}
           </div>
           <div style={{ fontSize: 11, color: theme.n.textMute, marginTop: 6 }}>
@@ -104,13 +116,10 @@ export function DownloadsView(): JSX.Element {
           </div>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginLeft: 'auto' }}>
-          <Button variant="secondary" size="sm" icon="refresh" onClick={retryFailedInstall}>Retry</Button>
-          <IconButton
-            icon="x"
-            size={28}
-            tooltip="Dismiss failed install"
-            onClick={clearInstallFailure}
-          />
+          <Button variant="secondary" size="sm" icon="refresh" onClick={retryFailedInstall}>
+            Retry
+          </Button>
+          <IconButton icon="x" size={28} tooltip="Dismiss failed install" onClick={clearInstallFailure} />
         </div>
       </div>
     </Card>
@@ -118,20 +127,29 @@ export function DownloadsView(): JSX.Element {
 
   return (
     <div class="cp-view-page" style={{ gap: 20 }}>
-
       {hasActive ? (
         <Card>
           <SectionHeading
             title={activeTitle}
-            right={(
-              <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+            right={
+              <div
+                style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}
+              >
                 {phaseLabel && <Pill>{phaseLabel}</Pill>}
                 {activeEta && <Pill icon="clock">{activeEta}</Pill>}
                 {queue.length > 0 && <Pill icon="clock">{queuedLabel}</Pill>}
               </div>
-            )}
+            }
           />
-          <div style={{ fontSize: 12, color: theme.n.textDim, marginBottom: 8, lineHeight: 1.45, overflowWrap: 'anywhere' }}>
+          <div
+            style={{
+              fontSize: 12,
+              color: theme.n.textDim,
+              marginBottom: 8,
+              lineHeight: 1.45,
+              overflowWrap: 'anywhere',
+            }}
+          >
             {state.label}
           </div>
           <div class="cp-download-active-meter">
@@ -141,25 +159,28 @@ export function DownloadsView(): JSX.Element {
             <div class="cp-download-step">
               <div class="cp-download-step-head">
                 <span>{stepTitle}</span>
-                <span>{stepRatio ? `${stepRatio} · ` : ''}{stepPct}%</span>
+                <span>
+                  {stepRatio ? `${stepRatio} · ` : ''}
+                  {stepPct}%
+                </span>
               </div>
               <div class="cp-download-active-meter cp-download-active-meter--step">
                 <Meter value={stepPct} ariaLabel={`${stepTitle} progress for ${activeTitle}`} />
               </div>
-              <div class="cp-download-step-label">
-                {activeStep.label}
-              </div>
+              <div class="cp-download-step-label">{activeStep.label}</div>
             </div>
           )}
-          <div style={{
-            display: 'flex',
-            justifyContent: 'space-between',
-            gap: 12,
-            marginTop: 7,
-            color: theme.n.textMute,
-            fontSize: 11,
-            lineHeight: 1.35,
-          }}>
+          <div
+            style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              gap: 12,
+              marginTop: 7,
+              color: theme.n.textMute,
+              fontSize: 11,
+              lineHeight: 1.35,
+            }}
+          >
             <span>{formatElapsedTime(state.startedAt, elapsedNow)}</span>
             <span style={{ fontVariantNumeric: 'tabular-nums' }}>
               {activeEta ? `${activeEta} · ` : ''}
@@ -167,7 +188,15 @@ export function DownloadsView(): JSX.Element {
             </span>
           </div>
           {nextQueuedLabel && (
-            <div style={{ fontSize: 11.5, color: theme.n.textMute, marginTop: 10, lineHeight: 1.4, overflowWrap: 'anywhere' }}>
+            <div
+              style={{
+                fontSize: 11.5,
+                color: theme.n.textMute,
+                marginTop: 10,
+                lineHeight: 1.4,
+                overflowWrap: 'anywhere',
+              }}
+            >
               Next: {nextQueuedLabel}
             </div>
           )}
@@ -186,7 +215,9 @@ export function DownloadsView(): JSX.Element {
             ) : (
               <>
                 <h2>Nothing downloading</h2>
-                <p>Launch an instance that needs a download, or install a new Minecraft version, and it'll show up here.</p>
+                <p>
+                  Launch an instance that needs a download, or install a new Minecraft version, and it'll show up here.
+                </p>
               </>
             )}
           </div>
@@ -197,25 +228,58 @@ export function DownloadsView(): JSX.Element {
 
       {queue.length > 0 && (
         <Card padding={10}>
-          <div style={{ fontSize: 11, fontWeight: 600, textTransform: 'uppercase', letterSpacing: 0, color: theme.n.textMute, padding: '8px 10px' }}>
+          <div
+            style={{
+              fontSize: 11,
+              fontWeight: 600,
+              textTransform: 'uppercase',
+              letterSpacing: 0,
+              color: theme.n.textMute,
+              padding: '8px 10px',
+            }}
+          >
             Queue
           </div>
           {queue.map((item, i) => {
             const itemLabel = formatInstallItemLabel(item);
             return (
-              <div key={item.versionId + i} style={{
-                display: 'flex', alignItems: 'center', gap: 10,
-                padding: '10px', borderTop: `1px solid ${theme.n.line}`,
-              }}>
+              <div
+                key={item.versionId + i}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 10,
+                  padding: '10px',
+                  borderTop: `1px solid ${theme.n.line}`,
+                }}
+              >
                 <span style={{ width: 18, fontSize: 11, color: theme.n.textMute, fontVariantNumeric: 'tabular-nums' }}>
                   {i + 1}
                 </span>
                 <div style={{ display: 'flex', alignItems: 'baseline', gap: 6, minWidth: 0, flex: 1 }}>
-                  <span style={{ fontSize: 13, color: theme.n.text, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  <span
+                    style={{
+                      fontSize: 13,
+                      color: theme.n.text,
+                      minWidth: 0,
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                    }}
+                  >
                     {itemLabel}
                   </span>
                   {item.loader && (
-                    <span style={{ fontSize: 11, color: theme.n.textMute, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    <span
+                      style={{
+                        fontSize: 11,
+                        color: theme.n.textMute,
+                        minWidth: 0,
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap',
+                      }}
+                    >
                       · {item.versionId}
                     </span>
                   )}

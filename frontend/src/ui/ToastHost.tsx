@@ -13,7 +13,7 @@ export function ToastHost(): JSX.Element | null {
   const list = toasts.value;
   return (
     <div class="cp-toasts" role="region" aria-live="polite" aria-label="Notifications">
-      {list.map(t => {
+      {list.map((t) => {
         const kind = t.type || 'success';
         return (
           <div key={t.id} class={`cp-toast cp-toast--${kind}`} role="status">
@@ -21,7 +21,12 @@ export function ToastHost(): JSX.Element | null {
               <Icon name={ICON_FOR[kind] || 'info'} size={14} stroke={2.2} />
             </span>
             <span class="cp-toast-msg">{t.message}</span>
-            <button class="cp-toast-close" aria-label="Dismiss" onClick={() => dismissToast(t.id)} data-sound-silent="true">
+            <button
+              class="cp-toast-close"
+              aria-label="Dismiss"
+              onClick={() => dismissToast(t.id)}
+              data-sound-silent="true"
+            >
               <Icon name="x" size={12} stroke={2} />
             </button>
           </div>

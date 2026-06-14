@@ -161,11 +161,11 @@ export function countDownRemainingSeconds(
   now: number,
 ): number | undefined {
   if (
-    typeof remainingSeconds !== 'number'
-    || !Number.isFinite(remainingSeconds)
-    || remainingSeconds <= 0
-    || typeof updatedAt !== 'number'
-    || !Number.isFinite(updatedAt)
+    typeof remainingSeconds !== 'number' ||
+    !Number.isFinite(remainingSeconds) ||
+    remainingSeconds <= 0 ||
+    typeof updatedAt !== 'number' ||
+    !Number.isFinite(updatedAt)
   ) {
     return undefined;
   }

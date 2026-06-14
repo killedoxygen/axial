@@ -50,7 +50,12 @@ function GlyphMark({ loader, className }: { loader: LoaderKey; className: string
   );
 }
 
-export function InstanceTile({ inst, radius, className, style }: {
+export function InstanceTile({
+  inst,
+  radius,
+  className,
+  style,
+}: {
   inst: VisualInstance;
   radius?: number;
   className?: string;

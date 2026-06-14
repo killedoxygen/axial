@@ -137,7 +137,10 @@ function addBox({
   const faceOrder: Region[] = [faces.px, faces.nx, faces.py, faces.ny, faces.pz, faces.nz];
   const materialPairs = faceOrder.map((face) => textureFromRegion(THREE, image, face, transparent));
   const geometry = new THREE.BoxGeometry(size[0], size[1], size[2]);
-  const mesh = new THREE.Mesh(geometry, materialPairs.map((pair) => pair.material));
+  const mesh = new THREE.Mesh(
+    geometry,
+    materialPairs.map((pair) => pair.material),
+  );
   mesh.position.set(position[0], position[1], position[2]);
   group.add(mesh);
   disposables.push(() => {
@@ -261,20 +264,128 @@ export function buildSkinModel({
   const rightLeg = limbPivot(-2, 12);
   const leftLeg = limbPivot(2, 12);
 
-  addBox({ THREE, group, image: skinBitmap, faces: headFaces(false), size: [8, 8, 8], position: [0, 28, 0], transparent: false, disposables });
-  addBox({ THREE, group, image: skinBitmap, faces: bodyFaces(false), size: [8, 12, 4], position: [0, 18, 0], transparent: false, disposables });
-  addBox({ THREE, group: rightArm, image: skinBitmap, faces: armFaces(44, 40, 16, 20, armWidth), size: [armWidth, 12, 4], position: [0, -4, 0], transparent: false, disposables });
-  addBox({ THREE, group: leftArm, image: skinBitmap, faces: armFaces(36, 32, 48, 52, armWidth), size: [armWidth, 12, 4], position: [0, -4, 0], transparent: false, disposables });
-  addBox({ THREE, group: rightLeg, image: skinBitmap, faces: legFaces(4, 0, 16, 20), size: [4, 12, 4], position: [0, -6, 0], transparent: false, disposables });
-  addBox({ THREE, group: leftLeg, image: skinBitmap, faces: legFaces(20, 16, 48, 52), size: [4, 12, 4], position: [0, -6, 0], transparent: false, disposables });
+  addBox({
+    THREE,
+    group,
+    image: skinBitmap,
+    faces: headFaces(false),
+    size: [8, 8, 8],
+    position: [0, 28, 0],
+    transparent: false,
+    disposables,
+  });
+  addBox({
+    THREE,
+    group,
+    image: skinBitmap,
+    faces: bodyFaces(false),
+    size: [8, 12, 4],
+    position: [0, 18, 0],
+    transparent: false,
+    disposables,
+  });
+  addBox({
+    THREE,
+    group: rightArm,
+    image: skinBitmap,
+    faces: armFaces(44, 40, 16, 20, armWidth),
+    size: [armWidth, 12, 4],
+    position: [0, -4, 0],
+    transparent: false,
+    disposables,
+  });
+  addBox({
+    THREE,
+    group: leftArm,
+    image: skinBitmap,
+    faces: armFaces(36, 32, 48, 52, armWidth),
+    size: [armWidth, 12, 4],
+    position: [0, -4, 0],
+    transparent: false,
+    disposables,
+  });
+  addBox({
+    THREE,
+    group: rightLeg,
+    image: skinBitmap,
+    faces: legFaces(4, 0, 16, 20),
+    size: [4, 12, 4],
+    position: [0, -6, 0],
+    transparent: false,
+    disposables,
+  });
+  addBox({
+    THREE,
+    group: leftLeg,
+    image: skinBitmap,
+    faces: legFaces(20, 16, 48, 52),
+    size: [4, 12, 4],
+    position: [0, -6, 0],
+    transparent: false,
+    disposables,
+  });
 
   if (showOuterLayers) {
-    addBox({ THREE, group, image: skinBitmap, faces: headFaces(true), size: [8.7, 8.7, 8.7], position: [0, 28, 0], transparent: true, disposables });
-    addBox({ THREE, group, image: skinBitmap, faces: bodyFaces(true), size: [8.55, 12.55, 4.55], position: [0, 18, 0], transparent: true, disposables });
-    addBox({ THREE, group: rightArm, image: skinBitmap, faces: armFaces(44, 40, 32, 36, armWidth), size: [armWidth + 0.5, 12.5, 4.5], position: [0, -4, 0], transparent: true, disposables });
-    addBox({ THREE, group: leftArm, image: skinBitmap, faces: armFaces(52, 48, 48, 52, armWidth), size: [armWidth + 0.5, 12.5, 4.5], position: [0, -4, 0], transparent: true, disposables });
-    addBox({ THREE, group: rightLeg, image: skinBitmap, faces: legFaces(4, 0, 32, 36), size: [4.5, 12.5, 4.5], position: [0, -6, 0], transparent: true, disposables });
-    addBox({ THREE, group: leftLeg, image: skinBitmap, faces: legFaces(4, 0, 48, 52), size: [4.5, 12.5, 4.5], position: [0, -6, 0], transparent: true, disposables });
+    addBox({
+      THREE,
+      group,
+      image: skinBitmap,
+      faces: headFaces(true),
+      size: [8.7, 8.7, 8.7],
+      position: [0, 28, 0],
+      transparent: true,
+      disposables,
+    });
+    addBox({
+      THREE,
+      group,
+      image: skinBitmap,
+      faces: bodyFaces(true),
+      size: [8.55, 12.55, 4.55],
+      position: [0, 18, 0],
+      transparent: true,
+      disposables,
+    });
+    addBox({
+      THREE,
+      group: rightArm,
+      image: skinBitmap,
+      faces: armFaces(44, 40, 32, 36, armWidth),
+      size: [armWidth + 0.5, 12.5, 4.5],
+      position: [0, -4, 0],
+      transparent: true,
+      disposables,
+    });
+    addBox({
+      THREE,
+      group: leftArm,
+      image: skinBitmap,
+      faces: armFaces(52, 48, 48, 52, armWidth),
+      size: [armWidth + 0.5, 12.5, 4.5],
+      position: [0, -4, 0],
+      transparent: true,
+      disposables,
+    });
+    addBox({
+      THREE,
+      group: rightLeg,
+      image: skinBitmap,
+      faces: legFaces(4, 0, 32, 36),
+      size: [4.5, 12.5, 4.5],
+      position: [0, -6, 0],
+      transparent: true,
+      disposables,
+    });
+    addBox({
+      THREE,
+      group: leftLeg,
+      image: skinBitmap,
+      faces: legFaces(4, 0, 48, 52),
+      size: [4.5, 12.5, 4.5],
+      position: [0, -6, 0],
+      transparent: true,
+      disposables,
+    });
   }
 
   if (capeBitmap) {
@@ -294,7 +405,7 @@ export function modelBounds({
   const armWidth = variant === 'slim' ? 3 : 4;
   const armX = 4 + armWidth / 2;
   const outerAllowance = showOuterLayers ? 0.55 : 0;
-  const modelWidth = Math.max(8 + outerAllowance, (armX * 2) + armWidth + outerAllowance);
+  const modelWidth = Math.max(8 + outerAllowance, armX * 2 + armWidth + outerAllowance);
   const modelDepth = showOuterLayers ? 8.7 : 8;
   const modelHeight = showOuterLayers ? 32.7 : 32;
 

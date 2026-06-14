@@ -1,14 +1,35 @@
 import { batch } from '@preact/signals';
 import {
-  instances, versions, config, systemInfo, devMode, catalog,
-  selectedInstanceId, lastInstanceId,
-  installState, installQueue, installFailure, installEventSource,
-  launchState, runningSessions, launchNotices,
-  currentPage, searchQuery, sidebarFilter, logLines,
+  instances,
+  versions,
+  config,
+  systemInfo,
+  devMode,
+  catalog,
+  selectedInstanceId,
+  lastInstanceId,
+  installState,
+  installQueue,
+  installFailure,
+  installEventSource,
+  launchState,
+  runningSessions,
+  launchNotices,
+  currentPage,
+  searchQuery,
+  sidebarFilter,
+  logLines,
 } from './store';
 import type {
-  Instance, Version, Config, SystemInfo, Catalog,
-  RunningSession, InstallItem, Page, LaunchNotice,
+  Instance,
+  Version,
+  Config,
+  SystemInfo,
+  Catalog,
+  RunningSession,
+  InstallItem,
+  Page,
+  LaunchNotice,
 } from './types';
 import { formatInstallItemLabel } from './install-labels';
 import { launchStageView, launchStageViewFrom, type LaunchStage } from './launch-stages';
@@ -26,9 +47,7 @@ export function selectInstance(id: string | null): void {
 const INSTALL_FAILURE_MESSAGE_LIMIT = 220;
 
 function cloneInstallItem(item: InstallItem): InstallItem {
-  return item.loader
-    ? { versionId: item.versionId, loader: { ...item.loader } }
-    : { versionId: item.versionId };
+  return item.loader ? { versionId: item.versionId, loader: { ...item.loader } } : { versionId: item.versionId };
 }
 
 let activeInstallItem: InstallItem | null = null;
@@ -37,21 +56,20 @@ export function isSameInstallItem(left: InstallItem, right: InstallItem): boolea
   if (left.versionId !== right.versionId) return false;
   if (!left.loader && !right.loader) return true;
   if (!left.loader || !right.loader) return false;
-  return left.loader.componentId === right.loader.componentId
-    && left.loader.buildId === right.loader.buildId;
+  return left.loader.componentId === right.loader.componentId && left.loader.buildId === right.loader.buildId;
 }
 
 export function isActiveInstallItem(item: InstallItem): boolean {
-  return installState.value.status === 'active'
-    && activeInstallItem !== null
-    && isSameInstallItem(activeInstallItem, item);
+  return (
+    installState.value.status === 'active' && activeInstallItem !== null && isSameInstallItem(activeInstallItem, item)
+  );
 }
 
 function boundedInstallFailureMessage(message: string): string {
   const firstUsefulLine = String(message || '')
     .split(/\r?\n/)
-    .map(line => line.trim())
-    .find(line => line && !line.startsWith('at '));
+    .map((line) => line.trim())
+    .find((line) => line && !line.startsWith('at '));
   const squashed = (firstUsefulLine || 'Install failed before Croopor received error details.')
     .replace(/\s+/g, ' ')
     .trim();
@@ -61,7 +79,7 @@ function boundedInstallFailureMessage(message: string): string {
 
 export function enqueueInstall(item: InstallItem): void {
   if (isActiveInstallItem(item)) return;
-  if (installQueue.value.some(q => isSameInstallItem(q, item))) return;
+  if (installQueue.value.some((q) => isSameInstallItem(q, item))) return;
   installQueue.value = [...installQueue.value, item];
 }
 
@@ -91,10 +109,8 @@ export function requeueFailedInstall(): boolean {
   const wasIdle = installState.value.status === 'idle';
   batch(() => {
     installFailure.value = null;
-    const rest = installQueue.value.filter(q => !isSameInstallItem(q, item));
-    installQueue.value = isActiveInstallItem(item)
-      ? rest
-      : [item, ...rest];
+    const rest = installQueue.value.filter((q) => !isSameInstallItem(q, item));
+    installQueue.value = isActiveInstallItem(item) ? rest : [item, ...rest];
   });
   return wasIdle;
 }
@@ -222,10 +238,7 @@ export function endSession(instanceId: string): void {
   runningSessions.value = next;
 }
 
-export function updateRunningSessionState(
-  instanceId: string,
-  patch: Partial<RunningSession>,
-): void {
+export function updateRunningSessionState(instanceId: string, patch: Partial<RunningSession>): void {
   const current = runningSessions.value[instanceId];
   if (!current) return;
   runningSessions.value = {
@@ -247,20 +260,42 @@ export function clearLaunchNotice(instanceId: string): void {
 
 // ── Data setters ──
 
-export function setVersions(v: Version[]): void { versions.value = v; }
-export function setInstances(i: Instance[]): void { instances.value = i; }
-export function setConfig(c: Config): void { config.value = c; }
-export function setSystemInfo(s: SystemInfo): void { systemInfo.value = s; }
-export function setDevMode(d: boolean): void { devMode.value = d; }
-export function setCatalog(c: Catalog | null): void { catalog.value = c; }
-export function setLastInstanceId(id: string | null): void { lastInstanceId.value = id; }
+export function setVersions(v: Version[]): void {
+  versions.value = v;
+}
+export function setInstances(i: Instance[]): void {
+  instances.value = i;
+}
+export function setConfig(c: Config): void {
+  config.value = c;
+}
+export function setSystemInfo(s: SystemInfo): void {
+  systemInfo.value = s;
+}
+export function setDevMode(d: boolean): void {
+  devMode.value = d;
+}
+export function setCatalog(c: Catalog | null): void {
+  catalog.value = c;
+}
+export function setLastInstanceId(id: string | null): void {
+  lastInstanceId.value = id;
+}
 
 // ── UI state setters ──
 
-export function navigate(page: Page): void { currentPage.value = page; }
-export function setSearch(q: string): void { searchQuery.value = q; }
-export function setFilter(f: string): void { sidebarFilter.value = f; }
-export function setLogLines(n: number): void { logLines.value = n; }
+export function navigate(page: Page): void {
+  currentPage.value = page;
+}
+export function setSearch(q: string): void {
+  searchQuery.value = q;
+}
+export function setFilter(f: string): void {
+  sidebarFilter.value = f;
+}
+export function setLogLines(n: number): void {
+  logLines.value = n;
+}
 
 // ── Instance mutations ──
 
@@ -270,11 +305,11 @@ export function addInstance(inst: Instance): void {
 
 export function removeInstance(id: string): void {
   batch(() => {
-    instances.value = instances.value.filter(i => i.id !== id);
+    instances.value = instances.value.filter((i) => i.id !== id);
     if (selectedInstanceId.value === id) selectedInstanceId.value = null;
   });
 }
 
 export function updateInstanceInList(updated: Instance): void {
-  instances.value = instances.value.map(i => i.id === updated.id ? updated : i);
+  instances.value = instances.value.map((i) => (i.id === updated.id ? updated : i));
 }

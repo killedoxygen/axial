@@ -95,7 +95,10 @@ export function logLineMatchesFilter(line: ClassifiedLogLine, filter: LogFilter)
 }
 
 export async function fetchLogTail(id: string, name: string): Promise<InstanceLogTail> {
-  const res: InstanceLogTail & { error?: string } = await api('GET', `/instances/${encodeURIComponent(id)}/logs/${encodeURIComponent(name)}`);
+  const res: InstanceLogTail & { error?: string } = await api(
+    'GET',
+    `/instances/${encodeURIComponent(id)}/logs/${encodeURIComponent(name)}`,
+  );
   if (res?.error) throw new Error(res.error);
   return res;
 }

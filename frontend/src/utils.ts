@@ -58,21 +58,23 @@ interface VersionDisplay {
   loader?: string | null;
 }
 
-type VersionLike = Pick<Version, 'id' | 'inherits_from' | 'loader' | 'minecraft_meta' | 'lifecycle' | 'release_time'>
+type VersionLike =
+  | Pick<Version, 'id' | 'inherits_from' | 'loader' | 'minecraft_meta' | 'lifecycle' | 'release_time'>
   | Pick<CatalogVersion, 'id' | 'minecraft_meta' | 'lifecycle' | 'release_time'>;
 
-export function hasLifecycleLabel(
-  lifecycle: LifecycleMeta | undefined | null,
-  label: LifecycleLabel,
-): boolean {
+export function hasLifecycleLabel(lifecycle: LifecycleMeta | undefined | null, label: LifecycleLabel): boolean {
   return !!lifecycle?.labels?.includes(label);
 }
 
-export function isReleaseVersion(version: Pick<Version, 'lifecycle'> | Pick<CatalogVersion, 'lifecycle'> | null | undefined): boolean {
+export function isReleaseVersion(
+  version: Pick<Version, 'lifecycle'> | Pick<CatalogVersion, 'lifecycle'> | null | undefined,
+): boolean {
   return version?.lifecycle?.channel === 'stable' && hasLifecycleLabel(version.lifecycle, 'release');
 }
 
-export function isSnapshotVersion(version: Pick<Version, 'lifecycle'> | Pick<CatalogVersion, 'lifecycle'> | null | undefined): boolean {
+export function isSnapshotVersion(
+  version: Pick<Version, 'lifecycle'> | Pick<CatalogVersion, 'lifecycle'> | null | undefined,
+): boolean {
   if (!version?.lifecycle) return false;
   if (hasLifecycleLabel(version.lifecycle, 'old_beta') || hasLifecycleLabel(version.lifecycle, 'old_alpha')) {
     return false;
@@ -80,11 +82,15 @@ export function isSnapshotVersion(version: Pick<Version, 'lifecycle'> | Pick<Cat
   return version.lifecycle.channel === 'preview' || version.lifecycle.channel === 'experimental';
 }
 
-export function isOldBetaVersion(version: Pick<Version, 'lifecycle'> | Pick<CatalogVersion, 'lifecycle'> | null | undefined): boolean {
+export function isOldBetaVersion(
+  version: Pick<Version, 'lifecycle'> | Pick<CatalogVersion, 'lifecycle'> | null | undefined,
+): boolean {
   return hasLifecycleLabel(version?.lifecycle, 'old_beta');
 }
 
-export function isOldAlphaVersion(version: Pick<Version, 'lifecycle'> | Pick<CatalogVersion, 'lifecycle'> | null | undefined): boolean {
+export function isOldAlphaVersion(
+  version: Pick<Version, 'lifecycle'> | Pick<CatalogVersion, 'lifecycle'> | null | undefined,
+): boolean {
   return hasLifecycleLabel(version?.lifecycle, 'old_alpha');
 }
 
@@ -176,12 +182,7 @@ function parseNormalizedLoaderDisplay(base: string, version?: Version | null): V
   if (!version?.loader) return null;
   const loader = loaderTypeFromComponentId(version.loader.component_id);
   if (!loader) return null;
-  return loaderDisplay(
-    loader,
-    base,
-    version.loader.loader_version,
-    version.loader.build_meta,
-  );
+  return loaderDisplay(loader, base, version.loader.loader_version, version.loader.build_meta);
 }
 
 function loaderTypeFromComponentId(componentId: string): LoaderType | null {
@@ -198,15 +199,15 @@ function loaderDisplay(
   loaderVersion: string,
   buildMeta?: LoaderBuildMetadata | null,
 ): VersionDisplay {
-  const title = loader === 'fabric' ? `Fabric ${base}`
-    : loader === 'quilt' ? `Quilt ${base}`
-    : loader === 'forge' ? `Forge ${base}`
-    : `NeoForge ${base}`;
-  const hintPrefix = loader === 'fabric' || loader === 'quilt'
-    ? 'Loader'
-    : loader === 'forge'
-      ? 'Forge'
-      : 'NeoForge';
+  const title =
+    loader === 'fabric'
+      ? `Fabric ${base}`
+      : loader === 'quilt'
+        ? `Quilt ${base}`
+        : loader === 'forge'
+          ? `Forge ${base}`
+          : `NeoForge ${base}`;
+  const hintPrefix = loader === 'fabric' || loader === 'quilt' ? 'Loader' : loader === 'forge' ? 'Forge' : 'NeoForge';
   return {
     name: title,
     hint: loaderVersion ? `${hintPrefix} ${formatLoaderVersionLabel(loaderVersion, buildMeta)}` : null,
@@ -214,7 +215,9 @@ function loaderDisplay(
   };
 }
 
-export function fmtMem(gb: number): string { return gb === Math.floor(gb) ? `${gb}\u00A0GB` : `${gb.toFixed(1)}\u00A0GB`; }
+export function fmtMem(gb: number): string {
+  return gb === Math.floor(gb) ? `${gb}\u00A0GB` : `${gb.toFixed(1)}\u00A0GB`;
+}
 
 export function formatBytes(bytes: number): string {
   if (bytes < 1024) return bytes + ' B';
@@ -235,7 +238,6 @@ export function formatRelativeTime(date: Date): string {
   if (days < 7) return `${days}d ago`;
   return new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' }).format(date);
 }
-
 
 export const USERNAME_MIN_LEN = 3;
 export const USERNAME_MAX_LEN = 16;

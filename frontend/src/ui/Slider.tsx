@@ -28,7 +28,7 @@ function zonesFromRecommendation(recommended: [number, number] | undefined, min:
   const low = clamp(recommended[0], min, max);
   const high = clamp(recommended[1], low, max);
   const range = Math.max(1e-9, max - min);
-  const extremeFrom = clamp(max - (range * 0.18), high, max);
+  const extremeFrom = clamp(max - range * 0.18, high, max);
   const zones: SliderZone[] = [];
   if (low > min) zones.push({ from: min, to: low, tone: 'low', label: 'Low' });
   zones.push({ from: low, to: high, tone: 'sweet', label: 'Sweet spot' });
@@ -77,8 +77,9 @@ export function Slider({
   const range = Math.max(1e-9, max - min);
   const clampedValue = clamp(value, min, max);
   const pct = ((clampedValue - min) / range) * 100;
-  const shownZones = (zones ?? zonesFromRecommendation(recommended, min, max))
-    .filter(zone => clamp(zone.to, min, max) > clamp(zone.from, min, max));
+  const shownZones = (zones ?? zonesFromRecommendation(recommended, min, max)).filter(
+    (zone) => clamp(zone.to, min, max) > clamp(zone.from, min, max),
+  );
   const emit = (next: number): void => {
     if (sound) {
       const normalized = soundValue ? soundValue(next) : (clamp(next, min, max) - min) / range;
@@ -136,7 +137,10 @@ export function Slider({
         <input
           ref={inputRef}
           type="range"
-          min={min} max={max} step={step} value={value}
+          min={min}
+          max={max}
+          step={step}
+          value={value}
           aria-label={ariaLabel}
           onInput={(e: any) => emit(parseFloat(e.currentTarget.value))}
           onChange={(e: any) => onCommit?.(parseFloat(e.currentTarget.value))}
@@ -145,8 +149,16 @@ export function Slider({
       </div>
       {ticks && ticks.length > 0 && (
         <div class="cp-slider-ticks">
-          {ticks.map(t => (
-            <button key={t} type="button" data-active={value === t} onClick={() => { emit(t); onCommit?.(t); }}>
+          {ticks.map((t) => (
+            <button
+              key={t}
+              type="button"
+              data-active={value === t}
+              onClick={() => {
+                emit(t);
+                onCommit?.(t);
+              }}
+            >
               {t}
             </button>
           ))}

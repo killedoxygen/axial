@@ -25,7 +25,11 @@ export async function renameWorld(inst: EnrichedInstance, worldName: string, onD
   const nextName = next?.trim() ?? '';
   if (!nextName || nextName === worldName) return;
   try {
-    const res: any = await api('PUT', `/instances/${encodeURIComponent(inst.id)}/worlds/${encodeURIComponent(worldName)}`, { name: nextName });
+    const res: any = await api(
+      'PUT',
+      `/instances/${encodeURIComponent(inst.id)}/worlds/${encodeURIComponent(worldName)}`,
+      { name: nextName },
+    );
     if (res?.error) throw new Error(res.error);
     toast('World renamed');
     onDone();
@@ -42,7 +46,10 @@ export async function deleteWorld(inst: EnrichedInstance, worldName: string, onD
   );
   if (choice !== 'delete') return;
   try {
-    const res: any = await api('DELETE', `/instances/${encodeURIComponent(inst.id)}/worlds/${encodeURIComponent(worldName)}`);
+    const res: any = await api(
+      'DELETE',
+      `/instances/${encodeURIComponent(inst.id)}/worlds/${encodeURIComponent(worldName)}`,
+    );
     if (res?.error) throw new Error(res.error);
     toast('World deleted');
     onDone();
@@ -55,18 +62,22 @@ export async function deleteWorlds(inst: EnrichedInstance, worldNames: string[],
   const confirmed = await confirmDeleteItems({
     count: worldNames.length,
     itemLabel: 'world',
-    message: worldNames.length === 1
-      ? `Delete "${worldNames[0]!}" from this instance. This removes the save folder from disk.`
-      : `Delete ${worldNames.length} worlds from this instance. This removes the selected save folders from disk.`,
+    message:
+      worldNames.length === 1
+        ? `Delete "${worldNames[0]!}" from this instance. This removes the save folder from disk.`
+        : `Delete ${worldNames.length} worlds from this instance. This removes the selected save folders from disk.`,
   });
   if (!confirmed) return;
   await runBulkMutation({
     items: worldNames,
     action: async (worldName) => {
-      const res: any = await api('DELETE', `/instances/${encodeURIComponent(inst.id)}/worlds/${encodeURIComponent(worldName)}`);
+      const res: any = await api(
+        'DELETE',
+        `/instances/${encodeURIComponent(inst.id)}/worlds/${encodeURIComponent(worldName)}`,
+      );
       if (res?.error) throw new Error(res.error);
     },
-    success: (count) => count === 1 ? 'World deleted' : `${count} worlds deleted`,
+    success: (count) => (count === 1 ? 'World deleted' : `${count} worlds deleted`),
     partial: (done, total, err) => partialFailureMessage('Deleted', done, total, err),
     onDone,
   });
@@ -74,7 +85,11 @@ export async function deleteWorlds(inst: EnrichedInstance, worldNames: string[],
 
 export async function backupWorld(inst: EnrichedInstance, worldName: string, onDone: () => void): Promise<void> {
   try {
-    const res: any = await api('POST', `/instances/${encodeURIComponent(inst.id)}/worlds/${encodeURIComponent(worldName)}/backup`, {});
+    const res: any = await api(
+      'POST',
+      `/instances/${encodeURIComponent(inst.id)}/worlds/${encodeURIComponent(worldName)}/backup`,
+      {},
+    );
     if (res?.error) throw new Error(res.error);
     toast(res?.location ? `World backed up to ${res.location}` : 'World backed up');
     onDone();

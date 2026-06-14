@@ -20,7 +20,10 @@ export async function openInstanceFolder(id: string, sub?: string): Promise<void
 }
 
 export async function renameInstance(inst: Instance): Promise<void> {
-  const next = await prompt('New name for this instance', inst.name, { title: 'Rename instance', confirmText: 'Rename' });
+  const next = await prompt('New name for this instance', inst.name, {
+    title: 'Rename instance',
+    confirmText: 'Rename',
+  });
   if (!next || next === inst.name) return;
   try {
     const res: any = await api('PUT', `/instances/${encodeURIComponent(inst.id)}`, { name: next });
@@ -90,7 +93,7 @@ export async function deleteInstancesFlow(selected: Instance[], onDone?: () => v
       if (res?.error) throw new Error(res.error);
       removeInstance(inst.id);
     },
-    success: (count) => keepFiles ? `${count} instances removed; files kept on disk` : `${count} instances deleted`,
+    success: (count) => (keepFiles ? `${count} instances removed; files kept on disk` : `${count} instances deleted`),
     partial: (done, total, err) => partialFailureMessage('Removed', done, total, err),
     onDone: () => onDone?.(),
   });

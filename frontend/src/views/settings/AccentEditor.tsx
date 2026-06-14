@@ -7,11 +7,7 @@ import { defaults, local, PRESET_HUES } from '../../state';
 import { Sound, playSliderSound } from '../../sound';
 import { useTheme } from '../../hooks/use-theme';
 
-export function AccentModeToggle({
-  onChange,
-}: {
-  onChange?: (mode: 'dark' | 'light') => void;
-}): JSX.Element {
+export function AccentModeToggle({ onChange }: { onChange?: (mode: 'dark' | 'light') => void }): JSX.Element {
   const theme = useTheme();
   const mode = theme.dark ? 'dark' : 'light';
 
@@ -27,7 +23,10 @@ export function AccentModeToggle({
     <Segmented<'dark' | 'light'>
       value={mode}
       onChange={applyMode}
-      options={[{ value: 'dark', label: 'Dark' }, { value: 'light', label: 'Light' }]}
+      options={[
+        { value: 'dark', label: 'Dark' },
+        { value: 'light', label: 'Light' },
+      ]}
     />
   );
 }
@@ -111,9 +110,13 @@ export function AccentField({
           aria-hidden="true"
         />
         <div class="cp-accent-readout-labels">
-          <span>hue <strong>{hue}°</strong></span>
+          <span>
+            hue <strong>{hue}°</strong>
+          </span>
           <span class="cp-accent-sep" />
-          <span>chroma <strong>{vibrancy}%</strong></span>
+          <span>
+            chroma <strong>{vibrancy}%</strong>
+          </span>
         </div>
       </div>
       {showPresets && (

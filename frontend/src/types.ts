@@ -30,12 +30,7 @@ export interface EnrichedInstance extends Instance {
   shader_count: number;
 }
 
-export type LifecycleChannel =
-  | 'stable'
-  | 'preview'
-  | 'experimental'
-  | 'legacy'
-  | 'unknown';
+export type LifecycleChannel = 'stable' | 'preview' | 'experimental' | 'legacy' | 'unknown';
 
 export type LifecycleLabel =
   | 'release'
@@ -94,11 +89,7 @@ export type LoaderTerm =
   | 'nightly'
   | 'dev';
 
-export type LoaderTermSource =
-  | 'explicit_version_label'
-  | 'explicit_api_flag'
-  | 'promotion_marker'
-  | 'none';
+export type LoaderTermSource = 'explicit_version_label' | 'explicit_api_flag' | 'promotion_marker' | 'none';
 
 export interface LoaderTermEvidence {
   term: LoaderTerm;
@@ -345,10 +336,7 @@ export interface LaunchPreflightResponse {
   resource_budget: LaunchPreflightResourceBudget;
 }
 
-export type HealingEventKind =
-  | 'runtime_bypassed'
-  | 'preset_downgraded'
-  | 'fallback_applied';
+export type HealingEventKind = 'runtime_bypassed' | 'preset_downgraded' | 'fallback_applied';
 
 export interface HealingEvent {
   kind: HealingEventKind;
@@ -651,12 +639,7 @@ export interface PerformancePlanResponse {
   fallback_reason?: string;
 }
 
-export type PerformanceHealthStatus =
-  | 'healthy'
-  | 'degraded'
-  | 'fallback'
-  | 'disabled'
-  | 'invalid';
+export type PerformanceHealthStatus = 'healthy' | 'degraded' | 'fallback' | 'disabled' | 'invalid';
 
 export type PerformanceRuleSource = 'built_in' | 'remote';
 

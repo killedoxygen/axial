@@ -17,7 +17,9 @@ export function ResourceStatus({
     return (
       <div class="cp-resource-note cp-resource-note--error">
         <span>{state.error}</span>
-        <Button variant="secondary" size="sm" icon="refresh" onClick={onRetry}>Retry</Button>
+        <Button variant="secondary" size="sm" icon="refresh" onClick={onRetry}>
+          Retry
+        </Button>
       </div>
     );
   }
@@ -37,8 +39,12 @@ export function ResourceToolbar({
     <div class="cp-resource-toolbar">
       <strong>{title}</strong>
       <div>
-        <Button variant="secondary" size="sm" icon="refresh" onClick={onRefresh}>Refresh</Button>
-        <Button variant="soft" size="sm" icon={action.icon} onClick={action.onClick}>{action.label}</Button>
+        <Button variant="secondary" size="sm" icon="refresh" onClick={onRefresh}>
+          Refresh
+        </Button>
+        <Button variant="soft" size="sm" icon={action.icon} onClick={action.onClick}>
+          {action.label}
+        </Button>
       </div>
     </div>
   );
@@ -47,7 +53,9 @@ export function ResourceToolbar({
 export function ResourceEmpty({ icon, title, hint }: { icon: string; title: string; hint: string }): JSX.Element {
   return (
     <div class="cp-resource-empty">
-      <span><Icon name={icon} size={20} /></span>
+      <span>
+        <Icon name={icon} size={20} />
+      </span>
       <strong>{title}</strong>
       <p>{hint}</p>
     </div>
@@ -78,8 +86,12 @@ export function ResourceRow({
       onContextMenu={onContextMenu}
     >
       {leading}
-      <span class="cp-resource-row-icon"><Icon name={icon} size={15} /></span>
-      <span class="cp-resource-name" title={name}>{name}</span>
+      <span class="cp-resource-row-icon">
+        <Icon name={icon} size={15} />
+      </span>
+      <span class="cp-resource-name" title={name}>
+        {name}
+      </span>
       <span class="cp-resource-meta">{meta}</span>
       {actions ? <span class="cp-resource-actions">{actions}</span> : null}
     </div>

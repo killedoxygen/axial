@@ -3,7 +3,7 @@ import type { JSX } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
 import type { SkinThreePreviewProps } from './SkinThreePreview';
 
-type SkinThreePreviewComponent = typeof import('./SkinThreePreview')['SkinThreePreview'];
+type SkinThreePreviewComponent = (typeof import('./SkinThreePreview'))['SkinThreePreview'];
 
 let loadedSkinThreePreview: SkinThreePreviewComponent | null = null;
 let loadingSkinThreePreview: Promise<SkinThreePreviewComponent> | null = null;
@@ -36,12 +36,16 @@ export function LazySkinThreePreview(props: SkinThreePreviewProps): JSX.Element 
       .catch(() => {
         if (mounted) setFailed(true);
       });
-    return () => { mounted = false; };
+    return () => {
+      mounted = false;
+    };
   }, [Preview]);
 
-  return Preview
-    ? h(Preview, props)
-    : <SkinThreePreviewFallback name={props.name} capeSrc={props.capeSrc} failed={failed} />;
+  return Preview ? (
+    h(Preview, props)
+  ) : (
+    <SkinThreePreviewFallback name={props.name} capeSrc={props.capeSrc} failed={failed} />
+  );
 }
 
 function SkinThreePreviewFallback({
@@ -62,9 +66,7 @@ function SkinThreePreviewFallback({
       data-skin-three-fit="pending"
       aria-label={`${name} 3D skin preview`}
     >
-      <div class="cp-skin-three__status">
-        {failed ? '3D preview unavailable' : 'Preparing 3D preview...'}
-      </div>
+      <div class="cp-skin-three__status">{failed ? '3D preview unavailable' : 'Preparing 3D preview...'}</div>
     </div>
   );
 }

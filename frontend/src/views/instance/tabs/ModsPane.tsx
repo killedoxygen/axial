@@ -31,7 +31,10 @@ export function ModsPane({
     const matchesFilter = filter === 'all' || (filter === 'enabled' ? mod.enabled : !mod.enabled);
     return matchesSearch && matchesFilter;
   });
-  const selection = useSelection(filteredMods, useCallback((mod: InstanceMod) => mod.name, []));
+  const selection = useSelection(
+    filteredMods,
+    useCallback((mod: InstanceMod) => mod.name, []),
+  );
   const selectedMods = selection.selectedItems;
   const allSelectedEnabled = selectedMods.length > 0 && selectedMods.every((mod) => mod.enabled);
   const allSelectedDisabled = selectedMods.length > 0 && selectedMods.every((mod) => !mod.enabled);
@@ -43,7 +46,9 @@ export function ModsPane({
   return (
     <div class="cp-instance-body" style={{ display: 'block' }}>
       <div class="cp-resource-toolbar">
-        <strong>{mods.length} mod{mods.length === 1 ? '' : 's'}</strong>
+        <strong>
+          {mods.length} mod{mods.length === 1 ? '' : 's'}
+        </strong>
         <div>
           <Input
             value={q}
@@ -53,7 +58,7 @@ export function ModsPane({
             style={{ width: 200, height: 30 }}
           />
           <div class="cp-mini-seg" role="tablist" aria-label="Filter mods">
-            {(['all', 'enabled', 'disabled'] as ModFilter[]).map(f => (
+            {(['all', 'enabled', 'disabled'] as ModFilter[]).map((f) => (
               <button
                 key={f}
                 type="button"
@@ -66,13 +71,10 @@ export function ModsPane({
               </button>
             ))}
           </div>
-          <Button variant="secondary" size="sm" icon="refresh" onClick={onRefresh}>Refresh</Button>
-          <Button
-            variant="soft"
-            size="sm"
-            icon="plus"
-            onClick={() => void openInstanceFolder(inst.id, 'mods')}
-          >
+          <Button variant="secondary" size="sm" icon="refresh" onClick={onRefresh}>
+            Refresh
+          </Button>
+          <Button variant="soft" size="sm" icon="plus" onClick={() => void openInstanceFolder(inst.id, 'mods')}>
             Add mod
           </Button>
         </div>
@@ -80,7 +82,9 @@ export function ModsPane({
       <ResourceStatus state={resources} onRetry={onRefresh} />
       <div class="cp-mods-table">
         <div class="cp-mods-table-head" aria-hidden="true">
-          <span /><span /><span />
+          <span />
+          <span />
+          <span />
           <span>Name</span>
           <span>Category</span>
           <span>Version</span>
@@ -99,7 +103,9 @@ export function ModsPane({
               data-disabled={!mod.enabled}
               data-selected={selection.isSelected(mod.name)}
               key={mod.name}
-              onContextMenu={(e) => openContextMenu(e, modMenuItems(inst, mod, onRefresh, selectionMenuItem(selection, mod.name)))}
+              onContextMenu={(e) =>
+                openContextMenu(e, modMenuItems(inst, mod, onRefresh, selectionMenuItem(selection, mod.name)))
+              }
             >
               <span>
                 <SelectionCheckbox
@@ -111,9 +117,13 @@ export function ModsPane({
                   }}
                 />
               </span>
-              <span><Icon name="puzzle" size={15} color="var(--text-dim)" /></span>
+              <span>
+                <Icon name="puzzle" size={15} color="var(--text-dim)" />
+              </span>
               <span class="cp-mods-file-icon">JAR</span>
-              <span class="cp-resource-name" title={mod.name}>{mod.name}</span>
+              <span class="cp-resource-name" title={mod.name}>
+                {mod.name}
+              </span>
               <span>Local</span>
               <span>{fmtBytes(mod.size)}</span>
               <span>{mod.enabled ? 'Enabled' : 'Disabled'}</span>
@@ -126,9 +136,24 @@ export function ModsPane({
         selection={selection}
         itemLabel="mod"
         actions={[
-          { label: 'Enable', icon: 'play', disabled: allSelectedEnabled, onClick: () => void setModsEnabled(inst, selectedMods, true, clearAndRefresh) },
-          { label: 'Disable', icon: 'stop', disabled: allSelectedDisabled, onClick: () => void setModsEnabled(inst, selectedMods, false, clearAndRefresh) },
-          { label: 'Delete', icon: 'trash', danger: true, onClick: () => void deleteMods(inst, selectedMods, clearAndRefresh) },
+          {
+            label: 'Enable',
+            icon: 'play',
+            disabled: allSelectedEnabled,
+            onClick: () => void setModsEnabled(inst, selectedMods, true, clearAndRefresh),
+          },
+          {
+            label: 'Disable',
+            icon: 'stop',
+            disabled: allSelectedDisabled,
+            onClick: () => void setModsEnabled(inst, selectedMods, false, clearAndRefresh),
+          },
+          {
+            label: 'Delete',
+            icon: 'trash',
+            danger: true,
+            onClick: () => void deleteMods(inst, selectedMods, clearAndRefresh),
+          },
         ]}
       />
     </div>

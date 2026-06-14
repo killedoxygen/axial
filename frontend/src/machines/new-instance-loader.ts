@@ -13,12 +13,7 @@ import {
   type LoaderMachineEvent,
   type NewInstanceLoaderState,
 } from './new-instance-loader-core';
-import type {
-  LoaderBuildRecord,
-  LoaderComponentId,
-  LoaderComponentRecord,
-  LoaderGameVersion,
-} from '../types';
+import type { LoaderBuildRecord, LoaderComponentId, LoaderComponentRecord, LoaderGameVersion } from '../types';
 
 export type { NewInstanceLoaderState } from './new-instance-loader-core';
 
@@ -38,10 +33,7 @@ function nextRequestId(machine: SignalMachine<NewInstanceLoaderState, LoaderMach
   return machine.state.value.context.requestId + 1;
 }
 
-function hasComponent(
-  components: LoaderComponentRecord[],
-  componentId: LoaderComponentId,
-): boolean {
+function hasComponent(components: LoaderComponentRecord[], componentId: LoaderComponentId): boolean {
   return components.some((component) => component.id === componentId);
 }
 
@@ -97,9 +89,7 @@ function resolveSelectedMcVersion(
   if (!selectedMcVersion) {
     return null;
   }
-  return supportedVersions.some((entry) => entry.id === selectedMcVersion)
-    ? selectedMcVersion
-    : null;
+  return supportedVersions.some((entry) => entry.id === selectedMcVersion) ? selectedMcVersion : null;
 }
 
 export function createNewInstanceLoaderMachine(): NewInstanceLoaderMachine {
@@ -168,10 +158,7 @@ export function createNewInstanceLoaderMachine(): NewInstanceLoaderMachine {
     }
   }
 
-  async function loadBuilds(
-    selectedComponentId: LoaderComponentId,
-    selectedMcVersion: string,
-  ): Promise<void> {
+  async function loadBuilds(selectedComponentId: LoaderComponentId, selectedMcVersion: string): Promise<void> {
     const requestId = nextRequestId(machine);
     machine.dispatch({
       type: 'start_builds',

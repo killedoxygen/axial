@@ -4,7 +4,10 @@ import { initColorField, positionFieldMarker } from '../../theme';
 
 // Hue by chroma picker, x is hue 0..360, y is chroma with vivid at top
 export function ColorField({
-  hue, vibrancy, onChange, onEnd,
+  hue,
+  vibrancy,
+  onChange,
+  onEnd,
 }: {
   hue: number;
   vibrancy: number;

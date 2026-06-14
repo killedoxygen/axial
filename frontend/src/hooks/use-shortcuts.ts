@@ -51,7 +51,7 @@ export function useShortcuts(): void {
         const currentRoute = route.value;
         let inst = selectedInstance.value;
         if (!inst && currentRoute.name === 'instance') {
-          inst = instances.value.find(i => i.id === currentRoute.id) ?? null;
+          inst = instances.value.find((i) => i.id === currentRoute.id) ?? null;
           if (inst) selectInstance(inst.id);
         }
         if (!inst) return;
@@ -62,7 +62,10 @@ export function useShortcuts(): void {
         return;
       }
       if (e.key === 'Escape' && !typing) {
-        if (commandPaletteOpen.value) { commandPaletteOpen.value = false; return; }
+        if (commandPaletteOpen.value) {
+          commandPaletteOpen.value = false;
+          return;
+        }
       }
     };
     window.addEventListener('keydown', onKeyDown);

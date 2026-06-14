@@ -3,16 +3,25 @@ import { showError, errMessage } from './utils';
 import { startLoaderInstall, connectLoaderInstallSSE } from './loaders/api';
 import { createProgressEstimator } from './progress-estimation';
 import {
-  hasNativeDesktopRuntime, nativeInstallEventName, nativeLoaderInstallEventName,
-  onNativeEvent, startNativeInstallEvents, startNativeLoaderInstallEvents,
+  hasNativeDesktopRuntime,
+  nativeInstallEventName,
+  nativeLoaderInstallEventName,
+  onNativeEvent,
+  startNativeInstallEvents,
+  startNativeLoaderInstallEvents,
 } from './native';
+import { selectedInstance, selectedVersion, installState, installEventSource, catalog, versions } from './store';
 import {
-  selectedInstance, selectedVersion, installState, installEventSource, catalog, versions,
-} from './store';
-import {
-  enqueueInstall, dequeueNextInstall, startInstall, updateInstallProgress,
-  completeInstall, setInstallEventSource, recordInstallFailure, clearInstallFailureForItem,
-  requeueFailedInstall, isActiveInstallItem,
+  enqueueInstall,
+  dequeueNextInstall,
+  startInstall,
+  updateInstallProgress,
+  completeInstall,
+  setInstallEventSource,
+  recordInstallFailure,
+  clearInstallFailureForItem,
+  requeueFailedInstall,
+  isActiveInstallItem,
 } from './actions';
 import { formatInstallItemLabel } from './install-labels';
 import { minecraftVersionLabel } from './version-display';
@@ -36,19 +45,9 @@ type PendingInstallEventSource = CloseableSource & {
   setSource(source: CloseableSource): boolean;
 };
 
-const INSTALL_ETA_PHASES = new Set([
-  'libraries',
-  'assets',
-  'loader_libraries',
-  'loader_processors',
-  'processors',
-]);
+const INSTALL_ETA_PHASES = new Set(['libraries', 'assets', 'loader_libraries', 'loader_processors', 'processors']);
 
-const ACTIVE_STEP_PHASES = new Set([
-  'java_runtime',
-  'loader_processors',
-  'processors',
-]);
+const ACTIVE_STEP_PHASES = new Set(['java_runtime', 'loader_processors', 'processors']);
 
 function isActiveInstall(item: InstallItem): boolean {
   return isActiveInstallItem(item);
@@ -178,7 +177,13 @@ export function installVersion(target: string): void {
 function parseLoaderFromId(
   id: string,
   baseVersion: string,
-): { componentId: LoaderComponentId; buildId: string; minecraftVersion: string; loaderVersion: string; versionId: string } | null {
+): {
+  componentId: LoaderComponentId;
+  buildId: string;
+  minecraftVersion: string;
+  loaderVersion: string;
+  versionId: string;
+} | null {
   const lo = id.toLowerCase();
   const inferredBase = baseVersion || inferMinecraftVersionFromCompositeId(id);
 
@@ -320,10 +325,7 @@ async function processLoaderInstall(next: InstallItem): Promise<void> {
   startInstall(next, 'Starting loader install...', formatInstallItemLabel(next));
 
   try {
-    const installId = await startLoaderInstall(
-      next.loader.componentId,
-      next.loader.buildId,
-    );
+    const installId = await startLoaderInstall(next.loader.componentId, next.loader.buildId);
     await connectLoaderEvents(installId, next);
   } catch (err: unknown) {
     const message = errMessage(err);
@@ -352,11 +354,13 @@ function currentInstallPct(): number {
 }
 
 function isJavaRuntimeReadyEvent(data: InstallProgressEvent): boolean {
-  return data.phase === 'java_runtime'
-    && data.current === 1
-    && data.total === 1
-    && typeof data.file === 'string'
-    && data.file.trim().toLowerCase().startsWith('ready ');
+  return (
+    data.phase === 'java_runtime' &&
+    data.current === 1 &&
+    data.total === 1 &&
+    typeof data.file === 'string' &&
+    data.file.trim().toLowerCase().startsWith('ready ')
+  );
 }
 
 function activeStepProgress(data: InstallProgressEvent, label: string): InstallStepProgress | undefined {
@@ -413,7 +417,9 @@ function phaseLabel(data: InstallProgressEvent, loaderInstall: boolean): string 
       if (typeof data.file === 'string' && data.file.trim()) {
         return data.file;
       }
-      return loaderInstall ? `Working on ${data.phase || 'loader install'}...` : `Working on ${data.phase || 'install'}...`;
+      return loaderInstall
+        ? `Working on ${data.phase || 'loader install'}...`
+        : `Working on ${data.phase || 'install'}...`;
   }
 }
 
@@ -637,7 +643,9 @@ async function onInstallDone(completedItem?: InstallItem): Promise<void> {
 
     if (catalog.value) {
       const installed = new Set<string>(
-        nextVersions.filter((version: { launchable: boolean }) => version.launchable).map((version: { id: string }) => version.id),
+        nextVersions
+          .filter((version: { launchable: boolean }) => version.launchable)
+          .map((version: { id: string }) => version.id),
       );
       catalog.value = {
         ...catalog.value,

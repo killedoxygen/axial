@@ -26,12 +26,13 @@ export function CapePicker({
   const pickerRef = useRef<HTMLDivElement>(null);
   const [scrollCue, setScrollCue] = useState({ top: false, bottom: false });
   const sortedCapes = useMemo(
-    () => [...capes].sort((left, right) => {
-      const leftActive = left.state.toLowerCase() === 'active';
-      const rightActive = right.state.toLowerCase() === 'active';
-      if (leftActive !== rightActive) return leftActive ? -1 : 1;
-      return left.id.localeCompare(right.id);
-    }),
+    () =>
+      [...capes].sort((left, right) => {
+        const leftActive = left.state.toLowerCase() === 'active';
+        const rightActive = right.state.toLowerCase() === 'active';
+        if (leftActive !== rightActive) return leftActive ? -1 : 1;
+        return left.id.localeCompare(right.id);
+      }),
     [capes],
   );
   const updateScrollCue = useCallback(() => {
@@ -46,9 +47,7 @@ export function CapePicker({
       top: scrollable && node.scrollTop > 2,
       bottom: scrollable && node.scrollTop < node.scrollHeight - node.clientHeight - 2,
     };
-    setScrollCue((current) => (
-      current.top === next.top && current.bottom === next.bottom ? current : next
-    ));
+    setScrollCue((current) => (current.top === next.top && current.bottom === next.bottom ? current : next));
   }, []);
 
   useEffect(() => {
@@ -105,30 +104,38 @@ export function CapePicker({
           );
         })}
         {sortedCapes.length === 0 && (
-          <div style={{
-            alignSelf: 'center',
-            color: theme.n.textMute,
-            fontSize: 12,
-            fontWeight: 500,
-            lineHeight: 1.35,
-          }}>
+          <div
+            style={{
+              alignSelf: 'center',
+              color: theme.n.textMute,
+              fontSize: 12,
+              fontWeight: 500,
+              lineHeight: 1.35,
+            }}
+          >
             No Minecraft capes on this profile.
           </div>
         )}
         {value !== NO_CAPE_VALUE && !sortedCapes.some((cape) => cape.id === value) && (
-          <div style={{
-            alignSelf: 'center',
-            color: theme.n.textMute,
-            fontSize: 12,
-            fontWeight: 500,
-            lineHeight: 1.35,
-          }}>
+          <div
+            style={{
+              alignSelf: 'center',
+              color: theme.n.textMute,
+              fontSize: 12,
+              fontWeight: 500,
+              lineHeight: 1.35,
+            }}
+          >
             Saved cape is unavailable on this profile.
           </div>
         )}
       </div>
       <span class="cp-cape-picker__fade cp-cape-picker__fade--top" data-cape-picker-fade="top" aria-hidden="true" />
-      <span class="cp-cape-picker__fade cp-cape-picker__fade--bottom" data-cape-picker-fade="bottom" aria-hidden="true" />
+      <span
+        class="cp-cape-picker__fade cp-cape-picker__fade--bottom"
+        data-cape-picker-fade="bottom"
+        aria-hidden="true"
+      />
     </div>
   );
 }
@@ -172,17 +179,19 @@ function CapeChoiceButton({
         font: 'inherit',
       }}
     >
-      <span style={{
-        position: 'relative',
-        display: 'block',
-        width: 44,
-        aspectRatio: '10 / 16',
-        overflow: 'hidden',
-        borderRadius: theme.r.xs,
-        background: selected
-          ? 'color-mix(in oklab, var(--accent-on) 12%, transparent)'
-          : 'color-mix(in oklab, var(--bg) 55%, var(--surface))',
-      }}>
+      <span
+        style={{
+          position: 'relative',
+          display: 'block',
+          width: 44,
+          aspectRatio: '10 / 16',
+          overflow: 'hidden',
+          borderRadius: theme.r.xs,
+          background: selected
+            ? 'color-mix(in oklab, var(--accent-on) 12%, transparent)'
+            : 'color-mix(in oklab, var(--bg) 55%, var(--surface))',
+        }}
+      >
         {imageSrc ? (
           <img
             src={imageSrc}
@@ -201,25 +210,29 @@ function CapeChoiceButton({
             }}
           />
         ) : (
-          <span style={{
-            position: 'absolute',
-            inset: 0,
-            display: 'grid',
-            placeItems: 'center',
-          }}>
+          <span
+            style={{
+              position: 'absolute',
+              inset: 0,
+              display: 'grid',
+              placeItems: 'center',
+            }}
+          >
             <Icon name="x" size={18} />
           </span>
         )}
       </span>
-      <span style={{
-        maxWidth: '100%',
-        overflow: 'hidden',
-        textOverflow: 'ellipsis',
-        whiteSpace: 'nowrap',
-        fontSize: 11,
-        fontWeight: 700,
-        lineHeight: 1.1,
-      }}>
+      <span
+        style={{
+          maxWidth: '100%',
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+          whiteSpace: 'nowrap',
+          fontSize: 11,
+          fontWeight: 700,
+          lineHeight: 1.1,
+        }}
+      >
         {caption}
       </span>
     </button>

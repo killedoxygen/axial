@@ -22,8 +22,18 @@ import { memoryGb } from '../format';
 import { globalPerformanceMode, performanceModeFrom, performanceModeLabel } from '../performance-mode';
 
 type PerformanceProgramState =
-  | { status: 'loading'; plan: PerformancePlanResponse | null; health: PerformanceHealthResponse | null; error?: undefined }
-  | { status: 'ready'; plan: PerformancePlanResponse | null; health: PerformanceHealthResponse | null; error?: undefined }
+  | {
+      status: 'loading';
+      plan: PerformancePlanResponse | null;
+      health: PerformanceHealthResponse | null;
+      error?: undefined;
+    }
+  | {
+      status: 'ready';
+      plan: PerformancePlanResponse | null;
+      health: PerformanceHealthResponse | null;
+      error?: undefined;
+    }
   | { status: 'error'; plan: PerformancePlanResponse | null; health: PerformanceHealthResponse | null; error: string };
 
 interface PerformanceInstallProgress {
@@ -144,7 +154,10 @@ function performanceSummary(
   const modCount = plan.mods?.length ?? 0;
   const healthText = health ? `bundle ${healthLabel(health.health)}` : 'health not checked';
   const fallback = Boolean(plan.fallback_reason) || health?.health === 'fallback';
-  const warning = userPerformanceNotice(plan.fallback_reason || health?.warnings?.[0] || plan.warnings?.[0] || '', fallback);
+  const warning = userPerformanceNotice(
+    plan.fallback_reason || health?.warnings?.[0] || plan.warnings?.[0] || '',
+    fallback,
+  );
   const launcherTuning = plan.tier === 'vanilla_enhanced' || modCount === 0;
 
   if (health?.health === 'fallback') {
@@ -152,7 +165,8 @@ function performanceSummary(
     return {
       tone: healthTone(health.health),
       title: fallbackTier === 'Launcher tuning' ? 'Using launcher tuning' : 'Using fallback bundle',
-      detail: warning || `Croopor chose ${fallbackTier.toLowerCase()} because the preferred bundle could not be applied.`,
+      detail:
+        warning || `Croopor chose ${fallbackTier.toLowerCase()} because the preferred bundle could not be applied.`,
     };
   }
 
@@ -212,13 +226,7 @@ function isPerformanceOperationComplete(status: PerformanceOperationStatus): boo
 function operationStatusAsProgress(status: PerformanceOperationStatus): PerformanceInstallProgress {
   const failed = status.state === 'failed' || status.state === 'interrupted';
   const phase = failed ? 'error' : status.state;
-  const current = phase === 'queued'
-    ? 0
-    : phase === 'planning'
-      ? 1
-      : phase === 'complete' || phase === 'error'
-        ? 4
-        : 2;
+  const current = phase === 'queued' ? 0 : phase === 'planning' ? 1 : phase === 'complete' || phase === 'error' ? 4 : 2;
   return {
     phase,
     current,
@@ -296,10 +304,17 @@ export function PerformanceCard({ inst }: { inst: EnrichedInstance }): JSX.Eleme
     if (planRes?.error) throw new Error(planRes.error);
     if (healthRes?.error) throw new Error(healthRes.error);
     return {
-      plan: planRes?.mode ? planRes as PerformancePlanResponse : null,
-      health: healthRes?.health ? healthRes as PerformanceHealthResponse : null,
+      plan: planRes?.mode ? (planRes as PerformancePlanResponse) : null,
+      health: healthRes?.health ? (healthRes as PerformanceHealthResponse) : null,
     };
-  }, [inst.id, inst.version_id, version?.id, version?.loader?.component_id, version?.minecraft_meta.effective_version, effectiveMode.mode]);
+  }, [
+    inst.id,
+    inst.version_id,
+    version?.id,
+    version?.loader?.component_id,
+    version?.minecraft_meta.effective_version,
+    effectiveMode.mode,
+  ]);
 
   useEffect(() => {
     return () => {
@@ -309,7 +324,7 @@ export function PerformanceCard({ inst }: { inst: EnrichedInstance }): JSX.Eleme
 
   useEffect(() => {
     let alive = true;
-    setProgram(current => ({ status: 'loading', plan: current.plan, health: current.health }));
+    setProgram((current) => ({ status: 'loading', plan: current.plan, health: current.health }));
     void fetchPerformanceProgram()
       .then(({ plan, health }) => {
         if (!alive) return;
@@ -321,7 +336,7 @@ export function PerformanceCard({ inst }: { inst: EnrichedInstance }): JSX.Eleme
       })
       .catch((err) => {
         if (!alive) return;
-        setProgram(current => ({
+        setProgram((current) => ({
           status: 'error',
           plan: current.plan,
           health: current.health,
@@ -329,7 +344,9 @@ export function PerformanceCard({ inst }: { inst: EnrichedInstance }): JSX.Eleme
         }));
       });
 
-    return () => { alive = false; };
+    return () => {
+      alive = false;
+    };
   }, [fetchPerformanceProgram]);
 
   useEffect(() => {
@@ -360,10 +377,7 @@ export function PerformanceCard({ inst }: { inst: EnrichedInstance }): JSX.Eleme
 
     const pollStatus = async (operationId: string): Promise<void> => {
       try {
-        const res: any = await api(
-          'GET',
-          `/performance/operations/${encodeURIComponent(operationId)}`,
-        );
+        const res: any = await api('GET', `/performance/operations/${encodeURIComponent(operationId)}`);
         if (!res?.id && res?.error) throw new Error(res.error);
         const status = res as PerformanceOperationStatus;
         const terminal = applyStatus(status);
@@ -422,20 +436,21 @@ export function PerformanceCard({ inst }: { inst: EnrichedInstance }): JSX.Eleme
   const operationProgress = lifecycleOperation ? operationStatusAsProgress(lifecycleOperation) : null;
   const visibleLifecycleProgress = operationProgress
     ? {
-      title: performanceProgressTitle(operationProgress),
-      detail: performanceProgressDetail(operationProgress),
-    }
+        title: performanceProgressTitle(operationProgress),
+        detail: performanceProgressDetail(operationProgress),
+      }
     : null;
   const summary = visibleLifecycleProgress
     ? {
-      tone: operationProgress?.phase === 'error'
-        ? 'err' as const
-        : operationProgress?.done
-          ? 'ok' as const
-          : 'mute' as const,
-      title: visibleLifecycleProgress.title || 'Updating bundle',
-      detail: visibleLifecycleProgress.detail || 'Croopor is updating managed performance files.',
-    }
+        tone:
+          operationProgress?.phase === 'error'
+            ? ('err' as const)
+            : operationProgress?.done
+              ? ('ok' as const)
+              : ('mute' as const),
+        title: visibleLifecycleProgress.title || 'Updating bundle',
+        detail: visibleLifecycleProgress.detail || 'Croopor is updating managed performance files.',
+      }
     : baseSummary;
   const summaryIcon = performanceSummaryIcon(summary.tone);
   const runtimeDetected = Boolean(inst.java_major);
@@ -468,8 +483,12 @@ export function PerformanceCard({ inst }: { inst: EnrichedInstance }): JSX.Eleme
           <MemoryBar minGb={minMem} maxGb={maxMem} totalGb={totalGb} />
           <div class="cp-od-perf-footer">
             <div class="cp-od-perf-runtime" data-detected={runtimeDetected}>
-              <span class="cp-od-perf-runtime-mark"><Icon name="check" size={11} stroke={2.8} /></span>
-              <span class="cp-od-perf-runtime-text">{runtimeDetected ? `Java ${inst.java_major}` : 'Managed Java'}</span>
+              <span class="cp-od-perf-runtime-mark">
+                <Icon name="check" size={11} stroke={2.8} />
+              </span>
+              <span class="cp-od-perf-runtime-text">
+                {runtimeDetected ? `Java ${inst.java_major}` : 'Managed Java'}
+              </span>
             </div>
             <span class="cp-od-perf-footer-mode">
               {performanceModeLabel(effectiveMode.mode)}

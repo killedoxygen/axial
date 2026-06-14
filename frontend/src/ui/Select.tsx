@@ -83,9 +83,12 @@ export function SelectField<T extends string>({
   const moveHighlight = (delta: number): void => {
     if (enabledIndexes.length === 0) return;
     const position = enabledIndexes.indexOf(highlighted);
-    const next = position < 0
-      ? (delta > 0 ? 0 : enabledIndexes.length - 1)
-      : Math.max(0, Math.min(enabledIndexes.length - 1, position + delta));
+    const next =
+      position < 0
+        ? delta > 0
+          ? 0
+          : enabledIndexes.length - 1
+        : Math.max(0, Math.min(enabledIndexes.length - 1, position + delta));
     setHighlighted(enabledIndexes[next]!);
   };
 
@@ -93,7 +96,9 @@ export function SelectField<T extends string>({
     if (key.length !== 1 || !/\S/.test(key)) return;
     window.clearTimeout(typeahead.current.timer);
     typeahead.current.buffer += key.toLowerCase();
-    typeahead.current.timer = window.setTimeout(() => { typeahead.current.buffer = ''; }, 600);
+    typeahead.current.timer = window.setTimeout(() => {
+      typeahead.current.buffer = '';
+    }, 600);
     const match = options.findIndex(
       (option) => !option.disabled && option.label.toLowerCase().startsWith(typeahead.current.buffer),
     );
@@ -124,10 +129,26 @@ export function SelectField<T extends string>({
       closeList(false);
       return;
     }
-    if (e.key === 'ArrowDown') { e.preventDefault(); moveHighlight(1); return; }
-    if (e.key === 'ArrowUp') { e.preventDefault(); moveHighlight(-1); return; }
-    if (e.key === 'Home') { e.preventDefault(); setHighlighted(enabledIndexes[0] ?? -1); return; }
-    if (e.key === 'End') { e.preventDefault(); setHighlighted(enabledIndexes[enabledIndexes.length - 1] ?? -1); return; }
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      moveHighlight(1);
+      return;
+    }
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      moveHighlight(-1);
+      return;
+    }
+    if (e.key === 'Home') {
+      e.preventDefault();
+      setHighlighted(enabledIndexes[0] ?? -1);
+      return;
+    }
+    if (e.key === 'End') {
+      e.preventDefault();
+      setHighlighted(enabledIndexes[enabledIndexes.length - 1] ?? -1);
+      return;
+    }
     if (e.key === 'Enter' || e.key === ' ') {
       e.preventDefault();
       commit(highlighted);
@@ -158,9 +179,7 @@ export function SelectField<T extends string>({
 
   useEffect(() => {
     if (!open || highlighted < 0) return;
-    listRef.current
-      ?.querySelector<HTMLElement>(`[data-index="${highlighted}"]`)
-      ?.scrollIntoView({ block: 'nearest' });
+    listRef.current?.querySelector<HTMLElement>(`[data-index="${highlighted}"]`)?.scrollIntoView({ block: 'nearest' });
   }, [open, highlighted]);
 
   const placement = open && triggerRef.current ? placePopover(triggerRef.current) : null;
@@ -188,48 +207,52 @@ export function SelectField<T extends string>({
           <Icon name="chevron-down" size={14} stroke={2} />
         </span>
       </button>
-      {open && placement && createPortal(
-        <div
-          ref={listRef}
-          class="cp-select-content"
-          role="listbox"
-          tabIndex={-1}
-          aria-label={ariaLabel}
-          style={{
-            position: 'fixed',
-            left: placement.left,
-            top: placement.top,
-            minWidth: placement.minWidth,
-            maxHeight: placement.maxHeight,
-          }}
-          onKeyDown={onListKeyDown}
-        >
-          <div class="cp-select-viewport">
-            {options.map((option, index) => (
-              <div
-                key={option.value}
-                class="cp-select-item"
-                role="option"
-                data-index={index}
-                aria-selected={option.value === value}
-                data-state={option.value === value ? 'checked' : 'unchecked'}
-                data-highlighted={index === highlighted ? '' : undefined}
-                data-disabled={option.disabled ? '' : undefined}
-                onPointerEnter={() => { if (!option.disabled) setHighlighted(index); }}
-                onClick={() => commit(index)}
-              >
-                <span class="cp-select-item-label">{option.label}</span>
-                {option.value === value && (
-                  <span class="cp-select-check" aria-hidden="true">
-                    <Icon name="check" size={13} stroke={2.4} />
-                  </span>
-                )}
-              </div>
-            ))}
-          </div>
-        </div>,
-        document.body,
-      )}
+      {open &&
+        placement &&
+        createPortal(
+          <div
+            ref={listRef}
+            class="cp-select-content"
+            role="listbox"
+            tabIndex={-1}
+            aria-label={ariaLabel}
+            style={{
+              position: 'fixed',
+              left: placement.left,
+              top: placement.top,
+              minWidth: placement.minWidth,
+              maxHeight: placement.maxHeight,
+            }}
+            onKeyDown={onListKeyDown}
+          >
+            <div class="cp-select-viewport">
+              {options.map((option, index) => (
+                <div
+                  key={option.value}
+                  class="cp-select-item"
+                  role="option"
+                  data-index={index}
+                  aria-selected={option.value === value}
+                  data-state={option.value === value ? 'checked' : 'unchecked'}
+                  data-highlighted={index === highlighted ? '' : undefined}
+                  data-disabled={option.disabled ? '' : undefined}
+                  onPointerEnter={() => {
+                    if (!option.disabled) setHighlighted(index);
+                  }}
+                  onClick={() => commit(index)}
+                >
+                  <span class="cp-select-item-label">{option.label}</span>
+                  {option.value === value && (
+                    <span class="cp-select-check" aria-hidden="true">
+                      <Icon name="check" size={13} stroke={2.4} />
+                    </span>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>,
+          document.body,
+        )}
     </>
   );
 }

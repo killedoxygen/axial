@@ -14,20 +14,19 @@ export function AccountsView(): JSX.Element {
   const activeAccount = accountsState.accounts.find((account) => account.active) ?? null;
   const onlineActive = activeAccount?.kind === 'microsoft';
   const onlineReady = state === 'ready' && onlineActive && Boolean(status?.online_mode_ready);
-  const minecraftProfile = onlineActive ? activeAccount?.minecraft_profile ?? status?.minecraft_profile : undefined;
+  const minecraftProfile = onlineActive ? (activeAccount?.minecraft_profile ?? status?.minecraft_profile) : undefined;
   const profileName = minecraftProfile?.name;
   const playerName = activeAccount?.display_name || (onlineActive && profileName ? profileName : savedUsername);
-  const skinAccountKey = activeAccount
-    ? launcherSkinAccountKey(activeAccount.account_id)
-    : FALLBACK_SKIN_ACCOUNT_KEY;
-  const renameNametag = onlineActive && profileName
-    ? undefined
-    : async (): Promise<void> => {
-        const next = await promptPlayerName(savedUsername);
-        if (!next) return;
-        const saved = await savePlayerName(next);
-        if (saved) refresh();
-      };
+  const skinAccountKey = activeAccount ? launcherSkinAccountKey(activeAccount.account_id) : FALLBACK_SKIN_ACCOUNT_KEY;
+  const renameNametag =
+    onlineActive && profileName
+      ? undefined
+      : async (): Promise<void> => {
+          const next = await promptPlayerName(savedUsername);
+          if (!next) return;
+          const saved = await savePlayerName(next);
+          if (saved) refresh();
+        };
 
   return (
     <div class="cp-view-page" style={{ gap: 18 }}>

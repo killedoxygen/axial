@@ -63,7 +63,8 @@ export function useLoaderHoverPrefetch({
     if (prefetchedComponentsRef.current.has(componentId)) return;
     if (prefetchingComponentsRef.current.has(componentId)) return;
     prefetchingComponentsRef.current.add(componentId);
-    void loaderMachine.prefetchComponent(componentId, hoverPrefetchVersions)
+    void loaderMachine
+      .prefetchComponent(componentId, hoverPrefetchVersions)
       .then(() => {
         prefetchedComponentsRef.current.add(componentId);
       })
@@ -85,17 +86,25 @@ export function useLoaderHoverPrefetch({
       hoverPrefetchTimeoutRef.current = null;
       const idleWindow = window as IdleCapableWindow;
       if (idleWindow.requestIdleCallback) {
-        hoverPrefetchIdleRef.current = idleWindow.requestIdleCallback(() => {
-          hoverPrefetchIdleRef.current = null;
-          runHoverPrefetch(componentId);
-        }, { timeout: LOADER_HOVER_IDLE_TIMEOUT_MS });
+        hoverPrefetchIdleRef.current = idleWindow.requestIdleCallback(
+          () => {
+            hoverPrefetchIdleRef.current = null;
+            runHoverPrefetch(componentId);
+          },
+          { timeout: LOADER_HOVER_IDLE_TIMEOUT_MS },
+        );
         return;
       }
       runHoverPrefetch(componentId);
     }, LOADER_HOVER_PREFETCH_DELAY_MS);
   };
 
-  useEffect(() => () => { cancelHoverPrefetch(); }, []);
+  useEffect(
+    () => () => {
+      cancelHoverPrefetch();
+    },
+    [],
+  );
 
   return {
     scheduleHoverPrefetch,

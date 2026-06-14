@@ -73,7 +73,10 @@ export function nativeLaunchLogEventName(sessionId: string): string {
 
 export const nativeDesktopCloseBlockedEventName = 'croopor:desktop:close-blocked';
 
-export async function onNativeEvent(eventName: string, callback: (data: any) => void): Promise<{ close(): void } | null> {
+export async function onNativeEvent(
+  eventName: string,
+  callback: (data: any) => void,
+): Promise<{ close(): void } | null> {
   const tauri = getTauriBinding();
   if (!tauri?.event) return null;
 
@@ -94,9 +97,8 @@ function nativeDragDropPayload(type: NativeDragDropType, payload: any): NativeDr
     : [];
   const x = payload?.position?.x;
   const y = payload?.position?.y;
-  const position = typeof x === 'number' && typeof y === 'number' && Number.isFinite(x) && Number.isFinite(y)
-    ? { x, y }
-    : null;
+  const position =
+    typeof x === 'number' && typeof y === 'number' && Number.isFinite(x) && Number.isFinite(y) ? { x, y } : null;
   return { type, paths, position };
 }
 
@@ -176,9 +178,7 @@ function nativeSkinFileFromPayload(payload: unknown): File {
     bytes[index] = value;
   });
 
-  const name = typeof record.name === 'string' && record.name.trim()
-    ? record.name.trim()
-    : 'skin.png';
+  const name = typeof record.name === 'string' && record.name.trim() ? record.name.trim() : 'skin.png';
 
   return new File([bytes], name, { type: 'image/png' });
 }

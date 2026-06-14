@@ -5,7 +5,8 @@ import { minecraftVersionLabel } from './version-display';
 import type { InstallFailure } from './store';
 import type { EnrichedInstance, InstallItem, Version } from './types';
 
-export type InstanceInstallCandidate = Pick<EnrichedInstance, 'version_id'> & Partial<Pick<EnrichedInstance, 'needs_install'>>;
+export type InstanceInstallCandidate = Pick<EnrichedInstance, 'version_id'> &
+  Partial<Pick<EnrichedInstance, 'needs_install'>>;
 
 export type InstanceInstallProgress = {
   pct: number;
@@ -51,18 +52,21 @@ function matchesInstanceInstall(candidate: InstallItem, expected: InstallItem): 
   return candidate.versionId === expected.versionId;
 }
 
-export function instanceInstallStatus(inst: InstanceInstallCandidate, version: Version | undefined): InstanceInstallStatus {
+export function instanceInstallStatus(
+  inst: InstanceInstallCandidate,
+  version: Version | undefined,
+): InstanceInstallStatus {
   const expectedItem = installItemForInstance(inst, version);
   const install = installState.value;
-  const activeInstall = install.status === 'active' && matchesInstanceInstall(install.item, expectedItem)
-    ? install
-    : undefined;
+  const activeInstall =
+    install.status === 'active' && matchesInstanceInstall(install.item, expectedItem) ? install : undefined;
   const activeItem = activeInstall?.item;
-  const queuedIndex = installQueue.value.findIndex(candidate => matchesInstanceInstall(candidate, expectedItem));
+  const queuedIndex = installQueue.value.findIndex((candidate) => matchesInstanceInstall(candidate, expectedItem));
   const queuedItem = queuedIndex >= 0 ? installQueue.value[queuedIndex] : undefined;
-  const failure = installFailure.value && matchesInstanceInstall(installFailure.value.item, expectedItem)
-    ? installFailure.value
-    : null;
+  const failure =
+    installFailure.value && matchesInstanceInstall(installFailure.value.item, expectedItem)
+      ? installFailure.value
+      : null;
   const item = activeItem ?? queuedItem ?? failure?.item ?? expectedItem;
   const progress = activeItem
     ? {
@@ -74,8 +78,8 @@ export function instanceInstallStatus(inst: InstanceInstallCandidate, version: V
       }
     : null;
   const state = progress ? 'active' : queuedItem ? 'queued' : failure ? 'failed' : 'idle';
-  const label = progress?.displayName
-    || (queuedItem ? formatInstallItemLabel(queuedItem) : failure?.displayName || item.versionId);
+  const label =
+    progress?.displayName || (queuedItem ? formatInstallItemLabel(queuedItem) : failure?.displayName || item.versionId);
 
   return {
     item,

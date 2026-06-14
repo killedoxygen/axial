@@ -48,17 +48,21 @@ export function launchAuthMode(value: unknown): LaunchAuthMode {
 
 export function statusCanSelectOnline(status: AuthStatusRecord): boolean {
   if (status.online_mode_ready) return true;
-  return status.minecraft_profile_ready === true &&
+  return (
+    status.minecraft_profile_ready === true &&
     status.minecraft_ownership_verified === true &&
     typeof status.minecraft_token_expires_in === 'number' &&
-    status.minecraft_token_expires_in > 0;
+    status.minecraft_token_expires_in > 0
+  );
 }
 
 export function accountHasLaunchReadyMinecraft(account: AuthAccount | LauncherAccount): boolean {
-  return account.minecraft_profile_ready === true &&
+  return (
+    account.minecraft_profile_ready === true &&
     account.minecraft_ownership_verified === true &&
     typeof account.minecraft_token_expires_in === 'number' &&
-    account.minecraft_token_expires_in > 0;
+    account.minecraft_token_expires_in > 0
+  );
 }
 
 export function accountCanSelectOnline(account: AuthAccount | LauncherAccount): boolean {

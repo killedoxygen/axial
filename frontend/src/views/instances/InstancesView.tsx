@@ -82,10 +82,16 @@ function ListRow({
       <div>
         <div class="cp-table-row-title" style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           {inst.name}
-          {running && <Pill tone="accent" icon="play">Live</Pill>}
+          {running && (
+            <Pill tone="accent" icon="play">
+              Live
+            </Pill>
+          )}
           {installing && <Pill icon={install.state === 'queued' ? 'clock' : 'download'}>{installLabel}</Pill>}
         </div>
-        <div class="cp-table-row-sub">{loaderLabel(v)} · {v?.loader?.loader_version || 'vanilla'}</div>
+        <div class="cp-table-row-sub">
+          {loaderLabel(v)} · {v?.loader?.loader_version || 'vanilla'}
+        </div>
       </div>
       <div class="cp-table-cell">{versionLabel(v)}</div>
       <div class="cp-table-cell">{showModsCount ? `${inst.mods_count ?? 0} mods` : null}</div>
@@ -94,14 +100,22 @@ function ListRow({
         <Button
           size="sm"
           variant="secondary"
-          icon={installing ? install.state === 'queued' ? 'clock' : 'download' : 'play'}
+          icon={installing ? (install.state === 'queued' ? 'clock' : 'download') : 'play'}
           disabled={installing}
-          onClick={(e) => { e.stopPropagation(); navigate({ name: 'instance', id: inst.id }); }}
-        >{installing ? installLabel : 'Play'}</Button>
+          onClick={(e) => {
+            e.stopPropagation();
+            navigate({ name: 'instance', id: inst.id });
+          }}
+        >
+          {installing ? installLabel : 'Play'}
+        </Button>
         <IconButton
           icon="dots"
           size={28}
-          onClick={(e: any) => { e.stopPropagation(); onContextMenu(e); }}
+          onClick={(e: any) => {
+            e.stopPropagation();
+            onContextMenu(e);
+          }}
         />
       </div>
     </div>
@@ -113,8 +127,11 @@ export function InstancesView(): JSX.Element {
   const [q, setQ] = useState('');
   const all = instances.value as EnrichedInstance[];
   const query = q.trim().toLowerCase();
-  const filtered = all.filter(i => i.name.toLowerCase().includes(query));
-  const selection = useSelection(filtered, useCallback((inst: EnrichedInstance) => inst.id, []));
+  const filtered = all.filter((i) => i.name.toLowerCase().includes(query));
+  const selection = useSelection(
+    filtered,
+    useCallback((inst: EnrichedInstance) => inst.id, []),
+  );
 
   const menuItems = (inst: EnrichedInstance) => [
     selectionMenuItem(selection, inst.id),
@@ -141,9 +158,17 @@ export function InstancesView(): JSX.Element {
         </div>
         <div style={{ flex: 1 }} />
         <Input value={q} onChange={setQ} placeholder="Filter instances…" icon="search" style={{ width: 260 }} />
-        <Segmented<'grid' | 'list'> value={view} onChange={setView}
-          options={[{ value: 'grid', label: 'Grid' }, { value: 'list', label: 'List' }]} />
-        <Button icon="plus" onClick={openCreate}>New</Button>
+        <Segmented<'grid' | 'list'>
+          value={view}
+          onChange={setView}
+          options={[
+            { value: 'grid', label: 'Grid' },
+            { value: 'list', label: 'List' },
+          ]}
+        />
+        <Button icon="plus" onClick={openCreate}>
+          New
+        </Button>
       </div>
 
       {filtered.length === 0 ? (
@@ -151,11 +176,15 @@ export function InstancesView(): JSX.Element {
           <Icon name="stack" size={36} color="var(--text-mute)" />
           <h2>{q ? 'No matches' : 'No instances yet'}</h2>
           <p>{q ? 'Try a different search term.' : 'Create your first Minecraft instance to get started.'}</p>
-          {!q && <Button icon="plus" onClick={openCreate}>New instance</Button>}
+          {!q && (
+            <Button icon="plus" onClick={openCreate}>
+              New instance
+            </Button>
+          )}
         </div>
       ) : view === 'grid' ? (
         <div class="cp-cover-grid">
-          {filtered.map(i => (
+          {filtered.map((i) => (
             <InstanceCard
               key={i.id}
               inst={i}
@@ -176,7 +205,7 @@ export function InstancesView(): JSX.Element {
             <span>Last played</span>
             <span />
           </div>
-          {filtered.map(i => (
+          {filtered.map((i) => (
             <ListRow
               key={i.id}
               inst={i}
@@ -190,9 +219,7 @@ export function InstancesView(): JSX.Element {
       <SelectionActionPill
         selection={selection}
         itemLabel="instance"
-        actions={[
-          { label: 'Delete', icon: 'trash', danger: true, onClick: () => void deleteSelected() },
-        ]}
+        actions={[{ label: 'Delete', icon: 'trash', danger: true, onClick: () => void deleteSelected() }]}
       />
     </div>
   );

@@ -52,12 +52,16 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
   const [minMem, setMinMem] = useState<number>(memoryGb(inst.min_memory_mb, config.value?.min_memory_mb ?? 1024));
   const [width, setWidth] = useState<number>(inst.window_width ?? 854);
   const [height, setHeight] = useState<number>(inst.window_height ?? 480);
-  const [performanceMode, setPerformanceMode] = useState<InstancePerformanceMode>(instancePerformanceModeFrom(inst.performance_mode));
+  const [performanceMode, setPerformanceMode] = useState<InstancePerformanceMode>(
+    instancePerformanceModeFrom(inst.performance_mode),
+  );
   const [jvmPreset, setJvmPreset] = useState<JvmPreset>(jvmPresetFrom(inst.jvm_preset));
   const [javaPath, setJavaPath] = useState<string>(inst.java_path ?? '');
   const [jvmArgs, setJvmArgs] = useState<string>(inst.extra_jvm_args ?? '');
   const [saving, setSaving] = useState(false);
-  const totalGB = systemInfo.value?.total_memory_mb ? Math.max(1, Math.floor(systemInfo.value.total_memory_mb / 1024)) : 32;
+  const totalGB = systemInfo.value?.total_memory_mb
+    ? Math.max(1, Math.floor(systemInfo.value.total_memory_mb / 1024))
+    : 32;
   const ramMax = Math.max(2, Math.min(32, totalGB));
   const rec = getMemoryRecommendation(totalGB);
   const recMin = Math.min(ramMax, Math.max(1, rec.rec - 2));
@@ -68,14 +72,14 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
     { from: recMax, to: Math.min(ramMax, Math.max(recMax, ramMax * 0.75)), tone: 'high', label: 'High' },
     { from: Math.min(ramMax, Math.max(recMax, ramMax * 0.75)), to: ramMax, tone: 'extreme', label: 'Aggressive' },
   ];
-  const activeWindowPreset = WINDOW_PRESETS.find(p => p.w === width && p.h === height)?.id ?? 'custom';
-  const activeWindowLabel = WINDOW_PRESETS.find(p => p.id === activeWindowPreset)?.label ?? 'Custom';
+  const activeWindowPreset = WINDOW_PRESETS.find((p) => p.w === width && p.h === height)?.id ?? 'custom';
+  const activeWindowLabel = WINDOW_PRESETS.find((p) => p.id === activeWindowPreset)?.label ?? 'Custom';
   const effectiveSettingsMode = performanceMode || globalPerformanceMode();
   const performanceModeText = performanceMode
     ? `${performanceModeLabel(effectiveSettingsMode)} override`
     : `Inherits ${performanceModeLabel(effectiveSettingsMode)} from global settings`;
   const runtimePresetText = `${JVM_PRESET_LABELS[jvmPreset]}: ${JVM_PRESET_HINTS[jvmPreset]}`;
-  const dirty = (
+  const dirty =
     artSeed !== initialArtSeed ||
     Math.round(maxMem * 1024) !== (inst.max_memory_mb ?? config.value?.max_memory_mb ?? 4096) ||
     Math.round(Math.min(minMem, maxMem) * 1024) !== (inst.min_memory_mb ?? config.value?.min_memory_mb ?? 1024) ||
@@ -84,11 +88,10 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
     performanceMode !== instancePerformanceModeFrom(inst.performance_mode) ||
     jvmPreset !== jvmPresetFrom(inst.jvm_preset) ||
     javaPath !== (inst.java_path ?? '') ||
-    jvmArgs !== (inst.extra_jvm_args ?? '')
-  );
+    jvmArgs !== (inst.extra_jvm_args ?? '');
 
   useEffect(() => {
-    setMinMem(prev => Math.min(prev, maxMem));
+    setMinMem((prev) => Math.min(prev, maxMem));
   }, [maxMem]);
 
   useEffect(() => {
@@ -146,7 +149,9 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
         <strong>Instance settings</strong>
         <div class="cp-settings-save">
           <span data-dirty={dirty}>{dirty ? 'Unsaved changes' : 'Up to date'}</span>
-          <Button onClick={save} disabled={saving || !dirty} sound="affirm">{saving ? 'Saving…' : 'Save settings'}</Button>
+          <Button onClick={save} disabled={saving || !dirty} sound="affirm">
+            {saving ? 'Saving…' : 'Save settings'}
+          </Button>
         </div>
       </div>
 
@@ -181,7 +186,9 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
             <div class="cp-iset-head">
               <div>
                 <h3>Memory</h3>
-                <p>Recommended range: {fmtMem(recMin)} to {fmtMem(recMax)}.</p>
+                <p>
+                  Recommended range: {fmtMem(recMin)} to {fmtMem(recMax)}.
+                </p>
               </div>
             </div>
             <div class="cp-iset-body">
@@ -268,7 +275,9 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
             <div class="cp-iset-head">
               <div>
                 <h3>Window</h3>
-                <p>{activeWindowLabel} · {width} × {height}</p>
+                <p>
+                  {activeWindowLabel} · {width} × {height}
+                </p>
               </div>
             </div>
             <div class="cp-iset-body">
@@ -316,16 +325,17 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
               </div>
             </div>
             <div class="cp-iset-body cp-settings-identity-control">
-              <InstanceTile
-                inst={{ ...inst, art_seed: artSeed }}
-                radius={12}
-                className="cp-settings-avatar"
-              />
+              <InstanceTile inst={{ ...inst, art_seed: artSeed }} radius={12} className="cp-settings-avatar" />
               <div>
                 <strong>Identity tile</strong>
                 <span>Used anywhere the instance needs a compact visual mark</span>
               </div>
-              <Button variant="secondary" size="sm" icon="refresh" onClick={() => setArtSeed(seed => nextArtSeed(seed))}>
+              <Button
+                variant="secondary"
+                size="sm"
+                icon="refresh"
+                onClick={() => setArtSeed((seed) => nextArtSeed(seed))}
+              >
                 Shuffle colors
               </Button>
             </div>

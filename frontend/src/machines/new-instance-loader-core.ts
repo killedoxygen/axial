@@ -1,10 +1,5 @@
 import { matches } from '../machine';
-import type {
-  LoaderBuildRecord,
-  LoaderComponentId,
-  LoaderComponentRecord,
-  LoaderGameVersion,
-} from '../types';
+import type { LoaderBuildRecord, LoaderComponentId, LoaderComponentRecord, LoaderGameVersion } from '../types';
 
 export type LoaderMachineContext = {
   components: LoaderComponentRecord[] | null;
@@ -31,48 +26,48 @@ export type LoaderMachineEvent =
   | { type: 'disable' }
   | { type: 'start_components'; requestId: number }
   | {
-    type: 'components_loaded';
-    requestId: number;
-    components: LoaderComponentRecord[];
-    selectedComponentId: LoaderComponentId | null;
-    selectedMcVersion: string | null;
-  }
+      type: 'components_loaded';
+      requestId: number;
+      components: LoaderComponentRecord[];
+      selectedComponentId: LoaderComponentId | null;
+      selectedMcVersion: string | null;
+    }
   | { type: 'components_failed'; requestId: number; errorMessage: string }
   | { type: 'start_versions'; selectedComponentId: LoaderComponentId; requestId: number }
   | {
-    type: 'versions_loaded';
-    requestId: number;
-    selectedComponentId: LoaderComponentId;
-    supportedVersions: LoaderGameVersion[];
-    selectedMcVersion: string | null;
-  }
+      type: 'versions_loaded';
+      requestId: number;
+      selectedComponentId: LoaderComponentId;
+      supportedVersions: LoaderGameVersion[];
+      selectedMcVersion: string | null;
+    }
   | {
-    type: 'versions_failed';
-    requestId: number;
-    selectedComponentId: LoaderComponentId;
-    errorMessage: string;
-  }
+      type: 'versions_failed';
+      requestId: number;
+      selectedComponentId: LoaderComponentId;
+      errorMessage: string;
+    }
   | {
-    type: 'start_builds';
-    selectedComponentId: LoaderComponentId;
-    selectedMcVersion: string;
-    requestId: number;
-  }
+      type: 'start_builds';
+      selectedComponentId: LoaderComponentId;
+      selectedMcVersion: string;
+      requestId: number;
+    }
   | {
-    type: 'builds_loaded';
-    requestId: number;
-    selectedComponentId: LoaderComponentId;
-    selectedMcVersion: string;
-    builds: LoaderBuildRecord[];
-    selectedBuildId: string | null;
-  }
+      type: 'builds_loaded';
+      requestId: number;
+      selectedComponentId: LoaderComponentId;
+      selectedMcVersion: string;
+      builds: LoaderBuildRecord[];
+      selectedBuildId: string | null;
+    }
   | {
-    type: 'builds_failed';
-    requestId: number;
-    selectedComponentId: LoaderComponentId;
-    selectedMcVersion: string;
-    errorMessage: string;
-  }
+      type: 'builds_failed';
+      requestId: number;
+      selectedComponentId: LoaderComponentId;
+      selectedMcVersion: string;
+      errorMessage: string;
+    }
   | { type: 'select_build'; buildId: string };
 
 const INITIAL_CONTEXT: LoaderMachineContext = {

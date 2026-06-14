@@ -56,8 +56,10 @@ export function selectedSkinForAccount(accountKey?: string): string {
 }
 
 export function hasSelectedSkinForAccount(accountKey: string): boolean {
-  return typeof local.selectedSkinsByAccount[accountKey] === 'string'
-    && local.selectedSkinsByAccount[accountKey].trim().length > 0;
+  return (
+    typeof local.selectedSkinsByAccount[accountKey] === 'string' &&
+    local.selectedSkinsByAccount[accountKey].trim().length > 0
+  );
 }
 
 export function selectedSkinTextureSrc(value = selectedSkinForAccount()): string | null {
@@ -72,9 +74,7 @@ export function selectedSkinTextureSrc(value = selectedSkinForAccount()): string
   return null;
 }
 
-export function minecraftProfileSkinTextureSrc(
-  profile: MinecraftProfileLike | undefined | null,
-): string | null {
+export function minecraftProfileSkinTextureSrc(profile: MinecraftProfileLike | undefined | null): string | null {
   const id = typeof profile?.id === 'string' ? profile.id.trim() : '';
   const skin = activeMinecraftSkin(profile);
   if (!id || !skin) return null;
@@ -109,13 +109,11 @@ export function refreshAccountSkin(): void {
   const requestId = ++accountSkinRequestId;
   const fallbackName = config.value?.username || 'Player';
 
-  void applyAccountSkinFromAccounts(requestId, fallbackName, false)
-    .catch(() => {
-      void applyAccountSkinFromAuthStatus(requestId, fallbackName, false)
-        .catch(() => {
-          if (requestId === accountSkinRequestId) applyNoAccountHead(fallbackName);
-        });
+  void applyAccountSkinFromAccounts(requestId, fallbackName, false).catch(() => {
+    void applyAccountSkinFromAuthStatus(requestId, fallbackName, false).catch(() => {
+      if (requestId === accountSkinRequestId) applyNoAccountHead(fallbackName);
     });
+  });
 }
 
 async function applyAccountSkinFromAccounts(
@@ -138,15 +136,15 @@ async function applyAccountSkinFromAccounts(
     return;
   }
 
-  const displayName = typeof activeAccount.display_name === 'string' && activeAccount.display_name.trim()
-    ? activeAccount.display_name.trim()
-    : fallbackName;
+  const displayName =
+    typeof activeAccount.display_name === 'string' && activeAccount.display_name.trim()
+      ? activeAccount.display_name.trim()
+      : fallbackName;
   if (activeAccount.kind === 'microsoft') {
     const profile = minecraftProfileLike(activeAccount.minecraft_profile);
     if (profile) {
-      accountDisplayName.value = typeof profile.name === 'string' && profile.name.trim()
-        ? profile.name.trim()
-        : displayName;
+      accountDisplayName.value =
+        typeof profile.name === 'string' && profile.name.trim() ? profile.name.trim() : displayName;
       accountSkinSrc.value = minecraftProfileSkinTextureSrc(profile);
       return;
     }
@@ -183,9 +181,7 @@ async function applyAccountSkinFromAuthStatus(
 
   const profile = activeStatusMinecraftProfile(status);
   if (status.launch_auth_mode === 'online' && profile) {
-    const profileName = typeof profile.name === 'string' && profile.name.trim()
-      ? profile.name.trim()
-      : fallbackName;
+    const profileName = typeof profile.name === 'string' && profile.name.trim() ? profile.name.trim() : fallbackName;
     accountDisplayName.value = profileName;
     accountSkinSrc.value = minecraftProfileSkinTextureSrc(profile);
     if (!status.online_mode_ready && status.msa_refresh_available === true && !refreshAttempted) {
@@ -194,11 +190,7 @@ async function applyAccountSkinFromAuthStatus(
     return;
   }
 
-  if (
-    status.launch_auth_mode === 'online' &&
-    status.msa_refresh_available === true &&
-    !refreshAttempted
-  ) {
+  if (status.launch_auth_mode === 'online' && status.msa_refresh_available === true && !refreshAttempted) {
     await api('POST', '/auth/refresh');
     await applyAccountSkinFromAuthStatus(requestId, fallbackName, true);
     return;
@@ -239,9 +231,7 @@ function applyNoAccountHead(displayName = 'Player'): void {
 }
 
 function authStatusDisplayName(status: AuthStatusLike, fallbackName: string): string {
-  return typeof status.username === 'string' && status.username.trim()
-    ? status.username.trim()
-    : fallbackName;
+  return typeof status.username === 'string' && status.username.trim() ? status.username.trim() : fallbackName;
 }
 
 function validSelectedSkin(value: string | undefined): string {
@@ -249,9 +239,7 @@ function validSelectedSkin(value: string | undefined): string {
   return selected || DEFAULT_SELECTED_SKIN;
 }
 
-function activeMinecraftSkin(
-  profile: MinecraftProfileLike | undefined | null,
-): { id: string; url: string } | null {
+function activeMinecraftSkin(profile: MinecraftProfileLike | undefined | null): { id: string; url: string } | null {
   const skins = Array.isArray(profile?.skins) ? profile.skins : [];
   const parsed = skins
     .map(minecraftProfileSkin)

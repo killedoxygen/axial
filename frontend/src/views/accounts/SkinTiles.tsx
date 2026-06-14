@@ -86,9 +86,7 @@ export function SavedSkinTile({
         aria-pressed={selected}
         disabled={deleting}
         onClick={onView}
-        onContextMenu={menuItems.length === 0
-          ? undefined
-          : (event) => openContextMenu(event, menuItems)}
+        onContextMenu={menuItems.length === 0 ? undefined : (event) => openContextMenu(event, menuItems)}
         title={skin.name}
       >
         <SkinSnapshotImg

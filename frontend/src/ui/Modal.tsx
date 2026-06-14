@@ -21,14 +21,11 @@ function Modal({
   children: ComponentChildren;
 }): JSX.Element | null {
   if (!open) return null;
-  return (
-    <ModalContext.Provider value={{ close: () => onOpenChange?.(false) }}>
-      {children}
-    </ModalContext.Provider>
-  );
+  return <ModalContext.Provider value={{ close: () => onOpenChange?.(false) }}>{children}</ModalContext.Provider>;
 }
 
-const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+const FOCUSABLE =
+  'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
 function ModalContent({
   className,
@@ -55,8 +52,9 @@ function ModalContent({
         return;
       }
       if (e.key === 'Tab' && panel) {
-        const focusable = Array.from(panel.querySelectorAll<HTMLElement>(FOCUSABLE))
-          .filter((el) => el.offsetParent !== null || el === document.activeElement);
+        const focusable = Array.from(panel.querySelectorAll<HTMLElement>(FOCUSABLE)).filter(
+          (el) => el.offsetParent !== null || el === document.activeElement,
+        );
         if (focusable.length === 0) return;
         const first = focusable[0]!;
         const last = focusable[focusable.length - 1]!;
@@ -80,12 +78,7 @@ function ModalContent({
 
   return createPortal(
     <>
-      <div
-        data-slot="modal-overlay"
-        class="cp-modal-overlay"
-        onClick={close}
-        aria-hidden="true"
-      />
+      <div data-slot="modal-overlay" class="cp-modal-overlay" onClick={close} aria-hidden="true" />
       <div
         data-slot="modal-content"
         role="dialog"
@@ -97,13 +90,7 @@ function ModalContent({
       >
         {children}
         {showCloseButton && (
-          <button
-            type="button"
-            data-slot="modal-close"
-            class="cp-modal-x"
-            aria-label="Close"
-            onClick={close}
-          >
+          <button type="button" data-slot="modal-close" class="cp-modal-x" aria-label="Close" onClick={close}>
             <Icon name="x" size={16} stroke={2} />
           </button>
         )}
@@ -122,13 +109,7 @@ function ModalClose({
 }): JSX.Element {
   const { close } = useContext(ModalContext);
   return (
-    <button
-      type="button"
-      data-slot="modal-close"
-      class={cn(className)}
-      onClick={close}
-      {...props}
-    >
+    <button type="button" data-slot="modal-close" class={cn(className)} onClick={close} {...props}>
       {children}
     </button>
   );
@@ -182,12 +163,4 @@ function ModalDescription({
   );
 }
 
-export {
-  Modal,
-  ModalClose,
-  ModalContent,
-  ModalDescription,
-  ModalFooter,
-  ModalHeader,
-  ModalTitle,
-};
+export { Modal, ModalClose, ModalContent, ModalDescription, ModalFooter, ModalHeader, ModalTitle };

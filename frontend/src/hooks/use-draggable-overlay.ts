@@ -73,20 +73,37 @@ function clampScale(value: number | undefined): number | null {
   return Math.min(Math.max(value, 0), 1);
 }
 
-function axisScale(value: number, viewportSize: number, surfaceSize: number, margin: number, fallback?: number): number {
+function axisScale(
+  value: number,
+  viewportSize: number,
+  surfaceSize: number,
+  margin: number,
+  fallback?: number,
+): number {
   const { min, max } = axisBounds(viewportSize, surfaceSize, margin);
   if (max === min) return clampScale(fallback) ?? 0.5;
   return Math.min(Math.max((value - min) / (max - min), 0), 1);
 }
 
-function axisFromScale(scale: number | undefined, fallback: number, viewportSize: number, surfaceSize: number, margin: number): number {
+function axisFromScale(
+  scale: number | undefined,
+  fallback: number,
+  viewportSize: number,
+  surfaceSize: number,
+  margin: number,
+): number {
   const ratio = clampScale(scale);
   if (ratio === null) return fallback;
   const { min, max } = axisBounds(viewportSize, surfaceSize, margin);
   return min + (max - min) * ratio;
 }
 
-function withScales(point: OverlayPosition, size: OverlaySize, margin: number, fallback?: OverlayPosition): OverlayPosition {
+function withScales(
+  point: OverlayPosition,
+  size: OverlaySize,
+  margin: number,
+  fallback?: OverlayPosition,
+): OverlayPosition {
   const clamped = clampPosition(point, size, margin);
   return {
     x: clamped.x,
@@ -97,10 +114,15 @@ function withScales(point: OverlayPosition, size: OverlaySize, margin: number, f
 }
 
 function resolvePosition(point: OverlayPosition, size: OverlaySize, margin: number): OverlayPosition {
-  return withScales({
-    x: axisFromScale(point.scaleX, point.x, window.innerWidth, size.width, margin),
-    y: axisFromScale(point.scaleY, point.y, window.innerHeight, size.height, margin),
-  }, size, margin, point);
+  return withScales(
+    {
+      x: axisFromScale(point.scaleX, point.x, window.innerWidth, size.width, margin),
+      y: axisFromScale(point.scaleY, point.y, window.innerHeight, size.height, margin),
+    },
+    size,
+    margin,
+    point,
+  );
 }
 
 function roundedScale(value: number | undefined): number {
@@ -108,10 +130,12 @@ function roundedScale(value: number | undefined): number {
 }
 
 function positionsMatch(a: OverlayPosition, b: OverlayPosition): boolean {
-  return Math.round(a.x) === Math.round(b.x)
-    && Math.round(a.y) === Math.round(b.y)
-    && roundedScale(a.scaleX) === roundedScale(b.scaleX)
-    && roundedScale(a.scaleY) === roundedScale(b.scaleY);
+  return (
+    Math.round(a.x) === Math.round(b.x) &&
+    Math.round(a.y) === Math.round(b.y) &&
+    roundedScale(a.scaleX) === roundedScale(b.scaleX) &&
+    roundedScale(a.scaleY) === roundedScale(b.scaleY)
+  );
 }
 
 function persistPosition(id: string, point: OverlayPosition): void {
@@ -155,15 +179,18 @@ export function useDraggableOverlay<T extends HTMLElement>({
     el.style.top = `${Math.round(point.y)}px`;
   }, []);
 
-  const queuePosition = useCallback((point: OverlayPosition): void => {
-    positionRef.current = point;
-    if (frameRef.current !== null) return;
-    frameRef.current = window.requestAnimationFrame(() => {
-      frameRef.current = null;
-      const next = positionRef.current;
-      if (next) applyPosition(next);
-    });
-  }, [applyPosition]);
+  const queuePosition = useCallback(
+    (point: OverlayPosition): void => {
+      positionRef.current = point;
+      if (frameRef.current !== null) return;
+      frameRef.current = window.requestAnimationFrame(() => {
+        frameRef.current = null;
+        const next = positionRef.current;
+        if (next) applyPosition(next);
+      });
+    },
+    [applyPosition],
+  );
 
   const cancelQueuedPosition = useCallback((): void => {
     if (frameRef.current === null) return;
@@ -218,9 +245,7 @@ export function useDraggableOverlay<T extends HTMLElement>({
     const handleResize = (): void => syncPosition();
 
     window.addEventListener('resize', handleResize);
-    const resizeObserver = typeof ResizeObserver !== 'undefined'
-      ? new ResizeObserver(() => syncPosition())
-      : null;
+    const resizeObserver = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(() => syncPosition()) : null;
     if (surfaceRef.current) resizeObserver?.observe(surfaceRef.current);
     return () => {
       window.removeEventListener('resize', handleResize);
@@ -236,77 +261,85 @@ export function useDraggableOverlay<T extends HTMLElement>({
     };
   }, [cancelQueuedPosition]);
 
-  const startDrag = useCallback((event: JSX.TargetedPointerEvent<HTMLElement>): void => {
-    if (!enabled || event.button !== 0) return;
-    const target = event.target instanceof HTMLElement ? event.target : null;
-    if (target?.closest(DRAG_IGNORE_SELECTOR)) return;
+  const startDrag = useCallback(
+    (event: JSX.TargetedPointerEvent<HTMLElement>): void => {
+      if (!enabled || event.button !== 0) return;
+      const target = event.target instanceof HTMLElement ? event.target : null;
+      if (target?.closest(DRAG_IGNORE_SELECTOR)) return;
 
-    const el = surfaceRef.current;
-    if (!el) return;
+      const el = surfaceRef.current;
+      if (!el) return;
 
-    cleanupDragRef.current?.();
-    cleanupDragRef.current = null;
-
-    const rect = el.getBoundingClientRect();
-    const size = { width: rect.width, height: rect.height };
-    const origin = withScales({ x: rect.left, y: rect.top }, size, clampMargin);
-    dragRef.current = {
-      startClientX: event.clientX,
-      startClientY: event.clientY,
-      origin,
-      size,
-    };
-    positionRef.current = origin;
-    setPosition(origin);
-    applyPosition(origin);
-    setIsDragging(true);
-
-    const previousUserSelect = document.body.style.userSelect;
-    const previousCursor = document.body.style.cursor;
-    document.body.style.userSelect = 'none';
-    document.body.style.cursor = 'grabbing';
-
-    const cleanup = (): void => {
-      window.removeEventListener('pointermove', onPointerMove);
-      window.removeEventListener('pointerup', onPointerUp);
-      window.removeEventListener('pointercancel', onPointerCancel);
-      cancelQueuedPosition();
-      document.body.style.userSelect = previousUserSelect;
-      document.body.style.cursor = previousCursor;
+      cleanupDragRef.current?.();
       cleanupDragRef.current = null;
-    };
 
-    const finish = (): void => {
-      cleanup();
-      dragRef.current = null;
-      setIsDragging(false);
-      const current = positionRef.current;
-      if (current) {
-        applyPosition(current);
-        setPosition(current);
-        persistPosition(id, current);
-      }
-    };
+      const rect = el.getBoundingClientRect();
+      const size = { width: rect.width, height: rect.height };
+      const origin = withScales({ x: rect.left, y: rect.top }, size, clampMargin);
+      dragRef.current = {
+        startClientX: event.clientX,
+        startClientY: event.clientY,
+        origin,
+        size,
+      };
+      positionRef.current = origin;
+      setPosition(origin);
+      applyPosition(origin);
+      setIsDragging(true);
 
-    const onPointerMove = (moveEvent: PointerEvent): void => {
-      const drag = dragRef.current;
-      if (!drag) return;
-      const next = withScales({
-        x: drag.origin.x + moveEvent.clientX - drag.startClientX,
-        y: drag.origin.y + moveEvent.clientY - drag.startClientY,
-      }, drag.size, clampMargin, drag.origin);
-      queuePosition(next);
-    };
+      const previousUserSelect = document.body.style.userSelect;
+      const previousCursor = document.body.style.cursor;
+      document.body.style.userSelect = 'none';
+      document.body.style.cursor = 'grabbing';
 
-    const onPointerUp = (): void => finish();
-    const onPointerCancel = (): void => finish();
+      const cleanup = (): void => {
+        window.removeEventListener('pointermove', onPointerMove);
+        window.removeEventListener('pointerup', onPointerUp);
+        window.removeEventListener('pointercancel', onPointerCancel);
+        cancelQueuedPosition();
+        document.body.style.userSelect = previousUserSelect;
+        document.body.style.cursor = previousCursor;
+        cleanupDragRef.current = null;
+      };
 
-    cleanupDragRef.current = cleanup;
-    window.addEventListener('pointermove', onPointerMove);
-    window.addEventListener('pointerup', onPointerUp);
-    window.addEventListener('pointercancel', onPointerCancel);
-    event.preventDefault();
-  }, [applyPosition, cancelQueuedPosition, clampMargin, enabled, id, queuePosition]);
+      const finish = (): void => {
+        cleanup();
+        dragRef.current = null;
+        setIsDragging(false);
+        const current = positionRef.current;
+        if (current) {
+          applyPosition(current);
+          setPosition(current);
+          persistPosition(id, current);
+        }
+      };
+
+      const onPointerMove = (moveEvent: PointerEvent): void => {
+        const drag = dragRef.current;
+        if (!drag) return;
+        const next = withScales(
+          {
+            x: drag.origin.x + moveEvent.clientX - drag.startClientX,
+            y: drag.origin.y + moveEvent.clientY - drag.startClientY,
+          },
+          drag.size,
+          clampMargin,
+          drag.origin,
+        );
+        queuePosition(next);
+      };
+
+      const onPointerUp = (): void => finish();
+      const onPointerCancel = (): void => finish();
+
+      cleanupDragRef.current = cleanup;
+      window.addEventListener('pointermove', onPointerMove);
+      window.addEventListener('pointerup', onPointerUp);
+      window.addEventListener('pointercancel', onPointerCancel);
+      event.preventDefault();
+    },
+    [applyPosition, cancelQueuedPosition, clampMargin, enabled, id, queuePosition],
+  );
 
   const style = useMemo<JSX.CSSProperties | undefined>(() => {
     if (!position) return undefined;

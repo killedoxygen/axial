@@ -27,15 +27,10 @@ function launchNoticeIcon(tone: LaunchNoticeTone): string {
   return 'info';
 }
 
-export function LaunchOutcomeNotice({ inst, notice }: {
-  inst: EnrichedInstance;
-  notice: LaunchNotice;
-}): JSX.Element {
-  const details = (notice.details ?? []).map(detail => detail.trim()).filter(Boolean);
+export function LaunchOutcomeNotice({ inst, notice }: { inst: EnrichedInstance; notice: LaunchNotice }): JSX.Element {
+  const details = (notice.details ?? []).map((detail) => detail.trim()).filter(Boolean);
   const primaryDetail = notice.detail?.trim() || (details.length === 1 ? details[0] : '');
-  const listDetails = details.length > 1
-    ? details.filter(detail => !primaryDetail || detail !== primaryDetail)
-    : [];
+  const listDetails = details.length > 1 ? details.filter((detail) => !primaryDetail || detail !== primaryDetail) : [];
 
   return (
     <div class="cp-instance-notice-shell">
@@ -50,7 +45,9 @@ export function LaunchOutcomeNotice({ inst, notice }: {
             <details class="cp-launch-notice-details">
               <summary>Details</summary>
               <ul>
-                {listDetails.map((detail, index) => <li key={`${index}:${detail}`}>{detail}</li>)}
+                {listDetails.map((detail, index) => (
+                  <li key={`${index}:${detail}`}>{detail}</li>
+                ))}
               </ul>
             </details>
           )}
@@ -89,9 +86,7 @@ export function LaunchSplitButton({
   onOpenSettings: () => void;
   preparing: Extract<LaunchState, { status: 'preparing' }> | null;
 }): JSX.Element {
-  const progress = preparing
-    ? { pct: preparing.pct, label: preparing.label }
-    : installProgress;
+  const progress = preparing ? { pct: preparing.pct, label: preparing.label } : installProgress;
   const needsInstall = !canLaunch;
   const label = progress?.label || (installQueued ? 'Queued' : needsInstall ? 'Install' : 'Launch');
   const icon = progress || installQueued ? 'clock' : needsInstall ? 'download' : 'play';
@@ -129,15 +124,25 @@ export function LaunchSplitButton({
         aria-label="Instance options"
         aria-haspopup="menu"
         disabled={Boolean(progress)}
-        onClick={(e) => openContextMenu(e, [
-          primaryMenuItem,
-          { icon: 'settings', label: 'Launch settings', onSelect: onOpenSettings },
-          { icon: 'terminal', label: 'View launch logs', onSelect: onOpenLogs },
-          { label: '', onSelect: () => {}, divider: true },
-          { icon: 'folder', label: 'Open instance folder', onSelect: () => void openInstanceFolder(inst.id) },
-          { icon: 'folder', label: 'Open resource packs folder', onSelect: () => void openInstanceFolder(inst.id, 'resourcepacks') },
-          { icon: 'folder', label: 'Open shader packs folder', onSelect: () => void openInstanceFolder(inst.id, 'shaderpacks') },
-        ])}
+        onClick={(e) =>
+          openContextMenu(e, [
+            primaryMenuItem,
+            { icon: 'settings', label: 'Launch settings', onSelect: onOpenSettings },
+            { icon: 'terminal', label: 'View launch logs', onSelect: onOpenLogs },
+            { label: '', onSelect: () => {}, divider: true },
+            { icon: 'folder', label: 'Open instance folder', onSelect: () => void openInstanceFolder(inst.id) },
+            {
+              icon: 'folder',
+              label: 'Open resource packs folder',
+              onSelect: () => void openInstanceFolder(inst.id, 'resourcepacks'),
+            },
+            {
+              icon: 'folder',
+              label: 'Open shader packs folder',
+              onSelect: () => void openInstanceFolder(inst.id, 'shaderpacks'),
+            },
+          ])
+        }
       >
         <Icon name="chevron-down" size={16} stroke={2.3} />
       </button>
@@ -182,12 +187,16 @@ export function InstallBarrierPane({
   const pct = installProgress ? Math.max(0, Math.min(100, Math.round(installProgress.pct))) : 0;
   const failed = Boolean(installFailure);
   const queuedBehind = installQueuePosition != null ? installQueuePosition - 1 : undefined;
-  const queuedDetail = installQueuePosition != null && installQueueCount != null
-    ? installQueuePosition === 1
-      ? `Position 1 of ${installQueueCount}; next to start when the download slot opens.`
-      : `Position ${installQueuePosition} of ${installQueueCount}; waiting behind ${queuedBehind} item${queuedBehind === 1 ? '' : 's'}.`
-    : 'This instance will unlock automatically after its version install starts and finishes.';
-  const label = installFailure?.message || installProgress?.label || (installQueued ? 'Install waiting in queue' : 'Preparing install');
+  const queuedDetail =
+    installQueuePosition != null && installQueueCount != null
+      ? installQueuePosition === 1
+        ? `Position 1 of ${installQueueCount}; next to start when the download slot opens.`
+        : `Position ${installQueuePosition} of ${installQueueCount}; waiting behind ${queuedBehind} item${queuedBehind === 1 ? '' : 's'}.`
+      : 'This instance will unlock automatically after its version install starts and finishes.';
+  const label =
+    installFailure?.message ||
+    installProgress?.label ||
+    (installQueued ? 'Install waiting in queue' : 'Preparing install');
   const targetLabel = installLabel || installTarget;
   const remainingSeconds = installProgress
     ? countDownRemainingSeconds(installProgress.remainingSeconds, installProgress.remainingSecondsUpdatedAt, etaNow)
@@ -196,10 +205,12 @@ export function InstallBarrierPane({
   const detail = failed
     ? 'Retry the required install or open Downloads for more context.'
     : installProgress
-    ? activeEta ? `${activeEta} · ${pct}% complete` : `${pct}% complete`
-    : installQueued
-      ? queuedDetail
-      : 'Croopor is preparing the required version files.';
+      ? activeEta
+        ? `${activeEta} · ${pct}% complete`
+        : `${pct}% complete`
+      : installQueued
+        ? queuedDetail
+        : 'Croopor is preparing the required version files.';
 
   return (
     <div class="cp-instance-install-lock" aria-live="polite">
@@ -215,7 +226,9 @@ export function InstallBarrierPane({
               <p>{label}</p>
             </>
           ) : (
-            <p>{label} for {targetLabel}.</p>
+            <p>
+              {label} for {targetLabel}.
+            </p>
           )}
         </div>
       </div>
@@ -227,7 +240,11 @@ export function InstallBarrierPane({
       <div class="cp-instance-install-lock-foot">
         <span>{detail}</span>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginLeft: 'auto' }}>
-          {failed && <Button variant="secondary" size="sm" icon="refresh" onClick={onRetryInstall}>Retry</Button>}
+          {failed && (
+            <Button variant="secondary" size="sm" icon="refresh" onClick={onRetryInstall}>
+              Retry
+            </Button>
+          )}
           <Button variant="secondary" size="sm" icon="download" onClick={() => navigate({ name: 'downloads' })}>
             Downloads
           </Button>

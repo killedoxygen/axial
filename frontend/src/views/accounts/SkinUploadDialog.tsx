@@ -88,11 +88,7 @@ export function SkinUploadDialog({
               {availableCapes.length > 0 && (
                 <div class="cp-skinedit__field">
                   <span>Cape</span>
-                  <CapePicker
-                    capes={availableCapes}
-                    value={stagedCapeId}
-                    onChange={onStagedCapeChange}
-                  />
+                  <CapePicker capes={availableCapes} value={stagedCapeId} onChange={onStagedCapeChange} />
                 </div>
               )}
               {stagedUpload.normalizeStatus === 'error' ? (
@@ -120,7 +116,11 @@ export function SkinUploadDialog({
                 icon={busy ? 'refresh' : 'check'}
                 disabled={!stagedCanSave || !onlineReady}
                 onClick={() => onSave(true)}
-                title={onlineReady ? 'Save locally, then apply to the active Minecraft account' : 'Online Minecraft account required'}
+                title={
+                  onlineReady
+                    ? 'Save locally, then apply to the active Minecraft account'
+                    : 'Online Minecraft account required'
+                }
                 sound="affirm"
               >
                 Save & apply

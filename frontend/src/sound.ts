@@ -33,7 +33,16 @@ interface NoteDescriptor extends ToneOptions {
   duration: number;
 }
 
-type SoundKind = 'soft' | 'bright' | 'affirm' | 'theme' | 'slider' | 'memory' | 'launchPress' | 'launchSuccess' | 'click';
+type SoundKind =
+  | 'soft'
+  | 'bright'
+  | 'affirm'
+  | 'theme'
+  | 'slider'
+  | 'memory'
+  | 'launchPress'
+  | 'launchSuccess'
+  | 'click';
 
 export const Sound = {
   ctx: null as AudioContext | null,
@@ -45,7 +54,9 @@ export const Sound = {
   init(): AudioContext | null {
     if (this.ctx) return this.ctx;
     try {
-      this.ctx = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
+      this.ctx = new (
+        window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext
+      )();
     } catch {}
     return this.ctx;
   },
@@ -76,17 +87,13 @@ export const Sound = {
   },
   async warmup(): Promise<void> {
     this.activate();
-    try { await this.preload(); } catch {}
+    try {
+      await this.preload();
+    } catch {}
   },
   playBuffer(buffer: AudioBuffer | undefined, options: PlayBufferOptions = {}): boolean {
     if (!buffer || !this.ctx) return false;
-    const {
-      when = 0,
-      volume = 0.22,
-      playbackRate = 1,
-      offset = 0,
-      duration = null,
-    } = options;
+    const { when = 0, volume = 0.22, playbackRate = 1, offset = 0, duration = null } = options;
     try {
       const source = this.ctx.createBufferSource();
       const gain = this.ctx.createGain();
@@ -120,19 +127,24 @@ export const Sound = {
       case 'soft':
         return this.playSprite('tap_01', { volume: 0.18 });
       case 'bright':
-        return this.playSprite(this.randomFrom(['swipe', 'swipe_01', 'swipe_02', 'swipe_03', 'swipe_04', 'swipe_05']), { volume: 0.22 });
+        return this.playSprite(this.randomFrom(['swipe', 'swipe_01', 'swipe_02', 'swipe_03', 'swipe_04', 'swipe_05']), {
+          volume: 0.22,
+        });
       case 'affirm':
         return this.playSprite('button', { volume: 0.24 });
       case 'theme':
         return this.playSprite('transition_up', { volume: 0.26 });
       case 'slider':
-        return this.playSprite('select', { volume: 0.15, playbackRate: 0.93 + (value * 0.16) });
+        return this.playSprite('select', { volume: 0.15, playbackRate: 0.93 + value * 0.16 });
       case 'memory':
-        return this.playSprite('select', { volume: 0.18, playbackRate: 0.86 + (value * 0.12) });
+        return this.playSprite('select', { volume: 0.18, playbackRate: 0.86 + value * 0.12 });
       case 'launchPress':
         return this.playSprite('button', { volume: 0.3, playbackRate: 0.96 });
       case 'launchSuccess':
-        return this.playBuffer(this.customBuffers.get('launchSuccess'), { volume: 0.38 }) || this.playSprite('celebration', { volume: 0.28 });
+        return (
+          this.playBuffer(this.customBuffers.get('launchSuccess'), { volume: 0.38 }) ||
+          this.playSprite('celebration', { volume: 0.28 })
+        );
       case 'click':
       default:
         return this.playSprite(this.randomFrom(['tap_01', 'tap_02', 'tap_03', 'tap_04', 'tap_05']), { volume: 0.17 });
@@ -168,7 +180,9 @@ export const Sound = {
       osc.stop(now + duration + release + 0.01);
     } catch {}
   },
-  sequence(notes: NoteDescriptor[]): void { notes.forEach((note: NoteDescriptor) => this.tone(note.freq, note.duration, note)); },
+  sequence(notes: NoteDescriptor[]): void {
+    notes.forEach((note: NoteDescriptor) => this.tone(note.freq, note.duration, note));
+  },
   ui(kind: SoundKind, value: number = 0.5): void {
     if (!this.enabled) return;
     this.activate();
@@ -202,12 +216,12 @@ export const Sound = {
         ]);
         break;
       case 'slider': {
-        const freq = 460 + (value * 360);
+        const freq = 460 + value * 360;
         this.sequence([{ freq, duration: 0.02, volume: 0.012, type: 'triangle', endFreq: freq * 1.05 }]);
         break;
       }
       case 'memory': {
-        const freq = 150 + (value * 160);
+        const freq = 150 + value * 160;
         this.sequence([
           { freq, duration: 0.024, volume: 0.018, type: 'sine', endFreq: freq * 1.03 },
           { freq: freq * 1.5, duration: 0.03, volume: 0.009, when: 0.008, type: 'triangle' },
@@ -238,7 +252,9 @@ export const Sound = {
         ]);
     }
   },
-  tick(): void { this.ui('click'); },
+  tick(): void {
+    this.ui('click');
+  },
 };
 
 export function inferButtonSound(btn: HTMLElement): SoundKind | null {
@@ -255,7 +271,14 @@ export function inferButtonSound(btn: HTMLElement): SoundKind | null {
     if (explicit === 'launchPress' || explicit === 'affirm' || explicit === 'bright') return explicit;
     const label = btn.textContent?.toLowerCase() || '';
     if (label.includes('play') || label.includes('launch') || label.includes('resume')) return 'launchPress';
-    if (label.includes('create') || label.includes('finish') || label.includes('save') || label.includes('continue') || label.includes('confirm')) return 'affirm';
+    if (
+      label.includes('create') ||
+      label.includes('finish') ||
+      label.includes('save') ||
+      label.includes('continue') ||
+      label.includes('confirm')
+    )
+      return 'affirm';
     return 'bright';
   }
   if (btn.classList.contains('cp-btn--danger')) return 'soft';

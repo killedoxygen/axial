@@ -2,19 +2,22 @@ import { local, saveLocalState } from './state';
 import { api } from './api';
 import { toast } from './toast';
 import { hasNativeDesktopRuntime, openExternalURL, requestNativeAppRestart } from './native';
-import { appVersion, bootstrapState, installQueue, installState, launchState, updateCheckState, updateInfo } from './store';
+import {
+  appVersion,
+  bootstrapState,
+  installQueue,
+  installState,
+  launchState,
+  updateCheckState,
+  updateInfo,
+} from './store';
 import type { UpdateInfo } from './types';
 import { errMessage } from './utils';
 
 const AUTO_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const AUTO_CHECK_DELAY_MS = 1600;
 const AUTO_CHECK_RETRY_MS = 15000;
-const AUTO_CHECK_FAILURE_RETRY_DELAYS_MS = [
-  60 * 1000,
-  5 * 60 * 1000,
-  15 * 60 * 1000,
-  60 * 60 * 1000,
-] as const;
+const AUTO_CHECK_FAILURE_RETRY_DELAYS_MS = [60 * 1000, 5 * 60 * 1000, 15 * 60 * 1000, 60 * 60 * 1000] as const;
 
 let autoCheckTimer: number | null = null;
 let autoCheckFailureCount = 0;
@@ -29,7 +32,7 @@ function displayVersion(version: string): string {
 function shouldAutoCheck(): boolean {
   if (!hasNativeDesktopRuntime()) return false;
   const last = Date.parse(local.lastUpdateCheckAt || '');
-  return Number.isNaN(last) || (Date.now() - last) >= AUTO_CHECK_INTERVAL_MS;
+  return Number.isNaN(last) || Date.now() - last >= AUTO_CHECK_INTERVAL_MS;
 }
 
 function stampUpdateCheck(): void {
@@ -42,9 +45,8 @@ function resetAutoCheckFailureBackoff(): void {
 }
 
 function nextFailedAutoCheckDelay(): number {
-  const delay = AUTO_CHECK_FAILURE_RETRY_DELAYS_MS[
-    Math.min(autoCheckFailureCount, AUTO_CHECK_FAILURE_RETRY_DELAYS_MS.length - 1)
-  ];
+  const delay =
+    AUTO_CHECK_FAILURE_RETRY_DELAYS_MS[Math.min(autoCheckFailureCount, AUTO_CHECK_FAILURE_RETRY_DELAYS_MS.length - 1)];
   autoCheckFailureCount += 1;
   return delay;
 }
@@ -102,9 +104,7 @@ export async function openUpdateChecksum(): Promise<void> {
 }
 
 export function restartBlockedByActivity(): boolean {
-  return installState.value.status !== 'idle'
-    || installQueue.value.length > 0
-    || launchState.value.status !== 'idle';
+  return installState.value.status !== 'idle' || installQueue.value.length > 0 || launchState.value.status !== 'idle';
 }
 
 export async function restartDesktopApp(): Promise<void> {
@@ -191,10 +191,10 @@ async function runAutoUpdateCheck(): Promise<void> {
     return;
   }
   if (
-    bootstrapState.value !== 'ready'
-    || installState.value.status !== 'idle'
-    || installQueue.value.length > 0
-    || launchState.value.status !== 'idle'
+    bootstrapState.value !== 'ready' ||
+    installState.value.status !== 'idle' ||
+    installQueue.value.length > 0 ||
+    launchState.value.status !== 'idle'
   ) {
     queueAutoUpdateCheck(AUTO_CHECK_RETRY_MS);
     return;

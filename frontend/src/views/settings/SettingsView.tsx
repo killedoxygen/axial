@@ -8,14 +8,7 @@ import { AccentField, AccentModeToggle } from './AccentEditor';
 import { local, saveLocalState, STORAGE_KEY } from '../../state';
 import { Sound } from '../../sound';
 import { Music, musicStateVersion } from '../../music';
-import {
-  config,
-  systemInfo,
-  devMode,
-  appVersion,
-  updateCheckState,
-  updateInfo,
-} from '../../store';
+import { config, systemInfo, devMode, appVersion, updateCheckState, updateInfo } from '../../store';
 import { navigate, ROUTE_STORAGE_KEY } from '../../ui-state';
 import { api } from '../../api';
 import { toast } from '../../toast';
@@ -32,26 +25,26 @@ import {
   openUpdateNotes,
   restartDesktopApp,
 } from '../../updater';
-import type {
-  GuardianMode,
-  PerformanceMode,
-  PerformanceRulesStatus,
-} from '../../types';
+import type { GuardianMode, PerformanceMode, PerformanceRulesStatus } from '../../types';
 
 type SectionId = 'appearance' | 'gameplay' | 'performance' | 'audio' | 'shortcuts' | 'advanced' | 'about';
 
 const SECTIONS: Array<{ id: SectionId; label: string; icon: string }> = [
   { id: 'appearance', label: 'Appearance', icon: 'palette' },
-  { id: 'gameplay',   label: 'Gameplay',   icon: 'stack' },
+  { id: 'gameplay', label: 'Gameplay', icon: 'stack' },
   { id: 'performance', label: 'Performance', icon: 'shield-check' },
-  { id: 'audio',      label: 'Audio',      icon: 'headphones' },
-  { id: 'shortcuts',  label: 'Shortcuts',  icon: 'keyboard' },
-  { id: 'advanced',   label: 'Advanced',   icon: 'terminal' },
-  { id: 'about',      label: 'About',      icon: 'info' },
+  { id: 'audio', label: 'Audio', icon: 'headphones' },
+  { id: 'shortcuts', label: 'Shortcuts', icon: 'keyboard' },
+  { id: 'advanced', label: 'Advanced', icon: 'terminal' },
+  { id: 'about', label: 'About', icon: 'info' },
 ];
 
 function SettingsCard({
-  title, desc, control, stack, children,
+  title,
+  desc,
+  control,
+  stack,
+  children,
 }: {
   title: string;
   desc?: string;
@@ -66,9 +59,7 @@ function SettingsCard({
         {desc && <div class="cp-settings-card-desc">{desc}</div>}
         {stack && children}
       </div>
-      {(control || (!stack && children)) && (
-        <div class="cp-settings-card-control">{control || children}</div>
-      )}
+      {(control || (!stack && children)) && <div class="cp-settings-card-control">{control || children}</div>}
     </Card>
   );
 }
@@ -97,7 +88,9 @@ function ModeChoice<T extends string>({
 
   return (
     <div class="cp-settings-mode-choice">
-      <label class="cp-settings-mode-choice-label" htmlFor={selectId}>{label}</label>
+      <label class="cp-settings-mode-choice-label" htmlFor={selectId}>
+        {label}
+      </label>
       <div class="cp-settings-mode-field">
         <SelectField<T>
           value={value}
@@ -124,18 +117,8 @@ function guardianModeFrom(value: string | undefined): GuardianMode {
 }
 
 function Toggle({ on, onChange }: { on: boolean; onChange: () => void }): JSX.Element {
-  return (
-    <button
-      type="button"
-      class="cp-toggle"
-      data-on={on}
-      role="switch"
-      aria-checked={on}
-      onClick={onChange}
-    />
-  );
+  return <button type="button" class="cp-toggle" data-on={on} role="switch" aria-checked={on} onClick={onChange} />;
 }
-
 
 function AppearanceSection(): JSX.Element {
   return (
@@ -156,7 +139,6 @@ function AppearanceSection(): JSX.Element {
   );
 }
 
-
 function GameplaySection(): JSX.Element {
   const cfg = config.value;
   const sys = systemInfo.value;
@@ -174,8 +156,9 @@ function GameplaySection(): JSX.Element {
   const recHigh = Math.min(maxGB, rec.rec + 2);
   const recLow = Math.min(Math.max(2, rec.rec - 2), recHigh);
   const recZone: [number, number] = [recLow, recHigh];
-  const memoryTicks = [1, Math.round(maxGB / 4), Math.round(maxGB / 2), Math.round(maxGB * 0.75), maxGB]
-    .filter((value, index, values) => value >= 1 && value <= maxGB && values.indexOf(value) === index);
+  const memoryTicks = [1, Math.round(maxGB / 4), Math.round(maxGB / 2), Math.round(maxGB * 0.75), maxGB].filter(
+    (value, index, values) => value >= 1 && value <= maxGB && values.indexOf(value) === index,
+  );
 
   useEffect(() => {
     setUsername(savedUsername);
@@ -249,7 +232,18 @@ function GameplaySection(): JSX.Element {
             placeholder="Player"
             style={{ width: 240 }}
           />
-          {dirty && <Button size="sm" onClick={() => { void save(); }} disabled={!nameValid} sound="affirm">Save</Button>}
+          {dirty && (
+            <Button
+              size="sm"
+              onClick={() => {
+                void save();
+              }}
+              disabled={!nameValid}
+              sound="affirm"
+            >
+              Save
+            </Button>
+          )}
           {showNameError && <span class="cp-settings-name-err">{nameError}</span>}
         </div>
       </SettingsCard>
@@ -265,12 +259,16 @@ function GameplaySection(): JSX.Element {
           </div>
           <Slider
             value={memGB}
-            min={1} max={maxGB} step={0.5}
+            min={1}
+            max={maxGB}
+            step={0.5}
             recommended={recZone}
             ticks={memoryTicks}
             sound="memory"
             onChange={setMemGB}
-            onCommit={(next) => { void save(next); }}
+            onCommit={(next) => {
+              void save(next);
+            }}
             ariaLabel="Max memory in gigabytes"
           />
         </div>
@@ -283,7 +281,6 @@ function GameplaySection(): JSX.Element {
     </>
   );
 }
-
 
 const PERFORMANCE_OPTIONS: Array<ModeOption<PerformanceMode>> = [
   { value: 'managed', label: 'Managed', note: 'Recommended defaults' },
@@ -386,7 +383,10 @@ function PerformanceRulesStatusBlock({
               : 'Managed performance rules need attention.'}
           </span>
         </div>
-        <Pill tone={status.validation === 'valid' ? 'ok' : 'err'} icon={status.validation === 'valid' ? 'check' : 'alert'}>
+        <Pill
+          tone={status.validation === 'valid' ? 'ok' : 'err'}
+          icon={status.validation === 'valid' ? 'check' : 'alert'}
+        >
           {status.validation === 'valid' ? 'Valid' : 'Invalid'}
         </Pill>
       </div>
@@ -400,11 +400,16 @@ function PerformanceRulesStatusBlock({
       </div>
       <details class="cp-settings-rule-details">
         <summary>
-          Rule details{status.warnings.length > 0 ? `, ${status.warnings.length} warning${status.warnings.length === 1 ? '' : 's'}` : ''}
+          Rule details
+          {status.warnings.length > 0
+            ? `, ${status.warnings.length} warning${status.warnings.length === 1 ? '' : 's'}`
+            : ''}
         </summary>
         {status.warnings.length > 0 && (
           <div class="cp-settings-rule-status-warnings">
-            {status.warnings.map((warning) => <span key={warning}>{warning}</span>)}
+            {status.warnings.map((warning) => (
+              <span key={warning}>{warning}</span>
+            ))}
           </div>
         )}
         <div class="cp-settings-rule-status-grid">
@@ -454,7 +459,9 @@ function PerformanceSection(): JSX.Element {
         if (!alive) return;
         setRulesStatus({ status: 'error', data: null, error: errMessage(err) });
       });
-    return () => { alive = false; };
+    return () => {
+      alive = false;
+    };
   }, []);
 
   const savePatch = async (
@@ -496,11 +503,7 @@ function PerformanceSection(): JSX.Element {
 
   return (
     <>
-      <SettingsCard
-        title="Performance"
-        desc="Launch behavior and managed rule readiness."
-        stack
-      >
+      <SettingsCard title="Performance" desc="Launch behavior and managed rule readiness." stack>
         <div class="cp-settings-mode-grid">
           <ModeChoice
             label="Performance mode"
@@ -523,7 +526,7 @@ function PerformanceSection(): JSX.Element {
   );
 }
 
-type PerformanceLabCardComponent = typeof import('./PerformanceLabCard')['PerformanceLabCard'];
+type PerformanceLabCardComponent = (typeof import('./PerformanceLabCard'))['PerformanceLabCard'];
 
 function PerformanceLabSlot(): JSX.Element | null {
   const isDev = devMode.value;
@@ -539,13 +542,14 @@ function PerformanceLabSlot(): JSX.Element | null {
     void import('./PerformanceLabCard').then((module) => {
       if (alive) setLab(() => module.PerformanceLabCard);
     });
-    return () => { alive = false; };
+    return () => {
+      alive = false;
+    };
   }, [isDev]);
 
   if (!isDev || !Lab) return null;
   return <Lab />;
 }
-
 
 function AudioSection(): JSX.Element {
   musicStateVersion.value;
@@ -553,7 +557,10 @@ function AudioSection(): JSX.Element {
   const [musicOn, setMusicOn] = useState<boolean>(Music.enabled);
   const [volume, setVolume] = useState<number>(Music.volume);
 
-  useEffect(() => { setMusicOn(Music.enabled); setVolume(Music.volume); }, [musicStateVersion.value]);
+  useEffect(() => {
+    setMusicOn(Music.enabled);
+    setVolume(Music.volume);
+  }, [musicStateVersion.value]);
 
   const toggleSounds = (): void => {
     const next = !soundsOn;
@@ -589,7 +596,10 @@ function AudioSection(): JSX.Element {
               <span style={{ color: 'var(--text)', fontWeight: 700 }}>{volume}%</span>
             </div>
             <Slider
-              value={volume} min={0} max={100} step={1}
+              value={volume}
+              min={0}
+              max={100}
+              step={1}
               sound="volume"
               onChange={(v) => {
                 setVolume(v);
@@ -604,7 +614,6 @@ function AudioSection(): JSX.Element {
   );
 }
 
-
 function ShortcutsSection(): JSX.Element {
   const rows: Array<[string, string]> = [
     ['Open settings', 'Ctrl + ,'],
@@ -617,10 +626,16 @@ function ShortcutsSection(): JSX.Element {
     <SettingsCard title="Keyboard shortcuts" desc="Global shortcuts available in the launcher." stack>
       <div style={{ marginTop: 14, display: 'flex', flexDirection: 'column', gap: 2 }}>
         {rows.map(([label, combo]) => (
-          <div key={label} style={{
-            display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-            padding: '8px 4px', borderBottom: '1px dashed var(--line)',
-          }}>
+          <div
+            key={label}
+            style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              padding: '8px 4px',
+              borderBottom: '1px dashed var(--line)',
+            }}
+          >
             <span style={{ fontSize: 13, color: 'var(--text)' }}>{label}</span>
             <kbd class="cp-kbd">{combo}</kbd>
           </div>
@@ -629,7 +644,6 @@ function ShortcutsSection(): JSX.Element {
     </SettingsCard>
   );
 }
-
 
 function AdvancedSection(): JSX.Element {
   const cfg = config.value;
@@ -663,7 +677,10 @@ function AdvancedSection(): JSX.Element {
 
   const flush = async (): Promise<void> => {
     const { showConfirm } = await import('../../ui/Dialog');
-    const ok = await showConfirm('Delete all Croopor-owned data and reset the launcher to first run?', { destructive: true, confirmText: 'Reset' });
+    const ok = await showConfirm('Delete all Croopor-owned data and reset the launcher to first run?', {
+      destructive: true,
+      confirmText: 'Reset',
+    });
     if (!ok) return;
     setBusy(true);
     try {
@@ -689,13 +706,21 @@ function AdvancedSection(): JSX.Element {
       <SettingsCard
         title="Reload launcher"
         desc="Useful if the launcher gets out of sync with the backend."
-        control={<Button variant="secondary" icon="refresh" onClick={() => location.reload()}>Reload</Button>}
+        control={
+          <Button variant="secondary" icon="refresh" onClick={() => location.reload()}>
+            Reload
+          </Button>
+        }
       />
       {__CROOPOR_ENABLE_DEV_LAB__ && isDev && (
         <SettingsCard
           title="Dev lab"
           desc="Developer-only workbench for procedural art and internal experiments."
-          control={<Button variant="secondary" icon="palette" onClick={() => navigate({ name: 'dev-lab' })}>Open lab</Button>}
+          control={
+            <Button variant="secondary" icon="palette" onClick={() => navigate({ name: 'dev-lab' })}>
+              Open lab
+            </Button>
+          }
         />
       )}
       {isDev && <PerformanceLabSlot />}
@@ -703,13 +728,16 @@ function AdvancedSection(): JSX.Element {
         <SettingsCard
           title="Flush all data"
           desc="Deletes every Croopor-managed file and restarts from first run. Existing libraries selected through 'Use existing' are preserved."
-          control={<Button variant="danger" icon="trash" disabled={busy} onClick={flush}>{busy ? 'Flushing…' : 'Flush'}</Button>}
+          control={
+            <Button variant="danger" icon="trash" disabled={busy} onClick={flush}>
+              {busy ? 'Flushing…' : 'Flush'}
+            </Button>
+          }
         />
       )}
     </>
   );
 }
-
 
 function displayReleaseVersion(version: string): string {
   return version.startsWith('v') || version.startsWith('V') ? version : `v${version}`;
@@ -748,12 +776,21 @@ function AboutSection(): JSX.Element {
   return (
     <SettingsCard title="Croopor" desc={`Version ${appVersion.value}. A focused Minecraft launcher.`} stack>
       <div style={{ marginTop: 12, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-        <Button variant="secondary" icon="globe" onClick={() => void openHomepage()}>Homepage</Button>
-        <Button variant="secondary" icon="refresh" disabled={checking} onClick={() => void checkForUpdates({ force: true })}>
+        <Button variant="secondary" icon="globe" onClick={() => void openHomepage()}>
+          Homepage
+        </Button>
+        <Button
+          variant="secondary"
+          icon="refresh"
+          disabled={checking}
+          onClick={() => void checkForUpdates({ force: true })}
+        >
           {checking ? 'Checking...' : 'Check'}
         </Button>
         {hasNativeDesktopRuntime() && (
-          <Button variant="secondary" icon="refresh" onClick={() => void restartDesktopApp()}>Restart</Button>
+          <Button variant="secondary" icon="refresh" onClick={() => void restartDesktopApp()}>
+            Restart
+          </Button>
         )}
       </div>
       <div style={{ marginTop: 12, color: 'var(--text)', fontSize: 13, fontWeight: 700 }}>{status}</div>
@@ -766,11 +803,17 @@ function AboutSection(): JSX.Element {
           <Button variant="primary" icon="globe" onClick={() => void openUpdateAction()}>
             {info?.action_label || 'Open release'}
           </Button>
-          <Button variant="secondary" icon="tag" onClick={() => void openUpdateNotes()}>Notes</Button>
+          <Button variant="secondary" icon="tag" onClick={() => void openUpdateNotes()}>
+            Notes
+          </Button>
           {info?.checksum_url && (
-            <Button variant="secondary" icon="shield-check" onClick={() => void openUpdateChecksum()}>Checksum</Button>
+            <Button variant="secondary" icon="shield-check" onClick={() => void openUpdateChecksum()}>
+              Checksum
+            </Button>
           )}
-          <Button variant="secondary" icon="x" onClick={dismiss}>Dismiss</Button>
+          <Button variant="secondary" icon="x" onClick={dismiss}>
+            Dismiss
+          </Button>
         </div>
       )}
     </SettingsCard>
@@ -785,7 +828,7 @@ export function SettingsView(): JSX.Element {
       <aside class="cp-settings-rail">
         <h1>Settings</h1>
         <div class="cp-settings-rail-list">
-          {SECTIONS.map(s => (
+          {SECTIONS.map((s) => (
             <button
               key={s.id}
               class="cp-settings-rail-btn"

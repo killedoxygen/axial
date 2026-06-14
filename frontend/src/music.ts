@@ -31,7 +31,11 @@ function clampTrack(track: number): number {
 function fadeStep(ts: number): void {
   if (!audio) {
     fadeRaf = null;
-    if (fadeCallback) { const cb = fadeCallback; fadeCallback = null; cb(); }
+    if (fadeCallback) {
+      const cb = fadeCallback;
+      fadeCallback = null;
+      cb();
+    }
     return;
   }
   const t = Math.min(1, (ts - fadeStart) / FADE_MS);
@@ -40,18 +44,28 @@ function fadeStep(ts: number): void {
     fadeRaf = requestAnimationFrame(fadeStep);
   } else {
     fadeRaf = null;
-    if (fadeCallback) { const cb = fadeCallback; fadeCallback = null; cb(); }
+    if (fadeCallback) {
+      const cb = fadeCallback;
+      fadeCallback = null;
+      cb();
+    }
   }
 }
 
 function cancelFade(): void {
-  if (fadeRaf) { cancelAnimationFrame(fadeRaf); fadeRaf = null; }
+  if (fadeRaf) {
+    cancelAnimationFrame(fadeRaf);
+    fadeRaf = null;
+  }
   fadeCallback = null;
 }
 
 function startFade(target: number, cb?: () => void): void {
   cancelFade();
-  if (!audio) { if (cb) cb(); return; }
+  if (!audio) {
+    if (cb) cb();
+    return;
+  }
   fadeFrom = audio.volume;
   fadeTarget = target;
   fadeCallback = cb || null;
@@ -66,10 +80,14 @@ export const Music = {
   ready: false,
 
   /** Resolved target volume (0-1). */
-  get targetVolume(): number { return this.volume / 100; },
+  get targetVolume(): number {
+    return this.volume / 100;
+  },
 
   /** Whether audio is actively producing sound (not paused, not suppressed at 0). */
-  get playing(): boolean { return !!audio && !audio.paused; },
+  get playing(): boolean {
+    return !!audio && !audio.paused;
+  },
 
   // -- Configuration --
 
@@ -91,12 +109,17 @@ export const Music = {
   },
 
   persist(): void {
-    api('PUT', '/config', { music_enabled: this.enabled, music_volume: this.volume, music_track: this.track }).catch(() => {});
+    api('PUT', '/config', { music_enabled: this.enabled, music_volume: this.volume, music_track: this.track }).catch(
+      () => {},
+    );
   },
 
   debouncedPersist(): void {
     if (persistTimer) clearTimeout(persistTimer);
-    persistTimer = setTimeout(() => { this.persist(); persistTimer = null; }, 400);
+    persistTimer = setTimeout(() => {
+      this.persist();
+      persistTimer = null;
+    }, 400);
   },
 
   // -- Playback --
@@ -141,12 +164,17 @@ export const Music = {
       await audio.play();
       startFade(this.targetVolume);
       this.syncUI();
-    } catch { /* autoplay blocked -- expected before interaction */ }
+    } catch {
+      /* autoplay blocked -- expected before interaction */
+    }
   },
 
   stop(): void {
     if (!audio || audio.paused) return;
-    startFade(0, () => { audio!.pause(); this.syncUI(); });
+    startFade(0, () => {
+      audio!.pause();
+      this.syncUI();
+    });
   },
 
   /** Cycle to the next track. Cross-fades if currently playing. */

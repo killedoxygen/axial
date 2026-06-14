@@ -6,7 +6,16 @@ import { ActivityCard } from './ActivityCard';
 import { QuickActionsCard } from './QuickActionsCard';
 import { DetailsCard } from './DetailsCard';
 
-export function OverviewPane({ inst, resources, running, onLaunch, onStop, onOpenWorlds, onOpenLogs, onRefreshResources }: {
+export function OverviewPane({
+  inst,
+  resources,
+  running,
+  onLaunch,
+  onStop,
+  onOpenWorlds,
+  onOpenLogs,
+  onRefreshResources,
+}: {
   inst: EnrichedInstance;
   resources: InstanceResourceSummary | null;
   running: boolean;
@@ -28,13 +37,7 @@ export function OverviewPane({ inst, resources, running, onLaunch, onStop, onOpe
         <ActivityCard inst={inst} resources={resources} onOpenLogs={onOpenLogs} />
       </div>
       <div class="cp-od-slot cp-od-slot--quick">
-        <QuickActionsCard
-          inst={inst}
-          running={running}
-          onLaunch={onLaunch}
-          onStop={onStop}
-          onOpenLogs={onOpenLogs}
-        />
+        <QuickActionsCard inst={inst} running={running} onLaunch={onLaunch} onStop={onStop} onOpenLogs={onOpenLogs} />
       </div>
       <div class="cp-od-slot cp-od-slot--details">
         <DetailsCard inst={inst} running={running} />

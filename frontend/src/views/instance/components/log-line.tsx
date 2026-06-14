@@ -6,7 +6,9 @@ import type { ClassifiedLogLine, LogFilter } from '../logs';
 export function LogLine({ line, compact = false }: { line: ClassifiedLogLine; compact?: boolean }): JSX.Element {
   return (
     <div class={`cp-log-line${compact ? ' cp-log-line--compact' : ''}`} data-kind={line.kind}>
-      <span class="cp-log-line-label" aria-label={`${line.kind} log line`}>{line.label}</span>
+      <span class="cp-log-line-label" aria-label={`${line.kind} log line`}>
+        {line.label}
+      </span>
       <span class="cp-log-line-text">{line.text || ' '}</span>
     </div>
   );

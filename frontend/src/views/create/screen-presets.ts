@@ -3,7 +3,10 @@
 // but requires a permission grant; fall back to `window.screen` for the
 // primary display when it's unavailable or denied.
 
-export interface ScreenSize { w: number; h: number; }
+export interface ScreenSize {
+  w: number;
+  h: number;
+}
 
 export interface WindowPresetSpec {
   id: string;
@@ -13,12 +16,12 @@ export interface WindowPresetSpec {
 }
 
 const CANDIDATES: WindowPresetSpec[] = [
-  { id: '5k',  label: '5K',    w: 5120, h: 2880 },
-  { id: '4k',  label: '4K',    w: 3840, h: 2160 },
-  { id: '3k',  label: '3K',    w: 3200, h: 1800 },
-  { id: '2k',  label: '2K',    w: 2560, h: 1440 },
+  { id: '5k', label: '5K', w: 5120, h: 2880 },
+  { id: '4k', label: '4K', w: 3840, h: 2160 },
+  { id: '3k', label: '3K', w: 3200, h: 1800 },
+  { id: '2k', label: '2K', w: 2560, h: 1440 },
   { id: 'fhd', label: '1080p', w: 1920, h: 1080 },
-  { id: 'hd',  label: '720p',  w: 1280, h: 720 },
+  { id: 'hd', label: '720p', w: 1280, h: 720 },
 ];
 
 const DEFAULT_PRESET: WindowPresetSpec = { id: 'default', label: 'Default', w: 0, h: 0 };
@@ -54,10 +57,7 @@ export function buildWindowPresets(max: ScreenSize): WindowPresetSpec[] {
   return [...fits, DEFAULT_PRESET];
 }
 
-export function nextWindowPreset(
-  presets: WindowPresetSpec[],
-  currentId: string,
-): WindowPresetSpec {
+export function nextWindowPreset(presets: WindowPresetSpec[], currentId: string): WindowPresetSpec {
   if (presets.length === 0) return DEFAULT_PRESET;
   const i = presets.findIndex((p) => p.id === currentId);
   return presets[(i + 1) % presets.length]!;

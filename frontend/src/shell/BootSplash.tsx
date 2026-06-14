@@ -28,10 +28,7 @@ export function BootSplash(): JSX.Element | null {
     if (state !== 'ready') return;
     setProgress(100);
     const elapsed = Date.now() - mountedAt.current;
-    const leaveTimer = setTimeout(
-      () => setLeaving(true),
-      Math.max(FILL_SETTLE_MS, MIN_DISPLAY_MS - elapsed),
-    );
+    const leaveTimer = setTimeout(() => setLeaving(true), Math.max(FILL_SETTLE_MS, MIN_DISPLAY_MS - elapsed));
     return () => clearTimeout(leaveTimer);
   }, [state]);
 
@@ -49,13 +46,7 @@ export function BootSplash(): JSX.Element | null {
   };
 
   return (
-    <div
-      class="cp-boot"
-      data-leaving={leaving || undefined}
-      role="status"
-      aria-live="polite"
-      onMouseDown={onMouseDown}
-    >
+    <div class="cp-boot" data-leaving={leaving || undefined} role="status" aria-live="polite" onMouseDown={onMouseDown}>
       <div class="cp-boot-stack">
         <Logo className="cp-boot-logo" size={56} />
         {state === 'error' ? (

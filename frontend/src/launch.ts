@@ -3,15 +3,24 @@ import { Sound } from './sound';
 import { Music } from './music';
 import { showError, appendLog, errMessage } from './utils';
 import {
-  hasNativeDesktopRuntime, nativeLaunchLogEventName, nativeLaunchStatusEventName,
-  onNativeEvent, startNativeLaunchEvents,
+  hasNativeDesktopRuntime,
+  nativeLaunchLogEventName,
+  nativeLaunchStatusEventName,
+  onNativeEvent,
+  startNativeLaunchEvents,
 } from './native';
+import { config, launchState, runningSessions, selectedInstance, selectedVersion, instanceLaunchDrafts } from './store';
 import {
-  config, launchState, runningSessions, selectedInstance, selectedVersion, instanceLaunchDrafts,
-} from './store';
-import {
-  clearLaunchNotice, confirmLaunch, endLaunchPrep, endSession, setLaunchNotice, startLaunch,
-  updateInstanceInList, updateLaunchPrep, updateLaunchPrepStage, updateRunningSessionState,
+  clearLaunchNotice,
+  confirmLaunch,
+  endLaunchPrep,
+  endSession,
+  setLaunchNotice,
+  startLaunch,
+  updateInstanceInList,
+  updateLaunchPrep,
+  updateLaunchPrepStage,
+  updateRunningSessionState,
 } from './actions';
 import { launchStageView, type LaunchStage } from './launch-stages';
 import type { Config, GuardianSummary, HealingEvent, Instance, LaunchHealingSummary } from './types';
@@ -63,12 +72,7 @@ function startPreResponseLaunchStageTicker(instanceId: string): () => void {
       timeoutId = null;
       if (stopped) return;
       const view = launchStageView(tick.stage);
-      updateLaunchPrep(
-        instanceId,
-        Math.min(view.pct, PRE_RESPONSE_STAGE_CAP_PCT),
-        view.label,
-        view.stage,
-      );
+      updateLaunchPrep(instanceId, Math.min(view.pct, PRE_RESPONSE_STAGE_CAP_PCT), view.label, view.stage);
       nextTick += 1;
       scheduleNext();
     }, delayMs);
@@ -238,7 +242,10 @@ function healingNoticeDetails(healing: LaunchHealingSummary): string[] {
   }
   pushUniqueNoticeDetail(details, healing.fallback_applied);
   if (healing.retry_count && healing.retry_count > 0) {
-    pushUniqueNoticeDetail(details, `Launch recovered automatically after ${healing.retry_count} retry attempt${healing.retry_count > 1 ? 's' : ''}.`);
+    pushUniqueNoticeDetail(
+      details,
+      `Launch recovered automatically after ${healing.retry_count} retry attempt${healing.retry_count > 1 ? 's' : ''}.`,
+    );
   }
   if (healing.failure_class) {
     pushUniqueNoticeDetail(details, `Reason: ${describeFailureClass(healing.failure_class)}`);
@@ -263,19 +270,25 @@ function friendlyLaunchErrorDetail(message: string): string {
 function isSelectedOnlineAuthFailure(payload: unknown): payload is LaunchAuthFailurePayload {
   if (!payload || typeof payload !== 'object') return false;
   const candidate = payload as LaunchAuthFailurePayload;
-  return candidate.failure_class === 'auth_mode_incompatible'
-    || (candidate.launch_auth_mode === 'online' && candidate.online_mode_ready === false);
+  return (
+    candidate.failure_class === 'auth_mode_incompatible' ||
+    (candidate.launch_auth_mode === 'online' && candidate.online_mode_ready === false)
+  );
 }
 
 function compactTokenLabel(value: string | undefined): string {
-  return String(value || '').trim().toLowerCase();
+  return String(value || '')
+    .trim()
+    .toLowerCase();
 }
 
 function isSignInRequiredAuthRefresh(status: string, reason: string): boolean {
-  return status === 'sign_in_required'
-    || reason === 'refresh_token_missing'
-    || reason === 'refresh_token_rejected'
-    || reason === 'refresh_state_unavailable';
+  return (
+    status === 'sign_in_required' ||
+    reason === 'refresh_token_missing' ||
+    reason === 'refresh_token_rejected' ||
+    reason === 'refresh_state_unavailable'
+  );
 }
 
 function authSignInRequiredDetail(reason: string): string {
@@ -397,8 +410,8 @@ function guardianHasActionableAuthoredDetails(
   noticeDetails = guardianNoticeDetails(guardian),
 ): boolean {
   return Boolean(
-    guardianHasAuthoredDetails(guardian, noticeDetails)
-    && (guardian?.decision === 'blocked' || guardian?.decision === 'warned' || guardian?.decision === 'intervened'),
+    guardianHasAuthoredDetails(guardian, noticeDetails) &&
+    (guardian?.decision === 'blocked' || guardian?.decision === 'warned' || guardian?.decision === 'intervened'),
   );
 }
 
@@ -578,8 +591,9 @@ export async function launchGame(): Promise<void> {
     })();
 
     if (res.error) {
-      const surfaced = surfaceSelectedOnlineAuthFailure(res, inst.id, inst.name)
-        || surfaceLaunchOutcome(
+      const surfaced =
+        surfaceSelectedOnlineAuthFailure(res, inst.id, inst.name) ||
+        surfaceLaunchOutcome(
           res.guardian,
           res.healing,
           inst.id,
@@ -623,7 +637,12 @@ export async function launchGame(): Promise<void> {
       });
     } catch (err: unknown) {
       showError(`Launch session started, but live updates failed: ${errMessage(err)}`);
-      appendLog('system', `Live updates unavailable for ${inst.name}; stop detection may be delayed.`, inst.id, inst.name);
+      appendLog(
+        'system',
+        `Live updates unavailable for ${inst.name}; stop detection may be delayed.`,
+        inst.id,
+        inst.name,
+      );
     }
 
     if (config.value) {
@@ -639,8 +658,9 @@ export async function launchGame(): Promise<void> {
         guardian?: GuardianSummary;
         healing?: LaunchHealingSummary;
       };
-      const surfaced = surfaceSelectedOnlineAuthFailure(payload, inst.id, inst.name)
-        || surfaceLaunchOutcome(
+      const surfaced =
+        surfaceSelectedOnlineAuthFailure(payload, inst.id, inst.name) ||
+        surfaceLaunchOutcome(
           payload.guardian,
           payload.healing,
           inst.id,
@@ -695,7 +715,9 @@ function makeLaunchStatusPoller(
     }
   };
 
-  timerId = window.setInterval(() => { void poll(); }, 1000);
+  timerId = window.setInterval(() => {
+    void poll();
+  }, 1000);
   void poll();
   return handle;
 }
@@ -778,12 +800,23 @@ async function connectLaunchEvents(
   es.onerror = () => {
     if (es.readyState !== EventSource.CLOSED) return;
     if (runningSessions.value[instanceId]?.sessionId !== sessionId) return;
-    appendLog('system', `Lost live updates for ${instanceName || instanceId}. The game may still be running.`, instanceId, instanceName);
+    appendLog(
+      'system',
+      `Lost live updates for ${instanceName || instanceId}. The game may still be running.`,
+      instanceId,
+      instanceName,
+    );
     es.close();
   };
 }
 
-function onGameExited(data: any, instanceId: string, instanceName: string, sessionId: string, eventSource: { close(): void }): void {
+function onGameExited(
+  data: any,
+  instanceId: string,
+  instanceName: string,
+  sessionId: string,
+  eventSource: { close(): void },
+): void {
   const session = runningSessions.value[instanceId];
   if (!session || session.sessionId !== sessionId) return;
   const exitCode = data.exit_code;

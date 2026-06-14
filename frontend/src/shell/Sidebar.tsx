@@ -35,10 +35,7 @@ function isRouteActive(target: Route, current: Route): boolean {
 function recentTime(inst: Instance): number {
   const lastPlayed = inst.last_played_at ? Date.parse(inst.last_played_at) : 0;
   const created = Date.parse(inst.created_at);
-  return Math.max(
-    Number.isFinite(lastPlayed) ? lastPlayed : 0,
-    Number.isFinite(created) ? created : 0,
-  );
+  return Math.max(Number.isFinite(lastPlayed) ? lastPlayed : 0, Number.isFinite(created) ? created : 0);
 }
 
 function railTipAttrs(label: string, tooltip: RailTooltipController) {
@@ -63,9 +60,18 @@ function RailIcon({ name, size = 20 }: { name: string; size?: number }): JSX.Ele
           fill="currentColor"
           focusable="false"
         >
-          <path class="cp-rail-stack-layer cp-rail-stack-layer--top" d="M4.948 4.683A2 2 0 0 1 6.454 4h11.092a2 2 0 0 1 1.505.683l3.5 4C23.683 9.976 22.764 12 21.046 12H2.954C1.235 12 .317 9.976 1.448 8.683l3.5-4ZM17.546 6H6.454l-3.5 4h18.092l-3.5-4Z" />
-          <path class="cp-rail-stack-layer cp-rail-stack-layer--mid" d="M2 15a1 1 0 0 1 1-1h18a1 1 0 1 1 0 2H3a1 1 0 0 1-1-1Z" />
-          <path class="cp-rail-stack-layer cp-rail-stack-layer--base" d="M3 19a1 1 0 0 1 1-1h16a1 1 0 1 1 0 2H4a1 1 0 0 1-1-1Z" />
+          <path
+            class="cp-rail-stack-layer cp-rail-stack-layer--top"
+            d="M4.948 4.683A2 2 0 0 1 6.454 4h11.092a2 2 0 0 1 1.505.683l3.5 4C23.683 9.976 22.764 12 21.046 12H2.954C1.235 12 .317 9.976 1.448 8.683l3.5-4ZM17.546 6H6.454l-3.5 4h18.092l-3.5-4Z"
+          />
+          <path
+            class="cp-rail-stack-layer cp-rail-stack-layer--mid"
+            d="M2 15a1 1 0 0 1 1-1h18a1 1 0 1 1 0 2H3a1 1 0 0 1-1-1Z"
+          />
+          <path
+            class="cp-rail-stack-layer cp-rail-stack-layer--base"
+            d="M3 19a1 1 0 0 1 1-1h16a1 1 0 1 1 0 2H4a1 1 0 0 1-1-1Z"
+          />
         </svg>
       </span>
     );
@@ -78,7 +84,13 @@ function RailIcon({ name, size = 20 }: { name: string; size?: number }): JSX.Ele
   );
 }
 
-function RailButton({ icon, label, target, accent, tooltip }: {
+function RailButton({
+  icon,
+  label,
+  target,
+  accent,
+  tooltip,
+}: {
   icon: string;
   label: string;
   target: Route;
@@ -86,15 +98,17 @@ function RailButton({ icon, label, target, accent, tooltip }: {
   tooltip: RailTooltipController;
 }): JSX.Element {
   const current = route.value;
-  const active = isRouteActive(target, current)
-    || (target.name === 'instances' && current.name === 'instance');
+  const active = isRouteActive(target, current) || (target.name === 'instances' && current.name === 'instance');
   return (
     <button
       class="cp-rail-btn"
       data-active={active}
       data-accent={accent}
       data-icon={icon}
-      onClick={() => { tooltip.hide(); navigate(target); }}
+      onClick={() => {
+        tooltip.hide();
+        navigate(target);
+      }}
       aria-label={label}
       {...railTipAttrs(label, tooltip)}
     >
@@ -107,8 +121,7 @@ function RailInstances({ tooltip }: { tooltip: RailTooltipController }): JSX.Ele
   const current = route.value;
   const listRef = useRef<HTMLDivElement>(null);
   const [scrollCue, setScrollCue] = useState({ top: false, bottom: false });
-  const list = [...instances.value]
-    .sort((a, b) => recentTime(b) - recentTime(a) || a.name.localeCompare(b.name));
+  const list = [...instances.value].sort((a, b) => recentTime(b) - recentTime(a) || a.name.localeCompare(b.name));
   const updateScrollCue = useCallback(() => {
     const node = listRef.current;
     if (!node) {
@@ -121,9 +134,9 @@ function RailInstances({ tooltip }: { tooltip: RailTooltipController }): JSX.Ele
       top: scrollable && node.scrollTop > 2,
       bottom: scrollable && node.scrollTop < node.scrollHeight - node.clientHeight - 2,
     };
-    setScrollCue(currentCue => (
-      currentCue.top === next.top && currentCue.bottom === next.bottom ? currentCue : next
-    ));
+    setScrollCue((currentCue) =>
+      currentCue.top === next.top && currentCue.bottom === next.bottom ? currentCue : next,
+    );
   }, []);
 
   useEffect(() => {
@@ -154,7 +167,7 @@ function RailInstances({ tooltip }: { tooltip: RailTooltipController }): JSX.Ele
         data-rail-instances-fade-bottom={scrollCue.bottom ? 'visible' : 'hidden'}
       >
         <div class="cp-rail-instances" ref={listRef} onScroll={updateScrollCue}>
-          {list.map(inst => {
+          {list.map((inst) => {
             const active = current.name === 'instance' && current.id === inst.id;
             const running = !!runningSessions.value[inst.id];
             const version = versionById(inst.version_id);
@@ -168,8 +181,14 @@ function RailInstances({ tooltip }: { tooltip: RailTooltipController }): JSX.Ele
                 data-active={active}
                 data-running={running}
                 data-installing={installing}
-                onClick={() => { tooltip.hide(); navigate({ name: 'instance', id: inst.id }); }}
-                onContextMenu={(e) => { tooltip.hide(); openInstanceContextMenu(e, inst); }}
+                onClick={() => {
+                  tooltip.hide();
+                  navigate({ name: 'instance', id: inst.id });
+                }}
+                onContextMenu={(e) => {
+                  tooltip.hide();
+                  openInstanceContextMenu(e, inst);
+                }}
                 aria-label={installing ? `${inst.name}: ${installLabel}` : inst.name}
                 {...railTipAttrs(installing ? `${inst.name} · ${installLabel}` : inst.name, tooltip)}
               >
@@ -216,7 +235,11 @@ function UserMenu({ onClose }: { onClose: () => void }): JSX.Element {
   };
 
   const MenuRow = ({
-    icon, label, onSelect, hint, right,
+    icon,
+    label,
+    onSelect,
+    hint,
+    right,
   }: {
     icon: string;
     label: string;
@@ -235,22 +258,45 @@ function UserMenu({ onClose }: { onClose: () => void }): JSX.Element {
   return (
     <div class="cp-userm" role="menu">
       <MenuRow icon="edit" label="Change display name" onSelect={renameUser} />
-      <MenuRow icon="user" label="Accounts and skins" onSelect={() => { navigate({ name: 'accounts' }); onClose(); }} />
+      <MenuRow
+        icon="user"
+        label="Accounts and skins"
+        onSelect={() => {
+          navigate({ name: 'accounts' });
+          onClose();
+        }}
+      />
       <div class="cp-userm-divider" />
       <MenuRow
         icon={soundsOn ? 'volume' : 'volume-off'}
         label="UI sounds"
         onSelect={toggleSounds}
-        right={<span class="cp-userm-pill" data-on={soundsOn}>{soundsOn ? 'On' : 'Off'}</span>}
+        right={
+          <span class="cp-userm-pill" data-on={soundsOn}>
+            {soundsOn ? 'On' : 'Off'}
+          </span>
+        }
       />
       <MenuRow
         icon={musicOn ? 'music' : 'music-off'}
         label="Background music"
         onSelect={toggleMusic}
-        right={<span class="cp-userm-pill" data-on={musicOn}>{musicOn ? 'On' : 'Off'}</span>}
+        right={
+          <span class="cp-userm-pill" data-on={musicOn}>
+            {musicOn ? 'On' : 'Off'}
+          </span>
+        }
       />
       <div class="cp-userm-divider" />
-      <MenuRow icon="settings" label="Open settings" onSelect={() => { navigate({ name: 'settings' }); onClose(); }} hint="Ctrl ," />
+      <MenuRow
+        icon="settings"
+        label="Open settings"
+        onSelect={() => {
+          navigate({ name: 'settings' });
+          onClose();
+        }}
+        hint="Ctrl ,"
+      />
     </div>
   );
 }
@@ -265,7 +311,9 @@ function UserTrigger({ tooltip }: { tooltip: RailTooltipController }): JSX.Eleme
     const onClick = (e: MouseEvent): void => {
       if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false);
     };
-    const onKey = (e: KeyboardEvent): void => { if (e.key === 'Escape') setOpen(false); };
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') setOpen(false);
+    };
     document.addEventListener('mousedown', onClick);
     document.addEventListener('keydown', onKey);
     return () => {
@@ -283,7 +331,10 @@ function UserTrigger({ tooltip }: { tooltip: RailTooltipController }): JSX.Eleme
         data-open={open}
         aria-haspopup="menu"
         aria-expanded={open}
-        onClick={() => { tooltip.hide(); setOpen(o => !o); }}
+        onClick={() => {
+          tooltip.hide();
+          setOpen((o) => !o);
+        }}
         aria-label={`${username} — account menu`}
         {...railTipAttrs(username, tooltip)}
       >
@@ -300,9 +351,7 @@ export function Sidebar(): JSX.Element {
     show: (label, target) => {
       const railRect = railRef.current?.getBoundingClientRect();
       const targetRect = target.getBoundingClientRect();
-      const top = railRect
-        ? targetRect.top - railRect.top + targetRect.height / 2
-        : targetRect.height / 2;
+      const top = railRect ? targetRect.top - railRect.top + targetRect.height / 2 : targetRect.height / 2;
       setTip({ label, top });
     },
     hide: () => setTip(null),
@@ -316,7 +365,10 @@ export function Sidebar(): JSX.Element {
       <button
         class="cp-rail-btn"
         data-icon="search"
-        onClick={() => { tooltip.hide(); commandPaletteOpen.value = true; }}
+        onClick={() => {
+          tooltip.hide();
+          commandPaletteOpen.value = true;
+        }}
         data-sound-silent="true"
         aria-label="Search and jump to"
         {...railTipAttrs('Search', tooltip)}
@@ -329,7 +381,10 @@ export function Sidebar(): JSX.Element {
         class="cp-rail-btn"
         data-accent="true"
         data-icon="plus"
-        onClick={() => { tooltip.hide(); openCreate(); }}
+        onClick={() => {
+          tooltip.hide();
+          openCreate();
+        }}
         aria-label="New instance"
         {...railTipAttrs('New instance', tooltip)}
       >

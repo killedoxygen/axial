@@ -70,11 +70,11 @@ export function SkinEditDialog({
   const saving = editingSkin ? editBusyKey === editingSkin.texture_key : false;
   const canSave = Boolean(
     editingSkin &&
-      editBusyKey === null &&
-      editDetectBusyKey === null &&
-      editReplacementReady &&
-      editHasChanges &&
-      trimmedEditName.length > 0,
+    editBusyKey === null &&
+    editDetectBusyKey === null &&
+    editReplacementReady &&
+    editHasChanges &&
+    trimmedEditName.length > 0,
   );
 
   return (
@@ -143,11 +143,7 @@ export function SkinEditDialog({
               {availableCapes.length > 0 && (
                 <div class="cp-skinedit__field">
                   <span>Cape</span>
-                  <CapePicker
-                    capes={availableCapes}
-                    value={editCapeId}
-                    onChange={onEditCapeChange}
-                  />
+                  <CapePicker capes={availableCapes} value={editCapeId} onChange={onEditCapeChange} />
                 </div>
               )}
               <div class="cp-skinedit__field">
@@ -215,9 +211,11 @@ export function SkinEditDialog({
                 icon={saving ? 'refresh' : 'check'}
                 disabled={!canSave || !onlineReady}
                 onClick={() => onSave(editingSkin.texture_key, true)}
-                title={onlineReady
-                  ? 'Save changes, then apply to the active Minecraft account'
-                  : 'Online Minecraft account required'}
+                title={
+                  onlineReady
+                    ? 'Save changes, then apply to the active Minecraft account'
+                    : 'Online Minecraft account required'
+                }
                 sound="affirm"
               >
                 Save & apply

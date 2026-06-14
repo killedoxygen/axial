@@ -28,7 +28,9 @@ export function LogsCard({
   const latest = pickInitialLog(resources?.logs ?? []);
   const latestLog = latest ? resources?.logs.find((log) => log.name === latest) : undefined;
   const count = resources?.logs_count ?? 0;
-  const summary = latestLog ? `${latestLog.name} · ${fmtRelative(latestLog.modified_at)}` : 'No launch logs on disk yet';
+  const summary = latestLog
+    ? `${latestLog.name} · ${fmtRelative(latestLog.modified_at)}`
+    : 'No launch logs on disk yet';
   const [tail, setTail] = useState<LogsCardTailState>({ status: 'idle' });
   const importantLines = useMemo(() => {
     if (tail.status !== 'ready' || tail.data.name !== latest || !tail.data.text) return [];
@@ -51,7 +53,9 @@ export function LogsCard({
     let alive = true;
     const load = (showLoading: boolean): void => {
       if (showLoading) {
-        setTail((current) => current.status === 'ready' && current.data.name === latest ? current : { status: 'loading', name: latest });
+        setTail((current) =>
+          current.status === 'ready' && current.data.name === latest ? current : { status: 'loading', name: latest },
+        );
       }
       void fetchLogTail(instanceId, latest)
         .then((data) => {
@@ -72,7 +76,9 @@ export function LogsCard({
   return (
     <Card padding={16} class="cp-od-logs-card">
       <div class="cp-od-logs-summary">
-        <span class="cp-od-logs-icon"><Icon name="terminal" size={14} stroke={1.9} /></span>
+        <span class="cp-od-logs-icon">
+          <Icon name="terminal" size={14} stroke={1.9} />
+        </span>
         <div class="cp-od-logs-line">
           <strong>Logs</strong>
           <span class="cp-od-logs-sub">{summary}</span>
@@ -86,9 +92,7 @@ export function LogsCard({
           {importantLines.length > 0 ? (
             importantLines.map((line) => <LogLine key={line.index} line={line} compact />)
           ) : (
-            <div class="cp-od-logs-preview-note">
-              {previewNote}
-            </div>
+            <div class="cp-od-logs-preview-note">{previewNote}</div>
           )}
         </div>
       )}

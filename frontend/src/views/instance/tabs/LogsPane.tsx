@@ -35,7 +35,11 @@ export function LogsPane({
   const logs = resources.data?.logs ?? [];
   const [selected, setSelected] = useState<string>('');
   const [filter, setFilter] = useState<LogFilter>('all');
-  const [tail, setTail] = useState<{ status: 'idle' | 'loading' | 'ready' | 'error'; data?: InstanceLogTail; error?: string }>({ status: 'idle' });
+  const [tail, setTail] = useState<{
+    status: 'idle' | 'loading' | 'ready' | 'error';
+    data?: InstanceLogTail;
+    error?: string;
+  }>({ status: 'idle' });
   const sortedLogs = useMemo(() => sortLogs(logs), [logs]);
   const selectedEntry = sortedLogs.find((log) => log.name === selected);
   const isLive = running && isCurrentLog(selected);
@@ -59,7 +63,7 @@ export function LogsPane({
     let alive = true;
     const load = (showLoading: boolean): void => {
       if (showLoading) {
-        setTail((current) => current.data?.name === selected ? current : { status: 'loading' });
+        setTail((current) => (current.data?.name === selected ? current : { status: 'loading' }));
       }
       void fetchLogTail(inst.id, selected)
         .then((data) => {
@@ -96,13 +100,21 @@ export function LogsPane({
               </button>
             ))}
           </div>
-          <Button variant="secondary" size="sm" icon="refresh" onClick={onRefresh}>Refresh</Button>
-          <Button variant="soft" size="sm" icon="folder" onClick={() => void openInstanceFolder(inst.id, 'logs')}>Open folder</Button>
+          <Button variant="secondary" size="sm" icon="refresh" onClick={onRefresh}>
+            Refresh
+          </Button>
+          <Button variant="soft" size="sm" icon="folder" onClick={() => void openInstanceFolder(inst.id, 'logs')}>
+            Open folder
+          </Button>
         </div>
       </div>
       <ResourceStatus state={resources} onRetry={onRefresh} />
       {logs.length === 0 && resources.status !== 'loading' ? (
-        <ResourceEmpty icon="terminal" title="No logs yet" hint="Launch this instance and Minecraft log files will appear here." />
+        <ResourceEmpty
+          icon="terminal"
+          title="No logs yet"
+          hint="Launch this instance and Minecraft log files will appear here."
+        />
       ) : (
         <div class="cp-logview">
           <div class="cp-logview-bar">
@@ -118,7 +130,11 @@ export function LogsPane({
                   label: isCurrentLog(log.name) ? `${log.name} — latest` : log.name,
                 }))}
               />
-              {isLive && <Pill tone="accent" icon="play">Live</Pill>}
+              {isLive && (
+                <Pill tone="accent" icon="play">
+                  Live
+                </Pill>
+              )}
             </div>
             {selectedEntry && (
               <span class="cp-logview-meta">
@@ -129,16 +145,22 @@ export function LogsPane({
           <div class="cp-logview-body">
             {selectedIsCompressedArchive && (
               <div class="cp-logview-note">
-                This is a compressed log archive. Croopor cannot preview .log.gz files here; use Open folder to extract it, or select an uncompressed .log file.
+                This is a compressed log archive. Croopor cannot preview .log.gz files here; use Open folder to extract
+                it, or select an uncompressed .log file.
               </div>
             )}
-            {!selectedIsCompressedArchive && tail.status === 'loading' && <div class="cp-logview-note">Loading log…</div>}
-            {!selectedIsCompressedArchive && tail.status === 'error' && <div class="cp-logview-note cp-logview-note--error">{tail.error}</div>}
+            {!selectedIsCompressedArchive && tail.status === 'loading' && (
+              <div class="cp-logview-note">Loading log…</div>
+            )}
+            {!selectedIsCompressedArchive && tail.status === 'error' && (
+              <div class="cp-logview-note cp-logview-note--error">{tail.error}</div>
+            )}
             {!selectedIsCompressedArchive && tail.status === 'ready' && (
               <>
                 {tail.data?.truncated && (
                   <div class="cp-logview-truncated">
-                    Showing the last {fmtBytes(tail.data.size > 0 ? Math.min(tail.data.size, 128 * 1024) : 0)} of this log.
+                    Showing the last {fmtBytes(tail.data.size > 0 ? Math.min(tail.data.size, 128 * 1024) : 0)} of this
+                    log.
                   </div>
                 )}
                 <LogLines text={tail.data?.text ?? ''} filter={filter} />

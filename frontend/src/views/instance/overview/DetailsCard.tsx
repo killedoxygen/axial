@@ -32,7 +32,10 @@ export function DetailsCard({ inst, running }: { inst: EnrichedInstance; running
         </div>
         <div class="cp-od-kv-row">
           <span class="cp-od-kv-key">Loader</span>
-          <span class="cp-od-kv-val">{loader}{loaderVer}</span>
+          <span class="cp-od-kv-val">
+            {loader}
+            {loaderVer}
+          </span>
         </div>
         <div class="cp-od-kv-row">
           <span class="cp-od-kv-key">Created</span>

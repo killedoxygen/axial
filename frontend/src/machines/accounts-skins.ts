@@ -50,10 +50,7 @@ export function initialAccountsSkinsState(): AccountsSkinsState {
   return { kind: 'loading', context: { ...INITIAL_CONTEXT } };
 }
 
-export function transitionAccountsSkins(
-  state: AccountsSkinsState,
-  event: AccountsSkinsEvent,
-): AccountsSkinsState {
+export function transitionAccountsSkins(state: AccountsSkinsState, event: AccountsSkinsEvent): AccountsSkinsState {
   switch (event.type) {
     case 'load_started':
       return {

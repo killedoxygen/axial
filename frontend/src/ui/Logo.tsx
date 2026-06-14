@@ -152,9 +152,7 @@ const LOGO_MARKUP = `
 `;
 
 function scopedLogoMarkup(scope: string): string {
-  return LOGO_MARKUP
-    .replace(/id="([^"]+)"/g, `id="${scope}-$1"`)
-    .replace(/url\(#([^)]+)\)/g, `url(#${scope}-$1)`);
+  return LOGO_MARKUP.replace(/id="([^"]+)"/g, `id="${scope}-$1"`).replace(/url\(#([^)]+)\)/g, `url(#${scope}-$1)`);
 }
 
 export function Logo({

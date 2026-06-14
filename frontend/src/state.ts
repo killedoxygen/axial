@@ -30,10 +30,16 @@ export function loadLocalState(): LocalPrefs {
   try {
     const raw: string | null = localStorage.getItem(STORAGE_KEY);
     if (!raw) return { ...defaults };
-    const { logExpanded: _ignored, offlineSkin, ...saved } = JSON.parse(raw) as Partial<LocalPrefs & {
-      logExpanded?: boolean;
-      offlineSkin?: string;
-    }>;
+    const {
+      logExpanded: _ignored,
+      offlineSkin,
+      ...saved
+    } = JSON.parse(raw) as Partial<
+      LocalPrefs & {
+        logExpanded?: boolean;
+        offlineSkin?: string;
+      }
+    >;
     return {
       ...defaults,
       ...saved,
@@ -49,7 +55,9 @@ export const local: LocalPrefs = loadLocalState();
 export const localStateVersion = signal(0);
 
 export function saveLocalState(): void {
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(local)); } catch {}
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(local));
+  } catch {}
   localStateVersion.value += 1;
 }
 

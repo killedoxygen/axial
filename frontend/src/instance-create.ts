@@ -46,14 +46,16 @@ interface CreateResponse {
 }
 
 function isInstance(value: CreateResponse & Partial<Instance>): value is Instance {
-  return typeof value.id === 'string'
-    && value.id.trim().length > 0
-    && typeof value.name === 'string'
-    && value.name.trim().length > 0
-    && typeof value.version_id === 'string'
-    && value.version_id.trim().length > 0
-    && typeof value.created_at === 'string'
-    && value.created_at.trim().length > 0;
+  return (
+    typeof value.id === 'string' &&
+    value.id.trim().length > 0 &&
+    typeof value.name === 'string' &&
+    value.name.trim().length > 0 &&
+    typeof value.version_id === 'string' &&
+    value.version_id.trim().length > 0 &&
+    typeof value.created_at === 'string' &&
+    value.created_at.trim().length > 0
+  );
 }
 
 function isNameCollision(error: string): boolean {
@@ -126,8 +128,8 @@ export async function createInstance(args: CreateInstanceArgs): Promise<CreateIn
   const initial = args.initialSettings;
   if (initial && Object.keys(initial).length > 0) {
     try {
-      const res = await api('PUT', `/instances/${encodeURIComponent(created.id)}`, initial) as
-        CreateResponse & Partial<Instance>;
+      const res = (await api('PUT', `/instances/${encodeURIComponent(created.id)}`, initial)) as CreateResponse &
+        Partial<Instance>;
       if (!res.error && isInstance(res)) {
         created = res;
       }

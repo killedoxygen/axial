@@ -32,16 +32,46 @@ const GROUP_LABELS: Record<Group, string> = {
 
 function buildCommands(): Command[] {
   const list: Command[] = [];
-  const close = (): void => { commandPaletteOpen.value = false; };
-  const goto = (r: Route, hint?: string): Command['perform'] => () => { navigate(r); close(); };
+  const close = (): void => {
+    commandPaletteOpen.value = false;
+  };
+  const goto =
+    (r: Route, hint?: string): Command['perform'] =>
+    () => {
+      navigate(r);
+      close();
+    };
 
   list.push(
     { id: 'jump:home', group: 'jump', icon: 'home', label: 'Home', perform: goto({ name: 'home' }) },
     { id: 'jump:instances', group: 'jump', icon: 'stack', label: 'Instances', perform: goto({ name: 'instances' }) },
-    { id: 'jump:create', group: 'jump', icon: 'plus', label: 'New instance', hint: 'Ctrl N', perform: () => { openCreate(); close(); } },
+    {
+      id: 'jump:create',
+      group: 'jump',
+      icon: 'plus',
+      label: 'New instance',
+      hint: 'Ctrl N',
+      perform: () => {
+        openCreate();
+        close();
+      },
+    },
     { id: 'jump:downloads', group: 'jump', icon: 'download', label: 'Downloads', perform: goto({ name: 'downloads' }) },
-    { id: 'jump:accounts', group: 'jump', icon: 'user', label: 'Accounts and skins', perform: goto({ name: 'accounts' }) },
-    { id: 'jump:settings', group: 'jump', icon: 'settings', label: 'Settings', hint: 'Ctrl ,', perform: goto({ name: 'settings' }) },
+    {
+      id: 'jump:accounts',
+      group: 'jump',
+      icon: 'user',
+      label: 'Accounts and skins',
+      perform: goto({ name: 'accounts' }),
+    },
+    {
+      id: 'jump:settings',
+      group: 'jump',
+      icon: 'settings',
+      label: 'Settings',
+      hint: 'Ctrl ,',
+      perform: goto({ name: 'settings' }),
+    },
   );
 
   const running = runningSessions.value;
@@ -55,7 +85,10 @@ function buildCommands(): Command[] {
       label: isRunning ? `Jump to ${inst.name}` : `Open ${inst.name}`,
       hint: isRunning ? 'Playing' : undefined,
       keywords: inst.name,
-      perform: () => { navigate({ name: 'instance', id: inst.id }); close(); },
+      perform: () => {
+        navigate({ name: 'instance', id: inst.id });
+        close();
+      },
     });
   }
 
@@ -76,7 +109,10 @@ function buildCommands(): Command[] {
       group: 'action',
       icon: Music.enabled ? 'music-off' : 'music',
       label: Music.enabled ? 'Mute background music' : 'Play background music',
-      perform: () => { Music.toggle(); close(); },
+      perform: () => {
+        Music.toggle();
+        close();
+      },
     },
     {
       id: 'action:sounds',
@@ -109,7 +145,9 @@ function buildCommands(): Command[] {
       icon: 'refresh',
       label: 'Reload launcher',
       hint: 'F5',
-      perform: () => { location.reload(); },
+      perform: () => {
+        location.reload();
+      },
     },
   );
 
@@ -146,20 +184,25 @@ export function CommandPalette(): JSX.Element | null {
   const commands = open ? buildCommands() : [];
 
   const filtered = useMemo(() => {
-    const scored = commands
-      .map(c => ({ cmd: c, s: score(c, query) }))
-      .filter(x => x.s > 0);
+    const scored = commands.map((c) => ({ cmd: c, s: score(c, query) })).filter((x) => x.s > 0);
     scored.sort((a, b) => {
       if (b.s !== a.s) return b.s - a.s;
       const ga = a.cmd.group === 'instance' ? 0 : a.cmd.group === 'jump' ? 1 : 2;
       const gb = b.cmd.group === 'instance' ? 0 : b.cmd.group === 'jump' ? 1 : 2;
       return ga - gb;
     });
-    return scored.map(x => x.cmd);
+    return scored.map((x) => x.cmd);
   }, [commands, query]);
 
-  useEffect(() => { if (open) { setQuery(''); setActive(0); } }, [open]);
-  useEffect(() => { setActive(a => Math.min(a, Math.max(0, filtered.length - 1))); }, [filtered.length]);
+  useEffect(() => {
+    if (open) {
+      setQuery('');
+      setActive(0);
+    }
+  }, [open]);
+  useEffect(() => {
+    setActive((a) => Math.min(a, Math.max(0, filtered.length - 1)));
+  }, [filtered.length]);
   useEffect(() => {
     if (!open) return;
     const frame = window.requestAnimationFrame(() => {
@@ -178,12 +221,12 @@ export function CommandPalette(): JSX.Element | null {
       }
       if (e.key === 'ArrowDown') {
         e.preventDefault();
-        setActive(a => Math.max(0, Math.min(filtered.length - 1, a + 1)));
+        setActive((a) => Math.max(0, Math.min(filtered.length - 1, a + 1)));
         return;
       }
       if (e.key === 'ArrowUp') {
         e.preventDefault();
-        setActive(a => Math.max(0, a - 1));
+        setActive((a) => Math.max(0, a - 1));
         return;
       }
       if (e.key === 'Enter') {
@@ -211,7 +254,7 @@ export function CommandPalette(): JSX.Element | null {
     arr.push({ cmd, idx });
     bucket.set(cmd.group, arr);
   });
-  (['instance', 'jump', 'action'] as Group[]).forEach(g => {
+  (['instance', 'jump', 'action'] as Group[]).forEach((g) => {
     const items = bucket.get(g);
     if (items && items.length > 0) grouped.push({ group: g, items });
   });
@@ -220,7 +263,9 @@ export function CommandPalette(): JSX.Element | null {
     <div
       class="cp-cmd-overlay"
       data-dragging={commandCenterDrag.isDragging}
-      onClick={(e) => { if (e.target === e.currentTarget) commandPaletteOpen.value = false; }}
+      onClick={(e) => {
+        if (e.target === e.currentTarget) commandPaletteOpen.value = false;
+      }}
     >
       <div
         class="cp-cmd"
@@ -251,31 +296,42 @@ export function CommandPalette(): JSX.Element | null {
               <Icon name="search" size={20} color="var(--text-mute)" />
               <span>No matches</span>
             </div>
-          ) : grouped.map(section => (
-            <div key={section.group} class="cp-cmd-section">
-              <div class="cp-cmd-section-title">{GROUP_LABELS[section.group]}</div>
-              {section.items.map(({ cmd, idx }) => (
-                <button
-                  key={cmd.id}
-                  class="cp-cmd-item"
-                  data-idx={idx}
-                  data-active={idx === active}
-                  onMouseMove={() => setActive(idx)}
-                  onClick={() => { void cmd.perform(); }}
-                  data-sound-silent="true"
-                >
-                  <Icon name={cmd.icon} size={15} stroke={1.8} />
-                  <span class="cp-cmd-label">{cmd.label}</span>
-                  {cmd.hint && <span class="cp-cmd-hint">{cmd.hint}</span>}
-                </button>
-              ))}
-            </div>
-          ))}
+          ) : (
+            grouped.map((section) => (
+              <div key={section.group} class="cp-cmd-section">
+                <div class="cp-cmd-section-title">{GROUP_LABELS[section.group]}</div>
+                {section.items.map(({ cmd, idx }) => (
+                  <button
+                    key={cmd.id}
+                    class="cp-cmd-item"
+                    data-idx={idx}
+                    data-active={idx === active}
+                    onMouseMove={() => setActive(idx)}
+                    onClick={() => {
+                      void cmd.perform();
+                    }}
+                    data-sound-silent="true"
+                  >
+                    <Icon name={cmd.icon} size={15} stroke={1.8} />
+                    <span class="cp-cmd-label">{cmd.label}</span>
+                    {cmd.hint && <span class="cp-cmd-hint">{cmd.hint}</span>}
+                  </button>
+                ))}
+              </div>
+            ))
+          )}
         </div>
         <div class="cp-cmd-foot">
-          <span class="cp-cmd-foot-hint"><Kbd>↑</Kbd><Kbd>↓</Kbd> move</span>
-          <span class="cp-cmd-foot-hint"><Kbd>↵</Kbd> select</span>
-          <span class="cp-cmd-foot-hint"><Kbd>esc</Kbd> close</span>
+          <span class="cp-cmd-foot-hint">
+            <Kbd>↑</Kbd>
+            <Kbd>↓</Kbd> move
+          </span>
+          <span class="cp-cmd-foot-hint">
+            <Kbd>↵</Kbd> select
+          </span>
+          <span class="cp-cmd-foot-hint">
+            <Kbd>esc</Kbd> close
+          </span>
         </div>
       </div>
     </div>

@@ -14,7 +14,7 @@
 }
 
 .cp-player-head::after {
-  content: "";
+  content: '';
   position: absolute;
   inset: 0;
   border-radius: inherit;
@@ -29,16 +29,15 @@
 }
 
 .cp-player-head-texture::after {
-  content: "";
+  content: '';
   position: absolute;
   inset: 0;
-  background:
-    linear-gradient(
-      to bottom,
-      oklch(0.98 0.006 70 / 0.08) 0 12.5%,
-      transparent 12.5% 87.5%,
-      oklch(0.16 0.008 70 / 0.13) 87.5% 100%
-    );
+  background: linear-gradient(
+    to bottom,
+    oklch(0.98 0.006 70 / 0.08) 0 12.5%,
+    transparent 12.5% 87.5%,
+    oklch(0.16 0.008 70 / 0.13) 87.5% 100%
+  );
   pointer-events: none;
 }
 

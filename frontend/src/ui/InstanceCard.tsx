@@ -18,7 +18,12 @@ function versionLabel(inst: EnrichedInstance): { loader: string; mc: string } {
 
 /* Cover card: square art on top, identity below, play overlay on hover.
  * The shared library tile for Home and Instances. */
-export function InstanceCard({ inst, onContextMenu, selected, onToggleSelect }: {
+export function InstanceCard({
+  inst,
+  onContextMenu,
+  selected,
+  onToggleSelect,
+}: {
   inst: EnrichedInstance;
   onContextMenu?: (e: MouseEvent) => void;
   selected?: boolean;
@@ -63,7 +68,11 @@ export function InstanceCard({ inst, onContextMenu, selected, onToggleSelect }: 
             }}
           />
         )}
-        {running && <span class="cp-icard-live" aria-label="Running"><span /> Live</span>}
+        {running && (
+          <span class="cp-icard-live" aria-label="Running">
+            <span /> Live
+          </span>
+        )}
         {installing && (
           <span class="cp-icard-install" aria-label={installBadge}>
             <Icon name={install.state === 'queued' ? 'clock' : 'download'} size={13} stroke={2} />
@@ -77,8 +86,13 @@ export function InstanceCard({ inst, onContextMenu, selected, onToggleSelect }: 
         )}
       </div>
       <div class="cp-icard-body">
-        <div class="cp-icard-name" title={inst.name}>{inst.name}</div>
-        <div class="cp-icard-sub">{installing ? `${installBadge} · ` : ''}{loader} · {mc}</div>
+        <div class="cp-icard-name" title={inst.name}>
+          {inst.name}
+        </div>
+        <div class="cp-icard-sub">
+          {installing ? `${installBadge} · ` : ''}
+          {loader} · {mc}
+        </div>
       </div>
     </div>
   );

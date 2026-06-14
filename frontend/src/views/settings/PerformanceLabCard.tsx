@@ -22,7 +22,11 @@ import type {
 } from '../../types';
 
 function SettingsCard({
-  title, desc, control, stack, children,
+  title,
+  desc,
+  control,
+  stack,
+  children,
 }: {
   title: string;
   desc?: string;
@@ -37,9 +41,7 @@ function SettingsCard({
         {desc && <div class="cp-settings-card-desc">{desc}</div>}
         {stack && children}
       </div>
-      {(control || (!stack && children)) && (
-        <div class="cp-settings-card-control">{control || children}</div>
-      )}
+      {(control || (!stack && children)) && <div class="cp-settings-card-control">{control || children}</div>}
     </Card>
   );
 }
@@ -248,12 +250,7 @@ function driverUpdatedLabel(driver: BenchmarkSuiteDriverStatus): string {
 
 function qualificationRequiredLabel(target: BenchmarkQualificationTargetEvidencePreview): string {
   const required = target.required;
-  return [
-    required.profile,
-    required.run_type,
-    required.mode,
-    required.performance_mode,
-  ]
+  return [required.profile, required.run_type, required.mode, required.performance_mode]
     .filter(Boolean)
     .map((part) => labelFromToken(part, part))
     .join(' · ');
@@ -277,9 +274,10 @@ function qualificationProofLabel(target: BenchmarkQualificationTargetEvidencePre
   const proof = target.proof;
   if (!proof?.present) return 'Proof missing';
   const outcome = proof.outcome ? labelFromToken(proof.outcome, proof.outcome) : 'Proof present';
-  const matched = proof.comparison?.present && typeof proof.comparison.matched_sample_count === 'number'
-    ? `, ${proof.comparison.matched_sample_count} matched`
-    : '';
+  const matched =
+    proof.comparison?.present && typeof proof.comparison.matched_sample_count === 'number'
+      ? `, ${proof.comparison.matched_sample_count} matched`
+      : '';
   return `${outcome}${matched}`;
 }
 
@@ -316,13 +314,16 @@ function safeQualificationErrorMessage(err: unknown): string {
 }
 
 function qualificationMissingTokenLabel(value: string): string {
-  const cleaned = value.replace(/[^a-zA-Z0-9 _-]/g, ' ').replace(/\s+/g, ' ').trim();
+  const cleaned = value
+    .replace(/[^a-zA-Z0-9 _-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
   if (!cleaned) return 'Evidence';
   return labelFromToken(cleaned.slice(0, 40), 'Evidence');
 }
 
 function qualificationMissingSummary(qualification: BenchmarkQualificationResponse): string {
-  const missing = qualification.targets.flatMap((target) => Array.isArray(target.missing) ? target.missing : []);
+  const missing = qualification.targets.flatMap((target) => (Array.isArray(target.missing) ? target.missing : []));
   if (missing.length === 0) return 'No missing evidence';
   const labels = Array.from(new Set(missing.map(qualificationMissingTokenLabel))).slice(0, 2);
   const suffix = missing.length > labels.length ? `, +${missing.length - labels.length}` : '';
@@ -347,7 +348,10 @@ function qualificationEvidenceSummary(qualification: BenchmarkQualificationRespo
   const fallback = selected.length > 0 ? selected : rows.slice(0, 2);
   return fallback
     .slice(0, 2)
-    .map((target) => `${labelFromToken(target.role, 'Target')}: ${qualificationSuiteLabel(target)}, ${qualificationProofLabel(target)}`)
+    .map(
+      (target) =>
+        `${labelFromToken(target.role, 'Target')}: ${qualificationSuiteLabel(target)}, ${qualificationProofLabel(target)}`,
+    )
     .join(' · ');
 }
 
@@ -434,9 +438,8 @@ function guardianProofSummary(record: LaunchProofRecord): ProofEvidenceSummary |
     ...(guardian.guidance || []),
     ...(guardian.interventions || []).map((intervention) => intervention.detail),
   ]);
-  const hasGuardianAction = guardian.decision === 'blocked'
-    || guardian.decision === 'warned'
-    || guardian.decision === 'intervened';
+  const hasGuardianAction =
+    guardian.decision === 'blocked' || guardian.decision === 'warned' || guardian.decision === 'intervened';
   if (!hasGuardianAction && !detail) return null;
 
   return {
@@ -451,10 +454,11 @@ function healingProofSummary(record: LaunchProofRecord): ProofEvidenceSummary | 
   if (!healing) return null;
 
   const retryCount = healing.retry_count && healing.retry_count > 0 ? healing.retry_count : 0;
-  const hasEvidence = retryCount > 0
-    || Boolean(healing.fallback_applied)
-    || Boolean(healing.failure_class)
-    || Boolean(healing.warnings && healing.warnings.length > 0);
+  const hasEvidence =
+    retryCount > 0 ||
+    Boolean(healing.fallback_applied) ||
+    Boolean(healing.failure_class) ||
+    Boolean(healing.warnings && healing.warnings.length > 0);
   if (!hasEvidence) return null;
 
   const detail = firstBoundedProofDetail([
@@ -463,11 +467,12 @@ function healingProofSummary(record: LaunchProofRecord): ProofEvidenceSummary | 
     ...(healing.events || []).map((event) => event.detail),
     healing.failure_class ? `Reason: ${labelFromToken(healing.failure_class, 'launch failure')}` : undefined,
   ]);
-  const label = retryCount > 0
-    ? `Healing retried ${retryCount} ${retryCount === 1 ? 'time' : 'times'}`
-    : healing.failure_class
-      ? 'Healing failure'
-      : 'Healing applied';
+  const label =
+    retryCount > 0
+      ? `Healing retried ${retryCount} ${retryCount === 1 ? 'time' : 'times'}`
+      : healing.failure_class
+        ? 'Healing failure'
+        : 'Healing applied';
 
   return {
     tone: healing.failure_class ? 'err' : retryCount > 0 ? 'ok' : 'info',
@@ -508,16 +513,15 @@ function resourceBudgetSummary(record: LaunchProofRecord): {
     details.push(`${formatMemoryMb(budget.launcher_process_memory_mb)} launcher RSS`);
   }
   if (budget.host_cpu_load_1m_x100 !== undefined) {
-    const threads = budget.host_cpu_threads && budget.host_cpu_threads > 0
-      ? `/${budget.host_cpu_threads} threads`
-      : '';
+    const threads = budget.host_cpu_threads && budget.host_cpu_threads > 0 ? `/${budget.host_cpu_threads} threads` : '';
     details.push(`load ${formatLoadAverageX100(budget.host_cpu_load_1m_x100)}${threads}`);
   }
   if (budget.active_session_count > 0) {
-    const allocation = budget.active_memory_allocation_mb > 0
-      ? `, ${formatMemoryMb(budget.active_memory_allocation_mb)} allocated`
-      : '';
-    details.push(`${budget.active_session_count} active ${budget.active_session_count === 1 ? 'session' : 'sessions'}${allocation}`);
+    const allocation =
+      budget.active_memory_allocation_mb > 0 ? `, ${formatMemoryMb(budget.active_memory_allocation_mb)} allocated` : '';
+    details.push(
+      `${budget.active_session_count} active ${budget.active_session_count === 1 ? 'session' : 'sessions'}${allocation}`,
+    );
   }
   if (budget.active_install_count > 0) {
     details.push(`${budget.active_install_count} active ${budget.active_install_count === 1 ? 'install' : 'installs'}`);
@@ -538,10 +542,12 @@ function stableJsonValue(value: unknown): unknown {
   if (!value || typeof value !== 'object') return value;
 
   const source = value as Record<string, unknown>;
-  return Object.keys(source).sort().reduce<Record<string, unknown>>((acc, key) => {
-    acc[key] = stableJsonValue(source[key]);
-    return acc;
-  }, {});
+  return Object.keys(source)
+    .sort()
+    .reduce<Record<string, unknown>>((acc, key) => {
+      acc[key] = stableJsonValue(source[key]);
+      return acc;
+    }, {});
 }
 
 function stablePrettyJson(value: unknown): string {
@@ -575,7 +581,7 @@ function LaunchProofHistoryBlock({ state }: { state: LaunchReportsState }): JSX.
     } catch (err) {
       toast(`Copy failed: ${proofCopyFailureMessage(err)}`, 'error');
     } finally {
-      setCopyingSessionId((current) => current === sessionId ? null : current);
+      setCopyingSessionId((current) => (current === sessionId ? null : current));
     }
   };
 
@@ -591,9 +597,7 @@ function LaunchProofHistoryBlock({ state }: { state: LaunchReportsState }): JSX.
       </div>
 
       {state.status === 'error' && records.length === 0 && (
-        <div class="cp-settings-proof-empty">
-          Launch proof history is unavailable. {state.error}
-        </div>
+        <div class="cp-settings-proof-empty">Launch proof history is unavailable. {state.error}</div>
       )}
 
       {state.status !== 'error' && records.length === 0 && (
@@ -612,14 +616,14 @@ function LaunchProofHistoryBlock({ state }: { state: LaunchReportsState }): JSX.
             const comparison = comparisonSummary(record.comparison);
             const budgetSummary = resourceBudgetSummary(record);
             const evidenceSummary = launchProofEvidenceSummary(record);
-            const memory = scenario.requested_memory_mb
-              ? fmtMem(scenario.requested_memory_mb / 1024)
-              : null;
+            const memory = scenario.requested_memory_mb ? fmtMem(scenario.requested_memory_mb / 1024) : null;
             const bootDuration = Number.isFinite(record.boot_duration_ms)
               ? `Boot ${formatDurationMs(record.boot_duration_ms as number)}`
               : null;
             const benchmarkParts = [
-              scenario.benchmark_mode ? `Mode ${labelFromToken(scenario.benchmark_mode, scenario.benchmark_mode)}` : null,
+              scenario.benchmark_mode
+                ? `Mode ${labelFromToken(scenario.benchmark_mode, scenario.benchmark_mode)}`
+                : null,
               scenario.benchmark_profile?.trim(),
               scenario.benchmark_run_type?.trim(),
             ].filter(Boolean);
@@ -715,11 +719,21 @@ function BenchmarkMatrixBlock({ state: matrixState }: { state: BenchmarkMatrixSt
       {matrix && (
         <>
           <div class="cp-settings-benchmark-counts">
-            <span><strong>{modes.length}</strong> modes</span>
-            <span><strong>{profiles.length}</strong> profiles</span>
-            <span><strong>{runTypes.length}</strong> run types</span>
-            <span><strong>{targets.length}</strong> targets</span>
-            <span><strong>v{matrix.schema_version}</strong> schema</span>
+            <span>
+              <strong>{modes.length}</strong> modes
+            </span>
+            <span>
+              <strong>{profiles.length}</strong> profiles
+            </span>
+            <span>
+              <strong>{runTypes.length}</strong> run types
+            </span>
+            <span>
+              <strong>{targets.length}</strong> targets
+            </span>
+            <span>
+              <strong>v{matrix.schema_version}</strong> schema
+            </span>
           </div>
           <div class="cp-settings-benchmark-lists">
             <div>
@@ -728,7 +742,12 @@ function BenchmarkMatrixBlock({ state: matrixState }: { state: BenchmarkMatrixSt
             </div>
             <div>
               <span>Profiles</span>
-              <strong>{profiles.slice(0, 4).map((profile) => profile.scenario || labelFromToken(profile.id, profile.id)).join(', ') || 'None'}</strong>
+              <strong>
+                {profiles
+                  .slice(0, 4)
+                  .map((profile) => profile.scenario || labelFromToken(profile.id, profile.id))
+                  .join(', ') || 'None'}
+              </strong>
             </div>
             <div>
               <span>Run types</span>
@@ -737,19 +756,24 @@ function BenchmarkMatrixBlock({ state: matrixState }: { state: BenchmarkMatrixSt
             <div>
               <span>Targets</span>
               <strong>
-                {targets.slice(0, 5).map((target) => {
-                  const family = /^[A-Z](?:-[A-Z])?$/.test(target.family)
-                    ? `Family ${target.family}`
-                    : labelFromToken(target.family, 'Target');
-                  const loader = target.loader || labelFromToken(target.id, target.id);
-                  const version = target.version ? ` ${target.version}` : '';
-                  return `${family} ${loader}${version}`;
-                }).join(', ') || 'None'}
+                {targets
+                  .slice(0, 5)
+                  .map((target) => {
+                    const family = /^[A-Z](?:-[A-Z])?$/.test(target.family)
+                      ? `Family ${target.family}`
+                      : labelFromToken(target.family, 'Target');
+                    const loader = target.loader || labelFromToken(target.id, target.id);
+                    const version = target.version ? ` ${target.version}` : '';
+                    return `${family} ${loader}${version}`;
+                  })
+                  .join(', ') || 'None'}
               </strong>
             </div>
           </div>
           {matrixState.status === 'error' && (
-            <div class="cp-settings-proof-note">Could not refresh benchmark descriptors. Showing the last loaded matrix.</div>
+            <div class="cp-settings-proof-note">
+              Could not refresh benchmark descriptors. Showing the last loaded matrix.
+            </div>
           )}
         </>
       )}
@@ -808,9 +832,7 @@ function BenchmarkQualificationPreviewBlock({ state }: { state: BenchmarkQualifi
             </div>
           </div>
 
-          {rows.length === 0 && (
-            <div class="cp-settings-proof-empty">No qualification targets are described yet.</div>
-          )}
+          {rows.length === 0 && <div class="cp-settings-proof-empty">No qualification targets are described yet.</div>}
 
           {rows.length > 0 && (
             <div class="cp-settings-qualification-table">
@@ -825,18 +847,28 @@ function BenchmarkQualificationPreviewBlock({ state }: { state: BenchmarkQualifi
               {rows.map((row) => (
                 <div class="cp-settings-qualification-row" key={`${row.role}:${row.target_id}`}>
                   <span data-label="Role">{labelFromToken(row.role, row.role || 'Target')}</span>
-                  <strong data-label="Target ID" title={row.target_id}>{compactId(row.target_id || 'Unknown target')}</strong>
+                  <strong data-label="Target ID" title={row.target_id}>
+                    {compactId(row.target_id || 'Unknown target')}
+                  </strong>
                   <span data-label="Required evidence">{qualificationRequiredLabel(row) || 'Requirement unknown'}</span>
-                  <span data-label="Suite" data-present={row.suite_run?.present ? 'true' : 'false'}>{qualificationSuiteLabel(row)}</span>
-                  <span data-label="Proof" data-present={row.proof?.present ? 'true' : 'false'}>{qualificationProofLabel(row)}</span>
-                  <span data-label="Missing" data-missing={row.missing?.length ? 'true' : 'false'}>{qualificationMissingLabel(row)}</span>
+                  <span data-label="Suite" data-present={row.suite_run?.present ? 'true' : 'false'}>
+                    {qualificationSuiteLabel(row)}
+                  </span>
+                  <span data-label="Proof" data-present={row.proof?.present ? 'true' : 'false'}>
+                    {qualificationProofLabel(row)}
+                  </span>
+                  <span data-label="Missing" data-missing={row.missing?.length ? 'true' : 'false'}>
+                    {qualificationMissingLabel(row)}
+                  </span>
                 </div>
               ))}
             </div>
           )}
 
           {state.status === 'error' && (
-            <div class="cp-settings-proof-note">Could not refresh qualification preview. Showing the last loaded evidence state.</div>
+            <div class="cp-settings-proof-note">
+              Could not refresh qualification preview. Showing the last loaded evidence state.
+            </div>
           )}
         </>
       )}
@@ -850,7 +882,11 @@ function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: BenchmarkMat
   const [resumingIds, setResumingIds] = useState<Set<string>>(() => new Set());
   const [qualificationChecks, setQualificationChecks] = useState<BenchmarkQualificationRowChecks>({});
   const instanceRows = instances.value;
-  const preferredInstanceId = preferredBenchmarkInstanceId(instanceRows, selectedInstanceId.value, lastInstanceId.value);
+  const preferredInstanceId = preferredBenchmarkInstanceId(
+    instanceRows,
+    selectedInstanceId.value,
+    lastInstanceId.value,
+  );
   const suiteModes = useMemo(() => {
     const ids = matrixState.data?.modes.map((mode) => mode.id).filter(Boolean) ?? [];
     return ids.length > 0 ? ids : [BENCHMARK_SUITE_DEFAULT_MODE];
@@ -864,11 +900,9 @@ function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: BenchmarkMat
   const aliveRef = useRef(true);
 
   useEffect(() => {
-    setStartInstanceId((current) => (
-      current && instanceRows.some((instance) => instance.id === current)
-        ? current
-        : preferredInstanceId
-    ));
+    setStartInstanceId((current) =>
+      current && instanceRows.some((instance) => instance.id === current) ? current : preferredInstanceId,
+    );
   }, [instanceRows, preferredInstanceId]);
 
   useEffect(() => {
@@ -897,7 +931,9 @@ function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: BenchmarkMat
   useEffect(() => {
     aliveRef.current = true;
     void loadDrivers();
-    return () => { aliveRef.current = false; };
+    return () => {
+      aliveRef.current = false;
+    };
   }, []);
 
   const stopDriver = async (id: string): Promise<void> => {
@@ -941,10 +977,7 @@ function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: BenchmarkMat
       if (!aliveRef.current) return;
       setDriversState((prev) => ({
         status: 'ready',
-        data: [
-          nextDriver,
-          ...prev.data.filter((driver) => driver.driver.id !== nextDriver.driver.id),
-        ],
+        data: [nextDriver, ...prev.data.filter((driver) => driver.driver.id !== nextDriver.driver.id)],
       }));
       toast('Driver resumed');
     } catch (err) {
@@ -989,9 +1022,10 @@ function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: BenchmarkMat
 
   const selectedStartInstance = instanceRows.find((instance) => instance.id === startInstanceId) ?? null;
   const parsedIntervalSeconds = parseBenchmarkSuiteDriverIntervalSeconds(intervalSeconds);
-  const intervalValid = parsedIntervalSeconds !== null
-    && parsedIntervalSeconds >= BENCHMARK_SUITE_DRIVER_MIN_INTERVAL_SECONDS
-    && parsedIntervalSeconds <= BENCHMARK_SUITE_DRIVER_MAX_INTERVAL_SECONDS;
+  const intervalValid =
+    parsedIntervalSeconds !== null &&
+    parsedIntervalSeconds >= BENCHMARK_SUITE_DRIVER_MIN_INTERVAL_SECONDS &&
+    parsedIntervalSeconds <= BENCHMARK_SUITE_DRIVER_MAX_INTERVAL_SECONDS;
   const showIntervalError = intervalSeconds.trim().length > 0 && !intervalValid;
   const canStartDriver = Boolean(selectedStartInstance && startSuiteMode && intervalValid && !starting);
 
@@ -1016,10 +1050,7 @@ function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: BenchmarkMat
       if (!aliveRef.current) return;
       setDriversState((prev) => ({
         status: 'ready',
-        data: [
-          nextDriver,
-          ...prev.data.filter((driver) => driver.driver.id !== nextDriver.driver.id),
-        ],
+        data: [nextDriver, ...prev.data.filter((driver) => driver.driver.id !== nextDriver.driver.id)],
       }));
       toast('Benchmark driver started');
     } catch (err) {
@@ -1061,15 +1092,17 @@ function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: BenchmarkMat
             disabled={starting || instanceRows.length === 0}
             onChange={setStartInstanceId}
             ariaLabel="Benchmark driver instance"
-            options={instanceRows.length === 0
-              ? [{ value: '', label: 'No instances' }]
-              : instanceRows.map((instance) => ({
-                  value: instance.id,
-                  label: `${instance.name} (${minecraftVersionLabel(
-                    versionById(instance.version_id),
-                    instance.version_id,
-                  )})`,
-                }))}
+            options={
+              instanceRows.length === 0
+                ? [{ value: '', label: 'No instances' }]
+                : instanceRows.map((instance) => ({
+                    value: instance.id,
+                    label: `${instance.name} (${minecraftVersionLabel(
+                      versionById(instance.version_id),
+                      instance.version_id,
+                    )})`,
+                  }))
+            }
           />
         </label>
         <label class="cp-settings-driver-start-field cp-settings-driver-start-field--mode">
@@ -1082,7 +1115,10 @@ function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: BenchmarkMat
             options={suiteModes.map((mode) => ({ value: mode, label: labelFromToken(mode, mode) }))}
           />
         </label>
-        <label class="cp-settings-driver-start-field cp-settings-driver-start-field--interval" data-invalid={showIntervalError ? 'true' : 'false'}>
+        <label
+          class="cp-settings-driver-start-field cp-settings-driver-start-field--interval"
+          data-invalid={showIntervalError ? 'true' : 'false'}
+        >
           <span>Interval</span>
           <div class="cp-settings-driver-interval-input">
             <input
@@ -1101,26 +1137,19 @@ function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: BenchmarkMat
             <span>s</span>
           </div>
         </label>
-        <Button
-          size="sm"
-          icon="play"
-          sound="affirm"
-          disabled={!canStartDriver}
-          onClick={() => void startDriver()}
-        >
+        <Button size="sm" icon="play" sound="affirm" disabled={!canStartDriver} onClick={() => void startDriver()}>
           {starting ? 'Starting' : 'Start'}
         </Button>
       </div>
       {showIntervalError && (
         <div class="cp-settings-driver-start-error">
-          Interval must be {BENCHMARK_SUITE_DRIVER_MIN_INTERVAL_SECONDS}-{BENCHMARK_SUITE_DRIVER_MAX_INTERVAL_SECONDS} seconds.
+          Interval must be {BENCHMARK_SUITE_DRIVER_MIN_INTERVAL_SECONDS}-{BENCHMARK_SUITE_DRIVER_MAX_INTERVAL_SECONDS}{' '}
+          seconds.
         </div>
       )}
 
       {driversState.status === 'error' && rows.length === 0 && (
-        <div class="cp-settings-proof-empty">
-          Benchmark driver status is unavailable. {driversState.error}
-        </div>
+        <div class="cp-settings-proof-empty">Benchmark driver status is unavailable. {driversState.error}</div>
       )}
 
       {driversState.status !== 'error' && rows.length === 0 && (
@@ -1247,7 +1276,10 @@ export function PerformanceLabCard(): JSX.Element | null {
   const isDev = devMode.value;
   const [launchReports, setLaunchReports] = useState<LaunchReportsState>({ status: 'loading', data: [] });
   const [benchmarkMatrix, setBenchmarkMatrix] = useState<BenchmarkMatrixState>({ status: 'loading', data: null });
-  const [qualificationPreview, setQualificationPreview] = useState<BenchmarkQualificationPreviewState>({ status: 'loading', data: null });
+  const [qualificationPreview, setQualificationPreview] = useState<BenchmarkQualificationPreviewState>({
+    status: 'loading',
+    data: null,
+  });
   const [labOpen, setLabOpen] = useState(false);
 
   useEffect(() => {
@@ -1269,7 +1301,9 @@ export function PerformanceLabCard(): JSX.Element | null {
         if (!alive) return;
         setLaunchReports((prev) => ({ status: 'error', data: prev.data, error: errMessage(err) }));
       });
-    return () => { alive = false; };
+    return () => {
+      alive = false;
+    };
   }, [isDev, labOpen]);
 
   useEffect(() => {
@@ -1286,7 +1320,9 @@ export function PerformanceLabCard(): JSX.Element | null {
         if (!alive) return;
         setBenchmarkMatrix((prev) => ({ status: 'error', data: prev.data, error: errMessage(err) }));
       });
-    return () => { alive = false; };
+    return () => {
+      alive = false;
+    };
   }, [isDev, labOpen]);
 
   useEffect(() => {
@@ -1307,7 +1343,9 @@ export function PerformanceLabCard(): JSX.Element | null {
         if (!alive) return;
         setQualificationPreview((prev) => ({ status: 'error', data: prev.data, error: errMessage(err) }));
       });
-    return () => { alive = false; };
+    return () => {
+      alive = false;
+    };
   }, [isDev, labOpen]);
 
   if (!isDev) return null;
@@ -1317,33 +1355,19 @@ export function PerformanceLabCard(): JSX.Element | null {
       <SettingsCard
         title="Performance lab"
         desc="Developer-only launch proof and benchmark tools."
-        control={(
-          <Button
-            variant="secondary"
-            size="sm"
-            icon="chevron-down"
-            onClick={() => setLabOpen(true)}
-          >
+        control={
+          <Button variant="secondary" size="sm" icon="chevron-down" onClick={() => setLabOpen(true)}>
             Open
           </Button>
-        )}
+        }
       />
     );
   }
 
   return (
-    <SettingsCard
-      title="Performance lab"
-      desc="Developer-only launch proof and benchmark tools."
-      stack
-    >
+    <SettingsCard title="Performance lab" desc="Developer-only launch proof and benchmark tools." stack>
       <div class="cp-settings-lab-action">
-        <Button
-          variant="secondary"
-          size="sm"
-          icon="chevron-up"
-          onClick={() => setLabOpen(false)}
-        >
+        <Button variant="secondary" size="sm" icon="chevron-up" onClick={() => setLabOpen(false)}>
           Close
         </Button>
       </div>

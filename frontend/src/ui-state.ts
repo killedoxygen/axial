@@ -22,7 +22,9 @@ function sameRoute(a: Route, b: Route): boolean {
 
 function setRoute(r: Route): void {
   route.value = r;
-  try { localStorage.setItem(ROUTE_STORAGE_KEY, JSON.stringify(r)); } catch {}
+  try {
+    localStorage.setItem(ROUTE_STORAGE_KEY, JSON.stringify(r));
+  } catch {}
 }
 
 export function navigate(r: Route): void {

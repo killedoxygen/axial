@@ -1,11 +1,6 @@
 import type { JSX } from 'preact';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import {
-  getSkinSnapshot,
-  requestSkinSnapshot,
-  subscribeSkinSnapshot,
-  type SkinSnapshotInput,
-} from './skin-snapshot';
+import { getSkinSnapshot, requestSkinSnapshot, subscribeSkinSnapshot, type SkinSnapshotInput } from './skin-snapshot';
 import type { SkinVariant } from './types';
 
 export function SkinSnapshotImg({
@@ -27,14 +22,17 @@ export function SkinSnapshotImg({
 }): JSX.Element {
   const rootRef = useRef<HTMLSpanElement>(null);
   const [, setVersion] = useState(0);
-  const input = useMemo<SkinSnapshotInput>(() => ({
-    cacheKey,
-    src,
-    variant,
-    capeSrc,
-    textureIdentity,
-    capeIdentity,
-  }), [cacheKey, capeIdentity, capeSrc, src, textureIdentity, variant]);
+  const input = useMemo<SkinSnapshotInput>(
+    () => ({
+      cacheKey,
+      src,
+      variant,
+      capeSrc,
+      textureIdentity,
+      capeIdentity,
+    }),
+    [cacheKey, capeIdentity, capeSrc, src, textureIdentity, variant],
+  );
   const front = getSkinSnapshot(input, 'front');
   const back = getSkinSnapshot(input, 'back');
 
@@ -71,12 +69,7 @@ export function SkinSnapshotImg({
       onPointerEnter={requestBack}
     >
       {front.status === 'ready' ? (
-        <img
-          class="cp-skin-tile__img"
-          src={front.url}
-          alt={alt}
-          draggable={false}
-        />
+        <img class="cp-skin-tile__img" src={front.url} alt={alt} draggable={false} />
       ) : (
         <span
           class="cp-skin-tile__img"

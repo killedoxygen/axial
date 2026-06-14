@@ -29,9 +29,7 @@ export function buildRowModel(
 ): VersionRowModel {
   const display = normalizeVersionDisplay(version);
   const baseInstalled = version.installed || installedSet.has(version.id);
-  const fullInstalled = source === 'vanilla'
-    ? baseInstalled
-    : fullInstalledSet.has(version.id);
+  const fullInstalled = source === 'vanilla' ? baseInstalled : fullInstalledSet.has(version.id);
   return {
     id: version.id,
     displayName: display.displayName === version.id ? version.id : display.displayName,

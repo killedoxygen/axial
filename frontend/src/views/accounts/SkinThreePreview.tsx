@@ -70,12 +70,10 @@ function fitCameraToCanvas({
   const horizontalFov = 2 * Math.atan(Math.tan(verticalFov / 2) * aspect);
   const paddedHalfHeight = bounds.halfHeight * (height / usableHeight);
   const paddedHalfWidth = bounds.halfWidth * (width / usableWidth);
-  const distance = Math.max(
-    paddedHalfHeight / Math.tan(verticalFov / 2),
-    paddedHalfWidth / Math.tan(horizontalFov / 2),
-  ) / FIT_ZOOM;
+  const distance =
+    Math.max(paddedHalfHeight / Math.tan(verticalFov / 2), paddedHalfWidth / Math.tan(horizontalFov / 2)) / FIT_ZOOM;
   const visibleHalfHeight = distance * Math.tan(verticalFov / 2);
-  const targetY = bounds.centerY - ((bottomPadding - topPadding) * visibleHalfHeight);
+  const targetY = bounds.centerY - (bottomPadding - topPadding) * visibleHalfHeight;
 
   camera.fov = FIT_FOV_DEGREES;
   camera.aspect = aspect;
@@ -91,20 +89,17 @@ function fitCameraToCanvas({
   const modelBottom = projectY(bounds.centerY - bounds.halfHeight);
 
   return {
-    overlayTopPx: Math.round(THREE.MathUtils.clamp(
-      modelTop - overlayHeightPx - OVERLAY_MODEL_GAP_PX,
-      8,
-      Math.max(8, height * 0.18),
-    )),
+    overlayTopPx: Math.round(
+      THREE.MathUtils.clamp(modelTop - overlayHeightPx - OVERLAY_MODEL_GAP_PX, 8, Math.max(8, height * 0.18)),
+    ),
     hintBottomPx: Math.round(THREE.MathUtils.clamp(height - modelBottom + 8, 8, 18)),
   };
 }
 
 function estimateOverlayHeightPx(props: SkinThreePreviewProps): number {
-  const rows = [
-    props.badge ? BADGE_HEIGHT_PX : 0,
-    props.nametag ? NAMETAG_HEIGHT_PX : 0,
-  ].filter((height) => height > 0);
+  const rows = [props.badge ? BADGE_HEIGHT_PX : 0, props.nametag ? NAMETAG_HEIGHT_PX : 0].filter(
+    (height) => height > 0,
+  );
   return rows.reduce((total, height) => total + height, 0) + Math.max(0, rows.length - 1) * OVERLAY_ROW_GAP_PX;
 }
 
@@ -121,7 +116,7 @@ async function setupScene(
   const disposables: Array<() => void> = [];
   const skinBitmap = await loadBitmap(props.src);
   const capeBitmap = await loadOptionalBitmap(props.capeSrc, 'cape');
-  setCapeState(props.capeSrc ? capeBitmap ? 'loaded' : 'omitted' : 'none');
+  setCapeState(props.capeSrc ? (capeBitmap ? 'loaded' : 'omitted') : 'none');
   const renderer = new THREE.WebGLRenderer({
     canvas,
     alpha: true,
@@ -170,21 +165,22 @@ async function setupScene(
     const width = Math.max(1, Math.round(rect.width));
     const height = Math.max(1, Math.round(rect.height));
     renderer.setSize(width, height, false);
-    setFitMetrics(fitCameraToCanvas({
-      THREE,
-      camera,
-      canvas,
-      bounds,
-      overlayHeightPx: estimateOverlayHeightPx(props),
-    }));
+    setFitMetrics(
+      fitCameraToCanvas({
+        THREE,
+        camera,
+        canvas,
+        bounds,
+        overlayHeightPx: estimateOverlayHeightPx(props),
+      }),
+    );
     setFitState('fitted');
   }
 
   function render(time = 0): void {
     const pulseElapsed = time - clickPulseStart;
-    const pulseProgress = pulseElapsed >= 0 && pulseElapsed < CLICK_PULSE_DURATION_MS
-      ? pulseElapsed / CLICK_PULSE_DURATION_MS
-      : 1;
+    const pulseProgress =
+      pulseElapsed >= 0 && pulseElapsed < CLICK_PULSE_DURATION_MS ? pulseElapsed / CLICK_PULSE_DURATION_MS : 1;
     const pulse = pulseProgress < 1 ? Math.sin(pulseProgress * Math.PI) : 0;
     const pulseWobble = pulseProgress < 1 ? Math.sin(pulseProgress * Math.PI * 2) : 0;
     if (!dragging) {
@@ -202,7 +198,7 @@ async function setupScene(
     group.position.x = pulseWobble * 0.22;
     group.scale.set(1 - pulse * 0.012, 1 + pulse * 0.026, 1);
     renderer.render(scene, camera);
-      frame = window.requestAnimationFrame(render);
+    frame = window.requestAnimationFrame(render);
   }
 
   const resizeObserver = new ResizeObserver(resize);
@@ -308,17 +304,25 @@ export function SkinThreePreview(props: SkinThreePreviewProps): JSX.Element {
     setCapeState(props.capeSrc ? 'loading' : 'none');
     setFitState('pending');
 
-    void setupScene(canvas, props, (nextReady) => {
-      if (active) setReady(nextReady);
-    }, (nextInteracting) => {
-      if (active) setInteracting(nextInteracting);
-    }, (nextCapeState) => {
-      if (active) setCapeState(nextCapeState);
-    }, (nextFitState) => {
-      if (active) setFitState(nextFitState);
-    }, (nextFitMetrics) => {
-      if (active) setFitMetrics(nextFitMetrics);
-    })
+    void setupScene(
+      canvas,
+      props,
+      (nextReady) => {
+        if (active) setReady(nextReady);
+      },
+      (nextInteracting) => {
+        if (active) setInteracting(nextInteracting);
+      },
+      (nextCapeState) => {
+        if (active) setCapeState(nextCapeState);
+      },
+      (nextFitState) => {
+        if (active) setFitState(nextFitState);
+      },
+      (nextFitMetrics) => {
+        if (active) setFitMetrics(nextFitMetrics);
+      },
+    )
       .then((nextHandle) => {
         if (!active) {
           nextHandle.dispose();
@@ -345,31 +349,33 @@ export function SkinThreePreview(props: SkinThreePreviewProps): JSX.Element {
       data-skin-three-cape={capeState}
       data-skin-three-fit={fitState}
       aria-label={`${props.name} 3D skin preview`}
-      style={{
-        '--skin-three-overlay-top': `${fitMetrics.overlayTopPx}px`,
-        '--skin-three-hint-bottom': `${fitMetrics.hintBottomPx}px`,
-      } as JSX.CSSProperties}
+      style={
+        {
+          '--skin-three-overlay-top': `${fitMetrics.overlayTopPx}px`,
+          '--skin-three-hint-bottom': `${fitMetrics.hintBottomPx}px`,
+        } as JSX.CSSProperties
+      }
     >
       <canvas ref={canvasRef} aria-hidden="true" />
-      {!ready && !error && (
-        <div class="cp-skin-three__status">Preparing 3D preview...</div>
-      )}
-      {error && (
-        <div class="cp-skin-three__status">3D preview unavailable</div>
-      )}
+      {!ready && !error && <div class="cp-skin-three__status">Preparing 3D preview...</div>}
+      {error && <div class="cp-skin-three__status">3D preview unavailable</div>}
       {(props.badge || props.nametag) && (
         <div class="cp-skin-three__overlays">
           {props.badge && (
             <div
               class="cp-skin-three__badge"
               data-skin-three-badge={props.badge.state}
-              title={props.badge.state === 'queued' ? 'Queued for Minecraft profile apply' : 'Preview selection differs from the equipped skin'}
+              title={
+                props.badge.state === 'queued'
+                  ? 'Queued for Minecraft profile apply'
+                  : 'Preview selection differs from the equipped skin'
+              }
             >
               {props.badge.label}
             </div>
           )}
-          {props.nametag && (
-            props.onNametagEdit ? (
+          {props.nametag &&
+            (props.onNametagEdit ? (
               <button
                 type="button"
                 class="cp-skin-three__nametag cp-skin-nametag cp-skin-nametag--editable"
@@ -390,8 +396,7 @@ export function SkinThreePreview(props: SkinThreePreviewProps): JSX.Element {
               >
                 <span>{props.nametag}</span>
               </div>
-            )
-          )}
+            ))}
         </div>
       )}
       <div class="cp-skin-three__hint" data-skin-three-hint="drag-rotate" aria-hidden="true">

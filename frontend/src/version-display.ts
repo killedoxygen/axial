@@ -57,14 +57,12 @@ function inferLoaderMinecraftVersion(versionId: string): string {
 }
 
 function loaderMinecraftVersion(version: VersionDisplaySource): string {
-  const inherited = 'inherits_from' in version ? version.inherits_from?.trim() ?? '' : '';
+  const inherited = 'inherits_from' in version ? (version.inherits_from?.trim() ?? '') : '';
   if (inherited) return inherited;
   return inferLoaderMinecraftVersion(version.id);
 }
 
-export function normalizeVersionDisplay(
-  version: VersionDisplaySource | null | undefined,
-): NormalizedVersionDisplay {
+export function normalizeVersionDisplay(version: VersionDisplaySource | null | undefined): NormalizedVersionDisplay {
   if (!version) {
     return {
       displayName: '',
@@ -80,12 +78,8 @@ export function normalizeVersionDisplay(
   const displayName = display.name || version.id;
   const meta = version.minecraft_meta;
   const loaderTarget = loaderMinecraftVersion(version);
-  const minecraftLabel = loaderTarget
-    || meta.effective_version
-    || meta.base_id
-    || meta.display_name
-    || meta.display_hint
-    || version.id;
+  const minecraftLabel =
+    loaderTarget || meta.effective_version || meta.base_id || meta.display_name || meta.display_hint || version.id;
   const searchText = [
     version.id,
     displayName,
@@ -109,25 +103,15 @@ export function normalizeVersionDisplay(
   };
 }
 
-export function versionSearchText(
-  version: VersionDisplaySource | null | undefined,
-): string {
+export function versionSearchText(version: VersionDisplaySource | null | undefined): string {
   return normalizeVersionDisplay(version).searchText;
 }
 
-export function minecraftVersionLabel(
-  version: VersionDisplaySource | null | undefined,
-  fallback = 'unknown',
-): string {
+export function minecraftVersionLabel(version: VersionDisplaySource | null | undefined, fallback = 'unknown'): string {
   return normalizeVersionDisplay(version).minecraftLabel || fallback;
 }
 
-export function fullVersionLabel(
-  version: VersionDisplaySource | null | undefined,
-  fallback = 'unknown',
-): string {
+export function fullVersionLabel(version: VersionDisplaySource | null | undefined, fallback = 'unknown'): string {
   const display = normalizeVersionDisplay(version);
-  return display.hint
-    ? `${display.displayName} (${display.hint})`
-    : display.displayName || fallback;
+  return display.hint ? `${display.displayName} (${display.hint})` : display.displayName || fallback;
 }

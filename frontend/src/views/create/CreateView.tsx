@@ -13,18 +13,19 @@ import { hashStr } from '../../tokens';
 import { Sound } from '../../sound';
 import { createNewInstanceLoaderMachine } from '../../machines/new-instance-loader';
 import { pickPreferredBuild } from '../../loaders/view-model';
-import {
-  getCachedLoaderBuilds,
-  getCachedLoaderSupportedVersions,
-} from '../../loaders/api';
+import { getCachedLoaderBuilds, getCachedLoaderSupportedVersions } from '../../loaders/api';
 import { createInstance } from '../../instance-create';
-import type {
-  Catalog, CatalogVersion, LoaderBuildRecord, LoaderComponentId,
-} from '../../types';
+import type { Catalog, CatalogVersion, LoaderBuildRecord, LoaderComponentId } from '../../types';
 import {
-  channelOfVersion, defaultIconFor, defaultNameFor,
-  LOADER_COMPONENT_IDS, LOADER_KEYS, LOADER_LABELS, LOADER_TAGLINES,
-  type Channel, type LoaderKey,
+  channelOfVersion,
+  defaultIconFor,
+  defaultNameFor,
+  LOADER_COMPONENT_IDS,
+  LOADER_KEYS,
+  LOADER_LABELS,
+  LOADER_TAGLINES,
+  type Channel,
+  type LoaderKey,
 } from './defaults';
 import { LoaderLogo } from './loader-logos';
 import { LibraryBlocker } from './shared';
@@ -45,12 +46,7 @@ import {
   type WindowPresetSpec,
 } from './screen-presets';
 import { versionSearchText } from '../../version-display';
-import {
-  JVM_PRESET_CREATE_ORDER,
-  JVM_PRESET_HINTS,
-  JVM_PRESET_LABELS,
-  type JvmPreset,
-} from './jvm-presets';
+import { JVM_PRESET_CREATE_ORDER, JVM_PRESET_HINTS, JVM_PRESET_LABELS, type JvmPreset } from './jvm-presets';
 
 const BASE_CHANNEL_TABS: Channel[] = ['release', 'snapshot', 'legacy'];
 type CreateStep = 'version' | 'details';
@@ -58,7 +54,12 @@ type CreateStep = 'version' | 'details';
 export function CreateView(): JSX.Element {
   const libraryDir = config.value?.library_dir ?? '';
   return (
-    <Modal open={createOpen.value} onOpenChange={(next: boolean) => { if (!next) closeCreate(); }}>
+    <Modal
+      open={createOpen.value}
+      onOpenChange={(next: boolean) => {
+        if (!next) closeCreate();
+      }}
+    >
       <ModalContent
         className="cp-cr-card"
         aria-label="Create instance"
@@ -99,9 +100,7 @@ function CreateCard(): JSX.Element {
   const versionWellRef = useRef<HTMLDivElement | null>(null);
   const versionListKey = `${source}:${channel}:${query.trim().toLowerCase()}`;
 
-  const totalGB = systemInfo.value?.total_memory_mb
-    ? Math.floor(systemInfo.value.total_memory_mb / 1024)
-    : 16;
+  const totalGB = systemInfo.value?.total_memory_mb ? Math.floor(systemInfo.value.total_memory_mb / 1024) : 16;
   const memoryRec = getMemoryRecommendation(totalGB);
   const [memoryGB, setMemoryGB] = useState<number>(memoryRec.rec);
   const [seedOverride, setSeedOverride] = useState<number | null>(null);
@@ -113,13 +112,14 @@ function CreateCard(): JSX.Element {
   }));
   useEffect(() => {
     let cancelled = false;
-    void detectMaxScreenSize().then((s) => { if (!cancelled) setScreenMax(s); });
-    return () => { cancelled = true; };
+    void detectMaxScreenSize().then((s) => {
+      if (!cancelled) setScreenMax(s);
+    });
+    return () => {
+      cancelled = true;
+    };
   }, []);
-  const windowPresets: WindowPresetSpec[] = useMemo(
-    () => buildWindowPresets(screenMax),
-    [screenMax],
-  );
+  const windowPresets: WindowPresetSpec[] = useMemo(() => buildWindowPresets(screenMax), [screenMax]);
   const [windowPresetId, setWindowPresetId] = useState<string>('default');
   useEffect(() => {
     if (!windowPresets.some((p) => p.id === windowPresetId)) {
@@ -151,7 +151,7 @@ function CreateCard(): JSX.Element {
     setCatalogLoading(true);
     setCatalogError(null);
     try {
-      const res = (await api('GET', '/catalog')) as (Catalog & { error?: string });
+      const res = (await api('GET', '/catalog')) as Catalog & { error?: string };
       if (res.error) throw new Error(res.error);
       setCatalog({ latest: res.latest, versions: res.versions });
     } catch (err: unknown) {
@@ -177,7 +177,12 @@ function CreateCard(): JSX.Element {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [source]);
 
-  useEffect(() => () => { loaderMachine.disable(); }, [loaderMachine]);
+  useEffect(
+    () => () => {
+      loaderMachine.disable();
+    },
+    [loaderMachine],
+  );
 
   const currentSupportedVersions = useMemo(() => {
     if (!currentComponentId) return null;
@@ -215,9 +220,7 @@ function CreateCard(): JSX.Element {
   const versionRows: VersionRowModel[] = useMemo(() => {
     const cat = catalog.value;
     if (!cat) return [];
-    const installedSet = new Set(
-      versions.value.filter((x) => x.installed && x.launchable).map((x) => x.id),
-    );
+    const installedSet = new Set(versions.value.filter((x) => x.installed && x.launchable).map((x) => x.id));
     const fullInstalledSet = new Set<string>();
     if (currentComponentId) {
       for (const version of versions.value) {
@@ -247,21 +250,22 @@ function CreateCard(): JSX.Element {
       return buildRowModel(v, installedSet, source, rowFullInstalledSet);
     });
   }, [catalog.value, versions.value, channel, query, availableForSource, source, currentComponentId]);
-  const selectedVersionRow = mcVersionId
-    ? versionRows.find((row) => row.id === mcVersionId) ?? null
-    : null;
+  const selectedVersionRow = mcVersionId ? (versionRows.find((row) => row.id === mcVersionId) ?? null) : null;
 
   const selectedBuild: LoaderBuildRecord | null = useMemo(() => {
     if (!currentComponentId || !mcVersionId) return null;
-    const builds = loaderState.context.selectedComponentId === currentComponentId
-      && loaderState.context.selectedMcVersion === mcVersionId
-      ? loaderState.context.builds
-      : getCachedLoaderBuilds(currentComponentId, mcVersionId);
+    const builds =
+      loaderState.context.selectedComponentId === currentComponentId &&
+      loaderState.context.selectedMcVersion === mcVersionId
+        ? loaderState.context.builds
+        : getCachedLoaderBuilds(currentComponentId, mcVersionId);
     const buildId = loaderState.context.selectedBuildId;
-    if (loaderState.context.selectedComponentId === currentComponentId
-      && loaderState.context.selectedMcVersion === mcVersionId
-      && builds
-      && buildId) {
+    if (
+      loaderState.context.selectedComponentId === currentComponentId &&
+      loaderState.context.selectedMcVersion === mcVersionId &&
+      builds &&
+      buildId
+    ) {
       return builds.find((build) => build.build_id === buildId) ?? null;
     }
     return pickPreferredBuild(builds ?? []);
@@ -323,18 +327,15 @@ function CreateCard(): JSX.Element {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mcVersionId, source, currentComponentId, currentSupportedVersions]);
 
-  const loaderLoading = source !== 'vanilla'
-    && currentSupportedVersions == null
-    && (
-      loaderState.kind === 'loading_components'
-      || loaderState.kind === 'loading_versions'
-    );
+  const loaderLoading =
+    source !== 'vanilla' &&
+    currentSupportedVersions == null &&
+    (loaderState.kind === 'loading_components' || loaderState.kind === 'loading_versions');
 
-  const loaderError = source !== 'vanilla'
-    && currentSupportedVersions == null
-    && loaderState.kind === 'error'
-    ? loaderState.context.errorMessage
-    : null;
+  const loaderError =
+    source !== 'vanilla' && currentSupportedVersions == null && loaderState.kind === 'error'
+      ? loaderState.context.errorMessage
+      : null;
 
   const versionReady = Boolean(mcVersionId && (source === 'vanilla' || selectedBuild));
   const canCreate = versionReady && name.trim().length > 0 && !submitting;
@@ -356,9 +357,7 @@ function CreateCard(): JSX.Element {
     try {
       const accentLabel = config.value?.theme ?? '';
       const winSpec = windowPresets.find((p) => p.id === windowPresetId);
-      const dims = winSpec && winSpec.id !== 'default'
-        ? { w: winSpec.w, h: winSpec.h }
-        : null;
+      const dims = winSpec && winSpec.id !== 'default' ? { w: winSpec.w, h: winSpec.h } : null;
       const result = await createInstance({
         name: trimmed,
         versionId: effectiveVersionId,
@@ -388,8 +387,7 @@ function CreateCard(): JSX.Element {
     const handler = (e: KeyboardEvent): void => {
       if (submitting) return;
       const target = e.target as HTMLElement | null;
-      const inField = target != null
-        && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA');
+      const inField = target != null && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA');
 
       if (e.key === 'Enter' && (e.ctrlKey || (!inField && target?.tagName !== 'BUTTON'))) {
         if (step === 'version') {
@@ -412,8 +410,24 @@ function CreateCard(): JSX.Element {
       }
     };
     window.addEventListener('keydown', handler);
-    return () => { window.removeEventListener('keydown', handler); };
-  }, [canCreate, submitting, source, mcVersionId, selectedBuild, name, memoryGB, previewSeed, windowPresets, windowPresetId, jvmPreset, step, versionReady]);
+    return () => {
+      window.removeEventListener('keydown', handler);
+    };
+  }, [
+    canCreate,
+    submitting,
+    source,
+    mcVersionId,
+    selectedBuild,
+    name,
+    memoryGB,
+    previewSeed,
+    windowPresets,
+    windowPresetId,
+    jvmPreset,
+    step,
+    versionReady,
+  ]);
 
   const availableChannelSet = new Set(availableChannels);
   const channelTabs: Channel[] = [
@@ -421,32 +435,31 @@ function CreateCard(): JSX.Element {
     ...availableChannels.filter((c) => !BASE_CHANNEL_TABS.includes(c)),
   ];
 
-  const winSpec = windowPresets.find((p) => p.id === windowPresetId)
-    ?? windowPresets[windowPresets.length - 1]
-    ?? { id: 'default', label: 'Default', w: 0, h: 0 };
+  const winSpec = windowPresets.find((p) => p.id === windowPresetId) ??
+    windowPresets[windowPresets.length - 1] ?? { id: 'default', label: 'Default', w: 0, h: 0 };
   const winSubtitle = winSpec.id === 'default' ? 'Game default' : `${winSpec.w} × ${winSpec.h}`;
 
   return (
     <>
-        <header class="cp-cr-card-head">
-          <div>
-            <h1>Create instance</h1>
-          </div>
-          <IconButton icon="x" tooltip="Close (Esc)" onClick={closeCreate} />
-          <div
-            class="cp-cr-progress"
-            data-step={step}
-            role="status"
-            aria-label={`Create step: ${step === 'version' ? 'Version' : 'Details'}`}
-          >
-            <span data-active={step === 'version'}>Version</span>
-            <i aria-hidden="true" />
-            <span data-active={step === 'details'}>Details</span>
-          </div>
-        </header>
+      <header class="cp-cr-card-head">
+        <div>
+          <h1>Create instance</h1>
+        </div>
+        <IconButton icon="x" tooltip="Close (Esc)" onClick={closeCreate} />
+        <div
+          class="cp-cr-progress"
+          data-step={step}
+          role="status"
+          aria-label={`Create step: ${step === 'version' ? 'Version' : 'Details'}`}
+        >
+          <span data-active={step === 'version'}>Version</span>
+          <i aria-hidden="true" />
+          <span data-active={step === 'details'}>Details</span>
+        </div>
+      </header>
 
-        <div class="cp-cr-card-body" data-step={step}>
-          {step === 'version' ? (
+      <div class="cp-cr-card-body" data-step={step}>
+        {step === 'version' ? (
           <section class="cp-cr-pick" aria-label="Version">
             <div class="cp-cr-sources" role="radiogroup" aria-label="Instance source">
               {LOADER_KEYS.map((key) => (
@@ -458,7 +471,10 @@ function CreateCard(): JSX.Element {
                   role="radio"
                   aria-checked={source === key}
                   title={LOADER_TAGLINES[key]}
-                  onClick={() => { setSource(key); setMcVersionId(null); }}
+                  onClick={() => {
+                    setSource(key);
+                    setMcVersionId(null);
+                  }}
                   onPointerEnter={() => scheduleHoverPrefetch(key)}
                   onPointerLeave={cancelHoverPrefetch}
                   onFocus={() => scheduleHoverPrefetch(key)}
@@ -492,7 +508,9 @@ function CreateCard(): JSX.Element {
                       aria-selected={channel === value}
                       disabled={!available}
                       title={available ? undefined : `No ${CHANNEL_LABEL[value].toLowerCase()} versions here`}
-                      onClick={() => { if (available) setChannel(value); }}
+                      onClick={() => {
+                        if (available) setChannel(value);
+                      }}
                     >
                       {CHANNEL_LABEL[value]}
                     </button>
@@ -511,7 +529,15 @@ function CreateCard(): JSX.Element {
               {!catalogLoading && catalogError && (
                 <div class="cp-cr-state is-error" role="alert" aria-live="polite">
                   <span>Couldn't load the catalog: {catalogError}</span>
-                  <Button variant="ghost" size="sm" onClick={() => { void loadCatalog(); }}>Retry</Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => {
+                      void loadCatalog();
+                    }}
+                  >
+                    Retry
+                  </Button>
                 </div>
               )}
               {!catalogLoading && !catalogError && loaderLoading && (
@@ -579,15 +605,20 @@ function CreateCard(): JSX.Element {
             </div>
 
             <div class="cp-cr-pickfoot" aria-live="polite">
-              {source !== 'vanilla' && mcVersionId && selectedBuild
-                ? <span>{LOADER_LABELS[source]} build <b>{selectedBuild.loader_version}</b></span>
-                : source !== 'vanilla' && mcVersionId
-                  ? <span>Resolving {LOADER_LABELS[source]} build…</span>
-                  : <span>{versionRows.length} version{versionRows.length === 1 ? '' : 's'}</span>}
+              {source !== 'vanilla' && mcVersionId && selectedBuild ? (
+                <span>
+                  {LOADER_LABELS[source]} build <b>{selectedBuild.loader_version}</b>
+                </span>
+              ) : source !== 'vanilla' && mcVersionId ? (
+                <span>Resolving {LOADER_LABELS[source]} build…</span>
+              ) : (
+                <span>
+                  {versionRows.length} version{versionRows.length === 1 ? '' : 's'}
+                </span>
+              )}
             </div>
           </section>
-          ) : (
-
+        ) : (
           <section class="cp-cr-side" aria-label="Instance details">
             <div class="cp-cr-identity">
               <div class="cp-cr-avatar">
@@ -606,27 +637,26 @@ function CreateCard(): JSX.Element {
                 <h2 title={displayName}>{displayName}</h2>
                 <div class="cp-cr-identity-pills">
                   <Pill>{source === 'vanilla' ? 'Vanilla' : LOADER_LABELS[source]}</Pill>
-                  {mcVersionId
-                    ? <Pill>MC {selectedVersionRow?.displayName ?? mcVersionId}</Pill>
-                    : <Pill>No version yet</Pill>}
-                 
+                  {mcVersionId ? (
+                    <Pill>MC {selectedVersionRow?.displayName ?? mcVersionId}</Pill>
+                  ) : (
+                    <Pill>No version yet</Pill>
+                  )}
                 </div>
               </div>
             </div>
 
             <label class="cp-cr-field">
               <span class="cp-cr-field-label">Name</span>
-              <Input
-                value={name}
-                onChange={(v) => setNameOverride(v)}
-                placeholder={suggestedName || 'New instance'}
-              />
+              <Input value={name} onChange={(v) => setNameOverride(v)} placeholder={suggestedName || 'New instance'} />
             </label>
 
             <div class="cp-cr-field">
               <div class="cp-cr-mem-head">
                 <span class="cp-cr-field-label">Memory</span>
-                <span class="cp-cr-mem-reading" aria-live="polite">{fmtMem(memoryGB)}</span>
+                <span class="cp-cr-mem-reading" aria-live="polite">
+                  {fmtMem(memoryGB)}
+                </span>
               </div>
               <Slider
                 value={memoryGB}
@@ -671,61 +701,58 @@ function CreateCard(): JSX.Element {
               </button>
             </div>
           </section>
-          )}
-        </div>
+        )}
+      </div>
 
-        <footer class="cp-cr-card-foot">
-          <span class="cp-cr-footnote" aria-live="polite">
-            {step === 'version'
-              ? (!versionReady
-                ? 'Pick a Minecraft version to continue.'
-                : source === 'vanilla'
-                  ? 'Continue to name and settings.'
-                  : selectedBuild
-                    ? `${LOADER_LABELS[source]} ${selectedBuild.loader_version} selected.`
-                    : `Resolving ${LOADER_LABELS[source]} build...`)
-              : !versionReady
+      <footer class="cp-cr-card-foot">
+        <span class="cp-cr-footnote" aria-live="polite">
+          {step === 'version'
+            ? !versionReady
+              ? 'Pick a Minecraft version to continue.'
+              : source === 'vanilla'
+                ? 'Continue to name and settings.'
+                : selectedBuild
+                  ? `${LOADER_LABELS[source]} ${selectedBuild.loader_version} selected.`
+                  : `Resolving ${LOADER_LABELS[source]} build...`
+            : !versionReady
               ? 'Pick a Minecraft version to continue.'
               : canCreate
                 ? 'Enter creates the instance.'
                 : 'Name your instance to create it.'}
-          </span>
-          <div class="cp-cr-foot-actions">
-            {step === 'version' ? (
-              <>
-                <Button variant="ghost" onClick={closeCreate} disabled={submitting}>
-                  Cancel
-                </Button>
-                <Button
-                  trailing={<Icon name="arrow-right" size={15} stroke={1.8} />}
-                  onClick={continueToDetails}
-                  disabled={!versionReady || submitting}
-                >
-                  Continue
-                </Button>
-              </>
-            ) : (
-              <>
-                <Button
-                  variant="ghost"
-                  icon="arrow-left"
-                  onClick={() => setStep('version')}
-                  disabled={submitting}
-                >
-                  Back
-                </Button>
-                <Button
-                  icon="plus"
-                  onClick={() => { void submit(); }}
-                  disabled={!canCreate}
-                  sound="affirm"
-                >
-                  {submitting ? 'Creating…' : 'Create instance'}
-                </Button>
-              </>
-            )}
-          </div>
-        </footer>
+        </span>
+        <div class="cp-cr-foot-actions">
+          {step === 'version' ? (
+            <>
+              <Button variant="ghost" onClick={closeCreate} disabled={submitting}>
+                Cancel
+              </Button>
+              <Button
+                trailing={<Icon name="arrow-right" size={15} stroke={1.8} />}
+                onClick={continueToDetails}
+                disabled={!versionReady || submitting}
+              >
+                Continue
+              </Button>
+            </>
+          ) : (
+            <>
+              <Button variant="ghost" icon="arrow-left" onClick={() => setStep('version')} disabled={submitting}>
+                Back
+              </Button>
+              <Button
+                icon="plus"
+                onClick={() => {
+                  void submit();
+                }}
+                disabled={!canCreate}
+                sound="affirm"
+              >
+                {submitting ? 'Creating…' : 'Create instance'}
+              </Button>
+            </>
+          )}
+        </div>
+      </footer>
     </>
   );
 }

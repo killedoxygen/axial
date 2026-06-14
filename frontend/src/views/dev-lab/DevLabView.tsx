@@ -43,12 +43,16 @@ function IdentityWorkbench(): JSX.Element {
       <Card>
         <SectionHeading
           title="Instance identity tiles"
-          right={(
+          right={
             <div class="cp-dev-lab-actions">
-              <Button variant="secondary" size="sm" icon="refresh" onClick={derive}>Derive</Button>
-              <Button size="sm" icon="refresh" onClick={randomize}>Randomize</Button>
+              <Button variant="secondary" size="sm" icon="refresh" onClick={derive}>
+                Derive
+              </Button>
+              <Button size="sm" icon="refresh" onClick={randomize}>
+                Randomize
+              </Button>
             </div>
-          )}
+          }
         />
         <div class="cp-dev-art-controls">
           <label>
@@ -95,7 +99,9 @@ export function DevLabView(): JSX.Element {
       </div>
 
       <div class="cp-dev-tabs">
-        <button type="button" data-active={tab === 'identity'} onClick={() => setTab('identity')}>Identity tiles</button>
+        <button type="button" data-active={tab === 'identity'} onClick={() => setTab('identity')}>
+          Identity tiles
+        </button>
       </div>
 
       {tab === 'identity' && <IdentityWorkbench />}

@@ -6,9 +6,7 @@
   align-items: center;
   justify-content: center;
   padding: 32px;
-  background:
-    radial-gradient(circle at 30% 20%, var(--accent-soft), transparent 60%),
-    var(--bg-deep);
+  background: radial-gradient(circle at 30% 20%, var(--accent-soft), transparent 60%), var(--bg-deep);
   animation: cp-fade-in 200ms ease;
 }
 .cp-setup-card {
@@ -52,7 +50,7 @@
   position: relative;
 }
 .cp-setup-progress::after {
-  content: "";
+  content: '';
   position: absolute;
   inset: 0;
   width: 40%;
@@ -61,14 +59,18 @@
   animation: cp-indet 1.2s ease-in-out infinite;
 }
 @keyframes cp-indet {
-  0%   { left: -40%; }
-  100% { left: 100%; }
+  0% {
+    left: -40%;
+  }
+  100% {
+    left: 100%;
+  }
 }
 .cp-setup-error {
   padding: 10px 12px;
   border-radius: var(--r-sm);
-  background: oklch(0.70 0.18 25 / 0.14);
+  background: oklch(0.7 0.18 25 / 0.14);
   color: var(--err);
-  border: 1px solid oklch(0.70 0.18 25 / 0.28);
+  border: 1px solid oklch(0.7 0.18 25 / 0.28);
   font-size: 12.5px;
 }

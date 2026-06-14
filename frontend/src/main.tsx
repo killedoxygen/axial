@@ -3,8 +3,15 @@ import './styles';
 import { App } from './App';
 import { local } from './state';
 import {
-  appVersion, bootstrapError, bootstrapState, config, instances, lastInstanceId,
-  systemInfo, versions, devMode,
+  appVersion,
+  bootstrapError,
+  bootstrapState,
+  config,
+  instances,
+  lastInstanceId,
+  systemInfo,
+  versions,
+  devMode,
 } from './store';
 import { api, initializeApiBase } from './api';
 import { applyTheme } from './theme';
@@ -63,10 +70,7 @@ async function init(): Promise<void> {
       instances.value = [];
       lastInstanceId.value = null;
     } else {
-      const [versionsRes, instancesRes] = await Promise.all([
-        api('GET', '/versions'),
-        api('GET', '/instances'),
-      ]);
+      const [versionsRes, instancesRes] = await Promise.all([api('GET', '/versions'), api('GET', '/instances')]);
       versions.value = versionsRes.versions || [];
       instances.value = instancesRes.instances || [];
       lastInstanceId.value = instancesRes.last_instance_id || null;
@@ -89,11 +93,7 @@ async function init(): Promise<void> {
     const startupWarnings = Array.isArray(statusRes?.warnings) ? statusRes.warnings : [];
     const shownStartupWarnings = new Set<string>();
     for (const startupWarning of startupWarnings) {
-      if (
-        typeof startupWarning === 'string'
-        && startupWarning.trim()
-        && !shownStartupWarnings.has(startupWarning)
-      ) {
+      if (typeof startupWarning === 'string' && startupWarning.trim() && !shownStartupWarnings.has(startupWarning)) {
         shownStartupWarnings.add(startupWarning);
         toast(startupWarning, 'info');
       }
@@ -102,7 +102,9 @@ async function init(): Promise<void> {
     if (!setupRequired && configRes && configRes.onboarding_done === false) {
       showOnboardingOverlay.value = true;
     } else if (!setupRequired && Music.enabled) {
-      const startMusic = (): void => { void Music.play(); };
+      const startMusic = (): void => {
+        void Music.play();
+      };
       window.addEventListener('pointerdown', startMusic, { once: true, capture: true });
       window.addEventListener('keydown', startMusic, { once: true, capture: true });
     }
@@ -117,7 +119,9 @@ async function init(): Promise<void> {
     bootstrapState.value = 'error';
   }
 
-  const activateSound = (): void => { Sound.activate(); };
+  const activateSound = (): void => {
+    Sound.activate();
+  };
   window.addEventListener('pointerdown', activateSound, { once: true, capture: true });
   window.addEventListener('touchstart', activateSound, { once: true, capture: true });
   window.addEventListener('keydown', activateSound, { once: true, capture: true });
@@ -126,9 +130,10 @@ async function init(): Promise<void> {
 function registerNativeCloseBlockedToast(): void {
   if (!hasNativeDesktopRuntime()) return;
   void onNativeEvent(nativeDesktopCloseBlockedEventName, (data: any) => {
-    const message = typeof data?.error === 'string' && data.error.trim()
-      ? data.error.trim()
-      : 'Close is blocked while installs or launches are active.';
+    const message =
+      typeof data?.error === 'string' && data.error.trim()
+        ? data.error.trim()
+        : 'Close is blocked while installs or launches are active.';
     toast(message, 'error');
   }).catch((err: unknown) => {
     console.error('Failed to register native close guard listener', err);

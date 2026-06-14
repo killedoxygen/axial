@@ -47,7 +47,7 @@ function loaderLabel(v: Version | undefined): string {
 
 export function InstanceDetailView({ id }: { id: string }): JSX.Element {
   const theme = useTheme();
-  const inst = instances.value.find(i => i.id === id) as EnrichedInstance | undefined;
+  const inst = instances.value.find((i) => i.id === id) as EnrichedInstance | undefined;
   const [tab, setTab] = useState<Tab>('overview');
   const [resources, setResources] = useState<ResourceLoadState>({ status: 'loading', data: null });
   const running = inst ? !!runningSessions.value[inst.id] : false;
@@ -59,11 +59,13 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
     setResources((current) => ({ status: 'loading', data: current.data ?? null }));
     void fetchInstanceResources(inst.id)
       .then((data) => setResources({ status: 'ready', data }))
-      .catch((err) => setResources((current) => ({
-        status: 'error',
-        data: current.data ?? null,
-        error: errMessage(err),
-      })));
+      .catch((err) =>
+        setResources((current) => ({
+          status: 'error',
+          data: current.data ?? null,
+          error: errMessage(err),
+        })),
+      );
   };
 
   useEffect(() => {
@@ -77,7 +79,9 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
       .catch((err) => {
         if (alive) setResources({ status: 'error', data: null, error: errMessage(err) });
       });
-    return () => { alive = false; };
+    return () => {
+      alive = false;
+    };
   }, [inst?.id]);
 
   useEffect(() => {
@@ -113,7 +117,9 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
           <Icon name="stack" size={36} color="var(--text-mute)" />
           <h2>Instance not found</h2>
           <p>That instance might have been deleted.</p>
-          <Button icon="chevron-left" onClick={() => navigate({ name: 'instances' })}>Back to instances</Button>
+          <Button icon="chevron-left" onClick={() => navigate({ name: 'instances' })}>
+            Back to instances
+          </Button>
         </div>
       </div>
     );
@@ -185,21 +191,32 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
             </div>
             <div class="cp-instance-titlebar-text">
               <div class="cp-instance-pills-row">
-                <Pill>{loaderLabel(v)}{loaderVer ? ` ${loaderVer}` : ''}</Pill>
+                <Pill>
+                  {loaderLabel(v)}
+                  {loaderVer ? ` ${loaderVer}` : ''}
+                </Pill>
                 <span class="cp-instance-mc-version">Minecraft {mcVer}</span>
               </div>
               <h1 class="cp-instance-title">{inst.name}</h1>
               <div class="cp-instance-subtitle">
-                <span>Last played <b>{fmtRelative(inst.last_played_at)}</b></span>
-                <span class="cp-instance-subtitle-sep" aria-hidden="true">·</span>
-                <span>Created <b>{fmtJoined(inst.created_at)}</b></span>
+                <span>
+                  Last played <b>{fmtRelative(inst.last_played_at)}</b>
+                </span>
+                <span class="cp-instance-subtitle-sep" aria-hidden="true">
+                  ·
+                </span>
+                <span>
+                  Created <b>{fmtJoined(inst.created_at)}</b>
+                </span>
               </div>
             </div>
           </div>
           <div class="cp-instance-actions">
             <div class="cp-instance-launch">
               {running ? (
-                <Button variant="secondary" size="lg" icon="stop" onClick={onStop}>Stop</Button>
+                <Button variant="secondary" size="lg" icon="stop" onClick={onStop}>
+                  Stop
+                </Button>
               ) : (
                 <LaunchSplitButton
                   inst={inst}
@@ -214,23 +231,41 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
                 />
               )}
             </div>
-            <IconButton icon="dots" tooltip="More"
-              onClick={(e) => openContextMenu(e, [
-                { icon: 'folder', label: 'Open folder', onSelect: () => void openInstanceFolder(inst.id) },
-                { icon: 'folder', label: 'Open resource packs folder', onSelect: () => void openInstanceFolder(inst.id, 'resourcepacks') },
-                { icon: 'folder', label: 'Open shader packs folder', onSelect: () => void openInstanceFolder(inst.id, 'shaderpacks') },
-                { icon: 'copy', label: 'Duplicate', onSelect: () => void duplicateInstance(inst) },
-                { icon: 'edit', label: 'Rename', onSelect: () => void renameInstance(inst) },
-                { label: '', onSelect: () => {}, divider: true },
-                { icon: 'trash', label: 'Delete', onSelect: () => void deleteInstanceFlow(inst, () => navigate({ name: 'instances' })), danger: true },
-              ])} />
+            <IconButton
+              icon="dots"
+              tooltip="More"
+              onClick={(e) =>
+                openContextMenu(e, [
+                  { icon: 'folder', label: 'Open folder', onSelect: () => void openInstanceFolder(inst.id) },
+                  {
+                    icon: 'folder',
+                    label: 'Open resource packs folder',
+                    onSelect: () => void openInstanceFolder(inst.id, 'resourcepacks'),
+                  },
+                  {
+                    icon: 'folder',
+                    label: 'Open shader packs folder',
+                    onSelect: () => void openInstanceFolder(inst.id, 'shaderpacks'),
+                  },
+                  { icon: 'copy', label: 'Duplicate', onSelect: () => void duplicateInstance(inst) },
+                  { icon: 'edit', label: 'Rename', onSelect: () => void renameInstance(inst) },
+                  { label: '', onSelect: () => {}, divider: true },
+                  {
+                    icon: 'trash',
+                    label: 'Delete',
+                    onSelect: () => void deleteInstanceFlow(inst, () => navigate({ name: 'instances' })),
+                    danger: true,
+                  },
+                ])
+              }
+            />
           </div>
         </div>
       </div>
 
       {!installLocked && (
         <div class="cp-instance-tabs" role="tablist">
-          {visibleTabs.map(t => {
+          {visibleTabs.map((t) => {
             const count = tabCount(t.id);
             return (
               <button
@@ -276,14 +311,27 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
             onOpenLogs={() => setTab('logs')}
           />
           <div class="cp-instance-bottom">
-            <LogsCard instanceId={inst.id} resources={resources.data} running={running} onOpenLogs={() => setTab('logs')} />
+            <LogsCard
+              instanceId={inst.id}
+              resources={resources.data}
+              running={running}
+              onOpenLogs={() => setTab('logs')}
+            />
           </div>
         </>
       )}
-      {!installLocked && activeTab === 'mods' && <ModsPane inst={inst} resources={resources} onRefresh={reloadResources} />}
-      {!installLocked && activeTab === 'worlds' && <WorldsPane inst={inst} resources={resources} onRefresh={reloadResources} />}
-      {!installLocked && activeTab === 'screenshots' && <ScreenshotsPane inst={inst} resources={resources} onRefresh={reloadResources} />}
-      {!installLocked && activeTab === 'logs' && <LogsPane inst={inst} resources={resources} running={running} onRefresh={reloadResources} />}
+      {!installLocked && activeTab === 'mods' && (
+        <ModsPane inst={inst} resources={resources} onRefresh={reloadResources} />
+      )}
+      {!installLocked && activeTab === 'worlds' && (
+        <WorldsPane inst={inst} resources={resources} onRefresh={reloadResources} />
+      )}
+      {!installLocked && activeTab === 'screenshots' && (
+        <ScreenshotsPane inst={inst} resources={resources} onRefresh={reloadResources} />
+      )}
+      {!installLocked && activeTab === 'logs' && (
+        <LogsPane inst={inst} resources={resources} running={running} onRefresh={reloadResources} />
+      )}
       {!installLocked && activeTab === 'settings' && <SettingsPane inst={inst} />}
     </div>
   );

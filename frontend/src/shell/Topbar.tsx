@@ -5,7 +5,15 @@ import { IconButton } from '../ui/Atoms';
 import { WindowControls } from './WindowControls';
 import { MusicWidget } from './MusicWidget';
 import { goBack, goForward, navigate, route } from '../ui-state';
-import { runningSessions, instances, versionById, launchState, installState, installQueue, installFailure } from '../store';
+import {
+  runningSessions,
+  instances,
+  versionById,
+  launchState,
+  installState,
+  installQueue,
+  installFailure,
+} from '../store';
 import { minecraftVersionLabel } from '../version-display';
 import { windowStartDragging, windowToggleMaximize, hasNativeDesktopRuntime } from '../native';
 import { launchStageViewFrom } from '../launch-stages';
@@ -19,23 +27,27 @@ function assertUnreachable(value: never): never {
 function crumbsFor(): { label: string; onClick?: () => void }[] {
   const r = route.value;
   switch (r.name) {
-    case 'home': return [{ label: 'Home' }];
-    case 'instances': return [{ label: 'Instances' }];
+    case 'home':
+      return [{ label: 'Home' }];
+    case 'instances':
+      return [{ label: 'Instances' }];
     case 'instance': {
-      const inst = instances.value.find(i => i.id === r.id);
+      const inst = instances.value.find((i) => i.id === r.id);
       return [
         { label: 'Instances', onClick: () => navigate({ name: 'instances' }) },
         { label: inst?.name || 'Instance' },
       ];
     }
-    case 'dev-lab': return [
-      { label: 'Settings', onClick: () => navigate({ name: 'settings' }) },
-      { label: 'Dev lab' },
-    ];
-    case 'downloads': return [{ label: 'Downloads' }];
-    case 'accounts': return [{ label: 'Accounts & skins' }];
-    case 'settings': return [{ label: 'Settings' }];
-    default: return assertUnreachable(r);
+    case 'dev-lab':
+      return [{ label: 'Settings', onClick: () => navigate({ name: 'settings' }) }, { label: 'Dev lab' }];
+    case 'downloads':
+      return [{ label: 'Downloads' }];
+    case 'accounts':
+      return [{ label: 'Accounts & skins' }];
+    case 'settings':
+      return [{ label: 'Settings' }];
+    default:
+      return assertUnreachable(r);
   }
 }
 
@@ -72,7 +84,7 @@ function StatusPill(): JSX.Element {
   ]);
 
   const runIds = Object.keys(sessions);
-  const inst = runIds.length > 0 ? instances.value.find(i => i.id === runIds[0]) : null;
+  const inst = runIds.length > 0 ? instances.value.find((i) => i.id === runIds[0]) : null;
   const session = runIds.length > 0 ? sessions[runIds[0]] : null;
 
   if (inst && session) {
@@ -97,7 +109,11 @@ function StatusPill(): JSX.Element {
     const queuedLabel = queuedCount > 0 ? ` · ${queuedCount} queued` : '';
     const installPct = Math.round(Math.max(0, Math.min(100, install.pct)));
     const installPhase = install.phase ? ` · ${install.phase.replace(/_/g, ' ')}` : '';
-    const installRemainingSeconds = countDownRemainingSeconds(install.remainingSeconds, install.remainingSecondsUpdatedAt, etaNow);
+    const installRemainingSeconds = countDownRemainingSeconds(
+      install.remainingSeconds,
+      install.remainingSecondsUpdatedAt,
+      etaNow,
+    );
     const installEta = installRemainingSeconds ? formatRemainingTime(installRemainingSeconds) : null;
     const installName = install.displayName || install.versionId;
     const installTag = install.item.loader?.minecraftVersion || versionTag(install.versionId);
@@ -123,10 +139,13 @@ function StatusPill(): JSX.Element {
 
   const launch = launchState.value;
   if (launch.status === 'preparing') {
-    const li = instances.value.find(i => i.id === launch.instanceId);
+    const li = instances.value.find((i) => i.id === launch.instanceId);
     const prepTag = versionTag(li?.version_id);
     return (
-      <span class="cp-status-pill cp-status-pill--preparing cp-nodrag" title={`${launch.label} · ${li?.name || 'launch'}`}>
+      <span
+        class="cp-status-pill cp-status-pill--preparing cp-nodrag"
+        title={`${launch.label} · ${li?.name || 'launch'}`}
+      >
         <StatusMark icon="clock" />
         <span class="cp-status-pill-label">{launch.label}</span>
         {prepTag && <span class="cp-status-pill-meta">{prepTag}</span>}
@@ -195,11 +214,7 @@ export function Topbar(): JSX.Element {
 
   const crumbs = crumbsFor();
   return (
-    <div
-      class="cp-topbar cp-drag"
-      onMouseDown={onDragAreaMouseDown}
-      onDblClick={onDragAreaDoubleClick}
-    >
+    <div class="cp-topbar cp-drag" onMouseDown={onDragAreaMouseDown} onDblClick={onDragAreaDoubleClick}>
       <div class="cp-nodrag" style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
         <IconButton icon="arrow-left" size={28} tooltip="Back" onClick={goBack} />
         <IconButton icon="arrow-right" size={28} tooltip="Forward" onClick={goForward} />
@@ -220,7 +235,9 @@ export function Topbar(): JSX.Element {
                 padding: 0,
                 cursor: c.onClick ? 'pointer' : 'default',
               }}
-            >{c.label}</button>
+            >
+              {c.label}
+            </button>
           </div>
         ))}
       </div>

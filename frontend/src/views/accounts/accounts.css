@@ -186,7 +186,9 @@ button.cp-skin-nametag--editable:focus-visible {
 }
 
 .cp-cape-choice {
-  transition: filter 120ms ease, scale 70ms ease;
+  transition:
+    filter 120ms ease,
+    scale 70ms ease;
 }
 .cp-cape-choice:hover {
   filter: brightness(1.12);
@@ -371,7 +373,10 @@ html[data-color-mode='light'] .cp-cape-choice:hover {
   font: inherit;
   cursor: pointer;
   overflow: hidden;
-  transition: background 150ms ease, box-shadow 150ms ease, scale 70ms ease;
+  transition:
+    background 150ms ease,
+    box-shadow 150ms ease,
+    scale 70ms ease;
 }
 .cp-skin-tile:hover {
   background: var(--surface-3);
@@ -424,8 +429,7 @@ html[data-color-mode='light'] .cp-cape-choice:hover {
   transform: scale(1.045) translateY(-1.5%);
 }
 span.cp-skin-tile__img[data-snapshot='loading'] {
-  background:
-    radial-gradient(48% 38% at 50% 42%, color-mix(in oklab, var(--text) 6%, transparent), transparent 72%);
+  background: radial-gradient(48% 38% at 50% 42%, color-mix(in oklab, var(--text) 6%, transparent), transparent 72%);
 }
 .cp-skin-tile__state {
   position: absolute;
@@ -497,7 +501,10 @@ span.cp-skin-tile__img[data-snapshot='loading'] {
   color: var(--text-mute);
   font: inherit;
   cursor: pointer;
-  transition: color 130ms ease, border-color 130ms ease, background 130ms ease;
+  transition:
+    color 130ms ease,
+    border-color 130ms ease,
+    background 130ms ease;
 }
 .cp-skin-add-tile:hover,
 .cp-skin-add-tile:focus-visible {

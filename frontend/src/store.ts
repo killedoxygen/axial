@@ -1,7 +1,17 @@
 import { signal, computed } from '@preact/signals';
 import type {
-  Instance, Version, Config, SystemInfo,
-  RunningSession, InstallItem, Catalog, Page, ToastItem, UpdateInfo, InstanceLaunchDraft, LaunchNotice,
+  Instance,
+  Version,
+  Config,
+  SystemInfo,
+  RunningSession,
+  InstallItem,
+  Catalog,
+  Page,
+  ToastItem,
+  UpdateInfo,
+  InstanceLaunchDraft,
+  LaunchNotice,
 } from './types';
 import type { LaunchStage } from './launch-stages';
 
@@ -22,12 +32,12 @@ export const selectedInstanceId = signal<string | null>(null);
 export const selectedInstance = computed<Instance | null>(() => {
   const id = selectedInstanceId.value;
   if (!id) return null;
-  return instances.value.find(i => i.id === id) ?? null;
+  return instances.value.find((i) => i.id === id) ?? null;
 });
 
 export function versionById(id: string | undefined): Version | undefined {
   if (!id) return undefined;
-  return versions.value.find(v => v.id === id);
+  return versions.value.find((v) => v.id === id);
 }
 
 export const selectedVersion = computed<Version | null>(() => {
@@ -47,18 +57,18 @@ export type InstallStepProgress = {
 export type InstallState =
   | { status: 'idle' }
   | {
-    status: 'active';
-    item: InstallItem;
-    versionId: string;
-    displayName?: string;
-    pct: number;
-    label: string;
-    phase?: string;
-    activeStep?: InstallStepProgress;
-    remainingSeconds?: number;
-    remainingSecondsUpdatedAt?: number;
-    startedAt: number;
-  };
+      status: 'active';
+      item: InstallItem;
+      versionId: string;
+      displayName?: string;
+      pct: number;
+      label: string;
+      phase?: string;
+      activeStep?: InstallStepProgress;
+      remainingSeconds?: number;
+      remainingSecondsUpdatedAt?: number;
+      startedAt: number;
+    };
 
 export type InstallFailure = {
   item: InstallItem;
@@ -116,23 +126,23 @@ export const filteredInstances = computed<Instance[]>(() => {
   const isRelease = (version: Version | undefined) =>
     version?.lifecycle?.channel === 'stable' && version.lifecycle.labels.includes('release');
   const isSnapshot = (version: Version | undefined) =>
-    !!version?.lifecycle
-    && !version.lifecycle.labels.includes('old_beta')
-    && !version.lifecycle.labels.includes('old_alpha')
-    && (version.lifecycle.channel === 'preview' || version.lifecycle.channel === 'experimental');
+    !!version?.lifecycle &&
+    !version.lifecycle.labels.includes('old_beta') &&
+    !version.lifecycle.labels.includes('old_alpha') &&
+    (version.lifecycle.channel === 'preview' || version.lifecycle.channel === 'experimental');
 
   if (filter === 'release') {
-    list = list.filter(inst => {
+    list = list.filter((inst) => {
       const v = vm.get(inst.version_id);
       return isRelease(v) && !v?.inherits_from;
     });
   } else if (filter === 'snapshot') {
-    list = list.filter(inst => {
+    list = list.filter((inst) => {
       const v = vm.get(inst.version_id);
       return isSnapshot(v) && !v?.inherits_from;
     });
   } else if (filter === 'modded') {
-    list = list.filter(inst => {
+    list = list.filter((inst) => {
       const v = vm.get(inst.version_id);
       return !!v?.inherits_from;
     });
@@ -140,10 +150,7 @@ export const filteredInstances = computed<Instance[]>(() => {
 
   if (search) {
     const q = search.toLowerCase();
-    list = list.filter(inst =>
-      inst.name.toLowerCase().includes(q) ||
-      inst.version_id.toLowerCase().includes(q)
-    );
+    list = list.filter((inst) => inst.name.toLowerCase().includes(q) || inst.version_id.toLowerCase().includes(q));
   }
 
   return list;

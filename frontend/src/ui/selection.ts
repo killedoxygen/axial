@@ -16,10 +16,7 @@ export interface SelectionState<T> {
   selectOnly: (id: string) => void;
 }
 
-export function useSelection<T>(
-  items: T[],
-  getId: (item: T) => string,
-): SelectionState<T> {
+export function useSelection<T>(items: T[], getId: (item: T) => string): SelectionState<T> {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
   const itemIds = useMemo(() => items.map(getId), [items, getId]);
   const idSet = useMemo(() => new Set(itemIds), [itemIds]);
@@ -55,20 +52,22 @@ export function useSelection<T>(
     someSelected,
     isSelected: (id) => selectedIds.has(id),
     select: (id) => setSelectedIds((current) => new Set(current).add(id)),
-    deselect: (id) => setSelectedIds((current) => {
-      const next = new Set(current);
-      next.delete(id);
-      return next;
-    }),
-    toggle: (id) => setSelectedIds((current) => {
-      const next = new Set(current);
-      if (next.has(id)) {
+    deselect: (id) =>
+      setSelectedIds((current) => {
+        const next = new Set(current);
         next.delete(id);
-      } else {
-        next.add(id);
-      }
-      return next;
-    }),
+        return next;
+      }),
+    toggle: (id) =>
+      setSelectedIds((current) => {
+        const next = new Set(current);
+        if (next.has(id)) {
+          next.delete(id);
+        } else {
+          next.add(id);
+        }
+        return next;
+      }),
     clear: () => setSelectedIds(new Set()),
     selectAll: () => setSelectedIds(new Set(itemIds)),
     selectOnly: (id) => setSelectedIds(new Set([id])),

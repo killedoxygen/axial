@@ -3,12 +3,7 @@ import { Button } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { apiResourceUrl } from '../../api';
 import type { DefaultSkin } from '../../default-skins';
-import {
-  capeFileUrl,
-  lookupCapeFileUrl,
-  lookupSkinFileUrl,
-  savedSkinFileUrl,
-} from './api';
+import { capeFileUrl, lookupCapeFileUrl, lookupSkinFileUrl, savedSkinFileUrl } from './api';
 import { LazySkinThreePreview as SkinThreePreview } from './LazySkinThreePreview';
 import type {
   AuthStatusState,

@@ -7,8 +7,18 @@ type BtnVariant = 'primary' | 'secondary' | 'soft' | 'ghost' | 'danger';
 type BtnSize = 'sm' | 'md' | 'lg';
 
 export function Button({
-  children, variant = 'primary', size = 'md', icon, trailing,
-  onClick, style, disabled, full, title, buttonRef, sound,
+  children,
+  variant = 'primary',
+  size = 'md',
+  icon,
+  trailing,
+  onClick,
+  style,
+  disabled,
+  full,
+  title,
+  buttonRef,
+  sound,
 }: {
   children?: ComponentChildren;
   variant?: BtnVariant;
@@ -42,7 +52,15 @@ export function Button({
 }
 
 export function IconButton({
-  icon, onClick, size = 32, active, style, tooltip, disabled, danger, variant,
+  icon,
+  onClick,
+  size = 32,
+  active,
+  style,
+  tooltip,
+  disabled,
+  danger,
+  variant,
 }: {
   icon: string;
   onClick?: (e: MouseEvent) => void;
@@ -56,9 +74,7 @@ export function IconButton({
 }): JSX.Element {
   const inner = Math.round(size * 0.55);
   const cls = `cp-ibtn${active ? ' cp-ibtn--active' : ''}${danger ? ' cp-ibtn--danger' : ''}`;
-  const overlay: JSX.CSSProperties = variant === 'overlay'
-    ? { background: 'rgba(0,0,0,0.3)', color: 'white' }
-    : {};
+  const overlay: JSX.CSSProperties = variant === 'overlay' ? { background: 'rgba(0,0,0,0.3)', color: 'white' } : {};
   return (
     <button
       class={cls}
@@ -73,7 +89,10 @@ export function IconButton({
 }
 
 export function Pill({
-  children, tone = 'neutral', icon, style,
+  children,
+  tone = 'neutral',
+  icon,
+  style,
 }: {
   children?: ComponentChildren;
   tone?: Tone;
@@ -95,17 +114,25 @@ export function Kbd({ children }: { children: ComponentChildren }): JSX.Element 
 
 export function Divider({ vertical, style }: { vertical?: boolean; style?: JSX.CSSProperties }): JSX.Element {
   return (
-    <div style={{
-      background: 'var(--line)',
-      width: vertical ? 1 : '100%',
-      height: vertical ? '100%' : 1,
-      flexShrink: 0,
-      ...style,
-    }} />
+    <div
+      style={{
+        background: 'var(--line)',
+        width: vertical ? 1 : '100%',
+        height: vertical ? '100%' : 1,
+        flexShrink: 0,
+        ...style,
+      }}
+    />
   );
 }
 
-export function Meter({ value, tone = 'accent', height = 4, style, ariaLabel }: {
+export function Meter({
+  value,
+  tone = 'accent',
+  height = 4,
+  style,
+  ariaLabel,
+}: {
   value: number;
   tone?: 'accent' | 'ok' | 'warn' | 'err';
   height?: number;
@@ -130,14 +157,18 @@ export function Meter({ value, tone = 'accent', height = 4, style, ariaLabel }: 
   );
 }
 
-export function Segmented<T extends string>({ options, value, onChange }: {
+export function Segmented<T extends string>({
+  options,
+  value,
+  onChange,
+}: {
   options: Array<T | { value: T; label: string }>;
   value: T;
   onChange: (v: T) => void;
 }): JSX.Element {
   return (
     <div class="cp-seg">
-      {options.map(opt => {
+      {options.map((opt) => {
         const v = typeof opt === 'string' ? opt : opt.value;
         const label = typeof opt === 'string' ? opt : opt.label;
         return (
@@ -151,8 +182,18 @@ export function Segmented<T extends string>({ options, value, onChange }: {
 }
 
 export function Input({
-  value, onChange, placeholder, icon, trailing, style, type = 'text', autoFocus, onKeyDown,
-  onFocus, onBlur, inputRef,
+  value,
+  onChange,
+  placeholder,
+  icon,
+  trailing,
+  style,
+  type = 'text',
+  autoFocus,
+  onKeyDown,
+  onFocus,
+  onBlur,
+  inputRef,
 }: {
   value: string;
   onChange: (v: string) => void;
@@ -180,8 +221,14 @@ export function Input({
         autoFocus={autoFocus}
         onKeyDown={onKeyDown as any}
         onInput={(e: any) => onChange(e.currentTarget.value)}
-        onFocus={() => { setFocus(true); onFocus?.(); }}
-        onBlur={() => { setFocus(false); onBlur?.(); }}
+        onFocus={() => {
+          setFocus(true);
+          onFocus?.();
+        }}
+        onBlur={() => {
+          setFocus(false);
+          onBlur?.();
+        }}
         placeholder={placeholder}
       />
       {trailing}
@@ -189,7 +236,13 @@ export function Input({
   );
 }
 
-export function Card({ children, padding = 18, style, onClick, class: cls }: {
+export function Card({
+  children,
+  padding = 18,
+  style,
+  onClick,
+  class: cls,
+}: {
   children?: ComponentChildren;
   padding?: number;
   style?: JSX.CSSProperties;
@@ -203,16 +256,18 @@ export function Card({ children, padding = 18, style, onClick, class: cls }: {
   );
 }
 
-export function SectionHeading({ title, action, right }: {
+export function SectionHeading({
+  title,
+  action,
+  right,
+}: {
   title?: string;
   action?: { label: string; onClick?: () => void };
   right?: ComponentChildren;
 }): JSX.Element {
   return (
     <div class="cp-section-head">
-      <div style={{ flex: 1, minWidth: 0 }}>
-        {title && <h2>{title}</h2>}
-      </div>
+      <div style={{ flex: 1, minWidth: 0 }}>{title && <h2>{title}</h2>}</div>
       {right}
       {action && (
         <button class="cp-section-action" onClick={action.onClick}>

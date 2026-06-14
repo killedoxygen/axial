@@ -15,7 +15,10 @@ export function dismissToast(id: number): void {
 
 function scheduleToastRemoval(item: ToastItem): void {
   const duration = item.type === 'error' ? 5000 : 3000;
-  toastTimers.set(item.id, setTimeout(() => dismissToast(item.id), duration));
+  toastTimers.set(
+    item.id,
+    setTimeout(() => dismissToast(item.id), duration),
+  );
 }
 
 export function toast(message: string, type: ToastKind = 'success'): void {

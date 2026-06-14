@@ -21,14 +21,21 @@ export function WorldsPane({
   onRefresh: () => void;
 }): JSX.Element {
   const worlds = resources.data?.worlds ?? [];
-  const selection = useSelection(worlds, useCallback((world) => world.name, []));
+  const selection = useSelection(
+    worlds,
+    useCallback((world) => world.name, []),
+  );
   const menuItems = (worldName: string) => [
     selectionMenuItem(selection, worldName),
     { divider: true, label: '', onSelect: () => undefined },
     ...worldMenuItems(inst, worldName, onRefresh),
   ];
   const deleteSelected = async (): Promise<void> => {
-    await deleteWorlds(inst, selection.selectedItems.map((world) => world.name), clearAndRefresh);
+    await deleteWorlds(
+      inst,
+      selection.selectedItems.map((world) => world.name),
+      clearAndRefresh,
+    );
   };
   const clearAndRefresh = (): void => {
     selection.clear();
@@ -44,7 +51,11 @@ export function WorldsPane({
       />
       <ResourceStatus state={resources} onRetry={onRefresh} />
       {worlds.length === 0 && resources.status !== 'loading' ? (
-        <ResourceEmpty icon="globe" title="No saves yet" hint="Create a world in Minecraft or place an existing save in this instance's saves folder." />
+        <ResourceEmpty
+          icon="globe"
+          title="No saves yet"
+          hint="Create a world in Minecraft or place an existing save in this instance's saves folder."
+        />
       ) : (
         <div class="cp-resource-list">
           {worlds.map((world) => (
@@ -54,7 +65,7 @@ export function WorldsPane({
               name={world.name}
               meta={`${fmtBytes(world.size)} · changed ${fmtRelative(world.modified_at)}`}
               selected={selection.isSelected(world.name)}
-              leading={(
+              leading={
                 <SelectionCheckbox
                   selected={selection.isSelected(world.name)}
                   label={selectionToggleLabel(selection.isSelected(world.name), world.name)}
@@ -63,9 +74,9 @@ export function WorldsPane({
                     selection.toggle(world.name);
                   }}
                 />
-              )}
+              }
               onContextMenu={(e) => openContextMenu(e, menuItems(world.name))}
-              actions={(
+              actions={
                 <button
                   class="cp-resource-action"
                   type="button"
@@ -74,7 +85,7 @@ export function WorldsPane({
                 >
                   <Icon name="dots" size={15} />
                 </button>
-              )}
+              }
             />
           ))}
         </div>
@@ -82,9 +93,7 @@ export function WorldsPane({
       <SelectionActionPill
         selection={selection}
         itemLabel="world"
-        actions={[
-          { label: 'Delete', icon: 'trash', danger: true, onClick: () => void deleteSelected() },
-        ]}
+        actions={[{ label: 'Delete', icon: 'trash', danger: true, onClick: () => void deleteSelected() }]}
       />
     </div>
   );

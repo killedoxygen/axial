@@ -43,17 +43,19 @@ export function SelectionActionPill({
 
   return createPortal(
     <div class="cp-selection-float" aria-live="polite">
-      <div
-        class="cp-selection-pill"
-        role="toolbar"
-        aria-label={ariaLabel ?? `${effectiveCount} selected ${noun}`}
-      >
-        <span class="cp-selection-count">{effectiveCount} {noun} selected</span>
+      <div class="cp-selection-pill" role="toolbar" aria-label={ariaLabel ?? `${effectiveCount} selected ${noun}`}>
+        <span class="cp-selection-count">
+          {effectiveCount} {noun} selected
+        </span>
         <span class="cp-selection-divider" aria-hidden="true" />
         {selectAll && !effectiveAllSelected && (
-          <Button variant="ghost" size="sm" onClick={selectAll}>Select all</Button>
+          <Button variant="ghost" size="sm" onClick={selectAll}>
+            Select all
+          </Button>
         )}
-        <Button variant="ghost" size="sm" icon="x" onClick={clear}>Clear</Button>
+        <Button variant="ghost" size="sm" icon="x" onClick={clear}>
+          Clear
+        </Button>
         {actions.length > 0 && <span class="cp-selection-divider" aria-hidden="true" />}
         {actions.map((action) => (
           <Button

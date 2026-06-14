@@ -25,7 +25,7 @@
   cursor: pointer;
 }
 
-.cp-dev-tabs button[data-active="true"] {
+.cp-dev-tabs button[data-active='true'] {
   background: var(--surface);
   color: var(--text);
 }

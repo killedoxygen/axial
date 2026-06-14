@@ -36,7 +36,11 @@ export function SetupOverlay(): JSX.Element {
           setStatus('running');
           const res: any = await api('POST', '/setup/init', { path: managedDefaultPath });
           if (cancelled || userTookOver.current) return;
-          if (res.error) { setError(res.error); setStatus('error'); return; }
+          if (res.error) {
+            setError(res.error);
+            setStatus('error');
+            return;
+          }
           const showOnboarding = await refreshLauncherStateAfterSetup();
           if (cancelled || userTookOver.current) return;
           completeSetup(showOnboarding);
@@ -50,7 +54,9 @@ export function SetupOverlay(): JSX.Element {
         setStatus('error');
       }
     })();
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const retryManaged = async (): Promise<void> => {
@@ -59,7 +65,11 @@ export function SetupOverlay(): JSX.Element {
     setStatus('running');
     try {
       const res: any = await api('POST', '/setup/init', { path: resolvedManagedPath });
-      if (res.error) { setError(res.error); setStatus('error'); return; }
+      if (res.error) {
+        setError(res.error);
+        setStatus('error');
+        return;
+      }
       completeSetup(await refreshLauncherStateAfterSetup());
     } catch (err) {
       setError(errMessage(err) || 'Setup failed');
@@ -69,11 +79,18 @@ export function SetupOverlay(): JSX.Element {
 
   const useExisting = async (): Promise<void> => {
     setError(null);
-    if (!existingPath.trim()) { setError('Pick a folder first.'); return; }
+    if (!existingPath.trim()) {
+      setError('Pick a folder first.');
+      return;
+    }
     setStatus('running');
     try {
       const res: any = await api('POST', '/setup/set-dir', { path: existingPath.trim() });
-      if (res.error) { setError(res.error); setStatus('error'); return; }
+      if (res.error) {
+        setError(res.error);
+        setStatus('error');
+        return;
+      }
       completeSetup(await refreshLauncherStateAfterSetup());
     } catch (err) {
       setError(errMessage(err) || 'Could not use that path');
@@ -108,8 +125,8 @@ export function SetupOverlay(): JSX.Element {
         <Logo className="cp-logo" size={48} />
         <h1 class="cp-setup-title">Set up your library</h1>
         <p class="cp-setup-sub">
-          Croopor needs a folder for instances, installed versions, and assets. It can manage one
-          for you (recommended) or use an existing Minecraft folder.
+          Croopor needs a folder for instances, installed versions, and assets. It can manage one for you (recommended)
+          or use an existing Minecraft folder.
         </p>
 
         {mode === 'managed' ? (
@@ -118,7 +135,15 @@ export function SetupOverlay(): JSX.Element {
             {status === 'running' && <div class="cp-setup-progress" />}
             {error && <div class="cp-setup-error">{error}</div>}
             <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
-              <Button variant="ghost" onClick={() => { userTookOver.current = true; setError(null); setStatus('pending'); setMode('existing'); }}>
+              <Button
+                variant="ghost"
+                onClick={() => {
+                  userTookOver.current = true;
+                  setError(null);
+                  setStatus('pending');
+                  setMode('existing');
+                }}
+              >
                 Use existing folder
               </Button>
               <Button onClick={retryManaged} disabled={status === 'running' || !resolvedManagedPath}>
@@ -129,12 +154,28 @@ export function SetupOverlay(): JSX.Element {
         ) : (
           <>
             <div style={{ display: 'flex', gap: 8 }}>
-              <Input value={existingPath} onChange={setExistingPath} placeholder="/path/to/.minecraft" style={{ flex: 1 }} />
-              <Button variant="secondary" icon="folder" onClick={browseForExisting}>Browse</Button>
+              <Input
+                value={existingPath}
+                onChange={setExistingPath}
+                placeholder="/path/to/.minecraft"
+                style={{ flex: 1 }}
+              />
+              <Button variant="secondary" icon="folder" onClick={browseForExisting}>
+                Browse
+              </Button>
             </div>
             {error && <div class="cp-setup-error">{error}</div>}
             <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
-              <Button variant="ghost" onClick={() => { setError(null); setStatus('pending'); setMode('managed'); }}>Use managed library</Button>
+              <Button
+                variant="ghost"
+                onClick={() => {
+                  setError(null);
+                  setStatus('pending');
+                  setMode('managed');
+                }}
+              >
+                Use managed library
+              </Button>
               <Button onClick={useExisting} disabled={status === 'running' || !existingPath.trim()}>
                 Use this folder
               </Button>

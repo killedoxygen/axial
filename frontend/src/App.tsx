@@ -12,9 +12,9 @@ import { commandPaletteOpen, createOpen, route, showOnboardingOverlay, showSetup
 import { devMode } from './store';
 import { useShortcuts } from './hooks/use-shortcuts';
 
-type DevLabViewComponent = typeof import('./views/dev-lab/DevLabView')['DevLabView'];
-type CommandPaletteComponent = typeof import('./ui/CommandPalette')['CommandPalette'];
-type SetupOverlayComponent = typeof import('./views/setup/SetupOverlay')['SetupOverlay'];
+type DevLabViewComponent = (typeof import('./views/dev-lab/DevLabView'))['DevLabView'];
+type CommandPaletteComponent = (typeof import('./ui/CommandPalette'))['CommandPalette'];
+type SetupOverlayComponent = (typeof import('./views/setup/SetupOverlay'))['SetupOverlay'];
 
 let loadedCommandPalette: CommandPaletteComponent | null = null;
 let loadedSetupOverlay: SetupOverlayComponent | null = null;
@@ -23,29 +23,17 @@ const InstanceDetailRoute = createRouteLoader<{ id: string }>(
   async () => (await import('./views/instance/InstanceDetailView')).InstanceDetailView,
 );
 
-const InstancesRoute = createRouteLoader(
-  async () => (await import('./views/instances/InstancesView')).InstancesView,
-);
+const InstancesRoute = createRouteLoader(async () => (await import('./views/instances/InstancesView')).InstancesView);
 
-const CreateOverlay = createRouteLoader(
-  async () => (await import('./views/create/CreateView')).CreateView,
-);
+const CreateOverlay = createRouteLoader(async () => (await import('./views/create/CreateView')).CreateView);
 
-const AccountsRoute = createRouteLoader(
-  async () => (await import('./views/accounts/AccountsView')).AccountsView,
-);
+const AccountsRoute = createRouteLoader(async () => (await import('./views/accounts/AccountsView')).AccountsView);
 
-const SettingsRoute = createRouteLoader(
-  async () => (await import('./views/settings/SettingsView')).SettingsView,
-);
+const SettingsRoute = createRouteLoader(async () => (await import('./views/settings/SettingsView')).SettingsView);
 
-const DownloadsRoute = createRouteLoader(
-  async () => (await import('./views/downloads/DownloadsView')).DownloadsView,
-);
+const DownloadsRoute = createRouteLoader(async () => (await import('./views/downloads/DownloadsView')).DownloadsView);
 
-const OnboardingOverlay = createRouteLoader(
-  async () => (await import('./views/onboarding/Onboarding')).Onboarding,
-);
+const OnboardingOverlay = createRouteLoader(async () => (await import('./views/onboarding/Onboarding')).Onboarding);
 
 const loadDevLabView = __CROOPOR_ENABLE_DEV_LAB__
   ? async (): Promise<DevLabViewComponent> => (await import('./views/dev-lab/DevLabView')).DevLabView
@@ -70,7 +58,9 @@ function createRouteLoader<P extends object>(load: () => Promise<ComponentType<P
         .catch(() => {
           if (mounted) setFailed(true);
         });
-      return () => { mounted = false; };
+      return () => {
+        mounted = false;
+      };
     }, [View]);
 
     return View ? h(View, props) : <RouteLoadingFallback failed={failed} />;
@@ -102,9 +92,7 @@ function SetupLoadingFallback({ failed = false }: { failed?: boolean }): JSX.Ele
         <Logo className="cp-logo" size={48} />
         <h1 class="cp-setup-title">{failed ? 'Could not load setup' : 'Loading setup...'}</h1>
         <p class="cp-setup-sub">
-          {failed
-            ? 'Restart the launcher and try again.'
-            : 'Preparing the library setup flow.'}
+          {failed ? 'Restart the launcher and try again.' : 'Preparing the library setup flow.'}
         </p>
         {!failed && <div class="cp-setup-progress" />}
       </div>
@@ -125,14 +113,18 @@ function DevLabLoader({ load }: { load: () => Promise<DevLabViewComponent> }): J
     void load().then((view) => {
       if (mounted) setDevLabView(() => view);
     });
-    return () => { mounted = false; };
+    return () => {
+      mounted = false;
+    };
   }, [load]);
 
   return DevLabView ? <DevLabView /> : <SettingsRoute />;
 }
 
 function LazyCommandPalette(): JSX.Element | null {
-  const [CommandPaletteView, setCommandPaletteView] = useState<CommandPaletteComponent | null>(() => loadedCommandPalette);
+  const [CommandPaletteView, setCommandPaletteView] = useState<CommandPaletteComponent | null>(
+    () => loadedCommandPalette,
+  );
 
   useEffect(() => {
     if (CommandPaletteView) return;
@@ -141,7 +133,9 @@ function LazyCommandPalette(): JSX.Element | null {
       loadedCommandPalette = module.CommandPalette;
       if (mounted) setCommandPaletteView(() => module.CommandPalette);
     });
-    return () => { mounted = false; };
+    return () => {
+      mounted = false;
+    };
   }, [CommandPaletteView]);
 
   return CommandPaletteView ? <CommandPaletteView /> : null;
@@ -163,7 +157,9 @@ function LazySetupOverlay(): JSX.Element {
       .catch(() => {
         if (mounted) setFailed(true);
       });
-    return () => { mounted = false; };
+    return () => {
+      mounted = false;
+    };
   }, [SetupOverlayView]);
 
   return SetupOverlayView ? <SetupOverlayView /> : <SetupLoadingFallback failed={failed} />;
@@ -172,13 +168,20 @@ function LazySetupOverlay(): JSX.Element {
 function CurrentView(): JSX.Element {
   const r = route.value;
   switch (r.name) {
-    case 'home': return <HomeView />;
-    case 'instances': return <InstancesRoute />;
-    case 'instance': return <InstanceDetailRoute id={r.id} />;
-    case 'dev-lab': return <DevLabRoute />;
-    case 'downloads': return <DownloadsRoute />;
-    case 'accounts': return <AccountsRoute />;
-    case 'settings': return <SettingsRoute />;
+    case 'home':
+      return <HomeView />;
+    case 'instances':
+      return <InstancesRoute />;
+    case 'instance':
+      return <InstanceDetailRoute id={r.id} />;
+    case 'dev-lab':
+      return <DevLabRoute />;
+    case 'downloads':
+      return <DownloadsRoute />;
+    case 'accounts':
+      return <AccountsRoute />;
+    case 'settings':
+      return <SettingsRoute />;
   }
 }
 
@@ -186,7 +189,9 @@ export function App(): JSX.Element {
   useShortcuts();
   return (
     <>
-      <AppFrame><CurrentView /></AppFrame>
+      <AppFrame>
+        <CurrentView />
+      </AppFrame>
       {createOpen.value && <CreateOverlay />}
       {showSetupOverlay.value && <LazySetupOverlay />}
       {showOnboardingOverlay.value && <OnboardingOverlay />}

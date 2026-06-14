@@ -13,15 +13,15 @@ import { windowSetResizeBackground } from './native';
 
 // ── Reactive theme snapshot ──────────────────────────────────────────────────
 
-const initialThemeHue = local.theme === 'custom'
-  ? local.customHue
-  : (PRESET_HUES[local.theme] ?? local.customHue);
+const initialThemeHue = local.theme === 'custom' ? local.customHue : (PRESET_HUES[local.theme] ?? local.customHue);
 
-export const themeSignal = signal<Theme>(buildTheme({
-  dark: local.lightness < 50,
-  hue: initialThemeHue,
-  vibrancy: local.customVibrancy,
-}));
+export const themeSignal = signal<Theme>(
+  buildTheme({
+    dark: local.lightness < 50,
+    hue: initialThemeHue,
+    vibrancy: local.customVibrancy,
+  }),
+);
 
 let lastNativeResizeBackgroundDark: boolean | null = null;
 
@@ -37,7 +37,7 @@ function syncNativeResizeBackground(dark: boolean): void {
 // Lightness is 0..100 where 0 is dark and 100 is light, we snap at 50
 
 function chromaFor(vibrancy: number): number {
-  return 0.14 * Math.max(0, Math.min(100, vibrancy)) / 100;
+  return (0.14 * Math.max(0, Math.min(100, vibrancy))) / 100;
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -71,36 +71,36 @@ function applyCssVars(hue: number, dark: boolean, vibrancy: number, deferLogo = 
   // Neutral chassis follows the accent hue at low chroma so the whole
   // surface stack harmonizes with the chosen accent.
   if (dark) {
-    set('--bg-deep',   `oklch(0.14 0.012 ${hue})`);
-    set('--bg',        `oklch(0.175 0.012 ${hue})`);
-    set('--surface',   `oklch(0.24 0.014 ${hue})`);
+    set('--bg-deep', `oklch(0.14 0.012 ${hue})`);
+    set('--bg', `oklch(0.175 0.012 ${hue})`);
+    set('--surface', `oklch(0.24 0.014 ${hue})`);
     set('--surface-2', `oklch(0.30 0.015 ${hue})`);
     set('--surface-3', `oklch(0.35 0.016 ${hue})`);
-    set('--text',      `oklch(0.96 0.005 ${hue})`);
-    set('--text-dim',  `oklch(0.74 0.010 ${hue})`);
+    set('--text', `oklch(0.96 0.005 ${hue})`);
+    set('--text-dim', `oklch(0.74 0.010 ${hue})`);
     set('--text-mute', `oklch(0.58 0.012 ${hue})`);
   } else {
-    set('--bg-deep',   `oklch(0.92 0.008 ${hue})`);
-    set('--bg',        `oklch(0.95 0.006 ${hue})`);
-    set('--surface',   `oklch(0.995 0.003 ${hue})`);
+    set('--bg-deep', `oklch(0.92 0.008 ${hue})`);
+    set('--bg', `oklch(0.95 0.006 ${hue})`);
+    set('--surface', `oklch(0.995 0.003 ${hue})`);
     set('--surface-2', `oklch(0.945 0.006 ${hue})`);
     set('--surface-3', `oklch(0.905 0.008 ${hue})`);
-    set('--text',      `oklch(0.21 0.010 ${hue})`);
-    set('--text-dim',  `oklch(0.45 0.010 ${hue})`);
+    set('--text', `oklch(0.21 0.010 ${hue})`);
+    set('--text-dim', `oklch(0.45 0.010 ${hue})`);
     set('--text-mute', `oklch(0.58 0.010 ${hue})`);
   }
 
   // Accent scale (hue-driven).
-  set('--accent',           `oklch(${L} ${C} ${hue})`);
-  set('--accent-strong',    `oklch(${L - 0.08} ${C} ${hue})`);
-  set('--accent-hover',     `oklch(${Math.min(0.99, L + 0.04)} ${C} ${hue})`);
-  set('--accent-fill',      `oklch(${Lf} ${Cf} ${hue})`);
-  set('--accent-fill-hover',`oklch(${Lf + 0.05} ${Cf} ${hue})`);
-  set('--accent-on',        `oklch(${dark ? 0.985 : 0.99} 0.015 ${hue})`);
-  set('--accent-soft',      `oklch(${L} ${C} ${hue} / 0.16)`);
-  set('--accent-softer',    `oklch(${L} ${C} ${hue} / 0.08)`);
-  set('--accent-ring',      `oklch(${L} ${C} ${hue} / 0.40)`);
-  set('--accent-line',      `oklch(${L} ${C} ${hue} / 0.28)`);
+  set('--accent', `oklch(${L} ${C} ${hue})`);
+  set('--accent-strong', `oklch(${L - 0.08} ${C} ${hue})`);
+  set('--accent-hover', `oklch(${Math.min(0.99, L + 0.04)} ${C} ${hue})`);
+  set('--accent-fill', `oklch(${Lf} ${Cf} ${hue})`);
+  set('--accent-fill-hover', `oklch(${Lf + 0.05} ${Cf} ${hue})`);
+  set('--accent-on', `oklch(${dark ? 0.985 : 0.99} 0.015 ${hue})`);
+  set('--accent-soft', `oklch(${L} ${C} ${hue} / 0.16)`);
+  set('--accent-softer', `oklch(${L} ${C} ${hue} / 0.08)`);
+  set('--accent-ring', `oklch(${L} ${C} ${hue} / 0.40)`);
+  set('--accent-line', `oklch(${L} ${C} ${hue} / 0.28)`);
   if (!deferLogo) applyLogoCssVars(set, hue, vibrancy);
 
   el.setAttribute('data-color-mode', dark ? 'dark' : 'light');
@@ -122,9 +122,7 @@ export function applyTheme(theme: string, hue: number | null, options: ApplyOpti
   const previousHue = local.customHue;
   const previousVibrancy = local.customVibrancy;
   const previousLightness = local.lightness;
-  const previousResolvedHue = previousTheme === 'custom'
-    ? previousHue
-    : (PRESET_HUES[previousTheme] ?? previousHue);
+  const previousResolvedHue = previousTheme === 'custom' ? previousHue : (PRESET_HUES[previousTheme] ?? previousHue);
 
   const lt = options.lightness ?? local.lightness;
   const vibrancy = options.vibrancy ?? local.customVibrancy;
@@ -186,9 +184,7 @@ export function resetThemeToDefault(): void {
   const previousHue = local.customHue;
   const previousVibrancy = local.customVibrancy;
   const previousLightness = local.lightness;
-  const previousResolvedHue = previousTheme === 'custom'
-    ? previousHue
-    : (PRESET_HUES[previousTheme] ?? previousHue);
+  const previousResolvedHue = previousTheme === 'custom' ? previousHue : (PRESET_HUES[previousTheme] ?? previousHue);
 
   const nextTheme = defaults.theme;
   const nextHue = defaults.customHue;
@@ -237,7 +233,12 @@ export function resetThemeToDefault(): void {
 
 // ── Color field (hue × vibrancy picker). Pointer-driven square surface. ─────
 
-export function positionFieldMarker(field: HTMLElement | null, marker: HTMLElement | null, hue: number, vibrancy: number): void {
+export function positionFieldMarker(
+  field: HTMLElement | null,
+  marker: HTMLElement | null,
+  hue: number,
+  vibrancy: number,
+): void {
   if (!field || !marker) return;
   marker.style.left = `${(hue / 360) * 100}%`;
   marker.style.top = `${(1 - vibrancy / 100) * 100}%`;
@@ -280,6 +281,11 @@ export function initColorField(
     positionFieldMarker(field, marker, c.hue, c.vibrancy);
     onDrag(c.hue, c.vibrancy);
   });
-  field.addEventListener('pointerup', () => { active = false; if (onEnd) onEnd(); });
-  field.addEventListener('lostpointercapture', () => { active = false; });
+  field.addEventListener('pointerup', () => {
+    active = false;
+    if (onEnd) onEnd();
+  });
+  field.addEventListener('lostpointercapture', () => {
+    active = false;
+  });
 }
