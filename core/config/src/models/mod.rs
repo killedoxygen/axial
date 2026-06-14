@@ -38,6 +38,10 @@ fn default_launch_auth_mode() -> String {
     LAUNCH_AUTH_MODE_OFFLINE.to_string()
 }
 
+fn default_discord_rpc_enabled() -> bool {
+    true
+}
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum AppConfigValidationError {
     #[error("invalid username: {0}")]
@@ -77,6 +81,10 @@ pub struct AppConfig {
     pub onboarding_done: bool,
     #[serde(default)]
     pub telemetry_enabled: bool,
+    #[serde(default = "default_discord_rpc_enabled")]
+    pub discord_rpc_enabled: bool,
+    #[serde(default)]
+    pub discord_rpc_onboarding_seen: bool,
     #[serde(default)]
     pub library_dir: String,
     #[serde(default)]
@@ -108,6 +116,8 @@ impl Default for AppConfig {
             lightness: None,
             onboarding_done: false,
             telemetry_enabled: false,
+            discord_rpc_enabled: true,
+            discord_rpc_onboarding_seen: false,
             library_dir: String::new(),
             library_mode: "managed".to_string(),
             music_enabled: None,
@@ -194,6 +204,8 @@ mod tests {
 
         assert_eq!(config.launch_auth_mode, LAUNCH_AUTH_MODE_OFFLINE);
         assert!(!config.telemetry_enabled);
+        assert!(config.discord_rpc_enabled);
+        assert!(!config.discord_rpc_onboarding_seen);
         assert_eq!(
             config
                 .normalized()

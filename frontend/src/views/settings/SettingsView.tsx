@@ -162,8 +162,11 @@ function GameplaySection(): JSX.Element {
   const sys = systemInfo.value;
   const savedUsername = cfg?.username || 'Player';
   const savedMemGB = (cfg?.max_memory_mb ?? 4096) / 1024;
+  const savedDiscordRpc = cfg?.discord_rpc_enabled !== false;
   const [username, setUsername] = useState(cfg?.username || 'Player');
   const [memGB, setMemGB] = useState<number>(savedMemGB);
+  const [discordRpcEnabled, setDiscordRpcEnabled] = useState(savedDiscordRpc);
+  const [savingDiscordRpc, setSavingDiscordRpc] = useState(false);
   const lastSaveRequest = useRef(0);
   const totalGB = sys?.total_memory_mb ? Math.floor(sys.total_memory_mb / 1024) : 16;
   const maxGB = Math.max(1, totalGB);
@@ -177,7 +180,8 @@ function GameplaySection(): JSX.Element {
   useEffect(() => {
     setUsername(savedUsername);
     setMemGB(savedMemGB);
-  }, [savedMemGB, savedUsername]);
+    setDiscordRpcEnabled(savedDiscordRpc);
+  }, [savedDiscordRpc, savedMemGB, savedUsername]);
 
   const recText = useMemo(() => {
     if (memGB < 2) return 'Low, may stutter';
@@ -207,6 +211,27 @@ function GameplaySection(): JSX.Element {
     } catch (err) {
       if (requestId !== lastSaveRequest.current) return;
       toast(`Could not save settings: ${errMessage(err)}`);
+    }
+  };
+
+  const toggleDiscordRpc = async (): Promise<void> => {
+    if (savingDiscordRpc) return;
+    const next = !discordRpcEnabled;
+    setDiscordRpcEnabled(next);
+    setSavingDiscordRpc(true);
+    try {
+      const res: any = await api('PUT', '/config', {
+        discord_rpc_enabled: next,
+        discord_rpc_onboarding_seen: true,
+      });
+      if (res?.error) throw new Error(res.error);
+      config.value = res;
+      toast('Saved');
+    } catch (err) {
+      setDiscordRpcEnabled(savedDiscordRpc);
+      toast(`Could not save Discord activity setting: ${errMessage(err)}`, 'error');
+    } finally {
+      setSavingDiscordRpc(false);
     }
   };
 
@@ -250,6 +275,11 @@ function GameplaySection(): JSX.Element {
           />
         </div>
       </SettingsCard>
+      <SettingsCard
+        title="Discord activity"
+        desc="Shows Croopor and broad Minecraft status on your Discord profile."
+        control={<Toggle on={discordRpcEnabled} onChange={() => void toggleDiscordRpc()} />}
+      />
     </>
   );
 }

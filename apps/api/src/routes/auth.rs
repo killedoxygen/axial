@@ -414,8 +414,8 @@ async fn auth_logout_for_state(state: &AppState) -> (StatusCode, Json<serde_json
 
     let mut next = state.config().current();
     next.launch_auth_mode = LAUNCH_AUTH_MODE_OFFLINE.to_string();
-    match state.config().update(next) {
-        Ok(config) => state.set_library_dir(config.library_dir),
+    match state.update_config(next) {
+        Ok(_) => {}
         Err(error) => {
             tracing::warn!("config sync after auth logout failed: {error}");
             return auth_logout_cleanup_failed_response();

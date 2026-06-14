@@ -29,6 +29,8 @@ struct ConfigPatch {
     custom_vibrancy: Option<i32>,
     lightness: Option<i32>,
     telemetry_enabled: Option<bool>,
+    discord_rpc_enabled: Option<bool>,
+    discord_rpc_onboarding_seen: Option<bool>,
     music_enabled: Option<bool>,
     music_volume: Option<i32>,
     music_track: Option<i32>,
@@ -100,6 +102,12 @@ async fn handle_update_config(
     if let Some(telemetry_enabled) = patch.telemetry_enabled {
         next.telemetry_enabled = telemetry_enabled;
     }
+    if let Some(discord_rpc_enabled) = patch.discord_rpc_enabled {
+        next.discord_rpc_enabled = discord_rpc_enabled;
+    }
+    if let Some(discord_rpc_onboarding_seen) = patch.discord_rpc_onboarding_seen {
+        next.discord_rpc_onboarding_seen = discord_rpc_onboarding_seen;
+    }
     if let Some(music_enabled) = patch.music_enabled {
         next.music_enabled = Some(music_enabled);
     }
@@ -116,9 +124,8 @@ async fn handle_update_config(
         next.library_mode = library_mode;
     }
 
-    match state.config().update(next) {
+    match state.update_config(next) {
         Ok(config) => {
-            state.set_library_dir(config.library_dir.clone());
             if sync_offline_username {
                 accounts::sync_active_offline_account_from_username(&state, &config.username)
                     .map_err(config_account_sync_error_response)?;
@@ -177,6 +184,18 @@ mod tests {
         .expect("telemetry consent patch should deserialize");
 
         assert_eq!(patch.telemetry_enabled, Some(true));
+    }
+
+    #[test]
+    fn config_patch_accepts_discord_rpc_flags() {
+        let patch = serde_json::from_value::<ConfigPatch>(serde_json::json!({
+            "discord_rpc_enabled": false,
+            "discord_rpc_onboarding_seen": true
+        }))
+        .expect("discord rpc patch should deserialize");
+
+        assert_eq!(patch.discord_rpc_enabled, Some(false));
+        assert_eq!(patch.discord_rpc_onboarding_seen, Some(true));
     }
 
     #[test]
@@ -246,6 +265,28 @@ mod tests {
             .expect("active account");
         assert_eq!(active.display_name, "NewName");
         assert_eq!(fixture.state.config().current().username, "NewName");
+    }
+
+    #[tokio::test]
+    async fn config_update_notifies_config_subscribers() {
+        let fixture = TestFixture::new("config-change-notify");
+        let mut changes = fixture.state.subscribe_config_changes();
+
+        let Json(config) = handle_update_config(
+            State(fixture.state.clone()),
+            Json(ConfigPatch {
+                discord_rpc_enabled: Some(false),
+                ..ConfigPatch::default()
+            }),
+        )
+        .await
+        .expect("update config");
+
+        assert!(!config.discord_rpc_enabled);
+        tokio::time::timeout(std::time::Duration::from_secs(1), changes.recv())
+            .await
+            .expect("config change notification should arrive")
+            .expect("config change sender should remain open");
     }
 
     struct TestFixture {

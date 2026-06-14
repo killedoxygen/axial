@@ -52,6 +52,7 @@ Do not use it for:
 
 ### Subsystem architecture docs
 Current subsystem docs:
+- `docs/DISCORD-RPC.md`
 - `docs/GUARDIAN-ARCHITECTURE.md`
 - `docs/LOADER-ARCHITECTURE.md`
 - `docs/VERSION-METADATA-ARCHITECTURE.md`

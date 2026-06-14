@@ -27,13 +27,14 @@ import { statusCanSelectOnline } from "../accounts/auth";
 import type { AuthStatusRecord, AuthStatusState } from "../accounts/types";
 import { useMicrosoftSignIn } from "../accounts/useMicrosoftSignIn";
 
-type Stage = "name" | "memory" | "color" | "music";
-const ORDER: Stage[] = ["name", "memory", "color", "music"];
+type Stage = "name" | "memory" | "color" | "music" | "discord";
+const ORDER: Stage[] = ["name", "memory", "color", "music", "discord"];
 const STAGE_LABELS: Record<Stage, string> = {
     name: "Name",
     memory: "Memory",
     color: "Mood",
     music: "Sound",
+    discord: "Activity",
 };
 
 async function readAuthStatus(): Promise<AuthStatusRecord> {
@@ -149,6 +150,9 @@ export function Onboarding(): JSX.Element | null {
     const [username, setUsername] = useState("");
     const [memory, setMemory] = useState<number>(rec.rec);
     const [musicEnabled, setMusicEnabled] = useState<boolean | null>(null);
+    const [discordRpcEnabled, setDiscordRpcEnabled] = useState<boolean>(
+        config.value?.discord_rpc_enabled !== false,
+    );
     const [isWeirdo, setIsWeirdo] = useState<boolean>(local.lightness >= 50);
     const [saving, setSaving] = useState(false);
     const [dissolving, setDissolving] = useState(false);
@@ -222,7 +226,7 @@ export function Onboarding(): JSX.Element | null {
                 ? true
                 : stage === "music"
                   ? !saving && musicEnabled != null
-                  : false;
+                  : !saving;
 
     const advance = (): void => {
         const nextIdx = idx + 1;
@@ -277,6 +281,8 @@ export function Onboarding(): JSX.Element | null {
                 max_memory_mb: Math.round(memory * 1024),
                 music_enabled: musicEnabled,
                 music_volume: 5,
+                discord_rpc_enabled: discordRpcEnabled,
+                discord_rpc_onboarding_seen: true,
             };
             if (onlineAfterOnboarding) {
                 patch.launch_auth_mode = "online";
@@ -326,7 +332,7 @@ export function Onboarding(): JSX.Element | null {
 
     const onCta = (): void => {
         if (!canAdvance) return;
-        if (stage === "music") void commit();
+        if (stage === "discord") void commit();
         else advance();
     };
 
@@ -368,6 +374,7 @@ export function Onboarding(): JSX.Element | null {
         stage,
         nameValid,
         musicEnabled,
+        discordRpcEnabled,
         saving,
         dissolving,
         idx,
@@ -531,7 +538,7 @@ export function Onboarding(): JSX.Element | null {
                 <AccentField showPresets={false} />
             </div>
         );
-    } else {
+    } else if (stage === "music") {
         headline = "Quiet, or a little atmosphere?";
         subline = (
             <p class="cp-ob-subline">
@@ -564,6 +571,44 @@ export function Onboarding(): JSX.Element | null {
                     >
                         <Icon name="music-off" size={16} />
                         <span>Silent launcher</span>
+                    </button>
+                </div>
+            </div>
+        );
+    } else {
+        headline = "Share launcher activity on Discord?";
+        subline = (
+            <p class="cp-ob-subline">
+                Croopor shares broad Minecraft activity, not instance names or
+                server details.
+            </p>
+        );
+        widget = (
+            <div class="cp-ob-widget">
+                <div class="cp-ob-pills">
+                    <button
+                        class="cp-ob-pill"
+                        data-active={discordRpcEnabled === true}
+                        onClick={() => {
+                            setDiscordRpcEnabled(true);
+                            Sound.ui("affirm");
+                        }}
+                        type="button"
+                    >
+                        <Icon name="activity" size={16} />
+                        <span>Discord activity</span>
+                    </button>
+                    <button
+                        class="cp-ob-pill"
+                        data-active={discordRpcEnabled === false}
+                        onClick={() => {
+                            setDiscordRpcEnabled(false);
+                            Sound.ui("soft");
+                        }}
+                        type="button"
+                    >
+                        <Icon name="shield-check" size={16} />
+                        <span>Private launcher</span>
                     </button>
                 </div>
             </div>
@@ -619,12 +664,12 @@ export function Onboarding(): JSX.Element | null {
                         onClick={onCta}
                         disabled={!canAdvance}
                         aria-label={
-                            stage === "music"
+                            stage === "discord"
                                 ? "Finish (Enter)"
                                 : "Next step (Right arrow)"
                         }
                         title={
-                            stage === "music"
+                            stage === "discord"
                                 ? saving
                                     ? "Starting…"
                                     : "Finish  ↵"

@@ -179,6 +179,8 @@ export interface Config {
   lightness?: number;
   onboarding_done: boolean;
   telemetry_enabled: boolean;
+  discord_rpc_enabled?: boolean;
+  discord_rpc_onboarding_seen?: boolean;
   library_dir?: string;
   library_mode?: string;
   music_enabled?: boolean;

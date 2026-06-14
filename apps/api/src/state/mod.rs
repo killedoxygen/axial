@@ -6,15 +6,17 @@ pub mod benchmark_suites;
 mod installs;
 pub mod launch_reports;
 pub mod performance_operations;
+pub mod presence;
 mod sessions;
 pub mod skins;
 
-use croopor_config::{ConfigStore, InstanceStore};
+use croopor_config::{AppConfig, ConfigStore, ConfigStoreError, InstanceStore};
 pub use croopor_launcher::{LaunchEvent, LaunchLogEvent, LaunchSessionRecord, LaunchStatusEvent};
 pub use croopor_minecraft::download::DownloadProgress;
 use croopor_performance::PerformanceManager;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+use tokio::sync::broadcast;
 
 const STARTUP_WARNING_LIMIT: usize = 8;
 const STARTUP_WARNING_MAX_CHARS: usize = 240;
@@ -47,6 +49,7 @@ pub struct AppState {
     performance_operations: Arc<performance_operations::PerformanceOperationStore>,
     performance: Arc<PerformanceManager>,
     startup_warnings: Arc<Vec<String>>,
+    config_changes: Arc<broadcast::Sender<()>>,
     library_dir: Arc<RwLock<Option<String>>>,
     frontend_dir: Arc<PathBuf>,
 }
@@ -76,6 +79,7 @@ impl AppState {
         );
         let skins = Arc::new(skins::SavedSkinStore::load_from_paths(init.config.paths()));
         let accounts = Arc::new(LauncherAccountStore::load_from_paths(init.config.paths()));
+        let (config_changes, _) = broadcast::channel(32);
 
         Self {
             app_name: init.app_name,
@@ -91,6 +95,7 @@ impl AppState {
             performance_operations,
             performance: init.performance,
             startup_warnings: Arc::new(bound_startup_warnings(init.startup_warnings)),
+            config_changes: Arc::new(config_changes),
             library_dir: Arc::new(RwLock::new(if library_dir.is_empty() {
                 None
             } else {
@@ -164,6 +169,17 @@ impl AppState {
         if let Ok(mut guard) = self.library_dir.write() {
             *guard = if value.is_empty() { None } else { Some(value) };
         }
+    }
+
+    pub fn update_config(&self, next: AppConfig) -> Result<AppConfig, ConfigStoreError> {
+        let config = self.config.update(next)?;
+        self.set_library_dir(config.library_dir.clone());
+        let _ = self.config_changes.send(());
+        Ok(config)
+    }
+
+    pub fn subscribe_config_changes(&self) -> broadcast::Receiver<()> {
+        self.config_changes.subscribe()
     }
 
     pub fn frontend_dir(&self) -> &Path {

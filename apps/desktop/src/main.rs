@@ -1,4 +1,5 @@
 mod commands;
+mod discord_presence;
 mod events;
 mod state;
 
@@ -48,10 +49,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         startup_warnings,
         frontend_dir: croopor_api::app::default_frontend_dir(),
     });
+    let discord_presence = discord_presence::spawn(state.clone());
     spawn_performance_operations_resume(&state);
     spawn_benchmark_suite_drivers_resume(&state);
     spawn_performance_rules_refresh(&state);
     let close_event_state = state.clone();
+    let close_event_presence = discord_presence.clone();
     let desktop_state = state::DesktopState::new(env!("CARGO_PKG_VERSION").to_string());
 
     let api = spawn_background(state.clone()).await?;
@@ -84,6 +87,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 api.prevent_close();
                 let window = window.clone();
                 let state = close_event_state.clone();
+                let discord_presence = close_event_presence.clone();
                 tauri::async_runtime::spawn(async move {
                     if let Some(error) = commands::close_blocking_error(&state).await {
                         let _ = window.emit(
@@ -94,6 +98,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     commands::flush_pending_saved_skin_applies("window close request", &state)
                         .await;
+                    let _ = tokio::task::spawn_blocking(move || {
+                        discord_presence.shutdown_blocking();
+                    })
+                    .await;
                     if let Err(error) = window.destroy() {
                         tracing::warn!("failed to destroy window after close request: {error}");
                     }
@@ -110,6 +118,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         })
         .run(tauri::generate_context!())?;
+
+    discord_presence.shutdown_blocking();
 
     Ok(())
 }

@@ -203,7 +203,7 @@ async fn handle_account_remove(
         None => {
             let mut next = state.config().current();
             next.launch_auth_mode = LAUNCH_AUTH_MODE_OFFLINE.to_string();
-            state.config().update(next).map_err(config_error)?;
+            state.update_config(next).map_err(config_error)?;
         }
     }
 
@@ -331,8 +331,7 @@ pub(crate) fn sync_config_for_account(
             next.username = account.display_name.clone();
         }
     }
-    let config = state.config().update(next)?;
-    state.set_library_dir(config.library_dir);
+    let _ = state.update_config(next)?;
     Ok(())
 }
 

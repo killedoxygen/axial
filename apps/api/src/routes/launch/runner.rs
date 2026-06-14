@@ -1005,7 +1005,7 @@ fn persist_launch_metadata(
     if min_memory_mb > 0 {
         next.min_memory_mb = min_memory_mb;
     }
-    let _ = state.config().update(next);
+    let _ = state.update_config(next);
 }
 
 pub(super) async fn persist_launch_proof_best_effort(

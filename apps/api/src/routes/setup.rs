@@ -98,8 +98,7 @@ async fn handle_setup_set_dir(
     let mut config = state.config().current();
     config.library_dir = payload.path.clone();
     config.library_mode = "existing".to_string();
-    state.config().update(config).map_err(setup_config_error)?;
-    state.set_library_dir(payload.path.clone());
+    state.update_config(config).map_err(setup_config_error)?;
     let _ = ensure_launcher_profiles(&path, "");
 
     Ok(Json(serde_json::json!({
@@ -133,8 +132,7 @@ async fn handle_setup_init(
     let mut config = state.config().current();
     config.library_dir = path.to_string_lossy().to_string();
     config.library_mode = "managed".to_string();
-    state.config().update(config).map_err(setup_config_error)?;
-    state.set_library_dir(path.to_string_lossy().to_string());
+    state.update_config(config).map_err(setup_config_error)?;
 
     Ok(Json(serde_json::json!({
         "status": "ok",

@@ -29,6 +29,7 @@ struct SessionEntry {
 
 pub struct SessionStore {
     sessions: RwLock<HashMap<String, SessionEntry>>,
+    changes: broadcast::Sender<()>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,9 +42,15 @@ pub enum StartupOutcome {
 
 impl SessionStore {
     pub fn new() -> Self {
+        let (changes, _) = broadcast::channel(64);
         Self {
             sessions: RwLock::new(HashMap::new()),
+            changes,
         }
+    }
+
+    fn notify_changed(&self) {
+        let _ = self.changes.send(());
     }
 
     pub async fn insert(&self, mut record: LaunchSessionRecord) {
@@ -62,6 +69,8 @@ impl SessionStore {
                 observed_failure: None,
             },
         );
+        drop(sessions);
+        self.notify_changed();
     }
 
     pub async fn get(&self, session_id: &str) -> Option<LaunchSessionRecord> {
@@ -80,7 +89,10 @@ impl SessionStore {
         let mut sessions = self.sessions.write().await;
         let entry = sessions.get_mut(session_id)?;
         entry.record.benchmark = Some(benchmark);
-        Some(entry.record.clone())
+        let record = entry.record.clone();
+        drop(sessions);
+        self.notify_changed();
+        Some(record)
     }
 
     pub async fn subscribe(&self, session_id: &str) -> Option<broadcast::Receiver<LaunchEvent>> {
@@ -89,6 +101,10 @@ impl SessionStore {
             .await
             .get(session_id)
             .map(|entry| entry.events.subscribe())
+    }
+
+    pub fn subscribe_changes(&self) -> broadcast::Receiver<()> {
+        self.changes.subscribe()
     }
 
     pub async fn emit_log(
@@ -100,6 +116,7 @@ impl SessionStore {
         let source = source.into();
         let text = text.into();
         let mut sessions = self.sessions.write().await;
+        let mut changed = false;
         if let Some(entry) = sessions.get_mut(session_id) {
             entry.startup_observed.store(true, Ordering::Relaxed);
             entry.log_count.fetch_add(1, Ordering::Relaxed);
@@ -140,6 +157,7 @@ impl SessionStore {
                 };
                 apply_status_update(entry, &mut status);
                 let _ = entry.events.send(LaunchEvent::Status(status));
+                changed = true;
             }
             let failure_class = classify_startup_failure_text(&text);
             if failure_class != LaunchFailureClass::Unknown {
@@ -149,6 +167,10 @@ impl SessionStore {
                 .events
                 .send(LaunchEvent::Log(LaunchLogEvent { source, text }));
         }
+        drop(sessions);
+        if changed {
+            self.notify_changed();
+        }
     }
 
     pub async fn emit_status(&self, session_id: &str, mut event: LaunchStatusEvent) {
@@ -156,6 +178,8 @@ impl SessionStore {
         if let Some(entry) = sessions.get_mut(session_id) {
             apply_status_update(entry, &mut event);
             let _ = entry.events.send(LaunchEvent::Status(event));
+            drop(sessions);
+            self.notify_changed();
         }
     }
 
@@ -242,6 +266,7 @@ impl SessionStore {
                 );
             }
         }
+        self.notify_changed();
 
         self.emit_status(
             &session_id,
@@ -298,6 +323,7 @@ impl SessionStore {
 
     pub async fn remove(&self, session_id: &str) {
         self.sessions.write().await.remove(session_id);
+        self.notify_changed();
     }
 
     pub async fn observed_failure(&self, session_id: &str) -> Option<LaunchFailureClass> {
@@ -322,6 +348,17 @@ impl SessionStore {
         }
 
         self.sessions.write().await.clear();
+        self.notify_changed();
+    }
+
+    pub async fn active_records(&self) -> Vec<LaunchSessionRecord> {
+        self.sessions
+            .read()
+            .await
+            .values()
+            .filter(|entry| !classify::is_terminal_state(entry.record.state))
+            .map(|entry| entry.record.clone())
+            .collect()
     }
 
     pub async fn has_active_instance(&self, instance_id: &str) -> bool {
