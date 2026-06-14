@@ -68,6 +68,8 @@ windows powershell:
 - `check`: run `fmt`, `check`, `clippy`, and frontend typecheck
 - `test`: run the Rust workspace tests
 - `verify`: run checks, tests, frontend build, and a release desktop build
+- `frontend:fmt`: run frontend formatting checks
+- `frontend:fmt:fix`: format frontend code
 - `rust:fmt`: run Rust formatting checks
 - `rust:fmt:fix`: format Rust code
 - `rust:check`: typecheck the Rust workspace

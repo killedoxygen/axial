@@ -35,6 +35,9 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm --dir frontend install --frozen-lockfile --ignore-scripts
 
+      - name: Frontend format check
+        run: pnpm --dir frontend run format:check
+
       - name: Frontend typecheck
         run: pnpm --dir frontend run check
 

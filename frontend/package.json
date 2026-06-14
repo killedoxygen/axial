@@ -7,11 +7,14 @@
     "dev": "node esbuild.mjs serve",
     "dev:desktop": "node esbuild.mjs serve --strict-port",
     "watch": "node esbuild.mjs watch",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
   },
   "devDependencies": {
     "@types/three": "^0.184.1",
     "esbuild": "^0.25.0",
+    "prettier": "^3.8.4",
     "typescript": "^5.7.0"
   },
   "dependencies": {

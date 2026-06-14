@@ -1,0 +1,5 @@
+node_modules/
+static/app.js
+static/app.css
+static/chunks/
+package.json.md5

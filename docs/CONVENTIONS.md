@@ -62,6 +62,7 @@ keep this short and real. if the codebase changes, update this file.
 - frontend entry is `frontend/src/main.tsx`
 - frontend JS entry output is `frontend/static/app.js`; additional generated chunks may be emitted under `frontend/static/chunks/`
 - frontend package manager is `pnpm`, pinned through `frontend/package.json`
+- frontend formatting uses Prettier from `frontend/`; run `pnpm run format:check` to check and `pnpm run format` to write
 - the Rust workspace root is `Cargo.toml`
 - release/build automation lives in `.github/workflows/`
 - Rust build output lives in `target/`

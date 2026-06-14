@@ -82,6 +82,18 @@ tasks:
     cmds:
       - pnpm run check
 
+  frontend:fmt:
+    desc: run frontend formatting checks
+    dir: "{{.FRONTEND_DIR}}"
+    cmds:
+      - pnpm run format:check
+
+  frontend:fmt:fix:
+    desc: format frontend code
+    dir: "{{.FRONTEND_DIR}}"
+    cmds:
+      - pnpm run format
+
   frontend:build:
     desc: build frontend bundle
     dir: "{{.FRONTEND_DIR}}"
