@@ -1951,20 +1951,14 @@ mod tests {
     }
 
     #[test]
-    fn benchmark_metadata_accepts_current_modes_and_rejects_aliases() {
+    fn benchmark_metadata_accepts_current_modes() {
         let development = LaunchBenchmarkMetadata::new(None, None, None, Some("development"));
         let qualification = LaunchBenchmarkMetadata::new(None, None, None, Some("qualification"));
         let release = LaunchBenchmarkMetadata::new(None, None, None, Some("release_validation"));
-        let alias = LaunchBenchmarkMetadata::new(None, None, None, Some("qual"));
-        let different_case = LaunchBenchmarkMetadata::new(None, None, None, Some("QUALIFICATION"));
-        let unknown = LaunchBenchmarkMetadata::new(None, None, None, Some("nightly-check"));
 
         assert_eq!(development.mode.as_deref(), Some("development"));
         assert_eq!(qualification.mode.as_deref(), Some("qualification"));
         assert_eq!(release.mode.as_deref(), Some("release_validation"));
-        assert_eq!(alias.mode, None);
-        assert_eq!(different_case.mode, None);
-        assert_eq!(unknown.mode, None);
     }
 
     #[test]

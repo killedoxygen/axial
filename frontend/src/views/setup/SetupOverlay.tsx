@@ -9,8 +9,6 @@ import { errMessage } from '../../utils';
 import { config, devMode, instances, lastInstanceId, versions } from '../../store';
 import { showOnboardingOverlay, showSetupOverlay } from '../../ui-state';
 
-// Library setup overlay
-// Creates a managed library at the recommended path or points at an existing one
 export function SetupOverlay(): JSX.Element {
   const [mode, setMode] = useState<'managed' | 'existing'>('managed');
   const [managedPath, setManagedPath] = useState<string>('Preparing default library path…');
@@ -20,7 +18,6 @@ export function SetupOverlay(): JSX.Element {
   const [error, setError] = useState<string | null>(null);
   const userTookOver = useRef(false);
 
-  // Fetch defaults on mount, then kick off a managed setup automatically
   useEffect(() => {
     let cancelled = false;
     void (async () => {
@@ -107,7 +104,7 @@ export function SetupOverlay(): JSX.Element {
         if (res?.path) setExistingPath(res.path);
       }
     } catch {
-      /* user cancelled */
+      /* Dialog cancellation keeps the current path. */
     }
   };
 

@@ -675,6 +675,7 @@ async fn prewarm_launch_plan(
     plan: &croopor_launcher::VanillaLaunchPlan,
     resource_budget: Option<&LaunchProofResourceBudget>,
 ) -> LaunchPrewarmRunSummary {
+    // Prewarm is bounded and best-effort. Resource pressure reduces or skips it.
     let selection = select_prewarm_budget(resource_budget);
     let candidate_paths = prewarm_candidate_paths(plan);
     let summary = match selection.budget {
@@ -837,6 +838,7 @@ async fn fail_launch(
     healing: Option<croopor_launcher::LaunchHealingSummary>,
     guardian: Option<GuardianSummary>,
 ) -> LaunchRequestError {
+    // Live failure details are sanitized before they enter status events or API responses.
     let public_message = sanitize_live_launch_failure_message(message);
     emit_terminal_failure(
         state,

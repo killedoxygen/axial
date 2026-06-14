@@ -35,14 +35,10 @@ import { formatInstallItemLabel } from './install-labels';
 import { launchStageView, launchStageViewFrom, type LaunchStage } from './launch-stages';
 import type { InstallStepProgress } from './store';
 
-// ── Selection ──
-
 export function selectInstance(id: string | null): void {
   selectedInstanceId.value = id;
   currentPage.value = 'launcher';
 }
-
-// ── Install state transitions ──
 
 const INSTALL_FAILURE_MESSAGE_LIMIT = 220;
 
@@ -188,8 +184,6 @@ export function setInstallEventSource(es: { close(): void } | null): void {
   installEventSource.value = es;
 }
 
-// ── Launch state transitions ──
-
 export function startLaunch(instanceId: string): void {
   const stage = launchStageView('queued');
   launchState.value = { status: 'preparing', instanceId, pct: stage.pct, label: stage.label, stage: stage.stage };
@@ -258,8 +252,6 @@ export function clearLaunchNotice(instanceId: string): void {
   launchNotices.value = next;
 }
 
-// ── Data setters ──
-
 export function setVersions(v: Version[]): void {
   versions.value = v;
 }
@@ -282,8 +274,6 @@ export function setLastInstanceId(id: string | null): void {
   lastInstanceId.value = id;
 }
 
-// ── UI state setters ──
-
 export function navigate(page: Page): void {
   currentPage.value = page;
 }
@@ -296,8 +286,6 @@ export function setFilter(f: string): void {
 export function setLogLines(n: number): void {
   logLines.value = n;
 }
-
-// ── Instance mutations ──
 
 export function addInstance(inst: Instance): void {
   instances.value = [...instances.value, inst];

@@ -11,8 +11,6 @@ import {
   windowIsMaximized,
 } from '../native';
 
-// Min, max, close for the custom frame
-// Returns null outside Tauri so we don't double up on the OS chrome
 export function WindowControls(): JSX.Element | null {
   const isNative = hasNativeDesktopRuntime();
   const [maximized, setMaximized] = useState(false);

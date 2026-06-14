@@ -1,5 +1,3 @@
-/* Accent editor (shared between Settings and Onboarding) */
-
 .cp-accent-pane {
   display: flex;
   flex-direction: column;
@@ -62,7 +60,6 @@
   gap: 12px;
 }
 
-/* Swatch row */
 .cp-swatch-row {
   display: flex;
   gap: 8px;
@@ -86,7 +83,7 @@
   box-shadow: 0 0 0 3px color-mix(in oklch, currentcolor 25%, transparent);
 }
 
-/* Color marker: transitions only fire when programmatically moved */
+/* Color marker transitions only fire when programmatically moved. */
 .cp-color-marker.animating {
   transition:
     left 260ms cubic-bezier(0.22, 1, 0.36, 1),

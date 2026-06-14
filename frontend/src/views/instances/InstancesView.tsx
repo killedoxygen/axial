@@ -35,7 +35,7 @@ function fmtRelative(iso?: string): string {
 }
 
 function versionLabel(v: Version | undefined): string {
-  return minecraftVersionLabel(v, '—');
+  return minecraftVersionLabel(v, 'Unknown');
 }
 
 function loaderLabel(v: Version | undefined): string {

@@ -629,8 +629,7 @@ fn auth_chain_error_response(error: AuthChainError) -> (StatusCode, Json<serde_j
         AuthChainErrorKind::Request
         | AuthChainErrorKind::UpstreamRejected
         | AuthChainErrorKind::UpstreamUnavailable
-        | AuthChainErrorKind::Parse
-        | AuthChainErrorKind::MissingUserHash => StatusCode::BAD_GATEWAY,
+        | AuthChainErrorKind::Parse => StatusCode::BAD_GATEWAY,
     };
 
     (
@@ -650,7 +649,6 @@ fn auth_chain_error_code(kind: AuthChainErrorKind) -> &'static str {
         AuthChainErrorKind::UpstreamRejected => "upstream_rejected",
         AuthChainErrorKind::UpstreamUnavailable => "upstream_unavailable",
         AuthChainErrorKind::Parse => "parse",
-        AuthChainErrorKind::MissingUserHash => "missing_user_hash",
     }
 }
 
@@ -806,12 +804,7 @@ mod tests {
         AppStateInit, AuthLoginMsaToken, InstallStore, NewAuthLoginMinecraftAccount,
         NewAuthLoginMsaToken, SessionStore,
     };
-    use axum::{
-        body::Bytes,
-        extract::State,
-        http::HeaderMap,
-        routing::{get, post},
-    };
+    use axum::{body::Bytes, extract::State, http::HeaderMap, routing::get};
     use croopor_config::{AppConfig, AppPaths, ConfigStore, InstanceStore};
     use croopor_performance::PerformanceManager;
     use std::{fs, path::PathBuf, sync::Arc};
@@ -1564,9 +1557,6 @@ mod tests {
 
     fn unused_auth_chain_client() -> AuthChainClient {
         AuthChainClient::with_endpoints(AuthChainEndpoints {
-            xbox_user_authenticate: "http://127.0.0.1:9/xbl".to_string(),
-            xsts_authorize: "http://127.0.0.1:9/xsts".to_string(),
-            minecraft_login_with_xbox: "http://127.0.0.1:9/minecraft/login".to_string(),
             minecraft_profile: "http://127.0.0.1:9/minecraft/profile".to_string(),
             minecraft_ownership: "http://127.0.0.1:9/minecraft/ownership".to_string(),
         })
@@ -1581,9 +1571,6 @@ mod tests {
     ) {
         let (tx, rx) = mpsc::unbounded_channel();
         let app = axum::Router::new()
-            .route("/xbl", post(record_route_xbl))
-            .route("/xsts", post(record_route_xsts))
-            .route("/minecraft/login", post(record_route_minecraft_login))
             .route("/minecraft/profile", get(record_route_minecraft_profile))
             .route(
                 "/minecraft/ownership",
@@ -1600,9 +1587,6 @@ mod tests {
                 .expect("auth chain route test server");
         });
         let client = AuthChainClient::with_endpoints(AuthChainEndpoints {
-            xbox_user_authenticate: format!("{base_url}/xbl"),
-            xsts_authorize: format!("{base_url}/xsts"),
-            minecraft_login_with_xbox: format!("{base_url}/minecraft/login"),
             minecraft_profile: format!("{base_url}/minecraft/profile"),
             minecraft_ownership: format!("{base_url}/minecraft/ownership"),
         })
@@ -1627,59 +1611,6 @@ mod tests {
     struct RecordedAuthChainRequest {
         path: String,
         authorization: Option<String>,
-    }
-
-    async fn record_route_xbl(
-        State(state): State<AuthChainRouteState>,
-        headers: HeaderMap,
-        body: Bytes,
-    ) -> (StatusCode, Json<serde_json::Value>) {
-        record_auth_chain_route_request(&state.tx, "/xbl", &headers, &body);
-
-        (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "Token": "xbl-token",
-                "DisplayClaims": {
-                    "xui": [{ "uhs": "xbl-user-hash" }]
-                },
-            })),
-        )
-    }
-
-    async fn record_route_xsts(
-        State(state): State<AuthChainRouteState>,
-        headers: HeaderMap,
-        body: Bytes,
-    ) -> (StatusCode, Json<serde_json::Value>) {
-        record_auth_chain_route_request(&state.tx, "/xsts", &headers, &body);
-
-        (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "Token": "xsts-token",
-                "DisplayClaims": {
-                    "xui": [{ "uhs": "xsts-user-hash" }]
-                },
-            })),
-        )
-    }
-
-    async fn record_route_minecraft_login(
-        State(state): State<AuthChainRouteState>,
-        headers: HeaderMap,
-        body: Bytes,
-    ) -> (StatusCode, Json<serde_json::Value>) {
-        record_auth_chain_route_request(&state.tx, "/minecraft/login", &headers, &body);
-
-        (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "access_token": "minecraft-access-token",
-                "expires_in": 86400,
-                "token_type": "Bearer"
-            })),
-        )
     }
 
     async fn record_route_minecraft_profile(

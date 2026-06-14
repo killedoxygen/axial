@@ -1,5 +1,5 @@
 import type { JSX } from 'preact';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { api, apiResourceUrl, apiUrl } from '../../api';
 import { Button, Input } from '../../ui/Atoms';
 import type { ContextMenuItem } from '../../ui/ContextMenu';
@@ -39,9 +39,7 @@ import {
   resolveUploadSkinVariant,
   savedSkinApplyErrorMessage,
   savedSkinDownloadFilename,
-  savedSkinFileUrl,
   savedSkinRecord,
-  savedSkinSourceLabel,
   skinActionErrorMessage,
   skinFlushResult,
   skinVariantValue,

@@ -13,7 +13,7 @@ import {
   type LoaderMachineEvent,
   type NewInstanceLoaderState,
 } from './new-instance-loader-core';
-import type { LoaderBuildRecord, LoaderComponentId, LoaderComponentRecord, LoaderGameVersion } from '../types';
+import type { LoaderComponentId, LoaderComponentRecord, LoaderGameVersion } from '../types';
 
 export type { NewInstanceLoaderState } from './new-instance-loader-core';
 

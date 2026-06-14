@@ -6,9 +6,6 @@ import { addInstance, removeInstance, updateInstanceInList } from '../../actions
 import type { Instance } from '../../types';
 import { partialFailureMessage, runBulkMutation } from './bulk-actions';
 
-// Instance-level actions shared between InstanceDetailView and InstancesView,
-// plus the folder helper used across this view's cards and panes.
-
 export async function openInstanceFolder(id: string, sub?: string): Promise<void> {
   try {
     const suffix = sub ? `?sub=${encodeURIComponent(sub)}` : '';

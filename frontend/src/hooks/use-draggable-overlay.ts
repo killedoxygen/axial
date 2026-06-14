@@ -104,6 +104,7 @@ function withScales(
   margin: number,
   fallback?: OverlayPosition,
 ): OverlayPosition {
+  // Store viewport-relative scales so overlays survive window resizes.
   const clamped = clampPosition(point, size, margin);
   return {
     x: clamped.x,

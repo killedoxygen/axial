@@ -138,9 +138,7 @@ export function Onboarding(): JSX.Element | null {
   const [isWeirdo, setIsWeirdo] = useState<boolean>(local.lightness >= 50);
   const [saving, setSaving] = useState(false);
   const [dissolving, setDissolving] = useState(false);
-  // Track name-input focus so the keyboard hint can mention the right key:
-  // Enter works from inside the input; → does NOT (arrow keys move the cursor
-  // there). Showing → while focused would mislead the user.
+  // The focused input hint shows Enter because arrow keys move the text cursor.
   const [nameFocused, setNameFocused] = useState(false);
   const [authStatus, setAuthStatus] = useState<AuthStatusRecord | null>(null);
   const [authState, setAuthState] = useState<AuthStatusState>('loading');
@@ -179,12 +177,8 @@ export function Onboarding(): JSX.Element | null {
   const idx = ORDER.indexOf(stage);
   const nameError = validateUsername(username);
   const nameValid = nameError === null;
-  // Only surface the error after the user has actually typed something;
-  // don't shout at an empty input they haven't touched yet.
   const showNameError = username.length > 0 && !nameValid;
 
-  // Single source of truth for whether the user can move off the current stage.
-  // Every forward path (button, keyboard Enter) funnels through this.
   const canAdvance: boolean =
     stage === 'name'
       ? nameValid && !microsoftLogin.busy
@@ -207,8 +201,7 @@ export function Onboarding(): JSX.Element | null {
   const jumpTo = (i: number): void => {
     const target = ORDER[i];
     if (!target || i === idx) return;
-    // Can't leap into a step that hasn't been reached yet — that has to be earned
-    // by a forward commit through the validated path.
+    // Only stages reached through the validated path can be jump targets.
     if (i > maxReached) return;
     setStage(target);
     Sound.ui('soft');
@@ -301,14 +294,7 @@ export function Onboarding(): JSX.Element | null {
     else advance();
   };
 
-  // Window-level keyboard routing. One handler, three shortcuts:
-  //   Enter       → advance / commit (same path as right arrow and ">")
-  //   Arrow Right → advance / commit (same path as Enter and ">")
-  //   Arrow Left  → back-nav to prior stage
-  // Arrow keys inside a text input keep their native cursor behavior, so we
-  // skip both arrow branches when the user is typing. Enter always routes
-  // through onCta — if the stage isn't ready (invalid name, no music pill),
-  // onCta is a no-op, so nothing bad happens.
+  // Enter always advances; arrow keys keep native cursor behavior in text fields.
   useEffect(() => {
     const h = (e: KeyboardEvent): void => {
       if (dissolving || saving) return;
@@ -358,10 +344,6 @@ export function Onboarding(): JSX.Element | null {
     headline = 'What should Minecraft call you?';
     widget = (
       <div class="cp-ob-widget cp-ob-namefield">
-        {/* Error and hint share one reserved slot above the input.
-            They are mutually exclusive (error only when the typed
-            name is invalid; hint only when valid). Placing them
-            above keeps the input and validation state visually grouped. */}
         <div class="cp-ob-feedback" data-state={showNameError ? 'error' : nameValid ? 'hint' : 'idle'}>
           {showNameError ? (
             <span class="cp-ob-feedback-error">{nameError}</span>

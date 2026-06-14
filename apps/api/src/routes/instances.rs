@@ -775,7 +775,7 @@ async fn handle_delete_instance(
         return Err((
             StatusCode::CONFLICT,
             Json(
-                serde_json::json!({ "error": "cannot delete a running instance — stop the game first" }),
+                serde_json::json!({ "error": "cannot delete a running instance; stop the game first" }),
             ),
         ));
     }

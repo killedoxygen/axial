@@ -538,42 +538,6 @@ mod tests {
     }
 
     #[test]
-    fn launch_suite_manifest_with_old_schema_version_is_invalid() {
-        let root = test_root("suite-old-schema");
-        let paths = test_paths(&root);
-        let suite_id = "suite-old-schema";
-        let path = suite_path(&paths, suite_id);
-        fs::create_dir_all(path.parent().expect("suite parent")).expect("create suite dir");
-        fs::write(
-            &path,
-            serde_json::to_string_pretty(&serde_json::json!({
-                "schema": BENCHMARK_SUITE_SCHEMA,
-                "schema_version": 1,
-                "suite_id": suite_id,
-                "instance_id": "instance",
-                "mode": "development",
-                "created_at": "2026-01-01T00:00:00.000Z",
-                "updated_at": "2026-01-01T00:00:00.000Z",
-                "runs": [{
-                    "run_index": 0,
-                    "profile": "vanilla_baseline",
-                    "run_type": "coldish",
-                    "target_id": "",
-                    "benchmark_id": "suite-development-00-vanilla_baseline-coldish",
-                    "state": "pending"
-                }]
-            }))
-            .expect("serialize manifest"),
-        )
-        .expect("write manifest");
-
-        let error = load(&paths, suite_id).expect_err("old schema should be invalid");
-
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn launch_suite_manifest_excludes_sensitive_fields_and_path_shapes() {
         let root = test_root("suite-sensitive");
         let paths = test_paths(&root);

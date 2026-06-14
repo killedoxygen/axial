@@ -12,54 +12,8 @@ export interface NormalizedVersionDisplay {
   searchText: string;
 }
 
-function inferNeoForgeMinecraftVersion(loaderVersion: string): string {
-  const numericParts = loaderVersion
-    .split('.')
-    .map((part) => {
-      const match = part.match(/^\d+/);
-      return match?.[0] ?? '';
-    })
-    .filter(Boolean);
-  const major = numericParts[0];
-  const minor = numericParts[1];
-  if (!major || !minor) return '';
-
-  const majorNumber = Number.parseInt(major, 10);
-  if (Number.isFinite(majorNumber) && majorNumber >= 25) {
-    const patch = numericParts[2];
-    return patch && patch !== '0' ? `${major}.${minor}.${patch}` : `${major}.${minor}`;
-  }
-
-  return minor === '0' ? `1.${major}` : `1.${major}.${minor}`;
-}
-
-function inferLoaderMinecraftVersion(versionId: string): string {
-  const lower = versionId.toLowerCase();
-
-  if (lower.startsWith('fabric-loader-')) {
-    const rest = versionId.slice('fabric-loader-'.length);
-    const index = rest.lastIndexOf('-');
-    return index >= 0 ? rest.slice(index + 1) : '';
-  }
-  if (lower.startsWith('quilt-loader-')) {
-    const rest = versionId.slice('quilt-loader-'.length);
-    const index = rest.lastIndexOf('-');
-    return index >= 0 ? rest.slice(index + 1) : '';
-  }
-  const forgeIndex = lower.lastIndexOf('-forge-');
-  if (forgeIndex > 0) {
-    return versionId.slice(0, forgeIndex);
-  }
-  if (lower.startsWith('neoforge-')) {
-    return inferNeoForgeMinecraftVersion(versionId.slice('neoforge-'.length));
-  }
-  return '';
-}
-
 function loaderMinecraftVersion(version: VersionDisplaySource): string {
-  const inherited = 'inherits_from' in version ? (version.inherits_from?.trim() ?? '') : '';
-  if (inherited) return inherited;
-  return inferLoaderMinecraftVersion(version.id);
+  return 'inherits_from' in version ? (version.inherits_from?.trim() ?? '') : '';
 }
 
 export function normalizeVersionDisplay(version: VersionDisplaySource | null | undefined): NormalizedVersionDisplay {

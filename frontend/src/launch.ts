@@ -427,6 +427,7 @@ function launchOutcomeDetails(
   healing: LaunchHealingSummary | undefined,
   leadDetail = '',
 ): string[] {
+  // Guardian-authored details lead unless Healing owns the concrete failure.
   const details: string[] = [];
   const guardianDetails = guardianNoticeDetails(guardian);
   const hasGuardianAuthoredDetails = guardianHasAuthoredDetails(guardian, guardianDetails);
@@ -676,14 +677,6 @@ export async function launchGame(): Promise<void> {
     showError(errMessage(err));
     if (!launchCommitted) rollbackLaunch(inst.id, launchAnimationFrameId);
   }
-}
-
-function makeCompositeSubscription(...subscriptions: Array<{ close(): void } | null>): { close(): void } {
-  return {
-    close(): void {
-      subscriptions.forEach((subscription) => subscription?.close());
-    },
-  };
 }
 
 function makeLaunchStatusPoller(

@@ -135,7 +135,7 @@ export function handleInstallClick(): void {
         loaderVersion: version.loader.loader_version,
         versionId: target,
       }
-    : parseLoaderFromId(target, version?.inherits_from || '');
+    : null;
   if (loader) {
     installLoaderVersion({
       subject_kind: 'loader_build',
@@ -172,101 +172,6 @@ export function installVersion(target: string): void {
   if (isActiveInstall(item)) return;
   enqueueInstall(item);
   if (installState.value.status === 'idle') processNextInstall();
-}
-
-function parseLoaderFromId(
-  id: string,
-  baseVersion: string,
-): {
-  componentId: LoaderComponentId;
-  buildId: string;
-  minecraftVersion: string;
-  loaderVersion: string;
-  versionId: string;
-} | null {
-  const lo = id.toLowerCase();
-  const inferredBase = baseVersion || inferMinecraftVersionFromCompositeId(id);
-
-  if (lo.startsWith('fabric-loader-')) {
-    const suffix = inferredBase ? `-${inferredBase}` : '';
-    const rest = id.slice('fabric-loader-'.length);
-    const loaderVersion = suffix && rest.endsWith(suffix) ? rest.slice(0, -suffix.length) : rest;
-    if (loaderVersion && inferredBase) {
-      return {
-        componentId: 'net.fabricmc.fabric-loader',
-        buildId: `fabric:${inferredBase}:${loaderVersion}`,
-        minecraftVersion: inferredBase,
-        loaderVersion,
-        versionId: id,
-      };
-    }
-  }
-
-  if (lo.startsWith('quilt-loader-')) {
-    const suffix = inferredBase ? `-${inferredBase}` : '';
-    const rest = id.slice('quilt-loader-'.length);
-    const loaderVersion = suffix && rest.endsWith(suffix) ? rest.slice(0, -suffix.length) : rest;
-    if (loaderVersion && inferredBase) {
-      return {
-        componentId: 'org.quiltmc.quilt-loader',
-        buildId: `quilt:${inferredBase}:${loaderVersion}`,
-        minecraftVersion: inferredBase,
-        loaderVersion,
-        versionId: id,
-      };
-    }
-  }
-
-  const forgeIndex = lo.lastIndexOf('-forge-');
-  if (forgeIndex > 0) {
-    const minecraftVersion = id.slice(0, forgeIndex);
-    const loaderVersion = id.slice(forgeIndex + '-forge-'.length);
-    if (minecraftVersion && loaderVersion) {
-      return {
-        componentId: 'net.minecraftforge',
-        buildId: `forge:${minecraftVersion}:${loaderVersion}`,
-        minecraftVersion,
-        loaderVersion,
-        versionId: id,
-      };
-    }
-  }
-
-  if (lo.startsWith('neoforge-')) {
-    const loaderVersion = id.slice('neoforge-'.length);
-    const minecraftVersion = inferNeoForgeGameVersion(loaderVersion);
-    if (loaderVersion && minecraftVersion) {
-      return {
-        componentId: 'net.neoforged',
-        buildId: `neoforge:${minecraftVersion}:${loaderVersion}`,
-        minecraftVersion,
-        loaderVersion,
-        versionId: id,
-      };
-    }
-  }
-
-  return null;
-}
-
-function inferNeoForgeGameVersion(loaderVersion: string): string {
-  const parts = loaderVersion.split('.', 3);
-  if (parts.length < 2) return '';
-  if (parts[1] === '0') return `1.${parts[0]}`;
-  return `1.${parts[0]}.${parts[1]}`;
-}
-
-function inferMinecraftVersionFromCompositeId(id: string): string {
-  const snapshot = id.match(/(\d{2}w\d{2}[a-z])$/i);
-  if (snapshot) return snapshot[1];
-
-  const prerelease = id.match(/(\d+\.\d+(?:\.\d+)?-(?:pre|rc)\d+)$/i);
-  if (prerelease) return prerelease[1];
-
-  const release = id.match(/(\d+\.\d+(?:\.\d+)?)$/);
-  if (release) return release[1];
-
-  return '';
 }
 
 export function installLoaderVersion(build: LoaderBuildRecord): void {
@@ -381,6 +286,7 @@ function activeStepProgress(data: InstallProgressEvent, label: string): InstallS
 }
 
 function phaseLabel(data: InstallProgressEvent, loaderInstall: boolean): string {
+  // These labels map backend install phases into stable user-facing progress copy.
   switch (data.phase) {
     case 'loader_meta':
       return 'Fetching loader info...';

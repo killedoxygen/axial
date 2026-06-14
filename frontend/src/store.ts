@@ -15,8 +15,6 @@ import type {
 } from './types';
 import type { LaunchStage } from './launch-stages';
 
-// ── Core data ──
-
 export const instances = signal<Instance[]>([]);
 export const versions = signal<Version[]>([]);
 export const config = signal<Config | null>(null);
@@ -24,8 +22,6 @@ export const systemInfo = signal<SystemInfo | null>(null);
 export const devMode = signal(false);
 export const catalog = signal<Catalog | null>(null);
 export const lastInstanceId = signal<string | null>(null);
-
-// ── Selection ──
 
 export const selectedInstanceId = signal<string | null>(null);
 
@@ -43,8 +39,6 @@ export function versionById(id: string | undefined): Version | undefined {
 export const selectedVersion = computed<Version | null>(() => {
   return versionById(selectedInstance.value?.version_id) ?? null;
 });
-
-// ── Install state machine ──
 
 export type InstallStepProgress = {
   phase: string;
@@ -82,8 +76,6 @@ export const installQueue = signal<InstallItem[]>([]);
 export const installFailure = signal<InstallFailure | null>(null);
 export const installEventSource = signal<{ close(): void } | null>(null);
 
-// ── Launch state machine ──
-
 export type LaunchState =
   | { status: 'idle' }
   | { status: 'preparing'; instanceId: string; pct: number; label: string; stage?: LaunchStage };
@@ -92,8 +84,6 @@ export const launchState = signal<LaunchState>({ status: 'idle' });
 export const runningSessions = signal<Record<string, RunningSession>>({});
 export const instanceLaunchDrafts = signal<Record<string, InstanceLaunchDraft>>({});
 export const launchNotices = signal<Record<string, LaunchNotice>>({});
-
-// ── UI state ──
 
 export const currentPage = signal<Page>('launcher');
 export const searchQuery = signal('');
@@ -108,8 +98,6 @@ export const appVersion = signal('1.1.0');
 export const toasts = signal<ToastItem[]>([]);
 export const updateInfo = signal<UpdateInfo | null>(null);
 export const updateCheckState = signal<'idle' | 'checking' | 'ready' | 'error'>('idle');
-
-// ── Derived state ──
 
 export const versionMap = computed<Map<string, Version>>(() => {
   const map = new Map<string, Version>();

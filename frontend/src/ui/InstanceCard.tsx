@@ -12,12 +12,10 @@ import type { EnrichedInstance } from '../types';
 
 function versionLabel(inst: EnrichedInstance): { loader: string; mc: string } {
   const v = versionById(inst.version_id);
-  const mc = minecraftVersionLabel(v, '—');
+  const mc = minecraftVersionLabel(v, 'Unknown');
   return { loader: LOADER_LABELS[loaderKeyFromVersion(v)], mc };
 }
 
-/* Cover card: square art on top, identity below, play overlay on hover.
- * The shared library tile for Home and Instances. */
 export function InstanceCard({
   inst,
   onContextMenu,

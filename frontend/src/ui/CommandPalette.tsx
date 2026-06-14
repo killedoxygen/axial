@@ -36,7 +36,7 @@ function buildCommands(): Command[] {
     commandPaletteOpen.value = false;
   };
   const goto =
-    (r: Route, hint?: string): Command['perform'] =>
+    (r: Route): Command['perform'] =>
     () => {
       navigate(r);
       close();

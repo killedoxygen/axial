@@ -22,11 +22,11 @@ This project is a desktop Minecraft launcher, not a marketing site. Keep UI work
 - Keep controls familiar:
   - icons for small actions;
   - segmented controls for small mode sets;
-  - dropdowns for larger option sets — always `ui/Select.tsx` (`SelectField`), never a native `<select>`;
+  - dropdowns for larger option sets: always `ui/Select.tsx` (`SelectField`), never a native `<select>`;
   - native disclosures for secondary or developer-only detail;
   - context menus for secondary row actions.
 - Modals use `ui/Modal.tsx` (`Modal`/`ModalContent`/`ModalHeader`/`ModalFooter`/`ModalTitle`/`ModalDescription`/`ModalClose`): portal rendering, scrim + Escape dismiss, focus trap and focus restore. Panels style themselves via `className`; pass `showCloseButton={false}` when the panel carries its own close.
-- Primitive policy: shadcn/ui is the **design and API reference** (component decomposition, `data-slot` conventions, behavior contract), but its Radix runtime does not render reliably under preact/compat — the dialog mounted only its overlay. Behavioral primitives are therefore implemented directly in Preact inside `ui/`, matching the shadcn contract, styled with `cp-*` classes. Do not add `@radix-ui/*` dependencies without smoke-testing the rendered output in the app first.
+- Primitive policy: shadcn/ui is the **design and API reference** (component decomposition, `data-slot` conventions, behavior contract), but its Radix runtime does not render reliably under preact/compat. The dialog mounted only its overlay. Behavioral primitives are therefore implemented directly in Preact inside `ui/`, matching the shadcn contract, styled with `cp-*` classes. Do not add `@radix-ui/*` dependencies without smoke-testing the rendered output in the app first.
 - Text inputs and select triggers focus with a neutral ring (stronger hairline + text-tinted halo), never accent. Accent rings are for interactive focus-visible on buttons only.
 - "Already installed" on version rows is the `download` icon (OpenAI icon set), not a colored status dot.
 - Do not use `cp-section-eyebrow`.
@@ -35,7 +35,7 @@ This project is a desktop Minecraft launcher, not a marketing site. Keep UI work
 
 ## Shell
 - The sidebar is a fixed 68px icon rail (`.cp-rail`): brand, search, Home/Instances/New, instance identity tiles, settings, player head. There is no expanded sidebar mode; labels live in tooltips and the command palette.
-- Active instance tile: full-color tile plus raised shadow while siblings sit dimmed — no rings or borders (they clip in the scroll container). Running instances get a status dot. Keep rail items 44px.
+- Active instance tile: full-color tile plus raised shadow while siblings sit dimmed. Do not use rings or borders because they clip in the scroll container. Running instances get a status dot. Keep rail items 44px.
 
 ## Selection & Active States
 - One selection language everywhere: solid `--accent-fill` background with `--accent-on` content (the onboarding pill pattern). No translucent accent washes, no accent borders for selection. Applies to rail nav, version rows, source tiles, runtime presets, icon-button active, settings rail, on/off pills.
@@ -48,7 +48,7 @@ This project is a desktop Minecraft launcher, not a marketing site. Keep UI work
 - Every tab is "toolbar row (30px controls) + raised panel" so switching tabs never shifts layout (`.cp-resource-toolbar` + panel).
 - Logs: the latest/current log renders by default at a fixed-height viewer (`.cp-logview`); past logs live behind a select. Log line colors derive from theme tokens, never hardcoded hues.
 - Instance settings: one raised sheet (`.cp-iset`) of hairline-divided sections, no master-detail nav, decoupled from the logs UI.
-- Overview first bento row (Worlds/Activity) is fixed-height so empty and populated states don't reflow.
+- Overview first bento row (Worlds/Activity) is fixed-height so empty and populated states do not reflow.
 - Context menus are expected on operational rows: worlds (tab and overview card), screenshots, mods, instance rows/cards.
 
 ## Layout Rules

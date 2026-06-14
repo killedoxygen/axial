@@ -81,6 +81,7 @@ pub fn sanitize_preset(
     is_modded: bool,
     info: &JavaRuntimeInfo,
 ) -> String {
+    // This is the compatibility gate for user and managed JVM preset choices.
     if !supports_hotspot_tuning(info) {
         return String::new();
     }

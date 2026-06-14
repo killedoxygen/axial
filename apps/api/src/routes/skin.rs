@@ -383,6 +383,7 @@ async fn active_minecraft_profile_skin(
     allowed_prefix: &str,
     not_ready_message: &'static str,
 ) -> Result<ActiveMinecraftProfileSkin, ApiError> {
+    // Remote profile textures must belong to the expected Minecraft texture host before use.
     let minecraft_state = state
         .auth_logins()
         .active_current_minecraft_account_state()
@@ -1310,6 +1311,7 @@ async fn handle_replace_saved_skin_texture(
     Query(query): Query<ReplaceSavedSkinTextureQuery>,
     body: Body,
 ) -> Result<Json<SavedSkinRecord>, ApiError> {
+    // Replacing texture bytes must retarget pending apply state from the old key to the new one.
     let old_texture_key = validate_texture_key(&path_texture_key)?;
     let saved_skins = list_saved_skins(&state).await?;
     let current = saved_skins
@@ -1554,6 +1556,7 @@ async fn apply_saved_skin_now_with_clients(
     cape_client: MinecraftCapeSyncClient,
     texture_client: MinecraftSkinTextureClient,
 ) -> Result<SkinApplyResponse, ApiError> {
+    // Direct apply uploads immediately; login/shutdown paths use the pending queue.
     let texture_key = validate_texture_key(&texture_key)?;
     let account = active_ready_minecraft_account_for_skin_apply(state).await?;
     apply_saved_skin_for_account_with_clients(
@@ -2020,6 +2023,7 @@ async fn preserve_current_profile_skin_before_change(
     client: &MinecraftSkinTextureClient,
     skip_texture_key: Option<&str>,
 ) -> Result<(), ApiError> {
+    // Do not overwrite a remote profile skin until the current external skin is saved locally.
     let Some(profile_skin) =
         select_sane_minecraft_skin_with_prefix(&account.profile.skins, client.allowed_prefix())
     else {
@@ -2924,6 +2928,7 @@ struct NormalizedSkinPng {
 }
 
 fn normalize_skin_png(bytes: &[u8]) -> Result<NormalizedSkinPng, ApiError> {
+    // Minecraft accepts 64x32 legacy skins, but Croopor stores normalized 64x64 PNGs.
     if !bytes.starts_with(PNG_SIGNATURE) {
         return Err(json_error(
             StatusCode::BAD_REQUEST,
@@ -3052,6 +3057,7 @@ fn normalize_legacy_skin_rgba(rgba: &[u8]) -> Vec<u8> {
 }
 
 fn suggest_skin_variant(rgba: &[u8]) -> &'static str {
+    // Slim skins leave the classic right-arm strip transparent in the normalized texture.
     for y in 20..32 {
         for x in 54..56 {
             let alpha_index = ((y * SKIN_WIDTH + x) * 4 + 3) as usize;

@@ -38,7 +38,7 @@ function relativeTime(iso?: string): string {
 }
 
 function versionBadge(v: Version | undefined): string {
-  return minecraftVersionLabel(v, '—');
+  return minecraftVersionLabel(v, 'Unknown');
 }
 
 const HOME_LIBRARY_CARD_LIMIT = 14;

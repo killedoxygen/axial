@@ -258,14 +258,12 @@ export const Sound = {
 };
 
 export function inferButtonSound(btn: HTMLElement): SoundKind | null {
-  // Skip buttons that play their own tailored sound
   if (btn.dataset.soundSilent === 'true') return null;
   if (btn.classList.contains('cp-winctrl')) return 'soft';
   if (btn.classList.contains('cp-sidebar-item')) return 'soft';
   if (btn.classList.contains('cp-seg') || btn.closest('.cp-seg')) return 'soft';
   if (btn.classList.contains('cp-ob-choice')) return 'soft';
 
-  // Button variants drive the sound directly.
   if (btn.classList.contains('cp-btn--primary')) {
     const explicit = btn.dataset.sound;
     if (explicit === 'launchPress' || explicit === 'affirm' || explicit === 'bright') return explicit;

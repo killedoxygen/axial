@@ -41,7 +41,7 @@ export function ContextMenuHost(): JSX.Element | null {
       if (e.key === 'Escape') closeContextMenu();
     };
     const onScroll = (): void => closeContextMenu();
-    // Use capture so we beat child handlers.
+    // Capture closes the menu before nested handlers can reopen it.
     window.addEventListener('mousedown', onDown, true);
     window.addEventListener('keydown', onKey);
     window.addEventListener('scroll', onScroll, true);
@@ -54,7 +54,7 @@ export function ContextMenuHost(): JSX.Element | null {
 
   if (!spec) return null;
 
-  // Keep menu inside viewport.
+  // Clamp the menu to the viewport.
   const max = 240;
   const lowerBound = 8;
   const clampedX = Math.max(lowerBound, Math.min(spec.x, window.innerWidth - max - lowerBound));

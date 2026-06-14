@@ -1,6 +1,3 @@
-/* Onboarding overlay. One canvas, one cinematic beat. */
-/* All animations are one-shot; the component teardown reclaims them. */
-
 .cp-ob-root {
   position: fixed;
   inset: 0;
@@ -12,13 +9,7 @@
   animation: cp-ob-root-in 320ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
 }
 
-/* Main region: grows between the status bar and the footer, vertically centers
-   the column. overflow auto is the safety net for very short windows — content
-   scrolls rather than colliding with the nav buttons.
-   With the status bar pulled out above main (topstrip 36 + statusbar ~50 ≈ 86)
-   and footer ~88, the chrome above/below main is near-symmetric, so main's
-   center naturally aligns with the viewport center. No asymmetric padding
-   needed. */
+/* Keeps the stage centered while short viewports scroll instead of colliding with the nav. */
 .cp-ob-main {
   flex: 1;
   display: flex;
@@ -39,10 +30,6 @@
   padding: 0 clamp(20px, 4vw, 40px) clamp(16px, 2.8vh, 28px);
 }
 
-/* Navigation — a single segmented pill holding < and >.
-   Grouping them in one container reads as a unified nav control, mirrors the
-   physical shape of the Arrow keys on a keyboard, and gives the buttons a
-   visual anchor at the bottom of the overlay. Pure grey, no accent. */
 .cp-ob-nav {
   display: inline-flex;
   padding: 4px;
@@ -93,9 +80,6 @@
   outline-offset: -2px;
 }
 
-/* Tight viewports (short laptops, small windowed sizes): shrink vertical gaps
-   inside the column so the centered stage + status row still fit comfortably
-   between the top strip and the fixed bottom bar. */
 @media (max-height: 720px) {
   .cp-ob-stage {
     gap: 16px;
@@ -142,8 +126,6 @@
   }
 }
 
-/* Top strip (drag region + window controls) ------------------------------ */
-
 .cp-ob-topstrip {
   flex-shrink: 0;
   height: 36px;
@@ -153,19 +135,13 @@
   padding-right: 2px;
 }
 
-/* Column ------------------------------------------------------------------ */
-
 .cp-ob-column {
   width: min(580px, 100%);
   display: flex;
   flex-direction: column;
 }
 
-/* Status bar — breadcrumb stepper at the absolute top of the viewport.
-   Numbered step labels separated by a chevron, clickable on past steps.
-   No container chrome (no border, no background), no separator line —
-   just typography + positioning. Its position never shifts; any layout
-   below is free to breathe with content. */
+/* The fixed-height status bar prevents stage content from shifting between steps. */
 .cp-ob-statusbar {
   flex-shrink: 0;
   display: flex;
@@ -271,8 +247,6 @@ button.cp-ob-stepper-item:focus-visible {
   padding: 0 2px;
 }
 
-/* Stage ------------------------------------------------------------------- */
-
 .cp-ob-stage {
   display: flex;
   flex-direction: column;
@@ -325,15 +299,12 @@ button.cp-ob-stepper-item:focus-visible {
   letter-spacing: 0;
 }
 
-/* Widget area ------------------------------------------------------------- */
-
 .cp-ob-widget {
   display: flex;
   flex-direction: column;
   gap: 14px;
 }
 
-/* Name stage input: a little taller and larger than the default Atom */
 .cp-ob-namefield .cp-field {
   height: 52px;
   padding: 0 18px;
@@ -344,8 +315,7 @@ button.cp-ob-stepper-item:focus-visible {
     background-color 240ms ease;
 }
 
-/* Override the Atom's accent-colored focus ring: a neutral high-contrast border
-   reads more professional here than a colored glow. */
+/* This onboarding field uses a neutral focus ring instead of the shared accent ring. */
 .cp-ob-namefield .cp-field.cp-field--focused {
   border-color: var(--text);
   box-shadow: none;
@@ -356,10 +326,7 @@ button.cp-ob-stepper-item:focus-visible {
   font-weight: 500;
 }
 
-/* Feedback slot above the name input — holds either the validation error OR
-   the keyboard hint (never both). One reserved row keeps layout stable as
-   state changes. Sits above the input so the input and validation state stay
-   visually grouped. */
+/* The reserved row keeps the input from jumping between hint and error states. */
 .cp-ob-feedback {
   display: flex;
   align-items: center;
@@ -491,7 +458,6 @@ button.cp-ob-stepper-item:focus-visible {
   color: var(--err);
 }
 
-/* Memory reading */
 .cp-ob-memory {
   gap: 16px;
 }
@@ -519,8 +485,6 @@ button.cp-ob-stepper-item:focus-visible {
   color: var(--text-mute);
   text-align: right;
 }
-
-/* Color stage: mode toggle row with Weirdo jab ---------------------------- */
 
 .cp-ob-mode-row {
   display: flex;
@@ -553,8 +517,6 @@ button.cp-ob-stepper-item:focus-visible {
     transform: none;
   }
 }
-
-/* Music pills ------------------------------------------------------------- */
 
 .cp-ob-pills {
   display: flex;
@@ -593,8 +555,6 @@ button.cp-ob-stepper-item:focus-visible {
   border-color: transparent;
 }
 
-/* Footnote ---------------------------------------------------------------- */
-
 .cp-ob-footnote {
   font-size: 11px;
   font-weight: 500;
@@ -616,8 +576,6 @@ button.cp-ob-stepper-item:focus-visible {
     transform: none;
   }
 }
-
-/* Reduced motion ---------------------------------------------------------- */
 
 @media (prefers-reduced-motion: reduce) {
   .cp-ob-root,

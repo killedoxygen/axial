@@ -334,6 +334,7 @@ async fn build_launch_preflight_facts(
     requested_max_memory_mb: Option<i32>,
     requested_min_memory_mb: Option<i32>,
 ) -> LaunchPreflightFacts {
+    // Preflight is read-only: no session creation, installs, Java probes, or raw path exposure.
     let memory_evidence = capture_launch_memory_evidence();
     let memory_defaults = policy::derived_launch_memory_defaults(
         instance,
@@ -423,6 +424,7 @@ async fn launch_auth_context_for_config_with_refresh(
     offline_username: &str,
     auth_refresh: LaunchAuthRefreshOptions,
 ) -> Result<LaunchAuthContext, (StatusCode, Json<serde_json::Value>)> {
+    // Online launches try one active-account refresh before returning a user-facing auth block.
     if let Some(account) = active_account {
         return match account.kind {
             LauncherAccountKind::Offline => Ok(LaunchAuthContext::offline(&account.display_name)),
@@ -744,6 +746,7 @@ fn capture_resource_budget_snapshot(
     active: ActiveLaunchResourceUse,
     requested_allocation_mb: i32,
 ) -> LaunchProofResourceBudget {
+    // Captured before launch work starts so Guardian and proof records use the same pressure view.
     let requested_memory_mb = positive_i32(requested_allocation_mb);
     let warning_facts = LaunchResourceWarningFacts {
         host_total_memory_mb: memory_evidence.host_total_memory_mb,

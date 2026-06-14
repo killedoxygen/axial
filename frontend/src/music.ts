@@ -79,17 +79,13 @@ export const Music = {
   track: 0,
   ready: false,
 
-  /** Resolved target volume (0-1). */
   get targetVolume(): number {
     return this.volume / 100;
   },
 
-  /** Whether audio is actively producing sound (not paused, not suppressed at 0). */
   get playing(): boolean {
     return !!audio && !audio.paused;
   },
-
-  // -- Configuration --
 
   applyConfig(cfg: { music_enabled?: boolean; music_volume?: number; music_track?: number }): void {
     if (cfg.music_enabled != null) this.enabled = cfg.music_enabled;
@@ -121,8 +117,6 @@ export const Music = {
       persistTimer = null;
     }, 400);
   },
-
-  // -- Playback --
 
   toggle(): void {
     this.enabled = !this.enabled;
@@ -165,7 +159,7 @@ export const Music = {
       startFade(this.targetVolume);
       this.syncUI();
     } catch {
-      /* autoplay blocked -- expected before interaction */
+      /* Browser blocked playback before user interaction. */
     }
   },
 
@@ -177,7 +171,6 @@ export const Music = {
     });
   },
 
-  /** Cycle to the next track. Cross-fades if currently playing. */
   nextTrack(): void {
     this.track = (this.track + 1) % trackCount;
     this.ready = false;
@@ -193,9 +186,7 @@ export const Music = {
     this.syncUI();
   },
 
-  // -- Game session suppression --
-  // Fades music out while any game instance is running.
-  // Does NOT touch `enabled` -- the user's preference is preserved.
+  // Game-session suppression preserves the user's enabled preference.
 
   suppress(): void {
     if (suppressed || !this.enabled) return;
@@ -215,9 +206,6 @@ export const Music = {
     this.syncUI();
   },
 
-  // -- UI sync --
-
-  /** Notify Preact music controls that state changed. */
   syncUI(): void {
     notifyMusicState();
   },

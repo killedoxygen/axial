@@ -174,7 +174,7 @@ async fn handle_delete_version(
         return Err((
             StatusCode::CONFLICT,
             Json(serde_json::json!({
-                "error": format!("cannot delete version {running_id} — stop the game first")
+                "error": format!("cannot delete version {running_id}; stop the game first")
             })),
         ));
     }

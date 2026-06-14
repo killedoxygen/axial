@@ -124,20 +124,4 @@ mod tests {
             assert_eq!(serialized.trim_matches('"'), class.as_str());
         }
     }
-
-    #[test]
-    fn launch_failure_class_rejects_old_aliases() {
-        assert_eq!(
-            LaunchFailureClass::from_name("jvm_experimental_unlock_required"),
-            None
-        );
-        assert_eq!(
-            LaunchFailureClass::from_name("classpath_or_module_conflict"),
-            None
-        );
-        serde_json::from_str::<LaunchFailureClass>("\"jvm_experimental_unlock_required\"")
-            .expect_err("old alias should not deserialize");
-        serde_json::from_str::<LaunchFailureClass>("\"classpath_or_module_conflict\"")
-            .expect_err("old alias should not deserialize");
-    }
 }

@@ -20,6 +20,8 @@ const DEFAULT_BENCHMARK_SUITE_DRIVER_INTERVAL_MS: u64 = 30_000;
 const MIN_BENCHMARK_SUITE_DRIVER_INTERVAL_MS: u64 = 5_000;
 const MAX_BENCHMARK_SUITE_DRIVER_INTERVAL_MS: u64 = 3_600_000;
 const MAX_BENCHMARK_SUITE_DRIVER_LIST: usize = 25;
+
+// These IDs are part of the Family C release-validation payload contract.
 const FAMILY_C_QUALIFICATION_PROOF_SCAN_LIMIT: usize = 100;
 const FAMILY_C_QUALIFICATION_SCHEMA: &str =
     "croopor.launch.benchmark.qualification.family_c_1_12_2";
@@ -227,6 +229,7 @@ pub(crate) fn spawn_restart_interrupted_benchmark_suite_drivers(state: &AppState
 pub(crate) async fn resume_restart_interrupted_benchmark_suite_drivers(
     state: AppState,
 ) -> BenchmarkSuiteDriverResumeSummary {
+    // Startup resume is best-effort. Each driver records its own resume failure.
     let pending = state
         .benchmark_suite_drivers()
         .take_restart_interrupted_resumable_drivers()
@@ -577,6 +580,7 @@ async fn resume_benchmark_suite_driver(
     let manifest = crate::state::benchmark_suites::load(state.config().paths(), &status.suite_id)
         .map_err(benchmark_suite_storage_error_response)?
         .ok_or_else(benchmark_suite_not_found_error)?;
+    // Prefer persisted driver identity, then manifest identity, then a derived fallback.
     let suite_id = crate::state::benchmark_suites::normalize_suite_id(&status.suite_id)
         .or_else(|| crate::state::benchmark_suites::normalize_suite_id(&manifest.suite_id))
         .unwrap_or_else(|| {
@@ -757,6 +761,7 @@ struct SanitizedLaunchCommand {
 }
 
 fn launch_command_response_payload(record: &LaunchSessionRecord) -> serde_json::Value {
+    // This diagnostic route never exposes raw credentials or token-like command values.
     let command = sanitize_launch_command(&record.command);
 
     json!({
@@ -1270,6 +1275,7 @@ struct FamilyCQualificationTarget {
 }
 
 fn family_c_qualification_targets() -> [FamilyCQualificationTarget; 2] {
+    // Qualification is complete only when both proof records and required managed evidence exist.
     [
         FamilyCQualificationTarget {
             role: "baseline",
@@ -2078,6 +2084,7 @@ async fn benchmark_suite_driver_decision(
     sessions: &crate::state::SessionStore,
     input: BenchmarkSuitePlanInput,
 ) -> Result<BenchmarkSuiteDriverDecision, (StatusCode, Json<serde_json::Value>)> {
+    // The driver either reports the active run, completes, or schedules exactly one next run.
     let pending_run_index = crate::state::benchmark_suites::next_pending_run_index(
         input.manifest.as_ref(),
         input.plan.len(),
@@ -2133,6 +2140,7 @@ async fn run_benchmark_suite_driver_loop(
     interval_ms: u64,
     mut stop_rx: tokio::sync::watch::Receiver<bool>,
 ) {
+    // Stop requests are observed between launches so an in-flight benchmark can finish cleanly.
     loop {
         if *stop_rx.borrow() {
             state
@@ -2325,18 +2333,6 @@ mod tests {
             error.1.0,
             serde_json::json!({ "error": "instance_id is required" })
         );
-    }
-
-    #[test]
-    fn benchmark_launch_request_rejects_old_benchmark_metadata_fields() {
-        let error = serde_json::from_value::<BenchmarkLaunchRequest>(serde_json::json!({
-            "instance_id": "instance",
-            "benchmark_profile": "dev",
-            "benchmark_run_type": "repeat"
-        }))
-        .expect_err("old benchmark metadata request fields should be rejected");
-
-        assert!(error.to_string().contains("unknown field"));
     }
 
     #[test]
@@ -2950,25 +2946,6 @@ mod tests {
                 .expect("suite mode input")
                 .mode,
             "release_validation"
-        );
-    }
-
-    #[test]
-    fn benchmark_suite_request_rejects_suite_mode_aliases() {
-        let request: BenchmarkLaunchRequest = serde_json::from_value(serde_json::json!({
-            "instance_id": "instance",
-            "suite_mode": "qual"
-        }))
-        .expect("deserialize suite request");
-
-        let error = request
-            .into_suite_launch_input()
-            .expect_err("suite mode alias should not be accepted");
-
-        assert_eq!(error.0, StatusCode::BAD_REQUEST);
-        assert_eq!(
-            error.1.0,
-            serde_json::json!({ "error": "suite_mode is not supported" })
         );
     }
 

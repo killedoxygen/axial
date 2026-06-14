@@ -1,7 +1,4 @@
-// Orchestrates instance creation: POST /instances, handle name collisions,
-// optionally queue a version install, toast, and navigate to the new instance.
-// Lives at the top level (next to install.ts) so it can import from both
-// install.ts and actions.ts without creating a cycle with actions.ts.
+// Kept at the top level so it can use install and action helpers without an import cycle.
 import { api, isApiError } from './api';
 import { toast } from './toast';
 import { errMessage } from './utils';
@@ -121,10 +118,7 @@ export async function createInstance(args: CreateInstanceArgs): Promise<CreateIn
     return { ok: false, error: lastError };
   }
 
-  // Apply user-tuned defaults from the create flow (memory, art seed, window
-  // size). Failures here don't kill the create; the instance is fine, the
-  // user can re-tune in Settings. The server returns the updated record so
-  // the UI signal carries the right values.
+  // Initial settings are best-effort after the instance record exists.
   const initial = args.initialSettings;
   if (initial && Object.keys(initial).length > 0) {
     try {
@@ -134,7 +128,7 @@ export async function createInstance(args: CreateInstanceArgs): Promise<CreateIn
         created = res;
       }
     } catch {
-      /* non-fatal */
+      /* Keep the created instance. */
     }
   }
 

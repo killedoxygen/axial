@@ -1,7 +1,3 @@
-// Theme engine
-// User picks a hue (0..359), vibrancy (0..100), and a light/dark mode
-// Vars mirror the :root block in style.css, components consume either
-// those CSS vars or the Theme object from tokens.ts (rebuilt on every change)
 import { signal } from '@preact/signals';
 import { defaults, local, saveLocalState, PRESET_HUES } from './state';
 import { api } from './api';
@@ -10,8 +6,6 @@ import { Sound } from './sound';
 import { buildTheme, type Theme } from './tokens';
 import { toast } from './toast';
 import { windowSetResizeBackground } from './native';
-
-// ── Reactive theme snapshot ──────────────────────────────────────────────────
 
 const initialThemeHue = local.theme === 'custom' ? local.customHue : (PRESET_HUES[local.theme] ?? local.customHue);
 
@@ -32,9 +26,6 @@ function syncNativeResizeBackground(dark: boolean): void {
     lastNativeResizeBackgroundDark = null;
   });
 }
-
-// Vibrancy is a chroma multiplier, 0..100, 100 gives full chroma of 0.14
-// Lightness is 0..100 where 0 is dark and 100 is light, we snap at 50
 
 function chromaFor(vibrancy: number): number {
   return (0.14 * Math.max(0, Math.min(100, vibrancy))) / 100;
@@ -90,7 +81,6 @@ function applyCssVars(hue: number, dark: boolean, vibrancy: number, deferLogo = 
     set('--text-mute', `oklch(0.58 0.010 ${hue})`);
   }
 
-  // Accent scale (hue-driven).
   set('--accent', `oklch(${L} ${C} ${hue})`);
   set('--accent-strong', `oklch(${L - 0.08} ${C} ${hue})`);
   set('--accent-hover', `oklch(${Math.min(0.99, L + 0.04)} ${C} ${hue})`);
@@ -230,8 +220,6 @@ export function resetThemeToDefault(): void {
       toast('Failed to reset theme', 'error');
     });
 }
-
-// ── Color field (hue × vibrancy picker). Pointer-driven square surface. ─────
 
 export function positionFieldMarker(
   field: HTMLElement | null,

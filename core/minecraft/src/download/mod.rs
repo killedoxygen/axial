@@ -1224,6 +1224,7 @@ async fn download_file_with_client(
     destination: &Path,
     expected: &ExpectedIntegrity,
 ) -> Result<(), DownloadError> {
+    // Files are downloaded through a temp path, verified, then promoted into place.
     if let Some(parent) = destination.parent() {
         async_fs::create_dir_all(parent).await?;
     }

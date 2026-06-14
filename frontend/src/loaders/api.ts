@@ -2,7 +2,6 @@ import { api, apiUrl } from '../api';
 import type {
   LoaderBuildRecord,
   LoaderBuildsResponse,
-  LoaderCatalogState,
   LoaderComponentId,
   LoaderComponentRecord,
   LoaderComponentsResponse,

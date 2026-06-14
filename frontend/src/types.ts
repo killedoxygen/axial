@@ -1,5 +1,3 @@
-// ── API response types (mirrors Rust structs) ──
-
 export interface Instance {
   id: string;
   name: string;
@@ -202,8 +200,6 @@ export interface Catalog {
   versions: CatalogVersion[];
 }
 
-// ── Install types ──
-
 export interface InstallItem {
   versionId: string;
   loader?: {
@@ -219,8 +215,6 @@ export interface ActiveInstall {
   pct: number;
   label: string;
 }
-
-// ── Launch / session types ──
 
 export interface LaunchBenchmarkMetadata {
   id?: string;
@@ -600,8 +594,6 @@ export interface BenchmarkSuiteDriversResponse {
   drivers: BenchmarkSuiteDriverResponse[];
 }
 
-// ── Performance program ──
-
 export type CompositionFamily = 'A' | 'B' | 'C' | 'D' | 'E' | 'F';
 
 export type CompositionTier = 'extended' | 'core' | 'vanilla_enhanced';
@@ -771,8 +763,6 @@ export interface PerformanceInstanceOperationResponse {
   operation: PerformanceOperationStatus | null;
 }
 
-// ── Version info (detail panel) ──
-
 export interface WorldInfo {
   name: string;
   size: number;
@@ -792,8 +782,6 @@ export interface VersionInfo {
   worlds: WorldInfo[];
   shared_data: SharedDataInfo[];
 }
-
-// ── Instance resource detail ──
 
 export interface InstanceWorld {
   name: string;
@@ -837,8 +825,6 @@ export interface InstanceLogTail {
   truncated: boolean;
   text: string;
 }
-
-// ── UI types ──
 
 export type Page = 'launcher' | 'settings';
 
@@ -885,8 +871,6 @@ export interface ToastItem {
   message: string;
   type: ToastKind;
 }
-
-// ── Loader metadata ──
 
 export interface LoaderAvailability {
   fresh: boolean;

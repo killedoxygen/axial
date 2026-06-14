@@ -127,7 +127,7 @@ export function LogsPane({
                 width={260}
                 options={sortedLogs.map((log) => ({
                   value: log.name,
-                  label: isCurrentLog(log.name) ? `${log.name} — latest` : log.name,
+                  label: isCurrentLog(log.name) ? `${log.name} (latest)` : log.name,
                 }))}
               />
               {isLive && (

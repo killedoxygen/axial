@@ -75,13 +75,6 @@ export function DownloadsView(): JSX.Element {
     : undefined;
   const activeEta = activeRemainingSeconds ? `${formatRemainingTime(activeRemainingSeconds)} left` : '';
   const nextQueuedLabel = queue.length > 0 ? formatInstallItemLabel(queue[0]) : '';
-  const pageStatus = hasActive
-    ? `1 active task${queue.length > 0 ? ` · ${queuedLabel}` : ''}`
-    : failure
-      ? `Install failed${queue.length > 0 ? ` · ${queuedLabel}` : ''}`
-      : queue.length > 0
-        ? `No active task · ${queuedLabel}`
-        : 'Nothing downloading';
   const failureCard = failure ? (
     <Card>
       <SectionHeading

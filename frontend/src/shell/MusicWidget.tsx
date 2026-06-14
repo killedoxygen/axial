@@ -2,9 +2,6 @@ import type { JSX } from 'preact';
 import { Icon } from '../ui/Icons';
 import { Music, musicStateVersion } from '../music';
 
-// Compact music control
-// When off, only the toggle is visible
-// When on, show equalizer during playback plus a skip button
 export function MusicWidget(): JSX.Element | null {
   musicStateVersion.value;
 

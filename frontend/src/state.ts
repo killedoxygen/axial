@@ -1,12 +1,8 @@
 import { signal } from '@preact/signals';
 import type { LocalPrefs } from './types';
 
-// ── Constants ──
-
 export const STORAGE_KEY: string = 'croopor_ui';
 export const PRESET_HUES: Record<string, number> = { obsidian: 140, deepslate: 215, nether: 15, end: 268, birch: 100 };
-
-// ── Local preferences (localStorage-backed) ──
 
 export const defaults: LocalPrefs = {
   theme: 'obsidian',
@@ -30,20 +26,10 @@ export function loadLocalState(): LocalPrefs {
   try {
     const raw: string | null = localStorage.getItem(STORAGE_KEY);
     if (!raw) return { ...defaults };
-    const {
-      logExpanded: _ignored,
-      offlineSkin,
-      ...saved
-    } = JSON.parse(raw) as Partial<
-      LocalPrefs & {
-        logExpanded?: boolean;
-        offlineSkin?: string;
-      }
-    >;
+    const saved = JSON.parse(raw) as Partial<LocalPrefs>;
     return {
       ...defaults,
       ...saved,
-      selectedSkin: saved.selectedSkin ?? offlineSkin ?? defaults.selectedSkin,
       selectedSkinsByAccount: stringRecord(saved.selectedSkinsByAccount),
     };
   } catch {

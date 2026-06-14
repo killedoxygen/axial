@@ -51,6 +51,7 @@ impl std::fmt::Display for InstallerTaskError {
     }
 }
 
+// Profile-source loaders ship a ready version JSON and then download its libraries.
 pub async fn install_from_profile_source<F>(
     library_dir: &Path,
     plan: &LoaderInstallPlan,
@@ -147,6 +148,7 @@ where
     Ok(installed_version_id)
 }
 
+// Installer-source loaders require extracting metadata and Maven entries from the installer jar.
 pub async fn install_from_installer_source<F>(
     library_dir: &Path,
     plan: &LoaderInstallPlan,
@@ -307,6 +309,7 @@ where
     Ok(installed_version_id)
 }
 
+// Legacy archive loaders carry Maven entries in provider-specific zip layouts.
 pub async fn install_from_legacy_archive<F>(
     library_dir: &Path,
     plan: &LoaderInstallPlan,

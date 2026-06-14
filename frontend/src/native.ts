@@ -256,8 +256,6 @@ export async function startNativeLaunchEvents(sessionId: string): Promise<boolea
   return true;
 }
 
-// ── Window controls (Tauri only). In browser mode these are no-ops. ──
-
 export async function windowMinimize(): Promise<boolean> {
   const tauri = getTauriBinding();
   if (!tauri?.core) return false;
