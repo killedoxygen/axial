@@ -11,10 +11,7 @@ pub mod strategies;
 pub mod types;
 pub mod workspace;
 
-pub use api::{
-    build_id_for, infer_build_from_version_id, infer_neoforge_minecraft_version,
-    installed_version_id_for, loader_components, parse_build_id,
-};
+pub use api::{build_id_for, installed_version_id_for, loader_components, parse_build_id};
 pub use index::{fetch_builds, fetch_components, fetch_supported_versions, resolve_build_record};
 pub use types::{
     LoaderArtifactKind, LoaderAvailability, LoaderBuildId, LoaderBuildMetadata, LoaderBuildRecord,

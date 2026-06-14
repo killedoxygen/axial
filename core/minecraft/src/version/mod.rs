@@ -1,15 +1,13 @@
-use crate::loaders::{
-    infer_build_from_version_id,
-    providers::common::infer_loader_build_metadata,
-    types::{CachedCatalog, LoaderBuildMetadata, LoaderComponentId, LoaderVersionIndex},
-};
-use crate::paths::{loader_catalog_dir, versions_dir};
+use crate::loaders::types::{LoaderBuildMetadata, LoaderComponentId};
+use crate::paths::versions_dir;
 use crate::types::{VersionEntry, VersionLoaderAttachment, VersionSubjectKind};
 use crate::version_meta::{analyze_minecraft_version, compare_version_entries};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+
+const LOADER_METADATA_FILE: &str = ".croopor-loader.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedVersion {
@@ -38,10 +36,25 @@ struct JavaVersionStub {
     major_version: i32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct InstalledLoaderMetadata {
+    #[serde(default)]
+    schema_version: u32,
+    component_id: LoaderComponentId,
+    #[serde(default)]
+    component_name: String,
+    build_id: String,
+    minecraft_version: String,
+    loader_version: String,
+    #[serde(default)]
+    build_meta: LoaderBuildMetadata,
+}
+
 pub fn scan_versions(mc_dir: &Path) -> std::io::Result<Vec<VersionEntry>> {
     let versions_dir = versions_dir(mc_dir);
     let entries = fs::read_dir(&versions_dir)?;
     let mut stubs = HashMap::new();
+    let mut loader_metadata = HashMap::new();
 
     for entry in entries.filter_map(Result::ok) {
         if !entry.path().is_dir() {
@@ -55,16 +68,20 @@ pub fn scan_versions(mc_dir: &Path) -> std::io::Result<Vec<VersionEntry>> {
         let Ok(stub) = serde_json::from_str::<VersionStub>(&data) else {
             continue;
         };
+        if let Some(metadata) = read_installed_loader_metadata(&entry.path()) {
+            loader_metadata.insert(id.clone(), metadata);
+        }
         stubs.insert(id, stub);
     }
 
     let mut versions = Vec::new();
     for (id, stub) in &stubs {
-        let effective_parent = effective_parent_version(id, &stub.inherits_from);
+        let metadata = loader_metadata.get(id);
+        let effective_parent = effective_parent_version(&stub.inherits_from, metadata);
         let jar_path = versions_dir.join(id).join(format!("{id}.jar"));
         let incomplete_marker = versions_dir.join(id).join(".incomplete");
 
-        let resolved_java = resolve_java_version(id, &stubs);
+        let resolved_java = resolve_java_version(id, &stubs, &loader_metadata);
         let (launchable, status, status_detail, needs_install) = if incomplete_marker.exists() {
             (
                 false,
@@ -116,7 +133,7 @@ pub fn scan_versions(mc_dir: &Path) -> std::io::Result<Vec<VersionEntry>> {
             }
         };
 
-        let loader = infer_loader_attachment(mc_dir, id);
+        let loader = metadata.map(loader_attachment_from_metadata);
         let analysis = analyze_minecraft_version(id, &stub.kind, &stub.release_time, None, &[]);
 
         versions.push(VersionEntry {
@@ -143,7 +160,11 @@ pub fn scan_versions(mc_dir: &Path) -> std::io::Result<Vec<VersionEntry>> {
     Ok(versions)
 }
 
-fn resolve_java_version(id: &str, stubs: &HashMap<String, VersionStub>) -> JavaVersionStub {
+fn resolve_java_version(
+    id: &str,
+    stubs: &HashMap<String, VersionStub>,
+    loader_metadata: &HashMap<String, InstalledLoaderMetadata>,
+) -> JavaVersionStub {
     let mut current_id = id.to_string();
     let mut current = stubs.get(&current_id);
     let mut fallback_parent = String::new();
@@ -151,7 +172,8 @@ fn resolve_java_version(id: &str, stubs: &HashMap<String, VersionStub>) -> JavaV
         if let Some(java_version) = &stub.java_version {
             return java_version.clone();
         }
-        let next_parent = effective_parent_version(&current_id, &stub.inherits_from);
+        let next_parent =
+            effective_parent_version(&stub.inherits_from, loader_metadata.get(&current_id));
         if next_parent.is_empty() {
             break;
         }
@@ -177,110 +199,54 @@ fn resolve_java_version(id: &str, stubs: &HashMap<String, VersionStub>) -> JavaV
     }
 }
 
-fn effective_parent_version(id: &str, declared_parent: &str) -> String {
+fn effective_parent_version(
+    declared_parent: &str,
+    metadata: Option<&InstalledLoaderMetadata>,
+) -> String {
     if !declared_parent.trim().is_empty() {
         return declared_parent.to_string();
     }
-    infer_loader_base_version(id).unwrap_or_default()
+    metadata
+        .map(|metadata| metadata.minecraft_version.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default()
 }
 
-fn infer_loader_base_version(id: &str) -> Option<String> {
-    let lower = id.to_ascii_lowercase();
-
-    if let Some(rest) = id.strip_prefix("fabric-loader-") {
-        return rest.rsplit_once('-').map(|(_, base)| base.to_string());
+fn read_installed_loader_metadata(version_dir: &Path) -> Option<InstalledLoaderMetadata> {
+    let data = fs::read(version_dir.join(LOADER_METADATA_FILE)).ok()?;
+    let metadata = serde_json::from_slice::<InstalledLoaderMetadata>(&data).ok()?;
+    if metadata.schema_version != 1
+        || metadata.build_id.trim().is_empty()
+        || metadata.minecraft_version.trim().is_empty()
+        || metadata.loader_version.trim().is_empty()
+    {
+        return None;
     }
-    if let Some(rest) = id.strip_prefix("quilt-loader-") {
-        return rest.rsplit_once('-').map(|(_, base)| base.to_string());
-    }
-    if lower.starts_with("neoforge-") {
-        let version = id.strip_prefix("neoforge-")?;
-        return Some(neoforge_to_mc_version(version));
-    }
-    id.split_once("-forge-").map(|(base, _)| base.to_string())
+    Some(metadata)
 }
 
-fn neoforge_to_mc_version(version: &str) -> String {
-    let numeric_parts = version
-        .split('.')
-        .map(|part| {
-            part.chars()
-                .take_while(|ch| ch.is_ascii_digit())
-                .collect::<String>()
-        })
-        .take_while(|part| !part.is_empty())
-        .collect::<Vec<_>>();
-    let Some(major) = numeric_parts.first() else {
-        return String::new();
-    };
-    let Some(minor) = numeric_parts.get(1) else {
-        return String::new();
-    };
-
-    if major.parse::<u32>().ok().is_some_and(|value| value >= 25) {
-        let mut parts = vec![major.clone(), minor.clone()];
-        if let Some(patch) = numeric_parts.get(2)
-            && patch != "0"
-        {
-            parts.push(patch.clone());
-        }
-        return parts.join(".");
+fn loader_attachment_from_metadata(metadata: &InstalledLoaderMetadata) -> VersionLoaderAttachment {
+    VersionLoaderAttachment {
+        component_id: metadata.component_id,
+        component_name: if metadata.component_name.trim().is_empty() {
+            metadata.component_id.display_name().to_string()
+        } else {
+            metadata.component_name.clone()
+        },
+        build_id: metadata.build_id.clone(),
+        loader_version: metadata.loader_version.clone(),
+        build_meta: metadata.build_meta.clone(),
     }
-
-    if minor == "0" {
-        return format!("1.{major}");
-    }
-
-    format!("1.{major}.{minor}")
-}
-
-fn infer_loader_attachment(mc_dir: &Path, version_id: &str) -> Option<VersionLoaderAttachment> {
-    let (component_id, build_id, minecraft_version, loader_version) =
-        infer_build_from_version_id(version_id)?;
-    let build_meta =
-        read_cached_loader_metadata(mc_dir, component_id, &build_id, &minecraft_version)
-            .unwrap_or_else(|| {
-                infer_loader_build_metadata(&loader_version, &[], false, false, None)
-            });
-
-    Some(VersionLoaderAttachment {
-        component_id,
-        component_name: component_id.display_name().to_string(),
-        build_id,
-        loader_version,
-        build_meta,
-    })
-}
-
-fn read_cached_loader_metadata(
-    mc_dir: &Path,
-    component_id: LoaderComponentId,
-    build_id: &str,
-    minecraft_version: &str,
-) -> Option<LoaderBuildMetadata> {
-    let cache_path = loader_catalog_dir(mc_dir).join(format!(
-        "component-{}-builds-{}.json",
-        component_id.short_key(),
-        minecraft_version
-    ));
-    let data = fs::read(cache_path).ok()?;
-    let cached = serde_json::from_slice::<CachedCatalog<LoaderVersionIndex>>(&data).ok()?;
-    cached
-        .value
-        .builds
-        .into_iter()
-        .find(|build| build.build_id == build_id)
-        .map(|build| build.build_meta)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{JavaVersionStub, VersionStub, resolve_java_version, scan_versions};
+    use super::{
+        InstalledLoaderMetadata, JavaVersionStub, VersionStub, resolve_java_version, scan_versions,
+    };
     use crate::loaders::types::{
-        CachedCatalog, LoaderArtifactKind, LoaderBuildMetadata, LoaderBuildRecord,
-        LoaderBuildSubjectKind, LoaderComponentId, LoaderInstallSource, LoaderInstallStrategy,
-        LoaderInstallability, LoaderSelectionMeta, LoaderSelectionReason, LoaderSelectionSource,
-        LoaderTerm, LoaderTermEvidence, LoaderTermSource, LoaderVersionIndex,
+        LoaderBuildMetadata, LoaderComponentId, LoaderSelectionMeta, LoaderSelectionReason,
+        LoaderSelectionSource, LoaderTerm, LoaderTermEvidence, LoaderTermSource,
     };
     use std::collections::HashMap;
     use std::fs;
@@ -288,7 +254,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn resolve_java_version_follows_current_parent_chain_for_loader_versions() {
+    fn resolve_java_version_follows_metadata_parent_chain_for_loader_versions() {
         let mut stubs = HashMap::new();
         stubs.insert(
             "fabric-loader-0.14.21-1.20.1".to_string(),
@@ -311,8 +277,13 @@ mod tests {
                 }),
             },
         );
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "fabric-loader-0.14.21-1.20.1".to_string(),
+            test_loader_metadata(LoaderComponentId::Fabric, "1.20.1", "0.14.21"),
+        );
 
-        let resolved = resolve_java_version("fabric-loader-0.14.21-1.20.1", &stubs);
+        let resolved = resolve_java_version("fabric-loader-0.14.21-1.20.1", &stubs, &metadata);
 
         assert_eq!(resolved.component, "java-runtime-gamma");
         assert_eq!(resolved.major_version, 17);
@@ -348,8 +319,8 @@ mod tests {
     }
 
     #[test]
-    fn scan_versions_reads_loader_lifecycle_from_cached_build_index() {
-        let mc_dir = unique_test_dir("loader-lifecycle-cache");
+    fn scan_versions_reads_loader_lifecycle_from_installed_metadata() {
+        let mc_dir = unique_test_dir("loader-lifecycle-metadata");
         let versions_dir = mc_dir.join("versions");
         let forge_dir = versions_dir.join("26.1.2-forge-64.0.4");
         fs::create_dir_all(&forge_dir).expect("create forge version dir");
@@ -363,50 +334,33 @@ mod tests {
         )
         .expect("write forge json");
 
-        let cache_dir = mc_dir.join("cache").join("loaders").join("catalog");
-        fs::create_dir_all(&cache_dir).expect("create cache dir");
-        let cache = CachedCatalog::new(LoaderVersionIndex {
-            component_id: LoaderComponentId::Forge,
-            builds: vec![LoaderBuildRecord {
-                subject_kind: LoaderBuildSubjectKind::LoaderBuild,
-                component_id: LoaderComponentId::Forge,
-                component_name: "Forge".to_string(),
-                build_id: "forge:26.1.2:64.0.4".to_string(),
-                minecraft_version: "26.1.2".to_string(),
-                loader_version: "64.0.4".to_string(),
-                version_id: "26.1.2-forge-64.0.4".to_string(),
-                build_meta: LoaderBuildMetadata {
-                    terms: vec![LoaderTerm::Beta, LoaderTerm::Latest],
-                    evidence: vec![
-                        LoaderTermEvidence {
-                            term: LoaderTerm::Beta,
-                            source: LoaderTermSource::ExplicitVersionLabel,
-                        },
-                        LoaderTermEvidence {
-                            term: LoaderTerm::Latest,
-                            source: LoaderTermSource::PromotionMarker,
-                        },
-                    ],
-                    selection: LoaderSelectionMeta {
-                        default_rank: 650,
-                        reason: LoaderSelectionReason::LatestUnstable,
-                        source: LoaderSelectionSource::AbsenceOfRecommended,
+        let metadata = InstalledLoaderMetadata {
+            build_meta: LoaderBuildMetadata {
+                terms: vec![LoaderTerm::Beta, LoaderTerm::Latest],
+                evidence: vec![
+                    LoaderTermEvidence {
+                        term: LoaderTerm::Beta,
+                        source: LoaderTermSource::ExplicitVersionLabel,
                     },
-                    display_tags: vec!["latest".to_string(), "beta".to_string()],
+                    LoaderTermEvidence {
+                        term: LoaderTerm::Latest,
+                        source: LoaderTermSource::PromotionMarker,
+                    },
+                ],
+                selection: LoaderSelectionMeta {
+                    default_rank: 650,
+                    reason: LoaderSelectionReason::LatestUnstable,
+                    source: LoaderSelectionSource::AbsenceOfRecommended,
                 },
-                strategy: LoaderInstallStrategy::ForgeModern,
-                artifact_kind: LoaderArtifactKind::InstallerJar,
-                installability: LoaderInstallability::Installable,
-                install_source: LoaderInstallSource::InstallerJar {
-                    url: "https://example.invalid/forge-installer.jar".to_string(),
-                },
-            }],
-        });
+                display_tags: vec!["latest".to_string(), "beta".to_string()],
+            },
+            ..test_loader_metadata(LoaderComponentId::Forge, "26.1.2", "64.0.4")
+        };
         fs::write(
-            cache_dir.join("component-forge-builds-26.1.2.json"),
-            serde_json::to_vec_pretty(&cache).expect("serialize cache"),
+            forge_dir.join(".croopor-loader.json"),
+            serde_json::to_vec_pretty(&metadata).expect("serialize metadata"),
         )
-        .expect("write cache");
+        .expect("write metadata");
 
         let versions = scan_versions(&mc_dir).expect("scan versions");
         let version = versions
@@ -424,6 +378,27 @@ mod tests {
         );
 
         fs::remove_dir_all(&mc_dir).expect("remove temp test dir");
+    }
+
+    fn test_loader_metadata(
+        component_id: LoaderComponentId,
+        minecraft_version: &str,
+        loader_version: &str,
+    ) -> InstalledLoaderMetadata {
+        InstalledLoaderMetadata {
+            schema_version: 1,
+            component_id,
+            component_name: component_id.display_name().to_string(),
+            build_id: format!(
+                "{}:{}:{}",
+                component_id.short_key(),
+                minecraft_version,
+                loader_version
+            ),
+            minecraft_version: minecraft_version.to_string(),
+            loader_version: loader_version.to_string(),
+            build_meta: LoaderBuildMetadata::default(),
+        }
     }
 
     fn unique_test_dir(name: &str) -> PathBuf {

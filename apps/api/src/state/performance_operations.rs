@@ -21,8 +21,6 @@ const RESUME_LIMIT_ERROR: &str = "pending performance operation ignored after re
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PerformanceOperationPayload {
-    pub version_id: String,
-    pub instance_performance_mode: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub game_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -320,7 +318,6 @@ fn is_non_terminal(state: &str) -> bool {
 fn is_valid_loaded_status(status: &PerformanceOperationStatus) -> bool {
     matches!(status.action.as_str(), "install" | "remove" | "rollback")
         && !status.instance_id.trim().is_empty()
-        && !status.payload.version_id.trim().is_empty()
 }
 
 fn load_status_file(path: &Path) -> io::Result<PerformanceOperationStatus> {
@@ -732,14 +729,12 @@ mod tests {
         let paths = test_paths(&root);
         let dir = operation_dir(&paths);
         fs::create_dir_all(&dir).expect("create operation dir");
-        let mut payload = test_payload();
-        payload.version_id = String::new();
         let status = test_status(
             "performance-install-00000000000000000000000000000001",
-            "instance-a",
+            "",
             "install",
             "applying",
-            payload,
+            test_payload(),
         );
         persist_status_to_dir(&dir, &status).expect("persist malformed status");
 
@@ -767,8 +762,6 @@ mod tests {
                 "instance_id": "instance-a",
                 "action": "install",
                 "payload": {
-                    "version_id": "1.20.4-fabric",
-                    "instance_performance_mode": "managed",
                     "unexpected_mode": true
                 },
                 "state": "applying",
@@ -856,8 +849,6 @@ mod tests {
 
     fn test_payload() -> PerformanceOperationPayload {
         PerformanceOperationPayload {
-            version_id: "1.20.4-fabric".to_string(),
-            instance_performance_mode: "managed".to_string(),
             game_version: None,
             loader: None,
             mode: None,

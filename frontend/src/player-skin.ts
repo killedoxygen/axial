@@ -22,7 +22,7 @@ type MinecraftProfileLike = {
   skins?: unknown;
 };
 
-type AuthAccountLike = {
+type LauncherAccountLike = {
   active?: unknown;
   account_id?: unknown;
   kind?: unknown;
@@ -36,7 +36,6 @@ type AuthStatusLike = {
   msa_refresh_available?: unknown;
   username?: unknown;
   minecraft_profile?: unknown;
-  accounts?: unknown;
 };
 
 type LauncherAccountsLike = {
@@ -129,8 +128,8 @@ async function applyAccountSkinFromAccounts(
     return;
   }
   const activeAccount = payload.accounts
-    .map(authAccountLike)
-    .find((account): account is AuthAccountLike => Boolean(account?.active));
+    .map(launcherAccountLike)
+    .find((account): account is LauncherAccountLike => Boolean(account?.active));
   if (!activeAccount) {
     await applyAccountSkinFromAuthStatus(requestId, fallbackName, refreshAttempted);
     return;
@@ -211,18 +210,12 @@ async function refreshAuthAndApplyAccountSkin(requestId: number, fallbackName: s
 }
 
 function activeStatusMinecraftProfile(status: AuthStatusLike): MinecraftProfileLike | null {
-  const profile = minecraftProfileLike(status.minecraft_profile);
-  if (profile) return profile;
-  if (!Array.isArray(status.accounts)) return null;
-  const activeAccount = status.accounts
-    .map(authAccountLike)
-    .find((account): account is AuthAccountLike => Boolean(account?.active));
-  return minecraftProfileLike(activeAccount?.minecraft_profile);
+  return minecraftProfileLike(status.minecraft_profile);
 }
 
-function authAccountLike(value: unknown): AuthAccountLike | null {
+function launcherAccountLike(value: unknown): LauncherAccountLike | null {
   if (!value || typeof value !== 'object') return null;
-  return value as AuthAccountLike;
+  return value as LauncherAccountLike;
 }
 
 function applyNoAccountHead(displayName = 'Player'): void {

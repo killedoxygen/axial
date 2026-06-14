@@ -9,7 +9,11 @@ use thiserror::Error;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VersionJson {
     pub id: String,
-    #[serde(rename = "inheritsFrom", default)]
+    #[serde(
+        rename = "inheritsFrom",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
     pub inherits_from: String,
     #[serde(rename = "type", default)]
     pub kind: String,

@@ -792,7 +792,6 @@ version = "0.4.0-alpha"
 dependencies = [
  "croopor-minecraft",
  "md5",
- "regex",
  "serde",
  "serde_json",
  "sysinfo",

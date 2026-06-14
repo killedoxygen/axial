@@ -16,6 +16,22 @@ export function fmtRelative(iso?: string): string {
   return `${y} year${y === 1 ? '' : 's'} ago`;
 }
 
+export function fmtRelativeCompact(iso?: string): string {
+  if (!iso) return 'never';
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) return 'never';
+  const diff = Date.now() - then;
+  const m = Math.floor(diff / 60000);
+  if (m < 1) return 'just now';
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h`;
+  const d = Math.floor(h / 24);
+  if (d < 30) return `${d}d`;
+  const mo = Math.floor(d / 30);
+  return `${mo}mo`;
+}
+
 export function fmtJoined(iso?: string): string {
   if (!iso) return 'unknown';
   const d = new Date(iso);

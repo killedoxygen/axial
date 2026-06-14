@@ -6,7 +6,7 @@ use axum::{
     response::sse::{Event, Sse},
     routing::{get, post},
 };
-use croopor_minecraft::{Downloader, infer_build_from_version_id};
+use croopor_minecraft::Downloader;
 use serde::Deserialize;
 use std::{convert::Infallible, path::PathBuf, time::SystemTime};
 use tokio::sync::mpsc;
@@ -36,15 +36,6 @@ async fn handle_install(
         return Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": "version_id is required" })),
-        ));
-    }
-
-    if is_loader_version_id(&version_id) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "modloader versions must be installed through /api/v1/loaders/install"
-            })),
         ));
     }
 
@@ -111,10 +102,6 @@ fn effective_install_fields(payload: &InstallRequest) -> (String, String) {
         payload.version_id.trim().to_string(),
         payload.manifest_url.trim().to_string(),
     )
-}
-
-fn is_loader_version_id(version_id: &str) -> bool {
-    infer_build_from_version_id(version_id).is_some()
 }
 
 fn sanitize_install_progress(mut progress: DownloadProgress) -> DownloadProgress {

@@ -1,4 +1,4 @@
-use crate::models::{AppConfig, AppConfigValidationError, LAUNCH_AUTH_MODE_OFFLINE};
+use crate::models::{AppConfig, AppConfigValidationError};
 use crate::paths::AppPaths;
 use std::fs;
 use std::path::Path;
@@ -73,8 +73,8 @@ impl ConfigStore {
     pub fn load_for_startup(paths: AppPaths) -> Result<ConfigStartupLoad, ConfigStoreError> {
         let (config, warnings) = match fs::read_to_string(&paths.config_file) {
             Ok(data) => match load_config_for_startup(&data) {
-                Ok(loaded) => loaded,
-                Err(ConfigStoreError::Parse(_)) => (
+                Ok(config) => (config, Vec::new()),
+                Err(ConfigStoreError::Parse(_) | ConfigStoreError::Validation(_)) => (
                     AppConfig::default(),
                     vec![CONFIG_STARTUP_WARNING.to_string()],
                 ),
@@ -137,30 +137,14 @@ impl ConfigStore {
     }
 }
 
-fn load_config_for_startup(data: &str) -> Result<(AppConfig, Vec<String>), ConfigStoreError> {
-    let parsed = serde_json::from_str::<AppConfig>(data)?;
-    match parsed.clone().normalized() {
-        Ok(config) => Ok((config, Vec::new())),
-        Err(AppConfigValidationError::InvalidLaunchAuthMode(_)) => {
-            let mut fallback = parsed;
-            fallback.launch_auth_mode = LAUNCH_AUTH_MODE_OFFLINE.to_string();
-            let config = fallback.normalized()?;
-            Ok((
-                config,
-                vec![
-                    "Croopor ignored an invalid launch auth setting for this session and is using Offline mode."
-                        .to_string(),
-                ],
-            ))
-        }
-        Err(error) => Err(ConfigStoreError::Validation(error)),
-    }
+fn load_config_for_startup(data: &str) -> Result<AppConfig, ConfigStoreError> {
+    Ok(serde_json::from_str::<AppConfig>(data)?.normalized()?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{ConfigStore, ConfigStoreError};
-    use crate::{AppConfig, AppConfigValidationError, AppPaths, LAUNCH_AUTH_MODE_OFFLINE};
+    use crate::{AppConfig, AppConfigValidationError, AppPaths};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -232,7 +216,7 @@ mod tests {
     }
 
     #[test]
-    fn load_for_startup_falls_back_only_for_invalid_launch_auth_mode_without_rewriting() {
+    fn load_for_startup_uses_default_config_and_warning_for_invalid_config_without_rewriting() {
         let paths = test_paths("startup-invalid-launch-auth-mode");
         fs::create_dir_all(&paths.config_dir).expect("should create temp config dir");
         let library_dir = paths.library_dir.to_string_lossy().to_string();
@@ -247,19 +231,12 @@ mod tests {
         fs::write(&paths.config_file, &data).expect("should write temp config");
 
         let loaded = ConfigStore::load_for_startup(paths.clone())
-            .expect("startup load should tolerate invalid launch auth mode");
-        let config = loaded.store.current();
+            .expect("startup load should tolerate invalid config");
 
-        assert_eq!(config.launch_auth_mode, LAUNCH_AUTH_MODE_OFFLINE);
-        assert_eq!(config.library_dir, library_dir);
-        assert_eq!(config.max_memory_mb, 600);
-        assert_eq!(config.min_memory_mb, 600);
+        assert_eq!(loaded.store.current(), AppConfig::default());
         assert_eq!(
             loaded.warnings,
-            vec![
-                "Croopor ignored an invalid launch auth setting for this session and is using Offline mode."
-                    .to_string()
-            ]
+            vec![super::CONFIG_STARTUP_WARNING.to_string()]
         );
         assert_eq!(
             fs::read_to_string(&paths.config_file).expect("config file should remain readable"),
@@ -333,7 +310,7 @@ mod tests {
     }
 
     #[test]
-    fn load_for_startup_keeps_rejecting_invalid_username() {
+    fn load_for_startup_uses_default_config_and_warning_for_invalid_username() {
         let paths = test_paths("startup-invalid-username");
         fs::create_dir_all(&paths.config_dir).expect("should create temp config dir");
         let data = serde_json::to_string_pretty(&AppConfig {
@@ -342,16 +319,20 @@ mod tests {
             ..AppConfig::default()
         })
         .expect("should serialize config");
-        fs::write(&paths.config_file, data).expect("should write temp config");
+        fs::write(&paths.config_file, &data).expect("should write temp config");
 
-        let err = match ConfigStore::load_for_startup(paths.clone()) {
-            Ok(_) => panic!("startup load should keep rejecting invalid username"),
-            Err(err) => err,
-        };
-        assert!(matches!(
-            err,
-            ConfigStoreError::Validation(AppConfigValidationError::InvalidUsername(_))
-        ));
+        let loaded = ConfigStore::load_for_startup(paths.clone())
+            .expect("startup should tolerate invalid config");
+
+        assert_eq!(loaded.store.current(), AppConfig::default());
+        assert_eq!(
+            loaded.warnings,
+            vec![super::CONFIG_STARTUP_WARNING.to_string()]
+        );
+        assert_eq!(
+            fs::read_to_string(&paths.config_file).expect("config file should remain readable"),
+            data
+        );
 
         cleanup(&paths.config_dir);
     }

@@ -737,42 +737,6 @@ pub fn resolve_plan(manifest: Option<&Manifest>, request: ResolutionRequest) -> 
     plan
 }
 
-pub fn extract_base_version(version_id: &str) -> String {
-    let mut fallback = String::new();
-    for part in version_id
-        .split('-')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-    {
-        if parse_version(part).is_ok() {
-            return part.to_string();
-        }
-        if fallback.is_empty() && part.matches('.').count() >= 1 {
-            fallback = part.to_string();
-        }
-    }
-    if fallback.is_empty() {
-        version_id.to_string()
-    } else {
-        fallback
-    }
-}
-
-pub fn infer_loader_from_version_id(version_id: &str) -> String {
-    let value = version_id.to_lowercase();
-    if value.contains("neoforge") {
-        "neoforge".to_string()
-    } else if value.contains("fabric") {
-        "fabric".to_string()
-    } else if value.contains("forge") {
-        "forge".to_string()
-    } else if value.contains("quilt") {
-        "quilt".to_string()
-    } else {
-        "vanilla".to_string()
-    }
-}
-
 pub fn parse_mode(raw: &str) -> Option<PerformanceMode> {
     match raw.trim().to_lowercase().as_str() {
         "managed" => Some(PerformanceMode::Managed),

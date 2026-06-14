@@ -67,7 +67,7 @@ export function isApiError(error: unknown): error is ApiError {
   return error instanceof Error && error.name === 'ApiError' && typeof (error as Partial<ApiError>).status === 'number';
 }
 
-export async function api(method: string, path: string, body?: unknown): Promise<any> {
+export async function api<T = any>(method: string, path: string, body?: unknown): Promise<T> {
   await initializeApiBase();
   const opts: RequestInit = { method };
   if (body !== undefined) {
@@ -79,7 +79,7 @@ export async function api(method: string, path: string, body?: unknown): Promise
   if (!response.ok) {
     throw makeApiError(response, payload);
   }
-  return payload;
+  return payload as T;
 }
 
 function normalizeApiBaseUrl(baseUrl: string): string {

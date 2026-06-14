@@ -13,6 +13,7 @@ use crate::loaders::types::{LoaderBuildRecord, LoaderError, LoaderInstallPlan};
 use crate::loaders::validate_version_id;
 use crate::paths::{loader_artifacts_dir, versions_dir};
 use crate::profiles::ensure_launcher_profiles;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::io::sink;
 use std::path::{Path, PathBuf};
@@ -23,6 +24,7 @@ use zip::ZipArchive;
 use zip::result::ZipError;
 
 const MAX_INSTALLER_DOWNLOAD_SIZE: u64 = 50 << 20;
+const LOADER_METADATA_FILE: &str = ".croopor-loader.json";
 
 #[derive(Debug)]
 struct CachedArtifact {
@@ -34,6 +36,17 @@ struct CachedArtifact {
 struct CachedProfile {
     bytes: Vec<u8>,
     fragment: LoaderProfileFragment,
+}
+
+#[derive(Debug, Serialize)]
+struct InstalledLoaderMetadata<'a> {
+    schema_version: u32,
+    component_id: crate::loaders::types::LoaderComponentId,
+    component_name: &'a str,
+    build_id: &'a str,
+    minecraft_version: &'a str,
+    loader_version: &'a str,
+    build_meta: &'a crate::loaders::types::LoaderBuildMetadata,
 }
 
 #[derive(Debug)]
@@ -136,6 +149,11 @@ where
     )?;
     cleanup_on_error(
         ensure_launcher_profiles(library_dir, &installed_version_id),
+        library_dir,
+        &installed_version_id,
+    )?;
+    cleanup_on_error(
+        write_installed_loader_metadata(library_dir, &installed_version_id, &plan.record).await,
         library_dir,
         &installed_version_id,
     )?;
@@ -301,6 +319,11 @@ where
         &installed_version_id,
     )?;
     cleanup_on_error(
+        write_installed_loader_metadata(library_dir, &installed_version_id, &plan.record).await,
+        library_dir,
+        &installed_version_id,
+    )?;
+    cleanup_on_error(
         finalize_version_install(library_dir, &installed_version_id),
         library_dir,
         &installed_version_id,
@@ -378,6 +401,11 @@ where
     )?;
     cleanup_on_error(
         ensure_launcher_profiles(library_dir, &plan.record.version_id),
+        library_dir,
+        &plan.record.version_id,
+    )?;
+    cleanup_on_error(
+        write_installed_loader_metadata(library_dir, &plan.record.version_id, &plan.record).await,
         library_dir,
         &plan.record.version_id,
     )?;
@@ -473,6 +501,28 @@ fn verify_install(library_dir: &Path, version_id: &str) -> Result<(), LoaderErro
     if !jar_path.is_file() {
         return Err(LoaderError::Verify("client jar is missing".to_string()));
     }
+    Ok(())
+}
+
+async fn write_installed_loader_metadata(
+    library_dir: &Path,
+    version_id: &str,
+    record: &LoaderBuildRecord,
+) -> Result<(), LoaderError> {
+    validate_version_id(version_id, "installed loader version id")?;
+    let metadata = InstalledLoaderMetadata {
+        schema_version: 1,
+        component_id: record.component_id,
+        component_name: &record.component_name,
+        build_id: &record.build_id,
+        minecraft_version: &record.minecraft_version,
+        loader_version: &record.loader_version,
+        build_meta: &record.build_meta,
+    };
+    let path = versions_dir(library_dir)
+        .join(version_id)
+        .join(LOADER_METADATA_FILE);
+    async_fs::write(path, serde_json::to_vec_pretty(&metadata)?).await?;
     Ok(())
 }
 

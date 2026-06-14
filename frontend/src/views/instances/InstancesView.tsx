@@ -16,23 +16,8 @@ import { instanceMenuItems } from '../instance/instance-menu';
 import { deleteInstancesFlow } from '../instance/instance-actions';
 import { supportsMods } from '../../utils';
 import { minecraftVersionLabel } from '../../version-display';
+import { fmtRelativeCompact } from '../instance/format';
 import type { EnrichedInstance, Version } from '../../types';
-
-function fmtRelative(iso?: string): string {
-  if (!iso) return 'never';
-  const then = new Date(iso).getTime();
-  if (Number.isNaN(then)) return 'never';
-  const diff = Date.now() - then;
-  const m = Math.floor(diff / 60000);
-  if (m < 1) return 'just now';
-  if (m < 60) return `${m}m`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return `${h}h`;
-  const d = Math.floor(h / 24);
-  if (d < 30) return `${d}d`;
-  const mo = Math.floor(d / 30);
-  return `${mo}mo`;
-}
 
 function versionLabel(v: Version | undefined): string {
   return minecraftVersionLabel(v, 'Unknown');
@@ -95,7 +80,7 @@ function ListRow({
       </div>
       <div class="cp-table-cell">{versionLabel(v)}</div>
       <div class="cp-table-cell">{showModsCount ? `${inst.mods_count ?? 0} mods` : null}</div>
-      <div class="cp-table-cell">{fmtRelative(inst.last_played_at)}</div>
+      <div class="cp-table-cell">{fmtRelativeCompact(inst.last_played_at)}</div>
       <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 4 }}>
         <Button
           size="sm"

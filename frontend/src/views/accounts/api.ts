@@ -2,7 +2,6 @@ import { api, apiResourceUrl, apiUrl, isApiError } from '../../api';
 import { DEFAULT_SKINS, type DefaultSkin } from '../../default-skins';
 import type { NativeDragDropPayload } from '../../native';
 import type {
-  AuthAccount,
   AuthStatusRecord,
   LauncherAccount,
   LauncherAccountsData,
@@ -427,27 +426,6 @@ export function minecraftReadiness(record: Record<string, unknown>): MinecraftAu
   };
 }
 
-function authAccount(value: unknown): AuthAccount | null {
-  if (
-    !isRecord(value) ||
-    typeof value.login_id !== 'string' ||
-    typeof value.active !== 'boolean' ||
-    typeof value.msa_authenticated !== 'boolean' ||
-    typeof value.msa_refresh_available !== 'boolean'
-  ) {
-    return null;
-  }
-
-  return {
-    login_id: value.login_id,
-    active: value.active,
-    msa_authenticated: value.msa_authenticated,
-    msa_token_expires_in: value.msa_token_expires_in === null ? null : maybeNumber(value.msa_token_expires_in),
-    msa_refresh_available: value.msa_refresh_available,
-    ...minecraftReadiness(value),
-  };
-}
-
 function launcherAccount(value: unknown): LauncherAccount | null {
   if (
     !isRecord(value) ||
@@ -518,9 +496,6 @@ export function authStatusResponse(value: unknown): AuthStatusRecord | null {
       typeof value.msa_provider === 'string' ? value.msa_provider : value.msa_provider === null ? null : undefined,
     msa_token_expires_in: value.msa_token_expires_in === null ? null : maybeNumber(value.msa_token_expires_in),
     msa_refresh_available: value.msa_refresh_available === true,
-    accounts: Array.isArray(value.accounts)
-      ? value.accounts.map(authAccount).filter((account): account is AuthAccount => account !== null)
-      : [],
     ...minecraftReadiness(value),
   };
 }

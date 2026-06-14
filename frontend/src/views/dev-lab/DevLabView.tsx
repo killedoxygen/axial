@@ -26,8 +26,8 @@ function parseSeed(value: string): number {
 
 function IdentityWorkbench(): JSX.Element {
   const [name, setName] = useState('Moonlit Forge');
-  const [versionId, setVersionId] = useState('1.21.1-fabric');
-  const [seed, setSeed] = useState(hashStr('Moonlit Forge:1.21.1-fabric') || 1);
+  const [versionId, setVersionId] = useState('1.21.1');
+  const [seed, setSeed] = useState(hashStr('Moonlit Forge:1.21.1') || 1);
   const inst = demoInstance(name || 'Untitled instance', versionId || 'unknown', seed);
 
   const randomize = (): void => {
@@ -61,7 +61,7 @@ function IdentityWorkbench(): JSX.Element {
           </label>
           <label>
             <span>Version hint</span>
-            <Input value={versionId} onChange={setVersionId} placeholder="1.21.1-fabric" />
+            <Input value={versionId} onChange={setVersionId} placeholder="1.21.1" />
           </label>
           <label>
             <span>Seed</span>

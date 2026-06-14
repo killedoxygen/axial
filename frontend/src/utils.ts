@@ -1,12 +1,12 @@
 import { collapsedLogSeverity, currentPage, logLines } from './store';
 import { toast } from './toast';
+import { loaderKeyFromComponentId, LOADER_LABELS } from './views/create/defaults';
 import type {
   CatalogVersion,
   LifecycleLabel,
   LifecycleMeta,
   LoaderBuildRecord,
   LoaderBuildMetadata,
-  LoaderType,
   Page,
   Version,
 } from './types';
@@ -148,64 +148,23 @@ export function formatLoaderVersionLabel(loaderVersion: string, buildMeta?: Load
 function parseModded(id: string, base: string, version?: Version | null): VersionDisplay {
   const normalized = parseNormalizedLoaderDisplay(base, version);
   if (normalized) return normalized;
-
-  const lo = id.toLowerCase();
-  if (lo.startsWith('fabric-loader-')) {
-    const suffix = base ? `-${base}` : '';
-    const rest = id.slice('fabric-loader-'.length);
-    const loaderVersion = suffix && rest.endsWith(suffix) ? rest.slice(0, -suffix.length) : rest;
-    return loaderDisplay('fabric', base, loaderVersion);
-  }
-  if (lo.startsWith('quilt-loader-')) {
-    const suffix = base ? `-${base}` : '';
-    const rest = id.slice('quilt-loader-'.length);
-    const loaderVersion = suffix && rest.endsWith(suffix) ? rest.slice(0, -suffix.length) : rest;
-    return loaderDisplay('quilt', base, loaderVersion);
-  }
-  const forgeIndex = lo.lastIndexOf('-forge-');
-  if (forgeIndex > 0) {
-    return loaderDisplay('forge', base, id.slice(forgeIndex + '-forge-'.length));
-  }
-  if (lo.startsWith('neoforge-')) {
-    return loaderDisplay('neoforge', base, id.slice('neoforge-'.length));
-  }
-  const m = id.match(/-optifine[_-](.*)/i);
-  if (m) return { name: `OptiFine ${base}`, hint: m[1].replace(/_/g, ' ').trim(), loader: null };
-  if (lo.includes('fabric')) return { name: `Fabric ${base}`, hint: null, loader: 'fabric' };
-  if (lo.includes('quilt')) return { name: `Quilt ${base}`, hint: null, loader: 'quilt' };
-  if (lo.includes('liteloader')) return { name: `LiteLoader ${base}`, hint: null, loader: null };
   return { name: base, hint: id !== base ? id : null, loader: null };
 }
 
 function parseNormalizedLoaderDisplay(base: string, version?: Version | null): VersionDisplay | null {
   if (!version?.loader) return null;
-  const loader = loaderTypeFromComponentId(version.loader.component_id);
-  if (!loader) return null;
+  const loader = loaderKeyFromComponentId(version.loader.component_id);
+  if (loader === 'vanilla') return null;
   return loaderDisplay(loader, base, version.loader.loader_version, version.loader.build_meta);
 }
 
-function loaderTypeFromComponentId(componentId: string): LoaderType | null {
-  if (componentId === 'net.fabricmc.fabric-loader') return 'fabric';
-  if (componentId === 'org.quiltmc.quilt-loader') return 'quilt';
-  if (componentId === 'net.minecraftforge') return 'forge';
-  if (componentId === 'net.neoforged') return 'neoforge';
-  return null;
-}
-
 function loaderDisplay(
-  loader: LoaderType,
+  loader: Exclude<ReturnType<typeof loaderKeyFromComponentId>, 'vanilla'>,
   base: string,
   loaderVersion: string,
   buildMeta?: LoaderBuildMetadata | null,
 ): VersionDisplay {
-  const title =
-    loader === 'fabric'
-      ? `Fabric ${base}`
-      : loader === 'quilt'
-        ? `Quilt ${base}`
-        : loader === 'forge'
-          ? `Forge ${base}`
-          : `NeoForge ${base}`;
+  const title = `${LOADER_LABELS[loader]} ${base}`;
   const hintPrefix = loader === 'fabric' || loader === 'quilt' ? 'Loader' : loader === 'forge' ? 'Forge' : 'NeoForge';
   return {
     name: title,

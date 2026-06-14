@@ -51,7 +51,6 @@ export interface AuthStatus {
   msa_provider?: string | null;
   msa_token_expires_in?: number | null;
   msa_refresh_available: boolean;
-  accounts: AuthAccount[];
 }
 
 export type AuthStatusRecord = AuthStatus & MinecraftAuthReadiness;
@@ -78,14 +77,6 @@ export interface SavedSkinRecord {
 export interface SavedSkinsData {
   skins: SavedSkinRecord[];
   pendingApplyKey: string | null;
-}
-
-export interface AuthAccount extends MinecraftAuthReadiness {
-  login_id: string;
-  active: boolean;
-  msa_authenticated: boolean;
-  msa_token_expires_in?: number | null;
-  msa_refresh_available: boolean;
 }
 
 export interface LauncherAccount extends MinecraftAuthReadiness {

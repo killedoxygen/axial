@@ -1,6 +1,6 @@
 use super::{
     AttemptOverrides, HealingSummaryInput, LaunchIntent, LaunchPreparationError,
-    LaunchPreparationMetrics, PreparedLaunchAttempt, build_healing_summary, infer_loader,
+    LaunchPreparationMetrics, PreparedLaunchAttempt, build_healing_summary,
 };
 use crate::build::{VanillaLaunchRequest, plan_resolved_launch};
 use crate::guardian::resolve_launch_preset;
@@ -103,8 +103,9 @@ where
     sanitize_effective_runtime_major(&mut runtime, &version.java_version);
 
     observer(LaunchPreparationEvent::Validating);
-    let loader = infer_loader(&intent.version_id);
-    let is_modded = loader != "vanilla" || !version.inherits_from.trim().is_empty();
+    let target_version_id = launch_target_version_id(intent, &version);
+    let loader = intent.loader.trim();
+    let is_modded = intent.is_modded || !version.inherits_from.trim().is_empty();
     let mut guardian_interventions = Vec::new();
     let mut effective_preset = if let Some(preset_override) = attempt.preset_override.clone() {
         preset_override
@@ -112,7 +113,7 @@ where
         let resolved = resolve_launch_preset(
             &intent.guardian,
             &intent.requested_preset,
-            &intent.version_id,
+            target_version_id,
             loader,
             is_modded,
             &runtime.effective_info,
@@ -259,6 +260,21 @@ fn launch_preparation_event_for_runtime_event(event: RuntimeEnsureEvent) -> Laun
     }
 }
 
+fn launch_target_version_id<'a>(
+    intent: &'a LaunchIntent,
+    version: &'a croopor_minecraft::VersionJson,
+) -> &'a str {
+    let explicit = intent.target_version_id.trim();
+    if !explicit.is_empty() {
+        return explicit;
+    }
+    let parent = version.inherits_from.trim();
+    if !parent.is_empty() {
+        return parent;
+    }
+    intent.version_id.trim()
+}
+
 fn uses_low_impact_startup(performance_mode: &str) -> bool {
     !matches!(performance_mode.trim(), "custom")
 }
@@ -368,6 +384,9 @@ mod tests {
                 library_dir: library_dir.clone(),
                 instance_id: format!("fabric-{}", target.minecraft_version),
                 version_id: version_id.clone(),
+                target_version_id: target.minecraft_version.to_string(),
+                loader: "fabric".to_string(),
+                is_modded: true,
                 username: "Player".to_string(),
                 auth: LaunchAuthContext::offline("Player"),
                 requested_java: fake_java.to_string_lossy().to_string(),
@@ -499,6 +518,9 @@ mod tests {
             library_dir: library_dir.clone(),
             instance_id: "auth-test".to_string(),
             version_id: version_id.to_string(),
+            target_version_id: version_id.to_string(),
+            loader: "vanilla".to_string(),
+            is_modded: false,
             username: "Player".to_string(),
             auth: LaunchAuthContext::offline("Player"),
             requested_java: fake_java.to_string_lossy().to_string(),
@@ -569,6 +591,9 @@ mod tests {
             library_dir: library_dir.clone(),
             instance_id: "custom-preset-block-test".to_string(),
             version_id: version_id.to_string(),
+            target_version_id: version_id.to_string(),
+            loader: "vanilla".to_string(),
+            is_modded: false,
             username: "Player".to_string(),
             auth: LaunchAuthContext::offline("Player"),
             requested_java: fake_java.to_string_lossy().to_string(),
@@ -648,6 +673,9 @@ mod tests {
             library_dir: library_dir.clone(),
             instance_id: "online-auth-test".to_string(),
             version_id: version_id.to_string(),
+            target_version_id: version_id.to_string(),
+            loader: "vanilla".to_string(),
+            is_modded: false,
             username: "OfflineName".to_string(),
             auth: LaunchAuthContext {
                 player_name: "ProfileName".to_string(),
@@ -729,6 +757,9 @@ mod tests {
             library_dir,
             instance_id: "runtime-event-test".to_string(),
             version_id: version_id.to_string(),
+            target_version_id: version_id.to_string(),
+            loader: "vanilla".to_string(),
+            is_modded: false,
             username: "Player".to_string(),
             auth: LaunchAuthContext::offline("Player"),
             requested_java: fake_java.to_string_lossy().to_string(),

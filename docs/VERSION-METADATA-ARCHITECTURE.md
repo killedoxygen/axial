@@ -176,6 +176,7 @@ Frontend code should:
 - render version labels through `frontend/src/version-display.ts`
 - use `minecraftVersionLabel()` for Minecraft-only UI labels
 - never render composite loader ids such as `quilt-loader-0.29.2-1.16.5`, `1.19-forge-41.1.0`, or `neoforge-26.1.0.19-beta` as the Minecraft version; backend metadata must provide `inherits_from` or normalized Minecraft metadata
+- installed loader versions must carry backend-authored loader metadata from `versions/<id>/.croopor-loader.json`; scanners and routes should not infer loader identity from raw version ids
 - use `normalizeVersionDisplay()` / `versionSearchText()` for version picker rows and filtering
 - use `lifecycle` for filtering and badges
 - avoid re-parsing vanilla-like version ids locally

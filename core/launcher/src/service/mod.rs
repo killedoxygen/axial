@@ -12,7 +12,7 @@ use crate::types::LaunchFailureClass;
 use serde::{Deserialize, Serialize};
 
 pub use crate::guardian::{RecoveryAction, RecoveryPlan, conservative_healing_preset};
-pub use healing::{HealingSummaryInput, build_healing_summary, infer_loader};
+pub use healing::{HealingSummaryInput, build_healing_summary};
 pub use mapping::{
     failure_class_name, format_failure_class, is_terminal_state, is_terminal_status,
     launch_stage_label, launch_state_name, snapshot_status,
@@ -28,6 +28,9 @@ pub struct LaunchIntent {
     pub library_dir: std::path::PathBuf,
     pub instance_id: String,
     pub version_id: String,
+    pub target_version_id: String,
+    pub loader: String,
+    pub is_modded: bool,
     pub username: String,
     pub auth: LaunchAuthContext,
     pub requested_java: String,

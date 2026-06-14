@@ -91,6 +91,7 @@ Guardian should reason from explicit facts, not implicit booleans:
 - origin of each override: global or instance
 - required Java major/runtime facts
 - effective runtime facts
+- target Minecraft version, loader component, and modded state from installed version metadata
 - requested preset and computed preset facts
 - host memory total and active launch allocation
 - selected raw minimum memory and effective maximum memory
@@ -111,7 +112,7 @@ Guardian should produce one normalized outcome for the pipeline:
 ## Current pipeline role
 
 ### Pre-launch
-1. Route builds `LaunchIntent`
+1. Route builds `LaunchIntent` with explicit target Minecraft version, loader component, and modded state from the installed version scan
 2. `LaunchGuardianContext` is assembled from config + instance overrides
 3. preparation captures selected memory bounds, host resource observations, active launch/install counts, CPU thread/load observations, and launch-relevant disk free space as Guardian warning facts
 4. preparation gathers runtime and override facts
@@ -133,7 +134,7 @@ Guardian should produce one normalized outcome for the pipeline:
 ### Startup failure
 1. Session layer reports observations about exit/stall/log output and stores only Guardian-classified startup failure classes
 2. runner keeps the session observation plumbing and maps `stalled`/`exited` observations into bounded Guardian startup-failure facts
-3. Guardian decides whether startup recovery is allowed
+3. Guardian decides whether startup recovery is allowed from the explicit target Minecraft version, not from raw loader version ids
 4. if allowed, the launch runner executes the Guardian-approved recovery action and Healing records supporting retry/fallback detail
 5. if not allowed, Guardian converts the startup observation into a blocked message, details, and guidance before the runner emits terminal launch failure status
 

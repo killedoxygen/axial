@@ -299,8 +299,7 @@ fn conservative_g1_args(pause_millis: i32, low_impact_startup: bool) -> Vec<Stri
 }
 
 fn is_legacy_family(version_id: &str) -> bool {
-    let version = base_version_id(version_id);
-    let parts = version
+    let parts = version_id
         .split('.')
         .filter_map(|part| part.parse::<u32>().ok())
         .collect::<Vec<_>>();
@@ -311,11 +310,10 @@ fn is_legacy_family(version_id: &str) -> bool {
 }
 
 fn legacy_preset_for_target(version_id: &str, loader: &str, is_modded: bool) -> &'static str {
-    let version = base_version_id(version_id);
-    if version == "1.8.9" {
+    if version_id == "1.8.9" {
         return PRESET_LEGACY_PVP;
     }
-    if version == "1.12.2" && is_modded_launch(loader, is_modded) {
+    if version_id == "1.12.2" && is_modded_launch(loader, is_modded) {
         return PRESET_LEGACY_HEAVY;
     }
     PRESET_LEGACY
@@ -336,23 +334,6 @@ fn is_known_preset(preset: &str) -> bool {
             | PRESET_LEGACY_PVP
             | PRESET_LEGACY_HEAVY
     )
-}
-
-fn base_version_id(version_id: &str) -> String {
-    if let Some((base, _)) = version_id.split_once("-forge-") {
-        return base.to_string();
-    }
-    if let Some(value) = version_id.strip_prefix("neoforge-") {
-        return value.to_string();
-    }
-    if let Some(captures) = regex::Regex::new(r"^(?:fabric|quilt)-loader-.+-(\d+\.\d+(?:\.\d+)?)$")
-        .ok()
-        .and_then(|regex| regex.captures(version_id))
-        && let Some(matched) = captures.get(1)
-    {
-        return matched.as_str().to_string();
-    }
-    version_id.to_string()
 }
 
 #[cfg(test)]

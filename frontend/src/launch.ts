@@ -114,30 +114,6 @@ function describeFailureClass(failureClass: string | undefined): string {
   }
 }
 
-function formatPresetName(preset: string): string {
-  switch (preset) {
-    case 'smooth':
-      return 'Smooth';
-    case 'performance':
-      return 'Performance';
-    case 'ultra_low_latency':
-      return 'Ultra Low Latency';
-    case 'graalvm':
-      return 'GraalVM';
-    case 'legacy':
-      return 'Legacy';
-    case 'legacy_pvp':
-      return 'Legacy PvP';
-    case 'legacy_heavy':
-      return 'Legacy Heavy';
-    case '':
-    case 'none':
-      return 'Auto';
-    default:
-      return preset.replace(/_/g, ' ').replace(/\b\w/g, (m) => m.toUpperCase());
-  }
-}
-
 function ensureSentence(text: string): string {
   const trimmed = text.trim();
   if (!trimmed) return '';
@@ -145,56 +121,8 @@ function ensureSentence(text: string): string {
   return `${trimmed}.`;
 }
 
-function stripFinalSentencePunctuation(text: string): string {
-  return text.replace(/[.!?]+$/, '').trim();
-}
-
 function formatHealingDetail(detail: string): string {
-  const trimmed = detail.trim();
-  if (!trimmed) return '';
-  const comparable = stripFinalSentencePunctuation(trimmed);
-
-  let match = comparable.match(/^Requested JVM preset "([^"]+)" was downgraded to "([^"]+)" for compatibility$/);
-  if (match) {
-    return `GC preset changed from ${formatPresetName(match[1])} to ${formatPresetName(match[2])} to match this runtime.`;
-  }
-
-  if (comparable === 'Requested Java override was bypassed in favor of a safer managed runtime') {
-    return 'Java override was skipped and the managed runtime was used instead.';
-  }
-  if (comparable === 'Requested runtime override was bypassed in favor of a safer managed runtime') {
-    return 'Java override was skipped and the managed runtime was used instead.';
-  }
-
-  if (comparable === 'Guardian switched to managed Java before launch') {
-    return 'Guardian switched to the managed Java runtime before launch.';
-  }
-
-  match = comparable.match(/^Automatic retry: downgraded JVM preset to "([^"]+)" after startup failure$/);
-  if (match) {
-    return `Croopor retried startup with the ${formatPresetName(match[1])} GC preset.`;
-  }
-
-  if (comparable === 'Automatic retry: disabled custom GC flags after startup failure') {
-    return 'Croopor retried startup without custom GC flags.';
-  }
-
-  if (comparable === 'Automatic retry: switched to managed Java after runtime mismatch') {
-    return 'Croopor retried startup with the managed Java runtime.';
-  }
-
-  match = trimmed.match(/^Launch recovered automatically after (\d+) retry attempt(?:s)?\.$/);
-  if (match) {
-    const count = Number(match[1]);
-    return `Recovered automatically after ${count} ${count === 1 ? 'retry' : 'retries'}.`;
-  }
-
-  match = trimmed.match(/^Reason: (.+)$/);
-  if (match) {
-    return ensureSentence(`Reason: ${match[1]}`);
-  }
-
-  return ensureSentence(trimmed);
+  return ensureSentence(detail);
 }
 
 function healingToastMessage(healing: LaunchHealingSummary): string {
@@ -244,7 +172,7 @@ function healingNoticeDetails(healing: LaunchHealingSummary): string[] {
   if (healing.retry_count && healing.retry_count > 0) {
     pushUniqueNoticeDetail(
       details,
-      `Launch recovered automatically after ${healing.retry_count} retry attempt${healing.retry_count > 1 ? 's' : ''}.`,
+      `Recovered automatically after ${healing.retry_count} ${healing.retry_count === 1 ? 'retry' : 'retries'}.`,
     );
   }
   if (healing.failure_class) {

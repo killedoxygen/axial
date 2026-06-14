@@ -6,9 +6,8 @@ use crate::{
     microsoft_auth::{MicrosoftAuthError, MicrosoftAuthErrorKind, MicrosoftAuthStep},
     routes::accounts,
     state::{
-        ActiveMinecraftAccountState, ActiveMsaTokenState, AppState, AuthLoginAccountState,
-        AuthLoginMinecraftAccount, AuthLoginMinecraftCape, AuthLoginMinecraftProfile,
-        AuthLoginMinecraftSkin, AuthLoginStore,
+        ActiveMinecraftAccountState, ActiveMsaTokenState, AppState, AuthLoginMinecraftAccount,
+        AuthLoginMinecraftCape, AuthLoginMinecraftProfile, AuthLoginMinecraftSkin, AuthLoginStore,
     },
 };
 use axum::{
@@ -48,7 +47,6 @@ struct AuthStatusResponse {
     minecraft_profile: Option<AuthMinecraftProfileResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     minecraft_token_expires_in: Option<u64>,
-    accounts: Vec<AuthAccountResponse>,
     login_available: bool,
     login_reason: &'static str,
 }
@@ -108,22 +106,6 @@ pub(crate) struct AuthMinecraftCapeResponse {
     id: String,
     state: String,
     url: String,
-}
-
-#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
-pub(crate) struct AuthAccountResponse {
-    login_id: String,
-    active: bool,
-    msa_authenticated: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    msa_token_expires_in: Option<u64>,
-    msa_refresh_available: bool,
-    minecraft_profile_ready: bool,
-    minecraft_ownership_verified: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    minecraft_profile: Option<AuthMinecraftProfileResponse>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    minecraft_token_expires_in: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -270,12 +252,6 @@ async fn auth_status_for_store(
             account: None,
             token_expires_in: None,
         });
-    let accounts = login_store
-        .account_states()
-        .await
-        .into_iter()
-        .map(auth_account_response)
-        .collect();
     auth_status_from_username(
         &config.username,
         &config.launch_auth_mode,
@@ -285,7 +261,6 @@ async fn auth_status_for_store(
             refresh_available,
         },
         minecraft_state,
-        accounts,
     )
 }
 
@@ -294,7 +269,6 @@ fn auth_status_from_username(
     launch_auth_mode: &str,
     msa_state: AuthStatusMsaState,
     minecraft_state: AuthStatusMinecraftState,
-    accounts: Vec<AuthAccountResponse>,
 ) -> Result<AuthStatusResponse, (StatusCode, Json<serde_json::Value>)> {
     let username = validate_username(config_username).map_err(|error| {
         (
@@ -348,31 +322,9 @@ fn auth_status_from_username(
             .is_some_and(|account| account.owns_minecraft_java),
         minecraft_profile,
         minecraft_token_expires_in: minecraft_state.token_expires_in,
-        accounts,
         login_available: false,
         login_reason: LOGIN_UNAVAILABLE_REASON,
     })
-}
-
-fn auth_account_response(state: AuthLoginAccountState) -> AuthAccountResponse {
-    let minecraft_profile = state
-        .minecraft_account
-        .as_ref()
-        .map(|account| auth_minecraft_profile_response(&account.profile));
-    AuthAccountResponse {
-        login_id: state.login_id,
-        active: state.active,
-        msa_authenticated: state.msa_authenticated,
-        msa_token_expires_in: state.msa_token_expires_in,
-        msa_refresh_available: state.msa_refresh_available,
-        minecraft_profile_ready: state.minecraft_account.is_some(),
-        minecraft_ownership_verified: state
-            .minecraft_account
-            .as_ref()
-            .is_some_and(|account| account.owns_minecraft_java),
-        minecraft_profile,
-        minecraft_token_expires_in: state.minecraft_token_expires_in,
-    }
 }
 
 fn minecraft_account_can_launch_online(account: &AuthLoginMinecraftAccount) -> bool {
@@ -832,7 +784,6 @@ mod tests {
         assert!(!response.minecraft_ownership_verified);
         assert_eq!(response.minecraft_profile, None);
         assert_eq!(response.minecraft_token_expires_in, None);
-        assert!(response.accounts.is_empty());
         assert!(!response.login_available);
         assert_eq!(response.login_reason, LOGIN_UNAVAILABLE_REASON);
     }
@@ -879,7 +830,6 @@ mod tests {
             "offline",
             AuthStatusMsaState::unauthenticated(),
             AuthStatusMinecraftState::unauthenticated(),
-            Vec::new(),
         )
         .expect_err("invalid username should fail");
 
@@ -1247,15 +1197,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auth_status_lists_signed_in_microsoft_accounts() {
+    async fn auth_status_uses_active_microsoft_account_profile() {
         let store = Arc::new(AuthLoginStore::new());
-        let first = insert_active_current_login_with_account(
+        let _first = insert_active_current_login_with_account(
             &store,
             Some("first-refresh-token"),
             test_minecraft_account_with_id("first-profile-id", "FirstProfile"),
         )
         .await;
-        let second = insert_active_current_login_with_account(
+        insert_active_current_login_with_account(
             &store,
             Some("second-refresh-token"),
             test_minecraft_account_with_id("second-profile-id", "SecondProfile"),
@@ -1276,28 +1226,15 @@ mod tests {
         assert_eq!(response.mode, "online");
         assert_eq!(response.username, "SecondProfile");
         assert_eq!(response.uuid, "second-profile-id");
-        assert_eq!(response.accounts.len(), 2);
-        assert_eq!(response.accounts[0].login_id, second.login_id);
-        assert!(response.accounts[0].active);
-        assert!(response.accounts[0].minecraft_profile_ready);
-        assert!(response.accounts[0].minecraft_ownership_verified);
+        assert!(response.minecraft_profile_ready);
+        assert!(response.minecraft_ownership_verified);
         assert_eq!(
-            response.accounts[0]
+            response
                 .minecraft_profile
                 .as_ref()
                 .expect("second profile")
                 .name,
             "SecondProfile"
-        );
-        assert_eq!(response.accounts[1].login_id, first.login_id);
-        assert!(!response.accounts[1].active);
-        assert_eq!(
-            response.accounts[1]
-                .minecraft_profile
-                .as_ref()
-                .expect("first profile")
-                .name,
-            "FirstProfile"
         );
     }
 
@@ -1447,7 +1384,6 @@ mod tests {
                 &self.state.config().current().launch_auth_mode,
                 AuthStatusMsaState::unauthenticated(),
                 AuthStatusMinecraftState::unauthenticated(),
-                Vec::new(),
             )
             .map(Json)
         }

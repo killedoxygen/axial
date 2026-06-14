@@ -403,7 +403,7 @@ pub(super) async fn launch_session(
                 if !attempt.startup_recovery_applied
                     && let Some(recovery) = recovery_plan_for_startup_failure(
                         failure_class,
-                        &intent.version_id,
+                        &intent.target_version_id,
                         &prepared.runtime.effective_info,
                         &intent.requested_java,
                         &intent.guardian,

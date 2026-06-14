@@ -18,6 +18,7 @@ use croopor_launcher::{
     LaunchIntent, LaunchReadiness, LaunchReadinessRequest, LaunchResourceWarningFacts, LaunchState,
     LaunchWarningFacts, failure_class_name, inspect_launch_readiness, summarize_launch_warnings,
 };
+use croopor_minecraft::scan_versions;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -54,6 +55,9 @@ struct LaunchPreflightFacts {
     min_memory_mb: i32,
     requested_java: String,
     requested_preset: String,
+    target_version_id: String,
+    loader: String,
+    is_modded: bool,
     guardian: LaunchGuardianContext,
     guardian_summary: GuardianSummary,
     readiness: LaunchReadiness,
@@ -208,6 +212,9 @@ async fn prepare_launch_session_with_auth_refresh(
         library_dir: library_dir.clone(),
         instance_id: instance.id.clone(),
         version_id: instance.version_id.clone(),
+        target_version_id: preflight.target_version_id.clone(),
+        loader: preflight.loader.clone(),
+        is_modded: preflight.is_modded,
         username: username.clone(),
         auth,
         requested_java: preflight.requested_java.clone(),
@@ -336,9 +343,27 @@ async fn build_launch_preflight_facts(
 ) -> LaunchPreflightFacts {
     // Preflight is read-only: no session creation, installs, Java probes, or raw path exposure.
     let memory_evidence = capture_launch_memory_evidence();
+    let version_records = scan_versions(library_dir).unwrap_or_default();
+    let version_record = version_records
+        .iter()
+        .find(|version| version.id == instance.version_id);
+    let target_version_id = version_record
+        .and_then(|version| {
+            let parent = version.inherits_from.trim();
+            (!parent.is_empty()).then(|| parent.to_string())
+        })
+        .unwrap_or_else(|| instance.version_id.clone());
+    let loader = version_record
+        .and_then(|version| version.loader.as_ref())
+        .map(|loader| loader.component_id.short_key().to_string())
+        .unwrap_or_else(|| "vanilla".to_string());
+    let is_modded = version_record.is_some_and(|version| {
+        version.loader.is_some() || !version.inherits_from.trim().is_empty()
+    });
     let memory_defaults = policy::derived_launch_memory_defaults(
         instance,
         config,
+        version_record,
         requested_max_memory_mb,
         requested_min_memory_mb,
         memory_evidence.host_total_memory_mb,
@@ -394,6 +419,9 @@ async fn build_launch_preflight_facts(
         min_memory_mb,
         requested_java,
         requested_preset,
+        target_version_id,
+        loader,
+        is_modded,
         guardian,
         guardian_summary,
         readiness,
@@ -1185,7 +1213,7 @@ mod tests {
     #[tokio::test]
     async fn omitted_request_memory_uses_backend_derived_defaults_for_fresh_builtin_global() {
         let fixture = TestFixture::new("prepare-derived-memory-defaults");
-        let instance_id = fixture.add_instance("Modded", "fabric-loader-0.16.10-1.21.1");
+        let instance_id = fixture.add_instance("Survival", "1.21.1");
         let config = fixture.state.config().current();
         let expected_defaults = policy::derived_launch_memory_defaults(
             &fixture
@@ -1194,6 +1222,7 @@ mod tests {
                 .get(&instance_id)
                 .expect("instance"),
             &config,
+            None,
             None,
             None,
             capture_launch_memory_evidence().host_total_memory_mb,

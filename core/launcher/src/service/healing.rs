@@ -97,21 +97,6 @@ pub fn build_healing_summary(input: HealingSummaryInput<'_>) -> Option<LaunchHea
     }
 }
 
-pub fn infer_loader(version_id: &str) -> &'static str {
-    let version = version_id.to_ascii_lowercase();
-    if version.contains("neoforge") {
-        "neoforge"
-    } else if version.contains("fabric") {
-        "fabric"
-    } else if version.contains("forge") {
-        "forge"
-    } else if version.contains("quilt") {
-        "quilt"
-    } else {
-        "vanilla"
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{HealingSummaryInput, build_healing_summary};

@@ -45,6 +45,8 @@ interface PerformanceInstallProgress {
   done?: boolean;
 }
 
+type ApiResult<T> = T & { error?: string };
+
 function effectivePerformanceMode(inst: EnrichedInstance): { mode: PerformanceMode; source: 'instance' | 'global' } {
   const instanceMode = performanceModeFrom(inst.performance_mode);
   if (instanceMode) return { mode: instanceMode, source: 'instance' };
@@ -92,15 +94,8 @@ function userPerformanceNotice(raw: string, fallback: boolean): string {
   return raw.replace('managed mod', 'installed mod');
 }
 
-function planLoader(v: Version | undefined, inst: EnrichedInstance): string {
-  const typedLoader = loaderKeyFromVersion(v);
-  if (typedLoader !== 'vanilla') return typedLoader;
-  const raw = inst.version_id.toLowerCase();
-  if (raw.includes('neoforge')) return 'neoforge';
-  if (raw.includes('fabric')) return 'fabric';
-  if (raw.includes('forge')) return 'forge';
-  if (raw.includes('quilt')) return 'quilt';
-  return 'vanilla';
+function planLoader(v: Version | undefined): string {
+  return loaderKeyFromVersion(v);
 }
 
 function planGameVersion(v: Version | undefined, inst: EnrichedInstance): string {
@@ -289,7 +284,7 @@ export function PerformanceCard({ inst }: { inst: EnrichedInstance }): JSX.Eleme
     health: PerformanceHealthResponse | null;
   }> => {
     const gameVersion = planGameVersion(version, inst);
-    const loader = planLoader(version, inst);
+    const loader = planLoader(version);
     const planParams = new URLSearchParams({
       game_version: gameVersion,
       loader,
@@ -297,9 +292,9 @@ export function PerformanceCard({ inst }: { inst: EnrichedInstance }): JSX.Eleme
       instance_id: inst.id,
     });
     const healthParams = new URLSearchParams({ instance_id: inst.id });
-    const [planRes, healthRes]: [any, any] = await Promise.all([
-      api('GET', `/performance/plan?${planParams.toString()}`),
-      api('GET', `/performance/health?${healthParams.toString()}`),
+    const [planRes, healthRes] = await Promise.all([
+      api<ApiResult<PerformancePlanResponse>>('GET', `/performance/plan?${planParams.toString()}`),
+      api<ApiResult<PerformanceHealthResponse>>('GET', `/performance/health?${healthParams.toString()}`),
     ]);
     if (planRes?.error) throw new Error(planRes.error);
     if (healthRes?.error) throw new Error(healthRes.error);
@@ -311,8 +306,12 @@ export function PerformanceCard({ inst }: { inst: EnrichedInstance }): JSX.Eleme
     inst.id,
     inst.version_id,
     version?.id,
+    version?.inherits_from,
     version?.loader?.component_id,
+    version?.loader?.loader_version,
     version?.minecraft_meta.effective_version,
+    version?.minecraft_meta.base_id,
+    version?.minecraft_meta.display_name,
     effectiveMode.mode,
   ]);
 
@@ -377,7 +376,10 @@ export function PerformanceCard({ inst }: { inst: EnrichedInstance }): JSX.Eleme
 
     const pollStatus = async (operationId: string): Promise<void> => {
       try {
-        const res: any = await api('GET', `/performance/operations/${encodeURIComponent(operationId)}`);
+        const res = await api<ApiResult<PerformanceOperationStatus>>(
+          'GET',
+          `/performance/operations/${encodeURIComponent(operationId)}`,
+        );
         if (!res?.id && res?.error) throw new Error(res.error);
         const status = res as PerformanceOperationStatus;
         const terminal = applyStatus(status);
@@ -401,7 +403,7 @@ export function PerformanceCard({ inst }: { inst: EnrichedInstance }): JSX.Eleme
 
     void (async () => {
       try {
-        const res: PerformanceInstanceOperationResponse & { error?: string } = await api(
+        const res = await api<ApiResult<PerformanceInstanceOperationResponse>>(
           'GET',
           `/performance/instances/${encodeURIComponent(inst.id)}/operation`,
         );

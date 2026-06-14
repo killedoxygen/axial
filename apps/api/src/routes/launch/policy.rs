@@ -1,6 +1,6 @@
 use croopor_config::{AppConfig, Instance};
 use croopor_launcher::{GuardianMode, OverrideOrigin, SessionId};
-use croopor_minecraft::{compare_version_like, infer_build_from_version_id};
+use croopor_minecraft::{VersionEntry, compare_version_like};
 use std::cmp::Ordering;
 use std::time::SystemTime;
 
@@ -110,6 +110,7 @@ pub(super) fn selected_raw_min_memory(
 pub(super) fn derived_launch_memory_defaults(
     instance: &Instance,
     config: &AppConfig,
+    version: Option<&VersionEntry>,
     requested_max_memory_mb: Option<i32>,
     requested_min_memory_mb: Option<i32>,
     host_total_memory_mb: Option<u64>,
@@ -130,8 +131,8 @@ pub(super) fn derived_launch_memory_defaults(
 
     launch_memory_defaults_for_host_version(
         host_total_memory_mb?,
-        instance.version_id.as_str(),
-        version_id_looks_modded(instance.version_id.as_str()),
+        version_base_id(instance, version).as_str(),
+        version.is_some_and(|version| version.loader.is_some()),
     )
 }
 
@@ -164,15 +165,18 @@ fn launch_memory_defaults_for_host_version(
     })
 }
 
-fn version_id_looks_modded(version_id: &str) -> bool {
-    infer_build_from_version_id(version_id).is_some()
+fn version_base_id(instance: &Instance, version: Option<&VersionEntry>) -> String {
+    version
+        .and_then(|version| {
+            let parent = version.inherits_from.trim();
+            (!parent.is_empty()).then(|| parent.to_string())
+        })
+        .or_else(|| version.map(|version| version.id.clone()))
+        .unwrap_or_else(|| instance.version_id.clone())
 }
 
 fn version_id_is_legacy(version_id: &str) -> bool {
-    let base_version = infer_build_from_version_id(version_id)
-        .map(|(_, _, minecraft_version, _)| minecraft_version)
-        .unwrap_or_else(|| version_id.to_string());
-    compare_version_like(base_version.as_str(), "1.12.2") != Ordering::Greater
+    compare_version_like(version_id, "1.12.2") != Ordering::Greater
 }
 
 pub(super) fn split_jvm_args(extra_jvm_args: &str) -> Vec<String> {
@@ -240,6 +244,7 @@ mod tests {
         let defaults = derived_launch_memory_defaults(
             &instance,
             &config,
+            None,
             Some(8192),
             Some(4096),
             Some(16_384),
@@ -268,6 +273,7 @@ mod tests {
         let defaults = derived_launch_memory_defaults(
             &instance,
             &config,
+            None,
             Some(5120),
             Some(2048),
             Some(16_384),
@@ -297,7 +303,8 @@ mod tests {
         };
         let instance = test_instance("1.21.1");
 
-        let defaults = derived_launch_memory_defaults(&instance, &config, None, None, Some(16_384));
+        let defaults =
+            derived_launch_memory_defaults(&instance, &config, None, None, None, Some(16_384));
 
         assert_eq!(defaults, None);
         assert_eq!(
@@ -315,8 +322,9 @@ mod tests {
         let config = AppConfig::default();
         let instance = test_instance("1.12.2");
 
-        let defaults = derived_launch_memory_defaults(&instance, &config, None, None, Some(16_384))
-            .expect("legacy defaults");
+        let defaults =
+            derived_launch_memory_defaults(&instance, &config, None, None, None, Some(16_384))
+                .expect("legacy defaults");
 
         assert_eq!(
             defaults,
@@ -340,8 +348,9 @@ mod tests {
         let config = AppConfig::default();
         let instance = test_instance("1.21.1");
 
-        let defaults = derived_launch_memory_defaults(&instance, &config, None, None, Some(16_384))
-            .expect("modern defaults");
+        let defaults =
+            derived_launch_memory_defaults(&instance, &config, None, None, None, Some(16_384))
+                .expect("modern defaults");
 
         assert_eq!(
             defaults,
@@ -356,9 +365,17 @@ mod tests {
     fn fresh_loader_target_uses_modded_memory_defaults() {
         let config = AppConfig::default();
         let instance = test_instance("fabric-loader-0.16.10-1.21.1");
+        let version = test_loader_version(&instance.version_id, "1.21.1");
 
-        let defaults = derived_launch_memory_defaults(&instance, &config, None, None, Some(16_384))
-            .expect("modded defaults");
+        let defaults = derived_launch_memory_defaults(
+            &instance,
+            &config,
+            Some(&version),
+            None,
+            None,
+            Some(16_384),
+        )
+        .expect("modded defaults");
 
         assert_eq!(
             defaults,
@@ -373,9 +390,17 @@ mod tests {
     fn derived_defaults_leave_host_headroom_when_host_budget_is_smaller_than_target() {
         let config = AppConfig::default();
         let instance = test_instance("fabric-loader-0.16.10-1.21.1");
+        let version = test_loader_version(&instance.version_id, "1.21.1");
 
-        let defaults = derived_launch_memory_defaults(&instance, &config, None, None, Some(6_144))
-            .expect("host-limited defaults");
+        let defaults = derived_launch_memory_defaults(
+            &instance,
+            &config,
+            Some(&version),
+            None,
+            None,
+            Some(6_144),
+        )
+        .expect("host-limited defaults");
 
         assert_eq!(
             defaults,
@@ -404,6 +429,33 @@ mod tests {
             extra_jvm_args: String::new(),
             icon: String::new(),
             accent: String::new(),
+        }
+    }
+
+    fn test_loader_version(id: &str, inherits_from: &str) -> VersionEntry {
+        VersionEntry {
+            subject_kind: croopor_minecraft::VersionSubjectKind::InstalledVersion,
+            id: id.to_string(),
+            raw_kind: "release".to_string(),
+            release_time: String::new(),
+            minecraft_meta: croopor_minecraft::MinecraftVersionMeta::default(),
+            lifecycle: croopor_minecraft::LifecycleMeta::default(),
+            inherits_from: inherits_from.to_string(),
+            launchable: true,
+            installed: true,
+            status: "ready".to_string(),
+            status_detail: String::new(),
+            needs_install: String::new(),
+            java_component: String::new(),
+            java_major: 21,
+            manifest_url: String::new(),
+            loader: Some(croopor_minecraft::VersionLoaderAttachment {
+                component_id: croopor_minecraft::LoaderComponentId::Fabric,
+                component_name: "Fabric".to_string(),
+                build_id: "fabric:1.21.1:0.16.10".to_string(),
+                loader_version: "0.16.10".to_string(),
+                build_meta: croopor_minecraft::LoaderBuildMetadata::default(),
+            }),
         }
     }
 }

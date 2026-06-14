@@ -220,7 +220,7 @@ mod tests {
         LoaderProfileFragment, cleanup_incomplete_version, compose_loader_version,
         write_composed_version,
     };
-    use crate::launch::{AssetIndex, Downloads, JavaVersion, VersionJson};
+    use crate::launch::{AssetIndex, Downloads, JavaVersion, VersionJson, resolve_version};
     use crate::paths::create_minecraft_dir;
     use std::fs;
     use std::path::PathBuf;
@@ -409,6 +409,94 @@ mod tests {
         assert!(!root.join("versions").join("loader-test").exists());
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn write_composed_version_keeps_resolved_loader_launch_model_standalone() {
+        let root = temp_dir("write-composed-version-standalone");
+        create_minecraft_dir(&root).expect("library");
+        let base_dir = root.join("versions").join("1.21.6");
+        fs::create_dir_all(&base_dir).expect("base version dir");
+        fs::write(base_dir.join("1.21.6.jar"), b"base jar").expect("base jar");
+        fs::write(
+            base_dir.join("1.21.6.json"),
+            r#"{
+                "id":"1.21.6",
+                "type":"release",
+                "mainClass":"net.minecraft.client.main.Main",
+                "arguments":{
+                    "game":["--username","${auth_player_name}"],
+                    "jvm":["-cp","${classpath}"]
+                },
+                "assetIndex":{"id":"1.21.6","url":"https://example.invalid/assets.json"},
+                "downloads":{"client":{"url":"https://example.invalid/client.jar"}},
+                "javaVersion":{"component":"java-runtime-gamma","majorVersion":21},
+                "libraries":[{"name":"com.mojang:base:1.0"}]
+            }"#,
+        )
+        .expect("base json");
+
+        let fragment = serde_json::from_str::<LoaderProfileFragment>(
+            r#"{
+                "id":"fabric-loader-0.16.10-1.21.6",
+                "inheritsFrom":"1.21.6",
+                "mainClass":"net.fabricmc.loader.impl.launch.knot.KnotClient",
+                "arguments":{
+                    "game":["--fabric.gameJarPath","${primary_jar}"],
+                    "jvm":["-Dfabric.side=client"]
+                },
+                "libraries":[{"name":"net.fabricmc:fabric-loader:0.16.10"}]
+            }"#,
+        )
+        .expect("fragment");
+
+        let version_id = "fabric-loader-0.16.10-1.21.6";
+        let composed = compose_loader_version(&root, "1.21.6", version_id, &fragment)
+            .expect("compose loader version");
+        write_composed_version(&root, version_id, &composed, "1.21.6")
+            .await
+            .expect("write composed version");
+
+        let written_json = fs::read_to_string(
+            root.join("versions")
+                .join(version_id)
+                .join(format!("{version_id}.json")),
+        )
+        .expect("read written json");
+        assert!(
+            !written_json.contains("inheritsFrom"),
+            "composed loader JSON must not re-inherit its already merged parent"
+        );
+
+        let resolved = resolve_version(&root, version_id).expect("resolve written loader version");
+        assert!(resolved.inherits_from.is_empty());
+        let arguments = resolved.arguments.expect("resolved arguments");
+        assert_eq!(count_arg_value(&arguments.jvm, "-cp"), 1);
+        assert_eq!(count_arg_value(&arguments.jvm, "-Dfabric.side=client"), 1);
+        assert_eq!(count_arg_value(&arguments.game, "--username"), 1);
+        assert_eq!(count_arg_value(&arguments.game, "--fabric.gameJarPath"), 1);
+        assert_eq!(count_library(&resolved.libraries, "com.mojang:base:1.0"), 1);
+        assert_eq!(
+            count_library(&resolved.libraries, "net.fabricmc:fabric-loader:0.16.10"),
+            1
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn count_arg_value(values: &[crate::launch::Argument], needle: &str) -> usize {
+        values
+            .iter()
+            .flat_map(|argument| argument.value.iter())
+            .filter(|value| value.as_str() == needle)
+            .count()
+    }
+
+    fn count_library(libraries: &[crate::launch::Library], name: &str) -> usize {
+        libraries
+            .iter()
+            .filter(|library| library.name == name)
+            .count()
     }
 
     fn temp_dir(prefix: &str) -> PathBuf {

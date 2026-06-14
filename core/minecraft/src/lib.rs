@@ -31,8 +31,8 @@ pub use loaders::{
     LoaderInstallFailureKind, LoaderInstallStrategy, LoaderInstallability, LoaderSelectionMeta,
     LoaderSelectionReason, LoaderSelectionSource, LoaderTerm, LoaderTermEvidence, LoaderTermSource,
     LoaderVersionIndex, build_id_for, fetch_builds, fetch_components, fetch_supported_versions,
-    infer_build_from_version_id, infer_neoforge_minecraft_version, install_build,
-    installed_version_id_for, loader_components, parse_build_id, resolve_build_record,
+    install_build, installed_version_id_for, loader_components, parse_build_id,
+    resolve_build_record,
 };
 pub use manifest::{
     ManifestEntry, VersionManifest, fetch_version_manifest, fetch_version_manifest_cached,

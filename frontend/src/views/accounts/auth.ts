@@ -1,6 +1,6 @@
 import type { LaunchAuthMode } from '../../types';
 import { boundedMessage, isRecord } from './api';
-import type { AuthAccount, AuthStatusRecord, LauncherAccount } from './types';
+import type { AuthStatusRecord, LauncherAccount } from './types';
 
 export function apiErrorMessage(value: unknown, fallback: string): string {
   if (!isRecord(value)) return fallback;
@@ -56,7 +56,7 @@ export function statusCanSelectOnline(status: AuthStatusRecord): boolean {
   );
 }
 
-export function accountHasLaunchReadyMinecraft(account: AuthAccount | LauncherAccount): boolean {
+export function accountHasLaunchReadyMinecraft(account: LauncherAccount): boolean {
   return (
     account.minecraft_profile_ready === true &&
     account.minecraft_ownership_verified === true &&
@@ -65,6 +65,6 @@ export function accountHasLaunchReadyMinecraft(account: AuthAccount | LauncherAc
   );
 }
 
-export function accountCanSelectOnline(account: AuthAccount | LauncherAccount): boolean {
+export function accountCanSelectOnline(account: LauncherAccount): boolean {
   return accountHasLaunchReadyMinecraft(account) || account.msa_refresh_available === true;
 }

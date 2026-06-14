@@ -11,10 +11,7 @@ pub mod types;
 
 pub use health::{BundleHealth, derive_health};
 pub use install::{InstallError, PERFORMANCE_RULES_URL_ENV, PerformanceManager, RulesRefreshError};
-pub use resolve::{
-    ResolveError, builtin_manifest, detect_hardware, extract_base_version,
-    infer_loader_from_version_id, parse_mode, resolve_plan,
-};
+pub use resolve::{ResolveError, builtin_manifest, detect_hardware, parse_mode, resolve_plan};
 pub use rules_cache::{
     LoadedRulesCache, RulesCacheSnapshot, RulesCacheState, RulesCacheStatus, rules_cache_path,
 };

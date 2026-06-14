@@ -191,7 +191,7 @@ Files:
 
 Responsibility:
 
-- `api.rs`: component ids, build ids, version-id inference
+- `api.rs`: component ids, build ids, and installed version-id construction
 - `types.rs`: normalized types and errors
 - helper modules: install artifacts, work dirs, composition, legacy behavior, processors
 - `forge_installer.rs` and `processors.rs`: parse installer ZIPs through bounded blocking work, with explicit decompressed-entry ceilings for profile JSON, embedded Maven libraries, and processor data extraction
@@ -260,6 +260,8 @@ The loader attachment carries:
 - `build_meta`
 
 That keeps Minecraft-version lifecycle and loader-build terms separate in the UI.
+
+Install strategies also write `versions/<id>/.croopor-loader.json` beside the composed version JSON. Version scanning reads that file as the authoritative installed-loader attachment source, so routes do not infer loader identity, Minecraft version, or loader version from composite local version ids.
 
 ## Maintenance rules
 

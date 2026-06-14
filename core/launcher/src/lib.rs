@@ -43,7 +43,7 @@ pub use runtime::RuntimeSelection;
 pub use service::{
     LaunchHealingSummary, LaunchIntent, LaunchPreparationError, LaunchPreparationEvent,
     PreparedLaunchAttempt, build_healing_summary, failure_class_name, format_failure_class,
-    infer_loader, is_terminal_state, is_terminal_status, launch_stage_label, launch_state_name,
+    is_terminal_state, is_terminal_status, launch_stage_label, launch_state_name,
     prepare_launch_attempt, prepare_launch_attempt_with_events, sanitize_effective_runtime_major,
     snapshot_status,
 };

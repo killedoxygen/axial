@@ -8,12 +8,12 @@ use axum::{
     http::StatusCode,
     routing::{get, post},
 };
+use croopor_minecraft::scan_versions;
 use croopor_performance::InstallError;
 use croopor_performance::{
     BundleHealth, CompositionPlan, CompositionTier, ManagedArtifactProvider, OwnershipClass,
     PerformanceMode, PerformanceRulesStatus, ResolutionRequest, RollbackSnapshotSummary,
-    RulesRefreshError, StateError, derive_health, extract_base_version,
-    infer_loader_from_version_id, load_state, parse_mode,
+    RulesRefreshError, StateError, derive_health, load_state, parse_mode,
 };
 use serde::{Deserialize, Serialize};
 
@@ -110,8 +110,6 @@ struct PerformanceRollbackListResponse {
 #[derive(Debug, Clone)]
 struct PerformanceOperation {
     instance_id: String,
-    version_id: String,
-    instance_performance_mode: String,
     game_version: Option<String>,
     loader: Option<String>,
     mode: Option<String>,
@@ -257,7 +255,7 @@ async fn handle_health(
             Json(serde_json::json!({ "error": "instance not found" })),
         )
     })?;
-    let mode = resolve_instance_mode(&state, &instance.performance_mode, None)?;
+    let mode = resolve_instance_mode(&state, &instance, None)?;
 
     if !matches!(mode, PerformanceMode::Managed) {
         return Ok(Json(disabled_health_response()));
@@ -283,9 +281,10 @@ async fn handle_health(
         }
         Err(error) => return Err(internal_error(error)),
     };
+    let (game_version, loader) = resolve_instance_version_target(&state, &instance, None, None)?;
     let plan = state.performance().get_plan(ResolutionRequest {
-        game_version: extract_base_version(&instance.version_id),
-        loader: infer_loader_from_version_id(&instance.version_id),
+        game_version,
+        loader,
         mode,
         hardware: state.performance().hardware(),
         installed_mods: installed_mod_evidence(&mods_dir, state_file.as_ref()),
@@ -350,8 +349,6 @@ async fn handle_install(
     let action = install_action(payload.action.as_deref())?;
     let operation = PerformanceOperation {
         instance_id: instance.id.clone(),
-        version_id: instance.version_id.clone(),
-        instance_performance_mode: instance.performance_mode.clone(),
         game_version: payload.game_version.clone(),
         loader: payload.loader.clone(),
         mode: payload.mode.clone(),
@@ -410,10 +407,16 @@ async fn execute_performance_operation(
     operation: &PerformanceOperation,
 ) -> Result<PerformanceInstallResponse, (StatusCode, Json<serde_json::Value>)> {
     let performance = state.performance().clone();
-    let mods_dir = state
+    let instance = state
         .instances()
-        .game_dir(&operation.instance_id)
-        .join("mods");
+        .get(&operation.instance_id)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "instance not found" })),
+            )
+        })?;
+    let mods_dir = state.instances().game_dir(&instance.id).join("mods");
 
     if matches!(operation.action, PerformanceInstallAction::Rollback) {
         let restored_state =
@@ -441,11 +444,7 @@ async fn execute_performance_operation(
         });
     }
 
-    let mode = resolve_instance_mode(
-        state,
-        &operation.instance_performance_mode,
-        operation.mode.as_deref(),
-    )?;
+    let mode = resolve_instance_mode(state, &instance, operation.mode.as_deref())?;
 
     if matches!(operation.action, PerformanceInstallAction::Remove)
         || !matches!(mode, PerformanceMode::Managed)
@@ -457,16 +456,12 @@ async fn execute_performance_operation(
         return Ok(removed_install_response());
     }
 
-    let game_version = operation
-        .game_version
-        .as_deref()
-        .and_then(|value| optional_value(Some(value)))
-        .unwrap_or_else(|| extract_base_version(&operation.version_id));
-    let loader = operation
-        .loader
-        .as_deref()
-        .and_then(|value| optional_value(Some(value)))
-        .unwrap_or_else(|| infer_loader_from_version_id(&operation.version_id));
+    let (game_version, loader) = resolve_instance_version_target(
+        state,
+        &instance,
+        operation.game_version.as_deref(),
+        operation.loader.as_deref(),
+    )?;
     let plan = state.performance().get_plan(ResolutionRequest {
         game_version: game_version.clone(),
         loader: loader.clone(),
@@ -702,8 +697,6 @@ fn operation_action_name(action: PerformanceInstallAction) -> &'static str {
 
 fn operation_payload(operation: &PerformanceOperation) -> PerformanceOperationPayload {
     PerformanceOperationPayload {
-        version_id: operation.version_id.clone(),
-        instance_performance_mode: operation.instance_performance_mode.clone(),
         game_version: operation.game_version.clone(),
         loader: operation.loader.clone(),
         mode: operation.mode.clone(),
@@ -716,14 +709,12 @@ fn operation_from_status(
 ) -> Result<PerformanceOperation, String> {
     let action = operation_action_from_name(&status.action)
         .ok_or_else(|| INVALID_PERSISTED_OPERATION_ERROR.to_string())?;
-    if status.instance_id.trim().is_empty() || status.payload.version_id.trim().is_empty() {
+    if status.instance_id.trim().is_empty() {
         return Err(INVALID_PERSISTED_OPERATION_ERROR.to_string());
     }
 
     Ok(PerformanceOperation {
         instance_id: status.instance_id.clone(),
-        version_id: status.payload.version_id.clone(),
-        instance_performance_mode: status.payload.instance_performance_mode.clone(),
         game_version: status.payload.game_version.clone(),
         loader: status.payload.loader.clone(),
         mode: status.payload.mode.clone(),
@@ -859,6 +850,65 @@ fn optional_value(raw: Option<&str>) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn resolve_instance_version_target(
+    state: &AppState,
+    instance: &croopor_config::Instance,
+    game_version_override: Option<&str>,
+    loader_override: Option<&str>,
+) -> Result<(String, String), (StatusCode, Json<serde_json::Value>)> {
+    let explicit_game_version = optional_value(game_version_override);
+    let explicit_loader = optional_value(loader_override);
+    if let Some(game_version) = explicit_game_version.clone()
+        && let Some(loader) = explicit_loader.clone()
+    {
+        return Ok((game_version, loader));
+    }
+
+    let library_dir = state.library_dir().ok_or_else(|| {
+        (
+            StatusCode::PRECONDITION_FAILED,
+            Json(serde_json::json!({ "error": "Croopor library is not configured" })),
+        )
+    })?;
+    let versions = scan_versions(&std::path::PathBuf::from(library_dir)).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "Could not scan installed versions. Check the library folder and try again."
+            })),
+        )
+    })?;
+    let version = versions
+        .iter()
+        .find(|version| version.id == instance.version_id)
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "instance version metadata is unavailable; install the version before resolving performance files"
+                })),
+            )
+        })?;
+
+    let game_version = explicit_game_version.unwrap_or_else(|| {
+        let parent = version.inherits_from.trim();
+        if parent.is_empty() {
+            version.id.clone()
+        } else {
+            parent.to_string()
+        }
+    });
+    let loader = explicit_loader.unwrap_or_else(|| {
+        version
+            .loader
+            .as_ref()
+            .map(|loader| loader.component_id.short_key().to_string())
+            .unwrap_or_else(|| "vanilla".to_string())
+    });
+
+    Ok((game_version, loader))
+}
+
 fn tier_name(tier: CompositionTier) -> &'static str {
     match tier {
         CompositionTier::Extended => "extended",
@@ -884,7 +934,7 @@ fn resolve_config_mode(
 
 fn resolve_instance_mode(
     state: &AppState,
-    instance_mode: &str,
+    instance: &croopor_config::Instance,
     raw: Option<&str>,
 ) -> Result<PerformanceMode, (StatusCode, Json<serde_json::Value>)> {
     if let Some(raw) = raw.filter(|value| !value.trim().is_empty()) {
@@ -895,7 +945,7 @@ fn resolve_instance_mode(
             )
         });
     }
-    if let Some(mode) = parse_mode(instance_mode) {
+    if let Some(mode) = parse_mode(&instance.performance_mode) {
         return Ok(mode);
     }
     resolve_config_mode(state, None)
@@ -1053,7 +1103,7 @@ mod tests {
         body::{Body, to_bytes},
         http::Request,
     };
-    use croopor_config::{AppPaths, ConfigStore, InstanceStore};
+    use croopor_config::{AppConfig, AppPaths, ConfigStore, InstanceStore};
     use croopor_performance::modrinth::ModrinthError;
     use croopor_performance::{CompositionState, InstalledMod, PerformanceManager};
     use ed25519_dalek::{Signer, SigningKey};
@@ -1553,6 +1603,7 @@ mod tests {
     async fn health_response_includes_bounded_managed_artifact_summary() {
         let fixture = TestFixture::new("health-managed-artifacts");
         let instance_id = fixture.add_instance("Managed", "1.20.4-fabric");
+        fixture.write_fabric_version("1.20.4-fabric", "1.20.4");
         let mods_dir = fixture
             .state
             .instances()
@@ -1637,6 +1688,7 @@ mod tests {
             .expect("remote manifest should refresh");
         assert_eq!(status.rule_source, croopor_performance::RuleSource::Remote);
         let instance_id = fixture.add_instance("Managed", "1.20.4-fabric");
+        fixture.write_fabric_version("1.20.4-fabric", "1.20.4");
         let mods_dir = fixture
             .state
             .instances()
@@ -2275,7 +2327,7 @@ mod tests {
             .start(
                 instance_id.clone(),
                 "remove".to_string(),
-                test_operation_payload("1.20.4-fabric"),
+                test_operation_payload(),
             )
             .await
             .expect("prelock instance");
@@ -2313,7 +2365,7 @@ mod tests {
             .start(
                 "instance-a".to_string(),
                 "install".to_string(),
-                test_operation_payload("1.20.4-fabric"),
+                test_operation_payload(),
             )
             .await
             .expect("operation starts");
@@ -2343,7 +2395,6 @@ mod tests {
         assert_eq!(response.id, started.id);
         assert_eq!(response.instance_id, "instance-a");
         assert_eq!(response.action, "install");
-        assert_eq!(response.payload.version_id, "1.20.4-fabric");
         assert_eq!(response.state, "applying");
     }
 
@@ -2394,7 +2445,7 @@ mod tests {
             .start(
                 instance_id.clone(),
                 "remove".to_string(),
-                test_operation_payload("1.20.4-fabric"),
+                test_operation_payload(),
             )
             .await
             .expect("persist pending operation");
@@ -2451,7 +2502,7 @@ mod tests {
             .start(
                 instance_id.clone(),
                 "remove".to_string(),
-                test_operation_payload("1.20.4-fabric"),
+                test_operation_payload(),
             )
             .await
             .expect("persist pending operation");
@@ -2587,6 +2638,41 @@ mod tests {
                 .expect("add instance")
                 .id
         }
+
+        fn write_fabric_version(&self, version_id: &str, minecraft_version: &str) {
+            let version_dir = self.root.join("library").join("versions").join(version_id);
+            fs::create_dir_all(&version_dir).expect("create version dir");
+            fs::write(
+                version_dir.join(format!("{version_id}.json")),
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "id": version_id,
+                    "inheritsFrom": minecraft_version,
+                    "type": "release",
+                    "mainClass": "net.minecraft.client.main.Main",
+                    "assetIndex": {},
+                    "javaVersion": { "component": "java-runtime-delta", "majorVersion": 21 },
+                    "libraries": []
+                }))
+                .expect("serialize version"),
+            )
+            .expect("write version json");
+            fs::write(
+                version_dir.join(".croopor-loader.json"),
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "schema_version": 1,
+                    "component_id": "net.fabricmc.fabric-loader",
+                    "component_name": "Fabric",
+                    "build_id": format!("fabric:{minecraft_version}:0.16.10"),
+                    "minecraft_version": minecraft_version,
+                    "loader_version": "0.16.10",
+                    "build_meta": {}
+                }))
+                .expect("serialize loader metadata"),
+            )
+            .expect("write loader metadata");
+            fs::write(version_dir.join(format!("{version_id}.jar")), b"client jar")
+                .expect("write version jar");
+        }
     }
 
     async fn spawn_rules_server(body: Vec<u8>, signature: Option<String>) -> String {
@@ -2664,6 +2750,12 @@ mod tests {
     ) -> AppState {
         let paths = test_paths(root);
         let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
+        config
+            .replace_in_memory(AppConfig {
+                library_dir: paths.library_dir.to_string_lossy().to_string(),
+                ..config.current()
+            })
+            .expect("configure library dir");
         let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
         AppState::new(AppStateInit {
             app_name: "Croopor".to_string(),
@@ -2685,10 +2777,8 @@ mod tests {
         })
     }
 
-    fn test_operation_payload(version_id: &str) -> PerformanceOperationPayload {
+    fn test_operation_payload() -> PerformanceOperationPayload {
         PerformanceOperationPayload {
-            version_id: version_id.to_string(),
-            instance_performance_mode: "managed".to_string(),
             game_version: None,
             loader: None,
             mode: None,

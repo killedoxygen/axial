@@ -998,11 +998,10 @@ pub fn conservative_healing_preset(version_id: &str, info: &JavaRuntimeInfo) -> 
 }
 
 fn is_legacy_version_family(version_id: &str) -> bool {
-    let base = version_id.split("-forge-").next().unwrap_or(version_id);
-    if matches!(base.as_bytes().first(), Some(b'a' | b'b')) {
+    if matches!(version_id.as_bytes().first(), Some(b'a' | b'b')) {
         return true;
     }
-    let numbers = base
+    let numbers = version_id
         .split('.')
         .filter_map(|part| part.parse::<u32>().ok())
         .collect::<Vec<_>>();
