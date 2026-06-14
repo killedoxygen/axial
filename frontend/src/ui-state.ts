@@ -80,6 +80,7 @@ export const showOnboardingOverlay = signal(false);
 export const showSetupOverlay = signal(false);
 
 export const createOpen = signal(false);
+export const accountSwitcherOpen = signal(false);
 
 export function openCreate(): void {
   createOpen.value = true;
@@ -87,4 +88,12 @@ export function openCreate(): void {
 
 export function closeCreate(): void {
   createOpen.value = false;
+}
+
+export function openAccountSwitcher(): void {
+  accountSwitcherOpen.value = true;
+}
+
+export function closeAccountSwitcher(): void {
+  accountSwitcherOpen.value = false;
 }

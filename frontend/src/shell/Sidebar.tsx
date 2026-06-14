@@ -4,10 +4,9 @@ import { InstanceTile } from '../ui/InstanceVisual';
 import { Icon } from '../ui/Icons';
 import { Logo } from '../ui/Logo';
 import { PlayerHeadPreview } from '../ui/PlayerHeadPreview';
-import { route, navigate, commandPaletteOpen, type Route, openCreate } from '../ui-state';
+import { route, navigate, commandPaletteOpen, type Route, openCreate, openAccountSwitcher } from '../ui-state';
 import { runningSessions, config, instances, versionById } from '../store';
 import { instanceInstallStatus } from '../instance-install-status';
-import { promptPlayerName, savePlayerName } from '../player-name';
 import { accountDisplayName, accountSkinSrc } from '../player-skin';
 import { Music, musicStateVersion } from '../music';
 import { local, saveLocalState } from '../state';
@@ -215,13 +214,6 @@ function UserMenu({ onClose }: { onClose: () => void }): JSX.Element {
   const musicOn = Music.enabled;
   const soundsOn = local.sounds;
 
-  const renameUser = async (): Promise<void> => {
-    const current = config.value?.username || 'Player';
-    const next = await promptPlayerName(current);
-    if (next) await savePlayerName(next);
-    onClose();
-  };
-
   const toggleSounds = (): void => {
     const next = !soundsOn;
     local.sounds = next;
@@ -257,7 +249,14 @@ function UserMenu({ onClose }: { onClose: () => void }): JSX.Element {
 
   return (
     <div class="cp-userm" role="menu">
-      <MenuRow icon="edit" label="Change display name" onSelect={renameUser} />
+      <MenuRow
+        icon="refresh"
+        label="Switch account"
+        onSelect={() => {
+          openAccountSwitcher();
+          onClose();
+        }}
+      />
       <MenuRow
         icon="user"
         label="Accounts and skins"

@@ -8,16 +8,25 @@ import { DialogHost } from './ui/Dialog';
 import { ContextMenuHost } from './ui/ContextMenu';
 import { ToastHost } from './ui/ToastHost';
 import { Logo } from './ui/Logo';
-import { commandPaletteOpen, createOpen, route, showOnboardingOverlay, showSetupOverlay } from './ui-state';
+import {
+  accountSwitcherOpen,
+  commandPaletteOpen,
+  createOpen,
+  route,
+  showOnboardingOverlay,
+  showSetupOverlay,
+} from './ui-state';
 import { devMode } from './store';
 import { useShortcuts } from './hooks/use-shortcuts';
 
 type DevLabViewComponent = (typeof import('./views/dev-lab/DevLabView'))['DevLabView'];
 type CommandPaletteComponent = (typeof import('./ui/CommandPalette'))['CommandPalette'];
 type SetupOverlayComponent = (typeof import('./views/setup/SetupOverlay'))['SetupOverlay'];
+type AccountSwitcherHostComponent = (typeof import('./views/accounts/AccountSwitcherHost'))['AccountSwitcherHost'];
 
 let loadedCommandPalette: CommandPaletteComponent | null = null;
 let loadedSetupOverlay: SetupOverlayComponent | null = null;
+let loadedAccountSwitcherHost: AccountSwitcherHostComponent | null = null;
 
 const InstanceDetailRoute = createRouteLoader<{ id: string }>(
   async () => (await import('./views/instance/InstanceDetailView')).InstanceDetailView,
@@ -142,7 +151,7 @@ function LazyCommandPalette(): JSX.Element | null {
 }
 
 function LazySetupOverlay(): JSX.Element {
-  const [SetupOverlayView, setSetupOverlayView] = useState<SetupOverlayComponent | null>(loadedSetupOverlay);
+  const [SetupOverlayView, setSetupOverlayView] = useState<SetupOverlayComponent | null>(() => loadedSetupOverlay);
   const [failed, setFailed] = useState(false);
 
   useEffect(() => {
@@ -163,6 +172,26 @@ function LazySetupOverlay(): JSX.Element {
   }, [SetupOverlayView]);
 
   return SetupOverlayView ? <SetupOverlayView /> : <SetupLoadingFallback failed={failed} />;
+}
+
+function LazyAccountSwitcherHost(): JSX.Element | null {
+  const [AccountSwitcherHostView, setAccountSwitcherHostView] = useState<AccountSwitcherHostComponent | null>(
+    () => loadedAccountSwitcherHost,
+  );
+
+  useEffect(() => {
+    if (AccountSwitcherHostView) return;
+    let mounted = true;
+    void import('./views/accounts/AccountSwitcherHost').then((module) => {
+      loadedAccountSwitcherHost = module.AccountSwitcherHost;
+      if (mounted) setAccountSwitcherHostView(() => module.AccountSwitcherHost);
+    });
+    return () => {
+      mounted = false;
+    };
+  }, [AccountSwitcherHostView]);
+
+  return AccountSwitcherHostView ? <AccountSwitcherHostView /> : null;
 }
 
 function CurrentView(): JSX.Element {
@@ -193,6 +222,7 @@ export function App(): JSX.Element {
         <CurrentView />
       </AppFrame>
       {createOpen.value && <CreateOverlay />}
+      {accountSwitcherOpen.value && <LazyAccountSwitcherHost />}
       {showSetupOverlay.value && <LazySetupOverlay />}
       {showOnboardingOverlay.value && <OnboardingOverlay />}
       <DialogHost />

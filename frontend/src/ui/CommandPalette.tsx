@@ -2,13 +2,12 @@ import type { JSX } from 'preact';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { Icon } from './Icons';
 import { Kbd } from './Atoms';
-import { commandPaletteOpen, navigate, type Route, openCreate } from '../ui-state';
-import { instances, runningSessions, config } from '../store';
+import { commandPaletteOpen, navigate, type Route, openCreate, openAccountSwitcher } from '../ui-state';
+import { instances, runningSessions } from '../store';
 import { Music } from '../music';
 import { local, saveLocalState } from '../state';
 import { Sound } from '../sound';
 import { applyTheme } from '../theme';
-import { promptPlayerName, savePlayerName } from '../player-name';
 import type { EnrichedInstance } from '../types';
 import { useDraggableOverlay } from '../hooks/use-draggable-overlay';
 
@@ -128,15 +127,13 @@ function buildCommands(): Command[] {
       },
     },
     {
-      id: 'action:name',
+      id: 'action:account',
       group: 'action',
-      icon: 'edit',
-      label: 'Change display name',
-      perform: async () => {
+      icon: 'refresh',
+      label: 'Switch account',
+      perform: () => {
+        openAccountSwitcher();
         close();
-        const current = config.value?.username || 'Player';
-        const next = await promptPlayerName(current);
-        if (next) await savePlayerName(next);
       },
     },
     {

@@ -150,17 +150,28 @@ export function AccountSwitcher({
   state,
   accounts,
   onChanged,
+  open: controlledOpen,
+  onOpenChange,
+  showTrigger = true,
 }: {
   status: AuthStatusRecord | null;
   state: AuthStatusState;
   accounts: LauncherAccount[];
   onChanged: () => void;
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
+  showTrigger?: boolean;
 }): JSX.Element {
-  const [open, setOpen] = useState(false);
+  const [internalOpen, setInternalOpen] = useState(false);
   const [removeBusy, setRemoveBusy] = useState(false);
   const [refreshBusy, setRefreshBusy] = useState(false);
   const [profileSyncBusy, setProfileSyncBusy] = useState(false);
   const [selectBusy, setSelectBusy] = useState(false);
+  const open = controlledOpen ?? internalOpen;
+  const setOpen = (next: boolean): void => {
+    onOpenChange?.(next);
+    if (controlledOpen === undefined) setInternalOpen(next);
+  };
 
   const activeAccount = accounts.find((account) => account.active) ?? null;
   const activeMicrosoftAccount = activeAccount?.kind === 'microsoft' ? activeAccount : null;
@@ -442,30 +453,32 @@ export function AccountSwitcher({
 
   return (
     <>
-      <button
-        type="button"
-        class="cp-account-chip"
-        onClick={() => {
-          loginFlow.clearMessage();
-          setOpen(true);
-        }}
-        title="Switch account or identity"
-      >
-        <PlayerHeadPreview
-          username={chipHeadName}
-          textureSrc={accountTextureSrc}
-          size={30}
-          radius={7}
-          ariaLabel={`${chipName} account`}
-        />
-        <span class="cp-account-chip__id">
-          <span class="cp-account-chip__name">{state === 'loading' ? 'Loading' : chipName}</span>
-          <span class="cp-account-chip__mode">
-            {activeAccount ? (onlineActive ? 'Microsoft account' : 'Offline identity') : 'No account selected'}
+      {showTrigger && (
+        <button
+          type="button"
+          class="cp-account-chip"
+          onClick={() => {
+            loginFlow.clearMessage();
+            setOpen(true);
+          }}
+          title="Switch account or identity"
+        >
+          <PlayerHeadPreview
+            username={chipHeadName}
+            textureSrc={accountTextureSrc}
+            size={30}
+            radius={7}
+            ariaLabel={`${chipName} account`}
+          />
+          <span class="cp-account-chip__id">
+            <span class="cp-account-chip__name">{state === 'loading' ? 'Loading' : chipName}</span>
+            <span class="cp-account-chip__mode">
+              {activeAccount ? (onlineActive ? 'Microsoft account' : 'Offline identity') : 'No account selected'}
+            </span>
           </span>
-        </span>
-        <Icon name="chevron-down" size={14} color="var(--text-dim)" />
-      </button>
+          <Icon name="chevron-down" size={14} color="var(--text-dim)" />
+        </button>
+      )}
 
       <Modal open={open} onOpenChange={setOpen}>
         <ModalContent className="cp-account-modal" aria-label="Accounts" aria-describedby={undefined}>
