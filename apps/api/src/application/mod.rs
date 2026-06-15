@@ -1,14 +1,21 @@
 //! Application system boundary.
 //!
 //! This module names the backend command orchestration and backend-authored
-//! view model contracts. Current routes still execute through their existing
-//! paths until later cutover phases move workflow behavior behind these types.
+//! view model contracts. Routes adapt HTTP transport to these entrypoints while
+//! remaining product workflow decisions move behind Application and owning
+//! backend systems.
 
+pub mod accounts;
+pub mod auth;
 pub mod authority;
 pub mod commands;
 pub mod install;
+pub mod instances;
 pub mod launch;
 pub mod performance;
+pub mod skin;
+pub mod update;
+pub mod version;
 
 use crate::guardian::{GuardianDecision, GuardianFact, SafetyOutcome};
 use crate::observability::{EvidenceRecord, OperationEvent, PerformanceProofRecord};
@@ -18,7 +25,21 @@ use crate::state::contracts::{
 };
 use serde::{Deserialize, Serialize};
 
-pub use authority::{AuthorityCutLine, DecisionCategory, DecisionLocation, authority_cut_lines};
+pub(crate) use accounts::{
+    AccountActionResponse, AccountListResponse, AccountPatchRequest, OfflineAccountCreateRequest,
+    accounts, create_offline_account, patch_account, remove_account, select_account,
+    sync_active_offline_account_from_username,
+};
+pub(crate) use auth::{
+    AuthRefreshFailure, AuthStatusResponse, auth_logout_for_state, auth_profile_sync_for_state,
+    auth_refresh_for_state, auth_status, refresh_active_auth,
+};
+pub use authority::{
+    AuthorityCutLine, DecisionCategory, DecisionLocation, RouteAdapterContract,
+    RouteAdapterResponsibility, RouteBoundaryEnforcement, RouteBoundaryProbe, RouteCutoverPhase,
+    RouteForbiddenResponsibility, RouteHotspotOwner, RouteWorkflowArea, RouteWorkflowHotspot,
+    authority_cut_lines, route_adapter_contract, route_boundary_probes, route_workflow_hotspots,
+};
 pub use commands::{
     ApplicationCommandPayload, ApplicationCommandRequest, ApplyPerformancePlanCommand,
     ApplyPerformancePlanPayload, CommandCatalogEntry, CommandPayloadStatus, CommandRequestContract,
@@ -30,20 +51,46 @@ pub use commands::{
     ValidateInstanceCommand, ValidateInstancePayload, command_catalog, phase_one_command_kinds,
 };
 pub use install::{
-    InstallGuardianRepairSummary, InstallVersionStaging, begin_install_operation_journal,
-    install_guardian_repair_summary_from_journal, install_operation_id,
+    InstallApplicationError, InstallGuardianRepairSummary, InstallStartResponse,
+    InstallStatusResponse, InstallVersionStaging, InstallVersionStartRequest, LoaderBuildsRequest,
+    LoaderInstallStartRequest, begin_install_operation_journal,
+    install_guardian_repair_summary_from_journal, install_operation_id, install_status,
+    loader_builds, loader_components, loader_error_response, loader_game_versions,
     record_install_operation_guardian_evidence, record_install_operation_guardian_repair_outcome,
     record_install_operation_interrupted, record_install_operation_progress,
-    repair_install_artifact_corruption_with_guardian, stage_install_version_command,
+    repair_install_artifact_corruption_with_guardian, sanitize_install_progress,
+    stage_install_version_command, start_install_version, start_loader_install,
 };
 pub use launch::{
     LaunchBoundaryStaging, LaunchBoundaryStagingRequest, LaunchInstanceStaging,
-    launch_application_stage_evidence, launch_boundary_stage_evidence, stage_launch_boundary,
-    stage_launch_instance_command,
+    LaunchPreflightMemory, LaunchPreflightOverride, LaunchPreflightOverrides,
+    LaunchPreflightResourceBudget, LaunchPreflightResponse, LaunchRequest, LaunchRequestError,
+    LaunchSessionTask, LaunchSuccess, PreparedLaunch, launch_application_stage_evidence,
+    launch_benchmark_status_payload, launch_boundary_stage_evidence,
+    launch_prepared_response_payload, launch_request_error_response_payload, launch_session,
+    launch_success_response_payload, persist_launch_proof_best_effort, prepare_launch_preflight,
+    prepare_launch_session, sanitize_live_launch_failure_message, stage_launch_boundary,
+    stage_launch_instance_command, trace_launch_event,
 };
 pub use performance::{
-    PerformanceRulesStatusResponse, RefreshPerformanceRulesError,
-    performance_plan_summary_view_model, performance_rules_status, refresh_performance_rules,
+    PerformanceHealthRequest, PerformanceHealthResponse, PerformanceInstallRequest,
+    PerformanceInstallResponse, PerformanceInstanceDisplay, PerformanceInstanceOperationResponse,
+    PerformanceManagedArtifactSummary, PerformanceMemoryDisplay, PerformanceModeDisplay,
+    PerformancePlanRequest, PerformancePlanResponse, PerformanceRollbackListRequest,
+    PerformanceRollbackListResponse, PerformanceRulesStatusResponse, PerformanceRuntimeDisplay,
+    RefreshPerformanceRulesError, performance_health, performance_install,
+    performance_instance_operation, performance_operation_status, performance_plan,
+    performance_plan_summary_view_model, performance_rollback_list, performance_rules_status,
+    refresh_performance_rules, refresh_performance_rules_error_response,
+    spawn_pending_performance_operations,
+};
+pub(crate) use skin::flush_pending_saved_skin_applies_for_launch;
+pub use skin::flush_pending_saved_skin_applies_for_shutdown;
+pub use update::{UpdateResponse, update_status};
+pub use version::{
+    CatalogEntry, CatalogResponse, DeleteVersionRequest, SharedDataInfo, VersionInfoResponse,
+    VersionsResponse, WorldInfo, catalog, delete_version, installed_versions,
+    installed_versions_event_payload, open_version_folder, version_info,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

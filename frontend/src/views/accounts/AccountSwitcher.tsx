@@ -190,7 +190,7 @@ export function AccountSwitcher({
   const accountTextureSrc = activeAccount
     ? (liveAccountTextureSrc ?? (onlineActive && activeProfileTextureSrc ? activeProfileTextureSrc : offlineTextureSrc))
     : undefined;
-  const refreshAvailable = Boolean(activeMicrosoftAccount?.msa_refresh_available ?? status?.msa_refresh_available);
+  const refreshAvailable = Boolean(activeMicrosoftAccount?.refresh_action?.enabled ?? status?.refresh_action?.enabled);
   const profileSyncAvailable = Boolean(activeMicrosoftAccount?.minecraft_profile ?? status?.minecraft_profile);
   const microsoftAccounts = accounts.filter((account) => account.kind === 'microsoft');
   const offlineAccounts = accounts.filter((account) => account.kind === 'offline');

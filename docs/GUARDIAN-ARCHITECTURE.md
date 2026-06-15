@@ -46,6 +46,8 @@ Guardian currently has working proof across these areas:
 - performance facts for invalid rules, degraded/fallback/invalid health, user-owned conflicts, repeated failures, and rollback availability
 - public/exportable redaction for Guardian outcomes, launch notices, session status/events, install status/events, operation status, performance health/status, operation journals, and local proof exports
 
+`apps/api/src/application/authority.rs` is the local proof gate for this model. Its tests enforce route adapter boundaries, frontend non-policy rendering, Execution non-policy, required source/control-plane reproducibility, and a quality-gate failure-scenario matrix that points every required Guardian failure scenario at local behavior tests.
+
 Not every domain has a specialized automatic repair workflow yet. When Guardian does not have a specific workflow, it still owns the safety interpretation if the issue crosses a safety boundary: it should cushion damage by producing a bounded block, warning, degraded state, retry suppression, or user-facing notice rather than letting raw errors or frontend guesses escape.
 
 ## Modes
@@ -162,7 +164,7 @@ It does not own raw provider selection, arbitrary file deletion, user-owned file
 ## Launch Runtime And JVM
 Runtime, JVM, and launch preparation code emit facts and provide execution hooks. Guardian decides whether to keep a requested runtime, switch to managed runtime, strip or preserve raw JVM args, disable custom GC, downgrade a preset, warn, repair, or block.
 
-Launch preparation remains backend-owned. The frontend does not decide readiness, compute effective memory policy, classify Java/JVM failures, choose Guardian/Healing precedence, or synthesize crash warnings.
+Launch preparation and launch-session execution are backend-owned under the Application launch modules. API launch routes adapt HTTP/SSE transport and call those Application entrypoints; they do not own Guardian preflight, runtime repair, startup recovery, or session outcome policy. The frontend does not decide readiness, compute effective memory policy, classify Java/JVM failures, choose Guardian/Healing precedence, or synthesize crash warnings.
 
 ## Session Outcomes
 Session code collects observations and preserves bounded history. It distinguishes:
@@ -176,12 +178,14 @@ Session code collects observations and preserves bounded history. It distinguish
 Guardian owns the safety interpretation when those observations affect user-facing outcomes. Closing Minecraft through the game window after startup is a clean `ExternalUserClosed` outcome and does not produce a crash warning unless the backend explicitly authors a notice.
 
 ## Install And Download
-Install/download systems emit redacted facts and keep private selected descriptors for repair planning. Public install progress/status/events are sanitized at the API boundary.
+Install/download systems emit redacted facts and keep private selected descriptors for repair planning. `apps/api/src/application/install.rs` owns install operation identity, worker coordination, journal recording, progress redaction, loader install coordination, Guardian artifact repair invocation, repair outcome shaping, and install status responses. Install and loader routes parse requests, call Application entrypoints, serialize backend-authored responses, and stream sanitized progress events; they do not own repair policy or operation journal semantics.
 
 Guardian can repair only launcher-managed artifacts when the failed fact exactly matches a private selected descriptor and ownership/postcondition gates pass. Metadata, provider, network, permission, ownership, temp-write, promote, and success facts do not trigger automatic artifact repair today; they still produce bounded evidence and public failures rather than raw provider or filesystem output.
 
 ## Performance
 Performance owns plan resolution, health, composition locks, managed artifact mutation, rollback snapshots, and queued performance operations.
+
+`apps/api/src/application/performance.rs` and `apps/api/src/application/performance/workflow.rs` own performance route orchestration: status and refresh response shaping, plan and health result carriers, Guardian performance fact adaptation, proof/view-model construction, rollback response semantics, queued operation creation/resume/status, and coordination of Performance-owned managed-artifact mutation. `apps/api/src/routes/performance.rs` only parses HTTP requests, calls those Application entrypoints, and serializes backend-authored responses.
 
 Guardian consumes Performance facts for invalid remote rules, degraded or fallback health, invalid ownership, repeated failure, and rollback availability. Guardian can recommend or record degraded/fallback/rollback-safe states, but concrete composition mutation stays in Performance and must respect composition-managed ownership.
 

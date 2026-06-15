@@ -1,3 +1,4 @@
+use crate::application::{self, VersionsResponse};
 use crate::state::AppState;
 use axum::{
     Json, Router,
@@ -6,18 +7,8 @@ use axum::{
     response::sse::{Event, Sse},
     routing::get,
 };
-use croopor_minecraft::{
-    VersionEntry, enrich_version_entries, fetch_version_manifest_cached,
-    manifest_release_references, scan_versions,
-};
-use serde::Serialize;
-use std::{convert::Infallible, path::PathBuf, time::Duration};
+use std::{convert::Infallible, time::Duration};
 use tokio::time::interval;
-
-#[derive(Debug, Serialize)]
-struct VersionsResponse {
-    versions: Vec<VersionEntry>,
-}
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -28,21 +19,7 @@ pub fn router() -> Router<AppState> {
 async fn handle_versions(
     State(state): State<AppState>,
 ) -> Result<Json<VersionsResponse>, (StatusCode, Json<serde_json::Value>)> {
-    let Some(mc_dir) = state.library_dir() else {
-        return Err((
-            StatusCode::PRECONDITION_FAILED,
-            Json(serde_json::json!({ "error": "Croopor library is not configured" })),
-        ));
-    };
-
-    let mc_dir = PathBuf::from(mc_dir);
-    let mut versions = scan_versions(&mc_dir).map_err(scan_versions_error_response)?;
-    if let Ok(manifest) = fetch_version_manifest_cached(&mc_dir).await {
-        let releases = manifest_release_references(&manifest);
-        enrich_version_entries(&mut versions, &releases);
-    }
-
-    Ok(Json(VersionsResponse { versions }))
+    application::installed_versions(&state).await.map(Json)
 }
 
 async fn handle_version_watch(
@@ -51,26 +28,15 @@ async fn handle_version_watch(
     Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>,
     (StatusCode, Json<serde_json::Value>),
 > {
-    let Some(mc_dir) = state.library_dir() else {
-        return Err((
-            StatusCode::PRECONDITION_FAILED,
-            Json(serde_json::json!({ "error": "Croopor library is not configured" })),
-        ));
-    };
+    application::installed_versions(&state).await?;
 
-    let mc_dir = PathBuf::from(mc_dir);
     let stream = async_stream::stream! {
         let mut ticker = interval(Duration::from_secs(5));
         let mut last_payload = String::new();
 
         loop {
             ticker.tick().await;
-            let mut versions = scan_versions(&mc_dir).unwrap_or_default();
-            if let Ok(manifest) = fetch_version_manifest_cached(&mc_dir).await {
-                let releases = manifest_release_references(&manifest);
-                enrich_version_entries(&mut versions, &releases);
-            }
-            let payload = serde_json::to_string(&serde_json::json!({ "versions": versions })).unwrap_or_else(|_| "{\"versions\":[]}".to_string());
+            let payload = application::installed_versions_event_payload(&state).await;
             if payload != last_payload {
                 last_payload = payload.clone();
                 yield Ok(Event::default().event("versions_changed").data(payload));
@@ -79,53 +45,4 @@ async fn handle_version_watch(
     };
 
     Ok(Sse::new(stream))
-}
-
-fn scan_versions_error_response(_error: std::io::Error) -> (StatusCode, Json<serde_json::Value>) {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(serde_json::json!({
-            "error": "Could not scan installed versions. Check the library folder and try again."
-        })),
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io;
-
-    #[test]
-    fn scan_versions_error_response_hides_unix_path_fragments() {
-        let (status, Json(body)) = scan_versions_error_response(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "permission denied reading /home/alice/Croopor Library/versions",
-        ));
-
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(
-            body.get("error").and_then(serde_json::Value::as_str),
-            Some("Could not scan installed versions. Check the library folder and try again.")
-        );
-        let body = body.to_string();
-        assert!(!body.contains("/home/alice"));
-        assert!(!body.contains("Croopor Library"));
-    }
-
-    #[test]
-    fn scan_versions_error_response_hides_windows_path_fragments() {
-        let (status, Json(body)) = scan_versions_error_response(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            r"permission denied reading C:\Users\Alice\AppData\Roaming\Croopor\versions",
-        ));
-
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(
-            body.get("error").and_then(serde_json::Value::as_str),
-            Some("Could not scan installed versions. Check the library folder and try again.")
-        );
-        let body = body.to_string();
-        assert!(!body.contains(r"C:\Users\Alice"));
-        assert!(!body.contains("AppData"));
-    }
 }

@@ -8,10 +8,12 @@ pub mod artifact_descriptor;
 pub mod artifact_repair;
 pub mod healing;
 pub mod install_evidence;
+pub mod launch_decision;
 pub mod launch_recovery;
 pub mod outcome;
 pub mod performance;
 pub mod policy;
+pub mod preflight;
 pub mod repair_plan;
 
 use crate::execution::{ExecutionFact, ExecutionFactKind};
@@ -40,11 +42,19 @@ pub use install_evidence::{
     install_artifact_failure_from_minecraft_download_fact, install_artifact_failure_guardian_fact,
     install_artifact_failure_safety_case,
 };
+pub use launch_decision::{
+    GuardianLaunchRecoveryDirective, GuardianLaunchRecoveryEffect, GuardianPrepareFailureOutcome,
+    GuardianPrepareFailureRequest, GuardianPresetAdjustmentRequest,
+    GuardianStartupFailureObservation, GuardianStartupFailureOutcome,
+    GuardianStartupFailureRequest, conservative_launch_recovery_preset,
+    guardian_prelaunch_preset_adjustment_directive, guardian_prepare_failure_outcome,
+    guardian_startup_failure_outcome,
+};
 pub use launch_recovery::{
     GuardianLaunchRecoveryKind, GuardianLaunchRecoveryOutcome, GuardianLaunchRecoveryRequest,
     GuardianLaunchRecoveryStatus, record_launch_recovery_attempt, record_launch_recovery_failure,
 };
-pub use outcome::{GuardianUserOutcome, startup_failure_guardian_outcome};
+pub use outcome::GuardianUserOutcome;
 pub use performance::{
     performance_failure_memory_guardian_fact, performance_health_guardian_facts,
     performance_plan_guardian_facts, performance_rules_guardian_facts,
@@ -53,6 +63,10 @@ pub use performance::{
 pub use policy::{
     GuardianPolicyContext, action_safety_score, decide_guardian_policy, decision_pressure_score,
     launch_summary_decision_kind, launch_summary_safety_outcome,
+};
+pub use preflight::{
+    GuardianPreflightOutcome, GuardianPreflightOutcomeRequest, GuardianPreflightOverrideSignals,
+    GuardianPreflightReadiness, GuardianPreflightResourceSignals, guardian_preflight_outcome,
 };
 pub use repair_plan::{
     GuardianRepairExecutor, GuardianRepairMutation, GuardianRepairPlan,
@@ -579,7 +593,11 @@ fn diagnosis_for_fact(fact: &GuardianFact, phase: OperationPhase) -> Option<Diag
                     user_intent_impact: 0.65,
                     ..GuardianImpactVector::default()
                 },
-                candidate_actions: vec![GuardianActionKind::Fallback, GuardianActionKind::Block],
+                candidate_actions: vec![
+                    GuardianActionKind::Fallback,
+                    GuardianActionKind::AskUser,
+                    GuardianActionKind::Block,
+                ],
                 public_reason_template: "selected_java_runtime_unavailable".to_string(),
             })
         }
@@ -699,6 +717,48 @@ fn diagnosis_for_fact(fact: &GuardianFact, phase: OperationPhase) -> Option<Diag
             impact: GuardianImpactVector::record_only(),
             candidate_actions: vec![GuardianActionKind::RecordOnly],
             public_reason_template: "launch_command_prepared".to_string(),
+        }),
+        "launch_memory_min_clamped"
+        | "launch_memory_allocation_low"
+        | "launch_resource_memory_pressure"
+        | "launch_resource_cpu_pressure"
+        | "launch_resource_install_pressure"
+        | "launch_resource_disk_pressure" => Some(Diagnosis {
+            id: DiagnosisId::new(fact.id.as_str()),
+            domain: fact.domain,
+            severity: fact.severity.unwrap_or(GuardianSeverity::Warning),
+            confidence: fact.confidence.unwrap_or(GuardianConfidence::High),
+            ownership: fact.ownership,
+            phase,
+            fact_ids: vec![fact.id.as_str().to_string()],
+            affected_targets: target,
+            impact: GuardianImpactVector {
+                launchability_impact: 0.35,
+                performance_impact: 0.45,
+                host_stability_impact: 0.50,
+                ..GuardianImpactVector::default()
+            },
+            candidate_actions: vec![GuardianActionKind::Warn, GuardianActionKind::RecordOnly],
+            public_reason_template: fact.id.as_str().to_string(),
+        }),
+        "custom_java_override_present"
+        | "custom_jvm_preset_present"
+        | "custom_jvm_args_present" => Some(Diagnosis {
+            id: DiagnosisId::new(fact.id.as_str()),
+            domain: fact.domain,
+            severity: fact.severity.unwrap_or(GuardianSeverity::Warning),
+            confidence: fact.confidence.unwrap_or(GuardianConfidence::High),
+            ownership: fact.ownership,
+            phase,
+            fact_ids: vec![fact.id.as_str().to_string()],
+            affected_targets: target,
+            impact: GuardianImpactVector {
+                user_intent_impact: 0.55,
+                launchability_impact: 0.20,
+                ..GuardianImpactVector::default()
+            },
+            candidate_actions: vec![GuardianActionKind::Warn, GuardianActionKind::RecordOnly],
+            public_reason_template: fact.id.as_str().to_string(),
         }),
         "jvm_args_empty" => Some(Diagnosis {
             id: DiagnosisId::new("jvm_args_empty"),

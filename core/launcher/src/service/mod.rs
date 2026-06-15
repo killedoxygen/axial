@@ -11,7 +11,6 @@ use crate::runtime::RuntimeSelection;
 use crate::types::LaunchFailureClass;
 use serde::{Deserialize, Serialize};
 
-pub use crate::guardian::{RecoveryAction, RecoveryPlan, conservative_healing_preset};
 pub use healing::{HealingSummaryInput, build_healing_summary};
 pub use mapping::{
     failure_class_name, format_failure_class, is_terminal_state, is_terminal_status, launch_notice,

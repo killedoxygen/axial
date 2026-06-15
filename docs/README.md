@@ -70,6 +70,19 @@ Do not use them for:
 - unrelated design decisions
 - temporary implementation notes
 
+### `plans/stabilization/`
+Ignored local target architecture specs and stabilization execution control plane.
+
+Use it for:
+- stabilization system specs
+- execution plans and active `PROGRESS.md`
+- Guardian reasoning, repair, redaction, frontend-removal, and proof method specs
+
+Do not use it for:
+- historical logs
+- broad product roadmap notes
+- unplanned implementation drift
+
 ### `docs/adr/`
 Architecture Decision Records.
 
@@ -88,6 +101,7 @@ Do not use ADRs for:
 - If the current pipeline changes: update `docs/ARCHITECTURE.md`.
 - If frontend design guardrails change: update `docs/DESIGN.md`.
 - If one subsystem changes internally: update that subsystem’s architecture doc.
+- If stabilization execution state changes: update local `plans/stabilization/execution/PROGRESS.md` as current state only.
 - If the rules for working in the repo change: update `docs/CONVENTIONS.md`.
 - If a major decision is made and the reasoning matters long-term: add an ADR.
 - If the docs structure itself changes: update this file.

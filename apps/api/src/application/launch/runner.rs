@@ -7,9 +7,13 @@ use crate::execution::process::{
     process_stage_evidence,
 };
 use crate::guardian::{
-    GuardianLaunchRecoveryKind, GuardianLaunchRecoveryOutcome, GuardianLaunchRecoveryRequest,
-    GuardianLaunchRecoveryStatus, record_launch_recovery_attempt, record_launch_recovery_failure,
-    startup_failure_guardian_outcome,
+    GuardianLaunchRecoveryDirective, GuardianLaunchRecoveryEffect, GuardianLaunchRecoveryKind,
+    GuardianLaunchRecoveryOutcome, GuardianLaunchRecoveryRequest, GuardianLaunchRecoveryStatus,
+    GuardianPrepareFailureRequest, GuardianPresetAdjustmentRequest,
+    GuardianStartupFailureObservation, GuardianStartupFailureRequest, GuardianUserOutcome,
+    guardian_prelaunch_preset_adjustment_directive, guardian_prepare_failure_outcome,
+    guardian_startup_failure_outcome, record_launch_recovery_attempt,
+    record_launch_recovery_failure,
 };
 use crate::logging::{append_trace, timestamp_utc};
 use crate::state::contracts::{OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind};
@@ -17,12 +21,10 @@ use crate::state::launch_reports::{LaunchProofContext, LaunchProofResourceBudget
 use crate::state::{AppState, LaunchStatusEvent, StartupOutcome};
 use croopor_config::{AppConfig, Instance};
 use croopor_launcher::{
-    GuardianInterventionKind, GuardianSummary, LaunchFailureClass, LaunchPreparationEvent,
-    LaunchSessionExitReason, LaunchSessionOutcome, LaunchState, PreLaunchAction, PreLaunchDecision,
-    PreparedLaunchAttempt, RecoveryAction, StartupFailureDecision, StartupFailureObservation,
-    build_healing_summary, decide_prepare_failure, decide_startup_failure, failure_class_name,
-    guidance_for_failure, launch_state_name, prepare_launch_attempt_with_events,
-    recovery_plan_for_startup_failure,
+    GuardianDecision, GuardianInterventionKind, GuardianSummary, LaunchFailureClass,
+    LaunchPreparationEvent, LaunchSessionExitReason, LaunchSessionOutcome, LaunchState,
+    PreparedLaunchAttempt, build_healing_summary, failure_class_name, launch_state_name,
+    prepare_launch_attempt_with_events,
 };
 use serde_json::Value;
 use std::collections::HashSet;
@@ -40,7 +42,7 @@ const PREWARM_BUFFER_BYTES: usize = 16 * 1024;
 const LIVE_LAUNCH_FAILURE_MAX_CHARS: usize = 180;
 const LIVE_LAUNCH_FAILURE_SAFE_FALLBACK: &str = "Launch failed before Minecraft could start. Detailed diagnostics were hidden because they may contain local paths or private data.";
 
-pub(super) struct LaunchSuccess {
+pub struct LaunchSuccess {
     pub session_id: String,
     pub instance_id: String,
     pub pid: u32,
@@ -51,17 +53,17 @@ pub(super) struct LaunchSuccess {
     pub guardian: Option<GuardianSummary>,
 }
 
-pub(super) struct LaunchRequestError {
+pub struct LaunchRequestError {
     pub message: String,
     pub healing: Option<croopor_launcher::LaunchHealingSummary>,
     pub guardian: Option<GuardianSummary>,
 }
 
-pub(super) async fn launch_session(
+pub async fn launch_session(
     state: AppState,
-    task: super::task::LaunchSessionTask,
+    task: super::session::LaunchSessionTask,
 ) -> Result<LaunchSuccess, LaunchRequestError> {
-    let super::task::LaunchSessionTask {
+    let super::session::LaunchSessionTask {
         application,
         boundary,
         mut instance,
@@ -90,7 +92,10 @@ pub(super) async fn launch_session(
         .sessions()
         .record_stage_evidence(&session_id, initial_evidence)
         .await;
-    if let Some(benchmark_payload) = benchmark.as_ref().map(super::benchmark_status_payload) {
+    if let Some(benchmark_payload) = benchmark
+        .as_ref()
+        .map(super::launch_benchmark_status_payload)
+    {
         state
             .sessions()
             .attach_benchmark(&session_id, benchmark_payload)
@@ -145,103 +150,55 @@ pub(super) async fn launch_session(
             Err(error) => {
                 trace_launch_event(&session_id, &format!("prepare failed: {}", error.message));
                 let failure_class = error.failure_class.unwrap_or(LaunchFailureClass::Unknown);
-                match decide_prepare_failure(
-                    &intent.guardian,
-                    failure_class,
-                    &error.message,
-                    &intent.requested_java,
-                    &intent.extra_jvm_args,
-                    attempt.runtime_intervention_applied,
-                    attempt.raw_jvm_args_intervention_applied,
-                ) {
-                    PreLaunchDecision::Allow => {}
-                    PreLaunchDecision::Intervene {
-                        action,
-                        kind,
-                        description,
-                    } => {
-                        let recovery_kind = pre_launch_recovery_kind(action);
-                        let recovery_outcome = record_guardian_launch_recovery_attempt(
-                            &state,
-                            &session_id,
-                            &intent,
-                            recovery_kind,
-                            failure_class,
-                        );
-                        if recovery_outcome.status == GuardianLaunchRecoveryStatus::Suppressed {
-                            let message = suppressed_launch_recovery_message(recovery_kind);
-                            state
-                                .sessions()
-                                .emit_log(&session_id, "system", message.clone())
-                                .await;
-                            block_guardian_for_suppressed_launch_recovery(&mut guardian, &message);
-                            return Err(fail_launch(
-                                &state,
-                                &session_id,
-                                Some(&proof_context),
-                                failure_class,
-                                &message,
-                                error.healing,
-                                Some(guardian.clone()),
-                            )
-                            .await);
-                        }
+                let prepare_outcome =
+                    guardian_prepare_failure_outcome(GuardianPrepareFailureRequest {
+                        mode: launch_policy_guardian_mode(intent.guardian.mode),
+                        failure_class,
+                        public_error: &error.message,
+                        requested_java_present: !intent.requested_java.trim().is_empty(),
+                        explicit_java_override_present: intent.guardian.has_java_override(),
+                        explicit_jvm_args_present: intent.guardian.has_raw_jvm_args()
+                            && !intent.extra_jvm_args.is_empty(),
+                        runtime_intervention_applied: attempt.runtime_intervention_applied,
+                        raw_jvm_args_intervention_applied: attempt
+                            .raw_jvm_args_intervention_applied,
+                    });
+                if let Some(directive) = prepare_outcome.directive.clone() {
+                    let recovery_kind = directive.kind;
+                    let recovery_outcome = record_guardian_launch_recovery_attempt(
+                        &state,
+                        &session_id,
+                        &intent,
+                        recovery_kind,
+                        failure_class,
+                    );
+                    if recovery_outcome.status == GuardianLaunchRecoveryStatus::Suppressed {
+                        let message = suppressed_launch_recovery_message(recovery_kind);
                         state
                             .sessions()
-                            .emit_log(&session_id, "system", description.clone())
+                            .emit_log(&session_id, "system", message.clone())
                             .await;
-                        record_guardian_intervention(
-                            &mut guardian,
-                            kind,
-                            description.clone(),
-                            false,
-                        );
-                        match action {
-                            PreLaunchAction::ForceManagedRuntime => {
-                                attempt.record_runtime_intervention(description);
-                            }
-                            PreLaunchAction::StripRawJvmArgs => {
-                                attempt.record_raw_jvm_args_intervention(description);
-                            }
-                        }
-                        last_recovery_kind = Some(recovery_kind);
-                        continue;
-                    }
-                    PreLaunchDecision::Block {
-                        class,
-                        message,
-                        guidance,
-                    } => {
-                        block_guardian_with_reason_and_guidance(
-                            &mut guardian,
-                            bounded_prepare_failure_reason(class, &message),
-                            guidance,
-                        );
-                        record_failed_self_healing_if_any(
-                            &state,
-                            &session_id,
-                            &intent,
-                            last_recovery_kind,
-                            class,
-                        )
-                        .await;
+                        block_guardian_for_suppressed_launch_recovery(&mut guardian, &message);
                         return Err(fail_launch(
                             &state,
                             &session_id,
                             Some(&proof_context),
-                            class,
+                            failure_class,
                             &message,
                             error.healing,
                             Some(guardian.clone()),
                         )
                         .await);
                     }
+                    state
+                        .sessions()
+                        .emit_log(&session_id, "system", directive.description.clone())
+                        .await;
+                    apply_prepare_recovery_directive(&mut guardian, &mut attempt, directive);
+                    last_recovery_kind = Some(recovery_kind);
+                    continue;
                 }
-                block_guardian_with_reason_and_guidance(
-                    &mut guardian,
-                    bounded_prepare_failure_reason(failure_class, &error.message),
-                    guidance_for_failure(failure_class, &intent.guardian),
-                );
+                block_guardian_with_user_outcome(&mut guardian, &prepare_outcome.user_outcome);
                 record_failed_self_healing_if_any(
                     &state,
                     &session_id,
@@ -262,16 +219,17 @@ pub(super) async fn launch_session(
                 .await);
             }
         };
-        for intervention in &prepared.guardian_interventions {
-            if let Some(detail) = intervention.detail.as_deref() {
-                record_guardian_intervention(
-                    &mut guardian,
-                    intervention.kind,
-                    detail,
-                    intervention.silent.unwrap_or(false),
-                );
-            }
+        if let Some(directive) =
+            guardian_prelaunch_preset_adjustment_directive(GuardianPresetAdjustmentRequest {
+                mode: launch_policy_guardian_mode(intent.guardian.mode),
+                requested_preset: &intent.requested_preset,
+                effective_preset: &prepared.effective_preset,
+                explicit_jvm_preset_present: intent.guardian.has_named_preset(),
+            })
+        {
+            record_prelaunch_preset_adjustment_directive(&mut guardian, directive);
         }
+
         trace_launch_event(
             &session_id,
             &format!(
@@ -530,9 +488,9 @@ pub(super) async fn launch_session(
                 }
 
                 let observation = if stalled {
-                    StartupFailureObservation::Stalled
+                    GuardianStartupFailureObservation::Stalled
                 } else {
-                    StartupFailureObservation::Exited {
+                    GuardianStartupFailureObservation::Exited {
                         failure_class: state
                             .sessions()
                             .observed_failure(&session_id)
@@ -540,20 +498,24 @@ pub(super) async fn launch_session(
                             .unwrap_or(LaunchFailureClass::Unknown),
                     }
                 };
-                let startup_decision = decide_startup_failure(&intent.guardian, observation);
-                let failure_class = startup_decision.class;
-                if !attempt.startup_recovery_applied
-                    && let Some(recovery) = recovery_plan_for_startup_failure(
-                        failure_class,
-                        &intent.target_version_id,
-                        &prepared.runtime.effective_info,
-                        &intent.requested_java,
-                        &intent.guardian,
-                        attempt.disable_custom_gc,
-                        &prepared.effective_preset,
-                    )
-                {
-                    let recovery_kind = startup_recovery_kind(&recovery.action);
+                let startup_outcome =
+                    guardian_startup_failure_outcome(GuardianStartupFailureRequest {
+                        mode: launch_policy_guardian_mode(intent.guardian.mode),
+                        observation,
+                        target_version_id: &intent.target_version_id,
+                        runtime_major: prepared.runtime.effective_info.major,
+                        requested_java_present: !intent.requested_java.trim().is_empty(),
+                        explicit_java_override_present: intent.guardian.has_java_override(),
+                        explicit_jvm_args_present: intent.guardian.has_raw_jvm_args()
+                            && !intent.extra_jvm_args.is_empty(),
+                        explicit_jvm_preset_present: intent.guardian.has_named_preset(),
+                        startup_recovery_applied: attempt.startup_recovery_applied,
+                        disable_custom_gc: attempt.disable_custom_gc,
+                        effective_preset: &prepared.effective_preset,
+                    });
+                let failure_class = startup_outcome.failure_class;
+                if let Some(directive) = startup_outcome.directive.clone() {
+                    let recovery_kind = directive.kind;
                     let recovery_outcome = record_guardian_launch_recovery_attempt(
                         &state,
                         &session_id,
@@ -583,42 +545,9 @@ pub(super) async fn launch_session(
                     }
                     state
                         .sessions()
-                        .emit_log(&session_id, "system", recovery.description.clone())
+                        .emit_log(&session_id, "system", directive.description.clone())
                         .await;
-                    attempt.record_startup_recovery(recovery.description.clone());
-                    match recovery.action {
-                        RecoveryAction::DowngradePreset(next_preset) => {
-                            record_guardian_intervention(
-                                &mut guardian,
-                                GuardianInterventionKind::DowngradePreset,
-                                recovery.description.clone(),
-                                false,
-                            );
-                            attempt.preset_override = Some(next_preset);
-                            attempt.disable_custom_gc = false;
-                        }
-                        RecoveryAction::DisableCustomGc => {
-                            record_guardian_intervention(
-                                &mut guardian,
-                                GuardianInterventionKind::DisableCustomGc,
-                                recovery.description.clone(),
-                                false,
-                            );
-                            attempt.preset_override = None;
-                            attempt.disable_custom_gc = true;
-                        }
-                        RecoveryAction::SwitchManagedRuntime => {
-                            record_guardian_intervention(
-                                &mut guardian,
-                                GuardianInterventionKind::SwitchManagedRuntime,
-                                recovery.description.clone(),
-                                false,
-                            );
-                            attempt.force_managed_runtime = true;
-                            attempt.preset_override = None;
-                            attempt.disable_custom_gc = false;
-                        }
-                    }
+                    apply_startup_recovery_directive(&mut guardian, &mut attempt, directive);
                     last_recovery_kind = Some(recovery_kind);
                     continue;
                 }
@@ -632,34 +561,19 @@ pub(super) async fn launch_session(
                     failure_class,
                 )
                 .await;
-                apply_startup_failure_guardian_decision(&mut guardian, &startup_decision);
+                block_guardian_with_user_outcome(&mut guardian, &startup_outcome.user_outcome);
                 return Err(fail_launch(
                     &state,
                     &session_id,
                     Some(&proof_context),
                     failure_class,
-                    &startup_decision.message,
+                    &startup_outcome.user_outcome.summary,
                     healing,
                     Some(guardian.clone()),
                 )
                 .await);
             }
         }
-    }
-}
-
-fn pre_launch_recovery_kind(action: PreLaunchAction) -> GuardianLaunchRecoveryKind {
-    match action {
-        PreLaunchAction::ForceManagedRuntime => GuardianLaunchRecoveryKind::SwitchManagedRuntime,
-        PreLaunchAction::StripRawJvmArgs => GuardianLaunchRecoveryKind::StripRawJvmArgs,
-    }
-}
-
-fn startup_recovery_kind(action: &RecoveryAction) -> GuardianLaunchRecoveryKind {
-    match action {
-        RecoveryAction::DowngradePreset(_) => GuardianLaunchRecoveryKind::DowngradePreset,
-        RecoveryAction::DisableCustomGc => GuardianLaunchRecoveryKind::DisableCustomGc,
-        RecoveryAction::SwitchManagedRuntime => GuardianLaunchRecoveryKind::SwitchManagedRuntime,
     }
 }
 
@@ -829,7 +743,7 @@ fn startup_failure_healing(
     })
 }
 
-pub(super) fn trace_launch_event(session_id: &str, message: &str) {
+pub fn trace_launch_event(session_id: &str, message: &str) {
     append_trace("launch", session_id, message);
 }
 
@@ -842,6 +756,23 @@ fn record_guardian_intervention(
     let existing_guidance = guardian.guidance.clone();
     guardian.record_intervention(kind, detail, silent);
     append_guardian_guidance_details(guardian, &existing_guidance);
+}
+
+fn record_prelaunch_preset_adjustment_directive(
+    guardian: &mut GuardianSummary,
+    directive: GuardianLaunchRecoveryDirective,
+) {
+    if matches!(
+        directive.effect,
+        GuardianLaunchRecoveryEffect::DowngradePreset { .. }
+    ) {
+        record_guardian_intervention(
+            guardian,
+            GuardianInterventionKind::DowngradePreset,
+            directive.description,
+            false,
+        );
+    }
 }
 
 fn block_guardian_with_reason_and_guidance(
@@ -860,48 +791,106 @@ fn block_guardian_with_reason_and_guidance(
     }
 }
 
-fn apply_startup_failure_guardian_decision(
+fn apply_prepare_recovery_directive(
     guardian: &mut GuardianSummary,
-    decision: &StartupFailureDecision,
+    attempt: &mut croopor_launcher::service::AttemptOverrides,
+    directive: GuardianLaunchRecoveryDirective,
 ) {
-    let outcome = startup_failure_guardian_outcome(decision, &guardian.guidance);
-    outcome.apply_to_launch_summary(guardian);
-}
-
-fn bounded_prepare_failure_reason(
-    failure_class: LaunchFailureClass,
-    message: &str,
-) -> Option<String> {
-    if failure_class == LaunchFailureClass::Unknown {
-        return None;
+    let description = directive.description;
+    match directive.effect {
+        GuardianLaunchRecoveryEffect::ForceManagedRuntime => {
+            record_guardian_intervention(
+                guardian,
+                GuardianInterventionKind::SwitchManagedRuntime,
+                description.clone(),
+                false,
+            );
+            attempt.record_runtime_intervention(description);
+        }
+        GuardianLaunchRecoveryEffect::StripRawJvmArgs => {
+            record_guardian_intervention(
+                guardian,
+                GuardianInterventionKind::StripJvmArgs,
+                description.clone(),
+                false,
+            );
+            attempt.record_raw_jvm_args_intervention(description);
+        }
+        GuardianLaunchRecoveryEffect::DowngradePreset { .. }
+        | GuardianLaunchRecoveryEffect::DisableCustomGc => {}
     }
-    bounded_guardian_detail(message)
 }
 
-fn bounded_guardian_detail(message: &str) -> Option<String> {
-    let detail = message.trim().replace(
-        "-XX:+UnlockExperimentalVMOptions",
-        "the required experimental JVM unlock flag",
-    );
-    if detail.is_empty() || detail.len() > 240 || contains_guardian_unsafe_detail(&detail) {
-        return None;
+fn apply_startup_recovery_directive(
+    guardian: &mut GuardianSummary,
+    attempt: &mut croopor_launcher::service::AttemptOverrides,
+    directive: GuardianLaunchRecoveryDirective,
+) {
+    let description = directive.description;
+    attempt.record_startup_recovery(description.clone());
+    match directive.effect {
+        GuardianLaunchRecoveryEffect::DowngradePreset { preset } => {
+            record_guardian_intervention(
+                guardian,
+                GuardianInterventionKind::DowngradePreset,
+                description,
+                false,
+            );
+            attempt.preset_override = Some(preset);
+            attempt.disable_custom_gc = false;
+        }
+        GuardianLaunchRecoveryEffect::DisableCustomGc => {
+            record_guardian_intervention(
+                guardian,
+                GuardianInterventionKind::DisableCustomGc,
+                description,
+                false,
+            );
+            attempt.preset_override = None;
+            attempt.disable_custom_gc = true;
+        }
+        GuardianLaunchRecoveryEffect::ForceManagedRuntime => {
+            record_guardian_intervention(
+                guardian,
+                GuardianInterventionKind::SwitchManagedRuntime,
+                description,
+                false,
+            );
+            attempt.force_managed_runtime = true;
+            attempt.preset_override = None;
+            attempt.disable_custom_gc = false;
+        }
+        GuardianLaunchRecoveryEffect::StripRawJvmArgs => {
+            record_guardian_intervention(
+                guardian,
+                GuardianInterventionKind::StripJvmArgs,
+                description,
+                false,
+            );
+            attempt.ignore_extra_jvm_args = true;
+        }
     }
-    Some(detail)
 }
 
-fn contains_guardian_unsafe_detail(detail: impl AsRef<str>) -> bool {
-    let detail = detail.as_ref();
-    let lower = detail.to_ascii_lowercase();
-    lower.contains("token")
-        || lower.contains("account")
-        || lower.contains("username")
-        || detail.contains("-X")
-        || detail.contains("-D")
-        || detail.contains('/')
-        || detail.contains('\\')
-        || detail.contains('\n')
-        || detail.contains('\r')
-        || detail.contains("${")
+fn block_guardian_with_user_outcome(guardian: &mut GuardianSummary, outcome: &GuardianUserOutcome) {
+    let existing_guidance = guardian.guidance.clone();
+    let mut guidance = existing_guidance.clone();
+    for detail in &outcome.guidance {
+        push_unique_detail(&mut guidance, detail.clone());
+    }
+
+    let mut details = outcome.details.clone();
+    for detail in &existing_guidance {
+        push_unique_detail(&mut details, detail.clone());
+    }
+    for detail in &outcome.guidance {
+        push_unique_detail(&mut details, detail.clone());
+    }
+
+    guardian.decision = GuardianDecision::Blocked;
+    guardian.message = Some(outcome.summary.clone());
+    guardian.details = details;
+    guardian.guidance = guidance;
 }
 
 fn append_guardian_guidance_details(guardian: &mut GuardianSummary, guidance: &[String]) {
@@ -1221,7 +1210,7 @@ async fn fail_launch_with_outcome(
     }
 }
 
-pub(super) fn sanitize_live_launch_failure_message(message: &str) -> String {
+pub fn sanitize_live_launch_failure_message(message: &str) -> String {
     let single_line = message.split_whitespace().collect::<Vec<_>>().join(" ");
     let trimmed = single_line.trim();
     if trimmed.is_empty() || contains_live_launch_unsafe_failure_detail(message) {
@@ -1406,7 +1395,7 @@ fn persist_launch_metadata(
     let _ = state.update_config(next);
 }
 
-pub(super) async fn persist_launch_proof_best_effort(
+pub async fn persist_launch_proof_best_effort(
     state: &AppState,
     session_id: &str,
     launched_at: Option<&str>,
@@ -1517,22 +1506,35 @@ mod tests {
         let warning = "Launch memory budget is tight.".to_string();
         let mut guardian = GuardianSummary::new(GuardianMode::Managed);
         guardian.warn_with_guidance(vec![warning.clone()]);
-        let context = croopor_launcher::LaunchGuardianContext {
-            mode: GuardianMode::Managed,
-            ..croopor_launcher::LaunchGuardianContext::default()
-        };
-
-        let decision = decide_startup_failure(&context, StartupFailureObservation::Stalled);
-        apply_startup_failure_guardian_decision(&mut guardian, &decision);
+        let outcome = guardian_startup_failure_outcome(GuardianStartupFailureRequest {
+            mode: launch_policy_guardian_mode(GuardianMode::Managed),
+            observation: GuardianStartupFailureObservation::Stalled,
+            target_version_id: "1.21.1",
+            runtime_major: 21,
+            requested_java_present: false,
+            explicit_java_override_present: false,
+            explicit_jvm_args_present: false,
+            explicit_jvm_preset_present: false,
+            startup_recovery_applied: false,
+            disable_custom_gc: false,
+            effective_preset: "performance",
+        });
+        block_guardian_with_user_outcome(&mut guardian, &outcome.user_outcome);
         let payload = serialize_guardian(Some(guardian.clone())).expect("guardian payload");
 
-        assert_eq!(decision.class, LaunchFailureClass::StartupStalled);
+        assert_eq!(outcome.failure_class, LaunchFailureClass::StartupStalled);
         assert_eq!(
             guardian.decision,
             croopor_launcher::GuardianDecision::Blocked
         );
-        assert_eq!(guardian.message.as_deref(), Some(decision.message.as_str()));
-        assert_eq!(guardian.details.first(), Some(&decision.reason));
+        assert_eq!(
+            guardian.message.as_deref(),
+            Some(outcome.user_outcome.summary.as_str())
+        );
+        assert_eq!(
+            guardian.details.first(),
+            outcome.user_outcome.details.first()
+        );
         assert!(guardian.details.iter().any(|detail| detail == &warning));
         assert!(
             guardian
@@ -1541,29 +1543,42 @@ mod tests {
                 .any(|detail| detail == "Review the latest game log before retrying.")
         );
         assert_eq!(payload["decision"], serde_json::json!("blocked"));
-        assert_eq!(payload["message"], serde_json::json!(decision.message));
-        assert_eq!(payload["details"][0], serde_json::json!(decision.reason));
+        assert_eq!(
+            payload["message"],
+            serde_json::json!(outcome.user_outcome.summary)
+        );
+        assert_eq!(
+            payload["details"][0],
+            serde_json::json!(outcome.user_outcome.details[0])
+        );
     }
 
     #[test]
     fn startup_exited_blocks_with_observed_failure_guardian_summary() {
         let mut guardian = GuardianSummary::new(GuardianMode::Custom);
-        let context = croopor_launcher::LaunchGuardianContext {
-            mode: GuardianMode::Custom,
-            raw_jvm_args_origin: Some(croopor_launcher::OverrideOrigin::Instance),
-            ..croopor_launcher::LaunchGuardianContext::default()
-        };
-
-        let decision = decide_startup_failure(
-            &context,
-            StartupFailureObservation::Exited {
+        let outcome = guardian_startup_failure_outcome(GuardianStartupFailureRequest {
+            mode: launch_policy_guardian_mode(GuardianMode::Custom),
+            observation: GuardianStartupFailureObservation::Exited {
                 failure_class: LaunchFailureClass::JvmUnsupportedOption,
             },
-        );
-        apply_startup_failure_guardian_decision(&mut guardian, &decision);
+            target_version_id: "1.21.1",
+            runtime_major: 21,
+            requested_java_present: false,
+            explicit_java_override_present: false,
+            explicit_jvm_args_present: true,
+            explicit_jvm_preset_present: false,
+            startup_recovery_applied: false,
+            disable_custom_gc: false,
+            effective_preset: "performance",
+        });
+        block_guardian_with_user_outcome(&mut guardian, &outcome.user_outcome);
         let payload = serialize_guardian(Some(guardian.clone())).expect("guardian payload");
 
-        assert_eq!(decision.class, LaunchFailureClass::JvmUnsupportedOption);
+        assert_eq!(
+            outcome.failure_class,
+            LaunchFailureClass::JvmUnsupportedOption
+        );
+        assert!(outcome.directive.is_none());
         assert_eq!(
             guardian.decision,
             croopor_launcher::GuardianDecision::Blocked
@@ -1580,7 +1595,10 @@ mod tests {
             ]
         );
         assert_eq!(payload["decision"], serde_json::json!("blocked"));
-        assert_eq!(payload["details"][0], serde_json::json!(decision.reason));
+        assert_eq!(
+            payload["details"][0],
+            serde_json::json!(outcome.user_outcome.details[0])
+        );
     }
 
     #[tokio::test]

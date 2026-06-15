@@ -1,4 +1,4 @@
-use crate::{routes::accounts, state::AppState};
+use crate::{application, state::AppState};
 use axum::{
     Json, Router,
     extract::State,
@@ -127,7 +127,7 @@ async fn handle_update_config(
     match state.update_config(next) {
         Ok(config) => {
             if sync_offline_username {
-                accounts::sync_active_offline_account_from_username(&state, &config.username)
+                application::sync_active_offline_account_from_username(&state, &config.username)
                     .map_err(config_account_sync_error_response)?;
             }
             Ok(Json(config))

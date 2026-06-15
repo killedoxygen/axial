@@ -1,4 +1,5 @@
 use crate::types::LaunchFailureClass;
+#[cfg(test)]
 use croopor_minecraft::JavaRuntimeInfo;
 use serde::{Deserialize, Serialize};
 
@@ -6,7 +7,9 @@ pub const LAUNCH_MEMORY_HEADROOM_MB: u64 = 2048;
 pub const LAUNCH_DISK_HEADROOM_MB: u64 = 2048;
 pub const LOW_MEMORY_ALLOCATION_WARNING_THRESHOLD_MB: i32 = 2048;
 
+#[cfg(test)]
 const MEMORY_CLAMP_WARNING: &str = "Minimum memory was higher than maximum memory, so Croopor clamped the launch minimum to match the maximum allocation.";
+#[cfg(test)]
 const MEMORY_CLAMP_GUIDANCE: &str = "Lower the minimum memory setting or raise the maximum memory allocation if this was intentional.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -68,19 +71,23 @@ impl LaunchGuardianContext {
         self.has_java_override() || self.has_named_preset() || self.has_raw_jvm_args()
     }
 
-    pub fn allows_runtime_healing(&self) -> bool {
+    #[cfg(test)]
+    fn allows_runtime_healing(&self) -> bool {
         matches!(self.mode, GuardianMode::Managed) && self.has_java_override()
     }
 
-    pub fn allows_preset_healing(&self) -> bool {
+    #[cfg(test)]
+    fn allows_preset_healing(&self) -> bool {
         matches!(self.mode, GuardianMode::Managed) || !self.has_named_preset()
     }
 
-    pub fn allows_raw_jvm_arg_intervention(&self) -> bool {
+    #[cfg(test)]
+    fn allows_raw_jvm_arg_intervention(&self) -> bool {
         matches!(self.mode, GuardianMode::Managed) && self.has_raw_jvm_args()
     }
 
-    pub fn allows_prelaunch_preset_intervention(&self) -> bool {
+    #[cfg(test)]
+    fn allows_prelaunch_preset_intervention(&self) -> bool {
         matches!(self.mode, GuardianMode::Managed) && self.has_named_preset()
     }
 }
@@ -127,13 +134,16 @@ pub struct GuardianSummary {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PreLaunchAction {
+#[cfg(test)]
+enum PreLaunchAction {
     ForceManagedRuntime,
     StripRawJvmArgs,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PreLaunchDecision {
+#[cfg(test)]
+#[allow(dead_code)]
+enum PreLaunchDecision {
     Allow,
     Intervene {
         action: PreLaunchAction,
@@ -148,13 +158,15 @@ pub enum PreLaunchDecision {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StartupFailureObservation {
+#[cfg(test)]
+enum StartupFailureObservation {
     Stalled,
     Exited { failure_class: LaunchFailureClass },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StartupFailureDecision {
+#[cfg(test)]
+struct StartupFailureDecision {
     pub class: LaunchFailureClass,
     pub message: String,
     pub reason: String,
@@ -233,27 +245,33 @@ impl LaunchResourceWarningFacts {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct LaunchWarningFacts {
+#[cfg(test)]
+struct LaunchWarningFacts {
     pub raw_min_memory_mb: i32,
     pub max_memory_mb: i32,
     pub resource: LaunchResourceWarningFacts,
 }
 
 #[derive(Debug, Clone)]
-pub struct RecoveryPlan {
+#[cfg(test)]
+#[allow(dead_code)]
+struct RecoveryPlan {
     pub description: String,
     pub action: RecoveryAction,
 }
 
 #[derive(Debug, Clone)]
-pub enum RecoveryAction {
+#[cfg(test)]
+#[allow(dead_code)]
+enum RecoveryAction {
     DowngradePreset(String),
     DisableCustomGc,
     SwitchManagedRuntime,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedGuardianPreset {
+#[cfg(test)]
+struct ResolvedGuardianPreset {
     pub effective_preset: String,
     pub intervention: Option<GuardianIntervention>,
 }
@@ -449,7 +467,8 @@ fn capitalize_ascii_word(word: &str) -> String {
     result
 }
 
-pub fn summarize_launch_warnings(
+#[cfg(test)]
+fn summarize_launch_warnings(
     context: &LaunchGuardianContext,
     facts: &LaunchWarningFacts,
 ) -> GuardianSummary {
@@ -471,6 +490,7 @@ pub fn summarize_launch_warnings(
     summary
 }
 
+#[cfg(test)]
 fn memory_clamp_warning_guidance(
     raw_min_memory_mb: i32,
     max_memory_mb: i32,
@@ -483,6 +503,7 @@ fn memory_clamp_warning_guidance(
     })
 }
 
+#[cfg(test)]
 fn low_memory_allocation_warning_guidance(max_memory_mb: i32) -> Option<Vec<String>> {
     (max_memory_mb > 0 && max_memory_mb < LOW_MEMORY_ALLOCATION_WARNING_THRESHOLD_MB).then(|| {
         vec![
@@ -494,6 +515,7 @@ fn low_memory_allocation_warning_guidance(max_memory_mb: i32) -> Option<Vec<Stri
     })
 }
 
+#[cfg(test)]
 fn memory_budget_warning_guidance(resource: LaunchResourceWarningFacts) -> Option<Vec<String>> {
     if !resource.memory_pressure() {
         return None;
@@ -504,6 +526,7 @@ fn memory_budget_warning_guidance(resource: LaunchResourceWarningFacts) -> Optio
     ])
 }
 
+#[cfg(test)]
 fn cpu_pressure_warning_guidance(resource: LaunchResourceWarningFacts) -> Option<Vec<String>> {
     if !resource.cpu_pressure() {
         return None;
@@ -540,6 +563,7 @@ fn cpu_pressure_warning_guidance(resource: LaunchResourceWarningFacts) -> Option
     (!guidance.is_empty()).then_some(guidance)
 }
 
+#[cfg(test)]
 fn install_pressure_warning_guidance(resource: LaunchResourceWarningFacts) -> Option<Vec<String>> {
     if !resource.install_pressure() {
         return None;
@@ -554,6 +578,7 @@ fn install_pressure_warning_guidance(resource: LaunchResourceWarningFacts) -> Op
     ])
 }
 
+#[cfg(test)]
 fn disk_pressure_warning_guidance(resource: LaunchResourceWarningFacts) -> Option<Vec<String>> {
     if !resource.disk_pressure() {
         return None;
@@ -569,6 +594,7 @@ fn disk_pressure_warning_guidance(resource: LaunchResourceWarningFacts) -> Optio
     ])
 }
 
+#[cfg(test)]
 fn custom_risky_override_warning_guidance(context: &LaunchGuardianContext) -> Option<Vec<String>> {
     if !matches!(context.mode, GuardianMode::Custom) || !context.has_risky_overrides() {
         return None;
@@ -675,14 +701,13 @@ fn measured_cpu_load_threshold_x100(cpu_threads: usize) -> u64 {
         .saturating_mul(headroom_percent)
 }
 
+#[cfg(test)]
 fn format_load_x100(value: u64) -> String {
     format!("{}.{:02}", value / 100, value % 100)
 }
 
-pub fn guidance_for_failure(
-    class: LaunchFailureClass,
-    context: &LaunchGuardianContext,
-) -> Vec<String> {
+#[cfg(test)]
+fn guidance_for_failure(class: LaunchFailureClass, context: &LaunchGuardianContext) -> Vec<String> {
     match class {
         LaunchFailureClass::JavaRuntimeMismatch => {
             if context.has_java_override() {
@@ -720,7 +745,8 @@ pub fn guidance_for_failure(
     }
 }
 
-pub fn decide_prepare_failure(
+#[cfg(test)]
+fn decide_prepare_failure(
     context: &LaunchGuardianContext,
     failure_class: LaunchFailureClass,
     message: &str,
@@ -765,7 +791,8 @@ pub fn decide_prepare_failure(
     }
 }
 
-pub fn decide_startup_failure(
+#[cfg(test)]
+fn decide_startup_failure(
     context: &LaunchGuardianContext,
     observation: StartupFailureObservation,
 ) -> StartupFailureDecision {
@@ -822,6 +849,7 @@ pub fn classify_startup_failure_text(text: &str) -> LaunchFailureClass {
     LaunchFailureClass::Unknown
 }
 
+#[cfg(test)]
 fn startup_failure_reason(observation: StartupFailureObservation) -> String {
     match observation {
         StartupFailureObservation::Stalled => {
@@ -860,6 +888,7 @@ fn startup_failure_reason(observation: StartupFailureObservation) -> String {
     }
 }
 
+#[cfg(test)]
 fn startup_failure_guidance(
     class: LaunchFailureClass,
     context: &LaunchGuardianContext,
@@ -890,7 +919,8 @@ fn startup_failure_guidance(
     guidance
 }
 
-pub fn resolve_launch_preset(
+#[cfg(test)]
+fn resolve_launch_preset(
     context: &LaunchGuardianContext,
     requested_preset: &str,
     version_id: &str,
@@ -940,7 +970,8 @@ pub fn resolve_launch_preset(
     })
 }
 
-pub fn recovery_plan_for_startup_failure(
+#[cfg(test)]
+fn recovery_plan_for_startup_failure(
     class: LaunchFailureClass,
     version_id: &str,
     info: &JavaRuntimeInfo,
@@ -989,7 +1020,8 @@ pub fn recovery_plan_for_startup_failure(
     None
 }
 
-pub fn conservative_healing_preset(version_id: &str, info: &JavaRuntimeInfo) -> String {
+#[cfg(test)]
+fn conservative_healing_preset(version_id: &str, info: &JavaRuntimeInfo) -> String {
     if info.major <= 8 || is_legacy_version_family(version_id) {
         "legacy".to_string()
     } else {
@@ -997,6 +1029,7 @@ pub fn conservative_healing_preset(version_id: &str, info: &JavaRuntimeInfo) -> 
     }
 }
 
+#[cfg(test)]
 fn is_legacy_version_family(version_id: &str) -> bool {
     if matches!(version_id.as_bytes().first(), Some(b'a' | b'b')) {
         return true;

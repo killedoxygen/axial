@@ -14,8 +14,23 @@ use crate::guardian::{
 };
 use crate::observability::{RedactionAudience, sanitize_evidence_text, sanitize_evidence_token};
 use crate::state::contracts::{CommandKind, OperationId, OperationPhase, OperationStatus};
-use croopor_launcher::LaunchStageEvidence;
+use croopor_launcher::{LaunchStageEvidence, launch_notice};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+mod policy;
+mod runner;
+mod session;
+
+pub use runner::{
+    LaunchRequestError, LaunchSuccess, launch_session, persist_launch_proof_best_effort,
+    sanitize_live_launch_failure_message, trace_launch_event,
+};
+pub use session::{
+    LaunchPreflightMemory, LaunchPreflightOverride, LaunchPreflightOverrides,
+    LaunchPreflightResourceBudget, LaunchPreflightResponse, LaunchRequest, LaunchSessionTask,
+    PreparedLaunch, prepare_launch_preflight, prepare_launch_session,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LaunchInstanceStaging {
@@ -151,6 +166,74 @@ pub fn launch_boundary_stage_evidence(staging: &LaunchBoundaryStaging) -> Vec<La
             vec![format!("mode:{}", staging.performance_mode)],
         ),
     ]
+}
+
+pub fn launch_benchmark_status_payload(
+    benchmark: &crate::state::launch_reports::LaunchBenchmarkMetadata,
+) -> Value {
+    let mut payload = json!({
+        "id": benchmark.benchmark_id,
+        "profile": benchmark.profile,
+        "run_type": benchmark.run_type,
+    });
+    if let Some(mode) = &benchmark.mode {
+        payload["mode"] = json!(mode);
+    }
+    payload
+}
+
+pub fn launch_success_response_payload(launched: &LaunchSuccess) -> Value {
+    json!({
+        "status": "launching",
+        "session_id": &launched.session_id,
+        "instance_id": &launched.instance_id,
+        "pid": launched.pid,
+        "launched_at": &launched.launched_at,
+        "max_memory_mb": launched.max_memory_mb,
+        "min_memory_mb": launched.min_memory_mb,
+        "healing": &launched.healing,
+        "guardian": &launched.guardian,
+        "notice": launch_notice(
+            launched.guardian.as_ref(),
+            launched.healing.as_ref(),
+            None,
+            None,
+            None,
+        ),
+    })
+}
+
+pub fn launch_prepared_response_payload(task: &LaunchSessionTask) -> Value {
+    json!({
+        "status": "launching",
+        "state": "queued",
+        "session_id": &task.intent.session_id,
+        "instance_id": &task.intent.instance_id,
+        "pid": null,
+        "launched_at": &task.launched_at,
+        "max_memory_mb": task.intent.max_memory_mb,
+        "min_memory_mb": task.intent.min_memory_mb,
+        "healing": null,
+        "guardian": &task.guardian,
+        "notice": launch_notice(Some(&task.guardian), None, None, None, None),
+    })
+}
+
+pub fn launch_request_error_response_payload(error: &LaunchRequestError) -> Value {
+    let public_message = sanitize_live_launch_failure_message(&error.message);
+    let notice = launch_notice(
+        error.guardian.as_ref(),
+        error.healing.as_ref(),
+        None,
+        Some(public_message.as_str()),
+        Some("Launch stopped before startup."),
+    );
+    json!({
+        "error": public_message,
+        "healing": error.healing,
+        "guardian": error.guardian,
+        "notice": notice,
+    })
 }
 
 fn launch_boundary_safety_outcome(

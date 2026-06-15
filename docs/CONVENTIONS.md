@@ -61,6 +61,7 @@ keep this short and real. if the codebase changes, update this file.
 
 ## Architecture docs
 - `docs/README.md` is the docs entrypoint and ownership map
+- `plans/stabilization/` is the ignored local stabilization spec and execution control plane; keep `execution/PROGRESS.md` current-only, not as a log
 - `docs/ARCHITECTURE.md` must describe the current launcher pipeline, not an aspirational one
 - if launch/install/settings/runtime architecture shifts, update `docs/ARCHITECTURE.md` in the same change
 - if Guardian authority, self-healing, Healing scope, redaction, or safety policy changes, update `docs/GUARDIAN-ARCHITECTURE.md` in the same change

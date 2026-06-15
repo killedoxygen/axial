@@ -32,8 +32,6 @@ type LauncherAccountLike = {
 
 type AuthStatusLike = {
   launch_auth_mode?: unknown;
-  online_mode_ready?: unknown;
-  msa_refresh_available?: unknown;
   username?: unknown;
   minecraft_profile?: unknown;
 };
@@ -108,30 +106,26 @@ export function refreshAccountSkin(): void {
   const requestId = ++accountSkinRequestId;
   const fallbackName = config.value?.username || 'Player';
 
-  void applyAccountSkinFromAccounts(requestId, fallbackName, false).catch(() => {
-    void applyAccountSkinFromAuthStatus(requestId, fallbackName, false).catch(() => {
+  void applyAccountSkinFromAccounts(requestId, fallbackName).catch(() => {
+    void applyAccountSkinFromAuthStatus(requestId, fallbackName).catch(() => {
       if (requestId === accountSkinRequestId) applyNoAccountHead(fallbackName);
     });
   });
 }
 
-async function applyAccountSkinFromAccounts(
-  requestId: number,
-  fallbackName: string,
-  refreshAttempted: boolean,
-): Promise<void> {
+async function applyAccountSkinFromAccounts(requestId: number, fallbackName: string): Promise<void> {
   const response = await api('GET', '/accounts');
   if (requestId !== accountSkinRequestId) return;
   const payload = launcherAccountsLike(response);
   if (!payload || !Array.isArray(payload.accounts)) {
-    await applyAccountSkinFromAuthStatus(requestId, fallbackName, refreshAttempted);
+    await applyAccountSkinFromAuthStatus(requestId, fallbackName);
     return;
   }
   const activeAccount = payload.accounts
     .map(launcherAccountLike)
     .find((account): account is LauncherAccountLike => Boolean(account?.active));
   if (!activeAccount) {
-    await applyAccountSkinFromAuthStatus(requestId, fallbackName, refreshAttempted);
+    await applyAccountSkinFromAuthStatus(requestId, fallbackName);
     return;
   }
 
@@ -147,11 +141,6 @@ async function applyAccountSkinFromAccounts(
       accountSkinSrc.value = minecraftProfileSkinTextureSrc(profile);
       return;
     }
-    if (!refreshAttempted) {
-      await api('POST', '/auth/refresh');
-      await applyAccountSkinFromAccounts(requestId, fallbackName, true);
-      return;
-    }
   }
 
   if (activeAccount.kind === 'offline' && typeof activeAccount.account_id === 'string') {
@@ -165,11 +154,7 @@ async function applyAccountSkinFromAccounts(
   applyNoAccountHead(fallbackName);
 }
 
-async function applyAccountSkinFromAuthStatus(
-  requestId: number,
-  fallbackName: string,
-  refreshAttempted: boolean,
-): Promise<void> {
+async function applyAccountSkinFromAuthStatus(requestId: number, fallbackName: string): Promise<void> {
   const response = await api('GET', '/auth/status');
   if (requestId !== accountSkinRequestId) return;
   const status = authStatusLike(response);
@@ -183,30 +168,10 @@ async function applyAccountSkinFromAuthStatus(
     const profileName = typeof profile.name === 'string' && profile.name.trim() ? profile.name.trim() : fallbackName;
     accountDisplayName.value = profileName;
     accountSkinSrc.value = minecraftProfileSkinTextureSrc(profile);
-    if (!status.online_mode_ready && status.msa_refresh_available === true && !refreshAttempted) {
-      void refreshAuthAndApplyAccountSkin(requestId, fallbackName);
-    }
-    return;
-  }
-
-  if (status.launch_auth_mode === 'online' && status.msa_refresh_available === true && !refreshAttempted) {
-    await api('POST', '/auth/refresh');
-    await applyAccountSkinFromAuthStatus(requestId, fallbackName, true);
     return;
   }
 
   applyNoAccountHead(authStatusDisplayName(status, fallbackName));
-}
-
-async function refreshAuthAndApplyAccountSkin(requestId: number, fallbackName: string): Promise<void> {
-  try {
-    await api('POST', '/auth/refresh');
-    await applyAccountSkinFromAuthStatus(requestId, fallbackName, true);
-  } catch (err: unknown) {
-    // Keep the restored profile visible. Launch/auth flows surface refresh errors
-    // when the user takes an online action.
-    console.warn('Could not refresh restored Microsoft sign-in for the account head.', err);
-  }
 }
 
 function activeStatusMinecraftProfile(status: AuthStatusLike): MinecraftProfileLike | null {

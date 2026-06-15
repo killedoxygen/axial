@@ -47,24 +47,13 @@ export function launchAuthMode(value: unknown): LaunchAuthMode {
 }
 
 export function statusCanSelectOnline(status: AuthStatusRecord): boolean {
-  if (status.online_mode_ready) return true;
-  return (
-    status.minecraft_profile_ready === true &&
-    status.minecraft_ownership_verified === true &&
-    typeof status.minecraft_token_expires_in === 'number' &&
-    status.minecraft_token_expires_in > 0
-  );
+  return status.online_action?.enabled === true;
 }
 
 export function accountHasLaunchReadyMinecraft(account: LauncherAccount): boolean {
-  return (
-    account.minecraft_profile_ready === true &&
-    account.minecraft_ownership_verified === true &&
-    typeof account.minecraft_token_expires_in === 'number' &&
-    account.minecraft_token_expires_in > 0
-  );
+  return account.online_action?.state_id === 'online_ready';
 }
 
 export function accountCanSelectOnline(account: LauncherAccount): boolean {
-  return accountHasLaunchReadyMinecraft(account) || account.msa_refresh_available === true;
+  return account.online_action?.enabled === true;
 }

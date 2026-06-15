@@ -3,6 +3,8 @@
 //! Application orchestrates command handling here while `croopor-performance`
 //! keeps ownership of rules refresh mechanics and validation.
 
+mod workflow;
+
 use super::{ApplicationCommand, PerformancePlanSummaryViewModel, ViewModelTone};
 use crate::guardian::{
     GuardianFact, performance_failure_memory_guardian_fact, performance_rules_guardian_facts,
@@ -18,12 +20,23 @@ use crate::state::{
     failure_memory::GuardianFailureMemoryEntry,
     ownership::{CurrentArtifact, classify_current_artifact},
 };
+use axum::{Json, http::StatusCode};
 use croopor_performance::{
     BundleHealth, CompositionPlan, CompositionTier, PerformanceMode, PerformanceRulesStatus,
     RulesRefreshError,
 };
 use serde::Serialize;
 use thiserror::Error;
+
+pub use workflow::{
+    PerformanceHealthRequest, PerformanceHealthResponse, PerformanceInstallRequest,
+    PerformanceInstallResponse, PerformanceInstanceDisplay, PerformanceInstanceOperationResponse,
+    PerformanceManagedArtifactSummary, PerformanceMemoryDisplay, PerformanceModeDisplay,
+    PerformancePlanRequest, PerformancePlanResponse, PerformanceRollbackListRequest,
+    PerformanceRollbackListResponse, PerformanceRuntimeDisplay, performance_health,
+    performance_install, performance_instance_operation, performance_operation_status,
+    performance_plan, performance_rollback_list, spawn_pending_performance_operations,
+};
 
 #[derive(Debug, Serialize)]
 pub struct PerformanceRulesStatusResponse {
@@ -253,6 +266,25 @@ pub async fn refresh_performance_rules(
         ApplicationCommand::new(CommandKind::RefreshPerformanceRules),
     )
     .await
+}
+
+pub fn refresh_performance_rules_error_response(
+    error: RefreshPerformanceRulesError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match error {
+        RefreshPerformanceRulesError::Unconfigured => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "performance remote rules url is not configured"
+            })),
+        ),
+        _error => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "Could not load performance data. Check app data permissions and try again."
+            })),
+        ),
+    }
 }
 
 async fn handle_refresh_performance_rules(

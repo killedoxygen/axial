@@ -50,7 +50,6 @@ export interface AuthStatus {
   uuid: string;
   provider: string;
   verified: boolean;
-  online_mode_ready: boolean;
   skin_source: string;
   login_available: boolean;
   login_reason: string;
@@ -58,6 +57,8 @@ export interface AuthStatus {
   msa_provider?: string | null;
   msa_token_expires_in?: number | null;
   msa_refresh_available: boolean;
+  online_action?: AccountActionState;
+  refresh_action?: AccountActionState;
   skin_action?: AccountActionState;
 }
 
@@ -98,6 +99,8 @@ export interface LauncherAccount extends MinecraftAuthReadiness {
   msa_authenticated: boolean;
   msa_token_expires_in?: number | null;
   msa_refresh_available: boolean;
+  online_action?: AccountActionState;
+  refresh_action?: AccountActionState;
 }
 
 export interface LauncherAccountsData {

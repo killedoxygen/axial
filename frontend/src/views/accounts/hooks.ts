@@ -23,23 +23,11 @@ export function useAuthStatus(savedUsername: string): {
     setStatus(null);
 
     void api('GET', '/auth/status')
-      .then(async (res: unknown) => {
+      .then((res: unknown) => {
         if (!active) return;
         if (isRecord(res) && typeof res.error === 'string') throw new Error(res.error);
-        let parsed = authStatusResponse(res);
+        const parsed = authStatusResponse(res);
         if (!parsed) throw new Error('invalid auth status');
-        if (parsed.launch_auth_mode === 'online' && !parsed.online_mode_ready && parsed.msa_refresh_available) {
-          try {
-            await api('POST', '/auth/refresh');
-            if (!active) return;
-            const refreshed = authStatusResponse(await api('GET', '/auth/status'));
-            if (refreshed) parsed = refreshed;
-          } catch (err: unknown) {
-            // Keep the restored account visible; account actions can surface the
-            // refresh failure when the user re-verifies or launches online.
-            console.warn('Could not refresh restored Microsoft sign-in while loading accounts.', err);
-          }
-        }
         setStatus(parsed);
         setState('ready');
       })
@@ -77,32 +65,10 @@ export function useLauncherAccounts(): {
     setState('loading');
 
     void api('GET', '/accounts')
-      .then(async (res: unknown) => {
+      .then((res: unknown) => {
         if (!active) return;
-        let parsed = launcherAccountsResponse(res);
+        const parsed = launcherAccountsResponse(res);
         if (!parsed) throw new Error('invalid account list');
-        const activeAccount = parsed.accounts.find((account) => account.active);
-        const activeNeedsRefresh =
-          activeAccount?.kind === 'microsoft' &&
-          activeAccount.msa_refresh_available === true &&
-          !(
-            activeAccount.minecraft_profile_ready === true &&
-            activeAccount.minecraft_ownership_verified === true &&
-            typeof activeAccount.minecraft_token_expires_in === 'number' &&
-            activeAccount.minecraft_token_expires_in > 0
-          );
-        if (activeNeedsRefresh) {
-          try {
-            await api('POST', '/auth/refresh');
-            if (!active) return;
-            const refreshed = launcherAccountsResponse(await api('GET', '/accounts'));
-            if (refreshed) parsed = refreshed;
-          } catch (err: unknown) {
-            // Keep the restored account visible; account actions surface the
-            // refresh failure when the user launches, refreshes, or re-verifies.
-            console.warn('Could not refresh restored Microsoft account while loading account list.', err);
-          }
-        }
         setAccounts(parsed.accounts);
         setActiveAccountId(parsed.active_account_id);
         setState('ready');

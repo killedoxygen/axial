@@ -3,8 +3,8 @@ use super::{
     LaunchPreparationMetrics, PreparedLaunchAttempt, build_healing_summary,
 };
 use crate::build::{VanillaLaunchRequest, plan_resolved_launch};
-use crate::guardian::resolve_launch_preset;
-use crate::jvm::{boot_throttle_args, gc_preset_args};
+use crate::guardian::{GuardianMode, LaunchGuardianContext};
+use crate::jvm::{boot_throttle_args, gc_preset_args, recommended_preset};
 use crate::runtime::RuntimeSelection;
 use crate::types::LaunchFailureClass;
 use croopor_minecraft::{
@@ -106,11 +106,11 @@ where
     let target_version_id = launch_target_version_id(intent, &version);
     let loader = intent.loader.trim();
     let is_modded = intent.is_modded || !version.inherits_from.trim().is_empty();
-    let mut guardian_interventions = Vec::new();
+    let guardian_interventions = Vec::new();
     let mut effective_preset = if let Some(preset_override) = attempt.preset_override.clone() {
         preset_override
     } else {
-        let resolved = resolve_launch_preset(
+        resolve_effective_launch_preset(
             &intent.guardian,
             &intent.requested_preset,
             target_version_id,
@@ -118,24 +118,6 @@ where
             is_modded,
             &runtime.effective_info,
         )
-        .map_err(|(class, message)| LaunchPreparationError {
-            message,
-            failure_class: Some(class),
-            healing: build_healing_summary(HealingSummaryInput {
-                auth_mode,
-                requested_java_path: &intent.requested_java,
-                requested_preset: &intent.requested_preset,
-                effective_java_path: Some(runtime.effective_path.as_str()),
-                effective_preset: None,
-                fallback_applied: attempt.fallback_applied.as_deref(),
-                retry_count: attempt.retry_count,
-                failure_class: Some(class),
-            }),
-        })?;
-        if let Some(intervention) = resolved.intervention {
-            guardian_interventions.push(intervention);
-        }
-        resolved.effective_preset
     };
 
     if intent.guardian.has_java_override()
@@ -249,6 +231,21 @@ where
             total_ms: started_at.elapsed().as_millis(),
         },
     })
+}
+
+fn resolve_effective_launch_preset(
+    guardian: &LaunchGuardianContext,
+    requested_preset: &str,
+    target_version_id: &str,
+    loader: &str,
+    is_modded: bool,
+    runtime: &JavaRuntimeInfo,
+) -> String {
+    let requested = requested_preset.trim();
+    if matches!(guardian.mode, GuardianMode::Custom) && guardian.has_named_preset() {
+        return requested.to_string();
+    }
+    recommended_preset(requested, target_version_id, loader, is_modded, runtime)
 }
 
 fn launch_preparation_event_for_runtime_event(event: RuntimeEnsureEvent) -> LaunchPreparationEvent {
@@ -556,7 +553,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn custom_explicit_unsupported_named_preset_fails_before_command_planning() {
+    async fn custom_explicit_unsupported_named_preset_is_preserved_for_guardian_startup_handling() {
         let root = unique_temp_root("croopor-prepare-custom-preset-block-test");
         let library_dir = root.join("library");
         let game_dir = root.join("instances").join("custom-preset-block-test");
@@ -614,16 +611,19 @@ mod tests {
             performance_mode: "managed".to_string(),
         };
 
-        let error = prepare_launch_attempt(&intent, &AttemptOverrides::default())
+        let prepared = prepare_launch_attempt(&intent, &AttemptOverrides::default())
             .await
-            .expect_err("known-fatal custom preset should fail during preparation");
+            .expect("core preparation preserves explicit Custom preset intent");
 
-        assert_eq!(
-            error.failure_class,
-            Some(LaunchFailureClass::JvmUnsupportedOption)
+        assert_eq!(prepared.effective_preset, crate::jvm::PRESET_SMOOTH);
+        assert!(prepared.guardian_interventions.is_empty());
+        assert!(
+            prepared
+                .plan
+                .jvm_args
+                .iter()
+                .any(|arg| arg == "-XX:+UseShenandoahGC")
         );
-        assert!(error.message.contains("Smooth"));
-        assert!(error.message.contains("HotSpot JVM tuning flags"));
 
         let _ = fs::remove_dir_all(root);
     }

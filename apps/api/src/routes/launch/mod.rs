@@ -1,9 +1,7 @@
 mod matrix;
-mod policy;
-mod runner;
 mod stream;
-mod task;
 
+use crate::application::launch as launch_app;
 use crate::guardian::{GuardianDecisionKind, launch_summary_decision_kind};
 use crate::state::{AppState, LaunchStatusEvent};
 use axum::{
@@ -12,7 +10,7 @@ use axum::{
     http::StatusCode,
     routing::{get, post},
 };
-use croopor_launcher::{LaunchSessionRecord, LaunchState, launch_notice, snapshot_status};
+use croopor_launcher::{LaunchSessionRecord, LaunchState, snapshot_status};
 use serde::Deserialize;
 use serde_json::json;
 use std::time::Duration;
@@ -111,27 +109,27 @@ pub fn router() -> Router<AppState> {
 async fn handle_launch_preflight(
     State(state): State<AppState>,
     Path(instance_id): Path<String>,
-) -> Result<Json<task::LaunchPreflightResponse>, (StatusCode, Json<serde_json::Value>)> {
-    task::prepare_launch_preflight(&state, instance_id)
+) -> Result<Json<launch_app::LaunchPreflightResponse>, (StatusCode, Json<serde_json::Value>)> {
+    launch_app::prepare_launch_preflight(&state, instance_id)
         .await
         .map(Json)
 }
 
 async fn handle_launch(
     State(state): State<AppState>,
-    Json(payload): Json<task::LaunchRequest>,
+    Json(payload): Json<launch_app::LaunchRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let prepared = task::prepare_launch_session(&state, payload).await?;
-    let response = launch_prepared_response_payload(&prepared.task);
+    let prepared = launch_app::prepare_launch_session(&state, payload).await?;
+    let response = launch_app::launch_prepared_response_payload(&prepared.task);
     spawn_launch_session(state, prepared.task);
 
     Ok(Json(response))
 }
 
-fn spawn_launch_session(state: AppState, task: task::LaunchSessionTask) {
+fn spawn_launch_session(state: AppState, task: launch_app::LaunchSessionTask) {
     let session_id = task.intent.session_id.clone();
     tokio::spawn(async move {
-        if let Err(error) = runner::launch_session(state, task).await {
+        if let Err(error) = launch_app::launch_session(state, task).await {
             tracing::warn!(
                 session_id,
                 error = %error.message,
@@ -168,7 +166,7 @@ struct BenchmarkLaunchRequest {
 
 #[derive(Debug)]
 struct BenchmarkLaunchInput {
-    launch: task::LaunchRequest,
+    launch: launch_app::LaunchRequest,
     profile: Option<String>,
     run_type: Option<String>,
     benchmark_mode: Option<String>,
@@ -176,7 +174,7 @@ struct BenchmarkLaunchInput {
 
 #[derive(Debug)]
 struct BenchmarkSuiteLaunchInput {
-    launch: task::LaunchRequest,
+    launch: launch_app::LaunchRequest,
     suite_id: String,
     mode: String,
     run_index: usize,
@@ -185,7 +183,7 @@ struct BenchmarkSuiteLaunchInput {
 
 #[derive(Debug)]
 struct BenchmarkSuitePlanInput {
-    launch: task::LaunchRequest,
+    launch: launch_app::LaunchRequest,
     suite_id: String,
     mode: String,
     plan: Vec<matrix::BenchmarkSuiteRunSpec>,
@@ -373,7 +371,9 @@ impl BenchmarkLaunchRequest {
         })
     }
 
-    fn launch_request(&self) -> Result<task::LaunchRequest, (StatusCode, Json<serde_json::Value>)> {
+    fn launch_request(
+        &self,
+    ) -> Result<launch_app::LaunchRequest, (StatusCode, Json<serde_json::Value>)> {
         let instance_id = self
             .instance_id
             .as_deref()
@@ -385,7 +385,7 @@ impl BenchmarkLaunchRequest {
                 )
             })?;
 
-        Ok(task::LaunchRequest {
+        Ok(launch_app::LaunchRequest {
             instance_id,
             username: self.username.clone(),
             max_memory_mb: self.max_memory_mb,
@@ -400,20 +400,20 @@ async fn handle_benchmark_launch(
     Json(payload): Json<BenchmarkLaunchRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let input = payload.into_launch_input()?;
-    let mut prepared = task::prepare_launch_session(&state, input.launch).await?;
+    let mut prepared = launch_app::prepare_launch_session(&state, input.launch).await?;
     let benchmark = crate::state::launch_reports::LaunchBenchmarkMetadata::new(
         Some(prepared.task.intent.session_id.as_str()),
         input.profile.as_deref(),
         input.run_type.as_deref(),
         input.benchmark_mode.as_deref(),
     );
-    let benchmark_response = benchmark_status_payload(&benchmark);
+    let benchmark_response = launch_app::launch_benchmark_status_payload(&benchmark);
     prepared.task.benchmark = Some(benchmark.clone());
-    let launched = runner::launch_session(state.clone(), prepared.task)
+    let launched = launch_app::launch_session(state.clone(), prepared.task)
         .await
         .map_err(launch_request_error_response)?;
 
-    let mut response = launch_success_response_payload(&launched);
+    let mut response = launch_app::launch_success_response_payload(&launched);
     response["benchmark"] = benchmark_response;
     Ok(Json(response))
 }
@@ -642,18 +642,18 @@ async fn launch_benchmark_suite_run(
 ) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
     let selected = input.plan[input.run_index];
     let benchmark_id = benchmark_suite_run_id(&input.mode, input.run_index, selected);
-    let mut prepared = task::prepare_launch_session(&state, input.launch).await?;
+    let mut prepared = launch_app::prepare_launch_session(&state, input.launch).await?;
     let benchmark = crate::state::launch_reports::LaunchBenchmarkMetadata::new(
         Some(benchmark_id.as_str()),
         Some(selected.profile),
         Some(selected.run_type),
         Some(input.mode.as_str()),
     );
-    let benchmark_response = benchmark_status_payload(&benchmark);
+    let benchmark_response = launch_app::launch_benchmark_status_payload(&benchmark);
     let suite_response =
         benchmark_suite_status_payload(&input.suite_id, &input.mode, input.run_index, &input.plan);
     prepared.task.benchmark = Some(benchmark.clone());
-    let launched = runner::launch_session(state.clone(), prepared.task)
+    let launched = launch_app::launch_session(state.clone(), prepared.task)
         .await
         .map_err(launch_request_error_response)?;
     let manifest_runs = benchmark_suite_manifest_run_inputs(&input.mode, &input.plan);
@@ -669,7 +669,7 @@ async fn launch_benchmark_suite_run(
     )
     .map_err(benchmark_suite_storage_error_response)?;
 
-    let mut response = launch_success_response_payload(&launched);
+    let mut response = launch_app::launch_success_response_payload(&launched);
     response["benchmark"] = benchmark_response;
     response["suite"] = suite_response;
     Ok(response)
@@ -907,7 +907,7 @@ async fn handle_launch_kill(
         .await
         .map_err(launch_kill_error_response)?;
 
-    runner::trace_launch_event(&id, "kill requested by client");
+    launch_app::trace_launch_event(&id, "kill requested by client");
     state
         .sessions()
         .emit_log(&id, "system", "Launch stopped by user.".to_string())
@@ -932,8 +932,13 @@ async fn handle_launch_kill(
             },
         )
         .await;
-    runner::persist_launch_proof_best_effort(&state, &id, record.launched_at.as_deref(), "stopped")
-        .await;
+    launch_app::persist_launch_proof_best_effort(
+        &state,
+        &id,
+        record.launched_at.as_deref(),
+        "stopped",
+    )
+    .await;
 
     Ok(Json(json!({ "status": "killed" })))
 }
@@ -971,29 +976,16 @@ fn launch_report_storage_error_response(
 }
 
 fn launch_request_error_response(
-    error: runner::LaunchRequestError,
+    error: launch_app::LaunchRequestError,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let status = launch_request_error_status(&error);
-    let public_message = runner::sanitize_live_launch_failure_message(&error.message);
-    let notice = launch_notice(
-        error.guardian.as_ref(),
-        error.healing.as_ref(),
-        None,
-        Some(public_message.as_str()),
-        Some("Launch stopped before startup."),
-    );
     (
         status,
-        Json(json!({
-            "error": public_message,
-            "healing": error.healing,
-            "guardian": error.guardian,
-            "notice": notice,
-        })),
+        Json(launch_app::launch_request_error_response_payload(&error)),
     )
 }
 
-fn launch_request_error_status(error: &runner::LaunchRequestError) -> StatusCode {
+fn launch_request_error_status(error: &launch_app::LaunchRequestError) -> StatusCode {
     if error.guardian.as_ref().is_some_and(|guardian| {
         launch_summary_decision_kind(guardian) == GuardianDecisionKind::Block
     }) {
@@ -1006,57 +998,6 @@ fn launch_request_error_status(error: &runner::LaunchRequestError) -> StatusCode
 fn trimmed_string(value: &str) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
-}
-
-fn benchmark_status_payload(
-    benchmark: &crate::state::launch_reports::LaunchBenchmarkMetadata,
-) -> serde_json::Value {
-    let mut payload = json!({
-        "id": benchmark.benchmark_id,
-        "profile": benchmark.profile,
-        "run_type": benchmark.run_type,
-    });
-    if let Some(mode) = &benchmark.mode {
-        payload["mode"] = json!(mode);
-    }
-    payload
-}
-
-fn launch_success_response_payload(launched: &runner::LaunchSuccess) -> serde_json::Value {
-    json!({
-        "status": "launching",
-        "session_id": &launched.session_id,
-        "instance_id": &launched.instance_id,
-        "pid": launched.pid,
-        "launched_at": &launched.launched_at,
-        "max_memory_mb": launched.max_memory_mb,
-        "min_memory_mb": launched.min_memory_mb,
-        "healing": &launched.healing,
-        "guardian": &launched.guardian,
-        "notice": launch_notice(
-            launched.guardian.as_ref(),
-            launched.healing.as_ref(),
-            None,
-            None,
-            None,
-        ),
-    })
-}
-
-fn launch_prepared_response_payload(task: &task::LaunchSessionTask) -> serde_json::Value {
-    json!({
-        "status": "launching",
-        "state": "queued",
-        "session_id": &task.intent.session_id,
-        "instance_id": &task.intent.instance_id,
-        "pid": null,
-        "launched_at": &task.launched_at,
-        "max_memory_mb": task.intent.max_memory_mb,
-        "min_memory_mb": task.intent.min_memory_mb,
-        "healing": null,
-        "guardian": &task.guardian,
-        "notice": launch_notice(Some(&task.guardian), None, None, None, None),
-    })
 }
 
 fn benchmark_suite_mode_or_default(
@@ -2357,7 +2298,7 @@ mod tests {
 
     #[test]
     fn launch_success_response_payload_exposes_effective_memory() {
-        let payload = launch_success_response_payload(&runner::LaunchSuccess {
+        let payload = launch_app::launch_success_response_payload(&launch_app::LaunchSuccess {
             session_id: "session-1".to_string(),
             instance_id: "instance-1".to_string(),
             pid: 1234,
@@ -2376,7 +2317,7 @@ mod tests {
     #[test]
     fn launch_prepared_response_payload_exposes_queued_session_metadata() {
         let task = test_launch_session_task();
-        let payload = launch_prepared_response_payload(&task);
+        let payload = launch_app::launch_prepared_response_payload(&task);
 
         assert_eq!(payload["status"], serde_json::json!("launching"));
         assert_eq!(payload["state"], serde_json::json!("queued"));
@@ -2432,7 +2373,7 @@ mod tests {
 
     #[test]
     fn launch_request_error_response_sanitizes_public_error_payload() {
-        let response = launch_request_error_response(runner::LaunchRequestError {
+        let response = launch_request_error_response(launch_app::LaunchRequestError {
             message: "prepare failed for /home/alice/.croopor --accessToken raw-secret-token -Xmx8192M -Dtoken=raw provider_payload=provider-secret account_id=account-secret username=SecretPlayer\njava.exe C:\\Users\\Alice\\AppData"
                 .to_string(),
             healing: None,
@@ -4660,7 +4601,7 @@ mod tests {
         store.insert(test_record("active-suite-session")).await;
         let plan = matrix::benchmark_suite_plan("development").expect("development plan");
         let input = BenchmarkSuitePlanInput {
-            launch: task::LaunchRequest {
+            launch: launch_app::LaunchRequest {
                 instance_id: "instance".to_string(),
                 username: None,
                 max_memory_mb: None,
@@ -4701,7 +4642,7 @@ mod tests {
         let store = crate::state::SessionStore::new();
         let plan = matrix::benchmark_suite_plan("development").expect("development plan");
         let input = BenchmarkSuitePlanInput {
-            launch: task::LaunchRequest {
+            launch: launch_app::LaunchRequest {
                 instance_id: "instance".to_string(),
                 username: None,
                 max_memory_mb: None,
@@ -4866,7 +4807,7 @@ mod tests {
             Some(input.mode.as_str()),
         );
         let payload = serde_json::json!({
-            "benchmark": benchmark_status_payload(&benchmark),
+            "benchmark": launch_app::launch_benchmark_status_payload(&benchmark),
             "suite": benchmark_suite_status_payload(
                 &input.suite_id,
                 &input.mode,
@@ -4897,7 +4838,7 @@ mod tests {
         );
 
         assert_eq!(
-            benchmark_status_payload(&benchmark),
+            launch_app::launch_benchmark_status_payload(&benchmark),
             serde_json::json!({
                 "id": "benchmark-1",
                 "profile": "dev-default",
@@ -5536,8 +5477,8 @@ mod tests {
         }
     }
 
-    fn launch_request_error(decision: Option<GuardianDecision>) -> runner::LaunchRequestError {
-        runner::LaunchRequestError {
+    fn launch_request_error(decision: Option<GuardianDecision>) -> launch_app::LaunchRequestError {
+        launch_app::LaunchRequestError {
             message: "launch rejected".to_string(),
             healing: None,
             guardian: decision.map(|decision| croopor_launcher::GuardianSummary {
@@ -5621,8 +5562,8 @@ mod tests {
         }
     }
 
-    fn test_launch_session_task() -> task::LaunchSessionTask {
-        task::LaunchSessionTask {
+    fn test_launch_session_task() -> launch_app::LaunchSessionTask {
+        launch_app::LaunchSessionTask {
             application: crate::application::stage_launch_instance_command(
                 crate::application::LaunchInstanceCommand {
                     instance_id: "instance-queued".to_string(),

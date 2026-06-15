@@ -469,6 +469,8 @@ function launcherAccount(value: unknown): LauncherAccount | null {
     msa_authenticated: value.msa_authenticated,
     msa_token_expires_in: value.msa_token_expires_in === null ? null : maybeNumber(value.msa_token_expires_in),
     msa_refresh_available: value.msa_refresh_available,
+    online_action: accountActionState(value.online_action),
+    refresh_action: accountActionState(value.refresh_action),
     ...minecraftReadiness(value),
   };
 }
@@ -491,10 +493,10 @@ export function authStatusResponse(value: unknown): AuthStatusRecord | null {
     typeof value.uuid !== 'string' ||
     typeof value.provider !== 'string' ||
     typeof value.verified !== 'boolean' ||
-    typeof value.online_mode_ready !== 'boolean' ||
     typeof value.skin_source !== 'string' ||
     typeof value.login_available !== 'boolean' ||
-    typeof value.login_reason !== 'string'
+    typeof value.login_reason !== 'string' ||
+    typeof value.msa_refresh_available !== 'boolean'
   ) {
     return null;
   }
@@ -506,7 +508,6 @@ export function authStatusResponse(value: unknown): AuthStatusRecord | null {
     uuid: value.uuid,
     provider: value.provider,
     verified: value.verified,
-    online_mode_ready: value.online_mode_ready,
     skin_source: value.skin_source,
     login_available: value.login_available,
     login_reason: value.login_reason,
@@ -514,7 +515,9 @@ export function authStatusResponse(value: unknown): AuthStatusRecord | null {
     msa_provider:
       typeof value.msa_provider === 'string' ? value.msa_provider : value.msa_provider === null ? null : undefined,
     msa_token_expires_in: value.msa_token_expires_in === null ? null : maybeNumber(value.msa_token_expires_in),
-    msa_refresh_available: value.msa_refresh_available === true,
+    msa_refresh_available: value.msa_refresh_available,
+    online_action: accountActionState(value.online_action),
+    refresh_action: accountActionState(value.refresh_action),
     skin_action: accountActionState(value.skin_action),
     ...minecraftReadiness(value),
   };

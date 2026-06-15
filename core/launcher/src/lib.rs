@@ -18,12 +18,7 @@ pub use guardian::{
     GuardianDecision, GuardianIntervention, GuardianInterventionKind, GuardianMode,
     GuardianSummary, LAUNCH_DISK_HEADROOM_MB, LAUNCH_MEMORY_HEADROOM_MB,
     LOW_MEMORY_ALLOCATION_WARNING_THRESHOLD_MB, LaunchCpuLoadWarningFacts, LaunchGuardianContext,
-    LaunchResourceWarningFacts, LaunchWarningFacts, OverrideOrigin, PreLaunchAction,
-    PreLaunchDecision, RecoveryAction, RecoveryPlan, ResolvedGuardianPreset,
-    StartupFailureDecision, StartupFailureObservation, classify_startup_failure_text,
-    conservative_healing_preset, decide_prepare_failure, decide_startup_failure,
-    guidance_for_failure, recovery_plan_for_startup_failure, resolve_launch_preset,
-    summarize_launch_warnings,
+    LaunchResourceWarningFacts, OverrideOrigin, classify_startup_failure_text,
 };
 pub use healing::{HealingEvent, HealingEventKind};
 pub use jvm::{

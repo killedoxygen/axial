@@ -1,8 +1,10 @@
 use super::policy;
 use super::runner::trace_launch_event;
 use crate::application::{
-    LaunchBoundaryStaging, LaunchBoundaryStagingRequest, LaunchInstanceCommand,
-    LaunchInstanceStaging, stage_launch_boundary, stage_launch_instance_command,
+    AuthRefreshFailure, LaunchBoundaryStaging, LaunchBoundaryStagingRequest, LaunchInstanceCommand,
+    LaunchInstanceStaging, flush_pending_saved_skin_applies_for_launch, refresh_active_auth,
+    stage_launch_boundary, stage_launch_instance_command,
+    sync_active_offline_account_from_username,
 };
 use crate::execution::jvm::{JvmArgsInspection, JvmArgsInspectionRequest, inspect_jvm_args};
 use crate::execution::runtime::{
@@ -10,16 +12,15 @@ use crate::execution::runtime::{
     inspect_java_override_value, verify_managed_runtime,
 };
 use crate::guardian::{
-    FactReliability, GuardianConfidence, GuardianDomain, GuardianFact, GuardianFactId,
-    GuardianManagedRuntimeRepairRequest, GuardianRepairOutcome, GuardianRepairStatus,
-    GuardianSeverity, diagnose_facts, execute_managed_runtime_ready_marker_repair,
-    guardian_fact_from_execution,
+    FactReliability, GuardianConfidence, GuardianDecisionKind as ApiGuardianDecisionKind,
+    GuardianDomain, GuardianFact, GuardianFactId, GuardianManagedRuntimeRepairRequest,
+    GuardianMode as ApiGuardianMode, GuardianPreflightOutcome, GuardianPreflightOutcomeRequest,
+    GuardianPreflightOverrideSignals, GuardianPreflightReadiness, GuardianPreflightResourceSignals,
+    GuardianRepairOutcome, GuardianRepairStatus, GuardianSeverity,
+    execute_managed_runtime_ready_marker_repair, guardian_fact_from_execution,
+    guardian_preflight_outcome,
 };
 use crate::logging::timestamp_utc;
-use crate::routes::{
-    accounts,
-    auth::{AuthRefreshFailure, refresh_active_auth},
-};
 use crate::state::contracts::{
     OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
 };
@@ -35,8 +36,8 @@ use croopor_launcher::{
     LAUNCH_MEMORY_HEADROOM_MB, LaunchAuthContext, LaunchCpuLoadWarningFacts, LaunchFailureClass,
     LaunchGuardianContext, LaunchIntent, LaunchNotice, LaunchNoticeTone, LaunchReadiness,
     LaunchReadinessReasonId, LaunchReadinessRequest, LaunchReadinessSeverity,
-    LaunchResourceWarningFacts, LaunchState, LaunchWarningFacts, failure_class_name,
-    inspect_launch_readiness, launch_notice, summarize_launch_warnings,
+    LaunchResourceWarningFacts, LaunchState, failure_class_name, inspect_launch_readiness,
+    launch_notice,
 };
 use croopor_minecraft::{preferred_runtime_component, resolve_version, scan_versions};
 use serde::{Deserialize, Serialize};
@@ -45,7 +46,7 @@ use std::path::{Path, PathBuf};
 use sysinfo::{Disks, ProcessRefreshKind, ProcessesToUpdate, System, get_current_pid};
 
 #[derive(Clone, Debug, Deserialize)]
-pub(super) struct LaunchRequest {
+pub struct LaunchRequest {
     pub instance_id: String,
     pub username: Option<String>,
     pub max_memory_mb: Option<i32>,
@@ -53,7 +54,7 @@ pub(super) struct LaunchRequest {
     pub client_started_at_ms: Option<i64>,
 }
 
-pub(super) struct LaunchSessionTask {
+pub struct LaunchSessionTask {
     pub application: LaunchInstanceStaging,
     pub boundary: LaunchBoundaryStaging,
     pub instance: Instance,
@@ -65,7 +66,7 @@ pub(super) struct LaunchSessionTask {
     pub resource_budget: Option<LaunchProofResourceBudget>,
 }
 
-pub(super) struct PreparedLaunch {
+pub struct PreparedLaunch {
     pub task: LaunchSessionTask,
 }
 
@@ -83,6 +84,7 @@ struct LaunchPreflightFacts {
     is_modded: bool,
     guardian: LaunchGuardianContext,
     guardian_summary: GuardianSummary,
+    guardian_outcome: GuardianPreflightOutcome,
     guardian_facts: Vec<GuardianFact>,
     boundary: LaunchBoundaryStaging,
     readiness: LaunchReadiness,
@@ -93,7 +95,7 @@ struct LaunchPreflightFacts {
 struct LaunchAuthRefreshOptions;
 
 #[derive(Clone, Debug, Serialize)]
-pub(super) struct LaunchPreflightResponse {
+pub struct LaunchPreflightResponse {
     pub status: &'static str,
     pub guardian: GuardianSummary,
     pub mode: GuardianMode,
@@ -105,28 +107,28 @@ pub(super) struct LaunchPreflightResponse {
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub(super) struct LaunchPreflightMemory {
+pub struct LaunchPreflightMemory {
     pub max_memory_mb: i32,
     pub min_memory_mb: i32,
     pub min_clamped: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub(super) struct LaunchPreflightOverrides {
+pub struct LaunchPreflightOverrides {
     pub java: LaunchPreflightOverride,
     pub preset: LaunchPreflightOverride,
     pub raw_jvm_args: LaunchPreflightOverride,
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub(super) struct LaunchPreflightOverride {
+pub struct LaunchPreflightOverride {
     pub present: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<croopor_launcher::OverrideOrigin>,
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub(super) struct LaunchPreflightResourceBudget {
+pub struct LaunchPreflightResourceBudget {
     pub active_session_count: usize,
     pub active_install_count: usize,
     pub active_memory_allocation_mb: u64,
@@ -138,7 +140,7 @@ pub(super) struct LaunchPreflightResourceBudget {
     pub disk_pressure: bool,
 }
 
-pub(super) async fn prepare_launch_session(
+pub async fn prepare_launch_session(
     state: &AppState,
     payload: LaunchRequest,
 ) -> Result<PreparedLaunch, (StatusCode, Json<serde_json::Value>)> {
@@ -185,7 +187,7 @@ async fn prepare_launch_session_with_auth_refresh(
     let requested_offline_username = validate_username(requested_offline_username)
         .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?;
     let active_account =
-        accounts::sync_active_offline_account_from_username(state, &requested_offline_username)
+        sync_active_offline_account_from_username(state, &requested_offline_username)
             .map_err(launch_account_store_error_response)?;
     let requested_username = active_account
         .as_ref()
@@ -213,7 +215,7 @@ async fn prepare_launch_session_with_auth_refresh(
         .is_some_and(|account| account.kind == LauncherAccountKind::Microsoft)
         || (active_account.is_none() && config.launch_auth_mode == LAUNCH_AUTH_MODE_ONLINE);
     if online_launch {
-        super::super::skin::flush_pending_saved_skin_applies_for_launch(state).await?;
+        flush_pending_saved_skin_applies_for_launch(state).await?;
     }
     let username = offline_username.clone();
     let mut preflight = build_launch_preflight_facts(
@@ -236,16 +238,11 @@ async fn prepare_launch_session_with_auth_refresh(
         payload.min_memory_mb,
     )
     .await;
-    if !preflight.readiness.launchable {
-        return Err(launch_readiness_error_response(
-            preflight.readiness,
-            Some(preflight.guardian_summary),
-        ));
-    }
-    if preflight.guardian_summary.decision == GuardianDecision::Blocked {
-        return Err(launch_guardian_block_error_response(
+    if guardian_preflight_blocks_launch(&preflight.guardian_outcome) {
+        return Err(launch_preflight_guardian_error_response(
             preflight.readiness,
             preflight.guardian_summary,
+            &preflight.guardian_outcome,
         ));
     }
 
@@ -344,44 +341,29 @@ fn launch_layout_error_response(
     )
 }
 
-fn launch_readiness_error_response(
-    readiness: LaunchReadiness,
-    guardian: Option<GuardianSummary>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let notice = guardian
-        .as_ref()
-        .and_then(|guardian| launch_notice(Some(guardian), None, None, None, None));
-    (
-        StatusCode::PRECONDITION_FAILED,
-        Json(json!({
-            "error": "Installed version is not ready to launch",
-            "readiness": readiness,
-            "guardian": guardian,
-            "notice": notice,
-        })),
-    )
-}
-
-fn launch_guardian_block_error_response(
+fn launch_preflight_guardian_error_response(
     readiness: LaunchReadiness,
     guardian: GuardianSummary,
+    outcome: &GuardianPreflightOutcome,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let error = guardian
-        .message
-        .clone()
-        .unwrap_or_else(|| "Guardian blocked launch preparation".to_string());
+    let status = if readiness.launchable {
+        StatusCode::UNPROCESSABLE_ENTITY
+    } else {
+        StatusCode::PRECONDITION_FAILED
+    };
     (
-        StatusCode::UNPROCESSABLE_ENTITY,
+        status,
         Json(json!({
-            "error": error,
+            "error": outcome.user_outcome.summary,
             "readiness": readiness,
             "notice": launch_notice(Some(&guardian), None, None, None, None),
             "guardian": guardian,
+            "safety": outcome.safety,
         })),
     )
 }
 
-pub(super) async fn prepare_launch_preflight(
+pub async fn prepare_launch_preflight(
     state: &AppState,
     instance_id: String,
 ) -> Result<LaunchPreflightResponse, (StatusCode, Json<serde_json::Value>)> {
@@ -499,21 +481,26 @@ async fn build_launch_preflight_facts(
         requested_java: requested_java.clone(),
         guardian_mode: guardian.mode,
     });
-    guardian_facts.extend(readiness_guardian_facts(&readiness));
+    let readiness_facts = readiness_guardian_facts(&readiness);
+    guardian_facts.extend(readiness_facts.iter().cloned());
     let boundary = stage_launch_boundary(LaunchBoundaryStagingRequest::new(
         application_guardian_mode(guardian.mode),
         OperationPhase::Validating,
         &guardian_facts,
         &performance_mode,
     ));
-    let mut guardian_summary = guardian_summary_for_preflight(
-        raw_min_memory_mb,
-        max_memory_mb,
-        &resource_budget,
-        &guardian,
-    );
-    append_launch_guardian_guidance(&mut guardian_summary, &guardian_facts);
-    block_guardian_for_launch_readiness(&mut guardian_summary, &readiness);
+    let guardian_outcome = guardian_preflight_outcome(GuardianPreflightOutcomeRequest {
+        operation_id: None,
+        mode: application_guardian_mode(guardian.mode),
+        phase: OperationPhase::Validating,
+        facts: &guardian_facts,
+        readiness: GuardianPreflightReadiness::from_facts(readiness.launchable, &readiness_facts),
+        resources: preflight_resource_signals(raw_min_memory_mb, max_memory_mb, &resource_budget),
+        overrides: preflight_override_signals(&guardian),
+        explicit_user_intent: guardian.has_risky_overrides(),
+    });
+    let guardian_summary =
+        guardian_summary_from_preflight_outcome(guardian.mode, &guardian_outcome);
 
     LaunchPreflightFacts {
         config: config.clone(),
@@ -528,6 +515,7 @@ async fn build_launch_preflight_facts(
         is_modded,
         guardian,
         guardian_summary,
+        guardian_outcome,
         guardian_facts,
         boundary,
         readiness,
@@ -615,6 +603,7 @@ async fn maybe_repair_managed_runtime_before_launch(
         | GuardianRepairStatus::Failed
         | GuardianRepairStatus::Suppressed => {
             block_guardian_for_runtime_repair_outcome(&mut preflight.guardian_summary, &outcome);
+            block_preflight_outcome_for_runtime_repair(&mut preflight.guardian_outcome, &outcome);
             preflight
         }
         GuardianRepairStatus::NotNeeded => preflight,
@@ -785,7 +774,33 @@ fn block_guardian_for_runtime_repair_outcome(
     summary: &mut GuardianSummary,
     outcome: &GuardianRepairOutcome,
 ) {
-    let reason = match outcome.status {
+    let reason = runtime_repair_outcome_reason(outcome);
+    let mut guidance = summary.guidance.clone();
+    push_unique_guidance(
+        &mut guidance,
+        "Reinstall or repair the affected version/runtime before launching again.",
+    );
+    summary.block_with_reason_and_guidance(reason, guidance);
+}
+
+fn block_preflight_outcome_for_runtime_repair(
+    preflight: &mut GuardianPreflightOutcome,
+    outcome: &GuardianRepairOutcome,
+) {
+    let reason = runtime_repair_outcome_reason(outcome).to_string();
+    let guidance = "Reinstall or repair the affected version/runtime before launching again.";
+    preflight.guardian_decision.kind = ApiGuardianDecisionKind::Block;
+    preflight.safety.decision = ApiGuardianDecisionKind::Block;
+    preflight.safety.summary = "Guardian blocked launch preflight.".to_string();
+    preflight.safety.detail = Some(reason.clone());
+    preflight.user_outcome.decision = ApiGuardianDecisionKind::Block;
+    preflight.user_outcome.summary = "Guardian blocked launch preflight.".to_string();
+    preflight.user_outcome.details = vec![reason];
+    preflight.user_outcome.guidance = vec![guidance.to_string()];
+}
+
+fn runtime_repair_outcome_reason(outcome: &GuardianRepairOutcome) -> &'static str {
+    match outcome.status {
         GuardianRepairStatus::Suppressed => {
             "Guardian suppressed managed Java runtime repair because the same repair failed recently."
         }
@@ -798,74 +813,6 @@ fn block_guardian_for_runtime_repair_outcome(
         GuardianRepairStatus::NotNeeded | GuardianRepairStatus::Repaired => {
             "Guardian did not need managed Java runtime repair."
         }
-    };
-    let mut guidance = summary.guidance.clone();
-    push_unique_guidance(
-        &mut guidance,
-        "Reinstall or repair the affected version/runtime before launching again.",
-    );
-    summary.block_with_reason_and_guidance(reason, guidance);
-}
-
-fn block_guardian_for_launch_readiness(summary: &mut GuardianSummary, readiness: &LaunchReadiness) {
-    let Some(reason) = readiness
-        .reasons
-        .iter()
-        .find(|reason| {
-            reason.severity == LaunchReadinessSeverity::Blocking
-                && readiness_guardian_fact_id(reason.id).is_some()
-        })
-        .map(|reason| reason.id)
-    else {
-        return;
-    };
-
-    let mut guidance = summary.guidance.clone();
-    push_unique_guidance(&mut guidance, readiness_guardian_guidance(reason));
-    summary.block_with_reason_and_guidance(readiness_guardian_block_reason(reason), guidance);
-}
-
-fn readiness_guardian_block_reason(reason: LaunchReadinessReasonId) -> &'static str {
-    match reason {
-        LaunchReadinessReasonId::VersionJsonMissing => {
-            "Guardian blocked launch because installed version metadata is missing."
-        }
-        LaunchReadinessReasonId::ParentVersionMissing => {
-            "Guardian blocked launch because parent version metadata is missing."
-        }
-        LaunchReadinessReasonId::IncompleteInstall => {
-            "Guardian blocked launch because the install is incomplete."
-        }
-        LaunchReadinessReasonId::ClientJarMissing => {
-            "Guardian blocked launch because client game files are missing."
-        }
-        LaunchReadinessReasonId::LibrariesMissing => {
-            "Guardian blocked launch because required libraries are missing."
-        }
-        LaunchReadinessReasonId::AssetIndexMissing => {
-            "Guardian blocked launch because the asset index is missing."
-        }
-        LaunchReadinessReasonId::JavaOverrideMissing => {
-            "Guardian blocked launch because the selected Java override is unavailable."
-        }
-        _ => "Guardian blocked launch because readiness failed.",
-    }
-}
-
-fn readiness_guardian_guidance(reason: LaunchReadinessReasonId) -> &'static str {
-    match reason {
-        LaunchReadinessReasonId::VersionJsonMissing
-        | LaunchReadinessReasonId::ParentVersionMissing
-        | LaunchReadinessReasonId::IncompleteInstall
-        | LaunchReadinessReasonId::ClientJarMissing
-        | LaunchReadinessReasonId::LibrariesMissing
-        | LaunchReadinessReasonId::AssetIndexMissing => {
-            "Install or repair the affected version before launching again."
-        }
-        LaunchReadinessReasonId::JavaOverrideMissing => {
-            "Choose a valid Java runtime or switch back to Managed Java before launching again."
-        }
-        _ => "Repair the affected launch state before launching again.",
     }
 }
 
@@ -906,10 +853,10 @@ fn java_override_target(id: &str) -> TargetDescriptor {
     )
 }
 
-fn application_guardian_mode(mode: GuardianMode) -> crate::guardian::GuardianMode {
+fn application_guardian_mode(mode: GuardianMode) -> ApiGuardianMode {
     match mode {
-        GuardianMode::Managed => crate::guardian::GuardianMode::Managed,
-        GuardianMode::Custom => crate::guardian::GuardianMode::Custom,
+        GuardianMode::Managed => ApiGuardianMode::Managed,
+        GuardianMode::Custom => ApiGuardianMode::Custom,
     }
 }
 
@@ -933,39 +880,6 @@ fn explicit_jvm_args_target() -> TargetDescriptor {
         "explicit_jvm_args",
         OwnershipClass::UserOwned,
     )
-}
-
-fn append_launch_guardian_guidance(summary: &mut GuardianSummary, facts: &[GuardianFact]) {
-    if facts.is_empty() {
-        return;
-    }
-
-    let diagnoses = diagnose_facts(facts, OperationPhase::Validating);
-    let mut guidance = Vec::new();
-    for diagnosis in diagnoses {
-        match diagnosis.id.as_str() {
-            "java_override_unavailable" => push_unique_guidance(
-                &mut guidance,
-                "Guardian detected an unavailable Java override. Use a valid Java runtime or switch back to Managed Java before relying on this launch.",
-            ),
-            "jvm_args_malformed" => push_unique_guidance(
-                &mut guidance,
-                "Guardian detected malformed JVM arguments. Fix or remove the explicit JVM args before relying on this launch.",
-            ),
-            "jvm_arg_unsupported" => push_unique_guidance(
-                &mut guidance,
-                "Guardian detected JVM flags that may fail on this Java runtime. Remove the explicit JVM args if startup fails.",
-            ),
-            "jvm_arg_unsafe_override" => push_unique_guidance(
-                &mut guidance,
-                "Guardian detected JVM arguments that override launcher-owned runtime settings. Remove them if startup fails or behaves unexpectedly.",
-            ),
-            _ => {}
-        }
-    }
-    if !guidance.is_empty() {
-        summary.warn_with_guidance(guidance);
-    }
 }
 
 fn push_unique_guidance(guidance: &mut Vec<String>, value: &str) {
@@ -1193,20 +1107,80 @@ fn online_auth_launch_notice(refresh: Option<(&'static str, &'static str)>) -> L
     }
 }
 
-fn guardian_summary_for_preflight(
+fn guardian_preflight_blocks_launch(outcome: &GuardianPreflightOutcome) -> bool {
+    matches!(
+        outcome.user_outcome.decision,
+        ApiGuardianDecisionKind::Block | ApiGuardianDecisionKind::AskUser
+    )
+}
+
+fn guardian_summary_from_preflight_outcome(
+    mode: GuardianMode,
+    outcome: &GuardianPreflightOutcome,
+) -> GuardianSummary {
+    let public_details = legacy_preflight_public_lines(outcome);
+    GuardianSummary {
+        mode,
+        decision: legacy_preflight_decision(outcome.user_outcome.decision),
+        message: Some(outcome.user_outcome.summary.clone()),
+        details: public_details.clone(),
+        guidance: public_details,
+        interventions: Vec::new(),
+    }
+}
+
+fn legacy_preflight_public_lines(outcome: &GuardianPreflightOutcome) -> Vec<String> {
+    let mut lines = Vec::new();
+    for value in outcome
+        .user_outcome
+        .details
+        .iter()
+        .chain(outcome.user_outcome.guidance.iter())
+    {
+        if !value.trim().is_empty() && !lines.iter().any(|existing| existing == value) {
+            lines.push(value.clone());
+        }
+    }
+    lines
+}
+
+fn legacy_preflight_decision(decision: ApiGuardianDecisionKind) -> GuardianDecision {
+    match decision {
+        ApiGuardianDecisionKind::Allow | ApiGuardianDecisionKind::RecordOnly => {
+            GuardianDecision::Allowed
+        }
+        ApiGuardianDecisionKind::Warn => GuardianDecision::Warned,
+        ApiGuardianDecisionKind::Block | ApiGuardianDecisionKind::AskUser => {
+            GuardianDecision::Blocked
+        }
+        _ => GuardianDecision::Intervened,
+    }
+}
+
+fn preflight_resource_signals(
     raw_min_memory_mb: i32,
     max_memory_mb: i32,
     resource_budget: &LaunchProofResourceBudget,
+) -> GuardianPreflightResourceSignals {
+    GuardianPreflightResourceSignals {
+        memory_clamped: raw_min_memory_mb > max_memory_mb,
+        low_memory_allocation: max_memory_mb > 0
+            && max_memory_mb < croopor_launcher::LOW_MEMORY_ALLOCATION_WARNING_THRESHOLD_MB,
+        memory_pressure: resource_budget.memory_pressure,
+        cpu_pressure: resource_budget.cpu_pressure,
+        install_pressure: resource_budget.install_pressure,
+        disk_pressure: resource_budget.disk_pressure,
+    }
+}
+
+fn preflight_override_signals(
     guardian: &LaunchGuardianContext,
-) -> GuardianSummary {
-    summarize_launch_warnings(
-        guardian,
-        &LaunchWarningFacts {
-            raw_min_memory_mb,
-            max_memory_mb,
-            resource: launch_resource_warning_facts(resource_budget),
-        },
-    )
+) -> GuardianPreflightOverrideSignals {
+    GuardianPreflightOverrideSignals {
+        explicit_java_override: guardian.has_java_override(),
+        explicit_jvm_preset: guardian.has_named_preset(),
+        explicit_jvm_args: guardian.has_raw_jvm_args(),
+    }
 }
 
 impl LaunchPreflightFacts {
@@ -1426,27 +1400,6 @@ fn capture_resource_budget_snapshot(
         launch_disk_available_mb: disk_evidence.launch_disk_available_mb,
         launch_disk_headroom_mb: LAUNCH_DISK_HEADROOM_MB,
         disk_pressure: warning_facts.disk_pressure(),
-    }
-}
-
-fn launch_resource_warning_facts(
-    resource_budget: &LaunchProofResourceBudget,
-) -> LaunchResourceWarningFacts {
-    LaunchResourceWarningFacts {
-        host_total_memory_mb: resource_budget.host_total_memory_mb,
-        host_cpu_threads: resource_budget.host_cpu_threads,
-        cpu_load: LaunchCpuLoadWarningFacts {
-            host_cpu_load_1m_x100: resource_budget.host_cpu_load_1m_x100,
-            host_cpu_load_5m_x100: resource_budget.host_cpu_load_5m_x100,
-            host_cpu_load_15m_x100: resource_budget.host_cpu_load_15m_x100,
-        },
-        active_session_count: resource_budget.active_session_count,
-        active_install_count: resource_budget.active_install_count,
-        active_memory_allocation_mb: resource_budget.active_memory_allocation_mb,
-        requested_memory_mb: resource_budget.requested_memory_mb,
-        launch_disk_available_mb: resource_budget.launch_disk_available_mb,
-        memory_headroom_mb: resource_budget.memory_headroom_mb,
-        launch_disk_headroom_mb: resource_budget.launch_disk_headroom_mb,
     }
 }
 
@@ -2295,10 +2248,7 @@ mod tests {
         };
 
         assert_eq!(error.0, StatusCode::PRECONDITION_FAILED);
-        assert_eq!(
-            error.1.0["error"],
-            "Installed version is not ready to launch"
-        );
+        assert_eq!(error.1.0["error"], "Guardian blocked launch preflight.");
         assert_eq!(error.1.0["readiness"]["launchable"], false);
         assert_eq!(
             error.1.0["readiness"]["reasons"][0]["id"],
@@ -2358,10 +2308,7 @@ mod tests {
         };
 
         assert_eq!(error.0, StatusCode::PRECONDITION_FAILED);
-        assert_eq!(
-            error.1.0["error"],
-            "Installed version is not ready to launch"
-        );
+        assert_eq!(error.1.0["error"], "Guardian blocked launch preflight.");
         assert_eq!(error.1.0["readiness"]["launchable"], false);
         assert_eq!(
             error.1.0["readiness"]["reasons"][0]["id"],
@@ -2376,7 +2323,7 @@ mod tests {
         );
         assert_eq!(
             error.1.0["notice"]["message"],
-            "Guardian blocked an unsafe launch setup."
+            "Guardian blocked launch preflight."
         );
         assert!(
             error.1.0["notice"]["details"]
@@ -3124,7 +3071,7 @@ mod tests {
         assert!(!resource_budget.install_pressure);
         assert_eq!(prepared.task.guardian.decision, GuardianDecision::Warned);
         for expected in [
-            "Launch memory budget is tight: active sessions plus this launch may leave less than 2 GB for the OS.",
+            "Launch memory budget is tight for the current active sessions.",
             "Guardian Custom mode will keep the selected Java override for this launch.",
             "Switch Guardian back to Managed if you want Croopor to adjust unsafe choices.",
         ] {
@@ -3183,9 +3130,9 @@ mod tests {
         assert!(resource_budget.install_pressure);
         assert_eq!(prepared.task.guardian.decision, GuardianDecision::Warned);
         for expected in [
-            "Launch memory budget is tight: active sessions plus this launch may leave less than 2 GB for the OS.",
+            "Launch memory budget is tight for the current active sessions.",
             "Multiple launches can saturate low-end CPUs; wait for another launch to finish if startup feels sluggish.",
-            "Active install/download sessions: 1. Launching now can add disk and network pressure during startup.",
+            "Active install or download work may add pressure during startup.",
             "Guardian Custom mode will keep the selected Java override for this launch.",
         ] {
             assert!(
@@ -3769,11 +3716,9 @@ mod tests {
         }
     }
 
-    fn assert_has_low_memory_allocation_warning(guardian: &GuardianSummary, max_memory_mb: i32) {
+    fn assert_has_low_memory_allocation_warning(guardian: &GuardianSummary, _max_memory_mb: i32) {
         for expected in [
-            format!(
-                "Launch memory allocation is very low: this instance is limited to less than 2 GB of RAM ({max_memory_mb} MB selected)."
-            ),
+            "Launch memory allocation is very low for Minecraft.".to_string(),
             "Raise the maximum memory allocation if Minecraft crashes during startup, stalls while loading, or exits with out-of-memory errors.".to_string(),
         ] {
             assert!(
