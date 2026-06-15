@@ -7,7 +7,7 @@ import { navigate } from '../../../ui-state';
 import { clearLaunchNotice } from '../../../actions';
 import { toast } from '../../../toast';
 import type { InstallFailure, LaunchState } from '../../../store';
-import type { EnrichedInstance, LaunchNotice, LaunchNoticeTone } from '../../../types';
+import type { EnrichedInstance, LaunchActionState, LaunchNotice, LaunchNoticeTone } from '../../../types';
 import { countDownRemainingSeconds, formatRemainingTime } from '../../../progress-estimation';
 import { openInstanceFolder } from '../instance-actions';
 
@@ -67,7 +67,7 @@ export function LaunchOutcomeNotice({ inst, notice }: { inst: EnrichedInstance; 
 
 export function LaunchSplitButton({
   inst,
-  canLaunch,
+  launchAction,
   installQueued,
   installProgress,
   onLaunch,
@@ -77,7 +77,7 @@ export function LaunchSplitButton({
   preparing,
 }: {
   inst: EnrichedInstance;
-  canLaunch: boolean;
+  launchAction: LaunchActionState;
   installQueued: boolean;
   installProgress: { pct: number; label: string } | null;
   onLaunch: () => void;
@@ -87,16 +87,16 @@ export function LaunchSplitButton({
   preparing: Extract<LaunchState, { status: 'preparing' }> | null;
 }): JSX.Element {
   const progress = preparing ? { pct: preparing.pct, label: preparing.label } : installProgress;
-  const needsInstall = !canLaunch;
-  const label = progress?.label || (installQueued ? 'Queued' : needsInstall ? 'Install' : 'Launch');
-  const icon = progress || installQueued ? 'clock' : needsInstall ? 'download' : 'play';
+  const usesInstallAction = launchAction.primary_action === 'install';
+  const label = progress?.label || (installQueued ? 'Queued' : launchAction.label);
+  const icon = progress || installQueued ? 'clock' : usesInstallAction ? 'download' : 'play';
   const pct = progress?.pct ?? 0;
   const disabled = Boolean(progress) || installQueued;
-  const primaryAction = needsInstall ? onInstall : onLaunch;
-  const primaryMenuItem = needsInstall
+  const primaryAction = usesInstallAction ? onInstall : onLaunch;
+  const primaryMenuItem = usesInstallAction
     ? {
         icon: installQueued ? 'clock' : 'download',
-        label: installQueued ? 'Queued' : 'Install',
+        label: installQueued ? 'Queued' : launchAction.label,
         onSelect: installQueued ? () => toast('Install already queued') : onInstall,
       }
     : { icon: 'play', label: 'Launch now', onSelect: onLaunch };
@@ -112,7 +112,7 @@ export function LaunchSplitButton({
         class="cp-instance-split-launch-main"
         type="button"
         onClick={disabled ? undefined : primaryAction}
-        data-sound={needsInstall ? 'bright' : 'launchPress'}
+        data-sound={usesInstallAction ? 'bright' : 'launchPress'}
         disabled={disabled}
       >
         <Icon name={icon} size={18} stroke={1.8} />

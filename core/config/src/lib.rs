@@ -5,6 +5,7 @@ pub mod store;
 
 pub use instances::{
     EnrichedInstance, Instance, InstanceStore, InstanceStoreError, InstanceStoreStartup,
+    LaunchActionState, LaunchActionTone, LaunchPrimaryAction,
 };
 pub use models::{
     AppConfig, AppConfigValidationError, LAUNCH_AUTH_MODE_OFFLINE, LAUNCH_AUTH_MODE_ONLINE,

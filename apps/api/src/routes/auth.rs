@@ -47,8 +47,18 @@ struct AuthStatusResponse {
     minecraft_profile: Option<AuthMinecraftProfileResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     minecraft_token_expires_in: Option<u64>,
+    skin_action: AuthActionState,
     login_available: bool,
     login_reason: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct AuthActionState {
+    state_id: &'static str,
+    label: &'static str,
+    enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disabled_reason: Option<&'static str>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -322,9 +332,45 @@ fn auth_status_from_username(
             .is_some_and(|account| account.owns_minecraft_java),
         minecraft_profile,
         minecraft_token_expires_in: minecraft_state.token_expires_in,
+        skin_action: skin_action_state(launch_auth_mode, &minecraft_state, online_mode_ready),
         login_available: false,
         login_reason: LOGIN_UNAVAILABLE_REASON,
     })
+}
+
+fn skin_action_state(
+    launch_auth_mode: &str,
+    minecraft_state: &AuthStatusMinecraftState,
+    online_mode_ready: bool,
+) -> AuthActionState {
+    if online_mode_ready {
+        return AuthActionState {
+            state_id: "online_profile_ready",
+            label: "Online profile ready",
+            enabled: true,
+            disabled_reason: None,
+        };
+    }
+    let disabled_reason = if launch_auth_mode != LAUNCH_AUTH_MODE_ONLINE {
+        "Online account actions require Online launch mode."
+    } else if minecraft_state.account.is_none() {
+        "Sign in with Microsoft to apply skins or capes online."
+    } else if minecraft_state
+        .account
+        .as_ref()
+        .is_some_and(|account| !account.owns_minecraft_java)
+    {
+        "The selected Microsoft account has not verified Minecraft Java ownership."
+    } else {
+        "The selected Microsoft account is not ready for online profile actions."
+    };
+
+    AuthActionState {
+        state_id: "online_profile_unavailable",
+        label: "Online profile unavailable",
+        enabled: false,
+        disabled_reason: Some(disabled_reason),
+    }
 }
 
 fn minecraft_account_can_launch_online(account: &AuthLoginMinecraftAccount) -> bool {
@@ -784,6 +830,12 @@ mod tests {
         assert!(!response.minecraft_ownership_verified);
         assert_eq!(response.minecraft_profile, None);
         assert_eq!(response.minecraft_token_expires_in, None);
+        assert_eq!(response.skin_action.state_id, "online_profile_unavailable");
+        assert!(!response.skin_action.enabled);
+        assert_eq!(
+            response.skin_action.disabled_reason,
+            Some("Online account actions require Online launch mode.")
+        );
         assert!(!response.login_available);
         assert_eq!(response.login_reason, LOGIN_UNAVAILABLE_REASON);
     }

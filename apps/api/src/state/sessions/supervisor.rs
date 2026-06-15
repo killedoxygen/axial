@@ -1,5 +1,7 @@
 use super::SessionStore;
-use croopor_launcher::{LaunchState, LaunchStatusEvent};
+use croopor_launcher::{
+    LaunchSessionExitReason, LaunchSessionOutcome, LaunchState, LaunchStatusEvent,
+};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -73,6 +75,9 @@ pub(super) fn spawn_wait_task(
                             failure_detail: None,
                             healing: existing.as_ref().and_then(|record| record.healing.clone()),
                             guardian: existing.as_ref().and_then(|record| record.guardian.clone()),
+                            outcome: None,
+                            notice: None,
+                            evidence: Vec::new(),
                             stages: Vec::new(),
                         },
                     )
@@ -91,6 +96,9 @@ pub(super) fn spawn_wait_task(
                             failure_detail: Some(error.to_string()),
                             healing: existing.as_ref().and_then(|record| record.healing.clone()),
                             guardian: existing.as_ref().and_then(|record| record.guardian.clone()),
+                            outcome: None,
+                            notice: None,
+                            evidence: Vec::new(),
                             stages: Vec::new(),
                         },
                     )
@@ -132,6 +140,11 @@ pub(super) fn spawn_startup_watchdog(
                     failure_detail: Some("no startup activity observed".to_string()),
                     healing: record.healing.clone(),
                     guardian: record.guardian.clone(),
+                    outcome: Some(LaunchSessionOutcome::from_reason(
+                        LaunchSessionExitReason::WatchdogKilled,
+                    )),
+                    notice: None,
+                    evidence: Vec::new(),
                     stages: Vec::new(),
                 },
             )

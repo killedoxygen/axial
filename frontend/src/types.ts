@@ -15,10 +15,24 @@ export interface Instance {
   extra_jvm_args?: string;
   icon?: string;
   accent?: string;
+  launch_action?: LaunchActionState;
+}
+
+export type LaunchActionTone = 'ok' | 'warn' | 'err' | 'mute';
+export type LaunchPrimaryAction = 'launch' | 'install';
+
+export interface LaunchActionState {
+  state_id: string;
+  label: string;
+  tone: LaunchActionTone;
+  launchable: boolean;
+  primary_action: LaunchPrimaryAction;
+  disabled_reason?: string;
 }
 
 export interface EnrichedInstance extends Instance {
   launchable: boolean;
+  launch_action: LaunchActionState;
   status_detail?: string;
   needs_install?: string;
   java_major?: number;
@@ -234,6 +248,7 @@ export interface RunningSession {
   benchmark?: LaunchBenchmarkMetadata;
   healing?: LaunchHealingSummary;
   guardian?: GuardianSummary;
+  outcome?: LaunchSessionOutcome;
   eventSource?: EventSource;
 }
 
@@ -264,6 +279,59 @@ export interface GuardianSummary {
   details?: string[];
   guidance?: string[];
   interventions?: GuardianIntervention[];
+}
+
+export interface GuardianEvidenceField {
+  key: string;
+  value: string;
+  sensitivity: string;
+}
+
+export interface GuardianTargetDescriptor {
+  system: string;
+  kind: string;
+  id: string;
+  ownership: string;
+}
+
+export interface GuardianFact {
+  operation_id?: string | null;
+  id: string;
+  domain: string;
+  phase: string;
+  reliability: string;
+  severity?: string | null;
+  confidence?: string | null;
+  ownership: string;
+  target?: GuardianTargetDescriptor | null;
+  fields: GuardianEvidenceField[];
+}
+
+export interface PerformanceProofRecord {
+  operation_id?: string | null;
+  target: GuardianTargetDescriptor;
+  health: string;
+  rollback: string;
+  fields: GuardianEvidenceField[];
+  retention: string;
+}
+
+export type ApplicationViewModelTone = 'ok' | 'warn' | 'err' | 'mute';
+
+export interface PerformancePlanSummaryViewModel {
+  state_id: string;
+  title: string;
+  detail: string;
+  tone: ApplicationViewModelTone;
+  health?: string | null;
+  composition_id?: string | null;
+  managed_artifact_count: number;
+  actions: Array<{
+    command: string;
+    label: string;
+    enabled: boolean;
+    disabled_reason?: string | null;
+  }>;
 }
 
 export type LaunchOverrideOrigin = 'global' | 'instance';
@@ -307,7 +375,7 @@ export type LaunchReadinessReasonId =
   | 'managed_runtime_missing'
   | 'java_override_missing';
 
-export type LaunchReadinessSeverity = 'blocking';
+export type LaunchReadinessSeverity = 'blocking' | 'recoverable';
 
 export interface LaunchReadinessReason {
   id: LaunchReadinessReasonId;
@@ -327,6 +395,7 @@ export interface LaunchPreflightResponse {
   memory: LaunchPreflightMemory;
   overrides: LaunchPreflightOverrides;
   readiness: LaunchReadiness;
+  guardian_facts: GuardianFact[];
   resource_budget: LaunchPreflightResourceBudget;
 }
 
@@ -362,6 +431,26 @@ export interface LaunchNotice {
   detail?: string;
   details?: string[];
   tone: LaunchNoticeTone;
+}
+
+export type LaunchSessionOutcomeKind = 'clean' | 'stopped' | 'failed' | 'unknown';
+
+export type LaunchSessionExitReason =
+  | 'clean_exit'
+  | 'external_user_closed'
+  | 'launcher_stopped'
+  | 'spawn_failed'
+  | 'startup_failed'
+  | 'startup_stalled'
+  | 'watchdog_killed'
+  | 'crashed_before_boot'
+  | 'crashed_after_boot'
+  | 'unknown_exit';
+
+export interface LaunchSessionOutcome {
+  reason: LaunchSessionExitReason;
+  kind: LaunchSessionOutcomeKind;
+  summary: string;
 }
 
 export interface LaunchProofScenario {
@@ -424,6 +513,7 @@ export interface LaunchProofRecord {
   launched_at: string;
   recorded_at: string;
   outcome: string;
+  session_outcome?: LaunchSessionOutcome | null;
   scenario: LaunchProofScenario;
   device: LaunchProofDevice;
   pid?: number;
@@ -619,6 +709,8 @@ export interface ManagedPerformanceMod {
 
 export interface PerformancePlanResponse {
   active: boolean;
+  effective: EffectivePerformancePlan;
+  guardian_facts: GuardianFact[];
   composition_id: string;
   family: CompositionFamily;
   loader: string;
@@ -629,6 +721,64 @@ export interface PerformancePlanResponse {
   fallback_chain?: string[];
   warnings?: string[];
   fallback_reason?: string;
+}
+
+export type PerformanceLoaderPosture = 'vanilla' | 'modded_loader';
+export type PerformanceContributionSource = 'performance_plan' | 'launcher_policy' | 'user_controlled';
+export type PerformanceLaunchSmoothingPolicy = 'managed' | 'launcher_defaults' | 'user_controlled';
+export type PerformanceInstrumentationMode = 'not_configured';
+
+export interface EffectivePerformancePlan {
+  active: boolean;
+  selected_mode: PerformanceMode;
+  version_family: CompositionFamily;
+  loader: string;
+  loader_posture: PerformanceLoaderPosture;
+  composition: {
+    id: string | null;
+    tier: CompositionTier;
+    selected: boolean;
+    managed_artifact_count: number;
+  };
+  managed_artifacts: Array<{
+    artifact_id: string;
+    project_id: string;
+    slug: string;
+    name: string;
+    condition: ModCondition;
+  }>;
+  jvm_contribution: {
+    preset?: string | null;
+    source: PerformanceContributionSource;
+    explanation: string;
+  };
+  launch_smoothing: {
+    policy: PerformanceLaunchSmoothingPolicy;
+    explanation: string;
+  };
+  instrumentation_policy: {
+    policy: PerformanceInstrumentationMode;
+    explanation: string;
+  };
+  fallback: {
+    selected: boolean;
+    chain: string[];
+    reason?: string | null;
+    launchable: boolean;
+  };
+  health_requirements: {
+    expected_health: PerformanceHealthStatus;
+    expected_tier: CompositionTier;
+    requires_composition_lock: boolean;
+    expected_managed_artifact_count: number;
+    managed_artifact_integrity_required: boolean;
+    required_ownership?: 'composition_managed' | 'user_managed' | null;
+    rollback_expected: boolean;
+  };
+  explanation: {
+    summary: string;
+    details: string[];
+  };
 }
 
 export type PerformanceHealthStatus = 'healthy' | 'degraded' | 'fallback' | 'disabled' | 'invalid';
@@ -678,6 +828,7 @@ export interface PerformanceRulesStatus {
   rule_source: PerformanceRuleSource;
   rule_channel: PerformanceRuleChannel;
   rules_cache: PerformanceRulesCacheStatus;
+  guardian_facts: GuardianFact[];
   schema_version: number;
   generated_at: string;
   composition_count: number;
@@ -700,6 +851,50 @@ export interface PerformanceHealthResponse {
   installed_count: number;
   managed_artifacts: PerformanceManagedArtifactSummary[];
   warnings: string[];
+  guardian_facts: GuardianFact[];
+  proof: PerformanceProofRecord;
+  view_model: PerformancePlanSummaryViewModel;
+  display: PerformanceInstanceDisplay;
+}
+
+export interface PerformanceInstanceDisplay {
+  memory: PerformanceMemoryDisplay;
+  runtime: PerformanceRuntimeDisplay;
+  mode: PerformanceModeDisplay;
+}
+
+export interface PerformanceMemoryDisplay {
+  min_gb: number;
+  max_gb: number;
+  label: string;
+}
+
+export interface PerformanceRuntimeDisplay {
+  detected: boolean;
+  label: string;
+}
+
+export interface PerformanceModeDisplay {
+  mode: PerformanceMode | string;
+  label: string;
+  source: 'instance' | 'global' | string;
+  source_label: string;
+}
+
+export interface PerformanceRollbackSnapshotSummary {
+  id: string;
+  created_at: string;
+  composition_id: string;
+  tier: CompositionTier;
+  installed_count: number;
+  artifact_count: number;
+  ownership_class: PerformanceOwnershipClass;
+  rollback_available: boolean;
+  latest: boolean;
+}
+
+export interface PerformanceRollbackListResponse {
+  snapshots: PerformanceRollbackSnapshotSummary[];
 }
 
 export type PerformanceInstallStatus = 'queued' | 'complete' | 'removed' | 'rolled_back';
@@ -727,8 +922,6 @@ export interface PerformanceInstallResponse {
 }
 
 export interface PerformanceOperationPayload {
-  version_id: string;
-  instance_performance_mode: string;
   game_version?: string;
   loader?: string;
   mode?: string;

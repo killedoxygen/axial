@@ -13,7 +13,7 @@ export function AccountsView(): JSX.Element {
   const accountsState = useLauncherAccounts();
   const activeAccount = accountsState.accounts.find((account) => account.active) ?? null;
   const onlineActive = activeAccount?.kind === 'microsoft';
-  const onlineReady = state === 'ready' && onlineActive && Boolean(status?.online_mode_ready);
+  const onlineReady = state === 'ready' && Boolean(status?.skin_action?.enabled);
   const minecraftProfile = onlineActive ? (activeAccount?.minecraft_profile ?? status?.minecraft_profile) : undefined;
   const profileName = minecraftProfile?.name;
   const playerName = activeAccount?.display_name || (onlineActive && profileName ? profileName : savedUsername);

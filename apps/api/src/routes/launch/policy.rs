@@ -20,7 +20,7 @@ pub(super) struct LaunchMemoryDefaults {
 }
 
 pub(super) fn selected_java_override(instance: &Instance, config: &AppConfig) -> String {
-    if !instance.java_path.trim().is_empty() {
+    if !instance.java_path.is_empty() {
         instance.java_path.trim().to_string()
     } else {
         config.java_path_override.trim().to_string()
@@ -179,15 +179,6 @@ fn version_id_is_legacy(version_id: &str) -> bool {
     compare_version_like(version_id, "1.12.2") != Ordering::Greater
 }
 
-pub(super) fn split_jvm_args(extra_jvm_args: &str) -> Vec<String> {
-    shlex::split(extra_jvm_args).unwrap_or_else(|| {
-        extra_jvm_args
-            .split_whitespace()
-            .map(str::to_string)
-            .collect()
-    })
-}
-
 pub(super) fn selected_guardian_mode(config: &AppConfig) -> GuardianMode {
     GuardianMode::from_config(&config.guardian_mode)
 }
@@ -196,9 +187,9 @@ pub(super) fn java_override_origin(
     instance: &Instance,
     config: &AppConfig,
 ) -> Option<OverrideOrigin> {
-    if !instance.java_path.trim().is_empty() {
+    if !instance.java_path.is_empty() {
         Some(OverrideOrigin::Instance)
-    } else if !config.java_path_override.trim().is_empty() {
+    } else if !config.java_path_override.is_empty() {
         Some(OverrideOrigin::Global)
     } else {
         None

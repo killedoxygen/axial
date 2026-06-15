@@ -9,7 +9,7 @@ use axum::{
     routing::{get, post, put},
 };
 use croopor_config::{EnrichedInstance, InstanceStoreError};
-use croopor_minecraft::scan_versions;
+use croopor_minecraft::{VersionEntry, scan_versions};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -225,12 +225,7 @@ pub fn router() -> Router<AppState> {
 }
 
 async fn handle_list_instances(State(state): State<AppState>) -> Json<InstancesResponse> {
-    let versions = state
-        .library_dir()
-        .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
-        .and_then(|path| scan_versions(&path).ok())
-        .unwrap_or_default();
+    let versions = scan_current_versions(&state);
 
     Json(InstancesResponse {
         instances: state.instances().enrich(&versions),
@@ -238,14 +233,35 @@ async fn handle_list_instances(State(state): State<AppState>) -> Json<InstancesR
     })
 }
 
+fn scan_current_versions(state: &AppState) -> Vec<VersionEntry> {
+    state
+        .library_dir()
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .and_then(|path| scan_versions(&path).ok())
+        .unwrap_or_default()
+}
+
+fn enrich_instance_for_state(
+    state: &AppState,
+    instance: croopor_config::Instance,
+) -> EnrichedInstance {
+    let versions = scan_current_versions(state);
+    let version = versions
+        .iter()
+        .find(|version| version.id == instance.version_id);
+    let game_dir = state.instances().game_dir(&instance.id);
+    EnrichedInstance::from_instance(instance, version, &game_dir)
+}
+
 async fn handle_get_instance(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<croopor_config::Instance>, (axum::http::StatusCode, Json<serde_json::Value>)> {
+) -> Result<Json<EnrichedInstance>, (axum::http::StatusCode, Json<serde_json::Value>)> {
     let instance = state.instances().get(&id);
 
     match instance {
-        Some(instance) => Ok(Json(instance)),
+        Some(instance) => Ok(Json(enrich_instance_for_state(&state, instance))),
         None => Err((
             axum::http::StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": "instance not found" })),
@@ -266,7 +282,7 @@ struct CreateInstanceRequest {
 async fn handle_create_instance(
     State(state): State<AppState>,
     Json(payload): Json<CreateInstanceRequest>,
-) -> Result<Json<croopor_config::Instance>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Json<EnrichedInstance>, (StatusCode, Json<serde_json::Value>)> {
     let mc_dir = state.library_dir().map(PathBuf::from);
     state
         .instances()
@@ -277,7 +293,7 @@ async fn handle_create_instance(
             payload.accent,
             mc_dir.as_deref(),
         )
-        .map(Json)
+        .map(|instance| Json(enrich_instance_for_state(&state, instance)))
         .map_err(|error| instance_write_error_response(InstanceWriteOperation::Create, error))
 }
 
@@ -290,13 +306,13 @@ async fn handle_duplicate_instance(
     State(state): State<AppState>,
     Path(id): Path<String>,
     payload: Option<Json<DuplicateInstanceRequest>>,
-) -> Result<Json<croopor_config::Instance>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Json<EnrichedInstance>, (StatusCode, Json<serde_json::Value>)> {
     let payload = payload.map(|Json(payload)| payload).unwrap_or_default();
     let mc_dir = state.library_dir().map(PathBuf::from);
     state
         .instances()
         .duplicate(&id, payload.name, mc_dir.as_deref())
-        .map(Json)
+        .map(|instance| Json(enrich_instance_for_state(&state, instance)))
         .map_err(|error| instance_write_error_response(InstanceWriteOperation::Duplicate, error))
 }
 
@@ -321,7 +337,7 @@ async fn handle_update_instance(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(patch): Json<InstancePatch>,
-) -> Result<Json<croopor_config::Instance>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Json<EnrichedInstance>, (StatusCode, Json<serde_json::Value>)> {
     let mut instance = state.instances().get(&id).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
@@ -371,7 +387,7 @@ async fn handle_update_instance(
     state
         .instances()
         .update(instance)
-        .map(Json)
+        .map(|instance| Json(enrich_instance_for_state(&state, instance)))
         .map_err(|error| instance_write_error_response(InstanceWriteOperation::Update, error))
 }
 
@@ -2439,6 +2455,11 @@ mod tests {
         assert_eq!(listed.instances[0].instance.name, "Survival");
         assert!(!listed.instances[0].launchable);
         assert_eq!(listed.instances[0].status_detail, "version not installed");
+        assert_eq!(listed.instances[0].launch_action.label, "Install");
+        assert_eq!(
+            listed.instances[0].launch_action.primary_action,
+            croopor_config::LaunchPrimaryAction::Install
+        );
 
         let Json(fetched) =
             handle_get_instance(State(fixture.state.clone()), Path(created.id.clone()))
@@ -2830,6 +2851,7 @@ mod tests {
             failure: None,
             healing: None,
             guardian: None,
+            outcome: None,
             stages: Vec::new(),
         }
     }

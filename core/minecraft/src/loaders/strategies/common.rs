@@ -1,4 +1,7 @@
-use crate::download::{DownloadProgress, Downloader, download_libraries};
+use crate::download::{
+    DownloadError, DownloadProgress, Downloader, ExecutionDownloadError, ExecutionDownloadReport,
+    download_libraries, write_launcher_managed_artifact_bytes_to_temp,
+};
 use crate::launch::resolve_version;
 use crate::loaders::compose::{
     LoaderProfileFragment, cleanup_incomplete_version, compose_loader_version,
@@ -27,6 +30,7 @@ const MAX_INSTALLER_DOWNLOAD_SIZE: u64 = 50 << 20;
 const LOADER_METADATA_FILE: &str = ".croopor-loader.json";
 
 #[derive(Debug)]
+#[cfg(test)]
 struct CachedArtifact {
     bytes: Vec<u8>,
     cache_hit: bool,
@@ -193,7 +197,8 @@ where
             plan.record.component_name
         )),
     ));
-    let cached_installer = read_or_download_cached_artifact(&installer_path, installer_url).await?;
+    let (installer_data, extracted) =
+        read_valid_installer(&installer_path, installer_url, &plan.record.component_name).await?;
 
     send(progress(
         "profile",
@@ -204,25 +209,6 @@ where
             plan.record.component_name
         )),
     ));
-    let (installer_data, extracted) = match extract_installer_blocking(cached_installer.bytes).await
-    {
-        Ok(extracted) => extracted,
-        Err(InstallerTaskError::Extract(_)) if cached_installer.cache_hit => {
-            let _ = async_fs::remove_file(&installer_path).await;
-            let bytes = download_and_cache_artifact(installer_url, &installer_path).await?;
-            extract_installer_blocking(bytes)
-                .await
-                .map_err(|fresh_error| {
-                    installer_task_extract_error(&plan.record.component_name, fresh_error)
-                })?
-        }
-        Err(error) => {
-            return Err(installer_task_extract_error(
-                &plan.record.component_name,
-                error,
-            ));
-        }
-    };
     let installed_version_id = if extracted.version_id.trim().is_empty() {
         plan.record.version_id.clone()
     } else {
@@ -547,6 +533,31 @@ async fn download_to_memory(url: &str) -> Result<Vec<u8>, LoaderError> {
     fetch_bytes(url, MAX_INSTALLER_DOWNLOAD_SIZE).await
 }
 
+async fn read_valid_installer(
+    path: &Path,
+    url: &str,
+    component_name: &str,
+) -> Result<(Vec<u8>, ExtractedForgeInstaller), LoaderError> {
+    if path_is_file(path).await
+        && let Some(bytes) = read_cached_artifact(path).await?
+    {
+        match extract_installer_blocking(bytes).await {
+            Ok(extracted) => return Ok(extracted),
+            Err(InstallerTaskError::Extract(_)) => {
+                let _ = async_fs::remove_file(path).await;
+            }
+            Err(error) => return Err(installer_task_extract_error(component_name, error)),
+        }
+    }
+
+    let bytes = download_to_memory(url).await?;
+    let (installer_data, extracted) = extract_installer_blocking(bytes)
+        .await
+        .map_err(|error| installer_task_extract_error(component_name, error))?;
+    Box::pin(write_cached_artifact(path, &installer_data)).await?;
+    Ok((installer_data, extracted))
+}
+
 async fn read_valid_profile_json(
     path: &Path,
     url: &str,
@@ -558,7 +569,7 @@ async fn read_valid_profile_json(
             None => {
                 let bytes = download_to_memory(url).await?;
                 let fragment = parse_profile_json(&bytes, component_name)?;
-                let _ = write_cached_artifact(path, &bytes).await;
+                let _ = Box::pin(write_cached_artifact(path, &bytes)).await;
                 return Ok(CachedProfile { bytes, fragment });
             }
         };
@@ -572,7 +583,7 @@ async fn read_valid_profile_json(
 
     let bytes = download_to_memory(url).await?;
     let fragment = parse_profile_json(&bytes, component_name)?;
-    let _ = write_cached_artifact(path, &bytes).await;
+    let _ = Box::pin(write_cached_artifact(path, &bytes)).await;
     Ok(CachedProfile { bytes, fragment })
 }
 
@@ -584,6 +595,7 @@ fn parse_profile_json(
         .map_err(|error| LoaderError::InvalidProfile(format!("{component_name} profile: {error}")))
 }
 
+#[cfg(test)]
 async fn read_or_download_cached_artifact(
     path: &Path,
     url: &str,
@@ -603,9 +615,10 @@ async fn read_or_download_cached_artifact(
     })
 }
 
+#[cfg(test)]
 async fn download_and_cache_artifact(url: &str, path: &Path) -> Result<Vec<u8>, LoaderError> {
     let bytes = download_to_memory(url).await?;
-    write_cached_artifact(path, &bytes).await?;
+    Box::pin(write_cached_artifact(path, &bytes)).await?;
     Ok(bytes)
 }
 
@@ -614,23 +627,23 @@ async fn read_valid_legacy_archive(
     url: &str,
     component_name: &str,
 ) -> Result<Vec<u8>, LoaderError> {
-    let cached_archive = read_or_download_cached_artifact(path, url).await?;
-    match validate_legacy_archive(&cached_archive.bytes) {
-        Ok(()) => Ok(cached_archive.bytes),
-        Err(_) if cached_archive.cache_hit => {
-            let _ = async_fs::remove_file(path).await;
-            let bytes = download_and_cache_artifact(url, path).await?;
-            if let Err(error) = validate_legacy_archive(&bytes) {
+    if path_is_file(path).await
+        && let Some(bytes) = read_cached_artifact(path).await?
+    {
+        match validate_legacy_archive(&bytes) {
+            Ok(()) => return Ok(bytes),
+            Err(_) => {
                 let _ = async_fs::remove_file(path).await;
-                return Err(legacy_archive_error(component_name, error));
             }
-            Ok(bytes)
-        }
-        Err(error) => {
-            let _ = async_fs::remove_file(path).await;
-            Err(legacy_archive_error(component_name, error))
         }
     }
+
+    let bytes = download_to_memory(url).await?;
+    if let Err(error) = validate_legacy_archive(&bytes) {
+        return Err(legacy_archive_error(component_name, error));
+    }
+    Box::pin(write_cached_artifact(path, &bytes)).await?;
+    Ok(bytes)
 }
 
 async fn read_cached_artifact(path: &Path) -> Result<Option<Vec<u8>>, LoaderError> {
@@ -675,55 +688,32 @@ async fn extract_maven_entries_blocking(
     .map_err(InstallerTaskError::Task)?
 }
 
+#[cfg(test)]
 async fn promote_cached_artifact_tmp(tmp_path: &Path, path: &Path) -> Result<(), LoaderError> {
-    let first_error = match async_fs::rename(tmp_path, path).await {
-        Ok(()) => return Ok(()),
-        Err(error) => error,
-    };
-
-    match async_fs::symlink_metadata(tmp_path).await {
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(first_error.into());
-        }
-        Err(error) => return Err(error.into()),
-    }
-
-    match async_fs::symlink_metadata(path).await {
-        Ok(metadata) if metadata.file_type().is_dir() => return Err(first_error.into()),
-        Ok(metadata) if metadata.file_type().is_file() || metadata.file_type().is_symlink() => {
-            async_fs::remove_file(path).await?;
-        }
-        Ok(_) => return Err(first_error.into()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-
-    match async_fs::rename(tmp_path, path).await {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = async_fs::remove_file(tmp_path).await;
-            Err(error.into())
-        }
-    }
+    crate::download::promote_launcher_managed_artifact_temp_once(tmp_path, path)
+        .await
+        .map_err(LoaderError::Io)
 }
 
-async fn write_cached_artifact(path: &Path, bytes: &[u8]) -> Result<(), LoaderError> {
-    if let Some(parent) = path.parent() {
-        async_fs::create_dir_all(parent).await?;
-    }
-
+async fn write_cached_artifact(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<ExecutionDownloadReport, LoaderError> {
     let tmp_path = artifact_tmp_path(path);
-    let result = async {
-        async_fs::write(&tmp_path, bytes).await?;
-        promote_cached_artifact_tmp(&tmp_path, path).await?;
-        Ok::<_, LoaderError>(())
+    write_launcher_managed_artifact_bytes_to_temp(path, &tmp_path, bytes)
+        .await
+        .map_err(loader_execution_download_error)
+}
+
+fn loader_execution_download_error(error: ExecutionDownloadError) -> LoaderError {
+    loader_download_error(error.into_download_error())
+}
+
+fn loader_download_error(error: DownloadError) -> LoaderError {
+    match error {
+        DownloadError::FileOperation(error) => LoaderError::Io(error),
+        error => LoaderError::Download(error),
     }
-    .await;
-    if result.is_err() {
-        let _ = async_fs::remove_file(&tmp_path).await;
-    }
-    result
 }
 
 async fn path_is_file(path: &Path) -> bool {
@@ -805,10 +795,10 @@ mod tests {
     use super::{
         base_version_install_lock_from_map, cleanup_on_error, ensure_base_version,
         install_from_installer_source, install_from_legacy_archive, install_from_profile_source,
-        promote_cached_artifact_tmp, read_or_download_cached_artifact, read_valid_legacy_archive,
-        read_valid_profile_json, write_cached_artifact,
+        promote_cached_artifact_tmp, read_or_download_cached_artifact, read_valid_installer,
+        read_valid_legacy_archive, read_valid_profile_json, write_cached_artifact,
     };
-    use crate::download::DownloadProgress;
+    use crate::download::{DownloadProgress, ExecutionDownloadFactKind};
     use crate::loaders::types::LoaderError;
     use crate::loaders::types::{
         LoaderArtifactKind, LoaderBuildMetadata, LoaderBuildRecord, LoaderBuildSubjectKind,
@@ -976,10 +966,31 @@ mod tests {
         fs::create_dir_all(&root).expect("root");
         let path = root.join("installer.jar");
 
-        write_cached_artifact(&path, b"installer bytes")
+        let report = write_cached_artifact(&path, b"installer bytes")
             .await
             .expect("write cached artifact");
 
+        assert_eq!(report.bytes_written, b"installer bytes".len() as u64);
+        assert_eq!(report.target, "installer.jar");
+        assert!(report.facts.iter().any(|fact| {
+            fact.kind == ExecutionDownloadFactKind::MetadataMissing
+                && fact
+                    .fields
+                    .iter()
+                    .any(|(key, value)| key == "field" && value == "sha1")
+        }));
+        assert!(
+            report
+                .facts
+                .iter()
+                .any(|fact| fact.kind == ExecutionDownloadFactKind::WrittenToTemp)
+        );
+        assert!(
+            report
+                .facts
+                .iter()
+                .any(|fact| fact.kind == ExecutionDownloadFactKind::Promoted)
+        );
         assert_eq!(fs::read(&path).expect("read artifact"), b"installer bytes");
         assert!(fs::read_dir(&root).expect("read root").all(|entry| {
             !entry
@@ -1090,6 +1101,58 @@ mod tests {
         assert!(error.to_string().contains("request failed"));
         assert!(!path.exists());
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn corrupt_cached_installer_is_removed_and_replaced_from_provider() {
+        let root = temp_dir("installer-cache-corrupt");
+        let path = root.join("artifacts/forge/1.21.5/55.0.0-installer.jar");
+        fs::create_dir_all(path.parent().expect("installer parent")).expect("installer parent");
+        fs::write(&path, b"corrupt installer").expect("corrupt cached installer");
+        let fresh_installer = installer_jar("fresh-installer");
+        let server = TestByteServer::start(fresh_installer.clone());
+
+        let (bytes, extracted) = read_valid_installer(&path, &server.url, "Forge")
+            .await
+            .expect("fresh installer");
+
+        assert_eq!(bytes, fresh_installer);
+        assert_eq!(extracted.version_id, "fresh-installer");
+        assert_eq!(
+            fs::read(&path).expect("cached fresh installer"),
+            fresh_installer
+        );
+        assert_eq!(server.request_count(), 1);
+
+        server.stop();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn fresh_invalid_installer_is_not_cached() {
+        let root = temp_dir("installer-cache-invalid-fresh");
+        let path = root.join("artifacts/forge/1.21.5/55.0.0-installer.jar");
+        let server = TestByteServer::start(b"not a zip".to_vec());
+
+        let error = read_valid_installer(&path, &server.url, "Forge")
+            .await
+            .expect_err("invalid provider installer");
+
+        match error {
+            LoaderError::InvalidProfile(message) => {
+                assert!(
+                    message.starts_with("extracting Forge installer: "),
+                    "{message}"
+                );
+                assert!(!message.contains(&server.url), "{message}");
+            }
+            error => panic!("expected invalid profile error, got {error:?}"),
+        }
+        assert_eq!(server.request_count(), 1);
+        assert!(!path.exists());
+
+        server.stop();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1325,6 +1388,21 @@ mod tests {
         zip::ZipWriter::new(&mut cursor)
             .finish()
             .expect("finish empty zip");
+        cursor.into_inner()
+    }
+
+    fn installer_jar(version_id: &str) -> Vec<u8> {
+        use zip::write::SimpleFileOptions;
+
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        let mut archive = zip::ZipWriter::new(&mut cursor);
+        archive
+            .start_file("version.json", SimpleFileOptions::default())
+            .expect("start version.json");
+        archive
+            .write_all(&profile_json(version_id))
+            .expect("write version.json");
+        archive.finish().expect("finish installer jar");
         cursor.into_inner()
     }
 

@@ -3,9 +3,10 @@ mod priority;
 mod supervisor;
 
 use croopor_launcher::{
-    LaunchEvent, LaunchFailure, LaunchFailureClass, LaunchLogEvent, LaunchPriorityEvidence,
-    LaunchSessionRecord, LaunchStageRecord, LaunchState, LaunchStatusEvent,
-    classify_startup_failure_text, launch_stage_label, launch_state_name,
+    LaunchEvent, LaunchFailure, LaunchFailureClass, LaunchLogEvent, LaunchNotice,
+    LaunchPriorityEvidence, LaunchSessionOutcomeKind, LaunchSessionRecord, LaunchStageEvidence,
+    LaunchStageRecord, LaunchState, LaunchStatusEvent, classify_startup_failure_text,
+    launch_notice_from_values, launch_stage_label, launch_state_name,
 };
 use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
@@ -16,6 +17,13 @@ use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, RwLock, broadcast};
 
 const MAX_GUARDIAN_STAGE_DETAILS: usize = 8;
+const MAX_STAGE_EVIDENCE: usize = 16;
+const MAX_STAGE_EVIDENCE_DETAILS: usize = 8;
+const MAX_STAGE_NOTE_CHARS: usize = 160;
+const MAX_NOTICE_MESSAGE_CHARS: usize = 180;
+const MAX_NOTICE_DETAIL_CHARS: usize = 240;
+const MAX_NOTICE_DETAILS: usize = 8;
+const PRIVATE_NOTICE_FALLBACK: &str = "Launch status details were hidden for privacy.";
 
 struct SessionEntry {
     record: LaunchSessionRecord,
@@ -25,6 +33,7 @@ struct SessionEntry {
     boot_completed: Arc<AtomicBool>,
     log_count: Arc<AtomicUsize>,
     observed_failure: Option<LaunchFailureClass>,
+    stop_requested: bool,
 }
 
 pub struct SessionStore {
@@ -67,6 +76,7 @@ impl SessionStore {
                 boot_completed: Arc::new(AtomicBool::new(false)),
                 log_count: Arc::new(AtomicUsize::new(0)),
                 observed_failure: None,
+                stop_requested: false,
             },
         );
         drop(sessions);
@@ -121,6 +131,7 @@ impl SessionStore {
             entry.startup_observed.store(true, Ordering::Relaxed);
             entry.log_count.fetch_add(1, Ordering::Relaxed);
             if classify::boot_marker_detected(&text) && record_boot_completion(entry, now_ms()) {
+                entry.observed_failure = None;
                 let pid = entry.record.pid;
                 match priority::promote_after_boot(pid) {
                     Ok(promotion) => {
@@ -153,6 +164,9 @@ impl SessionStore {
                     failure_detail: None,
                     healing: entry.record.healing.clone(),
                     guardian: entry.record.guardian.clone(),
+                    outcome: None,
+                    notice: None,
+                    evidence: Vec::new(),
                     stages: Vec::new(),
                 };
                 apply_status_update(entry, &mut status);
@@ -181,6 +195,22 @@ impl SessionStore {
             drop(sessions);
             self.notify_changed();
         }
+    }
+
+    pub async fn record_stage_evidence(
+        &self,
+        session_id: &str,
+        evidence: Vec<LaunchStageEvidence>,
+    ) -> Option<LaunchSessionRecord> {
+        let mut sessions = self.sessions.write().await;
+        let entry = sessions.get_mut(session_id)?;
+        ensure_stage_started(&mut entry.record, now_ms());
+        let evidence = sanitize_stage_evidence(evidence);
+        apply_stage_evidence(entry.record.stages.last_mut(), &evidence);
+        let record = entry.record.clone();
+        drop(sessions);
+        self.notify_changed();
+        Some(record)
     }
 
     pub async fn start_process(
@@ -232,6 +262,7 @@ impl SessionStore {
                 let previous_stages = entry.record.stages.clone();
                 let previous_benchmark = entry.record.benchmark.clone();
                 record.failure = None;
+                record.outcome = None;
                 let mut stored_record = record.clone();
                 stored_record.state = previous_state;
                 stored_record.stages = previous_stages;
@@ -246,6 +277,7 @@ impl SessionStore {
                 entry.boot_completed.store(false, Ordering::Relaxed);
                 entry.log_count.store(0, Ordering::Relaxed);
                 entry.observed_failure = None;
+                entry.stop_requested = false;
             } else {
                 let (events, _) = broadcast::channel(256);
                 sessions.insert(
@@ -262,6 +294,7 @@ impl SessionStore {
                         boot_completed: Arc::new(AtomicBool::new(false)),
                         log_count: Arc::new(AtomicUsize::new(0)),
                         observed_failure: None,
+                        stop_requested: false,
                     },
                 );
             }
@@ -279,6 +312,9 @@ impl SessionStore {
                 failure_detail: None,
                 healing: record.healing.clone(),
                 guardian: record.guardian.clone(),
+                outcome: None,
+                notice: None,
+                evidence: Vec::new(),
                 stages: Vec::new(),
             },
         )
@@ -305,12 +341,17 @@ impl SessionStore {
     }
 
     pub async fn kill(&self, session_id: &str) -> std::io::Result<()> {
-        let child = self
-            .sessions
-            .read()
-            .await
-            .get(session_id)
-            .and_then(|entry| entry.child.clone());
+        let child = {
+            let mut sessions = self.sessions.write().await;
+            let Some(entry) = sessions.get_mut(session_id) else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "session not found",
+                ));
+            };
+            entry.stop_requested = true;
+            entry.child.clone()
+        };
         if let Some(child) = child {
             child.lock().await.kill().await
         } else {
@@ -454,18 +495,44 @@ impl SessionStore {
 
 fn apply_status_update(entry: &mut SessionEntry, event: &mut LaunchStatusEvent) {
     let now = now_ms();
+    let previous_state = entry.record.state;
+    let next_state = classify::parse_launch_state(&event.state);
+    let parsed_failure_class = event
+        .failure_class
+        .as_deref()
+        .map(classify::parse_failure_class);
+    event.failure_detail = event
+        .failure_detail
+        .take()
+        .and_then(|detail| sanitize_public_notice_text(&detail, MAX_NOTICE_DETAIL_CHARS));
+    event.guardian = event.guardian.take().and_then(sanitize_public_json_value);
+    event.healing = event.healing.take().and_then(sanitize_public_json_value);
+    if event.outcome.is_none() {
+        event.outcome = entry.record.outcome.clone().or_else(|| {
+            classify::classify_session_outcome(classify::SessionOutcomeInput {
+                previous_state,
+                next_state,
+                boot_completed: entry.boot_completed.load(Ordering::Relaxed)
+                    || entry.record.boot_completed_at_ms.is_some(),
+                stop_requested: entry.stop_requested,
+                exit_code: event.exit_code,
+                failure_class: parsed_failure_class,
+            })
+        });
+    }
+
     update_stage_history(&mut entry.record, event, now);
 
-    entry.record.state = classify::parse_launch_state(&event.state);
+    entry.record.state = next_state;
     if event.pid.is_some() {
         entry.record.pid = event.pid;
     }
     if event.exit_code.is_some() {
         entry.record.exit_code = event.exit_code;
     }
-    if let Some(failure_class) = &event.failure_class {
+    if let Some(failure_class) = parsed_failure_class {
         entry.record.failure = Some(LaunchFailure {
-            class: classify::parse_failure_class(failure_class),
+            class: failure_class,
             detail: event.failure_detail.clone(),
         });
     }
@@ -479,6 +546,21 @@ fn apply_status_update(entry: &mut SessionEntry, event: &mut LaunchStatusEvent) 
         entry.record.benchmark = event.benchmark.clone();
     } else {
         event.benchmark = entry.record.benchmark.clone();
+    }
+    if let Some(outcome) = &event.outcome {
+        entry.record.outcome = Some(outcome.clone());
+    }
+    if event.notice.is_none() {
+        event.notice = launch_notice_from_values(
+            event.guardian.as_ref(),
+            event.healing.as_ref(),
+            event.outcome.as_ref(),
+            event.failure_detail.as_deref(),
+            None,
+        );
+    }
+    if let Some(notice) = event.notice.take() {
+        event.notice = Some(sanitize_launch_notice(notice));
     }
     event.stages = entry.record.stages.clone();
 }
@@ -535,12 +617,13 @@ fn ensure_stage_started(record: &mut LaunchSessionRecord, now: u64) {
     }
 }
 
-fn update_stage_history(record: &mut LaunchSessionRecord, event: &LaunchStatusEvent, now: u64) {
+fn update_stage_history(record: &mut LaunchSessionRecord, event: &mut LaunchStatusEvent, now: u64) {
     ensure_stage_started(record, now);
 
     let next_stage = event.state.as_str();
     let terminal_result = terminal_stage_result(event);
     let (warnings, fallback_reason) = stage_notes(event);
+    let evidence = sanitize_stage_evidence(std::mem::take(&mut event.evidence));
     let current_stage = record
         .stages
         .last()
@@ -552,6 +635,7 @@ fn update_stage_history(record: &mut LaunchSessionRecord, event: &LaunchStatusEv
             &warnings,
             fallback_reason.as_deref(),
         );
+        apply_stage_evidence(record.stages.last_mut(), &evidence);
         if let Some(result) = terminal_result {
             close_open_stage(record.stages.last_mut(), now, result);
         }
@@ -561,6 +645,7 @@ fn update_stage_history(record: &mut LaunchSessionRecord, event: &LaunchStatusEv
     let previous_result = terminal_result.unwrap_or("ok");
     close_open_stage(record.stages.last_mut(), now, previous_result);
     let mut next = start_stage(next_stage, now, Some(warnings), fallback_reason);
+    apply_stage_evidence(Some(&mut next), &evidence);
     if let Some(result) = terminal_result {
         close_open_stage(Some(&mut next), now, result);
     }
@@ -582,6 +667,7 @@ fn start_stage(
         result: None,
         warnings: warnings.unwrap_or_default(),
         fallback_reason,
+        evidence: Vec::new(),
     }
 }
 
@@ -600,7 +686,14 @@ fn close_open_stage(stage: Option<&mut LaunchStageRecord>, now: u64, result: &st
 fn terminal_stage_result(event: &LaunchStatusEvent) -> Option<&'static str> {
     match event.state.as_str() {
         "failed" => Some("failed"),
-        "exited" if event.failure_class.is_some() => Some("failed"),
+        "exited"
+            if event.failure_class.is_some()
+                || event.outcome.as_ref().is_some_and(|outcome| {
+                    matches!(outcome.kind, LaunchSessionOutcomeKind::Failed)
+                }) =>
+        {
+            Some("failed")
+        }
         "exited" => Some("exited"),
         _ => None,
     }
@@ -649,18 +742,19 @@ fn stage_notes(event: &LaunchStatusEvent) -> (Vec<String>, Option<String>) {
             healing
                 .get("fallback_applied")
                 .and_then(|value| value.as_str())
-                .filter(|value| !value.trim().is_empty())
-                .map(|value| value.trim().to_string())
+                .and_then(|value| sanitize_public_stage_text(value, MAX_STAGE_NOTE_CHARS))
         });
     (warnings, fallback_reason)
 }
 
 fn push_unique_warning(warnings: &mut Vec<String>, warning: &str) -> bool {
-    let warning = warning.trim();
-    if warning.is_empty() || warnings.iter().any(|existing| existing == warning) {
+    let Some(warning) = sanitize_public_stage_text(warning, MAX_STAGE_NOTE_CHARS) else {
+        return false;
+    };
+    if warnings.iter().any(|existing| existing == &warning) {
         return false;
     }
-    warnings.push(warning.to_string());
+    warnings.push(warning);
     true
 }
 
@@ -677,8 +771,139 @@ fn apply_stage_notes(
     }
     if stage.fallback_reason.is_none()
         && let Some(fallback_reason) = fallback_reason
+            .and_then(|value| sanitize_public_stage_text(value, MAX_STAGE_NOTE_CHARS))
     {
-        stage.fallback_reason = Some(fallback_reason.to_string());
+        stage.fallback_reason = Some(fallback_reason);
+    }
+}
+
+fn apply_stage_evidence(stage: Option<&mut LaunchStageRecord>, evidence: &[LaunchStageEvidence]) {
+    let Some(stage) = stage else {
+        return;
+    };
+    for evidence in evidence {
+        if stage
+            .evidence
+            .iter()
+            .any(|existing| existing.id == evidence.id && existing.system == evidence.system)
+        {
+            continue;
+        }
+        if stage.evidence.len() >= MAX_STAGE_EVIDENCE {
+            break;
+        }
+        stage.evidence.push(evidence.clone());
+    }
+}
+
+fn sanitize_stage_evidence(evidence: Vec<LaunchStageEvidence>) -> Vec<LaunchStageEvidence> {
+    evidence
+        .into_iter()
+        .filter_map(|evidence| {
+            let id = crate::observability::sanitize_evidence_token(
+                &evidence.id,
+                crate::observability::RedactionAudience::UserVisible,
+                64,
+            )?;
+            let system = crate::observability::sanitize_evidence_token(
+                &evidence.system,
+                crate::observability::RedactionAudience::UserVisible,
+                32,
+            )?;
+            let summary = crate::observability::sanitize_evidence_text(
+                &evidence.summary,
+                crate::observability::RedactionAudience::UserVisible,
+                160,
+            )?;
+            let details = evidence
+                .details
+                .into_iter()
+                .filter_map(|detail| {
+                    crate::observability::sanitize_evidence_text(
+                        &detail,
+                        crate::observability::RedactionAudience::UserVisible,
+                        120,
+                    )
+                })
+                .take(MAX_STAGE_EVIDENCE_DETAILS)
+                .collect();
+            Some(LaunchStageEvidence {
+                id,
+                system,
+                summary,
+                details,
+            })
+        })
+        .take(MAX_STAGE_EVIDENCE)
+        .collect()
+}
+
+fn sanitize_launch_notice(notice: LaunchNotice) -> LaunchNotice {
+    let message = sanitize_public_notice_text(&notice.message, MAX_NOTICE_MESSAGE_CHARS)
+        .unwrap_or_else(|| PRIVATE_NOTICE_FALLBACK.to_string());
+    let details = notice
+        .details
+        .into_iter()
+        .filter_map(|detail| sanitize_public_notice_text(&detail, MAX_NOTICE_DETAIL_CHARS))
+        .take(MAX_NOTICE_DETAILS)
+        .collect::<Vec<_>>();
+    let detail = details.first().cloned();
+    LaunchNotice {
+        message,
+        detail,
+        details,
+        tone: notice.tone,
+    }
+}
+
+fn sanitize_public_notice_text(value: &str, max_chars: usize) -> Option<String> {
+    crate::observability::sanitize_evidence_text(
+        value,
+        crate::observability::RedactionAudience::UserVisible,
+        max_chars,
+    )
+}
+
+fn sanitize_public_stage_text(value: &str, max_chars: usize) -> Option<String> {
+    crate::observability::sanitize_evidence_text(
+        value,
+        crate::observability::RedactionAudience::UserVisible,
+        max_chars,
+    )
+}
+
+fn sanitize_public_json_value(value: serde_json::Value) -> Option<serde_json::Value> {
+    match value {
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            Some(value)
+        }
+        serde_json::Value::String(value) => {
+            sanitize_public_notice_text(&value, MAX_NOTICE_DETAIL_CHARS)
+                .map(serde_json::Value::String)
+        }
+        serde_json::Value::Array(values) => {
+            let values = values
+                .into_iter()
+                .filter_map(sanitize_public_json_value)
+                .collect::<Vec<_>>();
+            Some(serde_json::Value::Array(values))
+        }
+        serde_json::Value::Object(values) => {
+            let mut sanitized = serde_json::Map::new();
+            for (key, value) in values {
+                let Some(key) = crate::observability::sanitize_evidence_token(
+                    &key,
+                    crate::observability::RedactionAudience::UserVisible,
+                    64,
+                ) else {
+                    continue;
+                };
+                if let Some(value) = sanitize_public_json_value(value) {
+                    sanitized.insert(key, value);
+                }
+            }
+            Some(serde_json::Value::Object(sanitized))
+        }
     }
 }
 
@@ -708,7 +933,7 @@ impl Default for SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use croopor_launcher::SessionId;
+    use croopor_launcher::{LaunchSessionExitReason, LaunchStageEvidence, SessionId};
     use serde_json::json;
     use std::sync::Arc;
     use tokio::process::Command;
@@ -739,6 +964,9 @@ mod tests {
                         "fallback_applied": "Guardian switched to managed Java before launch"
                     })),
                     guardian: None,
+                    outcome: None,
+                    notice: None,
+                    evidence: Vec::new(),
                     stages: Vec::new(),
                 },
             )
@@ -773,6 +1001,9 @@ mod tests {
                     failure_detail: Some("no startup activity observed".to_string()),
                     healing: None,
                     guardian: None,
+                    outcome: None,
+                    notice: None,
+                    evidence: Vec::new(),
                     stages: Vec::new(),
                 },
             )
@@ -827,6 +1058,9 @@ mod tests {
                             42
                         ]
                     })),
+                    outcome: None,
+                    notice: None,
+                    evidence: Vec::new(),
                     stages: Vec::new(),
                 },
             )
@@ -861,6 +1095,145 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn launch_status_public_notice_and_stage_notes_redact_sensitive_details() {
+        let store = SessionStore::new();
+        store.insert(test_record("guardian-stage-redaction")).await;
+
+        let mut receiver = store
+            .subscribe("guardian-stage-redaction")
+            .await
+            .expect("subscribe");
+        store
+            .emit_status(
+                "guardian-stage-redaction",
+                LaunchStatusEvent {
+                    state: "validating".to_string(),
+                    benchmark: None,
+                    pid: None,
+                    exit_code: None,
+                    failure_class: None,
+                    failure_detail: None,
+                    healing: Some(json!({
+                        "warnings": [
+                            "Healing added safe fallback context",
+                            r#"Fallback used C:\Users\Alice\.jdks\java.exe --accessToken raw-secret-token -Xmx8192M"#
+                        ],
+                        "fallback_applied": "provider_payload={\"token\":\"secret\"} account_id=account-secret username=SecretPlayer"
+                    })),
+                    guardian: Some(json!({
+                        "mode": "managed",
+                        "decision": "blocked",
+                        "message": "/home/alice/.minecraft/java.exe --accessToken raw-secret-token",
+                        "details": [
+                            "Review the latest game log before retrying",
+                            r#"Java failed at C:\Users\Alice\AppData\java.exe -Xmx8192M -Dtoken=raw"#,
+                            "provider_payload={\"token\":\"secret\"} account_id=account-secret username=SecretPlayer"
+                        ]
+                    })),
+                    outcome: None,
+                    notice: None,
+                    evidence: Vec::new(),
+                    stages: Vec::new(),
+                },
+            )
+            .await;
+
+        let emitted = receiver.recv().await.expect("status event");
+        let LaunchEvent::Status(status) = emitted else {
+            panic!("expected status event");
+        };
+        let notice = status.notice.as_ref().expect("public notice");
+        assert_eq!(notice.message, "Guardian blocked an unsafe launch setup.");
+        assert_eq!(
+            notice.details,
+            vec!["Review the latest game log before retrying."]
+        );
+        assert_eq!(
+            status.stages[1].warnings,
+            vec![
+                "Review the latest game log before retrying",
+                "Healing added safe fallback context",
+            ]
+        );
+        assert_eq!(status.stages[1].fallback_reason, None);
+
+        let stored = store
+            .get("guardian-stage-redaction")
+            .await
+            .expect("stored record");
+        assert_eq!(stored.stages[1].warnings, status.stages[1].warnings);
+        assert_eq!(stored.stages[1].fallback_reason, None);
+        assert_public_session_payload_excludes_sensitive_content(
+            &serde_json::to_string(&status).expect("status json"),
+        );
+        assert_public_session_payload_excludes_sensitive_content(
+            &serde_json::to_string(&stored.stages).expect("stage json"),
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_stage_history_merges_sanitized_stage_evidence() {
+        let store = SessionStore::new();
+        store.insert(test_record("stage-evidence")).await;
+
+        let mut receiver = store.subscribe("stage-evidence").await.expect("subscribe");
+        store
+            .emit_status(
+                "stage-evidence",
+                LaunchStatusEvent {
+                    state: "preparing".to_string(),
+                    benchmark: None,
+                    pid: None,
+                    exit_code: None,
+                    failure_class: None,
+                    failure_detail: None,
+                    healing: None,
+                    guardian: None,
+                    outcome: None,
+                    notice: None,
+                    evidence: vec![
+                        LaunchStageEvidence {
+                            id: "execution_launch_command_prepared".to_string(),
+                            system: "execution".to_string(),
+                            summary: "Execution prepared a runnable launch command.".to_string(),
+                            details: vec![
+                                "arg_count:3".to_string(),
+                                r"program:C:\Users\Alice\.jdks\java.exe".to_string(),
+                                "-Xmx8192M".to_string(),
+                            ],
+                        },
+                        LaunchStageEvidence {
+                            id: r"bad\path".to_string(),
+                            system: "execution".to_string(),
+                            summary: "/home/alice/.minecraft leaked".to_string(),
+                            details: vec!["token=secret".to_string()],
+                        },
+                    ],
+                    stages: Vec::new(),
+                },
+            )
+            .await;
+
+        let emitted = receiver.recv().await.expect("status event");
+        let LaunchEvent::Status(status) = emitted else {
+            panic!("expected status event");
+        };
+        assert_eq!(status.stages[1].evidence.len(), 1);
+        assert_eq!(
+            status.stages[1].evidence[0].id,
+            "execution_launch_command_prepared"
+        );
+        assert_eq!(status.stages[1].evidence[0].details, vec!["arg_count:3"]);
+
+        let stored = store.get("stage-evidence").await.expect("stored record");
+        let encoded = serde_json::to_string(&stored.stages).expect("stage json");
+        assert!(!encoded.contains("Alice"));
+        assert!(!encoded.contains("-Xmx"));
+        assert!(!encoded.contains("token"));
+        assert!(!encoded.contains("/home/"));
+    }
+
+    #[tokio::test]
     async fn launch_stage_history_ignores_allowed_empty_and_malformed_guardian_notes() {
         let store = SessionStore::new();
 
@@ -880,6 +1253,9 @@ mod tests {
                         "mode": "managed",
                         "decision": "allowed"
                     })),
+                    outcome: None,
+                    notice: None,
+                    evidence: Vec::new(),
                     stages: Vec::new(),
                 },
             )
@@ -906,6 +1282,9 @@ mod tests {
                         "decision": "blocked",
                         "details": []
                     })),
+                    outcome: None,
+                    notice: None,
+                    evidence: Vec::new(),
                     stages: Vec::new(),
                 },
             )
@@ -928,6 +1307,9 @@ mod tests {
                     failure_detail: None,
                     healing: None,
                     guardian: Some(json!("not an object")),
+                    outcome: None,
+                    notice: None,
+                    evidence: Vec::new(),
                     stages: Vec::new(),
                 },
             )
@@ -959,6 +1341,9 @@ mod tests {
                 "decision": "intervened",
                 "details": details
             })),
+            outcome: None,
+            notice: None,
+            evidence: Vec::new(),
             stages: Vec::new(),
         };
 
@@ -1003,6 +1388,9 @@ mod tests {
                     failure_detail: None,
                     healing: None,
                     guardian: None,
+                    outcome: None,
+                    notice: None,
+                    evidence: Vec::new(),
                     stages: Vec::new(),
                 },
             )
@@ -1101,6 +1489,10 @@ mod tests {
         let failure = stored.failure.expect("stored failure");
         assert_eq!(failure.class, LaunchFailureClass::JvmUnsupportedOption);
         assert_eq!(failure.detail, None);
+        assert_eq!(
+            stored.outcome.expect("stored outcome").reason,
+            LaunchSessionExitReason::StartupFailed
+        );
     }
 
     #[tokio::test]
@@ -1155,6 +1547,218 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn launch_external_close_after_boot_is_classified_cleanly() {
+        let store = SessionStore::new();
+        let session_id = "external-close-after-boot";
+        let mut record = test_record(session_id);
+        record.state = LaunchState::Starting;
+        record.process_started_at_ms = Some(now_ms().saturating_sub(1_000));
+        store.insert(record).await;
+
+        store
+            .emit_log(session_id, "stderr", "Unrecognized VM option '-XX:+UseZGC'")
+            .await;
+        assert_eq!(
+            store.observed_failure(session_id).await,
+            Some(LaunchFailureClass::JvmUnsupportedOption)
+        );
+
+        store
+            .emit_log(
+                session_id,
+                "stdout",
+                "[Render thread/INFO]: LWJGL Version: 3.3.3",
+            )
+            .await;
+        assert_eq!(store.observed_failure(session_id).await, None);
+
+        store
+            .emit_status(
+                session_id,
+                LaunchStatusEvent {
+                    state: "exited".to_string(),
+                    benchmark: None,
+                    pid: None,
+                    exit_code: Some(0),
+                    failure_class: None,
+                    failure_detail: None,
+                    healing: None,
+                    guardian: None,
+                    outcome: None,
+                    notice: None,
+                    evidence: Vec::new(),
+                    stages: Vec::new(),
+                },
+            )
+            .await;
+
+        let stored = store.get(session_id).await.expect("stored record");
+        assert_eq!(stored.failure, None);
+        assert_eq!(
+            stored.outcome.expect("stored outcome").reason,
+            LaunchSessionExitReason::ExternalUserClosed
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_terminal_statuses_emit_distinct_backend_outcomes_and_notices() {
+        let store = SessionStore::new();
+
+        let (preboot_status, preboot_record) = insert_and_emit_terminal_status(
+            &store,
+            terminal_record("preboot-crash", LaunchState::Starting, false),
+            terminal_status(Some(1), None, None),
+        )
+        .await;
+        assert_eq!(
+            preboot_record.outcome.expect("preboot outcome").reason,
+            LaunchSessionExitReason::CrashedBeforeBoot
+        );
+        assert_eq!(
+            preboot_status
+                .notice
+                .as_ref()
+                .map(|notice| notice.message.as_str()),
+            Some("Minecraft exited before startup completed.")
+        );
+        assert_eq!(
+            preboot_status.notice.as_ref().map(|notice| notice.tone),
+            Some(croopor_launcher::LaunchNoticeTone::Error)
+        );
+        assert_eq!(
+            preboot_status
+                .stages
+                .last()
+                .and_then(|stage| stage.result.as_deref()),
+            Some("failed")
+        );
+
+        let (stalled_status, stalled_record) = insert_and_emit_terminal_status(
+            &store,
+            terminal_record("startup-stalled", LaunchState::Monitoring, false),
+            terminal_status(
+                Some(-1),
+                Some("startup_stalled"),
+                Some("no startup activity observed"),
+            ),
+        )
+        .await;
+        assert_eq!(
+            stalled_record.outcome.expect("stalled outcome").reason,
+            LaunchSessionExitReason::StartupStalled
+        );
+        assert_eq!(
+            stalled_status
+                .notice
+                .as_ref()
+                .map(|notice| notice.message.as_str()),
+            Some("Minecraft did not finish startup in time.")
+        );
+        assert_eq!(
+            stalled_status
+                .notice
+                .as_ref()
+                .and_then(|notice| notice.detail.as_deref()),
+            Some("no startup activity observed.")
+        );
+
+        let (external_status, external_record) = insert_and_emit_terminal_status(
+            &store,
+            terminal_record("external-clean-close", LaunchState::Running, true),
+            terminal_status(Some(0), None, None),
+        )
+        .await;
+        assert_eq!(
+            external_record.outcome.expect("external outcome").reason,
+            LaunchSessionExitReason::ExternalUserClosed
+        );
+        assert_eq!(external_record.failure, None);
+        assert_eq!(external_status.notice, None);
+        let external_json = serde_json::to_string(&external_status).expect("external status json");
+        assert!(!external_json.to_ascii_lowercase().contains("crash"));
+
+        let launcher_stop_session = "launcher-stop";
+        let launcher_stop_record =
+            terminal_record(launcher_stop_session, LaunchState::Running, true);
+        store.insert(launcher_stop_record).await;
+        mark_stop_requested(&store, launcher_stop_session).await;
+        let mut receiver = store
+            .subscribe(launcher_stop_session)
+            .await
+            .expect("launcher stop subscription");
+        store
+            .emit_status(launcher_stop_session, terminal_status(Some(-9), None, None))
+            .await;
+        let launcher_stop_status = recv_status(&mut receiver).await;
+        let launcher_stop_record = store
+            .get(launcher_stop_session)
+            .await
+            .expect("launcher stop record");
+        assert_eq!(
+            launcher_stop_record
+                .outcome
+                .expect("launcher stop outcome")
+                .reason,
+            LaunchSessionExitReason::LauncherStopped
+        );
+        assert_eq!(launcher_stop_status.notice, None);
+        assert_eq!(
+            launcher_stop_status
+                .stages
+                .last()
+                .and_then(|stage| stage.result.as_deref()),
+            Some("exited")
+        );
+
+        let (postboot_status, postboot_record) = insert_and_emit_terminal_status(
+            &store,
+            terminal_record("postboot-crash", LaunchState::Running, true),
+            terminal_status(Some(1), None, None),
+        )
+        .await;
+        assert_eq!(
+            postboot_record.outcome.expect("postboot outcome").reason,
+            LaunchSessionExitReason::CrashedAfterBoot
+        );
+        assert_eq!(
+            postboot_status
+                .notice
+                .as_ref()
+                .map(|notice| notice.message.as_str()),
+            Some("Minecraft crashed after startup.")
+        );
+        assert_eq!(
+            postboot_status
+                .stages
+                .last()
+                .and_then(|stage| stage.result.as_deref()),
+            Some("failed")
+        );
+
+        let (unknown_status, unknown_record) = insert_and_emit_terminal_status(
+            &store,
+            terminal_record("unknown-exit", LaunchState::Starting, false),
+            terminal_status(Some(0), None, None),
+        )
+        .await;
+        assert_eq!(
+            unknown_record.outcome.expect("unknown outcome").reason,
+            LaunchSessionExitReason::UnknownExit
+        );
+        assert_eq!(
+            unknown_status
+                .notice
+                .as_ref()
+                .map(|notice| notice.message.as_str()),
+            Some("Minecraft exited and the launcher could not classify the reason.")
+        );
+        assert_eq!(
+            unknown_status.notice.as_ref().map(|notice| notice.tone),
+            Some(croopor_launcher::LaunchNoticeTone::Error)
+        );
+    }
+
+    #[tokio::test]
     async fn launch_running_status_without_boot_marker_does_not_record_boot_duration() {
         let store = SessionStore::new();
         let mut record = test_record("timeout-running");
@@ -1177,6 +1781,9 @@ mod tests {
                     failure_detail: None,
                     healing: None,
                     guardian: None,
+                    outcome: None,
+                    notice: None,
+                    evidence: Vec::new(),
                     stages: Vec::new(),
                 },
             )
@@ -1270,6 +1877,98 @@ mod tests {
         );
     }
 
+    async fn insert_and_emit_terminal_status(
+        store: &SessionStore,
+        record: LaunchSessionRecord,
+        status: LaunchStatusEvent,
+    ) -> (LaunchStatusEvent, LaunchSessionRecord) {
+        let session_id = record.session_id.0.clone();
+        store.insert(record).await;
+        let mut receiver = store.subscribe(&session_id).await.expect("subscribe");
+        store.emit_status(&session_id, status).await;
+        let status = recv_status(&mut receiver).await;
+        let record = store.get(&session_id).await.expect("stored record");
+        (status, record)
+    }
+
+    async fn recv_status(
+        receiver: &mut tokio::sync::broadcast::Receiver<LaunchEvent>,
+    ) -> LaunchStatusEvent {
+        match receiver.recv().await.expect("status event") {
+            LaunchEvent::Status(status) => status,
+            other => panic!("expected status event, got {other:?}"),
+        }
+    }
+
+    async fn mark_stop_requested(store: &SessionStore, session_id: &str) {
+        let mut sessions = store.sessions.write().await;
+        let entry = sessions
+            .get_mut(session_id)
+            .expect("session should exist for stop intent");
+        entry.stop_requested = true;
+    }
+
+    fn terminal_record(
+        session_id: &str,
+        state: LaunchState,
+        boot_completed: bool,
+    ) -> LaunchSessionRecord {
+        let mut record = test_record(session_id);
+        record.state = state;
+        record.process_started_at_ms = Some(now_ms().saturating_sub(1_000));
+        if boot_completed {
+            record.boot_completed_at_ms = Some(now_ms().saturating_sub(100));
+            record.boot_duration_ms = Some(900);
+        }
+        record
+    }
+
+    fn terminal_status(
+        exit_code: Option<i32>,
+        failure_class: Option<&str>,
+        failure_detail: Option<&str>,
+    ) -> LaunchStatusEvent {
+        LaunchStatusEvent {
+            state: "exited".to_string(),
+            benchmark: None,
+            pid: None,
+            exit_code,
+            failure_class: failure_class.map(ToOwned::to_owned),
+            failure_detail: failure_detail.map(ToOwned::to_owned),
+            healing: None,
+            guardian: None,
+            outcome: None,
+            notice: None,
+            evidence: Vec::new(),
+            stages: Vec::new(),
+        }
+    }
+
+    fn assert_public_session_payload_excludes_sensitive_content(data: &str) {
+        for fragment in [
+            "/home/alice",
+            "/home/",
+            r"C:\Users",
+            "AppData",
+            "java.exe",
+            "--accessToken",
+            "-Xmx8192M",
+            "-Dtoken",
+            "raw-secret",
+            "provider_payload",
+            "account_id",
+            "account-secret",
+            "username",
+            "SecretPlayer",
+            "token\":\"secret",
+        ] {
+            assert!(
+                !data.contains(fragment),
+                "public session payload leaked fragment {fragment:?}: {data}"
+            );
+        }
+    }
+
     fn test_record(session_id: &str) -> LaunchSessionRecord {
         LaunchSessionRecord {
             session_id: SessionId(session_id.to_string()),
@@ -1290,6 +1989,7 @@ mod tests {
             failure: None,
             healing: None,
             guardian: None,
+            outcome: None,
             stages: Vec::new(),
         }
     }

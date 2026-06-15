@@ -1,226 +1,252 @@
 # Guardian Architecture
-Guardian is the launch-safety authority. It exists so launch policy lives in one place instead of being spread across runtime resolution, JVM tuning, validation, route handlers, Healing, and frontend copy.
+Guardian is Croopor's horizontal safety intelligence layer. It exists so the launcher can keep working when runtime configuration, downloads, local state, performance state, connectivity, or user overrides are messy, without scattering safety policy across route handlers, Execution primitives, Performance helpers, Healing copy, session heuristics, and frontend code.
+
+Guardian is not only a launch-time checker. It is the safety authority that receives facts from the rest of the backend, diagnoses risk, chooses the allowed safety action, orchestrates lower-level repair systems, records evidence, and emits bounded user-facing outcomes. Self-healing is a Guardian subsystem, not a separate top-level policy authority.
 
 ## Goal
-Guardian answers one question:
+For every safety-relevant operation phase, Guardian answers:
 
-`given the launch request, observed facts, and the configured safety mode, what is the single launch-safety decision?`
+`given the request, observed facts, ownership, failure memory, current operation context, and configured safety mode, what safety decision protects the user and keeps the app functional?`
 
-That decision must cover:
-- whether launch is allowed
-- whether Guardian may intervene
-- which intervention is allowed
-- whether launch must be blocked
-- what guidance or intervention summary the user should see
+That decision covers:
+- whether the operation is allowed
+- whether Guardian may warn, intervene, repair, retry, degrade, roll back, suppress, or block
+- which lower-level subsystem is allowed to execute the action
+- what evidence must be recorded
+- what public summary or notice the user should see
+- why Guardian did not act when a safety-relevant failure occurred
 
-## Scope
-Guardian v1 is launch-only.
+## Layer Model
+Guardian has a foot in every backend system, but it should not absorb every implementation detail.
 
-It owns:
-- pre-launch safety decisions
-- startup-recovery eligibility
-- intervention summaries and user guidance
-- the meaning of `managed` vs `custom`
-- basic launch memory-pressure warnings
-- warnings when the selected minimum memory is clamped down to the effective maximum memory
-- warnings when the effective maximum memory allocation is very low for Minecraft startup
-- conservative launch concurrency, measured CPU load, install/download pressure, and low-disk-space warnings
-- custom-mode warnings for risky manual launch overrides
+- Application owns command staging, operation identity, route orchestration, and command result shape.
+- Execution owns primitive facts and concrete effects: file, download, JVM, runtime, process, and launch effects.
+- Performance owns performance plan resolution, health, composition state, rollback snapshots, and performance operation execution.
+- State owns live/durable sessions, operation journals, failure memory, and proof state.
+- Observability owns evidence tiers, redaction, local proof records, and any future telemetry-safe export boundary.
+- Interface/API owns DTO and view-model boundaries that let the frontend render without reconstructing policy.
+- Frontend owns draft UI state, event wiring, and rendering backend-authored states, actions, notices, and progress.
+- Guardian owns safety diagnosis, action selection, self-healing orchestration, public safety outcomes, and safety non-intervention reasons.
 
-It does not yet own:
-- install policy
-- active install/download scheduling policy
-- broader measured multi-instance resource coordination
-- updater safety
-- OS/process safety outside the launch flow
+Guardian coordinates those systems through structured facts and bounded actions. It should not become a giant list of route-local conditionals, and lower layers should not smuggle product safety decisions back into helpers.
+
+## Current Implemented Surface
+Guardian currently has working proof across these areas:
+
+- launch/runtime/JVM preflight facts for undefined, null, empty, missing, incompatible, and bad custom Java overrides
+- malformed or unsupported JVM argument and preset facts
+- launch readiness facts for missing metadata, incomplete install markers, missing jars/libraries/assets, and managed-runtime readiness
+- managed-runtime ready-marker repair before session creation when ownership, journal, postcondition, and failure-memory gates allow it
+- memory, CPU, concurrent launch, active install/download, low disk, and Custom override warnings
+- startup stall, pre-boot exit, crash-after-boot, clean external close, and launcher-stop session outcome separation
+- one startup recovery attempt when the target and failure memory allow it
+- install/download artifact evidence for checksum, size, missing-artifact, metadata, provider, network, permission, ownership, temp-write, promote, and success facts
+- one-shot launcher-managed artifact repair when checksum, size, or missing selected-artifact facts exactly match a private selected descriptor
+- install repair outcome journaling and failure-memory suppression
+- performance facts for invalid rules, degraded/fallback/invalid health, user-owned conflicts, repeated failures, and rollback availability
+- public/exportable redaction for Guardian outcomes, launch notices, session status/events, install status/events, operation status, performance health/status, operation journals, and local proof exports
+
+Not every domain has a specialized automatic repair workflow yet. When Guardian does not have a specific workflow, it still owns the safety interpretation if the issue crosses a safety boundary: it should cushion damage by producing a bounded block, warning, degraded state, retry suppression, or user-facing notice rather than letting raw errors or frontend guesses escape.
 
 ## Modes
-
 ### Managed
 Intent:
-- the launcher protects the user from technical mistakes
+- the launcher actively protects the user from technical mistakes and damaged launcher-managed state
 
 Policy:
-- Guardian may replace an incompatible Java override with managed Java
+- Guardian may replace incompatible Java overrides with managed Java
 - Guardian may strip fatal raw JVM args
 - Guardian may downgrade or disable unsafe GC/preset choices
-- Guardian may allow one startup recovery when launch fails during the startup window
-- Guardian must log what it changed
+- Guardian may repair launcher-managed runtime and artifact state when ownership and postcondition gates pass
+- Guardian may allow one bounded startup recovery when the startup window fails
+- Guardian may degrade or fall back when Performance marks that path safe
+- Guardian must journal what it changed and emit bounded public copy
 
 ### Custom
 Intent:
-- the launcher respects explicit technical choices and only blocks guaranteed-fatal setups
+- the launcher respects explicit technical choices while still enforcing hard safety invariants
 
 Policy:
-- Guardian does not silently change explicit launch intent
-- Guardian warns when explicit Java, JVM preset, or raw JVM argument overrides will be preserved
+- Guardian does not silently mutate explicit user intent
+- Guardian warns when explicit Java, JVM preset, or raw JVM argument overrides are preserved
 - Guardian blocks guaranteed-fatal override combinations before spawn
-- Guardian blocks explicit named JVM presets before spawn when the selected runtime is known not to support the flags emitted by that preset
-- Guardian returns guidance instead of auto-healing explicit unsafe choices
-- valid explicit overrides still pass unchanged
+- Guardian blocks explicit named JVM presets before spawn when the selected runtime is known not to support the emitted flags
+- Guardian can cushion unsafe Custom state with guidance, bounded errors, or non-destructive checks
+- automatic mutation of user-owned or unknown-owned state is not allowed
 
-## Authority model
+### Disabled
+Intent:
+- the user has explicitly opted out of normal Guardian intervention
 
-### What Guardian owns
-- policy
-- intervention eligibility
-- block/allow/intervene decision
-- user-facing safety outcome
+Policy:
+- Guardian does not perform normal repair or warning interventions
+- hard invariants still block unsafe unjournaled mutation, user-owned destructive repair, or unredacted public output
+- safety-relevant non-intervention should still be explainable in local evidence when possible
 
-### What lower layers should do
-- `core/minecraft runtime`: discover requested/effective runtimes, report facts, install managed runtime when asked
-- `core/launcher jvm`: compute preset/JVM args from a chosen policy outcome
-- `core/launcher validation`: report why a requested configuration is incompatible
-- `core/launcher healing`: format compatibility and recovery summaries after Guardian-approved actions
-- `apps/api session store`: capture running-process facts, store only bounded startup failure class observations, and preserve Guardian-authored stage telemetry details
-- `frontend`: render the backend-authored Guardian outcome
+## Decision Loop
+Guardian decisions follow the same shape even when a domain has only partial workflow coverage:
 
-Lower layers should not decide:
-- whether a user override should be respected
-- whether an intervention is allowed
-- whether an incompatibility should be auto-fixed or blocked
+1. Fact intake
+   Lower systems emit structured facts with source, phase, ownership, target, evidence fields, and sensitivity.
 
-## Core data model
+2. Diagnosis
+   Guardian maps facts into diagnoses with domain, diagnosis id, confidence, severity, ownership, and public reason templates.
 
+3. Risk and action pressure
+   Guardian combines severity, confidence, blast radius, reversibility, ownership, user intent, operation phase, mode, and failure memory into an action decision.
+
+4. Action selection
+   Guardian chooses allow, warn, intervene, repair, retry, degrade, rollback, suppress, ask, or block. Unsupported or unsafe actions become bounded warnings/blocks instead of improvised mutation.
+
+5. Plan and ownership gates
+   Any mutating plan must have launcher-managed or composition-managed ownership, an operation journal, a rollback/quarantine/postcondition story where applicable, redaction-ready public output, and loop-control checks.
+
+6. Execution by lower layer
+   Execution, Performance, runtime, install, or process helpers perform the concrete effect. Guardian authorizes; lower layers execute.
+
+7. Verification and memory
+   The postcondition is checked, the operation journal records success/failure/block/suppression, and failure memory prevents repeated destructive or useless loops.
+
+8. Public outcome
+   Guardian emits bounded message/details, intervention summaries, or non-intervention reasons. Raw paths, Java paths, JVM args, command lines, provider payloads, account ids, usernames, tokens, server addresses, and token-like strings do not cross public or exportable boundaries.
+
+## Core Data Model
 ### Inputs
-Guardian should reason from explicit facts, not implicit booleans:
-- Guardian mode
-- explicit Java override present
-- explicit preset present
-- explicit raw JVM args present
-- origin of each override: global or instance
-- required Java major/runtime facts
-- effective runtime facts
-- target Minecraft version, loader component, and modded state from installed version metadata
-- requested preset and computed preset facts
-- host memory total and active launch allocation
-- selected raw minimum memory and effective maximum memory
-- effective maximum memory allocation threshold facts
-- CPU thread count, active launch count, and best-effort CPU load averages
-- active install/download session count
-- startup failure observations
+Guardian reasons from explicit facts:
+- Guardian mode and operation phase
+- command kind and operation id
+- ownership class for every target
+- explicit Java override presence and origin
+- explicit JVM preset and raw JVM args presence and origin
+- required Java major/update facts
+- effective runtime facts and managed-runtime readiness
+- target Minecraft version, loader component, and modded state from installed metadata
+- selected memory bounds and host resource observations
+- active launch, install/download, and performance operation pressure
+- launch readiness diagnostics
+- startup observations: boot marker, log evidence, exit code, stall, clean stop, launcher stop
+- download/install facts and private selected launcher-managed descriptors
+- performance rules, composition, health, rollback, and failure-memory facts
+- prior attempts and suppression windows
+- redaction readiness for any public/exportable output
 
-### Output
-Guardian should produce one normalized outcome for the pipeline:
-- decision: `allowed | warned | intervened | blocked`
-- message: concise backend-authored user-facing summary for non-allowed outcomes
-- details: backend-authored user-facing details for interventions, warnings, or blocked guidance
-- interventions: list of concrete actions applied
-- guidance: user-facing fix guidance when blocked
-- optional approved recovery plan
+### Outputs
+Guardian outputs normalized safety results:
+- decision: `allowed | warned | intervened | blocked | suppressed | repaired | degraded | rollback`
+- diagnosis ids and confidence/severity
+- action plan and prerequisite metadata
+- ownership and target descriptors
+- operation/journal ids when a mutation or repair is involved
+- user-facing `message`, ordered `details`, optional guidance, and intervention summary
+- evidence for why Guardian acted or did not act
 
-## Current pipeline role
+## Self-Healing
+Self-healing is the Guardian subsystem that turns an approved action plan into a bounded repair attempt.
 
-### Pre-launch
-1. Route builds `LaunchIntent` with explicit target Minecraft version, loader component, and modded state from the installed version scan
-2. `LaunchGuardianContext` is assembled from config + instance overrides
-3. preparation captures selected memory bounds, host resource observations, active launch/install counts, CPU thread/load observations, and launch-relevant disk free space as Guardian warning facts
-4. preparation gathers runtime and override facts
-5. Guardian evaluates those facts
-6. Guardian either:
-   - allows launch unchanged
-   - warns when the selected minimum memory is higher than the effective maximum and is clamped
-   - warns when the effective maximum memory allocation is below the conservative 2 GB startup threshold
-   - warns when launch is allowed but memory headroom is tight
-   - warns when concurrent launches may saturate the CPU
-   - warns when measured host CPU load already indicates saturated CPU headroom
-   - warns when active install/download work may add disk or network pressure during startup
-   - warns when launch-relevant storage has less than the conservative free-space headroom
-   - warns in Custom mode when risky manual overrides are preserved
-   - blocks Custom-mode explicit named JVM presets that would emit known unsupported flags for the selected runtime
-   - intervenes and mutates attempt overrides
-   - blocks and returns guidance
+It owns:
+- repair plan validation
+- ownership gates
+- journal requirements
+- rollback/quarantine/postcondition requirements
+- failure-memory loop control
+- public repair outcome shape
 
-### Startup failure
-1. Session layer reports observations about exit/stall/log output and stores only Guardian-classified startup failure classes
-2. runner keeps the session observation plumbing and maps `stalled`/`exited` observations into bounded Guardian startup-failure facts
-3. Guardian decides whether startup recovery is allowed from the explicit target Minecraft version, not from raw loader version ids
-4. if allowed, the launch runner executes the Guardian-approved recovery action and Healing records supporting retry/fallback detail
-5. if not allowed, Guardian converts the startup observation into a blocked message, details, and guidance before the runner emits terminal launch failure status
+It orchestrates:
+- managed-runtime ready-marker repair
+- selected launcher-managed artifact quarantine/redownload/promote
+- selected missing launcher-managed artifact download/promote
+- performance fallback/degraded decisions and rollback eligibility through the Performance system
 
-## Guardian and Healing
-Healing is narrower than Guardian.
+It does not own raw provider selection, arbitrary file deletion, user-owned file mutation, or unbounded retry loops.
 
-Healing is responsible for:
-- summarizing compatibility adjustments
-- recording supporting retry/fallback summaries for Guardian-approved recovery plans
-- emitting healing events/details for UI/logs
+## Launch Runtime And JVM
+Runtime, JVM, and launch preparation code emit facts and provide execution hooks. Guardian decides whether to keep a requested runtime, switch to managed runtime, strip or preserve raw JVM args, disable custom GC, downgrade a preset, warn, repair, or block.
 
-Healing is not supposed to decide:
-- whether recovery is allowed
-- whether manual overrides should be respected
-- whether the launcher should intervene in managed/custom mode
+Launch preparation remains backend-owned. The frontend does not decide readiness, compute effective memory policy, classify Java/JVM failures, choose Guardian/Healing precedence, or synthesize crash warnings.
 
-The target architecture is:
+## Session Outcomes
+Session code collects observations and preserves bounded history. It distinguishes:
+- clean external close after boot
+- launcher stop
+- startup crash before boot
+- startup stall
+- crash after boot
+- unknown or failed exits
 
-```mermaid
-flowchart LR
-    A[Launch facts] --> B[Guardian]
-    B -->|allowed| C[launch unchanged]
-    B -->|intervened| D[approved intervention plan]
-    D --> E[Healing/runtime/JVM execution helpers]
-    B -->|blocked| F[user guidance + failure response]
-```
+Guardian owns the safety interpretation when those observations affect user-facing outcomes. Closing Minecraft through the game window after startup is a clean `ExternalUserClosed` outcome and does not produce a crash warning unless the backend explicitly authors a notice.
 
-## Guardian and runtime resolution
-Runtime resolution should become fact-oriented.
+## Install And Download
+Install/download systems emit redacted facts and keep private selected descriptors for repair planning. Public install progress/status/events are sanitized at the API boundary.
 
-Desired split:
-- runtime code answers:
-  - what Java was requested
-  - what Java was found
-  - what managed Java is available
-  - whether the requested runtime matches required major/update constraints
-- Guardian answers:
-  - do we keep the requested runtime
-  - do we switch to managed runtime
-  - do we block in custom mode
+Guardian can repair only launcher-managed artifacts when the failed fact exactly matches a private selected descriptor and ownership/postcondition gates pass. Metadata, provider, network, permission, ownership, temp-write, promote, and success facts do not trigger automatic artifact repair today; they still produce bounded evidence and public failures rather than raw provider or filesystem output.
 
-## Guardian and session heuristics
-Session heuristics are still needed, but they should be treated as observations:
-- log lines observed
-- boot markers seen
-- process exited
-- exit code
-- classified failure signals
+## Performance
+Performance owns plan resolution, health, composition locks, managed artifact mutation, rollback snapshots, and queued performance operations.
 
-Guardian should own the interpretation of those observations when they affect launch-safety outcomes.
+Guardian consumes Performance facts for invalid remote rules, degraded or fallback health, invalid ownership, repeated failure, and rollback availability. Guardian can recommend or record degraded/fallback/rollback-safe states, but concrete composition mutation stays in Performance and must respect composition-managed ownership.
 
-## Frontend contract
-The frontend should not decide which authority wins between Guardian and Healing.
+## Observability, Redaction, And Telemetry
+Observability is the redaction and evidence boundary.
 
-The preferred shape is:
-- Guardian outcome is primary
-- Healing is supporting detail inside or alongside the Guardian outcome
-- UI copy is backend-authored as much as possible through `guardian.message` and `guardian.details`
+Evidence tiers are:
+- internal local
+- user visible
+- exportable proof
+- optional telemetry export
 
-Current launcher behavior:
-- `GET /api/v1/launch/preflight/{instance_id}` returns a read-only Guardian preflight. It reuses launch preparation fact gathering for effective memory, Guardian-owned memory clamp, low-allocation, resource pressure, and Custom override warnings, Guardian mode, and override origins, but it does not launch Minecraft, create a session, install files, ensure instance layout, write proof state, or expose paths, command lines, raw JVM args, account names, usernames, or tokens. InstanceDetail does not currently render a persistent preflight panel; launch safety is surfaced through launch/install affordances and backend-authored launch outcome notices.
-- Launch routes return HTTP `422 Unprocessable Entity` when a launch request fails because Guardian authored a `blocked` decision. The response body keeps the normal bounded launch-error JSON shape with Guardian details; non-Guardian launch request failures remain server errors unless a route has a more specific status.
-- Guardian `message` is preferred for launch notices when present
-- blocked Guardian `details` include the bounded backend-authored failure reason before guidance when one is available
-- Guardian `details` are preferred over frontend-synthesized intervention/guidance copy
-- when `details` is absent, actionable Guardian `guidance` or `interventions[].detail` still count as backend-authored notice details and are ordered before frontend fallback details
-- startup `stalled` and pre-startup `exited` observations keep session plumbing as fact collection, but the terminal blocked summary and user guidance are Guardian-authored before launch failure status is emitted
-- `guidance` and `interventions` remain serialized as current bounded diagnostics
-- Healing remains supporting detail for runtime-adjustment specifics and retry/fallback context when Guardian has not already authored actionable `blocked`, `warned`, or `intervened` notice details
-- live launch stage records preserve bounded unique Guardian `details` for `warned`, `intervened`, and `blocked` status payloads before appending Healing warnings without duplicates; Healing `fallback_applied` remains the only source of stage fallback reasons
-- normal frontend launches do not run a separate pre-launch memory-pressure confirmation; backend preparation selects effective memory, Guardian owns memory warnings, and successful launch responses carry the selected `max_memory_mb` and `min_memory_mb`
+Current code has local evidence and exportable proof records. The config contains `telemetry_enabled` as a disabled-by-default consent flag only; there is no current upload pipeline or remote diagnostics channel. Any future telemetry must export sanitized evidence and cannot be required for local Guardian behavior.
+
+Public and exportable output must not expose raw:
+- tokens
+- account identifiers
+- usernames unless intentionally bounded
+- filesystem paths
+- Java paths
+- JVM args
+- command lines
+- provider payloads
+- server addresses
+- token-like strings
+
+## Frontend Contract
+The frontend renders backend-authored safety state.
+
+It may:
+- keep draft form state
+- submit commands
+- subscribe to progress/status streams
+- render backend actions, view models, notices, and details
+- show optimistic presentation only where the backend contract explicitly allows it
+
+It must not:
+- decide launch readiness
+- classify exits
+- parse raw JVM args for policy
+- choose whether Guardian or Healing wins
+- infer install/download repair status
+- decide performance health or rollback policy
+- turn raw diagnostics into user-facing copy
 
 ## Invariants
-- one launch-safety authority: Guardian
-- one user-facing safety decision per launch phase
-- explicit managed/custom semantics
-- no hidden intervention without a logged summary
-- no frontend reinterpretation of policy when backend already decided it
+- Guardian is the single safety authority.
+- Self-healing is a Guardian subsystem.
+- Lower systems emit facts and execute approved effects; they do not own product safety decisions.
+- Frontend renders backend-authored policy.
+- No automatic mutation happens without known owned state, journaling, redaction, and loop control.
+- Unknown ownership is treated as user-owned.
+- Public/exportable diagnostics are redacted before crossing the boundary.
+- Every Guardian intervention records evidence, diagnosis, confidence, severity, ownership, action, outcome, and user-facing summary.
+- Every non-intervention in a safety-relevant failure should be explainable by mode, ownership, unsupported action, low confidence, suppression, or missing safe workflow.
 
-## Known gaps
-- some policy still leaks into runtime/prepare/Healing/session heuristics, while the preflight API can return bounded Guardian-authored warning summaries from backend-captured facts instead of requiring frontend-inferred launch-safety copy
-- `warned` now covers min-memory clamp, very low launch allocation, memory pressure, conservative CPU/load/install/disk pressure, and Custom-mode risky overrides, but broader warning-only launch-safety paths are not normalized yet
-- the API still exposes Guardian and Healing as separate top-level payload pieces, though Guardian now carries normalized message/details and session stage telemetry preserves those details
+## Known Boundaries
+- Session startup/failure inference still depends on log and process observations, but those are facts, not policy.
+- Automatic install repair is currently specific to selected launcher-managed checksum/size/missing-artifact cases.
+- Performance artifact publisher signature verification is not implemented.
+- Optional telemetry upload is not implemented.
 
-## Change rule
-If Guardian behavior, authority boundaries, or the launch pipeline change, update:
+## Change Rule
+If Guardian behavior, authority boundaries, self-healing, redaction, launch/session safety, install repair, performance safety, or frontend safety rendering changes, update:
 - `docs/GUARDIAN-ARCHITECTURE.md`
 - `docs/ARCHITECTURE.md`
+- any affected subsystem architecture doc or ADR
 - any user-facing copy that describes Guardian mode behavior

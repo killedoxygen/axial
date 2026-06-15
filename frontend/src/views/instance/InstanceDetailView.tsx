@@ -130,14 +130,15 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
   const activeTab: Tab = !showModsTab && tab === 'mods' ? 'overview' : tab;
   const visibleTabs = showModsTab ? TABS : TABS.filter((t) => t.id !== 'mods');
   const mcVer = minecraftVersionLabel(v);
-  const canLaunch = Boolean(v?.launchable ?? inst.launchable);
+  const launchAction = inst.launch_action;
   const installStatus = instanceInstallStatus(inst, v);
   const installTarget = installStatus.target;
   const installProgress = installStatus.progress;
   const installQueued = installStatus.state === 'queued';
   const matchingInstallFailure = installStatus.failure;
   const installLabel = installStatus.label;
-  const installLocked = !canLaunch && (installStatus.installing || Boolean(matchingInstallFailure));
+  const installLocked =
+    launchAction.primary_action === 'install' && (installStatus.installing || Boolean(matchingInstallFailure));
 
   const onPlay = (): void => {
     selectInstance(inst.id);
@@ -220,7 +221,7 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
               ) : (
                 <LaunchSplitButton
                   inst={inst}
-                  canLaunch={canLaunch}
+                  launchAction={launchAction}
                   installQueued={installQueued}
                   installProgress={installProgress}
                   onLaunch={onPlay}

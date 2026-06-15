@@ -1,8 +1,10 @@
 use crate::logging::timestamp_utc;
+use crate::observability::{RedactionAudience, sanitize_evidence_text, sanitize_evidence_token};
 use croopor_config::AppPaths;
 use croopor_launcher::{
     GuardianSummary, LaunchHealingSummary, LaunchIntent, LaunchPriorityEvidence,
-    LaunchSessionRecord, LaunchStageRecord, launch_state_name,
+    LaunchSessionOutcome, LaunchSessionRecord, LaunchStageEvidence, LaunchStageRecord,
+    launch_state_name,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -37,6 +39,8 @@ pub struct LaunchProofRecord {
     pub launched_at: String,
     pub recorded_at: String,
     pub outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_outcome: Option<LaunchSessionOutcome>,
     pub scenario: LaunchProofScenario,
     pub device: LaunchProofDevice,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -72,6 +76,8 @@ pub struct LaunchProofExport {
     pub launched_at: String,
     pub recorded_at: String,
     pub outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_outcome: Option<LaunchSessionOutcome>,
     pub scenario: LaunchProofScenario,
     pub device: LaunchProofDevice,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -109,6 +115,17 @@ pub struct LaunchProofStageExport {
     pub warnings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fallback_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<LaunchProofStageEvidenceExport>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct LaunchProofStageEvidenceExport {
+    pub id: String,
+    pub system: String,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub details: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -406,6 +423,7 @@ impl LaunchProofExport {
             launched_at: sanitized_required_token(&record.launched_at, "unknown"),
             recorded_at: sanitized_required_token(&record.recorded_at, "unknown"),
             outcome: sanitized_required_token(&record.outcome, "unknown"),
+            session_outcome: record.session_outcome.clone(),
             scenario: sanitized_export_scenario(&record.scenario),
             device: sanitized_export_device(&record.device),
             resource_budget: record.resource_budget.clone(),
@@ -466,25 +484,39 @@ fn sanitized_export_device(device: &LaunchProofDevice) -> LaunchProofDevice {
 }
 
 fn sanitized_stage(stage: &LaunchStageRecord) -> LaunchProofStageExport {
-    let stage_name = sanitized_required_token(&stage.stage, "unknown");
+    let stage = sanitized_stage_record(stage);
     LaunchProofStageExport {
-        stage: stage_name.clone(),
-        label: sanitized_bounded_text(&stage.label).unwrap_or_else(|| stage_name.clone()),
+        stage: stage.stage,
+        label: stage.label,
         started_at_ms: stage.started_at_ms,
         ended_at_ms: stage.ended_at_ms,
         duration_ms: stage.duration_ms,
-        result: stage.result.as_deref().and_then(sanitized_optional_token),
-        warnings: stage
-            .warnings
+        result: stage.result,
+        warnings: stage.warnings,
+        fallback_reason: stage.fallback_reason,
+        evidence: stage
+            .evidence
             .iter()
-            .filter_map(|warning| sanitized_bounded_text(warning))
+            .filter_map(sanitized_stage_evidence)
             .take(MAX_EXPORT_DETAILS)
             .collect(),
-        fallback_reason: stage
-            .fallback_reason
-            .as_deref()
-            .and_then(sanitized_bounded_text),
     }
+}
+
+fn sanitized_stage_evidence(
+    evidence: &LaunchStageEvidence,
+) -> Option<LaunchProofStageEvidenceExport> {
+    Some(LaunchProofStageEvidenceExport {
+        id: sanitized_optional_token(&evidence.id)?,
+        system: sanitized_optional_token(&evidence.system)?,
+        summary: sanitized_bounded_text(&evidence.summary)?,
+        details: evidence
+            .details
+            .iter()
+            .filter_map(|detail| sanitized_bounded_text(detail))
+            .take(MAX_EXPORT_DETAILS)
+            .collect(),
+    })
 }
 
 fn sanitized_guardian(value: &Value) -> Option<GuardianSummary> {
@@ -575,108 +607,19 @@ fn sanitized_required_token(value: &str, fallback: &str) -> String {
 }
 
 fn sanitized_optional_token(value: &str) -> Option<String> {
-    let value = value.trim();
-    if value.is_empty()
-        || value.chars().any(char::is_control)
-        || value.chars().count() > MAX_EXPORT_TOKEN_CHARS
-        || export_text_looks_sensitive(value)
-        || !value.chars().all(|value| {
-            value.is_ascii_alphanumeric() || matches!(value, '-' | '_' | '.' | '+' | ':')
-        })
-    {
-        return None;
-    }
-
-    Some(value.to_string())
+    sanitize_evidence_token(
+        value,
+        RedactionAudience::ExportableProof,
+        MAX_EXPORT_TOKEN_CHARS,
+    )
 }
 
 fn sanitized_bounded_text(value: &str) -> Option<String> {
-    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if value.is_empty()
-        || value.chars().any(char::is_control)
-        || value.chars().count() > MAX_EXPORT_DETAIL_CHARS
-        || export_text_looks_sensitive(&value)
-    {
-        return None;
-    }
-
-    Some(value)
-}
-
-fn export_text_looks_sensitive(value: &str) -> bool {
-    let lower = value.to_ascii_lowercase();
-    if value.contains('/') || value.contains('\\') {
-        return true;
-    }
-    if lower.contains(".jar")
-        || lower.contains(".exe")
-        || lower.contains(".dll")
-        || lower.contains(".dylib")
-        || lower.contains(".so")
-    {
-        return true;
-    }
-    if lower.contains("-xmx")
-        || lower.contains("-xms")
-        || lower.contains("-xx:")
-        || lower.starts_with("-d")
-        || lower.contains(" -d")
-        || lower.contains("--access")
-        || lower.contains("--username")
-        || lower.contains("--uuid")
-        || lower.contains("--xuid")
-        || lower.contains("--user_properties")
-        || lower.contains("--classpath")
-        || lower.contains(" -cp ")
-        || lower.contains(" -classpath ")
-    {
-        return true;
-    }
-    if lower.contains("token")
-        || lower.contains("secret")
-        || lower.contains("password")
-        || lower.contains("provider_payload")
-        || lower.contains("account_id")
-        || lower.contains("username=")
-        || lower.contains("xuid=")
-        || lower.contains("bearer ")
-    {
-        return true;
-    }
-    if value.contains('@') && value.contains('.') {
-        return true;
-    }
-    if looks_like_jwt(value) || has_long_secret_like_run(value) {
-        return true;
-    }
-
-    false
-}
-
-fn looks_like_jwt(value: &str) -> bool {
-    value.split_whitespace().any(|token| {
-        let token = token.trim_matches(|value: char| {
-            !(value.is_ascii_alphanumeric() || matches!(value, '-' | '_' | '.'))
-        });
-        let parts = token.split('.').collect::<Vec<_>>();
-        parts.len() >= 3
-            && parts.iter().take(3).all(|part| {
-                part.len() >= 12
-                    && part
-                        .chars()
-                        .all(|value| value.is_ascii_alphanumeric() || matches!(value, '-' | '_'))
-            })
-    })
-}
-
-fn has_long_secret_like_run(value: &str) -> bool {
-    value
-        .split(|value: char| !(value.is_ascii_alphanumeric() || matches!(value, '-' | '_')))
-        .any(|part| {
-            part.len() >= 48
-                && part.chars().any(|value| value.is_ascii_alphabetic())
-                && part.chars().any(|value| value.is_ascii_digit())
-        })
+    sanitize_evidence_text(
+        value,
+        RedactionAudience::ExportableProof,
+        MAX_EXPORT_DETAIL_CHARS,
+    )
 }
 
 fn build_record(
@@ -706,6 +649,7 @@ fn build_record(
         launched_at,
         recorded_at,
         outcome,
+        session_outcome: record.outcome.clone(),
         scenario: build_scenario(record, context),
         device: local_device_metadata(),
         resource_budget: context.and_then(|value| value.resource_budget.clone()),
@@ -723,9 +667,56 @@ fn build_record(
             .and_then(|failure| failure.detail.clone()),
         guardian: record.guardian.clone(),
         healing: record.healing.clone(),
-        stages: record.stages.clone(),
+        stages: record
+            .stages
+            .iter()
+            .take(MAX_EXPORT_STAGES)
+            .map(sanitized_stage_record)
+            .collect(),
         comparison: None,
     }
+}
+
+fn sanitized_stage_record(stage: &LaunchStageRecord) -> LaunchStageRecord {
+    let stage_name = sanitized_required_token(&stage.stage, "unknown");
+    LaunchStageRecord {
+        stage: stage_name.clone(),
+        label: sanitized_bounded_text(&stage.label).unwrap_or_else(|| stage_name.clone()),
+        started_at_ms: stage.started_at_ms,
+        ended_at_ms: stage.ended_at_ms,
+        duration_ms: stage.duration_ms,
+        result: stage.result.as_deref().and_then(sanitized_optional_token),
+        warnings: stage
+            .warnings
+            .iter()
+            .filter_map(|warning| sanitized_bounded_text(warning))
+            .take(MAX_EXPORT_DETAILS)
+            .collect(),
+        fallback_reason: stage
+            .fallback_reason
+            .as_deref()
+            .and_then(sanitized_bounded_text),
+        evidence: stage
+            .evidence
+            .iter()
+            .filter_map(sanitized_stage_evidence_record)
+            .take(MAX_EXPORT_DETAILS)
+            .collect(),
+    }
+}
+
+fn sanitized_stage_evidence_record(evidence: &LaunchStageEvidence) -> Option<LaunchStageEvidence> {
+    Some(LaunchStageEvidence {
+        id: sanitized_optional_token(&evidence.id)?,
+        system: sanitized_optional_token(&evidence.system)?,
+        summary: sanitized_bounded_text(&evidence.summary)?,
+        details: evidence
+            .details
+            .iter()
+            .filter_map(|detail| sanitized_bounded_text(detail))
+            .take(MAX_EXPORT_DETAILS)
+            .collect(),
+    })
 }
 
 fn build_local_comparison(
@@ -1210,6 +1201,50 @@ mod tests {
                 .iter()
                 .any(|report| report.session_id == second.session_id)
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn launch_report_exports_redacted_stage_evidence() {
+        let root = test_root("stage-evidence");
+        let paths = test_paths(&root);
+        let mut record = test_record("stage-evidence");
+        record.stages[0].evidence = vec![
+            LaunchStageEvidence {
+                id: "execution_launch_command_prepared".to_string(),
+                system: "execution".to_string(),
+                summary: "Execution prepared a runnable launch command.".to_string(),
+                details: vec![
+                    "arg_count:3".to_string(),
+                    r"program:C:\Users\Alice\.jdks\java.exe".to_string(),
+                    "-Xmx8192M".to_string(),
+                ],
+            },
+            LaunchStageEvidence {
+                id: r"bad\path".to_string(),
+                system: "execution".to_string(),
+                summary: "/home/alice/.minecraft leaked".to_string(),
+                details: vec!["token=secret".to_string()],
+            },
+        ];
+
+        let proof = persist_record(&paths, &record, None, "running")
+            .expect("persist stage evidence report");
+        assert_eq!(proof.stages[0].evidence.len(), 1);
+        assert_eq!(
+            proof.stages[0].evidence[0].id,
+            "execution_launch_command_prepared"
+        );
+        assert_eq!(proof.stages[0].evidence[0].details, vec!["arg_count:3"]);
+
+        let persisted_json = fs::read_to_string(report_path(&paths, "stage-evidence"))
+            .expect("read persisted report");
+        assert!(persisted_json.contains("execution_launch_command_prepared"));
+        assert!(!persisted_json.contains("Alice"));
+        assert!(!persisted_json.contains("-Xmx"));
+        assert!(!persisted_json.contains("token"));
+        assert!(!persisted_json.contains("/home/"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2045,6 +2080,7 @@ mod tests {
             launched_at: recorded_at.to_string(),
             recorded_at: recorded_at.to_string(),
             outcome: "exited".to_string(),
+            session_outcome: None,
             scenario: LaunchProofScenario {
                 scenario_id: "managed_launch".to_string(),
                 performance_mode: "managed".to_string(),
@@ -2078,6 +2114,7 @@ mod tests {
                 result: Some("ok".to_string()),
                 warnings: Vec::new(),
                 fallback_reason: None,
+                evidence: Vec::new(),
             }],
             comparison: None,
         }
@@ -2119,6 +2156,7 @@ mod tests {
             failure: None,
             healing: Some(json!({ "fallback_applied": "test fallback" })),
             guardian: Some(json!({ "mode": "managed" })),
+            outcome: None,
             stages: vec![LaunchStageRecord {
                 stage: "queued".to_string(),
                 label: launch_stage_label("queued").to_string(),
@@ -2128,6 +2166,7 @@ mod tests {
                 result: Some("ok".to_string()),
                 warnings: Vec::new(),
                 fallback_reason: None,
+                evidence: Vec::new(),
             }],
         }
     }

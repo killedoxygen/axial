@@ -1,5 +1,20 @@
+use crate::application::{self, RefreshPerformanceRulesError};
+use crate::guardian::{
+    GuardianFact, performance_failure_memory_guardian_fact, performance_health_guardian_facts,
+    performance_plan_guardian_facts, performance_state_error_guardian_fact,
+};
+use crate::observability::{
+    PerformanceProofRecord, RedactionAudience, performance_health_proof_record,
+    sanitize_evidence_token,
+};
+use crate::state::contracts::{
+    CommandKind, JournalId, OperationId, OperationJournalEntry, OperationJournalStep,
+    OperationOutcome, OperationPhase, OperationStepResult, OwnershipClass as StateOwnershipClass,
+    RollbackState, StabilizationSystem, TargetDescriptor, TargetKind,
+};
 use crate::state::performance_operations::{
     PerformanceOperationConflict, PerformanceOperationPayload, PerformanceOperationStatus,
+    sanitize_operation_error,
 };
 use crate::state::{AppState, DownloadProgress};
 use axum::{
@@ -11,13 +26,15 @@ use axum::{
 use croopor_minecraft::scan_versions;
 use croopor_performance::InstallError;
 use croopor_performance::{
-    BundleHealth, CompositionPlan, CompositionTier, ManagedArtifactProvider, OwnershipClass,
-    PerformanceMode, PerformanceRulesStatus, ResolutionRequest, RollbackSnapshotSummary,
-    RulesRefreshError, StateError, derive_health, load_state, parse_mode,
+    BundleHealth, CompositionPlan, CompositionState, CompositionTier, ManagedArtifactProvider,
+    OwnershipClass, PerformanceMode, ResolutionRequest, RollbackSnapshotSummary, StateError,
+    derive_health, effective_performance_plan, load_state, parse_mode,
 };
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 const PERFORMANCE_MANAGED_ARTIFACT_SUMMARY_LIMIT: usize = 50;
+const PERFORMANCE_GUARDIAN_FACT_LIMIT: usize = 16;
 const INVALID_PERSISTED_OPERATION_ERROR: &str = "invalid persisted performance operation payload";
 const PERFORMANCE_DATA_INTERNAL_ERROR: &str =
     "Could not load performance data. Check app data permissions and try again.";
@@ -57,6 +74,8 @@ struct InstallRequest {
 #[derive(Debug, Serialize)]
 struct PerformancePlanResponse {
     active: bool,
+    effective: croopor_performance::EffectivePerformancePlan,
+    guardian_facts: Vec<GuardianFact>,
     #[serde(flatten)]
     plan: CompositionPlan,
 }
@@ -70,6 +89,10 @@ struct PerformanceHealthResponse {
     installed_count: usize,
     managed_artifacts: Vec<PerformanceManagedArtifactSummary>,
     warnings: Vec<String>,
+    guardian_facts: Vec<GuardianFact>,
+    proof: PerformanceProofRecord,
+    view_model: application::PerformancePlanSummaryViewModel,
+    display: PerformanceInstanceDisplay,
 }
 
 #[derive(Debug, Serialize)]
@@ -100,6 +123,34 @@ struct PerformanceManagedArtifactSummary {
     source_provider: ManagedArtifactProvider,
     sha512_present: bool,
     sha512_verified: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PerformanceInstanceDisplay {
+    memory: PerformanceMemoryDisplay,
+    runtime: PerformanceRuntimeDisplay,
+    mode: PerformanceModeDisplay,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PerformanceMemoryDisplay {
+    min_gb: f32,
+    max_gb: f32,
+    label: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PerformanceRuntimeDisplay {
+    detected: bool,
+    label: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PerformanceModeDisplay {
+    mode: String,
+    label: String,
+    source: String,
+    source_label: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -154,16 +205,18 @@ pub fn router() -> Router<AppState> {
 
 async fn handle_status(
     State(state): State<AppState>,
-) -> Result<Json<PerformanceRulesStatus>, (StatusCode, Json<serde_json::Value>)> {
-    Ok(Json(state.performance().rules_status()))
+) -> Result<Json<application::PerformanceRulesStatusResponse>, (StatusCode, Json<serde_json::Value>)>
+{
+    Ok(Json(application::performance_rules_status(&state)))
 }
 
 async fn handle_rules_refresh(
     State(state): State<AppState>,
-) -> Result<Json<PerformanceRulesStatus>, (StatusCode, Json<serde_json::Value>)> {
-    match state.performance().refresh_rules().await {
-        Ok(status) => Ok(Json(status)),
-        Err(RulesRefreshError::Unconfigured) => Err((
+) -> Result<Json<application::PerformanceRulesStatusResponse>, (StatusCode, Json<serde_json::Value>)>
+{
+    match application::refresh_performance_rules(&state).await {
+        Ok(response) => Ok(Json(response)),
+        Err(RefreshPerformanceRulesError::Unconfigured) => Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "error": "performance remote rules url is not configured"
@@ -191,8 +244,20 @@ async fn handle_plan(
         installed_mods,
     });
 
+    let mut guardian_facts = performance_plan_guardian_facts(&plan, OperationPhase::Planning);
+    append_performance_guardian_facts(
+        &mut guardian_facts,
+        performance_failure_memory_facts(
+            &state,
+            OperationPhase::Planning,
+            Some(&plan.composition_id),
+        ),
+    );
+
     Ok(Json(PerformancePlanResponse {
         active: matches!(mode, PerformanceMode::Managed),
+        effective: effective_performance_plan(&plan),
+        guardian_facts,
         plan,
     }))
 }
@@ -256,9 +321,10 @@ async fn handle_health(
         )
     })?;
     let mode = resolve_instance_mode(&state, &instance, None)?;
+    let display = performance_instance_display(&state, &instance, mode);
 
     if !matches!(mode, PerformanceMode::Managed) {
-        return Ok(Json(disabled_health_response()));
+        return Ok(Json(disabled_health_response(mode, display)));
     }
 
     let mods_dir = state.instances().game_dir(&instance.id).join("mods");
@@ -267,16 +333,24 @@ async fn handle_health(
         Err(StateError::Parse(_)) => {
             return Ok(Json(invalid_health_response(
                 PERFORMANCE_STATE_PARSE_WARNING,
+                Vec::new(),
+                display,
             )));
         }
-        Err(StateError::InvalidOwnership { .. }) => {
+        Err(error @ StateError::InvalidOwnership { .. }) => {
             return Ok(Json(invalid_health_response(
                 "invalid performance artifact ownership metadata",
+                performance_state_error_guardian_fact(&error, OperationPhase::Validating)
+                    .into_iter()
+                    .collect(),
+                display,
             )));
         }
         Err(StateError::InvalidIntegrity { .. }) => {
             return Ok(Json(invalid_health_response(
                 "invalid performance artifact integrity metadata",
+                Vec::new(),
+                display,
             )));
         }
         Err(error) => return Err(internal_error(error)),
@@ -291,24 +365,59 @@ async fn handle_health(
     });
     let (health, warnings) = derive_health(state_file.as_ref(), Some(&plan), &mods_dir);
     let warnings = response_warnings(&plan, warnings);
+    let composition_id = state_file
+        .as_ref()
+        .map(|value| value.composition_id.clone())
+        .unwrap_or_default();
+    let tier = state_file
+        .as_ref()
+        .map(|value| tier_name(value.tier).to_string())
+        .unwrap_or_default();
+    let installed_count = state_file
+        .as_ref()
+        .map(|value| value.installed_mods.len())
+        .unwrap_or_default();
+    let guardian_facts = performance_health_guardian_facts(
+        health,
+        &composition_id,
+        &warnings,
+        OperationPhase::Validating,
+    );
+    let mut guardian_facts = guardian_facts;
+    append_performance_guardian_facts(
+        &mut guardian_facts,
+        performance_failure_memory_facts(&state, OperationPhase::Validating, Some(&composition_id)),
+    );
+    let proof = performance_health_proof(
+        None,
+        health,
+        &composition_id,
+        &tier,
+        installed_count,
+        warnings.len(),
+        health_rollback_state(&state, &mods_dir),
+    );
+    let view_model = application::performance_plan_summary_view_model(
+        mode,
+        Some(&plan),
+        health,
+        state_file.as_ref().map(|value| value.tier),
+        installed_count,
+        &warnings,
+    );
 
     Ok(Json(PerformanceHealthResponse {
         active: true,
         health,
-        composition_id: state_file
-            .as_ref()
-            .map(|value| value.composition_id.clone())
-            .unwrap_or_default(),
-        tier: state_file
-            .as_ref()
-            .map(|value| tier_name(value.tier).to_string())
-            .unwrap_or_default(),
-        installed_count: state_file
-            .as_ref()
-            .map(|value| value.installed_mods.len())
-            .unwrap_or_default(),
+        composition_id,
+        tier,
+        installed_count,
         managed_artifacts: managed_artifact_summary(state_file.as_ref()),
         warnings,
+        guardian_facts,
+        proof,
+        view_model,
+        display,
     }))
 }
 
@@ -375,6 +484,7 @@ async fn handle_operation_status(
         .performance_operations()
         .get(&id)
         .await
+        .map(public_performance_operation_status)
         .map(Json)
         .ok_or_else(|| {
             (
@@ -397,7 +507,8 @@ async fn handle_instance_operation(
     let operation = state
         .performance_operations()
         .current_or_latest_for_instance(&instance.id)
-        .await;
+        .await
+        .map(public_performance_operation_status);
 
     Ok(Json(PerformanceInstanceOperationResponse { operation }))
 }
@@ -419,29 +530,66 @@ async fn execute_performance_operation(
     let mods_dir = state.instances().game_dir(&instance.id).join("mods");
 
     if matches!(operation.action, PerformanceInstallAction::Rollback) {
-        let restored_state =
-            if let Some(rollback_id) = optional_value(operation.rollback_id.as_deref()) {
-                performance
-                    .rollback_managed_snapshot(&mods_dir, &rollback_id)
-                    .map_err(performance_install_error)?
-            } else {
-                performance
-                    .rollback_managed(&mods_dir)
-                    .map_err(performance_install_error)?
-            };
-        let (health, warnings) = derive_health(Some(&restored_state), None, &mods_dir);
+        let preflight = rollback_preflight(&mods_dir, operation.rollback_id.as_deref());
+        let (target_id, rollback_state) = match &preflight {
+            Ok((target_id, rollback_state)) => (target_id.clone(), *rollback_state),
+            Err(_) => (
+                "performance_rollback_snapshot".to_string(),
+                RollbackState::Unavailable,
+            ),
+        };
+        let operation_id = begin_performance_operation_journal(
+            state,
+            operation.action,
+            &target_id,
+            rollback_state,
+        );
+        if let Err(error) = preflight {
+            record_performance_operation_failure(
+                state,
+                &operation_id,
+                operation.action,
+                &target_id,
+                rollback_state,
+            );
+            return Err(error);
+        }
 
-        return Ok(PerformanceInstallResponse {
-            active: true,
-            status: "rolled_back".to_string(),
-            install_id: None,
-            health,
-            composition_id: restored_state.composition_id.clone(),
-            tier: tier_name(restored_state.tier).to_string(),
-            installed_count: restored_state.installed_mods.len(),
-            managed_artifacts: managed_artifact_summary(Some(&restored_state)),
-            warnings,
-        });
+        let result = (|| {
+            let restored_state =
+                if let Some(rollback_id) = optional_value(operation.rollback_id.as_deref()) {
+                    performance
+                        .rollback_managed_snapshot(&mods_dir, &rollback_id)
+                        .map_err(performance_install_error)?
+                } else {
+                    performance
+                        .rollback_managed(&mods_dir)
+                        .map_err(performance_install_error)?
+                };
+            let (health, warnings) = derive_health(Some(&restored_state), None, &mods_dir);
+
+            Ok(PerformanceInstallResponse {
+                active: true,
+                status: "rolled_back".to_string(),
+                install_id: None,
+                health,
+                composition_id: restored_state.composition_id.clone(),
+                tier: tier_name(restored_state.tier).to_string(),
+                installed_count: restored_state.installed_mods.len(),
+                managed_artifacts: managed_artifact_summary(Some(&restored_state)),
+                warnings,
+            })
+        })();
+        record_performance_operation_result(
+            state,
+            &operation_id,
+            operation.action,
+            &target_id,
+            rollback_state,
+            &result,
+        );
+
+        return result;
     }
 
     let mode = resolve_instance_mode(state, &instance, operation.mode.as_deref())?;
@@ -449,11 +597,48 @@ async fn execute_performance_operation(
     if matches!(operation.action, PerformanceInstallAction::Remove)
         || !matches!(mode, PerformanceMode::Managed)
     {
-        performance
-            .remove_managed(&mods_dir)
-            .map_err(performance_install_error)?;
+        let journal_action = PerformanceInstallAction::Remove;
+        let current_state = preflight_current_performance_state(&mods_dir);
+        let (target_id, rollback_state) = match &current_state {
+            Ok(state) => (
+                state
+                    .as_ref()
+                    .map(|state| state.composition_id.clone())
+                    .unwrap_or_else(|| "performance_composition_lock".to_string()),
+                rollback_state_for_current_state(state.as_ref()),
+            ),
+            Err(_) => (
+                "performance_composition_lock".to_string(),
+                RollbackState::Unavailable,
+            ),
+        };
+        let operation_id =
+            begin_performance_operation_journal(state, journal_action, &target_id, rollback_state);
+        if let Err(error) = current_state {
+            record_performance_operation_failure(
+                state,
+                &operation_id,
+                journal_action,
+                &target_id,
+                rollback_state,
+            );
+            return Err(error);
+        }
 
-        return Ok(removed_install_response());
+        let result = performance
+            .remove_managed(&mods_dir)
+            .map(|_| removed_install_response())
+            .map_err(performance_install_error);
+        record_performance_operation_result(
+            state,
+            &operation_id,
+            journal_action,
+            &target_id,
+            rollback_state,
+            &result,
+        );
+
+        return result;
     }
 
     let (game_version, loader) = resolve_instance_version_target(
@@ -469,24 +654,59 @@ async fn execute_performance_operation(
         hardware: state.performance().hardware(),
         installed_mods: installed_mod_evidence_from_mods_dir(&mods_dir),
     });
-    let installed_state = performance
+    let current_state = preflight_current_performance_state(&mods_dir);
+    let rollback_state = match &current_state {
+        Ok(state) => rollback_state_for_current_state(state.as_ref()),
+        Err(_) => RollbackState::Unavailable,
+    };
+    let operation_id = begin_performance_operation_journal(
+        state,
+        operation.action,
+        &plan.composition_id,
+        rollback_state,
+    );
+    if let Err(error) = current_state {
+        record_performance_operation_failure(
+            state,
+            &operation_id,
+            operation.action,
+            &plan.composition_id,
+            rollback_state,
+        );
+        return Err(error);
+    }
+
+    let result = match performance
         .ensure_installed(&plan, &game_version, &mods_dir)
         .await
-        .map_err(performance_install_error)?;
-    let (health, warnings) = derive_health(Some(&installed_state), Some(&plan), &mods_dir);
-    let warnings = response_warnings(&plan, warnings);
+    {
+        Ok(installed_state) => {
+            let (health, warnings) = derive_health(Some(&installed_state), Some(&plan), &mods_dir);
+            let warnings = response_warnings(&plan, warnings);
+            Ok(PerformanceInstallResponse {
+                active: true,
+                status: "complete".to_string(),
+                install_id: None,
+                health,
+                composition_id: installed_state.composition_id.clone(),
+                tier: tier_name(installed_state.tier).to_string(),
+                installed_count: installed_state.installed_mods.len(),
+                managed_artifacts: managed_artifact_summary(Some(&installed_state)),
+                warnings,
+            })
+        }
+        Err(error) => Err(performance_install_error(error)),
+    };
+    record_performance_operation_result(
+        state,
+        &operation_id,
+        operation.action,
+        &plan.composition_id,
+        rollback_state,
+        &result,
+    );
 
-    Ok(PerformanceInstallResponse {
-        active: true,
-        status: "complete".to_string(),
-        install_id: None,
-        health,
-        composition_id: installed_state.composition_id.clone(),
-        tier: tier_name(installed_state.tier).to_string(),
-        installed_count: installed_state.installed_mods.len(),
-        managed_artifacts: managed_artifact_summary(Some(&installed_state)),
-        warnings,
-    })
+    result
 }
 
 async fn queue_performance_operation(
@@ -704,6 +924,47 @@ fn operation_payload(operation: &PerformanceOperation) -> PerformanceOperationPa
     }
 }
 
+fn public_performance_operation_status(
+    mut status: PerformanceOperationStatus,
+) -> PerformanceOperationStatus {
+    status.instance_id = public_operation_required_token(&status.instance_id, "redacted");
+    status.action = public_operation_required_token(&status.action, "unknown");
+    status.state = public_operation_required_token(&status.state, "unknown");
+    status.payload = public_operation_payload(status.payload);
+    status.error = status
+        .error
+        .as_deref()
+        .map(sanitize_operation_error)
+        .filter(|value| !value.trim().is_empty());
+    status
+}
+
+fn public_operation_required_token(value: &str, fallback: &str) -> String {
+    sanitize_evidence_token(value, RedactionAudience::UserVisible, 96)
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn public_operation_payload(payload: PerformanceOperationPayload) -> PerformanceOperationPayload {
+    PerformanceOperationPayload {
+        game_version: public_operation_payload_token(payload.game_version),
+        loader: public_operation_payload_token(payload.loader),
+        mode: public_operation_payload_token(payload.mode),
+        rollback_id: public_operation_payload_token(payload.rollback_id),
+    }
+}
+
+fn public_operation_payload_token(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let value = value.trim();
+        if value.is_empty() {
+            None
+        } else {
+            sanitize_evidence_token(value, RedactionAudience::UserVisible, 96)
+                .or_else(|| Some("redacted".to_string()))
+        }
+    })
+}
+
 fn operation_from_status(
     status: &PerformanceOperationStatus,
 ) -> Result<PerformanceOperation, String> {
@@ -773,7 +1034,391 @@ fn managed_artifact_summary(
         .unwrap_or_default()
 }
 
-fn disabled_health_response() -> PerformanceHealthResponse {
+fn performance_failure_memory_facts(
+    state: &AppState,
+    phase: OperationPhase,
+    target_id: Option<&str>,
+) -> Vec<GuardianFact> {
+    let target_id = target_id.map(str::trim).filter(|value| !value.is_empty());
+    state
+        .failure_memory()
+        .list()
+        .into_iter()
+        .filter(|entry| match target_id {
+            Some(target_id) => entry.target.id == target_id,
+            None => true,
+        })
+        .filter_map(|entry| performance_failure_memory_guardian_fact(&entry, phase))
+        .take(PERFORMANCE_GUARDIAN_FACT_LIMIT)
+        .collect()
+}
+
+fn append_performance_guardian_facts(facts: &mut Vec<GuardianFact>, more: Vec<GuardianFact>) {
+    let remaining = PERFORMANCE_GUARDIAN_FACT_LIMIT.saturating_sub(facts.len());
+    facts.extend(more.into_iter().take(remaining));
+    facts.truncate(PERFORMANCE_GUARDIAN_FACT_LIMIT);
+}
+
+fn health_rollback_state(state: &AppState, mods_dir: &std::path::Path) -> RollbackState {
+    match state.performance().list_rollback_snapshots(mods_dir) {
+        Ok(snapshots) if !snapshots.is_empty() => RollbackState::Available,
+        _ => RollbackState::Unavailable,
+    }
+}
+
+fn performance_health_proof(
+    operation_id: Option<OperationId>,
+    health: BundleHealth,
+    composition_id: &str,
+    tier: &str,
+    installed_count: usize,
+    warning_count: usize,
+    rollback: RollbackState,
+) -> PerformanceProofRecord {
+    performance_health_proof_record(
+        operation_id,
+        performance_composition_target(composition_id),
+        bundle_health_token(health),
+        rollback,
+        vec![
+            ("composition_id", proof_token(composition_id, "none")),
+            ("tier", proof_token(tier, "none")),
+            ("managed_artifact_count", installed_count.to_string()),
+            ("warning_count", warning_count.to_string()),
+        ],
+    )
+}
+
+fn bundle_health_token(health: BundleHealth) -> &'static str {
+    match health {
+        BundleHealth::Healthy => "healthy",
+        BundleHealth::Degraded => "degraded",
+        BundleHealth::Fallback => "fallback",
+        BundleHealth::Disabled => "disabled",
+        BundleHealth::Invalid => "invalid",
+    }
+}
+
+fn proof_token(value: &str, fallback: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        fallback.to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn performance_composition_target(composition_id: &str) -> TargetDescriptor {
+    let id = composition_id.trim();
+    TargetDescriptor::new(
+        StabilizationSystem::Performance,
+        TargetKind::PerformanceComposition,
+        if id.is_empty() {
+            "performance_composition"
+        } else {
+            id
+        },
+        StateOwnershipClass::CompositionManaged,
+    )
+}
+
+fn performance_artifacts_target(composition_id: &str) -> TargetDescriptor {
+    let id = composition_id.trim();
+    let target_id = if id.is_empty() {
+        "managed_performance_artifacts".to_string()
+    } else {
+        format!("{id}_managed_artifacts")
+    };
+    TargetDescriptor::new(
+        StabilizationSystem::Performance,
+        TargetKind::Artifact,
+        target_id,
+        StateOwnershipClass::CompositionManaged,
+    )
+}
+
+fn preflight_current_performance_state(
+    mods_dir: &std::path::Path,
+) -> Result<Option<CompositionState>, (StatusCode, Json<serde_json::Value>)> {
+    load_state(mods_dir).map_err(|error| performance_install_error(InstallError::State(error)))
+}
+
+fn rollback_preflight(
+    mods_dir: &std::path::Path,
+    rollback_id: Option<&str>,
+) -> Result<(String, RollbackState), (StatusCode, Json<serde_json::Value>)> {
+    let snapshot = if let Some(rollback_id) = optional_value(rollback_id) {
+        croopor_performance::state::load_rollback_snapshot_by_id(mods_dir, &rollback_id)
+            .map_err(|error| performance_install_error(InstallError::State(error)))?
+    } else {
+        croopor_performance::state::load_rollback_snapshot(mods_dir)
+            .map_err(|error| performance_install_error(InstallError::State(error)))?
+    };
+
+    Ok(match snapshot {
+        Some(snapshot) => (snapshot.state.composition_id, RollbackState::Available),
+        None => (
+            "performance_rollback_snapshot".to_string(),
+            RollbackState::Unavailable,
+        ),
+    })
+}
+
+fn rollback_state_for_current_state(state: Option<&CompositionState>) -> RollbackState {
+    if state.is_some() {
+        RollbackState::Available
+    } else {
+        RollbackState::Unavailable
+    }
+}
+
+fn begin_performance_operation_journal(
+    state: &AppState,
+    action: PerformanceInstallAction,
+    target_id: &str,
+    rollback: RollbackState,
+) -> OperationId {
+    let operation_id = OperationId::new(format!(
+        "performance-{}-{}",
+        performance_operation_step_id(action),
+        uuid::Uuid::new_v4()
+    ));
+    let mut entry = OperationJournalEntry::new(
+        JournalId::new(format!("journal-{}", operation_id.as_str())),
+        operation_id.clone(),
+        CommandKind::ApplyPerformancePlan,
+        StabilizationSystem::Application,
+        StateOwnershipClass::CompositionManaged,
+        rollback,
+    );
+    entry.targets = performance_operation_targets(target_id);
+    entry.planned_steps.push(performance_operation_journal_step(
+        action,
+        OperationStepResult::Planned,
+        target_id,
+        rollback,
+    ));
+    state.journals().create(entry);
+    operation_id
+}
+
+fn record_performance_operation_result(
+    state: &AppState,
+    operation_id: &OperationId,
+    action: PerformanceInstallAction,
+    fallback_target_id: &str,
+    rollback: RollbackState,
+    result: &Result<PerformanceInstallResponse, (StatusCode, Json<serde_json::Value>)>,
+) {
+    match result {
+        Ok(response) => {
+            let response_target_id = response.composition_id.trim();
+            let target_id = if response_target_id.is_empty() {
+                fallback_target_id
+            } else {
+                response_target_id
+            };
+            record_performance_operation_success(state, operation_id, action, target_id, rollback);
+        }
+        Err(_) => record_performance_operation_failure(
+            state,
+            operation_id,
+            action,
+            fallback_target_id,
+            rollback,
+        ),
+    }
+}
+
+fn record_performance_operation_success(
+    state: &AppState,
+    operation_id: &OperationId,
+    action: PerformanceInstallAction,
+    target_id: &str,
+    rollback: RollbackState,
+) {
+    let rollback = if matches!(action, PerformanceInstallAction::Rollback) {
+        RollbackState::Applied
+    } else {
+        rollback
+    };
+    state.journals().record_success(
+        operation_id,
+        performance_operation_journal_step(
+            action,
+            OperationStepResult::Completed,
+            target_id,
+            rollback,
+        ),
+        OperationOutcome::Succeeded,
+    );
+}
+
+fn record_performance_operation_failure(
+    state: &AppState,
+    operation_id: &OperationId,
+    action: PerformanceInstallAction,
+    target_id: &str,
+    rollback: RollbackState,
+) {
+    state.journals().record_failure(
+        operation_id,
+        performance_operation_journal_step(
+            action,
+            OperationStepResult::Failed,
+            target_id,
+            rollback,
+        ),
+        performance_operation_step_id(action),
+        OperationOutcome::Failed,
+    );
+}
+
+fn performance_operation_journal_step(
+    action: PerformanceInstallAction,
+    result: OperationStepResult,
+    target_id: &str,
+    rollback: RollbackState,
+) -> OperationJournalStep {
+    let mut step = OperationJournalStep::new(
+        performance_operation_step_id(action),
+        performance_operation_phase(action),
+    );
+    step.result = result;
+    step.rollback = rollback;
+    step.generated_facts
+        .push("performance_operation_evidence".to_string());
+    if !matches!(rollback, RollbackState::NotApplicable) {
+        step.generated_facts
+            .push("performance_rollback_evidence".to_string());
+    }
+    if result != OperationStepResult::Planned {
+        step.changed_target = Some(performance_composition_target(target_id));
+    }
+    step
+}
+
+fn performance_operation_targets(target_id: &str) -> Vec<TargetDescriptor> {
+    vec![
+        performance_composition_target(target_id),
+        performance_artifacts_target(target_id),
+    ]
+}
+
+fn performance_operation_step_id(action: PerformanceInstallAction) -> &'static str {
+    match action {
+        PerformanceInstallAction::Install => "apply_performance_plan",
+        PerformanceInstallAction::Remove => "remove_performance_plan",
+        PerformanceInstallAction::Rollback => "rollback_performance_plan",
+    }
+}
+
+fn performance_operation_phase(action: PerformanceInstallAction) -> OperationPhase {
+    match action {
+        PerformanceInstallAction::Install | PerformanceInstallAction::Remove => {
+            OperationPhase::Installing
+        }
+        PerformanceInstallAction::Rollback => OperationPhase::RollingBack,
+    }
+}
+
+fn performance_instance_display(
+    state: &AppState,
+    instance: &croopor_config::Instance,
+    mode: PerformanceMode,
+) -> PerformanceInstanceDisplay {
+    let config = state.config().current();
+    let min_gb = memory_gb(instance.min_memory_mb, config.min_memory_mb, 1024);
+    let max_gb = memory_gb(instance.max_memory_mb, config.max_memory_mb, 4096);
+    let java_major = instance_java_major(state, &instance.version_id);
+    let mode_source = if parse_mode(&instance.performance_mode).is_some() {
+        ("instance", "Per instance")
+    } else {
+        ("global", "Global default")
+    };
+
+    PerformanceInstanceDisplay {
+        memory: PerformanceMemoryDisplay {
+            min_gb,
+            max_gb,
+            label: heap_label(min_gb, max_gb),
+        },
+        runtime: PerformanceRuntimeDisplay {
+            detected: java_major.is_some(),
+            label: java_major
+                .map(|major| format!("Java {major}"))
+                .unwrap_or_else(|| "Managed Java".to_string()),
+        },
+        mode: PerformanceModeDisplay {
+            mode: performance_mode_token(mode).to_string(),
+            label: performance_mode_label(mode).to_string(),
+            source: mode_source.0.to_string(),
+            source_label: mode_source.1.to_string(),
+        },
+    }
+}
+
+fn instance_java_major(state: &AppState, version_id: &str) -> Option<i32> {
+    state
+        .library_dir()
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .and_then(|path| scan_versions(&path).ok())
+        .and_then(|versions| {
+            versions
+                .into_iter()
+                .find(|version| version.id == version_id)
+                .and_then(|version| (version.java_major > 0).then_some(version.java_major))
+        })
+}
+
+fn memory_gb(instance_mb: i32, config_mb: i32, fallback_mb: i32) -> f32 {
+    let mb = if instance_mb > 0 {
+        instance_mb
+    } else if config_mb > 0 {
+        config_mb
+    } else {
+        fallback_mb
+    };
+    mb as f32 / 1024.0
+}
+
+fn heap_label(min_gb: f32, max_gb: f32) -> String {
+    if (min_gb - max_gb).abs() < f32::EPSILON {
+        format!("{} GB", fmt_heap_gb(max_gb))
+    } else {
+        format!("{} to {} GB", fmt_heap_gb(min_gb), fmt_heap_gb(max_gb))
+    }
+}
+
+fn fmt_heap_gb(gb: f32) -> String {
+    if (gb.fract()).abs() < f32::EPSILON {
+        format!("{}", gb as i32)
+    } else {
+        format!("{gb:.1}")
+    }
+}
+
+fn performance_mode_label(mode: PerformanceMode) -> &'static str {
+    match mode {
+        PerformanceMode::Managed => "Managed",
+        PerformanceMode::Vanilla => "Vanilla",
+        PerformanceMode::Custom => "Custom",
+    }
+}
+
+fn performance_mode_token(mode: PerformanceMode) -> &'static str {
+    match mode {
+        PerformanceMode::Managed => "managed",
+        PerformanceMode::Vanilla => "vanilla",
+        PerformanceMode::Custom => "custom",
+    }
+}
+
+fn disabled_health_response(
+    mode: PerformanceMode,
+    display: PerformanceInstanceDisplay,
+) -> PerformanceHealthResponse {
     PerformanceHealthResponse {
         active: false,
         health: BundleHealth::Disabled,
@@ -782,10 +1427,35 @@ fn disabled_health_response() -> PerformanceHealthResponse {
         installed_count: 0,
         managed_artifacts: Vec::new(),
         warnings: Vec::new(),
+        guardian_facts: Vec::new(),
+        proof: performance_health_proof(
+            None,
+            BundleHealth::Disabled,
+            "",
+            "",
+            0,
+            0,
+            RollbackState::NotApplicable,
+        ),
+        view_model: application::performance_plan_summary_view_model(
+            mode,
+            None,
+            BundleHealth::Disabled,
+            None,
+            0,
+            &[],
+        ),
+        display,
     }
 }
 
-fn invalid_health_response(warning: impl Into<String>) -> PerformanceHealthResponse {
+fn invalid_health_response(
+    warning: impl Into<String>,
+    guardian_facts: Vec<GuardianFact>,
+    display: PerformanceInstanceDisplay,
+) -> PerformanceHealthResponse {
+    let warning = warning.into();
+    let warnings = vec![warning];
     PerformanceHealthResponse {
         active: true,
         health: BundleHealth::Invalid,
@@ -793,7 +1463,26 @@ fn invalid_health_response(warning: impl Into<String>) -> PerformanceHealthRespo
         tier: String::new(),
         installed_count: 0,
         managed_artifacts: Vec::new(),
-        warnings: vec![warning.into()],
+        warnings: warnings.clone(),
+        guardian_facts,
+        proof: performance_health_proof(
+            None,
+            BundleHealth::Invalid,
+            "",
+            "",
+            0,
+            1,
+            RollbackState::Unavailable,
+        ),
+        view_model: application::performance_plan_summary_view_model(
+            PerformanceMode::Managed,
+            None,
+            BundleHealth::Invalid,
+            None,
+            0,
+            &warnings,
+        ),
+        display,
     }
 }
 
@@ -825,9 +1514,9 @@ fn install_action(
         None | Some("install") | Some("apply") => Ok(PerformanceInstallAction::Install),
         Some("remove") | Some("disable") => Ok(PerformanceInstallAction::Remove),
         Some("rollback") => Ok(PerformanceInstallAction::Rollback),
-        Some(value) => Err((
+        Some(_) => Err((
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": format!("invalid performance action: {value}") })),
+            Json(serde_json::json!({ "error": "invalid performance action" })),
         )),
     }
 }
@@ -925,7 +1614,7 @@ fn resolve_config_mode(
         return parse_mode(raw).ok_or_else(|| {
             (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": format!("invalid performance mode: {raw}") })),
+                Json(serde_json::json!({ "error": "invalid performance mode" })),
             )
         });
     }
@@ -941,7 +1630,7 @@ fn resolve_instance_mode(
         return parse_mode(raw).ok_or_else(|| {
             (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": format!("invalid performance mode: {raw}") })),
+                Json(serde_json::json!({ "error": "invalid performance mode" })),
             )
         });
     }
@@ -1123,34 +1812,33 @@ mod tests {
         let Json(response) = handle_status(State(fixture.state.clone()))
             .await
             .expect("status should serialize");
+        let status = &response.status;
 
+        assert_eq!(status.rule_source, croopor_performance::RuleSource::BuiltIn);
         assert_eq!(
-            response.rule_source,
-            croopor_performance::RuleSource::BuiltIn
-        );
-        assert_eq!(
-            response.rule_channel,
+            status.rule_channel,
             croopor_performance::RuleChannel::Bundled
         );
-        assert!(response.rules_cache.recorded);
+        assert!(status.rules_cache.recorded);
         assert_eq!(
-            response.rules_cache.state,
+            status.rules_cache.state,
             croopor_performance::RulesCacheState::Recorded
         );
-        assert!(response.rules_cache.updated_at.is_some());
-        assert!(response.rules_cache.loaded_at.is_some());
-        assert!(response.rules_cache.warning.is_none());
-        assert_eq!(response.schema_version, 1);
-        assert!(!response.generated_at.is_empty());
-        assert!(response.composition_count > 0);
-        assert!(!response.remote_refresh);
-        assert_eq!(response.last_refresh_at, None);
+        assert!(status.rules_cache.updated_at.is_some());
+        assert!(status.rules_cache.loaded_at.is_some());
+        assert!(status.rules_cache.warning.is_none());
+        assert_eq!(status.schema_version, 1);
+        assert!(!status.generated_at.is_empty());
+        assert!(status.composition_count > 0);
+        assert!(!status.remote_refresh);
+        assert_eq!(status.last_refresh_at, None);
+        assert!(response.guardian_facts.is_empty());
         assert_eq!(
-            response.validation,
+            status.validation,
             croopor_performance::RulesValidation::Valid
         );
         assert_eq!(
-            response.health_states,
+            status.health_states,
             vec![
                 BundleHealth::Healthy,
                 BundleHealth::Degraded,
@@ -1160,13 +1848,133 @@ mod tests {
             ]
         );
         assert_eq!(
-            response.ownership_classes,
+            status.ownership_classes,
             vec![
                 croopor_performance::OwnershipClass::CompositionManaged,
                 croopor_performance::OwnershipClass::UserManaged,
             ]
         );
-        assert!(response.warnings.is_empty());
+        assert!(status.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn status_exposes_repeated_performance_failure_memory_fact() {
+        let fixture = TestFixture::new("status-repeated-performance-memory");
+        seed_repeated_performance_memory(&fixture.state, "family-f-fabric-core", 3);
+
+        let Json(response) = handle_status(State(fixture.state.clone()))
+            .await
+            .expect("status should serialize");
+
+        assert_eq!(
+            response.status.rule_source,
+            croopor_performance::RuleSource::BuiltIn
+        );
+        let fact = response
+            .guardian_facts
+            .iter()
+            .find(|fact| fact.id.as_str() == "performance_repeated_failure_memory")
+            .expect("repeated failure memory fact");
+        assert_eq!(fact.domain, crate::guardian::GuardianDomain::Performance);
+        assert_eq!(
+            fact.ownership,
+            crate::state::contracts::OwnershipClass::CompositionManaged
+        );
+        assert_eq!(
+            fact.target.as_ref().map(|target| target.id.as_str()),
+            Some("family-f-fabric-core")
+        );
+        assert!(
+            fact.fields
+                .iter()
+                .any(|field| field.key == "occurrence_count" && field.value == "3")
+        );
+    }
+
+    #[tokio::test]
+    async fn status_reports_invalid_remote_rules_with_guardian_fact_and_safe_copy() {
+        let root = test_root("status-invalid-remote-rules");
+        let paths = test_paths(&root);
+        let mut remote = croopor_performance::builtin_manifest().expect("builtin manifest");
+        remote.schema_version = 99;
+        let signed = signed_rules_response(&remote);
+        let cache_path = croopor_performance::rules_cache_path(&paths.config_dir);
+        fs::create_dir_all(cache_path.parent().expect("cache parent")).expect("create cache dir");
+        fs::write(
+            &cache_path,
+            serde_json::to_vec(&croopor_performance::RulesCacheSnapshot {
+                rule_source: croopor_performance::RuleSource::Remote,
+                rule_channel: croopor_performance::RuleChannel::Remote,
+                schema_version: remote.schema_version,
+                generated_at: remote.generated_at.clone(),
+                validation: croopor_performance::RulesValidation::Valid,
+                updated_at: "2026-06-15T12:00:00Z".to_string(),
+                loaded_at: "2026-06-15T12:00:00Z".to_string(),
+                manifest: Some(remote),
+                signature: Some(croopor_performance::RulesSignatureMetadata {
+                    signature: signed.signature,
+                    key_id: Some("test-key".to_string()),
+                }),
+            })
+            .expect("serialize invalid remote cache"),
+        )
+        .expect("write invalid remote cache");
+        let remote_url =
+            "https://rules.example.test/private-feed/performance.json?api_token=secret-token";
+        let state = build_test_state(&root, Some(remote_url.to_string()), Some(signed.public_key));
+
+        let response = router()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/performance/status")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("route response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let body = String::from_utf8(body.to_vec()).expect("utf8 body");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("status json");
+
+        assert_eq!(value["rule_source"], "built_in");
+        assert_eq!(value["rule_channel"], "bundled");
+        assert_eq!(value["rules_cache"]["state"], "invalid");
+        assert!(
+            value["warnings"]
+                .as_array()
+                .expect("warnings")
+                .iter()
+                .any(|warning| warning
+                    .as_str()
+                    .is_some_and(|warning| warning.contains("Remote rules cache was invalid")))
+        );
+        let fact = value["guardian_facts"]
+            .as_array()
+            .expect("guardian facts")
+            .iter()
+            .find(|fact| fact["id"] == "performance_rules_invalid")
+            .expect("invalid rules fact");
+        assert_eq!(fact["domain"], "Performance");
+        assert_eq!(fact["severity"], "Degraded");
+        assert_eq!(fact["confidence"], "High");
+        assert_eq!(fact["ownership"], "ExternalProviderDerived");
+        assert_omits_raw_fragments(
+            &body,
+            &[
+                remote_url,
+                "private-feed",
+                "api_token",
+                "secret-token",
+                &cache_path.display().to_string(),
+            ],
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -1194,6 +2002,32 @@ mod tests {
             value,
             serde_json::json!({ "error": "performance remote rules url is not configured" })
         );
+        let journal = fixture
+            .state
+            .journals()
+            .latest_for_command(crate::state::contracts::CommandKind::RefreshPerformanceRules)
+            .expect("refresh journal");
+        assert_eq!(
+            journal.status,
+            crate::state::contracts::OperationStatus::Failed
+        );
+        assert_eq!(
+            journal.failure_point.as_deref(),
+            Some("refresh_remote_rules")
+        );
+        assert_eq!(
+            journal.outcome,
+            Some(crate::state::contracts::OperationOutcome::Failed)
+        );
+        assert!(journal.targets.iter().any(|target| {
+            target.id == "performance_rules_remote_source"
+                && target.ownership
+                    == crate::state::contracts::OwnershipClass::ExternalProviderDerived
+        }));
+        assert!(journal.targets.iter().any(|target| {
+            target.id == "performance_rules_cache"
+                && target.ownership == crate::state::contracts::OwnershipClass::LauncherManaged
+        }));
     }
 
     #[tokio::test]
@@ -1228,7 +2062,7 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("read body");
-        let status: PerformanceRulesStatus =
+        let status: croopor_performance::PerformanceRulesStatus =
             serde_json::from_slice(&body).expect("rules status json");
         assert_eq!(status.rule_source, croopor_performance::RuleSource::Remote);
         assert_eq!(
@@ -1242,6 +2076,38 @@ mod tests {
             croopor_performance::RulesValidation::Valid
         );
         assert!(status.warnings.is_empty());
+        let journal = fixture
+            .state
+            .journals()
+            .latest_for_command(crate::state::contracts::CommandKind::RefreshPerformanceRules)
+            .expect("refresh journal");
+        assert_eq!(
+            journal.status,
+            crate::state::contracts::OperationStatus::Succeeded
+        );
+        assert_eq!(journal.failure_point, None);
+        assert_eq!(
+            journal.outcome,
+            Some(crate::state::contracts::OperationOutcome::Succeeded)
+        );
+        assert_eq!(journal.planned_steps.len(), 1);
+        assert_eq!(journal.completed_steps.len(), 1);
+        assert!(journal.targets.iter().any(|target| {
+            target.id == "performance_rules_remote_source"
+                && target.ownership
+                    == crate::state::contracts::OwnershipClass::ExternalProviderDerived
+        }));
+        assert!(journal.targets.iter().any(|target| {
+            target.id == "performance_rules_cache"
+                && target.ownership == crate::state::contracts::OwnershipClass::LauncherManaged
+        }));
+        assert_eq!(
+            journal.completed_steps[0]
+                .changed_target
+                .as_ref()
+                .map(|target| target.ownership),
+            Some(crate::state::contracts::OwnershipClass::LauncherManaged)
+        );
     }
 
     #[tokio::test]
@@ -1276,7 +2142,7 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("read body");
-        let status: PerformanceRulesStatus =
+        let status: croopor_performance::PerformanceRulesStatus =
             serde_json::from_slice(&body).expect("rules status json");
         assert_eq!(status.rule_source, croopor_performance::RuleSource::BuiltIn);
         assert!(status.remote_refresh);
@@ -1354,11 +2220,16 @@ mod tests {
         let raw_parser = serde_json::from_str::<serde_json::Value>("{not json")
             .expect_err("invalid json")
             .to_string();
-        let response = invalid_health_response(PERFORMANCE_STATE_PARSE_WARNING);
+        let response = invalid_health_response(
+            PERFORMANCE_STATE_PARSE_WARNING,
+            Vec::new(),
+            test_performance_display(),
+        );
         let warnings = response.warnings.join("\n");
 
         assert_eq!(warnings, PERFORMANCE_STATE_PARSE_WARNING);
         assert!(!warnings.contains(&raw_parser));
+        assert!(response.guardian_facts.is_empty());
     }
 
     #[tokio::test]
@@ -1393,7 +2264,7 @@ mod tests {
             Query(PlanQuery {
                 game_version: Some("1.20.4".to_string()),
                 loader: Some("fabric".to_string()),
-                mode: Some("turbo".to_string()),
+                mode: Some(r"C:\Users\Alice\.minecraft --accessToken raw-secret".to_string()),
                 instance_id: None,
             }),
         )
@@ -1401,9 +2272,19 @@ mod tests {
         .expect_err("invalid mode should fail");
 
         assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        let body = serde_json::to_string(&error.1.0).expect("error json");
         assert_eq!(
             error.1.0,
-            serde_json::json!({ "error": "invalid performance mode: turbo" })
+            serde_json::json!({ "error": "invalid performance mode" })
+        );
+        assert_omits_raw_fragments(
+            &body,
+            &[
+                "C:\\Users\\Alice",
+                ".minecraft",
+                "--accessToken",
+                "raw-secret",
+            ],
         );
     }
 
@@ -1427,6 +2308,101 @@ mod tests {
         assert_eq!(response.plan.mode, PerformanceMode::Custom);
         assert_eq!(response.plan.loader, "fabric");
         assert!(response.plan.mods.is_empty());
+    }
+
+    #[tokio::test]
+    async fn plan_effective_contract_covers_managed_vanilla_and_custom_modes() {
+        let fixture = TestFixture::new("plan-effective-contract-modes");
+
+        for (raw_mode, expected_active) in
+            [("managed", true), ("vanilla", false), ("custom", false)]
+        {
+            let Json(response) = handle_plan(
+                State(fixture.state.clone()),
+                Query(PlanQuery {
+                    game_version: Some("1.20.4".to_string()),
+                    loader: Some("fabric".to_string()),
+                    mode: Some(raw_mode.to_string()),
+                    instance_id: None,
+                }),
+            )
+            .await
+            .expect("effective plan should serialize");
+
+            assert_eq!(response.active, expected_active);
+            assert_eq!(response.effective.active, expected_active);
+            assert_eq!(response.effective.selected_mode, response.plan.mode);
+            assert_eq!(response.effective.version_family, response.plan.family);
+            assert_eq!(response.effective.loader, response.plan.loader);
+            assert!(!response.effective.explanation.summary.trim().is_empty());
+            assert!(
+                response.effective.explanation.summary.len() <= 180,
+                "{}",
+                response.effective.explanation.summary
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_route_preserves_flat_legacy_fields_and_adds_effective_payload() {
+        let fixture = TestFixture::new("plan-effective-route-shape");
+
+        let response = router()
+            .with_state(fixture.state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/performance/plan?game_version=1.20.4&loader=fabric&mode=managed")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("route response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("plan json");
+
+        assert_eq!(value["active"], true);
+        assert_eq!(value["mode"], "managed");
+        assert!(value.get("composition_id").is_some());
+        assert!(value["guardian_facts"].is_array());
+        assert_eq!(value["effective"]["active"], true);
+        assert_eq!(value["effective"]["selected_mode"], "managed");
+        assert_eq!(value["effective"]["version_family"], value["family"]);
+        assert_eq!(value["effective"]["loader"], value["loader"]);
+        assert!(value["effective"]["composition"]["tier"].is_string());
+        assert!(value["effective"]["managed_artifacts"].is_array());
+        assert!(
+            value["effective"]["explanation"]["summary"]
+                .as_str()
+                .is_some_and(|summary| !summary.trim().is_empty())
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_effective_contract_preserves_hyphenated_family_d_composition_id() {
+        let fixture = TestFixture::new("plan-effective-family-d-identity");
+
+        let Json(response) = handle_plan(
+            State(fixture.state.clone()),
+            Query(PlanQuery {
+                game_version: Some("1.15.2".to_string()),
+                loader: Some("fabric".to_string()),
+                mode: Some("managed".to_string()),
+                instance_id: None,
+            }),
+        )
+        .await
+        .expect("family d plan should serialize");
+
+        assert_eq!(response.plan.composition_id, "family-d-vanilla-enhanced");
+        assert!(response.effective.composition.selected);
+        assert_eq!(
+            response.effective.composition.id.as_deref(),
+            Some(response.plan.composition_id.as_str())
+        );
     }
 
     #[tokio::test]
@@ -1469,7 +2445,11 @@ mod tests {
         let Json(status) = handle_rules_refresh(State(fixture.state.clone()))
             .await
             .expect("remote manifest should refresh");
-        assert_eq!(status.rule_source, croopor_performance::RuleSource::Remote);
+        assert_eq!(
+            status.status.rule_source,
+            croopor_performance::RuleSource::Remote
+        );
+        assert!(status.guardian_facts.is_empty());
         let instance_id = fixture.add_instance("Managed", "1.20.4-fabric");
         let mods_dir = fixture
             .state
@@ -1518,7 +2498,11 @@ mod tests {
         let Json(status) = handle_rules_refresh(State(fixture.state.clone()))
             .await
             .expect("remote manifest should refresh");
-        assert_eq!(status.rule_source, croopor_performance::RuleSource::Remote);
+        assert_eq!(
+            status.status.rule_source,
+            croopor_performance::RuleSource::Remote
+        );
+        assert!(status.guardian_facts.is_empty());
         let instance_id = fixture.add_instance("Managed", "1.20.4-fabric");
         let mods_dir = fixture
             .state
@@ -1658,6 +2642,165 @@ mod tests {
         assert!(value.to_string().contains("managed.jar"));
         assert!(!value.to_string().contains(&mods_dir.display().to_string()));
         assert!(!value.to_string().contains(&valid_sha512()));
+        assert_eq!(response.proof.health, bundle_health_token(response.health));
+        assert_eq!(
+            response.proof.target.ownership,
+            crate::state::contracts::OwnershipClass::CompositionManaged
+        );
+        assert!(
+            response
+                .proof
+                .fields
+                .iter()
+                .any(|field| { field.key == "managed_artifact_count" && field.value == "1" })
+        );
+        assert!(
+            !serde_json::to_string(&response.proof)
+                .expect("serialize proof")
+                .contains("managed.jar")
+        );
+        assert!(!response.view_model.title.trim().is_empty());
+        assert!(!response.view_model.detail.trim().is_empty());
+        assert_eq!(response.view_model.managed_artifact_count, 1);
+        assert_eq!(
+            response.view_model.health.as_deref(),
+            Some(bundle_health_token(response.health))
+        );
+        assert!(
+            !serde_json::to_string(&response.view_model)
+                .expect("serialize view model")
+                .contains("managed.jar")
+        );
+        assert_eq!(response.display.memory.label, "0.5 to 4 GB");
+        assert_eq!(response.display.runtime.label, "Java 21");
+        assert!(response.display.runtime.detected);
+        assert_eq!(response.display.mode.mode, "managed");
+        assert_eq!(response.display.mode.source, "global");
+    }
+
+    #[tokio::test]
+    async fn health_response_exposes_degraded_and_fallback_guardian_view_models_and_proofs() {
+        let degraded = TestFixture::new("health-degraded-contract");
+        let degraded_instance = degraded.add_instance("Managed", "1.20.4-fabric");
+        degraded.write_fabric_version("1.20.4-fabric", "1.20.4");
+        let degraded_mods_dir = degraded
+            .state
+            .instances()
+            .game_dir(&degraded_instance)
+            .join("mods");
+        fs::create_dir_all(&degraded_mods_dir).expect("create degraded mods dir");
+        fs::write(degraded_mods_dir.join("managed.jar"), b"managed")
+            .expect("write degraded managed file");
+        let mut degraded_state = test_composition_state(
+            "family-f-fabric-core",
+            vec![InstalledMod {
+                project_id: "sodium".to_string(),
+                version_id: "version-a".to_string(),
+                filename: "managed.jar".to_string(),
+                ownership_class: croopor_performance::OwnershipClass::CompositionManaged,
+                source: test_modrinth_source(),
+                integrity: croopor_performance::ManagedArtifactIntegrity {
+                    sha512: valid_sha512(),
+                    sha512_verified: true,
+                },
+            }],
+        );
+        degraded_state.failure_count = 1;
+        degraded_state.last_failure = "managed artifact install failed".to_string();
+        croopor_performance::state::save_state(&degraded_mods_dir, &degraded_state)
+            .expect("save degraded state");
+        croopor_performance::state::save_rollback_snapshot(&degraded_mods_dir, &degraded_state)
+            .expect("save degraded rollback snapshot");
+
+        let Json(degraded_response) = handle_health(
+            State(degraded.state.clone()),
+            Query(HealthQuery {
+                instance_id: Some(degraded_instance),
+            }),
+        )
+        .await
+        .expect("degraded health should serialize");
+
+        assert_eq!(degraded_response.health, BundleHealth::Degraded);
+        assert_eq!(degraded_response.proof.health, "degraded");
+        assert_eq!(degraded_response.proof.rollback, RollbackState::Available);
+        assert_eq!(
+            degraded_response.view_model.state_id,
+            "performance_summary_degraded"
+        );
+        assert_eq!(
+            degraded_response.view_model.health.as_deref(),
+            Some("degraded")
+        );
+        let degraded_fact = degraded_response
+            .guardian_facts
+            .iter()
+            .find(|fact| fact.id.as_str() == "performance_health_degraded")
+            .expect("degraded Guardian fact");
+        assert_eq!(
+            degraded_fact.ownership,
+            crate::state::contracts::OwnershipClass::CompositionManaged
+        );
+        assert_eq!(
+            degraded_fact.severity,
+            Some(crate::guardian::GuardianSeverity::Degraded)
+        );
+
+        let fallback = TestFixture::new("health-fallback-contract");
+        let fallback_instance = fallback.add_instance("Managed", "1.20.4-fabric");
+        fallback.write_fabric_version("1.20.4-fabric", "1.20.4");
+        let fallback_mods_dir = fallback
+            .state
+            .instances()
+            .game_dir(&fallback_instance)
+            .join("mods");
+        fs::create_dir_all(&fallback_mods_dir).expect("create fallback mods dir");
+        let fallback_state = CompositionState {
+            composition_id: "family-f-vanilla-enhanced".to_string(),
+            tier: CompositionTier::VanillaEnhanced,
+            installed_mods: Vec::new(),
+            installed_at: "2026-05-30T00:00:00Z".to_string(),
+            failure_count: 0,
+            last_failure: String::new(),
+        };
+        croopor_performance::state::save_state(&fallback_mods_dir, &fallback_state)
+            .expect("save fallback state");
+        croopor_performance::state::save_rollback_snapshot(&fallback_mods_dir, &fallback_state)
+            .expect("save fallback rollback snapshot");
+
+        let Json(fallback_response) = handle_health(
+            State(fallback.state.clone()),
+            Query(HealthQuery {
+                instance_id: Some(fallback_instance),
+            }),
+        )
+        .await
+        .expect("fallback health should serialize");
+
+        assert_eq!(fallback_response.health, BundleHealth::Fallback);
+        assert_eq!(fallback_response.proof.health, "fallback");
+        assert_eq!(fallback_response.proof.rollback, RollbackState::Available);
+        assert_eq!(
+            fallback_response.view_model.state_id,
+            "performance_summary_fallback"
+        );
+        assert_eq!(
+            fallback_response.view_model.health.as_deref(),
+            Some("fallback")
+        );
+        let fallback_fact = fallback_response
+            .guardian_facts
+            .iter()
+            .find(|fact| fact.id.as_str() == "performance_health_fallback")
+            .expect("fallback Guardian fact");
+        assert_eq!(
+            fallback_fact.ownership,
+            crate::state::contracts::OwnershipClass::CompositionManaged
+        );
+        assert_eq!(
+            fallback_fact.severity,
+            Some(crate::guardian::GuardianSeverity::Warning)
+        );
     }
 
     #[tokio::test]
@@ -1686,7 +2829,11 @@ mod tests {
         let Json(status) = handle_rules_refresh(State(fixture.state.clone()))
             .await
             .expect("remote manifest should refresh");
-        assert_eq!(status.rule_source, croopor_performance::RuleSource::Remote);
+        assert_eq!(
+            status.status.rule_source,
+            croopor_performance::RuleSource::Remote
+        );
+        assert!(status.guardian_facts.is_empty());
         let instance_id = fixture.add_instance("Managed", "1.20.4-fabric");
         fixture.write_fabric_version("1.20.4-fabric", "1.20.4");
         let mods_dir = fixture
@@ -1778,6 +2925,18 @@ mod tests {
             response.warnings,
             vec!["invalid performance artifact ownership metadata".to_string()]
         );
+        assert_eq!(response.guardian_facts.len(), 1);
+        let fact = &response.guardian_facts[0];
+        assert_eq!(fact.id.as_str(), "performance_user_owned_conflict");
+        assert_eq!(fact.domain, crate::guardian::GuardianDomain::Performance);
+        assert_eq!(
+            fact.severity,
+            Some(crate::guardian::GuardianSeverity::Blocking)
+        );
+        assert_eq!(
+            fact.confidence,
+            Some(crate::guardian::GuardianConfidence::Confirmed)
+        );
     }
 
     #[tokio::test]
@@ -1829,6 +2988,75 @@ mod tests {
         assert_eq!(
             error.1.0,
             serde_json::json!({ "error": "instance not found" })
+        );
+    }
+
+    #[tokio::test]
+    async fn install_invalid_action_returns_redacted_json_error() {
+        let fixture = TestFixture::new("install-invalid-action");
+        let instance_id = fixture.add_instance("Managed", "1.20.4-fabric");
+
+        let error = handle_install(
+            State(fixture.state.clone()),
+            Json(InstallRequest {
+                instance_id: Some(instance_id),
+                game_version: None,
+                loader: None,
+                mode: None,
+                action: Some("/Users/alice/.minecraft --accessToken raw-secret".to_string()),
+                rollback_id: None,
+                queued: None,
+            }),
+        )
+        .await
+        .expect_err("invalid action should fail");
+
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        let body = serde_json::to_string(&error.1.0).expect("error json");
+        assert_eq!(
+            error.1.0,
+            serde_json::json!({ "error": "invalid performance action" })
+        );
+        assert_omits_raw_fragments(
+            &body,
+            &["/Users/alice", ".minecraft", "--accessToken", "raw-secret"],
+        );
+    }
+
+    #[tokio::test]
+    async fn install_invalid_mode_returns_redacted_json_error() {
+        let fixture = TestFixture::new("install-invalid-mode");
+        let instance_id = fixture.add_instance("Managed", "1.20.4-fabric");
+
+        let error = handle_install(
+            State(fixture.state.clone()),
+            Json(InstallRequest {
+                instance_id: Some(instance_id),
+                game_version: None,
+                loader: None,
+                mode: Some(r"C:\Users\Alice\.minecraft --accessToken raw-secret".to_string()),
+                action: None,
+                rollback_id: None,
+                queued: None,
+            }),
+        )
+        .await
+        .expect_err("invalid mode should fail");
+
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        let body = serde_json::to_string(&error.1.0).expect("error json");
+        assert_eq!(
+            error.1.0,
+            serde_json::json!({ "error": "invalid performance mode" })
+        );
+        assert_omits_raw_fragments(
+            &body,
+            &[
+                "C:\\Users\\Alice",
+                ".minecraft",
+                "--accessToken",
+                "raw-secret",
+            ],
         );
     }
 
@@ -1891,6 +3119,43 @@ mod tests {
         assert!(!mods_dir.join("managed.jar").exists());
         assert!(!mods_dir.join(".croopor-lock.json").exists());
         assert!(mods_dir.join("user.jar").is_file());
+        let journal = fixture
+            .state
+            .journals()
+            .latest_for_command(crate::state::contracts::CommandKind::ApplyPerformancePlan)
+            .expect("remove journal");
+        assert_eq!(
+            journal.status,
+            crate::state::contracts::OperationStatus::Succeeded
+        );
+        assert_eq!(
+            journal.rollback,
+            crate::state::contracts::RollbackState::Available
+        );
+        assert!(journal.targets.iter().any(|target| {
+            target.id == "core"
+                && target.ownership == crate::state::contracts::OwnershipClass::CompositionManaged
+        }));
+        assert_eq!(journal.completed_steps.len(), 1);
+        assert_eq!(
+            journal.completed_steps[0].step_id,
+            "remove_performance_plan"
+        );
+        assert_eq!(
+            journal.completed_steps[0]
+                .changed_target
+                .as_ref()
+                .map(|target| (target.id.as_str(), target.ownership)),
+            Some((
+                "core",
+                crate::state::contracts::OwnershipClass::CompositionManaged
+            ))
+        );
+        assert!(
+            journal.completed_steps[0]
+                .generated_facts
+                .contains(&"performance_rollback_evidence".to_string())
+        );
     }
 
     #[tokio::test]
@@ -2094,11 +3359,17 @@ mod tests {
         assert!(snapshots.iter().any(|snapshot| {
             snapshot["id"] == first.id
                 && snapshot["composition_id"] == "core-a"
+                && snapshot["artifact_count"] == 1
+                && snapshot["ownership_class"] == "composition_managed"
+                && snapshot["rollback_available"] == true
                 && snapshot["latest"] == false
         }));
         assert!(snapshots.iter().any(|snapshot| {
             snapshot["id"] == second.id
                 && snapshot["composition_id"] == "core-b"
+                && snapshot["artifact_count"] == 1
+                && snapshot["ownership_class"] == "composition_managed"
+                && snapshot["rollback_available"] == true
                 && snapshot["latest"] == true
         }));
     }
@@ -2174,6 +3445,39 @@ mod tests {
             b"managed-a"
         );
         assert!(!mods_dir.join("managed-b.jar").exists());
+        let journal = fixture
+            .state
+            .journals()
+            .latest_for_command(crate::state::contracts::CommandKind::ApplyPerformancePlan)
+            .expect("rollback journal");
+        assert_eq!(
+            journal.status,
+            crate::state::contracts::OperationStatus::Succeeded
+        );
+        assert_eq!(
+            journal.rollback,
+            crate::state::contracts::RollbackState::Available
+        );
+        assert_eq!(journal.completed_steps.len(), 1);
+        assert_eq!(
+            journal.completed_steps[0].rollback,
+            crate::state::contracts::RollbackState::Applied
+        );
+        assert_eq!(
+            journal.completed_steps[0]
+                .changed_target
+                .as_ref()
+                .map(|target| (target.id.as_str(), target.ownership)),
+            Some((
+                "core-a",
+                crate::state::contracts::OwnershipClass::CompositionManaged
+            ))
+        );
+        assert!(
+            journal.completed_steps[0]
+                .generated_facts
+                .contains(&"performance_rollback_evidence".to_string())
+        );
     }
 
     #[tokio::test]
@@ -2396,6 +3700,114 @@ mod tests {
         assert_eq!(response.instance_id, "instance-a");
         assert_eq!(response.action, "install");
         assert_eq!(response.state, "applying");
+    }
+
+    #[tokio::test]
+    async fn operation_status_routes_redact_payload_and_error_details() {
+        let fixture = TestFixture::new("operation-status-redaction");
+        let instance_id = fixture.add_instance("Managed", "1.20.4-fabric");
+        let started = fixture
+            .state
+            .performance_operations()
+            .start(
+                instance_id.clone(),
+                "install/provider_payload=secret-token".to_string(),
+                PerformanceOperationPayload {
+                    game_version: Some("/Users/alice/.minecraft/private-version".to_string()),
+                    loader: Some("fabric".to_string()),
+                    mode: Some("managed --accessToken secret-token".to_string()),
+                    rollback_id: Some("rb-old\\secret".to_string()),
+                },
+            )
+            .await
+            .expect("operation starts");
+        fixture
+            .state
+            .performance_operations()
+            .record_failed(
+                &started.id,
+                "provider_payload={\"url\":\"https://cdn.example.test/private-provider/sodium-secret.jar?token=secret-token\"}; java_path=C:\\Users\\Alice\\Java\\bin\\java.exe; -Xmx8192M",
+            )
+            .await;
+
+        let response = router()
+            .with_state(fixture.state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/performance/operations/{}", started.id))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("route response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let body = String::from_utf8(body.to_vec()).expect("utf8 body");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("operation json");
+
+        assert_eq!(value["state"], "failed");
+        assert_eq!(value["action"], "unknown");
+        assert_eq!(value["error"], "performance operation failed");
+        assert_eq!(value["payload"]["game_version"], "redacted");
+        assert_eq!(value["payload"]["loader"], "fabric");
+        assert_eq!(value["payload"]["mode"], "redacted");
+        assert_eq!(value["payload"]["rollback_id"], "redacted");
+        assert_omits_raw_fragments(
+            &body,
+            &[
+                "/Users/alice",
+                "C:\\Users\\Alice",
+                "provider_payload",
+                "private-provider",
+                "sodium-secret.jar",
+                "secret-token",
+                "-Xmx8192M",
+            ],
+        );
+
+        let response = router()
+            .with_state(fixture.state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/performance/instances/{instance_id}/operation"
+                    ))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("instance route response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read instance body");
+        let body = String::from_utf8(body.to_vec()).expect("utf8 instance body");
+        let value: serde_json::Value =
+            serde_json::from_str(&body).expect("instance operation json");
+
+        assert_eq!(value["operation"]["id"], started.id);
+        assert_eq!(value["operation"]["action"], "unknown");
+        assert_eq!(value["operation"]["error"], "performance operation failed");
+        assert_eq!(value["operation"]["payload"]["game_version"], "redacted");
+        assert_eq!(value["operation"]["payload"]["loader"], "fabric");
+        assert_eq!(value["operation"]["payload"]["mode"], "redacted");
+        assert_eq!(value["operation"]["payload"]["rollback_id"], "redacted");
+        assert_omits_raw_fragments(
+            &body,
+            &[
+                "/Users/alice",
+                "C:\\Users\\Alice",
+                "provider_payload",
+                "private-provider",
+                "sodium-secret.jar",
+                "secret-token",
+                "-Xmx8192M",
+            ],
+        );
     }
 
     #[tokio::test]
@@ -2777,12 +4189,54 @@ mod tests {
         })
     }
 
+    fn seed_repeated_performance_memory(state: &AppState, composition_id: &str, count: u32) {
+        let target = crate::state::contracts::TargetDescriptor::new(
+            crate::state::contracts::StabilizationSystem::Performance,
+            crate::state::contracts::TargetKind::PerformanceComposition,
+            composition_id,
+            crate::state::contracts::OwnershipClass::CompositionManaged,
+        );
+        let mut entry = crate::state::failure_memory::GuardianFailureMemoryEntry::observed(
+            crate::guardian::DiagnosisId::new("performance_fallback_selected"),
+            crate::guardian::GuardianDomain::Performance,
+            target,
+            crate::guardian::GuardianMode::Managed,
+            Some("intent"),
+            "2026-06-15T12:00:00Z",
+        );
+        entry.occurrence_count = count;
+        state
+            .failure_memory()
+            .record(entry)
+            .expect("record performance failure memory");
+    }
+
     fn test_operation_payload() -> PerformanceOperationPayload {
         PerformanceOperationPayload {
             game_version: None,
             loader: None,
             mode: None,
             rollback_id: None,
+        }
+    }
+
+    fn test_performance_display() -> PerformanceInstanceDisplay {
+        PerformanceInstanceDisplay {
+            memory: PerformanceMemoryDisplay {
+                min_gb: 1.0,
+                max_gb: 4.0,
+                label: "1 to 4 GB".to_string(),
+            },
+            runtime: PerformanceRuntimeDisplay {
+                detected: true,
+                label: "Java 17".to_string(),
+            },
+            mode: PerformanceModeDisplay {
+                mode: "managed".to_string(),
+                label: "Managed".to_string(),
+                source: "global".to_string(),
+                source_label: "Global default".to_string(),
+            },
         }
     }
 

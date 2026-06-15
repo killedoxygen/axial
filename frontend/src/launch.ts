@@ -9,7 +9,7 @@ import {
   onNativeEvent,
   startNativeLaunchEvents,
 } from './native';
-import { config, launchState, runningSessions, selectedInstance, selectedVersion, instanceLaunchDrafts } from './store';
+import { config, launchState, runningSessions, selectedInstance, instanceLaunchDrafts } from './store';
 import {
   clearLaunchNotice,
   confirmLaunch,
@@ -23,31 +23,16 @@ import {
   updateRunningSessionState,
 } from './actions';
 import { launchStageView, type LaunchStage } from './launch-stages';
-import type { Config, GuardianSummary, HealingEvent, Instance, LaunchHealingSummary } from './types';
+import type { Config, Instance, LaunchNotice, LaunchSessionOutcome } from './types';
 
 const PRE_RESPONSE_STAGE_CAP_PCT = 87;
 const LIVE_LAUNCH_UPDATES_UNAVAILABLE = 'Live launch updates are unavailable.';
-const OFFLINE_LAUNCH_AVAILABLE_DETAIL = 'Offline launch remains available for singleplayer and offline-mode servers.';
 const PRE_RESPONSE_STAGE_TICKS: Array<{ atMs: number; stage: LaunchStage }> = [
   { atMs: 700, stage: 'preparing' },
   { atMs: 1800, stage: 'prewarming' },
   { atMs: 3400, stage: 'starting' },
   { atMs: 6200, stage: 'monitoring' },
 ];
-
-interface LaunchAuthFailurePayload {
-  error?: string;
-  failure_class?: string;
-  launch_auth_mode?: string;
-  online_mode_ready?: boolean;
-  auth_refresh_status?: string;
-  auth_refresh_reason?: string;
-}
-
-interface LaunchAuthFailureNotice {
-  message: string;
-  details: string[];
-}
 
 function rollbackLaunch(instanceId: string, animationFrameId: number | null): void {
   if (animationFrameId !== null) cancelAnimationFrame(animationFrameId);
@@ -93,354 +78,58 @@ function updateRunningSession(instanceId: string, patch: Partial<import('./types
   updateRunningSessionState(instanceId, patch);
 }
 
-function describeFailureClass(failureClass: string | undefined): string {
-  switch (failureClass) {
-    case 'jvm_unsupported_option':
-      return 'unsupported JVM option';
-    case 'jvm_experimental_unlock':
-      return 'experimental JVM option requires unlock';
-    case 'jvm_option_ordering':
-      return 'JVM option ordering conflict';
-    case 'java_runtime_mismatch':
-      return 'Java runtime mismatch';
-    case 'classpath_module_conflict':
-      return 'classpath or module conflict';
-    case 'auth_mode_incompatible':
-      return 'auth mode incompatibility';
-    case 'loader_bootstrap_failure':
-      return 'loader bootstrap failure';
-    default:
-      return 'startup failure';
+function launchSessionOutcome(value: unknown): LaunchSessionOutcome | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const candidate = value as Partial<LaunchSessionOutcome>;
+  if (
+    candidate.kind !== 'clean' &&
+    candidate.kind !== 'stopped' &&
+    candidate.kind !== 'failed' &&
+    candidate.kind !== 'unknown'
+  ) {
+    return undefined;
   }
-}
-
-function ensureSentence(text: string): string {
-  const trimmed = text.trim();
-  if (!trimmed) return '';
-  if (/[.!?]$/.test(trimmed)) return trimmed;
-  return `${trimmed}.`;
-}
-
-function formatHealingDetail(detail: string): string {
-  return ensureSentence(detail);
-}
-
-function healingToastMessage(healing: LaunchHealingSummary): string {
-  if (healing.failure_class && (!healing.retry_count || healing.retry_count === 0) && !healing.fallback_applied) {
-    if (healing.failure_class === 'java_runtime_mismatch') {
-      return 'Launch stopped before startup because the required Java runtime was not available.';
-    }
-    return 'Launch stopped before startup because the selected setup was not compatible.';
-  }
-  if (healing.retry_count && healing.retry_count > 0) {
-    return 'Launch recovered automatically with safer settings.';
-  }
-  if (healing.fallback_applied || (healing.warnings && healing.warnings.length > 0)) {
-    return 'Launch settings were adjusted for compatibility.';
-  }
-  return '';
-}
-
-function formatHealingEvent(event: HealingEvent): string {
-  switch (event.kind) {
-    case 'runtime_bypassed':
-      return 'Java override was skipped and the managed runtime was used instead.';
-    case 'preset_downgraded':
-      return event.detail || 'GC preset was adjusted for compatibility.';
-    case 'fallback_applied':
-      return event.detail || 'Croopor retried startup with safer settings.';
-    default:
-      return event.detail || '';
-  }
-}
-
-function pushUniqueNoticeDetail(details: string[], detail: string | undefined): void {
-  const trimmed = detail ? formatHealingDetail(detail) : '';
-  if (!trimmed || details.includes(trimmed)) return;
-  details.push(trimmed);
-}
-
-function healingNoticeDetails(healing: LaunchHealingSummary): string[] {
-  const details: string[] = [];
-  for (const event of healing.events || []) {
-    pushUniqueNoticeDetail(details, formatHealingEvent(event));
-  }
-  for (const warning of healing.warnings || []) {
-    pushUniqueNoticeDetail(details, warning);
-  }
-  pushUniqueNoticeDetail(details, healing.fallback_applied);
-  if (healing.retry_count && healing.retry_count > 0) {
-    pushUniqueNoticeDetail(
-      details,
-      `Recovered automatically after ${healing.retry_count} ${healing.retry_count === 1 ? 'retry' : 'retries'}.`,
-    );
-  }
-  if (healing.failure_class) {
-    pushUniqueNoticeDetail(details, `Reason: ${describeFailureClass(healing.failure_class)}`);
-  }
-  return details;
+  if (typeof candidate.reason !== 'string' || typeof candidate.summary !== 'string') return undefined;
+  return candidate as LaunchSessionOutcome;
 }
 
 function primaryNoticeDetail(details: string[]): string {
   return details[0] || '';
 }
 
-function friendlyLaunchErrorDetail(message: string): string {
-  let detail = message.trim();
-  detail = detail.replace(/^resolve healing:\s*/i, '');
-  detail = detail.replace(/^explicit /i, 'Manual ');
-  if (detail.length > 0) {
-    detail = detail.charAt(0).toUpperCase() + detail.slice(1);
+function backendLaunchNotice(value: unknown): LaunchNotice | null {
+  if (!value || typeof value !== 'object') return null;
+  const candidate = value as Partial<LaunchNotice>;
+  if (typeof candidate.message !== 'string' || !candidate.message.trim()) return null;
+  if (
+    candidate.tone !== 'info' &&
+    candidate.tone !== 'success' &&
+    candidate.tone !== 'warned' &&
+    candidate.tone !== 'intervened' &&
+    candidate.tone !== 'error'
+  ) {
+    return null;
   }
-  return ensureSentence(detail);
-}
-
-function isSelectedOnlineAuthFailure(payload: unknown): payload is LaunchAuthFailurePayload {
-  if (!payload || typeof payload !== 'object') return false;
-  const candidate = payload as LaunchAuthFailurePayload;
-  return (
-    candidate.failure_class === 'auth_mode_incompatible' ||
-    (candidate.launch_auth_mode === 'online' && candidate.online_mode_ready === false)
-  );
-}
-
-function compactTokenLabel(value: string | undefined): string {
-  return String(value || '')
-    .trim()
-    .toLowerCase();
-}
-
-function isSignInRequiredAuthRefresh(status: string, reason: string): boolean {
-  return (
-    status === 'sign_in_required' ||
-    reason === 'refresh_token_missing' ||
-    reason === 'refresh_token_rejected' ||
-    reason === 'refresh_state_unavailable'
-  );
-}
-
-function authSignInRequiredDetail(reason: string): string {
-  switch (reason) {
-    case 'refresh_token_missing':
-      return 'Croopor could not refresh the Microsoft session because the saved sign-in is missing or expired.';
-    case 'refresh_token_rejected':
-      return 'Microsoft rejected the saved sign-in session.';
-    case 'refresh_state_unavailable':
-      return 'Croopor could not read the saved sign-in session.';
-    default:
-      return 'Croopor could not use the saved Microsoft session for Online launch.';
-  }
-}
-
-function authRefreshFailedDetail(status: string, reason: string): string {
-  switch (reason) {
-    case 'auth_chain_failed':
-      return 'Croopor refreshed Microsoft sign-in, but Minecraft account verification did not complete.';
-    case 'client_id_missing':
-      return 'Microsoft sign-in is not configured for this build.';
-    case 'client_build':
-    case 'token_client_unavailable':
-      return 'Croopor could not start Microsoft sign-in refresh.';
-    case 'oauth_refresh_failed':
-    case 'token_endpoint_unreachable':
-    case 'token_endpoint_rejected':
-    case 'token_endpoint_unavailable':
-    case 'token_endpoint_parse_failed':
-      return 'Microsoft sign-in refresh is unavailable or did not complete.';
-    case 'refreshed_account_unusable':
-      return 'The refreshed account could not be used for a verified Minecraft Java launch.';
-    default:
-      return status === 'refresh_unavailable'
-        ? 'Microsoft sign-in refresh is unavailable right now.'
-        : 'Croopor could not verify the Microsoft account for Online launch.';
-  }
-}
-
-export function formatSelectedOnlineAuthFailure(payload: unknown): LaunchAuthFailureNotice | null {
-  if (!isSelectedOnlineAuthFailure(payload)) return null;
-
-  const status = compactTokenLabel(payload.auth_refresh_status);
-  const reason = compactTokenLabel(payload.auth_refresh_reason);
-  if (isSignInRequiredAuthRefresh(status, reason)) {
-    return {
-      message: 'Online launch needs you to sign in again.',
-      details: [
-        authSignInRequiredDetail(reason),
-        'Sign in again from Accounts, then retry Online launch.',
-        OFFLINE_LAUNCH_AVAILABLE_DETAIL,
-      ],
-    };
-  }
-
+  const details = Array.isArray(candidate.details)
+    ? candidate.details.filter((detail): detail is string => typeof detail === 'string' && Boolean(detail.trim()))
+    : [];
+  const detail =
+    typeof candidate.detail === 'string' && candidate.detail.trim() ? candidate.detail : primaryNoticeDetail(details);
   return {
-    message: 'Online launch could not verify your Minecraft account.',
-    details: [
-      authRefreshFailedDetail(status, reason),
-      'Refresh or re-verify the account from Accounts, then retry Online launch.',
-      OFFLINE_LAUNCH_AVAILABLE_DETAIL,
-    ],
+    message: candidate.message,
+    detail,
+    details,
+    tone: candidate.tone,
   };
 }
 
-function guardianNoticeDetails(guardian: GuardianSummary | undefined): string[] {
-  if (!guardian) return [];
-  if (guardian.details && guardian.details.length > 0) {
-    return guardian.details;
-  }
-  const details: string[] = [];
-  for (const intervention of guardian.interventions || []) {
-    pushUniqueNoticeDetail(details, intervention.detail);
-  }
-  for (const guidance of guardian.guidance || []) {
-    pushUniqueNoticeDetail(details, guidance);
-  }
-  return details;
-}
-
-function guardianToastMessage(guardian: GuardianSummary | undefined): string {
-  if (!guardian) return '';
-  if (guardian.message?.trim()) {
-    return guardian.message.trim();
-  }
-  if (guardian.decision === 'blocked') {
-    return 'Guardian blocked an unsafe launch setup.';
-  }
-  if (guardian.decision === 'warned') {
-    return 'Guardian found launch settings to review.';
-  }
-  if (guardian.decision === 'intervened') {
-    return 'Guardian adjusted launch settings for safety.';
-  }
-  return '';
-}
-
-function guardianOwnsLaunchOutcome(
-  guardian: GuardianSummary | undefined,
-  healing: LaunchHealingSummary | undefined,
-  noticeDetails = guardianNoticeDetails(guardian),
-): boolean {
-  if (!guardian) return false;
-  if (guardianHasActionableAuthoredDetails(guardian, noticeDetails)) return true;
-  if (guardian.decision !== 'intervened') return false;
-  if (!healing) return true;
-  return !healing.failure_class && !healing.retry_count;
-}
-
-function guardianHasAuthoredDetails(
-  guardian: GuardianSummary | undefined,
-  noticeDetails = guardianNoticeDetails(guardian),
-): boolean {
-  return Boolean(guardian && noticeDetails.some((detail) => detail.trim()));
-}
-
-function guardianHasActionableAuthoredDetails(
-  guardian: GuardianSummary | undefined,
-  noticeDetails = guardianNoticeDetails(guardian),
-): boolean {
-  return Boolean(
-    guardianHasAuthoredDetails(guardian, noticeDetails) &&
-    (guardian?.decision === 'blocked' || guardian?.decision === 'warned' || guardian?.decision === 'intervened'),
-  );
-}
-
-function guardianOwnsLeadDetail(
-  guardian: GuardianSummary | undefined,
-  noticeDetails = guardianNoticeDetails(guardian),
-): boolean {
-  return guardianHasActionableAuthoredDetails(guardian, noticeDetails);
-}
-
-function launchOutcomeDetails(
-  guardian: GuardianSummary | undefined,
-  healing: LaunchHealingSummary | undefined,
-  leadDetail = '',
-): string[] {
-  // Guardian-authored details lead unless Healing owns the concrete failure.
-  const details: string[] = [];
-  const guardianDetails = guardianNoticeDetails(guardian);
-  const hasGuardianAuthoredDetails = guardianHasAuthoredDetails(guardian, guardianDetails);
-  const guardianOwnsLead = guardianOwnsLeadDetail(guardian, guardianDetails);
-  if (!hasGuardianAuthoredDetails) {
-    pushUniqueNoticeDetail(details, leadDetail);
-  }
-  for (const detail of guardianDetails) {
-    pushUniqueNoticeDetail(details, detail);
-  }
-  if (hasGuardianAuthoredDetails && !guardianOwnsLead) {
-    pushUniqueNoticeDetail(details, leadDetail);
-  }
-  const includeHealing = !guardianOwnsLaunchOutcome(guardian, healing, guardianDetails);
-  if (includeHealing) {
-    for (const detail of healingNoticeDetails(healing || {})) {
-      pushUniqueNoticeDetail(details, detail);
-    }
-  }
-  return details;
-}
-
-function launchOutcomeMessage(
-  guardian: GuardianSummary | undefined,
-  healing: LaunchHealingSummary | undefined,
-  fallbackMessage = '',
-): string {
-  return guardianToastMessage(guardian) || healingToastMessage(healing || {}) || fallbackMessage;
-}
-
-function guardianNoticeTone(guardian: GuardianSummary | undefined): import('./types').LaunchNoticeTone | null {
-  if (guardian?.decision === 'blocked') return 'error';
-  if (guardian?.decision === 'warned') return 'warned';
-  if (guardian?.decision === 'intervened') return 'intervened';
-  return null;
-}
-
-function launchOutcomeTone(
-  guardian: GuardianSummary | undefined,
-  healing: LaunchHealingSummary | undefined,
-): import('./types').LaunchNoticeTone {
-  const guardianTone = guardianNoticeTone(guardian);
-  if (guardianTone) return guardianTone;
-  if (healing?.failure_class) return 'error';
-  if (healing?.retry_count && healing.retry_count > 0) return 'success';
-  return 'info';
-}
-
-function surfaceLaunchOutcome(
-  guardian: GuardianSummary | undefined,
-  healing: LaunchHealingSummary | undefined,
-  instanceId: string,
-  instanceName: string,
-  showNotice = true,
-  leadDetail = '',
-  fallbackMessage = '',
-): boolean {
-  const details = launchOutcomeDetails(guardian, healing, leadDetail);
-  for (const detail of details) {
-    appendLog('system', detail, instanceId, instanceName);
-  }
-  if (!showNotice) return details.length > 0;
-  const message = launchOutcomeMessage(guardian, healing, fallbackMessage);
-  if (!message) return false;
-  setLaunchNotice(instanceId, {
-    message,
-    detail: primaryNoticeDetail(details),
-    details,
-    tone: launchOutcomeTone(guardian, healing),
-  });
-  return true;
-}
-
-function surfaceSelectedOnlineAuthFailure(payload: unknown, instanceId: string, instanceName: string): boolean {
-  const notice = formatSelectedOnlineAuthFailure(payload);
+function surfaceBackendLaunchNotice(value: unknown, instanceId: string, instanceName: string): boolean {
+  const notice = backendLaunchNotice(value);
   if (!notice) return false;
-  for (const detail of notice.details) {
+  for (const detail of notice.details || []) {
     appendLog('system', detail, instanceId, instanceName);
   }
-  setLaunchNotice(instanceId, {
-    message: notice.message,
-    detail: primaryNoticeDetail(notice.details),
-    details: notice.details,
-    tone: 'error',
-  });
+  setLaunchNotice(instanceId, notice);
   return true;
 }
 
@@ -453,8 +142,7 @@ function selectedLaunchMaxMemoryMB(response: any, inst: Instance, cfg: Config | 
 
 export async function launchGame(): Promise<void> {
   const inst = selectedInstance.value;
-  const version = selectedVersion.value;
-  if (!inst || !version?.launchable) return;
+  if (!inst?.launch_action?.launchable) return;
   if (runningSessions.value[inst.id]) return;
   if (launchState.value.status === 'preparing') return;
 
@@ -520,18 +208,7 @@ export async function launchGame(): Promise<void> {
     })();
 
     if (res.error) {
-      const surfaced =
-        surfaceSelectedOnlineAuthFailure(res, inst.id, inst.name) ||
-        surfaceLaunchOutcome(
-          res.guardian,
-          res.healing,
-          inst.id,
-          inst.name,
-          true,
-          friendlyLaunchErrorDetail(res.error),
-          'Launch stopped before startup.',
-        );
-      if (!surfaced) {
+      if (!surfaceBackendLaunchNotice(res.notice, inst.id, inst.name)) {
         showError(res.error);
       }
       launchCommitted = false;
@@ -553,7 +230,7 @@ export async function launchGame(): Promise<void> {
       guardian: res.guardian,
     });
     launchCommitted = true;
-    surfaceLaunchOutcome(res.guardian, res.healing, inst.id, inst.name);
+    surfaceBackendLaunchNotice(res.notice, inst.id, inst.name);
 
     Music.suppress();
     let launchStarted = false;
@@ -584,21 +261,9 @@ export async function launchGame(): Promise<void> {
     if (isApiError(err) && err.payload && typeof err.payload === 'object') {
       const payload = err.payload as {
         error?: string;
-        guardian?: GuardianSummary;
-        healing?: LaunchHealingSummary;
+        notice?: LaunchNotice;
       };
-      const surfaced =
-        surfaceSelectedOnlineAuthFailure(payload, inst.id, inst.name) ||
-        surfaceLaunchOutcome(
-          payload.guardian,
-          payload.healing,
-          inst.id,
-          inst.name,
-          true,
-          friendlyLaunchErrorDetail(payload.error || err.message),
-          'Launch stopped before startup.',
-        );
-      if (!surfaced) showError(payload.error || err.message);
+      if (!surfaceBackendLaunchNotice(payload.notice, inst.id, inst.name)) showError(payload.error || err.message);
       if (!launchCommitted) rollbackLaunch(inst.id, launchAnimationFrameId);
       return;
     }
@@ -654,14 +319,16 @@ async function connectLaunchEvents(
     const prep = launchState.value;
     const matchingPrep = prep.status === 'preparing' && prep.instanceId === instanceId;
     if (session?.sessionId !== sessionId && !matchingPrep) return;
+    const outcome = launchSessionOutcome(data.outcome);
     if (typeof data.state === 'string') updateLaunchPrepStage(instanceId, data.state);
-    if (session && (typeof data.pid === 'number' || data.healing || typeof data.state === 'string')) {
+    if (session && (typeof data.pid === 'number' || data.healing || typeof data.state === 'string' || outcome)) {
       updateRunningSession(instanceId, {
         pid: typeof data.pid === 'number' ? data.pid : session.pid || 0,
         state: typeof data.state === 'string' ? data.state : session.state,
         benchmark: data.benchmark || session.benchmark,
         healing: data.healing || session.healing,
         guardian: data.guardian || session.guardian,
+        outcome: outcome || session.outcome,
       });
     }
     if (data.state === 'running') onStarted?.();
@@ -740,24 +407,21 @@ function onGameExited(
 ): void {
   const session = runningSessions.value[instanceId];
   if (!session || session.sessionId !== sessionId) return;
-  const exitCode = data.exit_code;
+  const exitCode = typeof data.exit_code === 'number' ? data.exit_code : undefined;
+  const outcome = launchSessionOutcome(data.outcome) || session.outcome;
 
   eventSource.close();
   endSession(instanceId);
 
   if (Object.keys(runningSessions.value).length === 0) Music.unsuppress();
-  appendLog('system', `${instanceName || instanceId} exited with code ${exitCode}`, instanceId, instanceName);
-  if (typeof data.failure_class === 'string' && data.failure_class) {
-    surfaceLaunchOutcome(
-      data.guardian,
-      data.healing,
-      instanceId,
-      instanceName,
-      true,
-      formatHealingDetail(`Reason: ${describeFailureClass(data.failure_class)}`),
-      'Startup failed and the launch was stopped cleanly.',
-    );
-  }
+  appendLog(
+    'system',
+    outcome?.summary ||
+      `${instanceName || instanceId} exited${exitCode === undefined ? '' : ` with code ${exitCode}`}.`,
+    instanceId,
+    instanceName,
+  );
+  surfaceBackendLaunchNotice(data.notice, instanceId, instanceName);
 }
 
 export async function killGame(): Promise<void> {

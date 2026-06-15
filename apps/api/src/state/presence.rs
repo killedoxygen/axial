@@ -385,6 +385,7 @@ mod tests {
             failure: None,
             healing: None,
             guardian: None,
+            outcome: None,
             stages: Vec::new(),
         }
     }

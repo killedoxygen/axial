@@ -36,6 +36,13 @@ export interface MinecraftAuthReadiness {
   minecraft_token_expires_in?: number | null;
 }
 
+export interface AccountActionState {
+  state_id: string;
+  label: string;
+  enabled: boolean;
+  disabled_reason?: string;
+}
+
 export interface AuthStatus {
   launch_auth_mode: LaunchAuthMode;
   mode: string;
@@ -51,6 +58,7 @@ export interface AuthStatus {
   msa_provider?: string | null;
   msa_token_expires_in?: number | null;
   msa_refresh_available: boolean;
+  skin_action?: AccountActionState;
 }
 
 export type AuthStatusRecord = AuthStatus & MinecraftAuthReadiness;

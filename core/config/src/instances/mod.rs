@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io;
+use std::ops::Deref;
 use std::path::Path;
 use std::sync::RwLock;
 use thiserror::Error;
@@ -47,6 +48,7 @@ pub struct EnrichedInstance {
     #[serde(flatten)]
     pub instance: Instance,
     pub launchable: bool,
+    pub launch_action: LaunchActionState,
     #[serde(default)]
     pub status_detail: String,
     #[serde(default)]
@@ -57,6 +59,105 @@ pub struct EnrichedInstance {
     pub mods_count: usize,
     pub resource_count: usize,
     pub shader_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchActionTone {
+    Ok,
+    Warn,
+    Err,
+    Mute,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchPrimaryAction {
+    Launch,
+    Install,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LaunchActionState {
+    pub state_id: String,
+    pub label: String,
+    pub tone: LaunchActionTone,
+    pub launchable: bool,
+    pub primary_action: LaunchPrimaryAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
+}
+
+impl LaunchActionState {
+    fn from_readiness(launchable: bool, status_detail: &str, needs_install: &str) -> Self {
+        if launchable {
+            return Self {
+                state_id: "launch_ready".to_string(),
+                label: "Launch".to_string(),
+                tone: LaunchActionTone::Ok,
+                launchable: true,
+                primary_action: LaunchPrimaryAction::Launch,
+                disabled_reason: None,
+            };
+        }
+
+        let disabled_reason = [status_detail, needs_install]
+            .into_iter()
+            .map(str::trim)
+            .find(|value| !value.is_empty())
+            .unwrap_or("Version files are not ready.")
+            .to_string();
+
+        Self {
+            state_id: "install_required".to_string(),
+            label: "Install".to_string(),
+            tone: LaunchActionTone::Warn,
+            launchable: false,
+            primary_action: LaunchPrimaryAction::Install,
+            disabled_reason: Some(disabled_reason),
+        }
+    }
+}
+
+impl EnrichedInstance {
+    pub fn from_instance(
+        instance: Instance,
+        version: Option<&VersionEntry>,
+        game_dir: &Path,
+    ) -> Self {
+        let launchable = version.is_some_and(|entry| entry.launchable);
+        let status_detail = version
+            .map(|entry| entry.status_detail.clone())
+            .unwrap_or_else(|| "version not installed".to_string());
+        let needs_install = version
+            .map(|entry| entry.needs_install.clone())
+            .unwrap_or_default();
+
+        Self {
+            launch_action: LaunchActionState::from_readiness(
+                launchable,
+                &status_detail,
+                &needs_install,
+            ),
+            launchable,
+            status_detail,
+            needs_install,
+            java_major: version.map(|entry| entry.java_major).unwrap_or_default(),
+            saves_count: count_entries(&game_dir.join("saves")),
+            mods_count: count_entries(&game_dir.join("mods")),
+            resource_count: count_entries(&game_dir.join("resourcepacks")),
+            shader_count: count_entries(&game_dir.join("shaderpacks")),
+            instance,
+        }
+    }
+}
+
+impl Deref for EnrichedInstance {
+    type Target = Instance;
+
+    fn deref(&self) -> &Self::Target {
+        &self.instance
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -174,21 +275,7 @@ impl InstanceStore {
                 let version = version_map.get(instance.version_id.as_str()).copied();
                 let game_dir = self.game_dir(&instance.id);
 
-                EnrichedInstance {
-                    launchable: version.is_some_and(|entry| entry.launchable),
-                    status_detail: version
-                        .map(|entry| entry.status_detail.clone())
-                        .unwrap_or_else(|| "version not installed".to_string()),
-                    needs_install: version
-                        .map(|entry| entry.needs_install.clone())
-                        .unwrap_or_default(),
-                    java_major: version.map(|entry| entry.java_major).unwrap_or_default(),
-                    saves_count: count_entries(&game_dir.join("saves")),
-                    mods_count: count_entries(&game_dir.join("mods")),
-                    resource_count: count_entries(&game_dir.join("resourcepacks")),
-                    shader_count: count_entries(&game_dir.join("shaderpacks")),
-                    instance,
-                }
+                EnrichedInstance::from_instance(instance, version, &game_dir)
             })
             .collect()
     }

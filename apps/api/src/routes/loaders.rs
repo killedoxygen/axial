@@ -1,3 +1,9 @@
+use super::install::sanitize_install_progress;
+use crate::application::{
+    InstallVersionCommand, begin_install_operation_journal, install_operation_id,
+    record_install_operation_interrupted, record_install_operation_progress,
+    stage_install_version_command,
+};
 use crate::dto::loaders::{
     LoaderBuildsResponse, LoaderComponentsResponse, LoaderGameVersionsResponse,
 };
@@ -139,6 +145,7 @@ async fn handle_loader_install(
 
     let (install_version_key, install_manifest_key) =
         loader_install_key_fields(build.component_id, &build.build_id, &build.version_id);
+    let target_version_id = build.version_id.clone();
     let install_id = generate_install_id();
     let (install_id, inserted) = state
         .installs()
@@ -149,17 +156,34 @@ async fn handle_loader_install(
             install_manifest_key,
         )
         .await;
+    let operation_id = install_operation_id(&install_id);
+    let staging = stage_install_version_command(
+        InstallVersionCommand {
+            version_id: target_version_id.clone(),
+            manifest_url: None,
+        },
+        install_id.clone(),
+        operation_id.clone(),
+    );
     if !inserted {
-        return Ok(Json(serde_json::json!({ "install_id": install_id })));
+        return Ok(Json(serde_json::json!({
+            "install_id": install_id,
+            "operation_id": operation_id,
+        })));
     }
+    begin_install_operation_journal(state.journals(), &operation_id, &target_version_id);
 
     let store = state.installs().clone();
+    let journals = state.journals().clone();
     let library_dir = PathBuf::from(library_dir);
     let install_id_task = install_id.clone();
+    let operation_id_task = operation_id.clone();
 
     let worker_store = store.clone();
     let worker_install_id = install_id_task.clone();
-    InstallStore::spawn_tracked_worker(
+    let worker_journals = journals.clone();
+    let worker_operation_id = operation_id_task.clone();
+    InstallStore::spawn_tracked_worker_with_interrupt_handler(
         store,
         install_id_task,
         interrupted_loader_install_progress(),
@@ -168,8 +192,18 @@ async fn handle_loader_install(
             let store_task = {
                 let store = worker_store.clone();
                 let install_id = worker_install_id.clone();
+                let journals = worker_journals.clone();
+                let operation_id = worker_operation_id.clone();
                 tokio::spawn(async move {
+                    let mut last_journal_phase = None;
                     while let Some(progress) = progress_rx.recv().await {
+                        let progress = sanitize_install_progress(progress);
+                        record_install_operation_progress(
+                            journals.as_ref(),
+                            &operation_id,
+                            &progress,
+                            &mut last_journal_phase,
+                        );
                         store.emit(&install_id, progress).await;
                     }
                 })
@@ -217,9 +251,15 @@ async fn handle_loader_install(
             drop(progress_tx);
             let _ = store_task.await;
         },
+        move |progress| {
+            record_install_operation_interrupted(journals.as_ref(), &operation_id_task, &progress);
+        },
     );
 
-    Ok(Json(serde_json::json!({ "install_id": install_id })))
+    Ok(Json(serde_json::json!({
+        "install_id": install_id,
+        "operation_id": staging.result.operation_id,
+    })))
 }
 
 async fn handle_loader_install_events(
@@ -240,6 +280,7 @@ async fn handle_loader_install_events(
     let install_id = id.clone();
     let stream = async_stream::stream! {
         for progress in history {
+            let progress = sanitize_install_progress(progress);
             let terminal = progress.done;
             yield Ok(progress_event(&progress));
             if terminal {
@@ -253,6 +294,7 @@ async fn handle_loader_install_events(
         loop {
             match receiver.recv().await {
                 Ok(progress) => {
+                    let progress = sanitize_install_progress(progress);
                     let terminal = progress.done;
                     yield Ok(progress_event(&progress));
                     if terminal {
@@ -278,7 +320,7 @@ fn parse_component_id(
         (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
-                "error": format!("unknown loader component: {component_id}")
+                "error": "unknown loader component"
             })),
         )
     })
@@ -545,6 +587,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_component_id_error_does_not_echo_raw_component() {
+        let (status, Json(body)) =
+            parse_component_id(r"C:\Users\Alice\.minecraft --accessToken raw-secret")
+                .expect_err("invalid component should fail");
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], json!("unknown loader component"));
+        assert_no_raw_fragments(&serde_json::to_string(&body).expect("error json"));
+    }
+
+    #[test]
     fn error_progress_hides_raw_details_and_keeps_terminal_shape() {
         let progress = error_progress(LoaderError::ArtifactMissing(
             "missing https://cdn.example.invalid/path/mod-loader.jar in /tmp/croopor".to_string(),
@@ -616,6 +669,55 @@ mod tests {
             .expect("terminal loader install remains subscribable after stream completion");
         assert!(done);
         assert_eq!(history.len(), 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn loader_install_events_redact_raw_progress_history() {
+        let root = test_root("loader-install-events-redaction");
+        let state = build_test_state(&root);
+        state
+            .installs()
+            .insert("raw-loader-install".to_string())
+            .await;
+        state
+            .installs()
+            .emit(
+                "raw-loader-install",
+                DownloadProgress {
+                    phase: r"C:\Users\Alice\.minecraft --accessToken raw-secret".to_string(),
+                    current: 2,
+                    total: 5,
+                    file: Some("/Users/alice/.croopor/libraries/secret.jar".to_string()),
+                    error: Some(
+                        "provider_payload={\"token\":\"secret\"} account_id=account-secret username=SecretPlayer -Xmx8192M"
+                            .to_string(),
+                    ),
+                    done: false,
+                },
+            )
+            .await;
+        state
+            .installs()
+            .emit("raw-loader-install", done_progress())
+            .await;
+
+        let response = handle_loader_install_events(
+            State(state.clone()),
+            Path("raw-loader-install".to_string()),
+        )
+        .await
+        .expect("loader install events should be served")
+        .into_response();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("sse body should complete");
+        let body = String::from_utf8(body.to_vec()).expect("sse body is utf8");
+
+        assert!(body.contains("\"phase\":\"install\""));
+        assert!(body.contains("Install failed. Check your connection"));
+        assert_no_raw_fragments(&body);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -806,6 +908,16 @@ mod tests {
             "EOF while parsing",
             "line 1 column",
             "mod-loader.jar",
+            "/Users/alice",
+            "C:\\Users\\Alice",
+            "provider_payload",
+            "account_id",
+            "account-secret",
+            "username",
+            "SecretPlayer",
+            "raw-secret",
+            "java.exe",
+            "-Xmx8192M",
         ] {
             assert!(
                 !message.contains(fragment),

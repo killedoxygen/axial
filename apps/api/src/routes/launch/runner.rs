@@ -1,13 +1,28 @@
-use crate::logging::append_trace;
+use crate::application::{launch_application_stage_evidence, launch_boundary_stage_evidence};
+use crate::execution::launch::{
+    LaunchCommandPreparationRequest, launch_command_stage_evidence, prepare_launch_command,
+};
+use crate::execution::process::{
+    ProcessSpawnRequest, process_spawn_failed_stage_evidence, process_spawned,
+    process_stage_evidence,
+};
+use crate::guardian::{
+    GuardianLaunchRecoveryKind, GuardianLaunchRecoveryOutcome, GuardianLaunchRecoveryRequest,
+    GuardianLaunchRecoveryStatus, record_launch_recovery_attempt, record_launch_recovery_failure,
+    startup_failure_guardian_outcome,
+};
+use crate::logging::{append_trace, timestamp_utc};
+use crate::state::contracts::{OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind};
 use crate::state::launch_reports::{LaunchProofContext, LaunchProofResourceBudget};
 use crate::state::{AppState, LaunchStatusEvent, StartupOutcome};
 use croopor_config::{AppConfig, Instance};
 use croopor_launcher::{
     GuardianInterventionKind, GuardianSummary, LaunchFailureClass, LaunchPreparationEvent,
-    LaunchState, PreLaunchAction, PreLaunchDecision, RecoveryAction, StartupFailureDecision,
-    StartupFailureObservation, build_healing_summary, decide_prepare_failure,
-    decide_startup_failure, failure_class_name, guidance_for_failure, launch_state_name,
-    prepare_launch_attempt_with_events, recovery_plan_for_startup_failure,
+    LaunchSessionExitReason, LaunchSessionOutcome, LaunchState, PreLaunchAction, PreLaunchDecision,
+    PreparedLaunchAttempt, RecoveryAction, StartupFailureDecision, StartupFailureObservation,
+    build_healing_summary, decide_prepare_failure, decide_startup_failure, failure_class_name,
+    guidance_for_failure, launch_state_name, prepare_launch_attempt_with_events,
+    recovery_plan_for_startup_failure,
 };
 use serde_json::Value;
 use std::collections::HashSet;
@@ -23,7 +38,7 @@ const PREWARM_REDUCED_MAX_TOTAL_BYTES: u64 = 512 * 1024;
 const PREWARM_REDUCED_MAX_FILE_BYTES: u64 = 128 * 1024;
 const PREWARM_BUFFER_BYTES: usize = 16 * 1024;
 const LIVE_LAUNCH_FAILURE_MAX_CHARS: usize = 180;
-const LIVE_LAUNCH_FAILURE_SAFE_FALLBACK: &str = "Launch failed before Minecraft could start. Detailed diagnostics were hidden because they may contain local paths or secrets.";
+const LIVE_LAUNCH_FAILURE_SAFE_FALLBACK: &str = "Launch failed before Minecraft could start. Detailed diagnostics were hidden because they may contain local paths or private data.";
 
 pub(super) struct LaunchSuccess {
     pub session_id: String,
@@ -47,6 +62,8 @@ pub(super) async fn launch_session(
     task: super::task::LaunchSessionTask,
 ) -> Result<LaunchSuccess, LaunchRequestError> {
     let super::task::LaunchSessionTask {
+        application,
+        boundary,
         mut instance,
         config,
         intent,
@@ -56,6 +73,23 @@ pub(super) async fn launch_session(
         resource_budget,
     } = task;
     let session_id = intent.session_id.clone();
+    trace_launch_event(
+        &session_id,
+        &format!("application command staged: {:?}", application.command.kind),
+    );
+    trace_launch_event(
+        &session_id,
+        &format!(
+            "application launch boundary staged: safety={:?} performance_mode={}",
+            boundary.guardian_decision.kind, boundary.performance_mode
+        ),
+    );
+    let mut initial_evidence = launch_application_stage_evidence(&application);
+    initial_evidence.extend(launch_boundary_stage_evidence(&boundary));
+    state
+        .sessions()
+        .record_stage_evidence(&session_id, initial_evidence)
+        .await;
     if let Some(benchmark_payload) = benchmark.as_ref().map(super::benchmark_status_payload) {
         state
             .sessions()
@@ -66,6 +100,7 @@ pub(super) async fn launch_session(
         .with_benchmark(benchmark)
         .with_resource_budget(resource_budget);
     let mut attempt = croopor_launcher::service::AttemptOverrides::default();
+    let mut last_recovery_kind: Option<GuardianLaunchRecoveryKind> = None;
 
     loop {
         trace_launch_event(&session_id, "launch_session entered");
@@ -125,6 +160,32 @@ pub(super) async fn launch_session(
                         kind,
                         description,
                     } => {
+                        let recovery_kind = pre_launch_recovery_kind(action);
+                        let recovery_outcome = record_guardian_launch_recovery_attempt(
+                            &state,
+                            &session_id,
+                            &intent,
+                            recovery_kind,
+                            failure_class,
+                        );
+                        if recovery_outcome.status == GuardianLaunchRecoveryStatus::Suppressed {
+                            let message = suppressed_launch_recovery_message(recovery_kind);
+                            state
+                                .sessions()
+                                .emit_log(&session_id, "system", message.clone())
+                                .await;
+                            block_guardian_for_suppressed_launch_recovery(&mut guardian, &message);
+                            return Err(fail_launch(
+                                &state,
+                                &session_id,
+                                Some(&proof_context),
+                                failure_class,
+                                &message,
+                                error.healing,
+                                Some(guardian.clone()),
+                            )
+                            .await);
+                        }
                         state
                             .sessions()
                             .emit_log(&session_id, "system", description.clone())
@@ -143,6 +204,7 @@ pub(super) async fn launch_session(
                                 attempt.record_raw_jvm_args_intervention(description);
                             }
                         }
+                        last_recovery_kind = Some(recovery_kind);
                         continue;
                     }
                     PreLaunchDecision::Block {
@@ -155,6 +217,14 @@ pub(super) async fn launch_session(
                             bounded_prepare_failure_reason(class, &message),
                             guidance,
                         );
+                        record_failed_self_healing_if_any(
+                            &state,
+                            &session_id,
+                            &intent,
+                            last_recovery_kind,
+                            class,
+                        )
+                        .await;
                         return Err(fail_launch(
                             &state,
                             &session_id,
@@ -172,6 +242,14 @@ pub(super) async fn launch_session(
                     bounded_prepare_failure_reason(failure_class, &error.message),
                     guidance_for_failure(failure_class, &intent.guardian),
                 );
+                record_failed_self_healing_if_any(
+                    &state,
+                    &session_id,
+                    &intent,
+                    last_recovery_kind,
+                    failure_class,
+                )
+                .await;
                 return Err(fail_launch(
                     &state,
                     &session_id,
@@ -242,18 +320,50 @@ pub(super) async fn launch_session(
             )
             .await;
 
-        if prepared.plan.command.len() < 2 {
-            return Err(fail_launch(
-                &state,
-                &session_id,
-                Some(&proof_context),
-                LaunchFailureClass::Unknown,
-                "launch plan did not produce a runnable command",
-                prepared.healing.clone(),
-                Some(guardian.clone()),
-            )
-            .await);
-        }
+        let launch_command = match prepare_launch_command(LaunchCommandPreparationRequest::new(
+            launch_command_target(&session_id),
+            &prepared.plan.command,
+            &prepared.plan.game_dir,
+        )) {
+            Ok(command) => {
+                state
+                    .sessions()
+                    .record_stage_evidence(
+                        &session_id,
+                        launch_command_stage_evidence(&command.facts),
+                    )
+                    .await;
+                command
+            }
+            Err(error) => {
+                state
+                    .sessions()
+                    .record_stage_evidence(&session_id, launch_command_stage_evidence(&error.facts))
+                    .await;
+                trace_launch_event(
+                    &session_id,
+                    &format!("launch command preparation failed: {}", error),
+                );
+                record_failed_self_healing_if_any(
+                    &state,
+                    &session_id,
+                    &intent,
+                    last_recovery_kind,
+                    LaunchFailureClass::Unknown,
+                )
+                .await;
+                return Err(fail_launch(
+                    &state,
+                    &session_id,
+                    Some(&proof_context),
+                    LaunchFailureClass::Unknown,
+                    &error.to_string(),
+                    prepared.healing.clone(),
+                    Some(guardian.clone()),
+                )
+                .await);
+            }
+        };
 
         emit_status(
             &state,
@@ -274,9 +384,16 @@ pub(super) async fn launch_session(
             .emit_log(&session_id, "system", prewarm_summary)
             .await;
 
-        let mut command = Command::new(&prepared.plan.command[0]);
-        command.args(&prepared.plan.command[1..]);
-        command.current_dir(&prepared.plan.game_dir);
+        trace_launch_event(
+            &session_id,
+            &format!(
+                "launch command prepared facts={}",
+                launch_command.facts.len()
+            ),
+        );
+        let mut command = Command::new(launch_command.program);
+        command.args(launch_command.args);
+        command.current_dir(launch_command.game_dir);
 
         let record = crate::state::LaunchSessionRecord {
             session_id: croopor_launcher::SessionId(session_id.clone()),
@@ -304,14 +421,36 @@ pub(super) async fn launch_session(
                 .as_ref()
                 .and_then(|value| serde_json::to_value(value).ok()),
             guardian: serialize_guardian(Some(guardian.clone())),
+            outcome: None,
             stages: Vec::new(),
         };
 
         let launched = match state.sessions().start_process(record, command).await {
-            Ok(record) => record,
+            Ok(record) => {
+                state
+                    .sessions()
+                    .record_stage_evidence(
+                        &session_id,
+                        launch_spawn_stage_evidence(&session_id, &record),
+                    )
+                    .await;
+                record
+            }
             Err(error) => {
+                state
+                    .sessions()
+                    .record_stage_evidence(&session_id, vec![process_spawn_failed_stage_evidence()])
+                    .await;
                 trace_launch_event(&session_id, &format!("spawn failed: {error}"));
-                return Err(fail_launch(
+                record_failed_self_healing_if_any(
+                    &state,
+                    &session_id,
+                    &intent,
+                    last_recovery_kind,
+                    LaunchFailureClass::Unknown,
+                )
+                .await;
+                return Err(fail_launch_with_outcome(
                     &state,
                     &session_id,
                     Some(&proof_context),
@@ -319,6 +458,9 @@ pub(super) async fn launch_session(
                     &format!("failed to start launch process: {error}"),
                     prepared.healing.clone(),
                     Some(guardian.clone()),
+                    Some(LaunchSessionOutcome::from_reason(
+                        LaunchSessionExitReason::SpawnFailed,
+                    )),
                 )
                 .await);
             }
@@ -411,6 +553,34 @@ pub(super) async fn launch_session(
                         &prepared.effective_preset,
                     )
                 {
+                    let recovery_kind = startup_recovery_kind(&recovery.action);
+                    let recovery_outcome = record_guardian_launch_recovery_attempt(
+                        &state,
+                        &session_id,
+                        &intent,
+                        recovery_kind,
+                        failure_class,
+                    );
+                    if recovery_outcome.status == GuardianLaunchRecoveryStatus::Suppressed {
+                        let message = suppressed_launch_recovery_message(recovery_kind);
+                        state
+                            .sessions()
+                            .emit_log(&session_id, "system", message.clone())
+                            .await;
+                        block_guardian_for_suppressed_launch_recovery(&mut guardian, &message);
+                        let healing =
+                            startup_failure_healing(&intent, &prepared, &attempt, failure_class);
+                        return Err(fail_launch(
+                            &state,
+                            &session_id,
+                            Some(&proof_context),
+                            failure_class,
+                            &message,
+                            healing,
+                            Some(guardian.clone()),
+                        )
+                        .await);
+                    }
                     state
                         .sessions()
                         .emit_log(&session_id, "system", recovery.description.clone())
@@ -449,24 +619,19 @@ pub(super) async fn launch_session(
                             attempt.disable_custom_gc = false;
                         }
                     }
+                    last_recovery_kind = Some(recovery_kind);
                     continue;
                 }
 
-                let healing =
-                    build_healing_summary(croopor_launcher::service::HealingSummaryInput {
-                        auth_mode: if intent.auth.user_type == "msa" {
-                            "online"
-                        } else {
-                            "offline"
-                        },
-                        requested_java_path: &intent.requested_java,
-                        requested_preset: &intent.requested_preset,
-                        effective_java_path: Some(prepared.runtime.effective_path.as_str()),
-                        effective_preset: Some(prepared.effective_preset.as_str()),
-                        fallback_applied: attempt.fallback_applied.as_deref(),
-                        retry_count: attempt.retry_count,
-                        failure_class: Some(failure_class),
-                    });
+                let healing = startup_failure_healing(&intent, &prepared, &attempt, failure_class);
+                record_failed_self_healing_if_any(
+                    &state,
+                    &session_id,
+                    &intent,
+                    last_recovery_kind,
+                    failure_class,
+                )
+                .await;
                 apply_startup_failure_guardian_decision(&mut guardian, &startup_decision);
                 return Err(fail_launch(
                     &state,
@@ -481,6 +646,187 @@ pub(super) async fn launch_session(
             }
         }
     }
+}
+
+fn pre_launch_recovery_kind(action: PreLaunchAction) -> GuardianLaunchRecoveryKind {
+    match action {
+        PreLaunchAction::ForceManagedRuntime => GuardianLaunchRecoveryKind::SwitchManagedRuntime,
+        PreLaunchAction::StripRawJvmArgs => GuardianLaunchRecoveryKind::StripRawJvmArgs,
+    }
+}
+
+fn startup_recovery_kind(action: &RecoveryAction) -> GuardianLaunchRecoveryKind {
+    match action {
+        RecoveryAction::DowngradePreset(_) => GuardianLaunchRecoveryKind::DowngradePreset,
+        RecoveryAction::DisableCustomGc => GuardianLaunchRecoveryKind::DisableCustomGc,
+        RecoveryAction::SwitchManagedRuntime => GuardianLaunchRecoveryKind::SwitchManagedRuntime,
+    }
+}
+
+fn record_guardian_launch_recovery_attempt(
+    state: &AppState,
+    session_id: &str,
+    intent: &croopor_launcher::LaunchIntent,
+    kind: GuardianLaunchRecoveryKind,
+    failure_class: LaunchFailureClass,
+) -> GuardianLaunchRecoveryOutcome {
+    let observed_at = timestamp_utc();
+    let user_intent_hash = launch_recovery_user_intent_hash(intent, kind);
+    let outcome = record_launch_recovery_attempt(GuardianLaunchRecoveryRequest {
+        session_id,
+        mode: launch_policy_guardian_mode(intent.guardian.mode),
+        kind,
+        failure_class,
+        observed_at: observed_at.as_str(),
+        user_intent_hash: Some(user_intent_hash.as_str()),
+        journals: state.journals().as_ref(),
+        failure_memory: state.failure_memory().as_ref(),
+    });
+    trace_launch_event(
+        session_id,
+        &format!(
+            "guardian launch recovery attempt: kind={kind:?} status={:?} operation={}",
+            outcome.status,
+            outcome.operation_id.as_str()
+        ),
+    );
+    outcome
+}
+
+async fn record_failed_self_healing_if_any(
+    state: &AppState,
+    session_id: &str,
+    intent: &croopor_launcher::LaunchIntent,
+    recovery_kind: Option<GuardianLaunchRecoveryKind>,
+    failure_class: LaunchFailureClass,
+) {
+    let Some(kind) = recovery_kind else {
+        return;
+    };
+    let observed_at = timestamp_utc();
+    let user_intent_hash = launch_recovery_user_intent_hash(intent, kind);
+    let outcome = record_launch_recovery_failure(GuardianLaunchRecoveryRequest {
+        session_id,
+        mode: launch_policy_guardian_mode(intent.guardian.mode),
+        kind,
+        failure_class,
+        observed_at: observed_at.as_str(),
+        user_intent_hash: Some(user_intent_hash.as_str()),
+        journals: state.journals().as_ref(),
+        failure_memory: state.failure_memory().as_ref(),
+    });
+    trace_launch_event(
+        session_id,
+        &format!(
+            "guardian launch recovery failed: kind={kind:?} failure={failure_class:?} operation={}",
+            outcome.operation_id.as_str()
+        ),
+    );
+    state
+        .sessions()
+        .emit_log(
+            session_id,
+            "system",
+            format!(
+                "Guardian recorded failed launch self-healing for {}.",
+                launch_recovery_action_label(kind)
+            ),
+        )
+        .await;
+}
+
+fn launch_policy_guardian_mode(
+    mode: croopor_launcher::GuardianMode,
+) -> crate::guardian::GuardianMode {
+    match mode {
+        croopor_launcher::GuardianMode::Managed => crate::guardian::GuardianMode::Managed,
+        croopor_launcher::GuardianMode::Custom => crate::guardian::GuardianMode::Custom,
+    }
+}
+
+fn launch_recovery_user_intent_hash(
+    intent: &croopor_launcher::LaunchIntent,
+    kind: GuardianLaunchRecoveryKind,
+) -> String {
+    let override_marker = match kind {
+        GuardianLaunchRecoveryKind::SwitchManagedRuntime => {
+            if intent.guardian.has_java_override() {
+                "java_override_present"
+            } else {
+                "java_override_absent"
+            }
+        }
+        GuardianLaunchRecoveryKind::StripRawJvmArgs => {
+            if intent.guardian.has_raw_jvm_args() {
+                "raw_jvm_args_present"
+            } else {
+                "raw_jvm_args_absent"
+            }
+        }
+        GuardianLaunchRecoveryKind::DowngradePreset
+        | GuardianLaunchRecoveryKind::DisableCustomGc => {
+            if intent.guardian.has_named_preset() {
+                "jvm_preset_present"
+            } else {
+                "jvm_preset_recommended"
+            }
+        }
+    };
+    let version_marker = if intent.target_version_id.trim().is_empty() {
+        "unknown_version"
+    } else {
+        intent.target_version_id.trim()
+    };
+    format!("{override_marker}:{version_marker}")
+}
+
+fn suppressed_launch_recovery_message(kind: GuardianLaunchRecoveryKind) -> String {
+    format!(
+        "Guardian suppressed a repeated launch self-healing retry for {} because the same recovery failed recently.",
+        launch_recovery_action_label(kind)
+    )
+}
+
+fn block_guardian_for_suppressed_launch_recovery(guardian: &mut GuardianSummary, reason: &str) {
+    block_guardian_with_reason_and_guidance(
+        guardian,
+        Some(reason.to_string()),
+        vec![
+            "Review the latest game log or change the affected launch setting before retrying."
+                .to_string(),
+        ],
+    );
+}
+
+fn launch_recovery_action_label(kind: GuardianLaunchRecoveryKind) -> &'static str {
+    match kind {
+        GuardianLaunchRecoveryKind::SwitchManagedRuntime => "managed Java recovery",
+        GuardianLaunchRecoveryKind::StripRawJvmArgs => "explicit JVM argument recovery",
+        GuardianLaunchRecoveryKind::DowngradePreset => "JVM preset recovery",
+        GuardianLaunchRecoveryKind::DisableCustomGc => "custom GC flag recovery",
+    }
+}
+
+fn startup_failure_healing(
+    intent: &croopor_launcher::LaunchIntent,
+    prepared: &PreparedLaunchAttempt,
+    attempt: &croopor_launcher::service::AttemptOverrides,
+    failure_class: LaunchFailureClass,
+) -> Option<croopor_launcher::LaunchHealingSummary> {
+    build_healing_summary(croopor_launcher::service::HealingSummaryInput {
+        auth_mode: if intent.auth.user_type == "msa" {
+            "online"
+        } else {
+            "offline"
+        },
+        requested_java_path: &intent.requested_java,
+        requested_preset: &intent.requested_preset,
+        effective_java_path: Some(prepared.runtime.effective_path.as_str()),
+        effective_preset: Some(prepared.effective_preset.as_str()),
+        fallback_applied: attempt.fallback_applied.as_deref(),
+        retry_count: attempt.retry_count,
+        failure_class: Some(failure_class),
+    })
 }
 
 pub(super) fn trace_launch_event(session_id: &str, message: &str) {
@@ -518,15 +864,8 @@ fn apply_startup_failure_guardian_decision(
     guardian: &mut GuardianSummary,
     decision: &StartupFailureDecision,
 ) {
-    let mut merged = guardian.guidance.clone();
-    for detail in &decision.guidance {
-        push_unique_detail(&mut merged, detail.clone());
-    }
-    guardian.block_with_message_reason_and_guidance(
-        decision.message.clone(),
-        decision.reason.clone(),
-        merged,
-    );
+    let outcome = startup_failure_guardian_outcome(decision, &guardian.guidance);
+    outcome.apply_to_launch_summary(guardian);
 }
 
 fn bounded_prepare_failure_reason(
@@ -838,6 +1177,29 @@ async fn fail_launch(
     healing: Option<croopor_launcher::LaunchHealingSummary>,
     guardian: Option<GuardianSummary>,
 ) -> LaunchRequestError {
+    fail_launch_with_outcome(
+        state,
+        session_id,
+        proof_context,
+        failure_class,
+        message,
+        healing,
+        guardian,
+        None,
+    )
+    .await
+}
+
+async fn fail_launch_with_outcome(
+    state: &AppState,
+    session_id: &str,
+    proof_context: Option<&LaunchProofContext>,
+    failure_class: LaunchFailureClass,
+    message: &str,
+    healing: Option<croopor_launcher::LaunchHealingSummary>,
+    guardian: Option<GuardianSummary>,
+    outcome: Option<LaunchSessionOutcome>,
+) -> LaunchRequestError {
     // Live failure details are sanitized before they enter status events or API responses.
     let public_message = sanitize_live_launch_failure_message(message);
     emit_terminal_failure(
@@ -847,6 +1209,7 @@ async fn fail_launch(
         &public_message,
         healing.clone(),
         guardian.clone(),
+        outcome,
     )
     .await;
     persist_launch_proof_best_effort_with_context(state, session_id, None, "failed", proof_context)
@@ -927,6 +1290,32 @@ fn launch_state_for_preparation_event(event: LaunchPreparationEvent) -> LaunchSt
     }
 }
 
+fn launch_command_target(session_id: &str) -> TargetDescriptor {
+    TargetDescriptor::new(
+        StabilizationSystem::Execution,
+        TargetKind::Session,
+        session_id,
+        OwnershipClass::LauncherManaged,
+    )
+}
+
+fn launch_spawn_stage_evidence(
+    session_id: &str,
+    record: &crate::state::LaunchSessionRecord,
+) -> Vec<croopor_launcher::LaunchStageEvidence> {
+    let Some(pid) = record.pid else {
+        return vec![process_spawn_failed_stage_evidence()];
+    };
+    match process_spawned(
+        ProcessSpawnRequest::new(launch_command_target(session_id))
+            .with_command_label("game_session"),
+        pid,
+    ) {
+        Ok(report) => process_stage_evidence(&report.facts),
+        Err(error) => process_stage_evidence(&error.facts),
+    }
+}
+
 async fn emit_status(
     state: &AppState,
     session_id: &str,
@@ -949,6 +1338,9 @@ async fn emit_status(
                 failure_detail: None,
                 healing: serialize_healing(healing),
                 guardian: serialize_guardian(guardian),
+                outcome: None,
+                notice: None,
+                evidence: Vec::new(),
                 stages: Vec::new(),
             },
         )
@@ -962,6 +1354,7 @@ async fn emit_terminal_failure(
     message: &str,
     healing: Option<croopor_launcher::LaunchHealingSummary>,
     guardian: Option<GuardianSummary>,
+    outcome: Option<LaunchSessionOutcome>,
 ) {
     state
         .sessions()
@@ -980,6 +1373,9 @@ async fn emit_terminal_failure(
                 failure_detail: Some(message.to_string()),
                 healing: serialize_healing(healing),
                 guardian: serialize_guardian(guardian),
+                outcome,
+                notice: None,
+                evidence: Vec::new(),
                 stages: Vec::new(),
             },
         )
@@ -1069,6 +1465,7 @@ fn serialize_guardian(guardian: Option<GuardianSummary>) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::failure_memory::FailureMemoryActionOutcome;
     use crate::state::{AppStateInit, InstallStore, LaunchEvent, SessionStore};
     use croopor_config::{AppPaths, ConfigStore, InstanceStore};
     use croopor_launcher::{GuardianMode, LaunchSessionRecord, SessionId};
@@ -1187,6 +1584,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runner_launch_recovery_memory_records_redacted_attempt_failure_and_suppression() {
+        let root = unique_test_dir("runner-launch-recovery-memory");
+        let state = test_app_state(&root);
+        let session_id = "runner-launch-recovery-memory";
+        state.sessions().insert(test_record(session_id)).await;
+        let intent = test_launch_intent(&root, session_id);
+
+        let attempt = record_guardian_launch_recovery_attempt(
+            &state,
+            session_id,
+            &intent,
+            GuardianLaunchRecoveryKind::StripRawJvmArgs,
+            LaunchFailureClass::JvmUnsupportedOption,
+        );
+        assert_eq!(attempt.status, GuardianLaunchRecoveryStatus::Recorded);
+
+        record_failed_self_healing_if_any(
+            &state,
+            session_id,
+            &intent,
+            Some(GuardianLaunchRecoveryKind::StripRawJvmArgs),
+            LaunchFailureClass::JvmUnsupportedOption,
+        )
+        .await;
+
+        let suppressed = record_guardian_launch_recovery_attempt(
+            &state,
+            session_id,
+            &intent,
+            GuardianLaunchRecoveryKind::StripRawJvmArgs,
+            LaunchFailureClass::JvmUnsupportedOption,
+        );
+        assert_eq!(suppressed.status, GuardianLaunchRecoveryStatus::Suppressed);
+
+        let memory = state.failure_memory().list();
+        assert_eq!(memory.len(), 1);
+        assert_eq!(
+            memory[0].last_action_outcome,
+            Some(FailureMemoryActionOutcome::Suppressed)
+        );
+        assert_eq!(memory[0].repair_attempt_count, 1);
+        assert!(memory[0].suppression_until.is_some());
+
+        let memory_json = serde_json::to_string(&memory).expect("memory json");
+        assert!(memory_json.contains("raw_jvm_args_present"));
+        assert!(memory_json.contains("1.21.1"));
+        for fragment in ["-Dtoken", "raw-secret-token", "-XX:+UseZGC", "/home/alice"] {
+            assert!(
+                !memory_json.contains(fragment),
+                "launch recovery memory leaked {fragment:?}: {memory_json}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn fail_launch_sanitizes_public_error_and_terminal_failure_payloads() {
         let root = unique_test_dir("live-launch-failure");
         let state = test_app_state(&root);
@@ -1252,6 +1706,41 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn fail_launch_with_outcome_records_spawn_failure_in_session_and_proof() {
+        let root = unique_test_dir("spawn-failed-outcome");
+        let state = test_app_state(&root);
+        let session_id = "spawn-failed-outcome";
+        state.sessions().insert(test_record(session_id)).await;
+
+        let expected = LaunchSessionOutcome::from_reason(LaunchSessionExitReason::SpawnFailed);
+        let _ = fail_launch_with_outcome(
+            &state,
+            session_id,
+            None,
+            LaunchFailureClass::Unknown,
+            "failed to start launch process: program not found",
+            None,
+            None,
+            Some(expected.clone()),
+        )
+        .await;
+
+        let record = state
+            .sessions()
+            .get(session_id)
+            .await
+            .expect("terminal failure session record");
+        assert_eq!(record.outcome.as_ref(), Some(&expected));
+
+        let proof = crate::state::launch_reports::load(state.config().paths(), session_id)
+            .expect("load proof")
+            .expect("proof exists");
+        assert_eq!(proof.session_outcome.as_ref(), Some(&expected));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn live_launch_failure_sanitizer_keeps_safe_bounded_errors_useful() {
         let message = "launch plan did not produce a runnable command after preparation completed";
@@ -1284,6 +1773,90 @@ mod tests {
             launch_state_for_preparation_event(LaunchPreparationEvent::Preparing),
             LaunchState::Preparing
         );
+    }
+
+    #[tokio::test]
+    async fn runner_records_redacted_command_stage_evidence_into_status_and_proof() {
+        let root = unique_test_dir("runner-stage-evidence");
+        let state = test_app_state(&root);
+        let session_id = "runner-stage-evidence";
+        state.sessions().insert(test_record(session_id)).await;
+        let mut events = state
+            .sessions()
+            .subscribe(session_id)
+            .await
+            .expect("subscribe");
+
+        emit_status(
+            &state,
+            session_id,
+            LaunchState::Preparing,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("preparing status")
+            .expect("preparing status event");
+
+        let command = vec![
+            r"C:\Users\Alice\.jdks\java.exe".to_string(),
+            "-cp".to_string(),
+            "libraries".to_string(),
+        ];
+        let prepared = prepare_launch_command(LaunchCommandPreparationRequest::new(
+            launch_command_target(session_id),
+            &command,
+            &root,
+        ))
+        .expect("prepared command");
+        state
+            .sessions()
+            .record_stage_evidence(session_id, launch_command_stage_evidence(&prepared.facts))
+            .await;
+
+        emit_status(
+            &state,
+            session_id,
+            LaunchState::Prewarming,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        let status_event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("prewarming status")
+            .expect("prewarming status event");
+        let LaunchEvent::Status(status) = status_event else {
+            panic!("expected status event");
+        };
+        let preparing_stage = status
+            .stages
+            .iter()
+            .find(|stage| stage.stage == "preparing")
+            .expect("preparing stage");
+        assert!(
+            preparing_stage
+                .evidence
+                .iter()
+                .any(|evidence| evidence.id == "execution_launch_command_prepared")
+        );
+
+        persist_launch_proof_best_effort(&state, session_id, None, "running").await;
+        let proof = crate::state::launch_reports::load(state.config().paths(), session_id)
+            .expect("load proof")
+            .expect("proof exists");
+        let proof_json = serde_json::to_string(&proof).expect("proof json");
+        assert!(proof_json.contains("execution_launch_command_prepared"));
+        assert!(proof_json.contains("arg_count:3"));
+        assert_no_sensitive_stage_evidence(&proof_json);
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1466,7 +2039,41 @@ mod tests {
             failure: None,
             healing: None,
             guardian: None,
+            outcome: None,
             stages: Vec::new(),
+        }
+    }
+
+    fn test_launch_intent(root: &Path, session_id: &str) -> croopor_launcher::LaunchIntent {
+        croopor_launcher::LaunchIntent {
+            session_id: session_id.to_string(),
+            library_dir: root.join("library"),
+            instance_id: "instance".to_string(),
+            version_id: "1.21.1".to_string(),
+            target_version_id: "1.21.1".to_string(),
+            loader: "vanilla".to_string(),
+            is_modded: false,
+            username: "Player".to_string(),
+            auth: croopor_launcher::LaunchAuthContext::offline("Player"),
+            requested_java: "/home/alice/.jdks/bad-java/bin/java".to_string(),
+            requested_preset: "graalvm".to_string(),
+            extra_jvm_args: vec![
+                "-Dtoken=raw-secret-token".to_string(),
+                "-XX:+UseZGC".to_string(),
+            ],
+            max_memory_mb: 4096,
+            min_memory_mb: 1024,
+            resolution: None,
+            launcher_name: "croopor".to_string(),
+            launcher_version: "test".to_string(),
+            game_dir: None,
+            guardian: croopor_launcher::LaunchGuardianContext {
+                mode: GuardianMode::Managed,
+                java_override_origin: Some(croopor_launcher::OverrideOrigin::Instance),
+                preset_override_origin: Some(croopor_launcher::OverrideOrigin::Instance),
+                raw_jvm_args_origin: Some(croopor_launcher::OverrideOrigin::Instance),
+            },
+            performance_mode: "managed".to_string(),
         }
     }
 
@@ -1493,6 +2100,28 @@ mod tests {
             assert!(
                 !text.contains(fragment),
                 "live launch failure leaked fragment {fragment:?}: {text}"
+            );
+        }
+    }
+
+    fn assert_no_sensitive_stage_evidence(text: &str) {
+        for fragment in [
+            "/home/alice",
+            "/home/",
+            "C:\\Users",
+            "Alice",
+            ".jdks",
+            ".minecraft",
+            "java.exe",
+            "--accessToken",
+            "-Xmx",
+            "-cp",
+            "token",
+            "SecretPlayer",
+        ] {
+            assert!(
+                !text.contains(fragment),
+                "stage evidence leaked fragment {fragment:?}: {text}"
             );
         }
     }

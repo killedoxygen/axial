@@ -1,9 +1,27 @@
 use super::policy;
 use super::runner::trace_launch_event;
+use crate::application::{
+    LaunchBoundaryStaging, LaunchBoundaryStagingRequest, LaunchInstanceCommand,
+    LaunchInstanceStaging, stage_launch_boundary, stage_launch_instance_command,
+};
+use crate::execution::jvm::{JvmArgsInspection, JvmArgsInspectionRequest, inspect_jvm_args};
+use crate::execution::runtime::{
+    JavaOverrideInspection, ManagedRuntimeRoot, ManagedRuntimeVerificationRequest,
+    inspect_java_override_value, verify_managed_runtime,
+};
+use crate::guardian::{
+    FactReliability, GuardianConfidence, GuardianDomain, GuardianFact, GuardianFactId,
+    GuardianManagedRuntimeRepairRequest, GuardianRepairOutcome, GuardianRepairStatus,
+    GuardianSeverity, diagnose_facts, execute_managed_runtime_ready_marker_repair,
+    guardian_fact_from_execution,
+};
 use crate::logging::timestamp_utc;
 use crate::routes::{
     accounts,
     auth::{AuthRefreshFailure, refresh_active_auth},
+};
+use crate::state::contracts::{
+    OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
 };
 use crate::state::launch_reports::{LaunchBenchmarkMetadata, LaunchProofResourceBudget};
 use crate::state::{
@@ -11,14 +29,16 @@ use crate::state::{
     LauncherAccountRecord,
 };
 use axum::{Json, http::StatusCode};
-use croopor_config::{AppConfig, Instance, LAUNCH_AUTH_MODE_ONLINE, validate_username};
+use croopor_config::{AppConfig, AppPaths, Instance, LAUNCH_AUTH_MODE_ONLINE, validate_username};
 use croopor_launcher::{
-    GuardianMode, GuardianSummary, LAUNCH_DISK_HEADROOM_MB, LAUNCH_MEMORY_HEADROOM_MB,
-    LaunchAuthContext, LaunchCpuLoadWarningFacts, LaunchFailureClass, LaunchGuardianContext,
-    LaunchIntent, LaunchReadiness, LaunchReadinessRequest, LaunchResourceWarningFacts, LaunchState,
-    LaunchWarningFacts, failure_class_name, inspect_launch_readiness, summarize_launch_warnings,
+    GuardianDecision, GuardianMode, GuardianSummary, LAUNCH_DISK_HEADROOM_MB,
+    LAUNCH_MEMORY_HEADROOM_MB, LaunchAuthContext, LaunchCpuLoadWarningFacts, LaunchFailureClass,
+    LaunchGuardianContext, LaunchIntent, LaunchNotice, LaunchNoticeTone, LaunchReadiness,
+    LaunchReadinessReasonId, LaunchReadinessRequest, LaunchReadinessSeverity,
+    LaunchResourceWarningFacts, LaunchState, LaunchWarningFacts, failure_class_name,
+    inspect_launch_readiness, launch_notice, summarize_launch_warnings,
 };
-use croopor_minecraft::scan_versions;
+use croopor_minecraft::{preferred_runtime_component, resolve_version, scan_versions};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -34,6 +54,8 @@ pub(super) struct LaunchRequest {
 }
 
 pub(super) struct LaunchSessionTask {
+    pub application: LaunchInstanceStaging,
+    pub boundary: LaunchBoundaryStaging,
     pub instance: Instance,
     pub config: AppConfig,
     pub intent: LaunchIntent,
@@ -55,11 +77,14 @@ struct LaunchPreflightFacts {
     min_memory_mb: i32,
     requested_java: String,
     requested_preset: String,
+    extra_jvm_args: Vec<String>,
     target_version_id: String,
     loader: String,
     is_modded: bool,
     guardian: LaunchGuardianContext,
     guardian_summary: GuardianSummary,
+    guardian_facts: Vec<GuardianFact>,
+    boundary: LaunchBoundaryStaging,
     readiness: LaunchReadiness,
     resource_budget: LaunchProofResourceBudget,
 }
@@ -75,6 +100,7 @@ pub(super) struct LaunchPreflightResponse {
     pub memory: LaunchPreflightMemory,
     pub overrides: LaunchPreflightOverrides,
     pub readiness: LaunchReadiness,
+    pub guardian_facts: Vec<GuardianFact>,
     pub resource_budget: LaunchPreflightResourceBudget,
 }
 
@@ -190,7 +216,7 @@ async fn prepare_launch_session_with_auth_refresh(
         super::super::skin::flush_pending_saved_skin_applies_for_launch(state).await?;
     }
     let username = offline_username.clone();
-    let preflight = build_launch_preflight_facts(
+    let mut preflight = build_launch_preflight_facts(
         state,
         &instance,
         &config,
@@ -200,12 +226,41 @@ async fn prepare_launch_session_with_auth_refresh(
         payload.min_memory_mb,
     )
     .await;
+    preflight = maybe_repair_managed_runtime_before_launch(
+        state,
+        preflight,
+        &instance,
+        &library_dir,
+        &game_dir,
+        payload.max_memory_mb,
+        payload.min_memory_mb,
+    )
+    .await;
     if !preflight.readiness.launchable {
-        return Err(launch_readiness_error_response(preflight.readiness));
+        return Err(launch_readiness_error_response(
+            preflight.readiness,
+            Some(preflight.guardian_summary),
+        ));
+    }
+    if preflight.guardian_summary.decision == GuardianDecision::Blocked {
+        return Err(launch_guardian_block_error_response(
+            preflight.readiness,
+            preflight.guardian_summary,
+        ));
     }
 
     let launched_at = timestamp_utc();
     let session_id = policy::generate_session_id();
+    let application = stage_launch_instance_command(
+        LaunchInstanceCommand {
+            instance_id: instance.id.clone(),
+            username: payload.username.clone(),
+            max_memory_mb: payload.max_memory_mb,
+            min_memory_mb: payload.min_memory_mb,
+            client_started_at_ms: payload.client_started_at_ms,
+        },
+        Some(session_id.0.clone()),
+    );
 
     let intent = LaunchIntent {
         session_id: session_id.0.clone(),
@@ -219,7 +274,7 @@ async fn prepare_launch_session_with_auth_refresh(
         auth,
         requested_java: preflight.requested_java.clone(),
         requested_preset: preflight.requested_preset.clone(),
-        extra_jvm_args: policy::split_jvm_args(&instance.extra_jvm_args),
+        extra_jvm_args: preflight.extra_jvm_args.clone(),
         max_memory_mb: preflight.max_memory_mb,
         min_memory_mb: preflight.min_memory_mb,
         resolution: policy::selected_resolution(&instance, &config),
@@ -251,6 +306,7 @@ async fn prepare_launch_session_with_auth_refresh(
             failure: None,
             healing: None,
             guardian: serde_json::to_value(&preflight.guardian_summary).ok(),
+            outcome: None,
             stages: Vec::new(),
         })
         .await;
@@ -264,6 +320,8 @@ async fn prepare_launch_session_with_auth_refresh(
 
     Ok(PreparedLaunch {
         task: LaunchSessionTask {
+            application,
+            boundary: preflight.boundary,
             instance: instance.clone(),
             config: preflight.config.clone(),
             intent,
@@ -288,12 +346,37 @@ fn launch_layout_error_response(
 
 fn launch_readiness_error_response(
     readiness: LaunchReadiness,
+    guardian: Option<GuardianSummary>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    let notice = guardian
+        .as_ref()
+        .and_then(|guardian| launch_notice(Some(guardian), None, None, None, None));
     (
         StatusCode::PRECONDITION_FAILED,
         Json(json!({
             "error": "Installed version is not ready to launch",
             "readiness": readiness,
+            "guardian": guardian,
+            "notice": notice,
+        })),
+    )
+}
+
+fn launch_guardian_block_error_response(
+    readiness: LaunchReadiness,
+    guardian: GuardianSummary,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let error = guardian
+        .message
+        .clone()
+        .unwrap_or_else(|| "Guardian blocked launch preparation".to_string());
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(json!({
+            "error": error,
+            "readiness": readiness,
+            "notice": launch_notice(Some(&guardian), None, None, None, None),
+            "guardian": guardian,
         })),
     )
 }
@@ -381,12 +464,23 @@ async fn build_launch_preflight_facts(
     );
     let requested_java = policy::selected_java_override(instance, config);
     let requested_preset = policy::selected_jvm_preset(instance, config);
+    let mut execution_facts = inspect_explicit_java_override(instance, config)
+        .into_iter()
+        .flat_map(|inspection| inspection.facts)
+        .collect::<Vec<_>>();
+    let jvm_args_inspection = inspect_explicit_jvm_args(&instance.extra_jvm_args);
+    execution_facts.extend(jvm_args_inspection.facts.iter().cloned());
+    let mut guardian_facts = execution_facts
+        .iter()
+        .map(|fact| guardian_fact_from_execution(fact, OperationPhase::Validating))
+        .collect::<Vec<_>>();
     let guardian = LaunchGuardianContext {
         mode: policy::selected_guardian_mode(config),
         java_override_origin: policy::java_override_origin(instance, config),
         preset_override_origin: policy::preset_override_origin(instance, config),
         raw_jvm_args_origin: policy::raw_jvm_args_origin(instance),
     };
+    let performance_mode = policy::selected_performance_mode(instance, config);
     let resource_budget = capture_resource_budget_snapshot(
         memory_evidence,
         capture_launch_disk_evidence([library_dir, game_dir]),
@@ -399,18 +493,27 @@ async fn build_launch_preflight_facts(
         },
         max_memory_mb,
     );
-    let guardian_summary = guardian_summary_for_preflight(
-        raw_min_memory_mb,
-        max_memory_mb,
-        &resource_budget,
-        &guardian,
-    );
     let readiness = inspect_launch_readiness(&LaunchReadinessRequest {
         library_dir: library_dir.to_path_buf(),
         version_id: instance.version_id.clone(),
         requested_java: requested_java.clone(),
         guardian_mode: guardian.mode,
     });
+    guardian_facts.extend(readiness_guardian_facts(&readiness));
+    let boundary = stage_launch_boundary(LaunchBoundaryStagingRequest::new(
+        application_guardian_mode(guardian.mode),
+        OperationPhase::Validating,
+        &guardian_facts,
+        &performance_mode,
+    ));
+    let mut guardian_summary = guardian_summary_for_preflight(
+        raw_min_memory_mb,
+        max_memory_mb,
+        &resource_budget,
+        &guardian,
+    );
+    append_launch_guardian_guidance(&mut guardian_summary, &guardian_facts);
+    block_guardian_for_launch_readiness(&mut guardian_summary, &readiness);
 
     LaunchPreflightFacts {
         config: config.clone(),
@@ -419,13 +522,455 @@ async fn build_launch_preflight_facts(
         min_memory_mb,
         requested_java,
         requested_preset,
+        extra_jvm_args: jvm_args_inspection.args,
         target_version_id,
         loader,
         is_modded,
         guardian,
         guardian_summary,
+        guardian_facts,
+        boundary,
         readiness,
         resource_budget,
+    }
+}
+
+async fn maybe_repair_managed_runtime_before_launch(
+    state: &AppState,
+    mut preflight: LaunchPreflightFacts,
+    instance: &Instance,
+    library_dir: &Path,
+    game_dir: &Path,
+    requested_max_memory_mb: Option<i32>,
+    requested_min_memory_mb: Option<i32>,
+) -> LaunchPreflightFacts {
+    if preflight.guardian.mode != GuardianMode::Managed
+        || !readiness_has_managed_runtime_missing(&preflight.readiness)
+    {
+        return preflight;
+    }
+
+    let Some(candidate) = managed_runtime_ready_marker_repair_candidate(
+        state.config().paths(),
+        library_dir,
+        instance,
+    ) else {
+        return preflight;
+    };
+    let Ok(runtime_root) = ManagedRuntimeRoot::from_app_paths(
+        state.config().paths(),
+        &candidate.runtime_root,
+        &candidate.java_executable,
+    ) else {
+        return preflight;
+    };
+
+    let verification = verify_managed_runtime(ManagedRuntimeVerificationRequest::new(
+        runtime_root.target().clone(),
+        &candidate.runtime_root,
+        &candidate.java_executable,
+    ));
+    let Err(verification_error) = verification else {
+        return preflight;
+    };
+    let guardian_facts = verification_error
+        .facts
+        .iter()
+        .map(|fact| guardian_fact_from_execution(fact, OperationPhase::Validating))
+        .collect::<Vec<_>>();
+    let performance_mode = policy::selected_performance_mode(instance, &preflight.config);
+    let repair_boundary = stage_launch_boundary(LaunchBoundaryStagingRequest::new(
+        application_guardian_mode(preflight.guardian.mode),
+        OperationPhase::Validating,
+        &guardian_facts,
+        &performance_mode,
+    ));
+
+    let outcome =
+        execute_managed_runtime_ready_marker_repair(GuardianManagedRuntimeRepairRequest {
+            decision: &repair_boundary.guardian_decision,
+            runtime_root,
+            journals: state.journals().as_ref(),
+            failure_memory: state.failure_memory().as_ref(),
+            observed_at: timestamp_utc().as_str(),
+            suppression_until_on_failure: None,
+        });
+
+    match outcome.status {
+        GuardianRepairStatus::Repaired => {
+            let mut repaired = build_launch_preflight_facts(
+                state,
+                instance,
+                &preflight.config,
+                library_dir,
+                game_dir,
+                requested_max_memory_mb,
+                requested_min_memory_mb,
+            )
+            .await;
+            mark_guardian_runtime_repair_success(&mut repaired.guardian_summary, &outcome);
+            repaired
+        }
+        GuardianRepairStatus::Blocked
+        | GuardianRepairStatus::Failed
+        | GuardianRepairStatus::Suppressed => {
+            block_guardian_for_runtime_repair_outcome(&mut preflight.guardian_summary, &outcome);
+            preflight
+        }
+        GuardianRepairStatus::NotNeeded => preflight,
+    }
+}
+
+struct ManagedRuntimeRepairCandidate {
+    runtime_root: PathBuf,
+    java_executable: PathBuf,
+}
+
+fn managed_runtime_ready_marker_repair_candidate(
+    paths: &AppPaths,
+    library_dir: &Path,
+    instance: &Instance,
+) -> Option<ManagedRuntimeRepairCandidate> {
+    let version = resolve_version(library_dir, &instance.version_id).ok()?;
+    let component = preferred_runtime_component(&version.java_version);
+    let runtime_root = paths.config_dir.join("runtimes").join(component);
+    if !runtime_root.exists() || runtime_root.join(".croopor-ready").is_file() {
+        return None;
+    }
+    let java_executable = managed_runtime_java_executable(&runtime_root);
+    if !java_executable.is_file() {
+        return None;
+    }
+    Some(ManagedRuntimeRepairCandidate {
+        runtime_root,
+        java_executable,
+    })
+}
+
+fn managed_runtime_java_executable(runtime_root: &Path) -> PathBuf {
+    runtime_root
+        .join("bin")
+        .join(if cfg!(target_os = "windows") {
+            "javaw.exe"
+        } else {
+            "java"
+        })
+}
+
+fn readiness_has_managed_runtime_missing(readiness: &LaunchReadiness) -> bool {
+    readiness
+        .reasons
+        .iter()
+        .any(|reason| reason.id == LaunchReadinessReasonId::ManagedRuntimeMissing)
+}
+
+fn readiness_guardian_facts(readiness: &LaunchReadiness) -> Vec<GuardianFact> {
+    readiness
+        .reasons
+        .iter()
+        .filter_map(|reason| {
+            let id = readiness_guardian_fact_id(reason.id)?;
+            Some(GuardianFact {
+                operation_id: None,
+                id: GuardianFactId::new(id),
+                domain: readiness_guardian_domain(reason.id),
+                phase: OperationPhase::Validating,
+                reliability: readiness_guardian_fact_reliability(reason.id),
+                severity: Some(readiness_guardian_severity(reason.severity)),
+                confidence: Some(GuardianConfidence::Confirmed),
+                ownership: readiness_guardian_ownership(reason.id),
+                target: Some(TargetDescriptor::new(
+                    StabilizationSystem::Execution,
+                    readiness_guardian_target_kind(reason.id),
+                    readiness_guardian_target_id(reason.id),
+                    readiness_guardian_ownership(reason.id),
+                )),
+                fields: Vec::new(),
+            })
+        })
+        .collect()
+}
+
+fn readiness_guardian_fact_id(reason: LaunchReadinessReasonId) -> Option<&'static str> {
+    match reason {
+        LaunchReadinessReasonId::VersionJsonMissing => Some("version_json_missing"),
+        LaunchReadinessReasonId::ParentVersionMissing => Some("parent_version_missing"),
+        LaunchReadinessReasonId::IncompleteInstall => Some("incomplete_install"),
+        LaunchReadinessReasonId::ClientJarMissing => Some("client_jar_missing"),
+        LaunchReadinessReasonId::LibrariesMissing => Some("libraries_missing"),
+        LaunchReadinessReasonId::AssetIndexMissing => Some("asset_index_missing"),
+        LaunchReadinessReasonId::ManagedRuntimeMissing => Some("managed_runtime_missing"),
+        LaunchReadinessReasonId::JavaOverrideMissing => Some("java_override_missing"),
+    }
+}
+
+fn readiness_guardian_domain(reason: LaunchReadinessReasonId) -> GuardianDomain {
+    match reason {
+        LaunchReadinessReasonId::ManagedRuntimeMissing
+        | LaunchReadinessReasonId::JavaOverrideMissing => GuardianDomain::Runtime,
+        _ => GuardianDomain::Install,
+    }
+}
+
+fn readiness_guardian_severity(severity: LaunchReadinessSeverity) -> GuardianSeverity {
+    match severity {
+        LaunchReadinessSeverity::Blocking => GuardianSeverity::Blocking,
+        LaunchReadinessSeverity::Recoverable => GuardianSeverity::Recoverable,
+    }
+}
+
+fn readiness_guardian_ownership(reason: LaunchReadinessReasonId) -> OwnershipClass {
+    match reason {
+        LaunchReadinessReasonId::JavaOverrideMissing => OwnershipClass::UserOwned,
+        _ => OwnershipClass::LauncherManaged,
+    }
+}
+
+fn readiness_guardian_target_kind(reason: LaunchReadinessReasonId) -> TargetKind {
+    match reason {
+        LaunchReadinessReasonId::VersionJsonMissing
+        | LaunchReadinessReasonId::ParentVersionMissing
+        | LaunchReadinessReasonId::IncompleteInstall => TargetKind::Version,
+        LaunchReadinessReasonId::ClientJarMissing
+        | LaunchReadinessReasonId::LibrariesMissing
+        | LaunchReadinessReasonId::AssetIndexMissing => TargetKind::Artifact,
+        LaunchReadinessReasonId::ManagedRuntimeMissing => TargetKind::Runtime,
+        LaunchReadinessReasonId::JavaOverrideMissing => TargetKind::Config,
+    }
+}
+
+fn readiness_guardian_target_id(reason: LaunchReadinessReasonId) -> &'static str {
+    match reason {
+        LaunchReadinessReasonId::VersionJsonMissing => "version_json_missing",
+        LaunchReadinessReasonId::ParentVersionMissing => "parent_version_missing",
+        LaunchReadinessReasonId::IncompleteInstall => "incomplete_install",
+        LaunchReadinessReasonId::ClientJarMissing => "client_jar",
+        LaunchReadinessReasonId::LibrariesMissing => "libraries",
+        LaunchReadinessReasonId::AssetIndexMissing => "asset_index",
+        LaunchReadinessReasonId::ManagedRuntimeMissing => "managed_runtime",
+        LaunchReadinessReasonId::JavaOverrideMissing => "explicit_java_override",
+    }
+}
+
+fn readiness_guardian_fact_reliability(reason: LaunchReadinessReasonId) -> FactReliability {
+    match reason {
+        LaunchReadinessReasonId::IncompleteInstall => FactReliability::DirectStructured,
+        _ => FactReliability::ExpectedMarkerAbsence,
+    }
+}
+
+fn mark_guardian_runtime_repair_success(
+    summary: &mut GuardianSummary,
+    _outcome: &GuardianRepairOutcome,
+) {
+    let previous_details = summary.details.clone();
+    let previous_guidance = summary.guidance.clone();
+    summary.decision = GuardianDecision::Intervened;
+    summary.message = Some("Guardian repaired launch state before launch.".to_string());
+    summary.details.clear();
+    push_unique_summary_detail(
+        &mut summary.details,
+        "Guardian repaired the managed Java runtime before launch.",
+    );
+    for detail in previous_details {
+        push_unique_summary_detail(&mut summary.details, &detail);
+    }
+    for detail in &previous_guidance {
+        push_unique_summary_detail(&mut summary.details, detail);
+    }
+    summary.guidance = previous_guidance;
+}
+
+fn block_guardian_for_runtime_repair_outcome(
+    summary: &mut GuardianSummary,
+    outcome: &GuardianRepairOutcome,
+) {
+    let reason = match outcome.status {
+        GuardianRepairStatus::Suppressed => {
+            "Guardian suppressed managed Java runtime repair because the same repair failed recently."
+        }
+        GuardianRepairStatus::Failed => {
+            "Guardian could not repair the managed Java runtime automatically."
+        }
+        GuardianRepairStatus::Blocked => {
+            "Guardian blocked managed Java runtime repair because it was not safe to apply."
+        }
+        GuardianRepairStatus::NotNeeded | GuardianRepairStatus::Repaired => {
+            "Guardian did not need managed Java runtime repair."
+        }
+    };
+    let mut guidance = summary.guidance.clone();
+    push_unique_guidance(
+        &mut guidance,
+        "Reinstall or repair the affected version/runtime before launching again.",
+    );
+    summary.block_with_reason_and_guidance(reason, guidance);
+}
+
+fn block_guardian_for_launch_readiness(summary: &mut GuardianSummary, readiness: &LaunchReadiness) {
+    let Some(reason) = readiness
+        .reasons
+        .iter()
+        .find(|reason| {
+            reason.severity == LaunchReadinessSeverity::Blocking
+                && readiness_guardian_fact_id(reason.id).is_some()
+        })
+        .map(|reason| reason.id)
+    else {
+        return;
+    };
+
+    let mut guidance = summary.guidance.clone();
+    push_unique_guidance(&mut guidance, readiness_guardian_guidance(reason));
+    summary.block_with_reason_and_guidance(readiness_guardian_block_reason(reason), guidance);
+}
+
+fn readiness_guardian_block_reason(reason: LaunchReadinessReasonId) -> &'static str {
+    match reason {
+        LaunchReadinessReasonId::VersionJsonMissing => {
+            "Guardian blocked launch because installed version metadata is missing."
+        }
+        LaunchReadinessReasonId::ParentVersionMissing => {
+            "Guardian blocked launch because parent version metadata is missing."
+        }
+        LaunchReadinessReasonId::IncompleteInstall => {
+            "Guardian blocked launch because the install is incomplete."
+        }
+        LaunchReadinessReasonId::ClientJarMissing => {
+            "Guardian blocked launch because client game files are missing."
+        }
+        LaunchReadinessReasonId::LibrariesMissing => {
+            "Guardian blocked launch because required libraries are missing."
+        }
+        LaunchReadinessReasonId::AssetIndexMissing => {
+            "Guardian blocked launch because the asset index is missing."
+        }
+        LaunchReadinessReasonId::JavaOverrideMissing => {
+            "Guardian blocked launch because the selected Java override is unavailable."
+        }
+        _ => "Guardian blocked launch because readiness failed.",
+    }
+}
+
+fn readiness_guardian_guidance(reason: LaunchReadinessReasonId) -> &'static str {
+    match reason {
+        LaunchReadinessReasonId::VersionJsonMissing
+        | LaunchReadinessReasonId::ParentVersionMissing
+        | LaunchReadinessReasonId::IncompleteInstall
+        | LaunchReadinessReasonId::ClientJarMissing
+        | LaunchReadinessReasonId::LibrariesMissing
+        | LaunchReadinessReasonId::AssetIndexMissing => {
+            "Install or repair the affected version before launching again."
+        }
+        LaunchReadinessReasonId::JavaOverrideMissing => {
+            "Choose a valid Java runtime or switch back to Managed Java before launching again."
+        }
+        _ => "Repair the affected launch state before launching again.",
+    }
+}
+
+fn push_unique_summary_detail(details: &mut Vec<String>, value: &str) {
+    let value = value.trim();
+    if !value.is_empty() && !details.iter().any(|detail| detail == value) {
+        details.push(value.to_string());
+    }
+}
+
+fn inspect_explicit_java_override(
+    instance: &Instance,
+    config: &AppConfig,
+) -> Option<JavaOverrideInspection> {
+    if !instance.java_path.is_empty() {
+        return Some(inspect_java_override_value(
+            None,
+            java_override_target("instance_java_override"),
+            &instance.java_path,
+        ));
+    }
+    if !config.java_path_override.is_empty() {
+        return Some(inspect_java_override_value(
+            None,
+            java_override_target("global_java_override"),
+            &config.java_path_override,
+        ));
+    }
+    None
+}
+
+fn java_override_target(id: &str) -> TargetDescriptor {
+    TargetDescriptor::new(
+        StabilizationSystem::Execution,
+        TargetKind::Config,
+        id,
+        OwnershipClass::UserOwned,
+    )
+}
+
+fn application_guardian_mode(mode: GuardianMode) -> crate::guardian::GuardianMode {
+    match mode {
+        GuardianMode::Managed => crate::guardian::GuardianMode::Managed,
+        GuardianMode::Custom => crate::guardian::GuardianMode::Custom,
+    }
+}
+
+fn inspect_explicit_jvm_args(raw_args: &str) -> JvmArgsInspection {
+    if raw_args.trim().is_empty() {
+        return JvmArgsInspection {
+            args: Vec::new(),
+            facts: Vec::new(),
+        };
+    }
+    inspect_jvm_args(JvmArgsInspectionRequest::new(
+        explicit_jvm_args_target(),
+        raw_args,
+    ))
+}
+
+fn explicit_jvm_args_target() -> TargetDescriptor {
+    TargetDescriptor::new(
+        StabilizationSystem::Execution,
+        TargetKind::Config,
+        "explicit_jvm_args",
+        OwnershipClass::UserOwned,
+    )
+}
+
+fn append_launch_guardian_guidance(summary: &mut GuardianSummary, facts: &[GuardianFact]) {
+    if facts.is_empty() {
+        return;
+    }
+
+    let diagnoses = diagnose_facts(facts, OperationPhase::Validating);
+    let mut guidance = Vec::new();
+    for diagnosis in diagnoses {
+        match diagnosis.id.as_str() {
+            "java_override_unavailable" => push_unique_guidance(
+                &mut guidance,
+                "Guardian detected an unavailable Java override. Use a valid Java runtime or switch back to Managed Java before relying on this launch.",
+            ),
+            "jvm_args_malformed" => push_unique_guidance(
+                &mut guidance,
+                "Guardian detected malformed JVM arguments. Fix or remove the explicit JVM args before relying on this launch.",
+            ),
+            "jvm_arg_unsupported" => push_unique_guidance(
+                &mut guidance,
+                "Guardian detected JVM flags that may fail on this Java runtime. Remove the explicit JVM args if startup fails.",
+            ),
+            "jvm_arg_unsafe_override" => push_unique_guidance(
+                &mut guidance,
+                "Guardian detected JVM arguments that override launcher-owned runtime settings. Remove them if startup fails or behaves unexpectedly.",
+            ),
+            _ => {}
+        }
+    }
+    if !guidance.is_empty() {
+        summary.warn_with_guidance(guidance);
+    }
+}
+
+fn push_unique_guidance(guidance: &mut Vec<String>, value: &str) {
+    if !guidance.iter().any(|existing| existing == value) {
+        guidance.push(value.to_string());
     }
 }
 
@@ -581,8 +1126,71 @@ fn online_auth_unavailable_response_with_refresh(
         response["auth_refresh_status"] = json!(refresh_status);
         response["auth_refresh_reason"] = json!(refresh_reason);
     }
+    response["notice"] = json!(online_auth_launch_notice(refresh));
 
     (StatusCode::PRECONDITION_FAILED, Json(response))
+}
+
+fn online_auth_launch_notice(refresh: Option<(&'static str, &'static str)>) -> LaunchNotice {
+    let reason = refresh.map(|(_, reason)| reason).unwrap_or_default();
+    let sign_in_required = matches!(
+        reason,
+        "refresh_token_missing" | "refresh_token_rejected" | "refresh_state_unavailable"
+    ) || refresh
+        .map(|(status, _)| status == "sign_in_required")
+        .unwrap_or(false);
+    let message = if sign_in_required {
+        "Online launch needs you to sign in again."
+    } else {
+        "Online launch could not verify your Minecraft account."
+    };
+    let first_detail = if sign_in_required {
+        match reason {
+            "refresh_token_missing" => {
+                "Croopor could not refresh the Microsoft session because the saved sign-in is missing or expired."
+            }
+            "refresh_token_rejected" => "Microsoft rejected the saved sign-in session.",
+            "refresh_state_unavailable" => "Croopor could not read the saved sign-in session.",
+            _ => "Croopor could not use the saved Microsoft session for Online launch.",
+        }
+    } else {
+        match reason {
+            "auth_chain_failed" => {
+                "Croopor refreshed Microsoft sign-in, but Minecraft account verification did not complete."
+            }
+            "client_id_missing" => "Microsoft sign-in is not configured for this build.",
+            "client_build" | "token_client_unavailable" => {
+                "Croopor could not start Microsoft sign-in refresh."
+            }
+            "oauth_refresh_failed"
+            | "token_endpoint_unreachable"
+            | "token_endpoint_rejected"
+            | "token_endpoint_unavailable"
+            | "token_endpoint_parse_failed" => {
+                "Microsoft sign-in refresh is unavailable or did not complete."
+            }
+            "refreshed_account_unusable" => {
+                "The refreshed account could not be used for a verified Minecraft Java launch."
+            }
+            _ => "Croopor could not verify the Microsoft account for Online launch.",
+        }
+    };
+    let second_detail = if sign_in_required {
+        "Sign in again from Accounts, then retry Online launch."
+    } else {
+        "Refresh or re-verify the account from Accounts, then retry Online launch."
+    };
+    let details = vec![
+        first_detail.to_string(),
+        second_detail.to_string(),
+        "Offline launch remains available for singleplayer and offline-mode servers.".to_string(),
+    ];
+    LaunchNotice {
+        message: message.to_string(),
+        detail: details.first().cloned(),
+        details,
+        tone: LaunchNoticeTone::Error,
+    }
 }
 
 fn guardian_summary_for_preflight(
@@ -620,6 +1228,7 @@ impl LaunchPreflightFacts {
                 ),
             },
             readiness: self.readiness,
+            guardian_facts: self.guardian_facts,
             resource_budget: LaunchPreflightResourceBudget::from_budget(&self.resource_budget),
         }
     }
@@ -861,13 +1470,17 @@ fn positive_i32(value: i32) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::failure_memory::FailureMemoryActionOutcome;
     use crate::state::{
         AppStateInit, AuthLoginMinecraftProfile, InstallStore, NewAuthLoginMinecraftAccount,
         NewAuthLoginMsaToken, SessionStore,
     };
     use axum::Json;
     use croopor_config::{AppConfig, AppPaths, ConfigStore, InstanceStore};
-    use croopor_launcher::{GuardianDecision, LaunchReadinessReasonId, OverrideOrigin, SessionId};
+    use croopor_launcher::{
+        GuardianDecision, LaunchReadinessReason, LaunchReadinessReasonId, LaunchReadinessSeverity,
+        OverrideOrigin, SessionId,
+    };
     use croopor_performance::PerformanceManager;
     use std::{
         fs,
@@ -962,6 +1575,36 @@ mod tests {
         .await
         .expect("prepare launch session");
 
+        assert_eq!(
+            prepared.task.application.command.kind,
+            crate::state::contracts::CommandKind::LaunchInstance
+        );
+        assert_eq!(
+            prepared
+                .task
+                .application
+                .result
+                .payload
+                .session_id
+                .as_deref(),
+            Some(prepared.task.intent.session_id.as_str())
+        );
+        assert_eq!(
+            prepared
+                .task
+                .application
+                .result
+                .carriers
+                .session
+                .as_ref()
+                .and_then(|session| session.state.as_deref()),
+            Some("queued")
+        );
+        assert_eq!(
+            prepared.task.boundary.guardian_decision.mode,
+            crate::guardian::GuardianMode::Managed
+        );
+        assert_eq!(prepared.task.boundary.performance_mode, "managed");
         assert_eq!(prepared.task.intent.game_dir, Some(game_dir.clone()));
         assert_eq!(prepared.task.intent.auth.player_name, "Player");
         assert_eq!(
@@ -1183,6 +1826,7 @@ mod tests {
                 failure: None,
                 healing: None,
                 guardian: None,
+                outcome: None,
                 stages: Vec::new(),
             })
             .await;
@@ -1291,6 +1935,11 @@ mod tests {
         assert!(!preflight.readiness.launchable);
         assert_eq!(preflight.readiness.reasons.len(), 1);
         assert_readiness_reason(&preflight, LaunchReadinessReasonId::VersionJsonMissing);
+        assert_eq!(preflight.guardian.decision, GuardianDecision::Blocked);
+        assert_guardian_fact(&preflight, "version_json_missing");
+        assert!(preflight.guardian.details.iter().any(|detail| {
+            detail == "Guardian blocked launch because installed version metadata is missing."
+        }));
     }
 
     #[tokio::test]
@@ -1315,7 +1964,283 @@ mod tests {
 
         assert!(!preflight.readiness.launchable);
         assert_readiness_reason(&preflight, LaunchReadinessReasonId::ClientJarMissing);
-        assert_readiness_reason(&preflight, LaunchReadinessReasonId::ManagedRuntimeMissing);
+        let runtime_reason =
+            readiness_reason(&preflight, LaunchReadinessReasonId::ManagedRuntimeMissing);
+        assert_eq!(
+            runtime_reason.severity,
+            LaunchReadinessSeverity::Recoverable
+        );
+        assert_eq!(preflight.guardian.decision, GuardianDecision::Blocked);
+        assert_guardian_fact(&preflight, "client_jar_missing");
+        assert_guardian_fact(&preflight, "managed_runtime_missing");
+        assert!(preflight.guardian.details.iter().any(|detail| {
+            detail == "Guardian blocked launch because client game files are missing."
+        }));
+    }
+
+    #[tokio::test]
+    async fn launch_preflight_readiness_reports_missing_libraries_as_guardian_fact() {
+        let fixture = TestFixture::new("preflight-readiness-missing-libraries");
+        fixture.write_version_json(
+            "1.21.1",
+            serde_json::json!({
+                "id": "1.21.1",
+                "type": "release",
+                "mainClass": "net.minecraft.client.main.Main",
+                "assetIndex": {},
+                "javaVersion": { "component": "java-runtime-delta", "majorVersion": 21 },
+                "libraries": [{
+                    "name": "com.example:demo:1.0.0",
+                    "downloads": {
+                        "artifact": {
+                            "path": "com/example/demo/1.0.0/demo-1.0.0.jar",
+                            "url": "https://example.invalid/demo-1.0.0.jar"
+                        }
+                    }
+                }]
+            }),
+        );
+        let version_dir = fixture.paths.library_dir.join("versions").join("1.21.1");
+        fs::write(version_dir.join("1.21.1.jar"), b"client jar").expect("write client jar");
+        fixture.write_ready_runtime("java-runtime-delta");
+        let instance_id = fixture.add_instance("Survival", "1.21.1");
+
+        let preflight = prepare_launch_preflight(&fixture.state, instance_id)
+            .await
+            .expect("prepare preflight");
+
+        assert!(!preflight.readiness.launchable);
+        assert_readiness_reason(&preflight, LaunchReadinessReasonId::LibrariesMissing);
+        assert_eq!(preflight.guardian.decision, GuardianDecision::Blocked);
+        assert_guardian_fact(&preflight, "libraries_missing");
+        assert!(preflight.guardian.details.iter().any(|detail| {
+            detail == "Guardian blocked launch because required libraries are missing."
+        }));
+    }
+
+    #[tokio::test]
+    async fn launch_preflight_readiness_reports_missing_asset_index_as_guardian_fact() {
+        let fixture = TestFixture::new("preflight-readiness-missing-asset-index");
+        fixture.write_version_json(
+            "1.21.1",
+            serde_json::json!({
+                "id": "1.21.1",
+                "type": "release",
+                "mainClass": "net.minecraft.client.main.Main",
+                "assetIndex": { "id": "test-assets" },
+                "javaVersion": { "component": "java-runtime-delta", "majorVersion": 21 },
+                "libraries": []
+            }),
+        );
+        let version_dir = fixture.paths.library_dir.join("versions").join("1.21.1");
+        fs::write(version_dir.join("1.21.1.jar"), b"client jar").expect("write client jar");
+        fixture.write_ready_runtime("java-runtime-delta");
+        let instance_id = fixture.add_instance("Survival", "1.21.1");
+
+        let preflight = prepare_launch_preflight(&fixture.state, instance_id)
+            .await
+            .expect("prepare preflight");
+
+        assert!(!preflight.readiness.launchable);
+        assert_readiness_reason(&preflight, LaunchReadinessReasonId::AssetIndexMissing);
+        assert_eq!(preflight.guardian.decision, GuardianDecision::Blocked);
+        assert_guardian_fact(&preflight, "asset_index_missing");
+        assert!(preflight.guardian.details.iter().any(|detail| {
+            detail == "Guardian blocked launch because the asset index is missing."
+        }));
+    }
+
+    #[tokio::test]
+    async fn launch_preflight_readiness_reports_missing_managed_runtime_as_recoverable_fact() {
+        let fixture = TestFixture::new("preflight-readiness-missing-managed-runtime");
+        fixture.write_version_json(
+            "1.21.1",
+            serde_json::json!({
+                "id": "1.21.1",
+                "type": "release",
+                "mainClass": "net.minecraft.client.main.Main",
+                "assetIndex": {},
+                "javaVersion": { "component": "croopor-test-runtime-missing", "majorVersion": 21 },
+                "libraries": []
+            }),
+        );
+        let version_dir = fixture.paths.library_dir.join("versions").join("1.21.1");
+        fs::write(version_dir.join("1.21.1.jar"), b"client jar").expect("write client jar");
+        let instance_id = fixture.add_instance("Survival", "1.21.1");
+
+        let preflight = prepare_launch_preflight(&fixture.state, instance_id)
+            .await
+            .expect("prepare preflight");
+
+        assert!(preflight.readiness.launchable);
+        assert_eq!(preflight.guardian.decision, GuardianDecision::Allowed);
+        assert_eq!(
+            readiness_reason(&preflight, LaunchReadinessReasonId::ManagedRuntimeMissing).severity,
+            LaunchReadinessSeverity::Recoverable
+        );
+        let fact = guardian_fact(&preflight, "managed_runtime_missing");
+        assert_eq!(fact.domain, crate::guardian::GuardianDomain::Runtime);
+        assert_eq!(fact.severity, Some(GuardianSeverity::Recoverable));
+    }
+
+    #[tokio::test]
+    async fn launch_preparation_repairs_managed_runtime_ready_marker_before_blocking_readiness() {
+        let fixture = TestFixture::new("prepare-repairs-runtime-ready-marker");
+        fixture.write_version_json(
+            "1.21.1",
+            serde_json::json!({
+                "id": "1.21.1",
+                "type": "release",
+                "mainClass": "net.minecraft.client.main.Main",
+                "assetIndex": {},
+                "javaVersion": { "component": "java-runtime-delta", "majorVersion": 21 },
+                "libraries": []
+            }),
+        );
+        let version_dir = fixture.paths.library_dir.join("versions").join("1.21.1");
+        fs::write(version_dir.join("1.21.1.jar"), b"client jar").expect("client jar");
+        let runtime_root = fixture.write_global_runtime_without_ready_marker("java-runtime-delta");
+        let instance_id = fixture.add_instance("Survival", "1.21.1");
+        let instance = fixture
+            .state
+            .instances()
+            .get(&instance_id)
+            .expect("instance");
+        let config = fixture.state.config().current();
+        let game_dir = fixture.state.instances().game_dir(&instance.id);
+
+        let preflight = build_launch_preflight_facts(
+            &fixture.state,
+            &instance,
+            &config,
+            &fixture.paths.library_dir,
+            &game_dir,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            readiness_has_managed_runtime_missing(&preflight.readiness),
+            "missing managed runtime readiness reason: {:?}",
+            preflight.readiness.reasons
+        );
+
+        let repaired = maybe_repair_managed_runtime_before_launch(
+            &fixture.state,
+            preflight,
+            &instance,
+            &fixture.paths.library_dir,
+            &game_dir,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(runtime_root.join(".croopor-ready").is_file());
+        assert_eq!(
+            repaired.guardian_summary.decision,
+            GuardianDecision::Intervened
+        );
+        assert!(repaired.guardian_summary.details.iter().any(|detail| {
+            detail == "Guardian repaired the managed Java runtime before launch."
+        }));
+        let memory = fixture.state.failure_memory().list();
+        assert_eq!(memory.len(), 1);
+        assert_eq!(
+            memory[0].last_action_outcome,
+            Some(FailureMemoryActionOutcome::Repaired)
+        );
+        assert_eq!(memory[0].repair_attempt_count, 1);
+    }
+
+    #[tokio::test]
+    async fn launch_preparation_blocks_when_managed_runtime_repair_is_suppressed() {
+        let fixture = TestFixture::new("prepare-blocks-suppressed-runtime-repair");
+        let component = "croopor-test-runtime-suppressed";
+        fixture.write_version_json(
+            "1.21.1",
+            serde_json::json!({
+                "id": "1.21.1",
+                "type": "release",
+                "mainClass": "net.minecraft.client.main.Main",
+                "assetIndex": {},
+                "javaVersion": { "component": component, "majorVersion": 21 },
+                "libraries": []
+            }),
+        );
+        let version_dir = fixture.paths.library_dir.join("versions").join("1.21.1");
+        fs::write(version_dir.join("1.21.1.jar"), b"client jar").expect("client jar");
+        let runtime_root = fixture.write_global_runtime_without_ready_marker(component);
+        let instance_id = fixture.add_instance("Survival", "1.21.1");
+        let instance = fixture
+            .state
+            .instances()
+            .get(&instance_id)
+            .expect("instance");
+        let config = fixture.state.config().current();
+        let game_dir = fixture.state.instances().game_dir(&instance.id);
+        let preflight = build_launch_preflight_facts(
+            &fixture.state,
+            &instance,
+            &config,
+            &fixture.paths.library_dir,
+            &game_dir,
+            None,
+            None,
+        )
+        .await;
+
+        let repaired = maybe_repair_managed_runtime_before_launch(
+            &fixture.state,
+            preflight,
+            &instance,
+            &fixture.paths.library_dir,
+            &game_dir,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            repaired.guardian_summary.decision,
+            GuardianDecision::Intervened
+        );
+        fs::remove_file(runtime_root.join(".croopor-ready")).expect("remove ready marker");
+
+        let error = match prepare_launch_session(
+            &fixture.state,
+            LaunchRequest {
+                instance_id: instance_id.clone(),
+                username: None,
+                max_memory_mb: None,
+                min_memory_mb: None,
+                client_started_at_ms: None,
+            },
+        )
+        .await
+        {
+            Ok(_) => panic!("suppressed repair should block launch preparation"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error.1.0["guardian"]["decision"], "blocked");
+        assert_eq!(
+            error.1.0["readiness"]["reasons"][0]["severity"],
+            "recoverable"
+        );
+        assert_eq!(fixture.state.sessions().active_session_count().await, 0);
+        assert!(
+            !fixture
+                .state
+                .sessions()
+                .has_active_instance(&instance_id)
+                .await
+        );
+        let memory = fixture.state.failure_memory().list();
+        assert_eq!(
+            memory[0].last_action_outcome,
+            Some(FailureMemoryActionOutcome::Suppressed)
+        );
     }
 
     #[tokio::test]
@@ -1341,6 +2266,63 @@ mod tests {
         assert!(!preflight.readiness.launchable);
         assert_eq!(preflight.readiness.reasons.len(), 1);
         assert_readiness_reason(&preflight, LaunchReadinessReasonId::IncompleteInstall);
+        assert_eq!(preflight.guardian.decision, GuardianDecision::Blocked);
+        assert_guardian_fact(&preflight, "incomplete_install");
+        assert!(preflight.guardian.details.iter().any(|detail| {
+            detail == "Guardian blocked launch because the install is incomplete."
+        }));
+    }
+
+    #[tokio::test]
+    async fn prepare_launch_session_rejects_missing_version_json_with_guardian_block() {
+        let fixture = TestFixture::new("prepare-rejects-missing-version-json");
+        let instance_id = fixture.add_instance("Survival", "1.21.1");
+
+        let error = match prepare_launch_session(
+            &fixture.state,
+            LaunchRequest {
+                instance_id: instance_id.clone(),
+                username: None,
+                max_memory_mb: None,
+                min_memory_mb: None,
+                client_started_at_ms: None,
+            },
+        )
+        .await
+        {
+            Ok(_) => panic!("missing version metadata should not queue"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.0, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(
+            error.1.0["error"],
+            "Installed version is not ready to launch"
+        );
+        assert_eq!(error.1.0["readiness"]["launchable"], false);
+        assert_eq!(
+            error.1.0["readiness"]["reasons"][0]["id"],
+            "version_json_missing"
+        );
+        assert_eq!(error.1.0["guardian"]["decision"], "blocked");
+        assert!(
+            error.1.0["guardian"]["details"]
+                .as_array()
+                .is_some_and(|details| details.iter().any(|detail| detail.as_str()
+                    == Some(
+                        "Guardian blocked launch because installed version metadata is missing."
+                    )))
+        );
+        assert_eq!(fixture.state.sessions().active_session_count().await, 0);
+        assert!(
+            !fixture
+                .state
+                .sessions()
+                .has_active_instance(&instance_id)
+                .await
+        );
+        let payload = error.1.0.to_string();
+        assert!(!payload.contains(&fixture.root.to_string_lossy().to_string()));
     }
 
     #[tokio::test]
@@ -1384,6 +2366,23 @@ mod tests {
         assert_eq!(
             error.1.0["readiness"]["reasons"][0]["id"],
             "incomplete_install"
+        );
+        assert_eq!(error.1.0["guardian"]["decision"], "blocked");
+        assert!(
+            error.1.0["guardian"]["details"]
+                .as_array()
+                .is_some_and(|details| details.iter().any(|detail| detail.as_str()
+                    == Some("Guardian blocked launch because the install is incomplete.")))
+        );
+        assert_eq!(
+            error.1.0["notice"]["message"],
+            "Guardian blocked an unsafe launch setup."
+        );
+        assert!(
+            error.1.0["notice"]["details"]
+                .as_array()
+                .is_some_and(|details| details.iter().any(|detail| detail.as_str()
+                    == Some("Guardian blocked launch because the install is incomplete.")))
         );
         assert_eq!(fixture.state.sessions().active_session_count().await, 0);
         assert!(
@@ -1436,6 +2435,13 @@ mod tests {
             error.1.0["readiness"]["reasons"][0]["id"],
             "incomplete_install"
         );
+        assert_eq!(error.1.0["guardian"]["decision"], "blocked");
+        assert!(
+            error.1.0["guardian"]["details"]
+                .as_array()
+                .is_some_and(|details| details.iter().any(|detail| detail.as_str()
+                    == Some("Guardian blocked launch because the install is incomplete.")))
+        );
         assert_eq!(fixture.state.sessions().active_session_count().await, 0);
         assert!(
             !fixture
@@ -1450,9 +2456,11 @@ mod tests {
     async fn launch_preflight_custom_override_warns_with_bounded_override_payload() {
         let fixture = TestFixture::new("preflight-custom-bounded");
         fixture.set_guardian_mode("custom");
+        fixture.write_ready_install("1.21.1");
         let instance_id = fixture.add_instance("Survival", "1.21.1");
+        let java_path = fixture.write_manual_java_override();
         fixture.update_instance(&instance_id, |instance| {
-            instance.java_path = "/Users/SecretUser/.jdks/manual/bin/java".to_string();
+            instance.java_path = java_path.clone();
             instance.extra_jvm_args = "-Dtoken=secret-token -XX:+UseZGC".to_string();
         });
 
@@ -1471,15 +2479,13 @@ mod tests {
             preflight.overrides.raw_jvm_args.origin,
             Some(OverrideOrigin::Instance)
         );
-        assert_readiness_reason(&preflight, LaunchReadinessReasonId::JavaOverrideMissing);
         assert!(preflight.guardian.guidance.iter().any(|detail| detail
             == "Guardian Custom mode will keep the selected Java override for this launch."));
         assert!(preflight.guardian.guidance.iter().any(|detail| detail
             == "Guardian Custom mode will keep explicit JVM args; remove them first if startup becomes unstable."));
 
         let payload = serde_json::to_string(&preflight).expect("serialize preflight");
-        assert!(!payload.contains("/Users/SecretUser"));
-        assert!(!payload.contains("manual/bin/java"));
+        assert!(!payload.contains(&fixture.root.to_string_lossy().to_string()));
         assert!(!payload.contains("-Dtoken"));
         assert!(!payload.contains("secret-token"));
         assert!(!payload.contains("requested_java"));
@@ -1488,15 +2494,270 @@ mod tests {
         assert!(!payload.contains("command"));
         assert!(!payload.contains("username"));
         for reason in &preflight.readiness.reasons {
-            assert!(!reason.message.contains("/Users/SecretUser"));
-            assert!(!reason.message.contains("manual/bin/java"));
+            assert!(
+                !reason
+                    .message
+                    .contains(&fixture.root.to_string_lossy().to_string())
+            );
             assert!(!reason.message.contains("secret-token"));
         }
     }
 
     #[tokio::test]
+    async fn launch_preflight_bad_custom_java_override_blocks_with_guardian_fact() {
+        let fixture = TestFixture::new("preflight-bad-custom-java-block");
+        fixture.set_guardian_mode("custom");
+        fixture.write_ready_install("1.21.1");
+        let instance_id = fixture.add_instance("Survival", "1.21.1");
+        fixture.update_instance(&instance_id, |instance| {
+            instance.java_path = "/Users/SecretUser/.jdks/manual/bin/java".to_string();
+        });
+
+        let preflight = prepare_launch_preflight(&fixture.state, instance_id)
+            .await
+            .expect("prepare preflight");
+
+        assert!(!preflight.readiness.launchable);
+        assert_readiness_reason(&preflight, LaunchReadinessReasonId::JavaOverrideMissing);
+        assert_eq!(preflight.guardian.decision, GuardianDecision::Blocked);
+        let fact = guardian_fact(&preflight, "java_override_missing");
+        assert_eq!(fact.domain, crate::guardian::GuardianDomain::Runtime);
+        assert_eq!(fact.ownership, OwnershipClass::UserOwned);
+        assert_eq!(
+            fact.target.as_ref().map(|target| target.id.as_str()),
+            Some("explicit_java_override")
+        );
+        assert!(preflight.guardian.details.iter().any(|detail| {
+            detail == "Guardian blocked launch because the selected Java override is unavailable."
+        }));
+
+        let payload = serde_json::to_string(&preflight).expect("serialize preflight");
+        assert!(!payload.contains("/Users/SecretUser"));
+        assert!(!payload.contains("manual/bin/java"));
+    }
+
+    #[tokio::test]
+    async fn prepare_launch_session_rejects_bad_custom_java_override_with_guardian_block() {
+        let fixture = TestFixture::new("prepare-bad-custom-java-block");
+        fixture.set_guardian_mode("custom");
+        fixture.write_ready_install("1.21.1");
+        let instance_id = fixture.add_instance("Survival", "1.21.1");
+        fixture.update_instance(&instance_id, |instance| {
+            instance.java_path = "/Users/SecretUser/.jdks/manual/bin/java".to_string();
+        });
+
+        let error = match prepare_launch_session(
+            &fixture.state,
+            LaunchRequest {
+                instance_id: instance_id.clone(),
+                username: None,
+                max_memory_mb: None,
+                min_memory_mb: None,
+                client_started_at_ms: None,
+            },
+        )
+        .await
+        {
+            Ok(_) => panic!("bad custom Java override should not queue"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.0, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(error.1.0["readiness"]["launchable"], false);
+        assert_eq!(
+            error.1.0["readiness"]["reasons"][0]["id"],
+            "java_override_missing"
+        );
+        assert_eq!(error.1.0["guardian"]["decision"], "blocked");
+        assert!(
+            error.1.0["guardian"]["details"]
+                .as_array()
+                .is_some_and(|details| details.iter().any(|detail| detail.as_str()
+                    == Some(
+                        "Guardian blocked launch because the selected Java override is unavailable."
+                    )))
+        );
+        assert_eq!(fixture.state.sessions().active_session_count().await, 0);
+        assert!(
+            !fixture
+                .state
+                .sessions()
+                .has_active_instance(&instance_id)
+                .await
+        );
+        let payload = error.1.0.to_string();
+        assert!(!payload.contains("/Users/SecretUser"));
+        assert!(!payload.contains("manual/bin/java"));
+    }
+
+    #[tokio::test]
+    async fn launch_preflight_malformed_jvm_args_exposes_redacted_guardian_fact() {
+        let fixture = TestFixture::new("preflight-malformed-jvm-fact");
+        fixture.write_ready_install("1.21.1");
+        let instance_id = fixture.add_instance("Survival", "1.21.1");
+        fixture.update_instance(&instance_id, |instance| {
+            instance.extra_jvm_args =
+                r#"-Xmx2G "unterminated C:\Users\Alice\.jdks\java.exe"#.to_string();
+        });
+
+        let preflight = prepare_launch_preflight(&fixture.state, instance_id)
+            .await
+            .expect("prepare preflight");
+
+        assert_eq!(preflight.guardian.decision, GuardianDecision::Warned);
+        assert!(preflight.guardian.guidance.iter().any(|detail| {
+            detail == "Guardian detected malformed JVM arguments. Fix or remove the explicit JVM args before relying on this launch."
+        }));
+        let fact = preflight
+            .guardian_facts
+            .iter()
+            .find(|fact| fact.id.as_str() == "jvm_args_parse_failed")
+            .expect("jvm parse fact");
+        assert_eq!(fact.domain, crate::guardian::GuardianDomain::Jvm);
+        assert_eq!(
+            fact.target.as_ref().map(|target| target.id.as_str()),
+            Some("explicit_jvm_args")
+        );
+        let payload = serde_json::to_string(&preflight).expect("serialize preflight");
+        let lower = payload.to_ascii_lowercase();
+        assert!(!lower.contains("alice"));
+        assert!(!lower.contains(".jdks"));
+        assert!(!lower.contains("-xmx"));
+        assert!(!lower.contains("unterminated"));
+    }
+
+    #[tokio::test]
+    async fn launch_preflight_unsupported_jvm_gc_flags_exposes_guardian_fact() {
+        let fixture = TestFixture::new("preflight-unsupported-jvm-fact");
+        fixture.write_ready_install("1.21.1");
+        let instance_id = fixture.add_instance("Survival", "1.21.1");
+        fixture.update_instance(&instance_id, |instance| {
+            instance.extra_jvm_args = "-XX:+UseZGC -Dtoken=secret-token".to_string();
+        });
+
+        let preflight = prepare_launch_preflight(&fixture.state, instance_id)
+            .await
+            .expect("prepare preflight");
+
+        assert_eq!(preflight.guardian.decision, GuardianDecision::Warned);
+        assert!(preflight.guardian.guidance.iter().any(|detail| {
+            detail == "Guardian detected JVM flags that may fail on this Java runtime. Remove the explicit JVM args if startup fails."
+        }));
+        let fact = preflight
+            .guardian_facts
+            .iter()
+            .find(|fact| fact.id.as_str() == "jvm_arg_unsupported_gc")
+            .expect("unsupported jvm fact");
+        assert_eq!(fact.domain, crate::guardian::GuardianDomain::Jvm);
+        assert_eq!(
+            fact.target.as_ref().map(|target| target.id.as_str()),
+            Some("explicit_jvm_args")
+        );
+
+        let payload = serde_json::to_string(&preflight).expect("serialize preflight");
+        let lower = payload.to_ascii_lowercase();
+        assert!(!lower.contains("-xx:+usezgc"));
+        assert!(!lower.contains("-dtoken"));
+        assert!(!lower.contains("secret-token"));
+    }
+
+    #[tokio::test]
+    async fn launch_preflight_undefined_java_override_exposes_guardian_fact() {
+        let fixture = TestFixture::new("preflight-undefined-java-fact");
+        fixture.write_ready_install("1.21.1");
+        let instance_id = fixture.add_instance("Survival", "1.21.1");
+        fixture.update_instance(&instance_id, |instance| {
+            instance.java_path = "undefined".to_string();
+        });
+
+        let preflight = prepare_launch_preflight(&fixture.state, instance_id)
+            .await
+            .expect("prepare preflight");
+
+        assert_eq!(preflight.guardian.decision, GuardianDecision::Warned);
+        assert_eq!(
+            preflight.overrides.java.origin,
+            Some(OverrideOrigin::Instance)
+        );
+        assert!(preflight.guardian.guidance.iter().any(|detail| {
+            detail == "Guardian detected an unavailable Java override. Use a valid Java runtime or switch back to Managed Java before relying on this launch."
+        }));
+        let fact = preflight
+            .guardian_facts
+            .iter()
+            .find(|fact| fact.id.as_str() == "java_override_undefined_sentinel")
+            .expect("java sentinel fact");
+        assert_eq!(fact.domain, crate::guardian::GuardianDomain::Runtime);
+        assert_eq!(
+            fact.target.as_ref().map(|target| target.id.as_str()),
+            Some("instance_java_override")
+        );
+        assert!(
+            fact.fields
+                .iter()
+                .any(|field| { field.key == "sentinel" && field.value == "undefined" })
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_preflight_null_java_override_exposes_guardian_fact() {
+        let fixture = TestFixture::new("preflight-null-java-fact");
+        fixture.write_ready_install("1.21.1");
+        let instance_id = fixture.add_instance("Survival", "1.21.1");
+        fixture.update_instance(&instance_id, |instance| {
+            instance.java_path = "null".to_string();
+        });
+
+        let preflight = prepare_launch_preflight(&fixture.state, instance_id)
+            .await
+            .expect("prepare preflight");
+
+        assert_eq!(preflight.guardian.decision, GuardianDecision::Warned);
+        let fact = preflight
+            .guardian_facts
+            .iter()
+            .find(|fact| fact.id.as_str() == "java_override_undefined_sentinel")
+            .expect("java sentinel fact");
+        assert_eq!(fact.domain, crate::guardian::GuardianDomain::Runtime);
+        assert!(
+            fact.fields
+                .iter()
+                .any(|field| { field.key == "sentinel" && field.value == "null" })
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_preflight_blank_explicit_java_override_exposes_guardian_fact() {
+        let fixture = TestFixture::new("preflight-empty-java-fact");
+        fixture.set_global_java_override("/opt/java/bin/java");
+        fixture.write_ready_install("1.21.1");
+        let instance_id = fixture.add_instance("Survival", "1.21.1");
+        fixture.update_instance(&instance_id, |instance| {
+            instance.java_path = "   ".to_string();
+        });
+
+        let preflight = prepare_launch_preflight(&fixture.state, instance_id)
+            .await
+            .expect("prepare preflight");
+
+        assert_eq!(preflight.guardian.decision, GuardianDecision::Warned);
+        assert_eq!(
+            preflight.overrides.java.origin,
+            Some(OverrideOrigin::Instance)
+        );
+        assert!(preflight.guardian_facts.iter().any(|fact| {
+            fact.id.as_str() == "java_override_empty"
+                && fact
+                    .target
+                    .as_ref()
+                    .is_some_and(|target| target.id == "instance_java_override")
+        }));
+    }
+
+    #[tokio::test]
     async fn launch_preflight_memory_clamp_warning_is_reflected() {
         let fixture = TestFixture::new("preflight-memory-clamp");
+        fixture.write_ready_install("1.21.1");
         let instance_id = fixture.add_instance("Survival", "1.21.1");
         fixture.update_instance(&instance_id, |instance| {
             instance.max_memory_mb = 1024;
@@ -1517,6 +2778,7 @@ mod tests {
     #[tokio::test]
     async fn launch_preflight_resource_warning_path_is_reflected() {
         let fixture = TestFixture::new("preflight-resource-warning");
+        fixture.write_ready_install("1.21.1");
         let instance_id = fixture.add_instance("Survival", "1.21.1");
 
         let preflight = prepare_launch_preflight(&fixture.state, instance_id)
@@ -1596,6 +2858,38 @@ mod tests {
                 .any(|detail| detail
                     == "Guardian Custom mode will keep explicit JVM args; remove them first if startup becomes unstable.")
         );
+    }
+
+    #[tokio::test]
+    async fn malformed_raw_jvm_args_warn_before_queue_without_changing_fallback_args() {
+        let fixture = TestFixture::new("prepare-malformed-jvm-warning");
+        let instance_id = fixture.add_instance("Survival", "1.21.1");
+        fixture.update_instance(&instance_id, |instance| {
+            instance.extra_jvm_args = r#"-Xmx2G "unterminated"#.to_string();
+        });
+
+        let prepared = fixture
+            .prepare(instance_id.clone(), None)
+            .await
+            .expect("prepare launch session");
+
+        assert_eq!(prepared.task.guardian.decision, GuardianDecision::Warned);
+        assert!(
+            prepared
+                .task
+                .guardian
+                .guidance
+                .iter()
+                .any(|detail| detail
+                    == "Guardian detected malformed JVM arguments. Fix or remove the explicit JVM args before relying on this launch.")
+        );
+        assert_eq!(
+            prepared.task.intent.extra_jvm_args,
+            vec!["-Xmx2G", "\"unterminated"]
+        );
+        let guardian = serde_json::to_string(&prepared.task.guardian).expect("guardian json");
+        assert!(!guardian.to_ascii_lowercase().contains("-xmx"));
+        assert!(!guardian.contains("unterminated"));
     }
 
     #[tokio::test]
@@ -2105,6 +3399,19 @@ mod tests {
             fs::write(runtime_bin.join(java_name), b"java").expect("runtime java");
         }
 
+        fn write_global_runtime_without_ready_marker(&self, component: &str) -> PathBuf {
+            let runtime_root = self.paths.config_dir.join("runtimes").join(component);
+            let runtime_bin = runtime_root.join("bin");
+            fs::create_dir_all(&runtime_bin).expect("global runtime bin");
+            let java_name = if cfg!(target_os = "windows") {
+                "javaw.exe"
+            } else {
+                "java"
+            };
+            fs::write(runtime_bin.join(java_name), b"java").expect("global runtime java");
+            runtime_root
+        }
+
         fn write_manual_java_override(&self) -> String {
             let bin_dir = self.root.join("manual-java").join("bin");
             fs::create_dir_all(&bin_dir).expect("manual java bin");
@@ -2151,6 +3458,15 @@ mod tests {
                 .config()
                 .replace_in_memory(config)
                 .expect("set global jvm preset");
+        }
+
+        fn set_global_java_override(&self, java_path: &str) {
+            let mut config = self.state.config().current();
+            config.java_path_override = java_path.to_string();
+            self.state
+                .config()
+                .replace_in_memory(config)
+                .expect("set global java override");
         }
 
         fn write_version_json(&self, version_id: &str, value: serde_json::Value) {
@@ -2216,6 +3532,7 @@ mod tests {
                     failure: None,
                     healing: None,
                     guardian: None,
+                    outcome: None,
                     stages: Vec::new(),
                 })
                 .await;
@@ -2298,6 +3615,43 @@ mod tests {
             "missing readiness reason {expected:?}: {:?}",
             preflight.readiness.reasons
         );
+    }
+
+    fn assert_guardian_fact(preflight: &LaunchPreflightResponse, expected: &str) {
+        let _ = guardian_fact(preflight, expected);
+    }
+
+    fn guardian_fact<'a>(
+        preflight: &'a LaunchPreflightResponse,
+        expected: &str,
+    ) -> &'a GuardianFact {
+        preflight
+            .guardian_facts
+            .iter()
+            .find(|fact| fact.id.as_str() == expected)
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing guardian fact {expected}: {:?}",
+                    preflight.guardian_facts
+                )
+            })
+    }
+
+    fn readiness_reason(
+        preflight: &LaunchPreflightResponse,
+        expected: LaunchReadinessReasonId,
+    ) -> &LaunchReadinessReason {
+        preflight
+            .readiness
+            .reasons
+            .iter()
+            .find(|reason| reason.id == expected)
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing readiness reason {expected:?}: {:?}",
+                    preflight.readiness.reasons
+                )
+            })
     }
 
     fn assert_launch_error_is_token_safe(value: &serde_json::Value) {

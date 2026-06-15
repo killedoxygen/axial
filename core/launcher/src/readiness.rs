@@ -48,6 +48,7 @@ pub enum LaunchReadinessReasonId {
 #[serde(rename_all = "snake_case")]
 pub enum LaunchReadinessSeverity {
     Blocking,
+    Recoverable,
 }
 
 pub fn inspect_launch_readiness(request: &LaunchReadinessRequest) -> LaunchReadiness {
@@ -95,6 +96,7 @@ fn inspect_incomplete_install_markers(
             reasons.push(reason(
                 LaunchReadinessReasonId::IncompleteInstall,
                 "Installation is incomplete. Finish or repair this version before launching.",
+                LaunchReadinessSeverity::Blocking,
             ));
             return;
         }
@@ -119,6 +121,7 @@ fn inspect_version_files(
         reasons.push(reason(
             LaunchReadinessReasonId::ClientJarMissing,
             "Client game files are missing. Install this version before launching.",
+            LaunchReadinessSeverity::Blocking,
         ));
     }
 
@@ -127,6 +130,7 @@ fn inspect_version_files(
         reasons.push(reason(
             LaunchReadinessReasonId::LibrariesMissing,
             "Required libraries are missing. Install this version before launching.",
+            LaunchReadinessSeverity::Blocking,
         ));
     }
 
@@ -139,6 +143,7 @@ fn inspect_version_files(
             reasons.push(reason(
                 LaunchReadinessReasonId::AssetIndexMissing,
                 "Asset index is missing. Install this version before launching.",
+                LaunchReadinessSeverity::Blocking,
             ));
         }
     }
@@ -176,7 +181,8 @@ fn inspect_runtime_files(
     if !runtime_component_ready_without_probe(&request.library_dir, &component) {
         reasons.push(reason(
             LaunchReadinessReasonId::ManagedRuntimeMissing,
-            "Managed Java runtime is missing. Install or repair the runtime before launching.",
+            "Managed Java runtime is missing and will be prepared before launch.",
+            LaunchReadinessSeverity::Recoverable,
         ));
     }
 }
@@ -186,12 +192,14 @@ fn reason_for_version_error(error: &LaunchModelError) -> LaunchReadinessReason {
         return reason(
             LaunchReadinessReasonId::ParentVersionMissing,
             "Parent version metadata is missing. Install the base version before launching.",
+            LaunchReadinessSeverity::Blocking,
         );
     }
 
     reason(
         LaunchReadinessReasonId::VersionJsonMissing,
         "Installed version metadata is missing. Install this version before launching.",
+        LaunchReadinessSeverity::Blocking,
     )
 }
 
@@ -214,13 +222,141 @@ fn java_override_missing_reason() -> LaunchReadinessReason {
     reason(
         LaunchReadinessReasonId::JavaOverrideMissing,
         "Selected Java override is unavailable. Choose another Java runtime or use Managed mode.",
+        LaunchReadinessSeverity::Blocking,
     )
 }
 
-fn reason(id: LaunchReadinessReasonId, message: &'static str) -> LaunchReadinessReason {
+fn reason(
+    id: LaunchReadinessReasonId,
+    message: &'static str,
+    severity: LaunchReadinessSeverity,
+) -> LaunchReadinessReason {
     LaunchReadinessReason {
         id,
-        severity: LaunchReadinessSeverity::Blocking,
+        severity,
         message,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        LaunchReadinessReasonId, LaunchReadinessRequest, LaunchReadinessSeverity,
+        inspect_launch_readiness,
+    };
+    use crate::GuardianMode;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn managed_runtime_missing_is_recoverable_in_managed_mode() {
+        let library_dir = temp_library("managed-runtime-missing-recoverable");
+        write_version_json(
+            &library_dir,
+            "1.21.1",
+            r#"{
+                "id": "1.21.1",
+                "type": "release",
+                "mainClass": "net.minecraft.client.main.Main",
+                "assetIndex": {},
+                "javaVersion": {
+                    "component": "croopor-test-runtime-missing",
+                    "majorVersion": 21
+                },
+                "libraries": []
+            }"#,
+        );
+        fs::write(
+            library_dir
+                .join("versions")
+                .join("1.21.1")
+                .join("1.21.1.jar"),
+            b"client jar",
+        )
+        .expect("write client jar");
+
+        let readiness = inspect_launch_readiness(&LaunchReadinessRequest {
+            library_dir: library_dir.clone(),
+            version_id: "1.21.1".to_string(),
+            requested_java: String::new(),
+            guardian_mode: GuardianMode::Managed,
+        });
+
+        assert!(readiness.launchable, "{:?}", readiness.reasons);
+        let reason = readiness
+            .reasons
+            .iter()
+            .find(|reason| reason.id == LaunchReadinessReasonId::ManagedRuntimeMissing)
+            .expect("managed runtime reason");
+        assert_eq!(reason.severity, LaunchReadinessSeverity::Recoverable);
+        cleanup(&library_dir);
+    }
+
+    #[test]
+    fn custom_component_override_missing_stays_blocking() {
+        let library_dir = temp_library("custom-runtime-missing-blocking");
+        write_version_json(
+            &library_dir,
+            "1.21.1",
+            r#"{
+                "id": "1.21.1",
+                "type": "release",
+                "mainClass": "net.minecraft.client.main.Main",
+                "assetIndex": {},
+                "javaVersion": {
+                    "component": "java-runtime-delta",
+                    "majorVersion": 21
+                },
+                "libraries": []
+            }"#,
+        );
+        fs::write(
+            library_dir
+                .join("versions")
+                .join("1.21.1")
+                .join("1.21.1.jar"),
+            b"client jar",
+        )
+        .expect("write client jar");
+
+        let readiness = inspect_launch_readiness(&LaunchReadinessRequest {
+            library_dir: library_dir.clone(),
+            version_id: "1.21.1".to_string(),
+            requested_java: "croopor-test-runtime-missing".to_string(),
+            guardian_mode: GuardianMode::Custom,
+        });
+
+        assert!(!readiness.launchable);
+        let reason = readiness
+            .reasons
+            .iter()
+            .find(|reason| reason.id == LaunchReadinessReasonId::JavaOverrideMissing)
+            .expect("custom override reason");
+        assert_eq!(reason.severity, LaunchReadinessSeverity::Blocking);
+        cleanup(&library_dir);
+    }
+
+    fn temp_library(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "croopor-launcher-readiness-{name}-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create temp library");
+        root
+    }
+
+    fn write_version_json(library_dir: &Path, version_id: &str, json: &str) {
+        let version_dir = library_dir.join("versions").join(version_id);
+        fs::create_dir_all(&version_dir).expect("version dir");
+        fs::write(version_dir.join(format!("{version_id}.json")), json).expect("version json");
+    }
+
+    fn cleanup(path: &Path) {
+        let _ = fs::remove_dir_all(path);
     }
 }

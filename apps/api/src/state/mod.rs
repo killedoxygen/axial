@@ -3,8 +3,12 @@ mod auth_logins;
 mod auth_persistence;
 pub mod benchmark_suite_drivers;
 pub mod benchmark_suites;
+pub mod contracts;
+pub mod failure_memory;
 mod installs;
+mod journals;
 pub mod launch_reports;
+pub mod ownership;
 pub mod performance_operations;
 pub mod presence;
 mod sessions;
@@ -31,7 +35,9 @@ pub use auth_logins::{
     AuthLoginMinecraftSkin, AuthLoginMsaToken, AuthLoginStore, NewAuthLoginMinecraftAccount,
     NewAuthLoginMsaToken,
 };
+pub use failure_memory::GuardianFailureMemoryStore;
 pub use installs::InstallStore;
+pub use journals::OperationJournalStore;
 pub use sessions::{SessionStore, StartupOutcome};
 
 #[derive(Clone)]
@@ -43,6 +49,8 @@ pub struct AppState {
     accounts: Arc<LauncherAccountStore>,
     auth_logins: Arc<AuthLoginStore>,
     installs: Arc<InstallStore>,
+    failure_memory: Arc<GuardianFailureMemoryStore>,
+    journals: Arc<OperationJournalStore>,
     sessions: Arc<SessionStore>,
     skins: Arc<skins::SavedSkinStore>,
     benchmark_suite_drivers: Arc<benchmark_suite_drivers::BenchmarkSuiteDriverStore>,
@@ -89,6 +97,8 @@ impl AppState {
             accounts,
             auth_logins: Arc::new(AuthLoginStore::load_from_secure_store()),
             installs: init.installs,
+            failure_memory: Arc::new(GuardianFailureMemoryStore::new()),
+            journals: Arc::new(OperationJournalStore::new()),
             sessions: init.sessions,
             skins,
             benchmark_suite_drivers,
@@ -151,6 +161,14 @@ impl AppState {
 
     pub fn installs(&self) -> &Arc<InstallStore> {
         &self.installs
+    }
+
+    pub fn failure_memory(&self) -> &Arc<GuardianFailureMemoryStore> {
+        &self.failure_memory
+    }
+
+    pub fn journals(&self) -> &Arc<OperationJournalStore> {
+        &self.journals
     }
 
     pub fn performance(&self) -> &Arc<PerformanceManager> {

@@ -1,3 +1,4 @@
+pub mod effective;
 pub mod health;
 pub mod install;
 pub mod modrinth;
@@ -9,6 +10,13 @@ pub mod state;
 pub mod status;
 pub mod types;
 
+pub use effective::{
+    EffectiveContributionSource, EffectiveFallbackPlan, EffectiveInstrumentationMode,
+    EffectiveInstrumentationPolicy, EffectiveJvmContribution, EffectiveLaunchSmoothing,
+    EffectiveLaunchSmoothingPolicy, EffectiveLoaderPosture, EffectiveManagedArtifact,
+    EffectivePerformanceComposition, EffectivePerformanceExplanation,
+    EffectivePerformanceHealthRequirements, EffectivePerformancePlan, effective_performance_plan,
+};
 pub use health::{BundleHealth, derive_health};
 pub use install::{InstallError, PERFORMANCE_RULES_URL_ENV, PerformanceManager, RulesRefreshError};
 pub use resolve::{ResolveError, builtin_manifest, detect_hardware, parse_mode, resolve_plan};
@@ -27,5 +35,5 @@ pub use status::{
 pub use types::{
     CompositionPlan, CompositionState, CompositionTier, HardwareProfile, InstalledMod,
     ManagedArtifactIntegrity, ManagedArtifactProvider, ManagedArtifactSource, Manifest,
-    OwnershipClass, PerformanceMode, ResolutionRequest,
+    ModCondition, OwnershipClass, PerformanceMode, ResolutionRequest,
 };

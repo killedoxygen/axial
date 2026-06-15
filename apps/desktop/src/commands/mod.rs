@@ -2,7 +2,7 @@ use crate::events;
 use crate::state::{ApiRuntimeState, DesktopState};
 use croopor_api::routes::flush_pending_saved_skin_applies_for_shutdown;
 use croopor_api::state::{AppState, LaunchEvent, LaunchSessionRecord, LaunchStatusEvent};
-use croopor_launcher::LaunchState;
+use croopor_launcher::{LaunchState, launch_notice_from_values};
 use serde::Serialize;
 use std::fs;
 use std::path::PathBuf;
@@ -433,6 +433,18 @@ fn snapshot_status(record: &LaunchSessionRecord) -> LaunchStatusEvent {
             .and_then(|failure| failure.detail.clone()),
         healing: record.healing.clone(),
         guardian: record.guardian.clone(),
+        outcome: record.outcome.clone(),
+        notice: launch_notice_from_values(
+            record.guardian.as_ref(),
+            record.healing.as_ref(),
+            record.outcome.as_ref(),
+            record
+                .failure
+                .as_ref()
+                .and_then(|failure| failure.detail.as_deref()),
+            None,
+        ),
+        evidence: Vec::new(),
         stages: record.stages.clone(),
     }
 }

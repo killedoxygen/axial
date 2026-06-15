@@ -10,6 +10,12 @@ struct InstallEntry {
     done: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstallSnapshot {
+    pub history: Vec<DownloadProgress>,
+    pub done: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InstallKey {
     scope: String,
@@ -117,11 +123,34 @@ impl InstallStore {
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        Self::spawn_tracked_worker_with_interrupt_handler(
+            store,
+            install_id,
+            interrupted_progress,
+            worker,
+            |_| {},
+        )
+    }
+
+    pub fn spawn_tracked_worker_with_interrupt_handler<F, H>(
+        store: Arc<Self>,
+        install_id: String,
+        interrupted_progress: DownloadProgress,
+        worker: F,
+        on_interrupted: H,
+    ) -> JoinHandle<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+        H: FnOnce(DownloadProgress) + Send + 'static,
+    {
         tokio::spawn(async move {
             let _ = tokio::spawn(worker).await;
-            store
-                .finish_if_active(&install_id, interrupted_progress)
-                .await;
+            if store
+                .finish_if_active(&install_id, interrupted_progress.clone())
+                .await
+            {
+                on_interrupted(interrupted_progress);
+            }
         })
     }
 
@@ -138,6 +167,17 @@ impl InstallStore {
             .await
             .get(install_id)
             .map(|entry| (entry.history.clone(), entry.events.subscribe(), entry.done))
+    }
+
+    pub async fn snapshot(&self, install_id: &str) -> Option<InstallSnapshot> {
+        self.installs
+            .read()
+            .await
+            .get(install_id)
+            .map(|entry| InstallSnapshot {
+                history: entry.history.clone(),
+                done: entry.done,
+            })
     }
 
     pub async fn active_install_for_scope_and_version(
@@ -470,6 +510,52 @@ mod tests {
         .expect("tracked worker should complete");
 
         assert_eq!(store.active_install_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn tracked_worker_interruption_handler_runs_only_for_active_finish() {
+        let store = Arc::new(InstallStore::new());
+        store
+            .insert_or_existing_active(
+                "early-install".to_string(),
+                "1.21.5".to_string(),
+                String::new(),
+            )
+            .await;
+        let interrupted = Arc::new(std::sync::Mutex::new(None));
+        let interrupted_capture = interrupted.clone();
+
+        InstallStore::spawn_tracked_worker_with_interrupt_handler(
+            Arc::clone(&store),
+            "early-install".to_string(),
+            failed_progress(),
+            async {},
+            move |progress| {
+                *interrupted_capture.lock().expect("lock") = Some(progress.phase);
+            },
+        )
+        .await
+        .expect("tracked worker should complete");
+
+        assert_eq!(interrupted.lock().expect("lock").as_deref(), Some("error"));
+
+        store.insert("done-install".to_string()).await;
+        store.emit("done-install", done_progress()).await;
+        let not_interrupted = Arc::new(std::sync::Mutex::new(false));
+        let not_interrupted_capture = not_interrupted.clone();
+        InstallStore::spawn_tracked_worker_with_interrupt_handler(
+            Arc::clone(&store),
+            "done-install".to_string(),
+            failed_progress(),
+            async {},
+            move |_| {
+                *not_interrupted_capture.lock().expect("lock") = true;
+            },
+        )
+        .await
+        .expect("tracked worker should complete");
+
+        assert!(!*not_interrupted.lock().expect("lock"));
     }
 
     #[tokio::test]

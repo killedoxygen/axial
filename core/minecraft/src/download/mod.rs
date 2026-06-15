@@ -9,6 +9,7 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest as _, Sha1};
 use std::collections::HashSet;
+use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -27,6 +28,7 @@ const ASSET_DOWNLOADS_PER_CORE: usize = 4;
 const DOWNLOAD_CLIENT_MAX_IDLE_PER_HOST: usize = MAX_ASSET_DOWNLOAD_CONCURRENCY;
 const DOWNLOAD_CLIENT_POOL_IDLE_TIMEOUT_SECS: u64 = 120;
 const DOWNLOAD_CLIENT_TCP_KEEPALIVE_SECS: u64 = 60;
+const DEFAULT_SELECTED_ARTIFACT_MAX_BYTES: u64 = 512 << 20;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DownloadProgress {
@@ -86,10 +88,10 @@ struct RuntimeEnsurePipeline {
     progress_rx: mpsc::UnboundedReceiver<DownloadProgress>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-struct ExpectedIntegrity {
-    size: Option<u64>,
-    sha1: Option<String>,
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ExpectedIntegrity {
+    pub size: Option<u64>,
+    pub sha1: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,22 +144,175 @@ impl std::fmt::Display for DownloadIntegrityError {
 }
 
 impl ExpectedIntegrity {
-    fn from_mojang(size: i64, sha1: &str) -> Self {
+    pub fn from_mojang(size: i64, sha1: &str) -> Self {
         Self {
             size: u64::try_from(size).ok().filter(|value| *value > 0),
             sha1: non_empty_sha1(sha1),
         }
     }
 
-    fn from_sha1(sha1: &str) -> Self {
+    pub fn from_sha1(sha1: &str) -> Self {
         Self {
             size: None,
             sha1: non_empty_sha1(sha1),
         }
     }
 
-    fn has_evidence(&self) -> bool {
+    pub fn has_evidence(&self) -> bool {
         self.size.is_some() || self.sha1.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExecutionDownloadOwnership {
+    LauncherManaged,
+    UserOwned,
+    Unknown,
+}
+
+impl ExecutionDownloadOwnership {
+    fn allows_managed_mutation(self) -> bool {
+        matches!(self, Self::LauncherManaged)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExecutionDownloadFactKind {
+    ArtifactVerified,
+    ChecksumMismatch,
+    MetadataInvalid,
+    MetadataMissing,
+    Interrupted,
+    NetworkFailure,
+    OwnershipRefused,
+    PermissionFailure,
+    PromoteFailed,
+    ProviderFailure,
+    SizeMismatch,
+    TempDiscarded,
+    TempWriteFailed,
+    WrittenToTemp,
+    Promoted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionDownloadFact {
+    pub kind: ExecutionDownloadFactKind,
+    pub target: String,
+    pub fields: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionDownloadReport {
+    pub target: String,
+    pub bytes_written: u64,
+    pub facts: Vec<ExecutionDownloadFact>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SelectedDownloadArtifactKind {
+    VersionJson,
+    ClientJar,
+    Library,
+    AssetIndex,
+    AssetObject,
+    LogConfig,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct SelectedDownloadArtifactDescriptor {
+    pub kind: SelectedDownloadArtifactKind,
+    pub target: String,
+    destination: PathBuf,
+    provider_url: String,
+    sha1: String,
+    pub expected_size: Option<u64>,
+    pub max_bytes: u64,
+}
+
+impl SelectedDownloadArtifactDescriptor {
+    pub fn new(
+        kind: SelectedDownloadArtifactKind,
+        target: impl Into<String>,
+        destination: impl Into<PathBuf>,
+        provider_url: impl Into<String>,
+        sha1: impl Into<String>,
+        expected_size: Option<u64>,
+        max_bytes: u64,
+    ) -> Self {
+        Self {
+            kind,
+            target: target.into(),
+            destination: destination.into(),
+            provider_url: provider_url.into(),
+            sha1: sha1.into(),
+            expected_size,
+            max_bytes,
+        }
+    }
+
+    pub fn destination(&self) -> &Path {
+        &self.destination
+    }
+
+    pub fn provider_url(&self) -> &str {
+        &self.provider_url
+    }
+
+    pub fn sha1(&self) -> &str {
+        &self.sha1
+    }
+}
+
+impl fmt::Debug for SelectedDownloadArtifactDescriptor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SelectedDownloadArtifactDescriptor")
+            .field("kind", &self.kind)
+            .field("target", &self.target)
+            .field("destination", &"<redacted>")
+            .field("provider_url", &"<redacted>")
+            .field("sha1", &"<redacted>")
+            .field("expected_size", &self.expected_size)
+            .field("max_bytes", &self.max_bytes)
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+pub struct ExecutionDownloadError {
+    pub kind: ExecutionDownloadFactKind,
+    pub facts: Vec<ExecutionDownloadFact>,
+    error: DownloadError,
+}
+
+impl ExecutionDownloadError {
+    pub fn into_download_error(self) -> DownloadError {
+        let Self { kind, facts, error } = self;
+        let _fact_report = (kind, facts);
+        error
+    }
+}
+
+struct ExecutionDownloadRequest<'a> {
+    url: &'a str,
+    destination: &'a Path,
+    expected: &'a ExpectedIntegrity,
+    ownership: ExecutionDownloadOwnership,
+}
+
+impl<'a> ExecutionDownloadRequest<'a> {
+    fn launcher_managed(
+        url: &'a str,
+        destination: &'a Path,
+        expected: &'a ExpectedIntegrity,
+    ) -> Self {
+        Self {
+            url,
+            destination,
+            expected,
+            ownership: ExecutionDownloadOwnership::LauncherManaged,
+        }
     }
 }
 
@@ -178,14 +333,89 @@ impl Downloader {
     where
         F: FnMut(DownloadProgress),
     {
+        self.install_version_with_fact_sender(version_id, manifest_url, &mut send, None, None)
+            .await
+    }
+
+    pub async fn install_version_with_facts<F, G>(
+        &self,
+        version_id: &str,
+        manifest_url: Option<&str>,
+        send: F,
+        send_fact: G,
+    ) -> Result<(), DownloadError>
+    where
+        F: FnMut(DownloadProgress),
+        G: FnMut(ExecutionDownloadFact),
+    {
+        self.install_version_with_facts_and_descriptors(
+            version_id,
+            manifest_url,
+            send,
+            send_fact,
+            |_| {},
+        )
+        .await
+    }
+
+    pub async fn install_version_with_facts_and_descriptors<F, G, H>(
+        &self,
+        version_id: &str,
+        manifest_url: Option<&str>,
+        mut send: F,
+        mut send_fact: G,
+        mut send_descriptor: H,
+    ) -> Result<(), DownloadError>
+    where
+        F: FnMut(DownloadProgress),
+        G: FnMut(ExecutionDownloadFact),
+        H: FnMut(SelectedDownloadArtifactDescriptor),
+    {
+        let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
+        let (descriptor_tx, mut descriptor_rx) = mpsc::unbounded_channel();
+        let result = self
+            .install_version_with_fact_sender(
+                version_id,
+                manifest_url,
+                &mut send,
+                Some(fact_tx),
+                Some(descriptor_tx),
+            )
+            .await;
+        while let Ok(fact) = fact_rx.try_recv() {
+            send_fact(fact);
+        }
+        while let Ok(descriptor) = descriptor_rx.try_recv() {
+            send_descriptor(descriptor);
+        }
+        result
+    }
+
+    async fn install_version_with_fact_sender<F>(
+        &self,
+        version_id: &str,
+        manifest_url: Option<&str>,
+        send: &mut F,
+        fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
+        descriptor_tx: Option<mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
+    ) -> Result<(), DownloadError>
+    where
+        F: FnMut(DownloadProgress),
+    {
         let version_dir = versions_dir(&self.mc_dir).join(version_id);
         let marker_path = version_dir.join(".incomplete");
 
         let install_result = async {
             async_fs::create_dir_all(&version_dir).await?;
             async_fs::write(&marker_path, b"installing").await?;
-            self.install_version_inner(version_id, manifest_url, &mut send)
-                .await
+            self.install_version_inner(
+                version_id,
+                manifest_url,
+                send,
+                fact_tx.as_ref(),
+                descriptor_tx.as_ref(),
+            )
+            .await
         }
         .await;
 
@@ -221,6 +451,8 @@ impl Downloader {
         version_id: &str,
         manifest_url: Option<&str>,
         send: &mut F,
+        fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
+        descriptor_tx: Option<&mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
     ) -> Result<(), DownloadError>
     where
         F: FnMut(DownloadProgress),
@@ -257,9 +489,12 @@ impl Downloader {
                 || !existing_file_satisfies(&json_path, &version_json_download.expected).await?);
         if should_download_version_json {
             self.download_file(
+                SelectedDownloadArtifactKind::VersionJson,
                 &version_json_download.url,
                 &json_path,
                 &version_json_download.expected,
+                fact_tx,
+                descriptor_tx,
             )
             .await?;
         }
@@ -301,9 +536,20 @@ impl Downloader {
                 let url = client.url.clone();
                 let jar_path = version_dir.join(format!("{version_id}.jar"));
                 let expected = ExpectedIntegrity::from_mojang(client.size, &client.sha1);
+                let fact_tx = fact_tx.cloned();
+                let descriptor_tx = descriptor_tx.cloned();
                 Some(tokio::spawn(async move {
                     if !existing_file_satisfies(&jar_path, &expected).await? {
-                        download_file_with_client(&http_client, &url, &jar_path, &expected).await?;
+                        download_file_with_client_and_fact_sender(
+                            SelectedDownloadArtifactKind::ClientJar,
+                            &http_client,
+                            &url,
+                            &jar_path,
+                            &expected,
+                            fact_tx.as_ref(),
+                            descriptor_tx.as_ref(),
+                        )
+                        .await?;
                     }
                     Ok::<(), DownloadError>(())
                 }))
@@ -314,6 +560,8 @@ impl Downloader {
                 self.mc_dir.clone(),
                 self.client.clone(),
                 version.asset_index.clone(),
+                fact_tx.cloned(),
+                descriptor_tx.cloned(),
             );
 
             let library_jobs = self.library_jobs(&version);
@@ -325,13 +573,18 @@ impl Downloader {
                 let mut library_downloads =
                     futures_util::stream::iter(library_jobs.into_iter().map(|job| {
                         let client = client.clone();
+                        let fact_tx = fact_tx.cloned();
+                        let descriptor_tx = descriptor_tx.cloned();
                         async move {
                             if !existing_file_satisfies(&job.path, &job.expected).await? {
-                                download_file_with_client(
+                                download_file_with_client_and_fact_sender(
+                                    SelectedDownloadArtifactKind::Library,
                                     &client,
                                     &job.url,
                                     &job.path,
                                     &job.expected,
+                                    fact_tx.as_ref(),
+                                    descriptor_tx.as_ref(),
                                 )
                                 .await?;
                             }
@@ -405,8 +658,15 @@ impl Downloader {
                 let expected =
                     ExpectedIntegrity::from_mojang(logging.file.size, &logging.file.sha1);
                 if !existing_file_satisfies(&log_config_path, &expected).await? {
-                    self.download_file(&logging.file.url, &log_config_path, &expected)
-                        .await?;
+                    self.download_file(
+                        SelectedDownloadArtifactKind::LogConfig,
+                        &logging.file.url,
+                        &log_config_path,
+                        &expected,
+                        fact_tx,
+                        descriptor_tx,
+                    )
+                    .await?;
                 }
             }
             Ok::<(), DownloadError>(())
@@ -461,43 +721,23 @@ impl Downloader {
 
     async fn download_file(
         &self,
+        kind: SelectedDownloadArtifactKind,
         url: &str,
         destination: &Path,
         expected: &ExpectedIntegrity,
-    ) -> Result<(), DownloadError> {
-        if let Some(parent) = destination.parent() {
-            async_fs::create_dir_all(parent).await?;
-        }
-
-        let tmp_path = destination.with_extension("tmp");
-        let mut last_error: Option<DownloadError> = None;
-
-        for attempt in 0..3 {
-            let result = async {
-                remove_stale_download_temp(&tmp_path).await?;
-                let response = self.client.get(url).send().await?.error_for_status()?;
-                let actual =
-                    write_download_response(response, &tmp_path, destination, expected).await?;
-                verify_downloaded_integrity(destination, expected, &actual)?;
-                promote_download_temp(&tmp_path, destination).await?;
-                Ok::<(), DownloadError>(())
-            }
-            .await;
-
-            match result {
-                Ok(()) => return Ok(()),
-                Err(error) => {
-                    last_error = Some(error);
-                    let _ = remove_stale_download_temp(&tmp_path).await;
-                    if attempt < 2 {
-                        tokio::time::sleep(Duration::from_millis(250 * (attempt + 1) as u64)).await;
-                    }
-                }
-            }
-        }
-
-        Err(last_error
-            .unwrap_or_else(|| DownloadError::ResolveManifest("download failed".to_string())))
+        fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
+        descriptor_tx: Option<&mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
+    ) -> Result<ExecutionDownloadReport, DownloadError> {
+        download_file_with_client_and_fact_sender(
+            kind,
+            &self.client,
+            url,
+            destination,
+            expected,
+            fact_tx,
+            descriptor_tx,
+        )
+        .await
     }
 }
 
@@ -505,6 +745,8 @@ fn spawn_asset_download_pipeline(
     mc_dir: PathBuf,
     client: reqwest::Client,
     asset_index: VersionAssetIndex,
+    fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
+    descriptor_tx: Option<mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
 ) -> Option<AssetDownloadPipeline> {
     if asset_index.url.is_empty() {
         return None;
@@ -523,12 +765,27 @@ fn spawn_asset_download_pipeline(
         ));
         let expected = ExpectedIntegrity::from_mojang(asset_index.size, &asset_index.sha1);
         if !existing_file_satisfies(&asset_index_path, &expected).await? {
-            download_file_with_client(&client, &asset_index.url, &asset_index_path, &expected)
-                .await?;
+            download_file_with_client_and_fact_sender(
+                SelectedDownloadArtifactKind::AssetIndex,
+                &client,
+                &asset_index.url,
+                &asset_index_path,
+                &expected,
+                fact_tx.as_ref(),
+                descriptor_tx.as_ref(),
+            )
+            .await?;
         }
-        download_asset_objects_with_client(&mc_dir, client, &asset_index_path, |progress| {
-            let _ = progress_tx.send(progress);
-        })
+        download_asset_objects_with_client(
+            &mc_dir,
+            client,
+            &asset_index_path,
+            fact_tx,
+            descriptor_tx,
+            |progress| {
+                let _ = progress_tx.send(progress);
+            },
+        )
         .await
     });
 
@@ -580,6 +837,8 @@ async fn download_asset_objects_with_client<F>(
     mc_dir: &Path,
     client: reqwest::Client,
     asset_index_path: &Path,
+    fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
+    descriptor_tx: Option<mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
     mut send: F,
 ) -> Result<(), DownloadError>
 where
@@ -618,6 +877,8 @@ where
     let mut completed_jobs = 0;
     let mut asset_downloads = futures_util::stream::iter(jobs.into_iter().map(|job| {
         let client = client.clone();
+        let fact_tx = fact_tx.clone();
+        let descriptor_tx = descriptor_tx.clone();
         async move {
             let hash = job.hash;
             let path = job.path;
@@ -627,7 +888,16 @@ where
                 &hash[..2],
                 hash
             );
-            download_file_with_client(&client, &url, &path, &expected).await
+            download_file_with_client_and_fact_sender(
+                SelectedDownloadArtifactKind::AssetObject,
+                &client,
+                &url,
+                &path,
+                &expected,
+                fact_tx.as_ref(),
+                descriptor_tx.as_ref(),
+            )
+            .await
         }
     }))
     .buffer_unordered(asset_download_concurrency());
@@ -1223,82 +1493,680 @@ async fn download_file_with_client(
     url: &str,
     destination: &Path,
     expected: &ExpectedIntegrity,
-) -> Result<(), DownloadError> {
-    // Files are downloaded through a temp path, verified, then promoted into place.
-    if let Some(parent) = destination.parent() {
-        async_fs::create_dir_all(parent).await?;
-    }
+) -> Result<ExecutionDownloadReport, DownloadError> {
+    download_file_with_client_report(client, url, destination, expected)
+        .await
+        .map_err(ExecutionDownloadError::into_download_error)
+}
 
-    let tmp_path = destination.with_extension("tmp");
+async fn download_file_with_client_and_fact_sender(
+    kind: SelectedDownloadArtifactKind,
+    client: &reqwest::Client,
+    url: &str,
+    destination: &Path,
+    expected: &ExpectedIntegrity,
+    fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
+    descriptor_tx: Option<&mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
+) -> Result<ExecutionDownloadReport, DownloadError> {
+    emit_selected_download_descriptor(descriptor_tx, kind, destination, url, expected);
+    match download_file_with_client_report(client, url, destination, expected).await {
+        Ok(report) => {
+            emit_execution_download_facts(fact_tx, &report.facts);
+            Ok(report)
+        }
+        Err(error) => {
+            emit_execution_download_facts(fact_tx, &error.facts);
+            Err(error.into_download_error())
+        }
+    }
+}
+
+fn emit_selected_download_descriptor(
+    descriptor_tx: Option<&mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
+    kind: SelectedDownloadArtifactKind,
+    destination: &Path,
+    provider_url: &str,
+    expected: &ExpectedIntegrity,
+) {
+    let Some(descriptor_tx) = descriptor_tx else {
+        return;
+    };
+    let Some(sha1) = expected.sha1.as_deref() else {
+        return;
+    };
+    if !is_sha1_hex(sha1) {
+        return;
+    }
+    let descriptor = SelectedDownloadArtifactDescriptor::new(
+        kind,
+        safe_download_target_label(destination),
+        destination.to_path_buf(),
+        provider_url.to_string(),
+        sha1.to_ascii_lowercase(),
+        expected.size,
+        expected
+            .size
+            .unwrap_or(DEFAULT_SELECTED_ARTIFACT_MAX_BYTES)
+            .max(1),
+    );
+    let _ = descriptor_tx.send(descriptor);
+}
+
+fn emit_execution_download_facts(
+    fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
+    facts: &[ExecutionDownloadFact],
+) {
+    if let Some(fact_tx) = fact_tx {
+        for fact in facts {
+            let _ = fact_tx.send(fact.clone());
+        }
+    }
+}
+
+pub async fn download_file_with_client_report(
+    client: &reqwest::Client,
+    url: &str,
+    destination: &Path,
+    expected: &ExpectedIntegrity,
+) -> Result<ExecutionDownloadReport, ExecutionDownloadError> {
     let mut last_error: Option<DownloadError> = None;
     for attempt in 0..3 {
-        let result = async {
-            remove_stale_download_temp(&tmp_path).await?;
-            let response = client.get(url).send().await?.error_for_status()?;
-            let actual =
-                write_download_response(response, &tmp_path, destination, expected).await?;
-            verify_downloaded_integrity(destination, expected, &actual)?;
-            promote_download_temp(&tmp_path, destination).await?;
-            Ok::<(), DownloadError>(())
-        }
-        .await;
-
-        match result {
-            Ok(()) => return Ok(()),
+        match execute_download_to_temp(
+            client,
+            ExecutionDownloadRequest::launcher_managed(url, destination, expected),
+        )
+        .await
+        {
+            Ok(report) => return Ok(report),
             Err(error) => {
-                last_error = Some(error);
-                let _ = remove_stale_download_temp(&tmp_path).await;
-                if attempt < 2 {
-                    tokio::time::sleep(Duration::from_millis(250 * (attempt + 1) as u64)).await;
+                if attempt == 2 {
+                    return Err(error);
                 }
+                last_error = Some(error.into_download_error());
+                tokio::time::sleep(Duration::from_millis(250 * (attempt + 1) as u64)).await;
             }
         }
     }
-    Err(last_error.unwrap_or_else(|| DownloadError::ResolveManifest("download failed".to_string())))
+    Err(execution_download_error(
+        ExecutionDownloadFactKind::NetworkFailure,
+        Vec::new(),
+        last_error.unwrap_or_else(|| DownloadError::ResolveManifest("download failed".to_string())),
+    ))
 }
 
-async fn write_download_response(
-    response: reqwest::Response,
-    tmp_path: &Path,
+pub(crate) async fn write_launcher_managed_artifact_bytes_to_temp(
     destination: &Path,
-    expected: &ExpectedIntegrity,
-) -> Result<ActualIntegrity, DownloadError> {
-    if let Some(expected_size) = expected.size
-        && let Some(content_length) = response.content_length()
-        && content_length > expected_size
+    temp_path: &Path,
+    bytes: &[u8],
+) -> Result<ExecutionDownloadReport, ExecutionDownloadError> {
+    let target = safe_download_target_label(destination);
+    let expected = ExpectedIntegrity::default();
+    let mut facts = metadata_facts(&expected, &target);
+
+    if let Some(parent) = destination.parent()
+        && let Err(error) = async_fs::create_dir_all(parent).await
     {
-        return Err(download_size_mismatch(
-            destination,
-            expected_size,
-            content_length,
+        let kind = io_execution_fact_kind(error.kind());
+        facts.push(execution_download_fact(
+            kind,
+            &target,
+            no_download_fact_fields(),
+        ));
+        facts.push(execution_download_fact(
+            ExecutionDownloadFactKind::TempWriteFailed,
+            &target,
+            no_download_fact_fields(),
+        ));
+        return Err(execution_download_error(
+            kind,
+            facts,
+            DownloadError::FileOperation(error),
         ));
     }
 
-    let mut output = tokio::fs::File::create(tmp_path).await?;
+    discard_download_temp(temp_path, &target, &mut facts).await;
+    let mut output = match async_fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(temp_path)
+        .await
+    {
+        Ok(output) => output,
+        Err(error) => {
+            let kind = io_execution_fact_kind(error.kind());
+            facts.push(execution_download_fact(
+                kind,
+                &target,
+                no_download_fact_fields(),
+            ));
+            facts.push(execution_download_fact(
+                ExecutionDownloadFactKind::TempWriteFailed,
+                &target,
+                no_download_fact_fields(),
+            ));
+            return Err(execution_download_error(
+                ExecutionDownloadFactKind::TempWriteFailed,
+                facts,
+                DownloadError::FileOperation(error),
+            ));
+        }
+    };
+
+    if let Err(error) = output.write_all(bytes).await {
+        let kind = io_execution_fact_kind(error.kind());
+        facts.push(execution_download_fact(
+            kind,
+            &target,
+            no_download_fact_fields(),
+        ));
+        facts.push(execution_download_fact(
+            ExecutionDownloadFactKind::TempWriteFailed,
+            &target,
+            no_download_fact_fields(),
+        ));
+        drop(output);
+        discard_download_temp(temp_path, &target, &mut facts).await;
+        return Err(execution_download_error(
+            ExecutionDownloadFactKind::TempWriteFailed,
+            facts,
+            DownloadError::FileOperation(error),
+        ));
+    }
+    if let Err(error) = output.flush().await {
+        let kind = io_execution_fact_kind(error.kind());
+        facts.push(execution_download_fact(
+            kind,
+            &target,
+            no_download_fact_fields(),
+        ));
+        facts.push(execution_download_fact(
+            ExecutionDownloadFactKind::TempWriteFailed,
+            &target,
+            no_download_fact_fields(),
+        ));
+        drop(output);
+        discard_download_temp(temp_path, &target, &mut facts).await;
+        return Err(execution_download_error(
+            ExecutionDownloadFactKind::TempWriteFailed,
+            facts,
+            DownloadError::FileOperation(error),
+        ));
+    }
+    drop(output);
+
+    let written = bytes.len() as u64;
+    facts.push(execution_download_fact(
+        ExecutionDownloadFactKind::WrittenToTemp,
+        &target,
+        vec![("bytes", written.to_string())],
+    ));
+
+    if let Err(error) = promote_launcher_managed_artifact_temp_once(temp_path, destination).await {
+        let kind = io_execution_fact_kind(error.kind());
+        facts.push(execution_download_fact(
+            kind,
+            &target,
+            no_download_fact_fields(),
+        ));
+        facts.push(execution_download_fact(
+            ExecutionDownloadFactKind::PromoteFailed,
+            &target,
+            no_download_fact_fields(),
+        ));
+        discard_download_temp(temp_path, &target, &mut facts).await;
+        return Err(execution_download_error(
+            ExecutionDownloadFactKind::PromoteFailed,
+            facts,
+            DownloadError::FileOperation(error),
+        ));
+    }
+    facts.push(execution_download_fact(
+        ExecutionDownloadFactKind::Promoted,
+        &target,
+        no_download_fact_fields(),
+    ));
+
+    Ok(ExecutionDownloadReport {
+        target,
+        bytes_written: written,
+        facts,
+    })
+}
+
+async fn execute_download_to_temp(
+    client: &reqwest::Client,
+    request: ExecutionDownloadRequest<'_>,
+) -> Result<ExecutionDownloadReport, ExecutionDownloadError> {
+    let target = safe_download_target_label(request.destination);
+    let mut facts = metadata_facts(request.expected, &target);
+    if !request.ownership.allows_managed_mutation() {
+        facts.push(execution_download_fact(
+            ExecutionDownloadFactKind::OwnershipRefused,
+            &target,
+            no_download_fact_fields(),
+        ));
+        return Err(execution_download_error(
+            ExecutionDownloadFactKind::OwnershipRefused,
+            facts,
+            DownloadError::FileOperation(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "download target ownership is not launcher managed",
+            )),
+        ));
+    }
+    if let Some(expected_sha1) = request.expected.sha1.as_deref()
+        && !is_sha1_hex(expected_sha1)
+    {
+        facts.push(execution_download_fact(
+            ExecutionDownloadFactKind::MetadataInvalid,
+            &target,
+            vec![("field", "sha1")],
+        ));
+        return Err(execution_download_error(
+            ExecutionDownloadFactKind::MetadataInvalid,
+            facts,
+            DownloadError::Integrity(format!(
+                "{} integrity metadata is invalid",
+                bounded_download_file_label(request.destination)
+            )),
+        ));
+    }
+
+    if let Some(parent) = request.destination.parent()
+        && let Err(error) = async_fs::create_dir_all(parent).await
+    {
+        let kind = io_execution_fact_kind(error.kind());
+        facts.push(execution_download_fact(
+            kind,
+            &target,
+            no_download_fact_fields(),
+        ));
+        facts.push(execution_download_fact(
+            ExecutionDownloadFactKind::TempWriteFailed,
+            &target,
+            no_download_fact_fields(),
+        ));
+        return Err(execution_download_error(
+            kind,
+            facts,
+            DownloadError::FileOperation(error),
+        ));
+    }
+
+    let tmp_path = request.destination.with_extension("tmp");
+    discard_download_temp(&tmp_path, &target, &mut facts).await;
+    let response = match client.get(request.url).send().await {
+        Ok(response) => response,
+        Err(error) => {
+            facts.push(execution_download_fact(
+                ExecutionDownloadFactKind::NetworkFailure,
+                &target,
+                no_download_fact_fields(),
+            ));
+            return Err(execution_download_error(
+                ExecutionDownloadFactKind::NetworkFailure,
+                facts,
+                DownloadError::Request(error),
+            ));
+        }
+    };
+
+    if let Err(error) = response.error_for_status_ref() {
+        let status = response.status().as_u16().to_string();
+        facts.push(execution_download_fact(
+            ExecutionDownloadFactKind::ProviderFailure,
+            &target,
+            vec![("status", status.as_str())],
+        ));
+        return Err(execution_download_error(
+            ExecutionDownloadFactKind::ProviderFailure,
+            facts,
+            DownloadError::Request(error),
+        ));
+    }
+
+    let declared_content_length = response.content_length();
+    if let Some(expected_size) = request.expected.size
+        && let Some(content_length) = declared_content_length
+        && content_length > expected_size
+    {
+        facts.push(size_mismatch_fact(&target, expected_size, content_length));
+        return Err(execution_download_error(
+            ExecutionDownloadFactKind::SizeMismatch,
+            facts,
+            download_size_mismatch(request.destination, expected_size, content_length),
+        ));
+    }
+
+    let mut output = match async_fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)
+        .await
+    {
+        Ok(output) => output,
+        Err(error) => {
+            let kind = io_execution_fact_kind(error.kind());
+            facts.push(execution_download_fact(
+                kind,
+                &target,
+                no_download_fact_fields(),
+            ));
+            facts.push(execution_download_fact(
+                ExecutionDownloadFactKind::TempWriteFailed,
+                &target,
+                no_download_fact_fields(),
+            ));
+            return Err(execution_download_error(
+                ExecutionDownloadFactKind::TempWriteFailed,
+                facts,
+                DownloadError::FileOperation(error),
+            ));
+        }
+    };
     let mut stream = response.bytes_stream();
     let mut hasher = Sha1::new();
     let mut written = 0_u64;
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                facts.push(execution_download_fact(
+                    ExecutionDownloadFactKind::Interrupted,
+                    &target,
+                    no_download_fact_fields(),
+                ));
+                facts.push(execution_download_fact(
+                    ExecutionDownloadFactKind::NetworkFailure,
+                    &target,
+                    no_download_fact_fields(),
+                ));
+                drop(output);
+                discard_download_temp(&tmp_path, &target, &mut facts).await;
+                return Err(execution_download_error(
+                    ExecutionDownloadFactKind::NetworkFailure,
+                    facts,
+                    DownloadError::Request(error),
+                ));
+            }
+        };
         let next_written = written.saturating_add(chunk.len() as u64);
-        if let Some(expected_size) = expected.size
+        if let Some(expected_size) = request.expected.size
             && next_written > expected_size
         {
-            return Err(download_size_mismatch(
-                destination,
-                expected_size,
-                next_written,
+            facts.push(size_mismatch_fact(&target, expected_size, next_written));
+            drop(output);
+            discard_download_temp(&tmp_path, &target, &mut facts).await;
+            return Err(execution_download_error(
+                ExecutionDownloadFactKind::SizeMismatch,
+                facts,
+                download_size_mismatch(request.destination, expected_size, next_written),
             ));
         }
         hasher.update(&chunk);
-        output.write_all(&chunk).await?;
+        if let Err(error) = output.write_all(&chunk).await {
+            let kind = io_execution_fact_kind(error.kind());
+            facts.push(execution_download_fact(
+                kind,
+                &target,
+                no_download_fact_fields(),
+            ));
+            facts.push(execution_download_fact(
+                ExecutionDownloadFactKind::TempWriteFailed,
+                &target,
+                no_download_fact_fields(),
+            ));
+            drop(output);
+            discard_download_temp(&tmp_path, &target, &mut facts).await;
+            return Err(execution_download_error(
+                ExecutionDownloadFactKind::TempWriteFailed,
+                facts,
+                DownloadError::FileOperation(error),
+            ));
+        }
         written = next_written;
     }
-    output.flush().await?;
-    Ok(ActualIntegrity {
+    if let Some(content_length) = declared_content_length
+        && written != content_length
+    {
+        facts.push(execution_download_fact(
+            ExecutionDownloadFactKind::Interrupted,
+            &target,
+            no_download_fact_fields(),
+        ));
+        facts.push(size_mismatch_fact(&target, content_length, written));
+        drop(output);
+        discard_download_temp(&tmp_path, &target, &mut facts).await;
+        return Err(execution_download_error(
+            ExecutionDownloadFactKind::Interrupted,
+            facts,
+            DownloadError::Integrity(format!(
+                "{} download ended before the declared content length",
+                bounded_download_file_label(request.destination)
+            )),
+        ));
+    }
+    if let Err(error) = output.flush().await {
+        let kind = io_execution_fact_kind(error.kind());
+        facts.push(execution_download_fact(
+            kind,
+            &target,
+            no_download_fact_fields(),
+        ));
+        facts.push(execution_download_fact(
+            ExecutionDownloadFactKind::TempWriteFailed,
+            &target,
+            no_download_fact_fields(),
+        ));
+        drop(output);
+        discard_download_temp(&tmp_path, &target, &mut facts).await;
+        return Err(execution_download_error(
+            ExecutionDownloadFactKind::TempWriteFailed,
+            facts,
+            DownloadError::FileOperation(error),
+        ));
+    }
+    drop(output);
+    facts.push(execution_download_fact(
+        ExecutionDownloadFactKind::WrittenToTemp,
+        &target,
+        vec![("bytes", written.to_string())],
+    ));
+
+    let actual = ActualIntegrity {
         size: written,
         sha1: Some(format!("{:x}", hasher.finalize())),
+    };
+    if let Err(error) = verify_download_integrity(request.destination, request.expected, &actual) {
+        let error_kind = match &error {
+            DownloadIntegrityError::SizeMismatch {
+                expected, actual, ..
+            } => {
+                facts.push(size_mismatch_fact(&target, *expected, *actual));
+                ExecutionDownloadFactKind::SizeMismatch
+            }
+            DownloadIntegrityError::Sha1Mismatch { .. }
+            | DownloadIntegrityError::MissingSha1 { .. } => {
+                facts.push(execution_download_fact(
+                    ExecutionDownloadFactKind::ChecksumMismatch,
+                    &target,
+                    vec![("algorithm", "sha1")],
+                ));
+                ExecutionDownloadFactKind::ChecksumMismatch
+            }
+        };
+        discard_download_temp(&tmp_path, &target, &mut facts).await;
+        return Err(execution_download_error(
+            error_kind,
+            facts,
+            DownloadError::Integrity(error.to_string()),
+        ));
+    }
+    if request.expected.has_evidence() {
+        facts.push(execution_download_fact(
+            ExecutionDownloadFactKind::ArtifactVerified,
+            &target,
+            no_download_fact_fields(),
+        ));
+    }
+
+    if let Err(error) =
+        promote_launcher_managed_artifact_temp_once(&tmp_path, request.destination).await
+    {
+        let kind = io_execution_fact_kind(error.kind());
+        facts.push(execution_download_fact(
+            kind,
+            &target,
+            no_download_fact_fields(),
+        ));
+        facts.push(execution_download_fact(
+            ExecutionDownloadFactKind::PromoteFailed,
+            &target,
+            no_download_fact_fields(),
+        ));
+        discard_download_temp(&tmp_path, &target, &mut facts).await;
+        return Err(execution_download_error(
+            ExecutionDownloadFactKind::PromoteFailed,
+            facts,
+            DownloadError::FileOperation(error),
+        ));
+    }
+    facts.push(execution_download_fact(
+        ExecutionDownloadFactKind::Promoted,
+        &target,
+        no_download_fact_fields(),
+    ));
+
+    Ok(ExecutionDownloadReport {
+        target,
+        bytes_written: written,
+        facts,
     })
+}
+
+fn execution_download_error(
+    kind: ExecutionDownloadFactKind,
+    facts: Vec<ExecutionDownloadFact>,
+    error: DownloadError,
+) -> ExecutionDownloadError {
+    ExecutionDownloadError { kind, facts, error }
+}
+
+fn no_download_fact_fields() -> Vec<(&'static str, &'static str)> {
+    Vec::new()
+}
+
+fn execution_download_fact<K, V, I>(
+    kind: ExecutionDownloadFactKind,
+    target: &str,
+    fields: I,
+) -> ExecutionDownloadFact
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<str>,
+    V: AsRef<str>,
+{
+    ExecutionDownloadFact {
+        kind,
+        target: safe_download_fact_value(target, "artifact"),
+        fields: fields
+            .into_iter()
+            .filter_map(|(key, value)| {
+                Some((
+                    safe_download_fact_value(key.as_ref(), "field"),
+                    safe_download_fact_value(value.as_ref(), "value"),
+                ))
+            })
+            .collect(),
+    }
+}
+
+fn metadata_facts(expected: &ExpectedIntegrity, target: &str) -> Vec<ExecutionDownloadFact> {
+    let mut facts = Vec::new();
+    if expected.size.is_none() {
+        facts.push(execution_download_fact(
+            ExecutionDownloadFactKind::MetadataMissing,
+            target,
+            vec![("field", "size")],
+        ));
+    }
+    if expected.sha1.is_none() {
+        facts.push(execution_download_fact(
+            ExecutionDownloadFactKind::MetadataMissing,
+            target,
+            vec![("field", "sha1")],
+        ));
+    }
+    facts
+}
+
+fn size_mismatch_fact(target: &str, expected: u64, actual: u64) -> ExecutionDownloadFact {
+    execution_download_fact(
+        ExecutionDownloadFactKind::SizeMismatch,
+        target,
+        vec![
+            ("expected_bytes", expected.to_string()),
+            ("actual_bytes", actual.to_string()),
+        ],
+    )
+}
+
+fn io_execution_fact_kind(kind: io::ErrorKind) -> ExecutionDownloadFactKind {
+    match kind {
+        io::ErrorKind::PermissionDenied => ExecutionDownloadFactKind::PermissionFailure,
+        _ => ExecutionDownloadFactKind::TempWriteFailed,
+    }
+}
+
+async fn discard_download_temp(
+    temp_path: &Path,
+    target: &str,
+    facts: &mut Vec<ExecutionDownloadFact>,
+) {
+    match async_fs::symlink_metadata(temp_path).await {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+        Err(_) => {
+            facts.push(execution_download_fact(
+                ExecutionDownloadFactKind::TempWriteFailed,
+                target,
+                Vec::<(&str, &str)>::new(),
+            ));
+            return;
+        }
+    }
+
+    match remove_stale_download_temp(temp_path).await {
+        Ok(()) => {
+            facts.push(execution_download_fact(
+                ExecutionDownloadFactKind::TempDiscarded,
+                target,
+                Vec::<(&str, &str)>::new(),
+            ));
+        }
+        Err(DownloadError::FileOperation(error)) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => {
+            facts.push(execution_download_fact(
+                ExecutionDownloadFactKind::TempWriteFailed,
+                target,
+                Vec::<(&str, &str)>::new(),
+            ));
+        }
+    }
+}
+
+pub(crate) async fn promote_launcher_managed_artifact_temp_once(
+    temp_path: &Path,
+    destination: &Path,
+) -> io::Result<()> {
+    match async_fs::rename(temp_path, destination).await {
+        Ok(()) => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(error),
+        Err(_) => {}
+    }
+
+    remove_existing_download_destination(destination).await;
+    async_fs::rename(temp_path, destination).await
 }
 
 async fn remove_stale_download_temp(temp_path: &Path) -> Result<(), DownloadError> {
@@ -1315,25 +2183,6 @@ async fn remove_stale_download_temp(temp_path: &Path) -> Result<(), DownloadErro
     };
 
     result.map_err(DownloadError::FileOperation)
-}
-
-async fn promote_download_temp(temp_path: &Path, destination: &Path) -> Result<(), DownloadError> {
-    match async_fs::rename(temp_path, destination).await {
-        Ok(()) => return Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Err(DownloadError::FileOperation(error));
-        }
-        Err(_) => {}
-    }
-
-    remove_existing_download_destination(destination).await;
-    match async_fs::rename(temp_path, destination).await {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = async_fs::remove_file(temp_path).await;
-            Err(DownloadError::FileOperation(error))
-        }
-    }
 }
 
 async fn remove_existing_download_destination(destination: &Path) {
@@ -1385,19 +2234,6 @@ async fn existing_asset_object_satisfies(
         return Ok(metadata.len() == expected_size);
     }
     Ok(true)
-}
-
-fn verify_downloaded_integrity(
-    label_path: &Path,
-    expected: &ExpectedIntegrity,
-    actual: &ActualIntegrity,
-) -> Result<(), DownloadError> {
-    if !expected.has_evidence() {
-        return Ok(());
-    }
-    verify_download_integrity(label_path, expected, actual)
-        .map_err(|error| DownloadError::Integrity(error.to_string()))?;
-    Ok(())
 }
 
 async fn hash_file(path: &Path) -> Result<ActualIntegrity, DownloadError> {
@@ -1467,14 +2303,13 @@ fn non_empty_sha1(value: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+fn is_sha1_hex(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn bounded_download_file_label(path: &Path) -> String {
     const MAX_LABEL_CHARS: usize = 120;
-    let sanitized = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .filter(|value| !value.is_empty())
-        .unwrap_or("artifact")
-        .replace(['\r', '\n'], "?");
+    let sanitized = safe_download_target_label(path);
     let mut chars = sanitized.chars();
     let label = chars.by_ref().take(MAX_LABEL_CHARS).collect::<String>();
     if chars.next().is_some() {
@@ -1482,6 +2317,55 @@ fn bounded_download_file_label(path: &Path) -> String {
     } else {
         label
     }
+}
+
+fn safe_download_target_label(path: &Path) -> String {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .and_then(|value| {
+            let value = safe_download_fact_value(value, "artifact");
+            (value != "artifact").then_some(value)
+        })
+        .unwrap_or_else(|| "artifact".to_string())
+}
+
+fn safe_download_fact_value(value: &str, fallback: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() || download_value_looks_sensitive(value) {
+        return fallback.to_string();
+    }
+
+    let mut sanitized = String::with_capacity(value.len().min(96));
+    for ch in value.chars().take(96) {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '+' | ':') {
+            sanitized.push(ch);
+        } else {
+            sanitized.push('_');
+        }
+    }
+    let sanitized = sanitized.trim_matches('_');
+    if sanitized.is_empty() {
+        fallback.to_string()
+    } else {
+        sanitized.to_string()
+    }
+}
+
+fn download_value_looks_sensitive(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    value.contains('/')
+        || value.contains('\\')
+        || value.chars().any(char::is_control)
+        || lower.contains("-xmx")
+        || lower.contains("-xms")
+        || lower.contains("-xx:")
+        || lower.contains("--access")
+        || lower.contains("--username")
+        || lower.contains("--uuid")
+        || lower.contains("token")
+        || lower.contains("secret")
+        || lower.contains("password")
+        || lower.contains("provider_payload")
 }
 
 fn bounded_provider_path_label(path: &str) -> String {
@@ -1625,6 +2509,69 @@ mod tests {
             .await
             .expect("install task should join")
             .expect("install should succeed");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn install_version_with_facts_emits_private_download_facts_only() {
+        let root = temp_dir("install-private-facts");
+        let (version_url, _requests, release_library) = spawn_overlapped_install_server().await;
+        release_library
+            .send(())
+            .expect("release library response before request");
+        let downloader = Downloader::new(&root);
+        let mut events = Vec::new();
+        let mut facts = Vec::new();
+        let mut descriptors = Vec::new();
+
+        downloader
+            .install_version_with_facts_and_descriptors(
+                "overlap",
+                Some(&version_url),
+                |progress| events.push(progress),
+                |fact| facts.push(fact),
+                |descriptor| descriptors.push(descriptor),
+            )
+            .await
+            .expect("install should succeed");
+
+        assert!(
+            events
+                .iter()
+                .any(|event| event.phase == "done" && event.done)
+        );
+        assert!(
+            facts
+                .iter()
+                .any(|fact| fact.kind == ExecutionDownloadFactKind::MetadataMissing)
+        );
+        assert!(
+            facts
+                .iter()
+                .any(|fact| fact.kind == ExecutionDownloadFactKind::ArtifactVerified)
+        );
+        assert!(
+            facts
+                .iter()
+                .any(|fact| fact.kind == ExecutionDownloadFactKind::Promoted)
+        );
+        assert!(descriptors.iter().any(|descriptor| {
+            descriptor.kind == SelectedDownloadArtifactKind::AssetIndex
+                && descriptor.sha1().len() == 40
+        }));
+        assert!(descriptors.iter().any(|descriptor| {
+            descriptor.kind == SelectedDownloadArtifactKind::Library
+                && descriptor.destination().ends_with("lib-1.0.0.jar")
+        }));
+        let debug = format!("{:?}", descriptors[0]).to_ascii_lowercase();
+        assert!(!debug.contains(root.to_string_lossy().as_ref()));
+        assert!(!debug.contains("http://"));
+        assert!(!debug.contains(descriptors[0].sha1()));
+        let progress_json = serde_json::to_string(&events).expect("progress json");
+        assert!(!progress_json.contains("facts"));
+        assert!(!progress_json.contains("descriptors"));
+        assert!(!progress_json.contains("sha1"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2009,11 +2956,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_download_response_returns_streamed_integrity() {
-        let root = temp_dir("write-response-integrity");
-        fs::create_dir_all(&root).expect("create root");
+    async fn execute_download_to_temp_reports_successful_integrity() {
+        let root = temp_dir("execution-download-success");
         let destination = root.join("artifact.jar");
-        let tmp_path = destination.with_extension("tmp");
+        let body = b"artifact".to_vec();
+        let expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(&body));
+        let url = spawn_download_response_server(
+            "200 OK",
+            vec![(
+                "Content-Type".to_string(),
+                "application/octet-stream".to_string(),
+            )],
+            body.clone(),
+            1,
+        )
+        .await;
+        let client = build_http_client(Duration::from_secs(5));
+
+        let report = execute_download_to_temp(
+            &client,
+            ExecutionDownloadRequest::launcher_managed(&url, &destination, &expected),
+        )
+        .await
+        .expect("execute download");
+
+        assert_eq!(report.bytes_written, body.len() as u64);
+        assert!(
+            report
+                .facts
+                .iter()
+                .any(|fact| fact.kind == ExecutionDownloadFactKind::WrittenToTemp)
+        );
+        assert!(
+            report
+                .facts
+                .iter()
+                .any(|fact| fact.kind == ExecutionDownloadFactKind::ArtifactVerified)
+        );
+        assert!(
+            report
+                .facts
+                .iter()
+                .any(|fact| fact.kind == ExecutionDownloadFactKind::Promoted)
+        );
+        assert_eq!(
+            fs::read(&destination).expect("read promoted artifact"),
+            body
+        );
+        assert!(!destination.with_extension("tmp").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn execute_download_to_temp_reports_missing_metadata_without_blocking_download() {
+        let root = temp_dir("execution-download-missing-metadata");
+        let destination = root.join("artifact.jar");
         let body = b"artifact".to_vec();
         let url = spawn_download_response_server(
             "200 OK",
@@ -2026,34 +3024,257 @@ mod tests {
         )
         .await;
         let client = build_http_client(Duration::from_secs(5));
-        let response = client
-            .get(url)
-            .send()
-            .await
-            .expect("download response")
-            .error_for_status()
-            .expect("successful response");
 
-        let actual = write_download_response(
-            response,
-            &tmp_path,
-            &destination,
-            &ExpectedIntegrity::default(),
+        let report = execute_download_to_temp(
+            &client,
+            ExecutionDownloadRequest::launcher_managed(
+                &url,
+                &destination,
+                &ExpectedIntegrity::default(),
+            ),
         )
         .await
-        .expect("write response");
+        .expect("metadata-free download should still promote");
 
-        assert_eq!(
-            actual,
-            ActualIntegrity {
-                size: body.len() as u64,
-                sha1: Some(sha1_hex(&body)),
-            }
+        assert!(
+            report
+                .facts
+                .iter()
+                .any(|fact| fact.kind == ExecutionDownloadFactKind::MetadataMissing)
         );
-        assert_eq!(fs::read(&tmp_path).expect("read temp artifact"), body);
+        assert!(
+            !report
+                .facts
+                .iter()
+                .any(|fact| fact.kind == ExecutionDownloadFactKind::ArtifactVerified)
+        );
+        assert_eq!(
+            fs::read(&destination).expect("read promoted artifact"),
+            body
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn execute_download_to_temp_reports_invalid_metadata_without_promoting() {
+        let root = temp_dir("execution-download-invalid-metadata");
+        let destination = root.join("artifact.jar");
+        let url = spawn_download_response_server(
+            "200 OK",
+            vec![(
+                "Content-Type".to_string(),
+                "application/octet-stream".to_string(),
+            )],
+            b"artifact".to_vec(),
+            0,
+        )
+        .await;
+        let client = build_http_client(Duration::from_secs(5));
+        let expected = ExpectedIntegrity::from_sha1("not-a-sha1");
+
+        let error = execute_download_to_temp(
+            &client,
+            ExecutionDownloadRequest::launcher_managed(&url, &destination, &expected),
+        )
+        .await
+        .expect_err("invalid metadata should fail before download");
+
+        assert_eq!(error.kind, ExecutionDownloadFactKind::MetadataInvalid);
+        assert!(
+            error
+                .facts
+                .iter()
+                .any(|fact| fact.kind == ExecutionDownloadFactKind::MetadataInvalid)
+        );
+        assert!(!destination.exists());
+        assert!(!destination.with_extension("tmp").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn download_file_with_client_report_preserves_redacted_failure_facts() {
+        let root = temp_dir("download-report-invalid-metadata");
+        let destination = root.join("nested").join("artifact.jar");
+        let expected = ExpectedIntegrity::from_sha1("not-a-sha1");
+
+        let error = download_file_with_client_report(
+            &reqwest::Client::new(),
+            "https://example.invalid/artifact.jar?token=secret",
+            &destination,
+            &expected,
+        )
+        .await
+        .expect_err("invalid metadata should fail with report");
+
+        assert_eq!(error.kind, ExecutionDownloadFactKind::MetadataInvalid);
+        assert!(
+            error
+                .facts
+                .iter()
+                .any(|fact| fact.kind == ExecutionDownloadFactKind::MetadataInvalid)
+        );
+        let facts_json = serde_json::to_string(&error.facts).expect("facts json");
+        assert!(!facts_json.contains(root.to_string_lossy().as_ref()));
+        assert!(!facts_json.contains("example.invalid"));
+        assert!(!facts_json.contains("token"));
+        assert!(!facts_json.contains("secret"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn execute_download_to_temp_reports_provider_failure_fact() {
+        let root = temp_dir("execution-download-provider-failure");
+        let destination = root.join("artifact.jar");
+        let url = spawn_download_response_server(
+            "503 Service Unavailable",
+            vec![(
+                "Content-Type".to_string(),
+                "application/octet-stream".to_string(),
+            )],
+            b"unavailable".to_vec(),
+            1,
+        )
+        .await;
+        let client = build_http_client(Duration::from_secs(5));
+
+        let error = execute_download_to_temp(
+            &client,
+            ExecutionDownloadRequest::launcher_managed(
+                &url,
+                &destination,
+                &ExpectedIntegrity::default(),
+            ),
+        )
+        .await
+        .expect_err("provider failure should not promote");
+
+        assert_eq!(error.kind, ExecutionDownloadFactKind::ProviderFailure);
+        assert!(error.facts.iter().any(|fact| {
+            fact.kind == ExecutionDownloadFactKind::ProviderFailure
+                && fact
+                    .fields
+                    .iter()
+                    .any(|(key, value)| key == "status" && value == "503")
+        }));
         assert!(!destination.exists());
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn execute_download_to_temp_reports_interrupted_short_response_without_promoting() {
+        let root = temp_dir("execution-download-interrupted");
+        let destination = root.join("artifact.jar");
+        let url = spawn_download_response_server(
+            "200 OK",
+            vec![
+                (
+                    "Content-Type".to_string(),
+                    "application/octet-stream".to_string(),
+                ),
+                ("Content-Length".to_string(), "12".to_string()),
+            ],
+            b"partial".to_vec(),
+            1,
+        )
+        .await;
+        let client = build_http_client(Duration::from_secs(5));
+
+        let error = execute_download_to_temp(
+            &client,
+            ExecutionDownloadRequest::launcher_managed(
+                &url,
+                &destination,
+                &ExpectedIntegrity::default(),
+            ),
+        )
+        .await
+        .expect_err("short response should not promote");
+
+        assert!(
+            error
+                .facts
+                .iter()
+                .any(|fact| fact.kind == ExecutionDownloadFactKind::Interrupted)
+        );
+        assert!(
+            error
+                .facts
+                .iter()
+                .any(|fact| fact.kind == ExecutionDownloadFactKind::TempDiscarded)
+        );
+        assert!(!destination.exists());
+        assert!(!destination.with_extension("tmp").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn execute_download_to_temp_refuses_non_launcher_owned_targets() {
+        let root = temp_dir("execution-download-ownership");
+        let destination = root.join("artifact.jar");
+        let client = build_http_client(Duration::from_secs(5));
+        let expected = ExpectedIntegrity::default();
+
+        for ownership in [
+            ExecutionDownloadOwnership::UserOwned,
+            ExecutionDownloadOwnership::Unknown,
+        ] {
+            let error = execute_download_to_temp(
+                &client,
+                ExecutionDownloadRequest {
+                    url: "http://127.0.0.1:9/artifact.jar",
+                    destination: &destination,
+                    expected: &expected,
+                    ownership,
+                },
+            )
+            .await
+            .expect_err("non-launcher ownership should be refused before network");
+
+            assert_eq!(error.kind, ExecutionDownloadFactKind::OwnershipRefused);
+            assert!(
+                error
+                    .facts
+                    .iter()
+                    .any(|fact| fact.kind == ExecutionDownloadFactKind::OwnershipRefused)
+            );
+            assert!(!destination.exists());
+            assert!(!destination.with_extension("tmp").exists());
+        }
+    }
+
+    #[test]
+    fn execution_download_fact_labels_are_redacted() {
+        let label = safe_download_target_label(Path::new(
+            r"C:\Users\Alice\.minecraft\mods\secret-token -Xmx8192M.jar",
+        ));
+        let fact = execution_download_fact(
+            ExecutionDownloadFactKind::ProviderFailure,
+            &label,
+            vec![("provider_payload", "{\"token\":\"secret\"}")],
+        );
+        let encoded = format!("{fact:?}");
+
+        assert_eq!(fact.target, "artifact");
+        for fragment in [
+            "Users",
+            "Alice",
+            ".minecraft",
+            "secret-token",
+            "-Xmx",
+            "provider_payload",
+            "token",
+            "secret",
+        ] {
+            assert!(
+                !encoded.contains(fragment),
+                "sensitive fragment survived: {fragment}"
+            );
+        }
     }
 
     #[test]
@@ -2244,23 +3465,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn promote_download_temp_replaces_existing_destination() {
+    async fn execute_download_to_temp_replaces_existing_destination() {
         let root = temp_dir("promote-replace");
         fs::create_dir_all(&root).expect("create root");
         let destination = root.join("artifact.jar");
-        let temp_path = root.join("artifact.tmp");
         fs::write(&destination, b"stale").expect("write stale artifact");
-        fs::write(&temp_path, b"fresh").expect("write temp artifact");
+        let body = b"fresh".to_vec();
+        let expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(&body));
+        let url = spawn_download_response_server(
+            "200 OK",
+            vec![(
+                "Content-Type".to_string(),
+                "application/octet-stream".to_string(),
+            )],
+            body.clone(),
+            1,
+        )
+        .await;
+        let client = build_http_client(Duration::from_secs(5));
 
-        promote_download_temp(&temp_path, &destination)
-            .await
-            .expect("promote temp");
+        execute_download_to_temp(
+            &client,
+            ExecutionDownloadRequest::launcher_managed(&url, &destination, &expected),
+        )
+        .await
+        .expect("execute download");
 
         assert_eq!(
             fs::read(&destination).expect("read promoted artifact"),
             b"fresh"
         );
-        assert!(!temp_path.exists());
+        assert!(!destination.with_extension("tmp").exists());
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2306,32 +3541,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn promote_download_temp_removes_temp_when_retry_fails() {
+    async fn execute_download_to_temp_removes_temp_when_promotion_fails() {
         let root = temp_dir("promote-cleanup");
         fs::create_dir_all(&root).expect("create root");
         let destination = root.join("artifact.jar");
-        let temp_path = root.join("artifact.tmp");
         fs::create_dir_all(&destination).expect("create destination directory");
-        fs::write(&temp_path, b"fresh").expect("write temp artifact");
+        let body = b"fresh".to_vec();
+        let expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(&body));
+        let url = spawn_download_response_server(
+            "200 OK",
+            vec![(
+                "Content-Type".to_string(),
+                "application/octet-stream".to_string(),
+            )],
+            body,
+            1,
+        )
+        .await;
+        let client = build_http_client(Duration::from_secs(5));
 
-        let result = promote_download_temp(&temp_path, &destination).await;
+        let result = execute_download_to_temp(
+            &client,
+            ExecutionDownloadRequest::launcher_managed(&url, &destination, &expected),
+        )
+        .await;
 
-        assert!(result.is_err());
-        assert!(!temp_path.exists());
+        let error = result.expect_err("directory destination should fail promotion");
+        assert!(
+            error
+                .facts
+                .iter()
+                .any(|fact| fact.kind == ExecutionDownloadFactKind::PromoteFailed)
+        );
+        assert!(!destination.with_extension("tmp").exists());
         assert!(destination.is_dir());
 
         let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]
-    async fn promote_download_temp_preserves_destination_when_temp_is_missing() {
+    async fn promote_launcher_managed_artifact_temp_once_preserves_destination_when_temp_is_missing()
+     {
         let root = temp_dir("promote-missing-temp");
         fs::create_dir_all(&root).expect("create root");
         let destination = root.join("artifact.jar");
         let temp_path = root.join("missing.tmp");
         fs::write(&destination, b"existing").expect("write existing artifact");
 
-        let result = promote_download_temp(&temp_path, &destination).await;
+        let result = promote_launcher_managed_artifact_temp_once(&temp_path, &destination).await;
 
         assert!(result.is_err());
         assert_eq!(

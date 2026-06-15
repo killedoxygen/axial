@@ -63,6 +63,8 @@ Use them for:
 - boundaries with neighboring layers
 - the contract the rest of the system should rely on
 
+`docs/GUARDIAN-ARCHITECTURE.md` is also the safety model entrypoint: Guardian is the horizontal safety and self-healing orchestrator across launch, runtime/JVM, install/download, performance, operation journals, redaction, and frontend notice boundaries.
+
 Do not use them for:
 - broad repo onboarding
 - unrelated design decisions

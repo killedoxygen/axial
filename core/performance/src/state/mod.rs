@@ -54,6 +54,9 @@ pub struct RollbackSnapshotSummary {
     pub composition_id: String,
     pub tier: CompositionTier,
     pub installed_count: usize,
+    pub artifact_count: usize,
+    pub ownership_class: OwnershipClass,
+    pub rollback_available: bool,
     pub latest: bool,
 }
 
@@ -62,6 +65,16 @@ pub struct RollbackSnapshotSummary {
 pub struct RollbackArtifact {
     pub filename: String,
     pub stored_filename: String,
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub version_id: String,
+    #[serde(default = "default_rollback_artifact_ownership")]
+    pub ownership_class: OwnershipClass,
+    #[serde(default)]
+    pub sha512_present: bool,
+    #[serde(default)]
+    pub sha512_verified: bool,
 }
 
 pub fn load_state(instance_mods_dir: &Path) -> Result<Option<CompositionState>, StateError> {
@@ -154,6 +167,11 @@ pub fn save_rollback_snapshot(
         artifacts.push(RollbackArtifact {
             filename: installed.filename.clone(),
             stored_filename,
+            project_id: installed.project_id.clone(),
+            version_id: installed.version_id.clone(),
+            ownership_class: installed.ownership_class,
+            sha512_present: !installed.integrity.sha512.trim().is_empty(),
+            sha512_verified: installed.integrity.sha512_verified,
         });
     }
 
@@ -199,6 +217,11 @@ pub async fn save_rollback_snapshot_async(
         artifacts.push(RollbackArtifact {
             filename: installed.filename.clone(),
             stored_filename,
+            project_id: installed.project_id.clone(),
+            version_id: installed.version_id.clone(),
+            ownership_class: installed.ownership_class,
+            sha512_present: !installed.integrity.sha512.trim().is_empty(),
+            sha512_verified: installed.integrity.sha512_verified,
         });
     }
 
@@ -279,6 +302,9 @@ pub fn list_rollback_snapshots(
             composition_id: record.snapshot.state.composition_id,
             tier: record.snapshot.state.tier,
             installed_count: record.snapshot.state.installed_mods.len(),
+            artifact_count: record.snapshot.artifacts.len(),
+            ownership_class: OwnershipClass::CompositionManaged,
+            rollback_available: true,
             latest: record.latest,
         })
         .collect())
@@ -418,24 +444,54 @@ fn validate_rollback_snapshot(snapshot: &RollbackSnapshot) -> Result<(), StateEr
     validate_rollback_snapshot_id(&snapshot.id)?;
     validate_state(&snapshot.state)?;
 
-    let state_filenames: HashSet<&str> = snapshot
-        .state
-        .installed_mods
-        .iter()
-        .map(|installed| installed.filename.as_str())
-        .collect();
     for artifact in &snapshot.artifacts {
         validate_managed_filename(&artifact.filename)?;
         validate_managed_filename(&artifact.stored_filename)?;
-        if !state_filenames.contains(artifact.filename.as_str()) {
+        let Some(installed) = snapshot
+            .state
+            .installed_mods
+            .iter()
+            .find(|installed| installed.filename == artifact.filename)
+        else {
             return Err(StateError::InvalidRollback(format!(
                 "artifact {} is not in the rollback state",
+                artifact.filename
+            )));
+        };
+        if artifact.ownership_class != OwnershipClass::CompositionManaged
+            || artifact.ownership_class != installed.ownership_class
+        {
+            return Err(StateError::InvalidRollback(format!(
+                "artifact {} has invalid rollback ownership",
+                artifact.filename
+            )));
+        }
+        let legacy_missing_metadata =
+            artifact.project_id.is_empty() && artifact.version_id.is_empty();
+        if !legacy_missing_metadata
+            && (artifact.project_id != installed.project_id
+                || artifact.version_id != installed.version_id
+                || artifact.sha512_present != !installed.integrity.sha512.trim().is_empty()
+                || artifact.sha512_verified != installed.integrity.sha512_verified)
+        {
+            return Err(StateError::InvalidRollback(format!(
+                "artifact {} metadata does not match rollback state",
+                artifact.filename
+            )));
+        }
+        if artifact.sha512_verified && !artifact.sha512_present {
+            return Err(StateError::InvalidRollback(format!(
+                "artifact {} has invalid rollback integrity evidence",
                 artifact.filename
             )));
         }
     }
 
     Ok(())
+}
+
+fn default_rollback_artifact_ownership() -> OwnershipClass {
+    OwnershipClass::CompositionManaged
 }
 
 fn validate_rollback_snapshot_id(snapshot_id: &str) -> Result<(), StateError> {
@@ -757,6 +813,79 @@ mod tests {
         assert!(!listed_ids.contains(&saved_ids[1]));
         assert!(listed_ids.contains(saved_ids.last().expect("latest id")));
         assert_eq!(summaries.iter().filter(|summary| summary.latest).count(), 1);
+        assert!(summaries.iter().all(|summary| {
+            summary.ownership_class == OwnershipClass::CompositionManaged
+                && summary.rollback_available
+                && summary.artifact_count == summary.installed_count
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn empty_rollback_snapshot_is_still_available_evidence() {
+        let root = test_root("empty-rollback-evidence");
+        let snapshot = save_rollback_snapshot(&root, &test_state("vanilla-enhanced", Vec::new()))
+            .expect("save empty rollback snapshot");
+
+        let summaries = list_rollback_snapshots(&root).expect("list rollback snapshots");
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, snapshot.id);
+        assert_eq!(summaries[0].installed_count, 0);
+        assert_eq!(summaries[0].artifact_count, 0);
+        assert!(summaries[0].rollback_available);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_schema_one_rollback_snapshot_loads_without_new_artifact_evidence() {
+        let root = test_root("legacy-rollback-artifact-evidence");
+        fs::create_dir_all(rollback_files_dir_path(&root)).expect("create rollback files dir");
+        fs::write(
+            rollback_files_dir_path(&root).join("legacy.bin"),
+            b"managed-a",
+        )
+        .expect("write legacy rollback artifact");
+        fs::write(
+            rollback_file_path(&root),
+            serde_json::to_vec(&serde_json::json!({
+                "id": "rb-legacy",
+                "schema_version": ROLLBACK_SCHEMA_VERSION,
+                "created_at": "2026-05-30T00:00:00Z",
+                "state": test_state("core-a", vec![test_mod("sodium", "managed-a.jar")]),
+                "artifacts": [{
+                    "filename": "managed-a.jar",
+                    "stored_filename": "legacy.bin"
+                }]
+            }))
+            .expect("serialize legacy rollback snapshot"),
+        )
+        .expect("write legacy rollback snapshot");
+
+        let snapshot = load_rollback_snapshot(&root)
+            .expect("legacy snapshot should parse")
+            .expect("legacy snapshot should exist");
+        let artifact = snapshot.artifacts.first().expect("legacy artifact");
+        assert_eq!(artifact.project_id, "");
+        assert_eq!(artifact.version_id, "");
+        assert_eq!(artifact.ownership_class, OwnershipClass::CompositionManaged);
+        assert!(!artifact.sha512_present);
+        assert!(!artifact.sha512_verified);
+
+        let summaries = list_rollback_snapshots(&root).expect("legacy snapshot should list");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].artifact_count, 1);
+        assert!(summaries[0].rollback_available);
+
+        let restored =
+            restore_rollback_snapshot(&root, &snapshot).expect("legacy snapshot should restore");
+        assert_eq!(restored.composition_id, "core-a");
+        assert_eq!(
+            fs::read(root.join("managed-a.jar")).expect("read restored artifact"),
+            b"managed-a"
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -777,6 +906,11 @@ mod tests {
         assert_eq!(snapshot.artifacts.len(), 1);
         let artifact = &snapshot.artifacts[0];
         assert_eq!(artifact.filename, "managed-a.jar");
+        assert_eq!(artifact.project_id, "sodium");
+        assert_eq!(artifact.version_id, "version");
+        assert_eq!(artifact.ownership_class, OwnershipClass::CompositionManaged);
+        assert!(!artifact.sha512_present);
+        assert!(!artifact.sha512_verified);
         assert_eq!(
             fs::read(rollback_files_dir_path(&root).join(&artifact.stored_filename))
                 .expect("read stored artifact"),

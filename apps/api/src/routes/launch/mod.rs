@@ -4,6 +4,7 @@ mod runner;
 mod stream;
 mod task;
 
+use crate::guardian::{GuardianDecisionKind, launch_summary_decision_kind};
 use crate::state::{AppState, LaunchStatusEvent};
 use axum::{
     Json, Router,
@@ -11,7 +12,7 @@ use axum::{
     http::StatusCode,
     routing::{get, post},
 };
-use croopor_launcher::{GuardianDecision, LaunchSessionRecord, LaunchState, snapshot_status};
+use croopor_launcher::{LaunchSessionRecord, LaunchState, launch_notice, snapshot_status};
 use serde::Deserialize;
 use serde_json::json;
 use std::time::Duration;
@@ -877,6 +878,8 @@ async fn handle_launch_status(
         "failure_detail": status.failure_detail,
         "healing": status.healing,
         "guardian": status.guardian,
+        "outcome": status.outcome,
+        "notice": status.notice,
         "stages": status.stages,
         "session_id": record.session_id.0,
     });
@@ -922,6 +925,9 @@ async fn handle_launch_kill(
                 failure_detail: Some("stopped by user".to_string()),
                 healing: record.healing.clone(),
                 guardian: record.guardian.clone(),
+                outcome: None,
+                notice: None,
+                evidence: Vec::new(),
                 stages: Vec::new(),
             },
         )
@@ -969,22 +975,28 @@ fn launch_request_error_response(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let status = launch_request_error_status(&error);
     let public_message = runner::sanitize_live_launch_failure_message(&error.message);
+    let notice = launch_notice(
+        error.guardian.as_ref(),
+        error.healing.as_ref(),
+        None,
+        Some(public_message.as_str()),
+        Some("Launch stopped before startup."),
+    );
     (
         status,
         Json(json!({
             "error": public_message,
             "healing": error.healing,
             "guardian": error.guardian,
+            "notice": notice,
         })),
     )
 }
 
 fn launch_request_error_status(error: &runner::LaunchRequestError) -> StatusCode {
-    if error
-        .guardian
-        .as_ref()
-        .is_some_and(|guardian| guardian.decision == GuardianDecision::Blocked)
-    {
+    if error.guardian.as_ref().is_some_and(|guardian| {
+        launch_summary_decision_kind(guardian) == GuardianDecisionKind::Block
+    }) {
         StatusCode::UNPROCESSABLE_ENTITY
     } else {
         StatusCode::INTERNAL_SERVER_ERROR
@@ -1021,6 +1033,13 @@ fn launch_success_response_payload(launched: &runner::LaunchSuccess) -> serde_js
         "min_memory_mb": launched.min_memory_mb,
         "healing": &launched.healing,
         "guardian": &launched.guardian,
+        "notice": launch_notice(
+            launched.guardian.as_ref(),
+            launched.healing.as_ref(),
+            None,
+            None,
+            None,
+        ),
     })
 }
 
@@ -1036,6 +1055,7 @@ fn launch_prepared_response_payload(task: &task::LaunchSessionTask) -> serde_jso
         "min_memory_mb": task.intent.min_memory_mb,
         "healing": null,
         "guardian": &task.guardian,
+        "notice": launch_notice(Some(&task.guardian), None, None, None, None),
     })
 }
 
@@ -2300,8 +2320,8 @@ mod tests {
     };
     use croopor_config::{AppConfig, AppPaths, ConfigStore, Instance, InstanceStore};
     use croopor_launcher::{
-        GuardianMode, GuardianSummary, LaunchAuthContext, LaunchGuardianContext, LaunchIntent,
-        LaunchSessionRecord, LaunchStageRecord, LaunchState, SessionId,
+        GuardianDecision, GuardianMode, GuardianSummary, LaunchAuthContext, LaunchGuardianContext,
+        LaunchIntent, LaunchSessionRecord, LaunchStageRecord, LaunchState, SessionId,
     };
     use croopor_performance::PerformanceManager;
     use std::path::{Path, PathBuf};
@@ -4897,6 +4917,7 @@ mod tests {
             launched_at: "2026-01-01T00:00:00.000Z".to_string(),
             recorded_at: "2026-01-01T00:01:00.000Z".to_string(),
             outcome: "failed".to_string(),
+            session_outcome: None,
             scenario: crate::state::launch_reports::LaunchProofScenario {
                 scenario_id: "managed_launch".to_string(),
                 performance_mode: "managed".to_string(),
@@ -4992,6 +5013,7 @@ mod tests {
                         .to_string(),
                 ],
                 fallback_reason: Some("Vanilla fallback selected.".to_string()),
+                evidence: Vec::new(),
             }],
             comparison: Some(crate::state::launch_reports::LaunchProofComparison {
                 baseline_session_id: "baseline-session".to_string(),
@@ -5411,6 +5433,7 @@ mod tests {
             launched_at: "2026-01-01T00:00:00.000Z".to_string(),
             recorded_at: "2026-01-01T00:01:00.000Z".to_string(),
             outcome: "completed".to_string(),
+            session_outcome: None,
             scenario: crate::state::launch_reports::LaunchProofScenario {
                 scenario_id: scenario_id.to_string(),
                 performance_mode: performance_mode.to_string(),
@@ -5447,6 +5470,7 @@ mod tests {
                 result: Some("completed".to_string()),
                 warnings: Vec::new(),
                 fallback_reason: None,
+                evidence: Vec::new(),
             }],
             comparison,
         }
@@ -5592,12 +5616,31 @@ mod tests {
             failure: None,
             healing: None,
             guardian: None,
+            outcome: None,
             stages: Vec::new(),
         }
     }
 
     fn test_launch_session_task() -> task::LaunchSessionTask {
         task::LaunchSessionTask {
+            application: crate::application::stage_launch_instance_command(
+                crate::application::LaunchInstanceCommand {
+                    instance_id: "instance-queued".to_string(),
+                    username: None,
+                    max_memory_mb: Some(6144),
+                    min_memory_mb: Some(1024),
+                    client_started_at_ms: None,
+                },
+                Some("session-queued".to_string()),
+            ),
+            boundary: crate::application::stage_launch_boundary(
+                crate::application::LaunchBoundaryStagingRequest::new(
+                    crate::guardian::GuardianMode::Managed,
+                    crate::state::contracts::OperationPhase::Validating,
+                    &[],
+                    "managed",
+                ),
+            ),
             instance: Instance {
                 id: "instance-queued".to_string(),
                 name: "Queued Instance".to_string(),

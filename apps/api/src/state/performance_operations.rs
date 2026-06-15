@@ -1,4 +1,8 @@
+use crate::execution::file::{FileWriteRequest, write_file_atomically};
+#[cfg(test)]
+use crate::execution::file::{PromoteTempFileRequest, promote_temp_file};
 use crate::logging::timestamp_utc;
+use crate::state::ownership::{CurrentArtifact, classify_current_artifact};
 use croopor_config::AppPaths;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -333,29 +337,30 @@ fn persist_status_to_dir(
     let path = operation_path(storage_dir, &status.id);
     let data = serde_json::to_string_pretty(status)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let temp_path = path.with_extension("json.tmp");
-    fs::write(&temp_path, data)?;
-    replace_file(&temp_path, &path)
+    write_file_atomically(FileWriteRequest::new(
+        performance_operation_status_target(&status.id),
+        &path,
+        data.as_bytes(),
+    ))
+    .map(|_| ())
+    .map_err(io::Error::from)
 }
 
+#[cfg(test)]
 fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
-    let first_error = match fs::rename(source, destination) {
-        Ok(()) => return Ok(()),
-        Err(error) => error,
-    };
-    if !source.exists() {
-        return Err(first_error);
-    }
-    if destination.exists() && !destination.is_dir() {
-        let _ = fs::remove_file(destination);
-    }
-    match fs::rename(source, destination) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = fs::remove_file(source);
-            Err(error)
-        }
-    }
+    promote_temp_file(PromoteTempFileRequest::new(
+        performance_operation_status_target("performance_operation_status"),
+        source,
+        destination,
+    ))
+    .map(|_| ())
+    .map_err(io::Error::from)
+}
+
+fn performance_operation_status_target(
+    operation_id: &str,
+) -> crate::state::contracts::TargetDescriptor {
+    classify_current_artifact(CurrentArtifact::PerformanceOperationStatus, operation_id).target
 }
 
 pub fn operation_dir(paths: &AppPaths) -> PathBuf {
@@ -842,7 +847,7 @@ mod tests {
         replace_file(&source, &destination).expect_err("replace should fail");
 
         assert!(destination.is_dir());
-        assert!(!source.exists());
+        assert!(source.exists());
 
         cleanup(&root);
     }

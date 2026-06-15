@@ -3,38 +3,28 @@ import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { Icon } from '../../../ui/Icons';
 import { Card } from '../../../ui/Atoms';
 import { api } from '../../../api';
-import { config, systemInfo, versionById } from '../../../store';
+import { systemInfo } from '../../../store';
 import { errMessage } from '../../../utils';
-import { minecraftVersionLabel } from '../../../version-display';
-import { loaderKeyFromVersion } from '../../create/defaults';
 import type {
-  CompositionTier,
+  ApplicationViewModelTone,
   EnrichedInstance,
   PerformanceHealthResponse,
-  PerformanceHealthStatus,
   PerformanceInstanceOperationResponse,
-  PerformanceMode,
   PerformanceOperationStatus,
-  PerformancePlanResponse,
-  Version,
 } from '../../../types';
-import { memoryGb } from '../format';
-import { globalPerformanceMode, performanceModeFrom, performanceModeLabel } from '../performance-mode';
 
 type PerformanceProgramState =
   | {
       status: 'loading';
-      plan: PerformancePlanResponse | null;
       health: PerformanceHealthResponse | null;
       error?: undefined;
     }
   | {
       status: 'ready';
-      plan: PerformancePlanResponse | null;
       health: PerformanceHealthResponse | null;
       error?: undefined;
     }
-  | { status: 'error'; plan: PerformancePlanResponse | null; health: PerformanceHealthResponse | null; error: string };
+  | { status: 'error'; health: PerformanceHealthResponse | null; error: string };
 
 interface PerformanceInstallProgress {
   phase?: string;
@@ -47,140 +37,41 @@ interface PerformanceInstallProgress {
 
 type ApiResult<T> = T & { error?: string };
 
-function effectivePerformanceMode(inst: EnrichedInstance): { mode: PerformanceMode; source: 'instance' | 'global' } {
-  const instanceMode = performanceModeFrom(inst.performance_mode);
-  if (instanceMode) return { mode: instanceMode, source: 'instance' };
-  return { mode: globalPerformanceMode(), source: 'global' };
-}
-
-function compositionTierLabel(tier: CompositionTier | ''): string {
-  if (tier === 'extended') return 'Full mod bundle';
-  if (tier === 'core') return 'Core mod bundle';
-  if (tier === 'vanilla_enhanced') return 'Launcher tuning';
-  return 'Performance bundle';
-}
-
-function healthLabel(health: PerformanceHealthStatus | undefined): string {
-  if (health === 'healthy') return 'healthy';
-  if (health === 'degraded') return 'degraded';
-  if (health === 'fallback') return 'fallback';
-  if (health === 'invalid') return 'needs attention';
-  if (health === 'disabled') return 'not installed';
-  return 'unknown';
-}
-
-function healthTone(health: PerformanceHealthStatus | undefined): 'ok' | 'warn' | 'err' | 'mute' {
-  if (health === 'healthy') return 'ok';
-  if (health === 'degraded' || health === 'fallback' || health === 'disabled') return 'warn';
-  if (health === 'invalid') return 'err';
-  return 'mute';
-}
-
-function userPerformanceNotice(raw: string, fallback: boolean): string {
-  if (!raw) return '';
-  if (raw.includes('temporarily unavailable')) return raw;
-  if (raw.includes('not compatible with this instance')) return raw;
-  if (raw.includes('skipped by emergency disable')) {
-    return fallback
-      ? 'A performance bundle is temporarily unavailable, so Croopor chose the safest available option.'
-      : 'One performance mod is temporarily unavailable, so Croopor left it out.';
-  }
-  if (raw.includes('not enough compatible performance mods')) {
-    return 'A faster performance bundle is not compatible with this instance, so Croopor chose a safer option.';
-  }
-  if (raw.includes('no NVIDIA Turing+ GPU detected')) {
-    return 'Nvidium was left out because this device does not have a supported NVIDIA GPU.';
-  }
-  return raw.replace('managed mod', 'installed mod');
-}
-
-function planLoader(v: Version | undefined): string {
-  return loaderKeyFromVersion(v);
-}
-
-function planGameVersion(v: Version | undefined, inst: EnrichedInstance): string {
-  return minecraftVersionLabel(v, inst.version_id);
-}
-
-function performanceSummary(
-  state: PerformanceProgramState,
-  mode: PerformanceMode,
-): { tone: 'ok' | 'warn' | 'err' | 'mute'; title: string; detail: string } {
-  if (state.status === 'loading' && !state.plan && !state.health) {
+function performanceSummary(state: PerformanceProgramState): {
+  tone: ApplicationViewModelTone;
+  title: string;
+  detail: string;
+} {
+  if (state.status === 'loading' && !state.health) {
     return {
       tone: 'mute',
       title: 'Checking plan',
       detail: 'Memory and Java evidence stays visible while Croopor reads bundle state.',
     };
   }
-  if (state.status === 'error' && !state.plan && !state.health) {
+  if (state.status === 'error' && !state.health) {
     return {
       tone: 'mute',
       title: 'Plan status unavailable',
       detail: 'Backend plan data is not available right now.',
     };
   }
-  if (mode === 'vanilla') {
+  const viewModel = state.health?.view_model;
+  if (!viewModel) {
     return {
       tone: 'mute',
-      title: 'No managed bundle',
-      detail: 'Memory allocation and Java detection are shown below.',
+      title: 'Plan status unavailable',
+      detail: 'Backend plan data is not available right now.',
     };
   }
-  if (mode === 'custom') {
-    return {
-      tone: 'mute',
-      title: 'No managed bundle',
-      detail: 'Memory allocation and Java detection are shown below.',
-    };
-  }
-
-  const plan = state.plan;
-  const health = state.health;
-  if (!plan) {
-    return {
-      tone: 'mute',
-      title: 'Bundle status unavailable',
-      detail: 'Plan details are unavailable.',
-    };
-  }
-
-  const tier = compositionTierLabel(plan.tier);
-  const modCount = plan.mods?.length ?? 0;
-  const healthText = health ? `bundle ${healthLabel(health.health)}` : 'health not checked';
-  const fallback = Boolean(plan.fallback_reason) || health?.health === 'fallback';
-  const warning = userPerformanceNotice(
-    plan.fallback_reason || health?.warnings?.[0] || plan.warnings?.[0] || '',
-    fallback,
-  );
-  const launcherTuning = plan.tier === 'vanilla_enhanced' || modCount === 0;
-
-  if (health?.health === 'fallback') {
-    const fallbackTier = health.tier ? compositionTierLabel(health.tier) : compositionTierLabel('');
-    return {
-      tone: healthTone(health.health),
-      title: fallbackTier === 'Launcher tuning' ? 'Using launcher tuning' : 'Using fallback bundle',
-      detail:
-        warning || `Croopor chose ${fallbackTier.toLowerCase()} because the preferred bundle could not be applied.`,
-    };
-  }
-
-  if (launcherTuning) {
-    return {
-      tone: healthTone(health?.health),
-      title: 'Launcher tuning',
-      detail: warning || 'Croopor will tune Java and memory for this version; no performance mod bundle is available.',
-    };
-  }
-
   return {
-    tone: healthTone(health?.health),
-    title: tier,
-    detail: warning || `${modCount} performance mod${modCount === 1 ? '' : 's'} selected; ${healthText}.`,
+    tone: viewModel.tone,
+    title: viewModel.title,
+    detail: viewModel.detail,
   };
 }
 
-function performanceSummaryIcon(tone: 'ok' | 'warn' | 'err' | 'mute'): string {
+function performanceSummaryIcon(tone: ApplicationViewModelTone): string {
   if (tone === 'ok') return 'check-circle';
   if (tone === 'warn' || tone === 'err') return 'alert';
   return 'info';
@@ -235,10 +126,6 @@ function fmtHeap(gb: number): string {
   return Number.isInteger(gb) ? String(gb) : gb.toFixed(1);
 }
 
-function heapLabel(minGb: number, maxGb: number): string {
-  return minGb === maxGb ? `${fmtHeap(maxGb)} GB` : `${fmtHeap(minGb)} to ${fmtHeap(maxGb)} GB`;
-}
-
 function MemoryBar({ minGb, maxGb, totalGb }: { minGb: number; maxGb: number; totalGb: number }): JSX.Element {
   const clampFrac = (v: number): number => (Number.isFinite(v) ? Math.max(0, Math.min(1, v)) : 0);
   const maxFrac = clampFrac(maxGb / totalGb);
@@ -270,50 +157,24 @@ function MemoryBar({ minGb, maxGb, totalGb }: { minGb: number; maxGb: number; to
 }
 
 export function PerformanceCard({ inst }: { inst: EnrichedInstance }): JSX.Element {
-  const version = versionById(inst.version_id);
-  const effectiveMode = effectivePerformanceMode(inst);
-  const maxMem = memoryGb(inst.max_memory_mb, config.value?.max_memory_mb ?? 4096);
-  const minMem = memoryGb(inst.min_memory_mb, config.value?.min_memory_mb ?? 1024);
-  const [program, setProgram] = useState<PerformanceProgramState>({ status: 'loading', plan: null, health: null });
+  const [program, setProgram] = useState<PerformanceProgramState>({ status: 'loading', health: null });
   const [lifecycleOperation, setLifecycleOperation] = useState<PerformanceOperationStatus | null>(null);
   const operationPollRef = useRef<number | null>(null);
   const operationRequestRef = useRef(0);
 
   const fetchPerformanceProgram = useCallback(async (): Promise<{
-    plan: PerformancePlanResponse | null;
     health: PerformanceHealthResponse | null;
   }> => {
-    const gameVersion = planGameVersion(version, inst);
-    const loader = planLoader(version);
-    const planParams = new URLSearchParams({
-      game_version: gameVersion,
-      loader,
-      mode: effectiveMode.mode,
-      instance_id: inst.id,
-    });
     const healthParams = new URLSearchParams({ instance_id: inst.id });
-    const [planRes, healthRes] = await Promise.all([
-      api<ApiResult<PerformancePlanResponse>>('GET', `/performance/plan?${planParams.toString()}`),
-      api<ApiResult<PerformanceHealthResponse>>('GET', `/performance/health?${healthParams.toString()}`),
-    ]);
-    if (planRes?.error) throw new Error(planRes.error);
+    const healthRes = await api<ApiResult<PerformanceHealthResponse>>(
+      'GET',
+      `/performance/health?${healthParams.toString()}`,
+    );
     if (healthRes?.error) throw new Error(healthRes.error);
     return {
-      plan: planRes?.mode ? (planRes as PerformancePlanResponse) : null,
       health: healthRes?.health ? (healthRes as PerformanceHealthResponse) : null,
     };
-  }, [
-    inst.id,
-    inst.version_id,
-    version?.id,
-    version?.inherits_from,
-    version?.loader?.component_id,
-    version?.loader?.loader_version,
-    version?.minecraft_meta.effective_version,
-    version?.minecraft_meta.base_id,
-    version?.minecraft_meta.display_name,
-    effectiveMode.mode,
-  ]);
+  }, [inst.id]);
 
   useEffect(() => {
     return () => {
@@ -323,13 +184,12 @@ export function PerformanceCard({ inst }: { inst: EnrichedInstance }): JSX.Eleme
 
   useEffect(() => {
     let alive = true;
-    setProgram((current) => ({ status: 'loading', plan: current.plan, health: current.health }));
+    setProgram((current) => ({ status: 'loading', health: current.health }));
     void fetchPerformanceProgram()
-      .then(({ plan, health }) => {
+      .then(({ health }) => {
         if (!alive) return;
         setProgram({
           status: 'ready',
-          plan,
           health,
         });
       })
@@ -337,7 +197,6 @@ export function PerformanceCard({ inst }: { inst: EnrichedInstance }): JSX.Eleme
         if (!alive) return;
         setProgram((current) => ({
           status: 'error',
-          plan: current.plan,
           health: current.health,
           error: errMessage(err),
         }));
@@ -434,7 +293,7 @@ export function PerformanceCard({ inst }: { inst: EnrichedInstance }): JSX.Eleme
     };
   }, [inst.id, fetchPerformanceProgram]);
 
-  const baseSummary = performanceSummary(program, effectiveMode.mode);
+  const baseSummary = performanceSummary(program);
   const operationProgress = lifecycleOperation ? operationStatusAsProgress(lifecycleOperation) : null;
   const visibleLifecycleProgress = operationProgress
     ? {
@@ -455,7 +314,7 @@ export function PerformanceCard({ inst }: { inst: EnrichedInstance }): JSX.Eleme
       }
     : baseSummary;
   const summaryIcon = performanceSummaryIcon(summary.tone);
-  const runtimeDetected = Boolean(inst.java_major);
+  const display = program.health?.display ?? null;
   const totalGb = systemInfo.value?.total_memory_mb
     ? Math.max(1, Math.round(systemInfo.value.total_memory_mb / 1024))
     : 32;
@@ -480,22 +339,24 @@ export function PerformanceCard({ inst }: { inst: EnrichedInstance }): JSX.Eleme
         <div class="cp-od-perf-meter">
           <div class="cp-od-perf-meter-head">
             <span>Memory allocation</span>
-            <strong>{heapLabel(minMem, maxMem)}</strong>
+            <strong>{display?.memory.label || 'Checking allocation'}</strong>
           </div>
-          <MemoryBar minGb={minMem} maxGb={maxMem} totalGb={totalGb} />
+          {display ? (
+            <MemoryBar minGb={display.memory.min_gb} maxGb={display.memory.max_gb} totalGb={totalGb} />
+          ) : (
+            <MemoryBar minGb={0} maxGb={0} totalGb={totalGb} />
+          )}
           <div class="cp-od-perf-footer">
-            <div class="cp-od-perf-runtime" data-detected={runtimeDetected}>
+            <div class="cp-od-perf-runtime" data-detected={display?.runtime.detected ?? false}>
               <span class="cp-od-perf-runtime-mark">
                 <Icon name="check" size={11} stroke={2.8} />
               </span>
-              <span class="cp-od-perf-runtime-text">
-                {runtimeDetected ? `Java ${inst.java_major}` : 'Managed Java'}
-              </span>
+              <span class="cp-od-perf-runtime-text">{display?.runtime.label || 'Checking runtime'}</span>
             </div>
             <span class="cp-od-perf-footer-mode">
-              {performanceModeLabel(effectiveMode.mode)}
+              {display?.mode.label || 'Checking mode'}
               <span class="cp-od-perf-footer-sep">·</span>
-              {effectiveMode.source === 'instance' ? 'Per instance' : 'Global default'}
+              {display?.mode.source_label || 'Backend status'}
             </span>
           </div>
         </div>

@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 pub use crate::guardian::{RecoveryAction, RecoveryPlan, conservative_healing_preset};
 pub use healing::{HealingSummaryInput, build_healing_summary};
 pub use mapping::{
-    failure_class_name, format_failure_class, is_terminal_state, is_terminal_status,
-    launch_stage_label, launch_state_name, snapshot_status,
+    failure_class_name, format_failure_class, is_terminal_state, is_terminal_status, launch_notice,
+    launch_notice_from_values, launch_stage_label, launch_state_name, snapshot_status,
 };
 pub use prepare::{
     LaunchPreparationEvent, prepare_launch_attempt, prepare_launch_attempt_with_events,

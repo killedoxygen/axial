@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::download::{
+    DownloadError, ExecutionDownloadError, write_launcher_managed_artifact_bytes_to_temp,
+};
 use crate::paths::version_manifest_cache_path;
 
 const MANIFEST_URL: &str = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
@@ -74,7 +77,7 @@ pub async fn fetch_version_manifest_cached(library_dir: &Path) -> Result<Version
     let cache_path = version_manifest_cache_path(library_dir);
 
     if let Some(value) = fresh_cached_manifest() {
-        let _ = write_persistent_manifest_cache_value(&cache_path, &value);
+        let _ = write_persistent_manifest_cache_value(&cache_path, &value).await;
         return Ok(value);
     }
 
@@ -86,7 +89,7 @@ pub async fn fetch_version_manifest_cached(library_dir: &Path) -> Result<Version
     )?;
 
     if let Some(live_body) = live_body {
-        let _ = write_persistent_manifest_cache(&cache_path, &live_body);
+        let _ = write_persistent_manifest_cache(&cache_path, &live_body).await;
     }
 
     update_manifest_cache(manifest.clone());
@@ -200,60 +203,39 @@ fn read_persistent_manifest_cache(path: &Path) -> Result<VersionManifest, String
     parse_manifest_body(&data)
 }
 
-fn write_persistent_manifest_cache(path: &Path, data: &[u8]) -> Result<(), String> {
+async fn write_persistent_manifest_cache(path: &Path, data: &[u8]) -> Result<(), String> {
     parse_manifest_body(data)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("creating version manifest cache directory: {error}"))?;
-    }
-
     let tmp_path = manifest_cache_tmp_path(path);
-    let result = (|| -> Result<(), String> {
-        fs::write(&tmp_path, data)
-            .map_err(|error| format!("writing version manifest cache: {error}"))?;
-        promote_manifest_cache_tmp_file(&tmp_path, path)
-            .map_err(|error| format!("promoting version manifest cache: {error}"))?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp_path);
-    }
-    result
+    write_launcher_managed_artifact_bytes_to_temp(path, &tmp_path, data)
+        .await
+        .map(|_| ())
+        .map_err(manifest_execution_download_error)
 }
 
-fn write_persistent_manifest_cache_value(
+async fn write_persistent_manifest_cache_value(
     path: &Path,
     manifest: &VersionManifest,
 ) -> Result<(), String> {
     let data = serde_json::to_vec(manifest)
         .map_err(|error| format!("serializing version manifest cache: {error}"))?;
-    write_persistent_manifest_cache(path, &data)
+    write_persistent_manifest_cache(path, &data).await
 }
 
-fn promote_manifest_cache_tmp_file(tmp_path: &Path, path: &Path) -> std::io::Result<()> {
-    let first_error = match fs::rename(tmp_path, path) {
-        Ok(()) => return Ok(()),
-        Err(error) => error,
-    };
-
-    match fs::symlink_metadata(tmp_path) {
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(first_error),
-        Err(error) => return Err(error),
-    }
-
-    if let Ok(metadata) = fs::symlink_metadata(path) {
-        let file_type = metadata.file_type();
-        if file_type.is_file() || file_type.is_symlink() {
-            fs::remove_file(path)?;
+fn manifest_execution_download_error(error: ExecutionDownloadError) -> String {
+    let context = match error.kind {
+        crate::download::ExecutionDownloadFactKind::PromoteFailed => {
+            "promoting version manifest cache"
         }
+        crate::download::ExecutionDownloadFactKind::PermissionFailure
+        | crate::download::ExecutionDownloadFactKind::TempWriteFailed => {
+            "writing version manifest cache"
+        }
+        _ => "writing version manifest cache",
+    };
+    match error.into_download_error() {
+        DownloadError::FileOperation(error) => format!("{context}: {error}"),
+        error => format!("{context}: {error}"),
     }
-
-    let result = fs::rename(tmp_path, path);
-    if result.is_err() {
-        let _ = fs::remove_file(tmp_path);
-    }
-    result
 }
 
 fn manifest_cache_tmp_path(path: &Path) -> PathBuf {
@@ -292,13 +274,15 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::thread;
 
-    #[test]
-    fn writes_and_reads_persistent_manifest_cache() {
+    #[tokio::test]
+    async fn writes_and_reads_persistent_manifest_cache() {
         let root = temp_dir("manifest-cache-round-trip");
         let cache_path = root.join("cache").join("version_manifest_v2.json");
         let body = sample_manifest_body("1.21.5");
 
-        write_persistent_manifest_cache(&cache_path, body.as_bytes()).expect("write cache");
+        write_persistent_manifest_cache(&cache_path, body.as_bytes())
+            .await
+            .expect("write cache");
         let manifest = read_persistent_manifest_cache(&cache_path).expect("read cache");
 
         assert_eq!(manifest.latest.release, "1.21.5");
@@ -307,11 +291,12 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn fallback_returns_cached_manifest_when_live_provider_fails() {
+    #[tokio::test]
+    async fn fallback_returns_cached_manifest_when_live_provider_fails() {
         let root = temp_dir("manifest-cache-fallback");
         let cache_path = root.join("version_manifest_v2.json");
         write_persistent_manifest_cache(&cache_path, sample_manifest_body("1.21.4").as_bytes())
+            .await
             .expect("write cache");
 
         let (manifest, live_body) = resolve_manifest_from_live_or_cache(
@@ -327,14 +312,16 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn fresh_manifest_value_can_seed_a_requested_library_cache() {
+    #[tokio::test]
+    async fn fresh_manifest_value_can_seed_a_requested_library_cache() {
         let root = temp_dir("manifest-cache-fresh-library");
         let cache_path = root.join("cache").join("version_manifest_v2.json");
         let manifest =
             parse_manifest_body(sample_manifest_body("1.21.6").as_bytes()).expect("parse manifest");
 
-        write_persistent_manifest_cache_value(&cache_path, &manifest).expect("write cache value");
+        write_persistent_manifest_cache_value(&cache_path, &manifest)
+            .await
+            .expect("write cache value");
 
         let cached = read_persistent_manifest_cache(&cache_path).expect("read cache");
         assert_eq!(cached.latest.release, "1.21.6");
@@ -361,11 +348,12 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn live_parse_error_can_fall_back_to_cached_manifest() {
+    #[tokio::test]
+    async fn live_parse_error_can_fall_back_to_cached_manifest() {
         let root = temp_dir("manifest-cache-live-parse");
         let cache_path = root.join("version_manifest_v2.json");
         write_persistent_manifest_cache(&cache_path, sample_manifest_body("1.21.3").as_bytes())
+            .await
             .expect("write cache");
 
         let (manifest, live_body) =
@@ -420,8 +408,8 @@ mod tests {
         server.join();
     }
 
-    #[test]
-    fn temp_promotion_replaces_existing_manifest_cache() {
+    #[tokio::test]
+    async fn shared_promotion_replaces_existing_manifest_cache() {
         let root = temp_dir("manifest-cache-promote");
         fs::create_dir_all(&root).expect("create root");
         let tmp_path = root.join("version_manifest_v2.tmp");
@@ -429,7 +417,9 @@ mod tests {
         fs::write(&cache_path, b"old").expect("write old cache");
         fs::write(&tmp_path, b"new").expect("write temp cache");
 
-        promote_manifest_cache_tmp_file(&tmp_path, &cache_path).expect("promote temp cache");
+        crate::download::promote_launcher_managed_artifact_temp_once(&tmp_path, &cache_path)
+            .await
+            .expect("promote temp cache");
 
         assert_eq!(fs::read(&cache_path).expect("read promoted cache"), b"new");
         assert!(!tmp_path.exists());
@@ -437,16 +427,18 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn temp_promotion_preserves_destination_when_temp_is_missing() {
+    #[tokio::test]
+    async fn shared_promotion_preserves_destination_when_temp_is_missing() {
         let root = temp_dir("manifest-cache-missing-temp");
         fs::create_dir_all(&root).expect("create root");
         let tmp_path = root.join("missing.tmp");
         let cache_path = root.join("version_manifest_v2.json");
         fs::write(&cache_path, b"old").expect("write old cache");
 
-        let error = promote_manifest_cache_tmp_file(&tmp_path, &cache_path)
-            .expect_err("missing temp should fail");
+        let error =
+            crate::download::promote_launcher_managed_artifact_temp_once(&tmp_path, &cache_path)
+                .await
+                .expect_err("missing temp should fail");
 
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
         assert_eq!(fs::read(&cache_path).expect("read old cache"), b"old");

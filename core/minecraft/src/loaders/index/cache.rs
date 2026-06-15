@@ -1,3 +1,7 @@
+use crate::download::{
+    DownloadError, ExecutionDownloadError, ExecutionDownloadReport,
+    write_launcher_managed_artifact_bytes_to_temp,
+};
 use crate::loaders::types::{CachedCatalog, LoaderAvailability, LoaderCatalogState, LoaderError};
 use chrono::Utc;
 use std::fs;
@@ -40,9 +44,11 @@ where
 
     match live_fetch().await {
         Ok(value) => {
-            let cache_error = write_cache(&cache_path, &CachedCatalog::new(value.clone()))
-                .err()
-                .map(|_| CACHE_PERSIST_WARNING.to_string());
+            let cache_error =
+                Box::pin(write_cache(&cache_path, &CachedCatalog::new(value.clone())))
+                    .await
+                    .err()
+                    .map(|_| CACHE_PERSIST_WARNING.to_string());
             Ok((
                 value,
                 LoaderCatalogState {
@@ -92,50 +98,29 @@ where
     Ok(cached)
 }
 
-fn write_cache<T>(path: &Path, value: &CachedCatalog<T>) -> Result<(), LoaderError>
+async fn write_cache<T>(
+    path: &Path,
+    value: &CachedCatalog<T>,
+) -> Result<ExecutionDownloadReport, LoaderError>
 where
     T: serde::Serialize,
 {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     let data = serde_json::to_vec_pretty(value)?;
     let tmp_path = cache_tmp_path(path);
-    let result = (|| -> Result<(), LoaderError> {
-        fs::write(&tmp_path, data)?;
-        promote_cache_tmp_file(&tmp_path, path)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp_path);
-    }
-    result
+    write_launcher_managed_artifact_bytes_to_temp(path, &tmp_path, &data)
+        .await
+        .map_err(loader_execution_download_error)
 }
 
-fn promote_cache_tmp_file(tmp_path: &Path, path: &Path) -> std::io::Result<()> {
-    let first_error = match fs::rename(tmp_path, path) {
-        Ok(()) => return Ok(()),
-        Err(error) => error,
-    };
+fn loader_execution_download_error(error: ExecutionDownloadError) -> LoaderError {
+    loader_download_error(error.into_download_error())
+}
 
-    match fs::symlink_metadata(tmp_path) {
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(first_error),
-        Err(error) => return Err(error),
+fn loader_download_error(error: DownloadError) -> LoaderError {
+    match error {
+        DownloadError::FileOperation(error) => LoaderError::Io(error),
+        error => LoaderError::Download(error),
     }
-
-    if let Ok(metadata) = fs::symlink_metadata(path) {
-        let file_type = metadata.file_type();
-        if file_type.is_file() || file_type.is_symlink() {
-            fs::remove_file(path)?;
-        }
-    }
-
-    let result = fs::rename(tmp_path, path);
-    if result.is_err() {
-        let _ = fs::remove_file(tmp_path);
-    }
-    result
 }
 
 fn is_cache_fresh(fetched_at_ms: i64, ttl: Duration) -> bool {
@@ -192,7 +177,9 @@ mod tests {
             fetched_at_ms: 1,
             value: vec!["cached".to_string()],
         };
-        write_cache(&cache_path, &cached).expect("write stale cache");
+        write_cache(&cache_path, &cached)
+            .await
+            .expect("write stale cache");
 
         let (value, state) = resolve_cached(cache_path, Duration::ZERO, || async {
             Err::<Vec<String>, _>(LoaderError::Other(
@@ -215,8 +202,8 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn write_cache_uses_temp_file_before_replacement() {
+    #[tokio::test]
+    async fn write_cache_uses_temp_file_before_replacement() {
         let root = temp_dir("atomic-cache-write");
         fs::create_dir_all(&root).expect("create root");
         let cache_path = root.join("catalog.json");
@@ -225,18 +212,34 @@ mod tests {
             fetched_at_ms: 1,
             value: vec!["old".to_string()],
         };
-        write_cache(&cache_path, &old).expect("write old cache");
+        write_cache(&cache_path, &old)
+            .await
+            .expect("write old cache");
 
         let next = CachedCatalog {
             schema_version: CATALOG_SCHEMA_VERSION,
             fetched_at_ms: 2,
             value: vec!["new".to_string()],
         };
-        write_cache(&cache_path, &next).expect("replace cache");
+        let report = write_cache(&cache_path, &next)
+            .await
+            .expect("replace cache");
 
         let cached = read_cache::<Vec<String>>(&cache_path).expect("read replaced cache");
         assert_eq!(cached.value, vec!["new".to_string()]);
         assert_eq!(cached.fetched_at_ms, 2);
+        assert_eq!(report.target, "catalog.json");
+        assert!(
+            report.facts.iter().any(
+                |fact| fact.kind == crate::download::ExecutionDownloadFactKind::MetadataMissing
+            )
+        );
+        assert!(
+            report
+                .facts
+                .iter()
+                .any(|fact| fact.kind == crate::download::ExecutionDownloadFactKind::Promoted)
+        );
         assert!(fs::read_dir(&root).expect("read root").all(|entry| {
             !entry
                 .expect("entry")
@@ -248,8 +251,8 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn promote_cache_tmp_file_replaces_existing_destination() {
+    #[tokio::test]
+    async fn shared_promotion_replaces_existing_destination() {
         let root = temp_dir("promote-replaces-destination");
         fs::create_dir_all(&root).expect("create root");
         let tmp_path = root.join("catalog.tmp");
@@ -257,7 +260,9 @@ mod tests {
         fs::write(&cache_path, b"old").expect("write old cache");
         fs::write(&tmp_path, b"new").expect("write temp cache");
 
-        promote_cache_tmp_file(&tmp_path, &cache_path).expect("promote temp cache");
+        crate::download::promote_launcher_managed_artifact_temp_once(&tmp_path, &cache_path)
+            .await
+            .expect("promote temp cache");
 
         assert_eq!(fs::read(&cache_path).expect("read promoted cache"), b"new");
         assert!(!tmp_path.exists());
@@ -265,8 +270,8 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn promote_cache_tmp_file_preserves_destination_when_temp_is_missing() {
+    #[tokio::test]
+    async fn shared_promotion_preserves_destination_when_temp_is_missing() {
         let root = temp_dir("promote-missing-temp");
         fs::create_dir_all(&root).expect("create root");
         let tmp_path = root.join("missing.tmp");
@@ -274,7 +279,9 @@ mod tests {
         fs::write(&cache_path, b"old").expect("write old cache");
 
         let error =
-            promote_cache_tmp_file(&tmp_path, &cache_path).expect_err("missing temp should fail");
+            crate::download::promote_launcher_managed_artifact_temp_once(&tmp_path, &cache_path)
+                .await
+                .expect_err("missing temp should fail");
 
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
         assert_eq!(fs::read(&cache_path).expect("read old cache"), b"old");
@@ -282,20 +289,29 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn promote_cache_tmp_file_preserves_directory_destination_on_retry_failure() {
+    #[tokio::test]
+    async fn write_cache_preserves_directory_destination_and_cleans_temp_on_promotion_failure() {
         let root = temp_dir("promote-directory-destination");
         fs::create_dir_all(&root).expect("create root");
-        let tmp_path = root.join("catalog.tmp");
         let cache_path = root.join("catalog.json");
         fs::create_dir_all(&cache_path).expect("create cache directory");
-        fs::write(&tmp_path, b"new").expect("write temp cache");
+        let next = CachedCatalog {
+            schema_version: CATALOG_SCHEMA_VERSION,
+            fetched_at_ms: 2,
+            value: vec!["new".to_string()],
+        };
 
-        let result = promote_cache_tmp_file(&tmp_path, &cache_path);
+        let result = write_cache(&cache_path, &next).await;
 
         assert!(result.is_err());
         assert!(cache_path.is_dir());
-        assert!(!tmp_path.exists());
+        assert!(fs::read_dir(&root).expect("read root").all(|entry| {
+            !entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp-")
+        }));
 
         let _ = fs::remove_dir_all(root);
     }
