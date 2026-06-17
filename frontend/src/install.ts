@@ -16,6 +16,8 @@ import {
   installEventSource,
   catalog,
   versions,
+  instances,
+  lastInstanceId,
   installFailure,
 } from './store';
 import {
@@ -633,10 +635,13 @@ async function onInstallDone(completedItem?: InstallItem): Promise<void> {
   if (completedItem) clearInstallFailureForItem(completedItem);
 
   try {
-    const res = await api('GET', '/versions');
-    if (res.error) throw new Error(res.error);
-    const nextVersions = res.versions || [];
+    const [versionsRes, instancesRes] = await Promise.all([api('GET', '/versions'), api('GET', '/instances')]);
+    if (versionsRes.error) throw new Error(versionsRes.error);
+    if (instancesRes.error) throw new Error(instancesRes.error);
+    const nextVersions = versionsRes.versions || [];
     versions.value = nextVersions;
+    instances.value = instancesRes.instances || [];
+    lastInstanceId.value = instancesRes.last_instance_id || null;
 
     if (catalog.value) {
       const installed = new Set<string>(
@@ -653,7 +658,7 @@ async function onInstallDone(completedItem?: InstallItem): Promise<void> {
       };
     }
   } catch (err: unknown) {
-    showError(`Install completed, but failed to refresh versions: ${errMessage(err)}`);
+    showError(`Install completed, but failed to refresh launcher state: ${errMessage(err)}`);
   }
 
   try {
