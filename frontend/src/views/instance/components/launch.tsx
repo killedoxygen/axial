@@ -7,7 +7,9 @@ import { navigate } from '../../../ui-state';
 import { clearLaunchNotice } from '../../../actions';
 import { toast } from '../../../toast';
 import type { InstallFailure, LaunchState } from '../../../store';
-import type { EnrichedInstance, LaunchActionState, LaunchNotice, LaunchNoticeTone } from '../../../types';
+import type { LaunchActionState, LaunchNotice, LaunchNoticeTone } from '../../../types-launch';
+import type { EnrichedInstance } from '../../../types-instance';
+import type { InstallQueuedItemViewModel } from '../../../types-install';
 import { countDownRemainingSeconds, formatRemainingTime } from '../../../progress-estimation';
 import { openInstanceFolder } from '../instance-actions';
 
@@ -69,6 +71,7 @@ export function LaunchSplitButton({
   inst,
   launchAction,
   installQueued,
+  installQueuedView,
   installProgress,
   onLaunch,
   onInstall,
@@ -79,6 +82,7 @@ export function LaunchSplitButton({
   inst: EnrichedInstance;
   launchAction: LaunchActionState;
   installQueued: boolean;
+  installQueuedView?: InstallQueuedItemViewModel;
   installProgress: { pct: number; label: string } | null;
   onLaunch: () => void;
   onInstall: () => void;
@@ -88,7 +92,7 @@ export function LaunchSplitButton({
 }): JSX.Element {
   const progress = preparing ? { pct: preparing.pct, label: preparing.label } : installProgress;
   const usesInstallAction = launchAction.primary_action === 'install';
-  const label = progress?.label || (installQueued ? 'Queued' : launchAction.label);
+  const label = progress?.label || (installQueued ? installQueuedView?.title || 'Queued' : launchAction.label);
   const icon = progress || installQueued ? 'clock' : usesInstallAction ? 'download' : 'play';
   const pct = progress?.pct ?? 0;
   const disabled = Boolean(progress) || installQueued;
@@ -96,8 +100,13 @@ export function LaunchSplitButton({
   const primaryMenuItem = usesInstallAction
     ? {
         icon: installQueued ? 'clock' : 'download',
-        label: installQueued ? 'Queued' : launchAction.label,
-        onSelect: installQueued ? () => toast('Install already queued') : onInstall,
+        label: installQueued ? installQueuedView?.title || 'Install queued' : launchAction.label,
+        onSelect: installQueued
+          ? () => {
+              const message = installQueuedView?.summary || installQueuedView?.title || '';
+              if (message) toast(message, 'info');
+            }
+          : onInstall,
       }
     : { icon: 'play', label: 'Launch now', onSelect: onLaunch };
   return (
@@ -155,19 +164,17 @@ export function InstallBarrierPane({
   installTarget,
   installLabel,
   installQueued,
+  installQueuedView,
   installProgress,
   installFailure,
-  installQueuePosition,
-  installQueueCount,
   onRetryInstall,
 }: {
   installTarget: string;
   installLabel: string;
   installQueued: boolean;
+  installQueuedView?: InstallQueuedItemViewModel;
   installProgress: InstallBarrierProgress | null;
   installFailure: InstallFailure | null;
-  installQueuePosition?: number;
-  installQueueCount?: number;
   onRetryInstall: () => void;
 }): JSX.Element {
   const [etaNow, setEtaNow] = useState(() => Date.now());
@@ -186,30 +193,24 @@ export function InstallBarrierPane({
 
   const pct = installProgress ? Math.max(0, Math.min(100, Math.round(installProgress.pct))) : 0;
   const failed = Boolean(installFailure);
-  const queuedBehind = installQueuePosition != null ? installQueuePosition - 1 : undefined;
-  const queuedDetail =
-    installQueuePosition != null && installQueueCount != null
-      ? installQueuePosition === 1
-        ? `Position 1 of ${installQueueCount}; next to start when the download slot opens.`
-        : `Position ${installQueuePosition} of ${installQueueCount}; waiting behind ${queuedBehind} item${queuedBehind === 1 ? '' : 's'}.`
-      : 'This instance will unlock automatically after its version install starts and finishes.';
   const label =
-    installFailure?.message ||
+    installFailure?.viewModel.summary ||
     installProgress?.label ||
-    (installQueued ? 'Install waiting in queue' : 'Preparing install');
+    (installQueued ? installQueuedView?.summary || installLabel : 'Preparing install');
+  const retryAction = installFailure?.viewModel.retry_action;
   const targetLabel = installLabel || installTarget;
   const remainingSeconds = installProgress
     ? countDownRemainingSeconds(installProgress.remainingSeconds, installProgress.remainingSecondsUpdatedAt, etaNow)
     : undefined;
   const activeEta = remainingSeconds ? `${formatRemainingTime(remainingSeconds)} left` : '';
   const detail = failed
-    ? 'Retry the required install or open Downloads for more context.'
+    ? installFailure?.viewModel.detail || retryAction?.disabled_reason || 'Open Downloads for more context.'
     : installProgress
       ? activeEta
         ? `${activeEta} · ${pct}% complete`
         : `${pct}% complete`
       : installQueued
-        ? queuedDetail
+        ? installQueuedView?.detail || installQueuedView?.summary || ''
         : 'Croopor is preparing the required version files.';
 
   return (
@@ -219,7 +220,13 @@ export function InstallBarrierPane({
           <Icon name={failed ? 'alert' : installQueued ? 'clock' : 'download'} size={18} stroke={2} />
         </span>
         <div class="cp-instance-install-lock-copy">
-          <h2>{failed ? 'Install failed' : installQueued ? 'Install queued' : 'Installing required files'}</h2>
+          <h2>
+            {failed
+              ? installFailure?.viewModel.title || 'Install failed'
+              : installQueued
+                ? installQueuedView?.title || installLabel
+                : 'Installing required files'}
+          </h2>
           {failed ? (
             <>
               <p>Could not install {targetLabel}.</p>
@@ -241,8 +248,15 @@ export function InstallBarrierPane({
         <span>{detail}</span>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginLeft: 'auto' }}>
           {failed && (
-            <Button variant="secondary" size="sm" icon="refresh" onClick={onRetryInstall}>
-              Retry
+            <Button
+              variant="secondary"
+              size="sm"
+              icon="refresh"
+              onClick={onRetryInstall}
+              disabled={retryAction ? !retryAction.enabled : false}
+              title={retryAction?.disabled_reason || undefined}
+            >
+              {retryAction?.label || 'Retry install'}
             </Button>
           )}
           <Button variant="secondary" size="sm" icon="download" onClick={() => navigate({ name: 'downloads' })}>

@@ -17,7 +17,8 @@ import { deleteInstancesFlow } from '../instance/instance-actions';
 import { supportsMods } from '../../utils';
 import { minecraftVersionLabel } from '../../version-display';
 import { fmtRelativeCompact } from '../instance/format';
-import type { EnrichedInstance, Version } from '../../types';
+import type { Version } from '../../types-version';
+import type { EnrichedInstance } from '../../types-instance';
 
 function versionLabel(v: Version | undefined): string {
   return minecraftVersionLabel(v, 'Unknown');
@@ -45,7 +46,7 @@ function ListRow({
   const running = !!runningSessions.value[inst.id];
   const install = instanceInstallStatus(inst, v);
   const installing = install.installing;
-  const installLabel = install.state === 'queued' ? 'Queued' : 'Installing';
+  const installLabel = install.state === 'queued' ? install.queuedItem?.title || install.label : 'Installing';
   const showModsCount = supportsMods(v);
   return (
     <div

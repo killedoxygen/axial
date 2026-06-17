@@ -19,62 +19,23 @@ import {
   startLaunch,
   updateInstanceInList,
   updateLaunchPrep,
-  updateLaunchPrepStage,
+  updateLaunchPrepView,
   updateRunningSessionState,
 } from './actions';
-import { launchStageView, type LaunchStage } from './launch-stages';
-import type { Config, Instance, LaunchNotice, LaunchSessionOutcome } from './types';
+import type { LaunchNotice, LaunchSessionOutcome, LaunchStatusViewModel } from './types-launch';
+import type { Instance } from './types-instance';
+import type { Config } from './types-settings';
 
-const PRE_RESPONSE_STAGE_CAP_PCT = 87;
 const LIVE_LAUNCH_UPDATES_UNAVAILABLE = 'Live launch updates are unavailable.';
-const PRE_RESPONSE_STAGE_TICKS: Array<{ atMs: number; stage: LaunchStage }> = [
-  { atMs: 700, stage: 'preparing' },
-  { atMs: 1800, stage: 'prewarming' },
-  { atMs: 3400, stage: 'starting' },
-  { atMs: 6200, stage: 'monitoring' },
-];
 
-function rollbackLaunch(instanceId: string, animationFrameId: number | null): void {
-  if (animationFrameId !== null) cancelAnimationFrame(animationFrameId);
+function rollbackLaunch(instanceId: string): void {
   endSession(instanceId);
   if (Object.keys(runningSessions.value).length === 0) Music.unsuppress();
 
   endLaunchPrep();
 }
 
-function startPreResponseLaunchStageTicker(instanceId: string): () => void {
-  let stopped = false;
-  let timeoutId: number | null = null;
-  let nextTick = 0;
-  const startedAt = Date.now();
-
-  const scheduleNext = (): void => {
-    if (stopped) return;
-    const tick = PRE_RESPONSE_STAGE_TICKS[nextTick];
-    if (!tick) return;
-    const delayMs = Math.max(0, tick.atMs - (Date.now() - startedAt));
-    timeoutId = window.setTimeout(() => {
-      timeoutId = null;
-      if (stopped) return;
-      const view = launchStageView(tick.stage);
-      updateLaunchPrep(instanceId, Math.min(view.pct, PRE_RESPONSE_STAGE_CAP_PCT), view.label, view.stage);
-      nextTick += 1;
-      scheduleNext();
-    }, delayMs);
-  };
-
-  scheduleNext();
-
-  return () => {
-    stopped = true;
-    if (timeoutId !== null) {
-      window.clearTimeout(timeoutId);
-      timeoutId = null;
-    }
-  };
-}
-
-function updateRunningSession(instanceId: string, patch: Partial<import('./types').RunningSession>): void {
+function updateRunningSession(instanceId: string, patch: Partial<import('./types-launch').RunningSession>): void {
   updateRunningSessionState(instanceId, patch);
 }
 
@@ -91,6 +52,20 @@ function launchSessionOutcome(value: unknown): LaunchSessionOutcome | undefined 
   }
   if (typeof candidate.reason !== 'string' || typeof candidate.summary !== 'string') return undefined;
   return candidate as LaunchSessionOutcome;
+}
+
+function launchStatusViewModel(value: unknown): LaunchStatusViewModel | null {
+  if (!value || typeof value !== 'object') return null;
+  const candidate = value as Partial<LaunchStatusViewModel>;
+  if (typeof candidate.state_id !== 'string' || typeof candidate.label !== 'string') return null;
+  const pct =
+    typeof candidate.progress_pct === 'number' && Number.isFinite(candidate.progress_pct) ? candidate.progress_pct : 0;
+  return {
+    state_id: candidate.state_id,
+    label: candidate.label,
+    progress_pct: Math.max(0, Math.min(100, pct)),
+    terminal: candidate.terminal === true,
+  };
 }
 
 function primaryNoticeDetail(details: string[]): string {
@@ -153,17 +128,14 @@ export async function launchGame(): Promise<void> {
 
   clearLaunchNotice(inst.id);
   startLaunch(inst.id);
-  updateLaunchPrep(inst.id, 8, 'Resolving launch plan', 'planning');
-  const launchAnimationFrameId: number | null = null;
 
   let launchCommitted = false;
   let launchInst = inst;
 
   try {
-    updateLaunchPrep(inst.id, 18, 'Checking compatibility', 'validating');
     const launchDraft = instanceLaunchDrafts.value[inst.id];
     if (launchDraft?.dirty) {
-      updateLaunchPrep(inst.id, 24, 'Preparing launch files', 'preparing');
+      updateLaunchPrep(inst.id, 0, 'Saving launch settings');
       const saved = await api('PUT', `/instances/${encodeURIComponent(inst.id)}`, {
         java_path: launchDraft.javaPath.trim(),
         jvm_preset: launchDraft.jvmPreset,
@@ -176,7 +148,7 @@ export async function launchGame(): Promise<void> {
           tone: 'error',
         });
         showError(saved.error);
-        rollbackLaunch(inst.id, launchAnimationFrameId);
+        rollbackLaunch(inst.id);
         return;
       }
       launchInst = saved;
@@ -193,28 +165,23 @@ export async function launchGame(): Promise<void> {
       appendLog('system', `Applied pending launch overrides for ${inst.name}.`, inst.id, inst.name);
     }
 
-    updateLaunchPrep(inst.id, 46, 'Preparing launch files', 'preparing');
-    const stopPreResponseStages = startPreResponseLaunchStageTicker(inst.id);
-    const res = await (async () => {
-      try {
-        return await api('POST', '/launch', {
-          instance_id: launchInst.id,
-          username,
-          client_started_at_ms: Date.now(),
-        });
-      } finally {
-        stopPreResponseStages();
-      }
-    })();
+    updateLaunchPrep(inst.id, 0, 'Requesting launch');
+    const res = await api('POST', '/launch', {
+      instance_id: launchInst.id,
+      username,
+      client_started_at_ms: Date.now(),
+    });
 
     if (res.error) {
       if (!surfaceBackendLaunchNotice(res.notice, inst.id, inst.name)) {
         showError(res.error);
       }
       launchCommitted = false;
-      rollbackLaunch(inst.id, launchAnimationFrameId);
+      rollbackLaunch(inst.id);
       return;
     }
+    const initialViewModel = launchStatusViewModel(res.view_model) ?? undefined;
+    if (initialViewModel) updateLaunchPrepView(inst.id, initialViewModel);
 
     const launchedAt = res.launched_at || new Date().toISOString();
     const allocatedMB = selectedLaunchMaxMemoryMB(res, launchInst, cfg);
@@ -225,6 +192,7 @@ export async function launchGame(): Promise<void> {
       state: typeof res.state === 'string' ? res.state : 'queued',
       launchedAt,
       allocatedMB,
+      viewModel: initialViewModel,
       benchmark: res.benchmark,
       healing: res.healing,
       guardian: res.guardian,
@@ -264,11 +232,11 @@ export async function launchGame(): Promise<void> {
         notice?: LaunchNotice;
       };
       if (!surfaceBackendLaunchNotice(payload.notice, inst.id, inst.name)) showError(payload.error || err.message);
-      if (!launchCommitted) rollbackLaunch(inst.id, launchAnimationFrameId);
+      if (!launchCommitted) rollbackLaunch(inst.id);
       return;
     }
     showError(errMessage(err));
-    if (!launchCommitted) rollbackLaunch(inst.id, launchAnimationFrameId);
+    if (!launchCommitted) rollbackLaunch(inst.id);
   }
 }
 
@@ -320,11 +288,13 @@ async function connectLaunchEvents(
     const matchingPrep = prep.status === 'preparing' && prep.instanceId === instanceId;
     if (session?.sessionId !== sessionId && !matchingPrep) return;
     const outcome = launchSessionOutcome(data.outcome);
-    if (typeof data.state === 'string') updateLaunchPrepStage(instanceId, data.state);
+    const viewModel = launchStatusViewModel(data.view_model);
+    if (viewModel) updateLaunchPrepView(instanceId, viewModel);
     if (session && (typeof data.pid === 'number' || data.healing || typeof data.state === 'string' || outcome)) {
       updateRunningSession(instanceId, {
         pid: typeof data.pid === 'number' ? data.pid : session.pid || 0,
         state: typeof data.state === 'string' ? data.state : session.state,
+        viewModel: viewModel || session.viewModel,
         benchmark: data.benchmark || session.benchmark,
         healing: data.healing || session.healing,
         guardian: data.guardian || session.guardian,
@@ -407,20 +377,13 @@ function onGameExited(
 ): void {
   const session = runningSessions.value[instanceId];
   if (!session || session.sessionId !== sessionId) return;
-  const exitCode = typeof data.exit_code === 'number' ? data.exit_code : undefined;
   const outcome = launchSessionOutcome(data.outcome) || session.outcome;
 
   eventSource.close();
   endSession(instanceId);
 
   if (Object.keys(runningSessions.value).length === 0) Music.unsuppress();
-  appendLog(
-    'system',
-    outcome?.summary ||
-      `${instanceName || instanceId} exited${exitCode === undefined ? '' : ` with code ${exitCode}`}.`,
-    instanceId,
-    instanceName,
-  );
+  appendLog('system', outcome?.summary || `${instanceName || instanceId} session ended.`, instanceId, instanceName);
   surfaceBackendLaunchNotice(data.notice, instanceId, instanceName);
 }
 

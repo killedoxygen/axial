@@ -3,13 +3,19 @@
 //! Application orchestrates command handling here while `croopor-performance`
 //! keeps ownership of rules refresh mechanics and validation.
 
+mod benchmark_matrix;
+mod host;
+mod qualification;
 mod workflow;
 
-use super::{ApplicationCommand, PerformancePlanSummaryViewModel, ViewModelTone};
+use super::{ApplicationCommand, PerformancePlanSummaryViewModel, ViewModelAction, ViewModelTone};
 use crate::guardian::{
     GuardianFact, performance_failure_memory_guardian_fact, performance_rules_guardian_facts,
 };
-use crate::observability::evidence_text_looks_sensitive;
+use crate::observability::{
+    RedactionAudience, bounded_descriptor_token, evidence_text_looks_sensitive,
+    sanitize_evidence_token,
+};
 use crate::state::{
     AppState,
     contracts::{
@@ -23,26 +29,60 @@ use crate::state::{
 use axum::{Json, http::StatusCode};
 use croopor_performance::{
     BundleHealth, CompositionPlan, CompositionTier, PerformanceMode, PerformanceRulesStatus,
-    RulesRefreshError,
+    RuleChannel, RuleSource, RulesRefreshError, RulesValidation,
 };
 use serde::Serialize;
 use thiserror::Error;
 
+pub(crate) use benchmark_matrix::{
+    BenchmarkMatrix, BenchmarkSuiteRunSpec, benchmark_matrix, benchmark_suite_manifest_run_inputs,
+    benchmark_suite_plan, benchmark_suite_run_descriptor, benchmark_suite_run_id,
+};
+pub use host::{SystemResourceResponse, system_resource_status};
+#[cfg(test)]
+pub(crate) use qualification::{
+    FAMILY_C_BASELINE_TARGET_ID, FAMILY_C_MANAGED_COMPOSITION_ID, FAMILY_C_MANAGED_TARGET_ID,
+    FAMILY_C_QUALIFICATION_VERSION,
+};
+pub(crate) use qualification::{
+    FAMILY_C_QUALIFICATION_MODE, family_c_qualification_payload,
+    family_c_qualification_preview_payload,
+};
 pub use workflow::{
     PerformanceHealthRequest, PerformanceHealthResponse, PerformanceInstallRequest,
     PerformanceInstallResponse, PerformanceInstanceDisplay, PerformanceInstanceOperationResponse,
     PerformanceManagedArtifactSummary, PerformanceMemoryDisplay, PerformanceModeDisplay,
-    PerformancePlanRequest, PerformancePlanResponse, PerformanceRollbackListRequest,
-    PerformanceRollbackListResponse, PerformanceRuntimeDisplay, performance_health,
-    performance_install, performance_instance_operation, performance_operation_status,
-    performance_plan, performance_rollback_list, spawn_pending_performance_operations,
+    PerformanceOperationStatusResponse, PerformancePlanRequest, PerformancePlanResponse,
+    PerformanceRollbackListRequest, PerformanceRollbackListResponse, PerformanceRuntimeDisplay,
+    performance_health, performance_install, performance_instance_operation,
+    performance_operation_status, performance_plan, performance_rollback_list,
+    spawn_pending_performance_operations,
 };
 
 #[derive(Debug, Serialize)]
 pub struct PerformanceRulesStatusResponse {
     #[serde(flatten)]
     pub status: PerformanceRulesStatus,
+    pub view_model: PerformanceRulesStatusViewModel,
     pub guardian_facts: Vec<GuardianFact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PerformanceRulesStatusViewModel {
+    pub source_label: String,
+    pub channel_label: String,
+    pub validation_label: String,
+    pub validation_tone: ViewModelTone,
+    pub validation_icon: String,
+    pub summary: String,
+    pub refresh_label: String,
+    pub generated_label: String,
+    pub cache_label: String,
+    pub emergency_disable_label: String,
+    pub details_label: String,
+    pub health_states_label: String,
+    pub ownership_label: String,
+    pub warnings: Vec<String>,
 }
 
 pub fn performance_plan_summary_view_model(
@@ -50,6 +90,7 @@ pub fn performance_plan_summary_view_model(
     plan: Option<&CompositionPlan>,
     health: BundleHealth,
     health_tier: Option<CompositionTier>,
+    rollback: RollbackState,
     managed_artifact_count: usize,
     warnings: &[String],
 ) -> PerformancePlanSummaryViewModel {
@@ -60,7 +101,8 @@ pub fn performance_plan_summary_view_model(
             detail: "Memory allocation and Java detection are shown below.".to_string(),
             tone: ViewModelTone::Mute,
             health: Some(bundle_health_token(health).to_string()),
-            composition_id: plan.map(|plan| plan.composition_id.clone()),
+            composition_id: plan
+                .map(|plan| public_performance_descriptor(&plan.composition_id, "composition")),
             managed_artifact_count,
             actions: Vec::new(),
         };
@@ -79,7 +121,7 @@ pub fn performance_plan_summary_view_model(
             health: Some(bundle_health_token(health).to_string()),
             composition_id: None,
             managed_artifact_count,
-            actions: Vec::new(),
+            actions: performance_summary_actions(mode, health, rollback),
         };
     }
 
@@ -92,7 +134,7 @@ pub fn performance_plan_summary_view_model(
             health: Some(bundle_health_token(health).to_string()),
             composition_id: None,
             managed_artifact_count,
-            actions: Vec::new(),
+            actions: performance_summary_actions(mode, health, rollback),
         };
     };
 
@@ -139,9 +181,12 @@ pub fn performance_plan_summary_view_model(
             }),
             tone: health_view_tone(health),
             health: Some(bundle_health_token(health).to_string()),
-            composition_id: Some(plan.composition_id.clone()),
+            composition_id: Some(public_performance_descriptor(
+                &plan.composition_id,
+                "composition",
+            )),
             managed_artifact_count,
-            actions: Vec::new(),
+            actions: performance_summary_actions(mode, health, rollback),
         };
     }
 
@@ -155,9 +200,12 @@ pub fn performance_plan_summary_view_model(
             }),
             tone: health_view_tone(health),
             health: Some(bundle_health_token(health).to_string()),
-            composition_id: Some(plan.composition_id.clone()),
+            composition_id: Some(public_performance_descriptor(
+                &plan.composition_id,
+                "composition",
+            )),
             managed_artifact_count,
-            actions: Vec::new(),
+            actions: performance_summary_actions(mode, health, rollback),
         };
     }
 
@@ -175,9 +223,72 @@ pub fn performance_plan_summary_view_model(
         }),
         tone: health_view_tone(health),
         health: Some(bundle_health_token(health).to_string()),
-        composition_id: Some(plan.composition_id.clone()),
+        composition_id: Some(public_performance_descriptor(
+            &plan.composition_id,
+            "composition",
+        )),
         managed_artifact_count,
-        actions: Vec::new(),
+        actions: performance_summary_actions(mode, health, rollback),
+    }
+}
+
+pub(super) fn public_performance_descriptor(value: &str, fallback: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        fallback.to_string()
+    } else {
+        bounded_descriptor_token(value, fallback)
+    }
+}
+
+fn performance_summary_actions(
+    mode: PerformanceMode,
+    health: BundleHealth,
+    rollback: RollbackState,
+) -> Vec<ViewModelAction> {
+    if !matches!(mode, PerformanceMode::Managed) || matches!(health, BundleHealth::Disabled) {
+        return Vec::new();
+    }
+
+    let install_disabled_reason = matches!(health, BundleHealth::Invalid)
+        .then(|| "Managed performance state needs repair before this action can run.".to_string());
+    let install_label = match health {
+        BundleHealth::Healthy => "Reapply managed bundle",
+        BundleHealth::Degraded | BundleHealth::Fallback | BundleHealth::Invalid => {
+            "Repair managed bundle"
+        }
+        BundleHealth::Disabled => "Apply managed bundle",
+    };
+    let mut actions = vec![performance_view_action(
+        "install",
+        install_label,
+        install_disabled_reason.is_none(),
+        install_disabled_reason,
+    )];
+
+    let rollback_enabled = matches!(rollback, RollbackState::Available);
+    actions.push(performance_view_action(
+        "rollback",
+        "Rollback managed bundle",
+        rollback_enabled,
+        (!rollback_enabled).then(|| "No rollback snapshot is available.".to_string()),
+    ));
+
+    actions
+}
+
+fn performance_view_action(
+    action: &str,
+    label: &str,
+    enabled: bool,
+    disabled_reason: Option<String>,
+) -> ViewModelAction {
+    ViewModelAction {
+        command: CommandKind::ApplyPerformancePlan,
+        action: Some(action.to_string()),
+        label: label.to_string(),
+        enabled,
+        disabled_reason,
     }
 }
 
@@ -312,11 +423,13 @@ async fn handle_refresh_performance_rules(
     entry.targets = refresh_rules_targets();
     state.journals().create(entry);
 
+    let before = state.performance().rules_status();
     match state.performance().refresh_rules().await {
         Ok(status) => {
+            let cache_changed = performance_rules_cache_changed(&before, &status);
             state.journals().record_success(
                 &operation_id,
-                refresh_rules_step(OperationStepResult::Completed),
+                refresh_rules_step_with_cache_change(OperationStepResult::Completed, cache_changed),
                 OperationOutcome::Succeeded,
             );
             Ok(performance_rules_status_response(state, status))
@@ -342,14 +455,182 @@ fn performance_rules_status_response(
 }
 
 fn performance_rules_status_response_from_memory<'a>(
-    status: PerformanceRulesStatus,
+    mut status: PerformanceRulesStatus,
     failure_memory: impl IntoIterator<Item = &'a GuardianFailureMemoryEntry>,
 ) -> PerformanceRulesStatusResponse {
+    sanitize_performance_rules_status(&mut status);
     let mut guardian_facts = performance_rules_guardian_facts(&status, OperationPhase::Validating);
     guardian_facts.extend(performance_rules_failure_memory_facts(failure_memory));
+    let view_model = performance_rules_status_view_model(&status);
     PerformanceRulesStatusResponse {
         status,
+        view_model,
         guardian_facts,
+    }
+}
+
+fn sanitize_performance_rules_status(status: &mut PerformanceRulesStatus) {
+    status.warnings = public_rules_warnings(&status.warnings);
+    status.rules_cache.warning = status
+        .rules_cache
+        .warning
+        .as_deref()
+        .and_then(public_rules_warning);
+    for coverage in &mut status.family_coverage {
+        coverage.warnings = public_rules_warnings(&coverage.warnings);
+    }
+}
+
+fn public_rules_warnings(warnings: &[String]) -> Vec<String> {
+    warnings
+        .iter()
+        .filter_map(|warning| public_rules_warning(warning))
+        .collect()
+}
+
+fn public_rules_warning(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        None
+    } else if evidence_text_looks_sensitive(raw) {
+        Some("Performance rule diagnostics are unavailable.".to_string())
+    } else {
+        Some(raw.to_string())
+    }
+}
+
+fn performance_rules_status_view_model(
+    status: &PerformanceRulesStatus,
+) -> PerformanceRulesStatusViewModel {
+    let validation_valid = status.validation == RulesValidation::Valid;
+    let warnings = public_rules_warnings(&status.warnings);
+    PerformanceRulesStatusViewModel {
+        source_label: performance_rule_source_label(status.rule_source).to_string(),
+        channel_label: performance_rule_channel_label(status.rule_channel).to_string(),
+        validation_label: if validation_valid { "Valid" } else { "Invalid" }.to_string(),
+        validation_tone: if validation_valid {
+            ViewModelTone::Ok
+        } else {
+            ViewModelTone::Err
+        },
+        validation_icon: if validation_valid { "check" } else { "alert" }.to_string(),
+        summary: if validation_valid {
+            "Managed performance defaults are ready.".to_string()
+        } else {
+            "Managed performance rules need attention.".to_string()
+        },
+        refresh_label: performance_rules_refresh_label(status),
+        generated_label: public_performance_timestamp(&status.generated_at, "generated_at"),
+        cache_label: performance_rules_cache_label(status).to_string(),
+        emergency_disable_label: performance_rules_emergency_disable_label(status),
+        details_label: performance_rules_details_label(warnings.len()),
+        health_states_label: status
+            .health_states
+            .iter()
+            .map(|health| performance_rules_health_label(*health))
+            .collect::<Vec<_>>()
+            .join(", "),
+        ownership_label: status
+            .ownership_classes
+            .iter()
+            .map(|ownership| performance_rules_ownership_label(*ownership))
+            .collect::<Vec<_>>()
+            .join(", "),
+        warnings,
+    }
+}
+
+fn performance_rule_source_label(source: RuleSource) -> &'static str {
+    match source {
+        RuleSource::BuiltIn => "Built-in rules",
+        RuleSource::Remote => "Remote rules",
+    }
+}
+
+fn performance_rule_channel_label(channel: RuleChannel) -> &'static str {
+    match channel {
+        RuleChannel::Bundled => "Bundled manifest",
+        RuleChannel::Local => "Local cache",
+        RuleChannel::Remote => "Remote manifest",
+    }
+}
+
+fn performance_rules_refresh_label(status: &PerformanceRulesStatus) -> String {
+    if !status.remote_refresh {
+        return "Remote refresh off".to_string();
+    }
+    status
+        .last_refresh_at
+        .as_deref()
+        .map(|value| {
+            format!(
+                "Last refreshed {}",
+                public_performance_timestamp(value, "refresh_time")
+            )
+        })
+        .unwrap_or_else(|| "Remote refresh configured, not refreshed yet".to_string())
+}
+
+fn public_performance_timestamp(value: &str, fallback: &str) -> String {
+    sanitize_evidence_token(value, RedactionAudience::UserVisible, 64)
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn performance_rules_cache_label(status: &PerformanceRulesStatus) -> &'static str {
+    if status.rules_cache.state == croopor_performance::RulesCacheState::Invalid {
+        "Invalid local cache"
+    } else if !status.rules_cache.recorded {
+        "Unavailable"
+    } else {
+        "Recorded locally"
+    }
+}
+
+fn performance_rules_emergency_disable_label(status: &PerformanceRulesStatus) -> String {
+    let count = status
+        .emergency_disable_count
+        .max(status.emergency_disables.len());
+    if count == 0 {
+        return "None active".to_string();
+    }
+    let prefix = format!("{count} active");
+    let Some(reason) = status
+        .emergency_disables
+        .first()
+        .and_then(|disable| public_rules_warning(&disable.reason))
+    else {
+        return prefix;
+    };
+    format!("{prefix}: {reason}")
+}
+
+fn performance_rules_details_label(warning_count: usize) -> String {
+    if warning_count == 0 {
+        "Rule details".to_string()
+    } else {
+        format!(
+            "Rule details, {warning_count} warning{}",
+            if warning_count == 1 { "" } else { "s" }
+        )
+    }
+}
+
+fn performance_rules_health_label(health: BundleHealth) -> &'static str {
+    match health {
+        BundleHealth::Healthy => "Healthy",
+        BundleHealth::Degraded => "Degraded",
+        BundleHealth::Fallback => "Fallback",
+        BundleHealth::Disabled => "Disabled",
+        BundleHealth::Invalid => "Invalid",
+    }
+}
+
+fn performance_rules_ownership_label(
+    ownership: croopor_performance::OwnershipClass,
+) -> &'static str {
+    match ownership {
+        croopor_performance::OwnershipClass::CompositionManaged => "Croopor-managed",
+        croopor_performance::OwnershipClass::UserManaged => "User-managed",
     }
 }
 
@@ -372,9 +653,16 @@ fn new_refresh_rules_operation_id() -> OperationId {
 }
 
 fn refresh_rules_step(result: OperationStepResult) -> OperationJournalStep {
+    refresh_rules_step_with_cache_change(result, result == OperationStepResult::Completed)
+}
+
+fn refresh_rules_step_with_cache_change(
+    result: OperationStepResult,
+    cache_changed: bool,
+) -> OperationJournalStep {
     let mut step = OperationJournalStep::new("refresh_remote_rules", OperationPhase::Running);
     step.result = result;
-    if result == OperationStepResult::Completed {
+    if result == OperationStepResult::Completed && cache_changed {
         step.changed_target = Some(
             classify_current_artifact(
                 CurrentArtifact::PerformanceRulesCache,
@@ -384,6 +672,16 @@ fn refresh_rules_step(result: OperationStepResult) -> OperationJournalStep {
         );
     }
     step
+}
+
+fn performance_rules_cache_changed(
+    before: &PerformanceRulesStatus,
+    after: &PerformanceRulesStatus,
+) -> bool {
+    before.rule_source != after.rule_source
+        || before.rule_channel != after.rule_channel
+        || before.generated_at != after.generated_at
+        || before.last_refresh_at != after.last_refresh_at
 }
 
 fn refresh_rules_targets() -> Vec<TargetDescriptor> {
@@ -428,7 +726,9 @@ mod tests {
     };
     use crate::guardian::{DiagnosisId, GuardianDomain, GuardianMode};
     use crate::state::{
-        contracts::{OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind},
+        contracts::{
+            OwnershipClass, RollbackState, StabilizationSystem, TargetDescriptor, TargetKind,
+        },
         failure_memory::GuardianFailureMemoryEntry,
     };
     use croopor_performance::{
@@ -453,6 +753,7 @@ mod tests {
             Some(&plan),
             BundleHealth::Healthy,
             Some(CompositionTier::Core),
+            RollbackState::Unavailable,
             1,
             &[],
         );
@@ -465,6 +766,16 @@ mod tests {
         );
         assert_eq!(summary.tone, ViewModelTone::Ok);
         assert_eq!(summary.managed_artifact_count, 1);
+        assert!(summary.actions.iter().any(|action| {
+            action.action.as_deref() == Some("install")
+                && action.label == "Reapply managed bundle"
+                && action.enabled
+        }));
+        assert!(summary.actions.iter().any(|action| {
+            action.action.as_deref() == Some("rollback")
+                && !action.enabled
+                && action.disabled_reason.as_deref() == Some("No rollback snapshot is available.")
+        }));
     }
 
     #[test]
@@ -482,6 +793,7 @@ mod tests {
             Some(&plan),
             BundleHealth::Fallback,
             Some(CompositionTier::VanillaEnhanced),
+            RollbackState::Available,
             0,
             &[],
         );
@@ -493,6 +805,12 @@ mod tests {
             "A faster performance bundle is not compatible with this instance, so Croopor chose a safer option."
         );
         assert_eq!(summary.tone, ViewModelTone::Warn);
+        assert!(
+            summary
+                .actions
+                .iter()
+                .any(|action| { action.action.as_deref() == Some("rollback") && action.enabled })
+        );
     }
 
     #[test]
@@ -506,6 +824,7 @@ mod tests {
             None,
             BundleHealth::Invalid,
             None,
+            RollbackState::Unavailable,
             0,
             &warnings,
         );
@@ -514,6 +833,45 @@ mod tests {
         assert_eq!(summary.detail, "Managed performance state needs attention.");
         assert!(!summary.detail.contains("Alice"));
         assert!(!summary.detail.contains("-Xmx"));
+        assert!(summary.actions.iter().any(|action| {
+            action.action.as_deref() == Some("install")
+                && !action.enabled
+                && action.disabled_reason.as_deref()
+                    == Some("Managed performance state needs repair before this action can run.")
+        }));
+    }
+
+    #[test]
+    fn performance_summary_view_model_bounds_public_composition_id() {
+        let raw_composition_id = r"C:\Users\Alice\.minecraft\mods\secret.jar";
+        let plan = test_plan(
+            raw_composition_id,
+            CompositionTier::Core,
+            vec![test_mod("sodium", "Sodium")],
+            "",
+            Vec::new(),
+        );
+
+        let summary = performance_plan_summary_view_model(
+            PerformanceMode::Managed,
+            Some(&plan),
+            BundleHealth::Healthy,
+            Some(CompositionTier::Core),
+            RollbackState::Available,
+            1,
+            &[],
+        );
+        let encoded = serde_json::to_string(&summary).expect("serialize summary");
+
+        assert_ne!(summary.composition_id.as_deref(), Some(raw_composition_id));
+        assert!(
+            summary
+                .composition_id
+                .as_deref()
+                .is_some_and(|value| value.starts_with("composition-"))
+        );
+        assert!(!encoded.contains("Alice"));
+        assert!(!encoded.contains(".minecraft"));
     }
 
     #[test]
@@ -535,6 +893,13 @@ mod tests {
         let response = performance_rules_status_response_from_memory(status, std::iter::empty());
 
         assert_eq!(response.status.validation, RulesValidation::Invalid);
+        assert_eq!(response.view_model.validation_label, "Invalid");
+        assert_eq!(response.view_model.validation_tone, ViewModelTone::Err);
+        assert_eq!(
+            response.view_model.summary,
+            "Managed performance rules need attention."
+        );
+        assert_eq!(response.view_model.cache_label, "Invalid local cache");
         let fact = response
             .guardian_facts
             .iter()
@@ -544,6 +909,50 @@ mod tests {
             fact.target.as_ref().map(|target| target.id.as_str()),
             Some("performance_rules_remote_source")
         );
+    }
+
+    #[test]
+    fn performance_rules_status_response_bounds_public_warnings_and_view_model_copy() {
+        let manifest = builtin_manifest().expect("builtin manifest");
+        let mut cache = RulesCacheStatus::unavailable();
+        cache.state = RulesCacheState::Invalid;
+        cache.warning =
+            Some(r"C:\Users\Alice\.minecraft\performance.json?api_token=secret".to_string());
+        let status = rules_status_for(
+            &manifest,
+            RuleSource::Remote,
+            RuleChannel::Remote,
+            cache,
+            true,
+            Some("2026-06-15T12:00:00Z".to_string()),
+            RulesValidation::Invalid,
+        );
+
+        let response = performance_rules_status_response_from_memory(status, std::iter::empty());
+        let encoded = serde_json::to_string(&response).expect("serialize status");
+
+        assert_eq!(
+            response.status.warnings,
+            vec!["Performance rule diagnostics are unavailable.".to_string()]
+        );
+        assert_eq!(
+            response.status.rules_cache.warning.as_deref(),
+            Some("Performance rule diagnostics are unavailable.")
+        );
+        assert_eq!(
+            response.view_model.warnings,
+            vec!["Performance rule diagnostics are unavailable.".to_string()]
+        );
+        assert_eq!(response.view_model.source_label, "Remote rules");
+        assert_eq!(response.view_model.channel_label, "Remote manifest");
+        assert_eq!(
+            response.view_model.refresh_label,
+            "Last refreshed 2026-06-15T12:00:00Z"
+        );
+        assert!(response.view_model.details_label.contains("1 warning"));
+        for forbidden in ["Alice", ".minecraft", "api_token", "secret"] {
+            assert!(!encoded.contains(forbidden), "{forbidden}");
+        }
     }
 
     #[test]

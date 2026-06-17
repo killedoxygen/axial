@@ -1,6 +1,6 @@
 use super::{
-    DiagnosisId, GuardianAction, GuardianActionKind, GuardianActionPlan, GuardianConfidence,
-    GuardianDecision, GuardianDecisionKind, GuardianDomain, GuardianMode,
+    DiagnosisId, GuardianActionKind, GuardianDomain, GuardianMode, GuardianRepairExecutor,
+    GuardianRepairMutation, GuardianRepairPlan, GuardianRepairTask, GuardianRepairTaskKind,
 };
 use crate::execution::ExecutionFact;
 use crate::execution::runtime::{
@@ -26,7 +26,9 @@ const READY_MARKER_REPAIR_MAX_ATTEMPTS: u32 = 1;
 const DEFAULT_REPAIR_SUPPRESSION_MINUTES: i64 = 15;
 
 pub struct GuardianManagedRuntimeRepairRequest<'a> {
-    pub decision: &'a GuardianDecision,
+    pub operation_id: Option<OperationId>,
+    pub mode: GuardianMode,
+    pub plan: &'a GuardianRepairPlan,
     pub runtime_root: ManagedRuntimeRoot<'a>,
     pub journals: &'a OperationJournalStore,
     pub failure_memory: &'a GuardianFailureMemoryStore,
@@ -57,63 +59,32 @@ pub fn execute_managed_runtime_ready_marker_repair(
     request: GuardianManagedRuntimeRepairRequest<'_>,
 ) -> GuardianRepairOutcome {
     let operation_id = request
-        .decision
         .operation_id
         .as_ref()
         .map(safe_operation_id)
         .unwrap_or_else(new_repair_operation_id);
     let runtime_root_target = public_safe_target(request.runtime_root.target());
-
-    let Some(plan) = request.decision.action_plan.as_ref() else {
+    let plan = request.plan;
+    let Some(action) = runtime_ready_marker_repair_task(plan) else {
         return repair_outcome(
             operation_id,
+            Some(plan.diagnosis_id.clone()),
             None,
-            None,
-            GuardianRepairStatus::NotNeeded,
-            Vec::new(),
-            "guardian_repair_not_needed",
-        );
-    };
-
-    let Some(action) = plan
-        .actions
-        .iter()
-        .find(|action| action.kind == GuardianActionKind::Repair)
-    else {
-        return repair_outcome(
-            operation_id,
-            Some(plan.prerequisite.diagnosis_id.clone()),
-            None,
-            GuardianRepairStatus::NotNeeded,
-            Vec::new(),
-            "guardian_repair_not_needed",
-        );
-    };
-
-    let Some(target) = action
-        .target
-        .as_ref()
-        .or_else(|| plan.prerequisite.affected_targets.first())
-        .map(public_safe_target)
-    else {
-        return repair_outcome(
-            operation_id,
-            Some(plan.prerequisite.diagnosis_id.clone()),
-            Some(action.kind),
             GuardianRepairStatus::Blocked,
             Vec::new(),
-            "guardian_repair_blocked_missing_target",
+            "guardian_repair_blocked_by_policy",
         );
     };
 
-    if let Some(block_reason) = repair_policy_block_reason(request.decision, plan, action, &target)
-    {
+    let target = public_safe_target(&plan.target);
+
+    if let Some(block_reason) = repair_plan_block_reason(request.mode, plan, &target) {
         record_repair_memory(
             request.failure_memory,
-            &plan.prerequisite.diagnosis_id,
-            request.decision.mode,
+            &plan.diagnosis_id,
+            request.mode,
             &target,
-            action.kind,
+            action.action,
             FailureMemoryActionOutcome::Blocked,
             request.observed_at,
             None,
@@ -122,7 +93,7 @@ pub fn execute_managed_runtime_ready_marker_repair(
         create_terminal_journal(
             request.journals,
             &operation_id,
-            &plan.prerequisite.diagnosis_id,
+            &plan.diagnosis_id,
             &target,
             OperationStatus::Blocked,
             OperationOutcome::Blocked,
@@ -131,8 +102,8 @@ pub fn execute_managed_runtime_ready_marker_repair(
         );
         return repair_outcome(
             operation_id,
-            Some(plan.prerequisite.diagnosis_id.clone()),
-            Some(action.kind),
+            Some(plan.diagnosis_id.clone()),
+            Some(action.action),
             GuardianRepairStatus::Blocked,
             Vec::new(),
             block_reason,
@@ -145,10 +116,10 @@ pub fn execute_managed_runtime_ready_marker_repair(
     ) {
         record_repair_memory(
             request.failure_memory,
-            &plan.prerequisite.diagnosis_id,
-            request.decision.mode,
+            &plan.diagnosis_id,
+            request.mode,
             &target,
-            action.kind,
+            action.action,
             FailureMemoryActionOutcome::Blocked,
             request.observed_at,
             None,
@@ -157,7 +128,7 @@ pub fn execute_managed_runtime_ready_marker_repair(
         create_terminal_journal(
             request.journals,
             &operation_id,
-            &plan.prerequisite.diagnosis_id,
+            &plan.diagnosis_id,
             &target,
             OperationStatus::Blocked,
             OperationOutcome::Blocked,
@@ -166,8 +137,8 @@ pub fn execute_managed_runtime_ready_marker_repair(
         );
         return repair_outcome(
             operation_id,
-            Some(plan.prerequisite.diagnosis_id.clone()),
-            Some(action.kind),
+            Some(plan.diagnosis_id.clone()),
+            Some(action.action),
             GuardianRepairStatus::Blocked,
             Vec::new(),
             "guardian_repair_blocked_by_ownership",
@@ -180,10 +151,10 @@ pub fn execute_managed_runtime_ready_marker_repair(
     {
         record_repair_memory(
             request.failure_memory,
-            &plan.prerequisite.diagnosis_id,
-            request.decision.mode,
+            &plan.diagnosis_id,
+            request.mode,
             &target,
-            action.kind,
+            action.action,
             FailureMemoryActionOutcome::Blocked,
             request.observed_at,
             None,
@@ -192,7 +163,7 @@ pub fn execute_managed_runtime_ready_marker_repair(
         create_terminal_journal(
             request.journals,
             &operation_id,
-            &plan.prerequisite.diagnosis_id,
+            &plan.diagnosis_id,
             &target,
             OperationStatus::Blocked,
             OperationOutcome::Blocked,
@@ -201,8 +172,8 @@ pub fn execute_managed_runtime_ready_marker_repair(
         );
         return repair_outcome(
             operation_id,
-            Some(plan.prerequisite.diagnosis_id.clone()),
-            Some(action.kind),
+            Some(plan.diagnosis_id.clone()),
+            Some(action.action),
             GuardianRepairStatus::Blocked,
             Vec::new(),
             "guardian_repair_blocked_unsupported_target",
@@ -211,35 +182,31 @@ pub fn execute_managed_runtime_ready_marker_repair(
 
     let memory_key = FailureMemoryKey::for_observation(
         GuardianDomain::Runtime,
-        &plan.prerequisite.diagnosis_id,
+        &plan.diagnosis_id,
         &target,
-        request.decision.mode,
+        request.mode,
         None,
     );
-    if let Some(entry) = request.failure_memory.get(&memory_key)
-        && (suppression_active(&entry, request.observed_at)
-            || entry.repair_attempt_count >= READY_MARKER_REPAIR_MAX_ATTEMPTS)
+    if let Some(suppression_until) = request
+        .failure_memory
+        .get(&memory_key)
+        .and_then(|entry| runtime_repair_suppression_until(&entry, request.observed_at))
     {
-        let default_suppression_until = default_suppression_until(request.observed_at);
-        let suppression_until = entry
-            .suppression_until
-            .as_deref()
-            .or(default_suppression_until.as_deref());
         record_repair_memory(
             request.failure_memory,
-            &plan.prerequisite.diagnosis_id,
-            request.decision.mode,
+            &plan.diagnosis_id,
+            request.mode,
             &target,
-            action.kind,
+            action.action,
             FailureMemoryActionOutcome::Suppressed,
             request.observed_at,
-            suppression_until,
+            Some(suppression_until.as_str()),
             false,
         );
         create_terminal_journal(
             request.journals,
             &operation_id,
-            &plan.prerequisite.diagnosis_id,
+            &plan.diagnosis_id,
             &target,
             OperationStatus::Blocked,
             OperationOutcome::Suppressed,
@@ -248,20 +215,15 @@ pub fn execute_managed_runtime_ready_marker_repair(
         );
         return repair_outcome(
             operation_id,
-            Some(plan.prerequisite.diagnosis_id.clone()),
-            Some(action.kind),
+            Some(plan.diagnosis_id.clone()),
+            Some(action.action),
             GuardianRepairStatus::Suppressed,
             Vec::new(),
             "guardian_repair_suppressed",
         );
     }
 
-    create_planned_journal(
-        request.journals,
-        &operation_id,
-        &plan.prerequisite.diagnosis_id,
-        &target,
-    );
+    create_planned_journal(request.journals, &operation_id, &plan.diagnosis_id, &target);
 
     match repair_managed_runtime(ManagedRuntimeRepairRequest {
         operation_id: Some(operation_id.clone()),
@@ -283,10 +245,10 @@ pub fn execute_managed_runtime_ready_marker_repair(
             );
             record_repair_memory(
                 request.failure_memory,
-                &plan.prerequisite.diagnosis_id,
-                request.decision.mode,
+                &plan.diagnosis_id,
+                request.mode,
                 &target,
-                action.kind,
+                action.action,
                 FailureMemoryActionOutcome::Repaired,
                 request.observed_at,
                 default_suppression_until.as_deref(),
@@ -294,8 +256,8 @@ pub fn execute_managed_runtime_ready_marker_repair(
             );
             repair_outcome(
                 operation_id,
-                Some(plan.prerequisite.diagnosis_id.clone()),
-                Some(action.kind),
+                Some(plan.diagnosis_id.clone()),
+                Some(action.action),
                 GuardianRepairStatus::Repaired,
                 fact_ids,
                 "managed_runtime_ready_marker_repaired",
@@ -319,10 +281,10 @@ pub fn execute_managed_runtime_ready_marker_repair(
             );
             record_repair_memory(
                 request.failure_memory,
-                &plan.prerequisite.diagnosis_id,
-                request.decision.mode,
+                &plan.diagnosis_id,
+                request.mode,
                 &target,
-                action.kind,
+                action.action,
                 FailureMemoryActionOutcome::Failed,
                 request.observed_at,
                 suppression_until,
@@ -330,8 +292,8 @@ pub fn execute_managed_runtime_ready_marker_repair(
             );
             repair_outcome(
                 operation_id,
-                Some(plan.prerequisite.diagnosis_id.clone()),
-                Some(action.kind),
+                Some(plan.diagnosis_id.clone()),
+                Some(action.action),
                 GuardianRepairStatus::Failed,
                 fact_ids,
                 "managed_runtime_ready_marker_repair_failed",
@@ -456,6 +418,21 @@ fn suppression_active(entry: &GuardianFailureMemoryEntry, now: &str) -> bool {
     suppression_until > now
 }
 
+fn runtime_repair_suppression_until(
+    entry: &GuardianFailureMemoryEntry,
+    now: &str,
+) -> Option<String> {
+    if suppression_active(entry, now) {
+        return entry.suppression_until.clone();
+    }
+    if entry.repair_attempt_count >= READY_MARKER_REPAIR_MAX_ATTEMPTS
+        && entry.suppression_until.is_none()
+    {
+        return default_suppression_until(now);
+    }
+    None
+}
+
 fn fact_ids(facts: &[ExecutionFact]) -> Vec<String> {
     facts
         .iter()
@@ -482,54 +459,49 @@ fn repair_outcome(
     }
 }
 
-fn repair_policy_block_reason(
-    decision: &GuardianDecision,
-    plan: &GuardianActionPlan,
-    action: &GuardianAction,
+fn runtime_ready_marker_repair_task(plan: &GuardianRepairPlan) -> Option<&GuardianRepairTask> {
+    plan.tasks.iter().find(|task| {
+        task.kind == GuardianRepairTaskKind::RecreateManagedRuntimeReadyMarker
+            && task.action == GuardianActionKind::Repair
+            && task.executor == GuardianRepairExecutor::ExecutionRuntimeRepair
+            && task.mutation == GuardianRepairMutation::RecreateManagedRuntimeReadyMarker
+    })
+}
+
+fn repair_plan_block_reason(
+    mode: GuardianMode,
+    plan: &GuardianRepairPlan,
     target: &TargetDescriptor,
 ) -> Option<&'static str> {
-    if decision.kind != GuardianDecisionKind::Repair || decision.mode == GuardianMode::Disabled {
+    if mode == GuardianMode::Disabled {
         return Some("guardian_repair_blocked_by_policy");
     }
-    if plan.owner != StabilizationSystem::Guardian {
+    if plan.diagnosis_id.as_str() != "managed_runtime_corrupt" {
         return Some("guardian_repair_blocked_by_policy");
     }
-    if !decision.diagnoses.contains(&plan.prerequisite.diagnosis_id) {
-        return Some("guardian_repair_blocked_by_policy");
-    }
-    if !repair_confidence_is_sufficient(plan.prerequisite.confidence) {
-        return Some("guardian_repair_blocked_by_confidence");
-    }
-    if !plan
-        .prerequisite
-        .candidate_actions
-        .contains(&GuardianActionKind::Repair)
-    {
-        return Some("guardian_repair_blocked_by_policy");
-    }
-    if action.reason != plan.prerequisite.diagnosis_id {
-        return Some("guardian_repair_blocked_by_policy");
-    }
-    if plan.prerequisite.ownership != target.ownership {
+    if plan.ownership != target.ownership {
         return Some("guardian_repair_blocked_by_policy");
     }
     if !plan
-        .prerequisite
-        .affected_targets
+        .tasks
         .iter()
-        .map(public_safe_target)
-        .any(|affected| affected == *target)
+        .any(|task| task.target == *target && task.ownership == target.ownership)
     {
+        return Some("guardian_repair_blocked_by_policy");
+    }
+    if !plan.tasks.iter().any(|task| {
+        task.kind == GuardianRepairTaskKind::JournalRepairStart
+            && task.executor == GuardianRepairExecutor::StateJournal
+    }) {
+        return Some("guardian_repair_blocked_by_policy");
+    }
+    if !plan.tasks.iter().any(|task| {
+        task.kind == GuardianRepairTaskKind::RecordRepairOutcome
+            && task.executor == GuardianRepairExecutor::GuardianOutcomeRecorder
+    }) {
         return Some("guardian_repair_blocked_by_policy");
     }
     None
-}
-
-fn repair_confidence_is_sufficient(confidence: GuardianConfidence) -> bool {
-    matches!(
-        confidence,
-        GuardianConfidence::Confirmed | GuardianConfidence::Certain
-    )
 }
 
 fn public_safe_target(target: &TargetDescriptor) -> TargetDescriptor {
@@ -575,13 +547,15 @@ fn new_repair_operation_id() -> OperationId {
 #[cfg(test)]
 mod tests {
     use super::{
-        GuardianManagedRuntimeRepairRequest, GuardianRepairStatus,
+        GuardianManagedRuntimeRepairRequest, GuardianRepairOutcome, GuardianRepairStatus,
         execute_managed_runtime_ready_marker_repair,
     };
     use crate::execution::runtime::{ManagedRuntimeRoot, ManagedRuntimeRootError};
     use crate::guardian::{
         ActionPlanPrerequisite, DiagnosisId, GuardianAction, GuardianActionKind,
         GuardianActionPlan, GuardianDecision, GuardianDecisionKind, GuardianMode,
+        GuardianRepairPlan, GuardianRepairPlanRejection, GuardianRepairPlanningContext,
+        plan_managed_runtime_ready_marker_repair,
     };
     use crate::state::OperationJournalStore;
     use crate::state::contracts::{
@@ -605,7 +579,7 @@ mod tests {
         let stores = stores();
         let decision = repair_decision(OwnershipClass::LauncherManaged);
 
-        let outcome = execute_managed_runtime_ready_marker_repair(request(
+        let outcome = execute_repair(
             &decision,
             &paths,
             &runtime_root,
@@ -613,7 +587,7 @@ mod tests {
             &stores,
             "2026-06-15T10:00:00Z",
             None,
-        ));
+        );
 
         assert_eq!(outcome.status, GuardianRepairStatus::Repaired);
         assert!(runtime_root.join(".croopor-ready").is_file());
@@ -680,7 +654,7 @@ mod tests {
             )
             .expect("memory record");
 
-        let outcome = execute_managed_runtime_ready_marker_repair(request(
+        let outcome = execute_repair(
             &decision,
             &paths,
             &runtime_root,
@@ -688,7 +662,7 @@ mod tests {
             &stores,
             "2026-06-15T10:05:00Z",
             None,
-        ));
+        );
 
         assert_eq!(outcome.status, GuardianRepairStatus::Suppressed);
         assert!(!runtime_root.join(".croopor-ready").exists());
@@ -726,28 +700,16 @@ mod tests {
             let root = test_root("ownership-rejected");
             let paths = test_paths(&root);
             let runtime_root = managed_runtime_root(&paths, "java_runtime_delta");
-            let java_executable = runtime_root.join("bin").join("java");
-            let stores = stores();
             let decision = repair_decision(ownership);
 
-            let outcome = execute_managed_runtime_ready_marker_repair(request(
+            let error = plan_managed_runtime_ready_marker_repair(
                 &decision,
-                &paths,
-                &runtime_root,
-                &java_executable,
-                &stores,
-                "2026-06-15T10:00:00Z",
-                None,
-            ));
+                GuardianRepairPlanningContext::current_operation(),
+            )
+            .expect_err("unsafe ownership rejects before execution");
 
-            assert_eq!(outcome.status, GuardianRepairStatus::Blocked);
+            assert_eq!(error, GuardianRepairPlanRejection::UnsafeOwnership);
             assert!(!runtime_root.join(".croopor-ready").exists());
-            let journal = stores
-                .journals
-                .get(&outcome.operation_id)
-                .expect("journal entry");
-            assert_eq!(journal.status, OperationStatus::Blocked);
-            assert_eq!(journal.outcome, Some(OperationOutcome::Blocked));
             cleanup(&root);
         }
     }
@@ -757,8 +719,6 @@ mod tests {
         let root = test_root("unsupported-target");
         let paths = test_paths(&root);
         let runtime_root = managed_runtime_root(&paths, "java_runtime_delta");
-        let java_executable = runtime_root.join("bin").join("java");
-        let stores = stores();
         let decision = repair_decision_for_target(TargetDescriptor::new(
             StabilizationSystem::Guardian,
             TargetKind::Runtime,
@@ -766,30 +726,14 @@ mod tests {
             OwnershipClass::LauncherManaged,
         ));
 
-        let outcome = execute_managed_runtime_ready_marker_repair(request(
+        let error = plan_managed_runtime_ready_marker_repair(
             &decision,
-            &paths,
-            &runtime_root,
-            &java_executable,
-            &stores,
-            "2026-06-15T10:00:00Z",
-            None,
-        ));
+            GuardianRepairPlanningContext::current_operation(),
+        )
+        .expect_err("unsupported target rejects before execution");
 
-        assert_eq!(outcome.status, GuardianRepairStatus::Blocked);
+        assert_eq!(error, GuardianRepairPlanRejection::UnsupportedDiagnosis);
         assert!(!runtime_root.join(".croopor-ready").exists());
-        let journal = stores
-            .journals
-            .get(&outcome.operation_id)
-            .expect("journal entry");
-        assert_eq!(journal.status, OperationStatus::Blocked);
-        assert_eq!(journal.outcome, Some(OperationOutcome::Blocked));
-        let memory = stores.failure_memory.list();
-        assert_eq!(memory.len(), 1);
-        assert_eq!(
-            memory[0].last_action_outcome,
-            Some(FailureMemoryActionOutcome::Blocked)
-        );
         cleanup(&root);
     }
 
@@ -802,7 +746,7 @@ mod tests {
         let stores = stores();
         let decision = repair_decision(OwnershipClass::LauncherManaged);
 
-        let outcome = execute_managed_runtime_ready_marker_repair(request(
+        let outcome = execute_repair(
             &decision,
             &paths,
             &runtime_root,
@@ -810,7 +754,7 @@ mod tests {
             &stores,
             "2026-06-15T10:00:00Z",
             None,
-        ));
+        );
 
         assert_eq!(outcome.status, GuardianRepairStatus::Blocked);
         assert!(!runtime_root.join(".croopor-ready").exists());
@@ -838,7 +782,7 @@ mod tests {
         let root = test_root("malformed-policy");
         let paths = test_paths(&root);
         let runtime_root = managed_runtime_root(&paths, "java_runtime_delta");
-        let java_executable = write_fake_java(&runtime_root);
+        write_fake_java(&runtime_root);
         for decision in [
             {
                 let mut decision = repair_decision(OwnershipClass::LauncherManaged);
@@ -868,18 +812,17 @@ mod tests {
             },
         ] {
             let _ = fs::remove_file(runtime_root.join(".croopor-ready"));
-            let stores = stores();
-            let outcome = execute_managed_runtime_ready_marker_repair(request(
+            let error = plan_managed_runtime_ready_marker_repair(
                 &decision,
-                &paths,
-                &runtime_root,
-                &java_executable,
-                &stores,
-                "2026-06-15T10:00:00Z",
-                None,
-            ));
+                GuardianRepairPlanningContext::current_operation(),
+            )
+            .expect_err("malformed policy rejects before execution");
 
-            assert_eq!(outcome.status, GuardianRepairStatus::Blocked);
+            assert!(matches!(
+                error,
+                GuardianRepairPlanRejection::NonRepairDecision
+                    | GuardianRepairPlanRejection::UnsupportedDiagnosis
+            ));
             assert!(!runtime_root.join(".croopor-ready").exists());
         }
 
@@ -915,7 +858,7 @@ mod tests {
             .expect("memory record");
 
         let _ = fs::remove_file(runtime_root.join(".croopor-ready"));
-        let outcome = execute_managed_runtime_ready_marker_repair(request(
+        let outcome = execute_repair(
             &decision,
             &paths,
             &runtime_root,
@@ -923,7 +866,7 @@ mod tests {
             &stores,
             "2026-06-15T10:00:00Z",
             None,
-        ));
+        );
 
         assert_eq!(outcome.status, GuardianRepairStatus::Suppressed);
         assert!(!runtime_root.join(".croopor-ready").exists());
@@ -938,6 +881,57 @@ mod tests {
     }
 
     #[test]
+    fn expired_runtime_repair_cooldown_allows_new_safe_attempt() {
+        let root = test_root("expired-attempt-limit");
+        let paths = test_paths(&root);
+        let runtime_root = managed_runtime_root(&paths, "java_runtime_delta");
+        let java_executable = write_fake_java(&runtime_root);
+        let stores = stores();
+        let decision = repair_decision(OwnershipClass::LauncherManaged);
+        let target = decision_target(&decision);
+        stores
+            .failure_memory
+            .record(
+                GuardianFailureMemoryEntry::observed(
+                    DiagnosisId::new("managed_runtime_corrupt"),
+                    crate::guardian::GuardianDomain::Runtime,
+                    target,
+                    GuardianMode::Managed,
+                    None,
+                    "2026-06-15T09:00:00Z",
+                )
+                .with_action(
+                    GuardianActionKind::Repair,
+                    FailureMemoryActionOutcome::Failed,
+                )
+                .with_repair_attempt()
+                .with_suppression_until("2026-06-15T09:30:00Z"),
+            )
+            .expect("memory record");
+
+        let _ = fs::remove_file(runtime_root.join(".croopor-ready"));
+        let outcome = execute_repair(
+            &decision,
+            &paths,
+            &runtime_root,
+            &java_executable,
+            &stores,
+            "2026-06-15T10:00:00Z",
+            None,
+        );
+
+        assert_eq!(outcome.status, GuardianRepairStatus::Repaired);
+        assert!(runtime_root.join(".croopor-ready").exists());
+        let memory = stores.failure_memory.list();
+        assert_eq!(
+            memory[0].last_action_outcome,
+            Some(FailureMemoryActionOutcome::Repaired)
+        );
+        assert_eq!(memory[0].repair_attempt_count, 2);
+        cleanup(&root);
+    }
+
+    #[test]
     fn post_repair_verification_failure_is_not_reported_as_repaired() {
         let root = test_root("postcondition-failure");
         let paths = test_paths(&root);
@@ -946,7 +940,7 @@ mod tests {
         let stores = stores();
         let decision = repair_decision(OwnershipClass::LauncherManaged);
 
-        let outcome = execute_managed_runtime_ready_marker_repair(request(
+        let outcome = execute_repair(
             &decision,
             &paths,
             &runtime_root,
@@ -954,7 +948,7 @@ mod tests {
             &stores,
             "2026-06-15T10:00:00Z",
             None,
-        ));
+        );
 
         assert_eq!(outcome.status, GuardianRepairStatus::Failed);
         assert!(runtime_root.join(".croopor-ready").is_file());
@@ -987,14 +981,9 @@ mod tests {
         let java_executable = write_fake_java(&runtime_root);
         let stores = stores();
         let mut decision = repair_decision(OwnershipClass::LauncherManaged);
-        let unsafe_diagnosis = DiagnosisId::new("/home/alice/token/diagnosis");
         decision.operation_id = Some(OperationId::new("/home/alice/token/operation"));
-        decision.diagnoses = vec![unsafe_diagnosis.clone()];
-        let plan = decision.action_plan.as_mut().expect("plan");
-        plan.prerequisite.diagnosis_id = unsafe_diagnosis.clone();
-        plan.actions[0].reason = unsafe_diagnosis;
 
-        let outcome = execute_managed_runtime_ready_marker_repair(request(
+        let outcome = execute_repair(
             &decision,
             &paths,
             &runtime_root,
@@ -1002,7 +991,7 @@ mod tests {
             &stores,
             "2026-06-15T10:00:00Z",
             None,
-        ));
+        );
         let encoded = serde_json::to_string(&outcome).expect("outcome json");
         let lower = encoded.to_ascii_lowercase();
 
@@ -1024,7 +1013,7 @@ mod tests {
         let stores = stores();
         let decision = repair_decision(OwnershipClass::LauncherManaged);
 
-        let outcome = execute_managed_runtime_ready_marker_repair(request(
+        let outcome = execute_repair(
             &decision,
             &paths,
             &runtime_root,
@@ -1032,7 +1021,7 @@ mod tests {
             &stores,
             "2026-06-15T10:00:00Z",
             Some("2026-06-15T10:15:00Z"),
-        ));
+        );
 
         assert_eq!(outcome.status, GuardianRepairStatus::Failed);
         let journal = stores
@@ -1065,8 +1054,33 @@ mod tests {
         cleanup(&root);
     }
 
+    fn execute_repair(
+        decision: &GuardianDecision,
+        paths: &AppPaths,
+        runtime_root: &Path,
+        java_executable: &Path,
+        stores: &Stores,
+        observed_at: &str,
+        suppression_until_on_failure: Option<&str>,
+    ) -> GuardianRepairOutcome {
+        let plan = repair_plan(decision);
+        execute_managed_runtime_ready_marker_repair(request(
+            &plan,
+            decision.operation_id.clone(),
+            decision.mode,
+            paths,
+            runtime_root,
+            java_executable,
+            stores,
+            observed_at,
+            suppression_until_on_failure,
+        ))
+    }
+
     fn request<'a>(
-        decision: &'a GuardianDecision,
+        plan: &'a GuardianRepairPlan,
+        operation_id: Option<OperationId>,
+        mode: GuardianMode,
         paths: &AppPaths,
         runtime_root: &'a Path,
         java_executable: &'a Path,
@@ -1075,13 +1089,23 @@ mod tests {
         suppression_until_on_failure: Option<&'a str>,
     ) -> GuardianManagedRuntimeRepairRequest<'a> {
         GuardianManagedRuntimeRepairRequest {
-            decision,
+            operation_id,
+            mode,
+            plan,
             runtime_root: runtime_root_binding(paths, runtime_root, java_executable),
             journals: &stores.journals,
             failure_memory: &stores.failure_memory,
             observed_at,
             suppression_until_on_failure,
         }
+    }
+
+    fn repair_plan(decision: &GuardianDecision) -> GuardianRepairPlan {
+        plan_managed_runtime_ready_marker_repair(
+            decision,
+            GuardianRepairPlanningContext::current_operation(),
+        )
+        .expect("runtime repair plan")
     }
 
     fn decision_target(decision: &GuardianDecision) -> TargetDescriptor {
@@ -1147,8 +1171,21 @@ mod tests {
         let java_path = runtime_root.join("bin").join("java");
         fs::create_dir_all(java_path.parent().expect("java parent")).expect("runtime bin");
         fs::write(&java_path, b"java").expect("fake java");
+        make_executable(&java_path);
         java_path
     }
+
+    #[cfg(unix)]
+    fn make_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(path).expect("java metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("java executable");
+    }
+
+    #[cfg(not(unix))]
+    fn make_executable(_path: &Path) {}
 
     fn test_paths(root: &Path) -> AppPaths {
         AppPaths {

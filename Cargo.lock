@@ -795,6 +795,7 @@ dependencies = [
  "md5",
  "serde",
  "serde_json",
+ "sha1",
  "sysinfo",
  "thiserror 2.0.18",
  "tokio",

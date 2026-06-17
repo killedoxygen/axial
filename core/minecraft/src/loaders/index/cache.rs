@@ -37,6 +37,7 @@ where
                     checked_at_ms,
                     last_success_at_ms: Some(cached.fetched_at_ms),
                     last_error: None,
+                    last_failure_kind: None,
                 },
             },
         ));
@@ -59,11 +60,14 @@ where
                         checked_at_ms,
                         last_success_at_ms: Some(checked_at_ms),
                         last_error: cache_error,
+                        last_failure_kind: None,
                     },
                 },
             ))
         }
         Err(error) => {
+            let failure_kind = error.failure_kind();
+            let last_error = error.safe_status_label().to_string();
             if let Ok(cached) = cached {
                 return Ok((
                     cached.value,
@@ -74,12 +78,15 @@ where
                             cache_hit: true,
                             checked_at_ms,
                             last_success_at_ms: Some(cached.fetched_at_ms),
-                            last_error: Some(error.to_string()),
+                            last_error: Some(last_error),
+                            last_failure_kind: Some(failure_kind),
                         },
                     },
                 ));
             }
-            Err(LoaderError::CatalogUnavailable(error.to_string()))
+            Err(LoaderError::CatalogUnavailable(
+                error.safe_status_label().to_string(),
+            ))
         }
     }
 }
@@ -182,9 +189,10 @@ mod tests {
             .expect("write stale cache");
 
         let (value, state) = resolve_cached(cache_path, Duration::ZERO, || async {
-            Err::<Vec<String>, _>(LoaderError::Other(
-                "loader provider response too large".to_string(),
-            ))
+            Err::<Vec<String>, _>(LoaderError::ProviderDataInvalid {
+                kind: crate::loaders::types::LoaderProviderFailureKind::ResponseTooLarge,
+                status: None,
+            })
         })
         .await
         .expect("stale cache should cover oversized live fetch");
@@ -196,7 +204,11 @@ mod tests {
         assert_eq!(state.availability.last_success_at_ms, Some(1));
         assert_eq!(
             state.availability.last_error.as_deref(),
-            Some("loader provider response too large")
+            Some("provider_response_too_large")
+        );
+        assert_eq!(
+            state.availability.last_failure_kind,
+            Some(crate::loaders::types::LoaderInstallFailureKind::ProviderResponseTooLarge)
         );
 
         let _ = fs::remove_dir_all(root);

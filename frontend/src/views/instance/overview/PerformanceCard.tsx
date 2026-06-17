@@ -7,11 +7,11 @@ import { systemInfo } from '../../../store';
 import { errMessage } from '../../../utils';
 import type {
   ApplicationViewModelTone,
-  EnrichedInstance,
   PerformanceHealthResponse,
   PerformanceInstanceOperationResponse,
   PerformanceOperationStatus,
-} from '../../../types';
+} from '../../../types-performance';
+import type { EnrichedInstance } from '../../../types-instance';
 
 type PerformanceProgramState =
   | {
@@ -25,15 +25,6 @@ type PerformanceProgramState =
       error?: undefined;
     }
   | { status: 'error'; health: PerformanceHealthResponse | null; error: string };
-
-interface PerformanceInstallProgress {
-  phase?: string;
-  current?: number;
-  total?: number;
-  file?: string;
-  error?: string;
-  done?: boolean;
-}
 
 type ApiResult<T> = T & { error?: string };
 
@@ -75,51 +66,6 @@ function performanceSummaryIcon(tone: ApplicationViewModelTone): string {
   if (tone === 'ok') return 'check-circle';
   if (tone === 'warn' || tone === 'err') return 'alert';
   return 'info';
-}
-
-function performanceProgressTitle(progress: PerformanceInstallProgress): string {
-  if (progress.phase === 'queued') return 'Bundle queued';
-  if (progress.phase === 'planning') return 'Planning bundle';
-  if (progress.phase === 'applying') return 'Applying bundle';
-  if (progress.phase === 'removing') return 'Removing bundle';
-  if (progress.phase === 'rolling_back') return 'Rolling back bundle';
-  if (progress.phase === 'complete') return 'Bundle updated';
-  if (progress.phase === 'error') return 'Bundle update failed';
-  return 'Updating bundle';
-}
-
-function performanceProgressDetail(progress: PerformanceInstallProgress): string {
-  if (progress.error) return progress.error;
-  if (progress.file?.trim()) return progress.file;
-  if (progress.phase === 'queued') return 'Waiting to update managed performance files.';
-  if (progress.phase === 'planning') return 'Checking the managed performance plan.';
-  if (progress.phase === 'applying') return 'Applying managed performance files.';
-  if (progress.phase === 'removing') return 'Removing managed performance files.';
-  if (progress.phase === 'rolling_back') return 'Rolling back managed performance files.';
-  if (progress.phase === 'complete') return 'Managed performance update complete.';
-  if (progress.phase === 'error') return 'Performance update failed.';
-  return 'Updating managed performance files.';
-}
-
-function isPerformanceOperationTerminal(status: PerformanceOperationStatus): boolean {
-  return status.state === 'complete' || status.state === 'failed' || status.state === 'interrupted';
-}
-
-function isPerformanceOperationComplete(status: PerformanceOperationStatus): boolean {
-  return status.state === 'complete';
-}
-
-function operationStatusAsProgress(status: PerformanceOperationStatus): PerformanceInstallProgress {
-  const failed = status.state === 'failed' || status.state === 'interrupted';
-  const phase = failed ? 'error' : status.state;
-  const current = phase === 'queued' ? 0 : phase === 'planning' ? 1 : phase === 'complete' || phase === 'error' ? 4 : 2;
-  return {
-    phase,
-    current,
-    total: 4,
-    error: failed ? status.error || 'performance operation failed' : status.error,
-    done: isPerformanceOperationTerminal(status),
-  };
 }
 
 function fmtHeap(gb: number): string {
@@ -218,12 +164,12 @@ export function PerformanceCard({ inst }: { inst: EnrichedInstance }): JSX.Eleme
 
     const applyStatus = (status: PerformanceOperationStatus | null): boolean => {
       if (!alive || requestId !== operationRequestRef.current) return true;
-      if (status && isPerformanceOperationComplete(status)) {
+      if (status?.view_model.is_complete) {
         setLifecycleOperation(null);
         return true;
       }
       setLifecycleOperation(status);
-      return !status || isPerformanceOperationTerminal(status);
+      return !status || status.view_model.is_terminal;
     };
 
     const refreshAfterComplete = async (): Promise<void> => {
@@ -246,7 +192,7 @@ export function PerformanceCard({ inst }: { inst: EnrichedInstance }): JSX.Eleme
           window.clearInterval(operationPollRef.current);
           operationPollRef.current = null;
         }
-        if (terminal && isPerformanceOperationComplete(status)) {
+        if (terminal && status.view_model.is_complete) {
           await refreshAfterComplete();
         }
       } catch {
@@ -269,7 +215,7 @@ export function PerformanceCard({ inst }: { inst: EnrichedInstance }): JSX.Eleme
         if (res?.error) throw new Error(res.error);
         const operation = res.operation ?? null;
         const terminal = applyStatus(operation);
-        if (operation && isPerformanceOperationComplete(operation)) {
+        if (operation?.view_model.is_complete) {
           await refreshAfterComplete();
           return;
         }
@@ -294,21 +240,16 @@ export function PerformanceCard({ inst }: { inst: EnrichedInstance }): JSX.Eleme
   }, [inst.id, fetchPerformanceProgram]);
 
   const baseSummary = performanceSummary(program);
-  const operationProgress = lifecycleOperation ? operationStatusAsProgress(lifecycleOperation) : null;
-  const visibleLifecycleProgress = operationProgress
+  const operationViewModel = lifecycleOperation?.view_model ?? null;
+  const visibleLifecycleProgress = operationViewModel
     ? {
-        title: performanceProgressTitle(operationProgress),
-        detail: performanceProgressDetail(operationProgress),
+        title: operationViewModel.title,
+        detail: operationViewModel.detail,
       }
     : null;
   const summary = visibleLifecycleProgress
     ? {
-        tone:
-          operationProgress?.phase === 'error'
-            ? ('err' as const)
-            : operationProgress?.done
-              ? ('ok' as const)
-              : ('mute' as const),
+        tone: operationViewModel?.tone ?? ('mute' as const),
         title: visibleLifecycleProgress.title || 'Updating bundle',
         detail: visibleLifecycleProgress.detail || 'Croopor is updating managed performance files.',
       }

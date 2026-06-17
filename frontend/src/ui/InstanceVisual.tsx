@@ -5,7 +5,8 @@ import { hashStr } from '../tokens';
 import { loaderKeyFromComponentId, loaderKeyFromVersion, type LoaderKey } from '../views/create/defaults';
 import { loaderLogoSrc } from '../views/create/loader-logos';
 import { Icon } from './Icons';
-import type { Instance, Version } from '../types';
+import type { Version } from '../types-version';
+import type { Instance } from '../types-instance';
 
 export type VisualInstance = Pick<Instance, 'id' | 'name' | 'version_id' | 'art_seed'>;
 

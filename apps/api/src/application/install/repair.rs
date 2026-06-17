@@ -1,0 +1,183 @@
+use super::InstallGuardianRepairSummary;
+use super::operation::latest_generated_fact_value;
+use crate::guardian::{
+    GuardianArtifactRepairOutcome, GuardianArtifactRepairRequest, GuardianArtifactRepairStatus,
+    GuardianInstallArtifactFailureEvidence, GuardianInstallArtifactRepairPlanKind,
+    GuardianMinecraftArtifactRepairDescriptor, GuardianMode, execute_guardian_artifact_repair,
+    execute_guardian_missing_artifact_repair,
+    install_artifact_failure_from_minecraft_download_fact, install_artifact_repair_user_outcome,
+    plan_install_artifact_failure_repair,
+};
+use crate::observability::{RedactionAudience, sanitize_evidence_token};
+use crate::state::contracts::{OperationId, OperationJournalEntry, OperationPhase, OwnershipClass};
+use crate::state::{GuardianFailureMemoryStore, OperationJournalStore};
+use croopor_minecraft::download::{
+    ExecutionDownloadFact, ExecutionDownloadFactKind, SelectedDownloadArtifactDescriptor,
+};
+use reqwest::Client;
+
+const LAUNCHER_MANAGED_ARTIFACT_CORRUPT_DIAGNOSIS: &str = "launcher_managed_artifact_corrupt";
+const REPAIR_OPERATION_FACT_PREFIX: &str = "guardian_repair_operation:";
+const REPAIR_STATUS_FACT_PREFIX: &str = "guardian_repair_status:";
+const REPAIR_SUMMARY_FACT_PREFIX: &str = "guardian_repair_summary:";
+
+pub fn record_install_operation_guardian_repair_outcome(
+    journals: &OperationJournalStore,
+    operation_id: &OperationId,
+    outcome: &GuardianArtifactRepairOutcome,
+) {
+    let repair_operation_id = sanitize_evidence_token(
+        outcome.operation_id.as_str(),
+        RedactionAudience::UserVisible,
+        96,
+    )
+    .unwrap_or_else(|| "guardian-repair".to_string());
+    let diagnosis_id = sanitize_evidence_token(
+        outcome.diagnosis_id.as_str(),
+        RedactionAudience::UserVisible,
+        96,
+    )
+    .unwrap_or_else(|| LAUNCHER_MANAGED_ARTIFACT_CORRUPT_DIAGNOSIS.to_string());
+    let summary = sanitize_evidence_token(&outcome.summary, RedactionAudience::UserVisible, 96)
+        .unwrap_or_else(|| "guardian_artifact_repair".to_string());
+
+    journals.record_guardian_evidence(
+        operation_id,
+        vec![
+            format!("{REPAIR_OPERATION_FACT_PREFIX}{repair_operation_id}"),
+            format!(
+                "{REPAIR_STATUS_FACT_PREFIX}{}",
+                guardian_artifact_repair_status_id(outcome.status)
+            ),
+            format!("{REPAIR_SUMMARY_FACT_PREFIX}{summary}"),
+        ],
+        vec![diagnosis_id],
+    );
+}
+
+pub fn install_guardian_repair_summary_from_journal(
+    entry: &OperationJournalEntry,
+) -> Option<InstallGuardianRepairSummary> {
+    let repair_operation_id = latest_generated_fact_value(entry, REPAIR_OPERATION_FACT_PREFIX)?;
+    let status = latest_generated_fact_value(entry, REPAIR_STATUS_FACT_PREFIX)?;
+    let diagnosis_id = entry
+        .guardian_diagnosis_ids
+        .iter()
+        .rev()
+        .find(|diagnosis_id| diagnosis_id.as_str() == LAUNCHER_MANAGED_ARTIFACT_CORRUPT_DIAGNOSIS)
+        .cloned()
+        .unwrap_or_else(|| LAUNCHER_MANAGED_ARTIFACT_CORRUPT_DIAGNOSIS.to_string());
+    let outcome = install_artifact_repair_user_outcome(&status);
+
+    Some(InstallGuardianRepairSummary {
+        repair_operation_id: OperationId::new(repair_operation_id),
+        diagnosis_id,
+        status,
+        label: outcome.summary,
+        detail: outcome.details.first().cloned(),
+    })
+}
+
+pub async fn repair_install_artifact_corruption_with_guardian(
+    journals: &OperationJournalStore,
+    failure_memory: &GuardianFailureMemoryStore,
+    client: &Client,
+    operation_id: &OperationId,
+    facts: &[ExecutionDownloadFact],
+    descriptors: &[SelectedDownloadArtifactDescriptor],
+    observed_at: &str,
+) -> Option<GuardianArtifactRepairOutcome> {
+    let repair = first_repairable_install_artifact(facts, descriptors, operation_id)?;
+    let destination_missing = repair
+        .descriptor
+        .destination()
+        .try_exists()
+        .is_ok_and(|exists| !exists);
+    let plan_kind = if repair.evidence.kind
+        == crate::guardian::GuardianInstallArtifactFailureKind::ArtifactMissing
+        || destination_missing
+    {
+        GuardianInstallArtifactRepairPlanKind::MissingArtifact
+    } else {
+        GuardianInstallArtifactRepairPlanKind::ExistingArtifact
+    };
+    let plan = plan_install_artifact_failure_repair(
+        Some(operation_id.clone()),
+        GuardianMode::Managed,
+        OperationPhase::Downloading,
+        std::slice::from_ref(&repair.evidence),
+        plan_kind,
+    )
+    .ok()?;
+
+    let request = GuardianArtifactRepairRequest {
+        operation_id: None,
+        plan: &plan,
+        destination: repair.descriptor.destination(),
+        source: repair.descriptor.repair_source(),
+        client,
+        journals,
+        failure_memory,
+        mode: GuardianMode::Managed,
+        observed_at,
+    };
+
+    if destination_missing {
+        Some(execute_guardian_missing_artifact_repair(request).await)
+    } else {
+        Some(execute_guardian_artifact_repair(request).await)
+    }
+}
+
+fn guardian_artifact_repair_status_id(status: GuardianArtifactRepairStatus) -> &'static str {
+    match status {
+        GuardianArtifactRepairStatus::Repaired => "repaired",
+        GuardianArtifactRepairStatus::Blocked => "blocked",
+        GuardianArtifactRepairStatus::Failed => "failed",
+        GuardianArtifactRepairStatus::Suppressed => "suppressed",
+    }
+}
+
+struct RepairableInstallArtifact {
+    descriptor: GuardianMinecraftArtifactRepairDescriptor,
+    evidence: GuardianInstallArtifactFailureEvidence,
+}
+
+fn first_repairable_install_artifact(
+    facts: &[ExecutionDownloadFact],
+    descriptors: &[SelectedDownloadArtifactDescriptor],
+    operation_id: &OperationId,
+) -> Option<RepairableInstallArtifact> {
+    facts
+        .iter()
+        .filter(|fact| repairable_install_artifact_fact_kind(fact.kind))
+        .filter_map(|fact| {
+            let descriptor = descriptors
+                .iter()
+                .find(|descriptor| descriptor.target == fact.target)?;
+            let descriptor =
+                GuardianMinecraftArtifactRepairDescriptor::from_core_selected_descriptor(
+                    descriptor,
+                )
+                .ok()?;
+            let evidence = install_artifact_failure_from_minecraft_download_fact(
+                Some(operation_id.clone()),
+                OwnershipClass::LauncherManaged,
+                fact,
+            )?;
+            Some(RepairableInstallArtifact {
+                descriptor,
+                evidence,
+            })
+        })
+        .next()
+}
+
+fn repairable_install_artifact_fact_kind(kind: ExecutionDownloadFactKind) -> bool {
+    matches!(
+        kind,
+        ExecutionDownloadFactKind::ArtifactMissing
+            | ExecutionDownloadFactKind::ChecksumMismatch
+            | ExecutionDownloadFactKind::SizeMismatch
+    )
+}

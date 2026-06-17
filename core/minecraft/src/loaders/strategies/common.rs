@@ -30,13 +30,6 @@ const MAX_INSTALLER_DOWNLOAD_SIZE: u64 = 50 << 20;
 const LOADER_METADATA_FILE: &str = ".croopor-loader.json";
 
 #[derive(Debug)]
-#[cfg(test)]
-struct CachedArtifact {
-    bytes: Vec<u8>,
-    cache_hit: bool,
-}
-
-#[derive(Debug)]
 struct CachedProfile {
     bytes: Vec<u8>,
     fragment: LoaderProfileFragment,
@@ -423,13 +416,24 @@ where
     }
 
     let downloader = Downloader::new(library_dir.to_path_buf());
-    Box::pin(downloader.install_version(version_id, None, |progress| {
-        if !progress.done {
-            send(progress);
-        }
-    }))
-    .await?;
-    Ok(())
+    let mut facts = Vec::new();
+    let mut descriptors = Vec::new();
+    let result = Box::pin(downloader.install_version_with_facts_and_descriptors(
+        version_id,
+        None,
+        |progress| {
+            if !progress.done {
+                send(progress);
+            }
+        },
+        |fact| facts.push(fact),
+        |descriptor| descriptors.push(descriptor),
+    ))
+    .await;
+    match result {
+        Ok(()) => Ok(()),
+        Err(_error) => Err(LoaderError::BaseInstallFailed { facts, descriptors }),
+    }
 }
 
 fn base_version_install_lock(library_dir: &Path, version_id: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -543,8 +547,8 @@ async fn read_valid_installer(
     {
         match extract_installer_blocking(bytes).await {
             Ok(extracted) => return Ok(extracted),
-            Err(InstallerTaskError::Extract(_)) => {
-                let _ = async_fs::remove_file(path).await;
+            Err(InstallerTaskError::Extract(error)) => {
+                return Err(installer_extract_error(component_name, error));
             }
             Err(error) => return Err(installer_task_extract_error(component_name, error)),
         }
@@ -575,9 +579,7 @@ async fn read_valid_profile_json(
         };
         match parse_profile_json(&bytes, component_name) {
             Ok(fragment) => return Ok(CachedProfile { bytes, fragment }),
-            Err(_) => {
-                let _ = async_fs::remove_file(path).await;
-            }
+            Err(error) => return Err(error),
         }
     }
 
@@ -595,33 +597,6 @@ fn parse_profile_json(
         .map_err(|error| LoaderError::InvalidProfile(format!("{component_name} profile: {error}")))
 }
 
-#[cfg(test)]
-async fn read_or_download_cached_artifact(
-    path: &Path,
-    url: &str,
-) -> Result<CachedArtifact, LoaderError> {
-    if path_is_file(path).await
-        && let Some(bytes) = read_cached_artifact(path).await?
-    {
-        return Ok(CachedArtifact {
-            bytes,
-            cache_hit: true,
-        });
-    }
-
-    Ok(CachedArtifact {
-        bytes: download_and_cache_artifact(url, path).await?,
-        cache_hit: false,
-    })
-}
-
-#[cfg(test)]
-async fn download_and_cache_artifact(url: &str, path: &Path) -> Result<Vec<u8>, LoaderError> {
-    let bytes = download_to_memory(url).await?;
-    Box::pin(write_cached_artifact(path, &bytes)).await?;
-    Ok(bytes)
-}
-
 async fn read_valid_legacy_archive(
     path: &Path,
     url: &str,
@@ -632,9 +607,7 @@ async fn read_valid_legacy_archive(
     {
         match validate_legacy_archive(&bytes) {
             Ok(()) => return Ok(bytes),
-            Err(_) => {
-                let _ = async_fs::remove_file(path).await;
-            }
+            Err(error) => return Err(legacy_archive_error(component_name, error)),
         }
     }
 
@@ -649,8 +622,9 @@ async fn read_valid_legacy_archive(
 async fn read_cached_artifact(path: &Path) -> Result<Option<Vec<u8>>, LoaderError> {
     let metadata = async_fs::metadata(path).await?;
     if metadata.len() > MAX_INSTALLER_DOWNLOAD_SIZE {
-        let _ = async_fs::remove_file(path).await;
-        return Ok(None);
+        return Err(LoaderError::Verify(
+            "cached loader artifact exceeded the bounded size limit".to_string(),
+        ));
     }
     Ok(Some(async_fs::read(path).await?))
 }
@@ -795,7 +769,7 @@ mod tests {
     use super::{
         base_version_install_lock_from_map, cleanup_on_error, ensure_base_version,
         install_from_installer_source, install_from_legacy_archive, install_from_profile_source,
-        promote_cached_artifact_tmp, read_or_download_cached_artifact, read_valid_installer,
+        promote_cached_artifact_tmp, read_cached_artifact, read_valid_installer,
         read_valid_legacy_archive, read_valid_profile_json, write_cached_artifact,
     };
     use crate::download::{DownloadProgress, ExecutionDownloadFactKind};
@@ -1066,46 +1040,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_cached_artifact_is_removed_and_replaced_from_provider() {
+    async fn oversized_cached_artifact_blocks_without_mutation() {
         let root = temp_dir("cached-artifact-oversized");
         fs::create_dir_all(&root).expect("root");
         let path = root.join("installer.jar");
         write_oversized_cached_file(&path);
-        let fresh = b"fresh installer bytes".to_vec();
-        let server = TestByteServer::start(fresh.clone());
 
-        let artifact = read_or_download_cached_artifact(&path, &server.url)
+        let error = read_cached_artifact(&path)
             .await
-            .expect("fresh artifact");
+            .expect_err("oversized cached artifact should block");
 
-        assert!(!artifact.cache_hit);
-        assert_eq!(artifact.bytes, fresh);
-        assert_eq!(fs::read(&path).expect("cached fresh artifact"), fresh);
-        assert_eq!(server.request_count(), 1);
-
-        server.stop();
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn oversized_cached_artifact_is_removed_before_provider_failure() {
-        let root = temp_dir("cached-artifact-oversized-offline");
-        fs::create_dir_all(&root).expect("root");
-        let path = root.join("installer.jar");
-        write_oversized_cached_file(&path);
-
-        let error = read_or_download_cached_artifact(&path, "http://127.0.0.1:9/installer.jar")
-            .await
-            .expect_err("provider failure");
-
-        assert!(error.to_string().contains("request failed"));
-        assert!(!path.exists());
+        assert!(matches!(error, LoaderError::Verify(_)));
+        assert!(path.exists());
 
         let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]
-    async fn corrupt_cached_installer_is_removed_and_replaced_from_provider() {
+    async fn corrupt_cached_installer_blocks_without_provider_or_mutation() {
         let root = temp_dir("installer-cache-corrupt");
         let path = root.join("artifacts/forge/1.21.5/55.0.0-installer.jar");
         fs::create_dir_all(path.parent().expect("installer parent")).expect("installer parent");
@@ -1113,17 +1065,16 @@ mod tests {
         let fresh_installer = installer_jar("fresh-installer");
         let server = TestByteServer::start(fresh_installer.clone());
 
-        let (bytes, extracted) = read_valid_installer(&path, &server.url, "Forge")
+        let error = read_valid_installer(&path, &server.url, "Forge")
             .await
-            .expect("fresh installer");
+            .expect_err("corrupt cached installer should block");
 
-        assert_eq!(bytes, fresh_installer);
-        assert_eq!(extracted.version_id, "fresh-installer");
+        assert!(matches!(error, LoaderError::InvalidProfile(_)));
         assert_eq!(
-            fs::read(&path).expect("cached fresh installer"),
-            fresh_installer
+            fs::read(&path).expect("cached corrupt installer"),
+            b"corrupt installer"
         );
-        assert_eq!(server.request_count(), 1);
+        assert_eq!(server.request_count(), 0);
 
         server.stop();
         let _ = fs::remove_dir_all(root);
@@ -1174,7 +1125,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_cached_profile_is_removed_and_replaced_from_provider() {
+    async fn oversized_cached_profile_blocks_without_provider_or_mutation() {
         let root = temp_dir("profile-cache-oversized");
         let path = root.join("artifacts/fabric/1.21.5/0.16.14-profile.json");
         fs::create_dir_all(path.parent().expect("profile parent")).expect("profile parent");
@@ -1182,21 +1133,20 @@ mod tests {
         let fresh = profile_json("fresh-profile");
         let server = TestByteServer::start(fresh.clone());
 
-        let profile = read_valid_profile_json(&path, &server.url, "Fabric")
+        let error = read_valid_profile_json(&path, &server.url, "Fabric")
             .await
-            .expect("fresh profile");
+            .expect_err("oversized cached profile should block");
 
-        assert_eq!(profile.fragment.id, "fresh-profile");
-        assert_eq!(profile.bytes, fresh);
-        assert_eq!(fs::read(&path).expect("cached fresh profile"), fresh);
-        assert_eq!(server.request_count(), 1);
+        assert!(matches!(error, LoaderError::Verify(_)));
+        assert!(path.exists());
+        assert_eq!(server.request_count(), 0);
 
         server.stop();
         let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]
-    async fn corrupt_cached_profile_is_removed_and_replaced_from_provider() {
+    async fn corrupt_cached_profile_blocks_without_provider_or_mutation() {
         let root = temp_dir("profile-cache-corrupt");
         let path = root.join("artifacts/fabric/1.21.5/0.16.14-profile.json");
         fs::create_dir_all(path.parent().expect("profile parent")).expect("profile parent");
@@ -1204,13 +1154,16 @@ mod tests {
         let fresh = profile_json("fresh-profile");
         let server = TestByteServer::start(fresh.clone());
 
-        let profile = read_valid_profile_json(&path, &server.url, "Fabric")
+        let error = read_valid_profile_json(&path, &server.url, "Fabric")
             .await
-            .expect("fresh profile");
+            .expect_err("corrupt cached profile should block");
 
-        assert_eq!(profile.fragment.id, "fresh-profile");
-        assert_eq!(fs::read(&path).expect("cached fresh profile"), fresh);
-        assert_eq!(server.request_count(), 1);
+        assert!(matches!(error, LoaderError::InvalidProfile(_)));
+        assert_eq!(
+            fs::read(&path).expect("cached corrupt profile"),
+            b"{not-json"
+        );
+        assert_eq!(server.request_count(), 0);
 
         server.stop();
         let _ = fs::remove_dir_all(root);
@@ -1278,7 +1231,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cached_legacy_archive_corruption_fetches_provider_once() {
+    async fn corrupt_cached_legacy_archive_blocks_without_provider_or_mutation() {
         let root = temp_dir("legacy-archive-corrupt-cache");
         let path = root.join("artifacts/forge/1.2.4/2.0.0.68-client.zip");
         fs::create_dir_all(path.parent().expect("parent")).expect("artifact parent");
@@ -1286,23 +1239,23 @@ mod tests {
         let fresh_archive = empty_zip();
         let server = TestByteServer::start(fresh_archive.clone());
 
-        let bytes = read_valid_legacy_archive(&path, &server.url, "Forge")
+        let error = read_valid_legacy_archive(&path, &server.url, "Forge")
             .await
-            .expect("legacy archive");
+            .expect_err("corrupt cached legacy archive should block");
 
-        assert_eq!(bytes, fresh_archive);
+        assert!(matches!(error, LoaderError::InvalidProfile(_)));
         assert_eq!(
-            fs::read(&path).expect("cached fresh archive"),
-            fresh_archive
+            fs::read(&path).expect("cached corrupt archive"),
+            b"corrupt cached archive"
         );
-        assert_eq!(server.request_count(), 1);
+        assert_eq!(server.request_count(), 0);
 
         server.stop();
         let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]
-    async fn oversized_cached_legacy_archive_is_removed_and_replaced_from_provider() {
+    async fn oversized_cached_legacy_archive_blocks_without_provider_or_mutation() {
         let root = temp_dir("legacy-archive-oversized-cache");
         let path = root.join("artifacts/forge/1.2.4/2.0.0.68-client.zip");
         fs::create_dir_all(path.parent().expect("parent")).expect("artifact parent");
@@ -1310,16 +1263,13 @@ mod tests {
         let fresh_archive = empty_zip();
         let server = TestByteServer::start(fresh_archive.clone());
 
-        let bytes = read_valid_legacy_archive(&path, &server.url, "Forge")
+        let error = read_valid_legacy_archive(&path, &server.url, "Forge")
             .await
-            .expect("legacy archive");
+            .expect_err("oversized cached legacy archive should block");
 
-        assert_eq!(bytes, fresh_archive);
-        assert_eq!(
-            fs::read(&path).expect("cached fresh archive"),
-            fresh_archive
-        );
-        assert_eq!(server.request_count(), 1);
+        assert!(matches!(error, LoaderError::Verify(_)));
+        assert!(path.exists());
+        assert_eq!(server.request_count(), 0);
 
         server.stop();
         let _ = fs::remove_dir_all(root);

@@ -1,5 +1,5 @@
 import { toasts } from './store';
-import type { ToastItem, ToastKind } from './types';
+import type { ToastItem, ToastKind } from './types-ui';
 
 let nextToastId = 1;
 const toastTimers = new Map<number, ReturnType<typeof setTimeout>>();

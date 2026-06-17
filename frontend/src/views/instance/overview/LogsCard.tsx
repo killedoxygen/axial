@@ -3,7 +3,7 @@ import { useEffect, useMemo, useState } from 'preact/hooks';
 import { Icon } from '../../../ui/Icons';
 import { Card } from '../../../ui/Atoms';
 import { errMessage } from '../../../utils';
-import type { InstanceLogTail, InstanceResourceSummary } from '../../../types';
+import type { InstanceLogTail, InstanceResourceSummary } from '../../../types-instance';
 import { fmtRelative } from '../format';
 import { classifyLogText, fetchLogTail, LOG_TAIL_POLL_MS, pickInitialLog } from '../logs';
 import { LogLine } from '../components/log-line';

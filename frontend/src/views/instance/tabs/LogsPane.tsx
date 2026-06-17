@@ -4,7 +4,7 @@ import { Button, Pill } from '../../../ui/Atoms';
 import { SelectField } from '../../../ui/Select';
 import { Icon } from '../../../ui/Icons';
 import { errMessage } from '../../../utils';
-import type { EnrichedInstance, InstanceLogTail } from '../../../types';
+import type { EnrichedInstance, InstanceLogTail } from '../../../types-instance';
 import { fmtBytes, fmtRelative } from '../format';
 import type { ResourceLoadState } from '../resources';
 import {

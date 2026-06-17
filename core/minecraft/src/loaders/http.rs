@@ -1,4 +1,4 @@
-use super::types::LoaderError;
+use super::types::{LoaderError, LoaderProviderFailureKind};
 use futures_util::StreamExt;
 use serde::de::DeserializeOwned;
 use std::sync::OnceLock;
@@ -18,6 +18,7 @@ where
     for attempt in 0..3 {
         match fetch_json_once::<T>(url).await {
             Ok(value) => return Ok(value),
+            Err(error) if !loader_error_allows_primitive_retry(&error) => return Err(error),
             Err(error) => {
                 last_error = Some(error);
                 if attempt < 2 {
@@ -26,7 +27,7 @@ where
             }
         }
     }
-    Err(last_error.unwrap_or_else(|| LoaderError::Other(format!("request failed for {url}"))))
+    Err(last_error.unwrap_or_else(|| provider_network_error(None)))
 }
 
 pub async fn fetch_bytes(url: &str, max_size: u64) -> Result<Vec<u8>, LoaderError> {
@@ -37,6 +38,7 @@ pub async fn fetch_bytes(url: &str, max_size: u64) -> Result<Vec<u8>, LoaderErro
             Err(LoaderError::ArtifactMissing(message)) => {
                 return Err(LoaderError::ArtifactMissing(message));
             }
+            Err(error) if !loader_error_allows_primitive_retry(&error) => return Err(error),
             Err(error) => {
                 last_error = Some(error);
                 if attempt < 2 {
@@ -45,7 +47,7 @@ pub async fn fetch_bytes(url: &str, max_size: u64) -> Result<Vec<u8>, LoaderErro
             }
         }
     }
-    Err(last_error.unwrap_or_else(|| LoaderError::Other(format!("request failed for {url}"))))
+    Err(last_error.unwrap_or_else(|| provider_network_error(None)))
 }
 
 async fn fetch_json_once<T>(url: &str) -> Result<T, LoaderError>
@@ -56,35 +58,37 @@ where
         .get(url)
         .send()
         .await
-        .map_err(|error| LoaderError::Other(format!("request failed for {url}: {error}")))?;
+        .map_err(|error| provider_network_error(Some(error)))?;
     if !response.status().is_success() {
-        return Err(LoaderError::Other(format!(
-            "request failed for {url}: HTTP {}",
-            response.status()
-        )));
+        return Err(provider_status_error(response.status()));
     }
     if response
         .content_length()
         .is_some_and(|content_length| content_length > MAX_LOADER_JSON_BYTES as u64)
     {
-        return Err(loader_json_too_large());
+        return Err(loader_response_too_large());
     }
 
     let mut bytes = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk
-            .map_err(|error| LoaderError::Other(format!("request failed for {url}: {error}")))?;
+        let chunk = chunk.map_err(|error| provider_network_error(Some(error)))?;
         if bytes.len().saturating_add(chunk.len()) > MAX_LOADER_JSON_BYTES {
-            return Err(loader_json_too_large());
+            return Err(loader_response_too_large());
         }
         bytes.extend_from_slice(&chunk);
     }
-    serde_json::from_slice(&bytes).map_err(LoaderError::Parse)
+    serde_json::from_slice(&bytes).map_err(|_| LoaderError::ProviderDataInvalid {
+        kind: LoaderProviderFailureKind::SchemaInvalid,
+        status: None,
+    })
 }
 
-fn loader_json_too_large() -> LoaderError {
-    LoaderError::Other("loader provider response too large".to_string())
+fn loader_response_too_large() -> LoaderError {
+    LoaderError::ProviderDataInvalid {
+        kind: LoaderProviderFailureKind::ResponseTooLarge,
+        status: None,
+    }
 }
 
 async fn fetch_bytes_once(url: &str, max_size: u64) -> Result<Vec<u8>, LoaderError> {
@@ -92,45 +96,75 @@ async fn fetch_bytes_once(url: &str, max_size: u64) -> Result<Vec<u8>, LoaderErr
         .get(url)
         .send()
         .await
-        .map_err(|error| LoaderError::Other(format!("request failed for {url}: {error}")))?;
+        .map_err(|error| provider_network_error(Some(error)))?;
 
     let mut bytes = Vec::new();
     let status = response.status();
     if status == reqwest::StatusCode::NOT_FOUND {
-        return Err(LoaderError::ArtifactMissing(format!(
-            "artifact returned HTTP 404 for {url}"
-        )));
+        return Err(LoaderError::ArtifactMissing(
+            "artifact returned HTTP 404".to_string(),
+        ));
     }
     if !status.is_success() {
-        return Err(LoaderError::Other(format!(
-            "request failed for {url}: HTTP {status}"
-        )));
+        return Err(provider_status_error(status));
     }
     if response
         .content_length()
         .is_some_and(|content_length| content_length > max_size)
     {
-        return Err(LoaderError::ArtifactMissing(format!(
-            "download too large for {url}"
-        )));
+        return Err(loader_response_too_large());
     }
 
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk
-            .map_err(|error| LoaderError::Other(format!("request failed for {url}: {error}")))?;
+        let chunk = chunk.map_err(|error| provider_network_error(Some(error)))?;
         if bytes.len() as u64 + chunk.len() as u64 > max_size {
-            return Err(LoaderError::ArtifactMissing(format!(
-                "download too large for {url}"
-            )));
+            return Err(loader_response_too_large());
         }
         bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
 }
 
+fn provider_network_error(error: Option<reqwest::Error>) -> LoaderError {
+    let kind = if error.as_ref().is_some_and(reqwest::Error::is_timeout) {
+        LoaderProviderFailureKind::Timeout
+    } else {
+        LoaderProviderFailureKind::Network
+    };
+    LoaderError::ProviderUnavailable { kind, status: None }
+}
+
+fn provider_status_error(status: reqwest::StatusCode) -> LoaderError {
+    let kind = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        LoaderProviderFailureKind::HttpRateLimited
+    } else if status.is_server_error() {
+        LoaderProviderFailureKind::HttpServer
+    } else if status == reqwest::StatusCode::NOT_FOUND {
+        LoaderProviderFailureKind::HttpNotFound
+    } else {
+        LoaderProviderFailureKind::HttpStatus
+    };
+    LoaderError::ProviderUnavailable {
+        kind,
+        status: Some(status.as_u16()),
+    }
+}
+
 async fn retry_delay(attempt: usize) {
     tokio::time::sleep(Duration::from_millis(250 * (attempt + 1) as u64)).await;
+}
+
+fn loader_error_allows_primitive_retry(error: &LoaderError) -> bool {
+    matches!(
+        error,
+        LoaderError::ProviderUnavailable {
+            kind: LoaderProviderFailureKind::Network
+                | LoaderProviderFailureKind::Timeout
+                | LoaderProviderFailureKind::HttpServer,
+            ..
+        }
+    )
 }
 
 fn client() -> &'static reqwest::Client {
@@ -153,7 +187,7 @@ fn client() -> &'static reqwest::Client {
 #[cfg(test)]
 mod tests {
     use super::{MAX_LOADER_JSON_BYTES, fetch_bytes, fetch_json, fetch_json_once};
-    use crate::loaders::types::LoaderError;
+    use crate::loaders::types::{LoaderError, LoaderProviderFailureKind};
     use serde::Deserialize;
     use serde_json::Value;
     use std::io::{ErrorKind, Read, Write};
@@ -200,7 +234,7 @@ mod tests {
         match error {
             LoaderError::ArtifactMissing(message) => {
                 assert!(message.contains("HTTP 404"), "{message}");
-                assert!(message.contains(&url), "{message}");
+                assert!(!message.contains(&url), "{message}");
             }
             error => panic!("expected ArtifactMissing, got {error:?}"),
         }
@@ -224,10 +258,11 @@ mod tests {
             .expect_err("oversized response");
 
         match error {
-            LoaderError::ArtifactMissing(message) => {
-                assert!(message.contains("download too large"), "{message}");
+            LoaderError::ProviderDataInvalid { kind, status } => {
+                assert_eq!(kind, LoaderProviderFailureKind::ResponseTooLarge);
+                assert_eq!(status, None);
             }
-            error => panic!("expected ArtifactMissing, got {error:?}"),
+            error => panic!("expected ProviderDataInvalid, got {error:?}"),
         }
         assert_eq!(server.request_count(), 1);
     }
@@ -281,6 +316,55 @@ mod tests {
         assert_eq!(server.request_count(), 1);
     }
 
+    #[tokio::test]
+    async fn fetch_json_classifies_http_status_without_url_or_body() {
+        let server = TestServer::spawn(|stream| {
+            respond(
+                stream,
+                b"HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: 33\r\nConnection: close\r\n\r\n{\"token\":\"secret\",\"path\":\"/tmp/x\"}",
+            );
+        });
+
+        let error = fetch_json_once::<Value>(&server.url("/metadata.json"))
+            .await
+            .expect_err("http status should fail");
+
+        match error {
+            LoaderError::ProviderUnavailable { kind, status } => {
+                assert_eq!(kind, LoaderProviderFailureKind::HttpRateLimited);
+                assert_eq!(status, Some(429));
+            }
+            error => panic!("expected ProviderUnavailable, got {error:?}"),
+        }
+        assert_eq!(server.request_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn fetch_json_classifies_schema_drift_without_payload() {
+        let server = TestServer::spawn(|stream| {
+            respond(
+                stream,
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 9\r\nConnection: close\r\n\r\n{not-json",
+            );
+        });
+
+        let error = fetch_json_once::<Value>(&server.url("/metadata.json"))
+            .await
+            .expect_err("invalid json should fail");
+        let encoded = error.to_string().to_ascii_lowercase();
+
+        match &error {
+            LoaderError::ProviderDataInvalid { kind, status } => {
+                assert_eq!(*kind, LoaderProviderFailureKind::SchemaInvalid);
+                assert_eq!(*status, None);
+            }
+            error => panic!("expected ProviderDataInvalid, got {error:?}"),
+        }
+        assert!(!encoded.contains("not-json"));
+        assert!(!encoded.contains("metadata.json"));
+        assert_eq!(server.request_count(), 1);
+    }
+
     fn respond_404(stream: TcpStream) {
         respond(
             stream,
@@ -319,10 +403,11 @@ mod tests {
 
     fn assert_loader_json_too_large(error: LoaderError) {
         match error {
-            LoaderError::Other(message) => {
-                assert_eq!(message, "loader provider response too large");
+            LoaderError::ProviderDataInvalid { kind, status } => {
+                assert_eq!(kind, LoaderProviderFailureKind::ResponseTooLarge);
+                assert_eq!(status, None);
             }
-            error => panic!("expected Other, got {error:?}"),
+            error => panic!("expected ProviderDataInvalid, got {error:?}"),
         }
     }
 

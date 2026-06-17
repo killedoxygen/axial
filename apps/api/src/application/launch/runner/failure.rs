@@ -1,0 +1,323 @@
+use super::LaunchRequestError;
+use super::proof::persist_launch_proof_best_effort_with_context;
+use super::status::{serialize_guardian, serialize_healing};
+use crate::observability::{RedactionAudience, sanitize_public_diagnostic_text};
+use crate::state::launch_reports::LaunchProofContext;
+use crate::state::{AppState, LaunchStatusEvent};
+use croopor_launcher::{
+    GuardianSummary, LaunchFailureClass, LaunchSessionOutcome, failure_class_name,
+};
+
+const LIVE_LAUNCH_FAILURE_MAX_CHARS: usize = 180;
+const LIVE_LAUNCH_FAILURE_SAFE_FALLBACK: &str = "Launch failed before Minecraft could start. Detailed diagnostics were hidden because they may contain local paths or private data.";
+
+pub(super) async fn fail_launch(
+    state: &AppState,
+    session_id: &str,
+    proof_context: Option<&LaunchProofContext>,
+    failure_class: LaunchFailureClass,
+    message: &str,
+    healing: Option<croopor_launcher::LaunchHealingSummary>,
+    guardian: Option<GuardianSummary>,
+) -> LaunchRequestError {
+    fail_launch_with_outcome(
+        state,
+        session_id,
+        proof_context,
+        failure_class,
+        message,
+        healing,
+        guardian,
+        None,
+    )
+    .await
+}
+
+pub(super) async fn fail_launch_with_outcome(
+    state: &AppState,
+    session_id: &str,
+    proof_context: Option<&LaunchProofContext>,
+    failure_class: LaunchFailureClass,
+    message: &str,
+    healing: Option<croopor_launcher::LaunchHealingSummary>,
+    guardian: Option<GuardianSummary>,
+    outcome: Option<LaunchSessionOutcome>,
+) -> LaunchRequestError {
+    // Live failure details are sanitized before they enter status events or API responses.
+    let public_message = sanitize_live_launch_failure_message(message);
+    emit_terminal_failure(
+        state,
+        session_id,
+        failure_class,
+        &public_message,
+        healing.clone(),
+        guardian.clone(),
+        outcome,
+    )
+    .await;
+    persist_launch_proof_best_effort_with_context(state, session_id, None, "failed", proof_context)
+        .await;
+    LaunchRequestError {
+        message: public_message,
+        healing,
+        guardian,
+    }
+}
+
+pub fn sanitize_live_launch_failure_message(message: &str) -> String {
+    sanitize_public_diagnostic_text(
+        message,
+        RedactionAudience::UserVisible,
+        LIVE_LAUNCH_FAILURE_MAX_CHARS,
+        LIVE_LAUNCH_FAILURE_SAFE_FALLBACK,
+    )
+}
+
+async fn emit_terminal_failure(
+    state: &AppState,
+    session_id: &str,
+    failure_class: LaunchFailureClass,
+    message: &str,
+    healing: Option<croopor_launcher::LaunchHealingSummary>,
+    guardian: Option<GuardianSummary>,
+    outcome: Option<LaunchSessionOutcome>,
+) {
+    state
+        .sessions()
+        .emit_log(session_id, "system", message.to_string())
+        .await;
+    state
+        .sessions()
+        .emit_status(
+            session_id,
+            LaunchStatusEvent {
+                state: "exited".to_string(),
+                benchmark: None,
+                pid: None,
+                exit_code: Some(-1),
+                failure_class: Some(failure_class_name(failure_class).to_string()),
+                failure_detail: Some(message.to_string()),
+                healing: serialize_healing(healing),
+                guardian: serialize_guardian(guardian),
+                outcome,
+                notice: None,
+                evidence: Vec::new(),
+                stages: Vec::new(),
+            },
+        )
+        .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{AppStateInit, InstallStore, LaunchEvent, SessionStore};
+    use croopor_config::{AppPaths, ConfigStore, InstanceStore};
+    use croopor_launcher::{LaunchSessionExitReason, LaunchSessionRecord, LaunchState, SessionId};
+    use croopor_performance::PerformanceManager;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[tokio::test]
+    async fn fail_launch_sanitizes_public_error_and_terminal_failure_payloads() {
+        let root = unique_test_dir("live-launch-failure");
+        let state = test_app_state(&root);
+        let session_id = "unsafe-live-failure";
+        state.sessions().insert(test_record(session_id)).await;
+        let mut events = state
+            .sessions()
+            .subscribe(session_id)
+            .await
+            .expect("subscribe");
+        let unsafe_message = "prepare failed for /home/alice/.croopor/instances/secret java.exe --accessToken raw-secret-token -Xmx8192M -Dtoken=raw provider_payload=provider-secret account_id=account-secret username=SecretPlayer\nnext command fragment C:\\Users\\Alice\\AppData\\java.exe eyJheader123456789.abcdEFGH12345678.ijklMNOP12345678";
+
+        let error = fail_launch(
+            &state,
+            session_id,
+            None,
+            LaunchFailureClass::Unknown,
+            unsafe_message,
+            None,
+            None,
+        )
+        .await;
+
+        assert_safe_live_launch_failure_text(&error.message);
+        assert!(
+            error
+                .message
+                .contains("Launch failed before Minecraft could start")
+        );
+
+        let log_event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("log event")
+            .expect("log event result");
+        let log_text = match log_event {
+            LaunchEvent::Log(log) => log.text,
+            other => panic!("expected log event, got {other:?}"),
+        };
+        assert_safe_live_launch_failure_text(&log_text);
+        assert!(log_text.contains("Detailed diagnostics were hidden"));
+
+        let status_event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("status event")
+            .expect("status event result");
+        let failure_detail = match status_event {
+            LaunchEvent::Status(status) => {
+                assert_eq!(status.state, "exited");
+                status.failure_detail.expect("failure detail")
+            }
+            other => panic!("expected status event, got {other:?}"),
+        };
+        assert_safe_live_launch_failure_text(&failure_detail);
+        assert!(failure_detail.contains("Detailed diagnostics were hidden"));
+
+        let record = state
+            .sessions()
+            .get(session_id)
+            .await
+            .expect("terminal failure session record");
+        assert_eq!(record.state, LaunchState::Exited);
+        assert!(record.failure.is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn fail_launch_with_outcome_records_spawn_failure_in_session_and_proof() {
+        let root = unique_test_dir("spawn-failed-outcome");
+        let state = test_app_state(&root);
+        let session_id = "spawn-failed-outcome";
+        state.sessions().insert(test_record(session_id)).await;
+
+        let expected = LaunchSessionOutcome::from_reason(LaunchSessionExitReason::SpawnFailed);
+        let _ = fail_launch_with_outcome(
+            &state,
+            session_id,
+            None,
+            LaunchFailureClass::Unknown,
+            "failed to start launch process: program not found",
+            None,
+            None,
+            Some(expected.clone()),
+        )
+        .await;
+
+        let record = state
+            .sessions()
+            .get(session_id)
+            .await
+            .expect("terminal failure session record");
+        assert_eq!(record.outcome.as_ref(), Some(&expected));
+
+        let proof = crate::state::launch_reports::load(state.config().paths(), session_id)
+            .expect("load proof")
+            .expect("proof exists");
+        assert_eq!(proof.session_outcome.as_ref(), Some(&expected));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn live_launch_failure_sanitizer_keeps_safe_bounded_errors_useful() {
+        let message = "launch plan did not produce a runnable command after preparation completed";
+
+        let sanitized = sanitize_live_launch_failure_message(message);
+
+        assert_eq!(sanitized, message);
+        assert_safe_live_launch_failure_text(&sanitized);
+    }
+
+    fn test_app_state(root: &Path) -> AppState {
+        let paths = test_paths(root);
+        let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
+        let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
+        AppState::new(AppStateInit {
+            app_name: "Croopor".to_string(),
+            version: "test".to_string(),
+            config,
+            instances,
+            installs: Arc::new(InstallStore::new()),
+            sessions: Arc::new(SessionStore::new()),
+            performance: Arc::new(PerformanceManager::new().expect("performance manager")),
+            startup_warnings: Vec::new(),
+            frontend_dir: root.join("frontend"),
+        })
+    }
+
+    fn test_paths(root: &Path) -> AppPaths {
+        let config_dir = root.join("config");
+        AppPaths {
+            config_file: config_dir.join("config.json"),
+            instances_file: config_dir.join("instances.json"),
+            instances_dir: config_dir.join("instances"),
+            music_dir: config_dir.join("music"),
+            library_dir: config_dir.join("library"),
+            config_dir,
+        }
+    }
+
+    fn test_record(session_id: &str) -> LaunchSessionRecord {
+        LaunchSessionRecord {
+            session_id: SessionId(session_id.to_string()),
+            instance_id: "instance".to_string(),
+            version_id: "1.21.1".to_string(),
+            launched_at: Some("2026-01-01T00:00:00.000Z".to_string()),
+            benchmark: None,
+            state: LaunchState::Queued,
+            pid: None,
+            process_started_at_ms: None,
+            boot_completed_at_ms: None,
+            boot_duration_ms: None,
+            priority: None,
+            exit_code: None,
+            command: Vec::new(),
+            java_path: None,
+            natives_dir: None,
+            failure: None,
+            healing: None,
+            guardian: None,
+            outcome: None,
+            stages: Vec::new(),
+        }
+    }
+
+    fn assert_safe_live_launch_failure_text(text: &str) {
+        assert!(text.chars().count() <= LIVE_LAUNCH_FAILURE_MAX_CHARS + 3);
+        assert!(!text.contains('\n'));
+        assert!(!text.contains('\r'));
+        for fragment in [
+            "/home/alice",
+            "C:\\Users",
+            "--accessToken",
+            "-Xmx8192M",
+            "-Dtoken",
+            "raw-secret",
+            "provider_payload",
+            "provider-secret",
+            "account_id",
+            "account-secret",
+            "username",
+            "SecretPlayer",
+            "java.exe",
+            "eyJheader123456789",
+        ] {
+            assert!(
+                !text.contains(fragment),
+                "live launch failure leaked fragment {fragment:?}: {text}"
+            );
+        }
+    }
+
+    fn unique_test_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
+    }
+}

@@ -5,7 +5,7 @@ import { Button, Input } from '../../../ui/Atoms';
 import { openContextMenu } from '../../../ui/ContextMenu';
 import { SelectionActionPill, SelectionCheckbox } from '../../../ui/SelectionActionPill';
 import { selectionMenuItem, selectionToggleLabel, useSelection } from '../../../ui/selection';
-import type { EnrichedInstance, InstanceMod } from '../../../types';
+import type { EnrichedInstance, InstanceMod } from '../../../types-instance';
 import { fmtBytes } from '../format';
 import type { ResourceLoadState } from '../resources';
 import { openInstanceFolder } from '../instance-actions';

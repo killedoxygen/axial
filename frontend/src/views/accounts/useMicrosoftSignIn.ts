@@ -58,11 +58,7 @@ export function useMicrosoftSignIn(options: MicrosoftSignInOptions = {}): {
         return;
       }
 
-      const profileName =
-        typeof result.profile_name === 'string' && result.profile_name.trim()
-          ? result.profile_name.trim()
-          : 'Minecraft profile';
-      setMessage({ tone: 'ok', text: `${profileName} verified. Online launch is ready.` });
+      setMessage({ tone: 'ok', text: 'Microsoft sign-in completed.' });
     } catch (err: unknown) {
       setMessage({
         tone: 'err',

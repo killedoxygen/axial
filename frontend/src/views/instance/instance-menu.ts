@@ -1,6 +1,6 @@
 import { openContextMenu, type ContextMenuItem } from '../../ui/ContextMenu';
 import { navigate } from '../../ui-state';
-import type { Instance } from '../../types';
+import type { Instance } from '../../types-instance';
 import { deleteInstanceFlow, duplicateInstance, openInstanceFolder, renameInstance } from './instance-actions';
 
 export function instanceMenuItems(inst: Instance): ContextMenuItem[] {

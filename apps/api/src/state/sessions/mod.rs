@@ -2,6 +2,11 @@ mod classify;
 mod priority;
 mod supervisor;
 
+use crate::execution::process::{
+    ProcessKillReason, ProcessKillRequest, ProcessObservation, ProcessObservationRequest,
+    ProcessStopIntent, ProcessStopRequest, observe_process, process_killed, process_session_target,
+    process_stage_evidence, process_stop_requested,
+};
 use croopor_launcher::{
     LaunchEvent, LaunchFailure, LaunchFailureClass, LaunchLogEvent, LaunchNotice,
     LaunchPriorityEvidence, LaunchSessionOutcomeKind, LaunchSessionRecord, LaunchStageEvidence,
@@ -23,7 +28,9 @@ const MAX_STAGE_NOTE_CHARS: usize = 160;
 const MAX_NOTICE_MESSAGE_CHARS: usize = 180;
 const MAX_NOTICE_DETAIL_CHARS: usize = 240;
 const MAX_NOTICE_DETAILS: usize = 8;
+const MAX_LAUNCH_LOG_LINE_CHARS: usize = 1_000;
 const PRIVATE_NOTICE_FALLBACK: &str = "Launch status details were hidden for privacy.";
+const FAILURE_SIGNAL_VALID_FOR_EXIT_MS: u64 = 15_000;
 
 struct SessionEntry {
     record: LaunchSessionRecord,
@@ -32,8 +39,21 @@ struct SessionEntry {
     startup_observed: Arc<AtomicBool>,
     boot_completed: Arc<AtomicBool>,
     log_count: Arc<AtomicUsize>,
-    observed_failure: Option<LaunchFailureClass>,
+    observed_failure: Option<ObservedFailureSignal>,
     stop_requested: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ObservedFailureSignal {
+    class: LaunchFailureClass,
+    observed_at_ms: u64,
+}
+
+impl ObservedFailureSignal {
+    fn fresh_for_exit(self, exit_observed_at_ms: u64) -> Option<LaunchFailureClass> {
+        let age_ms = exit_observed_at_ms.saturating_sub(self.observed_at_ms);
+        (age_ms <= FAILURE_SIGNAL_VALID_FOR_EXIT_MS).then_some(self.class)
+    }
 }
 
 pub struct SessionStore {
@@ -125,12 +145,24 @@ impl SessionStore {
     ) {
         let source = source.into();
         let text = text.into();
+        let now = now_ms();
         let mut sessions = self.sessions.write().await;
         let mut changed = false;
         if let Some(entry) = sessions.get_mut(session_id) {
             entry.startup_observed.store(true, Ordering::Relaxed);
             entry.log_count.fetch_add(1, Ordering::Relaxed);
-            if classify::boot_marker_detected(&text) && record_boot_completion(entry, now_ms()) {
+            let boot_evidence =
+                if classify::boot_marker_detected(&text) && record_boot_completion(entry, now) {
+                    Some(process_observation_stage_evidence(
+                        session_id,
+                        ProcessObservation::BootEvidence {
+                            label: "boot_marker",
+                        },
+                    ))
+                } else {
+                    None
+                };
+            if boot_evidence.is_some() {
                 entry.observed_failure = None;
                 let pid = entry.record.pid;
                 match priority::promote_after_boot(pid) {
@@ -155,6 +187,7 @@ impl SessionStore {
                     LaunchState::Starting | LaunchState::Monitoring
                 )
             {
+                let evidence = boot_evidence.unwrap_or_default();
                 let mut status = LaunchStatusEvent {
                     state: "running".to_string(),
                     benchmark: entry.record.benchmark.clone(),
@@ -166,17 +199,34 @@ impl SessionStore {
                     guardian: entry.record.guardian.clone(),
                     outcome: None,
                     notice: None,
-                    evidence: Vec::new(),
+                    evidence,
                     stages: Vec::new(),
                 };
                 apply_status_update(entry, &mut status);
                 let _ = entry.events.send(LaunchEvent::Status(status));
                 changed = true;
+            } else if let Some(evidence) = boot_evidence {
+                apply_stage_evidence(entry.record.stages.last_mut(), &evidence);
+                changed = true;
             }
             let failure_class = classify_startup_failure_text(&text);
             if failure_class != LaunchFailureClass::Unknown {
-                entry.observed_failure = Some(failure_class);
+                entry.observed_failure = Some(ObservedFailureSignal {
+                    class: failure_class,
+                    observed_at_ms: now,
+                });
             }
+            let source = crate::observability::sanitize_evidence_token(
+                &source,
+                crate::observability::RedactionAudience::UserVisible,
+                32,
+            )
+            .unwrap_or_else(|| "game".to_string());
+            let text = crate::observability::sanitize_public_log_line(
+                &text,
+                crate::observability::RedactionAudience::UserVisible,
+                MAX_LAUNCH_LOG_LINE_CHARS,
+            );
             let _ = entry
                 .events
                 .send(LaunchEvent::Log(LaunchLogEvent { source, text }));
@@ -254,7 +304,7 @@ impl SessionStore {
 
         let session_id = record.session_id.0.clone();
         let child_handle = Arc::new(Mutex::new(child));
-        let mut startup_observed = Arc::new(AtomicBool::new(false));
+        let mut boot_completed = Arc::new(AtomicBool::new(false));
         {
             let mut sessions = self.sessions.write().await;
             if let Some(entry) = sessions.get_mut(&session_id) {
@@ -272,7 +322,7 @@ impl SessionStore {
                 ensure_stage_started(&mut stored_record, now_ms());
                 entry.record = stored_record;
                 entry.child = Some(child_handle.clone());
-                startup_observed = entry.startup_observed.clone();
+                boot_completed = entry.boot_completed.clone();
                 entry.startup_observed.store(false, Ordering::Relaxed);
                 entry.boot_completed.store(false, Ordering::Relaxed);
                 entry.log_count.store(0, Ordering::Relaxed);
@@ -290,8 +340,8 @@ impl SessionStore {
                         },
                         events,
                         child: Some(child_handle.clone()),
-                        startup_observed: startup_observed.clone(),
-                        boot_completed: Arc::new(AtomicBool::new(false)),
+                        startup_observed: Arc::new(AtomicBool::new(false)),
+                        boot_completed: boot_completed.clone(),
                         log_count: Arc::new(AtomicUsize::new(0)),
                         observed_failure: None,
                         stop_requested: false,
@@ -326,7 +376,7 @@ impl SessionStore {
             self.clone(),
             session_id.clone(),
             child_handle.clone(),
-            startup_observed,
+            boot_completed,
         );
         supervisor::spawn_wait_task(self.clone(), session_id, child_handle);
 
@@ -350,6 +400,10 @@ impl SessionStore {
                 ));
             };
             entry.stop_requested = true;
+            let evidence =
+                process_stop_stage_evidence(session_id, ProcessStopIntent::UserRequested);
+            ensure_stage_started(&mut entry.record, now_ms());
+            apply_stage_evidence(entry.record.stages.last_mut(), &evidence);
             entry.child.clone()
         };
         if let Some(child) = child {
@@ -372,7 +426,17 @@ impl SessionStore {
             .read()
             .await
             .get(session_id)
+            .and_then(|entry| entry.observed_failure.map(|signal| signal.class))
+    }
+
+    pub async fn observed_failure_for_exit(&self, session_id: &str) -> Option<LaunchFailureClass> {
+        let exit_observed_at_ms = now_ms();
+        self.sessions
+            .read()
+            .await
+            .get(session_id)
             .and_then(|entry| entry.observed_failure)
+            .and_then(|signal| signal.fresh_for_exit(exit_observed_at_ms))
     }
 
     pub async fn terminate_all(&self) {
@@ -597,6 +661,39 @@ fn default_priority_evidence() -> LaunchPriorityEvidence {
         promotion: None,
         promotion_error: None,
     }
+}
+
+fn process_observation_stage_evidence(
+    session_id: &str,
+    observation: ProcessObservation<'_>,
+) -> Vec<LaunchStageEvidence> {
+    let report = observe_process(ProcessObservationRequest::new(
+        process_session_target(session_id),
+        observation,
+    ));
+    process_stage_evidence(&report.facts)
+}
+
+fn process_kill_stage_evidence(
+    session_id: &str,
+    reason: ProcessKillReason,
+) -> Vec<LaunchStageEvidence> {
+    let report = process_killed(ProcessKillRequest::new(
+        process_session_target(session_id),
+        reason,
+    ));
+    process_stage_evidence(&report.facts)
+}
+
+fn process_stop_stage_evidence(
+    session_id: &str,
+    intent: ProcessStopIntent,
+) -> Vec<LaunchStageEvidence> {
+    let report = process_stop_requested(ProcessStopRequest::new(
+        process_session_target(session_id),
+        intent,
+    ));
+    process_stage_evidence(&report.facts)
 }
 
 fn platform_default_start_mode() -> &'static str {
@@ -873,38 +970,12 @@ fn sanitize_public_stage_text(value: &str, max_chars: usize) -> Option<String> {
 }
 
 fn sanitize_public_json_value(value: serde_json::Value) -> Option<serde_json::Value> {
-    match value {
-        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
-            Some(value)
-        }
-        serde_json::Value::String(value) => {
-            sanitize_public_notice_text(&value, MAX_NOTICE_DETAIL_CHARS)
-                .map(serde_json::Value::String)
-        }
-        serde_json::Value::Array(values) => {
-            let values = values
-                .into_iter()
-                .filter_map(sanitize_public_json_value)
-                .collect::<Vec<_>>();
-            Some(serde_json::Value::Array(values))
-        }
-        serde_json::Value::Object(values) => {
-            let mut sanitized = serde_json::Map::new();
-            for (key, value) in values {
-                let Some(key) = crate::observability::sanitize_evidence_token(
-                    &key,
-                    crate::observability::RedactionAudience::UserVisible,
-                    64,
-                ) else {
-                    continue;
-                };
-                if let Some(value) = sanitize_public_json_value(value) {
-                    sanitized.insert(key, value);
-                }
-            }
-            Some(serde_json::Value::Object(sanitized))
-        }
-    }
+    crate::observability::sanitize_public_json_value(
+        value,
+        crate::observability::RedactionAudience::UserVisible,
+        MAX_NOTICE_DETAIL_CHARS,
+        64,
+    )
 }
 
 fn command_xmx_mb(command: &[String]) -> Option<u64> {
@@ -933,7 +1004,9 @@ impl Default for SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use croopor_launcher::{LaunchSessionExitReason, LaunchStageEvidence, SessionId};
+    use croopor_launcher::{
+        LaunchSessionExitReason, LaunchSessionOutcome, LaunchStageEvidence, SessionId,
+    };
     use serde_json::json;
     use std::sync::Arc;
     use tokio::process::Command;
@@ -1480,6 +1553,10 @@ mod tests {
             Some(LaunchFailureClass::JvmUnsupportedOption.as_str())
         );
         assert_eq!(status.failure_detail, None);
+        let status_json = serde_json::to_string(&status).expect("terminal status json");
+        assert!(status_json.contains("execution_process_exited"));
+        assert!(status_json.contains("execution_process_exit_code"));
+        assert_public_session_payload_excludes_sensitive_content(&status_json);
         assert_eq!(
             store.observed_failure(session_id).await,
             Some(LaunchFailureClass::JvmUnsupportedOption)
@@ -1520,12 +1597,18 @@ mod tests {
             panic!("expected status event");
         };
         assert_eq!(status.state, "running");
+        let status_json = serde_json::to_string(&status).expect("boot status json");
+        assert!(status_json.contains("execution_process_boot_evidence"));
+        assert_public_session_payload_excludes_sensitive_content(&status_json);
 
         let stored = store
             .get("boot-marker-duration")
             .await
             .expect("stored record");
         assert_eq!(stored.state, LaunchState::Running);
+        let stored_json = serde_json::to_string(&stored.stages).expect("stored stages json");
+        assert!(stored_json.contains("execution_process_boot_evidence"));
+        assert_public_session_payload_excludes_sensitive_content(&stored_json);
         assert!(stored.boot_completed_at_ms.is_some());
         assert!(stored.boot_duration_ms.expect("boot duration") >= 4_200);
         let priority = stored.priority.expect("priority evidence");
@@ -1544,6 +1627,57 @@ mod tests {
             assert_eq!(priority.start_mode, "noop");
             assert_eq!(priority.promotion.as_deref(), Some("noop"));
         }
+    }
+
+    #[tokio::test]
+    async fn launch_log_events_preserve_normal_minecraft_markers() {
+        let store = SessionStore::new();
+        let session_id = "normal-log-marker";
+        store.insert(test_record(session_id)).await;
+        let mut receiver = store.subscribe(session_id).await.expect("subscribe");
+
+        store
+            .emit_log(
+                session_id,
+                "stdout",
+                "[Render thread/INFO]: Reloading ResourceManager: vanilla",
+            )
+            .await;
+
+        let emitted = receiver.recv().await.expect("log event");
+        let LaunchEvent::Log(log) = emitted else {
+            panic!("expected log event");
+        };
+        assert_eq!(log.source, "stdout");
+        assert_eq!(
+            log.text,
+            "[Render thread/INFO]: Reloading ResourceManager: vanilla"
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_log_events_redact_sensitive_public_lines() {
+        let store = SessionStore::new();
+        let session_id = "sensitive-log-line";
+        store.insert(test_record(session_id)).await;
+        let mut receiver = store.subscribe(session_id).await.expect("subscribe");
+
+        store
+            .emit_log(
+                session_id,
+                r"C:\Users\Alice\AppData\stdout",
+                "failed for /home/alice/.minecraft java.exe --accessToken raw-secret-token -Xmx8192M -Dtoken=raw provider_payload=provider-secret account_id=account-secret username=SecretPlayer",
+            )
+            .await;
+
+        let emitted = receiver.recv().await.expect("log event");
+        let LaunchEvent::Log(log) = emitted else {
+            panic!("expected log event");
+        };
+        assert_eq!(log.source, "game");
+        assert_eq!(log.text, crate::observability::PUBLIC_LOG_LINE_REDACTED);
+        let log_json = serde_json::to_string(&log).expect("log json");
+        assert_public_session_payload_excludes_sensitive_content(&log_json);
     }
 
     #[tokio::test]
@@ -1598,6 +1732,156 @@ mod tests {
             stored.outcome.expect("stored outcome").reason,
             LaunchSessionExitReason::ExternalUserClosed
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn launch_stop_request_records_execution_stop_intent_evidence() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "stop-intent-evidence";
+        store.insert(test_record(session_id)).await;
+        let mut receiver = store.subscribe(session_id).await.expect("subscribe");
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("sleep 5");
+
+        store
+            .start_process(test_record(session_id), command)
+            .await
+            .expect("spawn sleep process");
+        store.kill(session_id).await.expect("kill process");
+
+        let mut terminal_status = None;
+        for _ in 0..8 {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+                .await
+                .expect("status event")
+                .expect("broadcast event");
+            if let LaunchEvent::Status(status) = event
+                && status.state == "exited"
+            {
+                terminal_status = Some(status);
+                break;
+            }
+        }
+
+        let status = terminal_status.expect("terminal status");
+        assert_eq!(
+            status.outcome.as_ref().expect("stop outcome").reason,
+            LaunchSessionExitReason::LauncherStopped
+        );
+        let status_json = serde_json::to_string(&status).expect("status json");
+        assert!(status_json.contains("execution_process_stop_requested"));
+        assert!(status_json.contains("execution_process_exited"));
+        assert_public_session_payload_excludes_sensitive_content(&status_json);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn launch_watchdog_kills_outputting_process_without_boot_marker() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "watchdog-no-boot-marker";
+        store.insert(test_record(session_id)).await;
+        let mut receiver = store.subscribe(session_id).await.expect("subscribe");
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("printf '%s\\n' 'ordinary startup output'; sleep 30");
+
+        store
+            .start_process(test_record(session_id), command)
+            .await
+            .expect("spawn stalled process");
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(61)).await;
+        tokio::task::yield_now().await;
+
+        let mut terminal_status = None;
+        for _ in 0..20 {
+            while let Ok(event) = receiver.try_recv() {
+                if let LaunchEvent::Status(status) = event
+                    && status.state == "exited"
+                {
+                    terminal_status = Some(status);
+                    break;
+                }
+            }
+            if terminal_status.is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let status = terminal_status.expect("watchdog terminal status");
+        assert_eq!(
+            status.failure_class.as_deref(),
+            Some(LaunchFailureClass::StartupStalled.as_str())
+        );
+        assert_eq!(
+            status.outcome.as_ref().expect("watchdog outcome").reason,
+            LaunchSessionExitReason::WatchdogKilled
+        );
+        let status_json = serde_json::to_string(&status).expect("status json");
+        assert!(status_json.contains("execution_process_killed"));
+        assert!(status_json.contains("execution_process_watchdog_action"));
+        assert_public_session_payload_excludes_sensitive_content(&status_json);
+    }
+
+    #[tokio::test]
+    async fn stale_failure_signal_is_ignored_for_later_clean_exit() {
+        let store = SessionStore::new();
+        let session_id = "stale-failure-clean-exit";
+        store
+            .insert(terminal_record(session_id, LaunchState::Running, true))
+            .await;
+
+        {
+            let mut sessions = store.sessions.write().await;
+            let entry = sessions.get_mut(session_id).expect("session entry");
+            entry.observed_failure = Some(ObservedFailureSignal {
+                class: LaunchFailureClass::JvmUnsupportedOption,
+                observed_at_ms: now_ms().saturating_sub(FAILURE_SIGNAL_VALID_FOR_EXIT_MS + 1),
+            });
+        }
+
+        assert_eq!(
+            store.observed_failure(session_id).await,
+            Some(LaunchFailureClass::JvmUnsupportedOption)
+        );
+        let exit_failure = store.observed_failure_for_exit(session_id).await;
+        assert_eq!(exit_failure, None);
+
+        let mut receiver = store.subscribe(session_id).await.expect("subscribe");
+        store
+            .emit_status(
+                session_id,
+                LaunchStatusEvent {
+                    state: "exited".to_string(),
+                    benchmark: None,
+                    pid: None,
+                    exit_code: Some(0),
+                    failure_class: exit_failure
+                        .map(|failure_class| failure_class.as_str().to_string()),
+                    failure_detail: None,
+                    healing: None,
+                    guardian: None,
+                    outcome: None,
+                    notice: None,
+                    evidence: Vec::new(),
+                    stages: Vec::new(),
+                },
+            )
+            .await;
+
+        let status = recv_status(&mut receiver).await;
+        let stored = store.get(session_id).await.expect("stored record");
+        assert_eq!(stored.failure, None);
+        assert_eq!(
+            stored.outcome.expect("stored outcome").reason,
+            LaunchSessionExitReason::ExternalUserClosed
+        );
+        assert_eq!(status.notice, None);
+        let status_json = serde_json::to_string(&status).expect("status json");
+        assert!(!status_json.to_ascii_lowercase().contains("crash"));
     }
 
     #[tokio::test]
@@ -1755,6 +2039,174 @@ mod tests {
         assert_eq!(
             unknown_status.notice.as_ref().map(|notice| notice.tone),
             Some(croopor_launcher::LaunchNoticeTone::Error)
+        );
+    }
+
+    #[tokio::test]
+    async fn fake_process_session_harness_covers_exit_outcomes_without_shell_timing() {
+        let store = SessionStore::new();
+
+        let mut preboot_jvm =
+            SessionScenarioHarness::new(&store, "fake-preboot-jvm", LaunchState::Starting, false)
+                .await;
+        preboot_jvm
+            .emit_log(
+                "stderr",
+                "Unrecognized VM option '-XX:+UseZGC' /home/alice/.croopor/java.exe --accessToken raw-secret-token",
+            )
+            .await;
+        let preboot_status = preboot_jvm.exit_with_observed_failure(Some(1)).await;
+        assert_eq!(
+            preboot_status.failure_class.as_deref(),
+            Some(LaunchFailureClass::JvmUnsupportedOption.as_str())
+        );
+        assert_eq!(
+            preboot_status
+                .outcome
+                .as_ref()
+                .expect("preboot outcome")
+                .reason,
+            LaunchSessionExitReason::StartupFailed
+        );
+        assert_eq!(
+            preboot_jvm
+                .record()
+                .await
+                .outcome
+                .expect("stored preboot outcome")
+                .reason,
+            LaunchSessionExitReason::StartupFailed
+        );
+        assert_public_session_payload_excludes_sensitive_content(
+            &serde_json::to_string(&preboot_status).expect("preboot status json"),
+        );
+
+        let mut watchdog =
+            SessionScenarioHarness::new(&store, "fake-watchdog", LaunchState::Monitoring, false)
+                .await;
+        let watchdog_status = watchdog.watchdog_killed().await;
+        assert_eq!(
+            watchdog_status.failure_class.as_deref(),
+            Some(LaunchFailureClass::StartupStalled.as_str())
+        );
+        assert_eq!(
+            watchdog_status
+                .outcome
+                .as_ref()
+                .expect("watchdog outcome")
+                .reason,
+            LaunchSessionExitReason::WatchdogKilled
+        );
+        let watchdog_json = serde_json::to_string(&watchdog_status).expect("watchdog status json");
+        assert!(watchdog_json.contains("execution_process_killed"));
+        assert!(watchdog_json.contains("execution_process_watchdog_action"));
+        assert_public_session_payload_excludes_sensitive_content(&watchdog_json);
+
+        let mut external_close = SessionScenarioHarness::new(
+            &store,
+            "fake-external-close",
+            LaunchState::Starting,
+            false,
+        )
+        .await;
+        let running_status = external_close.emit_boot_marker().await;
+        assert_eq!(running_status.state, "running");
+        let external_status = external_close.exit_with_observed_failure(Some(0)).await;
+        assert_eq!(external_status.notice, None);
+        assert_eq!(
+            external_status
+                .outcome
+                .as_ref()
+                .expect("external close outcome")
+                .reason,
+            LaunchSessionExitReason::ExternalUserClosed
+        );
+        assert!(
+            !serde_json::to_string(&external_status)
+                .expect("external status json")
+                .to_ascii_lowercase()
+                .contains("crash")
+        );
+
+        let mut launcher_stop =
+            SessionScenarioHarness::new(&store, "fake-launcher-stop", LaunchState::Running, true)
+                .await;
+        launcher_stop.request_launcher_stop().await;
+        let launcher_stop_status = launcher_stop.exit_with_observed_failure(Some(-9)).await;
+        assert_eq!(launcher_stop_status.notice, None);
+        assert_eq!(
+            launcher_stop_status
+                .outcome
+                .as_ref()
+                .expect("launcher stop outcome")
+                .reason,
+            LaunchSessionExitReason::LauncherStopped
+        );
+        let launcher_stop_json =
+            serde_json::to_string(&launcher_stop_status).expect("launcher stop status json");
+        assert!(launcher_stop_json.contains("execution_process_stop_requested"));
+        assert_public_session_payload_excludes_sensitive_content(&launcher_stop_json);
+
+        let mut postboot_crash =
+            SessionScenarioHarness::new(&store, "fake-postboot-crash", LaunchState::Running, true)
+                .await;
+        let postboot_status = postboot_crash.exit_with_observed_failure(Some(1)).await;
+        assert_eq!(
+            postboot_status
+                .outcome
+                .as_ref()
+                .expect("postboot outcome")
+                .reason,
+            LaunchSessionExitReason::CrashedAfterBoot
+        );
+        assert_eq!(
+            postboot_status
+                .notice
+                .as_ref()
+                .map(|notice| notice.message.as_str()),
+            Some("Minecraft crashed after startup.")
+        );
+
+        let mut stale_signal = SessionScenarioHarness::new(
+            &store,
+            "fake-stale-signal-clean-exit",
+            LaunchState::Running,
+            true,
+        )
+        .await;
+        stale_signal
+            .seed_stale_failure(LaunchFailureClass::JvmUnsupportedOption)
+            .await;
+        let stale_status = stale_signal.exit_with_observed_failure(Some(0)).await;
+        assert_eq!(stale_status.failure_class, None);
+        assert_eq!(stale_status.notice, None);
+        assert_eq!(
+            stale_status
+                .outcome
+                .as_ref()
+                .expect("stale signal clean outcome")
+                .reason,
+            LaunchSessionExitReason::ExternalUserClosed
+        );
+
+        let mut unknown =
+            SessionScenarioHarness::new(&store, "fake-unknown-exit", LaunchState::Starting, false)
+                .await;
+        let unknown_status = unknown.exit_with_observed_failure(Some(0)).await;
+        assert_eq!(
+            unknown_status
+                .outcome
+                .as_ref()
+                .expect("unknown outcome")
+                .reason,
+            LaunchSessionExitReason::UnknownExit
+        );
+        assert_eq!(
+            unknown_status
+                .notice
+                .as_ref()
+                .map(|notice| notice.message.as_str()),
+            Some("Minecraft exited and the launcher could not classify the reason.")
         );
     }
 
@@ -1941,6 +2393,161 @@ mod tests {
             notice: None,
             evidence: Vec::new(),
             stages: Vec::new(),
+        }
+    }
+
+    struct SessionScenarioHarness<'a> {
+        store: &'a SessionStore,
+        session_id: String,
+        receiver: tokio::sync::broadcast::Receiver<LaunchEvent>,
+    }
+
+    impl<'a> SessionScenarioHarness<'a> {
+        async fn new(
+            store: &'a SessionStore,
+            session_id: &str,
+            state: LaunchState,
+            boot_completed: bool,
+        ) -> Self {
+            store
+                .insert(terminal_record(session_id, state, boot_completed))
+                .await;
+            let receiver = store.subscribe(session_id).await.expect("subscribe");
+            Self {
+                store,
+                session_id: session_id.to_string(),
+                receiver,
+            }
+        }
+
+        async fn emit_log(&mut self, source: &str, text: &str) -> LaunchLogEvent {
+            self.store.emit_log(&self.session_id, source, text).await;
+            self.recv_log().await
+        }
+
+        async fn emit_boot_marker(&mut self) -> LaunchStatusEvent {
+            self.store
+                .emit_log(
+                    &self.session_id,
+                    "stdout",
+                    "[Render thread/INFO]: LWJGL Version: 3.3.3",
+                )
+                .await;
+            let status = self.recv_status().await;
+            let _ = self.recv_log().await;
+            status
+        }
+
+        async fn request_launcher_stop(&self) {
+            let mut sessions = self.store.sessions.write().await;
+            let entry = sessions
+                .get_mut(&self.session_id)
+                .expect("session should exist for stop intent");
+            entry.stop_requested = true;
+            let evidence =
+                process_stop_stage_evidence(&self.session_id, ProcessStopIntent::UserRequested);
+            ensure_stage_started(&mut entry.record, now_ms());
+            apply_stage_evidence(entry.record.stages.last_mut(), &evidence);
+        }
+
+        async fn seed_stale_failure(&self, failure_class: LaunchFailureClass) {
+            let mut sessions = self.store.sessions.write().await;
+            let entry = sessions
+                .get_mut(&self.session_id)
+                .expect("session should exist for stale failure");
+            entry.observed_failure = Some(ObservedFailureSignal {
+                class: failure_class,
+                observed_at_ms: now_ms().saturating_sub(FAILURE_SIGNAL_VALID_FOR_EXIT_MS + 1),
+            });
+        }
+
+        async fn watchdog_killed(&mut self) -> LaunchStatusEvent {
+            self.store
+                .emit_status(
+                    &self.session_id,
+                    LaunchStatusEvent {
+                        state: "exited".to_string(),
+                        benchmark: None,
+                        pid: None,
+                        exit_code: Some(-1),
+                        failure_class: Some(
+                            LaunchFailureClass::StartupStalled.as_str().to_string(),
+                        ),
+                        failure_detail: Some("no startup activity observed".to_string()),
+                        healing: None,
+                        guardian: None,
+                        outcome: Some(LaunchSessionOutcome::from_reason(
+                            LaunchSessionExitReason::WatchdogKilled,
+                        )),
+                        notice: None,
+                        evidence: process_kill_stage_evidence(
+                            &self.session_id,
+                            ProcessKillReason::StartupWatchdog,
+                        ),
+                        stages: Vec::new(),
+                    },
+                )
+                .await;
+            self.recv_status().await
+        }
+
+        async fn exit_with_observed_failure(
+            &mut self,
+            exit_code: Option<i32>,
+        ) -> LaunchStatusEvent {
+            let failure_class = self
+                .store
+                .observed_failure_for_exit(&self.session_id)
+                .await
+                .map(|failure_class| failure_class.as_str().to_string());
+            let evidence = exit_code
+                .map(|exit_code| {
+                    process_observation_stage_evidence(
+                        &self.session_id,
+                        ProcessObservation::ExitCode(exit_code),
+                    )
+                })
+                .unwrap_or_else(|| {
+                    process_observation_stage_evidence(&self.session_id, ProcessObservation::Exited)
+                });
+            self.store
+                .emit_status(
+                    &self.session_id,
+                    LaunchStatusEvent {
+                        state: "exited".to_string(),
+                        benchmark: None,
+                        pid: None,
+                        exit_code,
+                        failure_class,
+                        failure_detail: None,
+                        healing: None,
+                        guardian: None,
+                        outcome: None,
+                        notice: None,
+                        evidence,
+                        stages: Vec::new(),
+                    },
+                )
+                .await;
+            self.recv_status().await
+        }
+
+        async fn record(&self) -> LaunchSessionRecord {
+            self.store
+                .get(&self.session_id)
+                .await
+                .expect("stored record")
+        }
+
+        async fn recv_status(&mut self) -> LaunchStatusEvent {
+            recv_status(&mut self.receiver).await
+        }
+
+        async fn recv_log(&mut self) -> LaunchLogEvent {
+            match self.receiver.recv().await.expect("log event") {
+                LaunchEvent::Log(log) => log,
+                other => panic!("expected log event, got {other:?}"),
+            }
         }
     }
 

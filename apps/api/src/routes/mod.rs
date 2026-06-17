@@ -26,7 +26,6 @@ use axum::{
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 pub use crate::application::flush_pending_saved_skin_applies_for_shutdown;
-pub(crate) use launch::spawn_restart_interrupted_benchmark_suite_drivers;
 pub(crate) use performance::spawn_pending_performance_operations;
 
 pub fn router(state: AppState) -> Router {

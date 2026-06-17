@@ -9,11 +9,17 @@ pub mod accounts;
 pub mod auth;
 pub mod authority;
 pub mod commands;
+pub mod config;
+pub mod dev;
 pub mod install;
 pub mod instances;
+pub mod java;
 pub mod launch;
+pub mod music;
 pub mod performance;
+pub mod setup;
 pub mod skin;
+pub mod status;
 pub mod update;
 pub mod version;
 
@@ -26,9 +32,9 @@ use crate::state::contracts::{
 use serde::{Deserialize, Serialize};
 
 pub(crate) use accounts::{
-    AccountActionResponse, AccountListResponse, AccountPatchRequest, OfflineAccountCreateRequest,
-    accounts, create_offline_account, patch_account, remove_account, select_account,
-    sync_active_offline_account_from_username,
+    AccountActionResponse, AccountListResponse, AccountPatchRequest, AccountRemoveResponse,
+    OfflineAccountCreateRequest, accounts, create_offline_account, patch_account, remove_account,
+    select_account, sync_active_offline_account_from_username,
 };
 pub(crate) use auth::{
     AuthRefreshFailure, AuthStatusResponse, auth_logout_for_state, auth_profile_sync_for_state,
@@ -43,24 +49,32 @@ pub use authority::{
 pub use commands::{
     ApplicationCommandPayload, ApplicationCommandRequest, ApplyPerformancePlanCommand,
     ApplyPerformancePlanPayload, CommandCatalogEntry, CommandPayloadStatus, CommandRequestContract,
-    CommandResultCarrierKind, CommandResultContract, CommandSafetyReview, InstallVersionCommand,
-    InstallVersionPayload, LaunchInstanceCommand, LaunchInstancePayload,
-    PerformancePlanCommandAction, RefreshAccountReadinessCommand, RefreshAccountReadinessPayload,
-    RefreshPerformanceRulesCommand, RefreshPerformanceRulesPayload, RepairInstanceCommand,
-    RepairInstancePayload, StopSessionCommand, StopSessionPayload, StopSessionReason,
-    ValidateInstanceCommand, ValidateInstancePayload, command_catalog, phase_one_command_kinds,
+    CommandResultCarrierKind, CommandResultContract, CommandSafetyReview, CreateInstanceCommand,
+    CreateInstancePayload, InstallVersionCommand, InstallVersionPayload, LaunchInstanceCommand,
+    LaunchInstancePayload, PerformancePlanCommandAction, RefreshAccountReadinessCommand,
+    RefreshAccountReadinessPayload, RefreshPerformanceRulesCommand, RefreshPerformanceRulesPayload,
+    RepairInstanceCommand, RepairInstancePayload, StopSessionCommand, StopSessionPayload,
+    StopSessionReason, ValidateInstanceCommand, ValidateInstancePayload, command_catalog,
+    phase_one_command_kinds,
 };
+pub use config::{ConfigPatch, current_config, update_config};
+pub use dev::{DevCleanupResponse, DevFlushResponse, dev_cleanup_versions, dev_flush};
 pub use install::{
-    InstallApplicationError, InstallGuardianRepairSummary, InstallStartResponse,
+    InstallApplicationError, InstallGuardianRepairSummary, InstallProgressStepViewModel,
+    InstallProgressViewModel, InstallQueueRequest, InstallQueueStateResponse, InstallStartResponse,
     InstallStatusResponse, InstallVersionStaging, InstallVersionStartRequest, LoaderBuildsRequest,
-    LoaderInstallStartRequest, begin_install_operation_journal,
-    install_guardian_repair_summary_from_journal, install_operation_id, install_status,
-    loader_builds, loader_components, loader_error_response, loader_game_versions,
+    LoaderInstallStartRequest, begin_install_operation_journal, enqueue_install,
+    install_events_stream, install_guardian_repair_summary_from_journal, install_operation_id,
+    install_queue_status, install_status, loader_builds, loader_components, loader_error_response,
+    loader_game_versions, loader_install_events_stream, loader_install_progress_view_model,
+    public_loader_install_progress_json, public_vanilla_install_progress_json,
     record_install_operation_guardian_evidence, record_install_operation_guardian_repair_outcome,
-    record_install_operation_interrupted, record_install_operation_progress,
-    repair_install_artifact_corruption_with_guardian, sanitize_install_progress,
+    record_install_operation_interrupted, record_install_operation_progress, remove_queued_install,
+    repair_install_artifact_corruption_with_guardian, retry_install, sanitize_install_progress,
     stage_install_version_command, start_install_version, start_loader_install,
+    vanilla_install_progress_view_model,
 };
+pub use java::{JavaRuntimesResponse, java_runtimes};
 pub use launch::{
     LaunchBoundaryStaging, LaunchBoundaryStagingRequest, LaunchInstanceStaging,
     LaunchPreflightMemory, LaunchPreflightOverride, LaunchPreflightOverrides,
@@ -72,20 +86,31 @@ pub use launch::{
     prepare_launch_session, sanitize_live_launch_failure_message, stage_launch_boundary,
     stage_launch_instance_command, trace_launch_event,
 };
+pub use music::{
+    MusicStatusResponse, MusicTrackBytes, MusicTrackError, MusicTrackRequest, music_status,
+    music_track,
+};
 pub use performance::{
     PerformanceHealthRequest, PerformanceHealthResponse, PerformanceInstallRequest,
     PerformanceInstallResponse, PerformanceInstanceDisplay, PerformanceInstanceOperationResponse,
     PerformanceManagedArtifactSummary, PerformanceMemoryDisplay, PerformanceModeDisplay,
-    PerformancePlanRequest, PerformancePlanResponse, PerformanceRollbackListRequest,
-    PerformanceRollbackListResponse, PerformanceRulesStatusResponse, PerformanceRuntimeDisplay,
-    RefreshPerformanceRulesError, performance_health, performance_install,
+    PerformanceOperationStatusResponse, PerformancePlanRequest, PerformancePlanResponse,
+    PerformanceRollbackListRequest, PerformanceRollbackListResponse,
+    PerformanceRulesStatusResponse, PerformanceRuntimeDisplay, RefreshPerformanceRulesError,
+    SystemResourceResponse, performance_health, performance_install,
     performance_instance_operation, performance_operation_status, performance_plan,
     performance_plan_summary_view_model, performance_rollback_list, performance_rules_status,
     refresh_performance_rules, refresh_performance_rules_error_response,
-    spawn_pending_performance_operations,
+    spawn_pending_performance_operations, system_resource_status,
+};
+pub use setup::{
+    SetupBrowseResponse, SetupDefaultsResponse, SetupLibraryResponse, SetupPathRequest,
+    SetupStatusResponse, SetupValidateResponse, onboarding_complete, setup_browse, setup_defaults,
+    setup_init, setup_set_dir, setup_validate,
 };
 pub(crate) use skin::flush_pending_saved_skin_applies_for_launch;
 pub use skin::flush_pending_saved_skin_applies_for_shutdown;
+pub use status::{StatusResponse, launcher_status};
 pub use update::{UpdateResponse, update_status};
 pub use version::{
     CatalogEntry, CatalogResponse, DeleteVersionRequest, SharedDataInfo, VersionInfoResponse,
@@ -251,6 +276,8 @@ pub enum ViewModelTone {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ViewModelAction {
     pub command: CommandKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
     pub label: String,
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]

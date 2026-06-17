@@ -1,8 +1,8 @@
 use super::{
     Diagnosis, DiagnosisId, GuardianActionKind, GuardianConfidence, GuardianDecision,
-    GuardianDecisionKind, GuardianDomain, GuardianImpactVector, GuardianLaunchRecoveryKind,
-    GuardianMode, GuardianPolicyContext, GuardianSeverity, GuardianUserOutcome, SafetyCase,
-    decide_guardian_policy,
+    GuardianDecisionKind, GuardianDomain, GuardianImpactVector, GuardianLaunchRecoveryDirective,
+    GuardianLaunchRecoveryEffect, GuardianLaunchRecoveryKind, GuardianMode, GuardianPolicyContext,
+    GuardianSeverity, GuardianUserOutcome, SafetyCase, decide_guardian_policy,
 };
 use crate::observability::{RedactionAudience, sanitize_evidence_text};
 use crate::state::contracts::{
@@ -72,21 +72,6 @@ pub struct GuardianStartupFailureOutcome {
     pub guardian_decision: GuardianDecision,
     pub user_outcome: GuardianUserOutcome,
     pub directive: Option<GuardianLaunchRecoveryDirective>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct GuardianLaunchRecoveryDirective {
-    pub kind: GuardianLaunchRecoveryKind,
-    pub effect: GuardianLaunchRecoveryEffect,
-    pub description: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum GuardianLaunchRecoveryEffect {
-    ForceManagedRuntime,
-    StripRawJvmArgs,
-    DowngradePreset { preset: String },
-    DisableCustomGc,
 }
 
 pub fn guardian_prepare_failure_outcome(

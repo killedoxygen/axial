@@ -1,7 +1,7 @@
 import type { JSX } from 'preact';
 import { Icon } from '../../../ui/Icons';
 import { Card } from '../../../ui/Atoms';
-import type { EnrichedInstance } from '../../../types';
+import type { EnrichedInstance } from '../../../types-instance';
 import { openInstanceFolder } from '../instance-actions';
 
 export function QuickActionsCard({

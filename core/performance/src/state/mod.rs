@@ -13,6 +13,7 @@ const ROLLBACK_DIR_NAME: &str = "rollback";
 const ROLLBACK_FILE_NAME: &str = "latest.json";
 const ROLLBACK_FILES_DIR_NAME: &str = "files";
 const ROLLBACK_HISTORY_DIR_NAME: &str = "history";
+const ROLLBACK_TMP_DIR_NAME: &str = "tmp";
 const ROLLBACK_SCHEMA_VERSION: i32 = 1;
 const ROLLBACK_HISTORY_LIMIT: usize = 5;
 
@@ -65,15 +66,10 @@ pub struct RollbackSnapshotSummary {
 pub struct RollbackArtifact {
     pub filename: String,
     pub stored_filename: String,
-    #[serde(default)]
     pub project_id: String,
-    #[serde(default)]
     pub version_id: String,
-    #[serde(default = "default_rollback_artifact_ownership")]
     pub ownership_class: OwnershipClass,
-    #[serde(default)]
     pub sha512_present: bool,
-    #[serde(default)]
     pub sha512_verified: bool,
 }
 
@@ -322,9 +318,14 @@ pub fn restore_rollback_snapshot(
         .iter()
         .map(|installed| installed.filename.clone())
         .collect();
+    let current_state = load_state(instance_mods_dir)?;
+    let current_filenames = managed_filenames(current_state.as_ref());
 
-    if let Ok(Some(current_state)) = load_state(instance_mods_dir) {
-        validate_state(&current_state)?;
+    let restore_targets =
+        prepare_rollback_restore_targets(instance_mods_dir, snapshot, &current_filenames)?;
+    stage_rollback_restore_targets(&restore_targets)?;
+
+    if let Some(current_state) = current_state {
         for installed in current_state.installed_mods {
             if snapshot_filenames.contains(&installed.filename) {
                 continue;
@@ -338,20 +339,10 @@ pub fn restore_rollback_snapshot(
         }
     }
 
-    let files_dir = rollback_files_dir_path(instance_mods_dir);
-    for artifact in &snapshot.artifacts {
-        let source_path = files_dir.join(&artifact.stored_filename);
-        if !source_path.is_file() {
-            return Err(StateError::InvalidRollback(format!(
-                "missing rollback artifact {}",
-                artifact.stored_filename
-            )));
-        }
-        let final_path = managed_artifact_path(instance_mods_dir, &artifact.filename)?;
-        let temp_path = final_path.with_extension("rollback.tmp");
-        fs::copy(&source_path, &temp_path)?;
-        replace_file_atomic(&temp_path, &final_path)?;
+    for target in &restore_targets {
+        replace_file_atomic(&target.temp_path, &target.final_path)?;
     }
+    cleanup_rollback_restore_targets(&restore_targets);
 
     save_state(instance_mods_dir, &snapshot.state)?;
     Ok(snapshot.state.clone())
@@ -369,9 +360,15 @@ pub async fn restore_rollback_snapshot_async(
         .iter()
         .map(|installed| installed.filename.clone())
         .collect();
+    let current_state = load_state_async(instance_mods_dir).await?;
+    let current_filenames = managed_filenames(current_state.as_ref());
 
-    if let Ok(Some(current_state)) = load_state_async(instance_mods_dir).await {
-        validate_state(&current_state)?;
+    let restore_targets =
+        prepare_rollback_restore_targets_async(instance_mods_dir, snapshot, &current_filenames)
+            .await?;
+    stage_rollback_restore_targets_async(&restore_targets).await?;
+
+    if let Some(current_state) = current_state {
         for installed in current_state.installed_mods {
             if snapshot_filenames.contains(&installed.filename) {
                 continue;
@@ -385,20 +382,10 @@ pub async fn restore_rollback_snapshot_async(
         }
     }
 
-    let files_dir = rollback_files_dir_path(instance_mods_dir);
-    for artifact in &snapshot.artifacts {
-        let source_path = files_dir.join(&artifact.stored_filename);
-        if !matches!(async_fs::metadata(&source_path).await, Ok(metadata) if metadata.is_file()) {
-            return Err(StateError::InvalidRollback(format!(
-                "missing rollback artifact {}",
-                artifact.stored_filename
-            )));
-        }
-        let final_path = managed_artifact_path(instance_mods_dir, &artifact.filename)?;
-        let temp_path = final_path.with_extension("rollback.tmp");
-        async_fs::copy(&source_path, &temp_path).await?;
-        replace_file_atomic_async(&temp_path, &final_path).await?;
+    for target in &restore_targets {
+        replace_file_atomic_async(&target.temp_path, &target.final_path).await?;
     }
+    cleanup_rollback_restore_targets_async(&restore_targets).await;
 
     save_state_async(instance_mods_dir, &snapshot.state).await?;
     Ok(snapshot.state.clone())
@@ -428,6 +415,10 @@ fn rollback_files_dir_path(instance_mods_dir: &Path) -> PathBuf {
 
 fn rollback_history_dir_path(instance_mods_dir: &Path) -> PathBuf {
     rollback_dir_path(instance_mods_dir).join(ROLLBACK_HISTORY_DIR_NAME)
+}
+
+fn rollback_tmp_dir_path(instance_mods_dir: &Path) -> PathBuf {
+    rollback_dir_path(instance_mods_dir).join(ROLLBACK_TMP_DIR_NAME)
 }
 
 fn rollback_history_file_path(instance_mods_dir: &Path, snapshot_id: &str) -> PathBuf {
@@ -466,13 +457,10 @@ fn validate_rollback_snapshot(snapshot: &RollbackSnapshot) -> Result<(), StateEr
                 artifact.filename
             )));
         }
-        let legacy_missing_metadata =
-            artifact.project_id.is_empty() && artifact.version_id.is_empty();
-        if !legacy_missing_metadata
-            && (artifact.project_id != installed.project_id
-                || artifact.version_id != installed.version_id
-                || artifact.sha512_present != !installed.integrity.sha512.trim().is_empty()
-                || artifact.sha512_verified != installed.integrity.sha512_verified)
+        if artifact.project_id != installed.project_id
+            || artifact.version_id != installed.version_id
+            || artifact.sha512_present != !installed.integrity.sha512.trim().is_empty()
+            || artifact.sha512_verified != installed.integrity.sha512_verified
         {
             return Err(StateError::InvalidRollback(format!(
                 "artifact {} metadata does not match rollback state",
@@ -490,10 +478,6 @@ fn validate_rollback_snapshot(snapshot: &RollbackSnapshot) -> Result<(), StateEr
     Ok(())
 }
 
-fn default_rollback_artifact_ownership() -> OwnershipClass {
-    OwnershipClass::CompositionManaged
-}
-
 fn validate_rollback_snapshot_id(snapshot_id: &str) -> Result<(), StateError> {
     let valid = !snapshot_id.is_empty()
         && snapshot_id.len() <= 96
@@ -504,6 +488,161 @@ fn validate_rollback_snapshot_id(snapshot_id: &str) -> Result<(), StateError> {
         Ok(())
     } else {
         Err(StateError::InvalidRollbackId)
+    }
+}
+
+fn managed_filenames(state: Option<&CompositionState>) -> HashSet<String> {
+    state
+        .map(|state| {
+            state
+                .installed_mods
+                .iter()
+                .map(|installed| installed.filename.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+struct RollbackRestoreTarget {
+    source_path: PathBuf,
+    temp_path: PathBuf,
+    final_path: PathBuf,
+}
+
+fn prepare_rollback_restore_targets(
+    instance_mods_dir: &Path,
+    snapshot: &RollbackSnapshot,
+    current_filenames: &HashSet<String>,
+) -> Result<Vec<RollbackRestoreTarget>, StateError> {
+    let files_dir = rollback_files_dir_path(instance_mods_dir);
+    snapshot
+        .artifacts
+        .iter()
+        .enumerate()
+        .map(|(index, artifact)| {
+            let source_path = files_dir.join(&artifact.stored_filename);
+            ensure_regular_rollback_artifact(&source_path, &artifact.stored_filename)?;
+            let final_path = managed_artifact_path(instance_mods_dir, &artifact.filename)?;
+            if !current_filenames.contains(&artifact.filename) && path_exists(&final_path)? {
+                return Err(StateError::InvalidRollback(format!(
+                    "rollback target {} is not tracked by current managed state",
+                    artifact.filename
+                )));
+            }
+            Ok(RollbackRestoreTarget {
+                source_path,
+                temp_path: rollback_restore_temp_path(instance_mods_dir, snapshot, index),
+                final_path,
+            })
+        })
+        .collect()
+}
+
+async fn prepare_rollback_restore_targets_async(
+    instance_mods_dir: &Path,
+    snapshot: &RollbackSnapshot,
+    current_filenames: &HashSet<String>,
+) -> Result<Vec<RollbackRestoreTarget>, StateError> {
+    let files_dir = rollback_files_dir_path(instance_mods_dir);
+    let mut targets = Vec::with_capacity(snapshot.artifacts.len());
+    for (index, artifact) in snapshot.artifacts.iter().enumerate() {
+        let source_path = files_dir.join(&artifact.stored_filename);
+        ensure_regular_rollback_artifact_async(&source_path, &artifact.stored_filename).await?;
+        let final_path = managed_artifact_path(instance_mods_dir, &artifact.filename)?;
+        if !current_filenames.contains(&artifact.filename) && path_exists_async(&final_path).await?
+        {
+            return Err(StateError::InvalidRollback(format!(
+                "rollback target {} is not tracked by current managed state",
+                artifact.filename
+            )));
+        }
+        targets.push(RollbackRestoreTarget {
+            source_path,
+            temp_path: rollback_restore_temp_path(instance_mods_dir, snapshot, index),
+            final_path,
+        });
+    }
+    Ok(targets)
+}
+
+fn rollback_restore_temp_path(
+    instance_mods_dir: &Path,
+    snapshot: &RollbackSnapshot,
+    index: usize,
+) -> PathBuf {
+    rollback_tmp_dir_path(instance_mods_dir).join(format!(
+        "{}-{}-{}-restore.tmp",
+        snapshot.id,
+        std::process::id(),
+        index
+    ))
+}
+
+fn ensure_regular_rollback_artifact(path: &Path, stored_filename: &str) -> Result<(), StateError> {
+    if fs::symlink_metadata(path)
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    Err(StateError::InvalidRollback(format!(
+        "missing rollback artifact {stored_filename}"
+    )))
+}
+
+async fn ensure_regular_rollback_artifact_async(
+    path: &Path,
+    stored_filename: &str,
+) -> Result<(), StateError> {
+    if async_fs::symlink_metadata(path)
+        .await
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    Err(StateError::InvalidRollback(format!(
+        "missing rollback artifact {stored_filename}"
+    )))
+}
+
+fn stage_rollback_restore_targets(targets: &[RollbackRestoreTarget]) -> Result<(), StateError> {
+    if let Some(first) = targets.first()
+        && let Some(parent) = first.temp_path.parent()
+    {
+        fs::create_dir_all(parent)?;
+    }
+    for target in targets {
+        remove_file_if_exists(&target.temp_path)?;
+        fs::copy(&target.source_path, &target.temp_path)?;
+    }
+    Ok(())
+}
+
+async fn stage_rollback_restore_targets_async(
+    targets: &[RollbackRestoreTarget],
+) -> Result<(), StateError> {
+    if let Some(first) = targets.first()
+        && let Some(parent) = first.temp_path.parent()
+    {
+        async_fs::create_dir_all(parent).await?;
+    }
+    for target in targets {
+        remove_file_if_exists_async(&target.temp_path).await?;
+        async_fs::copy(&target.source_path, &target.temp_path).await?;
+    }
+    Ok(())
+}
+
+fn cleanup_rollback_restore_targets(targets: &[RollbackRestoreTarget]) {
+    for target in targets {
+        let _ = fs::remove_file(&target.temp_path);
+    }
+}
+
+async fn cleanup_rollback_restore_targets_async(targets: &[RollbackRestoreTarget]) {
+    for target in targets {
+        let _ = async_fs::remove_file(&target.temp_path).await;
     }
 }
 
@@ -528,6 +667,38 @@ fn validate_state(state: &CompositionState) -> Result<(), StateError> {
         }
     }
     Ok(())
+}
+
+fn path_exists(path: &Path) -> Result<bool, StateError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(StateError::Read(error)),
+    }
+}
+
+async fn path_exists_async(path: &Path) -> Result<bool, StateError> {
+    match async_fs::symlink_metadata(path).await {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(StateError::Read(error)),
+    }
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<(), StateError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(StateError::Read(error)),
+    }
+}
+
+async fn remove_file_if_exists_async(path: &Path) -> Result<(), StateError> {
+    match async_fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(StateError::Read(error)),
+    }
 }
 
 fn validate_sha512_integrity(filename: &str, sha512: &str) -> Result<(), StateError> {
@@ -840,52 +1011,35 @@ mod tests {
     }
 
     #[test]
-    fn legacy_schema_one_rollback_snapshot_loads_without_new_artifact_evidence() {
-        let root = test_root("legacy-rollback-artifact-evidence");
+    fn rollback_snapshot_rejects_missing_artifact_metadata() {
+        let root = test_root("missing-rollback-artifact-metadata");
         fs::create_dir_all(rollback_files_dir_path(&root)).expect("create rollback files dir");
         fs::write(
-            rollback_files_dir_path(&root).join("legacy.bin"),
+            rollback_files_dir_path(&root).join("missing-metadata.bin"),
             b"managed-a",
         )
-        .expect("write legacy rollback artifact");
+        .expect("write rollback artifact");
         fs::write(
             rollback_file_path(&root),
             serde_json::to_vec(&serde_json::json!({
-                "id": "rb-legacy",
+                "id": "rb-missing-metadata",
                 "schema_version": ROLLBACK_SCHEMA_VERSION,
                 "created_at": "2026-05-30T00:00:00Z",
                 "state": test_state("core-a", vec![test_mod("sodium", "managed-a.jar")]),
                 "artifacts": [{
                     "filename": "managed-a.jar",
-                    "stored_filename": "legacy.bin"
+                    "stored_filename": "missing-metadata.bin"
                 }]
             }))
-            .expect("serialize legacy rollback snapshot"),
+            .expect("serialize rollback snapshot"),
         )
-        .expect("write legacy rollback snapshot");
+        .expect("write rollback snapshot");
 
-        let snapshot = load_rollback_snapshot(&root)
-            .expect("legacy snapshot should parse")
-            .expect("legacy snapshot should exist");
-        let artifact = snapshot.artifacts.first().expect("legacy artifact");
-        assert_eq!(artifact.project_id, "");
-        assert_eq!(artifact.version_id, "");
-        assert_eq!(artifact.ownership_class, OwnershipClass::CompositionManaged);
-        assert!(!artifact.sha512_present);
-        assert!(!artifact.sha512_verified);
-
-        let summaries = list_rollback_snapshots(&root).expect("legacy snapshot should list");
-        assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].artifact_count, 1);
-        assert!(summaries[0].rollback_available);
-
-        let restored =
-            restore_rollback_snapshot(&root, &snapshot).expect("legacy snapshot should restore");
-        assert_eq!(restored.composition_id, "core-a");
-        assert_eq!(
-            fs::read(root.join("managed-a.jar")).expect("read restored artifact"),
-            b"managed-a"
-        );
+        assert!(matches!(
+            load_rollback_snapshot(&root)
+                .expect_err("missing rollback artifact metadata should be invalid"),
+            StateError::Parse(_)
+        ));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -936,6 +1090,7 @@ mod tests {
         .expect("save older snapshot");
         let older_id = older.id.clone();
 
+        fs::remove_file(root.join("managed-a.jar")).expect("remove superseded managed a");
         fs::write(root.join("managed-b.jar"), b"managed-b").expect("write managed b");
         save_state(
             &root,
@@ -968,6 +1123,167 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn rollback_refuses_to_claim_untracked_matching_target() {
+        let root = test_root("restore-untracked-matching-target");
+        fs::write(root.join("managed-a.jar"), b"snapshot-managed").expect("write managed a");
+        let snapshot = save_rollback_snapshot(
+            &root,
+            &test_state("core-a", vec![test_mod("sodium", "managed-a.jar")]),
+        )
+        .expect("save snapshot");
+
+        let error = restore_rollback_snapshot(&root, &snapshot)
+            .expect_err("matching bytes are not ownership proof");
+
+        assert!(matches!(error, StateError::InvalidRollback(_)));
+        assert_eq!(
+            fs::read(root.join("managed-a.jar")).expect("read target"),
+            b"snapshot-managed"
+        );
+        assert!(load_state(&root).expect("load state").is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rollback_refuses_to_overwrite_untracked_existing_target() {
+        let root = test_root("restore-untracked-existing-target");
+        fs::write(root.join("managed-a.jar"), b"snapshot-managed").expect("write managed a");
+        let snapshot = save_rollback_snapshot(
+            &root,
+            &test_state("core-a", vec![test_mod("sodium", "managed-a.jar")]),
+        )
+        .expect("save snapshot");
+        fs::write(root.join("managed-a.jar"), b"user-replacement").expect("replace target");
+
+        let error = restore_rollback_snapshot(&root, &snapshot)
+            .expect_err("rollback must not overwrite untracked target");
+
+        assert!(matches!(error, StateError::InvalidRollback(_)));
+        assert_eq!(
+            fs::read(root.join("managed-a.jar")).expect("read target"),
+            b"user-replacement"
+        );
+        assert!(
+            load_state(&root).expect("load state").is_none(),
+            "rollback should not write state after refusing overwrite"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rollback_rejects_corrupt_current_state_before_mutation() {
+        let root = test_root("restore-corrupt-current-state");
+        fs::write(root.join("managed-a.jar"), b"snapshot-managed").expect("write managed a");
+        let snapshot = save_rollback_snapshot(
+            &root,
+            &test_state("core-a", vec![test_mod("sodium", "managed-a.jar")]),
+        )
+        .expect("save snapshot");
+        fs::write(root.join("managed-a.jar"), b"user-replacement").expect("replace target");
+        fs::write(
+            lock_file_path(&root),
+            serde_json::to_vec(&serde_json::json!({
+                "composition_id": "core-current",
+                "tier": "core",
+                "installed_mods": [{
+                    "project_id": "sodium",
+                    "version_id": "version",
+                    "filename": "managed-a.jar",
+                    "ownership_class": "user_managed",
+                    "source": { "provider": "modrinth" },
+                    "integrity": { "sha512": "", "sha512_verified": false }
+                }],
+                "installed_at": "2026-05-30T00:00:00Z",
+                "failure_count": 0,
+                "last_failure": ""
+            }))
+            .expect("serialize current state"),
+        )
+        .expect("write corrupt current state");
+
+        let error = restore_rollback_snapshot(&root, &snapshot)
+            .expect_err("corrupt current ownership must block rollback");
+
+        assert!(matches!(error, StateError::InvalidOwnership { .. }));
+        assert_eq!(
+            fs::read(root.join("managed-a.jar")).expect("read target"),
+            b"user-replacement"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rollback_validates_all_snapshot_artifacts_before_deleting_current_managed_files() {
+        let root = test_root("restore-missing-artifact-preflight");
+        fs::write(root.join("managed-a.jar"), b"managed-a").expect("write managed a");
+        let snapshot = save_rollback_snapshot(
+            &root,
+            &test_state("core-a", vec![test_mod("sodium", "managed-a.jar")]),
+        )
+        .expect("save snapshot");
+        fs::remove_file(root.join("managed-a.jar")).expect("remove old managed a");
+        fs::write(root.join("managed-b.jar"), b"managed-b").expect("write managed b");
+        save_state(
+            &root,
+            &test_state("core-b", vec![test_mod("lithium", "managed-b.jar")]),
+        )
+        .expect("save current state");
+        let artifact = snapshot.artifacts.first().expect("snapshot artifact");
+        fs::remove_file(rollback_files_dir_path(&root).join(&artifact.stored_filename))
+            .expect("remove snapshot artifact");
+
+        let error = restore_rollback_snapshot(&root, &snapshot)
+            .expect_err("missing snapshot artifact should fail before deletion");
+
+        assert!(matches!(error, StateError::InvalidRollback(_)));
+        assert_eq!(
+            fs::read(root.join("managed-b.jar")).expect("read current managed"),
+            b"managed-b"
+        );
+        assert_eq!(
+            load_state(&root)
+                .expect("load state")
+                .expect("current state remains")
+                .composition_id,
+            "core-b"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rollback_does_not_touch_user_owned_rollback_tmp_collision() {
+        let root = test_root("restore-temp-collision");
+        fs::write(root.join("managed-a.jar"), b"snapshot-managed").expect("write managed a");
+        let snapshot = save_rollback_snapshot(
+            &root,
+            &test_state("core-a", vec![test_mod("sodium", "managed-a.jar")]),
+        )
+        .expect("save snapshot");
+        fs::remove_file(root.join("managed-a.jar")).expect("remove target");
+        let user_temp_path = root.join("managed-a.rollback.tmp");
+        fs::write(&user_temp_path, b"user-temp").expect("write user temp");
+
+        let restored =
+            restore_rollback_snapshot(&root, &snapshot).expect("restore should use managed temp");
+
+        assert_eq!(restored.composition_id, "core-a");
+        assert_eq!(
+            fs::read(root.join("managed-a.jar")).expect("read restored"),
+            b"snapshot-managed"
+        );
+        assert_eq!(
+            fs::read(user_temp_path).expect("read user temp"),
+            b"user-temp"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn async_rollback_snapshot_restores_tracked_state_only() {
         let root = test_root("async-restore");
@@ -980,6 +1296,7 @@ mod tests {
         .await
         .expect("save snapshot");
 
+        fs::remove_file(root.join("managed-a.jar")).expect("remove superseded managed a");
         fs::write(root.join("managed-b.jar"), b"managed-b").expect("write managed b");
         save_state(
             &root,
@@ -1001,6 +1318,30 @@ mod tests {
         assert_eq!(
             fs::read(root.join("user.jar")).expect("read user"),
             b"user-v2"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn async_rollback_refuses_to_overwrite_untracked_existing_target() {
+        let root = test_root("async-restore-untracked-existing-target");
+        fs::write(root.join("managed-a.jar"), b"snapshot-managed").expect("write managed a");
+        let snapshot = save_rollback_snapshot(
+            &root,
+            &test_state("core-a", vec![test_mod("sodium", "managed-a.jar")]),
+        )
+        .expect("save snapshot");
+        fs::write(root.join("managed-a.jar"), b"user-replacement").expect("replace target");
+
+        let error = restore_rollback_snapshot_async(&root, &snapshot)
+            .await
+            .expect_err("async rollback must not overwrite untracked target");
+
+        assert!(matches!(error, StateError::InvalidRollback(_)));
+        assert_eq!(
+            fs::read(root.join("managed-a.jar")).expect("read target"),
+            b"user-replacement"
         );
 
         let _ = fs::remove_dir_all(root);

@@ -21,7 +21,8 @@ export function SkinEditDialog({
   editDetectError,
   editReplacementReady,
   editHasChanges,
-  onlineReady,
+  skinActionsEnabled,
+  skinActionDisabledReason,
   deleteKey,
   onClose,
   onEditReplacementDragEnter,
@@ -51,7 +52,8 @@ export function SkinEditDialog({
   editDetectError: string | null;
   editReplacementReady: boolean;
   editHasChanges: boolean;
-  onlineReady: boolean;
+  skinActionsEnabled: boolean;
+  skinActionDisabledReason: string;
   deleteKey: string | null;
   onClose: () => void;
   onEditReplacementDragEnter: (event: DragEvent) => void;
@@ -209,12 +211,12 @@ export function SkinEditDialog({
               <Button
                 variant="primary"
                 icon={saving ? 'refresh' : 'check'}
-                disabled={!canSave || !onlineReady}
+                disabled={!canSave || !skinActionsEnabled}
                 onClick={() => onSave(editingSkin.texture_key, true)}
                 title={
-                  onlineReady
+                  skinActionsEnabled
                     ? 'Save changes, then apply to the active Minecraft account'
-                    : 'Online Minecraft account required'
+                    : skinActionDisabledReason
                 }
                 sound="affirm"
               >

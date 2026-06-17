@@ -3,7 +3,7 @@ import { toast } from '../../toast';
 import { errMessage } from '../../utils';
 import { prompt, showChoice } from '../../ui/Dialog';
 import { addInstance, removeInstance, updateInstanceInList } from '../../actions';
-import type { Instance } from '../../types';
+import type { Instance } from '../../types-instance';
 import { partialFailureMessage, runBulkMutation } from './bulk-actions';
 
 export async function openInstanceFolder(id: string, sub?: string): Promise<void> {

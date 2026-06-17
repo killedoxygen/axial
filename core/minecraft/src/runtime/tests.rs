@@ -1,0 +1,816 @@
+use super::{
+    ComponentManifestDownload, ComponentManifestDownloads, ComponentManifestFile,
+    JavaRuntimeLookupError, RuntimeDownloadActual, RuntimeDownloadEvidence,
+    RuntimeDownloadIntegrityError, RuntimeEnsureEvent, RuntimeInstallState,
+    component_manifest_destination, detect_distribution, detect_runtime_state, ensure_java_runtime,
+    fetch_runtime_file, fetch_runtime_json, install_runtime_manifest_file,
+    install_runtime_manifest_files, java_executable, java_executable_for_os,
+    plan_runtime_manifest_files, remove_runtime_install_path, remove_runtime_install_path_async,
+    runtime_download_client, runtime_file_download_concurrency_for, runtime_install_lock_from_map,
+    runtime_os_arch_for, verify_runtime_download,
+};
+use crate::JavaVersion;
+use serde::Deserialize;
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+
+fn expected(size: Option<u64>, sha1: Option<&str>) -> RuntimeDownloadEvidence {
+    RuntimeDownloadEvidence {
+        size,
+        sha1: sha1.map(str::to_string),
+    }
+}
+
+fn actual(size: u64, sha1: &str) -> RuntimeDownloadActual {
+    RuntimeDownloadActual {
+        size,
+        sha1: sha1.to_string(),
+    }
+}
+
+fn manifest_file(kind: &str) -> ComponentManifestFile {
+    ComponentManifestFile {
+        kind: kind.to_string(),
+        executable: false,
+        downloads: None,
+    }
+}
+
+fn downloadable_manifest_file(url: &str, size: u64, sha1: &str) -> ComponentManifestFile {
+    ComponentManifestFile {
+        kind: "file".to_string(),
+        executable: false,
+        downloads: Some(ComponentManifestDownloads {
+            raw: Some(ComponentManifestDownload {
+                url: url.to_string(),
+                sha1: Some(sha1.to_string()),
+                size: Some(size),
+            }),
+        }),
+    }
+}
+
+fn planned_paths(entries: &[(String, ComponentManifestFile)]) -> Vec<&str> {
+    entries
+        .iter()
+        .map(|(relative_path, _)| relative_path.as_str())
+        .collect()
+}
+
+fn unsafe_manifest_path_message(result: Result<PathBuf, JavaRuntimeLookupError>) -> String {
+    match result {
+        Err(JavaRuntimeLookupError::Download(message)) => message,
+        other => panic!("expected unsafe manifest path error, got {other:?}"),
+    }
+}
+
+fn assert_runtime_distribution(text: &str, expected: &str) {
+    assert_eq!(detect_distribution(text), expected);
+}
+
+#[test]
+fn detect_runtime_distribution_favors_graalvm_identity() {
+    assert_runtime_distribution(
+        r#"
+                java.vendor = Oracle Corporation
+                java.vm.name = GraalVM 64-Bit Server VM
+            "#,
+        "graalvm",
+    );
+    assert_runtime_distribution(
+        r#"
+                java.vendor = OpenJDK
+                java.runtime.name = GraalVM Runtime Environment
+            "#,
+        "graalvm",
+    );
+}
+
+#[test]
+fn detect_runtime_distribution_classifies_openj9_identity() {
+    for text in [
+        "java.vm.name = Eclipse OpenJ9 VM",
+        "java.runtime.name = IBM Semeru Runtime Open Edition",
+        "java.vm.vendor = IBM Corporation",
+    ] {
+        assert_runtime_distribution(text, "openj9");
+    }
+}
+
+#[test]
+fn detect_runtime_distribution_classifies_temurin_identity() {
+    for text in [
+        "java.runtime.name = OpenJDK Runtime Environment Temurin-21.0.2+13",
+        "java.vendor = Eclipse Adoptium",
+        "java.vm.vendor = Eclipse Foundation",
+    ] {
+        assert_runtime_distribution(text, "temurin");
+    }
+}
+
+#[test]
+fn detect_runtime_distribution_classifies_oracle_identity() {
+    assert_runtime_distribution(
+        r#"
+                java.vendor   =   Oracle Corporation
+                java.vm.name = Java HotSpot(TM) 64-Bit Server VM
+            "#,
+        "oracle",
+    );
+}
+
+#[test]
+fn detect_runtime_distribution_classifies_generic_openjdk_identity() {
+    assert_runtime_distribution(
+        r#"
+                java.vendor = Debian
+                java.vm.name = OpenJDK 64-Bit Server VM
+                java.runtime.version = 21.0.5+11-Debian-1
+            "#,
+        "openjdk",
+    );
+}
+
+#[test]
+fn detect_runtime_distribution_classifies_missing_identity_as_unknown() {
+    assert_runtime_distribution(
+        r#"
+                java.home = /opt/java
+                sun.arch.data.model = 64
+            "#,
+        "unknown",
+    );
+}
+
+#[test]
+fn component_manifest_destination_accepts_safe_nested_path() {
+    let temp_dir = Path::new("runtime-temp");
+    let destination = component_manifest_destination(temp_dir, "bin/java").unwrap();
+
+    assert_eq!(destination, temp_dir.join("bin").join("java"));
+}
+
+#[test]
+fn component_manifest_destination_rejects_traversal() {
+    let temp_dir = Path::new("runtime-temp");
+    let message =
+        unsafe_manifest_path_message(component_manifest_destination(temp_dir, "bin/../java"));
+
+    assert!(message.contains("unsafe runtime manifest path"));
+    assert!(message.contains("bin/../java"));
+    assert!(!message.contains("runtime-temp"));
+}
+
+#[test]
+fn component_manifest_destination_rejects_absolute_path() {
+    let temp_dir = Path::new("runtime-temp");
+    let absolute_path = if cfg!(windows) {
+        r"\Windows\System32"
+    } else {
+        "/etc/passwd"
+    };
+    let message =
+        unsafe_manifest_path_message(component_manifest_destination(temp_dir, absolute_path));
+
+    assert!(message.contains("unsafe runtime manifest path"));
+    assert!(message.contains(absolute_path));
+    assert!(!message.contains("runtime-temp"));
+}
+
+#[test]
+fn component_manifest_destination_rejects_drive_like_path_with_slashes() {
+    let temp_dir = Path::new("runtime-temp");
+    let message = unsafe_manifest_path_message(component_manifest_destination(
+        temp_dir,
+        "C:/Windows/System32",
+    ));
+
+    assert!(message.contains("unsafe runtime manifest path"));
+    assert!(message.contains("C:/Windows/System32"));
+    assert!(!message.contains("runtime-temp"));
+}
+
+#[test]
+fn component_manifest_destination_rejects_drive_like_path_with_backslashes() {
+    let temp_dir = Path::new("runtime-temp");
+    let message = unsafe_manifest_path_message(component_manifest_destination(
+        temp_dir,
+        r"C:\Windows\System32",
+    ));
+
+    assert!(message.contains("unsafe runtime manifest path"));
+    assert!(message.contains(r"C:\Windows\System32"));
+    assert!(!message.contains("runtime-temp"));
+}
+
+#[test]
+fn runtime_file_download_concurrency_is_adaptive_and_bounded() {
+    assert_eq!(runtime_file_download_concurrency_for(0), 2);
+    assert_eq!(runtime_file_download_concurrency_for(1), 2);
+    assert_eq!(runtime_file_download_concurrency_for(2), 4);
+    assert_eq!(runtime_file_download_concurrency_for(3), 6);
+    assert_eq!(runtime_file_download_concurrency_for(4), 8);
+    assert_eq!(runtime_file_download_concurrency_for(64), 8);
+}
+
+#[test]
+fn runtime_manifest_install_plan_sorts_directories_before_files() {
+    let mut files = HashMap::new();
+    files.insert("lib/server/libjvm.so".to_string(), manifest_file("file"));
+    files.insert("bin/java".to_string(), manifest_file("file"));
+    files.insert("lib/server".to_string(), manifest_file("directory"));
+    files.insert("bin".to_string(), manifest_file("directory"));
+    files.insert("ignored-entry".to_string(), manifest_file("link"));
+
+    let plan = plan_runtime_manifest_files(files);
+
+    assert_eq!(
+        planned_paths(&plan.directory_entries),
+        vec!["bin", "lib/server"]
+    );
+    assert_eq!(
+        planned_paths(&plan.file_entries),
+        vec!["bin/java", "lib/server/libjvm.so"]
+    );
+    assert_eq!(planned_paths(&plan.other_entries), vec!["ignored-entry"]);
+}
+
+#[tokio::test]
+async fn runtime_manifest_install_reports_file_progress() {
+    let root = unique_temp_root("croopor-runtime-progress-test");
+    let mut files = HashMap::new();
+    files.insert("bin".to_string(), manifest_file("directory"));
+    files.insert("bin/java".to_string(), manifest_file("file"));
+    files.insert("lib/jvm.cfg".to_string(), manifest_file("file"));
+    let mut events = Vec::new();
+
+    install_runtime_manifest_files("java-runtime-delta", &root, files, &mut |event| {
+        events.push(event);
+    })
+    .await
+    .expect("runtime manifest files");
+
+    assert_eq!(
+        events.first(),
+        Some(&RuntimeEnsureEvent::InstallingManagedRuntimeFiles {
+            component: "java-runtime-delta".to_string(),
+            current: 0,
+            total: 2,
+            file: Some("Downloading runtime files".to_string()),
+        })
+    );
+    assert_eq!(events.len(), 3);
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEnsureEvent::InstallingManagedRuntimeFiles { current, total, .. } => {
+                    Some((*current, *total))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec![(0, 2), (1, 2), (2, 2)]
+    );
+    let completed_files = events
+        .iter()
+        .filter_map(|event| match event {
+            RuntimeEnsureEvent::InstallingManagedRuntimeFiles { file, current, .. }
+                if *current > 0 =>
+            {
+                file.as_deref()
+            }
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        completed_files,
+        std::collections::HashSet::from(["bin/java", "lib/jvm.cfg"])
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn runtime_manifest_json_fetch_reads_async_http_body() {
+    #[derive(Debug, Deserialize)]
+    struct SampleRuntimeManifest {
+        ok: bool,
+    }
+
+    let url = serve_runtime_json(200, r#"{"ok":true}"#.as_bytes().to_vec(), None).await;
+
+    let manifest = fetch_runtime_json::<SampleRuntimeManifest>(&url)
+        .await
+        .expect("runtime manifest json");
+
+    assert!(manifest.ok);
+}
+
+#[tokio::test]
+async fn runtime_manifest_json_fetch_rejects_http_errors() {
+    let url = serve_runtime_json(503, b"unavailable".to_vec(), None).await;
+
+    let error = fetch_runtime_json::<serde_json::Value>(&url)
+        .await
+        .expect_err("HTTP error should fail");
+
+    assert!(error.to_string().contains("HTTP 503"), "{error}");
+}
+
+#[tokio::test]
+async fn runtime_manifest_json_fetch_rejects_oversized_content_length() {
+    let url = serve_runtime_json(
+        200,
+        b"ignored".to_vec(),
+        Some(super::MAX_RUNTIME_MANIFEST_BYTES + 1),
+    )
+    .await;
+
+    let error = fetch_runtime_json::<serde_json::Value>(&url)
+        .await
+        .expect_err("oversized manifest should fail");
+
+    assert_eq!(
+        error.to_string(),
+        "failed to install java runtime: runtime manifest response too large"
+    );
+}
+
+#[test]
+fn runtime_install_lock_recovers_from_poisoned_map_lock() {
+    let locks = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let seeded_install_lock = Arc::new(tokio::sync::Mutex::new(()));
+    let poison_target = Arc::clone(&locks);
+    let poison_seed = Arc::clone(&seeded_install_lock);
+
+    let _ = std::thread::spawn(move || {
+        let mut guard = poison_target.lock().unwrap();
+        guard.insert("java-runtime-delta".to_string(), poison_seed);
+        panic!("poison runtime lock map");
+    })
+    .join();
+
+    assert!(locks.is_poisoned());
+    let recovered_lock = runtime_install_lock_from_map(&locks, "java-runtime-delta");
+
+    assert!(Arc::ptr_eq(&recovered_lock, &seeded_install_lock));
+}
+
+#[test]
+fn managed_runtime_requires_ready_marker_even_when_java_exists() {
+    let root = unique_temp_root("croopor-managed-runtime-ready-marker-test");
+    write_runtime_executable_fixture(&root);
+
+    assert_eq!(
+        detect_runtime_state(&root, true),
+        RuntimeInstallState::Broken
+    );
+
+    fs::write(root.join(".croopor-installing"), b"installing").expect("installing marker");
+    assert_eq!(
+        detect_runtime_state(&root, true),
+        RuntimeInstallState::Installing
+    );
+
+    fs::remove_file(root.join(".croopor-installing")).expect("remove installing marker");
+    fs::write(root.join(".croopor-ready"), b"ready").expect("ready marker");
+    assert_eq!(
+        detect_runtime_state(&root, true),
+        RuntimeInstallState::Ready
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn runtime_install_cleanup_removes_stale_directory_destination() {
+    let root = unique_temp_root("croopor-runtime-cleanup-dir-test");
+    fs::create_dir_all(root.join("bin")).expect("create stale runtime dir");
+    fs::write(root.join("bin").join("java"), b"stale").expect("write stale java");
+
+    remove_runtime_install_path(&root).expect("remove stale runtime dir");
+
+    assert!(!root.exists());
+}
+
+#[test]
+fn runtime_install_cleanup_removes_stale_file_destination() {
+    let root = unique_temp_root("croopor-runtime-cleanup-file-test");
+    fs::write(&root, b"blocking file").expect("write stale runtime file");
+
+    remove_runtime_install_path(&root).expect("remove stale runtime file");
+
+    assert!(!root.exists());
+}
+
+#[test]
+fn runtime_install_cleanup_accepts_missing_destination() {
+    let root = unique_temp_root("croopor-runtime-cleanup-missing-test");
+
+    remove_runtime_install_path(&root).expect("missing runtime path is clean");
+
+    assert!(!root.exists());
+}
+
+#[tokio::test]
+async fn async_runtime_install_cleanup_removes_stale_directory_destination() {
+    let root = unique_temp_root("croopor-runtime-async-cleanup-dir-test");
+    fs::create_dir_all(root.join("bin")).expect("create stale runtime dir");
+    fs::write(root.join("bin").join("java"), b"stale").expect("write stale java");
+
+    remove_runtime_install_path_async(&root)
+        .await
+        .expect("remove stale runtime dir");
+
+    assert!(!root.exists());
+}
+
+#[tokio::test]
+async fn async_runtime_install_cleanup_removes_stale_file_destination() {
+    let root = unique_temp_root("croopor-runtime-async-cleanup-file-test");
+    fs::write(&root, b"blocking file").expect("write stale runtime file");
+
+    remove_runtime_install_path_async(&root)
+        .await
+        .expect("remove stale runtime file");
+
+    assert!(!root.exists());
+}
+
+#[tokio::test]
+async fn async_runtime_install_cleanup_accepts_missing_destination() {
+    let root = unique_temp_root("croopor-runtime-async-cleanup-missing-test");
+
+    remove_runtime_install_path_async(&root)
+        .await
+        .expect("missing runtime path is clean");
+
+    assert!(!root.exists());
+}
+
+#[test]
+fn bundled_runtime_keeps_executable_readiness_without_marker() {
+    let root = unique_temp_root("croopor-bundled-runtime-ready-test");
+    write_runtime_executable_fixture(&root);
+
+    assert_eq!(
+        detect_runtime_state(&root, false),
+        RuntimeInstallState::Ready
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn runtime_os_arch_uses_mojang_manifest_platform_keys() {
+    assert_eq!(runtime_os_arch_for("linux", "x86_64"), "linux");
+    assert_eq!(runtime_os_arch_for("linux", "x86"), "linux-i386");
+    assert_eq!(runtime_os_arch_for("linux", "aarch64"), "linux");
+    assert_eq!(runtime_os_arch_for("macos", "x86_64"), "mac-os");
+    assert_eq!(runtime_os_arch_for("macos", "aarch64"), "mac-os-arm64");
+    assert_eq!(runtime_os_arch_for("windows", "x86_64"), "windows-x64");
+    assert_eq!(runtime_os_arch_for("windows", "x86"), "windows-x86");
+    assert_eq!(runtime_os_arch_for("windows", "aarch64"), "windows-arm64");
+}
+
+#[test]
+fn java_executable_uses_platform_runtime_layouts() {
+    let root = PathBuf::from("runtime-root");
+
+    assert_eq!(
+        java_executable_for_os(&root, "linux"),
+        root.join("bin").join("java")
+    );
+    assert_eq!(
+        java_executable_for_os(&root, "windows"),
+        root.join("bin").join("javaw.exe")
+    );
+    assert_eq!(
+        java_executable_for_os(&root, "macos"),
+        root.join("jre.bundle")
+            .join("Contents")
+            .join("Home")
+            .join("bin")
+            .join("java")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_with_non_executable_java_is_broken() {
+    let root = unique_temp_root("croopor-runtime-non-executable-test");
+    let java = java_executable(&root);
+    fs::create_dir_all(java.parent().expect("java parent")).expect("java parent dir");
+    fs::write(&java, b"java").expect("java file");
+    fs::write(root.join(".croopor-ready"), b"ready").expect("ready marker");
+
+    assert_eq!(
+        detect_runtime_state(&root, true),
+        RuntimeInstallState::Broken
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn runtime_download_verification_accepts_matching_metadata() {
+    let result = verify_runtime_download(
+        "bin/java",
+        &expected(Some(5), Some("AAF4C61DDCC5E8A2DABEDE0F3B482CD9AEA9434D")),
+        &actual(5, "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d"),
+    );
+
+    assert_eq!(result, Ok(()));
+}
+
+#[test]
+fn runtime_download_verification_rejects_size_mismatch() {
+    let result = verify_runtime_download(
+        "bin/java",
+        &expected(Some(6), None),
+        &actual(5, "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d"),
+    );
+
+    assert_eq!(
+        result,
+        Err(RuntimeDownloadIntegrityError::SizeMismatch {
+            file: "bin/java".to_string(),
+            expected: 6,
+            actual: 5,
+        })
+    );
+}
+
+#[test]
+fn runtime_download_verification_rejects_sha1_mismatch() {
+    let result = verify_runtime_download(
+        "bin/java",
+        &expected(None, Some("0000000000000000000000000000000000000000")),
+        &actual(5, "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d"),
+    );
+
+    assert_eq!(
+        result,
+        Err(RuntimeDownloadIntegrityError::Sha1Mismatch {
+            file: "bin/java".to_string(),
+            expected: "0000000000000000000000000000000000000000".to_string(),
+            actual: "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d".to_string(),
+        })
+    );
+}
+
+#[test]
+fn runtime_download_verification_accepts_missing_metadata() {
+    let result = verify_runtime_download(
+        "bin/java",
+        &expected(None, None),
+        &actual(5, "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d"),
+    );
+
+    assert_eq!(result, Ok(()));
+}
+
+#[tokio::test]
+async fn runtime_file_download_streams_and_verifies_to_temp() {
+    let root = unique_temp_root("croopor-runtime-download-stream-test");
+    fs::create_dir_all(&root).expect("download root");
+    let temp_path = root.join("java.croopor-tmp");
+    let url = serve_runtime_download(b"hello".to_vec()).await;
+    let client = runtime_download_client();
+
+    fetch_runtime_file(
+        &client,
+        &url,
+        &temp_path,
+        expected(Some(5), Some("aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d")),
+        "bin/java",
+    )
+    .await
+    .expect("runtime download");
+
+    assert_eq!(fs::read(&temp_path).expect("downloaded file"), b"hello");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn runtime_file_download_removes_temp_on_verification_error() {
+    let root = unique_temp_root("croopor-runtime-download-cleanup-test");
+    fs::create_dir_all(&root).expect("download root");
+    let temp_path = root.join("java.croopor-tmp");
+    let url = serve_runtime_download(b"hello".to_vec()).await;
+    let client = runtime_download_client();
+
+    let result = fetch_runtime_file(
+        &client,
+        &url,
+        &temp_path,
+        expected(Some(6), None),
+        "bin/java",
+    )
+    .await;
+
+    assert!(matches!(&result, Err(JavaRuntimeLookupError::Download(_))));
+    assert!(!temp_path.exists());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn runtime_file_download_rejects_oversized_content_length() {
+    let root = unique_temp_root("croopor-runtime-download-content-length-test");
+    fs::create_dir_all(&root).expect("download root");
+    let temp_path = root.join("java.croopor-tmp");
+    let url = serve_runtime_response(200, b"hello".to_vec(), Some(6), "/runtime.bin").await;
+    let client = runtime_download_client();
+
+    let result = fetch_runtime_file(
+        &client,
+        &url,
+        &temp_path,
+        expected(Some(5), None),
+        "bin/java",
+    )
+    .await;
+
+    assert!(matches!(&result, Err(JavaRuntimeLookupError::Download(_))));
+    assert!(!temp_path.exists());
+    assert!(
+        result
+            .expect_err("oversized content length should fail")
+            .to_string()
+            .contains("runtime file bin/java size mismatch: expected 5, got 6")
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn runtime_file_download_rejects_stream_past_expected_size_and_removes_temp() {
+    let root = unique_temp_root("croopor-runtime-download-stream-bound-test");
+    fs::create_dir_all(&root).expect("download root");
+    let temp_path = root.join("java.croopor-tmp");
+    let url = serve_runtime_response(200, b"hello!".to_vec(), None, "/runtime.bin").await;
+    let client = runtime_download_client();
+
+    let result = fetch_runtime_file(
+        &client,
+        &url,
+        &temp_path,
+        expected(Some(5), None),
+        "bin/java",
+    )
+    .await;
+
+    assert!(matches!(&result, Err(JavaRuntimeLookupError::Download(_))));
+    assert!(!temp_path.exists());
+    assert!(
+        result
+            .expect_err("oversized stream should fail")
+            .to_string()
+            .contains("runtime file bin/java size mismatch: expected 5, got 6")
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn runtime_install_futures_stay_small_enough_for_tokio_workers() {
+    let root = Path::new("/tmp/croopor-runtime-future-size");
+    let client = runtime_download_client();
+    let expected = expected(Some(8), Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+    let file = downloadable_manifest_file(
+        "https://example.test/runtime.bin",
+        8,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    let spawned_client = client.clone();
+    let spawned_root = root.to_path_buf();
+    let spawned_file = file.clone();
+    let spawned_future = async move {
+        Box::pin(install_runtime_manifest_file(
+            spawned_client,
+            &spawned_root,
+            "bin/java",
+            spawned_file,
+        ))
+        .await
+    };
+
+    assert!(
+        std::mem::size_of_val(&fetch_runtime_file(
+            &client,
+            "https://example.test/runtime.bin",
+            &root.join("java.croopor-tmp"),
+            expected,
+            "bin/java",
+        )) < 4096,
+        "runtime file download future should stay small"
+    );
+    assert!(
+        std::mem::size_of_val(&install_runtime_manifest_file(
+            client.clone(),
+            root,
+            "bin/java",
+            file.clone(),
+        )) < 4096,
+        "runtime manifest file install future should stay small"
+    );
+    assert!(
+        std::mem::size_of_val(&spawned_future) < 4096,
+        "spawned runtime manifest file install future should stay small"
+    );
+    assert!(
+        std::mem::size_of_val(&ensure_java_runtime(
+            root,
+            &JavaVersion {
+                component: "java-runtime-delta".to_string(),
+                major_version: 21,
+            },
+            "",
+        )) < 4096,
+        "managed-runtime ensure future should stay small"
+    );
+}
+
+fn unique_temp_root(label: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "{label}-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ))
+}
+
+fn write_runtime_executable_fixture(root: &Path) {
+    let java = java_executable(root);
+    fs::create_dir_all(java.parent().expect("java parent")).expect("java parent dir");
+    fs::write(&java, b"java").expect("java executable");
+    make_executable(&java);
+    if cfg!(target_os = "windows") {
+        let config = root.join("lib").join("jvm.cfg");
+        fs::create_dir_all(config.parent().expect("config parent")).expect("config parent dir");
+        fs::write(config, b"jvm").expect("runtime config");
+    }
+}
+
+#[cfg(unix)]
+fn make_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = fs::metadata(path).expect("java metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).expect("java executable");
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) {}
+
+async fn serve_runtime_download(body: Vec<u8>) -> String {
+    let content_length = body.len() as u64;
+    serve_runtime_response(200, body, Some(content_length), "/runtime.bin").await
+}
+
+async fn serve_runtime_json(status: u16, body: Vec<u8>, content_length: Option<u64>) -> String {
+    let content_length = content_length.unwrap_or(body.len() as u64);
+    serve_runtime_response(status, body, Some(content_length), "/runtime.json").await
+}
+
+async fn serve_runtime_response(
+    status: u16,
+    body: Vec<u8>,
+    content_length: Option<u64>,
+    path: &str,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("runtime test listener");
+    let address = listener
+        .local_addr()
+        .expect("runtime test listener address");
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("runtime test connection");
+        let mut request = [0_u8; 1024];
+        let _ = socket.read(&mut request).await;
+        let reason = if status == 200 { "OK" } else { "Error" };
+        let headers = if let Some(content_length) = content_length {
+            format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
+            )
+        } else {
+            format!("HTTP/1.1 {status} {reason}\r\nConnection: close\r\n\r\n")
+        };
+        socket
+            .write_all(headers.as_bytes())
+            .await
+            .expect("runtime test response headers");
+        socket
+            .write_all(&body)
+            .await
+            .expect("runtime test response body");
+    });
+    format!("http://{address}{path}")
+}

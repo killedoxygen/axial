@@ -1,5 +1,5 @@
 import { config } from '../../store';
-import type { PerformanceMode } from '../../types';
+import type { PerformanceMode } from '../../types-performance';
 
 export function performanceModeFrom(value: string | undefined): PerformanceMode | null {
   if (value === 'managed' || value === 'vanilla' || value === 'custom') return value;

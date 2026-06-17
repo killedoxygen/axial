@@ -5,13 +5,13 @@ import { hasNativeDesktopRuntime, openExternalURL, requestNativeAppRestart } fro
 import {
   appVersion,
   bootstrapState,
-  installQueue,
+  installQueueState,
   installState,
   launchState,
   updateCheckState,
   updateInfo,
 } from './store';
-import type { UpdateInfo } from './types';
+import type { UpdateInfo } from './types-update';
 import { errMessage } from './utils';
 
 const AUTO_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
@@ -104,7 +104,11 @@ export async function openUpdateChecksum(): Promise<void> {
 }
 
 export function restartBlockedByActivity(): boolean {
-  return installState.value.status !== 'idle' || installQueue.value.length > 0 || launchState.value.status !== 'idle';
+  return (
+    installState.value.status !== 'idle' ||
+    installQueueState.value.view_model.queued_count > 0 ||
+    launchState.value.status !== 'idle'
+  );
 }
 
 export async function restartDesktopApp(): Promise<void> {
@@ -193,7 +197,7 @@ async function runAutoUpdateCheck(): Promise<void> {
   if (
     bootstrapState.value !== 'ready' ||
     installState.value.status !== 'idle' ||
-    installQueue.value.length > 0 ||
+    installQueueState.value.view_model.queued_count > 0 ||
     launchState.value.status !== 'idle'
   ) {
     queueAutoUpdateCheck(AUTO_CHECK_RETRY_MS);

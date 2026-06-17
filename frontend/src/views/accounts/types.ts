@@ -1,3 +1,5 @@
+import type { LaunchAuthMode } from '../../types-auth';
+
 export interface MinecraftSkin {
   id: string;
   state: string;
@@ -41,6 +43,13 @@ export interface AccountActionState {
   label: string;
   enabled: boolean;
   disabled_reason?: string;
+  detail?: string;
+  success_summary?: string;
+}
+
+export interface CommandViewModel {
+  summary: string;
+  detail?: string;
 }
 
 export interface AuthStatus {
@@ -59,6 +68,7 @@ export interface AuthStatus {
   msa_refresh_available: boolean;
   online_action?: AccountActionState;
   refresh_action?: AccountActionState;
+  profile_sync_action?: AccountActionState;
   skin_action?: AccountActionState;
 }
 
@@ -101,6 +111,10 @@ export interface LauncherAccount extends MinecraftAuthReadiness {
   msa_refresh_available: boolean;
   online_action?: AccountActionState;
   refresh_action?: AccountActionState;
+  profile_sync_action?: AccountActionState;
+  view_model?: {
+    detail?: string;
+  };
 }
 
 export interface LauncherAccountsData {
@@ -111,6 +125,7 @@ export interface LauncherAccountsData {
 export interface SkinFlushResult {
   status: string;
   applied: number;
+  viewModel?: CommandViewModel;
 }
 
 export interface StagedSkinUpload {
@@ -136,4 +151,3 @@ export interface SkinNormalizeMetadata {
   normalizedByteSize: number;
   normalizedDataUrl?: string;
 }
-import type { LaunchAuthMode } from '../../types';

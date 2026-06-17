@@ -4,16 +4,23 @@
 //! not execute filesystem or network effects.
 
 use super::{
-    DiagnosisId, GuardianActionKind, GuardianActionPlan, GuardianDecision, GuardianDecisionKind,
+    DiagnosisId, GuardianAction, GuardianActionKind, GuardianActionPlan, GuardianConfidence,
+    GuardianDecision, GuardianDecisionKind, GuardianMode,
 };
 use crate::observability::{RedactionAudience, sanitize_evidence_text, sanitize_evidence_token};
-use crate::state::contracts::{OperationPhase, OwnershipClass, TargetDescriptor, TargetKind};
+use crate::state::contracts::{
+    OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
+};
 use serde::{Deserialize, Serialize};
 
 const CORRUPT_ARTIFACT_DIAGNOSIS: &str = "launcher_managed_artifact_corrupt";
+const MANAGED_RUNTIME_CORRUPT_DIAGNOSIS: &str = "managed_runtime_corrupt";
 const ARTIFACT_REPAIR_MAX_ATTEMPTS: u32 = 1;
 const ARTIFACT_REPAIR_MAX_DEPTH: u8 = 3;
 const ARTIFACT_REPAIR_SUPPRESSION_KEY: &str = "install:launcher_managed_artifact_corrupt";
+const RUNTIME_REPAIR_MAX_ATTEMPTS: u32 = 1;
+const RUNTIME_REPAIR_MAX_DEPTH: u8 = 2;
+const RUNTIME_REPAIR_SUPPRESSION_KEY: &str = "runtime:managed_runtime_corrupt";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GuardianRepairPlanningContext {
@@ -96,6 +103,8 @@ pub enum GuardianRepairTaskKind {
     DownloadArtifactToTemp,
     VerifyArtifactChecksum,
     PromoteVerifiedArtifact,
+    VerifyManagedRuntimeReadyMarker,
+    RecreateManagedRuntimeReadyMarker,
     RecordRepairOutcome,
 }
 
@@ -106,6 +115,8 @@ pub enum GuardianRepairExecutor {
     ExecutionDownload,
     ExecutionArtifactVerifier,
     ExecutionFilePromotion,
+    ExecutionRuntimeVerifier,
+    ExecutionRuntimeRepair,
     GuardianOutcomeRecorder,
 }
 
@@ -115,6 +126,7 @@ pub enum GuardianRepairMutation {
     QuarantineManagedTarget,
     WriteTempArtifact,
     PromoteVerifiedArtifact,
+    RecreateManagedRuntimeReadyMarker,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -122,6 +134,7 @@ pub enum GuardianRepairReversibility {
     JournalOnly,
     QuarantineOnly,
     RepairByRedownload,
+    ReadyMarkerRecreation,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -153,6 +166,60 @@ pub fn plan_launcher_managed_missing_artifact_repair(
         context,
         missing_artifact_repair_tasks,
     )
+}
+
+pub fn plan_managed_runtime_ready_marker_repair(
+    decision: &GuardianDecision,
+    context: GuardianRepairPlanningContext,
+) -> Result<GuardianRepairPlan, GuardianRepairPlanRejection> {
+    if !context.public_redaction_ready {
+        return Err(GuardianRepairPlanRejection::UnsafePublicBoundary);
+    }
+    if !context.journal_available {
+        return Err(GuardianRepairPlanRejection::MissingJournal);
+    }
+    if context.suppression_active {
+        return Err(GuardianRepairPlanRejection::Suppressed);
+    }
+    if !context.executor_available {
+        return Err(GuardianRepairPlanRejection::MissingExecutorCapability);
+    }
+    if decision.kind != GuardianDecisionKind::Repair || decision.mode == GuardianMode::Disabled {
+        return Err(GuardianRepairPlanRejection::NonRepairDecision);
+    }
+
+    let plan = decision
+        .action_plan
+        .as_ref()
+        .ok_or(GuardianRepairPlanRejection::MissingActionPlan)?;
+    let (diagnosis_id, action) = supported_runtime_ready_marker_repair(decision, plan)?;
+    let target = action
+        .target
+        .clone()
+        .or_else(|| plan.prerequisite.affected_targets.first().cloned())
+        .ok_or(GuardianRepairPlanRejection::MissingTarget)?;
+    let target = public_safe_target(&target)?;
+
+    if target.ownership != OwnershipClass::LauncherManaged {
+        return Err(GuardianRepairPlanRejection::UnsafeOwnership);
+    }
+    if target.system != StabilizationSystem::Execution || target.kind != TargetKind::Runtime {
+        return Err(GuardianRepairPlanRejection::UnsupportedDiagnosis);
+    }
+
+    Ok(GuardianRepairPlan {
+        diagnosis_id: diagnosis_id.clone(),
+        target: target.clone(),
+        ownership: target.ownership,
+        max_depth: RUNTIME_REPAIR_MAX_DEPTH,
+        max_attempts: RUNTIME_REPAIR_MAX_ATTEMPTS,
+        suppression_key: safe_fragment(
+            &format!("{RUNTIME_REPAIR_SUPPRESSION_KEY}:{}", target.id),
+            "repair_suppression",
+        ),
+        public_summary: public_summary("repair_managed_runtime_ready_marker"),
+        tasks: runtime_ready_marker_repair_tasks(&diagnosis_id, &target),
+    })
 }
 
 fn plan_launcher_managed_artifact_repair_with_tasks(
@@ -223,6 +290,42 @@ fn supported_artifact_diagnosis(
         return Err(GuardianRepairPlanRejection::UnsupportedDiagnosis);
     }
     Ok(plan.prerequisite.diagnosis_id.clone())
+}
+
+fn supported_runtime_ready_marker_repair<'a>(
+    decision: &GuardianDecision,
+    plan: &'a GuardianActionPlan,
+) -> Result<(DiagnosisId, &'a GuardianAction), GuardianRepairPlanRejection> {
+    if plan.owner != StabilizationSystem::Guardian
+        || plan.prerequisite.diagnosis_id.as_str() != MANAGED_RUNTIME_CORRUPT_DIAGNOSIS
+        || !decision
+            .diagnoses
+            .iter()
+            .any(|diagnosis| diagnosis.as_str() == MANAGED_RUNTIME_CORRUPT_DIAGNOSIS)
+        || !plan
+            .prerequisite
+            .candidate_actions
+            .contains(&GuardianActionKind::Repair)
+        || !repair_confidence_is_sufficient(plan.prerequisite.confidence)
+    {
+        return Err(GuardianRepairPlanRejection::UnsupportedDiagnosis);
+    }
+    let action = plan
+        .actions
+        .iter()
+        .find(|action| action.kind == GuardianActionKind::Repair)
+        .ok_or(GuardianRepairPlanRejection::MissingTarget)?;
+    if action.reason != plan.prerequisite.diagnosis_id {
+        return Err(GuardianRepairPlanRejection::UnsupportedDiagnosis);
+    }
+    Ok((plan.prerequisite.diagnosis_id.clone(), action))
+}
+
+fn repair_confidence_is_sufficient(confidence: GuardianConfidence) -> bool {
+    matches!(
+        confidence,
+        GuardianConfidence::Confirmed | GuardianConfidence::Certain
+    )
 }
 
 fn repair_target(
@@ -373,6 +476,58 @@ fn missing_artifact_repair_tasks(
     ]
 }
 
+fn runtime_ready_marker_repair_tasks(
+    diagnosis_id: &DiagnosisId,
+    target: &TargetDescriptor,
+) -> Vec<GuardianRepairTask> {
+    vec![
+        runtime_repair_task(
+            "journal_runtime_repair_start",
+            GuardianRepairTaskKind::JournalRepairStart,
+            GuardianActionKind::RecordOnly,
+            GuardianRepairExecutor::StateJournal,
+            GuardianRepairMutation::None,
+            GuardianRepairReversibility::JournalOnly,
+            "journal_guardian_runtime_repair_start",
+            diagnosis_id,
+            target,
+        ),
+        runtime_repair_task(
+            "verify_managed_runtime_ready_marker",
+            GuardianRepairTaskKind::VerifyManagedRuntimeReadyMarker,
+            GuardianActionKind::RecordOnly,
+            GuardianRepairExecutor::ExecutionRuntimeVerifier,
+            GuardianRepairMutation::None,
+            GuardianRepairReversibility::JournalOnly,
+            "verify_managed_runtime_ready_marker",
+            diagnosis_id,
+            target,
+        ),
+        runtime_repair_task(
+            "recreate_managed_runtime_ready_marker",
+            GuardianRepairTaskKind::RecreateManagedRuntimeReadyMarker,
+            GuardianActionKind::Repair,
+            GuardianRepairExecutor::ExecutionRuntimeRepair,
+            GuardianRepairMutation::RecreateManagedRuntimeReadyMarker,
+            GuardianRepairReversibility::ReadyMarkerRecreation,
+            "recreate_managed_runtime_ready_marker",
+            diagnosis_id,
+            target,
+        ),
+        runtime_repair_task(
+            "record_runtime_repair_outcome",
+            GuardianRepairTaskKind::RecordRepairOutcome,
+            GuardianActionKind::RecordOnly,
+            GuardianRepairExecutor::GuardianOutcomeRecorder,
+            GuardianRepairMutation::None,
+            GuardianRepairReversibility::JournalOnly,
+            "record_guardian_runtime_repair_outcome",
+            diagnosis_id,
+            target,
+        ),
+    ]
+}
+
 fn repair_task(
     id: &str,
     kind: GuardianRepairTaskKind,
@@ -384,6 +539,57 @@ fn repair_task(
     diagnosis_id: &DiagnosisId,
     target: &TargetDescriptor,
 ) -> GuardianRepairTask {
+    repair_task_with_max_attempts(
+        id,
+        kind,
+        action,
+        executor,
+        mutation,
+        reversibility,
+        summary,
+        diagnosis_id,
+        target,
+        ARTIFACT_REPAIR_MAX_ATTEMPTS,
+    )
+}
+
+fn runtime_repair_task(
+    id: &str,
+    kind: GuardianRepairTaskKind,
+    action: GuardianActionKind,
+    executor: GuardianRepairExecutor,
+    mutation: GuardianRepairMutation,
+    reversibility: GuardianRepairReversibility,
+    summary: &str,
+    diagnosis_id: &DiagnosisId,
+    target: &TargetDescriptor,
+) -> GuardianRepairTask {
+    repair_task_with_max_attempts(
+        id,
+        kind,
+        action,
+        executor,
+        mutation,
+        reversibility,
+        summary,
+        diagnosis_id,
+        target,
+        RUNTIME_REPAIR_MAX_ATTEMPTS,
+    )
+}
+
+fn repair_task_with_max_attempts(
+    id: &str,
+    kind: GuardianRepairTaskKind,
+    action: GuardianActionKind,
+    executor: GuardianRepairExecutor,
+    mutation: GuardianRepairMutation,
+    reversibility: GuardianRepairReversibility,
+    summary: &str,
+    diagnosis_id: &DiagnosisId,
+    target: &TargetDescriptor,
+    max_attempts: u32,
+) -> GuardianRepairTask {
     GuardianRepairTask {
         id: safe_fragment(id, "repair_task"),
         kind,
@@ -394,7 +600,7 @@ fn repair_task(
         executor,
         mutation,
         reversibility,
-        max_attempts: ARTIFACT_REPAIR_MAX_ATTEMPTS,
+        max_attempts,
         requires_user_confirmation: false,
         public_summary: public_summary(summary),
         private_evidence_refs: vec![safe_fragment(
@@ -430,6 +636,7 @@ mod tests {
         GuardianRepairExecutor, GuardianRepairMutation, GuardianRepairPlanRejection,
         GuardianRepairPlanningContext, GuardianRepairTaskKind,
         plan_launcher_managed_artifact_repair, plan_launcher_managed_missing_artifact_repair,
+        plan_managed_runtime_ready_marker_repair,
     };
     use crate::guardian::{
         ActionPlanPrerequisite, DiagnosisId, GuardianAction, GuardianActionKind,
@@ -519,6 +726,41 @@ mod tests {
     }
 
     #[test]
+    fn plans_managed_runtime_ready_marker_repair_workflow() {
+        let decision = runtime_repair_decision(OwnershipClass::LauncherManaged);
+
+        let plan = plan_managed_runtime_ready_marker_repair(
+            &decision,
+            GuardianRepairPlanningContext::current_operation(),
+        )
+        .expect("runtime repair plan");
+
+        assert_eq!(plan.diagnosis_id.as_str(), "managed_runtime_corrupt");
+        assert_eq!(plan.ownership, OwnershipClass::LauncherManaged);
+        assert_eq!(plan.target.kind, TargetKind::Runtime);
+        assert_eq!(plan.max_attempts, 1);
+        assert_eq!(plan.max_depth, 2);
+        assert_eq!(plan.tasks.len(), 4);
+        assert_eq!(
+            plan.tasks.iter().map(|task| task.kind).collect::<Vec<_>>(),
+            vec![
+                GuardianRepairTaskKind::JournalRepairStart,
+                GuardianRepairTaskKind::VerifyManagedRuntimeReadyMarker,
+                GuardianRepairTaskKind::RecreateManagedRuntimeReadyMarker,
+                GuardianRepairTaskKind::RecordRepairOutcome,
+            ]
+        );
+        assert_eq!(
+            plan.tasks[2].executor,
+            GuardianRepairExecutor::ExecutionRuntimeRepair
+        );
+        assert_eq!(
+            plan.tasks[2].mutation,
+            GuardianRepairMutation::RecreateManagedRuntimeReadyMarker
+        );
+    }
+
+    #[test]
     fn rejects_user_owned_and_unknown_artifact_repair() {
         for ownership in [OwnershipClass::UserOwned, OwnershipClass::Unknown] {
             let decision = repair_decision(ownership);
@@ -531,6 +773,37 @@ mod tests {
 
             assert_eq!(error, GuardianRepairPlanRejection::UnsafeOwnership);
         }
+    }
+
+    #[test]
+    fn rejects_user_owned_unknown_and_unsupported_runtime_repair() {
+        for ownership in [OwnershipClass::UserOwned, OwnershipClass::Unknown] {
+            let decision = runtime_repair_decision(ownership);
+
+            let error = plan_managed_runtime_ready_marker_repair(
+                &decision,
+                GuardianRepairPlanningContext::current_operation(),
+            )
+            .expect_err("unsafe runtime ownership should reject");
+
+            assert_eq!(error, GuardianRepairPlanRejection::UnsafeOwnership);
+        }
+
+        let unsupported = runtime_repair_decision_for_target(TargetDescriptor::new(
+            StabilizationSystem::Guardian,
+            TargetKind::Runtime,
+            "java_runtime_delta",
+            OwnershipClass::LauncherManaged,
+        ));
+
+        assert_eq!(
+            plan_managed_runtime_ready_marker_repair(
+                &unsupported,
+                GuardianRepairPlanningContext::current_operation(),
+            )
+            .expect_err("unsupported target system"),
+            GuardianRepairPlanRejection::UnsupportedDiagnosis
+        );
     }
 
     #[test]
@@ -689,6 +962,42 @@ mod tests {
                     kind: GuardianActionKind::Repair,
                     target: Some(target),
                     reason: DiagnosisId::new("launcher_managed_artifact_corrupt"),
+                }],
+            )),
+        }
+    }
+
+    fn runtime_repair_decision(ownership: OwnershipClass) -> GuardianDecision {
+        runtime_repair_decision_for_target(TargetDescriptor::new(
+            StabilizationSystem::Execution,
+            TargetKind::Runtime,
+            "java_runtime_delta",
+            ownership,
+        ))
+    }
+
+    fn runtime_repair_decision_for_target(target: TargetDescriptor) -> GuardianDecision {
+        let ownership = target.ownership;
+        let operation_id = OperationId::new(format!("operation-runtime-{ownership:?}"));
+        let diagnosis_id = DiagnosisId::new("managed_runtime_corrupt");
+        GuardianDecision {
+            operation_id: Some(operation_id),
+            mode: GuardianMode::Managed,
+            kind: GuardianDecisionKind::Repair,
+            diagnoses: vec![diagnosis_id.clone()],
+            action_plan: Some(GuardianActionPlan::new(
+                StabilizationSystem::Guardian,
+                ActionPlanPrerequisite {
+                    diagnosis_id: diagnosis_id.clone(),
+                    ownership,
+                    confidence: GuardianConfidence::Confirmed,
+                    affected_targets: vec![target.clone()],
+                    candidate_actions: vec![GuardianActionKind::Repair, GuardianActionKind::Block],
+                },
+                vec![GuardianAction {
+                    kind: GuardianActionKind::Repair,
+                    target: Some(target),
+                    reason: diagnosis_id,
                 }],
             )),
         }

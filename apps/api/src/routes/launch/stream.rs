@@ -1,3 +1,5 @@
+use crate::application::launch as launch_app;
+use crate::observability::{RedactionAudience, sanitize_evidence_token, sanitize_public_log_line};
 use crate::state::{AppState, LaunchEvent, LaunchLogEvent, LaunchStatusEvent};
 use axum::{
     Json,
@@ -55,13 +57,18 @@ pub(super) async fn launch_events_sse(
 }
 
 fn status_event(status: &LaunchStatusEvent) -> Event {
-    Event::default()
-        .event("status")
-        .data(serde_json::to_string(status).unwrap_or_else(|_| "{}".to_string()))
+    Event::default().event("status").data(
+        serde_json::to_string(&launch_app::public_launch_status_json(status))
+            .unwrap_or_else(|_| "{}".to_string()),
+    )
 }
 
 fn log_event(log: &LaunchLogEvent) -> Event {
-    Event::default()
-        .event("log")
-        .data(serde_json::to_string(log).unwrap_or_else(|_| "{}".to_string()))
+    let source = sanitize_evidence_token(&log.source, RedactionAudience::UserVisible, 32)
+        .unwrap_or_else(|| "game".to_string());
+    let text = sanitize_public_log_line(&log.text, RedactionAudience::UserVisible, 1_000);
+    Event::default().event("log").data(
+        serde_json::to_string(&serde_json::json!({ "source": source, "text": text }))
+            .unwrap_or_else(|_| "{}".to_string()),
+    )
 }

@@ -1,7 +1,7 @@
 import type { JSX, RefObject } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { local, saveLocalState } from '../state';
-import type { OverlayPosition } from '../types';
+import type { OverlayPosition } from '../types-ui';
 
 const DRAG_IGNORE_SELECTOR = 'input, textarea, select, button, a, [data-drag-ignore="true"]';
 

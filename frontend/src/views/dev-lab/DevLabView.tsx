@@ -4,7 +4,7 @@ import './dev-lab.css';
 import { InstanceTile, nextArtSeed } from '../../ui/InstanceVisual';
 import { Button, Card, Input, SectionHeading } from '../../ui/Atoms';
 import { hashStr } from '../../tokens';
-import type { Instance } from '../../types';
+import type { Instance } from '../../types-instance';
 
 type LabTab = 'identity';
 

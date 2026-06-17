@@ -3,7 +3,7 @@ import type { ContextMenuItem } from '../../ui/ContextMenu';
 import { api } from '../../api';
 import { toast } from '../../toast';
 import { errMessage } from '../../utils';
-import type { EnrichedInstance } from '../../types';
+import type { EnrichedInstance } from '../../types-instance';
 import { openInstanceFolder } from './instance-actions';
 import { confirmDeleteItems, partialFailureMessage, runBulkMutation } from './bulk-actions';
 

@@ -530,6 +530,12 @@ pub async fn download_url_to_temp(
         Ok(report) => report,
         Err(error) => {
             facts.extend(error.facts);
+            facts.push(download_fact(
+                ExecutionFactKind::DownloadPromotionFailed,
+                request.operation_id.clone(),
+                &request.target,
+                Vec::new(),
+            ));
             return Err(DownloadCapabilityError::new(
                 DownloadCapabilityErrorKind::PromoteFailed,
                 facts,
@@ -898,6 +904,40 @@ mod tests {
             ExecutionFactKind::DownloadTempDiscarded
         ));
         assert_no_temp_files(&root, &destination);
+
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn promotion_failure_reports_download_stage_fact_and_preserves_target() {
+        let root = test_root("promotion-failure");
+        let destination = root.join("track.mp3");
+        fs::create_dir_all(&destination).expect("create directory destination");
+        let (url, server) = spawn_download_server("200 OK", b"fresh music".to_vec(), None).await;
+        let expected_sha256 = sha256_hex(b"fresh music");
+
+        let error = download_url_to_temp(
+            DownloadToTempRequest::new(launcher_target("music_cache"), &destination, &url)
+                .with_max_bytes(1024)
+                .with_expected_sha256(&expected_sha256),
+            &Client::new(),
+        )
+        .await
+        .expect_err("directory destination should fail promotion");
+        server.await.expect("server task");
+
+        assert_eq!(error.kind, DownloadCapabilityErrorKind::PromoteFailed);
+        assert!(destination.is_dir());
+        assert!(has_fact(
+            &error.facts,
+            ExecutionFactKind::DownloadWrittenToTemp
+        ));
+        assert!(has_fact(
+            &error.facts,
+            ExecutionFactKind::DownloadPromotionFailed
+        ));
+        assert!(has_fact(&error.facts, ExecutionFactKind::PrimitiveRefused));
+        assert_no_raw_path_or_url(&error.facts, &root, &url);
 
         cleanup(&root);
     }

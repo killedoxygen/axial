@@ -1,33 +1,26 @@
-// Kept at the top level so it can use install and action helpers without an import cycle.
-import { api, isApiError } from './api';
+import { api } from './api';
 import { toast } from './toast';
 import { errMessage } from './utils';
 import { navigate } from './ui-state';
-import { addInstance } from './actions';
-import { installVersion, installLoaderVersion } from './install';
-import type { Instance, LoaderBuildRecord } from './types';
-
-const MAX_NAME_COLLISION_RETRIES = 9;
-
-type InstallIntent =
-  | { kind: 'none' }
-  | { kind: 'vanilla'; versionId: string }
-  | { kind: 'loader'; build: LoaderBuildRecord };
+import { addInstance, setInstallQueueState } from './actions';
+import { refreshInstallQueue } from './install';
+import type { Instance } from './types-instance';
+import type { InstallQueueStateResponse } from './types-install';
+import type { ToastKind } from './types-ui';
 
 export interface InitialInstanceSettings {
   max_memory_mb?: number;
   art_seed?: number;
   window_width?: number;
   window_height?: number;
-  jvm_preset?: string;
+  jvm_preset_id?: string;
 }
 
 export interface CreateInstanceArgs {
   name: string;
-  versionId: string;
+  selectionId: string;
   icon: string;
   accent: string;
-  install: InstallIntent;
   initialSettings?: InitialInstanceSettings;
 }
 
@@ -37,12 +30,69 @@ export interface CreateInstanceResult {
   error?: string;
 }
 
+interface CreateResultViewModel {
+  state_id?: string;
+  tone?: string;
+  title?: string;
+  summary?: string;
+  detail?: string | null;
+}
+
+interface CreateQueuedInstallSummary {
+  state_id?: string;
+  kind?: string;
+  label?: string;
+  queue_id?: string | null;
+  install_id?: string | null;
+  operation_id?: string | null;
+}
+
+interface CreateGuardianNotice {
+  state_id?: string;
+  tone?: string;
+  message?: string;
+  detail?: string | null;
+}
+
 interface CreateResponse {
   id?: string;
   error?: string;
+  view_model?: CreateResultViewModel;
+  install_queue?: InstallQueueStateResponse;
+  queued_install?: CreateQueuedInstallSummary;
+  guardian_notice?: CreateGuardianNotice;
 }
 
-function isInstance(value: CreateResponse & Partial<Instance>): value is Instance {
+function trimmed(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function createToastKind(tone: string | undefined): ToastKind {
+  if (tone === 'error') return 'error';
+  if (tone === 'warn') return 'info';
+  return 'success';
+}
+
+function appendUnique(parts: string[], value: string): void {
+  if (!value || parts.some((part) => part.includes(value))) return;
+  parts.push(value);
+}
+
+function createResultToastMessage(res: CreateResponse): string {
+  const summary = trimmed(res.view_model?.summary);
+  const detail = trimmed(res.view_model?.detail);
+  const guardianMessage = trimmed(res.guardian_notice?.message);
+  const guardianDetail = trimmed(res.guardian_notice?.detail);
+  const parts: string[] = [];
+
+  appendUnique(parts, summary);
+  appendUnique(parts, guardianMessage);
+  appendUnique(parts, detail);
+  appendUnique(parts, guardianDetail);
+  return parts.join(' ');
+}
+
+function isInstance(value: CreateResponse & Partial<Instance>): value is CreateResponse & Instance {
   return (
     typeof value.id === 'string' &&
     value.id.trim().length > 0 &&
@@ -51,98 +101,47 @@ function isInstance(value: CreateResponse & Partial<Instance>): value is Instanc
     typeof value.version_id === 'string' &&
     value.version_id.trim().length > 0 &&
     typeof value.created_at === 'string' &&
-    value.created_at.trim().length > 0
+    value.created_at.trim().length > 0 &&
+    typeof value.view_model?.summary === 'string' &&
+    value.view_model.summary.trim().length > 0
   );
 }
 
-function isNameCollision(error: string): boolean {
-  return /already exists/i.test(error);
-}
-
-function nextCandidateName(base: string, attempt: number): string {
-  return `${base} (${attempt + 1})`;
-}
-
-async function attemptCreate(
-  name: string,
-  versionId: string,
-  icon: string,
-  accent: string,
-): Promise<CreateResponse & Partial<Instance>> {
-  return api('POST', '/instances', { name, version_id: versionId, icon, accent }) as Promise<
-    CreateResponse & Partial<Instance>
-  >;
-}
-
 export async function createInstance(args: CreateInstanceArgs): Promise<CreateInstanceResult> {
-  const { versionId, icon, accent, install } = args;
+  const { selectionId, icon, accent } = args;
   const baseName = args.name.trim();
   if (!baseName) return { ok: false, error: 'Name is required' };
-  if (!versionId) return { ok: false, error: 'Version is required' };
+  if (!selectionId) return { ok: false, error: 'Version is required' };
 
-  let name = baseName;
-  let created: Instance | null = null;
-  let lastError = '';
-
-  for (let attempt = 0; attempt <= MAX_NAME_COLLISION_RETRIES; attempt++) {
-    try {
-      const res = await attemptCreate(name, versionId, icon, accent);
-      if (res.error) {
-        if (isNameCollision(res.error) && attempt < MAX_NAME_COLLISION_RETRIES) {
-          name = nextCandidateName(baseName, attempt);
-          continue;
-        }
-        lastError = res.error;
-        break;
-      }
-      if (isInstance(res)) {
-        created = res;
-        break;
-      }
-      lastError = 'server returned an incomplete instance';
-      console.error('Create instance returned invalid payload');
-      break;
-    } catch (err: unknown) {
-      const message = errMessage(err);
-      if (isApiError(err) && isNameCollision(message) && attempt < MAX_NAME_COLLISION_RETRIES) {
-        name = nextCandidateName(baseName, attempt);
-        continue;
-      }
-      lastError = message;
-      break;
-    }
+  let res: CreateResponse & Partial<Instance>;
+  try {
+    res = (await api('POST', '/instances', {
+      name: baseName,
+      selection_id: selectionId,
+      icon,
+      accent,
+      ...(args.initialSettings ?? {}),
+    })) as CreateResponse & Partial<Instance>;
+  } catch (err: unknown) {
+    const message = errMessage(err);
+    toast(`Failed to create instance: ${message}`, 'error');
+    return { ok: false, error: message };
   }
 
-  if (!created) {
-    toast(`Failed to create instance: ${lastError || 'unknown error'}`, 'error');
-    return { ok: false, error: lastError };
+  if (res.error || !isInstance(res)) {
+    const error = res.error || 'server returned an incomplete instance';
+    if (!res.error) console.error('Create instance returned invalid payload');
+    toast(`Failed to create instance: ${error}`, 'error');
+    return { ok: false, error };
   }
 
-  // Initial settings are best-effort after the instance record exists.
-  const initial = args.initialSettings;
-  if (initial && Object.keys(initial).length > 0) {
-    try {
-      const res = (await api('PUT', `/instances/${encodeURIComponent(created.id)}`, initial)) as CreateResponse &
-        Partial<Instance>;
-      if (!res.error && isInstance(res)) {
-        created = res;
-      }
-    } catch {
-      /* Keep the created instance. */
-    }
-  }
-
+  const created = res;
   addInstance(created);
-  let queuedInstall = false;
-  if (install.kind === 'vanilla') {
-    installVersion(install.versionId);
-    queuedInstall = true;
-  } else if (install.kind === 'loader') {
-    installLoaderVersion(install.build);
-    queuedInstall = true;
+  if (res.install_queue) {
+    setInstallQueueState(res.install_queue);
+    void refreshInstallQueue({ connectActive: true, retryPendingStart: true });
   }
-
-  toast(queuedInstall ? `Created ${created.name}; download queued` : `Created ${created.name}`);
+  toast(createResultToastMessage(res), createToastKind(res.view_model?.tone ?? res.guardian_notice?.tone));
   navigate({ name: 'instance', id: created.id });
 
   return { ok: true, instance: created };

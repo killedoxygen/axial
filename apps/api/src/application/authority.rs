@@ -396,11 +396,12 @@ pub const ROUTE_BOUNDARY_PROBES: &[RouteBoundaryProbe] = &[
             "execute_guardian_artifact_repair",
             "guardian_prepare_failure_outcome(",
             "guardian_startup_failure_outcome(",
+            "plan_launch_recovery_directive(",
             "record_launch_recovery_attempt(",
             "record_launch_recovery_failure(",
-            "GuardianLaunchRecoveryRequest",
+            "GuardianLaunchRecoveryPlanRequest",
+            "GuardianLaunchRecoveryRecordRequest",
             "recovery_plan_for_startup_failure(",
-            "RecoveryPlan",
             "RecoveryAction",
         ],
         enforcement: RouteBoundaryEnforcement::EnforceNow,
@@ -437,6 +438,7 @@ pub const ROUTE_BOUNDARY_PROBES: &[RouteBoundaryProbe] = &[
             "performance_health_guardian_facts(",
             "performance_plan_guardian_facts(",
             "performance_state_error_guardian_fact(",
+            "plan_performance_supervision(",
             "performance_health_proof_record(",
             "OperationJournalEntry::new",
             "OperationJournalStep::new",
@@ -839,7 +841,11 @@ mod tests {
         let detail = read_repo_file("frontend/src/views/instance/InstanceDetailView.tsx");
         let controls = read_repo_file("frontend/src/views/instance/components/launch.tsx");
         let launch = read_repo_file("frontend/src/launch.ts");
-        let types = read_repo_file("frontend/src/types.ts");
+        let types = format!(
+            "{}\n{}",
+            read_repo_file("frontend/src/types-launch.ts"),
+            read_repo_file("frontend/src/types-instance.ts")
+        );
 
         assert_contains_all(
             "frontend launch action files",
@@ -909,12 +915,14 @@ mod tests {
             "frontend account/auth flow",
             &source,
             &[
-                "status?.skin_action?.enabled",
-                "status.online_action?.enabled",
-                "account.online_action?.state_id",
-                "refresh_action?.enabled",
+                "status?.skin_action",
+                "skinAction={skinAction}",
+                "actionEnabled(account.online_action)",
+                "active.online_action?.state_id",
+                "actionEnabled(activeRefreshAction)",
                 "accountActionState(value.online_action)",
                 "accountActionState(value.refresh_action)",
+                "accountActionState(value.profile_sync_action)",
             ],
         );
         assert_absent_all(
@@ -1021,7 +1029,10 @@ mod tests {
     fn skin_routes_delegate_profile_saved_skin_and_provider_workflows_to_application_boundary() {
         let skin_route = read_repo_file("apps/api/src/routes/skin.rs");
         let skin_route_production = production_rust_source(&skin_route);
-        let application_skin = read_repo_file("apps/api/src/application/skin.rs");
+        let application_skin = sources_for_paths(&[
+            "apps/api/src/application/skin.rs",
+            "apps/api/src/application/skin",
+        ]);
 
         assert_contains_all(
             "apps/api/src/routes/skin.rs",
@@ -1074,7 +1085,10 @@ mod tests {
     fn instance_routes_delegate_resource_workflows_to_application_boundary() {
         let instance_route = read_repo_file("apps/api/src/routes/instances.rs");
         let instance_route_production = production_rust_source(&instance_route);
-        let application_instances = read_repo_file("apps/api/src/application/instances.rs");
+        let application_instances = sources_for_paths(&[
+            "apps/api/src/application/instances.rs",
+            "apps/api/src/application/instances",
+        ]);
 
         assert_contains_all(
             "apps/api/src/routes/instances.rs",
@@ -1134,8 +1148,6 @@ mod tests {
         let loader_route = read_repo_file("apps/api/src/routes/loaders.rs");
         let install_route_production = production_rust_source(&install_route);
         let loader_route_production = production_rust_source(&loader_route);
-        let application_install = read_repo_file("apps/api/src/application/install.rs");
-
         assert_contains_all(
             "apps/api/src/routes/install.rs",
             &install_route_production,
@@ -1143,7 +1155,7 @@ mod tests {
                 "start_install_version(",
                 "InstallVersionStartRequest",
                 "install_status(",
-                "sanitize_install_progress(",
+                "install_events_stream(",
             ],
         );
         assert_contains_all(
@@ -1155,11 +1167,15 @@ mod tests {
                 "loader_components(",
                 "loader_builds(",
                 "loader_game_versions(",
-                "sanitize_install_progress(",
+                "loader_install_events_stream(",
             ],
         );
-        assert_contains_all(
+        let application_install = sources_for_paths(&[
             "apps/api/src/application/install.rs",
+            "apps/api/src/application/install",
+        ]);
+        assert_contains_all(
+            "apps/api/src/application/install",
             &application_install,
             &[
                 "stage_install_version_command",
@@ -1222,10 +1238,64 @@ mod tests {
     }
 
     #[test]
+    fn install_application_delegates_guardian_repair_decisions_to_guardian() {
+        let repair_source = read_repo_file("apps/api/src/application/install/repair.rs");
+        let repair_production = production_rust_source(&repair_source);
+        let guardian_outcome =
+            production_rust_source(&read_repo_file("apps/api/src/guardian/outcome.rs"));
+
+        assert_contains_all(
+            "apps/api/src/application/install/repair.rs",
+            &repair_production,
+            &[
+                "install_artifact_failure_from_minecraft_download_fact(",
+                "plan_install_artifact_failure_repair(",
+                "execute_guardian_artifact_repair(",
+                "execute_guardian_missing_artifact_repair(",
+                "install_artifact_repair_user_outcome(",
+            ],
+        );
+        assert_contains_all(
+            "apps/api/src/guardian/outcome.rs",
+            &guardian_outcome,
+            &[
+                "install_artifact_repair_user_outcome(",
+                "Guardian repaired a launcher-managed install artifact.",
+                "Guardian paused automatic install repair after repeated failure.",
+                "Guardian blocked automatic install repair because it was unsafe.",
+                "Guardian could not repair the launcher-managed install artifact.",
+            ],
+        );
+        assert_absent_all(
+            "apps/api/src/application/install/repair.rs",
+            &repair_production,
+            &[
+                "GuardianDecision {",
+                "GuardianActionPlan::new",
+                "ActionPlanPrerequisite",
+                "GuardianAction {",
+                "GuardianDecisionKind::Repair",
+                "GuardianActionKind::Repair",
+                "install_repair_summary_copy",
+                "Guardian repaired a launcher-managed install artifact.",
+                "Guardian paused automatic install repair after repeated failure.",
+                "Guardian blocked automatic install repair because it was unsafe.",
+                "Guardian could not repair the launcher-managed install artifact.",
+            ],
+        );
+    }
+
+    #[test]
     fn launch_routes_delegate_workflow_to_application_launch_boundary() {
         let route = read_repo_file("apps/api/src/routes/launch/mod.rs");
-        let app_session = read_repo_file("apps/api/src/application/launch/session.rs");
-        let app_runner = read_repo_file("apps/api/src/application/launch/runner.rs");
+        let app_session = sources_for_paths(&[
+            "apps/api/src/application/launch/session.rs",
+            "apps/api/src/application/launch/session",
+        ]);
+        let app_runner = sources_for_paths(&[
+            "apps/api/src/application/launch/runner.rs",
+            "apps/api/src/application/launch/runner",
+        ]);
 
         assert_contains_all(
             "apps/api/src/routes/launch/mod.rs",
@@ -1236,8 +1306,7 @@ mod tests {
                 "launch_app::prepare_launch_session",
                 "launch_app::launch_session",
                 "launch_app::launch_prepared_response_payload",
-                "launch_app::launch_success_response_payload",
-                "launch_app::launch_request_error_response_payload",
+                "spawn_launch_session(",
             ],
         );
         assert_contains_all(
@@ -1258,12 +1327,16 @@ mod tests {
                 "prepare_launch_attempt_with_events(",
                 "guardian_prepare_failure_outcome(",
                 "guardian_startup_failure_outcome(",
+                "plan_guardian_launch_recovery_directive(",
                 "record_launch_recovery_attempt(",
                 "record_launch_recovery_failure(",
             ],
         );
 
-        for path in repo_files_under("apps/api/src/routes/launch") {
+        for path in repo_files_under("apps/api/src/routes/launch")
+            .into_iter()
+            .filter(|path| !is_rust_test_source(path))
+        {
             let display = path.strip_prefix(repo_root()).unwrap_or(&path).display();
             let raw_source = fs::read_to_string(&path)
                 .unwrap_or_else(|error| panic!("failed to read {display}: {error}"));
@@ -1281,6 +1354,7 @@ mod tests {
                     "execute_managed_runtime_ready_marker_repair",
                     "guardian_prepare_failure_outcome(",
                     "guardian_startup_failure_outcome(",
+                    "plan_guardian_launch_recovery_directive(",
                     "record_launch_recovery_attempt(",
                     "record_launch_recovery_failure(",
                 ],
@@ -1289,11 +1363,127 @@ mod tests {
     }
 
     #[test]
+    fn launch_recovery_delegates_directive_planning_to_guardian() {
+        let guardian_recovery =
+            production_rust_source(&read_repo_file("apps/api/src/guardian/launch_recovery.rs"));
+        let guardian_outcome =
+            production_rust_source(&read_repo_file("apps/api/src/guardian/outcome.rs"));
+        let app_recovery = production_rust_source(&read_repo_file(
+            "apps/api/src/application/launch/runner/recovery.rs",
+        ));
+        let app_runner =
+            production_rust_source(&read_repo_file("apps/api/src/application/launch/runner.rs"));
+
+        assert_contains_all(
+            "apps/api/src/guardian/launch_recovery.rs",
+            &guardian_recovery,
+            &[
+                "GuardianLaunchRecoveryPlan",
+                "GuardianLaunchRecoveryActionTemplate",
+                "GuardianLaunchRecoveryPlanRequest",
+                "plan: &'a GuardianLaunchRecoveryPlan",
+                "pub fn plan_launch_recovery_directive(",
+                "directive_kind_matches_effect(",
+            ],
+        );
+        assert_contains_all(
+            "apps/api/src/guardian/outcome.rs",
+            &guardian_outcome,
+            &[
+                "launch_recovery_suppressed_user_outcome(",
+                "launch_recovery_public_action_label(",
+                "Guardian suppressed a repeated launch self-healing retry",
+                "Review the latest game log or change the affected launch setting before retrying.",
+            ],
+        );
+        assert_contains_all(
+            "apps/api/src/application/launch/runner/recovery.rs",
+            &app_recovery,
+            &[
+                "plan_launch_recovery_directive(",
+                "GuardianLaunchRecoveryPlanRequest {",
+                "GuardianLaunchRecoveryRecordRequest {",
+                "plan: &GuardianLaunchRecoveryPlan",
+                "launch_recovery_suppressed_user_outcome(",
+            ],
+        );
+        assert_contains_all(
+            "apps/api/src/application/launch/runner.rs",
+            &app_runner,
+            &[
+                "let mut last_recovery_plan: Option<GuardianLaunchRecoveryPlan>",
+                "plan_guardian_launch_recovery_directive(",
+                "record_guardian_launch_recovery_attempt(",
+                "apply_prepare_recovery_directive(&mut guardian, &mut attempt, &recovery_plan)",
+                "apply_startup_recovery_directive(&mut guardian, &mut attempt, &recovery_plan)",
+                "last_recovery_plan.as_ref()",
+            ],
+        );
+        assert_absent_all(
+            "apps/api/src/application/launch/runner.rs",
+            &app_runner,
+            &["let recovery_kind = directive.kind", "last_recovery_kind"],
+        );
+        assert_absent_all(
+            "apps/api/src/application/launch/runner/recovery.rs",
+            &app_recovery,
+            &[
+                "suppressed_launch_recovery_message",
+                "Guardian suppressed a repeated launch self-healing retry",
+                "explicit JVM argument recovery",
+                "managed Java recovery",
+                "JVM preset recovery",
+                "custom GC flag recovery",
+            ],
+        );
+    }
+
+    #[test]
+    fn launch_runtime_repair_delegates_guardian_planning_to_guardian() {
+        let runtime_repair =
+            read_repo_file("apps/api/src/application/launch/session/runtime_repair.rs");
+        let runtime_repair_production = production_rust_source(&runtime_repair);
+
+        assert_contains_all(
+            "apps/api/src/application/launch/session/runtime_repair.rs",
+            &runtime_repair_production,
+            &[
+                "stage_launch_boundary(",
+                "plan_managed_runtime_ready_marker_repair(",
+                "execute_managed_runtime_ready_marker_repair(",
+                "runtime_repair_user_outcome(",
+                "GuardianManagedRuntimeRepairRequest {",
+                "plan: &repair_plan",
+            ],
+        );
+        assert_absent_all(
+            "apps/api/src/application/launch/session/runtime_repair.rs",
+            &runtime_repair_production,
+            &[
+                "GuardianDecision {",
+                "GuardianActionPlan::new",
+                "ActionPlanPrerequisite",
+                "GuardianAction {",
+                "GuardianDecisionKind::Repair",
+                "GuardianActionKind::Repair",
+                "Guardian repaired launch state before launch.",
+                "Guardian repaired the managed Java runtime before launch.",
+                "Guardian suppressed managed Java runtime repair",
+                "Guardian could not repair the managed Java runtime automatically.",
+                "Guardian blocked managed Java runtime repair because it was not safe to apply.",
+                "Reinstall or repair the affected version/runtime before launching again.",
+            ],
+        );
+    }
+
+    #[test]
     fn performance_routes_delegate_workflow_to_application_performance_boundary() {
         let route = read_repo_file("apps/api/src/routes/performance.rs");
         let route_production = production_rust_source(&route);
-        let application_performance =
-            production_rust_source(&read_repo_file("apps/api/src/application/performance.rs"));
+        let application_performance = sources_for_paths(&[
+            "apps/api/src/application/performance.rs",
+            "apps/api/src/application/performance",
+        ]);
         let workflow = production_rust_source(&read_repo_file(
             "apps/api/src/application/performance/workflow.rs",
         ));
@@ -1327,6 +1517,7 @@ mod tests {
                 "performance_health_guardian_facts(",
                 "performance_plan_guardian_facts(",
                 "performance_state_error_guardian_fact(",
+                "plan_performance_supervision(",
                 "performance_health_proof_record(",
                 "OperationJournalEntry::new",
                 "OperationJournalStep::new",
@@ -1363,6 +1554,98 @@ mod tests {
                 "performance_plan_summary_view_model",
                 "Could not update managed performance files",
                 "Could not load performance data",
+            ],
+        );
+    }
+
+    #[test]
+    fn performance_mutation_delegates_safety_supervision_to_guardian() {
+        let mutation = production_rust_source(&read_repo_file(
+            "apps/api/src/application/performance/workflow/mutation.rs",
+        ));
+        let operations = production_rust_source(&read_repo_file(
+            "apps/api/src/application/performance/workflow/operations.rs",
+        ));
+        let guardian_performance =
+            production_rust_source(&read_repo_file("apps/api/src/guardian/performance.rs"));
+        let guardian_outcome =
+            production_rust_source(&read_repo_file("apps/api/src/guardian/outcome.rs"));
+        let core_install =
+            production_rust_source(&read_repo_file("core/performance/src/install/mutation.rs"));
+        let core_resolve =
+            production_rust_source(&read_repo_file("core/performance/src/resolve/planner.rs"));
+
+        assert_contains_all(
+            "apps/api/src/guardian/performance.rs",
+            &guardian_performance,
+            &[
+                "GuardianPerformanceSupervisionRequest",
+                "GuardianPerformanceSupervisionPlan",
+                "plan_performance_supervision(",
+                "decide_guardian_policy(",
+                "build_safety_case(",
+            ],
+        );
+        assert_contains_all(
+            "apps/api/src/guardian/outcome.rs",
+            &guardian_outcome,
+            &[
+                "performance_supervision_rejection_user_outcome(",
+                "performance update was blocked by Guardian safety supervision",
+            ],
+        );
+        assert_contains_all(
+            "apps/api/src/application/performance/workflow/mutation.rs",
+            &mutation,
+            &[
+                "plan_performance_supervision(",
+                "GuardianPerformanceSupervisionRequest",
+                "GuardianPerformanceOperationKind::ApplyManagedComposition",
+                "GuardianPerformanceOperationKind::RemoveManagedComposition",
+                "GuardianPerformanceOperationKind::RollbackManagedComposition",
+                "performance_plan_guardian_facts(",
+                "performance_failure_memory_guardian_fact(",
+                "record_performance_guardian_supervision(",
+                "performance_supervision_rejection_user_outcome(",
+            ],
+        );
+        assert_contains_all(
+            "apps/api/src/application/performance/workflow/operations.rs",
+            &operations,
+            &[
+                "record_performance_guardian_supervision(",
+                "GuardianPerformanceSupervisionPlan",
+                "record_guardian_evidence(",
+            ],
+        );
+        assert_absent_all(
+            "apps/api/src/application/performance/workflow/mutation.rs",
+            &mutation,
+            &[
+                "GuardianDecision {",
+                "GuardianActionPlan::new",
+                "GuardianAction {",
+                "decide_guardian_policy(",
+                "build_safety_case(",
+                "performance update was blocked by Guardian safety supervision",
+            ],
+        );
+        assert_absent_all(
+            "core/performance/src/install/mutation.rs",
+            &core_install,
+            &[
+                "GuardianPerformance",
+                "decide_guardian_policy(",
+                "build_safety_case(",
+            ],
+        );
+        assert_absent_all(
+            "core/performance/src/resolve/planner.rs",
+            &core_resolve,
+            &[
+                "GuardianPerformance",
+                "decide_guardian_policy(",
+                "build_safety_case(",
             ],
         );
     }
@@ -1514,7 +1797,6 @@ mod tests {
                 "recovery_plan_for_startup_failure",
                 "PreLaunchDecision",
                 "StartupFailureDecision",
-                "RecoveryPlan",
                 "RecoveryAction",
             ],
         );
@@ -1538,7 +1820,6 @@ mod tests {
                     "recovery_plan_for_startup_failure(",
                     "PreLaunchDecision",
                     "StartupFailureDecision",
-                    "RecoveryPlan",
                     "RecoveryAction",
                 ],
             );
@@ -1671,19 +1952,19 @@ mod tests {
                 owner: "Application + Guardian + Execution runtime",
                 proofs: &[
                     LocalTestProof {
-                        file: "apps/api/src/application/launch/session.rs",
+                        file: "apps/api/src/application/launch/session/tests/overrides.rs",
                         test_name: "launch_preflight_undefined_java_override_exposes_guardian_fact",
                     },
                     LocalTestProof {
-                        file: "apps/api/src/application/launch/session.rs",
+                        file: "apps/api/src/application/launch/session/tests/overrides.rs",
                         test_name: "launch_preflight_null_java_override_exposes_guardian_fact",
                     },
                     LocalTestProof {
-                        file: "apps/api/src/application/launch/session.rs",
+                        file: "apps/api/src/application/launch/session/tests/overrides.rs",
                         test_name: "launch_preflight_blank_explicit_java_override_exposes_guardian_fact",
                     },
                     LocalTestProof {
-                        file: "apps/api/src/application/launch/session.rs",
+                        file: "apps/api/src/application/launch/session/tests/overrides.rs",
                         test_name: "launch_preflight_bad_custom_java_override_blocks_with_guardian_fact",
                     },
                 ],
@@ -1693,6 +1974,14 @@ mod tests {
                 owner: "Execution runtime + Guardian",
                 proofs: &[
                     LocalTestProof {
+                        file: "apps/api/src/application/launch/session/tests/overrides.rs",
+                        test_name: "launch_preflight_wrong_java_major_override_falls_back_with_guardian_fact",
+                    },
+                    LocalTestProof {
+                        file: "apps/api/src/application/launch/session/tests/overrides.rs",
+                        test_name: "launch_preflight_old_java8_update_falls_back_with_guardian_fact",
+                    },
+                    LocalTestProof {
                         file: "apps/api/src/execution/runtime.rs",
                         test_name: "wrong_major_emits_expected_and_actual_without_java_path",
                     },
@@ -1701,7 +1990,7 @@ mod tests {
                         test_name: "wrong_update_emits_required_and_actual_without_java_path",
                     },
                     LocalTestProof {
-                        file: "apps/api/src/guardian/mod.rs",
+                        file: "apps/api/src/guardian/tests.rs",
                         test_name: "execution_java_update_fact_maps_to_update_diagnosis",
                     },
                 ],
@@ -1711,11 +2000,15 @@ mod tests {
                 owner: "Execution runtime + Guardian",
                 proofs: &[
                     LocalTestProof {
+                        file: "apps/api/src/application/launch/session/tests/overrides.rs",
+                        test_name: "launch_preflight_probe_failing_java_override_falls_back_without_raw_path",
+                    },
+                    LocalTestProof {
                         file: "apps/api/src/execution/runtime.rs",
                         test_name: "probe_failure_emits_probe_failed_fact_without_path",
                     },
                     LocalTestProof {
-                        file: "apps/api/src/guardian/mod.rs",
+                        file: "apps/api/src/guardian/tests.rs",
                         test_name: "execution_runtime_fact_maps_to_confirmed_runtime_diagnosis",
                     },
                 ],
@@ -1729,7 +2022,7 @@ mod tests {
                         test_name: "malformed_jvm_args_emit_parse_fact_without_raw_args",
                     },
                     LocalTestProof {
-                        file: "apps/api/src/application/launch/session.rs",
+                        file: "apps/api/src/application/launch/session/tests/overrides.rs",
                         test_name: "launch_preflight_malformed_jvm_args_exposes_redacted_guardian_fact",
                     },
                 ],
@@ -1743,7 +2036,7 @@ mod tests {
                         test_name: "runtime_sensitive_gc_flags_emit_unsupported_gc_fact",
                     },
                     LocalTestProof {
-                        file: "apps/api/src/application/launch/session.rs",
+                        file: "apps/api/src/application/launch/session/tests/overrides.rs",
                         test_name: "launch_preflight_unsupported_jvm_gc_flags_exposes_guardian_fact",
                     },
                     LocalTestProof {
@@ -1761,7 +2054,7 @@ mod tests {
                         test_name: "memory_classpath_native_and_agent_overrides_emit_distinct_facts",
                     },
                     LocalTestProof {
-                        file: "apps/api/src/guardian/mod.rs",
+                        file: "apps/api/src/guardian/tests.rs",
                         test_name: "execution_jvm_unsafe_fact_maps_to_unsafe_override_diagnosis",
                     },
                 ],
@@ -1771,7 +2064,7 @@ mod tests {
                 owner: "Application launch + Guardian preflight",
                 proofs: &[
                     LocalTestProof {
-                        file: "apps/api/src/application/launch/session.rs",
+                        file: "apps/api/src/application/launch/session/tests/readiness.rs",
                         test_name: "launch_preflight_readiness_reports_missing_client_jar",
                     },
                     LocalTestProof {
@@ -1784,7 +2077,7 @@ mod tests {
                 id: "missing_library",
                 owner: "Application launch + Guardian preflight",
                 proofs: &[LocalTestProof {
-                    file: "apps/api/src/application/launch/session.rs",
+                    file: "apps/api/src/application/launch/session/tests/readiness.rs",
                     test_name: "launch_preflight_readiness_reports_missing_libraries_as_guardian_fact",
                 }],
             },
@@ -1793,7 +2086,7 @@ mod tests {
                 owner: "Application install + Guardian artifact repair + Execution download",
                 proofs: &[
                     LocalTestProof {
-                        file: "apps/api/src/application/install.rs",
+                        file: "apps/api/src/application/install/tests.rs",
                         test_name: "install_guardian_repair_repairs_matching_checksum_failure",
                     },
                     LocalTestProof {
@@ -1811,11 +2104,11 @@ mod tests {
                 owner: "Application launch + Guardian preflight",
                 proofs: &[
                     LocalTestProof {
-                        file: "apps/api/src/application/launch/session.rs",
+                        file: "apps/api/src/application/launch/session/tests/readiness.rs",
                         test_name: "launch_preflight_readiness_reports_incomplete_install_marker",
                     },
                     LocalTestProof {
-                        file: "apps/api/src/application/launch/session.rs",
+                        file: "apps/api/src/application/launch/session/tests/readiness.rs",
                         test_name: "prepare_launch_session_rejects_incomplete_install_without_session",
                     },
                 ],
@@ -1829,7 +2122,7 @@ mod tests {
                         test_name: "interrupted_download_discards_temp_and_reports_facts",
                     },
                     LocalTestProof {
-                        file: "apps/api/src/routes/install.rs",
+                        file: "apps/api/src/application/install/tests.rs",
                         test_name: "install_status_exposes_interrupted_install_as_redacted_terminal_state",
                     },
                 ],
@@ -1839,7 +2132,7 @@ mod tests {
                 owner: "Performance + Guardian performance",
                 proofs: &[
                     LocalTestProof {
-                        file: "apps/api/src/application/performance/workflow.rs",
+                        file: "apps/api/src/application/performance/workflow/tests/rules_status.rs",
                         test_name: "status_reports_invalid_remote_rules_with_guardian_fact_and_safe_copy",
                     },
                     LocalTestProof {
@@ -1853,11 +2146,11 @@ mod tests {
                 owner: "Performance + State performance operations",
                 proofs: &[
                     LocalTestProof {
-                        file: "apps/api/src/application/performance/workflow.rs",
+                        file: "apps/api/src/application/performance/workflow/tests/install_rollback.rs",
                         test_name: "rollback_with_specific_snapshot_id_restores_older_snapshot",
                     },
                     LocalTestProof {
-                        file: "apps/api/src/application/performance/workflow.rs",
+                        file: "apps/api/src/application/performance/workflow/tests/operations.rs",
                         test_name: "queued_rollback_without_snapshot_emits_terminal_error",
                     },
                 ],
@@ -1871,7 +2164,7 @@ mod tests {
                         test_name: "session_outcome_classifies_startup_stall_and_preboot_crash",
                     },
                     LocalTestProof {
-                        file: "apps/api/src/application/launch/runner.rs",
+                        file: "apps/api/src/application/launch/runner/recovery.rs",
                         test_name: "startup_exited_blocks_with_observed_failure_guardian_summary",
                     },
                 ],
@@ -1885,7 +2178,7 @@ mod tests {
                         test_name: "session_outcome_classifies_startup_stall_and_preboot_crash",
                     },
                     LocalTestProof {
-                        file: "apps/api/src/application/launch/runner.rs",
+                        file: "apps/api/src/application/launch/runner/recovery.rs",
                         test_name: "startup_stalled_blocks_with_guardian_authored_status_payload",
                     },
                 ],
@@ -1933,8 +2226,8 @@ mod tests {
                         test_name: "launch_recovery_attempt_is_suppressed_while_failure_window_is_active",
                     },
                     LocalTestProof {
-                        file: "apps/api/src/application/launch/runner.rs",
-                        test_name: "runner_launch_recovery_memory_records_redacted_attempt_failure_and_suppression",
+                        file: "apps/api/src/application/launch/runner/recovery.rs",
+                        test_name: "launch_recovery_memory_records_redacted_attempt_failure_and_suppression",
                     },
                 ],
             },
@@ -1974,6 +2267,38 @@ mod tests {
         let path = repo_root().join(relative);
         fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
+    }
+
+    fn sources_for_paths(relatives: &[&str]) -> String {
+        let mut sources = Vec::new();
+        for relative in relatives {
+            let path = repo_root().join(relative);
+            if path.is_dir() {
+                sources.extend(
+                    repo_files_under(relative)
+                        .into_iter()
+                        .filter(|path| !is_rust_test_source(path))
+                        .map(|path| {
+                            let display = path
+                                .strip_prefix(repo_root())
+                                .unwrap_or(&path)
+                                .display()
+                                .to_string();
+                            read_repo_file(&display)
+                        }),
+                );
+            } else {
+                sources.push(read_repo_file(relative));
+            }
+        }
+        sources.join("\n")
+    }
+
+    fn is_rust_test_source(path: &Path) -> bool {
+        path.file_name().is_some_and(|name| name == "tests.rs")
+            || path
+                .components()
+                .any(|component| component.as_os_str() == "tests")
     }
 
     fn repo_files_under(relative: &str) -> Vec<PathBuf> {

@@ -20,16 +20,9 @@ import { Icon } from '../../ui/Icons';
 import { MicrosoftMark } from '../../ui/MicrosoftMark';
 import { Modal, ModalContent, ModalHeader, ModalTitle } from '../../ui/Modal';
 import { PlayerHeadPreview } from '../../ui/PlayerHeadPreview';
-import {
-  authProfileSyncErrorMessage,
-  authRefreshErrorMessage,
-  configErrorMessage,
-  accountCanSelectOnline,
-  accountHasLaunchReadyMinecraft,
-  logoutErrorMessage,
-} from './auth';
-import { isRecord, launcherAccountsResponse } from './api';
-import type { AuthStatusRecord, AuthStatusState, LauncherAccount } from './types';
+import { authProfileSyncErrorMessage, authRefreshErrorMessage, configErrorMessage, logoutErrorMessage } from './auth';
+import { commandSummary, isRecord, launcherAccountsResponse } from './api';
+import type { AccountActionState, AuthStatusRecord, AuthStatusState, LauncherAccount } from './types';
 import { useMicrosoftSignIn } from './useMicrosoftSignIn';
 
 async function refreshConfigSignal(): Promise<void> {
@@ -38,6 +31,18 @@ async function refreshConfigSignal(): Promise<void> {
   } catch (err: unknown) {
     console.warn('Could not refresh config after account change.', err);
   }
+}
+
+function actionEnabled(action: AccountActionState | undefined): boolean {
+  return action?.enabled === true;
+}
+
+function actionUnavailableMessage(action: AccountActionState | undefined, fallback: string): string {
+  return action?.disabled_reason || action?.detail || fallback;
+}
+
+function actionSuccessMessage(action: AccountActionState | undefined, fallback: string): string {
+  return action?.success_summary || action?.label || fallback;
 }
 
 function IdentityRow({
@@ -190,8 +195,10 @@ export function AccountSwitcher({
   const accountTextureSrc = activeAccount
     ? (liveAccountTextureSrc ?? (onlineActive && activeProfileTextureSrc ? activeProfileTextureSrc : offlineTextureSrc))
     : undefined;
-  const refreshAvailable = Boolean(activeMicrosoftAccount?.refresh_action?.enabled ?? status?.refresh_action?.enabled);
-  const profileSyncAvailable = Boolean(activeMicrosoftAccount?.minecraft_profile ?? status?.minecraft_profile);
+  const activeRefreshAction = activeMicrosoftAccount?.refresh_action ?? status?.refresh_action;
+  const activeProfileSyncAction = activeMicrosoftAccount?.profile_sync_action ?? status?.profile_sync_action;
+  const refreshAvailable = actionEnabled(activeRefreshAction);
+  const profileSyncAvailable = actionEnabled(activeProfileSyncAction);
   const microsoftAccounts = accounts.filter((account) => account.kind === 'microsoft');
   const offlineAccounts = accounts.filter((account) => account.kind === 'offline');
   const externalBusy = removeBusy || refreshBusy || profileSyncBusy || selectBusy;
@@ -229,13 +236,16 @@ export function AccountSwitcher({
           ) ?? null;
       }
 
-      if (!active || !accountHasLaunchReadyMinecraft(active)) {
+      if (!active || active.online_action?.state_id !== 'online_ready') {
         await refreshConfigSignal();
         onChanged();
         refreshAccountSkin();
         return {
           tone: 'err',
-          text: 'Microsoft sign-in completed, but Minecraft Java ownership or profile readiness could not be verified.',
+          text: actionUnavailableMessage(
+            active?.online_action,
+            'Microsoft sign-in completed, but account state is unavailable.',
+          ),
         };
       }
       try {
@@ -246,6 +256,7 @@ export function AccountSwitcher({
       await refreshConfigSignal();
       onChanged();
       refreshAccountSkin();
+      return { tone: 'ok', text: actionSuccessMessage(active.online_action, 'Account state updated.') };
     },
   });
   const busy = externalBusy || loginFlow.busy;
@@ -260,11 +271,11 @@ export function AccountSwitcher({
         loginFlow.setMessage({ tone: 'err', text: authRefreshErrorMessage(response) });
         return;
       }
-      if (!isRecord(response) || response.status !== 'refreshed') {
-        loginFlow.setMessage({ tone: 'err', text: 'Microsoft sign-in refresh returned an unexpected response.' });
-        return;
-      }
-      loginFlow.setMessage({ tone: 'ok', text: 'Microsoft sign-in refreshed.' });
+      if (!isRecord(response)) throw new Error('Microsoft sign-in refresh returned an invalid response.');
+      loginFlow.setMessage({
+        tone: 'ok',
+        text: commandSummary(response, actionSuccessMessage(activeRefreshAction, 'Account state updated.')),
+      });
       await refreshConfigSignal();
     } catch (err: unknown) {
       loginFlow.setMessage({
@@ -289,11 +300,11 @@ export function AccountSwitcher({
         loginFlow.setMessage({ tone: 'err', text: authProfileSyncErrorMessage(response) });
         return;
       }
-      if (!isRecord(response) || response.status !== 'profile_synced') {
-        loginFlow.setMessage({ tone: 'err', text: 'Minecraft profile sync returned an unexpected response.' });
-        return;
-      }
-      loginFlow.setMessage({ tone: 'ok', text: 'Minecraft profile synced.' });
+      if (!isRecord(response)) throw new Error('Minecraft profile sync returned an invalid response.');
+      loginFlow.setMessage({
+        tone: 'ok',
+        text: commandSummary(response, actionSuccessMessage(activeProfileSyncAction, 'Account state updated.')),
+      });
       await refreshConfigSignal();
     } catch (err: unknown) {
       loginFlow.setMessage({
@@ -310,10 +321,13 @@ export function AccountSwitcher({
 
   const selectAccount = async (account: LauncherAccount): Promise<void> => {
     if (busy || account.active) return;
-    if (account.kind === 'microsoft' && !accountCanSelectOnline(account)) {
+    if (account.kind === 'microsoft' && !actionEnabled(account.online_action)) {
       loginFlow.setMessage({
         tone: 'err',
-        text: 'Online needs a verified, Java-owning Minecraft account with valid credentials.',
+        text: actionUnavailableMessage(
+          account.online_action,
+          'This Microsoft account is not available for Online mode.',
+        ),
       });
       return;
     }
@@ -325,6 +339,7 @@ export function AccountSwitcher({
         loginFlow.setMessage({ tone: 'err', text: configErrorMessage(selected) });
         return;
       }
+      loginFlow.setMessage({ tone: 'ok', text: commandSummary(selected, 'Account selected.') });
       await refreshConfigSignal();
       onChanged();
       refreshAccountSkin();
@@ -351,6 +366,7 @@ export function AccountSwitcher({
         loginFlow.setMessage({ tone: 'err', text: configErrorMessage(response) });
         return;
       }
+      loginFlow.setMessage({ tone: 'ok', text: commandSummary(response, 'Offline identity created.') });
       await refreshConfigSignal();
       onChanged();
       refreshAccountSkin();
@@ -377,6 +393,7 @@ export function AccountSwitcher({
         loginFlow.setMessage({ tone: 'err', text: configErrorMessage(response) });
         return;
       }
+      loginFlow.setMessage({ tone: 'ok', text: commandSummary(response, 'Offline identity updated.') });
       await refreshConfigSignal();
       onChanged();
       refreshAccountSkin();
@@ -411,10 +428,7 @@ export function AccountSwitcher({
         loginFlow.setMessage({ tone: 'err', text: logoutErrorMessage(response) });
         return;
       }
-      loginFlow.setMessage({
-        tone: 'ok',
-        text: account.kind === 'microsoft' && account.active ? 'Microsoft account signed out.' : 'Account removed.',
-      });
+      loginFlow.setMessage({ tone: 'ok', text: commandSummary(response, 'Account removed.') });
       await refreshConfigSignal();
       onChanged();
       refreshAccountSkin();
@@ -432,10 +446,22 @@ export function AccountSwitcher({
 
   const microsoftMenuItems = (account: LauncherAccount): ContextMenuItem[] => [
     ...(account.active && profileSyncAvailable
-      ? [{ icon: 'refresh', label: 'Sync Minecraft profile', onSelect: () => void syncMinecraftProfile() }]
+      ? [
+          {
+            icon: 'refresh',
+            label: activeProfileSyncAction?.label ?? 'Sync Minecraft profile',
+            onSelect: () => void syncMinecraftProfile(),
+          },
+        ]
       : []),
     ...(account.active && refreshAvailable
-      ? [{ icon: 'refresh', label: 'Refresh credentials', onSelect: () => void refreshAuth() }]
+      ? [
+          {
+            icon: 'refresh',
+            label: activeRefreshAction?.label ?? 'Refresh Microsoft sign-in',
+            onSelect: () => void refreshAuth(),
+          },
+        ]
       : []),
     ...(microsoftSignInAvailable
       ? [{ icon: 'globe', label: 'Re-verify with Microsoft', onSelect: () => void loginFlow.startLogin() }]
@@ -490,7 +516,7 @@ export function AccountSwitcher({
               {microsoftAccounts.map((account) => {
                 const profile = account.minecraft_profile;
                 const profileName = (profile?.name ?? account.display_name) || 'Microsoft account';
-                const onlineSelectable = accountCanSelectOnline(account);
+                const onlineSelectable = actionEnabled(account.online_action);
                 const profileTextureSrc = account.active
                   ? (liveAccountTextureSrc ?? minecraftProfileSkinTextureSrc(profile) ?? undefined)
                   : (minecraftProfileSkinTextureSrc(profile) ?? undefined);
@@ -507,7 +533,7 @@ export function AccountSwitcher({
                       />
                     }
                     name={profileName}
-                    detail={onlineSelectable ? 'Microsoft account' : 'Microsoft account, not ready for online launch'}
+                    detail={account.view_model?.detail ?? account.online_action?.detail ?? 'Microsoft account'}
                     active={account.active}
                     disabled={busy || (!account.active && !onlineSelectable)}
                     selectTitle={
@@ -515,7 +541,7 @@ export function AccountSwitcher({
                         ? 'Active account'
                         : onlineSelectable
                           ? 'Launch with this Microsoft account'
-                          : 'Online launch is not ready'
+                          : actionUnavailableMessage(account.online_action, 'Account unavailable')
                     }
                     onSelect={account.active ? undefined : () => void selectAccount(account)}
                     menuItems={microsoftMenuItems(account)}

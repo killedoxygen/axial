@@ -18,7 +18,6 @@ import { refreshAccountSkin } from '../../player-skin';
 import { errMessage, fmtMem, getMemoryRecommendation, validateUsername } from '../../utils';
 import { hasNativeDesktopRuntime } from '../../native';
 import { authStatusResponse, isRecord } from '../accounts/api';
-import { statusCanSelectOnline } from '../accounts/auth';
 import type { AuthStatusRecord, AuthStatusState } from '../accounts/types';
 import { useMicrosoftSignIn } from '../accounts/useMicrosoftSignIn';
 
@@ -40,6 +39,19 @@ async function readAuthStatus(): Promise<AuthStatusRecord> {
   const parsed = authStatusResponse(response);
   if (!parsed) throw new Error('invalid auth status');
   return parsed;
+}
+
+function statusOnlineReady(status: AuthStatusRecord | null): boolean {
+  return status?.online_action?.state_id === 'online_ready';
+}
+
+function statusOnlineMessage(status: AuthStatusRecord | null, fallback: string): string {
+  return (
+    status?.online_action?.success_summary ||
+    status?.online_action?.disabled_reason ||
+    status?.online_action?.detail ||
+    fallback
+  );
 }
 
 function Words({ text }: { text: string }): JSX.Element {
@@ -164,13 +176,17 @@ export function Onboarding(): JSX.Element | null {
       const nextUsername = clampPlayerNameInput(profileName);
       if (nextUsername) setUsername(nextUsername);
 
-      const onlineReady = refreshedStatus ? statusCanSelectOnline(refreshedStatus) : false;
-      setOnlineAfterOnboarding(onlineReady);
-      if (onlineReady && nextUsername && validateUsername(nextUsername) === null && stage === 'name') {
+      const backendOnlineReady = statusOnlineReady(refreshedStatus);
+      setOnlineAfterOnboarding(backendOnlineReady);
+      if (backendOnlineReady && nextUsername && validateUsername(nextUsername) === null && stage === 'name') {
         setStage('memory');
         setMaxReached((m) => Math.max(m, 1));
         Sound.ui('affirm');
       }
+      return {
+        tone: backendOnlineReady ? 'ok' : 'err',
+        text: statusOnlineMessage(refreshedStatus, 'Microsoft sign-in completed.'),
+      };
     },
   });
 
@@ -214,7 +230,7 @@ export function Onboarding(): JSX.Element | null {
       .then((status) => {
         if (!active) return;
         setAuthStatus(status);
-        setOnlineAfterOnboarding(statusCanSelectOnline(status));
+        setOnlineAfterOnboarding(statusOnlineReady(status));
         setAuthState('ready');
       })
       .catch(() => {

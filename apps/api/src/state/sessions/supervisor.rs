@@ -1,4 +1,7 @@
-use super::SessionStore;
+use super::{
+    ProcessKillReason, ProcessObservation, SessionStore, process_kill_stage_evidence,
+    process_observation_stage_evidence,
+};
 use croopor_launcher::{
     LaunchSessionExitReason, LaunchSessionOutcome, LaunchState, LaunchStatusEvent,
 };
@@ -8,6 +11,8 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Child;
 use tokio::sync::Mutex;
+
+const STARTUP_BOOT_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub(super) async fn spawn_output_tasks(
     store: Arc<SessionStore>,
@@ -59,9 +64,20 @@ pub(super) fn spawn_wait_task(
         {
             return;
         }
-        let observed_failure = store.observed_failure(&session_id).await;
+        let observed_failure = store.observed_failure_for_exit(&session_id).await;
         match status {
             Ok(status) => {
+                let exit_code = status.code();
+                let evidence = exit_code
+                    .map(|exit_code| {
+                        process_observation_stage_evidence(
+                            &session_id,
+                            ProcessObservation::ExitCode(exit_code),
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        process_observation_stage_evidence(&session_id, ProcessObservation::Exited)
+                    });
                 store
                     .emit_status(
                         &session_id,
@@ -69,7 +85,7 @@ pub(super) fn spawn_wait_task(
                             state: "exited".to_string(),
                             benchmark: None,
                             pid: None,
-                            exit_code: status.code(),
+                            exit_code,
                             failure_class: observed_failure
                                 .map(|failure_class| failure_class.as_str().to_string()),
                             failure_detail: None,
@@ -77,7 +93,7 @@ pub(super) fn spawn_wait_task(
                             guardian: existing.as_ref().and_then(|record| record.guardian.clone()),
                             outcome: None,
                             notice: None,
-                            evidence: Vec::new(),
+                            evidence,
                             stages: Vec::new(),
                         },
                     )
@@ -98,7 +114,10 @@ pub(super) fn spawn_wait_task(
                             guardian: existing.as_ref().and_then(|record| record.guardian.clone()),
                             outcome: None,
                             notice: None,
-                            evidence: Vec::new(),
+                            evidence: process_observation_stage_evidence(
+                                &session_id,
+                                ProcessObservation::Exited,
+                            ),
                             stages: Vec::new(),
                         },
                     )
@@ -112,17 +131,20 @@ pub(super) fn spawn_startup_watchdog(
     store: Arc<SessionStore>,
     session_id: String,
     child: Arc<Mutex<Child>>,
-    startup_observed: Arc<AtomicBool>,
+    boot_completed: Arc<AtomicBool>,
 ) {
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(15)).await;
-        if startup_observed.load(Ordering::Relaxed) {
+        tokio::time::sleep(STARTUP_BOOT_WATCHDOG_TIMEOUT).await;
+        if boot_completed.load(Ordering::Relaxed) {
             return;
         }
 
         let Some(record) = store.get(&session_id).await else {
             return;
         };
+        if record.boot_completed_at_ms.is_some() {
+            return;
+        }
         if matches!(record.state, LaunchState::Exited | LaunchState::Failed) {
             return;
         }
@@ -144,7 +166,10 @@ pub(super) fn spawn_startup_watchdog(
                         LaunchSessionExitReason::WatchdogKilled,
                     )),
                     notice: None,
-                    evidence: Vec::new(),
+                    evidence: process_kill_stage_evidence(
+                        &session_id,
+                        ProcessKillReason::StartupWatchdog,
+                    ),
                     stages: Vec::new(),
                 },
             )

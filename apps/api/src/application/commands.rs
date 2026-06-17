@@ -12,6 +12,7 @@ use crate::state::contracts::{
 use serde::{Deserialize, Serialize};
 
 const PHASE_ONE_COMMAND_KINDS: &[CommandKind] = &[
+    CommandKind::CreateInstance,
     CommandKind::LaunchInstance,
     CommandKind::InstallVersion,
     CommandKind::RepairInstance,
@@ -50,6 +51,14 @@ const GUARDIAN_VIEW: &[CommandResultCarrierKind] = &[
 ];
 
 const COMMAND_CATALOG: &[CommandCatalogEntry] = &[
+    CommandCatalogEntry {
+        kind: CommandKind::CreateInstance,
+        request: CommandRequestContract::CreateInstance,
+        result: CommandResultContract::CreateInstance,
+        safety_review: CommandSafetyReview::Conditional,
+        async_operation: false,
+        carriers: GUARDIAN_OPERATION_VIEW,
+    },
     CommandCatalogEntry {
         kind: CommandKind::LaunchInstance,
         request: CommandRequestContract::LaunchInstance,
@@ -136,6 +145,7 @@ pub struct CommandCatalogEntry {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum CommandRequestContract {
+    CreateInstance,
     LaunchInstance,
     InstallVersion,
     RepairInstance,
@@ -148,6 +158,7 @@ pub enum CommandRequestContract {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum CommandResultContract {
+    CreateInstance,
     LaunchInstance,
     InstallVersion,
     RepairInstance,
@@ -176,6 +187,7 @@ pub enum CommandResultCarrierKind {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "command", content = "request")]
 pub enum ApplicationCommandRequest {
+    CreateInstance(CreateInstanceCommand),
     LaunchInstance(LaunchInstanceCommand),
     InstallVersion(InstallVersionCommand),
     RepairInstance(RepairInstanceCommand),
@@ -189,6 +201,7 @@ pub enum ApplicationCommandRequest {
 impl ApplicationCommandRequest {
     pub fn kind(&self) -> CommandKind {
         match self {
+            Self::CreateInstance(_) => CommandKind::CreateInstance,
             Self::LaunchInstance(_) => CommandKind::LaunchInstance,
             Self::InstallVersion(_) => CommandKind::InstallVersion,
             Self::RepairInstance(_) => CommandKind::RepairInstance,
@@ -202,6 +215,7 @@ impl ApplicationCommandRequest {
 
     pub fn target(&self) -> Option<TargetDescriptor> {
         match self {
+            Self::CreateInstance(command) => Some(version_target(command.selection_id.as_str())),
             Self::LaunchInstance(command) => Some(instance_target(command.instance_id.as_str())),
             Self::InstallVersion(command) => Some(version_target(command.version_id.as_str())),
             Self::RepairInstance(command) => command
@@ -242,6 +256,14 @@ pub struct LaunchInstanceCommand {
     pub min_memory_mb: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_started_at_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CreateInstanceCommand {
+    pub name: String,
+    pub selection_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jvm_preset_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -321,6 +343,7 @@ pub struct RefreshAccountReadinessCommand {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "command", content = "payload")]
 pub enum ApplicationCommandPayload {
+    CreateInstance(CreateInstancePayload),
     LaunchInstance(LaunchInstancePayload),
     InstallVersion(InstallVersionPayload),
     RepairInstance(RepairInstancePayload),
@@ -334,6 +357,7 @@ pub enum ApplicationCommandPayload {
 impl ApplicationCommandPayload {
     pub fn kind(&self) -> CommandKind {
         match self {
+            Self::CreateInstance(_) => CommandKind::CreateInstance,
             Self::LaunchInstance(_) => CommandKind::LaunchInstance,
             Self::InstallVersion(_) => CommandKind::InstallVersion,
             Self::RepairInstance(_) => CommandKind::RepairInstance,
@@ -361,6 +385,18 @@ pub enum CommandPayloadStatus {
 pub struct LaunchInstancePayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<OperationId>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CreateInstancePayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_id: Option<OperationId>,
 }

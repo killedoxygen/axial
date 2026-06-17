@@ -1,15 +1,16 @@
-import type { CatalogVersion } from '../../types';
-import { channelOfVersion, type Channel, type LoaderKey } from './defaults';
-import { normalizeVersionDisplay } from '../../version-display';
+import type { Channel } from './defaults';
 
 export type VersionDownloadState = 'none' | 'base' | 'full';
 
 export interface VersionRowModel {
   id: string;
+  selectionId: string;
   displayName: string;
   hint: string | null;
   channel: Channel;
   downloadState: VersionDownloadState;
+  createEnabled: boolean;
+  disabledReason: string | null;
 }
 
 export const CHANNEL_LABEL: Record<Channel, string> = {
@@ -20,21 +21,3 @@ export const CHANNEL_LABEL: Record<Channel, string> = {
 };
 
 export const CHANNEL_ORDER: Channel[] = ['release', 'snapshot', 'legacy', 'unknown'];
-
-export function buildRowModel(
-  version: CatalogVersion,
-  installedSet: Set<string>,
-  source: LoaderKey,
-  fullInstalledSet: Set<string> = new Set(),
-): VersionRowModel {
-  const display = normalizeVersionDisplay(version);
-  const baseInstalled = version.installed || installedSet.has(version.id);
-  const fullInstalled = source === 'vanilla' ? baseInstalled : fullInstalledSet.has(version.id);
-  return {
-    id: version.id,
-    displayName: display.displayName === version.id ? version.id : display.displayName,
-    hint: display.hint,
-    channel: channelOfVersion(version),
-    downloadState: fullInstalled ? 'full' : baseInstalled ? 'base' : 'none',
-  };
-}

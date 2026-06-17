@@ -1,5 +1,9 @@
-use croopor_minecraft::download::DownloadProgress;
-use std::{collections::HashMap, future::Future, sync::Arc};
+use croopor_minecraft::{LoaderComponentId, download::DownloadProgress};
+use std::{
+    collections::{HashMap, VecDeque},
+    future::Future,
+    sync::Arc,
+};
 use tokio::sync::{RwLock, broadcast};
 use tokio::task::JoinHandle;
 
@@ -14,6 +18,98 @@ struct InstallEntry {
 pub struct InstallSnapshot {
     pub history: Vec<DownloadProgress>,
     pub done: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InstallQueueSpec {
+    Vanilla {
+        version_id: String,
+        manifest_url: String,
+    },
+    Loader {
+        component_id: LoaderComponentId,
+        build_id: String,
+        target_version_id: String,
+        minecraft_version: String,
+        loader_version: String,
+    },
+}
+
+impl InstallQueueSpec {
+    pub fn vanilla(version_id: String, manifest_url: String) -> Self {
+        Self::Vanilla {
+            version_id: version_id.trim().to_string(),
+            manifest_url: manifest_url.trim().to_string(),
+        }
+    }
+
+    pub fn loader(
+        component_id: LoaderComponentId,
+        build_id: String,
+        target_version_id: String,
+        minecraft_version: String,
+        loader_version: String,
+    ) -> Self {
+        Self::Loader {
+            component_id,
+            build_id: build_id.trim().to_string(),
+            target_version_id: target_version_id.trim().to_string(),
+            minecraft_version: minecraft_version.trim().to_string(),
+            loader_version: loader_version.trim().to_string(),
+        }
+    }
+
+    pub fn target_version_id(&self) -> &str {
+        match self {
+            Self::Vanilla { version_id, .. } => version_id,
+            Self::Loader {
+                target_version_id, ..
+            } => target_version_id,
+        }
+    }
+
+    pub fn is_loader(&self) -> bool {
+        matches!(self, Self::Loader { .. })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueuedInstallEntry {
+    pub queue_id: String,
+    pub spec: InstallQueueSpec,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActiveQueuedInstallEntry {
+    pub queue_id: String,
+    pub install_id: Option<String>,
+    pub spec: InstallQueueSpec,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstallQueueSnapshot {
+    pub active: Option<ActiveQueuedInstallEntry>,
+    pub pending: Vec<QueuedInstallEntry>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstallQueuePlacement {
+    Back,
+    Front,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InstallQueueEnqueueOutcome {
+    Enqueued { queue_id: String },
+    AlreadyActive { queue_id: String },
+    AlreadyQueued { queue_id: String },
+    MovedToFront { queue_id: String },
+}
+
+#[derive(Default)]
+struct InstallQueueInner {
+    active: Option<ActiveQueuedInstallEntry>,
+    pending: VecDeque<QueuedInstallEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,12 +131,14 @@ impl InstallKey {
 
 pub struct InstallStore {
     installs: RwLock<HashMap<String, InstallEntry>>,
+    queue: RwLock<InstallQueueInner>,
 }
 
 impl InstallStore {
     pub fn new() -> Self {
         Self {
             installs: RwLock::new(HashMap::new()),
+            queue: RwLock::new(InstallQueueInner::default()),
         }
     }
 
@@ -207,12 +305,124 @@ impl InstallStore {
             .count()
     }
 
+    pub async fn enqueue_queued_install(
+        &self,
+        queue_id: String,
+        spec: InstallQueueSpec,
+        placement: InstallQueuePlacement,
+    ) -> InstallQueueEnqueueOutcome {
+        let mut queue = self.queue.write().await;
+        if let Some(active) = queue.active.as_ref().filter(|active| active.spec == spec) {
+            return InstallQueueEnqueueOutcome::AlreadyActive {
+                queue_id: active.queue_id.clone(),
+            };
+        }
+
+        if let Some(position) = queue.pending.iter().position(|entry| entry.spec == spec) {
+            let existing_id = queue.pending[position].queue_id.clone();
+            if placement == InstallQueuePlacement::Front && position > 0 {
+                let entry = queue
+                    .pending
+                    .remove(position)
+                    .expect("pending position is valid");
+                queue.pending.push_front(entry);
+                return InstallQueueEnqueueOutcome::MovedToFront {
+                    queue_id: existing_id,
+                };
+            }
+            return InstallQueueEnqueueOutcome::AlreadyQueued {
+                queue_id: existing_id,
+            };
+        }
+
+        let entry = QueuedInstallEntry {
+            queue_id: queue_id.clone(),
+            spec,
+        };
+        match placement {
+            InstallQueuePlacement::Back => queue.pending.push_back(entry),
+            InstallQueuePlacement::Front => queue.pending.push_front(entry),
+        }
+        InstallQueueEnqueueOutcome::Enqueued { queue_id }
+    }
+
+    pub async fn reserve_next_queued_install(&self) -> Option<QueuedInstallEntry> {
+        let mut queue = self.queue.write().await;
+        if queue.active.is_some() {
+            return None;
+        }
+        let next = queue.pending.pop_front()?;
+        queue.active = Some(ActiveQueuedInstallEntry {
+            queue_id: next.queue_id.clone(),
+            install_id: None,
+            spec: next.spec.clone(),
+        });
+        Some(next)
+    }
+
+    pub async fn mark_queued_install_started(&self, queue_id: &str, install_id: String) -> bool {
+        let mut queue = self.queue.write().await;
+        let Some(active) = queue.active.as_mut() else {
+            return false;
+        };
+        if active.queue_id != queue_id {
+            return false;
+        }
+        active.install_id = Some(install_id);
+        true
+    }
+
+    pub async fn clear_active_queued_install(
+        &self,
+        install_id: &str,
+    ) -> Option<ActiveQueuedInstallEntry> {
+        let mut queue = self.queue.write().await;
+        if queue
+            .active
+            .as_ref()
+            .and_then(|active| active.install_id.as_deref())
+            != Some(install_id)
+        {
+            return None;
+        }
+        queue.active.take()
+    }
+
+    pub async fn clear_active_queued_install_for_queue_id(
+        &self,
+        queue_id: &str,
+    ) -> Option<ActiveQueuedInstallEntry> {
+        let mut queue = self.queue.write().await;
+        if queue.active.as_ref().map(|active| active.queue_id.as_str()) != Some(queue_id) {
+            return None;
+        }
+        queue.active.take()
+    }
+
+    pub async fn remove_queued_install(&self, queue_id: &str) -> Option<QueuedInstallEntry> {
+        let mut queue = self.queue.write().await;
+        let position = queue
+            .pending
+            .iter()
+            .position(|entry| entry.queue_id == queue_id)?;
+        queue.pending.remove(position)
+    }
+
+    pub async fn queue_snapshot(&self) -> InstallQueueSnapshot {
+        let queue = self.queue.read().await;
+        InstallQueueSnapshot {
+            active: queue.active.clone(),
+            pending: queue.pending.iter().cloned().collect(),
+        }
+    }
+
     pub async fn remove(&self, install_id: &str) {
         self.installs.write().await.remove(install_id);
     }
 
     pub async fn clear(&self) {
         self.installs.write().await.clear();
+        *self.queue.write().await = InstallQueueInner::default();
     }
 }
 
@@ -648,6 +858,91 @@ mod tests {
         assert_eq!(duplicate_loader_id, "loader-install");
         assert!(!duplicate_loader_inserted);
         assert_eq!(store.active_install_count().await, 2);
+    }
+
+    #[tokio::test]
+    async fn install_queue_dedupes_and_moves_retry_to_front() {
+        let store = InstallStore::new();
+        let first = InstallQueueSpec::vanilla("1.21.5".to_string(), String::new());
+        let second = InstallQueueSpec::loader(
+            LoaderComponentId::Fabric,
+            "fabric:1.21.6:0.16.10".to_string(),
+            "fabric-loader-1.21.6".to_string(),
+            "1.21.6".to_string(),
+            "0.16.10".to_string(),
+        );
+
+        assert_eq!(
+            store
+                .enqueue_queued_install(
+                    "queue-first".to_string(),
+                    first.clone(),
+                    InstallQueuePlacement::Back,
+                )
+                .await,
+            InstallQueueEnqueueOutcome::Enqueued {
+                queue_id: "queue-first".to_string()
+            }
+        );
+        assert_eq!(
+            store
+                .enqueue_queued_install(
+                    "queue-second".to_string(),
+                    second.clone(),
+                    InstallQueuePlacement::Back,
+                )
+                .await,
+            InstallQueueEnqueueOutcome::Enqueued {
+                queue_id: "queue-second".to_string()
+            }
+        );
+        assert_eq!(
+            store
+                .enqueue_queued_install(
+                    "queue-duplicate".to_string(),
+                    first.clone(),
+                    InstallQueuePlacement::Back,
+                )
+                .await,
+            InstallQueueEnqueueOutcome::AlreadyQueued {
+                queue_id: "queue-first".to_string()
+            }
+        );
+        assert_eq!(
+            store
+                .enqueue_queued_install(
+                    "queue-retry".to_string(),
+                    second,
+                    InstallQueuePlacement::Front,
+                )
+                .await,
+            InstallQueueEnqueueOutcome::MovedToFront {
+                queue_id: "queue-second".to_string()
+            }
+        );
+
+        let snapshot = store.queue_snapshot().await;
+        assert_eq!(snapshot.pending.len(), 2);
+        assert_eq!(snapshot.pending[0].queue_id, "queue-second");
+        assert_eq!(snapshot.pending[1].queue_id, "queue-first");
+
+        let active = store
+            .reserve_next_queued_install()
+            .await
+            .expect("first queue item");
+        assert_eq!(active.queue_id, "queue-second");
+        assert_eq!(
+            store
+                .enqueue_queued_install(
+                    "queue-active-duplicate".to_string(),
+                    active.spec,
+                    InstallQueuePlacement::Back,
+                )
+                .await,
+            InstallQueueEnqueueOutcome::AlreadyActive {
+                queue_id: "queue-second".to_string()
+            }
+        );
     }
 
     #[tokio::test]

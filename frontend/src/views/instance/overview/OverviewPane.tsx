@@ -1,5 +1,5 @@
 import type { JSX } from 'preact';
-import type { EnrichedInstance, InstanceResourceSummary } from '../../../types';
+import type { EnrichedInstance, InstanceResourceSummary } from '../../../types-instance';
 import { PerformanceCard } from './PerformanceCard';
 import { WorldsCard } from './WorldsCard';
 import { ActivityCard } from './ActivityCard';

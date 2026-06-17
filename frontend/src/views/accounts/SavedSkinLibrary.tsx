@@ -1,12 +1,8 @@
 import type { JSX } from 'preact';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { api, apiResourceUrl, apiUrl } from '../../api';
-import { Button, Input } from '../../ui/Atoms';
+import { api, apiResourceUrl } from '../../api';
 import type { ContextMenuItem } from '../../ui/ContextMenu';
 import { showConfirm } from '../../ui/Dialog';
-import { Icon } from '../../ui/Icons';
-import { onNativeDragDrop, pickNativeSkinFile, readNativeSkinFile, type NativeDragDropPayload } from '../../native';
-import { clampPlayerNameInput } from '../../player-name';
 import {
   hasSelectedSkinForAccount,
   resetSelectedSkin,
@@ -15,29 +11,18 @@ import {
 } from '../../player-skin';
 import { local } from '../../state';
 import { toast } from '../../toast';
-import { validateUsername } from '../../utils';
 import {
   activeMinecraftCape,
   activeMinecraftSkin,
-  apiResponseError,
   boundedMessage,
   capeFileUrl,
+  commandSummary,
   defaultSkinFile,
   DEFAULT_SKIN_SOURCE,
   defaultSkinTextureKey,
   defaultSkinTextureKeys,
-  detectSkinVariantFromSavedSkin,
   downloadBlob,
   fetchSavedSkinPng,
-  isPngFile,
-  isPngPath,
-  lookupMinecraftSkin,
-  nativeDragPositionHitsElement,
-  nativeDragTargetElement,
-  normalizeSkinUpload,
-  replaceSavedSkinTexture,
-  resolveUploadSkinVariant,
-  savedSkinApplyErrorMessage,
   savedSkinDownloadFilename,
   savedSkinRecord,
   skinActionErrorMessage,
@@ -45,131 +30,52 @@ import {
   skinVariantValue,
   sortSavedSkins,
   stagedSkinPreviewSrc,
-  stagedSkinVariant,
-  uploadSkinName,
 } from './api';
-import { CapePicker } from './CapePicker';
 import { DEFAULT_SKINS, type DefaultSkin } from '../../default-skins';
 import { useSavedSkins } from './hooks';
+import { SavedSkinCapeSection } from './SavedSkinCapeSection';
+import { SavedSkinDefaultStrip } from './SavedSkinDefaultStrip';
+import { SavedSkinFileInputs } from './SavedSkinFileInputs';
+import { SavedSkinLibraryGrid } from './SavedSkinLibraryGrid';
+import { SavedSkinLookupBar, type SavedSkinLibraryMessage } from './SavedSkinLookupBar';
 import { SkinStage } from './SkinStage';
 import { SkinEditDialog } from './SkinEditDialog';
-import { DefaultSkinTile, ProfileSkinTile, SavedSkinTile } from './SkinTiles';
 import { SkinUploadDialog } from './SkinUploadDialog';
+import { useSavedSkinEditWorkflow } from './use-saved-skin-edit-workflow';
+import { useSavedSkinLookupWorkflow } from './use-saved-skin-lookup-workflow';
+import { useSavedSkinNativeDragDrop } from './use-saved-skin-native-drag-drop';
+import { useSavedSkinUploadWorkflow } from './use-saved-skin-upload-workflow';
 import {
   NO_CAPE_VALUE,
+  type AccountActionState,
   type MinecraftProfile,
-  type MinecraftSkinLookup,
   type SavedSkinRecord,
   type SkinVariant,
-  type StagedSkinUpload,
-  type UploadSkinVariant,
 } from './types';
 
 type StagePreviewExtra = { kind: 'default'; id: string } | { kind: 'profile' } | { kind: 'lookup' };
 
 const PROFILE_SKIN_SOURCE = 'minecraft_profile_skin';
-
 function looksLikeUnresolvedDefaultSkin(skin: SavedSkinRecord, defaultKeyLookupComplete: boolean): boolean {
   if (defaultKeyLookupComplete || skin.source !== 'local_upload') return false;
   return DEFAULT_SKINS.some((defaultSkin) => defaultSkin.name === skin.name && defaultSkin.variant === skin.variant);
 }
-
-export function menuItemsForSavedSkin({
-  skin,
-  applied,
-  selectedPreviewEditing,
-  onlineReady,
-  applying,
-  pendingActionBusy,
-  queued,
-  deleting,
-  onView,
-  onApply,
-  onApplyNow,
-  onCancelQueue,
-  onEdit,
-  onDownload,
-  onDelete,
-}: {
-  skin: SavedSkinRecord;
-  applied?: boolean;
-  selectedPreviewEditing: boolean;
-  onlineReady: boolean;
-  applying: boolean;
-  pendingActionBusy: boolean;
-  queued: boolean;
-  deleting: boolean;
-  onView: () => void;
-  onApply: () => void;
-  onApplyNow: () => void;
-  onCancelQueue: () => void;
-  onEdit: () => void;
-  onDownload: () => void;
-  onDelete: () => void;
-}): ContextMenuItem[] {
-  const activeOnProfile = applied ?? Boolean(skin.applied_at);
-  const items: ContextMenuItem[] = [];
-
-  if (!deleting) {
-    items.push({ icon: 'image', label: 'View', onSelect: onView });
-  }
-  if (queued) {
-    if (onlineReady && !pendingActionBusy) {
-      items.push({ icon: 'check', label: 'Apply now', onSelect: onApplyNow });
-    }
-    if (!pendingActionBusy) {
-      items.push({ icon: 'x', label: 'Cancel queue', onSelect: onCancelQueue });
-    }
-  }
-  if (onlineReady && !activeOnProfile && !applying && !queued) {
-    items.push({ icon: 'check', label: 'Apply', onSelect: onApply });
-  }
-  if (!selectedPreviewEditing && !deleting && !applying) {
-    items.push({ icon: 'edit', label: 'Edit', onSelect: onEdit });
-  }
-  if (!deleting) {
-    items.push({ icon: 'download', label: 'Download PNG', onSelect: onDownload });
-    if (!activeOnProfile) {
-      items.push({ label: '', onSelect: () => {}, divider: true });
-      items.push({ icon: 'trash', label: 'Delete', onSelect: onDelete, danger: true });
-    }
-  }
-
-  return items;
-}
-
 export function SavedSkinLibrary({
-  onlineReady,
+  skinAction,
   minecraftProfile,
   skinAccountKey,
   playerName,
   onRenameNametag,
   onApplied,
 }: {
-  onlineReady: boolean;
+  skinAction?: AccountActionState;
   minecraftProfile?: MinecraftProfile;
   skinAccountKey: string;
   playerName: string;
   onRenameNametag?: () => void;
   onApplied: () => void;
 }): JSX.Element {
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const editTextureInputRef = useRef<HTMLInputElement | null>(null);
   const savedSkinsDropSurfaceRef = useRef<HTMLElement | null>(null);
-  const uploadApplyAfterSaveRef = useRef(false);
-  const uploadDragDepthRef = useRef(0);
-  const nativeDraggedSkinPathsRef = useRef<string[]>([]);
-  const nativeUploadBusyRef = useRef(false);
-  const nativeEditBusyRef = useRef(false);
-  const editKeyRef = useRef<string | null>(null);
-  const stageUploadFileRef = useRef<((file: File, applyAfterSave: boolean) => void) | null>(null);
-  const stageEditReplacementFileRef = useRef<((file: File) => void) | null>(null);
-  const editReplacementDragDepthRef = useRef(0);
-  const stagedUploadUrlRef = useRef<string | null>(null);
-  const stagedUploadTokenRef = useRef(0);
-  const editReplacementUrlRef = useRef<string | null>(null);
-  const editReplacementTokenRef = useRef(0);
-  const editDetectTokenRef = useRef(0);
   const {
     skins,
     pendingApplyKey,
@@ -178,34 +84,13 @@ export function SavedSkinLibrary({
     refresh,
     setPendingApplyKey: setLocalPendingApplyKey,
   } = useSavedSkins();
-  const [skinName, setSkinName] = useState('');
-  const [lookupUsername, setLookupUsername] = useState('');
-  const [lookupProfile, setLookupProfile] = useState<MinecraftSkinLookup | null>(null);
-  const [lookupState, setLookupState] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
-  const [lookupError, setLookupError] = useState<string | null>(null);
-  const [lookupVariant, setLookupVariant] = useState<SkinVariant>('classic');
-  const [uploadVariant, setUploadVariant] = useState<UploadSkinVariant>('auto');
-  const [stagedCapeId, setStagedCapeId] = useState<string>(NO_CAPE_VALUE);
-  const [stagedUpload, setStagedUpload] = useState<StagedSkinUpload | null>(null);
-  const [editReplacement, setEditReplacement] = useState<StagedSkinUpload | null>(null);
-  const [busy, setBusy] = useState(false);
+  const skinActionsEnabled = skinAction?.enabled === true;
+  const skinActionDisabledReason =
+    skinAction?.disabled_reason || skinAction?.detail || 'Online Minecraft account required';
   const [profileBusy, setProfileBusy] = useState(false);
   const [profileResetBusy, setProfileResetBusy] = useState(false);
   const [profileCapeResetBusy, setProfileCapeResetBusy] = useState(false);
-  const [lookupBusy, setLookupBusy] = useState(false);
-  const [uploadDragActive, setUploadDragActive] = useState(false);
-  const [editReplacementDragActive, setEditReplacementDragActive] = useState(false);
-  const [message, setMessage] = useState<{
-    tone: 'ok' | 'err';
-    text: string;
-  } | null>(null);
-  const [editKey, setEditKey] = useState<string | null>(null);
-  const [editName, setEditName] = useState('');
-  const [editVariant, setEditVariant] = useState<SkinVariant>('classic');
-  const [editCapeId, setEditCapeId] = useState<string>(NO_CAPE_VALUE);
-  const [editBusyKey, setEditBusyKey] = useState<string | null>(null);
-  const [editDetectBusyKey, setEditDetectBusyKey] = useState<string | null>(null);
-  const [editDetectError, setEditDetectError] = useState<string | null>(null);
+  const [message, setMessage] = useState<SavedSkinLibraryMessage | null>(null);
   const [deleteKey, setDeleteKey] = useState<string | null>(null);
   const [applyKey, setApplyKey] = useState<string | null>(null);
   const [downloadKey, setDownloadKey] = useState<string | null>(null);
@@ -217,22 +102,113 @@ export function SavedSkinLibrary({
   const [profileSavedKey, setProfileSavedKey] = useState<string | null>(null);
   const [defaultKeyById, setDefaultKeyById] = useState<Map<string, string>>(() => new Map());
   const [defaultKeyLookupComplete, setDefaultKeyLookupComplete] = useState(false);
+  const {
+    lookupUsername,
+    lookupProfile,
+    lookupState,
+    lookupError,
+    lookupVariant,
+    lookupBusy,
+    lookupUsernameError,
+    canLookupSkin: lookupInputCanLookup,
+    canSaveLookupSkin: lookupResultCanSave,
+    lookupSkin,
+    dismissLookup,
+    saveUsernameSkin,
+    handleLookupUsernameChange,
+  } = useSavedSkinLookupWorkflow({
+    skinAccountKey,
+    setMessage,
+    setSelectedKey,
+    setPreviewExtra,
+    refresh,
+    applySavedSkin,
+  });
+  const {
+    editTextureInputRef,
+    editReplacement,
+    editReplacementDragActive,
+    editKey,
+    editName,
+    editVariant,
+    editCapeId,
+    editBusyKey,
+    editDetectBusyKey,
+    editDetectError,
+    trimmedEditName,
+    editReplacementReady,
+    editReplacementDrop,
+    setEditName,
+    setEditVariant,
+    setEditCapeId,
+    setEditDetectError,
+    setEditReplacementDragActive,
+    clearEditReplacement,
+    closeSkinEditBeforeChanging,
+    startEdit,
+    cancelEdit,
+    detectSavedSkinModel,
+    stageEditReplacementFile,
+    openEditTexturePicker,
+    saveSkinMetadata,
+    savedSkinEditHasChanges,
+  } = useSavedSkinEditWorkflow({
+    skins,
+    skinActionsEnabled,
+    skinAccountKey,
+    setMessage,
+    setSelectedKey,
+    refresh,
+    applySavedSkin,
+  });
+  const {
+    fileInputRef,
+    stagedUpload,
+    stagedVariant,
+    stagedName,
+    stagedCapeId,
+    skinName,
+    uploadVariant,
+    uploadDragActive,
+    busy,
+    canUpload,
+    stagedCanSave,
+    uploadDrop,
+    setSkinName,
+    setUploadVariant,
+    setStagedCapeId,
+    setUploadDragActive,
+    setUploadBusy,
+    clearStagedUpload,
+    stageUploadFile,
+    openUploadPicker,
+    saveStagedUpload,
+    handleUploadInputFile,
+    upload,
+  } = useSavedSkinUploadWorkflow({
+    skinActionsEnabled,
+    profileBusy,
+    profileResetBusy,
+    profileCapeResetBusy,
+    lookupBusy,
+    skinAccountKey,
+    setMessage,
+    setSelectedKey,
+    setPreviewExtra,
+    refresh,
+    applySavedSkin,
+  });
   const profileSeedRef = useRef('');
   const profileSkin = activeMinecraftSkin(minecraftProfile);
   const profileCape = activeMinecraftCape(minecraftProfile);
   const availableCapes = minecraftProfile?.capes ?? [];
   const capeById = useMemo(() => new Map(availableCapes.map((cape) => [cape.id, cape])), [availableCapes]);
   const profileSkinVariant = skinVariantValue(profileSkin?.variant);
-  const trimmedName = skinName.trim();
-  const trimmedLookupUsername = lookupUsername.trim();
-  const trimmedEditName = editName.trim();
-  const lookupUsernameError = trimmedLookupUsername ? validateUsername(trimmedLookupUsername) : null;
   const profileSkinFileSrc = profileSkin ? apiResourceUrl('/skin/profile/file') : undefined;
   const profileSkinIdentity =
     profileSkin && minecraftProfile ? `profile:${minecraftProfile.id}:${profileSkin.id}:${profileSkin.url}` : undefined;
-  const canUpload = !busy && !profileBusy && !profileResetBusy && !profileCapeResetBusy && !lookupBusy;
   const canSaveProfileSkin =
-    onlineReady &&
+    skinActionsEnabled &&
     Boolean(profileSkin) &&
     !busy &&
     !profileBusy &&
@@ -240,7 +216,7 @@ export function SavedSkinLibrary({
     !profileCapeResetBusy &&
     !lookupBusy;
   const canResetProfileSkin =
-    onlineReady &&
+    skinActionsEnabled &&
     Boolean(profileSkin) &&
     !busy &&
     !profileBusy &&
@@ -248,29 +224,15 @@ export function SavedSkinLibrary({
     !profileCapeResetBusy &&
     !lookupBusy;
   const canResetProfileCape =
-    onlineReady &&
+    skinActionsEnabled &&
     Boolean(profileCape) &&
     !busy &&
     !profileBusy &&
     !profileResetBusy &&
     !profileCapeResetBusy &&
     !lookupBusy;
-  const canLookupSkin =
-    Boolean(trimmedLookupUsername) &&
-    !lookupUsernameError &&
-    !busy &&
-    !profileBusy &&
-    !profileResetBusy &&
-    !profileCapeResetBusy &&
-    !lookupBusy;
-  const canSaveLookupSkin =
-    Boolean(lookupProfile) &&
-    lookupState === 'ready' &&
-    !busy &&
-    !profileBusy &&
-    !profileResetBusy &&
-    !profileCapeResetBusy &&
-    !lookupBusy;
+  const canLookupSkin = lookupInputCanLookup && !busy && !profileBusy && !profileResetBusy && !profileCapeResetBusy;
+  const canSaveLookupSkin = lookupResultCanSave && !busy && !profileBusy && !profileResetBusy && !profileCapeResetBusy;
   const equippedSkin = skins.find((skin) => Boolean(skin.applied_at)) ?? null;
   const pendingApplySkin = skins.find((skin) => skin.texture_key === pendingApplyKey) ?? null;
   const selectedSavedSkin = selectedKey ? (skins.find((skin) => skin.texture_key === selectedKey) ?? null) : null;
@@ -327,12 +289,6 @@ export function SavedSkinLibrary({
     previewExtra?.kind === 'default' ? (DEFAULT_SKINS.find((skin) => skin.id === previewExtra.id) ?? null) : null;
   const selectedPreviewEditing = Boolean(selectedSkin && editKey === selectedSkin.texture_key);
   const selectedQueued = Boolean(selectedSkin && selectedSkin.texture_key === pendingApplyKey);
-  const stagedVariant = stagedUpload ? stagedSkinVariant(stagedUpload, uploadVariant) : null;
-  const stagedName = stagedUpload ? trimmedName || uploadSkinName(stagedUpload.file) || 'Uploaded skin' : '';
-  const stagedVariantReady = Boolean(stagedUpload && (uploadVariant !== 'auto' || !stagedUpload.detectingVariant));
-  const stagedValidated = stagedUpload?.normalizeStatus === 'ready';
-  const stagedCanSave = Boolean(stagedUpload && canUpload && stagedVariantReady && stagedValidated);
-  const editReplacementReady = !editReplacement || editReplacement.normalizeStatus === 'ready';
   const showProfileSelectedPreview = Boolean(
     state === 'ready' && skins.length === 0 && profileSkin && minecraftProfile,
   );
@@ -343,33 +299,9 @@ export function SavedSkinLibrary({
   };
   const stagedCapeSelected = stagedCapeId !== NO_CAPE_VALUE;
   const stagedCapeSrc = capeSrcForId(stagedCapeSelected ? stagedCapeId : null);
-  const clearStagedUpload = (): void => {
-    stagedUploadTokenRef.current += 1;
-    if (stagedUploadUrlRef.current) {
-      URL.revokeObjectURL(stagedUploadUrlRef.current);
-      stagedUploadUrlRef.current = null;
-    }
-    setStagedUpload(null);
-    setStagedCapeId(NO_CAPE_VALUE);
-    uploadApplyAfterSaveRef.current = false;
-    if (fileInputRef.current) fileInputRef.current.value = '';
-  };
-
-  const clearEditReplacement = (): void => {
-    editReplacementTokenRef.current += 1;
-    if (editReplacementUrlRef.current) {
-      URL.revokeObjectURL(editReplacementUrlRef.current);
-      editReplacementUrlRef.current = null;
-    }
-    setEditReplacement(null);
-    setEditReplacementDragActive(false);
-    editReplacementDragDepthRef.current = 0;
-    if (editTextureInputRef.current) editTextureInputRef.current.value = '';
-  };
-
   useEffect(() => {
     const selectedPreference = selectedSkinForAccount(skinAccountKey);
-    if (onlineReady && profileSkin && !hasSelectedSkinForAccount(skinAccountKey)) {
+    if (skinActionsEnabled && profileSkin && !hasSelectedSkinForAccount(skinAccountKey)) {
       setSelectedKey(null);
       setPreviewExtra({ kind: 'profile' });
       return;
@@ -386,7 +318,7 @@ export function SavedSkinLibrary({
       setSelectedKey(null);
       setPreviewExtra({ kind: 'default', id });
     }
-  }, [onlineReady, profileSkin, skinAccountKey]);
+  }, [skinActionsEnabled, profileSkin, skinAccountKey]);
 
   useEffect(() => {
     let active = true;
@@ -404,7 +336,7 @@ export function SavedSkinLibrary({
   }, []);
 
   useEffect(() => {
-    if (state !== 'ready' || !onlineReady || !minecraftProfile || !profileSkin || !profileSkinIdentity) {
+    if (state !== 'ready' || !skinActionsEnabled || !minecraftProfile || !profileSkin || !profileSkinIdentity) {
       setProfileSavedKey(null);
       return;
     }
@@ -436,7 +368,7 @@ export function SavedSkinLibrary({
     };
   }, [
     minecraftProfile,
-    onlineReady,
+    skinActionsEnabled,
     profileSkin,
     profileSkinIdentity,
     profileSkinVariant,
@@ -448,7 +380,7 @@ export function SavedSkinLibrary({
   useEffect(() => {
     if (state !== 'ready') return;
     const selectedPreference = selectedSkinForAccount(skinAccountKey);
-    if (onlineReady && profileSkin && !hasSelectedSkinForAccount(skinAccountKey)) {
+    if (skinActionsEnabled && profileSkin && !hasSelectedSkinForAccount(skinAccountKey)) {
       return;
     }
     if (skins.length === 0) {
@@ -465,19 +397,7 @@ export function SavedSkinLibrary({
       skins[0];
     setSelectedKey(next.texture_key);
     setSelectedSkin(`saved:${next.texture_key}`, skinAccountKey);
-  }, [onlineReady, profileSkin, skinAccountKey, skins, selectedKey, state]);
-
-  useEffect(() => {
-    nativeUploadBusyRef.current = busy || profileBusy || profileResetBusy || profileCapeResetBusy || lookupBusy;
-  }, [busy, lookupBusy, profileBusy, profileCapeResetBusy, profileResetBusy]);
-
-  useEffect(() => {
-    nativeEditBusyRef.current = Boolean(editBusyKey || editDetectBusyKey);
-  }, [editBusyKey, editDetectBusyKey]);
-
-  useEffect(() => {
-    editKeyRef.current = editKey;
-  }, [editKey]);
+  }, [skinActionsEnabled, profileSkin, skinAccountKey, skins, selectedKey, state]);
 
   useEffect(() => {
     if (!pendingApplyKey) return;
@@ -487,82 +407,6 @@ export function SavedSkinLibrary({
     }, 11_500);
     return () => window.clearTimeout(timer);
   }, [onApplied, pendingApplyKey, refresh]);
-
-  useEffect(() => {
-    return () => {
-      stagedUploadTokenRef.current += 1;
-      if (stagedUploadUrlRef.current) {
-        URL.revokeObjectURL(stagedUploadUrlRef.current);
-        stagedUploadUrlRef.current = null;
-      }
-      editReplacementTokenRef.current += 1;
-      if (editReplacementUrlRef.current) {
-        URL.revokeObjectURL(editReplacementUrlRef.current);
-        editReplacementUrlRef.current = null;
-      }
-    };
-  }, []);
-
-  const upload = async (
-    file: File,
-    applyAfterSave = false,
-    variantOverride?: SkinVariant,
-    capeIdOverride = NO_CAPE_VALUE,
-    sourceOverride?: string,
-  ): Promise<void> => {
-    const name = trimmedName || uploadSkinName(file);
-    if (!name) {
-      setMessage({ tone: 'err', text: 'Name the skin before uploading.' });
-      return;
-    }
-
-    setBusy(true);
-    setMessage(null);
-    try {
-      const resolvedVariant = variantOverride ?? (await resolveUploadSkinVariant(file, uploadVariant));
-      const params = new URLSearchParams({ name, variant: resolvedVariant });
-      if (capeIdOverride !== NO_CAPE_VALUE) params.set('cape_id', capeIdOverride);
-      if (sourceOverride) params.set('source', sourceOverride);
-      const response = await fetch(apiUrl(`/skins?${params.toString()}`), {
-        method: 'POST',
-        headers: { 'Content-Type': 'image/png' },
-        body: file,
-      });
-      const payload = await response.json().catch(() => undefined);
-      if (!response.ok) {
-        throw apiResponseError(response, payload, `Upload failed with HTTP ${response.status}`);
-      }
-      const saved = savedSkinRecord(payload);
-      setSkinName('');
-      clearStagedUpload();
-      if (saved) {
-        setSelectedKey(saved.texture_key);
-        setPreviewExtra(null);
-        setSelectedSkin(`saved:${saved.texture_key}`, skinAccountKey);
-      }
-      if (saved && applyAfterSave) {
-        try {
-          await applySavedSkin(saved.texture_key);
-          toast('Skin will apply shortly');
-        } catch (err) {
-          setSelectedKey(saved.texture_key);
-          refresh();
-          setMessage({ tone: 'err', text: savedSkinApplyErrorMessage(err) });
-        }
-      } else {
-        refresh();
-        toast('Skin added to your library');
-      }
-    } catch (err) {
-      setMessage({
-        tone: 'err',
-        text: skinActionErrorMessage(err, 'Could not save skin.'),
-      });
-    } finally {
-      setBusy(false);
-      if (fileInputRef.current) fileInputRef.current.value = '';
-    }
-  };
 
   const deleteSkin = async (textureKey: string, skinName?: string): Promise<void> => {
     setDeleteKey(textureKey);
@@ -599,7 +443,7 @@ export function SavedSkinLibrary({
   };
 
   const saveProfileSkin = async (): Promise<void> => {
-    if (!onlineReady) return;
+    if (!skinActionsEnabled) return;
 
     setProfileBusy(true);
     setMessage(null);
@@ -626,7 +470,7 @@ export function SavedSkinLibrary({
   };
 
   const resetProfileSkin = async (): Promise<void> => {
-    if (!onlineReady || !profileSkin) return;
+    if (!skinActionsEnabled || !profileSkin) return;
     const ok = await showConfirm(
       'Reset the active Minecraft profile skin to the default skin? Croopor will save the current profile skin locally first.',
       { title: 'Reset profile skin', destructive: true, confirmText: 'Reset' },
@@ -636,10 +480,10 @@ export function SavedSkinLibrary({
     setProfileResetBusy(true);
     setMessage(null);
     try {
-      await api('POST', '/skin/profile/reset', {});
+      const response = await api('POST', '/skin/profile/reset', {});
       refresh();
       onApplied();
-      toast('Profile skin reset to default');
+      toast(commandSummary(response, 'Skin command accepted.'));
     } catch (err) {
       setMessage({
         tone: 'err',
@@ -651,7 +495,7 @@ export function SavedSkinLibrary({
   };
 
   const resetProfileCape = async (): Promise<void> => {
-    if (!onlineReady || !profileCape) return;
+    if (!skinActionsEnabled || !profileCape) return;
     const ok = await showConfirm(
       'Remove the active Minecraft profile cape? Croopor will save the current skin and cape pairing locally first.',
       { title: 'Reset profile cape', destructive: true, confirmText: 'Reset cape' },
@@ -661,10 +505,10 @@ export function SavedSkinLibrary({
     setProfileCapeResetBusy(true);
     setMessage(null);
     try {
-      await api('POST', '/skin/cape/reset', {});
+      const response = await api('POST', '/skin/cape/reset', {});
       refresh();
       onApplied();
-      toast('Profile cape reset');
+      toast(commandSummary(response, 'Skin command accepted.'));
     } catch (err) {
       setMessage({
         tone: 'err',
@@ -675,383 +519,16 @@ export function SavedSkinLibrary({
     }
   };
 
-  const lookupSkin = async (): Promise<void> => {
-    if (!trimmedLookupUsername) {
-      setLookupState('error');
-      setLookupError('Enter a Minecraft username.');
-      return;
-    }
-    if (lookupUsernameError) {
-      setLookupState('error');
-      setLookupError(lookupUsernameError);
-      return;
-    }
-
-    setLookupBusy(true);
-    setLookupState('loading');
-    setLookupError(null);
-    setLookupProfile(null);
-    setMessage(null);
-    try {
-      const profile = await lookupMinecraftSkin(trimmedLookupUsername);
-      setLookupProfile(profile);
-      setLookupState('ready');
-      setLookupVariant(profile.variant);
-      setPreviewExtra({ kind: 'lookup' });
-    } catch (err) {
-      setLookupState('error');
-      setLookupError(skinActionErrorMessage(err, 'Could not find that player skin.'));
-    } finally {
-      setLookupBusy(false);
-    }
-  };
-
-  const dismissLookup = (): void => {
-    setLookupProfile(null);
-    setLookupState('idle');
-    setLookupError(null);
-    setLookupUsername('');
-    setPreviewExtra((current) => (current?.kind === 'lookup' ? null : current));
-  };
-
-  const saveUsernameSkin = async (applyAfterSave: boolean): Promise<void> => {
-    if (!lookupProfile) {
-      setMessage({ tone: 'err', text: 'Search for a Minecraft profile before saving this skin.' });
-      return;
-    }
-
-    setLookupBusy(true);
-    setMessage(null);
-    try {
-      const request: { username: string; variant?: SkinVariant } = {
-        username: lookupProfile.username,
-        variant: lookupVariant,
-      };
-      const payload = await api('POST', '/skins/from-username', request);
-      const saved = savedSkinRecord(payload);
-      if (saved) {
-        setSelectedKey(saved.texture_key);
-        setSelectedSkin(`saved:${saved.texture_key}`, skinAccountKey);
-      }
-      setLookupUsername('');
-      setLookupVariant('classic');
-      setLookupProfile(null);
-      setLookupState('idle');
-      setLookupError(null);
-      setPreviewExtra(null);
-      if (saved && applyAfterSave) {
-        try {
-          await applySavedSkin(saved.texture_key);
-          toast(`${request.username}'s skin will apply shortly`);
-        } catch (err) {
-          setSelectedKey(saved.texture_key);
-          refresh();
-          setMessage({ tone: 'err', text: savedSkinApplyErrorMessage(err) });
-        }
-      } else {
-        refresh();
-        toast(`${request.username}'s skin added to your library`);
-      }
-    } catch (err) {
-      setMessage({
-        tone: 'err',
-        text: skinActionErrorMessage(err, 'Could not save player skin.'),
-      });
-    } finally {
-      setLookupBusy(false);
-    }
-  };
-
-  const hasUnsavedSkinEdit = (): boolean => {
-    if (!editKey) return false;
-    const skin = skins.find((candidate) => candidate.texture_key === editKey);
-    if (!skin) return Boolean(editReplacement);
-    const nextCapeId = editCapeId === NO_CAPE_VALUE ? null : editCapeId;
-    return (
-      Boolean(editReplacement) ||
-      trimmedEditName !== skin.name ||
-      editVariant !== skin.variant ||
-      nextCapeId !== (skin.cape_id ?? null)
-    );
-  };
-
-  const resetSkinEditState = (): void => {
-    editDetectTokenRef.current += 1;
-    clearEditReplacement();
-    setEditKey(null);
-    setEditName('');
-    setEditVariant('classic');
-    setEditCapeId(NO_CAPE_VALUE);
-    setEditDetectBusyKey(null);
-    setEditDetectError(null);
-  };
-
-  const closeSkinEditBeforeChanging = async (): Promise<boolean> => {
-    if (!editKey) return true;
-    if (hasUnsavedSkinEdit()) {
-      const ok = await showConfirm('Discard unsaved skin edits? Your local skin record will stay unchanged.', {
-        title: 'Discard skin edits',
-        destructive: true,
-        confirmText: 'Discard',
-      });
-      if (!ok) return false;
-    }
-    resetSkinEditState();
-    return true;
-  };
-
-  const startEdit = async (skin: SavedSkinRecord): Promise<void> => {
-    if (editKey === skin.texture_key) return;
-    const ok = await closeSkinEditBeforeChanging();
-    if (!ok) return;
-
-    editDetectTokenRef.current += 1;
-    clearEditReplacement();
-    setEditKey(skin.texture_key);
-    setEditName(skin.name);
-    setEditVariant(skin.variant === 'slim' ? 'slim' : 'classic');
-    setEditCapeId(skin.cape_id ?? NO_CAPE_VALUE);
-    setEditDetectBusyKey(null);
-    setEditDetectError(null);
-    setMessage(null);
-  };
-
-  const cancelEdit = (): void => {
-    resetSkinEditState();
-  };
-
-  const detectSavedSkinModel = async (skin: SavedSkinRecord): Promise<void> => {
-    const token = editDetectTokenRef.current + 1;
-    editDetectTokenRef.current = token;
-    setEditDetectBusyKey(skin.texture_key);
-    setEditDetectError(null);
-    setMessage(null);
-    try {
-      const detectedVariant = await detectSkinVariantFromSavedSkin(skin);
-      if (token !== editDetectTokenRef.current) return;
-      setEditVariant(detectedVariant);
-    } catch (err) {
-      if (token !== editDetectTokenRef.current) return;
-      setEditDetectError(
-        boundedMessage(err instanceof Error ? err.message : undefined, 'Could not detect skin model.'),
-      );
-    } finally {
-      if (token === editDetectTokenRef.current) setEditDetectBusyKey(null);
-    }
-  };
-
-  const stageEditReplacementFile = (file: File): void => {
-    if (!editKey) return;
-    if (!isPngFile(file)) {
-      setMessage({ tone: 'err', text: 'Choose a PNG skin file.' });
-      if (editTextureInputRef.current) editTextureInputRef.current.value = '';
-      return;
-    }
-    if (editBusyKey) {
-      setMessage({ tone: 'err', text: 'Wait for the current skin edit to finish.' });
-      if (editTextureInputRef.current) editTextureInputRef.current.value = '';
-      return;
-    }
-
-    const objectUrl = URL.createObjectURL(file);
-    editReplacementTokenRef.current += 1;
-    const token = editReplacementTokenRef.current;
-    if (editReplacementUrlRef.current) URL.revokeObjectURL(editReplacementUrlRef.current);
-    editReplacementUrlRef.current = objectUrl;
-    setMessage(null);
-    setEditDetectError(null);
-    setEditReplacement({
-      file,
-      objectUrl,
-      detectedVariant: 'classic',
-      detectingVariant: true,
-      normalizeStatus: 'checking',
-      applyAfterSave: false,
-    });
-
-    void normalizeSkinUpload(file)
-      .then((metadata) => {
-        if (token !== editReplacementTokenRef.current) return;
-        setEditVariant(metadata.variantSuggestion);
-        setEditReplacement((current) =>
-          current?.objectUrl === objectUrl
-            ? {
-                ...current,
-                detectedVariant: metadata.variantSuggestion,
-                detectingVariant: false,
-                normalizeStatus: 'ready',
-                normalizeError: undefined,
-                textureKey: metadata.textureKey,
-                originalWidth: metadata.originalWidth,
-                originalHeight: metadata.originalHeight,
-                normalizedByteSize: metadata.normalizedByteSize,
-                normalizedDataUrl: metadata.normalizedDataUrl,
-              }
-            : current,
-        );
-      })
-      .catch((err) => {
-        if (token !== editReplacementTokenRef.current) return;
-        setEditReplacement((current) =>
-          current?.objectUrl === objectUrl
-            ? {
-                ...current,
-                detectingVariant: false,
-                normalizeStatus: 'error',
-                normalizeError: boundedMessage(
-                  err instanceof Error ? err.message : undefined,
-                  'Skin validation failed.',
-                ),
-              }
-            : current,
-        );
-      });
-  };
-
-  const openEditTexturePicker = (): void => {
-    if (editTextureInputRef.current) editTextureInputRef.current.value = '';
-    void (async () => {
-      try {
-        const nativeFile = await pickNativeSkinFile();
-        if (nativeFile) {
-          stageEditReplacementFile(nativeFile);
-          return;
-        }
-        if (nativeFile === null) return;
-        editTextureInputRef.current?.click();
-      } catch (err) {
-        setMessage({
-          tone: 'err',
-          text: boundedMessage(err instanceof Error ? err.message : undefined, 'Could not open skin file.'),
-        });
-      }
-    })();
-  };
-
-  const handleEditReplacementDrop = (event: DragEvent): void => {
-    event.preventDefault();
-    event.stopPropagation();
-    editReplacementDragDepthRef.current = 0;
-    setEditReplacementDragActive(false);
-
-    const files = event.dataTransfer?.files;
-    if (!files || files.length === 0) return;
-    if (files.length !== 1) {
-      setMessage({ tone: 'err', text: 'Drop one PNG skin file to replace this texture.' });
-      return;
-    }
-
-    stageEditReplacementFile(files[0]);
-  };
-
-  const handleEditReplacementDragEnter = (event: DragEvent): void => {
-    if (!Array.from(event.dataTransfer?.types ?? []).includes('Files')) return;
-    event.preventDefault();
-    event.stopPropagation();
-    editReplacementDragDepthRef.current += 1;
-    setEditReplacementDragActive(true);
-  };
-
-  const handleEditReplacementDragOver = (event: DragEvent): void => {
-    if (!Array.from(event.dataTransfer?.types ?? []).includes('Files')) return;
-    event.preventDefault();
-    event.stopPropagation();
-    if (event.dataTransfer) event.dataTransfer.dropEffect = editBusyKey ? 'none' : 'copy';
-  };
-
-  const handleEditReplacementDragLeave = (event: DragEvent): void => {
-    if (!Array.from(event.dataTransfer?.types ?? []).includes('Files')) return;
-    event.preventDefault();
-    event.stopPropagation();
-    editReplacementDragDepthRef.current = Math.max(0, editReplacementDragDepthRef.current - 1);
-    if (editReplacementDragDepthRef.current === 0) setEditReplacementDragActive(false);
-  };
-
-  const saveSkinMetadata = async (textureKey: string, applyAfterSave = false): Promise<void> => {
-    const skin = skins.find((candidate) => candidate.texture_key === textureKey);
-    if (skin && !savedSkinEditHasChanges(skin)) {
-      setMessage({ tone: 'err', text: 'Make an edit to the skin before saving.' });
-      return;
-    }
-    if (!trimmedEditName) {
-      setMessage({ tone: 'err', text: 'Name the skin before saving.' });
-      return;
-    }
-    if (editReplacement && editReplacement.normalizeStatus !== 'ready') {
-      setMessage({ tone: 'err', text: 'Wait for the replacement PNG to validate before saving.' });
-      return;
-    }
-
-    setEditBusyKey(textureKey);
-    setMessage(null);
-    try {
-      const previousCapeId = skin?.cape_id ?? null;
-      const nextCapeId = editCapeId === NO_CAPE_VALUE ? null : editCapeId;
-      const profileRelevantEdit = Boolean(
-        editReplacement || (skin && editVariant !== skin.variant) || nextCapeId !== previousCapeId,
-      );
-      const shouldReapplyEditedSkin = Boolean(skin?.applied_at && profileRelevantEdit);
-      const shouldApplyEditedSkin = Boolean(
-        onlineReady && ((applyAfterSave && !skin?.applied_at) || shouldReapplyEditedSkin),
-      );
-      let savedTextureKey = textureKey;
-      const savedMessage = editReplacement ? 'Skin texture replaced.' : 'Skin details updated.';
-      if (editReplacement) {
-        const saved = await replaceSavedSkinTexture(textureKey, editReplacement.file, {
-          name: trimmedEditName,
-          variant: editVariant,
-          capeId: nextCapeId === previousCapeId ? undefined : nextCapeId,
-        });
-        savedTextureKey = saved.texture_key;
-        setSelectedKey(saved.texture_key);
-        setSelectedSkin(`saved:${saved.texture_key}`, skinAccountKey);
-      } else {
-        const payload: { name: string; variant: SkinVariant; cape_id?: string | null } = {
-          name: trimmedEditName,
-          variant: editVariant,
-        };
-        if (skin && editCapeId !== (skin.cape_id ?? NO_CAPE_VALUE)) {
-          payload.cape_id = editCapeId === NO_CAPE_VALUE ? null : editCapeId;
-        }
-        const updated = savedSkinRecord(await api('PUT', `/skins/${textureKey}`, payload));
-        if (!updated) throw new Error('Skin details update returned an invalid response.');
-        savedTextureKey = updated.texture_key;
-      }
-      cancelEdit();
-      if (shouldApplyEditedSkin) {
-        try {
-          await applySavedSkin(savedTextureKey);
-          toast(`${savedMessage} It will apply shortly`);
-        } catch (err) {
-          refresh();
-          setMessage({
-            tone: 'err',
-            text: `${savedMessage} Could not queue the skin: ${skinActionErrorMessage(err, 'apply failed.')}`,
-          });
-        }
-      } else {
-        refresh();
-        toast(savedMessage);
-      }
-    } catch (err) {
-      setMessage({
-        tone: 'err',
-        text: skinActionErrorMessage(err, 'Could not update skin details.'),
-      });
-    } finally {
-      setEditBusyKey(null);
-    }
-  };
-
-  const applySavedSkin = async (textureKey: string, options: { select?: boolean } = {}): Promise<void> => {
-    await api('POST', `/skins/${textureKey}/apply?defer=true`);
+  async function applySavedSkin(textureKey: string, options: { select?: boolean } = {}): Promise<string> {
+    const response = await api('POST', `/skins/${textureKey}/apply?defer=true`);
     setLocalPendingApplyKey(textureKey);
     if (options.select !== false) {
       setSelectedKey(textureKey);
       setSelectedSkin(`saved:${textureKey}`, skinAccountKey);
     }
     refresh();
-  };
+    return commandSummary(response, 'Skin command accepted.');
+  }
 
   const viewSavedSkin = async (textureKey: string): Promise<void> => {
     if (editKey && editKey !== textureKey) {
@@ -1092,18 +569,17 @@ export function SavedSkinLibrary({
     }
     const existing = existingKey ? (savedSkinByKey.get(existingKey) ?? null) : null;
     if (existing) {
-      setBusy(true);
+      setUploadBusy(true);
       setMessage(null);
       try {
-        await applySavedSkin(existing.texture_key, { select: false });
-        toast('Skin will apply shortly');
+        toast(await applySavedSkin(existing.texture_key, { select: false }));
       } catch (err) {
         setMessage({
           tone: 'err',
           text: skinActionErrorMessage(err, 'Could not apply skin.'),
         });
       } finally {
-        setBusy(false);
+        setUploadBusy(false);
       }
       return;
     }
@@ -1122,8 +598,7 @@ export function SavedSkinLibrary({
     setApplyKey(textureKey);
     setMessage(null);
     try {
-      await applySavedSkin(textureKey);
-      toast('Skin will apply shortly');
+      toast(await applySavedSkin(textureKey));
     } catch (err) {
       setMessage({
         tone: 'err',
@@ -1151,9 +626,8 @@ export function SavedSkinLibrary({
         }),
       );
       if (!updated) throw new Error('Cape update returned an invalid response.');
-      if (selectedSkin.applied_at && onlineReady) {
-        await applySavedSkin(updated.texture_key);
-        toast('Cape will apply shortly');
+      if (selectedSkin.applied_at && skinActionsEnabled) {
+        toast(await applySavedSkin(updated.texture_key));
       } else {
         refresh();
         toast('Cape updated');
@@ -1178,11 +652,10 @@ export function SavedSkinLibrary({
       if (result.applied > 0) {
         onApplied();
         setLocalPendingApplyKey(null);
-        toast('Skin applied');
       } else {
         setLocalPendingApplyKey(null);
-        toast('No skin change was pending');
       }
+      toast(result.viewModel?.summary ?? 'Skin command accepted.');
       refresh();
     } catch (err) {
       setMessage({
@@ -1198,10 +671,10 @@ export function SavedSkinLibrary({
     setCancelPendingBusy(true);
     setMessage(null);
     try {
-      await api('DELETE', '/skins/pending');
+      const response = await api('DELETE', '/skins/pending');
       setLocalPendingApplyKey(null);
       refresh();
-      toast('Skin change canceled');
+      toast(commandSummary(response, 'Skin change canceled.'));
     } catch (err) {
       setMessage({
         tone: 'err',
@@ -1237,271 +710,24 @@ export function SavedSkinLibrary({
     setMessage(null);
   };
 
-  const stageUploadFile = (file: File, applyAfterSave: boolean): void => {
-    if (!isPngFile(file)) {
-      setMessage({ tone: 'err', text: 'Upload a PNG skin file.' });
-      if (fileInputRef.current) fileInputRef.current.value = '';
-      return;
-    }
-    if (busy || profileBusy || lookupBusy) {
-      setMessage({ tone: 'err', text: 'Wait for the current skin action to finish.' });
-      if (fileInputRef.current) fileInputRef.current.value = '';
-      return;
-    }
-
-    const objectUrl = URL.createObjectURL(file);
-    stagedUploadTokenRef.current += 1;
-    const token = stagedUploadTokenRef.current;
-    if (stagedUploadUrlRef.current) URL.revokeObjectURL(stagedUploadUrlRef.current);
-    stagedUploadUrlRef.current = objectUrl;
-    setMessage(null);
-    setStagedCapeId(NO_CAPE_VALUE);
-    setStagedUpload({
-      file,
-      objectUrl,
-      detectedVariant: 'classic',
-      detectingVariant: true,
-      normalizeStatus: 'checking',
-      applyAfterSave,
-    });
-
-    void normalizeSkinUpload(file)
-      .then((metadata) => {
-        if (token !== stagedUploadTokenRef.current) return;
-        setStagedUpload((current) =>
-          current?.objectUrl === objectUrl
-            ? {
-                ...current,
-                detectedVariant: metadata.variantSuggestion,
-                detectingVariant: false,
-                normalizeStatus: 'ready',
-                normalizeError: undefined,
-                textureKey: metadata.textureKey,
-                originalWidth: metadata.originalWidth,
-                originalHeight: metadata.originalHeight,
-                normalizedByteSize: metadata.normalizedByteSize,
-                normalizedDataUrl: metadata.normalizedDataUrl,
-              }
-            : current,
-        );
-      })
-      .catch((err) => {
-        if (token !== stagedUploadTokenRef.current) return;
-        setStagedUpload((current) =>
-          current?.objectUrl === objectUrl
-            ? {
-                ...current,
-                detectingVariant: false,
-                normalizeStatus: 'error',
-                normalizeError: boundedMessage(
-                  err instanceof Error ? err.message : undefined,
-                  'Skin validation failed.',
-                ),
-              }
-            : current,
-        );
+  useSavedSkinNativeDragDrop({
+    dropSurfaceRef: savedSkinsDropSurfaceRef,
+    editKey,
+    uploadBusy: busy || profileBusy || profileResetBusy || profileCapeResetBusy || lookupBusy,
+    editBusy: Boolean(editBusyKey || editDetectBusyKey),
+    setUploadDragActive,
+    setEditReplacementDragActive,
+    setMessage,
+    onReadError: (err) => {
+      setMessage({
+        tone: 'err',
+        text: boundedMessage(err instanceof Error ? err.message : undefined, 'Could not read dropped skin file.'),
       });
-  };
-
-  useEffect(() => {
-    stageUploadFileRef.current = stageUploadFile;
-    stageEditReplacementFileRef.current = stageEditReplacementFile;
+    },
+    stageUploadFile,
+    stageEditReplacementFile,
   });
 
-  useEffect(() => {
-    let active = true;
-    let subscription: { close(): void } | null = null;
-
-    const pathsForPayload = (payload: NativeDragDropPayload): string[] =>
-      payload.paths.length > 0 ? payload.paths : nativeDraggedSkinPathsRef.current;
-
-    const editDropTextureKeyForPayload = (payload: NativeDragDropPayload): string | null => {
-      const target = nativeDragTargetElement<HTMLElement>(payload.position, '[data-saved-skin-edit-drop-surface]');
-      const textureKey = target?.getAttribute('data-saved-skin-edit-drop-surface') ?? null;
-      return textureKey && textureKey === editKeyRef.current ? textureKey : null;
-    };
-
-    const handleNativeDragDrop = (payload: NativeDragDropPayload): void => {
-      if (!active) return;
-      if (payload.type === 'leave') {
-        nativeDraggedSkinPathsRef.current = [];
-        setUploadDragActive(false);
-        setEditReplacementDragActive(false);
-        return;
-      }
-
-      const paths = pathsForPayload(payload);
-      const skinPaths = paths.filter(isPngPath);
-      const editDropTextureKey = editDropTextureKeyForPayload(payload);
-      const overDropSurface = nativeDragPositionHitsElement(payload.position, savedSkinsDropSurfaceRef.current);
-      const overEditDropSurface = Boolean(editDropTextureKey);
-
-      if (payload.type === 'enter') {
-        nativeDraggedSkinPathsRef.current = payload.paths;
-        setEditReplacementDragActive(skinPaths.length > 0 && overEditDropSurface);
-        setUploadDragActive(skinPaths.length > 0 && !overEditDropSurface && overDropSurface);
-        return;
-      }
-
-      if (payload.type === 'over') {
-        setEditReplacementDragActive(skinPaths.length > 0 && overEditDropSurface);
-        setUploadDragActive(skinPaths.length > 0 && !overEditDropSurface && overDropSurface);
-        return;
-      }
-
-      nativeDraggedSkinPathsRef.current = [];
-      setUploadDragActive(false);
-      setEditReplacementDragActive(false);
-      if (payload.type !== 'drop' || (!overDropSurface && !overEditDropSurface)) return;
-      if (skinPaths.length === 0) return;
-      if (skinPaths.length !== 1) {
-        setMessage({
-          tone: 'err',
-          text: overEditDropSurface ? 'Drop one PNG skin file to replace this texture.' : 'Drop one PNG skin file.',
-        });
-        return;
-      }
-      if (overEditDropSurface) {
-        if (nativeEditBusyRef.current) {
-          setMessage({ tone: 'err', text: 'Wait for the current skin edit to finish.' });
-          return;
-        }
-
-        void (async () => {
-          try {
-            const file = await readNativeSkinFile(skinPaths[0]);
-            if (!active || !file) return;
-            stageEditReplacementFileRef.current?.(file);
-          } catch (err) {
-            if (!active) return;
-            setMessage({
-              tone: 'err',
-              text: boundedMessage(err instanceof Error ? err.message : undefined, 'Could not read dropped skin file.'),
-            });
-          }
-        })();
-        return;
-      }
-      if (nativeUploadBusyRef.current) {
-        setMessage({ tone: 'err', text: 'Wait for the current skin action to finish.' });
-        return;
-      }
-
-      void (async () => {
-        try {
-          const file = await readNativeSkinFile(skinPaths[0]);
-          if (!active || !file) return;
-          stageUploadFileRef.current?.(file, false);
-        } catch (err) {
-          if (!active) return;
-          setMessage({
-            tone: 'err',
-            text: boundedMessage(err instanceof Error ? err.message : undefined, 'Could not read dropped skin file.'),
-          });
-        }
-      })();
-    };
-
-    void onNativeDragDrop(handleNativeDragDrop).then((nextSubscription) => {
-      if (!active) {
-        nextSubscription?.close();
-        return;
-      }
-      subscription = nextSubscription;
-    });
-
-    return () => {
-      active = false;
-      nativeDraggedSkinPathsRef.current = [];
-      setUploadDragActive(false);
-      setEditReplacementDragActive(false);
-      subscription?.close();
-    };
-  }, []);
-
-  const saveStagedUpload = (applyAfterSave: boolean): void => {
-    if (!stagedUpload || !stagedVariant || !stagedCanSave) return;
-    if (applyAfterSave && !onlineReady) return;
-    void upload(stagedUpload.file, applyAfterSave, stagedVariant, stagedCapeId);
-  };
-
-  const handleUploadDrop = (event: DragEvent): void => {
-    event.preventDefault();
-    event.stopPropagation();
-    uploadDragDepthRef.current = 0;
-    setUploadDragActive(false);
-
-    const files = event.dataTransfer?.files;
-    if (!files || files.length === 0) return;
-    if (files.length !== 1) {
-      setMessage({ tone: 'err', text: 'Drop one PNG skin file.' });
-      return;
-    }
-
-    stageUploadFile(files[0], false);
-  };
-
-  const handleUploadDragEnter = (event: DragEvent): void => {
-    if (!Array.from(event.dataTransfer?.types ?? []).includes('Files')) return;
-    event.preventDefault();
-    event.stopPropagation();
-    uploadDragDepthRef.current += 1;
-    setUploadDragActive(true);
-  };
-
-  const handleUploadDragOver = (event: DragEvent): void => {
-    if (!Array.from(event.dataTransfer?.types ?? []).includes('Files')) return;
-    event.preventDefault();
-    if (event.dataTransfer) event.dataTransfer.dropEffect = busy || profileBusy || lookupBusy ? 'none' : 'copy';
-  };
-
-  const handleUploadDragLeave = (event: DragEvent): void => {
-    if (!Array.from(event.dataTransfer?.types ?? []).includes('Files')) return;
-    event.preventDefault();
-    event.stopPropagation();
-    uploadDragDepthRef.current = Math.max(0, uploadDragDepthRef.current - 1);
-    if (uploadDragDepthRef.current === 0) setUploadDragActive(false);
-  };
-
-  const handleUploadFile = (file: File, applyAfterSave: boolean): void => {
-    stageUploadFile(file, applyAfterSave);
-  };
-
-  const openUploadPicker = (applyAfterSave: boolean): void => {
-    uploadApplyAfterSaveRef.current = applyAfterSave;
-    if (fileInputRef.current) fileInputRef.current.value = '';
-    void (async () => {
-      try {
-        const nativeFile = await pickNativeSkinFile();
-        if (nativeFile) {
-          handleUploadFile(nativeFile, applyAfterSave);
-          uploadApplyAfterSaveRef.current = false;
-          return;
-        }
-        if (nativeFile === null) {
-          uploadApplyAfterSaveRef.current = false;
-          return;
-        }
-        fileInputRef.current?.click();
-      } catch (err) {
-        uploadApplyAfterSaveRef.current = false;
-        setMessage({
-          tone: 'err',
-          text: boundedMessage(err instanceof Error ? err.message : undefined, 'Could not open skin file.'),
-        });
-      }
-    })();
-  };
-
-  const savedSkinEditHasChanges = (skin: SavedSkinRecord): boolean => {
-    const nextCapeId = editCapeId === NO_CAPE_VALUE ? null : editCapeId;
-    return (
-      Boolean(editReplacement) ||
-      trimmedEditName !== skin.name ||
-      editVariant !== skin.variant ||
-      nextCapeId !== (skin.cape_id ?? null)
-    );
-  };
   const editingSkin = editKey ? (skins.find((skin) => skin.texture_key === editKey) ?? null) : null;
   const lookupPreview = previewExtra?.kind === 'lookup' && lookupState === 'ready' ? lookupProfile : null;
   const profilePreviewActive = Boolean(previewExtra?.kind === 'profile' && profileSkin && minecraftProfile);
@@ -1512,7 +738,7 @@ export function SavedSkinLibrary({
   const editPreviewCapeSrc = capeSrcForId(editCapeId === NO_CAPE_VALUE ? null : editCapeId);
   const stageApplyBusy = Boolean(selectedSkin && applyKey === selectedSkin.texture_key);
   const selectedSkinForStage =
-    selectedSkin && onlineReady && selectedSkin.texture_key === currentProfileSavedKey
+    selectedSkin && skinActionsEnabled && selectedSkin.texture_key === currentProfileSavedKey
       ? { ...selectedSkin, applied_at: selectedSkin.applied_at ?? 'minecraft_profile' }
       : selectedSkin;
   const profileMenuItems: ContextMenuItem[] = [
@@ -1529,34 +755,21 @@ export function SavedSkinLibrary({
   const showProfileSkinTile = Boolean(
     minecraftProfile && profileSkin && !showProfileSelectedPreview && !currentProfileSavedKey,
   );
+  const previewExtraActive = Boolean(previewExtra);
+  const selectedSkinTextureKey = selectedSkin?.texture_key ?? null;
 
   return (
     <div class="cp-skinpage">
-      <input
-        ref={editTextureInputRef}
-        type="file"
-        accept="image/png"
-        style={{ display: 'none' }}
-        onChange={(event) => {
-          const file = event.currentTarget.files?.[0];
-          if (file) stageEditReplacementFile(file);
-        }}
-      />
-      <input
-        ref={fileInputRef}
-        type="file"
-        accept="image/png"
-        style={{ display: 'none' }}
-        onChange={(event) => {
-          const file = event.currentTarget.files?.[0];
-          if (file) handleUploadFile(file, uploadApplyAfterSaveRef.current);
-          uploadApplyAfterSaveRef.current = false;
-        }}
+      <SavedSkinFileInputs
+        editTextureInputRef={editTextureInputRef}
+        fileInputRef={fileInputRef}
+        onEditTextureFile={stageEditReplacementFile}
+        onUploadFile={handleUploadInputFile}
       />
 
       <SkinStage
         state={state}
-        onlineReady={onlineReady}
+        skinActionsEnabled={skinActionsEnabled}
         lookupPreview={lookupPreview}
         lookupVariant={lookupVariant}
         lookupBusy={lookupBusy}
@@ -1606,174 +819,80 @@ export function SavedSkinLibrary({
         class="cp-skinwork"
         data-saved-skins-drop-surface
         data-saved-skins-drop-state={uploadDragActive ? 'active' : 'idle'}
-        onDragEnter={handleUploadDragEnter}
-        onDragOver={handleUploadDragOver}
-        onDragLeave={handleUploadDragLeave}
-        onDrop={handleUploadDrop}
+        onDragEnter={uploadDrop.onDragEnter}
+        onDragOver={uploadDrop.onDragOver}
+        onDragLeave={uploadDrop.onDragLeave}
+        onDrop={uploadDrop.onDrop}
       >
-        <div class="cp-skin-find" role="search" aria-label="Find player skin">
-          <Input
-            value={lookupUsername}
-            onChange={(value) => {
-              setLookupUsername(clampPlayerNameInput(value));
-              setLookupVariant('classic');
-              setLookupProfile(null);
-              setLookupState('idle');
-              setLookupError(null);
-              setMessage(null);
-              setPreviewExtra((current) => (current?.kind === 'lookup' ? null : current));
-            }}
-            onKeyDown={(event) => {
-              if (event.key === 'Enter' && canLookupSkin) void lookupSkin();
-            }}
-            placeholder="Find a player's skin by username"
-            icon="search"
-            style={{ flex: '1 1 240px', minWidth: 0 }}
-          />
-          <Button
-            variant="secondary"
-            icon={lookupBusy && lookupState === 'loading' ? 'refresh' : 'search'}
-            disabled={!canLookupSkin}
-            onClick={() => void lookupSkin()}
-            title={lookupUsernameError || 'Look up this player skin'}
-          >
-            {lookupState === 'loading' ? 'Searching' : 'Search'}
-          </Button>
-        </div>
+        <SavedSkinLookupBar
+          lookupUsername={lookupUsername}
+          lookupBusy={lookupBusy}
+          lookupState={lookupState}
+          lookupUsernameError={lookupUsernameError}
+          lookupError={lookupError}
+          message={message}
+          state={state}
+          error={error}
+          canLookupSkin={canLookupSkin}
+          onLookupUsernameChange={handleLookupUsernameChange}
+          onLookupSkin={() => void lookupSkin()}
+        />
 
-        {lookupUsernameError && lookupState !== 'error' && <div class="cp-skin-inline-err">{lookupUsernameError}</div>}
-        {lookupState === 'error' && lookupError && <div class="cp-skin-inline-err">{lookupError}</div>}
-        {message && message.tone === 'err' && <div class="cp-skin-inline-err">{message.text}</div>}
-        {state === 'unavailable' && <div class="cp-skin-inline-err">{error || 'Saved skins are unavailable.'}</div>}
+        <SavedSkinLibraryGrid
+          state={state}
+          librarySkins={librarySkins}
+          uploadDragActive={uploadDragActive}
+          canUpload={canUpload}
+          showProfileSkinTile={showProfileSkinTile}
+          minecraftProfile={minecraftProfile}
+          profileSkin={profileSkin ?? undefined}
+          profileSkinFileSrc={profileSkinFileSrc}
+          profileSkinVariant={profileSkinVariant}
+          profileCape={profileCape ?? undefined}
+          profileSkinIdentity={profileSkinIdentity}
+          profilePreviewActive={profilePreviewActive}
+          profileMenuItems={profileMenuItems}
+          selectedSkinTextureKey={selectedSkinTextureKey}
+          previewExtraActive={previewExtraActive}
+          skinActionsEnabled={skinActionsEnabled}
+          currentProfileSavedKey={currentProfileSavedKey}
+          pendingApplyKey={pendingApplyKey}
+          deleteKey={deleteKey}
+          editKey={editKey}
+          applyKey={applyKey}
+          flushBusy={flushBusy}
+          cancelPendingBusy={cancelPendingBusy}
+          capeSrcForId={capeSrcForId}
+          onOpenUploadPicker={() => openUploadPicker(false)}
+          onViewProfileSkin={viewProfileSkin}
+          onViewSavedSkin={(textureKey) => void viewSavedSkin(textureKey)}
+          onApplySkin={(textureKey) => void applySkin(textureKey)}
+          onFlushPendingApply={() => void flushPendingApply()}
+          onCancelPendingApply={() => void cancelPendingApply()}
+          onStartEdit={(skin) => void startEdit(skin)}
+          onDownloadSavedSkin={(skin) => void downloadSavedSkin(skin)}
+          onConfirmDeleteSkin={(skin) => void confirmDeleteSkin(skin)}
+        />
 
-        <section class="cp-skin-section" aria-label="Skin library">
-          <header class="cp-skin-section__head">
-            <span class="cp-skin-section__title">Library</span>
-            {state === 'ready' && librarySkins.length > 0 && (
-              <span class="cp-skin-section__count">{librarySkins.length}</span>
-            )}
-          </header>
-          {state === 'loading' ? (
-            <div class="cp-skin-grid-note">Loading saved skins...</div>
-          ) : (
-            <div class="cp-skin-grid">
-              <button
-                type="button"
-                class="cp-skin-add-tile"
-                data-drag={uploadDragActive ? 'active' : 'idle'}
-                disabled={!canUpload}
-                onClick={() => openUploadPicker(false)}
-                title="Upload a PNG skin file, or drop one here"
-              >
-                <Icon name="plus" size={24} />
-                <span class="cp-skin-add-tile__label">Add skin</span>
-                <span class="cp-skin-add-tile__hint">{uploadDragActive ? 'Drop to add' : 'Drag and drop'}</span>
-              </button>
-
-              {showProfileSkinTile && minecraftProfile && profileSkin && (
-                <ProfileSkinTile
-                  minecraftProfile={minecraftProfile}
-                  profileSkinId={profileSkin.id}
-                  profileSkinUrl={profileSkin.url}
-                  profileSkinFileSrc={profileSkinFileSrc}
-                  profileSkinVariant={profileSkinVariant}
-                  profileCape={profileCape}
-                  profileSkinIdentity={profileSkinIdentity}
-                  selected={profilePreviewActive}
-                  menuItems={profileMenuItems}
-                  onView={viewProfileSkin}
-                />
-              )}
-
-              {librarySkins.map((skin) => {
-                const applied = Boolean(
-                  skin.applied_at || (onlineReady && skin.texture_key === currentProfileSavedKey),
-                );
-                const selected = !previewExtra && selectedSkin?.texture_key === skin.texture_key;
-                const queued = pendingApplyKey === skin.texture_key;
-                const deleting = deleteKey === skin.texture_key;
-                const applyBlocked = applyKey === skin.texture_key || flushBusy || cancelPendingBusy;
-                const pendingRowActionBusy = flushBusy || cancelPendingBusy || applyKey !== null;
-                const tileMenuItems = menuItemsForSavedSkin({
-                  skin,
-                  applied,
-                  selectedPreviewEditing: editKey === skin.texture_key,
-                  onlineReady,
-                  applying: applyBlocked,
-                  pendingActionBusy: pendingRowActionBusy,
-                  queued,
-                  deleting,
-                  onView: () => void viewSavedSkin(skin.texture_key),
-                  onApply: () => void applySkin(skin.texture_key),
-                  onApplyNow: () => void flushPendingApply(),
-                  onCancelQueue: () => void cancelPendingApply(),
-                  onEdit: () => void startEdit(skin),
-                  onDownload: () => void downloadSavedSkin(skin),
-                  onDelete: () => void confirmDeleteSkin(skin),
-                });
-
-                return (
-                  <SavedSkinTile
-                    key={skin.texture_key}
-                    skin={skin}
-                    selected={selected}
-                    queued={queued}
-                    applied={applied}
-                    deleting={deleting}
-                    capeSrc={capeSrcForId(skin.cape_id)}
-                    menuItems={tileMenuItems}
-                    onView={() => void viewSavedSkin(skin.texture_key)}
-                  />
-                );
-              })}
-            </div>
-          )}
-        </section>
-
-        <section class="cp-skin-section" aria-label="Default skins">
-          <header class="cp-skin-section__head">
-            <span class="cp-skin-section__title">Default skins</span>
-            <span class="cp-skin-section__hint">Always available</span>
-          </header>
-          <div class="cp-skin-strip">
-            {DEFAULT_SKINS.map((skin) => {
-              const savedRecord = savedRecordForDefault(skin.id);
-              const selected =
-                selectedDefault?.id === skin.id ||
-                Boolean(!previewExtra && savedRecord && selectedSkin?.texture_key === savedRecord.texture_key);
-              const queued = Boolean(savedRecord && pendingApplyKey === savedRecord.texture_key);
-              const applied = Boolean(
-                savedRecord?.applied_at ||
-                (onlineReady && savedRecord && savedRecord.texture_key === currentProfileSavedKey),
-              );
-              return (
-                <DefaultSkinTile
-                  key={skin.id}
-                  skin={skin}
-                  selected={selected}
-                  queued={queued}
-                  applied={applied}
-                  onView={() => viewDefaultSkin(skin.id)}
-                />
-              );
-            })}
-          </div>
-        </section>
+        <SavedSkinDefaultStrip
+          skins={DEFAULT_SKINS}
+          selectedDefaultId={selectedDefault?.id ?? null}
+          selectedSkinTextureKey={selectedSkinTextureKey}
+          previewExtraActive={previewExtraActive}
+          pendingApplyKey={pendingApplyKey}
+          skinActionsEnabled={skinActionsEnabled}
+          currentProfileSavedKey={currentProfileSavedKey}
+          savedRecordForDefault={savedRecordForDefault}
+          onViewDefaultSkin={viewDefaultSkin}
+        />
 
         {availableCapes.length > 0 && selectedSkin && (
-          <section class="cp-skin-section" aria-label="Capes">
-            <header class="cp-skin-section__head">
-              <span class="cp-skin-section__title">Capes</span>
-              <span class="cp-skin-section__hint">
-                {capeBusy ? 'Updating cape...' : `Worn with ${selectedSkin.name}`}
-              </span>
-            </header>
-            <CapePicker
-              capes={availableCapes}
-              value={selectedSkin.cape_id ?? NO_CAPE_VALUE}
-              onChange={(value) => void changeSelectedSkinCape(value)}
-            />
-          </section>
+          <SavedSkinCapeSection
+            availableCapes={availableCapes}
+            selectedSkin={selectedSkin}
+            capeBusy={capeBusy}
+            onChange={(value) => void changeSelectedSkinCape(value)}
+          />
         )}
       </section>
 
@@ -1787,7 +906,8 @@ export function SavedSkinLibrary({
         skinName={skinName}
         uploadVariant={uploadVariant}
         busy={busy}
-        onlineReady={onlineReady}
+        skinActionsEnabled={skinActionsEnabled}
+        skinActionDisabledReason={skinActionDisabledReason}
         stagedCanSave={stagedCanSave}
         onClose={clearStagedUpload}
         onSkinNameChange={(value) => {
@@ -1817,13 +937,14 @@ export function SavedSkinLibrary({
         editDetectError={editDetectError}
         editReplacementReady={editReplacementReady}
         editHasChanges={editingSkin ? savedSkinEditHasChanges(editingSkin) : false}
-        onlineReady={onlineReady}
+        skinActionsEnabled={skinActionsEnabled}
+        skinActionDisabledReason={skinActionDisabledReason}
         deleteKey={deleteKey}
         onClose={cancelEdit}
-        onEditReplacementDragEnter={handleEditReplacementDragEnter}
-        onEditReplacementDragOver={handleEditReplacementDragOver}
-        onEditReplacementDragLeave={handleEditReplacementDragLeave}
-        onEditReplacementDrop={handleEditReplacementDrop}
+        onEditReplacementDragEnter={editReplacementDrop.onDragEnter}
+        onEditReplacementDragOver={editReplacementDrop.onDragOver}
+        onEditReplacementDragLeave={editReplacementDrop.onDragLeave}
+        onEditReplacementDrop={editReplacementDrop.onDrop}
         onEditNameChange={setEditName}
         onEditVariantChange={(value) => {
           setEditVariant(value);

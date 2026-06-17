@@ -4,12 +4,17 @@
 //! It does not parse route error strings, choose providers, repair files, or
 //! change install progress responses.
 
+use super::GuardianPolicyContext;
 use super::{
-    GuardianFact, GuardianMode, SafetyCase, build_safety_case, guardian_fact_from_execution,
+    DiagnosisId, GuardianDecisionKind, GuardianFact, GuardianMode, GuardianRepairPlan,
+    GuardianRepairPlanRejection, GuardianUserOutcome, SafetyCase, build_safety_case,
+    decide_guardian_policy, guardian_fact_from_execution, install_failure_user_outcome,
+    plan_launcher_managed_artifact_repair, plan_launcher_managed_missing_artifact_repair,
 };
 use crate::execution::{ExecutionFact, ExecutionFactKind};
 use crate::observability::{
-    EvidenceField, EvidenceSensitivity, RedactionAudience, sanitize_evidence_token,
+    EvidenceField, EvidenceSensitivity, RedactionAudience, evidence_text_looks_sensitive,
+    sanitize_evidence_token,
 };
 use crate::state::contracts::{
     OperationId, OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
@@ -28,6 +33,9 @@ pub enum GuardianInstallArtifactFailureKind {
     ProviderFailure,
     NetworkFailure,
     PermissionDenied,
+    TempWriteFailed,
+    PromotionFailed,
+    DependencyFailed,
     OwnershipRefused,
 }
 
@@ -66,6 +74,26 @@ impl GuardianInstallArtifactFailureEvidence {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuardianInstallArtifactRepairPlanKind {
+    ExistingArtifact,
+    MissingArtifact,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuardianInstallArtifactRepairPlanRejection {
+    NoFailureEvidence,
+    PolicyDidNotSelectRepair,
+    RepairPlan(GuardianRepairPlanRejection),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GuardianInstallFailureOutcome {
+    pub diagnosis_id: DiagnosisId,
+    pub decision: GuardianDecisionKind,
+    pub user_outcome: GuardianUserOutcome,
+}
+
 pub fn install_artifact_failure_guardian_fact(
     evidence: &GuardianInstallArtifactFailureEvidence,
     phase: OperationPhase,
@@ -90,6 +118,13 @@ pub fn install_artifact_failure_from_minecraft_download_fact(
     fact: &MinecraftDownloadFact,
 ) -> Option<GuardianInstallArtifactFailureEvidence> {
     let kind = install_failure_kind_for_minecraft_download_fact(fact.kind)?;
+    let ownership = if kind == GuardianInstallArtifactFailureKind::OwnershipRefused
+        && ownership == OwnershipClass::LauncherManaged
+    {
+        OwnershipClass::Unknown
+    } else {
+        ownership
+    };
     let evidence = GuardianInstallArtifactFailureEvidence {
         operation_id,
         target_id: fact.target.clone(),
@@ -113,10 +148,94 @@ pub fn install_artifact_failure_safety_case(
     build_safety_case(operation_id, mode, phase, &facts)
 }
 
+pub fn install_artifact_failure_guardian_outcome(
+    operation_id: Option<OperationId>,
+    mode: GuardianMode,
+    phase: OperationPhase,
+    evidence: &[GuardianInstallArtifactFailureEvidence],
+) -> Option<GuardianInstallFailureOutcome> {
+    install_artifact_failure_guardian_outcome_with_context(
+        operation_id,
+        mode,
+        phase,
+        evidence,
+        GuardianPolicyContext::current_operation(),
+    )
+}
+
+pub fn install_artifact_failure_guardian_outcome_with_context(
+    operation_id: Option<OperationId>,
+    mode: GuardianMode,
+    phase: OperationPhase,
+    evidence: &[GuardianInstallArtifactFailureEvidence],
+    context: GuardianPolicyContext,
+) -> Option<GuardianInstallFailureOutcome> {
+    if evidence.is_empty() {
+        return None;
+    }
+
+    let safety_case = install_artifact_failure_safety_case(operation_id, mode, phase, evidence);
+    let decision = decide_guardian_policy(&safety_case, context);
+    if matches!(
+        decision.kind,
+        GuardianDecisionKind::Allow
+            | GuardianDecisionKind::RecordOnly
+            | GuardianDecisionKind::Repair
+    ) {
+        return None;
+    }
+
+    let diagnosis_id = decision
+        .action_plan
+        .as_ref()
+        .map(|plan| plan.prerequisite.diagnosis_id.clone())
+        .or_else(|| decision.diagnoses.first().cloned())?;
+    if diagnosis_id.as_str() == "launcher_managed_artifact_corrupt" {
+        return None;
+    }
+
+    Some(GuardianInstallFailureOutcome {
+        diagnosis_id: diagnosis_id.clone(),
+        decision: decision.kind,
+        user_outcome: install_failure_user_outcome(decision.kind, diagnosis_id.as_str()),
+    })
+}
+
+pub fn plan_install_artifact_failure_repair(
+    operation_id: Option<OperationId>,
+    mode: GuardianMode,
+    phase: OperationPhase,
+    evidence: &[GuardianInstallArtifactFailureEvidence],
+    plan_kind: GuardianInstallArtifactRepairPlanKind,
+) -> Result<GuardianRepairPlan, GuardianInstallArtifactRepairPlanRejection> {
+    if evidence.is_empty() {
+        return Err(GuardianInstallArtifactRepairPlanRejection::NoFailureEvidence);
+    }
+
+    let safety_case = install_artifact_failure_safety_case(operation_id, mode, phase, evidence);
+    let decision = decide_guardian_policy(&safety_case, GuardianPolicyContext::current_operation());
+    if decision.kind != GuardianDecisionKind::Repair {
+        return Err(GuardianInstallArtifactRepairPlanRejection::PolicyDidNotSelectRepair);
+    }
+
+    match plan_kind {
+        GuardianInstallArtifactRepairPlanKind::ExistingArtifact => {
+            plan_launcher_managed_artifact_repair(&decision, Default::default())
+        }
+        GuardianInstallArtifactRepairPlanKind::MissingArtifact => {
+            plan_launcher_managed_missing_artifact_repair(&decision, Default::default())
+        }
+    }
+    .map_err(GuardianInstallArtifactRepairPlanRejection::RepairPlan)
+}
+
 fn install_failure_kind_for_minecraft_download_fact(
     kind: MinecraftDownloadFactKind,
 ) -> Option<GuardianInstallArtifactFailureKind> {
     match kind {
+        MinecraftDownloadFactKind::ArtifactMissing => {
+            Some(GuardianInstallArtifactFailureKind::ArtifactMissing)
+        }
         MinecraftDownloadFactKind::ChecksumMismatch => {
             Some(GuardianInstallArtifactFailureKind::ChecksumMismatch)
         }
@@ -132,10 +251,14 @@ fn install_failure_kind_for_minecraft_download_fact(
         MinecraftDownloadFactKind::NetworkFailure | MinecraftDownloadFactKind::Interrupted => {
             Some(GuardianInstallArtifactFailureKind::NetworkFailure)
         }
-        MinecraftDownloadFactKind::PermissionFailure
-        | MinecraftDownloadFactKind::PromoteFailed
-        | MinecraftDownloadFactKind::TempWriteFailed => {
+        MinecraftDownloadFactKind::PermissionFailure => {
             Some(GuardianInstallArtifactFailureKind::PermissionDenied)
+        }
+        MinecraftDownloadFactKind::TempWriteFailed => {
+            Some(GuardianInstallArtifactFailureKind::TempWriteFailed)
+        }
+        MinecraftDownloadFactKind::PromoteFailed => {
+            Some(GuardianInstallArtifactFailureKind::PromotionFailed)
         }
         MinecraftDownloadFactKind::OwnershipRefused => {
             Some(GuardianInstallArtifactFailureKind::OwnershipRefused)
@@ -168,6 +291,15 @@ fn execution_kind_for_install_failure(
         GuardianInstallArtifactFailureKind::PermissionDenied => {
             ExecutionFactKind::FilePermissionDenied
         }
+        GuardianInstallArtifactFailureKind::TempWriteFailed => {
+            ExecutionFactKind::DownloadTempWriteFailed
+        }
+        GuardianInstallArtifactFailureKind::PromotionFailed => {
+            ExecutionFactKind::DownloadPromotionFailed
+        }
+        GuardianInstallArtifactFailureKind::DependencyFailed => {
+            ExecutionFactKind::InstallDependencyFailed
+        }
         GuardianInstallArtifactFailureKind::OwnershipRefused => ExecutionFactKind::PrimitiveRefused,
     }
 }
@@ -193,7 +325,8 @@ fn public_safe_install_fields(fields: &[(String, String)]) -> Vec<EvidenceField>
 
 fn install_field_key_looks_sensitive(key: &str) -> bool {
     let key = key.trim().to_ascii_lowercase();
-    key.contains("user")
+    evidence_text_looks_sensitive(&key)
+        || key.contains("user")
         || key.contains("account")
         || key.contains("uuid")
         || key.contains("token")
@@ -208,8 +341,10 @@ fn install_field_key_looks_sensitive(key: &str) -> bool {
 mod tests {
     use super::{
         GuardianInstallArtifactFailureEvidence, GuardianInstallArtifactFailureKind,
+        GuardianInstallArtifactRepairPlanKind,
         install_artifact_failure_from_minecraft_download_fact,
-        install_artifact_failure_guardian_fact, install_artifact_failure_safety_case,
+        install_artifact_failure_guardian_fact, install_artifact_failure_guardian_outcome,
+        install_artifact_failure_safety_case, plan_install_artifact_failure_repair,
     };
     use crate::guardian::{GuardianActionKind, GuardianMode};
     use crate::state::contracts::{OperationId, OperationPhase, OwnershipClass};
@@ -258,6 +393,39 @@ mod tests {
     }
 
     #[test]
+    fn install_artifact_repair_plan_is_selected_by_guardian_policy() {
+        let evidence = GuardianInstallArtifactFailureEvidence::launcher_managed(
+            Some(OperationId::new("install-operation-1")),
+            "minecraft_client_1.21.5",
+            GuardianInstallArtifactFailureKind::ChecksumMismatch,
+        );
+
+        let plan = plan_install_artifact_failure_repair(
+            Some(OperationId::new("install-operation-1")),
+            GuardianMode::Managed,
+            OperationPhase::Downloading,
+            &[evidence],
+            GuardianInstallArtifactRepairPlanKind::ExistingArtifact,
+        )
+        .expect("Guardian policy selects managed artifact repair");
+
+        assert_eq!(
+            plan.diagnosis_id.as_str(),
+            "launcher_managed_artifact_corrupt"
+        );
+        assert_eq!(plan.target.id, "minecraft_client_1.21.5");
+        assert!(plan.tasks.iter().any(|task| {
+            task.id == "quarantine_launcher_managed_target"
+                && task.action == GuardianActionKind::Quarantine
+        }));
+        assert!(
+            plan.tasks
+                .iter()
+                .any(|task| task.id == "promote_verified_artifact")
+        );
+    }
+
+    #[test]
     fn structured_install_failures_map_to_bounded_diagnoses() {
         let cases = [
             (
@@ -283,6 +451,18 @@ mod tests {
             (
                 GuardianInstallArtifactFailureKind::PermissionDenied,
                 "filesystem_permission_denied",
+            ),
+            (
+                GuardianInstallArtifactFailureKind::TempWriteFailed,
+                "temp_file_leftover",
+            ),
+            (
+                GuardianInstallArtifactFailureKind::PromotionFailed,
+                "atomic_promotion_failed",
+            ),
+            (
+                GuardianInstallArtifactFailureKind::DependencyFailed,
+                "install_dependency_failed",
             ),
             (
                 GuardianInstallArtifactFailureKind::OwnershipRefused,
@@ -311,6 +491,142 @@ mod tests {
                 safety_case.diagnoses
             );
         }
+    }
+
+    #[test]
+    fn provider_and_network_failures_produce_guardian_user_outcome_without_repair() {
+        for kind in [
+            GuardianInstallArtifactFailureKind::ProviderFailure,
+            GuardianInstallArtifactFailureKind::NetworkFailure,
+        ] {
+            let evidence = GuardianInstallArtifactFailureEvidence::launcher_managed(
+                Some(OperationId::new("install-operation-1")),
+                "minecraft_client_1.21.5",
+                kind,
+            )
+            .with_field("url", "https://example.invalid/client.jar?token=secret")
+            .with_field("provider_payload", "{\"token\":\"secret\"}");
+
+            let outcome = install_artifact_failure_guardian_outcome(
+                Some(OperationId::new("install-operation-1")),
+                GuardianMode::Managed,
+                OperationPhase::Downloading,
+                &[evidence],
+            )
+            .expect("Guardian outcome");
+
+            assert_eq!(outcome.diagnosis_id.as_str(), "download_unavailable");
+            assert_eq!(
+                outcome.decision,
+                crate::guardian::GuardianDecisionKind::Retry
+            );
+            assert!(
+                outcome
+                    .user_outcome
+                    .summary
+                    .contains("download failure as retryable")
+            );
+            let encoded = serde_json::to_string(&outcome.user_outcome)
+                .expect("outcome json")
+                .to_ascii_lowercase();
+            assert!(!encoded.contains("example.invalid"));
+            assert!(!encoded.contains("provider_payload"));
+            assert!(!encoded.contains("token"));
+            assert!(!encoded.contains("secret"));
+        }
+    }
+
+    #[test]
+    fn non_repairable_install_safety_failures_block_without_repair() {
+        let cases = [
+            (
+                GuardianInstallArtifactFailureKind::MetadataInvalid,
+                "install_artifact_metadata_invalid",
+                "provider metadata could not be trusted",
+            ),
+            (
+                GuardianInstallArtifactFailureKind::PermissionDenied,
+                "filesystem_permission_denied",
+                "could not write launcher-managed files safely",
+            ),
+            (
+                GuardianInstallArtifactFailureKind::TempWriteFailed,
+                "temp_file_leftover",
+                "temporary download state could not be written safely",
+            ),
+            (
+                GuardianInstallArtifactFailureKind::PromotionFailed,
+                "atomic_promotion_failed",
+                "verified download data could not be promoted safely",
+            ),
+            (
+                GuardianInstallArtifactFailureKind::DependencyFailed,
+                "install_dependency_failed",
+                "required base install failed",
+            ),
+            (
+                GuardianInstallArtifactFailureKind::OwnershipRefused,
+                "artifact_ownership_unsafe",
+                "protect user-owned or unknown files",
+            ),
+        ];
+
+        for (kind, diagnosis_id, summary_fragment) in cases {
+            let evidence = GuardianInstallArtifactFailureEvidence::launcher_managed(
+                Some(OperationId::new("install-operation-1")),
+                "minecraft_client_1.21.5",
+                kind,
+            )
+            .with_field("path", "/Users/alice/.croopor/libraries/secret.jar")
+            .with_field("url", "https://example.invalid/client.jar?token=secret")
+            .with_field("provider_payload", "{\"token\":\"secret\"}");
+
+            let outcome = install_artifact_failure_guardian_outcome(
+                Some(OperationId::new("install-operation-1")),
+                GuardianMode::Managed,
+                OperationPhase::Downloading,
+                &[evidence],
+            )
+            .expect("Guardian outcome");
+
+            assert_eq!(outcome.diagnosis_id.as_str(), diagnosis_id);
+            assert_eq!(
+                outcome.decision,
+                crate::guardian::GuardianDecisionKind::Block
+            );
+            assert!(
+                outcome.user_outcome.summary.contains(summary_fragment),
+                "{diagnosis_id} summary did not contain expected fragment: {:?}",
+                outcome.user_outcome
+            );
+            let encoded = serde_json::to_string(&outcome.user_outcome)
+                .expect("outcome json")
+                .to_ascii_lowercase();
+            assert!(!encoded.contains("users/alice"));
+            assert!(!encoded.contains("example.invalid"));
+            assert!(!encoded.contains("provider_payload"));
+            assert!(!encoded.contains("token"));
+            assert!(!encoded.contains("secret"));
+        }
+    }
+
+    #[test]
+    fn repairable_artifact_corruption_does_not_emit_generic_install_failure_outcome() {
+        let evidence = GuardianInstallArtifactFailureEvidence::launcher_managed(
+            Some(OperationId::new("install-operation-1")),
+            "minecraft_client_1.21.5",
+            GuardianInstallArtifactFailureKind::ChecksumMismatch,
+        );
+
+        assert!(
+            install_artifact_failure_guardian_outcome(
+                Some(OperationId::new("install-operation-1")),
+                GuardianMode::Managed,
+                OperationPhase::Downloading,
+                &[evidence],
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -378,6 +694,79 @@ mod tests {
         assert!(!encoded.contains("example.invalid"));
         assert!(!encoded.contains("token"));
         assert!(!encoded.contains("secret"));
+    }
+
+    #[test]
+    fn minecraft_download_ownership_refusal_is_protected_when_caller_lacks_ownership_context() {
+        let fact = MinecraftDownloadFact {
+            kind: MinecraftDownloadFactKind::OwnershipRefused,
+            target: "minecraft_client_1.21.5".to_string(),
+            fields: Vec::new(),
+        };
+
+        let evidence = install_artifact_failure_from_minecraft_download_fact(
+            Some(OperationId::new("install-operation-1")),
+            OwnershipClass::LauncherManaged,
+            &fact,
+        )
+        .expect("failure evidence");
+
+        assert_eq!(
+            evidence.kind,
+            GuardianInstallArtifactFailureKind::OwnershipRefused
+        );
+        assert_eq!(evidence.ownership, OwnershipClass::Unknown);
+
+        let guardian_fact =
+            install_artifact_failure_guardian_fact(&evidence, OperationPhase::Downloading);
+        assert_eq!(guardian_fact.id.as_str(), "primitive_refused");
+        assert_eq!(guardian_fact.ownership, OwnershipClass::Unknown);
+    }
+
+    #[test]
+    fn minecraft_download_temp_and_promotion_failures_keep_distinct_guardian_facts() {
+        let cases = [
+            (
+                MinecraftDownloadFactKind::TempWriteFailed,
+                GuardianInstallArtifactFailureKind::TempWriteFailed,
+                "temp_file_leftover",
+            ),
+            (
+                MinecraftDownloadFactKind::PromoteFailed,
+                GuardianInstallArtifactFailureKind::PromotionFailed,
+                "atomic_promotion_failed",
+            ),
+        ];
+
+        for (download_kind, failure_kind, fact_id) in cases {
+            let fact = MinecraftDownloadFact {
+                kind: download_kind,
+                target: "minecraft_client_1.21.5".to_string(),
+                fields: vec![
+                    (
+                        "path".to_string(),
+                        "/Users/alice/.croopor/libraries/secret.jar".to_string(),
+                    ),
+                    ("phase".to_string(), "promote".to_string()),
+                ],
+            };
+
+            let evidence = install_artifact_failure_from_minecraft_download_fact(
+                Some(OperationId::new("install-operation-1")),
+                OwnershipClass::LauncherManaged,
+                &fact,
+            )
+            .expect("failure evidence");
+
+            assert_eq!(evidence.kind, failure_kind);
+            let guardian_fact =
+                install_artifact_failure_guardian_fact(&evidence, OperationPhase::Downloading);
+            assert_eq!(guardian_fact.id.as_str(), fact_id);
+            assert!(
+                guardian_fact.fields.iter().all(|field| field.key != "path"),
+                "{fact_id} leaked sensitive path field: {guardian_fact:?}"
+            );
+        }
     }
 
     #[test]

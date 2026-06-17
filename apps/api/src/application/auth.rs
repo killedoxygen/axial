@@ -45,6 +45,7 @@ pub(crate) struct AuthStatusResponse {
     minecraft_token_expires_in: Option<u64>,
     online_action: AuthActionState,
     refresh_action: AuthActionState,
+    profile_sync_action: AuthActionState,
     skin_action: AuthActionState,
     login_available: bool,
     login_reason: &'static str,
@@ -52,11 +53,15 @@ pub(crate) struct AuthStatusResponse {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct AuthActionState {
-    state_id: &'static str,
-    label: &'static str,
-    enabled: bool,
+    pub(crate) state_id: &'static str,
+    pub(crate) label: &'static str,
+    pub(crate) enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    disabled_reason: Option<&'static str>,
+    pub(crate) disabled_reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) detail: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) success_summary: Option<&'static str>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -123,6 +128,7 @@ struct AuthProfileSyncResponse {
     minecraft_ownership_verified: bool,
     minecraft_profile: AuthMinecraftProfileResponse,
     minecraft_token_expires_in: u64,
+    view_model: AuthCommandViewModel,
 }
 
 #[derive(Debug, Serialize)]
@@ -136,6 +142,12 @@ struct AuthLoginMinecraftChainErrorResponse {
 struct AuthLogoutResponse {
     status: &'static str,
     had_msa_auth: bool,
+    view_model: AuthCommandViewModel,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct AuthCommandViewModel {
+    summary: &'static str,
 }
 
 #[derive(Clone, Debug, Serialize, Eq, PartialEq)]
@@ -150,6 +162,7 @@ pub(crate) struct AuthRefreshSuccess {
     minecraft_profile: AuthMinecraftProfileResponse,
     minecraft_ownership_verified: bool,
     minecraft_token_expires_in: u64,
+    view_model: AuthCommandViewModel,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -206,7 +219,7 @@ pub(crate) async fn auth_refresh_for_state(
 pub(crate) async fn auth_profile_sync_for_state(
     state: &AppState,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let auth_chain_client = match AuthChainClient::new() {
+    let auth_chain_client = match auth_profile_sync_client_for_state(state) {
         Ok(client) => client,
         Err(error) => return auth_chain_error_response(error),
     };
@@ -230,6 +243,21 @@ pub(crate) async fn auth_profile_sync_for_state(
         }
     }
     response
+}
+
+#[cfg(test)]
+fn auth_profile_sync_client_for_state(state: &AppState) -> Result<AuthChainClient, AuthChainError> {
+    state
+        .auth_chain_client_override()
+        .map(Ok)
+        .unwrap_or_else(AuthChainClient::new)
+}
+
+#[cfg(not(test))]
+fn auth_profile_sync_client_for_state(
+    _state: &AppState,
+) -> Result<AuthChainClient, AuthChainError> {
+    AuthChainClient::new()
 }
 
 async fn auth_status_for_store(
@@ -322,6 +350,7 @@ fn auth_status_from_username(
             msa_state.refresh_available,
         ),
         refresh_action: refresh_action_state(msa_state.refresh_available, online_credentials_ready),
+        profile_sync_action: profile_sync_action_state(minecraft_state.account.as_ref()),
         skin_action: skin_action_state(launch_auth_mode, &minecraft_state, online_mode_ready),
         login_available: false,
         login_reason: LOGIN_UNAVAILABLE_REASON,
@@ -339,6 +368,8 @@ fn skin_action_state(
             label: "Online profile ready",
             enabled: true,
             disabled_reason: None,
+            detail: Some("Online profile skin and cape actions are available."),
+            success_summary: Some("Online profile actions are ready."),
         };
     }
     let disabled_reason = if launch_auth_mode != LAUNCH_AUTH_MODE_ONLINE {
@@ -360,6 +391,8 @@ fn skin_action_state(
         label: "Online profile unavailable",
         enabled: false,
         disabled_reason: Some(disabled_reason),
+        detail: Some(disabled_reason),
+        success_summary: None,
     }
 }
 
@@ -374,6 +407,8 @@ pub(crate) fn online_action_state(
             label: "Online ready",
             enabled: true,
             disabled_reason: None,
+            detail: Some("Launches can use this Microsoft account online."),
+            success_summary: Some("Microsoft account verified. Online launch is ready."),
         };
     }
     if refresh_available {
@@ -382,6 +417,8 @@ pub(crate) fn online_action_state(
             label: "Refresh available",
             enabled: true,
             disabled_reason: None,
+            detail: Some("Refresh Microsoft sign-in before using Online mode."),
+            success_summary: Some("Microsoft sign-in can be refreshed for Online mode."),
         };
     }
 
@@ -405,6 +442,8 @@ pub(crate) fn online_action_state(
         label: "Online unavailable",
         enabled: false,
         disabled_reason: Some(disabled_reason),
+        detail: Some(disabled_reason),
+        success_summary: None,
     }
 }
 
@@ -422,6 +461,10 @@ pub(crate) fn refresh_action_state(
             label: "Refresh Microsoft sign-in",
             enabled: true,
             disabled_reason: None,
+            detail: Some(
+                "Refresh the current Microsoft sign-in and Minecraft profile credentials.",
+            ),
+            success_summary: Some("Microsoft sign-in refreshed."),
         };
     }
 
@@ -430,6 +473,34 @@ pub(crate) fn refresh_action_state(
         label: "Refresh unavailable",
         enabled: false,
         disabled_reason: Some("Microsoft sign-in refresh is unavailable; sign in again."),
+        detail: Some("Microsoft sign-in refresh is unavailable; sign in again."),
+        success_summary: None,
+    }
+}
+
+pub(crate) fn profile_sync_action_state(
+    account: Option<&AuthLoginMinecraftAccount>,
+) -> AuthActionState {
+    if account.is_some_and(|account| !account.access_token.trim().is_empty()) {
+        return AuthActionState {
+            state_id: "profile_sync_available",
+            label: "Sync Minecraft profile",
+            enabled: true,
+            disabled_reason: None,
+            detail: Some(
+                "Refresh Minecraft profile and ownership from the active Microsoft account.",
+            ),
+            success_summary: Some("Minecraft profile synced."),
+        };
+    }
+
+    AuthActionState {
+        state_id: "profile_sync_unavailable",
+        label: "Profile sync unavailable",
+        enabled: false,
+        disabled_reason: Some("Minecraft profile sync needs an active Microsoft account."),
+        detail: Some("Minecraft profile sync needs an active Microsoft account."),
+        success_summary: None,
     }
 }
 
@@ -457,6 +528,13 @@ async fn auth_logout(login_store: &Arc<AuthLoginStore>) -> (StatusCode, Json<ser
                 Json(serde_json::json!(AuthLogoutResponse {
                     status: "logged_out",
                     had_msa_auth,
+                    view_model: AuthCommandViewModel {
+                        summary: if had_msa_auth {
+                            "Microsoft account signed out."
+                        } else {
+                            "No Microsoft sign-in was active."
+                        },
+                    },
                 })),
             )
         }
@@ -546,6 +624,9 @@ fn auth_refresh_success_from_active_state(
         minecraft_profile: auth_minecraft_profile_response(&minecraft_state.account.profile),
         minecraft_ownership_verified: minecraft_state.account.owns_minecraft_java,
         minecraft_token_expires_in: minecraft_state.token_expires_in,
+        view_model: AuthCommandViewModel {
+            summary: "Microsoft sign-in refreshed.",
+        },
     }
 }
 
@@ -594,6 +675,9 @@ async fn auth_profile_sync(
             minecraft_ownership_verified: updated.account.owns_minecraft_java,
             minecraft_profile: auth_minecraft_profile_response(&updated.account.profile),
             minecraft_token_expires_in: updated.token_expires_in,
+            view_model: AuthCommandViewModel {
+                summary: "Minecraft profile synced.",
+            },
         })),
     )
 }

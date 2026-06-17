@@ -2,7 +2,7 @@ import type { JSX } from 'preact';
 import { Card } from '../../../ui/Atoms';
 import { versionById } from '../../../store';
 import { minecraftVersionLabel } from '../../../version-display';
-import type { EnrichedInstance } from '../../../types';
+import type { EnrichedInstance } from '../../../types-instance';
 import { loaderKeyFromVersion, LOADER_LABELS } from '../../create/defaults';
 import { fmtJoined, fmtRelative } from '../format';
 

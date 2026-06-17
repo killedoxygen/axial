@@ -1,4 +1,4 @@
-use crate::download::DownloadError;
+use crate::download::{DownloadError, ExecutionDownloadFact, SelectedDownloadArtifactDescriptor};
 use crate::types::VersionSubjectKind;
 use crate::version_meta::MinecraftVersionMeta;
 use chrono::Utc;
@@ -172,6 +172,8 @@ pub struct LoaderAvailability {
     pub last_success_at_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_failure_kind: Option<LoaderInstallFailureKind>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -281,13 +283,70 @@ pub enum LoaderInstallFailureKind {
     BuildNotFound,
     ArtifactMissing,
     InvalidProfile,
+    ProviderHttpFailure,
+    ProviderNetworkFailure,
+    ProviderRateLimited,
+    ProviderResponseTooLarge,
+    ProviderSchemaInvalid,
     ProcessorFailed,
     VerifyFailed,
+    BaseInstallFailed,
     RequestFailed,
     DownloadFailed,
     IoFailed,
     ParseFailed,
     Other,
+}
+
+impl LoaderInstallFailureKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CatalogUnavailable => "catalog_unavailable",
+            Self::BuildNotFound => "build_not_found",
+            Self::ArtifactMissing => "artifact_missing",
+            Self::InvalidProfile => "invalid_profile",
+            Self::ProviderHttpFailure => "provider_http_failure",
+            Self::ProviderNetworkFailure => "provider_network_failure",
+            Self::ProviderRateLimited => "provider_rate_limited",
+            Self::ProviderResponseTooLarge => "provider_response_too_large",
+            Self::ProviderSchemaInvalid => "provider_schema_invalid",
+            Self::ProcessorFailed => "processor_failed",
+            Self::VerifyFailed => "verify_failed",
+            Self::BaseInstallFailed => "base_install_failed",
+            Self::RequestFailed => "request_failed",
+            Self::DownloadFailed => "download_failed",
+            Self::IoFailed => "io_failed",
+            Self::ParseFailed => "parse_failed",
+            Self::Other => "other",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoaderProviderFailureKind {
+    Network,
+    Timeout,
+    HttpNotFound,
+    HttpRateLimited,
+    HttpServer,
+    HttpStatus,
+    ResponseTooLarge,
+    SchemaInvalid,
+}
+
+impl LoaderProviderFailureKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Network => "network",
+            Self::Timeout => "timeout",
+            Self::HttpNotFound => "http_not_found",
+            Self::HttpRateLimited => "http_rate_limited",
+            Self::HttpServer => "http_server",
+            Self::HttpStatus => "http_status",
+            Self::ResponseTooLarge => "response_too_large",
+            Self::SchemaInvalid => "schema_invalid",
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -308,8 +367,23 @@ pub enum LoaderError {
     ArtifactMissing(String),
     #[error("loader profile is invalid: {0}")]
     InvalidProfile(String),
+    #[error("loader provider is unavailable: {kind:?}")]
+    ProviderUnavailable {
+        kind: LoaderProviderFailureKind,
+        status: Option<u16>,
+    },
+    #[error("loader provider data is invalid: {kind:?}")]
+    ProviderDataInvalid {
+        kind: LoaderProviderFailureKind,
+        status: Option<u16>,
+    },
     #[error("loader install verification failed: {0}")]
     Verify(String),
+    #[error("base Minecraft install failed")]
+    BaseInstallFailed {
+        facts: Vec<ExecutionDownloadFact>,
+        descriptors: Vec<SelectedDownloadArtifactDescriptor>,
+    },
     #[error("request failed: {0}")]
     Request(#[from] reqwest::Error),
     #[error("download failed: {0}")]
@@ -329,7 +403,46 @@ impl LoaderError {
             Self::BuildNotFound(_) => LoaderInstallFailureKind::BuildNotFound,
             Self::ArtifactMissing(_) => LoaderInstallFailureKind::ArtifactMissing,
             Self::InvalidProfile(_) => LoaderInstallFailureKind::InvalidProfile,
+            Self::ProviderUnavailable { kind, .. } => match kind {
+                LoaderProviderFailureKind::Timeout | LoaderProviderFailureKind::Network => {
+                    LoaderInstallFailureKind::ProviderNetworkFailure
+                }
+                LoaderProviderFailureKind::HttpRateLimited => {
+                    LoaderInstallFailureKind::ProviderRateLimited
+                }
+                LoaderProviderFailureKind::HttpServer
+                | LoaderProviderFailureKind::HttpStatus
+                | LoaderProviderFailureKind::HttpNotFound => {
+                    LoaderInstallFailureKind::ProviderHttpFailure
+                }
+                LoaderProviderFailureKind::ResponseTooLarge => {
+                    LoaderInstallFailureKind::ProviderResponseTooLarge
+                }
+                LoaderProviderFailureKind::SchemaInvalid => {
+                    LoaderInstallFailureKind::ProviderSchemaInvalid
+                }
+            },
+            Self::ProviderDataInvalid { kind, .. } => match kind {
+                LoaderProviderFailureKind::ResponseTooLarge => {
+                    LoaderInstallFailureKind::ProviderResponseTooLarge
+                }
+                LoaderProviderFailureKind::SchemaInvalid => {
+                    LoaderInstallFailureKind::ProviderSchemaInvalid
+                }
+                LoaderProviderFailureKind::HttpRateLimited => {
+                    LoaderInstallFailureKind::ProviderRateLimited
+                }
+                LoaderProviderFailureKind::Timeout | LoaderProviderFailureKind::Network => {
+                    LoaderInstallFailureKind::ProviderNetworkFailure
+                }
+                LoaderProviderFailureKind::HttpServer
+                | LoaderProviderFailureKind::HttpStatus
+                | LoaderProviderFailureKind::HttpNotFound => {
+                    LoaderInstallFailureKind::ProviderHttpFailure
+                }
+            },
             Self::Verify(_) => LoaderInstallFailureKind::VerifyFailed,
+            Self::BaseInstallFailed { .. } => LoaderInstallFailureKind::BaseInstallFailed,
             Self::Request(_) => LoaderInstallFailureKind::RequestFailed,
             Self::Download(_) => LoaderInstallFailureKind::DownloadFailed,
             Self::Parse(_) => LoaderInstallFailureKind::ParseFailed,
@@ -340,6 +453,28 @@ impl LoaderError {
             | Self::MissingLibraryDir
             | Self::Other(_) => LoaderInstallFailureKind::Other,
         }
+    }
+
+    pub fn provider_failure_kind(&self) -> Option<LoaderProviderFailureKind> {
+        match self {
+            Self::ProviderUnavailable { kind, .. } | Self::ProviderDataInvalid { kind, .. } => {
+                Some(*kind)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn provider_status(&self) -> Option<u16> {
+        match self {
+            Self::ProviderUnavailable { status, .. } | Self::ProviderDataInvalid { status, .. } => {
+                *status
+            }
+            _ => None,
+        }
+    }
+
+    pub fn safe_status_label(&self) -> &'static str {
+        self.failure_kind().as_str()
     }
 }
 

@@ -10,6 +10,10 @@ use crate::observability::{
 use crate::state::contracts::{OperationId, StabilizationSystem, TargetDescriptor, TargetKind};
 use crate::state::ownership::{classify_managed_runtime_root, protection_for};
 use croopor_config::AppPaths;
+use croopor_minecraft::{
+    JavaRuntimeLookupError, RuntimeOverride, parse_runtime_override,
+    runtime_executable_ready_without_probe,
+};
 use std::fmt;
 use std::fs;
 use std::path::Path;
@@ -275,6 +279,7 @@ pub trait JavaProbeRunner {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeProbeFailure {
     SpawnFailed,
+    TimedOut,
     OutputParseFailed,
     Unknown,
 }
@@ -289,7 +294,10 @@ impl JavaProbeRunner for CoreJavaProbeRunner {
     ) -> Result<RuntimeProbeInfo, RuntimeProbeFailure> {
         croopor_minecraft::probe_java_runtime_info(java_path, id_hint)
             .map(|info| RuntimeProbeInfo::new(info.id, info.major, info.update, info.distribution))
-            .map_err(|_| RuntimeProbeFailure::SpawnFailed)
+            .map_err(|error| match error {
+                JavaRuntimeLookupError::ProbeTimedOut => RuntimeProbeFailure::TimedOut,
+                _ => RuntimeProbeFailure::SpawnFailed,
+            })
     }
 }
 
@@ -323,6 +331,15 @@ pub fn inspect_java_override_value(
                 trimmed.to_ascii_lowercase(),
                 EvidenceSensitivity::Public,
             )],
+        ));
+    } else if let RuntimeOverride::ExecutablePath(path) = parse_runtime_override(trimmed)
+        && !runtime_executable_ready_without_probe(&path)
+    {
+        facts.push(runtime_fact(
+            ExecutionFactKind::RuntimeMissingExecutable,
+            operation_id,
+            &target,
+            Vec::new(),
         ));
     }
 
@@ -483,7 +500,7 @@ pub fn verify_managed_runtime(
         return Err(RuntimeCapabilityError::new(kind, facts));
     }
 
-    if !request.java_executable.is_file() {
+    if !runtime_executable_ready_without_probe(request.java_executable) {
         facts.push(runtime_fact(
             ExecutionFactKind::RuntimeMissingExecutable,
             request.operation_id.clone(),
@@ -691,6 +708,7 @@ fn sanitize_runtime_token(value: &str, fallback: &str) -> String {
 fn probe_failure_label(failure: RuntimeProbeFailure) -> &'static str {
     match failure {
         RuntimeProbeFailure::SpawnFailed => "spawn_failed",
+        RuntimeProbeFailure::TimedOut => "timed_out",
         RuntimeProbeFailure::OutputParseFailed => "output_parse_failed",
         RuntimeProbeFailure::Unknown => "unknown",
     }
@@ -758,6 +776,30 @@ mod tests {
             &error.facts,
             ExecutionFactKind::RuntimeProbeFailed
         ));
+        assert_no_sensitive_runtime_material(&error.facts);
+        cleanup(&root);
+    }
+
+    #[test]
+    fn probe_timeout_emits_bounded_probe_failure_reason() {
+        let root = test_root("probe-timeout");
+        let java_path = write_fake_java(&root);
+        let target =
+            classify_current_artifact(CurrentArtifact::UserJavaOverride, "manual_java").target;
+
+        let error = probe_java_runtime_with_runner(
+            RuntimeProbeRequest::new(target, &java_path).with_id_hint("java-runtime-delta"),
+            &TimedOutProbe,
+        )
+        .expect_err("probe timeout should fail");
+
+        assert_eq!(error.kind, RuntimeCapabilityErrorKind::ProbeFailed);
+        assert!(has_fact(
+            &error.facts,
+            ExecutionFactKind::RuntimeProbeFailed
+        ));
+        let encoded = serde_json::to_string(&error.facts).expect("facts json");
+        assert!(encoded.contains("timed_out"));
         assert_no_sensitive_runtime_material(&error.facts);
         cleanup(&root);
     }
@@ -899,16 +941,40 @@ mod tests {
     }
 
     #[test]
-    fn absent_or_real_java_override_values_do_not_emit_sentinel_facts() {
+    fn missing_java_override_path_emits_missing_executable_fact_without_raw_path() {
         let target = user_java_override_target("instance_java_override");
+        let inspection = inspect_java_override_value(
+            None,
+            target.clone(),
+            "/Users/SecretUser/.jdks/missing/bin/java",
+        );
 
-        for raw_value in ["", "/opt/java/bin/java", r"C:\Tools\Java\bin\java.exe"] {
+        assert_eq!(inspection.target, target);
+        assert!(has_fact(
+            &inspection.facts,
+            ExecutionFactKind::RuntimeMissingExecutable
+        ));
+        assert_no_sensitive_runtime_material(&inspection.facts);
+    }
+
+    #[test]
+    fn absent_component_or_existing_java_override_values_do_not_emit_override_facts() {
+        let target = user_java_override_target("instance_java_override");
+        let root = test_root("existing-java-override");
+        let java_path = write_fake_java(&root);
+
+        for raw_value in [
+            "",
+            "java-runtime-delta",
+            java_path.to_string_lossy().as_ref(),
+        ] {
             let inspection = inspect_java_override_value(None, target.clone(), raw_value);
 
             assert!(inspection.facts.is_empty());
         }
         assert!(java_override_is_undefined_sentinel(" null "));
         assert!(!java_override_is_undefined_sentinel("/opt/null/bin/java"));
+        cleanup(&root);
     }
 
     #[test]
@@ -1117,6 +1183,7 @@ mod tests {
         let java_path = runtime_root_path.join("bin").join("java");
         fs::create_dir_all(java_path.parent().expect("java parent")).expect("runtime bin");
         fs::write(&java_path, b"java").expect("fake java");
+        make_executable(&java_path);
         fs::create_dir_all(runtime_root_path.join(".croopor-ready")).expect("bad marker dir");
         let runtime_root = runtime_root_binding(&paths, &runtime_root_path, &java_path);
 
@@ -1237,6 +1304,18 @@ mod tests {
         }
     }
 
+    struct TimedOutProbe;
+
+    impl JavaProbeRunner for TimedOutProbe {
+        fn probe(
+            &self,
+            _java_path: &Path,
+            _id_hint: Option<&str>,
+        ) -> Result<RuntimeProbeInfo, RuntimeProbeFailure> {
+            Err(RuntimeProbeFailure::TimedOut)
+        }
+    }
+
     fn has_fact(facts: &[crate::execution::ExecutionFact], kind: ExecutionFactKind) -> bool {
         facts.iter().any(|fact| fact.kind == kind)
     }
@@ -1275,8 +1354,21 @@ mod tests {
         let java_path = root.join("secret-user").join("bin").join("java");
         fs::create_dir_all(java_path.parent().expect("java parent")).expect("java parent");
         fs::write(&java_path, b"java").expect("fake java");
+        make_executable(&java_path);
         java_path
     }
+
+    #[cfg(unix)]
+    fn make_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(path).expect("java metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("java executable");
+    }
+
+    #[cfg(not(unix))]
+    fn make_executable(_path: &Path) {}
 
     fn test_paths(root: &Path) -> AppPaths {
         AppPaths {

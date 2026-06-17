@@ -1,5 +1,5 @@
 import { api } from '../../api';
-import type { InstanceResourceSummary, InstanceLogTail } from '../../types';
+import type { InstanceResourceSummary, InstanceLogTail } from '../../types-instance';
 
 export type InstanceLogEntry = InstanceResourceSummary['logs'][number];
 export type LogFilter = 'all' | 'important' | 'errors' | 'warnings' | 'system-info';

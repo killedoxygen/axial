@@ -1,9 +1,10 @@
-import { installFailure, installQueue, installState } from './store';
+import { installFailure, installQueueState, installState } from './store';
 import { isSameInstallItem } from './actions';
-import { formatInstallItemLabel } from './install-labels';
 import { minecraftVersionLabel } from './version-display';
 import type { InstallFailure } from './store';
-import type { EnrichedInstance, InstallItem, Version } from './types';
+import type { Version } from './types-version';
+import type { InstallItem, InstallQueuedItemViewModel } from './types-install';
+import type { EnrichedInstance } from './types-instance';
 
 export type InstanceInstallCandidate = Pick<EnrichedInstance, 'version_id'> &
   Partial<Pick<EnrichedInstance, 'needs_install'>>;
@@ -23,9 +24,7 @@ export type InstanceInstallStatus = {
   installing: boolean;
   label: string;
   progress: InstanceInstallProgress | null;
-  queuedItem?: InstallItem;
-  queuePosition?: number;
-  queueCount?: number;
+  queuedItem?: InstallQueuedItemViewModel;
   failure: InstallFailure | null;
 };
 
@@ -52,6 +51,20 @@ function matchesInstanceInstall(candidate: InstallItem, expected: InstallItem): 
   return candidate.versionId === expected.versionId;
 }
 
+function installItemFromQueuedViewModel(item: InstallQueuedItemViewModel): InstallItem {
+  const versionId = item.install_item.version_id;
+  if (!item.install_item.loader) return { versionId };
+  return {
+    versionId,
+    loader: {
+      componentId: item.install_item.loader.component_id,
+      buildId: item.install_item.loader.build_id,
+      minecraftVersion: item.install_item.loader.minecraft_version,
+      loaderVersion: item.install_item.loader.loader_version,
+    },
+  };
+}
+
 export function instanceInstallStatus(
   inst: InstanceInstallCandidate,
   version: Version | undefined,
@@ -61,13 +74,18 @@ export function instanceInstallStatus(
   const activeInstall =
     install.status === 'active' && matchesInstanceInstall(install.item, expectedItem) ? install : undefined;
   const activeItem = activeInstall?.item;
-  const queuedIndex = installQueue.value.findIndex((candidate) => matchesInstanceInstall(candidate, expectedItem));
-  const queuedItem = queuedIndex >= 0 ? installQueue.value[queuedIndex] : undefined;
+  const queuedItem = installQueueState.value.items.find((candidate) =>
+    matchesInstanceInstall(installItemFromQueuedViewModel(candidate), expectedItem),
+  );
   const failure =
     installFailure.value && matchesInstanceInstall(installFailure.value.item, expectedItem)
       ? installFailure.value
       : null;
-  const item = activeItem ?? queuedItem ?? failure?.item ?? expectedItem;
+  const item =
+    activeItem ??
+    (queuedItem ? installItemFromQueuedViewModel(queuedItem) : undefined) ??
+    failure?.item ??
+    expectedItem;
   const progress = activeItem
     ? {
         pct: activeInstall.pct,
@@ -78,8 +96,7 @@ export function instanceInstallStatus(
       }
     : null;
   const state = progress ? 'active' : queuedItem ? 'queued' : failure ? 'failed' : 'idle';
-  const label =
-    progress?.displayName || (queuedItem ? formatInstallItemLabel(queuedItem) : failure?.displayName || item.versionId);
+  const label = progress?.displayName || queuedItem?.label || failure?.displayName || item.versionId;
 
   return {
     item,
@@ -89,8 +106,6 @@ export function instanceInstallStatus(
     label,
     progress,
     queuedItem,
-    queuePosition: queuedItem ? queuedIndex + 1 : undefined,
-    queueCount: queuedItem ? installQueue.value.length : undefined,
     failure,
   };
 }

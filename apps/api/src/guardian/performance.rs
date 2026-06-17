@@ -1,12 +1,14 @@
 use super::{
-    FactReliability, GuardianConfidence, GuardianDomain, GuardianFact, GuardianFactId,
-    GuardianSeverity,
+    FactReliability, GuardianConfidence, GuardianDecision, GuardianDecisionKind, GuardianDomain,
+    GuardianFact, GuardianFactId, GuardianMode, GuardianPolicyContext, GuardianSeverity,
+    build_safety_case, decide_guardian_policy,
 };
 use crate::observability::{
     EvidenceField, EvidenceSensitivity, RedactionAudience, sanitize_evidence_token,
 };
 use crate::state::contracts::{
-    OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
+    OperationId, OperationPhase, OwnershipClass, RollbackState, StabilizationSystem,
+    TargetDescriptor, TargetKind,
 };
 use crate::state::failure_memory::GuardianFailureMemoryEntry;
 use crate::state::ownership::{CurrentArtifact, classify_current_artifact};
@@ -14,6 +16,111 @@ use croopor_performance::{
     BundleHealth, CompositionPlan, PerformanceRulesStatus, RuleSource, RulesCacheState,
     RulesValidation, StateError,
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuardianPerformanceOperationKind {
+    ApplyManagedComposition,
+    RemoveManagedComposition,
+    RollbackManagedComposition,
+}
+
+#[derive(Clone, Debug)]
+pub struct GuardianPerformanceSupervisionRequest<'a> {
+    pub operation_id: Option<OperationId>,
+    pub mode: GuardianMode,
+    pub phase: OperationPhase,
+    pub operation: GuardianPerformanceOperationKind,
+    pub target: TargetDescriptor,
+    pub facts: &'a [GuardianFact],
+    pub fallback_chain_len: usize,
+    pub rollback_state: RollbackState,
+    pub context: GuardianPolicyContext,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GuardianPerformanceSupervisionPlan {
+    pub operation: GuardianPerformanceOperationKind,
+    pub target: TargetDescriptor,
+    pub decision: GuardianDecision,
+    pub fact_ids: Vec<String>,
+    pub fallback_authorized: bool,
+    pub rollback_authorized: bool,
+    pub max_fallback_attempts: usize,
+    pub public_summary: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuardianPerformanceSupervisionRejection {
+    UnsafeOwnership,
+    MissingJournal,
+    UnsafePublicBoundary,
+    GuardianBlocked,
+    FallbackUnavailable,
+    RollbackUnavailable,
+}
+
+pub fn plan_performance_supervision(
+    request: GuardianPerformanceSupervisionRequest<'_>,
+) -> Result<GuardianPerformanceSupervisionPlan, GuardianPerformanceSupervisionRejection> {
+    if !request.context.public_redaction_ready {
+        return Err(GuardianPerformanceSupervisionRejection::UnsafePublicBoundary);
+    }
+    if !request.context.journal_available {
+        return Err(GuardianPerformanceSupervisionRejection::MissingJournal);
+    }
+    if request.target.ownership != OwnershipClass::CompositionManaged {
+        return Err(GuardianPerformanceSupervisionRejection::UnsafeOwnership);
+    }
+    let decision = if request.facts.is_empty() {
+        GuardianDecision {
+            operation_id: request.operation_id.clone(),
+            mode: request.mode,
+            kind: GuardianDecisionKind::Allow,
+            diagnoses: Vec::new(),
+            action_plan: None,
+        }
+    } else {
+        let safety_case = build_safety_case(
+            request.operation_id.clone(),
+            request.mode,
+            request.phase,
+            request.facts,
+        );
+        decide_guardian_policy(&safety_case, request.context)
+    };
+
+    if !performance_supervision_allows(request.operation, decision.kind) {
+        return Err(GuardianPerformanceSupervisionRejection::GuardianBlocked);
+    }
+    if matches!(
+        decision.kind,
+        GuardianDecisionKind::Fallback | GuardianDecisionKind::Degrade
+    ) && request.fallback_chain_len == 0
+    {
+        return Err(GuardianPerformanceSupervisionRejection::FallbackUnavailable);
+    }
+
+    Ok(GuardianPerformanceSupervisionPlan {
+        operation: request.operation,
+        target: request.target,
+        decision,
+        fact_ids: request
+            .facts
+            .iter()
+            .map(|fact| fact.id.as_str().to_string())
+            .collect(),
+        fallback_authorized: matches!(
+            request.operation,
+            GuardianPerformanceOperationKind::ApplyManagedComposition
+        ) && request.fallback_chain_len > 0,
+        rollback_authorized: matches!(
+            request.operation,
+            GuardianPerformanceOperationKind::RollbackManagedComposition
+        ) && request.rollback_state == RollbackState::Available,
+        max_fallback_attempts: request.fallback_chain_len,
+        public_summary: performance_supervision_summary(request.operation),
+    })
+}
 
 pub fn performance_rules_guardian_facts(
     status: &PerformanceRulesStatus,
@@ -209,6 +316,49 @@ fn composition_target(composition_id: &str) -> TargetDescriptor {
     )
 }
 
+fn performance_supervision_allows(
+    operation: GuardianPerformanceOperationKind,
+    decision: GuardianDecisionKind,
+) -> bool {
+    match operation {
+        GuardianPerformanceOperationKind::ApplyManagedComposition => matches!(
+            decision,
+            GuardianDecisionKind::Allow
+                | GuardianDecisionKind::RecordOnly
+                | GuardianDecisionKind::Warn
+                | GuardianDecisionKind::Fallback
+                | GuardianDecisionKind::Degrade
+        ),
+        GuardianPerformanceOperationKind::RemoveManagedComposition => matches!(
+            decision,
+            GuardianDecisionKind::Allow
+                | GuardianDecisionKind::RecordOnly
+                | GuardianDecisionKind::Warn
+        ),
+        GuardianPerformanceOperationKind::RollbackManagedComposition => matches!(
+            decision,
+            GuardianDecisionKind::Allow
+                | GuardianDecisionKind::RecordOnly
+                | GuardianDecisionKind::Warn
+                | GuardianDecisionKind::Rollback
+        ),
+    }
+}
+
+fn performance_supervision_summary(operation: GuardianPerformanceOperationKind) -> String {
+    match operation {
+        GuardianPerformanceOperationKind::ApplyManagedComposition => {
+            "guardian_supervised_performance_apply".to_string()
+        }
+        GuardianPerformanceOperationKind::RemoveManagedComposition => {
+            "guardian_supervised_performance_remove".to_string()
+        }
+        GuardianPerformanceOperationKind::RollbackManagedComposition => {
+            "guardian_supervised_performance_rollback".to_string()
+        }
+    }
+}
+
 fn token_field(key: impl Into<String>, value: impl AsRef<str>) -> EvidenceField {
     let sanitized = sanitize_evidence_token(value.as_ref(), RedactionAudience::UserVisible, 96)
         .unwrap_or_else(|| "redacted".to_string());
@@ -218,16 +368,19 @@ fn token_field(key: impl Into<String>, value: impl AsRef<str>) -> EvidenceField 
 #[cfg(test)]
 mod tests {
     use super::{
-        performance_failure_memory_guardian_fact, performance_health_guardian_facts,
-        performance_plan_guardian_facts, performance_rules_guardian_facts,
-        performance_state_error_guardian_fact,
+        GuardianPerformanceOperationKind, GuardianPerformanceSupervisionRejection,
+        GuardianPerformanceSupervisionRequest, performance_failure_memory_guardian_fact,
+        performance_health_guardian_facts, performance_plan_guardian_facts,
+        performance_rules_guardian_facts, performance_state_error_guardian_fact,
+        plan_performance_supervision,
     };
     use crate::guardian::{
-        GuardianActionKind, GuardianConfidence, GuardianDomain, GuardianMode, GuardianSeverity,
-        diagnose_facts,
+        GuardianActionKind, GuardianConfidence, GuardianDecisionKind, GuardianDomain, GuardianMode,
+        GuardianPolicyContext, GuardianSeverity, diagnose_facts,
     };
     use crate::state::contracts::{
-        OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
+        OperationPhase, OwnershipClass, RollbackState, StabilizationSystem, TargetDescriptor,
+        TargetKind,
     };
     use crate::state::failure_memory::GuardianFailureMemoryEntry;
     use croopor_performance::types::VersionFamily;
@@ -376,5 +529,93 @@ mod tests {
         assert_eq!(fact.severity, Some(GuardianSeverity::Degraded));
         assert_eq!(fact.confidence, Some(GuardianConfidence::High));
         assert_eq!(fact.ownership, OwnershipClass::CompositionManaged);
+    }
+
+    #[test]
+    fn performance_supervision_authorizes_managed_fallback_envelope() {
+        let plan = CompositionPlan {
+            composition_id: "family-f-fabric-core".to_string(),
+            family: VersionFamily::F,
+            loader: "fabric".to_string(),
+            mode: PerformanceMode::Managed,
+            tier: CompositionTier::Core,
+            mods: Vec::new(),
+            jvm_preset: String::new(),
+            fallback_chain: vec!["family-f-vanilla-enhanced".to_string()],
+            warnings: Vec::new(),
+            fallback_reason: "A faster performance bundle is not compatible.".to_string(),
+        };
+        let facts = performance_plan_guardian_facts(&plan, OperationPhase::Installing);
+
+        let supervision = plan_performance_supervision(GuardianPerformanceSupervisionRequest {
+            operation_id: None,
+            mode: GuardianMode::Managed,
+            phase: OperationPhase::Installing,
+            operation: GuardianPerformanceOperationKind::ApplyManagedComposition,
+            target: performance_target("family-f-fabric-core", OwnershipClass::CompositionManaged),
+            facts: &facts,
+            fallback_chain_len: plan.fallback_chain.len(),
+            rollback_state: RollbackState::Available,
+            context: GuardianPolicyContext::current_operation(),
+        })
+        .expect("fallback supervision plan");
+
+        assert_eq!(supervision.decision.kind, GuardianDecisionKind::Warn);
+        assert!(supervision.fallback_authorized);
+        assert_eq!(supervision.max_fallback_attempts, 1);
+        assert_eq!(supervision.fact_ids, vec!["performance_fallback_selected"]);
+        assert_eq!(
+            supervision.public_summary,
+            "guardian_supervised_performance_apply"
+        );
+    }
+
+    #[test]
+    fn performance_supervision_rejects_user_owned_mutation_target() {
+        let error = plan_performance_supervision(GuardianPerformanceSupervisionRequest {
+            operation_id: None,
+            mode: GuardianMode::Managed,
+            phase: OperationPhase::Installing,
+            operation: GuardianPerformanceOperationKind::ApplyManagedComposition,
+            target: performance_target("user-mods", OwnershipClass::UserOwned),
+            facts: &[],
+            fallback_chain_len: 0,
+            rollback_state: RollbackState::Unavailable,
+            context: GuardianPolicyContext::current_operation(),
+        })
+        .expect_err("user-owned performance mutation should reject");
+
+        assert_eq!(
+            error,
+            GuardianPerformanceSupervisionRejection::UnsafeOwnership
+        );
+    }
+
+    #[test]
+    fn performance_supervision_marks_unavailable_rollback_without_blocking_preflight_error() {
+        let supervision = plan_performance_supervision(GuardianPerformanceSupervisionRequest {
+            operation_id: None,
+            mode: GuardianMode::Managed,
+            phase: OperationPhase::RollingBack,
+            operation: GuardianPerformanceOperationKind::RollbackManagedComposition,
+            target: performance_target("family-f-fabric-core", OwnershipClass::CompositionManaged),
+            facts: &[],
+            fallback_chain_len: 0,
+            rollback_state: RollbackState::Unavailable,
+            context: GuardianPolicyContext::current_operation(),
+        })
+        .expect("rollback supervision plan");
+
+        assert!(!supervision.rollback_authorized);
+        assert_eq!(supervision.decision.kind, GuardianDecisionKind::Allow);
+    }
+
+    fn performance_target(id: &str, ownership: OwnershipClass) -> TargetDescriptor {
+        TargetDescriptor::new(
+            StabilizationSystem::Performance,
+            TargetKind::PerformanceComposition,
+            id,
+            ownership,
+        )
     }
 }

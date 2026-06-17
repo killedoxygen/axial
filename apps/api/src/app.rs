@@ -129,7 +129,7 @@ pub fn spawn_performance_operations_resume(state: &AppState) -> bool {
 }
 
 pub fn spawn_benchmark_suite_drivers_resume(state: &AppState) -> bool {
-    crate::routes::spawn_restart_interrupted_benchmark_suite_drivers(state)
+    crate::application::launch::spawn_restart_interrupted_benchmark_suite_drivers(state)
 }
 
 #[derive(Debug)]

@@ -41,6 +41,13 @@ pub(crate) struct AccountResponse {
     minecraft_token_expires_in: Option<u64>,
     online_action: super::auth::AuthActionState,
     refresh_action: super::auth::AuthActionState,
+    profile_sync_action: super::auth::AuthActionState,
+    view_model: AccountViewModel,
+}
+
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
+pub(crate) struct AccountViewModel {
+    detail: &'static str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -57,6 +64,19 @@ pub(crate) struct AccountPatchRequest {
 pub(crate) struct AccountActionResponse {
     status: &'static str,
     account: AccountResponse,
+    view_model: AccountCommandViewModel,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct AccountRemoveResponse {
+    status: &'static str,
+    account_id: String,
+    view_model: AccountCommandViewModel,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct AccountCommandViewModel {
+    summary: &'static str,
 }
 
 pub(crate) async fn accounts(
@@ -78,6 +98,9 @@ pub(crate) async fn create_offline_account(
     Ok(Json(AccountActionResponse {
         status: "account_created",
         account: response,
+        view_model: AccountCommandViewModel {
+            summary: "Offline identity created.",
+        },
     }))
 }
 
@@ -113,6 +136,9 @@ pub(crate) async fn patch_account(
     Ok(Json(AccountActionResponse {
         status: "account_updated",
         account: response,
+        view_model: AccountCommandViewModel {
+            summary: "Offline identity updated.",
+        },
     }))
 }
 
@@ -138,13 +164,16 @@ pub(crate) async fn select_account(
     Ok(Json(AccountActionResponse {
         status: "account_selected",
         account: response,
+        view_model: AccountCommandViewModel {
+            summary: "Account selected.",
+        },
     }))
 }
 
 pub(crate) async fn remove_account(
     state: &AppState,
     account_id: &str,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Json<AccountRemoveResponse>, (StatusCode, Json<serde_json::Value>)> {
     let existing = state
         .accounts()
         .list()
@@ -188,10 +217,17 @@ pub(crate) async fn remove_account(
         }
     }
 
-    Ok(Json(serde_json::json!({
-        "status": "account_removed",
-        "account_id": removed.account_id,
-    })))
+    Ok(Json(AccountRemoveResponse {
+        status: "account_removed",
+        account_id: removed.account_id,
+        view_model: AccountCommandViewModel {
+            summary: if removed.kind == LauncherAccountKind::Microsoft {
+                "Microsoft account signed out."
+            } else {
+                "Offline identity removed."
+            },
+        },
+    }))
 }
 
 async fn select_authenticated_microsoft_replacement(
@@ -281,6 +317,15 @@ pub(crate) fn account_response(
     let msa_refresh_available = auth_state.is_some_and(|state| state.msa_refresh_available);
     let online_ready =
         super::auth::minecraft_account_launch_ready(minecraft_account, minecraft_token_expires_in);
+    let online_action = super::auth::online_action_state(
+        minecraft_account,
+        minecraft_token_expires_in,
+        msa_refresh_available,
+    );
+    let refresh_action = super::auth::refresh_action_state(msa_refresh_available, online_ready);
+    let profile_sync_action = super::auth::profile_sync_action_state(minecraft_account);
+    let view_model = account_view_model(record.kind, &online_action);
+
     AccountResponse {
         account_id: record.account_id,
         kind: record.kind,
@@ -297,13 +342,25 @@ pub(crate) fn account_response(
             .is_some_and(|account| account.owns_minecraft_java),
         minecraft_profile,
         minecraft_token_expires_in,
-        online_action: super::auth::online_action_state(
-            minecraft_account,
-            minecraft_token_expires_in,
-            msa_refresh_available,
-        ),
-        refresh_action: super::auth::refresh_action_state(msa_refresh_available, online_ready),
+        online_action,
+        refresh_action,
+        profile_sync_action,
+        view_model,
     }
+}
+
+fn account_view_model(
+    kind: LauncherAccountKind,
+    online_action: &super::auth::AuthActionState,
+) -> AccountViewModel {
+    let detail = match kind {
+        LauncherAccountKind::Offline => "Offline identity",
+        LauncherAccountKind::Microsoft if online_action.enabled => "Microsoft account",
+        LauncherAccountKind::Microsoft => online_action
+            .disabled_reason
+            .unwrap_or("Microsoft account unavailable"),
+    };
+    AccountViewModel { detail }
 }
 
 pub(crate) fn sync_config_for_account(

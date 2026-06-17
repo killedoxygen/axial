@@ -8,7 +8,7 @@ import { Music } from '../music';
 import { local, saveLocalState } from '../state';
 import { Sound } from '../sound';
 import { applyTheme } from '../theme';
-import type { EnrichedInstance } from '../types';
+import type { EnrichedInstance } from '../types-instance';
 import { useDraggableOverlay } from '../hooks/use-draggable-overlay';
 
 type Group = 'jump' | 'instance' | 'action';

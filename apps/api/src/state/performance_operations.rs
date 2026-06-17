@@ -2,6 +2,7 @@ use crate::execution::file::{FileWriteRequest, write_file_atomically};
 #[cfg(test)]
 use crate::execution::file::{PromoteTempFileRequest, promote_temp_file};
 use crate::logging::timestamp_utc;
+use crate::observability::{RedactionAudience, sanitize_public_diagnostic_text};
 use crate::state::ownership::{CurrentArtifact, classify_current_artifact};
 use croopor_config::AppPaths;
 use serde::{Deserialize, Serialize};
@@ -52,6 +53,22 @@ pub struct PerformanceOperationStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PerformanceOperationConflict;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PerformanceOperationLoadIssueKind {
+    DirectoryUnreadable,
+    DirectoryEntryUnreadable,
+    StatusUnreadable,
+    StatusInvalid,
+    UnsafeOperationId,
+    MalformedOperationStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PerformanceOperationLoadIssue {
+    pub kind: PerformanceOperationLoadIssueKind,
+    pub count: usize,
+}
+
 #[derive(Default)]
 struct PerformanceOperationInner {
     operations: HashMap<String, PerformanceOperationStatus>,
@@ -59,9 +76,17 @@ struct PerformanceOperationInner {
     pending_resume_ids: Vec<String>,
 }
 
+#[derive(Default)]
+struct PerformanceOperationLoadState {
+    inner: PerformanceOperationInner,
+    interrupted: Vec<PerformanceOperationStatus>,
+    issues: Vec<PerformanceOperationLoadIssue>,
+}
+
 pub struct PerformanceOperationStore {
     inner: Mutex<PerformanceOperationInner>,
     storage_dir: Option<PathBuf>,
+    load_issues: Vec<PerformanceOperationLoadIssue>,
 }
 
 impl PerformanceOperationStore {
@@ -69,13 +94,14 @@ impl PerformanceOperationStore {
         Self {
             inner: Mutex::new(PerformanceOperationInner::default()),
             storage_dir: None,
+            load_issues: Vec::new(),
         }
     }
 
     pub fn load_from_paths(paths: &AppPaths) -> Self {
         let storage_dir = operation_dir(paths);
-        let (inner, interrupted) = load_persisted_operation_inner(&storage_dir);
-        for status in interrupted {
+        let load_state = load_persisted_operation_inner(&storage_dir);
+        for status in &load_state.interrupted {
             if let Err(error) = persist_status_to_dir(&storage_dir, &status) {
                 warn!(
                     operation_id = %status.id,
@@ -86,8 +112,9 @@ impl PerformanceOperationStore {
         }
 
         Self {
-            inner: Mutex::new(inner),
+            inner: Mutex::new(load_state.inner),
             storage_dir: Some(storage_dir),
+            load_issues: load_state.issues,
         }
     }
 
@@ -143,6 +170,14 @@ impl PerformanceOperationStore {
             return None;
         }
         self.inner.lock().await.operations.get(id).cloned()
+    }
+
+    pub fn load_issues(&self) -> Vec<PerformanceOperationLoadIssue> {
+        self.load_issues.clone()
+    }
+
+    pub fn load_issue_count(&self) -> usize {
+        self.load_issues.iter().map(|issue| issue.count).sum()
     }
 
     pub async fn current_or_latest_for_instance(
@@ -243,25 +278,40 @@ impl Default for PerformanceOperationStore {
     }
 }
 
-fn load_persisted_operation_inner(
-    storage_dir: &Path,
-) -> (PerformanceOperationInner, Vec<PerformanceOperationStatus>) {
-    let mut inner = PerformanceOperationInner::default();
-    let mut interrupted = Vec::new();
+fn load_persisted_operation_inner(storage_dir: &Path) -> PerformanceOperationLoadState {
+    let mut load_state = PerformanceOperationLoadState::default();
     let entries = match fs::read_dir(storage_dir) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return (inner, interrupted),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return load_state,
         Err(error) => {
             warn!(
                 path = %storage_dir.display(),
                 error = %error,
                 "failed to read performance operation status directory"
             );
-            return (inner, interrupted);
+            record_load_issue(
+                &mut load_state.issues,
+                PerformanceOperationLoadIssueKind::DirectoryUnreadable,
+            );
+            return load_state;
         }
     };
 
-    for entry in entries.filter_map(Result::ok) {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "failed to read performance operation status directory entry"
+                );
+                record_load_issue(
+                    &mut load_state.issues,
+                    PerformanceOperationLoadIssueKind::DirectoryEntryUnreadable,
+                );
+                continue;
+            }
+        };
         let path = entry.path();
         if path.extension().and_then(|value| value.to_str()) != Some("json") {
             continue;
@@ -274,11 +324,19 @@ fn load_persisted_operation_inner(
                     error = %error,
                     "failed to load performance operation status"
                 );
+                record_load_issue(
+                    &mut load_state.issues,
+                    performance_status_load_issue_kind(&error),
+                );
                 continue;
             }
         };
         if !is_safe_operation_id(&status.id) {
             warn!("skipping persisted performance operation with unsafe id");
+            record_load_issue(
+                &mut load_state.issues,
+                PerformanceOperationLoadIssueKind::UnsafeOperationId,
+            );
             continue;
         }
         if let Some(error) = status.error.take() {
@@ -290,29 +348,60 @@ fn load_persisted_operation_inner(
                     operation_id = %status.id,
                     "skipping malformed persisted performance operation"
                 );
+                record_load_issue(
+                    &mut load_state.issues,
+                    PerformanceOperationLoadIssueKind::MalformedOperationStatus,
+                );
                 continue;
             }
-            if inner.pending_resume_ids.len() >= MAX_RESUMABLE_OPERATIONS {
+            if load_state.inner.pending_resume_ids.len() >= MAX_RESUMABLE_OPERATIONS {
                 status.state = "interrupted".to_string();
                 status.error = Some(RESUME_LIMIT_ERROR.to_string());
                 status.updated_at = timestamp_utc();
-                interrupted.push(status.clone());
-            } else if inner.active_by_instance.contains_key(&status.instance_id) {
+                load_state.interrupted.push(status.clone());
+            } else if load_state
+                .inner
+                .active_by_instance
+                .contains_key(&status.instance_id)
+            {
                 status.state = "interrupted".to_string();
                 status.error = Some(DUPLICATE_RESUME_ERROR.to_string());
                 status.updated_at = timestamp_utc();
-                interrupted.push(status.clone());
+                load_state.interrupted.push(status.clone());
             } else {
-                inner
+                load_state
+                    .inner
                     .active_by_instance
                     .insert(status.instance_id.clone(), status.id.clone());
-                inner.pending_resume_ids.push(status.id.clone());
+                load_state.inner.pending_resume_ids.push(status.id.clone());
             }
         }
-        inner.operations.insert(status.id.clone(), status);
+        load_state
+            .inner
+            .operations
+            .insert(status.id.clone(), status);
     }
 
-    (inner, interrupted)
+    load_state
+}
+
+fn record_load_issue(
+    issues: &mut Vec<PerformanceOperationLoadIssue>,
+    kind: PerformanceOperationLoadIssueKind,
+) {
+    if let Some(issue) = issues.iter_mut().find(|issue| issue.kind == kind) {
+        issue.count = issue.count.saturating_add(1);
+    } else {
+        issues.push(PerformanceOperationLoadIssue { kind, count: 1 });
+    }
+}
+
+fn performance_status_load_issue_kind(error: &io::Error) -> PerformanceOperationLoadIssueKind {
+    if error.kind() == io::ErrorKind::InvalidData {
+        PerformanceOperationLoadIssueKind::StatusInvalid
+    } else {
+        PerformanceOperationLoadIssueKind::StatusUnreadable
+    }
 }
 
 fn is_non_terminal(state: &str) -> bool {
@@ -422,46 +511,12 @@ pub fn generate_performance_operation_id() -> String {
 }
 
 pub fn sanitize_operation_error(value: &str) -> String {
-    let value = value.trim();
-    if value.is_empty() {
-        return "performance operation failed".to_string();
-    }
-
-    let lower = value.to_ascii_lowercase();
-    let sensitive = [
-        "access_token",
-        "refresh_token",
-        "id_token",
-        "auth_token",
-        "token",
-        "password",
-        "secret",
-        "credential",
-        "authorization",
-        "bearer",
-        "username",
-        "command",
-        "jvm",
-        "java_path",
-        "java path",
-        "args",
-    ];
-    if sensitive.iter().any(|token| lower.contains(token)) {
-        return "performance operation failed".to_string();
-    }
-
-    let sanitized = value
-        .chars()
-        .filter(|value| !value.is_control() && !matches!(value, '/' | '\\' | ';'))
-        .take(MAX_OPERATION_ERROR_CHARS)
-        .collect::<String>()
-        .trim()
-        .to_string();
-    if sanitized.is_empty() {
-        "performance operation failed".to_string()
-    } else {
-        sanitized
-    }
+    sanitize_public_diagnostic_text(
+        value,
+        RedactionAudience::UserVisible,
+        MAX_OPERATION_ERROR_CHARS,
+        "performance operation failed",
+    )
 }
 
 #[cfg(test)]
@@ -681,10 +736,17 @@ mod tests {
         };
         persist_status_to_dir(&dir, &status).expect("persist unsafe status");
 
-        let (inner, interrupted) = load_persisted_operation_inner(&dir);
+        let load_state = load_persisted_operation_inner(&dir);
 
-        assert!(inner.operations.is_empty());
-        assert!(interrupted.is_empty());
+        assert!(load_state.inner.operations.is_empty());
+        assert!(load_state.interrupted.is_empty());
+        assert_eq!(
+            load_state.issues,
+            vec![PerformanceOperationLoadIssue {
+                kind: PerformanceOperationLoadIssueKind::UnsafeOperationId,
+                count: 1,
+            }]
+        );
 
         cleanup(&root);
     }
@@ -712,18 +774,19 @@ mod tests {
         persist_status_to_dir(&dir, &first).expect("persist first status");
         persist_status_to_dir(&dir, &second).expect("persist second status");
 
-        let (inner, interrupted) = load_persisted_operation_inner(&dir);
+        let load_state = load_persisted_operation_inner(&dir);
 
-        assert_eq!(inner.pending_resume_ids.len(), 1);
-        assert_eq!(interrupted.len(), 1);
+        assert_eq!(load_state.inner.pending_resume_ids.len(), 1);
+        assert_eq!(load_state.interrupted.len(), 1);
         assert_eq!(
-            interrupted[0].error.as_deref(),
+            load_state.interrupted[0].error.as_deref(),
             Some(DUPLICATE_RESUME_ERROR)
         );
         assert_eq!(
-            inner.active_by_instance.get("instance-a"),
-            inner.pending_resume_ids.first()
+            load_state.inner.active_by_instance.get("instance-a"),
+            load_state.inner.pending_resume_ids.first()
         );
+        assert!(load_state.issues.is_empty());
 
         cleanup(&root);
     }
@@ -743,18 +806,25 @@ mod tests {
         );
         persist_status_to_dir(&dir, &status).expect("persist malformed status");
 
-        let (inner, interrupted) = load_persisted_operation_inner(&dir);
+        let load_state = load_persisted_operation_inner(&dir);
 
-        assert!(inner.operations.is_empty());
-        assert!(inner.active_by_instance.is_empty());
-        assert!(inner.pending_resume_ids.is_empty());
-        assert!(interrupted.is_empty());
+        assert!(load_state.inner.operations.is_empty());
+        assert!(load_state.inner.active_by_instance.is_empty());
+        assert!(load_state.inner.pending_resume_ids.is_empty());
+        assert!(load_state.interrupted.is_empty());
+        assert_eq!(
+            load_state.issues,
+            vec![PerformanceOperationLoadIssue {
+                kind: PerformanceOperationLoadIssueKind::MalformedOperationStatus,
+                count: 1,
+            }]
+        );
 
         cleanup(&root);
     }
 
     #[test]
-    fn persisted_operation_with_unknown_fields_is_not_loaded() {
+    fn persisted_operation_with_unknown_fields_is_not_loaded_and_records_safe_issue() {
         let root = test_root("unknown-field-pending");
         let paths = test_paths(&root);
         let dir = operation_dir(&paths);
@@ -778,10 +848,20 @@ mod tests {
         )
         .expect("write status");
 
-        let (inner, interrupted) = load_persisted_operation_inner(&dir);
+        let load_state = load_persisted_operation_inner(&dir);
 
-        assert!(inner.operations.is_empty());
-        assert!(interrupted.is_empty());
+        assert!(load_state.inner.operations.is_empty());
+        assert!(load_state.interrupted.is_empty());
+        assert_eq!(
+            load_state.issues,
+            vec![PerformanceOperationLoadIssue {
+                kind: PerformanceOperationLoadIssueKind::StatusInvalid,
+                count: 1,
+            }]
+        );
+        let encoded = format!("{:?}", load_state.issues);
+        assert!(!encoded.contains(root.to_string_lossy().as_ref()));
+        assert!(!encoded.contains("unexpected_mode"));
 
         cleanup(&root);
     }

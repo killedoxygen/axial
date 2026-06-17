@@ -1,4 +1,5 @@
 use crate::logging::timestamp_utc;
+use crate::observability::{RedactionAudience, sanitize_public_diagnostic_text};
 use croopor_config::AppPaths;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -57,6 +58,21 @@ pub struct BenchmarkSuiteDriverStart {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BenchmarkSuiteDriverConflict;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BenchmarkSuiteDriverLoadIssueKind {
+    DirectoryUnreadable,
+    DirectoryEntryUnreadable,
+    StatusUnreadable,
+    StatusInvalid,
+    UnsafeDriverId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BenchmarkSuiteDriverLoadIssue {
+    pub kind: BenchmarkSuiteDriverLoadIssueKind,
+    pub count: usize,
+}
+
 struct BenchmarkSuiteDriverEntry {
     status: BenchmarkSuiteDriverStatus,
     stop_tx: watch::Sender<bool>,
@@ -70,9 +86,17 @@ struct BenchmarkSuiteDriverInner {
     pending_resume_ids: Vec<String>,
 }
 
+#[derive(Default)]
+struct BenchmarkSuiteDriverLoadState {
+    inner: BenchmarkSuiteDriverInner,
+    interrupted: Vec<BenchmarkSuiteDriverStatus>,
+    issues: Vec<BenchmarkSuiteDriverLoadIssue>,
+}
+
 pub struct BenchmarkSuiteDriverStore {
     inner: Mutex<BenchmarkSuiteDriverInner>,
     storage_dir: Option<PathBuf>,
+    load_issues: Vec<BenchmarkSuiteDriverLoadIssue>,
 }
 
 impl BenchmarkSuiteDriverStore {
@@ -80,13 +104,14 @@ impl BenchmarkSuiteDriverStore {
         Self {
             inner: Mutex::new(BenchmarkSuiteDriverInner::default()),
             storage_dir: None,
+            load_issues: Vec::new(),
         }
     }
 
     pub fn load_from_paths(paths: &AppPaths) -> Self {
         let storage_dir = driver_dir(paths);
-        let (inner, interrupted) = load_persisted_driver_inner(&storage_dir);
-        for status in interrupted {
+        let load_state = load_persisted_driver_inner(&storage_dir);
+        for status in &load_state.interrupted {
             if let Err(error) = persist_status_to_dir(&storage_dir, &status) {
                 warn!(
                     driver_id = %status.id,
@@ -97,8 +122,9 @@ impl BenchmarkSuiteDriverStore {
         }
 
         Self {
-            inner: Mutex::new(inner),
+            inner: Mutex::new(load_state.inner),
             storage_dir: Some(storage_dir),
+            load_issues: load_state.issues,
         }
     }
 
@@ -163,6 +189,14 @@ impl BenchmarkSuiteDriverStore {
             .drivers
             .get(id)
             .map(|entry| entry.status.clone())
+    }
+
+    pub fn load_issues(&self) -> Vec<BenchmarkSuiteDriverLoadIssue> {
+        self.load_issues.clone()
+    }
+
+    pub fn load_issue_count(&self) -> usize {
+        self.load_issues.iter().map(|issue| issue.count).sum()
     }
 
     pub async fn take_restart_interrupted_resumable_drivers(
@@ -409,25 +443,40 @@ fn is_restart_interrupted_driver(status: &BenchmarkSuiteDriverStatus) -> bool {
     status.state == "interrupted" && status.error.as_deref() == Some(INTERRUPTED_BY_RESTART_ERROR)
 }
 
-fn load_persisted_driver_inner(
-    storage_dir: &Path,
-) -> (BenchmarkSuiteDriverInner, Vec<BenchmarkSuiteDriverStatus>) {
-    let mut inner = BenchmarkSuiteDriverInner::default();
-    let mut interrupted = Vec::new();
+fn load_persisted_driver_inner(storage_dir: &Path) -> BenchmarkSuiteDriverLoadState {
+    let mut load_state = BenchmarkSuiteDriverLoadState::default();
     let entries = match fs::read_dir(storage_dir) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return (inner, interrupted),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return load_state,
         Err(error) => {
             warn!(
                 path = %storage_dir.display(),
                 error = %error,
                 "failed to read benchmark suite driver status directory"
             );
-            return (inner, interrupted);
+            record_load_issue(
+                &mut load_state.issues,
+                BenchmarkSuiteDriverLoadIssueKind::DirectoryUnreadable,
+            );
+            return load_state;
         }
     };
 
-    for entry in entries.filter_map(Result::ok) {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "failed to read benchmark suite driver status directory entry"
+                );
+                record_load_issue(
+                    &mut load_state.issues,
+                    BenchmarkSuiteDriverLoadIssueKind::DirectoryEntryUnreadable,
+                );
+                continue;
+            }
+        };
         let path = entry.path();
         if path.extension().and_then(|value| value.to_str()) != Some("json") {
             continue;
@@ -440,14 +489,23 @@ fn load_persisted_driver_inner(
                     error = %error,
                     "failed to load benchmark suite driver status"
                 );
+                record_load_issue(
+                    &mut load_state.issues,
+                    driver_status_load_issue_kind(&error),
+                );
                 continue;
             }
         };
         if !is_safe_driver_id(&status.id) {
             warn!("skipping persisted benchmark suite driver with unsafe id");
+            record_load_issue(
+                &mut load_state.issues,
+                BenchmarkSuiteDriverLoadIssueKind::UnsafeDriverId,
+            );
             continue;
         }
-        inner.next_id = inner
+        load_state.inner.next_id = load_state
+            .inner
             .next_id
             .max(driver_id_index(&status.id).unwrap_or_default());
         if let Some(error) = status.error.take() {
@@ -462,8 +520,8 @@ fn load_persisted_driver_inner(
             should_persist = true;
         }
         if is_restart_interrupted_driver(&status) {
-            if inner.pending_resume_ids.len() < MAX_RESUMABLE_DRIVERS {
-                inner.pending_resume_ids.push(status.id.clone());
+            if load_state.inner.pending_resume_ids.len() < MAX_RESUMABLE_DRIVERS {
+                load_state.inner.pending_resume_ids.push(status.id.clone());
             } else {
                 status.error = Some(AUTOMATIC_RESUME_LIMIT_ERROR.to_string());
                 status.updated_at = timestamp_utc();
@@ -471,16 +529,35 @@ fn load_persisted_driver_inner(
             }
         }
         if should_persist {
-            interrupted.push(status.clone());
+            load_state.interrupted.push(status.clone());
         }
         let (stop_tx, _stop_rx) = watch::channel(!is_non_terminal(&status.state));
-        inner.drivers.insert(
+        load_state.inner.drivers.insert(
             status.id.clone(),
             BenchmarkSuiteDriverEntry { status, stop_tx },
         );
     }
 
-    (inner, interrupted)
+    load_state
+}
+
+fn record_load_issue(
+    issues: &mut Vec<BenchmarkSuiteDriverLoadIssue>,
+    kind: BenchmarkSuiteDriverLoadIssueKind,
+) {
+    if let Some(issue) = issues.iter_mut().find(|issue| issue.kind == kind) {
+        issue.count = issue.count.saturating_add(1);
+    } else {
+        issues.push(BenchmarkSuiteDriverLoadIssue { kind, count: 1 });
+    }
+}
+
+fn driver_status_load_issue_kind(error: &io::Error) -> BenchmarkSuiteDriverLoadIssueKind {
+    if error.kind() == io::ErrorKind::InvalidData {
+        BenchmarkSuiteDriverLoadIssueKind::StatusInvalid
+    } else {
+        BenchmarkSuiteDriverLoadIssueKind::StatusUnreadable
+    }
 }
 
 fn load_status_file(path: &Path) -> io::Result<BenchmarkSuiteDriverStatus> {
@@ -558,40 +635,12 @@ fn driver_id_index(driver_id: &str) -> Option<u64> {
 }
 
 pub fn sanitize_driver_error(value: &str) -> String {
-    let value = value.trim();
-    if value.is_empty() {
-        return "driver error".to_string();
-    }
-
-    let lower = value.to_ascii_lowercase();
-    let sensitive = [
-        "command",
-        "java_path",
-        "java path",
-        "jvm",
-        "username",
-        "filesystem",
-        "args",
-    ];
-    if sensitive.iter().any(|token| lower.contains(token))
-        || value.contains('/')
-        || value.contains('\\')
-    {
-        return "driver error".to_string();
-    }
-
-    let sanitized = value
-        .chars()
-        .filter(|value| !value.is_control() && !matches!(value, '/' | '\\' | ';'))
-        .take(MAX_DRIVER_ERROR_CHARS)
-        .collect::<String>()
-        .trim()
-        .to_string();
-    if sanitized.is_empty() {
-        "driver error".to_string()
-    } else {
-        sanitized
-    }
+    sanitize_public_diagnostic_text(
+        value,
+        RedactionAudience::UserVisible,
+        MAX_DRIVER_ERROR_CHARS,
+        "driver error",
+    )
 }
 
 #[cfg(test)]
@@ -890,7 +939,7 @@ mod tests {
     }
 
     #[test]
-    fn persisted_driver_with_unknown_fields_is_not_loaded() {
+    fn persisted_driver_with_unknown_fields_is_not_loaded_and_records_safe_issue() {
         let root = test_root("unknown-field");
         let paths = test_paths(&root);
         let dir = driver_dir(&paths);
@@ -914,10 +963,20 @@ mod tests {
         )
         .expect("write driver");
 
-        let (inner, interrupted) = load_persisted_driver_inner(&dir);
+        let load_state = load_persisted_driver_inner(&dir);
 
-        assert!(inner.drivers.is_empty());
-        assert!(interrupted.is_empty());
+        assert!(load_state.inner.drivers.is_empty());
+        assert!(load_state.interrupted.is_empty());
+        assert_eq!(
+            load_state.issues,
+            vec![BenchmarkSuiteDriverLoadIssue {
+                kind: BenchmarkSuiteDriverLoadIssueKind::StatusInvalid,
+                count: 1,
+            }]
+        );
+        let encoded = format!("{:?}", load_state.issues);
+        assert!(!encoded.contains(root.to_string_lossy().as_ref()));
+        assert!(!encoded.contains("unexpected_state"));
         cleanup(&root);
     }
 

@@ -4,6 +4,7 @@ import type { NativeDragDropPayload } from '../../native';
 import type {
   AccountActionState,
   AuthStatusRecord,
+  CommandViewModel,
   LauncherAccount,
   LauncherAccountsData,
   MinecraftAuthReadiness,
@@ -111,6 +112,22 @@ export function savedSkinsResponse(value: unknown): SavedSkinsData | null {
   };
 }
 
+export function commandViewModel(value: unknown): CommandViewModel | undefined {
+  if (!isRecord(value) || typeof value.summary !== 'string') return undefined;
+  return {
+    summary: value.summary,
+    detail: typeof value.detail === 'string' ? value.detail : undefined,
+  };
+}
+
+export function commandSummary(value: unknown, fallback: string): string {
+  if (isRecord(value)) {
+    const view = commandViewModel(value.view_model);
+    if (view?.summary.trim()) return view.summary;
+  }
+  return fallback;
+}
+
 function skinNormalizeMetadata(value: unknown): SkinNormalizeMetadata | null {
   if (!isRecord(value)) return null;
   if (
@@ -141,7 +158,11 @@ export function skinFlushResult(value: unknown): SkinFlushResult | null {
   if (!isRecord(value) || typeof value.status !== 'string' || typeof value.applied !== 'number') {
     return null;
   }
-  return { status: value.status, applied: value.applied };
+  return {
+    status: value.status,
+    applied: value.applied,
+    viewModel: commandViewModel(value.view_model),
+  };
 }
 
 export function skinVariantValue(value: string | undefined): SkinVariant {
@@ -433,7 +454,9 @@ function accountActionState(value: unknown): AccountActionState | undefined {
     typeof value.state_id !== 'string' ||
     typeof value.label !== 'string' ||
     typeof value.enabled !== 'boolean' ||
-    (value.disabled_reason !== undefined && typeof value.disabled_reason !== 'string')
+    (value.disabled_reason !== undefined && typeof value.disabled_reason !== 'string') ||
+    (value.detail !== undefined && typeof value.detail !== 'string') ||
+    (value.success_summary !== undefined && typeof value.success_summary !== 'string')
   ) {
     return undefined;
   }
@@ -442,6 +465,8 @@ function accountActionState(value: unknown): AccountActionState | undefined {
     label: value.label,
     enabled: value.enabled,
     disabled_reason: typeof value.disabled_reason === 'string' ? value.disabled_reason : undefined,
+    detail: typeof value.detail === 'string' ? value.detail : undefined,
+    success_summary: typeof value.success_summary === 'string' ? value.success_summary : undefined,
   };
 }
 
@@ -471,6 +496,10 @@ function launcherAccount(value: unknown): LauncherAccount | null {
     msa_refresh_available: value.msa_refresh_available,
     online_action: accountActionState(value.online_action),
     refresh_action: accountActionState(value.refresh_action),
+    profile_sync_action: accountActionState(value.profile_sync_action),
+    view_model: isRecord(value.view_model)
+      ? { detail: typeof value.view_model.detail === 'string' ? value.view_model.detail : undefined }
+      : undefined,
     ...minecraftReadiness(value),
   };
 }
@@ -518,6 +547,7 @@ export function authStatusResponse(value: unknown): AuthStatusRecord | null {
     msa_refresh_available: value.msa_refresh_available,
     online_action: accountActionState(value.online_action),
     refresh_action: accountActionState(value.refresh_action),
+    profile_sync_action: accountActionState(value.profile_sync_action),
     skin_action: accountActionState(value.skin_action),
     ...minecraftReadiness(value),
   };
@@ -608,49 +638,18 @@ export function apiResponseError(response: Response, payload: unknown, fallback:
   return error;
 }
 
-function apiPayloadStatus(error: unknown): string | null {
-  if (!isApiError(error)) return null;
-  const payload = error.payload;
-  if (!isRecord(payload) || typeof payload.status !== 'string') return null;
-  return payload.status;
-}
-
 export function skinActionErrorMessage(error: unknown, fallback: string): string {
-  const status = apiPayloadStatus(error);
-  switch (status) {
-    case 'minecraft_skin_rate_limited':
-    case 'minecraft_skin_reset_rate_limited':
-    case 'minecraft_cape_rate_limited':
-    case 'minecraft_profile_skin_rate_limited':
-    case 'minecraft_profile_skin_preserve_rate_limited':
-    case 'minecraft_cape_texture_rate_limited':
-      return "You're changing skins too frequently. Mojang has temporarily slowed these requests down. Wait a moment before trying again.";
-    case 'minecraft_profile_lookup_rate_limited':
-      return 'Minecraft profile lookups are temporarily rate limited. Wait a moment before trying again.';
-    case 'minecraft_cape_not_available':
-      return 'The saved cape is not available on this Minecraft account. Edit the saved skin and choose another cape or no cape.';
-    case 'minecraft_skin_auth_failed':
-    case 'minecraft_skin_reset_auth_failed':
-    case 'minecraft_cape_auth_failed':
-    case 'minecraft_account_required':
-      return 'Minecraft authorization is required for this skin action. Sign in or refresh the account, then try again.';
-    case 'minecraft_skin_unavailable':
-    case 'minecraft_skin_reset_unavailable':
-    case 'minecraft_profile_skin_unavailable':
-    case 'minecraft_profile_skin_preserve_unavailable':
-    case 'minecraft_cape_texture_unavailable':
-    case 'minecraft_profile_lookup_unavailable':
-      return 'Minecraft services are unavailable for this skin action. Try again later.';
-    default:
-      return boundedMessage(error instanceof Error ? error.message : undefined, fallback);
+  if (isApiError(error) && isRecord(error.payload)) {
+    return boundedMessage(typeof error.payload.error === 'string' ? error.payload.error : undefined, fallback);
   }
+  if (isRecord(error)) {
+    return boundedMessage(typeof error.error === 'string' ? error.error : undefined, fallback);
+  }
+  return boundedMessage(error instanceof Error ? error.message : undefined, fallback);
 }
 
 export function savedSkinApplyErrorMessage(error: unknown): string {
-  return `Skin saved locally, but could not apply to Minecraft profile: ${skinActionErrorMessage(
-    error,
-    'Minecraft profile apply failed.',
-  )}`;
+  return skinActionErrorMessage(error, 'Minecraft profile apply failed.');
 }
 
 export function formatByteSize(bytes: number): string {

@@ -2,7 +2,7 @@ import type { JSX } from 'preact';
 import { useMemo } from 'preact/hooks';
 import { Icon } from '../../../ui/Icons';
 import { Card } from '../../../ui/Atoms';
-import type { EnrichedInstance, InstanceResourceSummary } from '../../../types';
+import type { EnrichedInstance, InstanceResourceSummary } from '../../../types-instance';
 import { fmtRelative } from '../format';
 
 interface ActivityItem {

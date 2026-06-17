@@ -17,7 +17,7 @@ import type {
 
 export function SkinStage({
   state,
-  onlineReady,
+  skinActionsEnabled,
   lookupPreview,
   lookupVariant,
   lookupBusy,
@@ -62,7 +62,7 @@ export function SkinStage({
   onOpenUploadPicker,
 }: {
   state: AuthStatusState;
-  onlineReady: boolean;
+  skinActionsEnabled: boolean;
   lookupPreview: MinecraftSkinLookup | null;
   lookupVariant: SkinVariant;
   lookupBusy: boolean;
@@ -130,7 +130,7 @@ export function SkinStage({
             >
               Dismiss
             </Button>
-            {onlineReady ? (
+            {skinActionsEnabled ? (
               <>
                 <Button
                   variant="secondary"
@@ -191,7 +191,7 @@ export function SkinStage({
                 Reset
               </Button>
             )}
-            {onlineReady && (
+            {skinActionsEnabled && (
               <Button
                 variant="primary"
                 size="lg"
@@ -274,7 +274,7 @@ export function SkinStage({
                   variant="primary"
                   size="lg"
                   icon={flushBusy ? 'refresh' : 'check'}
-                  disabled={!onlineReady || flushBusy || cancelPendingBusy || applyKey !== null}
+                  disabled={!skinActionsEnabled || flushBusy || cancelPendingBusy || applyKey !== null}
                   onClick={onFlushPendingApply}
                   title="Apply the queued skin change now"
                   sound="affirm"
@@ -282,7 +282,7 @@ export function SkinStage({
                   {flushBusy ? 'Applying' : 'Apply now'}
                 </Button>
               </>
-            ) : !selectedSkin.applied_at && !selectedPreviewEditing && onlineReady ? (
+            ) : !selectedSkin.applied_at && !selectedPreviewEditing && skinActionsEnabled ? (
               <>
                 <Button
                   variant="secondary"

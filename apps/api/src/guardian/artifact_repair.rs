@@ -118,15 +118,11 @@ pub async fn execute_guardian_artifact_repair(
         request.mode,
         None,
     );
-    if let Some(entry) = request.failure_memory.get(&memory_key)
-        && (suppression_active(&entry, request.observed_at)
-            || entry.repair_attempt_count >= ARTIFACT_REPAIR_MAX_ATTEMPTS)
+    if let Some(suppression_until) = request
+        .failure_memory
+        .get(&memory_key)
+        .and_then(|entry| artifact_repair_suppression_until(&entry, request.observed_at))
     {
-        let suppression_until = entry
-            .suppression_until
-            .as_deref()
-            .map(str::to_string)
-            .or_else(|| default_suppression_until(request.observed_at));
         create_terminal_journal(
             request.journals,
             &operation_id,
@@ -143,7 +139,7 @@ pub async fn execute_guardian_artifact_repair(
             &target,
             FailureMemoryActionOutcome::Suppressed,
             request.observed_at,
-            suppression_until.as_deref(),
+            Some(suppression_until.as_str()),
             false,
             None,
         );
@@ -345,15 +341,11 @@ pub async fn execute_guardian_missing_artifact_repair(
         request.mode,
         None,
     );
-    if let Some(entry) = request.failure_memory.get(&memory_key)
-        && (suppression_active(&entry, request.observed_at)
-            || entry.repair_attempt_count >= ARTIFACT_REPAIR_MAX_ATTEMPTS)
+    if let Some(suppression_until) = request
+        .failure_memory
+        .get(&memory_key)
+        .and_then(|entry| artifact_repair_suppression_until(&entry, request.observed_at))
     {
-        let suppression_until = entry
-            .suppression_until
-            .as_deref()
-            .map(str::to_string)
-            .or_else(|| default_suppression_until(request.observed_at));
         create_terminal_journal(
             request.journals,
             &operation_id,
@@ -370,7 +362,7 @@ pub async fn execute_guardian_missing_artifact_repair(
             &target,
             FailureMemoryActionOutcome::Suppressed,
             request.observed_at,
-            suppression_until.as_deref(),
+            Some(suppression_until.as_str()),
             false,
             None,
         );
@@ -653,6 +645,8 @@ fn task_rollback(task: GuardianRepairTaskKind) -> RollbackState {
         | GuardianRepairTaskKind::PromoteVerifiedArtifact => RollbackState::Available,
         GuardianRepairTaskKind::JournalRepairStart
         | GuardianRepairTaskKind::VerifyArtifactChecksum
+        | GuardianRepairTaskKind::VerifyManagedRuntimeReadyMarker
+        | GuardianRepairTaskKind::RecreateManagedRuntimeReadyMarker
         | GuardianRepairTaskKind::RecordRepairOutcome => RollbackState::NotApplicable,
     }
 }
@@ -702,6 +696,21 @@ fn suppression_active(entry: &GuardianFailureMemoryEntry, now: &str) -> bool {
     suppression_until > now
 }
 
+fn artifact_repair_suppression_until(
+    entry: &GuardianFailureMemoryEntry,
+    now: &str,
+) -> Option<String> {
+    if suppression_active(entry, now) {
+        return entry.suppression_until.clone();
+    }
+    if entry.repair_attempt_count >= ARTIFACT_REPAIR_MAX_ATTEMPTS
+        && entry.suppression_until.is_none()
+    {
+        return default_suppression_until(now);
+    }
+    None
+}
+
 fn default_suppression_until(observed_at: &str) -> Option<String> {
     DateTime::parse_from_rfc3339(observed_at)
         .ok()
@@ -730,8 +739,15 @@ fn fact_id(kind: ExecutionFactKind) -> &'static str {
         ExecutionFactKind::DownloadProviderFailure => "download_provider_failure",
         ExecutionFactKind::DownloadNetworkFailure => "download_network_failure",
         ExecutionFactKind::DownloadInterrupted => "download_interrupted",
+        ExecutionFactKind::DownloadTempDiscarded => "download_temp_discarded",
+        ExecutionFactKind::DownloadTempWriteFailed => "download_temp_write_failed",
+        ExecutionFactKind::DownloadWrittenToTemp => "download_written_to_temp",
+        ExecutionFactKind::DownloadPromotionFailed => "download_promotion_failed",
         ExecutionFactKind::FileMissing => "file_missing",
+        ExecutionFactKind::FileLocked => "file_locked",
+        ExecutionFactKind::FileOwnershipUnknown => "file_ownership_unknown",
         ExecutionFactKind::FilePermissionDenied => "file_permission_denied",
+        ExecutionFactKind::ProviderDataInvalid => "provider_data_invalid",
         ExecutionFactKind::PrimitiveRefused => "primitive_refused",
         _ => "execution_fact",
     }
@@ -796,6 +812,26 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn artifact_repair_fact_ids_preserve_download_failure_family() {
+        assert_eq!(
+            super::fact_id(crate::execution::ExecutionFactKind::DownloadPromotionFailed),
+            "download_promotion_failed"
+        );
+        assert_eq!(
+            super::fact_id(crate::execution::ExecutionFactKind::DownloadTempWriteFailed),
+            "download_temp_write_failed"
+        );
+        assert_eq!(
+            super::fact_id(crate::execution::ExecutionFactKind::DownloadTempDiscarded),
+            "download_temp_discarded"
+        );
+        assert_eq!(
+            super::fact_id(crate::execution::ExecutionFactKind::ProviderDataInvalid),
+            "provider_data_invalid"
+        );
+    }
 
     #[tokio::test]
     async fn repairs_launcher_managed_artifact_with_sha256_source() {
@@ -1018,6 +1054,181 @@ mod tests {
             memory.last_action_outcome,
             Some(FailureMemoryActionOutcome::Suppressed)
         );
+
+        server.stop();
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn legacy_artifact_attempt_limit_suppresses_once_with_new_cooldown() {
+        let root = test_root("legacy-attempt-limit");
+        fs::create_dir_all(&root).expect("root");
+        let destination = root.join("bad.jar");
+        fs::write(&destination, b"corrupt").expect("corrupt artifact");
+        let replacement = b"fresh artifact".to_vec();
+        let server = TestByteServer::start(replacement.clone());
+        let stores = stores();
+        let plan = artifact_plan();
+        stores
+            .failure_memory
+            .record(
+                GuardianFailureMemoryEntry::observed(
+                    plan.diagnosis_id.clone(),
+                    crate::guardian::GuardianDomain::Install,
+                    plan.target.clone(),
+                    GuardianMode::Managed,
+                    None,
+                    "2026-06-15T09:00:00Z",
+                )
+                .with_action(
+                    crate::guardian::GuardianActionKind::Repair,
+                    FailureMemoryActionOutcome::Failed,
+                )
+                .with_repair_attempt(),
+            )
+            .expect("memory");
+
+        let outcome = execute_guardian_artifact_repair(request(
+            &plan,
+            &destination,
+            &server.url,
+            &sha256_hex(&replacement),
+            Some(replacement.len() as u64),
+            &stores,
+            "2026-06-15T10:00:00Z",
+        ))
+        .await;
+
+        assert_eq!(outcome.status, GuardianArtifactRepairStatus::Suppressed);
+        assert_eq!(fs::read(&destination).expect("original"), b"corrupt");
+        assert_eq!(server.request_count(), 0);
+        let memory = stores.failure_memory.list();
+        assert_eq!(memory[0].repair_attempt_count, 1);
+        assert_eq!(
+            memory[0].last_action_outcome,
+            Some(FailureMemoryActionOutcome::Suppressed)
+        );
+        assert!(memory[0].suppression_until.is_some());
+
+        server.stop();
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn expired_artifact_repair_cooldown_allows_new_safe_attempt() {
+        let root = test_root("expired-artifact-cooldown");
+        fs::create_dir_all(&root).expect("root");
+        let destination = root.join("bad.jar");
+        fs::write(&destination, b"corrupt").expect("corrupt artifact");
+        let replacement = b"fresh artifact after cooldown".to_vec();
+        let server = TestByteServer::start(replacement.clone());
+        let stores = stores();
+        let plan = artifact_plan();
+        stores
+            .failure_memory
+            .record(
+                GuardianFailureMemoryEntry::observed(
+                    plan.diagnosis_id.clone(),
+                    crate::guardian::GuardianDomain::Install,
+                    plan.target.clone(),
+                    GuardianMode::Managed,
+                    None,
+                    "2026-06-15T09:00:00Z",
+                )
+                .with_action(
+                    crate::guardian::GuardianActionKind::Repair,
+                    FailureMemoryActionOutcome::Failed,
+                )
+                .with_repair_attempt()
+                .with_suppression_until("2026-06-15T09:30:00Z"),
+            )
+            .expect("memory");
+
+        let outcome = execute_guardian_artifact_repair(request(
+            &plan,
+            &destination,
+            &server.url,
+            &sha256_hex(&replacement),
+            Some(replacement.len() as u64),
+            &stores,
+            "2026-06-15T10:00:00Z",
+        ))
+        .await;
+
+        assert_eq!(outcome.status, GuardianArtifactRepairStatus::Repaired);
+        assert_eq!(fs::read(&destination).expect("replacement"), replacement);
+        assert!(root_contains_quarantine(&root, b"corrupt"));
+        assert_eq!(server.request_count(), 1);
+        let memory = stores.failure_memory.list();
+        assert_eq!(memory[0].repair_attempt_count, 2);
+        assert_eq!(
+            memory[0].last_action_outcome,
+            Some(FailureMemoryActionOutcome::Repaired)
+        );
+        assert_ne!(
+            memory[0].suppression_until.as_deref(),
+            Some("2026-06-15T09:30:00Z")
+        );
+
+        server.stop();
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn expired_missing_artifact_repair_cooldown_allows_new_safe_attempt() {
+        let root = test_root("expired-missing-artifact-cooldown");
+        fs::create_dir_all(&root).expect("root");
+        let destination = root.join("missing.jar");
+        let replacement = b"fresh missing artifact after cooldown".to_vec();
+        let server = TestByteServer::start(replacement.clone());
+        let stores = stores();
+        let plan = missing_artifact_plan();
+        stores
+            .failure_memory
+            .record(
+                GuardianFailureMemoryEntry::observed(
+                    plan.diagnosis_id.clone(),
+                    crate::guardian::GuardianDomain::Install,
+                    plan.target.clone(),
+                    GuardianMode::Managed,
+                    None,
+                    "2026-06-15T09:00:00Z",
+                )
+                .with_action(
+                    crate::guardian::GuardianActionKind::Repair,
+                    FailureMemoryActionOutcome::Failed,
+                )
+                .with_repair_attempt()
+                .with_suppression_until("2026-06-15T09:30:00Z"),
+            )
+            .expect("memory");
+
+        let outcome = execute_guardian_missing_artifact_repair(request_with_checksum(
+            &plan,
+            &destination,
+            &server.url,
+            "sha1",
+            &sha1_hex(&replacement),
+            Some(replacement.len() as u64),
+            &stores,
+            "2026-06-15T10:00:00Z",
+        ))
+        .await;
+
+        assert_eq!(outcome.status, GuardianArtifactRepairStatus::Repaired);
+        assert_eq!(fs::read(&destination).expect("replacement"), replacement);
+        assert!(!root_contains_quarantine(
+            &root,
+            b"fresh missing artifact after cooldown"
+        ));
+        assert_eq!(server.request_count(), 1);
+        let memory = stores.failure_memory.list();
+        assert_eq!(memory[0].repair_attempt_count, 2);
+        assert_eq!(
+            memory[0].last_action_outcome,
+            Some(FailureMemoryActionOutcome::Repaired)
+        );
+        assert!(memory[0].quarantined_target.is_none());
 
         server.stop();
         cleanup(&root);

@@ -4,40 +4,27 @@ import { Button, IconButton, Input, Pill } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { Slider } from '../../ui/Slider';
 import { InstanceTile, nextArtSeed } from '../../ui/InstanceVisual';
-import { catalog, config, systemInfo, versions } from '../../store';
-import { setCatalog } from '../../actions';
+import { config, systemInfo } from '../../store';
 import { closeCreate, createOpen } from '../../ui-state';
 import { api } from '../../api';
 import { errMessage, fmtMem, getMemoryRecommendation } from '../../utils';
 import { hashStr } from '../../tokens';
 import { Sound } from '../../sound';
-import { createNewInstanceLoaderMachine } from '../../machines/new-instance-loader';
-import { pickPreferredBuild } from '../../loaders/view-model';
-import { getCachedLoaderBuilds, getCachedLoaderSupportedVersions } from '../../loaders/api';
 import { createInstance } from '../../instance-create';
-import type { Catalog, CatalogVersion, LoaderBuildRecord, LoaderComponentId } from '../../types';
+import type { LoaderComponentId } from '../../types-loader';
 import {
-  channelOfVersion,
   defaultIconFor,
   defaultNameFor,
-  LOADER_COMPONENT_IDS,
-  LOADER_KEYS,
   LOADER_LABELS,
   LOADER_TAGLINES,
+  loaderKeyFromComponentId,
   type Channel,
   type LoaderKey,
 } from './defaults';
 import { LoaderLogo } from './loader-logos';
 import { LibraryBlocker } from './shared';
 import { Modal, ModalContent } from '../../ui/Modal';
-import {
-  buildRowModel,
-  CHANNEL_ORDER,
-  CHANNEL_LABEL,
-  type VersionDownloadState,
-  type VersionRowModel,
-} from './view-model';
-import { useLoaderHoverPrefetch } from './use-loader-hover-prefetch';
+import { CHANNEL_ORDER, CHANNEL_LABEL, type VersionDownloadState, type VersionRowModel } from './view-model';
 import {
   buildWindowPresets,
   detectMaxScreenSize,
@@ -45,11 +32,58 @@ import {
   type ScreenSize,
   type WindowPresetSpec,
 } from './screen-presets';
-import { versionSearchText } from '../../version-display';
-import { JVM_PRESET_CREATE_ORDER, JVM_PRESET_HINTS, JVM_PRESET_LABELS, type JvmPreset } from './jvm-presets';
 
-const BASE_CHANNEL_TABS: Channel[] = ['release', 'snapshot', 'legacy'];
 type CreateStep = 'version' | 'details';
+
+interface CreatePresetOption {
+  id: string;
+  label: string;
+  detail: string;
+  default: boolean;
+  disabled_reason?: string | null;
+}
+
+interface CreateOption {
+  id: string;
+  label: string;
+  enabled: boolean;
+  disabled_reason?: string | null;
+}
+
+interface CreateVersionRow {
+  source_id: string;
+  selection_id: string;
+  minecraft_version_id: string;
+  display_name: string;
+  hint?: string | null;
+  channel: string;
+  download_state: string;
+  create_enabled: boolean;
+  disabled_reason?: string | null;
+}
+
+interface CreateNotice {
+  state_id: string;
+  tone: string;
+  message: string;
+  detail?: string | null;
+}
+
+interface CreateBackendViewResponse {
+  sources?: CreateOption[];
+  channels?: CreateOption[];
+  versions?: CreateVersionRow[];
+  preset_options?: CreatePresetOption[];
+  notices?: CreateNotice[];
+  defaults?: {
+    source_id?: string;
+    channel_id?: string;
+    jvm_preset_id?: string;
+    max_memory_mb?: number | null;
+    window_width?: number | null;
+    window_height?: number | null;
+  };
+}
 
 export function CreateView(): JSX.Element {
   const libraryDir = config.value?.library_dir ?? '';
@@ -72,11 +106,6 @@ export function CreateView(): JSX.Element {
   );
 }
 
-function minecraftVersionFromBuildId(buildId: string): string {
-  const parts = buildId.split(':');
-  return parts.length >= 3 ? parts[1]!.trim() : '';
-}
-
 function versionStatusTitle(state: VersionDownloadState, source: LoaderKey): string {
   if (state === 'full') return 'Already installed';
   if (state === 'base') {
@@ -87,24 +116,44 @@ function versionStatusTitle(state: VersionDownloadState, source: LoaderKey): str
   return '';
 }
 
+function loaderKeyFromSourceId(sourceId: string): LoaderKey {
+  if (sourceId === 'vanilla') return 'vanilla';
+  return loaderKeyFromComponentId(sourceId as LoaderComponentId);
+}
+
+function normalizeChannel(value: string | undefined): Channel {
+  return CHANNEL_ORDER.includes(value as Channel) ? (value as Channel) : 'unknown';
+}
+
+function normalizeDownloadState(value: string | undefined): VersionDownloadState {
+  return value === 'base' || value === 'full' ? value : 'none';
+}
+
+function rowSearchText(row: VersionRowModel): string {
+  return [row.id, row.displayName, row.hint ?? ''].join(' ').toLowerCase();
+}
+
 function CreateCard(): JSX.Element {
   const [step, setStep] = useState<CreateStep>('version');
-  const [source, setSource] = useState<LoaderKey>('vanilla');
+  const [sourceId, setSourceId] = useState('vanilla');
   const [mcVersionId, setMcVersionId] = useState<string | null>(null);
   const [channel, setChannel] = useState<Channel>('release');
   const [query, setQuery] = useState('');
   const [nameOverride, setNameOverride] = useState<string | null>(null);
-  const [catalogError, setCatalogError] = useState<string | null>(null);
-  const [catalogLoading, setCatalogLoading] = useState(false);
+  const [viewError, setViewError] = useState<string | null>(null);
+  const [viewLoading, setViewLoading] = useState(false);
+  const [backendView, setBackendView] = useState<CreateBackendViewResponse | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const versionWellRef = useRef<HTMLDivElement | null>(null);
-  const versionListKey = `${source}:${channel}:${query.trim().toLowerCase()}`;
+  const versionListKey = `${sourceId}:${channel}:${query.trim().toLowerCase()}`;
 
   const totalGB = systemInfo.value?.total_memory_mb ? Math.floor(systemInfo.value.total_memory_mb / 1024) : 16;
   const memoryRec = getMemoryRecommendation(totalGB);
   const [memoryGB, setMemoryGB] = useState<number>(memoryRec.rec);
   const [seedOverride, setSeedOverride] = useState<number | null>(null);
-  const [jvmPreset, setJvmPreset] = useState<JvmPreset>('');
+  const [jvmPreset, setJvmPreset] = useState('');
+  const [presetOptions, setPresetOptions] = useState<CreatePresetOption[]>([]);
+  const sourceKey = loaderKeyFromSourceId(sourceId);
 
   const [screenMax, setScreenMax] = useState<ScreenSize>(() => ({
     w: typeof window !== 'undefined' && window.screen ? window.screen.width : 1920,
@@ -121,6 +170,10 @@ function CreateCard(): JSX.Element {
   }, []);
   const windowPresets: WindowPresetSpec[] = useMemo(() => buildWindowPresets(screenMax), [screenMax]);
   const [windowPresetId, setWindowPresetId] = useState<string>('default');
+  const selectablePresetOptions = useMemo(
+    () => presetOptions.filter((option) => !option.disabled_reason),
+    [presetOptions],
+  );
   useEffect(() => {
     if (!windowPresets.some((p) => p.id === windowPresetId)) {
       setWindowPresetId('default');
@@ -131,9 +184,78 @@ function CreateCard(): JSX.Element {
     setWindowPresetId(nextWindowPreset(windowPresets, windowPresetId).id);
   };
   const cycleJvmPreset = (): void => {
-    const i = JVM_PRESET_CREATE_ORDER.indexOf(jvmPreset);
-    setJvmPreset(JVM_PRESET_CREATE_ORDER[(i + 1) % JVM_PRESET_CREATE_ORDER.length]!);
+    if (selectablePresetOptions.length === 0) return;
+    const i = selectablePresetOptions.findIndex((option) => option.id === jvmPreset);
+    const next =
+      selectablePresetOptions[(i + 1) % selectablePresetOptions.length] ??
+      selectablePresetOptions.find((option) => option.default);
+    if (next) setJvmPreset(next.id);
   };
+
+  const loadCreateView = async (): Promise<void> => {
+    setViewLoading(true);
+    setViewError(null);
+    try {
+      const res = (await api('GET', '/instances/create-view')) as CreateBackendViewResponse & { error?: string };
+      if (res.error) throw new Error(res.error);
+      setBackendView(res);
+      const options = Array.isArray(res.preset_options)
+        ? res.preset_options.filter(
+            (option): option is CreatePresetOption =>
+              typeof option.id === 'string' && typeof option.label === 'string' && typeof option.detail === 'string',
+          )
+        : [];
+      setPresetOptions(options);
+      const selectableOptions = options.filter((option) => !option.disabled_reason);
+      const defaultPresetId = res.defaults?.jvm_preset_id;
+      const defaultOption =
+        selectableOptions.find((option) => option.id === defaultPresetId) ??
+        selectableOptions.find((option) => option.default) ??
+        selectableOptions[0];
+      if (defaultOption) {
+        setJvmPreset((current) =>
+          selectableOptions.some((option) => option.id === current) ? current : defaultOption.id,
+        );
+      }
+      const defaultMaxMemoryMb = res.defaults?.max_memory_mb;
+      if (typeof defaultMaxMemoryMb === 'number' && Number.isFinite(defaultMaxMemoryMb) && defaultMaxMemoryMb > 0) {
+        setMemoryGB(Math.max(1, Math.round((defaultMaxMemoryMb / 1024) * 2) / 2));
+      }
+      const defaultWindowWidth = res.defaults?.window_width;
+      const defaultWindowHeight = res.defaults?.window_height;
+      if (
+        typeof defaultWindowWidth === 'number' &&
+        Number.isFinite(defaultWindowWidth) &&
+        defaultWindowWidth > 0 &&
+        typeof defaultWindowHeight === 'number' &&
+        Number.isFinite(defaultWindowHeight) &&
+        defaultWindowHeight > 0
+      ) {
+        const defaultWindowPreset = windowPresets.find(
+          (preset) => preset.w === defaultWindowWidth && preset.h === defaultWindowHeight,
+        );
+        setWindowPresetId(defaultWindowPreset?.id ?? 'default');
+      }
+      const defaultSource = res.defaults?.source_id;
+      const sources = Array.isArray(res.sources) ? res.sources.filter((option) => option.enabled) : [];
+      const nextSource = sources.find((option) => option.id === defaultSource) ?? sources[0];
+      if (nextSource)
+        setSourceId((current) => (sources.some((option) => option.id === current) ? current : nextSource.id));
+      const defaultChannel = normalizeChannel(res.defaults?.channel_id);
+      setChannel((current) => (CHANNEL_ORDER.includes(current) ? current : defaultChannel));
+    } catch (err: unknown) {
+      setBackendView(null);
+      setPresetOptions([]);
+      setViewError(errMessage(err));
+    } finally {
+      setViewLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void loadCreateView();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const searchInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -143,71 +265,59 @@ function CreateCard(): JSX.Element {
     node.scrollTop = 0;
   }, [versionListKey]);
 
-  const loaderMachine = useMemo(() => createNewInstanceLoaderMachine(), []);
-  const loaderState = loaderMachine.state.value;
-  const currentComponentId = source === 'vanilla' ? null : LOADER_COMPONENT_IDS[source];
+  const sourceOptions = useMemo<CreateOption[]>(() => {
+    return Array.isArray(backendView?.sources)
+      ? backendView.sources.filter((option): option is CreateOption => {
+          return typeof option.id === 'string' && typeof option.label === 'string';
+        })
+      : [];
+  }, [backendView]);
 
-  const loadCatalog = async (): Promise<void> => {
-    setCatalogLoading(true);
-    setCatalogError(null);
-    try {
-      const res = (await api('GET', '/catalog')) as Catalog & { error?: string };
-      if (res.error) throw new Error(res.error);
-      setCatalog({ latest: res.latest, versions: res.versions });
-    } catch (err: unknown) {
-      setCatalogError(errMessage(err));
-    } finally {
-      setCatalogLoading(false);
-    }
-  };
+  const channelOptions = useMemo<CreateOption[]>(() => {
+    return Array.isArray(backendView?.channels)
+      ? backendView.channels.filter((option): option is CreateOption => {
+          return typeof option.id === 'string' && typeof option.label === 'string';
+        })
+      : [];
+  }, [backendView]);
 
   useEffect(() => {
-    if (catalog.value || catalogLoading) return;
-    void loadCatalog();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    if (sourceOptions.some((option) => option.id === sourceId && option.enabled)) return;
+    const fallback = sourceOptions.find((option) => option.enabled);
+    if (fallback) setSourceId(fallback.id);
+  }, [sourceOptions, sourceId]);
 
-  useEffect(() => {
-    if (source === 'vanilla') {
-      loaderMachine.disable();
-      return;
-    }
-    const componentId: LoaderComponentId = LOADER_COMPONENT_IDS[source];
-    void loaderMachine.changeComponent(componentId, mcVersionId);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [source]);
+  const backendRows = useMemo<CreateVersionRow[]>(() => {
+    return Array.isArray(backendView?.versions)
+      ? backendView.versions.filter((row): row is CreateVersionRow => {
+          return (
+            typeof row.source_id === 'string' &&
+            typeof row.selection_id === 'string' &&
+            typeof row.minecraft_version_id === 'string' &&
+            typeof row.display_name === 'string'
+          );
+        })
+      : [];
+  }, [backendView]);
 
-  useEffect(
-    () => () => {
-      loaderMachine.disable();
-    },
-    [loaderMachine],
+  const createNotices = useMemo<CreateNotice[]>(() => {
+    return Array.isArray(backendView?.notices)
+      ? backendView.notices.filter((notice): notice is CreateNotice => {
+          return (
+            typeof notice.state_id === 'string' && typeof notice.tone === 'string' && typeof notice.message === 'string'
+          );
+        })
+      : [];
+  }, [backendView]);
+
+  const availableForSource = useMemo(
+    () => backendRows.filter((row) => row.source_id === sourceId),
+    [backendRows, sourceId],
   );
-
-  const currentSupportedVersions = useMemo(() => {
-    if (!currentComponentId) return null;
-    if (loaderState.context.selectedComponentId === currentComponentId && loaderState.context.supportedVersions) {
-      return loaderState.context.supportedVersions;
-    }
-    return getCachedLoaderSupportedVersions(currentComponentId);
-  }, [currentComponentId, loaderState]);
-
-  const supportedSet = useMemo(() => {
-    if (source === 'vanilla') return null;
-    if (!currentSupportedVersions) return null;
-    return new Set(currentSupportedVersions.map((version) => version.id));
-  }, [source, currentSupportedVersions]);
-
-  const availableForSource: CatalogVersion[] = useMemo(() => {
-    const cat = catalog.value;
-    if (!cat) return [];
-    if (source !== 'vanilla' && supportedSet == null) return [];
-    return cat.versions.filter((v) => supportedSet == null || supportedSet.has(v.id));
-  }, [catalog.value, source, supportedSet]);
 
   const availableChannels = useMemo<Channel[]>(() => {
     const has: Record<Channel, boolean> = { release: false, snapshot: false, legacy: false, unknown: false };
-    for (const v of availableForSource) has[channelOfVersion(v)] = true;
+    for (const row of availableForSource) has[normalizeChannel(row.channel)] = true;
     return CHANNEL_ORDER.filter((c) => has[c]);
   }, [availableForSource]);
 
@@ -218,85 +328,41 @@ function CreateCard(): JSX.Element {
   }, [availableChannels, channel]);
 
   const versionRows: VersionRowModel[] = useMemo(() => {
-    const cat = catalog.value;
-    if (!cat) return [];
-    const installedSet = new Set(versions.value.filter((x) => x.installed && x.launchable).map((x) => x.id));
-    const fullInstalledSet = new Set<string>();
-    if (currentComponentId) {
-      for (const version of versions.value) {
-        if (!version.installed || !version.launchable || !version.loader) continue;
-        if (version.loader.component_id !== currentComponentId) continue;
-        const baseVersion = version.inherits_from || minecraftVersionFromBuildId(version.loader.build_id);
-        if (baseVersion) fullInstalledSet.add(baseVersion);
-      }
-    }
     const q = query.trim().toLowerCase();
-    const rows = availableForSource
-      .filter((v) => channelOfVersion(v) === channel)
-      .filter((v) => !q || versionSearchText(v).includes(q));
-    rows.sort((a, b) => (b.release_time || '').localeCompare(a.release_time || ''));
-    return rows.map((v) => {
-      let rowFullInstalledSet = fullInstalledSet;
-      const cachedBuilds = currentComponentId ? getCachedLoaderBuilds(currentComponentId, v.id) : null;
-      const preferredBuild = currentComponentId && cachedBuilds ? pickPreferredBuild(cachedBuilds) : null;
-      if (preferredBuild) {
-        rowFullInstalledSet = new Set(fullInstalledSet);
-        if (installedSet.has(preferredBuild.version_id)) {
-          rowFullInstalledSet.add(v.id);
-        } else {
-          rowFullInstalledSet.delete(v.id);
-        }
-      }
-      return buildRowModel(v, installedSet, source, rowFullInstalledSet);
-    });
-  }, [catalog.value, versions.value, channel, query, availableForSource, source, currentComponentId]);
+    return availableForSource
+      .map((row) => ({
+        id: row.minecraft_version_id,
+        selectionId: row.selection_id,
+        displayName: row.display_name,
+        hint: row.hint ?? null,
+        channel: normalizeChannel(row.channel),
+        downloadState: normalizeDownloadState(row.download_state),
+        createEnabled: row.create_enabled,
+        disabledReason: row.disabled_reason ?? null,
+      }))
+      .filter((row) => row.channel === channel)
+      .filter((row) => !q || rowSearchText(row).includes(q));
+  }, [channel, query, availableForSource]);
   const selectedVersionRow = mcVersionId ? (versionRows.find((row) => row.id === mcVersionId) ?? null) : null;
 
-  const selectedBuild: LoaderBuildRecord | null = useMemo(() => {
-    if (!currentComponentId || !mcVersionId) return null;
-    const builds =
-      loaderState.context.selectedComponentId === currentComponentId &&
-      loaderState.context.selectedMcVersion === mcVersionId
-        ? loaderState.context.builds
-        : getCachedLoaderBuilds(currentComponentId, mcVersionId);
-    const buildId = loaderState.context.selectedBuildId;
-    if (
-      loaderState.context.selectedComponentId === currentComponentId &&
-      loaderState.context.selectedMcVersion === mcVersionId &&
-      builds &&
-      buildId
-    ) {
-      return builds.find((build) => build.build_id === buildId) ?? null;
-    }
-    return pickPreferredBuild(builds ?? []);
-  }, [currentComponentId, mcVersionId, loaderState]);
-
-  const effectiveVersionId: string = useMemo(() => {
-    if (source === 'vanilla') return mcVersionId ?? '';
-    return selectedBuild?.version_id ?? '';
-  }, [source, mcVersionId, selectedBuild]);
-
-  const effectiveAlreadyInstalled: boolean = useMemo(() => {
-    if (!effectiveVersionId) return false;
-    return versions.value.some((v) => v.id === effectiveVersionId && v.installed && v.launchable);
-  }, [effectiveVersionId, versions.value]);
+  const selectionId = selectedVersionRow?.selectionId ?? '';
 
   const suggestedName = useMemo(() => {
     if (!mcVersionId) return '';
-    return defaultNameFor(source, mcVersionId);
-  }, [source, mcVersionId]);
+    return defaultNameFor(sourceKey, mcVersionId);
+  }, [sourceKey, mcVersionId]);
 
   const name = nameOverride ?? suggestedName;
   const displayName = name.trim() || suggestedName || 'New instance';
 
   const previewSeed = useMemo(() => {
     if (seedOverride != null) return seedOverride;
-    const previewId = `preview:${source}:${mcVersionId ?? 'none'}`;
+    const previewId = `preview:${sourceId}:${mcVersionId ?? 'none'}`;
     return hashStr(`${previewId}:${displayName}:${mcVersionId ?? 'preview'}`) || 1;
-  }, [seedOverride, source, mcVersionId, displayName]);
+  }, [seedOverride, sourceId, mcVersionId, displayName]);
 
   const previewInstance = {
-    id: `preview:${source}:${mcVersionId ?? 'none'}`,
+    id: `preview:${sourceId}:${mcVersionId ?? 'none'}`,
     name: displayName,
     version_id: mcVersionId ?? '',
     art_seed: previewSeed,
@@ -307,37 +373,13 @@ function CreateCard(): JSX.Element {
     setSeedOverride(nextArtSeed(previewSeed));
   };
 
-  const { scheduleHoverPrefetch, cancelHoverPrefetch } = useLoaderHoverPrefetch({
-    source,
-    mcVersionId,
-    latest: catalog.value?.latest,
-    loaderMachine,
-  });
-
   useEffect(() => {
     if (!mcVersionId) return;
     if (versionRows.some((r) => r.id === mcVersionId)) return;
     setMcVersionId(null);
   }, [versionRows, mcVersionId]);
 
-  useEffect(() => {
-    if (source === 'vanilla' || !mcVersionId) return;
-    if (!currentSupportedVersions || !currentComponentId) return;
-    void loaderMachine.changeMcVersion(mcVersionId);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mcVersionId, source, currentComponentId, currentSupportedVersions]);
-
-  const loaderLoading =
-    source !== 'vanilla' &&
-    currentSupportedVersions == null &&
-    (loaderState.kind === 'loading_components' || loaderState.kind === 'loading_versions');
-
-  const loaderError =
-    source !== 'vanilla' && currentSupportedVersions == null && loaderState.kind === 'error'
-      ? loaderState.context.errorMessage
-      : null;
-
-  const versionReady = Boolean(mcVersionId && (source === 'vanilla' || selectedBuild));
+  const versionReady = Boolean(selectionId && selectedVersionRow?.createEnabled !== false);
   const canCreate = versionReady && name.trim().length > 0 && !submitting;
 
   useEffect(() => {
@@ -352,7 +394,7 @@ function CreateCard(): JSX.Element {
   const submit = async (): Promise<void> => {
     if (submitting || !canCreate) return;
     const trimmed = name.trim();
-    if (!trimmed || !effectiveVersionId) return;
+    if (!trimmed || !selectionId) return;
     setSubmitting(true);
     try {
       const accentLabel = config.value?.theme ?? '';
@@ -360,21 +402,14 @@ function CreateCard(): JSX.Element {
       const dims = winSpec && winSpec.id !== 'default' ? { w: winSpec.w, h: winSpec.h } : null;
       const result = await createInstance({
         name: trimmed,
-        versionId: effectiveVersionId,
-        icon: defaultIconFor(source),
+        selectionId,
+        icon: defaultIconFor(sourceKey),
         accent: accentLabel,
-        install: effectiveAlreadyInstalled
-          ? { kind: 'none' }
-          : source === 'vanilla'
-            ? { kind: 'vanilla', versionId: effectiveVersionId }
-            : selectedBuild
-              ? { kind: 'loader', build: selectedBuild }
-              : { kind: 'none' },
         initialSettings: {
           max_memory_mb: Math.round(memoryGB * 1024),
           art_seed: previewSeed,
           ...(dims ? { window_width: dims.w, window_height: dims.h } : {}),
-          ...(jvmPreset ? { jvm_preset: jvmPreset } : {}),
+          jvm_preset_id: jvmPreset,
         },
       });
       if (result.ok) closeCreate();
@@ -416,28 +451,33 @@ function CreateCard(): JSX.Element {
   }, [
     canCreate,
     submitting,
-    source,
+    sourceKey,
     mcVersionId,
-    selectedBuild,
     name,
     memoryGB,
     previewSeed,
     windowPresets,
     windowPresetId,
     jvmPreset,
+    selectionId,
     step,
     versionReady,
   ]);
 
   const availableChannelSet = new Set(availableChannels);
-  const channelTabs: Channel[] = [
-    ...BASE_CHANNEL_TABS,
-    ...availableChannels.filter((c) => !BASE_CHANNEL_TABS.includes(c)),
-  ];
+  const backendChannelTabs = channelOptions.map((option) => normalizeChannel(option.id));
+  const channelTabs: Channel[] = (
+    backendChannelTabs.length > 0
+      ? [...backendChannelTabs, ...availableChannels.filter((c) => !backendChannelTabs.includes(c))]
+      : availableChannels
+  ).filter((value, index, values) => values.indexOf(value) === index);
 
   const winSpec = windowPresets.find((p) => p.id === windowPresetId) ??
     windowPresets[windowPresets.length - 1] ?? { id: 'default', label: 'Default', w: 0, h: 0 };
   const winSubtitle = winSpec.id === 'default' ? 'Game default' : `${winSpec.w} × ${winSpec.h}`;
+  const selectedPresetOption =
+    presetOptions.find((option) => option.id === jvmPreset) ?? presetOptions.find((option) => option.default) ?? null;
+  const currentSourceLabel = sourceOptions.find((option) => option.id === sourceId)?.label ?? LOADER_LABELS[sourceKey];
 
   return (
     <>
@@ -462,29 +502,46 @@ function CreateCard(): JSX.Element {
         {step === 'version' ? (
           <section class="cp-cr-pick" aria-label="Version">
             <div class="cp-cr-sources" role="radiogroup" aria-label="Instance source">
-              {LOADER_KEYS.map((key) => (
-                <button
-                  key={key}
-                  type="button"
-                  class="cp-cr-source"
-                  data-active={source === key}
-                  role="radio"
-                  aria-checked={source === key}
-                  title={LOADER_TAGLINES[key]}
-                  onClick={() => {
-                    setSource(key);
-                    setMcVersionId(null);
-                  }}
-                  onPointerEnter={() => scheduleHoverPrefetch(key)}
-                  onPointerLeave={cancelHoverPrefetch}
-                  onFocus={() => scheduleHoverPrefetch(key)}
-                  onBlur={cancelHoverPrefetch}
-                >
-                  <LoaderLogo loader={key} size={14} class="cp-cr-loader-mark" />
-                  <span>{LOADER_LABELS[key]}</span>
-                </button>
-              ))}
+              {sourceOptions.map((option) => {
+                const key = loaderKeyFromSourceId(option.id);
+                return (
+                  <button
+                    key={option.id}
+                    type="button"
+                    class="cp-cr-source"
+                    data-active={sourceId === option.id}
+                    role="radio"
+                    aria-checked={sourceId === option.id}
+                    title={option.disabled_reason ?? LOADER_TAGLINES[key]}
+                    disabled={!option.enabled}
+                    onClick={() => {
+                      if (!option.enabled) return;
+                      setSourceId(option.id);
+                      setMcVersionId(null);
+                    }}
+                  >
+                    <LoaderLogo loader={key} size={14} class="cp-cr-loader-mark" />
+                    <span>{option.label || LOADER_LABELS[key]}</span>
+                  </button>
+                );
+              })}
             </div>
+
+            {createNotices.length > 0 && (
+              <div class="cp-cr-notices" aria-live="polite">
+                {createNotices.map((notice) => (
+                  <div
+                    key={notice.state_id}
+                    class="cp-cr-notice"
+                    data-tone={notice.tone}
+                    role={notice.tone === 'warn' || notice.tone === 'error' ? 'alert' : 'status'}
+                  >
+                    <span>{notice.message}</span>
+                    {notice.detail && <small>{notice.detail}</small>}
+                  </div>
+                ))}
+              </div>
+            )}
 
             <div class="cp-cr-vbar">
               <Input
@@ -520,48 +577,27 @@ function CreateCard(): JSX.Element {
             </div>
 
             <div class="cp-cr-vwell" ref={versionWellRef}>
-              {catalogLoading && (
+              {viewLoading && (
                 <div class="cp-cr-state">
                   <span class="cp-cr-spinner" aria-hidden="true" />
                   <span>Loading versions…</span>
                 </div>
               )}
-              {!catalogLoading && catalogError && (
+              {!viewLoading && viewError && (
                 <div class="cp-cr-state is-error" role="alert" aria-live="polite">
-                  <span>Couldn't load the catalog: {catalogError}</span>
+                  <span>Couldn't load create options: {viewError}</span>
                   <Button
                     variant="ghost"
                     size="sm"
                     onClick={() => {
-                      void loadCatalog();
+                      void loadCreateView();
                     }}
                   >
                     Retry
                   </Button>
                 </div>
               )}
-              {!catalogLoading && !catalogError && loaderLoading && (
-                <div class="cp-cr-state">
-                  <span class="cp-cr-spinner" aria-hidden="true" />
-                  <span>Fetching {LOADER_LABELS[source]}…</span>
-                </div>
-              )}
-              {!catalogLoading && !catalogError && loaderError && (
-                <div class="cp-cr-state is-error" role="alert" aria-live="polite">
-                  <span>{loaderError}</span>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => {
-                      if (source === 'vanilla') return;
-                      void loaderMachine.changeComponent(LOADER_COMPONENT_IDS[source], mcVersionId);
-                    }}
-                  >
-                    Retry
-                  </Button>
-                </div>
-              )}
-              {!catalogLoading && !catalogError && !loaderLoading && !loaderError && versionRows.length === 0 && (
+              {!viewLoading && !viewError && versionRows.length === 0 && (
                 <div class="cp-cr-state is-empty">
                   <span>Nothing matches.</span>
                 </div>
@@ -573,9 +609,14 @@ function CreateCard(): JSX.Element {
                       key={row.id}
                       class="cp-cr-vrow"
                       data-active={mcVersionId === row.id}
+                      data-disabled={!row.createEnabled}
                       role="option"
                       aria-selected={mcVersionId === row.id}
-                      onClick={() => setMcVersionId(row.id)}
+                      aria-disabled={!row.createEnabled}
+                      title={row.disabledReason ?? undefined}
+                      onClick={() => {
+                        if (row.createEnabled) setMcVersionId(row.id);
+                      }}
                     >
                       <span class="cp-cr-vrow-name">{row.displayName}</span>
                       {row.hint && <span class="cp-cr-vrow-hint">{row.hint}</span>}
@@ -584,7 +625,7 @@ function CreateCard(): JSX.Element {
                         <span
                           class="cp-cr-vrow-installed"
                           data-state={row.downloadState}
-                          title={versionStatusTitle(row.downloadState, source)}
+                          title={versionStatusTitle(row.downloadState, sourceKey)}
                         >
                           <Icon
                             name={row.downloadState === 'base' ? 'circle-dashed' : 'download'}
@@ -605,12 +646,8 @@ function CreateCard(): JSX.Element {
             </div>
 
             <div class="cp-cr-pickfoot" aria-live="polite">
-              {source !== 'vanilla' && mcVersionId && selectedBuild ? (
-                <span>
-                  {LOADER_LABELS[source]} build <b>{selectedBuild.loader_version}</b>
-                </span>
-              ) : source !== 'vanilla' && mcVersionId ? (
-                <span>Resolving {LOADER_LABELS[source]} build…</span>
+              {sourceKey !== 'vanilla' && mcVersionId ? (
+                <span>{currentSourceLabel} selected</span>
               ) : (
                 <span>
                   {versionRows.length} version{versionRows.length === 1 ? '' : 's'}
@@ -636,7 +673,7 @@ function CreateCard(): JSX.Element {
               <div class="cp-cr-identity-text">
                 <h2 title={displayName}>{displayName}</h2>
                 <div class="cp-cr-identity-pills">
-                  <Pill>{source === 'vanilla' ? 'Vanilla' : LOADER_LABELS[source]}</Pill>
+                  <Pill>{currentSourceLabel}</Pill>
                   {mcVersionId ? (
                     <Pill>MC {selectedVersionRow?.displayName ?? mcVersionId}</Pill>
                   ) : (
@@ -691,11 +728,12 @@ function CreateCard(): JSX.Element {
                 class="cp-cr-row"
                 onClick={cycleJvmPreset}
                 aria-label="Cycle performance profile"
-                title={JVM_PRESET_HINTS[jvmPreset]}
+                title={selectedPresetOption?.disabled_reason ?? selectedPresetOption?.detail ?? undefined}
+                disabled={selectablePresetOptions.length === 0}
               >
                 <span class="cp-cr-row-key">Profile</span>
                 <span class="cp-cr-row-val">
-                  <span class="cp-cr-row-value">{JVM_PRESET_LABELS[jvmPreset]}</span>
+                  <span class="cp-cr-row-value">{selectedPresetOption?.label ?? 'Loading'}</span>
                   <Icon name="chevron-right" size={13} stroke={2} />
                 </span>
               </button>
@@ -709,11 +747,7 @@ function CreateCard(): JSX.Element {
           {step === 'version'
             ? !versionReady
               ? 'Pick a Minecraft version to continue.'
-              : source === 'vanilla'
-                ? 'Continue to name and settings.'
-                : selectedBuild
-                  ? `${LOADER_LABELS[source]} ${selectedBuild.loader_version} selected.`
-                  : `Resolving ${LOADER_LABELS[source]} build...`
+              : 'Continue to name and settings.'
             : !versionReady
               ? 'Pick a Minecraft version to continue.'
               : canCreate

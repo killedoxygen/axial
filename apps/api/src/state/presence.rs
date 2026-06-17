@@ -1,4 +1,5 @@
 use super::AppState;
+use crate::observability::{RedactionAudience, sanitize_public_diagnostic_text};
 use croopor_config::{AppConfig, Instance};
 use croopor_launcher::{LaunchSessionRecord, LaunchState};
 use croopor_minecraft::{VersionEntry, scan_versions};
@@ -280,50 +281,12 @@ fn with_performance_mode(base: String, instance: Option<&Instance>, config: &App
 }
 
 fn sanitize_presence_text(raw: &str, fallback: &str) -> String {
-    if looks_sensitive(raw) {
-        return fallback.to_string();
-    }
-
-    let mut out = String::new();
-    let mut last_space = false;
-    for ch in raw.chars() {
-        let ch = if ch.is_control() || matches!(ch, '/' | '\\' | ':') {
-            ' '
-        } else {
-            ch
-        };
-        if ch.is_whitespace() {
-            if !last_space && !out.is_empty() {
-                out.push(' ');
-            }
-            last_space = true;
-            continue;
-        }
-        if out.chars().count() >= PRESENCE_TEXT_MAX_CHARS {
-            break;
-        }
-        out.push(ch);
-        last_space = false;
-    }
-
-    let trimmed = out.trim();
-    if trimmed.is_empty() {
-        fallback.to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
-fn looks_sensitive(raw: &str) -> bool {
-    let lower = raw.to_ascii_lowercase();
-    lower.contains("://")
-        || lower.contains("\\users\\")
-        || lower.contains("/users/")
-        || lower.contains("/home/")
-        || lower.contains("appdata")
-        || lower.contains(".minecraft")
-        || lower.contains("access_token")
-        || lower.contains("uuid")
+    sanitize_public_diagnostic_text(
+        raw,
+        RedactionAudience::UserVisible,
+        PRESENCE_TEXT_MAX_CHARS,
+        fallback,
+    )
 }
 
 #[cfg(test)]

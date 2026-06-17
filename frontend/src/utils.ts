@@ -1,15 +1,9 @@
 import { collapsedLogSeverity, currentPage, logLines } from './store';
 import { toast } from './toast';
 import { loaderKeyFromComponentId, LOADER_LABELS } from './views/create/defaults';
-import type {
-  CatalogVersion,
-  LifecycleLabel,
-  LifecycleMeta,
-  LoaderBuildRecord,
-  LoaderBuildMetadata,
-  Page,
-  Version,
-} from './types';
+import type { CatalogVersion, LifecycleLabel, LifecycleMeta, Version } from './types-version';
+import type { LoaderBuildRecord, LoaderBuildMetadata } from './types-loader';
+import type { Page } from './types-ui';
 
 import type { LogSeverity } from './store';
 

@@ -1,5 +1,9 @@
 use crate::events;
 use crate::state::{ApiRuntimeState, DesktopState};
+use croopor_api::application::launch::public_launch_status_json;
+use croopor_api::application::{
+    public_loader_install_progress_json, public_vanilla_install_progress_json,
+};
 use croopor_api::routes::flush_pending_saved_skin_applies_for_shutdown;
 use croopor_api::state::{AppState, LaunchEvent, LaunchSessionRecord, LaunchStatusEvent};
 use croopor_launcher::{LaunchState, launch_notice_from_values};
@@ -291,7 +295,7 @@ pub async fn start_install_events(
     tauri::async_runtime::spawn(async move {
         for progress in history {
             let terminal = progress.done;
-            let _ = app.emit(&event_name, progress);
+            let _ = app.emit(&event_name, public_vanilla_install_progress_json(&progress));
             if terminal {
                 installs.remove(&install_id).await;
                 return;
@@ -305,7 +309,7 @@ pub async fn start_install_events(
             match receiver.recv().await {
                 Ok(progress) => {
                     let terminal = progress.done;
-                    let _ = app.emit(&event_name, progress);
+                    let _ = app.emit(&event_name, public_vanilla_install_progress_json(&progress));
                     if terminal {
                         installs.remove(&install_id).await;
                         return;
@@ -340,7 +344,7 @@ pub async fn start_loader_install_events(
     tauri::async_runtime::spawn(async move {
         for progress in history {
             let terminal = progress.done;
-            let _ = app.emit(&event_name, progress);
+            let _ = app.emit(&event_name, public_loader_install_progress_json(&progress));
             if terminal {
                 installs.remove(&install_id).await;
                 return;
@@ -354,7 +358,7 @@ pub async fn start_loader_install_events(
             match receiver.recv().await {
                 Ok(progress) => {
                     let terminal = progress.done;
-                    let _ = app.emit(&event_name, progress);
+                    let _ = app.emit(&event_name, public_loader_install_progress_json(&progress));
                     if terminal {
                         installs.remove(&install_id).await;
                         return;
@@ -392,7 +396,11 @@ pub async fn start_launch_events(
     let log_event_name = events::launch_log(&session_id);
 
     tauri::async_runtime::spawn(async move {
-        let _ = app.emit(&status_event_name, snapshot_status(&snapshot));
+        let snapshot_status = snapshot_status(&snapshot);
+        let _ = app.emit(
+            &status_event_name,
+            public_launch_status_json(&snapshot_status),
+        );
         if is_terminal_state(snapshot.state) {
             return;
         }
@@ -400,7 +408,7 @@ pub async fn start_launch_events(
             match receiver.recv().await {
                 Ok(LaunchEvent::Status(status)) => {
                     let terminal = matches!(status.state.as_str(), "failed" | "exited");
-                    let _ = app.emit(&status_event_name, status);
+                    let _ = app.emit(&status_event_name, public_launch_status_json(&status));
                     if terminal {
                         return;
                     }

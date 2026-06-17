@@ -1,4 +1,4 @@
-import type { CatalogVersion, Version } from './types';
+import type { CatalogVersion, Version } from './types-version';
 import { parseVersionDisplay } from './utils';
 
 type VersionDisplaySource =

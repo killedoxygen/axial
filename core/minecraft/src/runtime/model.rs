@@ -1,0 +1,137 @@
+use crate::launch::JavaVersion;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use thiserror::Error;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JavaRuntimeInfo {
+    pub id: String,
+    pub major: u32,
+    #[serde(default)]
+    pub update: u32,
+    #[serde(default)]
+    pub distribution: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JavaRuntimeResult {
+    pub path: String,
+    pub component: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RuntimeId(pub String);
+
+impl RuntimeId {
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl From<String> for RuntimeId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for RuntimeId {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeSource {
+    Managed,
+    MinecraftBundled,
+    MicrosoftStore,
+    ExternalOverride,
+}
+
+impl RuntimeSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Managed => "managed",
+            Self::MinecraftBundled => "minecraft-runtime",
+            Self::MicrosoftStore => "ms-store",
+            Self::ExternalOverride => "override",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeInstallState {
+    Missing,
+    Installing,
+    Ready,
+    Broken,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeRecord {
+    pub id: RuntimeId,
+    pub java_path: String,
+    pub info: JavaRuntimeInfo,
+    pub source: RuntimeSource,
+    pub install_state: RuntimeInstallState,
+    pub root_dir: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeRequirement {
+    pub required_java: JavaVersion,
+    pub preferred_component: RuntimeId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeOverride {
+    None,
+    Component(RuntimeId),
+    ExecutablePath(PathBuf),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeEnsureAction {
+    UseRequested,
+    UseManaged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeEnsureResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested: Option<RuntimeRecord>,
+    pub effective: RuntimeRecord,
+    pub bypassed_requested_runtime: bool,
+    pub install_performed: bool,
+    pub action: RuntimeEnsureAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeEnsureEvent {
+    DownloadingManagedRuntime {
+        component: String,
+    },
+    InstallingManagedRuntimeFiles {
+        component: String,
+        current: usize,
+        total: usize,
+        file: Option<String>,
+    },
+}
+
+#[derive(Debug, Error)]
+pub enum JavaRuntimeLookupError {
+    #[error("java runtime not found: {component} (Java {major}) not installed")]
+    NotFound { component: String, major: i32 },
+    #[error("failed to install java runtime: {0}")]
+    Download(String),
+    #[error("java runtime probe timed out")]
+    ProbeTimedOut,
+    #[error("failed to probe java runtime: {0}")]
+    Probe(String),
+}

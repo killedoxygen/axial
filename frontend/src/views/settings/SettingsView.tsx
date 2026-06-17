@@ -1,30 +1,22 @@
-import type { JSX, ComponentChildren } from 'preact';
+import type { JSX } from 'preact';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { Button, Card, Input, Pill, Segmented } from '../../ui/Atoms';
+import { Button, Input, Pill, Segmented } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { Slider } from '../../ui/Slider';
 import { AccentField, AccentModeToggle } from './AccentEditor';
-import { local, saveLocalState, STORAGE_KEY } from '../../state';
+import { local, saveLocalState } from '../../state';
 import { Sound } from '../../sound';
 import { Music, musicStateVersion } from '../../music';
-import { config, systemInfo, devMode, appVersion, updateCheckState, updateInfo } from '../../store';
-import { navigate, ROUTE_STORAGE_KEY } from '../../ui-state';
+import { config, systemInfo } from '../../store';
 import { api } from '../../api';
 import { toast } from '../../toast';
-import { hasNativeDesktopRuntime, openExternalURL } from '../../native';
 import { clampPlayerNameInput } from '../../player-name';
 import { errMessage, fmtMem, getMemoryRecommendation, validateUsername } from '../../utils';
-import {
-  checkForUpdates,
-  dismissAvailableUpdate,
-  formatUpdateCheckTime,
-  hasVisibleUpdate,
-  openUpdateAction,
-  openUpdateChecksum,
-  openUpdateNotes,
-  restartDesktopApp,
-} from '../../updater';
-import type { GuardianMode, PerformanceMode, PerformanceRulesStatus } from '../../types';
+import type { GuardianMode } from '../../types-guardian';
+import type { PerformanceMode, PerformanceRulesStatus } from '../../types-performance';
+import { AboutSettingsSection } from './AboutSettingsSection';
+import { AdvancedSettingsSection } from './AdvancedSettingsSection';
+import { SettingsCard, Toggle } from './settings-shared';
 
 type SectionId = 'appearance' | 'gameplay' | 'performance' | 'audio' | 'shortcuts' | 'advanced' | 'about';
 
@@ -37,31 +29,6 @@ const SECTIONS: Array<{ id: SectionId; label: string; icon: string }> = [
   { id: 'advanced', label: 'Advanced', icon: 'terminal' },
   { id: 'about', label: 'About', icon: 'info' },
 ];
-
-function SettingsCard({
-  title,
-  desc,
-  control,
-  stack,
-  children,
-}: {
-  title: string;
-  desc?: string;
-  control?: ComponentChildren;
-  stack?: boolean;
-  children?: ComponentChildren;
-}): JSX.Element {
-  return (
-    <Card class={`cp-settings-card${stack ? ' cp-settings-card--stack' : ''}`}>
-      <div>
-        <div class="cp-settings-card-title">{title}</div>
-        {desc && <div class="cp-settings-card-desc">{desc}</div>}
-        {stack && children}
-      </div>
-      {(control || (!stack && children)) && <div class="cp-settings-card-control">{control || children}</div>}
-    </Card>
-  );
-}
 
 type ModeOption<T extends string> = {
   value: T;
@@ -112,10 +79,6 @@ function performanceModeFrom(value: string | undefined): PerformanceMode {
 
 function guardianModeFrom(value: string | undefined): GuardianMode {
   return value === 'custom' ? 'custom' : 'managed';
-}
-
-function Toggle({ on, onChange }: { on: boolean; onChange: () => void }): JSX.Element {
-  return <button type="button" class="cp-toggle" data-on={on} role="switch" aria-checked={on} onClick={onChange} />;
 }
 
 function AppearanceSection(): JSX.Element {
@@ -316,40 +279,6 @@ type RulesStatusState =
   | { status: 'ready'; data: PerformanceRulesStatus; error?: undefined }
   | { status: 'error'; data: null; error: string };
 
-function healthStateLabel(value: string): string {
-  return value
-    .split('_')
-    .map((part) => part[0]?.toUpperCase() + part.slice(1))
-    .join(' ');
-}
-
-function ownershipLabel(value: string): string {
-  if (value === 'composition_managed') return 'Croopor-managed';
-  if (value === 'user_managed') return 'User-managed';
-  return healthStateLabel(value);
-}
-
-function formatRuleDate(value: string): string {
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
-  return new Intl.DateTimeFormat(undefined, { year: 'numeric', month: 'short', day: 'numeric' }).format(date);
-}
-
-function emergencyDisableSummary(status: PerformanceRulesStatus): string {
-  const count = status.emergency_disable_count ?? status.emergency_disables?.length ?? 0;
-  if (count === 0) return 'None active';
-  const firstReason = status.emergency_disables?.[0]?.reason?.trim();
-  const prefix = `${count} active`;
-  return firstReason ? `${prefix}: ${firstReason}` : prefix;
-}
-
-function rulesCacheSummary(status: PerformanceRulesStatus): string {
-  const cache = status.rules_cache;
-  if (cache?.state === 'invalid') return 'Invalid local cache';
-  if (!cache?.recorded) return 'Unavailable';
-  return 'Recorded locally';
-}
-
 function PerformanceRulesStatusBlock({
   state,
   standalone = false,
@@ -382,50 +311,32 @@ function PerformanceRulesStatusBlock({
   }
 
   const status = state.data;
-  const source = status.rule_source === 'built_in' ? 'Built-in rules' : healthStateLabel(status.rule_source);
-  const channel = status.rule_channel === 'bundled' ? 'bundled manifest' : healthStateLabel(status.rule_channel);
-  const refresh = status.remote_refresh
-    ? status.last_refresh_at
-      ? `Last refreshed ${formatRuleDate(status.last_refresh_at)}`
-      : 'Remote refresh configured, not refreshed yet'
-    : 'Remote refresh off';
+  const viewModel = status.view_model;
 
   return (
     <div class={className} aria-live="polite">
       <div class="cp-settings-rule-status-head">
         <div class="cp-settings-rule-status-copy">
-          <strong>{source} active</strong>
-          <span>
-            {status.validation === 'valid'
-              ? 'Managed performance defaults are ready.'
-              : 'Managed performance rules need attention.'}
-          </span>
+          <strong>{viewModel.source_label} active</strong>
+          <span>{viewModel.summary}</span>
         </div>
-        <Pill
-          tone={status.validation === 'valid' ? 'ok' : 'err'}
-          icon={status.validation === 'valid' ? 'check' : 'alert'}
-        >
-          {status.validation === 'valid' ? 'Valid' : 'Invalid'}
+        <Pill tone={viewModel.validation_tone} icon={viewModel.validation_icon}>
+          {viewModel.validation_label}
         </Pill>
       </div>
       <div class="cp-settings-rule-status-meta">
         <span>Source</span>
-        <strong>{channel}</strong>
+        <strong>{viewModel.channel_label}</strong>
         <span>Refresh</span>
-        <strong>{refresh}</strong>
+        <strong>{viewModel.refresh_label}</strong>
         <span>Compositions</span>
         <strong>{status.composition_count}</strong>
       </div>
       <details class="cp-settings-rule-details">
-        <summary>
-          Rule details
-          {status.warnings.length > 0
-            ? `, ${status.warnings.length} warning${status.warnings.length === 1 ? '' : 's'}`
-            : ''}
-        </summary>
-        {status.warnings.length > 0 && (
+        <summary>{viewModel.details_label}</summary>
+        {viewModel.warnings.length > 0 && (
           <div class="cp-settings-rule-status-warnings">
-            {status.warnings.map((warning) => (
+            {viewModel.warnings.map((warning) => (
               <span key={warning}>{warning}</span>
             ))}
           </div>
@@ -434,15 +345,15 @@ function PerformanceRulesStatusBlock({
           <span>Schema</span>
           <strong>v{status.schema_version}</strong>
           <span>Generated</span>
-          <strong>{formatRuleDate(status.generated_at)}</strong>
+          <strong>{viewModel.generated_label}</strong>
           <span>Rules cache</span>
-          <strong>{rulesCacheSummary(status)}</strong>
+          <strong>{viewModel.cache_label}</strong>
           <span>Emergency disables</span>
-          <strong>{emergencyDisableSummary(status)}</strong>
+          <strong>{viewModel.emergency_disable_label}</strong>
           <span>Bundle health</span>
-          <strong>{status.health_states.map(healthStateLabel).join(', ')}</strong>
+          <strong>{viewModel.health_states_label}</strong>
           <span>Ownership</span>
-          <strong>{status.ownership_classes.map(ownershipLabel).join(', ')}</strong>
+          <strong>{viewModel.ownership_label}</strong>
         </div>
       </details>
     </div>
@@ -544,31 +455,6 @@ function PerformanceSection(): JSX.Element {
   );
 }
 
-type PerformanceLabCardComponent = (typeof import('./PerformanceLabCard'))['PerformanceLabCard'];
-
-function PerformanceLabSlot(): JSX.Element | null {
-  const isDev = devMode.value;
-  const [Lab, setLab] = useState<PerformanceLabCardComponent | null>(null);
-
-  useEffect(() => {
-    if (!isDev) {
-      setLab(null);
-      return;
-    }
-
-    let alive = true;
-    void import('./PerformanceLabCard').then((module) => {
-      if (alive) setLab(() => module.PerformanceLabCard);
-    });
-    return () => {
-      alive = false;
-    };
-  }, [isDev]);
-
-  if (!isDev || !Lab) return null;
-  return <Lab />;
-}
-
 function AudioSection(): JSX.Element {
   musicStateVersion.value;
   const [soundsOn, setSoundsOn] = useState<boolean>(local.sounds);
@@ -663,181 +549,6 @@ function ShortcutsSection(): JSX.Element {
   );
 }
 
-function AdvancedSection(): JSX.Element {
-  const cfg = config.value;
-  const isDev = devMode.value;
-  const savedTelemetry = cfg?.telemetry_enabled === true;
-  const [telemetryEnabled, setTelemetryEnabled] = useState(savedTelemetry);
-  const [savingTelemetry, setSavingTelemetry] = useState(false);
-  const [busy, setBusy] = useState(false);
-
-  useEffect(() => {
-    setTelemetryEnabled(savedTelemetry);
-  }, [savedTelemetry]);
-
-  const toggleTelemetry = async (): Promise<void> => {
-    if (savingTelemetry) return;
-    const next = !telemetryEnabled;
-    setTelemetryEnabled(next);
-    setSavingTelemetry(true);
-    try {
-      const res: any = await api('PUT', '/config', { telemetry_enabled: next });
-      if (res?.error) throw new Error(res.error);
-      config.value = res;
-      toast('Saved');
-    } catch (err) {
-      setTelemetryEnabled(savedTelemetry);
-      toast(`Could not save diagnostics setting: ${errMessage(err)}`, 'error');
-    } finally {
-      setSavingTelemetry(false);
-    }
-  };
-
-  const flush = async (): Promise<void> => {
-    const { showConfirm } = await import('../../ui/Dialog');
-    const ok = await showConfirm('Delete all Croopor-owned data and reset the launcher to first run?', {
-      destructive: true,
-      confirmText: 'Reset',
-    });
-    if (!ok) return;
-    setBusy(true);
-    try {
-      await api('POST', '/dev/flush');
-      for (const key of [STORAGE_KEY, ROUTE_STORAGE_KEY]) {
-        localStorage.removeItem(key);
-      }
-      location.reload();
-    } catch (err) {
-      toast(`Failed: ${errMessage(err)}`);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <>
-      <SettingsCard
-        title="Optional diagnostics"
-        desc="Stores diagnostics consent. Current builds do not upload telemetry or open a remote diagnostics channel."
-        control={<Toggle on={telemetryEnabled} onChange={() => void toggleTelemetry()} />}
-      />
-      <SettingsCard
-        title="Reload launcher"
-        desc="Useful if the launcher gets out of sync with the backend."
-        control={
-          <Button variant="secondary" icon="refresh" onClick={() => location.reload()}>
-            Reload
-          </Button>
-        }
-      />
-      {__CROOPOR_ENABLE_DEV_LAB__ && isDev && (
-        <SettingsCard
-          title="Dev lab"
-          desc="Developer-only workbench for procedural art and internal experiments."
-          control={
-            <Button variant="secondary" icon="palette" onClick={() => navigate({ name: 'dev-lab' })}>
-              Open lab
-            </Button>
-          }
-        />
-      )}
-      {isDev && <PerformanceLabSlot />}
-      {isDev && (
-        <SettingsCard
-          title="Flush all data"
-          desc="Deletes every Croopor-managed file and restarts from first run. Existing libraries selected through 'Use existing' are preserved."
-          control={
-            <Button variant="danger" icon="trash" disabled={busy} onClick={flush}>
-              {busy ? 'Flushing…' : 'Flush'}
-            </Button>
-          }
-        />
-      )}
-    </>
-  );
-}
-
-function displayReleaseVersion(version: string): string {
-  return version.startsWith('v') || version.startsWith('V') ? version : `v${version}`;
-}
-
-async function openHomepage(): Promise<void> {
-  try {
-    await openExternalURL('https://github.com/mateoltd/croopor');
-    toast('Opened homepage');
-  } catch (err: unknown) {
-    toast(`Failed to open homepage: ${errMessage(err)}`, 'error');
-  }
-}
-
-function AboutSection(): JSX.Element {
-  const info = updateInfo.value;
-  const checkState = updateCheckState.value;
-  const [, setDismissedAt] = useState(0);
-  const checking = checkState === 'checking';
-  const latestVersion = info?.latest_version || appVersion.value;
-  const status = checking
-    ? 'Checking for updates...'
-    : info
-      ? info.available
-        ? `Latest release: ${displayReleaseVersion(latestVersion)}`
-        : `Current release: ${displayReleaseVersion(info.current_version)}`
-      : 'Updates have not been checked yet.';
-  const visibleUpdate = hasVisibleUpdate();
-  const checkedAt = info ? formatUpdateCheckTime(info.checked_at) : 'Not checked yet';
-
-  const dismiss = (): void => {
-    dismissAvailableUpdate();
-    setDismissedAt(Date.now());
-  };
-
-  return (
-    <SettingsCard title="Croopor" desc={`Version ${appVersion.value}. A focused Minecraft launcher.`} stack>
-      <div style={{ marginTop: 12, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-        <Button variant="secondary" icon="globe" onClick={() => void openHomepage()}>
-          Homepage
-        </Button>
-        <Button
-          variant="secondary"
-          icon="refresh"
-          disabled={checking}
-          onClick={() => void checkForUpdates({ force: true })}
-        >
-          {checking ? 'Checking...' : 'Check'}
-        </Button>
-        {hasNativeDesktopRuntime() && (
-          <Button variant="secondary" icon="refresh" onClick={() => void restartDesktopApp()}>
-            Restart
-          </Button>
-        )}
-      </div>
-      <div style={{ marginTop: 12, color: 'var(--text)', fontSize: 13, fontWeight: 700 }}>{status}</div>
-      <div style={{ marginTop: 4, color: 'var(--text-mute)', fontSize: 12 }}>Last checked: {checkedAt}</div>
-      {checkState === 'error' && (
-        <div style={{ marginTop: 8, color: 'var(--err)', fontSize: 12 }}>Could not check for updates.</div>
-      )}
-      {visibleUpdate && (
-        <div style={{ marginTop: 12, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-          <Button variant="primary" icon="globe" onClick={() => void openUpdateAction()}>
-            {info?.action_label || 'Open release'}
-          </Button>
-          <Button variant="secondary" icon="tag" onClick={() => void openUpdateNotes()}>
-            Notes
-          </Button>
-          {info?.checksum_url && (
-            <Button variant="secondary" icon="shield-check" onClick={() => void openUpdateChecksum()}>
-              Checksum
-            </Button>
-          )}
-          <Button variant="secondary" icon="x" onClick={dismiss}>
-            Dismiss
-          </Button>
-        </div>
-      )}
-    </SettingsCard>
-  );
-}
-
 export function SettingsView(): JSX.Element {
   const [section, setSection] = useState<SectionId>('appearance');
 
@@ -865,8 +576,8 @@ export function SettingsView(): JSX.Element {
         {section === 'performance' && <PerformanceSection />}
         {section === 'audio' && <AudioSection />}
         {section === 'shortcuts' && <ShortcutsSection />}
-        {section === 'advanced' && <AdvancedSection />}
-        {section === 'about' && <AboutSection />}
+        {section === 'advanced' && <AdvancedSettingsSection />}
+        {section === 'about' && <AboutSettingsSection />}
       </div>
     </div>
   );

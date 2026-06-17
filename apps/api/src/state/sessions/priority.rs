@@ -1,3 +1,4 @@
+use crate::observability::{RedactionAudience, sanitize_public_diagnostic_text};
 use std::io;
 use tokio::process::Command;
 
@@ -54,13 +55,12 @@ pub(super) fn promote_after_boot(pid: Option<u32>) -> io::Result<PriorityPromoti
 }
 
 pub(super) fn sanitize_priority_error(error: &io::Error) -> Option<String> {
-    let sanitized = error
-        .to_string()
-        .trim()
-        .chars()
-        .filter(|value| !value.is_control() && !matches!(value, '/' | '\\'))
-        .take(MAX_PRIORITY_ERROR_CHARS)
-        .collect::<String>();
+    let sanitized = sanitize_public_diagnostic_text(
+        &error.to_string(),
+        RedactionAudience::UserVisible,
+        MAX_PRIORITY_ERROR_CHARS,
+        "",
+    );
     let sanitized = sanitized.trim();
     (!sanitized.is_empty()).then(|| sanitized.to_string())
 }
@@ -174,12 +174,15 @@ mod tests {
 
     #[test]
     fn priority_error_text_is_bounded_and_path_scrubbed() {
+        let error = io::Error::other(" /tmp\\secret priority setup failed");
+
+        assert_eq!(sanitize_priority_error(&error), None);
+
         let error = io::Error::other(format!(
-            " /tmp\\secret\n{}",
+            " priority setup failed {}",
             "x".repeat(MAX_PRIORITY_ERROR_CHARS + 40)
         ));
-
-        let sanitized = sanitize_priority_error(&error).expect("sanitized error");
+        let sanitized = sanitize_priority_error(&error).expect("safe sanitized error");
 
         assert!(!sanitized.contains('/'));
         assert!(!sanitized.contains('\\'));

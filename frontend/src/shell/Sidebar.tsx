@@ -12,7 +12,7 @@ import { Music, musicStateVersion } from '../music';
 import { local, saveLocalState } from '../state';
 import { Sound } from '../sound';
 import { openInstanceContextMenu } from '../views/instance/instance-menu';
-import type { Instance } from '../types';
+import type { Instance } from '../types-instance';
 
 type RailTip = {
   label: string;
@@ -172,7 +172,7 @@ function RailInstances({ tooltip }: { tooltip: RailTooltipController }): JSX.Ele
             const version = versionById(inst.version_id);
             const install = instanceInstallStatus(inst, version);
             const installing = install.installing;
-            const installLabel = install.state === 'queued' ? 'Install queued' : 'Installing';
+            const installLabel = install.state === 'queued' ? install.queuedItem?.title || install.label : 'Installing';
             return (
               <button
                 key={inst.id}

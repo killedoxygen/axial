@@ -4,6 +4,7 @@
 //! This submodule exposes the durable vocabulary for journals, ownership,
 //! snapshots, and persistence boundaries used by the target systems.
 
+use crate::observability::evidence_text_looks_sensitive;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -45,6 +46,7 @@ pub enum StabilizationSystem {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub enum CommandKind {
+    CreateInstance,
     LaunchInstance,
     StopSession,
     InstallVersion,
@@ -93,7 +95,7 @@ impl TargetDescriptor {
 
 pub(crate) fn sanitize_target_id(value: &str, fallback: &str) -> String {
     let value = value.trim();
-    if value.is_empty() || target_id_looks_sensitive(value) {
+    if value.is_empty() || evidence_text_looks_sensitive(value) || has_windows_drive_prefix(value) {
         return fallback.to_string();
     }
 
@@ -112,23 +114,6 @@ pub(crate) fn sanitize_target_id(value: &str, fallback: &str) -> String {
     } else {
         sanitized.to_string()
     }
-}
-
-fn target_id_looks_sensitive(value: &str) -> bool {
-    let lower = value.to_ascii_lowercase();
-    value.contains('/')
-        || value.contains('\\')
-        || value.chars().any(char::is_control)
-        || lower.contains("-xmx")
-        || lower.contains("-xms")
-        || lower.contains("-xx:")
-        || lower.contains("--access")
-        || lower.contains("--username")
-        || lower.contains("--uuid")
-        || lower.contains("token")
-        || lower.contains("secret")
-        || lower.contains("password")
-        || has_windows_drive_prefix(value)
 }
 
 fn has_windows_drive_prefix(value: &str) -> bool {

@@ -10,7 +10,8 @@ import { loaderKeyFromVersion, LOADER_LABELS } from '../create/defaults';
 import { openInstanceContextMenu } from '../instance/instance-menu';
 import { supportsMods } from '../../utils';
 import { minecraftVersionLabel } from '../../version-display';
-import type { EnrichedInstance, Version } from '../../types';
+import type { Version } from '../../types-version';
+import type { EnrichedInstance } from '../../types-instance';
 
 function greetingFor(date: Date): string {
   const h = date.getHours();
@@ -48,7 +49,7 @@ function FeatureBanner({ inst }: { inst: EnrichedInstance }): JSX.Element {
   const running = !!runningSessions.value[inst.id];
   const install = instanceInstallStatus(inst, version);
   const installing = install.installing;
-  const installBadge = install.state === 'queued' ? 'Install queued' : 'Installing';
+  const installBadge = install.state === 'queued' ? install.queuedItem?.title || install.label : 'Installing';
   const mods = inst.mods_count ?? 0;
   const showModsCount = supportsMods(version);
   const open = (): void => navigate({ name: 'instance', id: inst.id });

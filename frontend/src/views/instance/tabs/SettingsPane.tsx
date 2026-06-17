@@ -9,17 +9,11 @@ import { config, systemInfo } from '../../../store';
 import { updateInstanceInList } from '../../../actions';
 import { toast } from '../../../toast';
 import { errMessage, fmtMem, getMemoryRecommendation } from '../../../utils';
-import type { EnrichedInstance, InstancePerformanceMode } from '../../../types';
-import {
-  JVM_PRESET_HINTS,
-  JVM_PRESET_LABELS,
-  JVM_PRESET_ORDER,
-  jvmPresetFrom,
-  type JvmPreset,
-} from '../../create/jvm-presets';
+import type { InstancePerformanceMode } from '../../../types-performance';
+import type { EnrichedInstance } from '../../../types-instance';
 import { memoryGb } from '../format';
 import { globalPerformanceMode, performanceModeFrom, performanceModeLabel } from '../performance-mode';
-import type { PerformanceMode } from '../../../types';
+import type { PerformanceMode } from '../../../types-performance';
 import { JavaPathField, JvmArgsInput } from './AdvancedOverrides';
 import { WindowSizeField, type WindowPreset } from './WindowSizeField';
 
@@ -41,6 +35,18 @@ const INSTANCE_PERFORMANCE_OPTIONS: Array<{ value: InstancePerformanceMode; labe
   { value: 'custom', label: 'Custom', icon: 'sliders' },
 ];
 
+interface JvmPresetOption {
+  id: string;
+  label: string;
+  detail: string;
+  default: boolean;
+  disabled_reason?: string | null;
+}
+
+interface CreateBackendViewResponse {
+  preset_options?: JvmPresetOption[];
+}
+
 function instancePerformanceNote(mode: InstancePerformanceMode, globalMode: PerformanceMode): string {
   if (!mode) return `Follows the global Performance setting, currently ${performanceModeLabel(globalMode)}.`;
   if (mode === 'managed') return 'Croopor applies recommended tuning and optimizations for this instance.';
@@ -50,6 +56,21 @@ function instancePerformanceNote(mode: InstancePerformanceMode, globalMode: Perf
 
 function instancePerformanceModeFrom(value: string | undefined): InstancePerformanceMode {
   return performanceModeFrom(value) ?? '';
+}
+
+function jvmPresetFromBackendOptions(value: string | undefined, options: JvmPresetOption[]): string {
+  const trimmed = (value ?? '').trim();
+  const selectable = selectableJvmPresetOptions(options);
+  if (selectable.length === 0) return trimmed;
+  return selectable.some((option) => option.id === trimmed) ? trimmed : '';
+}
+
+function selectableJvmPresetOptions(options: JvmPresetOption[]): JvmPresetOption[] {
+  return options.filter((option) => !option.disabled_reason);
+}
+
+function jvmPresetSelectLabel(option: JvmPresetOption): string {
+  return option.disabled_reason ? `${option.label} (${option.disabled_reason})` : option.label;
 }
 
 function SettingRow({
@@ -82,7 +103,8 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
   const [performanceMode, setPerformanceMode] = useState<InstancePerformanceMode>(
     instancePerformanceModeFrom(inst.performance_mode),
   );
-  const [jvmPreset, setJvmPreset] = useState<JvmPreset>(jvmPresetFrom(inst.jvm_preset));
+  const [jvmPresetOptions, setJvmPresetOptions] = useState<JvmPresetOption[]>([]);
+  const [jvmPreset, setJvmPreset] = useState<string>(jvmPresetFromBackendOptions(inst.jvm_preset, jvmPresetOptions));
   const [javaPath, setJavaPath] = useState<string>(inst.java_path ?? '');
   const [jvmArgs, setJvmArgs] = useState<string>(inst.extra_jvm_args ?? '');
   const [saving, setSaving] = useState(false);
@@ -102,6 +124,12 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
   const activeWindowPreset = WINDOW_PRESETS.find((p) => p.w === width && p.h === height)?.id ?? 'custom';
   const activeWindowLabel = WINDOW_PRESETS.find((p) => p.id === activeWindowPreset)?.label ?? 'Custom';
   const effectiveSettingsMode = performanceMode || globalPerformanceMode();
+  const persistedJvmPreset = jvmPresetFromBackendOptions(inst.jvm_preset, jvmPresetOptions);
+  const selectableJvmPresets = selectableJvmPresetOptions(jvmPresetOptions);
+  const selectedJvmPresetOption =
+    jvmPresetOptions.find((option) => option.id === jvmPreset) ??
+    jvmPresetOptions.find((option) => option.default) ??
+    null;
   const performanceModeText = performanceMode
     ? `${performanceModeLabel(effectiveSettingsMode)} override`
     : `Inherits ${performanceModeLabel(effectiveSettingsMode)} from global settings`;
@@ -113,7 +141,7 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
     width !== persistedWidth ||
     height !== persistedHeight ||
     performanceMode !== instancePerformanceModeFrom(inst.performance_mode) ||
-    jvmPreset !== jvmPresetFrom(inst.jvm_preset) ||
+    jvmPreset !== persistedJvmPreset ||
     javaPath !== (inst.java_path ?? '') ||
     jvmArgs !== (inst.extra_jvm_args ?? '');
 
@@ -122,12 +150,35 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
   }, [maxMem]);
 
   useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = (await api('GET', '/instances/create-view')) as CreateBackendViewResponse & { error?: string };
+        if (cancelled || res.error) return;
+        const options = Array.isArray(res.preset_options)
+          ? res.preset_options.filter(
+              (option): option is JvmPresetOption =>
+                typeof option.id === 'string' && typeof option.label === 'string' && typeof option.detail === 'string',
+            )
+          : [];
+        setJvmPresetOptions(options);
+        setJvmPreset((current) => jvmPresetFromBackendOptions(current, options));
+      } catch {
+        if (!cancelled) setJvmPresetOptions([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
     setMaxMem(memoryGb(inst.max_memory_mb, config.value?.max_memory_mb ?? 4096));
     setMinMem(memoryGb(inst.min_memory_mb, config.value?.min_memory_mb ?? 1024));
     setWidth(windowDimension(inst.window_width, 854));
     setHeight(windowDimension(inst.window_height, 480));
     setPerformanceMode(instancePerformanceModeFrom(inst.performance_mode));
-    setJvmPreset(jvmPresetFrom(inst.jvm_preset));
+    setJvmPreset(jvmPresetFromBackendOptions(inst.jvm_preset, jvmPresetOptions));
     setJavaPath(inst.java_path ?? '');
     setJvmArgs(inst.extra_jvm_args ?? '');
   }, [
@@ -140,6 +191,7 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
     inst.jvm_preset,
     inst.java_path,
     inst.extra_jvm_args,
+    jvmPresetOptions,
   ]);
 
   const save = async (): Promise<void> => {
@@ -199,16 +251,26 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
             </div>
           </SettingRow>
 
-          <SettingRow title="Runtime" description={JVM_PRESET_HINTS[jvmPreset]} className="cp-iset-row--runtime">
+          <SettingRow
+            title="Runtime"
+            description={selectedJvmPresetOption?.disabled_reason ?? selectedJvmPresetOption?.detail}
+            className="cp-iset-row--runtime"
+          >
             <div class="cp-runtime-control">
               <div class="cp-iset-duo">
                 <label class="cp-ovr-field">
                   <span>JVM preset</span>
-                  <SelectField<JvmPreset>
+                  <SelectField<string>
                     value={jvmPreset}
                     ariaLabel="JVM preset"
                     onChange={setJvmPreset}
-                    options={JVM_PRESET_ORDER.map((preset) => ({ value: preset, label: JVM_PRESET_LABELS[preset] }))}
+                    disabled={selectableJvmPresets.length === 0}
+                    placeholder="Loading"
+                    options={jvmPresetOptions.map((preset) => ({
+                      value: preset.id,
+                      label: jvmPresetSelectLabel(preset),
+                      disabled: Boolean(preset.disabled_reason),
+                    }))}
                   />
                 </label>
 

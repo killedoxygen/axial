@@ -25,6 +25,7 @@ import {
 } from './native';
 import { refreshAccountSkin } from './player-skin';
 import { scheduleAutoUpdateCheck } from './updater';
+import { refreshInstallQueue } from './install';
 import { toast } from './toast';
 import { errMessage } from './utils';
 import { restoreRoute, showOnboardingOverlay, showSetupOverlay } from './ui-state';
@@ -74,6 +75,7 @@ async function init(): Promise<void> {
       versions.value = versionsRes.versions || [];
       instances.value = instancesRes.instances || [];
       lastInstanceId.value = instancesRes.last_instance_id || null;
+      await refreshInstallQueue({ connectActive: true });
     }
 
     // Apply backend-persisted theme if our local default won

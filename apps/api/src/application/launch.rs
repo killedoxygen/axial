@@ -14,14 +14,30 @@ use crate::guardian::{
 };
 use crate::observability::{RedactionAudience, sanitize_evidence_text, sanitize_evidence_token};
 use crate::state::contracts::{CommandKind, OperationId, OperationPhase, OperationStatus};
+use axum::{Json, http::StatusCode};
 use croopor_launcher::{LaunchStageEvidence, launch_notice};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+mod benchmark;
 mod policy;
+mod reports;
 mod runner;
 mod session;
 
+pub(crate) use super::performance::BenchmarkMatrix;
+pub(crate) use benchmark::*;
+#[cfg(test)]
+pub(crate) use reports::{
+    LAUNCH_COMMAND_REDACTED_VALUE, LAUNCH_KILL_INTERNAL_ERROR_MESSAGE,
+    LAUNCH_REPORT_STORAGE_ERROR_MESSAGE, launch_kill_error_response,
+    launch_report_storage_error_response, sanitize_launch_command,
+};
+pub use reports::{LaunchStatusViewModel, public_launch_status_json};
+pub(crate) use reports::{
+    launch_command_payload, launch_report_payload, launch_reports_payload, launch_status_payload,
+    stop_launch_session,
+};
 pub use runner::{
     LaunchRequestError, LaunchSuccess, launch_session, persist_launch_proof_best_effort,
     sanitize_live_launch_failure_message, trace_launch_event,
@@ -31,6 +47,8 @@ pub use session::{
     LaunchPreflightResourceBudget, LaunchPreflightResponse, LaunchRequest, LaunchSessionTask,
     PreparedLaunch, prepare_launch_preflight, prepare_launch_session,
 };
+
+pub type LaunchApplicationError = (StatusCode, Json<Value>);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LaunchInstanceStaging {
@@ -183,8 +201,10 @@ pub fn launch_benchmark_status_payload(
 }
 
 pub fn launch_success_response_payload(launched: &LaunchSuccess) -> Value {
+    let view_model = LaunchStatusViewModel::for_state("queued");
     json!({
         "status": "launching",
+        "state": "queued",
         "session_id": &launched.session_id,
         "instance_id": &launched.instance_id,
         "pid": launched.pid,
@@ -200,10 +220,12 @@ pub fn launch_success_response_payload(launched: &LaunchSuccess) -> Value {
             None,
             None,
         ),
+        "view_model": view_model,
     })
 }
 
 pub fn launch_prepared_response_payload(task: &LaunchSessionTask) -> Value {
+    let view_model = LaunchStatusViewModel::for_state("queued");
     json!({
         "status": "launching",
         "state": "queued",
@@ -216,6 +238,7 @@ pub fn launch_prepared_response_payload(task: &LaunchSessionTask) -> Value {
         "healing": null,
         "guardian": &task.guardian,
         "notice": launch_notice(Some(&task.guardian), None, None, None, None),
+        "view_model": view_model,
     })
 }
 
@@ -234,6 +257,22 @@ pub fn launch_request_error_response_payload(error: &LaunchRequestError) -> Valu
         "guardian": error.guardian,
         "notice": notice,
     })
+}
+
+pub fn launch_request_error_response(error: LaunchRequestError) -> LaunchApplicationError {
+    let status = launch_request_error_status(&error);
+    (status, Json(launch_request_error_response_payload(&error)))
+}
+
+pub fn launch_request_error_status(error: &LaunchRequestError) -> StatusCode {
+    if error.guardian.as_ref().is_some_and(|guardian| {
+        crate::guardian::launch_summary_decision_kind(guardian)
+            == crate::guardian::GuardianDecisionKind::Block
+    }) {
+        StatusCode::UNPROCESSABLE_ENTITY
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
 }
 
 fn launch_boundary_safety_outcome(

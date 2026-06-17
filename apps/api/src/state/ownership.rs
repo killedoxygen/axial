@@ -67,6 +67,8 @@ pub enum CurrentArtifact {
     ManagedRuntimeCache,
     MusicCacheFile,
     InternalLaunchProof,
+    GuardianFailureMemorySnapshot,
+    OperationJournalSnapshot,
     PerformanceRulesCache,
     PerformanceOperationStatus,
     PerformanceCompositionLock,
@@ -103,6 +105,8 @@ impl CurrentArtifact {
             Self::LauncherConfigFile
             | Self::InstanceRegistryFile
             | Self::PerformanceRulesCache
+            | Self::GuardianFailureMemorySnapshot
+            | Self::OperationJournalSnapshot
             | Self::PerformanceOperationStatus
             | Self::PerformanceCompositionLock => TargetKind::Config,
             Self::ManagedLibraryRoot
@@ -131,6 +135,8 @@ impl CurrentArtifact {
             | Self::ManagedRuntimeCache
             | Self::MusicCacheFile
             | Self::InternalLaunchProof
+            | Self::GuardianFailureMemorySnapshot
+            | Self::OperationJournalSnapshot
             | Self::PerformanceRulesCache
             | Self::PerformanceOperationStatus => OwnershipClass::LauncherManaged,
             Self::PerformanceCompositionLock | Self::ManagedPerformanceArtifact => {
@@ -158,6 +164,8 @@ impl CurrentArtifact {
             Self::ManagedRuntimeCache => "managed_runtime_cache",
             Self::MusicCacheFile => "music_cache_file",
             Self::InternalLaunchProof => "internal_launch_proof",
+            Self::GuardianFailureMemorySnapshot => "guardian_failure_memory",
+            Self::OperationJournalSnapshot => "operation_journal",
             Self::PerformanceRulesCache => "performance_rules_cache",
             Self::PerformanceOperationStatus => "performance_operation_status",
             Self::PerformanceCompositionLock => "performance_composition_lock",

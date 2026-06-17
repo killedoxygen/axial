@@ -1,19 +1,11 @@
 import { signal, computed } from '@preact/signals';
-import type {
-  Instance,
-  Version,
-  Config,
-  SystemInfo,
-  RunningSession,
-  InstallItem,
-  Catalog,
-  Page,
-  ToastItem,
-  UpdateInfo,
-  InstanceLaunchDraft,
-  LaunchNotice,
-} from './types';
-import type { LaunchStage } from './launch-stages';
+import type { RunningSession, InstanceLaunchDraft, LaunchNotice } from './types-launch';
+import type { Version, Catalog } from './types-version';
+import type { InstallFailureViewModel, InstallItem, InstallQueueStateResponse } from './types-install';
+import type { Instance } from './types-instance';
+import type { Config, SystemInfo } from './types-settings';
+import type { Page, ToastItem } from './types-ui';
+import type { UpdateInfo } from './types-update';
 
 export const instances = signal<Instance[]>([]);
 export const versions = signal<Version[]>([]);
@@ -67,18 +59,39 @@ export type InstallState =
 export type InstallFailure = {
   item: InstallItem;
   displayName: string;
-  message: string;
+  viewModel: InstallFailureViewModel;
   failedAt: number;
 };
 
 export const installState = signal<InstallState>({ status: 'idle' });
-export const installQueue = signal<InstallItem[]>([]);
+export const emptyInstallQueueState: InstallQueueStateResponse = {
+  active: null,
+  items: [],
+  view_model: {
+    state_id: 'idle',
+    status_label: 'Idle',
+    title: 'Nothing downloading',
+    summary: 'Launch an instance that needs a download, or install a new Minecraft version, and it will show up here.',
+    queued_count: 0,
+    queued_count_label: 'No queued downloads',
+    queued_item_label: 'No items queued',
+    next_label: null,
+    active_queued_count_label: null,
+    section_title: 'Queue',
+    empty_title: 'Nothing downloading',
+    empty_summary:
+      'Launch an instance that needs a download, or install a new Minecraft version, and it will show up here.',
+  },
+  notice: null,
+  started_install: null,
+};
+export const installQueueState = signal<InstallQueueStateResponse>(emptyInstallQueueState);
 export const installFailure = signal<InstallFailure | null>(null);
 export const installEventSource = signal<{ close(): void } | null>(null);
 
 export type LaunchState =
   | { status: 'idle' }
-  | { status: 'preparing'; instanceId: string; pct: number; label: string; stage?: LaunchStage };
+  | { status: 'preparing'; instanceId: string; pct: number; label: string; stage?: string };
 
 export const launchState = signal<LaunchState>({ status: 'idle' });
 export const runningSessions = signal<Record<string, RunningSession>>({});

@@ -161,7 +161,13 @@ pub fn cleanup_incomplete_version(mc_dir: &Path, version_id: &str) {
         return;
     }
     let version_dir = versions_dir(mc_dir).join(version_id);
-    let _ = fs::remove_dir_all(version_dir);
+    let marker = version_dir.join(".incomplete");
+    let marker_is_regular_file = fs::symlink_metadata(&marker)
+        .map(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        .unwrap_or(false);
+    if marker_is_regular_file {
+        let _ = fs::remove_dir_all(version_dir);
+    }
 }
 
 fn merge_arguments(
@@ -371,6 +377,26 @@ mod tests {
 
         assert!(root.join("versions").is_dir());
         assert!(retained.is_dir());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cleanup_incomplete_version_preserves_complete_version_without_marker() {
+        let root = temp_dir("cleanup-complete-version");
+        create_minecraft_dir(&root).expect("library");
+        let version_dir = root.join("versions").join("loader-complete");
+        fs::create_dir_all(&version_dir).expect("version dir");
+        fs::write(
+            version_dir.join("loader-complete.json"),
+            br#"{"id":"loader-complete"}"#,
+        )
+        .expect("version json");
+
+        cleanup_incomplete_version(&root, "loader-complete");
+
+        assert!(version_dir.is_dir());
+        assert!(version_dir.join("loader-complete.json").is_file());
 
         let _ = fs::remove_dir_all(root);
     }

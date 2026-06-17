@@ -1,17 +1,16 @@
 use crate::application::{
-    InstallStatusResponse, InstallVersionStartRequest, install_status, sanitize_install_progress,
-    start_install_version,
+    InstallQueueRequest, InstallQueueStateResponse, InstallStatusResponse,
+    InstallVersionStartRequest, enqueue_install, install_events_stream, install_queue_status,
+    install_status, remove_queued_install, retry_install, start_install_version,
 };
-use crate::state::{AppState, DownloadProgress};
+use crate::state::AppState;
 use axum::{
     Json, Router,
     extract::{Path, State},
     http::StatusCode,
-    response::sse::{Event, Sse},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use serde::Deserialize;
-use std::convert::Infallible;
 
 #[derive(Debug, Deserialize)]
 struct InstallRequest {
@@ -23,6 +22,18 @@ struct InstallRequest {
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/install", post(handle_install))
+        .route(
+            "/api/v1/install/queue",
+            get(handle_install_queue_status).post(handle_install_queue_enqueue),
+        )
+        .route(
+            "/api/v1/install/queue/retry",
+            post(handle_install_queue_retry),
+        )
+        .route(
+            "/api/v1/install/queue/{id}",
+            delete(handle_install_queue_remove),
+        )
         .route("/api/v1/install/{id}/status", get(handle_install_status))
         .route("/api/v1/install/{id}/events", get(handle_install_events))
 }
@@ -50,508 +61,245 @@ async fn handle_install_status(
     install_status(&state, &id).await.map(Json)
 }
 
+async fn handle_install_queue_status(
+    State(state): State<AppState>,
+) -> Result<Json<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
+    install_queue_status(&state).await.map(Json)
+}
+
+async fn handle_install_queue_enqueue(
+    State(state): State<AppState>,
+    Json(payload): Json<InstallQueueRequest>,
+) -> Result<Json<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
+    enqueue_install(&state, payload).await.map(Json)
+}
+
+async fn handle_install_queue_retry(
+    State(state): State<AppState>,
+    Json(payload): Json<InstallQueueRequest>,
+) -> Result<Json<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
+    retry_install(&state, payload).await.map(Json)
+}
+
+async fn handle_install_queue_remove(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
+    remove_queued_install(&state, &id).await.map(Json)
+}
+
 async fn handle_install_events(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<
-    Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>,
-    (StatusCode, Json<serde_json::Value>),
-> {
-    let (history, mut receiver, done) = state.installs().subscribe(&id).await.ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "install session not found" })),
-        )
-    })?;
-
-    let store = state.installs().clone();
-    let install_id = id.clone();
-    let stream = async_stream::stream! {
-        for progress in history {
-            let progress = sanitize_install_progress(progress);
-            let terminal = progress.done;
-            yield Ok(progress_event(&progress));
-            if terminal {
-                return;
-            }
-        }
-        if done {
-            return;
-        }
-
-        loop {
-            match receiver.recv().await {
-                Ok(progress) => {
-                    let progress = sanitize_install_progress(progress);
-                    let terminal = progress.done;
-                    yield Ok(progress_event(&progress));
-                    if terminal {
-                        return;
-                    }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    store.remove(&install_id).await;
-                    return;
-                }
-            }
-        }
-    };
-
-    Ok(Sse::new(stream))
-}
-
-fn progress_event(progress: &DownloadProgress) -> Event {
-    Event::default()
-        .event("progress")
-        .data(serde_json::to_string(progress).unwrap_or_else(|_| "{}".to_string()))
+) -> Result<impl axum::response::IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    install_events_stream(&state, &id).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::install::{
-        INSTALL_FAILURE_MESSAGE, effective_install_fields, interrupted_install_progress,
-        observed_install_failure_progress,
+    use crate::{
+        application::{
+            begin_install_operation_journal, install::INSTALL_FAILURE_MESSAGE,
+            install_operation_id, record_install_operation_guardian_repair_outcome,
+            record_install_operation_progress,
+        },
+        guardian::{
+            DiagnosisId, GuardianActionKind, GuardianArtifactRepairOutcome,
+            GuardianArtifactRepairStatus,
+        },
+        state::{AppStateInit, InstallStore, SessionStore},
     };
-    use crate::application::{
-        begin_install_operation_journal, install_operation_id,
-        record_install_operation_guardian_repair_outcome, record_install_operation_interrupted,
-        record_install_operation_progress,
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Method, Request},
     };
-    use crate::guardian::{
-        DiagnosisId, GuardianActionKind, GuardianArtifactRepairOutcome,
-        GuardianArtifactRepairStatus,
-    };
-    use crate::state::contracts::{OperationId, OperationStatus};
-    use crate::state::{AppStateInit, InstallStore, SessionStore};
-    use axum::{body::to_bytes, response::IntoResponse};
     use croopor_config::{AppPaths, ConfigStore, InstanceStore};
+    use croopor_minecraft::DownloadProgress;
     use croopor_performance::PerformanceManager;
-    use std::{fs, path::Path as FsPath, sync::Arc};
+    use serde_json::Value;
+    use std::{fs, path::PathBuf, sync::Arc};
+    use tower::ServiceExt;
 
-    #[test]
-    fn effective_install_fields_trims_version_id_and_manifest_url() {
-        let payload = InstallVersionStartRequest {
-            version_id: " 1.21.5 ".to_string(),
-            manifest_url: " https://example.invalid/manifest.json ".to_string(),
-        };
-
-        assert_eq!(
-            effective_install_fields(&payload),
-            (
-                "1.21.5".to_string(),
-                "https://example.invalid/manifest.json".to_string()
-            )
-        );
-    }
-
-    #[test]
-    fn effective_install_fields_preserves_explicit_manifest_url() {
-        let normal = InstallVersionStartRequest {
-            version_id: "1.21.5".to_string(),
-            manifest_url: String::new(),
-        };
-        let explicit = InstallVersionStartRequest {
-            version_id: "1.21.5".to_string(),
-            manifest_url: "https://example.invalid/manifest.json".to_string(),
-        };
-
-        assert_ne!(
-            effective_install_fields(&normal),
-            effective_install_fields(&explicit)
-        );
-    }
-
-    #[test]
-    fn sanitize_install_progress_preserves_safe_non_error_progress() {
-        let progress = DownloadProgress {
-            phase: "libraries".to_string(),
-            current: 7,
-            total: 42,
-            file: Some("1.20.1.json".to_string()),
-            error: None,
-            done: false,
-        };
-
-        assert_eq!(sanitize_install_progress(progress.clone()), progress);
-    }
-
-    #[test]
-    fn sanitize_install_progress_hides_raw_terminal_error_fragments() {
-        let progress = DownloadProgress {
+    #[tokio::test]
+    async fn install_status_route_serializes_guardian_repair_status_payload() {
+        let fixture = RouteInstallFixture::new("install-status-guardian-repair-route");
+        let install_id = "repair-status-route-install";
+        let operation_id = install_operation_id(install_id);
+        let failed_progress = DownloadProgress {
             phase: "error".to_string(),
             current: 0,
             total: 0,
-            file: None,
+            file: Some("/Users/alice/.croopor/libraries/secret-client.jar".to_string()),
             error: Some(
-                "request failed: GET https://piston-meta.mojang.com/mc/game/version_manifest_v2.json \
-                 parse version json: expected value at line 1 column 1 \
-                 prepare java runtime: failed in /home/zero/.croopor/runtime/java \
-                 and C:\\Users\\zero\\AppData\\Roaming\\Croopor\\runtime\\java"
+                "checksum failed in /Users/alice/.croopor with token secret provider_payload"
                     .to_string(),
             ),
             done: true,
         };
 
-        let sanitized = sanitize_install_progress(progress);
-        let message = sanitized.error.as_deref().expect("error is present");
-
-        assert_eq!(message, INSTALL_FAILURE_MESSAGE);
-        assert_no_raw_fragments(message);
-    }
-
-    #[test]
-    fn sanitize_install_progress_preserves_shape_and_only_changes_error_text() {
-        let progress = DownloadProgress {
-            phase: "error".to_string(),
-            current: 13,
-            total: 21,
-            file: Some("1.20.1.json".to_string()),
-            error: Some(
-                "request failed for https://example.invalid/manifest.json in /tmp/croopor"
-                    .to_string(),
-            ),
-            done: true,
-        };
-
-        let sanitized = sanitize_install_progress(progress.clone());
-
-        assert_eq!(sanitized.phase, progress.phase);
-        assert_eq!(sanitized.current, progress.current);
-        assert_eq!(sanitized.total, progress.total);
-        assert_eq!(sanitized.file, progress.file);
-        assert_eq!(sanitized.done, progress.done);
-        assert_eq!(sanitized.error.as_deref(), Some(INSTALL_FAILURE_MESSAGE));
-    }
-
-    #[test]
-    fn sanitize_install_progress_redacts_raw_non_terminal_progress() {
-        let progress = DownloadProgress {
-            phase: r"C:\Users\Alice\.minecraft --accessToken raw-secret".to_string(),
-            current: 7,
-            total: 42,
-            file: Some("/Users/alice/.croopor/libraries/secret.jar".to_string()),
-            error: Some(
-                "provider_payload={\"token\":\"secret\"} account_id=account-secret username=SecretPlayer"
-                    .to_string(),
-            ),
-            done: false,
-        };
-
-        let sanitized = sanitize_install_progress(progress);
-
-        assert_eq!(sanitized.phase, "install");
-        assert_eq!(sanitized.file, None);
-        assert_eq!(sanitized.error.as_deref(), Some(INSTALL_FAILURE_MESSAGE));
-    }
-
-    #[test]
-    fn observed_install_failure_progress_is_sanitized_terminal_error() {
-        let progress = observed_install_failure_progress();
-
-        assert_eq!(progress.phase, "error");
-        assert_eq!(progress.current, 0);
-        assert_eq!(progress.total, 0);
-        assert_eq!(progress.file, None);
-        assert_eq!(progress.error.as_deref(), Some(INSTALL_FAILURE_MESSAGE));
-        assert!(progress.done);
-    }
-
-    #[tokio::test]
-    async fn install_events_keep_terminal_installs_subscribable_after_stream_ends() {
-        let root = test_root("install-events-terminal-retention");
-        let state = build_test_state(&root);
-        state.installs().insert("done-install".to_string()).await;
-        state.installs().emit("done-install", done_progress()).await;
-
-        let response =
-            handle_install_events(State(state.clone()), Path("done-install".to_string()))
-                .await
-                .expect("terminal install events should be served")
-                .into_response();
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("sse body should complete");
-        let body = String::from_utf8(body.to_vec()).expect("sse body is utf8");
-
-        assert!(body.contains("event: progress"));
-        assert!(body.contains("\"phase\":\"done\""));
-        let (history, _, done) = state
+        fixture
+            .state
             .installs()
-            .subscribe("done-install")
-            .await
-            .expect("terminal install remains subscribable after stream completion");
-        assert!(done);
-        assert_eq!(history.len(), 1);
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn install_existing_active_response_includes_backend_operation_id() {
-        let root = test_root("install-existing-active-operation");
-        let state = build_test_state(&root);
-        configure_library_dir(&state, &root.join("library"));
-        state
-            .installs()
-            .insert_or_existing_active(
-                "existing-install".to_string(),
-                "1.21.5".to_string(),
-                String::new(),
-            )
+            .insert(install_id.to_string())
             .await;
-
-        let response = handle_install(
-            State(state.clone()),
-            Json(InstallRequest {
-                version_id: "1.21.5".to_string(),
-                manifest_url: String::new(),
-            }),
-        )
-        .await
-        .expect("existing active install should be returned");
-        let operation_id = crate::application::install_operation_id("existing-install");
-
-        assert_eq!(response.0["install_id"], "existing-install");
-        assert_eq!(response.0["operation_id"], operation_id.as_str());
-        assert!(state.journals().get(&operation_id).is_none());
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn install_status_exposes_backend_authored_guardian_repair_summary() {
-        let root = test_root("install-status-guardian-repair");
-        let state = build_test_state(&root);
-        let install_id = "repair-status-install";
-        let operation_id = install_operation_id(install_id);
-        state.installs().insert(install_id.to_string()).await;
-        state
+        fixture
+            .state
             .installs()
-            .emit(install_id, observed_install_failure_progress())
+            .emit(install_id, failed_progress.clone())
             .await;
-        begin_install_operation_journal(state.journals(), &operation_id, "1.21.5");
+        begin_install_operation_journal(fixture.state.journals(), &operation_id, "1.21.5");
         let mut last_phase = None;
         record_install_operation_progress(
-            state.journals(),
+            fixture.state.journals(),
             &operation_id,
-            &observed_install_failure_progress(),
+            &failed_progress,
             &mut last_phase,
         );
         record_install_operation_guardian_repair_outcome(
-            state.journals(),
+            fixture.state.journals(),
             &operation_id,
             &GuardianArtifactRepairOutcome {
-                operation_id: OperationId::new(
-                    "guardian-artifact-repair:123e4567-e89b-12d3-a456-426614174000",
+                operation_id: crate::state::contracts::OperationId::new(
+                    "guardian-artifact-repair:123e4567-e89b-12d3-a456-426614174002",
                 ),
                 diagnosis_id: DiagnosisId::new("launcher_managed_artifact_corrupt"),
                 action: GuardianActionKind::Repair,
                 status: GuardianArtifactRepairStatus::Repaired,
-                facts: vec!["https://example.invalid/client.jar?token=secret".to_string()],
+                facts: vec![
+                    "https://example.invalid/client.jar?token=secret".to_string(),
+                    "/Users/alice/.croopor/libraries/secret-client.jar".to_string(),
+                ],
                 summary: "guardian_artifact_repaired".to_string(),
             },
         );
 
-        let response = handle_install_status(State(state), Path(install_id.to_string()))
-            .await
-            .expect("install status");
-
-        assert_eq!(response.0.install_id, install_id);
-        assert_eq!(response.0.operation_id, operation_id);
-        assert!(response.0.done);
-        assert_eq!(response.0.progress.len(), 1);
-        let repair = response.0.guardian_repair.expect("guardian repair");
-        assert_eq!(repair.status, "repaired");
-        assert_eq!(
-            repair.repair_operation_id.as_str(),
-            "guardian-artifact-repair:123e4567-e89b-12d3-a456-426614174000"
-        );
-        assert!(repair.label.contains("repaired"));
-        assert_no_raw_fragments(&serde_json::to_string(&repair).expect("repair json"));
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn install_status_exposes_interrupted_install_as_redacted_terminal_state() {
-        let root = test_root("install-status-interrupted");
-        let state = build_test_state(&root);
-        let install_id = "interrupted-status-install";
-        let operation_id = install_operation_id(install_id);
-        state.installs().insert(install_id.to_string()).await;
-        state
-            .installs()
-            .emit(install_id, interrupted_install_progress())
-            .await;
-        begin_install_operation_journal(state.journals(), &operation_id, "1.21.5");
-        record_install_operation_interrupted(
-            state.journals(),
-            &operation_id,
-            &DownloadProgress {
-                phase: r"C:\Users\Alice\.minecraft --accessToken provider_payload".to_string(),
-                current: 0,
-                total: 0,
-                file: Some("/Users/alice/.croopor/libraries/secret.jar".to_string()),
-                error: Some(
-                    "worker interrupted in /Users/alice/.croopor with token secret provider_payload={\"token\":\"secret\"}"
-                        .to_string(),
-                ),
-                done: true,
-            },
-        );
-
-        let response = handle_install_status(State(state.clone()), Path(install_id.to_string()))
-            .await
-            .expect("install status");
-
-        assert_eq!(response.0.install_id, install_id);
-        assert_eq!(response.0.operation_id, operation_id);
-        assert!(response.0.done);
-        assert_eq!(response.0.progress.len(), 1);
-        assert_eq!(
-            response.0.progress[0].error.as_deref(),
-            Some(INSTALL_FAILURE_MESSAGE)
-        );
-        assert!(response.0.guardian_repair.is_none());
-        let journal = state.journals().get(&operation_id).expect("journal");
-        assert_eq!(journal.status, OperationStatus::Failed);
-        assert_eq!(
-            journal.failure_point.as_deref(),
-            Some("install_worker_interrupted")
-        );
-        assert_no_raw_fragments(&serde_json::to_string(&response.0).expect("status json"));
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn install_status_redacts_raw_progress_history_and_install_id() {
-        let root = test_root("install-status-raw-progress");
-        let state = build_test_state(&root);
-        let install_id = r"C:\Users\Alice\.minecraft --accessToken raw-secret";
-        state.installs().insert(install_id.to_string()).await;
-        state
-            .installs()
-            .emit(
-                install_id,
-                DownloadProgress {
-                    phase: r"C:\Users\Alice\.minecraft --accessToken raw-secret".to_string(),
-                    current: 3,
-                    total: 9,
-                    file: Some("/Users/alice/.croopor/libraries/secret.jar".to_string()),
-                    error: Some(
-                        "provider_payload={\"token\":\"secret\"} account_id=account-secret username=SecretPlayer"
-                            .to_string(),
-                    ),
-                    done: false,
-                },
+        let (status, payload) = fixture
+            .request_json(
+                Method::GET,
+                "/api/v1/install/repair-status-route-install/status",
             )
             .await;
 
-        let response = handle_install_status(State(state), Path(install_id.to_string()))
-            .await
-            .expect("install status");
-
-        assert_eq!(response.0.install_id, "install");
-        assert_eq!(response.0.progress.len(), 1);
-        assert_eq!(response.0.progress[0].phase, "install");
-        assert_eq!(response.0.progress[0].file, None);
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(payload["install_id"], install_id);
+        assert_eq!(payload["operation_id"], operation_id.as_str());
+        assert_eq!(payload["done"], true);
+        assert_eq!(payload["progress"][0]["phase"], "error");
+        assert_eq!(payload["progress"][0]["error"], INSTALL_FAILURE_MESSAGE);
         assert_eq!(
-            response.0.progress[0].error.as_deref(),
-            Some(INSTALL_FAILURE_MESSAGE)
+            payload["guardian_repair"]["diagnosis_id"],
+            "launcher_managed_artifact_corrupt"
         );
-        assert_no_raw_fragments(&serde_json::to_string(&response.0).expect("status json"));
-
-        let _ = fs::remove_dir_all(root);
+        assert_eq!(payload["guardian_repair"]["status"], "repaired");
+        assert_eq!(
+            payload["guardian_repair"]["repair_operation_id"],
+            "guardian-artifact-repair:123e4567-e89b-12d3-a456-426614174002"
+        );
+        assert!(
+            payload["guardian_repair"]["label"]
+                .as_str()
+                .is_some_and(|label| label.contains("repaired"))
+        );
+        assert_eq!(
+            payload["failure_view_model"]["state_id"],
+            "failed_repair_applied"
+        );
+        assert_eq!(payload["failure_view_model"]["title"], "Install failed");
+        assert_eq!(
+            payload["failure_view_model"]["retry_action"]["action"],
+            "retry"
+        );
+        assert_eq!(
+            payload["failure_view_model"]["retry_action"]["enabled"],
+            true
+        );
+        assert_eq!(
+            payload["failure_view_model"]["repair_action"]["action"],
+            "repair"
+        );
+        assert_eq!(
+            payload["failure_view_model"]["repair_action"]["enabled"],
+            false
+        );
+        assert!(
+            payload["proof"]["guardian_diagnosis_ids"]
+                .as_array()
+                .expect("proof diagnosis ids")
+                .iter()
+                .any(|id| id == "launcher_managed_artifact_corrupt")
+        );
+        assert_no_install_status_route_sensitive_fragments(&payload);
     }
 
-    #[tokio::test]
-    async fn install_status_returns_not_found_for_unknown_install() {
-        let root = test_root("install-status-unknown");
-        let state = build_test_state(&root);
-
-        let error = handle_install_status(State(state), Path("missing-install".to_string()))
-            .await
-            .expect_err("missing install should be 404");
-
-        assert_eq!(error.0, StatusCode::NOT_FOUND);
-        assert_eq!(error.1.0["error"], "install session not found");
-
-        let _ = fs::remove_dir_all(root);
+    struct RouteInstallFixture {
+        state: AppState,
+        root: PathBuf,
     }
 
-    fn assert_no_raw_fragments(message: &str) {
-        for fragment in [
-            "/home/zero",
-            "/tmp/croopor",
-            "C:\\Users\\zero",
-            "AppData\\Roaming",
-            "https://",
-            "piston-meta.mojang.com",
-            "request failed",
-            "parse version json",
-            "expected value",
-            "line 1 column",
-            "prepare java runtime",
-            "/Users/alice",
-            "C:\\Users\\Alice",
-            "token secret",
-            "provider_payload",
-            "account_id",
-            "account-secret",
-            "username",
-            "SecretPlayer",
-            "raw-secret",
-        ] {
-            assert!(
-                !message.contains(fragment),
-                "message exposed raw fragment {fragment:?}: {message}"
-            );
+    impl RouteInstallFixture {
+        fn new(name: &str) -> Self {
+            let root = test_root(name);
+            let paths = test_paths(&root);
+            let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
+            let instances =
+                Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
+            let state = AppState::new(AppStateInit {
+                app_name: "Croopor".to_string(),
+                version: "test".to_string(),
+                config,
+                instances,
+                installs: Arc::new(InstallStore::new()),
+                sessions: Arc::new(SessionStore::new()),
+                performance: Arc::new(PerformanceManager::new().expect("performance manager")),
+                startup_warnings: Vec::new(),
+                frontend_dir: root.join("frontend"),
+            });
+
+            Self { state, root }
+        }
+
+        async fn request_json(&self, method: Method, uri: &str) -> (StatusCode, Value) {
+            let response = router()
+                .with_state(self.state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("route response");
+            let status = response.status();
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read body");
+            let payload = serde_json::from_slice(&body).expect("json response");
+            (status, payload)
         }
     }
 
-    fn done_progress() -> DownloadProgress {
-        DownloadProgress {
-            phase: "done".to_string(),
-            current: 1,
-            total: 1,
-            file: None,
-            error: None,
-            done: true,
+    impl Drop for RouteInstallFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
         }
     }
 
-    fn build_test_state(root: &FsPath) -> AppState {
-        let paths = test_paths(root);
-        let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
-        let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
-        AppState::new(AppStateInit {
-            app_name: "Croopor".to_string(),
-            version: "test".to_string(),
-            config,
-            instances,
-            installs: Arc::new(InstallStore::new()),
-            sessions: Arc::new(SessionStore::new()),
-            performance: Arc::new(PerformanceManager::new().expect("performance manager")),
-            startup_warnings: Vec::new(),
-            frontend_dir: root.join("frontend"),
-        })
+    fn test_root(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "croopor-api-install-route-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or_default()
+        ));
+        fs::create_dir_all(&path).expect("create test root");
+        path
     }
 
-    fn configure_library_dir(state: &AppState, library_dir: &FsPath) {
-        fs::create_dir_all(library_dir).expect("library dir");
-        let mut config = state.config().current();
-        config.library_dir = library_dir.to_string_lossy().to_string();
-        state
-            .config()
-            .replace_in_memory(config.clone())
-            .expect("config update");
-        state.set_library_dir(config.library_dir);
-    }
-
-    fn test_paths(root: &FsPath) -> AppPaths {
+    fn test_paths(root: &std::path::Path) -> AppPaths {
         let config_dir = root.join("config");
         AppPaths {
             config_file: config_dir.join("config.json"),
@@ -563,16 +311,23 @@ mod tests {
         }
     }
 
-    fn test_root(name: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "croopor-api-install-{name}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|value| value.as_nanos())
-                .unwrap_or_default()
-        ));
-        fs::create_dir_all(&path).expect("create test root");
-        path
+    fn assert_no_install_status_route_sensitive_fragments(value: &Value) {
+        let text = value.to_string();
+        for material in [
+            "/Users/alice",
+            ".croopor",
+            ".minecraft",
+            "secret-client.jar",
+            "provider_payload",
+            "accessToken",
+            "token=secret",
+            "https://example.invalid",
+            "client.jar?token",
+        ] {
+            assert!(
+                !text.contains(material),
+                "public install status JSON exposed sensitive material {material}: {text}"
+            );
+        }
     }
 }

@@ -2,7 +2,7 @@ import { api } from '../../api';
 import { toast } from '../../toast';
 import { errMessage } from '../../utils';
 import type { ContextMenuItem } from '../../ui/ContextMenu';
-import type { EnrichedInstance, InstanceMod } from '../../types';
+import type { EnrichedInstance, InstanceMod } from '../../types-instance';
 import { openInstanceFolder } from './instance-actions';
 import { confirmDeleteItems, partialFailureMessage, runBulkMutation } from './bulk-actions';
 

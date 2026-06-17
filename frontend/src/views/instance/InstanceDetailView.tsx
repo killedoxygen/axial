@@ -14,7 +14,8 @@ import { errMessage, supportsMods } from '../../utils';
 import { minecraftVersionLabel } from '../../version-display';
 import { loaderKeyFromVersion, LOADER_LABELS } from '../create/defaults';
 import { instanceInstallStatus } from '../../instance-install-status';
-import type { EnrichedInstance, Version } from '../../types';
+import type { Version } from '../../types-version';
+import type { EnrichedInstance } from '../../types-instance';
 import { fmtJoined, fmtRelative } from './format';
 import { fetchInstanceResources, type ResourceLoadState } from './resources';
 import { LOG_RESOURCE_POLL_MS } from './logs';
@@ -135,6 +136,7 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
   const installTarget = installStatus.target;
   const installProgress = installStatus.progress;
   const installQueued = installStatus.state === 'queued';
+  const installQueuedView = installStatus.queuedItem;
   const matchingInstallFailure = installStatus.failure;
   const installLabel = installStatus.label;
   const installLocked =
@@ -223,6 +225,7 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
                   inst={inst}
                   launchAction={launchAction}
                   installQueued={installQueued}
+                  installQueuedView={installQueuedView}
                   installProgress={installProgress}
                   onLaunch={onPlay}
                   onInstall={onInstall}
@@ -292,10 +295,9 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
           installTarget={installTarget}
           installLabel={installLabel}
           installQueued={installQueued}
+          installQueuedView={installQueuedView}
           installProgress={installProgress}
           installFailure={matchingInstallFailure}
-          installQueuePosition={installStatus.queuePosition}
-          installQueueCount={installStatus.queueCount}
           onRetryInstall={retryFailedInstall}
         />
       )}

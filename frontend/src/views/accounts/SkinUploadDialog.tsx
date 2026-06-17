@@ -16,7 +16,8 @@ export function SkinUploadDialog({
   skinName,
   uploadVariant,
   busy,
-  onlineReady,
+  skinActionsEnabled,
+  skinActionDisabledReason,
   stagedCanSave,
   onClose,
   onSkinNameChange,
@@ -33,7 +34,8 @@ export function SkinUploadDialog({
   skinName: string;
   uploadVariant: UploadSkinVariant;
   busy: boolean;
-  onlineReady: boolean;
+  skinActionsEnabled: boolean;
+  skinActionDisabledReason: string;
   stagedCanSave: boolean;
   onClose: () => void;
   onSkinNameChange: (value: string) => void;
@@ -114,12 +116,12 @@ export function SkinUploadDialog({
               <Button
                 variant="primary"
                 icon={busy ? 'refresh' : 'check'}
-                disabled={!stagedCanSave || !onlineReady}
+                disabled={!stagedCanSave || !skinActionsEnabled}
                 onClick={() => onSave(true)}
                 title={
-                  onlineReady
+                  skinActionsEnabled
                     ? 'Save locally, then apply to the active Minecraft account'
-                    : 'Online Minecraft account required'
+                    : skinActionDisabledReason
                 }
                 sound="affirm"
               >

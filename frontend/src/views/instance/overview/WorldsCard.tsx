@@ -2,7 +2,7 @@ import type { JSX } from 'preact';
 import { Icon } from '../../../ui/Icons';
 import { Button, Card } from '../../../ui/Atoms';
 import { openContextMenu } from '../../../ui/ContextMenu';
-import type { EnrichedInstance, InstanceResourceSummary } from '../../../types';
+import type { EnrichedInstance, InstanceResourceSummary } from '../../../types-instance';
 import { fmtBytes, fmtRelative } from '../format';
 import { openInstanceFolder } from '../instance-actions';
 import { worldMenuItems } from '../world-actions';

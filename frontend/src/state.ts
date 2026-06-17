@@ -1,5 +1,5 @@
 import { signal } from '@preact/signals';
-import type { LocalPrefs } from './types';
+import type { LocalPrefs } from './types-ui';
 
 export const STORAGE_KEY: string = 'croopor_ui';
 export const PRESET_HUES: Record<string, number> = { obsidian: 140, deepslate: 215, nether: 15, end: 268, birch: 100 };

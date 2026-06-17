@@ -1,5 +1,5 @@
 import { api } from '../../api';
-import type { InstanceResourceSummary } from '../../types';
+import type { InstanceResourceSummary } from '../../types-instance';
 
 export type ResourceLoadState =
   | { status: 'loading'; data: InstanceResourceSummary | null; error?: undefined }

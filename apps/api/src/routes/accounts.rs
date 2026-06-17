@@ -1,7 +1,7 @@
 use crate::{
     application::{
         self, AccountActionResponse, AccountListResponse, AccountPatchRequest,
-        OfflineAccountCreateRequest,
+        AccountRemoveResponse, OfflineAccountCreateRequest,
     },
     state::AppState,
 };
@@ -60,6 +60,6 @@ async fn handle_account_select(
 async fn handle_account_remove(
     Path(account_id): Path<String>,
     State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Json<AccountRemoveResponse>, (StatusCode, Json<serde_json::Value>)> {
     application::remove_account(&state, &account_id).await
 }

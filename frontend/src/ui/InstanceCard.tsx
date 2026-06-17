@@ -8,7 +8,7 @@ import { runningSessions, versionById } from '../store';
 import { instanceInstallStatus } from '../instance-install-status';
 import { minecraftVersionLabel } from '../version-display';
 import { loaderKeyFromVersion, LOADER_LABELS } from '../views/create/defaults';
-import type { EnrichedInstance } from '../types';
+import type { EnrichedInstance } from '../types-instance';
 
 function versionLabel(inst: EnrichedInstance): { loader: string; mc: string } {
   const v = versionById(inst.version_id);
@@ -32,7 +32,7 @@ export function InstanceCard({
   const { loader, mc } = versionLabel(inst);
   const install = instanceInstallStatus(inst, version);
   const installing = install.installing;
-  const installBadge = install.state === 'queued' ? 'Queued' : 'Installing';
+  const installBadge = install.state === 'queued' ? install.queuedItem?.title || install.label : 'Installing';
   const open = (): void => navigate({ name: 'instance', id: inst.id });
   const onKeyDown = (e: KeyboardEvent): void => {
     if (e.target !== e.currentTarget) return;

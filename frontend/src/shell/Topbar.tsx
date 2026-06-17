@@ -11,13 +11,11 @@ import {
   versionById,
   launchState,
   installState,
-  installQueue,
+  installQueueState,
   installFailure,
 } from '../store';
 import { minecraftVersionLabel } from '../version-display';
 import { windowStartDragging, windowToggleMaximize, hasNativeDesktopRuntime } from '../native';
-import { launchStageViewFrom } from '../launch-stages';
-import { formatInstallItemLabel } from '../install-labels';
 import { countDownRemainingSeconds, formatRemainingTime } from '../progress-estimation';
 
 function assertUnreachable(value: never): never {
@@ -88,7 +86,7 @@ function StatusPill(): JSX.Element {
   const session = runIds.length > 0 ? sessions[runIds[0]] : null;
 
   if (inst && session) {
-    const label = session.stopping ? 'Stopping' : launchStageViewFrom(session.state)?.label || 'Playing';
+    const label = session.stopping ? 'Stopping' : session.viewModel?.label || 'Playing';
     const tag = versionTag(inst.version_id);
     return (
       <button
@@ -105,10 +103,8 @@ function StatusPill(): JSX.Element {
   }
 
   if (install.status === 'active') {
-    const queuedCount = installQueue.value.length;
-    const queuedLabel = queuedCount > 0 ? ` · ${queuedCount} queued` : '';
+    const queueView = installQueueState.value.view_model;
     const installPct = Math.round(Math.max(0, Math.min(100, install.pct)));
-    const installPhase = install.phase ? ` · ${install.phase.replace(/_/g, ' ')}` : '';
     const installRemainingSeconds = countDownRemainingSeconds(
       install.remainingSeconds,
       install.remainingSecondsUpdatedAt,
@@ -117,7 +113,7 @@ function StatusPill(): JSX.Element {
     const installEta = installRemainingSeconds ? formatRemainingTime(installRemainingSeconds) : null;
     const installName = install.displayName || install.versionId;
     const installTag = install.item.loader?.minecraftVersion || versionTag(install.versionId);
-    const installTitle = `${installName}: ${install.label} · ${installPct}%${installEta ? ` · ${installEta} left` : ''}${queuedLabel}${installPhase}`;
+    const installTitle = `${installName}: ${install.label} · ${installPct}%${installEta ? ` · ${installEta} left` : ''}${queueView.active_queued_count_label || ''}`;
     const installStyle = { '--cp-install-ratio': String(installPct / 100) } as JSX.CSSProperties;
 
     return (
@@ -132,7 +128,7 @@ function StatusPill(): JSX.Element {
         {installTag && <span class="cp-status-pill-meta">{installTag}</span>}
         <span class="cp-status-pill-pct">{installPct}%</span>
         {installEta && <span class="cp-status-pill-eta">{installEta}</span>}
-        {queuedCount > 0 && <span class="cp-status-pill-chip">+{queuedCount}</span>}
+        {queueView.queued_count > 0 && <span class="cp-status-pill-chip">+{queueView.queued_count}</span>}
       </button>
     );
   }
@@ -153,11 +149,10 @@ function StatusPill(): JSX.Element {
     );
   }
 
-  const queued = installQueue.value;
-  if (queued.length > 0) {
-    const firstQueued = queued[0];
-    const queuedLabel = queued.length === 1 ? '1 queued' : `${queued.length} queued`;
-    const queuedTitle = `${queuedLabel}. Next: ${formatInstallItemLabel(firstQueued)}`;
+  const queueState = installQueueState.value;
+  if (queueState.items.length > 0) {
+    const queueView = queueState.view_model;
+    const queuedTitle = `${queueView.queued_count_label}. ${queueView.next_label ? `Next: ${queueView.next_label}` : queueView.summary}`;
     return (
       <button
         class="cp-status-pill cp-status-pill--queued cp-nodrag"
@@ -166,15 +161,15 @@ function StatusPill(): JSX.Element {
         aria-label={`Open downloads. ${queuedTitle}`}
       >
         <StatusMark icon="archive" />
-        <span class="cp-status-pill-label">Queued</span>
-        {queued.length > 1 && <span class="cp-status-pill-chip">{queued.length}</span>}
+        <span class="cp-status-pill-label">{queueView.status_label}</span>
+        {queueView.queued_count > 1 && <span class="cp-status-pill-chip">{queueView.queued_count}</span>}
       </button>
     );
   }
 
   const failure = installFailure.value;
   if (failure) {
-    const title = `${failure.displayName}: ${failure.message}`;
+    const title = `${failure.displayName}: ${failure.viewModel.summary}`;
     return (
       <button
         class="cp-status-pill cp-status-pill--failed cp-nodrag"

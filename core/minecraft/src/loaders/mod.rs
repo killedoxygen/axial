@@ -17,8 +17,8 @@ pub use types::{
     LoaderArtifactKind, LoaderAvailability, LoaderBuildId, LoaderBuildMetadata, LoaderBuildRecord,
     LoaderCatalogState, LoaderComponentId, LoaderComponentRecord, LoaderError, LoaderGameVersion,
     LoaderInstallFailureKind, LoaderInstallPlan, LoaderInstallSource, LoaderInstallStrategy,
-    LoaderInstallability, LoaderSelectionMeta, LoaderSelectionReason, LoaderSelectionSource,
-    LoaderTerm, LoaderTermEvidence, LoaderTermSource, LoaderVersionIndex,
+    LoaderInstallability, LoaderProviderFailureKind, LoaderSelectionMeta, LoaderSelectionReason,
+    LoaderSelectionSource, LoaderTerm, LoaderTermEvidence, LoaderTermSource, LoaderVersionIndex,
 };
 
 use crate::download::DownloadProgress;

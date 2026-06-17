@@ -3,11 +3,9 @@ import { useEffect, useState } from 'preact/hooks';
 import { Button, Card, IconButton, Meter, Pill, SectionHeading } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { useTheme } from '../../hooks/use-theme';
-import { installFailure, installQueue, installState } from '../../store';
-import { clearInstallFailure, removeQueuedInstallAt } from '../../actions';
-import { retryFailedInstall } from '../../install';
-import { formatInstallItemLabel } from '../../install-labels';
-import { countDownRemainingSeconds, formatRemainingTime } from '../../progress-estimation';
+import { installFailure, installQueueState, installState } from '../../store';
+import { clearInstallFailure } from '../../actions';
+import { removeQueuedInstall, retryFailedInstall } from '../../install';
 
 function formatFailureTime(timestamp: number): string {
   return new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -24,18 +22,6 @@ function formatElapsedTime(startedAt: number, now: number): string {
   return `${hours}h ${remainingMinutes.toString().padStart(2, '0')}m elapsed`;
 }
 
-function activeStepTitle(phase: string): string {
-  switch (phase) {
-    case 'java_runtime':
-      return 'Java runtime';
-    case 'loader_processors':
-    case 'processors':
-      return 'Processors';
-    default:
-      return phase.replace(/_/g, ' ');
-  }
-}
-
 function activeStepRatio(current: number | undefined, total: number | undefined): string {
   if (typeof current !== 'number' || typeof total !== 'number' || total <= 0) return '';
   return `${current}/${total}`;
@@ -44,7 +30,9 @@ function activeStepRatio(current: number | undefined, total: number | undefined)
 export function DownloadsView(): JSX.Element {
   const theme = useTheme();
   const state = installState.value;
-  const queue = installQueue.value;
+  const queueState = installQueueState.value;
+  const queue = queueState.items;
+  const queueView = queueState.view_model;
   const failure = installFailure.value;
   const hasActive = state.status === 'active';
   const activeStartedAt = hasActive ? state.startedAt : 0;
@@ -62,23 +50,18 @@ export function DownloadsView(): JSX.Element {
   }, [hasActive, activeStartedAt]);
 
   const activeTitle = hasActive ? state.displayName || state.versionId : '';
-  const queuedLabel = `${queue.length} queued`;
-  const queuedItemLabel = queue.length === 1 ? '1 item queued' : `${queue.length} items queued`;
-  const phaseLabel = hasActive && state.phase ? state.phase.replace(/_/g, ' ') : '';
   const activePct = hasActive ? Math.round(Math.max(0, Math.min(100, state.pct))) : 0;
   const activeStep = hasActive ? state.activeStep : undefined;
-  const stepTitle = activeStep ? activeStepTitle(activeStep.phase) : '';
   const stepPct = activeStep ? Math.round(Math.max(0, Math.min(100, activeStep.pct))) : 0;
   const stepRatio = activeStep ? activeStepRatio(activeStep.current, activeStep.total) : '';
-  const activeRemainingSeconds = hasActive
-    ? countDownRemainingSeconds(state.remainingSeconds, state.remainingSecondsUpdatedAt, elapsedNow)
-    : undefined;
-  const activeEta = activeRemainingSeconds ? `${formatRemainingTime(activeRemainingSeconds)} left` : '';
-  const nextQueuedLabel = queue.length > 0 ? formatInstallItemLabel(queue[0]) : '';
+  const nextQueuedLabel = queueView.next_label || '';
+  const failureView = failure?.viewModel;
+  const failureDetails = failureView?.details ?? [];
+  const retryAction = failureView?.retry_action;
   const failureCard = failure ? (
     <Card>
       <SectionHeading
-        title="Install failed"
+        title={failureView?.title || 'Install failed'}
         right={
           <Pill tone="err" icon="alert">
             Failed
@@ -102,17 +85,46 @@ export function DownloadsView(): JSX.Element {
           <div
             style={{ fontSize: 12, color: theme.n.textDim, marginTop: 4, lineHeight: 1.45, overflowWrap: 'anywhere' }}
           >
-            {failure.message}
+            {failureView?.summary || 'Install failed.'}
           </div>
+          {failureView?.detail && (
+            <div
+              style={{ fontSize: 12, color: theme.n.textDim, marginTop: 4, lineHeight: 1.45, overflowWrap: 'anywhere' }}
+            >
+              {failureView.detail}
+            </div>
+          )}
+          {failureDetails.length > 1 && (
+            <ul
+              style={{ margin: '6px 0 0 16px', padding: 0, color: theme.n.textMute, fontSize: 11.5, lineHeight: 1.4 }}
+            >
+              {failureDetails.slice(1).map((detail) => (
+                <li key={detail}>{detail}</li>
+              ))}
+            </ul>
+          )}
           <div style={{ fontSize: 11, color: theme.n.textMute, marginTop: 6 }}>
             Failed at {formatFailureTime(failure.failedAt)}
           </div>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginLeft: 'auto' }}>
-          <Button variant="secondary" size="sm" icon="refresh" onClick={retryFailedInstall}>
-            Retry
+          <Button
+            variant="secondary"
+            size="sm"
+            icon="refresh"
+            onClick={retryFailedInstall}
+            disabled={retryAction ? !retryAction.enabled : false}
+            title={retryAction?.disabled_reason || undefined}
+          >
+            {retryAction?.label || 'Retry install'}
           </Button>
-          <IconButton icon="x" size={28} tooltip="Dismiss failed install" onClick={clearInstallFailure} />
+          <IconButton
+            icon="x"
+            size={28}
+            tooltip={failureView?.dismiss_action?.label || 'Dismiss failed install'}
+            onClick={clearInstallFailure}
+            disabled={failureView?.dismiss_action ? !failureView.dismiss_action.enabled : false}
+          />
         </div>
       </div>
     </Card>
@@ -128,9 +140,7 @@ export function DownloadsView(): JSX.Element {
               <div
                 style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}
               >
-                {phaseLabel && <Pill>{phaseLabel}</Pill>}
-                {activeEta && <Pill icon="clock">{activeEta}</Pill>}
-                {queue.length > 0 && <Pill icon="clock">{queuedLabel}</Pill>}
+                {queueView.queued_count > 0 && <Pill icon="clock">{queueView.queued_count_label}</Pill>}
               </div>
             }
           />
@@ -146,21 +156,20 @@ export function DownloadsView(): JSX.Element {
             {state.label}
           </div>
           <div class="cp-download-active-meter">
-            <Meter value={state.pct} ariaLabel={`Install progress for ${activeTitle}`} />
+            <Meter value={activePct} ariaLabel={`Install progress for ${activeTitle}`} />
           </div>
           {activeStep && (
             <div class="cp-download-step">
               <div class="cp-download-step-head">
-                <span>{stepTitle}</span>
+                <span>{activeStep.label}</span>
                 <span>
                   {stepRatio ? `${stepRatio} · ` : ''}
                   {stepPct}%
                 </span>
               </div>
               <div class="cp-download-active-meter cp-download-active-meter--step">
-                <Meter value={stepPct} ariaLabel={`${stepTitle} progress for ${activeTitle}`} />
+                <Meter value={stepPct} ariaLabel={`${activeStep.label} progress for ${activeTitle}`} />
               </div>
-              <div class="cp-download-step-label">{activeStep.label}</div>
             </div>
           )}
           <div
@@ -176,8 +185,7 @@ export function DownloadsView(): JSX.Element {
           >
             <span>{formatElapsedTime(state.startedAt, elapsedNow)}</span>
             <span style={{ fontVariantNumeric: 'tabular-nums' }}>
-              {activeEta ? `${activeEta} · ` : ''}
-              {activeStep ? `${stepTitle} ${stepPct}% · overall ${activePct}%` : `${activePct}%`}
+              {activeStep ? `${activeStep.label} ${stepPct}% · overall ${activePct}%` : `${activePct}%`}
             </span>
           </div>
           {nextQueuedLabel && (
@@ -202,15 +210,13 @@ export function DownloadsView(): JSX.Element {
             <Icon name="download" size={36} color="var(--text-mute)" />
             {queue.length > 0 ? (
               <>
-                <h2>Downloads queued</h2>
-                <p>{queuedItemLabel} and waiting to start. The next item will begin automatically.</p>
+                <h2>{queueView.title}</h2>
+                <p>{queueView.summary}</p>
               </>
             ) : (
               <>
-                <h2>Nothing downloading</h2>
-                <p>
-                  Launch an instance that needs a download, or install a new Minecraft version, and it'll show up here.
-                </p>
+                <h2>{queueView.empty_title}</h2>
+                <p>{queueView.empty_summary}</p>
               </>
             )}
           </div>
@@ -231,13 +237,12 @@ export function DownloadsView(): JSX.Element {
               padding: '8px 10px',
             }}
           >
-            Queue
+            {queueView.section_title}
           </div>
           {queue.map((item, i) => {
-            const itemLabel = formatInstallItemLabel(item);
             return (
               <div
-                key={item.versionId + i}
+                key={item.queue_id}
                 style={{
                   display: 'flex',
                   alignItems: 'center',
@@ -247,7 +252,7 @@ export function DownloadsView(): JSX.Element {
                 }}
               >
                 <span style={{ width: 18, fontSize: 11, color: theme.n.textMute, fontVariantNumeric: 'tabular-nums' }}>
-                  {i + 1}
+                  {item.position}
                 </span>
                 <div style={{ display: 'flex', alignItems: 'baseline', gap: 6, minWidth: 0, flex: 1 }}>
                   <span
@@ -260,9 +265,9 @@ export function DownloadsView(): JSX.Element {
                       whiteSpace: 'nowrap',
                     }}
                   >
-                    {itemLabel}
+                    {item.label}
                   </span>
-                  {item.loader && (
+                  {item.install_item.loader && (
                     <span
                       style={{
                         fontSize: 11,
@@ -273,7 +278,7 @@ export function DownloadsView(): JSX.Element {
                         whiteSpace: 'nowrap',
                       }}
                     >
-                      · {item.versionId}
+                      · {item.install_item.version_id}
                     </span>
                   )}
                 </div>
@@ -281,8 +286,9 @@ export function DownloadsView(): JSX.Element {
                   icon="trash"
                   size={28}
                   danger
-                  tooltip={`Remove ${itemLabel} from queue`}
-                  onClick={() => removeQueuedInstallAt(i)}
+                  tooltip={item.remove_action.disabled_reason || item.remove_action.label}
+                  onClick={() => void removeQueuedInstall(item.queue_id)}
+                  disabled={!item.remove_action.enabled}
                 />
               </div>
             );

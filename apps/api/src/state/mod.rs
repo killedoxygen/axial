@@ -36,7 +36,10 @@ pub use auth_logins::{
     NewAuthLoginMsaToken,
 };
 pub use failure_memory::GuardianFailureMemoryStore;
-pub use installs::InstallStore;
+pub use installs::{
+    ActiveQueuedInstallEntry, InstallQueueEnqueueOutcome, InstallQueuePlacement,
+    InstallQueueSnapshot, InstallQueueSpec, InstallStore, QueuedInstallEntry,
+};
 pub use journals::OperationJournalStore;
 pub use sessions::{SessionStore, StartupOutcome};
 
@@ -59,6 +62,8 @@ pub struct AppState {
     startup_warnings: Arc<Vec<String>>,
     config_changes: Arc<broadcast::Sender<()>>,
     library_dir: Arc<RwLock<Option<String>>>,
+    #[cfg(test)]
+    auth_chain_client_override: Arc<RwLock<Option<crate::auth_chain::AuthChainClient>>>,
     frontend_dir: Arc<PathBuf>,
 }
 
@@ -87,6 +92,10 @@ impl AppState {
         );
         let skins = Arc::new(skins::SavedSkinStore::load_from_paths(init.config.paths()));
         let accounts = Arc::new(LauncherAccountStore::load_from_paths(init.config.paths()));
+        let failure_memory = Arc::new(GuardianFailureMemoryStore::load_from_paths(
+            init.config.paths(),
+        ));
+        let journals = Arc::new(OperationJournalStore::load_from_paths(init.config.paths()));
         let (config_changes, _) = broadcast::channel(32);
 
         Self {
@@ -97,8 +106,8 @@ impl AppState {
             accounts,
             auth_logins: Arc::new(AuthLoginStore::load_from_secure_store()),
             installs: init.installs,
-            failure_memory: Arc::new(GuardianFailureMemoryStore::new()),
-            journals: Arc::new(OperationJournalStore::new()),
+            failure_memory,
+            journals,
             sessions: init.sessions,
             skins,
             benchmark_suite_drivers,
@@ -111,6 +120,8 @@ impl AppState {
             } else {
                 Some(library_dir)
             })),
+            #[cfg(test)]
+            auth_chain_client_override: Arc::new(RwLock::new(None)),
             frontend_dir: Arc::new(init.frontend_dir),
         }
     }
@@ -202,6 +213,24 @@ impl AppState {
 
     pub fn frontend_dir(&self) -> &Path {
         self.frontend_dir.as_path()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_auth_chain_client_override(
+        &self,
+        client: crate::auth_chain::AuthChainClient,
+    ) {
+        if let Ok(mut override_slot) = self.auth_chain_client_override.write() {
+            *override_slot = Some(client);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn auth_chain_client_override(&self) -> Option<crate::auth_chain::AuthChainClient> {
+        self.auth_chain_client_override
+            .read()
+            .ok()
+            .and_then(|override_slot| override_slot.clone())
     }
 }
 

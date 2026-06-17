@@ -1,4 +1,5 @@
-import type { LoaderComponentId, Version } from '../../types';
+import type { Version } from '../../types-version';
+import type { LoaderComponentId } from '../../types-loader';
 
 export type LoaderKey = 'vanilla' | 'fabric' | 'quilt' | 'forge' | 'neoforge';
 export type Channel = 'release' | 'snapshot' | 'legacy' | 'unknown';

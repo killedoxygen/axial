@@ -4,14 +4,22 @@
 //! loop suppression. It records memory; it does not decide Guardian policy.
 
 use super::contracts::{OwnershipClass, TargetDescriptor, sanitize_target_id};
+use super::ownership::{CurrentArtifact, classify_current_artifact};
+use crate::execution::file::{FileWriteRequest, write_file_atomically};
 use crate::guardian::{DiagnosisId, GuardianActionKind, GuardianDomain, GuardianMode};
 use chrono::{DateTime, FixedOffset};
+use croopor_config::AppPaths;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::RwLock;
+use tracing::warn;
 
 pub const FAILURE_MEMORY_SCHEMA: &str = "croopor.guardian.failure_memory.v1";
 pub const DEFAULT_FAILURE_MEMORY_LIMIT: usize = 64;
+const FAILURE_MEMORY_FILE: &str = "failure-memory.json";
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct FailureMemoryKey(pub String);
@@ -391,6 +399,7 @@ pub enum FailureMemoryValidationError {
 pub struct GuardianFailureMemoryStore {
     records: RwLock<BTreeMap<String, GuardianFailureMemoryEntry>>,
     max_entries: usize,
+    storage_path: Option<PathBuf>,
 }
 
 impl GuardianFailureMemoryStore {
@@ -402,6 +411,51 @@ impl GuardianFailureMemoryStore {
         Self {
             records: RwLock::new(BTreeMap::new()),
             max_entries: max_entries.max(1),
+            storage_path: None,
+        }
+    }
+
+    pub fn load_from_paths(paths: &AppPaths) -> Self {
+        let storage_path = failure_memory_path(paths);
+        let store = Self::with_max_entries_and_storage(
+            DEFAULT_FAILURE_MEMORY_LIMIT,
+            Some(storage_path.clone()),
+        );
+
+        match fs::read_to_string(&storage_path) {
+            Ok(data) => match FailureMemorySnapshot::from_json(&data) {
+                Ok(snapshot) => {
+                    if let Err(error) = store.load_snapshot(snapshot) {
+                        warn!(
+                            error = ?error,
+                            "failed to load persisted Guardian failure memory snapshot"
+                        );
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        error = ?error,
+                        "failed to parse persisted Guardian failure memory snapshot"
+                    );
+                }
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "failed to read persisted Guardian failure memory snapshot"
+                );
+            }
+        }
+
+        store
+    }
+
+    fn with_max_entries_and_storage(max_entries: usize, storage_path: Option<PathBuf>) -> Self {
+        Self {
+            records: RwLock::new(BTreeMap::new()),
+            max_entries: max_entries.max(1),
+            storage_path,
         }
     }
 
@@ -429,6 +483,7 @@ impl GuardianFailureMemoryStore {
             }
             prune_records(&mut records, self.max_entries);
         }
+        self.persist_snapshot();
         Ok(())
     }
 
@@ -463,6 +518,28 @@ impl GuardianFailureMemoryStore {
             prune_records(&mut records, self.max_entries);
         }
         Ok(())
+    }
+
+    fn persist_snapshot(&self) {
+        let Some(storage_path) = self.storage_path.as_deref() else {
+            return;
+        };
+        let snapshot = match self.snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                warn!(
+                    error = ?error,
+                    "failed to build Guardian failure memory snapshot"
+                );
+                return;
+            }
+        };
+        if let Err(error) = persist_snapshot_to_path(storage_path, &snapshot) {
+            warn!(
+                error = %error,
+                "failed to persist Guardian failure memory snapshot"
+            );
+        }
     }
 }
 
@@ -516,6 +593,27 @@ fn parse_timestamp(value: &str) -> Result<DateTime<FixedOffset>, chrono::ParseEr
     DateTime::parse_from_rfc3339(value.trim())
 }
 
+pub fn failure_memory_path(paths: &AppPaths) -> PathBuf {
+    paths.config_dir.join("guardian").join(FAILURE_MEMORY_FILE)
+}
+
+fn persist_snapshot_to_path(path: &Path, snapshot: &FailureMemorySnapshot) -> io::Result<()> {
+    let data = snapshot
+        .to_json()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    write_file_atomically(FileWriteRequest::new(
+        classify_current_artifact(
+            CurrentArtifact::GuardianFailureMemorySnapshot,
+            "guardian_failure_memory",
+        )
+        .target,
+        path,
+        data.as_bytes(),
+    ))
+    .map(|_| ())
+    .map_err(io::Error::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -528,6 +626,9 @@ mod tests {
         OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
     };
     use crate::state::ownership::{CurrentArtifact, classify_current_artifact};
+    use croopor_config::AppPaths;
+    use std::fs;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn failure_memory_entry_round_trips_strict_shape() {
@@ -803,6 +904,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn failure_memory_store_persists_snapshot_for_restart_reasoning() {
+        let root = test_root("persisted-snapshot");
+        let paths = test_paths(&root);
+        let store = GuardianFailureMemoryStore::load_from_paths(&paths);
+        let entry =
+            retry_entry("2026-06-15T10:00:00Z").with_suppression_until("2026-06-15T10:30:00Z");
+        let key = entry.key.clone();
+
+        store.record(entry).expect("record memory");
+        let path = super::failure_memory_path(&paths);
+        assert!(path.is_file());
+
+        let reloaded = GuardianFailureMemoryStore::load_from_paths(&paths);
+        let persisted = reloaded.get(&key).expect("persisted memory");
+        assert_eq!(
+            persisted.suppression_until.as_deref(),
+            Some("2026-06-15T10:30:00Z")
+        );
+        assert!(
+            !serde_json::to_string(&persisted)
+                .expect("memory json")
+                .contains("-Xmx")
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
     fn retry_entry(observed_at: &str) -> GuardianFailureMemoryEntry {
         GuardianFailureMemoryEntry::observed(
             DiagnosisId::new("process_exited_before_boot_marker"),
@@ -816,5 +945,27 @@ mod tests {
             GuardianActionKind::Retry,
             FailureMemoryActionOutcome::Failed,
         )
+    }
+
+    fn test_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "croopor-failure-memory-{name}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create test root");
+        root
+    }
+
+    fn test_paths(root: &Path) -> AppPaths {
+        let config_dir = root.join("config");
+        AppPaths {
+            config_file: config_dir.join("config.json"),
+            instances_file: config_dir.join("instances.json"),
+            instances_dir: root.join("instances"),
+            music_dir: root.join("music"),
+            library_dir: root.join("library"),
+            config_dir,
+        }
     }
 }

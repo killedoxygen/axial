@@ -71,6 +71,7 @@ pub enum ExecutionFactKind {
     DownloadInterrupted,
     DownloadNetworkFailure,
     DownloadPromoted,
+    DownloadPromotionFailed,
     DownloadProviderFailure,
     DownloadSizeMismatch,
     DownloadTempDiscarded,
@@ -86,6 +87,7 @@ pub enum ExecutionFactKind {
     FilePromoted,
     FileTempLeftover,
     FileWrittenToTemp,
+    InstallDependencyFailed,
     RuntimeCorrupt,
     RuntimeJavaOverrideEmpty,
     RuntimeJavaOverrideUndefinedSentinel,
@@ -149,6 +151,30 @@ fn execution_fact_stage_copy(kind: ExecutionFactKind) -> (&'static str, &'static
         ExecutionFactKind::ProcessSpawned => (
             "execution_process_spawned",
             "Execution started the game process.",
+        ),
+        ExecutionFactKind::ProcessStopIntent => (
+            "execution_process_stop_requested",
+            "Execution recorded a process stop request.",
+        ),
+        ExecutionFactKind::ProcessKilled => (
+            "execution_process_killed",
+            "Execution killed the game process.",
+        ),
+        ExecutionFactKind::ProcessExitCode => (
+            "execution_process_exit_code",
+            "Execution recorded the process exit code.",
+        ),
+        ExecutionFactKind::ProcessBootEvidence => (
+            "execution_process_boot_evidence",
+            "Execution observed Minecraft startup evidence.",
+        ),
+        ExecutionFactKind::ProcessWatchdogAction => (
+            "execution_process_watchdog_action",
+            "Execution recorded a process watchdog action.",
+        ),
+        ExecutionFactKind::ProcessExited => (
+            "execution_process_exited",
+            "Execution observed the game process exit.",
         ),
         ExecutionFactKind::PrimitiveRefused => (
             "execution_primitive_refused",

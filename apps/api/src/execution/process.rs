@@ -8,7 +8,9 @@ use crate::observability::{
     EvidenceField, EvidenceSensitivity, RedactionAudience, sanitize_evidence_text,
     sanitize_evidence_token,
 };
-use crate::state::contracts::{OperationId, TargetDescriptor};
+use crate::state::contracts::{
+    OperationId, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
+};
 use croopor_launcher::LaunchStageEvidence;
 use std::fmt;
 
@@ -122,6 +124,7 @@ pub enum ProcessKillReason {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessObservation<'a> {
+    Exited,
     ExitCode(i32),
     BootEvidence { label: &'a str },
     WatchdogAction(ProcessWatchdogAction),
@@ -166,6 +169,15 @@ impl std::error::Error for ProcessCapabilityError {}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessCapabilityErrorKind {
     MissingPid,
+}
+
+pub fn process_session_target(session_id: &str) -> TargetDescriptor {
+    TargetDescriptor::new(
+        StabilizationSystem::Execution,
+        TargetKind::Session,
+        session_id,
+        OwnershipClass::LauncherManaged,
+    )
 }
 
 pub fn process_spawned(
@@ -266,6 +278,12 @@ pub fn process_killed(request: ProcessKillRequest) -> ProcessCapabilityReport {
 
 pub fn observe_process(request: ProcessObservationRequest<'_>) -> ProcessCapabilityReport {
     let facts = match request.observation {
+        ProcessObservation::Exited => vec![process_fact(
+            ExecutionFactKind::ProcessExited,
+            request.operation_id,
+            &request.target,
+            Vec::new(),
+        )],
         ProcessObservation::ExitCode(exit_code) => vec![
             process_fact(
                 ExecutionFactKind::ProcessExited,
@@ -400,7 +418,8 @@ mod tests {
     use super::{
         ProcessCapabilityErrorKind, ProcessKillReason, ProcessKillRequest, ProcessObservation,
         ProcessObservationRequest, ProcessSpawnRequest, ProcessStopIntent, ProcessStopRequest,
-        observe_process, process_fact, process_killed, process_spawned, process_stop_requested,
+        observe_process, process_fact, process_killed, process_session_target, process_spawned,
+        process_stop_requested,
     };
     use crate::execution::ExecutionFactKind;
     use crate::state::contracts::{
@@ -501,6 +520,28 @@ mod tests {
         assert!(encoded.contains("exit_code"));
         assert!(!encoded.contains("crash"));
         assert!(!encoded.contains("clean"));
+    }
+
+    #[test]
+    fn process_exit_observation_can_omit_exit_code() {
+        let report = observe_process(ProcessObservationRequest::new(
+            session_target("session-1"),
+            ProcessObservation::Exited,
+        ));
+
+        assert!(has_fact(&report.facts, ExecutionFactKind::ProcessExited));
+        assert!(!has_fact(&report.facts, ExecutionFactKind::ProcessExitCode));
+        assert_no_sensitive_process_material(&facts_json(&report.facts));
+    }
+
+    #[test]
+    fn process_session_target_is_execution_owned_launcher_managed_session() {
+        let target = process_session_target("session-1");
+
+        assert_eq!(target.system, StabilizationSystem::Execution);
+        assert_eq!(target.kind, TargetKind::Session);
+        assert_eq!(target.ownership, OwnershipClass::LauncherManaged);
+        assert_eq!(target.id, "session-1");
     }
 
     #[test]
