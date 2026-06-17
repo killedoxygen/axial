@@ -93,8 +93,8 @@ pub(crate) async fn create_offline_account(
         .accounts()
         .create_offline_account(&request.username)
         .map_err(account_store_error)?;
-    apply_selected_account_to_config(&state, &account).map_err(config_error)?;
-    let response = account_response_for_record(&state, account, true).await;
+    apply_selected_account_to_config(state, &account).map_err(config_error)?;
+    let response = account_response_for_record(state, account, true).await;
     Ok(Json(AccountActionResponse {
         status: "account_created",
         account: response,
@@ -130,9 +130,9 @@ pub(crate) async fn patch_account(
         .as_deref()
         == Some(account.account_id.as_str());
     if active {
-        apply_selected_account_to_config(&state, &account).map_err(config_error)?;
+        apply_selected_account_to_config(state, &account).map_err(config_error)?;
     }
-    let response = account_response_for_record(&state, account, active).await;
+    let response = account_response_for_record(state, account, active).await;
     Ok(Json(AccountActionResponse {
         status: "account_updated",
         account: response,
@@ -159,8 +159,8 @@ pub(crate) async fn select_account(
         .select(account_id)
         .map_err(account_store_error)?
         .ok_or_else(account_missing_error)?;
-    apply_selected_account_to_config(&state, &account).map_err(config_error)?;
-    let response = account_response_for_record(&state, account, true).await;
+    apply_selected_account_to_config(state, &account).map_err(config_error)?;
+    let response = account_response_for_record(state, account, true).await;
     Ok(Json(AccountActionResponse {
         status: "account_selected",
         account: response,
@@ -202,13 +202,13 @@ pub(crate) async fn remove_account(
         .map_err(account_store_error)?
     {
         Some(active) => Some(active),
-        None => select_authenticated_microsoft_replacement(&state).await?,
+        None => select_authenticated_microsoft_replacement(state).await?,
     };
 
     match next_active {
         Some(active) => {
-            activate_account_auth(&state, &active).await?;
-            apply_selected_account_to_config(&state, &active).map_err(config_error)?;
+            activate_account_auth(state, &active).await?;
+            apply_selected_account_to_config(state, &active).map_err(config_error)?;
         }
         None => {
             let mut next = state.config().current();

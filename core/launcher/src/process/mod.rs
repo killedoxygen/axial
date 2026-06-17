@@ -156,7 +156,7 @@ pub struct LaunchLogEvent {
 
 #[derive(Debug, Clone)]
 pub enum LaunchEvent {
-    Status(LaunchStatusEvent),
+    Status(Box<LaunchStatusEvent>),
     Log(LaunchLogEvent),
 }
 

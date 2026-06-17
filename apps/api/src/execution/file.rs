@@ -250,10 +250,10 @@ pub fn promote_temp_file(
                 request.operation_id.clone(),
                 &request.target,
             ));
-            return Ok(FileCapabilityReport {
+            Ok(FileCapabilityReport {
                 target: request.target,
                 facts,
-            });
+            })
         }
         Err(first_error) if !request.temp_path.exists() => {
             facts.push(file_fact(
@@ -261,11 +261,11 @@ pub fn promote_temp_file(
                 request.operation_id.clone(),
                 &request.target,
             ));
-            return Err(FileCapabilityError::with_source(
+            Err(FileCapabilityError::with_source(
                 FileCapabilityErrorKind::PromoteFailed,
                 facts,
                 first_error,
-            ));
+            ))
         }
         Err(error) => {
             let mut error_facts = facts;

@@ -106,7 +106,7 @@ fn classify_jvm_args(
                 fact_fields(arg_family(arg)),
             ));
         }
-        if is_experimental_g1_arg(arg) && !unlock_index.is_some_and(|unlock| unlock < index) {
+        if is_experimental_g1_arg(arg) && unlock_index.is_none_or(|unlock| unlock >= index) {
             facts.push(jvm_fact(
                 ExecutionFactKind::JvmArgUnlockOrderInvalid,
                 operation_id.clone(),

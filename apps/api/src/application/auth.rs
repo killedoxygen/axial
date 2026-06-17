@@ -205,8 +205,8 @@ pub(crate) async fn auth_refresh_for_state(
         None
     };
     if let Some(active) = active {
-        if let Ok(account) = accounts::upsert_microsoft_account(&state, &active.account) {
-            if let Err(error) = accounts::sync_config_for_account(&state, &account) {
+        if let Ok(account) = accounts::upsert_microsoft_account(state, &active.account) {
+            if let Err(error) = accounts::sync_config_for_account(state, &account) {
                 tracing::warn!("account config sync after auth refresh failed: {error}");
             }
         } else {
@@ -234,8 +234,8 @@ pub(crate) async fn auth_profile_sync_for_state(
         None
     };
     if let Some(active) = active {
-        if let Ok(account) = accounts::upsert_microsoft_account(&state, &active.account) {
-            if let Err(error) = accounts::sync_config_for_account(&state, &account) {
+        if let Ok(account) = accounts::upsert_microsoft_account(state, &active.account) {
+            if let Err(error) = accounts::sync_config_for_account(state, &account) {
                 tracing::warn!("account config sync after profile sync failed: {error}");
             }
         } else {

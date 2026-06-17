@@ -459,7 +459,7 @@ fn validate_rollback_snapshot(snapshot: &RollbackSnapshot) -> Result<(), StateEr
         }
         if artifact.project_id != installed.project_id
             || artifact.version_id != installed.version_id
-            || artifact.sha512_present != !installed.integrity.sha512.trim().is_empty()
+            || artifact.sha512_present == installed.integrity.sha512.trim().is_empty()
             || artifact.sha512_verified != installed.integrity.sha512_verified
         {
             return Err(StateError::InvalidRollback(format!(

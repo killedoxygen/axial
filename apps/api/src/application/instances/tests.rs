@@ -1592,7 +1592,13 @@ async fn create_instance_vanilla_selection_returns_backend_queue_state() {
     assert_eq!(queued.kind, "vanilla");
     assert_eq!(queued.label, "Minecraft 1.21.2");
     assert!(queued.queue_id.is_some());
-    assert!(created.install_queue.expect("install queue").items.len() >= 1);
+    assert!(
+        !created
+            .install_queue
+            .expect("install queue")
+            .items
+            .is_empty()
+    );
 }
 
 #[tokio::test]

@@ -575,6 +575,7 @@ pub(crate) async fn launch_benchmark_suite_run(
     Ok(response)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn persist_benchmark_suite_run_reservation(
     paths: &croopor_config::AppPaths,
     suite_id: &str,

@@ -33,6 +33,7 @@ pub(super) async fn fail_launch(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn fail_launch_with_outcome(
     state: &AppState,
     session_id: &str,

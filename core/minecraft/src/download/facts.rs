@@ -102,11 +102,11 @@ where
         target: safe_download_fact_value(target, "artifact"),
         fields: fields
             .into_iter()
-            .filter_map(|(key, value)| {
-                Some((
+            .map(|(key, value)| {
+                (
                     safe_download_fact_value(key.as_ref(), "field"),
                     safe_download_fact_value(value.as_ref(), "value"),
-                ))
+                )
             })
             .collect(),
     }

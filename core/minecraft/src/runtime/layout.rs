@@ -66,10 +66,10 @@ pub(super) fn runtime_executable_ready(java_exe: &Path) -> bool {
     {
         use std::os::unix::fs::PermissionsExt;
 
-        return java_exe
+        java_exe
             .metadata()
             .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false);
+            .unwrap_or(false)
     }
 
     #[cfg(windows)]

@@ -910,7 +910,10 @@ mod tests {
 
         let managed = guardian_preflight_outcome(GuardianPreflightOutcomeRequest {
             explicit_user_intent: true,
-            ..GuardianPreflightOutcomeRequest::new(GuardianMode::Managed, &[fact.clone()])
+            ..GuardianPreflightOutcomeRequest::new(
+                GuardianMode::Managed,
+                std::slice::from_ref(&fact),
+            )
         });
         assert_eq!(managed.guardian_decision.kind, GuardianDecisionKind::Strip);
         assert_eq!(managed.user_outcome.decision, GuardianDecisionKind::Strip);

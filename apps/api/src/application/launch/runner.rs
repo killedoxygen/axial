@@ -244,15 +244,14 @@ pub async fn launch_session(
                 effective_preset: &prepared.effective_preset,
                 explicit_jvm_preset_present: intent.guardian.has_named_preset(),
             })
-        {
-            if let Ok(plan) = plan_guardian_launch_recovery_directive(
+            && let Ok(plan) = plan_guardian_launch_recovery_directive(
                 &session_id,
                 &intent,
                 directive,
                 launch_policy_guardian_mode(intent.guardian.mode),
-            ) {
-                record_prelaunch_preset_adjustment_directive(&mut guardian, &plan);
-            }
+            )
+        {
+            record_prelaunch_preset_adjustment_directive(&mut guardian, &plan);
         }
 
         trace_launch_event(

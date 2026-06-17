@@ -473,13 +473,7 @@ fn mode_permission(
     reasoning: PolicyReasoningInput,
 ) -> f32 {
     match mode {
-        GuardianMode::Managed => {
-            if matches!(action, GuardianActionKind::Allow) {
-                1.0
-            } else {
-                1.0
-            }
-        }
+        GuardianMode::Managed => 1.0,
         GuardianMode::Custom => custom_mode_permission(diagnosis, action, context, reasoning),
         GuardianMode::Disabled => {
             if matches!(
@@ -520,13 +514,20 @@ fn custom_mode_permission(
                 0.0
             }
         }
-        GuardianActionKind::Fallback | GuardianActionKind::Degrade => (!reasoning
-            .explicit_intent_blocks_automatic_change(context))
-        .then_some(0.75)
-        .unwrap_or(0.0),
-        GuardianActionKind::Retry => (!reasoning.explicit_intent_blocks_automatic_change(context))
-            .then_some(0.65)
-            .unwrap_or(0.0),
+        GuardianActionKind::Fallback | GuardianActionKind::Degrade => {
+            if !reasoning.explicit_intent_blocks_automatic_change(context) {
+                0.75
+            } else {
+                0.0
+            }
+        }
+        GuardianActionKind::Retry => {
+            if !reasoning.explicit_intent_blocks_automatic_change(context) {
+                0.65
+            } else {
+                0.0
+            }
+        }
         GuardianActionKind::Replace
         | GuardianActionKind::Strip
         | GuardianActionKind::Downgrade

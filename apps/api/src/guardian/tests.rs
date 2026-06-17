@@ -71,7 +71,7 @@ fn execution_java_override_sentinel_maps_to_unavailable_diagnosis() {
     };
 
     let fact = guardian_fact_from_execution(&execution_fact, OperationPhase::Validating);
-    let diagnoses = diagnose_facts(&[fact.clone()], OperationPhase::Validating);
+    let diagnoses = diagnose_facts(std::slice::from_ref(&fact), OperationPhase::Validating);
 
     assert_eq!(fact.id.as_str(), "java_override_undefined_sentinel");
     assert_eq!(fact.domain, GuardianDomain::Runtime);
@@ -105,7 +105,7 @@ fn execution_java_update_fact_maps_to_update_diagnosis() {
     };
 
     let fact = guardian_fact_from_execution(&execution_fact, OperationPhase::Validating);
-    let diagnoses = diagnose_facts(&[fact.clone()], OperationPhase::Validating);
+    let diagnoses = diagnose_facts(std::slice::from_ref(&fact), OperationPhase::Validating);
 
     assert_eq!(fact.id.as_str(), "java_update_too_old");
     assert_eq!(fact.domain, GuardianDomain::Runtime);
@@ -139,7 +139,7 @@ fn execution_launch_command_fact_maps_to_launch_domain() {
     };
 
     let fact = guardian_fact_from_execution(&execution_fact, OperationPhase::Preparing);
-    let diagnoses = diagnose_facts(&[fact.clone()], OperationPhase::Preparing);
+    let diagnoses = diagnose_facts(std::slice::from_ref(&fact), OperationPhase::Preparing);
 
     assert_eq!(fact.id.as_str(), "launch_command_prepared");
     assert_eq!(fact.domain, GuardianDomain::Launch);
@@ -224,7 +224,7 @@ fn persisted_state_observation_maps_to_state_warning_diagnosis() {
         )),
     );
 
-    let diagnoses = diagnose_facts(&[fact.clone()], OperationPhase::Startup);
+    let diagnoses = diagnose_facts(std::slice::from_ref(&fact), OperationPhase::Startup);
 
     assert_eq!(fact.id.as_str(), "persisted_state_schema_invalid");
     assert_eq!(fact.domain, GuardianDomain::State);
@@ -349,7 +349,11 @@ fn diagnosis_inference_graph_declares_evidence_slots_and_target_strategy() {
     );
     assert_eq!(node.public_reason_template(&fact), "jvm_args_malformed");
 
-    let evaluation = node.evaluate(&[fact.clone()], &fact, OperationPhase::Validating);
+    let evaluation = node.evaluate(
+        std::slice::from_ref(&fact),
+        &fact,
+        OperationPhase::Validating,
+    );
     assert_eq!(evaluation.action_eligibility, node.eligibility);
 }
 
@@ -608,7 +612,11 @@ fn graph_evaluation_truth_table_covers_scoring_inputs_without_output_drift() {
     assert_eq!(accumulated.resolved_severity, GuardianSeverity::Blocking);
     assert_eq!(accumulated.resolved_confidence, GuardianConfidence::Medium);
     assert_eq!(
-        diagnose_facts(&[provider_fact.clone()], OperationPhase::Downloading)[0].confidence,
+        diagnose_facts(
+            std::slice::from_ref(&provider_fact),
+            OperationPhase::Downloading,
+        )[0]
+        .confidence,
         GuardianConfidence::Medium
     );
 
@@ -644,12 +652,12 @@ fn graph_evaluation_truth_table_covers_scoring_inputs_without_output_drift() {
     );
 
     let phase_matched = download_node.evaluate(
-        &[provider_fact.clone()],
+        std::slice::from_ref(&provider_fact),
         &provider_fact,
         OperationPhase::Downloading,
     );
     let phase_mismatched = download_node.evaluate(
-        &[provider_fact.clone()],
+        std::slice::from_ref(&provider_fact),
         &provider_fact,
         OperationPhase::Running,
     );
@@ -668,7 +676,7 @@ fn graph_evaluation_truth_table_covers_scoring_inputs_without_output_drift() {
     );
     let marker_node = diagnosis_node_for_fact(&marker_fact).expect("runtime marker node");
     let weak_direct = marker_node.evaluate(
-        &[marker_fact.clone()],
+        std::slice::from_ref(&marker_fact),
         &marker_fact,
         OperationPhase::Validating,
     );
@@ -704,14 +712,14 @@ fn graph_evaluation_prioritizes_impact_scalar_and_unknown_fallback_threshold() {
     let unsafe_artifact = diagnosis_node_for_fact(&unsafe_artifact_fact)
         .expect("unsafe artifact node")
         .evaluate(
-            &[unsafe_artifact_fact.clone()],
+            std::slice::from_ref(&unsafe_artifact_fact),
             &unsafe_artifact_fact,
             OperationPhase::Installing,
         );
     let performance_fallback = diagnosis_node_for_fact(&performance_fallback_fact)
         .expect("performance fallback node")
         .evaluate(
-            &[performance_fallback_fact.clone()],
+            std::slice::from_ref(&performance_fallback_fact),
             &performance_fallback_fact,
             OperationPhase::Planning,
         );
@@ -988,7 +996,7 @@ fn execution_jvm_parse_fact_maps_to_malformed_diagnosis() {
     };
 
     let fact = guardian_fact_from_execution(&execution_fact, OperationPhase::Validating);
-    let diagnoses = diagnose_facts(&[fact.clone()], OperationPhase::Validating);
+    let diagnoses = diagnose_facts(std::slice::from_ref(&fact), OperationPhase::Validating);
 
     assert_eq!(fact.id.as_str(), "jvm_args_parse_failed");
     assert_eq!(fact.domain, GuardianDomain::Jvm);

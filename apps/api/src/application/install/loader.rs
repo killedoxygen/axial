@@ -376,7 +376,7 @@ pub(crate) fn loader_error_progress(error: &LoaderError) -> DownloadProgress {
         current: 0,
         total: 0,
         file: None,
-        error: Some(public_loader_error_message(&error).to_string()),
+        error: Some(public_loader_error_message(error).to_string()),
         done: true,
     }
 }

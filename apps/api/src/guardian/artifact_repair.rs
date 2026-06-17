@@ -651,6 +651,7 @@ fn task_rollback(task: GuardianRepairTaskKind) -> RollbackState {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_artifact_repair_memory(
     failure_memory: &GuardianFailureMemoryStore,
     diagnosis_id: &DiagnosisId,
@@ -1385,6 +1386,7 @@ mod tests {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn request_with_checksum<'a>(
         plan: &'a crate::guardian::GuardianRepairPlan,
         destination: &'a std::path::Path,

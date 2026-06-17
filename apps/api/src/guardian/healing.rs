@@ -328,6 +328,7 @@ fn create_planned_journal(
     journals.create(entry);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_terminal_journal(
     journals: &OperationJournalStore,
     operation_id: &OperationId,
@@ -376,6 +377,7 @@ fn repair_step(
     step
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_repair_memory(
     failure_memory: &GuardianFailureMemoryStore,
     diagnosis_id: &DiagnosisId,
@@ -1077,6 +1079,7 @@ mod tests {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn request<'a>(
         plan: &'a GuardianRepairPlan,
         operation_id: Option<OperationId>,

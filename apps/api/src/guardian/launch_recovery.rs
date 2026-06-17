@@ -346,6 +346,7 @@ fn launch_recovery_target(session_id: &str) -> TargetDescriptor {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_launch_recovery_journal(
     journals: &OperationJournalStore,
     operation_id: &OperationId,
@@ -395,6 +396,7 @@ fn launch_recovery_step(
     step
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_launch_recovery_memory(
     failure_memory: &GuardianFailureMemoryStore,
     diagnosis_id: &DiagnosisId,

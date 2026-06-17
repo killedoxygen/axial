@@ -203,7 +203,7 @@ impl SessionStore {
                     stages: Vec::new(),
                 };
                 apply_status_update(entry, &mut status);
-                let _ = entry.events.send(LaunchEvent::Status(status));
+                let _ = entry.events.send(LaunchEvent::Status(Box::new(status)));
                 changed = true;
             } else if let Some(evidence) = boot_evidence {
                 apply_stage_evidence(entry.record.stages.last_mut(), &evidence);
@@ -241,7 +241,7 @@ impl SessionStore {
         let mut sessions = self.sessions.write().await;
         if let Some(entry) = sessions.get_mut(session_id) {
             apply_status_update(entry, &mut event);
-            let _ = entry.events.send(LaunchEvent::Status(event));
+            let _ = entry.events.send(LaunchEvent::Status(Box::new(event)));
             drop(sessions);
             self.notify_changed();
         }
@@ -2347,7 +2347,7 @@ mod tests {
         receiver: &mut tokio::sync::broadcast::Receiver<LaunchEvent>,
     ) -> LaunchStatusEvent {
         match receiver.recv().await.expect("status event") {
-            LaunchEvent::Status(status) => status,
+            LaunchEvent::Status(status) => *status,
             other => panic!("expected status event, got {other:?}"),
         }
     }

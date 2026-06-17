@@ -277,16 +277,16 @@ pub fn sanitize_install_progress(mut progress: DownloadProgress) -> DownloadProg
         .file
         .take()
         .and_then(|file| sanitize_evidence_token(&file, RedactionAudience::UserVisible, 96));
-    progress.error = progress.error.take().and_then(|error| {
+    progress.error = progress.error.take().map(|error| {
         if progress.done {
-            return Some(INSTALL_FAILURE_MESSAGE.to_string());
+            return INSTALL_FAILURE_MESSAGE.to_string();
         }
-        Some(sanitize_public_diagnostic_text(
+        sanitize_public_diagnostic_text(
             &error,
             RedactionAudience::UserVisible,
             160,
             INSTALL_FAILURE_MESSAGE,
-        ))
+        )
     });
     progress
 }

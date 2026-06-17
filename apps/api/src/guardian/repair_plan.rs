@@ -528,6 +528,7 @@ fn runtime_ready_marker_repair_tasks(
     ]
 }
 
+#[allow(clippy::too_many_arguments)]
 fn repair_task(
     id: &str,
     kind: GuardianRepairTaskKind,
@@ -553,6 +554,7 @@ fn repair_task(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn runtime_repair_task(
     id: &str,
     kind: GuardianRepairTaskKind,
@@ -578,6 +580,7 @@ fn runtime_repair_task(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn repair_task_with_max_attempts(
     id: &str,
     kind: GuardianRepairTaskKind,

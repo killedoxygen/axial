@@ -112,7 +112,7 @@ impl BenchmarkSuiteDriverStore {
         let storage_dir = driver_dir(paths);
         let load_state = load_persisted_driver_inner(&storage_dir);
         for status in &load_state.interrupted {
-            if let Err(error) = persist_status_to_dir(&storage_dir, &status) {
+            if let Err(error) = persist_status_to_dir(&storage_dir, status) {
                 warn!(
                     driver_id = %status.id,
                     error = %error,
