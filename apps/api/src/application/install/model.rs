@@ -80,7 +80,7 @@ pub struct InstallProgressViewModel {
 impl InstallProgressViewModel {
     pub fn starting() -> Self {
         Self {
-            phase_id: "queued".to_string(),
+            phase_id: "starting".to_string(),
             label: "Preparing install".to_string(),
             progress_pct: 0,
             terminal: false,
@@ -179,8 +179,10 @@ pub struct InstallQueuedItemViewModel {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InstallQueueActiveViewModel {
     pub queue_id: String,
-    pub install_id: String,
-    pub operation_id: OperationId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<OperationId>,
     pub kind: String,
     pub title: String,
     pub label: String,

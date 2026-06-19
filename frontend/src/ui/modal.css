@@ -5,7 +5,7 @@
   background: color-mix(in oklab, var(--bg-deep) 62%, transparent);
   backdrop-filter: blur(6px);
   -webkit-backdrop-filter: blur(6px);
-  animation: cp-fade-in 160ms ease both;
+  animation: cp-fade-in 220ms ease both;
 }
 
 .cp-modal-panel {
@@ -18,15 +18,18 @@
   max-height: calc(100vh - 48px);
   z-index: 901;
   outline: none;
-  animation: cp-modal-in 200ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  transform-origin: center;
+  animation: cp-modal-in 340ms cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 
 @keyframes cp-modal-in {
   from {
     opacity: 0;
+    transform: translateY(14px) scale(0.975);
   }
   to {
     opacity: 1;
+    transform: translateY(0) scale(1);
   }
 }
 

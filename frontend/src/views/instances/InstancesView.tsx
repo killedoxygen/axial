@@ -47,6 +47,14 @@ function ListRow({
   const install = instanceInstallStatus(inst, v);
   const installing = install.installing;
   const installLabel = install.state === 'queued' ? install.queuedItem?.title || install.label : 'Installing';
+  const launchAction = inst.launch_action;
+  const actionIcon =
+    launchAction.primary_action === 'launch'
+      ? 'play'
+      : launchAction.primary_action === 'install'
+        ? 'download'
+        : 'alert';
+  const actionLabel = launchAction.primary_action === 'launch' ? 'Play' : launchAction.label;
   const showModsCount = supportsMods(v);
   return (
     <div
@@ -86,14 +94,15 @@ function ListRow({
         <Button
           size="sm"
           variant="secondary"
-          icon={installing ? (install.state === 'queued' ? 'clock' : 'download') : 'play'}
+          icon={installing ? (install.state === 'queued' ? 'clock' : 'download') : actionIcon}
           disabled={installing}
+          title={launchAction.primary_action === 'blocked' ? launchAction.disabled_reason : undefined}
           onClick={(e) => {
             e.stopPropagation();
             navigate({ name: 'instance', id: inst.id });
           }}
         >
-          {installing ? installLabel : 'Play'}
+          {installing ? installLabel : actionLabel}
         </Button>
         <IconButton
           icon="dots"

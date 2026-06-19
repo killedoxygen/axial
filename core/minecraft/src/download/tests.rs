@@ -1,6 +1,7 @@
 use super::assets::{
     AssetObjectDownloadJob, copy_virtual_asset_if_missing, copy_virtual_assets,
-    missing_asset_object_jobs, unique_asset_object_jobs, virtual_asset_destination,
+    missing_asset_object_jobs, repair_virtual_assets_from_index, unique_asset_object_jobs,
+    virtual_asset_destination,
 };
 use super::client::{adaptive_download_concurrency, build_http_client};
 use super::facts::{ExecutionDownloadRequest, execution_download_fact};
@@ -200,7 +201,8 @@ async fn selected_missing_artifact_fact_is_emitted_before_download_failure() {
         descriptors.push(descriptor);
     }
     assert!(facts.iter().any(|fact| {
-        fact.kind == ExecutionDownloadFactKind::ArtifactMissing && fact.target == "artifact.jar"
+        fact.kind == ExecutionDownloadFactKind::ArtifactMissing
+            && fact.target == "minecraft_client_artifact"
     }));
     assert!(
         facts
@@ -209,7 +211,7 @@ async fn selected_missing_artifact_fact_is_emitted_before_download_failure() {
     );
     assert_eq!(descriptors.len(), 1);
     assert_eq!(descriptors[0].kind, SelectedDownloadArtifactKind::ClientJar);
-    assert_eq!(descriptors[0].target, "artifact.jar");
+    assert_eq!(descriptors[0].target, "minecraft_client_artifact");
     assert!(!destination.exists());
 
     let _ = fs::remove_dir_all(root);
@@ -254,7 +256,7 @@ async fn selected_existing_corrupt_artifact_emits_fact_without_replacement() {
     }
     assert!(facts.iter().any(|fact| {
         fact.kind == ExecutionDownloadFactKind::ChecksumMismatch
-            && fact.target == "artifact.jar"
+            && fact.target == "minecraft_client_artifact"
             && fact
                 .fields
                 .iter()
@@ -272,7 +274,7 @@ async fn selected_existing_corrupt_artifact_emits_fact_without_replacement() {
     );
     assert_eq!(descriptors.len(), 1);
     assert_eq!(descriptors[0].kind, SelectedDownloadArtifactKind::ClientJar);
-    assert_eq!(descriptors[0].target, "artifact.jar");
+    assert_eq!(descriptors[0].target, "minecraft_client_artifact");
 
     let _ = fs::remove_dir_all(root);
 }
@@ -326,7 +328,7 @@ async fn selected_existing_unsupported_artifact_blocks_without_network() {
             .any(|fact| fact.kind == ExecutionDownloadFactKind::WrittenToTemp)
     );
     assert_eq!(descriptors.len(), 1);
-    assert_eq!(descriptors[0].target, "artifact.jar");
+    assert_eq!(descriptors[0].target, "minecraft_client_artifact");
 
     let _ = fs::remove_dir_all(root);
 }
@@ -773,7 +775,7 @@ async fn execute_download_to_temp_reports_successful_integrity() {
 }
 
 #[tokio::test]
-async fn execute_download_to_temp_reports_missing_metadata_without_blocking_download() {
+async fn execute_download_to_temp_reports_missing_metadata_without_promoting() {
     let root = temp_dir("execution-download-missing-metadata");
     let destination = root.join("artifact.jar");
     let body = b"artifact".to_vec();
@@ -789,7 +791,7 @@ async fn execute_download_to_temp_reports_missing_metadata_without_blocking_down
     .await;
     let client = build_http_client(Duration::from_secs(5));
 
-    let report = execute_download_to_temp(
+    let error = execute_download_to_temp(
         &client,
         ExecutionDownloadRequest::launcher_managed(
             &url,
@@ -798,24 +800,23 @@ async fn execute_download_to_temp_reports_missing_metadata_without_blocking_down
         ),
     )
     .await
-    .expect("metadata-free download should still promote");
+    .expect_err("metadata-free download should fail closed");
 
+    assert_eq!(error.kind, ExecutionDownloadFactKind::MetadataMissing);
     assert!(
-        report
+        error
             .facts
             .iter()
             .any(|fact| fact.kind == ExecutionDownloadFactKind::MetadataMissing)
     );
     assert!(
-        !report
+        !error
             .facts
             .iter()
             .any(|fact| fact.kind == ExecutionDownloadFactKind::ArtifactVerified)
     );
-    assert_eq!(
-        fs::read(&destination).expect("read promoted artifact"),
-        body
-    );
+    assert!(!destination.exists());
+    assert!(!destination.with_extension("tmp").exists());
 
     let _ = fs::remove_dir_all(root);
 }
@@ -903,14 +904,11 @@ async fn execute_download_to_temp_reports_provider_failure_fact() {
     )
     .await;
     let client = build_http_client(Duration::from_secs(5));
+    let expected = ExpectedIntegrity::from_mojang(12, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
 
     let error = execute_download_to_temp(
         &client,
-        ExecutionDownloadRequest::launcher_managed(
-            &url,
-            &destination,
-            &ExpectedIntegrity::default(),
-        ),
+        ExecutionDownloadRequest::launcher_managed(&url, &destination, &expected),
     )
     .await
     .expect_err("provider failure should not promote");
@@ -946,14 +944,11 @@ async fn execute_download_to_temp_reports_interrupted_short_response_without_pro
     )
     .await;
     let client = build_http_client(Duration::from_secs(5));
+    let expected = ExpectedIntegrity::from_mojang(12, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
 
     let error = execute_download_to_temp(
         &client,
-        ExecutionDownloadRequest::launcher_managed(
-            &url,
-            &destination,
-            &ExpectedIntegrity::default(),
-        ),
+        ExecutionDownloadRequest::launcher_managed(&url, &destination, &expected),
     )
     .await
     .expect_err("short response should not promote");
@@ -994,6 +989,7 @@ async fn execute_download_to_temp_refuses_non_launcher_owned_targets() {
                 destination: &destination,
                 expected: &expected,
                 ownership,
+                require_checksum: true,
             },
         )
         .await
@@ -1086,7 +1082,7 @@ async fn virtual_asset_copy_reports_destination_errors() {
 }
 
 #[tokio::test]
-async fn virtual_asset_copy_skips_existing_destination() {
+async fn virtual_asset_copy_repairs_stale_existing_destination() {
     let root = temp_dir("virtual-asset-copy-existing");
     let src = root.join("objects").join("aa").join("asset");
     let dst = root
@@ -1102,12 +1098,61 @@ async fn virtual_asset_copy_skips_existing_destination() {
 
     copy_virtual_asset_if_missing(&src, &dst)
         .await
-        .expect("existing virtual asset should be kept");
+        .expect("stale virtual asset should be repaired");
 
     assert_eq!(
         fs::read(&dst).expect("read existing virtual asset"),
-        b"existing"
+        b"source"
     );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn virtual_asset_copy_keeps_matching_existing_destination() {
+    let root = temp_dir("virtual-asset-copy-matching-existing");
+    let src = root.join("objects").join("aa").join("asset");
+    let dst = root
+        .join("virtual")
+        .join("legacy")
+        .join("sounds")
+        .join("step.ogg");
+    fs::create_dir_all(src.parent().expect("source parent")).expect("create source parent");
+    fs::create_dir_all(dst.parent().expect("destination parent"))
+        .expect("create destination parent");
+    fs::write(&src, b"source").expect("write source asset");
+    fs::write(&dst, b"source").expect("write existing virtual asset");
+
+    copy_virtual_asset_if_missing(&src, &dst)
+        .await
+        .expect("matching virtual asset should be kept");
+
+    assert_eq!(
+        fs::read(&dst).expect("read existing virtual asset"),
+        b"source"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn virtual_asset_copy_reports_missing_source_object() {
+    let root = temp_dir("virtual-asset-copy-missing-source");
+    let src = root.join("objects").join("aa").join("asset");
+    let dst = root
+        .join("virtual")
+        .join("legacy")
+        .join("sounds")
+        .join("step.ogg");
+
+    let result = copy_virtual_asset_if_missing(&src, &dst).await;
+
+    assert!(matches!(
+        result,
+        Err(DownloadError::Integrity(message))
+            if message.contains("virtual asset source is missing")
+    ));
+    assert!(!dst.exists());
 
     let _ = fs::remove_dir_all(root);
 }
@@ -1193,6 +1238,53 @@ async fn virtual_asset_mapping_reports_destination_errors() {
 
     assert!(result.is_err());
     assert!(dst.is_dir());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn virtual_asset_index_repair_refreshes_stale_legacy_copy() {
+    let root = temp_dir("virtual-asset-index-repair");
+    let asset = b"fresh";
+    let hash = sha1_hex(asset);
+    let object_path = root
+        .join("assets")
+        .join("objects")
+        .join(&hash[..2])
+        .join(&hash);
+    let virtual_path = root
+        .join("assets")
+        .join("virtual")
+        .join("legacy")
+        .join("sounds")
+        .join("step.ogg");
+    let index_path = root.join("assets").join("indexes").join("legacy.json");
+    fs::create_dir_all(object_path.parent().expect("object parent")).expect("create object parent");
+    fs::create_dir_all(virtual_path.parent().expect("virtual parent"))
+        .expect("create virtual parent");
+    fs::create_dir_all(index_path.parent().expect("index parent")).expect("create index parent");
+    fs::write(&object_path, asset).expect("write object");
+    fs::write(&virtual_path, b"stale").expect("write stale virtual copy");
+    fs::write(
+        &index_path,
+        format!(
+            r#"{{
+                "objects": {{
+                    "sounds/step.ogg": {{ "hash": "{hash}", "size": {} }}
+                }},
+                "virtual": true
+            }}"#,
+            asset.len()
+        ),
+    )
+    .expect("write asset index");
+
+    let repaired = repair_virtual_assets_from_index(&root, &index_path)
+        .await
+        .expect("repair virtual assets");
+
+    assert!(repaired);
+    assert_eq!(fs::read(&virtual_path).expect("read virtual copy"), asset);
 
     let _ = fs::remove_dir_all(root);
 }
@@ -1429,6 +1521,30 @@ fn library_artifact_job_carries_expected_integrity() {
     let job = resolve_library_download(&lib, Path::new("/tmp/croopor-test")).expect("library job");
 
     assert_eq!(job.expected, ExpectedIntegrity::from_mojang(1234, sha1));
+}
+
+#[test]
+fn library_job_uses_legacy_checksums_when_mojang_sha1_is_missing() {
+    let artifact_path = "org/example/lib/1.0.0/lib-1.0.0.jar";
+    let sha1 = "abcdef1234567890abcdef1234567890abcdef12";
+    let lib = Library {
+        name: "org.example:lib:1.0.0".to_string(),
+        downloads: Some(LibraryDownload {
+            artifact: Some(LibraryArtifact {
+                path: artifact_path.to_string(),
+                url: format!("https://libraries.minecraft.net/{artifact_path}"),
+                sha1: String::new(),
+                size: 0,
+            }),
+            classifiers: HashMap::new(),
+        }),
+        checksums: vec!["not-a-sha1".to_string(), sha1.to_string()],
+        ..Library::default()
+    };
+
+    let job = resolve_library_download(&lib, Path::new("/tmp/croopor-test")).expect("library job");
+
+    assert_eq!(job.expected, ExpectedIntegrity::from_sha1(sha1));
 }
 
 #[test]

@@ -302,6 +302,7 @@ fn is_readiness_fact(id: &str) -> bool {
             | "client_jar_missing"
             | "libraries_missing"
             | "asset_index_missing"
+            | "launcher_managed_artifact_signature_corruption"
             | "managed_runtime_missing"
             | "java_override_missing"
     )
@@ -459,6 +460,9 @@ fn detail_for_diagnosis(
         "launcher_managed_artifact_corrupt" => {
             Some("Guardian blocked launch because launcher-managed game files are corrupt.")
         }
+        "launcher_managed_artifact_signature_corrupt" => Some(
+            "Guardian blocked launch because launcher-managed jar signatures are inconsistent.",
+        ),
         "managed_runtime_missing" => {
             Some("Managed Java runtime is missing and can be prepared before launch.")
         }
@@ -564,7 +568,8 @@ fn guidance_for_diagnosis(
         | "client_jar_missing"
         | "libraries_missing"
         | "asset_index_missing"
-        | "launcher_managed_artifact_corrupt" => {
+        | "launcher_managed_artifact_corrupt"
+        | "launcher_managed_artifact_signature_corrupt" => {
             Some("Install or repair the affected version before launching again.")
         }
         "managed_runtime_missing" => {
@@ -952,6 +957,32 @@ mod tests {
         assert_eq!(outcome.user_outcome.decision, GuardianDecisionKind::Block);
         assert!(outcome.user_outcome.details.contains(
             &"Guardian blocked launch because client game files are missing.".to_string()
+        ));
+        assert!(outcome.user_outcome.guidance.contains(
+            &"Install or repair the affected version before launching again.".to_string()
+        ));
+    }
+
+    #[test]
+    fn launcher_managed_signature_readiness_blocks_preflight_with_specific_copy() {
+        let readiness_fact = fact(
+            "launcher_managed_artifact_signature_corruption",
+            GuardianDomain::Download,
+            GuardianSeverity::Blocking,
+            OwnershipClass::LauncherManaged,
+            TargetKind::Artifact,
+            "launcher_managed_jars",
+        );
+
+        let outcome = guardian_preflight_outcome(GuardianPreflightOutcomeRequest {
+            readiness: GuardianPreflightReadiness::from_facts(false, &[readiness_fact]),
+            ..GuardianPreflightOutcomeRequest::new(GuardianMode::Managed, &[])
+        });
+
+        assert_eq!(outcome.user_outcome.decision, GuardianDecisionKind::Block);
+        assert!(outcome.user_outcome.details.contains(
+            &"Guardian blocked launch because launcher-managed jar signatures are inconsistent."
+                .to_string()
         ));
         assert!(outcome.user_outcome.guidance.contains(
             &"Install or repair the affected version before launching again.".to_string()

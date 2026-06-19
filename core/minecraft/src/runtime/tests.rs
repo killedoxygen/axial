@@ -11,6 +11,7 @@ use super::{
 };
 use crate::JavaVersion;
 use serde::Deserialize;
+use sha1::{Digest as _, Sha1};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -243,10 +244,36 @@ fn runtime_manifest_install_plan_sorts_directories_before_files() {
 #[tokio::test]
 async fn runtime_manifest_install_reports_file_progress() {
     let root = unique_temp_root("croopor-runtime-progress-test");
+    let java_bytes = b"java".to_vec();
+    let cfg_bytes = b"cfg".to_vec();
+    let java_sha1 = {
+        let mut hasher = Sha1::new();
+        hasher.update(&java_bytes);
+        format!("{:x}", hasher.finalize())
+    };
+    let cfg_sha1 = {
+        let mut hasher = Sha1::new();
+        hasher.update(&cfg_bytes);
+        format!("{:x}", hasher.finalize())
+    };
+    let java_url = serve_runtime_download(java_bytes.clone()).await;
+    let cfg_url = serve_runtime_response(
+        200,
+        cfg_bytes.clone(),
+        Some(cfg_bytes.len() as u64),
+        "/jvm.cfg",
+    )
+    .await;
     let mut files = HashMap::new();
     files.insert("bin".to_string(), manifest_file("directory"));
-    files.insert("bin/java".to_string(), manifest_file("file"));
-    files.insert("lib/jvm.cfg".to_string(), manifest_file("file"));
+    files.insert(
+        "bin/java".to_string(),
+        downloadable_manifest_file(&java_url, java_bytes.len() as u64, &java_sha1),
+    );
+    files.insert(
+        "lib/jvm.cfg".to_string(),
+        downloadable_manifest_file(&cfg_url, cfg_bytes.len() as u64, &cfg_sha1),
+    );
     let mut events = Vec::new();
 
     install_runtime_manifest_files("java-runtime-delta", &root, files, &mut |event| {
@@ -381,7 +408,72 @@ fn managed_runtime_requires_ready_marker_even_when_java_exists() {
     fs::write(root.join(".croopor-ready"), b"ready").expect("ready marker");
     assert_eq!(
         detect_runtime_state(&root, true),
+        RuntimeInstallState::Broken
+    );
+    write_runtime_manifest_proof_for_java(&root);
+    assert_eq!(
+        detect_runtime_state(&root, true),
         RuntimeInstallState::Ready
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn managed_runtime_rejects_empty_manifest_proof() {
+    let root = unique_temp_root("croopor-managed-runtime-empty-proof-test");
+    write_runtime_executable_fixture(&root);
+    fs::write(root.join(".croopor-ready"), b"ready").expect("ready marker");
+    fs::write(
+        root.join(".croopor-runtime-manifest.json"),
+        br#"{"files":{}}"#,
+    )
+    .expect("empty runtime manifest proof");
+
+    assert_eq!(
+        detect_runtime_state(&root, true),
+        RuntimeInstallState::Broken
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn managed_runtime_rejects_manifest_file_without_raw_download_proof() {
+    let root = unique_temp_root("croopor-managed-runtime-missing-raw-proof-test");
+    write_runtime_executable_fixture(&root);
+    fs::write(root.join(".croopor-ready"), b"ready").expect("ready marker");
+    fs::write(
+        root.join(".croopor-runtime-manifest.json"),
+        br#"{"files":{"bin/java":{"type":"file","downloads":{}}}}"#,
+    )
+    .expect("runtime manifest proof without raw download");
+
+    assert_eq!(
+        detect_runtime_state(&root, true),
+        RuntimeInstallState::Broken
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn managed_runtime_manifest_drift_is_broken() {
+    let root = unique_temp_root("croopor-managed-runtime-manifest-drift-test");
+    write_runtime_executable_fixture(&root);
+    write_runtime_manifest_proof_for_java(&root);
+    fs::write(root.join(".croopor-ready"), b"ready").expect("ready marker");
+    assert_eq!(
+        detect_runtime_state(&root, true),
+        RuntimeInstallState::Ready
+    );
+
+    fs::write(java_executable(&root), b"changed java").expect("modify java");
+    make_executable(&java_executable(&root));
+
+    assert_eq!(
+        detect_runtime_state(&root, true),
+        RuntimeInstallState::Broken
     );
 
     let _ = fs::remove_dir_all(root);
@@ -648,6 +740,62 @@ async fn runtime_file_download_rejects_oversized_content_length() {
 }
 
 #[tokio::test]
+async fn runtime_manifest_file_requires_checksum_proof() {
+    let root = unique_temp_root("croopor-runtime-missing-checksum-test");
+    let file = ComponentManifestFile {
+        kind: "file".to_string(),
+        executable: false,
+        downloads: Some(ComponentManifestDownloads {
+            raw: Some(ComponentManifestDownload {
+                url: "https://example.test/runtime.bin".to_string(),
+                sha1: None,
+                size: Some(4),
+            }),
+        }),
+    };
+
+    let result =
+        install_runtime_manifest_file(runtime_download_client().clone(), &root, "bin/java", file)
+            .await;
+
+    assert!(matches!(
+        result,
+        Err(JavaRuntimeLookupError::Download(message))
+            if message.contains("missing checksum proof")
+    ));
+    assert!(!root.join("bin").join("java").exists());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn runtime_manifest_file_rejects_invalid_checksum_proof() {
+    let root = unique_temp_root("croopor-runtime-invalid-checksum-test");
+    let file = ComponentManifestFile {
+        kind: "file".to_string(),
+        executable: false,
+        downloads: Some(ComponentManifestDownloads {
+            raw: Some(ComponentManifestDownload {
+                url: "https://example.test/runtime.bin".to_string(),
+                sha1: Some("not-a-sha1".to_string()),
+                size: Some(4),
+            }),
+        }),
+    };
+
+    let result =
+        install_runtime_manifest_file(runtime_download_client().clone(), &root, "bin/java", file)
+            .await;
+
+    assert!(matches!(
+        result,
+        Err(JavaRuntimeLookupError::Download(message))
+            if message.contains("missing checksum proof")
+    ));
+    assert!(!root.join("bin").join("java").exists());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn runtime_file_download_rejects_stream_past_expected_size_and_removes_temp() {
     let root = unique_temp_root("croopor-runtime-download-stream-bound-test");
     fs::create_dir_all(&root).expect("download root");
@@ -755,6 +903,38 @@ fn write_runtime_executable_fixture(root: &Path) {
         fs::create_dir_all(config.parent().expect("config parent")).expect("config parent dir");
         fs::write(config, b"jvm").expect("runtime config");
     }
+}
+
+fn write_runtime_manifest_proof_for_java(root: &Path) {
+    let java = java_executable(root);
+    let bytes = fs::read(&java).expect("read java fixture");
+    let relative_path = java
+        .strip_prefix(root)
+        .expect("java under root")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let mut hasher = Sha1::new();
+    hasher.update(&bytes);
+    let sha1 = format!("{:x}", hasher.finalize());
+    let manifest = serde_json::json!({
+        "files": {
+            relative_path: {
+                "type": "file",
+                "downloads": {
+                    "raw": {
+                        "url": "https://example.invalid/java",
+                        "sha1": sha1,
+                        "size": bytes.len()
+                    }
+                }
+            }
+        }
+    });
+    fs::write(
+        root.join(".croopor-runtime-manifest.json"),
+        serde_json::to_vec(&manifest).expect("manifest json"),
+    )
+    .expect("write runtime manifest proof");
 }
 
 #[cfg(unix)]

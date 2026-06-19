@@ -76,6 +76,11 @@ pub async fn fetch_version_manifest() -> Result<VersionManifest, String> {
 pub async fn fetch_version_manifest_cached(library_dir: &Path) -> Result<VersionManifest, String> {
     let cache_path = version_manifest_cache_path(library_dir);
 
+    if let Some(value) = fresh_persistent_manifest_cache(&cache_path) {
+        update_manifest_cache(value.clone());
+        return Ok(value);
+    }
+
     if let Some(value) = fresh_cached_manifest() {
         let _ = write_persistent_manifest_cache_value(&cache_path, &value).await;
         return Ok(value);
@@ -121,6 +126,14 @@ fn stale_cached_manifest() -> Option<VersionManifest> {
         })
     });
     cache.lock().ok().and_then(|cache| cache.value.clone())
+}
+
+fn fresh_persistent_manifest_cache(path: &Path) -> Option<VersionManifest> {
+    let modified = fs::metadata(path).ok()?.modified().ok()?;
+    if modified.elapsed().ok()? >= CACHE_TTL {
+        return None;
+    }
+    read_persistent_manifest_cache(path).ok()
 }
 
 fn update_manifest_cache(manifest: VersionManifest) {
@@ -325,6 +338,22 @@ mod tests {
 
         let cached = read_persistent_manifest_cache(&cache_path).expect("read cache");
         assert_eq!(cached.latest.release, "1.21.6");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn fresh_persistent_manifest_is_preferred_for_requested_library() {
+        let root = temp_dir("manifest-cache-fresh-local-first");
+        let cache_path = version_manifest_cache_path(&root);
+        write_persistent_manifest_cache(&cache_path, sample_manifest_body("1.21.7").as_bytes())
+            .await
+            .expect("write cache");
+
+        let manifest = fresh_persistent_manifest_cache(&cache_path).expect("fresh local manifest");
+
+        assert_eq!(manifest.latest.release, "1.21.7");
+        assert_eq!(manifest.versions[0].id, "1.21.7");
 
         let _ = fs::remove_dir_all(root);
     }

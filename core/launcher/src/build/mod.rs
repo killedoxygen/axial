@@ -24,17 +24,36 @@ pub struct LaunchAuthContext {
     pub user_type: String,
 }
 
+const OFFLINE_AUTH_ACCESS_TOKEN: &str = "0";
+const OFFLINE_AUTH_USER_TYPE: &str = "msa";
+const AUTHLIB_OFFLINE_MULTIPLAYER_VERSIONS: &[&str] = &["1.16.4", "1.16.5"];
+const AUTHLIB_OFFLINE_MULTIPLAYER_JVM_ARGS: &[&str] = &[
+    "-Dminecraft.api.env=custom",
+    "-Dminecraft.api.auth.host=https://nope.invalid",
+    "-Dminecraft.api.account.host=https://nope.invalid",
+    "-Dminecraft.api.session.host=https://nope.invalid",
+    "-Dminecraft.api.services.host=https://nope.invalid",
+];
+const LEGACY_FML_LIBRARY_MIRROR_JVM_ARG: &str = "-Dfml.core.libraries.mirror=https://web.archive.org/web/20200830040255if_/http://files.minecraftforge.net/fmllibs/%s";
+
 impl LaunchAuthContext {
     pub fn offline(player_name: impl Into<String>) -> Self {
         let player_name = player_name.into();
         Self {
             uuid: offline_uuid(&player_name),
             player_name,
-            access_token: "null".to_string(),
+            access_token: OFFLINE_AUTH_ACCESS_TOKEN.to_string(),
             client_id: String::new(),
             xuid: String::new(),
-            user_type: "legacy".to_string(),
+            user_type: OFFLINE_AUTH_USER_TYPE.to_string(),
         }
+    }
+
+    pub fn is_offline(&self) -> bool {
+        self.access_token == OFFLINE_AUTH_ACCESS_TOKEN
+            && self.client_id.is_empty()
+            && self.xuid.is_empty()
+            && self.uuid == offline_uuid(&self.player_name)
     }
 }
 
@@ -57,6 +76,7 @@ pub struct VanillaLaunchRequest {
     pub session_id: String,
     pub mc_dir: PathBuf,
     pub version_id: String,
+    pub target_version_id: String,
     pub auth: LaunchAuthContext,
     pub runtime: RuntimeSelection,
     pub game_dir: Option<PathBuf>,
@@ -109,11 +129,7 @@ pub fn plan_resolved_launch(
     request: &VanillaLaunchRequest,
     version: VersionJson,
 ) -> Result<VanillaLaunchPlan, VanillaLaunchPlanError> {
-    let client_jar = if uses_module_bootstrap(&version) {
-        None
-    } else {
-        find_client_jar(&request.mc_dir, &version, &request.version_id)
-    };
+    let client_jar = find_client_jar(&request.mc_dir, &version, &request.version_id);
 
     let mut env = default_environment();
     let game_dir = request
@@ -200,6 +216,8 @@ pub fn plan_resolved_launch(
         jvm_args.push(format!("-Djna.tmpdir={natives_path}"));
         jvm_args.push(format!("-Djava.io.tmpdir={natives_path}"));
     }
+    jvm_args.extend(authlib_offline_multiplayer_jvm_args(request, &version));
+    jvm_args.extend(legacy_fml_library_mirror_jvm_args(request, &version));
     jvm_args.extend(request.extra_jvm_args.clone());
     let main_class = version.main_class.clone();
 
@@ -221,6 +239,63 @@ pub fn plan_resolved_launch(
         command,
         game_dir,
     })
+}
+
+fn authlib_offline_multiplayer_jvm_args(
+    request: &VanillaLaunchRequest,
+    version: &VersionJson,
+) -> Vec<String> {
+    if !request.auth.is_offline() {
+        return Vec::new();
+    }
+    let target_version = effective_minecraft_version_id(request, version);
+    if AUTHLIB_OFFLINE_MULTIPLAYER_VERSIONS
+        .iter()
+        .any(|version| *version == target_version)
+    {
+        return AUTHLIB_OFFLINE_MULTIPLAYER_JVM_ARGS
+            .iter()
+            .map(|arg| (*arg).to_string())
+            .collect();
+    }
+    Vec::new()
+}
+
+fn legacy_fml_library_mirror_jvm_args(
+    request: &VanillaLaunchRequest,
+    version: &VersionJson,
+) -> Vec<String> {
+    let target_version = effective_minecraft_version_id(request, version);
+    if !matches!(target_version, "1.5" | "1.5.1" | "1.5.2") {
+        return Vec::new();
+    }
+    if !version
+        .libraries
+        .iter()
+        .any(|library| library.name == "net.minecraftforge:legacyfixer:1.0")
+    {
+        return Vec::new();
+    }
+    vec![LEGACY_FML_LIBRARY_MIRROR_JVM_ARG.to_string()]
+}
+
+fn effective_minecraft_version_id<'a>(
+    request: &'a VanillaLaunchRequest,
+    version: &'a VersionJson,
+) -> &'a str {
+    let target = request.target_version_id.trim();
+    if !target.is_empty() {
+        return target;
+    }
+    let inherited = version.inherits_from.trim();
+    if !inherited.is_empty() {
+        return inherited;
+    }
+    let version_id = version.id.trim();
+    if !version_id.is_empty() {
+        return version_id;
+    }
+    request.version_id.trim()
 }
 
 pub fn cleanup_natives_dir(dir: &Path) -> io::Result<()> {
@@ -259,70 +334,91 @@ pub(crate) fn find_client_jar(
     original_version_id: &str,
 ) -> Option<PathBuf> {
     let versions_dir = mc_dir.join("versions");
-
-    if !original_version_id.is_empty() {
-        let original_json_path = versions_dir
-            .join(original_version_id)
-            .join(format!("{original_version_id}.json"));
-        if let Ok(data) = fs::read_to_string(original_json_path) {
-            #[derive(serde::Deserialize)]
-            struct StubVersion {
-                #[serde(rename = "inheritsFrom", default)]
-                inherits_from: String,
-            }
-
-            if let Ok(stub) = serde_json::from_str::<StubVersion>(&data)
-                && !stub.inherits_from.is_empty()
-            {
-                let parent_jar = versions_dir
-                    .join(&stub.inherits_from)
-                    .join(format!("{}.jar", stub.inherits_from));
-                if parent_jar.is_file() {
-                    return Some(parent_jar);
-                }
-            }
-        }
-    }
+    let child_manifest = read_child_manifest_summary(&versions_dir, original_version_id);
 
     let primary = client_jar_path(mc_dir, version, original_version_id);
     if primary.is_file() {
         return Some(primary);
     }
 
-    let version_dir = versions_dir.join(&version.id);
-    let Ok(entries) = fs::read_dir(version_dir) else {
+    if !original_version_id.is_empty()
+        && let Some(child_jar) = first_jar_in_version_dir(&versions_dir.join(original_version_id))
+    {
+        return Some(child_jar);
+    }
+
+    if child_manifest
+        .as_ref()
+        .is_some_and(|summary| summary.has_client_artifact)
+    {
         return None;
-    };
+    }
+
+    if let Some(parent_id) = child_manifest
+        .as_ref()
+        .and_then(|summary| summary.parent_id.as_deref())
+    {
+        let parent_jar = versions_dir
+            .join(parent_id)
+            .join(format!("{parent_id}.jar"));
+        if parent_jar.is_file() {
+            return Some(parent_jar);
+        }
+    }
+
+    if version.id.is_empty() {
+        None
+    } else {
+        first_jar_in_version_dir(&versions_dir.join(&version.id))
+    }
+}
+
+struct ChildManifestSummary {
+    parent_id: Option<String>,
+    has_client_artifact: bool,
+}
+
+fn read_child_manifest_summary(
+    versions_dir: &Path,
+    original_version_id: &str,
+) -> Option<ChildManifestSummary> {
+    if original_version_id.is_empty() {
+        return None;
+    }
+
+    #[derive(serde::Deserialize)]
+    struct StubVersion {
+        #[serde(rename = "inheritsFrom", default)]
+        inherits_from: String,
+        #[serde(default)]
+        downloads: StubDownloads,
+    }
+
+    #[derive(Default, serde::Deserialize)]
+    struct StubDownloads {
+        #[serde(default)]
+        client: Option<serde_json::Value>,
+    }
+
+    let original_json_path = versions_dir
+        .join(original_version_id)
+        .join(format!("{original_version_id}.json"));
+    let data = fs::read_to_string(original_json_path).ok()?;
+    let stub = serde_json::from_str::<StubVersion>(&data).ok()?;
+    Some(ChildManifestSummary {
+        parent_id: (!stub.inherits_from.trim().is_empty()).then_some(stub.inherits_from),
+        has_client_artifact: stub.downloads.client.is_some(),
+    })
+}
+
+fn first_jar_in_version_dir(version_dir: &Path) -> Option<PathBuf> {
+    let entries = fs::read_dir(version_dir).ok()?;
     for entry in entries.flatten() {
         if entry.path().extension().is_some_and(|ext| ext == "jar") {
             return Some(entry.path());
         }
     }
-
     None
-}
-
-pub(crate) fn uses_module_bootstrap(version: &VersionJson) -> bool {
-    let Some(arguments) = &version.arguments else {
-        return false;
-    };
-    if version.main_class == "cpw.mods.bootstraplauncher.BootstrapLauncher" {
-        return true;
-    }
-
-    let mut has_module_path = false;
-    let mut has_all_module_path = false;
-    for argument in &arguments.jvm {
-        for value in &argument.value {
-            match value.as_str() {
-                "-p" | "--module-path" => has_module_path = true,
-                "ALL-MODULE-PATH" => has_all_module_path = true,
-                _ => {}
-            }
-        }
-    }
-
-    has_module_path && has_all_module_path
 }
 
 fn create_natives_dir(version_id: &str, libraries: &[ResolvedLibrary]) -> io::Result<PathBuf> {
@@ -524,6 +620,7 @@ mod tests {
                 session_id: "test-session".to_string(),
                 mc_dir: library_dir.clone(),
                 version_id: "test".to_string(),
+                target_version_id: String::new(),
                 auth: LaunchAuthContext::offline("Player"),
                 runtime: RuntimeSelection {
                     requested_path: String::new(),
@@ -604,6 +701,7 @@ mod tests {
                 session_id: "test-session".to_string(),
                 mc_dir: root.clone(),
                 version_id: "auth-test".to_string(),
+                target_version_id: String::new(),
                 auth: LaunchAuthContext::offline("Player"),
                 runtime: test_runtime(),
                 game_dir: None,
@@ -620,12 +718,282 @@ mod tests {
 
         assert_arg_value(&plan.game_args, "--username", "Player");
         assert_arg_value(&plan.game_args, "--uuid", &offline_uuid("Player"));
-        assert_arg_value(&plan.game_args, "--accessToken", "null");
+        assert_arg_value(&plan.game_args, "--accessToken", "0");
         assert_arg_value(&plan.game_args, "--clientId", "");
         assert_arg_value(&plan.game_args, "--xuid", "");
-        assert_arg_value(&plan.game_args, "--userType", "legacy");
+        assert_arg_value(&plan.game_args, "--userType", "msa");
         assert!(plan.command.iter().any(|arg| arg == "--accessToken"));
-        assert!(plan.command.iter().any(|arg| arg == "null"));
+        assert!(plan.command.iter().any(|arg| arg == "0"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn offline_authlib_multiplayer_override_applies_to_1_16_5() {
+        let root = unique_temp_root("croopor-build-offline-authlib-mp-test");
+        let version: VersionJson = auth_version_json();
+
+        let plan = plan_resolved_launch(
+            &VanillaLaunchRequest {
+                session_id: "test-session".to_string(),
+                mc_dir: root.clone(),
+                version_id: "fabric-loader-0.16.10-1.16.5".to_string(),
+                target_version_id: "1.16.5".to_string(),
+                auth: LaunchAuthContext::offline("Player"),
+                runtime: test_runtime(),
+                game_dir: None,
+                launcher_name: "croopor".to_string(),
+                launcher_version: "test".to_string(),
+                min_memory_mb: None,
+                max_memory_mb: None,
+                extra_jvm_args: vec!["-Dextra=true".to_string()],
+                resolution: None,
+            },
+            version,
+        )
+        .expect("launch plan");
+
+        for expected in AUTHLIB_OFFLINE_MULTIPLAYER_JVM_ARGS {
+            assert!(
+                plan.jvm_args.iter().any(|arg| arg == expected),
+                "expected {expected} in {:?}",
+                plan.jvm_args
+            );
+        }
+        let override_index = plan
+            .jvm_args
+            .iter()
+            .position(|arg| arg == AUTHLIB_OFFLINE_MULTIPLAYER_JVM_ARGS[0])
+            .expect("override arg");
+        let extra_index = plan
+            .jvm_args
+            .iter()
+            .position(|arg| arg == "-Dextra=true")
+            .expect("extra arg");
+        assert!(override_index < extra_index);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn offline_authlib_multiplayer_override_applies_to_direct_1_16_4() {
+        let root = unique_temp_root("croopor-build-offline-authlib-direct-test");
+        let mut version: VersionJson = auth_version_json();
+        version.id = "1.16.4".to_string();
+
+        let plan = plan_resolved_launch(
+            &VanillaLaunchRequest {
+                session_id: "test-session".to_string(),
+                mc_dir: root.clone(),
+                version_id: "1.16.4".to_string(),
+                target_version_id: String::new(),
+                auth: LaunchAuthContext::offline("Player"),
+                runtime: test_runtime(),
+                game_dir: None,
+                launcher_name: "croopor".to_string(),
+                launcher_version: "test".to_string(),
+                min_memory_mb: None,
+                max_memory_mb: None,
+                extra_jvm_args: Vec::new(),
+                resolution: None,
+            },
+            version,
+        )
+        .expect("launch plan");
+
+        assert!(
+            plan.jvm_args
+                .iter()
+                .any(|arg| arg == AUTHLIB_OFFLINE_MULTIPLAYER_JVM_ARGS[0])
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn offline_authlib_multiplayer_override_is_exact_and_offline_only() {
+        let root = unique_temp_root("croopor-build-offline-authlib-scope-test");
+        let version: VersionJson = auth_version_json();
+        let online_auth = LaunchAuthContext {
+            player_name: "OnlinePlayer".to_string(),
+            uuid: "11112222333344445555666677778888".to_string(),
+            access_token: "test-access-token".to_string(),
+            client_id: String::new(),
+            xuid: String::new(),
+            user_type: "msa".to_string(),
+        };
+
+        let online_plan = plan_resolved_launch(
+            &VanillaLaunchRequest {
+                session_id: "test-session".to_string(),
+                mc_dir: root.clone(),
+                version_id: "1.16.5".to_string(),
+                target_version_id: "1.16.5".to_string(),
+                auth: online_auth,
+                runtime: test_runtime(),
+                game_dir: None,
+                launcher_name: "croopor".to_string(),
+                launcher_version: "test".to_string(),
+                min_memory_mb: None,
+                max_memory_mb: None,
+                extra_jvm_args: Vec::new(),
+                resolution: None,
+            },
+            version.clone(),
+        )
+        .expect("online launch plan");
+        assert!(
+            !online_plan
+                .jvm_args
+                .iter()
+                .any(|arg| arg == AUTHLIB_OFFLINE_MULTIPLAYER_JVM_ARGS[0])
+        );
+
+        for adjacent_version in ["1.16.3", "1.17.1"] {
+            let adjacent_plan = plan_resolved_launch(
+                &VanillaLaunchRequest {
+                    session_id: "test-session".to_string(),
+                    mc_dir: root.clone(),
+                    version_id: adjacent_version.to_string(),
+                    target_version_id: adjacent_version.to_string(),
+                    auth: LaunchAuthContext::offline("Player"),
+                    runtime: test_runtime(),
+                    game_dir: None,
+                    launcher_name: "croopor".to_string(),
+                    launcher_version: "test".to_string(),
+                    min_memory_mb: None,
+                    max_memory_mb: None,
+                    extra_jvm_args: Vec::new(),
+                    resolution: None,
+                },
+                version.clone(),
+            )
+            .expect("adjacent launch plan");
+            assert!(
+                !adjacent_plan
+                    .jvm_args
+                    .iter()
+                    .any(|arg| arg == AUTHLIB_OFFLINE_MULTIPLAYER_JVM_ARGS[0]),
+                "unexpected authlib override for {adjacent_version}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_forge_1_5_2_uses_archived_fml_library_mirror() {
+        let root = unique_temp_root("croopor-build-legacy-fml-mirror");
+        let version_dir = root.join("versions").join("1.5.2-forge-7.8.1.738");
+        fs::create_dir_all(&version_dir).expect("version dir");
+        fs::write(version_dir.join("1.5.2-forge-7.8.1.738.jar"), b"client").expect("client jar");
+        let version: VersionJson = serde_json::from_value(serde_json::json!({
+            "id": "1.5.2-forge-7.8.1.738",
+            "type": "release",
+            "mainClass": "net.minecraft.launchwrapper.Launch",
+            "minecraftArguments": "${auth_player_name} ${auth_session}",
+            "assetIndex": { "id": "pre-1.6" },
+            "libraries": [
+                { "name": "net.minecraftforge:legacyfixer:1.0" },
+                { "name": "net.minecraftforge:forge:1.5.2-7.8.1.738:universal" }
+            ]
+        }))
+        .expect("version json");
+
+        let plan = plan_resolved_launch(
+            &VanillaLaunchRequest {
+                session_id: "test-session".to_string(),
+                mc_dir: root.clone(),
+                version_id: "1.5.2-forge-7.8.1.738".to_string(),
+                target_version_id: "1.5.2".to_string(),
+                auth: LaunchAuthContext::offline("Player"),
+                runtime: test_runtime(),
+                game_dir: None,
+                launcher_name: "croopor".to_string(),
+                launcher_version: "test".to_string(),
+                min_memory_mb: None,
+                max_memory_mb: None,
+                extra_jvm_args: Vec::new(),
+                resolution: None,
+            },
+            version,
+        )
+        .expect("launch plan");
+
+        assert!(
+            plan.jvm_args
+                .iter()
+                .any(|arg| arg == LEGACY_FML_LIBRARY_MIRROR_JVM_ARG),
+            "expected legacy FML mirror arg in {:?}",
+            plan.jvm_args
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_fml_library_mirror_is_scoped_to_legacyfixer_1_5_versions() {
+        let root = unique_temp_root("croopor-build-legacy-fml-mirror-scope");
+        let version: VersionJson = auth_version_json();
+        let vanilla_plan = plan_resolved_launch(
+            &VanillaLaunchRequest {
+                session_id: "test-session".to_string(),
+                mc_dir: root.clone(),
+                version_id: "1.5.2".to_string(),
+                target_version_id: "1.5.2".to_string(),
+                auth: LaunchAuthContext::offline("Player"),
+                runtime: test_runtime(),
+                game_dir: None,
+                launcher_name: "croopor".to_string(),
+                launcher_version: "test".to_string(),
+                min_memory_mb: None,
+                max_memory_mb: None,
+                extra_jvm_args: Vec::new(),
+                resolution: None,
+            },
+            version.clone(),
+        )
+        .expect("vanilla launch plan");
+        assert!(
+            !vanilla_plan
+                .jvm_args
+                .iter()
+                .any(|arg| arg == LEGACY_FML_LIBRARY_MIRROR_JVM_ARG)
+        );
+
+        let mut modern_forge = version;
+        modern_forge.id = "1.6.4-forge-9.11.1.1345".to_string();
+        modern_forge
+            .libraries
+            .push(croopor_minecraft::launch::Library {
+                name: "net.minecraftforge:legacyfixer:1.0".to_string(),
+                ..croopor_minecraft::launch::Library::default()
+            });
+        let modern_plan = plan_resolved_launch(
+            &VanillaLaunchRequest {
+                session_id: "test-session".to_string(),
+                mc_dir: root.clone(),
+                version_id: "1.6.4-forge-9.11.1.1345".to_string(),
+                target_version_id: "1.6.4".to_string(),
+                auth: LaunchAuthContext::offline("Player"),
+                runtime: test_runtime(),
+                game_dir: None,
+                launcher_name: "croopor".to_string(),
+                launcher_version: "test".to_string(),
+                min_memory_mb: None,
+                max_memory_mb: None,
+                extra_jvm_args: Vec::new(),
+                resolution: None,
+            },
+            modern_forge,
+        )
+        .expect("modern launch plan");
+        assert!(
+            !modern_plan
+                .jvm_args
+                .iter()
+                .any(|arg| arg == LEGACY_FML_LIBRARY_MIRROR_JVM_ARG)
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -665,6 +1033,7 @@ mod tests {
                 session_id: "test-session".to_string(),
                 mc_dir: root.clone(),
                 version_id: "auth-test".to_string(),
+                target_version_id: String::new(),
                 auth,
                 runtime: test_runtime(),
                 game_dir: None,
@@ -758,6 +1127,7 @@ mod tests {
             session_id: "test-session".to_string(),
             mc_dir: root.clone(),
             version_id: "test".to_string(),
+            target_version_id: String::new(),
             auth: LaunchAuthContext::offline("Player"),
             runtime: RuntimeSelection {
                 requested_path: String::new(),
@@ -842,6 +1212,155 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn find_client_jar_prefers_child_jar_over_parent_jar() {
+        let root = unique_temp_root("croopor-build-child-jar-preference");
+        let versions_dir = root.join("versions");
+        fs::create_dir_all(versions_dir.join("base")).expect("base dir");
+        fs::create_dir_all(versions_dir.join("child")).expect("child dir");
+        fs::write(versions_dir.join("base").join("base.jar"), b"base").expect("base jar");
+        let child_jar = versions_dir.join("child").join("child.jar");
+        fs::write(&child_jar, b"child").expect("child jar");
+        write_test_version_json(
+            &root,
+            "child",
+            serde_json::json!({
+                "id": "child",
+                "inheritsFrom": "base",
+                "downloads": {
+                    "client": { "url": "https://example.invalid/child.jar" }
+                }
+            }),
+        );
+        let version: VersionJson = serde_json::from_value(serde_json::json!({
+            "id": "child",
+            "downloads": {
+                "client": { "url": "https://example.invalid/child.jar" }
+            }
+        }))
+        .expect("version");
+
+        let selected = find_client_jar(&root, &version, "child").expect("client jar");
+
+        assert_eq!(selected, child_jar);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn find_client_jar_falls_back_to_parent_when_child_has_no_client_artifact() {
+        let root = unique_temp_root("croopor-build-parent-jar-fallback");
+        let versions_dir = root.join("versions");
+        fs::create_dir_all(versions_dir.join("base")).expect("base dir");
+        fs::create_dir_all(versions_dir.join("child")).expect("child dir");
+        let parent_jar = versions_dir.join("base").join("base.jar");
+        fs::write(&parent_jar, b"base").expect("base jar");
+        write_test_version_json(
+            &root,
+            "child",
+            serde_json::json!({
+                "id": "child",
+                "inheritsFrom": "base"
+            }),
+        );
+        let version: VersionJson =
+            serde_json::from_value(serde_json::json!({ "id": "child" })).expect("version");
+
+        let selected = find_client_jar(&root, &version, "child").expect("client jar");
+
+        assert_eq!(selected, parent_jar);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn find_client_jar_does_not_fall_back_to_parent_when_child_client_is_missing() {
+        let root = unique_temp_root("croopor-build-no-parent-mask-child-client");
+        let versions_dir = root.join("versions");
+        fs::create_dir_all(versions_dir.join("base")).expect("base dir");
+        fs::create_dir_all(versions_dir.join("child")).expect("child dir");
+        fs::write(versions_dir.join("base").join("base.jar"), b"base").expect("base jar");
+        write_test_version_json(
+            &root,
+            "child",
+            serde_json::json!({
+                "id": "child",
+                "inheritsFrom": "base",
+                "downloads": {
+                    "client": { "url": "https://example.invalid/child.jar" }
+                }
+            }),
+        );
+        let version: VersionJson = serde_json::from_value(serde_json::json!({
+            "id": "child",
+            "downloads": {
+                "client": { "url": "https://example.invalid/child.jar" }
+            }
+        }))
+        .expect("version");
+
+        assert_eq!(find_client_jar(&root, &version, "child"), None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn module_bootstrap_launch_keeps_game_jar_in_classpath() {
+        let root = unique_temp_root("croopor-build-module-bootstrap-classpath");
+        let version_id = "1.20.1-forge-47.4.20";
+        let version_dir = root.join("versions").join(version_id);
+        fs::create_dir_all(&version_dir).expect("version dir");
+        let game_jar = version_dir.join(format!("{version_id}.jar"));
+        fs::write(&game_jar, b"patched client").expect("game jar");
+        write_test_version_json(
+            &root,
+            version_id,
+            serde_json::json!({
+                "id": version_id,
+                "type": "release",
+                "mainClass": "cpw.mods.bootstraplauncher.BootstrapLauncher",
+                "assetIndex": { "id": "1.20.1" },
+                "arguments": {
+                    "game": [],
+                    "jvm": [
+                        "-p",
+                        "${classpath}",
+                        "--add-modules",
+                        "ALL-MODULE-PATH"
+                    ]
+                },
+                "libraries": []
+            }),
+        );
+
+        let plan = plan_vanilla_launch(&VanillaLaunchRequest {
+            session_id: "test-session".to_string(),
+            mc_dir: root.clone(),
+            version_id: version_id.to_string(),
+            target_version_id: String::new(),
+            auth: LaunchAuthContext::offline("Player"),
+            runtime: test_runtime(),
+            game_dir: None,
+            launcher_name: "croopor".to_string(),
+            launcher_version: "test".to_string(),
+            min_memory_mb: None,
+            max_memory_mb: None,
+            extra_jvm_args: Vec::new(),
+            resolution: None,
+        })
+        .expect("launch plan");
+
+        assert_eq!(plan.client_jar_path.as_deref(), Some(game_jar.as_path()));
+        assert!(
+            plan.classpath
+                .contains(&game_jar.to_string_lossy().to_string())
+        );
+        assert!(
+            plan.jvm_args
+                .iter()
+                .any(|arg| arg.contains(&game_jar.to_string_lossy().to_string()))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn auth_version_json() -> VersionJson {
         serde_json::from_value(serde_json::json!({
             "id": "auth-test",
@@ -913,6 +1432,16 @@ mod tests {
                 .expect("time")
                 .as_nanos()
         ))
+    }
+
+    fn write_test_version_json(root: &Path, version_id: &str, value: serde_json::Value) {
+        let version_dir = root.join("versions").join(version_id);
+        fs::create_dir_all(&version_dir).expect("version dir");
+        fs::write(
+            version_dir.join(format!("{version_id}.json")),
+            value.to_string(),
+        )
+        .expect("version json");
     }
 
     fn write_native_zip(path: &Path, contents: &[u8]) -> io::Result<()> {

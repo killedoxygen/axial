@@ -13,6 +13,7 @@ use croopor_launcher::{
     LaunchReadinessReasonId, LaunchReadinessSeverity, OverrideOrigin, SessionId,
 };
 use croopor_performance::PerformanceManager;
+use sha1::{Digest, Sha1};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -140,6 +141,7 @@ impl TestFixture {
         let java_path = runtime_bin.join(java_name);
         fs::write(&java_path, b"java").expect("global runtime java");
         make_executable(&java_path);
+        write_runtime_manifest_proof(&runtime_root, &java_path);
         runtime_root
     }
 
@@ -320,6 +322,37 @@ fn make_executable(path: &Path) {
 
 #[cfg(not(unix))]
 fn make_executable(_path: &Path) {}
+
+fn write_runtime_manifest_proof(runtime_root: &Path, java_path: &Path) {
+    let bytes = fs::read(java_path).expect("read fake java");
+    let relative_path = java_path
+        .strip_prefix(runtime_root)
+        .expect("java under runtime root")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let mut hasher = Sha1::new();
+    hasher.update(&bytes);
+    let sha1 = format!("{:x}", hasher.finalize());
+    let manifest = serde_json::json!({
+        "files": {
+            relative_path: {
+                "type": "file",
+                "downloads": {
+                    "raw": {
+                        "url": "https://example.invalid/java",
+                        "sha1": sha1,
+                        "size": bytes.len()
+                    }
+                }
+            }
+        }
+    });
+    fs::write(
+        runtime_root.join(".croopor-runtime-manifest.json"),
+        serde_json::to_vec(&manifest).expect("manifest json"),
+    )
+    .expect("runtime manifest proof");
+}
 
 fn test_root(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!(

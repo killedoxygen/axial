@@ -44,17 +44,42 @@ pub fn parse_maven_versions(xml: &str) -> Vec<String> {
 }
 
 pub fn extract_forge_minecraft_version(entry: &str) -> String {
-    entry
-        .split_once('-')
+    split_forge_coordinate(entry)
         .map(|(minecraft_version, _)| minecraft_version.to_string())
         .unwrap_or_default()
 }
 
 pub fn extract_forge_loader_version(entry: &str) -> String {
-    entry
-        .split_once('-')
+    split_forge_coordinate(entry)
         .map(|(_, loader_version)| loader_version.to_string())
         .unwrap_or_default()
+}
+
+fn split_forge_coordinate(entry: &str) -> Option<(&str, &str)> {
+    entry.match_indices('-').find_map(|(index, _)| {
+        let minecraft_version = &entry[..index];
+        let loader_version = &entry[index + 1..];
+        (!minecraft_version.is_empty() && is_forge_loader_version_suffix(loader_version))
+            .then_some((minecraft_version, loader_version))
+    })
+}
+
+fn is_forge_loader_version_suffix(value: &str) -> bool {
+    let Some(first) = value.chars().next() else {
+        return false;
+    };
+    if !first.is_ascii_digit() {
+        return false;
+    }
+    let numeric_prefix = value.split('-').next().unwrap_or(value);
+    let mut part_count = 0;
+    for part in numeric_prefix.split('.') {
+        if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+            return false;
+        }
+        part_count += 1;
+    }
+    part_count >= 2
 }
 
 pub fn parse_version_triplet(version: &str) -> Option<Vec<u32>> {
@@ -218,7 +243,22 @@ pub fn apply_forge_promotion_selection(
     is_recommended: bool,
     is_latest: bool,
 ) {
-    build_meta.selection = if has_recommended {
+    let explicit_unstable_term = has_unstable_loader_terms(&build_meta.terms);
+    build_meta.selection = if explicit_unstable_term {
+        if is_latest {
+            LoaderSelectionMeta {
+                default_rank: 650,
+                reason: LoaderSelectionReason::LatestUnstable,
+                source: LoaderSelectionSource::ExplicitVersionLabel,
+            }
+        } else {
+            LoaderSelectionMeta {
+                default_rank: 600,
+                reason: LoaderSelectionReason::Unstable,
+                source: LoaderSelectionSource::ExplicitVersionLabel,
+            }
+        }
+    } else if has_recommended {
         if is_recommended {
             LoaderSelectionMeta {
                 default_rank: 1_000,
@@ -240,17 +280,32 @@ pub fn apply_forge_promotion_selection(
         }
     } else if is_latest {
         LoaderSelectionMeta {
-            default_rank: 650,
-            reason: LoaderSelectionReason::LatestUnstable,
-            source: LoaderSelectionSource::AbsenceOfRecommended,
+            default_rank: 900,
+            reason: LoaderSelectionReason::LatestStable,
+            source: LoaderSelectionSource::PromotionMarker,
         }
     } else {
         LoaderSelectionMeta {
-            default_rank: 600,
-            reason: LoaderSelectionReason::Unstable,
-            source: LoaderSelectionSource::AbsenceOfRecommended,
+            default_rank: 800,
+            reason: LoaderSelectionReason::Stable,
+            source: LoaderSelectionSource::None,
         }
     };
+}
+
+fn has_unstable_loader_terms(terms: &[LoaderTerm]) -> bool {
+    terms.iter().any(|term| {
+        matches!(
+            term,
+            LoaderTerm::Snapshot
+                | LoaderTerm::PreRelease
+                | LoaderTerm::ReleaseCandidate
+                | LoaderTerm::Beta
+                | LoaderTerm::Alpha
+                | LoaderTerm::Nightly
+                | LoaderTerm::Dev
+        )
+    })
 }
 
 fn infer_loader_selection(
@@ -351,6 +406,14 @@ pub fn loader_display_tags(terms: &[LoaderTerm]) -> Vec<String> {
 }
 
 pub fn neoforge_to_minecraft_version(version: &str) -> Option<String> {
+    if !version
+        .chars()
+        .next()
+        .is_some_and(|ch| matches!(ch, '1'..='9'))
+    {
+        return None;
+    }
+
     let numeric_parts = version
         .split('.')
         .map(|part| {
@@ -384,7 +447,8 @@ pub fn neoforge_to_minecraft_version(version: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_forge_promotion_selection, infer_loader_build_metadata, is_prerelease_loader_version,
+        apply_forge_promotion_selection, extract_forge_loader_version,
+        extract_forge_minecraft_version, infer_loader_build_metadata, is_prerelease_loader_version,
         neoforge_to_minecraft_version, parse_maven_versions,
     };
     use crate::loaders::types::{
@@ -410,6 +474,22 @@ mod tests {
             parse_maven_versions(xml),
             vec!["1.20.1-47.4.0".to_string(), "1.21.1-52.0.1".to_string()]
         );
+    }
+
+    #[test]
+    fn splits_forge_coordinates_at_loader_version_suffix() {
+        for (entry, minecraft_version, loader_version) in [
+            ("26.2-rc-1-65.0.0", "26.2-rc-1", "65.0.0"),
+            ("26.1-snapshot-9-62.0.0", "26.1-snapshot-9", "62.0.0"),
+            (
+                "1.7.10_pre4-10.12.2.1149-prerelease",
+                "1.7.10_pre4",
+                "10.12.2.1149-prerelease",
+            ),
+        ] {
+            assert_eq!(extract_forge_minecraft_version(entry), minecraft_version);
+            assert_eq!(extract_forge_loader_version(entry), loader_version);
+        }
     }
 
     #[test]
@@ -497,17 +577,43 @@ mod tests {
     }
 
     #[test]
-    fn forge_promotion_override_marks_missing_recommended_as_unstable_lane() {
+    fn ignores_neoforge_loader_versions_without_minecraft_major_prefix() {
+        assert_eq!(
+            neoforge_to_minecraft_version("0.25w14craftmine.5-beta"),
+            None
+        );
+        assert_eq!(neoforge_to_minecraft_version("0.25.5-beta"), None);
+        assert_eq!(neoforge_to_minecraft_version("beta-26.1.0.1"), None);
+    }
+
+    #[test]
+    fn forge_promotion_override_keeps_latest_without_recommended_stable() {
         let mut metadata = infer_loader_build_metadata("64.0.4", &[], false, true, None);
         apply_forge_promotion_selection(&mut metadata, false, false, true);
 
+        assert_eq!(
+            metadata.selection.reason,
+            LoaderSelectionReason::LatestStable
+        );
+        assert_eq!(
+            metadata.selection.source,
+            LoaderSelectionSource::PromotionMarker
+        );
+    }
+
+    #[test]
+    fn forge_promotion_override_keeps_explicit_beta_unstable() {
+        let mut metadata = infer_loader_build_metadata("64.0.4-beta", &[], false, true, None);
+        apply_forge_promotion_selection(&mut metadata, true, false, true);
+
+        assert!(metadata.terms.contains(&LoaderTerm::Beta));
         assert_eq!(
             metadata.selection.reason,
             LoaderSelectionReason::LatestUnstable
         );
         assert_eq!(
             metadata.selection.source,
-            LoaderSelectionSource::AbsenceOfRecommended
+            LoaderSelectionSource::ExplicitVersionLabel
         );
     }
 }

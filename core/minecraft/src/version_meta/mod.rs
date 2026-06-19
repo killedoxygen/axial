@@ -117,28 +117,61 @@ pub fn enrich_loader_game_versions(
 
 pub fn enrich_version_entries(entries: &mut [VersionEntry], releases: &[ReleaseReference]) {
     for entry in entries {
-        let analysis = analyze_minecraft_version(
-            &entry.id,
-            &entry.raw_kind,
-            &entry.release_time,
-            None,
-            releases,
-        );
+        let analysis_id = version_entry_analysis_id(entry).to_string();
+        let release_reference = releases.iter().find(|release| release.id == analysis_id);
+        let raw_kind = if release_reference.is_some() && entry.raw_kind.trim().is_empty() {
+            "release"
+        } else {
+            entry.raw_kind.as_str()
+        };
+        let release_time = release_reference
+            .map(|release| release.release_time.as_str())
+            .unwrap_or(entry.release_time.as_str());
+        let analysis =
+            analyze_minecraft_version(&analysis_id, raw_kind, release_time, None, releases);
         entry.lifecycle = analysis.lifecycle;
         entry.minecraft_meta = analysis.minecraft_meta;
+        if let Some(release) = release_reference {
+            if entry.raw_kind.trim().is_empty() {
+                entry.raw_kind = "release".to_string();
+            }
+            if entry.release_time.trim().is_empty() {
+                entry.release_time = release.release_time.clone();
+            }
+        }
     }
 }
 
 pub fn apply_version_analysis(entry: &mut VersionEntry, releases: &[ReleaseReference]) {
-    let analysis = analyze_minecraft_version(
-        &entry.id,
-        &entry.raw_kind,
-        &entry.release_time,
-        None,
-        releases,
-    );
+    let analysis_id = version_entry_analysis_id(entry).to_string();
+    let release_reference = releases.iter().find(|release| release.id == analysis_id);
+    let raw_kind = if release_reference.is_some() && entry.raw_kind.trim().is_empty() {
+        "release"
+    } else {
+        entry.raw_kind.as_str()
+    };
+    let release_time = release_reference
+        .map(|release| release.release_time.as_str())
+        .unwrap_or(entry.release_time.as_str());
+    let analysis = analyze_minecraft_version(&analysis_id, raw_kind, release_time, None, releases);
     entry.lifecycle = analysis.lifecycle;
     entry.minecraft_meta = analysis.minecraft_meta;
+    if let Some(release) = release_reference {
+        if entry.raw_kind.trim().is_empty() {
+            entry.raw_kind = "release".to_string();
+        }
+        if entry.release_time.trim().is_empty() {
+            entry.release_time = release.release_time.clone();
+        }
+    }
+}
+
+fn version_entry_analysis_id(entry: &VersionEntry) -> &str {
+    if entry.inherits_from.trim().is_empty() {
+        entry.id.as_str()
+    } else {
+        entry.inherits_from.as_str()
+    }
 }
 
 pub fn compare_version_like(left: &str, right: &str) -> Ordering {
@@ -218,6 +251,13 @@ fn classify_lifecycle(
             "SNAP",
             vec!["snapshot".to_string()],
         ),
+        VersionShape::Release { .. } if stable_hint == Some(false) => LifecycleMeta::new(
+            LifecycleChannel::Preview,
+            vec![LifecycleLabel::Beta],
+            450,
+            "BETA",
+            vec!["loader_beta".to_string()],
+        ),
         VersionShape::Release { .. } => LifecycleMeta::new(
             LifecycleChannel::Stable,
             vec![LifecycleLabel::Release],
@@ -249,6 +289,14 @@ fn classify_lifecycle(
                     400,
                     "SNAP",
                     vec![raw_kind.to_string()],
+                )
+            } else if stable_hint == Some(false) {
+                LifecycleMeta::new(
+                    LifecycleChannel::Preview,
+                    vec![LifecycleLabel::Beta],
+                    450,
+                    "BETA",
+                    vec!["loader_beta".to_string()],
                 )
             } else if raw_kind == "release" {
                 LifecycleMeta::new(
@@ -310,6 +358,8 @@ fn classify_version_family(
         VersionShape::WeeklySnapshot { is_potato, .. } if *is_potato => "potato_snapshot",
         VersionShape::WeeklySnapshot { .. } => "weekly_snapshot",
         VersionShape::Release { .. } => "release",
+        VersionShape::Unknown if raw_kind == "old_beta" => "old_beta",
+        VersionShape::Unknown if raw_kind == "old_alpha" => "old_alpha",
         VersionShape::Unknown if raw_kind == "snapshot" || matches!(stable_hint, Some(false)) => {
             "snapshot"
         }
@@ -881,6 +931,32 @@ mod tests {
     }
 
     #[test]
+    fn classifies_underscore_pre_release_ids_as_preview() {
+        let analysis = analyze_minecraft_version("1.7.10_pre4", "", "", Some(false), &[]);
+
+        assert_eq!(analysis.lifecycle.channel, LifecycleChannel::Preview);
+        assert_eq!(analysis.lifecycle.labels, vec![LifecycleLabel::PreRelease]);
+        assert_eq!(analysis.minecraft_meta.family, "pre_release");
+        assert_eq!(analysis.minecraft_meta.display_name, "1.7.10");
+        assert_eq!(analysis.minecraft_meta.display_hint, "Pre-release 4");
+    }
+
+    #[test]
+    fn unstable_loader_hint_downgrades_release_rows_to_preview() {
+        let analysis = analyze_minecraft_version("26.2", "release", "", Some(false), &[]);
+
+        assert_eq!(analysis.lifecycle.channel, LifecycleChannel::Preview);
+        assert_eq!(analysis.lifecycle.labels, vec![LifecycleLabel::Beta]);
+        assert_eq!(analysis.lifecycle.badge_text, "BETA");
+        assert_eq!(
+            analysis.lifecycle.provider_terms,
+            vec!["loader_beta".to_string()]
+        );
+        assert_eq!(analysis.minecraft_meta.family, "release");
+        assert_eq!(analysis.minecraft_meta.display_name, "26.2");
+    }
+
+    #[test]
     fn orders_release_candidate_between_release_and_pre_release() {
         assert_eq!(
             compare_version_like("1.21.11", "1.21.11-rc3"),
@@ -922,5 +998,18 @@ mod tests {
             compare_version_like("1.18_experimentaI-snapshot-6", "1.16_combat-3"),
             std::cmp::Ordering::Greater
         );
+    }
+
+    #[test]
+    fn raw_old_alpha_beta_kind_classifies_unknown_ids_as_legacy_families() {
+        let beta = analyze_minecraft_version("classic-server-test", "old_beta", "", None, &[]);
+        assert_eq!(beta.lifecycle.channel, LifecycleChannel::Legacy);
+        assert_eq!(beta.lifecycle.labels, vec![LifecycleLabel::OldBeta]);
+        assert_eq!(beta.minecraft_meta.family, "old_beta");
+
+        let alpha = analyze_minecraft_version("classic-client-test", "old_alpha", "", None, &[]);
+        assert_eq!(alpha.lifecycle.channel, LifecycleChannel::Legacy);
+        assert_eq!(alpha.lifecycle.labels, vec![LifecycleLabel::OldAlpha]);
+        assert_eq!(alpha.minecraft_meta.family, "old_alpha");
     }
 }

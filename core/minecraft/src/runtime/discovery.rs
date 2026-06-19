@@ -1,13 +1,20 @@
+use super::file_download::{
+    RuntimeDownloadActual, RuntimeDownloadEvidence, available_runtime_parallelism,
+    component_manifest_destination, verify_runtime_download,
+};
 use super::layout::{
     java_executable, runtime_cache_dir, runtime_executable_ready, runtime_os_arch,
 };
+use super::manifest::{COMPONENT_MANIFEST_PROOF_FILE, ComponentManifest};
 use super::model::{
     JavaRuntimeInfo, JavaRuntimeLookupError, JavaRuntimeResult, RuntimeId, RuntimeInstallState,
     RuntimeOverride, RuntimeRecord, RuntimeRequirement, RuntimeSource,
 };
 use super::probe::probe_java_runtime_info;
-use crate::launch::JavaVersion;
+use crate::launch::{JavaVersion, java_component_for_major};
 use crate::paths::runtime_dirs;
+use sha1::{Digest as _, Sha1};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 pub fn runtime_requirement(java_version: &JavaVersion) -> RuntimeRequirement {
@@ -69,8 +76,23 @@ pub fn runtime_component_ready_without_probe(library_dir: &Path, component: &str
         .any(|dir| component_runtime_ready_without_probe(&dir, component))
 }
 
+pub fn runtime_component_executable_present_without_probe(
+    library_dir: &Path,
+    component: &str,
+) -> bool {
+    let mut dirs = runtime_dirs(library_dir);
+    dirs.push(runtime_cache_dir());
+    dirs.into_iter()
+        .any(|dir| component_runtime_executable_present(&dir, component))
+}
+
 pub fn runtime_executable_ready_without_probe(java_exe: &Path) -> bool {
     runtime_executable_ready(java_exe)
+}
+
+pub fn managed_runtime_contents_verified_without_probe(runtime_root: &Path) -> bool {
+    runtime_executable_ready(&java_executable(runtime_root))
+        && persisted_runtime_manifest_verified(runtime_root)
 }
 
 pub fn find_java_runtime(
@@ -99,10 +121,12 @@ pub fn find_java_runtime(
     })
 }
 pub fn preferred_runtime_component(java_version: &JavaVersion) -> String {
-    if java_version.component.is_empty() {
-        "java-runtime-delta".to_string()
+    if java_version.component.trim().is_empty() {
+        java_component_for_major(java_version.major_version)
+            .unwrap_or("java-runtime-delta")
+            .to_string()
     } else {
-        java_version.component.clone()
+        java_version.component.trim().to_string()
     }
 }
 
@@ -159,6 +183,20 @@ pub(super) fn component_runtime_ready_without_probe(base_dir: &Path, component: 
         detect_runtime_state(&candidate, runtime_requires_ready_marker(base_dir))
             == RuntimeInstallState::Ready
     })
+}
+
+fn component_runtime_executable_present(base_dir: &Path, component: &str) -> bool {
+    if !base_dir.exists() {
+        return false;
+    }
+
+    let os_arch = runtime_os_arch();
+    [
+        base_dir.join(component).join(&os_arch).join(component),
+        base_dir.join(component),
+    ]
+    .into_iter()
+    .any(|candidate| java_executable(&candidate).is_file())
 }
 
 pub(super) fn resolve_managed_runtime(
@@ -269,7 +307,7 @@ pub(super) fn detect_runtime_state(
         if installing_marker.exists() {
             return RuntimeInstallState::Installing;
         }
-        if ready_marker.is_file() && runtime_executable_ready(&java_exe) {
+        if ready_marker.is_file() && managed_runtime_contents_verified_without_probe(runtime_root) {
             return RuntimeInstallState::Ready;
         }
         if ready_marker.exists() || runtime_root.exists() {
@@ -288,4 +326,103 @@ pub(super) fn detect_runtime_state(
         return RuntimeInstallState::Broken;
     }
     RuntimeInstallState::Missing
+}
+
+fn persisted_runtime_manifest_verified(runtime_root: &Path) -> bool {
+    let manifest_path = runtime_root.join(COMPONENT_MANIFEST_PROOF_FILE);
+    let Ok(data) = std::fs::read(&manifest_path) else {
+        return false;
+    };
+    let Ok(manifest) = serde_json::from_slice::<ComponentManifest>(&data) else {
+        return false;
+    };
+
+    let mut jobs = Vec::new();
+    for (relative_path, file) in manifest.files {
+        if file.kind != "file" {
+            continue;
+        }
+        let Some(raw) = file.downloads.and_then(|downloads| downloads.raw) else {
+            return false;
+        };
+        let Some(expected_sha1) = raw.sha1.as_deref() else {
+            return false;
+        };
+        if !runtime_sha1_hex(expected_sha1) {
+            return false;
+        }
+        let Ok(path) = component_manifest_destination(runtime_root, &relative_path) else {
+            return false;
+        };
+        jobs.push(RuntimeVerificationJob {
+            relative_path,
+            path,
+            expected: RuntimeDownloadEvidence {
+                size: raw.size,
+                sha1: raw.sha1,
+            },
+        });
+    }
+
+    !jobs.is_empty() && verify_runtime_jobs(jobs)
+}
+
+#[derive(Clone)]
+struct RuntimeVerificationJob {
+    relative_path: String,
+    path: PathBuf,
+    expected: RuntimeDownloadEvidence,
+}
+
+fn verify_runtime_jobs(jobs: Vec<RuntimeVerificationJob>) -> bool {
+    let worker_count = available_runtime_parallelism()
+        .saturating_mul(2)
+        .clamp(2, 16)
+        .min(jobs.len());
+    if worker_count <= 1 {
+        return jobs.into_iter().all(verify_runtime_job);
+    }
+
+    let chunk_size = jobs.len().div_ceil(worker_count);
+    let handles = jobs
+        .chunks(chunk_size)
+        .map(|chunk| {
+            let chunk = chunk.to_vec();
+            std::thread::spawn(move || chunk.into_iter().all(verify_runtime_job))
+        })
+        .collect::<Vec<_>>();
+
+    handles
+        .into_iter()
+        .all(|handle| handle.join().unwrap_or(false))
+}
+
+fn verify_runtime_job(job: RuntimeVerificationJob) -> bool {
+    let Ok(actual) = runtime_file_actual(&job.path) else {
+        return false;
+    };
+    verify_runtime_download(&job.relative_path, &job.expected, &actual).is_ok()
+}
+
+fn runtime_sha1_hex(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn runtime_file_actual(path: &Path) -> std::io::Result<RuntimeDownloadActual> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha1::new();
+    let mut size = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        size += read as u64;
+    }
+    Ok(RuntimeDownloadActual {
+        size,
+        sha1: format!("{:x}", hasher.finalize()),
+    })
 }

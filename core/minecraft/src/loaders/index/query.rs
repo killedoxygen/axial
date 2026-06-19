@@ -33,12 +33,16 @@ pub async fn fetch_supported_versions(
     let (supported_versions, version_manifest) = tokio::join!(supported_versions, version_manifest);
 
     let (mut versions, catalog) = supported_versions?;
-    let catalog_order = if let Ok(manifest) = version_manifest {
-        let releases = manifest_release_entries(&manifest.versions);
-        enrich_loader_game_versions(&mut versions, &manifest.versions, &releases);
-        Some(catalog_version_order(&manifest.versions))
-    } else {
-        None
+    let catalog_order = match version_manifest {
+        Ok(manifest) => {
+            let releases = manifest_release_entries(&manifest.versions);
+            enrich_loader_game_versions(&mut versions, &manifest.versions, &releases);
+            Some(catalog_version_order(&manifest.versions))
+        }
+        Err(_) => {
+            enrich_loader_game_versions(&mut versions, &[], &[]);
+            None
+        }
     };
     Ok((
         normalize_supported_versions(versions, catalog_order.as_ref()),
@@ -75,17 +79,25 @@ pub async fn resolve_build_record(
         return Err(LoaderError::InvalidBuildId);
     }
 
-    let (builds, _) = fetch_builds(library_dir, component_id, &minecraft_version).await?;
+    let (builds, catalog) = fetch_builds(library_dir, component_id, &minecraft_version).await?;
+    resolve_build_record_from_catalog(component_id, build_id, builds, &catalog)
+}
+
+fn resolve_build_record_from_catalog(
+    component_id: LoaderComponentId,
+    build_id: &str,
+    builds: Vec<LoaderBuildRecord>,
+    catalog: &LoaderCatalogState,
+) -> Result<LoaderBuildRecord, LoaderError> {
+    if catalog.availability.stale || !catalog.availability.fresh {
+        return Err(LoaderError::CatalogStale);
+    }
+
     builds
         .into_iter()
-        .find(|build| build.build_id == build_id)
+        .find(|build| build.component_id == component_id && build.build_id == build_id)
         .ok_or_else(|| {
-            LoaderError::BuildNotFound(format!(
-                "{} build {} for Minecraft {}",
-                component_id.short_key(),
-                build_id,
-                minecraft_version
-            ))
+            LoaderError::BuildNotFound(format!("{} build {}", component_id.short_key(), build_id,))
         })
 }
 
@@ -127,4 +139,79 @@ fn catalog_version_order(entries: &[crate::manifest::ManifestEntry]) -> HashMap<
         .enumerate()
         .map(|(index, entry)| (entry.id.clone(), index))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_build_record_from_catalog;
+    use crate::loaders::types::{
+        LoaderArtifactKind, LoaderAvailability, LoaderBuildMetadata, LoaderBuildRecord,
+        LoaderBuildSubjectKind, LoaderCatalogState, LoaderComponentId, LoaderError,
+        LoaderInstallSource, LoaderInstallStrategy, LoaderInstallability,
+    };
+
+    #[test]
+    fn exact_build_resolver_rejects_stale_catalogs() {
+        let component_id = LoaderComponentId::Fabric;
+        let build_id = "fabric:1.21.5:0.16.14";
+
+        let error = resolve_build_record_from_catalog(
+            component_id,
+            build_id,
+            vec![build_record(component_id, build_id)],
+            &catalog_state(false, true),
+        )
+        .expect_err("stale catalog should be gated");
+
+        assert!(matches!(error, LoaderError::CatalogStale));
+    }
+
+    #[test]
+    fn exact_build_resolver_returns_matching_fresh_build() {
+        let component_id = LoaderComponentId::Fabric;
+        let build_id = "fabric:1.21.5:0.16.14";
+
+        let build = resolve_build_record_from_catalog(
+            component_id,
+            build_id,
+            vec![build_record(component_id, build_id)],
+            &catalog_state(true, false),
+        )
+        .expect("fresh matching catalog");
+
+        assert_eq!(build.build_id, build_id);
+    }
+
+    fn catalog_state(fresh: bool, stale: bool) -> LoaderCatalogState {
+        LoaderCatalogState {
+            availability: LoaderAvailability {
+                fresh,
+                stale,
+                cache_hit: stale,
+                checked_at_ms: 1,
+                last_success_at_ms: Some(1),
+                last_error: None,
+                last_failure_kind: None,
+            },
+        }
+    }
+
+    fn build_record(component_id: LoaderComponentId, build_id: &str) -> LoaderBuildRecord {
+        LoaderBuildRecord {
+            subject_kind: LoaderBuildSubjectKind::LoaderBuild,
+            component_id,
+            component_name: component_id.display_name().to_string(),
+            build_id: build_id.to_string(),
+            minecraft_version: "1.21.5".to_string(),
+            loader_version: "0.16.14".to_string(),
+            version_id: "fabric-loader-0.16.14-1.21.5".to_string(),
+            build_meta: LoaderBuildMetadata::default(),
+            strategy: LoaderInstallStrategy::FabricProfile,
+            artifact_kind: LoaderArtifactKind::ProfileJson,
+            installability: LoaderInstallability::Installable,
+            install_source: LoaderInstallSource::ProfileJson {
+                url: "https://example.invalid/profile.json".to_string(),
+            },
+        }
+    }
 }

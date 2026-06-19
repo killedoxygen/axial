@@ -40,6 +40,17 @@ function cloneInstallItem(item: InstallItem): InstallItem {
 
 let activeInstallItem: InstallItem | null = null;
 
+export type InstallQueueActiveState = {
+  installId?: string;
+  operationId?: string;
+  item: InstallItem;
+  displayName?: string;
+  pct: number;
+  label: string;
+  phase?: string;
+  activeStep?: InstallStepProgress;
+};
+
 export function isSameInstallItem(left: InstallItem, right: InstallItem): boolean {
   if (left.versionId !== right.versionId) return false;
   if (!left.loader && !right.loader) return true;
@@ -53,8 +64,48 @@ export function isActiveInstallItem(item: InstallItem): boolean {
   );
 }
 
-export function setInstallQueueState(state: InstallQueueStateResponse): void {
-  installQueueState.value = state;
+export function reconcileInstallQueueState(
+  state: InstallQueueStateResponse,
+  active: InstallQueueActiveState | null,
+): void {
+  const currentSource = installEventSource.value;
+  batch(() => {
+    installQueueState.value = state;
+
+    if (active) {
+      const current = installState.value;
+      const installItem = cloneInstallItem(active.item);
+      const startedAt =
+        current.status === 'active' &&
+        isSameInstallItem(current.item, installItem) &&
+        current.installId === active.installId
+          ? current.startedAt
+          : Date.now();
+      activeInstallItem = installItem;
+      installState.value = {
+        status: 'active',
+        installId: active.installId,
+        operationId: active.operationId,
+        item: installItem,
+        versionId: installItem.versionId,
+        displayName: active.displayName,
+        pct: Math.max(0, Math.min(100, active.pct)),
+        label: active.label,
+        phase: active.phase,
+        activeStep: active.activeStep,
+        startedAt,
+      };
+      return;
+    }
+
+    if (installState.value.status === 'active' || installEventSource.value) {
+      activeInstallItem = null;
+      installState.value = { status: 'idle' };
+      installEventSource.value = null;
+    }
+  });
+
+  if (!active) currentSource?.close();
 }
 
 export function recordInstallFailure(item: InstallItem, displayName: string, viewModel: InstallFailureViewModel): void {
@@ -74,21 +125,6 @@ export function clearInstallFailureForItem(item: InstallItem): void {
   const failure = installFailure.value;
   if (!failure || !isSameInstallItem(failure.item, item)) return;
   installFailure.value = null;
-}
-
-export function startInstall(item: InstallItem, label = 'Starting...', displayName?: string): void {
-  const installItem = cloneInstallItem(item);
-  activeInstallItem = installItem;
-  installState.value = {
-    status: 'active',
-    item: installItem,
-    versionId: item.versionId,
-    displayName,
-    pct: 0,
-    label,
-    phase: 'starting',
-    startedAt: Date.now(),
-  };
 }
 
 function cleanRemainingSeconds(remainingSeconds: number | undefined): number | undefined {
@@ -136,18 +172,20 @@ export function setInstallEventSource(es: { close(): void } | null): void {
 }
 
 export function startLaunch(instanceId: string): void {
-  launchState.value = { status: 'preparing', instanceId, pct: 0, label: 'Starting launch' };
+  launchState.value = { status: 'preparing', instanceId, pct: 0, label: 'Starting launch', determinate: false };
 }
 
 export function updateLaunchPrep(instanceId: string, pct: number, label: string, stage?: string): void {
   const current = launchState.value;
   if (current.status !== 'preparing' || current.instanceId !== instanceId) return;
+  const nextPct = Math.max(0, Math.min(100, pct));
   launchState.value = {
     status: 'preparing',
     instanceId,
-    pct: Math.max(current.pct, Math.max(0, Math.min(100, pct))),
+    pct: Math.max(current.pct, nextPct),
     label,
     stage: stage ?? current.stage,
+    determinate: current.determinate === true || nextPct > 0,
   };
 }
 
@@ -162,6 +200,7 @@ export function updateLaunchPrepView(instanceId: string, viewModel: LaunchStatus
     pct: Math.max(current.pct, Math.max(0, Math.min(100, pct))),
     label,
     stage: viewModel.state_id || current.stage,
+    determinate: true,
   };
 }
 

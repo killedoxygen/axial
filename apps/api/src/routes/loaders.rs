@@ -1,6 +1,6 @@
 use crate::application::{
-    LoaderBuildsRequest, LoaderInstallStartRequest, loader_builds, loader_components,
-    loader_game_versions, loader_install_events_stream, start_loader_install,
+    InstallQueueRequest, InstallQueueStateResponse, LoaderBuildsRequest, enqueue_install,
+    loader_builds, loader_components, loader_game_versions, loader_install_events_stream,
 };
 use crate::state::AppState;
 use axum::{
@@ -77,18 +77,19 @@ async fn handle_loader_game_versions(
 async fn handle_loader_install(
     State(state): State<AppState>,
     Json(payload): Json<LoaderInstallRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let component_id = parse_component_id(&payload.component_id)?;
-    let response = start_loader_install(
+) -> Result<Json<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
+    enqueue_install(
         &state,
-        LoaderInstallStartRequest {
-            component_id,
+        InstallQueueRequest {
+            kind: "loader".to_string(),
+            version_id: String::new(),
+            manifest_url: String::new(),
+            component_id: payload.component_id,
             build_id: payload.build_id,
         },
     )
-    .await?;
-
-    Ok(Json(serde_json::json!(response)))
+    .await
+    .map(Json)
 }
 
 async fn handle_loader_install_events(

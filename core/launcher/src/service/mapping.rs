@@ -67,6 +67,9 @@ pub fn format_failure_class(class: LaunchFailureClass) -> &'static str {
         LaunchFailureClass::JvmOptionOrdering => "JVM option ordering conflict",
         LaunchFailureClass::JavaRuntimeMismatch => "Java runtime mismatch",
         LaunchFailureClass::ClasspathModuleConflict => "classpath or module conflict",
+        LaunchFailureClass::LauncherManagedArtifactSignature => {
+            "launcher-managed artifact signature corruption"
+        }
         LaunchFailureClass::AuthModeIncompatible => "auth mode incompatibility",
         LaunchFailureClass::LoaderBootstrapFailure => "loader bootstrap failure",
         LaunchFailureClass::StartupStalled => "startup stalled",
@@ -180,6 +183,9 @@ fn guardian_notice_details(guardian: Option<&GuardianSummary>) -> Vec<String> {
 
 fn guardian_message(guardian: Option<&GuardianSummary>) -> Option<String> {
     let guardian = guardian?;
+    if guardian.decision == GuardianDecision::Allowed {
+        return None;
+    }
     if let Some(message) = guardian
         .message
         .as_deref()
@@ -431,6 +437,32 @@ mod tests {
             notice
                 .details
                 .contains(&"Reason: Java runtime mismatch.".to_string())
+        );
+    }
+
+    #[test]
+    fn launch_notice_ignores_allowed_guardian_as_user_notice() {
+        let mut guardian = GuardianSummary::new(GuardianMode::Managed);
+        guardian.decision = GuardianDecision::Allowed;
+        guardian.message = Some("Internal diagnostic summary.".to_string());
+        guardian
+            .details
+            .push("Internal diagnostic detail.".to_string());
+        guardian
+            .guidance
+            .push("Internal diagnostic guidance.".to_string());
+
+        assert!(launch_notice(Some(&guardian), None, None, None, None).is_none());
+
+        let healing = LaunchHealingSummary {
+            retry_count: Some(1),
+            ..Default::default()
+        };
+        let notice = launch_notice(Some(&guardian), Some(&healing), None, None, None)
+            .expect("healing notice should still surface");
+        assert_eq!(
+            notice.message,
+            "Launch recovered automatically with safer settings."
         );
     }
 

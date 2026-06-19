@@ -21,18 +21,20 @@ pub use java::{
 };
 pub use launch::{
     JavaVersion, LaunchModelError, LaunchVars, ResolvedLibrary, VersionJson, build_classpath,
-    client_jar_path, load_version_json, offline_uuid, resolve_arguments, resolve_libraries,
-    resolve_version,
+    client_jar_path, effective_java_version_for, java_component_for_major,
+    java_major_for_component, load_version_json, offline_uuid, resolve_arguments,
+    resolve_libraries, resolve_version,
 };
 pub use lifecycle::{LifecycleChannel, LifecycleLabel, LifecycleMeta};
 pub use loaders::{
-    LoaderArtifactKind, LoaderAvailability, LoaderBuildId, LoaderBuildMetadata, LoaderBuildRecord,
-    LoaderCatalogState, LoaderComponentId, LoaderComponentRecord, LoaderError, LoaderGameVersion,
-    LoaderInstallFailureKind, LoaderInstallStrategy, LoaderInstallability,
-    LoaderProviderFailureKind, LoaderSelectionMeta, LoaderSelectionReason, LoaderSelectionSource,
-    LoaderTerm, LoaderTermEvidence, LoaderTermSource, LoaderVersionIndex, build_id_for,
-    fetch_builds, fetch_components, fetch_supported_versions, install_build,
-    installed_version_id_for, loader_components, parse_build_id, resolve_build_record,
+    LOADER_CATALOG_SCHEMA_VERSION, LoaderArtifactKind, LoaderAvailability, LoaderBuildId,
+    LoaderBuildMetadata, LoaderBuildRecord, LoaderCatalogState, LoaderComponentId,
+    LoaderComponentRecord, LoaderError, LoaderGameVersion, LoaderInstallFailureKind,
+    LoaderInstallStrategy, LoaderInstallability, LoaderProviderFailureKind, LoaderSelectionMeta,
+    LoaderSelectionReason, LoaderSelectionSource, LoaderTerm, LoaderTermEvidence, LoaderTermSource,
+    LoaderVersionIndex, build_id_for, fetch_builds, fetch_components, fetch_supported_versions,
+    install_build, installed_version_id_for, loader_components, parse_build_id,
+    resolve_build_record,
 };
 pub use manifest::{
     ManifestEntry, VersionManifest, fetch_version_manifest, fetch_version_manifest_cached,
@@ -50,12 +52,16 @@ pub use rules::{
 pub use runtime::{
     RuntimeEnsureAction, RuntimeEnsureEvent, RuntimeEnsureResult, RuntimeId, RuntimeInstallState,
     RuntimeOverride, RuntimeRecord, RuntimeRequirement, RuntimeSource, ensure_runtime,
-    ensure_runtime_with_events, list_runtime_records, parse_runtime_override,
-    runtime_component_ready_without_probe, runtime_executable_ready_without_probe,
-    runtime_requirement,
+    ensure_runtime_with_events, list_runtime_records,
+    managed_runtime_contents_verified_without_probe, parse_runtime_override,
+    runtime_component_executable_present_without_probe, runtime_component_ready_without_probe,
+    runtime_executable_ready_without_probe, runtime_requirement,
 };
 pub use types::{VersionEntry, VersionLoaderAttachment, VersionSubjectKind};
-pub use version::scan_versions;
+pub use version::{
+    VersionScanIssue, VersionScanIssueKind, VersionScanReport, VersionScanState, scan_versions,
+    scan_versions_report,
+};
 pub use version_meta::{
     MinecraftVersionMeta, ReleaseReference, analyze_minecraft_version, apply_version_analysis,
     compare_version_entries, compare_version_like, enrich_loader_game_versions,

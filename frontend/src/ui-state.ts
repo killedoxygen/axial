@@ -77,7 +77,6 @@ export function restoreRoute(): void {
 
 export const commandPaletteOpen = signal(false);
 export const showOnboardingOverlay = signal(false);
-export const showSetupOverlay = signal(false);
 
 export const createOpen = signal(false);
 export const accountSwitcherOpen = signal(false);

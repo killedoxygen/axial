@@ -23,6 +23,8 @@ use croopor_launcher::{
     GuardianSummary, LaunchFailureClass, LaunchSessionExitReason, LaunchSessionOutcome,
     LaunchState, PreparedLaunchAttempt, build_healing_summary, prepare_launch_attempt_with_events,
 };
+use croopor_minecraft::download::repair_virtual_assets_from_index;
+use croopor_minecraft::paths::assets_dir;
 use failure::{fail_launch, fail_launch_with_outcome};
 use metadata::persist_launch_metadata;
 use prewarm::{format_prewarm_run_summary, prewarm_launch_plan};
@@ -42,6 +44,8 @@ use tokio::process::Command;
 
 pub use failure::sanitize_live_launch_failure_message;
 pub use proof::persist_launch_proof_best_effort;
+
+const STARTUP_OBSERVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub struct LaunchSuccess {
     pub session_id: String,
@@ -346,6 +350,32 @@ pub async fn launch_session(
             }
         };
 
+        if let Err(error) =
+            repair_legacy_virtual_assets_before_launch(&intent, &prepared.plan).await
+        {
+            trace_launch_event(
+                &session_id,
+                &format!("legacy virtual asset repair failed: {error}"),
+            );
+            record_failed_self_healing_if_any(
+                &state,
+                &session_id,
+                last_recovery_plan.as_ref(),
+                LaunchFailureClass::Unknown,
+            )
+            .await;
+            return Err(fail_launch(
+                &state,
+                &session_id,
+                Some(&proof_context),
+                LaunchFailureClass::Unknown,
+                &error.to_string(),
+                prepared.healing.clone(),
+                Some(guardian.clone()),
+            )
+            .await);
+        }
+
         emit_status(
             &state,
             &session_id,
@@ -460,7 +490,7 @@ pub async fn launch_session(
 
         let outcome = state
             .sessions()
-            .wait_for_startup(&session_id, std::time::Duration::from_secs(5))
+            .wait_for_startup(&session_id, STARTUP_OBSERVATION_TIMEOUT)
             .await;
 
         match outcome {
@@ -621,6 +651,21 @@ pub async fn launch_session(
     }
 }
 
+async fn repair_legacy_virtual_assets_before_launch(
+    intent: &croopor_launcher::LaunchIntent,
+    plan: &croopor_launcher::VanillaLaunchPlan,
+) -> Result<(), croopor_minecraft::download::DownloadError> {
+    let asset_index_id = plan.version.asset_index.id.trim();
+    if asset_index_id.is_empty() {
+        return Ok(());
+    }
+    let asset_index_path = assets_dir(&intent.library_dir)
+        .join("indexes")
+        .join(format!("{asset_index_id}.json"));
+    repair_virtual_assets_from_index(&intent.library_dir, &asset_index_path).await?;
+    Ok(())
+}
+
 fn launch_policy_guardian_mode(
     mode: croopor_launcher::GuardianMode,
 ) -> crate::guardian::GuardianMode {
@@ -637,10 +682,10 @@ fn startup_failure_healing(
     failure_class: LaunchFailureClass,
 ) -> Option<croopor_launcher::LaunchHealingSummary> {
     build_healing_summary(croopor_launcher::service::HealingSummaryInput {
-        auth_mode: if intent.auth.user_type == "msa" {
-            "online"
-        } else {
+        auth_mode: if intent.auth.is_offline() {
             "offline"
+        } else {
+            "online"
         },
         requested_java_path: &intent.requested_java,
         requested_preset: &intent.requested_preset,

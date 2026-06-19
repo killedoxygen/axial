@@ -1,53 +1,144 @@
 use super::client::{library_download_concurrency, standard_minecraft_download_client};
+use super::integrity::is_sha1_hex;
 use super::model::{
-    DownloadError, DownloadProgress, ExpectedIntegrity, SelectedDownloadArtifactKind, progress,
+    DownloadError, DownloadProgress, ExecutionDownloadFact, ExpectedIntegrity,
+    SelectedDownloadArtifactDescriptor, SelectedDownloadArtifactKind, progress,
 };
 use super::path_safety::resolve_path_under_root;
-use super::transfer::ensure_selected_artifact_with_client;
+use super::transfer::{
+    ensure_selected_artifact_with_client,
+    ensure_selected_artifact_with_client_allowing_missing_checksum,
+};
 use crate::launch::{Library, maven_to_path};
 use crate::paths::libraries_dir;
 use crate::rules::{current_os_arch, default_environment, evaluate_rules};
 use futures_util::StreamExt;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use tokio::sync::mpsc;
 
 #[derive(Debug, Clone)]
-pub(super) struct DownloadJob {
-    pub(super) path: PathBuf,
-    pub(super) url: String,
-    pub(super) name: String,
-    pub(super) expected: ExpectedIntegrity,
+pub struct DownloadJob {
+    pub path: PathBuf,
+    pub url: String,
+    pub name: String,
+    pub expected: ExpectedIntegrity,
+    pub allow_missing_checksum: bool,
 }
 
 pub async fn download_libraries<F>(
     mc_dir: &Path,
     libraries: &[Library],
     phase: &str,
+    send: F,
+) -> Result<(), DownloadError>
+where
+    F: FnMut(DownloadProgress),
+{
+    let env = default_environment();
+    let jobs = library_jobs_for(mc_dir, libraries, &env);
+    download_library_jobs(jobs, phase, send, None, None, false).await
+}
+
+pub async fn download_libraries_with_facts_and_descriptors<F, G, H>(
+    mc_dir: &Path,
+    libraries: &[Library],
+    phase: &str,
+    send: F,
+    mut send_fact: G,
+    mut send_descriptor: H,
+) -> Result<(), DownloadError>
+where
+    F: FnMut(DownloadProgress),
+    G: FnMut(ExecutionDownloadFact),
+    H: FnMut(SelectedDownloadArtifactDescriptor),
+{
+    let env = default_environment();
+    let jobs = library_jobs_for(mc_dir, libraries, &env);
+    let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
+    let (descriptor_tx, mut descriptor_rx) = mpsc::unbounded_channel();
+    let result =
+        download_library_jobs(jobs, phase, send, Some(fact_tx), Some(descriptor_tx), false).await;
+    while let Ok(fact) = fact_rx.try_recv() {
+        send_fact(fact);
+    }
+    while let Ok(descriptor) = descriptor_rx.try_recv() {
+        send_descriptor(descriptor);
+    }
+    result
+}
+
+pub async fn download_libraries_allowing_missing_checksums_with_facts_and_descriptors<F, G, H>(
+    mc_dir: &Path,
+    libraries: &[Library],
+    phase: &str,
+    send: F,
+    mut send_fact: G,
+    mut send_descriptor: H,
+) -> Result<(), DownloadError>
+where
+    F: FnMut(DownloadProgress),
+    G: FnMut(ExecutionDownloadFact),
+    H: FnMut(SelectedDownloadArtifactDescriptor),
+{
+    let env = default_environment();
+    let jobs = library_jobs_for(mc_dir, libraries, &env);
+    let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
+    let (descriptor_tx, mut descriptor_rx) = mpsc::unbounded_channel();
+    let result =
+        download_library_jobs(jobs, phase, send, Some(fact_tx), Some(descriptor_tx), true).await;
+    while let Ok(fact) = fact_rx.try_recv() {
+        send_fact(fact);
+    }
+    while let Ok(descriptor) = descriptor_rx.try_recv() {
+        send_descriptor(descriptor);
+    }
+    result
+}
+
+async fn download_library_jobs<F>(
+    jobs: Vec<DownloadJob>,
+    phase: &str,
     mut send: F,
+    fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
+    descriptor_tx: Option<mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
+    allow_missing_checksum: bool,
 ) -> Result<(), DownloadError>
 where
     F: FnMut(DownloadProgress),
 {
     let client = standard_minecraft_download_client();
-    let env = default_environment();
-    let jobs = library_jobs_for(mc_dir, libraries, &env);
-
     send(progress(phase, 0, jobs.len() as i32, None));
     let total_jobs = jobs.len() as i32;
     let mut completed_jobs = 0;
     let mut downloads = futures_util::stream::iter(jobs.into_iter().map(|job| {
         let client = client.clone();
+        let fact_tx = fact_tx.clone();
+        let descriptor_tx = descriptor_tx.clone();
         async move {
-            ensure_selected_artifact_with_client(
-                SelectedDownloadArtifactKind::Library,
-                &client,
-                &job.url,
-                &job.path,
-                &job.expected,
-                None,
-                None,
-            )
-            .await?;
+            if allow_missing_checksum {
+                ensure_selected_artifact_with_client_allowing_missing_checksum(
+                    SelectedDownloadArtifactKind::Library,
+                    &client,
+                    &job.url,
+                    &job.path,
+                    &job.expected,
+                    fact_tx.as_ref(),
+                    descriptor_tx.as_ref(),
+                )
+                .await?;
+            } else {
+                ensure_selected_artifact_with_client(
+                    SelectedDownloadArtifactKind::Library,
+                    &client,
+                    &job.url,
+                    &job.path,
+                    &job.expected,
+                    fact_tx.as_ref(),
+                    descriptor_tx.as_ref(),
+                )
+                .await?;
+            }
             Ok::<String, DownloadError>(job.name)
         }
     }))
@@ -60,7 +151,7 @@ where
     Ok(())
 }
 
-pub(super) fn resolve_library_download(lib: &Library, mc_dir: &Path) -> Option<DownloadJob> {
+pub fn resolve_library_download(lib: &Library, mc_dir: &Path) -> Option<DownloadJob> {
     let lib_dir = libraries_dir(mc_dir);
     if !lib.natives.is_empty()
         && lib
@@ -85,7 +176,8 @@ pub(super) fn resolve_library_download(lib: &Library, mc_dir: &Path) -> Option<D
                     .unwrap_or_else(|| lib.name.clone()),
                 path,
                 url: artifact.url.clone(),
-                expected: ExpectedIntegrity::from_mojang(artifact.size, &artifact.sha1),
+                expected: library_expected_integrity(lib, artifact.size, &artifact.sha1),
+                allow_missing_checksum: lib.croopor_checksumless_allowed,
             });
         }
         return None;
@@ -114,15 +206,12 @@ pub(super) fn resolve_library_download(lib: &Library, mc_dir: &Path) -> Option<D
             base_url,
             maven_path.to_string_lossy().replace('\\', "/")
         ),
-        expected: ExpectedIntegrity::from_mojang(lib.size, &lib.sha1),
+        expected: library_expected_integrity(lib, lib.size, &lib.sha1),
+        allow_missing_checksum: lib.croopor_checksumless_allowed,
     })
 }
 
-pub(super) fn resolve_native_download(
-    lib: &Library,
-    mc_dir: &Path,
-    os_name: &str,
-) -> Option<DownloadJob> {
+pub fn resolve_native_download(lib: &Library, mc_dir: &Path, os_name: &str) -> Option<DownloadJob> {
     let lib_dir = libraries_dir(mc_dir);
     for classifier_key in native_classifier_candidates(lib, os_name) {
         if let Some(artifact) = lib
@@ -139,7 +228,8 @@ pub(super) fn resolve_native_download(
                     .unwrap_or_else(|| format!("{}:{classifier_key}", lib.name)),
                 path,
                 url: artifact.url.clone(),
-                expected: ExpectedIntegrity::from_mojang(artifact.size, &artifact.sha1),
+                expected: library_expected_integrity(lib, artifact.size, &artifact.sha1),
+                allow_missing_checksum: lib.croopor_checksumless_allowed,
             });
         }
     }
@@ -170,11 +260,25 @@ pub(super) fn resolve_native_download(
             base_url,
             maven_path.to_string_lossy().replace('\\', "/")
         ),
-        expected: ExpectedIntegrity::from_mojang(lib.size, &lib.sha1),
+        expected: library_expected_integrity(lib, lib.size, &lib.sha1),
+        allow_missing_checksum: lib.croopor_checksumless_allowed,
     })
 }
 
-pub(super) fn native_classifier_candidates(lib: &Library, os_name: &str) -> Vec<String> {
+fn library_expected_integrity(lib: &Library, size: i64, sha1: &str) -> ExpectedIntegrity {
+    let expected = ExpectedIntegrity::from_mojang(size, sha1);
+    if expected.sha1.is_some() {
+        return expected;
+    }
+    lib.checksums
+        .iter()
+        .map(|checksum| checksum.trim())
+        .find(|checksum| is_sha1_hex(checksum))
+        .map(ExpectedIntegrity::from_sha1)
+        .unwrap_or(expected)
+}
+
+pub fn native_classifier_candidates(lib: &Library, os_name: &str) -> Vec<String> {
     let Some(base) = lib.natives.get(os_name) else {
         return Vec::new();
     };
@@ -207,7 +311,7 @@ pub(super) fn native_classifier_candidates(lib: &Library, os_name: &str) -> Vec<
     candidates
 }
 
-pub(super) fn library_jobs_for(
+pub fn library_jobs_for(
     mc_dir: &Path,
     libraries: &[Library],
     env: &crate::rules::Environment,

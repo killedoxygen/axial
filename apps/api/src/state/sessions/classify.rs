@@ -44,10 +44,10 @@ pub(super) fn classify_session_outcome(input: SessionOutcomeInput) -> Option<Lau
         return None;
     }
 
-    let reason = if input.stop_requested {
-        LaunchSessionExitReason::LauncherStopped
-    } else if input.failure_class == Some(LaunchFailureClass::StartupStalled) {
+    let reason = if input.failure_class == Some(LaunchFailureClass::StartupStalled) {
         LaunchSessionExitReason::StartupStalled
+    } else if input.stop_requested {
+        LaunchSessionExitReason::LauncherStopped
     } else if input.boot_completed {
         classify_post_boot_outcome(input)
     } else {
@@ -185,6 +185,21 @@ mod tests {
 
         assert_eq!(stalled.reason, LaunchSessionExitReason::StartupStalled);
         assert_eq!(crashed.reason, LaunchSessionExitReason::CrashedBeforeBoot);
+    }
+
+    #[test]
+    fn session_outcome_keeps_startup_stall_when_internal_stop_was_requested() {
+        let outcome = classify_session_outcome(SessionOutcomeInput {
+            previous_state: LaunchState::Monitoring,
+            next_state: LaunchState::Exited,
+            boot_completed: false,
+            stop_requested: true,
+            exit_code: Some(-1),
+            failure_class: Some(LaunchFailureClass::StartupStalled),
+        })
+        .expect("outcome");
+
+        assert_eq!(outcome.reason, LaunchSessionExitReason::StartupStalled);
     }
 
     #[test]

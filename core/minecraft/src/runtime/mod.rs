@@ -15,8 +15,10 @@ mod probe;
 
 pub use discovery::{
     find_java_runtime, is_known_runtime_component, list_java_runtimes, list_runtime_records,
-    parse_runtime_override, preferred_runtime_component, runtime_component_ready_without_probe,
-    runtime_executable_ready_without_probe, runtime_requirement,
+    managed_runtime_contents_verified_without_probe, parse_runtime_override,
+    preferred_runtime_component, runtime_component_executable_present_without_probe,
+    runtime_component_ready_without_probe, runtime_executable_ready_without_probe,
+    runtime_requirement,
 };
 pub use ensure::{ensure_java_runtime, ensure_runtime, ensure_runtime_with_events};
 pub use model::{

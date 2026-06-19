@@ -7,25 +7,15 @@ import { HomeView } from './views/home/HomeView';
 import { DialogHost } from './ui/Dialog';
 import { ContextMenuHost } from './ui/ContextMenu';
 import { ToastHost } from './ui/ToastHost';
-import { Logo } from './ui/Logo';
-import {
-  accountSwitcherOpen,
-  commandPaletteOpen,
-  createOpen,
-  route,
-  showOnboardingOverlay,
-  showSetupOverlay,
-} from './ui-state';
+import { accountSwitcherOpen, commandPaletteOpen, createOpen, route, showOnboardingOverlay } from './ui-state';
 import { devMode } from './store';
 import { useShortcuts } from './hooks/use-shortcuts';
 
 type DevLabViewComponent = (typeof import('./views/dev-lab/DevLabView'))['DevLabView'];
 type CommandPaletteComponent = (typeof import('./ui/CommandPalette'))['CommandPalette'];
-type SetupOverlayComponent = (typeof import('./views/setup/SetupOverlay'))['SetupOverlay'];
 type AccountSwitcherHostComponent = (typeof import('./views/accounts/AccountSwitcherHost'))['AccountSwitcherHost'];
 
 let loadedCommandPalette: CommandPaletteComponent | null = null;
-let loadedSetupOverlay: SetupOverlayComponent | null = null;
 let loadedAccountSwitcherHost: AccountSwitcherHostComponent | null = null;
 
 const InstanceDetailRoute = createRouteLoader<{ id: string }>(
@@ -94,21 +84,6 @@ function RouteLoadingFallback({ failed = false }: { failed?: boolean }): JSX.Ele
   );
 }
 
-function SetupLoadingFallback({ failed = false }: { failed?: boolean }): JSX.Element {
-  return (
-    <div class="cp-setup-overlay" role="status" aria-live="polite">
-      <div class="cp-setup-card">
-        <Logo className="cp-logo" size={48} />
-        <h1 class="cp-setup-title">{failed ? 'Could not load setup' : 'Loading setup...'}</h1>
-        <p class="cp-setup-sub">
-          {failed ? 'Restart the launcher and try again.' : 'Preparing the library setup flow.'}
-        </p>
-        {!failed && <div class="cp-setup-progress" />}
-      </div>
-    </div>
-  );
-}
-
 function DevLabRoute(): JSX.Element {
   if (!loadDevLabView || !devMode.value) return <SettingsRoute />;
   return <DevLabLoader load={loadDevLabView} />;
@@ -148,30 +123,6 @@ function LazyCommandPalette(): JSX.Element | null {
   }, [CommandPaletteView]);
 
   return CommandPaletteView ? <CommandPaletteView /> : null;
-}
-
-function LazySetupOverlay(): JSX.Element {
-  const [SetupOverlayView, setSetupOverlayView] = useState<SetupOverlayComponent | null>(() => loadedSetupOverlay);
-  const [failed, setFailed] = useState(false);
-
-  useEffect(() => {
-    if (SetupOverlayView) return;
-    let mounted = true;
-    setFailed(false);
-    void import('./views/setup/SetupOverlay')
-      .then((module) => {
-        loadedSetupOverlay = module.SetupOverlay;
-        if (mounted) setSetupOverlayView(() => module.SetupOverlay);
-      })
-      .catch(() => {
-        if (mounted) setFailed(true);
-      });
-    return () => {
-      mounted = false;
-    };
-  }, [SetupOverlayView]);
-
-  return SetupOverlayView ? <SetupOverlayView /> : <SetupLoadingFallback failed={failed} />;
 }
 
 function LazyAccountSwitcherHost(): JSX.Element | null {
@@ -223,7 +174,6 @@ export function App(): JSX.Element {
       </AppFrame>
       {createOpen.value && <CreateOverlay />}
       {accountSwitcherOpen.value && <LazyAccountSwitcherHost />}
-      {showSetupOverlay.value && <LazySetupOverlay />}
       {showOnboardingOverlay.value && <OnboardingOverlay />}
       <DialogHost />
       <ContextMenuHost />

@@ -1,7 +1,7 @@
 use crate::application::{
-    InstallQueueRequest, InstallQueueStateResponse, InstallStatusResponse,
-    InstallVersionStartRequest, enqueue_install, install_events_stream, install_queue_status,
-    install_status, remove_queued_install, retry_install, start_install_version,
+    InstallQueueRequest, InstallQueueStateResponse, InstallStatusResponse, enqueue_install,
+    install_events_stream, install_queue_status, install_status, remove_queued_install,
+    retry_install,
 };
 use crate::state::AppState;
 use axum::{
@@ -41,17 +41,19 @@ pub fn router() -> Router<AppState> {
 async fn handle_install(
     State(state): State<AppState>,
     Json(payload): Json<InstallRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let response = start_install_version(
+) -> Result<Json<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
+    enqueue_install(
         &state,
-        InstallVersionStartRequest {
+        InstallQueueRequest {
+            kind: "vanilla".to_string(),
             version_id: payload.version_id,
             manifest_url: payload.manifest_url,
+            component_id: String::new(),
+            build_id: String::new(),
         },
     )
-    .await?;
-
-    Ok(Json(serde_json::json!(response)))
+    .await
+    .map(Json)
 }
 
 async fn handle_install_status(
@@ -232,6 +234,74 @@ mod tests {
         assert_no_install_status_route_sensitive_fragments(&payload);
     }
 
+    #[tokio::test]
+    async fn public_install_route_enqueues_behind_active_lane() {
+        let fixture = RouteInstallFixture::new("public-install-route-queue-lane");
+        let library_dir = fixture.root.join("library");
+        fs::create_dir_all(&library_dir).expect("library dir");
+        fixture
+            .state
+            .set_library_dir(library_dir.to_string_lossy().to_string());
+        fixture
+            .state
+            .installs()
+            .insert_or_existing_active(
+                "active-install".to_string(),
+                "1.21.5".to_string(),
+                String::new(),
+            )
+            .await;
+        fixture
+            .state
+            .installs()
+            .enqueue_queued_install(
+                "queue-active".to_string(),
+                crate::state::InstallQueueSpec::vanilla("1.21.5".to_string(), String::new()),
+                crate::state::InstallQueuePlacement::Back,
+            )
+            .await;
+        fixture
+            .state
+            .installs()
+            .reserve_next_queued_install()
+            .await
+            .expect("active queue item");
+        assert!(
+            fixture
+                .state
+                .installs()
+                .mark_queued_install_started("queue-active", "active-install".to_string())
+                .await
+        );
+
+        let (status, payload) = fixture
+            .request_json_body(
+                Method::POST,
+                "/api/v1/install",
+                serde_json::json!({
+                    "version_id": "1.21.6",
+                    "manifest_url": ""
+                }),
+            )
+            .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(payload["active"]["queue_id"], "queue-active");
+        assert_eq!(payload["active"]["install_id"], "active-install");
+        assert_eq!(payload["items"].as_array().expect("queue items").len(), 1);
+        assert_eq!(payload["items"][0]["label"], "Minecraft 1.21.6");
+        assert!(payload["started_install"].is_null());
+        let snapshot = fixture.state.installs().queue_snapshot().await;
+        assert_eq!(
+            snapshot
+                .active
+                .as_ref()
+                .map(|active| active.queue_id.as_str()),
+            Some("queue-active")
+        );
+        assert_eq!(snapshot.pending.len(), 1);
+    }
+
     struct RouteInstallFixture {
         state: AppState,
         root: PathBuf,
@@ -267,6 +337,32 @@ mod tests {
                         .method(method)
                         .uri(uri)
                         .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("route response");
+            let status = response.status();
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read body");
+            let payload = serde_json::from_slice(&body).expect("json response");
+            (status, payload)
+        }
+
+        async fn request_json_body(
+            &self,
+            method: Method,
+            uri: &str,
+            payload: Value,
+        ) -> (StatusCode, Value) {
+            let response = router()
+                .with_state(self.state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(payload.to_string()))
                         .expect("request"),
                 )
                 .await

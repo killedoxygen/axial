@@ -20,6 +20,7 @@ pub mod performance;
 pub mod setup;
 pub mod skin;
 pub mod status;
+pub(crate) mod timing;
 pub mod update;
 pub mod version;
 
@@ -71,8 +72,7 @@ pub use install::{
     record_install_operation_guardian_evidence, record_install_operation_guardian_repair_outcome,
     record_install_operation_interrupted, record_install_operation_progress, remove_queued_install,
     repair_install_artifact_corruption_with_guardian, retry_install, sanitize_install_progress,
-    stage_install_version_command, start_install_version, start_loader_install,
-    vanilla_install_progress_view_model,
+    stage_install_version_command, vanilla_install_progress_view_model,
 };
 pub use java::{JavaRuntimesResponse, java_runtimes};
 pub use launch::{

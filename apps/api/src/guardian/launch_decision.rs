@@ -308,6 +308,26 @@ fn startup_failure_diagnosis(
                 failure_class,
                 GuardianConfidence::High,
             ),
+            LaunchFailureClass::LauncherManagedArtifactSignature => Diagnosis {
+                id: DiagnosisId::new("launcher_managed_artifact_signature_corrupt"),
+                domain: GuardianDomain::Download,
+                severity: GuardianSeverity::Blocking,
+                confidence: GuardianConfidence::High,
+                ownership: OwnershipClass::LauncherManaged,
+                phase: OperationPhase::Launching,
+                fact_ids: vec![
+                    "process_exited_before_boot".to_string(),
+                    failure_class_fact_id(failure_class).to_string(),
+                ],
+                affected_targets: vec![target(
+                    GuardianDomain::Download,
+                    "launcher_managed_jars",
+                    OwnershipClass::LauncherManaged,
+                )],
+                impact: GuardianImpactVector::launch_blocking(),
+                candidate_actions: vec![GuardianActionKind::Block],
+                public_reason_template: "launcher_managed_artifact_signature_corrupt".to_string(),
+            },
             LaunchFailureClass::AuthModeIncompatible => blocking_startup_diagnosis(
                 "auth_mode_incompatible",
                 failure_class,
@@ -701,14 +721,14 @@ fn target_kind_for_domain(domain: GuardianDomain) -> TargetKind {
         GuardianDomain::Startup | GuardianDomain::Session | GuardianDomain::Launch => {
             TargetKind::Session
         }
-        GuardianDomain::Install | GuardianDomain::Library => TargetKind::Artifact,
+        GuardianDomain::Install | GuardianDomain::Library | GuardianDomain::Download => {
+            TargetKind::Artifact
+        }
         GuardianDomain::Performance => TargetKind::PerformanceComposition,
         GuardianDomain::Network => TargetKind::NetworkResource,
         GuardianDomain::Filesystem => TargetKind::FilesystemPath,
         GuardianDomain::Auth => TargetKind::Account,
-        GuardianDomain::Download | GuardianDomain::State | GuardianDomain::Unknown => {
-            TargetKind::Session
-        }
+        GuardianDomain::State | GuardianDomain::Unknown => TargetKind::Session,
     }
 }
 
@@ -768,6 +788,9 @@ fn failure_class_fact_id(failure_class: LaunchFailureClass) -> &'static str {
         LaunchFailureClass::JvmExperimentalUnlock => "jvm_arg_experimental_unlock_missing",
         LaunchFailureClass::JvmOptionOrdering => "jvm_arg_unlock_order_invalid",
         LaunchFailureClass::ClasspathModuleConflict => "classpath_module_conflict",
+        LaunchFailureClass::LauncherManagedArtifactSignature => {
+            "launcher_managed_artifact_signature_corruption"
+        }
         LaunchFailureClass::AuthModeIncompatible => "auth_mode_incompatible",
         LaunchFailureClass::LoaderBootstrapFailure => "loader_bootstrap_failure",
         LaunchFailureClass::StartupStalled => "startup_window_expired",
@@ -808,6 +831,9 @@ fn startup_failure_reason(
             }
             LaunchFailureClass::ClasspathModuleConflict => {
                 "Minecraft exited before startup completed with a detected classpath or module conflict."
+            }
+            LaunchFailureClass::LauncherManagedArtifactSignature => {
+                "Minecraft exited before startup completed with detected launcher-managed jar signature corruption."
             }
             LaunchFailureClass::AuthModeIncompatible => {
                 "Minecraft exited before startup completed because the selected auth mode was not launch-ready."
@@ -852,6 +878,11 @@ fn prepare_failure_guidance(
         }
         LaunchFailureClass::StartupStalled => {
             vec!["Launch stalled before startup. Review recent override changes first."]
+        }
+        LaunchFailureClass::LauncherManagedArtifactSignature => {
+            vec![
+                "Repair the installed version so Croopor can replace the affected launcher-managed jars.",
+            ]
         }
         _ => Vec::new(),
     }
@@ -1159,6 +1190,38 @@ mod tests {
             directive.kind,
             GuardianLaunchRecoveryKind::SwitchManagedRuntime
         );
+    }
+
+    #[test]
+    fn startup_launcher_managed_signature_corruption_blocks_with_specific_diagnosis() {
+        let outcome = guardian_startup_failure_outcome(GuardianStartupFailureRequest {
+            mode: GuardianMode::Managed,
+            observation: GuardianStartupFailureObservation::Exited {
+                failure_class: LaunchFailureClass::LauncherManagedArtifactSignature,
+            },
+            target_version_id: "1.5.2",
+            runtime_major: 8,
+            requested_java_present: false,
+            explicit_java_override_present: false,
+            explicit_jvm_args_present: false,
+            explicit_jvm_preset_present: false,
+            startup_recovery_applied: false,
+            disable_custom_gc: false,
+            effective_preset: "legacy",
+        });
+
+        assert_eq!(outcome.guardian_decision.kind, GuardianDecisionKind::Block);
+        assert_eq!(
+            outcome.safety_case.diagnoses[0].id.as_str(),
+            "launcher_managed_artifact_signature_corrupt"
+        );
+        assert!(outcome.directive.is_none());
+        assert!(outcome.user_outcome.details.contains(
+            &"Minecraft exited before startup completed with detected launcher-managed jar signature corruption.".to_string()
+        ));
+        assert!(outcome.user_outcome.guidance.contains(
+            &"Repair the installed version so Croopor can replace the affected launcher-managed jars.".to_string()
+        ));
     }
 
     #[test]

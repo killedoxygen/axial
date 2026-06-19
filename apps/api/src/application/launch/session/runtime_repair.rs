@@ -17,7 +17,7 @@ use crate::state::contracts::OperationPhase;
 use croopor_config::{AppPaths, Instance};
 use croopor_launcher::{GuardianDecision, GuardianMode, GuardianSummary};
 use croopor_minecraft::{
-    preferred_runtime_component, resolve_version, runtime_executable_ready_without_probe,
+    managed_runtime_contents_verified_without_probe, preferred_runtime_component, resolve_version,
 };
 use std::path::{Path, PathBuf};
 
@@ -144,7 +144,7 @@ fn managed_runtime_ready_marker_repair_candidate(
     }
     let java_executable = managed_runtime_java_executable(&runtime_root);
     if runtime_root.join(".croopor-ready").is_file()
-        && runtime_executable_ready_without_probe(&java_executable)
+        && managed_runtime_contents_verified_without_probe(&runtime_root)
     {
         return None;
     }

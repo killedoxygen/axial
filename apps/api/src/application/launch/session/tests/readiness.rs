@@ -1,5 +1,5 @@
 use super::*;
-use sha1::{Digest as _, Sha1};
+use sha1::Sha1;
 
 #[tokio::test]
 async fn launch_preflight_ready_payload_for_managed_instance_does_not_create_session() {
@@ -56,6 +56,7 @@ async fn launch_preflight_readiness_reports_missing_version_json() {
 #[tokio::test]
 async fn launch_preflight_readiness_reports_missing_client_jar() {
     let fixture = TestFixture::new("preflight-readiness-missing-client-jar");
+    let component = "croopor-test-runtime-missing-client";
     fixture.write_version_json(
         "1.21.1",
         serde_json::json!({
@@ -63,7 +64,7 @@ async fn launch_preflight_readiness_reports_missing_client_jar() {
             "type": "release",
             "mainClass": "net.minecraft.client.main.Main",
             "assetIndex": {},
-            "javaVersion": { "component": "java-runtime-delta", "majorVersion": 21 },
+            "javaVersion": { "component": component, "majorVersion": 21 },
             "libraries": []
         }),
     );
@@ -90,7 +91,7 @@ async fn launch_preflight_readiness_reports_missing_client_jar() {
 }
 
 #[tokio::test]
-async fn launch_preflight_readiness_reports_missing_libraries_as_guardian_fact() {
+async fn launch_preflight_readiness_reports_missing_library_metadata_as_corrupt_guardian_fact() {
     let fixture = TestFixture::new("preflight-readiness-missing-libraries");
     fixture.write_version_json(
         "1.21.1",
@@ -121,11 +122,17 @@ async fn launch_preflight_readiness_reports_missing_libraries_as_guardian_fact()
         .expect("prepare preflight");
 
     assert!(!preflight.readiness.launchable);
-    assert_readiness_reason(&preflight, LaunchReadinessReasonId::LibrariesMissing);
+    assert_readiness_reason(&preflight, LaunchReadinessReasonId::LibrariesCorrupt);
     assert_eq!(preflight.guardian.decision, GuardianDecision::Blocked);
-    assert_guardian_fact(&preflight, "libraries_missing");
+    assert!(preflight.guardian_facts.iter().any(|fact| {
+        fact.id.as_str() == "artifact_checksum_mismatch"
+            && fact
+                .target
+                .as_ref()
+                .is_some_and(|target| target.id == "libraries")
+    }));
     assert!(preflight.guardian.details.iter().any(|detail| {
-        detail == "Guardian blocked launch because required libraries are missing."
+        detail == "Guardian blocked launch because launcher-managed game files are corrupt."
     }));
 }
 
@@ -192,6 +199,7 @@ async fn launch_preflight_readiness_reports_corrupt_launcher_artifacts_as_guardi
                 "downloads": {
                     "artifact": {
                         "path": "com/example/demo/1.0.0/demo-1.0.0.jar",
+                        "url": "https://example.invalid/demo-1.0.0.jar",
                         "sha1": sha1_hex(expected_library),
                         "size": expected_library.len()
                     }
@@ -294,6 +302,7 @@ fn sha1_hex(bytes: &[u8]) -> String {
 #[tokio::test]
 async fn launch_preparation_repairs_managed_runtime_ready_marker_before_blocking_readiness() {
     let fixture = TestFixture::new("prepare-repairs-runtime-ready-marker");
+    let component = "croopor-test-runtime-repair-marker";
     fixture.write_version_json(
         "1.21.1",
         serde_json::json!({
@@ -301,13 +310,13 @@ async fn launch_preparation_repairs_managed_runtime_ready_marker_before_blocking
             "type": "release",
             "mainClass": "net.minecraft.client.main.Main",
             "assetIndex": {},
-            "javaVersion": { "component": "java-runtime-delta", "majorVersion": 21 },
+            "javaVersion": { "component": component, "majorVersion": 21 },
             "libraries": []
         }),
     );
     let version_dir = fixture.paths.library_dir.join("versions").join("1.21.1");
     fs::write(version_dir.join("1.21.1.jar"), b"client jar").expect("client jar");
-    let runtime_root = fixture.write_global_runtime_without_ready_marker("java-runtime-delta");
+    let runtime_root = fixture.write_global_runtime_without_ready_marker(component);
     let instance_id = fixture.add_instance("Survival", "1.21.1");
     let instance = fixture
         .state
@@ -366,6 +375,7 @@ async fn launch_preparation_repairs_managed_runtime_ready_marker_before_blocking
 #[tokio::test]
 async fn launch_preparation_repairs_corrupt_managed_runtime_ready_marker_before_launch() {
     let fixture = TestFixture::new("prepare-repairs-runtime-corrupt-ready-marker");
+    let component = "croopor-test-runtime-corrupt-marker";
     fixture.write_version_json(
         "1.21.1",
         serde_json::json!({
@@ -373,13 +383,13 @@ async fn launch_preparation_repairs_corrupt_managed_runtime_ready_marker_before_
             "type": "release",
             "mainClass": "net.minecraft.client.main.Main",
             "assetIndex": {},
-            "javaVersion": { "component": "java-runtime-delta", "majorVersion": 21 },
+            "javaVersion": { "component": component, "majorVersion": 21 },
             "libraries": []
         }),
     );
     let version_dir = fixture.paths.library_dir.join("versions").join("1.21.1");
     fs::write(version_dir.join("1.21.1.jar"), b"client jar").expect("client jar");
-    let runtime_root = fixture.write_global_runtime_without_ready_marker("java-runtime-delta");
+    let runtime_root = fixture.write_global_runtime_without_ready_marker(component);
     fs::create_dir(runtime_root.join(".croopor-ready")).expect("corrupt ready marker directory");
     let instance_id = fixture.add_instance("Survival", "1.21.1");
     let instance = fixture

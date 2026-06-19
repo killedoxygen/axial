@@ -2,13 +2,15 @@ use crate::download::{
     DownloadError, ExecutionDownloadError, ExecutionDownloadReport,
     write_launcher_managed_artifact_bytes_to_temp,
 };
-use crate::loaders::types::{CachedCatalog, LoaderAvailability, LoaderCatalogState, LoaderError};
+use crate::loaders::types::{
+    CachedCatalog, LOADER_CATALOG_SCHEMA_VERSION, LoaderAvailability, LoaderCatalogState,
+    LoaderError,
+};
 use chrono::Utc;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const CATALOG_SCHEMA_VERSION: u32 = 6;
 const CACHE_PERSIST_WARNING: &str =
     "Loader catalog is available, but the offline cache could not be updated.";
 
@@ -84,9 +86,11 @@ where
                     },
                 ));
             }
-            Err(LoaderError::CatalogUnavailable(
-                error.safe_status_label().to_string(),
-            ))
+            Err(LoaderError::CatalogUnavailable {
+                message: error.safe_status_label().to_string(),
+                provider_failure_kind: error.provider_failure_kind(),
+                provider_status: error.provider_status(),
+            })
         }
     }
 }
@@ -97,7 +101,7 @@ where
 {
     let data = fs::read(path)?;
     let cached = serde_json::from_slice::<CachedCatalog<T>>(&data)?;
-    if cached.schema_version != CATALOG_SCHEMA_VERSION {
+    if cached.schema_version != LOADER_CATALOG_SCHEMA_VERSION {
         return Err(LoaderError::Other(
             "catalog cache schema mismatch".to_string(),
         ));
@@ -174,13 +178,34 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn read_cache_rejects_previous_schema_version() {
+        let root = temp_dir("previous-cache-schema");
+        fs::create_dir_all(&root).expect("create root");
+        let cache_path = root.join("catalog.json");
+        let cached = CachedCatalog {
+            schema_version: LOADER_CATALOG_SCHEMA_VERSION - 1,
+            fetched_at_ms: 1,
+            value: vec!["old".to_string()],
+        };
+        fs::write(
+            &cache_path,
+            serde_json::to_vec(&cached).expect("serialize old cache"),
+        )
+        .expect("write old cache");
+
+        read_cache::<Vec<String>>(&cache_path).expect_err("old schema should be rejected");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn stale_cache_is_returned_when_live_fetch_response_is_too_large() {
         let root = temp_dir("stale-cache-oversized-live-fetch");
         fs::create_dir_all(&root).expect("create root");
         let cache_path = root.join("catalog.json");
         let cached = CachedCatalog {
-            schema_version: CATALOG_SCHEMA_VERSION,
+            schema_version: LOADER_CATALOG_SCHEMA_VERSION,
             fetched_at_ms: 1,
             value: vec!["cached".to_string()],
         };
@@ -220,7 +245,7 @@ mod tests {
         fs::create_dir_all(&root).expect("create root");
         let cache_path = root.join("catalog.json");
         let old = CachedCatalog {
-            schema_version: CATALOG_SCHEMA_VERSION,
+            schema_version: LOADER_CATALOG_SCHEMA_VERSION,
             fetched_at_ms: 1,
             value: vec!["old".to_string()],
         };
@@ -229,7 +254,7 @@ mod tests {
             .expect("write old cache");
 
         let next = CachedCatalog {
-            schema_version: CATALOG_SCHEMA_VERSION,
+            schema_version: LOADER_CATALOG_SCHEMA_VERSION,
             fetched_at_ms: 2,
             value: vec!["new".to_string()],
         };
@@ -308,7 +333,7 @@ mod tests {
         let cache_path = root.join("catalog.json");
         fs::create_dir_all(&cache_path).expect("create cache directory");
         let next = CachedCatalog {
-            schema_version: CATALOG_SCHEMA_VERSION,
+            schema_version: LOADER_CATALOG_SCHEMA_VERSION,
             fetched_at_ms: 2,
             value: vec!["new".to_string()],
         };

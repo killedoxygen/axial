@@ -4,7 +4,7 @@ use super::model::{
     ExecutionDownloadFactKind, ExecutionDownloadOwnership, ExpectedIntegrity,
     SelectedDownloadArtifactDescriptor, SelectedDownloadArtifactKind,
 };
-use super::path_safety::{safe_download_fact_value, safe_download_target_label};
+use super::path_safety::safe_download_fact_value;
 use std::io;
 use std::path::Path;
 use tokio::sync::mpsc;
@@ -16,6 +16,7 @@ pub(super) struct ExecutionDownloadRequest<'a> {
     pub(super) destination: &'a Path,
     pub(super) expected: &'a ExpectedIntegrity,
     pub(super) ownership: ExecutionDownloadOwnership,
+    pub(super) require_checksum: bool,
 }
 
 impl<'a> ExecutionDownloadRequest<'a> {
@@ -29,6 +30,21 @@ impl<'a> ExecutionDownloadRequest<'a> {
             destination,
             expected,
             ownership: ExecutionDownloadOwnership::LauncherManaged,
+            require_checksum: true,
+        }
+    }
+
+    pub(super) fn launcher_managed_best_effort(
+        url: &'a str,
+        destination: &'a Path,
+        expected: &'a ExpectedIntegrity,
+    ) -> Self {
+        Self {
+            url,
+            destination,
+            expected,
+            ownership: ExecutionDownloadOwnership::LauncherManaged,
+            require_checksum: false,
         }
     }
 }
@@ -51,7 +67,7 @@ pub(super) fn emit_selected_download_descriptor(
     }
     let descriptor = SelectedDownloadArtifactDescriptor::new(
         kind,
-        safe_download_target_label(destination),
+        selected_download_target_label(kind, destination),
         destination.to_path_buf(),
         provider_url.to_string(),
         sha1.to_ascii_lowercase(),
@@ -135,6 +151,7 @@ pub(super) fn metadata_facts(
 }
 
 pub(super) fn selected_artifact_missing_fact(
+    kind: SelectedDownloadArtifactKind,
     destination: &Path,
     expected: &ExpectedIntegrity,
 ) -> Option<ExecutionDownloadFact> {
@@ -144,9 +161,38 @@ pub(super) fn selected_artifact_missing_fact(
     }
     Some(execution_download_fact(
         ExecutionDownloadFactKind::ArtifactMissing,
-        &safe_download_target_label(destination),
+        &selected_download_target_label(kind, destination),
         no_download_fact_fields(),
     ))
+}
+
+pub(super) fn selected_download_target_label(
+    kind: SelectedDownloadArtifactKind,
+    destination: &Path,
+) -> String {
+    let prefix = selected_download_target_prefix(kind);
+    let suffix = destination
+        .file_stem()
+        .or_else(|| destination.file_name())
+        .and_then(|value| value.to_str())
+        .map(|value| safe_download_fact_value(value, prefix))
+        .filter(|value| value != prefix);
+
+    match suffix {
+        Some(suffix) => format!("{prefix}_{suffix}"),
+        None => prefix.to_string(),
+    }
+}
+
+fn selected_download_target_prefix(kind: SelectedDownloadArtifactKind) -> &'static str {
+    match kind {
+        SelectedDownloadArtifactKind::VersionJson => "minecraft_version_json",
+        SelectedDownloadArtifactKind::ClientJar => "minecraft_client",
+        SelectedDownloadArtifactKind::Library => "minecraft_library",
+        SelectedDownloadArtifactKind::AssetIndex => "minecraft_asset_index",
+        SelectedDownloadArtifactKind::AssetObject => "minecraft_asset_object",
+        SelectedDownloadArtifactKind::LogConfig => "minecraft_log_config",
+    }
 }
 
 pub(super) fn size_mismatch_fact(

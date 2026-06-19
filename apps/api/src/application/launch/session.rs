@@ -6,6 +6,11 @@ mod runtime_repair;
 
 use super::policy;
 use super::runner::trace_launch_event;
+use crate::application::timing::{
+    LaunchPreflightFactTiming, LaunchPreflightResponseTiming, LaunchSessionTiming,
+    trace_launch_preflight_facts, trace_launch_preflight_response, trace_launch_session,
+};
+use crate::application::version::{VERSION_SCAN_DEGRADED_MESSAGE, scan_installed_versions};
 use crate::application::{
     LaunchBoundaryStaging, LaunchBoundaryStagingRequest, LaunchInstanceCommand,
     LaunchInstanceStaging, flush_pending_saved_skin_applies_for_launch, stage_launch_boundary,
@@ -25,9 +30,9 @@ use axum::{Json, http::StatusCode};
 use croopor_config::{AppConfig, Instance};
 use croopor_launcher::{
     GuardianDecision, GuardianMode, GuardianSummary, LaunchGuardianContext, LaunchIntent,
-    LaunchReadiness, LaunchReadinessRequest, LaunchState, inspect_launch_readiness, launch_notice,
+    LaunchReadiness, LaunchReadinessReason, LaunchReadinessReasonId, LaunchReadinessRequest,
+    LaunchReadinessSeverity, LaunchState, inspect_launch_readiness, launch_notice,
 };
-use croopor_minecraft::scan_versions;
 use overrides::{
     inspect_explicit_java_override, inspect_explicit_jvm_args, preflight_override_signals,
 };
@@ -44,7 +49,10 @@ use resources::{LaunchCpuLoadEvidence, LaunchDiskEvidence, LaunchMemoryEvidence,
 use runtime_repair::maybe_repair_managed_runtime_before_launch;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct LaunchRequest {
@@ -150,6 +158,7 @@ async fn prepare_launch_session_with_auth_refresh(
     payload: LaunchRequest,
     auth_refresh: Option<LaunchAuthRefreshOptions>,
 ) -> Result<PreparedLaunch, (StatusCode, Json<serde_json::Value>)> {
+    let started_at = Instant::now();
     let library_dir = state.library_dir().ok_or_else(|| {
         (
             StatusCode::PRECONDITION_FAILED,
@@ -170,20 +179,25 @@ async fn prepare_launch_session_with_auth_refresh(
             Json(json!({ "error": "instance already has an active session" })),
         ));
     }
+    let layout_started_at = Instant::now();
     state
         .instances()
         .ensure_instance_layout(&instance.id, Some(&library_dir))
         .map_err(launch_layout_error_response)?;
+    let layout_elapsed = layout_started_at.elapsed();
     let game_dir = state.instances().game_dir(&instance.id);
 
     let config = state.config().current();
+    let auth_started_at = Instant::now();
     let auth_context =
         resolve_launch_auth_context(state, &config, payload.username.as_deref(), auth_refresh)
             .await?;
+    let auth_elapsed = auth_started_at.elapsed();
     if auth_context.online_launch {
         flush_pending_saved_skin_applies_for_launch(state).await?;
     }
     let username = auth_context.username.clone();
+    let preflight_started_at = Instant::now();
     let mut preflight = build_launch_preflight_facts(
         state,
         &instance,
@@ -194,6 +208,8 @@ async fn prepare_launch_session_with_auth_refresh(
         payload.min_memory_mb,
     )
     .await;
+    let preflight_elapsed = preflight_started_at.elapsed();
+    let repair_started_at = Instant::now();
     preflight = maybe_repair_managed_runtime_before_launch(
         state,
         preflight,
@@ -204,7 +220,25 @@ async fn prepare_launch_session_with_auth_refresh(
         payload.min_memory_mb,
     )
     .await;
+    let repair_elapsed = repair_started_at.elapsed();
     if guardian_preflight_blocks_launch(&preflight.guardian_outcome) {
+        trace_launch_session(
+            LaunchSessionTiming {
+                route: "/api/v1/launch",
+                session_id: None,
+                instance_id: &instance.id,
+                version_id: &instance.version_id,
+                total: started_at.elapsed(),
+                layout: layout_elapsed,
+                auth: auth_elapsed,
+                preflight: preflight_elapsed,
+                runtime_repair: repair_elapsed,
+                insert: None,
+                readiness_launchable: preflight.readiness.launchable,
+                guardian_decision: preflight.guardian_outcome.user_outcome.decision,
+            },
+            "launch session blocked by preflight timing",
+        );
         return Err(launch_preflight_guardian_error_response(
             preflight.readiness,
             preflight.guardian_summary,
@@ -248,6 +282,7 @@ async fn prepare_launch_session_with_auth_refresh(
         performance_mode: policy::selected_performance_mode(&instance, &config),
     };
 
+    let insert_started_at = Instant::now();
     state
         .sessions()
         .insert(LaunchSessionRecord {
@@ -273,12 +308,30 @@ async fn prepare_launch_session_with_auth_refresh(
             stages: Vec::new(),
         })
         .await;
+    let insert_elapsed = insert_started_at.elapsed();
     trace_launch_event(
         &session_id.0,
         &format!(
             "launch requested for instance {} version {} client_started_at_ms={:?}",
             instance.id, instance.version_id, payload.client_started_at_ms
         ),
+    );
+    trace_launch_session(
+        LaunchSessionTiming {
+            route: "/api/v1/launch",
+            session_id: Some(&session_id.0),
+            instance_id: &instance.id,
+            version_id: &instance.version_id,
+            total: started_at.elapsed(),
+            layout: layout_elapsed,
+            auth: auth_elapsed,
+            preflight: preflight_elapsed,
+            runtime_repair: repair_elapsed,
+            insert: Some(insert_elapsed),
+            readiness_launchable: preflight.readiness.launchable,
+            guardian_decision: preflight.guardian_outcome.user_outcome.decision,
+        },
+        "launch session preparation timing",
     );
 
     Ok(PreparedLaunch {
@@ -333,6 +386,7 @@ pub async fn prepare_launch_preflight(
     state: &AppState,
     instance_id: String,
 ) -> Result<LaunchPreflightResponse, (StatusCode, Json<serde_json::Value>)> {
+    let started_at = Instant::now();
     let library_dir = state.library_dir().ok_or_else(|| {
         (
             StatusCode::PRECONDITION_FAILED,
@@ -360,6 +414,16 @@ pub async fn prepare_launch_preflight(
     )
     .await;
 
+    trace_launch_preflight_response(LaunchPreflightResponseTiming {
+        instance_id: &instance.id,
+        version_id: &instance.version_id,
+        total: started_at.elapsed(),
+        readiness_launchable: facts.readiness.launchable,
+        guardian_decision: facts.guardian_outcome.user_outcome.decision,
+        reason_count: facts.readiness.reasons.len(),
+        fact_count: facts.guardian_facts.len(),
+    });
+
     Ok(facts.into_response())
 }
 
@@ -372,9 +436,16 @@ async fn build_launch_preflight_facts(
     requested_max_memory_mb: Option<i32>,
     requested_min_memory_mb: Option<i32>,
 ) -> LaunchPreflightFacts {
+    let started_at = Instant::now();
     // Preflight is read-only: no session creation, installs, or raw path exposure.
+    let memory_started_at = Instant::now();
     let memory_evidence = capture_launch_memory_evidence();
-    let version_records = scan_versions(library_dir).unwrap_or_default();
+    let memory_elapsed = memory_started_at.elapsed();
+    let scan_started_at = Instant::now();
+    let installed_versions = scan_installed_versions(library_dir);
+    let scan_elapsed = scan_started_at.elapsed();
+    let version_scan_degraded = installed_versions.is_degraded();
+    let version_records = installed_versions.versions;
     let version_record = version_records
         .iter()
         .find(|version| version.id == instance.version_id);
@@ -414,6 +485,7 @@ async fn build_launch_preflight_facts(
     let requested_preset = policy::selected_jvm_preset(instance, config);
     let required_java_major = version_record
         .and_then(|version| (version.java_major > 0).then_some(version.java_major as u32));
+    let overrides_started_at = Instant::now();
     let mut execution_facts = inspect_explicit_java_override(instance, config, required_java_major)
         .into_iter()
         .flat_map(|inspection| inspection.facts)
@@ -421,6 +493,7 @@ async fn build_launch_preflight_facts(
     let jvm_args_inspection = inspect_explicit_jvm_args(&instance.extra_jvm_args);
     let mut extra_jvm_args = jvm_args_inspection.args;
     execution_facts.extend(jvm_args_inspection.facts.iter().cloned());
+    let overrides_elapsed = overrides_started_at.elapsed();
     let mut guardian_facts = execution_facts
         .iter()
         .map(|fact| guardian_fact_from_execution(fact, OperationPhase::Validating))
@@ -432,6 +505,7 @@ async fn build_launch_preflight_facts(
         raw_jvm_args_origin: policy::raw_jvm_args_origin(instance),
     };
     let performance_mode = policy::selected_performance_mode(instance, config);
+    let resources_started_at = Instant::now();
     let resource_budget = capture_resource_budget_snapshot(
         memory_evidence,
         capture_launch_disk_evidence([library_dir, game_dir]),
@@ -444,14 +518,29 @@ async fn build_launch_preflight_facts(
         },
         max_memory_mb,
     );
-    let readiness = inspect_launch_readiness(&LaunchReadinessRequest {
-        library_dir: library_dir.to_path_buf(),
-        version_id: instance.version_id.clone(),
-        requested_java: requested_java.clone(),
-        guardian_mode: guardian.mode,
-    });
+    let resources_elapsed = resources_started_at.elapsed();
+    let readiness_started_at = Instant::now();
+    let readiness = if version_scan_degraded {
+        LaunchReadiness {
+            launchable: false,
+            reasons: vec![LaunchReadinessReason {
+                id: LaunchReadinessReasonId::InstalledVersionsDegraded,
+                severity: LaunchReadinessSeverity::Blocking,
+                message: VERSION_SCAN_DEGRADED_MESSAGE,
+            }],
+        }
+    } else {
+        inspect_launch_readiness(&LaunchReadinessRequest {
+            library_dir: library_dir.to_path_buf(),
+            version_id: instance.version_id.clone(),
+            requested_java: requested_java.clone(),
+            guardian_mode: guardian.mode,
+        })
+    };
+    let readiness_elapsed = readiness_started_at.elapsed();
     let readiness_facts = readiness_guardian_facts(&readiness);
     guardian_facts.extend(readiness_facts.iter().cloned());
+    let guardian_started_at = Instant::now();
     let boundary = stage_launch_boundary(LaunchBoundaryStagingRequest::new(
         application_guardian_mode(guardian.mode),
         OperationPhase::Validating,
@@ -475,6 +564,24 @@ async fn build_launch_preflight_facts(
     );
     let guardian_summary =
         guardian_summary_from_preflight_outcome(guardian.mode, &guardian_outcome);
+    let guardian_elapsed = guardian_started_at.elapsed();
+
+    trace_launch_preflight_facts(LaunchPreflightFactTiming {
+        instance_id: &instance.id,
+        version_id: &instance.version_id,
+        total: started_at.elapsed(),
+        memory: memory_elapsed,
+        scan: scan_elapsed,
+        overrides: overrides_elapsed,
+        resources: resources_elapsed,
+        readiness: readiness_elapsed,
+        guardian: guardian_elapsed,
+        version_count: version_records.len(),
+        readiness_launchable: readiness.launchable,
+        reason_count: readiness.reasons.len(),
+        fact_count: guardian_facts.len(),
+        guardian_decision: guardian_outcome.user_outcome.decision,
+    });
 
     LaunchPreflightFacts {
         config: config.clone(),

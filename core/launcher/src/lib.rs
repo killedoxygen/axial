@@ -33,7 +33,7 @@ pub use process::{
 };
 pub use readiness::{
     LaunchReadiness, LaunchReadinessReason, LaunchReadinessReasonId, LaunchReadinessRequest,
-    LaunchReadinessSeverity, inspect_launch_readiness,
+    LaunchReadinessSeverity, inspect_launch_readiness, inspect_launch_readiness_summary,
 };
 pub use runtime::RuntimeSelection;
 pub use service::{

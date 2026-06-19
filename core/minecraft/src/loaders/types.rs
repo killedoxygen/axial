@@ -154,7 +154,7 @@ pub struct LoaderGameVersion {
     pub minecraft_meta: MinecraftVersionMeta,
     #[serde(default)]
     pub lifecycle: crate::lifecycle::LifecycleMeta,
-    #[serde(skip)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stable_hint: Option<bool>,
 }
 
@@ -260,10 +260,12 @@ pub struct CachedCatalog<T> {
     pub value: T,
 }
 
+pub const LOADER_CATALOG_SCHEMA_VERSION: u32 = 8;
+
 impl<T> CachedCatalog<T> {
     pub fn new(value: T) -> Self {
         Self {
-            schema_version: 6,
+            schema_version: LOADER_CATALOG_SCHEMA_VERSION,
             fetched_at_ms: Utc::now().timestamp_millis(),
             value,
         }
@@ -280,6 +282,7 @@ pub struct LoaderInstallPlan {
 #[serde(rename_all = "snake_case")]
 pub enum LoaderInstallFailureKind {
     CatalogUnavailable,
+    CatalogStale,
     BuildNotFound,
     ArtifactMissing,
     InvalidProfile,
@@ -302,6 +305,7 @@ impl LoaderInstallFailureKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::CatalogUnavailable => "catalog_unavailable",
+            Self::CatalogStale => "catalog_stale",
             Self::BuildNotFound => "build_not_found",
             Self::ArtifactMissing => "artifact_missing",
             Self::InvalidProfile => "invalid_profile",
@@ -359,8 +363,14 @@ pub enum LoaderError {
     InvalidComponentId,
     #[error("Croopor library is not configured")]
     MissingLibraryDir,
-    #[error("loader catalog is unavailable: {0}")]
-    CatalogUnavailable(String),
+    #[error("loader catalog is unavailable: {message}")]
+    CatalogUnavailable {
+        message: String,
+        provider_failure_kind: Option<LoaderProviderFailureKind>,
+        provider_status: Option<u16>,
+    },
+    #[error("loader catalog must be refreshed before selecting this build")]
+    CatalogStale,
     #[error("selected loader build is not available in the upstream catalog: {0}")]
     BuildNotFound(String),
     #[error("loader artifact is not available: {0}")]
@@ -384,6 +394,11 @@ pub enum LoaderError {
         facts: Vec<ExecutionDownloadFact>,
         descriptors: Vec<SelectedDownloadArtifactDescriptor>,
     },
+    #[error("loader artifact download failed")]
+    ArtifactDownloadFailed {
+        facts: Vec<ExecutionDownloadFact>,
+        descriptors: Vec<SelectedDownloadArtifactDescriptor>,
+    },
     #[error("request failed: {0}")]
     Request(#[from] reqwest::Error),
     #[error("download failed: {0}")]
@@ -399,7 +414,12 @@ pub enum LoaderError {
 impl LoaderError {
     pub fn failure_kind(&self) -> LoaderInstallFailureKind {
         match self {
-            Self::CatalogUnavailable(_) => LoaderInstallFailureKind::CatalogUnavailable,
+            Self::CatalogUnavailable {
+                provider_failure_kind: Some(kind),
+                ..
+            } => provider_install_failure_kind(*kind),
+            Self::CatalogUnavailable { .. } => LoaderInstallFailureKind::CatalogUnavailable,
+            Self::CatalogStale => LoaderInstallFailureKind::CatalogStale,
             Self::BuildNotFound(_) => LoaderInstallFailureKind::BuildNotFound,
             Self::ArtifactMissing(_) => LoaderInstallFailureKind::ArtifactMissing,
             Self::InvalidProfile(_) => LoaderInstallFailureKind::InvalidProfile,
@@ -443,6 +463,7 @@ impl LoaderError {
             },
             Self::Verify(_) => LoaderInstallFailureKind::VerifyFailed,
             Self::BaseInstallFailed { .. } => LoaderInstallFailureKind::BaseInstallFailed,
+            Self::ArtifactDownloadFailed { .. } => LoaderInstallFailureKind::DownloadFailed,
             Self::Request(_) => LoaderInstallFailureKind::RequestFailed,
             Self::Download(_) => LoaderInstallFailureKind::DownloadFailed,
             Self::Parse(_) => LoaderInstallFailureKind::ParseFailed,
@@ -457,6 +478,10 @@ impl LoaderError {
 
     pub fn provider_failure_kind(&self) -> Option<LoaderProviderFailureKind> {
         match self {
+            Self::CatalogUnavailable {
+                provider_failure_kind,
+                ..
+            } => *provider_failure_kind,
             Self::ProviderUnavailable { kind, .. } | Self::ProviderDataInvalid { kind, .. } => {
                 Some(*kind)
             }
@@ -466,6 +491,9 @@ impl LoaderError {
 
     pub fn provider_status(&self) -> Option<u16> {
         match self {
+            Self::CatalogUnavailable {
+                provider_status, ..
+            } => *provider_status,
             Self::ProviderUnavailable { status, .. } | Self::ProviderDataInvalid { status, .. } => {
                 *status
             }
@@ -475,6 +503,22 @@ impl LoaderError {
 
     pub fn safe_status_label(&self) -> &'static str {
         self.failure_kind().as_str()
+    }
+}
+
+fn provider_install_failure_kind(kind: LoaderProviderFailureKind) -> LoaderInstallFailureKind {
+    match kind {
+        LoaderProviderFailureKind::Timeout | LoaderProviderFailureKind::Network => {
+            LoaderInstallFailureKind::ProviderNetworkFailure
+        }
+        LoaderProviderFailureKind::HttpRateLimited => LoaderInstallFailureKind::ProviderRateLimited,
+        LoaderProviderFailureKind::HttpServer
+        | LoaderProviderFailureKind::HttpStatus
+        | LoaderProviderFailureKind::HttpNotFound => LoaderInstallFailureKind::ProviderHttpFailure,
+        LoaderProviderFailureKind::ResponseTooLarge => {
+            LoaderInstallFailureKind::ProviderResponseTooLarge
+        }
+        LoaderProviderFailureKind::SchemaInvalid => LoaderInstallFailureKind::ProviderSchemaInvalid,
     }
 }
 
@@ -497,5 +541,24 @@ mod tests {
             version.subject_kind,
             crate::types::VersionSubjectKind::MinecraftVersion
         );
+    }
+
+    #[test]
+    fn loader_game_version_serializes_stable_hint_for_catalog_cache() {
+        let version = LoaderGameVersion {
+            subject_kind: crate::types::VersionSubjectKind::MinecraftVersion,
+            id: "26.2".to_string(),
+            release_time: String::new(),
+            minecraft_meta: crate::version_meta::MinecraftVersionMeta::default(),
+            lifecycle: crate::lifecycle::LifecycleMeta::default(),
+            stable_hint: Some(false),
+        };
+
+        let encoded = serde_json::to_string(&version).expect("serialize loader game version");
+        assert!(encoded.contains("\"stable_hint\":false"));
+
+        let decoded: LoaderGameVersion =
+            serde_json::from_str(&encoded).expect("deserialize loader game version");
+        assert_eq!(decoded.stable_hint, Some(false));
     }
 }

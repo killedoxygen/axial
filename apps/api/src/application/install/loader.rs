@@ -1,28 +1,27 @@
 use super::{
-    BASE_INSTALL_FAILED_MESSAGE, InstallApplicationError, InstallProgressViewModel,
-    InstallStartResponse, LOADER_INSTALL_INTERRUPTED_MESSAGE, LoaderBuildsRequest,
-    LoaderInstallStartRequest, begin_install_operation_journal, generate_install_id,
-    install_operation_id, record_install_operation_guardian_evidence,
-    record_install_operation_guardian_failure_outcome,
-    record_install_operation_guardian_repair_outcome, record_install_operation_interrupted,
-    record_install_operation_progress,
+    BASE_INSTALL_FAILED_MESSAGE, INSTALL_REPAIR_RESUME_MAX_DEPTH, InstallApplicationError,
+    InstallProgressViewModel, InstallStartResponse, LOADER_INSTALL_INTERRUPTED_MESSAGE,
+    LoaderBuildsRequest, LoaderInstallStartRequest, begin_install_operation_journal,
+    generate_install_id, install_operation_id, record_install_failure_outcome_and_repair,
+    record_install_operation_interrupted, record_install_operation_progress,
     record_loader_base_install_dependency_guardian_failure_outcome,
-    record_loader_install_operation_guardian_failure_outcome,
-    repair_install_artifact_corruption_with_guardian, sanitize_install_progress,
+    record_loader_install_operation_guardian_failure_outcome, sanitize_install_progress,
     stage_install_version_command,
 };
 use crate::application::InstallVersionCommand;
 use crate::dto::loaders::{
     LoaderBuildsResponse, LoaderComponentsResponse, LoaderGameVersionsResponse,
 };
+use crate::guardian::GuardianArtifactRepairStatus;
 use crate::install_runtime::prewarm_version_runtime;
 use crate::state::{AppState, InstallStore};
 use axum::{Json, http::StatusCode};
 use croopor_minecraft::{
-    DownloadProgress, LoaderComponentId, LoaderError, fetch_builds, fetch_components,
-    fetch_supported_versions, install_build, resolve_build_record,
+    DownloadProgress, LoaderComponentId, LoaderError, LoaderProviderFailureKind, fetch_builds,
+    fetch_components, fetch_supported_versions, install_build, resolve_build_record,
 };
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 const LOADER_INSTALL_SCOPE: &str = "loader";
@@ -143,81 +142,97 @@ pub async fn start_loader_install(
                 return;
             }
 
-            let mut final_progress: Option<DownloadProgress> = None;
-            let result = install_build(&library_dir, build, |progress| {
-                if progress.done && progress.phase == "done" {
-                    final_progress = Some(progress);
-                } else {
-                    let _ = progress_tx.send(progress);
+            let final_progress = Arc::new(Mutex::new(None::<DownloadProgress>));
+            let mut repair_resume_depth = 0_u8;
+            loop {
+                if let Ok(mut final_progress) = final_progress.lock() {
+                    *final_progress = None;
                 }
-            })
-            .await;
+                let final_progress_for_install = Arc::clone(&final_progress);
+                let result = install_build(&library_dir, build.clone(), |progress| {
+                    if progress.done {
+                        if let Ok(mut final_progress) = final_progress_for_install.lock() {
+                            *final_progress = Some(progress);
+                        }
+                        return;
+                    }
+                    let _ = progress_tx.send(progress);
+                })
+                .await;
 
-            if let Err(error) = result {
-                let observed_at = chrono::Utc::now().to_rfc3339();
-                match &error {
-                    LoaderError::BaseInstallFailed { facts, descriptors } => {
-                        if facts.is_empty() {
-                            record_loader_base_install_dependency_guardian_failure_outcome(
-                                worker_journals.as_ref(),
-                                &worker_operation_id,
-                                &loader_target_id,
-                                &base_version_id,
-                            );
-                        } else {
-                            record_install_operation_guardian_evidence(
-                                worker_journals.as_ref(),
-                                &worker_operation_id,
-                                facts,
-                            );
-                            record_install_operation_guardian_failure_outcome(
-                                worker_journals.as_ref(),
-                                &worker_operation_id,
-                                facts,
-                            );
-                            let repair_client = reqwest::Client::new();
-                            if let Some(repair_outcome) =
-                                repair_install_artifact_corruption_with_guardian(
+                if let Err(error) = result {
+                    let observed_at = chrono::Utc::now().to_rfc3339();
+                    let repair_outcome = match &error {
+                        LoaderError::BaseInstallFailed { facts, descriptors } => {
+                            if facts.is_empty() {
+                                record_loader_base_install_dependency_guardian_failure_outcome(
+                                    worker_journals.as_ref(),
+                                    &worker_operation_id,
+                                    &loader_target_id,
+                                    &base_version_id,
+                                );
+                                None
+                            } else {
+                                record_install_failure_outcome_and_repair(
                                     worker_journals.as_ref(),
                                     worker_failure_memory.as_ref(),
-                                    &repair_client,
                                     &worker_operation_id,
                                     facts,
                                     descriptors,
                                     &observed_at,
                                 )
                                 .await
-                            {
-                                record_install_operation_guardian_repair_outcome(
-                                    worker_journals.as_ref(),
-                                    &worker_operation_id,
-                                    &repair_outcome,
-                                );
                             }
                         }
+                        LoaderError::ArtifactDownloadFailed { facts, descriptors } => {
+                            record_install_failure_outcome_and_repair(
+                                worker_journals.as_ref(),
+                                worker_failure_memory.as_ref(),
+                                &worker_operation_id,
+                                facts,
+                                descriptors,
+                                &observed_at,
+                            )
+                            .await
+                        }
+                        _ => {
+                            record_loader_install_operation_guardian_failure_outcome(
+                                worker_journals.as_ref(),
+                                worker_failure_memory.as_ref(),
+                                &worker_operation_id,
+                                &loader_target_id,
+                                &error,
+                                &observed_at,
+                            );
+                            None
+                        }
+                    };
+                    if repair_resume_depth < INSTALL_REPAIR_RESUME_MAX_DEPTH
+                        && repair_outcome.as_ref().is_some_and(|outcome| {
+                            outcome.status == GuardianArtifactRepairStatus::Repaired
+                        })
+                    {
+                        repair_resume_depth += 1;
+                        continue;
                     }
-                    _ => record_loader_install_operation_guardian_failure_outcome(
-                        worker_journals.as_ref(),
-                        worker_failure_memory.as_ref(),
-                        &worker_operation_id,
-                        &loader_target_id,
-                        &error,
-                        &observed_at,
-                    ),
+                    let progress = loader_error_progress(&error);
+                    let _ = progress_tx.send(progress);
+                    drop(progress_tx);
+                    let _ = store_task.await;
+                    return;
                 }
-                let progress = loader_error_progress(&error);
-                let _ = progress_tx.send(progress);
-                drop(progress_tx);
-                let _ = store_task.await;
-                return;
-            } else if prewarm_version_runtime(&library_dir, &version_id, |progress| {
+                break;
+            }
+
+            let _ = prewarm_version_runtime(&library_dir, &version_id, |progress| {
                 let _ = progress_tx.send(progress);
             })
-            .await
-            .is_err()
+            .await;
+            if let Some(progress) = final_progress
+                .lock()
+                .ok()
+                .and_then(|mut progress| progress.take())
             {
-                let _ = progress_tx.send(prewarm_runtime_error_progress());
-            } else if let Some(progress) = final_progress {
                 let _ = progress_tx.send(progress);
             } else {
                 let _ = progress_tx.send(loader_install_done_progress());
@@ -353,10 +368,24 @@ pub fn loader_error_response(error: LoaderError) -> InstallApplicationError {
         | LoaderError::InvalidBuildId
         | LoaderError::InvalidComponentId => StatusCode::BAD_REQUEST,
         LoaderError::BuildNotFound(_) => StatusCode::NOT_FOUND,
+        LoaderError::CatalogStale => StatusCode::PRECONDITION_FAILED,
         LoaderError::MissingLibraryDir => StatusCode::PRECONDITION_FAILED,
-        LoaderError::CatalogUnavailable(_)
+        LoaderError::CatalogUnavailable {
+            provider_failure_kind: Some(LoaderProviderFailureKind::HttpNotFound),
+            ..
+        }
+        | LoaderError::ProviderUnavailable {
+            kind: LoaderProviderFailureKind::HttpNotFound,
+            ..
+        }
+        | LoaderError::ProviderDataInvalid {
+            kind: LoaderProviderFailureKind::HttpNotFound,
+            ..
+        } => StatusCode::NOT_FOUND,
+        LoaderError::CatalogUnavailable { .. }
         | LoaderError::ArtifactMissing(_)
         | LoaderError::BaseInstallFailed { .. }
+        | LoaderError::ArtifactDownloadFailed { .. }
         | LoaderError::ProviderUnavailable { .. }
         | LoaderError::ProviderDataInvalid { .. } => StatusCode::BAD_GATEWAY,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -377,17 +406,6 @@ pub(crate) fn loader_error_progress(error: &LoaderError) -> DownloadProgress {
         total: 0,
         file: None,
         error: Some(public_loader_error_message(error).to_string()),
-        done: true,
-    }
-}
-
-pub(crate) fn prewarm_runtime_error_progress() -> DownloadProgress {
-    DownloadProgress {
-        phase: "error".to_string(),
-        current: 0,
-        total: 0,
-        file: None,
-        error: Some(public_runtime_error_message().to_string()),
         done: true,
     }
 }
@@ -431,8 +449,11 @@ fn public_loader_error_message(error: &LoaderError) -> &'static str {
         LoaderError::InvalidBuildId => "Invalid loader build.",
         LoaderError::InvalidComponentId => "Invalid loader component.",
         LoaderError::MissingLibraryDir => "Croopor library is not configured",
-        LoaderError::CatalogUnavailable(_) => {
+        LoaderError::CatalogUnavailable { .. } => {
             "Loader catalog is unavailable. Check your connection and try again."
+        }
+        LoaderError::CatalogStale => {
+            "Loader catalog needs a fresh provider check before this build can be installed."
         }
         LoaderError::BuildNotFound(_) => "Selected loader build is not available.",
         LoaderError::ArtifactMissing(_) => {
@@ -451,6 +472,9 @@ fn public_loader_error_message(error: &LoaderError) -> &'static str {
         LoaderError::BaseInstallFailed { .. } => {
             "Base game install failed. Retry the install from Downloads."
         }
+        LoaderError::ArtifactDownloadFailed { .. } => {
+            "Loader download failed. Check your connection and try again."
+        }
         LoaderError::Request(_) => {
             "Loader service request failed. Check your connection and try again."
         }
@@ -461,8 +485,4 @@ fn public_loader_error_message(error: &LoaderError) -> &'static str {
         }
         LoaderError::Other(_) => "Loader operation failed. Try again.",
     }
-}
-
-fn public_runtime_error_message() -> &'static str {
-    "Could not prepare the Java runtime. Check your connection and try again."
 }

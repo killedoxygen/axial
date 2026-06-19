@@ -151,6 +151,7 @@ fn first_repairable_install_artifact(
     facts
         .iter()
         .filter(|fact| repairable_install_artifact_fact_kind(fact.kind))
+        .filter(|fact| !artifact_missing_shadowed_by_terminal_failure(fact, facts))
         .filter_map(|fact| {
             let descriptor = descriptors
                 .iter()
@@ -179,5 +180,33 @@ fn repairable_install_artifact_fact_kind(kind: ExecutionDownloadFactKind) -> boo
         ExecutionDownloadFactKind::ArtifactMissing
             | ExecutionDownloadFactKind::ChecksumMismatch
             | ExecutionDownloadFactKind::SizeMismatch
+    )
+}
+
+fn artifact_missing_shadowed_by_terminal_failure(
+    fact: &ExecutionDownloadFact,
+    facts: &[ExecutionDownloadFact],
+) -> bool {
+    fact.kind == ExecutionDownloadFactKind::ArtifactMissing
+        && facts.iter().any(|candidate| {
+            candidate.kind != ExecutionDownloadFactKind::ArtifactMissing
+                && terminal_download_failure_fact_kind(candidate.kind)
+        })
+}
+
+fn terminal_download_failure_fact_kind(kind: ExecutionDownloadFactKind) -> bool {
+    matches!(
+        kind,
+        ExecutionDownloadFactKind::ChecksumMismatch
+            | ExecutionDownloadFactKind::MetadataInvalid
+            | ExecutionDownloadFactKind::MetadataMissing
+            | ExecutionDownloadFactKind::Interrupted
+            | ExecutionDownloadFactKind::NetworkFailure
+            | ExecutionDownloadFactKind::OwnershipRefused
+            | ExecutionDownloadFactKind::PermissionFailure
+            | ExecutionDownloadFactKind::PromoteFailed
+            | ExecutionDownloadFactKind::ProviderFailure
+            | ExecutionDownloadFactKind::SizeMismatch
+            | ExecutionDownloadFactKind::TempWriteFailed
     )
 }

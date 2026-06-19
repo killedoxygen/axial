@@ -31,6 +31,7 @@ use croopor_minecraft::{LoaderError, LoaderInstallFailureKind};
 use serde_json::{Value, json};
 
 const PROVIDER_FAILURE_SUPPRESSION_COOLDOWN_MINUTES: i64 = 5;
+const PROVIDER_FAILURE_MEMORY_SOURCE: &str = "install_provider";
 
 const GUARDIAN_OUTCOME_DECISION_PREFIX: &str = "guardian_outcome_decision:";
 const GUARDIAN_OUTCOME_SUMMARY_PREFIX: &str = "guardian_outcome_summary:";
@@ -203,6 +204,23 @@ pub fn record_install_operation_guardian_failure_outcome(
         journals,
         operation_id,
         &evidence,
+    );
+}
+
+pub fn record_install_operation_guardian_failure_outcome_with_memory(
+    journals: &OperationJournalStore,
+    failure_memory: &GuardianFailureMemoryStore,
+    operation_id: &OperationId,
+    facts: &[ExecutionDownloadFact],
+    observed_at: &str,
+) {
+    let evidence = install_failure_evidence_from_download_facts(operation_id, facts);
+    record_install_operation_guardian_failure_outcome_from_evidence_with_memory(
+        journals,
+        Some(failure_memory),
+        operation_id,
+        &evidence,
+        observed_at,
     );
 }
 
@@ -610,6 +628,7 @@ fn loader_error_guardian_failure_evidence(
 ) -> Option<GuardianInstallArtifactFailureEvidence> {
     let (kind, ownership) = match error.failure_kind() {
         LoaderInstallFailureKind::CatalogUnavailable
+        | LoaderInstallFailureKind::CatalogStale
         | LoaderInstallFailureKind::ProviderHttpFailure
         | LoaderInstallFailureKind::ProviderRateLimited
         | LoaderInstallFailureKind::ArtifactMissing => (
@@ -700,7 +719,7 @@ fn provider_failure_memory_entry(
         &diagnosis.id,
         target,
         mode,
-        Some("loader_provider"),
+        Some(PROVIDER_FAILURE_MEMORY_SOURCE),
     );
     let entry = memory.get(&key)?;
     if !suppression_active(&entry, observed_at) {
@@ -741,7 +760,7 @@ fn record_provider_failure_memory_if_needed(
         diagnosis.domain,
         target,
         mode,
-        Some("loader_provider"),
+        Some(PROVIDER_FAILURE_MEMORY_SOURCE),
         observed_at.to_string(),
     )
     .with_action(

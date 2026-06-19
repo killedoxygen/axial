@@ -356,7 +356,7 @@ async fn install_queue_status_authors_backend_queue_view_models() {
         )
         .await;
 
-    let response = install_queue_status(&state).await.expect("queue status");
+    let response = install_queue_state_response(&state, None, None).await;
 
     assert!(response.active.is_none());
     assert!(response.started_install.is_none());
@@ -392,6 +392,137 @@ async fn install_queue_status_authors_backend_queue_view_models() {
     assert!(response.items[0].remove_action.enabled);
     assert_eq!(response.items[1].label, "Minecraft 1.21.5");
     assert_no_public_raw_fragments(&serde_json::to_string(&response).expect("queue json"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn enqueue_prestart_failure_does_not_insert_pending_queue_item() {
+    let root = temp_root("install-queue-start-failure-retention");
+    let state = build_test_state(&root);
+
+    let error = enqueue_install(
+        &state,
+        InstallQueueRequest {
+            kind: "vanilla".to_string(),
+            version_id: "1.21.5".to_string(),
+            manifest_url: String::new(),
+            component_id: String::new(),
+            build_id: String::new(),
+        },
+    )
+    .await
+    .expect_err("missing library should fail before queue insertion");
+
+    assert_eq!(error.0, StatusCode::PRECONDITION_FAILED);
+    let snapshot = state.installs().queue_snapshot().await;
+    assert!(snapshot.active.is_none());
+    assert!(snapshot.pending.is_empty());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn install_queue_state_shows_reserved_item_while_starting() {
+    let root = temp_root("install-queue-reserved-starting");
+    let state = build_test_state(&root);
+    state
+        .installs()
+        .enqueue_queued_install(
+            "queue-starting".to_string(),
+            InstallQueueSpec::vanilla("1.21.5".to_string(), String::new()),
+            InstallQueuePlacement::Back,
+        )
+        .await;
+    let reserved = state
+        .installs()
+        .reserve_next_queued_install()
+        .await
+        .expect("active reservation");
+    assert_eq!(reserved.queue_id, "queue-starting");
+
+    let response = install_queue_state_response(&state, None, None).await;
+
+    let active = response.active.expect("starting active view");
+    assert_eq!(active.queue_id, "queue-starting");
+    assert_eq!(active.install_id, None);
+    assert_eq!(active.operation_id, None);
+    assert_eq!(active.title, "Starting install");
+    assert_eq!(active.progress.phase_id, "starting");
+    assert_eq!(response.view_model.state_id, "active");
+    assert_eq!(response.view_model.status_label, "Installing");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn queue_monitor_advances_only_after_terminal_progress_and_discards_start_failure() {
+    let root = temp_root("install-queue-monitor-terminal");
+    let state = build_test_state(&root);
+    state
+        .installs()
+        .insert_or_existing_active(
+            "active-install".to_string(),
+            "1.21.5".to_string(),
+            String::new(),
+        )
+        .await;
+    state
+        .installs()
+        .enqueue_queued_install(
+            "queue-active".to_string(),
+            InstallQueueSpec::vanilla("1.21.5".to_string(), String::new()),
+            InstallQueuePlacement::Back,
+        )
+        .await;
+    let reserved = state
+        .installs()
+        .reserve_next_queued_install()
+        .await
+        .expect("active reservation");
+    assert_eq!(reserved.queue_id, "queue-active");
+    assert!(
+        state
+            .installs()
+            .mark_queued_install_started("queue-active", "active-install".to_string())
+            .await
+    );
+    state
+        .installs()
+        .enqueue_queued_install(
+            "queue-pending".to_string(),
+            InstallQueueSpec::vanilla("1.21.6".to_string(), String::new()),
+            InstallQueuePlacement::Back,
+        )
+        .await;
+
+    spawn_install_queue_monitor(state.clone(), "active-install".to_string());
+    state
+        .installs()
+        .emit("active-install", base_progress("libraries"))
+        .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let snapshot = state.installs().queue_snapshot().await;
+    assert_eq!(
+        snapshot
+            .active
+            .as_ref()
+            .map(|active| active.queue_id.as_str()),
+        Some("queue-active")
+    );
+    assert_eq!(snapshot.pending.len(), 1);
+    assert_eq!(snapshot.pending[0].queue_id, "queue-pending");
+
+    state
+        .installs()
+        .emit("active-install", failed_progress())
+        .await;
+    wait_for_queue_empty(&state).await;
+
+    let snapshot = state.installs().queue_snapshot().await;
+    assert!(snapshot.active.is_none());
+    assert!(snapshot.pending.is_empty());
 
     let _ = fs::remove_dir_all(root);
 }
@@ -1161,9 +1292,11 @@ async fn install_status_returns_not_found_for_unknown_install() {
 
 #[test]
 fn loader_error_response_keeps_status_and_failure_kind_without_raw_details() {
-    let (status, Json(body)) = loader_error_response(LoaderError::CatalogUnavailable(
-        "GET https://loader.example.invalid/catalog.json timed out".to_string(),
-    ));
+    let (status, Json(body)) = loader_error_response(LoaderError::CatalogUnavailable {
+        message: "GET https://loader.example.invalid/catalog.json timed out".to_string(),
+        provider_failure_kind: None,
+        provider_status: None,
+    });
 
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert_eq!(body["failure_kind"], json!("catalog_unavailable"));
@@ -1185,6 +1318,31 @@ fn loader_error_response_keeps_status_and_failure_kind_without_raw_details() {
         json!("Loader provider is unavailable. Check your connection and try again.")
     );
     assert_no_public_raw_fragments(body["error"].as_str().expect("error is a string"));
+
+    let (status, Json(body)) = loader_error_response(LoaderError::ProviderUnavailable {
+        kind: LoaderProviderFailureKind::HttpNotFound,
+        status: Some(404),
+    });
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["failure_kind"], json!("provider_http_failure"));
+    assert_eq!(
+        body["error"],
+        json!("Loader provider is unavailable. Check your connection and try again.")
+    );
+
+    let (status, Json(body)) = loader_error_response(LoaderError::CatalogUnavailable {
+        message: "provider_http_failure".to_string(),
+        provider_failure_kind: Some(LoaderProviderFailureKind::HttpNotFound),
+        provider_status: Some(404),
+    });
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["failure_kind"], json!("provider_http_failure"));
+    assert_eq!(
+        body["error"],
+        json!("Loader catalog is unavailable. Check your connection and try again.")
+    );
 
     let (status, Json(body)) = loader_error_response(LoaderError::ProviderDataInvalid {
         kind: LoaderProviderFailureKind::ResponseTooLarge,
@@ -1285,22 +1443,6 @@ fn loader_error_progress_hides_raw_details_and_keeps_terminal_shape() {
     assert_eq!(
         progress.error.as_deref(),
         Some("Loader artifact is unavailable. Try another build or component.")
-    );
-    assert!(progress.done);
-    assert_no_public_raw_fragments(progress.error.as_deref().expect("error is present"));
-}
-
-#[test]
-fn prewarm_runtime_error_progress_hides_raw_runtime_error() {
-    let progress = prewarm_runtime_error_progress();
-
-    assert_eq!(progress.phase, "error");
-    assert_eq!(progress.current, 0);
-    assert_eq!(progress.total, 0);
-    assert_eq!(progress.file, None);
-    assert_eq!(
-        progress.error.as_deref(),
-        Some("Could not prepare the Java runtime. Check your connection and try again.")
     );
     assert!(progress.done);
     assert_no_public_raw_fragments(progress.error.as_deref().expect("error is present"));
@@ -1669,6 +1811,33 @@ fn install_journal_records_failure_and_interruption() {
 }
 
 #[test]
+fn install_journal_ignores_late_non_terminal_progress_after_terminal_state() {
+    let journals = OperationJournalStore::new();
+    let operation_id = install_operation_id("install-terminal-sticky");
+    begin_install_operation_journal(&journals, &operation_id, "1.21.5");
+    let mut last_phase = None;
+    record_install_operation_progress(
+        &journals,
+        &operation_id,
+        &progress("error", true, Some("sanitized failure")),
+        &mut last_phase,
+    );
+    record_install_operation_progress(
+        &journals,
+        &operation_id,
+        &progress("libraries", false, None),
+        &mut last_phase,
+    );
+
+    let entry = journals.get(&operation_id).expect("journal");
+
+    assert_eq!(entry.status, OperationStatus::Failed);
+    assert_eq!(entry.outcome, Some(OperationOutcome::Failed));
+    assert_eq!(entry.completed_steps.len(), 1);
+    assert_eq!(entry.completed_steps[0].step_id, "install_progress_error");
+}
+
+#[test]
 fn install_journal_records_guardian_evidence_from_core_download_facts() {
     let journals = OperationJournalStore::new();
     let operation_id = install_operation_id("install-guardian-evidence");
@@ -1809,6 +1978,83 @@ fn install_journal_records_guardian_download_failure_outcome_without_raw_details
     );
     assert_no_sensitive_fragments(&serde_json::to_string(&entry).expect("journal json"));
     assert_no_sensitive_fragments(&serde_json::to_string(&summary).expect("summary json"));
+}
+
+#[test]
+fn vanilla_provider_failure_records_guardian_retry_then_suppression_without_raw_details() {
+    let journals = OperationJournalStore::new();
+    let failure_memory = GuardianFailureMemoryStore::new();
+    let operation_id = install_operation_id("vanilla-provider-failure");
+    begin_install_operation_journal(&journals, &operation_id, "1.21.5");
+    let mut last_phase = None;
+    record_install_operation_progress(
+        &journals,
+        &operation_id,
+        &progress("error", true, Some("sanitized failure")),
+        &mut last_phase,
+    );
+    let facts = [ExecutionDownloadFact {
+        kind: ExecutionDownloadFactKind::ProviderFailure,
+        target: "minecraft_client_1.21.5".to_string(),
+        fields: vec![("status".to_string(), "503".to_string())],
+    }];
+
+    record_install_operation_guardian_failure_outcome_with_memory(
+        &journals,
+        &failure_memory,
+        &operation_id,
+        &facts,
+        "2026-06-16T10:00:00+00:00",
+    );
+
+    let entry = journals.get(&operation_id).expect("journal");
+    let summary = install_guardian_outcome_summary_from_journal(&entry).expect("guardian outcome");
+    assert_eq!(summary.diagnosis_id, "download_unavailable");
+    assert_eq!(summary.decision, "retry");
+    assert!(
+        summary
+            .label
+            .contains("install download failure as retryable")
+    );
+    assert_eq!(failure_memory.list().len(), 1);
+    assert_no_sensitive_fragments(&serde_json::to_string(&entry).expect("journal json"));
+
+    let suppressed_operation_id = install_operation_id("vanilla-provider-failure-again");
+    begin_install_operation_journal(&journals, &suppressed_operation_id, "1.21.5");
+    let mut suppressed_last_phase = None;
+    record_install_operation_progress(
+        &journals,
+        &suppressed_operation_id,
+        &progress("error", true, Some("sanitized failure")),
+        &mut suppressed_last_phase,
+    );
+    record_install_operation_guardian_failure_outcome_with_memory(
+        &journals,
+        &failure_memory,
+        &suppressed_operation_id,
+        &facts,
+        "2026-06-16T10:01:00+00:00",
+    );
+
+    let suppressed_entry = journals.get(&suppressed_operation_id).expect("journal");
+    let suppressed =
+        install_guardian_outcome_summary_from_journal(&suppressed_entry).expect("guardian outcome");
+    assert_eq!(suppressed.diagnosis_id, "download_unavailable");
+    assert_eq!(suppressed.decision, "block");
+    assert!(
+        suppressed
+            .label
+            .contains("paused install retry after repeated provider failure")
+    );
+    assert!(
+        suppressed
+            .guidance
+            .iter()
+            .any(|guidance| guidance.contains("Wait a few minutes"))
+    );
+    assert_eq!(failure_memory.list().len(), 1);
+    assert_no_sensitive_fragments(&serde_json::to_string(&suppressed_entry).expect("journal json"));
+    assert_no_sensitive_fragments(&serde_json::to_string(&suppressed).expect("summary json"));
 }
 
 #[test]
@@ -2034,6 +2280,79 @@ async fn install_guardian_repair_repairs_matching_checksum_failure() {
 }
 
 #[tokio::test]
+async fn install_worker_reruns_once_after_guardian_repairs_artifact() {
+    let root = temp_root("guardian-install-repair-rerun");
+    let state = build_test_state(&root);
+    let library_dir = root.join("library");
+    configure_library_dir(&state, &library_dir);
+    write_bundled_runtime_fixture(&library_dir, "java-runtime-delta");
+
+    let version_id = "repair-rerun";
+    let replacement = b"fresh client from repair".to_vec();
+    let client_server = TestByteServer::start(replacement.clone());
+    let version_body = serde_json::json!({
+        "id": version_id,
+        "type": "release",
+        "mainClass": "net.minecraft.client.main.Main",
+        "downloads": {
+            "client": {
+                "url": client_server.url,
+                "sha1": sha1_hex(&replacement),
+                "size": replacement.len()
+            }
+        },
+        "libraries": []
+    })
+    .to_string()
+    .into_bytes();
+    let version_server = TestByteServer::start(version_body);
+    let client_jar = library_dir
+        .join("versions")
+        .join(version_id)
+        .join(format!("{version_id}.jar"));
+    fs::create_dir_all(client_jar.parent().expect("client jar parent")).expect("client jar parent");
+    fs::write(&client_jar, vec![b'X'; replacement.len()]).expect("corrupt client jar");
+
+    let response = start_install_version(
+        &state,
+        InstallVersionStartRequest {
+            version_id: version_id.to_string(),
+            manifest_url: version_server.url.clone(),
+        },
+    )
+    .await
+    .expect("start install");
+    let status = wait_for_install_done(&state, &response.install_id).await;
+
+    assert!(status.done);
+    assert!(status.view_model.terminal);
+    assert!(!status.view_model.failed);
+    assert_eq!(status.view_model.phase_id, "done");
+    let repair = status
+        .guardian_repair
+        .as_ref()
+        .expect("guardian repair summary");
+    assert_eq!(repair.status, "repaired");
+    assert_eq!(
+        fs::read(&client_jar).expect("repaired client jar"),
+        replacement
+    );
+    assert_eq!(
+        client_server.request_count(),
+        1,
+        "client artifact should be downloaded by Guardian repair, then reused by the resumed install"
+    );
+    assert!(
+        version_server.request_count() >= 2,
+        "explicit version json should be fetched for the failed attempt and the resumed attempt"
+    );
+
+    client_server.stop();
+    version_server.stop();
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn install_guardian_repair_restores_missing_matching_artifact() {
     let root = temp_root("guardian-install-missing-repair");
     let destination = root.join("missing-client.jar");
@@ -2133,6 +2452,98 @@ async fn install_guardian_missing_artifact_repair_blocks_if_target_now_exists() 
             .iter()
             .any(|step| { step.step_id.contains("quarantine_launcher_managed_target") })
     );
+
+    server.stop();
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn install_guardian_repair_skips_artifact_missing_when_provider_failure_matches_target() {
+    let root = temp_root("guardian-install-mixed-provider-failure");
+    let destination = root.join("missing-client.jar");
+    let replacement = b"fresh client".to_vec();
+    let server = TestByteServer::start(replacement.clone());
+    let journals = OperationJournalStore::new();
+    let failure_memory = GuardianFailureMemoryStore::new();
+    let operation_id = install_operation_id("install-mixed-provider-failure");
+    let target_id = "minecraft_client_1.21.5_mixed";
+    let facts = vec![
+        download_fact(ExecutionDownloadFactKind::ArtifactMissing, target_id),
+        ExecutionDownloadFact {
+            kind: ExecutionDownloadFactKind::ProviderFailure,
+            target: target_id.to_string(),
+            fields: vec![("status".to_string(), "503".to_string())],
+        },
+    ];
+    let descriptors = vec![selected_descriptor(
+        SelectedDownloadArtifactKind::ClientJar,
+        target_id,
+        &destination,
+        &server.url,
+        &replacement,
+    )];
+
+    let outcome = repair_install_artifact_corruption_with_guardian(
+        &journals,
+        &failure_memory,
+        &reqwest::Client::new(),
+        &operation_id,
+        &facts,
+        &descriptors,
+        "2026-06-15T10:00:00+00:00",
+    )
+    .await;
+
+    assert!(outcome.is_none());
+    assert!(!destination.exists());
+    assert_eq!(server.request_count(), 0);
+    assert!(failure_memory.list().is_empty());
+
+    server.stop();
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn install_guardian_repair_skips_artifact_missing_when_later_terminal_failure_exists() {
+    let root = temp_root("guardian-install-mixed-metadata-failure");
+    let destination = root.join("asset-index.json");
+    let replacement = b"fresh index".to_vec();
+    let server = TestByteServer::start(replacement.clone());
+    let journals = OperationJournalStore::new();
+    let failure_memory = GuardianFailureMemoryStore::new();
+    let operation_id = install_operation_id("install-mixed-metadata-failure");
+    let facts = vec![
+        download_fact(
+            ExecutionDownloadFactKind::ArtifactMissing,
+            "minecraft_asset_index_1.18",
+        ),
+        download_fact(
+            ExecutionDownloadFactKind::MetadataInvalid,
+            "minecraft_asset_object_bad",
+        ),
+    ];
+    let descriptors = vec![selected_descriptor(
+        SelectedDownloadArtifactKind::AssetIndex,
+        "minecraft_asset_index_1.18",
+        &destination,
+        &server.url,
+        &replacement,
+    )];
+
+    let outcome = repair_install_artifact_corruption_with_guardian(
+        &journals,
+        &failure_memory,
+        &reqwest::Client::new(),
+        &operation_id,
+        &facts,
+        &descriptors,
+        "2026-06-15T10:00:00+00:00",
+    )
+    .await;
+
+    assert!(outcome.is_none());
+    assert!(!destination.exists());
+    assert_eq!(server.request_count(), 0);
 
     server.stop();
     let _ = fs::remove_dir_all(root);
@@ -2354,6 +2765,83 @@ fn selected_descriptor(
         1024,
     )
 }
+
+async fn wait_for_queue_empty(state: &AppState) {
+    for _ in 0..40 {
+        let snapshot = state.installs().queue_snapshot().await;
+        if snapshot.active.is_none() && snapshot.pending.is_empty() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    panic!(
+        "queue did not settle to empty: {:?}",
+        state.installs().queue_snapshot().await
+    );
+}
+
+async fn wait_for_install_done(state: &AppState, install_id: &str) -> InstallStatusResponse {
+    for _ in 0..120 {
+        let status = install_status(state, install_id)
+            .await
+            .expect("install status");
+        if status.done {
+            return status;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    panic!(
+        "install did not finish: {:?}",
+        install_status(state, install_id)
+            .await
+            .expect("install status")
+    );
+}
+
+fn write_bundled_runtime_fixture(library_dir: &Path, component: &str) {
+    let runtime_root = library_dir.join("runtime").join(component);
+    let java = runtime_fixture_java_path(&runtime_root);
+    fs::create_dir_all(java.parent().expect("java parent")).expect("java parent dir");
+    fs::write(&java, b"java").expect("java executable");
+    make_runtime_fixture_executable(&java);
+    if cfg!(target_os = "windows") {
+        let config = runtime_root.join("lib").join("jvm.cfg");
+        fs::create_dir_all(config.parent().expect("runtime config parent"))
+            .expect("runtime config parent");
+        fs::write(config, b"jvm").expect("runtime config");
+    }
+}
+
+fn runtime_fixture_java_path(runtime_root: &Path) -> PathBuf {
+    if cfg!(target_os = "windows") {
+        runtime_root.join("bin").join("javaw.exe")
+    } else if cfg!(target_os = "macos") {
+        runtime_root
+            .join("jre.bundle")
+            .join("Contents")
+            .join("Home")
+            .join("bin")
+            .join("java")
+    } else {
+        runtime_root.join("bin").join("java")
+    }
+}
+
+#[cfg(unix)]
+fn make_runtime_fixture_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = fs::metadata(path)
+        .expect("runtime fixture metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).expect("runtime fixture executable");
+}
+
+#[cfg(not(unix))]
+fn make_runtime_fixture_executable(_path: &Path) {}
 
 fn temp_root(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!(

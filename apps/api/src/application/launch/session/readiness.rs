@@ -43,6 +43,7 @@ pub(super) fn readiness_guardian_facts(readiness: &LaunchReadiness) -> Vec<Guard
 
 fn readiness_guardian_fact_id(reason: LaunchReadinessReasonId) -> Option<&'static str> {
     match reason {
+        LaunchReadinessReasonId::InstalledVersionsDegraded => Some("installed_versions_degraded"),
         LaunchReadinessReasonId::VersionJsonMissing => Some("version_json_missing"),
         LaunchReadinessReasonId::ParentVersionMissing => Some("parent_version_missing"),
         LaunchReadinessReasonId::IncompleteInstall => Some("incomplete_install"),
@@ -50,6 +51,9 @@ fn readiness_guardian_fact_id(reason: LaunchReadinessReasonId) -> Option<&'stati
         LaunchReadinessReasonId::ClientJarCorrupt => Some("artifact_checksum_mismatch"),
         LaunchReadinessReasonId::LibrariesMissing => Some("libraries_missing"),
         LaunchReadinessReasonId::LibrariesCorrupt => Some("artifact_checksum_mismatch"),
+        LaunchReadinessReasonId::LauncherManagedArtifactSignatureCorrupt => {
+            Some("launcher_managed_artifact_signature_corruption")
+        }
         LaunchReadinessReasonId::AssetIndexMissing => Some("asset_index_missing"),
         LaunchReadinessReasonId::AssetIndexCorrupt => Some("artifact_checksum_mismatch"),
         LaunchReadinessReasonId::ManagedRuntimeMissing => Some("managed_runtime_missing"),
@@ -59,10 +63,12 @@ fn readiness_guardian_fact_id(reason: LaunchReadinessReasonId) -> Option<&'stati
 
 fn readiness_guardian_domain(reason: LaunchReadinessReasonId) -> GuardianDomain {
     match reason {
+        LaunchReadinessReasonId::InstalledVersionsDegraded => GuardianDomain::Install,
         LaunchReadinessReasonId::ManagedRuntimeMissing
         | LaunchReadinessReasonId::JavaOverrideMissing => GuardianDomain::Runtime,
         LaunchReadinessReasonId::ClientJarCorrupt
         | LaunchReadinessReasonId::LibrariesCorrupt
+        | LaunchReadinessReasonId::LauncherManagedArtifactSignatureCorrupt
         | LaunchReadinessReasonId::AssetIndexCorrupt => GuardianDomain::Download,
         _ => GuardianDomain::Install,
     }
@@ -77,6 +83,7 @@ fn readiness_guardian_severity(severity: LaunchReadinessSeverity) -> GuardianSev
 
 fn readiness_guardian_ownership(reason: LaunchReadinessReasonId) -> OwnershipClass {
     match reason {
+        LaunchReadinessReasonId::InstalledVersionsDegraded => OwnershipClass::LauncherManaged,
         LaunchReadinessReasonId::JavaOverrideMissing => OwnershipClass::UserOwned,
         _ => OwnershipClass::LauncherManaged,
     }
@@ -84,6 +91,7 @@ fn readiness_guardian_ownership(reason: LaunchReadinessReasonId) -> OwnershipCla
 
 fn readiness_guardian_target_kind(reason: LaunchReadinessReasonId) -> TargetKind {
     match reason {
+        LaunchReadinessReasonId::InstalledVersionsDegraded => TargetKind::Version,
         LaunchReadinessReasonId::VersionJsonMissing
         | LaunchReadinessReasonId::ParentVersionMissing
         | LaunchReadinessReasonId::IncompleteInstall => TargetKind::Version,
@@ -91,6 +99,7 @@ fn readiness_guardian_target_kind(reason: LaunchReadinessReasonId) -> TargetKind
         | LaunchReadinessReasonId::ClientJarCorrupt
         | LaunchReadinessReasonId::LibrariesMissing
         | LaunchReadinessReasonId::LibrariesCorrupt
+        | LaunchReadinessReasonId::LauncherManagedArtifactSignatureCorrupt
         | LaunchReadinessReasonId::AssetIndexMissing
         | LaunchReadinessReasonId::AssetIndexCorrupt => TargetKind::Artifact,
         LaunchReadinessReasonId::ManagedRuntimeMissing => TargetKind::Runtime,
@@ -100,6 +109,7 @@ fn readiness_guardian_target_kind(reason: LaunchReadinessReasonId) -> TargetKind
 
 fn readiness_guardian_target_id(reason: LaunchReadinessReasonId) -> &'static str {
     match reason {
+        LaunchReadinessReasonId::InstalledVersionsDegraded => "installed_versions",
         LaunchReadinessReasonId::VersionJsonMissing => "version_json_missing",
         LaunchReadinessReasonId::ParentVersionMissing => "parent_version_missing",
         LaunchReadinessReasonId::IncompleteInstall => "incomplete_install",
@@ -109,6 +119,7 @@ fn readiness_guardian_target_id(reason: LaunchReadinessReasonId) -> &'static str
         LaunchReadinessReasonId::LibrariesMissing | LaunchReadinessReasonId::LibrariesCorrupt => {
             "libraries"
         }
+        LaunchReadinessReasonId::LauncherManagedArtifactSignatureCorrupt => "launcher_managed_jars",
         LaunchReadinessReasonId::AssetIndexMissing | LaunchReadinessReasonId::AssetIndexCorrupt => {
             "asset_index"
         }
@@ -119,9 +130,11 @@ fn readiness_guardian_target_id(reason: LaunchReadinessReasonId) -> &'static str
 
 fn readiness_guardian_fact_reliability(reason: LaunchReadinessReasonId) -> FactReliability {
     match reason {
+        LaunchReadinessReasonId::InstalledVersionsDegraded => FactReliability::DirectStructured,
         LaunchReadinessReasonId::IncompleteInstall => FactReliability::DirectStructured,
         LaunchReadinessReasonId::ClientJarCorrupt
         | LaunchReadinessReasonId::LibrariesCorrupt
+        | LaunchReadinessReasonId::LauncherManagedArtifactSignatureCorrupt
         | LaunchReadinessReasonId::AssetIndexCorrupt => FactReliability::ExactClassifier,
         _ => FactReliability::ExpectedMarkerAbsence,
     }

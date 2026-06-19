@@ -9,8 +9,20 @@ mod path_safety;
 mod runtime;
 mod transfer;
 
+pub use assets::{
+    asset_object_hash_prefix, repair_virtual_assets_from_index, virtual_asset_destination,
+};
 pub use install::Downloader;
-pub use libraries::download_libraries;
+pub use integrity::{LauncherManagedArtifactReadiness, verify_existing_launcher_managed_artifact};
+pub use integrity::{
+    jar_contains_signed_metadata,
+    verify_existing_launcher_managed_artifact_allowing_missing_checksum,
+};
+pub use libraries::{
+    DownloadJob, download_libraries,
+    download_libraries_allowing_missing_checksums_with_facts_and_descriptors,
+    download_libraries_with_facts_and_descriptors, library_jobs_for,
+};
 pub use model::{
     DownloadError, DownloadProgress, ExecutionDownloadError, ExecutionDownloadFact,
     ExecutionDownloadFactKind, ExecutionDownloadOwnership, ExecutionDownloadReport,

@@ -199,6 +199,7 @@ where
             session_id: intent.session_id.clone(),
             mc_dir: intent.library_dir.clone(),
             version_id: intent.version_id.clone(),
+            target_version_id: target_version_id.to_string(),
             auth: intent.auth.clone(),
             runtime: runtime.clone(),
             game_dir: intent.game_dir.clone(),
@@ -277,10 +278,10 @@ fn uses_low_impact_startup(performance_mode: &str) -> bool {
 }
 
 fn launch_auth_mode_for_context(intent: &LaunchIntent) -> &'static str {
-    if intent.auth.user_type == "msa" {
-        "online"
-    } else {
+    if intent.auth.is_offline() {
         "offline"
+    } else {
+        "online"
     }
 }
 
@@ -546,8 +547,8 @@ mod tests {
             "--uuid",
             &croopor_minecraft::offline_uuid("Player"),
         );
-        assert_arg_value(&prepared.plan.game_args, "--accessToken", "null");
-        assert_arg_value(&prepared.plan.game_args, "--userType", "legacy");
+        assert_arg_value(&prepared.plan.game_args, "--accessToken", "0");
+        assert_arg_value(&prepared.plan.game_args, "--userType", "msa");
 
         let _ = fs::remove_dir_all(root);
     }

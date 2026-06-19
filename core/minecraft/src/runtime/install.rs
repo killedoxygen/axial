@@ -5,8 +5,8 @@ use super::file_download::{
 };
 use super::layout::{java_executable, runtime_executable_ready, runtime_os_arch};
 use super::manifest::{
-    ComponentManifest, ComponentManifestFile, RUNTIME_MANIFEST_URL, RuntimeManifest,
-    fetch_runtime_json,
+    COMPONENT_MANIFEST_PROOF_FILE, ComponentManifest, ComponentManifestFile, RUNTIME_MANIFEST_URL,
+    RuntimeManifest, fetch_runtime_json,
 };
 use super::model::{JavaRuntimeLookupError, RuntimeEnsureEvent, RuntimeId};
 use std::collections::HashMap;
@@ -66,11 +66,12 @@ pub(super) async fn install_managed_runtime(
             })?;
 
         let component_manifest = fetch_runtime_json::<ComponentManifest>(&manifest_url).await?;
+        persist_component_manifest_proof(&temp_dir, &component_manifest).await?;
 
         install_runtime_manifest_files(
             component.as_str(),
             &temp_dir,
-            component_manifest.files,
+            component_manifest.files.clone(),
             observer,
         )
         .await?;
@@ -103,6 +104,17 @@ pub(super) async fn install_managed_runtime(
     }
 
     Ok(())
+}
+
+async fn persist_component_manifest_proof(
+    temp_dir: &Path,
+    component_manifest: &ComponentManifest,
+) -> Result<(), JavaRuntimeLookupError> {
+    let bytes = serde_json::to_vec_pretty(component_manifest)
+        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+    async_fs::write(temp_dir.join(COMPONENT_MANIFEST_PROOF_FILE), bytes)
+        .await
+        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))
 }
 
 #[cfg(test)]
@@ -274,8 +286,17 @@ pub(super) async fn install_runtime_manifest_file(
         return Ok(());
     }
     let Some(raw) = file.downloads.and_then(|downloads| downloads.raw) else {
-        return Ok(());
+        return Err(JavaRuntimeLookupError::Download(format!(
+            "runtime manifest file {} is missing download proof",
+            bounded_manifest_file_label(relative_path)
+        )));
     };
+    if !raw.sha1.as_deref().is_some_and(runtime_sha1_is_valid) {
+        return Err(JavaRuntimeLookupError::Download(format!(
+            "runtime manifest file {} is missing checksum proof",
+            bounded_manifest_file_label(relative_path)
+        )));
+    }
 
     if let Some(parent) = destination.parent() {
         async_fs::create_dir_all(parent)
@@ -312,4 +333,8 @@ pub(super) async fn install_runtime_manifest_file(
     }
 
     Ok(())
+}
+
+fn runtime_sha1_is_valid(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }

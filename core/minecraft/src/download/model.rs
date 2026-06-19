@@ -105,6 +105,12 @@ impl ExpectedIntegrity {
     pub fn has_evidence(&self) -> bool {
         self.size.is_some() || self.sha1.is_some()
     }
+
+    pub fn has_checksum(&self) -> bool {
+        self.sha1
+            .as_deref()
+            .is_some_and(super::integrity::is_sha1_hex)
+    }
 }
 
 fn non_empty_sha1(value: &str) -> Option<String> {

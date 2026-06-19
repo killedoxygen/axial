@@ -13,9 +13,11 @@ use super::runtime::{
     finish_runtime_pipeline_after_artifacts, recv_runtime_progress, spawn_runtime_ensure_pipeline,
 };
 use super::transfer::{
-    download_file_with_client_and_fact_sender, ensure_selected_artifact_with_client,
+    download_file_with_client_and_fact_sender,
+    download_file_with_client_and_fact_sender_allowing_missing_checksum,
+    ensure_selected_artifact_with_client,
 };
-use crate::launch::VersionJson;
+use crate::launch::{VersionJson, resolve_version};
 use crate::manifest::{ManifestEntry, fetch_version_manifest_cached};
 use crate::paths::{assets_dir, versions_dir};
 use crate::rules::default_environment;
@@ -208,15 +210,28 @@ impl Downloader {
         let should_download_version_json =
             !version_json_download.url.is_empty() && version_json_download.force_download;
         if should_download_version_json {
-            self.download_file(
-                SelectedDownloadArtifactKind::VersionJson,
-                &version_json_download.url,
-                &json_path,
-                &version_json_download.expected,
-                fact_tx,
-                descriptor_tx,
-            )
-            .await?;
+            if version_json_download.expected.sha1.is_none() {
+                download_file_with_client_and_fact_sender_allowing_missing_checksum(
+                    SelectedDownloadArtifactKind::VersionJson,
+                    &self.client,
+                    &version_json_download.url,
+                    &json_path,
+                    &version_json_download.expected,
+                    fact_tx,
+                    descriptor_tx,
+                )
+                .await?;
+            } else {
+                self.download_file(
+                    SelectedDownloadArtifactKind::VersionJson,
+                    &version_json_download.url,
+                    &json_path,
+                    &version_json_download.expected,
+                    fact_tx,
+                    descriptor_tx,
+                )
+                .await?;
+            }
         } else if !version_json_download.url.is_empty() {
             self.ensure_artifact(
                 SelectedDownloadArtifactKind::VersionJson,
@@ -229,8 +244,8 @@ impl Downloader {
             .await?;
         }
 
-        let version =
-            serde_json::from_str::<VersionJson>(&async_fs::read_to_string(&json_path).await?)?;
+        let version = resolve_version(&self.mc_dir, version_id)
+            .map_err(|error| DownloadError::ResolveManifest(error.to_string()))?;
         let mut runtime_pipeline = if version.java_version.major_version > 0 {
             send(progress(
                 "java_runtime",

@@ -103,7 +103,10 @@ fn rule_matches(rule: &Rule, env: &Environment) -> bool {
         if !os.arch.is_empty() && os.arch != env.os_arch {
             return false;
         }
-        if !os.version.is_empty() && !env.os_version.is_empty() {
+        if !os.version.is_empty() && env.os_version.is_empty() {
+            return false;
+        }
+        if !os.version.is_empty() {
             let Ok(regex) = regex::Regex::new(&os.version) else {
                 return false;
             };
@@ -125,4 +128,52 @@ fn rule_matches(rule: &Rule, env: &Environment) -> bool {
     }
 
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Environment, OsRule, Rule, evaluate_rules};
+    use std::collections::HashMap;
+
+    #[test]
+    fn os_version_rule_fails_when_actual_version_is_unknown() {
+        let env = Environment {
+            os_name: "windows".to_string(),
+            os_arch: "x86_64".to_string(),
+            os_version: String::new(),
+            features: HashMap::new(),
+        };
+        let rules = vec![Rule {
+            action: "allow".to_string(),
+            os: Some(OsRule {
+                name: "windows".to_string(),
+                arch: String::new(),
+                version: "^10\\.".to_string(),
+            }),
+            features: None,
+        }];
+
+        assert!(!evaluate_rules(&rules, &env));
+    }
+
+    #[test]
+    fn os_version_rule_matches_known_version() {
+        let env = Environment {
+            os_name: "windows".to_string(),
+            os_arch: "x86_64".to_string(),
+            os_version: "10.0.22631".to_string(),
+            features: HashMap::new(),
+        };
+        let rules = vec![Rule {
+            action: "allow".to_string(),
+            os: Some(OsRule {
+                name: "windows".to_string(),
+                arch: String::new(),
+                version: "^10\\.".to_string(),
+            }),
+            features: None,
+        }];
+
+        assert!(evaluate_rules(&rules, &env));
+    }
 }

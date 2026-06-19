@@ -2,7 +2,7 @@ use super::facts::{
     ExecutionDownloadRequest, emit_execution_download_facts, emit_selected_download_descriptor,
     execution_download_error, execution_download_fact, integrity_mismatch_fact,
     io_execution_fact_kind, metadata_facts, no_download_fact_fields,
-    selected_artifact_missing_fact, size_mismatch_fact,
+    selected_artifact_missing_fact, selected_download_target_label, size_mismatch_fact,
 };
 use super::integrity::{
     ExistingArtifactIntegrity, download_size_mismatch, existing_artifact_integrity, is_sha1_hex,
@@ -17,7 +17,7 @@ use super::path_safety::{bounded_download_file_label, safe_download_target_label
 use futures_util::StreamExt;
 use sha1::{Digest as _, Sha1};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::fs as async_fs;
 use tokio::io::AsyncWriteExt;
@@ -54,14 +54,59 @@ pub(super) async fn download_file_with_client_and_fact_sender(
     )
     .await?;
     emit_selected_download_descriptor(descriptor_tx, kind, destination, url, expected);
-    emit_selected_artifact_missing_fact_if_absent(fact_tx, destination, expected).await;
+    emit_selected_artifact_missing_fact_if_absent(fact_tx, kind, destination, expected).await;
     match download_file_with_client_report(client, url, destination, expected).await {
         Ok(report) => {
-            emit_execution_download_facts(fact_tx, &report.facts);
+            let facts = selected_execution_download_facts(kind, destination, &report.facts);
+            emit_execution_download_facts(fact_tx, &facts);
             Ok(report)
         }
         Err(error) => {
-            emit_execution_download_facts(fact_tx, &error.facts);
+            let facts = selected_execution_download_facts(kind, destination, &error.facts);
+            emit_execution_download_facts(fact_tx, &facts);
+            Err(error.into_download_error())
+        }
+    }
+}
+
+pub(super) async fn download_file_with_client_and_fact_sender_allowing_missing_checksum(
+    kind: SelectedDownloadArtifactKind,
+    client: &reqwest::Client,
+    url: &str,
+    destination: &Path,
+    expected: &ExpectedIntegrity,
+    fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
+    descriptor_tx: Option<&mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
+) -> Result<ExecutionDownloadReport, DownloadError> {
+    guard_existing_unsupported_selected_artifact(
+        kind,
+        destination,
+        url,
+        expected,
+        fact_tx,
+        descriptor_tx,
+    )
+    .await?;
+    emit_selected_download_descriptor(descriptor_tx, kind, destination, url, expected);
+    emit_selected_artifact_missing_fact_if_absent(fact_tx, kind, destination, expected).await;
+    match execute_download_to_temp(
+        client,
+        ExecutionDownloadRequest::launcher_managed_best_effort(url, destination, expected),
+    )
+    .await
+    {
+        Ok(report) => {
+            if !checksumless_artifact_is_structurally_usable(destination, expected).await? {
+                let _ = async_fs::remove_file(destination).await;
+                return Err(checksumless_artifact_structure_error(destination));
+            }
+            let facts = selected_execution_download_facts(kind, destination, &report.facts);
+            emit_execution_download_facts(fact_tx, &facts);
+            Ok(report)
+        }
+        Err(error) => {
+            let facts = selected_execution_download_facts(kind, destination, &error.facts);
+            emit_execution_download_facts(fact_tx, &facts);
             Err(error.into_download_error())
         }
     }
@@ -78,6 +123,28 @@ pub(super) async fn ensure_selected_artifact_with_client(
 ) -> Result<Option<ExecutionDownloadReport>, DownloadError> {
     match existing_artifact_integrity(destination, expected).await? {
         ExistingArtifactIntegrity::Verified => Ok(None),
+        ExistingArtifactIntegrity::MetadataInvalid => {
+            emit_selected_metadata_failure(
+                kind,
+                destination,
+                expected,
+                fact_tx,
+                ExecutionDownloadFactKind::MetadataInvalid,
+                "sha1",
+            );
+            Err(selected_artifact_metadata_error(destination, "invalid"))
+        }
+        ExistingArtifactIntegrity::MetadataMissing => {
+            emit_selected_metadata_failure(
+                kind,
+                destination,
+                expected,
+                fact_tx,
+                ExecutionDownloadFactKind::MetadataMissing,
+                "sha1",
+            );
+            Err(selected_artifact_metadata_error(destination, "missing"))
+        }
         ExistingArtifactIntegrity::Corrupt(error) => {
             emit_existing_corrupt_selected_artifact(
                 kind,
@@ -115,6 +182,128 @@ pub(super) async fn ensure_selected_artifact_with_client(
     }
 }
 
+pub(super) async fn ensure_selected_artifact_with_client_allowing_missing_checksum(
+    kind: SelectedDownloadArtifactKind,
+    client: &reqwest::Client,
+    url: &str,
+    destination: &Path,
+    expected: &ExpectedIntegrity,
+    fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
+    descriptor_tx: Option<&mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
+) -> Result<Option<ExecutionDownloadReport>, DownloadError> {
+    if expected
+        .sha1
+        .as_deref()
+        .is_some_and(|sha1| !is_sha1_hex(sha1))
+    {
+        emit_selected_metadata_failure(
+            kind,
+            destination,
+            expected,
+            fact_tx,
+            ExecutionDownloadFactKind::MetadataInvalid,
+            "sha1",
+        );
+        return Err(selected_artifact_metadata_error(destination, "invalid"));
+    }
+
+    if expected.sha1.is_some() {
+        return ensure_selected_artifact_with_client(
+            kind,
+            client,
+            url,
+            destination,
+            expected,
+            fact_tx,
+            descriptor_tx,
+        )
+        .await;
+    }
+
+    match async_fs::symlink_metadata(destination).await {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            emit_unsupported_selected_artifact(
+                kind,
+                destination,
+                url,
+                expected,
+                fact_tx,
+                descriptor_tx,
+            );
+            return Err(unsupported_selected_artifact_error(destination));
+        }
+        Ok(metadata) => {
+            if expected
+                .size
+                .is_none_or(|expected_size| metadata.len() == expected_size)
+                && checksumless_artifact_is_structurally_usable(destination, expected).await?
+            {
+                return Ok(None);
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(DownloadError::FileOperation(error)),
+    }
+
+    download_file_with_client_and_fact_sender_allowing_missing_checksum(
+        kind,
+        client,
+        url,
+        destination,
+        expected,
+        fact_tx,
+        descriptor_tx,
+    )
+    .await
+    .map(Some)
+}
+
+async fn checksumless_artifact_is_structurally_usable(
+    destination: &Path,
+    expected: &ExpectedIntegrity,
+) -> Result<bool, DownloadError> {
+    if expected.sha1.is_some() {
+        return Ok(true);
+    }
+    let metadata = match async_fs::metadata(destination).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(DownloadError::FileOperation(error)),
+    };
+    if !metadata.is_file() || metadata.len() == 0 {
+        return Ok(false);
+    }
+    if destination
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("jar"))
+    {
+        return checksumless_jar_is_readable(destination.to_path_buf()).await;
+    }
+    Ok(true)
+}
+
+async fn checksumless_jar_is_readable(destination: PathBuf) -> Result<bool, DownloadError> {
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::File::open(&destination)?;
+        let Ok(mut archive) = zip::ZipArchive::new(file) else {
+            return Ok(false);
+        };
+        for index in 0..archive.len() {
+            let Ok(entry) = archive.by_index(index) else {
+                return Ok(false);
+            };
+            if !entry.is_dir() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    })
+    .await
+    .map_err(|error| DownloadError::FileOperation(io::Error::other(error.to_string())))?
+    .map_err(DownloadError::FileOperation)
+}
+
 async fn guard_existing_unsafe_selected_artifact(
     kind: SelectedDownloadArtifactKind,
     destination: &Path,
@@ -124,6 +313,28 @@ async fn guard_existing_unsafe_selected_artifact(
     descriptor_tx: Option<&mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
 ) -> Result<(), DownloadError> {
     match existing_artifact_integrity(destination, expected).await? {
+        ExistingArtifactIntegrity::MetadataInvalid => {
+            emit_selected_metadata_failure(
+                kind,
+                destination,
+                expected,
+                fact_tx,
+                ExecutionDownloadFactKind::MetadataInvalid,
+                "sha1",
+            );
+            Err(selected_artifact_metadata_error(destination, "invalid"))
+        }
+        ExistingArtifactIntegrity::MetadataMissing => {
+            emit_selected_metadata_failure(
+                kind,
+                destination,
+                expected,
+                fact_tx,
+                ExecutionDownloadFactKind::MetadataMissing,
+                "sha1",
+            );
+            Err(selected_artifact_metadata_error(destination, "missing"))
+        }
         ExistingArtifactIntegrity::Corrupt(error) => {
             emit_existing_corrupt_selected_artifact(
                 kind,
@@ -151,6 +362,31 @@ async fn guard_existing_unsafe_selected_artifact(
     }
 }
 
+async fn guard_existing_unsupported_selected_artifact(
+    kind: SelectedDownloadArtifactKind,
+    destination: &Path,
+    url: &str,
+    expected: &ExpectedIntegrity,
+    fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
+    descriptor_tx: Option<&mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
+) -> Result<(), DownloadError> {
+    let Ok(metadata) = async_fs::symlink_metadata(destination).await else {
+        return Ok(());
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        emit_unsupported_selected_artifact(
+            kind,
+            destination,
+            url,
+            expected,
+            fact_tx,
+            descriptor_tx,
+        );
+        return Err(unsupported_selected_artifact_error(destination));
+    }
+    Ok(())
+}
+
 fn emit_existing_corrupt_selected_artifact(
     kind: SelectedDownloadArtifactKind,
     destination: &Path,
@@ -162,7 +398,7 @@ fn emit_existing_corrupt_selected_artifact(
 ) {
     emit_selected_download_descriptor(descriptor_tx, kind, destination, url, expected);
     if let Some(fact_tx) = fact_tx {
-        let target = safe_download_target_label(destination);
+        let target = selected_download_target_label(kind, destination);
         let _ = fact_tx.send(integrity_mismatch_fact(&target, error));
     }
 }
@@ -177,13 +413,36 @@ fn emit_unsupported_selected_artifact(
 ) {
     emit_selected_download_descriptor(descriptor_tx, kind, destination, url, expected);
     if let Some(fact_tx) = fact_tx {
-        let target = safe_download_target_label(destination);
+        let target = selected_download_target_label(kind, destination);
         let _ = fact_tx.send(execution_download_fact(
             ExecutionDownloadFactKind::OwnershipRefused,
             &target,
             no_download_fact_fields(),
         ));
     }
+}
+
+fn emit_selected_metadata_failure(
+    kind: SelectedDownloadArtifactKind,
+    destination: &Path,
+    expected: &ExpectedIntegrity,
+    fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
+    fact_kind: ExecutionDownloadFactKind,
+    field: &str,
+) {
+    let Some(fact_tx) = fact_tx else {
+        return;
+    };
+    let target = selected_download_target_label(kind, destination);
+    let mut facts = metadata_facts(expected, &target);
+    if !facts.iter().any(|fact| fact.kind == fact_kind) {
+        facts.push(execution_download_fact(
+            fact_kind,
+            &target,
+            vec![("field", field)],
+        ));
+    }
+    emit_execution_download_facts(Some(fact_tx), &facts);
 }
 
 fn unsupported_selected_artifact_error(destination: &Path) -> DownloadError {
@@ -193,8 +452,23 @@ fn unsupported_selected_artifact_error(destination: &Path) -> DownloadError {
     ))
 }
 
+fn selected_artifact_metadata_error(destination: &Path, status: &str) -> DownloadError {
+    DownloadError::Integrity(format!(
+        "{} integrity metadata is {status}",
+        bounded_download_file_label(destination)
+    ))
+}
+
+fn checksumless_artifact_structure_error(destination: &Path) -> DownloadError {
+    DownloadError::Integrity(format!(
+        "{} could not be validated as a usable checksumless artifact",
+        bounded_download_file_label(destination)
+    ))
+}
+
 async fn emit_selected_artifact_missing_fact_if_absent(
     fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
+    kind: SelectedDownloadArtifactKind,
     destination: &Path,
     expected: &ExpectedIntegrity,
 ) {
@@ -204,10 +478,26 @@ async fn emit_selected_artifact_missing_fact_if_absent(
     if !matches!(async_fs::try_exists(destination).await, Ok(false)) {
         return;
     }
-    let Some(fact) = selected_artifact_missing_fact(destination, expected) else {
+    let Some(fact) = selected_artifact_missing_fact(kind, destination, expected) else {
         return;
     };
     let _ = fact_tx.send(fact);
+}
+
+fn selected_execution_download_facts(
+    kind: SelectedDownloadArtifactKind,
+    destination: &Path,
+    facts: &[ExecutionDownloadFact],
+) -> Vec<ExecutionDownloadFact> {
+    let target = selected_download_target_label(kind, destination);
+    facts
+        .iter()
+        .cloned()
+        .map(|mut fact| {
+            fact.target = target.clone();
+            fact
+        })
+        .collect()
 }
 
 pub async fn download_file_with_client_report(
@@ -414,6 +704,21 @@ pub(super) async fn execute_download_to_temp(
             facts,
             DownloadError::Integrity(format!(
                 "{} integrity metadata is invalid",
+                bounded_download_file_label(request.destination)
+            )),
+        ));
+    }
+    if request.require_checksum && request.expected.sha1.is_none() {
+        facts.push(execution_download_fact(
+            ExecutionDownloadFactKind::MetadataMissing,
+            &target,
+            vec![("field", "sha1")],
+        ));
+        return Err(execution_download_error(
+            ExecutionDownloadFactKind::MetadataMissing,
+            facts,
+            DownloadError::Integrity(format!(
+                "{} integrity metadata is missing",
                 bounded_download_file_label(request.destination)
             )),
         ));
@@ -732,14 +1037,26 @@ pub(crate) async fn promote_launcher_managed_artifact_temp_once(
     temp_path: &Path,
     destination: &Path,
 ) -> io::Result<()> {
-    match async_fs::rename(temp_path, destination).await {
-        Ok(()) => return Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(error),
-        Err(_) => {}
+    match async_fs::symlink_metadata(destination).await {
+        Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
+            let backup_path = promotion_backup_path(destination);
+            async_fs::rename(destination, &backup_path).await?;
+            match async_fs::rename(temp_path, destination).await {
+                Ok(()) => {
+                    let _ = async_fs::remove_file(&backup_path).await;
+                    Ok(())
+                }
+                Err(error) => {
+                    let restore_result = async_fs::rename(&backup_path, destination).await;
+                    if let Err(restore_error) = restore_result {
+                        return Err(restore_error);
+                    }
+                    Err(error)
+                }
+            }
+        }
+        Ok(_) | Err(_) => async_fs::rename(temp_path, destination).await,
     }
-
-    remove_existing_download_destination(destination).await;
-    async_fs::rename(temp_path, destination).await
 }
 
 pub(super) async fn remove_stale_download_temp(temp_path: &Path) -> Result<(), DownloadError> {
@@ -758,12 +1075,14 @@ pub(super) async fn remove_stale_download_temp(temp_path: &Path) -> Result<(), D
     result.map_err(DownloadError::FileOperation)
 }
 
-async fn remove_existing_download_destination(destination: &Path) {
-    let Ok(metadata) = async_fs::symlink_metadata(destination).await else {
-        return;
-    };
-    let file_type = metadata.file_type();
-    if metadata.is_file() || file_type.is_symlink() {
-        let _ = async_fs::remove_file(destination).await;
+fn promotion_backup_path(destination: &Path) -> std::path::PathBuf {
+    let mut extension = destination
+        .extension()
+        .map(|extension| extension.to_os_string())
+        .unwrap_or_default();
+    if !extension.is_empty() {
+        extension.push(".");
     }
+    extension.push(format!("croopor-backup-{}", std::process::id()));
+    destination.with_extension(extension)
 }

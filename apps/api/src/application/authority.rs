@@ -1152,8 +1152,8 @@ mod tests {
             "apps/api/src/routes/install.rs",
             &install_route_production,
             &[
-                "start_install_version(",
-                "InstallVersionStartRequest",
+                "enqueue_install(",
+                "InstallQueueRequest",
                 "install_status(",
                 "install_events_stream(",
             ],
@@ -1162,8 +1162,8 @@ mod tests {
             "apps/api/src/routes/loaders.rs",
             &loader_route_production,
             &[
-                "start_loader_install(",
-                "LoaderInstallStartRequest",
+                "enqueue_install(",
+                "InstallQueueRequest",
                 "loader_components(",
                 "loader_builds(",
                 "loader_game_versions(",
@@ -1714,14 +1714,13 @@ mod tests {
             "apps/api/src/application/version.rs",
             &application_version,
             &[
-                "scan_versions(",
+                "scan_installed_versions(",
                 "fetch_version_manifest_cached(",
                 "analyze_minecraft_version(",
                 "fs::remove_dir_all(",
                 "open_path(",
                 "VERSION_DELETE_ERROR_MESSAGE",
                 "catalog_fetch_error_response(",
-                "scan_versions_error_response(",
             ],
         );
         assert_absent_all(
@@ -1961,7 +1960,7 @@ mod tests {
                     },
                     LocalTestProof {
                         file: "apps/api/src/application/launch/session/tests/overrides.rs",
-                        test_name: "launch_preflight_blank_explicit_java_override_exposes_guardian_fact",
+                        test_name: "launch_preflight_blank_instance_java_override_uses_global_override",
                     },
                     LocalTestProof {
                         file: "apps/api/src/application/launch/session/tests/overrides.rs",
@@ -2078,7 +2077,7 @@ mod tests {
                 owner: "Application launch + Guardian preflight",
                 proofs: &[LocalTestProof {
                     file: "apps/api/src/application/launch/session/tests/readiness.rs",
-                    test_name: "launch_preflight_readiness_reports_missing_libraries_as_guardian_fact",
+                    test_name: "launch_preflight_readiness_reports_missing_library_metadata_as_corrupt_guardian_fact",
                 }],
             },
             FailureScenarioProof {

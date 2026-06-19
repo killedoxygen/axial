@@ -569,6 +569,7 @@ mod tests {
         GuardianFailureMemoryStore,
     };
     use croopor_config::AppPaths;
+    use sha1::{Digest, Sha1};
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -578,6 +579,7 @@ mod tests {
         let paths = test_paths(&root);
         let runtime_root = managed_runtime_root(&paths, "java_runtime_delta");
         let java_executable = write_fake_java(&runtime_root);
+        write_runtime_manifest_proof(&runtime_root, &java_executable);
         let stores = stores();
         let decision = repair_decision(OwnershipClass::LauncherManaged);
 
@@ -837,6 +839,7 @@ mod tests {
         let paths = test_paths(&root);
         let runtime_root = managed_runtime_root(&paths, "java_runtime_delta");
         let java_executable = write_fake_java(&runtime_root);
+        write_runtime_manifest_proof(&runtime_root, &java_executable);
         let stores = stores();
         let decision = repair_decision(OwnershipClass::LauncherManaged);
         let target = decision_target(&decision);
@@ -888,6 +891,7 @@ mod tests {
         let paths = test_paths(&root);
         let runtime_root = managed_runtime_root(&paths, "java_runtime_delta");
         let java_executable = write_fake_java(&runtime_root);
+        write_runtime_manifest_proof(&runtime_root, &java_executable);
         let stores = stores();
         let decision = repair_decision(OwnershipClass::LauncherManaged);
         let target = decision_target(&decision);
@@ -953,19 +957,14 @@ mod tests {
         );
 
         assert_eq!(outcome.status, GuardianRepairStatus::Failed);
-        assert!(runtime_root.join(".croopor-ready").is_file());
+        assert!(!runtime_root.join(".croopor-ready").exists());
         assert!(
-            outcome
+            !outcome
                 .facts
                 .iter()
                 .any(|fact| fact == "RuntimeRepairApplied")
         );
-        assert!(
-            outcome
-                .facts
-                .iter()
-                .any(|fact| fact == "RuntimeMissingExecutable")
-        );
+        assert!(outcome.facts.iter().any(|fact| fact == "RuntimeCorrupt"));
         let journal = stores
             .journals
             .get(&outcome.operation_id)
@@ -981,6 +980,7 @@ mod tests {
         let paths = test_paths(&root);
         let runtime_root = managed_runtime_root(&paths, "java_runtime_delta");
         let java_executable = write_fake_java(&runtime_root);
+        write_runtime_manifest_proof(&runtime_root, &java_executable);
         let stores = stores();
         let mut decision = repair_decision(OwnershipClass::LauncherManaged);
         decision.operation_id = Some(OperationId::new("/home/alice/token/operation"));
@@ -1176,6 +1176,37 @@ mod tests {
         fs::write(&java_path, b"java").expect("fake java");
         make_executable(&java_path);
         java_path
+    }
+
+    fn write_runtime_manifest_proof(runtime_root: &Path, java_path: &Path) {
+        let bytes = fs::read(java_path).expect("read fake java");
+        let relative_path = java_path
+            .strip_prefix(runtime_root)
+            .expect("java under runtime root")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let mut hasher = Sha1::new();
+        hasher.update(&bytes);
+        let sha1 = format!("{:x}", hasher.finalize());
+        let manifest = serde_json::json!({
+            "files": {
+                relative_path: {
+                    "type": "file",
+                    "downloads": {
+                        "raw": {
+                            "url": "https://example.invalid/java",
+                            "sha1": sha1,
+                            "size": bytes.len()
+                        }
+                    }
+                }
+            }
+        });
+        fs::write(
+            runtime_root.join(".croopor-runtime-manifest.json"),
+            serde_json::to_vec(&manifest).expect("manifest json"),
+        )
+        .expect("runtime manifest proof");
     }
 
     #[cfg(unix)]

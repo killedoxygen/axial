@@ -113,11 +113,11 @@ fn parse_old_channel(base_id: &str) -> Option<VersionShape> {
 
 fn parse_release_stage(base_id: &str) -> Option<VersionShape> {
     let tokens = tokenize_version_id(base_id);
-    let dash_index = tokens
+    let separator_index = tokens
         .iter()
-        .position(|token| matches!(token.kind, TokenKind::Separator('-')))?;
-    let release = reconstruct_release(&tokens[..dash_index])?;
-    let stage = parse_stage_marker(&tokens[dash_index + 1..])?;
+        .position(|token| matches!(token.kind, TokenKind::Separator('-' | '_')))?;
+    let release = reconstruct_release(&tokens[..separator_index])?;
+    let stage = parse_stage_marker(&tokens[separator_index + 1..])?;
     match stage.kind {
         StageKind::PreRelease => Some(VersionShape::PreRelease {
             release,

@@ -56,6 +56,12 @@ Minecraft-version records expose:
 
 `minecraft_meta` does not own maturity anymore. `lifecycle` does.
 
+Installed-version scans also carry a backend-authored scan state alongside the version rows. The state distinguishes `ready`, `empty`, and `degraded`: a missing `versions/` directory is a fresh empty library, while unreadable directories, missing/malformed version JSON outside an `.incomplete` install marker, or malformed loader metadata degrade the scan. `/api/v1/versions`, `/api/v1/instances`, create-view rows, and create queue checks consume that same scan result instead of treating scan errors as an empty installed-version list.
+
+Installed loader versions are classified by their Minecraft target, not by the composite local version id. Scans and enrichment use `inherits_from` or backend-authored loader metadata such as `minecraft_version` as the analysis id, so entries like `fabric-loader-0.16.14-1.21.5`, `1.19-forge-41.1.0`, and `neoforge-26.1.0.19-beta` inherit Minecraft display, lifecycle, and ordering metadata from `1.21.5`, `1.19`, and `26.1` respectively.
+
+Loader-supported Minecraft-version rows can also carry provider stability hints. Some providers use this as Minecraft-version stability, such as Fabric and Quilt marking snapshot/prerelease game rows; those hints affect lifecycle display but do not by themselves mean loader builds are beta-only. Providers that derive the hint from build availability, currently Forge and NeoForge, may use a negative hint to indicate only unstable loader builds exist for that Minecraft target, so create-view disables normal version-level creation and requires an exact loader build selection for deliberate beta testing. The hint is serialized as part of normalized loader catalog cache data so cached supported-version rows re-enrich to the same lifecycle as fresh provider rows.
+
 ## Pipeline
 ```mermaid
 flowchart TD
@@ -123,6 +129,10 @@ Examples:
   - `family = pre_release`
   - `lifecycle.channel = preview`
   - `lifecycle.labels = [pre_release]`
+- `1.7.10_pre4`
+  - `family = pre_release`
+  - `lifecycle.channel = preview`
+  - `lifecycle.labels = [pre_release]`
 - `1.21.11-rc3`
   - `family = release_candidate`
   - `lifecycle.channel = preview`
@@ -131,6 +141,10 @@ Examples:
   - `family = release_snapshot`
   - `lifecycle.channel = preview`
   - `lifecycle.labels = [snapshot]`
+- loader-supported `26.2` from a provider that reports only beta loader builds
+  - `family = release`
+  - `lifecycle.channel = preview`
+  - `lifecycle.labels = [beta]`
 - `b1.7.3`
   - `family = old_beta`
   - `lifecycle.channel = legacy`
@@ -139,6 +153,10 @@ Examples:
   - `family = old_alpha`
   - `lifecycle.channel = legacy`
   - `lifecycle.labels = [old_alpha]`
+- an unknown id with upstream `raw_kind = old_beta` or `old_alpha`
+  - `family` follows that raw kind
+  - `lifecycle.channel = legacy`
+  - the raw kind is not treated as a release fallback
 
 ## Effective version
 `effective_version` is the practical release target or grouping anchor.
@@ -177,6 +195,7 @@ Frontend code should:
 - use `minecraftVersionLabel()` for Minecraft-only UI labels
 - never render composite loader ids such as `quilt-loader-0.29.2-1.16.5`, `1.19-forge-41.1.0`, or `neoforge-26.1.0.19-beta` as the Minecraft version; backend metadata must provide `inherits_from` or normalized Minecraft metadata
 - installed loader versions must carry backend-authored loader metadata from `versions/<id>/.croopor-loader.json`; scanners and routes should not infer loader identity from raw version ids
+- loader create rows must use backend-authored exact build identity (`component_id`, `build_id`, target version id, Minecraft version, loader version, installability, and catalog availability); frontend code must not infer preferred builds or installed/full state from component id + Minecraft version groupings
 - use `normalizeVersionDisplay()` / `versionSearchText()` for version picker rows and filtering
 - use `lifecycle` for filtering and badges
 - avoid re-parsing vanilla-like version ids locally

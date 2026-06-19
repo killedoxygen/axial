@@ -6,6 +6,11 @@ pub(crate) use create::{
     handle_create_instance, handle_create_instance_view,
 };
 
+#[cfg(test)]
+use create::{
+    CreateSelection, preferred_loader_build, resolve_loader_create_selection_from_build_catalog,
+};
+
 pub(crate) use resources::{
     InstanceLogInfo, InstanceLogTailResponse, InstanceModInfo, InstanceResourcesResponse,
     InstanceScreenshotInfo, InstanceWorldInfo, OpenFolderQuery, RenameScreenshotRequest,
@@ -27,13 +32,29 @@ use resources::{
     validate_screenshot_name, validate_world_name,
 };
 
+use crate::application::timing::{
+    InstancesListTiming, trace_instances_list, trace_slow_instance_readiness,
+};
+use crate::application::version::{
+    InstalledVersionsScan, VERSION_SCAN_DEGRADED_MESSAGE, VersionScanViewModel,
+    scan_installed_versions,
+};
 use crate::guardian::normalize_create_jvm_preset;
 use crate::state::AppState;
 use axum::{Json, http::StatusCode};
-use croopor_config::{EnrichedInstance, InstanceStoreError};
-use croopor_minecraft::{VersionEntry, scan_versions};
+use croopor_config::{EnrichedInstance, InstanceStoreError, LaunchActionState};
+use croopor_launcher::{
+    GuardianMode, LaunchReadiness, LaunchReadinessReasonId, LaunchReadinessRequest,
+    LaunchReadinessSeverity, inspect_launch_readiness_summary,
+};
 use serde::{Deserialize, Serialize};
-use std::{io::ErrorKind, path::PathBuf};
+use std::{
+    io::ErrorKind,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
+
+const INSTANCE_READINESS_SLOW_SPAN: Duration = Duration::from_millis(25);
 
 #[derive(Clone, Copy)]
 enum InstanceWriteOperation {
@@ -99,36 +120,198 @@ fn instance_error_kind(error: &InstanceStoreError) -> Option<ErrorKind> {
 pub(crate) struct InstancesResponse {
     pub instances: Vec<EnrichedInstance>,
     pub last_instance_id: Option<String>,
+    pub scan_state: VersionScanViewModel,
 }
 
 pub(crate) async fn handle_list_instances(state: &AppState) -> InstancesResponse {
-    let versions = scan_current_versions(state);
+    let started_at = Instant::now();
+    let scan_started_at = Instant::now();
+    let scan = scan_current_versions(state);
+    let scan_elapsed = scan_started_at.elapsed();
+
+    let enrich_started_at = Instant::now();
+    let instances = enrich_instances_for_state(state, &scan);
+    let enrich_elapsed = enrich_started_at.elapsed();
+
+    trace_instances_list(InstancesListTiming {
+        total: started_at.elapsed(),
+        scan: scan_elapsed,
+        enrich: enrich_elapsed,
+        version_count: scan.versions.len(),
+        instance_count: instances.len(),
+        degraded: scan.is_degraded(),
+    });
 
     InstancesResponse {
-        instances: state.instances().enrich(&versions),
+        instances,
         last_instance_id: state.instances().last_instance_id(),
+        scan_state: scan.view_model,
     }
 }
 
-fn scan_current_versions(state: &AppState) -> Vec<VersionEntry> {
+pub(super) fn scan_current_versions(state: &AppState) -> InstalledVersionsScan {
     state
         .library_dir()
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty())
-        .and_then(|path| scan_versions(&path).ok())
-        .unwrap_or_default()
+        .map(|path| scan_installed_versions(&path))
+        .unwrap_or_else(|| InstalledVersionsScan {
+            versions: Vec::new(),
+            view_model: VersionScanViewModel {
+                state_id: "library_unconfigured".to_string(),
+                label: "Library is not configured".to_string(),
+                degraded: false,
+                detail: None,
+            },
+        })
 }
 
 fn enrich_instance_for_state(
     state: &AppState,
     instance: croopor_config::Instance,
 ) -> EnrichedInstance {
-    let versions = scan_current_versions(state);
-    let version = versions
+    let scan = scan_current_versions(state);
+    enrich_instance_for_scan(state, instance, &scan)
+}
+
+fn enrich_instances_for_state(
+    state: &AppState,
+    scan: &InstalledVersionsScan,
+) -> Vec<EnrichedInstance> {
+    state
+        .instances()
+        .list()
+        .into_iter()
+        .map(|instance| enrich_instance_for_scan(state, instance, scan))
+        .collect()
+}
+
+fn enrich_instance_for_scan(
+    state: &AppState,
+    instance: croopor_config::Instance,
+    scan: &InstalledVersionsScan,
+) -> EnrichedInstance {
+    let version = scan
+        .versions
         .iter()
         .find(|version| version.id == instance.version_id);
-    let game_dir = state.instances().game_dir(&instance.id);
-    EnrichedInstance::from_instance(instance, version, &game_dir)
+    let mut enriched = redact_runtime_overrides(
+        EnrichedInstance::from_instance_without_resource_counts(instance.clone(), version),
+    );
+    if scan.is_degraded() {
+        apply_blocked_launch_action(&mut enriched, VERSION_SCAN_DEGRADED_MESSAGE);
+        return enriched;
+    }
+
+    let Some(library_dir) = state.library_dir().map(PathBuf::from) else {
+        return enriched;
+    };
+    let config = state.config().current();
+    let readiness_started_at = Instant::now();
+    let readiness = inspect_launch_readiness_summary(&LaunchReadinessRequest {
+        library_dir,
+        requested_java: selected_java_override(&instance, &config),
+        version_id: instance.version_id.clone(),
+        guardian_mode: GuardianMode::from_config(&config.guardian_mode),
+    });
+    let readiness_elapsed = readiness_started_at.elapsed();
+    if readiness_elapsed >= INSTANCE_READINESS_SLOW_SPAN {
+        trace_slow_instance_readiness(
+            &instance.id,
+            &instance.version_id,
+            readiness_elapsed,
+            readiness.launchable,
+            readiness.reasons.len(),
+        );
+    }
+    apply_launch_readiness(&mut enriched, &readiness);
+    enriched
+}
+
+fn selected_java_override(
+    instance: &croopor_config::Instance,
+    config: &croopor_config::AppConfig,
+) -> String {
+    if !instance.java_path.trim().is_empty() {
+        instance.java_path.trim().to_string()
+    } else {
+        config.java_path_override.trim().to_string()
+    }
+}
+
+fn apply_launch_readiness(instance: &mut EnrichedInstance, readiness: &LaunchReadiness) {
+    if readiness.launchable {
+        instance.launchable = true;
+        instance.launch_action = LaunchActionState::launch_ready();
+        return;
+    }
+
+    let detail = readiness_blocking_message(readiness);
+    instance.launchable = false;
+    instance.status_detail = detail.clone();
+    if instance.needs_install.trim().is_empty() {
+        instance.needs_install = instance.version_id.clone();
+    }
+    instance.launch_action = if readiness_has_corrupt_managed_artifact(readiness) {
+        LaunchActionState::repair_required(detail)
+    } else if readiness_requires_launcher_install(readiness) {
+        LaunchActionState::install_required(detail)
+    } else if readiness_is_user_blocked(readiness) {
+        instance.needs_install.clear();
+        LaunchActionState::blocked(detail)
+    } else {
+        LaunchActionState::install_required(detail)
+    };
+}
+
+fn apply_blocked_launch_action(instance: &mut EnrichedInstance, detail: &str) {
+    instance.launchable = false;
+    instance.status_detail = detail.to_string();
+    instance.needs_install.clear();
+    instance.launch_action = LaunchActionState::blocked(detail.to_string());
+}
+
+fn readiness_blocking_message(readiness: &LaunchReadiness) -> String {
+    readiness
+        .reasons
+        .iter()
+        .find(|reason| reason.severity == LaunchReadinessSeverity::Blocking)
+        .or_else(|| readiness.reasons.first())
+        .map(|reason| reason.message.to_string())
+        .unwrap_or_else(|| "Version files are not ready.".to_string())
+}
+
+fn readiness_has_corrupt_managed_artifact(readiness: &LaunchReadiness) -> bool {
+    readiness.reasons.iter().any(|reason| {
+        matches!(
+            reason.id,
+            LaunchReadinessReasonId::ClientJarCorrupt
+                | LaunchReadinessReasonId::LibrariesCorrupt
+                | LaunchReadinessReasonId::AssetIndexCorrupt
+        )
+    })
+}
+
+fn readiness_requires_launcher_install(readiness: &LaunchReadiness) -> bool {
+    readiness.reasons.iter().any(|reason| {
+        matches!(
+            reason.id,
+            LaunchReadinessReasonId::VersionJsonMissing
+                | LaunchReadinessReasonId::ParentVersionMissing
+                | LaunchReadinessReasonId::IncompleteInstall
+                | LaunchReadinessReasonId::ClientJarMissing
+                | LaunchReadinessReasonId::LibrariesMissing
+                | LaunchReadinessReasonId::AssetIndexMissing
+                | LaunchReadinessReasonId::ManagedRuntimeMissing
+        )
+    })
+}
+
+fn readiness_is_user_blocked(readiness: &LaunchReadiness) -> bool {
+    readiness
+        .reasons
+        .iter()
+        .any(|reason| reason.id == LaunchReadinessReasonId::JavaOverrideMissing)
 }
 
 pub(crate) async fn handle_get_instance(
@@ -198,7 +381,14 @@ pub(crate) async fn handle_update_instance(
         instance.name = name;
     }
     if let Some(version_id) = patch.version_id.filter(|value| !value.trim().is_empty()) {
-        instance.version_id = version_id;
+        if version_id != instance.version_id {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "direct version changes are not supported"
+                })),
+            ));
+        }
     }
     if let Some(art_seed) = patch.art_seed {
         instance.art_seed = art_seed;
@@ -236,7 +426,7 @@ pub(crate) async fn handle_update_instance(
     state
         .instances()
         .update(instance)
-        .map(|instance| redact_runtime_overrides(enrich_instance_for_state(state, instance)))
+        .map(|instance| enrich_instance_for_state(state, instance))
         .map_err(|error| instance_write_error_response(InstanceWriteOperation::Update, error))
 }
 

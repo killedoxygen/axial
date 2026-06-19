@@ -1,17 +1,18 @@
 use super::client::asset_download_concurrency;
 #[cfg(test)]
 use super::integrity::existing_asset_object_satisfies;
+use super::integrity::hash_file;
 use super::model::{
     DownloadError, DownloadProgress, ExecutionDownloadFact, ExpectedIntegrity,
     SelectedDownloadArtifactDescriptor, SelectedDownloadArtifactKind, progress,
 };
-use super::path_safety::{bounded_provider_path_label, path_is_file};
+use super::path_safety::{bounded_download_file_label, bounded_provider_path_label, path_is_file};
 use super::transfer::ensure_selected_artifact_with_client;
 use crate::launch::AssetIndex as VersionAssetIndex;
 use crate::paths::assets_dir;
 use futures_util::StreamExt;
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tokio::fs as async_fs;
 use tokio::sync::mpsc;
@@ -19,6 +20,22 @@ use tokio::sync::mpsc;
 pub(super) struct AssetDownloadPipeline {
     task: tokio::task::JoinHandle<Result<(), DownloadError>>,
     progress_rx: mpsc::UnboundedReceiver<DownloadProgress>,
+}
+
+#[derive(Deserialize)]
+struct AssetIndex {
+    objects: HashMap<String, AssetObject>,
+    #[serde(default, rename = "virtual")]
+    virtual_flag: bool,
+    #[serde(default, rename = "map_to_resources")]
+    map_to_resources: bool,
+}
+
+#[derive(Deserialize)]
+struct AssetObject {
+    hash: String,
+    #[serde(default)]
+    size: i64,
 }
 
 pub(super) fn spawn_asset_download_pipeline(
@@ -122,24 +139,7 @@ async fn download_asset_objects_with_client<F>(
 where
     F: FnMut(DownloadProgress),
 {
-    #[derive(Deserialize)]
-    struct AssetIndex {
-        objects: std::collections::HashMap<String, AssetObject>,
-        #[serde(default, rename = "virtual")]
-        virtual_flag: bool,
-        #[serde(default, rename = "map_to_resources")]
-        map_to_resources: bool,
-    }
-
-    #[derive(Deserialize)]
-    struct AssetObject {
-        hash: String,
-        #[serde(default)]
-        size: i64,
-    }
-
-    let index =
-        serde_json::from_str::<AssetIndex>(&async_fs::read_to_string(asset_index_path).await?)?;
+    let index = read_asset_index(asset_index_path).await?;
     let objects_dir = assets_dir(mc_dir).join("objects");
     let jobs = unique_asset_object_jobs(
         &objects_dir,
@@ -202,6 +202,33 @@ where
     Ok(())
 }
 
+pub async fn repair_virtual_assets_from_index(
+    mc_dir: &Path,
+    asset_index_path: &Path,
+) -> Result<bool, DownloadError> {
+    let index = read_asset_index(asset_index_path).await?;
+    if !index.virtual_flag && !index.map_to_resources {
+        return Ok(false);
+    }
+    let objects_dir = assets_dir(mc_dir).join("objects");
+    let virtual_dir = assets_dir(mc_dir).join("virtual").join("legacy");
+    copy_virtual_assets(
+        &objects_dir,
+        &virtual_dir,
+        index
+            .objects
+            .into_iter()
+            .map(|(name, object)| (name, object.hash)),
+    )
+    .await?;
+    Ok(true)
+}
+
+async fn read_asset_index(asset_index_path: &Path) -> Result<AssetIndex, DownloadError> {
+    serde_json::from_str::<AssetIndex>(&async_fs::read_to_string(asset_index_path).await?)
+        .map_err(DownloadError::ParseVersion)
+}
+
 pub(super) async fn recv_asset_progress(
     pipeline: &mut Option<AssetDownloadPipeline>,
 ) -> Option<DownloadProgress> {
@@ -237,7 +264,7 @@ pub(super) fn unique_asset_object_jobs<'a>(
     Ok(jobs)
 }
 
-pub(super) fn asset_object_hash_prefix(hash: &str) -> Result<&str, DownloadError> {
+pub fn asset_object_hash_prefix(hash: &str) -> Result<&str, DownloadError> {
     const SHA1_HEX_LEN: usize = 40;
     if hash.len() != SHA1_HEX_LEN {
         return Err(DownloadError::Integrity(format!(
@@ -305,7 +332,13 @@ pub(super) async fn copy_virtual_asset_if_missing(
     src: &Path,
     dst: &Path,
 ) -> Result<(), DownloadError> {
-    if path_is_file(dst).await || !path_is_file(src).await {
+    if !path_is_file(src).await {
+        return Err(DownloadError::Integrity(format!(
+            "virtual asset source is missing: {}",
+            bounded_download_file_label(src)
+        )));
+    }
+    if virtual_asset_matches_source(src, dst).await? {
         return Ok(());
     }
     if let Some(parent) = dst.parent() {
@@ -315,10 +348,16 @@ pub(super) async fn copy_virtual_asset_if_missing(
     Ok(())
 }
 
-pub(super) fn virtual_asset_destination(
-    root: &Path,
-    asset_name: &str,
-) -> Result<PathBuf, DownloadError> {
+async fn virtual_asset_matches_source(src: &Path, dst: &Path) -> Result<bool, DownloadError> {
+    if !path_is_file(dst).await {
+        return Ok(false);
+    }
+    let source = hash_file(src).await?;
+    let destination = hash_file(dst).await?;
+    Ok(source.size == destination.size && source.sha1 == destination.sha1)
+}
+
+pub fn virtual_asset_destination(root: &Path, asset_name: &str) -> Result<PathBuf, DownloadError> {
     if asset_name.trim().is_empty() {
         return Err(unsafe_virtual_asset_path_error(asset_name));
     }

@@ -14,14 +14,14 @@ pub(super) fn inspect_explicit_java_override(
     config: &AppConfig,
     required_java_major: Option<u32>,
 ) -> Option<JavaOverrideInspection> {
-    if !instance.java_path.is_empty() {
+    if !instance.java_path.trim().is_empty() {
         return Some(inspect_java_override(
             "instance_java_override",
             &instance.java_path,
             required_java_major,
         ));
     }
-    if !config.java_path_override.is_empty() {
+    if !config.java_path_override.trim().is_empty() {
         return Some(inspect_java_override(
             "global_java_override",
             &config.java_path_override,

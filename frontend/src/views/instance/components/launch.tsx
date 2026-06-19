@@ -90,25 +90,36 @@ export function LaunchSplitButton({
   onOpenSettings: () => void;
   preparing: Extract<LaunchState, { status: 'preparing' }> | null;
 }): JSX.Element {
-  const progress = preparing ? { pct: preparing.pct, label: preparing.label } : installProgress;
+  const progress = preparing
+    ? { pct: preparing.pct, label: preparing.label, determinate: preparing.determinate !== false }
+    : installProgress
+      ? { ...installProgress, determinate: true }
+      : null;
   const usesInstallAction = launchAction.primary_action === 'install';
+  const blocked = launchAction.primary_action === 'blocked';
   const label = progress?.label || (installQueued ? installQueuedView?.title || 'Queued' : launchAction.label);
-  const icon = progress || installQueued ? 'clock' : usesInstallAction ? 'download' : 'play';
-  const pct = progress?.pct ?? 0;
-  const disabled = Boolean(progress) || installQueued;
+  const icon = progress || installQueued ? 'clock' : blocked ? 'alert' : usesInstallAction ? 'download' : 'play';
+  const pct = progress?.determinate ? progress.pct : 0;
+  const disabled = Boolean(progress) || installQueued || blocked;
   const primaryAction = usesInstallAction ? onInstall : onLaunch;
-  const primaryMenuItem = usesInstallAction
+  const primaryMenuItem = blocked
     ? {
-        icon: installQueued ? 'clock' : 'download',
-        label: installQueued ? installQueuedView?.title || 'Install queued' : launchAction.label,
-        onSelect: installQueued
-          ? () => {
-              const message = installQueuedView?.summary || installQueuedView?.title || '';
-              if (message) toast(message, 'info');
-            }
-          : onInstall,
+        icon: 'alert',
+        label: launchAction.disabled_reason || launchAction.label,
+        onSelect: () => toast(launchAction.disabled_reason || launchAction.label, 'error'),
       }
-    : { icon: 'play', label: 'Launch now', onSelect: onLaunch };
+    : usesInstallAction
+      ? {
+          icon: installQueued ? 'clock' : 'download',
+          label: installQueued ? installQueuedView?.title || 'Install queued' : launchAction.label,
+          onSelect: installQueued
+            ? () => {
+                const message = installQueuedView?.summary || installQueuedView?.title || '';
+                if (message) toast(message, 'info');
+              }
+            : onInstall,
+        }
+      : { icon: 'play', label: 'Launch now', onSelect: onLaunch };
   return (
     <div
       class={`cp-instance-split-launch${progress ? ' cp-instance-split-launch--preparing' : ''}`}
@@ -116,7 +127,7 @@ export function LaunchSplitButton({
       aria-label="Instance actions"
       style={{ '--cp-launch-pct': `${pct}%` } as any}
     >
-      {progress && <span class="cp-instance-split-launch-fill" aria-hidden="true" />}
+      {progress?.determinate && <span class="cp-instance-split-launch-fill" aria-hidden="true" />}
       <button
         class="cp-instance-split-launch-main"
         type="button"
@@ -155,7 +166,7 @@ export function LaunchSplitButton({
       >
         <Icon name="chevron-down" size={16} stroke={2.3} />
       </button>
-      {progress && <span class="cp-instance-launch-status">{Math.round(pct)}%</span>}
+      {progress?.determinate && <span class="cp-instance-launch-status">{Math.round(pct)}%</span>}
     </div>
   );
 }
@@ -198,6 +209,7 @@ export function InstallBarrierPane({
     installProgress?.label ||
     (installQueued ? installQueuedView?.summary || installLabel : 'Preparing install');
   const retryAction = installFailure?.viewModel.retry_action;
+  const repairAction = installFailure?.viewModel.repair_action;
   const targetLabel = installLabel || installTarget;
   const remainingSeconds = installProgress
     ? countDownRemainingSeconds(installProgress.remainingSeconds, installProgress.remainingSecondsUpdatedAt, etaNow)
@@ -248,16 +260,29 @@ export function InstallBarrierPane({
         <span>{detail}</span>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginLeft: 'auto' }}>
           {failed && (
-            <Button
-              variant="secondary"
-              size="sm"
-              icon="refresh"
-              onClick={onRetryInstall}
-              disabled={retryAction ? !retryAction.enabled : false}
-              title={retryAction?.disabled_reason || undefined}
-            >
-              {retryAction?.label || 'Retry install'}
-            </Button>
+            <>
+              {repairAction && (
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  icon="shield-check"
+                  disabled={!repairAction.enabled}
+                  title={repairAction.disabled_reason || undefined}
+                >
+                  {repairAction.label}
+                </Button>
+              )}
+              <Button
+                variant="secondary"
+                size="sm"
+                icon="refresh"
+                onClick={onRetryInstall}
+                disabled={retryAction ? !retryAction.enabled : false}
+                title={retryAction?.disabled_reason || undefined}
+              >
+                {retryAction?.label || 'Retry install'}
+              </Button>
+            </>
           )}
           <Button variant="secondary" size="sm" icon="download" onClick={() => navigate({ name: 'downloads' })}>
             Downloads

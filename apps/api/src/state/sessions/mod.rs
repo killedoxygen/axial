@@ -1808,6 +1808,7 @@ mod tests {
             if terminal_status.is_some() {
                 break;
             }
+            std::thread::sleep(std::time::Duration::from_millis(5));
             tokio::task::yield_now().await;
         }
 

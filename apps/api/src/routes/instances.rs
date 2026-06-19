@@ -18,6 +18,11 @@ use axum::{
 use croopor_config::EnrichedInstance;
 use std::collections::HashMap;
 
+#[derive(Debug, Default, serde::Deserialize)]
+struct CreateInstanceViewQuery {
+    source: Option<String>,
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route(
@@ -94,8 +99,9 @@ async fn handle_get_instance(
 
 async fn handle_create_instance_view(
     State(state): State<AppState>,
+    Query(query): Query<CreateInstanceViewQuery>,
 ) -> Json<CreateInstanceViewResponse> {
-    Json(instances::handle_create_instance_view(&state).await)
+    Json(instances::handle_create_instance_view(&state, query.source.as_deref()).await)
 }
 
 async fn handle_create_instance(

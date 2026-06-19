@@ -28,7 +28,7 @@ import { scheduleAutoUpdateCheck } from './updater';
 import { refreshInstallQueue } from './install';
 import { toast } from './toast';
 import { errMessage } from './utils';
-import { restoreRoute, showOnboardingOverlay, showSetupOverlay } from './ui-state';
+import { restoreRoute, showOnboardingOverlay } from './ui-state';
 
 async function init(): Promise<void> {
   // Theme before anything else so the first paint is tinted correctly
@@ -52,7 +52,7 @@ async function init(): Promise<void> {
     const nativeVersion = await getNativeAppVersion();
     if (nativeVersion) appVersion.value = nativeVersion;
 
-    const [configRes, systemRes, statusRes, musicStatusRes] = await Promise.all([
+    let [configRes, systemRes, statusRes, musicStatusRes] = await Promise.all([
       api('GET', '/config'),
       api('GET', '/system').catch(() => null),
       api('GET', '/status').catch(() => null),
@@ -63,19 +63,39 @@ async function init(): Promise<void> {
     devMode.value = statusRes?.dev_mode === true;
     Music.setTrackCount(musicStatusRes?.count);
 
-    // Library setup overlay opens when the backend says a library is missing
-    const setupRequired = statusRes?.setup_required === true;
+    let setupRequired = statusRes?.setup_required === true;
     if (setupRequired) {
-      showSetupOverlay.value = true;
-      versions.value = [];
-      instances.value = [];
-      lastInstanceId.value = null;
-    } else {
+      try {
+        const setupRes = await api('POST', '/setup/init', { path: '' });
+        if (setupRes?.error) throw new Error(setupRes.error);
+        configRes = {
+          ...configRes,
+          library_dir: setupRes.library_dir,
+          library_mode: setupRes.library_mode,
+        };
+        config.value = configRes;
+        statusRes = {
+          ...statusRes,
+          setup_required: false,
+          library_dir: setupRes.library_dir,
+          library_mode: setupRes.library_mode,
+        };
+        setupRequired = false;
+      } catch (err: unknown) {
+        toast(`Could not create the managed library: ${errMessage(err)}`, 'error');
+      }
+    }
+
+    if (!setupRequired) {
       const [versionsRes, instancesRes] = await Promise.all([api('GET', '/versions'), api('GET', '/instances')]);
       versions.value = versionsRes.versions || [];
       instances.value = instancesRes.instances || [];
       lastInstanceId.value = instancesRes.last_instance_id || null;
       await refreshInstallQueue({ connectActive: true });
+    } else {
+      versions.value = [];
+      instances.value = [];
+      lastInstanceId.value = null;
     }
 
     // Apply backend-persisted theme if our local default won

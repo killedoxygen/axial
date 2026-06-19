@@ -123,8 +123,8 @@ export interface InstallQueuedItemViewModel {
 
 export interface InstallQueueActiveViewModel {
   queue_id: string;
-  install_id: string;
-  operation_id: string;
+  install_id?: string | null;
+  operation_id?: string | null;
   kind: 'vanilla' | 'loader';
   title: string;
   label: string;

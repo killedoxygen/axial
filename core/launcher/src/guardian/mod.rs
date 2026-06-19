@@ -741,6 +741,9 @@ fn guidance_for_failure(class: LaunchFailureClass, context: &LaunchGuardianConte
         LaunchFailureClass::StartupStalled => {
             vec!["Launch stalled before startup. Review recent override changes first.".to_string()]
         }
+        LaunchFailureClass::LauncherManagedArtifactSignature => {
+            vec!["Repair the installed version so Croopor can replace the affected launcher-managed jars.".to_string()]
+        }
         _ => Vec::new(),
     }
 }
@@ -828,15 +831,21 @@ pub fn classify_startup_failure_text(text: &str) -> LaunchFailureClass {
     {
         return LaunchFailureClass::JavaRuntimeMismatch;
     }
+    if contains_artifact_signature_failure(&lower) {
+        return LaunchFailureClass::LauncherManagedArtifactSignature;
+    }
     if lower.contains("resolutionexception: modules")
         || lower.contains("export package")
         || lower.contains("modulelayerhandler.buildlayer")
+        || lower.contains("noclassdeffounderror")
+        || lower.contains("classnotfoundexception")
+        || lower.contains("failed to locate library:")
+        || lower.contains("unsatisfiedlinkerror")
     {
         return LaunchFailureClass::ClasspathModuleConflict;
     }
-    if lower.contains("bootstraplauncher")
-        || lower.contains("modlauncher")
-        || lower.contains("nosuchelementexception: no value present")
+    if lower.contains("nosuchelementexception: no value present")
+        || (contains_loader_bootstrap_marker(&lower) && contains_failure_context(&lower))
     {
         return LaunchFailureClass::LoaderBootstrapFailure;
     }
@@ -847,6 +856,34 @@ pub fn classify_startup_failure_text(text: &str) -> LaunchFailureClass {
         return LaunchFailureClass::AuthModeIncompatible;
     }
     LaunchFailureClass::Unknown
+}
+
+fn contains_artifact_signature_failure(text: &str) -> bool {
+    text.contains("invalid signature file digest")
+        || (text.contains("securityexception")
+            && text.contains("signer information does not match")
+            && text.contains("same package"))
+        || (text.contains("securityexception")
+            && text.contains("signature file")
+            && text.contains("digest"))
+        || (text.contains("securityexception")
+            && text.contains("manifest main attributes")
+            && text.contains("digest"))
+        || (text.contains("securityexception") && text.contains("digest error"))
+}
+
+fn contains_loader_bootstrap_marker(text: &str) -> bool {
+    text.contains("bootstraplauncher")
+        || text.contains("modlauncher")
+        || text.contains("fml loading")
+}
+
+fn contains_failure_context(text: &str) -> bool {
+    text.contains("exception")
+        || text.contains("error")
+        || text.contains("fail")
+        || text.contains("unable")
+        || text.contains("could not")
 }
 
 #[cfg(test)]
@@ -867,6 +904,10 @@ fn startup_failure_reason(observation: StartupFailureObservation) -> String {
             }
             LaunchFailureClass::ClasspathModuleConflict => {
                 "Minecraft exited before startup completed with a detected classpath or module conflict."
+                    .to_string()
+            }
+            LaunchFailureClass::LauncherManagedArtifactSignature => {
+                "Minecraft exited before startup completed with detected launcher-managed jar signature corruption."
                     .to_string()
             }
             LaunchFailureClass::AuthModeIncompatible => {
@@ -1413,6 +1454,54 @@ mod tests {
                 "java.lang.UnsupportedClassVersionError: compiled by a more recent version of the Java Runtime"
             ),
             LaunchFailureClass::JavaRuntimeMismatch
+        );
+        assert_eq!(
+            classify_startup_failure_text(
+                "Caused by: java.lang.NoClassDefFoundError: org/lwjgl/glfw/GLFW"
+            ),
+            LaunchFailureClass::ClasspathModuleConflict
+        );
+        assert_eq!(
+            classify_startup_failure_text(
+                "java.lang.UnsatisfiedLinkError: Failed to locate library: lwjgl.dll"
+            ),
+            LaunchFailureClass::ClasspathModuleConflict
+        );
+        assert_eq!(
+            classify_startup_failure_text(
+                "java.lang.SecurityException: class net.minecraft.SomeClass signer information does not match signer information of other classes in the same package"
+            ),
+            LaunchFailureClass::LauncherManagedArtifactSignature
+        );
+        assert_eq!(
+            classify_startup_failure_text(
+                "Exception in thread \"main\" java.lang.SecurityException: Invalid signature file digest for Manifest main attributes"
+            ),
+            LaunchFailureClass::LauncherManagedArtifactSignature
+        );
+        assert_eq!(
+            classify_startup_failure_text(
+                "java.lang.SecurityException: SHA-256 digest error for net/minecraft/client/Minecraft.class"
+            ),
+            LaunchFailureClass::LauncherManagedArtifactSignature
+        );
+        assert_eq!(
+            classify_startup_failure_text(
+                "[main/INFO] [cpw.mods.modlauncher.Launcher/MODLAUNCHER]: ModLauncher running"
+            ),
+            LaunchFailureClass::Unknown
+        );
+        assert_eq!(
+            classify_startup_failure_text(
+                "[EARLYDISPLAY/]: If this message is the only thing at the bottom of your log before a crash, you probably have a driver issue."
+            ),
+            LaunchFailureClass::Unknown
+        );
+        assert_eq!(
+            classify_startup_failure_text(
+                "cpw.mods.modlauncher.api.IncompatibleEnvironmentException: failed to load transformation service"
+            ),
+            LaunchFailureClass::LoaderBootstrapFailure
         );
         assert_eq!(
             classify_startup_failure_text("ordinary launcher output"),

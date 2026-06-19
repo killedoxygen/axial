@@ -11,7 +11,6 @@ import './ui/command-palette.css';
 import './ui/dialog.css';
 import './ui/toast.css';
 import './ui/player-head.css';
-import './views/setup/setup.css';
 import './views/onboarding/onboarding.css';
 import './views/settings/accent.css';
 import './views/create/create.css';

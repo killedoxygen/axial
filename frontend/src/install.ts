@@ -10,8 +10,6 @@ import {
   startNativeLoaderInstallEvents,
 } from './native';
 import {
-  selectedInstance,
-  selectedVersion,
   installState,
   installEventSource,
   catalog,
@@ -21,25 +19,24 @@ import {
   installFailure,
 } from './store';
 import {
-  startInstall,
   updateInstallProgress,
   completeInstall,
   setInstallEventSource,
   recordInstallFailure,
   clearInstallFailureForItem,
   isActiveInstallItem,
-  setInstallQueueState,
-  clearInstallFailure,
+  isSameInstallItem,
+  reconcileInstallQueueState,
+  type InstallQueueActiveState,
 } from './actions';
-import { minecraftVersionLabel } from './version-display';
+import { installItemFromQueueInstallItem, installItemFromQueuedViewModel } from './instance-install-status';
 import { toast } from './toast';
-import type { LoaderBuildRecord, LoaderComponentId } from './types-loader';
+import type { LoaderBuildRecord } from './types-loader';
 import type {
   InstallActionViewModel,
   InstallFailureViewModel,
   InstallItem,
   InstallQueueActiveViewModel,
-  InstallQueueInstallItemViewModel,
   InstallQueueNoticeViewModel,
   InstallQueueRequest,
   InstallQueueStateResponse,
@@ -67,6 +64,10 @@ type PendingInstallEventSource = CloseableSource & {
 };
 
 let connectedInstallId: string | null = null;
+const INSTALL_STREAM_SILENCE_MS = 15_000;
+const INSTALL_RECONCILE_ATTEMPTS = 4;
+const INSTALL_RECONCILE_DELAY_MS = 160;
+const reconcilingInstallIds = new Set<string>();
 
 function isActiveInstall(item: InstallItem): boolean {
   return isActiveInstallItem(item);
@@ -136,9 +137,9 @@ function installFailureViewModel(value: unknown): InstallFailureViewModel | null
   ) {
     return null;
   }
-  const retryFallback = transportFailureAction('retry', 'Retry install', true);
-  const dismissFallback = transportFailureAction('dismiss', 'Dismiss', true);
-  const repairFallback = transportFailureAction('repair', 'Automatic repair unavailable', false);
+  const retryFallback = unavailableFailureAction('retry', 'Retry unavailable');
+  const dismissFallback = dismissFailureAction();
+  const repairFallback = unavailableFailureAction('repair', 'Repair unavailable');
   return {
     state_id: candidate.state_id,
     title: candidate.title.trim() || 'Install failed',
@@ -154,16 +155,25 @@ function installFailureViewModel(value: unknown): InstallFailureViewModel | null
   };
 }
 
-function transportFailureAction(action: string, label: string, enabled: boolean): InstallActionViewModel {
+function unavailableFailureAction(action: string, label: string): InstallActionViewModel {
   return {
     action,
     label,
-    enabled,
-    disabled_reason: enabled ? null : 'No automatic repair is available for this failure.',
+    enabled: false,
+    disabled_reason: 'Action unavailable until Croopor receives backend failure details.',
   };
 }
 
-function boundedTransportFailureMessage(message: string): string {
+function dismissFailureAction(): InstallActionViewModel {
+  return {
+    action: 'dismiss',
+    label: 'Dismiss',
+    enabled: true,
+    disabled_reason: null,
+  };
+}
+
+function boundedFailureMessage(message: string): string {
   const firstUsefulLine = String(message || '')
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -175,18 +185,18 @@ function boundedTransportFailureMessage(message: string): string {
   return `${squashed.slice(0, 217).trimEnd()}...`;
 }
 
-function transportFailureViewModel(message: string): InstallFailureViewModel {
-  const summary = boundedTransportFailureMessage(message);
+function unresolvedFailureViewModel(message: string): InstallFailureViewModel {
+  const summary = boundedFailureMessage(message);
   return {
-    state_id: 'transport_failure',
+    state_id: 'failure_details_unavailable',
     title: 'Install failed',
     tone: 'err',
     summary,
     detail: null,
     details: [],
-    retry_action: transportFailureAction('retry', 'Retry install', true),
-    dismiss_action: transportFailureAction('dismiss', 'Dismiss', true),
-    repair_action: transportFailureAction('repair', 'Automatic repair unavailable', false),
+    retry_action: unavailableFailureAction('retry', 'Retry unavailable'),
+    dismiss_action: dismissFailureAction(),
+    repair_action: unavailableFailureAction('repair', 'Repair unavailable'),
   };
 }
 
@@ -218,20 +228,6 @@ async function recordBackendInstallFailure(
   return viewModel;
 }
 
-function installItemFromQueueInstallItem(value: InstallQueueInstallItemViewModel): InstallItem {
-  const versionId = value.version_id;
-  if (!value.loader) return { versionId };
-  return {
-    versionId,
-    loader: {
-      componentId: value.loader.component_id,
-      buildId: value.loader.build_id,
-      minecraftVersion: value.loader.minecraft_version,
-      loaderVersion: value.loader.loader_version,
-    },
-  };
-}
-
 function installQueueRequestFromItem(item: InstallItem): InstallQueueRequest {
   if (!item.loader) {
     return {
@@ -258,38 +254,71 @@ function showInstallQueueNotice(notice: InstallQueueNoticeViewModel | null | und
   toast(message, queueNoticeToastKind(notice));
 }
 
-function applyInstallQueueState(response: InstallQueueStateResponse, options: { showNotice?: boolean } = {}): void {
-  setInstallQueueState(response);
-  if (options.showNotice) showInstallQueueNotice(response.notice);
-}
-
 export async function refreshInstallQueue(
   options: { connectActive?: boolean; retryPendingStart?: boolean } = {},
-): Promise<void> {
+): Promise<InstallQueueStateResponse> {
+  let latestResponse: InstallQueueStateResponse | null = null;
   for (let attempt = 0; attempt < (options.retryPendingStart ? 4 : 1); attempt += 1) {
     const response = await api<InstallQueueStateResponse>('GET', '/install/queue');
-    applyInstallQueueState(response);
-    if (options.connectActive) await connectBackendActiveInstall(response.active ?? null);
-    if (!options.retryPendingStart || response.active || response.items.length === 0) return;
+    latestResponse = response;
+    await applyInstallQueueResponse(response, { connectActive: options.connectActive });
+    if (!options.retryPendingStart || response.active || response.items.length === 0) return response;
     await new Promise((resolve) => window.setTimeout(resolve, 120));
   }
+  if (latestResponse) return latestResponse;
+  throw new Error('Install queue did not return a response.');
 }
 
-async function applyInstallQueueResponse(
+function installQueueActiveState(
+  active: InstallQueueActiveViewModel | null | undefined,
+): InstallQueueActiveState | null {
+  if (!active) return null;
+  return {
+    installId: active.install_id ?? undefined,
+    operationId: active.operation_id ?? undefined,
+    item: installItemFromQueueInstallItem(active.install_item),
+    displayName: active.label,
+    pct: active.progress.progress_pct,
+    label: active.progress.label,
+    phase: active.progress.phase_id,
+    activeStep: installProgressStepViewModel(active.progress.active_step),
+  };
+}
+
+export async function applyInstallQueueResponse(
   response: InstallQueueStateResponse,
   options: { showNotice?: boolean; connectActive?: boolean } = {},
-): Promise<void> {
-  applyInstallQueueState(response, { showNotice: options.showNotice });
-  if (options.connectActive) await connectBackendActiveInstall(response.active ?? null);
+): Promise<InstallQueueStateResponse> {
+  const terminalActive = response.active?.progress.failed || response.active?.progress.terminal;
+  const activeResponse = terminalActive ? { ...response, active: null } : response;
+  reconcileInstallQueueState(activeResponse, installQueueActiveState(activeResponse.active));
+  if (!activeResponse.active) connectedInstallId = null;
+  if (options.showNotice) showInstallQueueNotice(response.notice);
+  if (terminalActive && response.active) {
+    const active = response.active;
+    if (!active.install_id) {
+      if (options.connectActive) await refreshInstallQueue({ connectActive: true, retryPendingStart: true });
+      return response;
+    }
+    const item = installItemFromQueueInstallItem(active.install_item);
+    const resolved = await reconcileInstallStatus(active.install_id, item, active.label);
+    if (!resolved) await refreshInstallQueue({ connectActive: options.connectActive, retryPendingStart: true });
+  } else if (options.connectActive) {
+    await connectBackendActiveInstall(response.active ?? null);
+  }
+  return response;
 }
 
 async function connectBackendActiveInstall(active: InstallQueueActiveViewModel | null): Promise<void> {
-  if (!active?.install_id) return;
-  if (connectedInstallId === active.install_id && installState.value.status === 'active') return;
+  if (!active?.install_id) {
+    connectedInstallId = null;
+    return;
+  }
+  if (connectedInstallId === active.install_id && installState.value.status === 'active' && installEventSource.value) {
+    return;
+  }
   const item = installItemFromQueueInstallItem(active.install_item);
   connectedInstallId = active.install_id;
-  startInstall(item, active.progress.label, active.label);
-  applyInstallProgressViewModel(active.progress);
   try {
     if (active.kind === 'loader') {
       await connectLoaderEvents(active.install_id, item, active.label);
@@ -298,9 +327,13 @@ async function connectBackendActiveInstall(active: InstallQueueActiveViewModel |
     }
   } catch (err: unknown) {
     const message = errMessage(err);
-    recordInstallFailure(item, active.label, transportFailureViewModel(message));
-    showError(`Install progress failed: ${message}`);
-    await onInstallDone();
+    connectedInstallId = null;
+    setInstallEventSource(null);
+    showError(`Install progress connection failed: ${message}`);
+    await reconcileInstallStreamIssue(active.install_id, item, active.label, {
+      reconnect: false,
+      notice: 'Install progress connection failed; refreshed backend status.',
+    });
   }
 }
 
@@ -316,6 +349,125 @@ function applyInstallProgressViewModel(viewModel: InstallProgressViewModel): voi
 
 function isActiveInstallSource(item: InstallItem, source: CloseableSource | null): boolean {
   return isActiveInstall(item) && source !== null && installEventSource.value === source;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+async function reconcileInstallStatus(installId: string, item: InstallItem, displayName: string): Promise<boolean> {
+  for (let attempt = 0; attempt < INSTALL_RECONCILE_ATTEMPTS; attempt += 1) {
+    let status: InstallStatusResponse;
+    try {
+      status = await api<InstallStatusResponse>('GET', `/install/${encodeURIComponent(installId)}/status`);
+    } catch {
+      await delay(INSTALL_RECONCILE_DELAY_MS);
+      continue;
+    }
+
+    const viewModel = installProgressViewModel(status.view_model);
+    if (!viewModel) {
+      await delay(INSTALL_RECONCILE_DELAY_MS);
+      continue;
+    }
+
+    applyInstallProgressViewModel(viewModel);
+
+    const failureViewModel = installFailureViewModel(status.failure_view_model);
+    if (viewModel.failed || failureViewModel) {
+      const failure = failureViewModel ?? unresolvedFailureViewModel(viewModel.label);
+      recordInstallFailure(item, displayName, failure);
+      showError(failure.summary);
+      await onInstallDone();
+      return true;
+    }
+
+    if (status.done || viewModel.terminal) {
+      await onInstallDone(item);
+      return true;
+    }
+
+    return false;
+  }
+
+  return false;
+}
+
+async function reconcileInstallStreamIssue(
+  installId: string,
+  item: InstallItem,
+  displayName: string,
+  options: {
+    source?: CloseableSource | null;
+    closeSource?: boolean;
+    reconnect?: boolean;
+    notice?: string;
+  } = {},
+): Promise<void> {
+  if (!isActiveInstall(item) || reconcilingInstallIds.has(installId)) return;
+  reconcilingInstallIds.add(installId);
+
+  try {
+    if (options.closeSource && options.source && installEventSource.value === options.source) {
+      connectedInstallId = null;
+      setInstallEventSource(null);
+    }
+
+    const resolved = await reconcileInstallStatus(installId, item, displayName);
+    if (resolved || !isActiveInstall(item)) return;
+
+    try {
+      await refreshInstallQueue({
+        connectActive: options.reconnect !== false,
+        retryPendingStart: true,
+      });
+    } catch (err: unknown) {
+      const prefix = options.notice || 'Install progress refresh failed.';
+      showError(`${prefix} ${errMessage(err)}`);
+    }
+  } finally {
+    reconcilingInstallIds.delete(installId);
+  }
+}
+
+type InstallStreamWatchdog = {
+  markProgress(): void;
+  stop(): void;
+};
+
+function createInstallStreamWatchdog(onSilence: () => Promise<void>): InstallStreamWatchdog {
+  let timer: number | undefined;
+  let stopped = false;
+  let reconciling = false;
+
+  const arm = (): void => {
+    if (timer !== undefined) window.clearTimeout(timer);
+    if (stopped) return;
+    timer = window.setTimeout(() => {
+      if (stopped || reconciling) {
+        arm();
+        return;
+      }
+      reconciling = true;
+      void onSilence()
+        .catch(() => {})
+        .finally(() => {
+          reconciling = false;
+          arm();
+        });
+    }, INSTALL_STREAM_SILENCE_MS);
+  };
+
+  arm();
+
+  return {
+    markProgress: arm,
+    stop(): void {
+      stopped = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+      timer = undefined;
+    },
+  };
 }
 
 function createPendingInstallEventSource(): PendingInstallEventSource {
@@ -382,55 +534,14 @@ async function connectNativeInstallEventSource(
   }
 }
 
-export function handleInstallClick(): void {
-  const inst = selectedInstance.value;
-  if (!inst) return;
-
-  const version = selectedVersion.value;
-  const target = version?.needs_install || version?.id || inst.version_id;
-  const loader = version?.loader
-    ? {
-        componentId: version.loader.component_id as LoaderComponentId,
-        buildId: version.loader.build_id,
-        minecraftVersion: minecraftVersionLabel(version, ''),
-        loaderVersion: version.loader.loader_version,
-        versionId: target,
-      }
-    : null;
-  if (loader) {
-    installLoaderVersion({
-      subject_kind: 'loader_build',
-      component_id: loader.componentId,
-      component_name: '',
-      build_id: loader.buildId,
-      minecraft_version: loader.minecraftVersion,
-      loader_version: loader.loaderVersion,
-      version_id: loader.versionId,
-      build_meta: {
-        terms: [],
-        evidence: [],
-        selection: {
-          default_rank: 0,
-          reason: 'unknown',
-          source: 'none',
-        },
-        display_tags: [],
-      },
-      strategy: '',
-      artifact_kind: '',
-      installability: '',
-    });
-    return;
-  }
-
-  installVersion(target);
+export function handleInstallClick(item: InstallItem): void {
+  void enqueueBackendInstallItem(item).catch(showInstallQueueError);
 }
 
 export function installVersion(target: string): void {
   if (!target) return;
   const item: InstallItem = { versionId: target };
-  clearInstallFailureForItem(item);
-  void enqueueBackendInstall(installQueueRequestFromItem(item));
+  void enqueueBackendInstallItem(item).catch(showInstallQueueError);
 }
 
 export function installLoaderVersion(build: LoaderBuildRecord): void {
@@ -444,17 +555,14 @@ export function installLoaderVersion(build: LoaderBuildRecord): void {
       loaderVersion: build.loader_version,
     },
   };
-  clearInstallFailureForItem(item);
-  void enqueueBackendInstall(installQueueRequestFromItem(item));
+  void enqueueBackendInstallItem(item).catch(showInstallQueueError);
 }
 
 export function retryFailedInstall(): void {
   const failure = installFailure.value;
   const retryAction = failure?.viewModel.retry_action;
   if (!failure || retryAction?.enabled === false) return;
-  void enqueueBackendInstall(installQueueRequestFromItem(failure.item), { retry: true }).then(() => {
-    clearInstallFailure();
-  });
+  void enqueueBackendInstallItem(failure.item, { retry: true }).catch(showInstallQueueError);
 }
 
 export async function removeQueuedInstall(queueId: string): Promise<void> {
@@ -467,72 +575,126 @@ export async function removeQueuedInstall(queueId: string): Promise<void> {
   }
 }
 
-async function enqueueBackendInstall(request: InstallQueueRequest, options: { retry?: boolean } = {}): Promise<void> {
-  try {
-    const response = await api<InstallQueueStateResponse>(
-      'POST',
-      options.retry ? '/install/queue/retry' : '/install/queue',
-      request,
-    );
-    await applyInstallQueueResponse(response, { showNotice: true, connectActive: true });
-  } catch (err: unknown) {
-    const message = errMessage(err);
-    showError(`Install queue failed: ${message}`);
-  }
+function installQueueResponseContainsItem(response: InstallQueueStateResponse, item: InstallItem): boolean {
+  const activeItem = response.active ? installItemFromQueueInstallItem(response.active.install_item) : null;
+  if (activeItem && isSameInstallItem(activeItem, item)) return true;
+  return response.items.some((queuedItem) => isSameInstallItem(installItemFromQueuedViewModel(queuedItem), item));
+}
+
+async function enqueueBackendInstallItem(
+  item: InstallItem,
+  options: { retry?: boolean } = {},
+): Promise<InstallQueueStateResponse> {
+  const response = await enqueueBackendInstall(installQueueRequestFromItem(item), options);
+  if (installQueueResponseContainsItem(response, item)) clearInstallFailureForItem(item);
+  return response;
+}
+
+async function enqueueBackendInstall(
+  request: InstallQueueRequest,
+  options: { retry?: boolean } = {},
+): Promise<InstallQueueStateResponse> {
+  const response = await api<InstallQueueStateResponse>(
+    'POST',
+    options.retry ? '/install/queue/retry' : '/install/queue',
+    request,
+  );
+  return applyInstallQueueResponse(response, { showNotice: true, connectActive: true });
+}
+
+function showInstallQueueError(err: unknown): void {
+  showError(`Install queue failed: ${errMessage(err)}`);
 }
 
 async function connectVanillaEvents(installId: string, item: InstallItem, displayName: string): Promise<void> {
   if (!isActiveInstall(item)) return;
 
   let progressSource: CloseableSource | null = null;
+  let watchdog: InstallStreamWatchdog | null = null;
+
+  const stopWatchdog = (): void => {
+    watchdog?.stop();
+    watchdog = null;
+  };
+
+  const startWatchdog = (): void => {
+    stopWatchdog();
+    watchdog = createInstallStreamWatchdog(async () => {
+      if (!isActiveInstallSource(item, progressSource)) {
+        stopWatchdog();
+        return;
+      }
+      await reconcileInstallStreamIssue(installId, item, displayName, {
+        source: progressSource,
+        closeSource: true,
+        reconnect: true,
+      });
+    });
+  };
 
   const onProgress = async (data: InstallProgressEvent): Promise<void> => {
     if (!isActiveInstallSource(item, progressSource)) return;
+    watchdog?.markProgress();
 
     const viewModel = installProgressViewModel(data.view_model);
     if (!viewModel) {
-      const message = 'Install progress data was invalid. Retry from Downloads.';
-      recordInstallFailure(item, displayName, transportFailureViewModel(message));
-      showError(message);
-      await onInstallDone();
+      stopWatchdog();
+      await reconcileInstallStreamIssue(installId, item, displayName, {
+        source: progressSource,
+        closeSource: true,
+        reconnect: true,
+        notice: 'Install progress data was invalid; refreshed backend status.',
+      });
       return;
     }
 
     applyInstallProgressViewModel(viewModel);
     if (viewModel.failed) {
+      stopWatchdog();
+      completeInstall();
       const failure = await recordBackendInstallFailure(
         item,
         displayName,
         installId,
-        transportFailureViewModel(viewModel.label),
+        unresolvedFailureViewModel(viewModel.label),
       );
       showError(failure.summary);
       await onInstallDone();
       return;
     }
-    if (data.done || viewModel.terminal) await onInstallDone(item);
+    if (data.done || viewModel.terminal) {
+      stopWatchdog();
+      await onInstallDone(item);
+    }
   };
 
   if (hasNativeDesktopRuntime()) {
     const controller = createPendingInstallEventSource();
     progressSource = controller;
+    startWatchdog();
 
-    await connectNativeInstallEventSource(
-      item,
-      controller,
-      nativeInstallEventName(installId),
-      (data) => {
-        void onProgress(data);
-      },
-      () => startNativeInstallEvents(installId),
-      'Desktop install progress is unavailable.',
-    );
+    try {
+      await connectNativeInstallEventSource(
+        item,
+        controller,
+        nativeInstallEventName(installId),
+        (data) => {
+          void onProgress(data);
+        },
+        () => startNativeInstallEvents(installId),
+        'Desktop install progress is unavailable.',
+      );
+    } catch (err: unknown) {
+      stopWatchdog();
+      throw err;
+    }
     return;
   }
 
   const es = new EventSource(apiUrl(`/install/${installId}/events`));
   progressSource = es;
   setInstallEventSource(es);
+  startWatchdog();
 
   es.addEventListener('progress', (e: MessageEvent) => {
     let data: InstallProgressEvent;
@@ -541,10 +703,13 @@ async function connectVanillaEvents(installId: string, item: InstallItem, displa
     } catch {
       void (async () => {
         if (isActiveInstallSource(item, es)) {
-          const message = 'Install progress data was invalid. Retry from Downloads.';
-          recordInstallFailure(item, displayName, transportFailureViewModel(message));
-          showError(message);
-          await onInstallDone();
+          stopWatchdog();
+          await reconcileInstallStreamIssue(installId, item, displayName, {
+            source: es,
+            closeSource: true,
+            reconnect: true,
+            notice: 'Install progress data was invalid; refreshed backend status.',
+          });
         }
       })();
       return;
@@ -556,10 +721,13 @@ async function connectVanillaEvents(installId: string, item: InstallItem, displa
     if (es.readyState !== EventSource.CLOSED) return;
     void (async () => {
       if (isActiveInstallSource(item, es)) {
-        const message = 'Install progress stopped unexpectedly. Retry the install from the launcher.';
-        recordInstallFailure(item, displayName, transportFailureViewModel(message));
-        showError(message);
-        await onInstallDone();
+        stopWatchdog();
+        await reconcileInstallStreamIssue(installId, item, displayName, {
+          source: es,
+          closeSource: true,
+          reconnect: true,
+          notice: 'Install progress stopped unexpectedly; refreshed backend status.',
+        });
       }
     })();
   };
@@ -569,38 +737,69 @@ async function connectLoaderEvents(installId: string, item: InstallItem, display
   if (!isActiveInstall(item)) return;
 
   let progressSource: CloseableSource | null = null;
+  let watchdog: InstallStreamWatchdog | null = null;
+
+  const stopWatchdog = (): void => {
+    watchdog?.stop();
+    watchdog = null;
+  };
+
+  const startWatchdog = (): void => {
+    stopWatchdog();
+    watchdog = createInstallStreamWatchdog(async () => {
+      if (!isActiveInstallSource(item, progressSource)) {
+        stopWatchdog();
+        return;
+      }
+      await reconcileInstallStreamIssue(installId, item, displayName, {
+        source: progressSource,
+        closeSource: true,
+        reconnect: true,
+      });
+    });
+  };
+
   const onProgress = (data: InstallProgressEvent): void => {
     if (!isActiveInstallSource(item, progressSource)) return;
+    watchdog?.markProgress();
 
     const viewModel = installProgressViewModel(data.view_model);
     if (!viewModel) {
-      onError('Loader install progress data was invalid. Retry from Downloads.');
+      onError('Loader install progress data was invalid.');
       return;
     }
 
     applyInstallProgressViewModel(viewModel);
     if (viewModel.failed) {
+      stopWatchdog();
+      completeInstall();
       void onBackendFailure(viewModel);
       return;
     }
-    if (data.done || viewModel.terminal) void onInstallDone(item);
+    if (data.done || viewModel.terminal) {
+      stopWatchdog();
+      void onInstallDone(item);
+    }
   };
 
   const onError = (message: string): void => {
     if (isActiveInstallSource(item, progressSource)) {
-      recordInstallFailure(item, displayName, transportFailureViewModel(message));
-      showError(message);
-      void onInstallDone();
+      stopWatchdog();
+      void reconcileInstallStreamIssue(installId, item, displayName, {
+        source: progressSource,
+        closeSource: true,
+        reconnect: true,
+        notice: `${message} Refreshed backend status.`,
+      });
     }
   };
 
   const onBackendFailure = async (viewModel: InstallProgressViewModel): Promise<void> => {
-    if (!isActiveInstallSource(item, progressSource)) return;
     const failure = await recordBackendInstallFailure(
       item,
       displayName,
       installId,
-      transportFailureViewModel(viewModel.label),
+      unresolvedFailureViewModel(viewModel.label),
     );
     showError(failure.summary);
     await onInstallDone();
@@ -609,17 +808,23 @@ async function connectLoaderEvents(installId: string, item: InstallItem, display
   if (hasNativeDesktopRuntime()) {
     const controller = createPendingInstallEventSource();
     progressSource = controller;
+    startWatchdog();
 
-    await connectNativeInstallEventSource(
-      item,
-      controller,
-      nativeLoaderInstallEventName(installId),
-      (data) => {
-        onProgress(data);
-      },
-      () => startNativeLoaderInstallEvents(installId),
-      'Desktop loader install progress is unavailable.',
-    );
+    try {
+      await connectNativeInstallEventSource(
+        item,
+        controller,
+        nativeLoaderInstallEventName(installId),
+        (data) => {
+          onProgress(data);
+        },
+        () => startNativeLoaderInstallEvents(installId),
+        'Desktop loader install progress is unavailable.',
+      );
+    } catch (err: unknown) {
+      stopWatchdog();
+      throw err;
+    }
     return;
   }
 
@@ -627,6 +832,7 @@ async function connectLoaderEvents(installId: string, item: InstallItem, display
 
   progressSource = es;
   setInstallEventSource(es);
+  startWatchdog();
 }
 
 async function onInstallDone(completedItem?: InstallItem): Promise<void> {

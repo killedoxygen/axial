@@ -157,6 +157,8 @@ Responsibility:
 
 This layer is the backend source of truth for loader selection and build ordering.
 
+Loader catalog caches store normalized metadata, not raw upstream payloads. The cache schema must be bumped whenever record semantics change, including lifecycle, stable/beta, promotion, default-selection, installability, or provider-term interpretation, so older normalized records cannot keep driving new UI or install behavior.
+
 ### 3. Strategy layer
 
 Files:
@@ -176,6 +178,8 @@ Responsibility:
 - choose behavior from `LoaderInstallStrategy`
 - keep loader-family and era-specific work local to the selected strategy
 
+Profile-based loaders, currently Fabric and Quilt, download libraries declared by trusted upstream profile JSON. Those profile libraries may omit SHA-1 metadata. Croopor permits a best-effort first download or size-matching reuse for those profile libraries only, while descriptor-backed vanilla artifacts and installer-sourced selected artifacts still require valid checksum metadata. Missing-checksum `.jar` profile libraries are not trusted solely because a file exists; existing and freshly downloaded jars must be structurally readable so stale bad cache entries are replaced. Composed profile-loader version JSON marks those trusted profile libraries with `crooporChecksumlessAllowed`; launch readiness uses that marker to accept only present, structurally readable checksumless jars, while unmarked checksumless libraries still fail strict readiness. Loader strategies also validate base Minecraft dependencies before treating a base version as already installed: the base JSON, client jar, incomplete marker, and selected base libraries must be ready so a partially-installed vanilla base cannot produce a finalized loader profile with missing inherited libraries.
+
 ### 4. Helper layers
 
 Files:
@@ -194,7 +198,7 @@ Responsibility:
 - `api.rs`: component ids, build ids, and installed version-id construction
 - `types.rs`: normalized types and errors
 - helper modules: install artifacts, work dirs, composition, legacy behavior, processors
-- `forge_installer.rs` and `processors.rs`: parse installer ZIPs through bounded blocking work, with explicit decompressed-entry ceilings for profile JSON, embedded Maven libraries, and processor data extraction
+- `forge_installer.rs` and `processors.rs`: parse installer ZIPs through bounded blocking work, with explicit decompressed-entry ceilings for profile JSON, embedded Maven libraries, and processor data extraction. Modern Forge/NeoForge installer profiles are not parsed as legacy root-library install profiles; legacy root-library extraction is a no-op unless the legacy `install` schema is present.
 
 ## Selection flow
 
@@ -204,9 +208,12 @@ Frontend flow:
 2. fetch supported Minecraft versions for that component
 3. pick a Minecraft version from that supported set
 4. fetch build records for that pair
-5. choose the highest `build_meta.selection.default_rank`
-6. create the instance with `build.version_id`
-7. install using `component_id + build_id`
+5. submit the backend-authored selection id
+6. the backend chooses the highest non-unstable default build
+7. create the instance with `build.version_id`
+8. install using `component_id + build_id`
+
+Version-level loader selections must not silently choose unstable builds. If a supported Minecraft-version row only has beta/unstable loader builds, create-view keeps the row visible as preview/beta but disables normal creation. Provider-unlabeled non-beta builds, such as current Quilt loader rows, remain valid defaults. Exact `loader_build` selections are the explicit path for beta testing.
 
 Complex async loader state lives in:
 
@@ -225,6 +232,8 @@ Croopor still treats it as three eras:
 3. modern processor-based Forge
 
 That split is install-strategy architecture, not lifecycle architecture.
+
+Earliest pre-installer Forge client archives are overlays, not complete replacement client jars. The strategy builds a temporary jar from the base Minecraft client plus the Forge archive, skipping signature metadata, then promotes the composed jar into the installed loader version.
 
 ## API shape
 
@@ -262,6 +271,8 @@ The loader attachment carries:
 That keeps Minecraft-version lifecycle and loader-build terms separate in the UI.
 
 Install strategies also write `versions/<id>/.croopor-loader.json` beside the composed version JSON. Version scanning reads that file as the authoritative installed-loader attachment source, so routes do not infer loader identity, Minecraft version, or loader version from composite local version ids.
+
+The installed-version scanner also anchors Minecraft metadata for loader versions to the inherited/base Minecraft id from the version JSON or `.croopor-loader.json`. Composite loader ids remain install identities, not Minecraft-version labels or lifecycle inputs.
 
 ## Maintenance rules
 

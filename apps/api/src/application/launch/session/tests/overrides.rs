@@ -550,9 +550,10 @@ async fn launch_preflight_conflicting_memory_jvm_args_are_guardian_stripped() {
 }
 
 #[tokio::test]
-async fn launch_preflight_blank_explicit_java_override_exposes_guardian_fact() {
-    let fixture = TestFixture::new("preflight-empty-java-fact");
-    fixture.set_global_java_override("/opt/java/bin/java");
+async fn launch_preflight_blank_instance_java_override_uses_global_override() {
+    let fixture = TestFixture::new("preflight-empty-java-uses-global");
+    let global_java = fixture.write_manual_java_override();
+    fixture.set_global_java_override(&global_java);
     fixture.write_ready_install("1.21.1");
     let instance_id = fixture.add_instance("Survival", "1.21.1");
     fixture.update_instance(&instance_id, |instance| {
@@ -563,12 +564,11 @@ async fn launch_preflight_blank_explicit_java_override_exposes_guardian_fact() {
         .await
         .expect("prepare preflight");
 
-    assert_eq!(preflight.guardian.decision, GuardianDecision::Warned);
     assert_eq!(
         preflight.overrides.java.origin,
-        Some(OverrideOrigin::Instance)
+        Some(OverrideOrigin::Global)
     );
-    assert!(preflight.guardian_facts.iter().any(|fact| {
+    assert!(!preflight.guardian_facts.iter().any(|fact| {
         fact.id.as_str() == "java_override_empty"
             && fact
                 .target

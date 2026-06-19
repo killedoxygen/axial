@@ -33,6 +33,13 @@ export function InstanceCard({
   const install = instanceInstallStatus(inst, version);
   const installing = install.installing;
   const installBadge = install.state === 'queued' ? install.queuedItem?.title || install.label : 'Installing';
+  const launchAction = inst.launch_action;
+  const actionIcon =
+    launchAction.primary_action === 'launch'
+      ? 'play'
+      : launchAction.primary_action === 'install'
+        ? 'download'
+        : 'alert';
   const open = (): void => navigate({ name: 'instance', id: inst.id });
   const onKeyDown = (e: KeyboardEvent): void => {
     if (e.target !== e.currentTarget) return;
@@ -79,7 +86,7 @@ export function InstanceCard({
         )}
         {!installing && (
           <span class="cp-icard-play" aria-hidden="true">
-            <Icon name="play" size={20} stroke={2} />
+            <Icon name={actionIcon} size={20} stroke={2} />
           </span>
         )}
       </div>

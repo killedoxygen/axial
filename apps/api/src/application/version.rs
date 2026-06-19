@@ -1,9 +1,9 @@
 use crate::state::AppState;
 use axum::{Json, http::StatusCode};
 use croopor_minecraft::{
-    LifecycleMeta, MinecraftVersionMeta, VersionEntry, VersionSubjectKind,
-    analyze_minecraft_version, enrich_version_entries, fetch_version_manifest_cached,
-    manifest_release_references, scan_versions, versions_dir,
+    LifecycleMeta, MinecraftVersionMeta, VersionEntry, VersionScanReport, VersionScanState,
+    VersionSubjectKind, analyze_minecraft_version, enrich_version_entries,
+    fetch_version_manifest_cached, manifest_release_references, scan_versions_report, versions_dir,
 };
 use serde::Deserialize;
 use serde::Serialize;
@@ -15,10 +15,34 @@ const VERSION_FOLDER_OPEN_ERROR_MESSAGE: &str =
     "Could not open the version folder. Check desktop permissions and try again.";
 const VERSION_DELETE_ERROR_MESSAGE: &str =
     "Could not delete the version files. Check library permissions and try again.";
+pub(crate) const VERSION_SCAN_DEGRADED_MESSAGE: &str =
+    "Could not verify installed versions. Check the library folder and try again.";
 
 #[derive(Debug, Serialize)]
 pub struct VersionsResponse {
     pub versions: Vec<VersionEntry>,
+    pub scan_state: VersionScanViewModel,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct VersionScanViewModel {
+    pub state_id: String,
+    pub label: String,
+    pub degraded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct InstalledVersionsScan {
+    pub versions: Vec<VersionEntry>,
+    pub view_model: VersionScanViewModel,
+}
+
+impl InstalledVersionsScan {
+    pub(crate) fn is_degraded(&self) -> bool {
+        self.view_model.degraded
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -67,10 +91,13 @@ pub async fn installed_versions(
     state: &AppState,
 ) -> Result<VersionsResponse, (StatusCode, Json<serde_json::Value>)> {
     let mc_dir = version_library_dir(state)?;
-    let mut versions = scan_versions(&mc_dir).map_err(scan_versions_error_response)?;
-    enrich_versions_from_cached_manifest(&mc_dir, &mut versions).await;
+    let mut scan = scan_installed_versions(&mc_dir);
+    enrich_versions_from_cached_manifest(&mc_dir, &mut scan.versions).await;
 
-    Ok(VersionsResponse { versions })
+    Ok(VersionsResponse {
+        versions: scan.versions,
+        scan_state: scan.view_model,
+    })
 }
 
 pub async fn installed_versions_event_payload(state: &AppState) -> String {
@@ -90,8 +117,8 @@ pub async fn catalog(
         .await
         .map_err(catalog_fetch_error_response)?;
 
-    let installed: HashSet<String> = scan_versions(&mc_dir)
-        .unwrap_or_default()
+    let installed: HashSet<String> = scan_installed_versions(&mc_dir)
+        .versions
         .into_iter()
         .filter(|version| version.launchable)
         .map(|version| version.id)
@@ -148,7 +175,11 @@ pub async fn version_info(
         ));
     }
 
-    let all_versions = scan_versions(&mc_dir).unwrap_or_default();
+    let scan = scan_installed_versions(&mc_dir);
+    if scan.is_degraded() {
+        return Err(version_scan_degraded_response());
+    }
+    let all_versions = scan.versions;
     let dependents = all_versions
         .iter()
         .filter(|version| version.inherits_from == version_id)
@@ -218,7 +249,11 @@ pub async fn delete_version(
 
     let mut to_delete = vec![version_id.to_string()];
     if payload.cascade_dependents {
-        let all_versions = scan_versions(&mc_dir).unwrap_or_default();
+        let scan = scan_installed_versions(&mc_dir);
+        if scan.is_degraded() {
+            return Err(version_scan_degraded_response());
+        }
+        let all_versions = scan.versions;
         to_delete.extend(
             all_versions
                 .into_iter()
@@ -277,6 +312,48 @@ fn version_library_dir(state: &AppState) -> Result<PathBuf, (StatusCode, Json<se
     Ok(PathBuf::from(mc_dir))
 }
 
+pub(crate) fn scan_installed_versions(mc_dir: &FsPath) -> InstalledVersionsScan {
+    let report = scan_versions_report(mc_dir).unwrap_or_else(|_| VersionScanReport {
+        state: VersionScanState::Degraded,
+        versions: Vec::new(),
+        issues: Vec::new(),
+    });
+    InstalledVersionsScan {
+        view_model: version_scan_view_model(&report),
+        versions: report.versions,
+    }
+}
+
+pub(crate) fn version_scan_degraded_response() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::PRECONDITION_FAILED,
+        Json(serde_json::json!({ "error": VERSION_SCAN_DEGRADED_MESSAGE })),
+    )
+}
+
+fn version_scan_view_model(report: &VersionScanReport) -> VersionScanViewModel {
+    match report.state {
+        VersionScanState::Ready => VersionScanViewModel {
+            state_id: "ready".to_string(),
+            label: "Installed versions ready".to_string(),
+            degraded: false,
+            detail: None,
+        },
+        VersionScanState::Empty => VersionScanViewModel {
+            state_id: "empty".to_string(),
+            label: "No installed versions".to_string(),
+            degraded: false,
+            detail: None,
+        },
+        VersionScanState::Degraded => VersionScanViewModel {
+            state_id: "degraded".to_string(),
+            label: "Installed versions unavailable".to_string(),
+            degraded: true,
+            detail: Some(VERSION_SCAN_DEGRADED_MESSAGE.to_string()),
+        },
+    }
+}
+
 async fn enrich_versions_from_cached_manifest(mc_dir: &FsPath, versions: &mut [VersionEntry]) {
     if let Ok(manifest) = fetch_version_manifest_cached(mc_dir).await {
         let releases = manifest_release_references(&manifest);
@@ -312,15 +389,6 @@ fn version_delete_error_response(_error: std::io::Error) -> (StatusCode, Json<se
     )
 }
 
-fn scan_versions_error_response(_error: std::io::Error) -> (StatusCode, Json<serde_json::Value>) {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(serde_json::json!({
-            "error": "Could not scan installed versions. Check the library folder and try again."
-        })),
-    )
-}
-
 fn catalog_fetch_error_response(
     _error: impl std::fmt::Display,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -328,6 +396,16 @@ fn catalog_fetch_error_response(
         StatusCode::BAD_GATEWAY,
         Json(serde_json::json!({
             "error": "Could not load the Minecraft catalog. Check your connection and try again."
+        })),
+    )
+}
+
+#[cfg(test)]
+fn scan_versions_error_response(_error: std::io::Error) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "error": "Could not scan installed versions. Check the library folder and try again."
         })),
     )
 }
@@ -415,7 +493,7 @@ fn open_path(path: &FsPath) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io;
+    use std::{fs, io};
 
     fn public_error_json(
         mapper: fn(std::io::Error) -> (StatusCode, Json<serde_json::Value>),
@@ -565,6 +643,34 @@ mod tests {
         let body = body.to_string();
         assert!(!body.contains(r"C:\Users\Alice"));
         assert!(!body.contains("AppData"));
+    }
+
+    #[test]
+    fn installed_version_scan_view_model_marks_malformed_library_as_degraded() {
+        let root = std::env::temp_dir().join(format!(
+            "croopor-api-version-scan-degraded-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or_default()
+        ));
+        let version_dir = root.join("versions").join("1.21.1");
+        fs::create_dir_all(&version_dir).expect("create version dir");
+        fs::write(version_dir.join("1.21.1.json"), "{not valid json")
+            .expect("write malformed version json");
+
+        let scan = scan_installed_versions(&root);
+
+        assert!(scan.is_degraded());
+        assert_eq!(scan.view_model.state_id, "degraded");
+        assert_eq!(
+            scan.view_model.detail.as_deref(),
+            Some(VERSION_SCAN_DEGRADED_MESSAGE)
+        );
+        assert!(scan.versions.is_empty());
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

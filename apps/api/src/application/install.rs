@@ -13,6 +13,7 @@ mod repair;
 mod stream;
 
 use super::InstallVersionCommand;
+use crate::guardian::{GuardianArtifactRepairOutcome, GuardianArtifactRepairStatus};
 use crate::observability::operation_journal_proof_record;
 use crate::state::AppState;
 use crate::state::{
@@ -20,12 +21,13 @@ use crate::state::{
     InstallQueueSnapshot, InstallQueueSpec, InstallStore, QueuedInstallEntry,
 };
 use axum::{Json, http::StatusCode};
-use croopor_minecraft::{DownloadProgress, Downloader, LoaderComponentId, resolve_build_record};
-use std::path::PathBuf;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use croopor_minecraft::{
+    DownloadProgress, Downloader, LoaderComponentId,
+    download::{ExecutionDownloadFact, SelectedDownloadArtifactDescriptor},
+    resolve_build_record,
 };
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
@@ -36,19 +38,17 @@ pub(crate) const LOADER_INSTALL_INTERRUPTED_MESSAGE: &str =
     "Loader install stopped before completing. Try again.";
 pub(crate) const BASE_INSTALL_FAILED_MESSAGE: &str =
     "Base game install failed. Retry the install from Downloads.";
+const INSTALL_REPAIR_RESUME_MAX_DEPTH: u8 = 1;
 
 pub type InstallApplicationError = (StatusCode, Json<serde_json::Value>);
 
+use loader::start_loader_install;
 #[cfg(test)]
 use loader::{
     base_install_failed_progress, loader_error_progress, loader_install_done_progress,
-    loader_install_key_fields, prewarm_runtime_error_progress,
-    wait_for_active_vanilla_base_install,
+    loader_install_key_fields, wait_for_active_vanilla_base_install,
 };
-pub use loader::{
-    loader_builds, loader_components, loader_error_response, loader_game_versions,
-    start_loader_install,
-};
+pub use loader::{loader_builds, loader_components, loader_error_response, loader_game_versions};
 pub use model::{
     InstallActionViewModel, InstallFailureViewModel, InstallGuardianOutcomeSummary,
     InstallGuardianRepairSummary, InstallProgressStepViewModel, InstallProgressViewModel,
@@ -62,8 +62,9 @@ pub use operation::{
     begin_install_operation_journal, install_guardian_outcome_summary_from_journal,
     install_operation_id, loader_install_progress_view_model, public_loader_install_progress_json,
     public_vanilla_install_progress_json, record_install_operation_guardian_evidence,
-    record_install_operation_guardian_failure_outcome, record_install_operation_interrupted,
-    record_install_operation_progress,
+    record_install_operation_guardian_failure_outcome,
+    record_install_operation_guardian_failure_outcome_with_memory,
+    record_install_operation_interrupted, record_install_operation_progress,
     record_loader_base_install_dependency_guardian_failure_outcome,
     record_loader_install_operation_guardian_failure_outcome, sanitize_install_progress,
     stage_install_version_command, vanilla_install_progress_view_model,
@@ -79,7 +80,7 @@ pub use repair::{
 };
 pub use stream::{install_events_stream, loader_install_events_stream};
 
-pub async fn start_install_version(
+pub(crate) async fn start_install_version(
     state: &AppState,
     request: InstallVersionStartRequest,
 ) -> Result<InstallStartResponse, InstallApplicationError> {
@@ -139,7 +140,7 @@ pub async fn start_install_version(
         interrupted_install_progress(),
         async move {
             let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<DownloadProgress>();
-            let terminal_progress_sent = Arc::new(AtomicBool::new(false));
+            let terminal_progress = Arc::new(Mutex::new(None::<DownloadProgress>));
             let store_task = {
                 let store = worker_store.clone();
                 let install_id = worker_install_id.clone();
@@ -161,59 +162,72 @@ pub async fn start_install_version(
             };
 
             let downloader = Downloader::new(mc_dir);
-            let progress_tx_for_downloader = progress_tx.clone();
-            let terminal_progress_sent_for_downloader = Arc::clone(&terminal_progress_sent);
-            let mut install_facts = Vec::new();
-            let mut install_descriptors = Vec::new();
-            let install_result = downloader
-                .install_version_with_facts_and_descriptors(
-                    &version_id,
-                    (!manifest_url.is_empty()).then_some(manifest_url.as_str()),
-                    move |progress| {
-                        if progress.done {
-                            terminal_progress_sent_for_downloader.store(true, Ordering::SeqCst);
-                        }
-                        let _ = progress_tx_for_downloader.send(progress);
-                    },
-                    |fact| install_facts.push(fact),
-                    |descriptor| install_descriptors.push(descriptor),
-                )
-                .await;
-            if install_result.is_err() {
-                record_install_operation_guardian_evidence(
-                    worker_journals.as_ref(),
-                    &worker_operation_id,
-                    &install_facts,
-                );
-                record_install_operation_guardian_failure_outcome(
-                    worker_journals.as_ref(),
-                    &worker_operation_id,
-                    &install_facts,
-                );
+            let mut repair_resume_depth = 0_u8;
+            let (final_install_succeeded, final_terminal_progress) = loop {
+                if let Ok(mut terminal_progress) = terminal_progress.lock() {
+                    *terminal_progress = None;
+                }
+                let progress_tx_for_downloader = progress_tx.clone();
+                let terminal_progress_for_downloader = Arc::clone(&terminal_progress);
+                let mut install_facts = Vec::new();
+                let mut install_descriptors = Vec::new();
+                let install_result = downloader
+                    .install_version_with_facts_and_descriptors(
+                        &version_id,
+                        (!manifest_url.is_empty()).then_some(manifest_url.as_str()),
+                        move |progress| {
+                            if progress.done {
+                                if let Ok(mut terminal_progress) =
+                                    terminal_progress_for_downloader.lock()
+                                {
+                                    *terminal_progress = Some(progress);
+                                }
+                                return;
+                            }
+                            let _ = progress_tx_for_downloader.send(progress);
+                        },
+                        |fact| install_facts.push(fact),
+                        |descriptor| install_descriptors.push(descriptor),
+                    )
+                    .await;
+                let attempt_terminal_progress = terminal_progress
+                    .lock()
+                    .ok()
+                    .and_then(|mut progress| progress.take());
+                if install_result.is_ok() {
+                    break (true, attempt_terminal_progress);
+                }
                 let observed_at = chrono::Utc::now().to_rfc3339();
-                let repair_client = reqwest::Client::new();
-                if let Some(repair_outcome) = repair_install_artifact_corruption_with_guardian(
+                let repair_outcome = record_install_failure_outcome_and_repair(
                     worker_journals.as_ref(),
                     worker_failure_memory.as_ref(),
-                    &repair_client,
                     &worker_operation_id,
                     &install_facts,
                     &install_descriptors,
                     &observed_at,
                 )
-                .await
+                .await;
+                if repair_resume_depth < INSTALL_REPAIR_RESUME_MAX_DEPTH
+                    && repair_outcome.as_ref().is_some_and(|outcome| {
+                        outcome.status == GuardianArtifactRepairStatus::Repaired
+                    })
                 {
-                    record_install_operation_guardian_repair_outcome(
-                        worker_journals.as_ref(),
-                        &worker_operation_id,
-                        &repair_outcome,
-                    );
+                    repair_resume_depth += 1;
+                    continue;
                 }
-            }
-            if install_result.is_err() && !terminal_progress_sent.load(Ordering::SeqCst) {
-                terminal_progress_sent.store(true, Ordering::SeqCst);
-                let _ = progress_tx.send(observed_install_failure_progress());
-            }
+                break (
+                    false,
+                    Some(terminal_failure_progress_or_default(
+                        attempt_terminal_progress,
+                    )),
+                );
+            };
+            let terminal_progress = if final_install_succeeded {
+                final_terminal_progress.unwrap_or_else(vanilla_install_done_progress)
+            } else {
+                final_terminal_progress.unwrap_or_else(observed_install_failure_progress)
+            };
+            let _ = progress_tx.send(terminal_progress);
             drop(progress_tx);
             let _ = store_task.await;
         },
@@ -227,6 +241,56 @@ pub async fn start_install_version(
         operation_id: staging.result.operation_id.unwrap_or(operation_id),
         view_model: InstallProgressViewModel::starting(),
     })
+}
+
+pub(super) async fn record_install_failure_outcome_and_repair(
+    journals: &crate::state::OperationJournalStore,
+    failure_memory: &crate::state::GuardianFailureMemoryStore,
+    operation_id: &crate::state::contracts::OperationId,
+    install_facts: &[ExecutionDownloadFact],
+    install_descriptors: &[SelectedDownloadArtifactDescriptor],
+    observed_at: &str,
+) -> Option<GuardianArtifactRepairOutcome> {
+    record_install_operation_guardian_evidence(journals, operation_id, install_facts);
+    record_install_operation_guardian_failure_outcome_with_memory(
+        journals,
+        failure_memory,
+        operation_id,
+        install_facts,
+        observed_at,
+    );
+    let repair_client = reqwest::Client::new();
+    let repair_outcome = repair_install_artifact_corruption_with_guardian(
+        journals,
+        failure_memory,
+        &repair_client,
+        operation_id,
+        install_facts,
+        install_descriptors,
+        observed_at,
+    )
+    .await;
+    if let Some(repair_outcome) = repair_outcome.as_ref() {
+        record_install_operation_guardian_repair_outcome(journals, operation_id, &repair_outcome);
+    }
+    repair_outcome
+}
+
+fn terminal_failure_progress_or_default(progress: Option<DownloadProgress>) -> DownloadProgress {
+    progress
+        .filter(|progress| progress.error.is_some())
+        .unwrap_or_else(observed_install_failure_progress)
+}
+
+fn vanilla_install_done_progress() -> DownloadProgress {
+    DownloadProgress {
+        phase: "done".to_string(),
+        current: 1,
+        total: 1,
+        file: None,
+        error: None,
+        done: true,
+    }
 }
 
 pub async fn install_status(
@@ -300,7 +364,8 @@ pub async fn install_status(
 pub async fn install_queue_status(
     state: &AppState,
 ) -> Result<InstallQueueStateResponse, InstallApplicationError> {
-    Ok(install_queue_state_response(state, None, None).await)
+    let started_install = maybe_start_next_queued_install(state).await?;
+    Ok(install_queue_state_response(state, None, started_install).await)
 }
 
 pub async fn enqueue_install(
@@ -376,6 +441,12 @@ async fn install_queue_spec_from_request(
                     Json(serde_json::json!({ "error": "version_id is required" })),
                 ));
             }
+            state.library_dir().ok_or_else(|| {
+                (
+                    StatusCode::PRECONDITION_FAILED,
+                    Json(serde_json::json!({ "error": "Croopor library is not configured" })),
+                )
+            })?;
             Ok(InstallQueueSpec::vanilla(version_id, manifest_url))
         }
         "loader" => {
@@ -432,7 +503,7 @@ async fn maybe_start_next_queued_install(
         Err(error) => {
             state
                 .installs()
-                .clear_active_queued_install_for_queue_id(&entry.queue_id)
+                .discard_active_queued_install(&entry.queue_id)
                 .await;
             return Err(error);
         }
@@ -531,16 +602,33 @@ async fn install_queue_active_view_model(
     active: Option<&ActiveQueuedInstallEntry>,
 ) -> Option<InstallQueueActiveViewModel> {
     let active = active?;
-    let install_id = active.install_id.clone()?;
-    let progress = install_queue_active_progress_view_model(state, &install_id, &active.spec).await;
+    let install_id = active.install_id.clone();
+    let progress = match install_id.as_deref() {
+        Some(install_id) => {
+            install_queue_active_progress_view_model(state, install_id, &active.spec).await
+        }
+        None => InstallProgressViewModel::starting(),
+    };
     let label = install_queue_label(&active.spec);
+    let title = if install_id.is_some() {
+        "Installing"
+    } else {
+        "Starting install"
+    };
+    let summary = if install_id.is_some() {
+        format!("{label} is installing.")
+    } else {
+        format!("{label} is starting.")
+    };
     Some(InstallQueueActiveViewModel {
         queue_id: active.queue_id.clone(),
-        install_id: install_id.clone(),
-        operation_id: install_operation_id(&install_id),
+        operation_id: install_id
+            .as_ref()
+            .map(|install_id| install_operation_id(install_id)),
+        install_id,
         kind: install_queue_kind(&active.spec).to_string(),
-        title: "Installing".to_string(),
-        summary: format!("{label} is installing."),
+        title: title.to_string(),
+        summary,
         label,
         install_item: install_queue_install_item(&active.spec),
         progress,
@@ -659,7 +747,9 @@ fn install_queue_view_model(
     let active_queued_count_label = (queued_count > 0).then(|| format!(" · {queued_count_label}"));
     InstallQueueViewModel {
         state_id: state_id.to_string(),
-        status_label: if queued_count > 0 {
+        status_label: if active.is_some() {
+            "Installing".to_string()
+        } else if queued_count > 0 {
             "Queued".to_string()
         } else {
             "Idle".to_string()

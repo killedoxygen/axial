@@ -11,8 +11,8 @@ use crate::state::contracts::{OperationId, StabilizationSystem, TargetDescriptor
 use crate::state::ownership::{classify_managed_runtime_root, protection_for};
 use croopor_config::AppPaths;
 use croopor_minecraft::{
-    JavaRuntimeLookupError, RuntimeOverride, parse_runtime_override,
-    runtime_executable_ready_without_probe,
+    JavaRuntimeLookupError, RuntimeOverride, managed_runtime_contents_verified_without_probe,
+    parse_runtime_override, runtime_executable_ready_without_probe,
 };
 use std::fmt;
 use std::fs;
@@ -521,6 +521,19 @@ pub fn verify_managed_runtime(
         ));
     }
 
+    if !managed_runtime_contents_verified_without_probe(request.runtime_root) {
+        facts.push(runtime_fact(
+            ExecutionFactKind::RuntimeCorrupt,
+            request.operation_id.clone(),
+            &request.target,
+            Vec::new(),
+        ));
+        return Err(RuntimeCapabilityError::new(
+            RuntimeCapabilityErrorKind::RuntimeCorrupt,
+            facts,
+        ));
+    }
+
     Ok(RuntimeCapabilityReport {
         target: request.target,
         facts,
@@ -562,6 +575,18 @@ pub fn repair_managed_runtime(
 
     match request.primitive {
         ManagedRuntimeRepairPrimitive::RecreateReadyMarker => {
+            if !managed_runtime_contents_verified_without_probe(request.runtime_root.path()) {
+                report.facts.push(runtime_fact(
+                    ExecutionFactKind::RuntimeCorrupt,
+                    request.operation_id.clone(),
+                    &request.target,
+                    Vec::new(),
+                ));
+                return Err(RuntimeCapabilityError::new(
+                    RuntimeCapabilityErrorKind::RuntimeCorrupt,
+                    report.facts,
+                ));
+            }
             recreate_ready_marker(request.runtime_root.path()).map_err(|_| {
                 let mut facts = report.facts.clone();
                 facts.push(runtime_fact(
@@ -730,6 +755,7 @@ mod tests {
     };
     use crate::state::ownership::{CurrentArtifact, classify_current_artifact};
     use croopor_config::AppPaths;
+    use sha1::{Digest, Sha1};
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -1184,6 +1210,7 @@ mod tests {
         fs::create_dir_all(java_path.parent().expect("java parent")).expect("runtime bin");
         fs::write(&java_path, b"java").expect("fake java");
         make_executable(&java_path);
+        write_runtime_manifest_proof(&runtime_root_path, &java_path);
         fs::create_dir_all(runtime_root_path.join(".croopor-ready")).expect("bad marker dir");
         let runtime_root = runtime_root_binding(&paths, &runtime_root_path, &java_path);
 
@@ -1218,16 +1245,13 @@ mod tests {
         ))
         .expect_err("missing executable should fail post-repair verification");
 
-        assert!(runtime_root.join(".croopor-ready").is_file());
-        assert_eq!(error.kind, RuntimeCapabilityErrorKind::MissingExecutable);
-        assert!(has_fact(
+        assert!(!runtime_root.join(".croopor-ready").exists());
+        assert_eq!(error.kind, RuntimeCapabilityErrorKind::RuntimeCorrupt);
+        assert!(!has_fact(
             &error.facts,
             ExecutionFactKind::RuntimeRepairApplied
         ));
-        assert!(has_fact(
-            &error.facts,
-            ExecutionFactKind::RuntimeMissingExecutable
-        ));
+        assert!(has_fact(&error.facts, ExecutionFactKind::RuntimeCorrupt));
         assert_no_sensitive_runtime_material(&error.facts);
         cleanup(&root);
     }
@@ -1356,6 +1380,37 @@ mod tests {
         fs::write(&java_path, b"java").expect("fake java");
         make_executable(&java_path);
         java_path
+    }
+
+    fn write_runtime_manifest_proof(runtime_root: &Path, java_path: &Path) {
+        let bytes = fs::read(java_path).expect("read fake java");
+        let relative_path = java_path
+            .strip_prefix(runtime_root)
+            .expect("java under runtime root")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let mut hasher = Sha1::new();
+        hasher.update(&bytes);
+        let sha1 = format!("{:x}", hasher.finalize());
+        let manifest = serde_json::json!({
+            "files": {
+                relative_path: {
+                    "type": "file",
+                    "downloads": {
+                        "raw": {
+                            "url": "https://example.invalid/java",
+                            "sha1": sha1,
+                            "size": bytes.len()
+                        }
+                    }
+                }
+            }
+        });
+        fs::write(
+            runtime_root.join(".croopor-runtime-manifest.json"),
+            serde_json::to_vec(&manifest).expect("manifest json"),
+        )
+        .expect("runtime manifest proof");
     }
 
     #[cfg(unix)]

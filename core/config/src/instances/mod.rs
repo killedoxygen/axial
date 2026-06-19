@@ -75,6 +75,7 @@ pub enum LaunchActionTone {
 pub enum LaunchPrimaryAction {
     Launch,
     Install,
+    Blocked,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -89,16 +90,56 @@ pub struct LaunchActionState {
 }
 
 impl LaunchActionState {
+    pub fn launch_ready() -> Self {
+        Self {
+            state_id: "launch_ready".to_string(),
+            label: "Launch".to_string(),
+            tone: LaunchActionTone::Ok,
+            launchable: true,
+            primary_action: LaunchPrimaryAction::Launch,
+            disabled_reason: None,
+        }
+    }
+
+    pub fn install_required(reason: impl Into<String>) -> Self {
+        let reason = reason.into();
+        Self {
+            state_id: "install_required".to_string(),
+            label: "Install".to_string(),
+            tone: LaunchActionTone::Warn,
+            launchable: false,
+            primary_action: LaunchPrimaryAction::Install,
+            disabled_reason: Some(reason),
+        }
+    }
+
+    pub fn repair_required(reason: impl Into<String>) -> Self {
+        let reason = reason.into();
+        Self {
+            state_id: "repair_required".to_string(),
+            label: "Repair".to_string(),
+            tone: LaunchActionTone::Err,
+            launchable: false,
+            primary_action: LaunchPrimaryAction::Install,
+            disabled_reason: Some(reason),
+        }
+    }
+
+    pub fn blocked(reason: impl Into<String>) -> Self {
+        let reason = reason.into();
+        Self {
+            state_id: "launch_blocked".to_string(),
+            label: "Blocked".to_string(),
+            tone: LaunchActionTone::Err,
+            launchable: false,
+            primary_action: LaunchPrimaryAction::Blocked,
+            disabled_reason: Some(reason),
+        }
+    }
+
     fn from_readiness(launchable: bool, status_detail: &str, needs_install: &str) -> Self {
         if launchable {
-            return Self {
-                state_id: "launch_ready".to_string(),
-                label: "Launch".to_string(),
-                tone: LaunchActionTone::Ok,
-                launchable: true,
-                primary_action: LaunchPrimaryAction::Launch,
-                disabled_reason: None,
-            };
+            return Self::launch_ready();
         }
 
         let disabled_reason = [status_detail, needs_install]
@@ -108,14 +149,7 @@ impl LaunchActionState {
             .unwrap_or("Version files are not ready.")
             .to_string();
 
-        Self {
-            state_id: "install_required".to_string(),
-            label: "Install".to_string(),
-            tone: LaunchActionTone::Warn,
-            launchable: false,
-            primary_action: LaunchPrimaryAction::Install,
-            disabled_reason: Some(disabled_reason),
-        }
+        Self::install_required(disabled_reason)
     }
 }
 
@@ -124,6 +158,30 @@ impl EnrichedInstance {
         instance: Instance,
         version: Option<&VersionEntry>,
         game_dir: &Path,
+    ) -> Self {
+        Self::from_instance_with_counts(
+            instance,
+            version,
+            ResourceCounts {
+                saves: count_entries(&game_dir.join("saves")),
+                mods: count_entries(&game_dir.join("mods")),
+                resourcepacks: count_entries(&game_dir.join("resourcepacks")),
+                shaderpacks: count_entries(&game_dir.join("shaderpacks")),
+            },
+        )
+    }
+
+    pub fn from_instance_without_resource_counts(
+        instance: Instance,
+        version: Option<&VersionEntry>,
+    ) -> Self {
+        Self::from_instance_with_counts(instance, version, ResourceCounts::default())
+    }
+
+    fn from_instance_with_counts(
+        instance: Instance,
+        version: Option<&VersionEntry>,
+        counts: ResourceCounts,
     ) -> Self {
         let launchable = version.is_some_and(|entry| entry.launchable);
         let status_detail = version
@@ -143,13 +201,21 @@ impl EnrichedInstance {
             status_detail,
             needs_install,
             java_major: version.map(|entry| entry.java_major).unwrap_or_default(),
-            saves_count: count_entries(&game_dir.join("saves")),
-            mods_count: count_entries(&game_dir.join("mods")),
-            resource_count: count_entries(&game_dir.join("resourcepacks")),
-            shader_count: count_entries(&game_dir.join("shaderpacks")),
+            saves_count: counts.saves,
+            mods_count: counts.mods,
+            resource_count: counts.resourcepacks,
+            shader_count: counts.shaderpacks,
             instance,
         }
     }
+}
+
+#[derive(Default)]
+struct ResourceCounts {
+    saves: usize,
+    mods: usize,
+    resourcepacks: usize,
+    shaderpacks: usize,
 }
 
 impl Deref for EnrichedInstance {
@@ -229,7 +295,8 @@ impl InstanceStore {
         }
     }
 
-    fn from_inner(paths: AppPaths, inner: StoredInstances) -> Self {
+    fn from_inner(paths: AppPaths, mut inner: StoredInstances) -> Self {
+        normalize_last_instance_id(&mut inner);
         Self {
             paths,
             inner: RwLock::new(inner),
@@ -255,10 +322,15 @@ impl InstanceStore {
 
     pub fn last_instance_id(&self) -> Option<String> {
         self.inner.read().ok().and_then(|inner| {
-            if inner.last_instance_id.is_empty() {
-                None
-            } else {
+            if !inner.last_instance_id.is_empty()
+                && inner
+                    .instances
+                    .iter()
+                    .any(|instance| instance.id == inner.last_instance_id)
+            {
                 Some(inner.last_instance_id.clone())
+            } else {
+                None
             }
         })
     }
@@ -374,8 +446,15 @@ impl InstanceStore {
         let mut inner = self.inner.write().map_err(|_| {
             InstanceStoreError::Read(std::io::Error::other("instance store lock poisoned"))
         })?;
+        let id = id.into();
+        if !id.is_empty() && !inner.instances.iter().any(|instance| instance.id == id) {
+            return Err(InstanceStoreError::Read(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "instance not found",
+            )));
+        }
         let previous = inner.last_instance_id.clone();
-        inner.last_instance_id = id.into();
+        inner.last_instance_id = id;
         if let Err(error) = self.persist_locked(&inner) {
             inner.last_instance_id = previous;
             return Err(error);
@@ -583,6 +662,19 @@ impl InstanceStore {
     }
 }
 
+fn normalize_last_instance_id(inner: &mut StoredInstances) {
+    if inner.last_instance_id.is_empty() {
+        return;
+    }
+    if !inner
+        .instances
+        .iter()
+        .any(|instance| instance.id == inner.last_instance_id)
+    {
+        inner.last_instance_id.clear();
+    }
+}
+
 fn promote_replacement(source: &Path, destination: &Path) -> Result<(), std::io::Error> {
     let first_error = match fs::rename(source, destination) {
         Ok(()) => return Ok(()),
@@ -710,7 +802,7 @@ fn derive_art_seed(id: &str, name: &str, version_id: &str) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{InstanceStore, StoredInstances};
+    use super::{Instance, InstanceStore, StoredInstances};
     use crate::paths::AppPaths;
     use std::path::{Path, PathBuf};
     use std::sync::RwLock;
@@ -738,6 +830,31 @@ mod tests {
             library_dir: root.join("library"),
             config_dir,
         }
+    }
+
+    fn stored_instance(id: &str) -> Instance {
+        Instance {
+            id: id.to_string(),
+            name: format!("Instance {id}"),
+            version_id: "1.21.1".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            last_played_at: String::new(),
+            art_seed: 1,
+            max_memory_mb: 0,
+            min_memory_mb: 0,
+            java_path: String::new(),
+            window_width: 0,
+            window_height: 0,
+            jvm_preset: String::new(),
+            performance_mode: String::new(),
+            extra_jvm_args: String::new(),
+            icon: String::new(),
+            accent: String::new(),
+        }
+    }
+
+    fn stored_instance_json(id: &str) -> serde_json::Value {
+        serde_json::to_value(stored_instance(id)).expect("serialize stored instance")
     }
 
     #[test]
@@ -777,6 +894,50 @@ mod tests {
         assert!(startup.store.list().is_empty());
         assert!(startup.warnings.is_empty());
         assert!(!paths.instances_file.exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_from_normalizes_stale_last_instance_id_without_rewriting_registry() {
+        let root = test_root("normalize-stale-last-instance");
+        let paths = test_paths(&root);
+        fs::create_dir_all(&paths.config_dir).expect("create config dir");
+        let stored = serde_json::json!({
+            "instances": [stored_instance_json("kept")],
+            "last_instance_id": "missing"
+        });
+        fs::write(
+            &paths.instances_file,
+            serde_json::to_vec_pretty(&stored).expect("serialize registry"),
+        )
+        .expect("write registry");
+
+        let store = InstanceStore::load_from(paths.clone()).expect("load store");
+
+        assert_eq!(store.last_instance_id(), None);
+        let persisted = fs::read_to_string(&paths.instances_file).expect("read registry");
+        assert!(
+            persisted.contains("\"last_instance_id\": \"missing\""),
+            "load normalization should not rewrite registry: {persisted}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn last_instance_id_returns_none_when_inner_value_is_stale() {
+        let root = test_root("last-instance-accessor-stale");
+        let paths = test_paths(&root);
+        let store = InstanceStore {
+            paths,
+            inner: RwLock::new(StoredInstances {
+                instances: vec![stored_instance("kept")],
+                last_instance_id: "missing".to_string(),
+            }),
+        };
+
+        assert_eq!(store.last_instance_id(), None);
 
         let _ = fs::remove_dir_all(root);
     }

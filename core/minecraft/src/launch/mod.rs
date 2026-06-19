@@ -31,7 +31,7 @@ pub struct VersionJson {
     pub arguments: Option<ArgumentsSection>,
     #[serde(rename = "minecraftArguments", default)]
     pub minecraft_arguments: String,
-    #[serde(rename = "assetIndex")]
+    #[serde(rename = "assetIndex", default)]
     pub asset_index: AssetIndex,
     #[serde(default)]
     pub assets: String,
@@ -149,6 +149,13 @@ pub struct JavaVersion {
     pub major_version: i32,
 }
 
+pub const JAVA_RUNTIME_LEGACY: &str = "jre-legacy";
+pub const JAVA_RUNTIME_ALPHA: &str = "java-runtime-alpha";
+pub const JAVA_RUNTIME_BETA: &str = "java-runtime-beta";
+pub const JAVA_RUNTIME_GAMMA: &str = "java-runtime-gamma";
+pub const JAVA_RUNTIME_DELTA: &str = "java-runtime-delta";
+pub const JAVA_RUNTIME_EPSILON: &str = "java-runtime-epsilon";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Library {
     #[serde(default)]
@@ -167,8 +174,16 @@ pub struct Library {
     pub sha1: String,
     #[serde(default)]
     pub sha256: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checksums: Vec<String>,
     #[serde(default)]
     pub size: i64,
+    #[serde(
+        rename = "crooporChecksumlessAllowed",
+        default,
+        skip_serializing_if = "is_false"
+    )]
+    pub croopor_checksumless_allowed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -195,6 +210,10 @@ pub struct LibraryArtifact {
 pub struct ExtractRule {
     #[serde(default)]
     pub exclude: Vec<String>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -321,9 +340,7 @@ pub fn load_version_json(mc_dir: &Path, version_id: &str) -> Result<VersionJson,
             source,
         })?;
 
-    if version.asset_index.id.is_empty() && !version.assets.is_empty() {
-        version.asset_index.id = version.assets.clone();
-    }
+    normalize_asset_index(&mut version);
 
     Ok(version)
 }
@@ -331,7 +348,7 @@ pub fn load_version_json(mc_dir: &Path, version_id: &str) -> Result<VersionJson,
 pub fn resolve_version(mc_dir: &Path, version_id: &str) -> Result<VersionJson, LaunchModelError> {
     let version = load_version_json(mc_dir, version_id)?;
     if version.inherits_from.is_empty() {
-        return Ok(version);
+        return Ok(finalize_effective_version(version));
     }
     resolve_inheritance(mc_dir, version, 0)
 }
@@ -344,12 +361,9 @@ pub fn resolve_libraries(
     let lib_dir = libraries_dir(mc_dir);
     let mut resolved = Vec::new();
     let mut seen_libraries = HashSet::new();
+    let mut seen_native_libraries = HashSet::new();
 
     for lib in &version.libraries {
-        if !seen_libraries.insert(library_merge_key(&lib.name)) {
-            continue;
-        }
-
         if !evaluate_rules(&lib.rules, env) {
             continue;
         }
@@ -360,7 +374,11 @@ pub fn resolve_libraries(
         }
 
         if !lib.natives.is_empty() {
-            resolved.extend(resolve_legacy_natives(lib, &lib_dir, env));
+            for native in resolve_legacy_natives(lib, &lib_dir, env) {
+                if seen_native_libraries.insert(native.name.clone()) {
+                    resolved.push(native);
+                }
+            }
             if lib
                 .downloads
                 .as_ref()
@@ -368,6 +386,10 @@ pub fn resolve_libraries(
             {
                 continue;
             }
+        }
+
+        if !seen_libraries.insert(library_merge_key(&lib.name)) {
+            continue;
         }
 
         if let Some(artifact) = lib
@@ -437,10 +459,9 @@ pub fn resolve_arguments(
             resolve_legacy_args(&version.minecraft_arguments, &var_map),
         )
     } else if let Some(arguments) = &version.arguments {
-        (
-            resolve_arg_list(&arguments.jvm, env, &var_map),
-            resolve_arg_list(&arguments.game, env, &var_map),
-        )
+        let mut game_args = resolve_legacy_args(&version.minecraft_arguments, &var_map);
+        game_args.extend(resolve_arg_list(&arguments.game, env, &var_map));
+        (resolve_arg_list(&arguments.jvm, env, &var_map), game_args)
     } else {
         (Vec::new(), Vec::new())
     };
@@ -498,6 +519,10 @@ impl LaunchVars {
         vars.insert("assets_index_name", self.asset_index_name.clone());
         vars.insert("auth_uuid", self.auth_uuid.clone());
         vars.insert("auth_access_token", self.auth_access_token.clone());
+        vars.insert(
+            "auth_session",
+            format!("token:{}:{}", self.auth_access_token, self.auth_uuid),
+        );
         vars.insert("clientid", self.client_id.clone());
         vars.insert("auth_xuid", self.auth_xuid.clone());
         vars.insert("user_type", self.user_type.clone());
@@ -551,7 +576,7 @@ fn resolve_inheritance(
     }
 
     if child.inherits_from.is_empty() {
-        return Ok(child);
+        return Ok(finalize_effective_version(child));
     }
 
     let parent_id = child.inherits_from.clone();
@@ -565,10 +590,11 @@ fn resolve_inheritance(
         parent = resolve_inheritance(mc_dir, parent, depth + 1)?;
     }
 
-    Ok(merge_versions(&parent, &child))
+    Ok(finalize_effective_version(merge_versions(&parent, &child)))
 }
 
 fn merge_versions(parent: &VersionJson, child: &VersionJson) -> VersionJson {
+    let (arguments, minecraft_arguments) = merge_arguments(parent, child);
     let mut merged = VersionJson {
         id: child.id.clone(),
         inherits_from: String::new(),
@@ -586,55 +612,59 @@ fn merge_versions(parent: &VersionJson, child: &VersionJson) -> VersionJson {
         },
         release_time: non_empty(&child.release_time, &parent.release_time),
         time: non_empty(&child.time, &parent.time),
-        arguments: None,
-        minecraft_arguments: if !child.minecraft_arguments.is_empty() {
-            child.minecraft_arguments.clone()
-        } else {
-            parent.minecraft_arguments.clone()
-        },
+        arguments,
+        minecraft_arguments,
         asset_index: if !child.asset_index.id.is_empty() {
             child.asset_index.clone()
         } else {
             parent.asset_index.clone()
         },
         assets: non_empty(&child.assets, &parent.assets),
-        downloads: parent.downloads.clone(),
-        java_version: merge_java_version(&parent.java_version, &child.java_version),
+        downloads: merge_downloads(&parent.downloads, &child.downloads),
+        java_version: merge_java_version(parent, child),
         libraries: Vec::new(),
         logging: child.logging.clone().or_else(|| parent.logging.clone()),
     };
 
     merged.libraries = merge_libraries_prefer_first(&child.libraries, &parent.libraries);
-
-    if parent.arguments.is_some() || child.arguments.is_some() {
-        let mut arguments = ArgumentsSection::default();
-        if let Some(parent_args) = &parent.arguments {
-            arguments.game.extend(parent_args.game.clone());
-            arguments.jvm.extend(parent_args.jvm.clone());
-        }
-        if let Some(child_args) = &child.arguments {
-            arguments.game.extend(child_args.game.clone());
-            arguments.jvm.extend(child_args.jvm.clone());
-        }
-        merged.arguments = Some(arguments);
-    }
+    normalize_asset_index(&mut merged);
 
     merged
 }
 
 pub fn merge_libraries_prefer_first(preferred: &[Library], fallback: &[Library]) -> Vec<Library> {
     let mut seen = HashSet::new();
+    let mut unconditional_seen = HashSet::new();
     let mut merged = Vec::with_capacity(preferred.len() + fallback.len());
 
     for library in preferred.iter().chain(fallback.iter()) {
-        let key = library_merge_key(&library.name);
-        if !seen.insert(key) {
+        if merged.iter().any(|existing| existing == library) {
             continue;
+        }
+        let key = library_merge_key(&library.name);
+        let duplicate = !seen.insert(key.clone());
+        if duplicate
+            && library.rules.is_empty()
+            && !library_has_native_classifier_variants(library)
+            && unconditional_seen.contains(&key)
+        {
+            continue;
+        }
+        if library.rules.is_empty() {
+            unconditional_seen.insert(key);
         }
         merged.push(library.clone());
     }
 
     merged
+}
+
+fn library_has_native_classifier_variants(library: &Library) -> bool {
+    !library.natives.is_empty()
+        || library
+            .downloads
+            .as_ref()
+            .is_some_and(|downloads| !downloads.classifiers.is_empty())
 }
 
 pub(crate) fn library_merge_key(name: &str) -> String {
@@ -651,18 +681,195 @@ pub(crate) fn library_merge_key(name: &str) -> String {
     key
 }
 
-fn merge_java_version(parent: &JavaVersion, child: &JavaVersion) -> JavaVersion {
+fn merge_arguments(
+    parent: &VersionJson,
+    child: &VersionJson,
+) -> (Option<ArgumentsSection>, String) {
+    let uses_modern_arguments = parent.arguments.is_some() || child.arguments.is_some();
+    if !uses_modern_arguments {
+        return (
+            None,
+            if child.minecraft_arguments.is_empty() {
+                parent.minecraft_arguments.clone()
+            } else {
+                child.minecraft_arguments.clone()
+            },
+        );
+    }
+
+    let mut arguments = ArgumentsSection::default();
+    arguments
+        .game
+        .extend(legacy_arguments_as_modern(&parent.minecraft_arguments));
+    if let Some(parent_args) = &parent.arguments {
+        arguments.game.extend(parent_args.game.clone());
+        arguments.jvm.extend(parent_args.jvm.clone());
+    }
+    arguments
+        .game
+        .extend(legacy_arguments_as_modern(&child.minecraft_arguments));
+    if let Some(child_args) = &child.arguments {
+        arguments.game.extend(child_args.game.clone());
+        arguments.jvm.extend(child_args.jvm.clone());
+    }
+
+    (Some(arguments), String::new())
+}
+
+fn legacy_arguments_as_modern(arguments: &str) -> Vec<Argument> {
+    arguments
+        .split_whitespace()
+        .map(|value| Argument {
+            rules: Vec::new(),
+            value: vec![value.to_string()],
+        })
+        .collect()
+}
+
+fn merge_downloads(parent: &Downloads, child: &Downloads) -> Downloads {
+    Downloads {
+        client: child.client.clone().or_else(|| parent.client.clone()),
+        server: child.server.clone().or_else(|| parent.server.clone()),
+        client_mappings: child
+            .client_mappings
+            .clone()
+            .or_else(|| parent.client_mappings.clone()),
+        server_mappings: child
+            .server_mappings
+            .clone()
+            .or_else(|| parent.server_mappings.clone()),
+    }
+}
+
+fn merge_java_version(parent: &VersionJson, child: &VersionJson) -> JavaVersion {
+    if has_declared_java_version(&child.java_version) {
+        return effective_java_version_for(&child.id, &child.kind, &child.java_version);
+    }
+    parent.java_version.clone()
+}
+
+fn has_declared_java_version(java_version: &JavaVersion) -> bool {
+    !java_version.component.trim().is_empty() || java_version.major_version > 0
+}
+
+fn finalize_effective_version(mut version: VersionJson) -> VersionJson {
+    normalize_asset_index(&mut version);
+    version.java_version =
+        effective_java_version_for(&version.id, &version.kind, &version.java_version);
+    version
+}
+
+fn normalize_asset_index(version: &mut VersionJson) {
+    if version.asset_index.id.is_empty() && !version.assets.is_empty() {
+        version.asset_index.id = version.assets.clone();
+    }
+}
+
+pub fn effective_java_version_for(
+    version_id: &str,
+    raw_kind: &str,
+    declared: &JavaVersion,
+) -> JavaVersion {
+    let inferred = inferred_java_version_for(version_id, raw_kind);
+    let declared_component = declared.component.trim();
+    let component_major = java_major_for_component(declared_component);
+
+    let major_version = if declared.major_version > 0 {
+        declared.major_version
+    } else {
+        component_major.unwrap_or(inferred.major_version)
+    };
+    let component = if declared_component.is_empty() {
+        java_component_for_major(major_version)
+            .unwrap_or(inferred.component.as_str())
+            .to_string()
+    } else {
+        declared_component.to_string()
+    };
+
     JavaVersion {
-        component: if child.component.is_empty() {
-            parent.component.clone()
-        } else {
-            child.component.clone()
-        },
-        major_version: if child.major_version == 0 {
-            parent.major_version
-        } else {
-            child.major_version
-        },
+        component,
+        major_version,
+    }
+}
+
+pub fn java_component_for_major(major_version: i32) -> Option<&'static str> {
+    match major_version {
+        8 => Some(JAVA_RUNTIME_LEGACY),
+        16 => Some(JAVA_RUNTIME_ALPHA),
+        17 => Some(JAVA_RUNTIME_GAMMA),
+        major if major >= 21 => Some(JAVA_RUNTIME_DELTA),
+        _ => None,
+    }
+}
+
+pub fn java_major_for_component(component: &str) -> Option<i32> {
+    match component.trim() {
+        JAVA_RUNTIME_LEGACY => Some(8),
+        JAVA_RUNTIME_ALPHA => Some(16),
+        JAVA_RUNTIME_BETA | JAVA_RUNTIME_GAMMA => Some(17),
+        JAVA_RUNTIME_DELTA | JAVA_RUNTIME_EPSILON => Some(21),
+        _ => None,
+    }
+}
+
+fn inferred_java_version_for(version_id: &str, raw_kind: &str) -> JavaVersion {
+    if matches!(raw_kind, "old_alpha" | "old_beta") {
+        return java_version(JAVA_RUNTIME_LEGACY, 8);
+    }
+
+    let Some(release) = parse_release_prefix(version_id) else {
+        return java_version(JAVA_RUNTIME_DELTA, 21);
+    };
+    match release.as_slice() {
+        [1, minor, ..] if *minor < 17 => java_version(JAVA_RUNTIME_LEGACY, 8),
+        [1, 17, ..] => java_version(JAVA_RUNTIME_ALPHA, 16),
+        [1, 18..=19, ..] => java_version(JAVA_RUNTIME_GAMMA, 17),
+        [1, 20] => java_version(JAVA_RUNTIME_GAMMA, 17),
+        [1, 20, patch, ..] if *patch < 5 => java_version(JAVA_RUNTIME_GAMMA, 17),
+        [1, 20, ..] => java_version(JAVA_RUNTIME_DELTA, 21),
+        [1, minor, ..] if *minor > 20 => java_version(JAVA_RUNTIME_DELTA, 21),
+        [major, ..] if *major > 1 => java_version(JAVA_RUNTIME_DELTA, 21),
+        _ => java_version(JAVA_RUNTIME_DELTA, 21),
+    }
+}
+
+fn java_version(component: &str, major_version: i32) -> JavaVersion {
+    JavaVersion {
+        component: component.to_string(),
+        major_version,
+    }
+}
+
+fn parse_release_prefix(version_id: &str) -> Option<Vec<u32>> {
+    let mut components = Vec::new();
+    let mut current = String::new();
+    let mut saw_dot = false;
+
+    for byte in version_id.bytes() {
+        if byte.is_ascii_digit() {
+            current.push(byte as char);
+            continue;
+        }
+        if byte == b'.' {
+            if current.is_empty() {
+                return None;
+            }
+            saw_dot = true;
+            components.push(current.parse::<u32>().ok()?);
+            current.clear();
+            continue;
+        }
+        break;
+    }
+
+    if !current.is_empty() {
+        components.push(current.parse::<u32>().ok()?);
+    }
+    if saw_dot && components.len() >= 2 {
+        Some(components)
+    } else {
+        None
     }
 }
 
@@ -880,7 +1087,7 @@ fn non_empty(preferred: &str, fallback: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rules::default_environment;
+    use crate::rules::{Environment, OsRule, Rule, default_environment};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -896,6 +1103,28 @@ mod tests {
         assert_eq!(
             game_args,
             vec!["--username".to_string(), "Player".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_arguments_fills_legacy_auth_session() {
+        let version = VersionJson {
+            id: "1.5.2".to_string(),
+            minecraft_arguments: "${auth_player_name} ${auth_session}".to_string(),
+            ..default_version()
+        };
+        let mut vars = default_launch_vars();
+        vars.auth_access_token = "access-token".to_string();
+        vars.auth_uuid = "offline-uuid".to_string();
+
+        let (_jvm_args, game_args) = resolve_arguments(&version, &default_environment(), &vars);
+
+        assert_eq!(
+            game_args,
+            vec![
+                "Player".to_string(),
+                "token:access-token:offline-uuid".to_string()
+            ]
         );
     }
 
@@ -918,13 +1147,7 @@ mod tests {
 
     #[test]
     fn resolve_version_inherits_java_and_arguments() {
-        let temp_root = std::env::temp_dir().join(format!(
-            "croopor-launch-test-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
+        let temp_root = temp_root("inherits-java-and-arguments");
         let versions_dir = temp_root.join("versions");
         fs::create_dir_all(versions_dir.join("base")).expect("base dir");
         fs::create_dir_all(versions_dir.join("child")).expect("child dir");
@@ -956,7 +1179,6 @@ mod tests {
                     "game": ["--child"],
                     "jvm": ["-Dchild=true"]
                 },
-                "assetIndex": { "id": "1.20.1" },
                 "libraries": []
             })
             .to_string(),
@@ -965,9 +1187,140 @@ mod tests {
 
         let resolved = resolve_version(&temp_root, "child").expect("resolve inherited version");
         assert_eq!(resolved.java_version.major_version, 17);
+        assert_eq!(resolved.asset_index.id, "1.20.1");
         let arguments = resolved.arguments.expect("merged arguments");
         assert_eq!(arguments.jvm.len(), 2);
         assert_eq!(arguments.game.len(), 2);
+
+        let _ = fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn missing_java_version_infers_java8_for_legacy_releases() {
+        let temp_root = temp_root("legacy-java-inference");
+        write_version_json(
+            &temp_root,
+            "1.8.9",
+            serde_json::json!({
+                "id": "1.8.9",
+                "type": "release",
+                "mainClass": "net.minecraft.client.main.Main",
+                "libraries": []
+            }),
+        );
+        write_version_json(
+            &temp_root,
+            "1.12.2",
+            serde_json::json!({
+                "id": "1.12.2",
+                "type": "release",
+                "mainClass": "net.minecraft.client.main.Main",
+                "libraries": []
+            }),
+        );
+
+        for version_id in ["1.8.9", "1.12.2"] {
+            let resolved = resolve_version(&temp_root, version_id).expect("resolve version");
+            assert_eq!(resolved.java_version.component, JAVA_RUNTIME_LEGACY);
+            assert_eq!(resolved.java_version.major_version, 8);
+        }
+
+        let _ = fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn inherited_child_client_download_prefers_child_artifact() {
+        let temp_root = temp_root("child-client-download");
+        write_version_json(
+            &temp_root,
+            "base",
+            serde_json::json!({
+                "id": "base",
+                "type": "release",
+                "mainClass": "net.minecraft.client.main.Main",
+                "assetIndex": { "id": "base-assets" },
+                "downloads": {
+                    "client": { "url": "https://example.invalid/base.jar" }
+                },
+                "javaVersion": { "component": "java-runtime-gamma", "majorVersion": 17 },
+                "libraries": []
+            }),
+        );
+        write_version_json(
+            &temp_root,
+            "child",
+            serde_json::json!({
+                "id": "child",
+                "inheritsFrom": "base",
+                "type": "release",
+                "downloads": {
+                    "client": { "url": "https://example.invalid/child.jar" }
+                },
+                "libraries": []
+            }),
+        );
+
+        let resolved = resolve_version(&temp_root, "child").expect("resolve inherited version");
+
+        assert_eq!(
+            resolved
+                .downloads
+                .client
+                .as_ref()
+                .map(|entry| entry.url.as_str()),
+            Some("https://example.invalid/child.jar")
+        );
+
+        let _ = fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn mixed_legacy_and_modern_arguments_keep_legacy_game_args() {
+        let temp_root = temp_root("mixed-legacy-modern-arguments");
+        write_version_json(
+            &temp_root,
+            "base",
+            serde_json::json!({
+                "id": "base",
+                "type": "release",
+                "mainClass": "net.minecraft.client.main.Main",
+                "minecraftArguments": "--username ${auth_player_name} --version ${version_name}",
+                "assetIndex": { "id": "legacy-assets" },
+                "javaVersion": { "component": "jre-legacy", "majorVersion": 8 },
+                "libraries": []
+            }),
+        );
+        write_version_json(
+            &temp_root,
+            "child",
+            serde_json::json!({
+                "id": "child",
+                "inheritsFrom": "base",
+                "type": "release",
+                "arguments": {
+                    "game": ["--tweakClass", "com.example.Tweaker"],
+                    "jvm": ["-Dchild=true"]
+                },
+                "libraries": []
+            }),
+        );
+
+        let resolved = resolve_version(&temp_root, "child").expect("resolve inherited version");
+        let mut vars = default_launch_vars();
+        vars.version_name = resolved.id.clone();
+        let (_jvm_args, game_args) = resolve_arguments(&resolved, &default_environment(), &vars);
+
+        assert_eq!(
+            game_args,
+            vec![
+                "--username".to_string(),
+                "Player".to_string(),
+                "--version".to_string(),
+                "child".to_string(),
+                "--tweakClass".to_string(),
+                "com.example.Tweaker".to_string(),
+            ]
+        );
 
         let _ = fs::remove_dir_all(&temp_root);
     }
@@ -1004,10 +1357,10 @@ mod tests {
             assets_root: ".".to_string(),
             asset_index_name: "1.20.1".to_string(),
             auth_uuid: offline_uuid("Player"),
-            auth_access_token: "null".to_string(),
+            auth_access_token: "0".to_string(),
             client_id: String::new(),
             auth_xuid: String::new(),
-            user_type: "legacy".to_string(),
+            user_type: "msa".to_string(),
             version_type: "release".to_string(),
             launcher_name: "croopor".to_string(),
             launcher_version: "1.0.0".to_string(),
@@ -1023,6 +1376,26 @@ mod tests {
             resolution_height: String::new(),
             game_assets: String::new(),
         }
+    }
+
+    fn temp_root(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "croopor-launch-{name}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ))
+    }
+
+    fn write_version_json(root: &Path, version_id: &str, value: serde_json::Value) {
+        let version_dir = root.join("versions").join(version_id);
+        fs::create_dir_all(&version_dir).expect("version dir");
+        fs::write(
+            version_dir.join(format!("{version_id}.json")),
+            value.to_string(),
+        )
+        .expect("version json");
     }
 
     #[test]
@@ -1091,6 +1464,83 @@ mod tests {
     }
 
     #[test]
+    fn merge_libraries_keeps_rule_variant_duplicates() {
+        let merged = merge_libraries_prefer_first(
+            &[Library {
+                name: "org.lwjgl:lwjgl:3.2.1".to_string(),
+                rules: vec![allow_os_rule("osx")],
+                ..Library::default()
+            }],
+            &[Library {
+                name: "org.lwjgl:lwjgl:3.2.2".to_string(),
+                rules: vec![allow_os_rule("linux")],
+                ..Library::default()
+            }],
+        );
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].name, "org.lwjgl:lwjgl:3.2.1");
+        assert_eq!(merged[1].name, "org.lwjgl:lwjgl:3.2.2");
+    }
+
+    #[test]
+    fn merge_libraries_drops_exact_rule_variant_duplicates() {
+        let library = Library {
+            name: "org.lwjgl.lwjgl:lwjgl:2.9.0".to_string(),
+            rules: vec![allow_os_rule("windows")],
+            ..Library::default()
+        };
+
+        let merged =
+            merge_libraries_prefer_first(std::slice::from_ref(&library), &[library.clone()]);
+
+        assert_eq!(merged, vec![library]);
+    }
+
+    #[test]
+    fn merge_libraries_keeps_native_classifier_duplicate() {
+        let mut classifiers = HashMap::new();
+        classifiers.insert(
+            "natives-windows".to_string(),
+            LibraryArtifact {
+                path: "org/lwjgl/lwjgl/3.1.6/lwjgl-3.1.6-natives-windows.jar".to_string(),
+                ..LibraryArtifact::default()
+            },
+        );
+        let merged = merge_libraries_prefer_first(
+            &[
+                Library {
+                    name: "org.lwjgl:lwjgl:3.1.6".to_string(),
+                    downloads: Some(LibraryDownload {
+                        artifact: Some(LibraryArtifact {
+                            path: "org/lwjgl/lwjgl/3.1.6/lwjgl-3.1.6.jar".to_string(),
+                            ..LibraryArtifact::default()
+                        }),
+                        ..LibraryDownload::default()
+                    }),
+                    ..Library::default()
+                },
+                Library {
+                    name: "org.lwjgl:lwjgl:3.1.6".to_string(),
+                    natives: HashMap::from([(
+                        "windows".to_string(),
+                        "natives-windows".to_string(),
+                    )]),
+                    downloads: Some(LibraryDownload {
+                        classifiers,
+                        ..LibraryDownload::default()
+                    }),
+                    ..Library::default()
+                },
+            ],
+            &[],
+        );
+
+        assert_eq!(merged.len(), 2);
+        assert!(merged[1].natives.contains_key("windows"));
+    }
+
+    #[test]
     fn resolve_libraries_skips_duplicate_artifact_versions_from_existing_manifest() {
         let mut version = default_version();
         version.libraries = vec![
@@ -1113,5 +1563,112 @@ mod tests {
                 .to_string_lossy()
                 .contains("org/ow2/asm/asm/9.9/asm-9.9.jar")
         );
+    }
+
+    #[test]
+    fn resolve_libraries_applies_rules_before_duplicate_keys() {
+        let mut version = default_version();
+        version.libraries = vec![
+            Library {
+                name: "org.lwjgl:lwjgl:3.2.1".to_string(),
+                rules: vec![allow_os_rule("osx")],
+                ..Library::default()
+            },
+            Library {
+                name: "org.lwjgl:lwjgl:3.2.2".to_string(),
+                rules: vec![allow_os_rule("linux")],
+                ..Library::default()
+            },
+        ];
+        let env = Environment {
+            os_name: "linux".to_string(),
+            os_arch: "x86_64".to_string(),
+            os_version: String::new(),
+            features: default_environment().features,
+        };
+
+        let resolved = resolve_libraries(&version, Path::new("/tmp/croopor"), &env);
+
+        assert_eq!(resolved.len(), 1);
+        assert!(
+            resolved[0]
+                .abs_path
+                .to_string_lossy()
+                .contains("org/lwjgl/lwjgl/3.2.2/lwjgl-3.2.2.jar")
+        );
+    }
+
+    #[test]
+    fn resolve_libraries_resolves_native_classifier_before_duplicate_artifact_key() {
+        let mut classifiers = HashMap::new();
+        classifiers.insert(
+            "natives-windows".to_string(),
+            LibraryArtifact {
+                path: "org/lwjgl/lwjgl/3.1.6/lwjgl-3.1.6-natives-windows.jar".to_string(),
+                ..LibraryArtifact::default()
+            },
+        );
+        let mut version = default_version();
+        version.libraries = vec![
+            Library {
+                name: "org.lwjgl:lwjgl:3.1.6".to_string(),
+                downloads: Some(LibraryDownload {
+                    artifact: Some(LibraryArtifact {
+                        path: "org/lwjgl/lwjgl/3.1.6/lwjgl-3.1.6.jar".to_string(),
+                        ..LibraryArtifact::default()
+                    }),
+                    ..LibraryDownload::default()
+                }),
+                ..Library::default()
+            },
+            Library {
+                name: "org.lwjgl:lwjgl:3.1.6".to_string(),
+                natives: HashMap::from([("windows".to_string(), "natives-windows".to_string())]),
+                downloads: Some(LibraryDownload {
+                    artifact: Some(LibraryArtifact {
+                        path: "org/lwjgl/lwjgl/3.1.6/lwjgl-3.1.6.jar".to_string(),
+                        ..LibraryArtifact::default()
+                    }),
+                    classifiers,
+                }),
+                ..Library::default()
+            },
+        ];
+        let env = Environment {
+            os_name: "windows".to_string(),
+            os_arch: "x86_64".to_string(),
+            os_version: String::new(),
+            features: default_environment().features,
+        };
+
+        let resolved = resolve_libraries(&version, Path::new("C:/croopor/library"), &env);
+
+        assert_eq!(resolved.len(), 2);
+        assert!(resolved.iter().any(|library| {
+            !library.is_native
+                && library
+                    .abs_path
+                    .to_string_lossy()
+                    .contains("lwjgl-3.1.6.jar")
+        }));
+        assert!(resolved.iter().any(|library| {
+            library.is_native
+                && library
+                    .abs_path
+                    .to_string_lossy()
+                    .contains("lwjgl-3.1.6-natives-windows.jar")
+        }));
+    }
+
+    fn allow_os_rule(name: &str) -> Rule {
+        Rule {
+            action: "allow".to_string(),
+            os: Some(OsRule {
+                name: name.to_string(),
+                arch: String::new(),
+                version: String::new(),
+            }),
+            features: None,
+        }
     }
 }

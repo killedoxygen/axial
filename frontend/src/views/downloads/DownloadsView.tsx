@@ -32,10 +32,12 @@ export function DownloadsView(): JSX.Element {
   const state = installState.value;
   const queueState = installQueueState.value;
   const queue = queueState.items;
+  const queueActive = queueState.active ?? null;
   const queueView = queueState.view_model;
   const failure = installFailure.value;
-  const hasActive = state.status === 'active';
-  const activeStartedAt = hasActive ? state.startedAt : 0;
+  const localActive = state.status === 'active' ? state : null;
+  const hasActive = Boolean(queueActive || localActive);
+  const activeStartedAt = localActive?.startedAt ?? 0;
   const [elapsedNow, setElapsedNow] = useState(() => Date.now());
 
   useEffect(() => {
@@ -49,15 +51,29 @@ export function DownloadsView(): JSX.Element {
     };
   }, [hasActive, activeStartedAt]);
 
-  const activeTitle = hasActive ? state.displayName || state.versionId : '';
-  const activePct = hasActive ? Math.round(Math.max(0, Math.min(100, state.pct))) : 0;
-  const activeStep = hasActive ? state.activeStep : undefined;
+  const queueActiveStep = queueActive?.progress.active_step
+    ? {
+        phase: queueActive.progress.active_step.phase_id,
+        label: queueActive.progress.active_step.label,
+        pct: queueActive.progress.active_step.progress_pct,
+        current: queueActive.progress.active_step.current,
+        total: queueActive.progress.active_step.total,
+      }
+    : undefined;
+  const activeTitle = queueActive?.label || localActive?.displayName || localActive?.versionId || '';
+  const activeLabel = queueActive?.progress.label || localActive?.label || '';
+  const activePct = Math.round(Math.max(0, Math.min(100, queueActive?.progress.progress_pct ?? localActive?.pct ?? 0)));
+  const activeStep = queueActiveStep ?? localActive?.activeStep;
   const stepPct = activeStep ? Math.round(Math.max(0, Math.min(100, activeStep.pct))) : 0;
   const stepRatio = activeStep ? activeStepRatio(activeStep.current, activeStep.total) : '';
+  const elapsedLabel = localActive
+    ? formatElapsedTime(localActive.startedAt, elapsedNow)
+    : queueActive?.summary || queueView.status_label;
   const nextQueuedLabel = queueView.next_label || '';
   const failureView = failure?.viewModel;
   const failureDetails = failureView?.details ?? [];
   const retryAction = failureView?.retry_action;
+  const repairAction = failureView?.repair_action;
   const failureCard = failure ? (
     <Card>
       <SectionHeading
@@ -108,6 +124,17 @@ export function DownloadsView(): JSX.Element {
           </div>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginLeft: 'auto' }}>
+          {repairAction && (
+            <Button
+              variant="secondary"
+              size="sm"
+              icon="shield-check"
+              disabled={!repairAction.enabled}
+              title={repairAction.disabled_reason || undefined}
+            >
+              {repairAction.label}
+            </Button>
+          )}
           <Button
             variant="secondary"
             size="sm"
@@ -153,7 +180,7 @@ export function DownloadsView(): JSX.Element {
               overflowWrap: 'anywhere',
             }}
           >
-            {state.label}
+            {activeLabel}
           </div>
           <div class="cp-download-active-meter">
             <Meter value={activePct} ariaLabel={`Install progress for ${activeTitle}`} />
@@ -183,7 +210,7 @@ export function DownloadsView(): JSX.Element {
               lineHeight: 1.35,
             }}
           >
-            <span>{formatElapsedTime(state.startedAt, elapsedNow)}</span>
+            <span>{elapsedLabel}</span>
             <span style={{ fontVariantNumeric: 'tabular-nums' }}>
               {activeStep ? `${activeStep.label} ${stepPct}% · overall ${activePct}%` : `${activePct}%`}
             </span>

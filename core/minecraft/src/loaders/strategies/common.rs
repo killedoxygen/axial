@@ -1,8 +1,12 @@
+#[cfg(test)]
+use crate::download::download_libraries_with_facts_and_descriptors;
 use crate::download::{
     DownloadError, DownloadProgress, Downloader, ExecutionDownloadError, ExecutionDownloadReport,
-    download_libraries, write_launcher_managed_artifact_bytes_to_temp,
+    LauncherManagedArtifactReadiness,
+    download_libraries_allowing_missing_checksums_with_facts_and_descriptors, library_jobs_for,
+    verify_existing_launcher_managed_artifact, write_launcher_managed_artifact_bytes_to_temp,
 };
-use crate::launch::resolve_version;
+use crate::launch::{DownloadEntry, VersionJson, resolve_version};
 use crate::loaders::compose::{
     LoaderProfileFragment, cleanup_incomplete_version, compose_loader_version,
     finalize_version_install, write_composed_version,
@@ -17,14 +21,18 @@ use crate::loaders::validate_version_id;
 use crate::paths::{loader_artifacts_dir, versions_dir};
 use crate::profiles::ensure_launcher_profiles;
 use serde::Serialize;
-use std::collections::HashMap;
-use std::io::sink;
+use sha1::{Digest as _, Sha1};
+use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::{Read, Write, sink};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs as async_fs;
 use zip::ZipArchive;
+use zip::ZipWriter;
 use zip::result::ZipError;
+use zip::write::SimpleFileOptions;
 
 const MAX_INSTALLER_DOWNLOAD_SIZE: u64 = 50 << 20;
 const LOADER_METADATA_FILE: &str = ".croopor-loader.json";
@@ -85,12 +93,12 @@ where
     )
     .await?;
     let profile_bytes = cached_profile.bytes;
-    let fragment = cached_profile.fragment;
-    let installed_version_id = if fragment.id.trim().is_empty() {
-        plan.record.version_id.clone()
-    } else {
-        fragment.id.clone()
-    };
+    let mut fragment = cached_profile.fragment;
+    mark_loader_libraries_checksumless_allowed(&mut fragment.libraries);
+    if !fragment.id.trim().is_empty() {
+        validate_version_id(&fragment.id, "upstream loader profile version id")?;
+    }
+    let installed_version_id = plan.record.version_id.clone();
     validate_version_id(&installed_version_id, "installed loader version id")?;
 
     cleanup_on_error(
@@ -98,14 +106,17 @@ where
         library_dir,
         &installed_version_id,
     )?;
-    let library_download_result = Box::pin(download_libraries(
+    let library_download_result = Box::pin(download_profile_loader_libraries_with_evidence(
         library_dir,
         &fragment.libraries,
         "loader_libraries",
         &mut *send,
     ))
     .await
-    .map_err(|error| LoaderError::Other(format!("downloading loader libraries: {error}")));
+    .map_err(|error| match error {
+        LoaderError::ArtifactDownloadFailed { .. } => error,
+        error => LoaderError::Other(format!("downloading loader libraries: {error}")),
+    });
     cleanup_on_error(library_download_result, library_dir, &installed_version_id)?;
     cleanup_on_error(
         Box::pin(ensure_base_version(
@@ -190,8 +201,10 @@ where
             plan.record.component_name
         )),
     ));
-    let (installer_data, extracted) =
+    let (installer_data, mut extracted) =
         read_valid_installer(&installer_path, installer_url, &plan.record.component_name).await?;
+    mark_loader_libraries_checksumless_allowed(&mut extracted.version_fragment.libraries);
+    mark_loader_libraries_checksumless_allowed(&mut extracted.libraries);
 
     send(progress(
         "profile",
@@ -202,11 +215,10 @@ where
             plan.record.component_name
         )),
     ));
-    let installed_version_id = if extracted.version_id.trim().is_empty() {
-        plan.record.version_id.clone()
-    } else {
-        extracted.version_id.clone()
-    };
+    if !extracted.version_id.trim().is_empty() {
+        validate_version_id(&extracted.version_id, "upstream installer version id")?;
+    }
+    let installed_version_id = plan.record.version_id.clone();
     validate_version_id(&installed_version_id, "installed loader version id")?;
     let version = compose_loader_version(
         library_dir,
@@ -237,18 +249,19 @@ where
         library_dir,
         &installed_version_id,
     )?;
-    let library_download_result = Box::pin(download_libraries(
+    let library_download_result = Box::pin(download_profile_loader_libraries_with_evidence(
         library_dir,
         &extracted.libraries,
         "loader_libraries",
         &mut *send,
     ))
     .await
-    .map_err(|error| {
-        LoaderError::Other(format!(
+    .map_err(|error| match error {
+        LoaderError::ArtifactDownloadFailed { .. } => error,
+        error => LoaderError::Other(format!(
             "downloading {} libraries: {error}",
             plan.record.component_name
-        ))
+        )),
     });
     cleanup_on_error(library_download_result, library_dir, &installed_version_id)?;
 
@@ -285,6 +298,31 @@ where
             ))
         });
         cleanup_on_error(processor_result, library_dir, &installed_version_id)?;
+    }
+
+    if extracted.strip_client_meta {
+        send(progress(
+            "client_jar",
+            0,
+            1,
+            Some(format!("{installed_version_id}.jar")),
+        ));
+        cleanup_on_error(
+            strip_child_client_jar_meta(library_dir, &installed_version_id).await,
+            library_dir,
+            &installed_version_id,
+        )?;
+        cleanup_on_error(
+            write_patched_client_jar_integrity(library_dir, &installed_version_id).await,
+            library_dir,
+            &installed_version_id,
+        )?;
+        send(progress(
+            "client_jar",
+            1,
+            1,
+            Some(format!("{installed_version_id}.jar")),
+        ));
     }
 
     cleanup_on_error(
@@ -365,11 +403,19 @@ where
         &plan.record.version_id,
     )?;
 
-    let version_jar = versions_dir(library_dir)
-        .join(&plan.record.version_id)
-        .join(format!("{}.jar", plan.record.version_id));
     cleanup_on_error(
-        async_fs::write(&version_jar, archive_data).await,
+        overlay_legacy_archive_onto_base_client(
+            library_dir,
+            &plan.record.minecraft_version,
+            &plan.record.version_id,
+            archive_data,
+        )
+        .await,
+        library_dir,
+        &plan.record.version_id,
+    )?;
+    cleanup_on_error(
+        write_patched_client_jar_integrity(library_dir, &plan.record.version_id).await,
         library_dir,
         &plan.record.version_id,
     )?;
@@ -464,7 +510,76 @@ fn is_base_game_installed(library_dir: &Path, game_version: &str) -> bool {
     let json_path = version_dir.join(format!("{game_version}.json"));
     let jar_path = version_dir.join(format!("{game_version}.jar"));
     let marker_path = version_dir.join(".incomplete");
-    json_path.is_file() && jar_path.is_file() && !marker_path.exists()
+    if !json_path.is_file() || !jar_path.is_file() || marker_path.exists() {
+        return false;
+    }
+
+    let Ok(version) = resolve_version(library_dir, game_version) else {
+        return false;
+    };
+    library_jobs_for(
+        library_dir,
+        &version.libraries,
+        &crate::rules::default_environment(),
+    )
+    .into_iter()
+    .all(|job| {
+        verify_existing_launcher_managed_artifact(&job.path, &job.expected)
+            == LauncherManagedArtifactReadiness::Verified
+    })
+}
+
+fn mark_loader_libraries_checksumless_allowed(libraries: &mut [crate::launch::Library]) {
+    for library in libraries {
+        library.croopor_checksumless_allowed = true;
+    }
+}
+
+#[cfg(test)]
+async fn download_loader_libraries_with_evidence<F>(
+    library_dir: &Path,
+    libraries: &[crate::launch::Library],
+    phase: &str,
+    send: &mut F,
+) -> Result<(), LoaderError>
+where
+    F: FnMut(DownloadProgress),
+{
+    let mut facts = Vec::new();
+    let mut descriptors = Vec::new();
+    download_libraries_with_facts_and_descriptors(
+        library_dir,
+        libraries,
+        phase,
+        &mut *send,
+        |fact| facts.push(fact),
+        |descriptor| descriptors.push(descriptor),
+    )
+    .await
+    .map_err(|_| LoaderError::ArtifactDownloadFailed { facts, descriptors })
+}
+
+async fn download_profile_loader_libraries_with_evidence<F>(
+    library_dir: &Path,
+    libraries: &[crate::launch::Library],
+    phase: &str,
+    send: &mut F,
+) -> Result<(), LoaderError>
+where
+    F: FnMut(DownloadProgress),
+{
+    let mut facts = Vec::new();
+    let mut descriptors = Vec::new();
+    download_libraries_allowing_missing_checksums_with_facts_and_descriptors(
+        library_dir,
+        libraries,
+        phase,
+        &mut *send,
+        |fact| facts.push(fact),
+        |descriptor| descriptors.push(descriptor),
+    )
+    .await
+    .map_err(|_| LoaderError::ArtifactDownloadFailed { facts, descriptors })
 }
 
 fn cleanup_on_error<T, E>(
@@ -662,6 +777,195 @@ async fn extract_maven_entries_blocking(
     .map_err(InstallerTaskError::Task)?
 }
 
+async fn overlay_legacy_archive_onto_base_client(
+    library_dir: &Path,
+    base_version_id: &str,
+    version_id: &str,
+    archive_data: Vec<u8>,
+) -> Result<(), LoaderError> {
+    validate_version_id(base_version_id, "base minecraft version id")?;
+    validate_version_id(version_id, "installed loader version id")?;
+    let base_jar = versions_dir(library_dir)
+        .join(base_version_id)
+        .join(format!("{base_version_id}.jar"));
+    let output_jar = versions_dir(library_dir)
+        .join(version_id)
+        .join(format!("{version_id}.jar"));
+    let temp_jar = artifact_tmp_path(&output_jar);
+    let blocking_temp_jar = temp_jar.clone();
+    tokio::task::spawn_blocking(move || {
+        overlay_legacy_archive_blocking(&base_jar, &blocking_temp_jar, &archive_data)
+    })
+    .await
+    .map_err(|error| LoaderError::Other(format!("overlaying legacy Forge archive: {error}")))??;
+    async_fs::rename(&temp_jar, &output_jar).await?;
+    Ok(())
+}
+
+async fn write_patched_client_jar_integrity(
+    library_dir: &Path,
+    version_id: &str,
+) -> Result<(), LoaderError> {
+    validate_version_id(version_id, "installed loader version id")?;
+    let version_dir = versions_dir(library_dir).join(version_id);
+    let version_path = version_dir.join(format!("{version_id}.json"));
+    let jar_path = version_dir.join(format!("{version_id}.jar"));
+    let jar_bytes = async_fs::read(&jar_path).await?;
+    let mut hasher = Sha1::new();
+    hasher.update(&jar_bytes);
+    let sha1 = format!("{:x}", hasher.finalize());
+    let size = i64::try_from(jar_bytes.len()).unwrap_or(i64::MAX);
+
+    let version_bytes = async_fs::read(&version_path).await?;
+    let mut version: VersionJson = serde_json::from_slice(&version_bytes).map_err(|error| {
+        LoaderError::InvalidProfile(format!("parse installed version: {error}"))
+    })?;
+    let client = version
+        .downloads
+        .client
+        .get_or_insert_with(DownloadEntry::default);
+    client.sha1 = sha1;
+    client.size = size;
+    client.url.clear();
+    async_fs::write(&version_path, serde_json::to_vec_pretty(&version)?).await?;
+    Ok(())
+}
+
+async fn strip_child_client_jar_meta(
+    library_dir: &Path,
+    version_id: &str,
+) -> Result<(), LoaderError> {
+    validate_version_id(version_id, "installed loader version id")?;
+    let jar_path = versions_dir(library_dir)
+        .join(version_id)
+        .join(format!("{version_id}.jar"));
+    let temp_jar = artifact_tmp_path(&jar_path);
+    let source_jar = jar_path.clone();
+    let blocking_temp_jar = temp_jar.clone();
+    tokio::task::spawn_blocking(move || {
+        strip_zip_metadata_blocking(&source_jar, &blocking_temp_jar)
+    })
+    .await
+    .map_err(|error| LoaderError::Other(format!("stripping legacy client metadata: {error}")))??;
+
+    match async_fs::remove_file(&jar_path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            let _ = async_fs::remove_file(&temp_jar).await;
+            return Err(LoaderError::Io(error));
+        }
+    }
+    match async_fs::rename(&temp_jar, &jar_path).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = async_fs::remove_file(&temp_jar).await;
+            Err(LoaderError::Io(error))
+        }
+    }
+}
+
+fn strip_zip_metadata_blocking(source_jar: &Path, temp_jar: &Path) -> Result<(), LoaderError> {
+    if let Some(parent) = temp_jar.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let source_file = File::open(source_jar)?;
+    let mut source_archive = ZipArchive::new(source_file)
+        .map_err(|error| legacy_archive_error("legacy client", error))?;
+    let output_file = File::create(temp_jar)?;
+    let mut writer = ZipWriter::new(output_file);
+    copy_zip_entries(&mut source_archive, &mut writer, None)?;
+    writer
+        .finish()
+        .map_err(|error| legacy_archive_error("legacy client metadata strip", error))?;
+    Ok(())
+}
+
+fn overlay_legacy_archive_blocking(
+    base_jar: &Path,
+    temp_jar: &Path,
+    archive_data: &[u8],
+) -> Result<(), LoaderError> {
+    if let Some(parent) = temp_jar.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let base_file = File::open(base_jar)?;
+    let mut base_archive = ZipArchive::new(base_file)
+        .map_err(|error| legacy_archive_error("base Minecraft", error))?;
+    let mut forge_archive = ZipArchive::new(std::io::Cursor::new(archive_data))
+        .map_err(|error| legacy_archive_error("Forge", error))?;
+    let forge_names = archive_entry_names(&mut forge_archive)?;
+    let output_file = File::create(temp_jar)?;
+    let mut writer = ZipWriter::new(output_file);
+
+    copy_zip_entries(&mut base_archive, &mut writer, Some(&forge_names))?;
+    let mut forge_archive = ZipArchive::new(std::io::Cursor::new(archive_data))
+        .map_err(|error| legacy_archive_error("Forge", error))?;
+    copy_zip_entries(&mut forge_archive, &mut writer, None)?;
+    writer
+        .finish()
+        .map_err(|error| legacy_archive_error("legacy Forge overlay", error))?;
+    Ok(())
+}
+
+fn archive_entry_names<R: std::io::Read + std::io::Seek>(
+    archive: &mut ZipArchive<R>,
+) -> Result<HashSet<String>, LoaderError> {
+    let mut names = HashSet::new();
+    for index in 0..archive.len() {
+        let entry = archive
+            .by_index(index)
+            .map_err(|error| legacy_archive_error("Forge", error))?;
+        if legacy_archive_entry_is_skipped(entry.name()) {
+            continue;
+        }
+        names.insert(entry.name().to_string());
+    }
+    Ok(names)
+}
+
+fn copy_zip_entries<R: std::io::Read + std::io::Seek, W: std::io::Write + std::io::Seek>(
+    archive: &mut ZipArchive<R>,
+    writer: &mut ZipWriter<W>,
+    replaced_names: Option<&HashSet<String>>,
+) -> Result<(), LoaderError> {
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|error| legacy_archive_error("legacy Forge", error))?;
+        let name = entry.name().to_string();
+        if legacy_archive_entry_is_skipped(&name)
+            || replaced_names.is_some_and(|names| names.contains(&name))
+        {
+            continue;
+        }
+        if entry.is_dir() || name.ends_with('/') {
+            writer
+                .add_directory(&name, SimpleFileOptions::default())
+                .map_err(|error| legacy_archive_error("legacy Forge overlay", error))?;
+            continue;
+        }
+
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).map_err(LoaderError::Io)?;
+        writer
+            .start_file(&name, SimpleFileOptions::default())
+            .map_err(|error| legacy_archive_error("legacy Forge overlay", error))?;
+        writer.write_all(&bytes).map_err(LoaderError::Io)?;
+    }
+    Ok(())
+}
+
+fn legacy_archive_entry_is_skipped(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper == "META-INF/MANIFEST.MF"
+        || upper.ends_with(".SF")
+        || upper.ends_with(".RSA")
+        || upper.ends_with(".DSA")
+}
+
 #[cfg(test)]
 async fn promote_cached_artifact_tmp(tmp_path: &Path, path: &Path) -> Result<(), LoaderError> {
     crate::download::promote_launcher_managed_artifact_temp_once(tmp_path, path)
@@ -736,10 +1040,25 @@ fn cached_profile_path(library_dir: &Path, record: &LoaderBuildRecord) -> PathBu
 }
 
 fn cached_legacy_archive_path(library_dir: &Path, record: &LoaderBuildRecord) -> PathBuf {
+    let suffix = legacy_archive_cache_suffix(record);
     loader_artifacts_dir(library_dir)
         .join(record.component_id.short_key())
         .join(&record.minecraft_version)
-        .join(format!("{}-client.zip", record.loader_version))
+        .join(format!("{}-{suffix}", record.loader_version))
+}
+
+fn legacy_archive_cache_suffix(record: &LoaderBuildRecord) -> &'static str {
+    match &record.install_source {
+        crate::loaders::types::LoaderInstallSource::LegacyArchive { url }
+            if url
+                .rsplit('/')
+                .next()
+                .is_some_and(|name| name.ends_with("-universal.zip")) =>
+        {
+            "universal.zip"
+        }
+        _ => "client.zip",
+    }
 }
 
 fn progress(phase: &str, current: i32, total: i32, file: Option<String>) -> DownloadProgress {
@@ -767,12 +1086,18 @@ fn done() -> DownloadProgress {
 #[cfg(test)]
 mod tests {
     use super::{
-        base_version_install_lock_from_map, cleanup_on_error, ensure_base_version,
-        install_from_installer_source, install_from_legacy_archive, install_from_profile_source,
-        promote_cached_artifact_tmp, read_cached_artifact, read_valid_installer,
-        read_valid_legacy_archive, read_valid_profile_json, write_cached_artifact,
+        base_version_install_lock_from_map, cleanup_on_error,
+        download_loader_libraries_with_evidence, download_profile_loader_libraries_with_evidence,
+        ensure_base_version, install_from_installer_source, install_from_legacy_archive,
+        install_from_profile_source, is_base_game_installed, promote_cached_artifact_tmp,
+        read_cached_artifact, read_valid_installer, read_valid_legacy_archive,
+        read_valid_profile_json, strip_child_client_jar_meta, write_cached_artifact,
+        write_patched_client_jar_integrity,
     };
-    use crate::download::{DownloadProgress, ExecutionDownloadFactKind};
+    use crate::download::{
+        DownloadProgress, ExecutionDownloadFactKind, SelectedDownloadArtifactKind,
+    };
+    use crate::launch::{Library, LibraryArtifact, LibraryDownload};
     use crate::loaders::types::LoaderError;
     use crate::loaders::types::{
         LoaderArtifactKind, LoaderBuildMetadata, LoaderBuildRecord, LoaderBuildSubjectKind,
@@ -781,6 +1106,7 @@ mod tests {
     };
     use crate::loaders::validate_version_id;
     use crate::paths::versions_dir;
+    use sha1::{Digest as _, Sha1};
     use std::collections::HashMap;
     use std::fs;
     use std::io::{ErrorKind, Read, Write};
@@ -974,6 +1300,175 @@ mod tests {
                 .contains(".tmp-")
         }));
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn base_game_installed_requires_selected_libraries() {
+        let root = temp_dir("base-installed-requires-libraries");
+        let version_id = "1.16";
+        let library_bytes = b"library jar";
+        write_base_version_with_library(&root, version_id, library_bytes);
+
+        assert!(
+            !is_base_game_installed(&root, version_id),
+            "base install must not be considered complete while selected libraries are missing"
+        );
+
+        let library_path = root
+            .join("libraries")
+            .join("com/example/base/1.0.0/base-1.0.0.jar");
+        fs::create_dir_all(library_path.parent().expect("library parent"))
+            .expect("create library parent");
+        fs::write(&library_path, library_bytes).expect("write library");
+
+        assert!(is_base_game_installed(&root, version_id));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn base_game_installed_rejects_corrupt_selected_libraries() {
+        let root = temp_dir("base-installed-rejects-corrupt-libraries");
+        let version_id = "1.16";
+        write_base_version_with_library(&root, version_id, b"library jar");
+
+        let library_path = root
+            .join("libraries")
+            .join("com/example/base/1.0.0/base-1.0.0.jar");
+        fs::create_dir_all(library_path.parent().expect("library parent"))
+            .expect("create library parent");
+        fs::write(&library_path, b"wrong").expect("write corrupt library");
+
+        assert!(!is_base_game_installed(&root, version_id));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn loader_library_download_failure_carries_artifact_evidence() {
+        let root = temp_dir("loader-library-evidence");
+        let server = TestByteServer::start(b"wrong".to_vec());
+        let expected = b"fresh";
+        let library = Library {
+            name: "com.example:loader-lib:1.0.0".to_string(),
+            downloads: Some(LibraryDownload {
+                artifact: Some(LibraryArtifact {
+                    path: "com/example/loader-lib/1.0.0/loader-lib-1.0.0.jar".to_string(),
+                    sha1: sha1_hex(expected),
+                    size: expected.len() as i64,
+                    url: server.url.clone(),
+                }),
+                ..LibraryDownload::default()
+            }),
+            ..Library::default()
+        };
+
+        let error = download_loader_libraries_with_evidence(
+            &root,
+            &[library],
+            "loader_libraries",
+            &mut |_progress| {},
+        )
+        .await
+        .expect_err("checksum mismatch should carry evidence");
+
+        match error {
+            LoaderError::ArtifactDownloadFailed { facts, descriptors } => {
+                assert!(
+                    facts
+                        .iter()
+                        .any(|fact| fact.kind == ExecutionDownloadFactKind::ArtifactMissing)
+                );
+                assert!(
+                    facts
+                        .iter()
+                        .any(|fact| fact.kind == ExecutionDownloadFactKind::ChecksumMismatch)
+                );
+                assert!(descriptors.iter().any(|descriptor| {
+                    descriptor.kind == SelectedDownloadArtifactKind::Library
+                        && descriptor.target == "minecraft_library_loader-lib-1.0.0"
+                }));
+            }
+            other => panic!("expected artifact download evidence, got {other:?}"),
+        }
+
+        server.stop();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn profile_loader_library_download_allows_missing_checksum_metadata() {
+        let root = temp_dir("profile-loader-library-missing-checksum");
+        let body = zip_entries(&[("org/quiltmc/loader/impl/QuiltLoader.class", b"loader")]);
+        let server = TestByteServer::start(body.clone());
+        let artifact_path = "org/quiltmc/quilt-loader/0.29.2/quilt-loader-0.29.2.jar";
+        let library = Library {
+            name: "org.quiltmc:quilt-loader:0.29.2".to_string(),
+            downloads: Some(LibraryDownload {
+                artifact: Some(LibraryArtifact {
+                    path: artifact_path.to_string(),
+                    url: server.url.clone(),
+                    ..LibraryArtifact::default()
+                }),
+                ..LibraryDownload::default()
+            }),
+            ..Library::default()
+        };
+
+        download_profile_loader_libraries_with_evidence(
+            &root,
+            &[library],
+            "loader_libraries",
+            &mut |_progress| {},
+        )
+        .await
+        .expect("profile loader library should allow missing checksum metadata");
+
+        assert_eq!(
+            fs::read(root.join("libraries").join(artifact_path)).expect("read loader library"),
+            body
+        );
+        assert_eq!(server.request_count(), 1);
+
+        server.stop();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn profile_loader_library_download_replaces_invalid_checksumless_jar() {
+        let root = temp_dir("profile-loader-library-invalid-checksumless-jar");
+        let body = zip_entries(&[("org/quiltmc/loader/impl/QuiltLoader.class", b"loader")]);
+        let server = TestByteServer::start(body.clone());
+        let artifact_path = "org/quiltmc/quilt-loader/0.29.2/quilt-loader-0.29.2.jar";
+        let destination = root.join("libraries").join(artifact_path);
+        fs::create_dir_all(destination.parent().expect("artifact parent"))
+            .expect("create artifact parent");
+        fs::write(&destination, b"not a jar").expect("write invalid cached jar");
+        let library = Library {
+            name: "org.quiltmc:quilt-loader:0.29.2".to_string(),
+            downloads: Some(LibraryDownload {
+                artifact: Some(LibraryArtifact {
+                    path: artifact_path.to_string(),
+                    url: server.url.clone(),
+                    ..LibraryArtifact::default()
+                }),
+                ..LibraryDownload::default()
+            }),
+            ..Library::default()
+        };
+
+        download_profile_loader_libraries_with_evidence(
+            &root,
+            &[library],
+            "loader_libraries",
+            &mut |_progress| {},
+        )
+        .await
+        .expect("invalid checksumless loader jar should be replaced");
+
+        assert_eq!(fs::read(&destination).expect("read loader library"), body);
+        assert_eq!(server.request_count(), 1);
+
+        server.stop();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1230,6 +1725,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cached_legacy_archive_path_tracks_archive_flavor() {
+        let root = PathBuf::from("/library");
+        let mut record = legacy_archive_record();
+
+        assert_eq!(
+            super::cached_legacy_archive_path(&root, &record),
+            root.join("cache")
+                .join("loaders")
+                .join("artifacts")
+                .join("forge")
+                .join("1.2.5")
+                .join("3.4.9.171-client.zip")
+        );
+
+        record.minecraft_version = "1.4.7".to_string();
+        record.loader_version = "6.6.2.534".to_string();
+        record.install_source = LoaderInstallSource::LegacyArchive {
+            url: "https://maven.minecraftforge.net/net/minecraftforge/forge/1.4.7-6.6.2.534/forge-1.4.7-6.6.2.534-universal.zip".to_string(),
+        };
+
+        assert_eq!(
+            super::cached_legacy_archive_path(&root, &record),
+            root.join("cache")
+                .join("loaders")
+                .join("artifacts")
+                .join("forge")
+                .join("1.4.7")
+                .join("6.6.2.534-universal.zip")
+        );
+    }
+
     #[tokio::test]
     async fn corrupt_cached_legacy_archive_blocks_without_provider_or_mutation() {
         let root = temp_dir("legacy-archive-corrupt-cache");
@@ -1318,6 +1845,500 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn profile_source_installs_to_backend_version_id_when_upstream_id_differs() {
+        let root = temp_dir("profile-upstream-id-mismatch");
+        write_base_version(&root, "1.21.5");
+        let mut record = profile_record();
+        record.version_id = "backend-profile-id".to_string();
+        let profile_path = super::cached_profile_path(&root, &record);
+        fs::create_dir_all(profile_path.parent().expect("profile parent"))
+            .expect("create profile cache parent");
+        fs::write(&profile_path, profile_json("upstream-profile-id")).expect("cached profile");
+        let plan = LoaderInstallPlan {
+            record: record.clone(),
+            stage_dir: root.join("stage"),
+        };
+        let mut progress = |_progress: DownloadProgress| {};
+
+        let installed_version_id = install_from_profile_source(
+            &root,
+            &plan,
+            "http://127.0.0.1:9/profile/json",
+            &mut progress,
+        )
+        .await
+        .expect("install profile-backed loader");
+
+        assert_eq!(installed_version_id, record.version_id);
+        assert_backend_version_was_written(&root, &record.version_id, "upstream-profile-id");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn profile_source_marks_checksumless_libraries_in_composed_version() {
+        let root = temp_dir("profile-marks-checksumless-libraries");
+        write_base_version(&root, "1.21.5");
+        let library_body = zip_entries(&[("org/quiltmc/loader/impl/QuiltLoader.class", b"loader")]);
+        let server = TestByteServer::start(library_body);
+        let record = profile_record();
+        let profile_path = super::cached_profile_path(&root, &record);
+        fs::create_dir_all(profile_path.parent().expect("profile parent"))
+            .expect("create profile cache parent");
+        fs::write(
+            &profile_path,
+            profile_json_with_checksumless_library("upstream-profile-id", &server.url),
+        )
+        .expect("cached profile");
+        let plan = LoaderInstallPlan {
+            record: record.clone(),
+            stage_dir: root.join("stage"),
+        };
+        let mut progress = |_progress: DownloadProgress| {};
+
+        install_from_profile_source(
+            &root,
+            &plan,
+            "http://127.0.0.1:9/profile/json",
+            &mut progress,
+        )
+        .await
+        .expect("install profile-backed loader");
+
+        let version_json = fs::read(
+            versions_dir(&root)
+                .join(&record.version_id)
+                .join(format!("{}.json", record.version_id)),
+        )
+        .expect("read composed profile");
+        let version: serde_json::Value =
+            serde_json::from_slice(&version_json).expect("parse composed profile");
+        let libraries = version["libraries"].as_array().expect("libraries");
+        assert!(libraries.iter().any(|library| {
+            library["name"] == "org.quiltmc:quilt-loader:0.29.2"
+                && library["crooporChecksumlessAllowed"] == true
+        }));
+
+        server.stop();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn installer_source_installs_to_backend_version_id_when_upstream_id_differs() {
+        let root = temp_dir("installer-upstream-id-mismatch");
+        write_base_version(&root, "1.21.5");
+        let mut record = installer_record();
+        record.version_id = "backend-installer-id".to_string();
+        let installer_path = super::cached_installer_path(&root, &record);
+        fs::create_dir_all(installer_path.parent().expect("installer parent"))
+            .expect("create installer cache parent");
+        fs::write(&installer_path, installer_jar("upstream-installer-id"))
+            .expect("cached installer");
+        let plan = LoaderInstallPlan {
+            record: record.clone(),
+            stage_dir: root.join("stage"),
+        };
+        let mut progress = |_progress: DownloadProgress| {};
+
+        let installed_version_id = install_from_installer_source(
+            &root,
+            &plan,
+            "http://127.0.0.1:9/installer.jar",
+            &mut progress,
+        )
+        .await
+        .expect("install installer-backed loader");
+
+        assert_eq!(installed_version_id, record.version_id);
+        assert_backend_version_was_written(&root, &record.version_id, "upstream-installer-id");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn installer_source_allows_checksumless_legacy_profile_libraries() {
+        let root = temp_dir("installer-checksumless-legacy-libraries");
+        let minecraft_version = "1.7.10";
+        write_base_version(&root, minecraft_version);
+        let library_body = zip_entries(&[("net/minecraftforge/Forge.class", b"forge")]);
+        let server = TestByteServer::start(library_body);
+        let mut record = installer_record();
+        record.minecraft_version = minecraft_version.to_string();
+        record.loader_version = "10.13.4.1614-1.7.10".to_string();
+        record.version_id = "1.7.10-forge-10.13.4.1614-1.7.10".to_string();
+        let installer_path = super::cached_installer_path(&root, &record);
+        fs::create_dir_all(installer_path.parent().expect("installer parent"))
+            .expect("create installer cache parent");
+        fs::write(
+            &installer_path,
+            installer_jar_with_profile_json(
+                format!(
+                    r#"{{
+                        "id":"upstream-forge-1.7.10",
+                        "inheritsFrom":"{minecraft_version}",
+                        "mainClass":"net.minecraft.launchwrapper.Launch",
+                        "minecraftArguments":"--username ${{auth_player_name}} --accessToken ${{auth_access_token}}",
+                        "libraries":[{{
+                            "name":"net.minecraftforge:forge:1.7.10-10.13.4.1614-1.7.10",
+                            "url":"{}"
+                        }}]
+                    }}"#,
+                    server.url
+                )
+                .as_bytes(),
+            ),
+        )
+        .expect("cached installer");
+        let plan = LoaderInstallPlan {
+            record: record.clone(),
+            stage_dir: root.join("stage"),
+        };
+
+        let installed_version_id = install_from_installer_source(
+            &root,
+            &plan,
+            "http://127.0.0.1:9/installer.jar",
+            &mut |_| {},
+        )
+        .await
+        .expect("install legacy installer-backed loader");
+
+        assert_eq!(installed_version_id, record.version_id);
+        assert_eq!(server.request_count(), 1);
+        let library_path = root.join("libraries").join(
+            "net/minecraftforge/forge/1.7.10-10.13.4.1614-1.7.10/forge-1.7.10-10.13.4.1614-1.7.10.jar",
+        );
+        assert!(zip_contains(
+            &library_path,
+            "net/minecraftforge/Forge.class"
+        ));
+        let version_json = fs::read(
+            versions_dir(&root)
+                .join(&record.version_id)
+                .join(format!("{}.json", record.version_id)),
+        )
+        .expect("read installer profile");
+        let version: serde_json::Value =
+            serde_json::from_slice(&version_json).expect("parse installer profile");
+        let libraries = version["libraries"].as_array().expect("libraries");
+        assert!(libraries.iter().any(|library| {
+            library["name"] == "net.minecraftforge:forge:1.7.10-10.13.4.1614-1.7.10"
+                && library["crooporChecksumlessAllowed"] == true
+        }));
+
+        server.stop();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn strip_meta_legacy_installer_rewrites_child_client_and_integrity() {
+        let root = temp_dir("installer-strip-meta-child-client");
+        let version_id = "1.5.2-forge-7.8.1.738";
+        let version_dir = versions_dir(&root).join(version_id);
+        fs::create_dir_all(&version_dir).expect("version dir");
+        let signed_client = zip_entries(&[
+            ("META-INF/MANIFEST.MF", b"signed manifest".as_slice()),
+            ("META-INF/MOJANG_C.SF", b"signature".as_slice()),
+            ("META-INF/MOJANG_C.RSA", b"signature".as_slice()),
+            ("net/minecraft/client/Minecraft.class", b"class".as_slice()),
+        ]);
+        fs::write(
+            version_dir.join(format!("{version_id}.jar")),
+            &signed_client,
+        )
+        .expect("write signed child client");
+        fs::write(
+            version_dir.join(format!("{version_id}.json")),
+            r#"{
+                "id":"1.5.2-forge-7.8.1.738",
+                "type":"release",
+                "mainClass":"net.minecraft.launchwrapper.Launch",
+                "assetIndex":{"id":"pre-1.6","url":"","sha1":"","size":0,"totalSize":0},
+                "downloads":{
+                    "client":{
+                        "url":"https://example.invalid/1.5.2.jar",
+                        "sha1":"originalvanillasha1",
+                        "size":123
+                    }
+                },
+                "libraries":[]
+            }"#,
+        )
+        .expect("write version json");
+
+        strip_child_client_jar_meta(&root, version_id)
+            .await
+            .expect("strip child client metadata");
+        write_patched_client_jar_integrity(&root, version_id)
+            .await
+            .expect("write stripped client integrity");
+
+        let installed_jar = version_dir.join(format!("{version_id}.jar"));
+        assert!(zip_contains(
+            &installed_jar,
+            "net/minecraft/client/Minecraft.class"
+        ));
+        assert!(!zip_contains(&installed_jar, "META-INF/MANIFEST.MF"));
+        assert!(!zip_contains(&installed_jar, "META-INF/MOJANG_C.SF"));
+        assert!(!zip_contains(&installed_jar, "META-INF/MOJANG_C.RSA"));
+        let installed_jar_bytes = fs::read(&installed_jar).expect("read stripped jar");
+        let installed_version_json =
+            fs::read_to_string(version_dir.join(format!("{version_id}.json")))
+                .expect("read version json");
+        let installed_version: serde_json::Value =
+            serde_json::from_str(&installed_version_json).expect("parse version json");
+        assert_eq!(
+            installed_version["downloads"]["client"]["sha1"],
+            sha1_hex(&installed_jar_bytes)
+        );
+        assert_eq!(
+            installed_version["downloads"]["client"]["size"],
+            installed_jar_bytes.len() as i64
+        );
+        assert_eq!(installed_version["downloads"]["client"]["url"], "");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn strip_meta_legacy_installer_install_strips_child_not_base_client() {
+        let root = temp_dir("installer-strip-meta-install");
+        let minecraft_version = "1.5.2";
+        let version_id = "1.5.2-forge-7.8.1.738";
+        let base_dir = versions_dir(&root).join(minecraft_version);
+        fs::create_dir_all(&base_dir).expect("base version dir");
+        let signed_client = zip_entries(&[
+            ("META-INF/MANIFEST.MF", b"signed manifest".as_slice()),
+            ("META-INF/MOJANG_C.SF", b"signature".as_slice()),
+            ("META-INF/MOJANG_C.RSA", b"signature".as_slice()),
+            ("net/minecraft/client/Minecraft.class", b"class".as_slice()),
+        ]);
+        fs::write(
+            base_dir.join(format!("{minecraft_version}.jar")),
+            &signed_client,
+        )
+        .expect("write signed base client");
+        fs::write(
+            base_dir.join(format!("{minecraft_version}.json")),
+            format!(
+                r#"{{
+                    "id":"{minecraft_version}",
+                    "type":"release",
+                    "mainClass":"net.minecraft.client.Minecraft",
+                    "assetIndex":{{"id":"legacy","url":"","sha1":"","size":0,"totalSize":0}},
+                    "downloads":{{
+                        "client":{{
+                            "url":"https://example.invalid/{minecraft_version}.jar",
+                            "sha1":"{}",
+                            "size":{}
+                        }}
+                    }},
+                    "libraries":[]
+                }}"#,
+                sha1_hex(&signed_client),
+                signed_client.len()
+            ),
+        )
+        .expect("write base version json");
+        let install_profile = br#"{
+            "versionInfo": {
+                "id": "1.5.2-Forge7.8.1.738",
+                "mainClass": "net.minecraft.launchwrapper.Launch",
+                "minecraftArguments": "${auth_player_name} ${auth_session}",
+                "assetIndex": { "id": "legacy" },
+                "libraries": [
+                    { "name": "net.minecraftforge:minecraftforge:7.8.1.738" }
+                ]
+            },
+            "install": {
+                "path": "net.minecraftforge:minecraftforge:7.8.1.738",
+                "filePath": "minecraftforge-universal-1.5.2-7.8.1.738.jar",
+                "target": "1.5.2-Forge7.8.1.738",
+                "minecraft": "1.5.2",
+                "stripMeta": true
+            }
+        }"#;
+        let forge_jar = zip_entries(&[
+            ("META-INF/MANIFEST.MF", b"forge manifest".as_slice()),
+            ("META-INF/FORGE.SF", b"signature".as_slice()),
+            ("net/minecraftforge/Forge.class", b"forge".as_slice()),
+        ]);
+        let installer = zip_entries(&[
+            ("install_profile.json", install_profile.as_slice()),
+            (
+                "minecraftforge-universal-1.5.2-7.8.1.738.jar",
+                forge_jar.as_slice(),
+            ),
+        ]);
+        let mut record = installer_record();
+        record.minecraft_version = minecraft_version.to_string();
+        record.loader_version = "7.8.1.738".to_string();
+        record.version_id = version_id.to_string();
+        record.strategy = LoaderInstallStrategy::ForgeLegacyInstaller;
+        let installer_path = super::cached_installer_path(&root, &record);
+        fs::create_dir_all(installer_path.parent().expect("installer parent"))
+            .expect("create installer cache parent");
+        fs::write(&installer_path, installer).expect("write cached installer");
+        let plan = LoaderInstallPlan {
+            record: record.clone(),
+            stage_dir: root.join("stage"),
+        };
+
+        install_from_installer_source(
+            &root,
+            &plan,
+            "http://127.0.0.1:9/installer.jar",
+            &mut |_| {},
+        )
+        .await
+        .expect("install stripMeta legacy installer");
+
+        let child_jar = versions_dir(&root)
+            .join(version_id)
+            .join(format!("{version_id}.jar"));
+        assert!(zip_contains(
+            &child_jar,
+            "net/minecraft/client/Minecraft.class"
+        ));
+        assert!(!zip_contains(&child_jar, "META-INF/MANIFEST.MF"));
+        assert!(!zip_contains(&child_jar, "META-INF/MOJANG_C.SF"));
+        assert!(!zip_contains(&child_jar, "META-INF/MOJANG_C.RSA"));
+        let base_jar = base_dir.join(format!("{minecraft_version}.jar"));
+        assert!(zip_contains(&base_jar, "META-INF/MANIFEST.MF"));
+        assert!(zip_contains(&base_jar, "META-INF/MOJANG_C.SF"));
+        assert!(zip_contains(&base_jar, "META-INF/MOJANG_C.RSA"));
+        let forge_artifact = root
+            .join("libraries")
+            .join("net")
+            .join("minecraftforge")
+            .join("forge")
+            .join("1.5.2-7.8.1.738")
+            .join("forge-1.5.2-7.8.1.738-universal.jar");
+        assert!(zip_contains(
+            &forge_artifact,
+            "net/minecraftforge/Forge.class"
+        ));
+        assert!(!zip_contains(&forge_artifact, "META-INF/MANIFEST.MF"));
+        assert!(!zip_contains(&forge_artifact, "META-INF/FORGE.SF"));
+
+        let child_jar_bytes = fs::read(&child_jar).expect("read child jar");
+        let version_json = fs::read_to_string(
+            versions_dir(&root)
+                .join(version_id)
+                .join(format!("{version_id}.json")),
+        )
+        .expect("read version json");
+        let version: serde_json::Value =
+            serde_json::from_str(&version_json).expect("parse version json");
+        assert_eq!(
+            version["downloads"]["client"]["sha1"],
+            sha1_hex(&child_jar_bytes)
+        );
+        assert_eq!(
+            version["downloads"]["client"]["size"],
+            child_jar_bytes.len() as i64
+        );
+        assert_eq!(version["downloads"]["client"]["url"], "");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn legacy_archive_overlays_base_client_without_mutating_base() {
+        let root = temp_dir("legacy-archive-overlay");
+        let base_version_id = "1.2.5";
+        let base_dir = versions_dir(&root).join(base_version_id);
+        fs::create_dir_all(&base_dir).expect("base version dir");
+        fs::write(
+            base_dir.join(format!("{base_version_id}.json")),
+            format!(
+                r#"{{
+                    "id":"{base_version_id}",
+                    "type":"release",
+                    "mainClass":"net.minecraft.client.Minecraft",
+                    "assetIndex":{{"id":"legacy","url":"","sha1":"","size":0,"totalSize":0}},
+                    "libraries":[]
+                }}"#
+            ),
+        )
+        .expect("base json");
+        fs::write(
+            base_dir.join(format!("{base_version_id}.jar")),
+            zip_entries(&[
+                ("net/minecraft/client/Minecraft.class", b"base".as_slice()),
+                ("com/example/Replaced.class", b"base".as_slice()),
+            ]),
+        )
+        .expect("base jar");
+        let forge_archive = zip_entries(&[
+            ("net/minecraftforge/Forge.class", b"forge".as_slice()),
+            ("com/example/Replaced.class", b"forge".as_slice()),
+            ("META-INF/TEST.SF", b"signature".as_slice()),
+        ]);
+        let server = TestByteServer::start(forge_archive);
+        let mut record = legacy_archive_record();
+        record.minecraft_version = base_version_id.to_string();
+        record.version_id = "forge-1.2.5-3.4.9.171".to_string();
+        let plan = LoaderInstallPlan {
+            record: record.clone(),
+            stage_dir: root.join("stage"),
+        };
+
+        let installed_version_id =
+            install_from_legacy_archive(&root, &plan, &server.url, &mut |_progress| {})
+                .await
+                .expect("install legacy archive");
+
+        assert_eq!(installed_version_id, record.version_id);
+        let installed_jar = versions_dir(&root)
+            .join(&record.version_id)
+            .join(format!("{}.jar", record.version_id));
+        assert!(zip_contains(
+            &installed_jar,
+            "net/minecraft/client/Minecraft.class"
+        ));
+        assert!(zip_contains(
+            &installed_jar,
+            "net/minecraftforge/Forge.class"
+        ));
+        assert_eq!(
+            zip_entry_bytes(&installed_jar, "com/example/Replaced.class"),
+            b"forge"
+        );
+        assert!(!zip_contains(&installed_jar, "META-INF/TEST.SF"));
+        let installed_jar_bytes = fs::read(&installed_jar).expect("read installed jar");
+        let installed_version_json = fs::read_to_string(
+            versions_dir(&root)
+                .join(&record.version_id)
+                .join(format!("{}.json", record.version_id)),
+        )
+        .expect("read installed version json");
+        let installed_version: serde_json::Value =
+            serde_json::from_str(&installed_version_json).expect("parse installed version json");
+        assert_eq!(
+            installed_version["downloads"]["client"]["sha1"],
+            sha1_hex(&installed_jar_bytes)
+        );
+        assert_eq!(
+            installed_version["downloads"]["client"]["size"],
+            installed_jar_bytes.len() as i64
+        );
+        assert_eq!(installed_version["downloads"]["client"]["url"], "");
+
+        let base_jar = base_dir.join(format!("{base_version_id}.jar"));
+        assert!(zip_contains(
+            &base_jar,
+            "net/minecraft/client/Minecraft.class"
+        ));
+        assert!(!zip_contains(&base_jar, "net/minecraftforge/Forge.class"));
+        assert_eq!(
+            zip_entry_bytes(&base_jar, "com/example/Replaced.class"),
+            b"base"
+        );
+
+        server.stop();
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn temp_dir(prefix: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1334,14 +2355,14 @@ mod tests {
     }
 
     fn empty_zip() -> Vec<u8> {
-        let mut cursor = std::io::Cursor::new(Vec::new());
-        zip::ZipWriter::new(&mut cursor)
-            .finish()
-            .expect("finish empty zip");
-        cursor.into_inner()
+        zip_entries(&[])
     }
 
     fn installer_jar(version_id: &str) -> Vec<u8> {
+        installer_jar_with_profile_json(&profile_json(version_id))
+    }
+
+    fn installer_jar_with_profile_json(profile_json: &[u8]) -> Vec<u8> {
         use zip::write::SimpleFileOptions;
 
         let mut cursor = std::io::Cursor::new(Vec::new());
@@ -1349,16 +2370,139 @@ mod tests {
         archive
             .start_file("version.json", SimpleFileOptions::default())
             .expect("start version.json");
-        archive
-            .write_all(&profile_json(version_id))
-            .expect("write version.json");
+        archive.write_all(profile_json).expect("write version.json");
         archive.finish().expect("finish installer jar");
         cursor.into_inner()
+    }
+
+    fn zip_entries(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use zip::write::SimpleFileOptions;
+
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        let mut archive = zip::ZipWriter::new(&mut cursor);
+        for (name, bytes) in entries {
+            archive
+                .start_file(name, SimpleFileOptions::default())
+                .expect("start zip entry");
+            archive.write_all(bytes).expect("write zip entry");
+        }
+        archive.finish().expect("finish zip");
+        cursor.into_inner()
+    }
+
+    fn zip_contains(path: &std::path::Path, name: &str) -> bool {
+        let file = fs::File::open(path).expect("open zip");
+        let mut archive = zip::ZipArchive::new(file).expect("read zip");
+        archive.by_name(name).is_ok()
+    }
+
+    fn zip_entry_bytes(path: &std::path::Path, name: &str) -> Vec<u8> {
+        let file = fs::File::open(path).expect("open zip");
+        let mut archive = zip::ZipArchive::new(file).expect("read zip");
+        let mut entry = archive.by_name(name).expect("zip entry");
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).expect("read zip entry");
+        bytes
     }
 
     fn profile_json(id: &str) -> Vec<u8> {
         format!(r#"{{"id":"{id}","mainClass":"net.fabricmc.loader.impl.launch.knot.KnotClient"}}"#)
             .into_bytes()
+    }
+
+    fn profile_json_with_checksumless_library(id: &str, library_url: &str) -> Vec<u8> {
+        format!(
+            r#"{{
+                "id":"{id}",
+                "mainClass":"org.quiltmc.loader.impl.launch.knot.KnotClient",
+                "libraries":[{{
+                    "name":"org.quiltmc:quilt-loader:0.29.2",
+                    "url":"{library_url}"
+                }}]
+            }}"#
+        )
+        .into_bytes()
+    }
+
+    fn write_base_version(root: &std::path::Path, version_id: &str) {
+        let version_dir = versions_dir(root).join(version_id);
+        fs::create_dir_all(&version_dir).expect("create base version dir");
+        fs::write(
+            version_dir.join(format!("{version_id}.json")),
+            format!(
+                r#"{{
+                    "id":"{version_id}",
+                    "type":"release",
+                    "mainClass":"net.minecraft.client.main.Main",
+                    "assetIndex":{{"id":"{version_id}","url":"","sha1":"","size":0,"totalSize":0}},
+                    "libraries":[]
+                }}"#
+            ),
+        )
+        .expect("write base version json");
+        fs::write(version_dir.join(format!("{version_id}.jar")), b"client jar")
+            .expect("write base jar");
+    }
+
+    fn write_base_version_with_library(
+        root: &std::path::Path,
+        version_id: &str,
+        library_bytes: &[u8],
+    ) {
+        let version_dir = versions_dir(root).join(version_id);
+        fs::create_dir_all(&version_dir).expect("create base version dir");
+        fs::write(
+            version_dir.join(format!("{version_id}.json")),
+            format!(
+                r#"{{
+                    "id":"{version_id}",
+                    "type":"release",
+                    "mainClass":"net.minecraft.client.main.Main",
+                    "assetIndex":{{"id":"{version_id}","url":"","sha1":"","size":0,"totalSize":0}},
+                    "libraries":[{{
+                        "name":"com.example:base:1.0.0",
+                        "downloads":{{
+                            "artifact":{{
+                                "path":"com/example/base/1.0.0/base-1.0.0.jar",
+                                "url":"https://example.invalid/base-1.0.0.jar",
+                                "sha1":"{}",
+                                "size":{}
+                            }}
+                        }}
+                    }}]
+                }}"#,
+                sha1_hex(library_bytes),
+                library_bytes.len()
+            ),
+        )
+        .expect("write base version json");
+        fs::write(version_dir.join(format!("{version_id}.jar")), b"client jar")
+            .expect("write base jar");
+    }
+
+    fn assert_backend_version_was_written(
+        root: &std::path::Path,
+        backend_version_id: &str,
+        upstream_version_id: &str,
+    ) {
+        let backend_dir = versions_dir(root).join(backend_version_id);
+        let upstream_dir = versions_dir(root).join(upstream_version_id);
+        assert!(backend_dir.is_dir());
+        assert!(!upstream_dir.exists());
+        let version_json = fs::read(backend_dir.join(format!("{backend_version_id}.json")))
+            .expect("read backend version json");
+        let version: serde_json::Value =
+            serde_json::from_slice(&version_json).expect("parse backend version json");
+        assert_eq!(
+            version.get("id").and_then(serde_json::Value::as_str),
+            Some(backend_version_id)
+        );
+    }
+
+    fn sha1_hex(bytes: &[u8]) -> String {
+        let mut hasher = Sha1::new();
+        hasher.update(bytes);
+        format!("{:x}", hasher.finalize())
     }
 
     fn profile_record() -> LoaderBuildRecord {

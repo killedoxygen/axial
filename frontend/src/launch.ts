@@ -347,12 +347,28 @@ async function connectLaunchEvents(
   }
 
   const es = new EventSource(apiUrl(`/launch/${sessionId}/events`));
+  let pollSubscription: { close(): void } | null = null;
+  const streamHandle = {
+    close(): void {
+      es.close();
+      pollSubscription?.close();
+      pollSubscription = null;
+    },
+  };
   es.addEventListener('status', (e: MessageEvent) => {
-    onStatus(JSON.parse(e.data), es);
+    try {
+      onStatus(JSON.parse(e.data), streamHandle);
+    } catch {
+      // Status polling below remains the convergence path for malformed stream events.
+    }
   });
 
   es.addEventListener('log', (e: MessageEvent) => {
-    onLog(JSON.parse(e.data));
+    try {
+      onLog(JSON.parse(e.data));
+    } catch {
+      // Ignore malformed log events; launch status polling owns terminal convergence.
+    }
   });
 
   es.onerror = () => {
@@ -364,8 +380,11 @@ async function connectLaunchEvents(
       instanceId,
       instanceName,
     );
-    es.close();
+    streamHandle.close();
   };
+  pollSubscription = makeLaunchStatusPoller(sessionId, instanceId, (data) => {
+    onStatus(data, streamHandle);
+  });
 }
 
 function onGameExited(

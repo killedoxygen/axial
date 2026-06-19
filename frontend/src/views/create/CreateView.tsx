@@ -22,7 +22,6 @@ import {
   type LoaderKey,
 } from './defaults';
 import { LoaderLogo } from './loader-logos';
-import { LibraryBlocker } from './shared';
 import { Modal, ModalContent } from '../../ui/Modal';
 import { CHANNEL_ORDER, CHANNEL_LABEL, type VersionDownloadState, type VersionRowModel } from './view-model';
 import {
@@ -54,12 +53,31 @@ interface CreateVersionRow {
   source_id: string;
   selection_id: string;
   minecraft_version_id: string;
+  loader_build?: CreateLoaderBuildIdentity | null;
   display_name: string;
   hint?: string | null;
   channel: string;
   download_state: string;
   create_enabled: boolean;
   disabled_reason?: string | null;
+}
+
+interface CreateLoaderBuildIdentity {
+  component_id: LoaderComponentId;
+  build_id: string;
+  target_version_id: string;
+  minecraft_version_id: string;
+  loader_version: string;
+  installability: string;
+  availability: {
+    fresh: boolean;
+    stale: boolean;
+    cache_hit: boolean;
+    checked_at_ms: number;
+    last_success_at_ms?: number | null;
+    last_error?: string | null;
+    last_failure_kind?: string | null;
+  };
 }
 
 interface CreateNotice {
@@ -86,7 +104,6 @@ interface CreateBackendViewResponse {
 }
 
 export function CreateView(): JSX.Element {
-  const libraryDir = config.value?.library_dir ?? '';
   return (
     <Modal
       open={createOpen.value}
@@ -100,7 +117,7 @@ export function CreateView(): JSX.Element {
         aria-describedby={undefined}
         showCloseButton={false}
       >
-        {libraryDir ? <CreateCard /> : <LibraryBlocker />}
+        <CreateCard />
       </ModalContent>
     </Modal>
   );
@@ -136,7 +153,7 @@ function rowSearchText(row: VersionRowModel): string {
 function CreateCard(): JSX.Element {
   const [step, setStep] = useState<CreateStep>('version');
   const [sourceId, setSourceId] = useState('vanilla');
-  const [mcVersionId, setMcVersionId] = useState<string | null>(null);
+  const [selectedSelectionId, setSelectedSelectionId] = useState<string | null>(null);
   const [channel, setChannel] = useState<Channel>('release');
   const [query, setQuery] = useState('');
   const [nameOverride, setNameOverride] = useState<string | null>(null);
@@ -145,6 +162,7 @@ function CreateCard(): JSX.Element {
   const [backendView, setBackendView] = useState<CreateBackendViewResponse | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const versionWellRef = useRef<HTMLDivElement | null>(null);
+  const loadRequestRef = useRef(0);
   const versionListKey = `${sourceId}:${channel}:${query.trim().toLowerCase()}`;
 
   const totalGB = systemInfo.value?.total_memory_mb ? Math.floor(systemInfo.value.total_memory_mb / 1024) : 16;
@@ -192,11 +210,17 @@ function CreateCard(): JSX.Element {
     if (next) setJvmPreset(next.id);
   };
 
-  const loadCreateView = async (): Promise<void> => {
+  const loadCreateView = async (source = sourceId): Promise<void> => {
+    const requestId = loadRequestRef.current + 1;
+    loadRequestRef.current = requestId;
     setViewLoading(true);
     setViewError(null);
     try {
-      const res = (await api('GET', '/instances/create-view')) as CreateBackendViewResponse & { error?: string };
+      const res = (await api(
+        'GET',
+        `/instances/create-view?source=${encodeURIComponent(source)}`,
+      )) as CreateBackendViewResponse & { error?: string };
+      if (requestId !== loadRequestRef.current) return;
       if (res.error) throw new Error(res.error);
       setBackendView(res);
       const options = Array.isArray(res.preset_options)
@@ -244,18 +268,19 @@ function CreateCard(): JSX.Element {
       const defaultChannel = normalizeChannel(res.defaults?.channel_id);
       setChannel((current) => (CHANNEL_ORDER.includes(current) ? current : defaultChannel));
     } catch (err: unknown) {
+      if (requestId !== loadRequestRef.current) return;
       setBackendView(null);
       setPresetOptions([]);
       setViewError(errMessage(err));
     } finally {
-      setViewLoading(false);
+      if (requestId === loadRequestRef.current) setViewLoading(false);
     }
   };
 
   useEffect(() => {
-    void loadCreateView();
+    void loadCreateView(sourceId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [sourceId]);
 
   const searchInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -282,7 +307,7 @@ function CreateCard(): JSX.Element {
   }, [backendView]);
 
   useEffect(() => {
-    if (sourceOptions.some((option) => option.id === sourceId && option.enabled)) return;
+    if (sourceOptions.some((option) => option.id === sourceId)) return;
     const fallback = sourceOptions.find((option) => option.enabled);
     if (fallback) setSourceId(fallback.id);
   }, [sourceOptions, sourceId]);
@@ -343,7 +368,10 @@ function CreateCard(): JSX.Element {
       .filter((row) => row.channel === channel)
       .filter((row) => !q || rowSearchText(row).includes(q));
   }, [channel, query, availableForSource]);
-  const selectedVersionRow = mcVersionId ? (versionRows.find((row) => row.id === mcVersionId) ?? null) : null;
+  const selectedVersionRow = selectedSelectionId
+    ? (versionRows.find((row) => row.selectionId === selectedSelectionId) ?? null)
+    : null;
+  const mcVersionId = selectedVersionRow?.id ?? null;
 
   const selectionId = selectedVersionRow?.selectionId ?? '';
 
@@ -374,10 +402,10 @@ function CreateCard(): JSX.Element {
   };
 
   useEffect(() => {
-    if (!mcVersionId) return;
-    if (versionRows.some((r) => r.id === mcVersionId)) return;
-    setMcVersionId(null);
-  }, [versionRows, mcVersionId]);
+    if (!selectedSelectionId) return;
+    if (versionRows.some((row) => row.selectionId === selectedSelectionId)) return;
+    setSelectedSelectionId(null);
+  }, [versionRows, selectedSelectionId]);
 
   const versionReady = Boolean(selectionId && selectedVersionRow?.createEnabled !== false);
   const canCreate = versionReady && name.trim().length > 0 && !submitting;
@@ -452,7 +480,7 @@ function CreateCard(): JSX.Element {
     canCreate,
     submitting,
     sourceKey,
-    mcVersionId,
+    selectedSelectionId,
     name,
     memoryGB,
     previewSeed,
@@ -517,7 +545,7 @@ function CreateCard(): JSX.Element {
                     onClick={() => {
                       if (!option.enabled) return;
                       setSourceId(option.id);
-                      setMcVersionId(null);
+                      setSelectedSelectionId(null);
                     }}
                   >
                     <LoaderLogo loader={key} size={14} class="cp-cr-loader-mark" />
@@ -606,16 +634,16 @@ function CreateCard(): JSX.Element {
                 <ul class="cp-cr-vlist" role="listbox" aria-label="Minecraft versions">
                   {versionRows.map((row) => (
                     <li
-                      key={row.id}
+                      key={row.selectionId}
                       class="cp-cr-vrow"
-                      data-active={mcVersionId === row.id}
+                      data-active={selectedSelectionId === row.selectionId}
                       data-disabled={!row.createEnabled}
                       role="option"
-                      aria-selected={mcVersionId === row.id}
+                      aria-selected={selectedSelectionId === row.selectionId}
                       aria-disabled={!row.createEnabled}
                       title={row.disabledReason ?? undefined}
                       onClick={() => {
-                        if (row.createEnabled) setMcVersionId(row.id);
+                        if (row.createEnabled) setSelectedSelectionId(row.selectionId);
                       }}
                     >
                       <span class="cp-cr-vrow-name">{row.displayName}</span>
@@ -634,7 +662,7 @@ function CreateCard(): JSX.Element {
                           />
                         </span>
                       )}
-                      {mcVersionId === row.id && (
+                      {selectedSelectionId === row.selectionId && (
                         <span class="cp-cr-vrow-mark" aria-hidden="true">
                           <Icon name="check" size={14} stroke={2.4} />
                         </span>

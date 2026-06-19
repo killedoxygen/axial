@@ -190,6 +190,9 @@ impl InstallStore {
     pub async fn emit(&self, install_id: &str, progress: DownloadProgress) {
         let mut installs = self.installs.write().await;
         if let Some(entry) = installs.get_mut(install_id) {
+            if entry.done {
+                return;
+            }
             entry.done = progress.done;
             entry.history.push(progress.clone());
             let _ = entry.events.send(progress);
@@ -388,15 +391,28 @@ impl InstallStore {
         queue.active.take()
     }
 
-    pub async fn clear_active_queued_install_for_queue_id(
-        &self,
-        queue_id: &str,
-    ) -> Option<ActiveQueuedInstallEntry> {
+    pub async fn release_active_queued_install_to_front(&self, queue_id: &str) -> bool {
         let mut queue = self.queue.write().await;
         if queue.active.as_ref().map(|active| active.queue_id.as_str()) != Some(queue_id) {
-            return None;
+            return false;
         }
-        queue.active.take()
+        let Some(active) = queue.active.take() else {
+            return false;
+        };
+        queue.pending.push_front(QueuedInstallEntry {
+            queue_id: active.queue_id,
+            spec: active.spec,
+        });
+        true
+    }
+
+    pub async fn discard_active_queued_install(&self, queue_id: &str) -> bool {
+        let mut queue = self.queue.write().await;
+        if queue.active.as_ref().map(|active| active.queue_id.as_str()) != Some(queue_id) {
+            return false;
+        }
+        queue.active.take();
+        true
     }
 
     pub async fn remove_queued_install(&self, queue_id: &str) -> Option<QueuedInstallEntry> {
@@ -672,6 +688,58 @@ mod tests {
         assert!(done);
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].phase, "done");
+    }
+
+    #[tokio::test]
+    async fn emit_ignores_late_progress_after_terminal_session() {
+        let store = InstallStore::new();
+        store.insert("done-install".to_string()).await;
+        store.emit("done-install", done_progress()).await;
+        store
+            .emit("done-install", base_progress("libraries", false))
+            .await;
+        store
+            .emit("done-install", base_progress("assets", true))
+            .await;
+
+        let (history, _, done) = store
+            .subscribe("done-install")
+            .await
+            .expect("done install remains until pruned");
+
+        assert!(done);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].phase, "done");
+    }
+
+    #[tokio::test]
+    async fn release_active_queued_install_to_front_restores_pending_item() {
+        let store = InstallStore::new();
+        let spec = InstallQueueSpec::vanilla("1.21.5".to_string(), String::new());
+        store
+            .enqueue_queued_install(
+                "queue-install".to_string(),
+                spec.clone(),
+                InstallQueuePlacement::Back,
+            )
+            .await;
+
+        let reserved = store
+            .reserve_next_queued_install()
+            .await
+            .expect("queued install");
+
+        assert_eq!(reserved.queue_id, "queue-install");
+        assert!(
+            store
+                .release_active_queued_install_to_front("queue-install")
+                .await
+        );
+        let snapshot = store.queue_snapshot().await;
+        assert!(snapshot.active.is_none());
+        assert_eq!(snapshot.pending.len(), 1);
+        assert_eq!(snapshot.pending[0].queue_id, "queue-install");
+        assert_eq!(snapshot.pending[0].spec, spec);
     }
 
     #[tokio::test]
@@ -1073,6 +1141,17 @@ mod tests {
             file: None,
             error: Some("failed".to_string()),
             done: true,
+        }
+    }
+
+    fn base_progress(phase: &str, done: bool) -> DownloadProgress {
+        DownloadProgress {
+            phase: phase.to_string(),
+            current: if done { 1 } else { 0 },
+            total: if done { 1 } else { 0 },
+            file: None,
+            error: None,
+            done,
         }
     }
 }

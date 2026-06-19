@@ -2,6 +2,8 @@ use super::{
     InstanceWriteOperation, enrich_instance_for_state, instance_error_kind,
     instance_write_error_response, scan_current_versions,
 };
+use crate::application::install::InstallQueueInstallItemViewModel;
+use crate::application::version::{VERSION_SCAN_DEGRADED_MESSAGE, version_scan_degraded_response};
 use crate::application::{
     CommandResult, CommandResultCarriers, CreateInstancePayload, InstallQueueRequest,
     InstallQueueStateResponse, enqueue_install, loader_error_response,
@@ -14,18 +16,19 @@ use crate::state::AppState;
 use crate::state::contracts::{CommandKind, OperationId, OperationStatus};
 use axum::{Json, http::StatusCode};
 use croopor_config::{EnrichedInstance, Instance};
+use croopor_launcher::{
+    GuardianMode, LaunchReadinessReasonId, LaunchReadinessRequest, LaunchReadinessSeverity,
+    inspect_launch_readiness,
+};
 use croopor_minecraft::{
-    LifecycleChannel, LifecycleMeta, LoaderBuildRecord, LoaderComponentId, MinecraftVersionMeta,
-    VersionEntry, analyze_minecraft_version, fetch_builds, fetch_components,
+    LifecycleChannel, LifecycleMeta, LoaderAvailability, LoaderBuildRecord, LoaderCatalogState,
+    LoaderComponentId, LoaderInstallability, LoaderSelectionReason, MinecraftVersionMeta,
+    VersionEntry, analyze_minecraft_version, compare_version_like, fetch_builds, fetch_components,
     fetch_supported_versions, fetch_version_manifest_cached, manifest_release_references,
-    scan_versions,
+    parse_build_id,
 };
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::{HashMap, HashSet},
-    ops::Deref,
-    path::PathBuf,
-};
+use std::{cmp::Ordering, collections::HashSet, ops::Deref, path::PathBuf};
 
 const MAX_CREATE_NAME_COLLISION_RETRIES: usize = 9;
 
@@ -66,6 +69,8 @@ pub(crate) struct CreateInstanceVersionRowViewModel {
     pub source_id: String,
     pub selection_id: String,
     pub minecraft_version_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loader_build: Option<CreateLoaderBuildIdentityViewModel>,
     pub display_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
@@ -74,6 +79,17 @@ pub(crate) struct CreateInstanceVersionRowViewModel {
     pub create_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disabled_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct CreateLoaderBuildIdentityViewModel {
+    pub component_id: LoaderComponentId,
+    pub build_id: String,
+    pub target_version_id: String,
+    pub minecraft_version_id: String,
+    pub loader_version: String,
+    pub installability: LoaderInstallability,
+    pub availability: LoaderAvailability,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -163,7 +179,10 @@ impl Deref for CreateInstanceResponse {
     }
 }
 
-pub(crate) async fn handle_create_instance_view(state: &AppState) -> CreateInstanceViewResponse {
+pub(crate) async fn handle_create_instance_view(
+    state: &AppState,
+    source_id: Option<&str>,
+) -> CreateInstanceViewResponse {
     let mut notices = Vec::new();
     if state.library_dir().is_none() {
         notices.push(CreateInstanceNoticeViewModel {
@@ -176,10 +195,12 @@ pub(crate) async fn handle_create_instance_view(state: &AppState) -> CreateInsta
             ),
         });
     }
-    let versions = create_version_rows(state, &mut notices).await;
+    let requested_source = normalize_create_view_source(source_id);
+    let versions = create_version_rows(state, requested_source.as_deref(), &mut notices).await;
+    let unavailable_sources = unavailable_source_ids(&notices);
 
     CreateInstanceViewResponse {
-        sources: create_source_options(),
+        sources: create_source_options(&unavailable_sources),
         channels: create_channel_options(),
         versions,
         preset_options: guardian_jvm_preset_options(),
@@ -195,6 +216,15 @@ pub(crate) async fn handle_create_instance_view(state: &AppState) -> CreateInsta
     }
 }
 
+fn normalize_create_view_source(source_id: Option<&str>) -> Option<String> {
+    let source_id = source_id.map(str::trim).filter(|value| !value.is_empty())?;
+    if source_id == "vanilla" {
+        return Some("vanilla".to_string());
+    }
+    let component_id = LoaderComponentId::parse(source_id)?;
+    Some(component_id.as_str().to_string())
+}
+
 pub(crate) async fn handle_create_instance(
     state: &AppState,
     payload: CreateInstanceRequest,
@@ -202,14 +232,26 @@ pub(crate) async fn handle_create_instance(
     let selection = resolve_create_selection(state, &payload).await?;
     let preset = normalize_create_jvm_preset(payload.jvm_preset_id.as_deref());
     let mc_dir = state.library_dir().map(PathBuf::from);
+    let install_request = create_install_queue_request_if_needed(state, &selection)?;
+    let queued_install_request = install_request.clone();
     let instance =
         create_instance_with_unique_name(state, &payload, &selection, mc_dir.as_deref())?;
-    let instance = apply_create_initial_settings(state, instance, &payload, &preset)?;
+    let created_instance_id = instance.id.clone();
+    let instance = match apply_create_initial_settings(state, instance, &payload, &preset) {
+        Ok(instance) => instance,
+        Err(error) => {
+            rollback_created_instance(state, &created_instance_id);
+            return Err(error);
+        }
+    };
+    let install_queue =
+        queue_create_install_or_rollback(state, &created_instance_id, install_request).await?;
     let enriched = enrich_instance_for_state(state, instance);
-    let install_queue = queue_create_install_if_needed(state, &selection).await?;
-    let queued_install = install_queue
-        .as_ref()
-        .and_then(create_queued_install_summary);
+    let queued_install = install_queue.as_ref().and_then(|response| {
+        queued_install_request
+            .as_ref()
+            .and_then(|request| create_queued_install_summary(response, request))
+    });
 
     Ok(create_instance_response(
         enriched,
@@ -220,7 +262,7 @@ pub(crate) async fn handle_create_instance(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum CreateSelection {
+pub(super) enum CreateSelection {
     Vanilla {
         version_id: String,
     },
@@ -279,7 +321,7 @@ async fn resolve_create_selection(
         (Some("vanilla"), Some(version_id), None) if !version_id.trim().is_empty() => {
             resolve_vanilla_create_selection(state, version_id.trim()).await
         }
-        (Some("loader_minecraft"), Some(component_id), Some(minecraft_version))
+        (Some("loader_version"), Some(component_id), Some(minecraft_version))
             if !minecraft_version.trim().is_empty() =>
         {
             let component_id = LoaderComponentId::parse(component_id.trim()).ok_or_else(|| {
@@ -288,31 +330,131 @@ async fn resolve_create_selection(
                     Json(serde_json::json!({ "error": "unknown loader component" })),
                 )
             })?;
-            let library_dir = state
-                .library_dir()
-                .ok_or_else(library_not_configured_response)?;
-            let (builds, _) = fetch_builds(
-                PathBuf::from(library_dir).as_path(),
-                component_id,
-                minecraft_version.trim(),
-            )
-            .await
-            .map_err(loader_error_response)?;
-            let build = preferred_loader_build(builds).ok_or_else(|| {
+            resolve_loader_version_create_selection(state, component_id, minecraft_version.trim())
+                .await
+        }
+        (Some("loader_build"), Some(component_id), Some(build_id))
+            if !build_id.trim().is_empty() =>
+        {
+            let component_id = LoaderComponentId::parse(component_id.trim()).ok_or_else(|| {
                 (
                     StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({ "error": "loader build not found" })),
+                    Json(serde_json::json!({ "error": "unknown loader component" })),
                 )
             })?;
-
-            Ok(CreateSelection::Loader {
-                component_id: build.component_id,
-                build_id: build.build_id,
-                target_version_id: build.version_id,
-            })
+            resolve_loader_create_selection(state, component_id, build_id.trim()).await
         }
         _ => Err(bad_create_request("invalid create selection")),
     }
+}
+
+async fn resolve_loader_version_create_selection(
+    state: &AppState,
+    component_id: LoaderComponentId,
+    minecraft_version: &str,
+) -> Result<CreateSelection, (StatusCode, Json<serde_json::Value>)> {
+    let library_dir = state
+        .library_dir()
+        .ok_or_else(library_not_configured_response)?;
+    let (builds, catalog) = fetch_builds(
+        PathBuf::from(library_dir).as_path(),
+        component_id,
+        minecraft_version,
+    )
+    .await
+    .map_err(loader_error_response)?;
+    let installed_scan = scan_current_versions(state);
+    if installed_scan.is_degraded() {
+        return Err(version_scan_degraded_response());
+    }
+    let build = preferred_loader_build(builds).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(
+                serde_json::json!({ "error": "No stable loader build is available for this Minecraft version." }),
+            ),
+        )
+    })?;
+    if loader_build_is_known_incompatible_default(&build) {
+        return Err(no_compatible_stable_loader_response(component_id));
+    }
+    let exact_installed = exact_loader_build_is_installed(&installed_scan.versions, &build);
+    if loader_catalog_is_stale(&catalog) && !exact_installed {
+        return Err(stale_loader_catalog_response());
+    }
+
+    Ok(CreateSelection::Loader {
+        component_id: build.component_id,
+        build_id: build.build_id,
+        target_version_id: build.version_id,
+    })
+}
+
+async fn resolve_loader_create_selection(
+    state: &AppState,
+    component_id: LoaderComponentId,
+    build_id: &str,
+) -> Result<CreateSelection, (StatusCode, Json<serde_json::Value>)> {
+    let Some((parsed_component_id, minecraft_version, _loader_version)) = parse_build_id(build_id)
+    else {
+        return Err(bad_create_request("invalid create selection"));
+    };
+    if parsed_component_id != component_id {
+        return Err(bad_create_request("invalid create selection"));
+    }
+
+    let library_dir = state
+        .library_dir()
+        .ok_or_else(library_not_configured_response)?;
+    let (builds, catalog) = fetch_builds(
+        PathBuf::from(library_dir).as_path(),
+        component_id,
+        &minecraft_version,
+    )
+    .await
+    .map_err(loader_error_response)?;
+    let installed_scan = scan_current_versions(state);
+    if installed_scan.is_degraded() {
+        return Err(version_scan_degraded_response());
+    }
+    resolve_loader_create_selection_from_build_catalog(
+        component_id,
+        build_id,
+        builds,
+        &catalog,
+        &installed_scan.versions,
+    )
+}
+
+pub(super) fn resolve_loader_create_selection_from_build_catalog(
+    component_id: LoaderComponentId,
+    build_id: &str,
+    builds: Vec<LoaderBuildRecord>,
+    catalog: &LoaderCatalogState,
+    installed_versions: &[VersionEntry],
+) -> Result<CreateSelection, (StatusCode, Json<serde_json::Value>)> {
+    let build = builds
+        .into_iter()
+        .find(|build| build.component_id == component_id && build.build_id == build_id)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "Selected loader build is not available." })),
+            )
+        })?;
+    let exact_installed = exact_loader_build_is_installed(installed_versions, &build);
+    if loader_build_is_known_incompatible_default(&build) {
+        return Err(no_compatible_stable_loader_response(component_id));
+    }
+    if loader_catalog_is_stale(catalog) && !exact_installed {
+        return Err(stale_loader_catalog_response());
+    }
+
+    Ok(CreateSelection::Loader {
+        component_id: build.component_id,
+        build_id: build.build_id,
+        target_version_id: build.version_id,
+    })
 }
 
 async fn resolve_vanilla_create_selection(
@@ -342,10 +484,18 @@ async fn resolve_vanilla_create_selection(
     })
 }
 
-fn preferred_loader_build(builds: Vec<LoaderBuildRecord>) -> Option<LoaderBuildRecord> {
-    builds
-        .into_iter()
-        .max_by_key(|build| build.build_meta.selection.default_rank)
+pub(super) fn preferred_loader_build(builds: Vec<LoaderBuildRecord>) -> Option<LoaderBuildRecord> {
+    builds.into_iter().find(loader_build_is_stable_default)
+}
+
+fn loader_build_is_stable_default(build: &LoaderBuildRecord) -> bool {
+    matches!(
+        build.build_meta.selection.reason,
+        LoaderSelectionReason::Recommended
+            | LoaderSelectionReason::LatestStable
+            | LoaderSelectionReason::Stable
+            | LoaderSelectionReason::Unlabeled
+    )
 }
 
 fn create_instance_with_unique_name(
@@ -436,43 +586,100 @@ fn apply_create_initial_settings(
         .map_err(|error| instance_write_error_response(InstanceWriteOperation::Create, error))
 }
 
-async fn queue_create_install_if_needed(
+fn create_install_queue_request_if_needed(
     state: &AppState,
     selection: &CreateSelection,
-) -> Result<Option<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Option<InstallQueueRequest>, (StatusCode, Json<serde_json::Value>)> {
     let Some(request) = selection.install_queue_request() else {
         return Ok(None);
     };
-    if version_is_installed(state, selection.target_version_id()) {
+    if version_is_launch_ready_or_user_blocked(state, selection.target_version_id())? {
         return Ok(None);
     }
+
+    Ok(Some(request))
+}
+
+async fn queue_create_install_request(
+    state: &AppState,
+    request: Option<InstallQueueRequest>,
+) -> Result<Option<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let Some(request) = request else {
+        return Ok(None);
+    };
 
     enqueue_install(state, request).await.map(Some)
 }
 
-fn version_is_installed(state: &AppState, version_id: &str) -> bool {
-    scan_current_versions(state)
-        .into_iter()
-        .any(|version| version.id == version_id && version.installed && version.launchable)
+pub(super) async fn queue_create_install_or_rollback(
+    state: &AppState,
+    instance_id: &str,
+    request: Option<InstallQueueRequest>,
+) -> Result<Option<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
+    match queue_create_install_request(state, request).await {
+        Ok(install_queue) => Ok(install_queue),
+        Err(error) => {
+            rollback_created_instance(state, instance_id);
+            Err(error)
+        }
+    }
+}
+
+fn version_is_launch_ready_or_user_blocked(
+    state: &AppState,
+    version_id: &str,
+) -> Result<bool, (StatusCode, Json<serde_json::Value>)> {
+    let scan = scan_current_versions(state);
+    if scan.is_degraded() {
+        return Err(version_scan_degraded_response());
+    }
+    let Some(library_dir) = state.library_dir().map(PathBuf::from) else {
+        return Ok(false);
+    };
+    let config = state.config().current();
+    let readiness = inspect_launch_readiness(&LaunchReadinessRequest {
+        library_dir,
+        requested_java: config.java_path_override.trim().to_string(),
+        version_id: version_id.to_string(),
+        guardian_mode: GuardianMode::from_config(&config.guardian_mode),
+    });
+    if readiness.launchable {
+        return Ok(true);
+    }
+    Ok(readiness
+        .reasons
+        .iter()
+        .filter(|reason| reason.severity == LaunchReadinessSeverity::Blocking)
+        .all(|reason| reason.id == LaunchReadinessReasonId::JavaOverrideMissing))
+}
+
+fn rollback_created_instance(state: &AppState, instance_id: &str) {
+    let _ = state.instances().remove(instance_id, true);
 }
 
 fn create_queued_install_summary(
     response: &InstallQueueStateResponse,
+    request: &InstallQueueRequest,
 ) -> Option<CreateQueuedInstallSummary> {
-    if let Some(active) = response.active.as_ref() {
+    if let Some(active) = response
+        .active
+        .as_ref()
+        .filter(|active| install_queue_item_matches_request(&active.install_item, request))
+    {
         return Some(CreateQueuedInstallSummary {
             state_id: "install_active".to_string(),
             kind: active.kind.clone(),
             label: active.label.clone(),
             queue_id: Some(active.queue_id.clone()),
-            install_id: Some(active.install_id.clone()),
-            operation_id: Some(active.operation_id.clone()),
+            install_id: active.install_id.clone(),
+            operation_id: active.operation_id.clone(),
         });
     }
 
     response
         .items
-        .first()
+        .iter()
+        .find(|item| install_queue_item_matches_request(&item.install_item, request))
         .map(|item| CreateQueuedInstallSummary {
             state_id: "install_queued".to_string(),
             kind: item.kind.clone(),
@@ -481,6 +688,19 @@ fn create_queued_install_summary(
             install_id: None,
             operation_id: None,
         })
+}
+
+fn install_queue_item_matches_request(
+    item: &InstallQueueInstallItemViewModel,
+    request: &InstallQueueRequest,
+) -> bool {
+    match request.kind.trim() {
+        "vanilla" | "minecraft" => item.loader.is_none() && item.version_id == request.version_id,
+        "loader" => item.loader.as_ref().is_some_and(|loader| {
+            loader.component_id == request.component_id && loader.build_id == request.build_id
+        }),
+        _ => false,
+    }
 }
 
 fn create_instance_response(
@@ -550,7 +770,9 @@ fn create_guardian_notice(preset: &GuardianJvmPresetResolution) -> Option<Create
     })
 }
 
-fn create_source_options() -> Vec<CreateInstanceSourceOptionViewModel> {
+fn create_source_options(
+    unavailable_sources: &HashSet<String>,
+) -> Vec<CreateInstanceSourceOptionViewModel> {
     let mut sources = vec![CreateInstanceSourceOptionViewModel {
         id: "vanilla".to_string(),
         label: "Vanilla".to_string(),
@@ -558,11 +780,14 @@ fn create_source_options() -> Vec<CreateInstanceSourceOptionViewModel> {
         disabled_reason: None,
     }];
     sources.extend(fetch_components().into_iter().map(|component| {
+        let id = component.id.as_str().to_string();
+        let unavailable = unavailable_sources.contains(&id);
         CreateInstanceSourceOptionViewModel {
-            id: component.id.as_str().to_string(),
+            id,
             label: component.name,
-            enabled: true,
-            disabled_reason: None,
+            enabled: !unavailable,
+            disabled_reason: unavailable
+                .then(|| "Provider catalog is unavailable right now.".to_string()),
         }
     }));
     sources
@@ -588,75 +813,104 @@ fn create_channel_options() -> Vec<CreateInstanceSourceOptionViewModel> {
 
 async fn create_version_rows(
     state: &AppState,
+    source_id: Option<&str>,
     notices: &mut Vec<CreateInstanceNoticeViewModel>,
 ) -> Vec<CreateInstanceVersionRowViewModel> {
     let Some(library_dir) = state.library_dir().map(PathBuf::from) else {
         return Vec::new();
     };
 
-    let manifest = match fetch_version_manifest_cached(&library_dir).await {
-        Ok(manifest) => manifest,
-        Err(_) => {
-            notices.push(CreateInstanceNoticeViewModel {
-                state_id: "catalog_unavailable".to_string(),
-                tone: "warn".to_string(),
-                message: "Minecraft versions are unavailable".to_string(),
-                detail: Some("Check your connection and try again.".to_string()),
-            });
-            return Vec::new();
-        }
-    };
-
-    let installed_versions = scan_versions(&library_dir).unwrap_or_default();
-    let installed = installed_launchable_version_ids(&installed_versions);
-    let loader_installed = full_loader_installed_minecraft_versions(&installed_versions);
-    let releases = manifest_release_references(&manifest);
-    let manifest_versions = manifest.versions;
+    let installed_scan = scan_current_versions(state);
+    if installed_scan.is_degraded() {
+        notices.push(CreateInstanceNoticeViewModel {
+            state_id: "library_scan_degraded".to_string(),
+            tone: "warn".to_string(),
+            message: "Installed versions are unavailable".to_string(),
+            detail: Some(VERSION_SCAN_DEGRADED_MESSAGE.to_string()),
+        });
+        return Vec::new();
+    }
     let mut rows = Vec::new();
 
-    for version in &manifest_versions {
-        let analysis = analyze_minecraft_version(
-            &version.id,
-            &version.kind,
-            &version.release_time,
-            None,
-            &releases,
-        );
-        rows.push(create_version_row(
-            "vanilla",
-            format!("vanilla|{}", version.id),
-            &version.id,
-            &analysis.minecraft_meta,
-            &analysis.lifecycle,
-            download_state(
-                installed.contains(&version.id),
-                installed.contains(&version.id),
-            ),
-        ));
+    let installed_versions = installed_scan.versions;
+    let installed = installed_launchable_version_ids(&installed_versions);
+    let loader_installed = installed_loader_minecraft_keys(&installed_versions);
+
+    if source_id.unwrap_or("vanilla") == "vanilla" {
+        let manifest = match fetch_version_manifest_cached(&library_dir).await {
+            Ok(manifest) => manifest,
+            Err(_) => {
+                notices.push(CreateInstanceNoticeViewModel {
+                    state_id: "catalog_unavailable".to_string(),
+                    tone: "warn".to_string(),
+                    message: "Minecraft versions are unavailable".to_string(),
+                    detail: Some("Check your connection and try again.".to_string()),
+                });
+                return Vec::new();
+            }
+        };
+        let releases = manifest_release_references(&manifest);
+        for version in &manifest.versions {
+            let analysis = analyze_minecraft_version(
+                &version.id,
+                &version.kind,
+                &version.release_time,
+                None,
+                &releases,
+            );
+            rows.push(create_version_row(
+                "vanilla",
+                format!("vanilla|{}", version.id),
+                &version.id,
+                None,
+                &analysis.minecraft_meta,
+                &analysis.lifecycle,
+                download_state(
+                    installed.contains(&version.id),
+                    installed.contains(&version.id),
+                ),
+                None,
+            ));
+        }
+        return rows;
     }
 
     for component in fetch_components() {
+        if source_id.is_some_and(|source_id| source_id != component.id.as_str()) {
+            continue;
+        }
         match fetch_supported_versions(&library_dir, component.id).await {
-            Ok((versions, _catalog)) => {
-                let full_installed = loader_installed.get(&component.id);
+            Ok((versions, versions_catalog)) => {
                 for version in versions {
+                    let exact_installed = loader_installed.contains(&LoaderMinecraftInstallKey {
+                        component_id: component.id,
+                        version_id: version.id.clone(),
+                    });
+                    let disabled_reason = loader_version_disabled_reason(
+                        &library_dir,
+                        component.id,
+                        &version.id,
+                        &versions_catalog,
+                        exact_installed,
+                        version.stable_hint,
+                    )
+                    .await;
                     rows.push(create_version_row(
                         component.id.as_str(),
-                        format!("loader_minecraft|{}|{}", component.id.as_str(), version.id),
+                        format!("loader_version|{}|{}", component.id.as_str(), version.id),
                         &version.id,
+                        None,
                         &version.minecraft_meta,
                         &version.lifecycle,
-                        download_state(
-                            installed.contains(&version.id),
-                            full_installed.is_some_and(|set| set.contains(&version.id)),
-                        ),
+                        download_state(installed.contains(&version.id), exact_installed),
+                        disabled_reason,
                     ));
                 }
             }
             Err(_) => notices.push(CreateInstanceNoticeViewModel {
-                state_id: format!("loader_versions_unavailable_{}", component.id.short_key()),
+                state_id: format!("source_unavailable_{}", component.id.short_key()),
                 tone: "warn".to_string(),
-                message: format!("{} versions are unavailable", component.id.display_name()),
+                message: format!("{} is unavailable", component.id.display_name()),
                 detail: Some("Check your connection and try again.".to_string()),
             }),
         }
@@ -669,14 +923,17 @@ fn create_version_row(
     source_id: &str,
     selection_id: String,
     minecraft_version_id: &str,
+    loader_build: Option<CreateLoaderBuildIdentityViewModel>,
     minecraft_meta: &MinecraftVersionMeta,
     lifecycle: &LifecycleMeta,
     download_state: &'static str,
+    disabled_reason: Option<String>,
 ) -> CreateInstanceVersionRowViewModel {
     CreateInstanceVersionRowViewModel {
         source_id: source_id.to_string(),
         selection_id,
         minecraft_version_id: minecraft_version_id.to_string(),
+        loader_build,
         display_name: if minecraft_meta.display_name.is_empty() {
             minecraft_version_id.to_string()
         } else {
@@ -686,8 +943,8 @@ fn create_version_row(
             .then(|| minecraft_meta.display_hint.clone()),
         channel: create_channel_id(lifecycle.channel).to_string(),
         download_state: download_state.to_string(),
-        create_enabled: true,
-        disabled_reason: None,
+        create_enabled: disabled_reason.is_none(),
+        disabled_reason,
     }
 }
 
@@ -699,10 +956,41 @@ fn installed_launchable_version_ids(versions: &[VersionEntry]) -> HashSet<String
         .collect()
 }
 
-fn full_loader_installed_minecraft_versions(
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct LoaderBuildInstallKey {
+    component_id: LoaderComponentId,
+    build_id: String,
+    version_id: String,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct LoaderMinecraftInstallKey {
+    component_id: LoaderComponentId,
+    version_id: String,
+}
+
+fn installed_loader_build_keys(versions: &[VersionEntry]) -> HashSet<LoaderBuildInstallKey> {
+    let mut installed = HashSet::new();
+    for version in versions {
+        if !version.installed || !version.launchable {
+            continue;
+        }
+        let Some(loader) = &version.loader else {
+            continue;
+        };
+        installed.insert(LoaderBuildInstallKey {
+            component_id: loader.component_id,
+            build_id: loader.build_id.clone(),
+            version_id: version.id.clone(),
+        });
+    }
+    installed
+}
+
+fn installed_loader_minecraft_keys(
     versions: &[VersionEntry],
-) -> HashMap<LoaderComponentId, HashSet<String>> {
-    let mut installed = HashMap::<LoaderComponentId, HashSet<String>>::new();
+) -> HashSet<LoaderMinecraftInstallKey> {
+    let mut installed = HashSet::new();
     for version in versions {
         if !version.installed || !version.launchable {
             continue;
@@ -711,28 +999,31 @@ fn full_loader_installed_minecraft_versions(
             continue;
         };
         let minecraft_version = if version.inherits_from.trim().is_empty() {
-            minecraft_version_from_loader_build_id(&loader.build_id)
+            parse_build_id(&loader.build_id)
+                .map(|(_component_id, minecraft_version, _)| minecraft_version.trim().to_string())
         } else {
-            Some(version.inherits_from.clone())
+            Some(version.inherits_from.trim().to_string())
         };
-        if let Some(minecraft_version) = minecraft_version {
-            installed
-                .entry(loader.component_id)
-                .or_default()
-                .insert(minecraft_version);
-        }
+        let Some(version_id) = minecraft_version.filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        installed.insert(LoaderMinecraftInstallKey {
+            component_id: loader.component_id,
+            version_id,
+        });
     }
     installed
 }
 
-fn minecraft_version_from_loader_build_id(build_id: &str) -> Option<String> {
-    let mut parts = build_id.split(':');
-    let _component = parts.next()?;
-    let minecraft_version = parts.next()?.trim();
-    if minecraft_version.is_empty() {
-        None
-    } else {
-        Some(minecraft_version.to_string())
+fn exact_loader_build_is_installed(versions: &[VersionEntry], build: &LoaderBuildRecord) -> bool {
+    installed_loader_build_keys(versions).contains(&loader_build_install_key(build))
+}
+
+fn loader_build_install_key(build: &LoaderBuildRecord) -> LoaderBuildInstallKey {
+    LoaderBuildInstallKey {
+        component_id: build.component_id,
+        build_id: build.build_id.clone(),
+        version_id: build.version_id.clone(),
     }
 }
 
@@ -744,6 +1035,125 @@ fn download_state(base_installed: bool, full_installed: bool) -> &'static str {
     } else {
         "none"
     }
+}
+
+fn unavailable_source_ids(notices: &[CreateInstanceNoticeViewModel]) -> HashSet<String> {
+    notices
+        .iter()
+        .filter_map(|notice| {
+            notice
+                .state_id
+                .strip_prefix("source_unavailable_")
+                .and_then(source_id_from_short_key)
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+fn source_id_from_short_key(short_key: &str) -> Option<&'static str> {
+    fetch_components()
+        .into_iter()
+        .find(|component| component.id.short_key() == short_key)
+        .map(|component| component.id.as_str())
+}
+
+async fn loader_version_disabled_reason(
+    library_dir: &std::path::Path,
+    component_id: LoaderComponentId,
+    minecraft_version: &str,
+    versions_catalog: &LoaderCatalogState,
+    exact_installed: bool,
+    stable_hint: Option<bool>,
+) -> Option<String> {
+    if matches!(
+        component_id,
+        LoaderComponentId::Forge | LoaderComponentId::NeoForge
+    ) && stable_hint == Some(false)
+    {
+        return Some(
+            "Only beta loader builds are available for this Minecraft version. Pick an exact beta build explicitly if you want to test it."
+                .to_string(),
+        );
+    }
+    if let Some(reason) =
+        known_loader_minecraft_version_disabled_reason(library_dir, component_id, minecraft_version)
+            .await
+    {
+        return Some(reason);
+    }
+    if exact_installed {
+        return None;
+    }
+    if loader_catalog_is_stale(versions_catalog) {
+        return Some(
+            "Loader catalog needs a fresh provider check before this version can be installed."
+                .to_string(),
+        );
+    }
+    None
+}
+
+async fn known_loader_minecraft_version_disabled_reason(
+    library_dir: &std::path::Path,
+    component_id: LoaderComponentId,
+    minecraft_version: &str,
+) -> Option<String> {
+    if component_id != LoaderComponentId::Quilt
+        || !quilt_java25_minecraft_version(minecraft_version)
+    {
+        return None;
+    }
+
+    let Ok((builds, _catalog)) = fetch_builds(library_dir, component_id, minecraft_version).await
+    else {
+        return None;
+    };
+    let Some(build) = preferred_loader_build(builds) else {
+        return Some(no_compatible_stable_loader_message(component_id).to_string());
+    };
+    if loader_build_is_known_incompatible_default(&build) {
+        Some(no_compatible_stable_loader_message(component_id).to_string())
+    } else {
+        None
+    }
+}
+
+fn loader_build_is_known_incompatible_default(build: &LoaderBuildRecord) -> bool {
+    build.component_id == LoaderComponentId::Quilt
+        && quilt_java25_minecraft_version(&build.minecraft_version)
+        && quilt_loader_version_is_before_java25_support(&build.loader_version)
+}
+
+fn quilt_java25_minecraft_version(minecraft_version: &str) -> bool {
+    let value = minecraft_version.trim();
+    value == "26" || value.starts_with("26.")
+}
+
+fn quilt_loader_version_is_before_java25_support(loader_version: &str) -> bool {
+    let value = loader_version.trim();
+    compare_version_like(value, "0.30.0") == Ordering::Less && !value.starts_with("0.30.")
+}
+
+fn no_compatible_stable_loader_response(
+    component_id: LoaderComponentId,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "error": no_compatible_stable_loader_message(component_id)
+        })),
+    )
+}
+
+fn no_compatible_stable_loader_message(component_id: LoaderComponentId) -> String {
+    format!(
+        "No stable compatible {} loader is available for this Minecraft version.",
+        component_id.display_name()
+    )
+}
+
+fn loader_catalog_is_stale(catalog: &LoaderCatalogState) -> bool {
+    catalog.availability.stale || !catalog.availability.fresh
 }
 
 fn create_channel_id(channel: LifecycleChannel) -> &'static str {
@@ -773,5 +1183,14 @@ fn minecraft_versions_unavailable_response() -> (StatusCode, Json<serde_json::Va
     (
         StatusCode::BAD_GATEWAY,
         Json(serde_json::json!({ "error": "Minecraft versions are unavailable" })),
+    )
+}
+
+fn stale_loader_catalog_response() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::PRECONDITION_FAILED,
+        Json(serde_json::json!({
+            "error": "Loader catalog needs a fresh provider check before this build can be installed."
+        })),
     )
 }

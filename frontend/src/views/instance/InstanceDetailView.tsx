@@ -148,7 +148,7 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
   };
   const onInstall = (): void => {
     selectInstance(inst.id);
-    handleInstallClick();
+    handleInstallClick(installStatus.item);
   };
   const onStop = (): void => {
     selectInstance(inst.id);

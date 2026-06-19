@@ -1,3 +1,4 @@
+use crate::launch::{Downloads, JavaVersion, effective_java_version_for};
 use crate::loaders::types::{LoaderBuildMetadata, LoaderComponentId};
 use crate::paths::versions_dir;
 use crate::types::{VersionEntry, VersionLoaderAttachment, VersionSubjectKind};
@@ -5,9 +6,45 @@ use crate::version_meta::{analyze_minecraft_version, compare_version_entries};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::io;
 use std::path::Path;
 
 const LOADER_METADATA_FILE: &str = ".croopor-loader.json";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionScanReport {
+    pub state: VersionScanState,
+    pub versions: Vec<VersionEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub issues: Vec<VersionScanIssue>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VersionScanState {
+    Ready,
+    Empty,
+    Degraded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionScanIssue {
+    pub kind: VersionScanIssueKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VersionScanIssueKind {
+    VersionsDirectoryUnreadable,
+    VersionDirectoryEntryUnreadable,
+    VersionJsonMissing,
+    VersionJsonUnreadable,
+    VersionJsonMalformed,
+    LoaderMetadataUnreadable,
+    LoaderMetadataMalformed,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedVersion {
@@ -25,15 +62,9 @@ struct VersionStub {
     #[serde(rename = "inheritsFrom", default)]
     inherits_from: String,
     #[serde(rename = "javaVersion", default)]
-    java_version: Option<JavaVersionStub>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct JavaVersionStub {
+    java_version: Option<JavaVersion>,
     #[serde(default)]
-    component: String,
-    #[serde(rename = "majorVersion", default)]
-    major_version: i32,
+    downloads: Downloads,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,26 +81,98 @@ struct InstalledLoaderMetadata {
     build_meta: LoaderBuildMetadata,
 }
 
-pub fn scan_versions(mc_dir: &Path) -> std::io::Result<Vec<VersionEntry>> {
+pub fn scan_versions(mc_dir: &Path) -> io::Result<Vec<VersionEntry>> {
+    scan_versions_report(mc_dir).map(|report| report.versions)
+}
+
+pub fn scan_versions_report(mc_dir: &Path) -> io::Result<VersionScanReport> {
     let versions_dir = versions_dir(mc_dir);
-    let entries = fs::read_dir(&versions_dir)?;
+    let entries = match fs::read_dir(&versions_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(VersionScanReport {
+                state: VersionScanState::Empty,
+                versions: Vec::new(),
+                issues: Vec::new(),
+            });
+        }
+        Err(_) => {
+            return Ok(VersionScanReport {
+                state: VersionScanState::Degraded,
+                versions: Vec::new(),
+                issues: vec![version_scan_issue(
+                    VersionScanIssueKind::VersionsDirectoryUnreadable,
+                    None,
+                )],
+            });
+        }
+    };
     let mut stubs = HashMap::new();
     let mut loader_metadata = HashMap::new();
+    let mut issues = Vec::new();
 
-    for entry in entries.filter_map(Result::ok) {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                issues.push(version_scan_issue(
+                    VersionScanIssueKind::VersionDirectoryEntryUnreadable,
+                    None,
+                ));
+                continue;
+            }
+        };
         if !entry.path().is_dir() {
             continue;
         }
         let id = entry.file_name().to_string_lossy().to_string();
         let json_path = entry.path().join(format!("{id}.json"));
-        let Ok(data) = fs::read_to_string(&json_path) else {
-            continue;
+        let data = match fs::read_to_string(&json_path) {
+            Ok(data) => data,
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    && entry.path().join(".incomplete").exists() =>
+            {
+                continue;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                issues.push(version_scan_issue(
+                    VersionScanIssueKind::VersionJsonMissing,
+                    Some(id),
+                ));
+                continue;
+            }
+            Err(_) => {
+                issues.push(version_scan_issue(
+                    VersionScanIssueKind::VersionJsonUnreadable,
+                    Some(id),
+                ));
+                continue;
+            }
         };
-        let Ok(stub) = serde_json::from_str::<VersionStub>(&data) else {
-            continue;
+        let stub = match serde_json::from_str::<VersionStub>(&data) {
+            Ok(stub) => stub,
+            Err(_) => {
+                issues.push(version_scan_issue(
+                    VersionScanIssueKind::VersionJsonMalformed,
+                    Some(id),
+                ));
+                continue;
+            }
         };
-        if let Some(metadata) = read_installed_loader_metadata(&entry.path()) {
-            loader_metadata.insert(id.clone(), metadata);
+        match read_installed_loader_metadata(&entry.path()) {
+            LoaderMetadataScan::Ready(metadata) => {
+                loader_metadata.insert(id.clone(), metadata);
+            }
+            LoaderMetadataScan::Missing => {}
+            LoaderMetadataScan::Unreadable => issues.push(version_scan_issue(
+                VersionScanIssueKind::LoaderMetadataUnreadable,
+                Some(id.clone()),
+            )),
+            LoaderMetadataScan::Malformed => issues.push(version_scan_issue(
+                VersionScanIssueKind::LoaderMetadataMalformed,
+                Some(id.clone()),
+            )),
         }
         stubs.insert(id, stub);
     }
@@ -107,6 +210,7 @@ pub fn scan_versions(mc_dir: &Path) -> std::io::Result<Vec<VersionEntry>> {
             let parent_jar = versions_dir
                 .join(&effective_parent)
                 .join(format!("{}.jar", effective_parent));
+            let child_has_client_artifact = stub.downloads.client.is_some();
             if !parent_json.is_file() {
                 (
                     false,
@@ -114,6 +218,15 @@ pub fn scan_versions(mc_dir: &Path) -> std::io::Result<Vec<VersionEntry>> {
                     format!("Base version {} needs to be installed", effective_parent),
                     effective_parent.clone(),
                 )
+            } else if child_has_client_artifact && !jar_path.is_file() {
+                (
+                    false,
+                    "incomplete".to_string(),
+                    "Game files not fully downloaded".to_string(),
+                    id.clone(),
+                )
+            } else if jar_path.is_file() {
+                (true, "ready".to_string(), String::new(), String::new())
             } else if !parent_jar.is_file() {
                 (
                     false,
@@ -121,26 +234,31 @@ pub fn scan_versions(mc_dir: &Path) -> std::io::Result<Vec<VersionEntry>> {
                     format!("Base version {} needs to be downloaded", effective_parent),
                     effective_parent.clone(),
                 )
-            } else if jar_path.is_file() {
-                (true, "ready".to_string(), String::new(), String::new())
             } else {
-                (
-                    false,
-                    "incomplete".to_string(),
-                    "Loader files are not fully installed".to_string(),
-                    id.clone(),
-                )
+                (true, "ready".to_string(), String::new(), String::new())
             }
         };
 
+        let analysis_id = if effective_parent.is_empty() {
+            id.as_str()
+        } else {
+            effective_parent.as_str()
+        };
+        let analysis_stub = stubs.get(analysis_id).unwrap_or(stub);
+        let analysis = analyze_minecraft_version(
+            analysis_id,
+            &analysis_stub.kind,
+            &analysis_stub.release_time,
+            None,
+            &[],
+        );
         let loader = metadata.map(loader_attachment_from_metadata);
-        let analysis = analyze_minecraft_version(id, &stub.kind, &stub.release_time, None, &[]);
 
         versions.push(VersionEntry {
             subject_kind: VersionSubjectKind::InstalledVersion,
             id: id.clone(),
-            raw_kind: stub.kind.clone(),
-            release_time: stub.release_time.clone(),
+            raw_kind: analysis_stub.kind.clone(),
+            release_time: analysis_stub.release_time.clone(),
             minecraft_meta: analysis.minecraft_meta,
             lifecycle: analysis.lifecycle,
             inherits_from: effective_parent.clone(),
@@ -157,20 +275,31 @@ pub fn scan_versions(mc_dir: &Path) -> std::io::Result<Vec<VersionEntry>> {
     }
 
     versions.sort_by(compare_version_entries);
-    Ok(versions)
+    let state = if !issues.is_empty() {
+        VersionScanState::Degraded
+    } else if versions.is_empty() {
+        VersionScanState::Empty
+    } else {
+        VersionScanState::Ready
+    };
+    Ok(VersionScanReport {
+        state,
+        versions,
+        issues,
+    })
 }
 
 fn resolve_java_version(
     id: &str,
     stubs: &HashMap<String, VersionStub>,
     loader_metadata: &HashMap<String, InstalledLoaderMetadata>,
-) -> JavaVersionStub {
+) -> JavaVersion {
     let mut current_id = id.to_string();
     let mut current = stubs.get(&current_id);
     let mut fallback_parent = String::new();
     while let Some(stub) = current {
         if let Some(java_version) = &stub.java_version {
-            return java_version.clone();
+            return effective_java_version_for(&current_id, &stub.kind, java_version);
         }
         let next_parent =
             effective_parent_version(&stub.inherits_from, loader_metadata.get(&current_id));
@@ -190,13 +319,20 @@ fn resolve_java_version(
         && let Some(stub) = stubs.get(&fallback_parent)
         && let Some(java_version) = &stub.java_version
     {
-        return java_version.clone();
+        return effective_java_version_for(&fallback_parent, &stub.kind, java_version);
     }
 
-    JavaVersionStub {
-        component: String::new(),
-        major_version: 0,
-    }
+    let inference_id = if fallback_parent.is_empty() {
+        id
+    } else {
+        fallback_parent.as_str()
+    };
+    let raw_kind = stubs
+        .get(inference_id)
+        .or_else(|| stubs.get(id))
+        .map(|stub| stub.kind.as_str())
+        .unwrap_or_default();
+    effective_java_version_for(inference_id, raw_kind, &JavaVersion::default())
 }
 
 fn effective_parent_version(
@@ -212,17 +348,32 @@ fn effective_parent_version(
         .unwrap_or_default()
 }
 
-fn read_installed_loader_metadata(version_dir: &Path) -> Option<InstalledLoaderMetadata> {
-    let data = fs::read(version_dir.join(LOADER_METADATA_FILE)).ok()?;
-    let metadata = serde_json::from_slice::<InstalledLoaderMetadata>(&data).ok()?;
+enum LoaderMetadataScan {
+    Ready(InstalledLoaderMetadata),
+    Missing,
+    Unreadable,
+    Malformed,
+}
+
+fn read_installed_loader_metadata(version_dir: &Path) -> LoaderMetadataScan {
+    let data = match fs::read(version_dir.join(LOADER_METADATA_FILE)) {
+        Ok(data) => data,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return LoaderMetadataScan::Missing;
+        }
+        Err(_) => return LoaderMetadataScan::Unreadable,
+    };
+    let Ok(metadata) = serde_json::from_slice::<InstalledLoaderMetadata>(&data) else {
+        return LoaderMetadataScan::Malformed;
+    };
     if metadata.schema_version != 1
         || metadata.build_id.trim().is_empty()
         || metadata.minecraft_version.trim().is_empty()
         || metadata.loader_version.trim().is_empty()
     {
-        return None;
+        return LoaderMetadataScan::Malformed;
     }
-    Some(metadata)
+    LoaderMetadataScan::Ready(metadata)
 }
 
 fn loader_attachment_from_metadata(metadata: &InstalledLoaderMetadata) -> VersionLoaderAttachment {
@@ -239,11 +390,17 @@ fn loader_attachment_from_metadata(metadata: &InstalledLoaderMetadata) -> Versio
     }
 }
 
+fn version_scan_issue(kind: VersionScanIssueKind, version_id: Option<String>) -> VersionScanIssue {
+    VersionScanIssue { kind, version_id }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        InstalledLoaderMetadata, JavaVersionStub, VersionStub, resolve_java_version, scan_versions,
+        InstalledLoaderMetadata, VersionScanIssueKind, VersionScanState, VersionStub,
+        resolve_java_version, scan_versions, scan_versions_report,
     };
+    use crate::launch::{Downloads, JavaVersion};
     use crate::loaders::types::{
         LoaderBuildMetadata, LoaderComponentId, LoaderSelectionMeta, LoaderSelectionReason,
         LoaderSelectionSource, LoaderTerm, LoaderTermEvidence, LoaderTermSource,
@@ -263,6 +420,7 @@ mod tests {
                 release_time: String::new(),
                 inherits_from: String::new(),
                 java_version: None,
+                downloads: Downloads::default(),
             },
         );
         stubs.insert(
@@ -271,10 +429,11 @@ mod tests {
                 kind: "release".to_string(),
                 release_time: String::new(),
                 inherits_from: String::new(),
-                java_version: Some(JavaVersionStub {
+                java_version: Some(JavaVersion {
                     component: "java-runtime-gamma".to_string(),
                     major_version: 17,
                 }),
+                downloads: Downloads::default(),
             },
         );
         let mut metadata = HashMap::new();
@@ -314,6 +473,76 @@ mod tests {
         assert_eq!(version.status, "incomplete");
         assert_eq!(version.needs_install, "1.20.1");
         assert!(version.status_detail.contains("1.20.1"));
+
+        let _ = fs::remove_dir_all(&mc_dir);
+    }
+
+    #[test]
+    fn scan_versions_report_distinguishes_empty_library_from_degraded_scan() {
+        let mc_dir = unique_test_dir("empty-library-scan");
+
+        let report = scan_versions_report(&mc_dir).expect("scan empty library");
+
+        assert_eq!(report.state, VersionScanState::Empty);
+        assert!(report.versions.is_empty());
+        assert!(report.issues.is_empty());
+
+        let _ = fs::remove_dir_all(&mc_dir);
+    }
+
+    #[test]
+    fn scan_versions_report_marks_malformed_version_json_as_degraded() {
+        let mc_dir = unique_test_dir("malformed-version-scan");
+        let version_dir = mc_dir.join("versions").join("1.21.1");
+        fs::create_dir_all(&version_dir).expect("create version dir");
+        fs::write(version_dir.join("1.21.1.json"), "{not valid json")
+            .expect("write malformed version json");
+
+        let report = scan_versions_report(&mc_dir).expect("scan degraded library");
+
+        assert_eq!(report.state, VersionScanState::Degraded);
+        assert!(report.versions.is_empty());
+        assert!(report.issues.iter().any(|issue| {
+            issue.kind == VersionScanIssueKind::VersionJsonMalformed
+                && issue.version_id.as_deref() == Some("1.21.1")
+        }));
+
+        fs::remove_dir_all(&mc_dir).expect("remove temp test dir");
+    }
+
+    #[test]
+    fn scan_versions_infers_java8_for_legacy_versions_without_java_version() {
+        let mc_dir = unique_test_dir("legacy-java-scan");
+        let versions_dir = mc_dir.join("versions");
+        for version_id in ["1.8.9", "1.12.2"] {
+            let version_dir = versions_dir.join(version_id);
+            fs::create_dir_all(&version_dir).expect("version dir");
+            fs::write(
+                version_dir.join(format!("{version_id}.json")),
+                format!(
+                    r#"{{
+                        "id":"{version_id}",
+                        "type":"release",
+                        "mainClass":"net.minecraft.client.main.Main",
+                        "libraries":[]
+                    }}"#
+                ),
+            )
+            .expect("write version json");
+            fs::write(version_dir.join(format!("{version_id}.jar")), b"client")
+                .expect("write client jar");
+        }
+
+        let versions = scan_versions(&mc_dir).expect("scan versions");
+
+        for version_id in ["1.8.9", "1.12.2"] {
+            let version = versions
+                .iter()
+                .find(|entry| entry.id == version_id)
+                .expect("version exists");
+            assert_eq!(version.java_component, "jre-legacy");
+            assert_eq!(version.java_major, 8);
+        }
 
         fs::remove_dir_all(&mc_dir).expect("remove temp test dir");
     }
@@ -376,6 +605,62 @@ mod tests {
             loader.build_meta.selection.reason,
             LoaderSelectionReason::LatestUnstable
         );
+
+        fs::remove_dir_all(&mc_dir).expect("remove temp test dir");
+    }
+
+    #[test]
+    fn scan_versions_anchors_loader_metadata_to_base_minecraft_version() {
+        let mc_dir = unique_test_dir("loader-base-version-metadata");
+        let versions_dir = mc_dir.join("versions");
+        let base_dir = versions_dir.join("1.21.5");
+        fs::create_dir_all(&base_dir).expect("create base version dir");
+        fs::write(
+            base_dir.join("1.21.5.json"),
+            r#"{
+                "id":"1.21.5",
+                "type":"release",
+                "releaseTime":"2025-03-25T12:00:00+00:00",
+                "mainClass":"net.minecraft.client.main.Main",
+                "libraries":[]
+            }"#,
+        )
+        .expect("write base json");
+        fs::write(base_dir.join("1.21.5.jar"), b"client").expect("write base jar");
+
+        let fabric_dir = versions_dir.join("fabric-loader-0.19.3-1.21.5");
+        fs::create_dir_all(&fabric_dir).expect("create fabric version dir");
+        fs::write(
+            fabric_dir.join("fabric-loader-0.19.3-1.21.5.json"),
+            r#"{
+                "id":"fabric-loader-0.19.3-1.21.5",
+                "mainClass":"net.fabricmc.loader.impl.launch.knot.KnotClient",
+                "libraries":[]
+            }"#,
+        )
+        .expect("write fabric json");
+        fs::write(
+            fabric_dir.join(".croopor-loader.json"),
+            serde_json::to_vec_pretty(&test_loader_metadata(
+                LoaderComponentId::Fabric,
+                "1.21.5",
+                "0.19.3",
+            ))
+            .expect("serialize metadata"),
+        )
+        .expect("write metadata");
+
+        let versions = scan_versions(&mc_dir).expect("scan versions");
+        let version = versions
+            .iter()
+            .find(|entry| entry.id == "fabric-loader-0.19.3-1.21.5")
+            .expect("fabric version exists");
+
+        assert_eq!(version.inherits_from, "1.21.5");
+        assert_eq!(version.raw_kind, "release");
+        assert_eq!(version.release_time, "2025-03-25T12:00:00+00:00");
+        assert_eq!(version.minecraft_meta.display_name, "1.21.5");
+        assert_eq!(version.minecraft_meta.effective_version, "1.21.5");
 
         fs::remove_dir_all(&mc_dir).expect("remove temp test dir");
     }

@@ -20,7 +20,7 @@ pub(super) struct LaunchMemoryDefaults {
 }
 
 pub(super) fn selected_java_override(instance: &Instance, config: &AppConfig) -> String {
-    if !instance.java_path.is_empty() {
+    if !instance.java_path.trim().is_empty() {
         instance.java_path.trim().to_string()
     } else {
         config.java_path_override.trim().to_string()
@@ -187,9 +187,9 @@ pub(super) fn java_override_origin(
     instance: &Instance,
     config: &AppConfig,
 ) -> Option<OverrideOrigin> {
-    if !instance.java_path.is_empty() {
+    if !instance.java_path.trim().is_empty() {
         Some(OverrideOrigin::Instance)
-    } else if !config.java_path_override.is_empty() {
+    } else if !config.java_path_override.trim().is_empty() {
         Some(OverrideOrigin::Global)
     } else {
         None

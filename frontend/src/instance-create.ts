@@ -2,8 +2,8 @@ import { api } from './api';
 import { toast } from './toast';
 import { errMessage } from './utils';
 import { navigate } from './ui-state';
-import { addInstance, setInstallQueueState } from './actions';
-import { refreshInstallQueue } from './install';
+import { addInstance } from './actions';
+import { applyInstallQueueResponse, refreshInstallQueue } from './install';
 import type { Instance } from './types-instance';
 import type { InstallQueueStateResponse } from './types-install';
 import type { ToastKind } from './types-ui';
@@ -138,7 +138,7 @@ export async function createInstance(args: CreateInstanceArgs): Promise<CreateIn
   const created = res;
   addInstance(created);
   if (res.install_queue) {
-    setInstallQueueState(res.install_queue);
+    await applyInstallQueueResponse(res.install_queue, { connectActive: true });
     void refreshInstallQueue({ connectActive: true, retryPendingStart: true });
   }
   toast(createResultToastMessage(res), createToastKind(res.view_model?.tone ?? res.guardian_notice?.tone));

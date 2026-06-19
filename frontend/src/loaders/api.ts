@@ -12,7 +12,7 @@ export function connectLoaderInstallSSE(
     try {
       data = JSON.parse(e.data);
     } catch {
-      onError('Loader install progress data was invalid. Retry from Downloads.');
+      onError('Loader install progress data was invalid.');
       es.close();
       return;
     }
@@ -24,7 +24,7 @@ export function connectLoaderInstallSSE(
 
   es.onerror = (): void => {
     if (es.readyState !== EventSource.CLOSED) return;
-    onError('Loader install progress stopped unexpectedly. Retry the install from the launcher.');
+    onError('Loader install progress stopped unexpectedly.');
   };
 
   return es;

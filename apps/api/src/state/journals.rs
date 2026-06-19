@@ -1,6 +1,6 @@
 use super::contracts::{
     CommandKind, OperationId, OperationJournalEntry, OperationJournalStep, OperationOutcome,
-    OperationStatus, TargetDescriptor,
+    OperationPhase, OperationStatus, OperationStepResult, TargetDescriptor,
 };
 use super::ownership::{CurrentArtifact, classify_current_artifact};
 use crate::execution::file::{FileWriteRequest, write_file_atomically};
@@ -119,6 +119,9 @@ impl OperationJournalStore {
         outcome: OperationOutcome,
     ) {
         self.update(operation_id, |entry| {
+            if operation_journal_status_is_terminal(entry.status) {
+                return;
+            }
             entry.status = OperationStatus::Succeeded;
             entry.completed_steps.push(completed_step);
             entry.failure_point = None;
@@ -134,6 +137,9 @@ impl OperationJournalStore {
         outcome: OperationOutcome,
     ) {
         self.update(operation_id, |entry| {
+            if operation_journal_status_is_terminal(entry.status) {
+                return;
+            }
             entry.status = OperationStatus::Failed;
             entry.completed_steps.push(failure_step);
             entry.failure_point = Some(failure_point.into());
@@ -143,6 +149,9 @@ impl OperationJournalStore {
 
     pub fn record_progress(&self, operation_id: &OperationId, progress_step: OperationJournalStep) {
         self.update(operation_id, |entry| {
+            if operation_journal_status_is_terminal(entry.status) {
+                return;
+            }
             entry.status = OperationStatus::Running;
             entry.completed_steps.push(progress_step);
         });
@@ -155,6 +164,12 @@ impl OperationJournalStore {
         diagnosis_ids: Vec<String>,
     ) {
         self.update(operation_id, |entry| {
+            if !fact_ids.is_empty() && entry.completed_steps.is_empty() {
+                let mut step =
+                    OperationJournalStep::new("guardian_evidence", OperationPhase::Running);
+                step.result = OperationStepResult::Completed;
+                entry.completed_steps.push(step);
+            }
             if let Some(step) = entry.completed_steps.last_mut() {
                 for fact_id in fact_ids {
                     if !step.generated_facts.contains(&fact_id) {
@@ -361,6 +376,16 @@ fn validate_entry(entry: &OperationJournalEntry) -> Result<(), OperationJournalV
     Ok(())
 }
 
+fn operation_journal_status_is_terminal(status: OperationStatus) -> bool {
+    matches!(
+        status,
+        OperationStatus::Succeeded
+            | OperationStatus::Failed
+            | OperationStatus::Blocked
+            | OperationStatus::Cancelled
+    )
+}
+
 fn validate_target(target: &TargetDescriptor) -> Result<(), OperationJournalValidationError> {
     if !safe_token(&target.id, 96) {
         return Err(OperationJournalValidationError::UnsafeTargetId);
@@ -559,6 +584,74 @@ mod tests {
                 .operation_id,
             operation_id
         );
+    }
+
+    #[test]
+    fn terminal_journal_outcome_is_immutable_after_success() {
+        let store = OperationJournalStore::new();
+        let operation_id = OperationId::new("operation-terminal-success");
+        store.create(OperationJournalEntry::new(
+            JournalId::new("journal-operation-terminal-success"),
+            operation_id.clone(),
+            CommandKind::InstallVersion,
+            StabilizationSystem::Application,
+            OwnershipClass::LauncherManaged,
+            RollbackState::NotApplicable,
+        ));
+
+        let mut success = OperationJournalStep::new("install_done", OperationPhase::Completed);
+        success.result = crate::state::contracts::OperationStepResult::Completed;
+        store.record_success(&operation_id, success, OperationOutcome::Succeeded);
+
+        let mut failure = OperationJournalStep::new("install_failed", OperationPhase::Failed);
+        failure.result = crate::state::contracts::OperationStepResult::Failed;
+        store.record_failure(
+            &operation_id,
+            failure,
+            "download_failed",
+            OperationOutcome::Failed,
+        );
+
+        let stored = store.get(&operation_id).expect("journal");
+        assert_eq!(stored.status, OperationStatus::Succeeded);
+        assert_eq!(stored.outcome, Some(OperationOutcome::Succeeded));
+        assert_eq!(stored.failure_point, None);
+        assert_eq!(stored.completed_steps.len(), 1);
+        assert_eq!(stored.completed_steps[0].step_id, "install_done");
+    }
+
+    #[test]
+    fn terminal_journal_outcome_is_immutable_after_failure() {
+        let store = OperationJournalStore::new();
+        let operation_id = OperationId::new("operation-terminal-failure");
+        store.create(OperationJournalEntry::new(
+            JournalId::new("journal-operation-terminal-failure"),
+            operation_id.clone(),
+            CommandKind::InstallVersion,
+            StabilizationSystem::Application,
+            OwnershipClass::LauncherManaged,
+            RollbackState::NotApplicable,
+        ));
+
+        let mut failure = OperationJournalStep::new("install_failed", OperationPhase::Failed);
+        failure.result = crate::state::contracts::OperationStepResult::Failed;
+        store.record_failure(
+            &operation_id,
+            failure,
+            "download_failed",
+            OperationOutcome::Failed,
+        );
+
+        let mut success = OperationJournalStep::new("install_done", OperationPhase::Completed);
+        success.result = crate::state::contracts::OperationStepResult::Completed;
+        store.record_success(&operation_id, success, OperationOutcome::Succeeded);
+
+        let stored = store.get(&operation_id).expect("journal");
+        assert_eq!(stored.status, OperationStatus::Failed);
+        assert_eq!(stored.outcome, Some(OperationOutcome::Failed));
+        assert_eq!(stored.failure_point.as_deref(), Some("download_failed"));
+        assert_eq!(stored.completed_steps.len(), 1);
+        assert_eq!(stored.completed_steps[0].step_id, "install_failed");
     }
 
     #[test]

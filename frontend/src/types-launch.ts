@@ -1,7 +1,7 @@
 import type { GuardianFact, GuardianMode, GuardianSummary } from './types-guardian';
 
 export type LaunchActionTone = 'ok' | 'warn' | 'err' | 'mute';
-export type LaunchPrimaryAction = 'launch' | 'install';
+export type LaunchPrimaryAction = 'launch' | 'install' | 'blocked';
 
 export interface LaunchActionState {
   state_id: string;
@@ -69,10 +69,13 @@ export interface LaunchPreflightResourceBudget {
 export type LaunchReadinessReasonId =
   | 'version_json_missing'
   | 'client_jar_missing'
+  | 'client_jar_corrupt'
   | 'parent_version_missing'
   | 'incomplete_install'
   | 'libraries_missing'
+  | 'libraries_corrupt'
   | 'asset_index_missing'
+  | 'asset_index_corrupt'
   | 'managed_runtime_missing'
   | 'java_override_missing';
 

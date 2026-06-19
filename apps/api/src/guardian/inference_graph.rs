@@ -896,6 +896,29 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         public_reason_template: ReasonTemplate::Static("jvm_arg_unsafe_override"),
     },
     DiagnosisGraphNode {
+        id: DiagnosisIdTemplate::Static("launcher_managed_artifact_signature_corrupt"),
+        domain: DomainTemplate::FactDomain,
+        required_facts: &[FactRequirement::Any(&[
+            "launcher_managed_artifact_signature_corruption",
+        ])],
+        supporting_facts: &[WeightedFact::new(
+            "launcher_managed_artifact_signature_corruption",
+            1.0,
+        )],
+        contradicting_facts: NO_CONTRADICTIONS,
+        phase_allowed: DOWNLOAD_PHASES,
+        ownership_allowed: ANY_OWNERSHIP,
+        severity: SeverityTemplate::Static(GuardianSeverity::Blocking),
+        confidence: ConfidenceTemplate::Static(GuardianConfidence::Confirmed),
+        impact: ImpactTemplate::LaunchBlocking,
+        eligibility: BLOCK_ONLY_ELIGIBILITY,
+        target_strategy: AffectedTargetStrategy::FactTargetOrGuardianFallback,
+        candidate_actions: &[GuardianActionKind::Block],
+        public_reason_template: ReasonTemplate::Static(
+            "launcher_managed_artifact_signature_corrupt",
+        ),
+    },
+    DiagnosisGraphNode {
         id: DiagnosisIdTemplate::Static("launcher_managed_artifact_corrupt"),
         domain: DomainTemplate::FactDomain,
         required_facts: &[FactRequirement::Any(&[
@@ -1271,6 +1294,9 @@ fn readiness_diagnosis_id(fact_id: &str) -> &'static str {
         "client_jar_missing" => "client_jar_missing",
         "libraries_missing" => "libraries_missing",
         "asset_index_missing" => "asset_index_missing",
+        "launcher_managed_artifact_signature_corruption" => {
+            "launcher_managed_artifact_signature_corrupt"
+        }
         _ => "launch_readiness_blocking",
     }
 }
@@ -1280,6 +1306,7 @@ fn readiness_state_corruption_impact(fact_id: &str) -> f32 {
         "incomplete_install" => 0.75,
         "version_json_missing" | "parent_version_missing" => 0.65,
         "client_jar_missing" | "libraries_missing" | "asset_index_missing" => 0.55,
+        "launcher_managed_artifact_signature_corruption" => 0.70,
         _ => 0.50,
     }
 }

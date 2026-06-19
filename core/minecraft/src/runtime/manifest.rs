@@ -1,11 +1,12 @@
 use super::model::JavaRuntimeLookupError;
 use futures_util::StreamExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
 pub(super) const RUNTIME_MANIFEST_URL: &str = "https://launchermeta.mojang.com/v1/products/java-runtime/2ec0cc96c44e5a76b9c8b7c39df7210883d12871/all.json";
 pub(super) const MAX_RUNTIME_MANIFEST_BYTES: u64 = 16 << 20;
+pub(super) const COMPONENT_MANIFEST_PROOF_FILE: &str = ".croopor-runtime-manifest.json";
 
 pub(super) async fn fetch_runtime_json<T>(url: &str) -> Result<T, JavaRuntimeLookupError>
 where
@@ -67,12 +68,12 @@ pub(super) struct RuntimeDownloadManifest {
 
 pub(super) type RuntimeManifest = HashMap<String, HashMap<String, Vec<RuntimeManifestEntry>>>;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct ComponentManifest {
     pub(super) files: HashMap<String, ComponentManifestFile>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct ComponentManifestFile {
     #[serde(rename = "type")]
     pub(super) kind: String,
@@ -83,13 +84,13 @@ pub(super) struct ComponentManifestFile {
     pub(super) downloads: Option<ComponentManifestDownloads>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct ComponentManifestDownloads {
     #[serde(default)]
     pub(super) raw: Option<ComponentManifestDownload>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct ComponentManifestDownload {
     pub(super) url: String,
     #[serde(default)]
