@@ -60,7 +60,7 @@ Installed-version scans also carry a backend-authored scan state alongside the v
 
 Installed loader versions are classified by their Minecraft target, not by the composite local version id. Scans and enrichment use `inherits_from` or backend-authored loader metadata such as `minecraft_version` as the analysis id, so entries like `fabric-loader-0.16.14-1.21.5`, `1.19-forge-41.1.0`, and `neoforge-26.1.0.19-beta` inherit Minecraft display, lifecycle, and ordering metadata from `1.21.5`, `1.19`, and `26.1` respectively.
 
-Loader-supported Minecraft-version rows can also carry provider stability hints. Some providers use this as Minecraft-version stability, such as Fabric and Quilt marking snapshot/prerelease game rows; those hints affect lifecycle display but do not by themselves mean loader builds are beta-only. Providers that derive the hint from build availability, currently Forge and NeoForge, may use a negative hint to indicate only unstable loader builds exist for that Minecraft target, so create-view disables normal version-level creation and requires an exact loader build selection for deliberate beta testing. The hint is serialized as part of normalized loader catalog cache data so cached supported-version rows re-enrich to the same lifecycle as fresh provider rows.
+Loader-supported Minecraft-version rows can also carry provider stability hints. Some providers use this as Minecraft-version stability, such as Fabric and Quilt marking snapshot/prerelease game rows; those hints affect lifecycle display but do not by themselves mean loader builds are beta-only. Providers that derive the hint from build availability, currently Forge and NeoForge, may use a negative hint to indicate only unstable loader builds exist for that Minecraft target. Create-view renders that as a backend-authored beta tag, but the row remains selectable; version-level loader creation resolves the best stable build first and falls back to the best provider-ranked unstable build when no stable build exists. Build-level create-view exceptions, such as Quilt Java compatibility guards, use fresh cached build metadata when available and may render conservative non-blocking tags when live build metadata is intentionally deferred; submit/install paths re-resolve builds through the full loader catalog authority. The hint is serialized as part of normalized loader catalog cache data so cached supported-version rows re-enrich to the same lifecycle as fresh provider rows.
 
 ## Pipeline
 ```mermaid
@@ -145,6 +145,7 @@ Examples:
   - `family = release`
   - `lifecycle.channel = preview`
   - `lifecycle.labels = [beta]`
+  - create-view row includes a backend-authored `Beta` tag and remains selectable
 - `b1.7.3`
   - `family = old_beta`
   - `lifecycle.channel = legacy`
@@ -196,6 +197,7 @@ Frontend code should:
 - never render composite loader ids such as `quilt-loader-0.29.2-1.16.5`, `1.19-forge-41.1.0`, or `neoforge-26.1.0.19-beta` as the Minecraft version; backend metadata must provide `inherits_from` or normalized Minecraft metadata
 - installed loader versions must carry backend-authored loader metadata from `versions/<id>/.croopor-loader.json`; scanners and routes should not infer loader identity from raw version ids
 - loader create rows must use backend-authored exact build identity (`component_id`, `build_id`, target version id, Minecraft version, loader version, installability, and catalog availability); frontend code must not infer preferred builds or installed/full state from component id + Minecraft version groupings
+- loader create row tags are backend-authored; frontend code renders tags such as `Beta` but does not decide loader stability or compatibility
 - use `normalizeVersionDisplay()` / `versionSearchText()` for version picker rows and filtering
 - use `lifecycle` for filtering and badges
 - avoid re-parsing vanilla-like version ids locally

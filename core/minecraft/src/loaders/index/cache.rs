@@ -29,45 +29,12 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<T, LoaderError>>,
 {
+    if let Some(cached) = resolve_fresh_cached::<T>(cache_path.clone(), ttl) {
+        return Ok(cached);
+    }
+
     let checked_at_ms = Utc::now().timestamp_millis();
-    if let Some(cached) = fresh_memory_cache::<T>(&cache_path, ttl) {
-        return Ok((
-            cached.value,
-            LoaderCatalogState {
-                availability: LoaderAvailability {
-                    fresh: true,
-                    stale: false,
-                    cache_hit: true,
-                    checked_at_ms,
-                    last_success_at_ms: Some(cached.fetched_at_ms),
-                    last_error: None,
-                    last_failure_kind: None,
-                },
-            },
-        ));
-    }
-
     let cached = read_cache::<T>(&cache_path);
-    if let Ok(cached) = &cached
-        && is_cache_fresh(cached.fetched_at_ms, ttl)
-    {
-        update_memory_cache(&cache_path, cached);
-        return Ok((
-            cached.value.clone(),
-            LoaderCatalogState {
-                availability: LoaderAvailability {
-                    fresh: true,
-                    stale: false,
-                    cache_hit: true,
-                    checked_at_ms,
-                    last_success_at_ms: Some(cached.fetched_at_ms),
-                    last_error: None,
-                    last_failure_kind: None,
-                },
-            },
-        ));
-    }
-
     match live_fetch().await {
         Ok(value) => {
             let cached = CachedCatalog::new(value.clone());
@@ -117,6 +84,42 @@ where
                 provider_status: error.provider_status(),
             })
         }
+    }
+}
+
+pub fn resolve_fresh_cached<T>(
+    cache_path: PathBuf,
+    ttl: Duration,
+) -> Option<(T, LoaderCatalogState)>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+{
+    let checked_at_ms = Utc::now().timestamp_millis();
+    let cached = fresh_memory_cache::<T>(&cache_path, ttl).or_else(|| {
+        let cached = read_cache::<T>(&cache_path).ok()?;
+        if !is_cache_fresh(cached.fetched_at_ms, ttl) {
+            return None;
+        }
+        update_memory_cache(&cache_path, &cached);
+        Some(cached)
+    })?;
+    Some((
+        cached.value,
+        fresh_cache_state(checked_at_ms, cached.fetched_at_ms),
+    ))
+}
+
+fn fresh_cache_state(checked_at_ms: i64, fetched_at_ms: i64) -> LoaderCatalogState {
+    LoaderCatalogState {
+        availability: LoaderAvailability {
+            fresh: true,
+            stale: false,
+            cache_hit: true,
+            checked_at_ms,
+            last_success_at_ms: Some(fetched_at_ms),
+            last_error: None,
+            last_failure_kind: None,
+        },
     }
 }
 
@@ -342,6 +345,25 @@ mod tests {
         assert_eq!(value, vec!["cached".to_string()]);
         assert!(state.availability.fresh);
         assert!(state.availability.cache_hit);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn resolve_fresh_cached_ignores_stale_disk_catalog() {
+        let root = temp_dir("fresh-cache-only-stale");
+        fs::create_dir_all(&root).expect("create root");
+        let cache_path = root.join("catalog.json");
+        let cached = CachedCatalog {
+            schema_version: LOADER_CATALOG_SCHEMA_VERSION,
+            fetched_at_ms: 1,
+            value: vec!["stale".to_string()],
+        };
+        write_cache(&cache_path, &cached)
+            .await
+            .expect("write stale cache");
+
+        assert!(resolve_fresh_cached::<Vec<String>>(cache_path, Duration::ZERO).is_none());
 
         let _ = fs::remove_dir_all(root);
     }

@@ -1,6 +1,6 @@
 //! Application-owned setup and onboarding workflows.
 
-use crate::state::AppState;
+use crate::{application::instances::invalidate_create_view_cache, state::AppState};
 use axum::{Json, http::StatusCode};
 use croopor_config::AppPaths;
 use croopor_minecraft::{
@@ -100,6 +100,7 @@ pub fn setup_set_dir(
     config.library_dir = payload.path.clone();
     config.library_mode = "existing".to_string();
     state.update_config(config).map_err(setup_config_error)?;
+    invalidate_create_view_cache();
     let _ = ensure_launcher_profiles(&path, "");
 
     Ok(SetupLibraryResponse {
@@ -134,6 +135,7 @@ pub fn setup_init(
     config.library_dir = path.to_string_lossy().to_string();
     config.library_mode = "managed".to_string();
     state.update_config(config).map_err(setup_config_error)?;
+    invalidate_create_view_cache();
 
     Ok(SetupLibraryResponse {
         status: "ok",

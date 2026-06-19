@@ -1868,45 +1868,8 @@ fn loader_create_selection_allows_stale_exact_build_when_already_installed() {
     );
 }
 
-#[test]
-fn preferred_loader_build_keeps_normalized_first_build_on_same_rank() {
-    let component_id = croopor_minecraft::LoaderComponentId::Fabric;
-    let first = fabric_build_record(component_id, "1.21.1", "0.16.15", 900);
-    let second = fabric_build_record(component_id, "1.21.1", "0.16.14", 900);
-
-    let preferred = preferred_loader_build(vec![first.clone(), second]).expect("preferred build");
-
-    assert_eq!(preferred.build_id, first.build_id);
-}
-
-#[test]
-fn preferred_loader_build_skips_unstable_default_builds() {
-    let component_id = croopor_minecraft::LoaderComponentId::NeoForge;
-    let mut unstable = fabric_build_record(component_id, "26.2", "26.2.0.3-beta", 600);
-    unstable.build_meta.selection.reason = croopor_minecraft::LoaderSelectionReason::Unstable;
-    let stable = fabric_build_record(component_id, "26.2", "26.2.0.4", 800);
-
-    let preferred =
-        preferred_loader_build(vec![unstable.clone(), stable.clone()]).expect("stable build");
-
-    assert_eq!(preferred.build_id, stable.build_id);
-    assert!(preferred_loader_build(vec![unstable]).is_none());
-}
-
-#[test]
-fn preferred_loader_build_allows_unlabeled_non_beta_builds() {
-    let component_id = croopor_minecraft::LoaderComponentId::Quilt;
-    let mut unlabeled = fabric_build_record(component_id, "1.20.1", "0.29.2", 700);
-    unlabeled.build_meta.selection.reason = croopor_minecraft::LoaderSelectionReason::Unlabeled;
-    unlabeled.build_meta.selection.source = croopor_minecraft::LoaderSelectionSource::None;
-
-    let preferred = preferred_loader_build(vec![unlabeled.clone()]).expect("unlabeled build");
-
-    assert_eq!(preferred.build_id, unlabeled.build_id);
-}
-
 #[tokio::test]
-async fn create_instance_rejects_loader_version_when_only_beta_builds_exist() {
+async fn create_instance_loader_version_uses_beta_build_when_only_beta_builds_exist() {
     let fixture = TestFixture::new("create-loader-version-beta-only");
     let library_dir = fixture.configure_create_manifest(&["26.2"]);
     let component_id = croopor_minecraft::LoaderComponentId::NeoForge;
@@ -1914,9 +1877,25 @@ async fn create_instance_rejects_loader_version_when_only_beta_builds_exist() {
     beta.build_meta.selection.reason = croopor_minecraft::LoaderSelectionReason::Unstable;
     beta.build_meta.selection.source =
         croopor_minecraft::LoaderSelectionSource::ExplicitVersionLabel;
+    let beta_version_id = beta.version_id.clone();
     write_loader_build_cache_records(&library_dir, component_id, "26.2", vec![beta]);
+    fixture
+        .state
+        .installs()
+        .enqueue_queued_install(
+            "busy-beta-queue".to_string(),
+            crate::state::InstallQueueSpec::vanilla("busy".to_string(), String::new()),
+            crate::state::InstallQueuePlacement::Back,
+        )
+        .await;
+    fixture
+        .state
+        .installs()
+        .reserve_next_queued_install()
+        .await
+        .expect("reserve active queue slot");
 
-    let (status, Json(body)) = handle_create_instance(
+    let created = handle_create_instance(
         &fixture.state,
         CreateInstanceRequest {
             name: "NeoForge beta default".to_string(),
@@ -1925,19 +1904,18 @@ async fn create_instance_rejects_loader_version_when_only_beta_builds_exist() {
         },
     )
     .await
-    .expect_err("beta-only loader version should fail");
+    .expect("beta-only loader version should create");
 
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_bounded_error_body(
-        &body,
-        "No stable loader build is available for this Minecraft version.",
-    );
-    assert!(fixture.state.instances().list().is_empty());
+    assert_eq!(created.version_id, beta_version_id);
+    let queued = created.queued_install.expect("queued install summary");
+    assert_eq!(queued.kind, "loader");
+    assert_eq!(queued.state_id, "install_queued");
+    assert_eq!(queued.label, "NeoForge 26.2.0.3-beta for Minecraft 26.2");
 }
 
 #[tokio::test]
-async fn create_instance_rejects_quilt_java25_default_without_selecting_beta_loader() {
-    let fixture = TestFixture::new("create-quilt-java25-default-guard");
+async fn create_instance_quilt_java25_default_uses_compatible_beta_fallback() {
+    let fixture = TestFixture::new("create-quilt-java25-beta-fallback");
     let library_dir = fixture.configure_create_manifest(&["26.1.2"]);
     let component_id = croopor_minecraft::LoaderComponentId::Quilt;
     let mut stable_build = fabric_build_record(component_id, "26.1.2", "0.29.2", 700);
@@ -1953,8 +1931,23 @@ async fn create_instance_rejects_quilt_java25_default_without_selecting_beta_loa
         "26.1.2",
         vec![stable_build, beta_build],
     );
+    fixture
+        .state
+        .installs()
+        .enqueue_queued_install(
+            "busy-quilt-beta-queue".to_string(),
+            crate::state::InstallQueueSpec::vanilla("busy".to_string(), String::new()),
+            crate::state::InstallQueuePlacement::Back,
+        )
+        .await;
+    fixture
+        .state
+        .installs()
+        .reserve_next_queued_install()
+        .await
+        .expect("reserve active queue slot");
 
-    let (status, Json(body)) = handle_create_instance(
+    let created = handle_create_instance(
         &fixture.state,
         CreateInstanceRequest {
             name: "Quilt 26".to_string(),
@@ -1963,14 +1956,12 @@ async fn create_instance_rejects_quilt_java25_default_without_selecting_beta_loa
         },
     )
     .await
-    .expect_err("known incompatible Quilt default should fail");
+    .expect("compatible Quilt beta fallback should create");
 
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_bounded_error_body(
-        &body,
-        "No stable compatible Quilt loader is available for this Minecraft version.",
-    );
-    assert!(fixture.state.instances().list().is_empty());
+    assert_eq!(created.version_id, "quilt-loader-0.30.0-beta.8-26.1.2");
+    let queued = created.queued_install.expect("queued install summary");
+    assert_eq!(queued.kind, "loader");
+    assert_eq!(queued.label, "Quilt 0.30.0-beta.8 for Minecraft 26.1.2");
 }
 
 #[tokio::test]
@@ -2085,7 +2076,44 @@ async fn create_instance_view_marks_loader_minecraft_row_full_when_any_loader_is
 }
 
 #[tokio::test]
-async fn create_instance_view_disables_beta_only_loader_version_rows() {
+async fn create_instance_view_reuses_installed_scan_until_invalidated() {
+    super::create_cache::reset_create_view_cache_for_tests();
+    let fixture = TestFixture::new("create-view-installed-scan-cache");
+    let library_dir = fixture.root.join("library");
+    fixture
+        .state
+        .set_library_dir(library_dir.to_string_lossy().to_string());
+    write_version_manifest_cache(&library_dir, &["1.21.1"]);
+
+    let view = handle_create_instance_view(&fixture.state, None).await;
+    let row = view
+        .versions
+        .iter()
+        .find(|row| row.source_id == "vanilla" && row.minecraft_version_id == "1.21.1")
+        .expect("vanilla row");
+    assert_eq!(row.download_state, "none");
+
+    write_installed_vanilla_version(&library_dir, "1.21.1");
+    let cached_view = handle_create_instance_view(&fixture.state, None).await;
+    let cached_row = cached_view
+        .versions
+        .iter()
+        .find(|row| row.source_id == "vanilla" && row.minecraft_version_id == "1.21.1")
+        .expect("cached vanilla row");
+    assert_eq!(cached_row.download_state, "none");
+
+    invalidate_create_view_installed_scan();
+    let refreshed_view = handle_create_instance_view(&fixture.state, None).await;
+    let refreshed_row = refreshed_view
+        .versions
+        .iter()
+        .find(|row| row.source_id == "vanilla" && row.minecraft_version_id == "1.21.1")
+        .expect("refreshed vanilla row");
+    assert_eq!(refreshed_row.download_state, "full");
+}
+
+#[tokio::test]
+async fn create_instance_view_tags_beta_only_loader_version_rows_without_blocking_selection() {
     let fixture = TestFixture::new("create-view-beta-only-loader-version");
     let library_dir = fixture.root.join("library");
     fixture
@@ -2128,12 +2156,12 @@ async fn create_instance_view_disables_beta_only_loader_version_rows() {
         if component_id == croopor_minecraft::LoaderComponentId::NeoForge {
             assert_eq!(row.download_state, "full");
         }
-        assert_eq!(row.create_enabled, false);
-        assert_eq!(
-            row.disabled_reason.as_deref(),
-            Some(
-                "Only beta loader builds are available for this Minecraft version. Pick an exact beta build explicitly if you want to test it."
-            )
+        assert_eq!(row.create_enabled, true);
+        assert_eq!(row.disabled_reason, None);
+        assert!(
+            row.tags
+                .iter()
+                .any(|tag| tag.id == "beta" && tag.label == "Beta")
         );
     }
 }
@@ -2185,6 +2213,7 @@ async fn create_instance_view_keeps_fabric_and_quilt_snapshot_rows_enabled() {
         assert_eq!(row.channel, "snapshot");
         assert_eq!(row.create_enabled, true);
         assert_eq!(row.disabled_reason, None);
+        assert!(row.tags.is_empty());
     }
 }
 
@@ -2260,6 +2289,89 @@ async fn create_instance_view_disables_known_incompatible_quilt_java25_default()
         })
         .expect("quilt 1.21 row");
     assert_eq!(quilt_1_21.create_enabled, true);
+}
+
+#[tokio::test]
+async fn create_instance_view_tags_quilt_java25_without_cached_builds() {
+    let fixture = TestFixture::new("create-view-quilt-java25-no-build-cache");
+    let library_dir = fixture.root.join("library");
+    fixture
+        .state
+        .set_library_dir(library_dir.to_string_lossy().to_string());
+    write_version_manifest_cache(&library_dir, &["26.1.2"]);
+    for component in croopor_minecraft::fetch_components() {
+        let versions = if component.id == croopor_minecraft::LoaderComponentId::Quilt {
+            vec![("26.1.2", Some(true))]
+        } else {
+            Vec::new()
+        };
+        write_supported_versions_cache_with_stable_hints(&library_dir, component.id, &versions);
+    }
+
+    let view = handle_create_instance_view(
+        &fixture.state,
+        Some(croopor_minecraft::LoaderComponentId::Quilt.as_str()),
+    )
+    .await;
+
+    let row = view
+        .versions
+        .iter()
+        .find(|row| {
+            row.source_id == croopor_minecraft::LoaderComponentId::Quilt.as_str()
+                && row.minecraft_version_id == "26.1.2"
+        })
+        .expect("quilt 26 row");
+    assert_eq!(row.create_enabled, true);
+    assert_eq!(row.disabled_reason, None);
+    assert!(row.tags.iter().any(|tag| tag.id == "beta"));
+}
+
+#[tokio::test]
+async fn create_instance_view_enables_quilt_java25_when_compatible_beta_is_default_fallback() {
+    let fixture = TestFixture::new("create-view-quilt-java25-beta-fallback");
+    let library_dir = fixture.root.join("library");
+    fixture
+        .state
+        .set_library_dir(library_dir.to_string_lossy().to_string());
+    write_version_manifest_cache(&library_dir, &["26.1.2"]);
+    for component in croopor_minecraft::fetch_components() {
+        let versions = if component.id == croopor_minecraft::LoaderComponentId::Quilt {
+            vec![("26.1.2", Some(true))]
+        } else {
+            Vec::new()
+        };
+        write_supported_versions_cache_with_stable_hints(&library_dir, component.id, &versions);
+    }
+    let component_id = croopor_minecraft::LoaderComponentId::Quilt;
+    let mut stable_build = fabric_build_record(component_id, "26.1.2", "0.29.2", 700);
+    stable_build.build_meta.selection.reason = croopor_minecraft::LoaderSelectionReason::Unlabeled;
+    let mut beta_build = fabric_build_record(component_id, "26.1.2", "0.30.0-beta.8", 600);
+    beta_build.build_meta.selection.reason = croopor_minecraft::LoaderSelectionReason::Unstable;
+    write_loader_build_cache_records(
+        &library_dir,
+        component_id,
+        "26.1.2",
+        vec![stable_build, beta_build],
+    );
+
+    let view = handle_create_instance_view(
+        &fixture.state,
+        Some(croopor_minecraft::LoaderComponentId::Quilt.as_str()),
+    )
+    .await;
+
+    let row = view
+        .versions
+        .iter()
+        .find(|row| {
+            row.source_id == croopor_minecraft::LoaderComponentId::Quilt.as_str()
+                && row.minecraft_version_id == "26.1.2"
+        })
+        .expect("quilt 26 row");
+    assert_eq!(row.create_enabled, true);
+    assert_eq!(row.disabled_reason, None);
+    assert!(row.tags.iter().any(|tag| tag.id == "beta"));
 }
 
 #[tokio::test]

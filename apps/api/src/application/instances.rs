@@ -1,15 +1,19 @@
 mod create;
+mod create_cache;
+mod create_policy;
 mod resources;
 
 pub(crate) use create::{
     CreateInstanceRequest, CreateInstanceResponse, CreateInstanceViewResponse,
     handle_create_instance, handle_create_instance_view,
 };
+pub(crate) use create_cache::{
+    invalidate_create_view_cache, invalidate_create_view_installed_scan,
+    invalidate_create_view_source,
+};
 
 #[cfg(test)]
-use create::{
-    CreateSelection, preferred_loader_build, resolve_loader_create_selection_from_build_catalog,
-};
+use create::{CreateSelection, resolve_loader_create_selection_from_build_catalog};
 
 pub(crate) use resources::{
     InstanceLogInfo, InstanceLogTailResponse, InstanceModInfo, InstanceResourcesResponse,

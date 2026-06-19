@@ -23,7 +23,13 @@ import {
 } from './defaults';
 import { LoaderLogo } from './loader-logos';
 import { Modal, ModalContent } from '../../ui/Modal';
-import { CHANNEL_ORDER, CHANNEL_LABEL, type VersionDownloadState, type VersionRowModel } from './view-model';
+import {
+  CHANNEL_ORDER,
+  CHANNEL_LABEL,
+  type VersionDownloadState,
+  type VersionRowModel,
+  type VersionRowTagModel,
+} from './view-model';
 import {
   buildWindowPresets,
   detectMaxScreenSize,
@@ -57,9 +63,15 @@ interface CreateVersionRow {
   display_name: string;
   hint?: string | null;
   channel: string;
+  tags?: CreateVersionTag[];
   download_state: string;
   create_enabled: boolean;
   disabled_reason?: string | null;
+}
+
+interface CreateVersionTag {
+  id?: string;
+  label?: string;
 }
 
 interface CreateLoaderBuildIdentity {
@@ -146,8 +158,18 @@ function normalizeDownloadState(value: string | undefined): VersionDownloadState
   return value === 'base' || value === 'full' ? value : 'none';
 }
 
+function normalizeVersionTags(tags: CreateVersionTag[] | undefined): VersionRowTagModel[] {
+  return Array.isArray(tags)
+    ? tags
+        .filter((tag): tag is Required<CreateVersionTag> => {
+          return typeof tag.id === 'string' && typeof tag.label === 'string';
+        })
+        .map((tag) => ({ id: tag.id, label: tag.label }))
+    : [];
+}
+
 function rowSearchText(row: VersionRowModel): string {
-  return [row.id, row.displayName, row.hint ?? ''].join(' ').toLowerCase();
+  return [row.id, row.displayName, row.hint ?? '', row.tags.map((tag) => tag.label).join(' ')].join(' ').toLowerCase();
 }
 
 function CreateCard(): JSX.Element {
@@ -361,6 +383,7 @@ function CreateCard(): JSX.Element {
         displayName: row.display_name,
         hint: row.hint ?? null,
         channel: normalizeChannel(row.channel),
+        tags: normalizeVersionTags(row.tags),
         downloadState: normalizeDownloadState(row.download_state),
         createEnabled: row.create_enabled,
         disabledReason: row.disabled_reason ?? null,
@@ -648,6 +671,11 @@ function CreateCard(): JSX.Element {
                     >
                       <span class="cp-cr-vrow-name">{row.displayName}</span>
                       {row.hint && <span class="cp-cr-vrow-hint">{row.hint}</span>}
+                      {row.tags.map((tag) => (
+                        <span key={tag.id} class="cp-cr-vrow-tag" title={tag.label}>
+                          {tag.label}
+                        </span>
+                      ))}
                       <span class="cp-cr-vrow-spacer" />
                       {row.downloadState !== 'none' && (
                         <span

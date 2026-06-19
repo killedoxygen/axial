@@ -209,11 +209,11 @@ Frontend flow:
 3. pick a Minecraft version from that supported set
 4. fetch build records for that pair
 5. submit the backend-authored selection id
-6. the backend chooses the highest non-unstable default build
+6. the backend chooses the highest stable default build, falling back to the best provider-ranked unstable build when no stable build exists
 7. create the instance with `build.version_id`
 8. install using `component_id + build_id`
 
-Version-level loader selections must not silently choose unstable builds. If a supported Minecraft-version row only has beta/unstable loader builds, create-view keeps the row visible as preview/beta but disables normal creation. Provider-unlabeled non-beta builds, such as current Quilt loader rows, remain valid defaults. Exact `loader_build` selections are the explicit path for beta testing.
+Version-level loader selections can choose unstable builds only through backend policy. If a supported Minecraft-version row only has beta/unstable loader builds, create-view keeps the row selectable and renders a backend-authored `Beta` tag. Provider-unlabeled non-beta builds, such as current Quilt loader rows, remain valid stable defaults. Exact `loader_build` selections still work for deliberate build selection, but beta-only Minecraft rows do not require a separate exact-build path. Create-view uses supported-version metadata plus fresh cached build metadata for expensive build-level exceptions, so slow provider lookups do not block source switching. Known build-level exception rows may receive conservative non-blocking tags when build metadata is not cached yet, but create-submit and install still perform the full build resolution and stale-catalog checks before accepting a selection.
 
 Complex async loader state lives in:
 

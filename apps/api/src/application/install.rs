@@ -13,6 +13,7 @@ mod repair;
 mod stream;
 
 use super::InstallVersionCommand;
+use crate::application::instances::invalidate_create_view_installed_scan;
 use crate::guardian::{GuardianArtifactRepairOutcome, GuardianArtifactRepairStatus};
 use crate::observability::operation_journal_proof_record;
 use crate::state::AppState;
@@ -554,6 +555,7 @@ async fn start_queued_install(
 fn spawn_install_queue_monitor(state: AppState, install_id: String) {
     tokio::spawn(async move {
         wait_for_install_terminal(&state, &install_id).await;
+        invalidate_create_view_installed_scan();
         state
             .installs()
             .clear_active_queued_install(&install_id)

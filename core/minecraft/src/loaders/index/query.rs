@@ -1,4 +1,4 @@
-use super::cache::resolve_cached;
+use super::cache::{resolve_cached, resolve_fresh_cached};
 use super::normalize::{normalize_build_index, normalize_supported_versions};
 use crate::loaders::api::{loader_components, parse_build_id};
 use crate::loaders::providers;
@@ -64,6 +64,22 @@ pub async fn fetch_builds(
     .await?;
     let normalized = normalize_build_index(index);
     Ok((normalized.builds, catalog))
+}
+
+pub fn fetch_cached_builds(
+    library_dir: &Path,
+    component_id: LoaderComponentId,
+    minecraft_version: &str,
+) -> Result<Option<(Vec<LoaderBuildRecord>, LoaderCatalogState)>, LoaderError> {
+    let minecraft_version = sanitize_segment(minecraft_version)?;
+    let Some((index, catalog)) = resolve_fresh_cached(
+        build_index_cache_path(library_dir, component_id, &minecraft_version),
+        BUILD_INDEX_TTL,
+    ) else {
+        return Ok(None);
+    };
+    let normalized = normalize_build_index(index);
+    Ok(Some((normalized.builds, catalog)))
 }
 
 pub async fn resolve_build_record(

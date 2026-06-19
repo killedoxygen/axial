@@ -43,6 +43,7 @@ pub fn current_config(state: &AppState) -> AppConfig {
 
 pub fn update_config(state: &AppState, patch: ConfigPatch) -> Result<AppConfig, ApiError> {
     let mut next = state.config().current();
+    let previous_library_dir = next.library_dir.clone();
     let sync_offline_username = patch.username.is_some();
     if let Some(username) = patch.username {
         next.username = username;
@@ -116,6 +117,9 @@ pub fn update_config(state: &AppState, patch: ConfigPatch) -> Result<AppConfig, 
 
     match state.update_config(next) {
         Ok(config) => {
+            if config.library_dir != previous_library_dir {
+                application::instances::invalidate_create_view_cache();
+            }
             if sync_offline_username {
                 application::sync_active_offline_account_from_username(state, &config.username)
                     .map_err(config_account_sync_error_response)?;

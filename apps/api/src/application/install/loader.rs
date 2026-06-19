@@ -8,7 +8,7 @@ use super::{
     record_loader_install_operation_guardian_failure_outcome, sanitize_install_progress,
     stage_install_version_command,
 };
-use crate::application::InstallVersionCommand;
+use crate::application::{InstallVersionCommand, instances::invalidate_create_view_source};
 use crate::dto::loaders::{
     LoaderBuildsResponse, LoaderComponentsResponse, LoaderGameVersionsResponse,
 };
@@ -276,14 +276,16 @@ pub async fn loader_builds(
         )
     })?;
 
-    fetch_builds(
-        PathBuf::from(library_dir).as_path(),
+    let library_dir = PathBuf::from(library_dir);
+    let (builds, catalog) = fetch_builds(
+        library_dir.as_path(),
         request.component_id,
         &request.mc_version,
     )
     .await
-    .map(|(builds, catalog)| LoaderBuildsResponse { builds, catalog })
-    .map_err(loader_error_response)
+    .map_err(loader_error_response)?;
+    invalidate_create_view_source(library_dir.as_path(), request.component_id.as_str());
+    Ok(LoaderBuildsResponse { builds, catalog })
 }
 
 pub async fn loader_game_versions(

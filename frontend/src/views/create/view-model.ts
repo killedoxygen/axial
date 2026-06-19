@@ -2,12 +2,18 @@ import type { Channel } from './defaults';
 
 export type VersionDownloadState = 'none' | 'base' | 'full';
 
+export interface VersionRowTagModel {
+  id: string;
+  label: string;
+}
+
 export interface VersionRowModel {
   id: string;
   selectionId: string;
   displayName: string;
   hint: string | null;
   channel: Channel;
+  tags: VersionRowTagModel[];
   downloadState: VersionDownloadState;
   createEnabled: boolean;
   disabledReason: string | null;

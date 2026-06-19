@@ -1,9 +1,23 @@
 use super::{
-    InstanceWriteOperation, enrich_instance_for_state, instance_error_kind,
-    instance_write_error_response, scan_current_versions,
+    InstanceWriteOperation,
+    create_cache::{
+        cached_installed_scan, cached_source_rows, invalidate_create_view_source,
+        store_installed_scan, store_source_rows,
+    },
+    create_policy::{
+        LoaderBuildSelectionError, evaluate_create_view_loader_version_policies,
+        loader_build_is_known_incompatible_default, loader_catalog_is_stale,
+        loader_version_policy_inputs, no_compatible_stable_loader_message,
+        select_preferred_loader_build, stale_loader_version_catalog_message,
+    },
+    enrich_instance_for_state, instance_error_kind, instance_write_error_response,
+    scan_current_versions,
 };
 use crate::application::install::InstallQueueInstallItemViewModel;
-use crate::application::version::{VERSION_SCAN_DEGRADED_MESSAGE, version_scan_degraded_response};
+use crate::application::timing::{CreateViewTiming, trace_create_view};
+use crate::application::version::{
+    VERSION_SCAN_DEGRADED_MESSAGE, scan_installed_versions, version_scan_degraded_response,
+};
 use crate::application::{
     CommandResult, CommandResultCarriers, CreateInstancePayload, InstallQueueRequest,
     InstallQueueStateResponse, enqueue_install, loader_error_response,
@@ -22,14 +36,17 @@ use croopor_launcher::{
 };
 use croopor_minecraft::{
     LifecycleChannel, LifecycleMeta, LoaderAvailability, LoaderBuildRecord, LoaderCatalogState,
-    LoaderComponentId, LoaderInstallability, LoaderSelectionReason, MinecraftVersionMeta,
-    VersionEntry, analyze_minecraft_version, compare_version_like, fetch_builds, fetch_components,
-    fetch_supported_versions, fetch_version_manifest_cached, manifest_release_references,
-    parse_build_id,
+    LoaderComponentId, LoaderInstallability, MinecraftVersionMeta, VersionEntry,
+    analyze_minecraft_version, fetch_builds, fetch_components, fetch_supported_versions,
+    fetch_version_manifest_cached, manifest_release_references, parse_build_id,
 };
-use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
-use std::{cmp::Ordering, collections::HashSet, ops::Deref, path::PathBuf};
+use std::{
+    collections::HashSet,
+    ops::Deref,
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 
 const MAX_CREATE_NAME_COLLISION_RETRIES: usize = 9;
 
@@ -76,10 +93,18 @@ pub(crate) struct CreateInstanceVersionRowViewModel {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
     pub channel: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<CreateVersionTagViewModel>,
     pub download_state: String,
     pub create_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disabled_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct CreateVersionTagViewModel {
+    pub id: String,
+    pub label: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -124,6 +149,43 @@ pub(crate) struct CreateInstanceViewResponse {
     pub defaults: CreateInstanceDefaultsViewModel,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notices: Vec<CreateInstanceNoticeViewModel>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct CreateStaticVersionRow {
+    source_id: String,
+    selection_id: String,
+    minecraft_version_id: String,
+    loader_build: Option<CreateLoaderBuildIdentityViewModel>,
+    display_name: String,
+    hint: Option<String>,
+    channel: String,
+    tags: Vec<CreateVersionTagViewModel>,
+    disabled_reason: Option<String>,
+    fresh_catalog_required: bool,
+}
+
+#[derive(Debug)]
+struct CreateVersionRowsResult {
+    rows: Vec<CreateInstanceVersionRowViewModel>,
+    scan_elapsed: Duration,
+    catalog_elapsed: Duration,
+    policy_elapsed: Duration,
+    source_cache_hit: bool,
+    scan_cache_hit: bool,
+}
+
+impl CreateVersionRowsResult {
+    fn empty() -> Self {
+        Self {
+            rows: Vec::new(),
+            scan_elapsed: Duration::ZERO,
+            catalog_elapsed: Duration::ZERO,
+            policy_elapsed: Duration::ZERO,
+            source_cache_hit: false,
+            scan_cache_hit: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -184,6 +246,7 @@ pub(crate) async fn handle_create_instance_view(
     state: &AppState,
     source_id: Option<&str>,
 ) -> CreateInstanceViewResponse {
+    let started_at = Instant::now();
     let mut notices = Vec::new();
     if state.library_dir().is_none() {
         notices.push(CreateInstanceNoticeViewModel {
@@ -197,8 +260,19 @@ pub(crate) async fn handle_create_instance_view(
         });
     }
     let requested_source = normalize_create_view_source(source_id);
-    let versions = create_version_rows(state, requested_source.as_deref(), &mut notices).await;
+    let row_result = create_version_rows(state, requested_source.as_deref(), &mut notices).await;
+    let versions = row_result.rows;
     let unavailable_sources = unavailable_source_ids(&notices);
+    trace_create_view(CreateViewTiming {
+        source_id: requested_source.as_deref().unwrap_or("vanilla"),
+        total: started_at.elapsed(),
+        scan: row_result.scan_elapsed,
+        catalog: row_result.catalog_elapsed,
+        policy: row_result.policy_elapsed,
+        version_count: versions.len(),
+        source_cache_hit: row_result.source_cache_hit,
+        scan_cache_hit: row_result.scan_cache_hit,
+    });
 
     CreateInstanceViewResponse {
         sources: create_source_options(&unavailable_sources),
@@ -357,24 +431,25 @@ async fn resolve_loader_version_create_selection(
     let library_dir = state
         .library_dir()
         .ok_or_else(library_not_configured_response)?;
-    let (builds, catalog) = fetch_builds(
-        PathBuf::from(library_dir).as_path(),
-        component_id,
-        minecraft_version,
-    )
-    .await
-    .map_err(loader_error_response)?;
+    let library_dir = PathBuf::from(library_dir);
+    let (builds, catalog) = fetch_builds(library_dir.as_path(), component_id, minecraft_version)
+        .await
+        .map_err(loader_error_response)?;
+    invalidate_create_view_source(library_dir.as_path(), component_id.as_str());
     let installed_scan = scan_current_versions(state);
     if installed_scan.is_degraded() {
         return Err(version_scan_degraded_response());
     }
-    let build = preferred_loader_build(builds).ok_or_else(|| {
-        (
+    let build = select_preferred_loader_build(component_id, builds).map_err(|error| match error {
+        LoaderBuildSelectionError::NoBuildAvailable => (
             StatusCode::NOT_FOUND,
             Json(
                 serde_json::json!({ "error": "No stable loader build is available for this Minecraft version." }),
             ),
-        )
+        ),
+        LoaderBuildSelectionError::NoCompatibleDefault { component_id } => {
+            no_compatible_stable_loader_response(component_id)
+        }
     })?;
     if loader_build_is_known_incompatible_default(&build) {
         return Err(no_compatible_stable_loader_response(component_id));
@@ -407,13 +482,11 @@ async fn resolve_loader_create_selection(
     let library_dir = state
         .library_dir()
         .ok_or_else(library_not_configured_response)?;
-    let (builds, catalog) = fetch_builds(
-        PathBuf::from(library_dir).as_path(),
-        component_id,
-        &minecraft_version,
-    )
-    .await
-    .map_err(loader_error_response)?;
+    let library_dir = PathBuf::from(library_dir);
+    let (builds, catalog) = fetch_builds(library_dir.as_path(), component_id, &minecraft_version)
+        .await
+        .map_err(loader_error_response)?;
+    invalidate_create_view_source(library_dir.as_path(), component_id.as_str());
     let installed_scan = scan_current_versions(state);
     if installed_scan.is_degraded() {
         return Err(version_scan_degraded_response());
@@ -483,20 +556,6 @@ async fn resolve_vanilla_create_selection(
     Ok(CreateSelection::Vanilla {
         version_id: version.id,
     })
-}
-
-pub(super) fn preferred_loader_build(builds: Vec<LoaderBuildRecord>) -> Option<LoaderBuildRecord> {
-    builds.into_iter().find(loader_build_is_stable_default)
-}
-
-fn loader_build_is_stable_default(build: &LoaderBuildRecord) -> bool {
-    matches!(
-        build.build_meta.selection.reason,
-        LoaderSelectionReason::Recommended
-            | LoaderSelectionReason::LatestStable
-            | LoaderSelectionReason::Stable
-            | LoaderSelectionReason::Unlabeled
-    )
 }
 
 fn create_instance_with_unique_name(
@@ -816,12 +875,14 @@ async fn create_version_rows(
     state: &AppState,
     source_id: Option<&str>,
     notices: &mut Vec<CreateInstanceNoticeViewModel>,
-) -> Vec<CreateInstanceVersionRowViewModel> {
+) -> CreateVersionRowsResult {
     let Some(library_dir) = state.library_dir().map(PathBuf::from) else {
-        return Vec::new();
+        return CreateVersionRowsResult::empty();
     };
 
-    let installed_scan = scan_current_versions(state);
+    let scan_started = Instant::now();
+    let (installed_scan, scan_cache_hit) = create_view_installed_scan(&library_dir);
+    let scan_elapsed = scan_started.elapsed();
     if installed_scan.is_degraded() {
         notices.push(CreateInstanceNoticeViewModel {
             state_id: "library_scan_degraded".to_string(),
@@ -829,16 +890,43 @@ async fn create_version_rows(
             message: "Installed versions are unavailable".to_string(),
             detail: Some(VERSION_SCAN_DEGRADED_MESSAGE.to_string()),
         });
-        return Vec::new();
+        return CreateVersionRowsResult {
+            scan_elapsed,
+            scan_cache_hit,
+            ..CreateVersionRowsResult::empty()
+        };
     }
-    let mut rows = Vec::new();
 
     let installed_versions = installed_scan.versions;
     let installed = installed_launchable_version_ids(&installed_versions);
+    let loader_build_installed = installed_loader_build_keys(&installed_versions);
     let loader_installed = installed_loader_minecraft_keys(&installed_versions);
+    let source_id = source_id.unwrap_or("vanilla");
 
-    if source_id.unwrap_or("vanilla") == "vanilla" {
-        let manifest = match fetch_version_manifest_cached(&library_dir).await {
+    if let Some(cached_rows) = cacheable_source_rows(&library_dir, source_id) {
+        return CreateVersionRowsResult {
+            rows: materialize_version_rows(
+                &cached_rows,
+                &installed,
+                &loader_build_installed,
+                &loader_installed,
+            ),
+            scan_elapsed,
+            source_cache_hit: true,
+            scan_cache_hit,
+            ..CreateVersionRowsResult::empty()
+        };
+    }
+
+    let mut static_rows = Vec::new();
+    let mut catalog_elapsed = Duration::ZERO;
+    let mut policy_elapsed = Duration::ZERO;
+
+    if source_id == "vanilla" {
+        let catalog_started = Instant::now();
+        let manifest_result = fetch_version_manifest_cached(&library_dir).await;
+        catalog_elapsed += catalog_started.elapsed();
+        let manifest = match manifest_result {
             Ok(manifest) => manifest,
             Err(_) => {
                 notices.push(CreateInstanceNoticeViewModel {
@@ -847,7 +935,13 @@ async fn create_version_rows(
                     message: "Minecraft versions are unavailable".to_string(),
                     detail: Some("Check your connection and try again.".to_string()),
                 });
-                return Vec::new();
+                return CreateVersionRowsResult {
+                    scan_elapsed,
+                    catalog_elapsed,
+                    policy_elapsed,
+                    scan_cache_hit,
+                    ..CreateVersionRowsResult::empty()
+                };
             }
         };
         let releases = manifest_release_references(&manifest);
@@ -859,85 +953,150 @@ async fn create_version_rows(
                 None,
                 &releases,
             );
-            rows.push(create_version_row(
+            static_rows.push(create_static_version_row(
                 "vanilla",
                 format!("vanilla|{}", version.id),
                 &version.id,
                 None,
                 &analysis.minecraft_meta,
                 &analysis.lifecycle,
-                download_state(
-                    installed.contains(&version.id),
-                    installed.contains(&version.id),
-                ),
+                Vec::new(),
                 None,
+                false,
             ));
         }
-        return rows;
+        store_cacheable_source_rows(&library_dir, source_id, &static_rows);
+        return CreateVersionRowsResult {
+            rows: materialize_version_rows(
+                &static_rows,
+                &installed,
+                &loader_build_installed,
+                &loader_installed,
+            ),
+            scan_elapsed,
+            catalog_elapsed,
+            policy_elapsed,
+            scan_cache_hit,
+            ..CreateVersionRowsResult::empty()
+        };
     }
 
     for component in fetch_components() {
-        if source_id.is_some_and(|source_id| source_id != component.id.as_str()) {
+        if source_id != component.id.as_str() {
             continue;
         }
-        match fetch_supported_versions(&library_dir, component.id).await {
+        let catalog_started = Instant::now();
+        let supported_versions_result = fetch_supported_versions(&library_dir, component.id).await;
+        catalog_elapsed += catalog_started.elapsed();
+        match supported_versions_result {
             Ok((versions, versions_catalog)) => {
-                let disabled_reasons = join_all(versions.iter().map(|version| {
-                    let exact_installed = loader_installed.contains(&LoaderMinecraftInstallKey {
-                        component_id: component.id,
-                        version_id: version.id.clone(),
-                    });
-                    loader_version_disabled_reason(
-                        &library_dir,
-                        component.id,
-                        &version.id,
-                        &versions_catalog,
-                        exact_installed,
-                        version.stable_hint,
-                    )
-                }))
-                .await;
+                let policy_inputs = loader_version_policy_inputs(&versions);
+                let policy_started = Instant::now();
+                let policy_decisions = evaluate_create_view_loader_version_policies(
+                    &library_dir,
+                    component.id,
+                    &versions_catalog,
+                    &policy_inputs,
+                );
+                policy_elapsed += policy_started.elapsed();
 
-                for (version, disabled_reason) in versions.into_iter().zip(disabled_reasons) {
-                    let exact_installed = loader_installed.contains(&LoaderMinecraftInstallKey {
-                        component_id: component.id,
-                        version_id: version.id.clone(),
-                    });
-                    rows.push(create_version_row(
+                for (version, decision) in versions.into_iter().zip(policy_decisions) {
+                    static_rows.push(create_static_version_row(
                         component.id.as_str(),
                         format!("loader_version|{}|{}", component.id.as_str(), version.id),
                         &version.id,
                         None,
                         &version.minecraft_meta,
                         &version.lifecycle,
-                        download_state(installed.contains(&version.id), exact_installed),
-                        disabled_reason,
+                        decision.tags,
+                        decision.disabled_reason,
+                        decision.fresh_catalog_required,
                     ));
                 }
             }
-            Err(_) => notices.push(CreateInstanceNoticeViewModel {
-                state_id: format!("source_unavailable_{}", component.id.short_key()),
-                tone: "warn".to_string(),
-                message: format!("{} is unavailable", component.id.display_name()),
-                detail: Some("Check your connection and try again.".to_string()),
-            }),
+            Err(_) => {
+                notices.push(CreateInstanceNoticeViewModel {
+                    state_id: format!("source_unavailable_{}", component.id.short_key()),
+                    tone: "warn".to_string(),
+                    message: format!("{} is unavailable", component.id.display_name()),
+                    detail: Some("Check your connection and try again.".to_string()),
+                });
+                return CreateVersionRowsResult {
+                    scan_elapsed,
+                    catalog_elapsed,
+                    policy_elapsed,
+                    scan_cache_hit,
+                    ..CreateVersionRowsResult::empty()
+                };
+            }
         }
     }
 
-    rows
+    store_cacheable_source_rows(&library_dir, source_id, &static_rows);
+    CreateVersionRowsResult {
+        rows: materialize_version_rows(
+            &static_rows,
+            &installed,
+            &loader_build_installed,
+            &loader_installed,
+        ),
+        scan_elapsed,
+        catalog_elapsed,
+        policy_elapsed,
+        scan_cache_hit,
+        ..CreateVersionRowsResult::empty()
+    }
 }
 
-fn create_version_row(
+fn cacheable_source_rows(
+    library_dir: &Path,
+    source_id: &str,
+) -> Option<Vec<CreateStaticVersionRow>> {
+    let rows = cached_source_rows(library_dir, source_id)?;
+    if source_rows_are_cacheable(&rows) {
+        return Some(rows);
+    }
+    invalidate_create_view_source(library_dir, source_id);
+    None
+}
+
+fn store_cacheable_source_rows(
+    library_dir: &Path,
+    source_id: &str,
+    rows: &[CreateStaticVersionRow],
+) {
+    if source_rows_are_cacheable(rows) {
+        store_source_rows(library_dir, source_id, rows.to_vec());
+    }
+}
+
+fn source_rows_are_cacheable(rows: &[CreateStaticVersionRow]) -> bool {
+    rows.iter().all(|row| !row.fresh_catalog_required)
+}
+
+fn create_view_installed_scan(
+    library_dir: &Path,
+) -> (crate::application::version::InstalledVersionsScan, bool) {
+    if let Some(scan) = cached_installed_scan(library_dir) {
+        return (scan, true);
+    }
+    let scan = scan_installed_versions(library_dir);
+    store_installed_scan(library_dir, scan.clone());
+    (scan, false)
+}
+
+fn create_static_version_row(
     source_id: &str,
     selection_id: String,
     minecraft_version_id: &str,
     loader_build: Option<CreateLoaderBuildIdentityViewModel>,
     minecraft_meta: &MinecraftVersionMeta,
     lifecycle: &LifecycleMeta,
-    download_state: &'static str,
+    tags: Vec<CreateVersionTagViewModel>,
     disabled_reason: Option<String>,
-) -> CreateInstanceVersionRowViewModel {
-    CreateInstanceVersionRowViewModel {
+    fresh_catalog_required: bool,
+) -> CreateStaticVersionRow {
+    CreateStaticVersionRow {
         source_id: source_id.to_string(),
         selection_id,
         minecraft_version_id: minecraft_version_id.to_string(),
@@ -950,10 +1109,79 @@ fn create_version_row(
         hint: (!minecraft_meta.display_hint.is_empty())
             .then(|| minecraft_meta.display_hint.clone()),
         channel: create_channel_id(lifecycle.channel).to_string(),
-        download_state: download_state.to_string(),
-        create_enabled: disabled_reason.is_none(),
+        tags,
         disabled_reason,
+        fresh_catalog_required,
     }
+}
+
+fn materialize_version_rows(
+    rows: &[CreateStaticVersionRow],
+    installed: &HashSet<String>,
+    loader_build_installed: &HashSet<LoaderBuildInstallKey>,
+    loader_installed: &HashSet<LoaderMinecraftInstallKey>,
+) -> Vec<CreateInstanceVersionRowViewModel> {
+    rows.iter()
+        .map(|row| {
+            let full_installed =
+                row_full_installed(row, installed, loader_build_installed, loader_installed);
+            let download_state = download_state(
+                installed.contains(&row.minecraft_version_id),
+                full_installed,
+            );
+            let disabled_reason = materialized_row_disabled_reason(row, full_installed);
+            CreateInstanceVersionRowViewModel {
+                source_id: row.source_id.clone(),
+                selection_id: row.selection_id.clone(),
+                minecraft_version_id: row.minecraft_version_id.clone(),
+                loader_build: row.loader_build.clone(),
+                display_name: row.display_name.clone(),
+                hint: row.hint.clone(),
+                channel: row.channel.clone(),
+                tags: row.tags.clone(),
+                download_state: download_state.to_string(),
+                create_enabled: disabled_reason.is_none(),
+                disabled_reason,
+            }
+        })
+        .collect()
+}
+
+fn materialized_row_disabled_reason(
+    row: &CreateStaticVersionRow,
+    full_installed: bool,
+) -> Option<String> {
+    if let Some(reason) = &row.disabled_reason {
+        return Some(reason.clone());
+    }
+    if row.fresh_catalog_required && !full_installed {
+        return Some(stale_loader_version_catalog_message());
+    }
+    None
+}
+
+fn row_full_installed(
+    row: &CreateStaticVersionRow,
+    installed: &HashSet<String>,
+    loader_build_installed: &HashSet<LoaderBuildInstallKey>,
+    loader_installed: &HashSet<LoaderMinecraftInstallKey>,
+) -> bool {
+    if row.source_id == "vanilla" {
+        return installed.contains(&row.minecraft_version_id);
+    }
+    if let Some(loader_build) = &row.loader_build {
+        return loader_build_installed.contains(&LoaderBuildInstallKey {
+            component_id: loader_build.component_id,
+            build_id: loader_build.build_id.clone(),
+            version_id: loader_build.target_version_id.clone(),
+        });
+    }
+    LoaderComponentId::parse(&row.source_id).is_some_and(|component_id| {
+        loader_installed.contains(&LoaderMinecraftInstallKey {
+            component_id,
+            version_id: row.minecraft_version_id.clone(),
+        })
+    })
 }
 
 fn installed_launchable_version_ids(versions: &[VersionEntry]) -> HashSet<String> {
@@ -1065,83 +1293,6 @@ fn source_id_from_short_key(short_key: &str) -> Option<&'static str> {
         .map(|component| component.id.as_str())
 }
 
-async fn loader_version_disabled_reason(
-    library_dir: &std::path::Path,
-    component_id: LoaderComponentId,
-    minecraft_version: &str,
-    versions_catalog: &LoaderCatalogState,
-    exact_installed: bool,
-    stable_hint: Option<bool>,
-) -> Option<String> {
-    if matches!(
-        component_id,
-        LoaderComponentId::Forge | LoaderComponentId::NeoForge
-    ) && stable_hint == Some(false)
-    {
-        return Some(
-            "Only beta loader builds are available for this Minecraft version. Pick an exact beta build explicitly if you want to test it."
-                .to_string(),
-        );
-    }
-    if let Some(reason) =
-        known_loader_minecraft_version_disabled_reason(library_dir, component_id, minecraft_version)
-            .await
-    {
-        return Some(reason);
-    }
-    if exact_installed {
-        return None;
-    }
-    if loader_catalog_is_stale(versions_catalog) {
-        return Some(
-            "Loader catalog needs a fresh provider check before this version can be installed."
-                .to_string(),
-        );
-    }
-    None
-}
-
-async fn known_loader_minecraft_version_disabled_reason(
-    library_dir: &std::path::Path,
-    component_id: LoaderComponentId,
-    minecraft_version: &str,
-) -> Option<String> {
-    if component_id != LoaderComponentId::Quilt
-        || !quilt_java25_minecraft_version(minecraft_version)
-    {
-        return None;
-    }
-
-    let Ok((builds, _catalog)) = fetch_builds(library_dir, component_id, minecraft_version).await
-    else {
-        return None;
-    };
-    let Some(build) = preferred_loader_build(builds) else {
-        return Some(no_compatible_stable_loader_message(component_id).to_string());
-    };
-    if loader_build_is_known_incompatible_default(&build) {
-        Some(no_compatible_stable_loader_message(component_id).to_string())
-    } else {
-        None
-    }
-}
-
-fn loader_build_is_known_incompatible_default(build: &LoaderBuildRecord) -> bool {
-    build.component_id == LoaderComponentId::Quilt
-        && quilt_java25_minecraft_version(&build.minecraft_version)
-        && quilt_loader_version_is_before_java25_support(&build.loader_version)
-}
-
-fn quilt_java25_minecraft_version(minecraft_version: &str) -> bool {
-    let value = minecraft_version.trim();
-    value == "26" || value.starts_with("26.")
-}
-
-fn quilt_loader_version_is_before_java25_support(loader_version: &str) -> bool {
-    let value = loader_version.trim();
-    compare_version_like(value, "0.30.0") == Ordering::Less && !value.starts_with("0.30.")
-}
-
 fn no_compatible_stable_loader_response(
     component_id: LoaderComponentId,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -1151,17 +1302,6 @@ fn no_compatible_stable_loader_response(
             "error": no_compatible_stable_loader_message(component_id)
         })),
     )
-}
-
-fn no_compatible_stable_loader_message(component_id: LoaderComponentId) -> String {
-    format!(
-        "No stable compatible {} loader is available for this Minecraft version.",
-        component_id.display_name()
-    )
-}
-
-fn loader_catalog_is_stale(catalog: &LoaderCatalogState) -> bool {
-    catalog.availability.stale || !catalog.availability.fresh
 }
 
 fn create_channel_id(channel: LifecycleChannel) -> &'static str {
@@ -1201,4 +1341,88 @@ fn stale_loader_catalog_response() -> (StatusCode, Json<serde_json::Value>) {
             "error": "Loader catalog needs a fresh provider check before this build can be installed."
         })),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_loader_catalog_requirement_uses_current_installed_state() {
+        let component_id = LoaderComponentId::Fabric;
+        let row = stale_required_loader_row(component_id, "1.21.1");
+        let installed = HashSet::new();
+        let loader_build_installed = HashSet::new();
+        let loader_installed = HashSet::new();
+
+        let uninstalled = materialize_version_rows(
+            std::slice::from_ref(&row),
+            &installed,
+            &loader_build_installed,
+            &loader_installed,
+        );
+        assert_eq!(uninstalled[0].create_enabled, false);
+        assert_eq!(
+            uninstalled[0].disabled_reason.as_deref(),
+            Some(
+                "Loader catalog needs a fresh provider check before this version can be installed."
+            )
+        );
+
+        let loader_installed = HashSet::from([LoaderMinecraftInstallKey {
+            component_id,
+            version_id: "1.21.1".to_string(),
+        }]);
+        let installed = materialize_version_rows(
+            &[row],
+            &installed,
+            &loader_build_installed,
+            &loader_installed,
+        );
+        assert_eq!(installed[0].create_enabled, true);
+        assert_eq!(installed[0].disabled_reason, None);
+    }
+
+    #[test]
+    fn stale_loader_catalog_rows_are_not_cached_or_reused() {
+        super::super::create_cache::reset_create_view_cache_for_tests();
+        let component_id = LoaderComponentId::Fabric;
+        let library_dir = std::env::temp_dir().join(format!(
+            "croopor-create-source-cache-stale-{}",
+            std::process::id()
+        ));
+        let source_id = component_id.as_str();
+        let row = stale_required_loader_row(component_id, "1.21.1");
+
+        store_cacheable_source_rows(&library_dir, source_id, std::slice::from_ref(&row));
+        assert!(cached_source_rows(&library_dir, source_id).is_none());
+
+        store_source_rows(&library_dir, source_id, vec![row]);
+        assert!(cacheable_source_rows(&library_dir, source_id).is_none());
+        assert!(cached_source_rows(&library_dir, source_id).is_none());
+
+        super::super::create_cache::reset_create_view_cache_for_tests();
+    }
+
+    fn stale_required_loader_row(
+        component_id: LoaderComponentId,
+        minecraft_version_id: &str,
+    ) -> CreateStaticVersionRow {
+        CreateStaticVersionRow {
+            source_id: component_id.as_str().to_string(),
+            selection_id: format!(
+                "loader_version|{}|{}",
+                component_id.as_str(),
+                minecraft_version_id
+            ),
+            minecraft_version_id: minecraft_version_id.to_string(),
+            loader_build: None,
+            display_name: minecraft_version_id.to_string(),
+            hint: None,
+            channel: "release".to_string(),
+            tags: Vec::new(),
+            disabled_reason: None,
+            fresh_catalog_required: true,
+        }
+    }
 }

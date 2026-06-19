@@ -12,7 +12,10 @@ pub mod types;
 pub mod workspace;
 
 pub use api::{build_id_for, installed_version_id_for, loader_components, parse_build_id};
-pub use index::{fetch_builds, fetch_components, fetch_supported_versions, resolve_build_record};
+pub use index::{
+    fetch_builds, fetch_cached_builds, fetch_components, fetch_supported_versions,
+    resolve_build_record,
+};
 pub use types::{
     LOADER_CATALOG_SCHEMA_VERSION, LoaderArtifactKind, LoaderAvailability, LoaderBuildId,
     LoaderBuildMetadata, LoaderBuildRecord, LoaderCatalogState, LoaderComponentId,

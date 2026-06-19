@@ -28,6 +28,33 @@ pub(crate) fn trace_instances_list(timing: InstancesListTiming) {
     );
 }
 
+pub(crate) struct CreateViewTiming<'a> {
+    pub source_id: &'a str,
+    pub total: Duration,
+    pub scan: Duration,
+    pub catalog: Duration,
+    pub policy: Duration,
+    pub version_count: usize,
+    pub source_cache_hit: bool,
+    pub scan_cache_hit: bool,
+}
+
+pub(crate) fn trace_create_view(timing: CreateViewTiming<'_>) {
+    tracing::debug!(
+        target: "croopor::timing",
+        route = "/api/v1/instances/create-view",
+        source_id = %timing.source_id,
+        total_ms = ms(timing.total),
+        scan_ms = ms(timing.scan),
+        catalog_ms = ms(timing.catalog),
+        policy_ms = ms(timing.policy),
+        version_count = timing.version_count,
+        source_cache_hit = timing.source_cache_hit,
+        scan_cache_hit = timing.scan_cache_hit,
+        "create view timing"
+    );
+}
+
 pub(crate) fn trace_slow_instance_readiness(
     instance_id: &str,
     version_id: &str,

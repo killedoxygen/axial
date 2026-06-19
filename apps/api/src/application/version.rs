@@ -1,4 +1,4 @@
-use crate::state::AppState;
+use crate::{application::instances::invalidate_create_view_installed_scan, state::AppState};
 use axum::{Json, http::StatusCode};
 use croopor_minecraft::{
     LifecycleMeta, MinecraftVersionMeta, VersionEntry, VersionScanReport, VersionScanState,
@@ -286,6 +286,7 @@ pub async fn delete_version(
 
     fs::remove_dir_all(&version_dir).map_err(version_delete_error_response)?;
     deleted.push(version_id.to_string());
+    invalidate_create_view_installed_scan();
 
     let affected_instances = state
         .instances()
