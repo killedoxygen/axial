@@ -27,6 +27,7 @@ use croopor_minecraft::{
     fetch_supported_versions, fetch_version_manifest_cached, manifest_release_references,
     parse_build_id,
 };
+use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use std::{cmp::Ordering, collections::HashSet, ops::Deref, path::PathBuf};
 
@@ -881,12 +882,12 @@ async fn create_version_rows(
         }
         match fetch_supported_versions(&library_dir, component.id).await {
             Ok((versions, versions_catalog)) => {
-                for version in versions {
+                let disabled_reasons = join_all(versions.iter().map(|version| {
                     let exact_installed = loader_installed.contains(&LoaderMinecraftInstallKey {
                         component_id: component.id,
                         version_id: version.id.clone(),
                     });
-                    let disabled_reason = loader_version_disabled_reason(
+                    loader_version_disabled_reason(
                         &library_dir,
                         component.id,
                         &version.id,
@@ -894,7 +895,14 @@ async fn create_version_rows(
                         exact_installed,
                         version.stable_hint,
                     )
-                    .await;
+                }))
+                .await;
+
+                for (version, disabled_reason) in versions.into_iter().zip(disabled_reasons) {
+                    let exact_installed = loader_installed.contains(&LoaderMinecraftInstallKey {
+                        component_id: component.id,
+                        version_id: version.id.clone(),
+                    });
                     rows.push(create_version_row(
                         component.id.as_str(),
                         format!("loader_version|{}|{}", component.id.as_str(), version.id),

@@ -7,12 +7,17 @@ use crate::loaders::types::{
     LoaderError,
 };
 use chrono::Utc;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const CACHE_PERSIST_WARNING: &str =
     "Loader catalog is available, but the offline cache could not be updated.";
+
+static MEMORY_CATALOG_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedCatalog<serde_json::Value>>>> =
+    OnceLock::new();
 
 pub async fn resolve_cached<T, F, Fut>(
     cache_path: PathBuf,
@@ -25,10 +30,28 @@ where
     Fut: std::future::Future<Output = Result<T, LoaderError>>,
 {
     let checked_at_ms = Utc::now().timestamp_millis();
+    if let Some(cached) = fresh_memory_cache::<T>(&cache_path, ttl) {
+        return Ok((
+            cached.value,
+            LoaderCatalogState {
+                availability: LoaderAvailability {
+                    fresh: true,
+                    stale: false,
+                    cache_hit: true,
+                    checked_at_ms,
+                    last_success_at_ms: Some(cached.fetched_at_ms),
+                    last_error: None,
+                    last_failure_kind: None,
+                },
+            },
+        ));
+    }
+
     let cached = read_cache::<T>(&cache_path);
     if let Ok(cached) = &cached
         && is_cache_fresh(cached.fetched_at_ms, ttl)
     {
+        update_memory_cache(&cache_path, cached);
         return Ok((
             cached.value.clone(),
             LoaderCatalogState {
@@ -47,11 +70,12 @@ where
 
     match live_fetch().await {
         Ok(value) => {
-            let cache_error =
-                Box::pin(write_cache(&cache_path, &CachedCatalog::new(value.clone())))
-                    .await
-                    .err()
-                    .map(|_| CACHE_PERSIST_WARNING.to_string());
+            let cached = CachedCatalog::new(value.clone());
+            let cache_error = Box::pin(write_cache(&cache_path, &cached))
+                .await
+                .err()
+                .map(|_| CACHE_PERSIST_WARNING.to_string());
+            update_memory_cache(&cache_path, &cached);
             Ok((
                 value,
                 LoaderCatalogState {
@@ -60,7 +84,7 @@ where
                         stale: false,
                         cache_hit: false,
                         checked_at_ms,
-                        last_success_at_ms: Some(checked_at_ms),
+                        last_success_at_ms: Some(cached.fetched_at_ms),
                         last_error: cache_error,
                         last_failure_kind: None,
                     },
@@ -71,6 +95,7 @@ where
             let failure_kind = error.failure_kind();
             let last_error = error.safe_status_label().to_string();
             if let Ok(cached) = cached {
+                update_memory_cache(&cache_path, &cached);
                 return Ok((
                     cached.value,
                     LoaderCatalogState {
@@ -93,6 +118,52 @@ where
             })
         }
     }
+}
+
+fn fresh_memory_cache<T>(path: &Path, ttl: Duration) -> Option<CachedCatalog<T>>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let cache = MEMORY_CATALOG_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()?;
+    let cached = cache.get(path)?;
+    if cached.schema_version != LOADER_CATALOG_SCHEMA_VERSION
+        || !is_cache_fresh(cached.fetched_at_ms, ttl)
+    {
+        return None;
+    }
+    let value = serde_json::from_value::<T>(cached.value.clone()).ok()?;
+    Some(CachedCatalog {
+        schema_version: cached.schema_version,
+        fetched_at_ms: cached.fetched_at_ms,
+        value,
+    })
+}
+
+fn update_memory_cache<T>(path: &Path, cached: &CachedCatalog<T>)
+where
+    T: serde::Serialize,
+{
+    let Ok(value) = serde_json::to_value(&cached.value) else {
+        return;
+    };
+    let Some(mut cache) = MEMORY_CATALOG_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()
+    else {
+        return;
+    };
+    cache.insert(
+        path.to_path_buf(),
+        CachedCatalog {
+            schema_version: cached.schema_version,
+            fetched_at_ms: cached.fetched_at_ms,
+            value,
+        },
+    );
 }
 
 fn read_cache<T>(path: &Path) -> Result<CachedCatalog<T>, LoaderError>
@@ -235,6 +306,42 @@ mod tests {
             state.availability.last_failure_kind,
             Some(crate::loaders::types::LoaderInstallFailureKind::ProviderResponseTooLarge)
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn fresh_disk_catalog_warms_memory_cache() {
+        let root = temp_dir("memory-cache-warm");
+        fs::create_dir_all(&root).expect("create root");
+        let cache_path = root.join("catalog.json");
+        let cached = CachedCatalog::new(vec!["cached".to_string()]);
+        write_cache(&cache_path, &cached)
+            .await
+            .expect("write fresh cache");
+
+        let (value, state) =
+            resolve_cached(cache_path.clone(), Duration::from_secs(60), || async {
+                Err::<Vec<String>, _>(LoaderError::Other("live should not run".to_string()))
+            })
+            .await
+            .expect("fresh disk cache should satisfy first lookup");
+
+        assert_eq!(value, vec!["cached".to_string()]);
+        assert!(state.availability.fresh);
+        assert!(state.availability.cache_hit);
+
+        fs::remove_file(&cache_path).expect("remove disk cache");
+
+        let (value, state) = resolve_cached(cache_path, Duration::from_secs(60), || async {
+            Err::<Vec<String>, _>(LoaderError::Other("live should not run".to_string()))
+        })
+        .await
+        .expect("memory cache should satisfy second lookup");
+
+        assert_eq!(value, vec!["cached".to_string()]);
+        assert!(state.availability.fresh);
+        assert!(state.availability.cache_hit);
 
         let _ = fs::remove_dir_all(root);
     }
