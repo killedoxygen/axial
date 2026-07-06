@@ -1,5 +1,5 @@
 import type { JSX } from 'preact';
-import { useEffect, useRef, useState } from 'preact/hooks';
+import { useEffect, useState } from 'preact/hooks';
 import { Icon } from '../../ui/Icons';
 import { Button, IconButton, Pill } from '../../ui/Atoms';
 import { InstanceTile, artSeedFor } from '../../ui/InstanceVisual';
@@ -26,6 +26,7 @@ import { InstallBarrierPane, LaunchOutcomeNotice, LaunchSplitButton } from './co
 export { deleteInstanceFlow, duplicateInstance, openInstanceFolder, renameInstance } from './instance-actions';
 
 type Tab = 'mods' | 'worlds' | 'screenshots' | 'logs' | 'settings';
+type TabSelection = { instanceId: string; tab: Tab } | null;
 
 const TABS: Array<{ id: Tab; icon: string; label: string }> = [
   { id: 'mods', icon: 'puzzle', label: 'Mods' },
@@ -51,8 +52,8 @@ function defaultTabFor(inst: EnrichedInstance | undefined): Tab {
 
 export function InstanceDetailView({ id }: { id: string }): JSX.Element {
   const inst = instances.value.find((i) => i.id === id) as EnrichedInstance | undefined;
-  const userSelectedTab = useRef(false);
-  const [tab, setTab] = useState<Tab>(() => defaultTabFor(inst));
+  const [selectedTab, setSelectedTab] = useState<TabSelection>(null);
+  const selectedTabForCurrentInstance = selectedTab?.instanceId === id ? selectedTab.tab : null;
   const [resources, setResources] = useState<ResourceLoadState>({ status: 'loading', data: null });
   const [now, setNow] = useState(() => Date.now());
   const running = inst ? !!runningSessions.value[inst.id] : false;
@@ -60,8 +61,7 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
   const launch = launchState.value;
   const preparing = inst && launch.status === 'preparing' && launch.instanceId === inst.id ? launch : null;
   const selectTab = (next: Tab): void => {
-    userSelectedTab.current = true;
-    setTab(next);
+    setSelectedTab({ instanceId: id, tab: next });
   };
 
   const reloadResources = (): void => {
@@ -93,15 +93,6 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
       alive = false;
     };
   }, [inst?.id]);
-
-  useEffect(() => {
-    userSelectedTab.current = false;
-  }, [id]);
-
-  useEffect(() => {
-    if (!inst || userSelectedTab.current) return;
-    setTab(defaultTabFor(inst));
-  }, [inst?.id, inst?.version_id]);
 
   useEffect(() => {
     if (!inst || !running) return;
@@ -153,7 +144,8 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
 
   const v = versionById(inst.version_id);
   const showModsTab = inst.version_display.supports_mods;
-  const activeTab: Tab = !showModsTab && tab === 'mods' ? 'worlds' : tab;
+  const currentTab = selectedTabForCurrentInstance ?? defaultTabFor(inst);
+  const activeTab: Tab = !showModsTab && currentTab === 'mods' ? 'worlds' : currentTab;
   const visibleTabs = showModsTab ? TABS : TABS.filter((t) => t.id !== 'mods');
   const auroraHue = artSeedFor(inst) % 360;
   const launchAction = inst.launch_action;
