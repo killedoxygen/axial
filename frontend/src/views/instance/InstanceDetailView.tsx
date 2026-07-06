@@ -206,7 +206,12 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
   return (
     <div class="cp-instance-view" data-running={running} style={{ ['--cp-aurora-h' as any]: auroraHue }}>
       <div class="cp-instance-stage" aria-hidden="true">
-        <div class="cp-instance-aurora" />
+        <div class="cp-instance-aurora-sheet">
+          <div class="cp-instance-aurora cp-instance-aurora--b1" />
+          <div class="cp-instance-aurora cp-instance-aurora--b2" />
+          <div class="cp-instance-aurora cp-instance-aurora--b3" />
+          <div class="cp-instance-aurora cp-instance-aurora--b4" />
+        </div>
       </div>
 
       <div class="cp-view-page cp-instance-page">
