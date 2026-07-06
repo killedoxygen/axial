@@ -243,9 +243,6 @@
   opacity: 1;
   transform: translate3d(0, 0, 0);
 }
-.cp-icard-play svg {
-  transform: translate3d(1px, 0, 0);
-}
 .cp-icard-live {
   position: absolute;
   top: 10px;
