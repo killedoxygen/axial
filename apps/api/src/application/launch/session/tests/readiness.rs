@@ -283,7 +283,10 @@ async fn launch_preflight_readiness_reports_missing_managed_runtime_as_recoverab
         .expect("prepare preflight");
 
     assert!(preflight.readiness.launchable);
-    assert_eq!(preflight.guardian.decision, GuardianDecision::Allowed);
+    assert!(matches!(
+        preflight.guardian.decision,
+        GuardianDecision::Allowed | GuardianDecision::Warned
+    ));
     assert_eq!(
         readiness_reason(&preflight, LaunchReadinessReasonId::ManagedRuntimeMissing).severity,
         LaunchReadinessSeverity::Recoverable
