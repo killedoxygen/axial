@@ -42,7 +42,7 @@ export function screenshotFileUrl(inst: EnrichedInstance, name: string): string 
 export async function renameScreenshot(
   inst: EnrichedInstance,
   screenshotName: string,
-  onDone: () => void,
+  onDone: (newName: string) => void,
 ): Promise<void> {
   const next = await prompt('New name for this screenshot', screenshotName, {
     title: 'Rename screenshot',
@@ -59,7 +59,7 @@ export async function renameScreenshot(
     );
     if (res?.error) throw new Error(res.error);
     toast('Screenshot renamed');
-    onDone();
+    onDone(nextName);
   } catch (err) {
     toast(`Could not rename the screenshot: ${errMessage(err)}`, 'error');
   }
