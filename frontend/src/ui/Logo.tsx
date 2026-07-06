@@ -1,11 +1,11 @@
 import type { JSX } from 'preact';
 
 const LOGO_PATH =
-  'M9 2h2v1H9z M13 2h1v1H13z M3 3h5v1H3z M10 3h2v1H10z M3 4h7v1H3z M11 4h2v1H11z M3 5h8v1H3z M2 6h4v1H2z M10 6h3v1H10z M2 7h4v1H2z M10 7h3v1H10z M2 8h4v1H2z M10 8h4v1H10z M3 9h3v1H3z M10 9h4v1H10z M3 10h3v1H3z M10 10h4v1H10z M3 11h11v1H3z M2 12h11v1H2z M2 13h3v1H2z M7 13h6v1H7z';
+  'M118 58h60a60 60 0 0160 60v60a84 84 0 0084 84h60a60 60 0 0160 60v60a60 60 0 01-60 60h-60a60 60 0 01-60-60v-60a84 84 0 00-84-84h-60a60 60 0 01-60-60v-60a60 60 0 0160-60zm244 318v28a14 14 0 0014 14h28a14 14 0 0014-14v-28a14 14 0 00-14-14h-28a14 14 0 00-14 14zm-40-318h60a60 60 0 0160 60v60a60 60 0 01-60 60h-60a60 60 0 01-60-60v-60a60 60 0 0160-60zm-204 204h60a60 60 0 0160 60v60a60 60 0 01-60 60h-60a60 60 0 01-60-60v-60a60 60 0 0160-60z';
 
 export function Logo({
   className,
-  size = 26,
+  size = 32,
   style,
 }: {
   className?: string;
@@ -17,7 +17,7 @@ export function Logo({
       class={className}
       width={size}
       height={size}
-      viewBox="0 0 16 16"
+      viewBox="0 0 500 500"
       xmlns="http://www.w3.org/2000/svg"
       aria-hidden="true"
       focusable="false"
@@ -28,7 +28,7 @@ export function Logo({
         ...style,
       }}
     >
-      <path shapeRendering="crispEdges" fill="#b3e029" fillRule="evenodd" d={LOGO_PATH} />
+      <path fill="#D4FF26" fillRule="evenodd" d={LOGO_PATH} />
     </svg>
   );
 }

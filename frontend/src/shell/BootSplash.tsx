@@ -48,7 +48,7 @@ export function BootSplash(): JSX.Element | null {
   return (
     <div class="cp-boot" data-leaving={leaving || undefined} role="status" aria-live="polite" onMouseDown={onMouseDown}>
       <div class="cp-boot-stack">
-        <Logo className="cp-boot-logo" size={56} />
+        <Logo className="cp-boot-logo" size={64} />
         {state === 'error' ? (
           <>
             <div class="cp-boot-error-title">Failed to connect</div>

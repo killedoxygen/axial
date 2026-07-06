@@ -2,18 +2,30 @@
 
 Use the designer-provided SVG as the source of truth for app icons when the `.ico` small-size frames are not visually approved.
 
+The desktop/taskbar icon uses the full source SVG, including the black squircle container. Keep desktop ICOs high-resolution only: Windows taskbar rendering can select tiny embedded frames and make this logo look like a simplified pixel icon. In-app logo surfaces and frontend static logo/favicon assets use the same SVG with only the squircle container removed, so theme-driven logo color filtering remains owned by the UI.
+
 ## Preferred workflow
 
-Render the SVG at every exact icon size. Do not render one large PNG and resize it down.
+Render desktop/taskbar frames directly from the source SVG at high resolution only. Render frontend logo/favicon frames from the no-squircle SVG.
 
 ```sh
 mkdir -p tmp/icon-svg-render
-for size in 16 20 24 30 32 36 40 48 60 64 72 80 96 128 256; do
+cp "$SOURCE_SVG" tmp/icon-svg-render/taskbar-source.svg
+cp "$SOURCE_SVG" tmp/icon-svg-render/logo-source.svg
+perl -0pi -e 's/\n\s*<!-- App Icon Squircle Container -->\n\s*<rect width="500" height="500" rx="112\.5" fill="#000000" \/>//' tmp/icon-svg-render/logo-source.svg
+
+for size in 128 256; do
   npx --yes @resvg/resvg-js-cli \
-    --shape-rendering 1 \
     --fit-width "$size" \
-    "$SOURCE_SVG" \
-    "tmp/icon-svg-render/icon-${size}.png"
+    tmp/icon-svg-render/taskbar-source.svg \
+    "tmp/icon-svg-render/taskbar-icon-${size}.png"
+done
+
+for size in 32 96; do
+  npx --yes @resvg/resvg-js-cli \
+    --fit-width "$size" \
+    tmp/icon-svg-render/logo-source.svg \
+    "tmp/icon-svg-render/logo-${size}.png"
 done
 ```
 
@@ -24,15 +36,17 @@ python3 - <<'PY'
 from PIL import Image
 from pathlib import Path
 
-sizes = [16, 20, 24, 30, 32, 36, 40, 48, 60, 64, 72, 80, 96, 128, 256]
-frames = [Image.open(Path("tmp/icon-svg-render") / f"icon-{size}.png").convert("RGBA") for size in sizes]
+base = Path("tmp/icon-svg-render")
+taskbar_sizes = [128, 256]
+taskbar_frames = [Image.open(base / f"taskbar-icon-{size}.png").convert("RGBA") for size in taskbar_sizes]
+logo_frames = {size: Image.open(base / f"logo-{size}.png").convert("RGBA") for size in [32, 96]}
 
-frames[sizes.index(256)].save("apps/desktop/icons/icon.png")
-frames[sizes.index(96)].save("frontend/static/logo.png")
-frames[sizes.index(32)].save("frontend/static/favicon.png")
+taskbar_frames[taskbar_sizes.index(256)].save("apps/desktop/icons/icon.png")
+logo_frames[96].save("frontend/static/logo.png")
+logo_frames[32].save("frontend/static/favicon.png")
 
 for target in ["apps/desktop/icons/icon.ico", "assets/icon.ico", "winres/icon.ico"]:
-    frames[-1].save(target, sizes=[(size, size) for size in sizes], append_images=frames[:-1])
+    taskbar_frames[-1].save(target, sizes=[(size, size) for size in taskbar_sizes], append_images=taskbar_frames[:-1])
 PY
 ```
 
