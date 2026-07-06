@@ -13,6 +13,7 @@ export function ScreenshotLightbox({
   name,
   onSelect,
   onClose,
+  onRename,
   onRefresh,
 }: {
   inst: EnrichedInstance;
@@ -20,6 +21,7 @@ export function ScreenshotLightbox({
   name: string;
   onSelect: (name: string) => void;
   onClose: () => void;
+  onRename: (shot: InstanceScreenshot, newName: string) => void;
   onRefresh: () => void;
 }): JSX.Element | null {
   const index = shots.findIndex((shot) => shot.name === name);
@@ -38,8 +40,7 @@ export function ScreenshotLightbox({
 
   const rename = (): void => {
     void renameScreenshot(inst, shot.name, (newName) => {
-      onRefresh();
-      onSelect(newName);
+      onRename(shot, newName);
     });
   };
   const remove = (): void => {

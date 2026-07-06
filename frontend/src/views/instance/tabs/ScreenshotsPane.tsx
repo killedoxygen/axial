@@ -21,6 +21,11 @@ const SCREENSHOT_SORT_LABELS: Record<ScreenshotSort, string> = {
   size: 'Size',
 };
 
+type OptimisticScreenshotRename = {
+  previousName: string;
+  shot: InstanceScreenshot;
+};
+
 export function ScreenshotsPane({
   inst,
   resources,
@@ -30,9 +35,15 @@ export function ScreenshotsPane({
   resources: ResourceLoadState;
   onRefresh: () => void;
 }): JSX.Element {
-  const screenshots = resources.data?.screenshots ?? [];
+  const rawScreenshots = resources.data?.screenshots ?? [];
   const [sort, setSort] = useState<ScreenshotSort>('newest');
   const [viewer, setViewer] = useState<string>('');
+  const [optimisticRename, setOptimisticRename] = useState<OptimisticScreenshotRename | null>(null);
+  const screenshots = useMemo(() => {
+    if (!optimisticRename) return rawScreenshots;
+    if (rawScreenshots.some((shot) => shot.name === optimisticRename.shot.name)) return rawScreenshots;
+    return rawScreenshots.map((shot) => (shot.name === optimisticRename.previousName ? optimisticRename.shot : shot));
+  }, [rawScreenshots, optimisticRename]);
   const sortedScreenshots = useMemo(() => {
     const next = [...screenshots];
     next.sort((a, b) => {
@@ -77,6 +88,18 @@ export function ScreenshotsPane({
     selection.clear();
     onRefresh();
   };
+  const handleLightboxRename = (shot: InstanceScreenshot, newName: string): void => {
+    setOptimisticRename({ previousName: shot.name, shot: { ...shot, name: newName } });
+    setViewer(newName);
+    onRefresh();
+  };
+
+  useEffect(() => {
+    if (!optimisticRename || resources.status === 'loading') return;
+    const hasRenamedShot = rawScreenshots.some((shot) => shot.name === optimisticRename.shot.name);
+    const hasPreviousShot = rawScreenshots.some((shot) => shot.name === optimisticRename.previousName);
+    if (hasRenamedShot || resources.status === 'ready' || !hasPreviousShot) setOptimisticRename(null);
+  }, [optimisticRename, rawScreenshots, resources.status]);
 
   useEffect(() => {
     if (!viewer || resources.status === 'loading') return;
@@ -196,6 +219,7 @@ export function ScreenshotsPane({
           name={viewer}
           onSelect={setViewer}
           onClose={() => setViewer('')}
+          onRename={handleLightboxRename}
           onRefresh={onRefresh}
         />
       ) : null}
