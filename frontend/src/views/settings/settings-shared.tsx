@@ -25,7 +25,3 @@ export function SettingsCard({
     </Card>
   );
 }
-
-export function Toggle({ on, onChange }: { on: boolean; onChange: () => void }): JSX.Element {
-  return <button type="button" class="cp-toggle" data-on={on} role="switch" aria-checked={on} onClick={onChange} />;
-}

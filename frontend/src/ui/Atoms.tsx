@@ -108,6 +108,10 @@ export function Pill({
   );
 }
 
+export function Toggle({ on, onChange }: { on: boolean; onChange: () => void }): JSX.Element {
+  return <button type="button" class="cp-toggle" data-on={on} role="switch" aria-checked={on} onClick={onChange} />;
+}
+
 export function Kbd({ children }: { children: ComponentChildren }): JSX.Element {
   return <span class="cp-kbd">{children}</span>;
 }

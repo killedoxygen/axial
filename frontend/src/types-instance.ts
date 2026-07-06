@@ -21,7 +21,18 @@ export interface Instance {
   launch_action?: LaunchActionState;
 }
 
+export interface InstanceVersionDisplay {
+  loader_key: string;
+  loader_label: string;
+  minecraft_label: string;
+  loader_version_label: string;
+  loader_detail_label: string;
+  summary_label: string;
+  supports_mods: boolean;
+}
+
 export interface EnrichedInstance extends Instance {
+  version_display: InstanceVersionDisplay;
   launchable: boolean;
   launch_action: LaunchActionState;
   status_detail?: string;

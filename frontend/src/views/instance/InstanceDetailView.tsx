@@ -9,11 +9,8 @@ import { navigate } from '../../ui-state';
 import { selectInstance } from '../../actions';
 import { launchGame, killGame } from '../../launch';
 import { handleInstallClick, retryFailedInstall } from '../../install';
-import { errMessage, supportsMods } from '../../utils';
-import { minecraftVersionLabel } from '../../version-display';
-import { loaderKeyFromVersion, LOADER_LABELS } from '../create/defaults';
+import { errMessage } from '../../utils';
 import { instanceInstallStatus } from '../../instance-install-status';
-import type { Version } from '../../types-version';
 import type { EnrichedInstance } from '../../types-instance';
 import { fmtJoined, fmtRelative } from './format';
 import { fetchInstanceResources, type ResourceLoadState } from './resources';
@@ -38,10 +35,6 @@ const TABS: Array<{ id: Tab; icon: string; label: string }> = [
   { id: 'settings', icon: 'settings', label: 'Settings' },
 ];
 
-function loaderLabel(v: Version | undefined): string {
-  return LOADER_LABELS[loaderKeyFromVersion(v)];
-}
-
 function fmtElapsed(startedAt: string | undefined, now: number): string {
   const start = startedAt ? Date.parse(startedAt) : NaN;
   if (!Number.isFinite(start)) return '0:00';
@@ -53,7 +46,7 @@ function fmtElapsed(startedAt: string | undefined, now: number): string {
 }
 
 function defaultTabFor(inst: EnrichedInstance | undefined): Tab {
-  return inst && supportsMods(versionById(inst.version_id)) ? 'mods' : 'worlds';
+  return inst?.version_display.supports_mods ? 'mods' : 'worlds';
 }
 
 export function InstanceDetailView({ id }: { id: string }): JSX.Element {
@@ -159,10 +152,9 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
   }
 
   const v = versionById(inst.version_id);
-  const showModsTab = supportsMods(v);
+  const showModsTab = inst.version_display.supports_mods;
   const activeTab: Tab = !showModsTab && tab === 'mods' ? 'worlds' : tab;
   const visibleTabs = showModsTab ? TABS : TABS.filter((t) => t.id !== 'mods');
-  const mcVer = minecraftVersionLabel(v);
   const auroraHue = artSeedFor(inst) % 360;
   const launchAction = inst.launch_action;
   const installStatus = instanceInstallStatus(inst, v);
@@ -209,7 +201,6 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
     return undefined;
   };
 
-  const loaderVer = v?.loader?.loader_version ?? '';
   const launchNotice = launchNotices.value[inst.id];
 
   return (
@@ -226,10 +217,10 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
           <div class="cp-instance-hero-id">
             <div class="cp-instance-hero-kicker">
               <Pill>
-                {loaderLabel(v)}
-                {loaderVer ? ` ${loaderVer}` : ''}
+                {inst.version_display.loader_label}
+                {inst.version_display.loader_version_label ? ` ${inst.version_display.loader_version_label}` : ''}
               </Pill>
-              <span class="cp-instance-hero-mc">Minecraft {mcVer}</span>
+              <span class="cp-instance-hero-mc">Minecraft {inst.version_display.minecraft_label}</span>
             </div>
             <h1 class="cp-instance-hero-title">{inst.name}</h1>
             <div class="cp-instance-hero-meta">

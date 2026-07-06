@@ -1,10 +1,10 @@
 use crate::{
     application::instances::{
         self, CreateInstanceRequest, CreateInstanceResponse, CreateInstanceViewResponse,
-        DuplicateInstanceRequest, InstanceLogInfo, InstanceLogTailResponse, InstanceModInfo,
-        InstancePatch, InstanceResourcesResponse, InstanceScreenshotInfo, InstanceWorldInfo,
-        OpenFolderQuery, RenameScreenshotRequest, RenameWorldRequest, UpdateModRequest,
-        WorldBackupResponse,
+        CreateLoaderBuildsViewResponse, DuplicateInstanceRequest, InstanceLogInfo,
+        InstanceLogTailResponse, InstanceModInfo, InstancePatch, InstanceResourcesResponse,
+        InstanceScreenshotInfo, InstanceWorldInfo, OpenFolderQuery, RenameScreenshotRequest,
+        RenameWorldRequest, UpdateModRequest, WorldBackupResponse,
     },
     state::AppState,
 };
@@ -23,6 +23,14 @@ struct CreateInstanceViewQuery {
     source: Option<String>,
 }
 
+#[derive(Debug, Default, serde::Deserialize)]
+struct CreateLoaderBuildsViewQuery {
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    minecraft_version: String,
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route(
@@ -32,6 +40,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/v1/instances/create-view",
             get(handle_create_instance_view),
+        )
+        .route(
+            "/api/v1/instances/create-view/loader-builds",
+            get(handle_create_loader_builds_view),
         )
         .route(
             "/api/v1/instances/{id}",
@@ -102,6 +114,15 @@ async fn handle_create_instance_view(
     Query(query): Query<CreateInstanceViewQuery>,
 ) -> Json<CreateInstanceViewResponse> {
     Json(instances::handle_create_instance_view(&state, query.source.as_deref()).await)
+}
+
+async fn handle_create_loader_builds_view(
+    State(state): State<AppState>,
+    Query(query): Query<CreateLoaderBuildsViewQuery>,
+) -> Result<Json<CreateLoaderBuildsViewResponse>, (StatusCode, Json<serde_json::Value>)> {
+    instances::handle_create_loader_builds_view(&state, &query.source, &query.minecraft_version)
+        .await
+        .map(Json)
 }
 
 async fn handle_create_instance(

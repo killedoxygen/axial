@@ -6,9 +6,11 @@ import { loaderKeyFromComponentId, loaderKeyFromVersion, type LoaderKey } from '
 import { loaderLogoSrc } from '../views/create/loader-logos';
 import { Icon } from './Icons';
 import type { Version } from '../types-version';
-import type { Instance } from '../types-instance';
+import type { Instance, InstanceVersionDisplay } from '../types-instance';
 
-export type VisualInstance = Pick<Instance, 'id' | 'name' | 'version_id' | 'art_seed'>;
+export type VisualInstance = Pick<Instance, 'id' | 'name' | 'version_id' | 'art_seed'> & {
+  version_display?: Pick<InstanceVersionDisplay, 'loader_key'>;
+};
 
 export function artSeedFor(instance: VisualInstance): number {
   const seed = instance.art_seed ?? 0;
@@ -25,7 +27,14 @@ function hueFor(inst: VisualInstance): number {
   return artSeedFor(inst) % 360;
 }
 
+function isLoaderKey(value: string | undefined): value is LoaderKey {
+  return value === 'vanilla' || value === 'fabric' || value === 'quilt' || value === 'forge' || value === 'neoforge';
+}
+
 function loaderKeyForInstance(inst: VisualInstance, version: Version | undefined): LoaderKey {
+  if (isLoaderKey(inst.version_display?.loader_key)) {
+    return inst.version_display.loader_key;
+  }
   const versionLoader = loaderKeyFromVersion(version);
   if (versionLoader !== 'vanilla') return versionLoader;
   const installLoader = instanceInstallStatus(inst, version).item.loader;

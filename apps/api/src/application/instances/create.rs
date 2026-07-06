@@ -6,9 +6,10 @@ use super::{
     },
     create_policy::{
         LoaderBuildSelectionError, evaluate_create_view_loader_version_policies,
-        loader_build_is_known_incompatible_default, loader_catalog_is_stale,
-        loader_version_policy_inputs, no_compatible_stable_loader_message,
-        select_preferred_loader_build, stale_loader_version_catalog_message,
+        loader_build_is_known_incompatible_default, loader_build_is_unstable_default,
+        loader_catalog_is_stale, loader_version_policy_inputs, no_compatible_stable_loader_message,
+        preferred_loader_build, select_preferred_loader_build,
+        stale_loader_version_catalog_message,
     },
     enrich_instance_for_state, instance_error_kind, instance_write_error_response,
     scan_current_versions,
@@ -71,6 +72,8 @@ pub(crate) struct CreateInstanceRequest {
     pub window_height: Option<i32>,
     #[serde(default)]
     pub jvm_preset_id: Option<String>,
+    #[serde(default)]
+    pub auto_optimize: Option<bool>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -141,11 +144,49 @@ pub(crate) struct CreateInstanceNoticeViewModel {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct CreateOptimizeOptionViewModel {
+    pub id: String,
+    pub label: String,
+    pub detail: String,
+    pub default_enabled: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct CreateLoaderAutoOptionViewModel {
+    pub selection_id: String,
+    pub label: String,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct CreateLoaderBuildOptionViewModel {
+    pub selection_id: String,
+    pub build_id: String,
+    pub label: String,
+    pub channel_id: String,
+    pub channel_label: String,
+    pub recommended: bool,
+    pub installed: bool,
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct CreateLoaderBuildsViewResponse {
+    pub source_id: String,
+    pub minecraft_version_id: String,
+    pub auto: CreateLoaderAutoOptionViewModel,
+    pub builds: Vec<CreateLoaderBuildOptionViewModel>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct CreateInstanceViewResponse {
     pub sources: Vec<CreateInstanceSourceOptionViewModel>,
     pub channels: Vec<CreateInstanceSourceOptionViewModel>,
     pub versions: Vec<CreateInstanceVersionRowViewModel>,
     pub preset_options: Vec<GuardianJvmPresetOption>,
+    pub optimize_option: CreateOptimizeOptionViewModel,
     pub defaults: CreateInstanceDefaultsViewModel,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notices: Vec<CreateInstanceNoticeViewModel>,
@@ -279,6 +320,7 @@ pub(crate) async fn handle_create_instance_view(
         channels: create_channel_options(),
         versions,
         preset_options: guardian_jvm_preset_options(),
+        optimize_option: create_optimize_option(),
         defaults: CreateInstanceDefaultsViewModel {
             source_id: "vanilla".to_string(),
             channel_id: "release".to_string(),
@@ -289,6 +331,96 @@ pub(crate) async fn handle_create_instance_view(
         },
         notices,
     }
+}
+
+fn create_optimize_option() -> CreateOptimizeOptionViewModel {
+    CreateOptimizeOptionViewModel {
+        id: "auto_optimize".to_string(),
+        label: "Auto-optimize".to_string(),
+        detail: "Croopor tunes this instance's performance while you play.".to_string(),
+        default_enabled: true,
+    }
+}
+
+pub(crate) async fn handle_create_loader_builds_view(
+    state: &AppState,
+    source_id: &str,
+    minecraft_version: &str,
+) -> Result<CreateLoaderBuildsViewResponse, (StatusCode, Json<serde_json::Value>)> {
+    let component_id = LoaderComponentId::parse(source_id.trim()).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "unknown loader component" })),
+        )
+    })?;
+    let minecraft_version = minecraft_version.trim();
+    if minecraft_version.is_empty() {
+        return Err(bad_create_request("minecraft_version is required"));
+    }
+    let library_dir = state
+        .library_dir()
+        .map(PathBuf::from)
+        .ok_or_else(library_not_configured_response)?;
+    let (builds, catalog) = fetch_builds(library_dir.as_path(), component_id, minecraft_version)
+        .await
+        .map_err(loader_error_response)?;
+    let installed_scan = scan_current_versions(state);
+    if installed_scan.is_degraded() {
+        return Err(version_scan_degraded_response());
+    }
+    let installed_keys = installed_loader_build_keys(&installed_scan.versions);
+    let recommended_build_id = preferred_loader_build(builds.clone()).map(|build| build.build_id);
+    let catalog_stale = loader_catalog_is_stale(&catalog);
+
+    let build_options = builds
+        .into_iter()
+        .filter(|build| build.component_id == component_id)
+        .map(|build| {
+            let installed = installed_keys.contains(&loader_build_install_key(&build));
+            let disabled_reason = if loader_build_is_known_incompatible_default(&build) {
+                Some(format!(
+                    "This {} build is known to be incompatible with Minecraft {}.",
+                    component_id.display_name(),
+                    build.minecraft_version
+                ))
+            } else if catalog_stale && !installed {
+                Some(stale_loader_version_catalog_message())
+            } else {
+                None
+            };
+            let beta = loader_build_is_unstable_default(&build);
+            let recommended = recommended_build_id.as_deref() == Some(build.build_id.as_str());
+            CreateLoaderBuildOptionViewModel {
+                selection_id: format!("loader_build|{}|{}", component_id.as_str(), build.build_id),
+                build_id: build.build_id,
+                label: build.loader_version,
+                channel_id: if beta { "beta" } else { "stable" }.to_string(),
+                channel_label: if beta { "Beta" } else { "Stable" }.to_string(),
+                recommended,
+                installed,
+                enabled: disabled_reason.is_none(),
+                disabled_reason,
+            }
+        })
+        .collect();
+
+    Ok(CreateLoaderBuildsViewResponse {
+        source_id: component_id.as_str().to_string(),
+        minecraft_version_id: minecraft_version.to_string(),
+        auto: CreateLoaderAutoOptionViewModel {
+            selection_id: format!(
+                "loader_version|{}|{}",
+                component_id.as_str(),
+                minecraft_version
+            ),
+            label: "Automatic".to_string(),
+            detail: format!(
+                "Croopor picks the newest stable {} build.",
+                component_id.display_name()
+            ),
+        },
+        builds: build_options,
+    })
 }
 
 fn normalize_create_view_source(source_id: Option<&str>) -> Option<String> {
@@ -633,6 +765,10 @@ fn apply_create_initial_settings(
     }
     if instance.jvm_preset != preset.stored_preset {
         instance.jvm_preset = preset.stored_preset.clone();
+        changed = true;
+    }
+    if let Some(auto_optimize) = payload.auto_optimize {
+        instance.auto_optimize = auto_optimize;
         changed = true;
     }
 

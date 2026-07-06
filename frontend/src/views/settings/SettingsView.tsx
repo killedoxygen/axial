@@ -1,6 +1,6 @@
 import type { JSX } from 'preact';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { Button, Input, Pill, Segmented } from '../../ui/Atoms';
+import { Button, Input, Pill, Segmented, Toggle } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { Slider } from '../../ui/Slider';
 import { AccentField, AccentModeToggle } from './AccentEditor';
@@ -16,7 +16,7 @@ import type { GuardianMode } from '../../types-guardian';
 import type { PerformanceMode, PerformanceRulesStatus } from '../../types-performance';
 import { AboutSettingsSection } from './AboutSettingsSection';
 import { AdvancedSettingsSection } from './AdvancedSettingsSection';
-import { SettingsCard, Toggle } from './settings-shared';
+import { SettingsCard } from './settings-shared';
 
 type SectionId = 'appearance' | 'gameplay' | 'performance' | 'audio' | 'shortcuts' | 'advanced' | 'about';
 

@@ -1,13 +1,13 @@
 import type { JSX } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
 import { api } from '../../api';
-import { Button } from '../../ui/Atoms';
+import { Button, Toggle } from '../../ui/Atoms';
 import { navigate, ROUTE_STORAGE_KEY } from '../../ui-state';
 import { STORAGE_KEY } from '../../state';
 import { config, devMode } from '../../store';
 import { toast } from '../../toast';
 import { errMessage } from '../../utils';
-import { SettingsCard, Toggle } from './settings-shared';
+import { SettingsCard } from './settings-shared';
 
 type PerformanceLabCardComponent = (typeof import('./PerformanceLabCard'))['PerformanceLabCard'];
 

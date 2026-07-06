@@ -11,22 +11,10 @@ import { useTheme } from '../../hooks/use-theme';
 import { instances, versionById, runningSessions } from '../../store';
 import { instanceInstallStatus } from '../../instance-install-status';
 import { navigate, openCreate } from '../../ui-state';
-import { loaderKeyFromVersion, LOADER_LABELS } from '../create/defaults';
 import { instanceMenuItems } from '../instance/instance-menu';
 import { deleteInstancesFlow } from '../instance/instance-actions';
-import { supportsMods } from '../../utils';
-import { minecraftVersionLabel } from '../../version-display';
 import { fmtRelativeCompact } from '../instance/format';
-import type { Version } from '../../types-version';
 import type { EnrichedInstance } from '../../types-instance';
-
-function versionLabel(v: Version | undefined): string {
-  return minecraftVersionLabel(v, 'Unknown');
-}
-
-function loaderLabel(v: Version | undefined): string {
-  return LOADER_LABELS[loaderKeyFromVersion(v)];
-}
 
 const LIST_COLS = '28px 52px 2.4fr 1fr 1fr 1fr 140px';
 
@@ -55,7 +43,7 @@ function ListRow({
         ? 'download'
         : 'alert';
   const actionLabel = launchAction.primary_action === 'launch' ? 'Play' : launchAction.label;
-  const showModsCount = supportsMods(v);
+  const showModsCount = inst.version_display.supports_mods;
   return (
     <div
       class="cp-table-row cp-selection-row"
@@ -83,11 +71,9 @@ function ListRow({
           )}
           {installing && <Pill icon={install.state === 'queued' ? 'clock' : 'download'}>{installLabel}</Pill>}
         </div>
-        <div class="cp-table-row-sub">
-          {loaderLabel(v)} · {v?.loader?.loader_version || 'vanilla'}
-        </div>
+        <div class="cp-table-row-sub">{inst.version_display.loader_detail_label}</div>
       </div>
-      <div class="cp-table-cell">{versionLabel(v)}</div>
+      <div class="cp-table-cell">{inst.version_display.minecraft_label}</div>
       <div class="cp-table-cell">{showModsCount ? `${inst.mods_count ?? 0} mods` : null}</div>
       <div class="cp-table-cell">{fmtRelativeCompact(inst.last_played_at)}</div>
       <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 4 }}>

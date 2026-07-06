@@ -6,15 +6,7 @@ import { selectionToggleLabel } from './selection';
 import { navigate } from '../ui-state';
 import { runningSessions, versionById } from '../store';
 import { instanceInstallStatus } from '../instance-install-status';
-import { minecraftVersionLabel } from '../version-display';
-import { loaderKeyFromVersion, LOADER_LABELS } from '../views/create/defaults';
 import type { EnrichedInstance } from '../types-instance';
-
-function versionLabel(inst: EnrichedInstance): { loader: string; mc: string } {
-  const v = versionById(inst.version_id);
-  const mc = minecraftVersionLabel(v, 'Unknown');
-  return { loader: LOADER_LABELS[loaderKeyFromVersion(v)], mc };
-}
 
 export function InstanceCard({
   inst,
@@ -29,7 +21,6 @@ export function InstanceCard({
 }): JSX.Element {
   const running = !!runningSessions.value[inst.id];
   const version = versionById(inst.version_id);
-  const { loader, mc } = versionLabel(inst);
   const install = instanceInstallStatus(inst, version);
   const installing = install.installing;
   const installBadge = install.state === 'queued' ? install.queuedItem?.title || install.label : 'Installing';
@@ -96,7 +87,7 @@ export function InstanceCard({
         </div>
         <div class="cp-icard-sub">
           {installing ? `${installBadge} · ` : ''}
-          {loader} · {mc}
+          {inst.version_display.summary_label}
         </div>
       </div>
     </div>

@@ -5,7 +5,8 @@ mod resources;
 
 pub(crate) use create::{
     CreateInstanceRequest, CreateInstanceResponse, CreateInstanceViewResponse,
-    handle_create_instance, handle_create_instance_view,
+    CreateLoaderBuildsViewResponse, handle_create_instance, handle_create_instance_view,
+    handle_create_loader_builds_view,
 };
 pub(crate) use create_cache::{
     invalidate_create_view_cache, invalidate_create_view_installed_scan,

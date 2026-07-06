@@ -6,11 +6,7 @@ import { InstanceCard } from '../../ui/InstanceCard';
 import { navigate, openCreate } from '../../ui-state';
 import { config, instances, runningSessions, versionById } from '../../store';
 import { instanceInstallStatus } from '../../instance-install-status';
-import { loaderKeyFromVersion, LOADER_LABELS } from '../create/defaults';
 import { openInstanceContextMenu } from '../instance/instance-menu';
-import { supportsMods } from '../../utils';
-import { minecraftVersionLabel } from '../../version-display';
-import type { Version } from '../../types-version';
 import type { EnrichedInstance } from '../../types-instance';
 
 function greetingFor(date: Date): string {
@@ -38,10 +34,6 @@ function relativeTime(iso?: string): string {
   return new Date(iso).toLocaleDateString();
 }
 
-function versionBadge(v: Version | undefined): string {
-  return minecraftVersionLabel(v, 'Unknown');
-}
-
 const HOME_LIBRARY_CARD_LIMIT = 14;
 
 function FeatureBanner({ inst }: { inst: EnrichedInstance }): JSX.Element {
@@ -51,7 +43,7 @@ function FeatureBanner({ inst }: { inst: EnrichedInstance }): JSX.Element {
   const installing = install.installing;
   const installBadge = install.state === 'queued' ? install.queuedItem?.title || install.label : 'Installing';
   const mods = inst.mods_count ?? 0;
-  const showModsCount = supportsMods(version);
+  const showModsCount = inst.version_display.supports_mods;
   const open = (): void => navigate({ name: 'instance', id: inst.id });
   const onKeyDown = (e: KeyboardEvent): void => {
     if (e.target !== e.currentTarget) return;
@@ -76,9 +68,9 @@ function FeatureBanner({ inst }: { inst: EnrichedInstance }): JSX.Element {
           <div class="cp-feature-kicker">{running ? 'Now playing' : installing ? installBadge : 'Jump back in'}</div>
           <h2 title={inst.name}>{inst.name}</h2>
           <div class="cp-meta">
-            <span>{LOADER_LABELS[loaderKeyFromVersion(version)]}</span>
+            <span>{inst.version_display.loader_label}</span>
             <span class="cp-dot" />
-            <span>MC {versionBadge(version)}</span>
+            <span>MC {inst.version_display.minecraft_label}</span>
             {showModsCount && (
               <>
                 <span class="cp-dot" />

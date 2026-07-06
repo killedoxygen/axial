@@ -218,7 +218,7 @@ fn loader_build_is_stable_default(build: &LoaderBuildRecord) -> bool {
     )
 }
 
-fn loader_build_is_unstable_default(build: &LoaderBuildRecord) -> bool {
+pub(super) fn loader_build_is_unstable_default(build: &LoaderBuildRecord) -> bool {
     matches!(
         build.build_meta.selection.reason,
         LoaderSelectionReason::Latest

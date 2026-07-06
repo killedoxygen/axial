@@ -318,6 +318,7 @@ mod tests {
             jvm_preset: String::new(),
             performance_mode: String::new(),
             extra_jvm_args: String::new(),
+            auto_optimize: false,
             icon: String::new(),
             accent: String::new(),
         }

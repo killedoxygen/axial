@@ -1,9 +1,12 @@
 import type { JSX } from 'preact';
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { Button, IconButton, Input, Pill } from '../../ui/Atoms';
+import { Button, IconButton, Input, Pill, Toggle } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { Slider } from '../../ui/Slider';
+import { SelectField } from '../../ui/Select';
 import { InstanceTile, nextArtSeed } from '../../ui/InstanceVisual';
+import { harmoniousTilePalette, seedForTileHue } from '../../ui/look-guardian';
+import { useTheme } from '../../hooks/use-theme';
 import { config, systemInfo } from '../../store';
 import { closeCreate, createOpen } from '../../ui-state';
 import { api } from '../../api';
@@ -99,11 +102,44 @@ interface CreateNotice {
   detail?: string | null;
 }
 
+interface CreateOptimizeOption {
+  id: string;
+  label: string;
+  detail: string;
+  default_enabled: boolean;
+}
+
+interface CreateLoaderAutoOption {
+  selection_id: string;
+  label: string;
+  detail: string;
+}
+
+interface CreateLoaderBuildOption {
+  selection_id: string;
+  build_id: string;
+  label: string;
+  channel_id: string;
+  channel_label: string;
+  recommended: boolean;
+  installed: boolean;
+  enabled: boolean;
+  disabled_reason?: string | null;
+}
+
+interface CreateLoaderBuildsResponse {
+  source_id: string;
+  minecraft_version_id: string;
+  auto: CreateLoaderAutoOption;
+  builds: CreateLoaderBuildOption[];
+}
+
 interface CreateBackendViewResponse {
   sources?: CreateOption[];
   channels?: CreateOption[];
   versions?: CreateVersionRow[];
   preset_options?: CreatePresetOption[];
+  optimize_option?: CreateOptimizeOption;
   notices?: CreateNotice[];
   defaults?: {
     source_id?: string;
@@ -205,9 +241,15 @@ function CreateCard(): JSX.Element {
   const totalGB = systemInfo.value?.total_memory_mb ? Math.floor(systemInfo.value.total_memory_mb / 1024) : 16;
   const memoryRec = getMemoryRecommendation(totalGB);
   const [memoryGB, setMemoryGB] = useState<number>(memoryRec.rec);
-  const [seedOverride, setSeedOverride] = useState<number | null>(null);
+  const [paletteSeedOverride, setPaletteSeedOverride] = useState<number | null>(null);
+  const [swatchPick, setSwatchPick] = useState<number | null>(null);
   const [jvmPreset, setJvmPreset] = useState('');
   const [presetOptions, setPresetOptions] = useState<CreatePresetOption[]>([]);
+  const [optimizeChoice, setOptimizeChoice] = useState<boolean | null>(null);
+  const [loaderChoice, setLoaderChoice] = useState<string | null>(null);
+  const [loaderBuilds, setLoaderBuilds] = useState<CreateLoaderBuildsResponse | null>(null);
+  const [loaderBuildsError, setLoaderBuildsError] = useState<string | null>(null);
+  const theme = useTheme();
   const sourceKey = loaderKeyFromSourceId(sourceId);
 
   const [screenMax, setScreenMax] = useState<ScreenSize>(() => ({
@@ -421,11 +463,21 @@ function CreateCard(): JSX.Element {
   const name = nameOverride ?? suggestedName;
   const displayName = name.trim() || suggestedName || 'New instance';
 
-  const previewSeed = useMemo(() => {
-    if (seedOverride != null) return seedOverride;
+  const baseSeed = useMemo(() => {
     const previewId = `preview:${sourceId}:${mcVersionId ?? 'none'}`;
     return hashStr(`${previewId}:${displayName}:${mcVersionId ?? 'preview'}`) || 1;
-  }, [seedOverride, sourceId, mcVersionId, displayName]);
+  }, [sourceId, mcVersionId, displayName]);
+  const paletteSeed = paletteSeedOverride ?? baseSeed;
+  const swatchHues = useMemo(() => harmoniousTilePalette(theme, paletteSeed), [theme, paletteSeed]);
+  const swatchIndex =
+    swatchPick != null && swatchPick < swatchHues.length ? swatchPick : paletteSeed % swatchHues.length;
+  const previewHue = swatchHues[swatchIndex] ?? theme.hue + 180;
+  const previewSeed = seedForTileHue(previewHue);
+
+  const pickSwatch = (index: number): void => {
+    Sound.ui('click');
+    setSwatchPick(index);
+  };
 
   const previewInstance = {
     id: `preview:${sourceId}:${mcVersionId ?? 'none'}`,
@@ -434,9 +486,9 @@ function CreateCard(): JSX.Element {
     art_seed: previewSeed,
   };
 
-  const rerollSeed = (): void => {
+  const shufflePalette = (): void => {
     Sound.ui('click');
-    setSeedOverride(nextArtSeed(previewSeed));
+    setPaletteSeedOverride(nextArtSeed(paletteSeed));
   };
 
   useEffect(() => {
@@ -452,10 +504,36 @@ function CreateCard(): JSX.Element {
     if (step === 'details' && !versionReady) setStep('version');
   }, [step, versionReady]);
 
+  useEffect(() => {
+    if (sourceKey === 'vanilla' || !mcVersionId) return;
+    let cancelled = false;
+    setLoaderBuilds(null);
+    setLoaderBuildsError(null);
+    setLoaderChoice(null);
+    api(
+      'GET',
+      `/instances/create-view/loader-builds?source=${encodeURIComponent(sourceId)}&minecraft_version=${encodeURIComponent(mcVersionId)}`,
+    )
+      .then((res: any) => {
+        if (cancelled) return;
+        if (res.error) throw new Error(res.error);
+        setLoaderBuilds(res as CreateLoaderBuildsResponse);
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) setLoaderBuildsError(errMessage(err));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [sourceKey, sourceId, mcVersionId]);
+
   const continueToDetails = (): void => {
     if (!versionReady) return;
     setStep('details');
   };
+
+  const optimizeOption = backendView?.optimize_option ?? null;
+  const autoOptimize = optimizeChoice ?? optimizeOption?.default_enabled ?? false;
 
   const submit = async (): Promise<void> => {
     if (submitting || !canCreate) return;
@@ -468,7 +546,7 @@ function CreateCard(): JSX.Element {
       const dims = winSpec && winSpec.id !== 'default' ? { w: winSpec.w, h: winSpec.h } : null;
       const result = await createInstance({
         name: trimmed,
-        selectionId,
+        selectionId: loaderChoice ?? selectionId,
         icon: defaultIconFor(sourceKey),
         accent: accentLabel,
         initialSettings: {
@@ -476,6 +554,7 @@ function CreateCard(): JSX.Element {
           art_seed: previewSeed,
           ...(dims ? { window_width: dims.w, window_height: dims.h } : {}),
           jvm_preset_id: jvmPreset,
+          ...(optimizeOption ? { auto_optimize: autoOptimize } : {}),
         },
       });
       if (result.ok) closeCreate();
@@ -526,6 +605,8 @@ function CreateCard(): JSX.Element {
     windowPresetId,
     jvmPreset,
     selectionId,
+    loaderChoice,
+    autoOptimize,
     step,
     versionReady,
   ]);
@@ -544,6 +625,25 @@ function CreateCard(): JSX.Element {
   const selectedPresetOption =
     presetOptions.find((option) => option.id === jvmPreset) ?? presetOptions.find((option) => option.default) ?? null;
   const currentSourceLabel = sourceOptions.find((option) => option.id === sourceId)?.label ?? LOADER_LABELS[sourceKey];
+  const loaderSelection = loaderChoice ?? loaderBuilds?.auto.selection_id ?? '';
+  const loaderOptions = useMemo(() => {
+    if (!loaderBuilds) return [];
+    return [
+      { value: loaderBuilds.auto.selection_id, label: loaderBuilds.auto.label },
+      ...loaderBuilds.builds.map((build) => ({
+        value: build.selection_id,
+        label: [
+          build.label,
+          build.channel_label,
+          build.recommended ? 'Recommended' : null,
+          build.installed ? 'Installed' : null,
+        ]
+          .filter(Boolean)
+          .join(' · '),
+        disabled: !build.enabled,
+      })),
+    ];
+  }, [loaderBuilds]);
 
   return (
     <>
@@ -725,97 +825,147 @@ function CreateCard(): JSX.Element {
             </div>
 
             <div class="cp-cr-pickfoot" aria-live="polite">
-              {sourceKey !== 'vanilla' && mcVersionId ? (
-                <span>{currentSourceLabel} selected</span>
-              ) : (
-                <span>
-                  {versionRows.length} version{versionRows.length === 1 ? '' : 's'}
-                </span>
+              <span>
+                {versionRows.length} version{versionRows.length === 1 ? '' : 's'}
+              </span>
+              {sourceKey !== 'vanilla' && mcVersionId != null && (
+                <div class="cp-cr-loader-pick">
+                  <span class="cp-cr-loader-pick-label">Loader</span>
+                  {loaderBuilds ? (
+                    <SelectField
+                      value={loaderSelection}
+                      onChange={(next) => {
+                        setLoaderChoice(next === loaderBuilds.auto.selection_id ? null : next);
+                      }}
+                      options={loaderOptions}
+                      ariaLabel="Loader version"
+                      width={230}
+                    />
+                  ) : loaderBuildsError ? (
+                    <span class="cp-cr-hint cp-cr-hint--err">{loaderBuildsError}</span>
+                  ) : (
+                    <span class="cp-cr-hint">Loading…</span>
+                  )}
+                </div>
               )}
             </div>
           </section>
         ) : (
-          <section class="cp-cr-side" aria-label="Instance details">
+          <section class="cp-cr-details" aria-label="Instance details" style={{ ['--cp-tile-h' as any]: previewHue }}>
             <div class="cp-cr-identity">
-              <div class="cp-cr-avatar">
+              <div class="cp-cr-tilebox">
                 <InstanceTile inst={previewInstance} radius={16} />
+              </div>
+              <div class="cp-cr-id-col">
+                <div class="cp-cr-kicker">
+                  <Pill>{currentSourceLabel}</Pill>
+                  <span class="cp-cr-kicker-mc">
+                    {selectedVersionRow ? `Minecraft ${selectedVersionRow.displayName}` : 'No version yet'}
+                  </span>
+                </div>
+                <Input
+                  value={name}
+                  onChange={(v) => setNameOverride(v)}
+                  placeholder={suggestedName || 'New instance'}
+                />
+              </div>
+            </div>
+
+            <div class="cp-cr-color" role="group" aria-label="Instance color">
+              <span class="cp-cr-field-label" id="cp-cr-color-label">
+                Color
+              </span>
+              <div class="cp-cr-swatches" aria-labelledby="cp-cr-color-label">
+                {swatchHues.map((hue, index) => (
+                  <button
+                    key={`${paletteSeed}:${index}`}
+                    type="button"
+                    class="cp-cr-swatch"
+                    data-active={index === swatchIndex}
+                    style={{ ['--sw' as any]: hue }}
+                    aria-label={`Use color ${index + 1} of ${swatchHues.length}`}
+                    aria-pressed={index === swatchIndex}
+                    onClick={() => pickSwatch(index)}
+                  />
+                ))}
                 <button
                   type="button"
-                  class="cp-cr-reroll"
-                  title="Shuffle tile colors"
-                  aria-label="Shuffle tile colors"
-                  onClick={rerollSeed}
+                  class="cp-cr-shuffle"
+                  title="Shuffle colors"
+                  aria-label="Shuffle colors"
+                  onClick={shufflePalette}
                 >
                   <Icon name="refresh" size={13} stroke={2} />
                 </button>
               </div>
-              <div class="cp-cr-identity-text">
-                <h2 title={displayName}>{displayName}</h2>
-                <div class="cp-cr-identity-pills">
-                  <Pill>{currentSourceLabel}</Pill>
-                  {mcVersionId ? (
-                    <Pill>MC {selectedVersionRow?.displayName ?? mcVersionId}</Pill>
-                  ) : (
-                    <Pill>No version yet</Pill>
-                  )}
+            </div>
+
+            <div class="cp-cr-fields">
+              <div class="cp-cr-field">
+                <div class="cp-cr-mem-head">
+                  <span class="cp-cr-field-label">Memory</span>
+                  <span class="cp-cr-mem-reading" aria-live="polite">
+                    {fmtMem(memoryGB)}
+                  </span>
                 </div>
-              </div>
-            </div>
-
-            <label class="cp-cr-field">
-              <span class="cp-cr-field-label">Name</span>
-              <Input value={name} onChange={(v) => setNameOverride(v)} placeholder={suggestedName || 'New instance'} />
-            </label>
-
-            <div class="cp-cr-field">
-              <div class="cp-cr-mem-head">
-                <span class="cp-cr-field-label">Memory</span>
-                <span class="cp-cr-mem-reading" aria-live="polite">
-                  {fmtMem(memoryGB)}
+                <Slider
+                  value={memoryGB}
+                  min={1}
+                  max={totalGB}
+                  step={0.5}
+                  recommended={[Math.max(2, memoryRec.rec - 2), Math.min(totalGB, memoryRec.rec + 2)]}
+                  sound="memory"
+                  onChange={setMemoryGB}
+                  ariaLabel="Max memory in gigabytes"
+                />
+                <span class="cp-cr-hint">
+                  {memoryGB < 2
+                    ? 'Low. May stutter.'
+                    : memoryGB > totalGB * 0.75
+                      ? 'High. Leave room for the OS.'
+                      : `Comfortable start: ${memoryRec.rec} GB.`}
                 </span>
               </div>
-              <Slider
-                value={memoryGB}
-                min={1}
-                max={totalGB}
-                step={0.5}
-                recommended={[Math.max(2, memoryRec.rec - 2), Math.min(totalGB, memoryRec.rec + 2)]}
-                sound="memory"
-                onChange={setMemoryGB}
-                ariaLabel="Max memory in gigabytes"
-              />
-              <span class="cp-cr-hint">
-                {memoryGB < 2
-                  ? 'Low. May stutter.'
-                  : memoryGB > totalGB * 0.75
-                    ? 'High. Leave room for the OS.'
-                    : `Comfortable start: ${memoryRec.rec} GB.`}
-              </span>
-            </div>
 
-            <div class="cp-cr-rows" role="group" aria-label="Instance defaults">
-              <button type="button" class="cp-cr-row" onClick={cycleWindowPreset} aria-label="Cycle window size">
-                <span class="cp-cr-row-key">Window</span>
-                <span class="cp-cr-row-val">
-                  <span class="cp-cr-row-value">{winSpec.label}</span>
-                  <span class="cp-cr-row-sub">{winSubtitle}</span>
-                  <Icon name="chevron-right" size={13} stroke={2} />
-                </span>
-              </button>
-              <button
-                type="button"
-                class="cp-cr-row"
-                onClick={cycleJvmPreset}
-                aria-label="Cycle performance profile"
-                title={selectedPresetOption?.disabled_reason ?? selectedPresetOption?.detail ?? undefined}
-                disabled={selectablePresetOptions.length === 0}
-              >
-                <span class="cp-cr-row-key">Profile</span>
-                <span class="cp-cr-row-val">
-                  <span class="cp-cr-row-value">{selectedPresetOption?.label ?? 'Loading'}</span>
-                  <Icon name="chevron-right" size={13} stroke={2} />
-                </span>
-              </button>
+              <div class="cp-cr-rows" role="group" aria-label="Instance defaults">
+                <button type="button" class="cp-cr-row" onClick={cycleWindowPreset} aria-label="Cycle window size">
+                  <span class="cp-cr-row-key">Window</span>
+                  <span class="cp-cr-row-val">
+                    <span class="cp-cr-row-value">{winSpec.label}</span>
+                    <span class="cp-cr-row-sub">{winSubtitle}</span>
+                    <Icon name="chevron-right" size={13} stroke={2} />
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  class="cp-cr-row"
+                  onClick={cycleJvmPreset}
+                  aria-label="Cycle performance profile"
+                  title={selectedPresetOption?.disabled_reason ?? selectedPresetOption?.detail ?? undefined}
+                  disabled={selectablePresetOptions.length === 0}
+                >
+                  <span class="cp-cr-row-key">Profile</span>
+                  <span class="cp-cr-row-val">
+                    <span class="cp-cr-row-value">{selectedPresetOption?.label ?? 'Loading'}</span>
+                    <Icon name="chevron-right" size={13} stroke={2} />
+                  </span>
+                </button>
+                {optimizeOption && (
+                  <div class="cp-cr-row cp-cr-row--switch">
+                    <span class="cp-cr-row-key">
+                      {optimizeOption.label}
+                      <span class="cp-cr-row-detail">{optimizeOption.detail}</span>
+                    </span>
+                    <Toggle
+                      on={autoOptimize}
+                      onChange={() => {
+                        Sound.ui('click');
+                        setOptimizeChoice(!autoOptimize);
+                      }}
+                    />
+                  </div>
+                )}
+              </div>
             </div>
           </section>
         )}

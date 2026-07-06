@@ -38,6 +38,8 @@ pub struct Instance {
     #[serde(default)]
     pub extra_jvm_args: String,
     #[serde(default)]
+    pub auto_optimize: bool,
+    #[serde(default)]
     pub icon: String,
     #[serde(default)]
     pub accent: String,
@@ -47,6 +49,7 @@ pub struct Instance {
 pub struct EnrichedInstance {
     #[serde(flatten)]
     pub instance: Instance,
+    pub version_display: InstanceVersionDisplay,
     pub launchable: bool,
     pub launch_action: LaunchActionState,
     #[serde(default)]
@@ -59,6 +62,51 @@ pub struct EnrichedInstance {
     pub mods_count: usize,
     pub resource_count: usize,
     pub shader_count: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InstanceVersionDisplay {
+    pub loader_key: String,
+    pub loader_label: String,
+    pub minecraft_label: String,
+    #[serde(default)]
+    pub loader_version_label: String,
+    pub loader_detail_label: String,
+    pub summary_label: String,
+    pub supports_mods: bool,
+}
+
+impl InstanceVersionDisplay {
+    fn from_version(version: Option<&VersionEntry>) -> Self {
+        let loader_key = version_loader_key(version);
+        let loader_label = version_loader_label(version);
+        let minecraft_label = version
+            .map(minecraft_label_for_version)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "Unknown".to_string());
+        let loader_version_label = version
+            .and_then(|entry| entry.loader.as_ref())
+            .map(|loader| {
+                loader_version_label(&loader.loader_version, &loader.build_meta.display_tags)
+            })
+            .unwrap_or_default();
+        let loader_detail_label = if loader_version_label.trim().is_empty() {
+            loader_label.clone()
+        } else {
+            format!("{loader_label} · {loader_version_label}")
+        };
+        let supports_mods = version.is_some_and(|entry| entry.loader.is_some());
+
+        Self {
+            summary_label: format!("{loader_label} · {minecraft_label}"),
+            loader_key,
+            loader_label,
+            minecraft_label,
+            loader_version_label,
+            loader_detail_label,
+            supports_mods,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -192,6 +240,7 @@ impl EnrichedInstance {
             .unwrap_or_default();
 
         Self {
+            version_display: InstanceVersionDisplay::from_version(version),
             launch_action: LaunchActionState::from_readiness(
                 launchable,
                 &status_detail,
@@ -208,6 +257,51 @@ impl EnrichedInstance {
             instance,
         }
     }
+}
+
+fn version_loader_key(version: Option<&VersionEntry>) -> String {
+    version
+        .and_then(|entry| entry.loader.as_ref())
+        .map(|loader| loader.component_id.short_key().to_string())
+        .unwrap_or_else(|| "vanilla".to_string())
+}
+
+fn version_loader_label(version: Option<&VersionEntry>) -> String {
+    version
+        .and_then(|entry| entry.loader.as_ref())
+        .map(|loader| loader.component_id.display_name().to_string())
+        .unwrap_or_else(|| "Vanilla".to_string())
+}
+
+fn minecraft_label_for_version(version: &VersionEntry) -> String {
+    let inherited = version.inherits_from.trim();
+    if !inherited.is_empty() {
+        return inherited.to_string();
+    }
+
+    [
+        version.minecraft_meta.effective_version.as_str(),
+        version.minecraft_meta.base_id.as_str(),
+        version.minecraft_meta.display_name.as_str(),
+        version.minecraft_meta.display_hint.as_str(),
+        version.id.as_str(),
+    ]
+    .into_iter()
+    .map(str::trim)
+    .find(|value| !value.is_empty())
+    .unwrap_or_default()
+    .to_string()
+}
+
+fn loader_version_label(loader_version: &str, display_tags: &[String]) -> String {
+    let loader_version = loader_version.trim();
+    if loader_version.is_empty() {
+        return String::new();
+    }
+    if display_tags.is_empty() {
+        return loader_version.to_string();
+    }
+    format!("{} ({})", loader_version, display_tags.join(", "))
 }
 
 #[derive(Default)]
@@ -511,6 +605,7 @@ impl InstanceStore {
             jvm_preset: String::new(),
             performance_mode: String::new(),
             extra_jvm_args: String::new(),
+            auto_optimize: false,
             icon,
             accent,
         };
@@ -590,6 +685,7 @@ impl InstanceStore {
             jvm_preset: source.jvm_preset.clone(),
             performance_mode: source.performance_mode.clone(),
             extra_jvm_args: source.extra_jvm_args.clone(),
+            auto_optimize: source.auto_optimize,
             icon: source.icon.clone(),
             accent: source.accent.clone(),
         };
@@ -802,8 +898,12 @@ fn derive_art_seed(id: &str, name: &str, version_id: &str) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Instance, InstanceStore, StoredInstances};
+    use super::{EnrichedInstance, Instance, InstanceStore, StoredInstances};
     use crate::paths::AppPaths;
+    use croopor_minecraft::{
+        LifecycleMeta, LoaderBuildMetadata, LoaderComponentId, MinecraftVersionMeta, VersionEntry,
+        VersionLoaderAttachment, VersionSubjectKind,
+    };
     use std::path::{Path, PathBuf};
     use std::sync::RwLock;
     use std::{fs, io};
@@ -848,6 +948,7 @@ mod tests {
             jvm_preset: String::new(),
             performance_mode: String::new(),
             extra_jvm_args: String::new(),
+            auto_optimize: false,
             icon: String::new(),
             accent: String::new(),
         }
@@ -855,6 +956,84 @@ mod tests {
 
     fn stored_instance_json(id: &str) -> serde_json::Value {
         serde_json::to_value(stored_instance(id)).expect("serialize stored instance")
+    }
+
+    fn version_entry(id: &str) -> VersionEntry {
+        VersionEntry {
+            subject_kind: VersionSubjectKind::InstalledVersion,
+            id: id.to_string(),
+            raw_kind: String::new(),
+            release_time: String::new(),
+            minecraft_meta: MinecraftVersionMeta {
+                effective_version: id.to_string(),
+                base_id: id.to_string(),
+                display_name: id.to_string(),
+                ..MinecraftVersionMeta::default()
+            },
+            lifecycle: LifecycleMeta::default(),
+            inherits_from: String::new(),
+            launchable: true,
+            installed: true,
+            status: "installed".to_string(),
+            status_detail: String::new(),
+            needs_install: String::new(),
+            java_component: String::new(),
+            java_major: 21,
+            manifest_url: String::new(),
+            loader: None,
+        }
+    }
+
+    #[test]
+    fn enriched_instance_exposes_backend_authored_vanilla_version_display() {
+        let instance = stored_instance("vanilla");
+        let version = version_entry("1.21.1");
+
+        let enriched =
+            EnrichedInstance::from_instance_without_resource_counts(instance, Some(&version));
+
+        assert_eq!(enriched.version_display.loader_label, "Vanilla");
+        assert_eq!(enriched.version_display.loader_key, "vanilla");
+        assert_eq!(enriched.version_display.minecraft_label, "1.21.1");
+        assert_eq!(enriched.version_display.summary_label, "Vanilla · 1.21.1");
+        assert_eq!(enriched.version_display.loader_version_label, "");
+        assert_eq!(enriched.version_display.loader_detail_label, "Vanilla");
+        assert!(!enriched.version_display.supports_mods);
+    }
+
+    #[test]
+    fn enriched_instance_exposes_backend_authored_loader_version_display() {
+        let mut instance = stored_instance("quilt");
+        instance.version_id = "quilt-loader-0.30.0-beta.8-1.21.1".to_string();
+        let mut version = version_entry(&instance.version_id);
+        version.inherits_from = "1.21.1".to_string();
+        version.loader = Some(VersionLoaderAttachment {
+            component_id: LoaderComponentId::Quilt,
+            component_name: "Quilt".to_string(),
+            build_id: "org.quiltmc.quilt-loader:1.21.1:0.30.0-beta.8".to_string(),
+            loader_version: "0.30.0-beta.8".to_string(),
+            build_meta: LoaderBuildMetadata {
+                display_tags: vec!["beta".to_string()],
+                ..LoaderBuildMetadata::default()
+            },
+        });
+
+        let enriched =
+            EnrichedInstance::from_instance_without_resource_counts(instance, Some(&version));
+
+        assert_eq!(enriched.version_display.loader_label, "Quilt");
+        assert_eq!(enriched.version_display.loader_key, "quilt");
+        assert_eq!(enriched.version_display.minecraft_label, "1.21.1");
+        assert_eq!(enriched.version_display.summary_label, "Quilt · 1.21.1");
+        assert_eq!(
+            enriched.version_display.loader_version_label,
+            "0.30.0-beta.8 (beta)"
+        );
+        assert_eq!(
+            enriched.version_display.loader_detail_label,
+            "Quilt · 0.30.0-beta.8 (beta)"
+        );
+        assert!(enriched.version_display.supports_mods);
     }
 
     #[test]

@@ -14,6 +14,7 @@ export interface InitialInstanceSettings {
   window_width?: number;
   window_height?: number;
   jvm_preset_id?: string;
+  auto_optimize?: boolean;
 }
 
 export interface CreateInstanceArgs {
