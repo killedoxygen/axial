@@ -39,7 +39,6 @@ export interface Theme {
   accent: AccentScale;
   n: NeutralScale;
   r: Radii;
-  sp: (n: number) => number;
   ok: string;
   warn: string;
   err: string;
@@ -98,27 +97,22 @@ export function buildNeutrals(dark: boolean, hue = 140): NeutralScale {
   };
 }
 
-export function buildTheme(
-  opts: { dark?: boolean; hue?: number; vibrancy?: number; radius?: number; density?: number } = {},
-): Theme {
+export function buildTheme(opts: { dark?: boolean; hue?: number; vibrancy?: number } = {}): Theme {
   const dark = opts.dark ?? true;
   const hue = opts.hue ?? 140;
   const vibrancy = opts.vibrancy ?? 100;
-  const radius = opts.radius ?? 1;
-  const density = opts.density ?? 1;
   return {
     dark,
     hue,
     accent: buildAccent(hue, dark, vibrancy),
     n: buildNeutrals(dark, hue),
     r: {
-      xs: 8 * radius,
-      sm: 12 * radius,
-      md: 16 * radius,
-      lg: 20 * radius,
-      xl: 28 * radius,
+      xs: 8,
+      sm: 12,
+      md: 16,
+      lg: 20,
+      xl: 28,
     },
-    sp: (n: number) => n * 4 * density,
     ok: 'oklch(0.78 0.14 150)',
     warn: 'oklch(0.80 0.14 70)',
     err: 'oklch(0.70 0.18 25)',

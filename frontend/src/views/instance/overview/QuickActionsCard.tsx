@@ -18,7 +18,7 @@ export function QuickActionsCard({
   onOpenLogs: () => void;
 }): JSX.Element {
   return (
-    <Card padding={18} class="cp-od-quick-card">
+    <Card padding={16} class="cp-od-quick-card">
       <div class="cp-od-head">
         <h3>Quick actions</h3>
       </div>

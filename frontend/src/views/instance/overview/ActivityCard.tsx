@@ -37,7 +37,7 @@ export function ActivityCard({
   }, [inst.id, inst.created_at, inst.last_played_at, resources]);
 
   return (
-    <Card padding={18}>
+    <Card padding={16}>
       <div class="cp-od-head cp-od-head--iconed">
         <div class="cp-od-head-tile">
           <Icon name="activity" size={13} stroke={1.9} />

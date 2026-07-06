@@ -161,13 +161,15 @@ export function Segmented<T extends string>({
   options,
   value,
   onChange,
+  size,
 }: {
   options: Array<T | { value: T; label: string; icon?: string }>;
   value: T;
   onChange: (v: T) => void;
+  size?: 'sm';
 }): JSX.Element {
   return (
-    <div class="cp-seg">
+    <div class={size === 'sm' ? 'cp-seg cp-seg--sm' : 'cp-seg'}>
       {options.map((opt) => {
         const v = typeof opt === 'string' ? opt : opt.value;
         const label = typeof opt === 'string' ? opt : opt.label;

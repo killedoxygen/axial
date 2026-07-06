@@ -389,7 +389,7 @@ export function WorldsCard({
         ? `${hiddenWorlds} more world${hiddenWorlds === 1 ? '' : 's'} in Worlds`
         : `${count} world${count === 1 ? '' : 's'} available`;
   return (
-    <Card padding={18} class={`cp-od-worlds-card${count === 0 ? ' cp-od-worlds-card--empty' : ''}`}>
+    <Card padding={16} class={`cp-od-worlds-card${count === 0 ? ' cp-od-worlds-card--empty' : ''}`}>
       {count === 0 ? (
         <div class="cp-od-worlds-empty">
           <div class="cp-od-worlds-art" aria-hidden="true">

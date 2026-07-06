@@ -261,7 +261,7 @@ export function PerformanceCard({ inst }: { inst: EnrichedInstance }): JSX.Eleme
     : 32;
 
   return (
-    <Card padding={18}>
+    <Card padding={16}>
       <div class="cp-od-head">
         <h3>Performance</h3>
       </div>

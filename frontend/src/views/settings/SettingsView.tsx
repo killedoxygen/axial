@@ -213,10 +213,10 @@ function GameplaySection(): JSX.Element {
         desc={`Maximum RAM given to the JVM when launching. ${recText} (system has ${totalGB} GB).`}
         stack
       >
-        <div style={{ marginTop: 14 }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 6 }}>
-            <span style={{ color: 'var(--text-mute)' }}>Allocation</span>
-            <span style={{ color: 'var(--text)', fontWeight: 700 }}>{fmtMem(memGB)}</span>
+        <div class="cp-settings-slider-control">
+          <div class="cp-settings-readout">
+            <span class="cp-settings-readout-label">Allocation</span>
+            <span class="cp-settings-readout-value">{fmtMem(memGB)}</span>
           </div>
           <Slider
             value={memGB}
@@ -494,10 +494,10 @@ function AudioSection(): JSX.Element {
       />
       {musicOn && (
         <SettingsCard title="Music volume" desc="Set the ambient level without muting." stack>
-          <div style={{ marginTop: 14 }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 6 }}>
-              <span style={{ color: 'var(--text-mute)' }}>Volume</span>
-              <span style={{ color: 'var(--text)', fontWeight: 700 }}>{volume}%</span>
+          <div class="cp-settings-slider-control">
+            <div class="cp-settings-readout">
+              <span class="cp-settings-readout-label">Volume</span>
+              <span class="cp-settings-readout-value">{volume}%</span>
             </div>
             <Slider
               value={volume}
@@ -528,19 +528,10 @@ function ShortcutsSection(): JSX.Element {
   ];
   return (
     <SettingsCard title="Keyboard shortcuts" desc="Global shortcuts available in the launcher." stack>
-      <div style={{ marginTop: 14, display: 'flex', flexDirection: 'column', gap: 2 }}>
+      <div class="cp-settings-shortcuts-list">
         {rows.map(([label, combo]) => (
-          <div
-            key={label}
-            style={{
-              display: 'flex',
-              justifyContent: 'space-between',
-              alignItems: 'center',
-              padding: '8px 4px',
-              borderBottom: '1px dashed var(--line)',
-            }}
-          >
-            <span style={{ fontSize: 13, color: 'var(--text)' }}>{label}</span>
+          <div key={label} class="cp-settings-shortcut-row">
+            <span class="cp-settings-shortcut-label">{label}</span>
             <kbd class="cp-kbd">{combo}</kbd>
           </div>
         ))}

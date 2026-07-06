@@ -6,7 +6,7 @@
   align-items: center;
   justify-content: center;
   padding: 24px;
-  background: oklch(0.1 0 0 / 0.5);
+  background: color-mix(in oklab, var(--bg-deep) 62%, transparent);
   backdrop-filter: blur(6px);
   animation: cp-fade-in 120ms ease;
 }
@@ -14,8 +14,9 @@
   width: min(420px, 100%);
   background: var(--surface);
   color: var(--text);
-  border: 1px solid var(--line);
+  border: 1px solid var(--line-strong);
   border-radius: var(--r-lg);
+  box-shadow: var(--shadow);
   padding: 22px;
   display: flex;
   flex-direction: column;

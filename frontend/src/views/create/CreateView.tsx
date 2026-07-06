@@ -158,6 +158,21 @@ function normalizeDownloadState(value: string | undefined): VersionDownloadState
   return value === 'base' || value === 'full' ? value : 'none';
 }
 
+function noticeTone(value: string): string {
+  if (value === 'warn' || value === 'warned') return 'warned';
+  if (value === 'error') return 'error';
+  if (value === 'intervened') return 'intervened';
+  if (value === 'success') return 'success';
+  return 'info';
+}
+
+function noticeIcon(tone: string): string {
+  if (tone === 'success') return 'check-circle';
+  if (tone === 'error' || tone === 'warned') return 'alert';
+  if (tone === 'intervened') return 'shield-check';
+  return 'info';
+}
+
 function normalizeVersionTags(tags: CreateVersionTag[] | undefined): VersionRowTagModel[] {
   return Array.isArray(tags)
     ? tags
@@ -552,7 +567,7 @@ function CreateCard(): JSX.Element {
       <div class="cp-cr-card-body" data-step={step}>
         {step === 'version' ? (
           <section class="cp-cr-pick" aria-label="Version">
-            <div class="cp-cr-sources" role="radiogroup" aria-label="Instance source">
+            <div class="cp-seg cp-cr-sources" role="radiogroup" aria-label="Instance source">
               {sourceOptions.map((option) => {
                 const key = loaderKeyFromSourceId(option.id);
                 return (
@@ -580,17 +595,25 @@ function CreateCard(): JSX.Element {
 
             {createNotices.length > 0 && (
               <div class="cp-cr-notices" aria-live="polite">
-                {createNotices.map((notice) => (
-                  <div
-                    key={notice.state_id}
-                    class="cp-cr-notice"
-                    data-tone={notice.tone}
-                    role={notice.tone === 'warn' || notice.tone === 'error' ? 'alert' : 'status'}
-                  >
-                    <span>{notice.message}</span>
-                    {notice.detail && <small>{notice.detail}</small>}
-                  </div>
-                ))}
+                {createNotices.map((notice) => {
+                  const tone = noticeTone(notice.tone);
+                  return (
+                    <section
+                      key={notice.state_id}
+                      class="cp-notice"
+                      data-tone={tone}
+                      role={tone === 'warned' || tone === 'error' ? 'alert' : 'status'}
+                    >
+                      <span class="cp-notice-mark" aria-hidden="true">
+                        <Icon name={noticeIcon(tone)} size={15} stroke={2.2} />
+                      </span>
+                      <div class="cp-notice-copy">
+                        <strong>{notice.message}</strong>
+                        {notice.detail && <p>{notice.detail}</p>}
+                      </div>
+                    </section>
+                  );
+                })}
               </div>
             )}
 
@@ -603,7 +626,7 @@ function CreateCard(): JSX.Element {
                 inputRef={searchInputRef}
                 style={{ flex: 1 }}
               />
-              <div class="cp-cr-channels" role="tablist" aria-label="Release channel">
+              <div class="cp-seg cp-seg--sm cp-cr-channels" role="tablist" aria-label="Release channel">
                 {channelTabs.map((value) => {
                   const available = availableChannelSet.has(value);
                   return (

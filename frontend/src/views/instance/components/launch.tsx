@@ -36,15 +36,15 @@ export function LaunchOutcomeNotice({ inst, notice }: { inst: EnrichedInstance; 
 
   return (
     <div class="cp-instance-notice-shell">
-      <section class="cp-launch-notice" data-tone={notice.tone} aria-live="polite">
-        <span class="cp-launch-notice-mark" aria-hidden="true">
+      <section class="cp-notice" data-tone={notice.tone} aria-live="polite">
+        <span class="cp-notice-mark" aria-hidden="true">
           <Icon name={launchNoticeIcon(notice.tone)} size={15} stroke={2.2} />
         </span>
-        <div class="cp-launch-notice-copy">
+        <div class="cp-notice-copy">
           <strong>{notice.message}</strong>
           {primaryDetail && <p>{primaryDetail}</p>}
           {listDetails.length > 0 && (
-            <details class="cp-launch-notice-details">
+            <details class="cp-notice-details">
               <summary>Details</summary>
               <ul>
                 {listDetails.map((detail, index) => (
@@ -55,7 +55,7 @@ export function LaunchOutcomeNotice({ inst, notice }: { inst: EnrichedInstance; 
           )}
         </div>
         <button
-          class="cp-launch-notice-dismiss"
+          class="cp-notice-dismiss"
           type="button"
           aria-label="Dismiss launch notice"
           onClick={() => clearLaunchNotice(inst.id)}

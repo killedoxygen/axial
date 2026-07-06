@@ -34,9 +34,9 @@
   display: inline-flex;
   padding: 4px;
   gap: 4px;
-  background: var(--surface-2);
+  background: color-mix(in oklab, var(--bg) 55%, var(--surface));
   border: 1px solid transparent;
-  border-radius: 14px;
+  border-radius: var(--r-sm);
 }
 
 .cp-ob-navbtn {
@@ -76,8 +76,8 @@
 }
 
 .cp-ob-navbtn:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: -2px;
+  outline: none;
+  box-shadow: inset 0 0 0 2px var(--accent-ring);
 }
 
 @media (max-height: 720px) {
@@ -193,8 +193,8 @@ button.cp-ob-stepper-item:hover {
 }
 
 button.cp-ob-stepper-item:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
 }
 
 .cp-ob-stepper-item[data-state='past'] {
@@ -308,7 +308,7 @@ button.cp-ob-stepper-item:focus-visible {
 .cp-ob-namefield .cp-field {
   height: 52px;
   padding: 0 18px;
-  border-radius: 14px;
+  border-radius: var(--r-sm);
   transition:
     box-shadow 200ms ease,
     border-color 200ms ease,
@@ -387,7 +387,7 @@ button.cp-ob-stepper-item:focus-visible {
   height: 48px;
   padding: 0 16px;
   border: 1px solid transparent;
-  border-radius: 12px;
+  border-radius: var(--r-sm);
   background: var(--surface-2);
   color: var(--text-dim);
   font: inherit;
@@ -532,7 +532,7 @@ button.cp-ob-stepper-item:focus-visible {
   height: 52px;
   padding: 0 16px;
   border: 1px solid transparent;
-  border-radius: 14px;
+  border-radius: var(--r-sm);
   background: var(--surface-2);
   color: var(--text);
   font: inherit;

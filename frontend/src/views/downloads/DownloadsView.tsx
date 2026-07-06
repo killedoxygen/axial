@@ -1,8 +1,8 @@
 import type { JSX } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
+import './downloads.css';
 import { Button, Card, IconButton, Meter, Pill, SectionHeading } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
-import { useTheme } from '../../hooks/use-theme';
 import { installFailure, installQueueState, installState } from '../../store';
 import { clearInstallFailure } from '../../actions';
 import { removeQueuedInstall, retryFailedInstall } from '../../install';
@@ -28,7 +28,6 @@ function activeStepRatio(current: number | undefined, total: number | undefined)
 }
 
 export function DownloadsView(): JSX.Element {
-  const theme = useTheme();
   const state = installState.value;
   const queueState = installQueueState.value;
   const queue = queueState.items;
@@ -75,113 +74,77 @@ export function DownloadsView(): JSX.Element {
   const retryAction = failureView?.retry_action;
   const repairAction = failureView?.repair_action;
   const failureCard = failure ? (
-    <Card>
-      <SectionHeading
-        title={failureView?.title || 'Install failed'}
-        right={
+    <div class="cp-notice cp-download-failure-notice" data-tone="error">
+      <div class="cp-notice-mark">
+        <Icon name="alert" size={16} />
+      </div>
+      <div class="cp-notice-copy">
+        <div class="cp-download-failure-head">
+          <strong>{failureView?.title || 'Install failed'}</strong>
           <Pill tone="err" icon="alert">
             Failed
           </Pill>
-        }
-      />
-      <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
-        <div style={{ minWidth: 0, flex: '1 1 260px' }}>
-          <div
-            style={{
-              fontSize: 13,
-              fontWeight: 600,
-              color: theme.n.text,
-              overflow: 'hidden',
-              textOverflow: 'ellipsis',
-              whiteSpace: 'nowrap',
-            }}
-          >
-            {failure.displayName}
-          </div>
-          <div
-            style={{ fontSize: 12, color: theme.n.textDim, marginTop: 4, lineHeight: 1.45, overflowWrap: 'anywhere' }}
-          >
-            {failureView?.summary || 'Install failed.'}
-          </div>
-          {failureView?.detail && (
-            <div
-              style={{ fontSize: 12, color: theme.n.textDim, marginTop: 4, lineHeight: 1.45, overflowWrap: 'anywhere' }}
-            >
-              {failureView.detail}
-            </div>
-          )}
-          {failureDetails.length > 1 && (
-            <ul
-              style={{ margin: '6px 0 0 16px', padding: 0, color: theme.n.textMute, fontSize: 11.5, lineHeight: 1.4 }}
-            >
+        </div>
+        <div class="cp-download-failure-title">{failure.displayName}</div>
+        <p>{failureView?.summary || 'Install failed.'}</p>
+        {failureView?.detail && <p>{failureView.detail}</p>}
+        {failureDetails.length > 1 && (
+          <div class="cp-notice-details">
+            <ul>
               {failureDetails.slice(1).map((detail) => (
                 <li key={detail}>{detail}</li>
               ))}
             </ul>
-          )}
-          <div style={{ fontSize: 11, color: theme.n.textMute, marginTop: 6 }}>
-            Failed at {formatFailureTime(failure.failedAt)}
           </div>
-        </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginLeft: 'auto' }}>
-          {repairAction && (
-            <Button
-              variant="secondary"
-              size="sm"
-              icon="shield-check"
-              disabled={!repairAction.enabled}
-              title={repairAction.disabled_reason || undefined}
-            >
-              {repairAction.label}
-            </Button>
-          )}
+        )}
+        <div class="cp-download-failure-time">Failed at {formatFailureTime(failure.failedAt)}</div>
+      </div>
+      <div class="cp-download-failure-actions">
+        {repairAction && (
           <Button
             variant="secondary"
             size="sm"
-            icon="refresh"
-            onClick={retryFailedInstall}
-            disabled={retryAction ? !retryAction.enabled : false}
-            title={retryAction?.disabled_reason || undefined}
+            icon="shield-check"
+            disabled={!repairAction.enabled}
+            title={repairAction.disabled_reason || undefined}
           >
-            {retryAction?.label || 'Retry install'}
+            {repairAction.label}
           </Button>
-          <IconButton
-            icon="x"
-            size={28}
-            tooltip={failureView?.dismiss_action?.label || 'Dismiss failed install'}
-            onClick={clearInstallFailure}
-            disabled={failureView?.dismiss_action ? !failureView.dismiss_action.enabled : false}
-          />
-        </div>
+        )}
+        <Button
+          variant="secondary"
+          size="sm"
+          icon="refresh"
+          onClick={retryFailedInstall}
+          disabled={retryAction ? !retryAction.enabled : false}
+          title={retryAction?.disabled_reason || undefined}
+        >
+          {retryAction?.label || 'Retry install'}
+        </Button>
+        <IconButton
+          icon="x"
+          size={28}
+          tooltip={failureView?.dismiss_action?.label || 'Dismiss failed install'}
+          onClick={clearInstallFailure}
+          disabled={failureView?.dismiss_action ? !failureView.dismiss_action.enabled : false}
+        />
       </div>
-    </Card>
+    </div>
   ) : null;
 
   return (
-    <div class="cp-view-page" style={{ gap: 20 }}>
+    <div class="cp-view-page cp-downloads-page">
       {hasActive ? (
         <Card>
           <SectionHeading
             title={activeTitle}
             right={
-              <div
-                style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}
-              >
+              <div class="cp-download-heading-actions">
                 {queueView.queued_count > 0 && <Pill icon="clock">{queueView.queued_count_label}</Pill>}
               </div>
             }
           />
-          <div
-            style={{
-              fontSize: 12,
-              color: theme.n.textDim,
-              marginBottom: 8,
-              lineHeight: 1.45,
-              overflowWrap: 'anywhere',
-            }}
-          >
-            {activeLabel}
-          </div>
+          <div class="cp-download-active-label">{activeLabel}</div>
           <div class="cp-download-active-meter">
             <Meter value={activePct} ariaLabel={`Install progress for ${activeTitle}`} />
           </div>
@@ -199,42 +162,22 @@ export function DownloadsView(): JSX.Element {
               </div>
             </div>
           )}
-          <div
-            style={{
-              display: 'flex',
-              justifyContent: 'space-between',
-              gap: 12,
-              marginTop: 7,
-              color: theme.n.textMute,
-              fontSize: 11,
-              lineHeight: 1.35,
-            }}
-          >
+          <div class="cp-download-active-footer">
             <span>{elapsedLabel}</span>
-            <span style={{ fontVariantNumeric: 'tabular-nums' }}>
+            <span class="cp-download-num">
               {activeStep ? `${activeStep.label} ${stepPct}% · overall ${activePct}%` : `${activePct}%`}
             </span>
           </div>
-          {nextQueuedLabel && (
-            <div
-              style={{
-                fontSize: 11.5,
-                color: theme.n.textMute,
-                marginTop: 10,
-                lineHeight: 1.4,
-                overflowWrap: 'anywhere',
-              }}
-            >
-              Next: {nextQueuedLabel}
-            </div>
-          )}
+          {nextQueuedLabel && <div class="cp-download-next">Next: {nextQueuedLabel}</div>}
         </Card>
       ) : failureCard ? (
         failureCard
       ) : (
         <Card padding={32}>
           <div class="cp-empty">
-            <Icon name="download" size={36} color="var(--text-mute)" />
+            <span class="cp-download-empty-icon">
+              <Icon name="download" size={36} />
+            </span>
             {queue.length > 0 ? (
               <>
                 <h2>{queueView.title}</h2>
@@ -254,72 +197,32 @@ export function DownloadsView(): JSX.Element {
 
       {queue.length > 0 && (
         <Card padding={10}>
-          <div
-            style={{
-              fontSize: 11,
-              fontWeight: 600,
-              textTransform: 'uppercase',
-              letterSpacing: 0,
-              color: theme.n.textMute,
-              padding: '8px 10px',
-            }}
-          >
-            {queueView.section_title}
-          </div>
-          {queue.map((item, i) => {
-            return (
-              <div
-                key={item.queue_id}
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 10,
-                  padding: '10px',
-                  borderTop: `1px solid ${theme.n.line}`,
-                }}
-              >
-                <span style={{ width: 18, fontSize: 11, color: theme.n.textMute, fontVariantNumeric: 'tabular-nums' }}>
-                  {item.position}
-                </span>
-                <div style={{ display: 'flex', alignItems: 'baseline', gap: 6, minWidth: 0, flex: 1 }}>
-                  <span
-                    style={{
-                      fontSize: 13,
-                      color: theme.n.text,
-                      minWidth: 0,
-                      overflow: 'hidden',
-                      textOverflow: 'ellipsis',
-                      whiteSpace: 'nowrap',
-                    }}
-                  >
-                    {item.label}
-                  </span>
-                  {item.install_item.loader && (
-                    <span
-                      style={{
-                        fontSize: 11,
-                        color: theme.n.textMute,
-                        minWidth: 0,
-                        overflow: 'hidden',
-                        textOverflow: 'ellipsis',
-                        whiteSpace: 'nowrap',
-                      }}
-                    >
-                      · {item.install_item.version_id}
-                    </span>
-                  )}
+          <div class="cp-download-section-label">{queueView.section_title}</div>
+          <div class="cp-table cp-download-queue-table">
+            {queue.map((item) => {
+              return (
+                <div key={item.queue_id} class="cp-table-row cp-download-queue-row">
+                  <span class="cp-table-cell cp-download-queue-position cp-download-num">{item.position}</span>
+                  <div class="cp-table-cell cp-download-queue-main">
+                    <span class="cp-table-row-title cp-download-queue-label">{item.label}</span>
+                    {item.install_item.loader && (
+                      <span class="cp-table-row-sub cp-download-queue-version">· {item.install_item.version_id}</span>
+                    )}
+                  </div>
+                  <div class="cp-table-cell cp-download-queue-action">
+                    <IconButton
+                      icon="trash"
+                      size={28}
+                      danger
+                      tooltip={item.remove_action.disabled_reason || item.remove_action.label}
+                      onClick={() => void removeQueuedInstall(item.queue_id)}
+                      disabled={!item.remove_action.enabled}
+                    />
+                  </div>
                 </div>
-                <IconButton
-                  icon="trash"
-                  size={28}
-                  danger
-                  tooltip={item.remove_action.disabled_reason || item.remove_action.label}
-                  onClick={() => void removeQueuedInstall(item.queue_id)}
-                  disabled={!item.remove_action.enabled}
-                />
-              </div>
-            );
-          })}
+              );
+            })}
+          </div>
         </Card>
       )}
     </div>

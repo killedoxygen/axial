@@ -12,7 +12,7 @@ export function DetailsCard({ inst, running }: { inst: EnrichedInstance; running
   const loaderVer = v?.loader?.loader_version ? ` ${v.loader.loader_version}` : '';
   const mcVer = minecraftVersionLabel(v);
   return (
-    <Card padding={18}>
+    <Card padding={16}>
       <div class="cp-od-head">
         <h3>Details</h3>
       </div>

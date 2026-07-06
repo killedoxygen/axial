@@ -1,4 +1,5 @@
 import type { JSX } from 'preact';
+import { Pill } from '../../ui/Atoms';
 import type { BenchmarkMatrixState } from './PerformanceLabTypes';
 import { familyLabel, labelFromToken } from './PerformanceLabFormat';
 
@@ -31,21 +32,21 @@ export function BenchmarkMatrixBlock({ state: matrixState }: { state: BenchmarkM
       {matrix && (
         <>
           <div class="cp-settings-benchmark-counts">
-            <span>
+            <Pill tone="neutral">
               <strong>{modes.length}</strong> modes
-            </span>
-            <span>
+            </Pill>
+            <Pill tone="neutral">
               <strong>{profiles.length}</strong> profiles
-            </span>
-            <span>
+            </Pill>
+            <Pill tone="neutral">
               <strong>{runTypes.length}</strong> run types
-            </span>
-            <span>
+            </Pill>
+            <Pill tone="neutral">
               <strong>{targets.length}</strong> targets
-            </span>
-            <span>
+            </Pill>
+            <Pill tone="neutral">
               <strong>v{matrix.schema_version}</strong> schema
-            </span>
+            </Pill>
           </div>
           <div class="cp-settings-benchmark-lists">
             <div>
