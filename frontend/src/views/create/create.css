@@ -404,12 +404,12 @@ html[data-color-mode='light'] .cp-cr-card {
   box-shadow:
     inset 0 0 0 1px oklch(1 0 0 / 0.1),
     inset 0 1px 0 oklch(1 0 0 / 0.12),
-    0 14px 30px -14px oklch(0.45 0.14 var(--cp-tile-h, 200) / 0.5);
+    0 14px 30px -14px oklch(0.45 0.14 var(--cp-tile-h, 200) / 0.22);
 }
 html[data-color-mode='light'] .cp-cr-tilebox {
   box-shadow:
     inset 0 0 0 1px oklch(0 0 0 / 0.08),
-    0 14px 30px -16px oklch(0.5 0.14 var(--cp-tile-h, 200) / 0.35);
+    0 14px 30px -16px oklch(0.5 0.14 var(--cp-tile-h, 200) / 0.16);
 }
 .cp-cr-tilebox .cp-tile {
   width: 100%;
