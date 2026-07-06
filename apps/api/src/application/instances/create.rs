@@ -1085,6 +1085,7 @@ fn create_view_installed_scan(
     (scan, false)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_static_version_row(
     source_id: &str,
     selection_id: String,
@@ -1361,7 +1362,7 @@ mod tests {
             &loader_build_installed,
             &loader_installed,
         );
-        assert_eq!(uninstalled[0].create_enabled, false);
+        assert!(!uninstalled[0].create_enabled);
         assert_eq!(
             uninstalled[0].disabled_reason.as_deref(),
             Some(
@@ -1379,7 +1380,7 @@ mod tests {
             &loader_build_installed,
             &loader_installed,
         );
-        assert_eq!(installed[0].create_enabled, true);
+        assert!(installed[0].create_enabled);
         assert_eq!(installed[0].disabled_reason, None);
     }
 

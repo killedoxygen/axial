@@ -384,15 +384,15 @@ pub(crate) async fn handle_update_instance(
     if let Some(name) = patch.name.filter(|value| !value.trim().is_empty()) {
         instance.name = name;
     }
-    if let Some(version_id) = patch.version_id.filter(|value| !value.trim().is_empty()) {
-        if version_id != instance.version_id {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "direct version changes are not supported"
-                })),
-            ));
-        }
+    if let Some(version_id) = patch.version_id.filter(|value| !value.trim().is_empty())
+        && version_id != instance.version_id
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "direct version changes are not supported"
+            })),
+        ));
     }
     if let Some(art_seed) = patch.art_seed {
         instance.art_seed = art_seed;

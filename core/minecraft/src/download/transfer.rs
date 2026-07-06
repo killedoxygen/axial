@@ -1048,9 +1048,7 @@ pub(crate) async fn promote_launcher_managed_artifact_temp_once(
                 }
                 Err(error) => {
                     let restore_result = async_fs::rename(&backup_path, destination).await;
-                    if let Err(restore_error) = restore_result {
-                        return Err(restore_error);
-                    }
+                    restore_result?;
                     Err(error)
                 }
             }

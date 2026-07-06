@@ -1491,8 +1491,10 @@ mod tests {
             ..Library::default()
         };
 
-        let merged =
-            merge_libraries_prefer_first(std::slice::from_ref(&library), &[library.clone()]);
+        let merged = merge_libraries_prefer_first(
+            std::slice::from_ref(&library),
+            std::slice::from_ref(&library),
+        );
 
         assert_eq!(merged, vec![library]);
     }

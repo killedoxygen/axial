@@ -153,7 +153,7 @@ pub(super) fn select_preferred_loader_build(
     let has_known_incompatible_default = builds
         .iter()
         .any(loader_build_is_known_incompatible_default);
-    preferred_loader_build(builds).ok_or_else(|| {
+    preferred_loader_build(builds).ok_or({
         if has_known_incompatible_default {
             LoaderBuildSelectionError::NoCompatibleDefault { component_id }
         } else {

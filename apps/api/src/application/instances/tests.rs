@@ -2156,7 +2156,7 @@ async fn create_instance_view_tags_beta_only_loader_version_rows_without_blockin
         if component_id == croopor_minecraft::LoaderComponentId::NeoForge {
             assert_eq!(row.download_state, "full");
         }
-        assert_eq!(row.create_enabled, true);
+        assert!(row.create_enabled);
         assert_eq!(row.disabled_reason, None);
         assert!(
             row.tags
@@ -2211,7 +2211,7 @@ async fn create_instance_view_keeps_fabric_and_quilt_snapshot_rows_enabled() {
             })
             .expect("snapshot loader row");
         assert_eq!(row.channel, "snapshot");
-        assert_eq!(row.create_enabled, true);
+        assert!(row.create_enabled);
         assert_eq!(row.disabled_reason, None);
         assert!(row.tags.is_empty());
     }
@@ -2265,7 +2265,7 @@ async fn create_instance_view_disables_known_incompatible_quilt_java25_default()
                 && row.minecraft_version_id == "26.1.2"
         })
         .expect("quilt 26 row");
-    assert_eq!(quilt_26.create_enabled, false);
+    assert!(!quilt_26.create_enabled);
     assert_eq!(
         quilt_26.disabled_reason.as_deref(),
         Some("No stable compatible Quilt loader is available for this Minecraft version.")
@@ -2278,7 +2278,7 @@ async fn create_instance_view_disables_known_incompatible_quilt_java25_default()
                 && row.minecraft_version_id == "26.1.3"
         })
         .expect("quilt compatible 26 row");
-    assert_eq!(quilt_26_compatible.create_enabled, true);
+    assert!(quilt_26_compatible.create_enabled);
 
     let quilt_1_21 = view
         .versions
@@ -2288,7 +2288,7 @@ async fn create_instance_view_disables_known_incompatible_quilt_java25_default()
                 && row.minecraft_version_id == "1.21.10"
         })
         .expect("quilt 1.21 row");
-    assert_eq!(quilt_1_21.create_enabled, true);
+    assert!(quilt_1_21.create_enabled);
 }
 
 #[tokio::test]
@@ -2322,7 +2322,7 @@ async fn create_instance_view_tags_quilt_java25_without_cached_builds() {
                 && row.minecraft_version_id == "26.1.2"
         })
         .expect("quilt 26 row");
-    assert_eq!(row.create_enabled, true);
+    assert!(row.create_enabled);
     assert_eq!(row.disabled_reason, None);
     assert!(row.tags.iter().any(|tag| tag.id == "beta"));
 }
@@ -2369,7 +2369,7 @@ async fn create_instance_view_enables_quilt_java25_when_compatible_beta_is_defau
                 && row.minecraft_version_id == "26.1.2"
         })
         .expect("quilt 26 row");
-    assert_eq!(row.create_enabled, true);
+    assert!(row.create_enabled);
     assert_eq!(row.disabled_reason, None);
     assert!(row.tags.iter().any(|tag| tag.id == "beta"));
 }

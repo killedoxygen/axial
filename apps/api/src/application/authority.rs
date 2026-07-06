@@ -867,33 +867,29 @@ mod tests {
     }
 
     #[test]
-    fn frontend_performance_card_renders_backend_health_display() {
-        let source = read_repo_file("frontend/src/views/instance/overview/PerformanceCard.tsx");
+    fn frontend_settings_performance_notice_renders_backend_health_view_model() {
+        let settings = read_repo_file("frontend/src/views/instance/tabs/SettingsPane.tsx");
+        let helper = read_repo_file("frontend/src/views/instance/performance-mode.ts");
+        let source = format!("{settings}\n{helper}");
 
         assert_contains_all(
-            "frontend/src/views/instance/overview/PerformanceCard.tsx",
+            "frontend instance Settings performance notice",
             &source,
             &[
                 "/performance/health",
-                "state.health?.view_model",
-                "program.health?.display",
-                "display?.memory.label",
-                "display?.runtime.label",
-                "display?.mode.label",
+                "fetchPerformanceHealth(inst.id)",
+                "health?.view_model",
+                "viewModel.tone === 'warn' || viewModel.tone === 'err'",
             ],
         );
         assert_absent_all(
-            "frontend/src/views/instance/overview/PerformanceCard.tsx",
+            "frontend instance Settings performance notice",
             &source,
             &[
                 "/performance/plan",
-                "performanceModeFrom",
                 "loaderKeyFromVersion",
-                "globalPerformanceMode",
-                "config.value?.performance_mode",
                 "planLoader",
                 "planGameVersion",
-                "memoryGb",
             ],
         );
     }

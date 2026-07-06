@@ -389,7 +389,7 @@ fn readiness_contains(
     statuses: &[LauncherManagedArtifactReadiness],
     needle: LauncherManagedArtifactReadiness,
 ) -> bool {
-    statuses.iter().any(|status| *status == needle)
+    statuses.contains(&needle)
 }
 
 fn inspect_artifact_metadata(
@@ -627,7 +627,6 @@ fn inspect_asset_object_files(
         .any(|status| *status != LauncherManagedArtifactReadiness::Verified)
     {
         reasons.push(asset_corrupt_reason());
-        return;
     }
 
     // Legacy virtual assets are a derived shared view over the verified object store.

@@ -249,10 +249,7 @@ fn authlib_offline_multiplayer_jvm_args(
         return Vec::new();
     }
     let target_version = effective_minecraft_version_id(request, version);
-    if AUTHLIB_OFFLINE_MULTIPLAYER_VERSIONS
-        .iter()
-        .any(|version| *version == target_version)
-    {
+    if AUTHLIB_OFFLINE_MULTIPLAYER_VERSIONS.contains(&target_version) {
         return AUTHLIB_OFFLINE_MULTIPLAYER_JVM_ARGS
             .iter()
             .map(|arg| (*arg).to_string())

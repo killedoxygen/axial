@@ -272,7 +272,7 @@ pub(super) async fn record_install_failure_outcome_and_repair(
     )
     .await;
     if let Some(repair_outcome) = repair_outcome.as_ref() {
-        record_install_operation_guardian_repair_outcome(journals, operation_id, &repair_outcome);
+        record_install_operation_guardian_repair_outcome(journals, operation_id, repair_outcome);
     }
     repair_outcome
 }
