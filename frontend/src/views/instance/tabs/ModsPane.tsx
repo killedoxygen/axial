@@ -44,7 +44,7 @@ export function ModsPane({
   };
 
   return (
-    <div class="cp-instance-body" style={{ display: 'block' }}>
+    <div class="cp-instance-body">
       <div class="cp-resource-toolbar">
         <strong>
           {mods.length} mod{mods.length === 1 ? '' : 's'}

@@ -44,16 +44,18 @@ This project is a desktop Minecraft launcher, not a marketing site. Keep UI work
 ## Create Instance
 - Creating an instance is a modal (`createOpen` signal in `ui-state.ts`), not a route: it pops over the current view with a scrim and closes on Esc/Cancel/success. One screen, no steps: source tiles, channel tabs, searchable version list in a recessed well (left) and identity preview, name, memory, window/profile rows (right).
 
-## Instance Tabs
+## Instance Detail
+- The page sits on the shared `.cp-view-page` scaffold (max-width 1480, centered) like every other view; no full-bleed gutters or fixed docks.
+- There is no Overview tab. The view is: hero card, tab row, then the active tab's content directly. Everything glanceable lives in the hero (identity, loader/version, last played/created, running state); everything operational lives in a tab.
+- The hero is a raised card in the `.cp-feature` family (`--surface`, `--r-lg`, `--shadow-raised`, internal accent glow): instance tile, kicker pills, title, meta line, and the launch cluster on the right. Launch is the only saturated action in the hero.
+- The tab row is section navigation and uses the selection language: ghost icon+label buttons, hover `--surface-2`, active `--accent-fill`/`--accent-on`, no box-shadow. Labels collapse to icons below 740px; never a scrolling tab strip.
 - Every tab is "toolbar row (30px controls) + raised panel" so switching tabs never shifts layout (`.cp-resource-toolbar` + panel).
 - Logs: the latest/current log renders by default at a fixed-height viewer (`.cp-logview`); past logs live behind a select. Log line colors derive from theme tokens, never hardcoded hues.
-- Instance settings: one raised sheet (`.cp-iset`) of hairline-divided sections, no master-detail nav, decoupled from the logs UI.
-- Overview first bento row (Worlds/Activity) is fixed-height so empty and populated states do not reflow.
-- Context menus are expected on operational rows: worlds (tab and overview card), screenshots, mods, instance rows/cards.
+- Instance settings: one raised sheet (`.cp-iset`) of hairline-divided sections, no master-detail nav, decoupled from the logs UI. Backend performance-health warnings render as a `.cp-notice` above the sheet.
+- Context menus are expected on operational rows: worlds, screenshots, mods, instance rows/cards.
 
 ## Layout Rules
-- Preserve existing grid and bento alignment unless a planned visual pass explicitly changes it.
-- Do not add policy/configuration blocks inside overview cards when that breaks card height balance. Instance overview cards should summarize; settings surfaces should edit.
+- Preserve existing grid alignment unless a planned visual pass explicitly changes it.
 - Keep text within controls and compact panels. Prefer tighter copy to larger containers.
 - Do not use viewport-scaled font sizes or nonzero letter spacing.
 - Avoid new decorative gradients, blobs, bokeh, or one-note palettes.
@@ -63,9 +65,8 @@ This project is a desktop Minecraft launcher, not a marketing site. Keep UI work
 Frontend surfaces render backend-authored policy. Do not add UI code that decides readiness, classifies exits, parses raw JVM args, infers install repair state, decides performance health, or chooses Guardian/Healing precedence. Use backend notices, actions, operation states, and view models as the display contract.
 
 ### InstanceDetail
-- Do not reintroduce a persistent Guardian preflight card in the overview without a planned design.
-- Do not put performance policy controls inside the overview Performance card.
-- Keep the Performance card close to the original bento role: plan summary, runtime/readiness facts, and memory scanability.
+- Do not reintroduce an Overview tab, summary cards, or a persistent Guardian preflight card without a planned design; the hero plus content tabs is the whole surface.
+- Performance health is backend-authored: the Settings tab displays the `/performance/health` view model as a notice when its tone is warn/err, and never derives health in the frontend.
 - Preserve Worlds, Screenshots, Logs, and Settings as operational tabs using existing resource/log primitives.
 
 ### CreateView

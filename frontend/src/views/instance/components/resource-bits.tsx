@@ -42,7 +42,7 @@ export function ResourceToolbar({
         <Button variant="secondary" size="sm" icon="refresh" onClick={onRefresh}>
           Refresh
         </Button>
-        <Button variant="soft" size="sm" icon={action.icon} onClick={action.onClick}>
+        <Button variant="secondary" size="sm" icon={action.icon} onClick={action.onClick}>
           {action.label}
         </Button>
       </div>

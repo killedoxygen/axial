@@ -1,5 +1,6 @@
 import type { ComponentChildren, JSX } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
+import { Icon } from '../../../ui/Icons';
 import { Button, Segmented } from '../../../ui/Atoms';
 import { SelectField } from '../../../ui/Select';
 import { type SliderZone } from '../../../ui/Slider';
@@ -12,7 +13,12 @@ import { errMessage, fmtMem, getMemoryRecommendation } from '../../../utils';
 import type { InstancePerformanceMode } from '../../../types-performance';
 import type { EnrichedInstance } from '../../../types-instance';
 import { memoryGb } from '../format';
-import { globalPerformanceMode, performanceModeFrom, performanceModeLabel } from '../performance-mode';
+import {
+  fetchPerformanceHealth,
+  globalPerformanceMode,
+  performanceModeFrom,
+  performanceModeLabel,
+} from '../performance-mode';
 import type { PerformanceMode } from '../../../types-performance';
 import { JavaPathField, JvmArgsInput } from './AdvancedOverrides';
 import { WindowSizeField, type WindowPreset } from './WindowSizeField';
@@ -108,6 +114,13 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
   const [javaPath, setJavaPath] = useState<string>(inst.java_path ?? '');
   const [jvmArgs, setJvmArgs] = useState<string>(inst.extra_jvm_args ?? '');
   const [saving, setSaving] = useState(false);
+  const [healthRefreshKey, setHealthRefreshKey] = useState(0);
+  const [healthNotice, setHealthNotice] = useState<{
+    tone: 'warned' | 'error';
+    title: string;
+    detail: string;
+  } | null>(null);
+  const globalMode = globalPerformanceMode();
   const totalGB = systemInfo.value?.total_memory_mb
     ? Math.max(1, Math.floor(systemInfo.value.total_memory_mb / 1024))
     : 32;
@@ -123,7 +136,7 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
   ];
   const activeWindowPreset = WINDOW_PRESETS.find((p) => p.w === width && p.h === height)?.id ?? 'custom';
   const activeWindowLabel = WINDOW_PRESETS.find((p) => p.id === activeWindowPreset)?.label ?? 'Custom';
-  const effectiveSettingsMode = performanceMode || globalPerformanceMode();
+  const effectiveSettingsMode = performanceMode || globalMode;
   const persistedJvmPreset = jvmPresetFromBackendOptions(inst.jvm_preset, jvmPresetOptions);
   const selectableJvmPresets = selectableJvmPresetOptions(jvmPresetOptions);
   const selectedJvmPresetOption =
@@ -148,6 +161,30 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
   useEffect(() => {
     setMinMem((prev) => Math.min(prev, maxMem));
   }, [maxMem]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void fetchPerformanceHealth(inst.id)
+      .then((health) => {
+        if (cancelled) return;
+        const viewModel = health?.view_model;
+        if (viewModel && (viewModel.tone === 'warn' || viewModel.tone === 'err')) {
+          setHealthNotice({
+            tone: viewModel.tone === 'warn' ? 'warned' : 'error',
+            title: viewModel.title,
+            detail: viewModel.detail,
+          });
+        } else {
+          setHealthNotice(null);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setHealthNotice(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [inst.id, inst.performance_mode, globalMode, healthRefreshKey]);
 
   useEffect(() => {
     let cancelled = false;
@@ -211,6 +248,7 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
       });
       if (res?.error) throw new Error(res.error);
       updateInstanceInList(res);
+      setHealthRefreshKey((current) => current + 1);
       toast('Saved instance settings');
     } catch (err) {
       toast(`Could not save instance settings: ${errMessage(err)}`, 'error');
@@ -231,13 +269,25 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
         </div>
       </div>
 
+      {healthNotice && (
+        <section class="cp-notice" data-tone={healthNotice.tone} aria-live="polite">
+          <span class="cp-notice-mark" aria-hidden="true">
+            <Icon name="alert" size={15} stroke={2.2} />
+          </span>
+          <div class="cp-notice-copy">
+            <strong>{healthNotice.title}</strong>
+            {healthNotice.detail && <p>{healthNotice.detail}</p>}
+          </div>
+        </section>
+      )}
+
       <div class="cp-iset">
         <div class="cp-iset-rows">
           <SettingRow
             title="Launch profile"
             description={
               <>
-                {performanceModeText}. {instancePerformanceNote(performanceMode, globalPerformanceMode())}
+                {performanceModeText}. {instancePerformanceNote(performanceMode, globalMode)}
               </>
             }
             className="cp-iset-row--performance"

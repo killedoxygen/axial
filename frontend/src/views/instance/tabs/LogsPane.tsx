@@ -103,7 +103,7 @@ export function LogsPane({
           <Button variant="secondary" size="sm" icon="refresh" onClick={onRefresh}>
             Refresh
           </Button>
-          <Button variant="soft" size="sm" icon="folder" onClick={() => void openInstanceFolder(inst.id, 'logs')}>
+          <Button variant="secondary" size="sm" icon="folder" onClick={() => void openInstanceFolder(inst.id, 'logs')}>
             Open folder
           </Button>
         </div>

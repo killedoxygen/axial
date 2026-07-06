@@ -1,9 +1,8 @@
 import type { JSX } from 'preact';
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import { Icon } from '../../ui/Icons';
 import { Button, IconButton, Pill } from '../../ui/Atoms';
-import { useTheme } from '../../hooks/use-theme';
-import { InstanceTile } from '../../ui/InstanceVisual';
+import { InstanceTile, artSeedFor } from '../../ui/InstanceVisual';
 import { openContextMenu } from '../../ui/ContextMenu';
 import { instances, launchNotices, launchState, runningSessions, versionById } from '../../store';
 import { navigate } from '../../ui-state';
@@ -20,8 +19,6 @@ import { fmtJoined, fmtRelative } from './format';
 import { fetchInstanceResources, type ResourceLoadState } from './resources';
 import { LOG_RESOURCE_POLL_MS } from './logs';
 import { deleteInstanceFlow, duplicateInstance, openInstanceFolder, renameInstance } from './instance-actions';
-import { OverviewPane } from './overview/OverviewPane';
-import { LogsCard } from './overview/LogsCard';
 import { ModsPane } from './tabs/ModsPane';
 import { WorldsPane } from './tabs/WorldsPane';
 import { ScreenshotsPane } from './tabs/ScreenshotsPane';
@@ -31,10 +28,9 @@ import { InstallBarrierPane, LaunchOutcomeNotice, LaunchSplitButton } from './co
 
 export { deleteInstanceFlow, duplicateInstance, openInstanceFolder, renameInstance } from './instance-actions';
 
-type Tab = 'overview' | 'mods' | 'worlds' | 'screenshots' | 'logs' | 'settings';
+type Tab = 'mods' | 'worlds' | 'screenshots' | 'logs' | 'settings';
 
 const TABS: Array<{ id: Tab; icon: string; label: string }> = [
-  { id: 'overview', icon: 'info', label: 'Overview' },
   { id: 'mods', icon: 'puzzle', label: 'Mods' },
   { id: 'worlds', icon: 'globe', label: 'Worlds' },
   { id: 'screenshots', icon: 'image', label: 'Screenshots' },
@@ -46,14 +42,34 @@ function loaderLabel(v: Version | undefined): string {
   return LOADER_LABELS[loaderKeyFromVersion(v)];
 }
 
+function fmtElapsed(startedAt: string | undefined, now: number): string {
+  const start = startedAt ? Date.parse(startedAt) : NaN;
+  if (!Number.isFinite(start)) return '0:00';
+  const secs = Math.max(0, Math.floor((now - start) / 1000));
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  const r = String(secs % 60).padStart(2, '0');
+  return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${r}` : `${m}:${r}`;
+}
+
+function defaultTabFor(inst: EnrichedInstance | undefined): Tab {
+  return inst && supportsMods(versionById(inst.version_id)) ? 'mods' : 'worlds';
+}
+
 export function InstanceDetailView({ id }: { id: string }): JSX.Element {
-  const theme = useTheme();
   const inst = instances.value.find((i) => i.id === id) as EnrichedInstance | undefined;
-  const [tab, setTab] = useState<Tab>('overview');
+  const userSelectedTab = useRef(false);
+  const [tab, setTab] = useState<Tab>(() => defaultTabFor(inst));
   const [resources, setResources] = useState<ResourceLoadState>({ status: 'loading', data: null });
+  const [now, setNow] = useState(() => Date.now());
   const running = inst ? !!runningSessions.value[inst.id] : false;
+  const session = inst ? runningSessions.value[inst.id] : undefined;
   const launch = launchState.value;
   const preparing = inst && launch.status === 'preparing' && launch.instanceId === inst.id ? launch : null;
+  const selectTab = (next: Tab): void => {
+    userSelectedTab.current = true;
+    setTab(next);
+  };
 
   const reloadResources = (): void => {
     if (!inst) return;
@@ -86,6 +102,15 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
   }, [inst?.id]);
 
   useEffect(() => {
+    userSelectedTab.current = false;
+  }, [id]);
+
+  useEffect(() => {
+    if (!inst || userSelectedTab.current) return;
+    setTab(defaultTabFor(inst));
+  }, [inst?.id, inst?.version_id]);
+
+  useEffect(() => {
     if (!inst || !running) return;
     let alive = true;
     const refreshQuietly = (): void => {
@@ -111,6 +136,13 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
     };
   }, [inst?.id, running]);
 
+  useEffect(() => {
+    if (!running) return;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [running]);
+
   if (!inst) {
     return (
       <div class="cp-view-page">
@@ -128,9 +160,10 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
 
   const v = versionById(inst.version_id);
   const showModsTab = supportsMods(v);
-  const activeTab: Tab = !showModsTab && tab === 'mods' ? 'overview' : tab;
+  const activeTab: Tab = !showModsTab && tab === 'mods' ? 'worlds' : tab;
   const visibleTabs = showModsTab ? TABS : TABS.filter((t) => t.id !== 'mods');
   const mcVer = minecraftVersionLabel(v);
+  const auroraHue = artSeedFor(inst) % 360;
   const launchAction = inst.launch_action;
   const installStatus = instanceInstallStatus(inst, v);
   const installTarget = installStatus.target;
@@ -180,46 +213,57 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
   const launchNotice = launchNotices.value[inst.id];
 
   return (
-    <div class={`cp-instance-page${activeTab === 'overview' ? ' cp-instance-page--overview' : ''}`}>
-      <div class="cp-instance-cover">
-        <div class="cp-instance-cover-vignette" aria-hidden="true" />
-        <div class="cp-instance-cover-glow" aria-hidden="true" />
+    <div class="cp-instance-view" data-running={running} style={{ ['--cp-aurora-h' as any]: auroraHue }}>
+      <div class="cp-instance-stage" aria-hidden="true">
+        <div class="cp-instance-aurora" />
       </div>
 
-      <div class="cp-instance-titlebar">
-        <div class="cp-instance-titlebar-row">
-          <div class="cp-instance-titlebar-left">
-            <div class="cp-instance-avatar">
-              <InstanceTile inst={inst} radius={theme.r.lg} />
+      <div class="cp-view-page cp-instance-page">
+        <header class="cp-instance-hero">
+          <div class="cp-instance-hero-tile">
+            <InstanceTile inst={inst} radius={18} />
+          </div>
+          <div class="cp-instance-hero-id">
+            <div class="cp-instance-hero-kicker">
+              <Pill>
+                {loaderLabel(v)}
+                {loaderVer ? ` ${loaderVer}` : ''}
+              </Pill>
+              <span class="cp-instance-hero-mc">Minecraft {mcVer}</span>
             </div>
-            <div class="cp-instance-titlebar-text">
-              <div class="cp-instance-pills-row">
-                <Pill>
-                  {loaderLabel(v)}
-                  {loaderVer ? ` ${loaderVer}` : ''}
-                </Pill>
-                <span class="cp-instance-mc-version">Minecraft {mcVer}</span>
-              </div>
-              <h1 class="cp-instance-title">{inst.name}</h1>
-              <div class="cp-instance-subtitle">
-                <span>
-                  Last played <b>{fmtRelative(inst.last_played_at)}</b>
-                </span>
-                <span class="cp-instance-subtitle-sep" aria-hidden="true">
-                  ·
-                </span>
-                <span>
-                  Created <b>{fmtJoined(inst.created_at)}</b>
-                </span>
-              </div>
+            <h1 class="cp-instance-hero-title">{inst.name}</h1>
+            <div class="cp-instance-hero-meta">
+              <span class="cp-instance-status" data-running={running}>
+                <span class="cp-instance-status-dot" aria-hidden="true" />
+                {running ? 'Playing now' : 'Ready'}
+              </span>
+              <span class="cp-instance-hero-meta-sep" aria-hidden="true">
+                ·
+              </span>
+              <span>
+                Last played <b>{fmtRelative(inst.last_played_at)}</b>
+              </span>
+              <span class="cp-instance-hero-meta-sep" aria-hidden="true">
+                ·
+              </span>
+              <span>
+                Created <b>{fmtJoined(inst.created_at)}</b>
+              </span>
             </div>
           </div>
-          <div class="cp-instance-actions">
+          <div class="cp-instance-hero-actions">
             <div class="cp-instance-launch">
               {running ? (
-                <Button variant="secondary" size="lg" icon="stop" onClick={onStop}>
-                  Stop
-                </Button>
+                <div class="cp-session">
+                  <span class="cp-session-time">
+                    <span class="cp-session-dot" aria-hidden="true" />
+                    <span>{fmtElapsed(session?.launchedAt, now)}</span>
+                  </span>
+                  <button class="cp-session-stop" type="button" onClick={onStop}>
+                    <Icon name="stop" size={13} />
+                    Stop
+                  </button>
+                </div>
               ) : (
                 <LaunchSplitButton
                   inst={inst}
@@ -229,8 +273,8 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
                   installProgress={installProgress}
                   onLaunch={onPlay}
                   onInstall={onInstall}
-                  onOpenLogs={() => setTab('logs')}
-                  onOpenSettings={() => setTab('settings')}
+                  onOpenLogs={() => selectTab('logs')}
+                  onOpenSettings={() => selectTab('settings')}
                   preparing={preparing}
                 />
               )}
@@ -264,78 +308,58 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
               }
             />
           </div>
-        </div>
-      </div>
+        </header>
 
-      {!installLocked && (
-        <div class="cp-instance-tabs" role="tablist">
-          {visibleTabs.map((t) => {
-            const count = tabCount(t.id);
-            return (
-              <button
-                key={t.id}
-                role="tab"
-                aria-selected={activeTab === t.id}
-                data-active={activeTab === t.id}
-                onClick={() => setTab(t.id)}
-              >
-                <Icon name={t.icon} size={15} />
-                {t.label}
-                {count != null && <span class="cp-tab-count">{count}</span>}
-              </button>
-            );
-          })}
-        </div>
-      )}
-
-      {launchNotice && <LaunchOutcomeNotice inst={inst} notice={launchNotice} />}
-
-      {installLocked && (
-        <InstallBarrierPane
-          installTarget={installTarget}
-          installLabel={installLabel}
-          installQueued={installQueued}
-          installQueuedView={installQueuedView}
-          installProgress={installProgress}
-          installFailure={matchingInstallFailure}
-          onRetryInstall={retryFailedInstall}
-        />
-      )}
-      {!installLocked && activeTab === 'overview' && (
-        <>
-          <OverviewPane
-            inst={inst}
-            resources={resources.data}
-            onRefreshResources={reloadResources}
-            running={running}
-            onLaunch={onPlay}
-            onStop={onStop}
-            onOpenWorlds={() => setTab('worlds')}
-            onOpenLogs={() => setTab('logs')}
-          />
-          <div class="cp-instance-bottom">
-            <LogsCard
-              instanceId={inst.id}
-              resources={resources.data}
-              running={running}
-              onOpenLogs={() => setTab('logs')}
-            />
+        {!installLocked && (
+          <div class="cp-instance-tabs" role="tablist">
+            {visibleTabs.map((t) => {
+              const count = tabCount(t.id);
+              return (
+                <button
+                  key={t.id}
+                  role="tab"
+                  aria-selected={activeTab === t.id}
+                  data-active={activeTab === t.id}
+                  aria-label={t.label}
+                  title={t.label}
+                  onClick={() => selectTab(t.id)}
+                >
+                  <Icon name={t.icon} size={15} />
+                  <span class="cp-tab-label">{t.label}</span>
+                  {count != null && <span class="cp-tab-count">{count}</span>}
+                </button>
+              );
+            })}
           </div>
-        </>
-      )}
-      {!installLocked && activeTab === 'mods' && (
-        <ModsPane inst={inst} resources={resources} onRefresh={reloadResources} />
-      )}
-      {!installLocked && activeTab === 'worlds' && (
-        <WorldsPane inst={inst} resources={resources} onRefresh={reloadResources} />
-      )}
-      {!installLocked && activeTab === 'screenshots' && (
-        <ScreenshotsPane inst={inst} resources={resources} onRefresh={reloadResources} />
-      )}
-      {!installLocked && activeTab === 'logs' && (
-        <LogsPane inst={inst} resources={resources} running={running} onRefresh={reloadResources} />
-      )}
-      {!installLocked && activeTab === 'settings' && <SettingsPane inst={inst} />}
+        )}
+
+        {launchNotice && <LaunchOutcomeNotice inst={inst} notice={launchNotice} />}
+
+        {installLocked && (
+          <InstallBarrierPane
+            installTarget={installTarget}
+            installLabel={installLabel}
+            installQueued={installQueued}
+            installQueuedView={installQueuedView}
+            installProgress={installProgress}
+            installFailure={matchingInstallFailure}
+            onRetryInstall={retryFailedInstall}
+          />
+        )}
+        {!installLocked && activeTab === 'mods' && (
+          <ModsPane inst={inst} resources={resources} onRefresh={reloadResources} />
+        )}
+        {!installLocked && activeTab === 'worlds' && (
+          <WorldsPane inst={inst} resources={resources} onRefresh={reloadResources} />
+        )}
+        {!installLocked && activeTab === 'screenshots' && (
+          <ScreenshotsPane inst={inst} resources={resources} onRefresh={reloadResources} />
+        )}
+        {!installLocked && activeTab === 'logs' && (
+          <LogsPane inst={inst} resources={resources} running={running} onRefresh={reloadResources} />
+        )}
+        {!installLocked && activeTab === 'settings' && <SettingsPane inst={inst} />}
+      </div>
     </div>
   );
 }

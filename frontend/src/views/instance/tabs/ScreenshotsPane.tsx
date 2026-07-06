@@ -67,7 +67,7 @@ export function ScreenshotsPane({
   }, [screenshots, viewer]);
 
   return (
-    <div class="cp-instance-body" style={{ display: 'block' }}>
+    <div class="cp-instance-body">
       <div class="cp-resource-toolbar cp-screenshots-toolbar">
         <strong>
           {screenshots.length} screenshot{screenshots.length === 1 ? '' : 's'}
@@ -91,7 +91,7 @@ export function ScreenshotsPane({
             Refresh
           </Button>
           <Button
-            variant="soft"
+            variant="secondary"
             size="sm"
             icon="folder"
             onClick={() => void openInstanceFolder(inst.id, 'screenshots')}

@@ -1,6 +1,7 @@
 import type { JSX } from 'preact';
 import { useCallback } from 'preact/hooks';
 import { Icon } from '../../../ui/Icons';
+import { Button } from '../../../ui/Atoms';
 import { openContextMenu } from '../../../ui/ContextMenu';
 import { SelectionActionPill, SelectionCheckbox } from '../../../ui/SelectionActionPill';
 import { selectionMenuItem, selectionToggleLabel, useSelection } from '../../../ui/selection';
@@ -8,7 +9,8 @@ import type { EnrichedInstance } from '../../../types-instance';
 import { fmtBytes, fmtRelative } from '../format';
 import type { ResourceLoadState } from '../resources';
 import { openInstanceFolder } from '../instance-actions';
-import { ResourceEmpty, ResourceRow, ResourceStatus, ResourceToolbar } from '../components/resource-bits';
+import { ResourceRow, ResourceStatus, ResourceToolbar } from '../components/resource-bits';
+import { WorldsEmptyArt } from '../components/worlds-empty-art';
 import { deleteWorlds, worldMenuItems } from '../world-actions';
 
 export function WorldsPane({
@@ -43,7 +45,7 @@ export function WorldsPane({
   };
 
   return (
-    <div class="cp-instance-body" style={{ display: 'block' }}>
+    <div class="cp-instance-body">
       <ResourceToolbar
         title={`${worlds.length} world${worlds.length === 1 ? '' : 's'}`}
         onRefresh={onRefresh}
@@ -51,11 +53,16 @@ export function WorldsPane({
       />
       <ResourceStatus state={resources} onRetry={onRefresh} />
       {worlds.length === 0 && resources.status !== 'loading' ? (
-        <ResourceEmpty
-          icon="globe"
-          title="No saves yet"
-          hint="Create a world in Minecraft or place an existing save in this instance's saves folder."
-        />
+        <div class="cp-resource-empty cp-worlds-empty">
+          <WorldsEmptyArt />
+          <strong>No worlds yet</strong>
+          <p>Create a new world, import an existing save, or launch Minecraft and create one there.</p>
+          <div class="cp-worlds-empty-actions">
+            <Button variant="secondary" icon="folder" onClick={() => void openInstanceFolder(inst.id, 'saves')}>
+              Import world
+            </Button>
+          </div>
+        </div>
       ) : (
         <div class="cp-resource-list">
           {worlds.map((world) => (

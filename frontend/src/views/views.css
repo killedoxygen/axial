@@ -329,9 +329,6 @@
   border-radius: 0 !important;
   transition: transform 360ms cubic-bezier(0.22, 1, 0.36, 1);
 }
-.cp-icard-canvas::after {
-  box-shadow: none;
-}
 .cp-icard:hover .cp-icard-canvas {
   transform: scale(1.04);
 }
