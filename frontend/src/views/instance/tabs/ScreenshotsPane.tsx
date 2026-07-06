@@ -6,10 +6,11 @@ import { openContextMenu } from '../../../ui/ContextMenu';
 import { SelectionActionPill, SelectionCheckbox } from '../../../ui/SelectionActionPill';
 import { selectionMenuItem, selectionToggleLabel, useSelection } from '../../../ui/selection';
 import type { EnrichedInstance, InstanceScreenshot } from '../../../types-instance';
-import { fmtBytes, fmtRelative } from '../format';
+import { fmtBytes, fmtDayLabel, fmtRelative } from '../format';
 import type { ResourceLoadState } from '../resources';
 import { openInstanceFolder } from '../instance-actions';
 import { ResourceEmpty, ResourceStatus } from '../components/resource-bits';
+import { ScreenshotLightbox } from '../components/screenshot-lightbox';
 import { deleteScreenshots, screenshotFileUrl, screenshotMenuItems } from '../screenshot-actions';
 
 type ScreenshotSort = 'newest' | 'name' | 'size';
@@ -41,7 +42,22 @@ export function ScreenshotsPane({
     });
     return next;
   }, [screenshots, sort]);
-  const viewedShot = viewer ? screenshots.find((shot) => shot.name === viewer) : undefined;
+  const groups = useMemo(() => {
+    if (sort !== 'newest') return [{ key: 'all', label: '', shots: sortedScreenshots }];
+    const byDay = new Map<string, { key: string; label: string; shots: InstanceScreenshot[] }>();
+    for (const shot of sortedScreenshots) {
+      const day = new Date(shot.modified_at);
+      const key = Number.isNaN(day.getTime()) ? 'earlier' : `${day.getFullYear()}-${day.getMonth()}-${day.getDate()}`;
+      let group = byDay.get(key);
+      if (!group) {
+        group = { key, label: fmtDayLabel(shot.modified_at), shots: [] };
+        byDay.set(key, group);
+      }
+      group.shots.push(shot);
+    }
+    return [...byDay.values()];
+  }, [sortedScreenshots, sort]);
+  const totalBytes = useMemo(() => screenshots.reduce((sum, shot) => sum + shot.size, 0), [screenshots]);
   const selection = useSelection(
     sortedScreenshots,
     useCallback((shot: InstanceScreenshot) => shot.name, []),
@@ -63,15 +79,19 @@ export function ScreenshotsPane({
   };
 
   useEffect(() => {
-    if (viewer && !screenshots.some((shot) => shot.name === viewer)) setViewer('');
-  }, [screenshots, viewer]);
+    if (!viewer || resources.status === 'loading') return;
+    if (!screenshots.some((shot) => shot.name === viewer)) setViewer('');
+  }, [screenshots, viewer, resources.status]);
 
   return (
     <div class="cp-instance-body">
       <div class="cp-resource-toolbar cp-screenshots-toolbar">
-        <strong>
-          {screenshots.length} screenshot{screenshots.length === 1 ? '' : 's'}
-        </strong>
+        <div class="cp-resource-toolbar-title">
+          <strong>
+            {screenshots.length} screenshot{screenshots.length === 1 ? '' : 's'}
+          </strong>
+          {totalBytes > 0 ? <span>{fmtBytes(totalBytes)}</span> : null}
+        </div>
         <div class="cp-screenshots-tools">
           <div class="cp-mini-seg" role="tablist" aria-label="Sort screenshots">
             {(Object.keys(SCREENSHOT_SORT_LABELS) as ScreenshotSort[]).map((item) => (
@@ -108,84 +128,76 @@ export function ScreenshotsPane({
           hint="Minecraft saves screenshots here after you capture them in game."
         />
       ) : (
-        <div class="cp-screenshots-grid">
-          {sortedScreenshots.map((shot) => (
-            <div
-              class="cp-screenshot-tile"
-              data-selected={selection.isSelected(shot.name)}
-              key={shot.name}
-              onContextMenu={(e) => openContextMenu(e, menuItems(shot))}
-            >
-              <SelectionCheckbox
-                className="cp-screenshot-select"
-                selected={selection.isSelected(shot.name)}
-                label={selectionToggleLabel(selection.isSelected(shot.name), shot.name)}
-                onToggle={(e) => {
-                  e.stopPropagation();
-                  selection.toggle(shot.name);
-                }}
-              />
-              <button
-                class="cp-screenshot-thumb"
-                type="button"
-                aria-label={`View ${shot.name}`}
-                onClick={() => setViewer(shot.name)}
-              >
-                <img src={screenshotFileUrl(inst, shot.name)} alt="" loading="lazy" />
-              </button>
-              <div class="cp-screenshot-caption">
-                <div class="cp-screenshot-text">
-                  <div class="cp-screenshot-name" title={shot.name}>
-                    {shot.name}
-                  </div>
-                  <div class="cp-screenshot-meta">
-                    {fmtBytes(shot.size)} · {fmtRelative(shot.modified_at)}
-                  </div>
+        <div class="cp-shot-groups">
+          {groups.map((group) => (
+            <section class="cp-shot-group" key={group.key}>
+              {group.label ? (
+                <div class="cp-shot-group-head">
+                  <span class="cp-shot-group-label">{group.label}</span>
+                  <span class="cp-shot-group-count">{group.shots.length}</span>
+                  <span class="cp-shot-group-rule" aria-hidden="true" />
                 </div>
-                <button
-                  class="cp-resource-action"
-                  type="button"
-                  aria-label={`Screenshot actions for ${shot.name}`}
-                  onClick={(e) => openContextMenu(e, menuItems(shot))}
-                >
-                  <Icon name="dots" size={15} />
-                </button>
+              ) : null}
+              <div class="cp-screenshots-grid">
+                {group.shots.map((shot) => (
+                  <div
+                    class="cp-screenshot-tile"
+                    data-selected={selection.isSelected(shot.name)}
+                    key={shot.name}
+                    onContextMenu={(e) => openContextMenu(e, menuItems(shot))}
+                  >
+                    <SelectionCheckbox
+                      className="cp-screenshot-select"
+                      selected={selection.isSelected(shot.name)}
+                      label={selectionToggleLabel(selection.isSelected(shot.name), shot.name)}
+                      onToggle={(e) => {
+                        e.stopPropagation();
+                        selection.toggle(shot.name);
+                      }}
+                    />
+                    <button
+                      class="cp-screenshot-thumb"
+                      type="button"
+                      aria-label={`View ${shot.name}`}
+                      onClick={() => setViewer(shot.name)}
+                    >
+                      <img src={screenshotFileUrl(inst, shot.name)} alt="" loading="lazy" />
+                    </button>
+                    <div class="cp-screenshot-caption">
+                      <div class="cp-screenshot-text">
+                        <div class="cp-screenshot-name" title={shot.name}>
+                          {shot.name}
+                        </div>
+                        <div class="cp-screenshot-meta">
+                          <span>{fmtBytes(shot.size)}</span>
+                          <span>{fmtRelative(shot.modified_at)}</span>
+                        </div>
+                      </div>
+                      <button
+                        class="cp-resource-action"
+                        type="button"
+                        aria-label={`Screenshot actions for ${shot.name}`}
+                        onClick={(e) => openContextMenu(e, menuItems(shot))}
+                      >
+                        <Icon name="dots" size={15} />
+                      </button>
+                    </div>
+                  </div>
+                ))}
               </div>
-            </div>
+            </section>
           ))}
         </div>
       )}
-      {viewedShot ? (
-        <div
-          class="cp-screenshot-viewer"
-          role="dialog"
-          aria-modal="true"
-          aria-label={viewedShot.name}
-          onClick={() => setViewer('')}
-          onKeyDown={(e: KeyboardEvent) => {
-            if (e.key === 'Escape') setViewer('');
-          }}
-        >
-          <div class="cp-screenshot-viewer-panel" onClick={(e) => e.stopPropagation()}>
-            <div class="cp-screenshot-viewer-bar">
-              <div>
-                <strong title={viewedShot.name}>{viewedShot.name}</strong>
-                <span>
-                  {fmtBytes(viewedShot.size)} · {fmtRelative(viewedShot.modified_at)}
-                </span>
-              </div>
-              <button
-                class="cp-resource-action"
-                type="button"
-                aria-label="Close screenshot viewer"
-                onClick={() => setViewer('')}
-              >
-                <Icon name="x" size={15} />
-              </button>
-            </div>
-            <img src={screenshotFileUrl(inst, viewedShot.name)} alt={viewedShot.name} />
-          </div>
-        </div>
+      {viewer ? (
+        <ScreenshotLightbox
+          inst={inst}
+          shots={sortedScreenshots}
+          name={viewer}
+          onSelect={setViewer}
+          onClose={() => setViewer('')}
+          onRefresh={onRefresh}
+        />
       ) : null}
       <SelectionActionPill
         selection={selection}

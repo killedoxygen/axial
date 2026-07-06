@@ -39,6 +39,20 @@ export function fmtJoined(iso?: string): string {
   return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
 }
 
+export function fmtDayLabel(iso?: string): string {
+  if (!iso) return 'Earlier';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return 'Earlier';
+  const now = new Date();
+  const dayStart = (x: Date): number => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  const days = Math.round((dayStart(now) - dayStart(d)) / 86400000);
+  if (days === 0) return 'Today';
+  if (days === 1) return 'Yesterday';
+  const opts: Intl.DateTimeFormatOptions = { month: 'long', day: 'numeric' };
+  if (d.getFullYear() !== now.getFullYear()) opts.year = 'numeric';
+  return d.toLocaleDateString(undefined, opts);
+}
+
 export function fmtBytes(bytes: number | undefined): string {
   const value = typeof bytes === 'number' && Number.isFinite(bytes) ? bytes : 0;
   if (value < 1024) return `${value} B`;
