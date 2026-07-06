@@ -498,6 +498,7 @@ function CreateCard(): JSX.Element {
   }, [versionRows, selectedSelectionId]);
 
   const versionReady = Boolean(selectionId && selectedVersionRow?.createEnabled !== false);
+  const createSelectionId = sourceKey === 'vanilla' ? selectionId : (loaderChoice ?? selectionId);
   const canCreate = versionReady && name.trim().length > 0 && !submitting;
 
   useEffect(() => {
@@ -505,11 +506,11 @@ function CreateCard(): JSX.Element {
   }, [step, versionReady]);
 
   useEffect(() => {
-    if (sourceKey === 'vanilla' || !mcVersionId) return;
-    let cancelled = false;
     setLoaderBuilds(null);
     setLoaderBuildsError(null);
     setLoaderChoice(null);
+    if (sourceKey === 'vanilla' || !mcVersionId) return;
+    let cancelled = false;
     api(
       'GET',
       `/instances/create-view/loader-builds?source=${encodeURIComponent(sourceId)}&minecraft_version=${encodeURIComponent(mcVersionId)}`,
@@ -546,7 +547,7 @@ function CreateCard(): JSX.Element {
       const dims = winSpec && winSpec.id !== 'default' ? { w: winSpec.w, h: winSpec.h } : null;
       const result = await createInstance({
         name: trimmed,
-        selectionId: loaderChoice ?? selectionId,
+        selectionId: createSelectionId,
         icon: defaultIconFor(sourceKey),
         accent: accentLabel,
         initialSettings: {
@@ -605,6 +606,7 @@ function CreateCard(): JSX.Element {
     windowPresetId,
     jvmPreset,
     selectionId,
+    createSelectionId,
     loaderChoice,
     autoOptimize,
     step,
