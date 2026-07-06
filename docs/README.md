@@ -54,6 +54,7 @@ Do not use it for:
 Current subsystem docs:
 - `docs/DISCORD-RPC.md`
 - `docs/GUARDIAN-ARCHITECTURE.md`
+- `docs/ICON-ASSETS.md`
 - `docs/LOADER-ARCHITECTURE.md`
 - `docs/VERSION-METADATA-ARCHITECTURE.md`
 
