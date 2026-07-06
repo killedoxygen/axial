@@ -23,7 +23,7 @@ export function nextArtSeed(seed: number): number {
   return next || 1;
 }
 
-function hueFor(inst: VisualInstance): number {
+export function instanceHue(inst: VisualInstance): number {
   return artSeedFor(inst) % 360;
 }
 
@@ -60,6 +60,11 @@ function GlyphMark({ loader, className }: { loader: LoaderKey; className: string
   );
 }
 
+export function InstanceGlyph({ inst, className }: { inst: VisualInstance; className: string }): JSX.Element {
+  const version = versionById(inst.version_id);
+  return <GlyphMark loader={loaderKeyForInstance(inst, version)} className={className} />;
+}
+
 export function InstanceTile({
   inst,
   radius,
@@ -77,7 +82,7 @@ export function InstanceTile({
   return (
     <div
       class={`cp-tile${className ? ` ${className}` : ''}`}
-      style={{ ['--cp-tile-h' as any]: hueFor(inst), borderRadius: radius, ...style }}
+      style={{ ['--cp-tile-h' as any]: instanceHue(inst), borderRadius: radius, ...style }}
       aria-hidden="true"
     >
       <div class="cp-tile-identity">

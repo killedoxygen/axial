@@ -3,6 +3,7 @@ import { useMemo } from 'preact/hooks';
 import { Button, SectionHeading, Card, Pill } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { InstanceCard } from '../../ui/InstanceCard';
+import { InstanceGlyph, instanceHue } from '../../ui/InstanceVisual';
 import { navigate, openCreate } from '../../ui-state';
 import { config, instances, runningSessions, versionById } from '../../store';
 import { instanceInstallStatus } from '../../instance-install-status';
@@ -58,11 +59,13 @@ function FeatureBanner({ inst }: { inst: EnrichedInstance }): JSX.Element {
       tabIndex={0}
       aria-label={installing ? `Open ${inst.name}. ${installBadge}` : `Open ${inst.name}`}
       data-installing={installing}
+      style={{ ['--cp-tile-h' as any]: instanceHue(inst) }}
       onClick={open}
       onKeyDown={onKeyDown}
       onContextMenu={(e) => openInstanceContextMenu(e, inst)}
     >
       <div class="cp-feature-glow" aria-hidden="true" />
+      <InstanceGlyph inst={inst} className="cp-feature-glyph" />
       <div class="cp-feature-content">
         <div class="cp-feature-id">
           <div class="cp-feature-kicker">{running ? 'Now playing' : installing ? installBadge : 'Jump back in'}</div>
