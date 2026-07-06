@@ -230,7 +230,6 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
             <h1 class="cp-instance-hero-title">{inst.name}</h1>
             <div class="cp-instance-hero-meta">
               <span class="cp-instance-status" data-running={running}>
-                <span class="cp-instance-status-dot" aria-hidden="true" />
                 {running ? 'Playing now' : 'Ready'}
               </span>
               <span class="cp-instance-hero-meta-sep" aria-hidden="true">

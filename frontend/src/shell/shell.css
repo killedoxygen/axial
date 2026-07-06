@@ -223,8 +223,10 @@
   width: 9px;
   height: 9px;
   border-radius: 999px;
-  background: var(--ok);
-  box-shadow: 0 0 0 2px var(--bg-deep);
+  background: var(--accent);
+  box-shadow:
+    0 0 0 2px var(--bg-deep),
+    0 0 12px -3px color-mix(in oklab, var(--accent) 78%, transparent);
 }
 
 .cp-rail-spacer {

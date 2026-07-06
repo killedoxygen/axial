@@ -191,25 +191,14 @@ html[data-color-mode='light'] .cp-instance-hero-tile {
 .cp-instance-status {
   display: inline-flex;
   align-items: center;
-  gap: 7px;
   font-weight: 600;
-}
-.cp-instance-status-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 999px;
-  background: var(--text-mute);
 }
 .cp-instance-status[data-running='true'] {
   color: var(--text);
 }
-.cp-instance-status[data-running='true'] .cp-instance-status-dot {
-  background: var(--ok);
-  animation: cp-live-pulse 1.8s ease-in-out infinite;
-}
 @keyframes cp-live-pulse {
   50% {
-    box-shadow: 0 0 0 4px color-mix(in oklab, var(--ok) 22%, transparent);
+    box-shadow: 0 0 0 4px color-mix(in oklab, var(--accent) 22%, transparent);
   }
 }
 .cp-instance-hero-actions {
@@ -246,7 +235,7 @@ html[data-color-mode='light'] .cp-instance-hero-tile {
   width: 7px;
   height: 7px;
   border-radius: 999px;
-  background: var(--ok);
+  background: var(--accent);
   animation: cp-live-pulse 1.8s ease-in-out infinite;
 }
 .cp-session-stop {
@@ -276,7 +265,6 @@ html[data-color-mode='light'] .cp-instance-hero-tile {
   box-shadow: inset 0 0 0 2px var(--accent-ring);
 }
 @media (prefers-reduced-motion: reduce) {
-  .cp-instance-status[data-running='true'] .cp-instance-status-dot,
   .cp-session-dot {
     animation: none;
   }

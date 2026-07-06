@@ -397,7 +397,8 @@
   width: 6px;
   height: 6px;
   border-radius: 999px;
-  background: var(--ok);
+  background: var(--accent);
+  box-shadow: 0 0 10px -2px color-mix(in oklab, var(--accent) 80%, transparent);
 }
 .cp-icard-install {
   position: absolute;
