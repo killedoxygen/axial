@@ -1,5 +1,6 @@
 import type { JSX, ComponentChildren } from 'preact';
 import { useState } from 'preact/hooks';
+import type { SoundKind } from '../sound';
 import { Icon } from './Icons';
 
 type Tone = 'neutral' | 'accent' | 'ok' | 'warn' | 'err' | 'info';
@@ -31,7 +32,7 @@ export function Button({
   full?: boolean;
   title?: string;
   buttonRef?: { current: HTMLButtonElement | null };
-  sound?: 'launchPress' | 'affirm' | 'bright';
+  sound?: SoundKind | false;
 }): JSX.Element {
   const cls = `cp-btn cp-btn--${size} cp-btn--${variant}${full ? ' cp-btn--full' : ''}`;
   return (
@@ -42,7 +43,8 @@ export function Button({
       disabled={disabled}
       style={style}
       title={title}
-      data-sound={sound}
+      data-sound={sound || undefined}
+      data-sound-silent={sound === false ? 'true' : undefined}
     >
       {icon && <Icon name={icon} size={size === 'lg' ? 18 : 16} stroke={1.8} />}
       {children != null && <span>{children}</span>}

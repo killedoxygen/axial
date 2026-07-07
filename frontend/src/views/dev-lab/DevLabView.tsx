@@ -1,7 +1,7 @@
 import type { JSX } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
 import './dev-lab.css';
-import { flagEnabled, setFlagOverride } from '../../flags';
+import { ensureFlags, flagEnabled, refreshFlags, setFlagOverride } from '../../flags';
 import { Sound } from '../../sound';
 import { PRESET_HUES } from '../../state';
 import {
@@ -21,6 +21,7 @@ import type { ToastKind } from '../../types-ui';
 import { Button, Card, Pill, Toggle } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { route } from '../../ui-state';
+import { errMessage } from '../../utils';
 
 type LabTab = 'flags' | 'inspector' | 'playground';
 type SoundKind = Parameters<typeof Sound.ui>[0];
@@ -85,13 +86,19 @@ function FlagRow({ flag }: { flag: FeatureFlagViewModel }): JSX.Element {
   );
 }
 
-function FlagsPanel(): JSX.Element {
+function FlagsPanel({ loadError, onRetry }: { loadError: string | null; onRetry: () => void }): JSX.Element {
   const flags = featureFlags.value;
 
   if (!flags) {
+    const failed = loadError !== null;
     return (
-      <div class="cp-dev-loading" role="status">
-        Feature flags are still loading.
+      <div class="cp-dev-loading" data-error={failed} role={failed ? 'alert' : 'status'}>
+        <span>{failed ? `Could not load feature flags: ${loadError}` : 'Feature flags are still loading.'}</span>
+        {failed && (
+          <Button variant="secondary" size="sm" icon="refresh" onClick={onRetry}>
+            Retry
+          </Button>
+        )}
       </div>
     );
   }
@@ -171,7 +178,7 @@ function SoundPlayground(): JSX.Element {
       </div>
       <div class="cp-dev-play-actions">
         {SOUND_KINDS.map(({ kind, label, value }) => (
-          <Button key={kind} variant="secondary" size="sm" onClick={() => Sound.ui(kind, value)}>
+          <Button key={kind} variant="secondary" size="sm" sound={false} onClick={() => Sound.ui(kind, value)}>
             {label}
           </Button>
         ))}
@@ -216,8 +223,32 @@ function PlaygroundPanel(): JSX.Element {
 
 export function DevLabView(): JSX.Element {
   const [tab, setTab] = useState<LabTab>('flags');
+  const [flagLoadError, setFlagLoadError] = useState<string | null>(null);
   const inspectorAvailable = flagEnabled('dev.state-inspector');
   const activeTab = tab === 'inspector' && !inspectorAvailable ? 'flags' : tab;
+
+  const loadFlags = (force = false): void => {
+    setFlagLoadError(null);
+    const request = force ? refreshFlags() : ensureFlags();
+    void request.catch((err: unknown) => {
+      setFlagLoadError(errMessage(err));
+    });
+  };
+
+  useEffect(() => {
+    let mounted = true;
+    const request = ensureFlags();
+    void request
+      .then(() => {
+        if (mounted) setFlagLoadError(null);
+      })
+      .catch((err: unknown) => {
+        if (mounted) setFlagLoadError(errMessage(err));
+      });
+    return () => {
+      mounted = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (tab === 'inspector' && !inspectorAvailable) setTab('flags');
@@ -250,7 +281,7 @@ export function DevLabView(): JSX.Element {
       </div>
 
       <div class="cp-dev-tab-panel">
-        {activeTab === 'flags' && <FlagsPanel />}
+        {activeTab === 'flags' && <FlagsPanel loadError={flagLoadError} onRetry={() => loadFlags(true)} />}
         {activeTab === 'inspector' && inspectorAvailable && <InspectorPanel />}
         {activeTab === 'playground' && <PlaygroundPanel />}
       </div>

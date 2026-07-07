@@ -53,8 +53,6 @@ async function init(): Promise<void> {
   try {
     await initializeApiBase();
 
-    void refreshFlags().catch(() => null);
-
     const nativeVersion = await getNativeAppVersion();
     if (nativeVersion) appVersion.value = nativeVersion;
 
@@ -63,6 +61,7 @@ async function init(): Promise<void> {
       api('GET', '/system').catch(() => null),
       api('GET', '/status').catch(() => null),
       api('GET', '/music/status').catch(() => null),
+      refreshFlags().catch(() => null),
     ]);
     config.value = configRes;
     systemInfo.value = systemRes;

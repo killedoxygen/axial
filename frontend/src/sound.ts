@@ -33,7 +33,7 @@ interface NoteDescriptor extends ToneOptions {
   duration: number;
 }
 
-type SoundKind =
+export type SoundKind =
   | 'soft'
   | 'bright'
   | 'affirm'
@@ -43,6 +43,22 @@ type SoundKind =
   | 'launchPress'
   | 'launchSuccess'
   | 'click';
+
+const BUTTON_SOUND_KINDS: readonly SoundKind[] = [
+  'soft',
+  'bright',
+  'affirm',
+  'theme',
+  'slider',
+  'memory',
+  'launchPress',
+  'launchSuccess',
+  'click',
+];
+
+function explicitButtonSound(value: string | undefined): SoundKind | null {
+  return BUTTON_SOUND_KINDS.includes(value as SoundKind) ? (value as SoundKind) : null;
+}
 
 export const Sound = {
   ctx: null as AudioContext | null,
@@ -259,14 +275,14 @@ export const Sound = {
 
 export function inferButtonSound(btn: HTMLElement): SoundKind | null {
   if (btn.dataset.soundSilent === 'true') return null;
+  const explicit = explicitButtonSound(btn.dataset.sound);
+  if (explicit) return explicit;
   if (btn.classList.contains('cp-winctrl')) return 'soft';
   if (btn.classList.contains('cp-sidebar-item')) return 'soft';
   if (btn.classList.contains('cp-seg') || btn.closest('.cp-seg')) return 'soft';
   if (btn.classList.contains('cp-ob-choice')) return 'soft';
 
   if (btn.classList.contains('cp-btn--primary')) {
-    const explicit = btn.dataset.sound;
-    if (explicit === 'launchPress' || explicit === 'affirm' || explicit === 'bright') return explicit;
     const label = btn.textContent?.toLowerCase() || '';
     if (label.includes('play') || label.includes('launch') || label.includes('resume')) return 'launchPress';
     if (

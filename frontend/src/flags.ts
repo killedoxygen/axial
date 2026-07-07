@@ -4,9 +4,25 @@ import { toast } from './toast';
 import type { FlagsResponse, KnownFlagKey } from './types-flags';
 import { errMessage } from './utils';
 
-export async function refreshFlags(): Promise<void> {
-  const response = await api<FlagsResponse>('GET', '/flags');
-  featureFlags.value = response.flags;
+let pendingFlagsRefresh: Promise<void> | null = null;
+
+export function refreshFlags(): Promise<void> {
+  if (pendingFlagsRefresh) return pendingFlagsRefresh;
+
+  pendingFlagsRefresh = api<FlagsResponse>('GET', '/flags')
+    .then((response) => {
+      featureFlags.value = response.flags;
+    })
+    .finally(() => {
+      pendingFlagsRefresh = null;
+    });
+
+  return pendingFlagsRefresh;
+}
+
+export function ensureFlags(): Promise<void> {
+  if (featureFlags.value) return Promise.resolve();
+  return refreshFlags();
 }
 
 export function flagEnabled(key: KnownFlagKey): boolean {
