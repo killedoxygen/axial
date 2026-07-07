@@ -44,6 +44,24 @@ keep this short and real. if the codebase changes, update this file.
 - public errors, notices, progress, operation state, proof exports, and logs must not echo raw paths, Java paths, JVM args, command lines, provider payloads, account ids, usernames, tokens, server addresses, or token-like strings
 - use backend-owned DTO/view-model boundaries for user-facing safety copy; routes adapt Application/Guardian/Performance output instead of authoring policy ad hoc
 
+## Feature flags
+- the flag registry is `core/config/src/flags.rs`; adding a flag means adding a registry entry, and retiring one means deleting the entry
+- stale user overrides self-prune through `AppConfig::normalized()`
+- user overrides persist in `feature_overrides` in `config.json`
+- flags are read and toggled only through `/api/v1/flags`
+- frontend code must read flags through `flagEnabled` and toggle them through `setFlagOverride` in `frontend/src/flags.ts`
+- do not fetch or cache flag state ad hoc
+- remote values apply only to non-dev registry keys
+- flag precedence is user override, then remote value, then registry default
+- dev-only flags never appear in release builds
+
+## Telemetry
+- telemetry events exist only in the closed vocabulary in `apps/api/src/observability/telemetry.rs`
+- do not add ad hoc event emission or extra telemetry egress points
+- frontend errors are reported only through `frontend/src/error-reporting.ts`; no ad hoc reporting
+- every telemetry property value goes through the `TelemetryExport` redaction audience
+- document new events in `docs/TELEMETRY.md` in the same change
+
 ## Backend layout
 - the Rust rewrite lives under `apps/` and `core/`
 - `apps/api` owns the local HTTP surface and static frontend serving
@@ -55,7 +73,7 @@ keep this short and real. if the codebase changes, update this file.
 - Execution owns primitive facts/effects only; it must not decide Guardian policy
 - Guardian owns horizontal safety diagnosis, action selection, self-healing orchestration, failure-memory loop control, and backend-authored safety outcomes
 - State owns sessions, operation journals, operation state, failure memory, and proof persistence
-- Observability owns redaction, evidence tiers, local proof records, and any future telemetry-safe export boundary
+- Observability owns redaction, evidence tiers, local proof records, and the telemetry-safe export boundary
 - Performance owns performance rules, plans, health, composition-managed mutation, rollback snapshots, and queued performance operations
 - unknown ownership is treated as user-owned; automatic repair needs owned state, journaling, redaction, and loop control
 
@@ -74,6 +92,7 @@ keep this short and real. if the codebase changes, update this file.
 - frontend entry is `frontend/src/main.tsx`
 - frontend CSS is imported through `frontend/src/styles.ts`; `frontend/static/app.css` is generated
 - frontend JS entry output is `frontend/static/app.js`; additional generated chunks may be emitted under `frontend/static/chunks/`
+- frontend mock mode is build-time gated via `__CROOPOR_MOCK_API__` and lives at the `api()` seam in `frontend/src/mock/`; run it with `task dev:web:mock`
 - frontend package manager is `pnpm`, pinned through `frontend/package.json`
 - frontend formatting uses Prettier from `frontend/`; run `pnpm run format:check` to check and `pnpm run format` to write
 - the Rust workspace root is `Cargo.toml`

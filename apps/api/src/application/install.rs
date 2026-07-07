@@ -15,7 +15,12 @@ mod stream;
 use super::InstallVersionCommand;
 use crate::application::instances::invalidate_create_view_installed_scan;
 use crate::guardian::{GuardianArtifactRepairOutcome, GuardianArtifactRepairStatus};
-use crate::observability::operation_journal_proof_record;
+use crate::observability::{
+    operation_journal_proof_record,
+    telemetry::{
+        TelemetryErrorArea, TelemetryErrorKind, TelemetryErrorLevel, TelemetryEvent, TelemetryHub,
+    },
+};
 use crate::state::AppState;
 use crate::state::{
     ActiveQueuedInstallEntry, InstallQueueEnqueueOutcome, InstallQueuePlacement,
@@ -126,6 +131,7 @@ pub(crate) async fn start_install_version(
     let store = state.installs().clone();
     let journals = state.journals().clone();
     let failure_memory = state.failure_memory().clone();
+    let telemetry = state.telemetry().clone();
     let mc_dir = PathBuf::from(mc_dir);
     let install_id_task = install_id.clone();
     let operation_id_task = operation_id.clone();
@@ -135,6 +141,7 @@ pub(crate) async fn start_install_version(
     let worker_journals = journals.clone();
     let worker_failure_memory = failure_memory.clone();
     let worker_operation_id = operation_id_task.clone();
+    let worker_telemetry = telemetry.clone();
     InstallStore::spawn_tracked_worker_with_interrupt_handler(
         store,
         install_id_task,
@@ -228,6 +235,16 @@ pub(crate) async fn start_install_version(
             } else {
                 final_terminal_progress.unwrap_or_else(observed_install_failure_progress)
             };
+            if !final_install_succeeded {
+                let sanitized = sanitize_install_progress(terminal_progress.clone());
+                emit_install_failed(
+                    worker_telemetry.as_ref(),
+                    sanitized
+                        .error
+                        .as_deref()
+                        .unwrap_or(INSTALL_FAILURE_MESSAGE),
+                );
+            }
             let _ = progress_tx.send(terminal_progress);
             drop(progress_tx);
             let _ = store_task.await;
@@ -281,6 +298,15 @@ fn terminal_failure_progress_or_default(progress: Option<DownloadProgress>) -> D
     progress
         .filter(|progress| progress.error.is_some())
         .unwrap_or_else(observed_install_failure_progress)
+}
+
+fn emit_install_failed(telemetry: &TelemetryHub, summary: &str) {
+    telemetry.emit(TelemetryEvent::error_captured(
+        TelemetryErrorKind::InstallFailed,
+        TelemetryErrorArea::Install,
+        TelemetryErrorLevel::Error,
+        summary,
+    ));
 }
 
 fn vanilla_install_done_progress() -> DownloadProgress {

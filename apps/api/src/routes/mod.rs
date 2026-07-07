@@ -3,6 +3,7 @@ mod auth;
 mod catalog;
 mod config;
 mod dev;
+mod flags;
 mod install;
 mod instances;
 mod java;
@@ -14,6 +15,7 @@ mod setup;
 mod skin;
 mod status;
 mod system;
+mod telemetry;
 mod update;
 mod version_info;
 mod versions;
@@ -34,8 +36,10 @@ pub fn router(state: AppState) -> Router {
         .merge(accounts::router())
         .merge(auth::router())
         .merge(system::router())
+        .merge(telemetry::router())
         .merge(config::router())
         .merge(dev::router())
+        .merge(flags::router())
         .merge(setup::router())
         .merge(catalog::router())
         .merge(instances::router())

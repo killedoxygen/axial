@@ -11,6 +11,7 @@ pub mod authority;
 pub mod commands;
 pub mod config;
 pub mod dev;
+pub mod flags;
 pub mod install;
 pub mod instances;
 pub mod java;
@@ -20,6 +21,7 @@ pub mod performance;
 pub mod setup;
 pub mod skin;
 pub mod status;
+pub mod telemetry;
 pub(crate) mod timing;
 pub mod update;
 pub mod version;
@@ -60,6 +62,9 @@ pub use commands::{
 };
 pub use config::{ConfigPatch, current_config, update_config};
 pub use dev::{DevCleanupResponse, DevFlushResponse, dev_cleanup_versions, dev_flush};
+pub use flags::{
+    FlagOverridePatch, FlagSource, FlagViewModel, FlagsResponse, list_flags, update_flag,
+};
 pub use install::{
     InstallApplicationError, InstallGuardianRepairSummary, InstallProgressStepViewModel,
     InstallProgressViewModel, InstallQueueRequest, InstallQueueStateResponse, InstallStartResponse,
@@ -111,6 +116,7 @@ pub use setup::{
 pub(crate) use skin::flush_pending_saved_skin_applies_for_launch;
 pub use skin::flush_pending_saved_skin_applies_for_shutdown;
 pub use status::{StatusResponse, launcher_status};
+pub use telemetry::{FrontendErrorReportRequest, report_frontend_error};
 pub use update::{UpdateResponse, update_status};
 pub use version::{
     CatalogEntry, CatalogResponse, DeleteVersionRequest, SharedDataInfo, VersionInfoResponse,

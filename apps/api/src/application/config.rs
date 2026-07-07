@@ -1,6 +1,12 @@
 //! Application-owned settings workflow.
 
-use crate::{application, state::AppState};
+use crate::{
+    application,
+    observability::telemetry::{
+        TelemetryErrorArea, TelemetryErrorKind, TelemetryErrorLevel, TelemetryEvent,
+    },
+    state::AppState,
+};
 use axum::{Json, http::StatusCode};
 use croopor_config::{AppConfig, ConfigStoreError};
 use serde::Deserialize;
@@ -126,8 +132,23 @@ pub fn update_config(state: &AppState, patch: ConfigPatch) -> Result<AppConfig, 
             }
             Ok(config)
         }
-        Err(error) => Err(config_update_error_response(error)),
+        Err(error) => {
+            emit_config_save_failed(state, &error);
+            Err(config_update_error_response(error))
+        }
     }
+}
+
+fn emit_config_save_failed(state: &AppState, error: &ConfigStoreError) {
+    if matches!(error, ConfigStoreError::Validation(_)) {
+        return;
+    }
+    state.telemetry().emit(TelemetryEvent::error_captured(
+        TelemetryErrorKind::ConfigSaveFailed,
+        TelemetryErrorArea::Config,
+        TelemetryErrorLevel::Error,
+        CONFIG_SAVE_ERROR_MESSAGE,
+    ));
 }
 
 fn config_update_error_response(error: ConfigStoreError) -> ApiError {

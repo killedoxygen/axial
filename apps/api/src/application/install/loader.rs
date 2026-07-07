@@ -2,8 +2,9 @@ use super::{
     BASE_INSTALL_FAILED_MESSAGE, INSTALL_REPAIR_RESUME_MAX_DEPTH, InstallApplicationError,
     InstallProgressViewModel, InstallStartResponse, LOADER_INSTALL_INTERRUPTED_MESSAGE,
     LoaderBuildsRequest, LoaderInstallStartRequest, begin_install_operation_journal,
-    generate_install_id, install_operation_id, record_install_failure_outcome_and_repair,
-    record_install_operation_interrupted, record_install_operation_progress,
+    emit_install_failed, generate_install_id, install_operation_id,
+    record_install_failure_outcome_and_repair, record_install_operation_interrupted,
+    record_install_operation_progress,
     record_loader_base_install_dependency_guardian_failure_outcome,
     record_loader_install_operation_guardian_failure_outcome, sanitize_install_progress,
     stage_install_version_command,
@@ -84,6 +85,7 @@ pub async fn start_loader_install(
 
     let store = state.installs().clone();
     let journals = state.journals().clone();
+    let telemetry = state.telemetry().clone();
     let library_dir = PathBuf::from(library_dir);
     let install_id_task = install_id.clone();
     let operation_id_task = operation_id.clone();
@@ -93,6 +95,7 @@ pub async fn start_loader_install(
     let worker_journals = journals.clone();
     let worker_operation_id = operation_id_task.clone();
     let worker_failure_memory = state.failure_memory().clone();
+    let worker_telemetry = telemetry.clone();
     InstallStore::spawn_tracked_worker_with_interrupt_handler(
         store,
         install_id_task,
@@ -135,6 +138,13 @@ pub async fn start_loader_install(
                     &worker_operation_id,
                     &loader_target_id,
                     &base_version_id,
+                );
+                emit_install_failed(
+                    worker_telemetry.as_ref(),
+                    progress
+                        .error
+                        .as_deref()
+                        .unwrap_or(BASE_INSTALL_FAILED_MESSAGE),
                 );
                 let _ = progress_tx.send(progress);
                 drop(progress_tx);
@@ -216,6 +226,13 @@ pub async fn start_loader_install(
                         continue;
                     }
                     let progress = loader_error_progress(&error);
+                    emit_install_failed(
+                        worker_telemetry.as_ref(),
+                        progress
+                            .error
+                            .as_deref()
+                            .unwrap_or(BASE_INSTALL_FAILED_MESSAGE),
+                    );
                     let _ = progress_tx.send(progress);
                     drop(progress_tx);
                     let _ = store_task.await;

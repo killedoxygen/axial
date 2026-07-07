@@ -12,6 +12,9 @@ use crate::guardian::{
     plan_managed_runtime_ready_marker_repair, runtime_repair_user_outcome,
 };
 use crate::logging::timestamp_utc;
+use crate::observability::telemetry::{
+    TelemetryErrorArea, TelemetryErrorKind, TelemetryErrorLevel, TelemetryEvent,
+};
 use crate::state::AppState;
 use crate::state::contracts::OperationPhase;
 use croopor_config::{AppPaths, Instance};
@@ -90,6 +93,14 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch(
             suppression_until_on_failure: None,
         });
 
+    if outcome.status == GuardianRepairStatus::Failed {
+        state.telemetry().emit(TelemetryEvent::error_captured(
+            TelemetryErrorKind::GuardianRepairFailed,
+            TelemetryErrorArea::Guardian,
+            TelemetryErrorLevel::Error,
+            outcome.summary.as_str(),
+        ));
+    }
     let repair_user_outcome = runtime_repair_user_outcome(&outcome);
     match outcome.status {
         GuardianRepairStatus::Repaired => {

@@ -1,15 +1,17 @@
 import { h } from 'preact';
-import type { ComponentType, JSX } from 'preact';
-import { useEffect, useState } from 'preact/hooks';
+import type { ComponentChildren, ComponentType, JSX } from 'preact';
+import { useEffect, useErrorBoundary, useState } from 'preact/hooks';
 import { AppFrame } from './shell/AppFrame';
 import { BootSplash } from './shell/BootSplash';
 import { HomeView } from './views/home/HomeView';
+import { Button, Card } from './ui/Atoms';
 import { DialogHost } from './ui/Dialog';
 import { ContextMenuHost } from './ui/ContextMenu';
 import { ToastHost } from './ui/ToastHost';
 import { accountSwitcherOpen, commandPaletteOpen, createOpen, route, showOnboardingOverlay } from './ui-state';
 import { devMode } from './store';
 import { useShortcuts } from './hooks/use-shortcuts';
+import { reportRenderError } from './error-reporting';
 
 type DevLabViewComponent = (typeof import('./views/dev-lab/DevLabView'))['DevLabView'];
 type CommandPaletteComponent = (typeof import('./ui/CommandPalette'))['CommandPalette'];
@@ -37,6 +39,8 @@ const OnboardingOverlay = createRouteLoader(async () => (await import('./views/o
 const loadDevLabView = __CROOPOR_ENABLE_DEV_LAB__
   ? async (): Promise<DevLabViewComponent> => (await import('./views/dev-lab/DevLabView')).DevLabView
   : null;
+
+const DevLabRouteView = loadDevLabView ? createRouteLoader(loadDevLabView) : null;
 
 function createRouteLoader<P extends object>(load: () => Promise<ComponentType<P>>): ComponentType<P> {
   let loadedView: ComponentType<P> | null = null;
@@ -85,24 +89,8 @@ function RouteLoadingFallback({ failed = false }: { failed?: boolean }): JSX.Ele
 }
 
 function DevLabRoute(): JSX.Element {
-  if (!loadDevLabView || !devMode.value) return <SettingsRoute />;
-  return <DevLabLoader load={loadDevLabView} />;
-}
-
-function DevLabLoader({ load }: { load: () => Promise<DevLabViewComponent> }): JSX.Element {
-  const [DevLabView, setDevLabView] = useState<DevLabViewComponent | null>(null);
-
-  useEffect(() => {
-    let mounted = true;
-    void load().then((view) => {
-      if (mounted) setDevLabView(() => view);
-    });
-    return () => {
-      mounted = false;
-    };
-  }, [load]);
-
-  return DevLabView ? <DevLabView /> : <SettingsRoute />;
+  if (!DevLabRouteView || !devMode.value) return <SettingsRoute />;
+  return <DevLabRouteView />;
 }
 
 function LazyCommandPalette(): JSX.Element | null {
@@ -165,7 +153,48 @@ function CurrentView(): JSX.Element {
   }
 }
 
-export function App(): JSX.Element {
+function AppErrorBoundary({ children }: { children: ComponentChildren }): JSX.Element {
+  const [error] = useErrorBoundary((caughtError) => {
+    reportRenderError(caughtError);
+  });
+
+  if (error) {
+    return (
+      <div
+        style={{
+          minHeight: '100vh',
+          display: 'grid',
+          placeItems: 'center',
+          padding: 24,
+          background: 'var(--bg)',
+        }}
+      >
+        <Card
+          padding={24}
+          style={{
+            width: 'min(420px, 100%)',
+            display: 'grid',
+            gap: 14,
+          }}
+        >
+          <div>
+            <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 6 }}>Croopor hit a render error</div>
+            <div style={{ color: 'var(--text-dim)', fontSize: 13, lineHeight: 1.45 }}>
+              Reloading usually gets the launcher back in sync with the backend.
+            </div>
+          </div>
+          <Button variant="secondary" icon="refresh" onClick={() => location.reload()}>
+            Reload
+          </Button>
+        </Card>
+      </div>
+    );
+  }
+
+  return <>{children}</>;
+}
+
+function AppContent(): JSX.Element {
   useShortcuts();
   return (
     <>
@@ -181,5 +210,13 @@ export function App(): JSX.Element {
       {commandPaletteOpen.value && <LazyCommandPalette />}
       <BootSplash />
     </>
+  );
+}
+
+export function App(): JSX.Element {
+  return (
+    <AppErrorBoundary>
+      <AppContent />
+    </AppErrorBoundary>
   );
 }

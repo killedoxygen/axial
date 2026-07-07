@@ -14,6 +14,7 @@ import {
   devMode,
 } from './store';
 import { api, initializeApiBase } from './api';
+import { initErrorReporting } from './error-reporting';
 import { applyTheme } from './theme';
 import { Sound, bindButtonSounds } from './sound';
 import { Music } from './music';
@@ -26,11 +27,14 @@ import {
 import { refreshAccountSkin } from './player-skin';
 import { scheduleAutoUpdateCheck } from './updater';
 import { refreshInstallQueue } from './install';
+import { refreshFlags } from './flags';
 import { toast } from './toast';
 import { errMessage } from './utils';
 import { restoreRoute, showOnboardingOverlay } from './ui-state';
 
 async function init(): Promise<void> {
+  initErrorReporting();
+
   // Theme before anything else so the first paint is tinted correctly
   applyTheme(local.theme, local.customHue, {
     silent: true,
@@ -48,6 +52,8 @@ async function init(): Promise<void> {
 
   try {
     await initializeApiBase();
+
+    void refreshFlags().catch(() => null);
 
     const nativeVersion = await getNativeAppVersion();
     if (nativeVersion) appVersion.value = nativeVersion;
