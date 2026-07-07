@@ -373,18 +373,20 @@ html[data-color-mode='light'] .cp-instance-hero-tile {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 4px;
+  gap: 6px;
+  min-height: 36px;
 }
 .cp-instance-tabs button {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  height: 34px;
-  padding: 0 13px;
+  justify-content: center;
+  gap: 9px;
+  height: 36px;
+  padding: 0 14px;
   border: none;
   border-radius: var(--r-sm);
   background: transparent;
-  color: var(--text-dim);
+  color: color-mix(in oklab, var(--text) 76%, transparent);
   font-family: inherit;
   font-size: 13px;
   font-weight: 600;
@@ -394,6 +396,16 @@ html[data-color-mode='light'] .cp-instance-hero-tile {
   transition:
     background 120ms ease,
     color 120ms ease;
+}
+.cp-tab-icon {
+  display: inline-grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  flex: 0 0 16px;
+}
+.cp-tab-icon svg {
+  opacity: 0.96;
 }
 .cp-instance-tabs button:hover {
   background: var(--surface-2);
@@ -406,6 +418,9 @@ html[data-color-mode='light'] .cp-instance-hero-tile {
 .cp-instance-tabs button[data-active='true'] {
   background: var(--accent-fill);
   color: var(--accent-on);
+}
+.cp-instance-tabs button[data-active='true'] .cp-tab-icon svg {
+  opacity: 1;
 }
 .cp-tab-count {
   padding: 1px 7px;

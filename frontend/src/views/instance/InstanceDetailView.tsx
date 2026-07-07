@@ -311,7 +311,9 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
                   title={t.label}
                   onClick={() => selectTab(t.id)}
                 >
-                  <Icon name={t.icon} size={15} />
+                  <span class="cp-tab-icon">
+                    <Icon name={t.icon} size={15} />
+                  </span>
                   <span class="cp-tab-label">{t.label}</span>
                   {count != null && <span class="cp-tab-count">{count}</span>}
                 </button>
