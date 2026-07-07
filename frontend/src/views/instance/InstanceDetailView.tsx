@@ -2,7 +2,7 @@ import type { JSX } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
 import { Icon } from '../../ui/Icons';
 import { Button, IconButton, Pill } from '../../ui/Atoms';
-import { InstanceTile, artSeedFor } from '../../ui/InstanceVisual';
+import { InstanceTile, guardedInstanceHue } from '../../ui/InstanceVisual';
 import { openContextMenu } from '../../ui/ContextMenu';
 import { instances, launchNotices, launchState, runningSessions, versionById } from '../../store';
 import { navigate } from '../../ui-state';
@@ -22,6 +22,7 @@ import { ScreenshotsPane } from './tabs/ScreenshotsPane';
 import { LogsPane } from './tabs/LogsPane';
 import { SettingsPane } from './tabs/SettingsPane';
 import { InstallBarrierPane, LaunchOutcomeNotice, LaunchSplitButton } from './components/launch';
+import { useTheme } from '../../hooks/use-theme';
 
 export { deleteInstanceFlow, duplicateInstance, openInstanceFolder, renameInstance } from './instance-actions';
 
@@ -51,6 +52,7 @@ function defaultTabFor(inst: EnrichedInstance | undefined): Tab {
 }
 
 export function InstanceDetailView({ id }: { id: string }): JSX.Element {
+  const theme = useTheme();
   const inst = instances.value.find((i) => i.id === id) as EnrichedInstance | undefined;
   const [selectedTab, setSelectedTab] = useState<TabSelection>(null);
   const selectedTabForCurrentInstance = selectedTab?.instanceId === id ? selectedTab.tab : null;
@@ -147,7 +149,7 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
   const currentTab = selectedTabForCurrentInstance ?? defaultTabFor(inst);
   const activeTab: Tab = !showModsTab && currentTab === 'mods' ? 'worlds' : currentTab;
   const visibleTabs = showModsTab ? TABS : TABS.filter((t) => t.id !== 'mods');
-  const auroraHue = artSeedFor(inst) % 360;
+  const auroraHue = guardedInstanceHue(inst, theme);
   const launchAction = inst.launch_action;
   const installStatus = instanceInstallStatus(inst, v);
   const installTarget = installStatus.target;

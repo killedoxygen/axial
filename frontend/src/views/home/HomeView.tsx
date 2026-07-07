@@ -3,11 +3,12 @@ import { useMemo } from 'preact/hooks';
 import { Button, SectionHeading, Card, Pill } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { InstanceCard } from '../../ui/InstanceCard';
-import { InstanceGlyph, instanceHue } from '../../ui/InstanceVisual';
+import { InstanceGlyph, guardedInstanceHue } from '../../ui/InstanceVisual';
 import { navigate, openCreate } from '../../ui-state';
 import { config, instances, runningSessions, versionById } from '../../store';
 import { instanceInstallStatus } from '../../instance-install-status';
 import { openInstanceContextMenu } from '../instance/instance-menu';
+import { useTheme } from '../../hooks/use-theme';
 import type { EnrichedInstance } from '../../types-instance';
 
 function greetingFor(date: Date): string {
@@ -38,6 +39,7 @@ function relativeTime(iso?: string): string {
 const HOME_LIBRARY_CARD_LIMIT = 14;
 
 function FeatureBanner({ inst }: { inst: EnrichedInstance }): JSX.Element {
+  const theme = useTheme();
   const version = versionById(inst.version_id);
   const running = !!runningSessions.value[inst.id];
   const install = instanceInstallStatus(inst, version);
@@ -59,7 +61,7 @@ function FeatureBanner({ inst }: { inst: EnrichedInstance }): JSX.Element {
       tabIndex={0}
       aria-label={installing ? `Open ${inst.name}. ${installBadge}` : `Open ${inst.name}`}
       data-installing={installing}
-      style={{ ['--cp-tile-h' as any]: instanceHue(inst) }}
+      style={{ ['--cp-tile-h' as any]: guardedInstanceHue(inst, theme) }}
       onClick={open}
       onKeyDown={onKeyDown}
       onContextMenu={(e) => openInstanceContextMenu(e, inst)}

@@ -2,9 +2,12 @@ import type { JSX } from 'preact';
 import { versionById } from '../store';
 import { instanceInstallStatus } from '../instance-install-status';
 import { hashStr } from '../tokens';
+import { useTheme } from '../hooks/use-theme';
 import { loaderKeyFromComponentId, loaderKeyFromVersion, type LoaderKey } from '../views/create/defaults';
 import { loaderLogoSrc } from '../views/create/loader-logos';
 import { Icon } from './Icons';
+import { resolveTileHue } from './look-guardian';
+import type { Theme } from '../tokens';
 import type { Version } from '../types-version';
 import type { Instance, InstanceVersionDisplay } from '../types-instance';
 
@@ -25,6 +28,10 @@ export function nextArtSeed(seed: number): number {
 
 export function instanceHue(inst: VisualInstance): number {
   return artSeedFor(inst) % 360;
+}
+
+export function guardedInstanceHue(inst: VisualInstance, theme: Theme): number {
+  return resolveTileHue(instanceHue(inst), theme);
 }
 
 function isLoaderKey(value: string | undefined): value is LoaderKey {
@@ -76,13 +83,14 @@ export function InstanceTile({
   className?: string;
   style?: JSX.CSSProperties;
 }): JSX.Element {
+  const theme = useTheme();
   const version = versionById(inst.version_id);
   const loader = loaderKeyForInstance(inst, version);
 
   return (
     <div
       class={`cp-tile${className ? ` ${className}` : ''}`}
-      style={{ ['--cp-tile-h' as any]: instanceHue(inst), borderRadius: radius, ...style }}
+      style={{ ['--cp-tile-h' as any]: guardedInstanceHue(inst, theme), borderRadius: radius, ...style }}
       aria-hidden="true"
     >
       <div class="cp-tile-identity">
