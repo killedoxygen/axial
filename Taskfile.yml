@@ -19,6 +19,7 @@ dotenv: [".env.local", ".env"]
 
 vars:
   WINDOWS_TARGET: x86_64-pc-windows-gnu
+  TAURI_CLI_VERSION_REQ: "^2.9"
   # override with `DEV_PORT=3001 task dev` or `task dev DEV_PORT=3001`
   DEV_PORT: '{{.DEV_PORT | default "1420"}}'
   DEV_TAURI_CONFIG: '{"build":{"beforeDevCommand":{"script":"pnpm run dev:desktop","cwd":"{{toSlash .ROOT_DIR}}/frontend"},"devUrl":"http://localhost:{{.DEV_PORT}}"}}'
@@ -76,7 +77,7 @@ tasks:
             exit 1
           fi
         platforms: [linux]
-      - cargo tauri dev --config '{{.DEV_TAURI_CONFIG}}'
+      - cargo tauri dev --config '{{.DEV_TAURI_CONFIG}}' -- --locked
 
   dev:windows:
     desc: run the desktop app in dev mode as a Windows app from Linux/WSL
@@ -86,7 +87,7 @@ tasks:
     env:
       PORT: "{{.DEV_PORT}}"
     cmds:
-      - cargo tauri dev --target {{.WINDOWS_TARGET}} --config '{{.DEV_TAURI_CONFIG}}'
+      - cargo tauri dev --target {{.WINDOWS_TARGET}} --config '{{.DEV_TAURI_CONFIG}}' -- --locked
 
   dev:web:
     desc: run the frontend-only dev server (browser mode, works headless)
@@ -185,7 +186,7 @@ tasks:
     deps: [ensure:tauri-cli]
     dir: apps/desktop
     cmds:
-      - cargo tauri build --config '{{.BUNDLE_TAURI_CONFIG}}'
+      - cargo tauri build --config '{{.BUNDLE_TAURI_CONFIG}}' -- --locked
 
   doctor:
     desc: show detected tools and platform state
@@ -273,16 +274,49 @@ tasks:
     internal: true
     cmds:
       - cmd: |
+          tauri_cli_req='{{.TAURI_CLI_VERSION_REQ}}'
+
+          install_tauri_cli() {
+            if command -v cargo-binstall >/dev/null 2>&1; then
+              cargo binstall -y --force --locked tauri-cli --version "$tauri_cli_req"
+            else
+              echo "(tip: cargo-binstall turns this long compile into a ~15s download: https://github.com/cargo-bins/cargo-binstall)"
+              cargo install tauri-cli --version "$tauri_cli_req" --locked --force
+            fi
+          }
+
           if command -v cargo-tauri >/dev/null 2>&1; then
-            exit 0
-          fi
-          echo "tauri-cli not found — installing…"
-          if command -v cargo-binstall >/dev/null 2>&1; then
-            cargo binstall -y tauri-cli --version '^2.9'
+            tauri_version_output="$(cargo tauri --version 2>/dev/null || true)"
+            tauri_version="${tauri_version_output#tauri-cli }"
+            required_min="${tauri_cli_req#^}"
+            required_major="${required_min%%.*}"
+            required_minor="${required_min#*.}"
+
+            if [ "$tauri_version" != "$tauri_version_output" ]; then
+              old_ifs="$IFS"
+              IFS=.
+              set -- $tauri_version
+              IFS="$old_ifs"
+
+              if [ "$#" -eq 3 ]; then
+                case "$1$2$3$required_major$required_minor" in
+                  *[!0-9]*)
+                    ;;
+                  *)
+                    if [ "$1" -eq "$required_major" ] && [ "$2" -ge "$required_minor" ]; then
+                      exit 0
+                    fi
+                    ;;
+                esac
+              fi
+            fi
+
+            echo "${tauri_version_output:-cargo-tauri} does not satisfy tauri-cli $tauri_cli_req — installing compatible version…"
           else
-            echo "(tip: cargo-binstall turns this long compile into a ~15s download: https://github.com/cargo-bins/cargo-binstall)"
-            cargo install tauri-cli --version '^2.9' --locked
+            echo "tauri-cli not found — installing $tauri_cli_req…"
           fi
+
+          install_tauri_cli
 
   ensure:windows-cross:
     internal: true
