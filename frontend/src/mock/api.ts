@@ -4,7 +4,12 @@ import type { InstallQueueStateResponse } from '../types-install';
 import type { FeatureFlagViewModel, FlagsResponse } from '../types-flags';
 import type { Version } from '../types-version';
 
-type Handler = (body?: unknown, path?: string) => unknown | Promise<unknown>;
+type Handler = (body?: unknown, path?: string, request?: MockRequest) => unknown | Promise<unknown>;
+
+interface MockRequest {
+  path: string;
+  searchParams: URLSearchParams;
+}
 
 interface StatusResponse {
   status: string;
@@ -26,6 +31,108 @@ interface InstancesResponse {
   instances: EnrichedInstance[];
   last_instance_id: string | null;
   scan_state: ScanState;
+}
+
+interface CreateOption {
+  id: string;
+  label: string;
+  enabled: boolean;
+  disabled_reason?: string | null;
+}
+
+interface CreateVersionRow {
+  source_id: string;
+  selection_id: string;
+  minecraft_version_id: string;
+  display_name: string;
+  hint?: string | null;
+  channel: string;
+  tags: CreateVersionTag[];
+  download_state: string;
+  create_enabled: boolean;
+  disabled_reason?: string | null;
+}
+
+interface CreateVersionTag {
+  id: string;
+  label: string;
+}
+
+interface CreatePresetOption {
+  id: string;
+  label: string;
+  detail: string;
+  default: boolean;
+  disabled_reason?: string | null;
+}
+
+interface CreateOptimizeOption {
+  id: string;
+  label: string;
+  detail: string;
+  default_enabled: boolean;
+}
+
+interface CreateInstanceViewResponse {
+  sources: CreateOption[];
+  channels: CreateOption[];
+  versions: CreateVersionRow[];
+  preset_options: CreatePresetOption[];
+  optimize_option: CreateOptimizeOption;
+  defaults: {
+    source_id: string;
+    channel_id: string;
+    jvm_preset_id: string;
+    max_memory_mb?: number | null;
+    window_width?: number | null;
+    window_height?: number | null;
+  };
+  notices: [];
+}
+
+interface CreateLoaderBuildsViewResponse {
+  source_id: string;
+  minecraft_version_id: string;
+  auto: {
+    selection_id: string;
+    label: string;
+    detail: string;
+  };
+  builds: Array<{
+    selection_id: string;
+    build_id: string;
+    label: string;
+    channel_id: string;
+    channel_label: string;
+    recommended: boolean;
+    installed: boolean;
+    enabled: boolean;
+    disabled_reason?: string | null;
+  }>;
+}
+
+interface CreateInstanceResponse extends EnrichedInstance {
+  result: {
+    command: 'CreateInstance';
+    operation_id: null;
+    status: 'succeeded';
+    safety: null;
+    carriers: Record<string, never>;
+    payload: {
+      instance_id: string;
+      queue_id: null;
+      install_id: null;
+      operation_id: null;
+    };
+    view_model: null;
+  };
+  view_model: {
+    state_id: 'created';
+    tone: 'success';
+    title: 'Instance created';
+    summary: string;
+    detail: null;
+  };
 }
 
 interface ScanState {
@@ -55,6 +162,11 @@ console.info('Croopor mock API active — data is fake, no backend running');
 
 const missingHandlers = new Set<string>();
 const flagOverrides = new Map<string, boolean>();
+
+const FABRIC_COMPONENT_ID = 'net.fabricmc.fabric-loader';
+const MOCK_FABRIC_MC_VERSION = '1.21.5';
+const MOCK_FABRIC_BUILD_ID = 'fabric-loader-0.16.14-1.21.5';
+const MOCK_FABRIC_LOADER_VERSION = '0.16.14';
 
 let configFixture: Config = {
   username: 'MockPlayer',
@@ -133,9 +245,13 @@ const handlers: Record<string, Handler> = {
   }),
   'GET /instances': (): InstancesResponse => ({
     instances: instanceFixtures,
-    last_instance_id: 'mock-fabric-lab',
+    last_instance_id: lastInstanceId,
     scan_state: scanState,
   }),
+  'GET /instances/create-view': (_body, _path, request): CreateInstanceViewResponse => createInstanceView(request),
+  'GET /instances/create-view/loader-builds': (_body, _path, request): CreateLoaderBuildsViewResponse =>
+    createLoaderBuildsView(request),
+  'POST /instances': (body): CreateInstanceResponse => createInstance(body),
   'GET /install/queue': (): InstallQueueStateResponse => ({
     active: null,
     items: [],
@@ -232,13 +348,16 @@ const instanceFixtures: EnrichedInstance[] = [
   }),
 ];
 
+let lastInstanceId: string | null = 'mock-fabric-lab';
+
 export async function mockApi<T>(method: string, path: string, body?: unknown): Promise<T> {
   const normalizedMethod = method.toUpperCase();
-  const normalizedPath = normalizePath(path);
+  const request = normalizeRequest(path);
+  const normalizedPath = request.path;
   const key = handlerKey(normalizedMethod, normalizedPath);
   const handler = handlers[key];
   if (!handler) throw missingHandlerError(key);
-  return (await handler(body, normalizedPath)) as T;
+  return (await handler(body, normalizedPath, request)) as T;
 }
 
 function handlerKey(method: string, path: string): string {
@@ -256,6 +375,270 @@ function updateFlag(encodedKey: string, body: unknown): FlagsResponse {
     flagOverrides.delete(flag.key);
   }
   return flagsResponse();
+}
+
+function createInstanceView(request: MockRequest | undefined): CreateInstanceViewResponse {
+  const requestedSource = request?.searchParams.get('source')?.trim() || 'vanilla';
+  const sourceId = createSourceOptions().some((option) => option.id === requestedSource) ? requestedSource : 'vanilla';
+  return {
+    sources: createSourceOptions(),
+    channels: [
+      { id: 'release', label: 'Release', enabled: true },
+      { id: 'snapshot', label: 'Snapshot', enabled: true },
+      { id: 'legacy', label: 'Legacy', enabled: true },
+    ],
+    versions: createVersionRows().filter((row) => row.source_id === sourceId),
+    preset_options: createPresetOptions(),
+    optimize_option: {
+      id: 'auto_optimize',
+      label: 'Auto-optimize',
+      detail: "Croopor tunes this instance's performance while you play.",
+      default_enabled: true,
+    },
+    defaults: {
+      source_id: 'vanilla',
+      channel_id: 'release',
+      jvm_preset_id: '',
+      max_memory_mb: configFixture.max_memory_mb,
+      window_width: configFixture.window_width,
+      window_height: configFixture.window_height,
+    },
+    notices: [],
+  };
+}
+
+function createLoaderBuildsView(request: MockRequest | undefined): CreateLoaderBuildsViewResponse {
+  const sourceId = request?.searchParams.get('source')?.trim() ?? '';
+  const minecraftVersion = request?.searchParams.get('minecraft_version')?.trim() ?? '';
+  if (sourceId !== FABRIC_COMPONENT_ID) {
+    throw apiError(404, 'Not Found', { error: 'unknown loader component' });
+  }
+  if (minecraftVersion !== MOCK_FABRIC_MC_VERSION) {
+    throw apiError(404, 'Not Found', { error: 'no mock loader builds for this Minecraft version' });
+  }
+  return {
+    source_id: FABRIC_COMPONENT_ID,
+    minecraft_version_id: MOCK_FABRIC_MC_VERSION,
+    auto: {
+      selection_id: `loader_version|${FABRIC_COMPONENT_ID}|${MOCK_FABRIC_MC_VERSION}`,
+      label: 'Automatic',
+      detail: 'Croopor picks the newest stable Fabric build.',
+    },
+    builds: [
+      {
+        selection_id: `loader_build|${FABRIC_COMPONENT_ID}|${MOCK_FABRIC_BUILD_ID}`,
+        build_id: MOCK_FABRIC_BUILD_ID,
+        label: MOCK_FABRIC_LOADER_VERSION,
+        channel_id: 'stable',
+        channel_label: 'Stable',
+        recommended: true,
+        installed: true,
+        enabled: true,
+        disabled_reason: null,
+      },
+    ],
+  };
+}
+
+function createInstance(body: unknown): CreateInstanceResponse {
+  if (!isRecord(body)) {
+    throw apiError(400, 'Bad Request', { error: 'request body is required' });
+  }
+  const name = typeof body.name === 'string' ? body.name.trim() : '';
+  const selectionId = typeof body.selection_id === 'string' ? body.selection_id.trim() : '';
+  if (!name) throw apiError(400, 'Bad Request', { error: 'name is required' });
+  if (!selectionId) throw apiError(400, 'Bad Request', { error: 'selection_id is required' });
+
+  const selection = createSelection(selectionId);
+  const now = new Date().toISOString();
+  const created = instanceFixture({
+    id: uniqueInstanceId(name),
+    name,
+    version_id: selection.versionId,
+    created_at: now,
+    art_seed: finiteNumber(body.art_seed) ?? nextArtSeed(name),
+    max_memory_mb: finiteNumber(body.max_memory_mb),
+    min_memory_mb: finiteNumber(body.min_memory_mb),
+    window_width: finiteNumber(body.window_width),
+    window_height: finiteNumber(body.window_height),
+    jvm_preset: typeof body.jvm_preset_id === 'string' ? body.jvm_preset_id : '',
+    performance_mode: body.auto_optimize === false ? '' : 'managed',
+    icon: typeof body.icon === 'string' ? body.icon : '',
+    accent: typeof body.accent === 'string' ? body.accent : '',
+    version_display: selection.versionDisplay,
+    mods_count: selection.supportsMods ? 0 : undefined,
+  });
+  instanceFixtures.push(created);
+  lastInstanceId = created.id;
+
+  return {
+    ...created,
+    result: {
+      command: 'CreateInstance',
+      operation_id: null,
+      status: 'succeeded',
+      safety: null,
+      carriers: {},
+      payload: {
+        instance_id: created.id,
+        queue_id: null,
+        install_id: null,
+        operation_id: null,
+      },
+      view_model: null,
+    },
+    view_model: {
+      state_id: 'created',
+      tone: 'success',
+      title: 'Instance created',
+      summary: `Created ${created.name}`,
+      detail: null,
+    },
+  };
+}
+
+function createSourceOptions(): CreateOption[] {
+  return [
+    { id: 'vanilla', label: 'Vanilla', enabled: true },
+    { id: FABRIC_COMPONENT_ID, label: 'Fabric', enabled: true },
+    {
+      id: 'net.minecraftforge',
+      label: 'Forge',
+      enabled: false,
+      disabled_reason: 'Not included in mock fixtures.',
+    },
+    {
+      id: 'net.neoforged',
+      label: 'NeoForge',
+      enabled: false,
+      disabled_reason: 'Not included in mock fixtures.',
+    },
+    {
+      id: 'org.quiltmc.quilt-loader',
+      label: 'Quilt',
+      enabled: false,
+      disabled_reason: 'Not included in mock fixtures.',
+    },
+  ];
+}
+
+function createVersionRows(): CreateVersionRow[] {
+  const vanillaRows = versionFixtures
+    .filter((version) => !version.loader)
+    .map((version): CreateVersionRow => {
+      const channel = version.lifecycle.channel === 'legacy' ? 'legacy' : 'release';
+      return {
+        source_id: 'vanilla',
+        selection_id: `vanilla|${version.id}`,
+        minecraft_version_id: version.id,
+        display_name: version.minecraft_meta.display_name || version.id,
+        hint: version.minecraft_meta.display_hint || null,
+        channel,
+        tags: [{ id: 'release', label: 'Release' }],
+        download_state: version.installed ? 'full' : 'none',
+        create_enabled: true,
+        disabled_reason: null,
+      };
+    });
+  return [
+    ...vanillaRows,
+    {
+      source_id: FABRIC_COMPONENT_ID,
+      selection_id: `loader_version|${FABRIC_COMPONENT_ID}|${MOCK_FABRIC_MC_VERSION}`,
+      minecraft_version_id: MOCK_FABRIC_MC_VERSION,
+      display_name: MOCK_FABRIC_MC_VERSION,
+      hint: null,
+      channel: 'release',
+      tags: [
+        { id: 'stable', label: 'Stable' },
+        { id: 'recommended', label: 'Recommended' },
+      ],
+      download_state: 'full',
+      create_enabled: true,
+      disabled_reason: null,
+    },
+  ];
+}
+
+function createPresetOptions(): CreatePresetOption[] {
+  return [
+    {
+      id: '',
+      label: 'Auto',
+      detail: 'Croopor picks safe JVM flags for this instance.',
+      default: true,
+      disabled_reason: null,
+    },
+    {
+      id: 'smooth',
+      label: 'Smooth',
+      detail: 'Balances throughput and steady frame times.',
+      default: false,
+      disabled_reason: null,
+    },
+    {
+      id: 'performance',
+      label: 'Performance',
+      detail: 'Pushes higher throughput on modern hardware.',
+      default: false,
+      disabled_reason: null,
+    },
+  ];
+}
+
+function createSelection(selectionId: string): {
+  versionId: string;
+  versionDisplay: EnrichedInstance['version_display'];
+  supportsMods: boolean;
+} {
+  const [kind, componentId, value] = selectionId.split('|');
+  if (kind === 'vanilla') {
+    const versionId = componentId ?? '';
+    const version = versionFixtures.find((fixture) => !fixture.loader && fixture.id === versionId);
+    if (!version) throw apiError(400, 'Bad Request', { error: 'unknown version selection' });
+    return {
+      versionId,
+      versionDisplay: versionDisplay('vanilla', 'Vanilla', versionId, '', 'Vanilla', false),
+      supportsMods: false,
+    };
+  }
+  if (
+    (kind === 'loader_version' && componentId === FABRIC_COMPONENT_ID && value === MOCK_FABRIC_MC_VERSION) ||
+    (kind === 'loader_build' && componentId === FABRIC_COMPONENT_ID && value === MOCK_FABRIC_BUILD_ID)
+  ) {
+    return {
+      versionId: MOCK_FABRIC_BUILD_ID,
+      versionDisplay: versionDisplay(
+        'fabric',
+        'Fabric',
+        MOCK_FABRIC_MC_VERSION,
+        MOCK_FABRIC_LOADER_VERSION,
+        `Fabric - ${MOCK_FABRIC_LOADER_VERSION}`,
+        true,
+      ),
+      supportsMods: true,
+    };
+  }
+  throw apiError(400, 'Bad Request', { error: 'unknown version selection' });
+}
+
+function versionDisplay(
+  loaderKey: string,
+  loaderLabel: string,
+  minecraftLabel: string,
+  loaderVersionLabel: string,
+  loaderDetailLabel: string,
+  supportsMods: boolean,
+): EnrichedInstance['version_display'] {
+  return {
+    loader_key: loaderKey,
+    loader_label: loaderLabel,
+    minecraft_label: minecraftLabel,
+    loader_version_label: loaderVersionLabel,
+    loader_detail_label: loaderDetailLabel,
+    summary_label: `${loaderLabel} - ${minecraftLabel}`,
+    supports_mods: supportsMods,
+  };
 }
 
 function flagsResponse(): FlagsResponse {
@@ -295,11 +678,14 @@ function errorMessage(status: number, statusText: string, payload: unknown): str
   return `Request failed with HTTP ${status}${statusText ? ` ${statusText}` : ''}`;
 }
 
-function normalizePath(path: string): string {
-  const withoutQuery = path.split(/[?#]/, 1)[0] || '/';
+function normalizeRequest(path: string): MockRequest {
+  const url = new URL(path, 'http://croopor.mock');
   const apiPrefix = '/api/v1';
-  const unprefixed = withoutQuery.startsWith(apiPrefix) ? withoutQuery.slice(apiPrefix.length) || '/' : withoutQuery;
-  return unprefixed.startsWith('/') ? unprefixed : `/${unprefixed}`;
+  const unprefixed = url.pathname.startsWith(apiPrefix) ? url.pathname.slice(apiPrefix.length) || '/' : url.pathname;
+  return {
+    path: unprefixed.startsWith('/') ? unprefixed : `/${unprefixed}`,
+    searchParams: url.searchParams,
+  };
 }
 
 function vanillaVersion(id: string, releaseTime: string, installed: boolean): Version {
@@ -353,25 +739,16 @@ function instanceFixture(
     art_seed: input.art_seed ?? 1,
     max_memory_mb: input.max_memory_mb,
     min_memory_mb: input.min_memory_mb,
-    java_path: '',
-    window_width: 0,
-    window_height: 0,
-    jvm_preset: '',
+    java_path: input.java_path ?? '',
+    window_width: input.window_width ?? 0,
+    window_height: input.window_height ?? 0,
+    jvm_preset: input.jvm_preset ?? '',
     performance_mode: input.performance_mode ?? '',
-    extra_jvm_args: '',
+    extra_jvm_args: input.extra_jvm_args ?? '',
     icon: input.icon ?? '',
     accent: input.accent ?? '',
     version_display:
-      input.version_display ??
-      ({
-        loader_key: 'vanilla',
-        loader_label: 'Vanilla',
-        minecraft_label: input.version_id,
-        loader_version_label: '',
-        loader_detail_label: 'Vanilla',
-        summary_label: `Vanilla - ${input.version_id}`,
-        supports_mods: false,
-      } satisfies EnrichedInstance['version_display']),
+      input.version_display ?? versionDisplay('vanilla', 'Vanilla', input.version_id, '', 'Vanilla', false),
     launchable: input.launchable ?? true,
     launch_action: {
       state_id: 'launch_ready',
@@ -388,6 +765,39 @@ function instanceFixture(
     resource_count: input.resource_count ?? 0,
     shader_count: input.shader_count ?? 0,
   };
+}
+
+function uniqueInstanceId(name: string): string {
+  const base = `mock-${slugify(name) || 'instance'}`;
+  let id = base;
+  let suffix = 2;
+  while (instanceFixtures.some((instance) => instance.id === id)) {
+    id = `${base}-${suffix}`;
+    suffix += 1;
+  }
+  return id;
+}
+
+function slugify(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48);
+}
+
+function finiteNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function nextArtSeed(name: string): number {
+  let hash = 2166136261;
+  for (let i = 0; i < name.length; i += 1) {
+    hash ^= name.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return Math.abs(hash) || 1;
 }
 
 function isRecord(value: unknown): value is Record<string, any> {
