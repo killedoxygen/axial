@@ -4,7 +4,7 @@ Use the designer-provided SVG as the source of truth for app icons when the `.ic
 
 The desktop/taskbar icon uses the full source SVG, including the black squircle container. Keep desktop ICOs high-resolution only: Windows taskbar rendering can select tiny embedded frames and make this logo look like a simplified pixel icon. In-app logo surfaces and frontend static logo/favicon assets use the same SVG with only the squircle container removed, so theme-driven logo color filtering remains owned by the UI.
 
-Developer desktop builds use `apps/desktop/icons/dev/icon.svg` as their source and override only `bundle.icon` through `apps/desktop/tauri.dev.conf.json`. `apps/desktop/build.rs` applies that override for non-release builds so direct `cargo build -p croopor-desktop` debug builds and `./dev dev` use the same developer icon.
+Developer desktop builds use `apps/desktop/icons/dev/icon.svg` as their source and override only `bundle.icon` through `apps/desktop/tauri.dev.conf.json`. `apps/desktop/build.rs` applies that override for non-release builds so direct `cargo build -p croopor-desktop` debug builds and `task dev` use the same developer icon.
 
 ## Preferred workflow
 

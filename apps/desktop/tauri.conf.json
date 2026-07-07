@@ -5,9 +5,7 @@
   "identifier": "dev.mateoltd.croopor",
   "build": {
     "beforeBuildCommand": "cd ../../frontend && pnpm run build",
-    "beforeDevCommand": "cd ../../frontend && pnpm run dev:desktop",
-    "frontendDist": "../../frontend/static",
-    "devUrl": "http://127.0.0.1:3000"
+    "frontendDist": "../../frontend/static"
   },
   "app": {
     "withGlobalTauri": true,

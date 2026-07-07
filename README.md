@@ -10,6 +10,7 @@ it already handles:
 - desktop update detection
 
 ## stack
+- dev tooling: [task](https://taskfile.dev) (`Taskfile.yml`) + [tauri-cli](https://v2.tauri.app/reference/cli/)
 - desktop shell: tauri
 - frontend: preact + signals
 - backend: rust workspace under `apps/` and `core/`
@@ -19,123 +20,71 @@ it already handles:
 ## prereqs
 - rust stable with `rustfmt` and `clippy`
 - node 22+
+- [task](https://taskfile.dev/installation) — the single dev entrypoint on every OS
+  - macos: `brew install go-task`
+  - windows: `winget install Task.Task`
+  - linux: `sh -c "$(curl -fsSL https://taskfile.dev/install.sh)" -- -d -b ~/.local/bin`
 - ubuntu 24.04 linux desktop builds need `libgtk-3-dev` and `libwebkit2gtk-4.1-dev`
-
-you do **not** need to install `task` or `pnpm` globally for normal local work.
-you also do not need a global cargo plugin setup.
-
-ubuntu 24.04 quick prereqs:
 
 ```bash
 sudo apt-get update
 sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev
 ```
 
-## cli
-main entrypoints:
-- unix, mac, wsl: `./dev`
-- windows powershell: `.\dev.ps1`
-- windows cmd: `dev.cmd`
-
-extra compatibility path:
-- unix, mac, wsl: `make`
+everything else (`pnpm` via corepack, `tauri-cli`, the Windows cross toolchain on Linux/WSL) is installed by `task setup`.
+`cargo-binstall` is optional but makes the `tauri-cli` install a ~15s download instead of a compile.
 
 ## quickstart
-unix, mac, wsl:
+same commands on macos, linux, wsl, and windows:
 
 ```bash
-./dev setup
-./dev help
-./dev dev
-```
-
-windows powershell:
-
-```powershell
-.\dev.ps1 setup
-.\dev.ps1 help
-.\dev.ps1 dev
+task setup
+task --list
+task dev
 ```
 
 ## common commands
-- `setup`: install frontend deps and prefetch Rust deps
-- on Linux/WSL, `setup` also prepares the Windows GNU target and MinGW linker for cross-builds
-- `dev`: run desktop dev with Rust + Tauri
-- `dev --target windows`: run desktop dev as a Windows app from Linux/WSL
-- `dev:windows`: explicit alias for Windows desktop dev from Linux/WSL
-- `dev-web`: run the frontend-only dev server
-- `watch`: rebuild frontend assets on file changes
-- `check`: run `fmt`, `check`, `clippy`, and frontend typecheck
-- `test`: run the Rust workspace tests
-- `verify`: run checks, tests, frontend build, and a release desktop build
-- `frontend:fmt`: run frontend formatting checks
-- `frontend:fmt:fix`: format frontend code
-- `rust:fmt`: run Rust formatting checks
-- `rust:fmt:fix`: format Rust code
-- `rust:check`: typecheck the Rust workspace
-- `rust:clippy`: run clippy with warnings denied
-- `rust:test`: run the Rust workspace tests
-- `rust:api`: run the Rust Axum API
-- `rust:desktop`: run the Rust Tauri desktop shell
-- `host:launch-evidence`: report Windows host Java and common Minecraft/Croopor folders without printing paths, from WSL or Windows PowerShell where applicable
-- `build`: build the release desktop binary
-- `build-dev`: build the dev desktop binary
-- `build --target windows`: build the release Windows desktop binary from Linux/WSL
-- `build-dev --target windows`: build the dev Windows desktop binary from Linux/WSL
-- `build:windows`: explicit alias for the release Windows cross-build
-- `build:windows:dev`: explicit alias for the dev Windows cross-build
-- `build:api`: build the dev API binary
-- `build:api:release`: build the release API binary
-- `doctor`: show detected tools and platform state
-- `clean`: remove `target/` and `dist/`
+- `task setup`: one-time setup — frontend deps, Rust deps, tauri-cli, and (Linux/WSL) Windows cross-build prerequisites
+- `task dev`: run the desktop app in dev mode — tauri-cli starts the frontend dev server, waits for it, hot-restarts Rust on change, and cleans up on exit
+- `task dev:windows`: run desktop dev as a Windows app from Linux/WSL
+- `task dev:web`: run the frontend-only dev server (browser mode, works headless)
+- `task watch`: rebuild frontend assets to disk on file changes
+- `task api`: run the local API server
+- `task check`: run all static checks — prettier, tsc, `cargo fmt`, `cargo check`, clippy (matches CI)
+- `task test`: run the Rust workspace tests
+- `task verify`: checks + tests + release desktop build (full CI parity)
+- `task fmt`: format Rust and frontend code
+- `task build` / `task build:dev`: build the release/debug desktop binary (debug uses bundled static assets, no dev server)
+- `task build:windows` / `task build:windows:dev`: cross-build the Windows desktop binary from Linux/WSL
+- `task build:api` / `task build:api:release`: build the API binary
+- `task bundle`: build native installers via tauri (`.app`/`.dmg`, `.msi`/`.exe`, `.deb`/`.rpm`)
+- `task host:launch-evidence`: report Windows host Java and Minecraft/Croopor folders without printing paths (WSL or Windows)
+- `task doctor`: show detected tools and platform state
+- `task clean`: remove `target/` and `dist/`
 
-examples:
-
-```bash
-./dev setup
-./dev dev-web
-./dev dev --target windows
-./dev watch
-./dev build-dev
-./dev build --target windows
-./dev verify
-```
+the desktop dev server is pinned to `localhost:1420`; override it with `DEV_PORT=3001 task dev`.
+`.env` and `.env.local` in the repo root are loaded automatically for every task.
 
 ## wsl note
-`dev` needs a Linux gui session. with wsl that means wslg or another linux gui path.
+`task dev` needs a Linux gui session. with wsl that means wslg or another linux gui path.
 
-if you are in headless wsl, use the frontend-only server or launch the Windows-targeted desktop binary:
-
-```bash
-./dev dev-web
-./dev dev --target windows
-```
-
-frontend dev server port is configurable:
+if you are in headless wsl, use the frontend-only server or run the Windows-targeted desktop app:
 
 ```bash
-PORT=3001 ./dev dev-web
+task dev:web
+task dev:windows
 ```
 
 windows cross-build note:
 
 ```bash
-./dev setup
-./dev build --target windows
+task setup
+task build:windows
 ```
 
 on Ubuntu/WSL, `setup` installs the Rust target and `gcc-mingw-w64-x86-64` by default unless `CI=true`.
-this currently builds a raw Windows `.exe`, not a signed installer or updater package.
+`build:windows` produces a raw Windows `.exe`, not a signed installer or updater package.
 tagged GitHub releases publish raw desktop archives plus matching `.sha256` checksum sidecars.
-
-## taskfile
-`Taskfile.yml` mirrors the same commands as `./dev`, but it is optional.
-
-if you already have `task` installed and prefer it:
-
-```bash
-task --list
-```
 
 ## maintainer docs
 - `docs/CONVENTIONS.md`

@@ -77,6 +77,7 @@ keep this short and real. if the codebase changes, update this file.
 - frontend package manager is `pnpm`, pinned through `frontend/package.json`
 - frontend formatting uses Prettier from `frontend/`; run `pnpm run format:check` to check and `pnpm run format` to write
 - the Rust workspace root is `Cargo.toml`
+- local dev commands live in `Taskfile.yml` and run through `task` on all OSes; desktop dev and bundling go through `tauri-cli` (`task dev`, `task bundle`)
 - release/build automation lives in `.github/workflows/`
 - Rust build output lives in `target/`
 - local release staging lives in `dist/`
