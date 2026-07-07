@@ -49,6 +49,7 @@ const shared = {
   format: 'esm',
   splitting: true,
   chunkNames: 'chunks/[name]-[hash]',
+  external: ['fonts/*'],
   target: ['es2020'],
   jsx: 'automatic',
   jsxImportSource: 'preact',

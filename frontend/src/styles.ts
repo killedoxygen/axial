@@ -1,3 +1,4 @@
+import './base.css';
 import './ui/atoms.css';
 import './shell/shell.css';
 import './shell/rail-icons.css';
