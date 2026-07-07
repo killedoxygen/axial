@@ -97,10 +97,10 @@ export function useSavedSkinEditWorkflow() {
     return true;
   };
 
-  const startEdit = async (skin: SavedSkinRecord): Promise<void> => {
-    if (editKey === skin.texture_key) return;
+  const startEdit = async (skin: SavedSkinRecord): Promise<boolean> => {
+    if (editKey === skin.texture_key) return true;
     const ok = await closeSkinEditBeforeChanging();
-    if (!ok) return;
+    if (!ok) return false;
 
     editDetectTokenRef.current += 1;
     clearEditReplacement();
@@ -111,6 +111,7 @@ export function useSavedSkinEditWorkflow() {
     setEditDetectBusyKey(null);
     setEditDetectError(null);
     setWardrobeNotice(null);
+    return true;
   };
 
   const cancelEdit = (): void => {

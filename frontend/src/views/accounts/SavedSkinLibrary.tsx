@@ -187,9 +187,10 @@ export function SavedSkinLibrary({
     await applySkin(textureKey);
   };
 
-  const startEditGuarded = (skin: SavedSkinRecord): void => {
+  const startEditGuarded = async (skin: SavedSkinRecord): Promise<void> => {
+    const started = await edit.startEdit(skin);
+    if (!started) return;
     selectSavedSkin(skin.texture_key);
-    void edit.startEdit(skin);
   };
 
   useSavedSkinNativeDragDrop({
@@ -249,7 +250,7 @@ export function SavedSkinLibrary({
       onApply: () => void applySkinGuarded(skin.texture_key),
       onApplyNow: () => void flushPendingApply(),
       onCancelQueue: () => void cancelPendingApply(),
-      onEdit: () => startEditGuarded(skin),
+      onEdit: () => void startEditGuarded(skin),
       onDownload: () => void downloadSavedSkin(skin),
       onDelete: () => void deleteSavedSkin(skin),
     });
