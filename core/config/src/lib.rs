@@ -1,8 +1,10 @@
+pub mod flags;
 pub mod instances;
 pub mod models;
 pub mod paths;
 pub mod store;
 
+pub use flags::{FEATURE_FLAGS, FeatureFlagDef, FlagStage, find_flag};
 pub use instances::{
     EnrichedInstance, Instance, InstanceStore, InstanceStoreError, InstanceStoreStartup,
     LaunchActionState, LaunchActionTone, LaunchPrimaryAction,

@@ -1,4 +1,6 @@
+use crate::flags::find_flag;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use thiserror::Error;
 
 pub const USERNAME_MIN_LEN: usize = 3;
@@ -81,6 +83,8 @@ pub struct AppConfig {
     pub onboarding_done: bool,
     #[serde(default)]
     pub telemetry_enabled: bool,
+    #[serde(default)]
+    pub telemetry_install_id: String,
     #[serde(default = "default_discord_rpc_enabled")]
     pub discord_rpc_enabled: bool,
     #[serde(default)]
@@ -95,6 +99,8 @@ pub struct AppConfig {
     pub music_volume: Option<i32>,
     #[serde(default)]
     pub music_track: i32,
+    #[serde(default)]
+    pub feature_overrides: BTreeMap<String, bool>,
 }
 
 impl Default for AppConfig {
@@ -116,6 +122,7 @@ impl Default for AppConfig {
             lightness: None,
             onboarding_done: false,
             telemetry_enabled: false,
+            telemetry_install_id: String::new(),
             discord_rpc_enabled: true,
             discord_rpc_onboarding_seen: false,
             library_dir: String::new(),
@@ -123,6 +130,7 @@ impl Default for AppConfig {
             music_enabled: None,
             music_volume: None,
             music_track: 0,
+            feature_overrides: BTreeMap::new(),
         }
     }
 }
@@ -152,8 +160,38 @@ impl AppConfig {
         if self.library_mode.is_empty() {
             self.library_mode = "managed".to_string();
         }
+        self.telemetry_install_id = if self.telemetry_enabled {
+            normalize_telemetry_install_id(&self.telemetry_install_id)
+        } else {
+            String::new()
+        };
+        self.feature_overrides
+            .retain(|key, _| find_flag(key).is_some());
         Ok(self)
     }
+}
+
+fn normalize_telemetry_install_id(value: &str) -> String {
+    let value = value.trim();
+    if telemetry_install_id_has_uuid_shape(value) {
+        value.to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn telemetry_install_id_has_uuid_shape(value: &str) -> bool {
+    if value.len() != 36 {
+        return false;
+    }
+
+    value.bytes().enumerate().all(|(index, byte)| {
+        if matches!(index, 8 | 13 | 18 | 23) {
+            byte == b'-'
+        } else {
+            byte.is_ascii_hexdigit()
+        }
+    })
 }
 
 #[cfg(test)]
@@ -162,6 +200,7 @@ mod tests {
         AppConfig, AppConfigValidationError, LAUNCH_AUTH_MODE_OFFLINE, LAUNCH_AUTH_MODE_ONLINE,
         validate_launch_auth_mode, validate_username,
     };
+    use crate::FEATURE_FLAGS;
 
     #[test]
     fn normalized_clamps_min_memory_to_max_memory() {
@@ -204,6 +243,7 @@ mod tests {
 
         assert_eq!(config.launch_auth_mode, LAUNCH_AUTH_MODE_OFFLINE);
         assert!(!config.telemetry_enabled);
+        assert!(config.telemetry_install_id.is_empty());
         assert!(config.discord_rpc_enabled);
         assert!(!config.discord_rpc_onboarding_seen);
         assert_eq!(
@@ -213,6 +253,69 @@ mod tests {
                 .launch_auth_mode,
             LAUNCH_AUTH_MODE_OFFLINE
         );
+    }
+
+    #[test]
+    fn missing_feature_overrides_deserializes_to_empty_map() {
+        let config = serde_json::from_value::<AppConfig>(serde_json::json!({
+            "username": "Player",
+            "max_memory_mb": 4096,
+            "min_memory_mb": 512
+        }))
+        .expect("missing feature overrides should deserialize");
+
+        assert!(config.feature_overrides.is_empty());
+    }
+
+    #[test]
+    fn normalized_prunes_unknown_feature_overrides() {
+        let known_key = FEATURE_FLAGS[0].key;
+        let config = AppConfig {
+            feature_overrides: [
+                (known_key.to_string(), true),
+                ("retired.flag".to_string(), true),
+            ]
+            .into(),
+            ..AppConfig::default()
+        }
+        .normalized()
+        .expect("config should normalize");
+
+        assert_eq!(config.feature_overrides.len(), 1);
+        assert_eq!(config.feature_overrides.get(known_key), Some(&true));
+        assert!(!config.feature_overrides.contains_key("retired.flag"));
+    }
+
+    #[test]
+    fn normalized_trims_and_soft_repairs_telemetry_install_id() {
+        let config = AppConfig {
+            telemetry_enabled: true,
+            telemetry_install_id: "  123e4567-e89b-12d3-a456-426614174000  ".to_string(),
+            ..AppConfig::default()
+        }
+        .normalized()
+        .expect("config should normalize");
+
+        assert_eq!(
+            config.telemetry_install_id,
+            "123e4567-e89b-12d3-a456-426614174000"
+        );
+
+        for invalid in [
+            "123e4567e89b12d3a456426614174000",
+            "123e4567-e89b-12d3-a456-42661417400z",
+            "not-a-uuid",
+        ] {
+            let config = AppConfig {
+                telemetry_enabled: true,
+                telemetry_install_id: invalid.to_string(),
+                ..AppConfig::default()
+            }
+            .normalized()
+            .expect("invalid install id should soft repair");
+
+            assert!(config.telemetry_install_id.is_empty());
+        }
     }
 
     #[test]

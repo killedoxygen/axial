@@ -6,12 +6,14 @@ import type { Instance } from './types-instance';
 import type { Config, SystemInfo } from './types-settings';
 import type { Page, ToastItem } from './types-ui';
 import type { UpdateInfo } from './types-update';
+import type { FeatureFlagViewModel } from './types-flags';
 
 export const instances = signal<Instance[]>([]);
 export const versions = signal<Version[]>([]);
 export const config = signal<Config | null>(null);
 export const systemInfo = signal<SystemInfo | null>(null);
 export const devMode = signal(false);
+export const featureFlags = signal<FeatureFlagViewModel[] | null>(null);
 export const catalog = signal<Catalog | null>(null);
 export const lastInstanceId = signal<string | null>(null);
 
