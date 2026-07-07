@@ -1,110 +1,259 @@
 import type { JSX } from 'preact';
-import { useState } from 'preact/hooks';
+import { useEffect, useState } from 'preact/hooks';
 import './dev-lab.css';
-import { InstanceTile, nextArtSeed } from '../../ui/InstanceVisual';
-import { Button, Card, Input, SectionHeading } from '../../ui/Atoms';
-import { hashStr } from '../../tokens';
-import type { Instance } from '../../types-instance';
+import { flagEnabled, setFlagOverride } from '../../flags';
+import { Sound } from '../../sound';
+import { PRESET_HUES } from '../../state';
+import {
+  bootstrapState,
+  config,
+  featureFlags,
+  installQueueState,
+  launchState,
+  runningSessions,
+  systemInfo,
+  updateInfo,
+} from '../../store';
+import { applyTheme, resetThemeToDefault } from '../../theme';
+import { toast } from '../../toast';
+import type { FeatureFlagViewModel } from '../../types-flags';
+import type { ToastKind } from '../../types-ui';
+import { Button, Card, Pill, Toggle } from '../../ui/Atoms';
+import { Icon } from '../../ui/Icons';
+import { route } from '../../ui-state';
 
-type LabTab = 'identity';
+type LabTab = 'flags' | 'inspector' | 'playground';
+type SoundKind = Parameters<typeof Sound.ui>[0];
 
-function demoInstance(name: string, versionId: string, seed: number): Instance {
-  return {
-    id: `dev-lab-${seed.toString(36)}`,
-    name,
-    version_id: versionId,
-    created_at: new Date(0).toISOString(),
-    art_seed: seed,
-  };
+const TOAST_KINDS: ToastKind[] = ['success', 'info', 'error'];
+
+const SOUND_KINDS: Array<{ kind: SoundKind; label: string; value?: number }> = [
+  { kind: 'soft', label: 'Soft' },
+  { kind: 'click', label: 'Click' },
+  { kind: 'bright', label: 'Bright' },
+  { kind: 'affirm', label: 'Affirm' },
+  { kind: 'theme', label: 'Theme' },
+  { kind: 'slider', label: 'Slider', value: 0.7 },
+  { kind: 'launchPress', label: 'Launch press' },
+  { kind: 'launchSuccess', label: 'Launch success' },
+];
+
+function formatJson(value: unknown): string {
+  try {
+    return JSON.stringify(value, null, 2) ?? 'undefined';
+  } catch {
+    return '[Unable to serialize value]';
+  }
 }
 
-function parseSeed(value: string): number {
-  const parsed = Number.parseInt(value, 10);
-  if (!Number.isFinite(parsed) || parsed <= 0) return 1;
-  return parsed >>> 0 || 1;
+function titleCase(value: string): string {
+  return value
+    .split(/[-_ ]+/)
+    .filter(Boolean)
+    .map((part) => part.slice(0, 1).toUpperCase() + part.slice(1))
+    .join(' ');
 }
 
-function IdentityWorkbench(): JSX.Element {
-  const [name, setName] = useState('Moonlit Forge');
-  const [versionId, setVersionId] = useState('1.21.1');
-  const [seed, setSeed] = useState(hashStr('Moonlit Forge:1.21.1') || 1);
-  const inst = demoInstance(name || 'Untitled instance', versionId || 'unknown', seed);
+function FlagRow({ flag }: { flag: FeatureFlagViewModel }): JSX.Element {
+  const custom = flag.source === 'override';
+  return (
+    <div class="cp-dev-flag-row">
+      <div class="cp-dev-flag-main">
+        <div class="cp-dev-flag-head">
+          <span class="cp-dev-flag-title">{flag.title}</span>
+          <code class="cp-dev-flag-key">{flag.key}</code>
+          <span class="cp-dev-flag-meta">
+            <Pill tone={flag.stage === 'beta' ? 'info' : 'warn'}>{flag.stage}</Pill>
+            {flag.dev_only && <Pill>dev only</Pill>}
+            {custom && <Pill tone="accent">custom</Pill>}
+          </span>
+        </div>
+        <div class="cp-dev-flag-description">{flag.description}</div>
+      </div>
+      <div class="cp-dev-flag-controls">
+        {custom && (
+          <Button variant="ghost" size="sm" icon="refresh" onClick={() => void setFlagOverride(flag.key, null)}>
+            Reset
+          </Button>
+        )}
+        <span class="cp-dev-flag-state" data-on={flag.enabled}>
+          <span>{flag.enabled ? 'Enabled' : 'Disabled'}</span>
+          <Toggle on={flag.enabled} onChange={() => void setFlagOverride(flag.key, !flag.enabled)} />
+        </span>
+      </div>
+    </div>
+  );
+}
 
-  const randomize = (): void => {
-    setSeed(nextArtSeed(seed ^ Date.now()));
-  };
+function FlagsPanel(): JSX.Element {
+  const flags = featureFlags.value;
 
-  const derive = (): void => {
-    setSeed(hashStr(`${name || 'Untitled instance'}:${versionId || 'unknown'}`) || 1);
-  };
+  if (!flags) {
+    return (
+      <div class="cp-dev-loading" role="status">
+        Feature flags are still loading.
+      </div>
+    );
+  }
+
+  if (flags.length === 0) {
+    return (
+      <div class="cp-dev-empty" role="status">
+        No feature flags are available.
+      </div>
+    );
+  }
 
   return (
-    <div class="cp-dev-lab-stack">
-      <Card>
-        <SectionHeading
-          title="Instance identity tiles"
-          right={
-            <div class="cp-dev-lab-actions">
-              <Button variant="secondary" size="sm" icon="refresh" onClick={derive}>
-                Derive
-              </Button>
-              <Button size="sm" icon="refresh" onClick={randomize}>
-                Randomize
-              </Button>
-            </div>
-          }
-        />
-        <div class="cp-dev-art-controls">
-          <label>
-            <span>Name</span>
-            <Input value={name} onChange={setName} placeholder="Instance name" />
-          </label>
-          <label>
-            <span>Version hint</span>
-            <Input value={versionId} onChange={setVersionId} placeholder="1.21.1" />
-          </label>
-          <label>
-            <span>Seed</span>
-            <Input value={String(seed)} onChange={(value) => setSeed(parseSeed(value))} type="number" />
-          </label>
-        </div>
-      </Card>
+    <div class="cp-dev-sheet">
+      <div class="cp-dev-flag-list">
+        {flags.map((flag) => (
+          <FlagRow key={flag.key} flag={flag} />
+        ))}
+      </div>
+    </div>
+  );
+}
 
-      <Card padding={12}>
-        <div class="cp-dev-preview-label">Tile fallback sizes</div>
-        <div class="cp-dev-thumb-row">
-          {[36, 52, 68, 96, 160].map((size) => (
-            <InstanceTile
-              key={size}
-              inst={inst}
-              radius={Math.max(10, Math.round(size * 0.22))}
-              style={{ width: size, height: size }}
-            />
-          ))}
-        </div>
-      </Card>
+function InspectorPanel(): JSX.Element {
+  const items = [
+    { key: 'bootstrapState', title: 'bootstrapState', value: bootstrapState.value, open: true },
+    { key: 'config', title: 'config', value: config.value },
+    { key: 'systemInfo', title: 'systemInfo', value: systemInfo.value },
+    { key: 'installQueueState', title: 'installQueueState', value: installQueueState.value },
+    { key: 'launchState', title: 'launchState', value: launchState.value },
+    { key: 'runningSessions', title: 'runningSessions', value: runningSessions.value },
+    { key: 'updateInfo', title: 'updateInfo', value: updateInfo.value },
+    { key: 'route', title: 'route', value: route.value, open: true },
+  ];
+
+  return (
+    <div class="cp-dev-sheet cp-dev-inspector">
+      {items.map((item) => (
+        <details key={item.key} class="cp-dev-inspector-row" open={item.open}>
+          <summary>
+            <Icon name="chevron-right" size={14} stroke={2} />
+            <span class="cp-dev-inspector-name">{item.title}</span>
+          </summary>
+          <div class="cp-dev-inspector-body">
+            <pre>{formatJson(item.value)}</pre>
+          </div>
+        </details>
+      ))}
+    </div>
+  );
+}
+
+function ToastPlayground(): JSX.Element {
+  return (
+    <Card class="cp-dev-play-card">
+      <div class="cp-dev-play-head">
+        <div class="cp-dev-play-title">Toasts</div>
+        <div class="cp-dev-play-hint">Fire a test toast in each tone.</div>
+      </div>
+      <div class="cp-dev-play-actions">
+        {TOAST_KINDS.map((kind) => (
+          <Button key={kind} variant="secondary" size="sm" onClick={() => toast('Test toast', kind)}>
+            {titleCase(kind)}
+          </Button>
+        ))}
+      </div>
+    </Card>
+  );
+}
+
+function SoundPlayground(): JSX.Element {
+  return (
+    <Card class="cp-dev-play-card">
+      <div class="cp-dev-play-head">
+        <div class="cp-dev-play-title">Sounds</div>
+        <div class="cp-dev-play-hint">Audition the interface sound cues.</div>
+      </div>
+      <div class="cp-dev-play-actions">
+        {SOUND_KINDS.map(({ kind, label, value }) => (
+          <Button key={kind} variant="secondary" size="sm" onClick={() => Sound.ui(kind, value)}>
+            {label}
+          </Button>
+        ))}
+      </div>
+    </Card>
+  );
+}
+
+function ThemePlayground(): JSX.Element {
+  return (
+    <Card class="cp-dev-play-card">
+      <div class="cp-dev-play-head">
+        <div class="cp-dev-play-title">Theme</div>
+        <div class="cp-dev-play-hint">Apply a preset hue to the live theme.</div>
+      </div>
+      <div class="cp-dev-play-actions">
+        {Object.entries(PRESET_HUES).map(([theme, hue]) => (
+          <Button key={theme} variant="secondary" size="sm" onClick={() => applyTheme(theme, hue)}>
+            <span class="cp-dev-theme-button">
+              <span class="cp-dev-theme-swatch" style={{ ['--cp-dev-hue' as any]: hue }} />
+              {titleCase(theme)}
+            </span>
+          </Button>
+        ))}
+        <Button variant="ghost" size="sm" icon="refresh" onClick={() => resetThemeToDefault()}>
+          Reset
+        </Button>
+      </div>
+    </Card>
+  );
+}
+
+function PlaygroundPanel(): JSX.Element {
+  return (
+    <div class="cp-dev-playground-grid">
+      <ToastPlayground />
+      <SoundPlayground />
+      <ThemePlayground />
     </div>
   );
 }
 
 export function DevLabView(): JSX.Element {
-  const [tab, setTab] = useState<LabTab>('identity');
+  const [tab, setTab] = useState<LabTab>('flags');
+  const inspectorAvailable = flagEnabled('dev.state-inspector');
+  const activeTab = tab === 'inspector' && !inspectorAvailable ? 'flags' : tab;
+
+  useEffect(() => {
+    if (tab === 'inspector' && !inspectorAvailable) setTab('flags');
+  }, [tab, inspectorAvailable]);
+
   return (
     <div class="cp-view-page cp-dev-lab">
       <div class="cp-page-header">
         <div>
           <h1>Dev lab</h1>
-          <div class="cp-page-sub">Developer-only workbench for internal generators and UI experiments.</div>
+          <div class="cp-page-sub">Developer workbench: feature flags, live state inspector, and UI playgrounds.</div>
         </div>
       </div>
 
       <div class="cp-dev-tabs">
-        <button type="button" data-active={tab === 'identity'} onClick={() => setTab('identity')}>
-          Identity tiles
+        <button type="button" data-active={activeTab === 'flags'} onClick={() => setTab('flags')}>
+          <Icon name="sliders" size={15} stroke={1.8} />
+          Flags
+        </button>
+        {inspectorAvailable && (
+          <button type="button" data-active={activeTab === 'inspector'} onClick={() => setTab('inspector')}>
+            <Icon name="activity" size={15} stroke={1.8} />
+            Inspector
+          </button>
+        )}
+        <button type="button" data-active={activeTab === 'playground'} onClick={() => setTab('playground')}>
+          <Icon name="sparkles" size={15} stroke={1.8} />
+          Playground
         </button>
       </div>
 
-      {tab === 'identity' && <IdentityWorkbench />}
+      <div class="cp-dev-tab-panel">
+        {activeTab === 'flags' && <FlagsPanel />}
+        {activeTab === 'inspector' && inspectorAvailable && <InspectorPanel />}
+        {activeTab === 'playground' && <PlaygroundPanel />}
+      </div>
     </div>
   );
 }
