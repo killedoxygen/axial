@@ -357,7 +357,7 @@ export async function mockApi<T>(method: string, path: string, body?: unknown): 
   const key = handlerKey(normalizedMethod, normalizedPath);
   const handler = handlers[key];
   if (!handler) throw missingHandlerError(key);
-  return (await handler(body, normalizedPath, request)) as T;
+  return cloneJsonResponse(await handler(body, normalizedPath, request)) as T;
 }
 
 function handlerKey(method: string, path: string): string {
@@ -676,6 +676,11 @@ function errorMessage(status: number, statusText: string, payload: unknown): str
     return payload.error.trim();
   }
   return `Request failed with HTTP ${status}${statusText ? ` ${statusText}` : ''}`;
+}
+
+function cloneJsonResponse(value: unknown): unknown {
+  if (value === undefined || value === null) return value;
+  return JSON.parse(JSON.stringify(value));
 }
 
 function normalizeRequest(path: string): MockRequest {
