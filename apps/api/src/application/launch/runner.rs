@@ -115,6 +115,12 @@ pub async fn launch_session(
         .with_resource_budget(resource_budget);
     let mut attempt = croopor_launcher::service::AttemptOverrides::default();
     let mut last_recovery_plan: Option<GuardianLaunchRecoveryPlan> = None;
+    let mut launch_completion_pending = false;
+    emit_launch_started(
+        &state,
+        &mut launch_completion_pending,
+        Some(intent.loader.clone()),
+    );
 
     loop {
         trace_launch_event(&session_id, "launch_session entered");
@@ -173,17 +179,22 @@ pub async fn launch_session(
                             .raw_jvm_args_intervention_applied,
                     });
                 if let Some(directive) = prepare_outcome.directive.clone() {
-                    let recovery_plan = plan_guardian_launch_recovery_directive(
+                    let recovery_plan = match plan_guardian_launch_recovery_directive(
                         &session_id,
                         &intent,
                         directive,
                         launch_policy_guardian_mode(intent.guardian.mode),
-                    )
-                    .map_err(|_| LaunchRequestError {
-                        message: prepare_outcome.user_outcome.summary.clone(),
-                        healing: error.healing.clone(),
-                        guardian: Some(guardian.clone()),
-                    })?;
+                    ) {
+                        Ok(recovery_plan) => recovery_plan,
+                        Err(_) => {
+                            emit_pending_launch_failure(&state, &mut launch_completion_pending);
+                            return Err(LaunchRequestError {
+                                message: prepare_outcome.user_outcome.summary.clone(),
+                                healing: error.healing.clone(),
+                                guardian: Some(guardian.clone()),
+                            });
+                        }
+                    };
                     let recovery_outcome = record_guardian_launch_recovery_attempt(
                         &state,
                         &session_id,
@@ -202,6 +213,7 @@ pub async fn launch_session(
                             &mut guardian,
                             &recovery_user_outcome,
                         );
+                        emit_pending_launch_failure(&state, &mut launch_completion_pending);
                         return Err(fail_launch(
                             &state,
                             &session_id,
@@ -233,6 +245,7 @@ pub async fn launch_session(
                     failure_class,
                 )
                 .await;
+                emit_pending_launch_failure(&state, &mut launch_completion_pending);
                 return Err(fail_launch(
                     &state,
                     &session_id,
@@ -341,6 +354,7 @@ pub async fn launch_session(
                     LaunchFailureClass::Unknown,
                 )
                 .await;
+                emit_pending_launch_failure(&state, &mut launch_completion_pending);
                 return Err(fail_launch(
                     &state,
                     &session_id,
@@ -368,6 +382,7 @@ pub async fn launch_session(
                 LaunchFailureClass::Unknown,
             )
             .await;
+            emit_pending_launch_failure(&state, &mut launch_completion_pending);
             return Err(fail_launch(
                 &state,
                 &session_id,
@@ -456,9 +471,11 @@ pub async fn launch_session(
                     .sessions()
                     .record_stage_evidence(&session_id, launch_spawn_failed_stage_evidence())
                     .await;
-                state.telemetry().emit(TelemetryEvent::launch_completed(
+                emit_launch_completed(
+                    &state,
+                    &mut launch_completion_pending,
                     TelemetryLaunchOutcome::Failure,
-                ));
+                );
                 state.telemetry().emit(TelemetryEvent::error_captured(
                     TelemetryErrorKind::LaunchSpawnFailed,
                     TelemetryErrorArea::Launch,
@@ -489,9 +506,6 @@ pub async fn launch_session(
             }
         };
         trace_launch_event(&session_id, &format!("spawned pid={:?}", launched.pid));
-        state
-            .telemetry()
-            .emit(TelemetryEvent::launch_started(Some(intent.loader.clone())));
 
         emit_status(
             &state,
@@ -511,9 +525,11 @@ pub async fn launch_session(
 
         match outcome {
             StartupOutcome::Stable | StartupOutcome::TimedOut => {
-                state.telemetry().emit(TelemetryEvent::launch_completed(
+                emit_launch_completed(
+                    &state,
+                    &mut launch_completion_pending,
                     TelemetryLaunchOutcome::Success,
-                ));
+                );
                 emit_status(
                     &state,
                     &session_id,
@@ -553,9 +569,6 @@ pub async fn launch_session(
                 });
             }
             StartupOutcome::Exited | StartupOutcome::Stalled => {
-                state.telemetry().emit(TelemetryEvent::launch_completed(
-                    TelemetryLaunchOutcome::Failure,
-                ));
                 let stalled = matches!(outcome, StartupOutcome::Stalled);
                 if stalled {
                     let _ = state.sessions().kill(&session_id).await;
@@ -595,22 +608,31 @@ pub async fn launch_session(
                     failure_class.as_str(),
                 ));
                 if let Some(directive) = startup_outcome.directive.clone() {
-                    let recovery_plan = plan_guardian_launch_recovery_directive(
+                    let recovery_plan = match plan_guardian_launch_recovery_directive(
                         &session_id,
                         &intent,
                         directive,
                         launch_policy_guardian_mode(intent.guardian.mode),
-                    )
-                    .map_err(|_| LaunchRequestError {
-                        message: startup_outcome.user_outcome.summary.clone(),
-                        healing: startup_failure_healing(
-                            &intent,
-                            &prepared,
-                            &attempt,
-                            failure_class,
-                        ),
-                        guardian: Some(guardian.clone()),
-                    })?;
+                    ) {
+                        Ok(recovery_plan) => recovery_plan,
+                        Err(_) => {
+                            emit_launch_completed(
+                                &state,
+                                &mut launch_completion_pending,
+                                TelemetryLaunchOutcome::Failure,
+                            );
+                            return Err(LaunchRequestError {
+                                message: startup_outcome.user_outcome.summary.clone(),
+                                healing: startup_failure_healing(
+                                    &intent,
+                                    &prepared,
+                                    &attempt,
+                                    failure_class,
+                                ),
+                                guardian: Some(guardian.clone()),
+                            });
+                        }
+                    };
                     let recovery_outcome = record_guardian_launch_recovery_attempt(
                         &state,
                         &session_id,
@@ -631,6 +653,11 @@ pub async fn launch_session(
                         );
                         let healing =
                             startup_failure_healing(&intent, &prepared, &attempt, failure_class);
+                        emit_launch_completed(
+                            &state,
+                            &mut launch_completion_pending,
+                            TelemetryLaunchOutcome::Failure,
+                        );
                         return Err(fail_launch(
                             &state,
                             &session_id,
@@ -664,6 +691,11 @@ pub async fn launch_session(
                 )
                 .await;
                 block_guardian_with_user_outcome(&mut guardian, &startup_outcome.user_outcome);
+                emit_launch_completed(
+                    &state,
+                    &mut launch_completion_pending,
+                    TelemetryLaunchOutcome::Failure,
+                );
                 return Err(fail_launch(
                     &state,
                     &session_id,
@@ -677,6 +709,44 @@ pub async fn launch_session(
             }
         }
     }
+}
+
+fn emit_launch_started(
+    state: &AppState,
+    launch_completion_pending: &mut bool,
+    loader_key: Option<String>,
+) {
+    if *launch_completion_pending {
+        return;
+    }
+
+    state
+        .telemetry()
+        .emit(TelemetryEvent::launch_started(loader_key));
+    *launch_completion_pending = true;
+}
+
+fn emit_launch_completed(
+    state: &AppState,
+    launch_completion_pending: &mut bool,
+    outcome: TelemetryLaunchOutcome,
+) {
+    state
+        .telemetry()
+        .emit(TelemetryEvent::launch_completed(outcome));
+    *launch_completion_pending = false;
+}
+
+fn emit_pending_launch_failure(state: &AppState, launch_completion_pending: &mut bool) {
+    if !*launch_completion_pending {
+        return;
+    }
+
+    emit_launch_completed(
+        state,
+        launch_completion_pending,
+        TelemetryLaunchOutcome::Failure,
+    );
 }
 
 async fn repair_legacy_virtual_assets_before_launch(
@@ -732,8 +802,9 @@ pub fn trace_launch_event(session_id: &str, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::observability::telemetry::{DEFAULT_POSTHOG_HOST, TelemetryHub};
     use crate::state::{AppStateInit, InstallStore, LaunchEvent, SessionStore};
-    use croopor_config::{AppPaths, ConfigStore, InstanceStore};
+    use croopor_config::{AppConfig, AppPaths, ConfigStore, InstanceStore};
     use croopor_launcher::{LaunchSessionRecord, SessionId};
     use croopor_performance::PerformanceManager;
     use std::fs;
@@ -741,6 +812,59 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    const TEST_TELEMETRY_INSTALL_ID: &str = "123e4567-e89b-12d3-a456-426614174000";
+    const TEST_TELEMETRY_KEY: &str = "phc_test";
+
+    #[test]
+    fn launch_started_emits_once_while_completion_is_pending() {
+        let root = unique_test_dir("launch-started-once");
+        let state = test_app_state_with_telemetry(&root);
+        let mut pending = false;
+
+        emit_launch_started(&state, &mut pending, Some("fabric".to_string()));
+        assert!(pending);
+
+        let queued = state.telemetry().queued_batch_for_test();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0]["event"], "launch_started");
+        assert_eq!(queued[0]["properties"]["loader_key"], "fabric");
+
+        emit_launch_started(&state, &mut pending, Some("neoforge".to_string()));
+        let queued = state.telemetry().queued_batch_for_test();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0]["properties"]["loader_key"], "fabric");
+
+        emit_launch_completed(&state, &mut pending, TelemetryLaunchOutcome::Success);
+        assert!(!pending);
+        assert_eq!(state.telemetry().queue_len_for_test(), 2);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pending_launch_failure_emits_once_only_when_completion_is_pending() {
+        let root = unique_test_dir("pending-launch-failure");
+        let state = test_app_state_with_telemetry(&root);
+        let mut pending = false;
+
+        emit_pending_launch_failure(&state, &mut pending);
+        assert_eq!(state.telemetry().queue_len_for_test(), 0);
+
+        pending = true;
+        emit_pending_launch_failure(&state, &mut pending);
+        assert!(!pending);
+
+        let queued = state.telemetry().queued_batch_for_test();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0]["event"], "launch_completed");
+        assert_eq!(queued[0]["properties"]["outcome"], "failure");
+
+        emit_pending_launch_failure(&state, &mut pending);
+        assert_eq!(state.telemetry().queue_len_for_test(), 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[tokio::test]
     async fn runner_records_redacted_command_stage_evidence_into_status() {
@@ -834,6 +958,40 @@ mod tests {
             startup_warnings: Vec::new(),
             frontend_dir: root.join("frontend"),
         })
+    }
+
+    fn test_app_state_with_telemetry(root: &Path) -> AppState {
+        let paths = test_paths(root);
+        let config_store = ConfigStore::load_from(paths.clone()).expect("load config");
+        config_store
+            .update(AppConfig {
+                telemetry_enabled: true,
+                telemetry_install_id: TEST_TELEMETRY_INSTALL_ID.to_string(),
+                ..AppConfig::default()
+            })
+            .expect("seed telemetry config");
+        let config = Arc::new(config_store);
+        let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
+        let telemetry = Arc::new(TelemetryHub::new(
+            config.clone(),
+            Some(TEST_TELEMETRY_KEY.to_string()),
+            DEFAULT_POSTHOG_HOST.to_string(),
+        ));
+
+        AppState::new_with_telemetry(
+            AppStateInit {
+                app_name: "Croopor".to_string(),
+                version: "test".to_string(),
+                config,
+                instances,
+                installs: Arc::new(InstallStore::new()),
+                sessions: Arc::new(SessionStore::new()),
+                performance: Arc::new(PerformanceManager::new().expect("performance manager")),
+                startup_warnings: Vec::new(),
+                frontend_dir: root.join("frontend"),
+            },
+            telemetry,
+        )
     }
 
     fn test_paths(root: &Path) -> AppPaths {

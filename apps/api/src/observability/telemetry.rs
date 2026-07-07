@@ -383,7 +383,7 @@ impl QueuedTelemetryEvent {
         let mut properties = Map::new();
         properties.insert(
             PROP_DISTINCT_ID.to_string(),
-            sanitize_property_value(json!(distinct_id))?,
+            sanitize_distinct_id_property_value(distinct_id)?,
         );
         properties.insert(
             PROP_PROCESS_PERSON_PROFILE.to_string(),
@@ -507,12 +507,7 @@ impl TelemetryHub {
             return None;
         }
 
-        let install_id = config.telemetry_install_id.trim();
-        if install_id.is_empty() {
-            None
-        } else {
-            Some(install_id.to_string())
-        }
+        self.canonicalize_existing_telemetry_install_id(config)
     }
 
     pub fn clear_queue(&self) {
@@ -556,8 +551,8 @@ impl TelemetryHub {
     }
 
     fn telemetry_install_id(&self, mut config: AppConfig) -> Option<String> {
-        if !config.telemetry_install_id.is_empty() {
-            return Some(config.telemetry_install_id);
+        if let Some(install_id) = self.canonicalize_existing_telemetry_install_id(config.clone()) {
+            return Some(install_id);
         }
 
         let install_id = uuid::Uuid::new_v4().to_string();
@@ -566,6 +561,21 @@ impl TelemetryHub {
             Ok(_) => Some(install_id),
             Err(_) => None,
         }
+    }
+
+    fn canonicalize_existing_telemetry_install_id(&self, mut config: AppConfig) -> Option<String> {
+        let raw = config.telemetry_install_id.trim();
+        if raw.is_empty() {
+            return None;
+        }
+
+        let install_id = sanitize_distinct_id(raw)?;
+        if install_id != raw {
+            config.telemetry_install_id = install_id.clone();
+            let _ = self.config.update(config);
+        }
+
+        Some(install_id)
     }
 
     fn can_send_now(&self) -> bool {
@@ -728,6 +738,24 @@ fn sanitize_property_value(value: Value) -> Option<Value> {
         MAX_PROPERTY_TEXT_CHARS,
         MAX_PROPERTY_TOKEN_CHARS,
     )
+}
+
+fn sanitize_distinct_id_property_value(value: &str) -> Option<Value> {
+    sanitize_distinct_id(value).map(Value::String)
+}
+
+fn sanitize_distinct_id(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.len() != 36 {
+        return None;
+    }
+
+    let canonical = uuid::Uuid::parse_str(value).ok()?.to_string();
+    if canonical.eq_ignore_ascii_case(value) {
+        Some(canonical)
+    } else {
+        None
+    }
 }
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {
@@ -1206,6 +1234,66 @@ mod tests {
         assert_eq!(queued.len(), 1);
         assert!(queued[0]["properties"]["loader_key"].is_null());
         assert_eq!(queued[0]["properties"][PROP_DISTINCT_ID], TEST_INSTALL_ID);
+    }
+
+    #[test]
+    fn distinct_id_sanitizer_allows_only_canonical_uuid_identity() {
+        assert_eq!(
+            sanitize_distinct_id_property_value("  123E4567-E89B-12D3-A456-426614174000  "),
+            Some(json!(TEST_INSTALL_ID))
+        );
+        assert_eq!(
+            sanitize_distinct_id_property_value("123e4567e89b12d3a456426614174000"),
+            None
+        );
+        assert_eq!(
+            sanitize_distinct_id_property_value(
+                "/Users/alice/123e4567-e89b-12d3-a456-426614174000"
+            ),
+            None
+        );
+        assert_eq!(sanitize_distinct_id_property_value("not-a-uuid"), None);
+    }
+
+    #[test]
+    fn queued_event_rejects_non_uuid_distinct_id() {
+        assert!(
+            QueuedTelemetryEvent::from_event(
+                TelemetryEvent::launch_completed(TelemetryLaunchOutcome::Success),
+                "not-a-uuid",
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn current_telemetry_install_id_canonicalizes_and_repairs_uppercase_uuid() {
+        let fixture = TestConfig::new(
+            "canonical-install-id",
+            AppConfig {
+                telemetry_enabled: true,
+                telemetry_install_id: TEST_INSTALL_ID.to_ascii_uppercase(),
+                ..AppConfig::default()
+            },
+        );
+        let hub = test_hub(fixture.store.clone());
+
+        assert_eq!(
+            hub.current_telemetry_install_id().as_deref(),
+            Some(TEST_INSTALL_ID)
+        );
+        assert_eq!(
+            fixture.store.current().telemetry_install_id,
+            TEST_INSTALL_ID
+        );
+
+        hub.emit(TelemetryEvent::launch_completed(
+            TelemetryLaunchOutcome::Success,
+        ));
+        assert_eq!(
+            hub.queued_batch_for_test()[0]["properties"][PROP_DISTINCT_ID],
+            TEST_INSTALL_ID
+        );
     }
 
     #[test]

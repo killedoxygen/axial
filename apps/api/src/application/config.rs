@@ -121,6 +121,8 @@ pub fn update_config(state: &AppState, patch: ConfigPatch) -> Result<AppConfig, 
         next.library_mode = library_mode;
     }
 
+    let telemetry_enabled_after_patch = next.telemetry_enabled;
+
     match state.update_config(next) {
         Ok(config) => {
             if config.library_dir != previous_library_dir {
@@ -133,14 +135,18 @@ pub fn update_config(state: &AppState, patch: ConfigPatch) -> Result<AppConfig, 
             Ok(config)
         }
         Err(error) => {
-            emit_config_save_failed(state, &error);
+            emit_config_save_failed(state, &error, telemetry_enabled_after_patch);
             Err(config_update_error_response(error))
         }
     }
 }
 
-fn emit_config_save_failed(state: &AppState, error: &ConfigStoreError) {
-    if matches!(error, ConfigStoreError::Validation(_)) {
+fn emit_config_save_failed(
+    state: &AppState,
+    error: &ConfigStoreError,
+    telemetry_enabled_after_patch: bool,
+) {
+    if !telemetry_enabled_after_patch || matches!(error, ConfigStoreError::Validation(_)) {
         return;
     }
     state.telemetry().emit(TelemetryEvent::error_captured(
@@ -179,7 +185,10 @@ fn config_account_sync_error_response(error: std::io::Error) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::{CONFIG_SAVE_ERROR_MESSAGE, ConfigPatch, config_update_error_response};
-    use crate::state::{AppState, AppStateInit, InstallStore, SessionStore};
+    use crate::{
+        observability::telemetry::{DEFAULT_POSTHOG_HOST, TelemetryHub},
+        state::{AppState, AppStateInit, InstallStore, SessionStore},
+    };
     use axum::Json;
     use croopor_config::{
         AppConfig, AppConfigValidationError, AppPaths, ConfigStore, ConfigStoreError, InstanceStore,
@@ -191,6 +200,9 @@ mod tests {
         sync::Arc,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    const TEST_TELEMETRY_KEY: &str = "phc_test";
+    const TEST_TELEMETRY_INSTALL_ID: &str = "123e4567-e89b-12d3-a456-426614174000";
 
     #[test]
     fn config_patch_accepts_telemetry_enabled() {
@@ -303,6 +315,51 @@ mod tests {
             .expect("config change sender should remain open");
     }
 
+    #[test]
+    fn config_save_failure_emits_when_requested_config_keeps_telemetry_enabled() {
+        let fixture = TestFixture::new("config-save-failure-emit");
+        fixture.seed_config(AppConfig {
+            telemetry_enabled: true,
+            telemetry_install_id: TEST_TELEMETRY_INSTALL_ID.to_string(),
+            ..AppConfig::default()
+        });
+        fixture.block_config_dir();
+
+        let result = super::update_config(
+            &fixture.state,
+            ConfigPatch {
+                discord_rpc_enabled: Some(false),
+                ..ConfigPatch::default()
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(fixture.state.telemetry().queue_len_for_test(), 1);
+    }
+
+    #[test]
+    fn config_save_failure_does_not_emit_when_request_disables_telemetry() {
+        let fixture = TestFixture::new("config-save-failure-disable-telemetry");
+        fixture.seed_config(AppConfig {
+            telemetry_enabled: true,
+            telemetry_install_id: TEST_TELEMETRY_INSTALL_ID.to_string(),
+            ..AppConfig::default()
+        });
+        fixture.block_config_dir();
+
+        let result = super::update_config(
+            &fixture.state,
+            ConfigPatch {
+                telemetry_enabled: Some(false),
+                ..ConfigPatch::default()
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(fixture.state.config().current().telemetry_enabled);
+        assert_eq!(fixture.state.telemetry().queue_len_for_test(), 0);
+    }
+
     struct TestFixture {
         state: AppState,
         root: PathBuf,
@@ -318,19 +375,40 @@ mod tests {
                 .expect("set config");
             let instances =
                 Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
-            let state = AppState::new(AppStateInit {
-                app_name: "Croopor".to_string(),
-                version: "test".to_string(),
-                config,
-                instances,
-                installs: Arc::new(InstallStore::new()),
-                sessions: Arc::new(SessionStore::new()),
-                performance: Arc::new(PerformanceManager::new().expect("performance manager")),
-                startup_warnings: Vec::new(),
-                frontend_dir: root.join("frontend"),
-            });
+            let telemetry = Arc::new(TelemetryHub::new(
+                config.clone(),
+                Some(TEST_TELEMETRY_KEY.to_string()),
+                DEFAULT_POSTHOG_HOST.to_string(),
+            ));
+            let state = AppState::new_with_telemetry(
+                AppStateInit {
+                    app_name: "Croopor".to_string(),
+                    version: "test".to_string(),
+                    config,
+                    instances,
+                    installs: Arc::new(InstallStore::new()),
+                    sessions: Arc::new(SessionStore::new()),
+                    performance: Arc::new(PerformanceManager::new().expect("performance manager")),
+                    startup_warnings: Vec::new(),
+                    frontend_dir: root.join("frontend"),
+                },
+                telemetry,
+            );
 
             Self { state, root }
+        }
+
+        fn seed_config(&self, config: AppConfig) {
+            self.state
+                .config()
+                .replace_in_memory(config)
+                .expect("seed config");
+        }
+
+        fn block_config_dir(&self) {
+            fs::create_dir_all(&self.root).expect("create test root");
+            fs::write(self.root.join("config"), "not a directory")
+                .expect("block config directory with file");
         }
     }
 
