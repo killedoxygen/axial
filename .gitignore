@@ -1,6 +1,7 @@
 *.tar.gz
 *.syso
 *.exe
+.DS_Store
 .tools/
 .cache/
 dist/
