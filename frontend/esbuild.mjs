@@ -11,6 +11,7 @@ const portOverride = process.env.PORT;
 const defaultDevPort = 3000;
 const webApiBase = process.env.CROOPOR_WEB_API_BASE ?? 'http://127.0.0.1:43430';
 const enableDevLab = mode === 'serve' || mode === 'watch';
+const enableMockApi = mode === 'serve' && process.argv.includes('--mock');
 
 const reactCompatAliases = new Map([
   ['react', 'preact/compat'],
@@ -56,6 +57,7 @@ const shared = {
   define: {
     __CROOPOR_WEB_API_BASE__: JSON.stringify(webApiBase),
     __CROOPOR_ENABLE_DEV_LAB__: JSON.stringify(enableDevLab),
+    __CROOPOR_MOCK_API__: JSON.stringify(enableMockApi),
   },
   plugins: [openaiIconSubsetPlugin, preactCompatAliasPlugin],
 };

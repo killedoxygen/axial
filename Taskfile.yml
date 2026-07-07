@@ -94,6 +94,11 @@ tasks:
     cmds:
       - pnpm --dir frontend run dev
 
+  dev:web:mock:
+    desc: run the frontend-only dev server with a mocked API (no backend needed)
+    cmds:
+      - pnpm --dir frontend run dev:mock
+
   watch:
     desc: rebuild frontend assets to disk on file changes
     cmds:

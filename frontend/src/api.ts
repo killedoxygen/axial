@@ -68,6 +68,10 @@ export function isApiError(error: unknown): error is ApiError {
 }
 
 export async function api<T = any>(method: string, path: string, body?: unknown): Promise<T> {
+  if (__CROOPOR_MOCK_API__) {
+    const { mockApi } = await import('./mock/api');
+    return mockApi<T>(method, path, body);
+  }
   await initializeApiBase();
   const opts: RequestInit = { method };
   if (body !== undefined) {
