@@ -1,10 +1,11 @@
 import type { JSX } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
 import { api } from '../../api';
+import { setFlagOverride } from '../../flags';
 import { Button, Toggle } from '../../ui/Atoms';
 import { navigate, ROUTE_STORAGE_KEY } from '../../ui-state';
 import { STORAGE_KEY } from '../../state';
-import { config, devMode } from '../../store';
+import { config, devMode, featureFlags } from '../../store';
 import { toast } from '../../toast';
 import { errMessage } from '../../utils';
 import { SettingsCard } from './settings-shared';
@@ -34,6 +35,29 @@ function PerformanceLabSlot(): JSX.Element | null {
   return <Lab />;
 }
 
+const FLAG_STAGE_NOTES = {
+  experimental: 'Experimental — may change or break.',
+  beta: 'Beta — may still change.',
+} as const;
+
+export function ExperimentalFlagsCards(): JSX.Element | null {
+  const flags = featureFlags.value?.filter((flag) => !flag.dev_only) ?? [];
+  if (flags.length === 0) return null;
+
+  return (
+    <>
+      {flags.map((flag) => (
+        <SettingsCard
+          key={flag.key}
+          title={flag.title}
+          desc={`${flag.description} ${FLAG_STAGE_NOTES[flag.stage]}`}
+          control={<Toggle on={flag.enabled} onChange={() => void setFlagOverride(flag.key, !flag.enabled)} />}
+        />
+      ))}
+    </>
+  );
+}
+
 export function AdvancedSettingsSection(): JSX.Element {
   const cfg = config.value;
   const isDev = devMode.value;
@@ -58,7 +82,7 @@ export function AdvancedSettingsSection(): JSX.Element {
       toast('Saved');
     } catch (err) {
       setTelemetryEnabled(savedTelemetry);
-      toast(`Could not save diagnostics setting: ${errMessage(err)}`, 'error');
+      toast(`Could not save anonymous usage stats setting: ${errMessage(err)}`, 'error');
     } finally {
       setSavingTelemetry(false);
     }
@@ -88,8 +112,8 @@ export function AdvancedSettingsSection(): JSX.Element {
   return (
     <>
       <SettingsCard
-        title="Optional diagnostics"
-        desc="Stores diagnostics consent. Current builds do not upload telemetry or open a remote diagnostics channel."
+        title="Anonymous usage stats"
+        desc="Shares anonymous feature-usage and launch-outcome events to improve Croopor. No names, files, or personal data — see docs/TELEMETRY.md. Builds without a telemetry key never upload."
         control={<Toggle on={telemetryEnabled} onChange={() => void toggleTelemetry()} />}
       />
       <SettingsCard
@@ -101,10 +125,11 @@ export function AdvancedSettingsSection(): JSX.Element {
           </Button>
         }
       />
+      <ExperimentalFlagsCards />
       {__CROOPOR_ENABLE_DEV_LAB__ && isDev && (
         <SettingsCard
           title="Dev lab"
-          desc="Developer-only workbench for procedural art and internal experiments."
+          desc="Developer workbench: feature flags, live state inspector, and UI playgrounds."
           control={
             <Button variant="secondary" icon="palette" onClick={() => navigate({ name: 'dev-lab' })}>
               Open lab

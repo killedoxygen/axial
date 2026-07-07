@@ -1,5 +1,8 @@
+use crate::observability::telemetry::{
+    TelemetryEvent, install_panic_capture, run_telemetry_flush_loop,
+};
 use crate::routes;
-use crate::state::AppState;
+use crate::state::{AppState, RemoteFlagRefreshOutcome};
 use axum::{
     Router,
     body::Body,
@@ -24,6 +27,7 @@ pub const PERFORMANCE_RULES_REFRESH_INTERVAL_ENV: &str =
 pub const MIN_PERFORMANCE_RULES_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
 pub const DEFAULT_PERFORMANCE_RULES_REFRESH_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 pub const MAX_PERFORMANCE_RULES_REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+pub const REMOTE_FLAGS_REFRESH_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 static EMBEDDED_FRONTEND: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../frontend/static");
 
 pub fn default_frontend_dir() -> PathBuf {
@@ -70,7 +74,56 @@ pub fn spawn_performance_rules_refresh(state: &AppState) -> bool {
     true
 }
 
+pub fn spawn_remote_flags_refresh(state: &AppState) -> bool {
+    if !state.telemetry().export_configured() {
+        return false;
+    }
+
+    let state = state.clone();
+    tracing::info!(
+        interval_seconds = REMOTE_FLAGS_REFRESH_INTERVAL.as_secs(),
+        "remote feature flags periodic refresh scheduled"
+    );
+    tokio::spawn(run_remote_flags_refresh_loop(
+        move || {
+            let state = state.clone();
+            async move {
+                refresh_remote_flags_once(&state).await;
+            }
+        },
+        REMOTE_FLAGS_REFRESH_INTERVAL,
+    ));
+
+    true
+}
+
+pub fn spawn_telemetry_export(state: &AppState) -> bool {
+    install_panic_capture(state.telemetry().clone());
+    state.telemetry().emit(TelemetryEvent::app_started(
+        state.version(),
+        &state.config().current(),
+    ));
+    if !state.telemetry().export_configured() {
+        return false;
+    }
+
+    let telemetry = state.telemetry().clone();
+    tokio::spawn(run_telemetry_flush_loop(telemetry));
+    true
+}
+
 async fn run_performance_rules_refresh_loop<F, Fut>(mut refresh: F, interval: Duration)
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    loop {
+        refresh().await;
+        tokio::time::sleep(interval).await;
+    }
+}
+
+async fn run_remote_flags_refresh_loop<F, Fut>(mut refresh: F, interval: Duration)
 where
     F: FnMut() -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
@@ -99,6 +152,21 @@ async fn refresh_performance_rules_once(performance: &croopor_performance::Perfo
         }
         Err(error) => {
             tracing::warn!("performance rules background refresh failed: {error}");
+        }
+    }
+}
+
+async fn refresh_remote_flags_once(state: &AppState) {
+    match state.remote_flags().refresh_once(state.telemetry()).await {
+        Ok(RemoteFlagRefreshOutcome::Skipped) => {}
+        Ok(RemoteFlagRefreshOutcome::Refreshed { flag_count }) => {
+            tracing::info!(
+                flag_count,
+                "remote feature flags background refresh finished"
+            );
+        }
+        Err(error) => {
+            tracing::warn!("remote feature flags background refresh failed: {error}");
         }
     }
 }

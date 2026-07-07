@@ -5,7 +5,10 @@ mod state;
 
 use croopor_api::app::{
     spawn_background, spawn_benchmark_suite_drivers_resume, spawn_performance_operations_resume,
-    spawn_performance_rules_refresh,
+    spawn_performance_rules_refresh, spawn_telemetry_export,
+};
+use croopor_api::observability::telemetry::{
+    TelemetryErrorArea, TelemetryErrorKind, TelemetryErrorLevel, TelemetryEvent, TelemetryHub,
 };
 use croopor_api::state::{AppState, AppStateInit, InstallStore, SessionStore};
 use croopor_config::{AppPaths, ConfigStore, InstanceStore};
@@ -49,19 +52,28 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         startup_warnings,
         frontend_dir: croopor_api::app::default_frontend_dir(),
     });
+    let telemetry = state.telemetry().clone();
     let discord_presence = discord_presence::spawn(state.clone());
     spawn_performance_operations_resume(&state);
     spawn_benchmark_suite_drivers_resume(&state);
     spawn_performance_rules_refresh(&state);
+    spawn_telemetry_export(&state);
     let close_event_state = state.clone();
     let close_event_presence = discord_presence.clone();
     let desktop_state = state::DesktopState::new(env!("CARGO_PKG_VERSION").to_string());
 
-    let api = spawn_background(state.clone()).await?;
+    let api = match spawn_background(state.clone()).await {
+        Ok(api) => api,
+        Err(error) => {
+            emit_startup_failed(&telemetry);
+            discord_presence.shutdown_blocking();
+            return Err(Box::new(error));
+        }
+    };
 
     info!("desktop shell connected to {}", api.addr);
 
-    tauri::Builder::default()
+    let run_result = tauri::Builder::default()
         .manage(desktop_state)
         .manage(state)
         .plugin(tauri_plugin_dialog::init())
@@ -117,9 +129,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             });
             Ok(())
         })
-        .run(tauri::generate_context!())?;
+        .run(tauri::generate_context!());
+
+    if let Err(error) = run_result {
+        emit_startup_failed(&telemetry);
+        discord_presence.shutdown_blocking();
+        return Err(Box::new(error));
+    }
 
     discord_presence.shutdown_blocking();
 
     Ok(())
+}
+
+fn emit_startup_failed(telemetry: &Arc<TelemetryHub>) {
+    telemetry.emit_sync_best_effort(TelemetryEvent::error_captured(
+        TelemetryErrorKind::StartupFailed,
+        TelemetryErrorArea::Startup,
+        TelemetryErrorLevel::Error,
+        "Backend startup failed.",
+    ));
 }

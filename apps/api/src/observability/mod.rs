@@ -3,6 +3,8 @@
 //! Observability owns structured events, local evidence, proof records,
 //! redaction scopes, retention, and future telemetry export boundaries.
 
+pub mod telemetry;
+
 use crate::state::contracts::{
     CommandKind, OperationId, OperationJournalEntry, OperationOutcome, OperationStatus,
     RollbackState, StabilizationSystem, TargetDescriptor,

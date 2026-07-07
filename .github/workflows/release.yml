@@ -96,6 +96,9 @@ jobs:
         run: cargo test --workspace --locked
 
       - name: Release desktop build
+        env:
+          # Telemetry key is a public write-only PostHog project token; keyless builds never upload (docs/TELEMETRY.md).
+          CROOPOR_POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
         run: cargo build --locked -p croopor-desktop --release
 
   linux-desktop:
@@ -131,6 +134,8 @@ jobs:
         run: pnpm --dir frontend run build
 
       - name: Build release desktop binary
+        env:
+          CROOPOR_POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
         run: cargo build --locked -p croopor-desktop --release
 
       - name: Package linux desktop binary
@@ -177,6 +182,8 @@ jobs:
         run: pnpm --dir frontend run build
 
       - name: Build release desktop binary
+        env:
+          CROOPOR_POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
         run: cargo build --locked -p croopor-desktop --release
 
       - name: Package windows desktop binary

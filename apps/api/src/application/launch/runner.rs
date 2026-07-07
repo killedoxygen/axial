@@ -17,6 +17,10 @@ use crate::guardian::{
     guardian_prepare_failure_outcome, guardian_startup_failure_outcome,
 };
 use crate::logging::append_trace;
+use crate::observability::telemetry::{
+    TelemetryErrorArea, TelemetryErrorKind, TelemetryErrorLevel, TelemetryEvent,
+    TelemetryLaunchOutcome,
+};
 use crate::state::launch_reports::LaunchProofContext;
 use crate::state::{AppState, StartupOutcome};
 use croopor_launcher::{
@@ -452,6 +456,15 @@ pub async fn launch_session(
                     .sessions()
                     .record_stage_evidence(&session_id, launch_spawn_failed_stage_evidence())
                     .await;
+                state.telemetry().emit(TelemetryEvent::launch_completed(
+                    TelemetryLaunchOutcome::Failure,
+                ));
+                state.telemetry().emit(TelemetryEvent::error_captured(
+                    TelemetryErrorKind::LaunchSpawnFailed,
+                    TelemetryErrorArea::Launch,
+                    TelemetryErrorLevel::Error,
+                    LaunchSessionExitReason::SpawnFailed.summary(),
+                ));
                 trace_launch_event(&session_id, &format!("spawn failed: {error}"));
                 record_failed_self_healing_if_any(
                     &state,
@@ -476,6 +489,9 @@ pub async fn launch_session(
             }
         };
         trace_launch_event(&session_id, &format!("spawned pid={:?}", launched.pid));
+        state
+            .telemetry()
+            .emit(TelemetryEvent::launch_started(Some(intent.loader.clone())));
 
         emit_status(
             &state,
@@ -495,6 +511,9 @@ pub async fn launch_session(
 
         match outcome {
             StartupOutcome::Stable | StartupOutcome::TimedOut => {
+                state.telemetry().emit(TelemetryEvent::launch_completed(
+                    TelemetryLaunchOutcome::Success,
+                ));
                 emit_status(
                     &state,
                     &session_id,
@@ -534,6 +553,9 @@ pub async fn launch_session(
                 });
             }
             StartupOutcome::Exited | StartupOutcome::Stalled => {
+                state.telemetry().emit(TelemetryEvent::launch_completed(
+                    TelemetryLaunchOutcome::Failure,
+                ));
                 let stalled = matches!(outcome, StartupOutcome::Stalled);
                 if stalled {
                     let _ = state.sessions().kill(&session_id).await;
@@ -566,6 +588,12 @@ pub async fn launch_session(
                         effective_preset: &prepared.effective_preset,
                     });
                 let failure_class = startup_outcome.failure_class;
+                state.telemetry().emit(TelemetryEvent::error_captured(
+                    TelemetryErrorKind::LaunchStartupFailed,
+                    TelemetryErrorArea::Launch,
+                    TelemetryErrorLevel::Error,
+                    failure_class.as_str(),
+                ));
                 if let Some(directive) = startup_outcome.directive.clone() {
                     let recovery_plan = plan_guardian_launch_recovery_directive(
                         &session_id,

@@ -11,16 +11,19 @@ pub mod launch_reports;
 pub mod ownership;
 pub mod performance_operations;
 pub mod presence;
+pub mod remote_flags;
 mod sessions;
 pub mod skins;
 
-use croopor_config::{AppConfig, ConfigStore, ConfigStoreError, InstanceStore};
+use croopor_config::{AppConfig, ConfigStore, ConfigStoreError, InstanceStore, find_flag};
 pub use croopor_launcher::{LaunchEvent, LaunchLogEvent, LaunchSessionRecord, LaunchStatusEvent};
 pub use croopor_minecraft::download::DownloadProgress;
 use croopor_performance::PerformanceManager;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
+
+use crate::observability::telemetry::TelemetryHub;
 
 const STARTUP_WARNING_LIMIT: usize = 8;
 const STARTUP_WARNING_MAX_CHARS: usize = 240;
@@ -41,6 +44,8 @@ pub use installs::{
     InstallQueueSnapshot, InstallQueueSpec, InstallStore, QueuedInstallEntry,
 };
 pub use journals::OperationJournalStore;
+pub use remote_flags::{RemoteFlagRefreshOutcome, RemoteFlagStore};
+pub(crate) use remote_flags::{ResolvedFlagSource, resolve_flag};
 pub use sessions::{SessionStore, StartupOutcome};
 
 #[derive(Clone)]
@@ -59,6 +64,8 @@ pub struct AppState {
     benchmark_suite_drivers: Arc<benchmark_suite_drivers::BenchmarkSuiteDriverStore>,
     performance_operations: Arc<performance_operations::PerformanceOperationStore>,
     performance: Arc<PerformanceManager>,
+    telemetry: Arc<TelemetryHub>,
+    remote_flags: Arc<RemoteFlagStore>,
     startup_warnings: Arc<Vec<String>>,
     config_changes: Arc<broadcast::Sender<()>>,
     library_dir: Arc<RwLock<Option<String>>>,
@@ -81,6 +88,16 @@ pub struct AppStateInit {
 
 impl AppState {
     pub fn new(init: AppStateInit) -> Self {
+        let telemetry = Arc::new(TelemetryHub::from_env(init.config.clone()));
+        Self::new_with_telemetry_inner(init, telemetry)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_telemetry(init: AppStateInit, telemetry: Arc<TelemetryHub>) -> Self {
+        Self::new_with_telemetry_inner(init, telemetry)
+    }
+
+    fn new_with_telemetry_inner(init: AppStateInit, telemetry: Arc<TelemetryHub>) -> Self {
         let library_dir = init.config.current().library_dir;
         let benchmark_suite_drivers = Arc::new(
             benchmark_suite_drivers::BenchmarkSuiteDriverStore::load_from_paths(
@@ -96,6 +113,9 @@ impl AppState {
             init.config.paths(),
         ));
         let journals = Arc::new(OperationJournalStore::load_from_paths(init.config.paths()));
+        let remote_flags = Arc::new(RemoteFlagStore::load_from_config_dir(
+            &init.config.paths().config_dir,
+        ));
         let (config_changes, _) = broadcast::channel(32);
 
         Self {
@@ -113,6 +133,8 @@ impl AppState {
             benchmark_suite_drivers,
             performance_operations,
             performance: init.performance,
+            telemetry,
+            remote_flags,
             startup_warnings: Arc::new(bound_startup_warnings(init.startup_warnings)),
             config_changes: Arc::new(config_changes),
             library_dir: Arc::new(RwLock::new(if library_dir.is_empty() {
@@ -186,6 +208,18 @@ impl AppState {
         &self.performance
     }
 
+    pub fn telemetry(&self) -> &Arc<TelemetryHub> {
+        &self.telemetry
+    }
+
+    pub fn remote_flags(&self) -> &Arc<RemoteFlagStore> {
+        &self.remote_flags
+    }
+
+    pub(crate) fn remote_flags_active_for(&self, config: &AppConfig) -> bool {
+        config.telemetry_enabled && self.telemetry.export_configured()
+    }
+
     pub fn startup_warnings(&self) -> Vec<String> {
         self.startup_warnings.as_ref().clone()
     }
@@ -200,11 +234,44 @@ impl AppState {
         }
     }
 
-    pub fn update_config(&self, next: AppConfig) -> Result<AppConfig, ConfigStoreError> {
+    pub fn update_config(&self, mut next: AppConfig) -> Result<AppConfig, ConfigStoreError> {
+        let previous = self.config.current();
+        let telemetry_disabled = previous.telemetry_enabled && !next.telemetry_enabled;
+        if telemetry_disabled {
+            next.telemetry_install_id.clear();
+        }
         let config = self.config.update(next)?;
         self.set_library_dir(config.library_dir.clone());
+        if telemetry_disabled {
+            self.telemetry.clear_queue();
+        }
         let _ = self.config_changes.send(());
         Ok(config)
+    }
+
+    pub fn flag_enabled(&self, key: &str) -> bool {
+        let Some(flag) = find_flag(key) else {
+            return false;
+        };
+        if flag.dev_only && !cfg!(debug_assertions) {
+            return false;
+        }
+
+        let config = self.config.current();
+        let remote_active = self.remote_flags_active_for(&config);
+        let remote_values = if remote_active {
+            self.remote_flags.values_snapshot()
+        } else {
+            Default::default()
+        };
+
+        resolve_flag(
+            flag,
+            &config.feature_overrides,
+            remote_active,
+            &remote_values,
+        )
+        .enabled
     }
 
     pub fn subscribe_config_changes(&self) -> broadcast::Receiver<()> {

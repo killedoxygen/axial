@@ -27,6 +27,7 @@ use crate::guardian::{
     GuardianJvmPresetOption, GuardianJvmPresetResolution, guardian_jvm_preset_options,
     normalize_create_jvm_preset,
 };
+use crate::observability::telemetry::TelemetryEvent;
 use crate::state::AppState;
 use crate::state::contracts::{CommandKind, OperationId, OperationStatus};
 use axum::{Json, http::StatusCode};
@@ -454,6 +455,11 @@ pub(crate) async fn handle_create_instance(
     let install_queue =
         queue_create_install_or_rollback(state, &created_instance_id, install_request).await?;
     let enriched = enrich_instance_for_state(state, instance);
+    state
+        .telemetry()
+        .emit(TelemetryEvent::instance_created(Some(
+            enriched.version_display.loader_key.clone(),
+        )));
     let queued_install = install_queue.as_ref().and_then(|response| {
         queued_install_request
             .as_ref()

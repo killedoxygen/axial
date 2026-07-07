@@ -21,13 +21,14 @@ import { authStatusResponse, isRecord } from '../accounts/api';
 import type { AuthStatusRecord, AuthStatusState } from '../accounts/types';
 import { useMicrosoftSignIn } from '../accounts/useMicrosoftSignIn';
 
-type Stage = 'name' | 'memory' | 'color' | 'music' | 'discord';
-const ORDER: Stage[] = ['name', 'memory', 'color', 'music', 'discord'];
+type Stage = 'name' | 'memory' | 'color' | 'music' | 'telemetry' | 'discord';
+const ORDER: Stage[] = ['name', 'memory', 'color', 'music', 'telemetry', 'discord'];
 const STAGE_LABELS: Record<Stage, string> = {
   name: 'Name',
   memory: 'Memory',
   color: 'Mood',
   music: 'Sound',
+  telemetry: 'Stats',
   discord: 'Activity',
 };
 
@@ -146,6 +147,7 @@ export function Onboarding(): JSX.Element | null {
   const [username, setUsername] = useState('');
   const [memory, setMemory] = useState<number>(rec.rec);
   const [musicEnabled, setMusicEnabled] = useState<boolean | null>(null);
+  const [telemetryEnabled, setTelemetryEnabled] = useState(config.value?.telemetry_enabled !== false);
   const [discordRpcEnabled, setDiscordRpcEnabled] = useState<boolean>(config.value?.discord_rpc_enabled !== false);
   const [isWeirdo, setIsWeirdo] = useState<boolean>(local.lightness >= 50);
   const [saving, setSaving] = useState(false);
@@ -204,7 +206,9 @@ export function Onboarding(): JSX.Element | null {
           ? true
           : stage === 'music'
             ? !saving && musicEnabled != null
-            : !saving;
+            : stage === 'telemetry'
+              ? true
+              : !saving;
 
   const advance = (): void => {
     const nextIdx = idx + 1;
@@ -258,6 +262,7 @@ export function Onboarding(): JSX.Element | null {
         max_memory_mb: Math.round(memory * 1024),
         music_enabled: musicEnabled,
         music_volume: 5,
+        telemetry_enabled: telemetryEnabled,
         discord_rpc_enabled: discordRpcEnabled,
         discord_rpc_onboarding_seen: true,
       };
@@ -481,6 +486,44 @@ export function Onboarding(): JSX.Element | null {
           >
             <Icon name="music-off" size={16} />
             <span>Silent launcher</span>
+          </button>
+        </div>
+      </div>
+    );
+  } else if (stage === 'telemetry') {
+    headline = 'Mind if Croopor keeps count?';
+    subline = (
+      <p class="cp-ob-subline">
+        Croopor counts which features get used and whether launches succeed — always anonymous. Never your name, your
+        files, or the servers you join. Off means nothing is ever sent.
+      </p>
+    );
+    widget = (
+      <div class="cp-ob-widget">
+        <div class="cp-ob-pills">
+          <button
+            class="cp-ob-pill"
+            data-active={telemetryEnabled === true}
+            onClick={() => {
+              setTelemetryEnabled(true);
+              Sound.ui('affirm');
+            }}
+            type="button"
+          >
+            <Icon name="shield-person" size={16} />
+            <span>Anonymous stats</span>
+          </button>
+          <button
+            class="cp-ob-pill"
+            data-active={telemetryEnabled === false}
+            onClick={() => {
+              setTelemetryEnabled(false);
+              Sound.ui('soft');
+            }}
+            type="button"
+          >
+            <Icon name="circle-dashed" size={16} />
+            <span>Nothing sent</span>
           </button>
         </div>
       </div>

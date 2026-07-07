@@ -56,6 +56,7 @@ Current subsystem docs:
 - `docs/GUARDIAN-ARCHITECTURE.md`
 - `docs/ICON-ASSETS.md`
 - `docs/LOADER-ARCHITECTURE.md`
+- `docs/TELEMETRY.md`
 - `docs/VERSION-METADATA-ARCHITECTURE.md`
 
 Use them for:

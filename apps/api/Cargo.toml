@@ -16,7 +16,7 @@ keyring = { version = "3.6.3", default-features = false, features = ["apple-nati
 p256.workspace = true
 png.workspace = true
 rand.workspace = true
-reqwest = { workspace = true, features = ["multipart"] }
+reqwest = { workspace = true, features = ["blocking", "multipart"] }
 serde.workspace = true
 serde_json.workspace = true
 sha1.workspace = true

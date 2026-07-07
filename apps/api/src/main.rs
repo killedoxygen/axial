@@ -1,6 +1,10 @@
 use croopor_api::app::{
     DEFAULT_API_PORT, build_router, default_frontend_dir, spawn_benchmark_suite_drivers_resume,
     spawn_performance_operations_resume, spawn_performance_rules_refresh,
+    spawn_remote_flags_refresh, spawn_telemetry_export,
+};
+use croopor_api::observability::telemetry::{
+    TelemetryErrorArea, TelemetryErrorKind, TelemetryErrorLevel, TelemetryEvent, TelemetryHub,
 };
 use croopor_api::state::{AppState, AppStateInit, InstallStore, SessionStore};
 use croopor_config::{AppPaths, ConfigStore, InstanceStore};
@@ -48,12 +52,23 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     spawn_performance_operations_resume(&state);
     spawn_benchmark_suite_drivers_resume(&state);
     spawn_performance_rules_refresh(&state);
+    spawn_telemetry_export(&state);
+    spawn_remote_flags_refresh(&state);
 
     let addr = std::env::var("CROOPOR_API_ADDR")
         .ok()
         .and_then(|value| value.parse::<SocketAddr>().ok())
         .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], DEFAULT_API_PORT)));
 
+    let telemetry = state.telemetry().clone();
+    let result = serve_api(state, addr).await;
+    if result.is_err() {
+        emit_startup_failed(&telemetry);
+    }
+    result
+}
+
+async fn serve_api(state: AppState, addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
     let addr = listener.local_addr()?;
     info!("croopor api listening on http://{addr}");
@@ -65,4 +80,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     Ok(())
+}
+
+fn emit_startup_failed(telemetry: &Arc<TelemetryHub>) {
+    telemetry.emit_sync_best_effort(TelemetryEvent::error_captured(
+        TelemetryErrorKind::StartupFailed,
+        TelemetryErrorArea::Startup,
+        TelemetryErrorLevel::Error,
+        "Backend startup failed.",
+    ));
 }
