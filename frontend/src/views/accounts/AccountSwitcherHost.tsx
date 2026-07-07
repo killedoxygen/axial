@@ -1,32 +1,47 @@
 import type { JSX } from 'preact';
-import { refreshAccountSkin } from '../../player-skin';
-import { config } from '../../store';
-import { accountSwitcherOpen } from '../../ui-state';
-import { AccountSwitcher } from './AccountSwitcher';
-import { useAuthStatus, useLauncherAccounts } from './hooks';
+import { useEffect } from 'preact/hooks';
+import { refreshAccountsData } from '../../machines/accounts';
+import { Modal, ModalContent } from '../../ui/Modal';
+import { accountSwitcherAnchor, accountSwitcherOpen, closeAccountSwitcher } from '../../ui-state';
+import { AccountSwitcherPanel } from './AccountSwitcher';
+
+const PANEL_WIDTH = 336;
+const VIEWPORT_GUTTER = 12;
 
 export function AccountSwitcherHost(): JSX.Element | null {
-  const savedUsername = config.value?.username || 'Player';
-  const { status, state, refresh } = useAuthStatus(savedUsername);
-  const accountsState = useLauncherAccounts();
+  const open = accountSwitcherOpen.value;
 
-  if (!accountSwitcherOpen.value) return null;
+  useEffect(() => {
+    if (open) void refreshAccountsData();
+  }, [open]);
+
+  if (!open) return null;
+
+  const anchor = accountSwitcherAnchor.value;
+  const anchoredStyle = anchor
+    ? {
+        top: `${Math.max(VIEWPORT_GUTTER, Math.min(anchor.y, window.innerHeight - 220))}px`,
+        left: `${Math.max(VIEWPORT_GUTTER, Math.min(anchor.x - PANEL_WIDTH, window.innerWidth - PANEL_WIDTH - VIEWPORT_GUTTER))}px`,
+        width: `${PANEL_WIDTH}px`,
+      }
+    : undefined;
 
   return (
-    <AccountSwitcher
-      status={status}
-      state={state}
-      accounts={accountsState.accounts}
-      open={accountSwitcherOpen.value}
-      onOpenChange={(open) => {
-        accountSwitcherOpen.value = open;
+    <Modal
+      open={open}
+      onOpenChange={(next) => {
+        if (!next) closeAccountSwitcher();
       }}
-      showTrigger={false}
-      onChanged={() => {
-        refresh();
-        accountsState.refresh();
-        refreshAccountSkin();
-      }}
-    />
+    >
+      <ModalContent
+        className={anchor ? 'cp-acct-surface cp-acct-surface--pop' : 'cp-acct-surface cp-acct-surface--modal'}
+        style={anchoredStyle}
+        aria-label="Accounts"
+        aria-describedby={undefined}
+        showCloseButton={false}
+      >
+        <AccountSwitcherPanel />
+      </ModalContent>
+    </Modal>
   );
 }

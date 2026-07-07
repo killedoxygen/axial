@@ -24,10 +24,6 @@ import type {
 
 export const DEFAULT_SKIN_SOURCE = 'minecraft_default_skin';
 
-export function shortenUuid(uuid: string): string {
-  return uuid.length > 24 ? `${uuid.slice(0, 8)}...${uuid.slice(-12)}` : uuid;
-}
-
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }
@@ -650,12 +646,6 @@ export function skinActionErrorMessage(error: unknown, fallback: string): string
 
 export function savedSkinApplyErrorMessage(error: unknown): string {
   return skinActionErrorMessage(error, 'Minecraft profile apply failed.');
-}
-
-export function formatByteSize(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes < 0) return '0 B';
-  if (bytes < 1024) return `${Math.round(bytes)} B`;
-  return `${(bytes / 1024).toFixed(1)} KiB`;
 }
 
 export function savedSkinFileUrl(skin: SavedSkinRecord): string {

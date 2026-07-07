@@ -1,4 +1,3 @@
-import type { LaunchAuthMode } from '../../types-auth';
 import { boundedMessage, isRecord } from './api';
 
 export function apiErrorMessage(value: unknown, fallback: string): string {
@@ -20,8 +19,4 @@ export function authProfileSyncErrorMessage(value: unknown): string {
 
 export function configErrorMessage(value: unknown): string {
   return apiErrorMessage(value, 'Could not save launch mode.');
-}
-
-export function launchAuthMode(value: unknown): LaunchAuthMode {
-  return value === 'online' ? 'online' : 'offline';
 }

@@ -1,15 +1,14 @@
 import { useRef } from 'preact/hooks';
-import type { SavedSkinLibraryMessage } from './SavedSkinLookupBar';
 
 export function useSavedSkinUploadDrop({
   busy,
   setUploadDragActive,
-  setMessage,
+  notifyError,
   stageUploadFile,
 }: {
   busy: boolean;
   setUploadDragActive: (active: boolean) => void;
-  setMessage: (message: SavedSkinLibraryMessage) => void;
+  notifyError: (text: string) => void;
   stageUploadFile: (file: File, applyAfterSave: boolean) => void;
 }): {
   onDrop: (event: DragEvent) => void;
@@ -29,7 +28,7 @@ export function useSavedSkinUploadDrop({
       const files = event.dataTransfer?.files;
       if (!files || files.length === 0) return;
       if (files.length !== 1) {
-        setMessage({ tone: 'err', text: 'Drop one PNG skin file.' });
+        notifyError('Drop one PNG skin file.');
         return;
       }
 

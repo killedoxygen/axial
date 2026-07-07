@@ -1,7 +1,16 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { api } from '../../api';
+import {
+  applySavedSkin,
+  refreshWardrobe,
+  runWardrobeOp,
+  selectSavedSkin,
+  setWardrobeNotice,
+  wardrobeContext,
+  wardrobeData,
+  wardrobeOp,
+} from '../../machines/skin-wardrobe';
 import { pickNativeSkinFile } from '../../native';
-import { setSelectedSkin } from '../../player-skin';
 import { toast } from '../../toast';
 import { showConfirm } from '../../ui/Dialog';
 import {
@@ -13,29 +22,10 @@ import {
   savedSkinRecord,
   skinActionErrorMessage,
 } from './api';
-import type { SavedSkinLibraryMessage } from './SavedSkinLookupBar';
 import { useSavedSkinEditReplacementDrop } from './use-saved-skin-edit-replacement-drop';
 import { NO_CAPE_VALUE, type SavedSkinRecord, type SkinVariant, type StagedSkinUpload } from './types';
 
-type Setter<T> = (value: T | ((current: T) => T)) => void;
-
-export function useSavedSkinEditWorkflow({
-  skins,
-  skinActionsEnabled,
-  skinAccountKey,
-  setMessage,
-  setSelectedKey,
-  refresh,
-  applySavedSkin,
-}: {
-  skins: SavedSkinRecord[];
-  skinActionsEnabled: boolean;
-  skinAccountKey: string;
-  setMessage: Setter<SavedSkinLibraryMessage | null>;
-  setSelectedKey: Setter<string | null>;
-  refresh: () => void;
-  applySavedSkin: (textureKey: string) => Promise<string>;
-}) {
+export function useSavedSkinEditWorkflow() {
   const editTextureInputRef = useRef<HTMLInputElement | null>(null);
   const editReplacementUrlRef = useRef<string | null>(null);
   const editReplacementTokenRef = useRef(0);
@@ -46,10 +36,11 @@ export function useSavedSkinEditWorkflow({
   const [editName, setEditName] = useState('');
   const [editVariant, setEditVariant] = useState<SkinVariant>('classic');
   const [editCapeId, setEditCapeId] = useState<string>(NO_CAPE_VALUE);
-  const [editBusyKey, setEditBusyKey] = useState<string | null>(null);
   const [editDetectBusyKey, setEditDetectBusyKey] = useState<string | null>(null);
   const [editDetectError, setEditDetectError] = useState<string | null>(null);
 
+  const skins = wardrobeData.value.skins;
+  const editBusyKey = wardrobeOp.value?.kind === 'edit' ? (wardrobeOp.value.key ?? null) : null;
   const trimmedEditName = editName.trim();
   const editReplacementReady = !editReplacement || editReplacement.normalizeStatus === 'ready';
 
@@ -119,7 +110,7 @@ export function useSavedSkinEditWorkflow({
     setEditCapeId(skin.cape_id ?? NO_CAPE_VALUE);
     setEditDetectBusyKey(null);
     setEditDetectError(null);
-    setMessage(null);
+    setWardrobeNotice(null);
   };
 
   const cancelEdit = (): void => {
@@ -131,7 +122,7 @@ export function useSavedSkinEditWorkflow({
     editDetectTokenRef.current = token;
     setEditDetectBusyKey(skin.texture_key);
     setEditDetectError(null);
-    setMessage(null);
+    setWardrobeNotice(null);
     try {
       const detectedVariant = await detectSkinVariantFromSavedSkin(skin);
       if (token !== editDetectTokenRef.current) return;
@@ -149,12 +140,12 @@ export function useSavedSkinEditWorkflow({
   const stageEditReplacementFile = (file: File): void => {
     if (!editKey) return;
     if (!isPngFile(file)) {
-      setMessage({ tone: 'err', text: 'Choose a PNG skin file.' });
+      setWardrobeNotice('Choose a PNG skin file.');
       if (editTextureInputRef.current) editTextureInputRef.current.value = '';
       return;
     }
     if (editBusyKey) {
-      setMessage({ tone: 'err', text: 'Wait for the current skin edit to finish.' });
+      setWardrobeNotice('Wait for the current skin edit to finish.');
       if (editTextureInputRef.current) editTextureInputRef.current.value = '';
       return;
     }
@@ -164,7 +155,7 @@ export function useSavedSkinEditWorkflow({
     const token = editReplacementTokenRef.current;
     if (editReplacementUrlRef.current) URL.revokeObjectURL(editReplacementUrlRef.current);
     editReplacementUrlRef.current = objectUrl;
-    setMessage(null);
+    setWardrobeNotice(null);
     setEditDetectError(null);
     setEditReplacement({
       file,
@@ -217,7 +208,7 @@ export function useSavedSkinEditWorkflow({
   const editReplacementDrop = useSavedSkinEditReplacementDrop({
     busy: Boolean(editBusyKey),
     setEditReplacementDragActive,
-    setMessage,
+    notifyError: setWardrobeNotice,
     stageEditReplacementFile,
   });
 
@@ -233,10 +224,7 @@ export function useSavedSkinEditWorkflow({
         if (nativeFile === null) return;
         editTextureInputRef.current?.click();
       } catch (err) {
-        setMessage({
-          tone: 'err',
-          text: boundedMessage(err instanceof Error ? err.message : undefined, 'Could not open skin file.'),
-        });
+        setWardrobeNotice(boundedMessage(err instanceof Error ? err.message : undefined, 'Could not open skin file.'));
       }
     })();
   };
@@ -244,76 +232,69 @@ export function useSavedSkinEditWorkflow({
   const saveSkinMetadata = async (textureKey: string, applyAfterSave = false): Promise<void> => {
     const skin = skins.find((candidate) => candidate.texture_key === textureKey);
     if (skin && !savedSkinEditHasChanges(skin)) {
-      setMessage({ tone: 'err', text: 'Make an edit to the skin before saving.' });
+      setWardrobeNotice('Make an edit to the skin before saving.');
       return;
     }
     if (!trimmedEditName) {
-      setMessage({ tone: 'err', text: 'Name the skin before saving.' });
+      setWardrobeNotice('Name the skin before saving.');
       return;
     }
     if (editReplacement && editReplacement.normalizeStatus !== 'ready') {
-      setMessage({ tone: 'err', text: 'Wait for the replacement PNG to validate before saving.' });
+      setWardrobeNotice('Wait for the replacement PNG to validate before saving.');
       return;
     }
 
-    setEditBusyKey(textureKey);
-    setMessage(null);
-    try {
-      const previousCapeId = skin?.cape_id ?? null;
-      const nextCapeId = editCapeId === NO_CAPE_VALUE ? null : editCapeId;
-      const profileRelevantEdit = Boolean(
-        editReplacement || (skin && editVariant !== skin.variant) || nextCapeId !== previousCapeId,
-      );
-      const shouldReapplyEditedSkin = Boolean(skin?.applied_at && profileRelevantEdit);
-      const shouldApplyEditedSkin = Boolean(
-        skinActionsEnabled && ((applyAfterSave && !skin?.applied_at) || shouldReapplyEditedSkin),
-      );
-      let savedTextureKey = textureKey;
-      const savedMessage = editReplacement ? 'Skin texture replaced.' : 'Skin details updated.';
-      if (editReplacement) {
-        const saved = await replaceSavedSkinTexture(textureKey, editReplacement.file, {
-          name: trimmedEditName,
-          variant: editVariant,
-          capeId: nextCapeId === previousCapeId ? undefined : nextCapeId,
-        });
-        savedTextureKey = saved.texture_key;
-        setSelectedKey(saved.texture_key);
-        setSelectedSkin(`saved:${saved.texture_key}`, skinAccountKey);
-      } else {
-        const payload: { name: string; variant: SkinVariant; cape_id?: string | null } = {
-          name: trimmedEditName,
-          variant: editVariant,
-        };
-        if (skin && editCapeId !== (skin.cape_id ?? NO_CAPE_VALUE)) {
-          payload.cape_id = editCapeId === NO_CAPE_VALUE ? null : editCapeId;
-        }
-        const updated = savedSkinRecord(await api('PUT', `/skins/${textureKey}`, payload));
-        if (!updated) throw new Error('Skin details update returned an invalid response.');
-        savedTextureKey = updated.texture_key;
-      }
-      cancelEdit();
-      if (shouldApplyEditedSkin) {
-        try {
-          toast(await applySavedSkin(savedTextureKey));
-        } catch (err) {
-          refresh();
-          setMessage({
-            tone: 'err',
-            text: skinActionErrorMessage(err, 'Minecraft profile apply failed.'),
+    await runWardrobeOp({ kind: 'edit', key: textureKey }, async () => {
+      setWardrobeNotice(null);
+      try {
+        const skinActionsEnabled = wardrobeContext.value.skinActionsEnabled;
+        const previousCapeId = skin?.cape_id ?? null;
+        const nextCapeId = editCapeId === NO_CAPE_VALUE ? null : editCapeId;
+        const profileRelevantEdit = Boolean(
+          editReplacement || (skin && editVariant !== skin.variant) || nextCapeId !== previousCapeId,
+        );
+        const shouldReapplyEditedSkin = Boolean(skin?.applied_at && profileRelevantEdit);
+        const shouldApplyEditedSkin = Boolean(
+          skinActionsEnabled && ((applyAfterSave && !skin?.applied_at) || shouldReapplyEditedSkin),
+        );
+        let savedTextureKey = textureKey;
+        const savedMessage = editReplacement ? 'Skin texture replaced.' : 'Skin details updated.';
+        if (editReplacement) {
+          const saved = await replaceSavedSkinTexture(textureKey, editReplacement.file, {
+            name: trimmedEditName,
+            variant: editVariant,
+            capeId: nextCapeId === previousCapeId ? undefined : nextCapeId,
           });
+          savedTextureKey = saved.texture_key;
+          selectSavedSkin(saved.texture_key);
+        } else {
+          const payload: { name: string; variant: SkinVariant; cape_id?: string | null } = {
+            name: trimmedEditName,
+            variant: editVariant,
+          };
+          if (skin && editCapeId !== (skin.cape_id ?? NO_CAPE_VALUE)) {
+            payload.cape_id = editCapeId === NO_CAPE_VALUE ? null : editCapeId;
+          }
+          const updated = savedSkinRecord(await api('PUT', `/skins/${textureKey}`, payload));
+          if (!updated) throw new Error('Skin details update returned an invalid response.');
+          savedTextureKey = updated.texture_key;
         }
-      } else {
-        refresh();
-        toast(savedMessage);
+        cancelEdit();
+        if (shouldApplyEditedSkin) {
+          try {
+            toast(await applySavedSkin(savedTextureKey));
+          } catch (err) {
+            void refreshWardrobe();
+            setWardrobeNotice(skinActionErrorMessage(err, 'Minecraft profile apply failed.'));
+          }
+        } else {
+          void refreshWardrobe();
+          toast(savedMessage);
+        }
+      } catch (err) {
+        setWardrobeNotice(skinActionErrorMessage(err, 'Could not update skin details.'));
       }
-    } catch (err) {
-      setMessage({
-        tone: 'err',
-        text: skinActionErrorMessage(err, 'Could not update skin details.'),
-      });
-    } finally {
-      setEditBusyKey(null);
-    }
+    });
   };
 
   useEffect(() => {

@@ -2,7 +2,6 @@ import type { RefObject } from 'preact';
 import { useEffect, useRef } from 'preact/hooks';
 import { onNativeDragDrop, readNativeSkinFile, type NativeDragDropPayload } from '../../native';
 import { isPngPath, nativeDragPositionHitsElement, nativeDragTargetElement } from './api';
-import type { SavedSkinLibraryMessage } from './SavedSkinLookupBar';
 
 export function useSavedSkinNativeDragDrop({
   dropSurfaceRef,
@@ -11,7 +10,7 @@ export function useSavedSkinNativeDragDrop({
   editBusy,
   setUploadDragActive,
   setEditReplacementDragActive,
-  setMessage,
+  notifyError,
   onReadError,
   stageUploadFile,
   stageEditReplacementFile,
@@ -22,7 +21,7 @@ export function useSavedSkinNativeDragDrop({
   editBusy: boolean;
   setUploadDragActive: (active: boolean) => void;
   setEditReplacementDragActive: (active: boolean) => void;
-  setMessage: (message: SavedSkinLibraryMessage) => void;
+  notifyError: (text: string) => void;
   onReadError: (error: unknown) => void;
   stageUploadFile: (file: File, applyAfterSave: boolean) => void;
   stageEditReplacementFile: (file: File) => void;
@@ -91,15 +90,14 @@ export function useSavedSkinNativeDragDrop({
       if (payload.type !== 'drop' || (!overDropSurface && !overEditDropSurface)) return;
       if (skinPaths.length === 0) return;
       if (skinPaths.length !== 1) {
-        setMessage({
-          tone: 'err',
-          text: overEditDropSurface ? 'Drop one PNG skin file to replace this texture.' : 'Drop one PNG skin file.',
-        });
+        notifyError(
+          overEditDropSurface ? 'Drop one PNG skin file to replace this texture.' : 'Drop one PNG skin file.',
+        );
         return;
       }
       if (overEditDropSurface) {
         if (editBusyRef.current) {
-          setMessage({ tone: 'err', text: 'Wait for the current skin edit to finish.' });
+          notifyError('Wait for the current skin edit to finish.');
           return;
         }
 
@@ -116,7 +114,7 @@ export function useSavedSkinNativeDragDrop({
         return;
       }
       if (uploadBusyRef.current) {
-        setMessage({ tone: 'err', text: 'Wait for the current skin action to finish.' });
+        notifyError('Wait for the current skin action to finish.');
         return;
       }
 
@@ -147,5 +145,5 @@ export function useSavedSkinNativeDragDrop({
       setEditReplacementDragActive(false);
       subscription?.close();
     };
-  }, [dropSurfaceRef, setEditReplacementDragActive, setMessage, setUploadDragActive]);
+  }, [dropSurfaceRef, setEditReplacementDragActive, notifyError, setUploadDragActive]);
 }

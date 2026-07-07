@@ -334,6 +334,9 @@ function UserTrigger({ tooltip }: { tooltip: RailTooltipController }): JSX.Eleme
           tooltip.hide();
           setOpen((o) => !o);
         }}
+        onPointerEnter={() => {
+          void import('../views/accounts/AccountSwitcherHost');
+        }}
         aria-label={`${username}, account menu`}
         {...railTipAttrs(username, tooltip)}
       >
@@ -359,7 +362,7 @@ export function Sidebar(): JSX.Element {
   return (
     <aside class="cp-rail" ref={railRef}>
       <div class="cp-rail-brand" {...railTipAttrs('Croopor', tooltip)}>
-        <Logo className="cp-logo" size={34} />
+        <Logo className="cp-logo" motion="loose" size={34} />
       </div>
       <button
         class="cp-rail-btn"

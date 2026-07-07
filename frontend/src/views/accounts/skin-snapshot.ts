@@ -4,14 +4,14 @@ import { loadOptionalBitmap, loadSkinBitmap } from './skin-textures';
 import type { SkinVariant } from './types';
 
 const SNAPSHOT_WIDTH = 320;
-const SNAPSHOT_HEIGHT = 378;
+const SNAPSHOT_HEIGHT = 346;
 const SNAPSHOT_FOV = 34;
 const SNAPSHOT_ROTATION = -Math.PI / 9;
-const SNAPSHOT_CENTER_Y = 21.4;
-const SNAPSHOT_HALF_HEIGHT = 13.2;
+const SNAPSHOT_CENTER_Y = 23.4;
+const SNAPSHOT_HALF_HEIGHT = 10.8;
 const MAX_SNAPSHOT_CACHE_SIZE = 180;
 const MAX_STORED_SNAPSHOT_CACHE_SIZE = 320;
-const SNAPSHOT_RENDER_VERSION = 3;
+const SNAPSHOT_RENDER_VERSION = 5;
 const SNAPSHOT_DB_NAME = 'croopor-skin-snapshots';
 const SNAPSHOT_DB_VERSION = 1;
 const SNAPSHOT_STORE_NAME = 'snapshots';

@@ -19,6 +19,7 @@ export { default as DotsHorizontal } from '../../node_modules/@openai/apps-sdk-u
 export { default as Download } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/Download.js';
 export { default as Edit } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/Edit.js';
 export { default as ExclamationMarkCircle } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/ExclamationMarkCircle.js';
+export { default as Expand } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/Expand.js';
 export { default as Folder } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/Folder.js';
 export { default as Globe } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/Globe.js';
 export { default as Headphones } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/Headphones.js';

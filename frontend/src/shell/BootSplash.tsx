@@ -8,6 +8,31 @@ const MIN_DISPLAY_MS = 500;
 const FILL_SETTLE_MS = 240;
 const LEAVE_MS = 360;
 
+type BootLogoStyle = JSX.CSSProperties & Record<string, string>;
+
+function clamp01(value: number): number {
+  return Math.min(1, Math.max(0, value));
+}
+
+function progressSegment(progress: number, start: number, end: number): number {
+  return clamp01((progress - start) / (end - start));
+}
+
+function bootLogoStyle(progress: number): BootLogoStyle {
+  const assemblyRibbon = progressSegment(progress, 0, 35);
+  const assemblyTr = progressSegment(progress, 14, 58);
+  const assemblyBl = progressSegment(progress, 24, 72);
+
+  return {
+    '--cp-mark-assembly-ribbon-opacity': String(assemblyRibbon),
+    '--cp-mark-assembly-ribbon-scale': String(0.9 + assemblyRibbon * 0.1),
+    '--cp-mark-assembly-tr-opacity': String(assemblyTr),
+    '--cp-mark-assembly-tr-scale': String(0.72 + assemblyTr * 0.28),
+    '--cp-mark-assembly-bl-opacity': String(assemblyBl),
+    '--cp-mark-assembly-bl-scale': String(0.72 + assemblyBl * 0.28),
+  };
+}
+
 export function BootSplash(): JSX.Element | null {
   const state = bootstrapState.value;
   const [progress, setProgress] = useState(4);
@@ -48,7 +73,7 @@ export function BootSplash(): JSX.Element | null {
   return (
     <div class="cp-boot" data-leaving={leaving || undefined} role="status" aria-live="polite" onMouseDown={onMouseDown}>
       <div class="cp-boot-stack">
-        <Logo className="cp-boot-logo" size={64} />
+        <Logo className="cp-boot-logo" motion="assembly" size={64} style={bootLogoStyle(progress)} />
         {state === 'error' ? (
           <>
             <div class="cp-boot-error-title">Failed to connect</div>

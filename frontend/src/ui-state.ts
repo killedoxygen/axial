@@ -81,6 +81,13 @@ export const showOnboardingOverlay = signal(false);
 export const createOpen = signal(false);
 export const accountSwitcherOpen = signal(false);
 
+export interface AccountSwitcherAnchor {
+  x: number;
+  y: number;
+}
+
+export const accountSwitcherAnchor = signal<AccountSwitcherAnchor | null>(null);
+
 export function openCreate(): void {
   createOpen.value = true;
 }
@@ -89,10 +96,16 @@ export function closeCreate(): void {
   createOpen.value = false;
 }
 
-export function openAccountSwitcher(): void {
+export function openAccountSwitcher(anchor?: AccountSwitcherAnchor): void {
+  accountSwitcherAnchor.value = anchor ?? null;
   accountSwitcherOpen.value = true;
+}
+
+export function expandAccountSwitcher(): void {
+  accountSwitcherAnchor.value = null;
 }
 
 export function closeAccountSwitcher(): void {
   accountSwitcherOpen.value = false;
+  accountSwitcherAnchor.value = null;
 }

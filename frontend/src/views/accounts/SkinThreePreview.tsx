@@ -19,6 +19,12 @@ const BADGE_HEIGHT_PX = 22;
 const NAMETAG_HEIGHT_PX = 26;
 const OVERLAY_ROW_GAP_PX = 6;
 
+export interface SkinThreeFitPadding {
+  top?: number;
+  bottom?: number;
+  side?: number;
+}
+
 export interface SkinThreePreviewProps {
   src: string;
   capeSrc?: string;
@@ -32,6 +38,8 @@ export interface SkinThreePreviewProps {
   variant: SkinVariant;
   side: SkinPreviewSide;
   showOuterLayers: boolean;
+  fitPadding?: SkinThreeFitPadding;
+  showHint?: boolean;
 }
 
 interface SceneHandle {
@@ -50,20 +58,22 @@ function fitCameraToCanvas({
   canvas,
   bounds,
   overlayHeightPx,
+  fitPadding,
 }: {
   THREE: ThreeModule;
   camera: import('three').PerspectiveCamera;
   canvas: HTMLCanvasElement;
   bounds: SkinModelBounds;
   overlayHeightPx: number;
+  fitPadding?: SkinThreeFitPadding;
 }): SkinThreeFitMetrics {
   const width = Math.max(1, Math.round(canvas.getBoundingClientRect().width));
   const height = Math.max(1, Math.round(canvas.getBoundingClientRect().height));
   const aspect = width / height;
   const hasOverlay = overlayHeightPx > 0;
-  const topPadding = hasOverlay ? 0.2 : 0.12;
-  const bottomPadding = 0.18;
-  const sidePadding = 0.12;
+  const topPadding = fitPadding?.top ?? (hasOverlay ? 0.2 : 0.12);
+  const bottomPadding = fitPadding?.bottom ?? 0.18;
+  const sidePadding = fitPadding?.side ?? 0.12;
   const usableWidth = Math.max(width * (1 - sidePadding * 2), 1);
   const usableHeight = Math.max(height * (1 - topPadding - bottomPadding), 1);
   const verticalFov = THREE.MathUtils.degToRad(FIT_FOV_DEGREES);
@@ -172,6 +182,7 @@ async function setupScene(
         canvas,
         bounds,
         overlayHeightPx: estimateOverlayHeightPx(props),
+        fitPadding: props.fitPadding,
       }),
     );
     setFitState('fitted');
@@ -198,8 +209,29 @@ async function setupScene(
     group.position.x = pulseWobble * 0.22;
     group.scale.set(1 - pulse * 0.012, 1 + pulse * 0.026, 1);
     renderer.render(scene, camera);
-    frame = window.requestAnimationFrame(render);
+    frame = paused ? 0 : window.requestAnimationFrame(render);
   }
+
+  let paused = false;
+  let canvasVisible = true;
+  function syncPaused(): void {
+    const next = document.hidden || !canvasVisible;
+    if (paused === next) return;
+    paused = next;
+    if (paused) {
+      if (frame !== 0) window.cancelAnimationFrame(frame);
+      frame = 0;
+    } else if (frame === 0) {
+      frame = window.requestAnimationFrame(render);
+    }
+  }
+  const onVisibilityChange = (): void => syncPaused();
+  const intersectionObserver = new IntersectionObserver((entries) => {
+    canvasVisible = entries[entries.length - 1]?.isIntersecting ?? true;
+    syncPaused();
+  });
+  intersectionObserver.observe(canvas);
+  document.addEventListener('visibilitychange', onVisibilityChange);
 
   const resizeObserver = new ResizeObserver(resize);
   resizeObserver.observe(canvas);
@@ -269,6 +301,8 @@ async function setupScene(
     dispose: () => {
       window.cancelAnimationFrame(frame);
       resizeObserver.disconnect();
+      intersectionObserver.disconnect();
+      document.removeEventListener('visibilitychange', onVisibilityChange);
       canvas.removeEventListener('pointerdown', onPointerDown);
       canvas.removeEventListener('pointermove', onPointerMove);
       canvas.removeEventListener('pointerup', onPointerUp);
@@ -399,13 +433,15 @@ export function SkinThreePreview(props: SkinThreePreviewProps): JSX.Element {
             ))}
         </div>
       )}
-      <div class="cp-skin-three__hint" data-skin-three-hint="drag-rotate" aria-hidden="true">
-        <span class="cp-skin-three__hint-icons">
-          <Icon name="arrow-left" size={10} />
-          <Icon name="arrow-right" size={10} />
-        </span>
-        <span>Drag to rotate</span>
-      </div>
+      {props.showHint !== false && (
+        <div class="cp-skin-three__hint" data-skin-three-hint="drag-rotate" aria-hidden="true">
+          <span class="cp-skin-three__hint-icons">
+            <Icon name="arrow-left" size={10} />
+            <Icon name="arrow-right" size={10} />
+          </span>
+          <span>Drag to rotate</span>
+        </div>
+      )}
     </div>
   );
 }

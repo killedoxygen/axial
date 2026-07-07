@@ -1,23 +1,40 @@
 import type { JSX } from 'preact';
+import { useEffect } from 'preact/hooks';
+import { accountsSnapshot, activeAccount, refreshAccountsData } from '../../machines/accounts';
+import { loadDefaultSkinKeys, refreshWardrobe, setWardrobeContext } from '../../machines/skin-wardrobe';
 import { promptPlayerName, savePlayerName } from '../../player-name';
-import { FALLBACK_SKIN_ACCOUNT_KEY, launcherSkinAccountKey, refreshAccountSkin } from '../../player-skin';
+import { FALLBACK_SKIN_ACCOUNT_KEY, launcherSkinAccountKey } from '../../player-skin';
 import { config } from '../../store';
-import { AccountSwitcher } from './AccountSwitcher';
-import { useAuthStatus, useLauncherAccounts } from './hooks';
 import { SavedSkinLibrary } from './SavedSkinLibrary';
 
 export function AccountsView(): JSX.Element {
-  const cfg = config.value;
-  const savedUsername = cfg?.username || 'Player';
-  const { status, state, refresh } = useAuthStatus(savedUsername);
-  const accountsState = useLauncherAccounts();
-  const activeAccount = accountsState.accounts.find((account) => account.active) ?? null;
-  const onlineActive = activeAccount?.kind === 'microsoft';
-  const skinAction = state === 'ready' ? status?.skin_action : undefined;
-  const minecraftProfile = onlineActive ? (activeAccount?.minecraft_profile ?? status?.minecraft_profile) : undefined;
+  const savedUsername = config.value?.username || 'Player';
+  const snapshot = accountsSnapshot.value;
+  const active = activeAccount(snapshot);
+  const onlineActive = active?.kind === 'microsoft';
+  const skinAction = snapshot.state === 'ready' ? snapshot.status?.skin_action : undefined;
+  const minecraftProfile = onlineActive ? (active?.minecraft_profile ?? snapshot.status?.minecraft_profile) : undefined;
   const profileName = minecraftProfile?.name;
-  const playerName = activeAccount?.display_name || (onlineActive && profileName ? profileName : savedUsername);
-  const skinAccountKey = activeAccount ? launcherSkinAccountKey(activeAccount.account_id) : FALLBACK_SKIN_ACCOUNT_KEY;
+  const playerName = active?.display_name || (onlineActive && profileName ? profileName : savedUsername);
+  const skinAccountKey = active ? launcherSkinAccountKey(active.account_id) : FALLBACK_SKIN_ACCOUNT_KEY;
+  const skinActionsEnabled = skinAction?.enabled === true;
+  const skinActionDisabledReason =
+    skinAction?.disabled_reason || skinAction?.detail || 'Online Minecraft account required';
+
+  useEffect(() => {
+    void refreshAccountsData();
+    void refreshWardrobe();
+    loadDefaultSkinKeys();
+  }, []);
+
+  useEffect(() => {
+    setWardrobeContext({
+      accountKey: skinAccountKey,
+      skinActionsEnabled,
+      profile: minecraftProfile ?? null,
+    });
+  }, [skinAccountKey, skinActionsEnabled, minecraftProfile]);
+
   const renameNametag =
     onlineActive && profileName
       ? undefined
@@ -25,38 +42,15 @@ export function AccountsView(): JSX.Element {
           const next = await promptPlayerName(savedUsername);
           if (!next) return;
           const saved = await savePlayerName(next);
-          if (saved) refresh();
+          if (saved) void refreshAccountsData();
         };
 
   return (
-    <div class="cp-view-page" style={{ gap: 18 }}>
-      <div class="cp-page-header">
-        <div>
-          <h1>Skins</h1>
-          <div class="cp-page-sub">Preview, fetch, and apply Minecraft skins.</div>
-        </div>
-        <AccountSwitcher
-          status={status}
-          state={state}
-          accounts={accountsState.accounts}
-          onChanged={() => {
-            refresh();
-            accountsState.refresh();
-            refreshAccountSkin();
-          }}
-        />
-      </div>
-
+    <div class="cp-skinhall">
       <SavedSkinLibrary
-        skinAction={skinAction}
-        minecraftProfile={minecraftProfile}
-        skinAccountKey={skinAccountKey}
+        skinActionDisabledReason={skinActionDisabledReason}
         playerName={playerName}
         onRenameNametag={renameNametag ? () => void renameNametag() : undefined}
-        onApplied={() => {
-          refresh();
-          refreshAccountSkin();
-        }}
       />
     </div>
   );

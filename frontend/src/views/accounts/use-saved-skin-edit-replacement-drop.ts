@@ -1,15 +1,14 @@
 import { useRef } from 'preact/hooks';
-import type { SavedSkinLibraryMessage } from './SavedSkinLookupBar';
 
 export function useSavedSkinEditReplacementDrop({
   busy,
   setEditReplacementDragActive,
-  setMessage,
+  notifyError,
   stageEditReplacementFile,
 }: {
   busy: boolean;
   setEditReplacementDragActive: (active: boolean) => void;
-  setMessage: (message: SavedSkinLibraryMessage) => void;
+  notifyError: (text: string) => void;
   stageEditReplacementFile: (file: File) => void;
 }): {
   onDrop: (event: DragEvent) => void;
@@ -29,7 +28,7 @@ export function useSavedSkinEditReplacementDrop({
       const files = event.dataTransfer?.files;
       if (!files || files.length === 0) return;
       if (files.length !== 1) {
-        setMessage({ tone: 'err', text: 'Drop one PNG skin file to replace this texture.' });
+        notifyError('Drop one PNG skin file to replace this texture.');
         return;
       }
 
