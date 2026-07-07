@@ -24,3 +24,6 @@ assets/*.mp3
 assets/*.wav
 CHANGELOG-next.md
 debug-builds
+
+# Generated tauri capability schemas (rebuilt per-platform on every compile)
+apps/desktop/gen/schemas/
