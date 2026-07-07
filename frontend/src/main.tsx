@@ -56,12 +56,13 @@ async function init(): Promise<void> {
     const nativeVersion = await getNativeAppVersion();
     if (nativeVersion) appVersion.value = nativeVersion;
 
+    void refreshFlags().catch(() => undefined);
+
     let [configRes, systemRes, statusRes, musicStatusRes] = await Promise.all([
       api('GET', '/config'),
       api('GET', '/system').catch(() => null),
       api('GET', '/status').catch(() => null),
       api('GET', '/music/status').catch(() => null),
-      refreshFlags().catch(() => null),
     ]);
     config.value = configRes;
     systemInfo.value = systemRes;

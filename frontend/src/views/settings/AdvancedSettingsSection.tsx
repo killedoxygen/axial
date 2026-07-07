@@ -1,11 +1,11 @@
 import type { JSX } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
 import { api } from '../../api';
-import { setFlagOverride } from '../../flags';
+import { ensureFlags, refreshFlags, setFlagOverride } from '../../flags';
 import { Button, Toggle } from '../../ui/Atoms';
 import { navigate, ROUTE_STORAGE_KEY } from '../../ui-state';
 import { STORAGE_KEY } from '../../state';
-import { config, devMode, featureFlags } from '../../store';
+import { config, devMode, featureFlags, featureFlagsLoadState } from '../../store';
 import { toast } from '../../toast';
 import { errMessage } from '../../utils';
 import { SettingsCard } from './settings-shared';
@@ -41,7 +41,33 @@ const FLAG_STAGE_NOTES = {
 } as const;
 
 export function ExperimentalFlagsCards(): JSX.Element | null {
-  const flags = featureFlags.value?.filter((flag) => !flag.dev_only) ?? [];
+  const allFlags = featureFlags.value;
+  const loadState = featureFlagsLoadState.value;
+
+  useEffect(() => {
+    if (!featureFlags.value) void ensureFlags().catch(() => undefined);
+  }, []);
+
+  if (!allFlags) {
+    const failed = loadState.status === 'error';
+    return (
+      <SettingsCard
+        title="Experimental flags"
+        desc={
+          failed ? `Could not load feature flags: ${loadState.error || 'Unknown error'}` : 'Feature flags are loading.'
+        }
+        control={
+          failed ? (
+            <Button variant="secondary" icon="refresh" onClick={() => void refreshFlags().catch(() => undefined)}>
+              Retry
+            </Button>
+          ) : undefined
+        }
+      />
+    );
+  }
+
+  const flags = allFlags.filter((flag) => !flag.dev_only);
   if (flags.length === 0) return null;
 
   return (

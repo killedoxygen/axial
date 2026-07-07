@@ -16,4 +16,9 @@ export interface FlagsResponse {
   flags: FeatureFlagViewModel[];
 }
 
+export interface FeatureFlagsLoadState {
+  status: 'idle' | 'loading' | 'ready' | 'error';
+  error: string | null;
+}
+
 export type KnownFlagKey = 'dev.state-inspector';

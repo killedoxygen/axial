@@ -1,5 +1,5 @@
 import { api } from './api';
-import { featureFlags } from './store';
+import { featureFlags, featureFlagsLoadState } from './store';
 import { toast } from './toast';
 import type { FlagsResponse, KnownFlagKey } from './types-flags';
 import { errMessage } from './utils';
@@ -9,9 +9,15 @@ let pendingFlagsRefresh: Promise<void> | null = null;
 export function refreshFlags(): Promise<void> {
   if (pendingFlagsRefresh) return pendingFlagsRefresh;
 
+  featureFlagsLoadState.value = { status: 'loading', error: null };
   pendingFlagsRefresh = api<FlagsResponse>('GET', '/flags')
     .then((response) => {
       featureFlags.value = response.flags;
+      featureFlagsLoadState.value = { status: 'ready', error: null };
+    })
+    .catch((err: unknown) => {
+      featureFlagsLoadState.value = { status: 'error', error: errMessage(err) };
+      throw err;
     })
     .finally(() => {
       pendingFlagsRefresh = null;
@@ -46,6 +52,7 @@ export async function setFlagOverride(key: string, enabled: boolean | null): Pro
   try {
     const response = await api<FlagsResponse>('PUT', `/flags/${encodeURIComponent(key)}`, { enabled });
     featureFlags.value = response.flags;
+    featureFlagsLoadState.value = { status: 'ready', error: null };
   } catch (err) {
     featureFlags.value = previous;
     toast(errMessage(err), 'error');

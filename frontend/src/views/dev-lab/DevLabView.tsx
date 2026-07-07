@@ -8,6 +8,7 @@ import {
   bootstrapState,
   config,
   featureFlags,
+  featureFlagsLoadState,
   installQueueState,
   launchState,
   runningSessions,
@@ -21,7 +22,6 @@ import type { ToastKind } from '../../types-ui';
 import { Button, Card, Pill, Toggle } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { route } from '../../ui-state';
-import { errMessage } from '../../utils';
 
 type LabTab = 'flags' | 'inspector' | 'playground';
 type SoundKind = Parameters<typeof Sound.ui>[0];
@@ -86,14 +86,16 @@ function FlagRow({ flag }: { flag: FeatureFlagViewModel }): JSX.Element {
   );
 }
 
-function FlagsPanel({ loadError, onRetry }: { loadError: string | null; onRetry: () => void }): JSX.Element {
+function FlagsPanel({ onRetry }: { onRetry: () => void }): JSX.Element {
   const flags = featureFlags.value;
+  const loadState = featureFlagsLoadState.value;
 
   if (!flags) {
-    const failed = loadError !== null;
+    const failed = loadState.status === 'error';
+    const error = loadState.error || 'Unknown error';
     return (
       <div class="cp-dev-loading" data-error={failed} role={failed ? 'alert' : 'status'}>
-        <span>{failed ? `Could not load feature flags: ${loadError}` : 'Feature flags are still loading.'}</span>
+        <span>{failed ? `Could not load feature flags: ${error}` : 'Feature flags are still loading.'}</span>
         {failed && (
           <Button variant="secondary" size="sm" icon="refresh" onClick={onRetry}>
             Retry
@@ -223,31 +225,16 @@ function PlaygroundPanel(): JSX.Element {
 
 export function DevLabView(): JSX.Element {
   const [tab, setTab] = useState<LabTab>('flags');
-  const [flagLoadError, setFlagLoadError] = useState<string | null>(null);
   const inspectorAvailable = flagEnabled('dev.state-inspector');
   const activeTab = tab === 'inspector' && !inspectorAvailable ? 'flags' : tab;
 
   const loadFlags = (force = false): void => {
-    setFlagLoadError(null);
     const request = force ? refreshFlags() : ensureFlags();
-    void request.catch((err: unknown) => {
-      setFlagLoadError(errMessage(err));
-    });
+    void request.catch(() => undefined);
   };
 
   useEffect(() => {
-    let mounted = true;
-    const request = ensureFlags();
-    void request
-      .then(() => {
-        if (mounted) setFlagLoadError(null);
-      })
-      .catch((err: unknown) => {
-        if (mounted) setFlagLoadError(errMessage(err));
-      });
-    return () => {
-      mounted = false;
-    };
+    loadFlags();
   }, []);
 
   useEffect(() => {
@@ -281,7 +268,7 @@ export function DevLabView(): JSX.Element {
       </div>
 
       <div class="cp-dev-tab-panel">
-        {activeTab === 'flags' && <FlagsPanel loadError={flagLoadError} onRetry={() => loadFlags(true)} />}
+        {activeTab === 'flags' && <FlagsPanel onRetry={() => loadFlags(true)} />}
         {activeTab === 'inspector' && inspectorAvailable && <InspectorPanel />}
         {activeTab === 'playground' && <PlaygroundPanel />}
       </div>
