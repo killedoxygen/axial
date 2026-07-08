@@ -1,5 +1,5 @@
 {
   "bundle": {
-    "icon": ["icons/dev/icon.icns", "icons/dev/icon.png", "icons/dev/icon.ico"]
+    "icon": ["icons/dev/macos/icon.icns", "icons/dev/icon.png", "icons/dev/icon.ico"]
   }
 }

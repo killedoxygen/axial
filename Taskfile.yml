@@ -63,6 +63,11 @@ tasks:
           fi
         platforms: [linux]
 
+  icons:
+    desc: regenerate desktop app icons
+    cmds:
+      - node scripts/generate-icons.mjs
+
   dev:
     desc: run the desktop app in dev mode (frontend dev server + Rust hot-restart)
     deps: [ensure:tauri-cli]
