@@ -10,18 +10,12 @@ export interface InstallItem {
   };
 }
 
-export interface ActiveInstall {
-  versionId: string;
-  pct: number;
-  label: string;
-}
-
 export interface InstallProgressStepViewModel {
   phase_id: string;
   label: string;
   progress_pct: number;
-  current: number;
-  total: number;
+  current?: number;
+  total?: number;
 }
 
 export interface InstallProgressViewModel {

@@ -3,6 +3,8 @@ keep this short and real. if the codebase changes, update this file.
 
 ## State
 - app runtime state lives in `frontend/src/store.ts`
+- domain workflow state owned by a machine lives with that machine (accounts, skin wardrobe, downloads in `frontend/src/machines/downloads.ts`)
+- download/install state has one active-download representation: the `activeDownload` signal fed by the backend queue view model; do not reintroduce local mirrors of it
 - local prefs live in `frontend/src/state.ts`
 - use signal reassignment or helpers in `frontend/src/actions.ts`
 - do not bring back proxy state, manual rerender helpers, or nested in-place mutations that dodge reactivity

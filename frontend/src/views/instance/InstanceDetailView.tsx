@@ -8,7 +8,7 @@ import { instances, launchNotices, launchState, runningSessions, versionById } f
 import { navigate } from '../../ui-state';
 import { selectInstance } from '../../actions';
 import { launchGame, killGame } from '../../launch';
-import { handleInstallClick, retryFailedInstall } from '../../install';
+import { handleInstallClick, retryFailedInstall } from '../../machines/downloads';
 import { errMessage } from '../../utils';
 import { instanceInstallStatus } from '../../instance-install-status';
 import type { EnrichedInstance } from '../../types-instance';

@@ -3,7 +3,7 @@ import { toast } from './toast';
 import { errMessage } from './utils';
 import { navigate } from './ui-state';
 import { addInstance } from './actions';
-import { applyInstallQueueResponse, refreshInstallQueue } from './install';
+import { applyInstallQueueResponse, refreshInstallQueue } from './machines/downloads';
 import type { Instance } from './types-instance';
 import type { InstallQueueStateResponse } from './types-install';
 import type { ToastKind } from './types-ui';

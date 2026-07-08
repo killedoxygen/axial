@@ -2,15 +2,8 @@ import { local, saveLocalState } from './state';
 import { api } from './api';
 import { toast } from './toast';
 import { hasNativeDesktopRuntime, openExternalURL, requestNativeAppRestart } from './native';
-import {
-  appVersion,
-  bootstrapState,
-  installQueueState,
-  installState,
-  launchState,
-  updateCheckState,
-  updateInfo,
-} from './store';
+import { appVersion, bootstrapState, launchState, updateCheckState, updateInfo } from './store';
+import { activeDownload, downloadQueue } from './machines/downloads';
 import type { UpdateInfo } from './types-update';
 import { errMessage } from './utils';
 
@@ -105,8 +98,8 @@ export async function openUpdateChecksum(): Promise<void> {
 
 export function restartBlockedByActivity(): boolean {
   return (
-    installState.value.status !== 'idle' ||
-    installQueueState.value.view_model.queued_count > 0 ||
+    activeDownload.value !== null ||
+    downloadQueue.value.view_model.queued_count > 0 ||
     launchState.value.status !== 'idle'
   );
 }
@@ -196,8 +189,8 @@ async function runAutoUpdateCheck(): Promise<void> {
   }
   if (
     bootstrapState.value !== 'ready' ||
-    installState.value.status !== 'idle' ||
-    installQueueState.value.view_model.queued_count > 0 ||
+    activeDownload.value !== null ||
+    downloadQueue.value.view_model.queued_count > 0 ||
     launchState.value.status !== 'idle'
   ) {
     queueAutoUpdateCheck(AUTO_CHECK_RETRY_MS);

@@ -26,7 +26,7 @@ import {
 } from './native';
 import { refreshAccountSkin } from './player-skin';
 import { scheduleAutoUpdateCheck } from './updater';
-import { refreshInstallQueue } from './install';
+import { refreshInstallQueue } from './machines/downloads';
 import { refreshFlags } from './flags';
 import { toast } from './toast';
 import { errMessage } from './utils';

@@ -9,12 +9,12 @@ import {
   config,
   featureFlags,
   featureFlagsLoadState,
-  installQueueState,
   launchState,
   runningSessions,
   systemInfo,
   updateInfo,
 } from '../../store';
+import { activeDownload, downloadQueue } from '../../machines/downloads';
 import { applyTheme, resetThemeToDefault } from '../../theme';
 import { toast } from '../../toast';
 import type { FeatureFlagViewModel } from '../../types-flags';
@@ -129,7 +129,8 @@ function InspectorPanel(): JSX.Element {
     { key: 'bootstrapState', title: 'bootstrapState', value: bootstrapState.value, open: true },
     { key: 'config', title: 'config', value: config.value },
     { key: 'systemInfo', title: 'systemInfo', value: systemInfo.value },
-    { key: 'installQueueState', title: 'installQueueState', value: installQueueState.value },
+    { key: 'activeDownload', title: 'activeDownload', value: activeDownload.value },
+    { key: 'downloadQueue', title: 'downloadQueue', value: downloadQueue.value },
     { key: 'launchState', title: 'launchState', value: launchState.value },
     { key: 'runningSessions', title: 'runningSessions', value: runningSessions.value },
     { key: 'updateInfo', title: 'updateInfo', value: updateInfo.value },

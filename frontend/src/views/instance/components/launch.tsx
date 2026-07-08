@@ -1,25 +1,18 @@
 import type { JSX } from 'preact';
-import { useEffect, useState } from 'preact/hooks';
 import { Icon } from '../../../ui/Icons';
-import { Button } from '../../../ui/Atoms';
+import { Button, Meter } from '../../../ui/Atoms';
+import { DownloadFailureNotice } from '../../../ui/DownloadFailureNotice';
 import { openContextMenu } from '../../../ui/ContextMenu';
 import { navigate } from '../../../ui-state';
 import { clearLaunchNotice } from '../../../actions';
 import { toast } from '../../../toast';
-import type { InstallFailure, LaunchState } from '../../../store';
+import type { LaunchState } from '../../../store';
+import type { DownloadFailure } from '../../../machines/downloads';
+import type { InstanceInstallProgress } from '../../../instance-install-status';
 import type { LaunchActionState, LaunchNotice, LaunchNoticeTone } from '../../../types-launch';
 import type { EnrichedInstance } from '../../../types-instance';
 import type { InstallQueuedItemViewModel } from '../../../types-install';
-import { countDownRemainingSeconds, formatRemainingTime } from '../../../progress-estimation';
 import { openInstanceFolder } from '../instance-actions';
-
-type InstallBarrierProgress = {
-  pct: number;
-  label: string;
-  displayName?: string;
-  remainingSeconds?: number;
-  remainingSecondsUpdatedAt?: number;
-};
 
 function launchNoticeIcon(tone: LaunchNoticeTone): string {
   if (tone === 'success') return 'check-circle';
@@ -171,6 +164,14 @@ export function LaunchSplitButton({
   );
 }
 
+function OpenDownloadsButton(): JSX.Element {
+  return (
+    <Button variant="secondary" size="sm" icon="download" onClick={() => navigate({ name: 'downloads' })}>
+      Downloads
+    </Button>
+  );
+}
+
 export function InstallBarrierPane({
   installTarget,
   installLabel,
@@ -184,110 +185,44 @@ export function InstallBarrierPane({
   installLabel: string;
   installQueued: boolean;
   installQueuedView?: InstallQueuedItemViewModel;
-  installProgress: InstallBarrierProgress | null;
-  installFailure: InstallFailure | null;
+  installProgress: InstanceInstallProgress | null;
+  installFailure: DownloadFailure | null;
   onRetryInstall: () => void;
 }): JSX.Element {
-  const [etaNow, setEtaNow] = useState(() => Date.now());
-  const hasActiveEta = Boolean(installProgress?.remainingSeconds);
-
-  useEffect(() => {
-    if (!hasActiveEta) return;
-    setEtaNow(Date.now());
-    const intervalId = window.setInterval(() => {
-      setEtaNow(Date.now());
-    }, 1000);
-    return () => {
-      window.clearInterval(intervalId);
-    };
-  }, [hasActiveEta, installProgress?.remainingSeconds, installProgress?.remainingSecondsUpdatedAt]);
+  if (installFailure) {
+    return (
+      <div class="cp-instance-install-pane">
+        <DownloadFailureNotice failure={installFailure} onRetry={onRetryInstall} trailing={<OpenDownloadsButton />} />
+      </div>
+    );
+  }
 
   const pct = installProgress ? Math.max(0, Math.min(100, Math.round(installProgress.pct))) : 0;
-  const failed = Boolean(installFailure);
-  const label =
-    installFailure?.viewModel.summary ||
-    installProgress?.label ||
-    (installQueued ? installQueuedView?.summary || installLabel : 'Preparing install');
-  const retryAction = installFailure?.viewModel.retry_action;
-  const repairAction = installFailure?.viewModel.repair_action;
   const targetLabel = installLabel || installTarget;
-  const remainingSeconds = installProgress
-    ? countDownRemainingSeconds(installProgress.remainingSeconds, installProgress.remainingSecondsUpdatedAt, etaNow)
-    : undefined;
-  const activeEta = remainingSeconds ? `${formatRemainingTime(remainingSeconds)} left` : '';
-  const detail = failed
-    ? installFailure?.viewModel.detail || retryAction?.disabled_reason || 'Open Downloads for more context.'
-    : installProgress
-      ? activeEta
-        ? `${activeEta} · ${pct}% complete`
-        : `${pct}% complete`
-      : installQueued
-        ? installQueuedView?.detail || installQueuedView?.summary || ''
-        : 'Croopor is preparing the required version files.';
+  const heading = installQueued ? installQueuedView?.title || installLabel : 'Installing required files';
+  const body = installProgress
+    ? `${installProgress.label} for ${targetLabel}.`
+    : installQueued
+      ? installQueuedView?.summary || `${targetLabel} is waiting in the download queue.`
+      : `Croopor is preparing the required version files for ${targetLabel}.`;
+  const detail = installProgress ? `${pct}% complete` : installQueued ? installQueuedView?.detail || '' : '';
 
   return (
-    <div class="cp-instance-install-lock" aria-live="polite">
-      <div class="cp-instance-install-lock-main">
-        <span class="cp-instance-install-lock-icon" aria-hidden="true">
-          <Icon name={failed ? 'alert' : installQueued ? 'clock' : 'download'} size={18} stroke={2} />
+    <div class="cp-instance-install-pane" aria-live="polite">
+      <div class="cp-instance-install-head">
+        <span class="cp-instance-install-icon" aria-hidden="true">
+          <Icon name={installQueued ? 'clock' : 'download'} size={18} stroke={2} />
         </span>
-        <div class="cp-instance-install-lock-copy">
-          <h2>
-            {failed
-              ? installFailure?.viewModel.title || 'Install failed'
-              : installQueued
-                ? installQueuedView?.title || installLabel
-                : 'Installing required files'}
-          </h2>
-          {failed ? (
-            <>
-              <p>Could not install {targetLabel}.</p>
-              <p>{label}</p>
-            </>
-          ) : (
-            <p>
-              {label} for {targetLabel}.
-            </p>
-          )}
+        <div class="cp-instance-install-copy">
+          <h2>{heading}</h2>
+          <p>{body}</p>
         </div>
+        {installProgress && <span class="cp-instance-install-pct">{pct}%</span>}
       </div>
-
-      <div class="cp-instance-install-lock-progress" style={{ '--cp-install-lock-pct': `${pct}%` } as any}>
-        <span aria-hidden="true" />
-      </div>
-
-      <div class="cp-instance-install-lock-foot">
+      <Meter value={pct} height={6} ariaLabel={`Install progress for ${targetLabel}`} />
+      <div class="cp-instance-install-foot">
         <span>{detail}</span>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginLeft: 'auto' }}>
-          {failed && (
-            <>
-              {repairAction && (
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  icon="shield-check"
-                  disabled={!repairAction.enabled}
-                  title={repairAction.disabled_reason || undefined}
-                >
-                  {repairAction.label}
-                </Button>
-              )}
-              <Button
-                variant="secondary"
-                size="sm"
-                icon="refresh"
-                onClick={onRetryInstall}
-                disabled={retryAction ? !retryAction.enabled : false}
-                title={retryAction?.disabled_reason || undefined}
-              >
-                {retryAction?.label || 'Retry install'}
-              </Button>
-            </>
-          )}
-          <Button variant="secondary" size="sm" icon="download" onClick={() => navigate({ name: 'downloads' })}>
-            Downloads
-          </Button>
-        </div>
+        <OpenDownloadsButton />
       </div>
     </div>
   );

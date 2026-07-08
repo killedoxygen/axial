@@ -1,22 +1,14 @@
 import type { JSX } from 'preact';
-import { useEffect, useState } from 'preact/hooks';
+import { useState } from 'preact/hooks';
 import { Icon } from '../ui/Icons';
 import { IconButton } from '../ui/Atoms';
 import { WindowControls } from './WindowControls';
 import { MusicWidget } from './MusicWidget';
 import { goBack, goForward, navigate, route } from '../ui-state';
-import {
-  runningSessions,
-  instances,
-  versionById,
-  launchState,
-  installState,
-  installQueueState,
-  installFailure,
-} from '../store';
+import { runningSessions, instances, versionById, launchState } from '../store';
+import { activeDownload, downloadFailure, downloadQueue } from '../machines/downloads';
 import { minecraftVersionLabel } from '../version-display';
 import { windowStartDragging, windowToggleMaximize, hasNativeDesktopRuntime } from '../native';
-import { countDownRemainingSeconds, formatRemainingTime } from '../progress-estimation';
 
 function assertUnreachable(value: never): never {
   throw new Error(`Unhandled route: ${JSON.stringify(value)}`);
@@ -63,23 +55,7 @@ function StatusMark({ icon }: { icon: string }): JSX.Element {
 
 function StatusPill(): JSX.Element {
   const sessions = runningSessions.value;
-  const install = installState.value;
-  const [etaNow, setEtaNow] = useState(() => Date.now());
-
-  useEffect(() => {
-    if (install.status !== 'active' || !install.remainingSeconds) return;
-    setEtaNow(Date.now());
-    const intervalId = window.setInterval(() => {
-      setEtaNow(Date.now());
-    }, 1000);
-    return () => {
-      window.clearInterval(intervalId);
-    };
-  }, [
-    install.status,
-    install.status === 'active' ? install.remainingSeconds : undefined,
-    install.status === 'active' ? install.remainingSecondsUpdatedAt : undefined,
-  ]);
+  const install = activeDownload.value;
 
   const runIds = Object.keys(sessions);
   const inst = runIds.length > 0 ? instances.value.find((i) => i.id === runIds[0]) : null;
@@ -102,18 +78,12 @@ function StatusPill(): JSX.Element {
     );
   }
 
-  if (install.status === 'active') {
-    const queueView = installQueueState.value.view_model;
+  if (install) {
+    const queueView = downloadQueue.value.view_model;
     const installPct = Math.round(Math.max(0, Math.min(100, install.pct)));
-    const installRemainingSeconds = countDownRemainingSeconds(
-      install.remainingSeconds,
-      install.remainingSecondsUpdatedAt,
-      etaNow,
-    );
-    const installEta = installRemainingSeconds ? formatRemainingTime(installRemainingSeconds) : null;
-    const installName = install.displayName || install.versionId;
-    const installTag = install.item.loader?.minecraftVersion || versionTag(install.versionId);
-    const installTitle = `${installName}: ${install.label} · ${installPct}%${installEta ? ` · ${installEta} left` : ''}${queueView.active_queued_count_label || ''}`;
+    const installName = install.displayName || install.item.versionId;
+    const installTag = install.item.loader?.minecraftVersion || versionTag(install.item.versionId);
+    const installTitle = `${installName}: ${install.label} · ${installPct}%${queueView.active_queued_count_label || ''}`;
     const installStyle = { '--cp-install-ratio': String(installPct / 100) } as JSX.CSSProperties;
 
     return (
@@ -127,7 +97,6 @@ function StatusPill(): JSX.Element {
         <StatusMark icon="download" />
         {installTag && <span class="cp-status-pill-meta">{installTag}</span>}
         <span class="cp-status-pill-pct">{installPct}%</span>
-        {installEta && <span class="cp-status-pill-eta">{installEta}</span>}
         {queueView.queued_count > 0 && <span class="cp-status-pill-chip">+{queueView.queued_count}</span>}
       </button>
     );
@@ -149,7 +118,7 @@ function StatusPill(): JSX.Element {
     );
   }
 
-  const queueState = installQueueState.value;
+  const queueState = downloadQueue.value;
   if (queueState.items.length > 0) {
     const queueView = queueState.view_model;
     const queuedTitle = `${queueView.queued_count_label}. ${queueView.next_label ? `Next: ${queueView.next_label}` : queueView.summary}`;
@@ -167,7 +136,7 @@ function StatusPill(): JSX.Element {
     );
   }
 
-  const failure = installFailure.value;
+  const failure = downloadFailure.value;
   if (failure) {
     const title = `${failure.displayName}: ${failure.viewModel.summary}`;
     return (
