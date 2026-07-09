@@ -139,12 +139,12 @@ export function AdvancedSettingsSection(): JSX.Element {
     <SettingsSection>
       <SettingRow
         title="Anonymous usage stats"
-        description="Shares anonymous feature-usage and launch-outcome events to improve Croopor. No names, files, or personal data — see docs/TELEMETRY.md. Builds without a telemetry key never upload."
+        description="Shares anonymous usage and launch stats to improve Croopor. Never includes names, files, or personal data."
         control={<Toggle on={telemetryEnabled} onChange={() => void toggleTelemetry()} />}
       />
       <SettingRow
         title="Reload launcher"
-        description="Useful if the launcher gets out of sync with the backend."
+        description="Restarts the interface if something looks stuck or out of date."
         control={
           <Button variant="secondary" icon="refresh" onClick={() => location.reload()}>
             Reload

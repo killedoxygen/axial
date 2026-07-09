@@ -1,7 +1,8 @@
-// Resolution presets derived from the user's largest available display.
-// The Window Management API (`getScreenDetails`) reports all attached screens
-// but requires a permission grant; fall back to `window.screen` for the
-// primary display when it's unavailable or denied.
+// Resolution presets derived from the user's largest available display,
+// in physical pixels (screen APIs report CSS points, so sizes are scaled
+// by each screen's devicePixelRatio). The Window Management API
+// (`getScreenDetails`) reports all attached screens but requires a
+// permission grant; fall back to `window.screen` when unavailable or denied.
 
 export interface ScreenSize {
   w: number;
@@ -26,7 +27,7 @@ const CANDIDATES: WindowPresetSpec[] = [
 
 const DEFAULT_PRESET: WindowPresetSpec = { id: 'default', label: 'Default', w: 0, h: 0 };
 
-type ScreenDetail = { width: number; height: number };
+type ScreenDetail = { width: number; height: number; devicePixelRatio?: number };
 type WithScreenDetails = Window & {
   getScreenDetails?: () => Promise<{ screens: ScreenDetail[] }>;
 };
@@ -39,17 +40,19 @@ export async function detectMaxScreenSize(): Promise<ScreenSize> {
       let maxW = 0;
       let maxH = 0;
       for (const s of details.screens) {
-        if (s.width > maxW) maxW = s.width;
-        if (s.height > maxH) maxH = s.height;
+        const dpr = s.devicePixelRatio && s.devicePixelRatio > 0 ? s.devicePixelRatio : 1;
+        maxW = Math.max(maxW, Math.round(s.width * dpr));
+        maxH = Math.max(maxH, Math.round(s.height * dpr));
       }
       if (maxW > 0 && maxH > 0) return { w: maxW, h: maxH };
     } catch {
       // Permission denied or API unsupported in this surface; fall through.
     }
   }
+  const dpr = window.devicePixelRatio > 0 ? window.devicePixelRatio : 1;
   const sw = window.screen?.width ?? 1920;
   const sh = window.screen?.height ?? 1080;
-  return { w: sw, h: sh };
+  return { w: Math.round(sw * dpr), h: Math.round(sh * dpr) };
 }
 
 export function buildWindowPresets(max: ScreenSize): WindowPresetSpec[] {
