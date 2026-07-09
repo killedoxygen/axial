@@ -898,13 +898,13 @@ mod tests {
     fn frontend_accounts_flow_uses_backend_auth_action_state() {
         let accounts_view = read_repo_file("frontend/src/views/accounts/AccountsView.tsx");
         let account_auth = read_repo_file("frontend/src/views/accounts/auth.ts");
-        let account_hooks = read_repo_file("frontend/src/views/accounts/hooks.ts");
+        let accounts_machine = read_repo_file("frontend/src/machines/accounts.ts");
         let account_api = read_repo_file("frontend/src/views/accounts/api.ts");
         let account_switcher = read_repo_file("frontend/src/views/accounts/AccountSwitcher.tsx");
         let player_skin = read_repo_file("frontend/src/player-skin.ts");
-        let passive_source = format!("{account_hooks}\n{player_skin}");
+        let passive_source = player_skin;
         let source = format!(
-            "{accounts_view}\n{account_auth}\n{account_hooks}\n{account_api}\n{account_switcher}\n{player_skin}"
+            "{accounts_view}\n{account_auth}\n{accounts_machine}\n{account_api}\n{account_switcher}\n{passive_source}"
         );
 
         assert_contains_all(
@@ -912,10 +912,10 @@ mod tests {
             &source,
             &[
                 "status?.skin_action",
-                "skinAction={skinAction}",
+                "skinActionsEnabled = skinAction?.enabled === true",
                 "actionEnabled(account.online_action)",
                 "active.online_action?.state_id",
-                "actionEnabled(activeRefreshAction)",
+                "actionEnabled(refreshAction)",
                 "accountActionState(value.online_action)",
                 "accountActionState(value.refresh_action)",
                 "accountActionState(value.profile_sync_action)",
