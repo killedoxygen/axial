@@ -119,8 +119,8 @@ where
                 install_performed: false,
             });
         }
-        // Reinstalling produces the same x86_64 build, so a missing-Rosetta
-        // failure can never be repaired by falling through to install.
+        // reinstalling produces the same x86_64 build, so a missing-Rosetta
+        // failure can never be repaired by falling through to install
         Err(error @ JavaRuntimeLookupError::RosettaRequired { .. }) => return Err(error),
         Err(_) => {}
     }

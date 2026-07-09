@@ -1,7 +1,9 @@
 use super::LaunchRequestError;
 use super::proof::persist_launch_proof_best_effort_with_context;
 use super::status::{serialize_guardian, serialize_healing};
-use crate::observability::{RedactionAudience, sanitize_public_diagnostic_text};
+use crate::observability::{
+    RedactionAudience, sanitize_evidence_token, sanitize_public_diagnostic_text,
+};
 use crate::state::launch_reports::LaunchProofContext;
 use crate::state::{AppState, LaunchStatusEvent};
 use croopor_launcher::{
@@ -10,6 +12,10 @@ use croopor_launcher::{
 
 const LIVE_LAUNCH_FAILURE_MAX_CHARS: usize = 180;
 const LIVE_LAUNCH_FAILURE_SAFE_FALLBACK: &str = "Launch failed before Minecraft could start. Detailed diagnostics were hidden because they may contain local paths or private data.";
+// must match prepare.rs's `resolve java: {error}` wrapping of
+// JavaRuntimeLookupError::RosettaRequired, pinned by a test
+const ROSETTA_REQUIRED_LAUNCH_MESSAGE_PREFIX: &str = "resolve java: java runtime ";
+const ROSETTA_REQUIRED_LAUNCH_MESSAGE_SUFFIX: &str = " needs Rosetta 2 on this Mac: run `softwareupdate --install-rosetta --agree-to-license` in Terminal";
 
 pub(super) async fn fail_launch(
     state: &AppState,
@@ -66,12 +72,27 @@ pub(super) async fn fail_launch_with_outcome(
 }
 
 pub fn sanitize_live_launch_failure_message(message: &str) -> String {
+    // the Rosetta hint's `--` flags trip the sensitive-text heuristic, so
+    // rebuild a trusted message instead of losing the guidance
+    if let Some(public_message) = rosetta_required_launch_failure_message(message) {
+        return public_message;
+    }
     sanitize_public_diagnostic_text(
         message,
         RedactionAudience::UserVisible,
         LIVE_LAUNCH_FAILURE_MAX_CHARS,
         LIVE_LAUNCH_FAILURE_SAFE_FALLBACK,
     )
+}
+
+fn rosetta_required_launch_failure_message(message: &str) -> Option<String> {
+    let component = message
+        .strip_prefix(ROSETTA_REQUIRED_LAUNCH_MESSAGE_PREFIX)?
+        .strip_suffix(ROSETTA_REQUIRED_LAUNCH_MESSAGE_SUFFIX)?;
+    let component = sanitize_evidence_token(component, RedactionAudience::UserVisible, 64)?;
+    Some(format!(
+        "This Minecraft version needs Rosetta 2 on Apple Silicon Macs. Required runtime: {component}. Install Rosetta 2 by running `softwareupdate --install-rosetta --agree-to-license` in Terminal, then launch again."
+    ))
 }
 
 async fn emit_terminal_failure(
@@ -121,6 +142,43 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn rosetta_required_launch_message_keeps_guidance_and_pins_core_display() {
+        // built from the real core error so a Display change fails here
+        // instead of silently regressing to the generic fallback
+        let error = croopor_minecraft::JavaRuntimeLookupError::RosettaRequired {
+            component: "jre-legacy".to_string(),
+        };
+        let message = format!("resolve java: {error}");
+
+        let public_message = sanitize_live_launch_failure_message(&message);
+
+        assert!(public_message.contains("Rosetta 2"));
+        assert!(public_message.contains("jre-legacy"));
+        assert!(public_message.contains("softwareupdate --install-rosetta --agree-to-license"));
+        assert!(!public_message.contains("Detailed diagnostics were hidden"));
+    }
+
+    #[test]
+    fn rosetta_recognizer_rejects_tampered_component_tokens() {
+        let message = format!(
+            "{ROSETTA_REQUIRED_LAUNCH_MESSAGE_PREFIX}/home/alice/.croopor/evil{ROSETTA_REQUIRED_LAUNCH_MESSAGE_SUFFIX}"
+        );
+
+        let public_message = sanitize_live_launch_failure_message(&message);
+
+        assert!(!public_message.contains("/home/alice"));
+        assert!(public_message.contains("Launch failed before Minecraft could start"));
+    }
+
+    #[test]
+    fn other_flag_bearing_launch_messages_still_fall_back_to_generic() {
+        let public_message =
+            sanitize_live_launch_failure_message("spawn failed: java --username SecretPlayer");
+
+        assert!(public_message.contains("Launch failed before Minecraft could start"));
+    }
 
     #[tokio::test]
     async fn fail_launch_sanitizes_public_error_and_terminal_failure_payloads() {

@@ -167,10 +167,8 @@ pub(super) fn resolve_component_runtime_from_roots(
     required_major: i32,
     mut inspect: impl FnMut(&Path) -> Result<Option<RuntimeRecord>, JavaRuntimeLookupError>,
 ) -> Result<RuntimeRecord, JavaRuntimeLookupError> {
-    // A Rosetta-blocked candidate in an earlier root must not shadow a
-    // compatible runtime in a later root; defer the error and only surface it
-    // when no root resolves. It still beats NotFound because reinstalling
-    // produces the same x86_64 build.
+    // defer Rosetta blocks: a later root may hold a compatible runtime, and
+    // surfacing beats NotFound since reinstall yields the same x86_64 build
     let mut rosetta_block = None;
     for dir in dirs {
         match inspect(&dir) {

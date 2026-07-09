@@ -195,10 +195,8 @@ pub async fn start_loader_install(
                             facts,
                             descriptors,
                         } => {
-                            // Recorded first so the error-aware outcome below
-                            // wins on journal read whenever it produces
-                            // evidence; this stays as the fallback when it
-                            // records nothing.
+                            // fallback outcome, recorded first so the
+                            // error-aware one below wins on journal read
                             if facts.is_empty() {
                                 record_loader_base_install_dependency_guardian_failure_outcome(
                                     worker_journals.as_ref(),

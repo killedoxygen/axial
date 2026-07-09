@@ -33,9 +33,8 @@ pub(super) fn rosetta_required_error_for_current_host(
         return None;
     }
 
-    // This file is installed as part of Rosetta. One metadata lookup keeps the
-    // common installed case cheap and lets a user install Rosetta then retry
-    // without restarting Croopor because missing results are not cached.
+    // installed with Rosetta, checked uncached so installing Rosetta then
+    // retrying works without restarting Croopor
     if rosetta_present_for_current_host() {
         return None;
     }
