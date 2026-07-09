@@ -3,8 +3,9 @@ use super::{
     InstallProgressCoalescer, InstallProgressViewModel, InstallStartResponse,
     LOADER_INSTALL_INTERRUPTED_MESSAGE, LoaderBuildsRequest, LoaderInstallStartRequest,
     begin_install_operation_journal, emit_install_failed, generate_install_id,
-    install_operation_id, record_and_emit_install_progress,
-    record_install_failure_outcome_and_repair, record_install_operation_interrupted,
+    install_operation_id, operation::install_progress_with_terminal_error,
+    record_and_emit_install_progress, record_install_failure_outcome_and_repair,
+    record_install_failure_outcome_and_repair_for_error, record_install_operation_interrupted,
     record_loader_base_install_dependency_guardian_failure_outcome,
     record_loader_install_operation_guardian_failure_outcome, sanitize_install_progress,
     stage_install_version_command,
@@ -189,7 +190,15 @@ pub async fn start_loader_install(
                 if let Err(error) = result {
                     let observed_at = chrono::Utc::now().to_rfc3339();
                     let repair_outcome = match &error {
-                        LoaderError::BaseInstallFailed { facts, descriptors } => {
+                        LoaderError::BaseInstallFailed {
+                            error: base_error,
+                            facts,
+                            descriptors,
+                        } => {
+                            // Recorded first so the error-aware outcome below
+                            // wins on journal read whenever it produces
+                            // evidence; this stays as the fallback when it
+                            // records nothing.
                             if facts.is_empty() {
                                 record_loader_base_install_dependency_guardian_failure_outcome(
                                     worker_journals.as_ref(),
@@ -197,18 +206,17 @@ pub async fn start_loader_install(
                                     &loader_target_id,
                                     &base_version_id,
                                 );
-                                None
-                            } else {
-                                record_install_failure_outcome_and_repair(
-                                    worker_journals.as_ref(),
-                                    worker_failure_memory.as_ref(),
-                                    &worker_operation_id,
-                                    facts,
-                                    descriptors,
-                                    &observed_at,
-                                )
-                                .await
                             }
+                            record_install_failure_outcome_and_repair_for_error(
+                                worker_journals.as_ref(),
+                                worker_failure_memory.as_ref(),
+                                &worker_operation_id,
+                                base_error,
+                                facts,
+                                descriptors,
+                                &observed_at,
+                            )
+                            .await
                         }
                         LoaderError::ArtifactDownloadFailed { facts, descriptors } => {
                             record_install_failure_outcome_and_repair(
@@ -435,7 +443,7 @@ pub fn loader_error_response(error: LoaderError) -> InstallApplicationError {
 }
 
 pub(crate) fn loader_error_progress(error: &LoaderError) -> DownloadProgress {
-    DownloadProgress {
+    let progress = DownloadProgress {
         phase: "error".to_string(),
         current: 0,
         total: 0,
@@ -444,7 +452,14 @@ pub(crate) fn loader_error_progress(error: &LoaderError) -> DownloadProgress {
         done: true,
         bytes_done: None,
         bytes_total: None,
+    };
+    if let LoaderError::BaseInstallFailed {
+        error: base_error, ..
+    } = error
+    {
+        return install_progress_with_terminal_error(progress, base_error);
     }
+    progress
 }
 
 pub(crate) fn base_install_failed_progress() -> DownloadProgress {

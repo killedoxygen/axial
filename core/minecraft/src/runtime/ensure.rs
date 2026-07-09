@@ -109,14 +109,20 @@ where
     F: FnMut(RuntimeEnsureEvent),
 {
     let preferred = &requirement.preferred_component;
-    if let Ok(runtime) = resolve_managed_runtime(library_dir, preferred) {
-        observer(RuntimeEnsureEvent::ManagedRuntimeReady {
-            component: preferred.as_str().to_string(),
-        });
-        return Ok(ManagedEnsure {
-            effective: runtime,
-            install_performed: false,
-        });
+    match resolve_managed_runtime(library_dir, preferred) {
+        Ok(runtime) => {
+            observer(RuntimeEnsureEvent::ManagedRuntimeReady {
+                component: preferred.as_str().to_string(),
+            });
+            return Ok(ManagedEnsure {
+                effective: runtime,
+                install_performed: false,
+            });
+        }
+        // Reinstalling produces the same x86_64 build, so a missing-Rosetta
+        // failure can never be repaired by falling through to install.
+        Err(error @ JavaRuntimeLookupError::RosettaRequired { .. }) => return Err(error),
+        Err(_) => {}
     }
 
     let install_root = runtime_cache_dir().join(preferred.as_str());
@@ -124,14 +130,18 @@ where
     let _guard = install_lock.lock().await;
     let _file_lock = acquire_runtime_install_file_lock(&install_root).await?;
 
-    if let Ok(runtime) = resolve_managed_runtime(library_dir, preferred) {
-        observer(RuntimeEnsureEvent::ManagedRuntimeReady {
-            component: preferred.as_str().to_string(),
-        });
-        return Ok(ManagedEnsure {
-            effective: runtime,
-            install_performed: false,
-        });
+    match resolve_managed_runtime(library_dir, preferred) {
+        Ok(runtime) => {
+            observer(RuntimeEnsureEvent::ManagedRuntimeReady {
+                component: preferred.as_str().to_string(),
+            });
+            return Ok(ManagedEnsure {
+                effective: runtime,
+                install_performed: false,
+            });
+        }
+        Err(error @ JavaRuntimeLookupError::RosettaRequired { .. }) => return Err(error),
+        Err(_) => {}
     }
 
     observer(RuntimeEnsureEvent::DownloadingManagedRuntime {

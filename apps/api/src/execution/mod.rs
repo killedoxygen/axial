@@ -95,6 +95,8 @@ pub enum ExecutionFactKind {
     RuntimeProbeFailed,
     RuntimeReadyMarkerMissing,
     RuntimeRepairApplied,
+    RuntimeRosettaRequired,
+    RuntimeUnavailableForPlatform,
     RuntimeWrongMajor,
     RuntimeWrongUpdate,
     JvmArgsEmpty,

@@ -20,7 +20,8 @@ use super::runtime::{
     RuntimeEnsurePipeline, finish_runtime_pipeline_after_artifacts, runtime_ensure_progress,
 };
 use super::transfer::{
-    download_file_with_client, download_file_with_client_and_fact_sender, download_temp_path,
+    download_file_with_client, download_file_with_client_and_fact_sender,
+    download_file_with_client_report_with_retry_delays, download_temp_path,
     ensure_selected_artifact_with_client, execute_download_to_temp, remove_stale_download_temp,
 };
 use super::*;
@@ -178,7 +179,7 @@ async fn selected_missing_artifact_fact_is_emitted_before_download_failure() {
             "application/octet-stream".to_string(),
         )],
         b"unavailable".to_vec(),
-        3,
+        4,
     )
     .await;
     let client = build_http_client(Duration::from_secs(5));
@@ -372,7 +373,7 @@ async fn runtime_task_is_aborted_when_artifact_install_fails() {
     let task = tokio::spawn(async move {
         let _guard = RuntimeGuard(cancelled_in_task);
         let _ = started_tx.send(());
-        std::future::pending::<Result<JavaVersion, String>>().await
+        std::future::pending::<Result<JavaVersion, crate::runtime::JavaRuntimeLookupError>>().await
     });
     started_rx.await.expect("runtime task should start");
     let artifact_error = DownloadError::ResolveManifest("artifact failed".to_string());
@@ -403,7 +404,11 @@ async fn runtime_task_is_aborted_when_artifact_install_fails() {
 
 #[tokio::test]
 async fn runtime_error_is_reported_when_artifact_install_succeeds() {
-    let task = tokio::spawn(async { Err::<JavaVersion, String>("runtime failed".to_string()) });
+    let task = tokio::spawn(async {
+        Err::<JavaVersion, _>(crate::runtime::JavaRuntimeLookupError::Download(
+            "runtime failed".to_string(),
+        ))
+    });
 
     let result =
         finish_runtime_pipeline_after_artifacts(Some(runtime_pipeline(task)), Ok(()), &mut |_| {})
@@ -411,13 +416,18 @@ async fn runtime_error_is_reported_when_artifact_install_succeeds() {
 
     assert!(matches!(
         result,
-        Err(DownloadError::PrepareRuntime(message)) if message == "runtime failed"
+        Err(DownloadError::PrepareRuntime(message))
+            if message == "failed to install java runtime: runtime failed"
     ));
 }
 
 #[tokio::test]
 async fn artifact_error_is_preserved_when_runtime_also_fails() {
-    let task = tokio::spawn(async { Err::<JavaVersion, String>("runtime failed".to_string()) });
+    let task = tokio::spawn(async {
+        Err::<JavaVersion, _>(crate::runtime::JavaRuntimeLookupError::Download(
+            "runtime failed".to_string(),
+        ))
+    });
     let artifact_error = DownloadError::ResolveManifest("artifact failed".to_string());
 
     let result = finish_runtime_pipeline_after_artifacts(
@@ -434,7 +444,7 @@ async fn artifact_error_is_preserved_when_runtime_also_fails() {
 }
 
 fn runtime_pipeline(
-    task: tokio::task::JoinHandle<Result<JavaVersion, String>>,
+    task: tokio::task::JoinHandle<Result<JavaVersion, crate::runtime::JavaRuntimeLookupError>>,
 ) -> RuntimeEnsurePipeline {
     let (_progress_tx, progress_rx) = mpsc::unbounded_channel();
     RuntimeEnsurePipeline { task, progress_rx }
@@ -1997,4 +2007,155 @@ async fn write_raw_response(socket: &mut tokio::net::TcpStream, status: &str, bo
     );
     let _ = socket.write_all(response.as_bytes()).await;
     let _ = socket.write_all(body).await;
+}
+
+#[tokio::test]
+async fn download_file_with_client_report_retries_retryable_provider_failure() {
+    let root = temp_dir("retry-provider-then-success");
+    let destination = root.join("artifact.jar");
+    let body = b"artifact".to_vec();
+    let expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(&body));
+    let (url, requests) = spawn_scripted_download_server(vec![
+        ScriptedDownloadResponse::full("500 Internal Server Error", b"temporary".to_vec()),
+        ScriptedDownloadResponse::full("200 OK", body.clone()),
+    ])
+    .await;
+    let client = build_http_client(Duration::from_secs(5));
+
+    let report = download_file_with_client_report_with_retry_delays(
+        &client,
+        &url,
+        &destination,
+        &expected,
+        &[Duration::ZERO],
+    )
+    .await
+    .expect("retryable provider failure should recover");
+
+    assert_eq!(report.bytes_written, body.len() as u64);
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+    assert_eq!(fs::read(&destination).expect("read artifact"), body);
+    assert!(!download_temp_path(&destination).exists());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn download_file_with_client_report_does_not_retry_checksum_mismatch() {
+    let root = temp_dir("retry-checksum-mismatch");
+    let destination = root.join("artifact.jar");
+    let body = b"artifact".to_vec();
+    let expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(&body));
+    let (url, requests) = spawn_scripted_download_server(vec![
+        ScriptedDownloadResponse::full("200 OK", b"wrong-by".to_vec()),
+        ScriptedDownloadResponse::full("200 OK", body),
+    ])
+    .await;
+    let client = build_http_client(Duration::from_secs(5));
+
+    let error = download_file_with_client_report_with_retry_delays(
+        &client,
+        &url,
+        &destination,
+        &expected,
+        &[Duration::ZERO, Duration::ZERO, Duration::ZERO],
+    )
+    .await
+    .expect_err("checksum mismatch should fail without retry");
+
+    assert_eq!(error.kind, ExecutionDownloadFactKind::ChecksumMismatch);
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    assert!(!destination.exists());
+    assert!(!download_temp_path(&destination).exists());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn download_file_with_client_report_retries_interrupted_body_stream() {
+    let root = temp_dir("retry-interrupted-stream");
+    let destination = root.join("artifact.jar");
+    let body = b"artifact".to_vec();
+    let expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(&body));
+    let (url, requests) = spawn_scripted_download_server(vec![
+        ScriptedDownloadResponse::partial("200 OK", body.len(), b"art".to_vec()),
+        ScriptedDownloadResponse::full("200 OK", body.clone()),
+    ])
+    .await;
+    let client = build_http_client(Duration::from_secs(5));
+
+    download_file_with_client_report_with_retry_delays(
+        &client,
+        &url,
+        &destination,
+        &expected,
+        &[Duration::ZERO],
+    )
+    .await
+    .expect("interrupted stream should recover");
+
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+    assert_eq!(fs::read(&destination).expect("read artifact"), body);
+    assert!(!download_temp_path(&destination).exists());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+struct ScriptedDownloadResponse {
+    status: &'static str,
+    body: Vec<u8>,
+    content_length: usize,
+}
+
+impl ScriptedDownloadResponse {
+    fn full(status: &'static str, body: Vec<u8>) -> Self {
+        let content_length = body.len();
+        Self {
+            status,
+            body,
+            content_length,
+        }
+    }
+
+    fn partial(status: &'static str, content_length: usize, body: Vec<u8>) -> Self {
+        Self {
+            status,
+            body,
+            content_length,
+        }
+    }
+}
+
+async fn spawn_scripted_download_server(
+    responses: Vec<ScriptedDownloadResponse>,
+) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind scripted download server");
+    let url = format!("http://{}", listener.local_addr().expect("local addr"));
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let requests_for_server = Arc::clone(&requests);
+    tokio::spawn(async move {
+        for response in responses {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            requests_for_server.fetch_add(1, Ordering::SeqCst);
+            let _ = read_request_path(&mut socket).await;
+            write_scripted_download_response(&mut socket, response).await;
+        }
+    });
+    (url, requests)
+}
+
+async fn write_scripted_download_response(
+    socket: &mut tokio::net::TcpStream,
+    response: ScriptedDownloadResponse,
+) {
+    let header = format!(
+        "HTTP/1.1 {}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        response.status, response.content_length
+    );
+    let _ = socket.write_all(header.as_bytes()).await;
+    let _ = socket.write_all(&response.body).await;
 }

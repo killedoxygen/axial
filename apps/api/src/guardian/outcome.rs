@@ -221,6 +221,18 @@ fn install_failure_outcome_copy(
             vec!["The loader install did not continue after the base Minecraft install failed."],
             vec!["Retry the base version install, then retry the loader install."],
         ),
+        "managed_runtime_unavailable_for_platform" => (
+            "This Minecraft version needs a Java runtime that is not available for this device.",
+            vec!["The required managed Java runtime is not available for this device."],
+            vec!["This version cannot be installed on this device."],
+        ),
+        "managed_runtime_rosetta_required" => (
+            "This Minecraft version needs Rosetta 2 on Apple Silicon Macs.",
+            vec!["The required managed Java runtime needs Rosetta 2 on this Mac."],
+            vec![
+                "Install Rosetta 2 by running `softwareupdate --install-rosetta --agree-to-license` in Terminal, then retry.",
+            ],
+        ),
         "filesystem_permission_denied" => (
             "Guardian blocked install because Croopor could not write launcher-managed files safely.",
             vec!["The install did not mutate files after the filesystem refused the operation."],
@@ -415,6 +427,18 @@ mod tests {
                 GuardianDecisionKind::Block,
                 "Guardian blocked loader install because the required base install failed.",
                 "base Minecraft install failed",
+            ),
+            (
+                "managed_runtime_rosetta_required",
+                GuardianDecisionKind::Block,
+                "This Minecraft version needs Rosetta 2 on Apple Silicon Macs.",
+                "Rosetta 2",
+            ),
+            (
+                "managed_runtime_unavailable_for_platform",
+                GuardianDecisionKind::Block,
+                "This Minecraft version needs a Java runtime that is not available for this device.",
+                "required managed Java runtime",
             ),
             (
                 "filesystem_permission_denied",

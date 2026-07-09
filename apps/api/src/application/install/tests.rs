@@ -18,7 +18,7 @@ use croopor_minecraft::download::{
     download_file_with_client_report,
 };
 use croopor_minecraft::{
-    DownloadProgress, LoaderComponentId, LoaderError, LoaderProviderFailureKind,
+    DownloadError, DownloadProgress, LoaderComponentId, LoaderError, LoaderProviderFailureKind,
 };
 use croopor_performance::PerformanceManager;
 use serde_json::json;
@@ -139,6 +139,48 @@ fn sanitize_install_progress_hides_raw_terminal_error_fragments() {
     let message = sanitized.error.as_deref().expect("error is present");
 
     assert_eq!(message, INSTALL_FAILURE_MESSAGE);
+    assert_no_public_raw_fragments(message);
+}
+
+#[test]
+fn sanitize_install_progress_preserves_runtime_unavailable_terminal_message() {
+    let error = DownloadError::RuntimeUnavailableForPlatform {
+        component: "jre-legacy".to_string(),
+        platform: "mac-os-arm64".to_string(),
+    };
+    let progress = install_progress_with_terminal_error(
+        progress("error", true, Some(&error.to_string())),
+        &error,
+    );
+
+    let sanitized = sanitize_install_progress(progress);
+    let message = sanitized.error.as_deref().expect("error is present");
+
+    assert_ne!(message, INSTALL_FAILURE_MESSAGE);
+    assert!(message.contains("Java runtime"));
+    assert!(message.contains("not available for this device"));
+    assert!(message.contains("jre-legacy"));
+    assert!(message.contains("mac-os-arm64"));
+    assert_no_public_raw_fragments(message);
+}
+
+#[test]
+fn sanitize_install_progress_preserves_rosetta_required_terminal_message() {
+    let error = DownloadError::RuntimeRosettaRequired {
+        component: "jre-legacy".to_string(),
+    };
+    let progress = install_progress_with_terminal_error(
+        progress("error", true, Some(&error.to_string())),
+        &error,
+    );
+
+    let sanitized = sanitize_install_progress(progress);
+    let message = sanitized.error.as_deref().expect("error is present");
+
+    assert_ne!(message, INSTALL_FAILURE_MESSAGE);
+    assert!(message.contains("Rosetta 2"));
+    assert!(message.contains("jre-legacy"));
+    assert!(message.contains("softwareupdate --install-rosetta --agree-to-license"));
     assert_no_public_raw_fragments(message);
 }
 
@@ -1279,6 +1321,370 @@ async fn install_status_exposes_backend_authored_guardian_download_failure_outco
 }
 
 #[tokio::test]
+async fn install_status_exposes_runtime_unavailable_failure_without_retry() {
+    let root = temp_root("install-status-runtime-unavailable");
+    let state = build_test_state(&root);
+    let failure_memory = GuardianFailureMemoryStore::new();
+    let install_id = "runtime-unavailable-status-install";
+    let operation_id = install_operation_id(install_id);
+    let error = DownloadError::RuntimeUnavailableForPlatform {
+        component: "jre-legacy".to_string(),
+        platform: "mac-os-arm64".to_string(),
+    };
+    let terminal_progress = sanitize_install_progress(install_progress_with_terminal_error(
+        progress("error", true, Some(&error.to_string())),
+        &error,
+    ));
+    state.installs().insert(install_id.to_string()).await;
+    state
+        .installs()
+        .emit(install_id, terminal_progress.clone())
+        .await;
+    begin_install_operation_journal(state.journals(), &operation_id, "1.11.2");
+    let mut last_phase = None;
+    record_install_operation_progress(
+        state.journals(),
+        &operation_id,
+        &terminal_progress,
+        &mut last_phase,
+    );
+    let facts = [
+        ExecutionDownloadFact {
+            kind: ExecutionDownloadFactKind::ArtifactMissing,
+            target: "minecraft_runtime_manifest".to_string(),
+            fields: Vec::new(),
+        },
+        ExecutionDownloadFact {
+            kind: ExecutionDownloadFactKind::MetadataMissing,
+            target: "minecraft_runtime_manifest".to_string(),
+            fields: Vec::new(),
+        },
+    ];
+    record_install_operation_guardian_evidence(state.journals(), &operation_id, &facts);
+    record_install_operation_guardian_failure_outcome_for_error_with_memory(
+        state.journals(),
+        &failure_memory,
+        &operation_id,
+        &error,
+        &facts,
+        "2026-07-09T10:00:00+00:00",
+    );
+
+    let response = install_status(&state, install_id)
+        .await
+        .expect("install status");
+
+    assert!(response.done);
+    assert!(
+        response
+            .progress
+            .last()
+            .and_then(|progress| progress.error.as_deref())
+            .is_some_and(|message| message.contains("not available for this device")
+                && message.contains("jre-legacy")
+                && message.contains("mac-os-arm64"))
+    );
+    let guardian = response.guardian.as_ref().expect("guardian outcome");
+    assert_eq!(
+        guardian.diagnosis_id,
+        "managed_runtime_unavailable_for_platform"
+    );
+    assert_eq!(guardian.decision, "block");
+    assert_eq!(
+        guardian.label,
+        "This Minecraft version needs a Java runtime that is not available for this device."
+    );
+    assert!(
+        guardian
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("jre-legacy") && detail.contains("mac-os-arm64"))
+    );
+    let failure_view_model = response
+        .failure_view_model
+        .as_ref()
+        .expect("failure view model");
+    assert_eq!(failure_view_model.state_id, "failed_blocked");
+    assert!(!failure_view_model.retry_action.enabled);
+    assert_eq!(
+        failure_view_model.retry_action.disabled_reason.as_deref(),
+        Some("This version cannot be installed on this device.")
+    );
+    assert_no_public_raw_fragments(
+        &serde_json::to_string(&failure_view_model).expect("failure view model json"),
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn install_status_exposes_rosetta_required_failure_with_retry() {
+    let root = temp_root("install-status-rosetta-required");
+    let state = build_test_state(&root);
+    let failure_memory = GuardianFailureMemoryStore::new();
+    let install_id = "runtime-rosetta-status-install";
+    let operation_id = install_operation_id(install_id);
+    let error = DownloadError::RuntimeRosettaRequired {
+        component: "jre-legacy".to_string(),
+    };
+    let terminal_progress = sanitize_install_progress(install_progress_with_terminal_error(
+        progress("error", true, Some(&error.to_string())),
+        &error,
+    ));
+    state.installs().insert(install_id.to_string()).await;
+    state
+        .installs()
+        .emit(install_id, terminal_progress.clone())
+        .await;
+    begin_install_operation_journal(state.journals(), &operation_id, "1.11.2");
+    let mut last_phase = None;
+    record_install_operation_progress(
+        state.journals(),
+        &operation_id,
+        &terminal_progress,
+        &mut last_phase,
+    );
+    let facts = [
+        ExecutionDownloadFact {
+            kind: ExecutionDownloadFactKind::ArtifactMissing,
+            target: "minecraft_runtime_manifest".to_string(),
+            fields: Vec::new(),
+        },
+        ExecutionDownloadFact {
+            kind: ExecutionDownloadFactKind::MetadataMissing,
+            target: "minecraft_runtime_manifest".to_string(),
+            fields: Vec::new(),
+        },
+    ];
+    record_install_operation_guardian_evidence(state.journals(), &operation_id, &facts);
+    record_install_operation_guardian_failure_outcome_for_error_with_memory(
+        state.journals(),
+        &failure_memory,
+        &operation_id,
+        &error,
+        &facts,
+        "2026-07-09T10:00:00+00:00",
+    );
+
+    let response = install_status(&state, install_id)
+        .await
+        .expect("install status");
+
+    assert!(response.done);
+    assert!(
+        response
+            .progress
+            .last()
+            .and_then(|progress| progress.error.as_deref())
+            .is_some_and(|message| message.contains("Rosetta 2")
+                && message.contains("jre-legacy")
+                && message.contains("softwareupdate --install-rosetta --agree-to-license"))
+    );
+    let guardian = response.guardian.as_ref().expect("guardian outcome");
+    assert_eq!(guardian.diagnosis_id, "managed_runtime_rosetta_required");
+    assert_eq!(guardian.decision, "block");
+    assert_eq!(
+        guardian.label,
+        "This Minecraft version needs Rosetta 2 on Apple Silicon Macs."
+    );
+    assert!(
+        guardian
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("jre-legacy") && detail.contains("Rosetta 2"))
+    );
+    assert!(guardian.guidance.iter().any(|guidance| {
+        guidance.contains("softwareupdate --install-rosetta --agree-to-license")
+    }));
+    let failure_view_model = response
+        .failure_view_model
+        .as_ref()
+        .expect("failure view model");
+    assert_eq!(failure_view_model.state_id, "failed_blocked");
+    assert!(failure_view_model.retry_action.enabled);
+    assert_eq!(failure_view_model.retry_action.disabled_reason, None);
+    assert_no_public_raw_fragments(
+        &serde_json::to_string(&failure_view_model).expect("failure view model json"),
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn network_install_error_wins_over_benign_accumulated_download_facts() {
+    let root = temp_root("install-status-network-error-benign-facts");
+    let state = build_test_state(&root);
+    let failure_memory = GuardianFailureMemoryStore::new();
+    let install_id = "network-error-benign-facts-install";
+    let operation_id = install_operation_id(install_id);
+    let request_error = reqwest::Client::builder()
+        .timeout(Duration::from_millis(100))
+        .build()
+        .expect("client")
+        .get("http://127.0.0.1:1/croopor-network-failure")
+        .send()
+        .await
+        .expect_err("closed localhost port should fail");
+    let error = DownloadError::Request(request_error);
+    state.installs().insert(install_id.to_string()).await;
+    state
+        .installs()
+        .emit(install_id, observed_install_failure_progress())
+        .await;
+    begin_install_operation_journal(state.journals(), &operation_id, "1.21.5");
+    let mut last_phase = None;
+    record_install_operation_progress(
+        state.journals(),
+        &operation_id,
+        &observed_install_failure_progress(),
+        &mut last_phase,
+    );
+    let facts = [
+        ExecutionDownloadFact {
+            kind: ExecutionDownloadFactKind::ArtifactMissing,
+            target: "minecraft_client_1.21.5".to_string(),
+            fields: Vec::new(),
+        },
+        ExecutionDownloadFact {
+            kind: ExecutionDownloadFactKind::MetadataMissing,
+            target: "minecraft_asset_object_checksumless".to_string(),
+            fields: Vec::new(),
+        },
+    ];
+    record_install_operation_guardian_evidence(state.journals(), &operation_id, &facts);
+    record_install_operation_guardian_failure_outcome_for_error_with_memory(
+        state.journals(),
+        &failure_memory,
+        &operation_id,
+        &error,
+        &facts,
+        "2026-07-09T10:05:00+00:00",
+    );
+
+    let response = install_status(&state, install_id)
+        .await
+        .expect("install status");
+
+    let guardian = response.guardian.as_ref().expect("guardian outcome");
+    assert_eq!(guardian.diagnosis_id, "download_unavailable");
+    assert_eq!(guardian.decision, "retry");
+    assert!(
+        guardian
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("provider or network download"))
+    );
+    let failure_view_model = response
+        .failure_view_model
+        .as_ref()
+        .expect("failure view model");
+    assert_eq!(failure_view_model.state_id, "failed_retryable");
+    assert!(failure_view_model.retry_action.enabled);
+    assert_eq!(failure_view_model.retry_action.disabled_reason, None);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn request_install_error_keeps_terminal_artifact_target_for_failure_memory() {
+    let journals = OperationJournalStore::new();
+    let failure_memory = GuardianFailureMemoryStore::new();
+    let operation_id = install_operation_id("request-terminal-target");
+    let request_error = reqwest::Client::builder()
+        .timeout(Duration::from_millis(100))
+        .build()
+        .expect("client")
+        .get("http://127.0.0.1:1/croopor-network-failure")
+        .send()
+        .await
+        .expect_err("closed localhost port should fail");
+    let error = DownloadError::Request(request_error);
+    let terminal_target = "minecraft_client_terminal_provider_failure";
+    let facts = [
+        download_fact(
+            ExecutionDownloadFactKind::ArtifactMissing,
+            "minecraft_client_stale_missing",
+        ),
+        ExecutionDownloadFact {
+            kind: ExecutionDownloadFactKind::ProviderFailure,
+            target: terminal_target.to_string(),
+            fields: vec![("status".to_string(), "503".to_string())],
+        },
+    ];
+
+    record_install_operation_guardian_failure_outcome_for_error_with_memory(
+        &journals,
+        &failure_memory,
+        &operation_id,
+        &error,
+        &facts,
+        "2026-07-09T10:05:00+00:00",
+    );
+
+    let entries = failure_memory.list();
+    let entry = entries
+        .iter()
+        .find(|entry| entry.diagnosis_id.as_str() == "download_unavailable")
+        .expect("provider failure memory");
+    assert_eq!(entry.target.id, terminal_target);
+    assert_ne!(entry.target.id, "minecraft_download");
+}
+
+#[tokio::test]
+async fn error_based_install_repair_skips_stale_artifact_facts_for_runtime_failure() {
+    let root = temp_root("install-runtime-stale-artifact-repair");
+    let destination = root.join("client.jar");
+    fs::write(&destination, b"already repaired client").expect("existing artifact");
+    let replacement = b"unexpected guardian repair".to_vec();
+    let server = TestByteServer::start(replacement.clone());
+    let journals = OperationJournalStore::new();
+    let failure_memory = GuardianFailureMemoryStore::new();
+    let operation_id = install_operation_id("runtime-stale-artifact-repair");
+    begin_install_operation_journal(&journals, &operation_id, "1.11.2");
+    let target_id = "minecraft_client_runtime_stale";
+    let facts = vec![download_fact(
+        ExecutionDownloadFactKind::ChecksumMismatch,
+        target_id,
+    )];
+    let descriptors = vec![selected_descriptor(
+        SelectedDownloadArtifactKind::ClientJar,
+        target_id,
+        &destination,
+        &server.url,
+        &replacement,
+    )];
+    let error = DownloadError::RuntimeRosettaRequired {
+        component: "jre-legacy".to_string(),
+    };
+
+    let outcome = record_install_failure_outcome_and_repair_for_error(
+        &journals,
+        &failure_memory,
+        &operation_id,
+        &error,
+        &facts,
+        &descriptors,
+        "2026-07-09T10:05:00+00:00",
+    )
+    .await;
+
+    assert!(outcome.is_none());
+    assert_eq!(
+        fs::read(&destination).expect("artifact should be untouched"),
+        b"already repaired client"
+    );
+    assert_eq!(server.request_count(), 0);
+    let entry = journals.get(&operation_id).expect("operation journal");
+    assert!(
+        install_guardian_repair_summary_from_journal(&entry).is_none(),
+        "runtime failure should not record stale artifact repair state"
+    );
+
+    server.stop();
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn install_status_exposes_backend_authored_guardian_blocking_safety_outcomes() {
     let root = temp_root("install-status-guardian-blocking-failures");
     let state = build_test_state(&root);
@@ -1602,6 +2008,9 @@ fn loader_error_response_keeps_status_and_failure_kind_without_raw_details() {
     assert_no_public_raw_fragments(body["error"].as_str().expect("error is a string"));
 
     let (status, Json(body)) = loader_error_response(LoaderError::BaseInstallFailed {
+        error: Box::new(DownloadError::ResolveManifest(
+            "https://example.invalid/manifest.json?token=secret".to_string(),
+        )),
         facts: vec![ExecutionDownloadFact {
             kind: ExecutionDownloadFactKind::ProviderFailure,
             target: "minecraft_client_1.21.5".to_string(),
@@ -1653,6 +2062,40 @@ fn loader_error_progress_hides_raw_details_and_keeps_terminal_shape() {
     );
     assert!(progress.done);
     assert_no_public_raw_fragments(progress.error.as_deref().expect("error is present"));
+}
+
+#[test]
+fn loader_base_install_rosetta_failure_keeps_specific_terminal_message() {
+    let progress = loader_error_progress(&LoaderError::BaseInstallFailed {
+        error: Box::new(DownloadError::RuntimeRosettaRequired {
+            component: "jre-legacy".to_string(),
+        }),
+        facts: Vec::new(),
+        descriptors: Vec::new(),
+    });
+
+    let message = progress.error.clone().expect("error is present");
+    assert!(message.contains("Rosetta 2"));
+    assert!(message.contains("softwareupdate --install-rosetta --agree-to-license"));
+
+    let sanitized = sanitize_install_progress(progress);
+    assert_eq!(sanitized.error.as_deref(), Some(message.as_str()));
+}
+
+#[test]
+fn loader_base_install_generic_failure_keeps_loader_message() {
+    let progress = loader_error_progress(&LoaderError::BaseInstallFailed {
+        error: Box::new(DownloadError::ResolveManifest(
+            "https://example.invalid/manifest.json".to_string(),
+        )),
+        facts: Vec::new(),
+        descriptors: Vec::new(),
+    });
+
+    assert_eq!(
+        progress.error.as_deref(),
+        Some("Base game install failed. Retry the install from Downloads.")
+    );
 }
 
 #[test]

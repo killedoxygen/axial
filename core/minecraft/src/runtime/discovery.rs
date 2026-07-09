@@ -12,6 +12,7 @@ use super::model::{
     RuntimeOverride, RuntimeRecord, RuntimeRequirement, RuntimeSource,
 };
 use super::probe::probe_java_runtime_info;
+use super::rosetta::rosetta_required_error_for_current_host;
 use crate::launch::{JavaVersion, java_component_for_major};
 use crate::paths::runtime_dirs;
 use sha1::{Digest as _, Sha1};
@@ -155,18 +156,39 @@ pub(super) fn resolve_component_runtime(
 ) -> Result<RuntimeRecord, JavaRuntimeLookupError> {
     let mut dirs = runtime_dirs(library_dir);
     dirs.push(runtime_cache_dir());
+    resolve_component_runtime_from_roots(dirs, component, required_major, |dir| {
+        inspect_component_runtime_for_resolution(dir, component.as_str())
+    })
+}
+
+pub(super) fn resolve_component_runtime_from_roots(
+    dirs: Vec<PathBuf>,
+    component: &RuntimeId,
+    required_major: i32,
+    mut inspect: impl FnMut(&Path) -> Result<Option<RuntimeRecord>, JavaRuntimeLookupError>,
+) -> Result<RuntimeRecord, JavaRuntimeLookupError> {
+    // A Rosetta-blocked candidate in an earlier root must not shadow a
+    // compatible runtime in a later root; defer the error and only surface it
+    // when no root resolves. It still beats NotFound because reinstalling
+    // produces the same x86_64 build.
+    let mut rosetta_block = None;
     for dir in dirs {
-        if let Some(record) = inspect_component_runtime(&dir, component.as_str())
-            && record.install_state == RuntimeInstallState::Ready
-        {
-            return Ok(record);
+        match inspect(&dir) {
+            Ok(Some(record)) if record.install_state == RuntimeInstallState::Ready => {
+                return Ok(record);
+            }
+            Ok(_) => {}
+            Err(error @ JavaRuntimeLookupError::RosettaRequired { .. }) => {
+                rosetta_block.get_or_insert(error);
+            }
+            Err(error) => return Err(error),
         }
     }
 
-    Err(JavaRuntimeLookupError::NotFound {
+    Err(rosetta_block.unwrap_or(JavaRuntimeLookupError::NotFound {
         component: component.0.clone(),
         major: required_major,
-    })
+    }))
 }
 
 pub(super) fn component_runtime_ready_without_probe(base_dir: &Path, component: &str) -> bool {
@@ -237,8 +259,25 @@ pub(super) fn resolve_override_runtime(
     })
 }
 pub(super) fn inspect_component_runtime(base_dir: &Path, component: &str) -> Option<RuntimeRecord> {
+    inspect_component_runtime_checked(base_dir, component, false)
+        .ok()
+        .flatten()
+}
+
+fn inspect_component_runtime_for_resolution(
+    base_dir: &Path,
+    component: &str,
+) -> Result<Option<RuntimeRecord>, JavaRuntimeLookupError> {
+    inspect_component_runtime_checked(base_dir, component, true)
+}
+
+fn inspect_component_runtime_checked(
+    base_dir: &Path,
+    component: &str,
+    strict_compatibility: bool,
+) -> Result<Option<RuntimeRecord>, JavaRuntimeLookupError> {
     if !runtime_filesystem_path(base_dir).as_ref().exists() {
-        return None;
+        return Ok(None);
     }
 
     let os_arch = runtime_os_arch();
@@ -252,8 +291,18 @@ pub(super) fn inspect_component_runtime(base_dir: &Path, component: &str) -> Opt
         }
 
         let java_exe = java_executable(&candidate);
+        let rosetta_required = if state == RuntimeInstallState::Ready {
+            rosetta_required_error_for_current_host(&java_exe, component)
+        } else {
+            None
+        };
+        if rosetta_required.is_some() && strict_compatibility {
+            return Err(JavaRuntimeLookupError::RosettaRequired {
+                component: component.to_string(),
+            });
+        }
         let source = classify_runtime_source(base_dir);
-        let info = if state == RuntimeInstallState::Ready {
+        let info = if state == RuntimeInstallState::Ready && rosetta_required.is_none() {
             probe_java_runtime_info(&java_exe, Some(component)).unwrap_or(JavaRuntimeInfo {
                 id: component.to_string(),
                 major: 0,
@@ -271,17 +320,17 @@ pub(super) fn inspect_component_runtime(base_dir: &Path, component: &str) -> Opt
             }
         };
 
-        return Some(RuntimeRecord {
+        return Ok(Some(RuntimeRecord {
             id: RuntimeId(component.to_string()),
             java_path: java_exe.to_string_lossy().to_string(),
             info,
             source,
             install_state: state,
             root_dir: candidate.to_string_lossy().to_string(),
-        });
+        }));
     }
 
-    None
+    Ok(None)
 }
 
 pub(super) fn runtime_requires_ready_marker(base_dir: &Path) -> bool {

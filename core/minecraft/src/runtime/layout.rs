@@ -32,6 +32,14 @@ pub(super) fn runtime_os_arch_for(target_os: &str, target_arch: &str) -> String 
     }
 }
 
+pub(super) fn runtime_platform_fallbacks(primary_platform: &str) -> &'static [&'static str] {
+    match primary_platform {
+        "mac-os-arm64" => &["mac-os"],
+        "windows-arm64" => &["windows-x64"],
+        _ => &[],
+    }
+}
+
 fn runtime_arch_name(target_arch: &str) -> &str {
     match target_arch {
         "x86_64" => "x64",

@@ -35,6 +35,12 @@ pub enum DownloadError {
     ParseVersion(#[from] serde_json::Error),
     #[error("prepare java runtime: {0}")]
     PrepareRuntime(String),
+    #[error("java runtime {component} is not available for {platform}")]
+    RuntimeUnavailableForPlatform { component: String, platform: String },
+    #[error(
+        "java runtime {component} needs Rosetta 2 on this Mac: run `softwareupdate --install-rosetta --agree-to-license` in Terminal"
+    )]
+    RuntimeRosettaRequired { component: String },
     #[error("download integrity: {0}")]
     Integrity(String),
 }

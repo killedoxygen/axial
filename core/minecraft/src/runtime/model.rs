@@ -134,6 +134,12 @@ pub enum JavaRuntimeLookupError {
     NotFound { component: String, major: i32 },
     #[error("failed to install java runtime: {0}")]
     Download(String),
+    #[error("java runtime {component} is not available for {platform}")]
+    UnsupportedPlatform { component: String, platform: String },
+    #[error(
+        "java runtime {component} needs Rosetta 2 on this Mac: run `softwareupdate --install-rosetta --agree-to-license` in Terminal"
+    )]
+    RosettaRequired { component: String },
     #[error("java runtime probe timed out")]
     ProbeTimedOut,
     #[error("failed to probe java runtime: {0}")]

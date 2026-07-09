@@ -389,8 +389,9 @@ pub enum LoaderError {
     },
     #[error("loader install verification failed: {0}")]
     Verify(String),
-    #[error("base Minecraft install failed")]
+    #[error("base Minecraft install failed: {error}")]
     BaseInstallFailed {
+        error: Box<DownloadError>,
         facts: Vec<ExecutionDownloadFact>,
         descriptors: Vec<SelectedDownloadArtifactDescriptor>,
     },

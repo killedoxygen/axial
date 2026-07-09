@@ -97,6 +97,10 @@ fn execution_fact_shape(fact: &ExecutionFact) -> (GuardianFactId, GuardianDomain
         ExecutionFactKind::RuntimeProbeFailed => "java_probe_failed",
         ExecutionFactKind::RuntimeReadyMarkerMissing => "managed_runtime_ready_marker_missing",
         ExecutionFactKind::RuntimeRepairApplied => "managed_runtime_repair_applied",
+        ExecutionFactKind::RuntimeRosettaRequired => "managed_runtime_rosetta_required",
+        ExecutionFactKind::RuntimeUnavailableForPlatform => {
+            "managed_runtime_unavailable_for_platform"
+        }
         ExecutionFactKind::RuntimeWrongMajor => "java_major_mismatch",
         ExecutionFactKind::RuntimeWrongUpdate => "java_update_too_old",
         ExecutionFactKind::JvmArgsEmpty => "jvm_args_empty",
@@ -202,6 +206,8 @@ fn exit_code_fact_id(fact: &ExecutionFact) -> &'static str {
 fn reliability_for_execution_fact(kind: ExecutionFactKind) -> FactReliability {
     match kind {
         ExecutionFactKind::RuntimeProbeFailed
+        | ExecutionFactKind::RuntimeRosettaRequired
+        | ExecutionFactKind::RuntimeUnavailableForPlatform
         | ExecutionFactKind::RuntimeWrongMajor
         | ExecutionFactKind::RuntimeWrongUpdate
         | ExecutionFactKind::DownloadChecksumMismatch

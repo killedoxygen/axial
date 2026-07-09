@@ -480,7 +480,11 @@ where
     .await;
     match result {
         Ok(()) => Ok(()),
-        Err(_error) => Err(LoaderError::BaseInstallFailed { facts, descriptors }),
+        Err(error) => Err(LoaderError::BaseInstallFailed {
+            error: Box::new(error),
+            facts,
+            descriptors,
+        }),
     }
 }
 

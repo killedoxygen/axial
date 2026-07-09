@@ -12,6 +12,7 @@ mod layout;
 mod manifest;
 mod model;
 mod probe;
+mod rosetta;
 
 pub use discovery::{
     find_java_runtime, is_known_runtime_component, list_java_runtimes, list_runtime_records,
@@ -29,7 +30,7 @@ pub use model::{
 pub use probe::probe_java_runtime_info;
 
 #[cfg(test)]
-use discovery::detect_runtime_state;
+use discovery::{detect_runtime_state, resolve_component_runtime_from_roots};
 #[cfg(test)]
 use ensure::{runtime_install_lock_file_path, runtime_install_lock_from_map};
 #[cfg(test)]
@@ -41,18 +42,24 @@ use file_download::{
 };
 #[cfg(test)]
 use install::{
-    install_runtime_manifest_file, install_runtime_manifest_files, plan_runtime_manifest_files,
-    remove_runtime_install_path, remove_runtime_install_path_async,
+    install_managed_runtime_from_manifest_url, install_runtime_manifest_file,
+    install_runtime_manifest_files, plan_runtime_manifest_files, remove_runtime_install_path,
+    remove_runtime_install_path_async, select_runtime_manifest_url,
 };
 #[cfg(test)]
 use layout::{java_executable, java_executable_for_os, runtime_os_arch_for};
 #[cfg(test)]
 use manifest::{
-    ComponentManifestDownload, ComponentManifestDownloads, ComponentManifestFile,
-    MAX_RUNTIME_MANIFEST_BYTES, fetch_runtime_json,
+    ComponentManifest, ComponentManifestDownload, ComponentManifestDownloads,
+    ComponentManifestFile, MAX_RUNTIME_MANIFEST_BYTES, RuntimeManifest, fetch_runtime_json,
 };
 #[cfg(test)]
 use probe::detect_distribution;
+#[cfg(test)]
+use rosetta::{
+    MachOArm64Compatibility, RosettaRuntimeDecision, parse_mach_o_arm64_compatibility,
+    rosetta_requirement_for_managed_runtime,
+};
 
 #[cfg(test)]
 mod tests;

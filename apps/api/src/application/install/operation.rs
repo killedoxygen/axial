@@ -25,19 +25,26 @@ use crate::state::failure_memory::{
     FailureMemoryActionOutcome, FailureMemoryKey, GuardianFailureMemoryEntry,
 };
 use crate::state::{GuardianFailureMemoryStore, InstallProgressRecord, OperationJournalStore};
-use croopor_minecraft::DownloadProgress;
-use croopor_minecraft::download::ExecutionDownloadFact;
+use croopor_minecraft::download::{ExecutionDownloadFact, ExecutionDownloadFactKind};
+use croopor_minecraft::{DownloadError, DownloadProgress};
 use croopor_minecraft::{LoaderError, LoaderInstallFailureKind};
 use serde_json::{Value, json};
 
 const PROVIDER_FAILURE_SUPPRESSION_COOLDOWN_MINUTES: i64 = 5;
 const PROVIDER_FAILURE_MEMORY_SOURCE: &str = "install_provider";
 const COALESCED_PROGRESS_EVENT_INTERVAL: usize = 25;
+const ROSETTA_INSTALL_COMMAND: &str = "softwareupdate --install-rosetta --agree-to-license";
+const ROSETTA_REQUIRED_INSTALL_GUIDANCE: &str = "Install Rosetta 2 by running `softwareupdate --install-rosetta --agree-to-license` in Terminal, then retry.";
+const ROSETTA_REQUIRED_INSTALL_GUIDANCE_TOKEN: &str = "rosetta_required_install_guidance";
 
 const GUARDIAN_OUTCOME_DECISION_PREFIX: &str = "guardian_outcome_decision:";
 const GUARDIAN_OUTCOME_SUMMARY_PREFIX: &str = "guardian_outcome_summary:";
 const GUARDIAN_OUTCOME_DETAIL_PREFIX: &str = "guardian_outcome_detail:";
 const GUARDIAN_OUTCOME_GUIDANCE_PREFIX: &str = "guardian_outcome_guidance:";
+const RUNTIME_UNAVAILABLE_INSTALL_FAILURE_MESSAGE_PREFIX: &str =
+    "This Minecraft version needs a Java runtime that is not available for this device.";
+const RUNTIME_ROSETTA_REQUIRED_INSTALL_FAILURE_MESSAGE_PREFIX: &str =
+    "This Minecraft version needs Rosetta 2 on Apple Silicon Macs.";
 
 pub fn stage_install_version_command(
     request: InstallVersionCommand,
@@ -225,6 +232,25 @@ pub fn record_install_operation_guardian_failure_outcome_with_memory(
     );
 }
 
+pub fn record_install_operation_guardian_failure_outcome_for_error_with_memory(
+    journals: &OperationJournalStore,
+    failure_memory: &GuardianFailureMemoryStore,
+    operation_id: &OperationId,
+    error: &DownloadError,
+    facts: &[ExecutionDownloadFact],
+    observed_at: &str,
+) {
+    let evidence =
+        install_failure_evidence_from_download_error_or_facts(operation_id, error, facts);
+    record_install_operation_guardian_failure_outcome_from_evidence_with_memory(
+        journals,
+        Some(failure_memory),
+        operation_id,
+        &evidence,
+        observed_at,
+    );
+}
+
 pub fn record_loader_install_operation_guardian_failure_outcome(
     journals: &OperationJournalStore,
     failure_memory: &GuardianFailureMemoryStore,
@@ -277,6 +303,7 @@ pub fn install_guardian_outcome_summary_from_journal(
         })?;
     let detail = latest_generated_fact_value(entry, GUARDIAN_OUTCOME_DETAIL_PREFIX);
     let guidance = latest_generated_fact_value(entry, GUARDIAN_OUTCOME_GUIDANCE_PREFIX)
+        .map(expand_guardian_guidance_fact)
         .into_iter()
         .collect();
 
@@ -298,6 +325,9 @@ pub fn sanitize_install_progress(mut progress: DownloadProgress) -> DownloadProg
         .and_then(|file| sanitize_evidence_token(&file, RedactionAudience::UserVisible, 96));
     progress.error = progress.error.take().map(|error| {
         if progress.done {
+            if is_specific_terminal_install_failure_message(&error) {
+                return error;
+            }
             return INSTALL_FAILURE_MESSAGE.to_string();
         }
         sanitize_public_diagnostic_text(
@@ -308,6 +338,83 @@ pub fn sanitize_install_progress(mut progress: DownloadProgress) -> DownloadProg
         )
     });
     progress
+}
+
+pub(crate) fn install_progress_with_terminal_error(
+    mut progress: DownloadProgress,
+    error: &DownloadError,
+) -> DownloadProgress {
+    if progress.done
+        && progress.error.is_some()
+        && let Some(message) = specific_terminal_install_failure_message(error)
+    {
+        progress.error = Some(message);
+    }
+    progress
+}
+
+fn specific_terminal_install_failure_message(error: &DownloadError) -> Option<String> {
+    match error {
+        DownloadError::RuntimeUnavailableForPlatform {
+            component,
+            platform,
+        } => Some(runtime_unavailable_install_failure_message(
+            component, platform,
+        )),
+        DownloadError::RuntimeRosettaRequired { component } => {
+            Some(runtime_rosetta_required_install_failure_message(component))
+        }
+        _ => None,
+    }
+}
+
+fn runtime_unavailable_install_failure_message(component: &str, platform: &str) -> String {
+    let component = sanitize_evidence_token(component, RedactionAudience::UserVisible, 64)
+        .unwrap_or_else(|| "required-runtime".to_string());
+    let platform = sanitize_evidence_token(platform, RedactionAudience::UserVisible, 64)
+        .unwrap_or_else(|| "this-device".to_string());
+    format!(
+        "{RUNTIME_UNAVAILABLE_INSTALL_FAILURE_MESSAGE_PREFIX} Required runtime: {component} on {platform}."
+    )
+}
+
+fn runtime_rosetta_required_install_failure_message(component: &str) -> String {
+    let component = sanitize_evidence_token(component, RedactionAudience::UserVisible, 64)
+        .unwrap_or_else(|| "required-runtime".to_string());
+    format!(
+        "{RUNTIME_ROSETTA_REQUIRED_INSTALL_FAILURE_MESSAGE_PREFIX} Required runtime: {component}. Install Rosetta 2 by running `{ROSETTA_INSTALL_COMMAND}` in Terminal, then retry."
+    )
+}
+
+fn is_specific_terminal_install_failure_message(error: &str) -> bool {
+    if error.starts_with(RUNTIME_ROSETTA_REQUIRED_INSTALL_FAILURE_MESSAGE_PREFIX) {
+        return is_rosetta_required_terminal_install_failure_message(error);
+    }
+
+    error.starts_with(RUNTIME_UNAVAILABLE_INSTALL_FAILURE_MESSAGE_PREFIX)
+        && sanitize_public_diagnostic_text(
+            error,
+            RedactionAudience::UserVisible,
+            220,
+            INSTALL_FAILURE_MESSAGE,
+        )
+        .as_str()
+            == error
+}
+
+fn is_rosetta_required_terminal_install_failure_message(error: &str) -> bool {
+    let prefix =
+        format!("{RUNTIME_ROSETTA_REQUIRED_INSTALL_FAILURE_MESSAGE_PREFIX} Required runtime: ");
+    let suffix = format!(". {ROSETTA_REQUIRED_INSTALL_GUIDANCE}");
+    let Some(component) = error
+        .strip_prefix(&prefix)
+        .and_then(|rest| rest.strip_suffix(&suffix))
+    else {
+        return false;
+    };
+
+    sanitize_evidence_token(component, RedactionAudience::UserVisible, 64)
+        .is_some_and(|sanitized| sanitized == component)
 }
 
 pub fn vanilla_install_progress_view_model(
@@ -636,6 +743,193 @@ fn install_failure_evidence_from_download_facts(
         .collect()
 }
 
+fn install_failure_evidence_from_download_error_or_facts(
+    operation_id: &OperationId,
+    error: &DownloadError,
+    facts: &[ExecutionDownloadFact],
+) -> Vec<GuardianInstallArtifactFailureEvidence> {
+    if let Some(evidence) = typed_runtime_failure_evidence(operation_id, error) {
+        return vec![evidence];
+    }
+
+    let terminal_facts = terminal_download_failure_facts_for_error(error, facts);
+    let terminal_fact_evidence =
+        install_failure_evidence_from_download_facts(operation_id, &terminal_facts);
+    if should_prefer_terminal_download_facts(error) && !terminal_fact_evidence.is_empty() {
+        return terminal_fact_evidence;
+    }
+
+    if let Some(evidence) = install_failure_evidence_from_download_error(operation_id, error) {
+        return vec![evidence];
+    }
+
+    if !terminal_fact_evidence.is_empty() {
+        return terminal_fact_evidence;
+    }
+
+    install_failure_evidence_from_download_facts(operation_id, facts)
+}
+
+fn typed_runtime_failure_evidence(
+    operation_id: &OperationId,
+    error: &DownloadError,
+) -> Option<GuardianInstallArtifactFailureEvidence> {
+    match error {
+        DownloadError::RuntimeUnavailableForPlatform {
+            component,
+            platform,
+        } => Some(
+            GuardianInstallArtifactFailureEvidence::launcher_managed(
+                Some(operation_id.clone()),
+                format!("java_runtime_{component}_{platform}"),
+                GuardianInstallArtifactFailureKind::RuntimeUnavailableForPlatform,
+            )
+            .with_field("component", component.as_str())
+            .with_field("platform", platform.as_str()),
+        ),
+        DownloadError::RuntimeRosettaRequired { component } => Some(
+            GuardianInstallArtifactFailureEvidence::launcher_managed(
+                Some(operation_id.clone()),
+                format!("java_runtime_{component}_rosetta"),
+                GuardianInstallArtifactFailureKind::RuntimeRosettaRequired,
+            )
+            .with_field("component", component.as_str()),
+        ),
+        _ => None,
+    }
+}
+
+fn install_failure_evidence_from_download_error(
+    operation_id: &OperationId,
+    error: &DownloadError,
+) -> Option<GuardianInstallArtifactFailureEvidence> {
+    let (target_id, kind) = install_failure_target_and_kind_from_download_error(error)?;
+
+    Some(GuardianInstallArtifactFailureEvidence::launcher_managed(
+        Some(operation_id.clone()),
+        target_id,
+        kind,
+    ))
+}
+
+fn install_failure_target_and_kind_from_download_error(
+    error: &DownloadError,
+) -> Option<(&'static str, GuardianInstallArtifactFailureKind)> {
+    let evidence = match error {
+        DownloadError::FileOperation(_) => (
+            "install_filesystem",
+            GuardianInstallArtifactFailureKind::PermissionDenied,
+        ),
+        DownloadError::ResolveManifest(_) => (
+            "version_manifest",
+            GuardianInstallArtifactFailureKind::ProviderFailure,
+        ),
+        DownloadError::Request(_) => (
+            "minecraft_download",
+            GuardianInstallArtifactFailureKind::NetworkFailure,
+        ),
+        DownloadError::ParseVersion(_) => (
+            "version_json",
+            GuardianInstallArtifactFailureKind::MetadataInvalid,
+        ),
+        DownloadError::PrepareRuntime(_) => (
+            "java_runtime",
+            GuardianInstallArtifactFailureKind::ProviderFailure,
+        ),
+        DownloadError::RuntimeRosettaRequired { .. }
+        | DownloadError::RuntimeUnavailableForPlatform { .. } => return None,
+        DownloadError::Integrity(_) => return None,
+    };
+
+    Some(evidence)
+}
+
+pub(super) fn install_repair_facts_from_download_error_or_facts(
+    error: &DownloadError,
+    facts: &[ExecutionDownloadFact],
+) -> Vec<ExecutionDownloadFact> {
+    if matches!(
+        error,
+        DownloadError::RuntimeRosettaRequired { .. }
+            | DownloadError::RuntimeUnavailableForPlatform { .. }
+    ) {
+        return Vec::new();
+    }
+
+    let terminal_facts = terminal_download_failure_facts_for_error(error, facts);
+    if should_prefer_terminal_download_facts(error) && !terminal_facts.is_empty() {
+        return terminal_facts;
+    }
+
+    if install_failure_target_and_kind_from_download_error(error).is_some() {
+        return Vec::new();
+    }
+
+    if !terminal_facts.is_empty() {
+        return terminal_facts;
+    }
+
+    Vec::new()
+}
+
+fn terminal_download_failure_facts_for_error(
+    error: &DownloadError,
+    facts: &[ExecutionDownloadFact],
+) -> Vec<ExecutionDownloadFact> {
+    facts
+        .iter()
+        .filter(|fact| terminal_download_failure_fact_kind_for_error(error, fact.kind))
+        .cloned()
+        .collect()
+}
+
+fn should_prefer_terminal_download_facts(error: &DownloadError) -> bool {
+    matches!(
+        error,
+        DownloadError::FileOperation(_)
+            | DownloadError::Request(_)
+            | DownloadError::PrepareRuntime(_)
+            | DownloadError::Integrity(_)
+    )
+}
+
+fn terminal_download_failure_fact_kind_for_error(
+    error: &DownloadError,
+    kind: ExecutionDownloadFactKind,
+) -> bool {
+    if matches!(error, DownloadError::Request(_)) {
+        return request_terminal_download_failure_fact_kind(kind);
+    }
+
+    terminal_download_failure_fact_kind(kind)
+}
+
+fn request_terminal_download_failure_fact_kind(kind: ExecutionDownloadFactKind) -> bool {
+    matches!(
+        kind,
+        ExecutionDownloadFactKind::Interrupted
+            | ExecutionDownloadFactKind::NetworkFailure
+            | ExecutionDownloadFactKind::ProviderFailure
+    )
+}
+
+fn terminal_download_failure_fact_kind(kind: ExecutionDownloadFactKind) -> bool {
+    matches!(
+        kind,
+        ExecutionDownloadFactKind::ChecksumMismatch
+            | ExecutionDownloadFactKind::MetadataInvalid
+            | ExecutionDownloadFactKind::MetadataMissing
+            | ExecutionDownloadFactKind::Interrupted
+            | ExecutionDownloadFactKind::NetworkFailure
+            | ExecutionDownloadFactKind::OwnershipRefused
+            | ExecutionDownloadFactKind::PermissionFailure
+            | ExecutionDownloadFactKind::PromoteFailed
+            | ExecutionDownloadFactKind::ProviderFailure
+            | ExecutionDownloadFactKind::SizeMismatch
+            | ExecutionDownloadFactKind::TempWriteFailed
+    )
+}
+
 fn record_install_operation_guardian_failure_outcome_from_evidence(
     journals: &OperationJournalStore,
     operation_id: &OperationId,
@@ -710,12 +1004,7 @@ fn record_install_operation_guardian_failure_outcome_from_evidence_with_memory(
         ));
     }
     if let Some(guidance) = outcome.user_outcome.guidance.first() {
-        facts.push(prefixed_text_fact(
-            GUARDIAN_OUTCOME_GUIDANCE_PREFIX,
-            guidance,
-            "Retry the install after checking connection and storage availability.",
-            240,
-        ));
+        facts.push(prefixed_guardian_guidance_fact(guidance));
     }
 
     journals.record_guardian_evidence(
@@ -947,6 +1236,29 @@ fn prefixed_text_fact(prefix: &str, value: &str, fallback: &str, max_len: usize)
     let value = sanitize_evidence_text(value, RedactionAudience::UserVisible, max_len)
         .unwrap_or_else(|| fallback.to_string());
     format!("{prefix}{value}")
+}
+
+fn prefixed_guardian_guidance_fact(value: &str) -> String {
+    if value == ROSETTA_REQUIRED_INSTALL_GUIDANCE {
+        return format!(
+            "{GUARDIAN_OUTCOME_GUIDANCE_PREFIX}{ROSETTA_REQUIRED_INSTALL_GUIDANCE_TOKEN}"
+        );
+    }
+
+    prefixed_text_fact(
+        GUARDIAN_OUTCOME_GUIDANCE_PREFIX,
+        value,
+        "Retry the install after checking connection and storage availability.",
+        240,
+    )
+}
+
+fn expand_guardian_guidance_fact(value: String) -> String {
+    if value == ROSETTA_REQUIRED_INSTALL_GUIDANCE_TOKEN {
+        ROSETTA_REQUIRED_INSTALL_GUIDANCE.to_string()
+    } else {
+        value
+    }
 }
 
 fn guardian_decision_kind_id(decision: GuardianDecisionKind) -> &'static str {

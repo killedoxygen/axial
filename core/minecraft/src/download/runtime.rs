@@ -1,13 +1,13 @@
 use super::model::{DownloadError, DownloadProgress, progress};
 use super::plan::TransferPlan;
 use crate::launch::JavaVersion;
-use crate::runtime::{RuntimeEnsureEvent, ensure_runtime_with_events};
+use crate::runtime::{JavaRuntimeLookupError, RuntimeEnsureEvent, ensure_runtime_with_events};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
 pub(super) struct RuntimeEnsurePipeline {
-    pub(super) task: tokio::task::JoinHandle<Result<JavaVersion, String>>,
+    pub(super) task: tokio::task::JoinHandle<Result<JavaVersion, JavaRuntimeLookupError>>,
     pub(super) progress_rx: mpsc::UnboundedReceiver<DownloadProgress>,
 }
 
@@ -57,8 +57,8 @@ pub(super) fn spawn_runtime_ensure_pipeline(
         if !plan_contribution_resolved {
             plan.resolve_contribution(0);
         }
-        ensure_result.map_err(|error| error.to_string())?;
-        Ok::<_, String>(java_version)
+        ensure_result?;
+        Ok::<_, JavaRuntimeLookupError>(java_version)
     });
 
     RuntimeEnsurePipeline { task, progress_rx }
@@ -146,7 +146,7 @@ where
                             send(progress);
                         }
                         let runtime_result = match result {
-                            Ok(result) => result.map_err(DownloadError::PrepareRuntime),
+                            Ok(result) => result.map_err(runtime_lookup_error_to_download_error),
                             Err(error) => Err(DownloadError::PrepareRuntime(error.to_string())),
                         };
                         return runtime_result.map(Some);
@@ -154,5 +154,69 @@ where
                 }
             }
         }
+    }
+}
+
+fn runtime_lookup_error_to_download_error(error: JavaRuntimeLookupError) -> DownloadError {
+    match error {
+        JavaRuntimeLookupError::UnsupportedPlatform {
+            component,
+            platform,
+        } => DownloadError::RuntimeUnavailableForPlatform {
+            component,
+            platform,
+        },
+        JavaRuntimeLookupError::RosettaRequired { component } => {
+            DownloadError::RuntimeRosettaRequired { component }
+        }
+        error => DownloadError::PrepareRuntime(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_runtime_platform_maps_to_typed_download_error() {
+        let error =
+            runtime_lookup_error_to_download_error(JavaRuntimeLookupError::UnsupportedPlatform {
+                component: "jre-legacy".to_string(),
+                platform: "mac-os-arm64".to_string(),
+            });
+
+        assert!(matches!(
+            error,
+            DownloadError::RuntimeUnavailableForPlatform {
+                component,
+                platform
+            } if component == "jre-legacy" && platform == "mac-os-arm64"
+        ));
+    }
+
+    #[test]
+    fn rosetta_required_runtime_maps_to_typed_download_error() {
+        let error =
+            runtime_lookup_error_to_download_error(JavaRuntimeLookupError::RosettaRequired {
+                component: "jre-legacy".to_string(),
+            });
+
+        assert!(matches!(
+            error,
+            DownloadError::RuntimeRosettaRequired { component }
+                if component == "jre-legacy"
+        ));
+    }
+
+    #[test]
+    fn other_runtime_errors_stay_prepare_runtime_errors() {
+        let error = runtime_lookup_error_to_download_error(JavaRuntimeLookupError::Download(
+            "network failed".to_string(),
+        ));
+
+        assert!(matches!(
+            error,
+            DownloadError::PrepareRuntime(message) if message == "failed to install java runtime: network failed"
+        ));
     }
 }

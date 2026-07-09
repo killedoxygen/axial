@@ -1,4 +1,5 @@
 use super::model::{JavaRuntimeInfo, JavaRuntimeLookupError};
+use super::rosetta::{is_rosetta_exec_error, rosetta_required_error_for_current_host};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -17,6 +18,13 @@ pub fn probe_java_runtime_info(
         command_output_with_timeout(command, JAVA_RUNTIME_PROBE_TIMEOUT).map_err(|error| {
             if error.kind() == std::io::ErrorKind::TimedOut {
                 JavaRuntimeLookupError::ProbeTimedOut
+            } else if is_rosetta_exec_error(&error)
+                && let Some(error) = rosetta_required_error_for_current_host(
+                    &exec_path,
+                    id_hint.unwrap_or("selected-runtime"),
+                )
+            {
+                error
             } else {
                 JavaRuntimeLookupError::Probe(error.to_string())
             }

@@ -30,7 +30,7 @@ use crate::state::{
 };
 use axum::{Json, http::StatusCode};
 use croopor_minecraft::{
-    DownloadProgress, Downloader, LoaderComponentId,
+    DownloadError, DownloadProgress, Downloader, LoaderComponentId,
     download::{ExecutionDownloadFact, SelectedDownloadArtifactDescriptor},
     resolve_build_record,
 };
@@ -68,14 +68,16 @@ pub use model::{
 };
 use operation::{
     InstallProgressCoalescer, install_failure_point_from_journal, install_journal_is_terminal,
-    install_progress_history_from_journal, install_progress_record, interrupted_install_progress,
-    observed_install_failure_progress, public_install_id,
+    install_progress_history_from_journal, install_progress_record,
+    install_progress_with_terminal_error, install_repair_facts_from_download_error_or_facts,
+    interrupted_install_progress, observed_install_failure_progress, public_install_id,
 };
 pub use operation::{
     begin_install_operation_journal, install_guardian_outcome_summary_from_journal,
     install_operation_id, loader_install_progress_view_model, public_loader_install_progress_json,
     public_vanilla_install_progress_json, record_install_operation_guardian_evidence,
     record_install_operation_guardian_failure_outcome,
+    record_install_operation_guardian_failure_outcome_for_error_with_memory,
     record_install_operation_guardian_failure_outcome_with_memory,
     record_install_operation_interrupted, record_install_operation_progress,
     record_loader_base_install_dependency_guardian_failure_outcome,
@@ -220,14 +222,22 @@ pub(crate) async fn start_install_version(
                     .lock()
                     .ok()
                     .and_then(|mut progress| progress.take());
-                if install_result.is_ok() {
-                    break (true, attempt_terminal_progress);
-                }
+                let install_error = match install_result {
+                    Ok(()) => break (true, attempt_terminal_progress),
+                    Err(error) => error,
+                };
+                tracing::warn!(
+                    operation_id = worker_operation_id.as_str(),
+                    version_id = version_id.as_str(),
+                    failure_kind = install_error_log_kind(&install_error),
+                    "install worker observed failed install"
+                );
                 let observed_at = chrono::Utc::now().to_rfc3339();
-                let repair_outcome = record_install_failure_outcome_and_repair(
+                let repair_outcome = record_install_failure_outcome_and_repair_for_error(
                     worker_journals.as_ref(),
                     worker_failure_memory.as_ref(),
                     &worker_operation_id,
+                    &install_error,
                     &install_facts,
                     &install_descriptors,
                     &observed_at,
@@ -243,8 +253,9 @@ pub(crate) async fn start_install_version(
                 }
                 break (
                     false,
-                    Some(terminal_failure_progress_or_default(
-                        attempt_terminal_progress,
+                    Some(install_progress_with_terminal_error(
+                        terminal_failure_progress_or_default(attempt_terminal_progress),
+                        &install_error,
                     )),
                 );
             };
@@ -295,6 +306,68 @@ pub(super) async fn record_install_failure_outcome_and_repair(
         install_facts,
         observed_at,
     );
+    repair_install_failure_with_guardian(
+        journals,
+        failure_memory,
+        operation_id,
+        install_facts,
+        install_descriptors,
+        observed_at,
+    )
+    .await
+}
+
+pub(super) async fn record_install_failure_outcome_and_repair_for_error(
+    journals: &crate::state::OperationJournalStore,
+    failure_memory: &crate::state::GuardianFailureMemoryStore,
+    operation_id: &crate::state::contracts::OperationId,
+    error: &DownloadError,
+    install_facts: &[ExecutionDownloadFact],
+    install_descriptors: &[SelectedDownloadArtifactDescriptor],
+    observed_at: &str,
+) -> Option<GuardianArtifactRepairOutcome> {
+    record_install_operation_guardian_evidence(journals, operation_id, install_facts);
+    record_install_operation_guardian_failure_outcome_for_error_with_memory(
+        journals,
+        failure_memory,
+        operation_id,
+        error,
+        install_facts,
+        observed_at,
+    );
+    let repair_facts = install_repair_facts_from_download_error_or_facts(error, install_facts);
+    repair_install_failure_with_guardian(
+        journals,
+        failure_memory,
+        operation_id,
+        &repair_facts,
+        install_descriptors,
+        observed_at,
+    )
+    .await
+}
+
+fn install_error_log_kind(error: &DownloadError) -> &'static str {
+    match error {
+        DownloadError::FileOperation(_) => "file_operation",
+        DownloadError::ResolveManifest(_) => "resolve_manifest",
+        DownloadError::Request(_) => "request",
+        DownloadError::ParseVersion(_) => "parse_version",
+        DownloadError::PrepareRuntime(_) => "prepare_runtime",
+        DownloadError::RuntimeUnavailableForPlatform { .. } => "runtime_unavailable_for_platform",
+        DownloadError::RuntimeRosettaRequired { .. } => "runtime_rosetta_required",
+        DownloadError::Integrity(_) => "integrity",
+    }
+}
+
+async fn repair_install_failure_with_guardian(
+    journals: &crate::state::OperationJournalStore,
+    failure_memory: &crate::state::GuardianFailureMemoryStore,
+    operation_id: &crate::state::contracts::OperationId,
+    install_facts: &[ExecutionDownloadFact],
+    install_descriptors: &[SelectedDownloadArtifactDescriptor],
+    observed_at: &str,
+) -> Option<GuardianArtifactRepairOutcome> {
     let repair_client = reqwest::Client::new();
     let repair_outcome = repair_install_artifact_corruption_with_guardian(
         journals,
@@ -1054,7 +1127,9 @@ fn install_retry_action(
         };
     }
 
-    if guardian.is_some_and(|guardian| guardian.decision == "block") {
+    if guardian.is_some_and(|guardian| {
+        guardian.decision == "block" && !blocking_guardian_allows_retry(guardian)
+    }) {
         let disabled_reason = guardian_retry_disabled_reason(guardian);
         return InstallActionViewModel {
             action: "retry".to_string(),
@@ -1070,6 +1145,10 @@ fn install_retry_action(
         enabled: true,
         disabled_reason: None,
     }
+}
+
+fn blocking_guardian_allows_retry(guardian: &InstallGuardianOutcomeSummary) -> bool {
+    guardian.diagnosis_id == "managed_runtime_rosetta_required"
 }
 
 fn guardian_retry_disabled_reason(guardian: Option<&InstallGuardianOutcomeSummary>) -> String {

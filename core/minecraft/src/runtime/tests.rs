@@ -1,14 +1,17 @@
 use super::{
-    ComponentManifestDownload, ComponentManifestDownloads, ComponentManifestFile,
-    JavaRuntimeLookupError, RuntimeDownloadActual, RuntimeDownloadEvidence,
-    RuntimeDownloadIntegrityError, RuntimeEnsureEvent, RuntimeInstallState,
+    ComponentManifest, ComponentManifestDownload, ComponentManifestDownloads,
+    ComponentManifestFile, JavaRuntimeLookupError, MachOArm64Compatibility, RosettaRuntimeDecision,
+    RuntimeDownloadActual, RuntimeDownloadEvidence, RuntimeDownloadIntegrityError,
+    RuntimeEnsureEvent, RuntimeId, RuntimeInstallState, RuntimeManifest,
     component_manifest_destination, detect_distribution, detect_runtime_state, ensure_java_runtime,
-    fetch_runtime_file, fetch_runtime_json, install_runtime_manifest_file,
-    install_runtime_manifest_files, java_executable, java_executable_for_os,
-    plan_runtime_manifest_files, remove_runtime_install_path, remove_runtime_install_path_async,
+    fetch_runtime_file, fetch_runtime_json, install_managed_runtime_from_manifest_url,
+    install_runtime_manifest_file, install_runtime_manifest_files, java_executable,
+    java_executable_for_os, parse_mach_o_arm64_compatibility, plan_runtime_manifest_files,
+    remove_runtime_install_path, remove_runtime_install_path_async,
+    resolve_component_runtime_from_roots, rosetta_requirement_for_managed_runtime,
     runtime_download_client, runtime_file_download_concurrency_for, runtime_install_lock_file_path,
     runtime_install_lock_from_map, runtime_os_arch_for, runtime_windows_verbatim_path_string,
-    verify_runtime_download,
+    select_runtime_manifest_url, verify_runtime_download,
 };
 use crate::JavaVersion;
 use serde::Deserialize;
@@ -756,6 +759,361 @@ fn runtime_os_arch_uses_mojang_manifest_platform_keys() {
 }
 
 #[test]
+fn runtime_manifest_selection_falls_back_from_macos_arm64_to_macos() {
+    let manifest = runtime_manifest_fixture(serde_json::json!({
+        "mac-os-arm64": {
+            "jre-legacy": []
+        },
+        "mac-os": {
+            "jre-legacy": [
+                { "manifest": { "url": "https://example.invalid/mac-os/jre-legacy.json" } }
+            ]
+        }
+    }));
+
+    let url =
+        select_runtime_manifest_url(&manifest, &RuntimeId::from("jre-legacy"), "mac-os-arm64")
+            .expect("fallback runtime manifest url");
+
+    assert_eq!(url, "https://example.invalid/mac-os/jre-legacy.json");
+}
+
+#[test]
+fn runtime_manifest_selection_uses_native_entries_before_fallbacks() {
+    let manifest = runtime_manifest_fixture(serde_json::json!({
+        "mac-os-arm64": {
+            "jre-legacy": [
+                { "manifest": { "url": "https://example.invalid/mac-os-arm64/jre-legacy.json" } }
+            ]
+        },
+        "mac-os": {
+            "jre-legacy": [
+                { "manifest": { "url": "https://example.invalid/mac-os/jre-legacy.json" } }
+            ]
+        }
+    }));
+
+    let url =
+        select_runtime_manifest_url(&manifest, &RuntimeId::from("jre-legacy"), "mac-os-arm64")
+            .expect("native runtime manifest url");
+
+    assert_eq!(url, "https://example.invalid/mac-os-arm64/jre-legacy.json");
+}
+
+#[test]
+fn runtime_manifest_selection_reports_unsupported_platform_after_empty_fallbacks() {
+    let manifest = runtime_manifest_fixture(serde_json::json!({
+        "mac-os-arm64": {
+            "jre-legacy": []
+        },
+        "mac-os": {
+            "jre-legacy": []
+        }
+    }));
+
+    let error =
+        select_runtime_manifest_url(&manifest, &RuntimeId::from("jre-legacy"), "mac-os-arm64")
+            .expect_err("empty native and fallback runtimes should fail");
+
+    assert!(matches!(
+        error,
+        JavaRuntimeLookupError::UnsupportedPlatform {
+            component,
+            platform
+        } if component == "jre-legacy" && platform == "mac-os-arm64"
+    ));
+}
+
+#[test]
+fn mach_o_sniff_detects_thin_arm64_binary_as_compatible() {
+    let mut bytes = Vec::new();
+    bytes.extend(0xfeed_facfu32.to_le_bytes());
+    bytes.extend(0x0100_000cu32.to_le_bytes());
+    bytes.extend([0u8; 24]);
+
+    assert_eq!(
+        parse_mach_o_arm64_compatibility(&bytes),
+        MachOArm64Compatibility::HasArm64Slice
+    );
+}
+
+#[test]
+fn mach_o_sniff_detects_thin_x86_64_binary_as_lacking_arm64() {
+    let mut bytes = Vec::new();
+    bytes.extend(0xfeed_facfu32.to_le_bytes());
+    bytes.extend(0x0100_0007u32.to_le_bytes());
+    bytes.extend([0u8; 24]);
+
+    assert_eq!(
+        parse_mach_o_arm64_compatibility(&bytes),
+        MachOArm64Compatibility::LacksArm64Slice
+    );
+}
+
+#[test]
+fn mach_o_sniff_detects_fat_binary_with_arm64_slice_as_compatible() {
+    let mut bytes = Vec::new();
+    bytes.extend(0xcafe_babeu32.to_be_bytes());
+    bytes.extend(2u32.to_be_bytes());
+    bytes.extend(fat_arch32_be(0x0100_0007));
+    bytes.extend(fat_arch32_be(0x0100_000c));
+
+    assert_eq!(
+        parse_mach_o_arm64_compatibility(&bytes),
+        MachOArm64Compatibility::HasArm64Slice
+    );
+}
+
+#[test]
+fn mach_o_sniff_detects_fat_binary_without_arm64_slice_as_lacking_arm64() {
+    let mut bytes = Vec::new();
+    bytes.extend(0xcafe_babeu32.to_be_bytes());
+    bytes.extend(1u32.to_be_bytes());
+    bytes.extend(fat_arch32_be(0x0100_0007));
+
+    assert_eq!(
+        parse_mach_o_arm64_compatibility(&bytes),
+        MachOArm64Compatibility::LacksArm64Slice
+    );
+}
+
+#[test]
+fn mach_o_sniff_handles_fat64_binary_with_arm64_slice() {
+    let mut bytes = Vec::new();
+    bytes.extend(0xcafe_babfu32.to_be_bytes());
+    bytes.extend(2u32.to_be_bytes());
+    bytes.extend(fat_arch64_be(0x0100_0007));
+    bytes.extend(fat_arch64_be(0x0100_000c));
+
+    assert_eq!(
+        parse_mach_o_arm64_compatibility(&bytes),
+        MachOArm64Compatibility::HasArm64Slice
+    );
+}
+
+#[test]
+fn mach_o_sniff_treats_garbage_as_conservatively_compatible() {
+    assert_eq!(
+        parse_mach_o_arm64_compatibility(b"not a mach-o"),
+        MachOArm64Compatibility::UnknownCompatible
+    );
+}
+
+#[test]
+fn rosetta_requirement_policy_only_blocks_arm64_macos_without_rosetta_for_non_arm64_binary() {
+    assert_eq!(
+        rosetta_requirement_for_managed_runtime(
+            "macos",
+            "aarch64",
+            false,
+            MachOArm64Compatibility::LacksArm64Slice,
+        ),
+        RosettaRuntimeDecision::RosettaRequired
+    );
+    for (host_os, host_arch, rosetta_present, binary) in [
+        (
+            "linux",
+            "aarch64",
+            false,
+            MachOArm64Compatibility::LacksArm64Slice,
+        ),
+        (
+            "macos",
+            "x86_64",
+            false,
+            MachOArm64Compatibility::LacksArm64Slice,
+        ),
+        (
+            "macos",
+            "aarch64",
+            true,
+            MachOArm64Compatibility::LacksArm64Slice,
+        ),
+        (
+            "macos",
+            "aarch64",
+            false,
+            MachOArm64Compatibility::HasArm64Slice,
+        ),
+        (
+            "macos",
+            "aarch64",
+            false,
+            MachOArm64Compatibility::UnknownCompatible,
+        ),
+    ] {
+        assert_eq!(
+            rosetta_requirement_for_managed_runtime(host_os, host_arch, rosetta_present, binary,),
+            RosettaRuntimeDecision::Compatible
+        );
+    }
+}
+
+fn ready_runtime_record(component: &str, root_dir: &str) -> super::RuntimeRecord {
+    super::RuntimeRecord {
+        id: RuntimeId::from(component),
+        java_path: format!("{root_dir}/bin/java"),
+        info: super::JavaRuntimeInfo {
+            id: component.to_string(),
+            major: 8,
+            update: 0,
+            distribution: String::new(),
+            path: format!("{root_dir}/bin/java"),
+        },
+        source: super::RuntimeSource::Managed,
+        install_state: RuntimeInstallState::Ready,
+        root_dir: root_dir.to_string(),
+    }
+}
+
+#[test]
+fn rosetta_blocked_root_does_not_shadow_compatible_runtime_in_later_root() {
+    let component = RuntimeId::from("java-runtime-gamma");
+    let roots = vec![
+        std::path::PathBuf::from("/roots/shared"),
+        std::path::PathBuf::from("/roots/cache"),
+    ];
+
+    let record = resolve_component_runtime_from_roots(roots, &component, 17, |dir| {
+        if dir.ends_with("shared") {
+            Err(JavaRuntimeLookupError::RosettaRequired {
+                component: "java-runtime-gamma".to_string(),
+            })
+        } else {
+            Ok(Some(ready_runtime_record(
+                "java-runtime-gamma",
+                "/roots/cache/java-runtime-gamma",
+            )))
+        }
+    })
+    .expect("later compatible root should resolve");
+
+    assert_eq!(record.root_dir, "/roots/cache/java-runtime-gamma");
+}
+
+#[test]
+fn rosetta_block_surfaces_when_no_root_is_compatible() {
+    let component = RuntimeId::from("jre-legacy");
+    let roots = vec![
+        std::path::PathBuf::from("/roots/shared"),
+        std::path::PathBuf::from("/roots/cache"),
+    ];
+
+    let error = resolve_component_runtime_from_roots(roots, &component, 8, |dir| {
+        if dir.ends_with("shared") {
+            Err(JavaRuntimeLookupError::RosettaRequired {
+                component: "jre-legacy".to_string(),
+            })
+        } else {
+            Ok(None)
+        }
+    })
+    .expect_err("rosetta block should surface over not-found");
+
+    assert!(matches!(
+        error,
+        JavaRuntimeLookupError::RosettaRequired { component } if component == "jre-legacy"
+    ));
+}
+
+#[test]
+fn non_rosetta_resolution_errors_stop_the_root_scan() {
+    let component = RuntimeId::from("jre-legacy");
+    let roots = vec![
+        std::path::PathBuf::from("/roots/shared"),
+        std::path::PathBuf::from("/roots/cache"),
+    ];
+    let mut inspected = 0_usize;
+
+    let error = resolve_component_runtime_from_roots(roots, &component, 8, |_dir| {
+        inspected += 1;
+        Err(JavaRuntimeLookupError::Download("io failed".to_string()))
+    })
+    .expect_err("hard errors should propagate");
+
+    assert!(matches!(error, JavaRuntimeLookupError::Download(_)));
+    assert_eq!(inspected, 1);
+}
+
+fn fat_arch32_be(cputype: u32) -> [u8; 20] {
+    let mut arch = [0u8; 20];
+    arch[0..4].copy_from_slice(&cputype.to_be_bytes());
+    arch
+}
+
+fn fat_arch64_be(cputype: u32) -> [u8; 32] {
+    let mut arch = [0u8; 32];
+    arch[0..4].copy_from_slice(&cputype.to_be_bytes());
+    arch
+}
+
+#[tokio::test]
+async fn fallback_selected_runtime_install_is_ready_with_manifest_proof() {
+    let root = unique_temp_root("croopor-runtime-fallback-install-test");
+    let component = RuntimeId::from("jre-legacy");
+    let java_bytes = b"fallback java".to_vec();
+    let cfg_bytes = b"fallback cfg".to_vec();
+    let java_url = serve_runtime_download(java_bytes.clone()).await;
+    let cfg_url = serve_runtime_download(cfg_bytes.clone()).await;
+    let mut files = HashMap::new();
+    let java_relative_path = java_executable(&root)
+        .strip_prefix(&root)
+        .expect("java path under runtime root")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let mut java_file =
+        downloadable_manifest_file(&java_url, java_bytes.len() as u64, &sha1_hex(&java_bytes));
+    java_file.executable = true;
+    files.insert(java_relative_path, java_file);
+    files.insert(
+        "lib/jvm.cfg".to_string(),
+        downloadable_manifest_file(&cfg_url, cfg_bytes.len() as u64, &sha1_hex(&cfg_bytes)),
+    );
+    let component_manifest = ComponentManifest { files };
+    let component_manifest_url = serve_runtime_json(
+        200,
+        serde_json::to_vec(&component_manifest).expect("component manifest json"),
+        None,
+    )
+    .await;
+    let manifest = runtime_manifest_fixture(serde_json::json!({
+        "mac-os-arm64": {
+            "jre-legacy": []
+        },
+        "mac-os": {
+            "jre-legacy": [
+                { "manifest": { "url": component_manifest_url } }
+            ]
+        }
+    }));
+    let manifest_url = select_runtime_manifest_url(&manifest, &component, "mac-os-arm64")
+        .expect("fallback manifest url");
+    let mut events = Vec::new();
+
+    install_managed_runtime_from_manifest_url(
+        &component,
+        &root,
+        std::future::ready(Ok::<_, JavaRuntimeLookupError>(manifest_url)),
+        &mut |event| events.push(event),
+    )
+    .await
+    .expect("fallback runtime install");
+
+    assert_eq!(
+        detect_runtime_state(&root, true),
+        RuntimeInstallState::Ready
+    );
+    assert!(root.join(".croopor-runtime-manifest.json").is_file());
+    assert_eq!(
+        events.last(),
+        Some(&RuntimeEnsureEvent::ManagedRuntimeReady {
+            component: "jre-legacy".to_string()
+        })
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn java_executable_uses_platform_runtime_layouts() {
     let root = PathBuf::from("runtime-root");
 
@@ -1137,6 +1495,10 @@ fn unique_temp_root(label: &str) -> PathBuf {
             .expect("time")
             .as_nanos()
     ))
+}
+
+fn runtime_manifest_fixture(value: serde_json::Value) -> RuntimeManifest {
+    serde_json::from_value(value).expect("runtime manifest fixture")
 }
 
 fn write_runtime_executable_fixture(root: &Path) {

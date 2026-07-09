@@ -37,6 +37,8 @@ pub enum GuardianInstallArtifactFailureKind {
     PromotionFailed,
     DependencyFailed,
     OwnershipRefused,
+    RuntimeRosettaRequired,
+    RuntimeUnavailableForPlatform,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -103,7 +105,7 @@ pub fn install_artifact_failure_guardian_fact(
         kind: execution_kind_for_install_failure(evidence.kind),
         target: Some(TargetDescriptor::new(
             StabilizationSystem::Execution,
-            TargetKind::Artifact,
+            target_kind_for_install_failure(evidence.kind),
             safe_artifact_target_id(&evidence.target_id),
             evidence.ownership,
         )),
@@ -197,7 +199,11 @@ pub fn install_artifact_failure_guardian_outcome_with_context(
     Some(GuardianInstallFailureOutcome {
         diagnosis_id: diagnosis_id.clone(),
         decision: decision.kind,
-        user_outcome: install_failure_user_outcome(decision.kind, diagnosis_id.as_str()),
+        user_outcome: install_failure_user_outcome_from_evidence(
+            decision.kind,
+            diagnosis_id.as_str(),
+            evidence,
+        ),
     })
 }
 
@@ -301,7 +307,87 @@ fn execution_kind_for_install_failure(
             ExecutionFactKind::InstallDependencyFailed
         }
         GuardianInstallArtifactFailureKind::OwnershipRefused => ExecutionFactKind::PrimitiveRefused,
+        GuardianInstallArtifactFailureKind::RuntimeRosettaRequired => {
+            ExecutionFactKind::RuntimeRosettaRequired
+        }
+        GuardianInstallArtifactFailureKind::RuntimeUnavailableForPlatform => {
+            ExecutionFactKind::RuntimeUnavailableForPlatform
+        }
     }
+}
+
+fn target_kind_for_install_failure(kind: GuardianInstallArtifactFailureKind) -> TargetKind {
+    match kind {
+        GuardianInstallArtifactFailureKind::RuntimeRosettaRequired
+        | GuardianInstallArtifactFailureKind::RuntimeUnavailableForPlatform => TargetKind::Runtime,
+        _ => TargetKind::Artifact,
+    }
+}
+
+fn install_failure_user_outcome_from_evidence(
+    decision: GuardianDecisionKind,
+    diagnosis_id: &str,
+    evidence: &[GuardianInstallArtifactFailureEvidence],
+) -> GuardianUserOutcome {
+    let mut outcome = install_failure_user_outcome(decision, diagnosis_id);
+    match diagnosis_id {
+        "managed_runtime_unavailable_for_platform" => {
+            outcome.details = vec![runtime_unavailable_detail(evidence)];
+            outcome.guidance = vec!["This version cannot be installed on this device.".to_string()];
+        }
+        "managed_runtime_rosetta_required" => {
+            outcome.details = vec![runtime_rosetta_required_detail(evidence)];
+            outcome.guidance = vec![
+                "Install Rosetta 2 by running `softwareupdate --install-rosetta --agree-to-license` in Terminal, then retry.".to_string(),
+            ];
+        }
+        _ => {}
+    }
+
+    outcome
+}
+
+fn runtime_unavailable_detail(evidence: &[GuardianInstallArtifactFailureEvidence]) -> String {
+    let component = runtime_failure_field(
+        evidence,
+        GuardianInstallArtifactFailureKind::RuntimeUnavailableForPlatform,
+        "component",
+    )
+    .unwrap_or_else(|| "the required runtime".to_string());
+    let platform = runtime_failure_field(
+        evidence,
+        GuardianInstallArtifactFailureKind::RuntimeUnavailableForPlatform,
+        "platform",
+    )
+    .unwrap_or_else(|| "this device".to_string());
+    format!("Java runtime component {component} is not available for {platform}.")
+}
+
+fn runtime_rosetta_required_detail(evidence: &[GuardianInstallArtifactFailureEvidence]) -> String {
+    let component = runtime_failure_field(
+        evidence,
+        GuardianInstallArtifactFailureKind::RuntimeRosettaRequired,
+        "component",
+    )
+    .unwrap_or_else(|| "the required runtime".to_string());
+    format!("Java runtime component {component} needs Rosetta 2 on this Mac.")
+}
+
+fn runtime_failure_field(
+    evidence: &[GuardianInstallArtifactFailureEvidence],
+    kind: GuardianInstallArtifactFailureKind,
+    key: &str,
+) -> Option<String> {
+    evidence
+        .iter()
+        .find(|evidence| evidence.kind == kind)
+        .and_then(|evidence| {
+            evidence
+                .fields
+                .iter()
+                .find(|(field_key, _)| field_key == key)
+        })
+        .and_then(|(_, value)| sanitize_evidence_token(value, RedactionAudience::UserVisible, 64))
 }
 
 fn safe_artifact_target_id(value: &str) -> String {
@@ -347,7 +433,7 @@ mod tests {
         install_artifact_failure_safety_case, plan_install_artifact_failure_repair,
     };
     use crate::guardian::{GuardianActionKind, GuardianMode};
-    use crate::state::contracts::{OperationId, OperationPhase, OwnershipClass};
+    use crate::state::contracts::{OperationId, OperationPhase, OwnershipClass, TargetKind};
     use croopor_minecraft::download::{
         ExecutionDownloadFact as MinecraftDownloadFact,
         ExecutionDownloadFactKind as MinecraftDownloadFactKind,
@@ -468,6 +554,14 @@ mod tests {
                 GuardianInstallArtifactFailureKind::OwnershipRefused,
                 "artifact_ownership_unsafe",
             ),
+            (
+                GuardianInstallArtifactFailureKind::RuntimeRosettaRequired,
+                "managed_runtime_rosetta_required",
+            ),
+            (
+                GuardianInstallArtifactFailureKind::RuntimeUnavailableForPlatform,
+                "managed_runtime_unavailable_for_platform",
+            ),
         ];
 
         for (kind, diagnosis_id) in cases {
@@ -511,7 +605,7 @@ mod tests {
                 Some(OperationId::new("install-operation-1")),
                 GuardianMode::Managed,
                 OperationPhase::Downloading,
-                &[evidence],
+                std::slice::from_ref(&evidence),
             )
             .expect("Guardian outcome");
 
@@ -534,6 +628,130 @@ mod tests {
             assert!(!encoded.contains("token"));
             assert!(!encoded.contains("secret"));
         }
+    }
+
+    #[test]
+    fn runtime_unavailable_failure_produces_device_specific_blocking_outcome() {
+        let evidence = GuardianInstallArtifactFailureEvidence::launcher_managed(
+            Some(OperationId::new("install-operation-1")),
+            "java_runtime_jre-legacy_mac-os-arm64",
+            GuardianInstallArtifactFailureKind::RuntimeUnavailableForPlatform,
+        )
+        .with_field("component", "jre-legacy")
+        .with_field("platform", "mac-os-arm64")
+        .with_field("url", "https://example.invalid/runtime.json?token=secret");
+
+        let outcome = install_artifact_failure_guardian_outcome(
+            Some(OperationId::new("install-operation-1")),
+            GuardianMode::Managed,
+            OperationPhase::Downloading,
+            std::slice::from_ref(&evidence),
+        )
+        .expect("Guardian outcome");
+
+        assert_eq!(
+            outcome.diagnosis_id.as_str(),
+            "managed_runtime_unavailable_for_platform"
+        );
+        assert_eq!(
+            outcome.decision,
+            crate::guardian::GuardianDecisionKind::Block
+        );
+        assert_eq!(
+            outcome.user_outcome.summary,
+            "This Minecraft version needs a Java runtime that is not available for this device."
+        );
+        assert_eq!(
+            outcome.user_outcome.details,
+            vec![
+                "Java runtime component jre-legacy is not available for mac-os-arm64.".to_string()
+            ]
+        );
+        assert_eq!(
+            outcome.user_outcome.guidance,
+            vec!["This version cannot be installed on this device.".to_string()]
+        );
+
+        let fact = install_artifact_failure_guardian_fact(&evidence, OperationPhase::Downloading);
+        assert_eq!(fact.id.as_str(), "managed_runtime_unavailable_for_platform");
+        assert_eq!(
+            fact.target.as_ref().expect("target").kind,
+            TargetKind::Runtime
+        );
+        assert!(
+            fact.fields
+                .iter()
+                .any(|field| { field.key == "component" && field.value == "jre-legacy" })
+        );
+        assert!(
+            fact.fields
+                .iter()
+                .any(|field| field.key == "platform" && field.value == "mac-os-arm64")
+        );
+        let encoded = serde_json::to_string(&outcome.user_outcome)
+            .expect("outcome json")
+            .to_ascii_lowercase();
+        assert!(!encoded.contains("example.invalid"));
+        assert!(!encoded.contains("token"));
+        assert!(!encoded.contains("secret"));
+    }
+
+    #[test]
+    fn runtime_rosetta_failure_produces_actionable_blocking_outcome() {
+        let evidence = GuardianInstallArtifactFailureEvidence::launcher_managed(
+            Some(OperationId::new("install-operation-1")),
+            "java_runtime_jre-legacy_rosetta",
+            GuardianInstallArtifactFailureKind::RuntimeRosettaRequired,
+        )
+        .with_field("component", "jre-legacy")
+        .with_field("path", "/Users/alice/.croopor/runtime/java");
+
+        let outcome = install_artifact_failure_guardian_outcome(
+            Some(OperationId::new("install-operation-1")),
+            GuardianMode::Managed,
+            OperationPhase::Downloading,
+            std::slice::from_ref(&evidence),
+        )
+        .expect("Guardian outcome");
+
+        assert_eq!(
+            outcome.diagnosis_id.as_str(),
+            "managed_runtime_rosetta_required"
+        );
+        assert_eq!(
+            outcome.decision,
+            crate::guardian::GuardianDecisionKind::Block
+        );
+        assert_eq!(
+            outcome.user_outcome.summary,
+            "This Minecraft version needs Rosetta 2 on Apple Silicon Macs."
+        );
+        assert_eq!(
+            outcome.user_outcome.details,
+            vec!["Java runtime component jre-legacy needs Rosetta 2 on this Mac.".to_string()]
+        );
+        assert_eq!(
+            outcome.user_outcome.guidance,
+            vec![
+                "Install Rosetta 2 by running `softwareupdate --install-rosetta --agree-to-license` in Terminal, then retry.".to_string()
+            ]
+        );
+
+        let fact = install_artifact_failure_guardian_fact(&evidence, OperationPhase::Downloading);
+        assert_eq!(fact.id.as_str(), "managed_runtime_rosetta_required");
+        assert_eq!(
+            fact.target.as_ref().expect("target").kind,
+            TargetKind::Runtime
+        );
+        assert!(
+            fact.fields
+                .iter()
+                .any(|field| { field.key == "component" && field.value == "jre-legacy" })
+        );
+        let encoded = serde_json::to_string(&outcome.user_outcome)
+            .expect("outcome json")
+            .to_ascii_lowercase();
+        assert!(!encoded.contains("users/alice"));
     }
 
     #[test]
@@ -569,6 +787,16 @@ mod tests {
                 "artifact_ownership_unsafe",
                 "protect user-owned or unknown files",
             ),
+            (
+                GuardianInstallArtifactFailureKind::RuntimeRosettaRequired,
+                "managed_runtime_rosetta_required",
+                "Rosetta 2",
+            ),
+            (
+                GuardianInstallArtifactFailureKind::RuntimeUnavailableForPlatform,
+                "managed_runtime_unavailable_for_platform",
+                "Java runtime that is not available",
+            ),
         ];
 
         for (kind, diagnosis_id, summary_fragment) in cases {
@@ -585,7 +813,7 @@ mod tests {
                 Some(OperationId::new("install-operation-1")),
                 GuardianMode::Managed,
                 OperationPhase::Downloading,
-                &[evidence],
+                std::slice::from_ref(&evidence),
             )
             .expect("Guardian outcome");
 
@@ -599,6 +827,20 @@ mod tests {
                 "{diagnosis_id} summary did not contain expected fragment: {:?}",
                 outcome.user_outcome
             );
+            if matches!(
+                kind,
+                GuardianInstallArtifactFailureKind::RuntimeRosettaRequired
+                    | GuardianInstallArtifactFailureKind::RuntimeUnavailableForPlatform
+            ) {
+                assert_eq!(
+                    install_artifact_failure_guardian_fact(&evidence, OperationPhase::Downloading)
+                        .target
+                        .as_ref()
+                        .expect("target")
+                        .kind,
+                    TargetKind::Runtime
+                );
+            }
             let encoded = serde_json::to_string(&outcome.user_outcome)
                 .expect("outcome json")
                 .to_ascii_lowercase();

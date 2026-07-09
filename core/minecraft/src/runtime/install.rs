@@ -4,7 +4,9 @@ use super::file_download::{
     runtime_download_client, runtime_download_temp_path, runtime_file_download_concurrency,
     runtime_filesystem_path, verify_runtime_download,
 };
-use super::layout::{java_executable, runtime_executable_ready, runtime_os_arch};
+use super::layout::{
+    java_executable, runtime_executable_ready, runtime_os_arch, runtime_platform_fallbacks,
+};
 use super::manifest::{
     COMPONENT_MANIFEST_PROOF_FILE, ComponentManifest, ComponentManifestDownload,
     ComponentManifestDownloads, ComponentManifestFile, RUNTIME_MANIFEST_URL, RuntimeManifest,
@@ -16,6 +18,7 @@ use sha1::{Digest as _, Sha1};
 use std::collections::HashMap;
 #[cfg(test)]
 use std::fs;
+use std::future::Future;
 use std::io::{BufReader, Write};
 use std::path::Path;
 use tokio::fs as async_fs;
@@ -26,6 +29,26 @@ pub(super) async fn install_managed_runtime(
     observer: &mut impl FnMut(RuntimeEnsureEvent),
 ) -> Result<(), JavaRuntimeLookupError> {
     let os_arch = runtime_os_arch();
+    let component_for_manifest = component.clone();
+    let manifest_platform = os_arch.clone();
+    install_managed_runtime_from_manifest_url(
+        component,
+        dest_dir,
+        async move {
+            let all_runtimes = fetch_runtime_json::<RuntimeManifest>(RUNTIME_MANIFEST_URL).await?;
+            select_runtime_manifest_url(&all_runtimes, &component_for_manifest, &manifest_platform)
+        },
+        observer,
+    )
+    .await
+}
+
+pub(super) async fn install_managed_runtime_from_manifest_url(
+    component: &RuntimeId,
+    dest_dir: &Path,
+    manifest_url: impl Future<Output = Result<String, JavaRuntimeLookupError>>,
+    observer: &mut impl FnMut(RuntimeEnsureEvent),
+) -> Result<(), JavaRuntimeLookupError> {
     let parent_dir = dest_dir.parent().ok_or_else(|| {
         JavaRuntimeLookupError::Download("invalid runtime destination".to_string())
     })?;
@@ -52,26 +75,7 @@ pub(super) async fn install_managed_runtime(
     .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
 
     let install_result = async {
-        let all_runtimes = fetch_runtime_json::<RuntimeManifest>(RUNTIME_MANIFEST_URL).await?;
-
-        let os_runtimes = all_runtimes.get(&os_arch).ok_or_else(|| {
-            JavaRuntimeLookupError::Download(format!("no runtimes available for {os_arch}"))
-        })?;
-        let entries = os_runtimes.get(component.as_str()).ok_or_else(|| {
-            JavaRuntimeLookupError::Download(format!(
-                "runtime {} is not available for {os_arch}",
-                component.as_str()
-            ))
-        })?;
-        let manifest_url = entries
-            .first()
-            .map(|entry| entry.manifest.url.clone())
-            .ok_or_else(|| {
-                JavaRuntimeLookupError::Download(format!(
-                    "runtime {} has no downloadable manifest for {os_arch}",
-                    component.as_str()
-                ))
-            })?;
+        let manifest_url = manifest_url.await?;
 
         let component_manifest = fetch_runtime_json::<ComponentManifest>(&manifest_url).await?;
         persist_component_manifest_proof(&temp_dir, &component_manifest).await?;
@@ -123,6 +127,32 @@ pub(super) async fn install_managed_runtime(
     });
 
     Ok(())
+}
+
+pub(super) fn select_runtime_manifest_url(
+    all_runtimes: &RuntimeManifest,
+    component: &RuntimeId,
+    primary_platform: &str,
+) -> Result<String, JavaRuntimeLookupError> {
+    std::iter::once(primary_platform)
+        .chain(runtime_platform_fallbacks(primary_platform).iter().copied())
+        .find_map(|platform| runtime_manifest_url_for(all_runtimes, component, platform))
+        .ok_or_else(|| JavaRuntimeLookupError::UnsupportedPlatform {
+            component: component.as_str().to_string(),
+            platform: primary_platform.to_string(),
+        })
+}
+
+fn runtime_manifest_url_for(
+    all_runtimes: &RuntimeManifest,
+    component: &RuntimeId,
+    platform: &str,
+) -> Option<String> {
+    all_runtimes
+        .get(platform)?
+        .get(component.as_str())?
+        .first()
+        .map(|entry| entry.manifest.url.clone())
 }
 
 async fn persist_component_manifest_proof(

@@ -32,6 +32,8 @@ use tokio::fs as async_fs;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
+const DOWNLOAD_RETRY_DELAY_MILLIS: [u64; 3] = [500, 1_500, 4_000];
+
 #[cfg(test)]
 pub(super) async fn download_file_with_client(
     client: &reqwest::Client,
@@ -87,6 +89,30 @@ struct SelectedArtifactDownload<'a> {
     descriptor_tx: Option<&'a mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
 }
 
+#[derive(Clone, Copy)]
+enum DownloadChecksumRequirement {
+    Required,
+    AllowMissing,
+}
+
+impl DownloadChecksumRequirement {
+    fn request<'a>(
+        self,
+        url: &'a str,
+        destination: &'a Path,
+        expected: &'a ExpectedIntegrity,
+    ) -> ExecutionDownloadRequest<'a> {
+        match self {
+            Self::Required => {
+                ExecutionDownloadRequest::launcher_managed(url, destination, expected)
+            }
+            Self::AllowMissing => {
+                ExecutionDownloadRequest::launcher_managed_best_effort(url, destination, expected)
+            }
+        }
+    }
+}
+
 pub(super) async fn download_file_with_client_and_fact_sender_allowing_missing_checksum(
     kind: SelectedDownloadArtifactKind,
     client: &reqwest::Client,
@@ -107,9 +133,14 @@ pub(super) async fn download_file_with_client_and_fact_sender_allowing_missing_c
     .await?;
     emit_selected_download_descriptor(descriptor_tx, kind, destination, url, expected);
     emit_selected_artifact_missing_fact_if_absent(fact_tx, kind, destination, expected).await;
-    match execute_download_to_temp(
+    let retry_delays = default_download_retry_delays();
+    match download_launcher_managed_with_transient_retries(
         client,
-        ExecutionDownloadRequest::launcher_managed_best_effort(url, destination, expected),
+        url,
+        destination,
+        expected,
+        DownloadChecksumRequirement::AllowMissing,
+        &retry_delays,
     )
     .await
     {
@@ -553,23 +584,114 @@ pub async fn download_file_with_client_report(
     destination: &Path,
     expected: &ExpectedIntegrity,
 ) -> Result<ExecutionDownloadReport, ExecutionDownloadError> {
-    const DOWNLOAD_ATTEMPTS: u64 = 3;
-    let mut attempt = 1;
+    let retry_delays = default_download_retry_delays();
+    download_launcher_managed_with_transient_retries(
+        client,
+        url,
+        destination,
+        expected,
+        DownloadChecksumRequirement::Required,
+        &retry_delays,
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(super) async fn download_file_with_client_report_with_retry_delays(
+    client: &reqwest::Client,
+    url: &str,
+    destination: &Path,
+    expected: &ExpectedIntegrity,
+    retry_delays: &[Duration],
+) -> Result<ExecutionDownloadReport, ExecutionDownloadError> {
+    download_launcher_managed_with_transient_retries(
+        client,
+        url,
+        destination,
+        expected,
+        DownloadChecksumRequirement::Required,
+        retry_delays,
+    )
+    .await
+}
+
+fn default_download_retry_delays() -> [Duration; 3] {
+    DOWNLOAD_RETRY_DELAY_MILLIS.map(Duration::from_millis)
+}
+
+async fn download_launcher_managed_with_transient_retries(
+    client: &reqwest::Client,
+    url: &str,
+    destination: &Path,
+    expected: &ExpectedIntegrity,
+    checksum_requirement: DownloadChecksumRequirement,
+    retry_delays: &[Duration],
+) -> Result<ExecutionDownloadReport, ExecutionDownloadError> {
+    let mut next_delay = 0_usize;
     loop {
         match execute_download_to_temp(
             client,
-            ExecutionDownloadRequest::launcher_managed(url, destination, expected),
+            checksum_requirement.request(url, destination, expected),
         )
         .await
         {
             Ok(report) => return Ok(report),
-            Err(_) if attempt < DOWNLOAD_ATTEMPTS => {
-                tokio::time::sleep(Duration::from_millis(250 * attempt)).await;
-                attempt += 1;
+            Err(error)
+                if next_delay < retry_delays.len()
+                    && execution_download_error_is_retryable(&error) =>
+            {
+                let delay = retry_delays[next_delay];
+                next_delay += 1;
+                tokio::time::sleep(delay).await;
             }
             Err(error) => return Err(error),
         }
     }
+}
+
+fn execution_download_error_is_retryable(error: &ExecutionDownloadError) -> bool {
+    match error.kind {
+        ExecutionDownloadFactKind::NetworkFailure | ExecutionDownloadFactKind::Interrupted => true,
+        ExecutionDownloadFactKind::ProviderFailure => {
+            provider_failure_status(error).is_some_and(is_retryable_provider_status)
+        }
+        ExecutionDownloadFactKind::ArtifactMissing
+        | ExecutionDownloadFactKind::ArtifactVerified
+        | ExecutionDownloadFactKind::ChecksumMismatch
+        | ExecutionDownloadFactKind::MetadataInvalid
+        | ExecutionDownloadFactKind::MetadataMissing
+        | ExecutionDownloadFactKind::OwnershipRefused
+        | ExecutionDownloadFactKind::PermissionFailure
+        | ExecutionDownloadFactKind::PromoteFailed
+        | ExecutionDownloadFactKind::SizeMismatch
+        | ExecutionDownloadFactKind::TempDiscarded
+        | ExecutionDownloadFactKind::TempWriteFailed
+        | ExecutionDownloadFactKind::WrittenToTemp
+        | ExecutionDownloadFactKind::Promoted => false,
+    }
+}
+
+fn provider_failure_status(error: &ExecutionDownloadError) -> Option<u16> {
+    if let DownloadError::Request(request_error) = &error.error
+        && let Some(status) = request_error.status()
+    {
+        return Some(status.as_u16());
+    }
+
+    error
+        .facts
+        .iter()
+        .filter(|fact| fact.kind == ExecutionDownloadFactKind::ProviderFailure)
+        .flat_map(|fact| fact.fields.iter())
+        .find_map(|(key, value)| {
+            (key == "status")
+                .then(|| value.parse::<u16>().ok())
+                .flatten()
+        })
+}
+
+fn is_retryable_provider_status(status: u16) -> bool {
+    status == 429 || (500..=599).contains(&status)
 }
 
 pub(super) fn download_temp_path(destination: &Path) -> PathBuf {
