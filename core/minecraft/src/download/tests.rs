@@ -74,7 +74,7 @@ async fn install_version_starts_asset_index_before_library_download_finishes() {
 
     let mut saw_asset_index = false;
     while !saw_asset_index {
-        let path = timeout(Duration::from_secs(2), requests.recv())
+        let path = timeout(Duration::from_secs(10), requests.recv())
             .await
             .expect("request should arrive before library release")
             .expect("request event");
@@ -1746,10 +1746,15 @@ async fn spawn_overlapped_install_server()
                 "/version.json" => version_body.clone(),
                 "/asset-index.json" => asset_index_body.clone(),
                 "/libraries/lib.jar" => {
-                    if let Some(receiver) = release_library_rx.take() {
-                        let _ = receiver.await;
-                    }
-                    library_body.clone()
+                    let receiver = release_library_rx.take();
+                    let body = library_body.clone();
+                    tokio::spawn(async move {
+                        if let Some(receiver) = receiver {
+                            let _ = receiver.await;
+                        }
+                        write_raw_response(&mut socket, "200 OK", &body).await;
+                    });
+                    continue;
                 }
                 _ => {
                     write_raw_response(&mut socket, "404 Not Found", b"not found").await;
