@@ -22,12 +22,14 @@ export function JavaPathField({
   onCommit,
   disabled,
   className,
+  label = 'Java runtime',
 }: {
   value: string;
   onChange: (value: string) => void;
   onCommit?: (value: string) => void;
   disabled?: boolean;
   className?: string;
+  label?: string;
 }): JSX.Element {
   const [runtimes, setRuntimes] = useState<JavaRuntime[]>([]);
   const trimmed = value.trim();
@@ -73,7 +75,7 @@ export function JavaPathField({
 
   return (
     <label class={`cp-ovr-field${className ? ` ${className}` : ''}`}>
-      <span>Java runtime</span>
+      {label && <span>{label}</span>}
       <SelectField
         value={selectValue}
         disabled={disabled}

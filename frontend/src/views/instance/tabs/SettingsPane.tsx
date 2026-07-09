@@ -1,16 +1,18 @@
-import type { ComponentChildren, JSX } from 'preact';
-import { useEffect, useState } from 'preact/hooks';
+import type { JSX } from 'preact';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import { Icon } from '../../../ui/Icons';
-import { Button } from '../../../ui/Atoms';
-import { Segmented } from '../../../ui/Segmented';
 import { SelectField } from '../../../ui/Select';
-import { type SliderZone } from '../../../ui/Slider';
-import { RangeSlider } from '../../../ui/RangeSlider';
+import { OptionList, type OptionListItem } from '../../../ui/OptionList';
+import { OverrideChip, SettingRow, SettingsSection } from '../../../ui/SettingsSheet';
+import { MemoryField, recommendedHeapRange } from '../../../ui/MemoryField';
+import { WindowField } from '../../../ui/WindowField';
+import { JavaPathField, JvmArgsInput } from '../../../ui/RuntimeFields';
+import { useAutoSave } from '../../../hooks/use-autosave';
+import { jvmPresetSelectLabel, normalizeJvmPreset, useJvmPresets } from '../../../hooks/use-jvm-presets';
 import { api } from '../../../api';
 import { config, systemInfo } from '../../../store';
 import { updateInstanceInList } from '../../../actions';
-import { toast } from '../../../toast';
-import { errMessage, fmtMem, getMemoryRecommendation } from '../../../utils';
+import { fmtMem } from '../../../utils';
 import type { InstancePerformanceMode } from '../../../types-performance';
 import type { EnrichedInstance } from '../../../types-instance';
 import { memoryGb } from '../format';
@@ -20,148 +22,85 @@ import {
   performanceModeFrom,
   performanceModeLabel,
 } from '../performance-mode';
-import type { PerformanceMode } from '../../../types-performance';
-import { JavaPathField, JvmArgsInput } from '../../../ui/RuntimeFields';
-import { WindowSizeField, type WindowPreset } from './WindowSizeField';
-
-const WINDOW_PRESETS: WindowPreset[] = [
-  { id: 'default', label: 'Default', w: 854, h: 480 },
-  { id: 'hd', label: '720p', w: 1280, h: 720 },
-  { id: 'fhd', label: '1080p', w: 1920, h: 1080 },
-  { id: '2k', label: '2K', w: 2560, h: 1440 },
-];
-
-function windowDimension(value: number | undefined, fallback: number): number {
-  return Number.isFinite(value) && (value ?? 0) > 0 ? value! : fallback;
-}
-
-const INSTANCE_PERFORMANCE_OPTIONS: Array<{ value: InstancePerformanceMode; label: string; icon: string }> = [
-  { value: '', label: 'Inherit', icon: 'globe' },
-  { value: 'managed', label: 'Managed', icon: 'sparkles' },
-  { value: 'vanilla', label: 'Vanilla', icon: 'cube' },
-  { value: 'custom', label: 'Custom', icon: 'sliders' },
-];
-
-interface JvmPresetOption {
-  id: string;
-  label: string;
-  detail: string;
-  default: boolean;
-  disabled_reason?: string | null;
-}
-
-interface CreateBackendViewResponse {
-  preset_options?: JvmPresetOption[];
-}
-
-function instancePerformanceNote(mode: InstancePerformanceMode, globalMode: PerformanceMode): string {
-  if (!mode) return `Follows the global Performance setting, currently ${performanceModeLabel(globalMode)}.`;
-  if (mode === 'managed') return 'Croopor applies recommended tuning and optimizations for this instance.';
-  if (mode === 'vanilla') return 'Pure Minecraft. No tweaks or add-ons applied at launch.';
-  return 'You set the tuning. Your manual choices are kept as-is.';
-}
 
 function instancePerformanceModeFrom(value: string | undefined): InstancePerformanceMode {
   return performanceModeFrom(value) ?? '';
 }
 
-function jvmPresetFromBackendOptions(value: string | undefined, options: JvmPresetOption[]): string {
-  const trimmed = (value ?? '').trim();
-  const selectable = selectableJvmPresetOptions(options);
-  if (selectable.length === 0) return trimmed;
-  return selectable.some((option) => option.id === trimmed) ? trimmed : '';
-}
-
-function selectableJvmPresetOptions(options: JvmPresetOption[]): JvmPresetOption[] {
-  return options.filter((option) => !option.disabled_reason);
-}
-
-function jvmPresetSelectLabel(option: JvmPresetOption): string {
-  return option.disabled_reason ? `${option.label} (${option.disabled_reason})` : option.label;
-}
-
-function SettingRow({
-  title,
-  description,
-  className,
-  children,
-}: {
-  title: string;
-  description?: ComponentChildren;
-  className?: string;
-  children: ComponentChildren;
-}): JSX.Element {
-  return (
-    <div class={`cp-iset-row${className ? ` ${className}` : ''}`}>
-      <div class="cp-iset-row-copy">
-        <strong>{title}</strong>
-        {description && <p>{description}</p>}
-      </div>
-      <div class="cp-iset-row-control">{children}</div>
-    </div>
-  );
+function windowDimension(value: number | undefined, fallback: number): number {
+  return Number.isFinite(value) && (value ?? 0) > 0 ? value! : fallback;
 }
 
 export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
-  const [maxMem, setMaxMem] = useState<number>(memoryGb(inst.max_memory_mb, config.value?.max_memory_mb ?? 4096));
-  const [minMem, setMinMem] = useState<number>(memoryGb(inst.min_memory_mb, config.value?.min_memory_mb ?? 1024));
-  const [width, setWidth] = useState<number>(windowDimension(inst.window_width, 854));
-  const [height, setHeight] = useState<number>(windowDimension(inst.window_height, 480));
-  const [performanceMode, setPerformanceMode] = useState<InstancePerformanceMode>(
-    instancePerformanceModeFrom(inst.performance_mode),
-  );
-  const [jvmPresetOptions, setJvmPresetOptions] = useState<JvmPresetOption[]>([]);
-  const [jvmPreset, setJvmPreset] = useState<string>(jvmPresetFromBackendOptions(inst.jvm_preset, jvmPresetOptions));
-  const [javaPath, setJavaPath] = useState<string>(inst.java_path ?? '');
-  const [jvmArgs, setJvmArgs] = useState<string>(inst.extra_jvm_args ?? '');
-  const [saving, setSaving] = useState(false);
+  const cfg = config.value;
+  const globalMode = globalPerformanceMode();
+  const totalGb = systemInfo.value?.total_memory_mb
+    ? Math.max(1, Math.floor(systemInfo.value.total_memory_mb / 1024))
+    : 32;
+  const [recMin, recMax] = recommendedHeapRange(totalGb);
+
+  const { commit, saving } = useAutoSave<EnrichedInstance & { error?: string }>({
+    send: (patch) => api('PUT', `/instances/${encodeURIComponent(inst.id)}`, patch),
+    apply: (res) => updateInstanceInList(res),
+    errorLabel: 'instance settings',
+  });
+
   const [healthRefreshKey, setHealthRefreshKey] = useState(0);
+  const bumpHealth = (): void => setHealthRefreshKey((current) => current + 1);
   const [healthNotice, setHealthNotice] = useState<{
     tone: 'warned' | 'error';
     title: string;
     detail: string;
   } | null>(null);
-  const globalMode = globalPerformanceMode();
-  const totalGB = systemInfo.value?.total_memory_mb
-    ? Math.max(1, Math.floor(systemInfo.value.total_memory_mb / 1024))
-    : 32;
-  const ramMax = Math.max(2, Math.min(32, totalGB));
-  const rec = getMemoryRecommendation(totalGB);
-  const recMin = Math.min(ramMax, Math.max(1, rec.rec - 2));
-  const recMax = Math.min(ramMax, rec.rec + 2);
-  const memoryZones: SliderZone[] = [
-    { from: 1, to: recMin, tone: 'low', label: 'Low' },
-    { from: recMin, to: recMax, tone: 'sweet', label: 'Recommended' },
-    { from: recMax, to: Math.min(ramMax, Math.max(recMax, ramMax * 0.75)), tone: 'high', label: 'High' },
-    { from: Math.min(ramMax, Math.max(recMax, ramMax * 0.75)), to: ramMax, tone: 'extreme', label: 'Aggressive' },
-  ];
-  const activeWindowPreset = WINDOW_PRESETS.find((p) => p.w === width && p.h === height)?.id ?? 'custom';
-  const activeWindowLabel = WINDOW_PRESETS.find((p) => p.id === activeWindowPreset)?.label ?? 'Custom';
-  const effectiveSettingsMode = performanceMode || globalMode;
-  const persistedJvmPreset = jvmPresetFromBackendOptions(inst.jvm_preset, jvmPresetOptions);
-  const selectableJvmPresets = selectableJvmPresetOptions(jvmPresetOptions);
-  const selectedJvmPresetOption =
-    jvmPresetOptions.find((option) => option.id === jvmPreset) ??
-    jvmPresetOptions.find((option) => option.default) ??
-    null;
-  const performanceModeText = performanceMode
-    ? `${performanceModeLabel(effectiveSettingsMode)} override`
-    : `Inherits ${performanceModeLabel(effectiveSettingsMode)} from global settings`;
-  const persistedWidth = inst.window_width ?? 854;
-  const persistedHeight = inst.window_height ?? 480;
-  const dirty =
-    Math.round(maxMem * 1024) !== (inst.max_memory_mb ?? config.value?.max_memory_mb ?? 4096) ||
-    Math.round(Math.min(minMem, maxMem) * 1024) !== (inst.min_memory_mb ?? config.value?.min_memory_mb ?? 1024) ||
-    width !== persistedWidth ||
-    height !== persistedHeight ||
-    performanceMode !== instancePerformanceModeFrom(inst.performance_mode) ||
-    jvmPreset !== persistedJvmPreset ||
-    javaPath !== (inst.java_path ?? '') ||
-    jvmArgs !== (inst.extra_jvm_args ?? '');
+
+  const memoryOverridden = (inst.max_memory_mb ?? 0) > 0 || (inst.min_memory_mb ?? 0) > 0;
+  const savedMaxGb = memoryGb(inst.max_memory_mb, cfg?.max_memory_mb ?? 4096);
+  const savedMinGb = memoryGb(inst.min_memory_mb, cfg?.min_memory_mb ?? 1024);
+  const [maxGb, setMaxGb] = useState(savedMaxGb);
+  const [minGb, setMinGb] = useState(savedMinGb);
+
+  const windowOverridden = (inst.window_width ?? 0) > 0 || (inst.window_height ?? 0) > 0;
+  const globalWidth = windowDimension(cfg?.window_width, 854);
+  const globalHeight = windowDimension(cfg?.window_height, 480);
+  const effectiveWidth = windowDimension(inst.window_width, globalWidth);
+  const effectiveHeight = windowDimension(inst.window_height, globalHeight);
+
+  const savedMode = instancePerformanceModeFrom(inst.performance_mode);
+  const [mode, setMode] = useState<InstancePerformanceMode>(savedMode);
+
+  const { options: presetOptions, selectable: selectablePresets } = useJvmPresets();
+  const savedPreset = normalizeJvmPreset(inst.jvm_preset, selectablePresets);
+  const selectedPreset =
+    presetOptions.find((option) => option.id === savedPreset) ?? presetOptions.find((option) => option.default) ?? null;
+
+  const savedJavaPath = inst.java_path ?? '';
+  const [javaPath, setJavaPath] = useState(savedJavaPath);
+
+  const savedArgs = inst.extra_jvm_args ?? '';
+  const [jvmArgs, setJvmArgs] = useState(savedArgs);
+  const argsTimer = useRef<number | null>(null);
+  const pendingArgs = useRef<string | null>(null);
 
   useEffect(() => {
-    setMinMem((prev) => Math.min(prev, maxMem));
-  }, [maxMem]);
+    setMaxGb(savedMaxGb);
+    setMinGb(savedMinGb);
+    setMode(savedMode);
+    setJavaPath(savedJavaPath);
+    setJvmArgs(savedArgs);
+  }, [inst.id, savedMaxGb, savedMinGb, savedMode, savedJavaPath, savedArgs]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void api('GET', `/instances/${encodeURIComponent(inst.id)}`)
+      .then((res: any) => {
+        if (cancelled || !res || res.error) return;
+        updateInstanceInList(res as EnrichedInstance);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [inst.id]);
 
   useEffect(() => {
     let cancelled = false;
@@ -187,87 +126,79 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
     };
   }, [inst.id, inst.performance_mode, globalMode, healthRefreshKey]);
 
+  const commitArgs = (next: string): void => {
+    pendingArgs.current = null;
+    if (next === savedArgs) return;
+    commit(
+      { extra_jvm_args: next },
+      { label: 'JVM arguments', revert: () => setJvmArgs(savedArgs), onSuccess: bumpHealth },
+    );
+  };
+
+  const onArgsChange = (next: string): void => {
+    setJvmArgs(next);
+    pendingArgs.current = next;
+    if (argsTimer.current !== null) window.clearTimeout(argsTimer.current);
+    argsTimer.current = window.setTimeout(() => {
+      argsTimer.current = null;
+      if (pendingArgs.current !== null) commitArgs(pendingArgs.current);
+    }, 600);
+  };
+
   useEffect(() => {
-    let cancelled = false;
-    void (async () => {
-      try {
-        const res = (await api('GET', '/instances/create-view')) as CreateBackendViewResponse & { error?: string };
-        if (cancelled || res.error) return;
-        const options = Array.isArray(res.preset_options)
-          ? res.preset_options.filter(
-              (option): option is JvmPresetOption =>
-                typeof option.id === 'string' && typeof option.label === 'string' && typeof option.detail === 'string',
-            )
-          : [];
-        setJvmPresetOptions(options);
-        setJvmPreset((current) => jvmPresetFromBackendOptions(current, options));
-      } catch {
-        if (!cancelled) setJvmPresetOptions([]);
-      }
-    })();
     return () => {
-      cancelled = true;
+      if (argsTimer.current !== null) {
+        window.clearTimeout(argsTimer.current);
+        argsTimer.current = null;
+      }
+      if (pendingArgs.current !== null) commitArgs(pendingArgs.current);
     };
-  }, []);
+  }, [inst.id]);
 
-  useEffect(() => {
-    setMaxMem(memoryGb(inst.max_memory_mb, config.value?.max_memory_mb ?? 4096));
-    setMinMem(memoryGb(inst.min_memory_mb, config.value?.min_memory_mb ?? 1024));
-    setWidth(windowDimension(inst.window_width, 854));
-    setHeight(windowDimension(inst.window_height, 480));
-    setPerformanceMode(instancePerformanceModeFrom(inst.performance_mode));
-    setJvmPreset(jvmPresetFromBackendOptions(inst.jvm_preset, jvmPresetOptions));
-    setJavaPath(inst.java_path ?? '');
-    setJvmArgs(inst.extra_jvm_args ?? '');
-  }, [
-    inst.id,
-    inst.max_memory_mb,
-    inst.min_memory_mb,
-    inst.window_width,
-    inst.window_height,
-    inst.performance_mode,
-    inst.jvm_preset,
-    inst.java_path,
-    inst.extra_jvm_args,
-    jvmPresetOptions,
-  ]);
+  const modeOptions: Array<OptionListItem<InstancePerformanceMode>> = [
+    {
+      value: '',
+      label: 'Inherit',
+      icon: 'globe',
+      note: `Follows the global Performance setting, currently ${performanceModeLabel(globalMode)}.`,
+    },
+    {
+      value: 'managed',
+      label: 'Managed',
+      icon: 'sparkles',
+      note: 'Croopor applies recommended tuning and optimizations for this instance.',
+    },
+    {
+      value: 'vanilla',
+      label: 'Vanilla',
+      icon: 'cube',
+      note: 'Pure Minecraft. No tweaks or add-ons applied at launch.',
+    },
+    {
+      value: 'custom',
+      label: 'Custom',
+      icon: 'sliders',
+      note: 'You set the tuning. Your manual choices are kept as-is.',
+    },
+  ];
 
-  const save = async (): Promise<void> => {
-    setSaving(true);
-    try {
-      const clampedMinMem = Math.min(minMem, maxMem);
-      const res: any = await api('PUT', `/instances/${encodeURIComponent(inst.id)}`, {
-        max_memory_mb: Math.round(maxMem * 1024),
-        min_memory_mb: Math.round(clampedMinMem * 1024),
-        art_seed: inst.art_seed,
-        window_width: width,
-        window_height: height,
-        performance_mode: performanceMode,
-        jvm_preset: jvmPreset,
-        java_path: javaPath,
-        extra_jvm_args: jvmArgs,
-      });
-      if (res?.error) throw new Error(res.error);
-      updateInstanceInList(res);
-      setHealthRefreshKey((current) => current + 1);
-      toast('Saved instance settings');
-    } catch (err) {
-      toast(`Could not save instance settings: ${errMessage(err)}`, 'error');
-    } finally {
-      setSaving(false);
-    }
+  const changeMode = (next: InstancePerformanceMode): void => {
+    setMode(next);
+    commit(
+      { performance_mode: next },
+      { label: 'launch profile', revert: () => setMode(savedMode), onSuccess: bumpHealth },
+    );
   };
 
   return (
     <div class="cp-instance-body cp-settings-pane">
       <div class="cp-resource-toolbar cp-settings-toolbar">
         <strong>Instance settings</strong>
-        <div class="cp-settings-save">
-          <span data-dirty={dirty}>{dirty ? 'Unsaved changes' : 'Up to date'}</span>
-          <Button onClick={save} disabled={saving || !dirty} sound="affirm">
-            {saving ? 'Saving…' : 'Save settings'}
-          </Button>
-        </div>
+        {saving && (
+          <span class="cp-settings-saving" aria-live="polite">
+            Saving…
+          </span>
+        )}
       </div>
 
       {healthNotice && (
@@ -282,112 +213,146 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
         </section>
       )}
 
-      <div class="cp-iset">
-        <div class="cp-iset-rows">
-          <SettingRow
-            title="Launch profile"
-            description={
-              <>
-                {performanceModeText}. {instancePerformanceNote(performanceMode, globalMode)}
-              </>
-            }
-            className="cp-iset-row--performance"
-          >
-            <div class="cp-iset-seg" aria-label="Instance performance mode">
-              <Segmented<InstancePerformanceMode>
-                options={INSTANCE_PERFORMANCE_OPTIONS}
-                value={performanceMode}
-                onChange={setPerformanceMode}
+      <SettingsSection>
+        <SettingRow
+          title="Launch profile"
+          description="How this instance is tuned at launch."
+          aside={mode !== '' && <OverrideChip onReset={() => changeMode('')} />}
+        >
+          <OptionList<InstancePerformanceMode>
+            value={mode}
+            options={modeOptions}
+            ariaLabel="Instance performance mode"
+            onChange={changeMode}
+          />
+        </SettingRow>
+
+        <SettingRow
+          title="JVM preset"
+          description={selectedPreset?.disabled_reason ?? selectedPreset?.detail}
+          aside={
+            savedPreset !== '' && (
+              <OverrideChip
+                onReset={() => commit({ jvm_preset: '' }, { label: 'JVM preset', onSuccess: bumpHealth })}
               />
-            </div>
-          </SettingRow>
+            )
+          }
+          control={
+            <SelectField<string>
+              value={savedPreset}
+              ariaLabel="JVM preset"
+              onChange={(next) => commit({ jvm_preset: next }, { label: 'JVM preset', onSuccess: bumpHealth })}
+              disabled={selectablePresets.length === 0}
+              placeholder="Loading"
+              options={presetOptions.map((preset) => ({
+                value: preset.id,
+                label: jvmPresetSelectLabel(preset),
+                disabled: Boolean(preset.disabled_reason),
+              }))}
+            />
+          }
+        />
 
-          <SettingRow
-            title="Runtime"
-            description={selectedJvmPresetOption?.disabled_reason ?? selectedJvmPresetOption?.detail}
-            className="cp-iset-row--runtime"
-          >
-            <div class="cp-runtime-control">
-              <div class="cp-iset-duo">
-                <label class="cp-ovr-field">
-                  <span>JVM preset</span>
-                  <SelectField<string>
-                    value={jvmPreset}
-                    ariaLabel="JVM preset"
-                    onChange={setJvmPreset}
-                    disabled={selectableJvmPresets.length === 0}
-                    placeholder="Loading"
-                    options={jvmPresetOptions.map((preset) => ({
-                      value: preset.id,
-                      label: jvmPresetSelectLabel(preset),
-                      disabled: Boolean(preset.disabled_reason),
-                    }))}
-                  />
-                </label>
-
-                <JavaPathField value={javaPath} onChange={setJavaPath} />
-              </div>
-
-              <JvmArgsInput value={jvmArgs} onChange={setJvmArgs} />
-            </div>
-          </SettingRow>
-
-          <SettingRow
-            title="Memory"
-            description={
-              <>
-                Recommended {fmtMem(recMin)} to {fmtMem(recMax)} for this system.
-              </>
-            }
-            className="cp-iset-row--memory"
-          >
-            <div class="cp-settings-heap">
-              <div class="cp-settings-heap-readout">
-                <span>
-                  Min <strong>{fmtMem(minMem)}</strong>
-                </span>
-                <span class="cp-settings-heap-band">{fmtMem(maxMem - minMem)} elastic</span>
-                <span>
-                  Max <strong>{fmtMem(maxMem)}</strong>
-                </span>
-              </div>
-              <div class="cp-settings-range-wrap">
-                <RangeSlider
-                  low={minMem}
-                  high={maxMem}
-                  min={1}
-                  max={ramMax}
-                  step={0.5}
-                  zones={memoryZones}
-                  sound="memory"
-                  onChange={(low, high) => {
-                    setMinMem(low);
-                    setMaxMem(high);
-                  }}
-                  ariaLabelLow="Minimum heap in gigabytes"
-                  ariaLabelHigh="Maximum heap in gigabytes"
-                />
-              </div>
-            </div>
-          </SettingRow>
-
-          <SettingRow
-            title="Window"
-            description={`${activeWindowLabel} · ${width} x ${height}.`}
-            className="cp-iset-row--window"
-          >
-            <WindowSizeField
-              width={width}
-              height={height}
-              presets={WINDOW_PRESETS}
-              onChange={(w, h) => {
-                setWidth(w);
-                setHeight(h);
+        <SettingRow
+          title="Java runtime"
+          description="Which Java executable launches this instance."
+          aside={
+            savedJavaPath.trim() !== '' && (
+              <OverrideChip
+                onReset={() => {
+                  setJavaPath('');
+                  commit({ java_path: '' }, { label: 'Java runtime', onSuccess: bumpHealth });
+                }}
+              />
+            )
+          }
+          control={
+            <JavaPathField
+              value={javaPath}
+              label=""
+              onChange={setJavaPath}
+              onCommit={(next) => {
+                if (next === savedJavaPath.trim()) return;
+                commit(
+                  { java_path: next },
+                  { label: 'Java runtime', revert: () => setJavaPath(savedJavaPath), onSuccess: bumpHealth },
+                );
               }}
             />
-          </SettingRow>
-        </div>
-      </div>
+          }
+        />
+
+        <SettingRow title="JVM arguments" description="Extra flags appended to the launch command.">
+          <JvmArgsInput value={jvmArgs} onChange={onArgsChange} label="" />
+        </SettingRow>
+
+        <SettingRow
+          title="Memory"
+          description={`${memoryOverridden ? '' : 'Inherits the global default. '}Recommended ${fmtMem(recMin)} to ${fmtMem(recMax)} for this system.`}
+          aside={
+            memoryOverridden && (
+              <OverrideChip
+                onReset={() =>
+                  commit({ min_memory_mb: 0, max_memory_mb: 0 }, { label: 'memory', onSuccess: bumpHealth })
+                }
+              />
+            )
+          }
+        >
+          <MemoryField
+            minGb={minGb}
+            maxGb={maxGb}
+            totalGb={totalGb}
+            onChange={(low, high) => {
+              setMinGb(low);
+              setMaxGb(high);
+            }}
+            onCommit={(low, high) =>
+              commit(
+                {
+                  min_memory_mb: Math.round(Math.min(low, high) * 1024),
+                  max_memory_mb: Math.round(high * 1024),
+                },
+                {
+                  label: 'memory',
+                  revert: () => {
+                    setMinGb(savedMinGb);
+                    setMaxGb(savedMaxGb);
+                  },
+                  onSuccess: bumpHealth,
+                },
+              )
+            }
+          />
+        </SettingRow>
+
+        <SettingRow
+          title="Window"
+          description="Game window size when this instance launches."
+          aside={
+            windowOverridden && (
+              <OverrideChip
+                onReset={() =>
+                  commit({ window_width: 0, window_height: 0 }, { label: 'window size', onSuccess: bumpHealth })
+                }
+              />
+            )
+          }
+        >
+          <WindowField
+            width={effectiveWidth}
+            height={effectiveHeight}
+            inherit={
+              windowOverridden
+                ? undefined
+                : { active: true, label: `Inherits global (${globalWidth} × ${globalHeight})` }
+            }
+            onCommit={(w, h) =>
+              commit({ window_width: w, window_height: h }, { label: 'window size', onSuccess: bumpHealth })
+            }
+          />
+        </SettingRow>
+      </SettingsSection>
     </div>
   );
 }
