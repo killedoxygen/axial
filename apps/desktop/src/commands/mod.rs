@@ -37,9 +37,38 @@ pub struct NativeMicrosoftSignIn {
     owns_minecraft_java: Option<bool>,
 }
 
+#[derive(Debug, Eq, PartialEq, Serialize)]
+pub struct NativeDesktopChrome {
+    platform: &'static str,
+    chrome_mode: &'static str,
+}
+
 #[tauri::command]
 pub fn app_version(state: State<'_, DesktopState>) -> String {
     state.version().to_string()
+}
+
+#[tauri::command]
+pub fn desktop_chrome() -> NativeDesktopChrome {
+    NativeDesktopChrome {
+        platform: std::env::consts::OS,
+        chrome_mode: desktop_chrome_mode(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn desktop_chrome_mode() -> &'static str {
+    "mac-overlay"
+}
+
+#[cfg(target_os = "windows")]
+fn desktop_chrome_mode() -> &'static str {
+    "custom-frameless"
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn desktop_chrome_mode() -> &'static str {
+    "native-decorated"
 }
 
 #[tauri::command]

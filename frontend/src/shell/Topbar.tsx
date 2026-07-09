@@ -8,7 +8,7 @@ import { goBack, goForward, navigate, route } from '../ui-state';
 import { runningSessions, instances, versionById, launchState } from '../store';
 import { activeDownload, downloadFailure, downloadQueue } from '../machines/downloads';
 import { minecraftVersionLabel } from '../version-display';
-import { windowStartDragging, windowToggleMaximize, hasNativeDesktopRuntime } from '../native';
+import { hasCustomDragRegion, windowStartDragging, windowToggleMaximize } from '../native';
 
 function assertUnreachable(value: never): never {
   throw new Error(`Unhandled route: ${JSON.stringify(value)}`);
@@ -161,16 +161,16 @@ function StatusPill(): JSX.Element {
 }
 
 export function Topbar(): JSX.Element {
-  const [isNative] = useState(hasNativeDesktopRuntime());
+  const [usesCustomDrag] = useState(hasCustomDragRegion());
 
   const onDragAreaDoubleClick = (e: MouseEvent): void => {
-    if (!isNative) return;
+    if (!usesCustomDrag) return;
     if ((e.target as HTMLElement)?.closest('.cp-nodrag')) return;
     void windowToggleMaximize();
   };
 
   const onDragAreaMouseDown = (e: MouseEvent): void => {
-    if (!isNative) return;
+    if (!usesCustomDrag) return;
     if ((e.target as HTMLElement)?.closest('.cp-nodrag')) return;
     if (e.button !== 0) return;
     void windowStartDragging();
@@ -178,7 +178,11 @@ export function Topbar(): JSX.Element {
 
   const crumbs = crumbsFor();
   return (
-    <div class="cp-topbar cp-drag" onMouseDown={onDragAreaMouseDown} onDblClick={onDragAreaDoubleClick}>
+    <div
+      class={`cp-topbar${usesCustomDrag ? ' cp-drag' : ''}`}
+      onMouseDown={onDragAreaMouseDown}
+      onDblClick={onDragAreaDoubleClick}
+    >
       <div class="cp-nodrag" style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
         <IconButton icon="arrow-left" size={28} tooltip="Back" onClick={goBack} />
         <IconButton icon="arrow-right" size={28} tooltip="Forward" onClick={goForward} />

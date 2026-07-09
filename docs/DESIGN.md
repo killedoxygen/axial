@@ -36,6 +36,7 @@ This project is a desktop Minecraft launcher, not a marketing site. Keep UI work
 ## Shell
 - The sidebar is a fixed 68px icon rail (`.cp-rail`): brand, search, Home/Instances/New, instance identity tiles, settings, player head. There is no expanded sidebar mode; labels live in tooltips and the command palette.
 - Active instance tile: full-color tile plus raised shadow while siblings sit dimmed. Do not use rings or borders because they clip in the scroll container. Running instances get a status dot. Keep rail items 44px.
+- Desktop window chrome is platform-owned where possible: Linux uses the base native-decorated Tauri window, macOS uses native decorations with the overlay traffic-light titlebar, and Windows keeps the custom frameless shell. The frontend consumes the shell-authored chrome mode from Tauri instead of sniffing browser user agents. Keep duplicated `app.windows` blocks in platform-specific Tauri configs in sync because platform config arrays replace the base array.
 
 ## Selection & Active States
 - One selection language everywhere: solid `--accent-fill` background with `--accent-on` content (the onboarding pill pattern). No translucent accent washes, no accent borders for selection. Applies to rail nav, version rows, source tiles, runtime presets, icon-button active, settings rail, on/off pills.

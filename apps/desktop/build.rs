@@ -2,6 +2,8 @@ use serde_json::Value;
 use std::{env, fs};
 
 const DEV_TAURI_CONFIG: &str = "tauri.dev.conf.json";
+const MACOS_TAURI_CONFIG: &str = "tauri.macos.conf.json";
+const WINDOWS_TAURI_CONFIG: &str = "tauri.windows.conf.json";
 const DEV_ICON_ICNS: &str = "icons/dev/macos/icon.icns";
 const DEV_ICON_PNG: &str = "icons/dev/icon.png";
 const DEV_ICON_ICO: &str = "icons/dev/icon.ico";
@@ -20,6 +22,8 @@ fn apply_dev_tauri_config() {
     }
 
     println!("cargo:rerun-if-changed={DEV_TAURI_CONFIG}");
+    println!("cargo:rerun-if-changed={MACOS_TAURI_CONFIG}");
+    println!("cargo:rerun-if-changed={WINDOWS_TAURI_CONFIG}");
     println!("cargo:rerun-if-changed={DEV_ICON_ICNS}");
     println!("cargo:rerun-if-changed={DEV_ICON_PNG}");
     println!("cargo:rerun-if-changed={DEV_ICON_ICO}");

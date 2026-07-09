@@ -83,6 +83,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             commands::app_version,
             commands::app_restart,
             commands::api_base_url,
+            commands::desktop_chrome,
             commands::microsoft_sign_in,
             commands::read_skin_file,
             commands::start_install_events,

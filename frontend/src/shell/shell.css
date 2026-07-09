@@ -1,3 +1,13 @@
+:root {
+  --cp-window-titlebar-safe-h: 0px;
+  --cp-window-onboarding-strip-h: 36px;
+}
+
+html[data-desktop-chrome='mac-overlay'] {
+  --cp-window-titlebar-safe-h: 38px;
+  --cp-window-onboarding-strip-h: 40px;
+}
+
 .cp-frame {
   --cp-topbar-h: 46px;
   width: 100%;
@@ -18,7 +28,7 @@
   flex-direction: column;
   align-items: center;
   gap: 6px;
-  padding: 10px 0 12px;
+  padding: calc(10px + var(--cp-window-titlebar-safe-h)) 0 12px;
   background: transparent;
 }
 .cp-rail-brand {
@@ -28,11 +38,15 @@
   align-items: center;
   justify-content: center;
   margin-bottom: 2px;
+  pointer-events: none;
 }
 .cp-logo {
   width: 34px;
   height: 34px;
   display: block;
+}
+html[data-desktop-chrome='mac-overlay'] .cp-rail-brand {
+  display: none;
 }
 .cp-mark {
   overflow: visible;

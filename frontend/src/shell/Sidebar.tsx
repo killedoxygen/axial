@@ -361,8 +361,8 @@ export function Sidebar(): JSX.Element {
 
   return (
     <aside class="cp-rail" ref={railRef}>
-      <div class="cp-rail-brand" {...railTipAttrs('Croopor', tooltip)}>
-        <Logo className="cp-logo" motion="loose" size={34} />
+      <div class="cp-rail-brand" aria-hidden="true">
+        <Logo className="cp-logo" size={34} />
       </div>
       <button
         class="cp-rail-btn"

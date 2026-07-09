@@ -55,6 +55,66 @@ export function hasNativeDesktopRuntime(): boolean {
   return isTauriRuntime();
 }
 
+export type DesktopPlatform = 'browser' | 'linux' | 'macos' | 'unknown' | 'windows';
+export type DesktopChromeMode = 'browser' | 'custom-frameless' | 'mac-overlay' | 'native-decorated';
+
+export interface NativeDesktopChrome {
+  platform: DesktopPlatform;
+  chrome_mode: DesktopChromeMode;
+}
+
+const browserDesktopChrome: NativeDesktopChrome = {
+  platform: 'browser',
+  chrome_mode: 'browser',
+};
+
+let desktopChrome = browserDesktopChrome;
+
+function desktopPlatformFromPayload(value: unknown): DesktopPlatform {
+  return value === 'linux' || value === 'macos' || value === 'windows' ? value : 'unknown';
+}
+
+function desktopChromeModeFromPayload(value: unknown): DesktopChromeMode {
+  return value === 'custom-frameless' || value === 'mac-overlay' || value === 'native-decorated' ? value : 'browser';
+}
+
+function desktopChromeFromPayload(payload: unknown): NativeDesktopChrome {
+  if (!payload || typeof payload !== 'object') return browserDesktopChrome;
+  const record = payload as { platform?: unknown; chrome_mode?: unknown };
+  return {
+    platform: desktopPlatformFromPayload(record.platform),
+    chrome_mode: desktopChromeModeFromPayload(record.chrome_mode),
+  };
+}
+
+async function getNativeDesktopChrome(): Promise<NativeDesktopChrome> {
+  const tauri = getTauriBinding();
+  if (!tauri?.core) return browserDesktopChrome;
+  const payload = await tauri.core.invoke<unknown>('desktop_chrome');
+  return desktopChromeFromPayload(payload);
+}
+
+export function currentDesktopChrome(): NativeDesktopChrome {
+  return desktopChrome;
+}
+
+export function hasCustomWindowControls(): boolean {
+  return desktopChrome.chrome_mode === 'custom-frameless';
+}
+
+export function hasCustomDragRegion(): boolean {
+  return desktopChrome.chrome_mode === 'custom-frameless' || desktopChrome.chrome_mode === 'mac-overlay';
+}
+
+export async function applyDesktopChromeAttributes(): Promise<void> {
+  desktopChrome = await getNativeDesktopChrome().catch(() => browserDesktopChrome);
+  const root = document.documentElement;
+  root.dataset.desktopPlatform = desktopChrome.platform;
+  root.dataset.desktopChrome = desktopChrome.chrome_mode;
+  root.dataset.windowControls = hasCustomWindowControls() ? 'custom' : 'native';
+  root.dataset.windowFrame = desktopChrome.chrome_mode;
+}
+
 export function nativeInstallEventName(installId: string): string {
   return `croopor:install:${installId}:progress`;
 }

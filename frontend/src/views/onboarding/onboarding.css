@@ -128,11 +128,16 @@
 
 .cp-ob-topstrip {
   flex-shrink: 0;
-  height: 36px;
+  height: var(--cp-window-onboarding-strip-h, 36px);
   display: flex;
   align-items: stretch;
   justify-content: flex-end;
   padding-right: 2px;
+}
+
+html[data-desktop-chrome='browser'] .cp-ob-topstrip,
+html[data-desktop-chrome='native-decorated'] .cp-ob-topstrip {
+  display: none;
 }
 
 .cp-ob-column {

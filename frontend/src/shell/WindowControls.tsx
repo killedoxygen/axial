@@ -9,23 +9,25 @@ import {
   windowMinimize,
   windowToggleMaximize,
   windowIsMaximized,
+  hasCustomWindowControls,
 } from '../native';
 
 export function WindowControls(): JSX.Element | null {
   const isNative = hasNativeDesktopRuntime();
+  const hasCustomControls = hasCustomWindowControls();
   const [maximized, setMaximized] = useState(false);
 
   useEffect(() => {
-    if (!isNative) return;
+    if (!isNative || !hasCustomControls) return;
     const syncMaximized = (): void => {
       void windowIsMaximized().then(setMaximized);
     };
     syncMaximized();
     window.addEventListener('focus', syncMaximized);
     return () => window.removeEventListener('focus', syncMaximized);
-  }, [isNative]);
+  }, [hasCustomControls, isNative]);
 
-  if (!isNative) return null;
+  if (!isNative || !hasCustomControls) return null;
 
   const onMin = (): void => {
     void windowMinimize();

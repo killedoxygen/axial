@@ -1,7 +1,7 @@
 import type { JSX } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { bootstrapError, bootstrapState } from '../store';
-import { hasNativeDesktopRuntime, windowStartDragging } from '../native';
+import { hasCustomDragRegion, windowStartDragging } from '../native';
 import { Logo } from '../ui/Logo';
 
 const MIN_DISPLAY_MS = 500;
@@ -39,7 +39,7 @@ export function BootSplash(): JSX.Element | null {
   const [leaving, setLeaving] = useState(false);
   const [gone, setGone] = useState(false);
   const mountedAt = useRef(Date.now());
-  const isNative = useRef(hasNativeDesktopRuntime());
+  const usesCustomDrag = useRef(hasCustomDragRegion());
 
   useEffect(() => {
     if (state !== 'loading') return;
@@ -66,7 +66,7 @@ export function BootSplash(): JSX.Element | null {
   if (gone) return null;
 
   const onMouseDown = (e: MouseEvent): void => {
-    if (!isNative.current || e.button !== 0) return;
+    if (!usesCustomDrag.current || e.button !== 0) return;
     void windowStartDragging();
   };
 

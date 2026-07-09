@@ -19,6 +19,7 @@ import { applyTheme } from './theme';
 import { Sound, bindButtonSounds } from './sound';
 import { Music } from './music';
 import {
+  applyDesktopChromeAttributes,
   getNativeAppVersion,
   hasNativeDesktopRuntime,
   nativeDesktopCloseBlockedEventName,
@@ -34,6 +35,7 @@ import { restoreRoute, showOnboardingOverlay } from './ui-state';
 
 async function init(): Promise<void> {
   initErrorReporting();
+  await applyDesktopChromeAttributes();
 
   // Theme before anything else so the first paint is tinted correctly
   applyTheme(local.theme, local.customHue, {
