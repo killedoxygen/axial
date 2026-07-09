@@ -8,7 +8,6 @@ export interface ShortcutBinding {
   shift?: boolean;
   alt?: boolean;
   meta?: boolean;
-  desc: string;
 }
 
 export interface OverlayPosition {

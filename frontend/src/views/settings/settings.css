@@ -66,6 +66,34 @@
   align-items: center;
   gap: 3px;
 }
+.cp-shortcut-edit {
+  display: inline-flex;
+  align-items: center;
+  min-height: 30px;
+  padding: 3px 8px;
+  border: none;
+  border-radius: var(--r-xs);
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+  transition: background 120ms;
+}
+.cp-shortcut-edit:hover {
+  background: var(--surface-2);
+}
+.cp-shortcut-edit:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.cp-shortcut-edit[data-recording='true'] {
+  background: color-mix(in oklab, var(--bg) 55%, var(--surface));
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.cp-shortcut-listening {
+  color: var(--text-dim);
+  font-size: 12px;
+  font-weight: 600;
+}
 .cp-settings-runtime {
   min-width: 0;
   display: grid;
