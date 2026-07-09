@@ -3,6 +3,7 @@ import type { EnrichedInstance } from '../types-instance';
 import type { InstallQueueStateResponse } from '../types-install';
 import type { FeatureFlagViewModel, FlagsResponse } from '../types-flags';
 import type { Version } from '../types-version';
+import type { PerformanceRulesStatus } from '../types-performance';
 
 type Handler = (body?: unknown, path?: string, request?: MockRequest) => unknown | Promise<unknown>;
 
@@ -275,6 +276,55 @@ const handlers: Record<string, Handler> = {
   'GET /flags': () => flagsResponse(),
   'PUT /flags/{key}': (body, path) => updateFlag(path?.slice('/flags/'.length) ?? '', body),
   'POST /telemetry/frontend-error': () => null,
+  'GET /instances/{id}': (_body, path) => findInstance(instanceIdFromPath(path)),
+  'PUT /instances/{id}': (body, path) => updateInstance(instanceIdFromPath(path), body),
+  'GET /java': () => ({
+    runtimes: [
+      { path: '/mock/java/21/bin/java', component: 'java-runtime-delta-21', source: 'managed' },
+      { path: '/mock/java/17/bin/java', component: 'java-runtime-gamma-17', source: 'system' },
+    ],
+  }),
+  'GET /performance/status': (): PerformanceRulesStatus => ({
+    rule_source: 'built_in',
+    rule_channel: 'bundled',
+    rules_cache: {
+      recorded: true,
+      state: 'recorded',
+      updated_at: '2026-07-01T12:00:00Z',
+      loaded_at: '2026-07-08T09:00:00Z',
+      warning: null,
+    },
+    view_model: {
+      source_label: 'Built-in rules',
+      channel_label: 'Bundled',
+      validation_label: 'Valid',
+      validation_tone: 'ok',
+      validation_icon: 'shield-check',
+      summary: 'Managed performance uses the bundled rule set.',
+      refresh_label: 'Refreshes with app updates',
+      generated_label: 'Jul 1, 2026',
+      cache_label: 'Recorded',
+      emergency_disable_label: 'None',
+      details_label: 'Rule details',
+      health_states_label: 'healthy, degraded, fallback',
+      ownership_label: 'composition managed',
+      warnings: [],
+    },
+    guardian_facts: [],
+    schema_version: 3,
+    generated_at: '2026-07-01T12:00:00Z',
+    composition_count: 6,
+    family_coverage: [],
+    remote_refresh: false,
+    last_refresh_at: null,
+    validation: 'valid',
+    health_states: ['healthy', 'degraded', 'fallback'],
+    ownership_classes: ['composition_managed'],
+    emergency_disable_count: 0,
+    emergency_disables: [],
+    warnings: [],
+  }),
+  'GET /performance/health': () => ({ health: null }),
 };
 
 const versionFixtures: Version[] = [
@@ -362,7 +412,37 @@ export async function mockApi<T>(method: string, path: string, body?: unknown): 
 
 function handlerKey(method: string, path: string): string {
   if (method === 'PUT' && path.startsWith('/flags/')) return 'PUT /flags/{key}';
+  if (/^\/instances\/[^/]+$/.test(path) && path !== '/instances/create-view') return `${method} /instances/{id}`;
   return `${method} ${path}`;
+}
+
+function instanceIdFromPath(path: string | undefined): string {
+  return decodeURIComponent((path ?? '').slice('/instances/'.length));
+}
+
+function findInstance(id: string): EnrichedInstance {
+  const instance = instanceFixtures.find((fixture) => fixture.id === id);
+  if (!instance) throw apiError(404, 'Not Found', { error: 'unknown instance' });
+  return instance;
+}
+
+function updateInstance(id: string, body: unknown): EnrichedInstance {
+  const instance = findInstance(id);
+  if (isRecord(body)) {
+    if (typeof body.name === 'string' && body.name.trim()) instance.name = body.name.trim();
+    for (const key of ['max_memory_mb', 'min_memory_mb', 'window_width', 'window_height', 'art_seed'] as const) {
+      const value = finiteNumber(body[key]);
+      if (value !== undefined) instance[key] = Math.max(0, Math.round(value));
+    }
+    for (const key of ['jvm_preset', 'java_path', 'extra_jvm_args'] as const) {
+      if (typeof body[key] === 'string') instance[key] = body[key];
+    }
+    const mode = body.performance_mode;
+    if (mode === '' || mode === 'managed' || mode === 'vanilla' || mode === 'custom') {
+      instance.performance_mode = mode;
+    }
+  }
+  return instance;
 }
 
 function updateFlag(encodedKey: string, body: unknown): FlagsResponse {
